@@ -5,12 +5,11 @@ from scipy.io import mmread
 from scipy.sparse import csr_matrix
 
 
-def test_export_knn_to_mtx(datastore, graph_artifacts, tmp_path):
+def test_export_knn_to_mtx(datastore, connectivity_graph, tmp_path):
     from scarf.embeddings.sgtsne import export_knn_to_mtx
 
     graph = datastore.load_graph(
-        from_assay="RNA",
-        cell_key="I",
+        connectivity_graph,
         symmetric=False,
         upper_only=False,
     )

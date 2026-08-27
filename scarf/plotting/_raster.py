@@ -5,8 +5,9 @@ from typing import Any
 
 import numpy as np
 
+from ..metadata.rows import read_metadata_missing_rows_chunkwise
 from ._deps import require_matplotlib
-from ._style import continuous_norm
+from ._style import continuous_norm, square_axis_limits
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +21,36 @@ class RasterCanvas:
     vmax: float
     n_cells: int
     n_blocks: int
+
+
+def _apply_raster_missing_mask(
+    values: np.ndarray,
+    missing: np.ndarray | None,
+) -> np.ndarray:
+    """Replace nullable metadata fill values with raster-safe missing values."""
+    if missing is None or not np.any(missing):
+        return values
+    if values.dtype.kind == "b":
+        output = values.copy()
+        output[missing] = False
+        return output
+    if values.dtype.kind in {"f", "i", "u"}:
+        output = values.astype(np.float64, copy=True)
+        output[missing] = np.nan
+        return output
+    output = values.astype(object, copy=True)
+    output[missing] = None
+    return output
+
+
+def _raster_block_values(cells: Any, block: Any, key: str) -> np.ndarray:
+    values = np.asarray(block.values[key])
+    missing = read_metadata_missing_rows_chunkwise(
+        cells,
+        key,
+        block.active_global_indices,
+    )
+    return _apply_raster_missing_mask(values, missing)
 
 
 def density_canvas_from_points(
@@ -149,11 +180,11 @@ def raster_from_metadata(
         n_blocks += 1
         if len(block.active_global_indices) == 0:
             continue
-        x = np.asarray(block.values[x_key], dtype=np.float64)
-        y = np.asarray(block.values[y_key], dtype=np.float64)
+        x = np.asarray(_raster_block_values(cells, block, x_key), dtype=np.float64)
+        y = np.asarray(_raster_block_values(cells, block, y_key), dtype=np.float64)
         finite = np.isfinite(x) & np.isfinite(y)
         if subset_by is not None:
-            sub = np.asarray(block.values[subset_by])
+            sub = _raster_block_values(cells, block, subset_by)
             if sub.dtype != bool:
                 raise TypeError(
                     f"subset_by {subset_by!r} must be boolean; got {sub.dtype}"
@@ -167,7 +198,10 @@ def raster_from_metadata(
         ymin = min(ymin, float(y[finite].min()))
         ymax = max(ymax, float(y[finite].max()))
         if color_key is not None:
-            c = np.asarray(block.values[color_key], dtype=np.float64)[finite]
+            c = np.asarray(
+                _raster_block_values(cells, block, color_key),
+                dtype=np.float64,
+            )[finite]
             mm = _finite_minmax(c)
             if mm is not None:
                 cmin = min(cmin, mm[0])
@@ -222,6 +256,11 @@ def raster_from_metadata(
     if ymax == ymin:
         ymax = ymin + 1.0
 
+    (xmin, xmax), (ymin, ymax) = square_axis_limits(
+        (xmin, xmax),
+        (ymin, ymax),
+    )
+
     sums = np.zeros((pixels, pixels), dtype=np.float64)
     counts = np.zeros((pixels, pixels), dtype=np.int64)
 
@@ -231,11 +270,11 @@ def raster_from_metadata(
     ):
         if len(block.active_global_indices) == 0:
             continue
-        x = np.asarray(block.values[x_key], dtype=np.float64)
-        y = np.asarray(block.values[y_key], dtype=np.float64)
+        x = np.asarray(_raster_block_values(cells, block, x_key), dtype=np.float64)
+        y = np.asarray(_raster_block_values(cells, block, y_key), dtype=np.float64)
         finite = np.isfinite(x) & np.isfinite(y)
         if subset_by is not None:
-            sub = np.asarray(block.values[subset_by])
+            sub = _raster_block_values(cells, block, subset_by)
             if sub.dtype != bool:
                 raise TypeError(
                     f"subset_by {subset_by!r} must be boolean; got {sub.dtype}"
@@ -260,7 +299,10 @@ def raster_from_metadata(
         if color_key is None:
             np.add.at(counts, (iy_img, ix), 1)
         else:
-            c = np.asarray(block.values[color_key], dtype=np.float64)[finite]
+            c = np.asarray(
+                _raster_block_values(cells, block, color_key),
+                dtype=np.float64,
+            )[finite]
             finite_color = np.isfinite(c)
             np.add.at(sums, (iy_img[finite_color], ix[finite_color]), c[finite_color])
             np.add.at(counts, (iy_img[finite_color], ix[finite_color]), 1)

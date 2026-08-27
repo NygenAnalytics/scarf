@@ -17,6 +17,7 @@ from scarf.storage import schema as storage_schema
 from scarf.writers import (
     CSVtoZarr,
     CrToZarr,
+    H5adImportResult,
     H5adToZarr,
     LoomToZarr,
     MtxToZarr,
@@ -60,7 +61,7 @@ _PUBLIC_CLASS_METHODS = {
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
     CrToZarr: "7b24b552fb00d9624015641a4b9d5bfa715288afcd9943e80601402ec622e37d",
-    H5adToZarr: "a8ca36670b32911cd32ab66370a8f5cc9b972a574e694f7a4f8e3dbdeae9d341",
+    H5adToZarr: "150858bef35ec818c6c9170fb5566a9592c457e12d3d5b6f7eff760f42f24ec9",
     LoomToZarr: "49707df259ee16c345fdb533866697da4dd1830638425a39e1ca0f4d24072fcf",
     SparseToZarr: "a535ea51f1b26618f234d248af1e7e6900ba6f50a7aa14223079d95a8e0b68bb",
     CSVtoZarr: "d2904c1662d71f2822ccd0b373d624eddd28938bf99bb4294c6f3badc72eb224",
@@ -78,7 +79,7 @@ _MODULE_FUNCTIONS = (
     "write_renorm_subset_to_zarr",
 )
 _MODULE_SIGNATURE_DIGEST = (
-    "ffb18630347ba23982f12fa6a6ce7ad202a5a680dae8789e8e2dd155014cfa05"
+    "e179c717241fa271ec1a3609b9dfc72ff7b8c4be4d14ca491b521ea918ea9ac9"
 )
 
 
@@ -93,6 +94,7 @@ def test_writers_facade_surface_is_stable():
         "SubsetZarr",
         "CrToZarr",
         "MtxToZarr",
+        "H5adImportResult",
         "H5adToZarr",
         "LoomToZarr",
         "SeuratImportResult",
@@ -139,6 +141,7 @@ def test_writer_public_metadata_remains_on_facade():
 
     for name in _MODULE_FUNCTIONS:
         assert getattr(writers_module, name).__module__ == "scarf.writers"
+    assert H5adImportResult.__module__ == "scarf.writers"
     assert SeuratImportResult.__module__ == "scarf.writers"
 
 
@@ -306,12 +309,14 @@ def test_writer_type_hints_resolve_from_facade_objects():
             assert get_type_hints(getattr(cls, name))
     for name in _MODULE_FUNCTIONS:
         assert get_type_hints(getattr(writers_module, name))
+    assert get_type_hints(H5adImportResult)
     assert get_type_hints(SeuratImportResult)
 
 
 def test_writer_facade_objects_remain_pickle_resolvable():
     for cls in _PUBLIC_CLASS_METHODS:
         assert pickle.loads(pickle.dumps(cls)) is cls
+    assert pickle.loads(pickle.dumps(H5adImportResult)) is H5adImportResult
     assert pickle.loads(pickle.dumps(SeuratImportResult)) is SeuratImportResult
     for name in _MODULE_FUNCTIONS:
         function = getattr(writers_module, name)

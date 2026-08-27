@@ -17,10 +17,10 @@ class EnrichmentResult:
         source_names: Source names aligned to the score columns.
         source_sizes: Matched target counts aligned to ``source_names``.
         cell_index: Assay cell indices aligned to the score rows.
-        label: User-supplied persistence label.
+        artifact: Immutable enrichment artifact backing the result.
         storage_path: Zarr path that owns the result.
         assay: Name of the RNA assay used for scoring.
-        cell_key: Cell selection used when the result was created.
+        cell_selection: Immutable cell selection used for scoring.
         feature_selection: Feature-selection artifact used for scoring.
         method: Enrichment method, either ``"waggr"`` or ``"aucell"``.
     """
@@ -29,14 +29,20 @@ class EnrichmentResult:
     source_names: np.ndarray = field(repr=False)
     source_sizes: np.ndarray = field(repr=False)
     cell_index: np.ndarray = field(repr=False)
-    label: str
+    artifact: ArtifactRef
     storage_path: str
     assay: str
-    cell_key: str
+    cell_selection: ArtifactRef
     feature_selection: ArtifactRef
     method: str
 
     def __post_init__(self) -> None:
+        if (
+            self.artifact.kind != "enrichment_scores"
+            or self.artifact.scope != "assay"
+            or self.artifact.assay != self.assay
+        ):
+            raise ValueError("Enrichment artifact must belong to the result assay")
         if (
             not isinstance(self.feature_selection, ArtifactRef)
             or self.feature_selection.kind != "feature_selection"
@@ -45,6 +51,15 @@ class EnrichmentResult:
         ):
             raise ValueError(
                 "Enrichment feature_selection must belong to the result assay"
+            )
+        if (
+            not isinstance(self.cell_selection, ArtifactRef)
+            or self.cell_selection.kind != "cell_selection"
+            or self.cell_selection.scope != "datastore"
+            or self.cell_selection.assay is not None
+        ):
+            raise ValueError(
+                "Enrichment cell_selection must be a datastore cell selection"
             )
         if len(self.data.shape) != 2:
             raise ValueError("Enrichment data must be two-dimensional")

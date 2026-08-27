@@ -56,11 +56,15 @@ def _write_artifact(
 
 
 class _ReferenceDatastore:
-    def __init__(self, root: zarr.Group) -> None:
+    def __init__(self, root: zarr.Group, fingerprint: str) -> None:
         self.zw = root
+        self._fingerprint = fingerprint
 
     def _get_assay(self, assay_name: str) -> zarr.Group:
         return self.zw[assay_name]
+
+    def _calculate_dataset_fingerprint(self, _assay_name: str) -> str:
+        return self._fingerprint
 
 
 def _mapping_reference(
@@ -73,7 +77,11 @@ def _mapping_reference(
         root.create_group(ref.assay)
     root[ref.assay].attrs["dataset_fingerprint"] = fingerprint
     reference = object.__new__(MappingReference)
-    object.__setattr__(reference, "datastore", _ReferenceDatastore(root))
+    object.__setattr__(
+        reference,
+        "datastore",
+        _ReferenceDatastore(root, fingerprint),
+    )
     object.__setattr__(reference, "ref", ref)
     object.__setattr__(reference, "assay_name", ref.assay)
     object.__setattr__(reference, "dataset_fingerprint", fingerprint)
@@ -522,12 +530,6 @@ def test_datastore_lineage_validates_reference_fingerprints_and_root_conflicts()
 ):
     query_root = zarr.open_group(store=MemoryStore(), mode="w")
     target = _ref("projection", "3")
-    _write_artifact(
-        query_root,
-        target,
-        operation="map_query",
-        inputs={},
-    )
     datastore = BaseDataStore.__new__(BaseDataStore)
     datastore.z = query_root
     datastore.workspace = None
@@ -538,6 +540,18 @@ def test_datastore_lineage_validates_reference_fingerprints_and_root_conflicts()
     first = _mapping_reference(first_root, reference_ref, "shared-dataset")
     second = _mapping_reference(second_root, reference_ref, "shared-dataset")
     same_root = _mapping_reference(first_root, reference_ref, "shared-dataset")
+    _write_artifact(
+        first_root,
+        reference_ref,
+        operation="build_mapping_reference",
+        inputs={},
+    )
+    _write_artifact(
+        query_root,
+        target,
+        operation="map_query",
+        inputs={"mapping_reference": first.external_ref},
+    )
     datastore.lineage(target, references=(first, same_root))
     with pytest.raises(ValueError, match="conflicting roots"):
         datastore.lineage(target, references=(first, second))
@@ -550,8 +564,5 @@ def test_datastore_lineage_validates_reference_fingerprints_and_root_conflicts()
         datastore.lineage(target, references=first)
 
     del first_root["RNA"].attrs["dataset_fingerprint"]
-    with pytest.raises(
-        ValueError,
-        match="no stored dataset fingerprint.*build_mapping_reference",
-    ):
-        datastore.lineage(target, references=first)
+    lineage = datastore.lineage(target, references=first)
+    assert lineage.graph.nodes[first.external_ref]["status"].complete

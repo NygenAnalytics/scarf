@@ -4,16 +4,13 @@ import numpy as np
 from scipy.sparse import csr_matrix
 
 from ...graph.distances import validate_distance_provenance
-from ...graph.feature_projection import resolve_native_graph_inputs
-from ...graph.state import (
-    read_assay_state,
-    resolve_graph_selection,
+from ...graph.feature_projection import (
+    graph_cell_selection,
+    resolve_coordinate_inputs,
+    resolve_native_graph_inputs,
 )
 from ...metadata.artifacts import (
     artifact_values,
-    column_display,
-    continuous_display,
-    link_cell_data_column,
     plan_cell_data_artifact,
     write_cell_data_artifact,
 )
@@ -26,7 +23,9 @@ from ...storage.artifacts import (
     inspect_artifact,
 )
 from ...storage.types import as_zarr_array, as_zarr_group
+from ...storage.selections import validate_stored_selection_integrity
 from ...utils.logging import logger, progress_enabled
+from ...utils.shutdown import shutdown_checkpoint
 
 if TYPE_CHECKING:
     from .graph import _GraphOperationsMixin as _EmbeddingOperationsBase
@@ -37,8 +36,7 @@ else:
 class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
     def _get_ini_embed(
         self,
-        from_assay: str,
-        cell_key: str,
+        initialization: ArtifactRef,
         graph: ArtifactRef,
         n_comps: int,
     ) -> tuple[np.ndarray, ArtifactRef]:
@@ -48,8 +46,7 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
         `rescale_array` to reduce the magnitude of extreme values.
 
         Args:
-            from_assay: Name fo the assay for which Kmeans was fit.
-            cell_key: Cell key used.
+            initialization: Explicit embedding-initialization artifact.
             graph: Graph whose rows the initialization must match.
             n_comps: Number of PC components to use
 
@@ -58,25 +55,32 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
         """
         from ...embeddings.initialization import initial_embedding
 
-        state = read_assay_state(self.zw, from_assay)
-        if (
-            state is None
-            or not state.matches(cell_key)
-            or state.embedding_initialization is None
-        ):
-            raise KeyError("AssayState has no embedding initialization")
-        initialization = state.embedding_initialization
+        if initialization.kind != "embedding_initialization":
+            raise ValueError("initialization must be an embedding_initialization ref")
+        if initialization.scope != "assay" or initialization.assay is None:
+            raise ValueError("initialization must be an assay-scoped artifact")
         initialization_status = inspect_artifact(self.zw, initialization)
-        if graph.kind == "connectivity_map":
+        if not initialization_status.complete:
+            raise ValueError("Embedding initialization is unavailable or incomplete")
+        if initialization_status.operation != "build_embedding_initialization":
+            raise ValueError("Embedding initialization has an invalid operation")
+        raw_source = (initialization_status.inputs or {}).get("coordinates")
+        if not isinstance(raw_source, dict):
+            raise ValueError("Embedding initialization has no coordinate source")
+        source = ArtifactRef.from_dict(raw_source)
+        if source.assay != initialization.assay:
+            raise ValueError("Embedding initialization source belongs to another assay")
+        source_inputs = resolve_coordinate_inputs(self.zw, source)
+        graph_selection = graph_cell_selection(self.zw, graph)
+        if source_inputs.cell_selection != graph_selection:
+            raise ValueError(
+                "Embedding initialization does not match the graph cell selection"
+            )
+        if graph.kind in {"connectivity_map", "neighbors"}:
             lineage = resolve_native_graph_inputs(self.zw, graph)
-            raw_reduction = (initialization_status.inputs or {}).get("reduction")
-            if (
-                lineage.reduction is None
-                or not isinstance(raw_reduction, dict)
-                or ArtifactRef.from_dict(raw_reduction) != lineage.reduction
-            ):
+            if source != lineage.coordinates:
                 raise ValueError(
-                    "Embedding initialization does not belong to the graph reduction"
+                    "Embedding initialization does not belong to the graph coordinates"
                 )
         kmeans_grp = artifact_group(self.zw, initialization)
         cluster_centers = np.asarray(
@@ -92,13 +96,11 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
 
     def run_tsne(
         self,
-        graph: ArtifactRef | None = None,
+        graph: ArtifactRef,
+        initialization: ArtifactRef | np.ndarray,
         *,
-        from_assay: str | None = None,
-        cell_key: str | None = None,
         symmetric_graph: bool = False,
         graph_upper_only: bool = False,
-        ini_embed: np.ndarray | None = None,
         tsne_dims: int = 2,
         lambda_scale: float = 1.0,
         max_iter: int = 500,
@@ -106,7 +108,6 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
         alpha: int = 10,
         box_h: float = 0.7,
         temp_file_loc: str = ".",
-        label: str = "tSNE",
         verbose: bool = True,
         parallel: bool = False,
         nthreads: int | None = None,
@@ -121,15 +122,10 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
         embedding, check this out: http://t-sne-pi.cs.duke.edu/
 
         Args:
-            graph: Connectivity map or integrated graph to embed. The current
-                   analysis chain of the assay is used when omitted.
-            from_assay: Name of assay to be used. If no value is provided then the default assay will be used.
-            cell_key: Cell key. Should be same as the one that was used in the desired graph. (Default value: 'I')
+            graph: Explicit connectivity map or integrated graph to embed.
+            initialization: Explicit initialization artifact or coordinate array.
             symmetric_graph: This parameter is forwarded to `load_graph` and is same as there. (Default value: False)
             graph_upper_only: This parameter is forwarded to `load_graph` and is same as there. (Default value: False)
-            ini_embed: Initial embedding coordinates for the cells in cell_key. Should have the same number of columns
-                       as tsne_dims. If not value is provided then the initial embedding is obtained using
-                       `get_ini_embed`.
             tsne_dims: Number of tSNE dimensions to compute (Default value: 2)
             lambda_scale: λ rescaling parameter (Default value: 1.0)
             max_iter: Maximum number of iterations (Default value: 500)
@@ -139,7 +135,6 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
                    the algorithm (Default value: 0.7)
             temp_file_loc: Location of temporary file. By default, these files will be created in the current working
                            directory. These files are deleted before the method returns.
-            label: base label for tSNE dimensions in the cell metadata column (Default value: 'tSNE')
             verbose: If True (default) then the full log from SGtSNEpi algorithm is shown.
             parallel: Whether to run tSNE in parallel mode. Setting value to True will use `nthreads` threads.
                       The results are not reproducible in parallel mode. (Default value: False)
@@ -147,40 +142,42 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
                       attribute of the class is used. (Default value: None)
 
         Returns:
-            Reference to the embedding artifact backing the layout columns.
+            Reference to the immutable embedding artifact.
         """
-        selection = resolve_graph_selection(
-            self,
-            graph,
-            from_assay=from_assay,
-            cell_key=cell_key,
+        if not isinstance(graph, ArtifactRef):
+            raise TypeError("graph must be an ArtifactRef")
+        graph_input = graph
+        cell_selection = graph_cell_selection(self.zw, graph_input)
+        validate_stored_selection_integrity(
+            self.zw,
+            cell_selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
         )
-        from_assay = selection.from_assay
-        cell_key = selection.cell_key
-        graph_input = selection.graph_ref
         graph_matrix = self.load_graph(
             graph_input,
-            from_assay=from_assay,
-            cell_key=cell_key,
             symmetric=symmetric_graph,
             upper_only=graph_upper_only,
         )
-        user_initialization = ini_embed is not None
         initialization_input: object
-        if ini_embed is None:
+        if isinstance(initialization, ArtifactRef):
             ini_embed, initialization_input = self._get_ini_embed(
-                from_assay,
-                cell_key,
+                initialization,
                 graph_input,
                 tsne_dims,
             )
+        elif isinstance(initialization, np.ndarray):
+            ini_embed = np.asarray(initialization)
+            initialization_input = {"value_fingerprint": fingerprint_array(ini_embed)}
+        else:
+            raise TypeError("initialization must be an ArtifactRef or numpy array")
         if ini_embed.shape != (graph_matrix.shape[0], tsne_dims):
             raise ValueError(
                 "Initial embedding has an invalid shape; expected "
                 f"{(graph_matrix.shape[0], tsne_dims)}"
             )
-        if user_initialization:
-            initialization_input = {"value_fingerprint": fingerprint_array(ini_embed)}
         if parallel:
             if nthreads is None:
                 nthreads = self.nthreads
@@ -188,14 +185,6 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
                 assert isinstance(nthreads, int)
         else:
             nthreads = 1
-        cell_selection = self._ensure_cell_selection(cell_key)
-        graph_cell_selection = self._graph_cell_selection(graph_input)
-        if not self._selection_artifacts_match(
-            graph_cell_selection,
-            cell_selection,
-        ):
-            raise ValueError("cell_key does not match the graph cell selection")
-        cell_selection = graph_cell_selection
         artifact_scope = graph_input.scope
         arguments = TsneArguments(
             graph=graph_input,
@@ -210,9 +199,6 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
             box_h=box_h,
             parallel=parallel,
             parallel_threads=nthreads,
-            label=label,
-            from_assay=from_assay,
-            cell_key=cell_key,
             temp_file_loc=temp_file_loc,
             verbose=verbose,
             invalidate_cache=invalidate_cache,
@@ -221,13 +207,7 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
         planned = plan_cell_data_artifact(
             self.zw,
             scope=artifact_scope,
-            assay=(
-                graph_input.assay
-                if graph_input.scope == "assay"
-                else from_assay
-                if artifact_scope == "assay"
-                else None
-            ),
+            assay=(graph_input.assay if graph_input.scope == "assay" else None),
             kind=arguments.artifact_kind,
             operation=arguments.operation,
             parameters=record.parameters,
@@ -237,21 +217,8 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
             arrays={"values": ((graph_matrix.shape[0], tsne_dims), "f")},
             invalidate_cache=invalidate_cache,
         )
-        columns = [
-            self._col_renamer(
-                selection.output_assay,
-                cell_key,
-                f"{label}{i + 1}",
-            )
-            for i in range(tsne_dims)
-        ]
-        preserved_displays = [column_display(self.zw, column) for column in columns]
         if planned.reused:
-            artifact_group = as_zarr_group(
-                self.zw[artifact_path(planned.ref)],
-                name=planned.ref.artifact_id,
-            )
-            values = artifact_values(artifact_group, "values")
+            values_count = graph_matrix.shape[0]
         else:
             import sys
 
@@ -262,6 +229,7 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
             from ...embeddings.sgtsne import run_sgtsne
 
             try:
+                shutdown_checkpoint()
                 raw_embedding = np.asarray(
                     run_sgtsne(
                         graph_matrix,
@@ -278,6 +246,7 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
                         nthreads=nthreads,
                     )
                 )
+                shutdown_checkpoint()
             except (FileNotFoundError, ImportError) as exc:
                 raise RuntimeError(
                     "SG-tSNE failed, possibly due to missing sgtsne executable or "
@@ -295,38 +264,20 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
                 planned,
                 {"values": values},
             )
-        for i, column in enumerate(columns):
-            self.cells.insert(
-                column,
-                values[:, i],
-                key=cell_key,
-                overwrite=True,
-            )
-        for i, column in enumerate(columns):
-            link_cell_data_column(
-                self.zw,
-                column,
-                planned.ref,
-                value_name="values",
-                value_index=i,
-                default_display=continuous_display(values[:, i]),
-                preserved_display=preserved_displays[i],
-            )
+            values_count = len(values)
         action = "Reused" if planned.reused else "Stored"
         logger.info(
-            f"{action} {tsne_dims}-dimensional t-SNE embedding for {len(values)} cells"
+            f"{action} {tsne_dims}-dimensional t-SNE embedding for {values_count} cells"
         )
         return planned.ref
 
-    def run_umap(
+    def _run_umap_artifact(
         self,
-        graph: ArtifactRef | None = None,
+        graph: ArtifactRef,
+        initialization: ArtifactRef | np.ndarray,
         *,
-        from_assay: str | None = None,
-        cell_key: str | None = None,
         symmetric_graph: bool | None = False,
         graph_upper_only: bool | None = False,
-        ini_embed: np.ndarray | None = None,
         umap_dims: int = 2,
         spread: float = 2.0,
         min_dist: float = 1,
@@ -339,24 +290,17 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
         dens_frac: float = 0.3,
         dens_var_shift: float = 0.1,
         random_seed: int = 4444,
-        label: str = "UMAP",
         parallel: bool = False,
         nthreads: int | None = None,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
-        """Runs UMAP algorithm using the precomputed cell-neighbourhood graph.
-        The calculated UMAP coordinates are saved in the cell metadata table.
+        """Run UMAP and store only its immutable coordinate artifact.
 
         Args:
-            graph: Connectivity map or integrated graph to embed. The current
-                   analysis chain of the assay is used when omitted.
-            from_assay: Name of assay to be used. If no value is provided then the default assay will be used.
-            cell_key: Cell key. Should be same as the one that was used in the desired graph. (Default value: 'I')
+            graph: Explicit connectivity map or integrated graph to embed.
+            initialization: Explicit initialization artifact or coordinate array.
             symmetric_graph: This parameter is forwarded to `load_graph` and is same as there. (Default value: False)
             graph_upper_only: This parameter is forwarded to `load_graph` and is same as there. (Default value: False)
-            ini_embed: Initial embedding coordinates for the cells in cell_key. Should have the same number of columns
-                       as umap_dims. If not value is provided then the initial embedding is obtained using
-                       `get_ini_embed`.
             umap_dims: Number of dimensions of UMAP embedding (Default value: 2)
             spread: Same as spread in UMAP package.  The effective scale of embedded points. In combination with
                     ``min_dist`` this determines how clustered/clumped the embedded points are.
@@ -382,59 +326,52 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
             dens_frac: Fraction of nearest neighbors used for local density estimation (Default value: 0.3).
             dens_var_shift: Variance shift for density correction (Default value: 0.1).
             random_seed: (Default value: 4444)
-            label: base label for UMAP dimensions in the cell metadata column (Default value: 'UMAP')
             parallel: Whether to run UMAP in parallel mode. Setting value to True will use `nthreads` threads.
                       The results are not reproducible in parallel mode. (Default value: False)
             nthreads: If parallel=True then this number of threads will be used to run UMAP. By default, the `nthreads`
                       attribute of the class is used. (Default value: None)
 
         Returns:
-            Reference to the embedding artifact backing the layout columns.
+            Reference to the immutable embedding artifact.
         """
         from ...embeddings.umap import fit_transform
 
-        selection = resolve_graph_selection(
-            self,
-            graph,
-            from_assay=from_assay,
-            cell_key=cell_key,
+        if not isinstance(graph, ArtifactRef):
+            raise TypeError("graph must be an ArtifactRef")
+        graph_input = graph
+        cell_selection = graph_cell_selection(self.zw, graph_input)
+        validate_stored_selection_integrity(
+            self.zw,
+            cell_selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
         )
-        from_assay = selection.from_assay
-        cell_key = selection.cell_key
-        graph_input = selection.graph_ref
         graph_matrix = self.load_graph(
             graph_input,
-            from_assay=from_assay,
-            cell_key=cell_key,
             symmetric=symmetric_graph,
             upper_only=graph_upper_only,
         )
-        user_initialization = ini_embed is not None
         initialization_input: object
-        if ini_embed is None:
+        if isinstance(initialization, ArtifactRef):
             ini_embed, initialization_input = self._get_ini_embed(
-                from_assay,
-                cell_key,
+                initialization,
                 graph_input,
                 umap_dims,
             )
+        elif isinstance(initialization, np.ndarray):
+            ini_embed = np.asarray(initialization)
+            initialization_input = {"value_fingerprint": fingerprint_array(ini_embed)}
+        else:
+            raise TypeError("initialization must be an ArtifactRef or numpy array")
         if ini_embed.shape != (graph_matrix.shape[0], umap_dims):
             raise ValueError(
                 "Initial embedding has an invalid shape; expected "
                 f"{(graph_matrix.shape[0], umap_dims)}"
             )
-        if user_initialization:
-            initialization_input = {"value_fingerprint": fingerprint_array(ini_embed)}
         if nthreads is None:
             nthreads = self.nthreads
-        cell_selection = self._ensure_cell_selection(cell_key)
-        graph_cell_selection = self._graph_cell_selection(graph_input)
-        if not self._selection_artifacts_match(
-            graph_cell_selection,
-            cell_selection,
-        ):
-            raise ValueError("cell_key does not match the graph cell selection")
-        cell_selection = graph_cell_selection
         effective_density_map = (
             use_density_map and graph_input.kind != "integrated_graph"
         )
@@ -458,22 +395,13 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
             random_seed=random_seed,
             parallel=parallel,
             parallel_threads=nthreads if parallel else None,
-            label=label,
-            from_assay=from_assay,
-            cell_key=cell_key,
             invalidate_cache=invalidate_cache,
         )
         record = arguments.to_record()
         planned = plan_cell_data_artifact(
             self.zw,
             scope=artifact_scope,
-            assay=(
-                graph_input.assay
-                if graph_input.scope == "assay"
-                else from_assay
-                if artifact_scope == "assay"
-                else None
-            ),
+            assay=(graph_input.assay if graph_input.scope == "assay" else None),
             kind=arguments.artifact_kind,
             operation=arguments.operation,
             parameters=record.parameters,
@@ -529,6 +457,7 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
             )
             t = artifact_values(artifact_group, "values")
         else:
+            shutdown_checkpoint()
             t, _a, _b = fit_transform(
                 graph=graph_matrix.tocoo(),
                 ini_embed=ini_embed,
@@ -544,39 +473,61 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
                 nthreads=nthreads,
                 verbose=verbose,
             )
+            shutdown_checkpoint()
             write_cell_data_artifact(
                 self.zw,
                 planned,
                 {"values": t},
             )
 
-        columns = [
-            self._col_renamer(
-                selection.output_assay,
-                cell_key,
-                f"{label}{i + 1}",
-            )
-            for i in range(umap_dims)
-        ]
-        preserved_displays = [column_display(self.zw, column) for column in columns]
-        for i, column in enumerate(columns):
-            self.cells.insert(
-                column,
-                t[:, i],
-                key=cell_key,
-                overwrite=True,
-            )
-            link_cell_data_column(
-                self.zw,
-                column,
-                planned.ref,
-                value_name="values",
-                value_index=i,
-                default_display=continuous_display(t[:, i]),
-                preserved_display=preserved_displays[i],
-            )
         action = "Reused" if planned.reused else "Stored"
         logger.info(
             f"{action} {umap_dims}-dimensional UMAP embedding for {len(t)} cells"
         )
         return planned.ref
+
+    def run_umap(
+        self,
+        graph: ArtifactRef,
+        initialization: ArtifactRef | np.ndarray,
+        *,
+        symmetric_graph: bool | None = False,
+        graph_upper_only: bool | None = False,
+        umap_dims: int = 2,
+        spread: float = 2.0,
+        min_dist: float = 1,
+        n_epochs: int = 300,
+        repulsion_strength: float = 1.0,
+        initial_alpha: float = 1.0,
+        negative_sample_rate: float = 5,
+        use_density_map: bool = False,
+        dens_lambda: float = 2.0,
+        dens_frac: float = 0.3,
+        dens_var_shift: float = 0.1,
+        random_seed: int = 4444,
+        parallel: bool = False,
+        nthreads: int | None = None,
+        invalidate_cache: bool = False,
+    ) -> ArtifactRef:
+        """Build and return an immutable UMAP embedding artifact."""
+        return self._run_umap_artifact(
+            graph,
+            initialization,
+            symmetric_graph=symmetric_graph,
+            graph_upper_only=graph_upper_only,
+            umap_dims=umap_dims,
+            spread=spread,
+            min_dist=min_dist,
+            n_epochs=n_epochs,
+            repulsion_strength=repulsion_strength,
+            initial_alpha=initial_alpha,
+            negative_sample_rate=negative_sample_rate,
+            use_density_map=use_density_map,
+            dens_lambda=dens_lambda,
+            dens_frac=dens_frac,
+            dens_var_shift=dens_var_shift,
+            random_seed=random_seed,
+            parallel=parallel,
+            nthreads=nthreads,
+            invalidate_cache=invalidate_cache,
+        )

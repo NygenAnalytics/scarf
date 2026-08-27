@@ -1,14 +1,27 @@
 import numpy as np
 import pytest
 from scarf.storage.artifacts import ArtifactRef
+from scarf.storage.selections import read_stored_selection_mask
 from scarf.utils import logger
 
 from scarf.quality_control.filtering import (
+    _apply_bounds,
     _mad_bounds,
     _metric_policy,
     _sample_aware_mad_mask,
     gaussian_quantile_bounds,
 )
+
+
+def _selection_mask(datastore, ref: ArtifactRef) -> np.ndarray:
+    return read_stored_selection_mask(
+        datastore.zw,
+        ref,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+    )
 
 
 def test_mad_bounds_matches_hand_computed_example():
@@ -20,6 +33,28 @@ def test_mad_bounds_matches_hand_computed_example():
     assert reported_mad == pytest.approx(scaled_mad)
     assert low == pytest.approx(median - 3.0 * scaled_mad)
     assert high == pytest.approx(median + 3.0 * scaled_mad)
+
+
+def test_apply_bounds_supports_open_and_closed_intervals():
+    values = np.array([-np.inf, 0.0, 1.0, 2.0, np.inf, np.nan])
+
+    np.testing.assert_array_equal(
+        _apply_bounds(values, 0.0, 2.0),
+        [False, False, True, False, False, False],
+    )
+    np.testing.assert_array_equal(
+        _apply_bounds(values, 0.0, 2.0, keep_bounds=True),
+        [False, True, True, True, False, False],
+    )
+    np.testing.assert_array_equal(
+        _apply_bounds(values, None, None, keep_bounds=True),
+        [True, True, True, True, True, False],
+    )
+
+
+def test_apply_bounds_rejects_non_vector_values():
+    with pytest.raises(ValueError, match="one-dimensional"):
+        _apply_bounds(np.ones((2, 2)), 0.0, 2.0)
 
 
 def test_metric_policy_defaults_and_custom_attrs():
@@ -194,12 +229,9 @@ def test_auto_filter_cells_without_sample_column_matches_gaussian(
     }
 
     before = np.asarray(datastore_ephemeral.cells.fetch_all("I"), dtype=bool).copy()
-    datastore_ephemeral.auto_filter_cells(attrs=attrs, show_qc_plots=False)
+    cell_ref = datastore_ephemeral.auto_filter_cells(attrs=attrs)
     after = np.asarray(datastore_ephemeral.cells.fetch_all("I"), dtype=bool)
 
-    cell_ref = ArtifactRef.from_dict(
-        datastore_ephemeral.zw["cellData"]["I"].attrs["source_artifact"]
-    )
     status = datastore_ephemeral.inspect_artifact(cell_ref)
     assert status.operation == "auto_filter_cells"
     assert "sample_column" not in status.parameters
@@ -210,7 +242,9 @@ def test_auto_filter_cells_without_sample_column_matches_gaussian(
         }
         for attr in attrs
     }
-    assert after.sum() < before.sum()
+    filtered = _selection_mask(datastore_ephemeral, cell_ref)
+    assert filtered.sum() < before.sum()
+    np.testing.assert_array_equal(after, before)
 
 
 def test_auto_filter_cells_sample_column_raises_on_conflicts(
@@ -228,14 +262,12 @@ def test_auto_filter_cells_sample_column_raises_on_conflicts(
             attrs=["RNA_nCounts"],
             sample_column="sample_id",
             min_p=0.05,
-            show_qc_plots=False,
         )
 
     with pytest.raises(ValueError, match="not found"):
         datastore_ephemeral.auto_filter_cells(
             attrs=["RNA_nCounts"],
             sample_column="missing_sample",
-            show_qc_plots=False,
         )
 
 
@@ -261,7 +293,6 @@ def test_auto_filter_cells_rejects_nonfinite_n_mads_without_mutating_selection(
             sample_column="sample_id",
             n_mads=n_mads,
             min_cells_per_sample=2,
-            show_qc_plots=False,
         )
 
     np.testing.assert_array_equal(
@@ -289,7 +320,6 @@ def test_auto_filter_cells_rejects_overflowing_finite_n_mads_without_mutation(
             sample_column="sample_id",
             n_mads=np.finfo(float).max,
             min_cells_per_sample=2,
-            show_qc_plots=False,
         )
 
     np.testing.assert_array_equal(selection[:], selection_before)
@@ -333,7 +363,6 @@ def test_auto_filter_cells_validates_provenance_before_selection_mutation(
             attrs=["RNA_nCounts"],
             sample_column="sample_id",
             min_cells_per_sample=2,
-            show_qc_plots=False,
         )
 
     np.testing.assert_array_equal(selection[:], selection_before)
@@ -364,7 +393,6 @@ def test_auto_filter_cells_rejects_negative_counts_without_selection_mutation(
             attrs=[attr],
             sample_column="sample_id",
             min_cells_per_sample=2,
-            show_qc_plots=False,
         )
 
     np.testing.assert_array_equal(
@@ -385,7 +413,6 @@ def test_auto_filter_cells_sample_column_raises_on_missing_and_nonfinite(
         datastore_ephemeral.auto_filter_cells(
             attrs=["RNA_nCounts"],
             sample_column="sample_id",
-            show_qc_plots=False,
             min_cells_per_sample=2,
         )
 
@@ -401,7 +428,6 @@ def test_auto_filter_cells_sample_column_raises_on_missing_and_nonfinite(
         datastore_ephemeral.auto_filter_cells(
             attrs=["RNA_nCounts"],
             sample_column="sample_id",
-            show_qc_plots=False,
             min_cells_per_sample=2,
         )
 
@@ -415,7 +441,7 @@ def test_auto_filter_cells_sample_column_records_provenance(
     labels = np.array(["A"] * (n - 5) + ["tiny"] * 5)
     datastore_ephemeral.cells.insert("sample_id", labels, overwrite=True)
     active = np.asarray(datastore_ephemeral.cells.fetch_all("I"), dtype=bool)
-    prior_selection = datastore_ephemeral._ensure_cell_selection("I")
+    prior_selection = datastore_ephemeral.snapshot_cell_selection("I")
     expected_sample_fingerprint = fingerprint_strings(labels[active])
     expected_metric_fingerprints = {
         attr: fingerprint_array(
@@ -430,19 +456,16 @@ def test_auto_filter_cells_sample_column_records_provenance(
         level="WARNING",
     )
     try:
-        datastore_ephemeral.auto_filter_cells(
+        cell_ref = datastore_ephemeral.auto_filter_cells(
             attrs=["RNA_nCounts", "RNA_percentMito"],
+            cell_selection=prior_selection,
             sample_column="sample_id",
             n_mads=3.0,
             min_cells_per_sample=20,
-            show_qc_plots=False,
         )
     finally:
         logger.remove(sink)
 
-    cell_ref = ArtifactRef.from_dict(
-        datastore_ephemeral.zw["cellData"]["I"].attrs["source_artifact"]
-    )
     status = datastore_ephemeral.inspect_artifact(cell_ref)
     assert status.operation == "auto_filter_cells"
     assert status.parameters["sample_column"] == "sample_id"
@@ -469,30 +492,32 @@ def test_pipeline_passes_sample_column_through(datastore_ephemeral):
         np.array(["A"] * (n // 2) + ["B"] * (n - n // 2)),
         overwrite=True,
     )
-    artifacts = datastore_ephemeral.pipeline.run(
-        pipeline_id="basic_rna_analysis",
+    run = datastore_ephemeral.pipeline.run(
         filtering={
             "sample_column": "sample_id",
             "n_mads": 3.0,
             "min_cells_per_sample": 20,
             "attrs": ["RNA_nCounts"],
         },
-        cell_cycle_scoring=False,
-        highly_variable_features={
-            "top_n": 50,
-            "label": "mad_pipeline_hvgs",
-        },
-        pca={"dims": 5, "n_centroids": 10},
-        ann_index={"ann_m": 16},
-        neighbors={"k": 3},
-        connectivity={},
+        cell_cycle=False,
+        hvg_count=50,
+        pca_dims=5,
+        neighbors_k=3,
         umap=False,
-        leiden={},
+        leiden=False,
         paris=False,
-        doublet_scoring=False,
+        doublets=False,
         markers=False,
     )
-    status = datastore_ephemeral.inspect_artifact(artifacts["cell_selection"])
-    assert status.operation == "auto_filter_cells"
-    assert status.parameters["sample_column"] == "sample_id"
-    assert status.parameters["n_mads"] == 3.0
+    status = datastore_ephemeral.inspect_artifact(run["analysis_cell_selection"])
+    assert status.operation == "filter_pipeline_cells"
+    assert status.parameters["sampleColumn"] == "sample_id"
+    assert status.parameters["nMads"] == 3.0
+    assert status.parameters["minCellsPerSample"] == 20
+    assert status.inputs is not None
+    assert set(status.inputs) == {
+        "cell_snapshot",
+        "input_cell_selection",
+        "ordered_row_ids_fingerprint",
+        "values_fingerprint",
+    }

@@ -19,6 +19,12 @@ kernelspec:
 Use `ds.plots` for plots backed by a `DataStore`.
 The same store-first functions remain available from `scarf.plotting`, which also provides reusable contracts such as color and normalization scales.
 
+Fresh granular analyses pass exact refs, for example
+`ds.plots.embedding(layout=umap_ref, color_by=cluster_ref)`. A completed run uses
+`ds.plots.embedding(run=run, layout="umap", color_by="clusters")`. The `layout_key` and `group_by`
+string forms below intentionally read literal metadata from the prepared teaching dataset; they do
+not select an artifact by name.
+
 ## Prerequisites
 
 - Scarf installed with the `extra` optional dependencies
@@ -110,6 +116,7 @@ figure
 
 For large datasets, `ds.plots.embedding_raster` builds a pixel image from continuous cell metadata without loading full columns into memory.
 Empty pixels are white by default.
+Set `ColorScale.missing_color` to change that color; the `missing_color` argument is an explicit override.
 It does not color by gene; use `ds.plots.embedding` for that.
 Side by side with a vector scatter on the same column, the raster fills space as pixels instead of overlapping markers.
 
@@ -507,7 +514,9 @@ Workflow chapters call a few standalone diagnostics:
 - `DataStore.run_pca(..., show_elbow_plot=True)` plots PCA explained variance
 
 - `scarf.plotting.graph_qc(graph)` plots degree and edge-weight distributions for a sparse graph from `load_graph`
-- `mark_hvgs(..., show_plot=True)` or `scarf.plotting.highly_variable_features` shows the mean-variance relationship used for HVG selection
+- `select_hvgs(...)` returns a feature-selection artifact;
+  `scarf.plotting.highly_variable_features` shows the mean-variance relationship used for HVG
+  selection
 
 `marker_heatmap` chooses each group's top features by stored marker `score`, with feature name as a deterministic tie-breaker.
 Adjusted p-values support interpretation but do not control top-N selection.

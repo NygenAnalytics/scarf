@@ -65,7 +65,7 @@ ds = scarf.DataStore(
 ```
 
 Read the stored shapes instead of loading a complete matrix.
-The ATAC count array retains all 240,122 peaks, while the analysis chain selects 25,000 peaks for reduction.
+The ATAC count array retains all 240,122 peaks, while the stored reduction lineage selects 25,000 peaks.
 
 ```{code-cell} ipython3
 assay_inventory = []
@@ -158,7 +158,6 @@ for assay in ("RNA", "ATAC", "ADT"):
                     "kind": kind,
                     "operation": status.operation,
                     "artifact": ref.artifact_id[:12],
-                    "label": None,
                     "method": None,
                     "dims": parameters.get("dims"),
                     "k": parameters.get("k"),
@@ -172,7 +171,6 @@ for ref in ds.list_artifacts(
     complete_only=True,
 ):
     status = ds.inspect_artifact(ref)
-    options = status.execution_options or {}
     parameters = status.parameters or {}
     artifact_rows.append(
         {
@@ -180,7 +178,6 @@ for ref in ds.list_artifacts(
             "kind": ref.kind,
             "operation": status.operation,
             "artifact": ref.artifact_id[:12],
-            "label": options.get("label"),
             "method": parameters.get("method"),
             "dims": None,
             "k": None,
@@ -249,7 +246,8 @@ snn_markers.figure.set_size_inches(10, 8)
 ## 4. Inspect the three-way WNN graph
 
 The prepared WNN result has an immutable artifact reference and records its assays in order.
-New calls to `integrate_assays` pair each `source_i` neighbour artifact with the exact native coordinate artifact it names, capture every source before planning, and never search for a latest graph or decode a storage path. This prepared download predates that final input schema and retains legacy analysis state, so it is inspected as a historical result rather than used as input to a new computation.
+`integrate_assays` consumes exact neighbour artifacts, whose lineage includes their native
+coordinate artifacts, and captures every source before planning.
 
 ```{code-cell} ipython3
 assays = ["RNA", "ATAC", "ADT"]
@@ -260,8 +258,7 @@ wnn_ref = next(
         kind="integrated_graph",
         complete_only=True,
     )
-    if (ds.inspect_artifact(ref).execution_options or {}).get("label")
-    == "RNA+ATAC+ADT_wnn"
+    if (ds.inspect_artifact(ref).parameters or {}).get("method") == "wnn"
 )
 wnn_status = ds.inspect_artifact(wnn_ref)
 
@@ -272,20 +269,15 @@ pd.Series(
         "artifact id": wnn_ref.artifact_id,
         "complete": wnn_status.complete,
         "ordered assays": ", ".join(wnn_status.parameters["assays"]),
-        "historical input roles": ", ".join(sorted(wnn_status.inputs)),
+        "input roles": ", ".join(sorted(wnn_status.inputs)),
     }
 )
 ```
 
-The artifact publishes its modality weights as cell metadata in the same order as the input assays.
+The artifact stores its modality weights in the same order as the input assays.
 
 ```{code-cell} ipython3
-weight_columns = [
-    f"RNA+ATAC+ADT_wnn_{assay}_weight" for assay in assays
-]
-weight_values = np.column_stack(
-    [ds.cells.fetch(column, key="I") for column in weight_columns]
-)
+weight_values = np.asarray(ds.load_artifact(wnn_ref)["modality_weights"][:])
 
 assert weight_values.shape == (6_194, 3)
 assert np.isfinite(weight_values).all()
@@ -323,21 +315,26 @@ weight_frame.groupby("tea_cell_type")[
 Plotting all three weights on the integrated layout shows where the graph relies more strongly on each local neighbourhood.
 
 ```{code-cell} ipython3
-wnn_view = ds.plots.embedding(
-    layout_key="RNA+ATAC+ADT_wnn_UMAP",
-    color_by=["tea_cell_type", *weight_columns],
-    n_columns=2,
-    point_size=5,
-    show_titles=False,
-    show=False,
+wnn_layout = ds.cells.to_pandas_dataframe(
+    ["RNA+ATAC+ADT_wnn_UMAP1", "RNA+ATAC+ADT_wnn_UMAP2"],
+    key="I",
 )
-for axis, title in zip(
-    wnn_view.axes.values(),
-    ("Cell type", "RNA weight", "ATAC weight", "ADT weight"),
+figure, axes = plt.subplots(1, 3, figsize=(12, 4))
+for axis, values, title in zip(
+    axes,
+    weight_values.T,
+    ("RNA weight", "ATAC weight", "ADT weight"),
     strict=True,
 ):
+    points = axis.scatter(
+        wnn_layout["RNA+ATAC+ADT_wnn_UMAP1"],
+        wnn_layout["RNA+ATAC+ADT_wnn_UMAP2"],
+        c=values,
+        s=5,
+    )
     axis.set_title(title)
-wnn_view.figure.set_size_inches(10, 8)
+    figure.colorbar(points, ax=axis)
+figure.tight_layout()
 ```
 
 Place the three-way SNN and WNN layouts side by side under the same cell-type colouring.

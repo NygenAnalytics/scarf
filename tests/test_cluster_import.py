@@ -16,7 +16,7 @@ def _active() -> np.ndarray:
 
 
 def _labels() -> np.ndarray:
-    return np.array(["a", "b", "a", "a"], dtype=object)
+    return np.array(["a", "b", "a"], dtype=object)
 
 
 def test_cluster_import_accepts_matching_identity() -> None:
@@ -79,7 +79,7 @@ def test_cluster_import_rejects_mismatched_masks() -> None:
 
 
 def test_cluster_import_rejects_one_group() -> None:
-    labels = np.array(["a", "a", "a", "a"], dtype=object)
+    labels = np.array(["a", "a", "a"], dtype=object)
     with pytest.raises(ValueError, match="at least two groups"):
         validate_cluster_source_identity(
             sourceIds=_ids(),
@@ -93,24 +93,24 @@ def test_cluster_import_rejects_one_group() -> None:
 def test_validate_experiment_checks_pca_and_marker_branches_separately() -> None:
     validate_experiment_branches(
         pcaComplete=True,
-        importedColumnPresent=True,
+        importedClusterComplete=True,
         markerComplete=True,
     )
     with pytest.raises(ValueError, match="PCA branch"):
         validate_experiment_branches(
             pcaComplete=False,
-            importedColumnPresent=True,
+            importedClusterComplete=True,
             markerComplete=True,
         )
-    with pytest.raises(ValueError, match="imported cluster column"):
+    with pytest.raises(ValueError, match="imported cluster artifact"):
         validate_experiment_branches(
             pcaComplete=True,
-            importedColumnPresent=False,
+            importedClusterComplete=False,
             markerComplete=True,
         )
     with pytest.raises(ValueError, match="marker_table"):
         validate_experiment_branches(
             pcaComplete=True,
-            importedColumnPresent=True,
+            importedClusterComplete=True,
             markerComplete=False,
         )

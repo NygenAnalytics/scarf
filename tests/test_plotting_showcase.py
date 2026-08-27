@@ -65,21 +65,51 @@ def test_showcase_generator_has_offline_fixture_cli():
     assert "--output-dir" in completed.stdout
 
 
+def test_showcase_keeps_analysis_outputs_as_artifacts():
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "generate_plotting_showcase.py"
+    )
+    source = script.read_text(encoding="utf-8")
+
+    assert ".cells.insert(" not in source
+    assert ".cells.update_key(" not in source
+    assert "layout_key=" not in source
+
+
 @pytest.mark.slow
-def test_generate_requested_showcase_artifacts(
+def test_generate_showcase_artifacts(
     datastore_zarr_root,
     tmp_path,
 ):
     requested = os.environ.get("SCARF_SHOWCASE_OUTPUT_DIR")
-    if requested is None:
-        pytest.skip("Set SCARF_SHOWCASE_OUTPUT_DIR to regenerate review figures")
+    output_directory = (
+        Path(requested) if requested is not None else tmp_path / "showcase_outputs"
+    )
     module = _load_showcase_module()
-    store = _prepare_isolated_store(
+    store, artifacts = _prepare_isolated_store(
         module,
         datastore_zarr_root,
         tmp_path,
     )
-    outputs = module.generate_showcase(store, Path(requested))
+    assert {
+        "RNA_G2M_score",
+        "RNA_S_score",
+        "RNA_UMAP1",
+        "RNA_UMAP2",
+        "RNA_cell_cycle_phase",
+        "RNA_leiden_cluster",
+    }.isdisjoint(store.cells.columns)
+    outputs = module.generate_showcase(
+        store,
+        output_directory,
+        layout=artifacts["layout"],
+        graph=artifacts["graph"],
+        clusters=artifacts["clusters"],
+        cell_cycle=artifacts["cell_cycle"],
+        features=artifacts["features"],
+    )
 
     assert {path.name for path in outputs} == _EXPECTED_OUTPUTS
     assert all(path.exists() and path.stat().st_size > 0 for path in outputs)
@@ -96,13 +126,21 @@ def test_showcase_matches_visual_references(
     from matplotlib.testing.compare import compare_images
 
     module = _load_showcase_module()
-    store = _prepare_isolated_store(
+    store, artifacts = _prepare_isolated_store(
         module,
         datastore_zarr_root,
         tmp_path,
     )
     output_directory = tmp_path / "showcase_outputs"
-    outputs = module.generate_showcase(store, output_directory)
+    outputs = module.generate_showcase(
+        store,
+        output_directory,
+        layout=artifacts["layout"],
+        graph=artifacts["graph"],
+        clusters=artifacts["clusters"],
+        cell_cycle=artifacts["cell_cycle"],
+        features=artifacts["features"],
+    )
     assert {path.name for path in outputs} == _EXPECTED_OUTPUTS
     reference_dir = Path(__file__).parent / "visual" / "showcase"
     expected_pngs = {

@@ -15,7 +15,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from scarf import configure_output
+from scarf import ArtifactRef, configure_output
 
 from profiling.config import StageResources, WorkflowParameters
 from profiling.stages import _open_datastore
@@ -60,17 +60,27 @@ def run_leiden_worker(requestPath: Path) -> None:
             flush=True,
         )
         operation_started = time.perf_counter()
+        raw_inputs = request.get("inputs")
+        if not isinstance(raw_inputs, dict) or not isinstance(
+            raw_inputs.get("graph"), dict
+        ):
+            raise ValueError("Leiden worker requires an explicit graph artifact")
+        graph = ArtifactRef.from_dict(raw_inputs["graph"])
+        if (
+            graph.scope != "assay"
+            or graph.assay != workflow.assayName
+            or graph.kind != "connectivity_map"
+        ):
+            raise ValueError("Leiden worker graph artifact is incompatible")
         arguments: dict[str, Any] = {
-            "from_assay": workflow.assayName,
-            "cell_key": workflow.cellKey,
             "resolution": workflow.leidenResolution,
             "backend": workflow.leidenBackend,
-            "label": workflow.leidenLabel,
             "random_seed": workflow.leidenSeed,
         }
         if request.get("invalidateCache") is True:
             arguments["invalidate_cache"] = True
-        store.run_leiden_clustering(
+        clusters = store.run_leiden_clustering(
+            graph,
             **arguments,
         )
         operation_seconds = time.perf_counter() - operation_started
@@ -101,6 +111,7 @@ def run_leiden_worker(requestPath: Path) -> None:
         {
             "status": "ok",
             "error": None,
+            "artifact": clusters.to_dict(),
             "inputSetupSeconds": input_setup_seconds,
             "operationSeconds": operation_seconds,
             "wholeWorkerSeconds": time.perf_counter() - worker_started,

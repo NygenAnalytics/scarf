@@ -10,15 +10,12 @@ import scarf.datastore._operations.mapping as mapping_operations
 import scarf.mapping.projection as projection_storage
 from scarf.datastore.datastore import DataStore
 from scarf.mapping.confidence import conformal_prediction_sets, distance_weights
-from scarf.mapping.models import MappingResult
 from scarf.mapping.projection import (
     NO_QUERY_BATCH_FINGERPRINT,
     ProjectionWriter,
-    load_projection,
     plan_projection,
 )
 from scarf.metadata.artifacts import (
-    link_cell_data_column,
     plan_cell_data_artifact,
     write_cell_data_artifact,
 )
@@ -30,7 +27,10 @@ from scarf.storage.artifact_writer import (
 from scarf.storage.artifacts import (
     ArtifactRef,
 )
-from scarf.storage.selections import resolve_selection_artifact
+from scarf.storage.selections import (
+    read_stored_selection_indices,
+    resolve_selection_artifact,
+)
 from scarf.storage.types import as_zarr_array as checked_zarr_array
 
 
@@ -65,10 +65,18 @@ def _record_projection_reads(monkeypatch, reads: list[tuple[str, object]]) -> No
 
 
 def _plain_reference(datastore):
-    state = datastore.get_assay_state("RNA")
-    assert state is not None
-    assert state.neighbors is not None
-    return datastore.build_mapping_reference(state.neighbors)
+    graphs = datastore.list_artifacts(
+        kind="connectivity_map",
+        from_assay="RNA",
+        scope="assay",
+        complete_only=True,
+    )
+    assert len(graphs) == 1
+    neighbors = ArtifactRef.from_dict(
+        datastore.inspect_artifact(graphs[0]).inputs["neighbors"]
+    )
+    reference_ref = datastore.build_mapping_reference(neighbors)
+    return datastore.get_mapping_reference(reference_ref)
 
 
 def _copied_query(datastore, path: Path, *, zarr_mode: str = "r+") -> DataStore:
@@ -93,13 +101,12 @@ def _write_projection(
     query,
     reference,
     *,
-    mapping_name: str,
     indices: np.ndarray,
     distances: np.ndarray,
     uninformative: np.ndarray,
     cell_key: str = "mapping_cells",
     feature_coverage: float = 0.75,
-) -> MappingResult:
+) -> ArtifactRef:
     index_values = np.asarray(indices, dtype=np.uint64)
     distance_values = np.asarray(distances, dtype=np.float64)
     uninformative_values = np.asarray(uninformative, dtype=bool)
@@ -126,7 +133,6 @@ def _write_projection(
     planned = plan_projection(
         query.zw,
         query_assay="RNA",
-        mapping_name=mapping_name,
         n_cells=n_cells,
         save_k=index_values.shape[1],
         missing_feature_policy="reference_mean",
@@ -158,66 +164,66 @@ def _write_projection(
             "queryScaledDispersion": 1.0,
         }
     )
-    return load_projection(query.zw, ref, reference=reference)
+    return ref
 
 
 def _write_reference_labels(reference, name: str = "reference_labels") -> np.ndarray:
     labels = np.full(reference.selected_cell_count, "other", dtype=object)
     labels[:2] = ["winner", "runner_up"]
-    reference.datastore.cells.insert(
-        name,
-        labels,
-        key=reference.cell_key,
-        overwrite=True,
-    )
+    _write_reference_column(reference, name, labels)
     return labels
+
+
+def _reference_cell_indices(reference) -> np.ndarray:
+    return read_stored_selection_indices(
+        reference.datastore.zw,
+        reference.cell_selection,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+    )
+
+
+def _write_reference_column(reference, name: str, values: np.ndarray) -> None:
+    compact = np.asarray(values)
+    indices = _reference_cell_indices(reference)
+    if compact.ndim != 1 or len(compact) != len(indices):
+        raise ValueError("Reference metadata must have one value per selected cell")
+    full = np.empty(reference.datastore.cells.N, dtype=compact.dtype)
+    if compact.dtype.kind in {"O", "S", "U"}:
+        full[:] = ""
+    else:
+        full[:] = 0
+    full[indices] = compact
+    reference.datastore.cells.insert(name, full, overwrite=True)
 
 
 def _write_reference_layout(
     reference,
     *,
-    layout_key: str,
-    linked: bool,
-) -> tuple[np.ndarray, ArtifactRef | None]:
+    name: str,
+) -> tuple[np.ndarray, ArtifactRef]:
     first = np.arange(reference.selected_cell_count, dtype=np.float64) * 10
     layout = np.column_stack((first, first + 10))
-    source_ref = None
-    if linked:
-        planned = plan_cell_data_artifact(
-            reference.datastore.zw,
-            scope="assay",
-            assay=reference.assay_name,
-            kind="embedding",
-            operation="manual_reference_embedding",
-            parameters={"layout_key": layout_key},
-            inputs={},
-            execution_options={},
-            cell_selection=reference.cell_selection,
-            arrays={"values": (layout.shape, "f")},
-        )
-        write_cell_data_artifact(
-            reference.datastore.zw,
-            planned,
-            {"values": layout},
-        )
-        source_ref = planned.ref
-    for dimension in range(2):
-        column = f"{layout_key}{dimension + 1}"
-        reference.datastore.cells.insert(
-            column,
-            layout[:, dimension],
-            key=reference.cell_key,
-            overwrite=True,
-        )
-        if source_ref is not None:
-            link_cell_data_column(
-                reference.datastore.zw,
-                column,
-                source_ref,
-                value_name="values",
-                value_index=dimension,
-            )
-    return layout, source_ref
+    planned = plan_cell_data_artifact(
+        reference.datastore.zw,
+        scope="assay",
+        assay=reference.assay_name,
+        kind="embedding",
+        operation="manual_reference_embedding",
+        parameters={"name": name},
+        inputs={},
+        execution_options={},
+        cell_selection=reference.cell_selection,
+        arrays={"values": (layout.shape, "f")},
+    )
+    write_cell_data_artifact(
+        reference.datastore.zw,
+        planned,
+        {"values": layout},
+    )
+    return layout, planned.ref
 
 
 @pytest.fixture
@@ -228,40 +234,47 @@ def mapping_consumer_context(analyzed_datastore_ephemeral, tmp_path):
     return reference_store, reference, query
 
 
-def test_mapping_result_resolves_all_handles_and_rejects_reference_ambiguity(
+def test_mapping_result_requires_explicit_ref_and_reference_after_cold_reopen(
     mapping_consumer_context,
 ):
-    _, reference, query = mapping_consumer_context
+    reference_store, reference, query = mapping_consumer_context
     result = _write_projection(
         query,
         reference,
-        mapping_name="atlas",
         indices=np.array([[0, 1], [1, 0]]),
         distances=np.array([[1.0, 9.0], [9.0, 1.0]]),
         uninformative=np.array([False, False]),
     )
 
-    by_session = query.get_mapping_result(result, load_arrays=True)
-    by_ref = query.get_mapping_result(result.ref, reference=reference)
-    by_name = query.get_mapping_result(
-        "atlas",
-        reference=reference,
-        query_assay="RNA",
+    reopened_reference_store = DataStore(
+        reference_store.zarr_loc,
+        default_assay="RNA",
+        zarr_mode="r",
+    )
+    reopened_reference = reopened_reference_store.get_mapping_reference(reference.ref)
+    reopened_query = DataStore(
+        query.zarr_loc,
+        default_assay="RNA",
+        zarr_mode="r",
+    )
+    loaded = reopened_query.get_mapping_result(
+        result,
+        reference=reopened_reference,
+        load_arrays=True,
     )
 
-    assert by_session.ref == by_ref.ref == by_name.ref == result.ref
-    assert by_session.reference is reference
-    assert by_session.indices is not None
-    with pytest.raises(ValueError, match="MappingReference is required"):
-        query.get_mapping_result(result.ref)
-    with pytest.raises(ValueError, match="MappingReference is required"):
-        query.get_mapping_result("atlas")
-    with pytest.raises(ValueError, match="only valid when result is a string"):
+    assert loaded.ref == result
+    assert loaded.reference is reopened_reference
+    assert loaded.indices is not None
+    with pytest.raises(TypeError, match="required keyword-only.*reference"):
+        query.get_mapping_result(result)
+    with pytest.raises(TypeError, match="result must be an ArtifactRef"):
         query.get_mapping_result(
-            result.ref,
+            "atlas",
             reference=reference,
-            query_assay="RNA",
         )
+    with pytest.raises(TypeError, match="result must be an ArtifactRef"):
+        query.get_mapping_result(loaded, reference=reference)
 
     mismatched = replace(
         reference,
@@ -272,7 +285,7 @@ def test_mapping_result_resolves_all_handles_and_rejects_reference_ambiguity(
             artifact_id="0" * 64,
         ),
     )
-    with pytest.raises(ValueError, match="does not match.*reference handle"):
+    with pytest.raises(ValueError, match="does not match the projection input"):
         query.get_mapping_result(result, reference=mismatched)
 
 
@@ -283,7 +296,6 @@ def test_mapping_scores_exclude_uninformative_rows_and_preserve_groups(
     result = _write_projection(
         query,
         reference,
-        mapping_name="scores",
         indices=np.array([[0, 1], [0, 1], [1, 2], [2, 3]]),
         distances=np.array([[1.0, 9.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]]),
         uninformative=np.array([False, True, True, True]),
@@ -294,13 +306,14 @@ def test_mapping_scores_exclude_uninformative_rows_and_preserve_groups(
         query.get_mapping_score(
             result,
             target_groups=groups,
+            reference=reference,
             log_transform=False,
             multiplier=1.0,
         )
     )
     unweighted = list(
         query.get_mapping_score(
-            result.ref,
+            result,
             target_groups=groups,
             reference=reference,
             log_transform=False,
@@ -322,11 +335,17 @@ def test_mapping_scores_exclude_uninformative_rows_and_preserve_groups(
     np.testing.assert_array_equal(unweighted[1][1], 0.0)
 
     with pytest.raises(ValueError, match="one value per projected query cell"):
-        list(query.get_mapping_score(result, target_groups=np.array(["short"])))
+        list(
+            query.get_mapping_score(
+                result,
+                target_groups=np.array(["short"]),
+                reference=reference,
+            )
+        )
     with pytest.raises(ValueError, match="fixed_weight"):
-        list(query.get_mapping_score(result, fixed_weight=0.0))
+        list(query.get_mapping_score(result, reference=reference, fixed_weight=0.0))
     with pytest.raises(TypeError, match="weighted"):
-        list(query.get_mapping_score(result, weighted=1))
+        list(query.get_mapping_score(result, reference=reference, weighted=1))
 
 
 def test_mapping_scores_keep_missing_target_groups_distinct(
@@ -336,7 +355,6 @@ def test_mapping_scores_keep_missing_target_groups_distinct(
     result = _write_projection(
         query,
         reference,
-        mapping_name="missing_groups",
         indices=np.array([[0, 1], [2, 0], [1, 2]]),
         distances=np.ones((3, 2)),
         uninformative=np.zeros(3, dtype=bool),
@@ -350,6 +368,7 @@ def test_mapping_scores_keep_missing_target_groups_distinct(
         query.get_mapping_score(
             result,
             target_groups=np.asarray(groups),
+            reference=reference,
             log_transform=False,
             multiplier=1.0,
             weighted=False,
@@ -374,7 +393,6 @@ def test_labels_and_evidence_abstain_without_fabricating_metrics(
     result = _write_projection(
         query,
         reference,
-        mapping_name="labels",
         indices=np.array([[0, 1], [0, 1], [1, 0]]),
         distances=np.array([[1.0, 9.0], [1.0, 9.0], [1.0, 9.0]]),
         uninformative=np.array([False, True, False]),
@@ -384,10 +402,11 @@ def test_labels_and_evidence_abstain_without_fabricating_metrics(
     labels = query.get_target_classes(
         result,
         reference_class_group="reference_labels",
+        reference=reference,
         threshold_fraction=0.75,
     )
     evidence = query.get_target_label_evidence(
-        result.ref,
+        result,
         reference=reference,
         reference_class_group="reference_labels",
         threshold_fraction=0.75,
@@ -421,7 +440,6 @@ def test_label_transfer_handles_ties_thresholds_distance_and_subsets(
     result = _write_projection(
         query,
         reference,
-        mapping_name="label_edges",
         indices=np.array([[0, 1], [0, 1], [1, 0]]),
         distances=np.array([[1.0, 1.0], [0.0, 4.0], [1.0, 3.0]]),
         uninformative=np.zeros(3, dtype=bool),
@@ -430,22 +448,26 @@ def test_label_transfer_handles_ties_thresholds_distance_and_subsets(
     labels = query.get_target_classes(
         result,
         reference_class_group="reference_labels",
+        reference=reference,
         threshold_fraction=0.75,
     )
     subset = query.get_target_classes(
         result,
         reference_class_group="reference_labels",
+        reference=reference,
         threshold_fraction=0.75,
         target_subset=[2],
     )
     empty = query.get_target_classes(
         result,
         reference_class_group="reference_labels",
+        reference=reference,
         target_subset=[],
     )
     evidence = query.get_target_label_evidence(
         result,
         reference_class_group="reference_labels",
+        reference=reference,
         threshold_fraction=0.75,
         max_distance=0.5,
     )
@@ -466,26 +488,34 @@ def test_label_transfer_handles_ties_thresholds_distance_and_subsets(
         query.get_target_classes(
             result,
             reference_class_group="reference_labels",
+            reference=reference,
             target_subset=(0,),  # type: ignore[arg-type]
         )
     with pytest.raises(TypeError, match="entries must be integers"):
         query.get_target_classes(
             result,
             reference_class_group="reference_labels",
+            reference=reference,
             target_subset=[True],
         )
     with pytest.raises(ValueError, match="out-of-range"):
         query.get_target_classes(
             result,
             reference_class_group="reference_labels",
-            target_subset=[result.n_cells],
+            reference=reference,
+            target_subset=[3],
         )
     with pytest.raises(TypeError, match="reference_class_group"):
-        query.get_target_classes(result, reference_class_group="")
+        query.get_target_classes(
+            result,
+            reference_class_group="",
+            reference=reference,
+        )
     with pytest.raises(TypeError, match="na_val"):
         query.get_target_label_evidence(
             result,
             reference_class_group="reference_labels",
+            reference=reference,
             na_val=None,  # type: ignore[arg-type]
         )
 
@@ -557,7 +587,6 @@ def test_mapping_consumers_stream_projection_arrays(
     result = _write_projection(
         query,
         reference,
-        mapping_name="streaming",
         indices=np.array([[0, 1], [0, 1], [1, 0], [1, 0]]),
         distances=np.array([[1.0, 9.0], [2.0, 3.0], [1.0, 9.0], [4.0, 5.0]]),
         uninformative=np.array([False, True, False, False]),
@@ -566,14 +595,16 @@ def test_mapping_consumers_stream_projection_arrays(
     _record_projection_reads(monkeypatch, reads)
 
     consumers = (
-        lambda: list(query.get_mapping_score(result)),
+        lambda: list(query.get_mapping_score(result, reference=reference)),
         lambda: query.get_target_classes(
             result,
             reference_class_group="reference_labels",
+            reference=reference,
         ),
         lambda: query.get_target_label_evidence(
             result,
             reference_class_group="reference_labels",
+            reference=reference,
         ),
     )
     for consume in consumers:
@@ -600,7 +631,6 @@ def test_label_scores_are_allocated_only_for_conformal_evidence(
     result = _write_projection(
         query,
         reference,
-        mapping_name="conformal_allocation",
         indices=np.array([[0, 1], [1, 0]]),
         distances=np.array([[1.0, 9.0], [1.0, 9.0]]),
         uninformative=np.array([False, False]),
@@ -616,11 +646,12 @@ def test_label_scores_are_allocated_only_for_conformal_evidence(
             return np.zeros(shape, *args, **kwargs)
 
     monkeypatch.setattr(mapping_operations, "np", _NumpyProxy())
-    score_shape = (result.n_cells, len(pd.unique(labels)))
+    score_shape = (2, len(pd.unique(labels)))
 
     query.get_target_label_evidence(
         result,
         reference_class_group="reference_labels",
+        reference=reference,
     )
     assert score_shape not in allocations
 
@@ -628,40 +659,47 @@ def test_label_scores_are_allocated_only_for_conformal_evidence(
     query.get_target_label_evidence(
         result,
         reference_class_group="reference_labels",
+        reference=reference,
         calibration_nonconformity=np.array([0.1, 0.2]),
     )
     assert score_shape in allocations
 
 
-def test_reference_layout_source_requires_the_linked_value_array(
+def test_reference_layout_requires_an_explicit_complete_embedding(
     mapping_consumer_context,
 ):
     _, reference, _ = mapping_consumer_context
-    _write_reference_layout(
+    _, layout = _write_reference_layout(
         reference,
-        layout_key="missing_source_values",
-        linked=True,
+        name="explicit_layout",
     )
-    for column in ("missing_source_values1", "missing_source_values2"):
-        reference.datastore.zw["cellData"][column].attrs["source_value"] = "missing"
+    with pytest.raises(TypeError, match="layout must be an ArtifactRef"):
+        reference.fetch_layout("explicit_layout")
+    wrong = ArtifactRef(
+        scope="assay",
+        assay=reference.assay_name,
+        kind="cluster_labels",
+        artifact_id=layout.artifact_id,
+    )
+    with pytest.raises(ValueError, match="embedding artifact"):
+        reference.fetch_layout(wrong)
 
-    assert reference.layout_source("missing_source_values") is None
 
-
-def test_reference_layout_reads_linked_immutable_artifact(
+def test_reference_layout_reads_explicit_immutable_artifact(
     mapping_consumer_context,
 ):
     _, reference, _ = mapping_consumer_context
-    expected, _ = _write_reference_layout(
+    expected, layout = _write_reference_layout(
         reference,
-        layout_key="linked_layout",
-        linked=True,
+        name="immutable_layout",
     )
-    for column in ("linked_layout1", "linked_layout2"):
-        values = reference.datastore.zw["cellData"][column]
-        values[:] = np.full(values.shape, -999.0)
+    reference.datastore.cells.insert(
+        "unrelated_layout1",
+        np.full(reference.datastore.cells.N, -999.0),
+        overwrite=True,
+    )
 
-    np.testing.assert_array_equal(reference.fetch_layout("linked_layout"), expected)
+    np.testing.assert_array_equal(reference.fetch_layout(layout), expected)
 
 
 def test_every_mapping_consumer_rejects_old_projection_artifacts(

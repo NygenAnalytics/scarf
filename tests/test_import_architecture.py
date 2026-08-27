@@ -1063,9 +1063,47 @@ def test_datastore_operation_mixins_are_runtime_isolated():
     assert all(mixin.__bases__ == (object,) for mixin in mixins)
 
 
-def test_assay_graph_path_grammar_is_centralized():
-    encoded_paths = _SCARF_ROOT / "graph" / "encoded_paths.py"
-    path_markers = ("normed__", "reduction__", "ann__", "knn__", "graph__")
+def test_analytical_producers_do_not_mutate_live_metadata():
+    """Keep analytical results behind immutable refs at the module boundary."""
+    operation_paths = sorted((_SCARF_ROOT / "datastore" / "_operations").glob("*.py"))
+    producer_paths = [
+        *operation_paths,
+        _SCARF_ROOT / "embeddings" / "imported.py",
+    ]
+    forbidden_helpers = {
+        "link_cell_data_column",
+        "link_feature_data_column",
+        "publish_feature_selection_alias",
+    }
+    forbidden_table_methods = {"drop", "insert", "reset_key", "update_key"}
+    violations: list[tuple[str, int, str]] = []
+
+    for path in producer_paths:
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            parts = _attribute_parts(node.func)
+            if not parts:
+                continue
+            called = parts[-1]
+            if called in forbidden_helpers or (
+                len(parts) >= 2
+                and parts[-2] in {"cells", "feats"}
+                and called in forbidden_table_methods
+            ):
+                violations.append(
+                    (
+                        path.relative_to(_SCARF_ROOT).as_posix(),
+                        node.lineno,
+                        ".".join(parts),
+                    )
+                )
+
+    assert violations == []
+
+
+def test_graph_latest_pointer_reads_are_absent():
     pointer_names = {
         "latest_reduction",
         "latest_ann",
@@ -1076,36 +1114,9 @@ def test_assay_graph_path_grammar_is_centralized():
     violations: list[tuple[str, int, str]] = []
 
     for path in _SCARF_ROOT.rglob("*.py"):
-        if path == encoded_paths:
-            continue
         tree = ast.parse(path.read_text(), filename=str(path))
-        docstring_constants = {
-            id(owner.body[0].value)
-            for owner in ast.walk(tree)
-            if isinstance(
-                owner,
-                ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
-            )
-            and owner.body
-            and isinstance(owner.body[0], ast.Expr)
-            and isinstance(owner.body[0].value, ast.Constant)
-            and isinstance(owner.body[0].value.value, str)
-        }
         for node in ast.walk(tree):
             if (
-                isinstance(node, ast.Constant)
-                and isinstance(node.value, str)
-                and id(node) not in docstring_constants
-                and any(marker in node.value for marker in path_markers)
-            ):
-                violations.append(
-                    (
-                        path.relative_to(_SCARF_ROOT).as_posix(),
-                        node.lineno,
-                        "path construction",
-                    )
-                )
-            elif (
                 isinstance(node, ast.Subscript)
                 and isinstance(node.ctx, ast.Load)
                 and isinstance(node.slice, ast.Constant)

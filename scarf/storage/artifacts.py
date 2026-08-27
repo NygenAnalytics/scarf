@@ -399,6 +399,8 @@ class ArtifactStatus:
     complete: bool
     provenance: dict[str, Any] | None = None
     execution_options: dict[str, Any] | None = None
+    created_at_ns: int | None = None
+    scarf_version: str | None = None
 
     @property
     def operation(self) -> str | None:
@@ -474,6 +476,19 @@ def inspect_artifact(root: zarr.Group, ref: ArtifactRef) -> ArtifactStatus:
             )
     provenance = _mapping_attr(group, "provenance")
     execution_options = _mapping_attr(group, "execution_options")
+    raw_created_at_ns = group.attrs.get("created_at_ns")
+    if raw_created_at_ns is not None and (
+        isinstance(raw_created_at_ns, bool)
+        or not isinstance(raw_created_at_ns, int | np.integer)
+        or int(raw_created_at_ns) <= 0
+    ):
+        raise TypeError(f"Artifact created_at_ns at {path} must be a positive integer")
+    created_at_ns = None if raw_created_at_ns is None else int(raw_created_at_ns)
+    raw_scarf_version = group.attrs.get("scarf_version")
+    if raw_scarf_version is not None and (
+        not isinstance(raw_scarf_version, str) or not raw_scarf_version
+    ):
+        raise TypeError(f"Artifact scarf_version at {path} must be a non-empty string")
     if complete:
         if provenance is None or execution_options is None:
             raise KeyError(f"Completed artifact at {path} has an incomplete record")
@@ -495,6 +510,8 @@ def inspect_artifact(root: zarr.Group, ref: ArtifactRef) -> ArtifactStatus:
         complete=complete,
         provenance=provenance,
         execution_options=execution_options,
+        created_at_ns=created_at_ns,
+        scarf_version=raw_scarf_version,
     )
 
 

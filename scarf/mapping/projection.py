@@ -22,7 +22,6 @@ from ..storage.artifacts import (
     artifact_group,
     fingerprint_array,
     inspect_artifact,
-    list_artifacts,
 )
 from ..storage.errors import ArtifactResolutionError
 from ..storage.feature_selection import resolve_feature_selection
@@ -38,7 +37,6 @@ NO_QUERY_BATCH_FINGERPRINT = fingerprint_array(np.empty(0, dtype=np.int64))
 
 _PARAMETER_NAMES = frozenset(
     {
-        "mapping_name",
         "save_k",
         "missing_feature_policy",
         "correction_method",
@@ -70,6 +68,7 @@ _ATTRIBUTE_NAMES = frozenset(
         "provenance",
         "execution_options",
         "created_at_ns",
+        "scarf_version",
         "complete",
         "diagnostics",
     }
@@ -268,7 +267,6 @@ def plan_projection(
     root: zarr.Group,
     *,
     query_assay: str,
-    mapping_name: str,
     n_cells: int,
     save_k: int,
     missing_feature_policy: str,
@@ -283,7 +281,6 @@ def plan_projection(
 ) -> ProjectionPlan:
     """Plan one immutable query-owned projection."""
     assay = _nonempty_string(query_assay, "query_assay")
-    name = _nonempty_string(mapping_name, "mapping_name")
     resolved_n_cells = _positive_int(n_cells, "n_cells")
     resolved_save_k = _positive_int(save_k, "save_k")
     resolved_reference_cell_count = _positive_int(
@@ -336,7 +333,6 @@ def plan_projection(
         kind="projection",
         operation="map_query",
         parameters={
-            "mapping_name": name,
             "save_k": resolved_save_k,
             "missing_feature_policy": policy,
             "correction_method": correction,
@@ -384,14 +380,14 @@ def load_projection(
     root: zarr.Group,
     ref: ArtifactRef,
     *,
+    reference: MappingReference,
     load_arrays: bool = False,
-    reference: MappingReference | None = None,
 ) -> MappingResult:
     """Load a query projection after validating the complete contract."""
     if not isinstance(load_arrays, bool):
         raise TypeError("load_arrays must be a boolean")
-    if reference is not None and not isinstance(reference, MappingReference):
-        raise TypeError("reference must be a MappingReference or None")
+    if not isinstance(reference, MappingReference):
+        raise TypeError("reference must be a MappingReference")
     try:
         return _load_projection(
             root,
@@ -405,67 +401,12 @@ def load_projection(
         raise _contract_error(str(exc)) from None
 
 
-def resolve_projection(
-    root: zarr.Group,
-    *,
-    query_assay: str,
-    mapping_name: str,
-    mapping_reference: ExternalArtifactRef,
-) -> ArtifactRef:
-    """Resolve the newest projection for one query name and reference."""
-    try:
-        assay = _nonempty_string(query_assay, "query_assay")
-        name = _nonempty_string(mapping_name, "mapping_name")
-        external = _validate_external_mapping_reference(mapping_reference)
-        candidates: list[tuple[int, ArtifactRef]] = []
-        for ref in list_artifacts(
-            root,
-            scope="assay",
-            assay=assay,
-            kind="projection",
-        ):
-            status = inspect_artifact(root, ref)
-            if not status.complete or status.operation != "map_query":
-                continue
-            parameters = status.parameters or {}
-            if parameters.get("mapping_name") != name:
-                continue
-            if set(parameters) != _PARAMETER_NAMES:
-                raise ValueError(
-                    f"Projection {name!r} has malformed map_query parameters"
-                )
-            inputs = status.inputs or {}
-            if set(inputs) != _INPUT_NAMES:
-                raise ValueError(f"Projection {name!r} has malformed map_query inputs")
-            raw_external = inputs["mapping_reference"]
-            if not isinstance(raw_external, Mapping):
-                raise TypeError("Projection mapping_reference input is malformed")
-            stored_external = ExternalArtifactRef.from_dict(raw_external)
-            _validate_external_mapping_reference(stored_external)
-            if stored_external != external:
-                continue
-            group = artifact_group(root, ref)
-            created_at_ns = _created_at_ns(group)
-            candidates.append((created_at_ns, ref))
-        if not candidates:
-            raise ValueError(
-                f"No complete projection named {name!r} matches the reference"
-            )
-        candidates.sort(
-            key=lambda item: (item[0], item[1].artifact_id),
-            reverse=True,
-        )
-        return candidates[0][1]
-    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
-        raise _contract_error(str(exc)) from None
-
-
 def _load_projection(
     root: zarr.Group,
     ref: ArtifactRef,
     *,
     load_arrays: bool,
-    reference: MappingReference | None,
+    reference: MappingReference,
 ) -> MappingResult:
     assay = _validate_projection_ref(ref)
     status = inspect_artifact(root, ref)
@@ -477,7 +418,6 @@ def _load_projection(
     parameters = status.parameters or {}
     if set(parameters) != _PARAMETER_NAMES:
         raise ValueError("Projection parameters do not match the map_query contract")
-    mapping_name = _nonempty_string(parameters["mapping_name"], "mapping_name")
     save_k = _positive_int(parameters["save_k"], "save_k")
     policy = _nonempty_string(
         parameters["missing_feature_policy"],
@@ -521,19 +461,17 @@ def _load_projection(
     external = _validate_external_mapping_reference(
         ExternalArtifactRef.from_dict(raw_external)
     )
-    reference_cell_count = None
-    if reference is not None:
-        reference.validate_dataset_fingerprint()
-        provided_external = reference.external_ref
-        if provided_external != external:
-            raise ValueError(
-                "Provided mapping reference does not match the projection input; "
-                f"expected {external!r}, received {provided_external!r}"
-            )
-        reference_cell_count = _positive_int(
-            reference.selected_cell_count,
-            "Mapping reference selected_cell_count",
+    reference.validate_dataset_fingerprint()
+    provided_external = reference.external_ref
+    if provided_external != external:
+        raise ValueError(
+            "Provided mapping reference does not match the projection input; "
+            f"expected {external!r}, received {provided_external!r}"
         )
+    reference_cell_count = _positive_int(
+        reference.selected_cell_count,
+        "Mapping reference selected_cell_count",
+    )
     _validate_local_selection(
         root,
         cell_selection,
@@ -568,7 +506,6 @@ def _load_projection(
         )
     return MappingResult(
         ref=ref,
-        mapping_name=mapping_name,
         n_cells=n_cells,
         correction_method=correction_method,
         diagnostics=diagnostics,

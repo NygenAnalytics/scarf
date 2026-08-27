@@ -23,7 +23,6 @@ from ...mapping.projection import (
     ProjectionWriter,
     load_projection,
     plan_projection,
-    resolve_projection,
 )
 from ...mapping.reference import MappingReference
 from ...mapping.symphony import (
@@ -44,6 +43,7 @@ from ...neighbors.stages import (
 from ...storage.ann_index import has_ann_index, load_ann_index
 from ...storage.geometry import array_geometry
 from ...storage.partition import row_band
+from ...storage.selections import validate_stored_selection_integrity
 from ...storage.stores import zarr_root_path
 from ...utils.logging import logger
 from ...storage.feature_selection import (
@@ -315,26 +315,23 @@ class _MappingOperationsMixin(_MappingOperationsBase):
     def run_mapping(
         self,
         reference: MappingReference,
-        mapping_name: str,
+        cell_selection: ArtifactRef,
         *,
         query_assay: str | None = None,
-        cell_key: str = "I",
         save_k: int = 3,
         missing_feature_policy: str = "reference_mean",
         query_batches: pd.DataFrame | None = None,
         invalidate_cache: bool = False,
-    ) -> MappingResult:
+    ) -> ArtifactRef:
         """Map selected query cells into an immutable prepared reference."""
         if not isinstance(reference, MappingReference):
             raise TypeError("reference must be a MappingReference")
-        if not isinstance(mapping_name, str) or not mapping_name.strip():
-            raise TypeError("mapping_name must be a non-empty string")
+        if not isinstance(cell_selection, ArtifactRef):
+            raise TypeError("cell_selection must be an ArtifactRef")
         if query_assay is not None and (
             not isinstance(query_assay, str) or not query_assay.strip()
         ):
             raise TypeError("query_assay must be a non-empty string or None")
-        if not isinstance(cell_key, str) or not cell_key.strip():
-            raise TypeError("cell_key must be a non-empty string")
         if isinstance(save_k, bool) or not isinstance(save_k, int | np.integer):
             raise TypeError("save_k must be an integer")
         save_k = int(save_k)
@@ -367,19 +364,19 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         assay = self._get_assay(assay_name)
         if not isinstance(assay, RNAassay):
             raise TypeError("Mapping currently supports RNA query assays only")
-        from ...graph.state import read_assay_state_document
-
-        read_assay_state_document(self.zw, assay_name)
-
-        cell_mask = np.asarray(self.cells.fetch_all(cell_key))
-        if cell_mask.ndim != 1 or cell_mask.dtype != np.dtype(bool):
-            raise TypeError("cell_key must identify a one-dimensional boolean column")
-        if len(cell_mask) != self.cells.N:
-            raise ValueError("cell_key does not align with query cell metadata")
+        validated_cells = validate_stored_selection_integrity(
+            self.zw,
+            cell_selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
+        )
+        cell_mask = np.asarray(validated_cells.values[:], dtype=bool)
         query_cell_indices = np.flatnonzero(cell_mask).astype(np.int64, copy=False)
-        n_cells = len(query_cell_indices)
+        n_cells = validated_cells.selected_count
         if n_cells < 1:
-            raise ValueError("cell_key must select at least one query cell")
+            raise ValueError("cell_selection must select at least one query cell")
 
         symphony_state = reference.symphony_state
         if symphony_state is None:
@@ -430,7 +427,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         )
         selected_expression_fingerprint = stream.raw_expression_fingerprint
 
-        cell_selection = self._ensure_cell_selection(cell_key)
         all_features = cast(Any, self)._ensure_all_features(assay)
         feature_mask = np.zeros(assay.feats.N, dtype=bool)
         feature_mask[stream.query_feature_indices] = True
@@ -459,7 +455,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         projection_plan = plan_projection(
             self.zw,
             query_assay=assay_name,
-            mapping_name=mapping_name,
             n_cells=n_cells,
             save_k=save_k,
             missing_feature_policy=missing_feature_policy,
@@ -473,11 +468,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             invalidate_cache=invalidate_cache,
         )
         if projection_plan.reused:
-            return load_projection(
-                self.zw,
-                projection_plan.ref,
-                reference=reference,
-            )
+            return projection_plan.ref
 
         writer = ProjectionWriter(
             self.zw,
@@ -590,11 +581,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             if not writer.finished:
                 writer.abort()
             raise
-        return load_projection(
-            self.zw,
-            projection_plan.ref,
-            reference=reference,
-        )
+        return projection_plan.ref
 
     @staticmethod
     def _query_batch_codes(
@@ -650,73 +637,30 @@ class _MappingOperationsMixin(_MappingOperationsBase):
 
     def get_mapping_result(
         self,
-        result: MappingResult | ArtifactRef | str,
+        result: ArtifactRef,
         *,
-        reference: MappingReference | None = None,
-        query_assay: str | None = None,
+        reference: MappingReference,
         load_arrays: bool = False,
     ) -> MappingResult:
         """Load one complete query-owned mapping projection."""
-        if reference is not None and not isinstance(reference, MappingReference):
-            raise TypeError("reference must be a MappingReference or None")
-        if query_assay is not None and not isinstance(result, str):
-            raise ValueError("query_assay is only valid when result is a string")
-
-        projection_ref: ArtifactRef
-        session_reference: MappingReference | None = None
-        if isinstance(result, MappingResult):
-            projection_ref = result.ref
-            session_reference = result.reference
-        elif isinstance(result, ArtifactRef):
-            projection_ref = result
-        elif isinstance(result, str):
-            if not result.strip():
-                raise TypeError("result must be a non-empty mapping name")
-        else:
-            raise TypeError(
-                "result must be a MappingResult, ArtifactRef, or mapping name"
-            )
-
-        if reference is not None and session_reference is not None:
-            if reference.external_ref != session_reference.external_ref:
-                raise ValueError(
-                    "Explicit reference does not match the MappingResult "
-                    "reference handle"
-                )
-        resolved_reference = reference or session_reference
-        if resolved_reference is None:
-            raise ValueError(
-                "A MappingReference is required unless result is an in-session "
-                "MappingResult carrying its reference"
-            )
-
-        if isinstance(result, str):
-            assay_name = query_assay or self._defaultAssay
-            if assay_name is None:
-                raise ValueError(
-                    "query_assay is required when the query store has no default assay"
-                )
-            projection_ref = resolve_projection(
-                self.zw,
-                query_assay=assay_name,
-                mapping_name=result,
-                mapping_reference=resolved_reference.external_ref,
-            )
+        if not isinstance(result, ArtifactRef):
+            raise TypeError("result must be an ArtifactRef")
+        if not isinstance(reference, MappingReference):
+            raise TypeError("reference must be a MappingReference")
 
         return load_projection(
             self.zw,
-            projection_ref,
+            result,
             load_arrays=load_arrays,
-            reference=resolved_reference,
+            reference=reference,
         )
 
     def get_mapping_score(
         self,
-        result: MappingResult | ArtifactRef | str,
+        result: ArtifactRef,
         target_groups: np.ndarray | None = None,
         *,
-        reference: MappingReference | None = None,
-        query_assay: str | None = None,
+        reference: MappingReference,
         log_transform: bool = True,
         multiplier: float = 1000,
         weighted: bool = True,
@@ -742,10 +686,8 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         loaded = self.get_mapping_result(
             result,
             reference=reference,
-            query_assay=query_assay,
             load_arrays=False,
         )
-        assert loaded.reference is not None
         indices, distances, uninformative = self._projection_arrays(loaded.ref)
         n_cells = loaded.n_cells
         n_k = int(indices.shape[1])
@@ -808,11 +750,10 @@ class _MappingOperationsMixin(_MappingOperationsBase):
 
     def get_target_classes(
         self,
-        result: MappingResult | ArtifactRef | str,
+        result: ArtifactRef,
         reference_class_group: str,
         *,
-        reference: MappingReference | None = None,
-        query_assay: str | None = None,
+        reference: MappingReference,
         threshold_fraction: float = 0.5,
         target_subset: list[int] | None = None,
         na_val: str = "NA",
@@ -832,10 +773,8 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         loaded = self.get_mapping_result(
             result,
             reference=reference,
-            query_assay=query_assay,
             load_arrays=False,
         )
-        assert loaded.reference is not None
         indices, distances, uninformative = self._projection_arrays(loaded.ref)
         reference_labels = loaded.reference.fetch_cell_column(reference_class_group)
 
@@ -912,11 +851,10 @@ class _MappingOperationsMixin(_MappingOperationsBase):
 
     def get_target_label_evidence(
         self,
-        result: MappingResult | ArtifactRef | str,
+        result: ArtifactRef,
         reference_class_group: str,
         *,
-        reference: MappingReference | None = None,
-        query_assay: str | None = None,
+        reference: MappingReference,
         threshold_fraction: float = 0.5,
         na_val: str = "NA",
         max_distance: float | None = None,
@@ -951,10 +889,8 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         loaded = self.get_mapping_result(
             result,
             reference=reference,
-            query_assay=query_assay,
             load_arrays=False,
         )
-        assert loaded.reference is not None
         indices, distances, uninformative = self._projection_arrays(loaded.ref)
         reference_labels = loaded.reference.fetch_cell_column(reference_class_group)
         class_labels = np.asarray(pd.unique(reference_labels), dtype=object)

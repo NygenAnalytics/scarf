@@ -30,7 +30,7 @@ Low-level layout details for contributors live in {doc}`../developers/zarr_inter
 - Inspect the Zarr hierarchy
 - Read and write cell or feature metadata
 - Inspect a persisted normalization result
-- Locate marker tables through the marker index
+- Load a marker table through its exact artifact ref
 
 ## Dataset
 
@@ -60,6 +60,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pandas as pd
+import numpy as np
 
 import scarf
 from scarf.tools.repack_zarr import repack_store
@@ -68,9 +69,9 @@ scarf.configure_output(level='WARNING', progress=True)
 ```
 
 This page uses the pre-analyzed Bastidas-Ponce pancreas store also used in {doc}`plotting` and {doc}`cell_cycle`.
-The published store contains literal UMAP coordinates and cluster labels together with analysis state from an older Scarf release.
-First repack it structurally into a temporary source with the current paired RNA count layout, then mount those count matrices into a fresh writable target.
-The published source stays untouched, and every artifact inspected below follows the current contract.
+The published store contains literal UMAP coordinates and cluster labels. First repack it
+structurally into a temporary source with the paired RNA count layout, then mount those count
+matrices into a fresh writable target. The published source stays untouched.
 
 ```{code-cell} ipython3
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
@@ -94,12 +95,25 @@ ds = scarf.mount_datastore(
     nthreads=4,
 )
 
-hvg_ref = ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
-normalized = ds.run_normalization(features=hvg_ref)
-all_features = ds.resolve_features('RNA', 'all_features')
+cell_selection = ds.snapshot_cell_selection(cell_key='I')
+hvg_ref = ds.select_hvgs(
+    cell_selection,
+    min_cells=20,
+    top_n=500,
+    show_plot=False,
+)
+normalized = ds.run_normalization(cell_selection, hvg_ref)
+pca = ds.run_pca(normalized, dims=15)
+ann = ds.build_ann_index(pca)
+neighbors = ds.query_neighbors(ann, k=11)
+graph = ds.build_connectivity_map(neighbors)
+clusters_ref = ds.run_leiden_clustering(graph, resolution=0.5)
+all_features = ds.set_feature_selection(
+    from_assay='RNA',
+    feature_indexes=range(ds.RNA.feats.N),
+)
 marker_ref = ds.run_marker_search(
-    group_key='clusters',
-    cell_key='I',
+    clusters_ref,
     features=all_features,
 )
 
@@ -107,18 +121,18 @@ ds
 ```
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='clusters',
-)
+cluster_values = np.asarray(ds.load_artifact(clusters_ref)['values'][:])
+pd.Series(cluster_values).value_counts().sort_index()
 ```
 
-Cluster labels already live in cell metadata; the embedding only reads those columns.
+The clustering remains in its artifact. The published source's literal UMAP and cluster columns are
+separate metadata and are not changed by this computation.
 
 ## 1. Inspect Zarr trees
 
 Scarf uses [Zarr](https://zarr.readthedocs.io/en/stable/) for chunked on-disk arrays.
-The store is a directory tree: counts, cell and feature attributes, and cached intermediates live under named groups.
+The store is a directory tree: counts, cell and feature attributes, and immutable artifacts live
+under named groups.
 Relative to a single HDF5 file, the layout supports parallel reads and writes, fast compression codecs, and automatic persistence of intermediate results.
 
 `show_zarr_tree` prints the hierarchy.
@@ -134,18 +148,20 @@ Cell statistics computed from an assay are stored under `cellData` with the assa
 ds.show_zarr_tree(start='cellData')
 ```
 
-**The `I` column** is the default {term}`cell key`, tracking which cells are active.
-Values are boolean: filtered-out cells are `False`.
-Most `DataStore` methods take `cell_key` (default `I`) and operate only on cells marked `True`.
+**The `I` column** is the default user-owned {term}`cell key`, tracking which cells are active for
+live-metadata APIs. Values are boolean.
+Use `snapshot_cell_selection("I")` to capture this live column before passing it to an analytical
+producer. Some metadata, mapping, and export utilities still accept `cell_key` directly.
 
 ```{code-cell} ipython3
 ds.cells.to_pandas_dataframe(['I'])['I'].value_counts()
 ```
 
-This store keeps every barcode active (`True`).
-Filtered cells stay in the table as `False` rows; they are not deleted.
+This store keeps every barcode active (`True`). Analytical filtering returns a separate immutable
+selection artifact and leaves this column unchanged. If you deliberately author a live selection
+column, its `False` rows also remain in the table rather than being deleted.
 
-Each assay group holds `featureData`, optional `markers`, and its persisted analysis outputs.
+Each assay group holds `featureData` and its persisted artifacts.
 Count matrices are Zarr arrays (often sharded): default `{assay}/counts`, workspace `matrices/{assay}/counts`, or still in a mounted source when the assay is mounted.
 
 ```{code-cell} ipython3
@@ -156,7 +172,9 @@ ds.show_zarr_tree(start='RNA', depth=1)
 ds.show_zarr_tree(start='RNA/featureData', depth=1)
 ```
 
-Each persisted result is an {term}`artifact`, living under `{assay}/artifacts/{kind}/{artifact_id}`.
+Each persisted result is an {term}`artifact`. Assay-scoped results live under
+`{assay}/artifacts/{kind}/{artifact_id}`; datastore-scoped selections and integrated results live
+under `artifacts/{kind}/{artifact_id}`.
 The kind names the operation family and the identifier is derived from the inputs and parameters, which is what lets Scarf recognise an equivalent result instead of recomputing it.
 Nothing here encodes parameters in the path, so a second PCA at different dimensionality becomes a sibling entry rather than a new branch of the tree.
 
@@ -164,11 +182,7 @@ Nothing here encodes parameters in the path, so a second PCA at different dimens
 ds.show_zarr_tree(start='RNA/artifacts', depth=1)
 ```
 
-For diagnosis only, stores written before this layout may contain nested names such as `RNA/normed__I__hvgs/reduction__pca__15__I/...`.
-Current analysis does not resolve those paths or migrate them silently.
-Counts and literal metadata remain readable, while legacy analysis state fails closed with `IncompatibleAnalysisStateError` before computation or mutation.
-Opening also leaves a legacy feature `I` column byte-for-byte untouched; lazy `all_features` creation covers the complete current feature row order instead of inheriting that older filter.
-{doc}`../developers/zarr_internals` covers the on-disk layout and structural Zarr repacking; repacking does not migrate legacy analysis state into artifacts.
+{doc}`../developers/zarr_internals` covers the on-disk layout and structural Zarr repacking.
 
 ## 2. Inspect cell and feature attributes
 
@@ -296,7 +310,7 @@ ds.RNA.rawData
 ```
 
 Normalized values are computed on demand through the lower-level assay `normed()` view from raw counts.
-`run_normalization(features=...)` is the public persisted path and requires an exact feature-selection label or reference.
+`run_normalization(cell_selection, features)` is the public persisted path and requires exact stored cell- and feature-selection references.
 The direct `normed()` view follows its explicit or literal metadata indexes; in a newly created store the physical feature `I` column is all true:
 
 ```{code-cell} ipython3
@@ -328,7 +342,7 @@ The setup retained the HVG and normalization references it created in the mounte
 Asking for the same normalization again reuses that result rather than recomputing:
 
 ```{code-cell} ipython3
-reused_normalized = ds.run_normalization(features=hvg_ref)
+reused_normalized = ds.run_normalization(cell_selection, hvg_ref)
 print('Reused:', reused_normalized == normalized)
 reused_normalized
 ```
@@ -346,37 +360,20 @@ print('Arrays:', list(group.array_keys())[:5])
 ```
 
 Identical inputs and parameters {term}`reuse` a complete result.
-Branching, invalidation, lineage, and the current {term}`analysis chain` are covered in {doc}`reuse_and_tracing`.
+Branching, invalidation, and lineage are covered in {doc}`reuse_and_tracing`.
 
 ## 6. Marker features
 
-`run_marker_search` writes a `marker_table` artifact like any other result and returns its exact reference.
-The assay also keeps an index under `{assay}/markers`.
-In the attrs index layout, that group holds no arrays of its own; its `artifacts` attribute nests refs by cell key, grouping column, and feature-selection artifact id. Legacy `markers/{slot}` subgroups can hold arrays.
-
-```{code-cell} ipython3
-index = dict(ds.z['RNA/markers'].attrs.get('artifacts', {}))
-index
-```
-
-```{code-cell} ipython3
-table = scarf.ArtifactRef.from_dict(
-    index['I']['clusters'][all_features.artifact_id]
-)
-print('Stored at:', ds.inspect_artifact(table).path)
-```
-
-The nested feature-selection key prevents a marker search over one feature universe from replacing another.
-If multiple feature-specific tables exist for the same grouping, pass the exact returned ref to table, plot, and export accessors.
+`run_marker_search` writes a `marker_table` artifact like any other result and returns its exact
+reference. Pass that ref to table, plot, and export accessors. Different clustering or feature refs
+naturally produce distinct artifacts.
 
 Fetch one group with `get_markers`, plot the stored table with `marker_heatmap`, or export all groups with `export_markers_to_csv`.
 
 ```{code-cell} ipython3
 ds.get_markers(
     marker=marker_ref,
-    cell_key='I',
-    group_key='clusters',
-    group_id=ds.cells.fetch('clusters')[0],
+    group_id=cluster_values[0],
     min_score=0.1,
     min_frac_exp=0.1,
 ).head()
@@ -385,8 +382,6 @@ ds.get_markers(
 ```{code-cell} ipython3
 ds.plots.marker_heatmap(
     marker=marker_ref,
-    cell_key='I',
-    group_key='clusters',
     topn=5,
     figsize=(5, 9),
 )
@@ -396,8 +391,6 @@ ds.plots.marker_heatmap(
 markers_csv = 'scarf_datasets/pancreas_cluster_markers.csv'
 ds.export_markers_to_csv(
     marker=marker_ref,
-    cell_key='I',
-    group_key='clusters',
     csv_filename=markers_csv,
     min_score=0.1,
     min_frac_exp=0.1,
@@ -423,7 +416,7 @@ See {doc}`../concepts/memory_and_execution` for why RNA stores two orientations,
 
 ## Common mistakes
 
-- Expecting filtered cells to be deleted instead of marked `False` in `I`
+- Expecting filtering to delete rows or rewrite live `I`
 - Treating `MetaData` as an in-memory pandas DataFrame
 - Using `fetch` when values for inactive cells are also required (`fetch_all`)
 - Treating a result reference as an in-memory matrix

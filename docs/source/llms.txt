@@ -5,7 +5,7 @@
 ## Start here
 
 - [Home](index.html): design, implemented methods, validation, and current boundaries
-- [Analysis with AI agents](analysis_with_agents.html): scientific decision loop, state inspection, task routing, troubleshooting, and handoff
+- [Analysis with AI agents](analysis_with_agents.html): scientific decision loop, run and artifact inspection, task routing, troubleshooting, and handoff
 - [Quick start](quickstart.html): minimal count-to-cluster workflow
 - [API reference](reference/api.html): exact public signatures and result contracts
 
@@ -34,7 +34,7 @@
 - [Fate mapping](tutorials/fate_mapping.html): multiple terminal outcomes
 - [Trajectory validation](tutorials/trajectory_validation.html): boundary, graph, statistical, and numerical checks
 
-## State, scale, and extension
+## Provenance, scale, and extension
 
 - [Provenance](concepts/provenance.html): artifacts, reuse, lineage, and limits
 - [Reuse and tracing](tutorials/reuse_and_tracing.html): executable branching example

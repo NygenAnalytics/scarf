@@ -21,7 +21,7 @@ from ..storage.artifacts import (
     inspect_artifact,
 )
 from ..storage.errors import ArtifactResolutionError
-from ..storage.selections import validate_stored_selection_artifact
+from ..storage.selections import validate_stored_selection_integrity
 from ..storage.types import as_zarr_array, as_zarr_group
 
 if TYPE_CHECKING:
@@ -38,59 +38,15 @@ def _selection_mask(
     *,
     n_cells: int,
 ) -> np.ndarray:
-    if ref.kind != "cell_selection" or ref.scope != "datastore":
-        raise ArtifactResolutionError(
-            "cell_selection must be a datastore cell-selection artifact",
-            code="artifact_reference_mismatch",
-            context={
-                "scope": ref.scope,
-                "assay": ref.assay,
-                "kind": ref.kind,
-                "artifact_id": ref.artifact_id,
-                "expected_scope": "datastore",
-                "expected_assay": None,
-                "expected_kind": "cell_selection",
-            },
-        )
-    try:
-        status = inspect_artifact(root, ref)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ArtifactResolutionError(
-            "Cell-selection artifact record is malformed",
-            code="artifact_missing",
-            context={"artifact_id": ref.artifact_id},
-        ) from exc
-    if not status.exists:
-        raise ArtifactResolutionError(
-            "Cell-selection artifact does not exist",
-            code="artifact_missing",
-            context={"artifact_id": ref.artifact_id},
-        )
-    if not status.complete:
-        raise ArtifactResolutionError(
-            "Cell-selection artifact is incomplete",
-            code="artifact_incomplete",
-            context={"artifact_id": ref.artifact_id},
-        )
-    source_column = (status.execution_options or {}).get("source_column")
-    if not isinstance(source_column, str) or not source_column:
-        raise ArtifactResolutionError(
-            "Cell-selection artifact has no source column",
-            code="selection_column_missing",
-            context={"artifact_id": ref.artifact_id},
-        )
-    validate_stored_selection_artifact(
+    validated = validate_stored_selection_integrity(
         root,
         ref,
         kind="cell_selection",
         scope="datastore",
         assay=None,
         table_path="cellData",
-        column=source_column,
     )
-    group = as_zarr_group(root[status.path], name=status.path)
-    stored_values = as_zarr_array(group["values"], name="values")
-    values = np.asarray(stored_values[:])
+    values = np.asarray(validated.values[:], dtype=bool)
     if values.shape != (n_cells,) or values.dtype != np.dtype(bool):
         raise ArtifactResolutionError(
             "Cell-selection artifact values do not align with the assay cells",

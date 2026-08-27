@@ -856,13 +856,29 @@ class DataStoreMerge:
                 assay_names.update(
                     name for name in stored_assays if isinstance(name, str)
                 )
-        paths = {self._cell_slot()}
+        workspace_prefix = "" if self.outWorkspace is None else f"{self.outWorkspace}/"
+        # Runs and datastore-scoped artifacts bind the row identity being
+        # replaced. Remove only this workspace's records and artifact namespace.
+        paths = {
+            self._cell_slot(),
+            f"{workspace_prefix}pipeline/runs",
+            f"{workspace_prefix}artifacts",
+        }
         for assay_name in assay_names:
             paths.add(_assay_metadata_path(assay_name, self.outWorkspace))
             paths.add(_matrix_group_path(assay_name, self.outWorkspace))
         for path in sorted(paths, key=lambda value: value.count("/"), reverse=True):
             if path in root:
                 del root[path]
+        pipeline_path = f"{workspace_prefix}pipeline"
+        if pipeline_path in root:
+            pipeline = as_zarr_group(root[pipeline_path], name=pipeline_path)
+            if (
+                not pipeline.attrs
+                and not tuple(pipeline.group_keys())
+                and not tuple(pipeline.array_keys())
+            ):
+                del root[pipeline_path]
 
     def _open_destination(
         self,

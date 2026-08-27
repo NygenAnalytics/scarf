@@ -12,6 +12,10 @@ from pathlib import Path
 from types import TracebackType
 from typing import Literal, Self
 
+from scarf.utils.process import (
+    read_process_tree_rss_bytes as _read_process_tree_rss_bytes,
+)
+
 type PeakScope = Literal["operation", "containerLifetime", "unavailable"]
 type LimitValue = int | Literal["max"] | None
 type _ReadText = Callable[[Path], str]
@@ -183,29 +187,6 @@ def _memory_event_delta(
     }
 
 
-def _parse_proc_status(value: str) -> tuple[int | None, int | None]:
-    parent_pid: int | None = None
-    rss_bytes: int | None = None
-    for line in value.splitlines():
-        key, separator, raw_value = line.partition(":")
-        if not separator:
-            continue
-        parts = raw_value.split()
-        if not parts:
-            continue
-        if key == "PPid":
-            parent_pid = _nonnegative_int(parts[0])
-        elif key == "VmRSS":
-            amount = _nonnegative_int(parts[0])
-            if amount is None:
-                continue
-            unit = parts[1].lower() if len(parts) > 1 else "b"
-            scale = {"b": 1, "kb": 1024, "mb": 1024**2}.get(unit)
-            if scale is not None:
-                rss_bytes = amount * scale
-    return parent_pid, rss_bytes
-
-
 def read_process_tree_rss_bytes(
     rootPid: int,
     *,
@@ -213,45 +194,12 @@ def read_process_tree_rss_bytes(
     readText: _ReadText | None = None,
     listPids: _ListPids | None = None,
 ) -> int | None:
-    if isinstance(rootPid, bool) or rootPid <= 0:
-        return None
-    proc_root = Path(procRoot)
-    text_reader = _default_read_text if readText is None else readText
-    pid_reader = _default_list_pids if listPids is None else listPids
-    try:
-        pids = {int(pid) for pid in pid_reader(proc_root)}
-    except Exception:
-        return None
-    pids.add(rootPid)
-
-    records: dict[int, tuple[int | None, int | None]] = {}
-    children: dict[int, set[int]] = {}
-    for pid in pids:
-        status = _optional_read(proc_root / str(pid) / "status", text_reader)
-        if status is None:
-            continue
-        parent_pid, rss_bytes = _parse_proc_status(status)
-        records[pid] = (parent_pid, rss_bytes)
-        if parent_pid is not None:
-            children.setdefault(parent_pid, set()).add(pid)
-
-    tree_pids: set[int] = set()
-    pending = [rootPid]
-    while pending:
-        pid = pending.pop()
-        if pid in tree_pids:
-            continue
-        tree_pids.add(pid)
-        pending.extend(children.get(pid, ()))
-
-    rss_values = [
-        records[pid][1]
-        for pid in tree_pids
-        if pid in records and records[pid][1] is not None
-    ]
-    if not rss_values:
-        return None
-    return sum(rss_values)
+    return _read_process_tree_rss_bytes(
+        rootPid,
+        proc_root=procRoot,
+        read_text=readText,
+        list_pids=listPids,
+    )
 
 
 def _coerce_disk_usage(value: object) -> DiskUsage | None:

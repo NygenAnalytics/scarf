@@ -56,6 +56,7 @@ Scarf hosts example datasets in the public [Cytebase bucket](https://huggingface
 Connect to the `scarf_docs` repository to list or download them:
 
 ```{code-cell} ipython3
+import numpy as np
 import scarf
 
 scarf.configure_output(level='ERROR', progress=True)
@@ -76,13 +77,17 @@ tenx_h5 = datasets.download_dataset(
     name='tenx_10K_pbmc-v1_atacseq',
     destination='scarf_datasets'
 )
+```
 
+```{code-cell} ipython3
 # This dataset is in MTX format along with barcodes and features TSV files.
 mtx_dir = datasets.download_dataset(
     name='xin_1K_pancreas_rnaseq',
     destination='scarf_datasets'
 )
+```
 
+```{code-cell} ipython3
 # This dataset is in H5ad (anndata) format.
 h5ad_dir = datasets.download_dataset(
     name='bastidas-ponce_4K_pancreas-d15_rnaseq',
@@ -189,23 +194,31 @@ inspection
 Override the inspection only after confirming that another layer contains the raw count matrix required by the analysis.
 
 ```{code-cell} ipython3
-reader = scarf.H5adReader.from_inspect(inspection)
+reader = scarf.H5adReader.from_inspect(
+    inspection,
+    embedding_roles={"X_umap": "umap"},
+    cluster_keys=("clusters",),
+)
 
 # change value of `zarr_loc` to your choice of filename and path
 writer = scarf.H5adToZarr(
     reader,
-    zarr_loc='scarf_datasets/differentiating_pancreatic_cells.zarr'
+    zarr_loc='scarf_datasets/differentiating_pancreatic_cells.zarr',
+    analysis_assay="RNA",
 )
-writer.dump()
+h5ad_import = writer.dump()
+h5ad_import.embeddingArtifacts, h5ad_import.clusterArtifacts
 ```
 
 Categorical columns are decoded from category codes.
 Missing categorical or object values become `None`; missing numeric nullable values become `NaN`.
 Unsupported group-encoded columns are skipped with a warning rather than treated as valid metadata.
 
-Supported dense `obsm` arrays with one row per cell are flattened into numbered cell columns.
-For example, a two-column `X_umap` array becomes `X_umap1` and `X_umap2`.
-Sparse or row-mismatched `obsm` entries are warned about and skipped.
+`embedding_roles` and `cluster_keys` select analytical values for artifact import.
+The result maps their source names to exact refs in `embeddingArtifacts` and `clusterArtifacts`.
+These values are not flattened into live cell metadata. Load them through the datastore or pass
+their refs directly to consumers. Sparse, non-numeric, or row-mismatched selected embeddings are
+rejected.
 
 Source read batches are selected automatically from destination shard geometry and the conversion memory budget.
 Physical writes remain shard-aligned even when the selected source batch is smaller.
@@ -216,6 +229,8 @@ Stable multi-assay names (CRISPR guide, multiplexing, antigen, custom, RNA, anti
 A plain `from_inspect` path without `assay_split_key` writes everything into one assay (default RNA).
 Inspection may set `assaySplitKey` and `suggestedAssays`, but `to_reader_kwargs` does not pass `assaySplitKey` through.
 Pass `assay_split_key` and optional `assay_name_map` on the writer to split.
+When selected analytical values accompany a multi-assay import, set `analysis_assay` to the assay
+that owns those artifacts.
 `reclassify_features` is a `CrReader` API (10x HDF5 / MEX), not `H5adReader`.
 
 ## 5. Import Seurat RDS
@@ -257,12 +272,18 @@ with scarf.SeuratReader(
 
 ds = scarf.DataStore("pbmc_from_seurat.zarr")
 result.assayNames, result.defaultAssay, result.notices
+result.activeIdentity, result.reductionArtifacts["pca"]
 ```
+
+`activeIdentity` is an exact cluster-label artifact. `reductionArtifacts` maps each requested
+Seurat reduction name to its exact imported-coordinate ref. Neither result is installed as a live
+analysis column. Pass the reduction ref to graph construction or load either payload explicitly.
 
 What this import covers:
 
 - Legacy `Assay`, `Assay5`, and `ChromatinAssay` count layers when their matrix layout is supported
-- Cell metadata, `active.ident`, and selected reductions such as PCA or LSI
+- Literal cell metadata, plus artifact refs for `active.ident` and selected reductions such as PCA
+  or LSI
 - Partial Assay5 cell membership as per-assay boolean columns when needed
 
 What it does not import as analysis artifacts:
@@ -278,31 +299,26 @@ Prefer original 10x HDF5 or Matrix Market counts when they are available and you
 
 ## 6. Export to Matrix Market
 
-Open the H5AD-derived store written in section 4 and inspect transferred columns before exporting:
+Open the H5AD-derived store written in section 4 and load the selected analytical artifacts:
 
 ```{code-cell} ipython3
 ds = scarf.DataStore('scarf_datasets/differentiating_pancreatic_cells.zarr')
 
-ds
-```
-
-```{code-cell} ipython3
-{
-    "cellColumns": ds.cells.columns[:12],
-    "embeddingColumns": [
-        name
-        for name in ds.cells.columns
-        if str(name).startswith(("X_umap", "X_tsne"))
-    ],
-}
+imported_umap = np.asarray(
+    ds.load_artifact(h5ad_import.embeddingArtifacts["X_umap"])["values"][:]
+)
+imported_clusters = np.asarray(
+    ds.load_artifact(h5ad_import.clusterArtifacts["clusters"])["values"][:]
+)
+imported_umap.shape, imported_clusters.shape
 ```
 
 Plot the imported layout colored by the imported cluster labels:
 
 ```{code-cell} ipython3
 ds.plots.embedding(
-    layout_key='X_umap',
-    color_by='clusters',
+    layout=h5ad_import.embeddingArtifacts["X_umap"],
+    color_by=h5ad_import.clusterArtifacts["clusters"],
 )
 ```
 
@@ -315,31 +331,23 @@ scarf.writers.to_mtx(
 
 ## 7. Export to H5AD and AnnData
 
-`to_h5ad` exports the count matrix and metadata, and promotes recognized `{assay}_UMAP` / `{assay}_tSNE` column pairs into AnnData `obsm`.
-Imported layouts arrive as `X_umap1` / `X_umap2`, so copy them to the Scarf export names before writing.
 `DataStore.to_anndata` returns an in-memory AnnData object with counts, cell and feature metadata, and optional assay layers.
-It currently leaves layout coordinates as ordinary `obs` columns rather than populating `obsm` (see {doc}`downsampling`).
+Artifact results are attached explicitly when another tool expects a particular AnnData slot.
 
-### 7.1 Promote layouts for `to_h5ad`
+For a completed pipeline, prefer `ds.to_anndata(run=run)`. That form exports the run's frozen
+assay, cell selection, feature selection, and metadata. It rejects live `cell_key`,
+`feature_indexes`, and `feature_names` overrides so the exported axes cannot drift from the run.
+
+### 7.1 Attach exact imported artifacts
 
 ```{code-cell} ipython3
-ds.cells.insert(
-    column_name='RNA_UMAP1',
-    values=ds.cells.fetch_all('X_umap1'),
-    overwrite=True,
-)
-ds.cells.insert(
-    column_name='RNA_UMAP2',
-    values=ds.cells.fetch_all('X_umap2'),
-    overwrite=True,
-)
-scarf.writers.to_h5ad(
-    assay=ds.RNA,
-    h5ad_filename='scarf_datasets/diff_pancreas.h5ad'
-)
+adata = ds.to_anndata(from_assay="RNA")
+adata.obsm["X_umap"] = imported_umap
+adata.obs["clusters"] = imported_clusters
+adata.write_h5ad('scarf_datasets/diff_pancreas.h5ad')
 ```
 
-Reload the H5AD and confirm that the promoted layout is in `obsm`:
+Reload the H5AD and confirm that the explicitly attached layout is in `obsm`:
 
 ```{code-cell} ipython3
 import anndata as ad
@@ -376,20 +384,14 @@ selected = ds.to_anndata(
     "shape": selected.shape,
     "genes": selected.var_names.tolist(),
     "dropped": dropped,
-    "umapInObs": [
-        name
-        for name in selected.obs.columns
-        if str(name).startswith("X_umap")
-    ],
-    "obsmKeys": list(selected.obsm.keys()),
 }
 ```
 
 Use `feature_indexes` instead when stable feature rows are already available.
 `feature_names` and `feature_indexes` are mutually exclusive, preserve the requested order, and reject duplicate or unknown selections.
 
-The panel export keeps layout coordinates in `obs` and leaves `obsm` empty.
-That is the `to_anndata` side of the distinction above: use `to_h5ad` when another tool expects `obsm["X_umap"]`.
+The panel export contains live metadata only. Attach an exact artifact payload in memory when the
+receiving tool needs that result.
 
 ## 8. Import CSV
 
@@ -542,7 +544,8 @@ writer.dump()
 - Expecting an older RNA Zarr store without `countsT` to open in the current Scarf version
 - Using `DataStoreMerge` without `assays=` when you only need one modality from multi-assay stores
 - Assuming an H5AD file uses `X` for raw counts without inspecting its layers
-- Expecting sparse or malformed `obsm` arrays to be imported as embeddings
+- Omitting `embedding_roles` or `cluster_keys` when analytical H5AD values should become artifacts
+- Selecting sparse, non-numeric, or row-mismatched `obsm` arrays as embeddings
 - Materializing a full AnnData object when a feature panel would answer the export question
 - Treating Seurat neighbour graphs, images, or normalized layers as imported Scarf artifacts
 - Expecting Scarf to read `.h5seurat` or write Seurat `.rds` files

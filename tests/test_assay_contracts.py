@@ -19,6 +19,7 @@ from scarf.assay import (
     norm_lib_size,
     norm_tf_idf,
 )
+from scarf.storage.artifacts import ArtifactRef, artifact_group
 from tests.signature_contracts import signature_digest
 
 
@@ -27,10 +28,7 @@ _PUBLIC_CLASS_METHODS = {
         "__init__",
         "normed",
         "to_raw_sparse",
-        "add_percent_feature",
-        "save_normalized_data",
         "iter_normed_feature_wise",
-        "save_aggregated_ordering",
         "mean_features",
         "score_features",
         "__repr__",
@@ -38,7 +36,6 @@ _PUBLIC_CLASS_METHODS = {
     RNAassay: (
         "__init__",
         "iter_normed_feature_wise",
-        "save_normalized_data",
         "normed",
         "iter_raw_column_blocks",
         "iter_raw_feature_columns",
@@ -53,8 +50,8 @@ _PUBLIC_CLASS_METHODS = {
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    Assay: "129440304c5c88a7c5324ffb215346eccb9c4474b0468fa0a4db1cce46711147",
-    RNAassay: "d9948b1bd0cea16d9d8728b1c6f8012635f130e569b13bc3cceec43314da1674",
+    Assay: "6c6391ad566523451251008ceaf57ed7051262ab86104197d1daa868b50ee92e",
+    RNAassay: "65d2d9b4f58fd79139db2deebc35b4629b1177781e47fb08abd71b7bb5e699a1",
     ATACassay: "1732f9ac8b4f368185e0965becb94b9472186db4ee53d372a8a2852d30dd42a4",
     ADTassay: "1732f9ac8b4f368185e0965becb94b9472186db4ee53d372a8a2852d30dd42a4",
 }
@@ -72,6 +69,10 @@ _MODULE_SIGNATURE_DIGEST = (
 
 
 def test_assay_facade_surface_is_stable():
+    assert not hasattr(Assay, "add_percent_feature")
+    assert not hasattr(Assay, "save_aggregated_ordering")
+    assert not hasattr(Assay, "save_normalized_data")
+    assert not hasattr(RNAassay, "save_normalized_data")
     assert assay_module.__all__ == [
         "Assay",
         "RNAassay",
@@ -292,7 +293,7 @@ def test_base_assay_sparse_export_combines_streamed_blocks():
     )
 
 
-def test_base_assay_percent_feature_helpers_cover_noop_and_write_paths():
+def test_base_assay_ingestion_percent_feature_writer_keeps_zero_path():
     zero_assay = SimpleNamespace(cells=None)
     Assay._write_percent_feature(
         zero_assay,
@@ -300,20 +301,46 @@ def test_base_assay_percent_feature_helpers_cover_noop_and_write_paths():
         np.zeros(2),
     )
 
-    writes = []
-    assay = SimpleNamespace(
-        _plan_percent_feature=lambda _pattern, _name: None,
-        rawData=np.array([[2, 1], [0, 3]]),
-        nthreads=1,
-        name="toy",
-        _write_percent_feature=lambda name, values: writes.append((name, values)),
-    )
-    assert Assay.add_percent_feature(assay, "^missing$", "percent_missing") is None
 
-    assay._plan_percent_feature = lambda _pattern, _name: np.array([0])
-    Assay.add_percent_feature(assay, "^gene", "percent_gene")
-    assert writes[0][0] == "percent_gene"
-    np.testing.assert_array_equal(writes[0][1], np.array([2, 0]))
+def test_feature_percentage_is_datastore_owned_and_artifact_only(
+    datastore_ephemeral,
+) -> None:
+    store = datastore_ephemeral
+    cells = store.snapshot_cell_selection()
+    features = store.set_feature_selection(
+        from_assay="RNA",
+        feature_indexes=[0],
+    )
+    cell_columns = set(store.cells.columns)
+    assay_attrs = dict(store.RNA.attrs)
+
+    ref = store.run_feature_percentage(cells, features)
+
+    assert isinstance(ref, ArtifactRef)
+    assert ref.kind == "quality_metric"
+    assert ref.scope == "assay"
+    assert ref.assay == "RNA"
+    status = store.inspect_artifact(ref)
+    assert status.operation == "run_feature_percentage"
+    assert status.parameters == {"scale": 100.0}
+    assert ArtifactRef.from_dict(status.inputs["cell_selection"]) == cells
+    assert ArtifactRef.from_dict(status.inputs["feature_selection"]) == features
+    cell_index = store.cells.active_index("I")
+    counts = store.RNA.rawData[cell_index, :].compute(nthreads=1)
+    expected = np.divide(
+        100.0 * counts[:, 0],
+        counts.sum(axis=1),
+        out=np.zeros(len(cell_index), dtype=np.float64),
+        where=counts.sum(axis=1) != 0,
+    )
+    np.testing.assert_allclose(
+        artifact_group(store.zw, ref)["values"][:],
+        expected,
+    )
+    assert store.run_feature_percentage(cells, features) == ref
+    assert not hasattr(store.RNA, "add_percent_feature")
+    assert set(store.cells.columns) == cell_columns
+    assert dict(store.RNA.attrs) == assay_attrs
 
 
 def test_base_assay_subset_hash_encodes_order_and_axis_boundary():

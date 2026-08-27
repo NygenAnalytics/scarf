@@ -346,7 +346,7 @@ class RNAassay(Assay):
             assert pending_labels is not None
             yield emit(pending_cols, pending_labels)
 
-    def save_normalized_data(
+    def _write_normalized_payload(
         self,
         cell_idx: np.ndarray,
         feat_idx: np.ndarray,
@@ -357,7 +357,7 @@ class RNAassay(Assay):
         mirror: zarr.Array | None = None,
     ) -> ChunkedArray:
         if not renormalize_subset:
-            return super().save_normalized_data(
+            return super()._write_normalized_payload(
                 cell_idx,
                 feat_idx,
                 location,
@@ -999,6 +999,7 @@ class RNAassay(Assay):
         blacklist: str,
         keep_bounds: bool,
         bin_strategy: Literal["fixed", "adaptive"] = "adaptive",
+        feature_names: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return an HVG mask and corrected variance from sufficient stats."""
         from ..features.variability import (
@@ -1035,12 +1036,22 @@ class RNAassay(Assay):
                 lowess_frac,
                 bin_strategy=bin_strategy,
             )
+        resolved_feature_names = (
+            np.asarray(self.feats.fetch_all("names"))
+            if feature_names is None
+            else np.asarray(feature_names)
+        )
+        if resolved_feature_names.shape != expected:
+            raise ValueError(
+                f"RNA feature names must have shape {expected}, got "
+                f"{resolved_feature_names.shape}"
+            )
         values = select_highly_variable_features(
             corrected_variance=corrected_variance,
             normalized_cell_counts=normed_n,
             mean_nonzero=nz_mean,
             active_features=np.ones(self.feats.N, dtype=bool),
-            feature_names=np.asarray(self.feats.fetch_all("names")),
+            feature_names=resolved_feature_names,
             min_cells=min_cells,
             max_cells=max_cells,
             top_n=top_n,

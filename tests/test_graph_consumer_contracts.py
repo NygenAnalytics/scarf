@@ -19,41 +19,47 @@ def _parameter_names(method: object) -> list[str]:
 
 
 def test_frozen_imputation_and_membership_signatures() -> None:
+    assert not hasattr(DataStore, "get_diffusion_operator")
     assert _parameter_names(DataStore.get_imputed) == [
         "self",
         "feature_name",
-        "graph",
+        "diffusion",
         "from_assay",
-        "cell_key",
-        "t",
-        "cache_operator",
-        "invalidate_cache",
+    ]
+    diffusion_runner = inspect.signature(DataStore.run_diffusion_operator).parameters
+    assert list(diffusion_runner) == ["self", "graph", "t", "invalidate_cache"]
+    assert all(
+        parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        for parameter in list(diffusion_runner.values())[2:]
+    )
+    assert _parameter_names(DataStore.load_diffusion_operator) == [
+        "self",
+        "diffusion",
     ]
     membership = inspect.signature(DataStore.calc_membership_strength).parameters
     assert list(membership) == [
         "self",
-        "clust_key",
+        "clusters",
         "graph",
-        "from_assay",
-        "cell_key",
         "invalidate_cache",
     ]
     assert all(
         parameter.kind is inspect.Parameter.KEYWORD_ONLY
-        for parameter in list(membership.values())[2:]
+        for parameter in list(membership.values())[3:]
     )
 
 
-def test_doublet_graph_is_keyword_only_without_feat_key() -> None:
+def test_doublet_graph_is_explicit_without_feat_key() -> None:
     parameters = inspect.signature(DataStore.run_doublet_detection).parameters
-    assert list(parameters)[:4] == [
+    assert list(parameters)[:5] == [
         "self",
-        "cluster_key",
+        "clusters",
+        "graph",
         "from_assay",
-        "cell_key",
+        "cluster_sample_fraction",
     ]
     assert "feat_key" not in parameters
-    assert parameters["graph"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["graph"].default is inspect.Parameter.empty
 
 
 def test_graph_and_neighbor_consumers_have_no_path_selectors() -> None:
@@ -64,9 +70,8 @@ def test_graph_and_neighbor_consumers_have_no_path_selectors() -> None:
         DataStore.run_leiden_clustering,
         DataStore.run_paris_clustering,
         DataStore.run_topacedo_sampler,
-        DataStore.get_diffusion_operator,
+        DataStore.run_diffusion_operator,
         DataStore.run_pseudotime_scoring,
-        DataStore.run_fate_mapping,
         DataStore.metric_graph_connectivity,
     )
     for method in graph_methods:
@@ -75,6 +80,11 @@ def test_graph_and_neighbor_consumers_have_no_path_selectors() -> None:
         assert "feat_key" not in names
         assert "integrated_graph" not in names
         assert "graph_loc" not in names
+
+    fate_names = _parameter_names(DataStore.run_fate_mapping)
+    assert "pseudotime" in fate_names
+    assert "sink_labels" in fate_names
+    assert "graph" not in fate_names
 
     neighbor_methods = (
         DataStore.metric_lisi,

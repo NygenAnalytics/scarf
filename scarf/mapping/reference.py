@@ -2,13 +2,14 @@
 
 from dataclasses import dataclass
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 
 from ..storage.artifacts import artifact_group, inspect_artifact
 from ..storage.refs import ArtifactRef, ExternalArtifactRef
-from ..storage.types import as_zarr_array, as_zarr_group
+from ..storage.selections import validate_stored_selection_integrity
+from ..storage.types import as_zarr_array
 from .models import (
     ScaledPCAProjectionModel,
     SymphonyCorrectionModel,
@@ -22,7 +23,6 @@ class MappingReference:
     datastore: Any
     ref: ArtifactRef
     assay_name: str
-    cell_key: str
     reduction: ArtifactRef
     ann_index: ArtifactRef
     neighbors: ArtifactRef
@@ -66,12 +66,12 @@ class MappingReference:
 
     def validate_dataset_fingerprint(self) -> None:
         assay = self.datastore._get_assay(self.assay_name)
-        live = assay.attrs.get("dataset_fingerprint")
-        if live is None:
-            raise ValueError(
-                f"Reference assay {self.assay_name!r} has no stored dataset "
-                "fingerprint. Rebuild it with build_mapping_reference(neighbors)."
-            )
+        stored = assay.attrs.get("dataset_fingerprint")
+        live = (
+            stored
+            if isinstance(stored, str) and stored
+            else self.datastore._calculate_dataset_fingerprint(self.assay_name)
+        )
         if live != self.dataset_fingerprint:
             raise ValueError(
                 f"Reference assay {self.assay_name!r} dataset fingerprint mismatch. "
@@ -81,120 +81,67 @@ class MappingReference:
 
     def fetch_cell_column(self, column: str) -> np.ndarray:
         """Fetch one reference cell column through the stored cell selection."""
-        from ..graph.state import validate_cell_selection_artifact
-
         self.validate_dataset_fingerprint()
-        validate_cell_selection_artifact(
+        selection = validate_stored_selection_integrity(
             self.datastore.zw,
             self.cell_selection,
-            self.cell_key,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
         )
-        values = np.asarray(self.datastore.cells.fetch(column, key=self.cell_key))
+        mask = np.asarray(selection.values[:], dtype=bool)
+        values = np.asarray(self.datastore.cells.fetch_all(column))[mask]
         if len(values) != self.selected_cell_count:
             raise ValueError(
                 "The selected reference cell count has changed. Rebuild the "
                 "mapping reference with build_mapping_reference(neighbors)."
             )
-        return values
+        return cast(np.ndarray, values)
 
-    def fetch_layout(self, layout_key: str) -> np.ndarray:
-        """Fetch a two-column layout for the selected reference cells."""
-        source = self.layout_source(layout_key)
-        if source is None:
-            raw_layout = np.column_stack(
-                (
-                    self.fetch_cell_column(f"{layout_key}1"),
-                    self.fetch_cell_column(f"{layout_key}2"),
-                )
+    def fetch_layout(self, layout: ArtifactRef) -> np.ndarray:
+        """Fetch a two-dimensional layout from one explicit embedding artifact."""
+        self.validate_dataset_fingerprint()
+        if not isinstance(layout, ArtifactRef):
+            raise TypeError("layout must be an ArtifactRef")
+        if (
+            layout.scope != "assay"
+            or layout.assay != self.assay_name
+            or layout.kind != "embedding"
+        ):
+            raise ValueError(
+                "layout must identify an assay-scoped embedding artifact for "
+                "the reference assay"
             )
-        else:
-            cell_data = as_zarr_group(
-                self.datastore.zw["cellData"],
-                name="cellData",
-            )
-            first_column = as_zarr_array(
-                cell_data[f"{layout_key}1"],
-                name=f"{layout_key}1",
-            )
-            source_value = first_column.attrs.get("source_value")
-            if not isinstance(source_value, str) or not source_value:
-                raise ValueError("Linked reference layout source is invalid")
-            source_values = as_zarr_array(
-                artifact_group(self.datastore.zw, source.ref)[source_value],
-                name=source_value,
-            )
-            raw_layout = np.asarray(source_values[:, :2])
+        status = inspect_artifact(self.datastore.zw, layout)
+        if not status.complete:
+            raise ValueError("Reference layout artifact is unavailable or incomplete")
+        raw_selection = (status.inputs or {}).get("cell_selection")
+        if not isinstance(raw_selection, Mapping):
+            raise ValueError("Reference layout artifact has no cell-selection input")
         try:
-            layout = np.asarray(raw_layout, dtype=np.float64)
+            source_selection = ArtifactRef.from_dict(raw_selection)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "Reference layout artifact has an invalid cell-selection input"
+            ) from exc
+        if source_selection != self.cell_selection:
+            raise ValueError(
+                "Reference layout and mapping reference use different cell selections"
+            )
+        group = artifact_group(self.datastore.zw, layout)
+        if "values" not in group:
+            raise ValueError("Reference layout artifact has no canonical values array")
+        raw_layout = np.asarray(as_zarr_array(group["values"], name="values")[:])
+        try:
+            coordinates = np.asarray(raw_layout, dtype=np.float64)
         except (TypeError, ValueError) as exc:
             raise TypeError("Reference layout coordinates must be numeric") from exc
-        if layout.shape != (self.selected_cell_count, 2):
+        if coordinates.shape != (self.selected_cell_count, 2):
             raise ValueError(
                 "Reference layout must have two columns and one row per "
                 "selected reference cell"
             )
-        if not np.all(np.isfinite(layout) | np.isnan(layout)):
+        if not np.all(np.isfinite(coordinates) | np.isnan(coordinates)):
             raise ValueError("Reference layout contains infinite coordinates")
-        return np.array(layout, copy=True)
-
-    def layout_source(self, layout_key: str) -> ExternalArtifactRef | None:
-        """Return the shared assay artifact linked to two layout columns."""
-        self.validate_dataset_fingerprint()
-        cell_data = as_zarr_group(
-            self.datastore.zw["cellData"],
-            name="cellData",
-        )
-        refs: list[ArtifactRef] = []
-        source_values: list[str] = []
-        for expected_index, column in enumerate((f"{layout_key}1", f"{layout_key}2")):
-            try:
-                values = as_zarr_array(cell_data[column], name=column)
-            except (KeyError, TypeError):
-                return None
-            raw_ref = values.attrs.get("source_artifact")
-            source_value = values.attrs.get("source_value")
-            value_index = values.attrs.get("value_index")
-            if not isinstance(raw_ref, Mapping):
-                return None
-            if not isinstance(source_value, str) or not source_value:
-                return None
-            if (
-                isinstance(value_index, bool | np.bool_)
-                or not isinstance(value_index, int | np.integer)
-                or int(value_index) != expected_index
-            ):
-                return None
-            try:
-                ref = ArtifactRef.from_dict(raw_ref)
-                status = inspect_artifact(self.datastore.zw, ref)
-            except (KeyError, TypeError, ValueError):
-                return None
-            if (
-                ref.scope != "assay"
-                or ref.assay != self.assay_name
-                or not status.complete
-            ):
-                return None
-            refs.append(ref)
-            source_values.append(source_value)
-        if refs[0] != refs[1]:
-            return None
-        if source_values[0] != source_values[1]:
-            return None
-        try:
-            source = as_zarr_array(
-                artifact_group(self.datastore.zw, refs[0])[source_values[0]],
-                name=source_values[0],
-            )
-        except (KeyError, TypeError, ValueError):
-            return None
-        if (
-            source.ndim != 2
-            or int(source.shape[0]) != self.selected_cell_count
-            or int(source.shape[1]) < 2
-        ):
-            return None
-        return ExternalArtifactRef(
-            dataset_fingerprint=self.dataset_fingerprint,
-            ref=refs[0],
-        )
+        return np.array(coordinates, copy=True)

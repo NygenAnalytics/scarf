@@ -62,30 +62,31 @@ ds = scarf.mount_datastore(
     nthreads=4,
     min_features_per_cell=10,
 )
-ds.filter_cells(
+cell_selection = ds.filter_cells(
     attrs=["RNA_nCounts", "RNA_nFeatures", "RNA_percentMito"],
     highs=[15000, 4000, 15],
     lows=[1000, 500, 0],
-    reset_previous=True,
 )
-hvg_ref = ds.mark_hvgs(
+hvg_ref = ds.select_hvgs(
+    cell_selection,
     min_cells=20,
     top_n=500,
     show_plot=False,
 )
-normalized = ds.run_normalization(features=hvg_ref)
+normalized = ds.run_normalization(cell_selection, hvg_ref)
 ```
 
-This section structurally repacks and mounts the source counts, then reconstructs the selected cells, features, and normalization from {doc}`scrna_seq` without reusing persisted analysis state.
+This section structurally repacks and mounts the source counts, then reconstructs the selected cells, features, and normalization from {doc}`scrna_seq` without reusing persisted analysis outputs.
 
 ## 2. Compare PCA dimension counts
 
 Build each candidate from the same normalized data and cluster each graph by passing it explicitly.
-The 15-component chain runs last, so it is the one left in the assay's {term}`analysis chain`, and the layout comparisons below pick it up when no graph is named.
+Retain the 15-component graph and initialization for the layout comparisons below.
 
 ```{code-cell} ipython3
-cluster_keys = {}
+cluster_refs = {}
 pca_refs = {}
+graph_refs = {}
 for dimensions in (10, 30, 15):
     pca = ds.run_pca(
         normalized,
@@ -93,19 +94,17 @@ for dimensions in (10, 30, 15):
         show_elbow_plot=dimensions == 30,
     )
     pca_refs[dimensions] = pca
-    if dimensions == 15:
-        ds.build_embedding_initialization(pca)
     ann = ds.build_ann_index(pca)
     neighbors = ds.query_neighbors(ann, k=11)
     graph = ds.build_connectivity_map(neighbors)
+    graph_refs[dimensions] = graph
 
-    label = f"leiden_pca_{dimensions}"
-    ds.run_leiden_clustering(
-        graph=graph,
+    cluster_refs[dimensions] = ds.run_leiden_clustering(
+        graph,
         resolution=0.5,
-        label=label,
     )
-    cluster_keys[dimensions] = f"RNA_{label}"
+
+initialization_15 = ds.build_embedding_initialization(pca_refs[15])
 ```
 
 PCA axes represent decreasing amounts of variation in the selected genes.
@@ -134,9 +133,9 @@ pd.Series(
 cluster_counts = pd.Series(
     {
         dimensions: pd.Series(
-            ds.cells.fetch(cluster_key, key="I")
+            np.asarray(ds.load_artifact(cluster_ref)["values"][:])
         ).nunique()
-        for dimensions, cluster_key in cluster_keys.items()
+        for dimensions, cluster_ref in cluster_refs.items()
     },
     name="n_clusters",
 ).rename_axis("pca_dimensions")
@@ -150,9 +149,9 @@ Per-cluster sizes show whether an extra group is a real split or a tiny fragment
 cluster_sizes = pd.DataFrame(
     {
         dimensions: pd.Series(
-            ds.cells.fetch(cluster_key, key="I")
+            np.asarray(ds.load_artifact(cluster_ref)["values"][:])
         ).value_counts()
-        for dimensions, cluster_key in cluster_keys.items()
+        for dimensions, cluster_ref in cluster_refs.items()
     }
 ).fillna(0).astype(int)
 cluster_sizes
@@ -160,18 +159,20 @@ cluster_sizes
 
 ```{code-cell} ipython3
 agreement_rows = []
-for first, second in combinations(cluster_keys, 2):
-    columns = [cluster_keys[first], cluster_keys[second]]
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+
+cluster_values = {
+    dimensions: np.asarray(ds.load_artifact(ref)["values"][:])
+    for dimensions, ref in cluster_refs.items()
+}
+for first, second in combinations(cluster_refs, 2):
     agreement_rows.append(
         {
             "comparison": f"{first} vs {second} dimensions",
-            "ARI": ds.metric_label_concordance(
-                columns,
-                metric="ari",
-            ),
-            "NMI": ds.metric_label_concordance(
-                columns,
-                metric="nmi",
+            "ARI": adjusted_rand_score(cluster_values[first], cluster_values[second]),
+            "NMI": normalized_mutual_info_score(
+                cluster_values[first],
+                cluster_values[second],
             ),
         }
     )
@@ -184,35 +185,37 @@ Investigate a low-agreement arm through markers, technical covariates, and graph
 ## 3. Run UMAP
 
 ```{code-cell} ipython3
-ds.run_umap(
+umap = ds.run_umap(
+    graph_refs[15],
+    initialization_15,
     n_epochs=150,
     spread=5,
     min_dist=1,
     parallel=True,
-    label="UMAP",
 )
 ```
 
-The layout below uses the active 15-component graph.
+The layout below uses the explicit 15-component graph.
 Colouring by each Leiden partition shows how the 10-, 15-, and 30-component cuts land on the same coordinates.
 
 ```{code-cell} ipython3
-pca_partition_view = ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by=[cluster_keys[dimensions] for dimensions in (10, 15, 30)],
-    n_columns=3,
-    legend_loc="on_data",
-    show_titles=False,
-    show=False,
-)
+umap_values = np.asarray(ds.load_artifact(umap)["values"][:])
+figure, axes = plt.subplots(1, 3, figsize=(12, 4))
 for axis, dimensions in zip(
-    pca_partition_view.axes.values(),
+    axes,
     (10, 15, 30),
     strict=True,
 ):
+    axis.scatter(
+        umap_values[:, 0],
+        umap_values[:, 1],
+        c=cluster_values[dimensions],
+        s=3,
+        cmap="tab20",
+    )
     axis.set_title(f"Leiden on {dimensions} PCs")
-pca_partition_view.figure.set_size_inches(12, 4)
-pca_partition_view.figure
+figure.tight_layout()
+figure
 ```
 
 `min_dist` controls how tightly local groups can pack, while `spread` controls the overall scale.
@@ -220,44 +223,48 @@ These parameters change appearance without changing the input graph.
 A second UMAP with a smaller `min_dist` shows packing on the same neighbours.
 
 ```{code-cell} ipython3
-ds.run_umap(
+umap_tight = ds.run_umap(
+    graph_refs[15],
+    initialization_15,
     n_epochs=150,
     spread=5,
     min_dist=0.1,
     parallel=True,
-    label="UMAP_tight",
 )
 ```
 
 ```{code-cell} ipython3
-min_dist_view = ds.plots.embedding(
-    layout_key=["RNA_UMAP", "RNA_UMAP_tight"],
-    color_by=cluster_keys[15],
-    n_columns=2,
-    legend_loc="on_data",
-    show_titles=False,
-    show=False,
-)
-for axis, title in zip(
-    min_dist_view.axes.values(),
+umap_tight_values = np.asarray(ds.load_artifact(umap_tight)["values"][:])
+figure, axes = plt.subplots(1, 2, figsize=(10, 4))
+for axis, coordinates, title in zip(
+    axes,
+    (umap_values, umap_tight_values),
     ("min_dist=1", "min_dist=0.1"),
     strict=True,
 ):
+    axis.scatter(
+        coordinates[:, 0],
+        coordinates[:, 1],
+        c=cluster_values[15],
+        s=3,
+        cmap="tab20",
+    )
     axis.set_title(title)
-min_dist_view.figure.set_size_inches(10, 4)
-min_dist_view.figure
+figure.tight_layout()
+figure
 ```
 
 ## 4. Preserve local density with densMAP
 
 ```{code-cell} ipython3
-ds.run_umap(
+densmap = ds.run_umap(
+    graph_refs[15],
+    initialization_15,
     n_epochs=150,
     spread=5,
     min_dist=1,
     parallel=True,
     use_density_map=True,
-    label="densMAP",
 )
 ```
 
@@ -266,23 +273,18 @@ Contours below contrast local cell density on the same cells under UMAP and dens
 Relative packing can differ; plot area is still not a direct estimate of cell frequency.
 
 ```{code-cell} ipython3
-density_contrast = ds.plots.embedding(
-    layout_key=["RNA_UMAP", "RNA_densMAP"],
-    color_by=None,
-    n_columns=2,
-    density_overlay=splt.DensityOverlay(statistic="density"),
-    show_legend=False,
-    show_titles=False,
-    show=False,
-)
-for axis, title in zip(
-    density_contrast.axes.values(),
+dense_values = np.asarray(ds.load_artifact(densmap)["values"][:])
+figure, axes = plt.subplots(1, 2, figsize=(10, 4))
+for axis, coordinates, title in zip(
+    axes,
+    (umap_values, dense_values),
     ("UMAP", "densMAP"),
     strict=True,
 ):
+    axis.hexbin(coordinates[:, 0], coordinates[:, 1], gridsize=50)
     axis.set_title(title)
-density_contrast.figure.set_size_inches(10, 4)
-density_contrast.figure
+figure.tight_layout()
+figure
 ```
 
 ## 5. Run graph-based t-SNE
@@ -291,7 +293,9 @@ Scarf's t-SNE consumes the same neighbourhood graph.
 Computing a new embedding requires `sys.platform` in `posix` or `linux`; macOS (`darwin`) and Windows are unsupported.
 
 ```{code-cell} ipython3
-ds.run_tsne(
+tsne = ds.run_tsne(
+    graph_refs[15],
+    initialization_15,
     alpha=10,
     box_h=1,
     early_iter=250,
@@ -304,22 +308,23 @@ ds.run_tsne(
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 3, figsize=(12, 4))
+tsne_values = np.asarray(ds.load_artifact(tsne)["values"][:])
 layout_comparisons = (
-    ("UMAP", "RNA_UMAP"),
-    ("densMAP", "RNA_densMAP"),
-    ("t-SNE", "RNA_tSNE"),
+    ("UMAP", umap_values),
+    ("densMAP", dense_values),
+    ("t-SNE", tsne_values),
 )
-for index, (axis, (title, layout_key)) in enumerate(
-    zip(axes, layout_comparisons, strict=True)
+for axis, (title, coordinates) in zip(
+    axes,
+    layout_comparisons,
+    strict=True,
 ):
-    ds.plots.embedding(
-        layout_key=layout_key,
-        color_by=cluster_keys[15],
-        legend_loc="right",
-        show_legend=index == 2,
-        show_titles=False,
-        target=axis,
-        show=False,
+    axis.scatter(
+        coordinates[:, 0],
+        coordinates[:, 1],
+        c=cluster_values[15],
+        s=3,
+        cmap="tab20",
     )
     axis.set_title(title)
 figure.tight_layout()

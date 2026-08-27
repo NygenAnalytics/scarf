@@ -118,14 +118,16 @@ def test_frozen_master_repack_preserves_data_but_not_legacy_analysis_state(
     assert not hasattr(datastore, "get_normalized_group_path")
     assert not hasattr(datastore, "_lookup_stored_graph")
 
-    from scarf.storage import ArtifactResolutionError
-
-    with pytest.raises(ArtifactResolutionError) as caught:
-        datastore.load_graph(from_assay=_ASSAY)
-    assert caught.value.code == "missing_current_graph"
-    with pytest.raises(ArtifactResolutionError) as caught:
-        datastore.resolve_features(_ASSAY, "hvgs")
-    assert caught.value.code == "missing_label"
+    for kind in ("connectivity_map", "feature_selection"):
+        assert (
+            datastore.list_artifacts(
+                kind=kind,
+                from_assay=_ASSAY,
+                scope="assay",
+                complete_only=True,
+            )
+            == []
+        )
 
     assert _tree_digest(repacked) == repacked_before_open
     assert _tree_digest(frozen_master_store) == before

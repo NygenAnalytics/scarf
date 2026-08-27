@@ -103,7 +103,7 @@ class MetaData:
     def _get_missing_mask_array(self, column: str) -> zarr.Array | None:
         location, stored_column = self._get_loc(column)
         group = self.locations[location]
-        output = as_zarr_array(group[stored_column], name=stored_column)
+        output = self._get_array(column)
         missing_name = output.attrs.get("missing_mask")
         if not isinstance(missing_name, str) or missing_name not in group:
             return None

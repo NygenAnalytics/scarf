@@ -41,11 +41,12 @@ import scarf
 ds = scarf.DataStore(
     "s3://bucket/10M_cells.zarr",  # also gs://, hf://, or a local path
 )
-ds.pipeline.run()  # convenience: QC → HVGs → PCA → graph → UMAP → clustering → markers
+run = ds.pipeline.run()  # durable QC → graph → UMAP → clustering → marker run
 
 ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by="RNA_clusters",
+    run=run,
+    layout="umap",
+    color_by="clusters",
 )
 ```
 <img width="400" alt="image" src="https://github.com/user-attachments/assets/c4e62d37-4c03-4cbc-8a8b-2ff86556b370" />

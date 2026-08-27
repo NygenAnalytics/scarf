@@ -100,7 +100,7 @@ subtrees:
           - file: reference/api/graph_construction
             title: Graph construction
           - file: reference/api/artifacts
-            title: Artifacts and state
+            title: Artifacts and lineage
           - file: reference/api/pipeline
             title: Pipeline
           - file: reference/api/import_export

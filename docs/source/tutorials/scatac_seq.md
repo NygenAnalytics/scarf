@@ -31,6 +31,9 @@ This tutorial follows one recommended path from a peak-count matrix to broad chr
 ## Dataset
 
 ```{code-cell} ipython3
+import matplotlib.pyplot as plt
+import numpy as np
+
 import scarf
 
 scarf.configure_output(level='WARNING', progress=True)
@@ -95,26 +98,28 @@ ds.plots.distribution(
 )
 ```
 
-`auto_filter_cells` applies Scarf's global automatic bounds and marks outlying cells inactive in `I`; it does not delete them.
+`auto_filter_cells` applies Scarf's global automatic bounds and returns a selection artifact. It
+does not change `I` or delete rows.
 The {doc}`quality_control` guide covers manual thresholds, sample-aware filtering, and the ATAC metrics Scarf does and does not provide.
 
 ```{code-cell} ipython3
 n_before = int(ds.cells.fetch_all('I').sum())
-ds.auto_filter_cells(show_qc_plots=True)
-n_after = int(ds.cells.fetch_all('I').sum())
-print(f'Active cells before filter: {n_before}')
-print(f'Active cells after filter: {n_after}')
+cell_selection = ds.auto_filter_cells()
+cell_mask = np.asarray(ds.load_artifact(cell_selection)['values'][:], dtype=bool)
+print(f'Cells in input selection: {n_before}')
+print(f'Cells after filter: {int(cell_mask.sum())}')
 ```
 
 ## 3. Select prevalent peaks
 
 For scATAC-seq data, features are ranked by TF-IDF-normalized values summed across cells.
-The top features are marked as `prevalent_peaks` for downstream steps.
+The top features are returned as an immutable selection artifact for downstream steps.
 Here we retain 25,000 peaks, slightly more than one quarter of the available peaks.
 
 ```{code-cell} ipython3
-peak_features = ds.mark_prevalent_peaks(top_n=25000)
-print('Selected peaks:', int(ds.ATAC.feats.fetch_all('prevalent_peaks').sum()))
+peak_features = ds.select_prevalent_peaks(cell_selection, top_n=25000)
+peak_values = np.asarray(ds.load_artifact(peak_features)['values'][:])
+print('Selected peaks:', int(peak_values.sum()))
 ```
 
 The retained peaks should be present across enough cells to support stable neighbour comparisons without collapsing the assay onto only the most common open regions.
@@ -122,7 +127,7 @@ The retained peaks should be present across enough cells to support stable neigh
 ## 4. Build an LSI neighbourhood graph
 
 For scATAC-Seq datasets, Scarf uses TF-IDF normalization during `run_normalization`.
-The selected features, marked as `prevalent_peaks` in feature metadata, are used for graph construction.
+The selected feature artifact is used for graph construction.
 Dimension reduction uses LSI rather than PCA.
 The remaining index, neighbour, and connectivity steps match the RNA graph workflow.
 
@@ -130,14 +135,14 @@ LSI reduction of scATAC-Seq is known to capture the sequencing depth of cells in
 `run_lsi` skips that component by default (`skip_first=True`).
 
 ```{code-cell} ipython3
-ds.run_normalization(features=peak_features)
-ds.run_lsi(dims=50, skip_first=True)
-ds.build_embedding_initialization()
-ds.build_ann_index()
-ds.query_neighbors(k=21)
-ds.build_connectivity_map()
+normalized = ds.run_normalization(cell_selection, peak_features)
+lsi = ds.run_lsi(normalized, dims=50, skip_first=True)
+initialization = ds.build_embedding_initialization(lsi)
+ann_index = ds.build_ann_index(lsi)
+neighbors = ds.query_neighbors(ann_index, k=21)
+graph = ds.build_connectivity_map(neighbors)
 
-ds.load_graph()
+ds.load_graph(graph)
 ```
 
 `load_graph` returns the graph as a sparse cell-by-cell matrix, which confirms it covers the active cells.
@@ -150,7 +155,9 @@ TF-IDF, LSI choices, and graph tuning are covered in {doc}`graph_construction` a
 UMAP and tSNE use the same neighbourhood-graph path as scRNA-seq, so the ATAC workflow looks the same after the graph is built.
 
 ```{code-cell} ipython3
-ds.run_umap(
+umap = ds.run_umap(
+    graph,
+    initialization,
     n_epochs=500,
     min_dist=0.1, 
     spread=1, 
@@ -161,25 +168,20 @@ ds.run_umap(
 Leiden clustering also acts on the neighbourhood graph directly.
 
 ```{code-cell} ipython3
-ds.run_leiden_clustering(resolution=0.6)
-ds.cells.to_pandas_dataframe(
-    columns=['ATAC_leiden_cluster'],
-    key='I'
-)['ATAC_leiden_cluster'].value_counts().sort_index()
+clusters = ds.run_leiden_clustering(graph, resolution=0.6)
+cluster_values = np.asarray(ds.load_artifact(clusters)['values'][:])
+np.unique(cluster_values, return_counts=True)
 ```
 
 Cluster sizes are worth a look before plotting: a resolution that is too high splits one accessibility state into several small clusters.
 
-UMAP and Leiden results are stored in the cell attribute table with an `ATAC` prefix because they were run on the default ATAC assay.
-Filtered cells (`I` is False) have NaN UMAP coordinates and cluster id `-1`.
+UMAP and Leiden results remain immutable artifacts aligned to the stored selection.
 
 Plot the UMAP embedding colored by Leiden clusters:
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='ATAC_UMAP',
-    color_by='ATAC_leiden_cluster',
-)
+umap_values = np.asarray(ds.load_artifact(umap)['values'][:])
+plt.scatter(umap_values[:, 0], umap_values[:, 1], c=cluster_values, s=3)
 ```
 
 The embedding should separate several broad PBMC accessibility states rather than form one undifferentiated cloud.
@@ -234,18 +236,7 @@ Some annotation features also do not overlap any peak.
 They remain in `GeneScores` but are marked invalid, while overlapping genes retain their calculated scores.
 ```
 
-Plot GeneScores for known PBMC marker genes on the ATAC UMAP:
-
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='ATAC_UMAP',
-    from_assay='GeneScores',
-    color_by=['CD3D', 'MS4A1', 'LEF1', 'NKG7', 'TREM1', 'LYZ'],
-    clip_fraction=0.01,
-    n_columns=3,
-    sort_values=True,
-)
-```
+Inspect GeneScores for known PBMC marker genes alongside the retained UMAP artifact.
 
 The marker patterns should occupy coherent accessibility regions.
 A uniformly flat score can indicate coordinate-build mismatch or poor overlap between peaks and annotations.

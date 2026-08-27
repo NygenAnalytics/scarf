@@ -932,13 +932,13 @@ def test_child_legend_removal_clears_all_axis_and_figure_legends():
 def test_panel_labels_and_legend_collection(umap, leiden_clustering, datastore):
     first = splt.embedding(
         datastore,
-        layout_key="RNA_UMAP",
-        color_by="RNA_leiden_cluster",
+        layout=umap,
+        color_by=leiden_clustering,
         show=False,
     )
     second = splt.embedding(
         datastore,
-        layout_key="RNA_UMAP",
+        layout=umap,
         color_by="RNA_nCounts",
         show=False,
     )

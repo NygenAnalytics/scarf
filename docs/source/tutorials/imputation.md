@@ -24,8 +24,8 @@ It does not create new molecular observations and should not replace counts in d
 ## 1. Standalone setup
 
 Diffusion needs a neighbourhood graph.
-The published PBMC store supplies counts, literal metadata, and the UMAP used below.
-This setup mounts those inputs into a temporary writable analysis store and builds a current graph lineage locally.
+The catalog PBMC store supplies counts, literal metadata, and the UMAP used below.
+This setup mounts those inputs into a temporary writable analysis store and builds a new explicit graph lineage locally.
 The catalog snapshot is structurally repacked inside the temporary directory first so the mounted counts satisfy the current RNA layout.
 
 ```{code-cell} ipython3
@@ -57,12 +57,13 @@ ds = scarf.mount_datastore(
     nthreads=4,
     default_assay="RNA",
 )
-hvg_ref = ds.mark_hvgs(
+cell_selection = ds.snapshot_cell_selection(cell_key="I")
+hvg_ref = ds.select_hvgs(
+    cell_selection,
     top_n=2000,
     show_plot=False,
-    label="imputation_hvgs",
 )
-normalized = ds.run_normalization(features=hvg_ref)
+normalized = ds.run_normalization(cell_selection, hvg_ref)
 reduction = ds.run_pca(normalized, dims=15)
 ann_index = ds.build_ann_index(reduction)
 neighbors = ds.query_neighbors(ann_index, k=11)
@@ -75,10 +76,14 @@ graph = ds.build_connectivity_map(neighbors)
 A larger value mixes information over more graph steps and can erase real boundaries.
 
 ```{code-cell} ipython3
-for t in (1, 2, 4):
+diffusion_operators = {
+    t: ds.run_diffusion_operator(graph, t=t)
+    for t in (1, 2, 4)
+}
+for t, diffusion in diffusion_operators.items():
     ds.cells.insert(
         f"CD4_imputed_t{t}",
-        ds.get_imputed(feature_name="CD4", graph=graph, t=t),
+        ds.get_imputed(feature_name="CD4", diffusion=diffusion),
         overwrite=True,
     )
 ```
@@ -112,7 +117,8 @@ Mean stays near the observed level while max falls with `t` as diffusion spreads
 `filled_zeros` counts active cells that were zero for observed CD4 and became nonzero after diffusion.
 That count is the size of the nonzero-as-detection mistake for this feature.
 
-Paris clusters on the published UMAP give the population context for the CD4 panels below.
+Literal Paris labels and UMAP coordinates from the catalog snapshot give the population context
+for the CD4 panels below.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -151,9 +157,10 @@ Signal across unrelated clusters indicates excessive diffusion or a graph that d
 
 ## 4. Caveats
 
-The result depends on the active cell selection, feature selection, and graph.
-By default, each diffusion operator remains cached in memory for reuse across features.
-Set `cache_operator=False` when memory matters more than repeated feature speed.
+The result depends on the immutable cell selection and graph captured by each diffusion artifact.
+Repeating `run_diffusion_operator` with the same graph and `t` reuses the complete stored artifact.
+Pass that exact ref to `get_imputed`, or use `load_diffusion_operator` when direct sparse-matrix work
+is needed.
 Inserted columns such as `CD4_imputed_t2` are explicit cell metadata.
 Do not interpret a nonzero imputed value as detection in that cell, use it for marker significance, or feed it to replicate-aware differential expression.
 The `filled_zeros` column above is the concrete count of that mismatch for CD4 at each `t`.

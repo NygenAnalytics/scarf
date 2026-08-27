@@ -1,45 +1,734 @@
 import inspect
-from pathlib import Path
-from threading import Event, get_ident
+from collections.abc import Mapping
+from typing import Any
 
+import numpy as np
 import pytest
-from scipy.sparse import tril
+import zarr
+from zarr.storage import MemoryStore
 
-import scarf.datastore.pipeline_accessor as pipeline_accessor_module
-from scarf.datastore.pipeline_accessor import PipelineEvent
-from scarf.storage.artifacts import ArtifactRef
-from scarf.utils import logger
+from scarf import PipelineExecutionError, PipelineRun
+from scarf.datastore.pipeline_accessor import (
+    PipelineEvent,
+    _PipelineEventEmitter,
+    _categorical_array_display,
+    _continuous_array_display,
+    _run_cluster_selection,
+    _sample_cluster_label_values,
+)
+from scarf.storage.artifact_writer import finish_artifact, plan_artifact, start_artifact
+from scarf.storage.artifacts import ArtifactRef, artifact_group
+from scarf.storage.refs import ArtifactScope
 
 
-def test_basic_rna_pipeline_returns_only_named_artifact_refs(
-    datastore_ephemeral,
+def _minimal_run_options() -> dict[str, Any]:
+    return {
+        "filtering": False,
+        "cell_cycle": False,
+        "hvg_count": 50,
+        "pca_dims": 3,
+        "neighbors_k": 3,
+        "umap": False,
+        "leiden": False,
+        "paris": False,
+        "doublets": False,
+        "markers": False,
+    }
+
+
+def test_pipeline_callback_baseexceptions_do_not_escape() -> None:
+    events: list[PipelineEvent] = []
+
+    def callback(event: PipelineEvent) -> None:
+        events.append(event)
+        raise KeyboardInterrupt("callback interruption")
+
+    _PipelineEventEmitter(callback).emit("stage_started", "input_snapshot")
+
+    assert [event.kind for event in events] == ["stage_started"]
+
+
+def _insert_nullable_cell_column(
+    datastore: Any,
+    name: str,
+    values: np.ndarray,
+    missing: np.ndarray,
 ) -> None:
-    artifacts = datastore_ephemeral.pipeline.run(
-        pipeline_id="basic_rna_analysis",
-        filtering={},
-        cell_cycle_scoring=False,
-        highly_variable_features={
-            "top_n": 100,
-            "label": "pipeline_hvgs",
-        },
-        pca={"dims": 5, "n_centroids": 10},
-        ann_index={"ann_m": 16},
-        neighbors={"k": 3},
-        connectivity={},
-        umap={"n_epochs": 10, "label": "pipeline_umap"},
-        leiden={
-            0.5: {},
-            1.0: {},
-        },
-        paris={"n_clusters": 3, "label": "pipeline_paris"},
-        doublet_scoring=False,
-        markers={
-            "clusters": {"leiden": 1.0},
-        },
+    cell_data = datastore.zw["cellData"]
+    missing_name = f"__scarf_missing__{name}"
+    cell_data.create_array(name, data=np.asarray(values))
+    cell_data.create_array(missing_name, data=np.asarray(missing, dtype=bool))
+    cell_data[name].attrs["missing_mask"] = missing_name
+
+
+class _ClusterSelectionStore:
+    def __init__(self, root: Any) -> None:
+        self.zw = root
+        self.memoryBytes = 64 * 1024 * 1024
+
+
+def test_pipeline_field_display_summaries_read_stored_chunks() -> None:
+    class ChunkedArray:
+        def __init__(self, values: np.ndarray, chunk_rows: int) -> None:
+            self._values = values
+            self.shape = values.shape
+            self.dtype = values.dtype
+            self.chunks = (chunk_rows, *values.shape[1:])
+            self.reads: list[slice] = []
+
+        def __getitem__(self, key):
+            row_slice = key if isinstance(key, slice) else key[0]
+            assert isinstance(row_slice, slice)
+            assert row_slice.start is not None and row_slice.stop is not None
+            assert row_slice.stop - row_slice.start <= self.chunks[0]
+            self.reads.append(row_slice)
+            return self._values[key]
+
+    coordinates = ChunkedArray(
+        np.asarray(
+            [[3.0, 8.0], [np.nan, 4.0], [-2.0, 6.0], [1.0, np.inf]],
+            dtype=np.float64,
+        ),
+        2,
+    )
+    display = _continuous_array_display(coordinates, value_index=0)
+    assert display["minimum"] == -2.0
+    assert display["maximum"] == 3.0
+    assert len(coordinates.reads) == 2
+
+    labels = ChunkedArray(
+        np.asarray([2.0, np.nan, 1.0, 2.0, 3.0]),
+        2,
+    )
+    categorical = _categorical_array_display(labels)
+    assert [item["value"] for item in categorical["categories"]] == [1.0, 2.0, 3.0]
+    assert categorical["missing_label"] == "NA"
+    assert len(labels.reads) == 3
+
+
+def test_cluster_selection_reads_only_sampled_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sample_indices = np.asarray([3, 11, 19], dtype=np.int64)
+
+    class Labels:
+        ndim = 1
+        shape = (1_000_000,)
+
+        def __getitem__(self, _index):
+            raise AssertionError("cluster selection must not read every label")
+
+        def get_orthogonal_selection(self, indexer):
+            assert len(indexer) == 1
+            np.testing.assert_array_equal(indexer[0], sample_indices)
+            return np.asarray([0, 1, 1], dtype=np.int32)
+
+    monkeypatch.setattr(
+        "scarf.datastore.pipeline_accessor._cluster_label_array",
+        lambda _root, _ref: Labels(),
+    )
+    ref = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="cluster_labels",
+        artifact_id="a" * 64,
     )
 
-    assert list(artifacts) == [
-        "cell_selection",
+    values = _sample_cluster_label_values(
+        object(),
+        ref,
+        sample_indices=sample_indices,
+        expected_rows=1_000_000,
+    )
+
+    np.testing.assert_array_equal(values, [0, 1, 1])
+
+
+def _array_artifact(
+    root: Any,
+    *,
+    kind: str,
+    values: dict[str, np.ndarray],
+    inputs: dict[str, Any] | None = None,
+    scope: ArtifactScope = "assay",
+) -> ArtifactRef:
+    planned = plan_artifact(
+        root,
+        scope=scope,
+        assay="RNA" if scope == "assay" else None,
+        kind=kind,
+        operation=f"test_{kind}",
+        parameters={
+            "payload": {
+                name: np.asarray(data).tolist() for name, data in values.items()
+            }
+        },
+        inputs={} if inputs is None else inputs,
+        execution_options={},
+    )
+    group = start_artifact(root, planned)
+    for name, data in values.items():
+        group.create_array(name, data=data)
+    finish_artifact(group, planned)
+    return planned.ref
+
+
+def test_pipeline_run_has_one_small_public_invocation() -> None:
+    signature = inspect.signature(PipelineRun)
+    assert tuple(signature.parameters) == ("owner", "record")
+
+    from scarf.datastore.pipeline_accessor import PipelineAccessor
+
+    run_signature = inspect.signature(PipelineAccessor.run)
+    assert tuple(run_signature.parameters) == (
+        "self",
+        "assay",
+        "label",
+        "cell_key",
+        "filtering",
+        "harmony_batch_columns",
+        "hvg_count",
+        "pca_dims",
+        "neighbors_k",
+        "umap",
+        "leiden",
+        "cell_cycle",
+        "paris",
+        "doublets",
+        "markers",
+        "snapshot_columns",
+        "callback",
+    )
+    assert tuple(inspect.signature(PipelineAccessor.open).parameters) == (
+        "self",
+        "run_id",
+        "label",
+    )
+    assert not hasattr(PipelineAccessor, "publish")
+
+
+def test_pipeline_preflight_rejects_ambiguous_recipes_without_writes(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    before = tuple(run.run_id for run in datastore.pipeline.list_runs(limit=100))
+
+    with pytest.raises(ValueError, match="exactly 'partitions'"):
+        datastore.pipeline.run(
+            leiden={"partitions": [0.5], "primary": 0.5, "automatic": True},
+            doublets=False,
+            markers=False,
+        )
+    with pytest.raises(ValueError, match="at least one clustering candidate"):
+        datastore.pipeline.run(leiden=False, paris=False)
+    with pytest.raises(ValueError, match="reserved run fields"):
+        datastore.pipeline.run(snapshot_columns=("clusters",))
+    with pytest.raises(ValueError, match="reserved run fields"):
+        datastore.pipeline.run(snapshot_columns=("highly_variable_features",))
+    with pytest.raises(ValueError, match="duplicate resolutions"):
+        datastore.pipeline.run(
+            leiden={"partitions": [1, 1.0]},
+            doublets=False,
+            markers=False,
+        )
+
+    after = tuple(run.run_id for run in datastore.pipeline.list_runs(limit=100))
+    assert after == before
+
+
+def test_minimal_pipeline_is_artifact_only_cold_openable_and_ordered(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    cells_before = frozenset(datastore.cells.columns)
+    assay = datastore.get_assay("RNA")
+    features_before = frozenset(assay.feats.columns)
+    assay_attrs_before = dict(assay.attrs)
+    events: list[PipelineEvent] = []
+
+    run = datastore.pipeline.run(
+        label="baseline",
+        callback=events.append,
+        **_minimal_run_options(),
+    )
+
+    assert isinstance(run, PipelineRun)
+    assert run.status == "completed"
+    assert run.label == "baseline"
+    assert list(run) == [
+        "input_cell_selection",
+        "analysis_cell_selection",
+        "feature_universe",
+        "highly_variable_features",
+        "normalized",
+        "pca",
+        "ann_index",
+        "neighbors",
+        "connectivity_map",
+        "embedding_initialization",
+    ]
+    assert run["analysis_cell_selection"] == run["input_cell_selection"]
+    assert all(isinstance(ref, ArtifactRef) for ref in run.values())
+    assert all(datastore.inspect_artifact(ref).complete for ref in run.values())
+    assert run.cells.columns == ("I", "ids", "names")
+    assert run.features.columns == (
+        "I",
+        "ids",
+        "names",
+        "highly_variable_features",
+    )
+    assert frozenset(datastore.cells.columns) == cells_before
+    assert frozenset(assay.feats.columns) == features_before
+    assert dict(assay.attrs) == assay_attrs_before
+
+    expected_stages = (
+        "input_snapshot",
+        "highly_variable_features",
+        "normalization",
+        "pca",
+        "ann_index",
+        "neighbors",
+        "connectivity",
+        "embedding_initialization",
+    )
+    assert [(event.kind, event.stage) for event in events] == [
+        (kind, stage)
+        for stage in expected_stages
+        for kind in ("stage_started", "stage_completed")
+    ]
+
+    reopened = datastore.pipeline.open(label="baseline")
+    assert reopened.run_id == run.run_id
+    assert datastore.pipeline.open(run_id=run.run_id).run_id == run.run_id
+    with pytest.raises(ValueError, match="exactly one"):
+        datastore.pipeline.open()
+    with pytest.raises(ValueError, match="exactly one"):
+        datastore.pipeline.open(run_id=run.run_id, label="baseline")
+    assert datastore.pipeline.list_runs(status="completed")[0].run_id == run.run_id
+    report = reopened.report()
+    assert isinstance(report, Mapping)
+    assert report["run"]["status"] == "completed"
+    assert all(stage["metrics"] is not None for stage in report["stages"])
+    assert all("plans" in stage for stage in report["stages"])
+    markdown = reopened.report(format="markdown")
+    assert "# Pipeline run" in markdown
+    assert f"- Scarf version: `{report['run']['scarfVersion']}`" in markdown
+    assert not hasattr(reopened, "plots")
+    assert not hasattr(reopened, "markers")
+    assert not hasattr(reopened, "publish")
+
+    with pytest.raises(ValueError, match="already committed"):
+        datastore.pipeline.run(label="baseline", **_minimal_run_options())
+    assert len(datastore.pipeline.list_runs(limit=100)) == 1
+
+
+def test_pipeline_failure_exposes_openable_run_and_original_cause(
+    datastore_ephemeral,
+    monkeypatch,
+) -> None:
+    datastore = datastore_ephemeral
+    expected = RuntimeError("deliberate PCA failure")
+    events: list[PipelineEvent] = []
+
+    def fail_pca(self, *_args, **_kwargs):
+        raise expected
+
+    monkeypatch.setattr(type(datastore), "run_pca", fail_pca)
+    with pytest.raises(PipelineExecutionError) as caught:
+        datastore.pipeline.run(
+            label="failed-baseline",
+            callback=events.append,
+            **_minimal_run_options(),
+        )
+
+    error = caught.value
+    assert error.stage == "pca"
+    assert error.__cause__ is expected
+    failed = datastore.pipeline.open(run_id=error.run_id)
+    assert failed.status == "failed"
+    assert failed.label is None
+    report = failed.report()
+    assert report["run"]["requestedLabel"] == "failed-baseline"
+    assert report["run"]["error"]["type"] == "RuntimeError"
+    assert events[-1].kind == "stage_failed"
+    with pytest.raises(RuntimeError, match="requires a completed run"):
+        list(failed)
+    with pytest.raises(KeyError, match="No completed pipeline run"):
+        datastore.pipeline.open(label="failed-baseline")
+
+
+def test_skipped_stage_bookkeeping_failure_commits_failed_stage_and_run(
+    datastore_ephemeral,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scarf.datastore.pipeline_accessor as pipeline_module
+
+    datastore = datastore_ephemeral
+    expected = RuntimeError("deliberate skipped-stage commit failure")
+    original_finish = pipeline_module.finish_pipeline_stage_record
+    events: list[PipelineEvent] = []
+
+    def fail_skipped_stage(*args, **kwargs):
+        if kwargs.get("status") == "skipped":
+            raise expected
+        return original_finish(*args, **kwargs)
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "finish_pipeline_stage_record",
+        fail_skipped_stage,
+    )
+    with pytest.raises(PipelineExecutionError) as caught:
+        datastore.pipeline.run(callback=events.append, **_minimal_run_options())
+
+    error = caught.value
+    assert error.stage == "filtering"
+    assert error.__cause__ is expected
+    failed = datastore.pipeline.open(run_id=error.run_id)
+    assert failed.status == "failed"
+    filtering = next(
+        stage for stage in failed.report()["stages"] if stage["stage"] == "filtering"
+    )
+    assert filtering["status"] == "failed"
+    assert filtering["complete"] is True
+    assert filtering["error"] == {
+        "type": "RuntimeError",
+        "message": str(expected),
+    }
+    assert events[-1].kind == "stage_failed"
+    assert events[-1].stage == "filtering"
+
+
+def test_completed_stage_bookkeeping_failure_commits_failed_stage_and_run(
+    datastore_ephemeral,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scarf.datastore.pipeline_accessor as pipeline_module
+
+    datastore = datastore_ephemeral
+    expected = RuntimeError("deliberate completed-stage commit failure")
+    original_finish = pipeline_module.finish_pipeline_stage_record
+    failed_once = False
+    events: list[PipelineEvent] = []
+
+    def fail_completed_stage_once(*args, **kwargs):
+        nonlocal failed_once
+        if kwargs.get("status") == "completed" and not failed_once:
+            failed_once = True
+            raise expected
+        return original_finish(*args, **kwargs)
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "finish_pipeline_stage_record",
+        fail_completed_stage_once,
+    )
+    with pytest.raises(PipelineExecutionError) as caught:
+        datastore.pipeline.run(callback=events.append, **_minimal_run_options())
+
+    error = caught.value
+    assert error.stage == "input_snapshot"
+    assert error.__cause__ is expected
+    failed = datastore.pipeline.open(run_id=error.run_id)
+    assert failed.status == "failed"
+    input_snapshot = failed.report()["stages"][0]
+    assert input_snapshot["stage"] == "input_snapshot"
+    assert input_snapshot["status"] == "failed"
+    assert input_snapshot["complete"] is True
+    assert input_snapshot["error"] == {
+        "type": "RuntimeError",
+        "message": str(expected),
+    }
+    assert [(event.kind, event.stage) for event in events] == [
+        ("stage_started", "input_snapshot"),
+        ("stage_failed", "input_snapshot"),
+    ]
+    assert events[-1].error is expected
+
+
+def test_pipeline_interruption_is_durable_before_callbacks(
+    datastore_ephemeral,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    datastore = datastore_ephemeral
+    events: list[PipelineEvent] = []
+
+    def interrupt_pca(self, *_args, **_kwargs):
+        raise KeyboardInterrupt("stop pipeline")
+
+    monkeypatch.setattr(type(datastore), "run_pca", interrupt_pca)
+    with pytest.raises(KeyboardInterrupt, match="stop pipeline"):
+        datastore.pipeline.run(callback=events.append, **_minimal_run_options())
+
+    interrupted = datastore.pipeline.list_runs(status="interrupted")
+    assert len(interrupted) == 1
+    report = interrupted[0].report()
+    assert report["run"]["complete"] is True
+    assert report["run"]["interruption"]["kind"] == "keyboard_interrupt"
+    pca_stage = next(stage for stage in report["stages"] if stage["stage"] == "pca")
+    assert pca_stage["status"] == "interrupted"
+    assert pca_stage["complete"] is True
+    assert [event.kind for event in events[-2:]] == [
+        "stage_interrupted",
+        "pipeline_interrupted",
+    ]
+
+
+def test_automatic_filtering_threads_one_distinct_analysis_selection(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    input_count = int(np.count_nonzero(datastore.cells.fetch_all("I")))
+    options = _minimal_run_options()
+    options["filtering"] = None
+
+    run = datastore.pipeline.run(label="filtered", **options)
+
+    assert run["analysis_cell_selection"] != run["input_cell_selection"]
+    analysis_count = int(np.count_nonzero(run.cells.fetch_all("I")))
+    assert 0 < analysis_count < input_count
+    assert len(run.cells.fetch("ids")) == analysis_count
+    normalized = datastore.inspect_artifact(run["normalized"])
+    assert (
+        ArtifactRef.from_dict(normalized.inputs["cell_selection"])
+        == run["analysis_cell_selection"]
+    )
+
+
+def test_pipeline_filtering_excludes_nullable_integer_metric_rows(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    active = np.asarray(datastore.cells.fetch_all("I"), dtype=bool)
+    missing = np.zeros(active.shape, dtype=bool)
+    missing_index = int(np.flatnonzero(active)[0])
+    missing[missing_index] = True
+    _insert_nullable_cell_column(
+        datastore,
+        "nullable_qc",
+        np.full(active.shape, 10, dtype=np.int32),
+        missing,
+    )
+    options = _minimal_run_options()
+    options["filtering"] = {
+        "method": "manual",
+        "attrs": ["nullable_qc"],
+        "lows": [0],
+        "highs": [20],
+        "keep_bounds": True,
+    }
+
+    run = datastore.pipeline.run(**options)
+
+    expected = active.copy()
+    expected[missing_index] = False
+    np.testing.assert_array_equal(run.cells.fetch_all("I"), expected)
+
+
+def test_pipeline_filtering_rejects_nullable_active_sample_label(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    active = np.asarray(datastore.cells.fetch_all("I"), dtype=bool)
+    missing = np.zeros(active.shape, dtype=bool)
+    missing[int(np.flatnonzero(active)[0])] = True
+    _insert_nullable_cell_column(
+        datastore,
+        "nullable_sample",
+        np.full(active.shape, "sample-a"),
+        missing,
+    )
+    options = _minimal_run_options()
+    options["filtering"] = {
+        "attrs": ["RNA_nCounts"],
+        "sample_column": "nullable_sample",
+        "min_cells_per_sample": 2,
+    }
+
+    with pytest.raises(PipelineExecutionError) as caught:
+        datastore.pipeline.run(**options)
+
+    assert caught.value.stage == "filtering"
+    assert isinstance(caught.value.__cause__, ValueError)
+    assert "contains missing labels among active cells" in str(caught.value.__cause__)
+
+
+def test_default_clustering_is_selected_by_a_persisted_silhouette_decision(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    cells_before = {
+        column: np.asarray(datastore.cells.fetch_all(column)).copy()
+        for column in datastore.cells.columns
+    }
+    assay = datastore.get_assay("RNA")
+    features_before = {
+        column: np.asarray(assay.feats.fetch_all(column)).copy()
+        for column in assay.feats.columns
+    }
+    options = _minimal_run_options()
+    options["leiden"] = None
+    run = datastore.pipeline.run(label="leiden-defaults", **options)
+
+    partitions = ("leiden_0.5", "leiden_0.75", "leiden_1.0", "leiden_1.25")
+    assert all(key in run for key in partitions)
+    assert "cluster_selection" in run
+    decision = artifact_group(datastore.zw, run["cluster_selection"])
+    assert tuple(decision.attrs["candidateKeys"]) == partitions
+    assert tuple(decision.attrs["tieOrder"]) == partitions
+    selected_key = decision.attrs["selectedKey"]
+    assert selected_key in partitions
+    assert run["clusters"] == run[selected_key]
+    scores = np.asarray(decision["scores"][:], dtype=float)
+    assert scores.shape == (4,)
+    assert np.isfinite(scores).any()
+    assert decision["sample_indices"].shape[0] <= 10_000
+    assert run.cells.columns[-5:] == (*partitions, "clusters")
+    assert "RNA_clusters" not in datastore.cells.columns
+    assert "hvgs" not in datastore.get_assay("RNA").feats.columns
+
+    assert set(datastore.cells.columns) == set(cells_before)
+    assert set(assay.feats.columns) == set(features_before)
+    for column, values in cells_before.items():
+        np.testing.assert_equal(datastore.cells.fetch_all(column), values)
+    for column, values in features_before.items():
+        np.testing.assert_equal(assay.feats.fetch_all(column), values)
+
+
+def test_custom_leiden_uses_only_the_requested_candidate_set(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    options = _minimal_run_options()
+    options["leiden"] = {"partitions": [0.4, 0.8]}
+    run = datastore.pipeline.run(**options)
+
+    assert "leiden_0.4" in run
+    assert "leiden_0.8" in run
+    assert run["clusters"] in {run["leiden_0.4"], run["leiden_0.8"]}
+    decision = artifact_group(datastore.zw, run["cluster_selection"])
+    assert tuple(decision.attrs["candidateKeys"]) == (
+        "leiden_0.4",
+        "leiden_0.8",
+    )
+    assert "leiden_1.0" not in run
+
+
+def test_cluster_selection_records_invalid_candidates_ties_and_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    store = _ClusterSelectionStore(root)
+    selection = _array_artifact(
+        root,
+        scope="datastore",
+        kind="cell_selection",
+        values={"values": np.ones(6, dtype=bool)},
+    )
+    pca = _array_artifact(
+        root,
+        kind="reduction",
+        values={
+            "data": np.asarray(
+                [
+                    [0.0, 0.0],
+                    [0.1, 0.0],
+                    [0.0, 0.1],
+                    [5.0, 5.0],
+                    [5.1, 5.0],
+                    [5.0, 5.1],
+                ],
+                dtype=np.float32,
+            )
+        },
+        inputs={"cell_selection": selection},
+    )
+    invalid = _array_artifact(
+        root,
+        kind="cluster_labels",
+        values={"values": np.zeros(6, dtype=np.int32)},
+        inputs={"cell_selection": selection},
+    )
+    first = _array_artifact(
+        root,
+        kind="cluster_labels",
+        values={"values": np.asarray([0, 0, 0, 1, 1, 1], dtype=np.int32)},
+        inputs={"cell_selection": selection},
+    )
+    second = _array_artifact(
+        root,
+        kind="cluster_labels",
+        values={"values": np.asarray([0, 0, 1, 1, 2, 2], dtype=np.int32)},
+        inputs={"cell_selection": selection},
+    )
+    monkeypatch.setattr(
+        "sklearn.metrics.silhouette_score",
+        lambda *_args, **_kwargs: 0.25,
+    )
+    candidates = (("invalid", invalid), ("first", first), ("second", second))
+
+    decision, selected_key, selected = _run_cluster_selection(
+        store,
+        pca=pca,
+        cell_selection=selection,
+        candidates=candidates,
+    )
+    group = artifact_group(root, decision)
+    assert selected_key == "first"
+    assert selected == first
+    assert group.attrs["invalidReasons"][0] == (
+        "sample contains fewer than two clusters"
+    )
+    assert tuple(group.attrs["tieOrder"]) == ("invalid", "first", "second")
+    np.testing.assert_allclose(group["scores"][:], [np.nan, 0.25, 0.25])
+
+    reused, reused_key, reused_selected = _run_cluster_selection(
+        store,
+        pca=pca,
+        cell_selection=selection,
+        candidates=candidates,
+    )
+    assert reused == decision
+    assert reused_key == selected_key
+    assert reused_selected == selected
+
+
+def test_rich_pipeline_views_plots_and_markers_remain_frozen_after_live_i_drift(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    initial = np.asarray(datastore.cells.fetch_all("I"), dtype=bool)
+    selected = np.flatnonzero(initial)[:250]
+    limited = np.zeros(datastore.cells.N, dtype=bool)
+    limited[selected] = True
+    datastore.cells.insert("I", limited, overwrite=True, force=True)
+
+    assay = datastore.get_assay("RNA")
+    cell_values_before = {
+        column: np.asarray(datastore.cells.fetch_all(column)).copy()
+        for column in datastore.cells.columns
+    }
+    feature_values_before = {
+        column: np.asarray(assay.feats.fetch_all(column)).copy()
+        for column in assay.feats.columns
+    }
+    cell_attrs_before = dict(datastore.cells.locations["primary"].attrs)
+    feature_attrs_before = dict(assay.feats.locations["primary"].attrs)
+    assay_attrs_before = dict(assay.attrs)
+
+    run = datastore.pipeline.run(
+        label="rich-frozen",
+        filtering=False,
+        hvg_count=50,
+        pca_dims=3,
+        neighbors_k=3,
+    )
+
+    assert list(run) == [
+        "input_cell_selection",
+        "analysis_cell_selection",
+        "feature_universe",
+        "cell_cycle",
         "highly_variable_features",
         "normalized",
         "pca",
@@ -49,796 +738,122 @@ def test_basic_rna_pipeline_returns_only_named_artifact_refs(
         "embedding_initialization",
         "umap",
         "leiden_0.5",
+        "leiden_0.75",
         "leiden_1.0",
+        "leiden_1.25",
         "paris",
-        "selected_clusters",
+        "cluster_selection",
+        "clusters",
+        "doublets",
         "markers",
     ]
-    assert all(isinstance(ref, ArtifactRef) for ref in artifacts.values())
-    assert artifacts["leiden_0.5"] != artifacts["leiden_1.0"]
-    assert all(
-        datastore_ephemeral.inspect_artifact(ref).complete for ref in artifacts.values()
-    )
-    assert (
-        datastore_ephemeral.resolve_features("RNA", "pipeline_hvgs")
-        == artifacts["highly_variable_features"]
-    )
-    assay = datastore_ephemeral.get_assay("RNA")
-    assert "pipeline_hvgs" in assay.feats.columns
-    assert "I__pipeline_hvgs" not in assay.feats.columns
-    marker_status = datastore_ephemeral.inspect_artifact(artifacts["markers"])
-    assert marker_status.inputs is not None
-    marker_features = ArtifactRef.from_dict(marker_status.inputs["feature_selection"])
-    assert marker_features == datastore_ephemeral.resolve_features(
-        "RNA", "all_features"
-    )
-    cluster_column = "RNA_leiden_1.0"
-    edited = datastore_ephemeral.cells.fetch(
-        cluster_column,
-        key="I",
-    ).copy()
-    edited[0] = int(edited.max()) + 1
-    datastore_ephemeral.cells.insert(
-        cluster_column,
-        edited,
-        key="I",
-        overwrite=True,
-    )
-    with pytest.raises(ValueError, match="cluster labels are stale"):
-        datastore_ephemeral.get_markers(
-            from_assay="RNA",
-            cell_key="I",
-            group_key=cluster_column,
-        )
+    decision = artifact_group(datastore.zw, run["cluster_selection"])
+    assert run["clusters"] == run[decision.attrs["selectedKey"]]
+    assert set(datastore.cells.columns) == set(cell_values_before)
+    assert set(assay.feats.columns) == set(feature_values_before)
+    for column, values in cell_values_before.items():
+        np.testing.assert_equal(datastore.cells.fetch_all(column), values)
+    for column, values in feature_values_before.items():
+        np.testing.assert_equal(assay.feats.fetch_all(column), values)
+    assert dict(datastore.cells.locations["primary"].attrs) == cell_attrs_before
+    assert dict(assay.feats.locations["primary"].attrs) == feature_attrs_before
+    assert dict(assay.attrs) == assay_attrs_before
 
-
-def test_pipeline_emits_ordered_events_and_omits_skipped_stages(
-    datastore_ephemeral,
-) -> None:
-    events: list[PipelineEvent] = []
-    messages: list[str] = []
-    sink = logger.add(
-        lambda message: messages.append(message.record["message"]),
-        level="INFO",
-    )
-
-    try:
-        artifacts = datastore_ephemeral.pipeline.run(
-            filtering=False,
-            cell_cycle_scoring=False,
-            highly_variable_features={
-                "top_n": 50,
-                "label": "pipeline_callback_hvgs",
-            },
-            pca={"dims": 3, "n_centroids": 5},
-            neighbors={"k": 3},
-            umap=False,
-            leiden={},
-            paris=False,
-            doublet_scoring=False,
-            markers=False,
-            callback=events.append,
-        )
-    finally:
-        logger.remove(sink)
-
-    expected_stages = [
-        "highly_variable_features",
-        "normalization",
-        "pca",
-        "ann_index",
-        "neighbors",
-        "connectivity",
-        "embedding_initialization",
-    ]
-    assert [(event.kind, event.stage) for event in events] == [
-        (kind, stage)
-        for stage in expected_stages
-        for kind in ("stage_started", "stage_completed")
-    ]
-    assert all(event.error is None for event in events)
-    lifecycle_messages = [
-        message
-        for message in messages
-        if message.startswith("Running pipeline stage:")
-        or message.startswith("Completed pipeline stage:")
-        or message.startswith("Pipeline completed")
-    ]
-    assert lifecycle_messages == [
-        *[
-            message
-            for stage in expected_stages
-            for message in (
-                f"Running pipeline stage: {stage.replace('_', ' ')}",
-                f"Completed pipeline stage: {stage.replace('_', ' ')}",
-            )
-        ],
-        f"Pipeline completed with {len(artifacts)} artifacts",
-    ]
-
-
-def test_pipeline_emits_failed_stage_and_reraises_original_error(
-    datastore_ephemeral,
-    monkeypatch,
-) -> None:
-    datastore = datastore_ephemeral
-    events: list[PipelineEvent] = []
-    expected_error = RuntimeError("PCA callback test failure")
-
-    def fail_pca(self, *_args, **_kwargs):
-        raise expected_error
-
-    monkeypatch.setattr(type(datastore), "run_pca", fail_pca)
-
-    with pytest.raises(RuntimeError, match="PCA callback test failure") as raised:
-        datastore.pipeline.run(
-            filtering=False,
-            cell_cycle_scoring=False,
-            highly_variable_features={
-                "top_n": 50,
-                "label": "pipeline_callback_failure_hvgs",
-            },
-            pca={"dims": 3, "n_centroids": 5},
-            umap=False,
-            leiden={},
-            paris=False,
-            doublet_scoring=False,
-            markers=False,
-            callback=events.append,
-        )
-
-    assert raised.value is expected_error
-    assert [(event.kind, event.stage) for event in events[-2:]] == [
-        ("stage_started", "pca"),
-        ("stage_failed", "pca"),
-    ]
-    assert events[-1].error is expected_error
-
-
-def test_pipeline_retry_reuses_completed_artifacts_after_stage_failure(
-    datastore_ephemeral,
-    monkeypatch,
-) -> None:
-    datastore = datastore_ephemeral
-    expected_error = RuntimeError("transient neighbor query failure")
-    observed: dict[str, list[ArtifactRef]] = {
-        "normalized": [],
-        "pca": [],
-        "ann_index": [],
-    }
-    original_methods = {
-        "normalized": type(datastore).run_normalization,
-        "pca": type(datastore).run_pca,
-        "ann_index": type(datastore).build_ann_index,
-    }
-
-    def recording_method(stage: str):
-        original = original_methods[stage]
-
-        def wrapped(self, *args, **kwargs):
-            ref = original(self, *args, **kwargs)
-            observed[stage].append(ref)
-            return ref
-
-        return wrapped
-
-    for stage, method_name in (
-        ("normalized", "run_normalization"),
-        ("pca", "run_pca"),
-        ("ann_index", "build_ann_index"),
-    ):
-        monkeypatch.setattr(
-            type(datastore),
-            method_name,
-            recording_method(stage),
-        )
-
-    original_query_neighbors = type(datastore).query_neighbors
-    query_attempts = 0
-
-    def fail_first_neighbor_query(self, *args, **kwargs):
-        nonlocal query_attempts
-        query_attempts += 1
-        if query_attempts == 1:
-            raise expected_error
-        return original_query_neighbors(self, *args, **kwargs)
-
-    monkeypatch.setattr(
-        type(datastore),
-        "query_neighbors",
-        fail_first_neighbor_query,
-    )
-    options = {
-        "filtering": False,
-        "cell_cycle_scoring": False,
-        "highly_variable_features": {
-            "top_n": 50,
-            "label": "pipeline_resume_hvgs",
-        },
-        "pca": {"dims": 3, "n_centroids": 5},
-        "neighbors": {"k": 3},
-        "umap": False,
-        "leiden": {},
-        "paris": False,
-        "doublet_scoring": False,
-        "markers": False,
-    }
-    failed_events: list[PipelineEvent] = []
-
-    with pytest.raises(
-        RuntimeError, match="transient neighbor query failure"
-    ) as raised:
-        datastore.pipeline.run(**options, callback=failed_events.append)
-
-    assert raised.value is expected_error
-    assert [(event.kind, event.stage) for event in failed_events[-2:]] == [
-        ("stage_started", "neighbors"),
-        ("stage_failed", "neighbors"),
-    ]
-    assert failed_events[-1].error is expected_error
-    assert not {
-        "connectivity",
-        "embedding_initialization",
-    }.intersection(event.stage for event in failed_events)
-    first_refs = {stage: refs[0] for stage, refs in observed.items()}
-    assert all(datastore.inspect_artifact(ref).complete for ref in first_refs.values())
-
-    retry_events: list[PipelineEvent] = []
-    artifacts = datastore.pipeline.run(**options, callback=retry_events.append)
-
-    assert query_attempts == 2
-    assert all(event.kind != "stage_failed" for event in retry_events)
-    assert artifacts["normalized"] == first_refs["normalized"]
-    assert artifacts["pca"] == first_refs["pca"]
-    assert artifacts["ann_index"] == first_refs["ann_index"]
-    assert {stage: refs[1] for stage, refs in observed.items()} == first_refs
-
-
-def test_pipeline_logs_callback_errors_and_continues(
-    datastore_ephemeral,
-    monkeypatch,
-) -> None:
-    callback_logs: list[str] = []
-
-    class RecordingLogger:
-        def info(self, _message: str) -> None:
-            pass
-
-        def exception(self, message: str) -> None:
-            callback_logs.append(message)
-
-    def fail_callback(_event: PipelineEvent) -> None:
-        raise RuntimeError("Callback failed")
-
-    monkeypatch.setattr(
-        pipeline_accessor_module,
-        "logger",
-        RecordingLogger(),
-    )
-
-    artifacts = datastore_ephemeral.pipeline.run(
-        filtering=False,
-        cell_cycle_scoring=False,
-        highly_variable_features={
-            "top_n": 50,
-            "label": "pipeline_broken_callback_hvgs",
-        },
-        pca={"dims": 3, "n_centroids": 5},
-        neighbors={"k": 3},
-        umap=False,
-        leiden={},
-        paris=False,
-        doublet_scoring=False,
-        markers=False,
-        callback=fail_callback,
-    )
-
-    assert artifacts["pca"].kind == "reduction"
-    assert callback_logs
-    assert all("Pipeline callback failed" in message for message in callback_logs)
-
-
-def test_pipeline_rejects_unknown_id(datastore_ephemeral) -> None:
-    with pytest.raises(ValueError, match="basic_rna_analysis"):
-        datastore_ephemeral.pipeline.run(pipeline_id="unknown")
-
-
-def test_pipeline_requires_highly_variable_features(datastore_ephemeral) -> None:
-    with pytest.raises(ValueError, match="highly_variable_features"):
-        datastore_ephemeral.pipeline.run(
-            highly_variable_features=False,
-            umap=False,
-            leiden={},
-            paris=False,
-            doublet_scoring=False,
-            markers=False,
-        )
-
-
-def test_pipeline_selects_clusters_by_pca_silhouette(
-    datastore_ephemeral,
-    monkeypatch,
-) -> None:
-    events: list[PipelineEvent] = []
-    store = datastore_ephemeral
-    original = store._store_to_sparse
-    graph_reads = 0
-
-    def counted_store_to_sparse(*args, **kwargs):
-        nonlocal graph_reads
-        graph_reads += 1
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(store, "_store_to_sparse", counted_store_to_sparse)
-    artifacts = store.pipeline.run(
-        filtering={},
-        cell_cycle_scoring=False,
-        highly_variable_features={
-            "top_n": 100,
-            "label": "pipeline_silhouette_hvgs",
-        },
-        pca={"dims": 5, "n_centroids": 10},
-        neighbors={"k": 3},
-        umap=False,
-        leiden={
-            0.5: {},
-            1.0: {},
-        },
-        paris={"n_clusters": 3, "label": "pipeline_silhouette_paris"},
-        clustering_concurrency=2,
-        doublet_scoring=False,
-        markers={},
-        callback=events.append,
-    )
-
-    assert "selected_clusters" in artifacts
-    selected = artifacts["selected_clusters"]
-    candidates = {
-        artifacts["leiden_0.5"]: "RNA_leiden_0.5",
-        artifacts["leiden_1.0"]: "RNA_leiden_1.0",
-        artifacts["paris"]: "RNA_pipeline_silhouette_paris",
-    }
-    assert selected in candidates
-    assert artifacts["markers"].kind == "marker_table"
-    assert graph_reads == 1
-    assert store._graphMemoryCache is None
-    for stage in ("cluster_selection", "markers"):
-        assert [event.kind for event in events if event.stage == stage] == [
-            "stage_started",
-            "stage_completed",
-        ]
-
-    labels = store.cells.fetch("RNA_clusters")
-    assert (labels == store.cells.fetch(candidates[selected])).all()
-    column = store.zw["cellData"]["RNA_clusters"]
-    assert ArtifactRef.from_dict(column.attrs["source_artifact"]) == selected
-    assert store.get_markers(group_key="RNA_clusters", group_id=labels[0]) is not None
-
-
-def test_pipeline_names_a_single_partition_without_silhouette(
-    datastore_ephemeral,
-    monkeypatch,
-) -> None:
-    def fail(*args, **kwargs):
-        raise AssertionError("silhouette selection is unnecessary for one partition")
-
-    monkeypatch.setattr(
-        pipeline_accessor_module.PipelineAccessor,
-        "_select_clusters_by_pca_silhouette",
-        fail,
-    )
-    artifacts = datastore_ephemeral.pipeline.run(
-        filtering={},
-        cell_cycle_scoring=False,
-        highly_variable_features={"top_n": 100, "label": "pipeline_single_hvgs"},
-        pca={"dims": 5, "n_centroids": 10},
-        neighbors={"k": 3},
-        umap=False,
-        leiden={1.0: {}},
-        paris=False,
-        doublet_scoring=False,
-        markers=False,
-    )
-
-    assert artifacts["selected_clusters"] == artifacts["leiden_1.0"]
-    store = datastore_ephemeral
-    assert (
-        store.cells.fetch("RNA_clusters") == store.cells.fetch("RNA_leiden_1.0")
-    ).all()
-
-
-def test_pipeline_rejects_downstream_steps_without_clustering(
-    datastore_ephemeral,
-) -> None:
-    with pytest.raises(ValueError, match="Marker needs a clustering result"):
-        datastore_ephemeral.pipeline.run(
-            filtering={},
-            cell_cycle_scoring=False,
-            highly_variable_features={"top_n": 100, "label": "pipeline_no_hvgs"},
-            pca={"dims": 5, "n_centroids": 10},
-            neighbors={"k": 3},
-            umap=False,
-            leiden={},
-            paris=False,
-            doublet_scoring=False,
-            markers={},
-        )
-
-
-def test_pipeline_rejects_invalid_clustering_concurrency(datastore_ephemeral) -> None:
-    with pytest.raises(ValueError, match="clustering_concurrency"):
-        datastore_ephemeral.pipeline.run(
-            clustering_concurrency=0,
-            umap=False,
-            leiden={},
-            paris=False,
-            doublet_scoring=False,
-            markers=False,
-        )
-
-
-def test_pipeline_reuses_leiden_without_recomputing(
-    datastore_ephemeral,
-    monkeypatch,
-) -> None:
-    datastore = datastore_ephemeral
-    options = {
-        "filtering": False,
-        "cell_cycle_scoring": False,
-        "highly_variable_features": {
-            "top_n": 100,
-            "label": "pipeline_cached_leiden_hvgs",
-        },
-        "pca": {"dims": 3, "n_centroids": 5},
-        "neighbors": {"k": 3},
-        "umap": False,
-        "leiden": {0.5: {}},
-        "paris": False,
-        "doublet_scoring": False,
-        "markers": False,
-    }
-    first = datastore.pipeline.run(**options)
-
-    def fail_compute(*_args, **_kwargs):
-        pytest.fail("A reusable Leiden artifact must not be recomputed")
-
-    monkeypatch.setattr(
-        type(datastore),
-        "_compute_prepared_leiden",
-        staticmethod(fail_compute),
-    )
-    events: list[PipelineEvent] = []
-    second = datastore.pipeline.run(**options, callback=events.append)
-
-    assert second["leiden_0.5"] == first["leiden_0.5"]
-    assert [
-        (event.kind, event.stage) for event in events if event.stage == "leiden_0.5"
-    ] == [
-        ("stage_started", "leiden_0.5"),
-        ("stage_completed", "leiden_0.5"),
-    ]
-
-
-def test_pipeline_computes_leiden_with_requested_graph_options(
-    datastore_ephemeral,
-    monkeypatch,
-) -> None:
-    datastore = datastore_ephemeral
-    original_compute = type(datastore)._compute_prepared_leiden
-    observed = False
-
-    def capture_graph(prepared, graph):
-        nonlocal observed
-        observed = True
-        assert prepared.symmetric_graph is True
-        assert prepared.graph_upper_only is True
-        assert tril(graph, k=-1).nnz == 0
-        return original_compute(prepared, graph)
-
-    monkeypatch.setattr(
-        type(datastore),
-        "_compute_prepared_leiden",
-        staticmethod(capture_graph),
-    )
-    datastore.pipeline.run(
-        filtering=False,
-        cell_cycle_scoring=False,
-        highly_variable_features={
-            "top_n": 100,
-            "label": "pipeline_graph_options_hvgs",
-        },
-        pca={"dims": 3, "n_centroids": 5},
-        neighbors={"k": 3},
-        umap=False,
-        leiden={
-            0.5: {
-                "symmetric_graph": True,
-                "graph_upper_only": True,
-            }
-        },
-        paris=False,
-        doublet_scoring=False,
-        markers=False,
-    )
-
-    assert observed is True
-
-
-def test_pipeline_reports_failed_and_aborted_clustering_jobs(
-    datastore_ephemeral,
-    monkeypatch,
-) -> None:
-    datastore = datastore_ephemeral
-    original_compute = type(datastore)._compute_prepared_leiden
-    expected_error = RuntimeError("Leiden callback test failure")
-    events: list[PipelineEvent] = []
-
-    def fail_one_resolution(prepared, graph):
-        if prepared.resolution == 0.5:
-            raise expected_error
-        return original_compute(prepared, graph)
-
-    monkeypatch.setattr(
-        type(datastore),
-        "_compute_prepared_leiden",
-        staticmethod(fail_one_resolution),
-    )
-
-    with pytest.raises(RuntimeError, match="Leiden callback test failure") as raised:
-        datastore.pipeline.run(
-            filtering=False,
-            cell_cycle_scoring=False,
-            highly_variable_features={
-                "top_n": 100,
-                "label": "pipeline_failed_clustering_hvgs",
-            },
-            pca={"dims": 3, "n_centroids": 5},
-            neighbors={"k": 3},
-            umap=False,
-            leiden={0.5: {}, 1.0: {}},
-            paris=False,
-            clustering_concurrency=2,
-            doublet_scoring=False,
-            markers=False,
-            callback=events.append,
-        )
-
-    assert raised.value is expected_error
-    failed_events = {
-        event.stage: event
-        for event in events
-        if event.kind == "stage_failed" and event.stage in {"leiden_0.5", "leiden_1.0"}
-    }
-    assert failed_events["leiden_0.5"].error is expected_error
-    assert isinstance(failed_events["leiden_1.0"].error, RuntimeError)
-    assert "was not written" in str(failed_events["leiden_1.0"].error)
-    for stage in ("leiden_0.5", "leiden_1.0"):
-        assert [event.kind for event in events if event.stage == stage] == [
-            "stage_started",
-            "stage_failed",
-        ]
-
-
-def test_leiden_public_api_does_not_accept_precomputed_membership(
-    datastore_ephemeral,
-) -> None:
-    parameters = inspect.signature(datastore_ephemeral.run_leiden_clustering).parameters
-    assert "precomputed_membership" not in parameters
-
-
-def test_pipeline_overlaps_paris_compute_but_serializes_leiden_publish(
-    datastore_ephemeral,
-    monkeypatch,
-) -> None:
-    datastore = datastore_ephemeral
-    compute_started = Event()
-    paris_started = Event()
-    paris_finished = Event()
-    original_compute = type(datastore)._compute_prepared_leiden
-    original_paris = type(datastore).run_paris_clustering
-    original_publish = type(datastore)._publish_prepared_leiden
-    callback_events: list[PipelineEvent] = []
-    callback_threads: list[int] = []
-    messages: list[str] = []
-    caller_thread = get_ident()
-
-    def record_event(event: PipelineEvent) -> None:
-        callback_events.append(event)
-        callback_threads.append(get_ident())
-
-    def observed_compute(prepared, graph):
-        compute_started.set()
-        assert paris_started.wait(timeout=5)
-        return original_compute(prepared, graph)
-
-    def observed_paris(self, *args, **kwargs):
-        paris_started.set()
-        assert compute_started.wait(timeout=5)
-        result = original_paris(self, *args, **kwargs)
-        paris_finished.set()
-        return result
-
-    def observed_publish(self, prepared, membership):
-        assert paris_finished.is_set()
-        return original_publish(self, prepared, membership)
-
-    monkeypatch.setattr(
-        type(datastore),
-        "_compute_prepared_leiden",
-        staticmethod(observed_compute),
-    )
-    monkeypatch.setattr(
-        type(datastore),
-        "run_paris_clustering",
-        observed_paris,
-    )
-    monkeypatch.setattr(
-        type(datastore),
-        "_publish_prepared_leiden",
-        observed_publish,
-    )
-
-    sink = logger.add(
-        lambda message: messages.append(message.record["message"]),
-        level="INFO",
-    )
-    try:
-        datastore.pipeline.run(
-            filtering=False,
-            cell_cycle_scoring=False,
-            highly_variable_features={
-                "top_n": 100,
-                "label": "pipeline_concurrency_hvgs",
-            },
-            pca={"dims": 3, "n_centroids": 5},
-            neighbors={"k": 3},
-            umap=False,
-            leiden={0.5: {}},
-            paris={"n_clusters": 3, "label": "pipeline_concurrency_paris"},
-            clustering_concurrency=2,
-            doublet_scoring=False,
-            markers=False,
-            callback=record_event,
-        )
-    finally:
-        logger.remove(sink)
-
-    assert paris_finished.is_set()
-    assert set(callback_threads) == {caller_thread}
-    for stage in ("leiden_0.5", "paris"):
-        assert [event.kind for event in callback_events if event.stage == stage] == [
-            "stage_started",
-            "stage_completed",
-        ]
-        label = stage.replace("_", " ")
-        expected_messages = [
-            f"Running pipeline stage: {label}",
-            f"Completed pipeline stage: {label}",
-        ]
-        assert [message for message in messages if message in expected_messages] == (
-            expected_messages
-        )
-
-
-def test_pipeline_rejects_unsaved_markers_before_writes(
-    datastore_ephemeral,
-) -> None:
-    before = set(datastore_ephemeral.cells.columns)
-
-    with pytest.raises(ValueError, match="skip_save"):
-        datastore_ephemeral.pipeline.run(
-            markers={"skip_save": True},
-        )
-
-    assert set(datastore_ephemeral.cells.columns) == before
-
-
-def test_basic_rna_pipeline_supports_optional_harmony(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
     datastore.cells.insert(
-        "pipeline_batch",
-        ["a" if i % 2 else "b" for i in range(datastore.cells.N)],
+        "I",
+        np.zeros(datastore.cells.N, dtype=bool),
         overwrite=True,
+        force=True,
     )
-
-    artifacts = datastore.pipeline.run(
-        filtering={},
-        cell_cycle_scoring=False,
-        highly_variable_features={
-            "top_n": 50,
-            "label": "pipeline_harmony_hvgs",
-        },
-        pca={"dims": 3, "n_centroids": 5},
-        harmony={
-            "batch_columns": ["pipeline_batch"],
-            "harmony_params": {"nclust": 3},
-        },
-        neighbors={"k": 3},
-        umap=False,
-        leiden={},
-        paris=False,
-        doublet_scoring=False,
-        markers=False,
+    reopened = datastore.pipeline.open(label="rich-frozen")
+    frame = reopened.cells.to_pandas_dataframe(
+        ["umap_1", "umap_2", "clusters", "doublet_score"]
     )
+    assert len(frame) == len(selected)
+    assert np.isfinite(frame[["umap_1", "umap_2"]].to_numpy()).all()
 
-    state = datastore.get_assay_state("RNA")
-    assert "harmony" in artifacts
-    assert state is not None
-    assert state.batch_correction == artifacts["harmony"]
+    plot = datastore.plots.embedding(
+        run=reopened,
+        layout="umap",
+        color_by="clusters",
+        show=False,
+        rasterize_threshold=0,
+    )
+    assert plot.figure is not None
+    plot.close()
+    raster = datastore.plots.embedding_raster(
+        run=reopened,
+        layout="umap",
+        color_by="doublet_score",
+        pixels=32,
+        block_rows=32,
+        show=False,
+    )
+    assert "artifact_layout" in raster.provenance.notes
+    assert "frozen_run_fields" in raster.provenance.notes
+    assert raster.provenance.n_cells == len(selected)
+    raster.close()
+    markers = datastore.get_markers(
+        marker=reopened["markers"],
+        min_score=0,
+        min_frac_exp=0,
+    )
+    assert {
+        "group_id",
+        "feature_name",
+        "feature_index",
+        "score",
+        "frac_exp",
+    }.issubset(markers.columns)
 
 
-def test_basic_rna_pipeline_runs_score_steps_after_clustering(
+def test_harmony_doublets_record_an_uncorrected_internal_graph_only(
     datastore_ephemeral,
     monkeypatch,
 ) -> None:
     datastore = datastore_ephemeral
-    events: list[PipelineEvent] = []
-    temporary_paths: list[Path] = []
-    original_run_mapping = type(datastore).run_mapping
+    batch = np.where(np.arange(datastore.cells.N) % 2, "b", "a")
+    datastore.cells.insert("pipeline_batch", batch)
+    captured: dict[str, Any] = {}
+    original_doublets = type(datastore)._run_doublet_detection_artifact
 
-    def observe_mapping(query, reference, mapping_name, **kwargs):
-        assert query is not datastore
-        temporary_paths.append(Path(query.zarr_loc))
-        return original_run_mapping(
-            query,
-            reference,
-            mapping_name,
-            **kwargs,
-        )
+    def capture_doublet_inputs(self, **kwargs):
+        captured.update(kwargs)
+        return original_doublets(self, **kwargs)
 
-    monkeypatch.setattr(type(datastore), "run_mapping", observe_mapping)
-    artifacts = datastore.pipeline.run(
-        filtering={},
-        cell_cycle_scoring={},
-        highly_variable_features={
-            "top_n": 50,
-            "label": "pipeline_full_hvgs",
-        },
-        pca={"dims": 3, "n_centroids": 5},
-        neighbors={"k": 3},
-        umap={"n_epochs": 5, "label": "pipeline_full_umap"},
-        leiden={0.5: {}},
-        paris={"n_clusters": 3, "label": "pipeline_full_paris"},
-        doublet_scoring={
-            "clusters": "paris",
-            "cluster_sample_fraction": 0.01,
-            "max_cells_per_cluster": 2,
-            "simulation_ratio": 0.01,
-            "save_k": 3,
-            "smoothing_t": 1,
-            "random_seed": 9,
-        },
-        markers={
-            "clusters": {"leiden": 0.5},
-            "features": "pipeline_full_hvgs",
-        },
-        callback=events.append,
+    monkeypatch.setattr(
+        type(datastore),
+        "_run_doublet_detection_artifact",
+        capture_doublet_inputs,
+    )
+    run = datastore.pipeline.run(
+        label="harmony-doublets",
+        filtering=False,
+        harmony_batch_columns=("pipeline_batch",),
+        hvg_count=50,
+        pca_dims=3,
+        neighbors_k=3,
+        umap=False,
+        leiden={"partitions": [1.0]},
+        cell_cycle=False,
+        paris=False,
+        doublets=True,
+        markers=False,
     )
 
-    assert artifacts["cell_cycle"].kind == "cell_cycle"
-    assert artifacts["doublets"].kind == "doublet_score"
-    assert artifacts["markers"].kind == "marker_table"
-    assert list(artifacts).index("doublets") > list(artifacts).index("paris")
-    assert temporary_paths and all(not path.exists() for path in temporary_paths)
-    assert not datastore.list_artifacts(
-        kind="projection",
-        from_assay="RNA",
+    assert run["clusters"] == captured["clusters"]
+    assert captured["connectivity"] != run["connectivity_map"]
+    assert not any(key.startswith("uncorrected_") for key in run)
+    stage = next(
+        item for item in run.report()["stages"] if item["stage"] == "doublet_graph"
     )
-    state = datastore.get_assay_state("RNA")
-    assert state is not None
-    assert state.connectivity_map == artifacts["connectivity_map"]
-    reference = datastore.get_mapping_reference()
-    assert reference.neighbors == artifacts["neighbors"]
-    assert reference.symphony_state is None
-    for stage in (
-        "cell_cycle_scoring",
-        "umap",
-        "doublet_scoring",
-        "markers",
-    ):
-        assert [event.kind for event in events if event.stage == stage] == [
-            "stage_started",
-            "stage_completed",
-        ]
+    stage_outputs = {
+        item["outputKey"]: ArtifactRef.from_dict(item["artifact"])
+        for item in stage["outputs"]
+    }
+    assert set(stage_outputs) == {
+        "uncorrected_ann_index",
+        "uncorrected_neighbors",
+        "uncorrected_connectivity_map",
+    }
+    assert captured["connectivity"] == stage_outputs["uncorrected_connectivity_map"]

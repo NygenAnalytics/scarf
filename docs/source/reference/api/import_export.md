@@ -45,8 +45,9 @@ Use this before `H5adReader` when you do not know which matrix and metadata keys
 Missing categorical or object values become `None`; missing numeric values become `NaN`.
 Unsupported group encodings are skipped with a warning.
 
-Dense `obsm` arrays with one row per cell are flattened into numbered metadata columns, such as `X_umap1` and `X_umap2`.
-Sparse arrays, group-encoded slots, and arrays with an unexpected row count are warned about and skipped.
+Pass `embedding_roles` and `cluster_keys` to select analytical H5AD values for artifact import.
+Selected `obsm` arrays and cluster labels are excluded from live metadata and returned as exact
+refs by `H5adToZarr.dump()`. Other supported `obs` columns remain literal metadata.
 
 ```{eval-rst}
 .. autofunction:: scarf.inspect_h5ad
@@ -54,6 +55,11 @@ Sparse arrays, group-encoded slots, and arrays with an unexpected row count are 
 
 ```{eval-rst}
 .. autoclass:: scarf.H5adInspectResult
+    :members:
+```
+
+```{eval-rst}
+.. autoclass:: scarf.H5adImportResult
     :members:
 ```
 
@@ -186,11 +192,30 @@ widths. Unset values stay under automatic planning from ``mem_budget`` and
 The two feature selectors are mutually exclusive.
 `SubsetZarr` selects cells but retains every feature in each supplied assay.
 
-`to_h5ad` and `to_mtx` export a complete assay.
-For feature-selective disk export, call `to_anndata` and use AnnData's writer.
+Without a `run`, `to_h5ad` and `to_mtx` export a complete assay.
+For feature-selective disk export outside a pipeline run, call `to_anndata` and use AnnData's
+writer.
 
-H5AD export recognizes UMAP and t-SNE coordinate pairs and writes them to `obsm`.
-H5AD import flattens supported dense `obsm` arrays into cell metadata; it does not preserve an AnnData-style `obsm` container inside `DataStore`.
+Pass a completed run to write its frozen cells, feature universe, and result fields directly:
+
+```python
+scarf.to_h5ad(ds.RNA, "analysis.h5ad", run=run)
+```
+
+The assay must be the exact assay object owned by the datastore that opened the run. Run export
+uses {py:meth}`~scarf.datastore.datastore.DataStore.to_anndata` to preserve the frozen view,
+writes its UMAP fields to `obsm["X_umap"]`, and keeps `clusters` in `obs`. `embeddings_cols`,
+feature-count recalculation, and a writer-specific thread override apply only to ordinary
+full-assay export and are rejected when `run` is supplied.
+
+`H5adToZarr.dump()` returns an `H5adImportResult` containing the written assays, analysis assay,
+all-cell selection, and imported embedding and clustering refs. Set `analysis_assay` when a
+multi-assay import selects analytical values. Use `DataStore.load_artifact(ref)` for payload access
+or pass the exact ref to a consumer. Import does not flatten these results into metadata columns.
+
+Ordinary `to_h5ad` export writes a complete assay and live metadata. Run-aware export reads only
+the completed run's frozen selections and fields, so export does not require physical result
+columns.
 
 `CrToZarr`, `MtxToZarr`, `H5adToZarr`, and `SparseToZarr` select source batch rows automatically when `batch_size` is omitted.
 The selection starts from the smallest destination row-shard height and shrinks only when required by the operation memory budget.

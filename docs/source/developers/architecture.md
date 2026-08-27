@@ -38,7 +38,9 @@ These calls do not create module-load cycles.
 
 ### Foundation
 
-- `storage/` owns stores, layouts, schemas, arrays, sharding, copying, resource budgets, storage profiles, materialization, ANN persistence, Zarr runtime guards, and artifact lineage reports.
+- `storage/` owns stores, layouts, schemas, arrays, sharding, copying, resource budgets, storage
+  profiles, materialization, ANN persistence, selection snapshots, run/stage records, Zarr runtime
+  guards, and artifact lineage reports.
 - `matrix/` owns the lazy blockwise matrix abstraction used over NumPy and Zarr arrays.
   Its arithmetic, indexing, and reduction behavior keeps it separate from low-level storage mechanics.
 - `utils/` owns generic array, compute, logging, prefetch, process, and progress helpers.
@@ -52,10 +54,11 @@ Column prefetch uses `storage.parallel` because read-ahead limits and I/O concur
 
 - `metadata/` owns Zarr-backed metadata tables, row streaming, and table queries.
   It is shared by datastore cell metadata and assay feature metadata, so neither `datastore`, `assay`, nor `storage` owns it.
-- `assay/` owns assay state, normalization, blockwise feature-summary computation, and the RNA, ATAC, and ADT assay types.
+- `assay/` owns normalization, blockwise feature-summary computation, and the RNA, ATAC, and ADT assay types.
   `DataStore` owns planning and persistence of feature-summary artifacts; a bare `Assay.score_features` remains computation-only.
-- `graph/` owns `AssayState`, graph feature projection through named artifact inputs, and the legacy encoded-path grammar used only for diagnostics and rejection fixtures.
-  Analysis execution must not resolve current inputs by parsing encoded paths.
+- `graph/` owns graph feature projection through named artifact inputs and rejects encoded-path inputs.
+  Analysis execution follows explicit artifact references and must not resolve inputs by parsing
+  encoded paths or choosing an implicit result.
 
 Data-model modules may call domain algorithms from the method that needs them.
 They must not import those packages at module load time.
@@ -117,6 +120,13 @@ Operation mixins have no runtime inheritance from datastore facades, no `__init_
 `TYPE_CHECKING` imports of siblings are allowed.
 Reusable algorithms must be placed in their domain package before being exposed through a datastore method.
 
+`datastore.pipeline_accessor` orchestrates the fixed basic RNA recipe, while
+`datastore.pipeline_run` exposes the narrow durable `PipelineRun` handle and its frozen cell and
+feature views. Pipeline execution creates immutable artifacts and a strict run/stage ledger under
+`pipeline/runs`; it does not write live metadata. DataStore-owned plotting, marker loading, and
+export consume narrow frozen-run views. Completed runs can be reopened by their immutable label or
+exact run ID.
+
 ### Presentation
 
 `plotting/` is the only plotting package.
@@ -147,9 +157,9 @@ New production code should import its canonical implementation directly unless i
 
 Compatibility policy for the 1.x series:
 
-- Feature selection and analysis state use a hard-break artifact contract.
-  There is no feature-key alias, encoded feature-column fallback, silent state migration, or implicit latest-result lookup.
-  Legacy feature fields in `AssayState` fail before computation or writes.
+- Feature selection and graph construction use a hard-break artifact contract.
+  Feature consumers require exact refs and do not parse encoded feature columns or choose an
+  implicit result.
 - Mapping references and query projections follow a hard-break contract.
   Incompatible artifacts fail with an explicit error rather than a silent upgrade.
   Read the current mapping and graph APIs for the supported paths.
@@ -164,7 +174,7 @@ Import the focused modules that own the current implementation.
 Use these rules when adding code:
 
 1. Put Zarr mechanics in `storage`, blockwise matrix behavior in `matrix`, and generic operational helpers in `utils`.
-2. Keep metadata and assay focused on state, normalization, and persistence.
+2. Keep metadata and assay focused on table access, normalization, and persistence.
 3. Put reusable computation in a concrete domain package.
 4. Keep domain packages independent of datastore and plotting.
 5. Use a named storage adapter when a domain persists an artifact.

@@ -12,6 +12,7 @@ from zarr.storage import MemoryStore
 import scarf.plotting as splt
 from scarf.datastore.datastore import DataStore
 from scarf.datastore.plot_accessor import DataStorePlotAccessor
+from scarf.storage import ArtifactRef
 
 
 _STORE_PLOT_METHODS = (
@@ -30,6 +31,43 @@ _STORE_PLOT_METHODS = (
     "matrixplot",
     "pseudotime_heatmap",
     "run_recipe",
+)
+
+_GRAPH_REF = ArtifactRef(
+    scope="assay",
+    assay="RNA",
+    kind="connectivity_map",
+    artifact_id="a" * 64,
+)
+_CLUSTER_REF = ArtifactRef(
+    scope="assay",
+    assay="RNA",
+    kind="cluster_cut",
+    artifact_id="b" * 64,
+)
+_MARKER_REF = ArtifactRef(
+    scope="assay",
+    assay="RNA",
+    kind="marker_table",
+    artifact_id="c" * 64,
+)
+_AGGREGATION_REF = ArtifactRef(
+    scope="assay",
+    assay="RNA",
+    kind="pseudotime_aggregation",
+    artifact_id="d" * 64,
+)
+_PROJECTION_REF = ArtifactRef(
+    scope="assay",
+    assay="RNA",
+    kind="projection",
+    artifact_id="e" * 64,
+)
+_EMBEDDING_REF = ArtifactRef(
+    scope="assay",
+    assay="RNA",
+    kind="embedding",
+    artifact_id="f" * 64,
 )
 
 
@@ -103,12 +141,26 @@ def test_plot_accessor_signatures_match_standalone_functions(name: str):
     standalone = getattr(splt, name)
     accessor_method = getattr(DataStorePlotAccessor, name)
 
-    assert _parameter_contract(accessor_method) == _parameter_contract(standalone)
+    accessor_contract = _parameter_contract(accessor_method)
+    if name in {"embedding", "embedding_raster"}:
+        accessor_contract = [
+            parameter for parameter in accessor_contract if parameter[0] != "run"
+        ]
+        layout_index = next(
+            index
+            for index, parameter in enumerate(accessor_contract)
+            if parameter[0] == "layout"
+        )
+        accessor_contract[layout_index] = _parameter_contract(standalone)[layout_index]
+    assert accessor_contract == _parameter_contract(standalone)
 
     standalone_annotations = _source_annotations(standalone)
     accessor_annotations = _source_annotations(accessor_method)
     standalone_annotations.pop("store")
     accessor_annotations.pop("self")
+    if name in {"embedding", "embedding_raster"}:
+        accessor_annotations.pop("run")
+        accessor_annotations["layout"] = standalone_annotations["layout"]
     assert accessor_annotations == standalone_annotations
 
 
@@ -118,6 +170,9 @@ def test_plot_accessor_type_hints_match_standalone_functions(name: str):
     accessor_hints = get_type_hints(getattr(DataStorePlotAccessor, name))
 
     standalone_hints.pop("store")
+    if name in {"embedding", "embedding_raster"}:
+        accessor_hints.pop("run")
+        accessor_hints["layout"] = standalone_hints["layout"]
     assert accessor_hints == standalone_hints
 
 
@@ -129,7 +184,7 @@ def test_plot_accessor_type_hints_match_standalone_functions(name: str):
             (),
             {"layout_key": "RNA_UMAP", "rasterize_threshold": 17},
         ),
-        ("embedding_raster", (), {"layout_key": "RNA_UMAP", "pixels": 32}),
+        ("embedding_raster", (), {"layout": _EMBEDDING_REF, "pixels": 32}),
         (
             "dotplot",
             (),
@@ -146,32 +201,39 @@ def test_plot_accessor_type_hints_match_standalone_functions(name: str):
         ),
         ("composition", (), {"category_by": "cluster", "kind": "per_sample"}),
         ("distribution", ("RNA_nCounts",), {"bins": 17}),
-        ("marker_heatmap", (), {"topn": 7, "linewidths": 0.25}),
+        (
+            "marker_heatmap",
+            (),
+            {"marker": _MARKER_REF, "topn": 7, "linewidths": 0.25},
+        ),
         (
             "mapping_calibration",
-            ("atlas",),
+            (_PROJECTION_REF,),
             {
+                "reference": object(),
                 "reference_class_group": "label",
                 "known_labels": ["a"],
             },
         ),
         (
             "mapping_confusion",
-            ("atlas",),
+            (_PROJECTION_REF,),
             {
+                "reference": object(),
                 "reference_class_group": "label",
                 "known_labels": ["a"],
             },
         ),
         (
             "mapping_evidence",
-            ("atlas",),
-            {"reference_class_group": "label"},
+            (_PROJECTION_REF,),
+            {"reference": object(), "reference_class_group": "label"},
         ),
         (
             "mapping_score",
-            ("atlas",),
+            (_PROJECTION_REF,),
             {
+                "reference": object(),
                 "kind": "histogram",
             },
         ),
@@ -181,15 +243,25 @@ def test_plot_accessor_type_hints_match_standalone_functions(name: str):
             {
                 "group_by": "cluster",
                 "layout_key": "RNA_UMAP",
+                "graph": _GRAPH_REF,
+                "cell_key": "I",
                 "minimum_edge_weight": 0.1,
             },
         ),
         ("run_recipe", ("recipe.toml",), {"show": False}),
-        ("cluster_tree", (), {"width": 2.5}),
+        (
+            "cluster_tree",
+            (),
+            {
+                "graph": _GRAPH_REF,
+                "clusters": _CLUSTER_REF,
+                "width": 2.5,
+            },
+        ),
         (
             "pseudotime_heatmap",
             (),
-            {"features": "all_features", "vmax": 3.0},
+            {"aggregation": _AGGREGATION_REF, "vmax": 3.0},
         ),
     ],
 )
@@ -213,6 +285,7 @@ def test_plot_accessor_forwards_to_canonical_function(
     bound = inspect.signature(method).bind(*args, **kwargs)
     bound.apply_defaults()
     expected_kwargs = dict(bound.arguments)
+    expected_kwargs.pop("run", None)
     expected_kwargs.update(expected_kwargs.pop("heatmap_kwargs", {}))
     expected_args = [store]
     if name == "distribution":
@@ -224,6 +297,117 @@ def test_plot_accessor_forwards_to_canonical_function(
 
     assert method(*args, **kwargs) is sentinel
     assert calls == [(tuple(expected_args), expected_kwargs)]
+
+
+def test_embedding_run_adapter_uses_exact_outputs_and_frozen_fields(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import scarf.datastore._plot_accessor as plot_accessor_module
+
+    layout = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="embedding",
+        artifact_id="f" * 64,
+    )
+    clusters = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="cluster_cut",
+        artifact_id="1" * 64,
+    )
+    owner = type("Owner", (), {"zw": object()})()
+    frozen_cells = type("FrozenCells", (), {"columns": ("sample_id",)})()
+
+    class FakeRun:
+        assay = "RNA"
+        cells = frozen_cells
+
+        def __init__(self) -> None:
+            self._owner = owner
+            self._outputs = {"umap": layout, "clusters": clusters}
+
+        def __contains__(self, key: object) -> bool:
+            return key in self._outputs
+
+        def __getitem__(self, key: str) -> ArtifactRef:
+            return self._outputs[key]
+
+    calls: list[tuple[object, dict[str, Any]]] = []
+
+    def canonical(store: object, **kwargs: Any) -> object:
+        calls.append((store, kwargs))
+        return object()
+
+    monkeypatch.setattr(plot_accessor_module, "PipelineRun", FakeRun)
+    monkeypatch.setattr(splt, "embedding", canonical)
+    accessor = DataStorePlotAccessor(owner)  # type: ignore[arg-type]
+    run = FakeRun()
+
+    accessor.embedding(
+        run=run,  # type: ignore[arg-type]
+        layout="umap",
+        color_by="sample_id",
+        show=False,
+    )
+    proxy, kwargs = calls.pop()
+    assert proxy is not owner
+    assert proxy.zw is owner.zw
+    assert proxy.cells._cells is frozen_cells
+    assert kwargs["layout"] == layout
+    assert kwargs["color_by"] == "sample_id"
+
+    accessor.embedding(
+        run=run,  # type: ignore[arg-type]
+        layout="umap",
+        color_by="clusters",
+        show=False,
+    )
+    _, kwargs = calls.pop()
+    assert kwargs["layout"] == layout
+    assert kwargs["color_by"] == clusters
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        accessor.embedding(
+            run=run,  # type: ignore[arg-type]
+            layout=layout,
+            show=False,
+        )
+    with pytest.raises(KeyError, match="no output or frozen cell field"):
+        accessor.embedding(
+            run=run,  # type: ignore[arg-type]
+            layout="umap",
+            color_by="live_only",
+            show=False,
+        )
+
+    monkeypatch.setattr(splt, "embedding_raster", canonical)
+    accessor.embedding_raster(
+        run=run,  # type: ignore[arg-type]
+        layout="umap",
+        color_by="sample_id",
+        show=False,
+    )
+    proxy, kwargs = calls.pop()
+    assert proxy is not owner
+    assert proxy.zw is owner.zw
+    assert proxy.cells._cells is frozen_cells
+    assert kwargs["layout"] == layout
+    assert kwargs["color_by"] == "sample_id"
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        accessor.embedding_raster(
+            run=run,  # type: ignore[arg-type]
+            layout=layout,
+            show=False,
+        )
+    with pytest.raises(KeyError, match="no frozen cell field"):
+        accessor.embedding_raster(
+            run=run,  # type: ignore[arg-type]
+            layout="umap",
+            color_by="live_only",
+            show=False,
+        )
 
 
 def test_datastore_plots_returns_a_fresh_store_bound_namespace():

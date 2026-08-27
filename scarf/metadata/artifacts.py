@@ -225,39 +225,6 @@ def artifact_values(
     return values if value_index is None else values[:, value_index]
 
 
-def link_cell_data_column(
-    root: zarr.Group,
-    column: str,
-    ref: ArtifactRef,
-    *,
-    value_name: str,
-    value_index: int | None = None,
-    default_display: Mapping[str, Any] | None = None,
-    preserved_display: Mapping[str, Any] | None = None,
-) -> None:
-    cell_data = as_zarr_group(root["cellData"], name="cellData")
-    target = as_zarr_array(cell_data[column], name=column)
-    display_to_write = None
-    if "display" in target.attrs:
-        current_display = target.attrs["display"]
-        if not isinstance(current_display, Mapping):
-            raise TypeError("Existing display metadata must be a mapping")
-        display_to_write = validate_display_metadata(current_display)
-    elif preserved_display is not None:
-        display_to_write = validate_display_metadata(preserved_display)
-    elif default_display is not None:
-        display_to_write = validate_display_metadata(default_display)
-    target.attrs["source_artifact"] = ref.to_dict()
-    target.attrs["source_value"] = value_name
-    if value_index is None:
-        if "value_index" in target.attrs:
-            del target.attrs["value_index"]
-    else:
-        target.attrs["value_index"] = int(value_index)
-    if display_to_write is not None:
-        target.attrs["display"] = display_to_write
-
-
 def column_display(
     root: zarr.Group,
     column: str,
@@ -342,61 +309,3 @@ def categorical_display(values: np.ndarray) -> dict[str, Any]:
         display["missing_label"] = "NA"
         display["missing_color"] = "#bdbdbd"
     return display
-
-
-def link_feature_data_column(
-    assay_group: zarr.Group,
-    column: str,
-    ref: ArtifactRef,
-    *,
-    value_name: str,
-    value_index: int | None = None,
-    default_display: Mapping[str, Any] | None = None,
-    preserved_display: Mapping[str, Any] | None = None,
-) -> None:
-    feature_data = as_zarr_group(
-        assay_group["featureData"],
-        name="featureData",
-    )
-    target = as_zarr_array(feature_data[column], name=column)
-    display_to_write = None
-    if "display" in target.attrs:
-        current_display = target.attrs["display"]
-        if not isinstance(current_display, Mapping):
-            raise TypeError("Existing display metadata must be a mapping")
-        display_to_write = validate_display_metadata(current_display)
-    elif preserved_display is not None:
-        display_to_write = validate_display_metadata(preserved_display)
-    elif default_display is not None:
-        display_to_write = validate_display_metadata(default_display)
-    target.attrs["source_artifact"] = ref.to_dict()
-    target.attrs["source_value"] = value_name
-    if value_index is None:
-        if "value_index" in target.attrs:
-            del target.attrs["value_index"]
-    else:
-        target.attrs["value_index"] = int(value_index)
-    if display_to_write is not None:
-        target.attrs["display"] = display_to_write
-
-
-def feature_column_display(
-    assay_group: zarr.Group,
-    column: str,
-) -> dict[str, Any] | None:
-    feature_data = as_zarr_group(
-        assay_group["featureData"],
-        name="featureData",
-    )
-    if column not in feature_data:
-        return None
-    attrs = as_zarr_array(
-        feature_data[column],
-        name=column,
-    ).attrs
-    if "display" not in attrs:
-        return None
-    raw_display = attrs["display"]
-    if not isinstance(raw_display, Mapping):
-        raise TypeError("Existing display metadata must be a mapping")
-    return validate_display_metadata(raw_display)

@@ -1,11 +1,19 @@
 # Assays and metadata API reference
 
 `Assay.score_features(feature_names, cell_key, ctrl_size, n_bins, rand_seed)` is computation-only.
-It computes full-row-order averages blockwise in memory and is safe on read-only counts; it does not plan artifacts, mount statistics, or write metadata.
-Persistent feature summaries and cell-cycle outputs belong to `DataStore.run_cell_cycle_scoring`.
+It computes full-row-order averages blockwise in memory and is safe on read-only counts; it does
+not plan artifacts or write metadata. Persistent cell-cycle outputs belong to
+`DataStore.run_cell_cycle_scoring`.
 
-Normalized materialization uses explicit cell and feature indexes through `Assay.save_normalized_data(cell_idx, feat_idx, location, ...)`.
-Lower assay methods do not resolve public feature labels.
+Feature-count percentages belong to
+`DataStore.run_feature_percentage(cell_selection, features)`. It derives the assay from the exact
+feature-selection ref and returns an assay-scoped `quality_metric` ref whose `values` array is the
+per-cell percentage. It does not add a metadata column.
+
+Persisted normalization belongs to
+`DataStore.run_normalization(cell_selection, features)`, which returns an immutable artifact ref.
+Assay normalization methods are computation-only and require explicit feature indexes where they
+do not accept an `ArtifactRef`.
 
 ```{eval-rst}
 .. autoclass:: scarf.assay.Assay

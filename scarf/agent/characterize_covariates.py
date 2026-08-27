@@ -16,7 +16,6 @@ from ..metadata.queries import (
     reduce_observation_units,
 )
 from ..metrics.association import directional_mapping, report_confounding
-from ..storage.types import as_zarr_array, as_zarr_group
 from ._deps import AGENT_INSTALL_HINT
 from .decide import DecisionValidationError, decide
 from .types import Decision, EvidenceItem, StageStatus
@@ -196,17 +195,6 @@ def _is_embedding_column(name: str) -> bool:
     return any(part in _SHORT_EMBEDDING_PARTS for part in parts)
 
 
-def _has_source_artifact(store: Any, column: str) -> bool:
-    try:
-        cell_data = as_zarr_group(store.zw["cellData"], name="cellData")
-        if column not in cell_data:
-            return False
-        attrs = as_zarr_array(cell_data[column], name=column).attrs
-    except (KeyError, TypeError, ValueError):
-        return False
-    return isinstance(attrs.get("source_artifact"), dict)
-
-
 def _infer_kind(values: np.ndarray) -> ColumnKind:
     if (
         values.dtype == object
@@ -278,8 +266,6 @@ def _triage_columns(
             continue
         if name.startswith(assay_prefixes):
             dropped.append((name, "dropAssayStat"))
-        elif _has_source_artifact(store, name):
-            dropped.append((name, "dropProvenance"))
         elif _is_embedding_column(name):
             dropped.append((name, "dropEmbedding"))
         else:

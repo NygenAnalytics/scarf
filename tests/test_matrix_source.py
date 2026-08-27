@@ -9,6 +9,10 @@ from zarr.codecs import BloscCodec, ZstdCodec
 from zarr.storage import ObjectStore
 
 from scarf.datastore.datastore import DataStore, mount_datastore
+from scarf.metadata.artifacts import (
+    plan_cell_data_artifact,
+    write_cell_data_artifact,
+)
 from scarf.storage.artifacts import ArtifactRef, artifact_group
 from scarf.storage.budget import ResourceBudget
 from scarf.storage.sharding import write_counts_t
@@ -156,6 +160,25 @@ def test_mount_datastore_multiple_assays(tmp_path):
     assert "counts" not in zarr.open_group(target, mode="r")["ADT"]
 
 
+def test_mount_datastore_does_not_copy_source_pipeline_runs(tmp_path):
+    source = str(tmp_path / "source_with_run.zarr")
+    target = str(tmp_path / "target_without_run.zarr")
+    _write_source_store(source, workspace=None)
+    source_root = zarr.open_group(source, mode="r+")
+    source_root.create_group(f"pipeline/runs/{'a' * 64}/stages")
+
+    mount_datastore(
+        source,
+        at=target,
+        default_assay="RNA",
+        min_features_per_cell=1,
+    )
+
+    mounted_root = zarr.open_group(target, mode="r")
+    assert "pipeline" in source_root
+    assert "pipeline" not in mounted_root
+
+
 def test_mounted_store_reopens_from_another_directory(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     values = _write_source_store("source.zarr", workspace=None)
@@ -273,7 +296,9 @@ def test_mounted_store_writes_only_to_target(tmp_path):
     assert int(np.asarray(ds.cells.fetch_all("I")).sum()) == 3
 
 
-def test_mount_copies_literal_feature_metadata_but_not_artifact_aliases(tmp_path):
+def test_mount_copies_literal_feature_metadata_and_resets_feature_selection(
+    tmp_path,
+):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
     _write_source_store(source, workspace=None)
@@ -285,18 +310,9 @@ def test_mount_copies_literal_feature_metadata_but_not_artifact_aliases(tmp_path
     )
     selected = source_ds.set_feature_selection(
         mask=np.array([True, True, False, False]),
-        label="selected_features",
     )
     source_features = source_ds.zw["RNA/featureData"]
     source_features["I"][:] = np.array([True, False, True, False])
-    source_features["I"].attrs["source_artifact"] = selected.to_dict()
-    source_features.create_array(
-        "half_published",
-        data=np.array([True, False, False, True]),
-    )
-    source_features.attrs["pending_feature_selection_aliases"] = {
-        "half_published": selected.to_dict()
-    }
 
     mounted = mount_datastore(source, at=target, default_assay="RNA")
 
@@ -307,21 +323,16 @@ def test_mount_copies_literal_feature_metadata_but_not_artifact_aliases(tmp_path
     )
     assert "all_features" not in mounted.RNA.feats.columns
     assert "selected_features" not in mounted.RNA.feats.columns
-    assert "half_published" not in mounted.RNA.feats.columns
     np.testing.assert_array_equal(
         mounted.RNA.feats.fetch_all("I"),
         np.ones(mounted.RNA.feats.N, dtype=bool),
     )
-    assert (
-        "pending_feature_selection_aliases"
-        not in mounted.RNA.feats.locations["primary"].attrs
-    )
+    assert selected.kind == "feature_selection"
 
     created = mounted.set_feature_selection(
         mask=np.array([True, False, True, False]),
-        label="mounted_features",
     )
-    assert mounted.resolve_features("RNA", "mounted_features") == created
+    assert mounted.resolve_features("RNA", created) == created
 
 
 def test_mounted_store_loads_assays_written_to_the_target(tmp_path):
@@ -343,8 +354,8 @@ def test_mounted_store_loads_assays_written_to_the_target(tmp_path):
         overwrite=True,
     )
     mounted.add_grouped_assay(
+        "modules",
         from_assay="RNA",
-        group_key="modules",
         assay_label="MODULES",
     )
 
@@ -386,8 +397,8 @@ def test_workspace_mounted_store_loads_assays_written_to_the_target(tmp_path):
         overwrite=True,
     )
     mounted.add_grouped_assay(
+        "modules",
         from_assay="RNA",
-        group_key="modules",
         assay_label="MODULES",
     )
 
@@ -410,25 +421,6 @@ def test_workspace_mounted_store_loads_assays_written_to_the_target(tmp_path):
     assert reopened.RNA.rawData.shape == (10, 4)
     assert reopened.MODULES.rawData.shape == (10, 2)
     assert _snapshot_store_files(source) == source_before
-
-
-def test_mount_rejects_malformed_pending_feature_alias_journal(tmp_path):
-    source = str(tmp_path / "source.zarr")
-    target = str(tmp_path / "target.zarr")
-    _write_source_store(source, workspace=None)
-    source_root = zarr.open_group(source, mode="r+")
-    source_root["RNA/featureData"].attrs["pending_feature_selection_aliases"] = [
-        "not",
-        "a",
-        "mapping",
-    ]
-
-    with pytest.raises(
-        ValueError,
-        match="pending_feature_selection_aliases must be a mapping",
-    ):
-        create_matrix_source(source, target)
-    assert not Path(target).exists()
 
 
 def test_mounted_store_computes_markers_without_writing_source(tmp_path):
@@ -457,19 +449,36 @@ def test_mounted_store_computes_markers_without_writing_source(tmp_path):
         overwrite=True,
     )
 
+    cell_selection = ds.snapshot_cell_selection()
+    cluster_plan = plan_cell_data_artifact(
+        ds.zw,
+        scope="assay",
+        assay="RNA",
+        kind="cluster_labels",
+        operation="test_marker_clusters",
+        parameters={},
+        inputs={},
+        execution_options={},
+        cell_selection=cell_selection,
+        arrays={"values": ((ds.cells.N,), None)},
+    )
+    write_cell_data_artifact(
+        ds.zw,
+        cluster_plan,
+        {"values": np.array(["a", "a", "b", "b"])},
+    )
     markers = ds.run_marker_search(
+        cluster_plan.ref,
         from_assay="RNA",
-        cell_key="I",
         features=ds.set_feature_selection(
             mask=np.ones(ds.RNA.feats.N, dtype=bool),
-            label="marker_features",
         ),
-        group_key="marker_groups",
         nthreads=1,
-        skip_save=True,
     )
 
-    assert set(markers) == {"a", "b"}
+    assert markers.kind == "marker_table"
+    assert ds.inspect_artifact(markers).complete
+    assert set(ds.get_markers(markers)["group_id"]) == {"a", "b"}
     assert _snapshot_store_files(source) == source_before
     assert "markers" not in zarr.open_group(target, mode="r")["RNA"]
 
@@ -658,7 +667,10 @@ def test_mounted_datastore_reads_remote_counts_and_persists_summary_locally(
     observed = np.concatenate([raw for _, raw, _, _, _ in blocks], axis=1)
     np.testing.assert_array_equal(observed, values[np.ix_(cell_idx, feat_idx)])
 
-    selection = ds.select_detected_features(min_cells=1)
+    selection = ds.select_detected_features(
+        ds.snapshot_cell_selection(),
+        min_cells=1,
+    )
     selection_status = ds.inspect_artifact(selection)
     summary_ref = ArtifactRef.from_dict(selection_status.inputs["feature_summary"])
     summary = artifact_group(ds.zw, summary_ref)
@@ -697,8 +709,8 @@ def test_mounted_store_normalization_and_graph(tmp_path):
     # Guarantee enough selected features for IncrementalPCA(dims).
     feature_mask = np.zeros(ds.RNA.feats.N, dtype=bool)
     feature_mask[:12] = True
-    features = ds.set_feature_selection(mask=feature_mask, label="hvgs")
-    build_neighbourhood_graph(
+    features = ds.set_feature_selection(mask=feature_mask)
+    graph = build_neighbourhood_graph(
         ds,
         features=features,
         k=3,
@@ -706,9 +718,7 @@ def test_mounted_store_normalization_and_graph(tmp_path):
         batch_size=25,
         local_cache=False,
     )
-    state = ds.get_assay_state("RNA")
-    assert state is not None
-    assert state.connectivity_map is not None
+    assert ds.inspect_artifact(graph).complete
     assert "counts" not in zarr.open_group(target, mode="r")["RNA"]
 
 
@@ -720,18 +730,22 @@ def test_mounted_store_build_mapping_reference(datastore_zarr_root, tmp_path):
         at=target,
         default_assay="RNA",
     )
-    features = ds.mark_hvgs(top_n=50, show_plot=False, bin_strategy="fixed")
-    build_neighbourhood_graph(
+    features = ds.select_hvgs(
+        ds.snapshot_cell_selection(),
+        top_n=50,
+        show_plot=False,
+        bin_strategy="fixed",
+    )
+    graph = build_neighbourhood_graph(
         ds,
         features=features,
         k=3,
         dims=5,
         n_centroids=10,
     )
-    state = ds.get_assay_state("RNA")
-    assert state is not None
-    assert state.neighbors is not None
-    reference = ds.build_mapping_reference(state.neighbors)
+    neighbors = ArtifactRef.from_dict(ds.inspect_artifact(graph).inputs["neighbors"])
+    reference_ref = ds.build_mapping_reference(neighbors)
+    reference = ds.get_mapping_reference(reference_ref)
     assert reference.method == "pca"
     assert reference.dataset_fingerprint
     assert "counts" not in zarr.open_group(target, mode="r")["RNA"]

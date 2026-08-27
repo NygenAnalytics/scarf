@@ -122,6 +122,7 @@ from scarf.trajectory.feature_dynamics import knn_clustering
 from scarf.writers import (
     CSVtoZarr,
     CrToZarr,
+    H5adImportResult,
     H5adToZarr,
     LoomToZarr,
     SeuratImportResult,
@@ -192,6 +193,7 @@ for writer_class in (
     CSVtoZarr,
 ):
     assert writer_class.__module__ == "scarf.writers"
+assert H5adImportResult.__module__ == "scarf.writers"
 assert SeuratImportResult.__module__ == "scarf.writers"
 assert inspect_seurat.__module__ == "scarf.readers"
 for writer_function in (
@@ -209,9 +211,10 @@ for writer_function in (
 for method in (
     "run_mapping",
     "run_marker_search",
-    "mark_hvgs",
+    "select_hvgs",
     "run_pseudotime_aggregation",
     "run_pseudotime_marker_search",
+    "load_metric_lisi",
     "metric_lisi",
 ):
     assert callable(getattr(DataStore, method))

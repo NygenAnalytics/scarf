@@ -33,7 +33,9 @@ In this tutorial, we will be mapping interferon-stimulated PBMCs onto a control 
 The shared author labels let us evaluate the result.
 
 Mapping currently supports RNA queries.
-The downloaded stores are immutable data sources. This tutorial mounts each one into a fresh writable analysis store so the artifact-era pipeline never reuses legacy analysis state. The reference and query must remain different stores.
+The downloaded stores are immutable data sources. This tutorial mounts each one into a fresh
+writable analysis store so new artifacts are isolated from the sources. The reference and query
+must remain different stores.
 
 For a reusable Symphony-style atlas, see {doc}`reference_atlases`.
 
@@ -52,28 +54,17 @@ from scarf.tools.repack_zarr import repack_store
 scarf.configure_output(level="WARNING", progress=True)
 
 repository = scarf.cytebase.connect("scarf_docs")
+analysis_directory = TemporaryDirectory()
+
 ctrl_path = repository.download_dataset(
     name="kang_15K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-stim_path = repository.download_dataset(
-    name="kang_14K_ifnb-pbmc_rnaseq",
-    destination="scarf_datasets",
-    zarr=True,
-)
-
-analysis_directory = TemporaryDirectory()
 ctrl_counts = Path(analysis_directory.name) / "control_counts.zarr"
-stim_counts = Path(analysis_directory.name) / "stimulated_counts.zarr"
 repack_store(
     f"{ctrl_path}/data.zarr",
     str(ctrl_counts),
-    nthreads=2,
-)
-repack_store(
-    f"{stim_path}/data.zarr",
-    str(stim_counts),
     nthreads=2,
 )
 ds_ctrl = scarf.mount_datastore(
@@ -81,6 +72,20 @@ ds_ctrl = scarf.mount_datastore(
     at=str(Path(analysis_directory.name) / "control_analysis.zarr"),
     default_assay="RNA",
     nthreads=4,
+)
+```
+
+```{code-cell} ipython3
+stim_path = repository.download_dataset(
+    name="kang_14K_ifnb-pbmc_rnaseq",
+    destination="scarf_datasets",
+    zarr=True,
+)
+stim_counts = Path(analysis_directory.name) / "stimulated_counts.zarr"
+repack_store(
+    f"{stim_path}/data.zarr",
+    str(stim_counts),
+    nthreads=2,
 )
 ds_stim = scarf.mount_datastore(
     str(stim_counts),
@@ -90,7 +95,8 @@ ds_stim = scarf.mount_datastore(
 )
 ```
 
-The structural repack rebuilds the RNA transpose required for streaming and does not migrate analysis state. Mounting the repacked counts into separate targets keeps the new reference and query lineage clean.
+The structural repack rebuilds the RNA transpose required for streaming. Mounting the repacked
+counts into separate targets keeps the new reference and query lineage isolated.
 
 ```{code-cell} ipython3
 ds_ctrl.plots.embedding(
@@ -112,30 +118,28 @@ The shared label vocabulary is what we use for evaluation.
 Build the reference graph with the standard RNA pipeline, then package the neighbour chain as an immutable mapping reference.
 
 ```{code-cell} ipython3
-artifacts = ds_ctrl.pipeline.run(
+run = ds_ctrl.pipeline.run(
+    label="mapping_reference",
     filtering=False,
-    cell_cycle_scoring=False,
-    highly_variable_features={
-        "min_cells": 10,
-        "top_n": 2000,
-        "min_mean": -3,
-        "max_mean": 2,
-        "max_var": 6,
-    },
-    pca={"dims": 25},
-    neighbors={"k": 17},
-    umap=False,
-    leiden={},
+    cell_cycle=False,
+    hvg_count=2000,
+    pca_dims=25,
+    neighbors_k=17,
+    leiden=False,
     paris=False,
-    doublet_scoring=False,
+    doublets=False,
     markers=False,
 )
-reference = ds_ctrl.build_mapping_reference(artifacts["neighbors"])
+reference_layout = run["umap"]
+reference_ref = ds_ctrl.build_mapping_reference(run["neighbors"])
+reference = ds_ctrl.get_mapping_reference(reference_ref)
 ```
 
 The completed `MappingReference` is immutable.
 Its `feature_selection` field pins the exact reference feature artifact rather than a metadata key.
 Its feature order, scaling, PCA loadings, neighbour index, and selected cells stay fixed in the reference datastore.
+`reference_layout` is the immutable UMAP from the same run and is used only to show where query
+weight landed.
 This example uses a plain PCA reference.
 A Symphony reference instead passes Harmony-corrected neighbours into `build_mapping_reference`.
 
@@ -146,23 +150,28 @@ It aligns query features to the reference panel, applies the reference normaliza
 Query cells are never inserted into the reference index.
 
 ```{code-cell} ipython3
-mapping = ds_stim.run_mapping(
+query_cell_selection = ds_stim.snapshot_cell_selection("I")
+mapping_ref = ds_stim.run_mapping(
     reference,
-    "stim",
+    query_cell_selection,
     query_assay="RNA",
     save_k=5,
     missing_feature_policy="reference_mean",
 )
 ```
 
-To check the neighbour arrays, reload the projection with `get_mapping_results()`. 
-Use `load_arrays=True` to get two arrays with one row per query cell and `save_k` columns. 
-`indices` identifies the nearest reference cells. 
-`distances` finite distances between the query cell and the neighbour reference cells.
+To check the neighbour arrays, reload the projection with `get_mapping_result()`.
+Use `load_arrays=True` to get two arrays with one row per query cell and `save_k` columns.
+`indices` identifies the nearest reference cells.
+`distances` contains finite distances between each query cell and its reference neighbours.
 
 ```{code-cell} ipython3
-peek = ds_stim.get_mapping_result(mapping, load_arrays=True)
-peek.n_cells, int(peek.indices.shape[1]), peek.indices[:3], peek.distances[:3]
+mapping = ds_stim.get_mapping_result(
+    mapping_ref,
+    reference=reference,
+    load_arrays=True,
+)
+mapping.n_cells, int(mapping.indices.shape[1]), mapping.indices[:3], mapping.distances[:3]
 ```
 
 `reference_mean` fills an absent query feature with the reference mean, which becomes zero after reference scaling.
@@ -190,8 +199,9 @@ score_groups = np.array(
     dtype=object,
 )
 ds_stim.plots.mapping_score(
-    mapping,
-    layout_key="RNA_UMAP",
+    mapping_ref,
+    reference=reference,
+    layout=reference_layout,
     target_groups=score_groups,
     size_by_score=True,
     figsize=(14, 3.4),
@@ -212,8 +222,9 @@ It is not a calibrated probability that the label is biologically correct.
 
 ```{code-cell} ipython3
 transferred_labels = ds_stim.get_target_classes(
-    mapping,
+    mapping_ref,
     reference_class_group="cluster_labels",
+    reference=reference,
     threshold_fraction=0.6,
 )
 ds_stim.cells.insert(
@@ -254,7 +265,8 @@ To force abstention by distance, pass `max_distance` to the evidence APIs.
 
 ```{code-cell} ipython3
 ds_stim.plots.mapping_evidence(
-    mapping,
+    mapping_ref,
+    reference=reference,
     reference_class_group="cluster_labels",
     target_groups=query_labels,
     metrics=("voteFraction", "topTwoMargin", "referenceDistancePercentile"),
@@ -264,11 +276,13 @@ ds_stim.plots.mapping_evidence(
 )
 ```
 
-Because this query daatset also carries orginal author labels, we can compare these known labels with our transferred labels.
+Because this query dataset also carries original author labels, we can compare these known labels
+with the transferred labels.
 
 ```{code-cell} ipython3
 ds_stim.plots.mapping_confusion(
-    mapping,
+    mapping_ref,
+    reference=reference,
     reference_class_group="cluster_labels",
     known_labels=query_labels,
     normalize="true",
@@ -287,7 +301,8 @@ Higher thresholds keep fewer cells and usually raise accuracy among the cells th
 
 ```{code-cell} ipython3
 ds_stim.plots.mapping_calibration(
-    mapping,
+    mapping_ref,
+    reference=reference,
     reference_class_group="cluster_labels",
     known_labels=query_labels,
     chosen_threshold=0.6,
@@ -309,15 +324,15 @@ focus_groups = np.array(
     [label if label in focus_labels else "other" for label in query_labels],
     dtype=object,
 )
-assert mapping.reference is not None
 ref_classes = np.asarray(
-    mapping.reference.fetch_cell_column("cluster_labels"),
+    reference.fetch_cell_column("cluster_labels"),
     dtype=object,
 )
 score_mass: dict[str, pd.Series] = {}
 for group, values in ds_stim.get_mapping_score(
-    mapping,
+    mapping_ref,
     target_groups=focus_groups,
+    reference=reference,
     log_transform=False,
 ):
     if group == "other":
@@ -337,8 +352,9 @@ score_mass_table.loc[
 
 ```{code-cell} ipython3
 ds_stim.plots.mapping_score(
-    mapping,
-    layout_key="RNA_UMAP",
+    mapping_ref,
+    reference=reference,
+    layout=reference_layout,
     target_groups=focus_groups,
     size_by_score=True,
     figsize=(14, 3.4),
@@ -355,16 +371,15 @@ If the scores were spread across multiple unrelated clusters, then it would be r
 
 ## 7. Reload a prepared mapping
 
-In a later session you may reopen the reference store and load the named mapping reference, then reload the query mapping by name:
+In a later session, retain the mapping-reference and projection artifact refs, reopen both stores, and reload the exact results:
 
 ```{code-cell} ipython3
-reference = ds_ctrl.get_mapping_reference()
+reference = ds_ctrl.get_mapping_reference(reference_ref)
 reloaded_mapping = ds_stim.get_mapping_result(
-    "stim",
+    mapping_ref,
     reference=reference,
-    query_assay="RNA",
 )
-reloaded_mapping.mapping_name, reloaded_mapping.n_cells
+reloaded_mapping.n_cells, reloaded_mapping.correction_method
 ```
 
 Building and reusing a Symphony-style fixed reference is covered in {doc}`reference_atlases`.

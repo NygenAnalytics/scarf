@@ -9,10 +9,12 @@ from scarf.storage.artifacts import ArtifactRef, inspect_artifact
 
 
 def test_hvg_public_contract_removed_assay_persistence_methods() -> None:
-    signature = inspect.signature(DataStore.mark_hvgs)
+    signature = inspect.signature(DataStore.select_hvgs)
     assert "hvg_key_name" not in signature.parameters
-    assert signature.parameters["label"].default == "hvgs"
+    assert "cell_key" not in signature.parameters
+    assert "label" not in signature.parameters
     assert signature.return_annotation in {ArtifactRef, "ArtifactRef"}
+    assert not hasattr(DataStore, "mark_hvgs")
     assert not hasattr(DataStore, "set_hvgs")
     assert not hasattr(RNAassay, "set_hvgs")
     assert not hasattr(RNAassay, "set_summary_stats")
@@ -20,11 +22,15 @@ def test_hvg_public_contract_removed_assay_persistence_methods() -> None:
     assert not hasattr(ATACassay, "set_feature_stats")
 
 
-def test_mark_hvgs_publishes_ref_and_exact_identity(datastore_ephemeral) -> None:
+def test_select_hvgs_returns_ref_without_creating_alias(
+    datastore_ephemeral,
+) -> None:
     store = datastore_ephemeral
-    ref = store.mark_hvgs(
+    cell_selection = store.snapshot_cell_selection()
+    columns_before = set(store.RNA.feats.columns)
+    ref = store.select_hvgs(
+        cell_selection,
         from_assay="RNA",
-        cell_key="I",
         min_cells=0,
         top_n=5,
         min_var=-np.inf,
@@ -36,16 +42,16 @@ def test_mark_hvgs_publishes_ref_and_exact_identity(datastore_ephemeral) -> None
         blacklist="",
         keep_bounds=True,
         show_plot=False,
-        label="test_hvgs",
         max_cells=np.inf,
         bin_strategy="adaptive",
     )
 
     assert isinstance(ref, ArtifactRef)
     assert ref.kind == "feature_selection"
-    assert store.resolve_features("RNA", "test_hvgs") == ref
+    assert store.resolve_features("RNA", ref) == ref
+    assert set(store.RNA.feats.columns) == columns_before
     status = inspect_artifact(store.zw, ref)
-    assert status.operation == "mark_hvgs"
+    assert status.operation == "select_hvgs"
     assert set(status.inputs or {}) == {"feature_summary"}
     assert status.parameters == {
         "min_cells": 0,
@@ -67,9 +73,9 @@ def test_mark_hvgs_publishes_ref_and_exact_identity(datastore_ephemeral) -> None
     assert values.dtype == np.dtype(bool)
     assert values.shape == corrected.shape == (store.RNA.feats.N,)
 
-    reused = store.mark_hvgs(
+    reused = store.select_hvgs(
+        cell_selection,
         from_assay="RNA",
-        cell_key="I",
         min_cells=0,
         top_n=5,
         min_var=-np.inf,
@@ -81,15 +87,14 @@ def test_mark_hvgs_publishes_ref_and_exact_identity(datastore_ephemeral) -> None
         blacklist="",
         keep_bounds=True,
         show_plot=False,
-        label="test_hvgs_alias",
         max_cells=np.inf,
         bin_strategy="adaptive",
     )
     assert reused == ref
-    assert store.resolve_features("RNA", "test_hvgs_alias") == ref
+    assert set(store.RNA.feats.columns) == columns_before
 
 
-def test_mark_hvgs_persists_effective_default_max_cells(
+def test_select_hvgs_persists_effective_default_max_cells(
     datastore_ephemeral,
 ) -> None:
     store = datastore_ephemeral
@@ -97,26 +102,25 @@ def test_mark_hvgs_persists_effective_default_max_cells(
     expected: int | float = n_selected - 20
     if expected <= 0:
         expected = np.inf
+    cell_selection = store.snapshot_cell_selection()
 
-    implicit = store.mark_hvgs(
+    implicit = store.select_hvgs(
+        cell_selection,
         from_assay="RNA",
-        cell_key="I",
         min_cells=0,
         top_n=5,
         n_bins=20,
         blacklist="",
         show_plot=False,
-        label="implicit_max",
     )
-    explicit = store.mark_hvgs(
+    explicit = store.select_hvgs(
+        cell_selection,
         from_assay="RNA",
-        cell_key="I",
         min_cells=0,
         top_n=5,
         n_bins=20,
         blacklist="",
         show_plot=False,
-        label="explicit_max",
         max_cells=expected,
     )
 
@@ -124,17 +128,19 @@ def test_mark_hvgs_persists_effective_default_max_cells(
     assert inspect_artifact(store.zw, implicit).parameters["max_cells"] == expected
 
 
-def test_mark_hvgs_rejects_empty_result_before_publication(
+def test_select_hvgs_rejects_empty_result_without_metadata_mutation(
     datastore_ephemeral,
 ) -> None:
     store = datastore_ephemeral
     store._ensure_all_features(store.RNA)
+    cell_selection = store.snapshot_cell_selection()
     before = set(store.list_artifacts(kind="feature_selection", from_assay="RNA"))
+    columns_before = set(store.RNA.feats.columns)
 
     with pytest.raises(ValueError, match="HVG selection contains no features"):
-        store.mark_hvgs(
+        store.select_hvgs(
+            cell_selection,
             from_assay="RNA",
-            cell_key="I",
             min_cells=0,
             max_cells=np.inf,
             top_n=5,
@@ -142,17 +148,18 @@ def test_mark_hvgs_rejects_empty_result_before_publication(
             n_bins=20,
             blacklist="",
             show_plot=False,
-            label="empty_hvgs",
         )
 
     after = set(store.list_artifacts(kind="feature_selection", from_assay="RNA"))
     assert after == before
-    assert "empty_hvgs" not in store.RNA.feats.columns
+    assert set(store.RNA.feats.columns) == columns_before
 
 
-def test_mark_hvgs_rejects_non_rna_assay(datastore_ephemeral) -> None:
+def test_select_hvgs_rejects_non_rna_assay(datastore_ephemeral) -> None:
+    cell_selection = datastore_ephemeral.snapshot_cell_selection()
     with pytest.raises(TypeError, match="RNAassay"):
-        datastore_ephemeral.mark_hvgs(
+        datastore_ephemeral.select_hvgs(
+            cell_selection,
             from_assay="assay2",
             show_plot=False,
         )

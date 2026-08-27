@@ -1,10 +1,11 @@
-# Artifacts and assay state API reference
+# Artifacts, lineage, and summaries API reference
 
-An {term}`artifact` is a persisted result, and its {term}`provenance` is what allows Scarf to {term}`reuse` it.
-Analysis code usually reaches artifacts through `DataStore` methods.
-The types below are the public contracts for a metadata-only store summary, references, status records, lineage, and the assay's current {term}`analysis chain`.
+An {term}`artifact` is an immutable persisted result. Its {term}`provenance` lets Scarf verify its
+inputs, inspect its lineage, and {term}`reuse` a completed match. Analysis code normally creates and
+consumes artifacts through `DataStore` methods.
 
-See {doc}`../../concepts/provenance` and {doc}`../../tutorials/graph_construction`.
+See {doc}`../../concepts/provenance`, {doc}`pipeline`, and
+{doc}`../../tutorials/graph_construction`.
 
 ## Types
 
@@ -14,10 +15,8 @@ See {doc}`../../concepts/provenance` and {doc}`../../tutorials/graph_constructio
 
    scarf.ArtifactRef
    scarf.ArtifactResolutionError
-   scarf.IncompatibleAnalysisStateError
    scarf.ArtifactStatus
    scarf.ArtifactLineage
-   scarf.AssayState
    scarf.DataStoreSummary
    scarf.storage.refs.ExternalArtifactRef
    scarf.storage.ARTIFACT_KINDS
@@ -30,16 +29,10 @@ See {doc}`../../concepts/provenance` and {doc}`../../tutorials/graph_constructio
 .. autoclass:: scarf.ArtifactResolutionError
     :members:
 
-.. autoclass:: scarf.IncompatibleAnalysisStateError
-    :members:
-
 .. autoclass:: scarf.ArtifactStatus
     :members:
 
 .. autoclass:: scarf.ArtifactLineage
-    :members:
-
-.. autoclass:: scarf.AssayState
     :members:
 
 .. autoclass:: scarf.DataStoreSummary
@@ -56,13 +49,17 @@ Supported artifact kind names are listed in {py:data}`scarf.storage.ARTIFACT_KIN
     :annotation:
 ```
 
-## Feature selections and summaries
+## Selections and summaries
 
-Feature-axis artifacts align to the assay's complete current feature-row order and carry ordered-row and payload integrity fingerprints.
-Selections store a Boolean `values` array.
-Feature summaries store sufficient statistics for one exact cell-selection artifact and are reused by detected-feature, HVG, prevalent-peak, and cell-cycle producers.
-New code does not create or read mounted `summary_stats_*` groups.
-RNA summaries persist `normed_tot`, `normed_n`, and `sigmas`; average and nonzero mean are derived zero-safely from those arrays and the selected-cell count.
+Cell and feature selections are immutable Boolean artifacts aligned to a complete stored axis.
+Their integrity includes the values and the exact ordered row identities. A live metadata column
+may be the source of a selection, but changing that column does not change or invalidate the
+historical artifact. Replacing, reordering, adding, or removing axis IDs fails closed; Scarf does
+not remap a stored result by matching IDs.
+
+Feature summaries hold sufficient statistics for one exact cell selection and can be reused by
+detected-feature, HVG, prevalent-peak, and cell-cycle producers. New code does not create or read
+mounted `summary_stats_*` groups. RNA summaries persist `normed_tot`, `normed_n`, and `sigmas`;
 ATAC summaries persist `prevalence` and `document_frequency`.
 
 | Producer | Artifact inputs | Scientific identity |
@@ -71,25 +68,17 @@ ATAC summaries persist `prevalence` and `document_frequency`.
 | manual selection | `all_features` | supplied values fingerprint |
 | RNA or ATAC summary | `cell_selection` | normalizer settings |
 | detected features | `feature_summary` | `min_cells` |
-| highly variable genes | `feature_summary` | resolved variance, mean, binning, blacklist, bounds, and cell-count settings |
+| highly variable genes | `feature_summary` | resolved variability settings |
 | prevalent peaks | `feature_summary` | `top_n` |
 | mapping overlap | mapping reference and query `all_features` | exact inputs |
 
-`mark_hvgs`, `mark_prevalent_peaks`, `select_detected_features`, and `set_feature_selection` return their selection reference.
-Publishing writes the same values under one exact plain label such as `hvgs`.
-Labels use lowercase snake case, contain no double underscore, and are not prefixed with a cell key.
-`I`, `ids`, `names`, `nCells`, `dropOuts`, and `all_features` are reserved user labels.
-Writable feature operations ensure the internal `all_features` universe exists before resolution.
-`resolve_features` is strictly read-only and raises `missing_universe` rather than creating a missing baseline.
+`select_hvgs`, `select_prevalent_peaks`, `select_detected_features`, and
+`set_feature_selection` return exact feature-selection refs. They do not create metadata columns.
+`resolve_features` accepts an explicit compatible ref.
 
-Publication uses a store journal so interrupted metadata writes fail closed.
-A completed label remains readable if only journal cleanup was interrupted, because the committed column and journal point to the same validated artifact.
-An actual in-progress or conflicting publication raises `ArtifactResolutionError` instead of guessing.
-Repointing a label never invalidates an older retained `ArtifactRef`.
+## Graph lineage
 
-## Feature projection from graphs
-
-Graph-derived analyses follow named provenance inputs rather than scanning arbitrary ancestors:
+Graph-derived analyses follow named artifact inputs:
 
 ```text
 connectivity_map -> neighbors -> coordinates and ann_index
@@ -97,42 +86,59 @@ ann_index -> the same coordinates
 batch_correction -> reduction -> normalized -> feature_selection
 ```
 
-Native graphs project one selection.
-Imported-coordinate graphs project none.
-Integrated graphs follow their ordered `source_i` inputs and can project zero, one, or several distinct selections while preserving source order.
-WNN integration is stricter than general projection and accepts only native reduction or batch-correction coordinates.
+Native graphs project one feature selection. Imported-coordinate graphs project none. Integrated
+graphs follow their ordered `source_i` refs and can project zero, one, or several distinct
+selections. Graph and neighbour consumers require their exact refs. Analytical producers return
+artifacts and leave metadata unchanged.
 
-## Selection validation failures
+## Inspect and trace results
 
-`ArtifactResolutionError` is a `ValueError` with machine-readable failure details.
-Its `code` and JSON-safe `context` attributes distinguish these conditions:
+Use public datastore methods rather than reading private Zarr paths:
 
-- `artifact_reference_mismatch`, `artifact_missing`, and `artifact_incomplete`
-- `selection_table_missing`, `selection_column_missing`, and `selection_row_ids_missing`
-- `selection_values_missing`, `row_identity_mismatch`, and `selection_values_changed`
-- `dimreduc_row_count_mismatch` and `dimreduc_cell_identity_mismatch`
-- `wrong_kind`, `wrong_scope`, `wrong_assay`, `missing_artifact`, and `incomplete_artifact`
-- `corrupt_payload`, `row_mismatch`, `invalid_label`, `missing_label`, and `unlinked_label`
-- `stale_label`, `pending_alias`, `label_collision`, and `missing_universe`
-- `missing_current_graph`, `missing_current_neighbors`, and `unsupported_graph_kind`
+```python
+refs = ds.list_artifacts(kind="reduction", complete_only=True)
+status = ds.inspect_artifact(refs[0])
 
-The context identifies the artifact kind and ID, scope, assay, metadata table, and source column when available.
-It does not choose a recovery or a scientifically preferred replacement.
+status.operation
+status.parameters
+status.inputs
+status.execution_options
+status.created_at_ns
+status.scarf_version
+```
 
-## DataStore inspection helpers
+`list_artifacts` uses the default assay unless another assay is supplied. Store-level outputs can
+be listed with `scope="datastore"`. `load_artifact(ref)` opens the payload only after Scarf confirms
+that the artifact exists and is complete.
 
-Prefer these store-bound methods over calling the storage helpers with a raw Zarr root.
-`summary()` scans the literal `I` cell and feature columns in blocks and omits store locations and credentials.
-These counts do not follow another selection stored in `AssayState`.
-Use the other helpers for deeper inspection of one result.
+`DataStore.lineage` follows artifact inputs upstream:
 
-`AssayState` stores no feature key or duplicate feature-selection field.
-When `normalized` is present, that artifact names its `feature_selection` input.
-Imported-coordinate state may have `normalized=None`; graph projection then returns no feature selection.
-Use `resolve_features(assay, label_or_ref)` for a strict, read-only lookup.
-Plain labels resolve exactly; the reserved `all_features` label names the complete assay feature universe.
-Legacy analysis state with feature-key fields raises `IncompatibleAnalysisStateError` before analysis or mutation.
-Its code is `legacy_feature_contract`; other malformed or unknown state uses `invalid_analysis_state`.
+```python
+lineage = ds.lineage(
+    {
+        "baselineGraph": baseline_graph,
+        "alternativeGraph": alternative_graph,
+    }
+)
+
+markdown_report = lineage.to_markdown()
+mermaid_source = lineage.to_mermaid()
+```
+
+This identifies the exact selections, normalization, coordinates, and graph behind a result and
+shows where branches diverge.
+
+`ArtifactResolutionError` is a `ValueError` with a machine-readable `code` and JSON-safe
+`context`. Failures distinguish missing or incomplete artifacts, wrong kind/scope/assay, changed
+row identity or selection values, corrupt payloads, and incompatible artifact contracts. The error
+explains what failed; it does not choose a replacement result.
+
+## DataStore summary
+
+`summary()` scans literal live `I` cell and feature columns in blocks and omits store locations and
+credentials. It reports artifact inventories, pipeline-run counts by status, and completed labeled
+runs. It never selects a pipeline run.
+Use `summary.to_dict()` for a deterministic JSON-safe record.
 
 ```{eval-rst}
 .. autosummary::
@@ -143,7 +149,6 @@ Its code is `legacy_feature_contract`; other malformed or unknown state uses `in
    scarf.DataStore.inspect_artifact
    scarf.DataStore.load_artifact
    scarf.DataStore.lineage
-   scarf.DataStore.get_assay_state
    scarf.DataStore.resolve_features
 ```
 
@@ -153,14 +158,13 @@ Its code is `legacy_feature_contract`; other malformed or unknown state uses `in
 .. automethod:: scarf.DataStore.inspect_artifact
 .. automethod:: scarf.DataStore.load_artifact
 .. automethod:: scarf.DataStore.lineage
-.. automethod:: scarf.DataStore.get_assay_state
 .. automethod:: scarf.DataStore.resolve_features
 ```
 
 ## Module-level helpers
 
-These accept a Zarr root group.
-They are useful in tooling; analysis notebooks should use the `DataStore` methods above.
+These functions accept a Zarr root group and are useful in tooling. Analysis notebooks should use
+the datastore methods above.
 
 ```{eval-rst}
 .. autofunction:: scarf.storage.list_artifacts

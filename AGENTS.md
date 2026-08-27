@@ -21,8 +21,8 @@ These instructions apply to the whole repository.
   before a thin `datastore._operations` method exposes it.
 - Dependencies flow from `storage`, `matrix`, and `utils`, through data models and domain
   algorithms, to I/O, datastore orchestration, and plotting.
-- Saved computations are immutable artifacts. `ArtifactRef`, provenance, and `AssayState` connect
-  selections, results, reuse, and the active analysis chain.
+- Saved computations are immutable artifacts. `ArtifactRef`, provenance, and durable `PipelineRun`
+  records connect frozen selections, results, reuse, and complete workflow invocations.
 - The lazy public facades are compatibility boundaries. Trace the public call, operation
   implementation, domain algorithm, persisted result, callers, tests, and documentation before
   changing a contract.
@@ -76,8 +76,8 @@ MPLBACKEND=Agg SCARF_RUN_VISUAL_REGRESSION=1 \
 
 - Wrong code location or import cycle: read the architecture placement rules and run
   `uv run pytest -n 0 tests/test_import_architecture.py`.
-- Missing, stale, or incompatible result: inspect `AssayState`, artifact status, and lineage before
-  reading private Zarr paths.
+- Missing, stale, or incompatible result: inspect the pipeline-run report, artifact status, and
+  lineage before reading private Zarr paths.
 - Public API or persisted contract: inspect the public API reference and the public,
   compatibility, signature, and frozen-store tests.
 - On-disk layout: read `docs/source/developers/zarr_internals.md`.

@@ -12,7 +12,9 @@ It is designed for analyses where the count matrix is too large, too remote, or 
 
 Scarf stores counts, metadata, and persisted results in Zarr.
 Operations stream bounded blocks instead of loading a complete matrix into memory.
-The same `DataStore` can hold alternative cell selections, feature selections, {term}`analysis chains <analysis chain>`, clustering resolutions, and mappings while recording which inputs and parameters produced each result.
+The same `DataStore` can hold alternative cell and feature selections, artifact lineages,
+{py:class}`~scarf.PipelineRun` records, clustering resolutions, and mappings while recording which
+inputs and parameters produced each result.
 
 :::{image} _static/overview.svg
 :width: 75%
@@ -90,9 +92,10 @@ See {doc}`analysis_with_agents` for the scientific decision and troubleshooting 
 Detailed work usually moves from a whole dataset to tissues, lineages, clusters, and smaller subpopulations.
 Keeping a separate in-memory object for each subset makes it easy to lose track of which cells produced which result.
 
-In Scarf, cell selections are boolean metadata columns and feature selections are immutable artifacts published under plain labels.
-Filtering marks cells inactive rather than deleting them.
-Whole-dataset and subpopulation analyses can therefore share one object and one set of count matrices, while each stored result stays tied to the exact {term}`cell key` and {term}`feature selection` artifact used to produce it.
+In Scarf, a live cell key is a Boolean metadata column; an analysis captures it as an immutable
+selection artifact. Feature selections are also immutable artifacts and are passed by exact ref.
+Filtering returns another selection artifact without changing the live column or deleting cells.
+Whole-dataset and subpopulation analyses can therefore share one object and one set of count matrices, while each stored result stays tied to the exact cell- and feature-selection artifacts used to produce it.
 Persisted outputs remain available between sessions, so an analysis can stop after an expensive stage and continue later.
 
 ## Implemented methods

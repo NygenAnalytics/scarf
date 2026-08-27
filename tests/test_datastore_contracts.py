@@ -11,12 +11,12 @@ _METHODS = {
     BaseDataStore: (
         "__init__",
         "get_cell_vals",
-        "get_assay_state",
         "inspect_artifact",
         "lineage",
         "list_artifacts",
         "load_artifact",
         "set_default_assay",
+        "snapshot_cell_selection",
         "summary",
     ),
     GraphDataStore: (
@@ -25,10 +25,10 @@ _METHODS = {
         "build_connectivity_map",
         "build_embedding_initialization",
         "build_mapping_reference",
-        "get_diffusion_operator",
         "get_imputed",
         "get_mapping_reference",
         "integrate_assays",
+        "load_diffusion_operator",
         "load_graph",
         "query_neighbors",
         "run_fate_mapping",
@@ -39,6 +39,7 @@ _METHODS = {
         "run_normalization",
         "run_paris_clustering",
         "run_pca",
+        "run_diffusion_operator",
         "run_pseudotime_scoring",
         "run_topacedo_sampler",
         "run_tsne",
@@ -63,10 +64,10 @@ _METHODS = {
         "get_assay",
         "get_enrichment",
         "get_markers",
+        "load_metric_lisi",
         "make_bulk",
-        "mark_hto_identities",
-        "mark_hvgs",
-        "mark_prevalent_peaks",
+        "select_hvgs",
+        "select_prevalent_peaks",
         "metric_clisi",
         "metric_cluster_separability",
         "metric_graph_connectivity",
@@ -79,10 +80,13 @@ _METHODS = {
         "run_aucell",
         "run_cell_cycle_scoring",
         "run_doublet_detection",
+        "run_feature_percentage",
+        "run_hto_demultiplexing",
         "run_marker_search",
         "run_pseudotime_aggregation",
         "run_pseudotime_marker_search",
         "run_waggr",
+        "select_cells",
         "select_detected_features",
         "set_feature_selection",
         "show_zarr_tree",
@@ -92,10 +96,10 @@ _METHODS = {
 }
 
 _SIGNATURE_DIGESTS = {
-    BaseDataStore: "4b362febb460fa3d4c23c6f79f9ea3a8878f17d1113944fe056e444f4d768f5f",
-    GraphDataStore: "9de75cc6814af055ec291c9cb6d83f68e7db0306f7a2fe663af9a53afff9cc73",
-    MappingDatastore: "1be2723f0c659336ff3dba16d58f4c9a7aa2f73a9a4a33bf3af232a280f1d7ec",
-    DataStore: "abc4cc784a9e042215b641322ce1e95b0963e0968df1987e03ce2dc60871f75b",
+    BaseDataStore: "265c58773661a006212d7c269300d4b0bd90dbb71ade2dacf785663bf1ce94f5",
+    GraphDataStore: "82320f376233d84bdf9601e23334a09b7388990c9bf74aead31c49c330150be0",
+    MappingDatastore: "dd7c11707d882495a767ccc3022e5053344a6c4196e5f1bd9b0a4008a55e78ff",
+    DataStore: "83cb8998efff59ac3c8430fc65d2823d18a8b8d8179cb77466655a50982a3fb8",
 }
 
 
@@ -125,6 +129,7 @@ def test_stored_graph_path_lookup_is_removed():
     assert not hasattr(GraphDataStore, "get_latest_graph_loc")
     assert not hasattr(GraphDataStore, "get_normalized_group_path")
     assert not hasattr(DataStore, "set_hvgs")
+    assert not hasattr(DataStore, "mark_hto_identities")
 
 
 def test_datastore_property_contracts_are_stable():
@@ -136,15 +141,15 @@ def test_datastore_property_contracts_are_stable():
         assert inspect.getattr_static(DataStore, name) is descriptor
 
 
-def test_datastore_plot_namespace_contract_is_stable():
-    descriptor = inspect.getattr_static(DataStore, "plots")
-
-    assert isinstance(descriptor, property)
-    assert descriptor.fget is not None
-    assert list(inspect.signature(descriptor.fget).parameters) == ["self"]
-    assert "plots" in DataStore.__dict__
-    for cls in (BaseDataStore, GraphDataStore, MappingDatastore):
-        assert not hasattr(cls, "plots")
+def test_datastore_accessor_namespace_contract_is_stable():
+    for name in ("pipeline", "plots"):
+        descriptor = inspect.getattr_static(DataStore, name)
+        assert isinstance(descriptor, property)
+        assert descriptor.fget is not None
+        assert list(inspect.signature(descriptor.fget).parameters) == ["self"]
+        assert name in DataStore.__dict__
+        for cls in (BaseDataStore, GraphDataStore, MappingDatastore):
+            assert not hasattr(cls, name)
 
 
 def test_datastore_static_method_contracts_are_stable():
@@ -371,11 +376,12 @@ def test_feature_selection_and_pseudotime_methods_have_domain_owners():
         _TrajectoryOperationsMixin,
     )
 
-    assert "mark_hvgs" in _FeatureOperationsMixin.__dict__
+    assert "select_hvgs" in _FeatureOperationsMixin.__dict__
     assert "get_enrichment" in _FeatureOperationsMixin.__dict__
     assert "run_aucell" in _FeatureOperationsMixin.__dict__
     assert "run_waggr" in _FeatureOperationsMixin.__dict__
-    assert "mark_hvgs" not in _QualityControlOperationsMixin.__dict__
+    assert "select_hvgs" not in _QualityControlOperationsMixin.__dict__
+    assert "select_prevalent_peaks" in _QualityControlOperationsMixin.__dict__
     assert "run_fate_mapping" in _TrajectoryOperationsMixin.__dict__
     assert "run_fate_mapping" not in _TrajectoryFeatureOperationsMixin.__dict__
     assert "run_pseudotime_marker_search" in (

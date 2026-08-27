@@ -10,15 +10,12 @@ import pytest
 from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from scipy.sparse import csr_matrix
-import zarr
-from zarr.storage import MemoryStore
 
 from scarf.agent import CovariateCharacterization, characterize_covariates
 from scarf.agent.characterize_covariates import (
     _Run,
     _assign_domain,
     _characterize_coefficient,
-    _has_source_artifact,
     _infer_kind,
     _is_embedding_column,
     _profile_column,
@@ -645,28 +642,17 @@ def test_covariate_kind_and_summary_handle_non_numeric_and_nonfinite_values() ->
     )
 
 
-def test_source_artifact_detection_and_triage_use_metadata_links() -> None:
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    cell_data = root.create_group("cellData")
-    derived = cell_data.create_array("derived", shape=(2,), dtype="f8")
-    derived.attrs["source_artifact"] = {"artifact_id": "artifact-1"}
+def test_triage_treats_non_assay_metadata_as_user_owned() -> None:
     store = SimpleNamespace(
-        zw=root,
         assay_names=["RNA"],
         cells=SimpleNamespace(
             columns=["I", "RNA_nCounts", "derived", "donor"],
         ),
     )
 
-    assert _has_source_artifact(store, "derived")
-    assert not _has_source_artifact(store, "missing")
-    assert not _has_source_artifact(SimpleNamespace(zw={}), "derived")
     candidates, dropped = _triage_columns(store, cell_key="I", exclude=set())
-    assert candidates == ["donor"]
-    assert dropped == [
-        ("RNA_nCounts", "dropAssayStat"),
-        ("derived", "dropProvenance"),
-    ]
+    assert candidates == ["derived", "donor"]
+    assert dropped == [("RNA_nCounts", "dropAssayStat")]
 
 
 def test_assign_domain_rejects_unsupported_mock_choice(monkeypatch) -> None:

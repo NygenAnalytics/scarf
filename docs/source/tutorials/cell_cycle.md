@@ -35,6 +35,9 @@ Score S-phase and G2M-phase gene sets to assign a cell-cycle phase to each cell.
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 import scarf
 import scarf.plotting as splt
 from scarf.tools.repack_zarr import repack_store
@@ -48,7 +51,8 @@ Here we use the data from [Bastidas-Ponce et al., 2019 Development](https://jour
 
 The prepared Zarr store is available from the `scarf_docs` Cytebase catalog.
 It includes cluster and UMAP columns for visualization.
-The source is structurally repacked to supply the current count layout, then mounted read-only while this page writes cell-cycle artifacts and score columns to a separate analysis store.
+The source is structurally repacked to supply the count layout, then mounted read-only while this
+page writes a cell-cycle artifact to a separate analysis store.
 
 ```{code-cell} ipython3
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
@@ -95,7 +99,12 @@ Cell cycle phase is assigned as follows (cells default to S, then rules override
 - otherwise the cell stays S
 
 ```{code-cell} ipython3
-ds.run_cell_cycle_scoring()
+cell_selection = ds.snapshot_cell_selection("I")
+cell_cycle = ds.run_cell_cycle_scoring(cell_selection)
+cell_cycle_values = ds.load_artifact(cell_cycle)
+s_score = np.asarray(cell_cycle_values["s_score"][:])
+g2m_score = np.asarray(cell_cycle_values["g2m_score"][:])
+phase = np.asarray(cell_cycle_values["phase"][:]).astype(str)
 ```
 
 The bundled list contains one marker that is absent from this assay.
@@ -108,8 +117,8 @@ In contrast, a direct `Assay.score_features(...)` call computes blockwise in mem
 
 ## 3. Visualize cell-cycle phases
 
-By default, the cell-cycle phase is stored in the cell metadata column `RNA_cell_cycle_phase`.
-Explicit colors keep the phase encoding consistent with the composition plot below:
+Cell-cycle phase remains in the returned artifact. Explicit colors keep the phase encoding
+consistent with the composition summary below:
 
 ```{code-cell} ipython3
 color_key = {
@@ -118,11 +127,9 @@ color_key = {
     'G2M': 'green',
 }
 
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='RNA_cell_cycle_phase',
-    categorical_scale=splt.CategoricalScale(palette=color_key),
-)
+umap = ds.cells.to_pandas_dataframe(['RNA_UMAP1', 'RNA_UMAP2'], key='I')
+phase_codes = pd.Categorical(phase, categories=['G1', 'S', 'G2M']).codes
+plt.scatter(umap['RNA_UMAP1'], umap['RNA_UMAP2'], c=phase_codes, s=3)
 ```
 
 Cycling cells should be concentrated in the ductal region rather than spread uniformly across the embedding.
@@ -130,29 +137,26 @@ Cycling cells should be concentrated in the ductal region rather than spread uni
 Phase composition per cluster shows which groups are enriched for S or G2M relative to G1:
 
 ```{code-cell} ipython3
-ds.plots.composition(
-    category_by='RNA_cell_cycle_phase',
-    sample_by='clusters',
-    kind='stacked',
-    categorical_scale=splt.CategoricalScale(
-        palette=color_key,
-        order=['G1', 'S', 'G2M'],
-    ),
-)
+pd.crosstab(ds.cells.fetch('clusters'), phase, normalize='index')
 ```
 
 Stacked bars are cluster-wise phase fractions among active cells; ductal-associated clusters should show a higher S/G2M share if the embedding pattern above holds.
 
 ## 4. Visualize phase-specific scores
 
-The individual and S and G2M scores for each cell are stored under columns `RNA_S_score` and `RNA_G2M_score`.
-We can visualize the distribution of these scores on the UMAP plots.
+The S and G2M score arrays are stored in the same artifact.
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by=['RNA_S_score', 'RNA_G2M_score'],
-)
+figure, axes = plt.subplots(1, 2, figsize=(9, 4))
+for axis, values, title in (
+    (axes[0], s_score, 'S score'),
+    (axes[1], g2m_score, 'G2M score'),
+):
+    points = axis.scatter(umap['RNA_UMAP1'], umap['RNA_UMAP2'], c=values, s=3)
+    axis.set_title(title)
+    figure.colorbar(points, ax=axis)
+figure.tight_layout()
+figure
 ```
 
 ## 5. Compare scores calculated with Scanpy
@@ -176,8 +180,7 @@ import matplotlib.pyplot as plt
 from scipy.stats import linregress
 
 fig, axis  = plt.subplots(1, 2, figsize=(6,3))
-for n,i in enumerate(['S_score', 'G2M_score']):
-    x = ds.cells.fetch(f"RNA_{i}")
+for n, (i, x) in enumerate((('S_score', s_score), ('G2M_score', g2m_score))):
     y = ds.cells.fetch(i)
     res = linregress(x, y)
     
@@ -200,4 +203,5 @@ High correlation coefficients indicate a large degree of concordance between the
 - Interpreting a phase score as evidence of cell proliferation without checking the underlying genes
 - Comparing scores across workflows with different gene sets or normalization
 
-`run_cell_cycle_scoring` stores `RNA_cell_cycle_phase`, `RNA_S_score`, and `RNA_G2M_score` beside the scoring step so they can be reused by plots and downstream metadata queries.
+`run_cell_cycle_scoring` stores phase and both scores in one immutable artifact. Retain its exact ref
+for loading and downstream analysis.

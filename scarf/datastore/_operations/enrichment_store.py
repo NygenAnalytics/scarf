@@ -1,4 +1,3 @@
-import hashlib
 import json
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, nullcontext
@@ -19,15 +18,12 @@ from ...storage.artifacts import (
     inspect_artifact,
 )
 from ...storage.feature_selection import resolve_feature_selection
+from ...storage.selections import validate_stored_selection_integrity
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...utils.arrays import array_digest
 
 
 _ENRICHMENT_LAYOUT = "cells_by_sources"
-_ENRICHMENT_ACTIVE_SLOT = "_active_slot"
-_ENRICHMENT_RUN_PREFIX = "_run_"
-_ENRICHMENT_ARTIFACT_RESULTS = "artifact_results"
-_ENRICHMENT_LEGACY_ARTIFACTS = "artifacts"
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,138 +43,6 @@ class _EnrichmentScorer:
     extra_required_arrays: tuple[ArrayRequirement, ...]
     score_batches: Callable[[], Iterator[np.ndarray]]
     write_context: Callable[[], AbstractContextManager[None]] = nullcontext
-
-
-def _validate_enrichment_label(label: str) -> str:
-    if not isinstance(label, str):
-        raise TypeError("Enrichment label must be a string")
-    if not label or label in {".", ".."}:
-        raise ValueError("Enrichment label must be a non-empty path component")
-    if "/" in label or "\\" in label or any(ord(char) < 32 for char in label):
-        raise ValueError(
-            "Enrichment label must not contain path separators or control characters"
-        )
-    return label
-
-
-def _execution_digest(payload: dict[str, Any]) -> str:
-    try:
-        encoded = json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Enrichment execution metadata must be JSON-safe") from exc
-    return hashlib.blake2b(encoded, digest_size=16).hexdigest()
-
-
-def _resolve_enrichment_slot(
-    label_group: zarr.Group,
-    *,
-    label: str,
-) -> zarr.Group:
-    active_slot = label_group.attrs.get(_ENRICHMENT_ACTIVE_SLOT)
-    if active_slot is None:
-        return label_group
-    if (
-        not isinstance(active_slot, str)
-        or not active_slot.startswith(_ENRICHMENT_RUN_PREFIX)
-        or "/" in active_slot
-        or active_slot not in label_group
-    ):
-        raise ValueError(f"Enrichment slot {label!r} has an invalid active result")
-    return as_zarr_group(
-        label_group[active_slot],
-        name=f"{label}/{active_slot}",
-    )
-
-
-def _enrichment_artifact_entry(
-    assay: Assay,
-    label: str,
-) -> tuple[ArtifactRef, str] | None:
-    if "enrichment" not in assay.z:
-        return None
-    enrichment_group = as_zarr_group(
-        assay.z["enrichment"],
-        name=f"{assay.name}/enrichment",
-    )
-    raw_results = enrichment_group.attrs.get(_ENRICHMENT_ARTIFACT_RESULTS)
-    if raw_results is not None:
-        if not isinstance(raw_results, dict):
-            raise ValueError("Enrichment artifact index is invalid")
-        raw_entry = raw_results.get(label)
-        if raw_entry is not None:
-            if not isinstance(raw_entry, dict):
-                raise ValueError(
-                    f"Enrichment label {label!r} has an invalid artifact entry"
-                )
-            raw_ref = raw_entry.get("artifact")
-            cell_key = raw_entry.get("cell_key")
-            if (
-                set(raw_entry) != {"artifact", "cell_key"}
-                or not isinstance(raw_ref, dict)
-                or not isinstance(cell_key, str)
-                or not cell_key
-            ):
-                raise ValueError(
-                    f"Enrichment label {label!r} has invalid execution metadata"
-                )
-            return ArtifactRef.from_dict(raw_ref), cell_key
-    return None
-
-
-def _enrichment_artifact_ref(
-    assay: Assay,
-    label: str,
-) -> ArtifactRef | None:
-    entry = _enrichment_artifact_entry(assay, label)
-    return None if entry is None else entry[0]
-
-
-def _legacy_enrichment_slot(
-    assay: Assay,
-    label: str,
-) -> zarr.Group | None:
-    if "enrichment" not in assay.z:
-        return None
-    enrichment_group = as_zarr_group(
-        assay.z["enrichment"],
-        name=f"{assay.name}/enrichment",
-    )
-    if label not in enrichment_group:
-        return None
-    label_group = as_zarr_group(
-        enrichment_group[label],
-        name=f"{assay.name}/enrichment/{label}",
-    )
-    return _resolve_enrichment_slot(label_group, label=label)
-
-
-def _publish_enrichment_artifact(
-    assay: Assay,
-    label: str,
-    ref: ArtifactRef,
-    *,
-    cell_key: str,
-) -> None:
-    if "enrichment" not in assay.z:
-        assay.z.create_group("enrichment")
-    enrichment_group = as_zarr_group(
-        assay.z["enrichment"],
-        name=f"{assay.name}/enrichment",
-    )
-    raw_results = enrichment_group.attrs.get(_ENRICHMENT_ARTIFACT_RESULTS, {})
-    if not isinstance(raw_results, dict):
-        raise ValueError("Enrichment artifact index is invalid")
-    results = dict(raw_results)
-    results[label] = {
-        "artifact": ref.to_dict(),
-        "cell_key": cell_key,
-    }
-    enrichment_group.attrs[_ENRICHMENT_ARTIFACT_RESULTS] = results
 
 
 def _write_enrichment_slot(
@@ -303,7 +167,7 @@ def _enrichment_artifact_matches(
     rank_feature_index: np.ndarray | None,
 ) -> bool:
     for key, expected in attrs.items():
-        if key in {"cell_key", "complete"}:
+        if key == "complete":
             continue
         if group.attrs.get(key) != expected:
             return False
@@ -351,11 +215,9 @@ def _validate_enrichment_artifact_provenance(
     status: ArtifactStatus,
     group: zarr.Group,
     method: str,
-    cell_key: str,
-) -> tuple[str, ArtifactRef]:
+) -> tuple[ArtifactRef, ArtifactRef]:
     parameters = status.parameters or {}
     inputs = status.inputs or {}
-    execution = status.execution_options or {}
     expected_parameters: dict[str, Any] = {
         "algorithm_version": group.attrs["algorithm_version"],
         "tmin": group.attrs["tmin"],
@@ -384,11 +246,6 @@ def _validate_enrichment_artifact_provenance(
         raise ValueError(
             "Enrichment artifact network input does not match its metadata"
         )
-    if execution.get("cell_key") != group.attrs["cell_key"]:
-        raise ValueError("Enrichment artifact cell selection does not match metadata")
-    if "feat_key" in execution or "feat_key" in group.attrs:
-        raise ValueError("Enrichment artifact uses the legacy feature contract")
-
     raw_cell_selection = inputs.get("cell_selection")
     raw_feature_selection = inputs.get("feature_selection")
     if not isinstance(raw_cell_selection, dict) or not isinstance(
@@ -398,9 +255,14 @@ def _validate_enrichment_artifact_provenance(
     cell_selection = ArtifactRef.from_dict(raw_cell_selection)
     feature_selection = ArtifactRef.from_dict(raw_feature_selection)
 
-    from ...graph.state import validate_cell_selection_artifact
-
-    validate_cell_selection_artifact(root, cell_selection, cell_key)
+    validate_stored_selection_integrity(
+        root,
+        cell_selection,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+    )
     feature_selection = resolve_feature_selection(
         root,
         assay.name,
@@ -424,24 +286,22 @@ def _validate_enrichment_artifact_provenance(
                 f"Enrichment artifact {selection_ref.kind!r} input "
                 "does not match its metadata"
             )
-    return cell_key, feature_selection
+    return cell_selection, feature_selection
 
 
 def _load_enrichment_result(
     assay: Assay,
     *,
-    label: str,
+    enrichment: ArtifactRef,
     sources: Sequence[str] | None,
     artifact_root: zarr.Group | None = None,
 ) -> EnrichmentResult:
     from ...matrix import ChunkedArray
 
-    artifact_entry = _enrichment_artifact_entry(assay, label)
-    if artifact_entry is None:
-        raise KeyError(f"Enrichment label {label!r} was not found for {assay.name}")
     if artifact_root is None:
-        raise ValueError("Artifact root is required for indexed enrichment")
-    ref, indexed_cell_key = artifact_entry
+        raise ValueError("Artifact root is required for enrichment loading")
+    ref = enrichment
+    label = ref.artifact_id
     status = inspect_artifact(artifact_root, ref)
     if (
         ref.kind != "enrichment_scores"
@@ -449,7 +309,7 @@ def _load_enrichment_result(
         or ref.assay != assay.name
         or not status.complete
     ):
-        raise ValueError(f"Enrichment label {label!r} has an invalid artifact")
+        raise ValueError("Enrichment artifact reference is invalid")
     slot = as_zarr_group(
         artifact_root[status.path],
         name=status.path,
@@ -468,7 +328,6 @@ def _load_enrichment_result(
     required_attrs = {
         "algorithm_version",
         "cell_digest",
-        "cell_key",
         "feature_digest",
         "network_digest",
         "tmin",
@@ -506,9 +365,6 @@ def _load_enrichment_result(
             raise ValueError(
                 f"Enrichment slot {label!r} has invalid {digest_name} metadata"
             )
-    key_value = slot.attrs["cell_key"]
-    if not isinstance(key_value, str) or not key_value:
-        raise ValueError(f"Enrichment slot {label!r} has invalid cell_key metadata")
     stored_n_up: int | None = None
     if method == "waggr":
         size_factor = slot.attrs["size_factor"]
@@ -535,13 +391,12 @@ def _load_enrichment_result(
         ):
             raise ValueError(f"AUCell slot {label!r} has invalid method metadata")
         stored_n_up = int(n_up)
-    resolved_cell_key, feature_selection = _validate_enrichment_artifact_provenance(
+    cell_selection, feature_selection = _validate_enrichment_artifact_provenance(
         artifact_root,
         assay,
         status,
         slot,
         method,
-        indexed_cell_key,
     )
 
     required_arrays = {
@@ -653,10 +508,10 @@ def _load_enrichment_result(
         source_names=source_names,
         source_sizes=source_sizes,
         cell_index=cell_index,
-        label=label,
+        artifact=ref,
         storage_path=storage_path,
         assay=assay.name,
-        cell_key=resolved_cell_key,
+        cell_selection=cell_selection,
         feature_selection=feature_selection,
         method=method,
     )

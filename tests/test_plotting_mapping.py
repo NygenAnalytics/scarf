@@ -15,6 +15,7 @@ import scarf.plotting.mapping as plotting_mapping
 from tests.test_mapping_label_transfer import (
     _copied_query,
     _plain_reference,
+    _write_reference_column,
     _write_projection,
     _write_reference_layout,
 )
@@ -25,10 +26,9 @@ def plotting_mapping_context(analyzed_datastore_ephemeral, tmp_path: Path):
     reference_store = analyzed_datastore_ephemeral
     reference = _plain_reference(reference_store)
     query = _copied_query(reference_store, tmp_path / "plotting_query.zarr")
-    reference_layout, _ = _write_reference_layout(
+    reference_layout, layout_ref = _write_reference_layout(
         reference,
-        layout_key="mapping_layout",
-        linked=True,
+        name="mapping_layout",
     )
     reference_labels = np.full(
         reference.selected_cell_count,
@@ -36,12 +36,7 @@ def plotting_mapping_context(analyzed_datastore_ephemeral, tmp_path: Path):
         dtype=object,
     )
     reference_labels[:4] = ["A", "A", "B", "B"]
-    reference.datastore.cells.insert(
-        "mapping_label",
-        reference_labels,
-        key=reference.cell_key,
-        overwrite=True,
-    )
+    _write_reference_column(reference, "mapping_label", reference_labels)
 
     query.cells.insert(
         "mapping_layout1",
@@ -87,7 +82,6 @@ def plotting_mapping_context(analyzed_datastore_ephemeral, tmp_path: Path):
     result = _write_projection(
         query,
         reference,
-        mapping_name="plot_diagnostics",
         indices=indices,
         distances=distances,
         uninformative=uninformative,
@@ -95,6 +89,7 @@ def plotting_mapping_context(analyzed_datastore_ephemeral, tmp_path: Path):
     return {
         "reference": reference,
         "reference_layout": reference_layout,
+        "layout_ref": layout_ref,
         "reference_labels": reference_labels,
         "query": query,
         "result": result,
@@ -125,7 +120,6 @@ def _controlled_mapping_store(
     mapping = SimpleNamespace(
         reference=reference,
         ref=SimpleNamespace(assay="RNA"),
-        mapping_name="controlled_mapping",
     )
     monkeypatch.setattr(
         plotting_mapping,
@@ -155,7 +149,7 @@ def test_mapping_plot_families_use_query_result_and_reference_semantics(
         result,
         reference=reference,
         target_groups=query_groups,
-        layout_key="mapping_layout",
+        layout=context["layout_ref"],
         show=False,
     )
     evidence = splt.mapping_evidence(
@@ -181,7 +175,7 @@ def test_mapping_plot_families_use_query_result_and_reference_semantics(
         result,
         reference=reference,
         target_groups=query_groups,
-        layout_key="mapping_layout",
+        layout=context["layout_ref"],
         size_by_score=True,
         show=False,
     )
@@ -215,7 +209,7 @@ def test_mapping_plot_families_use_query_result_and_reference_semantics(
         _sorted_rows(score_coordinates),
         _sorted_rows(context["reference_layout"]),
     )
-    assert score.provenance.extras["mapping_name"] == result.mapping_name
+    assert "mapping_name" not in score.provenance.extras
 
     assert set(evidence.axes) == {"voteFraction", "topTwoMargin"}
     assert len(evidence.tables["evidence"]) == len(query_groups)
@@ -246,20 +240,19 @@ def test_mapping_plot_families_use_query_result_and_reference_semantics(
         plot.close()
 
 
-def test_mapping_plots_resolve_string_result_with_query_assay(
+def test_mapping_plots_resolve_explicit_artifact_result(
     plotting_mapping_context,
 ):
     context = plotting_mapping_context
     plot = splt.mapping_score(
         context["query"],
-        "plot_diagnostics",
+        context["result"],
         reference=context["reference"],
-        query_assay="RNA",
         kind="histogram",
         show=False,
     )
 
-    assert plot.provenance.extras["mapping_name"] == "plot_diagnostics"
+    assert "mapping_name" not in plot.provenance.extras
     plot.close()
 
 
@@ -304,7 +297,7 @@ def test_mapping_score_box_kind_groups_by_reference_class(
     plot.close()
 
 
-def test_mapping_score_uses_mapping_name_as_default_title(
+def test_mapping_score_uses_generic_default_title(
     plotting_mapping_context,
 ):
     context = plotting_mapping_context
@@ -312,12 +305,12 @@ def test_mapping_score_uses_mapping_name_as_default_title(
         context["query"],
         context["result"],
         reference=context["reference"],
-        layout_key="mapping_layout",
+        layout=context["layout_ref"],
         show=False,
     )
 
     assert plot.tables["scores"]["group"].unique().tolist() == [0]
-    assert next(iter(plot.axes.values())).get_title() == "plot_diagnostics"
+    assert next(iter(plot.axes.values())).get_title() == "all query cells"
     plot.close()
 
 
@@ -346,12 +339,7 @@ def test_mapping_calibration_rejects_pairwise_label_type_mismatch(
     reference = context["reference"]
     numeric_labels = np.zeros(reference.selected_cell_count, dtype=np.int64)
     numeric_labels[:4] = [1, 1, 2, 2]
-    reference.datastore.cells.insert(
-        "mapping_numeric_label",
-        numeric_labels,
-        key=reference.cell_key,
-        overwrite=True,
-    )
+    _write_reference_column(reference, "mapping_numeric_label", numeric_labels)
 
     with pytest.raises(ValueError, match="after text conversion"):
         splt.mapping_calibration(
@@ -427,11 +415,13 @@ def test_mapping_plots_do_not_project_or_weight_coordinates(
         query.get_mapping_score(
             result,
             target_groups=context["query_groups"],
+            reference=reference,
         )
     )
     evidence = query.get_target_label_evidence(
         result,
         reference_class_group="mapping_label",
+        reference=reference,
     )
 
     def cached_scores(*args, **kwargs):
@@ -453,7 +443,7 @@ def test_mapping_plots_do_not_project_or_weight_coordinates(
             result,
             reference=reference,
             target_groups=context["query_groups"],
-            layout_key="mapping_layout",
+            layout=context["layout_ref"],
             show=False,
         ),
         splt.mapping_score(
@@ -516,6 +506,7 @@ def test_mapping_calibration_respects_direction_and_draws_uncertainty(
     higher = plotting_mapping.mapping_calibration(
         store,
         object(),
+        reference=object(),
         reference_class_group="label",
         known_labels=known,
         metric="voteFraction",
@@ -527,6 +518,7 @@ def test_mapping_calibration_respects_direction_and_draws_uncertainty(
     lower = plotting_mapping.mapping_calibration(
         store,
         object(),
+        reference=object(),
         reference_class_group="label",
         known_labels=known,
         metric="meanNeighborDistance",
@@ -537,6 +529,7 @@ def test_mapping_calibration_respects_direction_and_draws_uncertainty(
     explicit = plotting_mapping.mapping_calibration(
         store,
         object(),
+        reference=object(),
         reference_class_group="label",
         known_labels=known,
         metric="customConfidence",
@@ -627,6 +620,7 @@ def test_mapping_calibration_rejects_malformed_threshold_controls(
         plotting_mapping.mapping_calibration(
             store,
             object(),
+            reference=object(),
             reference_class_group="label",
             known_labels=np.asarray(["A", "B"]),
             show=False,
@@ -649,6 +643,7 @@ def test_mapping_calibration_rejects_nonfinite_or_unretained_evidence(
         plotting_mapping.mapping_calibration(
             store,
             object(),
+            reference=object(),
             reference_class_group="label",
             known_labels=np.asarray(["A", "B"]),
             show=False,
@@ -660,6 +655,7 @@ def test_mapping_calibration_rejects_nonfinite_or_unretained_evidence(
         plotting_mapping.mapping_calibration(
             store,
             object(),
+            reference=object(),
             reference_class_group="label",
             known_labels=np.asarray(["A", "B"]),
             thresholds=[2.0],
@@ -679,6 +675,7 @@ def test_mapping_plots_reject_empty_and_misaligned_data(
         plotting_mapping.mapping_score(
             empty_store,
             object(),
+            reference=object(),
             kind="histogram",
             show=False,
         )
@@ -695,6 +692,7 @@ def test_mapping_plots_reject_empty_and_misaligned_data(
         plotting_mapping.mapping_score(
             mismatched_store,
             object(),
+            reference=object(),
             kind="histogram",
             show=False,
         )
@@ -711,6 +709,7 @@ def test_mapping_plots_reject_empty_and_misaligned_data(
         plotting_mapping.mapping_evidence(
             evidence_store,
             object(),
+            reference=object(),
             reference_class_group="label",
             target_groups=["only-one"],
             metrics=("voteFraction",),
@@ -720,6 +719,7 @@ def test_mapping_plots_reject_empty_and_misaligned_data(
         plotting_mapping.mapping_evidence(
             evidence_store,
             object(),
+            reference=object(),
             reference_class_group="label",
             target_groups=["first", None],
             metrics=("voteFraction",),
@@ -729,6 +729,7 @@ def test_mapping_plots_reject_empty_and_misaligned_data(
         plotting_mapping.mapping_evidence(
             evidence_store,
             object(),
+            reference=object(),
             reference_class_group="label",
             metrics=(),
             show=False,
@@ -737,6 +738,7 @@ def test_mapping_plots_reject_empty_and_misaligned_data(
         plotting_mapping.mapping_evidence(
             evidence_store,
             object(),
+            reference=object(),
             reference_class_group="label",
             metrics=("missingMetric",),
             show=False,
@@ -790,6 +792,7 @@ def test_mapping_categorical_legends_serialize_and_owned_figures_close(
     scores = plotting_mapping.mapping_score(
         store,
         object(),
+        reference=object(),
         kind="histogram",
         categorical_scale=scale,
         bins=3,
@@ -798,6 +801,7 @@ def test_mapping_categorical_legends_serialize_and_owned_figures_close(
     evidence_plot = plotting_mapping.mapping_evidence(
         store,
         object(),
+        reference=object(),
         reference_class_group="label",
         target_groups=["beta", "alpha", "beta"],
         metrics=("voteFraction",),
@@ -860,6 +864,7 @@ def test_mapping_score_surfaces_missing_matplotlib_without_opening_a_figure(
         plotting_mapping.mapping_score(
             store,
             object(),
+            reference=object(),
             kind="histogram",
             show=False,
         )

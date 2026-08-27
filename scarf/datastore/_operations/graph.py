@@ -3,10 +3,8 @@ import os
 import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import replace
 from threading import RLock
 from typing import TYPE_CHECKING, Any, Literal, cast
-from weakref import WeakKeyDictionary
 
 import numpy as np
 import pandas as pd
@@ -32,27 +30,13 @@ from ...graph.arguments import (
 from ...graph.distances import validate_distance_provenance
 from ...graph.feature_projection import (
     graph_cell_selection,
+    resolve_coordinate_inputs,
     resolve_native_graph_inputs,
 )
-from ...graph.state import (
-    AssayState,
-    named_result_mismatch,
-    read_assay_state,
-    read_assay_state_document,
-    validate_cell_selection_artifact,
+from ...graph.imported_storage import (
     validate_imported_coordinates_artifact,
-    validate_normalized_artifact_selection,
-    validate_assay_state,
-    write_assay_state,
 )
 from ...matrix import ChunkedArray
-from ...metadata.artifacts import (
-    categorical_display,
-    column_display,
-    continuous_display,
-    link_cell_data_column,
-    link_feature_data_column,
-)
 from ...neighbors.stages import (
     AnnIndexStage,
     BatchCorrectionStage,
@@ -83,11 +67,9 @@ from ...storage.artifacts import (
     ArtifactScope,
     artifact_group,
     artifact_path,
-    fingerprint_strings,
     group_at,
     inspect_artifact,
     require_complete_artifact,
-    serialize_artifact_value,
 )
 from ...storage.errors import ArtifactResolutionError
 from ...storage.copy import (
@@ -106,12 +88,18 @@ from ...storage.profiles import resolve_storage_profile
 from ...storage.sharding import write_dense_from_row_batches
 from ...storage.stores import is_remote_datastore
 from ...storage.selections import (
-    resolve_metadata_snapshot,
+    ValidatedStoredSelection,
+    iter_selected_axis_selection_blocks,
+    read_stored_selection_mask,
     resolve_selection_artifact,
+    snapshot_run_metadata,
+    validate_run_metadata_snapshot,
+    validate_stored_selection_integrity,
 )
 from ...utils.arrays import clean_array
 from ...utils.compute import compute_with_progress
 from ...utils.logging import logger
+from ...utils.shutdown import shutdown_checkpoint
 
 if TYPE_CHECKING:
     from ..base_datastore import BaseDataStore as _GraphOperationsBase
@@ -382,8 +370,6 @@ def _sampling_fraction(value: Any, name: str) -> float:
 
 
 class _GraphOperationsMixin(_GraphOperationsBase):
-    _annStreamPaths: WeakKeyDictionary[AnnStream, str]
-    _annStreamNeighborPaths: WeakKeyDictionary[AnnStream, str]
     _normalizedArtifactCache: dict[ArtifactRef, ChunkedArray]
     _artifactExecutionContext: dict[str, Any]
     _graphMemoryCache: dict[tuple[str, bool, bool, int | None], csr_matrix] | None
@@ -418,7 +404,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         def resolve_features(
             self,
             assay: str,
-            features: ArtifactRef | str,
+            features: ArtifactRef,
         ) -> ArtifactRef: ...
 
         def _build_mapping_reference_artifact(
@@ -430,26 +416,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             neighbors: ArtifactRef,
             invalidate_cache: bool,
         ) -> ArtifactRef: ...
-
-    def _remember_ann_stream_path(self, ann_obj: AnnStream, path: str) -> None:
-        try:
-            paths = self._annStreamPaths
-        except AttributeError:
-            paths = WeakKeyDictionary()
-            self._annStreamPaths = paths
-        paths[ann_obj] = path
-
-    def _remember_ann_stream_neighbors(
-        self,
-        ann_obj: AnnStream,
-        path: str,
-    ) -> None:
-        try:
-            paths = self._annStreamNeighborPaths
-        except AttributeError:
-            paths = WeakKeyDictionary()
-            self._annStreamNeighborPaths = paths
-        paths[ann_obj] = path
 
     def _resolve_ann_index(
         self,
@@ -619,13 +585,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
     def _load_artifact_ann_stream(
         self,
-        from_assay: str,
-        cell_key: str,
-        feat_scaling: bool,
         neighbors_ref: ArtifactRef,
+        feat_scaling: bool,
     ) -> AnnStream:
-        if neighbors_ref.scope != "assay" or neighbors_ref.assay != from_assay:
-            raise ValueError("neighbors does not belong to from_assay")
+        if neighbors_ref.scope != "assay" or neighbors_ref.assay is None:
+            raise ValueError("neighbors must be assay-scoped")
         lineage = resolve_native_graph_inputs(self.zw, neighbors_ref)
         if lineage.normalized is None or lineage.reduction is None:
             raise ValueError(
@@ -661,7 +625,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         )
         reduction_status = inspect_artifact(self.zw, reduction_ref)
         reduction_params = reduction_status.parameters or {}
-        reduction_execution = reduction_status.execution_options or {}
         operation = reduction_status.operation
         reduction_method = (
             {
@@ -723,10 +686,27 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             dims=dims,
             loadings=loadings,
             use_for_pca=(
-                self.cells.fetch(
-                    str(reduction_execution.get("pca_cell_key", cell_key)),
-                    key=cell_key,
-                )
+                read_stored_selection_mask(
+                    self.zw,
+                    self._artifact_input_ref(
+                        reduction_ref,
+                        "pca_cell_selection",
+                        "cell_selection",
+                    ),
+                    kind="cell_selection",
+                    scope="datastore",
+                    assay=None,
+                    table_path="cellData",
+                )[
+                    read_stored_selection_mask(
+                        self.zw,
+                        lineage.cell_selection,
+                        kind="cell_selection",
+                        scope="datastore",
+                        assay=None,
+                        table_path="cellData",
+                    )
+                ]
                 if reduction_method == "pca"
                 else np.ones(data.shape[0], dtype=bool)
             ),
@@ -760,14 +740,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             threads=persisted_ann_threads,
         )
         ann_obj.annThreads = persisted_ann_threads
-        self._remember_ann_stream_path(
-            ann_obj,
-            artifact_path(ann_ref),
-        )
-        self._remember_ann_stream_neighbors(
-            ann_obj,
-            artifact_path(neighbors_ref),
-        )
         return ann_obj
 
     def _get_graph_ncells_k(self, graph_loc: str) -> tuple[int, int]:
@@ -884,371 +856,23 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         assay: str | None,
         invalidate_cache: bool,
     ) -> ArtifactRef:
-        ref = None
-        if not invalidate_cache:
-            column_array = as_zarr_array(
-                metadata_group[column],
-                name=column,
-            )
-            raw_ref = column_array.attrs.get("source_artifact")
-            if isinstance(raw_ref, dict):
-                try:
-                    candidate = ArtifactRef.from_dict(raw_ref)
-                    status = inspect_artifact(self.zw, candidate)
-                except (KeyError, TypeError, ValueError):
-                    pass
-                else:
-                    if (
-                        candidate.scope == scope
-                        and candidate.kind == kind
-                        and candidate.assay == assay
-                        and status.complete
-                        and (status.inputs or {}).get("ordered_row_ids_fingerprint")
-                        == fingerprint_strings(row_ids)
-                    ):
-                        group = group_at(self.zw, status.path)
-                        if "values" in group:
-                            stored = np.asarray(
-                                as_zarr_array(
-                                    group["values"],
-                                    name="values",
-                                )[:]
-                            )
-                            if (
-                                stored.ndim == 1
-                                and stored.dtype == np.dtype(bool)
-                                and values.ndim == 1
-                                and values.dtype == np.dtype(bool)
-                                and stored.shape == values.shape
-                                and np.array_equal(stored, values)
-                            ):
-                                ref = candidate
-        if ref is None:
-            if getattr(self, "zarr_mode", "r+") != "r+":
-                raise PermissionError(
-                    f"Selection provenance for {column!r} is unavailable "
-                    "in the read-only store"
-                )
-            ref = resolve_selection_artifact(
-                self.zw,
-                scope=scope,
-                assay=assay,
-                kind=kind,
-                values=values,
-                row_ids=row_ids,
-                operation="manual_selection",
-                parameters={},
-                inputs={},
-                source_column=column,
-                invalidate_cache=invalidate_cache,
-            )
+        del metadata_group
         if getattr(self, "zarr_mode", "r+") != "r+":
-            return ref
-        if scope == "assay" and assay is not None:
-            link_feature_data_column(
-                self._get_assay(assay).z,
-                column,
-                ref,
-                value_name="values",
-                default_display=categorical_display(values),
+            raise PermissionError(
+                f"Snapshotting selection column {column!r} requires a writable store"
             )
-        else:
-            target = as_zarr_array(
-                metadata_group[column],
-                name=column,
-            )
-            target.attrs["source_artifact"] = ref.to_dict()
-            target.attrs["source_value"] = "values"
-        return ref
-
-    def _selected_artifact(
-        self,
-        from_assay: str | None,
-        field_name: str,
-        kind: str,
-    ) -> ArtifactRef:
-        assay = from_assay or self._defaultAssay
-        if assay is None:
-            raise ValueError("No assay was provided and no default is configured")
-        state = read_assay_state(self.zw, assay)
-        if state is None:
-            raise KeyError(f"Assay {assay!r} has no selected artifact state")
-        ref = getattr(state, field_name)
-        if not isinstance(ref, ArtifactRef):
-            raise KeyError(f"AssayState has no selected {field_name} artifact")
-        self._require_complete_artifact(ref, kind, assay=assay)
-        return ref
-
-    def _artifact_chain_state(
-        self,
-        terminal: ArtifactRef,
-        *,
-        embedding_initialization: ArtifactRef | None = None,
-        named_results: dict[str, ArtifactRef] | None = None,
-        cell_key_override: str | None = None,
-    ) -> AssayState:
-        normalized = feature_scaling = reduction = None
-        batch_correction = ann_index = neighbors = connectivity_map = None
-        current = terminal
-        if current.kind == "connectivity_map":
-            connectivity_map = current
-            current = self._artifact_input_ref(
-                current,
-                "neighbors",
-                "neighbors",
-            )
-        if current.kind == "neighbors":
-            neighbors = current
-            ann_index = self._artifact_input_ref(
-                current,
-                "ann_index",
-                "ann_index",
-            )
-            neighbor_status = self._require_complete_artifact(
-                current,
-                "neighbors",
-            )
-            raw_coordinates = (neighbor_status.inputs or {}).get("coordinates")
-            if not isinstance(raw_coordinates, dict):
-                raise ValueError("Neighbors artifact has no coordinates input")
-            current = ArtifactRef.from_dict(raw_coordinates)
-            if current.kind not in {
-                "reduction",
-                "batch_correction",
-                "imported_coordinates",
-            }:
-                raise ValueError(
-                    "Neighbor coordinates must be reduction, batch_correction, "
-                    "or imported_coordinates"
-                )
-            self._require_complete_artifact(current, current.kind)
-            ann_coordinates = self._artifact_input_ref(
-                ann_index,
-                "coordinates",
-                current.kind,
-            )
-            if ann_coordinates != current:
-                raise ValueError("Neighbors and ANN index use different coordinates")
-        elif current.kind == "ann_index":
-            ann_index = current
-            status = self._require_complete_artifact(current, "ann_index")
-            raw_coordinates = (status.inputs or {}).get("coordinates")
-            if not isinstance(raw_coordinates, dict):
-                raise ValueError("ANN artifact has no coordinates input")
-            current = ArtifactRef.from_dict(raw_coordinates)
-        if current.kind == "imported_coordinates":
-            imported_status = self._require_complete_artifact(
-                current,
-                "imported_coordinates",
-            )
-            if current.assay is None:
-                raise ValueError("Imported-coordinate artifact has no assay")
-            execution = imported_status.execution_options or {}
-            cell_key = execution.get("cell_key")
-            if not isinstance(cell_key, str):
-                raise ValueError("Imported-coordinate artifact has no cell_key")
-            if cell_key_override is not None:
-                cell_key = cell_key_override
-            validate_imported_coordinates_artifact(
-                self.zw,
-                current,
-                cell_key=cell_key,
-            )
-            imported_state = AssayState(
-                assay=current.assay,
-                cell_key=cell_key,
-                ann_index=ann_index,
-                neighbors=neighbors,
-                connectivity_map=connectivity_map,
-                named_results=named_results or {},
-            )
-            previous = read_assay_state_document(self.zw, current.assay)
-            if named_results is None and previous is not None:
-                carried = {}
-                for name, ref in previous.named_results.items():
-                    try:
-                        fits = (
-                            named_result_mismatch(
-                                self.zw,
-                                name,
-                                ref,
-                                imported_state,
-                            )
-                            is None
-                        )
-                    except (KeyError, RuntimeError, TypeError, ValueError):
-                        continue
-                    if fits:
-                        carried[name] = ref
-                if carried:
-                    imported_state = replace(
-                        imported_state,
-                        named_results=carried,
-                    )
-            return imported_state
-        if current.kind == "batch_correction":
-            batch_correction = current
-            current = self._artifact_input_ref(
-                current,
-                "reduction",
-                "reduction",
-            )
-        if current.kind == "reduction":
-            reduction = current
-            normalized = self._artifact_input_ref(
-                current,
-                "normalized",
-                "normalized",
-            )
-            reduction_status = self._require_complete_artifact(
-                current,
-                "reduction",
-            )
-            raw_scaling = (reduction_status.inputs or {}).get("feature_scaling")
-            if raw_scaling is not None:
-                if not isinstance(raw_scaling, dict):
-                    raise ValueError(
-                        "Reduction feature_scaling input is not an artifact ref"
-                    )
-                feature_scaling = ArtifactRef.from_dict(raw_scaling)
-                self._require_complete_artifact(
-                    feature_scaling,
-                    "feature_scaling",
-                    assay=current.assay,
-                )
-        elif current.kind == "normalized":
-            normalized = current
-        else:
-            raise ValueError(f"Cannot select graph state from {terminal.kind!r}")
-        assert normalized is not None
-        normalized_status = self._require_complete_artifact(
-            normalized,
-            "normalized",
-        )
-        execution = normalized_status.execution_options or {}
-        cell_key = execution.get("cell_key")
-        if not isinstance(cell_key, str):
-            raise ValueError("Normalized artifact is missing cell_key")
-        if normalized.assay is None:
-            raise ValueError("Normalized artifact has no assay")
-        previous = read_assay_state_document(self.zw, normalized.assay)
-        if cell_key_override is not None:
-            cell_key = cell_key_override
-        elif previous is not None and previous.normalized == normalized:
-            cell_key = previous.cell_key
-        validate_normalized_artifact_selection(
+        return resolve_selection_artifact(
             self.zw,
-            normalized,
-            cell_key,
-        )
-        if embedding_initialization is None and reduction is not None:
-            if previous is not None and previous.embedding_initialization is not None:
-                try:
-                    previous_reduction = self._artifact_input_ref(
-                        previous.embedding_initialization,
-                        "reduction",
-                        "reduction",
-                    )
-                except (KeyError, RuntimeError, TypeError, ValueError):
-                    previous_reduction = None
-                if previous_reduction == reduction:
-                    embedding_initialization = previous.embedding_initialization
-        if connectivity_map is None and neighbors is not None:
-            if previous is not None and previous.connectivity_map is not None:
-                try:
-                    previous_neighbors = self._artifact_input_ref(
-                        previous.connectivity_map,
-                        "neighbors",
-                        "neighbors",
-                    )
-                except (KeyError, RuntimeError, ValueError):
-                    # Publishing a new chain is how a store recovers from a graph
-                    # artifact that was removed, so a stale ref cannot block it.
-                    previous_neighbors = None
-                if previous_neighbors == neighbors:
-                    connectivity_map = previous.connectivity_map
-        state = AssayState(
-            assay=normalized.assay,
-            cell_key=cell_key,
-            normalized=normalized,
-            feature_scaling=feature_scaling,
-            reduction=reduction,
-            batch_correction=batch_correction,
-            ann_index=ann_index,
-            embedding_initialization=embedding_initialization,
-            neighbors=neighbors,
-            connectivity_map=connectivity_map,
-            named_results=named_results or {},
-        )
-        if named_results is None and previous is not None and previous.named_results:
-            carried = {}
-            for name, ref in previous.named_results.items():
-                try:
-                    fits = named_result_mismatch(self.zw, name, ref, state) is None
-                except (KeyError, RuntimeError, TypeError, ValueError):
-                    continue
-                if fits:
-                    carried[name] = ref
-            if carried:
-                state = replace(state, named_results=carried)
-        return state
-
-    def _publish_current_artifact(
-        self,
-        ref: ArtifactRef,
-        *,
-        update_state: bool,
-        embedding_initialization: ArtifactRef | None = None,
-        named_results: dict[str, ArtifactRef] | None = None,
-        named_result_updates: dict[str, ArtifactRef] | None = None,
-        cell_key_override: str | None = None,
-    ) -> None:
-        if not update_state:
-            return
-        if named_results is not None and named_result_updates is not None:
-            raise ValueError(
-                "named_results and named_result_updates cannot both be provided"
-            )
-        candidate = self._artifact_chain_state(
-            ref,
-            embedding_initialization=embedding_initialization,
-            named_results=named_results,
-            cell_key_override=cell_key_override,
-        )
-        if named_result_updates is not None:
-            merged_results = dict(candidate.named_results)
-            merged_results.update(named_result_updates)
-            candidate = replace(candidate, named_results=merged_results)
-        previous = read_assay_state_document(self.zw, candidate.assay)
-        field_name = {
-            "normalized": "normalized",
-            "embedding_initialization": "embedding_initialization",
-            "reduction": "reduction",
-            "batch_correction": "batch_correction",
-            "ann_index": "ann_index",
-            "neighbors": "neighbors",
-            "connectivity_map": "connectivity_map",
-        }.get(ref.kind)
-        if (
-            previous is not None
-            and previous.matches(candidate.cell_key)
-            and field_name is not None
-            and getattr(previous, field_name) == ref
-            and embedding_initialization is None
-            and named_results is None
-            and named_result_updates is None
-        ):
-            try:
-                validate_assay_state(self.zw, previous)
-            except ArtifactResolutionError:
-                # An unavailable artifact in the previous current chain must
-                # not prevent this complete chain from becoming current.
-                pass
-            else:
-                candidate = previous
-        write_assay_state(
-            self.zw,
-            candidate,
+            scope=scope,
+            assay=assay,
+            kind=kind,
+            values=values,
+            row_ids=row_ids,
+            operation="snapshot_manual_selection",
+            parameters={},
+            inputs={},
+            source_column=column,
+            invalidate_cache=invalidate_cache,
         )
 
     def _graph_cell_selection(
@@ -1438,22 +1062,13 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         *,
         batch_size: int | None,
     ) -> tuple[CoordinateSource, int, int]:
+        resolve_coordinate_inputs(self.zw, coordinates)
         if coordinates.kind == "imported_coordinates":
             status = self._require_complete_artifact(
                 coordinates,
                 "imported_coordinates",
             )
-            execution = status.execution_options or {}
-            cell_key = execution.get("cell_key")
-            if not isinstance(cell_key, str) or not cell_key:
-                raise ValueError(
-                    "Imported-coordinate artifact has no cell selection key"
-                )
-            validate_imported_coordinates_artifact(
-                self.zw,
-                coordinates,
-                cell_key=cell_key,
-            )
+            validate_imported_coordinates_artifact(self.zw, coordinates)
             group = group_at(self.zw, status.path)
             backing = as_zarr_array(group["data"], name="data")
             data = ChunkedArray(
@@ -1592,130 +1207,67 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
     def run_normalization(
         self,
-        from_assay: str | None = None,
-        cell_key: str = "I",
+        cell_selection: ArtifactRef,
+        features: ArtifactRef,
         *,
-        features: ArtifactRef | str,
         log_transform: bool | None = None,
         renormalize_subset: bool | None = None,
-        update_state: bool = True,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
-        """Normalize one cell and feature selection into an artifact.
-
-        An identical operation reuses a complete artifact unless
-        ``invalidate_cache`` is true. The returned reference can be passed
-        directly to a reduction method.
-
-        Args:
-            from_assay: Assay to normalize. Uses the default assay when omitted.
-            cell_key: Boolean cell metadata column selecting rows.
-            features: Exact published feature label or feature-selection ref.
-            log_transform: Whether to apply the assay log transform. When
-                omitted, reuse the selected artifact setting or default to
-                true. ATAC defaults to false and rejects true.
-            renormalize_subset: Whether to recompute the normalization
-                denominator from selected features. When omitted, reuse the
-                selected setting. ATAC defaults to false; other assays default
-                to true.
-            update_state: Select the result as the assay's current normalized
-                artifact.
-            invalidate_cache: Force a new artifact instead of reusing an
-                identical complete result.
-
-        Returns:
-            Reference to the normalized artifact.
-
-        Raises:
-            ArtifactResolutionError: If the feature selection is invalid.
-            TypeError: If a selection is not boolean.
-            ValueError: If the assay or selected data is invalid.
-        """
-        assay_name = from_assay or self._defaultAssay
+        """Normalize explicit immutable cell and feature selections."""
+        if not isinstance(cell_selection, ArtifactRef):
+            raise TypeError("cell_selection must be an ArtifactRef")
+        if not isinstance(features, ArtifactRef):
+            raise TypeError("features must be an ArtifactRef")
+        assay_name = features.assay
         if assay_name is None:
-            raise ValueError("No assay was provided and no default is configured")
+            raise ValueError("Feature-selection artifact has no assay")
         assay = self._get_assay(assay_name)
-        state = read_assay_state_document(self.zw, assay_name)
-        self._ensure_all_features(assay)
         feature_selection = self.resolve_features(assay_name, features)
-        cell_values = np.asarray(self.cells.fetch_all(cell_key))
+        validated_cells = validate_stored_selection_integrity(
+            self.zw,
+            cell_selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
+        )
+        cell_values = np.asarray(validated_cells.values[:], dtype=bool)
         feature_group = artifact_group(self.zw, feature_selection)
         feature_values = np.asarray(
             as_zarr_array(feature_group["values"], name="values")[:],
             dtype=bool,
         )
-        if cell_values.dtype != bool or feature_values.dtype != bool:
-            raise TypeError("Cell and feature selections must be boolean")
-        n_cells = int(cell_values.sum())
+        n_cells = validated_cells.selected_count
         n_features = int(feature_values.sum())
         if n_cells < 1 or n_features < 1:
             raise ValueError("Normalization requires selected cells and features")
-        cell_selection = self._ensure_cell_selection(cell_key)
-        stored_parameters: dict[str, Any] = {}
-        if state is not None and state.cell_key == cell_key and state.normalized:
-            candidate_parameters: dict[str, Any] = {}
-            try:
-                normalized_status = inspect_artifact(self.zw, state.normalized)
-                if not normalized_status.exists or not normalized_status.complete:
-                    raise ValueError("Current normalized artifact is unavailable")
-                validate_normalized_artifact_selection(
-                    self.zw,
-                    state.normalized,
-                    cell_key,
-                )
-                normalized_inputs = normalized_status.inputs or {}
-                stored_cell_selection = ArtifactRef.from_dict(
-                    cast(dict[str, Any], normalized_inputs["cell_selection"])
-                )
-                stored_feature_selection = ArtifactRef.from_dict(
-                    cast(dict[str, Any], normalized_inputs["feature_selection"])
-                )
-                candidate_parameters = normalized_status.parameters or {}
-            except (KeyError, RuntimeError, TypeError, ValueError):
-                stored_cell_selection = None
-                stored_feature_selection = None
-            if (
-                stored_cell_selection == cell_selection
-                and stored_feature_selection == feature_selection
-            ):
-                stored_parameters = candidate_parameters
         from ...assay import ATACassay
 
         if isinstance(assay, ATACassay):
-            stored_method_is_current = stored_parameters.get(
-                "normalization_method"
-            ) == serialize_artifact_value(assay.normMethod)
             if log_transform is None:
-                log_transform = (
-                    bool(stored_parameters.get("log_transform", False))
-                    if stored_method_is_current
-                    else False
-                )
-            elif not isinstance(log_transform, (bool, np.bool_)):
+                log_transform = False
+            elif not isinstance(log_transform, bool | np.bool_):
                 raise TypeError("log_transform must be a boolean")
             if log_transform:
                 raise ValueError(
                     "ATAC TF-IDF does not support log_transform; use False"
                 )
-            else:
-                log_transform = False
             if renormalize_subset is None:
-                renormalize_subset = (
-                    bool(stored_parameters.get("renormalize_subset", False))
-                    if stored_method_is_current
-                    else False
-                )
-            elif not isinstance(renormalize_subset, (bool, np.bool_)):
+                renormalize_subset = False
+            elif not isinstance(renormalize_subset, bool | np.bool_):
                 raise TypeError("renormalize_subset must be a boolean")
-            else:
-                renormalize_subset = bool(renormalize_subset)
         else:
             if log_transform is None:
-                log_transform = bool(stored_parameters.get("log_transform", True))
+                log_transform = True
+            elif not isinstance(log_transform, bool | np.bool_):
+                raise TypeError("log_transform must be a boolean")
             if renormalize_subset is None:
-                renormalize_subset = bool(
-                    stored_parameters.get("renormalize_subset", True)
-                )
+                renormalize_subset = True
+            elif not isinstance(renormalize_subset, bool | np.bool_):
+                raise TypeError("renormalize_subset must be a boolean")
+        log_transform = bool(log_transform)
+        renormalize_subset = bool(renormalize_subset)
         normalization_method = assay.normMethod
         if callable(normalization_method):
             method_qualname = str(getattr(normalization_method, "__qualname__", ""))
@@ -1727,11 +1279,16 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     "artifact_identity for provenance"
                 )
         raw_size_factor = getattr(assay, "sf", None)
+        raw_dataset_fingerprint = assay.attrs.get("dataset_fingerprint")
+        dataset_fingerprint = (
+            raw_dataset_fingerprint
+            if isinstance(raw_dataset_fingerprint, str) and raw_dataset_fingerprint
+            else self._calculate_dataset_fingerprint(assay_name)
+        )
         arguments = NormalizationArguments(
-            from_assay=assay_name,
-            cell_key=cell_key,
             cell_selection=cell_selection,
             feature_selection=feature_selection,
+            dataset_fingerprint=dataset_fingerprint,
             normalization_method=normalization_method,
             size_factor=(
                 float(cast(int | float, raw_size_factor))
@@ -1740,7 +1297,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             ),
             log_transform=log_transform,
             renormalize_subset=renormalize_subset,
-            update_state=update_state,
             invalidate_cache=invalidate_cache,
         )
         planned = self._plan_assay_artifact(
@@ -1765,11 +1321,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             ),
             invalidate_cache=invalidate_cache,
         )
-        self._ensure_dataset_fingerprint(assay_name)
         if not planned.reused:
             group = start_artifact(self.zw, planned)
             relative_path = artifact_path(planned.ref).removeprefix(f"{assay_name}/")
-            assay.save_normalized_data(
+            assay._write_normalized_payload(
                 np.flatnonzero(cell_values),
                 np.flatnonzero(feature_values),
                 relative_path,
@@ -1777,11 +1332,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 renormalize_subset=renormalize_subset,
             )
             finish_artifact(group, planned)
-        self._publish_current_artifact(
-            planned.ref,
-            update_state=update_state,
-            cell_key_override=cell_key,
-        )
         action = "Reused" if planned.reused else "Stored"
         logger.info(
             f"{action} normalized data for {n_cells} cells and {n_features} features"
@@ -1792,10 +1342,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         self,
         *,
         method: str,
-        normalized: ArtifactRef | None,
-        from_assay: str | None,
+        normalized: ArtifactRef,
         dims: int,
-        pca_cell_key: str | None,
+        pca_cell_selection: ArtifactRef | None,
         feat_scaling: bool,
         lsi_skip_first: bool,
         custom_loadings: np.ndarray | None,
@@ -1803,7 +1352,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         batch_size: int | None,
         local_cache: bool | str,
         show_elbow_plot: bool,
-        update_state: bool,
         invalidate_cache: bool,
         lsi_solver: Literal["streaming", "materialized"] = "streaming",
         lsi_n_iter: int = 5,
@@ -1812,15 +1360,12 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         requested_dims = _positive_integer(dims, "dims")
         if batch_size is not None:
             _positive_integer(batch_size, "batch_size")
-        normalized_ref = normalized or self._selected_artifact(
-            from_assay,
-            "normalized",
-            "normalized",
-        )
+        if not isinstance(normalized, ArtifactRef):
+            raise TypeError("normalized must be an ArtifactRef")
+        normalized_ref = normalized
         status = self._require_complete_artifact(normalized_ref, "normalized")
         if normalized_ref.assay is None:
             raise ValueError("Normalized artifact has no assay")
-        read_assay_state_document(self.zw, normalized_ref.assay)
         group = group_at(self.zw, status.path)
         data = as_zarr_array(group["data"], name="data")
         effective_batch_size = _row_block(
@@ -1850,16 +1395,14 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 return self._run_reduction_artifact_impl(
                     method=method,
                     normalized=normalized_ref,
-                    from_assay=from_assay,
                     dims=requested_dims,
-                    pca_cell_key=pca_cell_key,
+                    pca_cell_selection=pca_cell_selection,
                     feat_scaling=feat_scaling,
                     lsi_skip_first=lsi_skip_first,
                     custom_loadings=custom_loadings,
                     rand_state=rand_state,
                     batch_size=effective_batch_size,
                     show_elbow_plot=show_elbow_plot,
-                    update_state=update_state,
                     invalidate_cache=invalidate_cache,
                     lsi_solver=lsi_solver,
                     lsi_n_iter=lsi_n_iter,
@@ -1870,27 +1413,21 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         self,
         *,
         method: str,
-        normalized: ArtifactRef | None,
-        from_assay: str | None,
+        normalized: ArtifactRef,
         dims: int,
-        pca_cell_key: str | None,
+        pca_cell_selection: ArtifactRef | None,
         feat_scaling: bool,
         lsi_skip_first: bool,
         custom_loadings: np.ndarray | None,
         rand_state: int,
         batch_size: int | None,
         show_elbow_plot: bool,
-        update_state: bool,
         invalidate_cache: bool,
         lsi_solver: Literal["streaming", "materialized"] = "streaming",
         lsi_n_iter: int = 5,
         lsi_n_oversamples: int = 10,
     ) -> ArtifactRef:
-        normalized_ref = normalized or self._selected_artifact(
-            from_assay,
-            "normalized",
-            "normalized",
-        )
+        normalized_ref = normalized
         normalized_status = self._require_complete_artifact(
             normalized_ref,
             "normalized",
@@ -1898,17 +1435,27 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         if normalized_ref.assay is None:
             raise ValueError("Normalized artifact has no assay")
         assay_name = normalized_ref.assay
-        execution = normalized_status.execution_options or {}
-        cell_key = execution.get("cell_key")
-        if not isinstance(cell_key, str):
-            raise ValueError("Normalized artifact has no cell_key")
-        state = read_assay_state_document(self.zw, assay_name)
-        if state is not None and state.normalized == normalized_ref:
-            cell_key = state.cell_key
-        validate_normalized_artifact_selection(
-            self.zw,
+        normalized_cell_selection = self._artifact_input_ref(
             normalized_ref,
-            cell_key,
+            "cell_selection",
+            "cell_selection",
+        )
+        normalized_feature_selection = self._artifact_input_ref(
+            normalized_ref,
+            "feature_selection",
+            "feature_selection",
+        )
+        normalized_feature_selection = self.resolve_features(
+            assay_name,
+            normalized_feature_selection,
+        )
+        validated_normalized_cells = validate_stored_selection_integrity(
+            self.zw,
+            normalized_cell_selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
         )
         data_group = as_zarr_group(
             self.zw[normalized_status.path],
@@ -1916,6 +1463,26 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         )
         data_array = as_zarr_array(data_group["data"], name="data")
         n_cells, n_features = map(int, data_array.shape)
+        feature_group = artifact_group(self.zw, normalized_feature_selection)
+        selected_features = int(
+            np.count_nonzero(
+                np.asarray(
+                    as_zarr_array(feature_group["values"], name="values")[:],
+                    dtype=bool,
+                )
+            )
+        )
+        if selected_features != n_features:
+            raise ArtifactResolutionError(
+                "Normalized columns do not match its feature selection",
+                code="column_mismatch",
+                context={
+                    "assay": assay_name,
+                    "artifact_id": normalized_ref.artifact_id,
+                    "normalized_columns": n_features,
+                    "selected_count": selected_features,
+                },
+            )
         effective_batch_size = min(
             _positive_integer(batch_size, "batch_size"),
             n_cells,
@@ -1929,15 +1496,50 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             effective_dims = int(custom_loadings.shape[1])
             if effective_dims < 1:
                 raise ValueError("Custom loadings must contain at least one dimension")
-        pca_key = pca_cell_key or cell_key
-        pca_selection = None
+        if validated_normalized_cells.selected_count != n_cells:
+            raise ArtifactResolutionError(
+                "Normalized rows do not match its cell selection",
+                code="row_mismatch",
+                context={
+                    "assay": assay_name,
+                    "artifact_id": normalized_ref.artifact_id,
+                    "normalized_rows": n_cells,
+                    "selected_count": validated_normalized_cells.selected_count,
+                },
+            )
+        pca_selection = pca_cell_selection or normalized_cell_selection
         pca_use_values: np.ndarray | None = None
         if method == "pca":
-            pca_use_values = np.asarray(self.cells.fetch(pca_key, key=cell_key))
-            if pca_use_values.dtype != bool or pca_use_values.shape != (n_cells,):
-                raise TypeError(
-                    "pca_cell_key must select one boolean value per normalized cell"
+            normalized_mask = read_stored_selection_mask(
+                self.zw,
+                normalized_cell_selection,
+                kind="cell_selection",
+                scope="datastore",
+                assay=None,
+                table_path="cellData",
+            )
+            pca_mask = (
+                normalized_mask
+                if pca_cell_selection is None
+                else read_stored_selection_mask(
+                    self.zw,
+                    pca_cell_selection,
+                    kind="cell_selection",
+                    scope="datastore",
+                    assay=None,
+                    table_path="cellData",
                 )
+            )
+            if np.any(pca_mask & ~normalized_mask):
+                raise ArtifactResolutionError(
+                    "PCA cell selection must be a subset of normalized cells",
+                    code="row_mismatch",
+                    context={
+                        "assay": assay_name,
+                        "artifact_id": pca_selection.artifact_id,
+                    },
+                )
+            pca_use_values = pca_mask[normalized_mask]
             selected_pca_cells = int(pca_use_values.sum())
             if selected_pca_cells < effective_dims + 1:
                 raise ValueError("PCA requires at least dims + 1 selected cells")
@@ -1945,23 +1547,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 raise ValueError("PCA requires at least dims + 1 selected features")
             if effective_batch_size < effective_dims + 1:
                 raise ValueError("PCA batch_size must be at least dims + 1")
-            pca_values = np.asarray(self.cells.fetch_all(pca_key))
-            if pca_values.dtype != bool:
-                raise TypeError("pca_cell_key must reference a boolean column")
-            cell_data = as_zarr_group(
-                self.zw["cellData"],
-                name="cellData",
-            )
-            pca_selection = self._resolve_selection_input(
-                metadata_group=cell_data,
-                column=pca_key,
-                values=pca_values,
-                row_ids=np.asarray(self.cells.fetch_all("ids")),
-                scope="datastore",
-                kind="cell_selection",
-                assay=None,
-                invalidate_cache=invalidate_cache,
-            )
         elif method == "lsi":
             required_rank = effective_dims + int(lsi_skip_first)
             if required_rank > min(n_cells, n_features):
@@ -2059,12 +1644,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 normalized=normalized_ref,
                 feature_scaling=scaling_plan.ref,
                 pca_cell_selection=pca_selection,
-                pca_cell_key=pca_key,
                 dims=effective_dims,
                 feat_scaling=feat_scaling,
                 batch_size=effective_batch_size,
                 show_elbow_plot=show_elbow_plot,
-                update_state=update_state,
                 invalidate_cache=invalidate_cache,
             )
         elif method == "lsi":
@@ -2078,7 +1661,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 n_iter=lsi_n_iter,
                 n_oversamples=lsi_n_oversamples,
                 batch_size=effective_batch_size,
-                update_state=update_state,
                 invalidate_cache=invalidate_cache,
             )
         else:
@@ -2090,7 +1672,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 loadings=custom_loadings,
                 dims=effective_dims,
                 feat_scaling=feat_scaling,
-                update_state=update_state,
                 invalidate_cache=invalidate_cache,
             )
         required_arrays: tuple[str | ArrayRequirement, ...] = (
@@ -2189,10 +1770,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     variance_explained=(100 * transform.pca.explained_variance_ratio_),
                     show=True,
                 )
-        self._publish_current_artifact(
-            planned.ref,
-            update_state=update_state,
-        )
         action = "Reused" if planned.reused else "Stored"
         logger.info(
             f"{action} {method.upper()} reduction for {n_cells} cells "
@@ -2202,27 +1779,23 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
     def run_pca(
         self,
-        normalized: ArtifactRef | None = None,
+        normalized: ArtifactRef,
         *,
-        from_assay: str | None = None,
         dims: int = 21,
-        pca_cell_key: str | None = None,
+        pca_cell_selection: ArtifactRef | None = None,
         feat_scaling: bool = True,
         batch_size: int | None = None,
         local_cache: bool | str = "auto",
         show_elbow_plot: bool = False,
-        update_state: bool = True,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
         """Fit or reuse PCA for a normalized artifact.
 
         Args:
-            normalized: Normalized artifact to reduce. Uses the selected assay
-                state when omitted.
-            from_assay: Assay used to resolve the selected normalized artifact.
+            normalized: Normalized artifact to reduce.
             dims: Requested number of principal components. (Default: 21)
-            pca_cell_key: Optional boolean cell column used to fit PCA while
-                projecting every selected cell.
+            pca_cell_selection: Optional stored cell-selection artifact used to
+                fit PCA while projecting every cell in ``normalized``.
             feat_scaling: Whether to standardize features before fitting PCA.
             batch_size: Number of selected cells processed per block. When
                 omitted, whole stored row bands are combined as needed to fit
@@ -2232,7 +1805,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 stores.
             show_elbow_plot: Whether to display explained variance after a new
                 PCA fit.
-            update_state: Select the result as the current reduction.
             invalidate_cache: Force a new reduction artifact.
 
         Returns:
@@ -2241,9 +1813,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         return self._run_reduction_artifact(
             method="pca",
             normalized=normalized,
-            from_assay=from_assay,
             dims=dims,
-            pca_cell_key=pca_cell_key,
+            pca_cell_selection=pca_cell_selection,
             feat_scaling=feat_scaling,
             lsi_skip_first=False,
             custom_loadings=None,
@@ -2251,15 +1822,13 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             batch_size=batch_size,
             local_cache=local_cache,
             show_elbow_plot=show_elbow_plot,
-            update_state=update_state,
             invalidate_cache=invalidate_cache,
         )
 
     def run_lsi(
         self,
-        normalized: ArtifactRef | None = None,
+        normalized: ArtifactRef,
         *,
-        from_assay: str | None = None,
         dims: int = 11,
         skip_first: bool = True,
         rand_state: int = 4466,
@@ -2268,15 +1837,12 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         n_oversamples: int = 10,
         batch_size: int | None = None,
         local_cache: bool | str = "auto",
-        update_state: bool = True,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
         """Fit or reuse latent semantic indexing for normalized data.
 
         Args:
-            normalized: Normalized artifact to reduce. Uses selected assay
-                state when omitted.
-            from_assay: Assay used to resolve selected normalized data.
+            normalized: Normalized artifact to reduce.
             dims: Requested number of retained LSI dimensions.
             skip_first: Whether to omit the first singular component.
             rand_state: Seed used by the randomized decomposition.
@@ -2288,7 +1854,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             batch_size: Number of selected cells processed per block.
             local_cache: Local staging policy for normalized data on remote
                 stores.
-            update_state: Select the result as the current reduction.
             invalidate_cache: Force a new reduction artifact.
 
         Returns:
@@ -2310,9 +1875,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         return self._run_reduction_artifact(
             method="lsi",
             normalized=normalized,
-            from_assay=from_assay,
             dims=dims,
-            pca_cell_key=None,
+            pca_cell_selection=None,
             feat_scaling=False,
             lsi_skip_first=skip_first,
             custom_loadings=None,
@@ -2320,7 +1884,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             batch_size=batch_size,
             local_cache=local_cache,
             show_elbow_plot=False,
-            update_state=update_state,
             invalidate_cache=invalidate_cache,
             lsi_solver=solver,
             lsi_n_iter=int(n_iter),
@@ -2330,12 +1893,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
     def run_custom_reduction(
         self,
         loadings: np.ndarray,
-        normalized: ArtifactRef | None = None,
+        normalized: ArtifactRef,
         *,
-        from_assay: str | None = None,
         batch_size: int | None = None,
         local_cache: bool | str = "auto",
-        update_state: bool = True,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
         """Register custom feature loadings as a reusable reduction.
@@ -2343,13 +1904,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         Args:
             loadings: Two-dimensional feature-by-dimension loading matrix. Its
                 row count must match the normalized feature selection.
-            normalized: Normalized artifact associated with the loadings. Uses
-                selected assay state when omitted.
-            from_assay: Assay used to resolve selected normalized data.
+            normalized: Normalized artifact associated with the loadings.
             batch_size: Number of selected cells processed per block.
             local_cache: Local staging policy for normalized data on remote
                 stores.
-            update_state: Select the result as the current reduction.
             invalidate_cache: Force a new reduction artifact.
 
         Returns:
@@ -2363,9 +1921,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         return self._run_reduction_artifact(
             method="custom",
             normalized=normalized,
-            from_assay=from_assay,
             dims=int(loading_values.shape[1]),
-            pca_cell_key=None,
+            pca_cell_selection=None,
             feat_scaling=False,
             lsi_skip_first=False,
             custom_loadings=loading_values,
@@ -2373,31 +1930,52 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             batch_size=batch_size,
             local_cache=local_cache,
             show_elbow_plot=False,
-            update_state=update_state,
             invalidate_cache=invalidate_cache,
         )
 
     def run_harmony(
         self,
+        reduction: ArtifactRef,
         batch_columns: list[str],
-        reduction: ArtifactRef | None = None,
         *,
-        from_assay: str | None = None,
         harmony_params: dict[str, Any] | None = None,
         batch_size: int | None = None,
-        update_state: bool = True,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
-        """Fit or reuse Harmony correction for a reduction artifact."""
-        reduction_ref = reduction or self._selected_artifact(
-            from_assay,
-            "reduction",
-            "reduction",
+        """Snapshot live batch columns, then fit or reuse Harmony correction."""
+        self._resolve_harmony_reduction(reduction)
+        if not isinstance(batch_columns, list) or not batch_columns:
+            raise ValueError("batch_columns must be a non-empty list")
+        if any(not isinstance(column, str) or not column for column in batch_columns):
+            raise ValueError("batch_columns must contain non-empty strings")
+        if len(set(batch_columns)) != len(batch_columns):
+            raise ValueError("batch_columns must be unique")
+        batch_snapshot = snapshot_run_metadata(
+            self.zw,
+            table_path="cellData",
+            id_column="ids",
+            columns=batch_columns,
+            axis="cell",
+            invalidate_cache=invalidate_cache,
         )
-        self._require_complete_artifact(
-            reduction_ref,
-            "reduction",
+        return self._run_harmony_artifact(
+            reduction,
+            batch_snapshot,
+            batch_columns,
+            harmony_params=harmony_params,
+            batch_size=batch_size,
+            invalidate_cache=invalidate_cache,
         )
+
+    def _resolve_harmony_reduction(
+        self,
+        reduction: ArtifactRef,
+    ) -> tuple[str, ArtifactRef, ValidatedStoredSelection]:
+        if not isinstance(reduction, ArtifactRef):
+            raise TypeError("reduction must be an ArtifactRef")
+        resolve_coordinate_inputs(self.zw, reduction)
+        reduction_ref = reduction
+        self._require_complete_artifact(reduction_ref, "reduction")
         if reduction_ref.assay is None:
             raise ValueError("Reduction artifact has no assay")
         normalized_ref = self._artifact_input_ref(
@@ -2405,39 +1983,125 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             "normalized",
             "normalized",
         )
-        normalized_status = self._require_complete_artifact(
+        self._require_complete_artifact(normalized_ref, "normalized")
+        cell_selection = self._artifact_input_ref(
             normalized_ref,
-            "normalized",
+            "cell_selection",
+            "cell_selection",
         )
-        execution = normalized_status.execution_options or {}
-        cell_key = execution.get("cell_key")
-        if not isinstance(cell_key, str):
-            raise ValueError("Normalized artifact has no cell_key")
-        state = read_assay_state_document(self.zw, reduction_ref.assay)
-        if state is not None and state.normalized == normalized_ref:
-            cell_key = state.cell_key
-        validate_normalized_artifact_selection(
+        validated_cells = validate_stored_selection_integrity(
             self.zw,
-            normalized_ref,
-            cell_key,
+            cell_selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
+        )
+        return reduction_ref.assay, cell_selection, validated_cells
+
+    def _run_harmony_artifact(
+        self,
+        reduction: ArtifactRef,
+        batch_snapshot: ArtifactRef,
+        batch_columns: list[str],
+        *,
+        harmony_params: dict[str, Any] | None = None,
+        batch_size: int | None = None,
+        invalidate_cache: bool = False,
+    ) -> ArtifactRef:
+        """Fit Harmony from an explicit immutable metadata snapshot."""
+        if not isinstance(batch_snapshot, ArtifactRef):
+            raise TypeError("batch_snapshot must be an ArtifactRef")
+        reduction_ref = reduction
+        reduction_assay, cell_selection, validated_cells = (
+            self._resolve_harmony_reduction(reduction_ref)
         )
         if not isinstance(batch_columns, list) or not batch_columns:
             raise ValueError("batch_columns must be a non-empty list")
+        if any(not isinstance(column, str) or not column for column in batch_columns):
+            raise ValueError("batch_columns must contain non-empty strings")
         if len(set(batch_columns)) != len(batch_columns):
             raise ValueError("batch_columns must be unique")
         requested_batch_size = (
             None if batch_size is None else _positive_integer(batch_size, "batch_size")
         )
+        snapshot = validate_run_metadata_snapshot(
+            self.zw,
+            batch_snapshot,
+            axis="cell",
+            assay=None,
+            table_path="cellData",
+            ordered_columns=None,
+        )
+        missing_columns = [column for column in batch_columns if column not in snapshot]
+        if missing_columns:
+            raise ArtifactResolutionError(
+                "Harmony batch columns are absent from the metadata snapshot",
+                code="snapshot_contract_mismatch",
+                context={
+                    "artifact_id": batch_snapshot.artifact_id,
+                    "missing_columns": ",".join(missing_columns),
+                },
+            )
+
+        def selected_snapshot_values(column: str) -> np.ndarray:
+            values = as_zarr_array(snapshot[column], name=column)
+            selected_blocks = tuple(
+                np.asarray(block.values)
+                for block in iter_selected_axis_selection_blocks(
+                    self.zw,
+                    cell_selection,
+                    values,
+                    kind="cell_selection",
+                    scope="datastore",
+                    assay=None,
+                    table_path="cellData",
+                    block_rows=requested_batch_size,
+                )
+            )
+            selected = np.concatenate(selected_blocks)
+            missing_name = values.attrs.get("missing_mask")
+            if isinstance(missing_name, str):
+                missing_values = as_zarr_array(
+                    snapshot[missing_name], name=missing_name
+                )
+                missing = np.concatenate(
+                    tuple(
+                        np.asarray(block.values, dtype=bool)
+                        for block in iter_selected_axis_selection_blocks(
+                            self.zw,
+                            cell_selection,
+                            missing_values,
+                            kind="cell_selection",
+                            scope="datastore",
+                            assay=None,
+                            table_path="cellData",
+                            block_rows=requested_batch_size,
+                        )
+                    )
+                )
+                selected = selected.astype(object)
+                selected[missing] = None
+            return selected.astype(object)
+
         batches = pd.DataFrame(
-            {
-                column: self.cells.fetch(column, key=cell_key).astype(object)
-                for column in batch_columns
-            }
+            {column: selected_snapshot_values(column) for column in batch_columns}
         )
         source, n_cells, dims = self._coordinate_source(
             reduction_ref,
             batch_size=requested_batch_size,
         )
+        if n_cells != validated_cells.selected_count:
+            raise ArtifactResolutionError(
+                "Reduction rows do not match its cell selection",
+                code="row_mismatch",
+                context={
+                    "assay": reduction_ref.assay,
+                    "artifact_id": reduction_ref.artifact_id,
+                    "coordinate_rows": n_cells,
+                    "selected_count": validated_cells.selected_count,
+                },
+            )
         source_data = getattr(source, "data", None)
         source_batch_size = (
             int(source_data.chunksize[0]) if source_data is not None else n_cells
@@ -2446,24 +2110,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             source_batch_size if requested_batch_size is None else requested_batch_size,
             n_cells,
         )
-        cell_selection = self._artifact_input_ref(
-            normalized_ref,
-            "cell_selection",
-            "cell_selection",
-        )
-        batch_values = resolve_metadata_snapshot(
-            self.zw,
-            values=batches.to_numpy(),
-            row_ids=np.asarray(self.cells.fetch("ids", key=cell_key)),
-            operation="snapshot_metadata",
-            parameters={"columns": batch_columns},
-            inputs={"cell_selection": cell_selection},
-            source_columns=batch_columns,
-            invalidate_cache=invalidate_cache,
-        )
         arguments = HarmonyArguments(
             reduction=reduction_ref,
-            batch_values=batch_values,
+            batch_snapshot=batch_snapshot,
             batch_columns=tuple(batch_columns),
             harmony_parameters=harmony_params or {},
             algorithm_version="centroid_snapshot_v2",
@@ -2471,7 +2120,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             invalidate_cache=invalidate_cache,
         )
         planned = self._plan_assay_artifact(
-            reduction_ref.assay,
+            reduction_assay,
             arguments,
             required_arrays=(
                 ArrayRequirement(
@@ -2530,6 +2179,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 n_cells,
                 array_shard_rows(output),
             ):
+                shutdown_checkpoint()
                 output[start:stop, :] = np.asarray(
                     result.corrected[:, start:stop].T,
                     dtype=np.float32,
@@ -2554,10 +2204,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 list(levels) for levels in result.batch_levels
             ]
             finish_artifact(group, planned)
-        self._publish_current_artifact(
-            planned.ref,
-            update_state=update_state,
-        )
         action = "Reused" if planned.reused else "Stored"
         logger.info(
             f"{action} Harmony coordinates for {n_cells} cells with {dims} dimensions"
@@ -2566,7 +2212,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
     def _build_embedding_initialization(
         self,
-        reduction: ArtifactRef,
+        coordinates: ArtifactRef,
         *,
         n_centroids: int,
         rand_state: int,
@@ -2576,8 +2222,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         kmeans_batch_size: int = 10_000,
         algorithm_version: str = "minibatch_kmeans_v2",
     ) -> ArtifactRef:
-        if reduction.assay is None:
-            raise ValueError("Reduction artifact has no assay")
+        if coordinates.assay is None:
+            raise ValueError("Coordinate artifact has no assay")
         resolved_batch_size = (
             None if batch_size is None else _positive_integer(batch_size, "batch_size")
         )
@@ -2592,7 +2238,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             "kmeans_batch_size",
         )
         stream, n_cells, coordinate_dims = self._coordinate_source(
-            reduction,
+            coordinates,
             batch_size=resolved_batch_size,
         )
         source_data = getattr(stream, "data", None)
@@ -2616,7 +2262,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             max(requested_kmeans_batch_size, effective_clusters),
         )
         arguments = EmbeddingInitializationArguments(
-            reduction=reduction,
+            coordinates=coordinates,
             n_centroids=effective_clusters,
             rand_state=resolved_rand_state,
             batch_size=effective_batch_size,
@@ -2626,7 +2272,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             invalidate_cache=invalidate_cache,
         )
         planned = self._plan_assay_artifact(
-            reduction.assay,
+            coordinates.assay,
             arguments,
             required_arrays=(
                 ArrayRequirement(
@@ -2682,50 +2328,35 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
     def build_embedding_initialization(
         self,
-        reduction: ArtifactRef | None = None,
+        coordinates: ArtifactRef,
         *,
-        from_assay: str | None = None,
         n_centroids: int = 1000,
         rand_state: int = 4466,
         batch_size: int | None = None,
         kmeans_sampling: float = 0.1,
         kmeans_batch_size: int = 10_000,
-        update_state: bool = True,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
-        """Build or reuse K-means embedding initialization for a reduction.
+        """Build or reuse K-means initialization for explicit coordinates.
 
-        Downstream UMAP reads this artifact from ``AssayState`` unless you pass
-        ``ini_embed`` explicitly.
+        Pass the returned reference explicitly to an embedding operation.
 
         Args:
-            reduction: Reduction artifact to cluster. Uses the selected assay
-                reduction when omitted.
-            from_assay: Assay used to resolve the selected reduction.
+            coordinates: Reduction or batch-correction artifact to cluster.
             n_centroids: Requested number of K-means centroids.
             rand_state: K-means random seed.
             batch_size: Number of cells processed per block.
             kmeans_sampling: Fraction of cells considered during centroid seeding.
             kmeans_batch_size: Number of cells per internal K-means update.
-            update_state: Select the result as the current embedding
-                initialization.
             invalidate_cache: Force a new initialization artifact.
 
         Returns:
             Reference to the embedding-initialization artifact.
         """
-        if reduction is None:
-            assay = from_assay or self._defaultAssay
-            if assay is None:
-                raise ValueError("No assay was provided and no default is configured")
-            state = read_assay_state(self.zw, assay)
-            if state is None or state.reduction is None:
-                raise KeyError(f"AssayState for {assay!r} has no selected reduction")
-            reduction = state.reduction
-        elif reduction.assay is not None:
-            read_assay_state_document(self.zw, reduction.assay)
-        initialization = self._build_embedding_initialization(
-            reduction,
+        if not isinstance(coordinates, ArtifactRef):
+            raise TypeError("coordinates must be an ArtifactRef")
+        return self._build_embedding_initialization(
+            coordinates,
             n_centroids=n_centroids,
             rand_state=rand_state,
             batch_size=batch_size,
@@ -2733,39 +2364,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             kmeans_sampling=kmeans_sampling,
             kmeans_batch_size=kmeans_batch_size,
         )
-        if update_state:
-            if reduction.assay is None:
-                raise ValueError("Reduction artifact has no assay")
-            state_document = read_assay_state_document(self.zw, reduction.assay)
-            state = None
-            if state_document is not None and state_document.reduction == reduction:
-                try:
-                    validate_assay_state(self.zw, state_document)
-                except ArtifactResolutionError:
-                    pass
-                else:
-                    state = state_document
-            if state is not None:
-                write_assay_state(
-                    self.zw,
-                    replace(
-                        state,
-                        embedding_initialization=initialization,
-                    ),
-                )
-            else:
-                self._publish_current_artifact(
-                    reduction,
-                    update_state=True,
-                    embedding_initialization=initialization,
-                )
-        return initialization
 
     def build_ann_index(
         self,
-        coordinates: ArtifactRef | None = None,
+        coordinates: ArtifactRef,
         *,
-        from_assay: str | None = None,
         ann_metric: str = "l2",
         ann_efc: int = 50,
         ann_ef: int = 50,
@@ -2773,25 +2376,13 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         ann_parallel: bool = False,
         rand_state: int = 4466,
         batch_size: int | None = None,
-        update_state: bool = True,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
         """Build or reuse an approximate nearest-neighbor index."""
-        if coordinates is None:
-            assay = from_assay or self._defaultAssay
-            if assay is None:
-                raise ValueError("No assay was provided and no default is configured")
-            state = read_assay_state(self.zw, assay)
-            if state is None or state.reduction is None:
-                raise KeyError("AssayState has no selected reduction")
-            coordinates = (
-                state.batch_correction
-                if state.batch_correction is not None
-                else state.reduction
-            )
+        if not isinstance(coordinates, ArtifactRef):
+            raise TypeError("coordinates must be an ArtifactRef")
         if coordinates.assay is None:
             raise ValueError("Coordinate artifact has no assay")
-        read_assay_state_document(self.zw, coordinates.assay)
         if ann_metric not in {"l2", "cosine"}:
             raise ValueError("ann_metric must be one of: l2, cosine")
         resolved_ann_efc = _positive_integer(ann_efc, "ann_efc")
@@ -2874,38 +2465,29 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 element_count=n_cells,
             )
             finish_artifact(group, planned)
-        self._publish_current_artifact(
-            planned.ref,
-            update_state=update_state,
-        )
         action = "Reused" if planned.reused else "Stored"
         logger.info(f"{action} ANN index for {n_cells} cells")
         return planned.ref
 
     def query_neighbors(
         self,
-        ann_index: ArtifactRef | None = None,
+        ann_index: ArtifactRef,
         *,
-        from_assay: str | None = None,
         coordinates: ArtifactRef | None = None,
         k: int = 11,
         batch_size: int | None = None,
-        update_state: bool = True,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
         """Query an ANN artifact and persist compact neighbor matrices."""
-        ann_ref = ann_index or self._selected_artifact(
-            from_assay,
-            "ann_index",
-            "ann_index",
-        )
+        if not isinstance(ann_index, ArtifactRef):
+            raise TypeError("ann_index must be an ArtifactRef")
+        ann_ref = ann_index
         ann_status = self._require_complete_artifact(
             ann_ref,
             "ann_index",
         )
         if ann_ref.assay is None:
             raise ValueError("ANN artifact has no assay")
-        read_assay_state_document(self.zw, ann_ref.assay)
         raw_coordinates = (ann_status.inputs or {}).get("coordinates")
         if not isinstance(raw_coordinates, dict):
             raise ValueError("ANN artifact has no coordinates input")
@@ -3052,50 +2634,39 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 100.0 * (n_cells - missed_self_hits) / n_cells
             )
             finish_artifact(group, planned)
-        self._publish_current_artifact(
-            planned.ref,
-            update_state=update_state,
-        )
         action = "Reused" if planned.reused else "Stored"
         logger.info(f"{action} {effective_k} neighbors for each of {n_cells} cells")
         return planned.ref
 
     def build_connectivity_map(
         self,
-        neighbors: ArtifactRef | None = None,
+        neighbors: ArtifactRef,
         *,
-        from_assay: str | None = None,
         local_connectivity: float = 1.0,
         bandwidth: float = 1.5,
-        update_state: bool = True,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
         """Convert persisted neighbors into a weighted connectivity graph.
 
         Args:
-            neighbors: Neighbors artifact. Uses current assay state when
-                omitted.
-            from_assay: Assay used to resolve current neighbors.
+            neighbors: Neighbors artifact.
             local_connectivity: UMAP-style local-connectivity adjustment.
             bandwidth: Distance-kernel bandwidth multiplier.
-            update_state: Select the result as the current connectivity map.
             invalidate_cache: Force a new connectivity artifact.
 
         Returns:
             Reference to the connectivity-map artifact.
         """
-        neighbors_ref = neighbors or self._selected_artifact(
-            from_assay,
-            "neighbors",
-            "neighbors",
-        )
+        if not isinstance(neighbors, ArtifactRef):
+            raise TypeError("neighbors must be an ArtifactRef")
+        neighbors_ref = neighbors
         status = self._require_complete_artifact(
             neighbors_ref,
             "neighbors",
         )
+        resolve_native_graph_inputs(self.zw, neighbors_ref)
         if neighbors_ref.assay is None:
             raise ValueError("Neighbors artifact has no assay")
-        read_assay_state_document(self.zw, neighbors_ref.assay)
         group = group_at(self.zw, status.path)
         indices = as_zarr_array(group["indices"], name="indices")
         n_cells, n_neighbors = map(int, indices.shape)
@@ -3170,10 +2741,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             output.attrs["n_cells"] = n_cells
             output.attrs["n_neighbors"] = n_neighbors
             finish_artifact(output, planned)
-        self._publish_current_artifact(
-            planned.ref,
-            update_state=update_state,
-        )
         action = "Reused" if planned.reused else "Stored"
         logger.info(f"{action} connectivity map for {n_cells} cells")
         return planned.ref
@@ -3227,10 +2794,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
     def load_graph(
         self,
-        graph: ArtifactRef | None = None,
+        graph: ArtifactRef,
         *,
-        from_assay: str | None = None,
-        cell_key: str | None = None,
         symmetric: bool | None = None,
         upper_only: bool | None = None,
         use_k: int | None = None,
@@ -3238,10 +2803,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         """Load the cell neighbourhood as a scipy sparse matrix.
 
         Args:
-            graph: Connectivity-map or integrated-graph artifact. The current
-                assay graph is used when omitted.
-            from_assay: Name of the assay used for current-state resolution.
-            cell_key: Optional cell key, validated against the graph lineage.
+            graph: Connectivity-map or integrated-graph artifact.
             symmetric: If True, makes the graph symmetric by adding it to its transpose.
             upper_only: If True, then only the values from upper triangular of the matrix are returned. This is only
                        used when symmetric is True.
@@ -3252,16 +2814,19 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             A scipy sparse matrix representing cell neighbourhood graph.
         """
 
-        from ...graph.state import resolve_graph_selection
-
-        selection = resolve_graph_selection(
-            self,
-            graph,
-            from_assay=from_assay,
-            cell_key=cell_key,
+        if not isinstance(graph, ArtifactRef):
+            raise TypeError("graph must be an ArtifactRef")
+        selection = graph_cell_selection(self.zw, graph)
+        validate_stored_selection_integrity(
+            self.zw,
+            selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
         )
         return self._load_graph_artifact(
-            selection.graph_ref,
+            graph,
             symmetric=symmetric,
             upper_only=upper_only,
             use_k=use_k,
@@ -3269,14 +2834,13 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
     def integrate_assays(
         self,
-        assays: list[str],
-        label: str,
+        sources: list[ArtifactRef],
         method: str = "snn",
         chunk_size: int = 10000,
         invalidate_cache: bool = False,
         l2_normalize: bool = True,
     ) -> ArtifactRef:
-        """Integrate the current state-selected graphs for selected assays.
+        """Integrate explicit graph or neighbor artifacts across assays.
 
         SNN combines shared edge support across two or more assays. WNN accepts
         two or more assays and uses Hao-inspired per-cell modality weights.
@@ -3286,9 +2850,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         and SNN-far bandwidth.
 
         Args:
-            assays: Input assay names. Each assay's current state-selected graph
-                or neighbors artifact is captured once.
-            label: Label for integrated graph
+            sources: Connectivity-map refs for SNN or neighbor refs for WNN.
             method: Choose a method for modality integration. Available options: 'snn': Shared nearest neighbour
                     approach and 'wnn': Hao-inspired weighted nearest neighbor integration.
             chunk_size: number of cells to be loaded at a time while reading and writing the graph
@@ -3300,21 +2862,20 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             Reference to the integrated-graph artifact. Pass it to `run_umap`,
             `run_tsne`, or the clustering methods as their ``graph`` argument.
 
-        WNN stores one modality-weight column per assay, named
-        ``{label}_{assay}_weight`` in cell metadata.
+        WNN modality weights remain in the returned immutable artifact.
         """
         from ...neighbors.graph import merge_graphs
         from ...neighbors.integration import _wnn_integration_many
 
-        assays = list(assays)
+        sources = list(sources)
         if method not in {"snn", "wnn"}:
             raise ValueError(
                 f"Method {method} not supported, choose one of these: 'snn', 'wnn'"
             )
-        if len(assays) < 2:
+        if len(sources) < 2:
             raise ValueError("Assay integration requires at least two assays")
-        if len(set(assays)) != len(assays):
-            raise ValueError("Assay integration requires unique assay names")
+        if not all(isinstance(source, ArtifactRef) for source in sources):
+            raise TypeError("sources must contain only ArtifactRef values")
         if method == "wnn" and not isinstance(l2_normalize, bool | np.bool_):
             raise TypeError("l2_normalize must be a boolean")
 
@@ -3350,30 +2911,28 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         captured_sources: list[ArtifactRef] = []
         captured_coordinates: list[ArtifactRef | None] = []
         shared_selection: ArtifactRef | None = None
-        shared_cell_key: str | None = None
         shared_source_n_cells: int | None = None
-        for index, assay_name in enumerate(assays):
-            if assay_name not in self.assay_names:
-                raise ValueError(f"ERROR: Assay {assay_name} was not found.")
-            state = read_assay_state(self.zw, assay_name)
-            source = (
-                None
-                if state is None
-                else (state.neighbors if method == "wnn" else state.connectivity_map)
-            )
-            if source is None:
-                code = (
-                    "missing_current_neighbors"
-                    if method == "wnn"
-                    else "missing_current_graph"
-                )
-                noun = "neighbors" if method == "wnn" else "connectivity map"
+        assays: list[str] = []
+        expected_kind = "neighbors" if method == "wnn" else "connectivity_map"
+        for index, source in enumerate(sources):
+            if source.kind != expected_kind:
                 raise ArtifactResolutionError(
-                    f"Assay {assay_name!r} has no current {noun}",
-                    code=code,
-                    context={"assay": assay_name},
+                    f"{method.upper()} integration requires {expected_kind} artifacts",
+                    code="wrong_kind",
+                    context={
+                        "artifact_id": source.artifact_id,
+                        "actual_kind": source.kind,
+                        "expected_kind": expected_kind,
+                    },
                 )
-            assert state is not None
+            assay_name = source.assay
+            if assay_name is None:
+                raise ArtifactResolutionError(
+                    "Integration source has no assay",
+                    code="wrong_scope",
+                    context={"artifact_id": source.artifact_id},
+                )
+            assays.append(assay_name)
             ancestry = resolve_native_graph_inputs(self.zw, source)
             if method == "wnn" and ancestry.coordinates.kind not in {
                 "reduction",
@@ -3389,10 +2948,13 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                         "expected_kind": "reduction,batch_correction",
                     },
                 )
-            validate_cell_selection_artifact(
+            validate_stored_selection_integrity(
                 self.zw,
                 ancestry.cell_selection,
-                state.cell_key,
+                kind="cell_selection",
+                scope="datastore",
+                assay=None,
+                table_path="cellData",
             )
             source_n_cells = _validate_integration_source_payload(self.zw, source)
             if shared_source_n_cells is None:
@@ -3415,18 +2977,16 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 if method == "wnn"
                 else source
             )
-            cell_key = state.cell_key
             if shared_selection is None:
                 shared_selection = selection
-                shared_cell_key = cell_key
             elif shared_selection != selection:
                 raise ValueError(
                     "Integrated graphs require one exact shared cell selection"
                 )
         if shared_selection is None:
             raise ValueError("No assay cell selection was resolved")
-        if shared_cell_key is None:
-            raise RuntimeError("No cell key was resolved for assay integration")
+        if len(set(assays)) != len(assays):
+            raise ValueError("Assay integration requires unique assay sources")
         source_inputs["cell_selection"] = shared_selection
         parameters: dict[str, Any] = {"method": method, "assays": assays}
         required_arrays: list[ArrayRequirement] = [
@@ -3449,83 +3009,12 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             operation="integrate_assays",
             parameters=parameters,
             inputs=source_inputs,
-            execution_options={"label": label, "chunk_size": chunk_size},
+            execution_options={"chunk_size": chunk_size},
             invalidate_cache=invalidate_cache,
             required_arrays=tuple(required_arrays),
         )
 
-        def select_integrated_artifact() -> None:
-            index_path = self._integratedGraphsLoc
-            index_group = (
-                as_zarr_group(self.zw[index_path], name=index_path)
-                if index_path in self.zw
-                else self.zw.create_group(index_path)
-            )
-            raw_artifacts = index_group.attrs.get("artifacts", {})
-            if "artifacts" in index_group.attrs and not isinstance(
-                raw_artifacts,
-                dict,
-            ):
-                raise RuntimeError("Integrated graph artifact index is invalid")
-            artifacts = dict(raw_artifacts) if isinstance(raw_artifacts, dict) else {}
-            artifacts[label] = integrated_plan.ref.to_dict()
-            index_group.attrs["artifacts"] = artifacts
-
-        weight_columns = (
-            [f"{label}_{assay_name}_weight" for assay_name in assays]
-            if method == "wnn"
-            else []
-        )
-        preserved_weight_displays = {
-            column: column_display(self.zw, column) for column in weight_columns
-        }
-
-        def publish_modality_weights() -> None:
-            if method != "wnn":
-                return
-            group = artifact_group(self.zw, integrated_plan.ref)
-            stored_assays = group.attrs.get("assays")
-            if not isinstance(stored_assays, list) or stored_assays != assays:
-                raise RuntimeError("Stored WNN modality assay order is invalid")
-            try:
-                stored_n_cells = _positive_integer(
-                    group.attrs.get("n_cells"),
-                    "stored n_cells",
-                )
-            except (TypeError, ValueError) as error:
-                raise RuntimeError(
-                    "Stored WNN modality weights have invalid cell metadata"
-                ) from error
-            values = np.asarray(
-                as_zarr_array(
-                    group["modality_weights"],
-                    name="modality_weights",
-                )[:],
-                dtype=np.float32,
-            )
-            if values.shape != (stored_n_cells, len(assays)):
-                raise RuntimeError("Stored WNN modality weights have an invalid shape")
-            for index, column in enumerate(weight_columns):
-                column_values = values[:, index]
-                self.cells.insert(
-                    column,
-                    column_values,
-                    overwrite=True,
-                    key=shared_cell_key,
-                )
-                link_cell_data_column(
-                    self.zw,
-                    column,
-                    integrated_plan.ref,
-                    value_name="modality_weights",
-                    value_index=index,
-                    default_display=continuous_display(column_values),
-                    preserved_display=preserved_weight_displays[column],
-                )
-
         if integrated_plan.reused:
-            select_integrated_artifact()
-            publish_modality_weights()
             return integrated_plan.ref
 
         def load_wnn_inputs(
@@ -3623,6 +3112,4 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             )
             stored_modality_weights[:, :] = modality_weights
         finish_artifact(store, integrated_plan)
-        select_integrated_artifact()
-        publish_modality_weights()
         return integrated_plan.ref

@@ -20,8 +20,9 @@ It assumes the reader already understands the recommended CITE-seq path in {doc}
 
 ## Standalone setup
 
-The published CITE-seq store carries the independent RNA and ADT {term}`analysis chains <analysis chain>` and both integrated graphs, built exactly as {doc}`cite_seq` describes: matched active cells, `k=21` for each modality, and an explicit non-control ADT feature-selection artifact.
-This page reads those results rather than reproducing them.
+The published CITE-seq store carries literal layouts and partitions for visualization plus immutable
+SNN and WNN graph artifacts over matched cells. This page reads those values for diagnostics;
+{doc}`cite_seq` shows the current explicit-input construction API.
 
 ```{code-cell} ipython3
 from itertools import combinations
@@ -46,21 +47,22 @@ ds = scarf.DataStore(
 )
 ```
 
-The SNN graph is stored under `RNA+ADT` and the WNN graph under `RNA+ADT_wnn`, each with its own UMAP and Leiden partition.
-The method is a parameter, because it changes the result, while the label is an execution option, because renaming a graph does not.
+The snapshot retains literal `RNA+ADT` and `RNA+ADT_wnn` layout and partition columns.
+The immutable graph artifacts themselves are distinguished by their scientific `method` parameter and exact references.
 
 ```{code-cell} ipython3
 integrated = []
+integrated_refs = {}
 for ref in ds.list_artifacts(scope="datastore", kind="integrated_graph"):
     status = ds.inspect_artifact(ref)
+    integrated_refs[status.parameters["method"]] = ref
     integrated.append(
         {
-            "label": status.execution_options["label"],
             "method": status.parameters["method"],
             "artifact": ref.artifact_id[:12],
         }
     )
-pd.DataFrame(integrated).sort_values("label", ignore_index=True)
+pd.DataFrame(integrated).sort_values("method", ignore_index=True)
 ```
 
 ## 1. Measure modality concordance
@@ -170,9 +172,9 @@ Large regions with contradictory signal need inspection before integration.
 
 ## 2. Compare SNN and WNN
 
-SNN combines shared edge support and can integrate two or more assays.
-WNN also accepts two or more assays and learns how strongly each cell should rely on each modality.
-Both consume one graph per named assay and require matched cells.
+SNN combines shared edge support from one connectivity-map artifact per assay.
+WNN accepts one neighbour artifact per assay and learns how strongly each cell should rely on each modality.
+Both accept two or more assays and require matched cells.
 Matched neighbour counts (`k`) are required for SNN only; WNN warns and keeps `min(k)` when they differ.
 The RNA and ADT comparison here is the two-modality special case.
 
@@ -257,19 +259,16 @@ compare_signal(
 
 ## 4. Inspect WNN modality weights
 
-WNN records how much each cell relies on each modality.
+WNN stores how much each cell relies on each modality inside the returned graph artifact.
 First check the weight constraints directly.
 
 ```{code-cell} ipython3
-weight_columns = {
-    "RNA weight": "RNA+ADT_wnn_RNA_weight",
-    "ADT weight": "RNA+ADT_wnn_ADT_weight",
-}
+weight_values = np.asarray(
+    ds.load_artifact(integrated_refs["wnn"])["modality_weights"][:]
+)
 weight_frame = pd.DataFrame(
-    {
-        label: ds.cells.fetch(column, key="I")
-        for label, column in weight_columns.items()
-    }
+    weight_values,
+    columns=["RNA weight", "ADT weight"],
 )
 weight_values = weight_frame.to_numpy(dtype=np.float64)
 pd.Series(
@@ -287,21 +286,21 @@ Map the weights onto the WNN layout, then inspect their distribution.
 Because the two weights sum to one per cell, the RNA-weight histogram also shows where ADT takes over.
 
 ```{code-cell} ipython3
-weight_view = ds.plots.embedding(
-    layout_key="RNA+ADT_wnn_UMAP",
-    color_by=list(weight_columns.values()),
-    n_columns=2,
-    point_size=5,
-    show_titles=False,
-    show=False,
+wnn_layout = ds.cells.to_pandas_dataframe(
+    ["RNA+ADT_wnn_UMAP1", "RNA+ADT_wnn_UMAP2"],
+    key="I",
 )
-for axis, title in zip(
-    weight_view.axes.values(),
-    weight_columns,
-    strict=True,
-):
+figure, axes = plt.subplots(1, 2, figsize=(9, 4))
+for axis, title in zip(axes, weight_frame.columns, strict=True):
+    points = axis.scatter(
+        wnn_layout["RNA+ADT_wnn_UMAP1"],
+        wnn_layout["RNA+ADT_wnn_UMAP2"],
+        c=weight_frame[title],
+        s=5,
+    )
     axis.set_title(title)
-weight_view.figure.set_size_inches(9, 4)
+    figure.colorbar(points, ax=axis)
+figure.tight_layout()
 ```
 
 ```{code-cell} ipython3
@@ -326,9 +325,7 @@ weight_frame["RNA-ADT overlap"] = np.where(
     "dominant overlap",
     "other overlap",
 )
-weight_frame.groupby("RNA-ADT overlap")[
-    list(weight_columns)
-].agg(["count", "mean", "median"])
+weight_frame.groupby("RNA-ADT overlap").agg(["count", "mean", "median"])
 ```
 
 The dominant-overlap grouping is descriptive, not a reference annotation.

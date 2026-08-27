@@ -21,7 +21,12 @@ from scarf.metrics import (
     silhouette_scoring,
 )
 from scarf.metrics.lisi import _effective_perplexity, _neighbor_probabilities
-from scarf.storage.errors import ArtifactResolutionError
+from scarf.storage.artifacts import ArtifactRef
+
+
+def _graph_neighbors(datastore, graph: ArtifactRef) -> ArtifactRef:
+    raw = datastore.inspect_artifact(graph).inputs["neighbors"]
+    return ArtifactRef.from_dict(raw)
 
 
 def _uniform_self_free_knn() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -674,16 +679,15 @@ def test_top_k_distances_reject_unsupported_metric():
         )
 
 
-def test_metric_silhouette(datastore, graph_artifacts, leiden_clustering):
-    scores = datastore.metric_graph_silhouette(random_seed=42)
-    scores_from_full_label = datastore.metric_graph_silhouette(
-        res_label="RNA_leiden_cluster",
+def test_metric_silhouette(datastore, connectivity_graph, leiden_clustering):
+    neighbors = _graph_neighbors(datastore, connectivity_graph)
+    scores = datastore.metric_graph_silhouette(
+        neighbors,
+        leiden_clustering,
         random_seed=42,
     )
 
     assert scores is not None
-    assert scores_from_full_label is not None
-    assert np.array_equal(scores, scores_from_full_label, equal_nan=True)
     assert np.isfinite(scores).any()
     assert np.all(np.abs(scores[np.isfinite(scores)]) <= 1)
 
@@ -773,7 +777,7 @@ def test_lisi_batch_mixing_score():
     assert lisi_batch_mixing_score(np.full(4, 2.0), labels) == pytest.approx(1)
 
 
-def test_metric_label_concordance(datastore, graph_artifacts, leiden_clustering):
+def test_metric_label_concordance(datastore, connectivity_graph, leiden_clustering):
     rng = np.random.default_rng(42)
     labels1 = rng.integers(0, 2, datastore.cells.N)
     labels2 = labels1.copy()
@@ -807,15 +811,33 @@ def test_metric_label_concordance(datastore, graph_artifacts, leiden_clustering)
         )
         < 1
     )
-    mixing_score = datastore.metric_proportional_batch_mixing("labels1")
+    mixing_score = datastore.metric_proportional_batch_mixing(
+        "labels1",
+        _graph_neighbors(datastore, connectivity_graph),
+    )
     assert 0 <= mixing_score <= 1
 
 
-def test_datastore_scib_metrics(datastore, graph_artifacts, leiden_clustering):
-    label_colname = "RNA_leiden_cluster"
-    state = datastore.get_assay_state("RNA")
-    assert state is not None
-    assert state.connectivity_map is not None
+def test_datastore_scib_metrics(datastore, connectivity_graph, leiden_clustering):
+    neighbors = _graph_neighbors(datastore, connectivity_graph)
+    cluster_labels = np.asarray(datastore.load_artifact(leiden_clustering)["values"][:])
+    raw_selection = datastore.inspect_artifact(leiden_clustering).inputs[
+        "cell_selection"
+    ]
+    cluster_selection = ArtifactRef.from_dict(raw_selection)
+    cluster_mask = np.asarray(
+        datastore.load_artifact(cluster_selection)["values"][:],
+        dtype=bool,
+    )
+    full_cluster_labels = np.full(datastore.cells.N, -1, dtype=cluster_labels.dtype)
+    full_cluster_labels[cluster_mask] = cluster_labels
+    label_colname = "metric_clusters"
+    datastore.cells.insert(
+        column_name=label_colname,
+        values=full_cluster_labels,
+        fill_value=-1,
+        overwrite=True,
+    )
 
     labels = np.zeros(datastore.cells.N, dtype=np.int8)
     datastore.cells.insert(
@@ -823,102 +845,146 @@ def test_datastore_scib_metrics(datastore, graph_artifacts, leiden_clustering):
         values=labels,
         overwrite=True,
     )
-    lisi = datastore.metric_lisi(label_columns=["single_batch"])
+    lisi_ref = datastore.metric_lisi(
+        label_columns=["single_batch"],
+        neighbors=neighbors,
+    )
+    assert lisi_ref.kind == "quality_metric"
+    lisi = datastore.load_metric_lisi(lisi_ref)
     assert np.allclose(lisi["single_batch"], 1)
 
-    ilisi = datastore.metric_ilisi(label_colname)
-    clisi = datastore.metric_clisi(label_colname)
-    latest_connectivity = datastore.metric_graph_connectivity(
+    ilisi = datastore.metric_ilisi(label_colname, neighbors)
+    clisi = datastore.metric_clisi(label_colname, neighbors)
+    graph_connectivity_score = datastore.metric_graph_connectivity(
         label_colname,
-        from_assay="RNA",
-        cell_key="I",
-    )
-    explicit_connectivity = datastore.metric_graph_connectivity(
-        label_colname,
-        state.connectivity_map,
+        connectivity_graph,
     )
 
     assert 0 <= ilisi <= 1
     assert 0 <= clisi <= 1
-    assert 0 <= latest_connectivity <= 1
-    assert explicit_connectivity == pytest.approx(latest_connectivity)
-    assert state.neighbors is not None
+    assert 0 <= graph_connectivity_score <= 1
     with pytest.raises(ValueError, match="connectivity map or an integrated graph"):
         datastore.metric_graph_connectivity(
             label_colname,
-            state.neighbors,
+            neighbors,
         )
 
 
-def test_metric_lisi_rejects_invalid_inputs(datastore, graph_artifacts):
+def test_metric_lisi_rejects_invalid_inputs(datastore, connectivity_graph):
+    neighbors = _graph_neighbors(datastore, connectivity_graph)
     with pytest.raises(TypeError, match="sequence of column names"):
-        datastore.metric_lisi("names")
+        datastore.metric_lisi("names", neighbors)
     with pytest.raises(ValueError, match="non-empty"):
-        datastore.metric_lisi([])
+        datastore.metric_lisi([], neighbors)
     with pytest.raises(TypeError, match="only strings"):
-        datastore.metric_lisi(["names", 1])
+        datastore.metric_lisi(["names", 1], neighbors)
     with pytest.raises(ValueError, match="duplicate names"):
-        datastore.metric_lisi(["names", "names"])
+        datastore.metric_lisi(["names", "names"], neighbors)
     with pytest.raises(KeyError, match="__missing_lisi_column__"):
-        datastore.metric_lisi(["__missing_lisi_column__"])
+        datastore.metric_lisi(
+            ["__missing_lisi_column__"],
+            neighbors,
+        )
     with pytest.raises(TypeError, match="artifact reference"):
         datastore.metric_lisi(
             ["names"],
             neighbors="not-a-ref",
         )
-    state = datastore.get_assay_state("RNA")
-    assert state is not None
-    assert state.connectivity_map is not None
     with pytest.raises(ValueError, match="neighbors artifact"):
         datastore.metric_lisi(
             ["names"],
-            neighbors=state.connectivity_map,
-        )
-    assert state.neighbors is not None
-    with pytest.raises(ValueError, match="different assay"):
-        datastore.metric_lisi(
-            ["names"],
-            neighbors=state.neighbors,
-            from_assay="missing",
+            neighbors=connectivity_graph,
         )
 
 
-def test_metric_lisi_revalidates_explicit_neighbor_cell_selection(
+def test_metric_lisi_uses_explicit_neighbor_selection_after_live_alias_changes(
     datastore,
-    graph_artifacts,
-    monkeypatch,
+    connectivity_graph,
 ):
-    del graph_artifacts
-    state = datastore.get_assay_state("RNA")
-    assert state is not None
-    assert state.neighbors is not None
+    neighbors = _graph_neighbors(datastore, connectivity_graph)
     column = datastore.zw["cellData/I"]
     original = np.asarray(column[:], dtype=bool)
     selected = np.flatnonzero(original)
-    excluded = np.flatnonzero(~original)
-    assert selected.size and excluded.size
+    assert selected.size
     changed = original.copy()
     changed[selected[0]] = False
-    changed[excluded[0]] = True
     column[:] = changed
 
-    def reject_current_state_read(*_args, **_kwargs):
-        raise AssertionError("explicit neighbors resolved the current state")
-
-    monkeypatch.setattr(
-        "scarf.datastore._operations.integration_metrics.read_assay_state",
-        reject_current_state_read,
-    )
     try:
-        with pytest.raises(ArtifactResolutionError) as error:
-            datastore.metric_lisi(
-                ["names"],
-                neighbors=state.neighbors,
-                perplexity=1,
-            )
-        assert error.value.code == "selection_values_changed"
+        metric = datastore.metric_lisi(
+            ["names"],
+            neighbors=neighbors,
+            perplexity=1,
+        )
+        scores = datastore.load_metric_lisi(metric)
+        raw_selection = datastore.inspect_artifact(metric).inputs["cell_selection"]
+        selection = ArtifactRef.from_dict(raw_selection)
+        selected_count = int(
+            np.asarray(
+                datastore.load_artifact(selection)["values"][:], dtype=bool
+            ).sum()
+        )
+        assert scores["names"].shape == (selected_count,)
+        assert selected_count != int(changed.sum())
     finally:
         column[:] = original
+
+
+def test_metric_lisi_snapshots_mutable_label_inputs(
+    datastore,
+    connectivity_graph,
+):
+    neighbors = _graph_neighbors(datastore, connectivity_graph)
+    labels = np.zeros(datastore.cells.N, dtype=np.int8)
+    datastore.cells.insert("lisi_snapshot_labels", labels, overwrite=True)
+    first = datastore.metric_lisi(
+        ["lisi_snapshot_labels"],
+        neighbors,
+        perplexity=1,
+    )
+    assert (
+        datastore.metric_lisi(
+            ["lisi_snapshot_labels"],
+            neighbors,
+            perplexity=1,
+        )
+        == first
+    )
+    first_values = datastore.load_metric_lisi(first)["lisi_snapshot_labels"]
+
+    column = datastore.zw["cellData/lisi_snapshot_labels"]
+    status = datastore.inspect_artifact(first)
+    raw_selection = status.inputs["cell_selection"]
+    selection = ArtifactRef.from_dict(raw_selection)
+    selection_mask = np.asarray(
+        datastore.load_artifact(selection)["values"][:],
+        dtype=bool,
+    )
+    raw_snapshots = status.inputs["label_snapshots"]
+    assert len(raw_snapshots) == 1
+    assert raw_snapshots[0]["column"] == "lisi_snapshot_labels"
+    snapshot = ArtifactRef.from_dict(raw_snapshots[0]["artifact"])
+    assert snapshot.kind == "metadata_snapshot"
+    assert datastore.inspect_artifact(snapshot).operation == "snapshot_metric_label"
+    np.testing.assert_array_equal(
+        datastore.load_artifact(snapshot)["values"][:],
+        labels[selection_mask],
+    )
+    selected_index = int(np.flatnonzero(selection_mask)[0])
+    column[selected_index] = 1
+    try:
+        second = datastore.metric_lisi(
+            ["lisi_snapshot_labels"],
+            neighbors,
+            perplexity=1,
+        )
+        assert second != first
+        np.testing.assert_array_equal(
+            datastore.load_metric_lisi(first)["lisi_snapshot_labels"],
+            first_values,
+        )
+    finally:
+        column[:] = labels
 
 
 def test_silhouette_scoring_missing_cluster_labels(datastore):

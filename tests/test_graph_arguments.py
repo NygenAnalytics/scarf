@@ -40,45 +40,40 @@ def _ref(
 
 def test_normalization_arguments_partition_every_value() -> None:
     arguments = NormalizationArguments(
-        from_assay="RNA",
-        cell_key="I",
         cell_selection=_ref("cell_selection", "2", scope="datastore"),
         feature_selection=_ref("feature_selection", "3"),
+        dataset_fingerprint="dataset-v1",
         normalization_method="norm_lib_size",
         size_factor=1000.0,
         log_transform=True,
         renormalize_subset=False,
-        update_state=True,
         invalidate_cache=False,
     )
     record = arguments.to_record()
 
-    assert set(record.inputs) == {"cell_selection", "feature_selection"}
+    assert set(record.inputs) == {
+        "cell_selection",
+        "dataset_fingerprint",
+        "feature_selection",
+    }
     assert record.parameters == {
         "normalization_method": "norm_lib_size",
         "size_factor": 1000.0,
         "log_transform": True,
         "renormalize_subset": False,
     }
-    assert record.execution_options == {
-        "from_assay": "RNA",
-        "cell_key": "I",
-        "update_state": True,
-        "invalidate_cache": False,
-    }
+    assert record.execution_options == {"invalidate_cache": False}
 
 
 def test_execution_options_do_not_change_provenance_hash() -> None:
     common = {
-        "from_assay": "RNA",
-        "cell_key": "I",
         "cell_selection": _ref("cell_selection", "2", scope="datastore"),
         "feature_selection": _ref("feature_selection", "3"),
+        "dataset_fingerprint": "dataset-v1",
         "normalization_method": "norm_lib_size",
         "size_factor": 1000.0,
         "log_transform": True,
         "renormalize_subset": False,
-        "update_state": True,
     }
     small_batch = NormalizationArguments(
         invalidate_cache=False,
@@ -108,7 +103,6 @@ def test_reduction_fingerprints_custom_loadings_as_input() -> None:
         "feature_scaling": _ref("feature_scaling", "c"),
         "dims": 2,
         "feat_scaling": False,
-        "update_state": False,
         "invalidate_cache": False,
     }
     first = CustomReductionArguments(
@@ -137,7 +131,7 @@ def test_stage_models_chain_logical_artifact_refs() -> None:
     )
     harmony = HarmonyArguments(
         reduction=_ref("reduction", "1"),
-        batch_values=_ref("metadata_snapshot", "2", scope="datastore"),
+        batch_snapshot=_ref("metadata_snapshot", "2", scope="datastore"),
         batch_columns=("donor", "sample"),
         harmony_parameters={"theta": 2.0},
         algorithm_version="centroid_snapshot_v2",
@@ -186,7 +180,6 @@ def test_reduction_batch_size_does_not_change_reuse() -> None:
         "solver": "streaming",
         "n_iter": 5,
         "n_oversamples": 10,
-        "update_state": False,
         "invalidate_cache": False,
     }
     lsi_small = LsiArguments(batch_size=100, **lsi_common)
@@ -195,11 +188,9 @@ def test_reduction_batch_size_does_not_change_reuse() -> None:
         "normalized": normalized,
         "feature_scaling": _ref("feature_scaling", "1"),
         "pca_cell_selection": _ref("cell_selection", "2", scope="datastore"),
-        "pca_cell_key": "I",
         "dims": 5,
         "feat_scaling": True,
         "show_elbow_plot": False,
-        "update_state": False,
         "invalidate_cache": False,
     }
     pca_small = PcaArguments(batch_size=100, **pca_common)
@@ -212,7 +203,7 @@ def test_reduction_batch_size_does_not_change_reuse() -> None:
 
 def test_embedding_initialization_parameters_change_provenance() -> None:
     initialization_common = {
-        "reduction": _ref("reduction", "3"),
+        "coordinates": _ref("reduction", "3"),
         "n_centroids": 20,
         "rand_state": 4466,
         "invalidate_cache": False,
@@ -287,19 +278,17 @@ def test_ann_parallel_is_normal_provenance_not_cache_policy() -> None:
 def test_dynamic_callable_requires_explicit_identity() -> None:
     with pytest.raises(ValueError, match="artifact_identity"):
         NormalizationArguments(
-            from_assay="RNA",
-            cell_key="I",
             cell_selection=_ref(
                 "cell_selection",
                 "2",
                 scope="datastore",
             ),
             feature_selection=_ref("feature_selection", "3"),
+            dataset_fingerprint="dataset-v1",
             normalization_method=lambda values: values,
             size_factor=1000.0,
             log_transform=True,
             renormalize_subset=False,
-            update_state=True,
         ).to_record()
 
 

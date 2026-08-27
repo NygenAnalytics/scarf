@@ -187,10 +187,9 @@ def _draw_tree_pie(
 def cluster_tree(
     store: Any,
     *,
-    graph: ArtifactRef | None = None,
+    graph: ArtifactRef,
+    clusters: ArtifactRef,
     from_assay: str | None = None,
-    cell_key: str | None = None,
-    cluster_key: str | None = None,
     fill_by_value: str | None = None,
     force_ints_as_cats: bool = True,
     width: float = 1,
@@ -220,19 +219,18 @@ def cluster_tree(
 
     prepared = store._prepare_cluster_tree(
         graph=graph,
+        clusters=clusters,
         from_assay=from_assay,
-        cell_key=cell_key,
-        cluster_key=cluster_key,
         fill_by_value=fill_by_value,
     )
     tree_graph: Any = prepared["graph"]
-    clusters = np.asarray(prepared["clusters"])
+    cluster_values = np.asarray(prepared["clusters"])
     raw_color_values = (
-        clusters
+        cluster_values
         if prepared["color_values"] is None
         else np.asarray(prepared["color_values"])
     )
-    if raw_color_values.shape[0] != clusters.shape[0]:
+    if raw_color_values.shape[0] != cluster_values.shape[0]:
         raise ValueError("Cluster colors and cluster assignments are misaligned")
     using_clusters = prepared["color_values"] is None
     color_values, categorical = _tree_color_series(
@@ -250,7 +248,7 @@ def cluster_tree(
         node: (radius * math.cos(theta), radius * math.sin(theta))
         for node, (theta, radius) in angular_positions.items()
     }
-    cluster_counts = pd.Series(clusters).value_counts()
+    cluster_counts = pd.Series(cluster_values).value_counts()
     cluster_sizes = (
         node_size_multiplier * ((cluster_counts / cluster_counts.sum()) ** node_power)
     ).to_dict()
@@ -271,7 +269,7 @@ def cluster_tree(
         )
     else:
         cluster_means = (
-            pd.DataFrame({"cluster": clusters, "value": color_values})
+            pd.DataFrame({"cluster": cluster_values, "value": color_values})
             .groupby("cluster", observed=False)["value"]
             .mean()
         )
@@ -304,7 +302,7 @@ def cluster_tree(
             else:
                 node_colors.append("white")
                 node_sizes.append(0.0)
-        elif node_data["nleaves"] == len(clusters):
+        elif node_data["nleaves"] == len(cluster_values):
             node_colors.append(root_color)
             node_sizes.append(root_size)
         else:
@@ -345,7 +343,7 @@ def cluster_tree(
                 if "partition_id" not in node_data:
                     continue
                 cluster_id = node_data["partition_id"]
-                counts = color_values[clusters == cluster_id].value_counts()
+                counts = color_values[cluster_values == cluster_id].value_counts()
                 _draw_tree_pie(
                     tree_ax,
                     counts.to_numpy(),
@@ -382,7 +380,7 @@ def cluster_tree(
                 shrink=0.65,
                 pad=0.02,
             )
-            colorbar.set_label(fill_by_value or cast(str, prepared["cluster_key"]))
+            colorbar.set_label(fill_by_value or "clusters")
             axes["colorbar"] = colorbar.ax
         apply_figure_chrome(fig, theme)
 
@@ -412,7 +410,7 @@ def cluster_tree(
         )
         legend = LegendSpec(
             kind="categorical",
-            label=fill_by_value or cast(str, prepared["cluster_key"]),
+            label=fill_by_value or "clusters",
         )
     else:
         assert cluster_means is not None
@@ -427,7 +425,7 @@ def cluster_tree(
         )
         legend = LegendSpec(
             kind="colorbar",
-            label=fill_by_value or cast(str, prepared["cluster_key"]),
+            label=fill_by_value or "clusters",
             extras={"vmin": color_min, "vmax": color_max},
         )
     size_scale = SizeScale(
@@ -449,13 +447,20 @@ def cluster_tree(
         scales=(color_scale, size_scale),
         provenance=PlotProvenance(
             assay=cast(str, prepared["from_assay"]),
-            cell_key=cast(str, prepared["cell_key"]),
-            n_cells=len(clusters),
+            cell_key=None,
+            n_cells=len(cluster_values),
             renderer="matplotlib",
             notes=("cluster_tree", "coalesced"),
             extras={
                 "graph": cast(ArtifactRef, prepared["graph_ref"]).to_dict(),
-                "cluster_key": prepared["cluster_key"],
+                "clusters": cast(
+                    ArtifactRef,
+                    prepared["clusters_ref"],
+                ).to_dict(),
+                "cell_selection": cast(
+                    ArtifactRef,
+                    prepared["cell_selection"],
+                ).to_dict(),
                 "fill_by_value": fill_by_value,
                 "coalesced_location": prepared["coalesced_location"],
                 "force_ints_as_cats": force_ints_as_cats,

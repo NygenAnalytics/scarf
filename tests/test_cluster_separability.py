@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from scarf.graph.errors import IncompatibleAnalysisStateError
+from scarf.graph.feature_projection import resolve_native_graph_inputs
 from scarf.metrics import (
     ClusterSeparabilityResult,
     evaluate_cluster_separability,
@@ -25,6 +25,12 @@ def _normalized_feature_selection(datastore, reduction: ArtifactRef):
         normalized_status.inputs["feature_selection"]
     )
     return normalized, feature_selection
+
+
+def _fixture_reduction(datastore, graph: ArtifactRef) -> ArtifactRef:
+    reduction = resolve_native_graph_inputs(datastore.zw, graph).coordinates
+    assert reduction.kind == "reduction"
+    return reduction
 
 
 def test_sampling_is_deterministic_stratified_and_shared():
@@ -309,93 +315,86 @@ def test_invalid_inputs_are_rejected(coordinates, clusterings, kwargs, message):
 
 def test_datastore_wrapper_uses_explicit_pca_without_writes(
     datastore,
-    graph_artifacts,
+    connectivity_graph,
     leiden_clustering,
 ):
-    state = datastore.get_assay_state("RNA")
-    assert state is not None
-    assert state.reduction is not None
+    reduction = _fixture_reduction(datastore, connectivity_graph)
     columns_before = set(datastore.cells.columns)
     artifacts_before = set(datastore.list_artifacts())
 
     result = datastore.metric_cluster_separability(
-        state.reduction,
-        ["RNA_leiden_cluster"],
+        reduction,
+        {"leiden": leiden_clustering},
         n_folds=3,
         max_sample_cells=300,
         max_silhouette_cells=100,
     )
 
     assert isinstance(result, ClusterSeparabilityResult)
-    assert list(result.clustering_scores["clustering"]) == ["RNA_leiden_cluster"]
+    assert list(result.clustering_scores["clustering"]) == ["leiden"]
     assert int(result.clustering_scores["n_sampled_cells"].iloc[0]) == len(
         result.sample_indices
     )
     assert len(result.sample_indices) == min(
         300,
-        len(datastore.cells.fetch("RNA_leiden_cluster", key="I")),
+        datastore.load_artifact(leiden_clustering)["values"].shape[0],
     )
     assert set(datastore.cells.columns) == columns_before
     assert set(datastore.list_artifacts()) == artifacts_before
-    with pytest.raises(KeyError):
+    normalized, _features = _normalized_feature_selection(datastore, reduction)
+    with pytest.raises(ValueError, match="clustering artifact"):
         datastore.metric_cluster_separability(
-            state.reduction,
-            ["missing_cluster_column"],
+            reduction,
+            {"not_clusters": normalized},
         )
-    assert state.normalized is not None
     with pytest.raises(ValueError, match="reduction"):
         datastore.metric_cluster_separability(
-            state.normalized,
-            ["RNA_leiden_cluster"],
+            normalized,
+            {"leiden": leiden_clustering},
         )
 
 
-def test_datastore_wrapper_rejects_a_foreign_cell_selection(
+def test_datastore_wrapper_uses_reduction_selection_after_live_alias_drift(
     datastore,
-    graph_artifacts,
+    connectivity_graph,
     leiden_clustering,
 ):
-    state = datastore.get_assay_state("RNA")
-    assert state is not None
-    assert state.reduction is not None
-    selected = np.asarray(datastore.cells.fetch_all("I"), dtype=bool)
-    subset = selected.copy()
-    subset[np.flatnonzero(selected)[::2]] = False
-    datastore.cells.insert(
-        column_name="separability_subset",
-        values=subset,
-        overwrite=True,
-    )
-
-    with pytest.raises(ValueError, match="does not match the cell selection"):
-        datastore.metric_cluster_separability(
-            state.reduction,
-            ["RNA_leiden_cluster"],
-            cell_key="separability_subset",
+    reduction = _fixture_reduction(datastore, connectivity_graph)
+    original = np.asarray(datastore.cells.fetch_all("I"), dtype=bool)
+    drifted = original.copy()
+    drifted[::2] = False
+    datastore.cells.insert("I", drifted, overwrite=True, force=True)
+    try:
+        result = datastore.metric_cluster_separability(
+            reduction,
+            {"leiden": leiden_clustering},
+            max_sample_cells=200,
+            max_silhouette_cells=100,
         )
+    finally:
+        datastore.cells.insert("I", original, overwrite=True, force=True)
+
+    assert isinstance(result, ClusterSeparabilityResult)
+    assert int(result.clustering_scores["n_sampled_cells"].iloc[0]) == min(
+        200,
+        datastore.load_artifact(leiden_clustering)["values"].shape[0],
+    )
 
 
 def test_datastore_wrapper_revalidates_feature_selection_ancestry(
     datastore,
-    graph_artifacts,
+    connectivity_graph,
     leiden_clustering,
     monkeypatch,
 ):
-    del graph_artifacts, leiden_clustering
-    state = datastore.get_assay_state("RNA")
-    assert state is not None
-    assert state.reduction is not None
+    reduction = _fixture_reduction(datastore, connectivity_graph)
     _normalized, feature_selection = _normalized_feature_selection(
         datastore,
-        state.reduction,
+        reduction,
     )
     values = datastore.zw[artifact_path(feature_selection)]["values"]
     original = bool(values[0])
     values[0] = not original
-    monkeypatch.setattr(
-        "scarf.datastore._operations.integration_metrics.read_assay_state",
-        lambda *_args, **_kwargs: None,
-    )
 
     def fail_if_computed(*_args, **_kwargs):
         raise AssertionError("cluster separability computation must not start")
@@ -407,41 +406,34 @@ def test_datastore_wrapper_revalidates_feature_selection_ancestry(
     try:
         with pytest.raises(ArtifactResolutionError) as caught:
             datastore.metric_cluster_separability(
-                state.reduction,
-                ["RNA_leiden_cluster"],
+                reduction,
+                {"leiden": leiden_clustering},
             )
         assert caught.value.code == "corrupt_payload"
     finally:
         values[0] = original
 
 
-def test_datastore_wrapper_rejects_legacy_feature_selection_ancestry(
+def test_datastore_wrapper_rejects_malformed_feature_selection_ancestry(
     datastore,
-    graph_artifacts,
+    connectivity_graph,
     leiden_clustering,
     monkeypatch,
 ):
-    del graph_artifacts, leiden_clustering
-    state = datastore.get_assay_state("RNA")
-    assert state is not None
-    assert state.reduction is not None
+    reduction = _fixture_reduction(datastore, connectivity_graph)
     normalized, _feature_selection = _normalized_feature_selection(
         datastore,
-        state.reduction,
+        reduction,
     )
     normalized_group = datastore.zw[artifact_path(normalized)]
     original_provenance = dict(normalized_group.attrs["provenance"])
     provenance = dict(original_provenance)
     inputs = dict(provenance["inputs"])
     raw_feature_selection = dict(inputs["feature_selection"])
-    raw_feature_selection["feat_key"] = "I__hvgs"
+    raw_feature_selection["unexpected"] = True
     inputs["feature_selection"] = raw_feature_selection
     provenance["inputs"] = inputs
     normalized_group.attrs["provenance"] = provenance
-    monkeypatch.setattr(
-        "scarf.datastore._operations.integration_metrics.read_assay_state",
-        lambda *_args, **_kwargs: None,
-    )
 
     def fail_if_computed(*_args, **_kwargs):
         raise AssertionError("cluster separability computation must not start")
@@ -451,12 +443,12 @@ def test_datastore_wrapper_rejects_legacy_feature_selection_ancestry(
         fail_if_computed,
     )
     try:
-        with pytest.raises(IncompatibleAnalysisStateError) as caught:
+        with pytest.raises(ArtifactResolutionError) as caught:
             datastore.metric_cluster_separability(
-                state.reduction,
-                ["RNA_leiden_cluster"],
+                reduction,
+                {"leiden": leiden_clustering},
             )
-        assert caught.value.code == "legacy_feature_contract"
+        assert caught.value.code == "corrupt_payload"
         assert caught.value.context["input_name"] == "feature_selection"
     finally:
         normalized_group.attrs["provenance"] = original_provenance

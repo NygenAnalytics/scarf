@@ -73,7 +73,8 @@ pd.DataFrame(
 
 ## 2. Merge counts and metadata
 
-`names` supplies the source labels, `source_column` names their metadata column, and `prepend_text` prevents imported columns from colliding with new analysis results.
+`names` supplies the source labels, `source_column` names their metadata column, and `prepend_text`
+keeps imported metadata names distinct from columns authored in the merged store.
 `reset_cell_filter=False` preserves the source quality-control selections.
 
 ```{code-cell} ipython3
@@ -93,7 +94,7 @@ ds = scarf.DataStore(merged_path, nthreads=4)
 ```
 
 `sample_id` records the source label.
-Columns imported from the sources keep the `orig_` prefix so later analysis columns can reuse their original names.
+Columns imported from the sources keep the `orig_` prefix so their origin remains explicit.
 
 ```{code-cell} ipython3
 orig_cols = [
@@ -119,76 +120,63 @@ active_cells.groupby("sample_id")["orig_cluster_labels"].agg(
 
 ## 3. Build the uncorrected baseline
 
-The standard RNA pipeline records the complete analysis chain as reusable artifacts.
+The standard RNA pipeline records the complete workflow as reusable artifacts.
 Filtering is disabled because the source selections were retained.
 The graph uses 21 neighbours so the same graph parameters can be compared with the correction methods on the next page.
 
 ```{code-cell} ipython3
 baseline = ds.pipeline.run(
+    label="uncorrected",
     filtering=False,
-    cell_cycle_scoring=False,
-    highly_variable_features={
-        "min_cells": 10,
-        "top_n": 2000,
-        "min_mean": -3,
-        "max_mean": 2,
-        "max_var": 6,
-    },
-    pca={"dims": 25},
-    neighbors={"k": 21},
-    umap={
-        "n_epochs": 250,
-        "spread": 5,
-        "min_dist": 1,
-        "parallel": True,
-    },
-    leiden={1.0: {"label": "integration_clusters"}},
+    cell_cycle=False,
+    hvg_count=2000,
+    pca_dims=25,
+    neighbors_k=21,
+    leiden={"partitions": (1.0,)},
     paris=False,
-    doublet_scoring=False,
+    doublets=False,
     markers=False,
+    snapshot_columns=("sample_id", "orig_cluster_labels"),
 )
 sorted(baseline)
 ```
 
-The return value lists each written {term}`artifact` by name.
-The selected Leiden partition is also published as `RNA_clusters` for later plotting.
+The durable run maps each output name to its exact {term}`artifact`.
+Requested metadata and results remain in its frozen view.
 
 One plotting call compares source identity with the imported cell types on the same layout.
 
 ```{code-cell} ipython3
-comparison = ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by=["sample_id", "orig_cluster_labels"],
-    n_columns=2,
-    show_titles=False,
-    show=False,
+ds.plots.embedding(
+    run=baseline,
+    layout="umap",
+    color_by="sample_id",
 )
-for axis, title in zip(
-    comparison.axes.values(),
-    ("Source", "Imported cell type"),
-    strict=True,
-):
-    axis.set_title(title)
-comparison.show()
+ds.plots.embedding(
+    run=baseline,
+    layout="umap",
+    color_by="orig_cluster_labels",
+)
 ```
 
-The uncorrected Leiden partition that the pipeline selected as `RNA_clusters` should track broad cell-type structure even while sources remain segregated.
+The clustering candidate selected by the pipeline should track broad cell-type structure even while
+sources remain segregated.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by="RNA_clusters",
+    run=baseline,
+    layout="umap",
+    color_by="clusters",
 )
 ```
 
 A proportional composition plot makes source dominance within the uncorrected Leiden clusters explicit.
 
 ```{code-cell} ipython3
-ds.plots.composition(
-    category_by="sample_id",
-    sample_by="RNA_clusters",
-    kind="stacked",
-    show_percent_labels=True,
+pd.crosstab(
+    baseline.cells.fetch("clusters"),
+    baseline.cells.fetch("sample_id"),
+    normalize="index",
 )
 ```
 
@@ -199,6 +187,7 @@ One is the maximum mixing score across the observed sources.
 ```{code-cell} ipython3
 uncorrected_ilisi = ds.metric_ilisi(
     batch_colname="sample_id",
+    neighbors=baseline["neighbors"],
     perplexity=7,
 )
 {"uncorrected iLISI": round(uncorrected_ilisi, 3)}
@@ -210,12 +199,8 @@ The stimulated sample received interferon beta, and PBMC cell types do not all r
 Source-associated structure can therefore include biological response as well as technical variation.
 An interferon-response gene such as `ISG15` makes that stim-enriched program visible on the same uncorrected layout.
 
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by="ISG15",
-)
-```
+Inspect treatment-linked expression separately before interpreting the source mixing as purely
+technical.
 
 This page establishes the uncorrected observation; {doc}`batch_correction` compares how partial PCA and Harmony change it.
 Keep uncorrected counts for condition-level differential expression.

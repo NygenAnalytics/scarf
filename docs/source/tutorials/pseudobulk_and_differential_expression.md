@@ -1,5 +1,5 @@
 ---
-description: Aggregate cells with make_bulk and export for external differential expression.
+description: Aggregate counts with make_bulk and export them for external differential expression.
 jupytext:
   text_representation:
     extension: .md
@@ -16,225 +16,150 @@ kernelspec:
 
 # Pseudobulk and differential expression
 
-Scarf stops at aggregation and export.
-Use `make_bulk` to build bulk-like count profiles, then export those counts (with sample-level metadata) for condition-level differential expression in an external tool such as edgeR or DESeq2.
-`run_marker_search` is separate: it returns Mann-Whitney `p_value` columns plus within-group `p_value_adjusted` (Benjamini-Hochberg) for cluster interpretation.
-Those adjusted values are still cell-level marker statistics, not replicate-aware FDR-controlled DE.
+Scarf aggregates counts and exports them. Use a replicate-aware external method such as edgeR or
+DESeq2 for condition-level differential expression. Scarf marker tables answer a different,
+cell-level question and must not be reported as replicate-aware differential expression.
 
-## Prerequisites
-
-- A clustered RNA `DataStore`
-- Optional: multi-sample metadata for true pseudobulk designs
-
-## What you will learn
-
-- Export aggregate counts from `make_bulk` for external DE
-- Keep marker statistics separate from condition-level DE
-- Build optional pseudo-replicates within groups
-
-## Dataset
-
-This page uses the Kang control PBMC store and Leiden clusters as groups.
-For multi-sample designs, merge samples first ({doc}`dataset_merging`) and pass sample and cell-type columns to `make_bulk`.
-The catalog snapshot is structurally repacked in a temporary directory and mounted into a clean writable analysis target, preserving literal cluster and UMAP metadata without reusing legacy analysis state.
+## 1. Create an artifact-only baseline
 
 ```{code-cell} ipython3
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import numpy as np
 import pandas as pd
 
 import scarf
 from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level='WARNING', progress=True)
+scarf.configure_output(level="WARNING", progress=True)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    'kang_15K_pbmc_rnaseq',
-    destination='scarf_datasets',
+    "kang_15K_pbmc_rnaseq",
+    destination="scarf_datasets",
     zarr=True,
 )
 analysis_directory = TemporaryDirectory()
-repacked_counts = f'{analysis_directory.name}/counts.zarr'
-repack_store(
-    f'{dataset}/data.zarr',
-    repacked_counts,
-    nthreads=2,
-)
+counts_path = Path(analysis_directory.name) / "counts.zarr"
+repack_store(f"{dataset}/data.zarr", str(counts_path), nthreads=2)
 ds = scarf.mount_datastore(
-    repacked_counts,
-    at=f'{analysis_directory.name}/analysis.zarr',
+    str(counts_path),
+    at=str(Path(analysis_directory.name) / "analysis.zarr"),
+    default_assay="RNA",
     nthreads=4,
-    default_assay='RNA',
 )
+
+run = ds.pipeline.run(
+    filtering=False,
+    cell_cycle=False,
+    doublets=False,
+)
+ds.plots.embedding(run=run, layout="umap", color_by="clusters")
 ```
 
-The published Kang store carries a UMAP and a Leiden partition under `RNA_clusters`.
-Those groups are the aggregation key below, and they may differ from the author-provided `cluster_labels` column.
+The pipeline chose its clustering by silhouette score. The clustering and marker table are
+immutable outputs of this run.
+
+## 2. Keep marker interpretation separate
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='RNA_clusters',
-)
-```
-
-Leiden clusters on the published UMAP; these labels are the grouping key for `make_bulk` below.
-
-## 1. Inspect marker ranks separately from DE
-
-```{code-cell} ipython3
-ds.set_feature_selection(
-    feature_indexes=range(ds.RNA.feats.N),
-    label='all_for_markers',
-)
-all_features = ds.resolve_features('RNA', 'all_features')
-marker_ref = ds.run_marker_search(
-    group_key='RNA_clusters',
-    cell_key='I',
-    features=all_features,
-)
+marker_ref = run["markers"]
+cluster_values = np.asarray(run.cells.fetch("clusters"))
+group_id = pd.Series(cluster_values).value_counts().index[0]
 markers = ds.get_markers(
     marker=marker_ref,
-    cell_key='I',
-    group_key='RNA_clusters',
-    group_id='1',
+    group_id=group_id,
     min_score=-1,
     min_frac_exp=-1,
 )
 markers[
     [
-        'feature_name',
-        'score',
-        'frac_exp',
-        'auc',
-        'p_value',
-        'p_value_adjusted',
+        "feature_name",
+        "score",
+        "frac_exp",
+        "auc",
+        "p_value",
+        "p_value_adjusted",
     ]
 ].head()
 ```
 
-```{code-cell} ipython3
-ds.plots.marker_heatmap(
-    marker=marker_ref,
-    group_key='RNA_clusters',
-    cell_key='I',
-    topn=2,
-    figsize=(8, 8),
-)
-```
+The adjusted values use the marker-table correction scope documented in
+{doc}`../reference/api/datastore`. They are not biological-replicate FDR values.
 
-Rows are top markers per cluster for interpretation only, not exported DE results.
+## 3. Aggregate raw counts
 
-```{note}
-Use marker tables for cluster interpretation.
-Do not treat within-group `p_value_adjusted` columns as replicate-aware differential expression results.
-```
-
-## 2. Aggregate with make_bulk
-
-Cell counts per Leiden group set the scale for each bulk column:
+`make_bulk` accepts the exact categorical artifact directly. Its stored lineage supplies the cell
+selection, so no cluster column needs to be created:
 
 ```{code-cell} ipython3
 group_sizes = (
-    ds.cells.to_pandas_dataframe(
-        columns=['RNA_clusters'],
-        key='I',
-    )['RNA_clusters']
+    pd.Series(cluster_values, name="group")
     .astype(str)
     .value_counts()
     .sort_index()
 )
-group_sizes
 ```
 
-`make_bulk` sums raw counts per group.
-`return_fraction=True` adds the fraction of cells with non-zero counts in the same pass:
-
 ```{code-cell} ipython3
-bulk, fracs = ds.make_bulk(
-    group_key='RNA_clusters',
-    aggr_type='sum',
-    feature_label='name',
+bulk, fractions = ds.make_bulk(
+    run["clusters"],
+    from_assay="RNA",
+    aggr_type="sum",
+    feature_label="name",
     return_fraction=True,
 )
-totals = bulk.sum().rename('total_counts')
+totals = bulk.sum().rename("total_counts")
 totals.index = totals.index.astype(str)
-pd.concat(
-    [group_sizes.rename('n_cells'), totals],
+pd.concat([group_sizes.rename("n_cells"), totals], axis=1)
+```
+
+`bulk` contains summed raw counts. `fractions` contains the fraction of cells with a nonzero count
+for the same feature and group.
+
+Pass a user-owned metadata column name as `groups` when its categories were authored outside an
+analysis producer. Use `cell_selection=` to restrict either input path explicitly; for an artifact,
+the requested selection must be a subset of its stored selection. For nested aggregation,
+`secondary_groups=` accepts another compatible categorical artifact or metadata column.
+
+```{code-cell} ipython3
+top_features = bulk.sum(axis=1).sort_values(ascending=False).head(8).index
+bulk.loc[top_features], fractions.loc[top_features]
+```
+
+For a real condition comparison, the grouping must retain biological sample identity, usually as
+`secondary_groups="sample_id"` alongside the cell-type artifact. Merge samples first as described
+in {doc}`dataset_merging`.
+
+## 4. Export counts and sample metadata
+
+```{code-cell} ipython3
+counts_csv = Path(analysis_directory.name) / "pseudobulk_counts.csv"
+metadata_csv = Path(analysis_directory.name) / "pseudobulk_metadata.csv"
+
+bulk.to_csv(counts_csv)
+sample_metadata = pd.concat(
+    [group_sizes.rename("n_cells"), totals],
     axis=1,
 )
+sample_metadata.index.name = "group"
+sample_metadata.to_csv(metadata_csv)
+
+pd.read_csv(counts_csv, index_col=0, nrows=5).iloc[:, :5]
 ```
 
-Top expressed genes across groups (summed counts), with detection fractions alongside:
+Use the count matrix and design metadata with a method appropriate to the study. Scarf does not fit
+edgeR or DESeq2 models.
 
-```{code-cell} ipython3
-top_genes = bulk.sum(axis=1).sort_values(ascending=False).head(8).index
-bulk.loc[top_genes]
-```
+## About pseudo-replicates
 
-```{code-cell} ipython3
-fracs.loc[top_genes]
-```
-
-Optional pseudo-replicates within each group:
-
-```{note}
-`pseudo_reps > 1` randomly splits cells within each group.
-These are descriptive resamples of the same cells, not independent biological replicates.
-Do not treat them as replicates in edgeR, DESeq2, or PyDESeq2.
-For replicate-aware differential expression, aggregate with a sample-aware `group_key` (for example sample nested with cell type) and keep true biological replicates in the exported metadata.
-```
-
-```{code-cell} ipython3
-bulk_reps = ds.make_bulk(
-    group_key='RNA_clusters',
-    aggr_type='sum',
-    feature_label='name',
-    pseudo_reps=2,
-)
-list(bulk_reps.columns)
-```
-
-Column names carry the group label plus `_Rep1` / `_Rep2`.
-Shape doubles the group count because each cluster is split once:
-
-```{code-cell} ipython3
-bulk_reps.shape
-```
-
-## 3. Export counts for external DE
-
-```{code-cell} ipython3
-export_path = 'scarf_datasets/kang_pseudobulk_counts.csv'
-meta_path = 'scarf_datasets/kang_pseudobulk_sample_meta.csv'
-bulk.to_csv(export_path)
-sample_meta = pd.concat(
-    [group_sizes.rename('n_cells'), totals],
-    axis=1,
-)
-sample_meta.index.name = 'group'
-sample_meta.to_csv(meta_path)
-print(f'Wrote {bulk.shape[0]} features x {bulk.shape[1]} groups to {export_path}')
-print(f'Wrote sample metadata for {sample_meta.shape[0]} groups to {meta_path}')
-```
-
-Peek the written count matrix and the group-level metadata that pairs with its columns:
-
-```{code-cell} ipython3
-pd.read_csv(export_path, index_col=0, nrows=5).iloc[:, :5]
-```
-
-```{code-cell} ipython3
-pd.read_csv(meta_path, index_col=0)
-```
-
-Use the exported count matrix and sample-level metadata with a method appropriate to the study design, such as edgeR or DESeq2.
-Scarf stops at aggregation and export; it does not run those models.
-For a true multi-sample design, merge donors or conditions first ({doc}`dataset_merging`), aggregate with a sample-aware `group_key` (for example sample nested with cell type), and keep biological replicates in the exported metadata.
+`make_bulk(..., pseudo_reps=2)` randomly divides cells within each group. These splits can be useful
+for descriptive stability checks, but they are not independent biological replicates and must not
+be used as such in differential expression.
 
 ## Common mistakes
 
-- Reporting Scarf's within-group marker adjustment as replicate-aware DE
-- Building pseudobulk without a sample (donor) covariate when the biological question is condition-level
-- Treating `pseudo_reps` splits as independent biological replicates
-- Expecting Scarf to run DESeq2/edgeR-style models in-process
+- Reporting marker-table adjusted p-values as replicate-aware differential expression
+- Aggregating by cell type while discarding sample or donor identity
+- Treating random cell splits as biological replicates
+- Expecting Scarf to fit an external count model

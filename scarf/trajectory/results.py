@@ -10,17 +10,14 @@ from ..storage.refs import ArtifactRef
 
 @dataclass(frozen=True, slots=True, eq=False)
 class FateMappingResult:
-    """Saved fate probabilities aligned to cells selected by result_cell_key."""
+    """Fate probabilities loaded from an immutable artifact."""
 
-    fate_keys: tuple[str, ...]
-    validity_key: str
-    sink_labels: tuple[Any, ...]
-    assay: str
-    graph_cell_key: str
-    result_cell_key: str
+    ref: ArtifactRef
     graph: ArtifactRef
-    pseudotime_key: str
-    sink_key: str
+    pseudotime: ArtifactRef
+    sink_labels_artifact: ArtifactRef
+    cell_selection: ArtifactRef
+    sink_labels: tuple[Any, ...]
     values: np.ndarray = field(repr=False)
     valid: np.ndarray = field(repr=False)
 
@@ -32,22 +29,17 @@ class FateMappingResult:
         if self.values.shape[0] != self.valid.shape[0]:
             raise ValueError("Fate probabilities and validity rows must align")
         n_sinks = self.values.shape[1]
-        if n_sinks != len(self.fate_keys) or n_sinks != len(self.sink_labels):
-            raise ValueError(
-                "Fate probability columns, keys, and sink labels must align"
-            )
+        if n_sinks != len(self.sink_labels):
+            raise ValueError("Fate probability columns and sink labels must align")
 
 
 @dataclass(frozen=True, slots=True, eq=False)
 class PseudotimeScoreResult:
-    """Saved pseudotime values and their metadata keys."""
+    """Pseudotime values loaded from an immutable artifact."""
 
-    pseudotime_key: str
-    validity_key: str
-    assay: str
-    graph_cell_key: str
-    result_cell_key: str
+    ref: ArtifactRef
     graph: ArtifactRef
+    cell_selection: ArtifactRef
     values: np.ndarray = field(repr=False)
     valid: np.ndarray = field(repr=False)
 
@@ -60,15 +52,14 @@ class PseudotimeScoreResult:
 
 @dataclass(frozen=True, slots=True, eq=False)
 class PseudotimeMarkerResult:
-    """Pseudotime correlation table and saved feature-metadata keys."""
+    """Pseudotime correlation table loaded from an immutable artifact."""
 
+    ref: ArtifactRef
     table: pd.DataFrame = field(repr=False)
-    correlation_key: str
-    p_value_key: str
     assay: str
-    cell_key: str
+    cell_selection: ArtifactRef
     feature_selection: ArtifactRef
-    pseudotime_key: str
+    pseudotime: ArtifactRef
 
     def __post_init__(self) -> None:
         if (
@@ -93,29 +84,19 @@ class PseudotimeMarkerResult:
                 + ", ".join(sorted(missing))
             )
 
-    @property
-    def p_value_adjusted_key(self) -> str | None:
-        if (
-            "p_value_adjusted" not in self.table.columns
-            or not self.p_value_key.endswith("__p")
-        ):
-            return None
-        return f"{self.p_value_key[:-3]}__padj"
-
 
 @dataclass(frozen=True, slots=True, eq=False)
 class PseudotimeAggregationResult:
-    """Lazy pseudotime aggregation with aligned feature metadata."""
+    """Lazy pseudotime aggregation loaded from an immutable artifact."""
 
+    ref: ArtifactRef
     data: ChunkedArray = field(repr=False)
     feature_indices: np.ndarray = field(repr=False)
     feature_clusters: np.ndarray = field(repr=False)
-    cluster_key: str
-    storage_path: str
     assay: str
-    cell_key: str
+    cell_selection: ArtifactRef
     feature_selection: ArtifactRef
-    pseudotime_key: str
+    pseudotime: ArtifactRef
 
     def __post_init__(self) -> None:
         if (

@@ -8,7 +8,6 @@ import zarr
 
 from ..assay import RNAassay
 from ..graph.distances import validate_distance_provenance
-from ..graph.state import validate_normalized_artifact_selection
 from ..storage.arrays import create_zarr_dataset, create_zarr_obj_array
 from ..storage.artifacts import (
     ArtifactRef,
@@ -19,6 +18,7 @@ from ..storage.artifacts import (
 from ..storage.feature_selection import resolve_feature_selection
 from ..storage.geometry import array_geometry
 from ..storage.partition import row_band
+from ..storage.selections import validate_stored_selection_integrity
 from ..storage.types import as_zarr_array, as_zarr_group
 from .models import ScaledPCAProjectionModel, SymphonyCorrectionModel
 from .reference import MappingReference
@@ -49,7 +49,6 @@ _COMMON_METADATA = frozenset(
     {
         "method",
         "assay",
-        "cell_key",
         "selected_cell_count",
         "ann_metric",
         "normalization_parameters",
@@ -276,6 +275,14 @@ def load_artifact_mapping_reference(
     )
     if normalized_status.operation != "run_normalization":
         raise _contract_error("Normalized input has an old operation")
+    normalized_dataset_fingerprint = (normalized_status.inputs or {}).get(
+        "dataset_fingerprint"
+    )
+    if (
+        not isinstance(normalized_dataset_fingerprint, str)
+        or not normalized_dataset_fingerprint
+    ):
+        raise _contract_error("Normalized input has no dataset fingerprint")
     if (
         scaling_status.operation != "calculate_feature_scaling"
         or (scaling_status.parameters or {}).get("enabled") is not True
@@ -299,10 +306,6 @@ def load_artifact_mapping_reference(
         for name in ("schemaVersion", "schema_version", "modelVersion", "model_version")
     ):
         raise _contract_error("Mapping reference metadata uses a versioned contract")
-    if "feature_key" in metadata:
-        raise _contract_error(
-            "Mapping reference metadata uses the removed feature-key contract"
-        )
     expected_metadata = set(_COMMON_METADATA)
     if method == "symphony":
         expected_metadata.update(_SYMPHONY_METADATA)
@@ -311,7 +314,6 @@ def load_artifact_mapping_reference(
             "Mapping reference metadata does not match the current contract"
         )
     assay_name = _metadata_string(metadata, "assay")
-    cell_key = _metadata_string(metadata, "cell_key")
     if assay_name != ref.assay or metadata.get("method") != method:
         raise _contract_error("Mapping reference metadata does not match its artifact")
 
@@ -343,10 +345,20 @@ def load_artifact_mapping_reference(
     dataset_fingerprint = metadata.get("dataset_fingerprint")
     if not isinstance(dataset_fingerprint, str) or not dataset_fingerprint:
         raise _contract_error("Mapping reference dataset fingerprint is missing")
+    if dataset_fingerprint != normalized_dataset_fingerprint:
+        raise _contract_error(
+            "Mapping reference dataset fingerprint does not match normalized data"
+        )
     assay = datastore._get_assay(assay_name)
     if not isinstance(assay, RNAassay):
         raise _contract_error("Mapping references currently support RNA assays only")
-    if assay.attrs.get("dataset_fingerprint") != dataset_fingerprint:
+    stored_dataset_fingerprint = assay.attrs.get("dataset_fingerprint")
+    live_dataset_fingerprint = (
+        stored_dataset_fingerprint
+        if isinstance(stored_dataset_fingerprint, str) and stored_dataset_fingerprint
+        else datastore._calculate_dataset_fingerprint(assay_name)
+    )
+    if live_dataset_fingerprint != dataset_fingerprint:
         raise _contract_error(
             "Live assay dataset fingerprint does not match the mapping reference"
         )
@@ -358,29 +370,22 @@ def load_artifact_mapping_reference(
         or selected_cell_count < 1
     ):
         raise _contract_error("Selected reference cell count is missing")
-    selected_count = int(
-        np.count_nonzero(
-            np.asarray(
-                as_zarr_array(
-                    artifact_group(datastore.zw, cell_selection)["values"],
-                    name="values",
-                )[:],
-                dtype=bool,
-            )
-        )
-    )
-    if selected_count != selected_cell_count:
-        raise _contract_error("Selected reference cell count does not match its input")
     try:
-        validate_normalized_artifact_selection(
+        validated_cells = validate_stored_selection_integrity(
             datastore.zw,
-            normalized,
-            cell_key,
+            cell_selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise _contract_error(
-            "Mapping reference cell or feature selection no longer matches"
+            "Mapping reference cell selection no longer matches"
         ) from exc
+    selected_count = validated_cells.selected_count
+    if selected_count != selected_cell_count:
+        raise _contract_error("Selected reference cell count does not match its input")
 
     feature_ids = _values(group, "feature_ids")
     try:
@@ -452,7 +457,6 @@ def load_artifact_mapping_reference(
         datastore=datastore,
         ref=ref,
         assay_name=assay_name,
-        cell_key=cell_key,
         reduction=reduction,
         ann_index=ann_index,
         neighbors=neighbors,

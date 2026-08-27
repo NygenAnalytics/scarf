@@ -118,40 +118,32 @@ Each violin is one QC metric before filtering; set thresholds from the tails of 
 
 ```{code-cell} ipython3
 n_before = int(ds.cells.fetch_all('I').sum())
-ds.filter_cells(
+cell_selection = ds.filter_cells(
     attrs=['RNA_nCounts', 'RNA_nFeatures', 'RNA_percentMito'],
     highs=[15000, 4000, 15],
     lows=[1000, 500, 0]
 )
-I = ds.cells.fetch_all('I')
-print(f'Active cells before filter: {n_before}')
-print(f'Active cells after filter: {int(I.sum())}')
-print(f'Inactive cells (I=False): {int((~I).sum())}; total in store: {len(I)}')
-ds.cells.to_pandas_dataframe(columns=['I'])['I'].value_counts()
+cell_mask = np.asarray(ds.load_artifact(cell_selection)['values'][:], dtype=bool)
+print(f'Cells in input selection: {n_before}')
+print(f'Cells after filter: {int(cell_mask.sum())}')
+print(f'Excluded cells: {int((~cell_mask).sum())}; total in store: {len(cell_mask)}')
 ```
 
 ```{note}
-Filtered cells are marked inactive in the boolean cell key `I`, not deleted.
-Most `DataStore` methods default to `cell_key='I'`.
-See {doc}`data_organization`.
+Filtering returns an immutable selection artifact and does not change the boolean cell key `I` or
+delete rows. Pass that exact ref to downstream analytical producers. See {doc}`data_organization`.
 ```
 
 ```{code-cell} ipython3
-ds.plots.distribution(
-    keys=qc_cols,
-    kind='violin',
-    max_points=2000,
-    color='coral',
-)
+pd.DataFrame({key: ds.cells.fetch_all(key)[cell_mask] for key in qc_cols}).describe()
 ```
 
-After filtering, the same metrics are restricted to active cells (`I=True`).
+The summary now covers only the cells selected by the returned artifact.
 
 ## 3. Feature selection
 
-`mark_hvgs` ranks genes by corrected variance and marks highly variable genes.
-It returns an immutable {term}`feature selection` artifact and publishes the same Boolean values under the plain label `hvgs`.
-There is no cell-key prefix.
+`select_hvgs` ranks genes by corrected variance and returns an immutable {term}`feature selection`
+artifact and leaves feature metadata unchanged.
 
 By default, Scarf excludes common mitochondrial, ribosomal, cell-cycle, HLA/H2, histone, and sex-linked gene-name patterns, together with genes detected in nearly every selected cell.
 These defaults reduce technical and broadly shared signals in this teaching workflow.
@@ -159,7 +151,8 @@ Use `blacklist=""` to keep all names, pass a custom regular expression for a dat
 The {doc}`feature_selection` guide explains the exact patterns and how to compare feature sets.
 
 ```{code-cell} ipython3
-hvg_ref = ds.mark_hvgs(
+hvg_ref = ds.select_hvgs(
+    cell_selection,
     min_cells=20,
     top_n=500,
     min_mean=-3,
@@ -167,7 +160,10 @@ hvg_ref = ds.mark_hvgs(
     max_var=6,
     show_plot=True,
 )
-print('Selected genes:', int(ds.RNA.feats.fetch_all('hvgs').sum()))
+print(
+    'Selected genes:',
+    int(np.asarray(ds.load_artifact(hvg_ref)['values'][:]).sum()),
+)
 hvg_ref
 ```
 
@@ -181,15 +177,14 @@ Full `RNA_nCounts` library size is used only when `renormalize_subset=False`.
 The default size factor is 1000, and the earlier filter removes cells below that count.
 
 ```{code-cell} ipython3
-normalized = ds.run_normalization(features=hvg_ref)
+normalized = ds.run_normalization(cell_selection, hvg_ref)
 status = ds.inspect_artifact(normalized)
-opts = status.execution_options or {}
 print('Size factor (ds.RNA.sf):', ds.RNA.sf)
-print('cell_key:', opts.get('cell_key'))
+print('cell selection:', status.inputs['cell_selection'])
 print('feature selection:', status.inputs['feature_selection'])
 ```
 
-The normalized {term}`artifact` records both the active cell selection and the `hvgs` feature selection.
+The normalized {term}`artifact` records both exact selection refs.
 
 ## 5. PCA
 
@@ -197,7 +192,7 @@ PCA represents the dominant axes of variation among the selected genes.
 Fifteen components are sufficient for this controlled PBMC example; the elbow plot shows explained variance flattening after the early components.
 
 ```{code-cell} ipython3
-ds.run_pca(dims=15, show_elbow_plot=True)
+pca = ds.run_pca(normalized, dims=15, show_elbow_plot=True)
 ```
 
 Choosing a component count is a scientific decision on new data.
@@ -209,12 +204,12 @@ The remaining steps index the PCA coordinates, find nearby cells, and turn those
 Downstream layouts and clusters consume this graph rather than the count matrix directly.
 
 ```{code-cell} ipython3
-ds.build_embedding_initialization()
-ds.build_ann_index()
-ds.query_neighbors(k=11)
-ds.build_connectivity_map()
+initialization = ds.build_embedding_initialization(pca)
+ann_index = ds.build_ann_index(pca)
+neighbors = ds.query_neighbors(ann_index, k=11)
+graph_ref = ds.build_connectivity_map(neighbors)
 
-graph = ds.load_graph()
+graph = ds.load_graph(graph_ref)
 degrees = graph.getnnz(axis=1)
 print(graph.shape, graph.nnz)
 print(
@@ -237,11 +232,13 @@ See {doc}`graph_construction`.
 
 ## 7. UMAP
 
-Run UMAP on the current graph recorded in `AssayState`.
-Results are stored as `RNA_UMAP1` and `RNA_UMAP2`.
+Run UMAP on the explicit graph and its matching initialization artifact.
+The result is an immutable embedding artifact.
 
 ```{code-cell} ipython3
-ds.run_umap(
+umap_ref = ds.run_umap(
+    graph_ref,
+    initialization,
     n_epochs=250,
     spread=5,
     min_dist=1,
@@ -250,16 +247,13 @@ ds.run_umap(
 ```
 
 ```{code-cell} ipython3
-ds.plots.embedding(layout_key='RNA_UMAP')
+ds.plots.embedding(layout=umap_ref)
 ```
 
 Cells are placed by neighbourhood-graph proximity on the UMAP.
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='RNA_nCounts',
-)
+ds.plots.embedding(layout=umap_ref, color_by="RNA_nCounts")
 ```
 
 Library size varies across the embedding; check whether high-count cells dominate one region.
@@ -270,24 +264,19 @@ Parameter choice, densMAP, and t-SNE are covered in {doc}`dimensionality_reducti
 ## 8. Clustering
 
 Leiden clustering runs on the same neighbourhood graph.
-This manual call saves labels as `RNA_leiden_cluster`.
-`ds.pipeline.run()` instead writes `RNA_leiden_<resolution>` columns (for example `RNA_leiden_0.5`) and copies the selected partition to `RNA_clusters`.
+This manual call returns its exact cluster-label artifact. A pipeline run keeps the same artifact
+refs in frozen run-local fields.
 
 ```{code-cell} ipython3
-ds.run_leiden_clustering(resolution=0.5)
-ds.cells.to_pandas_dataframe(
-    columns=['RNA_leiden_cluster'],
-    key='I'
-)['RNA_leiden_cluster'].value_counts().sort_index()
+leiden = ds.run_leiden_clustering(graph_ref, resolution=0.5)
+leiden_values = np.asarray(ds.load_artifact(leiden)['values'][:])
+pd.Series(leiden_values).value_counts().sort_index()
 ```
 
 Cluster sizes are worth a look before plotting: a resolution that is too high splits one cell type into several small clusters.
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='RNA_leiden_cluster',
-)
+ds.plots.embedding(layout=umap_ref, color_by=leiden)
 ```
 
 Each colour is a Leiden partition on the same UMAP coordinates.
@@ -296,24 +285,19 @@ Paris provides a hierarchical view of the same graph.
 Its automatic cut is a useful second checkpoint, not a replacement for biological validation.
 
 ```{code-cell} ipython3
-paris = ds.run_paris_clustering()
-ds.cells.to_pandas_dataframe(
-    columns=[paris.label_key],
-    key='I'
-)[paris.label_key].value_counts().sort_index()
+paris = ds.run_paris_clustering(graph_ref)
+paris_values = np.asarray(ds.load_artifact(paris)['labels'][:])
+pd.Series(paris_values).value_counts().sort_index()
 ```
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by=paris.label_key,
-)
+ds.plots.embedding(layout=umap_ref, color_by=paris)
 ```
 
 ```{code-cell} ipython3
 pd.crosstab(
-    pd.Series(ds.cells.fetch('RNA_leiden_cluster', key='I'), name='Leiden'),
-    pd.Series(ds.cells.fetch(paris.label_key, key='I'), name='Paris'),
+    pd.Series(leiden_values, name='Leiden'),
+    pd.Series(paris_values, name='Paris'),
 )
 ```
 
@@ -330,9 +314,12 @@ The adjusted column is a cell-level marker correction for that group, not replic
 For condition-level DE with full workflows, export counts (see {doc}`pseudobulk_and_differential_expression`) and use an external tool.
 
 ```{code-cell} ipython3
-all_features = ds.resolve_features('RNA', 'all_features')
+all_features = ds.set_feature_selection(
+    from_assay='RNA',
+    feature_indexes=range(ds.RNA.feats.N),
+)
 marker_ref = ds.run_marker_search(
-    group_key='RNA_leiden_cluster',
+    leiden,
     features=all_features,
 )
 ```
@@ -340,7 +327,6 @@ marker_ref = ds.run_marker_search(
 ```{code-cell} ipython3
 ds.plots.marker_heatmap(
     marker=marker_ref,
-    group_key='RNA_leiden_cluster',
     topn=5,
     figsize=(5, 9)
 )
@@ -351,7 +337,6 @@ Rows are top marker genes per cluster; stronger scores mark more cluster-specifi
 ```{code-cell} ipython3
 df = ds.get_markers(
     marker=marker_ref,
-    group_key='RNA_leiden_cluster',
     group_id='1',
     min_score=-1,
     min_frac_exp=-1
@@ -364,7 +349,6 @@ Rank the same three lineage genes across all Leiden groups before plotting them 
 ```{code-cell} ipython3
 markers = ds.get_markers(
     marker=marker_ref,
-    group_key='RNA_leiden_cluster',
     group_id=None,
     min_score=-1,
     min_frac_exp=-1,
@@ -376,15 +360,13 @@ panel.sort_values(
 ```
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by=['CD14', 'MS4A1', 'CD3D'],
-    n_columns=3,
-    sort_values=True,
+ds.plots.dotplot(
+    features=["CD14", "MS4A1", "CD3D"],
+    groups=leiden,
 )
 ```
 
-CD14, MS4A1, and CD3D mark monocyte-, B-, and T-cell-like regions when those lineages are present.
+CD14, MS4A1, and CD3D provide monocyte-, B-, and T-cell evidence when those lineages are present.
 The lookup above names which Leiden clusters rank each gene highest.
 
 Annotation from markers, known gene panels, and subclustering is covered in {doc}`annotation`.
@@ -407,4 +389,4 @@ See {doc}`imputation` for a focused comparison of observed and imputed expressio
 - Treating every extra cluster at a higher resolution as a distinct cell type
 - Requesting marker tests for groups with fewer than two target or reference cells
 - Treating marker `p_value` or within-group `p_value_adjusted` columns as replicate-aware DE results
-- Expecting filtered cells to disappear from `ds.cells` (they remain, with `I=False`)
+- Expecting filtering to delete rows or change live `I` instead of returning a selection artifact

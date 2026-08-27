@@ -7,6 +7,9 @@ from typing import Any, Hashable, Literal
 import numpy as np
 import pandas as pd
 
+from ..storage.artifacts import ArtifactRef, artifact_group, inspect_artifact
+from ..storage.selections import read_stored_selection_indices
+from ..storage.types import as_zarr_array
 from ._contracts import (
     CategoricalScale,
     CellField,
@@ -17,6 +20,8 @@ from ._contracts import (
     StudyDesign,
 )
 from ._data import (
+    _artifact_cell_selection,
+    _resolve_grouping,
     fetch_normalized_feature_matrix,
     resolve_cell_selection,
     resolve_feature,
@@ -40,7 +45,16 @@ def _cell_index(store: Any, cell_key: str | None) -> np.ndarray:
     return np.asarray(store.cells.active_index(cell_key))
 
 
-def _fetch_cell_column(store: Any, column: str, cell_key: str | None) -> np.ndarray:
+def _fetch_cell_column(
+    store: Any,
+    column: str,
+    cell_key: str | None,
+    cell_indices: np.ndarray | None = None,
+) -> np.ndarray:
+    if cell_indices is not None:
+        values = np.asarray(store.cells.fetch_all(column))
+        selected: np.ndarray = values[cell_indices]
+        return selected
     if cell_key is None:
         return np.asarray(store.cells.fetch_all(column))
     return np.asarray(store.cells.fetch(column, key=cell_key))
@@ -53,11 +67,12 @@ def _fetch_series(
     cell_key: str | None,
     from_assay: str | None,
     normalization: NormalizationSpec,
+    cell_indices: np.ndarray | None = None,
 ) -> tuple[np.ndarray, str, bool]:
     """Return (values, label, is_feature)."""
     if isinstance(key, CellField):
         return (
-            _fetch_cell_column(store, key.key, cell_key),
+            _fetch_cell_column(store, key.key, cell_key, cell_indices),
             key.label or key.key,
             False,
         )
@@ -65,7 +80,9 @@ def _fetch_series(
         isinstance(key, str) and key not in store.cells.columns
     ):
         resolved = resolve_feature(store, key, from_assay=from_assay)
-        cell_idx = _cell_index(store, cell_key)
+        cell_idx = (
+            _cell_index(store, cell_key) if cell_indices is None else cell_indices
+        )
         mat = fetch_normalized_feature_matrix(
             store,
             [resolved],
@@ -73,7 +90,11 @@ def _fetch_series(
             normalization=normalization,
         )
         return mat[:, 0], resolved.label, True
-    return _fetch_cell_column(store, str(key), cell_key), str(key), False
+    return (
+        _fetch_cell_column(store, str(key), cell_key, cell_indices),
+        str(key),
+        False,
+    )
 
 
 def _subsample_frame(
@@ -346,9 +367,16 @@ def _draw_ecdf(
 
 def distribution(
     store: Any,
-    keys: str | CellField | FeatureRef | Sequence[str | CellField | FeatureRef],
+    keys: (
+        str
+        | CellField
+        | FeatureRef
+        | ArtifactRef
+        | Sequence[str | CellField | FeatureRef]
+    ),
     *,
     group_by: str | None = None,
+    grouping: ArtifactRef | None = None,
     groups: Sequence[Any] | None = None,
     split_by: str | None = None,
     sample_by: str | None = None,
@@ -385,10 +413,12 @@ def distribution(
 ) -> PlotResult:
     """Compare value distributions for QC metrics or genes.
 
-    ``keys`` may be cell-metadata columns (for example ``RNA_nCounts``) or gene
-    names. ``kind`` selects the display: ``"violin"``, ``"box"``, ``"hist"``,
-    or ``"ecdf"``. With ``group_by``, each category gets its own distribution
-    along the x-axis and a distinct color.
+    ``keys`` may be cell-metadata columns (for example ``RNA_nCounts``), gene
+    names, or one exact ``cell_cycle`` artifact. The artifact form plots its
+    canonical ``s_score`` and ``g2m_score`` arrays. ``kind`` selects the
+    display: ``"violin"``, ``"box"``, ``"hist"``, or ``"ecdf"``. With
+    ``group_by`` or its artifact counterpart ``grouping``, each category gets
+    its own distribution along the x-axis and a distinct color.
 
     Cell selection (same knobs as embeddings):
 
@@ -409,6 +439,20 @@ def distribution(
     categorical variable.
     """
     require_matplotlib()
+    value_artifact = keys if isinstance(keys, ArtifactRef) else None
+    if value_artifact is not None:
+        if value_artifact.scope != "assay" or value_artifact.kind != "cell_cycle":
+            raise ValueError(
+                "keys ArtifactRef must identify an assay-scoped cell_cycle artifact"
+            )
+        if cell_key != "I":
+            raise ValueError(
+                "cell_key cannot override an artifact's stored cell selection"
+            )
+        if from_assay is not None:
+            raise ValueError("from_assay cannot be used with artifact-backed keys")
+        if normalization is not None:
+            raise ValueError("normalization cannot be used with artifact-backed keys")
     normalization = normalization or NormalizationSpec()
     if kind not in ("violin", "stacked_violin", "box", "hist", "ecdf"):
         raise ValueError(
@@ -426,10 +470,13 @@ def distribution(
         raise ValueError("violin_linewidth must be non-negative")
     if not 0 <= violin_alpha <= 1 or not 0 <= point_alpha <= 1:
         raise ValueError("violin and point alpha values must be between 0 and 1")
-    if groups is not None and group_by is None:
-        raise ValueError("groups requires group_by")
-    if split_by is not None and group_by is None:
-        raise ValueError("split_by requires group_by")
+    if group_by is not None and grouping is not None:
+        raise ValueError("Provide at most one of group_by or grouping")
+    has_grouping = group_by is not None or grouping is not None
+    if groups is not None and not has_grouping:
+        raise ValueError("groups requires group_by or grouping")
+    if split_by is not None and not has_grouping:
+        raise ValueError("split_by requires group_by or grouping")
     if split_by is not None and kind not in ("violin", "stacked_violin"):
         raise ValueError("split_by is available only for violin plots")
     if split_by == group_by and split_by is not None:
@@ -447,11 +494,19 @@ def distribution(
     if bins < 1:
         raise ValueError("bins must be >= 1")
 
-    if isinstance(keys, (str, CellField, FeatureRef)):
-        key_list: list[str | CellField | FeatureRef] = [keys]
+    key_list: list[str | CellField | FeatureRef]
+    if isinstance(keys, ArtifactRef):
+        key_list = []
+    elif isinstance(keys, (str, CellField, FeatureRef)):
+        key_list = [keys]
     else:
         key_list = list(keys)
-    if not key_list:
+        if any(isinstance(key, ArtifactRef) for key in key_list):
+            raise TypeError(
+                "An ArtifactRef must be passed as the complete keys argument, "
+                "not mixed into a sequence"
+            )
+    if not key_list and value_artifact is None:
         raise ValueError("keys must be non-empty")
     if group_by is not None:
         categorical_scale = resolve_categorical_scale(
@@ -479,28 +534,120 @@ def distribution(
         )
         feature_assays.add(assay_name)
 
-    series_list = [
-        _fetch_series(
+    artifact_cell_indices: np.ndarray | None = None
+    value_selection: ArtifactRef | None = None
+    artifact_series: list[tuple[np.ndarray, str, bool]] | None = None
+    if value_artifact is not None:
+        status = inspect_artifact(store.zw, value_artifact)
+        if not status.complete:
+            raise ValueError("Cell-cycle artifact is unavailable or incomplete")
+        value_selection = _artifact_cell_selection(
             store,
-            k,
-            cell_key=cell_key,
-            from_assay=from_assay,
-            normalization=normalization,
+            value_artifact,
+            label="Cell-cycle score",
         )
-        for k in key_list
-    ]
+        artifact_cell_indices = read_stored_selection_indices(
+            store.zw,
+            value_selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
+        ).astype(np.int64, copy=False)
+        value_group = artifact_group(store.zw, value_artifact)
+        artifact_series = []
+        for value_name in ("s_score", "g2m_score"):
+            if value_name not in value_group:
+                raise ValueError(
+                    f"Cell-cycle artifact has no canonical {value_name!r} array"
+                )
+            values = np.asarray(
+                as_zarr_array(value_group[value_name], name=value_name)[:]
+            )
+            if values.ndim != 1 or values.shape != (len(artifact_cell_indices),):
+                raise ValueError(
+                    f"Cell-cycle {value_name!r} values do not align with their "
+                    "cell selection"
+                )
+            if not np.issubdtype(values.dtype, np.number):
+                raise TypeError(f"Cell-cycle {value_name!r} values must be numeric")
+            artifact_series.append((values, value_name, False))
+    resolved_group_by = group_by
+    if grouping is not None:
+        if cell_key != "I":
+            raise ValueError(
+                "cell_key cannot override an artifact's stored cell selection"
+            )
+        _, grouping_cell_indices, grouping_values = _resolve_grouping(
+            store,
+            group_by=None,
+            groups=grouping,
+            cell_key="I",
+        )
+        grouping_selection = _artifact_cell_selection(
+            store,
+            grouping,
+            label="Grouping",
+        )
+        if value_selection is not None:
+            assert artifact_cell_indices is not None
+            if grouping_selection != value_selection:
+                raise ValueError(
+                    "keys and grouping artifacts must share the same cell selection"
+                )
+            if not np.array_equal(grouping_cell_indices, artifact_cell_indices):
+                raise ValueError(
+                    "keys and grouping artifacts select cells in a different order"
+                )
+        else:
+            artifact_cell_indices = grouping_cell_indices
+        groups_arr = np.asarray(grouping_values[0], dtype=object)
+        resolved_group_by = "groups"
+
+    series_list = (
+        artifact_series
+        if artifact_series is not None
+        else [
+            _fetch_series(
+                store,
+                k,
+                cell_key=cell_key,
+                from_assay=from_assay,
+                normalization=normalization,
+                cell_indices=artifact_cell_indices,
+            )
+            for k in key_list
+        ]
+    )
     n = len(series_list[0][0])
     if group_by is not None:
-        groups_arr = _fetch_cell_column(store, group_by, cell_key)
+        groups_arr = _fetch_cell_column(
+            store,
+            group_by,
+            cell_key,
+            artifact_cell_indices,
+        )
         if len(groups_arr) != n:
             raise ValueError("group_by length does not match selected cells")
-    else:
+    elif grouping is None:
         groups_arr = np.zeros(n, dtype=int)
     split_arr = (
-        _fetch_cell_column(store, split_by, cell_key) if split_by is not None else None
+        _fetch_cell_column(
+            store,
+            split_by,
+            cell_key,
+            artifact_cell_indices,
+        )
+        if split_by is not None
+        else None
     )
     sample_arr = (
-        _fetch_cell_column(store, sample_by, cell_key)
+        _fetch_cell_column(
+            store,
+            sample_by,
+            cell_key,
+            artifact_cell_indices,
+        )
         if sample_by is not None
         else None
     )
@@ -510,7 +657,12 @@ def distribution(
         raise ValueError("sample_by length does not match selected cells")
 
     subset_vals = (
-        _fetch_cell_column(store, subset_by, cell_key)
+        _fetch_cell_column(
+            store,
+            subset_by,
+            cell_key,
+            artifact_cell_indices,
+        )
         if subset_by is not None
         else None
     )
@@ -518,7 +670,7 @@ def distribution(
         n,
         subset=subset_vals,
         subset_name=subset_by,
-        category_values=groups_arr if group_by is not None else None,
+        category_values=groups_arr if has_grouping else None,
         groups=groups,
     )
     dropped_sample_cells = 0
@@ -533,7 +685,7 @@ def distribution(
         selection_mask &= valid_split
     if not selection_mask.any():
         raise ValueError("No cells remain after distribution selections")
-    if group_by is None:
+    if not has_grouping:
         group_order = None
     elif groups is None:
         observed_values = list(pd.unique(groups_arr[selection_mask]))
@@ -569,11 +721,11 @@ def distribution(
     if len(set(panel_keys)) != len(panel_keys):
         panel_keys = list(range(len(panel_keys)))
 
-    n_groups = 1 if group_by is None else len(group_order or [])
+    n_groups = 1 if not has_grouping else len(group_order or [])
     n_panels = len(panel_keys)
     palette = (
         _group_palette(list(group_order), categorical_scale)
-        if group_by is not None and group_order is not None
+        if has_grouping and group_order is not None
         else None
     )
     split_order: list[Any] | None = None
@@ -693,7 +845,7 @@ def distribution(
                     max_points=max_points,
                     point_size=point_size,
                     rng=rng,
-                    order=None if group_by is None else list(group_order or []),
+                    order=None if not has_grouping else list(group_order or []),
                     palette=palette,
                     orientation=orientation,
                     violin_inner=violin_inner,
@@ -723,7 +875,7 @@ def distribution(
                             bbox_to_anchor=(1.02, 1),
                             borderaxespad=0,
                         )
-                if group_by is None:
+                if not has_grouping:
                     if orientation == "vertical":
                         ax.set_xticks([])
                     else:
@@ -744,8 +896,8 @@ def distribution(
                     df,
                     color=color,
                     bins=bins,
-                    group_by=group_by,
-                    order=None if group_by is None else list(group_order or []),
+                    group_by=resolved_group_by,
+                    order=None if not has_grouping else list(group_order or []),
                     palette=palette,
                     show_legend=show_legend,
                 )
@@ -756,8 +908,8 @@ def distribution(
                     color=color,
                     max_points=max_points,
                     rng=rng,
-                    group_by=group_by,
-                    order=None if group_by is None else list(group_order or []),
+                    group_by=resolved_group_by,
+                    order=None if not has_grouping else list(group_order or []),
                     palette=palette,
                     show_legend=show_legend,
                 )
@@ -786,7 +938,7 @@ def distribution(
                     else "value"
                 )
                 if orientation == "vertical":
-                    ax.set_xlabel(group_by or "")
+                    ax.set_xlabel(resolved_group_by or "")
                     ax.set_ylabel(
                         measurement_label,
                         fontstyle=(
@@ -810,7 +962,7 @@ def distribution(
                             else "normal"
                         ),
                     )
-                    ax.set_ylabel(group_by or "")
+                    ax.set_ylabel(resolved_group_by or "")
             if kind == "stacked_violin" and panel_index < n_panels - 1:
                 if orientation == "vertical":
                     ax.tick_params(axis="x", labelbottom=False)
@@ -884,7 +1036,9 @@ def distribution(
         ),
         provenance=PlotProvenance(
             assay=(next(iter(feature_assays)) if len(feature_assays) == 1 else None),
-            cell_key=cell_key,
+            cell_key=(
+                None if grouping is not None or value_artifact is not None else cell_key
+            ),
             n_cells=n,
             n_samples=(
                 int(pd.Series(sample_arr).nunique()) if sample_arr is not None else None
@@ -895,6 +1049,10 @@ def distribution(
                 "max_points": max_points,
                 "seed": seed,
                 "group_by": group_by,
+                "grouping": None if grouping is None else grouping.to_dict(),
+                "values": (
+                    None if value_artifact is None else value_artifact.to_dict()
+                ),
                 "groups": None if groups is None else list(groups),
                 "split_by": split_by,
                 "split_order": split_order,
@@ -916,10 +1074,14 @@ def distribution(
                 "violin_inner": violin_inner,
                 "italicize_features": italicize_features,
                 "approximate": any_subsampled,
-                "normalization": {
-                    "source": normalization.source,
-                    "transform": normalization.transform,
-                },
+                "normalization": (
+                    None
+                    if value_artifact is not None
+                    else {
+                        "source": normalization.source,
+                        "transform": normalization.transform,
+                    }
+                ),
                 "assays": sorted(feature_assays),
             },
         ),

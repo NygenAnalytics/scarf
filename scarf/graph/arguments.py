@@ -164,15 +164,13 @@ class NormalizationArguments(OperationArguments):
     operation: ClassVar[str] = "run_normalization"
     artifact_kind: ClassVar[str] = "normalized"
 
-    from_assay: str = execution()
-    cell_key: str = execution()
     cell_selection: ArtifactRef = artifact_input()
     feature_selection: ArtifactRef = artifact_input()
+    dataset_fingerprint: str = artifact_input()
     normalization_method: Callable[..., Any] | str = parameter()
     size_factor: float | None = parameter()
     log_transform: bool = parameter()
     renormalize_subset: bool = parameter()
-    update_state: bool = execution()
     invalidate_cache: bool = execution(False)
 
 
@@ -195,12 +193,10 @@ class PcaArguments(OperationArguments):
     normalized: ArtifactRef = artifact_input()
     feature_scaling: ArtifactRef = artifact_input()
     pca_cell_selection: ArtifactRef = artifact_input()
-    pca_cell_key: str = execution()
     dims: int = parameter()
     feat_scaling: bool = parameter()
     batch_size: int = execution()
     show_elbow_plot: bool = execution()
-    update_state: bool = execution()
     invalidate_cache: bool = execution(False)
 
 
@@ -218,7 +214,6 @@ class LsiArguments(OperationArguments):
     n_iter: int = parameter()
     n_oversamples: int = parameter()
     batch_size: int = execution()
-    update_state: bool = execution()
     invalidate_cache: bool = execution(False)
 
 
@@ -232,7 +227,6 @@ class CustomReductionArguments(OperationArguments):
     loadings: np.ndarray = artifact_input()
     dims: int = parameter()
     feat_scaling: bool = parameter()
-    update_state: bool = execution()
     invalidate_cache: bool = execution(False)
 
 
@@ -242,7 +236,7 @@ class HarmonyArguments(OperationArguments):
     artifact_kind: ClassVar[str] = "batch_correction"
 
     reduction: ArtifactRef = artifact_input()
-    batch_values: ArtifactRef = artifact_input()
+    batch_snapshot: ArtifactRef = artifact_input()
     batch_columns: tuple[str, ...] = parameter()
     harmony_parameters: Mapping[str, Any] = parameter()
     algorithm_version: str = parameter()
@@ -313,7 +307,7 @@ class EmbeddingInitializationArguments(OperationArguments):
     operation: ClassVar[str] = "build_embedding_initialization"
     artifact_kind: ClassVar[str] = "embedding_initialization"
 
-    reduction: ArtifactRef = artifact_input()
+    coordinates: ArtifactRef = artifact_input()
     n_centroids: int = parameter()
     rand_state: int = parameter()
     batch_size: int = parameter()

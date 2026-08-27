@@ -22,34 +22,89 @@ _HVG_REF = ArtifactRef(
     kind="feature_selection",
     artifact_id="a" * 64,
 )
+_CELL_REF = ArtifactRef(
+    scope="datastore",
+    assay=None,
+    kind="cell_selection",
+    artifact_id="b" * 64,
+)
+_CLUSTER_REF = ArtifactRef(
+    scope="assay",
+    assay="RNA",
+    kind="cluster_labels",
+    artifact_id="c" * 64,
+)
 
 
 def _config(*, runTag: str = "e2e-test") -> ProfilingConfig:
     return load_profiling_config(_EXAMPLE_CONFIG).model_copy(update={"runTag": runTag})
 
 
-def test_load_hvg_ref_from_prior_stage_result(
+def test_load_stage_input_refs_from_prior_stage_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config()
-    monkeypatch.setattr(
-        modal_app,
-        "load_result",
-        lambda *_args: {
+    refs = {
+        "filterCells": _CELL_REF,
+        "markHvgs": _HVG_REF,
+    }
+
+    def load_result(_config: ProfilingConfig, _rows: int, stage: str):
+        return {
             "status": "ok",
-            "details": {"artifact": _HVG_REF.to_dict()},
-        },
-    )
+            "details": {"artifact": refs[stage].to_dict()},
+        }
 
-    assert modal_app._load_hvg_ref(config, 10_000) == _HVG_REF
+    monkeypatch.setattr(modal_app, "load_result", load_result)
+
+    assert modal_app._load_stage_input_refs(
+        config,
+        10_000,
+        "runNormalization",
+    ) == {"cells": _CELL_REF, "features": _HVG_REF}
 
 
-def test_load_hvg_ref_allows_an_unprofiled_hvg_stage(
+def test_load_stage_input_refs_rejects_missing_dependency(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(modal_app, "load_result", lambda *_args: None)
 
-    assert modal_app._load_hvg_ref(_config(), 10_000) is None
+    with pytest.raises(ValueError, match="filterCells stage result is unavailable"):
+        modal_app._load_stage_input_refs(
+            _config(),
+            10_000,
+            "runNormalization",
+        )
+
+
+def test_load_stage_input_refs_uses_bound_imported_cluster_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    loaded_stages: list[str] = []
+
+    def load_result(_config: ProfilingConfig, _rows: int, stage: str):
+        loaded_stages.append(stage)
+        return {
+            "status": "ok",
+            "details": {"artifact": _CLUSTER_REF.to_dict()},
+        }
+
+    monkeypatch.setattr(modal_app, "load_result", load_result)
+    workflow = config.workflow.model_copy(
+        update={
+            "clusterSourceUri": "s3://bucket/source.zarr",
+            "clusterSourceArtifactId": "d" * 64,
+        }
+    )
+
+    assert modal_app._load_stage_input_refs(
+        config,
+        10_000,
+        "findMarkers",
+        workflow=workflow,
+    ) == {"clusters": _CLUSTER_REF}
+    assert loaded_stages == ["importClusters"]
 
 
 class _Sampler:

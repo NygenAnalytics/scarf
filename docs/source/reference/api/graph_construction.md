@@ -1,36 +1,71 @@
 # Graph construction API reference
 
-These `DataStore` methods build the neighbourhood graph as separate, provenance-backed steps.
-Stage builders return an {py:class}`~scarf.ArtifactRef` and, by default, select it in {py:class}`~scarf.AssayState` as part of the current analysis chain (`update_state=True`).
-{py:meth}`~scarf.DataStore.load_graph` returns a `csr_matrix` and has no `update_state` parameter.
-Prefer `ds.pipeline.run` for a default RNA recipe; use individual methods when you need branching, custom parameters, or partial recomputation.
+These `DataStore` methods build a neighbourhood graph as explicit, provenance-backed stages. Each
+builder returns an {py:class}`~scarf.ArtifactRef`; pass that exact ref to the next stage.
 
-See {doc}`../../tutorials/graph_construction`.
+Prefer `ds.pipeline.run()` for the fixed rich RNA recipe. Use the individual methods for a partial
+workflow, an alternative branch, or parameters intentionally kept out of the pipeline surface.
+See {doc}`../../tutorials/graph_construction` for an executable walkthrough.
 
-## Chain order
+## Explicit chain
 
-1. {py:meth}`~scarf.DataStore.run_normalization`
-2. {py:meth}`~scarf.DataStore.run_pca`, {py:meth}`~scarf.DataStore.run_lsi`, or {py:meth}`~scarf.DataStore.run_custom_reduction`
-3. Optional {py:meth}`~scarf.DataStore.run_harmony` (batch correction before ANN)
-4. {py:meth}`~scarf.DataStore.build_ann_index`
-5. {py:meth}`~scarf.DataStore.query_neighbors`
-6. {py:meth}`~scarf.DataStore.build_connectivity_map`
-
-{py:meth}`~scarf.DataStore.build_embedding_initialization` depends only on the reduction.
-Call it when you need K-means initialization for UMAP, unless you pass ``ini_embed`` yourself.
-It is not required to build the neighbourhood graph.
-
-## Downstream methods
-
-Downstream UMAP, t-SNE, clustering, and sampling read the current `AssayState.connectivity_map` when `graph=None`.
-Each also accepts an exact connectivity-map or integrated-graph reference through `graph=`, so a side branch can be analysed without changing the selected chain.
-They do not accept an independent feature selection: named lineage edges project the normalized feature selections used to construct the graph.
-Leiden and UMAP return the {py:class}`~scarf.ArtifactRef` they wrote; Paris clustering returns a {py:class}`~scarf.clustering.ParisClusteringResult` whose ``ref`` field holds that artifact:
+Capture the live Boolean cell column once at the workflow boundary. The returned selection is
+immutable; later live changes do not alter it.
 
 ```python
-graph_k21 = ds.build_connectivity_map(neighbors_k21, update_state=False)
-ds.run_leiden_clustering(graph=graph_k21, resolution=0.5, label="leiden_k21")
+cells = ds.snapshot_cell_selection("I")
+features = ds.select_hvgs(cells, top_n=1000, show_plot=False)
+
+normalized = ds.run_normalization(cells, features)
+pca = ds.run_pca(normalized, dims=21)
+ann = ds.build_ann_index(pca)
+neighbors = ds.query_neighbors(ann, k=11)
+graph = ds.build_connectivity_map(neighbors)
+initialization = ds.build_embedding_initialization(pca)
 ```
+
+The full stage order is:
+
+1. {py:meth}`~scarf.DataStore.snapshot_cell_selection` and an exact feature-selection ref
+2. {py:meth}`~scarf.DataStore.run_normalization`
+3. {py:meth}`~scarf.DataStore.run_pca`, {py:meth}`~scarf.DataStore.run_lsi`, or
+   {py:meth}`~scarf.DataStore.run_custom_reduction`
+4. Optional {py:meth}`~scarf.DataStore.run_harmony`
+5. {py:meth}`~scarf.DataStore.build_ann_index`
+6. {py:meth}`~scarf.DataStore.query_neighbors`
+7. {py:meth}`~scarf.DataStore.build_connectivity_map`
+
+{py:meth}`~scarf.DataStore.build_embedding_initialization` depends on explicit reduction or Harmony
+coordinates. It is needed for UMAP unless an initialization array is supplied, but is not part of
+connectivity construction.
+
+`query_neighbors` reads the coordinate ref named by the ANN artifact. Its optional `coordinates=`
+argument is only an equality check; it cannot redirect an index to different coordinates.
+
+## Downstream consumers
+
+UMAP, t-SNE, clustering, sampling, diffusion, trajectories, graph metrics, and graph-backed plots
+require an exact graph or neighbour artifact. Analytical producers return artifacts and do not add
+live metadata fields:
+
+```python
+umap = ds.run_umap(
+    graph,
+    initialization,
+)
+leiden = ds.run_leiden_clustering(
+    graph,
+    resolution=0.5,
+)
+ds.plots.embedding(layout=umap, color_by=leiden)
+```
+
+The scientific cell selection comes from graph lineage. Load a payload from its exact ref, or pass
+the ref to another consumer.
+
+Graph consumers do not accept an independent feature selection. Named lineage edges identify the
+normalized feature selections used to construct a native graph. Imported-coordinate graphs have
+no such selection; integrated graphs preserve the ordered projections of their explicit sources.
 
 ## Methods
 
@@ -38,6 +73,7 @@ ds.run_leiden_clustering(graph=graph_k21, resolution=0.5, label="leiden_k21")
 .. autosummary::
    :nosignatures:
 
+   scarf.DataStore.snapshot_cell_selection
    scarf.DataStore.run_normalization
    scarf.DataStore.run_pca
    scarf.DataStore.run_lsi
@@ -51,6 +87,7 @@ ds.run_leiden_clustering(graph=graph_k21, resolution=0.5, label="leiden_k21")
 ```
 
 ```{eval-rst}
+.. automethod:: scarf.DataStore.snapshot_cell_selection
 .. automethod:: scarf.DataStore.run_normalization
 .. automethod:: scarf.DataStore.run_pca
 .. automethod:: scarf.DataStore.run_lsi

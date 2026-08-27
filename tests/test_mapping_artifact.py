@@ -34,9 +34,18 @@ def _ref(
 
 
 def _plain_reference(datastore):
-    state = datastore.get_assay_state("RNA")
-    assert state is not None and state.neighbors is not None
-    return datastore.build_mapping_reference(state.neighbors)
+    graphs = datastore.list_artifacts(
+        kind="connectivity_map",
+        from_assay="RNA",
+        scope="assay",
+        complete_only=True,
+    )
+    assert len(graphs) == 1
+    neighbors = ArtifactRef.from_dict(
+        datastore.inspect_artifact(graphs[0]).inputs["neighbors"]
+    )
+    reference_ref = datastore.build_mapping_reference(neighbors)
+    return datastore.get_mapping_reference(reference_ref)
 
 
 def test_load_rejects_non_mapping_reference_refs() -> None:
@@ -179,8 +188,6 @@ def test_load_rejects_versioned_metadata_and_bad_distance_summary(
     analyzed_datastore_ephemeral,
 ) -> None:
     datastore = analyzed_datastore_ephemeral
-    state = datastore.get_assay_state("RNA")
-    assert state is not None and state.neighbors is not None
     reference = _plain_reference(datastore)
     group = artifact_group(datastore.zw, reference.ref)
 
@@ -190,7 +197,12 @@ def test_load_rejects_versioned_metadata_and_bad_distance_summary(
     with pytest.raises(ValueError, match="versioned contract"):
         load_artifact_mapping_reference(datastore, reference.ref)
 
-    reference = datastore.build_mapping_reference(state.neighbors)
+    reference = datastore.get_mapping_reference(
+        datastore.build_mapping_reference(
+            reference.neighbors,
+            invalidate_cache=True,
+        )
+    )
     group = artifact_group(datastore.zw, reference.ref)
     metadata = dict(group.attrs["reference_metadata"])
     metadata.pop("schemaVersion", None)
@@ -253,11 +265,15 @@ def test_load_rejects_coordinate_chain_and_live_fingerprint_mismatches(
         load_artifact_mapping_reference(datastore, reference.ref)
 
     ann_group.attrs["provenance"] = original_ann_provenance
-    original_fingerprint = datastore.RNA.attrs["dataset_fingerprint"]
+    had_stored_fingerprint = "dataset_fingerprint" in datastore.RNA.attrs
+    original_fingerprint = datastore.RNA.attrs.get("dataset_fingerprint")
     datastore.RNA.attrs["dataset_fingerprint"] = "changed"
     with pytest.raises(ValueError, match="dataset fingerprint"):
         load_artifact_mapping_reference(datastore, reference.ref)
-    datastore.RNA.attrs["dataset_fingerprint"] = original_fingerprint
+    if had_stored_fingerprint:
+        datastore.RNA.attrs["dataset_fingerprint"] = original_fingerprint
+    else:
+        del datastore.RNA.attrs["dataset_fingerprint"]
 
 
 def test_load_rejects_metadata_model_and_payload_tampering(
@@ -269,9 +285,9 @@ def test_load_rejects_metadata_model_and_payload_tampering(
     original_metadata = dict(group.attrs["reference_metadata"])
 
     metadata = dict(original_metadata)
-    metadata["feature_key"] = "I"
+    metadata["unexpected"] = "value"
     group.attrs["reference_metadata"] = metadata
-    with pytest.raises(ValueError, match="removed feature-key contract"):
+    with pytest.raises(ValueError, match="current contract"):
         load_artifact_mapping_reference(datastore, reference.ref)
 
     metadata = dict(original_metadata)
@@ -348,7 +364,6 @@ def test_write_artifact_mapping_reference_persists_required_pca_arrays() -> None
         {
             "assay": "RNA",
             "method": "pca",
-            "cell_key": "I",
             "ann_metric": "l2",
             "dataset_fingerprint": "fp",
             "selected_cell_count": 2,

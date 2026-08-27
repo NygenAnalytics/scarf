@@ -1,4 +1,3 @@
-from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -13,7 +12,6 @@ from scarf.mapping.projection import (
     ProjectionWriter,
     load_projection,
     plan_projection,
-    resolve_projection,
 )
 from scarf.mapping.reference import MappingReference
 from scarf.storage.artifact_writer import (
@@ -173,7 +171,6 @@ def _mapping_reference(
         datastore=_ReferenceDatastore(root),
         ref=_artifact_ref("mapping_reference", token),
         assay_name="RNA",
-        cell_key="I",
         reduction=_artifact_ref("reduction", "1"),
         ann_index=_artifact_ref("ann_index", "2"),
         neighbors=_artifact_ref("neighbors", "3"),
@@ -206,7 +203,6 @@ def _plan(
     feature_selection: ArtifactRef,
     external: ExternalArtifactRef,
     *,
-    mapping_name: str = "atlas",
     n_cells: int = 4,
     save_k: int = 2,
     missing_feature_policy: str = "reference_mean",
@@ -216,7 +212,6 @@ def _plan(
     return plan_projection(
         root,
         query_assay="RNA",
-        mapping_name=mapping_name,
         n_cells=n_cells,
         save_k=save_k,
         missing_feature_policy=missing_feature_policy,
@@ -307,7 +302,6 @@ def test_projection_writer_persists_exact_contract_and_loads_copies() -> None:
     assert status.complete
     assert status.operation == "map_query"
     assert status.parameters == {
-        "mapping_name": "atlas",
         "save_k": 2,
         "missing_feature_policy": "reference_mean",
         "correction_method": "none",
@@ -327,16 +321,15 @@ def test_projection_writer_persists_exact_contract_and_loads_copies() -> None:
     assert "ann_metric" not in (status.parameters or {})
     assert "reference_feature_indices" not in group
 
-    metadata = load_projection(root, plan.ref)
+    metadata = load_projection(root, plan.ref, reference=reference)
     assert metadata.ref == plan.ref
-    assert metadata.mapping_name == "atlas"
     assert metadata.n_cells == 4
     assert metadata.correction_method == "none"
     assert metadata.diagnostics == _diagnostics()
     assert metadata.indices is None
     assert metadata.distances is None
     assert metadata.uninformative is None
-    assert metadata.reference is None
+    assert metadata.reference is reference
 
     loaded = load_projection(
         root,
@@ -348,7 +341,10 @@ def test_projection_writer_persists_exact_contract_and_loads_copies() -> None:
     np.testing.assert_allclose(loaded.distances, distances)
     np.testing.assert_array_equal(loaded.uninformative, uninformative)
     assert loaded.reference is reference
-    assert replace(metadata, reference=reference) == metadata
+    assert loaded.ref == metadata.ref
+    assert loaded.n_cells == metadata.n_cells
+    assert loaded.correction_method == metadata.correction_method
+    assert loaded.diagnostics == metadata.diagnostics
     assert "MappingReference" not in repr(loaded)
     assert "[[" not in repr(loaded)
     assert dict(reference_root["RNA"].attrs) == before_reference_attrs
@@ -534,7 +530,10 @@ def test_projection_writer_reuses_only_a_valid_complete_artifact() -> None:
     reused = _plan(root, cell_selection, feature_selection, reference.external_ref)
     assert reused.reused
     assert reused.ref == ref
-    assert load_projection(root, ref).diagnostics["zeroNormCellCount"] == 2
+    assert (
+        load_projection(root, ref, reference=reference).diagnostics["zeroNormCellCount"]
+        == 2
+    )
     with pytest.raises(ValueError, match="without a writer"):
         ProjectionWriter(root, reused, chunk_rows=2)
 
@@ -671,7 +670,6 @@ def _manual_projection(
         kind="projection",
         operation=operation,
         parameters={
-            "mapping_name": "atlas",
             "save_k": 2,
             "missing_feature_policy": "reference_mean",
             "correction_method": "none",
@@ -714,7 +712,7 @@ def test_projection_loader_rejects_old_and_local_reference_contracts() -> None:
 
     for ref in (old, local):
         with pytest.raises(ValueError, match="run_mapping"):
-            load_projection(root, ref)
+            load_projection(root, ref, reference=reference)
 
 
 @pytest.mark.parametrize(
@@ -745,7 +743,7 @@ def test_projection_loader_rejects_malformed_or_extra_payload(
         group.attrs["diagnostics"] = diagnostics
 
     with pytest.raises(ValueError, match="run_mapping"):
-        load_projection(root, ref)
+        load_projection(root, ref, reference=reference)
 
 
 @pytest.mark.parametrize(
@@ -834,7 +832,7 @@ def test_projection_written_without_the_dispersion_diagnostic_is_rejected() -> N
     # Projections predating the diagnostic are not silently migrated. They are
     # cheap to recompute, so the loader names the gap instead of guessing a value.
     with pytest.raises(ValueError, match="is missing queryScaledDispersion"):
-        load_projection(root, ref)
+        load_projection(root, ref, reference=reference)
 
 
 def test_projection_loader_validates_and_matches_provided_reference() -> None:
@@ -871,13 +869,22 @@ def test_projection_loader_rejects_invalid_call_and_artifact_handles() -> None:
     )
 
     with pytest.raises(TypeError, match="load_arrays must be a boolean"):
-        load_projection(root, ref, load_arrays=1)  # type: ignore[arg-type]
+        load_projection(
+            root,
+            ref,
+            reference=reference,
+            load_arrays=1,  # type: ignore[arg-type]
+        )
     with pytest.raises(TypeError, match="reference must be a MappingReference"):
         load_projection(root, ref, reference=object())  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="assay-scoped projection"):
-        load_projection(root, cell_selection)
+        load_projection(root, cell_selection, reference=reference)
     with pytest.raises(ValueError, match="missing or incomplete"):
-        load_projection(root, _artifact_ref("projection", "d"))
+        load_projection(
+            root,
+            _artifact_ref("projection", "d"),
+            reference=reference,
+        )
 
 
 @pytest.mark.parametrize(
@@ -960,81 +967,6 @@ def test_projection_loader_metadata_only_rejects_out_of_range_neighbor() -> None
         load_projection(root, ref, reference=reference)
 
 
-def test_projection_resolver_scopes_names_by_reference_and_uses_newest() -> None:
-    root, cell_selection, feature_selection = _query_inputs()
-    first_reference, _ = _mapping_reference(token="a")
-    second_reference, _ = _mapping_reference(
-        fingerprint="second-dataset",
-        token="b",
-    )
-    first_old = _write(
-        root,
-        _plan(
-            root,
-            cell_selection,
-            feature_selection,
-            first_reference.external_ref,
-            mapping_name="shared",
-        ),
-        created_at_ns=10,
-    )
-    first_new = _write(
-        root,
-        _plan(
-            root,
-            cell_selection,
-            feature_selection,
-            first_reference.external_ref,
-            mapping_name="shared",
-            invalidate_cache=True,
-        ),
-        created_at_ns=30,
-    )
-    second = _write(
-        root,
-        _plan(
-            root,
-            cell_selection,
-            feature_selection,
-            second_reference.external_ref,
-            mapping_name="shared",
-        ),
-        created_at_ns=20,
-    )
-
-    assert first_old != first_new
-    assert (
-        resolve_projection(
-            root,
-            query_assay="RNA",
-            mapping_name="shared",
-            mapping_reference=first_reference.external_ref,
-        )
-        == first_new
-    )
-    assert (
-        resolve_projection(
-            root,
-            query_assay="RNA",
-            mapping_name="shared",
-            mapping_reference=second_reference.external_ref,
-        )
-        == second
-    )
-    assert (
-        len(
-            list_artifacts(
-                root,
-                scope="assay",
-                assay="RNA",
-                kind="projection",
-                complete_only=True,
-            )
-        )
-        == 3
-    )
-
-
 def test_plan_projection_rejects_empty_string_arguments() -> None:
     root, cell_selection, feature_selection = _query_inputs()
     reference, _ = _mapping_reference()
@@ -1043,23 +975,6 @@ def test_plan_projection_rejects_empty_string_arguments() -> None:
         plan_projection(
             root,
             query_assay=" ",
-            mapping_name="atlas",
-            n_cells=4,
-            save_k=2,
-            missing_feature_policy="reference_mean",
-            correction_method="none",
-            cell_selection=cell_selection,
-            feature_selection=feature_selection,
-            selected_expression_fingerprint="e" * 64,
-            query_batch_fingerprint=NO_QUERY_BATCH_FINGERPRINT,
-            mapping_reference=reference.external_ref,
-            reference_cell_count=3,
-        )
-    with pytest.raises(TypeError, match="mapping_name must be a non-empty string"):
-        plan_projection(
-            root,
-            query_assay="RNA",
-            mapping_name="",
             n_cells=4,
             save_k=2,
             missing_feature_policy="reference_mean",
@@ -1075,7 +990,6 @@ def test_plan_projection_rejects_empty_string_arguments() -> None:
         plan_projection(
             root,
             query_assay="RNA",
-            mapping_name="atlas",
             n_cells=4,
             save_k=0,
             missing_feature_policy="reference_mean",
@@ -1197,64 +1111,6 @@ def test_load_projection_rejects_corrupt_feature_selection_with_stable_code() ->
     values[0] = not bool(values[0])
 
     with pytest.raises(ArtifactResolutionError) as caught:
-        load_projection(root, projection)
+        load_projection(root, projection, reference=reference)
 
     assert caught.value.code == "corrupt_payload"
-
-
-def test_resolve_projection_rejects_empty_mapping_name() -> None:
-    root, cell_selection, feature_selection = _query_inputs()
-    reference, _ = _mapping_reference()
-    _write(
-        root,
-        _plan(
-            root,
-            cell_selection,
-            feature_selection,
-            reference.external_ref,
-        ),
-    )
-    with pytest.raises(ValueError, match="mapping_name must be a non-empty string"):
-        resolve_projection(
-            root,
-            query_assay="RNA",
-            mapping_name="",
-            mapping_reference=reference.external_ref,
-        )
-
-
-def test_resolve_projection_rejects_missing_and_malformed_candidates() -> None:
-    root, cell_selection, feature_selection = _query_inputs()
-    reference, _ = _mapping_reference()
-    with pytest.raises(ValueError, match="No complete projection"):
-        resolve_projection(
-            root,
-            query_assay="RNA",
-            mapping_name="missing",
-            mapping_reference=reference.external_ref,
-        )
-
-    ref = _write(
-        root,
-        _plan(
-            root,
-            cell_selection,
-            feature_selection,
-            reference.external_ref,
-            mapping_name="malformed",
-        ),
-    )
-    group = artifact_group(root, ref)
-    provenance = dict(group.attrs["provenance"])
-    parameters = dict(provenance["parameters"])
-    parameters["extra"] = True
-    provenance["parameters"] = parameters
-    group.attrs["provenance"] = provenance
-
-    with pytest.raises(ValueError, match="malformed map_query parameters"):
-        resolve_projection(
-            root,
-            query_assay="RNA",
-            mapping_name="malformed",
-            mapping_reference=reference.external_ref,
-        )

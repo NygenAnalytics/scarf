@@ -5,13 +5,7 @@ import numpy as np
 
 from ...assay import RNAassay
 from ...graph.distances import validate_distance_provenance
-from ...graph.state import (
-    read_assay_state,
-    read_assay_state_document,
-    validate_normalized_artifact_selection,
-)
 from ...mapping.artifact import (
-    MAPPING_REFERENCE_REBUILD_MESSAGE,
     _selected_feature_ids,
     load_artifact_mapping_reference,
     write_artifact_mapping_reference,
@@ -33,6 +27,7 @@ from ...storage.artifacts import (
     artifact_group,
 )
 from ...storage.types import as_zarr_array
+from ...storage.selections import validate_stored_selection_integrity
 
 if TYPE_CHECKING:
     from .graph import _GraphOperationsMixin as _MappingReferenceOperationsBase
@@ -43,54 +38,28 @@ else:
 class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
     def get_mapping_reference(
         self,
-        reference: ArtifactRef | None = None,
-        *,
-        from_assay: str | None = None,
+        reference: ArtifactRef,
     ) -> MappingReference:
-        """Load one mapping reference from an explicit or named artifact."""
-        resolved: ArtifactRef | None
-        if reference is not None:
-            if not isinstance(reference, ArtifactRef):
-                raise TypeError("reference must be an ArtifactRef or None")
-            if (
-                reference.scope != "assay"
-                or reference.assay is None
-                or reference.kind != "mapping_reference"
-            ):
-                raise ValueError(
-                    "reference must identify an assay-scoped mapping_reference artifact"
-                )
-            if from_assay is not None and reference.assay != from_assay:
-                raise ValueError(
-                    f"reference belongs to assay {reference.assay!r}, not "
-                    f"{from_assay!r}"
-                )
-            resolved = reference
-        else:
-            assay_name = from_assay or self._defaultAssay
-            if assay_name is None:
-                raise ValueError("No assay was provided and no default is configured")
-            state = read_assay_state(self.zw, assay_name)
-            resolved = (
-                state.named_results.get("mapping_reference")
-                if state is not None
-                else None
+        """Load one mapping reference from an explicit artifact."""
+        if not isinstance(reference, ArtifactRef):
+            raise TypeError("reference must be an ArtifactRef")
+        if (
+            reference.scope != "assay"
+            or reference.assay is None
+            or reference.kind != "mapping_reference"
+        ):
+            raise ValueError(
+                "reference must identify an assay-scoped mapping_reference artifact"
             )
-            if resolved is None:
-                raise ValueError(
-                    "The selected assay has no mapping reference under "
-                    "AssayState.named_results. " + MAPPING_REFERENCE_REBUILD_MESSAGE
-                )
-        assert resolved is not None
-        return load_artifact_mapping_reference(self, resolved)
+        return load_artifact_mapping_reference(self, reference)
 
     def build_mapping_reference(
         self,
         neighbors: ArtifactRef,
         *,
         invalidate_cache: bool = False,
-    ) -> MappingReference:
-        """Package an existing scaled-PCA neighbor chain for mapping."""
+    ) -> ArtifactRef:
+        """Package a scaled-PCA neighbor chain as an immutable artifact."""
         if self.zarr_mode != "r+":
             raise ValueError("Building a mapping reference requires a read-write store")
         if not isinstance(neighbors, ArtifactRef):
@@ -109,8 +78,6 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
         assay = self._get_assay(assay_name)
         if not isinstance(assay, RNAassay):
             raise TypeError("Mapping references currently support RNA assays only")
-        read_assay_state_document(self.zw, assay_name)
-
         neighbors_status = self._require_complete_artifact(
             neighbors,
             "neighbors",
@@ -208,6 +175,13 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
         )
         if normalized_status.operation != "run_normalization":
             raise ValueError("Mapping references require a run_normalization artifact")
+        normalized_inputs = normalized_status.inputs or {}
+        lineage_dataset_fingerprint = normalized_inputs.get("dataset_fingerprint")
+        if (
+            not isinstance(lineage_dataset_fingerprint, str)
+            or not lineage_dataset_fingerprint
+        ):
+            raise ValueError("Normalized artifact is missing its dataset fingerprint")
         if (
             scaling_status.operation != "calculate_feature_scaling"
             or (scaling_status.parameters or {}).get("enabled") is not True
@@ -232,14 +206,13 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
             "feature_selection",
         )
 
-        normalized_execution = normalized_status.execution_options or {}
-        cell_key = normalized_execution.get("cell_key")
-        if not isinstance(cell_key, str) or not cell_key:
-            raise ValueError("Normalized artifact is missing its cell selection key")
-        validate_normalized_artifact_selection(
+        validated_cells = validate_stored_selection_integrity(
             self.zw,
-            normalized,
-            cell_key,
+            cell_selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
         )
 
         ann_metric = (ann_status.parameters or {}).get("ann_metric")
@@ -283,7 +256,7 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
         )
         if len(feature_ids) != model.n_features:
             raise ValueError("Selected reference features do not match PCA loadings")
-        selected_cell_count = len(self.cells.fetch("ids", key=cell_key))
+        selected_cell_count = validated_cells.selected_count
         if selected_cell_count < 1:
             raise ValueError("Mapping references require at least one selected cell")
         reduction_data = as_zarr_array(reduction_group["data"], name="data")
@@ -335,11 +308,21 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
 
         validate_distance_provenance(self.zw, neighbors)
         distance_quantiles, distance_values = _distance_quantile_summary(distances)
-        dataset_fingerprint = self._ensure_dataset_fingerprint(assay_name)
+        stored_dataset_fingerprint = assay.attrs.get("dataset_fingerprint")
+        live_dataset_fingerprint = (
+            stored_dataset_fingerprint
+            if isinstance(stored_dataset_fingerprint, str)
+            and stored_dataset_fingerprint
+            else self._calculate_dataset_fingerprint(assay_name)
+        )
+        if live_dataset_fingerprint != lineage_dataset_fingerprint:
+            raise ValueError(
+                "Normalized artifact does not match the current reference dataset"
+            )
+        dataset_fingerprint = lineage_dataset_fingerprint
         metadata: dict[str, Any] = {
             "method": method,
             "assay": assay_name,
-            "cell_key": cell_key,
             "selected_cell_count": selected_cell_count,
             "ann_metric": ann_metric,
             "normalization_parameters": dict(normalization_parameters),
@@ -430,12 +413,7 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
                 distance_values,
             )
             finish_artifact(group, planned)
-        self._publish_current_artifact(
-            neighbors,
-            update_state=True,
-            named_result_updates={"mapping_reference": planned.ref},
-        )
-        return load_artifact_mapping_reference(self, planned.ref)
+        return planned.ref
 
 
 def _artifact_input(

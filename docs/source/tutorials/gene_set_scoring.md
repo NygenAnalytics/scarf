@@ -31,12 +31,14 @@ These methods do not calculate enrichment p-values.
 - Read gene sets from GMT and inspect feature overlap
 - Score weighted signatures with WAGGR
 - Score rank-based signatures with AUCell
-- Load selected score columns without materializing the full result
+- Load selected score sources without materializing the full result
 
 ## Dataset
 
-This page structurally repacks the published 5K PBMC snapshot into a temporary current count store, then mounts it into a clean writable analysis target.
-Literal metadata, including the UMAP used for score plots, is retained without reusing legacy analysis state.
+This page structurally repacks the published 5K PBMC snapshot into a temporary count store with the
+required layout, then mounts it into a clean writable analysis target.
+Literal metadata, including the UMAP used for score plots, is retained while new artifacts are
+written to the mounted target.
 Signature scoring streams raw counts from `assay.rawData`, not a pre-normalized matrix or the graph.
 AUCell ranks those raw counts; WAGGR applies library-size normalization inside the scorer.
 
@@ -113,11 +115,10 @@ Signed weights are supported.
 This comparison uses the complete assay feature universe for both methods:
 
 ```{code-cell} ipython3
-ds.set_feature_selection(
+cell_selection = ds.snapshot_cell_selection('I')
+all_features = ds.set_feature_selection(
     feature_indexes=range(ds.RNA.feats.N),
-    label='all_for_scoring',
 )
-all_features = ds.resolve_features('RNA', 'all_features')
 ```
 
 ```{code-cell} ipython3
@@ -134,37 +135,37 @@ S100A8 and S100A9 carry weight 1.5; every other edge stays at 1.0.
 ```{code-cell} ipython3
 waggr = ds.run_waggr(
     weighted_sets,
+    cell_selection,
     features=all_features,
-    label='pbmc_waggr',
     mode='wmean',
     tmin=3,
-    overwrite=True,
 )
+waggr_result = ds.get_enrichment(waggr)
 waggr_scores = pd.DataFrame(
-    waggr.data.compute(),
-    columns=list(waggr.source_names),
+    waggr_result.data.compute(),
+    columns=list(waggr_result.source_names),
 )
 waggr_scores.describe().loc[['min', '50%', 'max']]
 ```
 
 Each column is one source.
 The ranges show that WAGGR tracks expression magnitude and is not confined to values between zero and one.
-The returned `EnrichmentResult.feature_selection` records the exact ranking and normalization universe.
+The loaded `EnrichmentResult.feature_selection` records the exact normalization universe.
 
 To see what the raised Myeloid weights change, run the same network with every weight at 1.0 and compare Myeloid summaries:
 
 ```{code-cell} ipython3
 waggr_unweighted = ds.run_waggr(
     gene_sets.assign(weight=1.0),
+    cell_selection,
     features=all_features,
-    label='pbmc_waggr_unweighted',
     mode='wmean',
     tmin=3,
-    overwrite=True,
 )
+waggr_unweighted_result = ds.get_enrichment(waggr_unweighted)
 unweighted_scores = pd.DataFrame(
-    waggr_unweighted.data.compute(),
-    columns=list(waggr_unweighted.source_names),
+    waggr_unweighted_result.data.compute(),
+    columns=list(waggr_unweighted_result.source_names),
 )
 pd.DataFrame(
     {
@@ -193,16 +194,16 @@ Here the `all_features` artifact ranks the complete RNA feature order.
 ```{code-cell} ipython3
 aucell = ds.run_aucell(
     gene_sets,
+    cell_selection,
     features=all_features,
-    label='pbmc_aucell',
     tmin=3,
     n_up=500,
     tie_seed=0,
-    overwrite=True,
 )
+aucell_result = ds.get_enrichment(aucell)
 aucell_scores = pd.DataFrame(
-    aucell.data.compute(),
-    columns=list(aucell.source_names),
+    aucell_result.data.compute(),
+    columns=list(aucell_result.source_names),
 )
 aucell_scores.describe().loc[['min', '50%', 'max']]
 ```
@@ -213,80 +214,50 @@ Changing `n_up`, `tie_seed`, the feature selection, or the network creates a dif
 
 ## 4. Load selected sources and visualize scores
 
-`get_enrichment` returns a lazy result.
+`get_enrichment` requires an exact enrichment ref and returns a lazy result.
 Selecting sources first avoids loading unrelated columns.
 The values below are activity scores, not p-values.
 
 ```{code-cell} ipython3
-aucell_cols = []
-for source in ['T_cell', 'B_cell', 'Myeloid']:
-    result = ds.get_enrichment('pbmc_aucell', sources=[source])
-    col = f'{source}_AUCell'
-    ds.cells.insert(
-        col,
-        result.data.compute().ravel(),
-        key=result.cell_key,
-        overwrite=True,
-    )
-    aucell_cols.append(col)
-
-present = [c for c in aucell_cols if c in ds.cells.columns]
-if present:
-    ds.plots.embedding(
-        layout_key='RNA_UMAP',
-        color_by=present,
-        n_columns=3,
-        sort_values=True,
-    )
+umap = ds.cells.to_pandas_dataframe(['RNA_UMAP1', 'RNA_UMAP2'], key='I')
+figure, axes = plt.subplots(1, 3, figsize=(12, 4))
+for axis, source in zip(axes, ['T_cell', 'B_cell', 'Myeloid'], strict=True):
+    scores = ds.get_enrichment(aucell, sources=[source]).data.compute().ravel()
+    axis.scatter(umap['RNA_UMAP1'], umap['RNA_UMAP2'], c=scores, s=3)
+    axis.set_title(f'{source} AUCell')
+figure.tight_layout()
+figure
 ```
 
 AUCell scores highlight lineage-consistent regions: T-cell, B-cell, and Myeloid scores peak in separate parts of the UMAP when those populations are present.
 
 ```{code-cell} ipython3
-waggr_cols = []
-for source in ['T_cell', 'B_cell', 'Myeloid']:
-    result = ds.get_enrichment('pbmc_waggr', sources=[source])
-    col = f'{source}_WAGGR'
-    ds.cells.insert(
-        col,
-        result.data.compute().ravel(),
-        key=result.cell_key,
-        overwrite=True,
-    )
-    waggr_cols.append(col)
-
-present = [c for c in waggr_cols if c in ds.cells.columns]
-if present:
-    ds.plots.embedding(
-        layout_key='RNA_UMAP',
-        color_by=present,
-        n_columns=3,
-        sort_values=True,
-    )
+figure, axes = plt.subplots(1, 3, figsize=(12, 4))
+for axis, source in zip(axes, ['T_cell', 'B_cell', 'Myeloid'], strict=True):
+    scores = ds.get_enrichment(waggr, sources=[source]).data.compute().ravel()
+    axis.scatter(umap['RNA_UMAP1'], umap['RNA_UMAP2'], c=scores, s=3)
+    axis.set_title(f'{source} WAGGR')
+figure.tight_layout()
+figure
 ```
 
 WAGGR marks the same lineage regions, but the color scale follows expression magnitude rather than rank recovery.
-
-```{code-cell} ipython3
-compare = [
-    c for c in ['Myeloid_WAGGR', 'Myeloid_AUCell'] if c in ds.cells.columns
-]
-if len(compare) == 2:
-    ds.plots.embedding(
-        layout_key='RNA_UMAP',
-        color_by=compare,
-        n_columns=2,
-        sort_values=True,
-    )
-```
 
 WAGGR and AUCell both mark myeloid-like cells here, but the score scales differ because one aggregates weighted expression and the other measures within-cell rank recovery.
 Quantify that difference cell by cell:
 
 ```{code-cell} ipython3
-myeloid_compare = ds.cells.to_pandas_dataframe(
-    ['Myeloid_WAGGR', 'Myeloid_AUCell'],
-    key='I',
+myeloid_compare = pd.DataFrame(
+    {
+        'Myeloid_WAGGR': ds.get_enrichment(
+            waggr,
+            sources=['Myeloid'],
+        ).data.compute().ravel(),
+        'Myeloid_AUCell': ds.get_enrichment(
+            aucell,
+            sources=['Myeloid'],
+        ).data.compute().ravel(),
+    }
 )
 myeloid_compare.describe()
 ```
@@ -319,8 +290,8 @@ Cells that rank high for Myeloid under AUCell also tend to score high under WAGG
 - Setting `tmin` above the number of targets that remain after feature matching
 - Passing an HVG selection to AUCell without intending to restrict its ranking universe
 - Comparing WAGGR runs that use different normalization or log-transform settings
-- Reusing a label for different inputs without `overwrite=True`
 - Editing the count matrix outside Scarf after a result has been cached
 
 Scarf persists each score matrix.
-Repeating an identical call reuses its completed result; `overwrite=True` keeps the previous complete result available until replacement finishes.
+Repeating an identical call reuses its completed result. `invalidate_cache=True` creates another
+immutable result without replacing the earlier one.

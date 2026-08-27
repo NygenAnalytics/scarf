@@ -16,6 +16,16 @@ from scarf.storage.artifact_writer import (
     plan_artifact,
     start_artifact,
 )
+from scarf.storage.pipeline_runs import (
+    PipelineOutputRecord,
+    PipelineStageMetrics,
+    PipelineStageOutputRecord,
+    complete_pipeline_run_record,
+    create_pipeline_run_record,
+    fail_pipeline_run_record,
+    finish_pipeline_stage_record,
+    start_pipeline_stage_record,
+)
 from scarf.storage.refs import ArtifactRef, ArtifactScope
 from scarf.writers import SparseToZarr
 
@@ -85,6 +95,19 @@ def _file_snapshot(location: Path) -> dict[str, tuple[int, int]]:
     }
 
 
+def _metrics() -> PipelineStageMetrics:
+    return PipelineStageMetrics(
+        wall_seconds=0.01,
+        rss_baseline_bytes=None,
+        rss_peak_bytes=None,
+        rss_incremental_peak_bytes=None,
+        sample_interval_seconds=0.1,
+        sample_count=0,
+        sampling_error_count=0,
+        rss_unavailable_reason="test",
+    )
+
+
 def test_summary_of_minimal_store_is_frozen_and_metadata_only(tmp_path: Path) -> None:
     datastore = _create_minimal_datastore(tmp_path / "minimal.zarr")
 
@@ -106,11 +129,109 @@ def test_summary_of_minimal_store_is_frozen_and_metadata_only(tmp_path: Path) ->
     assert summary.assays[0].assay_type == "RNA"
     assert summary.assays[0].total_features == 2
     assert summary.assays[0].active_features == 2
-    assert summary.assays[0].state is None
+    assert not hasattr(summary.assays[0], "state")
     assert summary.artifacts == ()
+    assert summary.pipeline_run_counts == {
+        "total": 0,
+        "running": 0,
+        "completed": 0,
+        "failed": 0,
+        "interrupted": 0,
+        "incomplete": 0,
+    }
+    assert summary.labeled_pipeline_runs == ()
     assert not hasattr(summary, "__dict__")
     with pytest.raises(FrozenInstanceError):
         summary.total_cells = 3  # type: ignore[misc]
+
+
+def test_summary_discovers_runs_and_labels(
+    summary_datastore: DataStore,
+) -> None:
+    artifact = _add_artifact(
+        summary_datastore,
+        scope="datastore",
+        kind="quality_metric",
+        operation="summary_root",
+        parameter=1,
+        complete=True,
+    )
+    completed = create_pipeline_run_record(
+        summary_datastore.zw,
+        recipe="basic_rna_analysis",
+        requested_label="baseline",
+        assay="RNA",
+        config={},
+        stage_order=("snapshot",),
+        scarf_version=scarf.__version__,
+        run_id="a" * 64,
+        started_at_ns=100,
+    )
+    start_pipeline_stage_record(
+        summary_datastore.zw,
+        run_id=completed.run_id,
+        ordinal=0,
+        stage="snapshot",
+        started_at_ns=110,
+    )
+    finish_pipeline_stage_record(
+        summary_datastore.zw,
+        run_id=completed.run_id,
+        ordinal=0,
+        status="completed",
+        outputs=(PipelineStageOutputRecord("root", artifact, False),),
+        metrics=_metrics(),
+        finished_at_ns=120,
+    )
+    complete_pipeline_run_record(
+        summary_datastore.zw,
+        run_id=completed.run_id,
+        outputs=(PipelineOutputRecord("root", artifact),),
+        fields=(),
+        finished_at_ns=130,
+    )
+    failed = create_pipeline_run_record(
+        summary_datastore.zw,
+        recipe="basic_rna_analysis",
+        requested_label="failed-attempt",
+        assay="RNA",
+        config={},
+        stage_order=("snapshot",),
+        scarf_version=scarf.__version__,
+        run_id="b" * 64,
+        started_at_ns=200,
+    )
+    fail_pipeline_run_record(
+        summary_datastore.zw,
+        run_id=failed.run_id,
+        error=ValueError("deliberate failure"),
+        finished_at_ns=210,
+    )
+    create_pipeline_run_record(
+        summary_datastore.zw,
+        recipe="basic_rna_analysis",
+        requested_label="interrupted",
+        assay="RNA",
+        config={},
+        stage_order=("snapshot",),
+        scarf_version=scarf.__version__,
+        run_id="c" * 64,
+        started_at_ns=300,
+    )
+    summary = summary_datastore.summary()
+
+    assert summary.pipeline_run_counts == {
+        "total": 3,
+        "running": 1,
+        "completed": 1,
+        "failed": 1,
+        "interrupted": 0,
+        "incomplete": 1,
+    }
+    assert summary.labeled_pipeline_runs == (("baseline", completed.run_id),)
+    assert summary.to_dict()["labeled_pipeline_runs"] == [
+        {"label": "baseline", "run_id": completed.run_id}
+    ]
 
 
 def test_summary_counts_selections_blockwise(

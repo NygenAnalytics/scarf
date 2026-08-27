@@ -3,11 +3,13 @@ import sys
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 import pytest
 from scipy import sparse
 
 import scarf.datastore._operations.presentation as presentation_operations
 from scarf.datastore.datastore import DataStore
+from scarf.datastore._operations.presentation import _PresentationOperationsMixin
 
 
 @pytest.fixture
@@ -43,6 +45,88 @@ def test_to_anndata_handles_missing_optional_dependency(
     assert len(messages) == 1
     assert "anndata is not installed" in messages[0]
     assert "optional dependency" in messages[0]
+
+
+def test_to_anndata_materializes_frozen_pipeline_run_views(monkeypatch) -> None:
+    from scarf.datastore import pipeline_run as pipeline_run_module
+
+    class RawMatrix:
+        def __init__(self, values):
+            self.values = np.asarray(values)
+            self.dtype = self.values.dtype
+
+        def __getitem__(self, item):
+            return RawMatrix(self.values[item])
+
+        def stream_blocks(self, **_kwargs):
+            yield self.values
+
+    class FrozenView:
+        def __init__(self, frame, selected):
+            self._frame = frame
+            self._selected = np.asarray(selected, dtype=bool)
+            self.columns = tuple(frame)
+
+        def fetch_all(self, column):
+            if column == "I":
+                return self._selected.copy()
+            return self._frame[column].to_numpy(copy=True)
+
+        def fetch(self, column):
+            return self.fetch_all(column)[self._selected]
+
+        def to_pandas_dataframe(self, columns):
+            return self._frame.loc[self._selected, list(columns)].reset_index(drop=True)
+
+    class FakePipelineRun:
+        def __init__(self, owner):
+            self._owner = owner
+            self.assay = "RNA"
+            self.cells = FrozenView(
+                pd.DataFrame(
+                    {
+                        "I": [True, False, True],
+                        "ids": ["c0", "c1", "c2"],
+                        "names": ["frozen-a", "frozen-b", "frozen-c"],
+                        "clusters": [1, 2, 1],
+                    }
+                ),
+                [True, False, True],
+            )
+            self.features = FrozenView(
+                pd.DataFrame(
+                    {
+                        "I": [False, True],
+                        "ids": ["g0", "g1"],
+                        "names": ["frozen-g0", "frozen-g1"],
+                    }
+                ),
+                [False, True],
+            )
+
+    store = _PresentationOperationsMixin()
+    assay = SimpleNamespace(
+        name="RNA",
+        nthreads=1,
+        rawData=RawMatrix([[1, 2], [3, 4], [5, 6]]),
+    )
+    store._get_assay = lambda name: assay
+    monkeypatch.setattr(pipeline_run_module, "PipelineRun", FakePipelineRun)
+    run = FakePipelineRun(store)
+
+    exported = store.to_anndata(run=run)
+
+    np.testing.assert_array_equal(exported.X.toarray(), [[2], [6]])
+    assert list(exported.obs_names) == ["c0", "c2"]
+    assert exported.obs["names"].tolist() == ["frozen-a", "frozen-c"]
+    assert exported.obs["clusters"].tolist() == [1, 1]
+    assert list(exported.var_names) == ["g1"]
+    assert exported.var["names"].tolist() == ["frozen-g1"]
+
+    with pytest.raises(ValueError, match="frozen run selection"):
+        store.to_anndata(run=run, cell_key="I")
+    with pytest.raises(ValueError, match="feature selection"):
+        store.to_anndata(run=run, feature_indexes=[0])
 
 
 def test_to_anndata_exports_empty_normed_cell_selection(export_store) -> None:

@@ -105,18 +105,13 @@ class QueryCorrection:
 @dataclass(frozen=True)
 class MappingResult:
     ref: ArtifactRef
-    mapping_name: str
     n_cells: int
     correction_method: str
     diagnostics: dict[str, float | int | str]
+    reference: "MappingReference" = field(repr=False, compare=False)
     indices: np.ndarray | None = None
     distances: np.ndarray | None = None
     uninformative: np.ndarray | None = None
-    reference: "MappingReference | None" = field(
-        default=None,
-        repr=False,
-        compare=False,
-    )
 
     def __repr__(self) -> str:
         loaded = [
@@ -126,7 +121,6 @@ class MappingResult:
         ]
         return (
             f"MappingResult(ref={self.ref!r}, "
-            f"mapping_name={self.mapping_name!r}, "
             f"n_cells={self.n_cells}, "
             f"correction_method={self.correction_method!r}, "
             f"diagnostics={self.diagnostics!r}, "

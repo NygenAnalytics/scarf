@@ -26,6 +26,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 import scarf
@@ -52,35 +53,24 @@ ds = scarf.mount_datastore(
     default_assay="RNA",
     nthreads=4,
 )
-ds.pipeline.run(
+baseline = ds.pipeline.run(
+    label="uncorrected",
     filtering=False,
-    cell_cycle_scoring=False,
-    highly_variable_features={
-        "min_cells": 10,
-        "top_n": 2000,
-        "min_mean": -3,
-        "max_mean": 2,
-        "max_var": 6,
-    },
-    pca={"dims": 25},
-    neighbors={"k": 21},
-    umap={
-        "n_epochs": 250,
-        "spread": 5,
-        "min_dist": 1,
-        "parallel": True,
-    },
-    leiden={1.0: {"label": "integration_clusters"}},
+    cell_cycle=False,
+    hvg_count=2000,
+    pca_dims=25,
+    neighbors_k=21,
+    leiden={"partitions": (1.0,)},
     paris=False,
-    doublet_scoring=False,
+    doublets=False,
     markers=False,
+    snapshot_columns=("sample_id", "orig_cluster_labels"),
 )
 
-baseline = ds.get_assay_state("RNA")
-normalized = baseline.normalized
-pca_full = baseline.reduction
-uncorrected_neighbors = baseline.neighbors
-uncorrected_graph = baseline.connectivity_map
+normalized = baseline["normalized"]
+pca_full = baseline["pca"]
+uncorrected_neighbors = baseline["neighbors"]
+uncorrected_graph = baseline["connectivity_map"]
 
 
 def integration_scores(neighbors, graph):
@@ -110,23 +100,35 @@ scores = {
 }
 ```
 
+The run remains immutable and artifact-only. Its requested metadata and result fields stay in the
+frozen run view; no live layout or cluster columns are created.
+
 The baseline artifacts fix the active cells, highly variable features, full PCA, and 21-neighbour graph used by every comparison below.
 Source identity and imported cell types on the uncorrected UMAP show the defect this page aims to reduce.
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by=["sample_id", "orig_cluster_labels"],
-    n_columns=2,
-)
+figure, axes = plt.subplots(1, 2, figsize=(10, 4))
+for axis, color_by in zip(
+    axes,
+    ("sample_id", "orig_cluster_labels"),
+    strict=True,
+):
+    ds.plots.embedding(
+        run=baseline,
+        layout="umap",
+        color_by=color_by,
+        target=axis,
+        show=False,
+    )
+figure.tight_layout()
+figure
 ```
 
 ```{code-cell} ipython3
-ds.plots.composition(
-    category_by="sample_id",
-    sample_by="RNA_clusters",
-    kind="stacked",
-    show_percent_labels=True,
+pd.crosstab(
+    baseline.cells.fetch("clusters"),
+    baseline.cells.fetch("sample_id"),
+    normalize="index",
 )
 ```
 
@@ -141,23 +143,24 @@ pd.Series(scores["Uncorrected"]).round(3).rename("Uncorrected")
 
 ## 1. Learn PCA from a reference subset
 
-Partial PCA learns its loading basis from cells selected by `pca_cell_key`, then projects every active cell into that basis.
+`pca_cell_selection` is an explicit immutable subset of the cells represented by the normalized artifact.
+PCA fits its loading basis on that subset, then projects every cell represented by `normalized` into the same basis.
 Here the control cells define the reference space.
 Signals absent from the control subset contribute less to the resulting graph.
 
 ```{code-cell} ipython3
+baseline_active = baseline.cells.fetch_all("I").astype(bool)
+is_ctrl = baseline_active & (baseline.cells.fetch_all("sample_id") == "ctrl")
 ds.cells.insert(
     column_name="is_ctrl",
-    values=ds.cells.fetch_all("sample_id") == "ctrl",
+    values=is_ctrl,
     overwrite=True,
 )
-active = ds.cells.fetch_all("I").astype(bool)
-is_ctrl = ds.cells.fetch_all("is_ctrl")
 pd.Series(
     {
-        "active cells": int(active.sum()),
-        "reference (is_ctrl)": int(is_ctrl[active].sum()),
-        "reference fraction": round(float(is_ctrl[active].mean()), 3),
+        "active cells": int(baseline_active.sum()),
+        "reference (is_ctrl)": int(is_ctrl.sum()),
+        "reference fraction": round(float(is_ctrl[baseline_active].mean()), 3),
     }
 )
 ```
@@ -166,26 +169,25 @@ pd.Series(
 pca_partial = ds.run_pca(
     normalized,
     dims=25,
-    pca_cell_key="is_ctrl",
+    pca_cell_selection=ds.snapshot_cell_selection(cell_key="is_ctrl"),
 )
-ds.build_embedding_initialization(pca_partial)
+partial_initialization = ds.build_embedding_initialization(pca_partial)
 partial_neighbors = ds.query_neighbors(
     ds.build_ann_index(pca_partial),
     k=21,
 )
 partial_graph = ds.build_connectivity_map(partial_neighbors)
-ds.run_umap(
-    graph=partial_graph,
+partial_umap = ds.run_umap(
+    partial_graph,
+    partial_initialization,
     n_epochs=250,
     spread=5,
     min_dist=1,
     parallel=True,
-    label="partial_UMAP",
 )
-ds.run_leiden_clustering(
-    graph=partial_graph,
+partial_clusters = ds.run_leiden_clustering(
+    partial_graph,
     resolution=1.0,
-    label="partial_clusters",
 )
 scores["Partial PCA"] = integration_scores(
     partial_neighbors,
@@ -194,10 +196,9 @@ scores["Partial PCA"] = integration_scores(
 ```
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key="RNA_partial_UMAP",
-    color_by=["sample_id", "orig_cluster_labels"],
-    n_columns=2,
+partial_umap_values = np.asarray(ds.load_artifact(partial_umap)["values"][:])
+partial_cluster_values = np.asarray(
+    ds.load_artifact(partial_clusters)["values"][:]
 )
 ```
 
@@ -213,25 +214,24 @@ Treat each supplied column as variation to remove.
 Do not use a biological condition that the downstream analysis needs to retain.
 
 ```{code-cell} ipython3
-corrected = ds.run_harmony(["sample_id"], pca_full)
-ds.build_embedding_initialization(pca_full)
+corrected = ds.run_harmony(pca_full, ["sample_id"])
+harmony_initialization = ds.build_embedding_initialization(corrected)
 harmony_neighbors = ds.query_neighbors(
     ds.build_ann_index(corrected),
     k=21,
 )
 harmony_graph = ds.build_connectivity_map(harmony_neighbors)
-ds.run_umap(
-    graph=harmony_graph,
+harmony_umap = ds.run_umap(
+    harmony_graph,
+    harmony_initialization,
     n_epochs=250,
     spread=5,
     min_dist=1,
     parallel=True,
-    label="harmony_UMAP",
 )
-ds.run_leiden_clustering(
-    graph=harmony_graph,
+harmony_clusters = ds.run_leiden_clustering(
+    harmony_graph,
     resolution=1.0,
-    label="harmony_clusters",
 )
 scores["Harmony"] = integration_scores(
     harmony_neighbors,
@@ -240,89 +240,78 @@ scores["Harmony"] = integration_scores(
 ```
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key="RNA_harmony_UMAP",
-    color_by=["sample_id", "orig_cluster_labels"],
-    n_columns=2,
+harmony_umap_values = np.asarray(ds.load_artifact(harmony_umap)["values"][:])
+harmony_cluster_values = np.asarray(
+    ds.load_artifact(harmony_clusters)["values"][:]
 )
 ```
 
 ## 3. Compare the three graphs
 
-The plotting facade accepts several layouts directly, so the comparison does not need a custom Matplotlib helper.
-Panels appear in uncorrected, partial-PCA, and Harmony order.
+Read the three exact embedding refs and place them in uncorrected, partial-PCA, and Harmony order.
 
 ```{code-cell} ipython3
-layouts = [
-    "RNA_UMAP",
-    "RNA_partial_UMAP",
-    "RNA_harmony_UMAP",
-]
-ds.plots.embedding(
-    layout_key=layouts,
-    color_by="sample_id",
-    n_columns=3,
-    legend_loc="right",
+baseline_frame = baseline.cells.to_pandas_dataframe(
+    ["umap_1", "umap_2", "sample_id", "orig_cluster_labels", "clusters"]
 )
+baseline_umap_values = baseline_frame[["umap_1", "umap_2"]].to_numpy()
+layout_values = (baseline_umap_values, partial_umap_values, harmony_umap_values)
+sample_codes = pd.factorize(baseline_frame["sample_id"])[0]
+
+figure, axes = plt.subplots(1, 3, figsize=(12, 4))
+for axis, coordinates, title in zip(
+    axes,
+    layout_values,
+    ("Uncorrected", "Partial PCA", "Harmony"),
+    strict=True,
+):
+    axis.scatter(coordinates[:, 0], coordinates[:, 1], c=sample_codes, s=3)
+    axis.set_title(title)
+figure.tight_layout()
+figure
 ```
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key=layouts,
-    color_by="orig_cluster_labels",
-    n_columns=3,
-    legend_loc="right",
-)
+label_codes = pd.factorize(baseline_frame["orig_cluster_labels"])[0]
+figure, axes = plt.subplots(1, 3, figsize=(12, 4))
+for axis, coordinates, title in zip(
+    axes,
+    layout_values,
+    ("Uncorrected", "Partial PCA", "Harmony"),
+    strict=True,
+):
+    axis.scatter(coordinates[:, 0], coordinates[:, 1], c=label_codes, s=3)
+    axis.set_title(title)
+figure.tight_layout()
+figure
 ```
 
-Each method also writes its own Leiden partition.
+Each method also creates its own Leiden label artifact.
 Plotting those labels on the matching layout links the composition bars below to geography on the page.
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 3, figsize=(12, 4))
 cluster_panels = (
-    ("Uncorrected", "RNA_UMAP", "RNA_clusters"),
-    ("Partial PCA", "RNA_partial_UMAP", "RNA_partial_clusters"),
-    ("Harmony", "RNA_harmony_UMAP", "RNA_harmony_clusters"),
+    ("Uncorrected", baseline_umap_values, baseline_frame["clusters"].to_numpy()),
+    ("Partial PCA", partial_umap_values, partial_cluster_values),
+    ("Harmony", harmony_umap_values, harmony_cluster_values),
 )
-for axis, (title, layout_key, color_by) in zip(
+for axis, (title, coordinates, values) in zip(
     axes, cluster_panels, strict=True
 ):
-    ds.plots.embedding(
-        layout_key=layout_key,
-        color_by=color_by,
-        legend_loc="on_data",
-        show_titles=False,
-        target=axis,
-        show=False,
-    )
+    axis.scatter(coordinates[:, 0], coordinates[:, 1], c=values, s=3)
     axis.set_title(title)
 figure.tight_layout()
 figure
 ```
 
 ```{code-cell} ipython3
-figure, axes = plt.subplots(1, 3, figsize=(14, 4))
-composition_panels = (
-    ("Uncorrected", "RNA_clusters"),
-    ("Partial PCA", "RNA_partial_clusters"),
-    ("Harmony", "RNA_harmony_clusters"),
+pd.concat(
+    {
+        title: pd.crosstab(values, baseline_frame["sample_id"], normalize="index")
+        for title, _coordinates, values in cluster_panels
+    }
 )
-for index, (axis, (title, sample_by)) in enumerate(
-    zip(axes, composition_panels, strict=True)
-):
-    ds.plots.composition(
-        category_by="sample_id",
-        sample_by=sample_by,
-        kind="stacked",
-        show_percent_labels=True,
-        show_legend=index == 2,
-        target=axis,
-        show=False,
-    )
-    axis.set_title(title)
-figure.tight_layout()
-figure
 ```
 
 ## 4. Treatment response is not batch structure
@@ -332,16 +321,6 @@ The two Kang sources are also the control and interferon beta treatment groups.
 Default `plots.embedding` and `plots.distribution` use assay-normalized expression via `NormalizationSpec(source="assay")` (library-size normalized through `assay.normed()`), not raw counts; use `source="raw"` for counts.
 Coloring uncorrected and Harmony layouts with those same values shows that Harmony moves cells while expression itself is unchanged.
 Source mixing on the graph is therefore not the same question as removing a treatment effect from the counts.
-
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key=["RNA_UMAP", "RNA_harmony_UMAP"],
-    color_by="ISG15",
-    n_columns=2,
-    sort_values=True,
-    legend_loc="right",
-)
-```
 
 ```{code-cell} ipython3
 ds.plots.distribution(

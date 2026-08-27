@@ -18,8 +18,8 @@ def test_tiff_export_exact_size_and_provenance_sidecar(
 ):
     result = splt.embedding(
         datastore,
-        layout_key="RNA_UMAP",
-        color_by="RNA_leiden_cluster",
+        layout=umap,
+        color_by=leiden_clustering,
         figsize=(3.0, 2.0),
         show=False,
     )
@@ -35,14 +35,14 @@ def test_tiff_export_exact_size_and_provenance_sidecar(
     sidecar = tmp_path / "figure.tiff.json"
     payload = json.loads(sidecar.read_text())
     assert payload["provenance"]["renderer"] == "matplotlib"
-    assert payload["provenance"]["n_cells"] == len(datastore.cells.active_index("I"))
+    assert payload["provenance"]["n_cells"] == result.provenance.n_cells
     assert payload["figure"]["width_inches"] == pytest.approx(3.0)
     assert payload["export"] == {
         "dpi": 120.0,
         "filename": "figure.tiff",
         "format": "tiff",
     }
-    assert "RNA_leiden_cluster" in payload["legends"][0]["label"]
+    assert "cluster" in payload["legends"][0]["label"]
     result.close()
 
 
@@ -51,7 +51,7 @@ def test_svg_export_preserves_physical_size_under_tight_global_setting(
 ):
     result = splt.embedding(
         datastore,
-        layout_key="RNA_UMAP",
+        layout=umap,
         figsize=(3.0, 2.0),
         show=False,
     )
@@ -69,8 +69,8 @@ def test_save_provenance_handles_numpy_values(
 ):
     result = splt.embedding(
         datastore,
-        layout_key="RNA_UMAP",
-        color_by="RNA_leiden_cluster",
+        layout=umap,
+        color_by=leiden_clustering,
         show=False,
     )
     result.provenance.extras["array"] = np.array([1, 2], dtype=np.int64)
@@ -85,7 +85,7 @@ def test_save_provenance_handles_numpy_values(
 def test_export_validates_extension_and_dpi(umap, datastore, tmp_path):
     result = splt.embedding(
         datastore,
-        layout_key="RNA_UMAP",
+        layout=umap,
         show=False,
     )
     with pytest.raises(ValueError, match="file extension"):
@@ -102,13 +102,13 @@ def test_export_validates_extension_and_dpi(umap, datastore, tmp_path):
 def test_embedding_rasterization_threshold(umap, datastore):
     vector = splt.embedding(
         datastore,
-        layout_key="RNA_UMAP",
+        layout=umap,
         rasterize_threshold=10**9,
         show=False,
     )
     rasterized = splt.embedding(
         datastore,
-        layout_key="RNA_UMAP",
+        layout=umap,
         rasterize_threshold=0,
         show=False,
     )

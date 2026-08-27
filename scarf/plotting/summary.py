@@ -7,6 +7,8 @@ from typing import Any, Hashable
 import numpy as np
 import pandas as pd
 
+from ..storage.artifacts import ArtifactRef
+
 from ._contracts import (
     CategoricalScale,
     ColorScale,
@@ -16,7 +18,12 @@ from ._contracts import (
     SizeScale,
     StudyDesign,
 )
-from ._data import coerce_feature_list, resolve_feature, summarize_features_by_group
+from ._data import (
+    _resolve_grouping,
+    coerce_feature_list,
+    resolve_feature,
+    summarize_features_by_group,
+)
 from ._deps import require_matplotlib
 from ._display import resolve_categorical_scale
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
@@ -224,13 +231,18 @@ def _sample_counts(
     store: Any,
     *,
     cell_key: str,
+    cell_indices: np.ndarray | None,
     sample_by: str | None,
     study_design: StudyDesign | None,
 ) -> tuple[int | None, int]:
     sample_key = study_design.sample_by if study_design is not None else sample_by
     if sample_key is None:
         return None, 0
-    values = np.asarray(store.cells.fetch(sample_key, key=cell_key), dtype=object)
+    values = (
+        np.asarray(store.cells.fetch(sample_key, key=cell_key), dtype=object)
+        if cell_indices is None
+        else np.asarray(store.cells.fetch_all(sample_key), dtype=object)[cell_indices]
+    )
     valid = pd.notna(values) & (values != "")
     return int(pd.Series(values[valid]).nunique()), int((~valid).sum())
 
@@ -255,7 +267,8 @@ def dotplot(
     store: Any,
     *,
     features: Sequence[str | FeatureRef] | Mapping[str, Sequence[str | FeatureRef]],
-    group_by: str | tuple[str, ...],
+    group_by: str | tuple[str, ...] | None = None,
+    groups: ArtifactRef | None = None,
     cell_key: str = "I",
     from_assay: str | None = None,
     sample_by: str | None = None,
@@ -296,6 +309,12 @@ def dotplot(
         raise NotImplementedError("dotplot currently supports only linear color scales")
     size_scale_is_explicit = size_scale is not None
     normalization = normalization or NormalizationSpec()
+    group_keys, cell_indices, _group_values = _resolve_grouping(
+        store,
+        group_by=group_by,
+        groups=groups,
+        cell_key=cell_key,
+    )
     if marker_linewidth < 0:
         raise ValueError("marker_linewidth must be non-negative")
     if isinstance(group_by, str):
@@ -315,6 +334,7 @@ def dotplot(
         store,
         features=features,
         group_by=group_by,
+        groups=groups,
         cell_key=cell_key,
         from_assay=from_assay,
         sample_by=sample_by,
@@ -327,7 +347,6 @@ def dotplot(
     elif standardize not in ("none", "feature"):
         raise ValueError("standardize must be 'none' or 'feature'")
 
-    group_keys = (group_by,) if isinstance(group_by, str) else tuple(group_by)
     plot_df = aggregate.copy()
     plot_df["group_label"] = _group_axis_labels(plot_df, group_keys)
     # Preserve feature order from input
@@ -563,6 +582,7 @@ def dotplot(
     n_samples, dropped_sample_cells = _sample_counts(
         store,
         cell_key=cell_key,
+        cell_indices=cell_indices if groups is not None else None,
         sample_by=sample_by,
         study_design=study_design,
     )
@@ -616,13 +636,14 @@ def dotplot(
         ),
         provenance=PlotProvenance(
             assay=next(iter(assays)) if len(assays) == 1 else None,
-            cell_key=cell_key,
-            n_cells=len(store.cells.active_index(cell_key)),
+            cell_key=cell_key if groups is None else None,
+            n_cells=len(cell_indices),
             n_samples=n_samples,
             renderer="matplotlib",
             notes=("dotplot",),
             extras={
-                "group_by": list(group_keys),
+                "group_by": list(group_keys) if groups is None else None,
+                "groups": groups.to_dict() if groups is not None else None,
                 "sample_by": (
                     study_design.sample_by if study_design is not None else sample_by
                 ),
@@ -655,7 +676,8 @@ def matrixplot(
     store: Any,
     *,
     features: Sequence[str | FeatureRef] | Mapping[str, Sequence[str | FeatureRef]],
-    group_by: str | tuple[str, ...],
+    group_by: str | tuple[str, ...] | None = None,
+    groups: ArtifactRef | None = None,
     cell_key: str = "I",
     from_assay: str | None = None,
     sample_by: str | None = None,
@@ -705,11 +727,18 @@ def matrixplot(
             "matrixplot currently supports only linear color scales"
         )
     normalization = normalization or NormalizationSpec()
+    group_keys, cell_indices, _group_values = _resolve_grouping(
+        store,
+        group_by=group_by,
+        groups=groups,
+        cell_key=cell_key,
+    )
 
     aggregate, per_sample = summarize_features_by_group(
         store,
         features=features,
         group_by=group_by,
+        groups=groups,
         cell_key=cell_key,
         from_assay=from_assay,
         sample_by=sample_by,
@@ -723,7 +752,6 @@ def matrixplot(
     elif standardize not in ("none", "feature"):
         raise ValueError("standardize must be 'none' or 'feature'")
 
-    group_keys = (group_by,) if isinstance(group_by, str) else tuple(group_by)
     plot_df["group_label"] = _group_axis_labels(plot_df, group_keys)
     requested_feature_order = list(
         dict.fromkeys(
@@ -900,6 +928,7 @@ def matrixplot(
     n_samples, dropped_sample_cells = _sample_counts(
         store,
         cell_key=cell_key,
+        cell_indices=cell_indices if groups is not None else None,
         sample_by=sample_by,
         study_design=study_design,
     )
@@ -924,13 +953,14 @@ def matrixplot(
         scales=(color_scale, *resolved_annotation_scales),
         provenance=PlotProvenance(
             assay=next(iter(assays)) if len(assays) == 1 else None,
-            cell_key=cell_key,
-            n_cells=len(store.cells.active_index(cell_key)),
+            cell_key=cell_key if groups is None else None,
+            n_cells=len(cell_indices),
             n_samples=n_samples,
             renderer="matplotlib",
             notes=("matrixplot", value),
             extras={
-                "group_by": list(group_keys),
+                "group_by": list(group_keys) if groups is None else None,
+                "groups": groups.to_dict() if groups is not None else None,
                 "sample_by": (
                     study_design.sample_by if study_design is not None else sample_by
                 ),

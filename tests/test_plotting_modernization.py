@@ -13,6 +13,21 @@ import matplotlib.pyplot as plt
 
 import scarf.plotting as splt
 from scarf.plotting._style import default_point_size, resolve_legend_loc
+from scarf.storage import ArtifactRef
+from scarf.storage.selections import read_stored_selection_indices
+
+
+def _artifact_cell_indices(store, ref: ArtifactRef) -> np.ndarray:
+    status = store.inspect_artifact(ref)
+    selection = ArtifactRef.from_dict(status.inputs["cell_selection"])
+    return read_stored_selection_indices(
+        store.zw,
+        selection,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+    )
 
 
 class _SyntheticCells:
@@ -79,7 +94,7 @@ def test_embedding_density_highlight_and_labeled_colorbar(umap, datastore):
 
     result = splt.embedding(
         datastore,
-        layout_key="RNA_UMAP",
+        layout=umap,
         color_by="RNA_nCounts",
         density_overlay=splt.DensityOverlay(pixels=32, levels=3, sigma=1),
         highlight=splt.Highlight(by="plot_highlight"),
@@ -90,7 +105,10 @@ def test_embedding_density_highlight_and_labeled_colorbar(umap, datastore):
 
     ax = next(iter(result.axes.values()))
     assert len(ax.collections) >= 3
-    assert result.provenance.extras["highlight"]["n_highlighted"] == highlighted.sum()
+    selected = _artifact_cell_indices(datastore, umap)
+    assert result.provenance.extras["highlight"]["n_highlighted"] == int(
+        highlighted[selected].sum()
+    )
     assert all(
         2 <= value <= 20
         for value in result.provenance.extras["point_size_by_panel"].values()
@@ -109,7 +127,7 @@ def test_embedding_mean_contours_require_and_use_continuous_values(
 ):
     result = splt.embedding(
         datastore,
-        layout_key="RNA_UMAP",
+        layout=umap,
         color_by="RNA_nCounts",
         density_overlay=splt.DensityOverlay(
             statistic="mean",
@@ -131,7 +149,7 @@ def test_embedding_mean_contours_require_and_use_continuous_values(
     with pytest.raises(ValueError, match="continuous color_by"):
         splt.embedding(
             datastore,
-            layout_key="RNA_UMAP",
+            layout=umap,
             color_by=splt.CellField("I", kind="categorical"),
             density_overlay=splt.DensityOverlay(statistic="mean"),
             show=False,
@@ -168,7 +186,7 @@ def test_contour_hotspot_limit_keeps_the_strongest_region():
 def test_embedding_point_size_uses_final_panel_area(umap, datastore):
     result = splt.embedding(
         datastore,
-        layout_key="RNA_UMAP",
+        layout=umap,
         color_by="RNA_nCounts",
         point_size_range=(2, 20),
         show=False,
@@ -180,7 +198,7 @@ def test_embedding_point_size_uses_final_panel_area(umap, datastore):
     width, height = result.figure.get_size_inches()
     panel_area = float(bbox.width * width * bbox.height * height)
     expected = default_point_size(
-        len(datastore.cells.active_index("I")),
+        result.provenance.extras["input_n_cells"],
         panel_area=panel_area,
         size_min=2,
         size_max=20,
@@ -693,7 +711,7 @@ def test_imported_embedding_reuse_guard_and_validator_reject_damage():
         _payloads_match,
         validate_imported_embedding_artifact,
     )
-    from scarf.graph.state import ImportedArtifactStorage
+    from scarf.graph.imported_storage import ImportedArtifactStorage
     from scarf.storage.artifacts import fingerprint_array
     from tests.test_imported_coordinates import (
         _root_with_selection,
@@ -755,7 +773,7 @@ def test_dotplot_feature_brackets_and_axis_swap(umap, leiden_clustering, datasto
     result = splt.dotplot(
         datastore,
         features=features,
-        group_by="RNA_leiden_cluster",
+        groups=leiden_clustering,
         swap_axes=True,
         marker_linewidth=0.6,
         show=False,
@@ -781,7 +799,7 @@ def test_dotplot_marker_sizes_follow_physical_grid_cells(
     compact = splt.dotplot(
         datastore,
         features=features,
-        group_by="RNA_leiden_cluster",
+        groups=leiden_clustering,
         target=compact_ax,
         show_legend=False,
         show=False,
@@ -789,7 +807,7 @@ def test_dotplot_marker_sizes_follow_physical_grid_cells(
     large = splt.dotplot(
         datastore,
         features=features,
-        group_by="RNA_leiden_cluster",
+        groups=leiden_clustering,
         target=large_ax,
         show_legend=False,
         show=False,
@@ -829,7 +847,7 @@ def test_dotplot_left_group_labels_clear_feature_tick_labels(
     result = splt.dotplot(
         datastore,
         features={"Myeloid lineage": genes[:2], "Cell state": genes[2:]},
-        group_by="RNA_leiden_cluster",
+        groups=leiden_clustering,
         show_legend=False,
         show=False,
     )
@@ -857,7 +875,7 @@ def test_stacked_violin_standardizes_rows(umap, leiden_clustering, datastore):
     result = splt.distribution(
         datastore,
         keys=genes,
-        group_by="RNA_leiden_cluster",
+        grouping=leiden_clustering,
         kind="stacked_violin",
         row_standardize=True,
         max_points=0,
@@ -871,12 +889,54 @@ def test_stacked_violin_standardizes_rows(umap, leiden_clustering, datastore):
     result.close()
 
 
+def test_distribution_reads_cell_cycle_scores_from_exact_artifact(
+    cell_cycle_scoring,
+    leiden_clustering,
+    datastore,
+):
+    result = splt.distribution(
+        datastore,
+        keys=cell_cycle_scoring,
+        grouping=leiden_clustering,
+        kind="box",
+        max_points=0,
+        show=False,
+    )
+
+    assert set(result.tables) == {"s_score", "g2m_score"}
+    assert all(
+        len(table) == len(_artifact_cell_indices(datastore, cell_cycle_scoring))
+        for table in result.tables.values()
+    )
+    assert result.provenance.cell_key is None
+    assert result.provenance.assay is None
+    assert result.provenance.extras["values"] == cell_cycle_scoring.to_dict()
+    assert result.provenance.extras["grouping"] == leiden_clustering.to_dict()
+    assert result.provenance.extras["normalization"] is None
+    result.close()
+
+
+def test_distribution_rejects_non_cell_cycle_or_mixed_value_artifacts(
+    cell_cycle_scoring,
+    leiden_clustering,
+    datastore,
+):
+    with pytest.raises(ValueError, match="assay-scoped cell_cycle"):
+        splt.distribution(datastore, keys=leiden_clustering, show=False)
+    with pytest.raises(TypeError, match="complete keys argument"):
+        splt.distribution(
+            datastore,
+            keys=["RNA_nCounts", cell_cycle_scoring],  # type: ignore[list-item]
+            show=False,
+        )
+
+
 def test_stacked_violin_can_share_value_scale(umap, leiden_clustering, datastore):
     genes = [str(value) for value in datastore.RNA.feats.fetch_all("names")[:2]]
     result = splt.distribution(
         datastore,
         keys=genes,
-        group_by="RNA_leiden_cluster",
+        grouping=leiden_clustering,
         kind="stacked_violin",
         share_y=True,
         max_points=0,
@@ -901,7 +961,7 @@ def test_distribution_aggregates_biological_samples(
     result = splt.distribution(
         datastore,
         keys="RNA_nCounts",
-        group_by="RNA_leiden_cluster",
+        grouping=leiden_clustering,
         sample_by="plot_distribution_sample",
         sample_stat="median",
         kind="box",
@@ -932,7 +992,7 @@ def test_distribution_draws_sample_aware_split_violins(
     result = splt.distribution(
         datastore,
         keys="RNA_nCounts",
-        group_by="RNA_leiden_cluster",
+        grouping=leiden_clustering,
         split_by="plot_split_condition",
         study_design=splt.StudyDesign(sample_by="plot_split_sample"),
         kind="violin",
@@ -956,7 +1016,7 @@ def test_distribution_seed_repeats_point_jitter(
 ):
     kwargs = {
         "keys": "RNA_nCounts",
-        "group_by": "RNA_leiden_cluster",
+        "grouping": leiden_clustering,
         "kind": "box",
         "max_points": 80,
         "seed": 17,
@@ -1020,7 +1080,7 @@ def test_per_sample_composition_reports_uncertainty(
 
     result = splt.composition(
         datastore,
-        category_by="RNA_leiden_cluster",
+        categories=leiden_clustering,
         study_design=splt.StudyDesign(
             sample_by="plot_ci_sample",
             condition_by="plot_ci_condition",
@@ -1063,12 +1123,13 @@ def test_embedding_side_legend_stays_page_sized_for_many_categories(
 ):
     n = len(datastore.cells.active_index("I"))
     labels = np.full(n, "type_149", dtype=object)
-    labels[:149] = [f"type_{index:03d}" for index in range(149)]
+    selected = _artifact_cell_indices(datastore, umap)
+    labels[selected[:149]] = [f"type_{index:03d}" for index in range(149)]
     datastore.cells.insert("plot_many_types", labels, overwrite=True)
 
     result = splt.embedding(
         datastore,
-        layout_key="RNA_UMAP",
+        layout=umap,
         color_by="plot_many_types",
         legend_loc="right",
         show=False,
@@ -1089,18 +1150,20 @@ def test_embedding_side_legend_stays_page_sized_for_many_categories(
 def test_cluster_connectivity_runs_on_real_datastore_graph(
     umap,
     leiden_clustering,
+    connectivity_graph,
     datastore,
 ):
     result = datastore.plots.cluster_connectivity(
-        group_by="RNA_leiden_cluster",
-        layout_key="RNA_UMAP",
+        groups=leiden_clustering,
+        layout=umap,
+        graph=connectivity_graph,
         minimum_edge_weight=0,
         max_edges_per_node=3,
         show_cells=True,
         show=False,
     )
 
-    observed = len(np.unique(datastore.cells.fetch("RNA_leiden_cluster", key="I")))
+    observed = len(result.tables["nodes"])
     assert len(result.tables["nodes"]) == observed
     assert set(result.tables["edges"]) == {
         "source",
@@ -1129,14 +1192,14 @@ def test_composition_borders_labels_and_stored_palette(
 
     embedding = splt.embedding(
         datastore,
-        layout_key="RNA_UMAP",
-        color_by="RNA_leiden_cluster",
+        layout=umap,
+        color_by=leiden_clustering,
         show_legend=False,
         show=False,
     )
     composition = splt.composition(
         datastore,
-        category_by="RNA_leiden_cluster",
+        categories=leiden_clustering,
         sample_by="plot_modern_samples",
         segment_linewidth=0.8,
         show_percent_labels=True,
@@ -1161,6 +1224,46 @@ def test_composition_borders_labels_and_stored_palette(
     composition.close()
 
 
+def test_composition_uses_two_exact_artifact_axes(
+    cell_cycle_scoring,
+    leiden_clustering,
+    datastore,
+):
+    result = splt.composition(
+        datastore,
+        categories=cell_cycle_scoring,
+        grouping=leiden_clustering,
+        kind="stacked",
+        show=False,
+    )
+
+    assert "per_group" in result.tables
+    assert "per_sample" not in result.tables
+    assert result.provenance.cell_key is None
+    assert result.provenance.n_samples is None
+    assert result.provenance.extras["categories"] == cell_cycle_scoring.to_dict()
+    assert result.provenance.extras["grouping"] == leiden_clustering.to_dict()
+    assert result.axes["composition"].get_xlabel() == "grouping"
+    result.close()
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        splt.composition(
+            datastore,
+            categories=cell_cycle_scoring,
+            grouping=leiden_clustering,
+            sample_by="RNA_nCounts",
+            show=False,
+        )
+    with pytest.raises(ValueError, match="only for kind='stacked'"):
+        splt.composition(
+            datastore,
+            categories=cell_cycle_scoring,
+            grouping=leiden_clustering,
+            kind="per_sample",
+            show=False,
+        )
+
+
 def test_compose_results_namespaces_tables_and_renders_shared_legend(
     umap,
     leiden_clustering,
@@ -1176,8 +1279,8 @@ def test_compose_results_namespaces_tables_and_renders_shared_legend(
     )
     first = splt.embedding(
         datastore,
-        layout_key="RNA_UMAP",
-        color_by="RNA_leiden_cluster",
+        layout=umap,
+        color_by=leiden_clustering,
         target=axes["embedding"],
         show_legend=True,
         theme="paper",
@@ -1224,27 +1327,29 @@ def test_compose_results_namespaces_tables_and_renders_shared_legend(
     plt.close(figure)
 
 
-def test_recipe_execution_is_headless_and_preserves_analysis_state(umap, datastore):
-    before = datastore.get_assay_state("RNA")
+def test_recipe_execution_is_headless_and_read_only(umap, datastore):
+    columns_before = frozenset(datastore.cells.columns)
+    artifacts_before = frozenset(datastore.list_artifacts())
     recipe = splt.PlotRecipe(
         (
             splt.PlotStep(
                 name="overview",
                 plot="embedding",
                 kwargs={
-                    "layout_key": "RNA_UMAP",
                     "color_by": "RNA_nCounts",
                 },
+                artifact_kwargs={"layout": "umap"},
             ),
         )
     )
 
-    execution = datastore.plots.run_recipe(recipe)
+    execution = datastore.plots.run_recipe(recipe, artifacts={"umap": umap})
 
     assert not execution.written_paths
     assert not execution.failures
     assert len(execution.results) == 1
-    assert datastore.get_assay_state("RNA") == before
+    assert frozenset(datastore.cells.columns) == columns_before
+    assert frozenset(datastore.list_artifacts()) == artifacts_before
     result = execution.results[0]
     assert plt.fignum_exists(result.figure.number)
     result.close()
@@ -1257,9 +1362,9 @@ def test_recipe_batch_output_closes_owned_figure(umap, datastore, tmp_path):
                 name="overview",
                 plot="embedding",
                 kwargs={
-                    "layout_key": "RNA_UMAP",
                     "color_by": "RNA_nCounts",
                 },
+                artifact_kwargs={"layout": "umap"},
                 output=splt.PlotOutputSettings(
                     filename="overview.png",
                     dpi=90,
@@ -1268,7 +1373,12 @@ def test_recipe_batch_output_closes_owned_figure(umap, datastore, tmp_path):
         )
     )
 
-    execution = splt.run_recipe(datastore, recipe, output_dir=tmp_path)
+    execution = splt.run_recipe(
+        datastore,
+        recipe,
+        artifacts={"umap": umap},
+        output_dir=tmp_path,
+    )
     plot_result = execution.results[0]
 
     assert execution.written_paths == (tmp_path / "overview.png",)

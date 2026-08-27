@@ -13,6 +13,9 @@ import pandas as pd
 import pytest
 
 import scarf.plotting as splt
+from scarf.metadata.artifacts import artifact_values
+from scarf.storage import ArtifactRef
+from scarf.storage.artifacts import artifact_group
 
 
 class _ArrayCells:
@@ -289,9 +292,9 @@ def test_embedding_keeps_square_panel_with_side_legend():
     store = _ArrayStore(
         {
             "I": np.ones(n_cells, dtype=bool),
-            "RNA_UMAP1": rng.normal(size=n_cells),
-            "RNA_UMAP2": rng.normal(size=n_cells),
-            "RNA_leiden_cluster": np.array(
+            "plot_layout1": rng.normal(size=n_cells),
+            "plot_layout2": rng.normal(size=n_cells),
+            "plot_group": np.array(
                 [str(index % 6) for index in range(n_cells)],
                 dtype=object,
             ),
@@ -300,8 +303,8 @@ def test_embedding_keeps_square_panel_with_side_legend():
     )
     result = splt.embedding(
         store,
-        layout_key="RNA_UMAP",
-        color_by="RNA_leiden_cluster",
+        layout_key="plot_layout",
+        color_by="plot_group",
         legend_loc="right",
         show=False,
     )
@@ -319,12 +322,12 @@ def test_embedding_keeps_square_panel_with_side_legend():
 def test_embedding_dotplot_matrixplot_on_fixture(umap, leiden_clustering, datastore):
     ds = datastore
     # Point sizes and sort order are part of the native embedding contract.
-    n = len(ds.cells.fetch("I", key="I"))
+    n = len(artifact_values(artifact_group(ds.zw, umap), "values"))
     sizes = np.linspace(5, 40, n)
     emb = splt.embedding(
         ds,
-        layout_key="RNA_UMAP",
-        color_by="RNA_leiden_cluster",
+        layout=umap,
+        color_by=leiden_clustering,
         point_sizes=sizes,
         sort_values=False,
         show=False,
@@ -339,7 +342,7 @@ def test_embedding_dotplot_matrixplot_on_fixture(umap, leiden_clustering, datast
     gene = str(names[0])
     emb2 = splt.embedding(
         ds,
-        layout_key="RNA_UMAP",
+        layout=umap,
         color_by=gene,
         sort_values=True,
         show=False,
@@ -350,25 +353,97 @@ def test_embedding_dotplot_matrixplot_on_fixture(umap, leiden_clustering, datast
     dp = splt.dotplot(
         ds,
         features=[gene],
-        group_by="RNA_leiden_cluster",
+        groups=leiden_clustering,
         show=False,
     )
     assert "aggregate" in dp.tables
     assert "mean" in dp.tables["aggregate"].columns
     assert "fraction" in dp.tables["aggregate"].columns
-    assert dp.provenance.n_cells == len(ds.cells.active_index("I"))
+    assert dp.provenance.n_cells == n
     assert dp.figure.legends or next(iter(dp.axes.values())).get_legend() is not None
     dp.close()
 
     mp = splt.matrixplot(
         ds,
         features=[gene],
-        group_by="RNA_leiden_cluster",
+        groups=leiden_clustering,
         show=False,
     )
     assert "matrix" in mp.tables
-    assert mp.provenance.n_cells == len(ds.cells.active_index("I"))
+    assert mp.provenance.n_cells == n
     mp.close()
+
+
+def _artifact_color_cache(monkeypatch, values, *, kind, grouping_indices=None):
+    import importlib
+
+    embedding_module = importlib.import_module("scarf.plotting.embedding")
+    ref = ArtifactRef(
+        scope="datastore",
+        kind=kind,
+        artifact_id="a" * 64,
+    )
+    indices = np.asarray([0, 2, 4], dtype=np.int64)
+    resolved_indices = indices if grouping_indices is None else grouping_indices
+    monkeypatch.setattr(
+        embedding_module,
+        "_resolve_grouping",
+        lambda *_args, **_kwargs: (("groups",), resolved_indices, [values]),
+    )
+    cache = embedding_module._prefetch_colors(
+        object(),
+        [ref],
+        from_assay=None,
+        cell_key="I",
+        n_cells=len(indices),
+        normalization=splt.NormalizationSpec(),
+        cell_indices=indices,
+    )
+    return ref, indices, cache[0]
+
+
+def test_embedding_classifies_float_artifact_values_as_continuous(monkeypatch):
+    values = np.asarray([0.1, 0.5, 0.9], dtype=np.float64)
+    ref, _indices, (loaded, label, is_categorical, is_uniform) = _artifact_color_cache(
+        monkeypatch, values, kind="membership_strength"
+    )
+
+    np.testing.assert_array_equal(loaded, values)
+    assert label == ref.kind
+    assert is_categorical is False
+    assert is_uniform is False
+
+
+def test_embedding_artifact_color_requires_exact_layout_selection(monkeypatch):
+    with pytest.raises(ValueError, match="different order"):
+        _artifact_color_cache(
+            monkeypatch,
+            np.asarray([0.1, 0.5, 0.9], dtype=np.float64),
+            kind="membership_strength",
+            grouping_indices=np.asarray([0, 4, 2], dtype=np.int64),
+        )
+
+
+@pytest.mark.parametrize(
+    ("values", "kind"),
+    [
+        (np.asarray([0, 1, 1], dtype=np.int64), "cluster_labels"),
+        (np.asarray(["a", "b", "a"]), "hto_identity"),
+    ],
+)
+def test_embedding_classifies_discrete_artifact_values_as_categorical(
+    monkeypatch,
+    values,
+    kind,
+):
+    ref, _indices, (loaded, label, is_categorical, is_uniform) = _artifact_color_cache(
+        monkeypatch, values, kind=kind
+    )
+
+    np.testing.assert_array_equal(loaded, values)
+    assert label == ref.kind
+    assert is_categorical is True
+    assert is_uniform is False
 
 
 def test_feature_ref_duplicate_raises(datastore):
@@ -386,8 +461,7 @@ def test_caller_owned_target(umap, datastore):
     fig, ax = plt.subplots()
     result = splt.embedding(
         datastore,
-        layout_key="RNA_UMAP",
-        color_by="RNA_leiden_cluster",
+        layout=umap,
         target=ax,
         show=False,
     )
@@ -397,9 +471,7 @@ def test_caller_owned_target(umap, datastore):
     plt.close(fig)
 
 
-def test_summary_and_composition_accept_foreign_targets(
-    umap, leiden_clustering, datastore
-):
+def test_summary_and_composition_accept_foreign_targets(leiden_clustering, datastore):
     import matplotlib.pyplot as plt
 
     ds = datastore
@@ -409,20 +481,20 @@ def test_summary_and_composition_accept_foreign_targets(
         splt.dotplot(
             ds,
             features=[gene],
-            group_by="RNA_leiden_cluster",
+            groups=leiden_clustering,
             target=axes[0],
             show=False,
         ),
         splt.matrixplot(
             ds,
             features=[gene],
-            group_by="RNA_leiden_cluster",
+            groups=leiden_clustering,
             target=axes[1],
             show=False,
         ),
         splt.composition(
             ds,
-            category_by="RNA_leiden_cluster",
+            categories=leiden_clustering,
             kind="stacked",
             target=axes[2],
             show=False,
@@ -435,7 +507,7 @@ def test_summary_and_composition_accept_foreign_targets(
     plt.close(fig)
 
 
-def test_sample_by_equal_weight_on_datastore(umap, leiden_clustering, datastore):
+def test_sample_by_equal_weight_on_datastore(leiden_clustering, datastore):
     from scarf.plotting._data import summarize_features_by_group
 
     ds = datastore
@@ -449,7 +521,7 @@ def test_sample_by_equal_weight_on_datastore(umap, leiden_clustering, datastore)
     agg, per = summarize_features_by_group(
         ds,
         features=[gene],
-        group_by="RNA_leiden_cluster",
+        groups=leiden_clustering,
         sample_by="plot_sample_id",
     )
     assert per is not None
@@ -457,18 +529,16 @@ def test_sample_by_equal_weight_on_datastore(umap, leiden_clustering, datastore)
 
     # For each group×feature present in both samples, aggregate mean ==
     # unweighted mean of per-sample means (not cell-weighted).
-    both = per.groupby(["RNA_leiden_cluster", "feature"], observed=False)[
-        "sample"
-    ].nunique()
+    both = per.groupby(["groups", "feature"], observed=False)["sample"].nunique()
     shared = both[both == 2].index
     assert len(shared) > 0
     for cluster, feature in shared:
-        rows = per[(per["RNA_leiden_cluster"] == cluster) & (per["feature"] == feature)]
+        rows = per[(per["groups"] == cluster) & (per["feature"] == feature)]
         expected = float(rows["mean"].mean())
         cell_weighted = float(np.average(rows["mean"], weights=rows["n_cells"]))
         got = float(
             agg.loc[
-                (agg["RNA_leiden_cluster"] == cluster) & (agg["feature"] == feature),
+                (agg["groups"] == cluster) & (agg["feature"] == feature),
                 "mean",
             ].iloc[0]
         )
@@ -484,7 +554,7 @@ def test_sample_by_equal_weight_on_datastore(umap, leiden_clustering, datastore)
     dp = splt.dotplot(
         ds,
         features=[gene],
-        group_by="RNA_leiden_cluster",
+        groups=leiden_clustering,
         sample_by="plot_sample_id",
         show=False,
     )
@@ -510,7 +580,7 @@ def test_facet_shared_color_limits(umap, datastore):
 
     result = splt.embedding(
         ds,
-        layout_key="RNA_UMAP",
+        layout=umap,
         color_by=splt.CellField("plot_score", kind="continuous"),
         facet_by="plot_condition",
         facet_order=["low", "high"],
@@ -531,7 +601,7 @@ def test_facet_shared_color_limits(umap, datastore):
 
     panel_result = splt.embedding(
         ds,
-        layout_key="RNA_UMAP",
+        layout=umap,
         color_by=splt.CellField("plot_score", kind="continuous"),
         facet_by="plot_condition",
         facet_order=["low", "high"],
@@ -547,7 +617,7 @@ def test_facet_shared_color_limits(umap, datastore):
     ds.cells.insert("plot_score_scaled", score * 10, overwrite=True)
     shared_result = splt.embedding(
         ds,
-        layout_key="RNA_UMAP",
+        layout=umap,
         color_by=[
             splt.CellField("plot_score", kind="continuous"),
             splt.CellField("plot_score_scaled", kind="continuous"),
@@ -561,7 +631,7 @@ def test_facet_shared_color_limits(umap, datastore):
     shared_result.close()
 
 
-def test_composition_and_export(umap, leiden_clustering, datastore, tmp_path):
+def test_composition_and_export(leiden_clustering, datastore, tmp_path):
     ds = datastore
     active_n = len(ds.cells.active_index("I"))
     sample = np.array([f"s{i % 3}" for i in range(active_n)], dtype=object)
@@ -569,7 +639,7 @@ def test_composition_and_export(umap, leiden_clustering, datastore, tmp_path):
 
     result = splt.composition(
         ds,
-        category_by="RNA_leiden_cluster",
+        categories=leiden_clustering,
         sample_by="plot_comp_sample",
         kind="per_sample",
         show=False,
@@ -581,7 +651,7 @@ def test_composition_and_export(umap, leiden_clustering, datastore, tmp_path):
 
     stacked = splt.composition(
         ds,
-        category_by="RNA_leiden_cluster",
+        categories=leiden_clustering,
         sample_by="plot_comp_sample",
         show=False,
     )
@@ -606,7 +676,7 @@ def test_feature_plotting_uses_assay_normalization_adapter(
     monkeypatch.setattr(assay, "normed", tracked_normed)
     result = splt.embedding(
         ds,
-        layout_key="RNA_UMAP",
+        layout=umap,
         color_by=gene,
         normalization=splt.NormalizationSpec(transform="log1p"),
         sort_values=True,
@@ -796,8 +866,7 @@ def test_figsize_rejected_with_owned_target(umap, datastore):
     with pytest.raises(ValueError, match="figsize"):
         splt.embedding(
             datastore,
-            layout_key="RNA_UMAP",
-            color_by="RNA_leiden_cluster",
+            layout=umap,
             target=ax,
             figsize=(3, 3),
             show=False,
@@ -815,7 +884,7 @@ def test_multi_gene_by_condition_embedding(umap, datastore):
     names = [str(x) for x in ds.RNA.feats.fetch_all("names")[:2]]
     result = splt.embedding(
         ds,
-        layout_key="RNA_UMAP",
+        layout=umap,
         color_by=names,
         facet_by="plot_condition_mg",
         facet_order=["ctrl", "stim"],
@@ -837,21 +906,6 @@ def test_multi_gene_by_condition_embedding(umap, datastore):
     result.close()
 
 
-def _add_secondary_embedding(datastore):
-    x = np.asarray(datastore.cells.fetch_all("RNA_UMAP1"), dtype=np.float64)
-    y = np.asarray(datastore.cells.fetch_all("RNA_UMAP2"), dtype=np.float64)
-    datastore.cells.insert(
-        "plot_secondary_embedding1",
-        -y,
-        overwrite=True,
-    )
-    datastore.cells.insert(
-        "plot_secondary_embedding2",
-        x,
-        overwrite=True,
-    )
-
-
 def _add_synthetic_embeddings(datastore, assay_name):
     coordinates = np.linspace(-1.0, 1.0, datastore.cells.N)
     layouts = [
@@ -865,9 +919,8 @@ def _add_synthetic_embeddings(datastore, assay_name):
     return layouts
 
 
-def test_multi_layout_multi_color_embedding(umap, datastore):
-    _add_secondary_embedding(datastore)
-    layouts = ["RNA_UMAP", "plot_secondary_embedding"]
+def test_multi_layout_multi_color_embedding(datastore):
+    layouts = _add_synthetic_embeddings(datastore, "RNA")
     colors = ["RNA_nCounts", "RNA_nFeatures"]
     expected_keys = [(layout, color) for layout in layouts for color in colors]
 
@@ -949,11 +1002,10 @@ def test_multi_layout_embedding_uses_native_feature_values(
     result.close()
 
 
-def test_multi_layout_embedding_accepts_matching_target_axes(umap, datastore):
+def test_multi_layout_embedding_accepts_matching_target_axes(datastore):
     import matplotlib.pyplot as plt
 
-    _add_secondary_embedding(datastore)
-    layouts = ["RNA_UMAP", "plot_secondary_embedding"]
+    layouts = _add_synthetic_embeddings(datastore, "RNA")
     colors = ["RNA_nCounts", "RNA_nFeatures"]
     panel_keys = [(layout, color) for layout in layouts for color in colors]
     figure, target_axes = plt.subplots(2, 2)
@@ -988,12 +1040,12 @@ def test_embedding_show_default_suppression_and_later_show(
     monkeypatch.setattr(splt.PlotResult, "show", track_show)
     default_result = splt.embedding(
         datastore,
-        layout_key="RNA_UMAP",
+        layout=umap,
         color_by="RNA_nCounts",
     )
     suppressed_result = splt.embedding(
         datastore,
-        layout_key="RNA_UMAP",
+        layout=umap,
         color_by="RNA_nCounts",
         show=False,
     )
@@ -1016,22 +1068,22 @@ def test_resolve_feature_by_index(datastore):
     assert resolved.label
 
 
-def test_label_panels_and_collect_legends(umap, datastore):
+def test_label_panels_and_collect_legends(umap, leiden_clustering, datastore):
     import matplotlib.pyplot as plt
 
     ds = datastore
     fig, axes = plt.subplot_mosaic([["A", "B"]], figsize=(6, 3))
     a = splt.embedding(
         ds,
-        layout_key="RNA_UMAP",
-        color_by="RNA_leiden_cluster",
+        layout=umap,
+        color_by=leiden_clustering,
         target=axes["A"],
         show=False,
     )
     gene = str(ds.RNA.feats.fetch_all("names")[0])
     b = splt.embedding(
         ds,
-        layout_key="RNA_UMAP",
+        layout=umap,
         color_by=gene,
         target=axes["B"],
         show=False,
@@ -1044,7 +1096,7 @@ def test_label_panels_and_collect_legends(umap, datastore):
     plt.close(fig)
 
 
-def test_paired_composition_draws_subject_lines(umap, leiden_clustering, datastore):
+def test_paired_composition_draws_subject_lines(leiden_clustering, datastore):
     ds = datastore
     active_n = len(ds.cells.active_index("I"))
     sample = np.array([f"s{i % 6}" for i in range(active_n)], dtype=object)
@@ -1060,7 +1112,7 @@ def test_paired_composition_draws_subject_lines(umap, leiden_clustering, datasto
 
     result = splt.composition(
         ds,
-        category_by="RNA_leiden_cluster",
+        categories=leiden_clustering,
         study_design=splt.StudyDesign(
             sample_by="plot_pair_sample",
             subject_by="plot_pair_subject",
@@ -1079,9 +1131,9 @@ def test_paired_composition_requires_condition(leiden_clustering, datastore):
     with pytest.raises(ValueError, match="requires condition_by"):
         splt.composition(
             datastore,
-            category_by="RNA_leiden_cluster",
-            sample_by="RNA_leiden_cluster",
-            subject_by="RNA_leiden_cluster",
+            categories=leiden_clustering,
+            sample_by="I",
+            subject_by="I",
             kind="per_sample",
             show=False,
         )
@@ -1096,7 +1148,7 @@ def test_embedding_clip_and_subset(umap, datastore):
     gene = str(ds.RNA.feats.fetch_all("names")[0])
     result = splt.embedding(
         ds,
-        layout_key="RNA_UMAP",
+        layout=umap,
         color_by=gene,
         clip_fraction=0.01,
         subset_by="plot_keep",
@@ -1109,13 +1161,20 @@ def test_embedding_clip_and_subset(umap, datastore):
 
 def test_embedding_groups_filters_categories(umap, leiden_clustering, datastore):
     ds = datastore
-    labels = list(pd.unique(ds.cells.fetch("RNA_leiden_cluster")))
+    labels = list(
+        pd.unique(
+            artifact_values(
+                artifact_group(ds.zw, leiden_clustering),
+                "values",
+            )
+        )
+    )
     assert len(labels) >= 2
     keep = labels[:2]
     result = splt.embedding(
         ds,
-        layout_key="RNA_UMAP",
-        color_by="RNA_leiden_cluster",
+        layout=umap,
+        color_by=leiden_clustering,
         groups=keep,
         show=False,
     )
@@ -1125,12 +1184,12 @@ def test_embedding_groups_filters_categories(umap, leiden_clustering, datastore)
     result.close()
 
 
-def test_distribution_violin(umap, leiden_clustering, datastore):
+def test_distribution_violin(leiden_clustering, datastore):
     ds = datastore
     result = splt.distribution(
         ds,
         keys=["RNA_nCounts", "RNA_nFeatures"],
-        group_by="RNA_leiden_cluster",
+        grouping=leiden_clustering,
         kind="violin",
         max_points=200,
         seed=1,
@@ -1172,18 +1231,25 @@ def test_distribution_cell_key_none_includes_all_cells(datastore):
     result.close()
 
 
-def test_distribution_subset_and_groups(umap, leiden_clustering, datastore):
+def test_distribution_subset_and_groups(leiden_clustering, datastore):
     ds = datastore
     active_n = len(ds.cells.active_index("I"))
     keep = np.zeros(active_n, dtype=bool)
     keep[: max(20, active_n // 2)] = True
     ds.cells.insert("dist_keep", keep, overwrite=True)
-    labels = list(pd.unique(ds.cells.fetch("RNA_leiden_cluster")))
+    labels = list(
+        pd.unique(
+            artifact_values(
+                artifact_group(ds.zw, leiden_clustering),
+                "values",
+            )
+        )
+    )
     keep_groups = labels[:2]
     result = splt.distribution(
         ds,
         keys="RNA_nCounts",
-        group_by="RNA_leiden_cluster",
+        grouping=leiden_clustering,
         groups=keep_groups,
         subset_by="dist_keep",
         kind="box",
@@ -1199,12 +1265,12 @@ def test_distribution_subset_and_groups(umap, leiden_clustering, datastore):
     result.close()
 
 
-def test_distribution_hist_and_ecdf(umap, leiden_clustering, datastore):
+def test_distribution_hist_and_ecdf(leiden_clustering, datastore):
     ds = datastore
     hist = splt.distribution(
         ds,
         keys="RNA_nCounts",
-        group_by="RNA_leiden_cluster",
+        grouping=leiden_clustering,
         kind="hist",
         bins=20,
         show=False,
@@ -1212,7 +1278,14 @@ def test_distribution_hist_and_ecdf(umap, leiden_clustering, datastore):
     assert hist.provenance.extras["bins"] == 20
     assert hist.provenance.extras["approximate"] is False
     ax = next(iter(hist.axes.values()))
-    n_groups = len(np.unique(ds.cells.fetch("RNA_leiden_cluster")))
+    n_groups = len(
+        np.unique(
+            artifact_values(
+                artifact_group(ds.zw, leiden_clustering),
+                "values",
+            )
+        )
+    )
     assert len(ax.patches) == n_groups * 20
     first_bins = [(patch.get_x(), patch.get_width()) for patch in ax.patches[:20]]
     for group_index in range(1, n_groups):

@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 """Regenerate the two-way or synthetic three-way Seurat WNN golden fixture.
 
-The default mode pulls reductions from the public CITE-seq store. The
+The default mode loads explicitly named reduction artifacts from the public
+CITE-seq store. Pass one ``--reduction ASSAY=ARTIFACT_ID`` for every assay. The
 ``--synthetic-three-way`` mode creates deterministic RNA, ATAC, and ADT
 embeddings without an external dataset. Both modes compute exact self-free
 neighbour rows and hand an arbitrary ordered modality list to the R companion.
@@ -19,6 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
+from scarf.storage import ArtifactRef
 from scarf.storage.types import as_zarr_array
 
 REPO = Path(__file__).resolve().parent.parent
@@ -36,6 +38,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rscript", type=Path, default=Path("Rscript"))
     parser.add_argument("--output", type=Path)
     parser.add_argument("--assays", nargs="+", default=["RNA", "ADT"])
+    parser.add_argument(
+        "--reduction",
+        action="append",
+        default=[],
+        metavar="ASSAY=ARTIFACT_ID",
+        help="Explicit assay-scoped reduction artifact (repeat per assay)",
+    )
     parser.add_argument("--synthetic-three-way", action="store_true")
     parser.add_argument("--cells", type=int)
     parser.add_argument("--k", type=int, default=20)
@@ -43,17 +52,46 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_embeddings(store: Path, assays: tuple[str, ...]) -> dict[str, np.ndarray]:
+def parse_reduction_refs(
+    values: list[str],
+    assays: tuple[str, ...],
+) -> dict[str, ArtifactRef]:
+    refs: dict[str, ArtifactRef] = {}
+    for value in values:
+        assay, separator, artifact_id = value.partition("=")
+        if not separator or not assay or not artifact_id:
+            raise ValueError("--reduction values must use ASSAY=ARTIFACT_ID")
+        if assay in refs:
+            raise ValueError(f"Duplicate reduction for assay {assay!r}")
+        refs[assay] = ArtifactRef(
+            scope="assay",
+            assay=assay,
+            kind="reduction",
+            artifact_id=artifact_id,
+        )
+    expected = set(assays)
+    actual = set(refs)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        raise ValueError(
+            "Explicit reductions must match --assays exactly; "
+            f"missing={missing!r}, unexpected={unexpected!r}"
+        )
+    return refs
+
+
+def load_embeddings(
+    store: Path,
+    reductions: dict[str, ArtifactRef],
+) -> dict[str, np.ndarray]:
     import scarf
 
     scarf.configure_output(level="ERROR", progress=False)
+    assays = tuple(reductions)
     datastore = scarf.DataStore(str(store), default_assay=assays[0], nthreads=4)
     embeddings = {}
-    for assay in assays:
-        state = datastore.get_assay_state(assay)
-        if state is None or state.reduction is None:
-            raise RuntimeError(f"Assay {assay!r} has no reduction artifact")
-        reference = state.batch_correction or state.reduction
+    for assay, reference in reductions.items():
         group = datastore.load_artifact(reference)
         embeddings[assay] = np.asarray(as_zarr_array(group["data"])[:])
     return embeddings
@@ -95,7 +133,10 @@ def read_table(path: Path) -> np.ndarray:
 
 def main() -> None:
     args = parse_args()
+    reduction_sources: dict[str, dict[str, str | None]] | None = None
     if args.synthetic_three_way:
+        if args.reduction:
+            raise ValueError("--reduction is not used with --synthetic-three-way")
         modality_names = ("RNA", "ATAC", "ADT")
         n_cells = args.cells or 48
         selected_embeddings = synthetic_three_way_embeddings(n_cells, args.seed)
@@ -110,7 +151,8 @@ def main() -> None:
             raise ValueError("Golden generation requires unique assay names")
         if modality_names != ("RNA", "ADT") and args.output is None:
             raise ValueError("--output is required for a non-default assay list")
-        embeddings = load_embeddings(args.store, modality_names)
+        reductions = parse_reduction_refs(args.reduction, modality_names)
+        embeddings = load_embeddings(args.store, reductions)
         generator = np.random.default_rng(args.seed)
         total = embeddings[modality_names[0]].shape[0]
         n_cells = args.cells or 300
@@ -127,6 +169,9 @@ def main() -> None:
             if args.store == DEFAULT_STORE
             else str(args.store)
         )
+        reduction_sources = {
+            name: reductions[name].to_dict() for name in modality_names
+        }
         output = args.output or DEFAULT_FIXTURE
     if args.k >= n_cells:
         raise ValueError("k must be smaller than the number of fixture cells")
@@ -166,41 +211,45 @@ def main() -> None:
         default_indices = read_table(work / "default_indices.tsv")
         default_weights = read_table(work / "default_modality_weights.tsv")
 
+    provenance = {
+        "package": "Seurat",
+        "packageVersion": versions["seurat"],
+        "seuratObjectVersion": versions["seuratObject"],
+        "rVersion": versions["r"],
+        "sourceRepository": "https://github.com/satijalab/seurat",
+        "dataset": dataset,
+        "datasetSource": dataset_source,
+        "generator": "scripts/export_seurat_wnn_golden.py",
+        "nCells": n_cells,
+        "kNn": int(args.k),
+        "cellSampleSeed": int(args.seed),
+        "modalityNames": list(modality_names),
+        "l2Normalize": True,
+        "matchedFunctions": [
+            "Seurat:::L2Norm",
+            "Seurat:::PredictAssay",
+            "Seurat:::impute_dist",
+            "Seurat:::NNdist",
+            "Seurat::MinMax",
+        ],
+        "matchedNote": (
+            "Seurat routines evaluated on Scarf's union candidate pool and "
+            "nearest-to-k-th non-self distance-span bandwidth. The kernel, "
+            "score and softmax expressions are copied from the body of "
+            "FindModalityWeights."
+        ),
+        "defaultFunction": "Seurat::FindMultiModalNeighbors",
+        "defaultNote": (
+            "Shipped defaults, including the wider knn.range search and the "
+            "SNN-far bandwidth. Scarf does not reproduce these, so the "
+            "comparison is statistical."
+        ),
+    }
+    if reduction_sources is not None:
+        provenance["reductions"] = reduction_sources
+
     fixture = {
-        "provenance": {
-            "package": "Seurat",
-            "packageVersion": versions["seurat"],
-            "seuratObjectVersion": versions["seuratObject"],
-            "rVersion": versions["r"],
-            "sourceRepository": "https://github.com/satijalab/seurat",
-            "dataset": dataset,
-            "datasetSource": dataset_source,
-            "generator": "scripts/export_seurat_wnn_golden.py",
-            "nCells": n_cells,
-            "kNn": int(args.k),
-            "cellSampleSeed": int(args.seed),
-            "modalityNames": list(modality_names),
-            "l2Normalize": True,
-            "matchedFunctions": [
-                "Seurat:::L2Norm",
-                "Seurat:::PredictAssay",
-                "Seurat:::impute_dist",
-                "Seurat:::NNdist",
-                "Seurat::MinMax",
-            ],
-            "matchedNote": (
-                "Seurat routines evaluated on Scarf's union candidate pool and "
-                "nearest-to-k-th non-self distance-span bandwidth. The kernel, "
-                "score and softmax expressions are copied from the body of "
-                "FindModalityWeights."
-            ),
-            "defaultFunction": "Seurat::FindMultiModalNeighbors",
-            "defaultNote": (
-                "Shipped defaults, including the wider knn.range search and the "
-                "SNN-far bandwidth. Scarf does not reproduce these, so the "
-                "comparison is statistical."
-            ),
-        },
+        "provenance": provenance,
         "matched": {
             "modalityWeights": matched_weights.tolist(),
             "neighborIndices": matched_indices.astype(int).tolist(),

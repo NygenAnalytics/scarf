@@ -11,6 +11,21 @@ from profiling.stages import (
     _run_leiden_in_subprocess,
     run_stage,
 )
+from scarf.storage import ArtifactRef
+
+
+_GRAPH_REF = ArtifactRef(
+    scope="assay",
+    assay="RNA",
+    kind="connectivity_map",
+    artifact_id="a" * 64,
+)
+_CLUSTER_REF = ArtifactRef(
+    scope="assay",
+    assay="RNA",
+    kind="cluster_labels",
+    artifact_id="b" * 64,
+)
 
 
 def _resources() -> StageResources:
@@ -31,10 +46,15 @@ class _Store:
         self.error = error
         self.arguments: dict[str, object] | None = None
 
-    def run_leiden_clustering(self, **arguments: object) -> None:
-        self.arguments = arguments
+    def run_leiden_clustering(
+        self,
+        graph: ArtifactRef,
+        **arguments: object,
+    ) -> ArtifactRef:
+        self.arguments = {"graph": graph, **arguments}
         if self.error is not None:
             raise self.error
+        return _CLUSTER_REF
 
 
 def _request(
@@ -53,6 +73,7 @@ def _request(
                 "resources": _resources().model_dump(mode="json"),
                 "statusPath": str(status_path),
                 "invalidateCache": invalidateCache,
+                "inputs": {"graph": _GRAPH_REF.to_dict()},
             }
         ),
         encoding="utf-8",
@@ -90,17 +111,16 @@ def test_worker_runs_leiden(
     assert opened["storeUri"] == "s3://bucket/store.zarr"
     assert opened["initialize"] is False
     assert store.arguments == {
-        "from_assay": "RNA",
-        "cell_key": "I",
+        "graph": _GRAPH_REF,
         "resolution": 1.0,
         "backend": "igraph",
-        "label": "leiden_cluster",
         "random_seed": 4444,
         "invalidate_cache": True,
     }
     status = json.loads(status_path.read_text(encoding="utf-8"))
     assert status["status"] == "ok"
     assert status["error"] is None
+    assert status["artifact"] == _CLUSTER_REF.to_dict()
     assert status["inputSetupSeconds"] >= 0
     assert status["operationSeconds"] >= 0
     assert status["wholeWorkerSeconds"] >= (
@@ -184,7 +204,13 @@ def test_parent_starts_worker_module(
             request_path = Path(self.command[-1])
             request = json.loads(request_path.read_text(encoding="utf-8"))
             Path(request["statusPath"]).write_text(
-                json.dumps({"status": "ok", "error": None}),
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "error": None,
+                        "artifact": _CLUSTER_REF.to_dict(),
+                    }
+                ),
                 encoding="utf-8",
             )
             return 0
@@ -196,6 +222,7 @@ def test_parent_starts_worker_module(
         workflow=WorkflowParameters(),
         resources=_resources(),
         workDir=tmp_path,
+        graph=_GRAPH_REF,
         invalidateCache=True,
     )
 
@@ -204,6 +231,7 @@ def test_parent_starts_worker_module(
     assert request["storeUri"] == "s3://bucket/store.zarr"
     assert request["invalidateCache"] is True
     assert request["workflow"]["leidenBackend"] == "igraph"
+    assert request["inputs"] == {"graph": _GRAPH_REF.to_dict()}
 
 
 def test_run_stage_routes_leiden_to_child(
@@ -215,6 +243,7 @@ def test_run_stage_routes_leiden_to_child(
     def fake_child(**arguments: object) -> dict[str, object]:
         called.update(arguments)
         return {
+            "artifact": _CLUSTER_REF.to_dict(),
             "inputSetupSeconds": 0.5,
             "operationSeconds": 1.5,
             "wholeWorkerSeconds": 2.25,
@@ -237,15 +266,18 @@ def test_run_stage_routes_leiden_to_child(
         workDir=tmp_path,
         sampleIntervalSeconds=0.01,
         invalidateCache=True,
+        inputRefs={"graph": _GRAPH_REF},
     )
 
     assert result.status == "ok"
     assert result.inputSetupSeconds == 0.5
     assert result.seconds == 1.5
     assert result.details is not None
+    assert result.details["artifact"] == _CLUSTER_REF.to_dict()
     assert result.details["workerWholeSeconds"] == 2.25
     assert result.details["workerProcessCpuSeconds"] == 1.05
     assert result.childCpuSeconds == 1.1
     assert called["storeUri"] == "s3://bucket/store.zarr"
     assert called["workDir"] == tmp_path
     assert called["invalidateCache"] is True
+    assert called["graph"] == _GRAPH_REF

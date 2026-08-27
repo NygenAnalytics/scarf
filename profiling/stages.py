@@ -10,8 +10,13 @@ from typing import Any
 
 import numpy as np
 from scarf import DataStore, H5adReader, H5adToZarr, configure_output
+from scarf.metadata.artifacts import (
+    plan_cell_data_artifact,
+    write_cell_data_artifact,
+)
 from scarf.storage import ArtifactRef
 from scarf.storage.budget import resolve_budget
+from scarf.storage.selections import validate_stored_selection_integrity
 from scarf.storage.stores import open_store
 from scarf.storage.types import as_zarr_array, as_zarr_group
 
@@ -30,6 +35,50 @@ configure_output(progress=False, timestamps=True)
 CHILD_MONITOR_INTERVAL_SECONDS = 30.0
 CHILD_WARNING_SECONDS = 1_800.0
 CHILD_STOP_GRACE_SECONDS = 30.0
+
+PROFILE_STAGE_INPUTS: dict[StageName, dict[str, tuple[StageName, str]]] = {
+    "markHvgs": {"cells": ("filterCells", "cell_selection")},
+    "importClusters": {"cells": ("filterCells", "cell_selection")},
+    "runNormalization": {
+        "cells": ("filterCells", "cell_selection"),
+        "features": ("markHvgs", "feature_selection"),
+    },
+    "runPca": {"normalized": ("runNormalization", "normalized")},
+    "buildEmbeddingInitialization": {"coordinates": ("runPca", "reduction")},
+    "buildAnnIndex": {"coordinates": ("runPca", "reduction")},
+    "queryNeighbors": {"ann_index": ("buildAnnIndex", "ann_index")},
+    "buildConnectivityMap": {"neighbors": ("queryNeighbors", "neighbors")},
+    "runUmap": {
+        "graph": ("buildConnectivityMap", "connectivity_map"),
+        "initialization": (
+            "buildEmbeddingInitialization",
+            "embedding_initialization",
+        ),
+    },
+    "runLeiden": {"graph": ("buildConnectivityMap", "connectivity_map")},
+}
+
+
+def profile_stage_inputs(
+    workflow: WorkflowParameters,
+    stage: StageName,
+) -> dict[str, tuple[StageName, str]]:
+    """Return exact artifact dependencies for one profiling stage."""
+    inputs = dict(PROFILE_STAGE_INPUTS.get(stage, {}))
+    cluster_stage: StageName = (
+        "importClusters" if workflow.clusterSourceUri is not None else "runLeiden"
+    )
+    if stage == "findMarkers":
+        inputs["clusters"] = (cluster_stage, "cluster_labels")
+    elif stage == "validateExperiment":
+        inputs.update(
+            {
+                "pca": ("runPca", "reduction"),
+                "clusters": (cluster_stage, "cluster_labels"),
+                "markers": ("findMarkers", "marker_table"),
+            }
+        )
+    return inputs
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,6 +337,7 @@ def _run_worker_in_subprocess(
     workDir: Path | None,
     workDirPrefix: str,
     invalidateCache: bool = False,
+    requestInputs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     worker_dir = (
         workDir if workDir is not None else Path(tempfile.mkdtemp(prefix=workDirPrefix))
@@ -302,6 +352,7 @@ def _run_worker_in_subprocess(
         "resources": resources.model_dump(mode="json"),
         "statusPath": str(status_path),
         "invalidateCache": invalidateCache,
+        "inputs": requestInputs or {},
     }
     request_path.write_text(json.dumps(request), encoding="utf-8")
 
@@ -349,6 +400,7 @@ def _run_leiden_in_subprocess(
     workflow: WorkflowParameters,
     resources: StageResources,
     workDir: Path | None,
+    graph: ArtifactRef,
     invalidateCache: bool = False,
 ) -> dict[str, Any]:
     return _run_worker_in_subprocess(
@@ -360,6 +412,7 @@ def _run_leiden_in_subprocess(
         workDir=workDir,
         workDirPrefix="scarf-leiden-",
         invalidateCache=invalidateCache,
+        requestInputs={"graph": graph.to_dict()},
     )
 
 
@@ -635,7 +688,7 @@ def run_stage(
     invalidateCache: bool = False,
     recordStoreOperations: bool = True,
     clientProvenance: dict[str, Any] | None = None,
-    hvgRef: ArtifactRef | None = None,
+    inputRefs: dict[str, ArtifactRef] | None = None,
     session: dict[str, Any] | None = None,
 ) -> StageRunResult:
     install_stage_zarr_runtime(resources)
@@ -678,10 +731,16 @@ def run_stage(
         if session is not None and opened is not None:
             session["store"] = opened
 
-    if hvgRef is None and session is not None:
-        session_hvg_ref = session.get("hvgRef")
-        if isinstance(session_hvg_ref, ArtifactRef):
-            hvgRef = session_hvg_ref
+    resolved_input_refs = dict(inputRefs or {})
+    if session is not None:
+        session_refs = session.get("artifactRefs")
+        if isinstance(session_refs, dict):
+            for input_name, (source_stage, _kind) in profile_stage_inputs(
+                workflow, stage
+            ).items():
+                candidate = session_refs.get(source_stage)
+                if isinstance(candidate, ArtifactRef):
+                    resolved_input_refs.setdefault(input_name, candidate)
 
     from profiling.metrics import child_cpu_seconds as read_child_cpu_seconds
 
@@ -807,14 +866,38 @@ def run_stage(
                         if session is None:
                             store = None
                 elif stage == "runLeiden":
+                    graph = _profile_input(
+                        resolved_input_refs,
+                        name="graph",
+                        kind="connectivity_map",
+                        assay=workflow.assayName,
+                    )
                     with timer.operation():
                         worker_timings = _run_leiden_in_subprocess(
                             storeUri=storeUri,
                             workflow=workflow,
                             resources=resources,
                             workDir=workDir,
+                            graph=graph,
                             invalidateCache=invalidateCache,
                         )
+                    raw_artifact = worker_timings.get("artifact")
+                    if not isinstance(raw_artifact, dict):
+                        raise RuntimeError(
+                            "runLeiden worker did not return its cluster artifact"
+                        )
+                    cluster_ref = ArtifactRef.from_dict(raw_artifact)
+                    if (
+                        cluster_ref.scope != "assay"
+                        or cluster_ref.assay != workflow.assayName
+                        or cluster_ref.kind != "cluster_labels"
+                    ):
+                        raise RuntimeError(
+                            "runLeiden worker returned an incompatible artifact"
+                        )
+                    details = {"artifact": cluster_ref.to_dict()}
+                    if session is not None:
+                        session.setdefault("artifactRefs", {})[stage] = cluster_ref
                 else:
                     store = None
                     reused = (
@@ -853,20 +936,19 @@ def run_stage(
                                 workflow,
                                 resources,
                                 invalidateCache=invalidateCache,
-                                hvgRef=hvgRef,
+                                inputRefs=resolved_input_refs,
                             )
                             if analysis_details:
                                 details = {
                                     **(details or {}),
                                     **analysis_details,
                                 }
-                                if stage == "markHvgs" and session is not None:
+                                if session is not None:
                                     artifact = analysis_details.get("artifact")
-                                    if not isinstance(artifact, dict):
-                                        raise ValueError(
-                                            "markHvgs did not return an artifact reference"
-                                        )
-                                    session["hvgRef"] = ArtifactRef.from_dict(artifact)
+                                    if isinstance(artifact, dict):
+                                        session.setdefault("artifactRefs", {})[
+                                            stage
+                                        ] = ArtifactRef.from_dict(artifact)
                             print(
                                 f"[run_stage] analysis DONE stage={stage}",
                                 flush=True,
@@ -1032,7 +1114,7 @@ def validate_cluster_source_identity(
     targetActive: np.ndarray,
     labels: np.ndarray,
 ) -> list[str]:
-    """Reject reordered, missing, duplicate, mismatched, or one-group labels."""
+    """Validate compact cluster labels against identical stored selections."""
     if sourceIds.shape != targetIds.shape:
         raise ValueError(
             "cluster source row count does not match the target store; "
@@ -1050,12 +1132,12 @@ def validate_cluster_source_identity(
         np.asarray(targetActive).astype(bool),
     ):
         raise ValueError("cluster source active-cell mask does not match the target")
-    if labels.shape[0] != sourceIds.shape[0]:
-        raise ValueError("cluster source labels do not cover every row")
-    active_labels = labels[np.asarray(targetActive).astype(bool)]
-    if any(str(value) in {"", "nan", "None"} for value in active_labels):
-        raise ValueError("cluster source has missing labels on active cells")
-    groups = sorted({str(value) for value in active_labels})
+    selected_count = int(np.asarray(sourceActive, dtype=bool).sum())
+    if labels.shape != (selected_count,):
+        raise ValueError("cluster source labels do not cover every selected cell")
+    if any(str(value) in {"", "nan", "None"} for value in labels):
+        raise ValueError("cluster source has missing labels on selected cells")
+    groups = sorted({str(value) for value in labels})
     if len(groups) < 2:
         raise ValueError("cluster source must contain at least two groups")
     return groups
@@ -1064,7 +1146,7 @@ def validate_cluster_source_identity(
 def validate_experiment_branches(
     *,
     pcaComplete: bool,
-    importedColumnPresent: bool,
+    importedClusterComplete: bool,
     markerComplete: bool,
 ) -> dict[str, bool]:
     """Validate the PCA branch and the imported-marker branch separately."""
@@ -1072,8 +1154,8 @@ def validate_experiment_branches(
         raise ValueError(
             "validateExperiment: PCA branch is missing a reduction artifact"
         )
-    if not importedColumnPresent:
-        raise ValueError("validateExperiment: imported cluster column is missing")
+    if not importedClusterComplete:
+        raise ValueError("validateExperiment: imported cluster artifact is missing")
     if not markerComplete:
         raise ValueError("validateExperiment: marker branch is missing a marker_table")
     return {"pcaBranch": True, "markerBranch": True}
@@ -1096,28 +1178,71 @@ def _ordered_id_digest(values: np.ndarray) -> str:
 
 
 def _import_cluster_labels(
-    store: DataStore, workflow: WorkflowParameters
+    store: DataStore,
+    workflow: WorkflowParameters,
+    *,
+    cell_selection: ArtifactRef,
 ) -> dict[str, Any]:
     source_uri = workflow.clusterSourceUri
     if source_uri is None or not source_uri.strip():
         raise ValueError("importClusters requires workflow.clusterSourceUri")
+    source_artifact_id = workflow.clusterSourceArtifactId
+    if source_artifact_id is None:
+        raise ValueError("importClusters requires workflow.clusterSourceArtifactId")
     options = storage_options(source_uri)
-    source = open_store(source_uri, mode="r", storage_options=options)
-    if "cellData" not in source:
-        raise ValueError(f"cluster source {source_uri} is missing cellData")
-    cell_data = source["cellData"]
-    if "ids" not in cell_data:
-        raise ValueError("cluster source is missing cell ids")
-    source_ids = np.asarray(cell_data["ids"][:])
-    target_ids = np.asarray(store.cells.fetch_all("ids"))
-    if workflow.cellKey not in cell_data:
-        raise ValueError("cluster source is missing the active-cell mask")
-    source_active = np.asarray(cell_data[workflow.cellKey][:]).astype(bool)
-    target_active = np.asarray(store.cells.fetch_all(workflow.cellKey)).astype(bool)
-    label_column = workflow.clusterLabelColumn
-    if label_column not in cell_data:
-        raise ValueError(f"cluster source is missing label column {label_column}")
-    labels = np.asarray(cell_data[label_column][:])
+    source_store = DataStore(
+        source_uri,
+        default_assay=workflow.assayName,
+        zarr_mode="r",
+        zarrProfile=("cloud" if source_uri.startswith("s3://") else "fast_local"),
+        storage_options=options,
+    )
+    source_ref = ArtifactRef(
+        scope="assay",
+        assay=workflow.assayName,
+        kind="cluster_labels",
+        artifact_id=source_artifact_id,
+    )
+    source_status = source_store.inspect_artifact(source_ref)
+    if not source_status.exists:
+        raise ValueError(
+            f"cluster source artifact does not exist: {source_status.path}"
+        )
+    if not source_status.complete:
+        raise ValueError(f"cluster source artifact is incomplete: {source_status.path}")
+    raw_source_selection = (source_status.inputs or {}).get("cell_selection")
+    if not isinstance(raw_source_selection, dict):
+        raise ValueError("cluster source artifact has no cell-selection input")
+    try:
+        source_selection_ref = ArtifactRef.from_dict(raw_source_selection)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "cluster source artifact cell-selection input is malformed"
+        ) from exc
+    source_selection = validate_stored_selection_integrity(
+        source_store.zw,
+        source_selection_ref,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+    )
+    target_selection = validate_stored_selection_integrity(
+        store.zw,
+        cell_selection,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+    )
+    source_group = source_store.load_artifact(source_ref)
+    if "values" not in source_group:
+        raise ValueError("cluster source artifact has no values")
+    labels = np.asarray(as_zarr_array(source_group["values"], name="values")[:])
+    source_ids = np.asarray(source_selection.row_ids[:])
+    target_ids = np.asarray(target_selection.row_ids[:])
+    source_active = np.asarray(source_selection.values[:], dtype=bool)
+    target_active = np.asarray(target_selection.values[:], dtype=bool)
     groups = validate_cluster_source_identity(
         sourceIds=source_ids,
         targetIds=target_ids,
@@ -1125,68 +1250,96 @@ def _import_cluster_labels(
         targetActive=target_active,
         labels=labels,
     )
-    dest_column = workflow.resolvedMarkerGroupKey
-    store.cells.insert(
-        dest_column,
-        labels,
-        fill_value=-1,
-        key="I",
-        overwrite=True,
+    dtype_kind = None if labels.dtype.kind in {"O", "S", "U"} else labels.dtype.kind
+    planned = plan_cell_data_artifact(
+        store.zw,
+        scope="assay",
+        assay=workflow.assayName,
+        kind="cluster_labels",
+        operation="import_cluster_labels",
+        parameters={
+            "source_uri": source_uri,
+            "source_artifact_id": source_ref.artifact_id,
+        },
+        inputs={
+            "source_row_ids_fingerprint": _ordered_id_digest(source_ids),
+            "source_labels_fingerprint": _ordered_id_digest(
+                np.asarray(labels, dtype=object)
+            ),
+            "source_cell_selection_id": source_selection_ref.artifact_id,
+        },
+        execution_options={},
+        cell_selection=cell_selection,
+        arrays={"values": (labels.shape, dtype_kind)},
     )
-    source_artifact = None
-    if hasattr(cell_data[label_column], "attrs"):
-        source_artifact = dict(cell_data[label_column].attrs).get("source_artifact")
+    write_cell_data_artifact(
+        store.zw,
+        planned,
+        {"values": labels},
+    )
     return {
+        "artifact": planned.ref.to_dict(),
         "sourceUri": source_uri,
-        "sourceArtifact": source_artifact,
-        "destColumn": dest_column,
+        "sourceArtifact": source_ref.to_dict(),
         "rowSelectionFingerprint": _ordered_id_digest(source_ids),
         "labelFingerprint": _ordered_id_digest(np.asarray(labels, dtype=object)),
         "groupCount": len(groups),
-        "activeCells": int(target_active.sum()),
+        "activeCells": target_selection.selected_count,
         "kind": "observed",
     }
 
 
 def _validate_experiment(
-    store: DataStore, workflow: WorkflowParameters
+    store: DataStore,
+    workflow: WorkflowParameters,
+    *,
+    pca: ArtifactRef,
+    clusters: ArtifactRef,
+    markers: ArtifactRef,
 ) -> dict[str, Any]:
-    pca_refs = store.list_artifacts(
-        kind="reduction",
-        from_assay=workflow.assayName,
-        scope="assay",
-        complete_only=True,
-    )
-    marker_refs = store.list_artifacts(
-        kind="marker_table",
-        from_assay=workflow.assayName,
-        scope="assay",
-        complete_only=True,
-    )
-    pca_complete = bool(pca_refs) and store.inspect_artifact(pca_refs[-1]).complete
-    imported = workflow.resolvedMarkerGroupKey in store.cells.columns
-    marker_complete = (
-        bool(marker_refs) and store.inspect_artifact(marker_refs[-1]).complete
-    )
+    pca_status = store.inspect_artifact(pca)
+    cluster_status = store.inspect_artifact(clusters)
+    marker_status = store.inspect_artifact(markers)
+    pca_complete = pca_status.complete
+    imported = clusters.kind == "cluster_labels" and cluster_status.complete
+    marker_complete = marker_status.complete
     validate_experiment_branches(
         pcaComplete=pca_complete,
-        importedColumnPresent=imported,
+        importedClusterComplete=imported,
         markerComplete=marker_complete,
     )
-    pca_status = store.inspect_artifact(pca_refs[-1])
-    marker_status = store.inspect_artifact(marker_refs[-1])
     return {
         "pcaBranch": {
-            "artifactId": pca_refs[-1].artifact_id,
+            "artifactId": pca.artifact_id,
             "complete": pca_status.complete,
         },
         "markerBranch": {
-            "artifactId": marker_refs[-1].artifact_id,
+            "artifactId": markers.artifact_id,
             "complete": marker_status.complete,
-            "groupKey": workflow.resolvedMarkerGroupKey,
+            "clustersArtifactId": clusters.artifact_id,
         },
         "kind": "observed",
     }
+
+
+def _profile_input(
+    inputs: dict[str, ArtifactRef],
+    *,
+    name: str,
+    kind: str,
+    assay: str,
+) -> ArtifactRef:
+    ref = inputs.get(name)
+    if ref is None:
+        raise ValueError(f"Profiling stage requires explicit {name!r} input ({kind})")
+    expected_scope = "datastore" if kind == "cell_selection" else "assay"
+    expected_assay = None if expected_scope == "datastore" else assay
+    if ref.scope != expected_scope or ref.assay != expected_assay or ref.kind != kind:
+        raise ValueError(
+            f"Profiling input {name!r} must be a {expected_scope}-scoped "
+            f"{kind} artifact for {expected_assay!r}"
+        )
+    return ref
 
 
 def _run_analysis(
@@ -1196,25 +1349,30 @@ def _run_analysis(
     resources: StageResources,
     *,
     invalidateCache: bool = False,
-    hvgRef: ArtifactRef | None = None,
+    inputRefs: dict[str, ArtifactRef] | None = None,
 ) -> dict[str, Any] | None:
+    inputs = inputRefs or {}
     if stage == "filterCells":
-        store.auto_filter_cells(
+        ref = store.auto_filter_cells(
             attrs=workflow.filterAttrs,
             min_p=workflow.filterMinQuantile,
             max_p=workflow.filterMaxQuantile,
-            show_qc_plots=False,
             invalidate_cache=invalidateCache,
         )
-        return None
+        return {"artifact": ref.to_dict()}
     if stage == "markHvgs":
-        ref = store.mark_hvgs(
+        cell_selection = _profile_input(
+            inputs,
+            name="cells",
+            kind="cell_selection",
+            assay=workflow.assayName,
+        )
+        ref = store.select_hvgs(
+            cell_selection,
             from_assay=workflow.assayName,
-            cell_key=workflow.cellKey,
             min_cells=workflow.hvgMinCells,
             top_n=workflow.topN,
             show_plot=False,
-            label=workflow.hvgLabel,
             invalidate_cache=invalidateCache,
         )
         return {
@@ -1226,112 +1384,188 @@ def _run_analysis(
             ),
         }
     if stage == "runNormalization":
-        feature_selection = hvgRef
-        if feature_selection is None:
-            feature_selection = store.resolve_features(
-                workflow.assayName,
-                workflow.hvgLabel,
-            )
-        store.run_normalization(
-            from_assay=workflow.assayName,
-            cell_key=workflow.cellKey,
-            features=feature_selection,
-            update_state=True,
+        feature_selection = _profile_input(
+            inputs,
+            name="features",
+            kind="feature_selection",
+            assay=workflow.assayName,
+        )
+        cell_selection = _profile_input(
+            inputs,
+            name="cells",
+            kind="cell_selection",
+            assay=workflow.assayName,
+        )
+        ref = store.run_normalization(
+            cell_selection,
+            feature_selection,
             invalidate_cache=invalidateCache,
         )
-        return None
+        return {"artifact": ref.to_dict()}
     if stage == "runPca":
-        store.run_pca(
-            from_assay=workflow.assayName,
+        normalized = _profile_input(
+            inputs,
+            name="normalized",
+            kind="normalized",
+            assay=workflow.assayName,
+        )
+        ref = store.run_pca(
+            normalized,
             dims=workflow.dims,
             local_cache=workflow.graphLocalCache,
             show_elbow_plot=False,
-            update_state=True,
             invalidate_cache=invalidateCache,
         )
-        return None
+        return {"artifact": ref.to_dict()}
     if stage == "buildEmbeddingInitialization":
-        store.build_embedding_initialization(
-            from_assay=workflow.assayName,
+        reduction = _profile_input(
+            inputs,
+            name="coordinates",
+            kind="reduction",
+            assay=workflow.assayName,
+        )
+        ref = store.build_embedding_initialization(
+            reduction,
             n_centroids=workflow.nCentroids,
             rand_state=workflow.graphSeed,
             kmeans_sampling=workflow.kmeansSampling,
             kmeans_batch_size=workflow.kmeansBatchSize,
-            update_state=True,
             invalidate_cache=invalidateCache,
         )
-        return None
+        return {"artifact": ref.to_dict()}
     if stage == "buildAnnIndex":
-        store.build_ann_index(
-            from_assay=workflow.assayName,
+        reduction = _profile_input(
+            inputs,
+            name="coordinates",
+            kind="reduction",
+            assay=workflow.assayName,
+        )
+        ref = store.build_ann_index(
+            reduction,
             ann_efc=min(100, max(workflow.k * 3, 50)),
             ann_ef=min(100, max(workflow.k * 3, 50)),
             ann_m=min(max(48, int(workflow.dims * 1.5)), 64),
             ann_parallel=workflow.annParallel,
             rand_state=workflow.graphSeed,
-            update_state=True,
             invalidate_cache=invalidateCache,
         )
-        return None
+        return {"artifact": ref.to_dict()}
     if stage == "queryNeighbors":
-        store.query_neighbors(
-            from_assay=workflow.assayName,
+        ann_index = _profile_input(
+            inputs,
+            name="ann_index",
+            kind="ann_index",
+            assay=workflow.assayName,
+        )
+        ref = store.query_neighbors(
+            ann_index,
             k=workflow.k,
-            update_state=True,
             invalidate_cache=invalidateCache,
         )
-        return None
+        return {"artifact": ref.to_dict()}
     if stage == "buildConnectivityMap":
-        store.build_connectivity_map(
-            from_assay=workflow.assayName,
-            update_state=True,
+        neighbors = _profile_input(
+            inputs,
+            name="neighbors",
+            kind="neighbors",
+            assay=workflow.assayName,
+        )
+        ref = store.build_connectivity_map(
+            neighbors,
             invalidate_cache=invalidateCache,
         )
-        return None
+        return {"artifact": ref.to_dict()}
     if stage == "runUmap":
-        store.run_umap(
-            from_assay=workflow.assayName,
-            cell_key=workflow.cellKey,
+        graph = _profile_input(
+            inputs,
+            name="graph",
+            kind="connectivity_map",
+            assay=workflow.assayName,
+        )
+        initialization = _profile_input(
+            inputs,
+            name="initialization",
+            kind="embedding_initialization",
+            assay=workflow.assayName,
+        )
+        ref = store.run_umap(
+            graph,
+            initialization,
             n_epochs=workflow.umapEpochs,
             random_seed=workflow.umapSeed,
-            label=workflow.umapLabel,
             parallel=workflow.umapParallel,
             nthreads=resources.workers,
             invalidate_cache=invalidateCache,
         )
-        return None
+        return {"artifact": ref.to_dict()}
     if stage == "runLeiden":
         raise AssertionError("runLeiden must execute in its child process")
     if stage == "findMarkers":
-        if workflow.markerFeatures == "all_features":
-            store._ensure_all_features(store._get_assay(workflow.assayName))
-            feature_selection = store.resolve_features(
-                workflow.assayName,
-                "all_features",
-            )
-        else:
-            feature_selection = store.resolve_features(
-                workflow.assayName,
-                workflow.markerFeatures,
-            )
-        store.run_marker_search(
+        clusters = _profile_input(
+            inputs,
+            name="clusters",
+            kind="cluster_labels",
+            assay=workflow.assayName,
+        )
+        feature_selection = store.set_feature_selection(
             from_assay=workflow.assayName,
-            group_key=workflow.resolvedMarkerGroupKey,
-            cell_key=workflow.cellKey,
+            mask=np.ones(
+                store.get_assay(workflow.assayName).feats.N,
+                dtype=bool,
+            ),
+            invalidate_cache=invalidateCache,
+        )
+        ref = store.run_marker_search(
+            clusters,
+            from_assay=workflow.assayName,
             features=feature_selection,
             nthreads=resources.workers,
-            skip_save=False,
             invalidate_cache=invalidateCache,
         )
         return {
+            "artifact": ref.to_dict(),
             "consume": _feature_consume_details(
                 workflow,
                 resources,
                 unitKind="countsTReadGroup",
-            )
+            ),
         }
     if stage == "importClusters":
-        return _import_cluster_labels(store, workflow)
+        cell_selection = _profile_input(
+            inputs,
+            name="cells",
+            kind="cell_selection",
+            assay=workflow.assayName,
+        )
+        return _import_cluster_labels(
+            store,
+            workflow,
+            cell_selection=cell_selection,
+        )
     if stage == "validateExperiment":
-        return _validate_experiment(store, workflow)
+        pca = _profile_input(
+            inputs,
+            name="pca",
+            kind="reduction",
+            assay=workflow.assayName,
+        )
+        markers = _profile_input(
+            inputs,
+            name="markers",
+            kind="marker_table",
+            assay=workflow.assayName,
+        )
+        clusters = _profile_input(
+            inputs,
+            name="clusters",
+            kind="cluster_labels",
+            assay=workflow.assayName,
+        )
+        return _validate_experiment(
+            store,
+            workflow,
+            pca=pca,
+            clusters=clusters,
+            markers=markers,
+        )
     raise ValueError(f"No analysis operation for {stage}")

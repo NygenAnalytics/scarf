@@ -37,8 +37,8 @@ Published remote object-store funnel timings are in {doc}`../concepts/benchmarks
 
 ## 1. Open the public demo store
 
-The `scarf_docs` Cytebase repository publishes one analyzed store unpacked, so you can open it directly instead of downloading an archive.
-`Repository.open_zarr` returns a read-only Zarr group; pass its store to `DataStore`.
+The `scarf_docs` Cytebase repository publishes one analyzed store unpacked, so you can open its URI directly instead of downloading an archive.
+Pass `token=False` for anonymous read-only access to this public Hugging Face bucket.
 
 ```{code-cell} ipython3
 import scarf
@@ -46,9 +46,17 @@ import scarf
 scarf.configure_output(level="ERROR", progress=True)
 
 repository = scarf.cytebase.connect('scarf_docs')
-remote_group = repository.open_zarr('tenx_5K_pbmc_rnaseq/data.zarr')
+source_uri = (
+    'hf://buckets/Nygen/cytebase/scarf_docs/'
+    'tenx_5K_pbmc_rnaseq/data.zarr'
+)
 
-ds = scarf.DataStore(remote_group.store, zarr_mode='r', nthreads=4)
+ds = scarf.DataStore(
+    source_uri,
+    zarr_mode='r',
+    storage_options={'token': False},
+    nthreads=4,
+)
 print(ds)
 ```
 
@@ -56,16 +64,11 @@ Opening a store over object storage costs many small metadata requests, so expec
 Nothing but metadata is read until you touch the counts.
 The printed summary lists active cells, assays, and the cell and feature columns already present in the remote store.
 
-The published store predates the current artifact contract.
-Counts and literal metadata remain readable, including its UMAP columns and cluster partition, while legacy analysis state fails closed instead of being migrated silently.
-The next section mounts those count matrices and builds a current analysis chain in a separate target.
+Counts and literal metadata in the published store remain readable, including its UMAP columns and
+cluster partition. New computations write exact artifacts to the mounted analysis target.
+The next section mounts those count matrices and builds a new explicit artifact chain in a separate target.
 
 ```{code-cell} ipython3
-try:
-    ds.get_assay_state('RNA')
-except scarf.IncompatibleAnalysisStateError as error:
-    print('Legacy state rejected:', error.code)
-
 ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_clusters',
@@ -82,31 +85,32 @@ It is mounted with `counts` and is not rewritten into the target.
 Non-RNA assays have no `countsT`.
 New metadata and analysis artifacts are written only to the target.
 
-The public snapshot used here predates the required RNA `countsT` layout, so first repack it structurally into a temporary local count source.
-The repack streams from the public URI, creates the transpose, and leaves the remote source unchanged.
-Mounting that repacked source into a separate target then prevents copied legacy analysis state from becoming active.
+The public snapshot used here predates the required RNA `countsT` layout, so first download its packaged Zarr store into a temporary directory and repack it locally.
+The repack creates the transpose and leaves the remote source unchanged.
+Mounting that repacked source into a separate target keeps copied literal metadata separate from newly computed artifacts.
 
 ```{code-cell} ipython3
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import numpy as np
+import matplotlib.pyplot as plt
 import zarr
 
 from scarf.tools.repack_zarr import repack_store
 
-source_uri = (
-    "hf://buckets/Nygen/cytebase/scarf_docs/"
-    "tenx_5K_pbmc_rnaseq/data.zarr"
-)
 mount_directory = TemporaryDirectory()
+staged_dataset = repository.download_dataset(
+    'tenx_5K_pbmc_rnaseq',
+    destination=mount_directory.name,
+    zarr=True,
+)
 repacked_path = Path(mount_directory.name) / 'counts.zarr'
 target_path = Path(mount_directory.name) / 'analysis.zarr'
 
 repack_store(
-    source_uri,
+    str(staged_dataset / 'data.zarr'),
     str(repacked_path),
-    storage_options={"token": False},
     nthreads=2,
 )
 ```
@@ -124,7 +128,8 @@ mounted = scarf.mount_datastore(
 matrix_source = zarr.open_group(str(target_path), mode='r').attrs['matrixSource']
 print('Target path:', target_path)
 print('Target exists:', target_path.exists())
-print('Original source URI:', source_uri)
+print('Remote demo URI:', source_uri)
+print('Downloaded dataset:', staged_dataset)
 print('Mounted count source:', matrix_source['location'])
 print('Mounted assays:', sorted(matrix_source['assays']))
 ```
@@ -135,16 +140,16 @@ The printed `matrixSource` record is what later reopen uses to resolve the repac
 
 ```{mermaid}
 flowchart LR
-    source["Read-only remote source<br/>legacy counts"]
-    repack["Temporary structural repack<br/>counts and RNA countsT"]
-    mount["Mounted DataStore"]
-    target["Writable target<br/>metadata and new artifacts"]
-    source -->|stream once| repack
-    repack -->|stream count blocks| mount
-    mount -->|write analysis results| target
+    source["Read-only remote dataset"]
+    staged["Temporary local download<br/>counts and metadata"]
+    repack["Local count source<br/>counts and RNA countsT"]
+    target["Writable mounted target<br/>metadata and new artifacts"]
+    source -->|download once| staged
+    staged -->|repack locally| repack
+    repack -->|mount count blocks| target
 ```
 
-The target assay has no physical count array, while `rawData` exposes the complete remote matrix:
+The target assay has no physical count array, while `rawData` exposes the complete mounted count matrix:
 
 ```{code-cell} ipython3
 target_root = zarr.open_group(str(target_path), mode='r')
@@ -159,38 +164,44 @@ Normalized data, reductions, neighbours, graph, UMAP, and clusters are written o
 Because that target is a local path, `local_cache` staging is skipped here; Section 4 makes the remote-only policy explicit and gives a writable-remote template.
 
 ```{code-cell} ipython3
-mounted_features = mounted.mark_hvgs(
+cell_selection = mounted.snapshot_cell_selection(cell_key='I')
+mounted_features = mounted.select_hvgs(
+    cell_selection,
     min_cells=20,
     top_n=500,
     show_plot=False,
-    label='mounted_hvgs',
 )
-normalized = mounted.run_normalization(features=mounted_features)
+normalized = mounted.run_normalization(cell_selection, mounted_features)
 pca = mounted.run_pca(normalized, dims=15)
 
-mounted.build_embedding_initialization(pca)
+initialization = mounted.build_embedding_initialization(pca)
 ann_index = mounted.build_ann_index(pca)
 neighbors = mounted.query_neighbors(ann_index, k=11)
 graph = mounted.build_connectivity_map(neighbors)
-mounted.run_umap(
-    graph=graph,
+mounted_umap = mounted.run_umap(
+    graph,
+    initialization,
     n_epochs=100,
     spread=5,
     min_dist=1,
     parallel=True,
-    label="mounted_UMAP",
 )
-mounted.run_leiden_clustering(
-    graph=graph,
+mounted_clusters = mounted.run_leiden_clustering(
+    graph,
     resolution=0.5,
-    label="mounted_clusters",
 )
 ```
 
 ```{code-cell} ipython3
-mounted.plots.embedding(
-    layout_key="RNA_mounted_UMAP",
-    color_by="RNA_mounted_clusters",
+mounted_umap_values = np.asarray(mounted.load_artifact(mounted_umap)['values'][:])
+mounted_cluster_values = np.asarray(
+    mounted.load_artifact(mounted_clusters)['values'][:]
+)
+plt.scatter(
+    mounted_umap_values[:, 0],
+    mounted_umap_values[:, 1],
+    c=mounted_cluster_values,
+    s=3,
 )
 ```
 
@@ -316,7 +327,6 @@ pca_without_staging = mounted.run_pca(
     normalized,
     dims=15,
     local_cache=str(scratch_dir),
-    update_state=False,
 )
 staged_bytes = sum(
     path.stat().st_size for path in scratch_dir.rglob('*') if path.is_file()
@@ -330,18 +340,19 @@ print('Reduction reused:', pca_without_staging == pca)
 On your own writable remote store, the same path-string policy stages normalized blocks and keeps the cache for inspection or reuse:
 
 ```python
-features = remote_writable.mark_hvgs(
+cell_selection = remote_writable.snapshot_cell_selection(cell_key="I")
+features = remote_writable.select_hvgs(
+    cell_selection,
     min_cells=20,
     top_n=2000,
     show_plot=False,
 )
-normalized = remote_writable.run_normalization(features=features)
+normalized = remote_writable.run_normalization(cell_selection, features)
 reduction = remote_writable.run_pca(
     normalized,
     dims=15,
     local_cache="/tmp/scarf_pca_scratch",
 )
-remote_writable.build_embedding_initialization(reduction)
 ann_index = remote_writable.build_ann_index(reduction)
 neighbors = remote_writable.query_neighbors(ann_index, k=11)
 remote_writable.build_connectivity_map(neighbors)
