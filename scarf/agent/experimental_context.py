@@ -468,9 +468,7 @@ async def analyze_experimental_design(
         raise ModelRetry("; ".join(characterization.notes))
 
     proposed_batch_columns = (
-        [batch_columns]
-        if isinstance(batch_columns, str)
-        else list(batch_columns or [])
+        [batch_columns] if isinstance(batch_columns, str) else list(batch_columns or [])
     )
     canonical_batch_columns = sorted(set(proposed_batch_columns))
     if len(canonical_batch_columns) != len(proposed_batch_columns):
