@@ -15,6 +15,8 @@ from pydantic_ai.usage import RunUsage
 from scarf.agent.experimental_context import (
     BatchCorrectionPlan,
     BatchSafetyEvidence,
+    CellQcPlan,
+    CellQcProfileEvidence,
     CovariateEvidence,
     ExperimentalContextAgent,
     ExperimentalContextDecision,
@@ -31,6 +33,12 @@ from scarf.agent.characterize_covariates import CovariateCharacterization
 from scarf.agent.types import ExperimentalBiologyHandoff, ExperimentalTuningHandoff
 
 type TestAction = Literal["skip", "evaluateHarmony", "unsafe", "needsInput"]
+
+
+class _Root(dict[str, Any]):
+    def __init__(self, assay_types: dict[str, str]) -> None:
+        super().__init__()
+        self.attrs = {"assayTypes": assay_types}
 
 
 class _Cells:
@@ -157,6 +165,8 @@ def test_agent_models_have_blank_and_example_constructors() -> None:
         InferenceUnit,
         BatchCorrectionPlan,
         BatchSafetyEvidence,
+        CellQcPlan,
+        CellQcProfileEvidence,
         CovariateEvidence,
         ExperimentalContextDecision,
         RepresentationEvaluation,
@@ -239,6 +249,9 @@ def test_agent_runs_only_read_only_tools_and_returns_a_grounded_report() -> None
     assert biology_handoff.conditionColumn == "disease"
     assert biology_handoff.observationUnit == "sample"
     assert result.runInfo.agentName == "experimental_context"
+    assert result.cellQc == result.decision.cellQc
+    assert result.cellQc.action == "skip"
+    assert result.qcProfiles[0].activeCells == 12
     assert [call.toolName for call in result.runInfo.toolCalls] == [
         "inspect_cell_covariates",
         "analyze_experimental_design",
@@ -301,6 +314,159 @@ def test_tools_build_a_grounded_design_report_without_mutation() -> None:
     assert set(store.cells.columns) == columns_before
     assert store.list_artifacts(from_assay="RNA") == artifacts_before
     assert store.get_assay_state("RNA") == state_before
+
+
+def test_qc_profiles_use_persisted_modality_and_shared_cell_selection() -> None:
+    store = _Store()
+    store.assay_names = ["protein", "peaks", "transcript"]
+    store.zw = _Root(
+        {
+            "protein": "ADT",
+            "peaks": "ATAC",
+            "transcript": "RNA",
+        }
+    )
+    store.cells._values["I"][:2] = False
+    store.cells._values["transcript_nCounts"] = np.asarray(
+        [1, 2, 5, 9, 10, 11, 12, 13, 14, 15, 50, 100],
+        dtype=float,
+    )
+    store.cells._values["transcript_nFeatures"] = np.asarray(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 30],
+        dtype=float,
+    )
+    store.cells._values["peaks_nCounts"] = np.arange(12, dtype=float) + 1
+    context = _context(store)
+
+    inspected = asyncio.run(inspect_cell_covariates(context))
+
+    assert {profile.action for profile in inspected.qcProfiles} == {
+        "skip",
+        "globalGaussian",
+    }
+    for profile in inspected.qcProfiles:
+        assert profile.driverAssay == "transcript"
+        assert profile.driverAssayType == "RNA"
+        assert profile.cellKey == "I"
+        assert profile.activeCells == 10
+        assert profile.retainedCells <= 10
+    global_profile = next(
+        profile
+        for profile in inspected.qcProfiles
+        if profile.action == "globalGaussian"
+    )
+    assert global_profile.attributes == [
+        "transcript_nCounts",
+        "transcript_nFeatures",
+    ]
+
+
+def test_design_tool_offers_only_grounded_sample_mad_profiles() -> None:
+    store = _Store()
+    store.cells._values["RNA_nCounts"] = np.arange(12, dtype=float) + 1
+    store.cells._values["RNA_nFeatures"] = np.arange(12, dtype=float) + 5
+    context = _context(store)
+    decision = _design_decision()
+
+    asyncio.run(inspect_cell_covariates(context))
+    analyzed = asyncio.run(
+        analyze_experimental_design(
+            context,
+            column_domains=decision.columnDomains,
+            coefficients_of_interest=decision.coefficientsOfInterest,
+            units_of_inference=decision.unitsOfInference,
+            batch_columns=decision.batchCorrection.batchColumns,
+        )
+    )
+
+    sample_profile = next(
+        profile for profile in analyzed.qcProfiles if profile.action == "sampleMad"
+    )
+    assert sample_profile.sampleColumn == "sample"
+    assert sample_profile.parameters == {
+        "nMads": 3.0,
+        "minCellsPerSample": 20,
+        "nSamples": 4,
+        "nSkippedSamples": 4,
+    }
+    assert sample_profile.retainedCells == 12
+    assert sample_profile.evidenceId in analyzed.evidenceIds
+
+    decision.cellQc = CellQcPlan(
+        action=sample_profile.action,
+        profileId=sample_profile.profileId,
+        driverAssay=sample_profile.driverAssay,
+        driverAssayType=sample_profile.driverAssayType,
+        cellKey=sample_profile.cellKey,
+        sampleColumn=sample_profile.sampleColumn,
+        rationale="Use sample-aware retention evidence.",
+        evidenceIds=[sample_profile.evidenceId],
+    )
+    validated = validate_experimental_context(decision, context.deps)
+    assert validated.cellQc == decision.cellQc
+
+
+def test_caller_qc_direction_overrides_model_profile_selection() -> None:
+    store = _Store()
+    store.cells._values["RNA_nCounts"] = np.arange(12, dtype=float) + 1
+    store.cells._values["RNA_nFeatures"] = np.arange(12, dtype=float) + 5
+    context = _context(
+        store,
+        directions={"cellQc": {"action": "sampleMad", "sampleColumn": "sample"}},
+    )
+    decision = _design_decision()
+
+    asyncio.run(inspect_cell_covariates(context))
+    asyncio.run(
+        analyze_experimental_design(
+            context,
+            column_domains=decision.columnDomains,
+            coefficients_of_interest=decision.coefficientsOfInterest,
+            units_of_inference=decision.unitsOfInference,
+            batch_columns=decision.batchCorrection.batchColumns,
+        )
+    )
+    decision.cellQc = CellQcPlan(
+        action="skip",
+        profileId="model-authored-profile",
+        evidenceIds=["model-authored-evidence"],
+    )
+
+    validated = validate_experimental_context(decision, context.deps)
+
+    assert validated.cellQc.action == "sampleMad"
+    assert validated.cellQc.sampleColumn == "sample"
+    assert validated.cellQc.evidenceIds == [
+        next(
+            profile.evidenceId
+            for profile in context.deps.qcProfiles.values()
+            if profile.action == "sampleMad"
+        )
+    ]
+
+
+def test_adt_and_hto_do_not_drive_qc_and_hto_identity_remains_metadata() -> None:
+    store = _Store()
+    store.assay_names = ["protein", "hashtags"]
+    store.zw = _Root({"protein": "ADT", "hashtags": "HTO"})
+    store.cells._values["sample_id"] = np.asarray(
+        ["sample-a"] * 5 + ["sample-b"] * 5 + ["Negative", "Doublet"]
+    )
+    context = _context(
+        store,
+        directions={"htoIdentityColumn": "sample_id"},
+    )
+
+    inspected = asyncio.run(inspect_cell_covariates(context))
+
+    assert inspected.htoIdentityColumns == ["sample_id"]
+    assert "qcProfile:cellQc:none:none:I:skip" in inspected.evidenceIds
+    assert len(inspected.qcProfiles) == 1
+    profile = inspected.qcProfiles[0]
+    assert profile.action == "skip"
+    assert profile.driverAssay is None
+    assert profile.driverAssayType is None
+    assert profile.retainedCells == 12
 
 
 def test_validator_rejects_harmony_when_batch_confounds_biology() -> None:
@@ -504,6 +670,29 @@ def test_score_tool_reports_missing_graph_without_writing() -> None:
     assert evaluation.metrics == {}
     assert evaluation.notes == ["No current neighbors artifact is available"]
     assert store.list_artifacts(from_assay="RNA") == artifacts_before
+
+
+def test_score_tool_rejects_non_categorical_or_nontechnical_batch_column() -> None:
+    context = _context(_Store())
+    context.deps.characterization = CovariateCharacterization(
+        status="done",
+        columns=[
+            {
+                "name": "sequencing_depth",
+                "domain": "ignore",
+                "kind": "continuous",
+            }
+        ],
+    )
+
+    with pytest.raises(ModelRetry, match="categorical technical batch column"):
+        asyncio.run(
+            score_current_representation(
+                context,
+                batch_column="sequencing_depth",
+                from_assay="RNA",
+            )
+        )
 
 
 def test_metric_evidence_namespaces_exact_representation_artifacts() -> None:

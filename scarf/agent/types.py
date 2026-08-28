@@ -124,11 +124,33 @@ class TuningBiologyHandoff(AgentDataModel):
     """Exact selected clustering branch for Biological Interpretation."""
 
     fromAssay: str = ""
+    graphAssay: str | None = None
+    markerAssay: str | None = None
     cellKey: str = "I"
     recommendedCandidateId: str = ""
     clusterColumn: str = ""
     clusterArtifact: ArtifactReferenceModel | None = None
     evidenceIds: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def get_blank(cls) -> "TuningBiologyHandoff":
+        return cls()
+
+    @classmethod
+    def get_example(cls) -> "TuningBiologyHandoff":
+        return cls(
+            fromAssay="RNA",
+            graphAssay="RNA",
+            markerAssay="RNA",
+            recommendedCandidateId="baseline",
+            clusterColumn="RNA_agent_tuning_baseline",
+            clusterArtifact=ArtifactReferenceModel(
+                assay="RNA",
+                kind="cluster_labels",
+                artifactId="1" * 64,
+            ),
+            evidenceIds=["candidate:baseline:clusters"],
+        )
 
 
 class ToolCallInfo(AgentDataModel):

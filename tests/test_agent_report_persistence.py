@@ -486,6 +486,51 @@ def test_lineage_distinguishes_parallel_reports_and_persists_typed_handoffs(
     assert record_b1.invocation.tuningBiologyHandoff == tuning_1.to_biological_handoff()
 
 
+def test_biology_may_cite_context_without_a_treatment_handoff(
+    tmp_path: Path,
+) -> None:
+    path = _create_scarf_store(tmp_path)
+    create_agent_workflow(path, workflow_run_id="workflow-1")
+    experimental = _experimental_report("experimental-provider")
+    experimental_ref = save_agent_report(
+        path,
+        "workflow-1",
+        experimental,
+        invocation=_invocation("experimental_context"),
+        agent_run_id="e1",
+    )
+    experimental_link = AgentReportLink.from_reference(experimental_ref)
+    tuning = _tuning_report("tuning-provider")
+    tuning_ref = save_agent_report(
+        path,
+        "workflow-1",
+        tuning,
+        invocation=_invocation(
+            "parameter_tuning",
+            parents=[experimental_link],
+            experimentalTuningHandoff=experimental.to_parameter_tuning_handoff(),
+        ),
+        agent_run_id="t1",
+    )
+    tuning_link = AgentReportLink.from_reference(tuning_ref)
+
+    biology_ref = save_agent_report(
+        path,
+        "workflow-1",
+        BiologicalInterpretationReport.get_example(),
+        invocation=_invocation(
+            "biological_interpretation",
+            parents=[experimental_link, tuning_link],
+            tuningBiologyHandoff=tuning.to_biological_handoff(),
+        ),
+        agent_run_id="b1",
+    )
+
+    record = load_agent_record(path, biology_ref)
+    assert record.invocation.parentReports == [experimental_link, tuning_link]
+    assert record.invocation.experimentalBiologyHandoff is None
+
+
 def test_lineage_rejects_unknown_cross_workflow_and_changed_parent_links(
     tmp_path: Path,
 ) -> None:

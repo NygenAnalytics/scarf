@@ -991,11 +991,17 @@ def _validate_invocation(
 
     if agent_name == "biological_interpretation":
         experimental_parents = parents["experimental_context"]
-        if _has_handoff_parent(
-            label="experimentalBiologyHandoff",
-            supplied=invocation.experimentalBiologyHandoff,
-            parent_records=experimental_parents,
-        ):
+        if len(experimental_parents) > 1:
+            raise ValueError(
+                "Biological Interpretation accepts at most one Experimental "
+                "Context parent report"
+            )
+        if invocation.experimentalBiologyHandoff is not None:
+            if len(experimental_parents) != 1:
+                raise ValueError(
+                    "experimentalBiologyHandoff requires exactly one matching "
+                    "parent report"
+                )
             assert invocation.experimentalBiologyHandoff is not None
             expected_experimental = ExperimentalContextResult.model_validate(
                 experimental_parents[0].report
