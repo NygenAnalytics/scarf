@@ -475,8 +475,7 @@ def parameter_search_prompt(
     evaluation_payload = [evaluation.model_dump() for evaluation in evaluations]
     correction_modes = ["none", "harmony"] if harmony_authorized else ["none"]
     return (
-        dedent(
-            """
+        dedent("""
         Inspect the completed initial screen for assay {from_assay} and cell
         selection {cell_key}.
 
@@ -490,8 +489,7 @@ def parameter_search_prompt(
 
         Return one ParameterSearchPlan. Refinement is optional and is limited to
         one deterministic follow-up pass.
-        """
-        )
+        """)
         .strip()
         .format(
             from_assay=from_assay,

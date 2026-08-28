@@ -35,6 +35,19 @@ from .parameter_tuning import (
     get_default_parameter_candidates,
     tune_parameters,
 )
+from .persistence import (
+    AgentName,
+    AgentReport,
+    AgentReportReference,
+    AgentReportType,
+    AgentWorkflowRun,
+    create_agent_workflow,
+    list_agent_reports,
+    list_agent_workflows,
+    load_agent_report,
+    load_agent_workflow,
+    save_agent_report,
+)
 from .runtime import check_runtime, load_env
 from .types import (
     BatchSafetyEvidence,
@@ -50,6 +63,11 @@ from .types import (
 
 __all__ = [
     "AgentRunConfig",
+    "AgentName",
+    "AgentReport",
+    "AgentReportReference",
+    "AgentReportType",
+    "AgentWorkflowRun",
     "BatchSafetyEvidence",
     "BiologicalContext",
     "BiologicalInterpretationAgent",
@@ -78,12 +96,18 @@ __all__ = [
     "characterize_covariates",
     "characterize_features",
     "check_runtime",
+    "create_agent_workflow",
     "decide",
     "detect_format",
     "get_default_parameter_candidates",
     "ingest",
     "load_env",
+    "list_agent_reports",
+    "list_agent_workflows",
+    "load_agent_report",
+    "load_agent_workflow",
     "run_agent",
     "run_agent_sync",
+    "save_agent_report",
     "tune_parameters",
 ]
