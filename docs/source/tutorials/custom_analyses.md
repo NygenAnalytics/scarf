@@ -28,10 +28,11 @@ Scarf exposes graphs, bounded count streams, metadata tables, and export formats
 
 ## 1. Prepare a store
 
-The published PBMC store supplies the counts and active-cell metadata for the examples below.
-The page structurally repacks those counts, mounts them into a separate analysis store, and
-uses the standard RNA pipeline to rebuild the graph with exact artifact references.
-Only the graph-statistic and `wellConnected` path uses `load_graph`.
+The rebuilt PBMC store supplies counts and a completed standard run labeled `docs_default`.
+Open the downloaded store directly because the examples write custom artifacts and metadata, then
+reuse the run's frozen selection, graph, feature selection, and UMAP. The prepared store's active
+`I` matches the run's analysis selection.
+Only the graph-statistic and `wellConnected` paths use `load_graph`.
 Streaming, `set_feature_selection`, custom reduction, `to_anndata`, and `SubsetZarr` do not.
 See {doc}`graph_construction` to build a graph by hand.
 
@@ -39,53 +40,22 @@ See {doc}`graph_construction` to build a graph by hand.
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 
 import scarf
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-repacked_counts = str(Path(analysis_directory.name) / "counts.zarr")
-repack_store(
-    f"{dataset}/data.zarr",
-    repacked_counts,
-    nthreads=2,
-)
-ds = scarf.mount_datastore(
-    repacked_counts,
-    at=str(Path(analysis_directory.name) / "custom_analysis.zarr"),
-    default_assay="RNA",
-    nthreads=4,
-)
-setup = ds.pipeline.run(
-    filtering=False,
-    hvg_count=500,
-    pca_dims=15,
-    umap=False,
-    leiden=False,
-    cell_cycle=False,
-    paris=False,
-    doublets=False,
-    markers=False,
-)
-hvg_ref = setup["highly_variable_features"]
-graph_ref = setup["connectivity_map"]
-initialization = ds.build_embedding_initialization(setup["pca"])
-umap_ref = ds.run_umap(
-    graph_ref,
-    initialization,
-    n_epochs=100,
-    parallel=True,
-)
-layout = np.asarray(ds.load_artifact(umap_ref)["values"][:])
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+run = ds.pipeline.open(label="docs_default")
+graph_ref = run["connectivity_map"]
+layout = run.cells.to_pandas_dataframe(["umap_1", "umap_2"]).to_numpy()
 ```
 
 ## 2. Calculate from the graph
@@ -133,13 +103,16 @@ Rebuilds with another feature set or neighbour count need a new statistic.
 ## 3. Stream count blocks
 
 Avoid `.compute()` on a matrix that may exceed memory.
-Slice to the intended cell index and the indexes from the feature-selection artifact, then process
-ordered row blocks.
+Slice to the frozen run's cell and highly variable feature indexes, then process ordered row
+blocks.
 This example counts detected HVGs per active cell:
 
 ```{code-cell} ipython3
-cell_index = ds.cells.active_index("I")
-hvg_values = np.asarray(ds.load_artifact(hvg_ref)["values"][:], dtype=bool)
+cell_index = np.flatnonzero(run.cells.fetch_all("I"))
+hvg_values = np.asarray(
+    run.features.fetch_all("highly_variable_features"),
+    dtype=bool,
+)
 feature_index = np.flatnonzero(hvg_values)
 selected_counts = ds.RNA.rawData[:, feature_index][cell_index, :]
 
@@ -164,8 +137,8 @@ ds.cells.insert(
 }
 ```
 
-`stream_blocks` preserves row order.
-Insert with the same `cell_key` used to construct the view so values align with metadata rows.
+`stream_blocks` preserves row order. Because active `I` is the frozen run selection, inserting with
+that key keeps each streamed value aligned with its metadata row.
 The summary checks that every streamed cell received a detection count.
 
 ## 4. Create custom selections
@@ -206,7 +179,7 @@ panel_mask = np.isin(feature_names, panel_genes)
 custom_features = ds.set_feature_selection(
     mask=panel_mask,
 )
-custom_features, int(np.asarray(ds.load_artifact(custom_features)["values"][:]).sum())
+custom_features, int(panel_mask.sum())
 ```
 
 The returned reference identifies this exact panel. Pass it directly to later computations instead
@@ -252,7 +225,8 @@ adata.shape, adata.var_names.tolist()
 ```
 
 ```{code-cell} ipython3
-subset_path = Path(analysis_directory.name) / "custom_analyses_subset.zarr"
+export_directory = TemporaryDirectory()
+subset_path = Path(export_directory.name) / "custom_analyses_subset.zarr"
 
 writer = scarf.SubsetZarr(
     zarr_loc=str(subset_path),

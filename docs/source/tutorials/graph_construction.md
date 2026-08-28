@@ -44,12 +44,11 @@ The stage methods below expose the same persisted results with more control.
 
 ## 2. Build an RNA graph explicitly
 
-The downloaded store is structurally repacked and mounted as a count source so this page builds a complete graph without reusing persisted analysis outputs.
+The rebuilt store carries a completed `docs_default` pipeline run. This page starts from that
+run's frozen cell and feature selections, then calls every graph stage explicitly. Identical calls
+reuse the completed baseline artifacts; later sections create only the branches they discuss.
 
 ```{code-cell} ipython3
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -57,40 +56,19 @@ import pandas as pd
 import scarf
 import scarf.plotting as splt
 from scarf.embeddings import initial_embedding
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-repacked_counts = str(Path(analysis_directory.name) / "counts.zarr")
-repack_store(
-    f"{dataset}/data.zarr",
-    repacked_counts,
-    nthreads=2,
-)
-ds = scarf.mount_datastore(
-    repacked_counts,
-    at=str(Path(analysis_directory.name) / "graph_analysis.zarr"),
-    default_assay="RNA",
-    nthreads=4,
-    min_features_per_cell=10,
-)
-cell_selection = ds.filter_cells(
-    attrs=["RNA_nCounts", "RNA_nFeatures"],
-    highs=[15000, 4000],
-    lows=[1000, 500],
-)
-hvg_ref = ds.select_hvgs(
-    cell_selection,
-    min_cells=20,
-    top_n=500,
-    show_plot=False,
-)
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+baseline = ds.pipeline.open(label="docs_default")
+cell_selection = baseline["analysis_cell_selection"]
+hvg_ref = baseline["highly_variable_features"]
+run_cells = baseline.cells
 ```
 
 Each method returns an {term}`ArtifactRef`.
@@ -99,10 +77,7 @@ Passing it to the next method makes the dependency explicit.
 ```{code-cell} ipython3
 normalized = ds.run_normalization(cell_selection, hvg_ref)
 pca = ds.run_pca(normalized, dims=15)
-initialization = ds.build_embedding_initialization(
-    pca,
-    n_centroids=100,
-)
+initialization = ds.build_embedding_initialization(pca)
 ann_index = ds.build_ann_index(pca)
 neighbors = ds.query_neighbors(ann_index, k=11)
 graph = ds.build_connectivity_map(neighbors)
@@ -163,12 +138,8 @@ pd.Series(
 degree_vs_qc = pd.DataFrame(
     {
         "degree": degrees,
-        "RNA_nCounts": ds.cells.fetch_all("RNA_nCounts")[
-            np.asarray(ds.load_artifact(cell_selection)["values"][:], dtype=bool)
-        ],
-        "RNA_nFeatures": ds.cells.fetch_all("RNA_nFeatures")[
-            np.asarray(ds.load_artifact(cell_selection)["values"][:], dtype=bool)
-        ],
+        "RNA_nCounts": run_cells.fetch("RNA_nCounts"),
+        "RNA_nFeatures": run_cells.fetch("RNA_nFeatures"),
     }
 )
 degree_vs_qc.corr(numeric_only=True)
@@ -183,10 +154,9 @@ Every stage consumes the exact reference returned by its predecessor, so result 
 Keep the references you need, or retain them together in a small mapping owned by your analysis code.
 
 ```{code-cell} ipython3
-normalized_status = ds.inspect_artifact(normalized)
 {
     "cell selection": cell_selection,
-    "feature selection": normalized_status.inputs["feature_selection"],
+    "feature selection": hvg_ref,
     "normalization": normalized,
     "reduction": pca,
     "embedding initialization": initialization,
@@ -229,12 +199,7 @@ Each returns an immutable artifact without adding cell-metadata columns. Use
 `load_paris_clustering(ref)` only when hierarchy diagnostics are needed.
 
 ```{code-cell} ipython3
-umap = ds.run_umap(
-    graph,
-    initialization,
-    n_epochs=100,
-    parallel=True,
-)
+umap = ds.run_umap(graph, initialization)
 clusters = ds.run_leiden_clustering(graph, resolution=0.5)
 umap_values = np.asarray(ds.load_artifact(umap)["values"][:])
 cluster_values = np.asarray(ds.load_artifact(clusters)["values"][:])
@@ -251,13 +216,8 @@ Suppose the PCA and ANN index are expensive but two neighbour counts need to be 
 Reuse the same index and retain both returned graph references.
 
 ```{code-cell} ipython3
-neighbors_k21 = ds.query_neighbors(
-    ann_index,
-    k=21,
-)
-graph_k21 = ds.build_connectivity_map(
-    neighbors_k21,
-)
+neighbors_k21 = ds.query_neighbors(ann_index, k=21)
+graph_k21 = ds.build_connectivity_map(neighbors_k21)
 graph_k21 != graph
 ```
 
@@ -267,9 +227,7 @@ Downstream calls must receive one of them explicitly, so a parameter experiment 
 Degree and edge weight both shift when every cell sees more neighbours:
 
 ```{code-cell} ipython3
-loaded_graph_k21 = ds.load_graph(
-    graph=graph_k21,
-)
+loaded_graph_k21 = ds.load_graph(graph_k21)
 pd.Series(
     {
         "k=11 nnz": int(loaded_graph.nnz),
@@ -287,10 +245,7 @@ To analyse the side branch, pass its exact graph reference.
 Retain both returned refs so neither branch replaces the other.
 
 ```{code-cell} ipython3
-clusters_k21 = ds.run_leiden_clustering(
-    graph_k21,
-    resolution=0.5,
-)
+clusters_k21 = ds.run_leiden_clustering(graph_k21, resolution=0.5)
 ```
 
 Place both partitions on the shared `k=11` UMAP so absorption is visible, then quantify agreement with a crosstab:

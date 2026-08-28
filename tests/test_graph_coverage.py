@@ -435,48 +435,6 @@ def test_legacy_filesystem_ann_is_not_loaded_without_zarr_bytes(
     assert legacy_path.exists()
 
 
-def test_partial_normalization_statistics_cache_paths(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = _memory_graph_store()
-    data = Mock()
-    data.mean.return_value = np.array([2.0, 4.0])
-    data.std.return_value = np.array([1.5, 2.5])
-    monkeypatch.setattr(
-        "scarf.datastore._operations.graph.compute_with_progress",
-        lambda values, *_: values,
-    )
-
-    missing_mu = store.zw.create_group("missingMu")
-    missing_mu.create_array("sigma", data=np.array([3.0, 5.0]))
-    mu, sigma = store._load_or_compute_norm_stats("missingMu", data, "pca")
-    np.testing.assert_allclose(mu, [2.0, 4.0])
-    np.testing.assert_allclose(sigma, [3.0, 5.0])
-    np.testing.assert_allclose(missing_mu["mu"][:], [2.0, 4.0])
-
-    missing_sigma = store.zw.create_group("missingSigma")
-    missing_sigma.create_array("mu", data=np.array([6.0, 8.0]))
-    mu, sigma = store._load_or_compute_norm_stats("missingSigma", data, "pca")
-    np.testing.assert_allclose(mu, [6.0, 8.0])
-    np.testing.assert_allclose(sigma, [1.5, 2.5])
-    np.testing.assert_allclose(missing_sigma["sigma"][:], [1.5, 2.5])
-
-    store.zarr_mode = "r"
-    read_only_mu = store.zw.create_group("readOnlyMu")
-    read_only_mu.create_array("sigma", data=np.array([3.0, 5.0]))
-    mu, sigma = store._load_or_compute_norm_stats("readOnlyMu", data, "pca")
-    np.testing.assert_allclose(mu, [2.0, 4.0])
-    np.testing.assert_allclose(sigma, [3.0, 5.0])
-    assert "mu" not in read_only_mu
-
-    read_only_sigma = store.zw.create_group("readOnlySigma")
-    read_only_sigma.create_array("mu", data=np.array([6.0, 8.0]))
-    mu, sigma = store._load_or_compute_norm_stats("readOnlySigma", data, "pca")
-    np.testing.assert_allclose(mu, [6.0, 8.0])
-    np.testing.assert_allclose(sigma, [1.5, 2.5])
-    assert "sigma" not in read_only_sigma
-
-
 def test_remote_cache_plan_auto_and_invalid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1607,23 +1565,6 @@ def test_ann_storage_fails_closed(
     )
     assert "writable_ann" in store.zw
     save_index.assert_called_once()
-
-
-def test_norm_statistics_populates_a_fully_empty_cache() -> None:
-    store = _memory_graph_store()
-    store.zw.create_group("stats")
-    data = Mock()
-    data.mean_and_std.return_value = (
-        np.asarray([2.0, np.nan]),
-        np.asarray([3.0, 0.0]),
-    )
-
-    mean, scale = store._load_or_compute_norm_stats("stats", data, "pca")
-
-    np.testing.assert_allclose(mean, [2.0, 0.0])
-    np.testing.assert_allclose(scale, [3.0, 1.0])
-    np.testing.assert_allclose(store.zw["stats/mu"][:], mean)
-    np.testing.assert_allclose(store.zw["stats/sigma"][:], scale)
 
 
 def test_normalized_local_cache_cleans_up_after_failure(

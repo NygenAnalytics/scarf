@@ -17,66 +17,45 @@ kernelspec:
 Pseudotime is an oriented summary of graph structure. Source and sink choices supervise that
 orientation; Scarf does not infer terminal states or causal lineage.
 
-## 1. Build an explicit graph
+## 1. Open the prepared graph
 
 ```{code-cell} ipython3
-from tempfile import TemporaryDirectory
-
 import numpy as np
 import pandas as pd
 
 import scarf
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     name="bastidas-ponce_4K_pancreas-d15_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-repacked_counts = f"{analysis_directory.name}/counts.zarr"
-repack_store(f"{dataset}/data.zarr", repacked_counts, nthreads=2)
-ds = scarf.mount_datastore(
-    repacked_counts,
-    at=f"{analysis_directory.name}/analysis.zarr",
+ds = scarf.DataStore(
+    f"{dataset}/data.zarr",
     nthreads=4,
-    default_assay="RNA",
 )
-
-preparation = ds.pipeline.run(
-    filtering=False,
-    hvg_count=2000,
-    pca_dims=15,
-    neighbors_k=11,
-    leiden=False,
-    cell_cycle=False,
-    paris=False,
-    doublets=False,
-    markers=False,
-)
-graph = preparation["connectivity_map"]
-all_features = preparation["feature_universe"]
+analysis_run = ds.pipeline.open(label="docs_default")
+graph = analysis_run["connectivity_map"]
+all_features = analysis_run["feature_universe"]
 ```
 
-The pipeline builds the standard RNA graph and UMAP without unrelated clustering, doublet, or
-marker stages. The teaching store's literal `clusters` column supplies external endpoint labels;
-it is not a result inferred by this run. Build a zero-sum source/sink vector over the exact graph
-rows. Ductal cells supply positive source mass; Alpha, Beta, and Delta cells share negative sink
-mass.
+The rebuilt catalog store contains the completed `docs_default` pipeline run. This page reuses its
+exact graph, feature universe, and UMAP. The teaching store's literal `clusters` column supplies
+external endpoint labels; it is not the clustering selected by the pipeline run. Build a zero-sum
+source/sink vector over the graph rows. Ductal cells supply positive source mass; Alpha, Beta, and
+Delta cells share negative sink mass.
 
 ```{code-cell} ipython3
-labels = np.asarray(ds.cells.fetch_all("clusters"))[
-    preparation.cells.fetch_all("I")
-]
+labels = ds.cells.fetch("clusters", key="I")
 source = labels == "Ductal"
 sink = np.isin(labels, ["Alpha", "Beta", "Delta"])
-if not source.any() or not sink.any() or np.any(source & sink):
-    raise ValueError("Source and sink labels must be non-empty and disjoint")
+if not source.any() or not sink.any():
+    raise ValueError("Source and sink labels must both be present")
 source_sink_vector = np.zeros(len(labels), dtype=float)
-source_sink_vector[source] = 1.0 / int(source.sum())
-source_sink_vector[sink] = -1.0 / int(sink.sum())
+source_sink_vector[source] = 1.0 / source.sum()
+source_sink_vector[sink] = -1.0 / sink.sum()
 float(source_sink_vector.sum())
 ```
 
@@ -99,7 +78,7 @@ The producer returns an artifact. The explicit loader returns values, a validity
 and cell-selection ref. No pseudotime or validity column is added to live metadata.
 
 ```{code-cell} ipython3
-plot_data = preparation.cells.to_pandas_dataframe(["umap_1", "umap_2"])
+plot_data = analysis_run.cells.to_pandas_dataframe(["umap_1", "umap_2"])
 plot_data["pseudotime"] = pseudotime.values
 plot_data.loc[pseudotime.valid].plot.scatter(
     x="umap_1",

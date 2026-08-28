@@ -30,52 +30,30 @@ Clustering guidance from the former combined page now lives in {doc}`clustering`
 
 ```{code-cell} ipython3
 from itertools import combinations
-from pathlib import Path
-from tempfile import TemporaryDirectory
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
 import scarf
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-repacked_counts = str(Path(analysis_directory.name) / "counts.zarr")
-repack_store(
-    f"{dataset}/data.zarr",
-    repacked_counts,
-    nthreads=2,
-)
-ds = scarf.mount_datastore(
-    repacked_counts,
-    at=str(Path(analysis_directory.name) / "dimensionality_analysis.zarr"),
-    default_assay="RNA",
-    nthreads=4,
-    min_features_per_cell=10,
-)
-cell_selection = ds.filter_cells(
-    attrs=["RNA_nCounts", "RNA_nFeatures", "RNA_percentMito"],
-    highs=[15000, 4000, 15],
-    lows=[1000, 500, 0],
-)
-hvg_ref = ds.select_hvgs(
-    cell_selection,
-    min_cells=20,
-    top_n=500,
-    show_plot=False,
-)
-normalized = ds.run_normalization(cell_selection, hvg_ref)
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+baseline = ds.pipeline.open(label="docs_default")
+normalized = baseline["normalized"]
+umap = baseline["umap"]
 ```
 
-This section structurally repacks and mounts the source counts, then reconstructs the selected cells, features, and normalization from {doc}`scrna_seq` without reusing persisted analysis outputs.
+The rebuilt store's `docs_default` run freezes the cell selection, feature selection, and
+normalization used here. Each dimensionality branch therefore changes only PCA and its downstream
+artifacts.
 
 ## 2. Compare PCA dimension counts
 
@@ -83,10 +61,11 @@ Build each candidate from the same normalized data and cluster each graph by pas
 Retain the 15-component graph and initialization for the layout comparisons below.
 
 ```{code-cell} ipython3
-cluster_refs = {}
-pca_refs = {}
-graph_refs = {}
-for dimensions in (10, 30, 15):
+dimension_counts = (10, 15, 30)
+pca_refs = {15: baseline["pca"]}
+graph_15 = baseline["connectivity_map"]
+cluster_refs = {15: baseline["leiden_0.5"]}
+for dimensions in (10, 30):
     pca = ds.run_pca(
         normalized,
         dims=dimensions,
@@ -96,14 +75,16 @@ for dimensions in (10, 30, 15):
     ann = ds.build_ann_index(pca)
     neighbors = ds.query_neighbors(ann, k=11)
     graph = ds.build_connectivity_map(neighbors)
-    graph_refs[dimensions] = graph
-
     cluster_refs[dimensions] = ds.run_leiden_clustering(
         graph,
         resolution=0.5,
     )
 
-initialization_15 = ds.build_embedding_initialization(pca_refs[15])
+initialization_15 = baseline["embedding_initialization"]
+cluster_values = {
+    dimensions: np.asarray(ds.load_artifact(cluster_refs[dimensions])["values"][:])
+    for dimensions in dimension_counts
+}
 ```
 
 PCA axes represent decreasing amounts of variation in the selected genes.
@@ -122,49 +103,37 @@ cumulative_share = np.cumsum(retained_share)
 pd.Series(
     {
         dimensions: float(cumulative_share[dimensions - 1])
-        for dimensions in (10, 15, 30)
+        for dimensions in dimension_counts
     },
     name="cumulative_share_of_30pc_fit",
 ).rename_axis("pca_dimensions")
 ```
 
 ```{code-cell} ipython3
-cluster_counts = pd.Series(
+pd.Series(
     {
-        dimensions: pd.Series(
-            np.asarray(ds.load_artifact(cluster_ref)["values"][:])
-        ).nunique()
-        for dimensions, cluster_ref in cluster_refs.items()
+        dimensions: pd.Series(cluster_values[dimensions]).nunique()
+        for dimensions in dimension_counts
     },
     name="n_clusters",
 ).rename_axis("pca_dimensions")
-cluster_counts
 ```
 
 Similar cluster counts can still hide size flips.
 Per-cluster sizes show whether an extra group is a real split or a tiny fragment.
 
 ```{code-cell} ipython3
-cluster_sizes = pd.DataFrame(
+pd.DataFrame(
     {
-        dimensions: pd.Series(
-            np.asarray(ds.load_artifact(cluster_ref)["values"][:])
-        ).value_counts()
-        for dimensions, cluster_ref in cluster_refs.items()
+        dimensions: pd.Series(cluster_values[dimensions]).value_counts()
+        for dimensions in dimension_counts
     }
 ).fillna(0).astype(int)
-cluster_sizes
 ```
 
 ```{code-cell} ipython3
 agreement_rows = []
-from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
-
-cluster_values = {
-    dimensions: np.asarray(ds.load_artifact(ref)["values"][:])
-    for dimensions, ref in cluster_refs.items()
-}
-for first, second in combinations(cluster_refs, 2):
+for first, second in combinations(dimension_counts, 2):
     agreement_rows.append(
         {
             "comparison": f"{first} vs {second} dimensions",
@@ -181,18 +150,7 @@ pd.DataFrame(agreement_rows)
 ARI and NMI measure agreement between partitions but do not identify the biologically correct dimension count.
 Investigate a low-agreement arm through markers, technical covariates, and graph diagnostics before choosing it or discarding it.
 
-## 3. Run UMAP
-
-```{code-cell} ipython3
-umap = ds.run_umap(
-    graph_refs[15],
-    initialization_15,
-    n_epochs=150,
-    spread=5,
-    min_dist=1,
-    parallel=True,
-)
-```
+## 3. Compare UMAP packing
 
 The layout below uses the explicit 15-component graph.
 Colouring by each Leiden partition shows how the 10-, 15-, and 30-component cuts land on the same coordinates.
@@ -202,7 +160,7 @@ umap_values = np.asarray(ds.load_artifact(umap)["values"][:])
 figure, axes = plt.subplots(1, 3, figsize=(12, 4))
 for axis, dimensions in zip(
     axes,
-    (10, 15, 30),
+    dimension_counts,
     strict=True,
 ):
     axis.scatter(
@@ -222,14 +180,7 @@ These parameters change appearance without changing the input graph.
 A second UMAP with a smaller `min_dist` shows packing on the same neighbours.
 
 ```{code-cell} ipython3
-umap_tight = ds.run_umap(
-    graph_refs[15],
-    initialization_15,
-    n_epochs=150,
-    spread=5,
-    min_dist=0.1,
-    parallel=True,
-)
+umap_tight = ds.run_umap(graph_15, initialization_15, min_dist=0.1)
 ```
 
 ```{code-cell} ipython3
@@ -256,15 +207,7 @@ figure
 ## 4. Preserve local density with densMAP
 
 ```{code-cell} ipython3
-densmap = ds.run_umap(
-    graph_refs[15],
-    initialization_15,
-    n_epochs=150,
-    spread=5,
-    min_dist=1,
-    parallel=True,
-    use_density_map=True,
-)
+densmap = ds.run_umap(graph_15, initialization_15, use_density_map=True)
 ```
 
 densMAP adds a density-preservation objective.
@@ -292,15 +235,7 @@ Scarf's t-SNE consumes the same neighbourhood graph.
 Computing a new embedding requires `sys.platform` in `posix` or `linux`; macOS (`darwin`) and Windows are unsupported.
 
 ```{code-cell} ipython3
-tsne = ds.run_tsne(
-    graph_refs[15],
-    initialization_15,
-    alpha=10,
-    box_h=1,
-    early_iter=250,
-    max_iter=500,
-    verbose=False,
-)
+tsne = ds.run_tsne(graph_15, initialization_15, verbose=False)
 ```
 
 ## 6. Compare layouts responsibly

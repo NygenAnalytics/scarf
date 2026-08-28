@@ -37,6 +37,7 @@ LEGACY_SUFFIX = "_legacy_master"
 # executor to one codec thread and async concurrency 1, which every
 # later stage can reuse.
 ZARR_NTHREADS = 2
+DOCS_RUN_LABEL = "docs_default"
 
 PBMC_FILTERS = {
     "method": "manual",
@@ -143,7 +144,13 @@ def _materialize_run_cell_columns(
         values = np.asarray(run.cells.fetch_all(source))
         if values.shape != (store.cells.N,):
             raise ValueError(f"Pipeline field {source!r} is not a full-axis vector")
-        store.cells.insert(target, values, overwrite=True)
+        fill_value = 0 if np.issubdtype(values.dtype, np.integer) else np.nan
+        store.cells.insert(
+            target,
+            values,
+            fill_value=fill_value,
+            overwrite=True,
+        )
     if set_selection:
         _set_prepared_cell_selection(store, run.cells.fetch_all("I"))
 
@@ -211,9 +218,16 @@ def _materialize_artifact_cell_columns(
                     f"Prepared artifact array {source!r} has no component {value_index}"
                 )
             compact = values[:, value_index]
+        full_values = _prepared_full_axis_values(
+            compact,
+            indices,
+            store.cells.N,
+        )
+        fill_value = 0 if np.issubdtype(full_values.dtype, np.integer) else np.nan
         store.cells.insert(
             target,
-            _prepared_full_axis_values(compact, indices, store.cells.N),
+            full_values,
+            fill_value=fill_value,
             overwrite=True,
         )
 
@@ -275,12 +289,14 @@ def _derive_labelled_kang_store(
 
 def _analyze_pbmc(store: Any) -> None:
     run = store.pipeline.run(
+        label=DOCS_RUN_LABEL,
         filtering=PBMC_FILTERS,
         hvg_count=500,
         pca_dims=15,
         neighbors_k=11,
         leiden={"partitions": [0.5]},
         paris=False,
+        snapshot_columns=("RNA_nCounts", "RNA_nFeatures"),
     )
     paris = store.run_paris_clustering(run["connectivity_map"], n_clusters=15)
     _materialize_run_cell_columns(
@@ -307,6 +323,7 @@ def _analyze_pbmc(store: Any) -> None:
 
 def _analyze_pancreas(store: Any) -> None:
     run = store.pipeline.run(
+        label=DOCS_RUN_LABEL,
         filtering=False,
         cell_cycle=False,
         hvg_count=2000,
@@ -315,14 +332,7 @@ def _analyze_pancreas(store: Any) -> None:
         leiden={"partitions": [0.5]},
         paris=False,
         doublets=False,
-        markers=False,
-    )
-    store.run_marker_search(
-        run["clusters"],
-        features=store.set_feature_selection(
-            from_assay="RNA",
-            mask=np.ones(store.get_assay("RNA").feats.N, dtype=bool),
-        ),
+        markers=True,
     )
     _materialize_run_cell_columns(
         store,
@@ -339,6 +349,7 @@ def _analyze_pancreas(store: Any) -> None:
 
 def _analyze_kang(store: Any) -> None:
     run = store.pipeline.run(
+        label=DOCS_RUN_LABEL,
         filtering={
             "method": "manual",
             "attrs": ["RNA_nCounts", "RNA_nFeatures"],
@@ -352,7 +363,7 @@ def _analyze_kang(store: Any) -> None:
         leiden={"partitions": [1.0]},
         paris=False,
         doublets=False,
-        markers=False,
+        markers=True,
     )
     _materialize_run_cell_columns(
         store,
@@ -393,6 +404,7 @@ def _merge_kang(source_paths: dict[str, Path], store: Path) -> None:
 
 def _analyze_kang_integration(store: Any) -> None:
     run = store.pipeline.run(
+        label=DOCS_RUN_LABEL,
         filtering=False,
         cell_cycle=False,
         hvg_count=2000,
@@ -402,6 +414,7 @@ def _analyze_kang_integration(store: Any) -> None:
         paris=False,
         doublets=False,
         markers=False,
+        snapshot_columns=("sample_id", "orig_cluster_labels"),
     )
     _materialize_run_cell_columns(
         store,
@@ -420,6 +433,7 @@ def _analyze_citeseq(store: Any) -> None:
     import numpy as np
 
     rna_run = store.pipeline.run(
+        label=DOCS_RUN_LABEL,
         cell_cycle=False,
         hvg_count=1000,
         pca_dims=15,
@@ -1110,6 +1124,18 @@ def _artifact_inventory(store: Any) -> list[dict[str, object]]:
     return inventory
 
 
+def _pipeline_inventory(store: Any) -> list[dict[str, object]]:
+    return [
+        {
+            "runId": run.run_id,
+            "label": run.label,
+            "recipe": run.recipe,
+            "status": run.status,
+        }
+        for run in store.pipeline.list_runs(limit=2**31 - 1)
+    ]
+
+
 def _directory_bytes(path: Path) -> int:
     return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
 
@@ -1265,6 +1291,7 @@ def build_store(
     cells_total = int(datastore.cells.N)
     cells_active = int(datastore.cells.active_index("I").size)
     artifacts = _artifact_inventory(datastore)
+    pipeline_runs = _pipeline_inventory(datastore)
 
     manifest = {
         "dataset": dataset,
@@ -1283,6 +1310,7 @@ def build_store(
         "archiveSha256": _file_digest(archive),
         "cellColumns": sorted(datastore.cells.columns),
         "artifacts": artifacts,
+        "pipelineRuns": pipeline_runs,
         "publishNotes": [
             f"Publish with: uv run python scripts/publish_docs_datasets.py {dataset}",
             f"That preserves the published archive as {dataset}_legacy_master "

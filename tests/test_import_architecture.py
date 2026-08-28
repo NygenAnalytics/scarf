@@ -365,13 +365,26 @@ assert not any(
 
 def test_algorithm_domains_do_not_import_orchestration_or_io():
     # storage.refs holds the artifact reference value type and reads no store,
-    # so results that a caller persists may name it.
-    forbidden = {"datastore", "plotting", "readers", "storage", "writers"}
-    allowed = frozenset({"storage.refs"})
+    # so results that a caller persists may name it. Imported-embedding
+    # persistence is the one honest embeddings-to-storage adapter.
+    forbidden = {"datastore", "plotting", "readers", "writers"}
+    storage_exceptions = {
+        "clustering": set(),
+        "embeddings": {"imported_storage.py"},
+        "trajectory": set(),
+    }
     for package_name in ("clustering", "embeddings", "trajectory"):
         package_root = _SCARF_ROOT / package_name
         if package_root.is_dir():
-            assert _upward_imports(package_name, forbidden, allowed) == set()
+            assert _upward_imports(package_name, forbidden) == set()
+            storage_edges = _upward_imports(
+                package_name,
+                {"storage"},
+                frozenset({"storage.refs"}),
+            )
+            assert {path for path, _target in storage_edges} == storage_exceptions[
+                package_name
+            ]
     assert {path for path, _target in _upward_imports("clustering", {"storage"})} == {
         "paris_multiscale.py"
     }
@@ -581,6 +594,7 @@ def test_compatibility_only_modules_are_removed():
         _SCARF_ROOT / "clustering" / "_paris_mdl.py",
         _SCARF_ROOT / "clustering" / "feature_graph.py",
         _SCARF_ROOT / "clustering" / "hierarchy.py",
+        _SCARF_ROOT / "graph" / "imported_storage.py",
         _SCARF_ROOT / "parallel.py",
         _SCARF_ROOT / "plotting" / "unified.py",
         _SCARF_ROOT / "results.py",
@@ -609,6 +623,7 @@ def test_retired_root_import_paths_do_not_resolve():
         "scarf.clustering.feature_graph",
         "scarf.clustering.hierarchy",
         "scarf.features.lowess",
+        "scarf.graph.imported_storage",
         "scarf.trajectory.aggregation",
         "scarf.lineage",
     ):

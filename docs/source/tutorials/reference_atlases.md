@@ -25,16 +25,12 @@ It is not a complete reimplementation of every option in the Symphony R package.
 ## 1. Open the reference and query
 
 ```{code-cell} ipython3
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
 import numpy as np
 import pandas as pd
 
 import scarf
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 repository = scarf.cytebase.connect("scarf_docs")
 ctrl_path = repository.download_dataset(
@@ -47,38 +43,21 @@ stim_path = repository.download_dataset(
     destination="scarf_datasets",
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-ctrl_counts_path = Path(analysis_directory.name) / "control_counts.zarr"
-stim_counts_path = Path(analysis_directory.name) / "stimulated_counts.zarr"
-ctrl_analysis_path = Path(analysis_directory.name) / "reference.zarr"
-stim_analysis_path = Path(analysis_directory.name) / "query.zarr"
-repack_store(
+ds_ctrl = scarf.DataStore(
     f"{ctrl_path}/data.zarr",
-    str(ctrl_counts_path),
-    nthreads=2,
-)
-repack_store(
-    f"{stim_path}/data.zarr",
-    str(stim_counts_path),
-    nthreads=2,
-)
-ds_ctrl = scarf.mount_datastore(
-    str(ctrl_counts_path),
-    at=str(ctrl_analysis_path),
     default_assay="RNA",
     nthreads=4,
 )
-ds_stim = scarf.mount_datastore(
-    str(stim_counts_path),
-    at=str(stim_analysis_path),
+ds_stim = scarf.DataStore(
+    f"{stim_path}/data.zarr",
     default_assay="RNA",
     nthreads=4,
 )
 ```
 
-Both published stores remain unchanged.
-Each is structurally repacked into its own temporary source with the current RNA count layout.
-Mounting those sources copies literal cell metadata into two separate page-local targets, while new reference and mapping artifacts are written only there.
+Both catalog stores were rebuilt from their declared sources with the current RNA count layout.
+Documentation execution downloads separate page-local copies, so the new reference and mapping
+artifacts remain isolated from the published archives.
 
 `reference_batch` must represent technical structure such as donor, preparation, or sequencing batch.
 The single control label below only exercises the API.
@@ -140,7 +119,7 @@ Use `mount_datastore` when the query counts come from a read-only source or from
 
 ```{code-cell} ipython3
 reference_store = scarf.DataStore(
-    str(ctrl_analysis_path),
+    f"{ctrl_path}/data.zarr",
     zarr_mode="r",
     nthreads=4,
 )

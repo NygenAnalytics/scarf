@@ -995,7 +995,7 @@ def create_pipeline_run_record(
     """Create a durable running record before pipeline computation starts."""
 
     if requested_label is not None:
-        ensure_pipeline_label_available(root, requested_label)
+        ensure_pipeline_label_claimable(root, requested_label)
     record = PipelineRunRecord(
         run_id=new_pipeline_run_id() if run_id is None else run_id,
         recipe=recipe,
@@ -1117,6 +1117,18 @@ def _ensure_pipeline_label_claim_container(root: zarr.Group) -> None:
             )
         except zarr.errors.ContainsArrayError:
             pass
+    _validate_pipeline_label_claim_container(root)
+
+
+def _validate_pipeline_label_claim_container(root: zarr.Group) -> None:
+    """Validate an existing raw claim namespace without creating it."""
+
+    try:
+        runs = _get_group(root, PIPELINE_RUNS_PATH, "Pipeline runs")
+    except KeyError:
+        return
+    if _PIPELINE_LABEL_CLAIMS_NAME not in runs:
+        return
     container = runs[_PIPELINE_LABEL_CLAIMS_NAME]
     if (
         not isinstance(container, zarr.Array)
@@ -1126,10 +1138,7 @@ def _ensure_pipeline_label_claim_container(root: zarr.Group) -> None:
         raise ValueError("Pipeline label claim container is incompatible")
 
 
-def _read_pipeline_label_claim(path: StorePath, label: str) -> str:
-    stored = sync(path.get())
-    if stored is None:
-        raise ValueError(f"Pipeline label {label!r} has an incomplete durable claim")
+def _decode_pipeline_label_claim(stored: Buffer, label: str) -> str:
     try:
         value = json.loads(stored.to_bytes().decode("utf-8"))
         raw = _exact_mapping(value, _LABEL_CLAIM_FIELDS, "pipeline label claim")
@@ -1145,6 +1154,30 @@ def _read_pipeline_label_claim(path: StorePath, label: str) -> str:
             f"Pipeline label {label!r} collides with another durable claim"
         )
     return run_id
+
+
+def _read_pipeline_label_claim(path: StorePath, label: str) -> str:
+    stored = sync(path.get())
+    if stored is None:
+        raise ValueError(f"Pipeline label {label!r} has an incomplete durable claim")
+    return _decode_pipeline_label_claim(stored, label)
+
+
+def _pipeline_label_claim_owner(root: zarr.Group, label: str) -> str | None:
+    """Return the tail owner of an immutable label-claim chain."""
+
+    predecessor = "head"
+    visited: set[str] = set()
+    while True:
+        path = _pipeline_label_claim_path(root, label, predecessor)
+        stored = sync(path.get())
+        if stored is None:
+            return None if predecessor == "head" else predecessor
+        owner_id = _decode_pipeline_label_claim(stored, label)
+        if owner_id in visited:
+            raise ValueError(f"Pipeline label {label!r} has a cyclic durable claim")
+        visited.add(owner_id)
+        predecessor = owner_id
 
 
 def _claim_pipeline_label(root: zarr.Group, label: str, run_id: str) -> None:
@@ -1555,6 +1588,19 @@ def _runs_group(root: zarr.Group) -> zarr.Group | None:
     return as_zarr_group(pipeline["runs"], name=PIPELINE_RUNS_PATH)
 
 
+def _valid_pipeline_run_records(root: zarr.Group) -> list[PipelineRunRecord]:
+    group = _runs_group(root)
+    if group is None:
+        return []
+    records = []
+    for run_id in group.group_keys():
+        try:
+            records.append(load_pipeline_run_record(root, run_id))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return records
+
+
 def list_pipeline_run_records(
     root: zarr.Group,
     *,
@@ -1579,10 +1625,7 @@ def list_pipeline_run_records(
     unknown = statuses - allowed
     if unknown:
         raise ValueError(f"Unknown pipeline run status: {sorted(unknown)!r}")
-    group = _runs_group(root)
-    if group is None:
-        return ()
-    records = [load_pipeline_run_record(root, run_id) for run_id in group.group_keys()]
+    records = _valid_pipeline_run_records(root)
     records = [record for record in records if record.status in statuses]
     records.sort(key=lambda item: (item.started_at_ns, item.run_id), reverse=True)
     return tuple(records[:limit])
@@ -1632,12 +1675,8 @@ def ensure_pipeline_label_available(
     _validate_non_empty_string(label, "label")
     if exclude_run_id is not None:
         _validate_run_id(exclude_run_id)
-    group = _runs_group(root)
-    if group is None:
-        return
     matches = []
-    for run_id in group.group_keys():
-        record = load_pipeline_run_record(root, run_id)
+    for record in _valid_pipeline_run_records(root):
         if (
             record.successfully_completed
             and record.label == label
@@ -1648,3 +1687,82 @@ def ensure_pipeline_label_available(
         raise ValueError(
             f"Pipeline label {label!r} is already committed by run {matches[0]}"
         )
+
+
+def ensure_pipeline_label_claimable(root: zarr.Group, label: str) -> None:
+    """Fail before computation when a requested label cannot be claimed safely."""
+
+    _validate_non_empty_string(label, "label")
+    if not _store_supports_atomic_label_claims(root.store):
+        raise RuntimeError(
+            "Pipeline labels require a Zarr store with atomic set_if_not_exists support"
+        )
+    _validate_pipeline_label_claim_container(root)
+    ensure_pipeline_label_available(root, label)
+    owner_id = _pipeline_label_claim_owner(root, label)
+    if owner_id is None:
+        return
+    try:
+        owner = load_pipeline_run_record(root, owner_id)
+    except KeyError:
+        return
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Pipeline label {label!r} has an invalid claim-owner record"
+        ) from exc
+    if owner.requested_label != label:
+        raise ValueError(
+            f"Pipeline label {label!r} has a claim from an incompatible run"
+        )
+    if owner.successfully_completed:
+        raise ValueError(
+            f"Pipeline label {label!r} is already committed by run {owner_id}"
+        )
+    if owner.complete and owner.status in {"failed", "interrupted"}:
+        return
+    raise RuntimeError(
+        f"Pipeline label {label!r} is held by unfinished run {owner_id}; "
+        "after confirming that process has stopped, call "
+        "pipeline.abandon_label_claim with this label and run_id"
+    )
+
+
+def abandon_pipeline_label_claim(
+    root: zarr.Group,
+    *,
+    label: str,
+    run_id: str,
+    reason: str,
+) -> PipelineRunRecord:
+    """Interrupt an explicitly identified claim owner after its process has stopped."""
+
+    _validate_non_empty_string(label, "label")
+    _validate_run_id(run_id)
+    _validate_non_empty_string(reason, "reason")
+    if not _store_supports_atomic_label_claims(root.store):
+        raise RuntimeError(
+            "Pipeline labels require a Zarr store with atomic set_if_not_exists support"
+        )
+    owner_id = _pipeline_label_claim_owner(root, label)
+    if owner_id is None:
+        raise KeyError(f"Pipeline label {label!r} has no durable claim")
+    if owner_id != run_id:
+        raise ValueError(
+            f"Pipeline label {label!r} is owned by run {owner_id}, not {run_id}"
+        )
+    owner = load_pipeline_run_record(root, owner_id)
+    if owner.requested_label != label:
+        raise ValueError(
+            f"Pipeline label {label!r} has a claim from an incompatible run"
+        )
+    if owner.complete:
+        raise ValueError(f"Pipeline label {label!r} is not held by an unfinished run")
+    return interrupt_pipeline_run_record(
+        root,
+        run_id=run_id,
+        interruption=PipelineInterruptionRecord(
+            kind="abandoned_label_claim",
+            message=reason,
+            requested_at_ns=time.time_ns(),
+        ),
+    )

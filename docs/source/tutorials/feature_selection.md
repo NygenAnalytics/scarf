@@ -27,60 +27,38 @@ The threshold is inclusive and the method returns the selection reference.
 
 ## 1. Fit the mean-variance model
 
-The published PBMC store contains literal metadata from an earlier analysis.
-Structurally repack it into a temporary source with the current RNA count layout, then mount those count matrices into a fresh page-local store.
-The published source remains unchanged and the selections below are newly created immutable
-artifacts.
+The rebuilt PBMC store carries a completed `docs_default` run. Repeating its 500-gene selection
+with `show_plot=True` reuses the exact stored artifact and its diagnostics. Later sections create
+only the alternative feature selections they compare.
 
 ```{code-cell} ipython3
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
 import scarf
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-repacked_counts_path = Path(analysis_directory.name) / "counts.zarr"
-analysis_path = Path(analysis_directory.name) / "feature_selection.zarr"
-repack_store(
-    f"{dataset}/data.zarr",
-    str(repacked_counts_path),
-    nthreads=2,
-)
-ds = scarf.mount_datastore(
-    str(repacked_counts_path),
-    at=str(analysis_path),
-    default_assay="RNA",
-    nthreads=4,
-    min_features_per_cell=10,
-)
-cell_selection = ds.filter_cells(
-    attrs=["RNA_nCounts", "RNA_nFeatures", "RNA_percentMito"],
-    highs=[15000, 4000, 15],
-    lows=[1000, 500, 0],
-)
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+baseline = ds.pipeline.open(label="docs_default")
+cell_selection = baseline["analysis_cell_selection"]
 hvg_500 = ds.select_hvgs(
     cell_selection,
-    min_cells=20,
     top_n=500,
     show_plot=True,
 )
-print(
-    "Selected genes:",
-    int(np.asarray(ds.load_artifact(hvg_500)["values"][:]).sum()),
-)
-hvg_500
+hvg_500_values = np.asarray(ds.load_artifact(hvg_500)["values"][:])
+{
+    "matches docs_default": hvg_500 == baseline["highly_variable_features"],
+    "selected genes": int(hvg_500_values.sum()),
+}
 ```
 
 The plot should retain genes above the fitted mean-variance trend across a useful expression range.
@@ -140,21 +118,22 @@ Clearing the blacklist keeps every gene name while retaining other HVG filters.
 Compare the same `top_n` with and without the default pattern:
 
 ```{code-cell} ipython3
-selections = {
-    "hvgs_default": hvg_500,
-    "hvgs_no_blacklist": ds.select_hvgs(
-        cell_selection,
-        min_cells=20,
-        top_n=500,
-        blacklist="",
-        show_plot=False,
+hvg_no_blacklist = ds.select_hvgs(
+    cell_selection,
+    top_n=500,
+    blacklist="",
+    show_plot=False,
+)
+selection_values = {
+    "hvgs_default": hvg_500_values,
+    "hvgs_no_blacklist": np.asarray(
+        ds.load_artifact(hvg_no_blacklist)["values"][:]
     ),
 }
-
 pd.Series(
     {
-        key: int(np.asarray(ds.load_artifact(ref)["values"][:]).sum())
-        for key, ref in selections.items()
+        key: int(values.sum())
+        for key, values in selection_values.items()
     },
     name="selected genes",
 )
@@ -162,13 +141,9 @@ pd.Series(
 
 ```{code-cell} ipython3
 feature_names = ds.RNA.feats.fetch_all("names")
-default_values = np.asarray(ds.load_artifact(selections["hvgs_default"])["values"][:])
-unblocked_values = np.asarray(
-    ds.load_artifact(selections["hvgs_no_blacklist"])["values"][:]
-)
-only_without_blacklist = feature_names[
-    unblocked_values & ~default_values
-]
+default_values = selection_values["hvgs_default"]
+unblocked_values = selection_values["hvgs_no_blacklist"]
+only_without_blacklist = feature_names[unblocked_values & ~default_values]
 print("Genes selected only when blacklist is cleared:", len(only_without_blacklist))
 pd.Series(only_without_blacklist).head(15)
 ```
@@ -192,44 +167,38 @@ On reuse, an HVG plot reads stored corrected-variance diagnostics rather than re
 ## 3. Compare feature-set size
 
 The number of selected genes changes the PCA basis and can change neighbourhood structure.
-This small comparison keeps all other graph choices fixed.
+This comparison keeps all other graph choices fixed. The 500-gene branch comes directly from
+`docs_default`; only the 1,000-gene branch is new.
 
 ```{code-cell} ipython3
-feature_branches = {}
-for top_n in (300, 1000):
-    feature_ref = ds.select_hvgs(
-        cell_selection,
-        min_cells=20,
-        top_n=top_n,
-        show_plot=False,
-    )
-    normalized_ref = ds.run_normalization(cell_selection, feature_ref)
-    pca_ref = ds.run_pca(normalized_ref, dims=15)
-    initialization_ref = ds.build_embedding_initialization(pca_ref)
-    ann_ref = ds.build_ann_index(pca_ref)
-    neighbors_ref = ds.query_neighbors(ann_ref, k=11)
-    graph_ref = ds.build_connectivity_map(neighbors_ref)
-    umap_ref = ds.run_umap(
-        graph_ref,
-        initialization_ref,
-        n_epochs=150,
-        spread=5,
-        min_dist=1,
-        parallel=True,
-    )
-    cluster_ref = ds.run_leiden_clustering(
-        graph_ref,
-        resolution=0.5,
-    )
-    feature_branches[top_n] = (feature_ref, umap_ref, cluster_ref)
+feature_1000 = ds.select_hvgs(
+    cell_selection,
+    top_n=1000,
+    show_plot=False,
+)
+normalized_1000 = ds.run_normalization(cell_selection, feature_1000)
+pca_1000 = ds.run_pca(normalized_1000, dims=15)
+initialization_1000 = ds.build_embedding_initialization(pca_1000)
+ann_1000 = ds.build_ann_index(pca_1000)
+neighbors_1000 = ds.query_neighbors(ann_1000, k=11)
+graph_1000 = ds.build_connectivity_map(neighbors_1000)
+feature_branches = {
+    500: (baseline["umap"], baseline["leiden_0.5"]),
+    1000: (
+        ds.run_umap(graph_1000, initialization_1000),
+        ds.run_leiden_clustering(graph_1000, resolution=0.5),
+    ),
+}
 ```
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 2, figsize=(10, 4))
-for axis, top_n in zip(axes, (300, 1000), strict=True):
-    _features, umap_ref, cluster_ref = feature_branches[top_n]
+cluster_values = {}
+for axis, top_n in zip(axes, feature_branches, strict=True):
+    umap_ref, cluster_ref = feature_branches[top_n]
     coordinates = np.asarray(ds.load_artifact(umap_ref)["values"][:])
     labels = np.asarray(ds.load_artifact(cluster_ref)["values"][:])
+    cluster_values[top_n] = labels
     axis.scatter(
         coordinates[:, 0],
         coordinates[:, 1],
@@ -246,27 +215,25 @@ A cross-tabulation shows how partitions rematch when the feature set grows. The 
 cluster sizes; off-diagonal mass marks groups that split or merge.
 
 ```{code-cell} ipython3
-cluster_300 = np.asarray(ds.load_artifact(feature_branches[300][2])["values"][:])
-cluster_1000 = np.asarray(ds.load_artifact(feature_branches[1000][2])["values"][:])
+cluster_500 = cluster_values[500]
+cluster_1000 = cluster_values[1000]
 pd.crosstab(
-    pd.Series(cluster_300, name="300 genes"),
+    pd.Series(cluster_500, name="500 genes"),
     pd.Series(cluster_1000, name="1,000 genes"),
     margins=True,
 )
 ```
 
 ```{code-cell} ipython3
-from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
-
 pd.Series(
     {
-        "adjusted Rand index": adjusted_rand_score(cluster_300, cluster_1000),
+        "adjusted Rand index": adjusted_rand_score(cluster_500, cluster_1000),
         "normalized mutual information": normalized_mutual_info_score(
-            cluster_300,
+            cluster_500,
             cluster_1000,
         ),
     },
-    name="300 vs 1,000 selected genes",
+    name="500 vs 1,000 selected genes",
 )
 ```
 
@@ -285,15 +252,12 @@ Verify the mask length and selected count before building a graph:
 ```{code-cell} ipython3
 panel_genes = ["CD3D", "MS4A1", "CD14", "LYZ", "NKG7", "GNLY"]
 manual_mask = np.isin(
-    ds.RNA.feats.fetch_all("names").astype(str),
+    feature_names.astype(str),
     panel_genes,
 )
 print("mask length:", len(manual_mask), "selected:", int(manual_mask.sum()))
-custom_features = ds.set_feature_selection(
-    mask=manual_mask,
-)
-custom_values = np.asarray(ds.load_artifact(custom_features)["values"][:])
-custom_features, int(custom_values.sum())
+custom_features = ds.set_feature_selection(mask=manual_mask)
+custom_features
 ```
 
 Construct selections with Scarf's metadata helpers when possible: `sift` and `multi_sift` return boolean masks for `mask=`; `get_index_by` returns integer feature-table indexes for `feature_indexes=`.
@@ -306,13 +270,10 @@ normalized = ds.run_normalization(cell_selection, custom_features)
 ```
 
 Retain or persist exact refs in the analysis record. To request the complete feature universe,
-create an explicit all-true selection:
+use the canonical all-features producer:
 
 ```python
-all_features = ds.set_feature_selection(
-    from_assay="RNA",
-    feature_indexes=range(ds.RNA.feats.N),
-)
+all_features = ds.select_all_features(from_assay="RNA")
 ```
 
 `all_features` is an immutable all-true artifact for this exact assay axis.
@@ -320,9 +281,7 @@ all_features = ds.set_feature_selection(
 The standard pipeline exposes the common feature-count choice directly:
 
 ```python
-ds.pipeline.run(
-    hvg_count=2000,
-)
+ds.pipeline.run(hvg_count=2000)
 ```
 
 Use `select_hvgs` plus the explicit stage methods when you need blacklist or mean-variance tuning.

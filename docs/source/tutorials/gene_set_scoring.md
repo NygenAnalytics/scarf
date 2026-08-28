@@ -35,10 +35,9 @@ These methods do not calculate enrichment p-values.
 
 ## Dataset
 
-This page structurally repacks the published 5K PBMC snapshot into a temporary count store with the
-required layout, then mounts it into a clean writable analysis target.
-Literal metadata, including the UMAP used for score plots, is retained while new artifacts are
-written to the mounted target.
+The rebuilt 5K PBMC store contains a completed standard analysis labeled `docs_default`.
+Open the downloaded store directly because scoring writes new immutable artifacts. The frozen run
+provides the exact analysis cells and UMAP used below.
 Signature scoring streams raw counts from `assay.rawData`, not a pre-normalized matrix or the graph.
 AUCell ranks those raw counts; WAGGR applies library-size normalization inside the scorer.
 
@@ -48,29 +47,18 @@ from tempfile import TemporaryDirectory
 
 import matplotlib.pyplot as plt
 import pandas as pd
-import scarf
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level='WARNING', progress=True)
+import scarf
+
+scarf.configure_output(level='WARNING', progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     'tenx_5K_pbmc_rnaseq',
     destination='scarf_datasets',
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-repacked_counts = f'{analysis_directory.name}/counts.zarr'
-repack_store(
-    f'{dataset}/data.zarr',
-    repacked_counts,
-    nthreads=2,
-)
-ds = scarf.mount_datastore(
-    repacked_counts,
-    at=f'{analysis_directory.name}/analysis.zarr',
-    nthreads=4,
-    default_assay='RNA',
-)
+ds = scarf.DataStore(f'{dataset}/data.zarr', nthreads=4)
+run = ds.pipeline.open(label='docs_default')
 ```
 
 ## 1. Read and inspect gene sets
@@ -80,7 +68,8 @@ The first field is the source name, the second is a description, and the remaini
 `read_gmt` returns one source-target row per gene.
 
 ```{code-cell} ipython3
-gmt_path = Path(analysis_directory.name) / 'pbmc_signatures.gmt'
+input_directory = TemporaryDirectory()
+gmt_path = Path(input_directory.name) / 'pbmc_signatures.gmt'
 gmt_path.write_text(
     'T_cell\tna\tCD3D\tCD3E\tTRAC\tLTB\tIL7R\n'
     'B_cell\tna\tMS4A1\tCD79A\tCD37\tCD74\tHLA-DRA\n'
@@ -115,10 +104,8 @@ Signed weights are supported.
 This comparison uses the complete assay feature universe for both methods:
 
 ```{code-cell} ipython3
-cell_selection = ds.snapshot_cell_selection('I')
-all_features = ds.set_feature_selection(
-    feature_indexes=range(ds.RNA.feats.N),
-)
+cell_selection = run['analysis_cell_selection']
+all_features = ds.select_all_features(from_assay='RNA')
 ```
 
 ```{code-cell} ipython3
@@ -220,12 +207,12 @@ The calls above selected only the requested source columns before computing them
 loaded tables for every plot and comparison below. The values are activity scores, not p-values.
 
 ```{code-cell} ipython3
-umap = ds.cells.to_pandas_dataframe(['RNA_UMAP1', 'RNA_UMAP2'], key='I')
+umap = run.cells.to_pandas_dataframe(['umap_1', 'umap_2'])
 figure, axes = plt.subplots(1, 3, figsize=(12, 4))
 for axis, source in zip(axes, score_sources, strict=True):
     axis.scatter(
-        umap['RNA_UMAP1'],
-        umap['RNA_UMAP2'],
+        umap['umap_1'],
+        umap['umap_2'],
         c=aucell_scores[source],
         s=3,
     )
@@ -240,8 +227,8 @@ AUCell scores highlight lineage-consistent regions: T-cell, B-cell, and Myeloid 
 figure, axes = plt.subplots(1, 3, figsize=(12, 4))
 for axis, source in zip(axes, score_sources, strict=True):
     axis.scatter(
-        umap['RNA_UMAP1'],
-        umap['RNA_UMAP2'],
+        umap['umap_1'],
+        umap['umap_2'],
         c=waggr_scores[source],
         s=3,
     )

@@ -95,6 +95,50 @@ def test_repack_rebuilds_incorrect_source_counts_t(tmp_path):
     assert result["RNA/countsT"].attrs["complete"] is True
 
 
+def test_repack_discards_retired_assay_state(tmp_path):
+    source = tmp_path / "source_with_state.zarr"
+    output = tmp_path / "output_without_state.zarr"
+    root = zarr.open_group(str(source), mode="w")
+    assay = root.create_group("RNA")
+    assay.attrs["is_assay"] = True
+    assay.create_array(
+        "counts",
+        data=np.arange(6, dtype=np.uint32).reshape(2, 3),
+    )
+    state = assay.create_group("state")
+    state.create_array("legacy", data=np.array([1], dtype=np.uint8))
+
+    repack_store(str(source), str(output))
+
+    result = zarr.open_group(str(output), mode="r")
+    assert "state" not in result["RNA"]
+    np.testing.assert_array_equal(result["RNA/counts"][:], assay["counts"][:])
+
+
+def test_repack_discards_state_from_every_workspace_sharing_an_assay(tmp_path):
+    source = tmp_path / "source_with_workspace_state.zarr"
+    output = tmp_path / "output_without_workspace_state.zarr"
+    root = zarr.open_group(str(source), mode="w")
+    for workspace_name in ("first", "second"):
+        assay = root.create_group(f"{workspace_name}/RNA")
+        assay.attrs["is_assay"] = True
+        assay.create_array("metadata", data=np.array([1], dtype=np.uint8))
+        state = assay.create_group("state")
+        state.create_array("legacy", data=np.array([1], dtype=np.uint8))
+    counts = root.create_group("matrices/RNA")
+    values = np.arange(6, dtype=np.uint32).reshape(2, 3)
+    counts.create_array("counts", data=values)
+
+    repack_store(str(source), str(output))
+
+    result = zarr.open_group(str(output), mode="r")
+    assert "state" not in result["first/RNA"]
+    assert "state" not in result["second/RNA"]
+    np.testing.assert_array_equal(result["first/RNA/metadata"][:], [1])
+    np.testing.assert_array_equal(result["second/RNA/metadata"][:], [1])
+    np.testing.assert_array_equal(result["matrices/RNA/counts"][:], values)
+
+
 def test_repack_workspace_counts_uses_requested_profile(tmp_path):
     source = tmp_path / "source_workspace.zarr"
     output = tmp_path / "output_workspace.zarr"

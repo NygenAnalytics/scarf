@@ -66,6 +66,7 @@ _METHODS = {
         "get_markers",
         "load_metric_lisi",
         "make_bulk",
+        "select_all_features",
         "select_hvgs",
         "select_prevalent_peaks",
         "metric_clisi",
@@ -99,7 +100,7 @@ _SIGNATURE_DIGESTS = {
     BaseDataStore: "265c58773661a006212d7c269300d4b0bd90dbb71ade2dacf785663bf1ce94f5",
     GraphDataStore: "82320f376233d84bdf9601e23334a09b7388990c9bf74aead31c49c330150be0",
     MappingDatastore: "dd7c11707d882495a767ccc3022e5053344a6c4196e5f1bd9b0a4008a55e78ff",
-    DataStore: "83cb8998efff59ac3c8430fc65d2823d18a8b8d8179cb77466655a50982a3fb8",
+    DataStore: "5cbbd6dcb88b0b5a35ae6c0a7b94de1888b85cb702b37ede4c1653b2eb656b17",
 }
 
 

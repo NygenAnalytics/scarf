@@ -13,7 +13,7 @@ from scarf.embeddings.imported import (
     write_imported_coordinates,
     write_imported_embedding,
 )
-from scarf.graph.imported_storage import validate_imported_coordinates_artifact
+from scarf.embeddings.imported_storage import validate_imported_coordinates_artifact
 from scarf.storage.errors import ArtifactResolutionError
 from scarf.storage.artifacts import (
     artifact_group,
@@ -611,9 +611,31 @@ def test_imported_coordinates_reject_invalid_matrix_shape_and_dtype(
         )
 
 
-def test_imported_coordinates_report_selected_row_count_mismatch() -> None:
-    root, selection, cell_ids, _mask = _root_with_selection()
-    coordinates = np.arange(21, dtype=np.float32).reshape(7, 3)
+@pytest.mark.parametrize(
+    ("mask", "coordinate_rows", "source_rows", "selected_count"),
+    [
+        pytest.param(None, 7, 7, 8, id="selection-exceeds-source"),
+        pytest.param(None, 8, 7, None, id="coordinates-exceed-source"),
+        pytest.param(
+            (True, True, True, True, True, True, True, False),
+            8,
+            8,
+            7,
+            id="source-exceeds-selection",
+        ),
+    ],
+)
+def test_imported_coordinates_report_row_count_mismatch(
+    mask,
+    coordinate_rows,
+    source_rows,
+    selected_count,
+) -> None:
+    root, selection, cell_ids, _mask = _root_with_selection(mask)
+    coordinates = np.arange(coordinate_rows * 3, dtype=np.float32).reshape(
+        coordinate_rows,
+        3,
+    )
 
     with pytest.raises(ArtifactResolutionError) as caught:
         write_imported_coordinates(
@@ -624,14 +646,18 @@ def test_imported_coordinates_report_selected_row_count_mismatch() -> None:
             coordinates=coordinates,
             source_digest=_SOURCE_DIGEST,
             payload_fingerprints={"data": fingerprint_array(coordinates)},
-            source_cell_ids=cell_ids[:7],
+            source_cell_ids=cell_ids[:source_rows],
             cell_selection=selection,
             block_rows=3,
         )
 
     assert caught.value.code == "dimreduc_row_count_mismatch"
-    assert caught.value.context["coordinate_rows"] == 7
-    assert caught.value.context["source_cell_count"] == 7
+    assert caught.value.context["coordinate_rows"] == coordinate_rows
+    assert caught.value.context["source_cell_count"] == source_rows
+    if selected_count is None:
+        assert "selected_count" not in caught.value.context
+    else:
+        assert caught.value.context["selected_count"] == selected_count
 
 
 @pytest.mark.parametrize(

@@ -32,9 +32,14 @@ def test_prepared_run_columns_are_explicit_full_axis_copies():
             name: str,
             values: np.ndarray,
             *,
+            fill_value: object,
             overwrite: bool,
         ) -> None:
             assert overwrite is True
+            if np.issubdtype(values.dtype, np.integer):
+                assert fill_value == 0
+            else:
+                assert np.isnan(fill_value)
             self.columns[name] = np.asarray(values)
 
         def reset_key(self, key: str) -> None:
@@ -118,9 +123,11 @@ def test_prepared_artifact_columns_project_the_exact_stored_selection(monkeypatc
             name: str,
             values: np.ndarray,
             *,
+            fill_value: object,
             overwrite: bool,
         ) -> None:
             assert overwrite is True
+            assert np.isnan(fill_value)
             self.columns[name] = np.asarray(values)
 
     root = object()

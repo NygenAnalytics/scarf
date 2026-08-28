@@ -20,7 +20,10 @@ CITE-seq measures RNA and antibody-derived tags in the same cells. Scarf keeps e
 normalization and graph separate, then integrates exact graph artifacts. No analytical stage adds
 layout, cluster, or modality-weight columns to shared cell metadata.
 
-## 1. Import the matched assays
+## 1. Open the matched assays
+
+The downloaded Zarr store was rebuilt with this Scarf version. It contains the complete RNA, ADT,
+SNN, and WNN artifacts used below, so calls with the recorded parameters reuse those artifacts.
 
 ```{code-cell} ipython3
 import matplotlib.pyplot as plt
@@ -29,80 +32,41 @@ import pandas as pd
 
 import scarf
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
-counts = scarf.cytebase.connect("scarf_docs").download(
-    "tenx_8K_pbmc_citeseq/data.h5",
+dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
+    "tenx_8K_pbmc_citeseq",
     destination="scarf_datasets",
-)[0]
-store = counts.with_name("data.zarr")
-reader = scarf.CrH5Reader(str(counts))
-print(reader.assayFeats)
-scarf.CrToZarr(reader, zarr_loc=str(store)).dump()
-
-ds = scarf.DataStore(
-    str(store),
-    default_assay="RNA",
-    nthreads=4,
+    zarr=True,
 )
+ds = scarf.DataStore(f"{dataset}/data.zarr", default_assay="RNA", nthreads=4)
+ds
 ```
 
 ## 2. Build the RNA graph and select cells
 
-The standard RNA pipeline handles filtering, feature selection, normalization, PCA, neighbours,
-the connectivity map, and the requested Leiden partition. UMAP is disabled in the pipeline so all
-four graphs on this page can use the same non-default display settings.
+The prepared RNA pipeline run fixes the filtering, feature selection, normalization, PCA,
+neighbours, connectivity map, UMAP, and Leiden outputs used together.
 
 ```{code-cell} ipython3
-shared_umap_options = {
-    "n_epochs": 250,
-    "spread": 5,
-    "min_dist": 1,
-    "parallel": True,
-}
-rna_run = ds.pipeline.run(
-    assay="RNA",
-    hvg_count=1000,
-    pca_dims=15,
-    neighbors_k=21,
-    umap=False,
-    leiden={"partitions": [1.0]},
-    cell_cycle=False,
-    paris=False,
-    doublets=False,
-    markers=False,
-)
+rna_run = ds.pipeline.open(label="docs_default")
 cell_selection = rna_run["analysis_cell_selection"]
-rna_initialization = ds.build_embedding_initialization(rna_run["pca"])
+rna_initialization = rna_run["embedding_initialization"]
 rna_neighbors = rna_run["neighbors"]
 rna_graph = rna_run["connectivity_map"]
-rna_umap = ds.run_umap(
-    rna_graph,
-    rna_initialization,
-    **shared_umap_options,
-)
+rna_umap = rna_run["umap"]
 rna_clusters = rna_run["leiden_1.0"]
 
-cell_mask = np.asarray(
-    ds.load_artifact(cell_selection)["values"][:],
-    dtype=bool,
-)
+cell_mask = rna_run.cells.fetch_all("I")
 print(f"Selected cells: {int(cell_mask.sum())} of {len(cell_mask)}")
 ```
 
-The pipeline's immutable cell selection is shared by both assays because their rows describe the
-same cells. The live `I` column remains unchanged. The ADT-specific reduction and the multimodal
-integration steps below stay atomic because they are not part of the fixed RNA recipe.
+The run's immutable cell selection is shared by both assays because their rows describe the same
+cells. The live `I` column remains unchanged. ADT reduction and multimodal integration remain
+separate atomic chains.
 
 ```{code-cell} ipython3
-rna_umap_values = np.asarray(ds.load_artifact(rna_umap)["values"][:])
-rna_cluster_values = np.asarray(ds.load_artifact(rna_clusters)["values"][:])
-plt.scatter(
-    rna_umap_values[:, 0],
-    rna_umap_values[:, 1],
-    c=rna_cluster_values,
-    s=3,
-)
+ds.plots.embedding(layout=rna_umap, color_by=rna_clusters)
 ```
 
 ## 3. Build the ADT graph
@@ -111,8 +75,9 @@ ADT uses centred-log-ratio normalization. Inspect the panel before excluding con
 naming conventions vary.
 
 ```{code-cell} ipython3
-adt_panel = ds.ADT.feats.to_pandas_dataframe(["names"])
-adt_panel["is_control"] = adt_panel["names"].str.contains("control")
+adt_names = ds.ADT.feats.fetch_all("names").astype(str)
+adt_panel = pd.DataFrame({"name": adt_names})
+adt_panel["is_control"] = adt_panel["name"].str.lower().str.contains("control")
 adt_panel[adt_panel["is_control"]]
 ```
 
@@ -134,11 +99,7 @@ adt_initialization = ds.build_embedding_initialization(adt_reduction)
 adt_ann = ds.build_ann_index(adt_reduction)
 adt_neighbors = ds.query_neighbors(adt_ann, k=21)
 adt_graph = ds.build_connectivity_map(adt_neighbors)
-adt_umap = ds.run_umap(
-    adt_graph,
-    adt_initialization,
-    **shared_umap_options,
-)
+adt_umap = ds.run_umap(adt_graph, adt_initialization)
 adt_clusters = ds.run_leiden_clustering(adt_graph, resolution=1)
 ```
 
@@ -146,17 +107,7 @@ An identity reduction keeps neighbour search in normalized antibody space. PCA i
 a panel with only a few dozen features.
 
 ```{code-cell} ipython3
-adt_umap_values = np.asarray(ds.load_artifact(adt_umap)["values"][:])
-adt_cluster_values = np.asarray(ds.load_artifact(adt_clusters)["values"][:])
-figure, axes = plt.subplots(1, 2, figsize=(9, 4))
-for axis, coordinates, labels, title in (
-    (axes[0], rna_umap_values, rna_cluster_values, "RNA"),
-    (axes[1], adt_umap_values, adt_cluster_values, "ADT"),
-):
-    axis.scatter(coordinates[:, 0], coordinates[:, 1], c=labels, s=3)
-    axis.set_title(title)
-figure.tight_layout()
-figure
+ds.plots.embedding(layout=adt_umap, color_by=adt_clusters)
 ```
 
 ## 4. Shared nearest-neighbour integration
@@ -165,23 +116,12 @@ SNN consumes exact connectivity-map refs and requires equal neighbour degree.
 
 ```{code-cell} ipython3
 snn_graph = ds.integrate_assays([rna_graph, adt_graph], method="snn")
-snn_umap = ds.run_umap(
-    snn_graph,
-    rna_initialization,
-    **shared_umap_options,
-)
+snn_umap = ds.run_umap(snn_graph, rna_initialization)
 snn_clusters = ds.run_leiden_clustering(snn_graph, resolution=1.75)
 ```
 
 ```{code-cell} ipython3
-snn_umap_values = np.asarray(ds.load_artifact(snn_umap)["values"][:])
-snn_cluster_values = np.asarray(ds.load_artifact(snn_clusters)["values"][:])
-plt.scatter(
-    snn_umap_values[:, 0],
-    snn_umap_values[:, 1],
-    c=snn_cluster_values,
-    s=3,
-)
+ds.plots.embedding(layout=snn_umap, color_by=snn_clusters)
 ```
 
 (wnn_integration)=
@@ -197,12 +137,7 @@ wnn_graph = ds.integrate_assays(
     method="wnn",
     l2_normalize=True,
 )
-wnn_umap = ds.run_umap(
-    wnn_graph,
-    rna_initialization,
-    **shared_umap_options,
-)
-wnn_clusters = ds.run_leiden_clustering(wnn_graph, resolution=1.75)
+wnn_umap = ds.run_umap(wnn_graph, rna_initialization)
 weight_values = np.asarray(ds.load_artifact(wnn_graph)["modality_weights"][:])
 
 pd.Series(
@@ -211,9 +146,7 @@ pd.Series(
         "maximum weight": float(weight_values.max()),
         "mean RNA weight": float(weight_values[:, 0].mean()),
         "mean ADT weight": float(weight_values[:, 1].mean()),
-        "maximum row-sum error": float(
-            np.abs(weight_values.sum(axis=1) - 1).max()
-        ),
+        "maximum row-sum error": float(np.abs(weight_values.sum(axis=1) - 1).max()),
     }
 )
 ```

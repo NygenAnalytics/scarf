@@ -129,10 +129,12 @@ deterministic silhouette comparison automatically and exposes the selected ref a
 
 Current Scarf versions write RNA counts twice: cell-major `counts` and a gene-major `countsT` copy.
 Opening an RNA assay fails if that copy is missing, incomplete, still Zarr v2, or does not match `counts`.
-There is no silent rewrite on open.
+Stores containing the retired `{assay}/state` group also fail on open. There is no silent rewrite,
+migration, or state-based result selection.
 
 Re-import the source, or write a new store with `python -m scarf.tools.repack_zarr`.
-After a rewrite, recompute HVG, normalization, PCA, graph, and marker results.
+The offline rewrite omits retired state. Afterward, recompute HVG, normalization, PCA, graph, and
+marker results with the current release.
 Non-RNA assays do not use `countsT`.
 See {doc}`../concepts/memory_and_execution`.
 

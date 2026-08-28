@@ -11,6 +11,8 @@ Those methods are excluded here rather than repeated.
 
 `summary` is reserved for `DataStore.summary()` and cannot be used as an assay name.
 Writers and `DataStore` opening reject that name before mutating store-level state.
+Opening also rejects the removed `{assay}/state` group. Rebuild such a store with the current
+release; Scarf does not read or migrate its former analysis state.
 
 ## Mounting shared count matrices
 
@@ -52,6 +54,8 @@ Array and DataFrame diagnostics such as `elbow`, `qc`, `graph_qc`, and `highly_v
 
 Feature producers return immutable {py:class}`~scarf.ArtifactRef` values. Use
 `resolve_features(assay, ref)` for strict read-only validation.
+`select_all_features(from_assay=...)` creates or reuses the canonical immutable all-feature
+selection for granular workflows. It does not write a live feature metadata column.
 `snapshot_cell_selection(cell_key)` captures the explicit immutable cell input for granular graph
 construction. `run_normalization(cell_selection, features)` requires both exact refs. Direct marker,
 WAGGR, AUCell, and pseudotime feature analyses likewise require exact refs.
@@ -60,7 +64,8 @@ They do not accept a separate feature selection.
 
 ```python
 cells = ds.snapshot_cell_selection("I")
-normalized = ds.run_normalization(cells, hvg_ref)
+features = ds.select_all_features(from_assay="RNA")
+normalized = ds.run_normalization(cells, features)
 diffusion = ds.run_diffusion_operator(graph_ref, t=2)
 imputed = ds.get_imputed("CD4", diffusion)
 membership = ds.calc_membership_strength(cluster_ref, graph_ref)

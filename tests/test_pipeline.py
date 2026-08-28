@@ -250,6 +250,23 @@ def test_pipeline_filtering_rejects_coercible_scalar_types_without_writes(
     assert after == before
 
 
+def test_pipeline_requested_filtering_requires_at_least_one_qc_column(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    for suffix in ("nCounts", "nFeatures", "percentMito", "percentRibo"):
+        column = f"RNA_{suffix}"
+        if column in datastore.cells.columns:
+            datastore.cells.drop(column)
+    before = tuple(run.run_id for run in datastore.pipeline.list_runs(limit=100))
+
+    with pytest.raises(ValueError, match="pass filtering=False"):
+        datastore.pipeline.run(**{**_minimal_run_options(), "filtering": None})
+
+    after = tuple(run.run_id for run in datastore.pipeline.list_runs(limit=100))
+    assert after == before
+
+
 def test_minimal_pipeline_is_artifact_only_cold_openable_and_ordered(
     datastore_ephemeral,
     monkeypatch: pytest.MonkeyPatch,

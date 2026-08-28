@@ -33,7 +33,7 @@ import pandas as pd
 
 import scarf
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_8K_pbmc_citeseq",
@@ -73,6 +73,50 @@ for ref in ds.list_artifacts(
         }
     )
 pd.DataFrame(integrated).sort_values("method", ignore_index=True)
+```
+
+Resolve the four immutable clustering artifacts once. Their graph inputs identify
+which partition each artifact contains; the literal metadata columns below remain
+useful only for plotting and cross-tabulation.
+
+```{code-cell} ipython3
+baseline = ds.pipeline.open(label="docs_default")
+graph_names = {
+    baseline["connectivity_map"]: "RNA",
+    integrated_refs["snn"]: "SNN",
+    integrated_refs["wnn"]: "WNN",
+}
+partition_refs = {"RNA": baseline["clusters"]}
+partition_candidates = ds.list_artifacts(
+    kind="cluster_labels",
+    scope="datastore",
+    complete_only=True,
+)
+for assay in ("RNA", "ADT"):
+    partition_candidates.extend(
+        ds.list_artifacts(
+            kind="cluster_labels",
+            from_assay=assay,
+            complete_only=True,
+        )
+    )
+for ref in partition_candidates:
+    graph_value = (ds.inspect_artifact(ref).inputs or {}).get("graph")
+    if not isinstance(graph_value, dict):
+        continue
+    graph_ref = scarf.ArtifactRef.from_dict(graph_value)
+    name = graph_names.get(graph_ref)
+    if name is None and ref.assay == "ADT":
+        name = "ADT"
+    if name is None:
+        continue
+    if name in partition_refs and partition_refs[name] != ref:
+        raise RuntimeError(f"Expected one complete {name!r} partition")
+    partition_refs[name] = ref
+
+expected_partitions = {"RNA", "ADT", "SNN", "WNN"}
+if set(partition_refs) != expected_partitions:
+    raise RuntimeError("The CITE-seq snapshot is missing a required partition")
 ```
 
 ## 1. Measure modality concordance
@@ -210,27 +254,19 @@ figure.tight_layout()
 ```
 
 ```{code-cell} ipython3
-partition_columns = {
-    "RNA": "RNA_leiden_cluster",
-    "ADT": "ADT_leiden_cluster",
-    "SNN": "RNA+ADT_leiden_cluster",
-    "WNN": "RNA+ADT_wnn_leiden_cluster",
-}
 concordance_rows = []
-for first, second in combinations(partition_columns, 2):
-    columns = [
-        partition_columns[first],
-        partition_columns[second],
-    ]
+for first, second in combinations(partition_refs, 2):
     concordance_rows.append(
         {
             "comparison": f"{first} vs {second}",
             "ARI": ds.metric_label_concordance(
-                columns,
+                partition_refs[first],
+                partition_refs[second],
                 metric="ari",
             ),
             "NMI": ds.metric_label_concordance(
-                columns,
+                partition_refs[first],
+                partition_refs[second],
                 metric="nmi",
             ),
         }

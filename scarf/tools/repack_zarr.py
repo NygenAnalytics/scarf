@@ -107,6 +107,21 @@ def _count_assays(store: zarr.Group) -> list[tuple[str, str | None]]:
     return assays
 
 
+def _retired_assay_state_paths(store: zarr.Group) -> frozenset[str]:
+    paths: set[str] = set()
+
+    def visit(group: zarr.Group, path: str) -> None:
+        for name in group.group_keys():
+            child_path = f"{path}/{name}" if path else name
+            child = as_zarr_group(group[name], name=child_path)
+            if child.attrs.get("is_assay") and "state" in child:
+                paths.add(f"{child_path}/state")
+            visit(child, child_path)
+
+    visit(store, "")
+    return frozenset(paths)
+
+
 def _counts_t_path(counts_path: str) -> str:
     if counts_path == "counts" or counts_path.endswith("/counts"):
         return f"{counts_path[: -len('counts')]}countsT"
@@ -340,6 +355,9 @@ def repack_store(
 ) -> None:
     """Copy a Zarr store to v3 and shard discovered assay count matrices.
 
+    Retired per-assay ``state`` groups are omitted. They cannot identify current
+    artifacts and all analysis must be recomputed after the rewrite.
+
     Args:
         input_path: Source Zarr directory or URI.
         output_path: Destination Zarr directory or URI (created or overwritten).
@@ -365,7 +383,8 @@ def repack_store(
         f"{assay_name}/counts" if workspace is None else f"matrices/{assay_name}/counts"
         for assay_name, workspace in assays
     )
-    skip_paths = frozenset(_counts_t_path(path) for path in count_paths)
+    state_paths = _retired_assay_state_paths(src)
+    skip_paths = frozenset(_counts_t_path(path) for path in count_paths) | state_paths
     _copy_group(
         src,
         dst,

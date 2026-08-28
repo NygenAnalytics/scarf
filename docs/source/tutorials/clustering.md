@@ -18,13 +18,11 @@ Clustering is a model of graph structure, not a cell-type verdict. This page kee
 compares several Leiden resolutions with a Paris hierarchy, and reads every result through its
 exact immutable artifact ref.
 
-## 1. Build one graph
+## 1. Open one graph
 
 ```{code-cell} ipython3
 from dataclasses import asdict
 from itertools import combinations
-from pathlib import Path
-from tempfile import TemporaryDirectory
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -32,71 +30,32 @@ import pandas as pd
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
 import scarf
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-repacked_counts = str(Path(analysis_directory.name) / "counts.zarr")
-repack_store(f"{dataset}/data.zarr", repacked_counts, nthreads=2)
-ds = scarf.mount_datastore(
-    repacked_counts,
-    at=str(Path(analysis_directory.name) / "clustering_analysis.zarr"),
-    default_assay="RNA",
-    nthreads=4,
-    min_features_per_cell=10,
-)
-```
-
-With the source mounted, one pipeline invocation builds the shared graph and all clustering
-candidates compared below. UMAP remains an explicit display step because this page uses
-non-default layout settings; it does not affect the graph or cluster candidates.
-
-```{code-cell} ipython3
-clustering_run = ds.pipeline.run(
-    filtering={
-        "method": "manual",
-        "attrs": ["RNA_nCounts", "RNA_nFeatures", "RNA_percentMito"],
-        "lows": [1000, 500, 0],
-        "highs": [15000, 4000, 15],
-    },
-    hvg_count=500,
-    pca_dims=15,
-    neighbors_k=11,
-    umap=False,
-    leiden={"partitions": [0.3, 0.5, 0.8]},
-    cell_cycle=False,
-    paris=True,
-    doublets=False,
-    markers=False,
-)
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+clustering_run = ds.pipeline.open(label="docs_default")
 graph = clustering_run["connectivity_map"]
-initialization = ds.build_embedding_initialization(clustering_run["pca"])
-umap = ds.run_umap(
-    graph,
-    initialization,
-    n_epochs=150,
-    spread=5,
-    min_dist=1,
-    parallel=True,
-)
+umap = clustering_run["umap"]
 umap_values = np.asarray(ds.load_artifact(umap)["values"][:])
 ```
 
-All candidates below consume this exact graph. Changing only the clustering choice keeps graph and
-feature effects out of the comparison.
+The rebuilt store carries one completed pipeline run under the immutable label `docs_default`.
+Its exact graph and UMAP refs are the baseline below. Only the additional clustering choices are
+created on this page, so feature, PCA, graph, and layout effects stay out of the comparison.
 
 ## 2. Sweep Leiden resolution
 
 ```{code-cell} ipython3
 leiden_refs = {
-    resolution: clustering_run[f"leiden_{resolution}"]
-    for resolution in (0.3, 0.5, 0.8)
+    0.3: ds.run_leiden_clustering(graph, resolution=0.3),
+    0.5: clustering_run["leiden_0.5"],
+    0.8: ds.run_leiden_clustering(graph, resolution=0.8),
 }
 leiden_values = {
     resolution: np.asarray(ds.load_artifact(ref)["values"][:])
@@ -153,8 +112,7 @@ pd.DataFrame(agreement)
 ## 3. Inspect membership strength
 
 Use the chosen cluster ref directly. The result is another axis-aligned artifact, not a metadata
-column. Resolution `0.5` is fixed here for the diagnostic walkthrough; it is separate from the
-pipeline's automatic candidate choice discussed in section 6.
+column. Resolution `0.5` is fixed here for the diagnostic walkthrough.
 
 ```{code-cell} ipython3
 chosen = leiden_refs[0.5]
@@ -187,11 +145,11 @@ otherwise coherent groups may represent continuous biology.
 
 ## 4. Compare Paris cuts
 
-The pipeline's `paris` output is a `cluster_cut` ref, the same type returned by
-`run_paris_clustering`. Load the domain result explicitly when hierarchy diagnostics are needed.
+`run_paris_clustering` returns a `cluster_cut` ref. Load the domain result explicitly when
+hierarchy diagnostics are needed.
 
 ```{code-cell} ipython3
-paris_auto = clustering_run["paris"]
+paris_auto = ds.run_paris_clustering(graph)
 paris_result = ds.load_paris_clustering(paris_auto)
 pd.DataFrame([asdict(item) for item in paris_result.diagnostics])[
     ["label", "size", "persistence", "decision_margin", "forced"]
@@ -233,11 +191,10 @@ Marker search requires exact cluster and feature-selection refs and returns one 
 table artifact.
 
 ```{code-cell} ipython3
-all_features = ds.set_feature_selection(
-    from_assay="RNA",
-    feature_indexes=range(ds.RNA.feats.N),
+markers = ds.run_marker_search(
+    chosen,
+    features=clustering_run["feature_universe"],
 )
-markers = ds.run_marker_search(chosen, features=all_features)
 sizes = pd.Series(chosen_values).value_counts()
 largest = sizes.index[0]
 smallest = sizes.index[-1]
@@ -264,7 +221,7 @@ support, technical covariates, replicate coverage, and the study question.
 
 ## 6. Pipeline cluster selection
 
-The pipeline used above also evaluates its three Leiden candidates and Paris result with one
+When a pipeline run includes multiple Leiden candidates or Paris, it evaluates them with one
 deterministic sample of at most 10,000 cells in PCA space. Its `cluster_selection` artifact persists
 the scores, invalid-candidate reasons, tie order, and selected key:
 

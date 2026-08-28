@@ -20,7 +20,7 @@ Scarf aggregates counts and exports them. Use a replicate-aware external method 
 DESeq2 for condition-level differential expression. Scarf marker tables answer a different,
 cell-level question and must not be reported as replicate-aware differential expression.
 
-## 1. Create an artifact-only baseline
+## 1. Open the frozen baseline
 
 ```{code-cell} ipython3
 from pathlib import Path
@@ -30,35 +30,25 @@ import numpy as np
 import pandas as pd
 
 import scarf
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "kang_15K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-counts_path = Path(analysis_directory.name) / "counts.zarr"
-repack_store(f"{dataset}/data.zarr", str(counts_path), nthreads=2)
-ds = scarf.mount_datastore(
-    str(counts_path),
-    at=str(Path(analysis_directory.name) / "analysis.zarr"),
+ds = scarf.DataStore(
+    f"{dataset}/data.zarr",
     default_assay="RNA",
     nthreads=4,
 )
-
-run = ds.pipeline.run(
-    filtering=False,
-    cell_cycle=False,
-    doublets=False,
-)
+run = ds.pipeline.open(label="docs_default")
 ds.plots.embedding(run=run, layout="umap", color_by="clusters")
 ```
 
-The pipeline chose its clustering by silhouette score. The clustering and marker table are
-immutable outputs of this run.
+The rebuilt teaching store records its clustering and marker table as immutable outputs of this
+exact run.
 
 ## 2. Keep marker interpretation separate
 
@@ -184,8 +174,9 @@ in {doc}`dataset_merging`.
 ## 5. Export counts and sample metadata
 
 ```{code-cell} ipython3
-counts_csv = Path(analysis_directory.name) / "pseudobulk_counts.csv"
-metadata_csv = Path(analysis_directory.name) / "pseudobulk_metadata.csv"
+export_directory = TemporaryDirectory()
+counts_csv = Path(export_directory.name) / "pseudobulk_counts.csv"
+metadata_csv = Path(export_directory.name) / "pseudobulk_metadata.csv"
 
 bulk.to_csv(counts_csv)
 sample_metadata.index.name = "group"

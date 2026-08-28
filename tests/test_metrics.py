@@ -21,12 +21,44 @@ from scarf.metrics import (
     silhouette_scoring,
 )
 from scarf.metrics.lisi import _effective_perplexity, _neighbor_probabilities
-from scarf.storage.artifacts import ArtifactRef
+from scarf.metadata.artifacts import plan_cell_data_artifact, write_cell_data_artifact
+from scarf.storage.artifacts import ArtifactRef, ArtifactScope
+from scarf.storage.selections import resolve_stored_selection_artifact
 
 
 def _graph_neighbors(datastore, graph: ArtifactRef) -> ArtifactRef:
     raw = datastore.inspect_artifact(graph).inputs["neighbors"]
     return ArtifactRef.from_dict(raw)
+
+
+def _clustering_artifact(
+    datastore,
+    labels: np.ndarray,
+    *,
+    selection: ArtifactRef,
+    scope: ArtifactScope = "assay",
+    assay: str | None = "RNA",
+    kind: str = "cluster_labels",
+) -> ArtifactRef:
+    if scope == "datastore":
+        assay = None
+    values = np.asarray(labels)
+    value_name = "values" if kind == "cluster_labels" else "labels"
+    planned = plan_cell_data_artifact(
+        datastore.zw,
+        scope=scope,
+        assay=assay,
+        kind=kind,
+        operation="test_metric_clustering",
+        parameters={},
+        inputs={},
+        execution_options={},
+        cell_selection=selection,
+        arrays={value_name: (values.shape, None)},
+        invalidate_cache=True,
+    )
+    write_cell_data_artifact(datastore.zw, planned, {value_name: values})
+    return planned.ref
 
 
 def _uniform_self_free_knn() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -777,97 +809,335 @@ def test_lisi_batch_mixing_score():
     assert lisi_batch_mixing_score(np.full(4, 2.0), labels) == pytest.approx(1)
 
 
-def test_metric_label_concordance(datastore, connectivity_graph, leiden_clustering):
-    rng = np.random.default_rng(42)
-    labels1 = rng.integers(0, 2, datastore.cells.N)
-    labels2 = labels1.copy()
-    selected = np.zeros(datastore.cells.N, dtype=bool)
-    selected[: datastore.cells.N // 2] = True
-    labels2[~selected] = 1 - labels2[~selected]
-    datastore.cells.insert(
-        column_name="labels1",
-        values=labels1,
-        overwrite=True,
+def test_metric_label_concordance_uses_frozen_clustering_refs_after_alias_drift(
+    datastore_ephemeral,
+):
+    datastore = datastore_ephemeral
+    selection = datastore.snapshot_cell_selection("I")
+    selection_mask = np.asarray(datastore.load_artifact(selection)["values"][:])
+    first_labels = np.arange(int(selection_mask.sum())) % 3
+    second_labels = first_labels.copy()
+    second_labels[::5] = (second_labels[::5] + 1) % 3
+    first = _clustering_artifact(
+        datastore,
+        first_labels,
+        selection=selection,
     )
-    datastore.cells.insert(
-        column_name="labels2",
-        values=labels2,
-        overwrite=True,
+    second = _clustering_artifact(
+        datastore,
+        second_labels,
+        selection=selection,
+        assay="assay2",
+        kind="cluster_cut",
     )
-    datastore.cells.insert(
-        column_name="metric_subset",
-        values=selected,
-        overwrite=True,
-    )
-
-    assert datastore.metric_label_concordance(
-        ["labels1", "labels2"],
-        cell_key="metric_subset",
-    ) == pytest.approx(1)
-    assert (
-        datastore.metric_label_concordance(
-            ["labels1", "labels2"],
-            cell_key="I",
+    expected_ari = label_concordance_score([first_labels, second_labels], "ari")
+    expected_nmi = label_concordance_score([first_labels, second_labels], "nmi")
+    columns_before = set(datastore.cells.columns)
+    artifacts_before = set(datastore.list_artifacts())
+    live_selection = datastore.zw["cellData/I"]
+    original = np.asarray(live_selection[:], dtype=bool)
+    live_selection[:] = ~original
+    try:
+        assert datastore.metric_label_concordance(first, second) == pytest.approx(
+            expected_ari
         )
-        < 1
-    )
-    mixing_score = datastore.metric_proportional_batch_mixing(
-        "labels1",
-        _graph_neighbors(datastore, connectivity_graph),
-    )
-    assert 0 <= mixing_score <= 1
+        assert datastore.metric_label_concordance(
+            first,
+            second,
+            metric="nmi",
+        ) == pytest.approx(expected_nmi)
+    finally:
+        live_selection[:] = original
+
+    assert set(datastore.cells.columns) == columns_before
+    assert set(datastore.list_artifacts()) == artifacts_before
 
 
-def test_datastore_scib_metrics(datastore, connectivity_graph, leiden_clustering):
-    neighbors = _graph_neighbors(datastore, connectivity_graph)
-    cluster_labels = np.asarray(datastore.load_artifact(leiden_clustering)["values"][:])
-    raw_selection = datastore.inspect_artifact(leiden_clustering).inputs[
-        "cell_selection"
+def test_metric_label_concordance_requires_the_exact_cell_selection_ref(
+    datastore_ephemeral,
+):
+    datastore = datastore_ephemeral
+    first_selection = datastore.snapshot_cell_selection("I")
+    second_selection = resolve_stored_selection_artifact(
+        datastore.zw,
+        table_path="cellData",
+        id_column="ids",
+        source_column="I",
+        scope="datastore",
+        kind="cell_selection",
+        operation="test_metric_selection",
+        parameters={},
+        inputs={},
+        invalidate_cache=True,
+    )
+    assert second_selection != first_selection
+    selected_count = int(
+        np.asarray(datastore.load_artifact(first_selection)["values"][:]).sum()
+    )
+    labels = np.arange(selected_count) % 2
+    first = _clustering_artifact(
+        datastore,
+        labels,
+        selection=first_selection,
+    )
+    second = _clustering_artifact(
+        datastore,
+        labels,
+        selection=second_selection,
+    )
+
+    with pytest.raises(ValueError, match="different cell selections"):
+        datastore.metric_label_concordance(first, second)
+    with pytest.raises(TypeError, match="first must be an ArtifactRef"):
+        datastore.metric_label_concordance("labels1", second)
+
+
+def test_metric_label_concordance_fails_closed_on_invalid_clustering_contracts(
+    datastore_ephemeral,
+):
+    datastore = datastore_ephemeral
+    selection = datastore.snapshot_cell_selection("I")
+    selected_count = int(
+        np.asarray(datastore.load_artifact(selection)["values"][:]).sum()
+    )
+    labels = np.arange(selected_count) % 2
+    valid = _clustering_artifact(datastore, labels, selection=selection)
+
+    with pytest.raises(ValueError, match="clustering artifact"):
+        datastore.metric_label_concordance(selection, valid)
+
+    group = datastore.zw[datastore.inspect_artifact(valid).path]
+    original_provenance = dict(group.attrs["provenance"])
+    try:
+        group.attrs["provenance"] = {**original_provenance, "inputs": {}}
+        with pytest.raises(ValueError, match="no cell-selection input"):
+            datastore.metric_label_concordance(valid, valid)
+
+        malformed = {**original_provenance, "inputs": {"cell_selection": {}}}
+        group.attrs["provenance"] = malformed
+        with pytest.raises(ValueError, match="malformed cell-selection input"):
+            datastore.metric_label_concordance(valid, valid)
+    finally:
+        group.attrs["provenance"] = original_provenance
+
+    missing_values = _clustering_artifact(datastore, labels, selection=selection)
+    missing_group = datastore.zw[datastore.inspect_artifact(missing_values).path]
+    del missing_group["values"]
+    with pytest.raises(ValueError, match="no canonical 'values' label array"):
+        datastore.metric_label_concordance(missing_values, valid)
+
+    misaligned = _clustering_artifact(datastore, labels, selection=selection)
+    misaligned_values = datastore.zw[datastore.inspect_artifact(misaligned).path][
+        "values"
     ]
-    cluster_selection = ArtifactRef.from_dict(raw_selection)
-    cluster_mask = np.asarray(
-        datastore.load_artifact(cluster_selection)["values"][:],
-        dtype=bool,
+    misaligned_values.resize((selected_count - 1,))
+    with pytest.raises(ValueError, match="one label per selected cell"):
+        datastore.metric_label_concordance(misaligned, valid)
+
+
+def test_metric_label_concordance_accepts_datastore_scoped_clusterings(
+    datastore_ephemeral,
+):
+    datastore = datastore_ephemeral
+    selection = datastore.snapshot_cell_selection("I")
+    selected_count = int(
+        np.asarray(datastore.load_artifact(selection)["values"][:]).sum()
     )
-    full_cluster_labels = np.full(datastore.cells.N, -1, dtype=cluster_labels.dtype)
-    full_cluster_labels[cluster_mask] = cluster_labels
-    label_colname = "metric_clusters"
+    labels = np.arange(selected_count) % 2
+    assay_scoped = _clustering_artifact(datastore, labels, selection=selection)
+    datastore_scoped = _clustering_artifact(
+        datastore,
+        labels,
+        selection=selection,
+        scope="datastore",
+    )
+    assert datastore.metric_label_concordance(
+        datastore_scoped,
+        assay_scoped,
+    ) == pytest.approx(1.0)
+
+
+def test_metric_label_concordance_rejects_missing_cluster_labels(
+    datastore_ephemeral,
+):
+    datastore = datastore_ephemeral
+    selection = datastore.snapshot_cell_selection("I")
+    selected_count = int(
+        np.asarray(datastore.load_artifact(selection)["values"][:]).sum()
+    )
+    labels = np.arange(selected_count) % 2
+    complete = _clustering_artifact(datastore, labels, selection=selection)
+    masked = _clustering_artifact(datastore, labels, selection=selection)
+    group = datastore.zw[datastore.inspect_artifact(masked).path]
+    missing_name = "__scarf_missing__values"
+    missing = np.zeros(selected_count, dtype=bool)
+    missing[0] = True
+    group.create_array(missing_name, data=missing)
+    group["values"].attrs["missing_mask"] = missing_name
+
+    with pytest.raises(ValueError, match="contains missing cluster labels"):
+        datastore.metric_label_concordance(masked, complete)
+
+
+def test_metric_label_concordance_rejects_malformed_cluster_missing_masks(
+    datastore_ephemeral,
+):
+    datastore = datastore_ephemeral
+    selection = datastore.snapshot_cell_selection("I")
+    selected_count = int(
+        np.asarray(datastore.load_artifact(selection)["values"][:]).sum()
+    )
+    labels = np.arange(selected_count) % 2
+    complete = _clustering_artifact(datastore, labels, selection=selection)
+    for mask_case in (
+        "non_string_link",
+        "missing_array",
+        "wrong_dtype",
+        "wrong_shape",
+    ):
+        malformed = _clustering_artifact(datastore, labels, selection=selection)
+        group = datastore.zw[datastore.inspect_artifact(malformed).path]
+        missing_name = "__scarf_missing__values"
+        if mask_case == "wrong_dtype":
+            group.create_array(
+                missing_name,
+                data=np.zeros(selected_count, dtype=np.int8),
+            )
+        elif mask_case == "wrong_shape":
+            group.create_array(
+                missing_name,
+                data=np.zeros(selected_count + 1, dtype=bool),
+            )
+        group["values"].attrs["missing_mask"] = (
+            None if mask_case == "non_string_link" else missing_name
+        )
+
+        with pytest.raises(ValueError, match="malformed missing-label mask"):
+            datastore.metric_label_concordance(malformed, complete)
+
+
+def test_datastore_scib_metrics(datastore, connectivity_graph):
+    neighbors = _graph_neighbors(datastore, connectivity_graph)
+    annotations = np.arange(datastore.cells.N) % 3
     datastore.cells.insert(
-        column_name=label_colname,
-        values=full_cluster_labels,
-        fill_value=-1,
+        column_name="metric_annotations",
+        values=annotations,
         overwrite=True,
     )
-
-    labels = np.zeros(datastore.cells.N, dtype=np.int8)
+    batches = np.arange(datastore.cells.N) % 2
     datastore.cells.insert(
-        column_name="single_batch",
-        values=labels,
+        column_name="metric_batches",
+        values=batches,
         overwrite=True,
     )
     lisi_ref = datastore.metric_lisi(
-        label_columns=["single_batch"],
+        label_columns=["metric_annotations"],
         neighbors=neighbors,
     )
     assert lisi_ref.kind == "quality_metric"
     lisi = datastore.load_metric_lisi(lisi_ref)
-    assert np.allclose(lisi["single_batch"], 1)
+    assert np.isfinite(lisi["metric_annotations"]).all()
 
-    ilisi = datastore.metric_ilisi(label_colname, neighbors)
-    clisi = datastore.metric_clisi(label_colname, neighbors)
+    ilisi = datastore.metric_ilisi("metric_batches", neighbors)
+    clisi = datastore.metric_clisi(
+        annotation_column="metric_annotations",
+        neighbors=neighbors,
+    )
     graph_connectivity_score = datastore.metric_graph_connectivity(
-        label_colname,
-        connectivity_graph,
+        annotation_column="metric_annotations",
+        graph=connectivity_graph,
+    )
+    mixing_score = datastore.metric_proportional_batch_mixing(
+        "metric_batches",
+        neighbors,
     )
 
     assert 0 <= ilisi <= 1
     assert 0 <= clisi <= 1
     assert 0 <= graph_connectivity_score <= 1
+    assert 0 <= mixing_score <= 1
     with pytest.raises(ValueError, match="connectivity map or an integrated graph"):
         datastore.metric_graph_connectivity(
-            label_colname,
+            "metric_annotations",
             neighbors,
         )
+    with pytest.raises(TypeError, match="unexpected keyword argument 'label_colname'"):
+        datastore.metric_clisi(
+            label_colname="metric_annotations",
+            neighbors=neighbors,
+        )
+    with pytest.raises(TypeError, match="unexpected keyword argument 'label_colname'"):
+        datastore.metric_graph_connectivity(
+            label_colname="metric_annotations",
+            graph=connectivity_graph,
+        )
+
+
+def test_datastore_metrics_reject_missing_metadata_labels(
+    datastore,
+    connectivity_graph,
+):
+    neighbors = _graph_neighbors(datastore, connectivity_graph)
+    column = "masked_metric_labels"
+    datastore.cells.insert(
+        column_name=column,
+        values=np.zeros(datastore.cells.N, dtype=np.int8),
+        overwrite=True,
+    )
+    cell_data = datastore.zw["cellData"]
+    missing_name = f"__scarf_missing__{column}"
+    cell_data.create_array(
+        missing_name,
+        data=np.ones(datastore.cells.N, dtype=bool),
+    )
+    cell_data[column].attrs["missing_mask"] = missing_name
+
+    with pytest.raises(ValueError, match="contains missing values"):
+        datastore.metric_lisi([column], neighbors)
+    with pytest.raises(ValueError, match="contains missing values"):
+        datastore.metric_ilisi(column, neighbors)
+    with pytest.raises(ValueError, match="contains missing values"):
+        datastore.metric_clisi(column, neighbors)
+    with pytest.raises(ValueError, match="contains missing values"):
+        datastore.metric_graph_connectivity(column, connectivity_graph)
+    with pytest.raises(ValueError, match="contains missing values"):
+        datastore.metric_proportional_batch_mixing(column, neighbors)
+
+
+@pytest.mark.parametrize(
+    "mask_case",
+    ("missing_array", "wrong_dtype", "wrong_shape", "non_string_link"),
+)
+def test_datastore_metrics_reject_malformed_metadata_missing_masks(
+    datastore,
+    connectivity_graph,
+    mask_case,
+):
+    neighbors = _graph_neighbors(datastore, connectivity_graph)
+    column = f"malformed_metric_mask_{mask_case}"
+    datastore.cells.insert(
+        column_name=column,
+        values=np.zeros(datastore.cells.N, dtype=np.int8),
+        overwrite=True,
+    )
+    cell_data = datastore.zw["cellData"]
+    missing_name = f"__scarf_missing__{column}"
+    if mask_case == "wrong_dtype":
+        cell_data.create_array(
+            missing_name,
+            data=np.zeros(datastore.cells.N, dtype=np.int8),
+        )
+    elif mask_case == "wrong_shape":
+        cell_data.create_array(
+            missing_name,
+            data=np.zeros(datastore.cells.N - 1, dtype=bool),
+        )
+    cell_data[column].attrs["missing_mask"] = (
+        None if mask_case == "non_string_link" else missing_name
+    )
+
+    with pytest.raises(ValueError, match="missing-mask"):
+        datastore.metric_ilisi(column, neighbors)
 
 
 def test_metric_lisi_rejects_invalid_inputs(datastore, connectivity_graph):

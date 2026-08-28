@@ -388,6 +388,13 @@ def test_marker_facade_does_not_export_layout_internals():
     assert internal_names.isdisjoint(dir(markers))
 
 
+def test_graph_package_does_not_export_artifact_references():
+    graph = import_module("scarf.graph")
+
+    assert "ArtifactRef" not in graph.__all__
+    assert not hasattr(graph, "ArtifactRef")
+
+
 def test_domain_packages_export_canonical_objects():
     exports = {
         (

@@ -44,86 +44,51 @@ flowchart TB
     cells["Shared cell metadata"]
     rna["RNA assay<br/>feature metadata and results<br/>(default assay)"]
     atac["ATAC assay<br/>feature metadata and results"]
-    source["Optional mounted source<br/>counts and RNA countsT"]
     ds --> cells
     ds --> rna
     ds --> atac
-    source -.-> rna
-    source -.-> atac
 ```
 
 The default assay supplies method defaults when `from_assay` is omitted.
 It does not merge assay-specific feature tables or results.
 
 ```{code-cell} ipython3
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
 import pandas as pd
-import numpy as np
 
 import scarf
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level='WARNING', progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 ```
 
 This page uses the pre-analyzed Bastidas-Ponce pancreas store also used in {doc}`plotting` and {doc}`cell_cycle`.
-The published store contains literal UMAP coordinates and cluster labels. First repack it
-structurally into a temporary source with the paired RNA count layout, then mount those count
-matrices into a fresh writable target. The published source stays untouched.
-The pipeline keeps every live `I` cell, builds one Leiden partition, and searches its markers;
-UMAP and unrelated stages are disabled.
+The rebuilt store uses the current layout and contains a completed pipeline run named
+`docs_default`. Open it directly and reuse that run's exact selections, clustering, UMAP, and
+markers.
 
 ```{code-cell} ipython3
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    name='bastidas-ponce_4K_pancreas-d15_rnaseq',
-    destination='scarf_datasets',
+    name="bastidas-ponce_4K_pancreas-d15_rnaseq",
+    destination="scarf_datasets",
     zarr=True,
 )
-
-analysis_directory = TemporaryDirectory()
-repacked_counts_path = Path(analysis_directory.name) / 'counts.zarr'
-analysis_path = Path(analysis_directory.name) / 'data_organization.zarr'
-repack_store(
-    f'{dataset}/data.zarr',
-    str(repacked_counts_path),
-    nthreads=2,
-)
-ds = scarf.mount_datastore(
-    str(repacked_counts_path),
-    at=str(analysis_path),
-    default_assay='RNA',
+ds = scarf.DataStore(
+    f"{dataset}/data.zarr",
     nthreads=4,
 )
-
-analysis_run = ds.pipeline.run(
-    filtering=False,
-    hvg_count=500,
-    pca_dims=15,
-    umap=False,
-    leiden={'partitions': [0.5]},
-    cell_cycle=False,
-    paris=False,
-    doublets=False,
-    markers=True,
-)
-cell_selection = analysis_run['analysis_cell_selection']
-hvg_ref = analysis_run['highly_variable_features']
-normalized = analysis_run['normalized']
-clusters_ref = analysis_run['clusters']
-marker_ref = analysis_run['markers']
+analysis_run = ds.pipeline.open(label="docs_default")
+marker_ref = analysis_run["markers"]
 
 ds
 ```
 
 ```{code-cell} ipython3
-cluster_values = np.asarray(ds.load_artifact(clusters_ref)['values'][:])
+cluster_values = analysis_run.cells.fetch("clusters")
 pd.Series(cluster_values).value_counts().sort_index()
 ```
 
-The clustering remains in its artifact. The published source's literal UMAP and cluster columns are
-separate metadata and are not changed by this computation.
+The selected clustering remains in its exact artifact. The catalog's literal `clusters` column is
+an imported cell-type annotation, not a copy of this analytical result. Opening the run does not
+modify either one.
 
 ## 1. Inspect Zarr trees
 
@@ -142,7 +107,7 @@ ds.show_zarr_tree(depth=1)
 Cell statistics computed from an assay are stored under `cellData` with the assay name as a prefix (`RNA_…`, `ADT_…`).
 
 ```{code-cell} ipython3
-ds.show_zarr_tree(start='cellData')
+ds.show_zarr_tree(start="cellData")
 ```
 
 **The `I` column** is the default user-owned {term}`cell key`, tracking which cells are active for
@@ -151,7 +116,7 @@ Use `snapshot_cell_selection("I")` to capture this live column before passing it
 producer. Some metadata, mapping, and export utilities still accept `cell_key` directly.
 
 ```{code-cell} ipython3
-ds.cells.to_pandas_dataframe(['I'])['I'].value_counts()
+ds.cells.to_pandas_dataframe(["I"])["I"].value_counts()
 ```
 
 This store keeps every barcode active (`True`). Analytical filtering returns a separate immutable
@@ -159,14 +124,14 @@ selection artifact and leaves this column unchanged. If you deliberately author 
 column, its `False` rows also remain in the table rather than being deleted.
 
 Each assay group holds `featureData` and its persisted artifacts.
-Count matrices are Zarr arrays (often sharded): default `{assay}/counts`, workspace `matrices/{assay}/counts`, or still in a mounted source when the assay is mounted.
+Count matrices are Zarr arrays, often sharded. This store keeps RNA counts at `RNA/counts`.
 
 ```{code-cell} ipython3
-ds.show_zarr_tree(start='RNA', depth=1)
+ds.show_zarr_tree(start="RNA", depth=1)
 ```
 
 ```{code-cell} ipython3
-ds.show_zarr_tree(start='RNA/featureData', depth=1)
+ds.show_zarr_tree(start="RNA/featureData", depth=1)
 ```
 
 Each persisted result is an {term}`artifact`. Assay-scoped results live under
@@ -176,10 +141,10 @@ The kind names the operation family and the identifier is derived from the input
 Nothing here encodes parameters in the path, so a second PCA at different dimensionality becomes a sibling entry rather than a new branch of the tree.
 
 ```{code-cell} ipython3
-ds.show_zarr_tree(start='RNA/artifacts', depth=1)
+ds.show_zarr_tree(start="RNA/artifacts", depth=1)
 ```
 
-{doc}`../developers/zarr_internals` covers the on-disk layout and structural Zarr repacking.
+{doc}`../developers/zarr_internals` covers the complete on-disk layout.
 
 ## 2. Inspect cell and feature attributes
 
@@ -196,30 +161,33 @@ ds.RNA.feats.head()
 
 ```{code-cell} ipython3
 ds.cells.to_pandas_dataframe(
-    columns=['ids', 'RNA_nCounts', 'RNA_nFeatures', 'clusters']
-).set_index('ids')
+    columns=["ids", "RNA_nCounts", "RNA_nFeatures", "clusters"]
+).set_index("ids")
 ```
 
 `insert` writes a new column and aligns values to the active subset unless you override `key`.
 Re-inserting an existing column requires `overwrite=True`.
 
 ```{code-cell} ipython3
-cluster_labels = ds.cells.fetch('clusters')
-first_cluster = str(cluster_labels[0])
-is_first_cluster = cluster_labels.astype(str) == first_cluster
-ds.cells.insert(column_name='is_first_cluster', values=is_first_cluster, overwrite=True)
+first_run_cluster = cluster_values[0]
+is_first_cluster = cluster_values == first_run_cluster
+ds.cells.insert(
+    column_name="is_first_cluster",
+    values=is_first_cluster,
+    overwrite=True,
+)
 ```
 
 ```{code-cell} ipython3
 ds.cells.to_pandas_dataframe(
-    columns=['ids', 'clusters', 'is_first_cluster']
+    columns=["ids", "clusters", "is_first_cluster"]
 ).head()
 ```
 
 ```{code-cell} ipython3
 ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='is_first_cluster',
+    layout=analysis_run["umap"],
+    color_by="is_first_cluster",
 )
 ```
 
@@ -227,32 +195,14 @@ The new column marks one cluster on the same active cells used for the insert.
 
 `fetch` returns values for the active subset (default column `I`).
 `fetch_all` returns every row in the store.
-With every cell active the lengths match, so temporarily restrict `I` to make the difference visible, then restore the backup:
+With every cell active the lengths match. Pass the new Boolean column as `key` to select one
+cluster without changing `I`:
 
 ```{code-cell} ipython3
-i_backup = ds.cells.fetch_all('I').copy()
-ds.cells.update_key(is_first_cluster, 'I')
-
 print(
-    'fetch:', ds.cells.fetch('clusters').shape,
-    'fetch_all:', ds.cells.fetch_all('clusters').shape,
+    "fetch:", ds.cells.fetch("clusters", key="is_first_cluster").shape,
+    "fetch_all:", ds.cells.fetch_all("clusters").shape,
 )
-ds.cells.to_pandas_dataframe(['I'])['I'].value_counts()
-```
-
-```{code-cell} ipython3
-ds.cells.insert(column_name='I', values=i_backup, overwrite=True, force=True)
-print('Restored active cells:', int(ds.cells.fetch_all('I').sum()))
-```
-
-```{code-cell} ipython3
-try:
-    ds.cells.insert(
-        column_name='is_first_cluster',
-        values=is_first_cluster,
-    )
-except ValueError:
-    print("Expected validation: use overwrite=True to replace an existing column.")
 ```
 
 ## 3. Query metadata without materializing a DataFrame
@@ -261,33 +211,33 @@ except ValueError:
 `multi_sift` combines several ranges, and `get_index_by` locates exact categorical values:
 
 ```{code-cell} ipython3
-active_before = int(ds.cells.fetch_all('I').sum())
+active_before = int(ds.cells.fetch_all("I").sum())
 count_range = ds.cells.sift(
-    'RNA_nCounts',
+    "RNA_nCounts",
     min_v=1000,
     max_v=15000,
 )
 joint_range = ds.cells.multi_sift(
-    columns=['RNA_nCounts', 'RNA_nFeatures'],
+    columns=["RNA_nCounts", "RNA_nFeatures"],
     lows=[1000, 500],
     highs=[15000, 4000],
 )
-cluster_rows = ds.cells.get_index_by([first_cluster], 'clusters')
+ductal_rows = ds.cells.get_index_by(["Ductal"], "clusters")
 
 print(
-    'count_range:', int(count_range.sum()),
-    'joint_range:', int(joint_range.sum()),
-    'cluster_rows:', int(cluster_rows.size),
+    "count_range:", int(count_range.sum()),
+    "joint_range:", int(joint_range.sum()),
+    "ductal_rows:", int(ductal_rows.size),
 )
-print('Active cells (I) before:', active_before)
-print('Active cells (I) after:', int(ds.cells.fetch_all('I').sum()))
+print("Active cells (I) before:", active_before)
+print("Active cells (I) after:", int(ds.cells.fetch_all("I").sum()))
 ```
 
 ```{code-cell} ipython3
-ds.cells.insert(column_name='in_count_range', values=count_range, overwrite=True)
+ds.cells.insert(column_name="in_count_range", values=count_range, overwrite=True)
 ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='in_count_range',
+    layout=analysis_run["umap"],
+    color_by="in_count_range",
 )
 ```
 
@@ -298,25 +248,19 @@ See the `MetaData` API in {doc}`../reference/api/assays` for update and delete h
 ## 4. Count matrices and normalization
 
 Raw counts are a Zarr array (often sharded), exposed as `rawData`, a chunked array with a NumPy-like interface that streams by row.
-Location depends on layout: default `{assay}/counts`, workspace `matrices/{assay}/counts`, or the mounted source when counts stay there.
+In this store the array is at `RNA/counts`.
 RNA assays also store `countsT`, a gene-major copy used by HVG and marker stages.
 Routine analysis does not need to touch either array directly.
 
-```{code-cell} ipython3
-ds.RNA.rawData
-```
-
 Normalized values are computed on demand through the lower-level assay `normed()` view from raw counts.
 `run_normalization(cell_selection, features)` is the public persisted path and requires exact stored cell- and feature-selection references.
-The direct `normed()` view follows its explicit or literal metadata indexes; in a newly created store the physical feature `I` column is all true:
+The direct `normed()` view follows its explicit or literal metadata indexes; in a newly created
+store the physical feature `I` column is all true. Inspect only small slices when exploring these
+lazy arrays:
 
 ```{code-cell} ipython3
-ds.RNA.normed()
-```
-
-```{code-cell} ipython3
-print('Raw shape:', ds.RNA.rawData.shape)
-print('Normed shape:', ds.RNA.normed().shape)
+print("Raw shape:", ds.RNA.rawData.shape)
+print("Normed shape:", ds.RNA.normed().shape)
 ds.RNA.rawData[:3, :5].compute()
 ```
 
@@ -328,19 +272,18 @@ Override normalization by assigning `normMethod`.
 Reassign a custom function each time you open the store.
 `scarf.assay.norm_dummy` disables normalization for pre-normalized inputs.
 
-```{code-cell} ipython3
-print('Current method:', ds.RNA.normMethod.__name__)
-```
-
 ## 5. Inspect persisted analysis results
 
 Analysis methods return lightweight references to results stored in Zarr.
-The pipeline retained the HVG and normalization references it created in the mounted target.
+The completed `docs_default` run retained the HVG and normalization references it created.
 Asking for the same normalization again reuses that result rather than recomputing:
 
 ```{code-cell} ipython3
-reused_normalized = ds.run_normalization(cell_selection, hvg_ref)
-print('Reused:', reused_normalized == normalized)
+reused_normalized = ds.run_normalization(
+    analysis_run["analysis_cell_selection"],
+    analysis_run["highly_variable_features"],
+)
+print("Reused:", reused_normalized == analysis_run["normalized"])
 reused_normalized
 ```
 
@@ -348,12 +291,12 @@ Inspect its status and open the underlying group only when a custom method needs
 
 ```{code-cell} ipython3
 status = ds.inspect_artifact(reused_normalized)
-print('Complete:', status.complete)
-print('Operation:', status.operation)
-print('Parameters:', status.parameters)
+print("Complete:", status.complete)
+print("Operation:", status.operation)
+print("Parameters:", status.parameters)
 
 group = ds.load_artifact(reused_normalized)
-print('Arrays:', list(group.array_keys())[:5])
+print("Arrays:", list(group.array_keys())[:5])
 ```
 
 Identical inputs and parameters {term}`reuse` a complete result.
@@ -362,7 +305,7 @@ Branching, invalidation, and lineage are covered in {doc}`reuse_and_tracing`.
 ## 6. Marker features
 
 Marker search writes a `marker_table` artifact like any other result. The pipeline returns its
-exact ref as `analysis_run['markers']`; an explicit `run_marker_search` call follows the same
+exact ref as `analysis_run["markers"]`; an explicit `run_marker_search` call follows the same
 artifact contract. Pass that ref to table, plot, and export accessors. Different clustering or
 feature refs naturally produce distinct artifacts.
 
@@ -386,7 +329,7 @@ ds.plots.marker_heatmap(
 ```
 
 ```{code-cell} ipython3
-markers_csv = 'scarf_datasets/pancreas_cluster_markers.csv'
+markers_csv = "scarf_datasets/pancreas_cluster_markers.csv"
 ds.export_markers_to_csv(
     marker=marker_ref,
     csv_filename=markers_csv,
@@ -400,14 +343,11 @@ pd.read_csv(markers_csv).iloc[:5, :6]
 
 Current Scarf versions write new datasets as Zarr v3.
 RNA assays also write a gene-major `countsT` copy next to `counts`.
-An older RNA store that is still Zarr v2, or that lacks that copy, will not open until you re-import it or repack it.
+The catalog dataset used here was rebuilt from its raw source with this codebase, so it already has
+the current layout. Re-import older RNA stores that use Zarr v2 or lack `countsT` before analysis.
 
 Count matrices from the writers use sharded arrays (default profile `fast_local`).
 Set the profile with `SCARF_ZARR_PROFILE` (`fast_local` or `cloud`) or `zarrProfile=` when opening a `DataStore`.
-
-```bash
-uv run python -m scarf.tools.repack_zarr input.zarr output.zarr --profile fast_local
-```
 
 Storage profiles and conversion belong to the physical store, while `mem_budget` and `nthreads` control execution.
 See {doc}`../concepts/memory_and_execution` for why RNA stores two orientations, and {doc}`remote_stores` for object storage and local scratch.
@@ -419,7 +359,7 @@ See {doc}`../concepts/memory_and_execution` for why RNA stores two orientations,
 - Using `fetch` when values for inactive cells are also required (`fetch_all`)
 - Treating a result reference as an in-memory matrix
 - Editing artifact groups directly instead of using Scarf's analysis methods
-- Expecting an older RNA Zarr v2 store, or one without `countsT`, to open without a re-import or `repack_zarr`
+- Expecting an older RNA Zarr v2 store, or one without `countsT`, to open without re-importing it
 
 Metadata changes and artifacts are written into the Zarr store.
 Low-level layout details intended for contributors remain in {doc}`../developers/zarr_internals`.

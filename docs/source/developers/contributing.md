@@ -122,7 +122,9 @@ Timeout per code cell is 600 seconds (`nb_execution_timeout` in `conf.py`).
 
 Pages that are not about building an artifact lineage open a pre-analyzed store with `download_dataset(..., zarr=True)`.
 Source stores are rebuilt from raw counts, while declared derived stores are rebuilt from their published inputs.
-`scripts/regenerate_docs_datasets.py` writes both kinds and creates a manifest under `docs/source/developers/dataset_manifests/` recording the recipe, cell counts, artifact inventory, and archive checksum:
+`scripts/regenerate_docs_datasets.py` writes both kinds and creates a manifest under
+`docs/source/developers/dataset_manifests/` recording the recipe, cell counts, artifact and
+pipeline-run inventories, and archive checksum:
 
     uv run python scripts/regenerate_docs_datasets.py --all
 

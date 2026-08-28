@@ -24,7 +24,8 @@ feature selection
   Direct feature consumers require the exact ref through `features=`.
 
 all features
-  Assay-wide all-true feature-selection artifact used internally by complete-universe operations.
+  Assay-wide all-true feature-selection artifact returned by `DataStore.select_all_features` and
+  used by complete-universe operations.
   It is distinct from the physical feature metadata column `I`.
 
 provenance

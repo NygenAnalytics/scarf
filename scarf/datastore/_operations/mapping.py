@@ -427,7 +427,9 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         )
         selected_expression_fingerprint = stream.raw_expression_fingerprint
 
-        all_features = cast(Any, self)._ensure_all_features(assay)
+        all_features = cast(Any, self).select_all_features(
+            from_assay=assay.name,
+        )
         feature_mask = np.zeros(assay.feats.N, dtype=bool)
         feature_mask[stream.query_feature_indices] = True
         feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay)

@@ -18,80 +18,63 @@ Fate mapping estimates terminal-outcome probabilities on an oriented graph. It i
 pseudotime artifact and an exact sink-label artifact. The probabilities summarize the model; they
 do not establish causal lineage.
 
-## 1. Build pseudotime and sink labels
+## 1. Reuse the prepared graph and sink labels
 
 ```{code-cell} ipython3
-from tempfile import TemporaryDirectory
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 import scarf
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     name="bastidas-ponce_4K_pancreas-d15_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-repacked_counts = f"{analysis_directory.name}/counts.zarr"
-repack_store(f"{dataset}/data.zarr", repacked_counts, nthreads=2)
-ds = scarf.mount_datastore(
-    repacked_counts,
-    at=f"{analysis_directory.name}/analysis.zarr",
+ds = scarf.DataStore(
+    f"{dataset}/data.zarr",
     nthreads=4,
-    default_assay="RNA",
 )
+analysis_run = ds.pipeline.open(label="docs_default")
+graph = analysis_run["connectivity_map"]
 
-preparation = ds.pipeline.run(
-    filtering=False,
-    hvg_count=2000,
-    pca_dims=15,
-    neighbors_k=11,
-    umap=False,
-    leiden=False,
-    cell_cycle=False,
-    paris=False,
-    doublets=False,
-    markers=False,
-)
-graph = preparation["connectivity_map"]
-
-annotations = np.asarray(ds.cells.fetch("clusters", key="I"))
+annotations = ds.cells.fetch("clusters", key="I")
 source = annotations == "Ductal"
 sink = np.isin(annotations, ["Alpha", "Beta", "Delta"])
-if not source.any() or not sink.any() or np.any(source & sink):
-    raise ValueError("Source and sink annotations must be non-empty and disjoint")
+if not source.any() or not sink.any():
+    raise ValueError("Source and sink annotations must both be present")
 source_sink_vector = np.zeros(len(annotations), dtype=float)
-source_sink_vector[source] = 1.0 / int(source.sum())
-source_sink_vector[sink] = -1.0 / int(sink.sum())
+source_sink_vector[source] = 1.0 / source.sum()
+source_sink_vector[sink] = -1.0 / sink.sum()
 
 pseudotime_ref = ds.run_pseudotime_scoring(graph, ss_vec=source_sink_vector)
 pseudotime = ds.load_pseudotime_scoring(pseudotime_ref)
-sink_labels_ref = ds.run_leiden_clustering(graph, resolution=1.0)
-sink_labels = np.asarray(ds.load_artifact(sink_labels_ref)["values"][:])
+sink_labels_ref = analysis_run["clusters"]
+sink_labels = analysis_run.cells.fetch("clusters")
 ```
 
-The `clusters` labels and `RNA_UMAP*` columns used on this page are prepared catalog metadata copied
-by the mount. The new pseudotime, Leiden, and fate results remain exact artifacts.
+The rebuilt catalog store contains the completed `docs_default` pipeline run. This page reuses its
+exact graph, selected clustering, and UMAP. The literal `clusters` column contains the published
+cell-type annotations used only to orient pseudotime. The new pseudotime and fate results remain
+exact artifacts.
 
 For this executable mechanics example, choose the two clusters with the greatest mean valid
 pseudotime as candidate terminal labels. A real analysis should choose and validate endpoints from
 study-specific evidence.
 
 ```{code-cell} ipython3
-valid_frame = pd.DataFrame(
-    {
-        "label": sink_labels[pseudotime.valid],
-        "pseudotime": pseudotime.values[pseudotime.valid],
-    }
-)
 terminal_labels = (
-    valid_frame.groupby("label")["pseudotime"].mean().nlargest(2).index.tolist()
+    pd.Series(
+        pseudotime.values[pseudotime.valid],
+        index=sink_labels[pseudotime.valid],
+    )
+    .groupby(level=0)
+    .mean()
+    .nlargest(2)
+    .index.tolist()
 )
 if len(terminal_labels) != 2:
     raise ValueError("Fate mapping requires exactly two terminal labels in this example")
@@ -133,17 +116,13 @@ probability_summary.agg(["min", "median", "max"])
 Probabilities should be finite, non-negative, and sum to one for valid cells.
 
 ```{code-cell} ipython3
-umap = ds.cells.to_pandas_dataframe(["RNA_UMAP1", "RNA_UMAP2"], key="I")
+umap = np.asarray(ds.load_artifact(analysis_run["umap"])["values"][:])
 figure, axes = plt.subplots(1, len(fate.sink_labels), figsize=(9, 4))
-for axis, index, label in zip(
-    np.atleast_1d(axes),
-    range(len(fate.sink_labels)),
-    fate.sink_labels,
-    strict=True,
-):
+for index, label in enumerate(fate.sink_labels):
+    axis = axes[index]
     points = axis.scatter(
-        umap.loc[fate.valid, "RNA_UMAP1"],
-        umap.loc[fate.valid, "RNA_UMAP2"],
+        umap[fate.valid, 0],
+        umap[fate.valid, 1],
         c=fate.values[fate.valid, index],
         s=4,
     )

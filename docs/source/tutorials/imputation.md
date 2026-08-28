@@ -21,55 +21,30 @@ Scarf can diffuse a feature over the neighbourhood graph to reveal coherent regi
 Imputation is a visualization and exploratory-analysis aid.
 It does not create new molecular observations and should not replace counts in differential expression.
 
-## 1. Standalone setup
+## 1. Open the prepared baseline
 
 Diffusion needs a neighbourhood graph.
-The catalog PBMC store supplies counts, literal metadata, and the UMAP used below.
-This setup mounts those inputs into a temporary writable analysis store and builds a new explicit graph lineage locally.
-The catalog snapshot is structurally repacked inside the temporary directory first so the mounted counts satisfy the current RNA layout.
+The rebuilt PBMC store contains a completed standard analysis labeled `docs_default`.
+Open the downloaded store directly because this page writes new diffusion artifacts and deliberate
+cell columns, then take the graph and UMAP from that frozen run. The prepared store's active `I`
+matches the run's analysis selection.
 
 ```{code-cell} ipython3
-from tempfile import TemporaryDirectory
-
 import pandas as pd
 
 import scarf
 import scarf.plotting as splt
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-repacked_counts = f"{analysis_directory.name}/counts.zarr"
-repack_store(
-    f"{dataset}/data.zarr",
-    repacked_counts,
-    nthreads=2,
-)
-ds = scarf.mount_datastore(
-    repacked_counts,
-    at=f"{analysis_directory.name}/analysis.zarr",
-    nthreads=4,
-    default_assay="RNA",
-)
-preparation = ds.pipeline.run(
-    filtering=False,
-    hvg_count=2000,
-    pca_dims=15,
-    neighbors_k=11,
-    umap=False,
-    leiden=False,
-    cell_cycle=False,
-    paris=False,
-    doublets=False,
-    markers=False,
-)
-graph = preparation["connectivity_map"]
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+run = ds.pipeline.open(label="docs_default")
+graph = run["connectivity_map"]
 ```
 
 ## 2. Diffuse one feature
@@ -87,11 +62,7 @@ diffused_by_t = {
     for t, diffusion in diffusion_operators.items()
 }
 for t, values in diffused_by_t.items():
-    ds.cells.insert(
-        f"CD4_imputed_t{t}",
-        values,
-        overwrite=True,
-    )
+    ds.cells.insert(f"CD4_imputed_t{t}", values, key="I", overwrite=True)
 ```
 
 ```{code-cell} ipython3
@@ -121,19 +92,22 @@ Mean stays near the observed level while max falls with `t` as diffusion spreads
 `filled_zeros` counts active cells that were zero for observed CD4 and became nonzero after diffusion.
 That count is the size of the nonzero-as-detection mistake for this feature.
 
-Literal Paris labels and UMAP coordinates from the catalog snapshot give the population context
-for the CD4 panels below.
+The frozen selected clustering gives population context for the CD4 panels below.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by="RNA_paris_cluster",
+    run=run,
+    layout="umap",
+    color_by="clusters",
 )
 ```
 
+The comparison uses the exact UMAP artifact from the same run while coloring by the live columns
+created above.
+
 ```{code-cell} ipython3
 imputation_comparison = ds.plots.embedding(
-    layout_key="RNA_UMAP",
+    layout=run["umap"],
     color_by=[
         "CD4",
         "CD4_imputed_t1",

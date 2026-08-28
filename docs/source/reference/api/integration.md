@@ -14,13 +14,17 @@ wnn = ds.integrate_assays([rna_neighbors, adt_neighbors], method="wnn")
 ```
 
 Neighbour-based metrics require `neighbors`; graph metrics require `graph`; reduction metrics
-require their exact coordinate artifact. Methods that compare against live metadata read the rows
-selected by artifact lineage. None accepts a storage path or an omitted artifact input.
+require their exact coordinate artifact. Batch-mixing methods and biological-annotation cLISI or
+graph connectivity intentionally read imported metadata columns over the rows selected by artifact
+lineage. They are not an indirect path for scoring Scarf-produced clusterings. Concordance instead
+accepts two exact clustering refs with the same frozen cell selection. None accepts a storage path
+or an omitted artifact input.
 
 ```python
 mixing_ref = ds.metric_lisi(["batch"], rna_neighbors)
 mixing = ds.load_metric_lisi(mixing_ref)["batch"]
 connectivity = ds.metric_graph_connectivity("cell_type", snn)
+agreement = ds.metric_label_concordance(rna_clusters, adt_clusters, metric="ari")
 ```
 
 Per-cell LISI is axis-aligned analytical data, so `metric_lisi` returns an artifact and

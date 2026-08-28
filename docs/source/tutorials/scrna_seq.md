@@ -46,11 +46,11 @@ import pandas as pd
 
 import scarf
 
-scarf.configure_output(level='WARNING', progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    'tenx_5K_pbmc_rnaseq',
-    destination='scarf_datasets',
+    "tenx_5K_pbmc_rnaseq",
+    destination="scarf_datasets",
 )
 ```
 
@@ -63,16 +63,15 @@ A Zarr "file" is a directory hierarchy on disk, not a single HDF5-style file.
 ```
 
 ```{code-cell} ipython3
-reader = scarf.CrH5Reader(f'{dataset}/data.h5')
+reader = scarf.CrH5Reader(f"{dataset}/data.h5")
 reader.nCells, reader.nFeatures
 ```
 
 ```{code-cell} ipython3
-writer = scarf.CrToZarr(
+scarf.CrToZarr(
     reader,
-    zarr_loc=f'{dataset}/data.zarr',
-)
-writer.dump()
+    zarr_loc=f"{dataset}/data.zarr",
+).dump()
 ```
 
 Open a `DataStore`.
@@ -84,11 +83,7 @@ Opening this store prints a message that the smallest cell count is below the RN
 It refers to normalization, which is covered in step 3, and the QC filter in step 2 removes those cells.
 
 ```{code-cell} ipython3
-ds = scarf.DataStore(
-    f'{dataset}/data.zarr',
-    nthreads=4,
-    min_features_per_cell=10
-)
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4, min_features_per_cell=10)
 ds
 ```
 
@@ -102,16 +97,15 @@ Deeper QC options, including `auto_filter_cells` and doublet detection, are in {
 
 ```{code-cell} ipython3
 qc_cols = [
-    c for c in (
-        'RNA_nCounts', 'RNA_nFeatures', 'RNA_percentMito', 'RNA_percentRibo'
-    )
+    c
+    for c in ("RNA_nCounts", "RNA_nFeatures", "RNA_percentMito", "RNA_percentRibo")
     if c in ds.cells.columns
 ]
-qc_cell_selection = ds.snapshot_cell_selection('I')
+qc_cell_selection = ds.snapshot_cell_selection("I")
 ds.plots.distribution(
     keys=qc_cols,
     cell_selection=qc_cell_selection,
-    kind='violin',
+    kind="violin",
     max_points=2000,
 )
 ```
@@ -189,9 +183,9 @@ The default size factor is 1000, and the earlier filter removes cells below that
 
 ```{code-cell} ipython3
 status = ds.inspect_artifact(run["normalized"])
-print('Size factor (ds.RNA.sf):', ds.RNA.sf)
-print('cell selection:', status.inputs['cell_selection'])
-print('feature selection:', status.inputs['feature_selection'])
+print("Size factor (ds.RNA.sf):", ds.RNA.sf)
+print("cell selection:", status.inputs["cell_selection"])
+print("feature selection:", status.inputs["feature_selection"])
 ```
 
 The normalized {term}`artifact` records both exact selection refs.
@@ -212,7 +206,7 @@ print("PCA input:", pca_status.inputs["normalized"])
 print("PCA coordinate shape:", pca_shape)
 print(graph.shape, graph.nnz)
 print(
-    'Degree min / median / max:',
+    "Degree min / median / max:",
     int(degrees.min()),
     int(np.median(degrees)),
     int(degrees.max()),
@@ -272,7 +266,7 @@ graph so the comparison changes only the clustering method.
 
 ```{code-cell} ipython3
 paris = ds.run_paris_clustering(graph_ref)
-paris_values = np.asarray(ds.load_artifact(paris)['labels'][:])
+paris_values = np.asarray(ds.load_artifact(paris)["labels"][:])
 pd.Series(paris_values).value_counts().sort_index()
 ```
 
@@ -282,8 +276,8 @@ ds.plots.embedding(layout=run["umap"], color_by=paris)
 
 ```{code-cell} ipython3
 pd.crosstab(
-    pd.Series(leiden_values, name='Leiden'),
-    pd.Series(paris_values, name='Paris'),
+    pd.Series(leiden_values, name="Leiden"),
+    pd.Series(paris_values, name="Paris"),
 )
 ```
 
@@ -303,39 +297,16 @@ The pipeline already ran marker search against its selected Leiden artifact and 
 universe, so the plots and lookups below reuse that exact result.
 
 ```{code-cell} ipython3
-ds.plots.marker_heatmap(
-    marker=marker_ref,
-    topn=5,
-    figsize=(5, 9)
-)
+ds.plots.marker_heatmap(marker=marker_ref, topn=5, figsize=(5, 9))
 ```
 
 Rows are top marker genes per cluster; stronger scores mark more cluster-specific genes.
 
 ```{code-cell} ipython3
-df = ds.get_markers(
-    marker=marker_ref,
-    group_id='1',
-    min_score=-1,
-    min_frac_exp=-1
-)
-df.head()
+ds.get_markers(marker=marker_ref, group_id="1", min_score=-1, min_frac_exp=-1).head()
 ```
 
-Rank the same three lineage genes across all Leiden groups before plotting them on the embedding.
-
-```{code-cell} ipython3
-markers = ds.get_markers(
-    marker=marker_ref,
-    group_id=None,
-    min_score=-1,
-    min_frac_exp=-1,
-)
-panel = markers[markers['feature_name'].isin(['CD14', 'MS4A1', 'CD3D'])]
-panel.sort_values(
-    ['feature_name', 'score'], ascending=[True, False]
-).groupby('feature_name', sort=False).head(2)
-```
+Plot three lineage genes across all Leiden groups.
 
 ```{code-cell} ipython3
 ds.plots.dotplot(
@@ -345,7 +316,6 @@ ds.plots.dotplot(
 ```
 
 CD14, MS4A1, and CD3D provide monocyte-, B-, and T-cell evidence when those lineages are present.
-The lookup above names which Leiden clusters rank each gene highest.
 
 Annotation from markers, known gene panels, and subclustering is covered in {doc}`annotation`.
 

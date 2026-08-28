@@ -16,7 +16,10 @@ from ...metadata.artifacts import (
     plan_cell_data_artifact,
     write_cell_data_artifact,
 )
-from ...metadata.rows import read_metadata_rows_chunkwise
+from ...metadata.rows import (
+    read_metadata_missing_rows_chunkwise,
+    read_metadata_rows_chunkwise,
+)
 from ...storage.artifacts import (
     ArtifactRef,
     group_at,
@@ -38,7 +41,76 @@ else:
     _IntegrationMetricsBase = object
 
 
+def _read_complete_metric_metadata(
+    metadata: Any,
+    column: str,
+    rows: np.ndarray,
+) -> np.ndarray:
+    values = read_metadata_rows_chunkwise(metadata, column, rows)
+    missing = read_metadata_missing_rows_chunkwise(metadata, column, rows)
+    if missing is not None:
+        if missing.any():
+            raise ValueError(f"Metric column {column!r} contains missing values")
+    return values
+
+
 class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
+    def _load_metric_clustering(
+        self,
+        clustering: ArtifactRef,
+        *,
+        name: str,
+    ) -> tuple[ArtifactRef, np.ndarray]:
+        if not isinstance(clustering, ArtifactRef):
+            raise TypeError(f"{name} must be an ArtifactRef")
+        if clustering.kind not in {"cluster_labels", "cluster_cut"}:
+            raise ValueError(
+                f"{name} must reference a clustering artifact "
+                "(cluster_labels or cluster_cut)"
+            )
+
+        status = self._require_complete_artifact(
+            clustering,
+            clustering.kind,
+        )
+        raw_selection = (status.inputs or {}).get("cell_selection")
+        if not isinstance(raw_selection, Mapping):
+            raise ValueError(f"{name} has no cell-selection input")
+        try:
+            selection = ArtifactRef.from_dict(raw_selection)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{name} has a malformed cell-selection input") from error
+        stored_selection = validate_stored_selection_integrity(
+            self.zw,
+            selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
+        )
+
+        value_name = "values" if clustering.kind == "cluster_labels" else "labels"
+        group = group_at(self.zw, status.path)
+        if value_name not in group:
+            raise ValueError(f"{name} has no canonical {value_name!r} label array")
+        values = as_zarr_array(group[value_name], name=value_name)
+        labels = np.asarray(values[:])
+        if labels.ndim != 1 or len(labels) != stored_selection.selected_count:
+            raise ValueError(f"{name} must contain one label per selected cell")
+        if "missing_mask" in values.attrs:
+            missing_name = values.attrs["missing_mask"]
+            if not isinstance(missing_name, str) or missing_name not in group:
+                raise ValueError(f"{name} has a malformed missing-label mask")
+            missing_array = as_zarr_array(group[missing_name], name=missing_name)
+            if (
+                missing_array.dtype != np.dtype(bool)
+                or missing_array.shape != labels.shape
+            ):
+                raise ValueError(f"{name} has a malformed missing-label mask")
+            if np.asarray(missing_array[:], dtype=bool).any():
+                raise ValueError(f"{name} contains missing cluster labels")
+        return selection, labels
+
     def _resolve_metric_neighbors(
         self,
         neighbors: ArtifactRef,
@@ -136,6 +208,9 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
             LISI scores are computed for each label column separately.
             Scores near 1 indicate cells grouped with similar labels.
             Higher scores indicate more mixing between different labels.
+            This metadata-column API is for imported annotations and batch or
+            covariate labels. Use :meth:`metric_label_concordance` to compare
+            Scarf-produced clusterings.
         """
 
         if isinstance(label_columns, str):
@@ -153,7 +228,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
         )
         try:
             labels = {
-                column: read_metadata_rows_chunkwise(
+                column: _read_complete_metric_metadata(
                     self.cells,
                     column,
                     cell_indices,
@@ -273,12 +348,13 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
 
         Notes:
             Scarf persisted KNN graphs exclude self-neighbors, as required by
-            this metric.
+            this metric. The batch column is intentionally an imported metadata
+            input.
         """
         from ...metrics import ilisi_knn
 
         _, _, cell_indices, distances, indices = self._load_metric_knn(neighbors)
-        batch_labels = read_metadata_rows_chunkwise(
+        batch_labels = _read_complete_metric_metadata(
             self.cells,
             batch_colname,
             cell_indices,
@@ -293,7 +369,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
 
     def metric_clisi(
         self,
-        label_colname: str,
+        annotation_column: str,
         neighbors: ArtifactRef,
         *,
         perplexity: float | None = None,
@@ -302,7 +378,8 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
         """Compute scIB cell-type LISI on a persisted KNN graph.
 
         Args:
-            label_colname: Cell metadata column containing biological labels.
+            annotation_column: Cell metadata column containing imported biological
+                annotations.
             neighbors: Explicit neighbor artifact to score.
             perplexity: Effective neighborhood size. ``None`` uses
                 ``floor(k / 3)``.
@@ -315,14 +392,15 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
 
         Notes:
             Scarf persisted KNN graphs exclude self-neighbors, as required by
-            this metric.
+            this metric. The annotation column is intentionally an imported
+            metadata input, not a Scarf-produced clustering.
         """
         from ...metrics import clisi_knn
 
         _, _, cell_indices, distances, indices = self._load_metric_knn(neighbors)
-        cell_labels = read_metadata_rows_chunkwise(
+        cell_labels = _read_complete_metric_metadata(
             self.cells,
-            label_colname,
+            annotation_column,
             cell_indices,
         )
         return clisi_knn(
@@ -335,13 +413,14 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
 
     def metric_graph_connectivity(
         self,
-        label_colname: str,
+        annotation_column: str,
         graph: ArtifactRef,
     ) -> float:
         """Score label connectivity on a persisted, symmetrized assay graph.
 
         Args:
-            label_colname: Cell metadata column containing biological labels.
+            annotation_column: Cell metadata column containing imported biological
+                annotations.
             graph: Explicit connectivity-map or integrated-graph artifact.
         Returns:
             Mean fraction of cells retained in the largest connected component
@@ -351,7 +430,8 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
             Persisted directed edges are treated as undirected. This follows
             the original scIB symmetrized-graph definition and intentionally
             differs from the directed strong-component calculation currently
-            used by YosefLab ``scib-metrics``.
+            used by YosefLab ``scib-metrics``. The annotation column is an
+            imported biological label, not a Scarf-produced clustering.
         """
         from ...metrics import graph_connectivity
 
@@ -372,9 +452,9 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
         )
         status = inspect_artifact(self.zw, graph)
         n_cells, _ = self._get_graph_ncells_k(status.path)
-        labels = read_metadata_rows_chunkwise(
+        labels = _read_complete_metric_metadata(
             self.cells,
-            label_colname,
+            annotation_column,
             cell_indices,
         )
         if len(labels) != n_cells:
@@ -428,35 +508,13 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
             self._load_metric_knn(neighbors)
         )
         lineage = resolve_native_graph_inputs(self.zw, neighbors)
-        if not isinstance(clusters, ArtifactRef):
-            raise TypeError("clusters must be an ArtifactRef")
-        if clusters.kind not in {"cluster_labels", "cluster_cut"}:
-            raise ValueError(
-                "clusters must reference cluster labels or a Paris cluster cut"
-            )
-        cluster_status = inspect_artifact(self.zw, clusters)
-        if not cluster_status.complete:
-            raise ValueError("Cluster artifact is unavailable or incomplete")
-        raw_cluster_selection = (cluster_status.inputs or {}).get("cell_selection")
-        if not isinstance(raw_cluster_selection, Mapping):
-            raise ValueError("Cluster artifact has no cell-selection input")
-        cluster_selection = ArtifactRef.from_dict(raw_cluster_selection)
+        cluster_selection, cluster_labels = self._load_metric_clustering(
+            clusters,
+            name="clusters",
+        )
         if cluster_selection != lineage.cell_selection:
             raise ValueError(
                 "Cluster labels and neighbors use different cell selections"
-            )
-        cluster_group = group_at(self.zw, cluster_status.path)
-        value_name = "labels" if clusters.kind == "cluster_cut" else "values"
-        if value_name not in cluster_group:
-            raise ValueError(
-                f"Cluster artifact has no canonical {value_name!r} label array"
-            )
-        cluster_labels = np.asarray(
-            as_zarr_array(cluster_group[value_name], name=value_name)[:]
-        )
-        if cluster_labels.ndim != 1 or len(cluster_labels) != len(cell_indices):
-            raise ValueError(
-                "Cluster labels must contain one value per selected graph cell"
             )
         coordinate_status = inspect_artifact(self.zw, lineage.coordinates)
         coordinate_group = group_at(self.zw, coordinate_status.path)
@@ -601,42 +659,19 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
         coordinates = as_zarr_array(group["data"], name="PCA coordinates")
         clusterings: dict[str, np.ndarray] = {}
         for name, ref in clusters.items():
-            if (
-                ref.kind not in {"cluster_labels", "cluster_cut"}
-                or ref.scope != "assay"
-                or ref.assay != pca.assay
-            ):
+            if ref.assay != pca.assay:
                 raise ValueError(
                     f"Cluster {name!r} must be an assay-scoped clustering "
                     "artifact for the PCA assay"
                 )
-            cluster_status = self._require_complete_artifact(
+            cluster_selection, labels = self._load_metric_clustering(
                 ref,
-                ref.kind,
-                assay=pca.assay,
+                name=f"Cluster {name!r}",
             )
-            raw_selection = (cluster_status.inputs or {}).get("cell_selection")
-            if not isinstance(raw_selection, Mapping):
-                raise ValueError(f"Cluster {name!r} has no cell-selection input")
-            try:
-                cluster_selection = ArtifactRef.from_dict(raw_selection)
-            except (TypeError, ValueError) as error:
-                raise ValueError(
-                    f"Cluster {name!r} has a malformed cell-selection input"
-                ) from error
             if cluster_selection != cell_selection:
                 raise ValueError(
                     f"Cluster {name!r} does not use the PCA cell selection"
                 )
-            value_name = "labels" if ref.kind == "cluster_cut" else "values"
-            cluster_group = group_at(self.zw, cluster_status.path)
-            if value_name not in cluster_group:
-                raise ValueError(f"Cluster {name!r} has no label values")
-            labels = np.asarray(
-                as_zarr_array(cluster_group[value_name], name=value_name)[:]
-            )
-            if labels.ndim != 1:
-                raise ValueError(f"Cluster {name!r} labels must be one-dimensional")
             if len(labels) != coordinates.shape[0]:
                 raise ValueError(f"Cluster {name!r} does not align with PCA rows")
             clusterings[name] = labels
@@ -654,39 +689,43 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
 
     def metric_label_concordance(
         self,
-        label_columns: Sequence[str],
+        first: ArtifactRef,
+        second: ArtifactRef,
         metric: Literal["ari", "nmi"] = "ari",
-        *,
-        cell_key: str = "I",
     ) -> float:
-        """Compare two metadata label partitions using ARI or NMI.
+        """Compare two immutable clustering artifacts using ARI or NMI.
 
-        This measures whether two labelings of the same cells agree, for
-        example predicted clusters against imported reference annotations. It
-        does not measure batch mixing; use :meth:`metric_ilisi`,
-        :meth:`metric_proportional_batch_mixing`, or :meth:`metric_lisi`
-        for that.
+        Both clusterings must carry the exact same cell-selection reference.
+        This allows clusterings from different assays to be compared without
+        consulting mutable cell metadata.
 
         Args:
-            label_columns: Exactly two cell metadata column names to compare.
+            first: First cluster-label or Paris cluster-cut artifact.
+            second: Second cluster-label or Paris cluster-cut artifact.
             metric: ``"ari"`` for the adjusted Rand index or ``"nmi"`` for
                 normalized mutual information.
-            cell_key: Boolean cell metadata column selecting rows to compare.
 
         Returns:
             Agreement between the two partitions. ARI ranges from -1 to 1 and
             NMI from 0 to 1, with higher values meaning stronger agreement.
 
         Raises:
-            ValueError: If the number of columns or the metric name is invalid.
+            ValueError: If the clusterings do not use the same frozen cell
+                selection or the metric name is invalid.
         """
         from ...metrics import label_concordance_score
 
-        label_values = [
-            np.asarray(self.cells.fetch(column, key=cell_key))
-            for column in label_columns
-        ]
-        return label_concordance_score(label_values, metric)
+        first_selection, first_labels = self._load_metric_clustering(
+            first,
+            name="first",
+        )
+        second_selection, second_labels = self._load_metric_clustering(
+            second,
+            name="second",
+        )
+        if first_selection != second_selection:
+            raise ValueError("Clusterings use different cell selections")
+        return label_concordance_score([first_labels, second_labels], metric)
 
     def metric_proportional_batch_mixing(
         self,
@@ -719,7 +758,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
         from ...metrics import compute_lisi, lisi_batch_mixing_score
 
         _, _, cell_indices, distances, indices = self._load_metric_knn(neighbors)
-        batch_labels = read_metadata_rows_chunkwise(
+        batch_labels = _read_complete_metric_metadata(
             self.cells,
             label_colname,
             cell_indices,

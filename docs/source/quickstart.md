@@ -28,8 +28,6 @@ Run this notebook from the same environment so its kernel imports that Scarf ins
 ```{code-cell} ipython3
 import scarf
 
-scarf.configure_output(level="ERROR", progress=True)
-
 counts = scarf.cytebase.connect("scarf_docs").download(
     "tenx_5K_pbmc_rnaseq/data.h5",
     destination="scarf_datasets",
@@ -44,34 +42,16 @@ reader.nCells, reader.nFeatures
 ```
 
 ```{code-cell} ipython3
-scarf.CrToZarr(
-    reader,
-    zarr_loc=str(store),
-).dump()
+scarf.CrToZarr(reader, zarr_loc=str(store)).dump()
 ```
 
 The same reader and writer work with a Cell Ranger H5 file from your own dataset.
 Scarf converts the counts to Zarr so later steps can stream data from disk.
-Scarf normally uses INFO logging with progress enabled.
-Read the completed bars in this cached page as a record of the work performed during execution.
-Log level and progress are independent; batch runs can use
-`scarf.configure_output(progress=False, timestamps=True)`.
-See {doc}`reference/api/utilities` for file logging and the full output contract.
 
 ## Open the datastore
 
 ```{code-cell} ipython3
-ds = scarf.DataStore(
-    str(store),
-    nthreads=4,
-)
-```
-
-```{code-cell} ipython3
-print(f"Active cells: {int(ds.cells.fetch_all('I').sum())} / {ds.cells.N}")
-ds.cells.to_pandas_dataframe(
-    columns=["RNA_nCounts", "RNA_nFeatures", "RNA_percentMito"],
-).describe().loc[["min", "50%", "max"]]
+ds = scarf.DataStore(str(store), nthreads=4)
 ```
 
 ## Run the RNA pipeline
@@ -83,44 +63,19 @@ It compares every valid Leiden and Paris candidate with a deterministic PCA-spac
 sample, then exposes the selected candidate as `clusters`.
 
 ```{code-cell} ipython3
-live_before = int(ds.cells.fetch_all("I").sum())
-run = ds.pipeline.run(label="baseline", snapshot_columns=["RNA_nCounts"])
-live_after = int(ds.cells.fetch_all("I").sum())
-
-print(run)
-print(f"Cells selected by the run: {len(run.cells.fetch('ids'))}")
-print(f"Live I before and after: {live_before}, {live_after}")
-print(f"Cluster decision: {run['cluster_selection']}")
-print(f"Selected clustering: {run['clusters']}")
+run = ds.pipeline.run(label="baseline")
+run
 ```
 
 The return value is a durable {py:class}`~scarf.PipelineRun`. It maps stable result names to exact
 immutable {term}`ArtifactRef` values and keeps frozen cell and feature views. The pipeline itself
 does not change live `I` or write analytical outputs to metadata.
 
-```{code-cell} ipython3
-list(run)
-```
-
 Inspect the selected labels without copying them into live metadata:
 
 ```{code-cell} ipython3
-run.cells.to_pandas_dataframe(
-    ["clusters"],
-)["clusters"].value_counts().sort_index()
+run.cells.to_pandas_dataframe(["clusters"])["clusters"].value_counts().sort_index()
 ```
-
-```{code-cell} ipython3
-run.cells.to_pandas_dataframe(
-    ["leiden_0.5"],
-)["leiden_0.5"].value_counts().sort_index()
-```
-
-Most rich stages use a direct Boolean switch. Cell-cycle scoring, UMAP, Paris, doublets, and
-markers can be disabled separately. Pass `leiden=False` together with `doublets=False` and
-`markers=False` when Paris supplies the only clustering candidate, or provide exact `partitions`
-for a custom Leiden set. Highly variable feature selection, normalization, PCA, and graph
-construction remain part of this fixed recipe.
 
 Use {doc}`tutorials/graph_construction` when you need stage-by-stage control and explicit refs.
 
@@ -129,42 +84,16 @@ Use {doc}`tutorials/graph_construction` when you need stage-by-stage control and
 Plotting stays on `DataStore` and reads only the run's frozen fields:
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    run=run,
-    layout="umap",
-    color_by="clusters",
-)
+ds.plots.embedding(run=run, layout="umap", color_by="clusters")
 ```
 
 Several broad PBMC populations should separate without every group becoming an isolated island.
-The snapshotted library size lets us check tiny low-count groups against the same inputs the run
-captured:
-
-```{code-cell} ipython3
-(
-    run.cells.to_pandas_dataframe(["clusters", "RNA_nCounts"])
-    .groupby("clusters")["RNA_nCounts"]
-    .agg(n_cells="size", median_nCounts="median")
-    .sort_values("median_nCounts")
-)
-```
 
 Marker search used the selected partition. Read its immutable table through the exact ref:
 
 ```{code-cell} ipython3
-cluster_id = (
-    run.cells.to_pandas_dataframe(["clusters"])["clusters"]
-    .value_counts()
-    .index[0]
-)
-print(f"Markers for cluster {cluster_id}")
+cluster_id = run.cells.fetch("clusters")[0]
 ds.get_markers(marker=run["markers"], group_id=cluster_id).head(10)
-```
-
-External interoperability also consumes the frozen view directly:
-
-```python
-adata = ds.to_anndata(run=run)
 ```
 
 ## Reopen a named run
@@ -172,8 +101,7 @@ adata = ds.to_anndata(run=run)
 A completed run can be reopened by its immutable label or exact run ID:
 
 ```{code-cell} ipython3
-reopened = ds.pipeline.open(label="baseline")
-assert reopened.run_id == run.run_id
+assert ds.pipeline.open(label="baseline").run_id == run.run_id
 ```
 
 Labels are bound to one successful run and cannot be moved to another run. An unlabeled run can be

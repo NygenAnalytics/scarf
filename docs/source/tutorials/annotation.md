@@ -19,48 +19,34 @@ kernelspec:
 Cluster IDs are not cell types. This page reads one immutable marker artifact, combines several
 forms of evidence, and writes a user-owned annotation only after the labels are reviewed.
 
-## 1. Create a clustered baseline
+## 1. Open the clustered baseline
 
 ```{code-cell} ipython3
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 import scarf
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-repacked_counts = str(Path(analysis_directory.name) / "counts.zarr")
-repack_store(f"{dataset}/data.zarr", repacked_counts, nthreads=2)
-ds = scarf.mount_datastore(
-    repacked_counts,
-    at=str(Path(analysis_directory.name) / "annotation_analysis.zarr"),
-    default_assay="RNA",
-    nthreads=4,
-)
-
-run = ds.pipeline.run(
-    filtering=False,
-    cell_cycle=False,
-    doublets=False,
-)
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+run = ds.pipeline.open(label="docs_default")
 cluster_ref = run["clusters"]
 marker_ref = run["markers"]
 cluster_values = np.asarray(run.cells.fetch("clusters"))
 pd.Series(cluster_values).value_counts().sort_index()
 ```
 
-The pipeline compares its enabled Leiden and Paris candidates and records the silhouette decision
+The rebuilt store carries this completed run under the immutable label `docs_default`. Its frozen
+analysis selection is also the store's active `I`, so user-owned columns written below align with
+the run without rebuilding any analytical stage.
+
+The run's cluster-selection stage scores its configured Leiden partition and records the decision
 in `run["cluster_selection"]`. `cluster_ref` and `marker_ref` remain exact artifacts; neither result
 is written to live metadata.
 
@@ -128,7 +114,7 @@ This example labels the cluster where each panel gene ranks highest and leaves o
 
 ```{code-cell} ipython3
 unique = sorted(pd.unique(cluster_values), key=str)
-label_map = {value: f"Cluster {value}" for value in unique}
+label_map = {str(value): f"Cluster {value}" for value in unique}
 for gene, name in (
     ("CD14", "Monocytes"),
     ("MS4A1", "B cells"),
@@ -136,17 +122,18 @@ for gene, name in (
 ):
     hit = panel_hits.loc[panel_hits["feature_name"].astype(str) == gene]
     if not hit.empty:
-        label_map[hit.iloc[0]["group_id"]] = name
+        label_map[str(hit.iloc[0]["group_id"])] = name
 
-cell_type = np.asarray([label_map[value] for value in cluster_values], dtype=object)
+cell_type = np.asarray([label_map[str(value)] for value in cluster_values], dtype=object)
 ds.cells.insert("cell_type", cell_type, key="I", overwrite=True)
 pd.Series(cell_type).value_counts()
 ```
 
 ```{code-cell} ipython3
-frame = run.cells.to_pandas_dataframe(["umap_1", "umap_2"])
-codes = pd.factorize(cell_type)[0]
-plt.scatter(frame["umap_1"], frame["umap_2"], c=codes, s=3)
+ds.plots.embedding(
+    layout=run["umap"],
+    color_by="cell_type",
+)
 ```
 
 Keep `label_map`, the marker ref, and the run ID in the study record. Cluster IDs can change when

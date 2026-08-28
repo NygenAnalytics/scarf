@@ -40,6 +40,7 @@ from ...storage.feature_selection import (
 )
 from ...storage.selections import (
     read_stored_selection_indices,
+    snapshot_run_metadata,
     validate_stored_selection_integrity,
 )
 from ...storage.types import as_zarr_array, as_zarr_group
@@ -343,14 +344,18 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 f"{operation} requires a DataStore opened with zarr_mode='r+'"
             )
 
-    def _ensure_all_features(self, assay: Any) -> ArtifactRef:
+    def select_all_features(
+        self,
+        *,
+        from_assay: str | None = None,
+    ) -> ArtifactRef:
         """Create or reuse the canonical all-true feature universe.
 
         The universe is an artifact only. It is never mirrored into feature
         metadata or registered under a mutable label.
         """
         self._require_feature_write("Feature selection")
-        resolved_assay = self._get_assay(assay) if isinstance(assay, str) else assay
+        resolved_assay = self._get_assay(from_assay)
         feature_ids_fingerprint = _ordered_feature_ids_fingerprint(resolved_assay)
         values = np.ones(resolved_assay.feats.N, dtype=bool)
         payload_fingerprint = fingerprint_array(values)
@@ -370,7 +375,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 "ordered_feature_ids_fingerprint": feature_ids_fingerprint,
             },
             inputs={},
-            execution_options={"label": "all_features"},
+            execution_options={},
             expected_payload_fingerprint=payload_fingerprint,
         )
         _write_feature_selection(
@@ -392,7 +397,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         """Persist an explicit feature mask as an immutable artifact."""
         self._require_feature_write("set_feature_selection")
         assay = self._get_assay(from_assay)
-        all_features = self._ensure_all_features(assay)
+        all_features = self.select_all_features(from_assay=assay.name)
         if (mask is None) == (feature_indexes is None):
             raise ValueError("Provide exactly one of mask or feature_indexes")
         if mask is not None:
@@ -514,8 +519,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         *,
         assay: RNAassay,
         cell_selection: ArtifactRef,
-        feature_names: np.ndarray | None = None,
-        feature_snapshot: ArtifactRef | None = None,
+        feature_names: np.ndarray,
+        feature_snapshot: ArtifactRef,
         min_cells: int = 20,
         top_n: int = 1000,
         min_var: float = -np.inf,
@@ -589,11 +594,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             },
             inputs={
                 "feature_summary": summary_ref,
-                **(
-                    {"feature_snapshot": feature_snapshot}
-                    if feature_snapshot is not None
-                    else {}
-                ),
+                "feature_snapshot": feature_snapshot,
             },
             execution_options={
                 "show_plot": show_plot,
@@ -702,9 +703,26 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 "HVG selection can only be applied to an RNAassay; "
                 f"received {type(assay).__name__}"
             )
+        self._require_feature_write("select_hvgs")
+        feature_snapshot = snapshot_run_metadata(
+            self.zw,
+            table_path=f"{assay.name}/featureData",
+            id_column="ids",
+            columns=("names",),
+            axis="feature",
+            assay=assay.name,
+        )
+        feature_names = np.asarray(
+            as_zarr_array(
+                artifact_group(self.zw, feature_snapshot)["names"],
+                name="names",
+            )[:]
+        )
         ref = self._select_hvgs_artifact(
             assay=assay,
             cell_selection=cell_selection,
+            feature_names=feature_names,
+            feature_snapshot=feature_snapshot,
             min_cells=min_cells,
             top_n=top_n,
             min_var=min_var,

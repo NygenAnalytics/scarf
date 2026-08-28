@@ -6,6 +6,7 @@ import pytest
 import zarr
 from scipy.spatial import procrustes
 from sklearn.metrics import adjusted_rand_score
+from zarr.storage import MemoryStore
 
 import scarf
 import scarf.plotting as splt
@@ -360,6 +361,37 @@ class TestDataStore:
             tar.extractall(out_fn, filter="data")
         with pytest.raises(ValueError):
             DataStore(str(out_fn), zarr_mode="wrong", default_assay="RNA")
+
+    @pytest.mark.parametrize("zarr_mode", ["r", "r+"])
+    def test_init_rejects_legacy_assay_state_without_mutation(
+        self,
+        zarr_mode,
+    ):
+        store = MemoryStore()
+        root = zarr.open_group(store=store, mode="w")
+        assay = root.create_group("RNA")
+        assay.attrs["is_assay"] = True
+        assay.create_group("featureData")
+        assay.create_array("counts", shape=(1, 1), dtype=np.uint32)
+        state = assay.create_group("state")
+        state.attrs["state"] = {"assay": "RNA", "legacy": True}
+        root_attrs = dict(root.attrs)
+        state_attrs = dict(state.attrs)
+
+        with pytest.raises(
+            ValueError,
+            match=r"RNA/state.*never reads or migrates.*rebuild",
+        ):
+            DataStore(
+                store,
+                default_assay="RNA",
+                min_features_per_cell=0,
+                zarr_mode=zarr_mode,
+            )
+
+        reopened = zarr.open_group(store=store, mode="r")
+        assert dict(reopened.attrs) == root_attrs
+        assert dict(reopened["RNA/state"].attrs) == state_attrs
 
     def test_nthreads_env_and_explicit_precedence(
         self, toy_crdir_writer, tmp_path, monkeypatch

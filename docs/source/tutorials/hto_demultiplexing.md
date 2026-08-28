@@ -22,7 +22,7 @@ identities = ds.run_hto_demultiplexing(
     cell_selection,
     from_assay="HTO",
 )
-identity_values = ds.load_artifact(identities)["values"][:]
+ds.load_artifact(identities)["values"][:]
 ```
 
 ## 2. Interpret singlet, negative, and doublet labels

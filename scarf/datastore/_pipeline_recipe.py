@@ -158,9 +158,10 @@ def _resolve_filtering(
     if missing:
         raise KeyError(f"Filtering columns were not found: {missing!r}")
     if not attrs:
-        if options:
-            raise ValueError("Filtering options require at least one attribute")
-        return {"enabled": False}
+        raise ValueError(
+            "Filtering was requested, but no QC columns were found; "
+            "pass filtering=False to analyze the unfiltered cell selection"
+        )
     if method == "manual":
         allowed = {"lows", "highs", "keep_bounds"}
         unknown = set(options) - allowed

@@ -40,7 +40,6 @@ over-filtering, or an unsuitable neighbourhood count. Report both the valid frac
 decision.
 
 ```python
-pseudotime = ds.load_pseudotime_scoring(pseudotime_ref)
 valid_fraction = float(pseudotime.valid.mean())
 ```
 

@@ -33,7 +33,7 @@ from ...graph.feature_projection import (
     resolve_coordinate_inputs,
     resolve_native_graph_inputs,
 )
-from ...graph.imported_storage import (
+from ...embeddings.imported_storage import (
     validate_imported_coordinates_artifact,
 )
 from ...matrix import ChunkedArray
@@ -97,7 +97,6 @@ from ...storage.selections import (
     validate_stored_selection_integrity,
 )
 from ...utils.arrays import clean_array
-from ...utils.compute import compute_with_progress
 from ...utils.logging import logger
 from ...utils.shutdown import shutdown_checkpoint
 
@@ -399,7 +398,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
     if TYPE_CHECKING:
 
-        def _ensure_all_features(self, assay: Any) -> ArtifactRef: ...
+        def select_all_features(
+            self,
+            *,
+            from_assay: str | None = None,
+        ) -> ArtifactRef: ...
 
         def resolve_features(
             self,
@@ -519,69 +522,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             dimensions=dimensions,
             element_count=element_count,
         )
-
-    def _load_or_compute_norm_stats(
-        self,
-        normed_loc: str,
-        data: ChunkedArray,
-        reduction_method: str,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        mu, sigma = np.ndarray([]), np.ndarray([])
-        if reduction_method not in ["pca", "manual"]:
-            return mu, sigma
-        normed_grp = as_zarr_group(self.zw[normed_loc], name=normed_loc)
-        need_mu = "mu" not in normed_grp
-        need_sigma = "sigma" not in normed_grp
-        if not need_mu:
-            mu = np.asarray(as_zarr_array(normed_grp["mu"], name="mu")[:])
-        if not need_sigma:
-            sigma = np.asarray(as_zarr_array(normed_grp["sigma"], name="sigma")[:])
-        if need_mu and need_sigma:
-            mu_raw, sigma_raw = data.mean_and_std(
-                nthreads=self.nthreads,
-                msg="Calculating normalization statistics",
-            )
-            mu = clean_array(mu_raw)
-            sigma = clean_array(sigma_raw, 1)
-            if self.zarr_mode == "r+":
-                g = create_zarr_dataset(normed_grp, "mu", (100000,), "f8", mu.shape)
-                g[:] = mu
-                g = create_zarr_dataset(
-                    normed_grp, "sigma", (100000,), "f8", sigma.shape
-                )
-                g[:] = sigma
-            else:
-                logger.debug("Skipping mu/sigma persistence on read-only store")
-        elif need_mu:
-            mu = clean_array(
-                compute_with_progress(
-                    data.mean(axis=0),
-                    "Calculating mean of norm. data",
-                    self.nthreads,
-                )
-            )
-            if self.zarr_mode == "r+":
-                g = create_zarr_dataset(normed_grp, "mu", (100000,), "f8", mu.shape)
-                g[:] = mu
-            else:
-                logger.debug("Skipping mu persistence on read-only store")
-        elif need_sigma:
-            sigma = clean_array(
-                compute_with_progress(
-                    data.std(axis=0),
-                    "Calculating std. dev. of norm. data",
-                    self.nthreads,
-                ),
-                1,
-            )
-            if self.zarr_mode == "r+":
-                g = create_zarr_dataset(
-                    normed_grp, "sigma", (100000,), "f8", sigma.shape
-                )
-                g[:] = sigma
-            else:
-                logger.debug("Skipping sigma persistence on read-only store")
-        return mu, sigma
 
     def _load_artifact_ann_stream(
         self,

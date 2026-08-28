@@ -129,7 +129,7 @@ def _write_projection(
         inputs={},
         source_column=cell_key,
     )
-    feature_selection = query._ensure_all_features("RNA")
+    feature_selection = query.select_all_features(from_assay="RNA")
     planned = plan_projection(
         query.zw,
         query_assay="RNA",

@@ -18,62 +18,44 @@ Pseudotime correlation captures monotonic change. Aggregation adds smoothed feat
 clusters them into early, intermediate, and late modules. Both operations persist immutable
 artifacts and leave feature metadata unchanged.
 
-## 1. Build an oriented graph
+## 1. Open the prepared graph and orient it
 
 ```{code-cell} ipython3
-from tempfile import TemporaryDirectory
-
 import numpy as np
 import pandas as pd
 
 import scarf
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     name="bastidas-ponce_4K_pancreas-d15_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-repacked_counts = f"{analysis_directory.name}/counts.zarr"
-repack_store(f"{dataset}/data.zarr", repacked_counts, nthreads=2)
-ds = scarf.mount_datastore(
-    repacked_counts,
-    at=f"{analysis_directory.name}/analysis.zarr",
+ds = scarf.DataStore(
+    f"{dataset}/data.zarr",
     nthreads=4,
-    default_assay="RNA",
 )
+analysis_run = ds.pipeline.open(label="docs_default")
+graph = analysis_run["connectivity_map"]
+all_features = analysis_run["feature_universe"]
 
-preparation = ds.pipeline.run(
-    filtering=False,
-    hvg_count=2000,
-    pca_dims=15,
-    neighbors_k=11,
-    umap=False,
-    leiden=False,
-    cell_cycle=False,
-    paris=False,
-    doublets=False,
-    markers=False,
-)
-graph = preparation["connectivity_map"]
-all_features = preparation["feature_universe"]
-
-annotations = np.asarray(ds.cells.fetch("clusters", key="I"))
+annotations = ds.cells.fetch("clusters", key="I")
 source = annotations == "Ductal"
 sink = np.isin(annotations, ["Alpha", "Beta", "Delta"])
-if not source.any() or not sink.any() or np.any(source & sink):
-    raise ValueError("Source and sink annotations must be non-empty and disjoint")
+if not source.any() or not sink.any():
+    raise ValueError("Source and sink annotations must both be present")
 source_sink_vector = np.zeros(len(annotations), dtype=float)
-source_sink_vector[source] = 1.0 / int(source.sum())
-source_sink_vector[sink] = -1.0 / int(sink.sum())
+source_sink_vector[source] = 1.0 / source.sum()
+source_sink_vector[sink] = -1.0 / sink.sum()
 pseudotime_ref = ds.run_pseudotime_scoring(graph, ss_vec=source_sink_vector)
 ```
 
-The `clusters` labels used to orient this example are prepared catalog metadata copied by the mount.
-The new pseudotime and module results remain exact artifacts.
+The rebuilt catalog store contains the completed `docs_default` pipeline run. This page reuses its
+exact graph and feature universe instead of rebuilding preprocessing. The literal `clusters`
+column contains the published cell-type annotations used only to orient the trajectory. The new
+pseudotime and module results remain exact artifacts.
 
 ## 2. Aggregate and cluster feature profiles
 

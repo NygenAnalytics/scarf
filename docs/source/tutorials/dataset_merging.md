@@ -32,7 +32,7 @@ import pandas as pd
 
 import scarf
 
-scarf.configure_output(level="ERROR", progress=True)
+scarf.configure_output(level="ERROR", progress=False)
 
 repository = scarf.cytebase.connect("scarf_docs")
 ctrl_path = repository.download_dataset(
@@ -50,13 +50,11 @@ ds_ctrl = scarf.DataStore(f"{ctrl_path}/data.zarr", nthreads=4)
 ds_stim = scarf.DataStore(f"{stim_path}/data.zarr", nthreads=4)
 ```
 
-Confirm assay type, cell counts, and feature counts before merging.
-Matching gene symbols alone do not establish compatible measurements; genome builds and quantification conventions still need to match when you bring other datasets.
+Confirm assay type, cell counts, and feature counts before merging. `DataStoreMerge` validates the
+feature axes; matching gene symbols alone do not establish compatible genome builds or
+quantification conventions.
 
 ```{code-cell} ipython3
-ctrl_ids = set(ds_ctrl.RNA.feats.fetch_all("ids").astype(str))
-stim_ids = set(ds_stim.RNA.feats.fetch_all("ids").astype(str))
-
 pd.DataFrame(
     [
         {
@@ -68,7 +66,7 @@ pd.DataFrame(
         }
         for label, store in (("ctrl", ds_ctrl), ("stim", ds_stim))
     ]
-).assign(shared_features=len(ctrl_ids & stim_ids))
+)
 ```
 
 ## 2. Merge counts and metadata
@@ -90,83 +88,53 @@ scarf.DataStoreMerge(
     overwrite=True,
 ).dump()
 
-ds = scarf.DataStore(merged_path, nthreads=4)
+merged = scarf.DataStore(merged_path, nthreads=4)
 ```
 
 `sample_id` records the source label.
 Columns imported from the sources keep the `orig_` prefix so their origin remains explicit.
 
-```{code-cell} ipython3
-orig_cols = [
-    column
-    for column in ds.cells.columns
-    if column == "sample_id" or column.startswith("orig_")
-]
-ds.cells.to_pandas_dataframe(orig_cols, key="I").head()
-```
-
 The merged active population contains labelled cells from both sources.
 
 ```{code-cell} ipython3
-active_cells = ds.cells.to_pandas_dataframe(
+merged.cells.to_pandas_dataframe(
     ["sample_id", "orig_cluster_labels"],
     key="I",
-)
-active_cells.groupby("sample_id")["orig_cluster_labels"].agg(
+).groupby("sample_id")["orig_cluster_labels"].agg(
     cells="count",
     cell_types="nunique",
 )
 ```
 
-## 3. Build the uncorrected baseline
+## 3. Open the rebuilt uncorrected baseline
 
-The standard RNA pipeline records the complete workflow as reusable artifacts.
-Filtering is disabled because the source selections were retained.
-The graph uses 21 neighbours so the same graph parameters can be compared with the correction methods on the next page.
+The catalog's merged store is rebuilt with the merge recipe above and a labelled standard RNA
+run. Open that frozen run instead of repeating PCA, graph construction, clustering, and UMAP in
+this merge tutorial. Its graph uses 21 neighbours so the correction methods on the next page can
+branch from the same baseline.
 
 ```{code-cell} ipython3
-baseline = ds.pipeline.run(
-    label="uncorrected",
-    filtering=False,
-    cell_cycle=False,
-    hvg_count=2000,
-    pca_dims=25,
-    neighbors_k=21,
-    leiden={"partitions": (1.0,)},
-    paris=False,
-    doublets=False,
-    markers=False,
-    snapshot_columns=("sample_id", "orig_cluster_labels"),
+prepared_path = repository.download_dataset(
+    name="kang_29K_ctrl-ifnb_pbmc_rnaseq",
+    destination="scarf_datasets",
+    zarr=True,
 )
+ds = scarf.DataStore(f"{prepared_path}/data.zarr", nthreads=4)
+baseline = ds.pipeline.open(label="docs_default")
 sorted(baseline)
 ```
 
 The durable run maps each output name to its exact {term}`artifact`.
 Requested metadata and results remain in its frozen view.
 
-One plotting call compares source identity with the imported cell types on the same layout.
+One plotting call compares source identity, imported cell types, and the exact clustering artifact
+on the same layout.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
-    run=baseline,
-    layout="umap",
-    color_by="sample_id",
-)
-ds.plots.embedding(
-    run=baseline,
-    layout="umap",
-    color_by="orig_cluster_labels",
-)
-```
-
-The clustering candidate selected by the pipeline should track broad cell-type structure even while
-sources remain segregated.
-
-```{code-cell} ipython3
-ds.plots.embedding(
-    run=baseline,
-    layout="umap",
-    color_by="clusters",
+    layout=baseline["umap"],
+    color_by=["sample_id", "orig_cluster_labels", baseline["clusters"]],
+    n_columns=3,
 )
 ```
 
@@ -192,8 +160,6 @@ uncorrected_ilisi = ds.metric_ilisi(
 )
 {"uncorrected iLISI": round(uncorrected_ilisi, 3)}
 ```
-
-The value `0.000` therefore indicates essentially no source mixing in the median uncorrected neighbourhood.
 
 The stimulated sample received interferon beta, and PBMC cell types do not all respond identically to that treatment.
 Source-associated structure can therefore include biological response as well as technical variation.

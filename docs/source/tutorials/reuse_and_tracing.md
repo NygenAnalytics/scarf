@@ -32,67 +32,37 @@ Read {doc}`../concepts/provenance` for the rules that decide which of the two ha
 
 ## Dataset
 
-Structurally repack the published store into a temporary source with the current RNA count layout, then mount its count matrices into a fresh page-local target.
-This keeps the published source untouched and ensures every lineage node below is created under
-the immutable artifact contract.
+The rebuilt PBMC store carries a completed pipeline run labelled `docs_default`. Its exact
+selection, normalization, PCA, neighbour, and graph refs provide the baseline. This page creates
+only the parameter forks needed to demonstrate reuse.
 
 ```{code-cell} ipython3
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
 import scarf
-from scarf.tools.repack_zarr import repack_store
+import scarf.plotting as splt
 
-scarf.configure_output(level='WARNING', progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    'tenx_5K_pbmc_rnaseq',
-    destination='scarf_datasets',
+    "tenx_5K_pbmc_rnaseq",
+    destination="scarf_datasets",
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-repacked_counts_path = Path(analysis_directory.name) / 'counts.zarr'
-analysis_path = Path(analysis_directory.name) / 'reuse_and_tracing.zarr'
-repack_store(
-    f'{dataset}/data.zarr',
-    str(repacked_counts_path),
-    nthreads=2,
-)
-ds = scarf.mount_datastore(
-    str(repacked_counts_path),
-    at=str(analysis_path),
-    default_assay='RNA',
-    nthreads=4,
-    min_features_per_cell=10,
-)
-cell_selection = ds.filter_cells(
-    attrs=['RNA_nCounts', 'RNA_nFeatures'],
-    highs=[15000, 4000],
-    lows=[1000, 500],
-)
-# Remake HVGs after this tutorial's cell filter so lineage does not pull in a
-# feature selection that was computed under an earlier cell mask on the store.
-hvg_ref = ds.select_hvgs(
-    cell_selection,
-    min_cells=20,
-    top_n=500,
-    show_plot=False,
-)
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+baseline_run = ds.pipeline.open(label="docs_default")
+cell_selection = baseline_run["analysis_cell_selection"]
+hvg_ref = baseline_run["highly_variable_features"]
 ```
 
-## 1. Build a baseline chain
+## 1. Open the baseline chain
 
-Each method returns an immutable reference, so retaining the references is enough to keep side comparisons separate.
+The completed run retains every immutable reference needed to keep side comparisons separate.
 
 ```{code-cell} ipython3
-normalized = ds.run_normalization(
-    cell_selection,
-    hvg_ref,
-)
-pca = ds.run_pca(normalized, dims=15)
-ann = ds.build_ann_index(pca)
-neighbors_k11 = ds.query_neighbors(ann, k=11)
-graph_k11 = ds.build_connectivity_map(neighbors_k11)
+normalized = baseline_run["normalized"]
+pca = baseline_run["pca"]
+ann = baseline_run["ann_index"]
+neighbors_k11 = baseline_run["neighbors"]
+graph_k11 = baseline_run["connectivity_map"]
 ```
 
 ## 2. Vary `k`: reuse upstream
@@ -105,22 +75,20 @@ neighbors_k15 = ds.query_neighbors(ann, k=15)
 graph_k15 = ds.build_connectivity_map(neighbors_k15)
 
 {
-    'normalization reused': ds.run_normalization(cell_selection, hvg_ref) == normalized,
-    'PCA reused': ds.run_pca(normalized, dims=15) == pca,
-    'ANN index reused': ds.build_ann_index(pca) == ann,
-    'neighbors recomputed': neighbors_k15 != neighbors_k11,
-    'graph recomputed': graph_k15 != graph_k11,
+    "normalization reused": ds.run_normalization(cell_selection, hvg_ref) == normalized,
+    "PCA reused": ds.run_pca(normalized, dims=15) == pca,
+    "ANN index reused": ds.build_ann_index(pca) == ann,
+    "neighbors recomputed": neighbors_k15 != neighbors_k11,
+    "graph recomputed": graph_k15 != graph_k11,
 }
 ```
 
 Degree and edge-weight distributions shift with `k` even though the upstream artifacts are identical:
 
 ```{code-cell} ipython3
-import scarf.plotting as splt
-
-matrix_k11 = ds.load_graph(graph=graph_k11)
-matrix_k15 = ds.load_graph(graph=graph_k15)
-print('edges (nnz):', {'k11': matrix_k11.nnz, 'k15': matrix_k15.nnz})
+matrix_k11 = ds.load_graph(graph_k11)
+matrix_k15 = ds.load_graph(graph_k15)
+print("edges (nnz):", {"k11": matrix_k11.nnz, "k15": matrix_k15.nnz})
 splt.graph_qc(matrix_k11)
 splt.graph_qc(matrix_k15)
 ```
@@ -137,11 +105,10 @@ neighbors_dims20 = ds.query_neighbors(ann_dims20, k=11)
 graph_dims20 = ds.build_connectivity_map(neighbors_dims20)
 
 {
-    'PCA recomputed': pca_dims20 != pca,
-    'ANN index recomputed': ann_dims20 != ann,
-    'neighbors recomputed': neighbors_dims20 != neighbors_k11,
-    'graph recomputed': graph_dims20 != graph_k11,
-    'normalization reused': ds.run_normalization(cell_selection, hvg_ref) == normalized,
+    "PCA recomputed": pca_dims20 != pca,
+    "ANN index recomputed": ann_dims20 != ann,
+    "neighbors recomputed": neighbors_dims20 != neighbors_k11,
+    "graph recomputed": graph_dims20 != graph_k11,
 }
 ```
 
@@ -161,19 +128,18 @@ forced = ds.run_normalization(
     invalidate_cache=True,
 )
 status = ds.inspect_artifact(forced)
-baseline = ds.inspect_artifact(normalized)
-baseline_inputs = baseline.inputs or {}
+baseline_status = ds.inspect_artifact(normalized)
+baseline_inputs = baseline_status.inputs or {}
 forced_inputs = status.inputs or {}
 
 {
-    'new artifact': forced != normalized,
-    'complete': status.complete,
-    'operation': status.operation,
-    'path': status.path,
-    'baseline path': baseline.path,
-    'same parameters': status.parameters == baseline.parameters,
-    'same input roles': set(baseline_inputs) == set(forced_inputs),
-    'same inputs': forced_inputs == baseline_inputs,
+    "new artifact": forced != normalized,
+    "complete": status.complete,
+    "operation": status.operation,
+    "path": status.path,
+    "baseline path": baseline_status.path,
+    "same parameters": status.parameters == baseline_status.parameters,
+    "same inputs": forced_inputs == baseline_inputs,
 }
 ```
 
@@ -181,14 +147,13 @@ forced_inputs = status.inputs or {}
 
 Build one read-only report from both neighbour-count branches and the `dims=20` fork.
 Shared upstream nodes appear once; the forks show where each branch diverged.
-Because HVGs were remade after this page's cell filter, the graph should not include an older mito filter that lived on the shared store:
 
 ```{code-cell} ipython3
 lineage = ds.lineage(
     {
-        'k11 graph': graph_k11,
-        'k15 graph': graph_k15,
-        'dims20 graph': graph_dims20,
+        "k11 graph": graph_k11,
+        "k15 graph": graph_k15,
+        "dims20 graph": graph_dims20,
     }
 )
 lineage

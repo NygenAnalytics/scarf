@@ -120,7 +120,8 @@ class _RecordingStore:
         return SimpleNamespace(feats=SimpleNamespace(N=10))
 
     @staticmethod
-    def _ensure_all_features(_assay: object) -> ArtifactRef:
+    def select_all_features(*, from_assay: str | None = None) -> ArtifactRef:
+        assert from_assay == "RNA"
         return _FEATURE_REF
 
     def __getattr__(self, name: str) -> Any:

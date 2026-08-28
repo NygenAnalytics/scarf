@@ -32,9 +32,8 @@ When sources must be analysed together in one store, start with {doc}`dataset_me
 In this tutorial, we will be mapping interferon-stimulated PBMCs onto a control PBMC reference from the same Kang study.
 The shared author labels let us evaluate the result.
 
-Mapping currently supports RNA queries.
-The downloaded stores are immutable data sources. This tutorial mounts each one into a fresh
-writable analysis store so new artifacts are isolated from the sources. The reference and query
+Mapping currently supports RNA queries. The catalog stores were rebuilt with the current count
+layout, and documentation execution downloads separate writable copies. The reference and query
 must remain different stores.
 
 For a reusable Symphony-style atlas, see {doc}`reference_atlases`.
@@ -42,34 +41,22 @@ For a reusable Symphony-style atlas, see {doc}`reference_atlases`.
 ## 1. Open the reference and query
 
 ```{code-cell} ipython3
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
 import numpy as np
 import pandas as pd
 
 import scarf
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 repository = scarf.cytebase.connect("scarf_docs")
-analysis_directory = TemporaryDirectory()
 
 ctrl_path = repository.download_dataset(
     name="kang_15K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-ctrl_counts = Path(analysis_directory.name) / "control_counts.zarr"
-repack_store(
+ds_ctrl = scarf.DataStore(
     f"{ctrl_path}/data.zarr",
-    str(ctrl_counts),
-    nthreads=2,
-)
-ds_ctrl = scarf.mount_datastore(
-    str(ctrl_counts),
-    at=str(Path(analysis_directory.name) / "control_analysis.zarr"),
     default_assay="RNA",
     nthreads=4,
 )
@@ -81,22 +68,14 @@ stim_path = repository.download_dataset(
     destination="scarf_datasets",
     zarr=True,
 )
-stim_counts = Path(analysis_directory.name) / "stimulated_counts.zarr"
-repack_store(
+ds_stim = scarf.DataStore(
     f"{stim_path}/data.zarr",
-    str(stim_counts),
-    nthreads=2,
-)
-ds_stim = scarf.mount_datastore(
-    str(stim_counts),
-    at=str(Path(analysis_directory.name) / "stimulated_analysis.zarr"),
     default_assay="RNA",
     nthreads=4,
 )
 ```
 
-The structural repack rebuilds the RNA transpose required for streaming. Mounting the repacked
-counts into separate targets keeps the new reference and query lineage isolated.
+The two page-local stores keep reference and query lineage isolated.
 
 ```{code-cell} ipython3
 ds_ctrl.plots.embedding(
@@ -115,21 +94,10 @@ The shared label vocabulary is what we use for evaluation.
 
 ## 2. Prepare a labelled reference
 
-Build the reference graph with the standard RNA pipeline, then package the neighbour chain as an immutable mapping reference.
+Package the frozen reference run's neighbour chain as an immutable mapping reference.
 
 ```{code-cell} ipython3
-run = ds_ctrl.pipeline.run(
-    label="mapping_reference",
-    filtering=False,
-    cell_cycle=False,
-    hvg_count=2000,
-    pca_dims=25,
-    neighbors_k=17,
-    leiden=False,
-    paris=False,
-    doublets=False,
-    markers=False,
-)
+run = ds_ctrl.pipeline.open(label="docs_default")
 reference_layout = run["umap"]
 reference_ref = ds_ctrl.build_mapping_reference(run["neighbors"])
 reference = ds_ctrl.get_mapping_reference(reference_ref)

@@ -783,7 +783,7 @@ def test_imported_embedding_reuse_guard_and_validator_reject_damage():
         _payloads_match,
         validate_imported_embedding_artifact,
     )
-    from scarf.graph.imported_storage import ImportedArtifactStorage
+    from scarf.embeddings.imported_storage import ImportedArtifactStorage
     from scarf.storage.artifacts import fingerprint_array
     from tests.test_imported_coordinates import (
         _root_with_selection,

@@ -250,7 +250,7 @@ _FEATURE_SELECTION_CONTRACTS = {
         ("values",),
     ),
     "select_hvgs": (
-        frozenset({"feature_summary"}),
+        frozenset({"feature_snapshot", "feature_summary"}),
         frozenset(
             {
                 "min_cells",
@@ -474,10 +474,7 @@ def _validate_feature_selection_provenance(
     inputs = status.inputs or {}
     parameters = status.parameters or {}
     received_inputs = set(inputs)
-    valid_inputs = {input_names}
-    if status.operation == "select_hvgs":
-        valid_inputs.add(input_names | {"feature_snapshot"})
-    if received_inputs not in valid_inputs or set(parameters) != parameter_names:
+    if received_inputs != input_names or set(parameters) != parameter_names:
         raise ArtifactResolutionError(
             "Feature-selection provenance does not match its operation",
             code="corrupt_payload",
@@ -537,6 +534,7 @@ def _validate_feature_selection_provenance(
             axis="feature",
             assay=assay,
             table_path=f"{assay}/featureData",
+            ordered_columns=("names",),
         )
     if "mapping_reference" in inputs:
         raw_mapping = inputs["mapping_reference"]

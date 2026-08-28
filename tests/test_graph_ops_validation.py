@@ -13,7 +13,7 @@ from scarf.datastore.graph_datastore import GraphDataStore
 from scarf.graph.feature_projection import (
     resolve_native_graph_inputs,
 )
-from scarf.graph.imported_storage import validate_imported_coordinates_artifact
+from scarf.embeddings.imported_storage import validate_imported_coordinates_artifact
 from scarf.storage.artifacts import (
     ArtifactRef,
     artifact_path,

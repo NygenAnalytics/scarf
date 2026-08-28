@@ -9,6 +9,7 @@ import zarr
 from zarr.storage import FsspecStore, LoggingStore, MemoryStore, ZipStore
 
 import scarf.storage.pipeline_runs as pipeline_run_storage
+from scarf.datastore.pipeline_accessor import PipelineAccessor
 from scarf.datastore.pipeline_run import (
     PipelineExecutionError,
     PipelineRun,
@@ -556,6 +557,36 @@ def test_strict_run_lifecycle_and_scan_based_label_lookup() -> None:
     assert list_pipeline_runs(owner)[0].run_id == completed.run_id
 
 
+def test_run_catalog_skips_torn_and_corrupt_children() -> None:
+    root = _root()
+    completed = _completed_run(root)
+    runs = root["pipeline/runs"]
+    torn_id = "a" * 64
+    runs.create_group(torn_id)
+    corrupt_id = "b" * 64
+    runs.create_group(corrupt_id).create_group("stages")
+    runs.create_group("not-a-run")
+
+    assert list_pipeline_run_records(root) == (
+        load_pipeline_run_record(root, completed.run_id),
+    )
+    assert open_pipeline_run_record(root, label="baseline").run_id == completed.run_id
+    assert list_pipeline_runs(_Owner(root))[0].run_id == completed.run_id
+    with pytest.raises(ValueError, match="has no stages group"):
+        open_pipeline_run_record(root, run_id=torn_id)
+
+    fresh = create_pipeline_run_record(
+        root,
+        recipe="basic_rna_analysis",
+        requested_label="fresh",
+        assay="RNA",
+        config={},
+        stage_order=("input_snapshot",),
+        scarf_version="1.0.0",
+    )
+    assert fresh.status == "running"
+
+
 def test_stage_record_paths_load_the_run_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -626,6 +657,114 @@ def test_stage_record_paths_load_the_run_once(
         started_at_ns=130,
     )
     assert load_count == 1
+
+
+def test_labeled_run_rejects_unsupported_backend_before_record_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _root()
+    monkeypatch.setattr(
+        pipeline_run_storage,
+        "_store_supports_atomic_label_claims",
+        lambda _store: False,
+    )
+
+    with pytest.raises(RuntimeError, match="atomic set_if_not_exists"):
+        create_pipeline_run_record(
+            root,
+            recipe="basic_rna_analysis",
+            requested_label="unsupported",
+            assay="RNA",
+            config={},
+            stage_order=("input_snapshot",),
+            scarf_version="1.0.0",
+        )
+
+    assert "pipeline" not in root
+    unlabeled = create_pipeline_run_record(
+        root,
+        recipe="basic_rna_analysis",
+        requested_label=None,
+        assay="RNA",
+        config={},
+        stage_order=("input_snapshot",),
+        scarf_version="1.0.0",
+    )
+    assert unlabeled.status == "running"
+
+
+@pytest.mark.parametrize("container_kind", ("group", "nonempty", "wrong_dtype"))
+def test_labeled_run_rejects_incompatible_claim_container_before_record_creation(
+    container_kind: str,
+) -> None:
+    root = _root()
+    runs = root.create_group("pipeline/runs")
+    if container_kind == "group":
+        runs.create_group(".label-claims")
+    elif container_kind == "nonempty":
+        runs.create_array(".label-claims", shape=(1,), dtype="uint8")
+    else:
+        runs.create_array(".label-claims", shape=(0,), dtype="int8")
+    children_before = set(runs.keys())
+
+    with pytest.raises(ValueError, match="claim container is incompatible"):
+        create_pipeline_run_record(
+            root,
+            recipe="basic_rna_analysis",
+            requested_label="blocked",
+            assay="RNA",
+            config={},
+            stage_order=("input_snapshot",),
+            scarf_version="1.0.0",
+        )
+
+    assert set(runs.keys()) == children_before
+
+
+def test_raw_label_claim_reader_rejects_incomplete_and_cyclic_chains() -> None:
+    root = _root()
+    label = "corrupt-claim-chain"
+    head = pipeline_run_storage._pipeline_label_claim_path(root, label, "head")
+
+    with pytest.raises(ValueError, match="incomplete durable claim"):
+        pipeline_run_storage._read_pipeline_label_claim(head, label)
+
+    run_id = "a" * 64
+    payload = pipeline_run_storage._pipeline_label_claim_bytes(label, run_id)
+    pipeline_run_storage.sync(head.set(payload))
+    successor = pipeline_run_storage._pipeline_label_claim_path(root, label, run_id)
+    pipeline_run_storage.sync(successor.set(payload))
+
+    with pytest.raises(ValueError, match="cyclic durable claim"):
+        pipeline_run_storage._pipeline_label_claim_owner(root, label)
+
+
+def test_label_claim_preflight_advances_past_a_missing_owner() -> None:
+    root = _root()
+    label = "missing-owner"
+    owner = create_pipeline_run_record(
+        root,
+        recipe="basic_rna_analysis",
+        requested_label=label,
+        assay="RNA",
+        config={},
+        stage_order=("input_snapshot",),
+        scarf_version="1.0.0",
+    )
+    pipeline_run_storage._claim_pipeline_label(root, label, owner.run_id)
+    del root[f"pipeline/runs/{owner.run_id}"]
+
+    replacement = create_pipeline_run_record(
+        root,
+        recipe="basic_rna_analysis",
+        requested_label=label,
+        assay="RNA",
+        config={},
+        stage_order=("input_snapshot",),
+        scarf_version="1.0.0",
+    )
+
+    assert replacement.status == "running"
 
 
 def test_terminal_label_conflict_fails_one_concurrent_thread(
@@ -764,6 +903,250 @@ def test_terminal_label_claim_advances_past_non_owner(
         fields=(),
     )
     assert open_pipeline_run_record(root, label=label) == completed
+
+
+def test_running_label_claim_requires_explicit_exact_owner_abandonment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _root()
+    label = "abandoned-finalizer"
+    artifact, (first,) = _ready_labeled_runs(root, label, count=1)
+    pipeline_run_storage._claim_pipeline_label(root, label, first.run_id)
+    run_ids_before = set(root["pipeline/runs"].group_keys())
+
+    with pytest.raises(RuntimeError, match="pipeline.abandon_label_claim"):
+        create_pipeline_run_record(
+            root,
+            recipe="basic_rna_analysis",
+            requested_label=label,
+            assay="RNA",
+            config={},
+            stage_order=("input_snapshot",),
+            scarf_version="1.0.0",
+        )
+    assert set(root["pipeline/runs"].group_keys()) == run_ids_before
+
+    owner = _Owner(root)
+    accessor = PipelineAccessor(owner)
+    owner.zarr_mode = "r"
+    with pytest.raises(
+        PermissionError,
+        match=r"zarr_mode='r\+'",
+    ):
+        accessor.abandon_label_claim(
+            label=label,
+            run_id=first.run_id,
+            reason="read-only recovery must fail",
+        )
+    owner.zarr_mode = "r+"
+    with monkeypatch.context() as unsupported_backend:
+        unsupported_backend.setattr(
+            pipeline_run_storage,
+            "_store_supports_atomic_label_claims",
+            lambda _store: False,
+        )
+        with pytest.raises(RuntimeError, match="atomic set_if_not_exists"):
+            accessor.abandon_label_claim(
+                label=label,
+                run_id=first.run_id,
+                reason="unsupported backend must fail",
+            )
+
+    run_group = root[f"pipeline/runs/{first.run_id}"]
+    run_group.attrs["runId"] = "invalid"
+    with pytest.raises(ValueError, match="invalid claim-owner record"):
+        pipeline_run_storage.ensure_pipeline_label_claimable(root, label)
+    run_group.attrs["runId"] = first.run_id
+    run_group.attrs["requestedLabel"] = "different-label"
+    with pytest.raises(ValueError, match="claim from an incompatible run"):
+        pipeline_run_storage.ensure_pipeline_label_claimable(root, label)
+    with pytest.raises(ValueError, match="claim from an incompatible run"):
+        accessor.abandon_label_claim(
+            label=label,
+            run_id=first.run_id,
+            reason="mismatched owner must fail",
+        )
+    run_group.attrs["requestedLabel"] = label
+
+    with pytest.raises(ValueError, match="is owned by run"):
+        accessor.abandon_label_claim(
+            label=label,
+            run_id="f" * 64,
+            reason="wrong owner",
+        )
+    with pytest.raises(KeyError, match="has no durable claim"):
+        accessor.abandon_label_claim(
+            label="wrong-label",
+            run_id=first.run_id,
+            reason="wrong label",
+        )
+    with pytest.raises(TypeError, match="reason must be a non-empty string"):
+        accessor.abandon_label_claim(
+            label=label,
+            run_id=first.run_id,
+            reason="",
+        )
+
+    abandoned = accessor.abandon_label_claim(
+        label=label,
+        run_id=first.run_id,
+        reason="worker was terminated and confirmed stopped",
+    )
+    assert abandoned.status == "interrupted"
+    interruption = abandoned.report()["run"]["interruption"]
+    assert interruption["kind"] == "abandoned_label_claim"
+    assert interruption["message"] == "worker was terminated and confirmed stopped"
+
+    second = create_pipeline_run_record(
+        root,
+        recipe="basic_rna_analysis",
+        requested_label=label,
+        assay="RNA",
+        config={},
+        stage_order=("input_snapshot",),
+        scarf_version="1.0.0",
+    )
+    start_pipeline_stage_record(
+        root,
+        run_id=second.run_id,
+        ordinal=0,
+        stage="input_snapshot",
+    )
+    finish_pipeline_stage_record(
+        root,
+        run_id=second.run_id,
+        ordinal=0,
+        status="completed",
+        outputs=(PipelineStageOutputRecord("selection", artifact, True),),
+        metrics=_metrics(),
+    )
+    completed = complete_pipeline_run_record(
+        root,
+        run_id=second.run_id,
+        outputs=(PipelineOutputRecord("selection", artifact),),
+        fields=(),
+    )
+    assert open_pipeline_run_record(root, label=label) == completed
+
+
+def test_label_claim_preflight_rechecks_an_owner_completed_during_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _root()
+    label = "completed-during-preflight"
+    artifact, (owner,) = _ready_labeled_runs(root, label, count=1)
+    pipeline_run_storage._claim_pipeline_label(root, label, owner.run_id)
+    original_check = pipeline_run_storage.ensure_pipeline_label_available
+
+    def complete_after_scan(
+        root: zarr.Group,
+        label: str,
+        *,
+        exclude_run_id: str | None = None,
+    ) -> None:
+        original_check(root, label, exclude_run_id=exclude_run_id)
+        if exclude_run_id is None:
+            complete_pipeline_run_record(
+                root,
+                run_id=owner.run_id,
+                outputs=(PipelineOutputRecord("selection", artifact),),
+                fields=(),
+            )
+
+    monkeypatch.setattr(
+        pipeline_run_storage,
+        "ensure_pipeline_label_available",
+        complete_after_scan,
+    )
+
+    with pytest.raises(ValueError, match="already committed"):
+        pipeline_run_storage.ensure_pipeline_label_claimable(root, label)
+
+
+def test_torn_terminal_label_claim_can_be_explicitly_abandoned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _root()
+    label = "torn-terminal-finalizer"
+    artifact, (first,) = _ready_labeled_runs(root, label, count=1)
+    original_write = pipeline_run_storage._write_terminal_attrs
+
+    def write_without_final_complete(
+        group: zarr.Group,
+        value: dict[str, Any],
+    ) -> None:
+        payload = dict(value)
+        payload["complete"] = False
+        group.attrs.update(payload)
+
+    monkeypatch.setattr(
+        pipeline_run_storage,
+        "_write_terminal_attrs",
+        write_without_final_complete,
+    )
+    complete_pipeline_run_record(
+        root,
+        run_id=first.run_id,
+        outputs=(PipelineOutputRecord("selection", artifact),),
+        fields=(),
+    )
+    torn = load_pipeline_run_record(root, first.run_id)
+    assert torn.status == "completed"
+    assert torn.complete is False
+
+    monkeypatch.setattr(
+        pipeline_run_storage,
+        "_write_terminal_attrs",
+        original_write,
+    )
+    owner = _Owner(root)
+    owner.zarr_mode = "r+"
+    recovered = PipelineAccessor(owner).abandon_label_claim(
+        label=label,
+        run_id=first.run_id,
+        reason="worker stopped during the terminal commit",
+    )
+    assert recovered.status == "interrupted"
+    assert load_pipeline_run_record(root, first.run_id).complete is True
+
+    retry = create_pipeline_run_record(
+        root,
+        recipe="basic_rna_analysis",
+        requested_label=label,
+        assay="RNA",
+        config={},
+        stage_order=("input_snapshot",),
+        scarf_version="1.0.0",
+    )
+    assert retry.status == "running"
+
+
+@pytest.mark.parametrize("terminal_status", ("completed", "failed"))
+def test_label_claim_abandonment_refuses_terminal_owner(
+    terminal_status: str,
+) -> None:
+    root = _root()
+    label = f"terminal-{terminal_status}"
+    artifact, (record,) = _ready_labeled_runs(root, label, count=1)
+    pipeline_run_storage._claim_pipeline_label(root, label, record.run_id)
+    if terminal_status == "completed":
+        complete_pipeline_run_record(
+            root,
+            run_id=record.run_id,
+            outputs=(PipelineOutputRecord("selection", artifact),),
+            fields=(),
+        )
+    else:
+        fail_pipeline_run_record(root, run_id=record.run_id, error=RuntimeError("x"))
+
+    owner = _Owner(root)
+    owner.zarr_mode = "r+"
+    with pytest.raises(ValueError, match="not held by an unfinished run"):
+        PipelineAccessor(owner).abandon_label_claim(
+            label=label,
+            run_id=record.run_id,
+            reason="must refuse terminal owners",
+        )
 
 
 def test_terminal_label_claim_backend_failure_is_durable(

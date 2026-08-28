@@ -5,11 +5,9 @@ from typing import Any, cast
 import numpy as np
 import zarr
 
-from ..graph.imported_storage import (
-    ArtifactRef,
-    ArtifactResolutionError,
+from ..storage.refs import ArtifactRef
+from .imported_storage import (
     ImportedArtifactStorage,
-    fingerprint_selected_stored_strings,
     validate_imported_coordinates_artifact,
 )
 
@@ -226,7 +224,7 @@ def _selection_alignment(
         "artifact_id": cell_selection.artifact_id,
     }
     if source_count != coordinate_rows:
-        raise ArtifactResolutionError(
+        raise storage.resolution_error(
             "Imported coordinates do not match the source cell count",
             code="dimreduc_row_count_mismatch",
             context=context,
@@ -240,7 +238,7 @@ def _selection_alignment(
         source_stop = source_start + selected
         if source_stop > source_count:
             context["selected_count"] = source_stop
-            raise ArtifactResolutionError(
+            raise storage.resolution_error(
                 "Imported coordinates do not match the selected cell count",
                 code="dimreduc_row_count_mismatch",
                 context=context,
@@ -253,7 +251,7 @@ def _selection_alignment(
         )
         if not np.array_equal(expected, actual):
             context["selected_count"] = selected_count + selected
-            raise ArtifactResolutionError(
+            raise storage.resolution_error(
                 "Imported cell IDs do not match the selected cell order",
                 code="dimreduc_cell_identity_mismatch",
                 context=context,
@@ -262,12 +260,12 @@ def _selection_alignment(
         selected_count += selected
     context["selected_count"] = selected_count
     if selected_count != coordinate_rows or source_start != source_count:
-        raise ArtifactResolutionError(
+        raise storage.resolution_error(
             "Imported coordinates do not match the selected cell count",
             code="dimreduc_row_count_mismatch",
             context=context,
         )
-    fingerprint, fingerprint_count = fingerprint_selected_stored_strings(
+    fingerprint, fingerprint_count = storage.fingerprint_selected_strings(
         stored_ids,
         selection,
     )
@@ -683,7 +681,7 @@ def validate_imported_embedding_artifact(
         or role not in {"umap", "tsne"}
     ):
         raise ValueError("Imported embedding payload is malformed")
-    selected_fingerprint, selected_count = fingerprint_selected_stored_strings(
+    selected_fingerprint, selected_count = storage.fingerprint_selected_strings(
         validated_selection.row_ids,
         validated_selection.values,
     )

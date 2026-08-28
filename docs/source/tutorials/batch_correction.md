@@ -19,21 +19,18 @@ kernelspec:
 Batch correction changes the reduced coordinates used to build a neighbourhood graph.
 Counts remain unchanged.
 A useful correction should increase source mixing without dissolving biological populations.
-This guide structurally repacks the published count store, reconstructs the uncorrected analysis in a separate mounted store, then compares it with partial PCA and Harmony.
+The rebuilt teaching store carries one frozen uncorrected run. This guide branches its exact
+normalization and PCA artifacts into partial PCA and Harmony comparisons.
 
 ```{code-cell} ipython3
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 import scarf
 from scarf.plotting import CellField
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level="ERROR", progress=True)
+scarf.configure_output(level="ERROR", progress=False)
 
 repository = scarf.cytebase.connect("scarf_docs")
 merged_path = repository.download_dataset(
@@ -41,32 +38,12 @@ merged_path = repository.download_dataset(
     destination="scarf_datasets",
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-repacked_counts = str(Path(analysis_directory.name) / "counts.zarr")
-repack_store(
+ds = scarf.DataStore(
     f"{merged_path}/data.zarr",
-    repacked_counts,
-    nthreads=2,
-)
-ds = scarf.mount_datastore(
-    repacked_counts,
-    at=str(Path(analysis_directory.name) / "batch_analysis.zarr"),
     default_assay="RNA",
     nthreads=4,
 )
-baseline = ds.pipeline.run(
-    label="uncorrected",
-    filtering=False,
-    cell_cycle=False,
-    hvg_count=2000,
-    pca_dims=25,
-    neighbors_k=21,
-    leiden={"partitions": (1.0,)},
-    paris=False,
-    doublets=False,
-    markers=False,
-    snapshot_columns=("sample_id", "orig_cluster_labels"),
-)
+baseline = ds.pipeline.open(label="docs_default")
 
 normalized = baseline["normalized"]
 pca_full = baseline["pca"]
@@ -82,12 +59,12 @@ def integration_scores(neighbors, graph):
             perplexity=7,
         ),
         "cLISI": ds.metric_clisi(
-            label_colname="orig_cluster_labels",
+            annotation_column="orig_cluster_labels",
             neighbors=neighbors,
             perplexity=7,
         ),
         "graph connectivity": ds.metric_graph_connectivity(
-            label_colname="orig_cluster_labels",
+            annotation_column="orig_cluster_labels",
             graph=graph,
         ),
     }
@@ -320,8 +297,9 @@ pd.concat(
 The two Kang sources are also the control and interferon beta treatment groups.
 `ISG15` is an interferon-stimulated gene.
 Default `plots.embedding` and `plots.distribution` use assay-normalized expression via `NormalizationSpec(source="assay")` (library-size normalized through `assay.normed()`), not raw counts; use `source="raw"` for counts.
-Coloring uncorrected and Harmony layouts with those same values shows that Harmony moves cells while expression itself is unchanged.
-Source mixing on the graph is therefore not the same question as removing a treatment effect from the counts.
+Compare expression on the same frozen cell selection because Harmony changes coordinates, not the
+count matrix. Source mixing on the graph is not the same question as removing a treatment effect
+from the counts.
 
 ```{code-cell} ipython3
 ds.plots.distribution(
@@ -348,7 +326,7 @@ score_frame.round(3)
 ```
 
 Because `sample_id` coincides with treatment, iLISI describes source mixing rather than proving removal of a technical effect. cLISI and connectivity provide preservation checks, but they cannot establish that every treatment response was retained.
-The `ISG15` panels above keep that distinction visible.
+The `ISG15` comparison above keeps that distinction visible.
 Keep the uncorrected counts for condition-level differential expression.
 
 Compare methods only when active cells, selected features, neighbour count, and LISI perplexity match.

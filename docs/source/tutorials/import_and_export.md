@@ -48,23 +48,23 @@ See {doc}`../concepts/memory_and_execution` for why the two orientations exist.
 - Download datasets from the `scarf_docs` Cytebase catalog
 - Convert 10x HDF5, MTX, H5AD, Seurat RDS, CSV, and sparse inputs to Zarr
 - Export an assay to MTX or H5AD
-- Merge full DataStores with `DataStoreMerge`
 
 ## 1. Download example datasets
 
 Scarf hosts example datasets in the public [Cytebase bucket](https://huggingface.co/buckets/Nygen/cytebase) in formats such as MTX, 10x HDF5, and H5AD.
-Connect to the `scarf_docs` repository to list or download them:
+Connect to the `scarf_docs` repository to download them:
 
 ```{code-cell} ipython3
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 import numpy as np
 import scarf
 
-scarf.configure_output(level='ERROR', progress=True)
-```
-
-```{code-cell} ipython3
+scarf.configure_output(level="ERROR", progress=False)
 datasets = scarf.cytebase.connect("scarf_docs")
-datasets.list_datasets()
+outputs = TemporaryDirectory()
+output_dir = Path(outputs.name)
 ```
 
 **Naming format**: `<author>_<number of cells>_<cell/tissue type or species>_<single-cell method>`
@@ -72,33 +72,24 @@ datasets.list_datasets()
 Each download returns the directory it wrote, which the readers below use as their input path.
 
 ```{code-cell} ipython3
-# This dataset is in Cellranger (10x) HDF5 format.
 tenx_h5 = datasets.download_dataset(
-    name='tenx_10K_pbmc-v1_atacseq',
-    destination='scarf_datasets'
+    name="tenx_10K_pbmc-v1_atacseq",
+    destination=output_dir,
 )
-```
-
-```{code-cell} ipython3
-# This dataset is in MTX format along with barcodes and features TSV files.
 mtx_dir = datasets.download_dataset(
-    name='xin_1K_pancreas_rnaseq',
-    destination='scarf_datasets'
+    name="xin_1K_pancreas_rnaseq",
+    destination=output_dir,
 )
-```
-
-```{code-cell} ipython3
-# This dataset is in H5ad (anndata) format.
 h5ad_dir = datasets.download_dataset(
-    name='bastidas-ponce_4K_pancreas-d15_rnaseq',
-    destination='scarf_datasets'
+    name="bastidas-ponce_4K_pancreas-d15_rnaseq",
+    destination=output_dir,
 )
 
 tenx_h5, mtx_dir, h5ad_dir
 ```
 
-The downloads land under `scarf_datasets` in the current working directory unless `destination` is changed.
-The cell prints each returned path.
+This tutorial writes downloads and converted stores below one temporary directory. Replace
+`output_dir` with a persistent project directory in your own workflow.
 
 ## 2. Import 10x HDF5
 
@@ -108,23 +99,20 @@ Assay type is inferred from the H5 feature types (RNA, ATAC, or multimodal).
 This ATAC file needs `mem_budget="8G"` so one source row and one destination row band fit.
 
 ```{code-cell} ipython3
-# Assay type is inferred from the H5 contents (RNA, ATAC, or multimodal).
-reader = scarf.CrH5Reader(f'{tenx_h5}/data.h5')
-
-# change value of `zarr_loc` to your choice of filename and path
-writer = scarf.CrToZarr(
+atac_store = output_dir / "pbmc_atac.zarr"
+reader = scarf.CrH5Reader(str(tenx_h5 / "data.h5"))
+scarf.CrToZarr(
     reader,
-    zarr_loc='scarf_datasets/pbmc_atac.zarr',
+    zarr_loc=str(atac_store),
     mem_budget="8G",
-)
-writer.dump()
+).dump()
 ```
 
 Open the written store.
 The summary lists an ATAC assay, which confirms that inference from the H5 feature types survived the dump:
 
 ```{code-cell} ipython3
-ds_atac = scarf.DataStore('scarf_datasets/pbmc_atac.zarr')
+ds_atac = scarf.DataStore(str(atac_store))
 ds_atac
 ```
 
@@ -144,21 +132,19 @@ Select one candidate explicitly when inspection reports more than one.
 This example contains a count above the `uint32` range, so both the reader and writer use `uint64`:
 
 ```{code-cell} ipython3
-reader = scarf.MtxReader(candidates[0], dtype='uint64')
-
-# change value of `zarr_loc` to your choice of filename and path
-writer = scarf.MtxToZarr(
+mtx_store = output_dir / "xin_1K.zarr"
+reader = scarf.MtxReader(candidates[0], dtype="uint64")
+scarf.MtxToZarr(
     reader,
-    zarr_loc='scarf_datasets/xin_1K.zarr',
-    dtype='uint64'
-)
-writer.dump()
+    zarr_loc=str(mtx_store),
+    dtype="uint64",
+).dump()
 ```
 
 Reopen the store and check that the count matrix kept the requested width and the candidate dimensions:
 
 ```{code-cell} ipython3
-ds_mtx = scarf.DataStore('scarf_datasets/xin_1K.zarr')
+ds_mtx = scarf.DataStore(str(mtx_store))
 ds_mtx.RNA.rawData.dtype, ds_mtx.RNA.rawData.shape
 ```
 
@@ -185,7 +171,7 @@ H5AD files vary in where they store counts, feature names, metadata, and layers.
 Inspect the file before conversion rather than assuming `X`, `obs`, and `var` contain the intended values.
 
 ```{code-cell} ipython3
-h5ad_path = f'{h5ad_dir}/data.h5ad'
+h5ad_path = str(h5ad_dir / "data.h5ad")
 inspection = scarf.inspect_h5ad(h5ad_path)
 inspection
 ```
@@ -200,13 +186,12 @@ reader = scarf.H5adReader.from_inspect(
     cluster_keys=("clusters",),
 )
 
-# change value of `zarr_loc` to your choice of filename and path
-writer = scarf.H5adToZarr(
+pancreas_store = output_dir / "differentiating_pancreatic_cells.zarr"
+h5ad_import = scarf.H5adToZarr(
     reader,
-    zarr_loc='scarf_datasets/differentiating_pancreatic_cells.zarr',
+    zarr_loc=str(pancreas_store),
     analysis_assay="RNA",
-)
-h5ad_import = writer.dump()
+).dump()
 h5ad_import.embeddingArtifacts, h5ad_import.clusterArtifacts
 ```
 
@@ -302,7 +287,7 @@ Prefer original 10x HDF5 or Matrix Market counts when they are available and you
 Open the H5AD-derived store written in section 4 and load the selected analytical artifacts:
 
 ```{code-cell} ipython3
-ds = scarf.DataStore('scarf_datasets/differentiating_pancreatic_cells.zarr')
+ds = scarf.DataStore(str(pancreas_store))
 
 imported_umap = np.asarray(
     ds.load_artifact(h5ad_import.embeddingArtifacts["X_umap"])["values"][:]
@@ -325,7 +310,7 @@ ds.plots.embedding(
 ```{code-cell} ipython3
 scarf.writers.to_mtx(
     assay=ds.RNA,
-    mtx_directory='scarf_datasets/diff_pancreas'
+    mtx_directory=str(output_dir / "diff_pancreas"),
 )
 ```
 
@@ -344,7 +329,8 @@ assay, cell selection, feature selection, and metadata. It rejects live `cell_ke
 adata = ds.to_anndata(from_assay="RNA")
 adata.obsm["X_umap"] = imported_umap
 adata.obs["clusters"] = imported_clusters
-adata.write_h5ad('scarf_datasets/diff_pancreas.h5ad')
+h5ad_export = output_dir / "diff_pancreas.h5ad"
+adata.write_h5ad(h5ad_export)
 ```
 
 Reload the H5AD and confirm that the explicitly attached layout is in `obsm`:
@@ -352,38 +338,28 @@ Reload the H5AD and confirm that the explicitly attached layout is in `obsm`:
 ```{code-cell} ipython3
 import anndata as ad
 
-adata = ad.read_h5ad('scarf_datasets/diff_pancreas.h5ad')
-sorted(adata.obsm.keys()), adata.obsm['X_umap'].shape
+adata = ad.read_h5ad(h5ad_export)
+sorted(adata.obsm.keys()), adata.obsm["X_umap"].shape
 ```
 
 ### 7.2 Export a feature panel with `to_anndata`
 
 Full-assay export can require enough memory and disk for the selected cell by feature matrix.
 When only a marker panel is needed, select features before materializing AnnData.
-Genes absent from the feature table are omitted from the panel; here `INS` is not present, so it is dropped:
+Resolve the requested display names against the store once, then export only those columns:
 
 ```{code-cell} ipython3
 all_names = ds.RNA.feats.fetch_all("names").astype(str)
 name_lookup = {name.upper(): name for name in all_names}
-requested = ["GCG", "INS", "SST", "KRT19"]
-panel = [
-    name_lookup[gene]
-    for gene in requested
-    if gene in name_lookup
-]
-dropped = [gene for gene in requested if gene not in name_lookup]
-if not panel:
-    panel = all_names[:4].tolist()
+panel = [name_lookup[gene] for gene in ("GCG", "SST", "KRT19")]
 selected = ds.to_anndata(
     from_assay="RNA",
-    cell_key="I",
     matrix="raw",
     feature_names=panel,
 )
 {
     "shape": selected.shape,
     "genes": selected.var_names.tolist(),
-    "dropped": dropped,
 }
 ```
 
@@ -400,40 +376,28 @@ The toy matrix below is synthesized in-notebook so the conversion does not depen
 Rows are cells and columns are features; `cell_data_cols` moves selected columns into cell metadata.
 
 ```{code-cell} ipython3
-from pathlib import Path
-import shutil
-
-import numpy as np
-from scipy.sparse import csr_matrix
-
-csv_dir = Path('scarf_datasets')
-csv_dir.mkdir(parents=True, exist_ok=True)
-csv_path = csv_dir / 'toy_counts.csv'
+csv_path = output_dir / "toy_counts.csv"
 csv_path.write_text(
-    'quality,geneA,geneB,geneC\n'
-    '10,1,0,2\n'
-    '20,0,3,0\n'
-    '30,4,5,6\n'
-    '40,7,0,8\n'
-    '50,9,10,0\n',
-    encoding='utf-8',
+    "quality,geneA,geneB,geneC\n"
+    "10,1,0,2\n"
+    "20,0,3,0\n"
+    "30,4,5,6\n"
+    "40,7,0,8\n"
+    "50,9,10,0\n",
+    encoding="utf-8",
 )
 
-csv_zarr = csv_dir / 'toy_csv.zarr'
-if csv_zarr.exists():
-    shutil.rmtree(csv_zarr)
-
+csv_zarr = output_dir / "toy_csv.zarr"
 reader = scarf.CSVReader(
     str(csv_path),
-    cell_data_cols=['quality'],
+    cell_data_cols=["quality"],
 )
-writer = scarf.CSVtoZarr(
+scarf.CSVtoZarr(
     reader,
     zarr_loc=str(csv_zarr),
-    assay_name='RNA',
-    dtype=np.dtype('uint16'),
-)
-writer.dump()
+    assay_name="RNA",
+    dtype=np.dtype("uint16"),
+).dump()
 ds_csv = scarf.DataStore(str(csv_zarr))
 ds_csv.cells.head()
 ```
@@ -445,6 +409,8 @@ ds_csv.cells.head()
 `SparseToZarr` accepts a SciPy CSR matrix with matching cell and feature IDs.
 
 ```{code-cell} ipython3
+from scipy.sparse import csr_matrix
+
 mat = csr_matrix(
     (
         [1, 10, 15, 10, 20, 2, 3, 1, 5],
@@ -452,71 +418,32 @@ mat = csr_matrix(
     ),
     shape=(3, 10),
 )
-sparse_zarr = Path('scarf_datasets/toy_sparse.zarr')
-if sparse_zarr.exists():
-    shutil.rmtree(sparse_zarr)
-sparse_writer = scarf.SparseToZarr(
+sparse_zarr = output_dir / "toy_sparse.zarr"
+scarf.SparseToZarr(
     mat,
     zarr_loc=str(sparse_zarr),
-    cell_ids=[f'cell_{i}' for i in range(mat.shape[0])],
-    feature_ids=[f'feat_{i}' for i in range(mat.shape[1])],
-    assay_name='RNA',
-)
-sparse_writer.dump()
+    cell_ids=[f"cell_{i}" for i in range(mat.shape[0])],
+    feature_ids=[f"feat_{i}" for i in range(mat.shape[1])],
+    assay_name="RNA",
+).dump()
 ds_sparse = scarf.DataStore(str(sparse_zarr))
 ds_sparse
 ```
 
-## 10. Merge DataStores
+For a complete `DataStoreMerge` example, continue to {doc}`dataset_merging`.
 
-`DataStoreMerge` merges multiple full DataStores (all assays per dataset) into one Zarr file.
-Merged RNA assays receive both `counts` and `countsT`.
-The example below merges two tiny stores created with `SparseToZarr`.
-For single-assay merges pass `assays=["RNA"]` (or the assay name you need).
+## 10. Other import paths
 
-```{code-cell} ipython3
-for name, values in [
-    ('toy_merge_a.zarr', [1, 2, 3, 4, 5, 6]),
-    ('toy_merge_b.zarr', [7, 8, 9, 10, 11, 12]),
-]:
-    path = Path('scarf_datasets') / name
-    if path.exists():
-        shutil.rmtree(path)
-    m = csr_matrix(np.asarray(values, dtype=np.uint16).reshape(3, 2))
-    scarf.SparseToZarr(
-        m,
-        zarr_loc=str(path),
-        cell_ids=[f'{path.stem}_{i}' for i in range(3)],
-        feature_ids=['g1', 'g2'],
-        assay_name='RNA',
-    ).dump()
-
-ds_a = scarf.DataStore('scarf_datasets/toy_merge_a.zarr')
-ds_b = scarf.DataStore('scarf_datasets/toy_merge_b.zarr')
-merger = scarf.DataStoreMerge(
-    datasets=[ds_a, ds_b],
-    zarr_path='scarf_datasets/toy_merged.zarr',
-    names=['a', 'b'],
-    source_column='sample_id',
-    overwrite=True,
-)
-merger.dump()
-ds_merged = scarf.DataStore('scarf_datasets/toy_merged.zarr')
-ds_merged.cells.head()
-```
-
-## 11. Other import paths
-
-### 11.1 Loom
+### 10.1 Loom
 
 Loom import remains available through `LoomReader` and `LoomToZarr` with the same dump pattern as the readers above.
 This page does not execute a Loom example.
 
-### 11.2 Chunked arrays
+### 10.2 Chunked arrays
 
 `chunked_to_zarr` writes from a Scarf `ChunkedArray` when lazy out-of-core conversion is needed.
 
-### 11.3 Remote Zarr destinations
+### 10.3 Remote Zarr destinations
 
 Writers also accept remote Zarr locations.
 Choose the `cloud` profile for an object-store destination and pass credentials through the environment or runtime configuration:
@@ -542,7 +469,6 @@ writer.dump()
 - Reusing an existing Zarr output path without confirming that it can be overwritten
 - Exporting normalized values when a downstream method requires raw counts
 - Expecting an older RNA Zarr store without `countsT` to open in the current Scarf version
-- Using `DataStoreMerge` without `assays=` when you only need one modality from multi-assay stores
 - Assuming an H5AD file uses `X` for raw counts without inspecting its layers
 - Omitting `embedding_roles` or `cluster_keys` when analytical H5AD values should become artifacts
 - Selecting sparse, non-numeric, or row-mismatched `obsm` arrays as embeddings
@@ -550,5 +476,4 @@ writer.dump()
 - Treating Seurat neighbour graphs, images, or normalized layers as imported Scarf artifacts
 - Expecting Scarf to read `.h5seurat` or write Seurat `.rds` files
 
-Conversion writes the requested Zarr target.
-Export commands write MTX or H5AD at the supplied destination, and `DataStoreMerge` writes its merged store at `zarr_path`.
+Conversion writes the requested Zarr target, and export commands write MTX or H5AD at the supplied destination.

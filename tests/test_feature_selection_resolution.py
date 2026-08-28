@@ -158,7 +158,7 @@ def test_corrupt_all_features_is_replaced_without_metadata_alias(
 ) -> None:
     store = datastore_ephemeral
     columns_before = set(store.RNA.feats.columns)
-    first = store._ensure_all_features(store.RNA)
+    first = store.select_all_features(from_assay="RNA")
     first_status = inspect_artifact(store.zw, first)
     assert first_status.inputs == {}
     assert set(first_status.parameters or {}) == {
@@ -170,7 +170,7 @@ def test_corrupt_all_features_is_replaced_without_metadata_alias(
         data=np.zeros(store.RNA.feats.N, dtype=np.float64),
     )
 
-    replacement = store._ensure_all_features(store.RNA)
+    replacement = store.select_all_features(from_assay="RNA")
 
     assert replacement != first
     assert store.resolve_features("RNA", replacement) == replacement
@@ -184,7 +184,7 @@ def test_detected_feature_producer_rejects_empty_result_without_metadata_mutatio
     datastore_ephemeral,
 ) -> None:
     store = datastore_ephemeral
-    store._ensure_all_features(store.RNA)
+    store.select_all_features(from_assay="RNA")
     cell_selection = store.snapshot_cell_selection()
     before = set(store.list_artifacts(kind="feature_selection", from_assay="RNA"))
     columns_before = set(store.RNA.feats.columns)

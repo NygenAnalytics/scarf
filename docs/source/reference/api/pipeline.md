@@ -15,6 +15,7 @@ The result is a durable, read-only {py:class}`~scarf.PipelineRun` whose outputs 
    scarf.datastore.pipeline_accessor.PipelineAccessor.run
    scarf.datastore.pipeline_accessor.PipelineAccessor.open
    scarf.datastore.pipeline_accessor.PipelineAccessor.list_runs
+   scarf.datastore.pipeline_accessor.PipelineAccessor.abandon_label_claim
 ```
 
 ## Run the RNA recipe
@@ -82,6 +83,8 @@ retain the captured input selection, or pass a configuration mapping. Automatic 
 `min_cells_per_sample`. Manual filtering requires aligned `attrs`, `lows`, and `highs`, with an
 optional Boolean `keep_bounds` value. Probability, MAD, and manual-bound values must be finite
 numbers when present; booleans and numeric strings are rejected rather than coerced.
+If filtering is requested and none of the default QC columns exists, validation raises instead of
+silently analyzing the unfiltered cells. Pass `filtering=False` only when that choice is deliberate.
 
 ```python
 run = ds.pipeline.run(
@@ -121,6 +124,11 @@ the sample definition, invalid-candidate reasons, deterministic tie order, and t
 `run["clusters"]` is the selected candidate's exact ref. It is not a copied artifact or metadata
 column. If no candidate can be scored, the stage fails. A single valid candidate still receives a
 decision artifact.
+
+Persisted cluster selection is intentionally pipeline-only. The fixed recipe owns the candidate
+set, deterministic sampling policy, and run-ledger decision. Granular callers can use the public
+in-memory functions in `scarf.metrics` to evaluate their own candidates, but there is no separate
+`DataStore` persistence method that could imply the pipeline policy outside a run.
 
 ## Durable outputs and frozen views
 
@@ -182,8 +190,24 @@ interrupted = ds.pipeline.list_runs(status="interrupted")
 requested label. Failed and interrupted attempts do not reserve it. `list_runs` returns newest
 first and includes all statuses unless filtered. Concurrent finalizers use an atomic label claim,
 so at most one completed run can acquire a name. A storage backend without atomic conditional
-creation rejects labeled finalization; unlabeled runs are unaffected. An unclean incomplete
-finalizer blocks reuse of its requested label and fails closed.
+creation rejects `label=` before a run record or computation starts; unlabeled runs are unaffected.
+An unclean incomplete finalizer blocks reuse of its requested label and fails closed.
+
+After confirming that the owner process has stopped, explicitly abandon that exact claim before
+retrying the label:
+
+```python
+interrupted = ds.pipeline.abandon_label_claim(
+    label="baseline",
+    run_id=stopped_run_id,
+    reason="worker terminated after finalization began",
+)
+replacement = ds.pipeline.run(label="baseline")
+```
+
+The recovery call succeeds only for the exact current owner while `complete=False`, including a
+torn terminal payload, and records an `abandoned_label_claim` interruption. It refuses every
+`complete=True` owner and has no timeout or automatic stale-process heuristic.
 
 Every status exposes identity, status, and `run.report(format="dict" | "markdown")`. Only a
 completed run exposes mapping outputs and frozen views. Reports include stage timing, sampled
@@ -194,6 +218,8 @@ measurement is reported as null with a reason.
 Run and stage records are strict and unversioned. Unknown or malformed fields fail closed. A hard
 process death can leave `complete=False`; this is reported as an unclean incomplete run. There is
 no resume, repair, or same-ID retry. A new invocation may reuse only complete artifacts.
+Catalog scans and open-by-label skip malformed or torn children so healthy runs remain accessible;
+opening the malformed child by its exact run ID remains strict.
 
 ## Graceful interruption and callbacks
 
@@ -237,7 +263,7 @@ and cannot block durable status.
 
 ```{eval-rst}
 .. autoclass:: scarf.datastore.pipeline_accessor.PipelineAccessor
-    :members: run, open, list_runs
+    :members: run, open, list_runs, abandon_label_claim
 
 .. autoclass:: scarf.datastore.pipeline_accessor.PipelineEvent
     :members:

@@ -20,12 +20,11 @@ This tutorial follows one recommended path from a peak-count matrix to broad chr
 ## Prerequisites
 
 - Scarf installed with the `extra` optional dependencies
-- A 10x scATAC-seq HDF5 count matrix
 
 ## What you will learn
 
-- Convert a 10x scATAC-seq HDF5 matrix to Zarr
-- Build an LSI-based graph and cluster cells
+- Open a prepared 10x scATAC-seq Zarr store
+- Follow an LSI-based graph and clustering chain by exact artifact reference
 - Create a gene-score assay from peak annotations
 
 ## Dataset
@@ -35,80 +34,71 @@ import numpy as np
 
 import scarf
 
-scarf.configure_output(level='WARNING', progress=True)
-```
-
-## 1. Import the peak-count matrix
-
-We will use 10x Genomics single-cell ATAC-seq data from peripheral blood mononuclear cells.
-Like single-cell RNA-seq, Scarf only needs a count matrix to start the analysis.
-Use the `scarf_docs` Cytebase client to download the data in 10x HDF5 format.
-
-```{code-cell} ipython3
+scarf.configure_output(level="WARNING", progress=False)
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    name='tenx_10K_pbmc-v1_atacseq',
-    destination='scarf_datasets'
+    name="tenx_10K_pbmc-v1_atacseq",
+    destination="scarf_datasets",
+    zarr=True,
 )
+ds = scarf.DataStore(f"{dataset}/data.zarr", default_assay="ATAC", nthreads=4)
+
 ```
 
-The `CrH5Reader` class provides access to the HDF5 file.
-We can load the file and quickly check the number of features, and also verify that Scarf identified the assay as an ATAC assay.
+## 1. Open the prepared peak-count analysis
+
+The downloaded store was rebuilt with this Scarf version. It contains the raw peak counts and a
+complete analysis chain, so this page can inspect exact lineage without refitting the expensive
+wide-matrix reduction.
+
+Start from the stored Leiden output and follow each recorded input upstream.
 
 ```{code-cell} ipython3
-reader = scarf.CrH5Reader(f'{dataset}/data.h5')
-reader.assayFeats
-```
+def input_ref(ref, name):
+    return scarf.ArtifactRef.from_dict(ds.inspect_artifact(ref).inputs[name])
 
-This peak matrix is wide. `mem_budget="8G"` leaves room for one source row and one destination row band; the default 4 GiB budget is not enough for this file.
 
-```{code-cell} ipython3
-writer = scarf.CrToZarr(
-    reader,
-    zarr_loc=f'{dataset}/data.zarr',
-    mem_budget="8G",
+[clusters] = ds.list_artifacts(
+    from_assay="ATAC", kind="cluster_labels", complete_only=True
 )
-writer.dump()
+graph = input_ref(clusters, "graph")
+neighbors = input_ref(graph, "neighbors")
+ann_index = input_ref(neighbors, "ann_index")
+lsi = input_ref(ann_index, "coordinates")
+normalized = input_ref(lsi, "normalized")
+cell_selection = input_ref(normalized, "cell_selection")
+peak_features = input_ref(normalized, "feature_selection")
+input_cell_selection = input_ref(cell_selection, "prior_cell_selection")
+[umap] = ds.list_artifacts(from_assay="ATAC", kind="embedding", complete_only=True)
+assert input_ref(umap, "graph") == graph
 ```
 
-## 2. Filter cells
+## 2. Inspect cell filtering
 
-Load the Zarr store with `DataStore`, which is the main interface for the rest of the analysis.
-On first load, Scarf streams the count matrix once to compute initialization statistics: accessible peaks per cell (`nFeatures`), total fragments or cut sites per cell (`nCounts`), and per-peak detection counts used by explicit selection producers.
-
-```{code-cell} ipython3
-ds = scarf.DataStore(
-    f'{dataset}/data.zarr',
-    nthreads=4
-)
-```
+Scarf initialization records accessible peaks per cell (`nFeatures`), total fragments or cut sites
+per cell (`nCounts`), and per-peak detection counts used by explicit selection producers.
 
 Inspect fragment and peak-count distributions before filtering.
 Thresholds are dataset-specific.
 
 ```{code-cell} ipython3
-qc_cols = [
-    c for c in ('ATAC_nCounts', 'ATAC_nFeatures')
-    if c in ds.cells.columns
-]
-qc_cell_selection = ds.snapshot_cell_selection('I')
+qc_cols = [c for c in ("ATAC_nCounts", "ATAC_nFeatures") if c in ds.cells.columns]
 ds.plots.distribution(
     keys=qc_cols,
-    cell_selection=qc_cell_selection,
-    kind='violin',
+    cell_selection=input_cell_selection,
+    kind="violin",
     max_points=2000,
 )
 ```
 
-`auto_filter_cells` applies Scarf's global automatic bounds and returns a selection artifact. It
-does not change `I` or delete rows.
+The prepared `auto_filter_cells` result stores Scarf's global automatic bounds and the exact input
+selection. It did not delete rows.
 The {doc}`quality_control` guide covers manual thresholds, sample-aware filtering, and the ATAC metrics Scarf does and does not provide.
 
 ```{code-cell} ipython3
-n_before = int(ds.cells.fetch_all('I').sum())
-cell_selection = ds.auto_filter_cells()
-cell_mask = np.asarray(ds.load_artifact(cell_selection)['values'][:], dtype=bool)
-print(f'Cells in input selection: {n_before}')
-print(f'Cells after filter: {int(cell_mask.sum())}')
+input_mask = np.asarray(ds.load_artifact(input_cell_selection)["values"][:], dtype=bool)
+cell_mask = np.asarray(ds.load_artifact(cell_selection)["values"][:], dtype=bool)
+print(f"Cells in input selection: {int(input_mask.sum())}")
+print(f"Cells after filter: {int(cell_mask.sum())}")
 ```
 
 ## 3. Select prevalent peaks
@@ -118,59 +108,40 @@ The top features are returned as an immutable selection artifact for downstream 
 Here we retain 25,000 peaks, slightly more than one quarter of the available peaks.
 
 ```{code-cell} ipython3
-peak_features = ds.select_prevalent_peaks(cell_selection, top_n=25000)
-peak_values = np.asarray(ds.load_artifact(peak_features)['values'][:])
-print('Selected peaks:', int(peak_values.sum()))
+peak_values = np.asarray(ds.load_artifact(peak_features)["values"][:])
+print("Selected peaks:", int(peak_values.sum()))
 ```
 
 The retained peaks should be present across enough cells to support stable neighbour comparisons without collapsing the assay onto only the most common open regions.
 
-## 4. Build an LSI neighbourhood graph
+## 4. Inspect the LSI neighbourhood graph
 
 For scATAC-Seq datasets, Scarf uses TF-IDF normalization during `run_normalization`.
 The selected feature artifact is used for graph construction.
 Dimension reduction uses LSI rather than PCA.
-The remaining index, neighbour, and connectivity steps match the RNA graph workflow.
+The stored index, neighbour, and connectivity artifacts match the RNA graph workflow.
 
 LSI reduction of scATAC-Seq is known to capture the sequencing depth of cells in the first LSI dimension.
 `run_lsi` skips that component by default (`skip_first=True`).
 
 ```{code-cell} ipython3
-normalized = ds.run_normalization(cell_selection, peak_features)
-lsi = ds.run_lsi(normalized, dims=50, skip_first=True)
-initialization = ds.build_embedding_initialization(lsi)
-ann_index = ds.build_ann_index(lsi)
-neighbors = ds.query_neighbors(ann_index, k=21)
-graph = ds.build_connectivity_map(neighbors)
-
-ds.load_graph(graph)
+connectivity = ds.load_graph(graph)
+connectivity.shape, connectivity.nnz
 ```
 
-`load_graph` returns the graph as a sparse cell-by-cell matrix, which confirms it covers the active cells.
+The sparse graph shape confirms that it covers the selected cells.
 
 TF-IDF, LSI choices, and graph tuning are covered in {doc}`graph_construction` and {doc}`dimensionality_reduction`.
 
-## 5. Run UMAP and clustering
+## 5. Inspect UMAP and clustering
 
 
 UMAP and tSNE use the same neighbourhood-graph path as scRNA-seq, so the ATAC workflow looks the same after the graph is built.
 
-```{code-cell} ipython3
-umap = ds.run_umap(
-    graph,
-    initialization,
-    n_epochs=500,
-    min_dist=0.1, 
-    spread=1, 
-    parallel=True
-)
-```
-
-Leiden clustering also acts on the neighbourhood graph directly.
+The stored UMAP and Leiden artifacts both name the same exact graph input.
 
 ```{code-cell} ipython3
-clusters = ds.run_leiden_clustering(graph, resolution=0.6)
-cluster_values = np.asarray(ds.load_artifact(clusters)['values'][:])
+cluster_values = np.asarray(ds.load_artifact(clusters)["values"][:])
 np.unique(cluster_values, return_counts=True)
 ```
 
@@ -200,12 +171,9 @@ Download them with `annotations`:
 
 ```{code-cell} ipython3
 annotations = scarf.cytebase.connect("scarf_docs").download_dataset(
-    name='annotations',
-    destination='scarf_datasets'
+    name="annotations", destination="scarf_datasets"
 )
 ```
-
-----
 
 `add_melded_assay` maps genomic coordinates onto ATAC peaks.
 For a given locus, values from all overlapping peaks are melded into one feature.
@@ -217,16 +185,16 @@ BED column requirements, promoter offsets, renormalization, and other coordinate
 
 ```{code-cell} ipython3
 ds.add_melded_assay(
-    from_assay='ATAC',
-    external_bed_fn=f'{annotations}/human_GRCh37_gencode_v38_gene_body.bed.gz',
-    peaks_col='ids',
+    from_assay="ATAC",
+    external_bed_fn=f"{annotations}/human_GRCh37_gencode_v38_gene_body.bed.gz",
+    peaks_col="ids",
     renormalization=False,
-    assay_label='GeneScores',
-    assay_type='RNA'
+    assay_label="GeneScores",
+    assay_type="RNA",
 )
 print(
-    'Valid GeneScores features:',
-    int(ds.GeneScores.feats.fetch_all('I').sum()),
+    "Valid GeneScores features:",
+    int(ds.GeneScores.feats.fetch_all("I").sum()),
 )
 ```
 
@@ -243,6 +211,6 @@ A uniformly flat score can indicate coordinate-build mismatch or poor overlap be
 
 ## Common mistakes and limitations
 
-- Assuming `tenx_10K_pbmc-v1_atacseq` has no prepared Zarr and skipping `zarr=True`
+- Downloading raw HDF5 and repeating the wide LSI analysis when the prepared Zarr result is sufficient
 - Using RNA normalization or PCA assumptions for ATAC data
 - Setting `skip_first=False` on `run_lsi` without checking whether sequencing depth dominates the first LSI component

@@ -159,7 +159,19 @@ class BaseDataStore:
         self.memoryBytes = self.resources.memoryBytes
         self.storageProfile = storage_profile
         self.storageIo = storageIo
-        _ = self.assay_names
+        assay_names = self.assay_names
+        legacy_state_paths = [
+            f"{assay_name}/state"
+            for assay_name in assay_names
+            if "state" in as_zarr_group(self.zw[assay_name], name=assay_name)
+        ]
+        if legacy_state_paths:
+            paths = ", ".join(legacy_state_paths)
+            raise ValueError(
+                f"Legacy assay state is unsupported: {paths}. This release never "
+                "reads or migrates {assay}/state; rebuild the dataset with this "
+                "Scarf version."
+            )
         # The order is critical here:
         self.cells = self._load_cells()
         self._defaultAssay = self._load_default_assay(default_assay)

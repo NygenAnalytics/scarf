@@ -231,7 +231,9 @@ def resolve_coordinate_inputs(
             expected_scope="assay",
             expected_assay=assay,
         )
-        from .imported_storage import validate_imported_coordinates_artifact
+        from ..embeddings.imported_storage import (
+            validate_imported_coordinates_artifact,
+        )
 
         validate_imported_coordinates_artifact(root, coordinates)
         cell_selection = _input_ref(
@@ -435,7 +437,9 @@ def resolve_native_graph_inputs(
         )
 
     if coordinates.kind == "imported_coordinates":
-        from .imported_storage import validate_imported_coordinates_artifact
+        from ..embeddings.imported_storage import (
+            validate_imported_coordinates_artifact,
+        )
 
         validate_imported_coordinates_artifact(root, coordinates)
         cell_selection = _input_ref(

@@ -44,14 +44,14 @@ import pandas as pd
 
 import scarf
 
-scarf.configure_output(level='WARNING', progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 counts = scarf.cytebase.connect("scarf_docs").download(
-    'tenx_5K_pbmc_rnaseq/data.h5',
-    destination='scarf_datasets',
+    "tenx_5K_pbmc_rnaseq/data.h5",
+    destination="scarf_datasets",
 )[0]
 
-store = counts.with_name('data.zarr')
+store = counts.with_name("data.zarr")
 reader = scarf.CrH5Reader(str(counts))
 scarf.CrToZarr(
     reader,
@@ -77,16 +77,15 @@ patterns, plus per-feature detection statistics used by explicit selection produ
 
 ```{code-cell} ipython3
 qc_cols = [
-    c for c in (
-        'RNA_nCounts', 'RNA_nFeatures', 'RNA_percentMito', 'RNA_percentRibo'
-    )
+    c
+    for c in ("RNA_nCounts", "RNA_nFeatures", "RNA_percentMito", "RNA_percentRibo")
     if c in ds.cells.columns
 ]
-qc_cell_selection = ds.snapshot_cell_selection('I')
+qc_cell_selection = ds.snapshot_cell_selection("I")
 ds.plots.distribution(
     keys=qc_cols,
     cell_selection=qc_cell_selection,
-    kind='violin',
+    kind="violin",
     max_points=2000,
 )
 ```
@@ -103,16 +102,16 @@ The named QC columns are read from current cell metadata when the method is call
 explicitly named column is absent, filtering raises an error instead of silently omitting it.
 
 ```{code-cell} ipython3
-n_before = int(ds.cells.fetch_all('I').sum())
+n_before = int(ds.cells.fetch_all("I").sum())
 manual_filter = {
     "attrs": ["RNA_nCounts", "RNA_nFeatures", "RNA_percentMito"],
     "highs": [15000, 4000, 15],
     "lows": [1000, 500, 0],
 }
 manual_selection = ds.filter_cells(**manual_filter)
-manual_mask = np.asarray(ds.load_artifact(manual_selection)['values'][:], dtype=bool)
-print(f'Cells in input selection: {n_before}')
-print(f'Cells in filtered selection: {int(manual_mask.sum())}')
+manual_mask = np.asarray(ds.load_artifact(manual_selection)["values"][:], dtype=bool)
+print(f"Cells in input selection: {n_before}")
+print(f"Cells in filtered selection: {int(manual_mask.sum())}")
 pd.DataFrame({key: ds.cells.fetch_all(key)[manual_mask] for key in qc_cols}).describe()
 ```
 
@@ -129,10 +128,10 @@ Pass the previous selection explicitly to compose filters.
 ```{code-cell} ipython3
 automatic_selection = ds.auto_filter_cells(cell_selection=manual_selection)
 automatic_mask = np.asarray(
-    ds.load_artifact(automatic_selection)['values'][:],
+    ds.load_artifact(automatic_selection)["values"][:],
     dtype=bool,
 )
-print(f'Cells after automatic refinement: {int(automatic_mask.sum())}')
+print(f"Cells after automatic refinement: {int(automatic_mask.sum())}")
 ```
 
 Inspect the selected values through the returned mask before accepting the thresholds.
@@ -143,31 +142,21 @@ Global bounds can penalize a sample whose count-depth distribution differs from 
 With `sample_column`, Scarf calculates robust bounds within each sample using the median absolute deviation (MAD).
 
 The PBMC teaching dataset has no biological sample column.
-The balanced `qc_sample` labels below make the API executable but must not be interpreted as a real sample-aware result.
+Use a real sample column when the dataset contains multiple donors or batches. The call has the
+same immutable-selection contract as the global filter:
 
-```{code-cell} ipython3
-ds.cells.insert(
-    "qc_sample",
-    np.asarray(
-        [f"sample_{index % 4}" for index in range(ds.cells.N)]
-    ),
-    overwrite=True,
-)
-n_before = int(ds.cells.fetch_all('I').sum())
+```python
 sample_selection = ds.auto_filter_cells(
     attrs=qc_cols,
-    sample_column="qc_sample",
+    cell_selection=manual_selection,
+    sample_column="sample_id",
     n_mads=3.0,
     min_cells_per_sample=20,
 )
-sample_mask = np.asarray(ds.load_artifact(sample_selection)['values'][:], dtype=bool)
-print(f'Cells in input selection: {n_before}')
-print(f'Cells after MAD filter: {int(sample_mask.sum())}')
 ```
 
-The input and selected counts show the sample-aware path.
-The `qc_sample` labels are synthetic and balanced, so treat the retained counts as a mechanics demo, not a biological sample comparison.
-Use a real sample column when comparing depth distributions across donors or batches.
+The PBMC page does not execute this call because inventing sample assignments would produce a
+mechanics demo with no biological interpretation.
 
 Count-like metrics such as `nCounts` and `nFeatures` use log1p values and two-sided bounds.
 Percentage metrics such as `percentMito` and `percentRibo` use their original scale and an upper bound only.
@@ -244,7 +233,7 @@ Higher doublet scores mark cells that map near simulated doublets.
 Inspect the score distribution before applying a cutoff:
 
 ```{code-cell} ipython3
-pd.Series(scores, name='doublet_score').plot(kind='hist', bins=40)
+pd.Series(scores, name="doublet_score").plot(kind="hist", bins=40)
 ```
 
 The score distribution and embedding should be reviewed together.
@@ -254,11 +243,11 @@ The teaching cutoff below identifies the upper 5% of scores on this PBMC run; re
 study-specific value when the upper-tail shape differs.
 
 ```{code-cell} ipython3
-scores_series = pd.Series(scores, name='doublet_score')
+scores_series = pd.Series(scores, name="doublet_score")
 print(scores_series.describe())
 doublet_threshold = float(scores_series.quantile(0.95))
-print(f'Doublet threshold (95th percentile): {doublet_threshold:.4f}')
-print(f'Cells above threshold: {int((scores > doublet_threshold).sum())}')
+print(f"Doublet threshold (95th percentile): {doublet_threshold:.4f}")
+print(f"Cells above threshold: {int((scores > doublet_threshold).sum())}")
 ```
 
 Compose the upper bound with the score artifact's stored input selection. This retains scores at

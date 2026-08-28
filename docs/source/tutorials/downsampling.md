@@ -18,11 +18,12 @@ TopACeDo selects representative cells from an explicit graph and Paris clusterin
 immutable artifact with the selected mask and diagnostics. Nothing is added to cell metadata unless
 you deliberately add a column for an export tool.
 
-## 1. Build the required artifacts
+## 1. Open the required artifacts
 
-TopACeDo requires the Paris cut for the same graph. This pipeline run builds both, plus the UMAP
-used for inspection, and skips unrelated stages. A Leiden partition or a cut from another graph is
-rejected.
+TopACeDo requires a Paris cut from the same graph. The rebuilt PBMC store contains a completed
+standard run labeled `docs_default` and a 15-cluster Paris cut built from its graph. Calling
+`run_paris_clustering` with that graph and cut size reuses the exact stored result. A Leiden
+partition or a cut from another graph is rejected.
 
 ```{code-cell} ipython3
 from pathlib import Path
@@ -33,41 +34,19 @@ import numpy as np
 import pandas as pd
 
 import scarf
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-counts_path = Path(analysis_directory.name) / "counts.zarr"
-analysis_path = Path(analysis_directory.name) / "downsampling.zarr"
-repack_store(f"{dataset}/data.zarr", str(counts_path), nthreads=2)
-ds = scarf.mount_datastore(
-    str(counts_path),
-    at=str(analysis_path),
-    default_assay="RNA",
-    nthreads=4,
-)
-
-preparation = ds.pipeline.run(
-    filtering=False,
-    hvg_count=500,
-    pca_dims=15,
-    neighbors_k=11,
-    umap=True,
-    leiden=False,
-    cell_cycle=False,
-    paris=True,
-    doublets=False,
-    markers=False,
-)
-graph = preparation["connectivity_map"]
-umap = preparation["umap"]
-paris = preparation["paris"]
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+run = ds.pipeline.open(label="docs_default")
+graph = run["connectivity_map"]
+umap = run["umap"]
+paris = ds.run_paris_clustering(graph, n_clusters=15)
 ```
 
 `paris` is an exact `cluster_cut` ref. Inspect its labels through the dedicated loader:
@@ -135,7 +114,8 @@ replacement for the complete dataset.
 ## 3. Export the selected cells
 
 `SubsetZarr` currently selects cells by a boolean metadata column. Add one explicitly, then export.
-This mutation is a user-owned handoff step, not a side effect of TopACeDo.
+The rebuilt store's active `I` matches the graph selection, so the compact sampler mask aligns with
+the insert. This mutation is a user-owned handoff step, not a side effect of TopACeDo.
 
 ```{code-cell} ipython3
 ds.cells.insert(
@@ -146,7 +126,8 @@ ds.cells.insert(
     overwrite=True,
 )
 
-subset_path = Path(analysis_directory.name) / "subset.zarr"
+export_directory = TemporaryDirectory()
+subset_path = Path(export_directory.name) / "subset.zarr"
 writer = scarf.SubsetZarr(
     zarr_loc=str(subset_path),
     assays=[ds.RNA],

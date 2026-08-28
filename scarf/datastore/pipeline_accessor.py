@@ -6,6 +6,7 @@ import numpy as np
 from ..storage.artifacts import ArtifactRef, artifact_group
 from ..storage.pipeline_runs import (
     PipelineOutputRecord,
+    abandon_pipeline_label_claim,
     complete_pipeline_run_record,
     create_pipeline_run_record,
     fail_pipeline_run_record,
@@ -81,6 +82,30 @@ class PipelineAccessor:
     ) -> tuple[PipelineRun, ...]:
         """List recent runs, optionally filtered by their terminal status."""
         return list_pipeline_runs(self._store, status=status, limit=limit)
+
+    def abandon_label_claim(
+        self,
+        *,
+        label: str,
+        run_id: str,
+        reason: str,
+    ) -> PipelineRun:
+        """Mark an exact stopped finalizer interrupted so its label can be retried.
+
+        The caller must first confirm that the process executing ``run_id`` has
+        stopped. Scarf does not infer abandonment from elapsed time because a
+        slow live finalizer must never lose its label claim.
+        """
+
+        if self._store.zarr_mode != "r+":
+            raise PermissionError("Label-claim recovery requires zarr_mode='r+'")
+        record = abandon_pipeline_label_claim(
+            self._store.zw,
+            label=label,
+            run_id=run_id,
+            reason=reason,
+        )
+        return PipelineRun(self._store, record)
 
     def run(
         self,
@@ -235,7 +260,7 @@ class PipelineAccessor:
                 axis="feature",
                 assay=recipe.assay,
             )
-            all_features = store._ensure_all_features(assay_obj)
+            all_features = store.select_all_features(from_assay=assay_obj.name)
             frozen_feature_names = np.asarray(
                 as_zarr_array(
                     artifact_group(store.zw, feature_snapshot)["names"],

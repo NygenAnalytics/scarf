@@ -20,10 +20,9 @@ Use `ds.plots` for plots backed by a `DataStore`.
 The same store-first functions remain available from `scarf.plotting`, which also provides reusable contracts such as color and normalization scales.
 
 Fresh granular analyses pass exact refs, for example
-`ds.plots.embedding(layout=umap_ref, color_by=cluster_ref)`. A completed run uses
-`ds.plots.embedding(run=run, layout="umap", color_by="clusters")`. The `layout_key` and `group_by`
-string forms below intentionally read literal metadata from the prepared teaching dataset; they do
-not select an artifact by name.
+`ds.plots.embedding(layout=umap_ref, color_by=cluster_ref)`. This page opens the exact UMAP from a
+completed run. Its `clusters` cell field is the imported biological annotation, not an artifact
+name.
 
 ## Prerequisites
 
@@ -45,11 +44,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import matplotlib.pyplot as plt
+import numpy as np
 
 import scarf
 import scarf.plotting as splt
 
-scarf.configure_output(level='WARNING', progress=True)
+scarf.configure_output(level='WARNING', progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     name="bastidas-ponce_4K_pancreas-d15_rnaseq",
@@ -61,6 +61,9 @@ ds = scarf.DataStore(
     nthreads=4,
     default_assay="RNA",
 )
+run = ds.pipeline.open(label="docs_default")
+layout = run["umap"]
+cell_types = splt.CellField("clusters", label="cell type")
 ```
 
 ## 1. Plot embeddings
@@ -68,19 +71,14 @@ ds = scarf.DataStore(
 `ds.plots.embedding` colors cells on a layout such as UMAP.
 Pass a metadata column or a gene name in `color_by`.
 Plot functions render in the current notebook cell by default.
-
-```{code-cell} ipython3
-ds.plots.embedding(layout_key="RNA_UMAP", color_by="clusters");
-```
-
-Several genes become a row of panels.
+Several color fields become a row of panels.
 `NormalizationSpec(transform="log1p")` compresses the expression scale.
 `sort_values=True` draws high-expressing cells last so they sit on top of the cloud.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by=["Gcg", "Ins2", "Sst"],
+    layout=layout,
+    color_by=[cell_types, "Gcg", "Ins2", "Sst"],
     normalization=splt.NormalizationSpec(transform="log1p"),
     sort_values=True,
 );
@@ -92,7 +90,7 @@ The left panel uses the default absolute maximum; the right panel sets the color
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 2, figsize=(7.2, 3.2), layout="constrained")
 ds.plots.embedding(
-    layout_key="RNA_UMAP",
+    layout=layout,
     color_by="Gcg",
     normalization=splt.NormalizationSpec(transform="log1p"),
     sort_values=True,
@@ -101,7 +99,7 @@ ds.plots.embedding(
     show=False,
 )
 ds.plots.embedding(
-    layout_key="RNA_UMAP",
+    layout=layout,
     color_by="Gcg",
     normalization=splt.NormalizationSpec(transform="log1p"),
     color_scale=splt.ColorScale(cmap="viridis", quantiles=(0.0, 0.99)),
@@ -124,16 +122,15 @@ Side by side with a vector scatter on the same column, the raster fills space as
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 2, figsize=(7.2, 3.2), layout="constrained")
 ds.plots.embedding(
-    layout_key="RNA_UMAP",
+    layout=layout,
     color_by="RNA_nCounts",
     target=axes[0],
     show_titles=False,
     show=False,
 )
 ds.plots.embedding_raster(
-    layout_key="RNA_UMAP",
+    layout=layout,
     color_by="RNA_nCounts",
-    pixels=400,
     target=axes[1],
     show=False,
 )
@@ -153,9 +150,9 @@ shared_expression_scale = splt.ColorScale(
     quantiles=(0.0, 0.99),
 )
 ds.plots.embedding(
-    layout_key="RNA_UMAP",
+    layout=layout,
     color_by="Ins2",
-    facet_by="clusters",
+    facet_by=cell_types.key,
     groups=["Alpha", "Beta", "Delta"],
     color_scale=shared_expression_scale,
     sort_values=True,
@@ -163,24 +160,7 @@ ds.plots.embedding(
 );
 ```
 
-Pass several layout keys when the same values need to be compared across embeddings.
-The panels remain coordinated views of one cell table, not independent analyses.
-This store ships a single UMAP; the reflected `demo_layout` below is only so the multi-layout API is visible.
-Compare independently fitted layouts in {doc}`dimensionality_reduction`.
-
-```{code-cell} ipython3
-umap1 = ds.cells.fetch("RNA_UMAP1")
-umap2 = ds.cells.fetch("RNA_UMAP2")
-ds.cells.insert("demo_layout1", umap1, overwrite=True)
-ds.cells.insert("demo_layout2", -umap2, overwrite=True)
-
-ds.plots.embedding(
-    layout_key=["RNA_UMAP", "demo_layout"],
-    color_by="clusters",
-    n_columns=2,
-    legend_loc="on_data",
-);
-```
+Compare independently fitted layout artifacts in {doc}`dimensionality_reduction`.
 
 ### Highlights and density contours
 
@@ -189,24 +169,20 @@ ds.plots.embedding(
 
 ```{code-cell} ipython3
 ds.plots.embedding(
-    layout_key="RNA_UMAP",
+    layout=layout,
     color_by=None,
     default_color="#bdbdbd",
     point_alpha=0.4,
     highlight=splt.Highlight(
-        by="clusters",
+        by=cell_types.key,
         groups=("Beta",),
-        color="#d62728",
-        dim_alpha=0.12,
-        size_multiplier=1.35,
-        halo_width=0.4,
     ),
 );
 ```
 
 ```{code-cell} ipython3
 ds.plots.embedding(
-    layout_key="RNA_UMAP",
+    layout=layout,
     color_by="Ins2",
     color_scale=shared_expression_scale,
     sort_values=True,
@@ -245,35 +221,21 @@ Override them when the default is a poor fit for your number of clusters or for 
 `theme="paper"` uses smaller fonts suited to multi-panel figures; `theme="dark"` is for dark notebook themes.
 
 ```{code-cell} ipython3
-figure, axes = plt.subplots(1, 2, figsize=(7.2, 3.2), layout="constrained")
 ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by="clusters",
-    target=axes[0],
-    show_titles=False,
-    show=False,
-)
-ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by="clusters",
+    layout=layout,
+    color_by=cell_types,
     legend_loc="on_data",
     frame="none",
     theme="paper",
     point_size=28,
-    target=axes[1],
-    show_titles=False,
-    show=False,
-)
-axes[0].set_title("defaults")
-axes[1].set_title("on_data, no frame, large points")
-figure
+);
 ```
 
 ### Point size
 
 Leave `point_size=None` (the default) so marker size follows the cell count.
 Small datasets get larger points; dense clouds get smaller points and thinner edges so clusters do not turn into a dark smudge.
-Pass an explicit `point_size` only when you need a fixed look across figures, as in the right panel above.
+Pass an explicit `point_size` only when you need a fixed look across figures.
 
 ---
 
@@ -287,20 +249,20 @@ The three `demo_*` columns below are synthetic study-design metadata for this sh
 not experimental annotations.
 
 ```{code-cell} ipython3
-n = len(ds.cells.active_index("I"))
+row = np.arange(ds.cells.N)
 ds.cells.insert(
     "demo_sample",
-    [f"s{i % 8}" for i in range(n)],
+    np.char.add("s", (row % 8).astype(str)),
     overwrite=True,
 )
 ds.cells.insert(
     "demo_subject",
-    [f"d{i % 4}" for i in range(n)],
+    np.char.add("d", (row % 4).astype(str)),
     overwrite=True,
 )
 ds.cells.insert(
     "demo_condition",
-    ["before" if i % 8 < 4 else "after" for i in range(n)],
+    np.where(row % 8 < 4, "before", "after"),
     overwrite=True,
 )
 
@@ -353,21 +315,18 @@ ds.plots.composition(
 Violins (or boxes, histograms, ECDFs) are useful for QC metrics or genes split by cluster.
 Groups are colored distinctly.
 `max_points` limits how many individual cells are overlaid as points (`0` turns points off).
-Pass a categorical `CellField` and an exact cell-selection artifact. Use `subset_by` for an
-additional boolean cell column and `groups` to keep and order categories from the grouping.
+Pass a categorical `CellField`; optionally add an exact cell-selection artifact. This store keeps
+all cells active, so these examples need no extra selection. Use `groups` to keep and order
+categories from the grouping.
 Several gene keys share a y-axis scale and wrap into a grid.
 
 ```{code-cell} ipython3
-cluster_ids = sorted(set(ds.cells.fetch("clusters")), key=str)[:6]
-active_cells = ds.snapshot_cell_selection("I")
 ds.plots.distribution(
     keys=["RNA_nCounts", "RNA_nFeatures"],
-    grouping=splt.CellField("clusters"),
-    cell_selection=active_cells,
-    groups=cluster_ids,
+    grouping=cell_types,
+    groups=["Alpha", "Beta", "Delta"],
     kind="violin",
     max_points=2000,
-    seed=0,
 );
 ```
 
@@ -377,8 +336,7 @@ This is useful when the question is whether a small marker panel separates the a
 ```{code-cell} ipython3
 ds.plots.distribution(
     keys=["Gcg", "Ins2", "Sst"],
-    grouping=splt.CellField("clusters"),
-    cell_selection=active_cells,
+    grouping=cell_types,
     groups=["Alpha", "Beta", "Delta"],
     normalization=splt.NormalizationSpec(transform="log1p"),
     kind="stacked_violin",
@@ -393,8 +351,7 @@ For replicated studies, `sample_by` summarizes biological samples rather than pl
 ```{code-cell} ipython3
 ds.plots.distribution(
     keys="Ins2",
-    grouping=splt.CellField("clusters"),
-    cell_selection=active_cells,
+    grouping=cell_types,
     groups=["Alpha", "Beta", "Delta"],
     sample_by="demo_sample",
     split_by="demo_condition",
@@ -419,8 +376,8 @@ Pass `transparent=True` when the destination supplies its own background, and ca
 output_directory = TemporaryDirectory()
 out = Path(output_directory.name) / "plotting_showcase_embedding.png"
 result = ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by="clusters",
+    layout=layout,
+    color_by=cell_types,
     show=False,
 )
 result.save(
@@ -430,11 +387,9 @@ result.save(
     provenance_sidecar=True,
 )
 sidecar = out.with_suffix(out.suffix + ".json")
-assert out.exists()
-assert sidecar.exists()
-print(out)
-print(json.dumps(json.loads(sidecar.read_text())["provenance"], indent=2))
+provenance = json.loads(sidecar.read_text())["provenance"]
 result.close()
+provenance
 ```
 
 `exact_size=True` preserves the figure's physical inch size.
@@ -457,8 +412,8 @@ with splt.theme_context("paper"):
     )
     children = {
         "annotation": ds.plots.embedding(
-            layout_key="RNA_UMAP",
-            color_by="clusters",
+            layout=layout,
+            color_by=cell_types,
             legend_loc="on_data",
             show_legend=False,
             show_titles=False,
@@ -467,7 +422,7 @@ with splt.theme_context("paper"):
             show=False,
         ),
         "expression": ds.plots.embedding(
-            layout_key="RNA_UMAP",
+            layout=layout,
             color_by="Ins2",
             color_scale=shared_expression_scale,
             sort_values=True,
@@ -494,13 +449,8 @@ Save through `composite.save(...)` when provenance is needed, then close it expl
 composite_out = Path(output_directory.name) / "plotting_composite.svg"
 composite.save(
     composite_out,
-    exact_size=True,
     provenance_sidecar=True,
 )
-composite_sidecar = composite_out.with_suffix(composite_out.suffix + ".json")
-assert composite_out.exists()
-assert composite_sidecar.exists()
-print(composite_out)
 plt.close(figure)
 ```
 

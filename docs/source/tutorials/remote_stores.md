@@ -28,34 +28,27 @@ Published remote object-store funnel timings are in {doc}`../concepts/benchmarks
 
 ## What you will learn
 
-- Open a public demo store on object storage without downloading it
+- Open a release-matched store on object storage without downloading it
 - Open `DataStore` on `s3://` or `gs://` with `storage_options`
 - Mount shared count matrices into a separate writable analysis store
 - Reopen a durable pipeline run from its mounted target
 - Select the `cloud` storage profile
 - Stage normalized data locally for PCA with `local_cache`
-- Repack an older store with `scarf.tools.repack_zarr`
 
-## 1. Open the public demo store
+## 1. Open a release-matched remote store
 
-The `scarf_docs` Cytebase repository publishes one analyzed store unpacked, so you can open its URI directly instead of downloading an archive.
-Pass `token=False` for anonymous read-only access to this public Hugging Face bucket.
+An unpacked store built by the same Scarf release can be opened directly instead of downloading
+an archive. Replace the URI and storage options below with those for your object store. The
+executable sections use the rebuilt documentation archive so they do not depend on a separate
+publication step.
 
-```{code-cell} ipython3
+```python
 import scarf
 
-scarf.configure_output(level="ERROR", progress=True)
-
-repository = scarf.cytebase.connect('scarf_docs')
-source_uri = (
-    'hf://buckets/Nygen/cytebase/scarf_docs/'
-    'tenx_5K_pbmc_rnaseq/data.zarr'
-)
-
 ds = scarf.DataStore(
-    source_uri,
-    zarr_mode='r',
-    storage_options={'token': False},
+    "s3://my-bucket/current-scarf-store.zarr",
+    zarr_mode="r",
+    storage_options={"anon": True},
     nthreads=4,
 )
 print(ds)
@@ -65,18 +58,19 @@ Opening a store over object storage costs many small metadata requests, so expec
 Nothing but metadata is read until you touch the counts.
 The printed summary lists active cells, assays, and the cell and feature columns already present in the remote store.
 
-Counts and literal metadata in the published store remain readable, including its UMAP columns and
-cluster partition. New computations write exact artifacts to the mounted analysis target.
-The next section mounts those count matrices and records a new pipeline run in a separate target.
+Counts and metadata in a matching published store remain readable. Durable analysis is reopened
+through its pipeline label and exact artifacts. The next section mounts the rebuilt count matrices
+and records a new pipeline run in a separate target.
 
-```{code-cell} ipython3
+```python
+run = ds.pipeline.open(label="docs_default")
 ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='RNA_clusters',
+    run=run,
+    color_by="clusters",
 )
 ```
 
-## 2. Prepare and mount read-only counts
+## 2. Mount read-only counts
 
 Use `mount_datastore` when count matrices must remain in a shared source store, but each analysis needs its own writable store.
 Scarf copies cell and feature metadata into the target.
@@ -86,40 +80,34 @@ It is mounted with `counts` and is not rewritten into the target.
 Non-RNA assays have no `countsT`.
 New metadata and analysis artifacts are written only to the target.
 
-The public snapshot used here predates the required RNA `countsT` layout, so first download its packaged Zarr store into a temporary directory and repack it locally.
-The repack creates the transpose and leaves the remote source unchanged.
-Mounting that repacked source into a separate target keeps copied literal metadata separate from newly computed artifacts.
+The public snapshot was rebuilt from raw counts with the current paired RNA layout. Download it
+once, then mount those count arrays into a separate writable target.
 
 ```{code-cell} ipython3
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import numpy as np
+import scarf
 import zarr
 
-from scarf.tools.repack_zarr import repack_store
-
+scarf.configure_output(level="ERROR", progress=False)
+repository = scarf.cytebase.connect("scarf_docs")
 mount_directory = TemporaryDirectory()
 staged_dataset = repository.download_dataset(
     'tenx_5K_pbmc_rnaseq',
     destination=mount_directory.name,
     zarr=True,
 )
-repacked_path = Path(mount_directory.name) / 'counts.zarr'
+source_path = staged_dataset / 'data.zarr'
 target_path = Path(mount_directory.name) / 'analysis.zarr'
-
-repack_store(
-    str(staged_dataset / 'data.zarr'),
-    str(repacked_path),
-    nthreads=2,
-)
 ```
 
 The target path must not already exist:
 
 ```{code-cell} ipython3
 mounted = scarf.mount_datastore(
-    str(repacked_path),
+    str(source_path),
     at=str(target_path),
     default_assay='RNA',
     nthreads=4,
@@ -128,25 +116,22 @@ mounted = scarf.mount_datastore(
 matrix_source = zarr.open_group(str(target_path), mode='r').attrs['matrixSource']
 print('Target path:', target_path)
 print('Target exists:', target_path.exists())
-print('Remote demo URI:', source_uri)
 print('Downloaded dataset:', staged_dataset)
 print('Mounted count source:', matrix_source['location'])
 print('Mounted assays:', sorted(matrix_source['assays']))
 ```
 
-Counts and RNA `countsT` stay in the repacked count source.
+Counts and RNA `countsT` stay in the downloaded count source.
 Cell and feature metadata are copied once, while new analysis artifacts are written to the target.
-The printed `matrixSource` record is what later reopen uses to resolve the repacked counts.
+The printed `matrixSource` record is what later reopen uses to resolve those counts.
 
 ```{mermaid}
 flowchart LR
     source["Read-only remote dataset"]
-    staged["Temporary local download<br/>counts and metadata"]
-    repack["Local count source<br/>counts and RNA countsT"]
+    staged["Current local count source<br/>counts, RNA countsT, metadata"]
     target["Writable mounted target<br/>metadata and new artifacts"]
     source -->|download once| staged
-    staged -->|repack locally| repack
-    repack -->|mount count blocks| target
+    staged -->|mount count blocks| target
 ```
 
 The target assay has no physical count array, while `rawData` exposes the complete mounted count matrix:
@@ -158,8 +143,8 @@ print('Counts stored in target:', 'counts' in target_root['RNA'])
 print('Mounted shape:', mounted.RNA.rawData.shape)
 ```
 
-Run the standard RNA pipeline through the mount. Count blocks are read from the structurally
-repacked source, while the run record and its normalized data, reductions, graph, UMAP, and
+Run the standard RNA pipeline through the mount. Count blocks are read from the current source,
+while the run record and its normalized data, reductions, graph, UMAP, and
 clusters are written only to the local target. Because that target is a local path, `local_cache`
 staging is skipped here; Section 4 makes the remote-only policy explicit.
 
@@ -350,25 +335,5 @@ Gene-wise stages and small metadata opens feel remote latency most.
 Remote-first analysis is still useful for shared stores; download-then-analyze remains available when you need local disk performance.
 Published remote object-store funnel timings and caveats are in {doc}`../concepts/benchmarks`.
 Resource planning controls are in {doc}`../concepts/memory_and_execution`.
-
-## 6. Repack older stores
-
-New Scarf writers emit Zarr v3.
-An RNA store that predates the paired `counts` / `countsT` layout, or that is still Zarr v2, will not open as an RNA assay.
-Repack writes a new store with the current layout and storage profile, locally or on object storage:
-
-```bash
-uv run python -m scarf.tools.repack_zarr \
-  s3://bucket/input.zarr s3://bucket/output.zarr \
-  --profile cloud \
-  --mem-budget 8G \
-  --storage-options '{"skip_signature": true}'
-```
-
-Paths stay as URIs (do not pass them through `pathlib.Path`).
-Use `--storage-options` for backend credentials or public reads (`skip_signature` for anonymous S3/GCS).
-Point `DataStore` at the output URI afterward.
-Repacking rewrites physical layout; it is not an analysis step.
-After a rewrite, recompute HVG, normalization, PCA, graph, and marker results rather than resuming them from the input store.
 
 For custom statistics over mounted graphs or count blocks, followed by a supported selective export, continue with {doc}`custom_analyses`.
