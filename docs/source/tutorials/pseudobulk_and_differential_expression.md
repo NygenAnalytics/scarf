@@ -136,30 +136,30 @@ Do not treat within-group `p_value_adjusted` columns as replicate-aware differen
 The rank-based defaults suit single-cell data: `mann_whitney` for two groups, `kruskal_wallis` (optionally with Dunn's post-hoc) for three or more, and paired Wilcoxon on aggregated samples.
 
 Explicitly requested parametric tests (`welch`, aliased by `t_test`, and `one_way_anova`) also run on raw cell-level values.
-They are descriptive only: cells violate normality, they cannot be combined with sample aggregation, and Welch honours the one-sided `alternative` while auto never selects them.
+They are descriptive only: they treat cells as independent, cannot be combined with sample aggregation, and make assumptions that zero-inflated single-cell values often violate.
+Welch honours the one-sided `alternative`; automatic method selection never chooses a parametric test.
 
-```python
-# Welch t-test on raw normalized values, two groups selected explicitly
+```{code-cell} ipython3
+# Compare two clusters that are present in the Kang dataset.
 result = ds.run_statistical_testing(
     ['MALAT1'],
-    group_by='stat_group2',
-    groups=['g0', 'g1'],
+    group_by='RNA_clusters',
+    groups=[1, 2],
     test='welch',
     alternative='greater',
 )
-# variant parameters must be repeated to read results back
-loaded = ds.get_statistical_tests(
-    group_key='stat_group2',
-    method='welch',
-    keys=['MALAT1'],
-    groups=['g0', 'g1'],
-    alternative='greater',
-)
 
-# overlay significance brackets onto the matching violin panel
+# Pin retrieval to the exact immutable result returned by the run.
+loaded = ds.get_statistical_tests(artifact=result.artifact)
+loaded.tables['MALAT1']
+```
+
+```{code-cell} ipython3
+# The plotted selection and test design must match the stored result.
 figure = ds.plots.distribution(
     ['MALAT1'],
-    group_by='stat_group2',
+    group_by='RNA_clusters',
+    groups=[1, 2],
     kind='violin',
     stats_results=result,
     show=False,

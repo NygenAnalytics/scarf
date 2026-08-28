@@ -3,11 +3,20 @@
 import warnings
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import replace
 from typing import Any, Hashable, Literal
 
 import numpy as np
 import pandas as pd
 
+from ..metadata.selection import valid_category_mask
+from ..metadata.rows import read_metadata_missing_rows
+from ..storage.artifacts import (
+    callable_identity,
+    fingerprint_array,
+    fingerprint_strings,
+    provenance_hash,
+)
 from ._contracts import (
     CategoricalScale,
     CellField,
@@ -49,6 +58,50 @@ def _fetch_cell_column(store: Any, column: str, cell_key: str | None) -> np.ndar
     return np.asarray(store.cells.fetch(column, key=cell_key))
 
 
+def _value_fingerprint(values: Any) -> str:
+    """Match the stable value identity used by statistical-test results."""
+    array = np.asarray(values)
+    if array.dtype.kind in {"O", "S", "U"}:
+        return fingerprint_strings(array)
+    return fingerprint_array(array)
+
+
+def _fetch_metadata_series(
+    store: Any,
+    column: str,
+    cell_key: str | None,
+) -> tuple[np.ndarray, str]:
+    """Return mask-aware metadata values and their stable tested-key identity."""
+    raw_values = _fetch_cell_column(store, column, cell_key)
+    raw_value_fingerprint = _value_fingerprint(raw_values)
+    values = raw_values
+    cell_idx = _cell_index(store, cell_key)
+    missing = read_metadata_missing_rows(store.cells, column, cell_idx)
+    if missing is not None:
+        missing = np.asarray(missing, dtype=bool)
+        if missing.shape != values.shape:
+            raise ValueError(
+                f"Missing-value mask for {column!r} does not match its values"
+            )
+        if missing.any():
+            if values.dtype.kind in {"b", "i", "u", "f", "c"}:
+                values = np.asarray(values, dtype=np.float64).copy()
+            else:
+                values = np.asarray(values, dtype=object).copy()
+            values[missing] = np.nan
+    identity = provenance_hash(
+        {
+            "source": "cell_metadata",
+            "column": column,
+            "values_fingerprint": raw_value_fingerprint,
+            "missing_fingerprint": (
+                _value_fingerprint(missing) if missing is not None else None
+            ),
+        }
+    )
+    return values, identity
+
+
 def _fetch_series(
     store: Any,
     key: str | CellField | FeatureRef,
@@ -56,13 +109,16 @@ def _fetch_series(
     cell_key: str | None,
     from_assay: str | None,
     normalization: NormalizationSpec,
-) -> tuple[np.ndarray, str, bool]:
-    """Return (values, label, is_feature)."""
+) -> tuple[np.ndarray, str, bool, str, str | None]:
+    """Return values, label, feature flag, stable identity, and source assay."""
     if isinstance(key, CellField):
+        values, identity = _fetch_metadata_series(store, key.key, cell_key)
         return (
-            _fetch_cell_column(store, key.key, cell_key),
+            values,
             key.label or key.key,
             False,
+            identity,
+            None,
         )
     if isinstance(key, FeatureRef) or (
         isinstance(key, str) and key not in store.cells.columns
@@ -75,8 +131,23 @@ def _fetch_series(
             cell_idx,
             normalization=normalization,
         )
-        return mat[:, 0], resolved.label, True
-    return _fetch_cell_column(store, str(key), cell_key), str(key), False
+        identity = provenance_hash(
+            {
+                "source": "feature",
+                "assay": resolved.assay,
+                "ids": tuple(str(identifier) for identifier in resolved.ids),
+                "reduction": resolved.reduction,
+            }
+        )
+        return mat[:, 0], resolved.label, True, identity, resolved.assay
+    values, identity = _fetch_metadata_series(store, str(key), cell_key)
+    return (
+        values,
+        str(key),
+        False,
+        identity,
+        None,
+    )
 
 
 def _subsample_frame(
@@ -358,16 +429,22 @@ def _panel_display_frame(
     row_standardize: bool,
 ) -> pd.DataFrame:
     """Build the per-panel display frame (value, group[, split][, sample])."""
+    raw_values = np.asarray(values, dtype=np.float64)
+    if np.isinf(raw_values).any():
+        raise ValueError("Distribution values must not contain infinite entries")
+    finite_values = np.isfinite(raw_values)
+    if not finite_values.any():
+        raise ValueError("No finite values remain for a distribution panel")
     cell_frame = pd.DataFrame(
         {
-            "raw_value": np.asarray(values, dtype=np.float64),
-            "group": groups_arr,
+            "raw_value": raw_values[finite_values],
+            "group": groups_arr[finite_values],
         }
     )
     if split_arr is not None:
-        cell_frame["split"] = split_arr
+        cell_frame["split"] = split_arr[finite_values]
     if sample_arr is not None:
-        cell_frame["sample"] = sample_arr
+        cell_frame["sample"] = sample_arr[finite_values]
         frame = _sample_aggregate(
             cell_frame,
             statistic=sample_stat,
@@ -466,6 +543,13 @@ def _mean_color_limits(
                     lo = color_scale.vcenter - eps
                 if color_scale.vcenter >= hi:
                     hi = color_scale.vcenter + eps
+        if hi == lo:
+            # Quantiles commonly collapse for sparse genes (for example when
+            # most group means are zero). Keep the tied value at the midpoint
+            # while allowing outlying means to clip to a colormap endpoint.
+            pad = max(0.5, abs(lo) * 0.05)
+            lo -= pad
+            hi += pad
         return lo, hi
 
     reference = resolve(pooled)
@@ -486,6 +570,179 @@ def _format_stat_p_text(p_value: float, show_p_value: bool) -> str:
     return f"p={p_value:.2g}"
 
 
+def _result_key_metadata(
+    result: Any,
+    label: str,
+) -> tuple[str | None, str | None, bool, str | None, bool]:
+    """Return one table's tested-key, assay, and realized-value identities."""
+    table_keys = list(result.tables)
+    try:
+        index = table_keys.index(label)
+    except ValueError:
+        return None, None, False, None, False
+    identities = tuple(getattr(result, "tested_features", ()) or ())
+    identity = (
+        identities[index]
+        if index < len(identities) and isinstance(identities[index], str)
+        else None
+    )
+    source_assays = tuple(getattr(result, "source_assays", ()) or ())
+    source_assay_recorded = len(source_assays) == len(table_keys)
+    source_assay = source_assays[index] if source_assay_recorded else None
+    if source_assay is not None and not isinstance(source_assay, str):
+        source_assay_recorded = False
+        source_assay = None
+    value_fingerprints = tuple(getattr(result, "value_fingerprints", ()) or ())
+    value_fingerprint_recorded = len(value_fingerprints) == len(table_keys)
+    value_fingerprint = (
+        value_fingerprints[index] if value_fingerprint_recorded else None
+    )
+    if not isinstance(value_fingerprint, str) or not value_fingerprint:
+        value_fingerprint_recorded = False
+        value_fingerprint = None
+    return (
+        identity,
+        source_assay,
+        source_assay_recorded,
+        value_fingerprint,
+        value_fingerprint_recorded,
+    )
+
+
+def _same_category_universe(left: Sequence[Any], right: Sequence[Any]) -> bool:
+    if len(left) != len(right):
+        return False
+    return all(any(value == candidate for candidate in right) for value in left)
+
+
+def _stat_result_compatibility_issue(
+    result: Any,
+    *,
+    label: str,
+    expected_identity: str,
+    expected_value_fingerprint: str,
+    expected_source_assay: str | None,
+    group_by: str,
+    cell_key: str | None,
+    n_cells: int,
+    n_groups: int,
+    group_order: Sequence[Any],
+    sample_by: str | None,
+    pair_by: str | None,
+    sample_fingerprint: str | None,
+    pair_fingerprint: str | None,
+    sample_stat: str,
+    expression_cutoff: float,
+    normalization: NormalizationSpec,
+    normalization_method: Mapping[str, str] | None,
+    size_factor: float | None,
+    cell_selection_fingerprint: str,
+    group_fingerprint: str,
+) -> str | None:
+    """Explain why a statistical result cannot safely annotate this panel."""
+    if result.group_key != group_by:
+        return "stats_results.group_key does not match group_by"
+    if result.cell_key != cell_key:
+        return "stats_results.cell_key does not match cell_key"
+    if result.n_cells != n_cells:
+        return (
+            f"stats_results was computed on {result.n_cells} cells but the plot "
+            f"shows {n_cells}"
+        )
+    result_n_groups = int(getattr(result, "n_groups", 0) or 0)
+    if result_n_groups != n_groups:
+        return (
+            f"stats_results was computed on {result_n_groups} groups but the plot "
+            f"shows {n_groups}"
+        )
+    if getattr(result, "sample_by", None) != sample_by:
+        return "stats_results.sample_by does not match sample_by"
+    if getattr(result, "pair_by", None) != pair_by:
+        return "stats_results.pair_by does not match the plotted study design"
+    result_sample_fingerprint = getattr(result, "sample_fingerprint", None)
+    if result_sample_fingerprint != sample_fingerprint:
+        if result_sample_fingerprint is None:
+            return "stats_results does not include sample-value identity"
+        return "stats_results sample values do not match the plotted cells"
+    result_pair_fingerprint = getattr(result, "pair_fingerprint", None)
+    if result_pair_fingerprint != pair_fingerprint:
+        if result_pair_fingerprint is None:
+            return "stats_results does not include pair-value identity"
+        return "stats_results pair values do not match the plotted cells"
+    expected_scope = "sample" if sample_by is not None else "cell"
+    result_scope = getattr(result, "summary_scope", expected_scope)
+    if result_scope != expected_scope:
+        return "stats_results.summary_scope does not match the plotted value scope"
+    if sample_by is not None:
+        if getattr(result, "sample_stat", None) != sample_stat:
+            return "stats_results.sample_stat does not match sample_stat"
+        if sample_stat == "fraction" and not np.isclose(
+            float(getattr(result, "expression_cutoff", np.nan)),
+            expression_cutoff,
+            equal_nan=False,
+        ):
+            return "stats_results.expression_cutoff does not match expression_cutoff"
+
+    (
+        result_identity,
+        result_source_assay,
+        source_assay_recorded,
+        result_value_fingerprint,
+        value_fingerprint_recorded,
+    ) = _result_key_metadata(result, label)
+    if result_identity is None:
+        return f"stats_results does not include tested-value identity for {label!r}"
+    if result_identity != expected_identity:
+        return f"stats_results tested-value identity does not match panel {label!r}"
+    if not value_fingerprint_recorded:
+        return f"stats_results does not include realized-value identity for {label!r}"
+    if result_value_fingerprint != expected_value_fingerprint:
+        return f"stats_results realized values do not match panel {label!r}"
+    if not source_assay_recorded:
+        return f"stats_results does not include source-assay identity for {label!r}"
+    if result_source_assay != expected_source_assay:
+        return f"stats_results source assay does not match panel {label!r}"
+
+    result_selection_fingerprint = getattr(
+        result,
+        "cell_selection_fingerprint",
+        None,
+    )
+    if not result_selection_fingerprint:
+        return "stats_results does not include cell-selection identity"
+    if result_selection_fingerprint != cell_selection_fingerprint:
+        return "stats_results cell selection does not match the plotted cells"
+    result_group_fingerprint = getattr(result, "group_fingerprint", None)
+    if not result_group_fingerprint:
+        return "stats_results does not include group-value identity"
+    if result_group_fingerprint != group_fingerprint:
+        return "stats_results group values do not match the plotted cells"
+    result_group_order = tuple(getattr(result, "group_order", ()) or ())
+    if not result_group_order:
+        return "stats_results does not include the tested group universe"
+    if not _same_category_universe(
+        result_group_order,
+        group_order,
+    ):
+        return "stats_results group universe does not match the plotted groups"
+    if expected_source_assay is not None:
+        result_normalization = getattr(result, "normalization", None)
+        if not isinstance(result_normalization, Mapping) or not result_normalization:
+            return "stats_results does not include feature-normalization identity"
+        expected_normalization = {
+            "source": normalization.source,
+            "transform": normalization.transform,
+        }
+        if dict(result_normalization) != expected_normalization:
+            return "stats_results normalization does not match the plotted values"
+        if getattr(result, "normalization_method", None) != normalization_method:
+            return "stats_results assay normalization method does not match the plot"
+        result_size_factor = getattr(result, "size_factor", None)
+        if result_size_factor != size_factor:
+            return "stats_results assay size factor does not match the plot"
+    return None
+
+
 def _annotate_distribution_stats(
     ax: Any,
     frame: pd.DataFrame,
@@ -495,13 +752,15 @@ def _annotate_distribution_stats(
     orientation: Literal["vertical", "horizontal"],
     bracket_height: float,
     show_p_value: bool,
+    annotation_color: str,
 ) -> bool:
     """Draw significance brackets over an existing violin/box panel.
 
     Pure matplotlib: ``ax.plot`` plus ``ax.text`` on positions derived from
     the seaborn category order, so the seaborn backend stays untouched.
-    Pairwise tables provide their own groups; a one-way ANOVA omnibus table
-    spans every displayed group. Returns whether anything was drawn.
+    Pairwise tables provide their own groups; one-way ANOVA and Kruskal-Wallis
+    omnibus tables span every displayed group. Returns whether anything was
+    drawn.
     """
     p_column = "p_value_adjusted" if "p_value_adjusted" in frame.columns else "p_value"
     if p_column not in frame.columns or frame.empty:
@@ -519,7 +778,7 @@ def _annotate_distribution_stats(
             p_value = float(row[p_column])
             if np.isfinite(p_value):
                 rows.append((pos_1, pos_2, p_value))
-    elif method == "one_way_anova":
+    elif method in ("one_way_anova", "kruskal_wallis"):
         p_value = float(frame.iloc[0][p_column])
         rows = (
             [(0, len(group_order) - 1, p_value)]
@@ -542,7 +801,7 @@ def _annotate_distribution_stats(
             ax.plot(
                 [pos_1, pos_1, pos_2, pos_2],
                 [y, elbow, elbow, y],
-                color="black",
+                color=annotation_color,
                 lw=0.9,
                 clip_on=False,
             )
@@ -553,6 +812,7 @@ def _annotate_distribution_stats(
                 ha="center",
                 va="bottom",
                 fontsize=7,
+                color=annotation_color,
             )
             highest = max(highest, elbow + step)
         ax.set_ylim(value_bottom, max(float(base_top), highest))
@@ -566,7 +826,7 @@ def _annotate_distribution_stats(
             ax.plot(
                 [x, elbow, elbow, x],
                 [pos_1, pos_1, pos_2, pos_2],
-                color="black",
+                color=annotation_color,
                 lw=0.9,
                 clip_on=False,
             )
@@ -577,6 +837,7 @@ def _annotate_distribution_stats(
                 ha="left",
                 va="center",
                 fontsize=7,
+                color=annotation_color,
             )
             farthest = max(farthest, elbow + step)
         ax.set_xlim(float(value_left), max(float(base_right), farthest))
@@ -592,11 +853,20 @@ def _render_color_limits(lo: float, hi: float) -> tuple[float, float]:
     return lo - pad, hi + pad
 
 
-def _mean_colorbar_label(color_scale: ColorScale, row_standardize: bool) -> str:
+def _mean_colorbar_label(
+    color_scale: ColorScale,
+    row_standardize: bool,
+    *,
+    all_features: bool,
+) -> str:
     """Label for the mean-expression colourbar, adapted to the value scale."""
     if color_scale.scope == "panel":
-        return "Relative Expression Per Gene"
-    return "mean standardized value" if row_standardize else "mean expression"
+        return (
+            "Relative Expression Per Gene" if all_features else "Relative Value Per Key"
+        )
+    if row_standardize:
+        return "mean standardized value"
+    return "mean expression" if all_features else "mean value"
 
 
 def _mean_group_palette(
@@ -647,7 +917,7 @@ def distribution(
     split_scale: CategoricalScale | None = None,
     kind: DistKind = "violin",
     bins: int = 40,
-    max_points: int | None = None,
+    max_points: int | None = 10000,
     point_size: float = 0.8,
     point_alpha: float = 0.28,
     seed: int = 0,
@@ -669,7 +939,6 @@ def distribution(
     show_legend: bool = True,
     stats_results: Any = None,
     stats_keys: Sequence[str] | None = None,
-    stats_method: str | None = None,
     stats_bracket_height: float | None = None,
     stats_show_p: bool = True,
     show: bool = True,
@@ -689,13 +958,13 @@ def distribution(
     - ``groups``: keep / order these ``group_by`` categories
 
     For violins and boxes, Scarf can overlay a subsample of cells as points.
-    ``max_points`` limits how many points are drawn (``0`` disables points;
-    ``None`` selects the kind default). Stacked violins default to no overlay
-    (``0``), while other kinds default to ``10000``. Histograms always use
-    every selected cell. Regular multi-gene violin and box panels share their
-    value scale by default. Stacked violins keep independent scales unless
-    ``share_y=True``. With horizontal orientation, the same option shares the
-    x-axis value scale.
+    ``max_points`` limits how many points are drawn (``0`` disables points).
+    The public default is ``10000`` for compatibility. Explicit ``None`` uses
+    a kind-specific behavior: no overlay for stacked violins and ``10000`` for
+    other kinds. Histograms always use every selected cell. Regular multi-gene
+    violin and box panels share their value scale by default. Stacked violins
+    keep independent scales unless ``share_y=True``. With horizontal
+    orientation, the same option shares the x-axis value scale.
 
     Set ``sample_by`` or ``study_design`` to summarize cells within biological
     samples before plotting. ``split_by`` draws two violin halves for a second
@@ -705,11 +974,14 @@ def distribution(
     :class:`~scarf.features.statistical.StatisticalTestResult`, or a mapping
     from panel label to one) to annotate significance brackets over the drawn
     violins or boxes. Brackets are pure matplotlib overlays positioned by the
-    displayed category order; pairwise tables place one bracket per row and a
-    one-way ANOVA omnibus result spans every group. The annotation prefers
-    ``p_value_adjusted`` when present. Nothing is recomputed here; when
-    ``stats_results`` does not match the plotted selection, panels are skipped
-    with a warning instead of raising.
+    displayed category order; pairwise tables place one bracket per row, while
+    one-way ANOVA and Kruskal-Wallis omnibus results span every group. A Dunn
+    posthoc table is preferred over its Kruskal-Wallis omnibus table when both
+    are present. The annotation prefers ``p_value_adjusted`` when present.
+    Nothing is recomputed here. Results must carry the selection, grouping,
+    tested-value, assay, sample-design, and normalization identity recorded by
+    ``run_statistical_testing``; incompatible or incomplete results are skipped
+    with a warning. Statistical overlays cannot be combined with ``split_by``.
 
     For ``kind="stacked_violin"``, pass ``color_by="mean"`` to colour each
     stacked violin by its group mean expression on a continuous scale. Pass a
@@ -717,7 +989,8 @@ def distribution(
     ``vmin``/``vmax`` fix explicit limits, ``quantiles`` clips extreme means,
     and ``vcenter`` enables diverging maps. The color scale follows
     ``share_y``: ``scope="shared"`` when ``share_y=True`` and ``scope="panel"``
-    otherwise, unless an explicit ``color_scale.scope`` overrides it. A
+    otherwise. ``ColorScale``'s general ``scope="feature"`` default is treated
+    as automatic here; explicit ``"shared"`` or ``"panel"`` overrides it. A
     ``scope="shared"`` scale is drawn as a colorbar on the right;
     ``scope="panel"`` rescales each row independently and draws a single
     reference colorbar. On caller-supplied axes the colorbar is not drawn;
@@ -726,6 +999,7 @@ def distribution(
     """
     plt, mpl = require_matplotlib()
     normalization = normalization or NormalizationSpec()
+    plot_pair_by: str | None = None
     color_scale_was_explicit = color_scale is not None
     color_scale = color_scale or ColorScale(cmap="viridis")
     if color_scale_was_explicit and color_by != "mean":
@@ -744,11 +1018,20 @@ def distribution(
         else max_points
     )
     if color_by == "mean":
+        automatic_scope: Literal["panel", "shared"] = (
+            "shared" if share_y is True else "panel"
+        )
         if not color_scale_was_explicit:
             color_scale = ColorScale(
                 cmap="viridis",
-                scope="shared" if share_y is True else "panel",
+                scope=automatic_scope,
             )
+        elif color_scale.scope == "feature":
+            # ``feature`` is ColorScale's general-purpose default, but stacked
+            # violin rows are panels. Treat it as an unspecified scope so
+            # callers can customize only the colormap without also having to
+            # learn this plot's panel/shared distinction.
+            color_scale = replace(color_scale, scope=automatic_scope)
         if color_scale.scale != "linear":
             raise NotImplementedError(
                 "distribution mean coloring currently supports only linear color scales"
@@ -787,8 +1070,17 @@ def distribution(
             raise ValueError(
                 "stats annotation applies only to violin, stacked_violin, and box plots"
             )
-        if stats_bracket_height is not None and stats_bracket_height <= 0:
-            raise ValueError("stats_bracket_height must be positive when provided")
+        if stats_bracket_height is not None and (
+            not np.isfinite(stats_bracket_height) or stats_bracket_height <= 0
+        ):
+            raise ValueError(
+                "stats_bracket_height must be finite and positive when provided"
+            )
+        if split_by is not None:
+            raise ValueError(
+                "stats_results cannot be combined with split_by because the "
+                "statistical result has no split-category identity"
+            )
     if violin_linewidth < 0:
         raise ValueError("violin_linewidth must be non-negative")
     if not 0 <= violin_alpha <= 1 or not 0 <= point_alpha <= 1:
@@ -809,6 +1101,8 @@ def distribution(
         if sample_by is not None and sample_by != study_design.sample_by:
             raise ValueError("sample_by conflicts with study_design.sample_by")
         sample_by = study_design.sample_by
+        if stats_results is not None:
+            plot_pair_by = study_design.subject_by or study_design.pair_by
     if kind in ("violin", "stacked_violin", "box"):
         sns = require_seaborn()
     else:
@@ -859,6 +1153,9 @@ def distribution(
         for k in key_list
     ]
     n = len(series_list[0][0])
+    base_cell_idx = _cell_index(store, cell_key)
+    if len(base_cell_idx) != n:
+        raise ValueError("cell selection index length does not match selected cells")
     if group_by is not None:
         groups_arr = _fetch_cell_column(store, group_by, cell_key)
         if len(groups_arr) != n:
@@ -873,31 +1170,107 @@ def distribution(
         if sample_by is not None
         else None
     )
+    pair_arr = (
+        _fetch_cell_column(store, plot_pair_by, cell_key)
+        if plot_pair_by is not None
+        else None
+    )
     if split_arr is not None and len(split_arr) != n:
         raise ValueError("split_by length does not match selected cells")
     if sample_arr is not None and len(sample_arr) != n:
         raise ValueError("sample_by length does not match selected cells")
+    if pair_arr is not None and len(pair_arr) != n:
+        raise ValueError("pair_by length does not match selected cells")
 
     subset_vals = (
         _fetch_cell_column(store, subset_by, cell_key)
         if subset_by is not None
         else None
     )
-    selection_mask, group_order = resolve_cell_selection(
-        n,
-        subset=subset_vals,
-        subset_name=subset_by,
-        category_values=groups_arr if group_by is not None else None,
-        groups=groups,
+    group_missing = (
+        read_metadata_missing_rows(store.cells, group_by, base_cell_idx)
+        if group_by is not None
+        else None
     )
+    sample_missing = (
+        read_metadata_missing_rows(store.cells, sample_by, base_cell_idx)
+        if sample_by is not None
+        else None
+    )
+    pair_missing = (
+        read_metadata_missing_rows(store.cells, plot_pair_by, base_cell_idx)
+        if plot_pair_by is not None
+        else None
+    )
+    split_missing = (
+        read_metadata_missing_rows(store.cells, split_by, base_cell_idx)
+        if split_by is not None
+        else None
+    )
+    subset_missing = (
+        read_metadata_missing_rows(store.cells, subset_by, base_cell_idx)
+        if subset_by is not None
+        else None
+    )
+    if subset_vals is not None:
+        subset_array = np.asarray(subset_vals)
+        if subset_array.dtype != bool:
+            raise TypeError(f"{subset_by!r} must be boolean; got {subset_array.dtype}")
+        if subset_missing is not None:
+            subset_array = subset_array & ~subset_missing
+        subset_vals = subset_array
+    if group_by is None:
+        selection_mask, group_order = resolve_cell_selection(
+            n,
+            subset=subset_vals,
+            subset_name=subset_by,
+        )
+        dropped_group_cells = 0
+    else:
+        subset_mask, _ = resolve_cell_selection(
+            n,
+            subset=subset_vals,
+            subset_name=subset_by,
+        )
+        valid_group = valid_category_mask(
+            groups_arr,
+            missing_mask=group_missing,
+        )
+        dropped_group_cells = int((subset_mask & ~valid_group).sum())
+        subset_mask &= valid_group
+        selection_mask, group_order = resolve_cell_selection(
+            n,
+            subset=subset_mask,
+            subset_name=subset_by,
+            category_values=groups_arr,
+            groups=groups,
+        )
     dropped_sample_cells = 0
     if sample_arr is not None:
-        valid_sample = pd.notna(sample_arr) & (np.asarray(sample_arr, dtype=str) != "")
+        valid_sample = valid_category_mask(
+            sample_arr,
+            missing_mask=sample_missing,
+        )
         dropped_sample_cells = int((selection_mask & ~valid_sample).sum())
         selection_mask &= valid_sample
+    dropped_pair_cells = 0
+    if pair_arr is not None:
+        valid_pair = valid_category_mask(
+            pair_arr,
+            missing_mask=pair_missing,
+        )
+        dropped_pair_cells = int((selection_mask & ~valid_pair).sum())
+        if dropped_pair_cells:
+            raise ValueError(
+                "pair values must be present for every selected cell when "
+                "stats_results uses a paired study design"
+            )
     dropped_split_cells = 0
     if split_arr is not None:
-        valid_split = pd.notna(split_arr) & (np.asarray(split_arr, dtype=str) != "")
+        valid_split = valid_category_mask(
+            split_arr,
+            missing_mask=split_missing,
+        )
         dropped_split_cells = int((selection_mask & ~valid_split).sum())
         selection_mask &= valid_split
     if not selection_mask.any():
@@ -921,20 +1294,39 @@ def distribution(
             ]
         else:
             group_order = sort_categories(observed_values)
+    else:
+        observed = set(pd.unique(groups_arr[selection_mask]))
+        group_order = [value for value in group_order or [] if value in observed]
 
+    selected_cell_idx = np.asarray(base_cell_idx[selection_mask], dtype=np.int64)
     series_list = [
-        (np.asarray(vals)[selection_mask], label, is_feature)
-        for vals, label, is_feature in series_list
+        (
+            np.asarray(vals)[selection_mask],
+            label,
+            is_feature,
+            identity,
+            source_assay,
+        )
+        for vals, label, is_feature, identity, source_assay in series_list
     ]
     groups_arr = groups_arr[selection_mask]
     if split_arr is not None:
         split_arr = split_arr[selection_mask]
     if sample_arr is not None:
         sample_arr = sample_arr[selection_mask]
+    if pair_arr is not None:
+        pair_arr = pair_arr[selection_mask]
     n = int(selection_mask.sum())
-    any_feature = any(is_feature for _, _, is_feature in series_list)
+    cell_selection_fingerprint = _value_fingerprint(selected_cell_idx)
+    group_fingerprint = _value_fingerprint(groups_arr)
+    sample_fingerprint = (
+        _value_fingerprint(sample_arr) if sample_arr is not None else None
+    )
+    pair_fingerprint = _value_fingerprint(pair_arr) if pair_arr is not None else None
+    any_feature = any(is_feature for _, _, is_feature, _, _ in series_list)
+    all_features = all(is_feature for _, _, is_feature, _, _ in series_list)
 
-    panel_keys: list[Hashable] = [label for _, label, _ in series_list]
+    panel_keys: list[Hashable] = [label for _, label, _, _, _ in series_list]
     if len(set(panel_keys)) != len(panel_keys):
         panel_keys = list(range(len(panel_keys)))
 
@@ -993,25 +1385,25 @@ def distribution(
     else:
         n_columns = n_panels
 
-    # Build the per-panel display frames once; the group means that feed the
-    # mean-expression colour scale are derived only when ``color_by="mean"``.
-    panel_display_frames = [
-        _panel_display_frame(
-            np.asarray(vals),
-            groups_arr,
-            split_arr=split_arr,
-            sample_arr=sample_arr,
-            sample_stat=sample_stat,
-            expression_cutoff=expression_cutoff,
-            row_standardize=row_standardize,
-        )
-        for vals, _label, _is_feature in series_list
-    ]
+    # Mean colouring needs a small prepass to resolve shared colour limits.
+    # Retain only one Series of group means per panel, not every cell-level
+    # display frame. The latter can be very large for marker panels.
     panel_group_means: list[pd.Series] | None = None
     mean_limits: list[tuple[float, float]] | None = None
     if color_by == "mean":
         panel_group_means = [
-            _panel_group_means(frame) for frame in panel_display_frames
+            _panel_group_means(
+                _panel_display_frame(
+                    np.asarray(vals),
+                    groups_arr,
+                    split_arr=split_arr,
+                    sample_arr=sample_arr,
+                    sample_stat=sample_stat,
+                    expression_cutoff=expression_cutoff,
+                    row_standardize=row_standardize,
+                )
+            )
+            for vals, _label, _is_feature, _identity, _source_assay in series_list
         ]
         mean_limits, _reference_limits = _mean_color_limits(
             panel_group_means,
@@ -1041,11 +1433,20 @@ def distribution(
     y_limits: list[tuple[float, float]] = []
     panel_tables: list[tuple[str, pd.DataFrame]] = []
     with theme_context(theme):
-        for panel_index, ((vals, label, is_feature), panel_key) in enumerate(
-            zip(series_list, panel_keys)
-        ):
+        for panel_index, (
+            (vals, label, is_feature, _identity, _source_assay),
+            panel_key,
+        ) in enumerate(zip(series_list, panel_keys)):
             ax = axes[panel_key]
-            df = panel_display_frames[panel_index]
+            df = _panel_display_frame(
+                np.asarray(vals),
+                groups_arr,
+                split_arr=split_arr,
+                sample_arr=sample_arr,
+                sample_stat=sample_stat,
+                expression_cutoff=expression_cutoff,
+                row_standardize=row_standardize,
+            )
             table = df.rename(
                 columns={
                     "raw_value": "value",
@@ -1230,18 +1631,29 @@ def distribution(
         stats_methods: set[str] = set()
         stats_adjustments: set[str] = set()
         if stats_results is not None:
+            assert group_by is not None
             display_order = list(group_order or [])
             allowed_stats_keys = (
                 None if stats_keys is None else {str(value) for value in stats_keys}
             )
             warned_validation: set[str] = set()
+            assay_normalization_states: dict[
+                str,
+                tuple[dict[str, str] | None, float | None],
+            ] = {}
 
             def _warn_once(reason_key: str, message: str) -> None:
                 if reason_key not in warned_validation:
-                    warnings.warn(message, UserWarning, stacklevel=2)
+                    warnings.warn(message, UserWarning, stacklevel=3)
                     warned_validation.add(reason_key)
 
-            for index, (_vals, label, _is_feature) in enumerate(series_list):
+            for index, (
+                _vals,
+                _label,
+                _is_feature,
+                expected_identity,
+                expected_source_assay,
+            ) in enumerate(series_list):
                 str_label = str(panel_keys[index])
                 if allowed_stats_keys is not None and str_label not in (
                     allowed_stats_keys
@@ -1254,29 +1666,62 @@ def distribution(
                 )
                 if result_for_panel is None:
                     continue
-                if result_for_panel.group_key != group_by:
+                expected_normalization_method: dict[str, str] | None = None
+                expected_size_factor: float | None = None
+                if (
+                    expected_source_assay is not None
+                    and normalization.source == "assay"
+                ):
+                    if expected_source_assay not in assay_normalization_states:
+                        assay = store._get_assay(expected_source_assay)
+                        raw_size_factor = getattr(assay, "sf", None)
+                        assay_normalization_states[expected_source_assay] = (
+                            callable_identity(assay.normMethod),
+                            (
+                                None
+                                if raw_size_factor is None
+                                else float(raw_size_factor)
+                            ),
+                        )
+                    (
+                        expected_normalization_method,
+                        expected_size_factor,
+                    ) = assay_normalization_states[expected_source_assay]
+                compatibility_issue = _stat_result_compatibility_issue(
+                    result_for_panel,
+                    label=str_label,
+                    expected_identity=expected_identity,
+                    expected_value_fingerprint=_value_fingerprint(
+                        np.asarray(_vals, dtype=np.float64)
+                    ),
+                    expected_source_assay=expected_source_assay,
+                    group_by=group_by,
+                    cell_key=cell_key,
+                    n_cells=n,
+                    n_groups=n_groups,
+                    group_order=display_order,
+                    sample_by=sample_by,
+                    pair_by=plot_pair_by,
+                    sample_fingerprint=sample_fingerprint,
+                    pair_fingerprint=pair_fingerprint,
+                    sample_stat=sample_stat,
+                    expression_cutoff=expression_cutoff,
+                    normalization=normalization,
+                    normalization_method=expected_normalization_method,
+                    size_factor=expected_size_factor,
+                    cell_selection_fingerprint=cell_selection_fingerprint,
+                    group_fingerprint=group_fingerprint,
+                )
+                if compatibility_issue is not None:
                     _warn_once(
-                        "group_by",
-                        "stats_results.group_key does not match group_by; "
-                        "skipping statistical annotations",
+                        compatibility_issue,
+                        compatibility_issue + "; skipping statistical annotations",
                     )
                     continue
-                if result_for_panel.cell_key != cell_key:
-                    _warn_once(
-                        "cell_key",
-                        "stats_results.cell_key does not match cell_key; "
-                        "skipping statistical annotations",
-                    )
-                    continue
-                if result_for_panel.n_cells != n:
-                    _warn_once(
-                        "n_cells",
-                        f"stats_results was computed on {result_for_panel.n_cells} "
-                        f"cells but the plot shows {n}; skipping statistical "
-                        "annotations",
-                    )
-                    continue
-                table_to_annotate = result_for_panel.tables.get(str_label)
+                posthoc_tables = getattr(result_for_panel, "posthoc_tables", {})
+                table_to_annotate = posthoc_tables.get(str_label)
+                if table_to_annotate is None:
+                    table_to_annotate = result_for_panel.tables.get(str_label)
                 if table_to_annotate is None:
                     continue
                 ax_panel = axes[panel_keys[index]]
@@ -1299,11 +1744,40 @@ def distribution(
                     orientation=orientation,
                     bracket_height=float(resolved_height),
                     show_p_value=stats_show_p,
+                    annotation_color=str(mpl.rcParams["text.color"]),
                 ):
                     stats_annotated_any = True
                     stats_annotated_keys.append(str_label)
                     stats_methods.add(result_for_panel.method)
                     stats_adjustments.add(result_for_panel.adjustment_method)
+                else:
+                    _warn_once(
+                        f"unsupported:{result_for_panel.method}",
+                        "stats_results contains no supported pairwise or omnibus "
+                        f"annotation table for method {result_for_panel.method!r}; "
+                        "skipping statistical annotations",
+                    )
+
+        # Brackets extend individual axes. Reapply the shared value range after
+        # every overlay so partial ``stats_keys`` selections and per-panel result
+        # mappings cannot silently undo ``share_y=True``.
+        if stats_annotated_any and resolved_share_y and len(axes) > 1:
+            if orientation == "vertical":
+                value_limits = [ax.get_ylim() for ax in axes.values()]
+                shared_limits = (
+                    min(float(lo) for lo, _hi in value_limits),
+                    max(float(hi) for _lo, hi in value_limits),
+                )
+                for ax in axes.values():
+                    ax.set_ylim(*shared_limits)
+            else:
+                value_limits = [ax.get_xlim() for ax in axes.values()]
+                shared_limits = (
+                    min(float(lo) for lo, _hi in value_limits),
+                    max(float(hi) for _lo, hi in value_limits),
+                )
+                for ax in axes.values():
+                    ax.set_xlim(*shared_limits)
 
         if title is not None:
             fig.suptitle(title)
@@ -1311,7 +1785,7 @@ def distribution(
         # The colorbar is only drawn on figures Scarf owns; caller-supplied
         # axes keep their layout and the limits are exposed through
         # ``PlotResult.legends`` / ``scales`` instead.
-        if render_limits is not None and owns:
+        if render_limits is not None and owns and show_legend:
             lo, hi = render_limits
             mappable = plt.cm.ScalarMappable(
                 cmap=color_scale.cmap or "viridis",
@@ -1331,9 +1805,17 @@ def distribution(
                 fraction=0.04,
                 pad=0.02,
             )
-            colorbar.set_label(_mean_colorbar_label(color_scale, row_standardize))
+            colorbar.set_label(
+                _mean_colorbar_label(
+                    color_scale,
+                    row_standardize,
+                    all_features=all_features,
+                )
+            )
 
-    label_counts = pd.Series([label for _, label, _ in series_list]).value_counts()
+    label_counts = pd.Series(
+        [label for _, label, _, _, _ in series_list]
+    ).value_counts()
     tables = {}
     for index, (label, table) in enumerate(panel_tables):
         table_name = label if label_counts[label] == 1 else f"{index}:{label}"
@@ -1362,7 +1844,11 @@ def distribution(
         legend_specs: tuple[LegendSpec, ...] = (
             LegendSpec(
                 kind="colorbar",
-                label=_mean_colorbar_label(color_scale, row_standardize),
+                label=_mean_colorbar_label(
+                    color_scale,
+                    row_standardize,
+                    all_features=all_features,
+                ),
                 extras={"vmin": lo, "vmax": hi},
             ),
         )
@@ -1412,6 +1898,7 @@ def distribution(
                 "split_by": split_by,
                 "split_order": split_order,
                 "sample_by": sample_by,
+                "pair_by": plot_pair_by,
                 "sample_stat": sample_stat if sample_by is not None else None,
                 "expression_cutoff": (
                     expression_cutoff
@@ -1419,6 +1906,8 @@ def distribution(
                     else None
                 ),
                 "dropped_sample_cells": dropped_sample_cells,
+                "dropped_pair_cells": dropped_pair_cells,
+                "dropped_group_cells": dropped_group_cells,
                 "dropped_split_cells": dropped_split_cells,
                 "subset_by": subset_by,
                 "bins": bins if kind == "hist" else None,

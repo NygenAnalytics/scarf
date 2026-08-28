@@ -41,6 +41,8 @@ import numpy as np
 import pandas as pd
 from scipy.stats import f_oneway, kruskal, norm, ttest_ind, wilcoxon
 
+from ..metadata.selection import valid_category_mask as _valid_group_mask
+from ..storage.refs import ArtifactRef
 from .markers.rank import mannwhitneyu_from_ranks
 
 TestMethod = Literal[
@@ -166,6 +168,19 @@ class StatisticalTestResult:
     n_cells: int = 0
     tested_features: tuple[str, ...] = ()
     summary_scope: SummaryScope = "cell"
+    artifact: ArtifactRef | None = None
+    cell_selection: ArtifactRef | None = None
+    cell_selection_fingerprint: str | None = None
+    group_fingerprint: str | None = None
+    group_order: tuple[Any, ...] = ()
+    normalization: dict[str, str] = field(default_factory=dict)
+    normalization_method: dict[str, str] | None = None
+    size_factor: float | None = None
+    source_assays: tuple[str | None, ...] = ()
+    source_dataset_fingerprint: str | None = None
+    value_fingerprints: tuple[str, ...] = ()
+    sample_fingerprint: str | None = None
+    pair_fingerprint: str | None = None
     tables: dict[str, pd.DataFrame] = field(default_factory=dict)
     posthoc_tables: dict[str, pd.DataFrame] = field(default_factory=dict)
 
@@ -284,36 +299,6 @@ def _maybe_adjust(
     return frame
 
 
-def _is_missing_label(value: object) -> bool:
-    try:
-        return bool(pd.isna(value))
-    except (TypeError, ValueError):
-        return False
-
-
-def _is_valid_group_label(value: object) -> bool:
-    if _is_missing_label(value):
-        return False
-    if isinstance(value, str):
-        return value.strip() != ""
-    return True
-
-
-def _valid_group_mask(groups: np.ndarray) -> np.ndarray:
-    """Mark entries usable as group labels.
-
-    Missing values (NaN, ``None``, pandas NA) are invalid. Empty or
-    whitespace-only labels are invalid only when they were originally
-    strings, so legitimate string categories such as ``"None"`` survive.
-    """
-    arr = np.asarray(groups, dtype=object)
-    return np.fromiter(
-        (_is_valid_group_label(value) for value in arr),
-        dtype=bool,
-        count=arr.size,
-    )
-
-
 def aggregate_samples(
     values: np.ndarray,
     groups: np.ndarray,
@@ -333,25 +318,73 @@ def aggregate_samples(
     Returns a frame with one row per ``(sample, group)`` (and ``pair`` when
     supplied) holding the aggregated ``value``. ``sample_stat`` is ``"mean"``,
     ``"median"``, or ``"fraction"`` (fraction of cells above
-    ``expression_cutoff``). Each sample must map to a single pair key.
+    ``expression_cutoff``). Each retained sample must belong to exactly one
+    group and, when paired, map to exactly one valid pair key. Missing pair
+    keys are rejected rather than treated as a shared pair.
     """
-    frame = pd.DataFrame(
-        {
-            "value": np.asarray(values, dtype=np.float64),
-            "group": np.asarray(groups, dtype=object),
-            "sample": np.asarray(samples, dtype=object),
-        }
-    )
-    valid = pd.notna(frame["sample"]) & (frame["sample"].astype(str) != "")
-    frame = frame.loc[valid]
+    value_array = np.asarray(values, dtype=np.float64)
+    group_array = np.asarray(groups, dtype=object)
+    sample_array = np.asarray(samples, dtype=object)
+    if value_array.ndim != 1:
+        raise ValueError("values must be one-dimensional")
+    if group_array.shape != value_array.shape:
+        raise ValueError("groups length must match values")
+    if sample_array.shape != value_array.shape:
+        raise ValueError("samples length must match values")
+    pair_array: np.ndarray | None = None
+    if pairs is not None:
+        pair_array = np.asarray(pairs, dtype=object)
+        if pair_array.shape != value_array.shape:
+            raise ValueError("pairs length must match values")
+
+    columns: dict[str, np.ndarray] = {
+        "value": value_array,
+        "group": group_array,
+        "sample": sample_array,
+    }
+    if pair_array is not None:
+        columns["pair"] = pair_array
+    frame = pd.DataFrame(columns)
+    valid = _valid_group_mask(frame["sample"].to_numpy(dtype=object, copy=False))
+    frame = frame.loc[valid].copy()
     if frame.empty:
         raise ValueError("No selected cells have a valid sample value")
-    if pairs is not None:
-        frame["pair"] = np.asarray(pairs, dtype=object)
-        pair_counts = frame.groupby("sample", observed=False)["pair"].nunique()
-        if (pair_counts > 1).any():
+    sample_group_counts = frame.groupby(
+        "sample",
+        observed=False,
+        sort=False,
+    )["group"].nunique(dropna=False)
+    if (sample_group_counts != 1).any():
+        samples_in_multiple_groups = sample_group_counts[
+            sample_group_counts != 1
+        ].index[:5]
+        examples = ", ".join(repr(sample) for sample in samples_in_multiple_groups)
+        raise ValueError(
+            "Each sample must belong to exactly one group; samples observed in "
+            f"multiple groups include {examples}. Use distinct sample ids per "
+            "condition and pair_by to identify repeated subjects."
+        )
+    if pair_array is not None:
+        valid_pairs = _valid_group_mask(
+            frame["pair"].to_numpy(dtype=object, copy=False)
+        )
+        if not np.all(valid_pairs):
+            raise ValueError(
+                "pairs must contain a valid pair value for every cell with a "
+                "valid sample"
+            )
+        pair_counts = frame.groupby(
+            "sample",
+            observed=False,
+            sort=False,
+        )["pair"].nunique(dropna=False)
+        if (pair_counts != 1).any():
             raise ValueError("Each sample must map to exactly one pair key")
-    grouped = frame.groupby(["sample", "group"], observed=False)["value"]
+    grouped = frame.groupby(
+        ["sample", "group"],
+        observed=False,
+        sort=False,
+    )["value"]
     if sample_stat == "mean":
         values_by_group = grouped.mean()
     elif sample_stat == "median":
@@ -365,8 +398,12 @@ def aggregate_samples(
     else:
         raise ValueError("sample_stat must be 'mean', 'median', or 'fraction'")
     out = values_by_group.rename("value").reset_index()
-    if pairs is not None:
-        pair_for_sample = frame.groupby("sample", observed=False)["pair"].first()
+    if pair_array is not None:
+        pair_for_sample = frame.groupby(
+            "sample",
+            observed=False,
+            sort=False,
+        )["pair"].first()
         out["pair"] = out["sample"].map(pair_for_sample)
     return out
 
@@ -476,7 +513,10 @@ def _welch_ttest(
         df_stat = (
             float(numerator / denominator) if denominator > 0 else float(n1 + n2 - 2)
         )
-    if not np.isfinite(statistic) or not np.isfinite(p_value):
+    all_tied = bool(np.all(m1 == m1[0]) and np.all(m2 == m1[0]))
+    if np.isnan(statistic) or np.isnan(p_value):
+        if not all_tied:
+            raise ValueError("welch returned an undefined statistic for these values")
         statistic = 0.0
         p_value = 1.0
     if not np.isfinite(df_stat):
@@ -524,7 +564,12 @@ def _one_way_anova(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         statistic, p_value = f_oneway(*group_values)
-    if not np.isfinite(statistic) or not np.isfinite(p_value):
+    all_tied = bool(np.all(values == values[0]))
+    if np.isnan(statistic) or np.isnan(p_value):
+        if not all_tied:
+            raise ValueError(
+                "one_way_anova returned an undefined statistic for these values"
+            )
         statistic = 0.0
         p_value = 1.0
     return pd.DataFrame(
@@ -709,7 +754,8 @@ def compare_group_distributions(
     When ``samples`` is provided, cells are aggregated to biological samples
     first using ``sample_stat``. ``pairs`` (a subject or donor id per cell)
     enables the paired Wilcoxon signed-rank test, which is only meaningful on
-    aggregated sample data and therefore requires ``samples`` too.
+    aggregated sample data and therefore requires ``samples`` too. Pair keys
+    are rejected for explicitly selected independent tests rather than ignored.
 
     ``test`` is ``"auto"`` (pick by design: paired -> Wilcoxon, two groups ->
     Mann-Whitney, three or more -> Kruskal-Wallis), one of the non-parametric
@@ -720,14 +766,15 @@ def compare_group_distributions(
     them raises ``ValueError``.
 
     ``alternative`` sets the alternative hypothesis direction for Welch's
-    t-test; other tests ignore it and remain two-sided. ``posthoc="dunn"``
-    adds pairwise Dunn's tests after Kruskal-Wallis and preserves the omnibus
-    result in the returned :class:`GroupComparisonResult`. ``comparisons``
-    restricts the pairwise rows to the listed group pairs. ``group_order``
-    fixes the group order (and therefore the contrast direction) exactly;
-    when omitted, first-seen order is used. ``adjustment`` corrects p-values
-    within the returned tables when they hold multiple comparisons; pass
-    ``"none"`` to adjust across keys in the caller instead.
+    t-test; other tests require ``"two-sided"``. ``posthoc="dunn"`` adds
+    pairwise Dunn's tests after Kruskal-Wallis and preserves the omnibus result
+    in the returned :class:`GroupComparisonResult`. ``comparisons`` restricts
+    the pairwise rows to the listed group pairs. ``group_order`` selects and
+    orders the groups (and therefore fixes the contrast direction) exactly;
+    when omitted, first-seen order is used, including after sample aggregation.
+    ``adjustment`` corrects p-values within the returned tables when they hold
+    multiple comparisons; pass ``"none"`` to adjust across keys in the caller
+    instead.
 
     Returns:
         A :class:`GroupComparisonResult` whose ``table`` is the primary test
@@ -745,20 +792,38 @@ def compare_group_distributions(
         raise ValueError("values must contain only finite entries")
     if posthoc not in (None, "dunn"):
         raise ValueError("posthoc must be 'dunn' or None")
+    if adjustment not in ("fdr_bh", "bonferroni", "holm", "none"):
+        raise ValueError("adjustment must be 'fdr_bh', 'bonferroni', 'holm', or 'none'")
     if alternative not in _ALTERNATIVES:
         raise ValueError(
             f"alternative must be 'two-sided', 'less', or 'greater'; got {alternative!r}"
         )
-    if comparisons is not None and not comparisons:
-        raise ValueError("comparisons must be non-empty when provided")
+    if comparisons is not None:
+        comparisons = tuple(
+            (_native(left), _native(right)) for left, right in comparisons
+        )
+        if len(comparisons) == 0:
+            raise ValueError("comparisons must be non-empty when provided")
     if samples is not None:
         samples = np.asarray(samples, dtype=object)
         if samples.shape != values.shape:
             raise ValueError("samples length must match values")
+    elif sample_stat != "mean" or expression_cutoff != 0.0:
+        raise ValueError(
+            "sample_stat and expression_cutoff require samples; cell-level "
+            "tests do not use aggregation parameters"
+        )
+    if samples is not None and sample_stat != "fraction" and expression_cutoff != 0.0:
+        raise ValueError("expression_cutoff is only used with sample_stat='fraction'")
     if pairs is not None:
         pairs = np.asarray(pairs, dtype=object)
         if pairs.shape != values.shape:
             raise ValueError("pairs length must match values")
+    if pairs is not None and test not in ("auto", "wilcoxon"):
+        raise ValueError(
+            "pairs is only supported with test='auto' or test='wilcoxon'; "
+            "independent tests do not model pairing"
+        )
     if test in _CELL_LEVEL_PARAMETRIC_TESTS and (
         samples is not None or pairs is not None
     ):
@@ -772,6 +837,11 @@ def compare_group_distributions(
             "the explicit cell-level parametric welch/t_test and "
             f"one_way_anova; {test!r} is a non-parametric-phase alias with "
             "no implementation."
+        )
+    if alternative != "two-sided" and test not in ("welch", "t_test"):
+        raise ValueError(
+            "alternative is only supported for test='welch' or test='t_test'; "
+            "other tests are two-sided"
         )
     if group_order is not None:
         ordered_check = [_native(value) for value in group_order]
@@ -802,6 +872,18 @@ def compare_group_distributions(
     if len(values) == 0:
         raise ValueError("No values remain after dropping missing groups")
 
+    pre_aggregation_order = resolve_group_order(groups, group_order=group_order)
+    if group_order is not None:
+        selected = (
+            pd.Series(groups, dtype=object).isin(pre_aggregation_order).to_numpy()
+        )
+        values = values[selected]
+        groups = groups[selected]
+        if samples is not None:
+            samples = samples[selected]
+        if pairs is not None:
+            pairs = pairs[selected]
+
     aggregated: pd.DataFrame | None = None
     if samples is not None or pairs is not None:
         if pairs is not None and samples is None:
@@ -822,7 +904,11 @@ def compare_group_distributions(
         groups = aggregated["group"].to_numpy(dtype=object)
         pairs = aggregated["pair"].to_numpy(dtype=object) if pairs is not None else None
 
-    present = resolve_group_order(groups, group_order=group_order)
+    if group_order is None:
+        surviving = set(resolve_group_order(groups))
+        present = [group for group in pre_aggregation_order if group in surviving]
+    else:
+        present = resolve_group_order(groups, group_order=pre_aggregation_order)
     if comparisons is not None:
         present_set = set(present)
         for left, right in comparisons:
@@ -855,6 +941,13 @@ def compare_group_distributions(
         )
     if posthoc == "dunn" and test != "kruskal_wallis":
         raise ValueError("posthoc='dunn' requires test='kruskal_wallis'")
+    if comparisons is not None and (
+        test == "one_way_anova" or (test == "kruskal_wallis" and posthoc is None)
+    ):
+        raise ValueError(
+            "comparisons is only supported by pairwise tests or "
+            "kruskal_wallis with posthoc='dunn'"
+        )
 
     if test == "wilcoxon":
         if pairs is None:

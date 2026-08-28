@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import matplotlib
 import numpy as np
+import pandas as pd
 import pytest
 
 matplotlib.use("Agg")
@@ -19,9 +20,13 @@ class _SyntheticCells:
     def __init__(self, **columns):
         self._columns = {name: np.asarray(values) for name, values in columns.items()}
         self.columns = tuple(self._columns)
+        self.N = len(next(iter(self._columns.values())))
 
     def fetch(self, column, key="I"):
         assert key == "I"
+        return self._columns[column]
+
+    def fetch_all(self, column):
         return self._columns[column]
 
     def active_index(self, key="I"):
@@ -33,6 +38,68 @@ def _synthetic_plot_store(**columns):
     return SimpleNamespace(
         cells=_SyntheticCells(**columns),
         _defaultAssay="RNA",
+    )
+
+
+def _synthetic_stats_result(
+    store,
+    table,
+    *,
+    method="welch",
+    posthoc_table=None,
+    sample_by=None,
+    pair_by=None,
+    sample_stat="mean",
+    expression_cutoff=0.0,
+):
+    from scarf.plotting.distribution import _value_fingerprint
+    from scarf.storage.artifacts import provenance_hash
+
+    values = store.cells.fetch("metric")
+    groups = store.cells.fetch("group")
+    unique_groups = list(pd.unique(groups))
+    cell_selection = store.cells.active_index("I")
+    samples = store.cells.fetch(sample_by) if sample_by is not None else None
+    pairs = store.cells.fetch(pair_by) if pair_by is not None else None
+    return SimpleNamespace(
+        method=method,
+        posthoc="dunn" if posthoc_table is not None else None,
+        adjustment_method="fdr_bh",
+        group_key="group",
+        cell_key="I",
+        sample_by=sample_by,
+        pair_by=pair_by,
+        sample_stat=sample_stat,
+        expression_cutoff=expression_cutoff,
+        n_groups=len(unique_groups),
+        n_cells=len(values),
+        tested_features=(
+            provenance_hash(
+                {
+                    "source": "cell_metadata",
+                    "column": "metric",
+                    "values_fingerprint": _value_fingerprint(values),
+                    "missing_fingerprint": None,
+                }
+            ),
+        ),
+        value_fingerprints=(_value_fingerprint(np.asarray(values, dtype=np.float64)),),
+        summary_scope="sample" if sample_by is not None else "cell",
+        tables={"metric": table},
+        posthoc_tables=({"metric": posthoc_table} if posthoc_table is not None else {}),
+        cell_selection=None,
+        cell_selection_fingerprint=_value_fingerprint(cell_selection),
+        group_fingerprint=_value_fingerprint(groups),
+        group_order=tuple(sorted(unique_groups, key=str)),
+        normalization={},
+        normalization_method=None,
+        size_factor=None,
+        source_assays=(None,),
+        sample_fingerprint=(
+            _value_fingerprint(samples) if samples is not None else None
+        ),
+        pair_fingerprint=_value_fingerprint(pairs) if pairs is not None else None,
+        artifact=None,
     )
 
 
@@ -1558,21 +1625,26 @@ def test_stacked_violin_scope_follows_share_y(umap, leiden_clustering, datastore
         shared.close()
 
 
-def test_stacked_violin_mean_color_rejects_feature_scope(
+def test_stacked_violin_mean_color_default_scale_scope_is_ergonomic(
     umap, leiden_clustering, datastore
 ):
     gene = _expressed_gene_names(datastore, n=1)[0]
-    with pytest.raises(ValueError, match="scope must be 'shared' or 'panel'"):
-        splt.distribution(
-            datastore,
-            keys=gene,
-            group_by="RNA_leiden_cluster",
-            kind="stacked_violin",
-            color_by="mean",
-            color_scale=splt.ColorScale(),
-            max_points=0,
-            show=False,
-        )
+    result = splt.distribution(
+        datastore,
+        keys=gene,
+        group_by="RNA_leiden_cluster",
+        kind="stacked_violin",
+        color_by="mean",
+        color_scale=splt.ColorScale(cmap="magma"),
+        max_points=0,
+        show=False,
+    )
+    try:
+        scale = next(s for s in result.scales if isinstance(s, splt.ColorScale))
+        assert scale.scope == "panel"
+        assert scale.cmap == "magma"
+    finally:
+        result.close()
 
 
 def test_stacked_violin_mean_color_no_colorbar_on_target(
@@ -1603,8 +1675,6 @@ def test_stacked_violin_mean_color_no_colorbar_on_target(
 
 
 def test_stacked_violin_mean_color_missing_group_missing_color():
-    import pandas as pd
-
     from scarf.plotting.distribution import _mean_group_palette
 
     means = pd.Series({"a": 1.0, "b": np.nan})
@@ -1643,13 +1713,16 @@ def test_stacked_violin_mean_color_vcenter_extends_bounds(
         result.close()
 
 
-def test_stacked_violin_defaults_to_no_overlay(umap, leiden_clustering, datastore):
+def test_stacked_violin_explicit_none_uses_no_overlay(
+    umap, leiden_clustering, datastore
+):
     gene = _expressed_gene_names(datastore, n=1)[0]
     result = splt.distribution(
         datastore,
         keys=gene,
         group_by="RNA_leiden_cluster",
         kind="stacked_violin",
+        max_points=None,
         show=False,
     )
     try:
@@ -1743,4 +1816,662 @@ def test_stacked_violin_panel_scope_rejects_bounds(umap, leiden_clustering, data
             color_scale=splt.ColorScale(scope="panel", vcenter=0.0),
             max_points=0,
             show=False,
+        )
+
+
+def test_stacked_violin_sparse_quantile_limits_preserve_outlier_color():
+    from scarf.plotting.distribution import _mean_color_limits, _mean_group_palette
+
+    means = pd.Series({"a": 0.0, "b": 0.0, "c": 0.0, "d": 0.0, "e": 10.0})
+    scale = splt.ColorScale(scope="shared", quantiles=(0.25, 0.75))
+
+    limits, reference = _mean_color_limits([means], scale)
+    palette = _mean_group_palette(
+        means,
+        list(means.index),
+        color_scale=scale,
+        lo=limits[0][0],
+        hi=limits[0][1],
+    )
+
+    assert reference[0] < 0 < reference[1]
+    assert palette["a"] != palette["e"]
+
+
+def test_stacked_violin_mean_color_honors_hidden_legend_and_generic_label():
+    store = _synthetic_plot_store(
+        I=np.ones(12, dtype=bool),
+        group=np.repeat(["a", "b", "c"], 4),
+        metric=np.arange(12, dtype=float),
+    )
+    result = splt.distribution(
+        store,
+        "metric",
+        group_by="group",
+        kind="stacked_violin",
+        color_by="mean",
+        color_scale=splt.ColorScale(scope="shared"),
+        max_points=0,
+        show_legend=False,
+        show=False,
+    )
+    try:
+        assert len(result.figure.axes) == 1
+        assert result.legends[0].label == "mean value"
+    finally:
+        result.close()
+
+
+def test_stacked_violin_public_default_keeps_point_overlay():
+    store = _synthetic_plot_store(
+        I=np.ones(12, dtype=bool),
+        group=np.repeat(["a", "b", "c"], 4),
+        metric=np.arange(12, dtype=float),
+    )
+    result = splt.distribution(
+        store,
+        "metric",
+        group_by="group",
+        kind="stacked_violin",
+        show=False,
+    )
+    try:
+        assert result.provenance.extras["max_points"] == 10000
+        assert any(
+            len(collection.get_offsets()) > 1
+            for collection in result.axes["metric"].collections
+            if hasattr(collection, "get_offsets")
+        )
+    finally:
+        result.close()
+
+
+def test_distribution_public_signature_preserves_compatibility_defaults():
+    from inspect import signature
+
+    from scarf.datastore._plot_accessor import DataStorePlotAccessor
+
+    function_parameters = signature(splt.distribution).parameters
+    accessor_parameters = signature(DataStorePlotAccessor.distribution).parameters
+    assert function_parameters["max_points"].default == 10000
+    assert accessor_parameters["max_points"].default == 10000
+    assert "stats_method" not in function_parameters
+    assert "stats_method" not in accessor_parameters
+
+
+@pytest.mark.parametrize(
+    ("orientation", "posthoc_table", "expected_text"),
+    [
+        ("vertical", None, "p=0.02"),
+        (
+            "horizontal",
+            pd.DataFrame({"group_1": ["a"], "group_2": ["c"], "p_value": [0.01]}),
+            "p=0.01",
+        ),
+    ],
+)
+def test_distribution_annotates_kruskal_omnibus_and_dunn_posthoc(
+    orientation,
+    posthoc_table,
+    expected_text,
+):
+    store = _synthetic_plot_store(
+        I=np.ones(12, dtype=bool),
+        group=np.repeat(["a", "b", "c"], 4),
+        metric=np.arange(12, dtype=float),
+    )
+    result_table = pd.DataFrame(
+        {"kruskal_statistic": [7.0], "df": [2.0], "p_value": [0.02]}
+    )
+    stats = _synthetic_stats_result(
+        store,
+        result_table,
+        method="kruskal_wallis",
+        posthoc_table=posthoc_table,
+    )
+    result = splt.distribution(
+        store,
+        "metric",
+        group_by="group",
+        orientation=orientation,
+        max_points=0,
+        stats_results=stats,
+        show=False,
+    )
+    try:
+        assert expected_text in [
+            text.get_text() for text in result.axes["metric"].texts
+        ]
+        assert result.provenance.extras["stats_annotated"] is True
+    finally:
+        result.close()
+
+
+def test_distribution_stats_rejects_same_size_different_identity():
+    store = _synthetic_plot_store(
+        I=np.ones(12, dtype=bool),
+        group=np.repeat(["a", "b", "c"], 4),
+        metric=np.arange(12, dtype=float),
+    )
+    table = pd.DataFrame({"group_1": ["a"], "group_2": ["b"], "p_value": [0.01]})
+    stats = _synthetic_stats_result(store, table)
+    stats.cell_selection_fingerprint = "different-selection"
+
+    with pytest.warns(UserWarning, match="cell selection does not match"):
+        result = splt.distribution(
+            store,
+            "metric",
+            group_by="group",
+            max_points=0,
+            stats_results=stats,
+            show=False,
+        )
+    try:
+        assert result.provenance.extras["stats_annotated"] is False
+        assert not result.axes["metric"].texts
+    finally:
+        result.close()
+
+    incomplete_stats = _synthetic_stats_result(store, table)
+    incomplete_stats.cell_selection_fingerprint = None
+    with pytest.warns(UserWarning, match="does not include cell-selection identity"):
+        result = splt.distribution(
+            store,
+            "metric",
+            group_by="group",
+            max_points=0,
+            stats_results=incomplete_stats,
+            show=False,
+        )
+    result.close()
+
+
+def test_distribution_stats_rejects_changed_assay_normalization_state():
+    from scarf.plotting.distribution import (
+        _stat_result_compatibility_issue,
+        _value_fingerprint,
+    )
+
+    store = _synthetic_plot_store(
+        I=np.ones(12, dtype=bool),
+        group=np.repeat(["a", "b", "c"], 4),
+        metric=np.arange(12, dtype=float),
+    )
+    table = pd.DataFrame({"group_1": ["a"], "group_2": ["b"], "p_value": [0.01]})
+    stats = _synthetic_stats_result(store, table)
+    stats.source_assays = ("RNA",)
+    stats.normalization = {"source": "assay", "transform": "none"}
+    stats.normalization_method = {"module": "old", "qualname": "normalize"}
+    stats.size_factor = 1_000.0
+    values = store.cells.fetch("metric")
+    groups = store.cells.fetch("group")
+    cells = store.cells.active_index("I")
+
+    def compatibility_issue(*, method, size_factor):
+        return _stat_result_compatibility_issue(
+            stats,
+            label="metric",
+            expected_identity=stats.tested_features[0],
+            expected_value_fingerprint=stats.value_fingerprints[0],
+            expected_source_assay="RNA",
+            group_by="group",
+            cell_key="I",
+            n_cells=len(values),
+            n_groups=3,
+            group_order=("a", "b", "c"),
+            sample_by=None,
+            pair_by=None,
+            sample_fingerprint=None,
+            pair_fingerprint=None,
+            sample_stat="mean",
+            expression_cutoff=0.0,
+            normalization=splt.NormalizationSpec(),
+            normalization_method=method,
+            size_factor=size_factor,
+            cell_selection_fingerprint=_value_fingerprint(cells),
+            group_fingerprint=_value_fingerprint(groups),
+        )
+
+    assert "normalization method" in compatibility_issue(
+        method={"module": "new", "qualname": "normalize"},
+        size_factor=1_000.0,
+    )
+    assert "size factor" in compatibility_issue(
+        method=stats.normalization_method,
+        size_factor=2_000.0,
+    )
+
+
+def test_distribution_stats_and_plot_drop_the_same_invalid_group_labels():
+    from scarf.plotting.distribution import _value_fingerprint
+
+    store = _synthetic_plot_store(
+        I=np.ones(8, dtype=bool),
+        group=np.array(["a", "a", "b", "b", None, "", "   ", np.nan], dtype=object),
+        metric=np.arange(8, dtype=float),
+    )
+    table = pd.DataFrame({"group_1": ["a"], "group_2": ["b"], "p_value": [0.01]})
+    stats = _synthetic_stats_result(store, table)
+    retained = np.arange(4, dtype=np.int64)
+    stats.n_cells = 4
+    stats.n_groups = 2
+    stats.cell_selection_fingerprint = _value_fingerprint(retained)
+    stats.group_fingerprint = _value_fingerprint(store.cells.fetch("group")[:4])
+    stats.group_order = ("a", "b")
+    stats.value_fingerprints = (_value_fingerprint(store.cells.fetch("metric")[:4]),)
+
+    result = splt.distribution(
+        store,
+        "metric",
+        group_by="group",
+        max_points=0,
+        stats_results=stats,
+        show=False,
+    )
+    try:
+        assert result.provenance.n_cells == 4
+        assert result.provenance.extras["dropped_group_cells"] == 4
+        assert result.provenance.extras["stats_annotated"] is True
+    finally:
+        result.close()
+
+
+def test_distribution_stats_rejects_sample_and_split_mismatches():
+    store = _synthetic_plot_store(
+        I=np.ones(12, dtype=bool),
+        group=np.repeat(["a", "b", "c"], 4),
+        split=np.tile(["x", "y"], 6),
+        sample=np.repeat(["s1", "s2", "s3", "s4"], 3),
+        pair=np.repeat(["p1", "p2", "p3", "p4"], 3),
+        metric=np.arange(12, dtype=float),
+    )
+    table = pd.DataFrame({"group_1": ["a"], "group_2": ["b"], "p_value": [0.01]})
+    sample_stats = _synthetic_stats_result(store, table, sample_by="sample")
+
+    with pytest.warns(UserWarning, match="sample_by does not match"):
+        result = splt.distribution(
+            store,
+            "metric",
+            group_by="group",
+            max_points=0,
+            stats_results=sample_stats,
+            show=False,
+        )
+    result.close()
+
+    sample_identity_stats = _synthetic_stats_result(
+        store,
+        table,
+        sample_by="sample",
+    )
+    sample_identity_stats.sample_fingerprint = "different-samples"
+    with pytest.warns(UserWarning, match="sample values do not match"):
+        result = splt.distribution(
+            store,
+            "metric",
+            group_by="group",
+            sample_by="sample",
+            max_points=0,
+            stats_results=sample_identity_stats,
+            show=False,
+        )
+    result.close()
+
+    paired_stats = _synthetic_stats_result(
+        store,
+        table,
+        sample_by="sample",
+        pair_by="pair",
+    )
+    with pytest.warns(UserWarning, match="pair_by does not match"):
+        result = splt.distribution(
+            store,
+            "metric",
+            group_by="group",
+            sample_by="sample",
+            max_points=0,
+            stats_results=paired_stats,
+            show=False,
+        )
+    result.close()
+
+    matching_paired_stats = _synthetic_stats_result(
+        store,
+        table,
+        sample_by="sample",
+        pair_by="pair",
+    )
+    result = splt.distribution(
+        store,
+        "metric",
+        group_by="group",
+        study_design=splt.StudyDesign(sample_by="sample", subject_by="pair"),
+        max_points=0,
+        stats_results=matching_paired_stats,
+        show=False,
+    )
+    try:
+        assert result.provenance.extras["stats_annotated"] is True
+        assert result.provenance.extras["pair_by"] == "pair"
+    finally:
+        result.close()
+
+    with pytest.raises(ValueError, match="cannot be combined with split_by"):
+        splt.distribution(
+            store,
+            "metric",
+            group_by="group",
+            split_by="split",
+            stats_results=sample_stats,
+            show=False,
+        )
+
+
+@pytest.mark.parametrize("orientation", ["vertical", "horizontal"])
+def test_distribution_stats_preserve_shared_value_axis(orientation):
+    store = _synthetic_plot_store(
+        I=np.ones(12, dtype=bool),
+        group=np.repeat(["a", "b", "c"], 4),
+        metric=np.arange(12, dtype=float),
+        metric2=np.arange(12, dtype=float) * 10,
+    )
+    table = pd.DataFrame({"group_1": ["a"], "group_2": ["b"], "p_value": [0.01]})
+    stats = _synthetic_stats_result(store, table)
+
+    result = splt.distribution(
+        store,
+        ["metric", "metric2"],
+        group_by="group",
+        orientation=orientation,
+        share_y=True,
+        max_points=0,
+        stats_results=stats,
+        stats_keys=["metric"],
+        show=False,
+    )
+    try:
+        limits = [
+            axis.get_ylim() if orientation == "vertical" else axis.get_xlim()
+            for axis in result.axes.values()
+        ]
+        assert limits[0] == pytest.approx(limits[1])
+    finally:
+        result.close()
+
+
+def test_distribution_study_design_pair_is_not_resolved_without_stats():
+    store = _synthetic_plot_store(
+        I=np.ones(8, dtype=bool),
+        group=np.repeat(["a", "b"], 4),
+        sample=np.repeat(["s1", "s2", "s3", "s4"], 2),
+        pair=np.array(["p1", "p1", "p2", "p2", "p3", "p3", None, None]),
+        metric=np.arange(8, dtype=float),
+    )
+
+    result = splt.distribution(
+        store,
+        "metric",
+        group_by="group",
+        study_design=splt.StudyDesign(sample_by="sample", subject_by="pair"),
+        max_points=0,
+        show=False,
+    )
+    try:
+        assert result.provenance.n_cells == 8
+        assert set(result.tables["metric"]["sample"]) == {"s1", "s2", "s3", "s4"}
+        assert result.provenance.extras["pair_by"] is None
+        assert result.provenance.extras["dropped_pair_cells"] == 0
+    finally:
+        result.close()
+
+
+def test_distribution_paired_stats_reject_missing_pair_values():
+    store = _synthetic_plot_store(
+        I=np.ones(8, dtype=bool),
+        group=np.repeat(["a", "b"], 4),
+        sample=np.repeat(["s1", "s2", "s3", "s4"], 2),
+        pair=np.array(["p1", "p1", "p2", "p2", "p3", "p3", None, None]),
+        metric=np.arange(8, dtype=float),
+    )
+    table = pd.DataFrame({"group_1": ["a"], "group_2": ["b"], "p_value": [0.01]})
+    stats = _synthetic_stats_result(
+        store,
+        table,
+        method="wilcoxon",
+        sample_by="sample",
+        pair_by="pair",
+    )
+
+    with pytest.raises(ValueError, match="pair values must be present"):
+        splt.distribution(
+            store,
+            "metric",
+            group_by="group",
+            study_design=splt.StudyDesign(sample_by="sample", subject_by="pair"),
+            max_points=0,
+            stats_results=stats,
+            show=False,
+        )
+
+
+def test_distribution_stats_annotations_use_theme_foreground():
+    from scarf.plotting._style import foreground_color
+
+    store = _synthetic_plot_store(
+        I=np.ones(12, dtype=bool),
+        group=np.repeat(["a", "b", "c"], 4),
+        metric=np.arange(12, dtype=float),
+    )
+    table = pd.DataFrame({"group_1": ["a"], "group_2": ["b"], "p_value": [0.01]})
+    stats = _synthetic_stats_result(store, table)
+
+    result = splt.distribution(
+        store,
+        "metric",
+        group_by="group",
+        theme="dark",
+        max_points=0,
+        stats_results=stats,
+        show=False,
+    )
+    try:
+        bracket = next(
+            line for line in result.axes["metric"].lines if len(line.get_xdata()) == 4
+        )
+        assert bracket.get_color() == foreground_color("dark")
+        assert result.axes["metric"].texts[0].get_color() == foreground_color("dark")
+    finally:
+        result.close()
+
+
+def test_distribution_stats_annotations_use_custom_dark_theme_foreground():
+    theme_name = "test-distribution-custom-dark"
+    splt.register_theme(theme_name, {"font.size": 9}, base="dark", overwrite=True)
+    store = _synthetic_plot_store(
+        I=np.ones(12, dtype=bool),
+        group=np.repeat(["a", "b", "c"], 4),
+        metric=np.arange(12, dtype=float),
+    )
+    table = pd.DataFrame({"group_1": ["a"], "group_2": ["b"], "p_value": [0.01]})
+    stats = _synthetic_stats_result(store, table)
+
+    result = splt.distribution(
+        store,
+        "metric",
+        group_by="group",
+        theme=theme_name,
+        max_points=0,
+        stats_results=stats,
+        show=False,
+    )
+    try:
+        bracket = next(
+            line for line in result.axes["metric"].lines if len(line.get_xdata()) == 4
+        )
+        assert bracket.get_color() == "#e8e8e8"
+        assert result.axes["metric"].texts[0].get_color() == "#e8e8e8"
+    finally:
+        result.close()
+
+
+def test_distribution_stats_rejects_changed_realized_values():
+    store = _synthetic_plot_store(
+        I=np.ones(12, dtype=bool),
+        group=np.repeat(["a", "b", "c"], 4),
+        metric=np.arange(12, dtype=float),
+    )
+    table = pd.DataFrame({"group_1": ["a"], "group_2": ["b"], "p_value": [0.01]})
+    stats = _synthetic_stats_result(store, table)
+    stats.value_fingerprints = ("different-values",)
+
+    with pytest.warns(UserWarning, match="realized values do not match"):
+        result = splt.distribution(
+            store,
+            "metric",
+            group_by="group",
+            max_points=0,
+            stats_results=stats,
+            show=False,
+        )
+    try:
+        assert result.provenance.extras["stats_annotated"] is False
+        assert not result.axes["metric"].texts
+    finally:
+        result.close()
+
+
+@pytest.mark.parametrize("height", [0.0, -1.0, np.nan, np.inf, -np.inf])
+def test_distribution_stats_bracket_height_requires_finite_positive_value(height):
+    store = _synthetic_plot_store(
+        I=np.ones(6, dtype=bool),
+        group=np.repeat(["a", "b"], 3),
+        metric=np.arange(6, dtype=float),
+    )
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        splt.distribution(
+            store,
+            "metric",
+            group_by="group",
+            stats_results=object(),
+            stats_bracket_height=height,
+            show=False,
+        )
+
+
+def test_distribution_masks_metadata_placeholders_per_panel():
+    from scarf.plotting.distribution import _fetch_series, _value_fingerprint
+    from scarf.storage.artifacts import provenance_hash
+
+    class MaskedCells(_SyntheticCells):
+        def __init__(self, missing_masks, **columns):
+            super().__init__(**columns)
+            self.missing_masks = {
+                key: np.asarray(value, dtype=bool)
+                for key, value in missing_masks.items()
+            }
+
+        def _get_missing_mask_array(self, column):
+            return self.missing_masks.get(column)
+
+    columns = {
+        "I": np.ones(6, dtype=bool),
+        "group": np.repeat(["a", "b"], 3),
+        "sample": np.repeat(["s1", "s2"], 3),
+        "metric": np.array([1.0, 999.0, 0.0, 0.0, 2.0, 2.0]),
+    }
+    masked_store = SimpleNamespace(
+        cells=MaskedCells(
+            {"metric": np.array([False, True, False, False, False, False])},
+            **columns,
+        ),
+        _defaultAssay="RNA",
+    )
+    plain_store = _synthetic_plot_store(**columns)
+    masked_values, _label, _is_feature, masked_identity, _assay = _fetch_series(
+        masked_store,
+        "metric",
+        cell_key="I",
+        from_assay=None,
+        normalization=splt.NormalizationSpec(),
+    )
+    _values, _label, _is_feature, plain_identity, _assay = _fetch_series(
+        plain_store,
+        "metric",
+        cell_key="I",
+        from_assay=None,
+        normalization=splt.NormalizationSpec(),
+    )
+    assert np.isnan(masked_values[1])
+    assert masked_identity == provenance_hash(
+        {
+            "source": "cell_metadata",
+            "column": "metric",
+            "values_fingerprint": _value_fingerprint(columns["metric"]),
+            "missing_fingerprint": _value_fingerprint(
+                np.array([False, True, False, False, False, False])
+            ),
+        }
+    )
+    assert masked_identity != plain_identity
+
+    result = splt.distribution(
+        masked_store,
+        "metric",
+        group_by="group",
+        sample_by="sample",
+        sample_stat="fraction",
+        expression_cutoff=0.0,
+        max_points=0,
+        show=False,
+    )
+    try:
+        sample_a = result.tables["metric"].set_index("sample").loc["s1"]
+        assert sample_a["value"] == pytest.approx(0.5)
+        assert sample_a["nCells"] == 2
+    finally:
+        result.close()
+
+
+def test_distribution_masked_subset_still_requires_boolean_dtype():
+    class MaskedSubsetCells(_SyntheticCells):
+        def _get_missing_mask_array(self, column):
+            if column == "subset":
+                return np.zeros(self.N, dtype=bool)
+            return None
+
+    store = SimpleNamespace(
+        cells=MaskedSubsetCells(
+            I=np.ones(6, dtype=bool),
+            group=np.repeat(["a", "b"], 3),
+            subset=np.array([0, 1, 1, 0, 1, 1], dtype=np.int64),
+            metric=np.arange(6, dtype=float),
+        ),
+        _defaultAssay="RNA",
+    )
+
+    with pytest.raises(TypeError, match="must be boolean"):
+        splt.distribution(
+            store,
+            "metric",
+            group_by="group",
+            subset_by="subset",
+            max_points=0,
+            show=False,
+        )
+
+
+@pytest.mark.parametrize("infinite", [np.inf, -np.inf])
+def test_distribution_panel_rejects_infinite_values(infinite):
+    from scarf.plotting.distribution import _panel_display_frame
+
+    with pytest.raises(ValueError, match="infinite entries"):
+        _panel_display_frame(
+            np.array([0.0, infinite]),
+            np.array(["a", "a"], dtype=object),
+            split_arr=None,
+            sample_arr=np.array(["s1", "s1"], dtype=object),
+            sample_stat="fraction",
+            expression_cutoff=0.0,
+            row_standardize=False,
         )

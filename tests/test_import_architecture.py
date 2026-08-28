@@ -432,16 +432,25 @@ def test_extracted_domains_have_only_narrow_storage_dependencies():
             "genomic/melding.py",
             "markers/batching.py",
             "markers/search.py",
+            "statistical.py",
         },
         "neighbors": set(),
         "quality_control": {"doublets.py"},
     }
     for package_name, allowed_storage_importers in storage_exceptions.items():
         assert _upward_imports(package_name, forbidden) == set()
-        storage_importers = {
-            path for path, target in _upward_imports(package_name, {"storage"})
-        }
+        storage_edges = _upward_imports(package_name, {"storage"})
+        storage_importers = {path for path, _target in storage_edges}
         assert storage_importers == allowed_storage_importers
+        if package_name == "features":
+            statistical_imports = _root_imports(
+                _SCARF_ROOT / "features" / "statistical.py"
+            )
+            assert {
+                target
+                for target in statistical_imports
+                if target == "storage" or target.startswith("storage.")
+            } == {"storage.refs"}
 
 
 def test_read_paths_take_chunk_geometry_only_from_the_storage_geometry_module():

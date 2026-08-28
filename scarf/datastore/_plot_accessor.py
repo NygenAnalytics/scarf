@@ -561,7 +561,7 @@ class DataStorePlotAccessor:
         split_scale: "CategoricalScale | None" = None,
         kind: "DistKind" = "violin",
         bins: int = 40,
-        max_points: int | None = None,
+        max_points: int | None = 10000,
         point_size: float = 0.8,
         point_alpha: float = 0.28,
         seed: int = 0,
@@ -583,7 +583,6 @@ class DataStorePlotAccessor:
         show_legend: bool = True,
         stats_results: Any = None,
         stats_keys: Sequence[str] | None = None,
-        stats_method: str | None = None,
         stats_bracket_height: float | None = None,
         stats_show_p: bool = True,
         show: bool = True,
@@ -593,7 +592,9 @@ class DataStorePlotAccessor:
         ``stats_results`` overlays significance brackets from
         ``run_statistical_testing`` results onto the drawn violins or
         boxes; see :func:`scarf.plotting.distribution` for the full
-        behaviour.
+        behaviour. ``max_points`` defaults to ``10000``; explicit ``None``
+        disables the point overlay for stacked violins and otherwise uses
+        ``10000``.
         """
         from ..plotting import distribution
 
@@ -637,7 +638,6 @@ class DataStorePlotAccessor:
             show_legend=show_legend,
             stats_results=stats_results,
             stats_keys=stats_keys,
-            stats_method=stats_method,
             stats_bracket_height=stats_bracket_height,
             stats_show_p=stats_show_p,
             show=show,

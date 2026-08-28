@@ -31,6 +31,15 @@ def test_metadata_fetch(dummy_metadata):
     assert len(dummy_metadata.fetch_all("I")) == 9
 
 
+def test_metadata_insert_encodes_none_as_missing_text(dummy_metadata):
+    values = np.array(["a", None, "b", "", "a", "b", "a", "b", "a"], dtype=object)
+
+    dummy_metadata.insert("group", values)
+
+    stored = dummy_metadata.fetch_all("group")
+    assert stored.tolist() == ["a", "", "b", "", "a", "b", "a", "b", "a"]
+
+
 def test_metadata_verify_bool(dummy_metadata):
     assert dummy_metadata._verify_bool("I") is True
 
