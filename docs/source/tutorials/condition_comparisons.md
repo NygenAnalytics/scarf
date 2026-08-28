@@ -24,7 +24,7 @@ It tells you which genes shift between conditions and how strongly, but it is no
 
 ## Prerequisites
 
-- Scarf installed (see {doc}`quickstart`)
+- Scarf installed (see {doc}`/quickstart`)
 - Network access to download the dataset on first run
 
 ## What you will learn
