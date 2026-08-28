@@ -36,7 +36,7 @@ image = (
     )
     .uv_sync(
         groups=["docs-modal"],
-        extras=["docs", "extra"],
+        extras=["agent", "docs", "extra"],
         frozen=True,
         extra_options="--no-default-groups",
         env={"HNSWLIB_NO_NATIVE": "1"},

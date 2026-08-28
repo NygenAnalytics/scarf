@@ -220,6 +220,31 @@ def test_group_order_is_first_seen_when_not_provided():
     assert resolve_group_order(groups) == ["b", "a"]
 
 
+def test_group_order_filters_omitted_groups_before_dunn():
+    values = np.arange(1, 17, dtype=np.float64)
+    groups = np.repeat(np.array(["a", "b", "c", "omitted"], dtype=object), 4)
+    selected_order = ["a", "b", "c"]
+
+    from_full = compare_group_distributions(
+        values,
+        groups,
+        test="kruskal_wallis",
+        posthoc="dunn",
+        group_order=selected_order,
+    )
+    selected = groups != "omitted"
+    from_filtered = compare_group_distributions(
+        values[selected],
+        groups[selected],
+        test="kruskal_wallis",
+        posthoc="dunn",
+        group_order=selected_order,
+    )
+
+    pd.testing.assert_frame_equal(from_full.table, from_filtered.table)
+    pd.testing.assert_frame_equal(from_full.posthoc_table, from_filtered.posthoc_table)
+
+
 def test_dunn_comparisons_restricts_pairs():
     rng = np.random.default_rng(5)
     values = rng.normal(size=90)
@@ -238,6 +263,25 @@ def test_dunn_comparisons_restricts_pairs():
         (reference["group_1"] == "g0") & (reference["group_2"] == "g2")
     ]
     assert np.isclose(table.loc[0, "z"], expected["z"].iloc[0])
+
+
+def test_dunn_accepts_numpy_comparison_sequence():
+    rng = np.random.default_rng(51)
+    values = rng.normal(size=90)
+    groups = _seeded_groups(rng, 90, 3)
+
+    table = compare_group_distributions(
+        values,
+        groups,
+        test="kruskal_wallis",
+        posthoc="dunn",
+        comparisons=np.array([["g0", "g2"]], dtype=object),
+    ).posthoc_table
+
+    assert table is not None
+    assert table[["group_1", "group_2"]].to_dict("records") == [
+        {"group_1": "g0", "group_2": "g2"}
+    ]
 
 
 def test_dunn_comparisons_missing_group_raises():
@@ -276,7 +320,7 @@ def test_wilcoxon_matches_scipy_on_aggregated_pairs():
         rng.normal(1.2, 1, n),
         rng.normal(0, 1, n),
     )
-    samples = np.array([f"s{i // 8}" for i in range(n)], dtype=object)
+    samples = np.array([f"s{i // 8}_{groups[i]}" for i in range(n)], dtype=object)
     pairs = np.array([f"d{i // 8}" for i in range(n)], dtype=object)
     table = compare_group_distributions(
         values,
@@ -308,7 +352,7 @@ def test_wilcoxon_rejects_duplicate_pair_groups():
     n = 40
     values = rng.normal(size=n)
     groups = np.array([f"g{i % 2}" for i in range(n)], dtype=object)
-    samples = np.array([f"s{i // 2}" for i in range(n)], dtype=object)
+    samples = np.array([f"s{i // 2}_{groups[i]}" for i in range(n)], dtype=object)
     pairs = np.array([f"d{i // 4}" for i in range(n)], dtype=object)
     with pytest.raises(ValueError, match="Duplicate \\(pair, group\\)"):
         compare_group_distributions(
@@ -350,7 +394,7 @@ def test_aggregate_samples_semantics():
     n = 32
     values = rng.poisson(3, n).astype(float)
     groups = np.array([f"g{i % 2}" for i in range(n)], dtype=object)
-    samples = np.array([f"s{i // 4}" for i in range(n)], dtype=object)
+    samples = np.array([f"s{i // 4}_{groups[i]}" for i in range(n)], dtype=object)
     mean_frame = aggregate_samples(values, groups, samples, sample_stat="mean")
     median_frame = aggregate_samples(values, groups, samples, sample_stat="median")
     frac_frame = aggregate_samples(
@@ -372,6 +416,15 @@ def test_aggregate_samples_semantics():
         assert np.isclose(row["value"], float(np.mean(cells > 1.0)))
 
 
+def test_aggregate_samples_rejects_sample_in_multiple_groups():
+    values = np.arange(6, dtype=np.float64)
+    groups = np.array(["a", "a", "b", "b", "a", "b"], dtype=object)
+    samples = np.array(["a0", "shared", "b0", "shared", "a1", "b1"])
+
+    with pytest.raises(ValueError, match="exactly one group"):
+        aggregate_samples(values, groups, samples)
+
+
 def test_aggregate_samples_rejects_multiple_pairs_per_sample():
     rng = np.random.default_rng(12)
     n = 40
@@ -381,6 +434,53 @@ def test_aggregate_samples_rejects_multiple_pairs_per_sample():
     pairs = np.array([f"d{i % 8}" for i in range(n)], dtype=object)
     with pytest.raises(ValueError, match="exactly one pair key"):
         aggregate_samples(values, groups, samples, pairs=pairs)
+
+
+@pytest.mark.parametrize("missing_pair", [None, np.nan, "", "   "])
+def test_aggregate_samples_rejects_missing_pair_values(missing_pair):
+    values = np.arange(8, dtype=np.float64)
+    groups = np.array(["a", "b"] * 4, dtype=object)
+    samples = np.array([f"s{i // 2}_{groups[i]}" for i in range(8)], dtype=object)
+    pairs = np.array(["p0", "p0", "p1", "p1", "p2", "p2", "p3", "p3"], dtype=object)
+    pairs[2] = missing_pair
+
+    with pytest.raises(ValueError, match="valid pair value for every cell"):
+        aggregate_samples(values, groups, samples, pairs=pairs)
+
+
+def test_aggregate_samples_aligns_pairs_after_dropping_missing_samples():
+    values = np.arange(6, dtype=np.float64)
+    groups = np.array(["a", "a", "b", "b", "a", "b"], dtype=object)
+    samples = np.array(
+        [None, "s1", "s2", "s2", "s3_a", "s3_b"],
+        dtype=object,
+    )
+    pairs = np.array(["ignored", "p1", "p2", "p2", "p3", "p3"], dtype=object)
+
+    aggregated = aggregate_samples(values, groups, samples, pairs=pairs)
+
+    assert aggregated["sample"].tolist() == ["s1", "s2", "s3_a", "s3_b"]
+    assert aggregated["pair"].tolist() == ["p1", "p2", "p3", "p3"]
+
+
+def test_sample_aggregation_preserves_first_seen_group_order():
+    values = np.array([10.0, 1.0, 11.0, 2.0, 12.0, 3.0, 13.0, 4.0])
+    groups = np.array(["b", "a"] * 4, dtype=object)
+    samples = np.array(
+        ["s2_b", "s2_a", "s2_b", "s2_a", "s1_b", "s1_a", "s1_b", "s1_a"],
+        dtype=object,
+    )
+
+    table = compare_group_distributions(
+        values,
+        groups,
+        test="mann_whitney",
+        samples=samples,
+    ).table
+
+    assert table.loc[0, "group_1"] == "b"
+    assert table.loc[0, "group_2"] == "a"
+    assert table.loc[0, "mean_difference"] == 9.0
 
 
 def test_auto_selects_test_by_design():
@@ -395,7 +495,10 @@ def test_auto_selects_test_by_design():
         compare_group_distributions(values3, groups3).table.columns[0]
         == "kruskal_statistic"
     )
-    samples = np.array([f"s{i // 4}" for i in range(80)], dtype=object)
+    samples = np.array(
+        [f"s{i // 4}_{groups2[i]}" for i in range(80)],
+        dtype=object,
+    )
     pairs = np.array([f"d{i // 4}" for i in range(80)], dtype=object)
     paired_table = compare_group_distributions(
         values2,
@@ -438,6 +541,8 @@ def test_compare_rejects_bad_inputs():
         compare_group_distributions(values, groups, test="bogus")
     with pytest.raises(ValueError, match="posthoc must be"):
         compare_group_distributions(values, groups, posthoc="bonferroni")
+    with pytest.raises(ValueError, match="adjustment must be"):
+        compare_group_distributions(values, groups, adjustment="bogus")
     single = values[:20]
     single_groups = np.full(20, "g0", dtype=object)
     with pytest.raises(ValueError, match="two populated groups"):
@@ -462,8 +567,62 @@ def test_compare_validates_auxiliary_arrays():
         compare_group_distributions(
             values,
             groups,
-            samples=np.array(["s"] * 40, dtype=object),
+            samples=np.array([f"s_{groups[i]}" for i in range(40)], dtype=object),
             pairs=np.array(["d"] * 39, dtype=object),
+        )
+
+
+def test_compare_rejects_unused_aggregation_parameters():
+    values = np.arange(6, dtype=float)
+    groups = np.array(["a", "a", "a", "b", "b", "b"], dtype=object)
+    samples = np.array(["s0", "s0", "s1", "s2", "s2", "s3"], dtype=object)
+
+    with pytest.raises(ValueError, match="require samples"):
+        compare_group_distributions(values, groups, sample_stat="median")
+    with pytest.raises(ValueError, match="require samples"):
+        compare_group_distributions(values, groups, expression_cutoff=1.0)
+    with pytest.raises(ValueError, match="only used with sample_stat='fraction'"):
+        compare_group_distributions(
+            values,
+            groups,
+            samples=samples,
+            sample_stat="mean",
+            expression_cutoff=1.0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("test", "posthoc"),
+    [("one_way_anova", None), ("kruskal_wallis", None)],
+)
+def test_compare_rejects_comparisons_for_omnibus_only_tests(test, posthoc):
+    values = np.arange(9, dtype=float)
+    groups = np.repeat(np.array(["a", "b", "c"], dtype=object), 3)
+
+    with pytest.warns(UserWarning, match="Cell-level"):
+        with pytest.raises(ValueError, match="comparisons is only supported"):
+            compare_group_distributions(
+                values,
+                groups,
+                test=test,
+                posthoc=posthoc,
+                comparisons=[("a", "b")],
+            )
+
+
+def test_compare_rejects_pairing_for_independent_tests():
+    values = np.arange(8, dtype=np.float64)
+    groups = np.array(["a", "b"] * 4, dtype=object)
+    samples = np.array([f"s{i // 2}_{groups[i]}" for i in range(8)], dtype=object)
+    pairs = np.array([f"p{i // 2}" for i in range(8)], dtype=object)
+
+    with pytest.raises(ValueError, match="independent tests do not model pairing"):
+        compare_group_distributions(
+            values,
+            groups,
+            test="mann_whitney",
+            samples=samples,
+            pairs=pairs,
         )
 
 
@@ -540,7 +699,10 @@ def test_cell_level_testing_warns_user():
     groups = _seeded_groups(rng, 40, 2)
     with pytest.warns(UserWarning, match="descriptive distribution testing"):
         compare_group_distributions(values, groups, test="mann_whitney")
-    samples = np.array([f"s{i // 4}" for i in range(40)], dtype=object)
+    samples = np.array(
+        [f"s{i // 4}_{groups[i]}" for i in range(40)],
+        dtype=object,
+    )
     with warnings.catch_warnings():
         warnings.simplefilter("error", UserWarning)
         compare_group_distributions(
@@ -638,6 +800,17 @@ def test_welch_alternative_less_and_greater():
     )
 
 
+def test_welch_preserves_constant_separation():
+    values = np.concatenate([np.zeros(4), np.ones(4)])
+    groups = np.array(["a"] * 4 + ["b"] * 4, dtype=object)
+
+    table = compare_group_distributions(values, groups, test="welch").table
+
+    assert np.isneginf(table.loc[0, "t_statistic"])
+    assert table.loc[0, "p_value"] == 0.0
+    assert table.loc[0, "mean_difference"] == -1.0
+
+
 def test_welch_requires_two_groups_and_cells():
     rng = np.random.default_rng(32)
     values = rng.normal(size=90)
@@ -682,6 +855,38 @@ def test_one_way_anova_handles_all_tied_values():
     assert table.loc[0, "df_within"] == 57
 
 
+def test_one_way_anova_preserves_constant_separation():
+    values = np.concatenate([np.zeros(4), np.ones(4), np.full(4, 2.0)])
+    groups = np.repeat(np.array(["a", "b", "c"], dtype=object), 4)
+
+    table = compare_group_distributions(values, groups, test="one_way_anova").table
+
+    assert np.isposinf(table.loc[0, "f_statistic"])
+    assert table.loc[0, "p_value"] == 0.0
+
+
+def test_one_way_anova_group_order_filters_values_and_degrees_of_freedom():
+    values = np.arange(1, 17, dtype=np.float64)
+    groups = np.repeat(np.array(["a", "b", "c", "omitted"], dtype=object), 4)
+
+    table = compare_group_distributions(
+        values,
+        groups,
+        test="one_way_anova",
+        group_order=["a", "b", "c"],
+    ).table
+    expected_stat, expected_p = f_oneway(
+        values[groups == "a"],
+        values[groups == "b"],
+        values[groups == "c"],
+    )
+
+    assert table.loc[0, "f_statistic"] == pytest.approx(float(expected_stat))
+    assert table.loc[0, "p_value"] == pytest.approx(float(expected_p))
+    assert table.loc[0, "df_between"] == 2
+    assert table.loc[0, "df_within"] == 9
+
+
 def test_compare_rejects_bad_alternative_and_mismatched_posthoc():
     rng = np.random.default_rng(35)
     values = rng.normal(size=60)
@@ -704,6 +909,23 @@ def test_compare_rejects_bad_alternative_and_mismatched_posthoc():
         )
     with pytest.raises(NotImplementedError, match="non-parametric-phase"):
         compare_group_distributions(values, groups, test="student_t_test")
+
+
+@pytest.mark.parametrize(
+    "test",
+    ["auto", "mann_whitney", "kruskal_wallis", "wilcoxon", "one_way_anova"],
+)
+def test_directional_alternative_rejected_for_unsupported_tests(test):
+    values = np.arange(60, dtype=np.float64)
+    groups = _seeded_groups(np.random.default_rng(37), 60, 3)
+
+    with pytest.raises(ValueError, match="alternative is only supported"):
+        compare_group_distributions(
+            values,
+            groups,
+            test=test,
+            alternative="greater",
+        )
 
 
 def test_group_order_controls_welch_direction():
@@ -778,3 +1000,23 @@ def test_statistical_test_result_is_frozen():
     )
     with pytest.raises(AttributeError):
         result.method = "kruskal_wallis"
+
+
+def test_statistical_test_result_identity_defaults_are_optional():
+    result = StatisticalTestResult(
+        method="mann_whitney",
+        posthoc=None,
+        adjustment_method="fdr_bh",
+        group_key="grp",
+        cell_key="I",
+    )
+
+    assert result.artifact is None
+    assert result.cell_selection is None
+    assert result.cell_selection_fingerprint is None
+    assert result.group_fingerprint is None
+    assert result.group_order == ()
+    assert result.normalization == {}
+    assert result.source_assays == ()
+    assert result.source_dataset_fingerprint is None
+    assert result.value_fingerprints == ()

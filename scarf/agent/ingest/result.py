@@ -3,16 +3,16 @@
 from collections.abc import Sequence
 from typing import Any
 
-from .._deps import AGENT_INSTALL_HINT
-from ..types import Decision, NeedsInput, StageStatus
+from ..config._deps import AGENT_INSTALL_HINT
+from ..types import AgentDataModel, Decision, NeedsInput, StageStatus
 
 try:
-    from pydantic import BaseModel, Field
+    from pydantic import Field
 except ImportError as exc:
     raise ImportError(AGENT_INSTALL_HINT) from exc
 
 
-class IngestResult(BaseModel):
+class IngestResult(AgentDataModel):
     status: StageStatus
     format: str | None = None
     zarrPath: str | None = None
@@ -23,6 +23,19 @@ class IngestResult(BaseModel):
     actions: list[str] = Field(default_factory=list)
     acceptedActions: list[dict[str, Any]] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def get_blank(cls) -> "IngestResult":
+        return cls(status="failed")
+
+    @classmethod
+    def get_example(cls) -> "IngestResult":
+        return cls(
+            status="done",
+            format="h5ad",
+            zarrPath="dataset.zarr",
+            assayNames=["RNA"],
+        )
 
 
 def done(

@@ -380,7 +380,6 @@ _CONTRACTS = (
         },
         signature_only={
             **_classified("transformed", "keys", "test", "study_design"),
-            **_classified("execution", "subset_by"),
             **_classified("publication", "skip_save"),
         },
         model_only={
@@ -389,6 +388,7 @@ _CONTRACTS = (
                 "cell_selection",
                 "normalization_method",
                 "size_factor",
+                "source_dataset_fingerprint",
             ),
             **_classified(
                 "derived",
@@ -397,8 +397,9 @@ _CONTRACTS = (
                 "n_groups",
                 "n_cells",
                 "key_labels",
-                "cell_selection_hash",
+                "cell_selection_fingerprint",
                 "tested_features",
+                "source_assays",
                 "group_fingerprint",
                 "subset_fingerprint",
                 "sample_fingerprint",

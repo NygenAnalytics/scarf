@@ -40,6 +40,21 @@ def test_agent_guide_and_llms_index_are_published() -> None:
     assert html_extra_path == [["llms.txt"]]
 
 
+def test_executable_agent_workflow_is_published_and_discoverable() -> None:
+    toctree = (_DOCS_SOURCE / "toctree.yml").read_text()
+    workflow = (_DOCS_SOURCE / "tutorials" / "agent_workflow.md").read_text()
+    discovery_routes = {
+        _DOCS_SOURCE / "index.md": "{doc}`tutorials/agent_workflow`",
+        _DOCS_SOURCE / "analysis_with_agents.md": ("{doc}`tutorials/agent_workflow`"),
+        _DOCS_SOURCE / "llms.txt": "tutorials/agent_workflow.html",
+    }
+
+    assert re.search(r"(?m)^\s*- file: tutorials/agent_workflow\s*$", toctree)
+    assert "```{code-cell} ipython3" in workflow
+    for source, expected_link in discovery_routes.items():
+        assert expected_link in source.read_text(), source
+
+
 def test_agent_guide_is_linked_from_discovery_routes() -> None:
     routes = {
         _REPOSITORY_ROOT / "README.md": (

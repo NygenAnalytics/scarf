@@ -6,6 +6,7 @@
 
 - [Home](index.html): design, implemented methods, validation, and current boundaries
 - [Analysis with AI agents](analysis_with_agents.html): scientific decision loop, state inspection, task routing, troubleshooting, and handoff
+- [Grounded agent workflow](tutorials/agent_workflow.html): executable enrichment, design, tuning, and biological-interpretation handoffs
 - [Quick start](quickstart.html): minimal count-to-cluster workflow
 - [API reference](reference/api.html): exact public signatures and result contracts
 
