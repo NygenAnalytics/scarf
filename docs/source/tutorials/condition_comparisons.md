@@ -47,8 +47,10 @@ Download the published store, repack its counts, and mount a writable analysis c
 Statistical results are persisted as artifacts, so the store must be writable.
 
 ```{code-cell} ipython3
-import tempfile
 from pathlib import Path
+from tempfile import TemporaryDirectory
+
+import numpy as np
 
 import scarf
 from scarf.tools.repack_zarr import repack_store
