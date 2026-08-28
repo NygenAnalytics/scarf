@@ -13,7 +13,7 @@ SPHINXPROJ    = Scarf
 help:
 	@$(SPHINXBUILD) -M help "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
 
-.PHONY: help Makefile execute-docs execute-docs-modal execute-page execute-vignette execute-vignettes resume-docs resume-docs-modal validate-cache prune-stale-cache html execute-notebooks-all nitpick coverage check-reference
+.PHONY: help Makefile execute-docs execute-docs-modal execute-page execute-vignette execute-vignettes resume-docs resume-docs-modal validate validate-cache prune-stale-cache html execute-notebooks-all nitpick coverage check-reference
 
 
 # Execute one doc page locally and update docs/.jupyter_cache.
@@ -35,13 +35,15 @@ resume-docs:
 # Execute all pages concurrently on Modal and publish the cache locally.
 # Set PAGES="cite_seq batch_correction" for a partial run.
 execute-docs-modal:
-	@cd .. && MODAL_ENVIRONMENT=scarf_profiling uv run --group docs-modal --extra docs --extra extra modal run -m docs.modal_docs $(if $(strip $(PAGES)),--pages "$(strip $(PAGES))",)
+	@cd .. && MODAL_ENVIRONMENT=scarf_profiling uv run --group docs-modal --extra agent --extra docs --extra extra modal run -m docs.modal_docs $(if $(strip $(PAGES)),--pages "$(strip $(PAGES))",)
 
 # Resume the failed Modal run scope using matching staged page results.
 resume-docs-modal:
-	@cd .. && MODAL_ENVIRONMENT=scarf_profiling uv run --group docs-modal --extra docs --extra extra modal run -m docs.modal_docs --resume $(if $(strip $(PAGES)),--pages "$(strip $(PAGES))",)
+	@cd .. && MODAL_ENVIRONMENT=scarf_profiling uv run --group docs-modal --extra agent --extra docs --extra extra modal run -m docs.modal_docs --resume $(if $(strip $(PAGES)),--pages "$(strip $(PAGES))",)
 
 # Validate the committed cache without changing it.
+validate: validate-cache
+
 validate-cache:
 	@uv run python execute_all_vignettes.py --validate
 

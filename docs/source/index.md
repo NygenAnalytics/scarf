@@ -27,6 +27,7 @@ inputs and parameters produced each result.
 - {ref}`Install Scarf <installation>`
 - Follow the {ref}`Quick start <quickstart>`
 - Use {doc}`analysis_with_agents` to route an autonomous or AI-assisted analysis
+- Run the executable {doc}`tutorials/agent_workflow` for the four grounded agent stages
 - Read {doc}`scanpy_and_seurat` if you already use Scanpy or Seurat
 - See {doc}`concepts/benchmarks` for measured end-to-end scale and stage timings
 

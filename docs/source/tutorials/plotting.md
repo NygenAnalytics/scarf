@@ -356,14 +356,17 @@ ds.plots.composition(
 Violins (or boxes, histograms, ECDFs) are useful for QC metrics or genes split by cluster.
 Groups are colored distinctly.
 `max_points` limits how many individual cells are overlaid as points (`0` turns points off).
-Use the same selection knobs as embeddings: `subset_by` for a boolean cell column and `groups` to keep and order categories from `group_by`.
+Pass a categorical `CellField` and an exact cell-selection artifact. Use `subset_by` for an
+additional boolean cell column and `groups` to keep and order categories from the grouping.
 Several gene keys share a y-axis scale and wrap into a grid.
 
 ```{code-cell} ipython3
 cluster_ids = sorted(set(ds.cells.fetch("clusters")), key=str)[:6]
+active_cells = ds.snapshot_cell_selection("I")
 ds.plots.distribution(
     keys=["RNA_nCounts", "RNA_nFeatures"],
-    group_by="clusters",
+    grouping=splt.CellField("clusters"),
+    cell_selection=active_cells,
     groups=cluster_ids,
     kind="violin",
     max_points=2000,
@@ -377,7 +380,8 @@ This is useful when the question is whether a small marker panel separates the a
 ```{code-cell} ipython3
 ds.plots.distribution(
     keys=["Gcg", "Ins2", "Sst"],
-    group_by="clusters",
+    grouping=splt.CellField("clusters"),
+    cell_selection=active_cells,
     groups=["Alpha", "Beta", "Delta"],
     normalization=splt.NormalizationSpec(transform="log1p"),
     kind="stacked_violin",
@@ -392,7 +396,8 @@ For replicated studies, `sample_by` summarizes biological samples rather than pl
 ```{code-cell} ipython3
 ds.plots.distribution(
     keys="Ins2",
-    group_by="clusters",
+    grouping=splt.CellField("clusters"),
+    cell_selection=active_cells,
     groups=["Alpha", "Beta", "Delta"],
     sample_by="demo_sample",
     split_by="demo_condition",

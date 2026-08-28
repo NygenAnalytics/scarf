@@ -241,3 +241,16 @@ bandwidth, and stores all source refs plus modality weights in one immutable int
 
 Keep RNA, ADT, SNN, and WNN refs when comparing alternatives. No branch becomes an implicit active
 graph or writes weights into cell metadata.
+
+## 6. HTO demultiplexing
+
+Hashtag assignment is a separate sample-identification task, not part of the RNA/ADT integration path.
+See {doc}`hto_demultiplexing`.
+
+## Common mistakes and limitations
+
+- Filtering cells on one assay and then comparing modalities built from different cell sets
+- Integrating per-assay graphs built with different `k`
+- Leaving control antibodies active in the ADT panel
+- Using WNN with fewer than two assays or with graphs built over different cells
+- Reading RNA and ADT clusters as interchangeable labels for the same populations

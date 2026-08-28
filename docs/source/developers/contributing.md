@@ -42,7 +42,7 @@ For full CI parity, also run the visual regression step (or see `AGENTS.md`):
 ## Contributions to the documentation
 
 You may contribute to the documentation by either adding new sections or modifying existing sections.
-Install the documentation and test dependencies with `uv sync --extra docs --extra test --extra extra`.
+Install the documentation and test dependencies with `uv sync --extra agent --extra docs --extra test --extra extra`.
 
 Executable docs are MyST markdown files with `{code-cell}` blocks, not standalone `.ipynb` files.
 Sources live in `docs/source/quickstart.md` and `docs/source/tutorials/`.
@@ -61,7 +61,7 @@ Execute one affected page locally with one worker:
 
 Modal can execute pages in parallel when authentication and the `scarf_profiling` environment are available:
 
-    uv sync --group docs-modal --extra docs --extra extra
+    uv sync --group docs-modal --extra agent --extra docs --extra extra
     make -C docs execute-docs-modal PAGES="scrna_seq"
 
 Both paths preserve matching outputs for other sources, validate a complete candidate, and publish through a recoverable backup-and-rename sequence.

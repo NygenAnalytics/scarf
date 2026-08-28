@@ -26,12 +26,13 @@ from ..quality_control.cell_cycle_genes import (
     s_phase_genes,
     s_phase_genes_mouse,
 )
-from ._deps import AGENT_INSTALL_HINT
+from .config import CONFIG
+from .config._deps import AGENT_INSTALL_HINT
 from .decide import DecisionValidationError, decide
-from .types import Decision, EvidenceItem, StageStatus
+from .types import AgentDataModel, Decision, EvidenceItem, StageStatus
 
 try:
-    from pydantic import BaseModel, Field
+    from pydantic import Field
 except ImportError as exc:
     raise ImportError(AGENT_INSTALL_HINT) from exc
 
@@ -40,9 +41,7 @@ __all__ = [
     "characterize_features",
 ]
 
-_DEFAULT_MAX_EXOGENOUS = 25
-_CONTEXT_LIMIT = 1200
-_AUTO_DOWNLOAD_SPECIES = frozenset({"homo_sapiens", "mus_musculus"})
+
 _CELL_CYCLE = {
     "homo_sapiens": {"s": s_phase_genes, "g2m": g2m_phase_genes},
     "mus_musculus": {"s": s_phase_genes_mouse, "g2m": g2m_phase_genes_mouse},
@@ -50,7 +49,7 @@ _CELL_CYCLE = {
 _SEX_COEFFICIENT_TOKENS = frozenset({"sex", "gender", "Sex", "Gender"})
 
 
-class FeatureCharacterization(BaseModel):
+class FeatureCharacterization(AgentDataModel):
     status: StageStatus
     auditLog: list[dict[str, Any]] = Field(default_factory=list)
     actions: list[str] = Field(default_factory=list)
@@ -58,10 +57,26 @@ class FeatureCharacterization(BaseModel):
     decisions: list[dict[str, Any]] = Field(default_factory=list)
     assays: list[dict[str, Any]] = Field(default_factory=list)
 
+    @classmethod
+    def get_blank(cls) -> "FeatureCharacterization":
+        return cls(status="failed")
+
+    @classmethod
+    def get_example(cls) -> "FeatureCharacterization":
+        return cls(
+            status="done",
+            notes=["Feature identity and families were characterized."],
+            assays=[{"assay": "RNA", "species": "homo_sapiens"}],
+        )
+
 
 def _bounded_context(study_context: str | None) -> str:
     text = (study_context or "").strip()
-    return text if len(text) <= _CONTEXT_LIMIT else text[: _CONTEXT_LIMIT - 3] + "..."
+    return (
+        text
+        if len(text) <= CONFIG._CONTEXT_LIMIT
+        else text[: CONFIG._CONTEXT_LIMIT - 3] + "..."
+    )
 
 
 def _audit(
@@ -371,7 +386,7 @@ def _characterize_assay(
 
     # Only human/mouse auto-download; any other species needs an explicit direction.
     may_download = allow_download and (
-        species in _AUTO_DOWNLOAD_SPECIES or directed_species == species
+        species in CONFIG._AUTO_DOWNLOAD_SPECIES or directed_species == species
     )
     reference = _load_or_fetch_reference(
         species,
@@ -430,17 +445,17 @@ def _characterize_assay(
             assay=assay_name,
         )
 
-    raw_max = directions.get("maxExogenousCandidates", _DEFAULT_MAX_EXOGENOUS)
+    raw_max = directions.get("maxExogenousCandidates", CONFIG._MAX_EXOGENOUS)
     try:
         max_exogenous = int(raw_max)
     except (TypeError, ValueError):
         _audit(
             audit_log,
             kind="invalidDirection",
-            detail=f"maxExogenousCandidates={raw_max!r}; using {_DEFAULT_MAX_EXOGENOUS}",
+            detail=f"maxExogenousCandidates={raw_max!r}; using {CONFIG._MAX_EXOGENOUS}",
             assay=assay_name,
         )
-        max_exogenous = _DEFAULT_MAX_EXOGENOUS
+        max_exogenous = CONFIG._MAX_EXOGENOUS
     if reference is not None:
         misses = reference_misses(ids, symbols, reference)
         if misses["count"]:

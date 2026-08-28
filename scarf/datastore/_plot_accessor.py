@@ -730,8 +730,8 @@ class DataStorePlotAccessor:
             " | Sequence[str | CellField | FeatureRef]"
         ),
         *,
-        group_by: str | None = None,
-        grouping: ArtifactRef | None = None,
+        grouping: ArtifactRef | CellField | None = None,
+        cell_selection: ArtifactRef | None = None,
         groups: Sequence[Any] | None = None,
         split_by: str | None = None,
         sample_by: str | None = None,
@@ -739,18 +739,19 @@ class DataStorePlotAccessor:
         sample_stat: Literal["mean", "median", "fraction"] = "mean",
         expression_cutoff: float = 0.0,
         subset_by: str | None = None,
-        cell_key: str | None = "I",
         from_assay: str | None = None,
         normalization: "NormalizationSpec | None" = None,
         categorical_scale: "CategoricalScale | None" = None,
         split_scale: "CategoricalScale | None" = None,
         kind: "DistKind" = "violin",
         bins: int = 40,
-        max_points: int = 10000,
+        max_points: int | None = 10000,
         point_size: float = 0.8,
         point_alpha: float = 0.28,
         seed: int = 0,
         color: str = "steelblue",
+        color_by: Literal["group", "mean"] = "group",
+        color_scale: "ColorScale | None" = None,
         orientation: Literal["vertical", "horizontal"] = "vertical",
         row_standardize: bool = False,
         share_y: bool | None = None,
@@ -764,16 +765,40 @@ class DataStorePlotAccessor:
         title: str | None = None,
         theme: str = "notebook",
         show_legend: bool = True,
+        stats_results: Any = None,
+        stats_keys: Sequence[str] | None = None,
+        stats_bracket_height: float | None = None,
+        stats_show_p: bool = True,
         show: bool = True,
     ) -> "PlotResult":
-        """Plot distributions of cell metadata or feature values."""
+        """Plot distributions of cell metadata or feature values.
+
+        ``stats_results`` overlays significance brackets from
+        ``run_statistical_testing`` results onto the drawn violins or
+        boxes; see :func:`scarf.plotting.distribution` for the full
+        behaviour. ``max_points`` defaults to ``10000``; explicit ``None``
+        disables the point overlay for stacked violins and otherwise uses
+        ``10000``.
+        """
         from ..plotting import distribution
 
+        resolved_stats = stats_results
+        if isinstance(stats_results, ArtifactRef):
+            resolved_stats = self._store.get_statistical_tests(stats_results)
+        elif isinstance(stats_results, Mapping):
+            resolved_stats = {
+                key: (
+                    self._store.get_statistical_tests(value)
+                    if isinstance(value, ArtifactRef)
+                    else value
+                )
+                for key, value in stats_results.items()
+            }
         return distribution(
             self._store,
             keys,
-            group_by=group_by,
             grouping=grouping,
+            cell_selection=cell_selection,
             groups=groups,
             split_by=split_by,
             sample_by=sample_by,
@@ -781,7 +806,6 @@ class DataStorePlotAccessor:
             sample_stat=sample_stat,
             expression_cutoff=expression_cutoff,
             subset_by=subset_by,
-            cell_key=cell_key,
             from_assay=from_assay,
             normalization=normalization,
             categorical_scale=categorical_scale,
@@ -793,6 +817,8 @@ class DataStorePlotAccessor:
             point_alpha=point_alpha,
             seed=seed,
             color=color,
+            color_by=color_by,
+            color_scale=color_scale,
             orientation=orientation,
             row_standardize=row_standardize,
             share_y=share_y,
@@ -806,6 +832,10 @@ class DataStorePlotAccessor:
             title=title,
             theme=theme,
             show_legend=show_legend,
+            stats_results=resolved_stats,
+            stats_keys=stats_keys,
+            stats_bracket_height=stats_bracket_height,
+            stats_show_p=stats_show_p,
             show=show,
         )
 

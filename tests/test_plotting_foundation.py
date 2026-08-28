@@ -36,6 +36,9 @@ class _ArrayCells:
     def fetch_all(self, column):
         return self._columns[column]
 
+    def _get_array(self, column):
+        return self._columns[column]
+
 
 class _ArrayFeatures:
     def __init__(self, names):
@@ -75,6 +78,7 @@ class _ArrayAssay:
 class _ArrayStore:
     _defaultAssay = "RNA"
     nthreads = 1
+    zw = None
 
     def __init__(self, columns, feature_values):
         self.cells = _ArrayCells(columns)
@@ -84,6 +88,10 @@ class _ArrayStore:
         if name != "RNA":
             raise KeyError(name)
         return self.RNA
+
+    @staticmethod
+    def _stored_display_metadata(_column):
+        return None
 
 
 @pytest.fixture
@@ -1186,6 +1194,7 @@ def test_embedding_groups_filters_categories(umap, leiden_clustering, datastore)
 
 def test_distribution_violin(leiden_clustering, datastore):
     ds = datastore
+    cell_selection = ds.snapshot_cell_selection("I")
     result = splt.distribution(
         ds,
         keys=["RNA_nCounts", "RNA_nFeatures"],
@@ -1212,20 +1221,26 @@ def test_distribution_violin(leiden_clustering, datastore):
     result.close()
 
     gene = str(ds.RNA.feats.fetch_all("names")[0])
-    result2 = splt.distribution(ds, keys=gene, kind="box", max_points=100, show=False)
+    result2 = splt.distribution(
+        ds,
+        keys=gene,
+        cell_selection=cell_selection,
+        kind="box",
+        max_points=100,
+        show=False,
+    )
     assert len(result2.axes) == 1
     result2.close()
 
 
-def test_distribution_cell_key_none_includes_all_cells(datastore):
+def test_distribution_without_cell_selection_includes_all_cells(datastore):
     result = splt.distribution(
         datastore,
         keys="RNA_nCounts",
-        cell_key=None,
         max_points=0,
         show=False,
     )
-    assert result.provenance.cell_key is None
+    assert result.provenance.extras["cell_selection"] is None
     assert result.provenance.n_cells == datastore.cells.N
     assert len(result.tables["RNA_nCounts"]) == datastore.cells.N
     result.close()
@@ -1267,6 +1282,7 @@ def test_distribution_subset_and_groups(leiden_clustering, datastore):
 
 def test_distribution_hist_and_ecdf(leiden_clustering, datastore):
     ds = datastore
+    cell_selection = ds.snapshot_cell_selection("I")
     hist = splt.distribution(
         ds,
         keys="RNA_nCounts",
@@ -1300,6 +1316,7 @@ def test_distribution_hist_and_ecdf(leiden_clustering, datastore):
     ecdf = splt.distribution(
         ds,
         keys="RNA_nFeatures",
+        cell_selection=cell_selection,
         kind="ecdf",
         max_points=500,
         seed=2,
@@ -1312,6 +1329,7 @@ def test_distribution_hist_and_ecdf(leiden_clustering, datastore):
     duplicates = splt.distribution(
         ds,
         keys=["RNA_nCounts", "RNA_nCounts"],
+        cell_selection=cell_selection,
         kind="hist",
         bins=5,
         show=False,
@@ -1338,7 +1356,7 @@ def test_grouped_violin_and_horizontal_box_follow_explicit_order(
     violin = splt.distribution(
         synthetic_plot_store,
         keys="metricA",
-        group_by="group",
+        grouping=splt.CellField("group"),
         categorical_scale=scale,
         kind="violin",
         max_points=0,
@@ -1347,7 +1365,7 @@ def test_grouped_violin_and_horizontal_box_follow_explicit_order(
     box = splt.distribution(
         synthetic_plot_store,
         keys="metricB",
-        group_by="group",
+        grouping=splt.CellField("group"),
         categorical_scale=scale,
         kind="box",
         orientation="horizontal",
@@ -1380,7 +1398,7 @@ def test_grouped_ecdf_uses_order_palette_and_probability_limits(
     result = splt.distribution(
         synthetic_plot_store,
         keys="metricA",
-        group_by="group",
+        grouping=splt.CellField("group"),
         categorical_scale=scale,
         kind="ecdf",
         max_points=0,
@@ -1433,12 +1451,16 @@ def test_grouped_ecdf_uses_order_palette_and_probability_limits(
         pytest.param({"groups": ["group1"]}, "groups requires", id="groups"),
         pytest.param({"split_by": "split"}, "split_by requires", id="split"),
         pytest.param(
-            {"group_by": "group", "split_by": "split", "kind": "box"},
+            {
+                "grouping": splt.CellField("group"),
+                "split_by": "split",
+                "kind": "box",
+            },
             "only for violin",
             id="split-kind",
         ),
         pytest.param(
-            {"group_by": "group", "split_by": "group"},
+            {"grouping": splt.CellField("group"), "split_by": "group"},
             "different columns",
             id="split-same-column",
         ),
@@ -1483,7 +1505,7 @@ def test_distribution_rejects_missing_groups_and_incomplete_scales(
         splt.distribution(
             synthetic_plot_store,
             keys="metricA",
-            group_by="group",
+            grouping=splt.CellField("group"),
             groups=["group1", "absent"],
             show=False,
         )
@@ -1491,7 +1513,7 @@ def test_distribution_rejects_missing_groups_and_incomplete_scales(
         splt.distribution(
             synthetic_plot_store,
             keys="metricA",
-            group_by="group",
+            grouping=splt.CellField("group"),
             categorical_scale=splt.CategoricalScale(order=("group1", "group2")),
             show=False,
         )
@@ -1499,7 +1521,7 @@ def test_distribution_rejects_missing_groups_and_incomplete_scales(
         splt.distribution(
             synthetic_plot_store,
             keys="metricA",
-            group_by="group",
+            grouping=splt.CellField("group"),
             categorical_scale=splt.CategoricalScale(
                 order=("group1", "group2", "group10"),
                 palette={"group1": "#111111", "group10": "#333333"},
@@ -1510,7 +1532,7 @@ def test_distribution_rejects_missing_groups_and_incomplete_scales(
         splt.distribution(
             synthetic_plot_store,
             keys="metricA",
-            group_by="group",
+            grouping=splt.CellField("group"),
             split_by="split",
             split_scale=splt.CategoricalScale(order=("left",)),
             show=False,
@@ -1519,7 +1541,7 @@ def test_distribution_rejects_missing_groups_and_incomplete_scales(
         splt.distribution(
             synthetic_plot_store,
             keys="metricA",
-            group_by="group",
+            grouping=splt.CellField("group"),
             split_by="split3",
             show=False,
         )
@@ -1531,7 +1553,7 @@ def test_sample_fraction_distribution_drops_missing_sample_ids(
     result = splt.distribution(
         synthetic_plot_store,
         keys="metricA",
-        group_by="group",
+        grouping=splt.CellField("group"),
         sample_by="sample_with_missing",
         sample_stat="fraction",
         expression_cutoff=5.0,
@@ -1572,27 +1594,44 @@ def test_distribution_rejects_malformed_cell_column_lengths(
     synthetic_plot_store,
     monkeypatch,
 ):
-    original_fetch = synthetic_plot_store.cells.fetch
+    original_get_array = synthetic_plot_store.cells._get_array
+
+    class MalformedArray:
+        def __init__(self, values):
+            self.values = values
+            self.shape = values.shape
+
+        def __getitem__(self, item):
+            return self.values[item][:-1]
+
     cases = [
-        ("group", {"group_by": "group"}, "group_by length"),
+        (
+            "group",
+            {"grouping": splt.CellField("group")},
+            "Grouping metadata does not align",
+        ),
         (
             "split",
-            {"group_by": "group", "split_by": "split"},
+            {"grouping": splt.CellField("group"), "split_by": "split"},
             "split_by length",
         ),
         (
             "sample",
-            {"group_by": "group", "sample_by": "sample"},
+            {"grouping": splt.CellField("group"), "sample_by": "sample"},
             "sample_by length",
         ),
     ]
     for malformed_column, kwargs, message in cases:
 
-        def malformed_fetch(column, key="I", *, _malformed=malformed_column):
-            values = original_fetch(column, key=key)
-            return values[:-1] if column == _malformed else values
+        def malformed_get_array(column, *, _malformed=malformed_column):
+            values = original_get_array(column)
+            return MalformedArray(values) if column == _malformed else values
 
-        monkeypatch.setattr(synthetic_plot_store.cells, "fetch", malformed_fetch)
+        monkeypatch.setattr(
+            synthetic_plot_store.cells,
+            "_get_array",
+            malformed_get_array,
+        )
         with pytest.raises(ValueError, match=message):
             splt.distribution(
                 synthetic_plot_store,
@@ -2072,7 +2111,7 @@ def test_owned_distribution_composition_and_summary_results_close_after_show(
         splt.distribution(
             synthetic_plot_store,
             keys="metricA",
-            group_by="group",
+            grouping=splt.CellField("group"),
             kind="box",
             max_points=0,
         ),

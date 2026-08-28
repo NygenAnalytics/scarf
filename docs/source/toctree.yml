@@ -8,6 +8,8 @@ subtrees:
         title: Quick start
       - file: analysis_with_agents
         title: Analysis with AI agents
+      - file: tutorials/agent_workflow
+        title: Grounded agent workflow
       - file: scanpy_and_seurat
         title: Scanpy and Seurat users
   - caption: Assay workflows

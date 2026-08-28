@@ -99,7 +99,8 @@ def _decode_metadata_values(data: Any) -> np.ndarray:
     if values.dtype.kind == "S":
         return np.asarray([bytes(value).decode("utf-8") for value in values.flat])
     if values.dtype.kind == "O" and any(
-        isinstance(value, bytes | bytearray | np.bytes_) for value in values.flat
+        value is None or isinstance(value, bytes | bytearray | np.bytes_)
+        for value in values.flat
     ):
         decoded: list[str] = []
         for value in values.flat:

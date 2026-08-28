@@ -8,6 +8,7 @@ description: Use Scarf safely in an autonomous or AI-assisted single-cell analys
 This page is a routing and reasoning guide for an AI agent that uses Scarf to analyse data.
 It does not replace the workflow tutorials or define one correct analysis.
 The study question, experimental design, and user instructions remain authoritative.
+For an executable example of the four bounded Scarf agents and their validated handoffs, see {doc}`tutorials/agent_workflow`.
 
 ## Scope and authority
 
@@ -27,7 +28,9 @@ Stop rather than claim an identified treatment, disease, or batch effect when th
 ### DataStore, selections, and artifacts
 
 A `DataStore` contains count matrices, cell metadata, feature metadata, and persisted results.
-A Boolean {term}`cell key` selects cells, while an immutable {term}`feature selection` artifact selects assay features.
+A Boolean {term}`cell key` can define an initial cohort. Snapshot it before analysis so downstream
+operations and agents consume an immutable cell-selection artifact. An immutable
+{term}`feature selection` artifact selects assay features.
 Analytical producers return exact {py:class}`~scarf.ArtifactRef` values and leave metadata
 unchanged. Filtering returns a cell-selection artifact without changing live `I` or
 deleting counts.
@@ -86,7 +89,7 @@ Use the format-specific import guides for other inputs.
 Before the first mutating operation, make a short execution record containing:
 
 - the scientific question and unit of inference;
-- the selected cell key, feature-selection reference, and other input artifact references;
+- the cell-selection and feature-selection references, plus other input artifact references;
 - the operations that will persist artifacts or export data;
 - the alternatives and independent evidence that will be compared;
 - the criteria for selecting a branch, preserving uncertainty, or stopping.
@@ -234,7 +237,7 @@ A layout can vary in orientation or spacing without representing different biolo
 A useful handoff reports:
 
 - the scientific question and unit of inference;
-- the store workspace, active cell key, resolved feature selections, and relevant artifact refs;
+- the store workspace, exact cell selection, resolved feature selections, and relevant artifact refs;
 - metadata roles and any confounding;
 - alternatives considered and the evidence used to compare them;
 - the selected result and why it is fit for the question;

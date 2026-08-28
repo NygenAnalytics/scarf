@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 
 import scarf
+from scarf.plotting import CellField
 from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level="ERROR", progress=True)
@@ -325,7 +326,8 @@ Source mixing on the graph is therefore not the same question as removing a trea
 ```{code-cell} ipython3
 ds.plots.distribution(
     keys="ISG15",
-    group_by="sample_id",
+    grouping=CellField("sample_id"),
+    cell_selection=baseline["analysis_cell_selection"],
     kind="violin",
     max_points=2000,
     seed=0,

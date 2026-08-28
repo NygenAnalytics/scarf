@@ -87,10 +87,57 @@ markers[
 The adjusted values use the marker-table correction scope documented in
 {doc}`../reference/api/datastore`. They are not biological-replicate FDR values.
 
-## 3. Aggregate raw counts
+```{note}
+Use marker tables for cluster interpretation.
+Do not treat within-group `p_value_adjusted` columns as replicate-aware differential expression results.
+```
 
-`make_bulk` accepts the exact categorical artifact directly. Its stored lineage supplies the cell
-selection, so no cluster column needs to be created:
+## 3. Run descriptive group comparisons
+
+`run_statistical_testing` compares one feature at a time across an exact categorical artifact and
+persists each variant as an immutable result artifact. The rank-based defaults suit single-cell
+data: `mann_whitney` for two groups, `kruskal_wallis` with optional Dunn post-hoc comparisons for
+three or more, and paired Wilcoxon on aggregated samples.
+
+Explicit parametric tests also run on raw cell-level values. They are descriptive only: they treat
+cells as independent, cannot be combined with sample aggregation, and make assumptions that
+zero-inflated single-cell values often violate. Automatic method selection never chooses a
+parametric test.
+
+```{code-cell} ipython3
+# Compare two clusters that are present in the Kang dataset.
+result = ds.run_statistical_testing(
+    ["MALAT1"],
+    run["clusters"],
+    groups=[1, 2],
+    test="welch",
+    alternative="greater",
+)
+
+# Pin retrieval to the exact immutable result returned by the run.
+loaded = ds.get_statistical_tests(result.artifact)
+loaded.tables["MALAT1"]
+```
+
+```{code-cell} ipython3
+# The plotted selection and test design must match the stored result.
+figure = ds.plots.distribution(
+    ["MALAT1"],
+    grouping=run["clusters"],
+    groups=[1, 2],
+    kind="violin",
+    stats_results=result.artifact,
+    show=False,
+)
+```
+
+Brackets prefer the pooled `p_value_adjusted` column when present.
+
+## 4. Aggregate raw counts
+
+`make_bulk` accepts the same exact categorical artifact. Its lineage supplies the cell selection,
+so no cluster column needs to be created. Cell counts per Leiden group set the scale for each bulk
+column:
 
 ```{code-cell} ipython3
 group_sizes = (
@@ -131,7 +178,7 @@ For a real condition comparison, the grouping must retain biological sample iden
 `secondary_groups="sample_id"` alongside the cell-type artifact. Merge samples first as described
 in {doc}`dataset_merging`.
 
-## 4. Export counts and sample metadata
+## 5. Export counts and sample metadata
 
 ```{code-cell} ipython3
 counts_csv = Path(analysis_directory.name) / "pseudobulk_counts.csv"

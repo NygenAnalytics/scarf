@@ -9,7 +9,7 @@ from pydantic_ai.models.function import AgentInfo
 from pydantic_ai.models.test import TestModel
 
 from scarf.agent import DecisionValidationError, EvidenceItem, decide
-from scarf.agent.decide import validate_decision
+from scarf.agent.decide import _SYSTEM_PROMPT, validate_decision
 from scarf.agent.types import Decision
 
 
@@ -33,6 +33,11 @@ def _function_model(decision: Decision) -> FunctionModel:
         )
 
     return FunctionModel(reply)
+
+
+def test_system_prompt_does_not_embed_fictional_output_values() -> None:
+    assert "Output example" not in _SYSTEM_PROMPT
+    assert "evidence:example" not in _SYSTEM_PROMPT
 
 
 def test_decide_with_function_model_returns_valid_decision() -> None:

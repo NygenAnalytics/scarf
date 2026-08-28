@@ -29,8 +29,9 @@ Granular workflows pass exact refs to the same datastore-owned plotting surface:
 | pseudotime heatmap | `aggregation=aggregation_ref` |
 | mapping score | `mapping_score(result_ref, reference=reference, layout=embedding_ref)` |
 
-`layout_key`, `group_by`, and other string forms refer to deliberate live metadata inputs. They do
-not resolve an analysis artifact by name.
+`layout_key` and string forms on plotters that still accept them refer to deliberate live metadata
+inputs. Distribution grouping instead requires either an exact categorical artifact or an explicit
+`CellField`, with `cell_selection=` when a frozen metadata subset is intended.
 
 Store-backed plotters and diagnostics generally return a `PlotResult` and render by default with `show=True`.
 Pass `show=False` before accessing, saving, or reusing an owned figure.

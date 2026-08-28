@@ -54,6 +54,7 @@ Column prefetch uses `storage.parallel` because read-ahead limits and I/O concur
 
 - `metadata/` owns Zarr-backed metadata tables, row streaming, and table queries.
   It is shared by datastore cell metadata and assay feature metadata, so neither `datastore`, `assay`, nor `storage` owns it.
+  Shared value-selection contracts also live here so domain, orchestration, and presentation code can use one typed contract without reversing dependencies.
 - `assay/` owns normalization, blockwise feature-summary computation, and the RNA, ATAC, and ADT assay types.
   `DataStore` owns planning and persistence of feature-summary artifacts; a bare `Assay.score_features` remains computation-only.
 - `graph/` owns graph feature projection through named artifact inputs and rejects encoded-path inputs.
@@ -72,6 +73,7 @@ They must not import those packages at module load time.
 - `trajectory/` owns pseudotime scoring, feature-profile aggregation, feature module clustering, and pseudotime result records.
 - `metrics/` owns LISI, silhouette, graph, concordance, and integration scores.
 - `features/` owns variability selection, LOWESS trend fitting, feature scoring, enrichment, rank and regression marker searches, GFF parsing, genomic intervals, and coordinate-based feature construction.
+  It also owns presentation-independent feature resolution and normalized value fetching used by datastore workflows and plots.
 - `quality_control/` owns filtering, HTO demultiplexing, doublet processing, cell-cycle assignment, and the default cell-cycle gene references.
 - `mapping/` owns reference artifacts, feature alignment, confidence, Symphony-style correction, and mapping results.
 

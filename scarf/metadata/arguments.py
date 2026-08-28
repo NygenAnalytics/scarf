@@ -310,3 +310,42 @@ class SmartLabelArguments(OperationArguments):
     algorithm_version: int = parameter()
     suffix_style: str = parameter()
     invalidate_cache: bool = execution()
+
+
+@dataclass(frozen=True, slots=True)
+class StatisticalTestingArguments(OperationArguments):
+    operation: ClassVar[str] = "run_statistical_testing"
+    artifact_kind: ClassVar[str] = "statistical_tests"
+
+    grouping: ArtifactRef | None = artifact_input()
+    cell_selection: ArtifactRef | None = artifact_input()
+    tested_features: tuple[str, ...] = artifact_input()
+    source_assays: tuple[str | None, ...] = artifact_input()
+    source_dataset_fingerprint: str | None = artifact_input()
+    cell_selection_fingerprint: str = artifact_input()
+    group_fingerprint: str = artifact_input()
+    subset_fingerprint: str | None = artifact_input()
+    sample_fingerprint: str | None = artifact_input()
+    pair_fingerprint: str | None = artifact_input()
+
+    group_field: str | None = parameter()
+    method: str = parameter()
+    posthoc: str | None = parameter()
+    adjustment_method: str = parameter()
+    alternative: str = parameter()
+    equal_var: bool | None = parameter()
+    sample_stat: str = parameter()
+    expression_cutoff: float = parameter()
+    groups: tuple[Any, ...] | None = parameter()
+    comparisons: tuple[tuple[Any, Any], ...] | None = parameter()
+    sample_by: str | None = parameter()
+    pair_by: str | None = parameter()
+    subset_by: str | None = parameter()
+    normalization: dict[str, Any] = parameter()
+    normalization_method: dict[str, str] | None = parameter()
+    size_factor: float | None = parameter()
+    n_groups: int = parameter()
+    n_cells: int = parameter()
+    key_labels: tuple[str, ...] = parameter()
+    from_assay: str | None = execution()
+    invalidate_cache: bool = execution()

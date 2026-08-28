@@ -107,8 +107,10 @@ qc_cols = [
     )
     if c in ds.cells.columns
 ]
+qc_cell_selection = ds.snapshot_cell_selection('I')
 ds.plots.distribution(
     keys=qc_cols,
+    cell_selection=qc_cell_selection,
     kind='violin',
     max_points=2000,
 )
