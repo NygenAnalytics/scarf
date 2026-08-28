@@ -1,3 +1,5 @@
+import hashlib
+import json
 import math
 import re
 import secrets
@@ -7,6 +9,16 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 import zarr
+from zarr.abc.store import Store
+from zarr.core.buffer import Buffer, default_buffer_prototype
+from zarr.core.sync import collect_aiterator, sync
+from zarr.storage import (
+    LocalStore,
+    MemoryStore,
+    ObjectStore,
+    StorePath,
+    WrapperStore,
+)
 
 from .artifacts import require_complete_artifact
 from .refs import ArtifactRef
@@ -14,6 +26,8 @@ from .types import as_zarr_group
 
 
 PIPELINE_RUNS_PATH = "pipeline/runs"
+_PIPELINE_LABEL_CLAIMS_PATH = f"{PIPELINE_RUNS_PATH}/.label-claims"
+_PIPELINE_LABEL_CLAIMS_NAME = ".label-claims"
 
 type PipelineRunStatus = Literal["running", "completed", "failed", "interrupted"]
 type PipelineStageStatus = Literal[
@@ -90,6 +104,10 @@ _METRIC_FIELDS = frozenset(
         "samplingErrorCount",
         "rssUnavailableReason",
     }
+)
+_LABEL_CLAIM_FIELDS = frozenset({"label", "runId"})
+_LABEL_CLAIM_KEY_PATTERN = re.compile(
+    r"^(?P<digest>[0-9a-f]{64})/(?P<predecessor>head|[0-9a-f]{64})\.json$"
 )
 
 
@@ -1017,6 +1035,228 @@ def load_pipeline_run_record(root: zarr.Group, run_id: str) -> PipelineRunRecord
     return record
 
 
+def _pipeline_label_claim_path(
+    root: zarr.Group,
+    label: str,
+    predecessor: str,
+) -> StorePath:
+    digest = hashlib.sha256(label.encode("utf-8")).hexdigest()
+    return root.store_path / (
+        f"{_PIPELINE_LABEL_CLAIMS_PATH}/{digest}/{predecessor}.json"
+    )
+
+
+def _group_store_prefix(root: zarr.Group) -> str:
+    path = root.store_path.path.rstrip("/")
+    return f"{path}/" if path else ""
+
+
+def _pipeline_label_claim_namespaces(root: zarr.Group) -> tuple[str, ...]:
+    namespaces: list[str] = []
+
+    def visit(group: zarr.Group, relative_path: str) -> None:
+        if "pipeline" in group:
+            pipeline = group["pipeline"]
+            if isinstance(pipeline, zarr.Group) and "runs" in pipeline:
+                runs = pipeline["runs"]
+                if isinstance(runs, zarr.Group) and _PIPELINE_LABEL_CLAIMS_NAME in runs:
+                    container = runs[_PIPELINE_LABEL_CLAIMS_NAME]
+                    if (
+                        not isinstance(container, zarr.Array)
+                        or tuple(container.shape) != (0,)
+                        or container.dtype != "uint8"
+                    ):
+                        raise ValueError(
+                            "Pipeline label claim container is incompatible"
+                        )
+                    namespace = f"{relative_path}/{_PIPELINE_LABEL_CLAIMS_PATH}"
+                    namespaces.append(namespace.lstrip("/"))
+        for name in group.group_keys():
+            if name == "pipeline":
+                continue
+            child_path = f"{relative_path}/{name}" if relative_path else name
+            child = group[name]
+            assert isinstance(child, zarr.Group)
+            visit(child, child_path)
+
+    visit(root, "")
+    return tuple(namespaces)
+
+
+def _store_supports_atomic_label_claims(store: Store) -> bool:
+    visited: set[int] = set()
+    while isinstance(store, WrapperStore):
+        identity = id(store)
+        if identity in visited:
+            return False
+        visited.add(identity)
+        store = store._store
+    return isinstance(store, LocalStore | MemoryStore | ObjectStore)
+
+
+def _pipeline_label_claim_bytes(label: str, run_id: str) -> Buffer:
+    payload = json.dumps(
+        {"label": label, "runId": run_id},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return default_buffer_prototype().buffer.from_bytes(payload)
+
+
+def _ensure_pipeline_label_claim_container(root: zarr.Group) -> None:
+    # Mark the raw claim namespace as a Zarr child so hierarchy walks remain
+    # warning-free. Its zero-length payload is never read or written.
+    runs = _get_group(root, PIPELINE_RUNS_PATH, "Pipeline runs")
+    if _PIPELINE_LABEL_CLAIMS_NAME not in runs:
+        try:
+            runs.create_array(
+                _PIPELINE_LABEL_CLAIMS_NAME,
+                shape=(0,),
+                dtype="uint8",
+            )
+        except zarr.errors.ContainsArrayError:
+            pass
+    container = runs[_PIPELINE_LABEL_CLAIMS_NAME]
+    if (
+        not isinstance(container, zarr.Array)
+        or tuple(container.shape) != (0,)
+        or container.dtype != "uint8"
+    ):
+        raise ValueError("Pipeline label claim container is incompatible")
+
+
+def _read_pipeline_label_claim(path: StorePath, label: str) -> str:
+    stored = sync(path.get())
+    if stored is None:
+        raise ValueError(f"Pipeline label {label!r} has an incomplete durable claim")
+    try:
+        value = json.loads(stored.to_bytes().decode("utf-8"))
+        raw = _exact_mapping(value, _LABEL_CLAIM_FIELDS, "pipeline label claim")
+        stored_label = _validate_non_empty_string(raw["label"], "claim label")
+        run_id = _validate_non_empty_string(raw["runId"], "claim runId")
+        _validate_run_id(run_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Pipeline label {label!r} has an invalid durable claim"
+        ) from exc
+    if stored_label != label:
+        raise ValueError(
+            f"Pipeline label {label!r} collides with another durable claim"
+        )
+    return run_id
+
+
+def _claim_pipeline_label(root: zarr.Group, label: str, run_id: str) -> None:
+    """Atomically elect one finalizer while retaining recoverable predecessors."""
+
+    _validate_non_empty_string(label, "label")
+    _validate_run_id(run_id)
+    if not _store_supports_atomic_label_claims(root.store):
+        raise RuntimeError(
+            "Pipeline label uniqueness requires a Zarr store with atomic "
+            "set_if_not_exists support"
+        )
+    _ensure_pipeline_label_claim_container(root)
+
+    claim_bytes = _pipeline_label_claim_bytes(label, run_id)
+    predecessor = "head"
+    visited: set[str] = set()
+    while True:
+        claim_path = _pipeline_label_claim_path(root, label, predecessor)
+        sync(claim_path.set_if_not_exists(claim_bytes))
+        owner_id = _read_pipeline_label_claim(claim_path, label)
+        if owner_id == run_id:
+            return
+        if owner_id in visited:
+            raise ValueError(f"Pipeline label {label!r} has a cyclic durable claim")
+        visited.add(owner_id)
+        try:
+            owner = load_pipeline_run_record(root, owner_id)
+        except KeyError:
+            # A claim whose run was removed cannot own a public label. Keep the
+            # immutable predecessor and let conditional creation elect its successor.
+            predecessor = owner_id
+            continue
+        if owner.requested_label != label:
+            raise ValueError(
+                f"Pipeline label {label!r} has a claim from an incompatible run"
+            )
+        if owner.successfully_completed:
+            raise ValueError(
+                f"Pipeline label {label!r} is already committed by run {owner_id}"
+            )
+        if owner.complete and owner.status in {"failed", "interrupted"}:
+            predecessor = owner_id
+            continue
+        raise ValueError(
+            f"Pipeline label {label!r} is currently being finalized by run {owner_id}"
+        )
+
+
+def _copy_pipeline_label_claims(
+    source: zarr.Group,
+    destination: zarr.Group,
+) -> None:
+    """Copy raw append-only claims in every nested datastore workspace."""
+
+    namespaces = _pipeline_label_claim_namespaces(source)
+    source_prefix = _group_store_prefix(source)
+    destination_prefix = _group_store_prefix(destination)
+    for namespace in namespaces:
+        try:
+            destination_container = destination[namespace]
+        except KeyError as error:
+            raise ValueError(
+                f"Pipeline label claim container is missing: {namespace}"
+            ) from error
+        if (
+            not isinstance(destination_container, zarr.Array)
+            or tuple(destination_container.shape) != (0,)
+            or destination_container.dtype != "uint8"
+        ):
+            raise ValueError(
+                f"Pipeline label claim container is incompatible: {namespace}"
+            )
+        claim_prefix = f"{namespace}/"
+        source_claim_prefix = f"{source_prefix}{claim_prefix}"
+        claim_keys = sorted(
+            collect_aiterator(source.store.list_prefix(source_claim_prefix))
+        )
+        for source_key in claim_keys:
+            if not source_key.startswith(source_claim_prefix):
+                continue
+            relative_claim = source_key[len(source_claim_prefix) :]
+            match = _LABEL_CLAIM_KEY_PATTERN.fullmatch(relative_claim)
+            if match is None:
+                continue
+            relative = f"{claim_prefix}{relative_claim}"
+            stored = sync(
+                source.store.get(
+                    source_key,
+                    prototype=default_buffer_prototype(),
+                )
+            )
+            if stored is None:
+                raise ValueError(
+                    f"Pipeline label claim disappeared during copy: {relative}"
+                )
+            try:
+                value = json.loads(stored.to_bytes().decode("utf-8"))
+                raw = _exact_mapping(value, _LABEL_CLAIM_FIELDS, "pipeline label claim")
+                label = _validate_non_empty_string(raw["label"], "claim label")
+                run_id = _validate_non_empty_string(raw["runId"], "claim runId")
+                _validate_run_id(run_id)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"Pipeline label claim is invalid: {relative}"
+                ) from error
+            if hashlib.sha256(label.encode("utf-8")).hexdigest() != match["digest"]:
+                raise ValueError(f"Pipeline label claim digest is invalid: {relative}")
+            destination_key = f"{destination_prefix}{relative}"
+            sync(destination.store.set(destination_key, stored))
+
+
 def _load_pipeline_stage_record_for_run(
     root: zarr.Group,
     run: PipelineRunRecord,
@@ -1210,12 +1450,18 @@ def complete_pipeline_run_record(
                 run.requested_label,
                 exclude_run_id=run.run_id,
             )
-        except ValueError as exc:
+            _claim_pipeline_label(root, run.requested_label, run.run_id)
+        except (ValueError, RuntimeError) as exc:
+            error_type = (
+                "PipelineLabelConflict"
+                if isinstance(exc, ValueError)
+                else "PipelineLabelClaimUnavailable"
+            )
             fail_pipeline_run_record(
                 root,
                 run_id=run.run_id,
                 error=PipelineErrorRecord(
-                    type="PipelineLabelConflict",
+                    type=error_type,
                     message=str(exc)[:512],
                 ),
                 finished_at_ns=finished_at_ns,

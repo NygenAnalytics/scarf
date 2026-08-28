@@ -20,8 +20,9 @@ you deliberately add a column for an export tool.
 
 ## 1. Build the required artifacts
 
-TopACeDo requires the Paris cut for the same graph. A Leiden partition or a cut from another graph
-is rejected.
+TopACeDo requires the Paris cut for the same graph. This pipeline run builds both, plus the UMAP
+used for inspection, and skips unrelated stages. A Leiden partition or a cut from another graph is
+rejected.
 
 ```{code-cell} ipython3
 from pathlib import Path
@@ -52,15 +53,21 @@ ds = scarf.mount_datastore(
     nthreads=4,
 )
 
-cells = ds.snapshot_cell_selection(cell_key="I")
-features = ds.select_hvgs(cells, min_cells=20, top_n=500, show_plot=False)
-normalized = ds.run_normalization(cells, features)
-pca = ds.run_pca(normalized, dims=15)
-initialization = ds.build_embedding_initialization(pca)
-neighbors = ds.query_neighbors(ds.build_ann_index(pca), k=11)
-graph = ds.build_connectivity_map(neighbors)
-umap = ds.run_umap(graph, initialization, n_epochs=100)
-paris = ds.run_paris_clustering(graph)
+preparation = ds.pipeline.run(
+    filtering=False,
+    hvg_count=500,
+    pca_dims=15,
+    neighbors_k=11,
+    umap=True,
+    leiden=False,
+    cell_cycle=False,
+    paris=True,
+    doublets=False,
+    markers=False,
+)
+graph = preparation["connectivity_map"]
+umap = preparation["umap"]
+paris = preparation["paris"]
 ```
 
 `paris` is an exact `cluster_cut` ref. Inspect its labels through the dedicated loader:
@@ -107,6 +114,8 @@ summary.groupby("cluster", sort=True).agg(
     cells=("sampled", "size"),
     selected=("sampled", "sum"),
     seeds=("seed", "sum"),
+    mean_density=("density", "mean"),
+    mean_snn=("mean_snn", "mean"),
 )
 ```
 

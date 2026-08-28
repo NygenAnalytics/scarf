@@ -40,7 +40,6 @@ Quality control has to see the population it is judging, so this page builds its
 
 ```{code-cell} ipython3
 import numpy as np
-import matplotlib.pyplot as plt
 import pandas as pd
 
 import scarf
@@ -105,11 +104,12 @@ explicitly named column is absent, filtering raises an error instead of silently
 
 ```{code-cell} ipython3
 n_before = int(ds.cells.fetch_all('I').sum())
-manual_selection = ds.filter_cells(
-    attrs=['RNA_nCounts', 'RNA_nFeatures', 'RNA_percentMito'],
-    highs=[15000, 4000, 15],
-    lows=[1000, 500, 0],
-)
+manual_filter = {
+    "attrs": ["RNA_nCounts", "RNA_nFeatures", "RNA_percentMito"],
+    "highs": [15000, 4000, 15],
+    "lows": [1000, 500, 0],
+}
+manual_selection = ds.filter_cells(**manual_filter)
 manual_mask = np.asarray(ds.load_artifact(manual_selection)['values'][:], dtype=bool)
 print(f'Cells in input selection: {n_before}')
 print(f'Cells in filtered selection: {int(manual_mask.sum())}')
@@ -216,45 +216,28 @@ See {doc}`feature_selection` for the default HVG blacklist and supported overrid
 
 ## 6. Doublet scores
 
-`run_doublet_detection` simulates doublets, maps them onto the existing neighbourhood graph, and
-returns a per-cell score artifact.
-It does not remove cells automatically.
-It requires exact clustering and graph refs.
+`run_doublet_detection` is the atomic score producer. The standard pipeline supplies its exact
+clustering and graph refs, and returns the same per-cell doublet artifact. It does not remove cells
+automatically. Reusing the manual-filter mapping keeps this example's QC bounds in one place.
 
 ```{code-cell} ipython3
-hvg_ref = ds.select_hvgs(
-    manual_selection,
-    min_cells=20,
-    top_n=500,
-    show_plot=False,
+doublet_run = ds.pipeline.run(
+    filtering={"method": "manual", **manual_filter},
+    hvg_count=500,
+    pca_dims=15,
+    leiden={"partitions": [0.5]},
+    cell_cycle=False,
+    paris=False,
+    doublets=True,
+    markers=False,
 )
-cell_selection = manual_selection
-normalized = ds.run_normalization(cell_selection, hvg_ref)
-pca = ds.run_pca(normalized, dims=15)
-initialization = ds.build_embedding_initialization(pca)
-ann_index = ds.build_ann_index(pca)
-neighbors = ds.query_neighbors(ann_index, k=11)
-graph = ds.build_connectivity_map(neighbors)
-clusters = ds.run_leiden_clustering(graph, resolution=0.5)
-doublets = ds.run_doublet_detection(
-    clusters,
-    graph,
+doublets = doublet_run["doublets"]
+scores = np.asarray(doublet_run.cells.fetch("doublet_score"))
+ds.plots.embedding(
+    run=doublet_run,
+    color_by="doublet_score",
+    sort_values=True,
 )
-umap = ds.run_umap(
-    graph,
-    initialization,
-    n_epochs=100,
-    spread=5,
-    min_dist=1,
-    parallel=True,
-)
-```
-
-
-```{code-cell} ipython3
-umap_values = np.asarray(ds.load_artifact(umap)['values'][:])
-scores = np.asarray(ds.load_artifact(doublets)['values'][:])
-plt.scatter(umap_values[:, 0], umap_values[:, 1], c=scores, s=3)
 ```
 
 Higher doublet scores mark cells that map near simulated doublets.
@@ -266,9 +249,9 @@ pd.Series(scores, name='doublet_score').plot(kind='hist', bins=40)
 
 The score distribution and embedding should be reviewed together.
 A threshold is study-dependent, and `run_doublet_detection` does not remove cells.
-After choosing an upper bound from the ECDF shoulder, apply it as an additional filter.
+After choosing an upper bound from the score distribution, apply it as an additional filter.
 The teaching cutoff below identifies the upper 5% of scores on this PBMC run; replace it with a
-study-specific value when the ECDF shape differs.
+study-specific value when the upper-tail shape differs.
 
 ```{code-cell} ipython3
 scores_series = pd.Series(scores, name='doublet_score')

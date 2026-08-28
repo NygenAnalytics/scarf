@@ -20,7 +20,7 @@ CITE-seq measures RNA and antibody-derived tags in the same cells. Scarf keeps e
 normalization and graph separate, then integrates exact graph artifacts. No analytical stage adds
 layout, cluster, or modality-weight columns to shared cell metadata.
 
-## 1. Import and select cells
+## 1. Import the matched assays
 
 ```{code-cell} ipython3
 import matplotlib.pyplot as plt
@@ -45,7 +45,44 @@ ds = scarf.DataStore(
     default_assay="RNA",
     nthreads=4,
 )
-cell_selection = ds.auto_filter_cells()
+```
+
+## 2. Build the RNA graph and select cells
+
+The standard RNA pipeline handles filtering, feature selection, normalization, PCA, neighbours,
+the connectivity map, and the requested Leiden partition. UMAP is disabled in the pipeline so all
+four graphs on this page can use the same non-default display settings.
+
+```{code-cell} ipython3
+shared_umap_options = {
+    "n_epochs": 250,
+    "spread": 5,
+    "min_dist": 1,
+    "parallel": True,
+}
+rna_run = ds.pipeline.run(
+    assay="RNA",
+    hvg_count=1000,
+    pca_dims=15,
+    neighbors_k=21,
+    umap=False,
+    leiden={"partitions": [1.0]},
+    cell_cycle=False,
+    paris=False,
+    doublets=False,
+    markers=False,
+)
+cell_selection = rna_run["analysis_cell_selection"]
+rna_initialization = ds.build_embedding_initialization(rna_run["pca"])
+rna_neighbors = rna_run["neighbors"]
+rna_graph = rna_run["connectivity_map"]
+rna_umap = ds.run_umap(
+    rna_graph,
+    rna_initialization,
+    **shared_umap_options,
+)
+rna_clusters = rna_run["leiden_1.0"]
+
 cell_mask = np.asarray(
     ds.load_artifact(cell_selection)["values"][:],
     dtype=bool,
@@ -53,35 +90,9 @@ cell_mask = np.asarray(
 print(f"Selected cells: {int(cell_mask.sum())} of {len(cell_mask)}")
 ```
 
-The selection is shared by both assays because their rows describe the same cells. The live `I`
-column remains unchanged.
-
-## 2. Build the RNA graph
-
-```{code-cell} ipython3
-rna_features = ds.select_hvgs(
-    cell_selection,
-    from_assay="RNA",
-    min_cells=20,
-    top_n=1000,
-    show_plot=False,
-)
-normalized_rna = ds.run_normalization(cell_selection, rna_features)
-pca_rna = ds.run_pca(normalized_rna, dims=15)
-rna_initialization = ds.build_embedding_initialization(pca_rna)
-rna_ann = ds.build_ann_index(pca_rna)
-rna_neighbors = ds.query_neighbors(rna_ann, k=21)
-rna_graph = ds.build_connectivity_map(rna_neighbors)
-rna_umap = ds.run_umap(
-    rna_graph,
-    rna_initialization,
-    n_epochs=250,
-    spread=5,
-    min_dist=1,
-    parallel=True,
-)
-rna_clusters = ds.run_leiden_clustering(rna_graph, resolution=1)
-```
+The pipeline's immutable cell selection is shared by both assays because their rows describe the
+same cells. The live `I` column remains unchanged. The ADT-specific reduction and the multimodal
+integration steps below stay atomic because they are not part of the fixed RNA recipe.
 
 ```{code-cell} ipython3
 rna_umap_values = np.asarray(ds.load_artifact(rna_umap)["values"][:])
@@ -126,10 +137,7 @@ adt_graph = ds.build_connectivity_map(adt_neighbors)
 adt_umap = ds.run_umap(
     adt_graph,
     adt_initialization,
-    n_epochs=250,
-    spread=5,
-    min_dist=1,
-    parallel=True,
+    **shared_umap_options,
 )
 adt_clusters = ds.run_leiden_clustering(adt_graph, resolution=1)
 ```
@@ -160,10 +168,7 @@ snn_graph = ds.integrate_assays([rna_graph, adt_graph], method="snn")
 snn_umap = ds.run_umap(
     snn_graph,
     rna_initialization,
-    n_epochs=250,
-    spread=5,
-    min_dist=1,
-    parallel=True,
+    **shared_umap_options,
 )
 snn_clusters = ds.run_leiden_clustering(snn_graph, resolution=1.75)
 ```
@@ -195,10 +200,7 @@ wnn_graph = ds.integrate_assays(
 wnn_umap = ds.run_umap(
     wnn_graph,
     rna_initialization,
-    n_epochs=250,
-    spread=5,
-    min_dist=1,
-    parallel=True,
+    **shared_umap_options,
 )
 wnn_clusters = ds.run_leiden_clustering(wnn_graph, resolution=1.75)
 weight_values = np.asarray(ds.load_artifact(wnn_graph)["modality_weights"][:])

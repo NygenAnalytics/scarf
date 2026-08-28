@@ -109,22 +109,11 @@ run = ds_ctrl.pipeline.run(
     paris=False,
     doublets=False,
     markers=False,
+    snapshot_columns=["cluster_labels"],
 )
 reference_layout = run["umap"]
 reference_ref = ds_ctrl.build_mapping_reference(run["neighbors"])
-reference = ds_ctrl.get_mapping_reference(reference_ref)
-pd.Series(
-    {
-        "method": reference.method,
-        "assay": reference.assay_name,
-        "feature_selection": reference.feature_selection,
-        "selected_cells": reference.selected_cell_count,
-        "n_features": reference.model.n_features,
-        "n_dims": reference.model.n_dims,
-        "has_symphony_state": reference.symphony_state is not None,
-    },
-    name="mapping_reference",
-)
+reference_ref
 ```
 
 `method="symphony"` means the neighbour chain used Harmony-corrected coordinates and the reference carries soft-assignment state for query correction.
@@ -132,13 +121,14 @@ The feature count and PCA dimensions stay fixed for every later query.
 
 ```{code-cell} ipython3
 ds_ctrl.plots.embedding(
-    layout_key="RNA_UMAP",
+    run=run,
+    layout="umap",
     color_by="cluster_labels",
 )
 ```
 
-This plot uses the catalog snapshot's literal `RNA_UMAP` metadata. `reference_layout` is the
-Harmony run's immutable UMAP and is used for mapping-score plots below. `MappingReference` stores
+This plot uses the Harmony run's immutable UMAP and its snapshot of `cluster_labels`.
+`reference_layout` is reused for mapping-score plots below. `MappingReference` stores
 the exact immutable `feature_selection` reference, PCA basis, corrected coordinates, and neighbour
 index; it does not store an embedding.
 Mapping places query weight onto reference cells without moving those cells.
@@ -149,7 +139,12 @@ Mapping still requires a separate writable query datastore.
 Use `mount_datastore` when the query counts come from a read-only source or from the same source used to prepare the reference.
 
 ```{code-cell} ipython3
-reference = ds_ctrl.get_mapping_reference(reference_ref)
+reference_store = scarf.DataStore(
+    str(ctrl_analysis_path),
+    zarr_mode="r",
+    nthreads=4,
+)
+reference = reference_store.get_mapping_reference(reference_ref)
 pd.Series(
     {
         "method": reference.method,
@@ -227,6 +222,9 @@ accepted.value_counts().rename(
 
 Cells below `threshold_fraction` abstain as `NA` instead of taking a weak majority label.
 Compare the accepted and abstained counts with the `NA` column in the confusion matrix below.
+The mapping reference freezes its model and selected cell axis, while `reference_class_group`
+reads the named column from the reference store at use time. Keep a reusable atlas read-only, or
+version externally revised labels under a new column name.
 
 ```{code-cell} ipython3
 query_labels = np.asarray(ds_stim.cells.fetch("cluster_labels")).astype(str)

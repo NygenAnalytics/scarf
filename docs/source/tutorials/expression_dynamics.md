@@ -46,26 +46,30 @@ ds = scarf.mount_datastore(
     default_assay="RNA",
 )
 
-cell_selection = ds.snapshot_cell_selection("I")
-hvg = ds.select_hvgs(cell_selection, top_n=2000, show_plot=False)
-normalized = ds.run_normalization(cell_selection, hvg)
-pca = ds.run_pca(normalized, dims=15)
-ann = ds.build_ann_index(pca)
-neighbors = ds.query_neighbors(ann, k=11)
-graph = ds.build_connectivity_map(neighbors)
+preparation = ds.pipeline.run(
+    filtering=False,
+    hvg_count=2000,
+    pca_dims=15,
+    neighbors_k=11,
+    umap=False,
+    leiden=False,
+    cell_cycle=False,
+    paris=False,
+    doublets=False,
+    markers=False,
+)
+graph = preparation["connectivity_map"]
+all_features = preparation["feature_universe"]
 
 annotations = np.asarray(ds.cells.fetch("clusters", key="I"))
 source = annotations == "Ductal"
 sink = np.isin(annotations, ["Alpha", "Beta", "Delta"])
+if not source.any() or not sink.any() or np.any(source & sink):
+    raise ValueError("Source and sink annotations must be non-empty and disjoint")
 source_sink_vector = np.zeros(len(annotations), dtype=float)
 source_sink_vector[source] = 1.0 / int(source.sum())
 source_sink_vector[sink] = -1.0 / int(sink.sum())
 pseudotime_ref = ds.run_pseudotime_scoring(graph, ss_vec=source_sink_vector)
-
-all_features = ds.set_feature_selection(
-    from_assay="RNA",
-    feature_indexes=range(ds.RNA.feats.N),
-)
 ```
 
 The `clusters` labels used to orient this example are prepared catalog metadata copied by the mount.
@@ -105,13 +109,15 @@ module_frame["module"].value_counts().sort_index()
 ```
 
 ```{code-cell} ipython3
-representatives = (
+examples = (
     module_frame.groupby("module", sort=True)["feature_name"]
     .first()
-    .rename("representative gene")
+    .rename("example gene")
 )
-representatives
+examples
 ```
+
+The first feature is a compact example for each module, not a ranked representative.
 
 ## 3. Inspect the ordered profiles
 
@@ -123,8 +129,8 @@ ds.plots.pseudotime_heatmap(
 ```
 
 A useful result contains coherent early, intermediate, and late patterns rather than one block of
-uniformly expressed genes. Module numbers are labels, not developmental stages. Verify
-representative genes and stability before assigning biological meaning.
+uniformly expressed genes. Module numbers are labels, not developmental stages. Inspect example
+genes and module stability before assigning biological meaning.
 
 ## 4. Build a grouped assay when needed
 
@@ -138,7 +144,7 @@ ds.add_grouped_assay(
 ds.TrajectoryModules
 ```
 
-This is an explicit new-assay construction step. It does not publish the module labels into the
+This is an explicit new-assay construction step. It does not write the module labels into the
 RNA feature table. A feature metadata column can be passed instead of an artifact when the groups
 were deliberately authored as metadata.
 

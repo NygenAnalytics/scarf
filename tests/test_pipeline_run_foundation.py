@@ -1,9 +1,12 @@
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from typing import Any
 
 import numpy as np
 import pytest
 import zarr
-from zarr.storage import MemoryStore
+from zarr.storage import FsspecStore, LoggingStore, MemoryStore, ZipStore
 
 import scarf.storage.pipeline_runs as pipeline_run_storage
 from scarf.datastore.pipeline_run import (
@@ -29,13 +32,16 @@ from scarf.storage.feature_selection import (
 )
 from scarf.storage.pipeline_runs import (
     PipelineFieldDescriptor,
+    PipelineInterruptionRecord,
     PipelineOutputRecord,
+    PipelineRunRecord,
     PipelineStageMetrics,
     PipelineStageOutputRecord,
     complete_pipeline_run_record,
     create_pipeline_run_record,
     fail_pipeline_run_record,
     finish_pipeline_stage_record,
+    interrupt_pipeline_run_record,
     list_pipeline_run_records,
     load_pipeline_stage_record,
     load_pipeline_stage_records,
@@ -93,8 +99,11 @@ def _metrics() -> PipelineStageMetrics:
     )
 
 
-def _root() -> zarr.Group:
-    root = zarr.open_group(store=MemoryStore(), mode="w")
+def _root(*, store: Any | None = None) -> zarr.Group:
+    root = zarr.open_group(
+        store=MemoryStore() if store is None else store,
+        mode="w",
+    )
     cell_data = root.create_group("cellData")
     cell_data.create_array("ids", data=np.asarray(["c1", "c2", "c3", "c4"]))
     cell_data.create_array(
@@ -110,6 +119,41 @@ def _root() -> zarr.Group:
     )
     feature_data.create_array("I", data=np.asarray([True, True, False]))
     return root
+
+
+def _complete_labeled_run_in_process(
+    store_path: str,
+    run_id: str,
+    artifact_value: dict[str, Any],
+    barrier: Any,
+    result_queue: Any,
+) -> None:
+    root = zarr.open_group(store=store_path, mode="r+")
+    artifact = ArtifactRef.from_dict(artifact_value)
+    original_check = pipeline_run_storage.ensure_pipeline_label_available
+
+    def synchronized_check(
+        root: zarr.Group,
+        label: str,
+        *,
+        exclude_run_id: str | None = None,
+    ) -> None:
+        original_check(root, label, exclude_run_id=exclude_run_id)
+        if exclude_run_id is not None:
+            barrier.wait(timeout=10)
+
+    pipeline_run_storage.ensure_pipeline_label_available = synchronized_check
+    try:
+        completed = complete_pipeline_run_record(
+            root,
+            run_id=run_id,
+            outputs=(PipelineOutputRecord("selection", artifact),),
+            fields=(),
+        )
+    except Exception as exc:
+        result_queue.put(("error", type(exc).__name__, str(exc)))
+    else:
+        result_queue.put(("completed", completed.run_id, ""))
 
 
 def _artifact(
@@ -137,6 +181,55 @@ def _artifact(
         group.create_array(name, data=data)
     finish_artifact(group, planned)
     return planned.ref
+
+
+def _ready_labeled_runs(
+    root: zarr.Group,
+    label: str,
+    *,
+    count: int = 2,
+) -> tuple[ArtifactRef, tuple[PipelineRunRecord, ...]]:
+    artifact = _artifact(
+        root,
+        kind="cell_selection",
+        values={"values": np.asarray([True, True, True, True])},
+        inputs={
+            "ordered_row_ids_fingerprint": fingerprint_strings(
+                np.asarray(["c1", "c2", "c3", "c4"])
+            )
+        },
+    )
+    runs = tuple(
+        create_pipeline_run_record(
+            root,
+            recipe="basic_rna_analysis",
+            requested_label=label,
+            assay="RNA",
+            config={},
+            stage_order=("input_snapshot",),
+            scarf_version="1.0.0",
+            started_at_ns=100 + index,
+        )
+        for index in range(count)
+    )
+    for index, record in enumerate(runs):
+        start_pipeline_stage_record(
+            root,
+            run_id=record.run_id,
+            ordinal=0,
+            stage="input_snapshot",
+            started_at_ns=110 + index,
+        )
+        finish_pipeline_stage_record(
+            root,
+            run_id=record.run_id,
+            ordinal=0,
+            status="completed",
+            outputs=(PipelineStageOutputRecord("selection", artifact, True),),
+            metrics=_metrics(),
+            finished_at_ns=120 + index,
+        )
+    return artifact, runs
 
 
 def _fixture_feature_selection(
@@ -535,78 +628,193 @@ def test_stage_record_paths_load_the_run_once(
     assert load_count == 1
 
 
-def test_terminal_label_conflict_fails_second_concurrent_run() -> None:
-    root = _root()
-    artifact = _artifact(
-        root,
-        kind="cell_selection",
-        values={"values": np.asarray([True, True, True, True])},
-        inputs={
-            "ordered_row_ids_fingerprint": fingerprint_strings(
-                np.asarray(["c1", "c2", "c3", "c4"])
-            )
-        },
-    )
-    first = create_pipeline_run_record(
-        root,
-        recipe="basic_rna_analysis",
-        requested_label="same",
-        assay="RNA",
-        config={},
-        stage_order=("input_snapshot",),
-        scarf_version="1.0.0",
-        started_at_ns=100,
-    )
-    second = create_pipeline_run_record(
-        root,
-        recipe="basic_rna_analysis",
-        requested_label="same",
-        assay="RNA",
-        config={},
-        stage_order=("input_snapshot",),
-        scarf_version="1.0.0",
-        started_at_ns=101,
-    )
-    for index, record in enumerate((first, second)):
-        start_pipeline_stage_record(
-            root,
-            run_id=record.run_id,
-            ordinal=0,
-            stage="input_snapshot",
-            started_at_ns=110 + index,
-        )
-        finish_pipeline_stage_record(
-            root,
-            run_id=record.run_id,
-            ordinal=0,
-            status="completed",
-            outputs=(PipelineStageOutputRecord("selection", artifact, True),),
-            metrics=_metrics(),
-            finished_at_ns=120 + index,
-        )
-    complete_pipeline_run_record(
-        root,
-        run_id=first.run_id,
-        outputs=(PipelineOutputRecord("selection", artifact),),
-        fields=(),
-        finished_at_ns=130,
+def test_terminal_label_conflict_fails_one_concurrent_thread(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store_path = str(tmp_path / "threaded-labels.zarr")
+    root = _root(store=store_path)
+    artifact, (first, second) = _ready_labeled_runs(root, "same")
+    scan_barrier = Barrier(2)
+    original_check = pipeline_run_storage.ensure_pipeline_label_available
+
+    def synchronized_check(
+        root: zarr.Group,
+        label: str,
+        *,
+        exclude_run_id: str | None = None,
+    ) -> None:
+        original_check(root, label, exclude_run_id=exclude_run_id)
+        if exclude_run_id is not None:
+            scan_barrier.wait(timeout=10)
+
+    monkeypatch.setattr(
+        pipeline_run_storage,
+        "ensure_pipeline_label_available",
+        synchronized_check,
     )
 
-    with pytest.raises(ValueError, match="already committed"):
-        complete_pipeline_run_record(
-            root,
-            run_id=second.run_id,
+    def complete(run_id: str) -> PipelineRunRecord:
+        worker_root = zarr.open_group(store=store_path, mode="r+")
+        return complete_pipeline_run_record(
+            worker_root,
+            run_id=run_id,
             outputs=(PipelineOutputRecord("selection", artifact),),
             fields=(),
-            finished_at_ns=131,
         )
 
-    failed = load_pipeline_run_record(root, second.run_id)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(complete, run.run_id) for run in (first, second)]
+    completed = []
+    failures = []
+    for future in futures:
+        try:
+            completed.append(future.result())
+        except ValueError as exc:
+            failures.append(exc)
+
+    assert len(completed) == 1
+    assert len(failures) == 1
+    assert "Pipeline label 'same'" in str(failures[0])
+    loser_id = second.run_id if completed[0].run_id == first.run_id else first.run_id
+    failed = load_pipeline_run_record(root, loser_id)
     assert failed.status == "failed"
     assert failed.complete
     assert failed.label is None
     assert failed.error is not None
-    assert open_pipeline_run_record(root, label="same").run_id == first.run_id
+    assert open_pipeline_run_record(root, label="same") == completed[0]
+
+
+def test_terminal_label_claim_is_process_safe(tmp_path: Any) -> None:
+    store_path = str(tmp_path / "process-labels.zarr")
+    root = _root(store=store_path)
+    artifact, runs = _ready_labeled_runs(root, "process-safe")
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(2)
+    result_queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_complete_labeled_run_in_process,
+            args=(
+                store_path,
+                run.run_id,
+                artifact.to_dict(),
+                barrier,
+                result_queue,
+            ),
+        )
+        for run in runs
+    ]
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=20)
+        assert all(not process.is_alive() for process in processes)
+        assert all(process.exitcode == 0 for process in processes)
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    results = [result_queue.get(timeout=5) for _ in processes]
+    assert [result[0] for result in results].count("completed") == 1
+    assert [result[0] for result in results].count("error") == 1
+    assert {load_pipeline_run_record(root, run.run_id).status for run in runs} == {
+        "completed",
+        "failed",
+    }
+    owner = open_pipeline_run_record(root, label="process-safe")
+    assert owner.run_id == next(
+        result[1] for result in results if result[0] == "completed"
+    )
+
+
+@pytest.mark.parametrize("stale_kind", ("failed", "interrupted", "orphaned"))
+def test_terminal_label_claim_advances_past_non_owner(
+    stale_kind: str,
+) -> None:
+    root = _root()
+    label = f"retry-{stale_kind}"
+    artifact, (first, second) = _ready_labeled_runs(root, label)
+    pipeline_run_storage._claim_pipeline_label(root, label, first.run_id)
+    with pytest.raises(KeyError, match="No completed pipeline run"):
+        open_pipeline_run_record(root, label=label)
+
+    if stale_kind == "failed":
+        fail_pipeline_run_record(root, run_id=first.run_id, error=RuntimeError("x"))
+    elif stale_kind == "interrupted":
+        interrupt_pipeline_run_record(
+            root,
+            run_id=first.run_id,
+            interruption=PipelineInterruptionRecord(
+                kind="cancelled",
+                message="cancelled",
+                requested_at_ns=130,
+            ),
+        )
+    else:
+        del root[f"pipeline/runs/{first.run_id}"]
+
+    completed = complete_pipeline_run_record(
+        root,
+        run_id=second.run_id,
+        outputs=(PipelineOutputRecord("selection", artifact),),
+        fields=(),
+    )
+    assert open_pipeline_run_record(root, label=label) == completed
+
+
+def test_terminal_label_claim_backend_failure_is_durable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _root()
+    artifact, (record,) = _ready_labeled_runs(root, "unsupported", count=1)
+
+    def reject_claim(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("atomic conditional creation is unavailable")
+
+    monkeypatch.setattr(
+        pipeline_run_storage,
+        "_claim_pipeline_label",
+        reject_claim,
+    )
+    with pytest.raises(RuntimeError, match="atomic conditional creation"):
+        complete_pipeline_run_record(
+            root,
+            run_id=record.run_id,
+            outputs=(PipelineOutputRecord("selection", artifact),),
+            fields=(),
+        )
+
+    failed = load_pipeline_run_record(root, record.run_id)
+    assert failed.status == "failed"
+    assert failed.complete
+    assert failed.error is not None
+    assert failed.error.type == "PipelineLabelClaimUnavailable"
+
+
+def test_atomic_label_claim_backend_detection(tmp_path: Any) -> None:
+    memory_store = MemoryStore()
+    safe_wrapper = LoggingStore(memory_store)
+    fsspec_store = FsspecStore.from_url(f"memory://scarf-label-claims/{tmp_path.name}")
+    unsafe_wrapper = LoggingStore(fsspec_store)
+    zip_store = ZipStore(tmp_path / "label-claims.zip", mode="w")
+    try:
+        assert pipeline_run_storage._store_supports_atomic_label_claims(memory_store)
+        assert pipeline_run_storage._store_supports_atomic_label_claims(safe_wrapper)
+        assert not pipeline_run_storage._store_supports_atomic_label_claims(
+            fsspec_store
+        )
+        assert not pipeline_run_storage._store_supports_atomic_label_claims(
+            unsafe_wrapper
+        )
+        assert not pipeline_run_storage._store_supports_atomic_label_claims(zip_store)
+    finally:
+        safe_wrapper.close()
+        unsafe_wrapper.close()
+        zip_store.close()
 
 
 def test_run_view_reads_frozen_fields_and_ignores_live_i_drift() -> None:

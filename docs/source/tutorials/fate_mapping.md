@@ -47,17 +47,25 @@ ds = scarf.mount_datastore(
     default_assay="RNA",
 )
 
-cell_selection = ds.snapshot_cell_selection("I")
-features = ds.select_hvgs(cell_selection, top_n=2000, show_plot=False)
-normalized = ds.run_normalization(cell_selection, features)
-pca = ds.run_pca(normalized, dims=15)
-ann = ds.build_ann_index(pca)
-neighbors = ds.query_neighbors(ann, k=11)
-graph = ds.build_connectivity_map(neighbors)
+preparation = ds.pipeline.run(
+    filtering=False,
+    hvg_count=2000,
+    pca_dims=15,
+    neighbors_k=11,
+    umap=False,
+    leiden=False,
+    cell_cycle=False,
+    paris=False,
+    doublets=False,
+    markers=False,
+)
+graph = preparation["connectivity_map"]
 
 annotations = np.asarray(ds.cells.fetch("clusters", key="I"))
 source = annotations == "Ductal"
 sink = np.isin(annotations, ["Alpha", "Beta", "Delta"])
+if not source.any() or not sink.any() or np.any(source & sink):
+    raise ValueError("Source and sink annotations must be non-empty and disjoint")
 source_sink_vector = np.zeros(len(annotations), dtype=float)
 source_sink_vector[source] = 1.0 / int(source.sum())
 source_sink_vector[sink] = -1.0 / int(sink.sum())
@@ -85,6 +93,8 @@ valid_frame = pd.DataFrame(
 terminal_labels = (
     valid_frame.groupby("label")["pseudotime"].mean().nlargest(2).index.tolist()
 )
+if len(terminal_labels) != 2:
+    raise ValueError("Fate mapping requires exactly two terminal labels in this example")
 terminal_labels
 ```
 
@@ -110,25 +120,17 @@ metadata unchanged.
 
 ```{code-cell} ipython3
 valid_probabilities = fate.values[fate.valid]
-pd.DataFrame(
+probability_summary = pd.DataFrame(
     valid_probabilities,
     columns=[str(label) for label in fate.sink_labels],
-).describe().loc[["min", "50%", "max"]]
+)
+probability_summary["row-sum error"] = np.abs(
+    probability_summary.sum(axis=1) - 1.0
+)
+probability_summary.agg(["min", "median", "max"])
 ```
 
 Probabilities should be finite, non-negative, and sum to one for valid cells.
-
-```{code-cell} ipython3
-pd.Series(
-    {
-        "minimum": float(valid_probabilities.min()),
-        "maximum": float(valid_probabilities.max()),
-        "maximum row-sum error": float(
-            np.abs(valid_probabilities.sum(axis=1) - 1.0).max()
-        ),
-    }
-)
-```
 
 ```{code-cell} ipython3
 umap = ds.cells.to_pandas_dataframe(["RNA_UMAP1", "RNA_UMAP2"], key="I")

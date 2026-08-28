@@ -1,4 +1,5 @@
 import inspect
+import pickle
 from collections.abc import Mapping
 from typing import Any
 
@@ -8,17 +9,21 @@ import zarr
 from zarr.storage import MemoryStore
 
 from scarf import PipelineExecutionError, PipelineRun
-from scarf.datastore.pipeline_accessor import (
-    PipelineEvent,
-    _PipelineEventEmitter,
-    _categorical_array_display,
-    _continuous_array_display,
-    _run_cluster_selection,
-    _sample_cluster_label_values,
+from scarf.datastore._pipeline_cluster_selection import run_cluster_selection
+from scarf.datastore._pipeline_fields import (
+    categorical_array_display,
+    continuous_array_display,
 )
+from scarf.datastore._pipeline_ledger import PipelineEventEmitter
+from scarf.datastore.pipeline_accessor import PipelineEvent
 from scarf.storage.artifact_writer import finish_artifact, plan_artifact, start_artifact
-from scarf.storage.artifacts import ArtifactRef, artifact_group
+from scarf.storage.artifacts import (
+    ArtifactRef,
+    artifact_group,
+    require_complete_artifact,
+)
 from scarf.storage.refs import ArtifactScope
+from scarf.utils.shutdown import ShutdownRequested, current_shutdown_token
 
 
 def _minimal_run_options() -> dict[str, Any]:
@@ -43,9 +48,16 @@ def test_pipeline_callback_baseexceptions_do_not_escape() -> None:
         events.append(event)
         raise KeyboardInterrupt("callback interruption")
 
-    _PipelineEventEmitter(callback).emit("stage_started", "input_snapshot")
+    PipelineEventEmitter(callback).emit("stage_started", "input_snapshot")
 
     assert [event.kind for event in events] == ["stage_started"]
+
+
+def test_pipeline_event_keeps_its_public_pickle_identity() -> None:
+    event = PipelineEvent(kind="stage_completed", stage="pca")
+
+    assert PipelineEvent.__module__ == "scarf.datastore.pipeline_accessor"
+    assert pickle.loads(pickle.dumps(event)) == event
 
 
 def _insert_nullable_cell_column(
@@ -65,6 +77,12 @@ class _ClusterSelectionStore:
     def __init__(self, root: Any) -> None:
         self.zw = root
         self.memoryBytes = 64 * 1024 * 1024
+
+    def _validate_reduction_cell_selection(self, pca: ArtifactRef) -> ArtifactRef:
+        status = require_complete_artifact(self.zw, pca)
+        raw_selection = (status.inputs or {}).get("cell_selection")
+        assert isinstance(raw_selection, Mapping)
+        return ArtifactRef.from_dict(raw_selection)
 
 
 def test_pipeline_field_display_summaries_read_stored_chunks() -> None:
@@ -91,7 +109,7 @@ def test_pipeline_field_display_summaries_read_stored_chunks() -> None:
         ),
         2,
     )
-    display = _continuous_array_display(coordinates, value_index=0)
+    display = continuous_array_display(coordinates, value_index=0)
     assert display["minimum"] == -2.0
     assert display["maximum"] == 3.0
     assert len(coordinates.reads) == 2
@@ -100,48 +118,10 @@ def test_pipeline_field_display_summaries_read_stored_chunks() -> None:
         np.asarray([2.0, np.nan, 1.0, 2.0, 3.0]),
         2,
     )
-    categorical = _categorical_array_display(labels)
+    categorical = categorical_array_display(labels)
     assert [item["value"] for item in categorical["categories"]] == [1.0, 2.0, 3.0]
     assert categorical["missing_label"] == "NA"
     assert len(labels.reads) == 3
-
-
-def test_cluster_selection_reads_only_sampled_labels(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sample_indices = np.asarray([3, 11, 19], dtype=np.int64)
-
-    class Labels:
-        ndim = 1
-        shape = (1_000_000,)
-
-        def __getitem__(self, _index):
-            raise AssertionError("cluster selection must not read every label")
-
-        def get_orthogonal_selection(self, indexer):
-            assert len(indexer) == 1
-            np.testing.assert_array_equal(indexer[0], sample_indices)
-            return np.asarray([0, 1, 1], dtype=np.int32)
-
-    monkeypatch.setattr(
-        "scarf.datastore.pipeline_accessor._cluster_label_array",
-        lambda _root, _ref: Labels(),
-    )
-    ref = ArtifactRef(
-        scope="assay",
-        assay="RNA",
-        kind="cluster_labels",
-        artifact_id="a" * 64,
-    )
-
-    values = _sample_cluster_label_values(
-        object(),
-        ref,
-        sample_indices=sample_indices,
-        expected_rows=1_000_000,
-    )
-
-    np.testing.assert_array_equal(values, [0, 1, 1])
 
 
 def _array_artifact(
@@ -151,13 +131,14 @@ def _array_artifact(
     values: dict[str, np.ndarray],
     inputs: dict[str, Any] | None = None,
     scope: ArtifactScope = "assay",
+    operation: str | None = None,
 ) -> ArtifactRef:
     planned = plan_artifact(
         root,
         scope=scope,
         assay="RNA" if scope == "assay" else None,
         kind=kind,
-        operation=f"test_{kind}",
+        operation=f"test_{kind}" if operation is None else operation,
         parameters={
             "payload": {
                 name: np.asarray(data).tolist() for name, data in values.items()
@@ -236,10 +217,53 @@ def test_pipeline_preflight_rejects_ambiguous_recipes_without_writes(
     assert after == before
 
 
-def test_minimal_pipeline_is_artifact_only_cold_openable_and_ordered(
+@pytest.mark.parametrize(
+    ("filtering", "message"),
+    (
+        ({"attrs": ["RNA_nCounts"], "min_p": "0.1"}, "min_p"),
+        ({"attrs": ["RNA_nCounts"], "max_p": True}, "max_p"),
+        ({"attrs": ["RNA_nCounts"], "n_mads": "3"}, "n_mads"),
+        (
+            {
+                "method": "manual",
+                "attrs": ["RNA_nCounts"],
+                "lows": [0],
+                "highs": [100],
+                "keep_bounds": 1,
+            },
+            "keep_bounds",
+        ),
+    ),
+)
+def test_pipeline_filtering_rejects_coercible_scalar_types_without_writes(
     datastore_ephemeral,
+    filtering: dict[str, object],
+    message: str,
 ) -> None:
     datastore = datastore_ephemeral
+    before = tuple(run.run_id for run in datastore.pipeline.list_runs(limit=100))
+
+    with pytest.raises(TypeError, match=message):
+        datastore.pipeline.run(filtering=filtering)
+
+    after = tuple(run.run_id for run in datastore.pipeline.list_runs(limit=100))
+    assert after == before
+
+
+def test_minimal_pipeline_is_artifact_only_cold_openable_and_ordered(
+    datastore_ephemeral,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    datastore = datastore_ephemeral
+
+    def reject_embedding_initialization(*_args, **_kwargs):
+        raise AssertionError("umap=False must not build embedding initialization")
+
+    monkeypatch.setattr(
+        type(datastore),
+        "build_embedding_initialization",
+        reject_embedding_initialization,
+    )
     cells_before = frozenset(datastore.cells.columns)
     assay = datastore.get_assay("RNA")
     features_before = frozenset(assay.feats.columns)
@@ -265,7 +289,6 @@ def test_minimal_pipeline_is_artifact_only_cold_openable_and_ordered(
         "ann_index",
         "neighbors",
         "connectivity_map",
-        "embedding_initialization",
     ]
     assert run["analysis_cell_selection"] == run["input_cell_selection"]
     assert all(isinstance(ref, ArtifactRef) for ref in run.values())
@@ -289,7 +312,6 @@ def test_minimal_pipeline_is_artifact_only_cold_openable_and_ordered(
         "ann_index",
         "neighbors",
         "connectivity",
-        "embedding_initialization",
     )
     assert [(event.kind, event.stage) for event in events] == [
         (kind, stage)
@@ -310,6 +332,9 @@ def test_minimal_pipeline_is_artifact_only_cold_openable_and_ordered(
     assert report["run"]["status"] == "completed"
     assert all(stage["metrics"] is not None for stage in report["stages"])
     assert all("plans" in stage for stage in report["stages"])
+    stages = {stage["stage"]: stage for stage in report["stages"]}
+    assert stages["embedding_initialization"]["status"] == "skipped"
+    assert stages["umap"]["status"] == "skipped"
     markdown = reopened.report(format="markdown")
     assert "# Pipeline run" in markdown
     assert f"- Scarf version: `{report['run']['scarfVersion']}`" in markdown
@@ -361,7 +386,7 @@ def test_skipped_stage_bookkeeping_failure_commits_failed_stage_and_run(
     datastore_ephemeral,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import scarf.datastore.pipeline_accessor as pipeline_module
+    import scarf.datastore._pipeline_ledger as pipeline_module
 
     datastore = datastore_ephemeral
     expected = RuntimeError("deliberate skipped-stage commit failure")
@@ -403,7 +428,7 @@ def test_completed_stage_bookkeeping_failure_commits_failed_stage_and_run(
     datastore_ephemeral,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import scarf.datastore.pipeline_accessor as pipeline_module
+    import scarf.datastore._pipeline_ledger as pipeline_module
 
     datastore = datastore_ephemeral
     expected = RuntimeError("deliberate completed-stage commit failure")
@@ -472,6 +497,38 @@ def test_pipeline_interruption_is_durable_before_callbacks(
         "stage_interrupted",
         "pipeline_interrupted",
     ]
+
+
+def test_pending_shutdown_propagates_when_interruption_cleanup_fails(
+    datastore_ephemeral,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    datastore = datastore_ephemeral
+
+    def request_shutdown(
+        _accessor,
+        _recipe,
+        _callback,
+        *,
+        active_run_id,
+        **_kwargs,
+    ) -> None:
+        active_run_id.append("a" * 64)
+        token = current_shutdown_token()
+        assert token is not None
+        token.request(reason="test shutdown")
+        token.checkpoint()
+
+    monkeypatch.setattr(type(datastore.pipeline), "_execute_recipe", request_shutdown)
+    monkeypatch.setattr(
+        "scarf.datastore.pipeline_accessor.load_pipeline_run_record",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("cleanup bookkeeping failed")
+        ),
+    )
+
+    with pytest.raises(ShutdownRequested, match="test shutdown"):
+        datastore.pipeline.run(**_minimal_run_options())
 
 
 def test_automatic_filtering_threads_one_distinct_analysis_selection(
@@ -628,6 +685,7 @@ def test_cluster_selection_records_invalid_candidates_ties_and_reuse(
     pca = _array_artifact(
         root,
         kind="reduction",
+        operation="run_pca",
         values={
             "data": np.asarray(
                 [
@@ -667,7 +725,7 @@ def test_cluster_selection_records_invalid_candidates_ties_and_reuse(
     )
     candidates = (("invalid", invalid), ("first", first), ("second", second))
 
-    decision, selected_key, selected = _run_cluster_selection(
+    decision, selected_key, selected = run_cluster_selection(
         store,
         pca=pca,
         cell_selection=selection,
@@ -682,7 +740,7 @@ def test_cluster_selection_records_invalid_candidates_ties_and_reuse(
     assert tuple(group.attrs["tieOrder"]) == ("invalid", "first", "second")
     np.testing.assert_allclose(group["scores"][:], [np.nan, 0.25, 0.25])
 
-    reused, reused_key, reused_selected = _run_cluster_selection(
+    reused, reused_key, reused_selected = run_cluster_selection(
         store,
         pca=pca,
         cell_selection=selection,
@@ -691,6 +749,177 @@ def test_cluster_selection_records_invalid_candidates_ties_and_reuse(
     assert reused == decision
     assert reused_key == selected_key
     assert reused_selected == selected
+
+    group.attrs["selectedKey"] = "second"
+    replacement, replacement_key, _replacement_selected = run_cluster_selection(
+        store,
+        pca=pca,
+        cell_selection=selection,
+        candidates=candidates,
+    )
+    assert replacement != decision
+    assert replacement_key == "first"
+
+    replacement_group = artifact_group(root, replacement)
+    replacement_group["sample_indices"][0] = 1
+    resampled, resampled_key, _resampled_selected = run_cluster_selection(
+        store,
+        pca=pca,
+        cell_selection=selection,
+        candidates=candidates,
+    )
+    assert resampled != replacement
+    assert resampled_key == "first"
+
+    resampled_group = artifact_group(root, resampled)
+    resampled_group["scores"][1] = np.nan
+    rescored, rescored_key, _rescored_selected = run_cluster_selection(
+        store,
+        pca=pca,
+        cell_selection=selection,
+        candidates=candidates,
+    )
+    assert rescored != resampled
+    assert rescored_key == "first"
+
+    rescored_group = artifact_group(root, rescored)
+    rescored_group.attrs["candidateRefs"] = [
+        second.to_dict(),
+        first.to_dict(),
+        invalid.to_dict(),
+    ]
+    rereferenced, rereferenced_key, _rereferenced_selected = run_cluster_selection(
+        store,
+        pca=pca,
+        cell_selection=selection,
+        candidates=candidates,
+    )
+    assert rereferenced != rescored
+    assert rereferenced_key == "first"
+
+    def replace_after_attr_corruption(
+        current: ArtifactRef,
+        attribute: str,
+        value: object,
+    ) -> ArtifactRef:
+        artifact_group(root, current).attrs[attribute] = value
+        replacement, replacement_key, _replacement_selected = run_cluster_selection(
+            store,
+            pca=pca,
+            cell_selection=selection,
+            candidates=candidates,
+        )
+        assert replacement != current
+        assert replacement_key == "first"
+        return replacement
+
+    rereferenced = replace_after_attr_corruption(
+        rereferenced,
+        "candidateKeys",
+        ["wrong", "first", "second"],
+    )
+    rereferenced = replace_after_attr_corruption(
+        rereferenced,
+        "tieOrder",
+        ["second", "first", "invalid"],
+    )
+    rereferenced = replace_after_attr_corruption(
+        rereferenced,
+        "invalidReasons",
+        ["too short"],
+    )
+    replace_after_attr_corruption(
+        rereferenced,
+        "sampleDefinition",
+        {
+            "seed": 4466,
+            "populationSize": 7,
+            "sampleSize": 6,
+            "maxSampleSize": 10_000,
+        },
+    )
+
+
+def test_cluster_selection_adapter_rejects_detached_lineage() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    store = _ClusterSelectionStore(root)
+    selection = _array_artifact(
+        root,
+        scope="datastore",
+        kind="cell_selection",
+        values={"values": np.ones(4, dtype=bool)},
+    )
+    other_selection = _array_artifact(
+        root,
+        scope="datastore",
+        kind="cell_selection",
+        values={"values": np.asarray([True, True, True, False])},
+    )
+    coordinates = {"data": np.arange(8, dtype=np.float32).reshape(4, 2)}
+    detached_pca = _array_artifact(
+        root,
+        kind="reduction",
+        values=coordinates,
+        inputs={"cell_selection": selection},
+    )
+    labels = _array_artifact(
+        root,
+        kind="cluster_labels",
+        values={"values": np.asarray([0, 0, 1, 1], dtype=np.int32)},
+        inputs={"cell_selection": selection},
+    )
+
+    with pytest.raises(ValueError, match="PCA reduction"):
+        run_cluster_selection(
+            store,
+            pca=detached_pca,
+            cell_selection=selection,
+            candidates=(("clusters", labels),),
+        )
+
+    pca = _array_artifact(
+        root,
+        kind="reduction",
+        operation="run_pca",
+        values=coordinates,
+        inputs={"cell_selection": selection},
+    )
+    detached_labels = _array_artifact(
+        root,
+        kind="cluster_labels",
+        values={"values": np.asarray([0, 0, 1, 1], dtype=np.int32)},
+        inputs={"cell_selection": other_selection},
+    )
+    with pytest.raises(ValueError, match="does not use the PCA cell selection"):
+        run_cluster_selection(
+            store,
+            pca=pca,
+            cell_selection=selection,
+            candidates=(("clusters", detached_labels),),
+        )
+
+    with pytest.raises(ValueError, match="does not use the requested cell selection"):
+        run_cluster_selection(
+            store,
+            pca=pca,
+            cell_selection=other_selection,
+            candidates=(("clusters", labels),),
+        )
+
+    wrong_scope = _array_artifact(
+        root,
+        scope="datastore",
+        kind="cluster_labels",
+        values={"values": np.asarray([0, 0, 1, 1], dtype=np.int32)},
+        inputs={"cell_selection": selection},
+    )
+    with pytest.raises(ValueError, match="assay-scoped clustering artifact"):
+        run_cluster_selection(
+            store,
+            pca=pca,
+            cell_selection=selection,
+            candidates=(("clusters", wrong_scope),),
+        )
 
 
 def test_rich_pipeline_views_plots_and_markers_remain_frozen_after_live_i_drift(

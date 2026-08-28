@@ -57,17 +57,19 @@ ds = scarf.mount_datastore(
     nthreads=4,
     default_assay="RNA",
 )
-cell_selection = ds.snapshot_cell_selection(cell_key="I")
-hvg_ref = ds.select_hvgs(
-    cell_selection,
-    top_n=2000,
-    show_plot=False,
+preparation = ds.pipeline.run(
+    filtering=False,
+    hvg_count=2000,
+    pca_dims=15,
+    neighbors_k=11,
+    umap=False,
+    leiden=False,
+    cell_cycle=False,
+    paris=False,
+    doublets=False,
+    markers=False,
 )
-normalized = ds.run_normalization(cell_selection, hvg_ref)
-reduction = ds.run_pca(normalized, dims=15)
-ann_index = ds.build_ann_index(reduction)
-neighbors = ds.query_neighbors(ann_index, k=11)
-graph = ds.build_connectivity_map(neighbors)
+graph = preparation["connectivity_map"]
 ```
 
 ## 2. Diffuse one feature
@@ -80,10 +82,14 @@ diffusion_operators = {
     t: ds.run_diffusion_operator(graph, t=t)
     for t in (1, 2, 4)
 }
-for t, diffusion in diffusion_operators.items():
+diffused_by_t = {
+    t: ds.get_imputed(feature_name="CD4", diffusion=diffusion)
+    for t, diffusion in diffusion_operators.items()
+}
+for t, values in diffused_by_t.items():
     ds.cells.insert(
         f"CD4_imputed_t{t}",
-        ds.get_imputed(feature_name="CD4", diffusion=diffusion),
+        values,
         overwrite=True,
     )
 ```
@@ -92,9 +98,7 @@ for t, diffusion in diffusion_operators.items():
 observed = ds.get_cell_vals(from_assay="RNA", cell_key="I", k="CD4")
 cd4_series = {
     "Observed CD4": observed,
-    "Diffusion t=1": ds.cells.fetch("CD4_imputed_t1", key="I"),
-    "Diffusion t=2": ds.cells.fetch("CD4_imputed_t2", key="I"),
-    "Diffusion t=4": ds.cells.fetch("CD4_imputed_t4", key="I"),
+    **{f"Diffusion t={t}": values for t, values in diffused_by_t.items()},
 }
 cd4_summary = pd.DataFrame(
     {

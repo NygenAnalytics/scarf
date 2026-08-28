@@ -53,12 +53,22 @@ The immutable graph artifacts themselves are distinguished by their scientific `
 ```{code-cell} ipython3
 integrated = []
 integrated_refs = {}
-for ref in ds.list_artifacts(scope="datastore", kind="integrated_graph"):
+integrated_parameters = {}
+for ref in ds.list_artifacts(
+    scope="datastore",
+    kind="integrated_graph",
+    complete_only=True,
+):
     status = ds.inspect_artifact(ref)
-    integrated_refs[status.parameters["method"]] = ref
+    parameters = status.parameters or {}
+    method = parameters["method"]
+    if method in integrated_refs:
+        raise RuntimeError(f"Expected one complete {method!r} graph")
+    integrated_refs[method] = ref
+    integrated_parameters[method] = parameters
     integrated.append(
         {
-            "method": status.parameters["method"],
+            "method": method,
             "artifact": ref.artifact_id[:12],
         }
     )
@@ -170,15 +180,13 @@ compare_signal(
 Protein signal is commonly less sparse than the matching transcript, so exact point-wise agreement is not expected.
 Large regions with contradictory signal need inspection before integration.
 
-## 2. Compare SNN and WNN
+## 2. Compare SNN and WNN partitions
 
 SNN combines shared edge support from one connectivity-map artifact per assay.
 WNN accepts one neighbour artifact per assay and learns how strongly each cell should rely on each modality.
 Both accept two or more assays and require matched cells.
 Matched neighbour counts (`k`) are required for SNN only; WNN warns and keeps `min(k)` when they differ.
 The RNA and ADT comparison here is the two-modality special case.
-
-## 3. Compare integrated partitions
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 2, figsize=(9, 4))
@@ -257,20 +265,24 @@ compare_signal(
 );
 ```
 
-## 4. Inspect WNN modality weights
+## 3. Inspect WNN modality weights
 
 WNN stores how much each cell relies on each modality inside the returned graph artifact.
 First check the weight constraints directly.
 
 ```{code-cell} ipython3
 weight_values = np.asarray(
-    ds.load_artifact(integrated_refs["wnn"])["modality_weights"][:]
+    ds.load_artifact(integrated_refs["wnn"])["modality_weights"][:],
+    dtype=np.float64,
 )
+weight_columns = [
+    f"{assay} weight"
+    for assay in integrated_parameters["wnn"]["assays"]
+]
 weight_frame = pd.DataFrame(
     weight_values,
-    columns=["RNA weight", "ADT weight"],
+    columns=weight_columns,
 )
-weight_values = weight_frame.to_numpy(dtype=np.float64)
 pd.Series(
     {
         "all finite": bool(np.isfinite(weight_values).all()),

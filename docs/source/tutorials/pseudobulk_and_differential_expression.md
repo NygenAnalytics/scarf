@@ -114,20 +114,19 @@ result = ds.run_statistical_testing(
     alternative="greater",
 )
 
-# Pin retrieval to the exact immutable result returned by the run.
+# Pin retrieval to the exact immutable result returned by statistical testing.
 loaded = ds.get_statistical_tests(result.artifact)
 loaded.tables["MALAT1"]
 ```
 
 ```{code-cell} ipython3
 # The plotted selection and test design must match the stored result.
-figure = ds.plots.distribution(
+ds.plots.distribution(
     ["MALAT1"],
     grouping=run["clusters"],
     groups=[1, 2],
     kind="violin",
     stats_results=result.artifact,
-    show=False,
 )
 ```
 
@@ -158,7 +157,11 @@ bulk, fractions = ds.make_bulk(
 )
 totals = bulk.sum().rename("total_counts")
 totals.index = totals.index.astype(str)
-pd.concat([group_sizes.rename("n_cells"), totals], axis=1)
+sample_metadata = pd.concat(
+    [group_sizes.rename("n_cells"), totals],
+    axis=1,
+)
+sample_metadata
 ```
 
 `bulk` contains summed raw counts. `fractions` contains the fraction of cells with a nonzero count
@@ -185,10 +188,6 @@ counts_csv = Path(analysis_directory.name) / "pseudobulk_counts.csv"
 metadata_csv = Path(analysis_directory.name) / "pseudobulk_metadata.csv"
 
 bulk.to_csv(counts_csv)
-sample_metadata = pd.concat(
-    [group_sizes.rename("n_cells"), totals],
-    axis=1,
-)
 sample_metadata.index.name = "group"
 sample_metadata.to_csv(metadata_csv)
 

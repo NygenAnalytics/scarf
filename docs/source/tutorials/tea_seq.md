@@ -158,11 +158,11 @@ for assay in ("RNA", "ATAC", "ADT"):
                     "kind": kind,
                     "operation": status.operation,
                     "artifact": ref.artifact_id[:12],
-                    "method": None,
-                    "dims": parameters.get("dims"),
-                    "k": parameters.get("k"),
-                    "top_n": parameters.get("top_n"),
-                    "skip_first": parameters.get("skip_first"),
+                    "parameters": {
+                        name: parameters[name]
+                        for name in ("dims", "k", "top_n", "skip_first")
+                        if name in parameters
+                    },
                 }
             )
 for ref in ds.list_artifacts(
@@ -178,11 +178,10 @@ for ref in ds.list_artifacts(
             "kind": ref.kind,
             "operation": status.operation,
             "artifact": ref.artifact_id[:12],
-            "method": parameters.get("method"),
-            "dims": None,
-            "k": None,
-            "top_n": None,
-            "skip_first": None,
+            "parameters": {
+                "method": parameters.get("method"),
+                "assays": parameters.get("assays"),
+            },
         }
     )
 pd.DataFrame(artifact_rows)
@@ -201,28 +200,18 @@ These layouts are independent outputs.
 Similar broad populations support a shared signal, while local differences can reflect complementary measurements or modality-specific noise.
 
 ```{code-cell} ipython3
-figure, axes = plt.subplots(2, 2, figsize=(10, 8))
-layout_panels = (
-    ("RNA", "RNA_UMAP"),
-    ("ATAC", "ATAC_UMAP"),
-    ("ADT", "ADT_UMAP"),
-    ("Three-way SNN", "RNA+ATAC+ADT_UMAP"),
+ds.plots.embedding(
+    layout_key=[
+        "RNA_UMAP",
+        "ATAC_UMAP",
+        "ADT_UMAP",
+        "RNA+ATAC+ADT_UMAP",
+    ],
+    color_by="tea_cell_type",
+    n_columns=2,
+    point_size=5,
+    legend_loc="right",
 )
-for index, (axis, (title, layout_key)) in enumerate(
-    zip(axes.flat, layout_panels, strict=True)
-):
-    ds.plots.embedding(
-        layout_key=layout_key,
-        color_by="tea_cell_type",
-        point_size=5,
-        legend_loc="right",
-        show_legend=index == len(layout_panels) - 1,
-        show_titles=False,
-        target=axis,
-        show=False,
-    )
-    axis.set_title(title)
-figure.tight_layout()
 ```
 
 The SNN layout is a joint view, not a reference truth.
@@ -250,7 +239,6 @@ The prepared WNN result has an immutable artifact reference and records its assa
 coordinate artifacts, and captures every source before planning.
 
 ```{code-cell} ipython3
-assays = ["RNA", "ATAC", "ADT"]
 wnn_ref = next(
     ref
     for ref in ds.list_artifacts(
@@ -261,8 +249,9 @@ wnn_ref = next(
     if (ds.inspect_artifact(ref).parameters or {}).get("method") == "wnn"
 )
 wnn_status = ds.inspect_artifact(wnn_ref)
+assays = list(wnn_status.parameters["assays"])
 
-assert wnn_status.parameters["assays"] == assays
+assert assays == ["RNA", "ATAC", "ADT"]
 pd.Series(
     {
         "artifact kind": wnn_ref.kind,
@@ -300,16 +289,14 @@ Mean modality weight by publication label shows which populations lean on RNA, A
 
 ```{code-cell} ipython3
 weight_frame = pd.DataFrame(
-    {
-        "RNA weight": weight_values[:, 0],
-        "ATAC weight": weight_values[:, 1],
-        "ADT weight": weight_values[:, 2],
-        "tea_cell_type": ds.cells.fetch("tea_cell_type", key="I"),
-    }
+    weight_values,
+    columns=[f"{assay} weight" for assay in assays],
 )
-weight_frame.groupby("tea_cell_type")[
-    ["RNA weight", "ATAC weight", "ADT weight"]
-].agg(["count", "mean"]).round(3)
+weight_frame["tea_cell_type"] = ds.cells.fetch("tea_cell_type", key="I")
+weight_columns = [f"{assay} weight" for assay in assays]
+weight_frame.groupby("tea_cell_type")[weight_columns].agg(
+    ["count", "mean"]
+).round(3)
 ```
 
 Plotting all three weights on the integrated layout shows where the graph relies more strongly on each local neighbourhood.
@@ -323,7 +310,7 @@ figure, axes = plt.subplots(1, 3, figsize=(12, 4))
 for axis, values, title in zip(
     axes,
     weight_values.T,
-    ("RNA weight", "ATAC weight", "ADT weight"),
+    weight_columns,
     strict=True,
 ):
     points = axis.scatter(
@@ -341,26 +328,16 @@ Place the three-way SNN and WNN layouts side by side under the same cell-type co
 Broad populations should agree; local rearrangements need marker and weight support before interpretation.
 
 ```{code-cell} ipython3
-figure, axes = plt.subplots(1, 2, figsize=(10, 4))
-integration_panels = (
-    ("Three-way SNN", "RNA+ATAC+ADT_UMAP"),
-    ("Three-way WNN", "RNA+ATAC+ADT_wnn_UMAP"),
+ds.plots.embedding(
+    layout_key=[
+        "RNA+ATAC+ADT_UMAP",
+        "RNA+ATAC+ADT_wnn_UMAP",
+    ],
+    color_by="tea_cell_type",
+    n_columns=2,
+    point_size=5,
+    legend_loc="right",
 )
-for index, (axis, (title, layout_key)) in enumerate(
-    zip(axes, integration_panels, strict=True)
-):
-    ds.plots.embedding(
-        layout_key=layout_key,
-        color_by="tea_cell_type",
-        point_size=5,
-        legend_loc="right",
-        show_legend=index == 1,
-        show_titles=False,
-        target=axis,
-        show=False,
-    )
-    axis.set_title(title)
-figure.tight_layout()
 ```
 
 The same ADT panel on the WNN layout checks whether lineage landmarks remain coherent after per-cell reweighting.

@@ -30,7 +30,7 @@ Scarf exposes graphs, bounded count streams, metadata tables, and export formats
 
 The published PBMC store supplies the counts and active-cell metadata for the examples below.
 The page structurally repacks those counts, mounts them into a separate analysis store, and
-rebuilds the graph with exact artifact references.
+uses the standard RNA pipeline to rebuild the graph with exact artifact references.
 Only the graph-statistic and `wellConnected` path uses `load_graph`.
 Streaming, `set_feature_selection`, custom reduction, `to_anndata`, and `SubsetZarr` do not.
 See {doc}`graph_construction` to build a graph by hand.
@@ -65,19 +65,20 @@ ds = scarf.mount_datastore(
     default_assay="RNA",
     nthreads=4,
 )
-cell_selection = ds.snapshot_cell_selection(cell_key="I")
-hvg_ref = ds.select_hvgs(
-    cell_selection,
-    min_cells=20,
-    top_n=500,
-    show_plot=False,
+setup = ds.pipeline.run(
+    filtering=False,
+    hvg_count=500,
+    pca_dims=15,
+    umap=False,
+    leiden=False,
+    cell_cycle=False,
+    paris=False,
+    doublets=False,
+    markers=False,
 )
-normalized = ds.run_normalization(cell_selection, hvg_ref)
-pca = ds.run_pca(normalized, dims=15)
-initialization = ds.build_embedding_initialization(pca)
-ann_index = ds.build_ann_index(pca)
-neighbors = ds.query_neighbors(ann_index, k=11)
-graph_ref = ds.build_connectivity_map(neighbors)
+hvg_ref = setup["highly_variable_features"]
+graph_ref = setup["connectivity_map"]
+initialization = ds.build_embedding_initialization(setup["pca"])
 umap_ref = ds.run_umap(
     graph_ref,
     initialization,
@@ -251,12 +252,7 @@ adata.shape, adata.var_names.tolist()
 ```
 
 ```{code-cell} ipython3
-from pathlib import Path
-import shutil
-
-subset_path = Path("scarf_datasets/custom_analyses_subset.zarr")
-if subset_path.exists():
-    shutil.rmtree(subset_path)
+subset_path = Path(analysis_directory.name) / "custom_analyses_subset.zarr"
 
 writer = scarf.SubsetZarr(
     zarr_loc=str(subset_path),

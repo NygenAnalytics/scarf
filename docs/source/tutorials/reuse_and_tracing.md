@@ -104,11 +104,13 @@ The normalization, PCA, and ANN references are unchanged.
 neighbors_k15 = ds.query_neighbors(ann, k=15)
 graph_k15 = ds.build_connectivity_map(neighbors_k15)
 
-print('normalization reused:', ds.run_normalization(cell_selection, hvg_ref) == normalized)
-print('PCA reused:', ds.run_pca(normalized, dims=15) == pca)
-print('ANN index reused:', ds.build_ann_index(pca) == ann)
-print('neighbors recomputed:', neighbors_k15 != neighbors_k11)
-print('graph recomputed:', graph_k15 != graph_k11)
+{
+    'normalization reused': ds.run_normalization(cell_selection, hvg_ref) == normalized,
+    'PCA reused': ds.run_pca(normalized, dims=15) == pca,
+    'ANN index reused': ds.build_ann_index(pca) == ann,
+    'neighbors recomputed': neighbors_k15 != neighbors_k11,
+    'graph recomputed': graph_k15 != graph_k11,
+}
 ```
 
 Degree and edge-weight distributions shift with `k` even though the upstream artifacts are identical:
@@ -134,11 +136,13 @@ ann_dims20 = ds.build_ann_index(pca_dims20)
 neighbors_dims20 = ds.query_neighbors(ann_dims20, k=11)
 graph_dims20 = ds.build_connectivity_map(neighbors_dims20)
 
-print('PCA recomputed:', pca_dims20 != pca)
-print('ANN index recomputed:', ann_dims20 != ann)
-print('neighbors recomputed:', neighbors_dims20 != neighbors_k11)
-print('graph recomputed:', graph_dims20 != graph_k11)
-print('normalization reused:', ds.run_normalization(cell_selection, hvg_ref) == normalized)
+{
+    'PCA recomputed': pca_dims20 != pca,
+    'ANN index recomputed': ann_dims20 != ann,
+    'neighbors recomputed': neighbors_dims20 != neighbors_k11,
+    'graph recomputed': graph_dims20 != graph_k11,
+    'normalization reused': ds.run_normalization(cell_selection, hvg_ref) == normalized,
+}
 ```
 
 ## 4. Force recompute
@@ -161,14 +165,16 @@ baseline = ds.inspect_artifact(normalized)
 baseline_inputs = baseline.inputs or {}
 forced_inputs = status.inputs or {}
 
-print('new artifact:', forced != normalized)
-print('complete:', status.complete)
-print('operation:', status.operation)
-print('path:', status.path)
-print('baseline path:', baseline.path)
-print('same parameters:', status.parameters == baseline.parameters)
-print('same input roles:', set(baseline_inputs) == set(forced_inputs))
-print('same inputs:', forced_inputs == baseline_inputs)
+{
+    'new artifact': forced != normalized,
+    'complete': status.complete,
+    'operation': status.operation,
+    'path': status.path,
+    'baseline path': baseline.path,
+    'same parameters': status.parameters == baseline.parameters,
+    'same input roles': set(baseline_inputs) == set(forced_inputs),
+    'same inputs': forced_inputs == baseline_inputs,
+}
 ```
 
 ## 5. Compare lineage
@@ -193,12 +199,12 @@ The `k` branches should diverge after the ANN index.
 The `dims=20` branch should fork earlier, at PCA, then carry its own ANN, neighbours, and graph.
 
 Export the same report when it needs to travel with an analysis.
-`to_markdown()` is what notebook display uses; showing it here makes that export explicit:
+`to_markdown()` is what notebook display uses. Inspect a short preview before writing or sending
+the complete string elsewhere:
 
 ```{code-cell} ipython3
-from IPython.display import Markdown
-
-Markdown(lineage.to_markdown())
+lineage_markdown = lineage.to_markdown()
+lineage_markdown.splitlines()[:12]
 ```
 
 `lineage.to_mermaid()` returns only the diagram source when a tooling pipeline needs that form alone.

@@ -31,7 +31,6 @@ This tutorial follows one recommended path from a peak-count matrix to broad chr
 ## Dataset
 
 ```{code-cell} ipython3
-import matplotlib.pyplot as plt
 import numpy as np
 
 import scarf
@@ -182,8 +181,7 @@ UMAP and Leiden results remain immutable artifacts aligned to the stored selecti
 Plot the UMAP embedding colored by Leiden clusters:
 
 ```{code-cell} ipython3
-umap_values = np.asarray(ds.load_artifact(umap)['values'][:])
-plt.scatter(umap_values[:, 0], umap_values[:, 1], c=cluster_values, s=3)
+ds.plots.embedding(layout=umap, color_by=clusters)
 ```
 
 The embedding should separate several broad PBMC accessibility states rather than form one undifferentiated cloud.

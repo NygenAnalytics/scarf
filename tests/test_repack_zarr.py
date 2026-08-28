@@ -5,6 +5,7 @@ import pytest
 import zarr
 from zarr.codecs import ZstdCodec
 
+import scarf.storage.pipeline_runs as pipeline_run_storage
 from scarf.storage.ann_index import (
     ANN_INDEX_CHUNK_BYTES,
     ANN_INDEX_FORMAT_VERSION,
@@ -227,22 +228,19 @@ def test_repack_preserves_non_count_completion_attrs(tmp_path):
     assert result["artifacts/marker_table/slot"].attrs["complete"] is True
 
 
-def test_repack_copies_completed_and_incomplete_pipeline_records_verbatim(tmp_path):
-    source = tmp_path / "source_runs.zarr"
-    output = tmp_path / "output_runs.zarr"
-    root = zarr.open_group(str(source), mode="w", zarr_format=2)
-    assay = root.create_group("RNA")
-    assay.attrs["is_assay"] = True
-    assay.create_array(
-        "counts",
-        data=np.arange(6, dtype=np.uint32).reshape(2, 3),
-        chunks=(2, 3),
-    )
-
+def _seed_labeled_pipeline_records(
+    root,
+    *,
+    artifact_id,
+    completed_run_id,
+    running_run_id,
+    completed_label,
+    running_label,
+):
     artifact = ArtifactRef(
         scope="datastore",
         kind="cell_selection",
-        artifact_id="c" * 64,
+        artifact_id=artifact_id,
     )
     artifact_node = root.create_group(artifact_path(artifact))
     artifact_node.attrs.update(
@@ -263,12 +261,12 @@ def test_repack_copies_completed_and_incomplete_pipeline_records_verbatim(tmp_pa
     completed = create_pipeline_run_record(
         root,
         recipe="basic_rna_analysis",
-        requested_label="baseline",
+        requested_label=completed_label,
         assay="RNA",
         config={"filtering": False},
         stage_order=("snapshot",),
         scarf_version="1.0.0",
-        run_id="a" * 64,
+        run_id=completed_run_id,
         started_at_ns=100,
     )
     start_pipeline_stage_record(
@@ -306,12 +304,12 @@ def test_repack_copies_completed_and_incomplete_pipeline_records_verbatim(tmp_pa
     running = create_pipeline_run_record(
         root,
         recipe="basic_rna_analysis",
-        requested_label="interrupted",
+        requested_label=running_label,
         assay="RNA",
         config={"filtering": True},
         stage_order=("snapshot",),
         scarf_version="1.0.0",
-        run_id="b" * 64,
+        run_id=running_run_id,
         started_at_ns=200,
     )
     start_pipeline_stage_record(
@@ -321,28 +319,89 @@ def test_repack_copies_completed_and_incomplete_pipeline_records_verbatim(tmp_pa
         stage="snapshot",
         started_at_ns=210,
     )
-    record_paths = (
-        f"pipeline/runs/{completed.run_id}",
-        f"pipeline/runs/{completed.run_id}/stages/0",
-        f"pipeline/runs/{running.run_id}",
-        f"pipeline/runs/{running.run_id}/stages/0",
+    pipeline_run_storage._claim_pipeline_label(
+        root,
+        running_label,
+        running.run_id,
+    )
+    return completed.run_id, running.run_id
+
+
+def test_repack_copies_pipeline_records_and_label_claims_in_all_workspaces(tmp_path):
+    source = tmp_path / "source_runs.zarr"
+    output = tmp_path / "output_runs.zarr"
+    root = zarr.open_group(str(source), mode="w", zarr_format=2)
+    assay = root.create_group("RNA")
+    assay.attrs["is_assay"] = True
+    assay.create_array(
+        "counts",
+        data=np.arange(6, dtype=np.uint32).reshape(2, 3),
+        chunks=(2, 3),
+    )
+
+    root_run_ids = _seed_labeled_pipeline_records(
+        root,
+        artifact_id="c" * 64,
+        completed_run_id="a" * 64,
+        running_run_id="b" * 64,
+        completed_label="baseline",
+        running_label="interrupted",
+    )
+    workspace = root.create_group("analysis_workspace")
+    workspace_run_ids = _seed_labeled_pipeline_records(
+        workspace,
+        artifact_id="f" * 64,
+        completed_run_id="d" * 64,
+        running_run_id="e" * 64,
+        completed_label="workspace-baseline",
+        running_label="workspace-interrupted",
+    )
+    namespaces = (
+        ("", root, root_run_ids, "baseline", "interrupted"),
+        (
+            "analysis_workspace",
+            workspace,
+            workspace_run_ids,
+            "workspace-baseline",
+            "workspace-interrupted",
+        ),
+    )
+    record_paths = tuple(
+        f"{prefix + '/' if prefix else ''}pipeline/runs/{run_id}{suffix}"
+        for prefix, _namespace, run_ids, _completed_label, _running_label in namespaces
+        for run_id in run_ids
+        for suffix in ("", "/stages/0")
     )
     source_attrs = {path: dict(root[path].attrs) for path in record_paths}
 
     repack_store(str(source), str(output))
 
-    result = zarr.open_group(str(output), mode="r")
+    result = zarr.open_group(str(output), mode="r+")
     assert {path: dict(result[path].attrs) for path in record_paths} == source_attrs
-    assert load_pipeline_run_record(
-        result, completed.run_id
-    ) == load_pipeline_run_record(
-        root,
-        completed.run_id,
-    )
-    assert load_pipeline_run_record(result, running.run_id) == load_pipeline_run_record(
-        root,
-        running.run_id,
-    )
+    for prefix, source_root, run_ids, completed_label, running_label in namespaces:
+        result_root = result if prefix == "" else result[prefix]
+        completed_run_id, running_run_id = run_ids
+        assert load_pipeline_run_record(
+            result_root,
+            completed_run_id,
+        ) == load_pipeline_run_record(source_root, completed_run_id)
+        assert load_pipeline_run_record(
+            result_root,
+            running_run_id,
+        ) == load_pipeline_run_record(source_root, running_run_id)
+
+        with pytest.raises(ValueError, match="already committed"):
+            pipeline_run_storage._claim_pipeline_label(
+                result_root,
+                completed_label,
+                "1" * 64,
+            )
+        with pytest.raises(ValueError, match="currently being finalized"):
+            pipeline_run_storage._claim_pipeline_label(
+                result_root,
+                running_label,
+                "2" * 64,
+            )
 
 
 def test_repack_skips_copying_counts_t_when_sharding(tmp_path, monkeypatch):

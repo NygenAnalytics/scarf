@@ -37,6 +37,12 @@ only when the complete recipe succeeds. A handled failure or interruption first 
 stage and run details. A hard process death can leave a run or stage incomplete. There is no
 on-disk resume, repair, or same-ID retry protocol.
 
+Requested run labels use append-only atomic claims below
+`pipeline/runs/.label-claims/{labelDigest}` while a run is finalized. The completed run record is
+the public and legacy-compatible label owner. Failed, interrupted, and removed predecessors can be
+bypassed by a later claim; a live or unclean incomplete predecessor blocks the same label and fails
+closed. A storage backend without atomic conditional creation cannot finalize a labeled run.
+
 The first stage stores a cell-selection artifact, a `feature_universe` all-feature selection, and
 full-axis cell and feature metadata snapshots. Frozen `run.features["I"]` is backed by that
 immutable feature selection rather than the live feature `I` column. Stored selection integrity
@@ -49,8 +55,9 @@ process-tree RSS metrics. Artifact reuse comes from planning receipts, never tim
 Timing, memory, run identity, and reuse state remain in the run ledger and never mutate an artifact.
 New artifacts store immutable creation time and creator Scarf version for diagnostics only.
 
-`repack_zarr` copies run records because it preserves the axes. Subset and merge outputs do not
-copy source runs.
+`repack_zarr` copies run records and their append-only label claims because it preserves the axes.
+This applies to the root datastore and nested workspaces. Subset and merge outputs do not copy
+source runs.
 An overwriting merge clears pipeline records and datastore-scoped artifacts in its destination
 workspace while preserving unrelated root siblings.
 

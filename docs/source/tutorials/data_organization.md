@@ -72,6 +72,8 @@ This page uses the pre-analyzed Bastidas-Ponce pancreas store also used in {doc}
 The published store contains literal UMAP coordinates and cluster labels. First repack it
 structurally into a temporary source with the paired RNA count layout, then mount those count
 matrices into a fresh writable target. The published source stays untouched.
+The pipeline keeps every live `I` cell, builds one Leiden partition, and searches its markers;
+UMAP and unrelated stages are disabled.
 
 ```{code-cell} ipython3
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
@@ -95,27 +97,22 @@ ds = scarf.mount_datastore(
     nthreads=4,
 )
 
-cell_selection = ds.snapshot_cell_selection(cell_key='I')
-hvg_ref = ds.select_hvgs(
-    cell_selection,
-    min_cells=20,
-    top_n=500,
-    show_plot=False,
+analysis_run = ds.pipeline.run(
+    filtering=False,
+    hvg_count=500,
+    pca_dims=15,
+    umap=False,
+    leiden={'partitions': [0.5]},
+    cell_cycle=False,
+    paris=False,
+    doublets=False,
+    markers=True,
 )
-normalized = ds.run_normalization(cell_selection, hvg_ref)
-pca = ds.run_pca(normalized, dims=15)
-ann = ds.build_ann_index(pca)
-neighbors = ds.query_neighbors(ann, k=11)
-graph = ds.build_connectivity_map(neighbors)
-clusters_ref = ds.run_leiden_clustering(graph, resolution=0.5)
-all_features = ds.set_feature_selection(
-    from_assay='RNA',
-    feature_indexes=range(ds.RNA.feats.N),
-)
-marker_ref = ds.run_marker_search(
-    clusters_ref,
-    features=all_features,
-)
+cell_selection = analysis_run['analysis_cell_selection']
+hvg_ref = analysis_run['highly_variable_features']
+normalized = analysis_run['normalized']
+clusters_ref = analysis_run['clusters']
+marker_ref = analysis_run['markers']
 
 ds
 ```
@@ -338,7 +335,7 @@ print('Current method:', ds.RNA.normMethod.__name__)
 ## 5. Inspect persisted analysis results
 
 Analysis methods return lightweight references to results stored in Zarr.
-The setup retained the HVG and normalization references it created in the mounted target.
+The pipeline retained the HVG and normalization references it created in the mounted target.
 Asking for the same normalization again reuses that result rather than recomputing:
 
 ```{code-cell} ipython3
@@ -364,9 +361,10 @@ Branching, invalidation, and lineage are covered in {doc}`reuse_and_tracing`.
 
 ## 6. Marker features
 
-`run_marker_search` writes a `marker_table` artifact like any other result and returns its exact
-reference. Pass that ref to table, plot, and export accessors. Different clustering or feature refs
-naturally produce distinct artifacts.
+Marker search writes a `marker_table` artifact like any other result. The pipeline returns its
+exact ref as `analysis_run['markers']`; an explicit `run_marker_search` call follows the same
+artifact contract. Pass that ref to table, plot, and export accessors. Different clustering or
+feature refs naturally produce distinct artifacts.
 
 Fetch one group with `get_markers`, plot the stored table with `marker_heatmap`, or export all groups with `export_markers_to_csv`.
 

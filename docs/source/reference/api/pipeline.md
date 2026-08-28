@@ -73,12 +73,15 @@ run = ds.pipeline.run(leiden={"partitions": [0.4, 0.8]})
 ```
 
 At least one Leiden or Paris candidate is required when doublets or markers are enabled.
+Setting `umap=False` skips both embedding initialization and UMAP, so neither artifact appears in
+the completed run.
 
 `filtering=None` uses automatic filtering over available assay QC columns. Set it to `False` to
 retain the captured input selection, or pass a configuration mapping. Automatic filtering accepts
 `attrs`, `min_p`, `max_p`, and optionally `sample_column`, `n_mads`, and
 `min_cells_per_sample`. Manual filtering requires aligned `attrs`, `lows`, and `highs`, with an
-optional `keep_bounds` value.
+optional Boolean `keep_bounds` value. Probability, MAD, and manual-bound values must be finite
+numbers when present; booleans and numeric strings are rejected rather than coerced.
 
 ```python
 run = ds.pipeline.run(
@@ -177,7 +180,10 @@ interrupted = ds.pipeline.list_runs(status="interrupted")
 
 `open` requires exactly one of `run_id` or `label`. Only a successfully completed run acquires its
 requested label. Failed and interrupted attempts do not reserve it. `list_runs` returns newest
-first and includes all statuses unless filtered.
+first and includes all statuses unless filtered. Concurrent finalizers use an atomic label claim,
+so at most one completed run can acquire a name. A storage backend without atomic conditional
+creation rejects labeled finalization; unlabeled runs are unaffected. An unclean incomplete
+finalizer blocks reuse of its requested label and fails closed.
 
 Every status exposes identity, status, and `run.report(format="dict" | "markdown")`. Only a
 completed run exposes mapping outputs and frozen views. Reports include stage timing, sampled
@@ -200,6 +206,8 @@ record that signal protection was unavailable.
 
 `KeyboardInterrupt` and an escaped `asyncio.CancelledError` use the same durable interruption
 boundary. Ordinary stage exceptions produce a failed run instead.
+If a termination signal races with an ordinary failure or the final successful handoff, the
+pipeline preserves that durable outcome and still propagates the pending signal after cleanup.
 
 `SIGKILL`, `SIGSTOP`, out-of-memory termination, power loss, and expired shutdown grace periods
 cannot perform cleanup. Their durable contract is an incomplete artifact or run, followed by a new

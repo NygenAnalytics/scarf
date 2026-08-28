@@ -53,27 +53,30 @@ ds = scarf.mount_datastore(
 )
 ```
 
-With the source mounted, build the normalized representation and the graph used by every
-comparison below.
+With the source mounted, one pipeline invocation builds the shared graph and all clustering
+candidates compared below. UMAP remains an explicit display step because this page uses
+non-default layout settings; it does not affect the graph or cluster candidates.
 
 ```{code-cell} ipython3
-cell_selection = ds.filter_cells(
-    attrs=["RNA_nCounts", "RNA_nFeatures", "RNA_percentMito"],
-    highs=[15000, 4000, 15],
-    lows=[1000, 500, 0],
+clustering_run = ds.pipeline.run(
+    filtering={
+        "method": "manual",
+        "attrs": ["RNA_nCounts", "RNA_nFeatures", "RNA_percentMito"],
+        "lows": [1000, 500, 0],
+        "highs": [15000, 4000, 15],
+    },
+    hvg_count=500,
+    pca_dims=15,
+    neighbors_k=11,
+    umap=False,
+    leiden={"partitions": [0.3, 0.5, 0.8]},
+    cell_cycle=False,
+    paris=True,
+    doublets=False,
+    markers=False,
 )
-features = ds.select_hvgs(
-    cell_selection,
-    min_cells=20,
-    top_n=500,
-    show_plot=False,
-)
-normalized = ds.run_normalization(cell_selection, features)
-pca = ds.run_pca(normalized, dims=15)
-initialization = ds.build_embedding_initialization(pca)
-ann = ds.build_ann_index(pca)
-neighbors = ds.query_neighbors(ann, k=11)
-graph = ds.build_connectivity_map(neighbors)
+graph = clustering_run["connectivity_map"]
+initialization = ds.build_embedding_initialization(clustering_run["pca"])
 umap = ds.run_umap(
     graph,
     initialization,
@@ -92,7 +95,7 @@ feature effects out of the comparison.
 
 ```{code-cell} ipython3
 leiden_refs = {
-    resolution: ds.run_leiden_clustering(graph, resolution=resolution)
+    resolution: clustering_run[f"leiden_{resolution}"]
     for resolution in (0.3, 0.5, 0.8)
 }
 leiden_values = {
@@ -150,7 +153,8 @@ pd.DataFrame(agreement)
 ## 3. Inspect membership strength
 
 Use the chosen cluster ref directly. The result is another axis-aligned artifact, not a metadata
-column.
+column. Resolution `0.5` is fixed here for the diagnostic walkthrough; it is separate from the
+pipeline's automatic candidate choice discussed in section 6.
 
 ```{code-cell} ipython3
 chosen = leiden_refs[0.5]
@@ -183,11 +187,11 @@ otherwise coherent groups may represent continuous biology.
 
 ## 4. Compare Paris cuts
 
-`run_paris_clustering` returns a `cluster_cut` ref. Load the domain result explicitly when hierarchy
-diagnostics are needed.
+The pipeline's `paris` output is a `cluster_cut` ref, the same type returned by
+`run_paris_clustering`. Load the domain result explicitly when hierarchy diagnostics are needed.
 
 ```{code-cell} ipython3
-paris_auto = ds.run_paris_clustering(graph, n_clusters="auto")
+paris_auto = clustering_run["paris"]
 paris_result = ds.load_paris_clustering(paris_auto)
 pd.DataFrame([asdict(item) for item in paris_result.diagnostics])[
     ["label", "size", "persistence", "decision_margin", "forced"]
@@ -260,15 +264,13 @@ support, technical covariates, replicate coverage, and the study question.
 
 ## 6. Pipeline cluster selection
 
-The standard RNA pipeline runs Leiden at `0.5`, `0.75`, `1.0`, and `1.25` plus Paris. Its
-`cluster_selection` stage evaluates every valid candidate with one deterministic sample of at most
-10,000 cells in PCA space. It persists the scores, invalid-candidate reasons, tie order, and selected
-key:
+The pipeline used above also evaluates its three Leiden candidates and Paris result with one
+deterministic sample of at most 10,000 cells in PCA space. Its `cluster_selection` artifact persists
+the scores, invalid-candidate reasons, tie order, and selected key:
 
 ```python
-run = ds.pipeline.run()
-decision_ref = run["cluster_selection"]
-selected_cluster_ref = run["clusters"]
+decision_ref = clustering_run["cluster_selection"]
+selected_cluster_ref = clustering_run["clusters"]
 ```
 
 This automatic choice is a reproducible baseline, not proof that the selected resolution is best

@@ -336,10 +336,11 @@ policy = enrichment.policies[0]
 The family policy is advisory.
 The feature-selection API accepts an exact selection or regular-expression blacklist, so do not silently translate family names into guessed feature names.
 
-## 3. Preprocess through normalization
+## 3. Prepare a frozen baseline
 
-Start with one durable pipeline run. Parameter Tuning consumes its exact normalized artifact and
-creates independent PCA, neighbour, graph, and clustering candidates without changing the run.
+Start with one durable pipeline run. It supplies frozen metadata, normalization, and a current
+graph to Experimental Context. Parameter Tuning consumes the exact normalized artifact and creates
+its own PCA, neighbour, graph, and clustering candidate without changing the run.
 
 ```{code-cell} ipython3
 run = ds.pipeline.run(
@@ -350,7 +351,8 @@ run = ds.pipeline.run(
         "lows": [1000, 500, 0],
     },
     hvg_count=500,
-    leiden={"partitions": [0.5]},
+    umap=False,
+    leiden=False,
     cell_cycle=False,
     paris=False,
     doublets=False,
@@ -371,7 +373,7 @@ hvg_ref = run["highly_variable_features"]
 
 Experimental Context classifies metadata and authorizes an exact Harmony batch-column set only when the design supports it.
 Passing the completed run binds metadata and integration metrics to its frozen cell selection and
-graph artifacts.
+graph artifact.
 This single-donor store has no treatment or batch labels, so the grounded action is to keep an uncorrected baseline.
 
 ```{code-cell} ipython3
@@ -401,8 +403,9 @@ Downstream tuning receives the exact batch action and columns, rather than repar
 ## 5. Evaluate one authorized parameter branch
 
 The original notebook screens five defaults.
-For a bounded documentation run, authorize one explicit baseline and disable refinement.
-The candidate still executes normalization consumers, PCA, neighbours, graph construction, Leiden clustering, and its available diagnostics against the fresh store.
+For a bounded documentation run, authorize one explicit candidate and disable refinement.
+The candidate executes PCA, neighbours, graph construction, Leiden clustering, and its available
+diagnostics against the baseline run's exact normalized artifact.
 
 ```{code-cell} ipython3
 if experimental.status != "done":
@@ -483,13 +486,6 @@ biology = BiologicalInterpretationAgent(
     "tool_calls": [call.toolName for call in biology.runInfo.toolCalls],
     "treatment_observations": len(biology.treatmentObservations),
     "limitations": biology.limitations,
-}
-```
-
-```{code-cell} ipython3
-{
-    "cluster_artifact": biology_handoff.clusterArtifact.artifactId,
-    "cell_selection": biology_handoff.cellSelection.artifactId,
 }
 ```
 

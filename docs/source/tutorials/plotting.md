@@ -42,6 +42,7 @@ not select an artifact by name.
 ```{code-cell} ipython3
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import matplotlib.pyplot as plt
 
@@ -282,14 +283,24 @@ A dotplot shows two summaries at once: color is mean expression in the group, si
 Pass an ordered mapping if you want gene-group brackets.
 `sample_by` makes each sample contribute equal weight instead of letting large samples dominate.
 
-The `demo_sample` column below is synthetic demo metadata for equal sample weighting in this showcase.
-It is not an experimental sample annotation.
+The three `demo_*` columns below are synthetic study-design metadata for this showcase. They are
+not experimental annotations.
 
 ```{code-cell} ipython3
 n = len(ds.cells.active_index("I"))
 ds.cells.insert(
     "demo_sample",
     [f"s{i % 8}" for i in range(n)],
+    overwrite=True,
+)
+ds.cells.insert(
+    "demo_subject",
+    [f"d{i % 4}" for i in range(n)],
+    overwrite=True,
+)
+ds.cells.insert(
+    "demo_condition",
+    ["before" if i % 8 < 4 else "after" for i in range(n)],
     overwrite=True,
 )
 
@@ -323,21 +334,7 @@ Use composition plots when you care about how cell types change across samples.
 `kind="per_sample"` draws one point per sample.
 With subject and condition fields, Scarf connects the same subject across conditions inside each category.
 
-The `demo_subject` and `demo_condition` columns below are synthetic demo metadata for this showcase.
-They are not experimental sample annotations.
-
 ```{code-cell} ipython3
-ds.cells.insert(
-    "demo_subject",
-    [f"d{i % 4}" for i in range(n)],
-    overwrite=True,
-)
-ds.cells.insert(
-    "demo_condition",
-    ["before" if i % 8 < 4 else "after" for i in range(n)],
-    overwrite=True,
-)
-
 ds.plots.composition(
     category_by="clusters",
     study_design=splt.StudyDesign(
@@ -419,8 +416,8 @@ The default background is opaque white for light themes and charcoal (`#111111`)
 Pass `transparent=True` when the destination supplies its own background, and call `close()` when you are done with an owned figure.
 
 ```{code-cell} ipython3
-out = Path("scarf_datasets") / "plotting_showcase_embedding.png"
-out.parent.mkdir(parents=True, exist_ok=True)
+output_directory = TemporaryDirectory()
+out = Path(output_directory.name) / "plotting_showcase_embedding.png"
 result = ds.plots.embedding(
     layout_key="RNA_UMAP",
     color_by="clusters",
@@ -494,17 +491,16 @@ The figure belongs to the caller because Matplotlib created it.
 Save through `composite.save(...)` when provenance is needed, then close it explicitly.
 
 ```{code-cell} ipython3
-composite_out = (
-    Path("scarf_datasets") / "plotting_publication_composite.svg"
-)
+composite_out = Path(output_directory.name) / "plotting_composite.svg"
 composite.save(
     composite_out,
     exact_size=True,
     provenance_sidecar=True,
 )
 composite_sidecar = composite_out.with_suffix(composite_out.suffix + ".json")
+assert composite_out.exists()
+assert composite_sidecar.exists()
 print(composite_out)
-print(json.dumps(json.loads(composite_sidecar.read_text())["provenance"], indent=2))
 plt.close(figure)
 ```
 

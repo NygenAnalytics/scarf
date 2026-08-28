@@ -38,7 +38,6 @@ import numpy as np
 import pandas as pd
 
 import scarf
-import scarf.plotting as splt
 from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level="WARNING", progress=True)

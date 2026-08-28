@@ -30,8 +30,8 @@ It is not evidence for Scarf's scaling claims; see {doc}`../concepts/memory_and_
 
 - Convert Cell Ranger H5 to Zarr and open a `DataStore`
 - Filter cells without deleting them from the store
-- Select informative genes and build a neighbourhood graph step by step
-- Run UMAP and Leiden clustering on that graph
+- Run the standard RNA pipeline and inspect its exact outputs
+- Check feature selection, normalization, PCA, graph, UMAP, and Leiden results
 - Compare the Leiden result with Scarf's hierarchical Paris alternative
 - Rank marker genes per cluster and inspect known immune markers
 
@@ -119,30 +119,50 @@ ds.plots.distribution(
 Each violin is one QC metric before filtering; set thresholds from the tails of these distributions.
 
 ```{code-cell} ipython3
-n_before = int(ds.cells.fetch_all('I').sum())
-cell_selection = ds.filter_cells(
-    attrs=['RNA_nCounts', 'RNA_nFeatures', 'RNA_percentMito'],
-    highs=[15000, 4000, 15],
-    lows=[1000, 500, 0]
-)
-cell_mask = np.asarray(ds.load_artifact(cell_selection)['values'][:], dtype=bool)
-print(f'Cells in input selection: {n_before}')
-print(f'Cells after filter: {int(cell_mask.sum())}')
-print(f'Excluded cells: {int((~cell_mask).sum())}; total in store: {len(cell_mask)}')
+manual_filter = {
+    "method": "manual",
+    "attrs": ["RNA_nCounts", "RNA_nFeatures", "RNA_percentMito"],
+    "highs": [15000, 4000, 15],
+    "lows": [1000, 500, 0],
+}
 ```
 
-```{note}
-Filtering returns an immutable selection artifact and does not change the boolean cell key `I` or
-delete rows. Pass that exact ref to downstream analytical producers. See {doc}`data_organization`.
-```
+## 3. Run the standard RNA pipeline
+
+Pass the QC bounds to one pipeline run. This produces one durable record whose outputs retain the
+exact selection, feature, reduction, graph, clustering, and marker refs used together. The QC
+columns are frozen with the run so later plots do not depend on mutable live metadata.
 
 ```{code-cell} ipython3
-pd.DataFrame({key: ds.cells.fetch_all(key)[cell_mask] for key in qc_cols}).describe()
+run = ds.pipeline.run(
+    filtering=manual_filter,
+    hvg_count=500,
+    pca_dims=15,
+    neighbors_k=11,
+    leiden={"partitions": [0.5]},
+    cell_cycle=False,
+    paris=False,
+    doublets=False,
+    markers=True,
+    snapshot_columns=qc_cols,
+)
+
+graph_ref = run["connectivity_map"]
+leiden = run["clusters"]
+marker_ref = run["markers"]
+
+cell_mask = run.cells.fetch_all("I")
+print(f"Cells in input selection: {int(ds.cells.fetch_all('I').sum())}")
+print(f"Cells after filter: {int(cell_mask.sum())}")
+print(f"Excluded cells: {int((~cell_mask).sum())}; total in store: {len(cell_mask)}")
+run.cells.to_pandas_dataframe(qc_cols).describe()
 ```
 
-The summary now covers only the cells selected by the returned artifact.
+Filtering returns an immutable selection artifact and does not change live `I` or delete rows. The
+summary covers only cells selected by the run. See {doc}`data_organization` for branching from
+exact output refs and {doc}`reuse_and_tracing` for reopening and comparing runs.
 
-## 3. Feature selection
+## 4. Inspect feature selection and normalization
 
 `select_hvgs` ranks genes by corrected variance and returns an immutable {term}`feature selection`
 artifact and leaves feature metadata unchanged.
@@ -153,34 +173,22 @@ Use `blacklist=""` to keep all names, pass a custom regular expression for a dat
 The {doc}`feature_selection` guide explains the exact patterns and how to compare feature sets.
 
 ```{code-cell} ipython3
-hvg_ref = ds.select_hvgs(
-    cell_selection,
-    min_cells=20,
-    top_n=500,
-    min_mean=-3,
-    max_mean=2,
-    max_var=6,
-    show_plot=True,
-)
 print(
-    'Selected genes:',
-    int(np.asarray(ds.load_artifact(hvg_ref)['values'][:]).sum()),
+    "Selected genes:",
+    int(np.count_nonzero(run.features.fetch("highly_variable_features"))),
 )
-hvg_ref
+print("HVG artifact:", run["highly_variable_features"])
 ```
 
 The selected genes should span the fitted mean-variance trend rather than being concentrated among only the most abundant genes.
 Very few retained genes or a selection dominated by one gene family warrants inspection before continuing.
-
-## 4. Normalization
 
 By default, `run_normalization` scales each selected cell profile by the sum of its selected features (here the HVGs; `renormalize_subset=True`), multiplies by `ds.RNA.sf`, and applies log1p (`log_transform=True`).
 Full `RNA_nCounts` library size is used only when `renormalize_subset=False`.
 The default size factor is 1000, and the earlier filter removes cells below that count.
 
 ```{code-cell} ipython3
-normalized = ds.run_normalization(cell_selection, hvg_ref)
-status = ds.inspect_artifact(normalized)
+status = ds.inspect_artifact(run["normalized"])
 print('Size factor (ds.RNA.sf):', ds.RNA.sf)
 print('cell selection:', status.inputs['cell_selection'])
 print('feature selection:', status.inputs['feature_selection'])
@@ -188,31 +196,20 @@ print('feature selection:', status.inputs['feature_selection'])
 
 The normalized {term}`artifact` records both exact selection refs.
 
-## 5. PCA
+## 5. Inspect PCA and the graph
 
-PCA represents the dominant axes of variation among the selected genes.
-Fifteen components are sufficient for this controlled PBMC example; the elbow plot shows explained variance flattening after the early components.
-
-```{code-cell} ipython3
-pca = ds.run_pca(normalized, dims=15, show_elbow_plot=True)
-```
-
-Choosing a component count is a scientific decision on new data.
-The {doc}`dimensionality_reduction` guide shows how to compare choices.
-
-## 6. Graph construction
-
-The remaining steps index the PCA coordinates, find nearby cells, and turn those neighbours into a weighted graph.
-Downstream layouts and clusters consume this graph rather than the count matrix directly.
+PCA represents the dominant axes of variation among the selected genes. Fifteen components are
+sufficient for this controlled PBMC example. The pipeline indexes those coordinates, finds nearby
+cells, and turns the neighbours into a weighted graph. Downstream layouts and clusters consume
+that exact graph rather than the count matrix directly.
 
 ```{code-cell} ipython3
-initialization = ds.build_embedding_initialization(pca)
-ann_index = ds.build_ann_index(pca)
-neighbors = ds.query_neighbors(ann_index, k=11)
-graph_ref = ds.build_connectivity_map(neighbors)
-
+pca_status = ds.inspect_artifact(run["pca"])
+pca_shape = ds.load_artifact(run["pca"])["data"].shape
 graph = ds.load_graph(graph_ref)
 degrees = graph.getnnz(axis=1)
+print("PCA input:", pca_status.inputs["normalized"])
+print("PCA coordinate shape:", pca_shape)
 print(graph.shape, graph.nnz)
 print(
     'Degree min / median / max:',
@@ -223,39 +220,28 @@ print(
 ```
 
 `load_graph` returns the result as a sparse cell-by-cell matrix.
-Shape and nnz confirm the graph covers the active cells; the degree summary checks that neighbourhood sizes stay near the requested `k`.
+Shape and nnz confirm the graph covers the selected cells; the degree summary checks that
+neighbourhood sizes stay near the requested `k`.
 
 ```{seealso}
-Each step also returns a reference to the artifact it wrote.
-Capturing those references allows branches and partial recomputation without changing the recommended path here.
-See {doc}`graph_construction`.
+Choosing a component count and checking graph construction are scientific decisions on new data.
+See {doc}`dimensionality_reduction` and {doc}`graph_construction` for atomic branches and deeper
+diagnostics.
 ```
 
+## 6. Inspect UMAP
 
-## 7. UMAP
-
-Run UMAP on the explicit graph and its matching initialization artifact.
-The result is an immutable embedding artifact.
-
-```{code-cell} ipython3
-umap_ref = ds.run_umap(
-    graph_ref,
-    initialization,
-    n_epochs=250,
-    spread=5,
-    min_dist=1,
-    parallel=True
-)
-```
+The pipeline's UMAP consumes the graph and its matching initialization artifact. Plotting through
+the run uses its frozen selection and fields.
 
 ```{code-cell} ipython3
-ds.plots.embedding(layout=umap_ref)
+ds.plots.embedding(run=run)
 ```
 
 Cells are placed by neighbourhood-graph proximity on the UMAP.
 
 ```{code-cell} ipython3
-ds.plots.embedding(layout=umap_ref, color_by="RNA_nCounts")
+ds.plots.embedding(run=run, color_by="RNA_nCounts")
 ```
 
 Library size varies across the embedding; check whether high-count cells dominate one region.
@@ -263,28 +249,26 @@ Library size varies across the embedding; check whether high-count cells dominat
 UMAP preserves local neighbourhood evidence but its global distances and empty space are not quantitative measurements.
 Parameter choice, densMAP, and t-SNE are covered in {doc}`dimensionality_reduction`.
 
-## 8. Clustering
+## 7. Inspect clustering
 
-Leiden clustering runs on the same neighbourhood graph.
-This manual call returns its exact cluster-label artifact. A pipeline run keeps the same artifact
-refs in frozen run-local fields.
+This run requested one Leiden resolution, so its selected `clusters` output is that exact Leiden
+artifact. Cluster sizes are worth checking before plotting.
 
 ```{code-cell} ipython3
-leiden = ds.run_leiden_clustering(graph_ref, resolution=0.5)
-leiden_values = np.asarray(ds.load_artifact(leiden)['values'][:])
+leiden_values = np.asarray(run.cells.fetch("clusters"))
 pd.Series(leiden_values).value_counts().sort_index()
 ```
 
 Cluster sizes are worth a look before plotting: a resolution that is too high splits one cell type into several small clusters.
 
 ```{code-cell} ipython3
-ds.plots.embedding(layout=umap_ref, color_by=leiden)
+ds.plots.embedding(run=run, color_by="clusters")
 ```
 
 Each colour is a Leiden partition on the same UMAP coordinates.
 
-Paris provides a hierarchical view of the same graph.
-Its automatic cut is a useful second checkpoint, not a replacement for biological validation.
+Paris is an optional hierarchical alternative. Run its atomic producer on the pipeline's exact
+graph so the comparison changes only the clustering method.
 
 ```{code-cell} ipython3
 paris = ds.run_paris_clustering(graph_ref)
@@ -293,7 +277,7 @@ pd.Series(paris_values).value_counts().sort_index()
 ```
 
 ```{code-cell} ipython3
-ds.plots.embedding(layout=umap_ref, color_by=paris)
+ds.plots.embedding(layout=run["umap"], color_by=paris)
 ```
 
 ```{code-cell} ipython3
@@ -308,23 +292,15 @@ The sizes and Leiden×Paris crosstab make that concordance readable before the m
 Tiny isolated clusters dominated by low-count cells are a reason to revisit QC before interpreting markers.
 Resolution sweeps, cluster confidence, graph connectivity, and the Paris tree are covered in {doc}`clustering`.
 
-## 9. Marker genes
+## 8. Marker genes
 
 `run_marker_search` ranks genes per group.
 Results include specificity-oriented scores, Mann-Whitney U test p-values (`p_value`), AUC effect sizes, and within-group Benjamini-Hochberg adjusted values (`p_value_adjusted`).
 The adjusted column is a cell-level marker correction for that group, not replicate-aware differential expression.
 For condition-level DE with full workflows, export counts (see {doc}`pseudobulk_and_differential_expression`) and use an external tool.
 
-```{code-cell} ipython3
-all_features = ds.set_feature_selection(
-    from_assay='RNA',
-    feature_indexes=range(ds.RNA.feats.N),
-)
-marker_ref = ds.run_marker_search(
-    leiden,
-    features=all_features,
-)
-```
+The pipeline already ran marker search against its selected Leiden artifact and frozen feature
+universe, so the plots and lookups below reuse that exact result.
 
 ```{code-cell} ipython3
 ds.plots.marker_heatmap(
@@ -377,7 +353,7 @@ Annotation from markers, known gene panels, and subclustering is covered in {doc
 <span id="imputation"></span>
 ```
 
-## 10. Feature imputation
+## 9. Feature imputation
 
 Graph diffusion is optional and is not part of this default workflow.
 See {doc}`imputation` for a focused comparison of observed and imputed expression, including the limits on interpretation.

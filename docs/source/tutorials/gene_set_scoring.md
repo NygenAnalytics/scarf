@@ -80,7 +80,7 @@ The first field is the source name, the second is a description, and the remaini
 `read_gmt` returns one source-target row per gene.
 
 ```{code-cell} ipython3
-gmt_path = Path('scarf_datasets/pbmc_signatures.gmt')
+gmt_path = Path(analysis_directory.name) / 'pbmc_signatures.gmt'
 gmt_path.write_text(
     'T_cell\tna\tCD3D\tCD3E\tTRAC\tLTB\tIL7R\n'
     'B_cell\tna\tMS4A1\tCD79A\tCD37\tCD74\tHLA-DRA\n'
@@ -96,7 +96,7 @@ Targets are matched to active RNA feature names without case sensitivity.
 Missing targets do not need to be removed from the input table first.
 
 ```{code-cell} ipython3
-available = {str(name).upper() for name in ds.RNA.feats.fetch('names')}
+available = {str(name).upper() for name in ds.RNA.feats.fetch_all('names')}
 (
     gene_sets.assign(
         matched=gene_sets['target'].str.upper().isin(available),
@@ -140,7 +140,8 @@ waggr = ds.run_waggr(
     mode='wmean',
     tmin=3,
 )
-waggr_result = ds.get_enrichment(waggr)
+score_sources = ['T_cell', 'B_cell', 'Myeloid']
+waggr_result = ds.get_enrichment(waggr, sources=score_sources)
 waggr_scores = pd.DataFrame(
     waggr_result.data.compute(),
     columns=list(waggr_result.source_names),
@@ -200,7 +201,7 @@ aucell = ds.run_aucell(
     n_up=500,
     tie_seed=0,
 )
-aucell_result = ds.get_enrichment(aucell)
+aucell_result = ds.get_enrichment(aucell, sources=score_sources)
 aucell_scores = pd.DataFrame(
     aucell_result.data.compute(),
     columns=list(aucell_result.source_names),
@@ -212,18 +213,22 @@ AUCell values stay between zero and one.
 The same `tie_seed` gives a deterministic global ordering for equal expression values.
 Changing `n_up`, `tie_seed`, the feature selection, or the network creates a different execution.
 
-## 4. Load selected sources and visualize scores
+## 4. Visualize the selected sources
 
 `get_enrichment` requires an exact enrichment ref and returns a lazy result.
-Selecting sources first avoids loading unrelated columns.
-The values below are activity scores, not p-values.
+The calls above selected only the requested source columns before computing them. Reuse those
+loaded tables for every plot and comparison below. The values are activity scores, not p-values.
 
 ```{code-cell} ipython3
 umap = ds.cells.to_pandas_dataframe(['RNA_UMAP1', 'RNA_UMAP2'], key='I')
 figure, axes = plt.subplots(1, 3, figsize=(12, 4))
-for axis, source in zip(axes, ['T_cell', 'B_cell', 'Myeloid'], strict=True):
-    scores = ds.get_enrichment(aucell, sources=[source]).data.compute().ravel()
-    axis.scatter(umap['RNA_UMAP1'], umap['RNA_UMAP2'], c=scores, s=3)
+for axis, source in zip(axes, score_sources, strict=True):
+    axis.scatter(
+        umap['RNA_UMAP1'],
+        umap['RNA_UMAP2'],
+        c=aucell_scores[source],
+        s=3,
+    )
     axis.set_title(f'{source} AUCell')
 figure.tight_layout()
 figure
@@ -233,9 +238,13 @@ AUCell scores highlight lineage-consistent regions: T-cell, B-cell, and Myeloid 
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 3, figsize=(12, 4))
-for axis, source in zip(axes, ['T_cell', 'B_cell', 'Myeloid'], strict=True):
-    scores = ds.get_enrichment(waggr, sources=[source]).data.compute().ravel()
-    axis.scatter(umap['RNA_UMAP1'], umap['RNA_UMAP2'], c=scores, s=3)
+for axis, source in zip(axes, score_sources, strict=True):
+    axis.scatter(
+        umap['RNA_UMAP1'],
+        umap['RNA_UMAP2'],
+        c=waggr_scores[source],
+        s=3,
+    )
     axis.set_title(f'{source} WAGGR')
 figure.tight_layout()
 figure
@@ -249,14 +258,8 @@ Quantify that difference cell by cell:
 ```{code-cell} ipython3
 myeloid_compare = pd.DataFrame(
     {
-        'Myeloid_WAGGR': ds.get_enrichment(
-            waggr,
-            sources=['Myeloid'],
-        ).data.compute().ravel(),
-        'Myeloid_AUCell': ds.get_enrichment(
-            aucell,
-            sources=['Myeloid'],
-        ).data.compute().ravel(),
+        'Myeloid_WAGGR': waggr_scores['Myeloid'],
+        'Myeloid_AUCell': aucell_scores['Myeloid'],
     }
 )
 myeloid_compare.describe()

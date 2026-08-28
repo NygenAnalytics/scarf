@@ -31,6 +31,7 @@ Published remote object-store funnel timings are in {doc}`../concepts/benchmarks
 - Open a public demo store on object storage without downloading it
 - Open `DataStore` on `s3://` or `gs://` with `storage_options`
 - Mount shared count matrices into a separate writable analysis store
+- Reopen a durable pipeline run from its mounted target
 - Select the `cloud` storage profile
 - Stage normalized data locally for PCA with `local_cache`
 - Repack an older store with `scarf.tools.repack_zarr`
@@ -66,7 +67,7 @@ The printed summary lists active cells, assays, and the cell and feature columns
 
 Counts and literal metadata in the published store remain readable, including its UMAP columns and
 cluster partition. New computations write exact artifacts to the mounted analysis target.
-The next section mounts those count matrices and builds a new explicit artifact chain in a separate target.
+The next section mounts those count matrices and records a new pipeline run in a separate target.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -94,7 +95,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import numpy as np
-import matplotlib.pyplot as plt
 import zarr
 
 from scarf.tools.repack_zarr import repack_store
@@ -158,51 +158,28 @@ print('Counts stored in target:', 'counts' in target_root['RNA'])
 print('Mounted shape:', mounted.RNA.rawData.shape)
 ```
 
-Run a complete graph and plotting checkpoint through the mount.
-Count blocks are read from the structurally repacked source.
-Normalized data, reductions, neighbours, graph, UMAP, and clusters are written only to the local target.
-Because that target is a local path, `local_cache` staging is skipped here; Section 4 makes the remote-only policy explicit and gives a writable-remote template.
+Run the standard RNA pipeline through the mount. Count blocks are read from the structurally
+repacked source, while the run record and its normalized data, reductions, graph, UMAP, and
+clusters are written only to the local target. Because that target is a local path, `local_cache`
+staging is skipped here; Section 4 makes the remote-only policy explicit.
 
 ```{code-cell} ipython3
-cell_selection = mounted.snapshot_cell_selection(cell_key='I')
-mounted_features = mounted.select_hvgs(
-    cell_selection,
-    min_cells=20,
-    top_n=500,
-    show_plot=False,
+mounted_run = mounted.pipeline.run(
+    filtering=False,
+    hvg_count=500,
+    pca_dims=15,
+    leiden={"partitions": [0.5]},
+    cell_cycle=False,
+    paris=False,
+    doublets=False,
+    markers=False,
 )
-normalized = mounted.run_normalization(cell_selection, mounted_features)
-pca = mounted.run_pca(normalized, dims=15)
-
-initialization = mounted.build_embedding_initialization(pca)
-ann_index = mounted.build_ann_index(pca)
-neighbors = mounted.query_neighbors(ann_index, k=11)
-graph = mounted.build_connectivity_map(neighbors)
-mounted_umap = mounted.run_umap(
-    graph,
-    initialization,
-    n_epochs=100,
-    spread=5,
-    min_dist=1,
-    parallel=True,
-)
-mounted_clusters = mounted.run_leiden_clustering(
-    graph,
-    resolution=0.5,
-)
+normalized = mounted_run["normalized"]
+pca = mounted_run["pca"]
 ```
 
 ```{code-cell} ipython3
-mounted_umap_values = np.asarray(mounted.load_artifact(mounted_umap)['values'][:])
-mounted_cluster_values = np.asarray(
-    mounted.load_artifact(mounted_clusters)['values'][:]
-)
-plt.scatter(
-    mounted_umap_values[:, 0],
-    mounted_umap_values[:, 1],
-    c=mounted_cluster_values,
-    s=3,
-)
+mounted.plots.embedding(run=mounted_run, color_by="clusters")
 ```
 
 The populated embedding demonstrates that mounted counts behave like a normal datastore input.
@@ -230,12 +207,17 @@ reopened = scarf.DataStore(
     str(target_path),
     nthreads=4,
 )
+reopened_run = reopened.pipeline.open(run_id=mounted_run.run_id)
 same_counts = np.array_equal(
     reopened.RNA.rawData[:20, :20].compute(),
     mounted.RNA.rawData[:20, :20].compute(),
 )
 print('Counts still resolve:', same_counts)
-print('Normalization complete:', reopened.inspect_artifact(normalized).complete)
+print('Reopened pipeline status:', reopened_run.status)
+print(
+    'Normalization complete:',
+    reopened.inspect_artifact(reopened_run['normalized']).complete,
+)
 ```
 
 For a current S3 or GCS source with a complete RNA `countsT`, pass the URI directly and keep the target local:
@@ -280,7 +262,7 @@ Credentialed read-write template (do not embed secrets in notebooks):
 import os
 import scarf
 
-ds = scarf.DataStore(
+remote_writable = scarf.DataStore(
     "s3://my-bucket/project/data.zarr",
     zarr_mode="r+",
     zarrProfile="cloud",
@@ -297,7 +279,9 @@ ds = scarf.DataStore(
 Google Cloud Storage uses a `gs://` URI.
 Pass the provider options your environment already uses for obstore/fsspec (for example application-default credentials on the VM, or an explicit token in `storage_options`).
 
-After open, call the same analysis APIs as on a local store: `ds.pipeline.run(...)` or the individual graph-construction methods.
+After open, call the same analysis APIs as on a local store. Use
+`remote_writable.pipeline.run(...)` for the standard RNA workflow, and atomic producers for a
+deliberate branch or execution option.
 
 ## 4. Local scratch for reductions
 
@@ -318,9 +302,6 @@ The mounted target in this page is local, so normalized artifacts already live o
 This executable checkpoint makes that distinction explicit:
 
 ```{code-cell} ipython3
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
 scratch_directory = TemporaryDirectory()
 scratch_dir = Path(scratch_directory.name) / 'pca_scratch'
 pca_without_staging = mounted.run_pca(
@@ -337,7 +318,8 @@ print('Local cache present after PCA:', scratch_dir.exists())
 print('Reduction reused:', pca_without_staging == pca)
 ```
 
-On your own writable remote store, the same path-string policy stages normalized blocks and keeps the cache for inspection or reuse:
+On your own writable remote store, the same path-string policy stages normalized blocks and keeps
+the cache for inspection or reuse. Only the stages needed to demonstrate the PCA option are shown:
 
 ```python
 cell_selection = remote_writable.snapshot_cell_selection(cell_key="I")
@@ -353,9 +335,6 @@ reduction = remote_writable.run_pca(
     dims=15,
     local_cache="/tmp/scarf_pca_scratch",
 )
-ann_index = remote_writable.build_ann_index(reduction)
-neighbors = remote_writable.query_neighbors(ann_index, k=11)
-remote_writable.build_connectivity_map(neighbors)
 ```
 
 `local_cache` is an execution option.

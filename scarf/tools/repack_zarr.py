@@ -23,6 +23,7 @@ from scarf.storage.layout import (
     get_compressors,
     normalize_chunks,
 )
+from scarf.storage.pipeline_runs import _copy_pipeline_label_claims
 from scarf.storage.profiles import StorageProfile
 from scarf.storage.sharding import write_counts_t, write_dense_in_shard_rows
 from scarf.storage.stores import open_store
@@ -373,6 +374,7 @@ def repack_store(
         shardedCounts=count_paths,
         skipPaths=skip_paths,
     )
+    _copy_pipeline_label_claims(src, dst)
     for assay_name, workspace in assays:
         counts_path = (
             f"{assay_name}/counts"

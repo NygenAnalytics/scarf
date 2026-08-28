@@ -140,18 +140,16 @@ Clearing the blacklist keeps every gene name while retaining other HVG filters.
 Compare the same `top_n` with and without the default pattern:
 
 ```{code-cell} ipython3
-selections = {}
-for key, kwargs in (
-    ("hvgs_default", {}),
-    ("hvgs_no_blacklist", {"blacklist": ""}),
-):
-    selections[key] = ds.select_hvgs(
+selections = {
+    "hvgs_default": hvg_500,
+    "hvgs_no_blacklist": ds.select_hvgs(
         cell_selection,
         min_cells=20,
         top_n=500,
+        blacklist="",
         show_plot=False,
-        **kwargs,
-    )
+    ),
+}
 
 pd.Series(
     {
@@ -244,34 +242,16 @@ figure.tight_layout()
 figure
 ```
 
-```{code-cell} ipython3
-pd.Series(
-    {
-        f"hvgs_{top_n}": int(
-            np.asarray(ds.load_artifact(refs[0])["values"][:]).sum()
-        )
-        for top_n, refs in feature_branches.items()
-    },
-    name="selected genes",
-)
-```
-
-Cluster sizes and the cross-tabulation show how partitions rematch when the feature set grows.
-Off-diagonal mass marks groups that split or merge.
+A cross-tabulation shows how partitions rematch when the feature set grows. The margins report
+cluster sizes; off-diagonal mass marks groups that split or merge.
 
 ```{code-cell} ipython3
 cluster_300 = np.asarray(ds.load_artifact(feature_branches[300][2])["values"][:])
 cluster_1000 = np.asarray(ds.load_artifact(feature_branches[1000][2])["values"][:])
-pd.DataFrame({
-    "300 genes": pd.Series(cluster_300).value_counts().sort_index(),
-    "1,000 genes": pd.Series(cluster_1000).value_counts().sort_index(),
-})
-```
-
-```{code-cell} ipython3
 pd.crosstab(
     pd.Series(cluster_300, name="300 genes"),
     pd.Series(cluster_1000, name="1,000 genes"),
+    margins=True,
 )
 ```
 

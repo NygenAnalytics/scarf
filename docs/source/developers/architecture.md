@@ -122,12 +122,15 @@ Operation mixins have no runtime inheritance from datastore facades, no `__init_
 `TYPE_CHECKING` imports of siblings are allowed.
 Reusable algorithms must be placed in their domain package before being exposed through a datastore method.
 
-`datastore.pipeline_accessor` orchestrates the fixed basic RNA recipe, while
-`datastore.pipeline_run` exposes the narrow durable `PipelineRun` handle and its frozen cell and
-feature views. Pipeline execution creates immutable artifacts and a strict run/stage ledger under
-`pipeline/runs`; it does not write live metadata. DataStore-owned plotting, marker loading, and
-export consume narrow frozen-run views. Completed runs can be reopened by their immutable label or
-exact run ID.
+`datastore.pipeline_accessor` orchestrates the fixed basic RNA recipe. Focused internal modules own
+recipe validation, run/stage ledger bookkeeping, filtering, frozen field assembly, and cluster
+decision persistence. The reusable bounded silhouette comparison lives in
+`metrics.cluster_selection`; its datastore adapter validates lineage and persists the immutable
+decision. `datastore.pipeline_run` exposes the narrow durable `PipelineRun` handle and its frozen
+cell and feature views. Pipeline execution creates immutable artifacts and a strict run/stage
+ledger under `pipeline/runs`; it does not write live metadata. DataStore-owned plotting, marker
+loading, and export consume narrow frozen-run views. Completed runs can be reopened by their
+immutable label or exact run ID.
 
 ### Presentation
 

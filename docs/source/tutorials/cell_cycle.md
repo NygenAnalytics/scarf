@@ -39,7 +39,6 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import scarf
-import scarf.plotting as splt
 from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level='WARNING', progress=True)
@@ -176,7 +175,6 @@ The Scanpy scores look similar to Scarf's.
 Quantify the concordance:
 
 ```{code-cell} ipython3
-import matplotlib.pyplot as plt
 from scipy.stats import linregress
 
 fig, axis  = plt.subplots(1, 2, figsize=(6,3))

@@ -22,7 +22,6 @@ orientation; Scarf does not infer terminal states or causal lineage.
 ```{code-cell} ipython3
 from tempfile import TemporaryDirectory
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -46,31 +45,35 @@ ds = scarf.mount_datastore(
     default_assay="RNA",
 )
 
-cell_selection = ds.snapshot_cell_selection("I")
-features = ds.select_hvgs(
-    cell_selection,
-    top_n=2000,
-    show_plot=False,
+preparation = ds.pipeline.run(
+    filtering=False,
+    hvg_count=2000,
+    pca_dims=15,
+    neighbors_k=11,
+    leiden=False,
+    cell_cycle=False,
+    paris=False,
+    doublets=False,
+    markers=False,
 )
-normalized = ds.run_normalization(cell_selection, features)
-reduction = ds.run_pca(normalized, dims=15)
-ann = ds.build_ann_index(reduction)
-neighbors = ds.query_neighbors(ann, k=11)
-graph = ds.build_connectivity_map(neighbors)
-all_features = ds.set_feature_selection(
-    from_assay="RNA",
-    feature_indexes=range(ds.RNA.feats.N),
-)
+graph = preparation["connectivity_map"]
+all_features = preparation["feature_universe"]
 ```
 
-The teaching store includes literal `clusters` annotations and an imported UMAP. Build a custom
-zero-sum source/sink vector over the exact graph rows. Ductal cells supply positive source mass;
-Alpha, Beta, and Delta cells share negative sink mass.
+The pipeline builds the standard RNA graph and UMAP without unrelated clustering, doublet, or
+marker stages. The teaching store's literal `clusters` column supplies external endpoint labels;
+it is not a result inferred by this run. Build a zero-sum source/sink vector over the exact graph
+rows. Ductal cells supply positive source mass; Alpha, Beta, and Delta cells share negative sink
+mass.
 
 ```{code-cell} ipython3
-labels = np.asarray(ds.cells.fetch("clusters", key="I"))
+labels = np.asarray(ds.cells.fetch_all("clusters"))[
+    preparation.cells.fetch_all("I")
+]
 source = labels == "Ductal"
 sink = np.isin(labels, ["Alpha", "Beta", "Delta"])
+if not source.any() or not sink.any() or np.any(source & sink):
+    raise ValueError("Source and sink labels must be non-empty and disjoint")
 source_sink_vector = np.zeros(len(labels), dtype=float)
 source_sink_vector[source] = 1.0 / int(source.sum())
 source_sink_vector[sink] = -1.0 / int(sink.sum())
@@ -96,18 +99,16 @@ The producer returns an artifact. The explicit loader returns values, a validity
 and cell-selection ref. No pseudotime or validity column is added to live metadata.
 
 ```{code-cell} ipython3
-umap = ds.cells.to_pandas_dataframe(["RNA_UMAP1", "RNA_UMAP2"], key="I")
-valid = pseudotime.valid
-figure, axis = plt.subplots(figsize=(5, 4))
-points = axis.scatter(
-    umap.loc[valid, "RNA_UMAP1"],
-    umap.loc[valid, "RNA_UMAP2"],
-    c=pseudotime.values[valid],
+plot_data = preparation.cells.to_pandas_dataframe(["umap_1", "umap_2"])
+plot_data["pseudotime"] = pseudotime.values
+plot_data.loc[pseudotime.valid].plot.scatter(
+    x="umap_1",
+    y="umap_2",
+    c="pseudotime",
+    colormap="viridis",
     s=4,
+    figsize=(5, 4),
 )
-figure.colorbar(points, ax=axis, label="pseudotime")
-figure.tight_layout()
-figure
 ```
 
 Values should progress from the ductal region toward endocrine endpoints. A disconnected or
@@ -116,8 +117,8 @@ reversed pattern is a reason to revisit the graph and endpoint choices.
 ```{code-cell} ipython3
 pd.DataFrame(
     {
-        "cluster": labels[valid],
-        "pseudotime": pseudotime.values[valid],
+        "cluster": labels[pseudotime.valid],
+        "pseudotime": pseudotime.values[pseudotime.valid],
     }
 ).groupby("cluster")["pseudotime"].describe()
 ```
