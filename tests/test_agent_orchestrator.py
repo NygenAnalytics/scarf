@@ -608,7 +608,7 @@ def _build_plan(
     **kwargs: Any,
 ) -> AutomatedPreprocessingPlan:
     inputs = _planning_inputs(assays, **kwargs)
-    return AgentOrchestrator(object())._build_preprocessing_plan(*inputs)
+    return AgentOrchestrator(object()).build_preprocessing_plan(*inputs)
 
 
 def _native_assay_report(assay: str, token: int) -> ParameterTuningReport:
@@ -1194,7 +1194,7 @@ def test_interrupted_attempt_supersedes_a_historical_pause_for_resume(
     orchestrator, paused, path = _start_paused_workflow(tmp_path, monkeypatch)
     assert paused.workflowRun is not None
     workflow_id = paused.workflowRun.workflowRunId
-    record, store = orchestrator._load_request_for_resume(
+    record, store = orchestrator.load_request_for_resume(
         AutomatedWorkflowResumeRequest(
             zarrPath=str(path),
             workflowRunId=workflow_id,
@@ -1247,7 +1247,7 @@ def test_interrupted_answered_attempt_inherits_exact_persisted_answers(
     orchestrator, paused, path = _start_paused_workflow(tmp_path, monkeypatch)
     assert paused.workflowRun is not None
     workflow_id = paused.workflowRun.workflowRunId
-    record, store = orchestrator._load_request_for_resume(
+    record, store = orchestrator.load_request_for_resume(
         AutomatedWorkflowResumeRequest(
             zarrPath=str(path),
             workflowRunId=workflow_id,
@@ -1401,7 +1401,7 @@ def test_unsafe_experimental_context_pauses_and_explicit_skip_reuses_evidence(
 
     monkeypatch.setattr(context_module, "ExperimentalContextAgent", UnsafeAgent)
     orchestrator = AgentOrchestrator(object())
-    paused_outcome, paused_report = orchestrator._experimental_context_stage(
+    paused_outcome, paused_report = orchestrator.experimental_context_stage(
         store,
         workflow,
         request_record,
@@ -1437,7 +1437,7 @@ def test_unsafe_experimental_context_pauses_and_explicit_skip_reuses_evidence(
         },
     )
 
-    done_outcome, resolved_report = orchestrator._experimental_context_stage(
+    done_outcome, resolved_report = orchestrator.experimental_context_stage(
         store,
         workflow,
         request_record,
@@ -1651,7 +1651,7 @@ def test_converted_input_always_resets_selection_and_persists_typed_qc() -> None
     inputs[1] = request_record.model_copy(update={"request": request})
     inputs[4] = inputs[4].model_copy(update={"outputs": {"format": "h5ad"}})
 
-    plan = AgentOrchestrator(object())._build_preprocessing_plan(*inputs)
+    plan = AgentOrchestrator(object()).build_preprocessing_plan(*inputs)
 
     assert plan.resetCellSelection is True
     assert isinstance(plan.cellQc, CellQcPlan)
@@ -1704,7 +1704,7 @@ def test_multimodal_pairing_requires_persisted_or_explicit_provenance(
         }
     )
 
-    plan = AgentOrchestrator(object())._build_preprocessing_plan(*inputs)
+    plan = AgentOrchestrator(object()).build_preprocessing_plan(*inputs)
 
     assert plan.pairedAssays == expected
 
@@ -2105,7 +2105,7 @@ def test_initial_candidates_are_rank_valid(
         nFeatures=n_features,
     )
 
-    candidates = orchestrator._initial_parameter_candidates(
+    candidates = orchestrator.initial_parameter_candidates(
         "rank-test",
         handoff,
         count=5,
@@ -2135,21 +2135,21 @@ def test_initial_candidates_reject_fully_invalid_rank_or_neighbor_count() -> Non
     )
 
     with pytest.raises(ValueError, match="no rank-valid graph candidate"):
-        orchestrator._initial_parameter_candidates(
+        orchestrator.initial_parameter_candidates(
             "rank-test",
             rank_invalid,
             count=3,
             neighbors_k=3,
         )
     with pytest.raises(ValueError, match="no rank-valid graph candidate"):
-        orchestrator._initial_parameter_candidates(
+        orchestrator.initial_parameter_candidates(
             "rank-test",
             identity_invalid,
             count=3,
             neighbors_k=3,
         )
     with pytest.raises(ValueError, match="no rank-valid graph candidate"):
-        orchestrator._initial_parameter_candidates(
+        orchestrator.initial_parameter_candidates(
             "rank-test",
             rank_invalid.model_copy(update={"nFeatures": 3}),
             count=3,
@@ -2203,7 +2203,7 @@ def test_parameter_tuning_rejects_plan_above_global_branch_cap(
         "ParameterTuningAgent",
         lambda *_args, **_kwargs: UnusedAgent(),
     )
-    outcome, report = AgentOrchestrator(object())._parameter_tuning_stage(
+    outcome, report = AgentOrchestrator(object()).parameter_tuning_stage(
         store,
         workflow,
         request_record,
@@ -2363,7 +2363,7 @@ def test_final_selection_pause_exposes_exact_options_and_resumes_without_screen(
         calls["integrate"] += 1
         return [integration]
 
-    monkeypatch.setattr(orchestrator, "_evaluate_integrations", evaluate_integrations)
+    monkeypatch.setattr(orchestrator, "evaluate_integrations", evaluate_integrations)
     real_validated_outcome = journal_module._validated_done_outcome
     paused_attempts: list[WorkflowStageAttempt] = []
 
@@ -2396,7 +2396,7 @@ def test_final_selection_pause_exposes_exact_options_and_resumes_without_screen(
         "_validated_done_outcome",
         validated_outcome,
     )
-    paused, paused_report = orchestrator._parameter_tuning_stage(
+    paused, paused_report = orchestrator.parameter_tuning_stage(
         store,
         workflow,
         request_record,
@@ -2422,7 +2422,7 @@ def test_final_selection_pause_exposes_exact_options_and_resumes_without_screen(
     assert paused_report.finalSelection.needsInput.options == expected_options
     assert paused_report.totalCandidates == 3
 
-    completed, completed_report = orchestrator._parameter_tuning_stage(
+    completed, completed_report = orchestrator.parameter_tuning_stage(
         store,
         workflow,
         request_record,
@@ -2609,7 +2609,7 @@ def test_data_enrichment_recovers_report_after_outcome_write_crash(
 
     monkeypatch.setattr(context_module, "_save_outcome", crash_after_report)
     with pytest.raises(KeyboardInterrupt, match="simulated process crash"):
-        orchestrator._data_enrichment_stage(
+        orchestrator.data_enrichment_stage(
             store,
             workflow,
             request_record,
@@ -2618,7 +2618,7 @@ def test_data_enrichment_recovers_report_after_outcome_write_crash(
         )
     monkeypatch.setattr(context_module, "_save_outcome", save_outcome)
 
-    outcome, recovered = orchestrator._data_enrichment_stage(
+    outcome, recovered = orchestrator.data_enrichment_stage(
         store,
         workflow,
         request_record,
@@ -2647,7 +2647,7 @@ def test_long_assay_names_produce_bounded_unique_candidate_ids() -> None:
 
     first_ids = {
         candidate.candidateId
-        for candidate in orchestrator._initial_parameter_candidates(
+        for candidate in orchestrator.initial_parameter_candidates(
             "long-name-test",
             first,
             count=5,
@@ -2656,7 +2656,7 @@ def test_long_assay_names_produce_bounded_unique_candidate_ids() -> None:
     }
     second_ids = {
         candidate.candidateId
-        for candidate in orchestrator._initial_parameter_candidates(
+        for candidate in orchestrator.initial_parameter_candidates(
             "long-name-test",
             second,
             count=5,
@@ -2741,7 +2741,7 @@ def test_single_integration_resolution_is_centered_and_workflow_unique() -> None
         markerAssay="RNA",
         pairedAssays=["RNA", "ADT"],
     )
-    evaluations = AgentOrchestrator(object())._evaluate_integrations(
+    evaluations = AgentOrchestrator(object()).evaluate_integrations(
         store,
         "integration-center",
         plan,
@@ -2792,7 +2792,7 @@ def test_integration_requires_trusted_label_connectivity() -> None:
         def metric_graph_connectivity(self, *_args: Any, **_kwargs: Any) -> float:
             raise ValueError("trusted label is unavailable")
 
-    evaluations = AgentOrchestrator(object())._evaluate_integrations(
+    evaluations = AgentOrchestrator(object()).evaluate_integrations(
         IntegrationStore(),
         "integration-connectivity",
         AutomatedPreprocessingPlan(
@@ -2900,7 +2900,7 @@ def test_integration_checkpoints_prevent_retry_execution(
     first_actions: list[str] = []
     orchestrator = AgentOrchestrator(object())
 
-    first = orchestrator._evaluate_integrations(
+    first = orchestrator.evaluate_integrations(
         store,
         workflow.workflowRunId,
         plan,
@@ -2914,7 +2914,7 @@ def test_integration_checkpoints_prevent_retry_execution(
         update={"attemptId": "retry-attempt", "startedAtNs": started.startedAtNs + 1}
     )
     retry_actions: list[str] = []
-    second = orchestrator._evaluate_integrations(
+    second = orchestrator.evaluate_integrations(
         store,
         workflow.workflowRunId,
         plan,
