@@ -418,6 +418,22 @@ def test_domain_packages_export_canonical_objects():
             "scarf.features",
             "find_markers_by_rank",
         ): "scarf.features.markers.search",
+        (
+            "scarf.features",
+            "compare_group_distributions",
+        ): "scarf.features.statistical",
+        (
+            "scarf.features",
+            "StatisticalTestResult",
+        ): "scarf.features.statistical",
+        (
+            "scarf.features",
+            "GroupComparisonResult",
+        ): "scarf.features.statistical",
+        (
+            "scarf.features",
+            "resolve_group_order",
+        ): "scarf.features.statistical",
         ("scarf.matrix", "ChunkedArray"): "scarf.matrix.chunked",
         (
             "scarf.metrics",

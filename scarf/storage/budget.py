@@ -143,10 +143,12 @@ def _cpu_quota_workers() -> int | None:
 
 def detect_workers() -> int:
     limits = [max(1, os.cpu_count() or 1)]
-    try:
-        limits.append(max(1, len(os.sched_getaffinity(0))))
-    except (AttributeError, OSError):
-        pass
+    sched_getaffinity = getattr(os, "sched_getaffinity", None)
+    if sched_getaffinity is not None:
+        try:
+            limits.append(max(1, len(sched_getaffinity(0))))
+        except OSError:
+            pass
     quota = _cpu_quota_workers()
     if quota is not None:
         limits.append(quota)

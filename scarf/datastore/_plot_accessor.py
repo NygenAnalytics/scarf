@@ -561,11 +561,13 @@ class DataStorePlotAccessor:
         split_scale: "CategoricalScale | None" = None,
         kind: "DistKind" = "violin",
         bins: int = 40,
-        max_points: int = 10000,
+        max_points: int | None = 10000,
         point_size: float = 0.8,
         point_alpha: float = 0.28,
         seed: int = 0,
         color: str = "steelblue",
+        color_by: Literal["group", "mean"] = "group",
+        color_scale: "ColorScale | None" = None,
         orientation: Literal["vertical", "horizontal"] = "vertical",
         row_standardize: bool = False,
         share_y: bool | None = None,
@@ -579,9 +581,21 @@ class DataStorePlotAccessor:
         title: str | None = None,
         theme: str = "notebook",
         show_legend: bool = True,
+        stats_results: Any = None,
+        stats_keys: Sequence[str] | None = None,
+        stats_bracket_height: float | None = None,
+        stats_show_p: bool = True,
         show: bool = True,
     ) -> "PlotResult":
-        """Plot distributions of cell metadata or feature values."""
+        """Plot distributions of cell metadata or feature values.
+
+        ``stats_results`` overlays significance brackets from
+        ``run_statistical_testing`` results onto the drawn violins or
+        boxes; see :func:`scarf.plotting.distribution` for the full
+        behaviour. ``max_points`` defaults to ``10000``; explicit ``None``
+        disables the point overlay for stacked violins and otherwise uses
+        ``10000``.
+        """
         from ..plotting import distribution
 
         return distribution(
@@ -607,6 +621,8 @@ class DataStorePlotAccessor:
             point_alpha=point_alpha,
             seed=seed,
             color=color,
+            color_by=color_by,
+            color_scale=color_scale,
             orientation=orientation,
             row_standardize=row_standardize,
             share_y=share_y,
@@ -620,6 +636,10 @@ class DataStorePlotAccessor:
             title=title,
             theme=theme,
             show_legend=show_legend,
+            stats_results=stats_results,
+            stats_keys=stats_keys,
+            stats_bracket_height=stats_bracket_height,
+            stats_show_p=stats_show_p,
             show=show,
         )
 

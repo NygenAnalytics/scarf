@@ -461,7 +461,6 @@ WNN also accepts two or more assays and adjusts their contributions cell by cell
 In this two-assay dataset, both integrated layouts should preserve broad PBMC populations while resolving differences supported by the protein panel.
 Use the advanced guide to compare them quantitatively rather than choosing from UMAP appearance alone.
 
-(hto_demultiplexing)=
 ## 5. HTO demultiplexing
 
 Hashtag assignment is a separate sample-identification task, not part of the RNA/ADT integration path.

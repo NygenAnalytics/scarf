@@ -46,6 +46,7 @@ ARTIFACT_KINDS = frozenset(
         "reduction",
         "sampling",
         "smart_label",
+        "statistical_tests",
         "wnn_coordinates",
     }
 )

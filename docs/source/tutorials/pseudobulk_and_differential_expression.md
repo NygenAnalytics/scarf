@@ -130,6 +130,44 @@ Use marker tables for cluster interpretation.
 Do not treat within-group `p_value_adjusted` columns as replicate-aware differential expression results.
 ```
 
+## 1b. Descriptive group comparisons with run_statistical_testing
+
+`run_statistical_testing` compares one feature at a time across groups and persists each variant under its own slot.
+The rank-based defaults suit single-cell data: `mann_whitney` for two groups, `kruskal_wallis` (optionally with Dunn's post-hoc) for three or more, and paired Wilcoxon on aggregated samples.
+
+Explicitly requested parametric tests (`welch`, aliased by `t_test`, and `one_way_anova`) also run on raw cell-level values.
+They are descriptive only: they treat cells as independent, cannot be combined with sample aggregation, and make assumptions that zero-inflated single-cell values often violate.
+Welch honours the one-sided `alternative`; automatic method selection never chooses a parametric test.
+
+```{code-cell} ipython3
+# Compare two clusters that are present in the Kang dataset.
+result = ds.run_statistical_testing(
+    ['MALAT1'],
+    group_by='RNA_clusters',
+    groups=[1, 2],
+    test='welch',
+    alternative='greater',
+)
+
+# Pin retrieval to the exact immutable result returned by the run.
+loaded = ds.get_statistical_tests(artifact=result.artifact)
+loaded.tables['MALAT1']
+```
+
+```{code-cell} ipython3
+# The plotted selection and test design must match the stored result.
+figure = ds.plots.distribution(
+    ['MALAT1'],
+    group_by='RNA_clusters',
+    groups=[1, 2],
+    kind='violin',
+    stats_results=result,
+    show=False,
+)
+```
+
+Brackets are drawn directly with matplotlib over the seaborn violins and prefer the pooled `p_value_adjusted` column when present.
+
 ## 2. Aggregate with make_bulk
 
 Cell counts per Leiden group set the scale for each bulk column:

@@ -133,7 +133,14 @@ def test_duplicate_graph_weights_cannot_overflow_during_canonicalization():
 
 
 def test_transition_rejects_weights_that_underflow_during_float_conversion():
-    tiny = np.nextafter(np.longdouble(0), np.longdouble(1))
+    longdouble_min = np.nextafter(np.longdouble(0), np.longdouble(1))
+    float64_min = np.nextafter(np.float64(0), np.float64(1))
+    if longdouble_min >= np.longdouble(float64_min):
+        pytest.skip(
+            "Platform longdouble has no wider exponent range than float64, so "
+            "an underflowing weight cannot be constructed here"
+        )
+    tiny = longdouble_min
     graph = csr_matrix(
         (
             np.array([tiny, tiny], dtype=np.longdouble),
