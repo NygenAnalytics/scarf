@@ -28,7 +28,8 @@ from .types import (
 
 try:
     from pydantic import ConfigDict, Field
-    from pydantic_ai import ModelRetry, RunContext
+    from pydantic_ai import ModelRetry, RunContext, Tool
+    from pydantic_ai.tools import ToolDefinition
 except ImportError as exc:
     raise ImportError(AGENT_INSTALL_HINT) from exc
 
@@ -372,6 +373,31 @@ class ExperimentalContextDependencies(AgentDataModel):
             cellKey="I",
             directions={"columnDomains": {"batch": "technical"}},
         )
+
+
+def _prepare_experimental_context_tool(
+    ctx: RunContext[ExperimentalContextDependencies],
+    tool_definition: ToolDefinition,
+) -> ToolDefinition | None:
+    """Expose each context tool once and in its required dependency order."""
+    completed_calls = set(ctx.deps.toolCalls)
+    if tool_definition.name == "inspect_cell_covariates":
+        return None if tool_definition.name in completed_calls else tool_definition
+    if tool_definition.name == "analyze_experimental_design":
+        if (
+            "inspect_cell_covariates" not in completed_calls
+            or tool_definition.name in completed_calls
+        ):
+            return None
+        return tool_definition
+    if tool_definition.name == "score_current_representation":
+        if (
+            "analyze_experimental_design" not in completed_calls
+            or tool_definition.name in completed_calls
+        ):
+            return None
+        return tool_definition
+    return tool_definition
 
 
 def characterization_evidence(
@@ -1023,7 +1049,7 @@ class ExperimentalContextAgent:
         self.model = model
         self.config = (config or AgentRunConfig()).with_limits(
             request_limit=6,
-            tool_call_limit=3,
+            tool_call_limit=4,
             output_token_limit=32768,
             timeout_seconds=600.0,
         )
@@ -1039,7 +1065,9 @@ class ExperimentalContextAgent:
             score_current_representation at most once when a current graph can add
             evidence. Do not split metadata, coefficients, or batch columns across
             calls, and do not repeat a tool call. Pass batch_columns as a JSON array,
-            including when the array contains exactly one column.
+            including when the array contains exactly one column. Each tool is
+            removed after it succeeds, so include the complete decision context in
+            its single call.
 
             A batch column must be categorical and technical. Never use donor,
             sample, observation-unit, independent-unit, biological, cluster, or
@@ -1100,9 +1128,24 @@ class ExperimentalContextAgent:
             system_prompt=self.system_prompt,
             user_prompt=user_prompt,
             tools=(
-                inspect_cell_covariates,
-                analyze_experimental_design,
-                score_current_representation,
+                Tool(
+                    inspect_cell_covariates,
+                    prepare=_prepare_experimental_context_tool,
+                    sequential=self.config.sequentialTools,
+                    timeout=self.config.timeoutSeconds,
+                ),
+                Tool(
+                    analyze_experimental_design,
+                    prepare=_prepare_experimental_context_tool,
+                    sequential=self.config.sequentialTools,
+                    timeout=self.config.timeoutSeconds,
+                ),
+                Tool(
+                    score_current_representation,
+                    prepare=_prepare_experimental_context_tool,
+                    sequential=self.config.sequentialTools,
+                    timeout=self.config.timeoutSeconds,
+                ),
             ),
             deps_type=ExperimentalContextDependencies,
             deps=deps,

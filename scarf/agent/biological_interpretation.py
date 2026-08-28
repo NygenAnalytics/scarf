@@ -22,7 +22,8 @@ from .types import (
 )
 
 try:
-    from pydantic_ai import ModelRetry, RunContext
+    from pydantic_ai import ModelRetry, RunContext, Tool
+    from pydantic_ai.tools import ToolDefinition
 except ImportError as exc:
     from .config._deps import AGENT_INSTALL_HINT
 
@@ -360,6 +361,7 @@ class BiologicalInterpretationDependencies(AgentDataModel):
     evidenceIds: set[str] = Field(default_factory=set, exclude=True)
     clusterValues: dict[str, Any] = Field(default_factory=dict, exclude=True)
     markerEvidenceIds: dict[str, str] = Field(default_factory=dict, exclude=True)
+    toolCalls: list[str] = Field(default_factory=list, exclude=True)
     conditionEvidence: dict[str, ConditionClusterSummary] = Field(
         default_factory=dict,
         exclude=True,
@@ -378,6 +380,24 @@ class BiologicalInterpretationDependencies(AgentDataModel):
             sampleColumn="sample",
             conditionColumn="treatment",
         )
+
+
+def _prepare_biological_interpretation_tool(
+    ctx: RunContext[BiologicalInterpretationDependencies],
+    tool_definition: ToolDefinition,
+) -> ToolDefinition | None:
+    """Expose composition and marker batches once and in the required order."""
+    completed_calls = set(ctx.deps.toolCalls)
+    if tool_definition.name == "inspect_cluster_composition":
+        return None if tool_definition.name in completed_calls else tool_definition
+    if tool_definition.name == "inspect_cluster_markers_batch":
+        if (
+            "inspect_cluster_composition" not in completed_calls
+            or tool_definition.name in completed_calls
+        ):
+            return None
+        return tool_definition
+    return tool_definition
 
 
 _SYSTEM_PROMPT = dedent(
@@ -541,6 +561,7 @@ async def inspect_cluster_composition(
             {summary.evidenceId: summary for summary in condition_summaries}
         )
 
+    deps.toolCalls.append("inspect_cluster_composition")
     return ClusterCompositionEvidence(
         clusterColumn=deps.clusterColumn,
         clusterArtifact=cluster_artifact,
@@ -774,6 +795,7 @@ async def inspect_cluster_markers_batch(
         for cluster in clusters
         for warning in cluster.warnings
     ]
+    ctx.deps.toolCalls.append("inspect_cluster_markers_batch")
     return ClusterMarkerBatchEvidence(
         clusters=clusters,
         evidenceIds=evidence_ids,
@@ -1013,7 +1035,7 @@ class BiologicalInterpretationAgent:
         self.model = model
         self.config = (config or AgentRunConfig()).with_limits(
             request_limit=5,
-            tool_call_limit=2,
+            tool_call_limit=3,
             output_token_limit=32768,
             timeout_seconds=600.0,
         )
@@ -1154,7 +1176,8 @@ class BiologicalInterpretationAgent:
                 Call inspect_cluster_composition once. Then send every cluster you
                 intend to interpret in one inspect_cluster_markers_batch call. If
                 markers cannot be inspected, return needsInput and state the exact
-                missing input.
+                missing input. Each tool is removed after it succeeds, so request
+                every required cluster in that one marker batch.
                 """
             )
             .strip()
@@ -1179,7 +1202,20 @@ class BiologicalInterpretationAgent:
             output_type=BiologicalInterpretationReport,
             system_prompt=_SYSTEM_PROMPT,
             user_prompt=user_prompt,
-            tools=(inspect_cluster_composition, inspect_cluster_markers_batch),
+            tools=(
+                Tool(
+                    inspect_cluster_composition,
+                    prepare=_prepare_biological_interpretation_tool,
+                    sequential=self.config.sequentialTools,
+                    timeout=self.config.timeoutSeconds,
+                ),
+                Tool(
+                    inspect_cluster_markers_batch,
+                    prepare=_prepare_biological_interpretation_tool,
+                    sequential=self.config.sequentialTools,
+                    timeout=self.config.timeoutSeconds,
+                ),
+            ),
             deps_type=BiologicalInterpretationDependencies,
             deps=deps,
             config=self.config,

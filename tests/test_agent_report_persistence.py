@@ -1,30 +1,44 @@
-"""Tests for immutable sidecar persistence of the four agent reports."""
+"""Tests for immutable JSON agent reports embedded in a Scarf store."""
 
-import hashlib
+import json
 import re
+import warnings
 from pathlib import Path
 
 import numpy as np
 import pytest
 import zarr
 from pydantic import ValidationError
+from zarr.errors import ZarrUserWarning
 
 import scarf.agent as agent_api
 from scarf.agent.biological_interpretation import BiologicalInterpretationReport
+from scarf.agent.config import AgentRunConfig
 from scarf.agent.data_enrichment import DataEnrichmentReport
 from scarf.agent.experimental_context import ExperimentalContextResult
-from scarf.agent.parameter_tuning import ParameterTuningReport
+from scarf.agent.parameter_tuning import ArtifactRecord, ParameterTuningReport
 from scarf.agent.persistence import (
+    AgentInvocation,
+    AgentReportLink,
+    AgentReportRecord,
     AgentReportReference,
     AgentWorkflowRun,
     create_agent_workflow,
-    list_agent_reports,
+    finalize_agent_workflow,
     list_agent_workflows,
+    load_agent_record,
     load_agent_report,
     load_agent_workflow,
     save_agent_report,
 )
-from scarf.agent.types import AgentDataModel
+from scarf.agent.types import (
+    AgentDataModel,
+    ArtifactReferenceModel,
+    ExperimentalTuningHandoff,
+    TuningBiologyHandoff,
+)
+from scarf.datastore.datastore import DataStore
+from scarf.storage.schema import create_cell_data, create_zarr_count_assay
 
 
 REPORT_CASES = (
@@ -35,7 +49,85 @@ REPORT_CASES = (
 )
 
 
-def _report(report_type: type[AgentDataModel], execution_run_id: str) -> AgentDataModel:
+class AnyReport(AgentDataModel):
+    value: str = ""
+
+    @classmethod
+    def get_example(cls) -> "AnyReport":
+        return cls(value="not an agent report")
+
+
+def _populate_scarf_group(
+    group: zarr.Group,
+    *,
+    fingerprints: dict[str, str | None],
+) -> None:
+    values = np.asarray(
+        [
+            [4, 0, 1, 0],
+            [0, 3, 0, 2],
+            [2, 1, 0, 0],
+            [0, 0, 5, 1],
+        ],
+        dtype=np.uint32,
+    )
+    cell_ids = np.asarray([f"cell-{index}" for index in range(values.shape[0])])
+    feature_ids = np.asarray([f"feature-{index}" for index in range(values.shape[1])])
+    feature_names = np.asarray(["MT-CO1", "RPS3", "GENE1", "GENE2"])
+    create_cell_data(
+        group,
+        None,
+        ids=cell_ids,
+        names=cell_ids,
+        profile="fast_local",
+    )
+    for assay_name, fingerprint in fingerprints.items():
+        counts = create_zarr_count_assay(
+            group,
+            assay_name,
+            None,
+            values.shape[0],
+            feat_ids=feature_ids,
+            feat_names=feature_names,
+            dtype="uint32",
+            profile="fast_local",
+        )
+        counts[:] = values
+        if fingerprint is not None:
+            group[assay_name].attrs["dataset_fingerprint"] = fingerprint
+    group.attrs["assayTypes"] = {assay_name: "Assay" for assay_name in fingerprints}
+
+
+def _create_scarf_store(
+    tmp_path: Path,
+    *,
+    fingerprints: dict[str, str | None] | None = None,
+) -> Path:
+    path = tmp_path / "data.zarr"
+    root = zarr.open_group(str(path), mode="w", zarr_format=3)
+    _populate_scarf_group(
+        root,
+        fingerprints=fingerprints or {"RNA": "dataset-rna"},
+    )
+    return path
+
+
+def _create_workspace_store(tmp_path: Path) -> Path:
+    path = tmp_path / "data.zarr"
+    root = zarr.open_group(str(path), mode="w", zarr_format=3)
+    for workspace in ("workspace_a", "workspace_b"):
+        group = root.create_group(workspace)
+        _populate_scarf_group(
+            group,
+            fingerprints={"RNA": f"dataset-{workspace}"},
+        )
+    return path
+
+
+def _report(
+    report_type: type[AgentDataModel],
+    execution_run_id: str,
+) -> AgentDataModel:
     report = report_type.get_example()
     return report.model_copy(
         update={
@@ -50,453 +142,709 @@ def _report(report_type: type[AgentDataModel], execution_run_id: str) -> AgentDa
     )
 
 
-def _record_group(
+def _experimental_report(execution_run_id: str) -> ExperimentalContextResult:
+    report = _report(ExperimentalContextResult, execution_run_id)
+    assert isinstance(report, ExperimentalContextResult)
+    characterization = report.characterization.model_copy(
+        update={
+            "coefficients": [
+                {
+                    "name": "treatment",
+                    "observationUnit": "sample",
+                    "independentUnit": "donor",
+                    "scope": "between",
+                }
+            ]
+        }
+    )
+    return report.model_copy(update={"characterization": characterization})
+
+
+def _tuning_report(execution_run_id: str) -> ParameterTuningReport:
+    report = _report(ParameterTuningReport, execution_run_id)
+    assert isinstance(report, ParameterTuningReport)
+    evaluation = report.evaluations[0]
+    artifacts = {
+        **evaluation.artifacts,
+        "clusters": ArtifactRecord(
+            scope="assay",
+            kind="clusters",
+            artifactId="c" * 64,
+            assay="RNA",
+        ),
+    }
+    evaluation = evaluation.model_copy(update={"artifacts": artifacts})
+    return report.model_copy(
+        update={
+            "evaluations": [evaluation],
+            "selectedArtifacts": artifacts,
+        }
+    )
+
+
+def _invocation(
+    agent_name: str,
+    *,
+    parents: list[AgentReportLink] | None = None,
+    **updates: object,
+) -> AgentInvocation:
+    values: dict[str, object] = {
+        "agentName": agent_name,
+        "parentReports": parents or [],
+        "inputs": {"fromAssay": "RNA", "cellKey": "I"},
+        "artifacts": {"input": ArtifactReferenceModel.get_example()},
+        "runConfig": AgentRunConfig.get_example(),
+    }
+    values.update(updates)
+    return AgentInvocation.model_validate(values)
+
+
+def _report_path(
     path: Path,
     reference: AgentReportReference,
-) -> zarr.Group:
-    root = zarr.open_group(str(path), mode="r+")
-    node = root[
-        f"runs/{reference.workflowRunId}/{reference.agentName}/{reference.agentRunId}"
-    ]
-    assert isinstance(node, zarr.Group)
-    return node
+    *,
+    workspace: str | None = None,
+) -> Path:
+    base = path if workspace is None else path / workspace
+    return (
+        base
+        / "agents"
+        / "runs"
+        / reference.workflowRunId
+        / reference.agentName
+        / reference.agentRunId
+        / "report.json"
+    )
 
 
-def test_persistence_models_have_factories_and_camelcase_fields() -> None:
-    for model_type in (AgentReportReference, AgentWorkflowRun):
+def test_public_persistence_models_have_factories_and_exports() -> None:
+    model_types = (
+        AgentReportLink,
+        AgentInvocation,
+        AgentReportReference,
+        AgentReportRecord,
+        AgentWorkflowRun,
+    )
+    for model_type in model_types:
         assert isinstance(model_type.get_blank(), model_type)
         assert isinstance(model_type.get_example(), model_type)
         assert all("_" not in field_name for field_name in model_type.model_fields)
+
+    assert agent_api.AgentInvocation is AgentInvocation
+    assert agent_api.AgentReportLink is AgentReportLink
+    assert agent_api.AgentReportRecord is AgentReportRecord
     assert agent_api.create_agent_workflow is create_agent_workflow
+    assert agent_api.finalize_agent_workflow is finalize_agent_workflow
+    assert agent_api.load_agent_record is load_agent_record
     assert agent_api.save_agent_report is save_agent_report
-    assert agent_api.load_agent_report is load_agent_report
-    assert agent_api.list_agent_reports is list_agent_reports
-    assert agent_api.list_agent_workflows is list_agent_workflows
-    assert agent_api.load_agent_workflow is load_agent_workflow
 
 
-def test_persistence_models_reject_invalid_nonblank_metadata() -> None:
-    with pytest.raises(ValidationError):
-        AgentReportReference(workflowRunId="../workflow")
-    with pytest.raises(ValidationError):
-        AgentReportReference(createdAtNs=-1)
-    with pytest.raises(ValidationError):
-        AgentReportReference(complete=1)  # type: ignore[arg-type]
-    with pytest.raises(ValidationError):
-        AgentReportReference(reportType="UnknownReport")  # type: ignore[arg-type]
+def test_persistence_models_reject_invalid_identity_and_duplicate_parents() -> None:
+    with pytest.raises(ValidationError, match="safe path component"):
+        AgentReportLink(workflowRunId="../workflow")
+    with pytest.raises(ValidationError, match="SHA-256"):
+        AgentReportReference(contentSha256="not-a-digest")
+    with pytest.raises(ValidationError, match="Workspace name"):
+        AgentWorkflowRun(workspace="nested/workspace")
+    with pytest.raises(ValidationError, match="cannot precede"):
+        AgentWorkflowRun(
+            workflowRunId="workflow-1",
+            createdAtNs=2,
+            finalizedAtNs=1,
+            status="failed",
+            datasetFingerprints={"RNA": "dataset-rna"},
+        )
+
+    parent = AgentReportLink.get_example()
+    with pytest.raises(ValidationError, match="duplicate"):
+        AgentInvocation(
+            agentName="parameter_tuning",
+            parentReports=[parent, parent],
+        )
 
 
-@pytest.mark.parametrize(("report_type", "agent_name"), REPORT_CASES)
-def test_all_agent_reports_round_trip_in_exact_hierarchy(
+def test_reports_are_plain_json_under_metadata_only_zarr_group(
     tmp_path: Path,
-    report_type: type[AgentDataModel],
-    agent_name: str,
 ) -> None:
-    path = tmp_path / "analysis.agents.zarr"
+    path = _create_scarf_store(tmp_path)
     workflow = create_agent_workflow(
         path,
         workflow_run_id="workflow-1",
-        analysis_store="analysis.zarr",
-        dataset_fingerprints={"RNA": "dataset-1"},
+        dataset_fingerprints={"RNA": "dataset-rna"},
     )
-    report = _report(report_type, f"provider-{agent_name}")
+    expected_files = {
+        "zarr.json",
+        "store.json",
+        "runs/workflow-1/workflow.json",
+    }
 
-    reference = save_agent_report(
-        path,
-        workflow.workflowRunId,
-        report,  # type: ignore[arg-type]
-        agent_run_id=f"{agent_name}-run",
+    for report_type, agent_name in REPORT_CASES:
+        report = _report(report_type, f"provider-{agent_name}")
+        reference = save_agent_report(
+            path,
+            workflow.workflowRunId,
+            report,  # type: ignore[arg-type]
+            invocation=_invocation(agent_name),  # type: ignore[arg-type]
+            agent_run_id=f"{agent_name}-run",
+        )
+        record = load_agent_record(path, reference)
+
+        assert reference.agentName == agent_name
+        assert record.invocation.inputs == {"fromAssay": "RNA", "cellKey": "I"}
+        assert record.invocation.runConfig == AgentRunConfig.get_example()
+        assert load_agent_report(path, reference).model_dump(mode="json") == (
+            report.model_dump(mode="json")
+        )
+        expected_files.add(f"runs/workflow-1/{agent_name}/{agent_name}-run/report.json")
+
+    agents_path = path / "agents"
+    actual_files = {
+        item.relative_to(agents_path).as_posix()
+        for item in agents_path.rglob("*")
+        if item.is_file()
+    }
+    assert actual_files == expected_files
+    assert not any(
+        item.name in {".zarray"} or "c" in item.relative_to(agents_path).parts
+        for item in agents_path.rglob("*")
     )
-    loaded = load_agent_report(path, reference)
-
-    assert reference.agentName == agent_name
-    assert reference.executionRunId == f"provider-{agent_name}"
-    assert type(loaded) is report_type
-    assert loaded.model_dump(mode="json") == report.model_dump(mode="json")
     root = zarr.open_group(str(path), mode="r")
-    assert root.attrs["format"] == "scarf_agent_reports"
-    assert root.attrs["format_version"] == 1
-    record_path = f"runs/workflow-1/{agent_name}/{agent_name}-run"
-    assert record_path in root
-    assert f"{record_path}/report_json" in root
-    assert root[record_path].attrs["complete"] is True
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ZarrUserWarning)
+        assert "agents" in root.group_keys()
+    agents = root["agents"]
+    assert isinstance(agents, zarr.Group)
+    assert agents.attrs.asdict() == {
+        "format": "scarf_agent_reports",
+        "format_version": 2,
+    }
+    metadata = json.loads((agents_path / "zarr.json").read_text(encoding="utf-8"))
+    assert metadata["node_type"] == "group"
+    assert root.attrs.get("format") != "scarf_agent_reports"
 
 
-def test_workflow_load_and_report_listing_are_deterministic(tmp_path: Path) -> None:
-    path = tmp_path / "analysis.agents.zarr"
-    create_agent_workflow(
+def test_datastore_target_generates_a_missing_dataset_fingerprint(
+    tmp_path: Path,
+) -> None:
+    path = _create_scarf_store(tmp_path, fingerprints={"RNA": None})
+    datastore = DataStore(
+        str(path),
+        assay_types={"RNA": "Assay"},
+        default_assay="RNA",
+        min_features_per_cell=0,
+        nthreads=1,
+        mem_budget="64M",
+    )
+
+    workflow = create_agent_workflow(datastore, workflow_run_id="workflow-1")
+
+    fingerprint = datastore._get_assay("RNA").attrs["dataset_fingerprint"]
+    assert workflow.datasetFingerprints == {"RNA": fingerprint}
+    assert load_agent_workflow(datastore, workflow.workflowRunId) == workflow
+
+
+@pytest.mark.parametrize(
+    "supplied",
+    [
+        {"RNA": "dataset-rna"},
+        {"RNA": "dataset-rna", "ATAC": "dataset-atac", "ADT": "unknown"},
+        {"RNA": "wrong", "ATAC": "dataset-atac"},
+        {"RNA": "dataset-rna", "ATAC": ""},
+    ],
+)
+def test_workflow_creation_requires_exact_all_assay_fingerprints(
+    tmp_path: Path,
+    supplied: dict[str, str],
+) -> None:
+    path = _create_scarf_store(
+        tmp_path,
+        fingerprints={"RNA": "dataset-rna", "ATAC": "dataset-atac"},
+    )
+
+    with pytest.raises(ValueError, match="do not match"):
+        create_agent_workflow(
+            path,
+            workflow_run_id="workflow-1",
+            dataset_fingerprints=supplied,
+        )
+
+    assert not (path / "agents").exists()
+
+
+def test_load_fails_closed_when_dataset_binding_changes(tmp_path: Path) -> None:
+    path = _create_scarf_store(
+        tmp_path,
+        fingerprints={"RNA": "dataset-rna", "ATAC": "dataset-atac"},
+    )
+    workflow = create_agent_workflow(
         path,
         workflow_run_id="workflow-1",
-        analysis_store="analysis.zarr",
-        dataset_fingerprints={"RNA": "dataset-1"},
+        dataset_fingerprints={"ATAC": "dataset-atac", "RNA": "dataset-rna"},
     )
-    for index, (report_type, _agent_name) in enumerate(reversed(REPORT_CASES)):
+    assert workflow.datasetFingerprints == {
+        "ATAC": "dataset-atac",
+        "RNA": "dataset-rna",
+    }
+
+    root = zarr.open_group(str(path), mode="r+")
+    root["ATAC"].attrs["dataset_fingerprint"] = "changed"
+
+    with pytest.raises(ValueError, match="do not match"):
+        load_agent_workflow(path, workflow.workflowRunId)
+    with pytest.raises(ValueError, match="do not match"):
+        list_agent_workflows(path, include_incomplete=True)
+
+
+def test_path_target_rejects_missing_assay_fingerprints(tmp_path: Path) -> None:
+    path = _create_scarf_store(
+        tmp_path,
+        fingerprints={"RNA": "dataset-rna", "ATAC": None},
+    )
+
+    with pytest.raises(ValueError, match="missing.*ATAC"):
+        create_agent_workflow(path, workflow_run_id="workflow-1")
+
+
+def test_lineage_distinguishes_parallel_reports_and_persists_typed_handoffs(
+    tmp_path: Path,
+) -> None:
+    path = _create_scarf_store(tmp_path)
+    create_agent_workflow(path, workflow_run_id="workflow-1")
+
+    experimental_1 = _experimental_report("experimental-provider-1")
+    experimental_2 = _experimental_report("experimental-provider-2")
+    experimental_ref_1 = save_agent_report(
+        path,
+        "workflow-1",
+        experimental_1,
+        invocation=_invocation("experimental_context"),
+        agent_run_id="e1",
+    )
+    experimental_ref_2 = save_agent_report(
+        path,
+        "workflow-1",
+        experimental_2,
+        invocation=_invocation("experimental_context"),
+        agent_run_id="e2",
+    )
+    experimental_link_1 = AgentReportLink.from_reference(experimental_ref_1)
+    experimental_link_2 = AgentReportLink.from_reference(experimental_ref_2)
+
+    tuning_1 = _tuning_report("tuning-provider-1")
+    tuning_2 = _tuning_report("tuning-provider-2")
+    tuning_ref_1 = save_agent_report(
+        path,
+        "workflow-1",
+        tuning_1,
+        invocation=_invocation(
+            "parameter_tuning",
+            parents=[experimental_link_1],
+            experimentalTuningHandoff=(experimental_1.to_parameter_tuning_handoff()),
+        ),
+        agent_run_id="t1",
+    )
+    tuning_ref_2 = save_agent_report(
+        path,
+        "workflow-1",
+        tuning_2,
+        invocation=_invocation(
+            "parameter_tuning",
+            parents=[experimental_link_2],
+            experimentalTuningHandoff=(experimental_2.to_parameter_tuning_handoff()),
+        ),
+        agent_run_id="t2",
+    )
+    tuning_link_1 = AgentReportLink.from_reference(tuning_ref_1)
+
+    biology_ref = save_agent_report(
+        path,
+        "workflow-1",
+        BiologicalInterpretationReport.get_example(),
+        invocation=_invocation(
+            "biological_interpretation",
+            parents=[experimental_link_1, tuning_link_1],
+            experimentalBiologyHandoff=experimental_1.to_biological_handoff(),
+            tuningBiologyHandoff=tuning_1.to_biological_handoff(),
+        ),
+        agent_run_id="b1",
+    )
+
+    record_t1 = load_agent_record(path, tuning_ref_1)
+    record_t2 = load_agent_record(path, tuning_ref_2)
+    record_b1 = load_agent_record(path, biology_ref)
+    assert record_t1.invocation.parentReports == [experimental_link_1]
+    assert record_t2.invocation.parentReports == [experimental_link_2]
+    assert record_b1.invocation.parentReports == [
+        experimental_link_1,
+        tuning_link_1,
+    ]
+    assert record_b1.reference.parentReports == record_b1.invocation.parentReports
+    assert (
+        record_b1.invocation.experimentalBiologyHandoff
+        == experimental_1.to_biological_handoff()
+    )
+    assert record_b1.invocation.tuningBiologyHandoff == tuning_1.to_biological_handoff()
+
+
+def test_lineage_rejects_unknown_cross_workflow_and_changed_parent_links(
+    tmp_path: Path,
+) -> None:
+    path = _create_scarf_store(tmp_path)
+    create_agent_workflow(path, workflow_run_id="workflow-1")
+    create_agent_workflow(path, workflow_run_id="workflow-2")
+    experimental = _experimental_report("experimental-provider")
+    reference = save_agent_report(
+        path,
+        "workflow-1",
+        experimental,
+        invocation=_invocation("experimental_context"),
+        agent_run_id="e1",
+    )
+    link = AgentReportLink.from_reference(reference)
+    handoff = experimental.to_parameter_tuning_handoff()
+
+    invalid_links = (
+        link.model_copy(update={"agentRunId": "unknown"}),
+        link.model_copy(update={"workflowRunId": "workflow-2"}),
+        link.model_copy(update={"contentSha256": "f" * 64}),
+    )
+    for index, invalid_link in enumerate(invalid_links):
+        with pytest.raises(ValueError, match="parent|Parent"):
+            save_agent_report(
+                path,
+                "workflow-1",
+                _tuning_report(f"tuning-provider-{index}"),
+                invocation=_invocation(
+                    "parameter_tuning",
+                    parents=[invalid_link],
+                    experimentalTuningHandoff=handoff,
+                ),
+                agent_run_id=f"invalid-{index}",
+            )
+
+
+def test_typed_handoffs_must_match_their_cited_parent_reports(
+    tmp_path: Path,
+) -> None:
+    path = _create_scarf_store(tmp_path)
+    create_agent_workflow(path, workflow_run_id="workflow-1")
+    experimental = _experimental_report("experimental-provider")
+    experimental_ref = save_agent_report(
+        path,
+        "workflow-1",
+        experimental,
+        invocation=_invocation("experimental_context"),
+        agent_run_id="e1",
+    )
+    experimental_link = AgentReportLink.from_reference(experimental_ref)
+
+    with pytest.raises(ValueError, match="experimentalTuningHandoff.*required"):
         save_agent_report(
             path,
             "workflow-1",
-            _report(report_type, f"provider-{index}"),  # type: ignore[arg-type]
-            agent_run_id=f"run-{index}",
+            _tuning_report("missing-handoff"),
+            invocation=_invocation(
+                "parameter_tuning",
+                parents=[experimental_link],
+            ),
+            agent_run_id="missing-handoff",
+        )
+    with pytest.raises(ValueError, match="does not match"):
+        save_agent_report(
+            path,
+            "workflow-1",
+            _tuning_report("wrong-handoff"),
+            invocation=_invocation(
+                "parameter_tuning",
+                parents=[experimental_link],
+                experimentalTuningHandoff=ExperimentalTuningHandoff(batchAction="skip"),
+            ),
+            agent_run_id="wrong-handoff",
         )
 
-    first = list_agent_reports(path, "workflow-1")
-    second = list_agent_reports(path, "workflow-1")
-    workflow = load_agent_workflow(path, "workflow-1")
-
-    assert first == second
-    assert first == sorted(
-        first,
-        key=lambda item: (item.createdAtNs, item.agentName, item.agentRunId),
-    )
-    assert workflow.reports == first
-    assert workflow.analysisStore == "analysis.zarr"
-    assert workflow.datasetFingerprints == {"RNA": "dataset-1"}
-    assert {item.agentName for item in first} == {
-        agent_name for _report_type, agent_name in REPORT_CASES
-    }
-    filtered = list_agent_reports(
+    tuning = _tuning_report("tuning-provider")
+    tuning_ref = save_agent_report(
         path,
         "workflow-1",
-        agent_name="parameter_tuning",
+        tuning,
+        invocation=_invocation("parameter_tuning"),
+        agent_run_id="t1",
     )
-    assert [item.agentName for item in filtered] == ["parameter_tuning"]
+    with pytest.raises(ValueError, match="tuningBiologyHandoff.*does not match"):
+        save_agent_report(
+            path,
+            "workflow-1",
+            BiologicalInterpretationReport.get_example(),
+            invocation=_invocation(
+                "biological_interpretation",
+                parents=[AgentReportLink.from_reference(tuning_ref)],
+                tuningBiologyHandoff=TuningBiologyHandoff(),
+            ),
+            agent_run_id="wrong-biology-handoff",
+        )
 
 
-def test_generated_workflow_and_agent_run_ids_are_safe(tmp_path: Path) -> None:
-    path = tmp_path / "analysis.agents.zarr"
-    workflow = create_agent_workflow(path)
-    reference = save_agent_report(
-        path,
-        workflow.workflowRunId,
-        DataEnrichmentReport.get_example(),
-    )
+def test_invocation_is_required_and_must_match_report_type(tmp_path: Path) -> None:
+    path = _create_scarf_store(tmp_path)
+    create_agent_workflow(path, workflow_run_id="workflow-1")
 
-    assert re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", workflow.workflowRunId)
-    assert re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", reference.agentRunId)
+    with pytest.raises(TypeError, match="invocation"):
+        save_agent_report(
+            path,
+            "workflow-1",
+            DataEnrichmentReport.get_example(),
+            invocation=None,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="agentName"):
+        save_agent_report(
+            path,
+            "workflow-1",
+            DataEnrichmentReport.get_example(),
+            invocation=_invocation("experimental_context"),
+        )
+    with pytest.raises(ValueError, match="inputs"):
+        save_agent_report(
+            path,
+            "workflow-1",
+            DataEnrichmentReport.get_example(),
+            invocation=AgentInvocation(agentName="data_enrichment"),
+        )
 
 
-def test_existing_complete_or_incomplete_report_is_never_overwritten(
+def test_workspace_records_are_physically_and_logically_isolated(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "analysis.agents.zarr"
+    path = _create_workspace_store(tmp_path)
+    workflow_a = create_agent_workflow(
+        path,
+        workflow_run_id="workflow-a",
+        workspace="workspace_a",
+    )
+    workflow_b = create_agent_workflow(
+        path,
+        workflow_run_id="workflow-b",
+        workspace="workspace_b",
+    )
+    reference_a = save_agent_report(
+        path,
+        workflow_a.workflowRunId,
+        DataEnrichmentReport.get_example(),
+        invocation=_invocation("data_enrichment"),
+        agent_run_id="run-a",
+        workspace="workspace_a",
+    )
+    reference_b = save_agent_report(
+        path,
+        workflow_b.workflowRunId,
+        DataEnrichmentReport.get_example(),
+        invocation=_invocation("data_enrichment"),
+        agent_run_id="run-b",
+        workspace="workspace_b",
+    )
+
+    assert reference_a.workspace == "workspace_a"
+    assert reference_b.workspace == "workspace_b"
+    assert _report_path(path, reference_a, workspace="workspace_a").is_file()
+    assert _report_path(path, reference_b, workspace="workspace_b").is_file()
+    assert not (path / "agents").exists()
+    assert [
+        item.workflowRunId
+        for item in list_agent_workflows(
+            path,
+            workspace="workspace_a",
+            include_incomplete=True,
+        )
+    ] == ["workflow-a"]
+    assert [
+        item.workflowRunId
+        for item in list_agent_workflows(
+            path,
+            workspace="workspace_b",
+            include_incomplete=True,
+        )
+    ] == ["workflow-b"]
+    with pytest.raises(KeyError, match="Unknown agent workflow"):
+        load_agent_report(path, reference_a, workspace="workspace_b")
+
+
+def test_datastore_rejects_an_explicit_workspace_mismatch(tmp_path: Path) -> None:
+    path = _create_scarf_store(tmp_path)
+    datastore = DataStore(
+        str(path),
+        assay_types={"RNA": "Assay"},
+        default_assay="RNA",
+        min_features_per_cell=0,
+        nthreads=1,
+        mem_budget="64M",
+    )
+
+    with pytest.raises(ValueError, match="workspace does not match"):
+        create_agent_workflow(
+            datastore,
+            workflow_run_id="workflow-1",
+            workspace="workspace_a",
+        )
+
+
+def test_workflow_lifecycle_controls_listing_and_future_writes(
+    tmp_path: Path,
+) -> None:
+    path = _create_scarf_store(tmp_path)
+    running = create_agent_workflow(path, workflow_run_id="running-workflow")
+    completed = create_agent_workflow(path, workflow_run_id="completed-workflow")
+    failed = create_agent_workflow(path, workflow_run_id="failed-workflow")
+    abandoned = create_agent_workflow(path, workflow_run_id="abandoned-workflow")
+
+    assert list_agent_workflows(path) == []
+    assert {
+        item.workflowRunId
+        for item in list_agent_workflows(path, include_incomplete=True)
+    } == {
+        running.workflowRunId,
+        completed.workflowRunId,
+        failed.workflowRunId,
+        abandoned.workflowRunId,
+    }
+    with pytest.raises(ValueError, match="at least one report"):
+        finalize_agent_workflow(path, completed.workflowRunId, status="completed")
+
+    reference = save_agent_report(
+        path,
+        completed.workflowRunId,
+        DataEnrichmentReport.get_example(),
+        invocation=_invocation("data_enrichment"),
+        agent_run_id="run-1",
+    )
+    workflow_file = path / "agents/runs/completed-workflow/workflow.json"
+    original_workflow = workflow_file.read_bytes()
+    completed_result = finalize_agent_workflow(
+        path,
+        completed.workflowRunId,
+        status="completed",
+        message="analysis finished",
+    )
+    failed_result = finalize_agent_workflow(
+        path,
+        failed.workflowRunId,
+        status="failed",
+        message="provider failed",
+    )
+    abandoned_result = finalize_agent_workflow(
+        path,
+        abandoned.workflowRunId,
+        status="abandoned",
+    )
+
+    assert workflow_file.read_bytes() == original_workflow
+    assert completed_result.status == "completed"
+    assert completed_result.finalizedAtNs > completed_result.createdAtNs
+    assert completed_result.finalizationMessage == "analysis finished"
+    assert failed_result.status == "failed"
+    assert failed_result.finalizationMessage == "provider failed"
+    assert abandoned_result.status == "abandoned"
+    assert load_agent_workflow(path, running.workflowRunId).status == "running"
+    assert {item.status for item in list_agent_workflows(path)} == {
+        "completed",
+        "failed",
+        "abandoned",
+    }
+    finalization = json.loads(
+        (path / "agents/runs/completed-workflow/finalization.json").read_text()
+    )
+    assert finalization["status"] == "completed"
+    assert finalization["message"] == "analysis finished"
+
+    with pytest.raises(FileExistsError, match="already 'completed'"):
+        finalize_agent_workflow(path, completed.workflowRunId, status="failed")
+    with pytest.raises(RuntimeError, match="completed"):
+        save_agent_report(
+            path,
+            completed.workflowRunId,
+            DataEnrichmentReport.get_example(),
+            invocation=_invocation("data_enrichment"),
+            agent_run_id="run-2",
+        )
+    assert load_agent_report(path, reference) == DataEnrichmentReport.get_example()
+
+    finalization["finalizedAtNs"] = completed_result.createdAtNs - 1
+    (path / "agents/runs/completed-workflow/finalization.json").write_text(
+        json.dumps(finalization),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="cannot precede"):
+        load_agent_workflow(path, completed.workflowRunId)
+
+
+def test_report_paths_are_immutable_and_corruption_fails_closed(
+    tmp_path: Path,
+) -> None:
+    path = _create_scarf_store(tmp_path)
     create_agent_workflow(path, workflow_run_id="workflow-1")
     report = DataEnrichmentReport.get_example()
     reference = save_agent_report(
         path,
         "workflow-1",
         report,
+        invocation=_invocation("data_enrichment"),
         agent_run_id="run-1",
     )
+    report_path = _report_path(path, reference)
+    original = report_path.read_bytes()
 
     with pytest.raises(FileExistsError, match="already exists"):
         save_agent_report(
             path,
             "workflow-1",
-            report,
+            report.model_copy(update={"limitations": ["different payload"]}),
+            invocation=_invocation("data_enrichment"),
             agent_run_id="run-1",
         )
+    assert report_path.read_bytes() == original
 
-    group = _record_group(path, reference)
-    group.attrs["complete"] = False
-    with pytest.raises(FileExistsError, match="already exists"):
-        save_agent_report(
-            path,
-            "workflow-1",
-            report,
-            agent_run_id="run-1",
-        )
-    with pytest.raises(RuntimeError, match="incomplete"):
-        load_agent_report(path, reference)
-    assert list_agent_reports(path, "workflow-1") == []
-    incomplete = list_agent_reports(
-        path,
-        "workflow-1",
-        include_incomplete=True,
-    )
-    assert len(incomplete) == 1
-    assert incomplete[0].complete is False
-
-
-def test_workflow_ids_are_immutable_and_workflows_are_isolated(tmp_path: Path) -> None:
-    path = tmp_path / "analysis.agents.zarr"
-    create_agent_workflow(path, workflow_run_id="workflow-1")
-    create_agent_workflow(path, workflow_run_id="workflow-2")
-    with pytest.raises(FileExistsError, match="already exists"):
-        create_agent_workflow(path, workflow_run_id="workflow-1")
-
-    first_report = _report(DataEnrichmentReport, "provider-1")
-    second_report = _report(DataEnrichmentReport, "provider-2")
-    first = save_agent_report(
-        path,
-        "workflow-1",
-        first_report,  # type: ignore[arg-type]
-        agent_run_id="shared-run",
-    )
-    second = save_agent_report(
-        path,
-        "workflow-2",
-        second_report,  # type: ignore[arg-type]
-        agent_run_id="shared-run",
-    )
-
-    assert list_agent_reports(path, "workflow-1") == [first]
-    assert list_agent_reports(path, "workflow-2") == [second]
-    assert load_agent_report(path, first).runInfo.runId == "provider-1"
-    assert load_agent_report(path, second).runInfo.runId == "provider-2"
-    workflows = list_agent_workflows(path)
-    assert {item.workflowRunId for item in workflows} == {"workflow-1", "workflow-2"}
-    assert [item.workflowRunId for item in workflows] == [
-        item.workflowRunId
-        for item in sorted(
-            workflows,
-            key=lambda item: (item.createdAtNs, item.workflowRunId),
-        )
-    ]
-
-
-def test_save_requires_an_existing_sidecar_and_workflow(tmp_path: Path) -> None:
-    path = tmp_path / "analysis.agents.zarr"
-    report = DataEnrichmentReport.get_example()
-
-    with pytest.raises(FileNotFoundError):
-        save_agent_report(path, "workflow-1", report)
-    assert not path.exists()
-
-    create_agent_workflow(path, workflow_run_id="workflow-1")
-    with pytest.raises(KeyError, match="Unknown agent workflow"):
-        save_agent_report(path, "workflow-2", report)
-    root = zarr.open_group(str(path), mode="r")
-    assert set(root["runs"].group_keys()) == {"workflow-1"}
-
-
-def test_load_rejects_payload_corruption(tmp_path: Path) -> None:
-    path = tmp_path / "analysis.agents.zarr"
-    create_agent_workflow(path, workflow_run_id="workflow-1")
-    reference = save_agent_report(
-        path,
-        "workflow-1",
-        DataEnrichmentReport.get_example(),
-        agent_run_id="run-1",
-    )
-    group = _record_group(path, reference)
-    payload = group["report_json"]
-    payload[0] = (int(payload[0]) + 1) % 256
-
+    payload = json.loads(original)
+    payload["report"]["limitations"] = ["tampered"]
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="checksum"):
         load_agent_report(path, reference)
 
 
-def test_load_rejects_schema_invalid_payload_with_valid_checksum(
+def test_malformed_json_and_legacy_zarr_agents_group_are_rejected(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "analysis.agents.zarr"
+    path = _create_scarf_store(tmp_path)
     create_agent_workflow(path, workflow_run_id="workflow-1")
-    reference = save_agent_report(
-        path,
-        "workflow-1",
-        DataEnrichmentReport.get_example(),
-        agent_run_id="run-1",
+    workflow_path = path / "agents/runs/workflow-1/workflow.json"
+    workflow_path.write_text("{", encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed"):
+        load_agent_workflow(path, "workflow-1")
+
+    legacy_path = tmp_path / "legacy.zarr"
+    legacy_root = zarr.open_group(str(legacy_path), mode="w", zarr_format=3)
+    _populate_scarf_group(legacy_root, fingerprints={"RNA": "dataset-rna"})
+    legacy_root.create_group(
+        "agents",
+        attributes={"format": "scarf_agent_reports", "format_version": 1},
     )
-    group = _record_group(path, reference)
-    payload = group["report_json"]
-    invalid_json = b"{}" + (b" " * (payload.shape[0] - 2))
-    payload[:] = np.frombuffer(invalid_json, dtype=np.uint8)
-    group.attrs["payload_sha256"] = hashlib.sha256(invalid_json).hexdigest()
-
-    with pytest.raises(ValueError, match="Pydantic schema"):
-        load_agent_report(path, reference)
-
-
-def test_load_rejects_report_identity_mismatch(tmp_path: Path) -> None:
-    path = tmp_path / "analysis.agents.zarr"
-    create_agent_workflow(path, workflow_run_id="workflow-1")
-    reference = save_agent_report(
-        path,
-        "workflow-1",
-        DataEnrichmentReport.get_example(),
-        agent_run_id="run-1",
-    )
-    group = _record_group(path, reference)
-    group.attrs["agent_name"] = "parameter_tuning"
-
-    with pytest.raises(ValueError, match="name identity mismatch"):
-        load_agent_report(path, reference)
-
-
-def test_load_rejects_missing_payload_and_type_mismatches(tmp_path: Path) -> None:
-    path = tmp_path / "analysis.agents.zarr"
-    create_agent_workflow(path, workflow_run_id="workflow-1")
-    reference = save_agent_report(
-        path,
-        "workflow-1",
-        DataEnrichmentReport.get_example(),
-        agent_run_id="run-1",
-    )
-    group = _record_group(path, reference)
-
-    group.attrs["report_type"] = "ParameterTuningReport"
-    with pytest.raises(ValueError, match="report type"):
-        load_agent_report(path, reference)
-    group.attrs["report_type"] = "DataEnrichmentReport"
-
-    mismatched_reference = reference.model_copy(
-        update={"reportType": "ParameterTuningReport"}
-    )
-    with pytest.raises(ValueError, match="reference type"):
-        load_agent_report(path, mismatched_reference)
-
-    group.attrs["execution_run_id"] = "different-execution"
-    with pytest.raises(ValueError, match="reference execution ID"):
-        load_agent_report(path, reference)
-    minimal_reference = AgentReportReference(
-        workflowRunId=reference.workflowRunId,
-        agentName=reference.agentName,
-        agentRunId=reference.agentRunId,
-    )
-    with pytest.raises(ValueError, match="JSON payload"):
-        load_agent_report(path, minimal_reference)
-    group.attrs["execution_run_id"] = reference.executionRunId
-
-    del group["report_json"]
-    with pytest.raises(ValueError, match="missing its JSON payload"):
-        load_agent_report(path, reference)
+    with pytest.raises(ValueError, match="version 1.*migration"):
+        create_agent_workflow(legacy_path, workflow_run_id="workflow-1")
 
 
 @pytest.mark.parametrize(
     "invalid_id",
     ["", ".", "..", "../x", "a/b", r"a\b", "UPPER", " leading", "x\x00"],
 )
-def test_run_ids_must_be_safe_single_path_components(
+def test_workflow_run_ids_are_validated_before_writing(
     tmp_path: Path,
     invalid_id: str,
 ) -> None:
-    path = tmp_path / "analysis.agents.zarr"
+    path = _create_scarf_store(tmp_path)
     with pytest.raises(ValueError, match="safe path component"):
         create_agent_workflow(path, workflow_run_id=invalid_id)
-    assert not path.exists()
-
-
-@pytest.mark.parametrize("invalid_id", ["", "../x", "a/b", "UPPER"])
-def test_agent_run_ids_are_validated_before_writing(
-    tmp_path: Path,
-    invalid_id: str,
-) -> None:
-    path = tmp_path / "analysis.agents.zarr"
-    create_agent_workflow(path, workflow_run_id="workflow-1")
-
-    with pytest.raises(ValueError, match="safe path component"):
-        save_agent_report(
-            path,
-            "workflow-1",
-            DataEnrichmentReport.get_example(),
-            agent_run_id=invalid_id,
-        )
-
-    root = zarr.open_group(str(path), mode="r")
-    workflow = root["runs/workflow-1"]
-    assert isinstance(workflow, zarr.Group)
-    assert list(workflow.group_keys()) == []
-
-
-def test_sidecar_suffix_prevents_writing_to_analysis_store(tmp_path: Path) -> None:
-    analysis_path = tmp_path / "analysis.zarr"
-
-    with pytest.raises(ValueError, match="agents.zarr"):
-        create_agent_workflow(analysis_path, workflow_run_id="workflow-1")
-
-    assert not analysis_path.exists()
-
-    zarr.open_group(str(analysis_path), mode="w", zarr_format=3)
-    nested_path = analysis_path / "results.agents.zarr"
-    with pytest.raises(ValueError, match="inside another Zarr store"):
-        create_agent_workflow(nested_path, workflow_run_id="workflow-1")
-    assert not nested_path.exists()
-
-
-def test_local_sidecar_does_not_adopt_an_ordinary_directory(tmp_path: Path) -> None:
-    path = tmp_path / "analysis.agents.zarr"
-    path.mkdir()
-    sentinel = path / "sentinel.txt"
-    sentinel.write_text("keep", encoding="utf-8")
-
-    with pytest.raises(ValueError, match="non-Zarr directory"):
-        create_agent_workflow(path, workflow_run_id="workflow-1")
-
-    assert sentinel.read_text(encoding="utf-8") == "keep"
-    assert not (path / "zarr.json").exists()
-
-
-def test_remote_sidecar_urls_are_rejected() -> None:
-    with pytest.raises(ValueError, match="local paths only"):
-        create_agent_workflow(
-            "s3://example/analysis.agents.zarr",
-            workflow_run_id="workflow-1",
-        )
-
-
-def test_foreign_or_unknown_version_store_is_rejected(tmp_path: Path) -> None:
-    foreign_path = tmp_path / "foreign.agents.zarr"
-    foreign = zarr.open_group(str(foreign_path), mode="w", zarr_format=3)
-    foreign.create_group("unrelated")
-    with pytest.raises(ValueError, match="non-empty"):
-        create_agent_workflow(foreign_path, workflow_run_id="workflow-1")
-
-    path = tmp_path / "analysis.agents.zarr"
-    create_agent_workflow(path, workflow_run_id="workflow-1")
-    root = zarr.open_group(str(path), mode="r+")
-    root.attrs["format_version"] = 2
-    with pytest.raises(ValueError, match="only version 1"):
-        load_agent_workflow(path, "workflow-1")
-
-
-def test_boolean_format_versions_are_rejected(tmp_path: Path) -> None:
-    path = tmp_path / "analysis.agents.zarr"
-    create_agent_workflow(path, workflow_run_id="workflow-1")
-    root = zarr.open_group(str(path), mode="r+")
-    root.attrs["format_version"] = True
-
-    with pytest.raises(ValueError, match="only version 1"):
-        load_agent_workflow(path, "workflow-1")
-
-
-def test_missing_store_reads_do_not_create_a_sidecar(tmp_path: Path) -> None:
-    path = tmp_path / "analysis.agents.zarr"
-
-    with pytest.raises(FileNotFoundError):
-        list_agent_reports(path, "workflow-1")
-    with pytest.raises(FileNotFoundError):
-        load_agent_workflow(path, "workflow-1")
-    assert not path.exists()
-
-
-def test_unknown_agent_filter_is_rejected(tmp_path: Path) -> None:
-    path = tmp_path / "analysis.agents.zarr"
-    create_agent_workflow(path, workflow_run_id="workflow-1")
-
-    with pytest.raises(ValueError, match="Unknown agent name"):
-        list_agent_reports(
-            path,
-            "workflow-1",
-            agent_name="unknown",  # type: ignore[arg-type]
-        )
-
-
-def test_default_listing_skips_an_interrupted_bare_report(tmp_path: Path) -> None:
-    path = tmp_path / "analysis.agents.zarr"
-    create_agent_workflow(path, workflow_run_id="workflow-1")
-    root = zarr.open_group(str(path), mode="r+")
-    root.create_group("runs/workflow-1/data_enrichment/interrupted")
-
-    assert list_agent_reports(path, "workflow-1") == []
-    with pytest.raises(ValueError, match="Malformed agent report"):
-        list_agent_reports(
-            path,
-            "workflow-1",
-            include_incomplete=True,
-        )
+    assert not (path / "agents").exists()
 
 
 def test_save_rejects_unknown_report_model(tmp_path: Path) -> None:
-    path = tmp_path / "analysis.agents.zarr"
+    path = _create_scarf_store(tmp_path)
     create_agent_workflow(path, workflow_run_id="workflow-1")
 
     with pytest.raises(TypeError, match="four Scarf agent report models"):
@@ -504,12 +852,19 @@ def test_save_rejects_unknown_report_model(tmp_path: Path) -> None:
             path,
             "workflow-1",
             AnyReport.get_example(),  # type: ignore[arg-type]
+            invocation=_invocation("data_enrichment"),
         )
 
 
-class AnyReport(AgentDataModel):
-    value: str = ""
+def test_generated_workflow_and_agent_run_ids_are_safe(tmp_path: Path) -> None:
+    path = _create_scarf_store(tmp_path)
+    workflow = create_agent_workflow(path)
+    reference = save_agent_report(
+        path,
+        workflow.workflowRunId,
+        DataEnrichmentReport.get_example(),
+        invocation=_invocation("data_enrichment"),
+    )
 
-    @classmethod
-    def get_example(cls) -> "AnyReport":
-        return cls(value="not an agent report")
+    assert re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", workflow.workflowRunId)
+    assert re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", reference.agentRunId)

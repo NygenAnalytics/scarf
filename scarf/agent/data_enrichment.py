@@ -15,7 +15,8 @@ from .types import AgentDataModel, AgentRunInfo, StageStatus
 
 try:
     from pydantic import ConfigDict, Field, model_validator
-    from pydantic_ai import ModelRetry, RunContext
+    from pydantic_ai import ModelRetry, RunContext, Tool
+    from pydantic_ai.tools import ToolDefinition
 except ImportError as exc:
     raise ImportError(AGENT_INSTALL_HINT) from exc
 
@@ -426,6 +427,24 @@ class DataEnrichmentDependencies(AgentDataModel):
         )
 
 
+def _prepare_data_enrichment_tool(
+    ctx: RunContext[DataEnrichmentDependencies],
+    tool_definition: ToolDefinition,
+) -> ToolDefinition | None:
+    """Expose each batched enrichment tool only while its work is pending."""
+    deps = ctx.deps
+    completed_calls = {call.name for call in deps.toolCalls}
+    inspection_complete = "inspect_assay_features_batch" in completed_calls
+
+    if tool_definition.name == "inspect_assay_features_batch":
+        return None if inspection_complete else tool_definition
+    if tool_definition.name == "find_present_features_batch":
+        if not inspection_complete or tool_definition.name in completed_calls:
+            return None
+        return tool_definition
+    return tool_definition
+
+
 async def inspect_assay_features(
     ctx: RunContext[DataEnrichmentDependencies],
     assay_name: str,
@@ -829,7 +848,7 @@ class DataEnrichmentAgent:
         self.model = model
         self.config = (config or AgentRunConfig()).with_limits(
             request_limit=5,
-            tool_call_limit=2,
+            tool_call_limit=3,
             output_token_limit=32768,
             timeout_seconds=600.0,
         )
@@ -894,7 +913,8 @@ class DataEnrichmentAgent:
                 assay together. If a policy needs individual features, collect all
                 proposed names for all assays and call
                 find_present_features_batch exactly once. Do not call a singular
-                assay tool or split lookups across calls.
+                assay tool or split lookups across calls. A batched tool is removed
+                after it succeeds, so use each call to request all required data.
                 """
             )
             .strip()
@@ -915,7 +935,20 @@ class DataEnrichmentAgent:
             output_type=DataEnrichmentReport,
             system_prompt=_SYSTEM_PROMPT,
             user_prompt=user_prompt,
-            tools=[inspect_assay_features_batch, find_present_features_batch],
+            tools=[
+                Tool(
+                    inspect_assay_features_batch,
+                    prepare=_prepare_data_enrichment_tool,
+                    sequential=self.config.sequentialTools,
+                    timeout=self.config.timeoutSeconds,
+                ),
+                Tool(
+                    find_present_features_batch,
+                    prepare=_prepare_data_enrichment_tool,
+                    sequential=self.config.sequentialTools,
+                    timeout=self.config.timeoutSeconds,
+                ),
+            ],
             deps_type=DataEnrichmentDependencies,
             deps=deps,
             config=self.config,
