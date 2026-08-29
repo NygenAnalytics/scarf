@@ -138,6 +138,9 @@ def configure_doc_execution_env(
         }
     )
     target.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
+    local_catalog = REPO_ROOT / "build" / "cytebase"
+    if any(local_catalog.glob("*/data.zarr")):
+        target["SCARF_CYTEBASE_LOCAL"] = str(local_catalog)
     return target
 
 

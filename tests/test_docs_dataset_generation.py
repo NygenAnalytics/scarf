@@ -84,6 +84,24 @@ def test_prepared_run_columns_are_explicit_full_axis_copies():
     np.testing.assert_array_equal(store.cells.columns["I"], [True, False, True])
 
 
+def test_drop_retired_assay_state_removes_leftover_groups(tmp_path):
+    import zarr
+
+    root = zarr.open_group(str(tmp_path / "store.zarr"), mode="w")
+    rna = root.create_group("RNA")
+    rna.attrs["is_assay"] = True
+    rna.create_group("state")
+    rna.create_group("artifacts")
+    cell_data = root.create_group("cellData")
+    cell_data.create_group("ids")
+
+    removed = generator._drop_retired_assay_state(root)
+
+    assert removed == ("RNA/state",)
+    assert "state" not in root["RNA"]
+    assert "artifacts" in root["RNA"]
+
+
 def test_prepared_artifact_columns_project_the_exact_stored_selection(monkeypatch):
     selection = ArtifactRef(
         scope="datastore",

@@ -232,6 +232,30 @@ def _materialize_artifact_cell_columns(
         )
 
 
+def _drop_retired_assay_state(root: Any) -> tuple[str, ...]:
+    """Delete leftover `{assay}/state` groups so the archived store can reopen."""
+    removed: list[str] = []
+    for name in list(root.group_keys()):
+        child = root[name]
+        if not hasattr(child, "group_keys"):
+            continue
+        if child.attrs.get("is_assay") and "state" in child:
+            del child["state"]
+            removed.append(f"{name}/state")
+    return tuple(removed)
+
+
+def _verify_store_opens(store: Path, *, default_assay: str) -> None:
+    from scarf import DataStore
+
+    DataStore(
+        str(store),
+        default_assay=default_assay,
+        nthreads=ZARR_NTHREADS,
+        zarr_mode="r",
+    )
+
+
 def _openable_rna_store(source_path: Path, work: Path) -> Path:
     """Return a store DataStore can open, repacking a legacy snapshot if needed."""
     import zarr
@@ -1281,6 +1305,12 @@ def build_store(
         **datastore_options,
     )
     recipe.analyze(datastore)
+    retired_state = _drop_retired_assay_state(datastore.z)
+    if retired_state:
+        print(
+            "Dropped leftover assay state before archiving: " + ", ".join(retired_state)
+        )
+    _verify_store_opens(store, default_assay=recipe.default_assay)
 
     archive = output / ARCHIVE_NAME
     with tarfile.open(archive, "w:gz") as handle:
