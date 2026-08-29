@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from ..config._deps import AGENT_INSTALL_HINT
+from ..persistence import AgentWorkflowRun
 from ..types import AgentDataModel, Decision, NeedsInput, StageStatus
 
 try:
@@ -16,6 +17,7 @@ class IngestResult(AgentDataModel):
     status: StageStatus
     format: str | None = None
     zarrPath: str | None = None
+    workflowRun: AgentWorkflowRun | None = None
     assayNames: list[str] = Field(default_factory=list)
     summary: dict[str, Any] | None = None
     decision: Decision | None = None
@@ -34,6 +36,7 @@ class IngestResult(AgentDataModel):
             status="done",
             format="h5ad",
             zarrPath="dataset.zarr",
+            workflowRun=AgentWorkflowRun.get_example(),
             assayNames=["RNA"],
         )
 
@@ -47,12 +50,14 @@ def done(
     accepted_actions: list[dict[str, Any]],
     action_labels: list[str],
     notes: list[str],
+    workflow_run: AgentWorkflowRun | None = None,
     decision: Decision | None = None,
 ) -> IngestResult:
     return IngestResult(
         status="done",
         format=format_name,
         zarrPath=zarr_path,
+        workflowRun=workflow_run,
         assayNames=assay_names,
         summary=summary,
         decision=decision,

@@ -5,6 +5,7 @@ import zarr
 from zarr.storage import MemoryStore
 
 import scarf.metadata.artifacts as metadata_artifacts_module
+import scarf.metadata.selection as metadata_selection_module
 from scarf.datastore.datastore import DataStore
 from scarf.metadata.artifacts import (
     artifact_values,
@@ -14,6 +15,7 @@ from scarf.metadata.artifacts import (
     validate_display_metadata,
     write_cell_data_artifact,
 )
+from scarf.metadata.selection import resolve_cell_aligned_artifact
 from scarf.storage.artifacts import (
     ArtifactRef,
     artifact_group,
@@ -171,6 +173,89 @@ def test_cell_data_artifact_cache_hit_miss_and_payload_validation(
     assert inspect_artifact(root, first.ref).complete
     assert corrupt_miss.reused is False
     assert corrupt_miss.ref != first.ref
+
+
+def test_cell_aligned_artifact_resolver_validates_lineage_and_reads_subset(
+    monkeypatch,
+) -> None:
+    root, source_selection = _memory_metadata_root()
+    planned = plan_cell_data_artifact(
+        root,
+        scope="assay",
+        assay="RNA",
+        kind="quality_metric",
+        operation="test_resolve_cell_aligned_artifact",
+        parameters={},
+        inputs={},
+        execution_options={},
+        cell_selection=source_selection,
+        arrays={"values": ((2,), "f")},
+    )
+    write_cell_data_artifact(
+        root,
+        planned,
+        {"values": np.asarray([10.0, 30.0])},
+    )
+    cell_ids = np.asarray(root["cellData"]["ids"][:])
+    target_selection = resolve_selection_artifact(
+        root,
+        scope="datastore",
+        kind="cell_selection",
+        values=np.asarray([False, False, True]),
+        row_ids=cell_ids,
+        operation="target_subset",
+        parameters={},
+        inputs={},
+        source_column="artifact",
+    )
+    read_positions: list[np.ndarray] = []
+    read_rows = metadata_selection_module.read_array_rows_chunkwise
+
+    def capture_rows(array, rows):
+        read_positions.append(np.asarray(rows).copy())
+        return read_rows(array, rows)
+
+    monkeypatch.setattr(
+        metadata_selection_module,
+        "read_array_rows_chunkwise",
+        capture_rows,
+    )
+
+    resolved = resolve_cell_aligned_artifact(
+        root,
+        planned.ref,
+        cell_selection=target_selection,
+        expected_kind="quality_metric",
+    )
+
+    np.testing.assert_array_equal(resolved.values, [30.0])
+    np.testing.assert_array_equal(resolved.cell_idx, [2])
+    assert resolved.source_cell_selection == source_selection
+    assert resolved.cell_selection == target_selection
+    assert len(read_positions) == 1
+    np.testing.assert_array_equal(read_positions[0], [1])
+
+    outside_selection = resolve_selection_artifact(
+        root,
+        scope="datastore",
+        kind="cell_selection",
+        values=np.asarray([False, True, False]),
+        row_ids=cell_ids,
+        operation="outside_source_selection",
+        parameters={},
+        inputs={},
+        source_column="artifact",
+    )
+    with pytest.raises(ValueError, match="subset"):
+        resolve_cell_aligned_artifact(
+            root,
+            planned.ref,
+            cell_selection=outside_selection,
+        )
+
+    artifact_group(root, planned.ref).attrs["complete"] = False
+    with pytest.raises(ValueError, match="unavailable or incomplete"):
+        resolve_cell_aligned_artifact(root, planned.ref)
 
 
 def test_cell_data_artifact_validation_and_failed_write_status() -> None:

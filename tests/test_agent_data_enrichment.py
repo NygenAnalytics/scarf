@@ -9,8 +9,11 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from scarf.agent.characterize_features import FeatureCharacterization
 from scarf.agent.data_enrichment import (
+    AdtControlEvidence,
     AssayFeatureInspection,
     AssayFeatureInspectionBatch,
+    AssayModalityEvidence,
+    AtacCoordinateEvidence,
     DataEnrichmentAgent,
     DataEnrichmentContext,
     DataEnrichmentDependencies,
@@ -23,6 +26,8 @@ from scarf.agent.data_enrichment import (
     FeatureMatch,
     FeatureReference,
     FeatureSelectionPolicy,
+    HtoTagEvidence,
+    StudyContextSummary,
     validate_data_enrichment_report,
 )
 
@@ -100,6 +105,11 @@ def characterization() -> FeatureCharacterization:
 def test_data_enrichment_models_have_factories_and_camelcase_fields() -> None:
     model_types: list[type[BaseModel]] = [
         DataEnrichmentContext,
+        StudyContextSummary,
+        AdtControlEvidence,
+        HtoTagEvidence,
+        AtacCoordinateEvidence,
+        AssayModalityEvidence,
         FeatureFamilyEvidence,
         ExogenousFeatureEvidence,
         AssayFeatureInspection,
@@ -238,6 +248,160 @@ def test_data_enrichment_agent_uses_only_read_tools_and_context(
     assert characterization_calls[0]["studyContext"].startswith("Treated human")
     assert settings[0]["parallel_tool_calls"] is False
     assert settings[0]["extra_body"]["reasoning_effort"] == "none"
+
+
+def test_data_enrichment_batches_grounded_multimodal_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scarf.agent import data_enrichment as module
+
+    assay_features = {
+        "RNA": (
+            ["ENSG00000198727", "ENSG00000111640"],
+            ["MT-CYB", "GAPDH"],
+        ),
+        "peaks": (
+            ["chr1:100-200", "not-a-coordinate"],
+            ["chr1:100-200", "not-a-coordinate"],
+        ),
+        "proteins": (
+            ["CD3", "mouse-igg1-control", "IgG1"],
+            ["CD3", "Mouse IgG1 isotype control", "IgG1 antibody"],
+        ),
+        "hashes": (["HTO-1", "HTO-2"], ["sample one", "sample two"]),
+        "guides": (["guide-1"], ["guide one"]),
+    }
+
+    class Table:
+        def __init__(self, ids: list[str], names: list[str]) -> None:
+            self.values = {"ids": ids, "names": names}
+
+        def fetch_all(self, column: str) -> list[str]:
+            return self.values[column]
+
+    class Store:
+        assay_names = list(assay_features)
+
+        def __init__(self) -> None:
+            self.assays = {
+                name: SimpleNamespace(feats=Table(ids, names))
+                for name, (ids, names) in assay_features.items()
+            }
+
+        def get_assay(self, assay_name: str) -> SimpleNamespace:
+            return self.assays[assay_name]
+
+        def summary(self) -> SimpleNamespace:
+            assay_types = {
+                "RNA": "RNA",
+                "peaks": "ATAC",
+                "proteins": "ADT",
+                "hashes": "HTO",
+                "guides": "CRISPR",
+            }
+            return SimpleNamespace(
+                assays=[
+                    SimpleNamespace(name=name, assay_type=assay_type)
+                    for name, assay_type in assay_types.items()
+                ]
+            )
+
+    def inspect_characterization(_store, **kwargs):
+        assay_name = kwargs["assays"][0]
+        ids, _names = assay_features[assay_name]
+        assay_kind = {
+            "RNA": "RNAassay",
+            "peaks": "ATACassay",
+            "proteins": "ADTassay",
+            "hashes": "ADTassay",
+            "guides": "Assay",
+        }[assay_name]
+        return FeatureCharacterization(
+            status="done",
+            assays=[
+                {
+                    "assay": assay_name,
+                    "assayKind": assay_kind,
+                    "identity": {"nFeatures": len(ids)},
+                    "species": "unknown",
+                    "speciesMethod": "notApplicable",
+                    "speciesResolution": {"reason": "not an RNA decision"},
+                    "families": [],
+                    "exogenous": [],
+                }
+            ],
+        )
+
+    monkeypatch.setattr(module, "characterize_features", inspect_characterization)
+    state = {"request": 0}
+
+    async def reply(
+        _messages: list[ModelMessage],
+        info: AgentInfo,
+    ) -> ModelResponse:
+        request = state["request"]
+        state["request"] += 1
+        if request == 0:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="inspect_assay_features_batch",
+                        args={},
+                    )
+                ]
+            )
+        report = DataEnrichmentReport(
+            status="done",
+            studyContextSummary=StudyContextSummary(
+                tissueReferences=["blood"],
+                hypothesisReferences=["treatment changes immune states"],
+            ),
+            policies=[
+                FeatureSelectionPolicy(
+                    assay=assay_name,
+                    evidenceIds=[f"assay:{assay_name}:species"],
+                )
+                for assay_name in assay_features
+            ],
+        )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name,
+                    args=report.model_dump(),
+                )
+            ]
+        )
+
+    context = "Human blood study tests whether treatment changes immune states."
+    result = DataEnrichmentAgent(FunctionModel(reply)).run(
+        Store(),
+        context=DataEnrichmentContext(studyContext=context),
+    )
+
+    policies = {policy.assay: policy for policy in result.policies}
+    assert policies["RNA"].assayModality == "RNA"
+    assert policies["RNA"].graphEligible is True
+    assert policies["peaks"].assayModality == "ATAC"
+    assert policies["peaks"].peakCoordinateStatus == "partial"
+    assert [item.featureId for item in policies["proteins"].exactControlFeatures] == [
+        "mouse-igg1-control"
+    ]
+    assert [item.featureId for item in policies["hashes"].exactTagFeatures] == [
+        "HTO-1",
+        "HTO-2",
+    ]
+    assert policies["hashes"].demultiplexEligible is True
+    assert policies["hashes"].graphEligible is False
+    assert policies["guides"].assayModality == "unsupported"
+    assert result.studyContextSummary.studyContext == context
+    assert result.studyContextSummary.organismReferences == ["Human"]
+    assert result.studyContextSummary.tissueReferences == ["blood"]
+    assert result.studyContextSummary.hypothesisReferences == [
+        "treatment changes immune states"
+    ]
+    assert policies["RNA"].tissueReferences == ["blood"]
+    assert [call.name for call in result.toolCalls] == ["inspect_assay_features_batch"]
 
 
 def test_data_enrichment_retries_hallucinated_features(

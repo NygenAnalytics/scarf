@@ -5,9 +5,11 @@ from pathlib import Path
 import h5py
 import numpy as np
 import pytest
+import zarr
 from scipy.sparse import csr_matrix
 
 from scarf.agent import detect_format, ingest
+from scarf.agent.persistence import AgentWorkflowRun
 from scarf.agent.types import Decision
 from scarf.readers import inspect_h5ad
 
@@ -84,6 +86,7 @@ def _patch_ingest_summary(
     import importlib
 
     ingest_common = importlib.import_module("scarf.agent.ingest.common")
+    persistence = importlib.import_module("scarf.agent.persistence")
 
     def summarize(
         _zarr_path: str,
@@ -98,6 +101,16 @@ def _patch_ingest_summary(
         )
 
     monkeypatch.setattr(ingest_common, "open_summary", summarize)
+    monkeypatch.setattr(
+        persistence,
+        "create_agent_workflow",
+        lambda _path: AgentWorkflowRun(
+            workflowRunId="workflow-1",
+            createdAtNs=1,
+            analysisStore=str(_path),
+            datasetFingerprints={assay_name: "fingerprint-1"},
+        ),
+    )
 
 
 def test_detect_format_by_suffix(tmp_path: Path) -> None:
@@ -161,8 +174,24 @@ def test_ingest_h5ad_prefers_raw_integer_matrix(tmp_path: Path) -> None:
     assert result.zarrPath is not None
     assert "RNA" in result.assayNames
     assert result.summary is not None
+    assert result.workflowRun is not None
     assert result.acceptedActions
-    assert result.acceptedActions[-1]["op"] == "DataStore"
+    assert result.acceptedActions[-2]["op"] == "DataStore"
+    assert result.acceptedActions[-1]["op"] == "createAgentWorkflow"
+    root = zarr.open_group(result.zarrPath, mode="r")
+    assert result.workflowRun.datasetFingerprints == {
+        assay_name: str(root[assay_name].attrs["dataset_fingerprint"])
+        for assay_name in result.assayNames
+    }
+    assert isinstance(root["agents"], zarr.Group)
+    assert root["agents"].attrs["format"] == "scarf_agent_reports"
+    assert (
+        Path(result.zarrPath)
+        / "agents"
+        / "runs"
+        / result.workflowRun.workflowRunId
+        / "workflow.json"
+    ).is_file()
 
 
 def test_ingest_h5ad_stops_on_prenormalized_only(tmp_path: Path) -> None:
@@ -329,8 +358,10 @@ def test_ingest_10x_h5(tmp_path: Path) -> None:
     assert result.status == "done", result.notes
     assert result.format == "10x_h5"
     assert "RNA" in result.assayNames
+    assert result.workflowRun is not None
     assert result.acceptedActions
-    assert result.acceptedActions[-1]["op"] == "DataStore"
+    assert result.acceptedActions[-2]["op"] == "DataStore"
+    assert result.acceptedActions[-1]["op"] == "createAgentWorkflow"
 
 
 def _file_snapshot(location: Path) -> dict[str, tuple[int, int]]:
@@ -407,13 +438,29 @@ def test_ingest_overwrite_true_replaces_destination(tmp_path: Path) -> None:
     assert not sentinel.exists()
 
 
-def test_ingest_missing_destination_fails(tmp_path: Path) -> None:
+def test_ingest_derives_destination_and_creates_workflow(tmp_path: Path) -> None:
     path = tmp_path / "counts.h5ad"
     _write_h5ad(path, np.array([[1, 0], [0, 2]], dtype=np.uint16))
     result = ingest(path=path)
-    assert result.status == "failed"
+    assert result.status == "done"
     assert result.format == "h5ad"
-    assert any("zarrPath is required" in note for note in result.notes)
+    assert result.zarrPath == str(tmp_path / "counts.zarr")
+    assert result.workflowRun is not None
+    assert any("Using derived Zarr destination" in note for note in result.notes)
+    root = zarr.open_group(result.zarrPath, mode="r")
+    assert result.workflowRun.datasetFingerprints == {
+        assay_name: str(root[assay_name].attrs["dataset_fingerprint"])
+        for assay_name in result.assayNames
+    }
+    assert isinstance(root["agents"], zarr.Group)
+    assert root["agents"].attrs["format"] == "scarf_agent_reports"
+    assert (
+        Path(result.zarrPath)
+        / "agents"
+        / "runs"
+        / result.workflowRun.workflowRunId
+        / "workflow.json"
+    ).is_file()
 
 
 def test_ingest_overlapping_source_destination_fails(tmp_path: Path) -> None:
@@ -534,7 +581,8 @@ def test_ingest_mtx_selected_candidate_happy_path(
     assert created_writers[0].dump_calls == 1
     assert result.acceptedActions[0]["op"] == "MtxToZarr"
     assert result.acceptedActions[0]["mtxIndex"] == 1
-    assert result.acceptedActions[-1]["op"] == "DataStore"
+    assert result.acceptedActions[-2]["op"] == "DataStore"
+    assert result.acceptedActions[-1]["op"] == "createAgentWorkflow"
     assert destination.is_dir()
 
 
@@ -716,7 +764,8 @@ def test_ingest_seurat_success_closes_reader(
     assert created_writers[0].reader is created_readers[0]
     assert created_writers[0].dump_calls == 1
     assert result.acceptedActions[0]["op"] == "SeuratToZarr"
-    assert result.acceptedActions[-1]["op"] == "DataStore"
+    assert result.acceptedActions[-2]["op"] == "DataStore"
+    assert result.acceptedActions[-1]["op"] == "createAgentWorkflow"
     assert destination.is_dir()
 
 
@@ -864,8 +913,9 @@ def test_ingest_loom_success_forwards_reader_options_and_closes(
     assert created_writers[0].assay_name == "ADT"
     assert created_writers[0].dump_calls == 1
     assert result.acceptedActions[0]["op"] == "LoomToZarr"
-    assert result.acceptedActions[-1]["op"] == "DataStore"
-    assert result.acceptedActions[-1]["defaultAssay"] == "ADT"
+    assert result.acceptedActions[-2]["op"] == "DataStore"
+    assert result.acceptedActions[-2]["defaultAssay"] == "ADT"
+    assert result.acceptedActions[-1]["op"] == "createAgentWorkflow"
     assert destination.is_dir()
 
 
@@ -1157,8 +1207,10 @@ def test_ingest_h5ad_still_initializes_qc(tmp_path: Path) -> None:
     dest = tmp_path / "out.zarr"
     result = ingest(path=path, zarrPath=dest)
     assert result.status == "done"
-    assert result.acceptedActions[-1]["op"] == "DataStore"
-    assert result.acceptedActions[-1]["zarrMode"] == "r+"
+    assert result.workflowRun is not None
+    assert result.acceptedActions[-2]["op"] == "DataStore"
+    assert result.acceptedActions[-2]["zarrMode"] == "r+"
+    assert result.acceptedActions[-1]["op"] == "createAgentWorkflow"
     from scarf.datastore.datastore import DataStore
 
     store = DataStore(str(dest), default_assay="RNA", nthreads=1)

@@ -1,7 +1,7 @@
 """Bounded parameter tuning over explicit Scarf analysis candidates."""
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from textwrap import dedent
 from threading import Lock
 from typing import Any, Literal
@@ -10,6 +10,7 @@ import numpy as np
 
 from ..storage.refs import ArtifactRef
 from .config import CONFIG, AgentRunConfig
+from .config._deps import AGENT_INSTALL_HINT
 from .config.agent_exec import run_agent_sync
 from .tools import artifact_reference, core_artifact_reference
 from .types import (
@@ -20,16 +21,15 @@ from .types import (
     StageStatus,
     TuningBiologyHandoff,
 )
+from ..utils.logging import logger
 
 try:
     from pydantic import Field
 except ImportError as exc:
-    from .config._deps import AGENT_INSTALL_HINT
-
     raise ImportError(AGENT_INSTALL_HINT) from exc
 
 try:
-    from pydantic_ai import RunContext
+    from pydantic_ai import RunContext, UnexpectedModelBehavior
 except ImportError as exc:
     raise ImportError(AGENT_INSTALL_HINT) from exc
 
@@ -38,6 +38,8 @@ type CandidateStatus = Literal["done", "failed"]
 type CandidatePhase = Literal["initial", "refined"]
 type ParameterSearchStatus = Literal["complete", "refine"]
 type TuningConfidence = Literal["low", "medium", "high"]
+type ReductionMethod = Literal["pca", "lsi", "identity"]
+type IntegrationMethod = Literal["snn", "wnn"]
 
 
 class ArtifactRecord(ArtifactReferenceModel):
@@ -73,6 +75,7 @@ class ParameterCandidate(AgentDataModel):
         default="",
         description="Exact candidate id supplied to the evaluation tool",
     )
+    reductionMethod: ReductionMethod = "pca"
     dimensions: int = Field(default=21, ge=2)
     leidenResolution: float = Field(default=1.0, gt=0)
     neighborsK: int = Field(default=11, ge=2)
@@ -86,6 +89,7 @@ class ParameterCandidate(AgentDataModel):
     def get_example(cls) -> "ParameterCandidate":
         return cls(
             candidateId="baseline",
+            reductionMethod="pca",
             dimensions=21,
             leidenResolution=1.0,
             neighborsK=11,
@@ -138,6 +142,9 @@ class ParameterCandidateEvaluation(AgentDataModel):
     parameters: ParameterCandidate = Field(default_factory=ParameterCandidate.get_blank)
     artifacts: dict[str, ArtifactRecord] = Field(default_factory=dict)
     cellSelection: ArtifactReferenceModel | None = None
+    clusterColumn: str | None = None
+    clusterLabel: str | None = None
+    effectiveDimensions: int | None = None
     metrics: ParameterMetrics = Field(default_factory=ParameterMetrics.get_blank)
     evidenceIds: list[str] = Field(default_factory=list)
     eligibilityReasons: list[str] = Field(default_factory=list)
@@ -170,8 +177,172 @@ class ParameterCandidateEvaluation(AgentDataModel):
                 kind="cell_selection",
                 artifactId="c" * 64,
             ),
+            clusterColumn="RNA_agent_tuning_baseline",
+            clusterLabel="agent_tuning_baseline",
+            effectiveDimensions=21,
             metrics=ParameterMetrics.get_example(),
             evidenceIds=["candidate:baseline:clusters"],
+        )
+
+
+class IntegrationMetrics(AgentDataModel):
+    """Metrics that are valid for an integrated graph comparison."""
+
+    nClusters: int | None = None
+    minClusterCells: int | None = None
+    minClusterFraction: float | None = None
+    adjustedRandByAssay: dict[str, float] = Field(default_factory=dict)
+    normalizedMutualInformationByAssay: dict[str, float] = Field(default_factory=dict)
+    biologicalConnectivity: dict[str, float] = Field(default_factory=dict)
+    modalityWeightsValid: bool | None = None
+
+    @classmethod
+    def get_blank(cls) -> "IntegrationMetrics":
+        return cls()
+
+    @classmethod
+    def get_example(cls) -> "IntegrationMetrics":
+        return cls(
+            nClusters=8,
+            minClusterCells=37,
+            minClusterFraction=0.0185,
+            adjustedRandByAssay={"RNA": 0.71, "ADT": 0.63},
+            normalizedMutualInformationByAssay={"RNA": 0.76, "ADT": 0.69},
+            modalityWeightsValid=True,
+        )
+
+
+class IntegrationCandidateEvaluation(AgentDataModel):
+    """One executor-produced SNN or WNN graph and cluster evaluation."""
+
+    integrationId: str = ""
+    method: IntegrationMethod = "snn"
+    assays: list[str] = Field(default_factory=list)
+    status: CandidateStatus = "failed"
+    eligible: bool = False
+    cellSelection: ArtifactReferenceModel | None = None
+    resolution: float = Field(default=1.0, gt=0)
+    graphArtifact: ArtifactRecord | None = None
+    clusterArtifact: ArtifactRecord | None = None
+    clusterColumn: str | None = None
+    metrics: IntegrationMetrics = Field(default_factory=IntegrationMetrics.get_blank)
+    evidenceIds: list[str] = Field(default_factory=list)
+    eligibilityReasons: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    error: str | None = None
+
+    @classmethod
+    def get_blank(cls) -> "IntegrationCandidateEvaluation":
+        return cls()
+
+    @classmethod
+    def get_example(cls) -> "IntegrationCandidateEvaluation":
+        return cls(
+            integrationId="wnn_resolution_1",
+            method="wnn",
+            assays=["RNA", "ADT"],
+            status="done",
+            eligible=True,
+            cellSelection=ArtifactReferenceModel(
+                scope="datastore",
+                assay=None,
+                kind="cell_selection",
+                artifactId="c" * 64,
+            ),
+            graphArtifact=ArtifactRecord(
+                scope="datastore",
+                kind="integrated_graph",
+                artifactId="2" * 64,
+            ),
+            clusterArtifact=ArtifactRecord(
+                scope="datastore",
+                kind="cluster_labels",
+                artifactId="3" * 64,
+            ),
+            clusterColumn="agent_wnn_cluster",
+            metrics=IntegrationMetrics.get_example(),
+            evidenceIds=["integration:wnn_resolution_1:clusters"],
+        )
+
+
+class FinalGraphComparison(AgentDataModel):
+    """Evidence-backed comparison against one eligible final graph option."""
+
+    optionId: str = ""
+    summary: str = ""
+    evidenceIds: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def get_blank(cls) -> "FinalGraphComparison":
+        return cls()
+
+    @classmethod
+    def get_example(cls) -> "FinalGraphComparison":
+        return cls(
+            optionId="native:ADT:baseline",
+            summary="The RNA-native option better preserves the requested labels.",
+            evidenceIds=[
+                "native:RNA:candidate:baseline:clusters",
+                "native:ADT:candidate:baseline:clusters",
+            ],
+        )
+
+
+class FinalGraphNeedsInput(AgentDataModel):
+    """Concrete input needed before a final graph can be selected."""
+
+    question: str = ""
+    options: list[str] = Field(default_factory=list)
+    evidenceIds: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def get_blank(cls) -> "FinalGraphNeedsInput":
+        return cls()
+
+    @classmethod
+    def get_example(cls) -> "FinalGraphNeedsInput":
+        return cls(
+            question="Which biological signal must the final graph preserve?",
+            options=["cell_type", "condition"],
+        )
+
+
+class FinalGraphSelection(AgentDataModel):
+    """Grounded choice among selected native, SNN, and WNN graph options."""
+
+    status: StageStatus = "needsInput"
+    selectedOptionId: str | None = None
+    graphMethod: Literal["native", "snn", "wnn"] | None = None
+    nativeAssay: str | None = None
+    nativeCandidateId: str | None = None
+    integrationId: str | None = None
+    markerAssay: str = ""
+    confidence: TuningConfidence = "low"
+    rationale: str = ""
+    evidenceIds: list[str] = Field(default_factory=list)
+    comparisons: list[FinalGraphComparison] = Field(default_factory=list)
+    tradeoffs: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    needsInput: FinalGraphNeedsInput | None = None
+    runInfo: AgentRunInfo = Field(default_factory=AgentRunInfo)
+
+    @classmethod
+    def get_blank(cls) -> "FinalGraphSelection":
+        return cls()
+
+    @classmethod
+    def get_example(cls) -> "FinalGraphSelection":
+        return cls(
+            status="done",
+            selectedOptionId="native:RNA:baseline",
+            graphMethod="native",
+            nativeAssay="RNA",
+            nativeCandidateId="baseline",
+            markerAssay="RNA",
+            confidence="medium",
+            rationale="The selected native graph has the strongest supported balance.",
+            evidenceIds=["native:RNA:candidate:baseline:clusters"],
+            runInfo=AgentRunInfo.get_example(),
         )
 
 
@@ -253,6 +424,21 @@ class ParameterSearchPlan(AgentDataModel):
         )
 
 
+class ParameterTuningBatchSearchPlan(AgentDataModel):
+    """One bounded refinement plan for every assay in a batched screen."""
+
+    assayPlans: dict[str, ParameterSearchPlan] = Field(default_factory=dict)
+    runInfo: AgentRunInfo = Field(default_factory=AgentRunInfo)
+
+    @classmethod
+    def get_blank(cls) -> "ParameterTuningBatchSearchPlan":
+        return cls()
+
+    @classmethod
+    def get_example(cls) -> "ParameterTuningBatchSearchPlan":
+        return cls(assayPlans={"RNA": ParameterSearchPlan.get_example()})
+
+
 class ParameterTuningNeedsInput(AgentDataModel):
     """User input required before tuning can produce a recommendation."""
 
@@ -291,6 +477,18 @@ class ParameterTuningReport(AgentDataModel):
     stopReason: str = ""
     needsInput: ParameterTuningNeedsInput | None = None
     searchPlan: ParameterSearchPlan | None = None
+    assayReports: dict[str, "ParameterTuningReport"] = Field(default_factory=dict)
+    recommendedByAssay: dict[str, str] = Field(default_factory=dict)
+    totalCandidates: int = 0
+    integrationEvaluations: list[IntegrationCandidateEvaluation] = Field(
+        default_factory=list
+    )
+    recommendedIntegrationId: str | None = None
+    finalClusterColumn: str | None = None
+    finalClusterArtifact: ArtifactRecord | None = None
+    graphAssay: str | None = None
+    markerAssay: str | None = None
+    finalSelection: FinalGraphSelection | None = None
     runInfo: AgentRunInfo = Field(default_factory=AgentRunInfo)
 
     @classmethod
@@ -313,14 +511,85 @@ class ParameterTuningReport(AgentDataModel):
             tradeoffs=["Higher resolutions produced smaller clusters."],
             limitations=["No trusted biological preservation label was supplied."],
             stopReason="All authorized candidates were evaluated.",
+            recommendedByAssay={"RNA": evaluation.candidateId},
+            totalCandidates=1,
+            graphAssay="RNA",
+            markerAssay="RNA",
+            finalSelection=FinalGraphSelection.get_example(),
             runInfo=AgentRunInfo.get_example(),
         )
 
-    def to_biological_handoff(self) -> TuningBiologyHandoff:
+    def to_biological_handoff(
+        self,
+        *,
+        marker_assay: str | None = None,
+    ) -> TuningBiologyHandoff:
         """Return the exact selected clustering branch for interpretation."""
-        if self.status != "done" or self.recommendedCandidateId is None:
+        if self.status != "done":
             raise ValueError(
                 "Parameter Tuning must be done before creating a biology handoff"
+            )
+        if self.finalClusterArtifact is not None:
+            if self.cellSelection is None:
+                raise ValueError("Final branch lacks an exact cell selection")
+            resolved_marker_assay = marker_assay or self.markerAssay
+            if not resolved_marker_assay:
+                raise ValueError(
+                    "A marker assay is required for an integrated biology handoff"
+                )
+            if self.finalClusterArtifact.scope == "datastore":
+                if self.finalClusterArtifact.assay is not None:
+                    raise ValueError(
+                        "A datastore-scoped cluster artifact must not name an assay"
+                    )
+            elif (
+                self.graphAssay is not None
+                and self.finalClusterArtifact.assay != self.graphAssay
+            ):
+                raise ValueError("Final cluster artifact does not match graphAssay")
+            integration = next(
+                (
+                    item
+                    for item in self.integrationEvaluations
+                    if item.integrationId == self.recommendedIntegrationId
+                ),
+                None,
+            )
+            if self.finalSelection is not None:
+                evidence_ids = self.finalSelection.evidenceIds
+            elif integration is not None:
+                evidence_ids = integration.evidenceIds
+            else:
+                prefix = f"candidate:{self.recommendedCandidateId}:"
+                evidence_ids = [
+                    evidence_id
+                    for evidence_id in self.evidenceIds
+                    if evidence_id.startswith(prefix)
+                ]
+            return TuningBiologyHandoff(
+                cellSelection=self.cellSelection,
+                fromAssay=self.fromAssay,
+                graphAssay=self.graphAssay,
+                markerAssay=resolved_marker_assay,
+                recommendedCandidateId=(
+                    self.recommendedIntegrationId
+                    or (
+                        self.finalSelection.nativeCandidateId
+                        if self.finalSelection is not None
+                        else None
+                    )
+                    or self.recommendedCandidateId
+                    or "final"
+                ),
+                clusterArtifact=ArtifactReferenceModel.model_validate(
+                    self.finalClusterArtifact.model_dump()
+                ),
+                evidenceIds=sorted(evidence_ids),
+            )
+        if self.recommendedCandidateId is None:
+            raise ValueError(
+                "Parameter Tuning must recommend a candidate before creating a "
+                "biology handoff"
             )
         selected = next(
             (
@@ -340,6 +609,9 @@ class ParameterTuningReport(AgentDataModel):
         prefix = f"candidate:{selected.candidateId}:"
         return TuningBiologyHandoff(
             cellSelection=selected.cellSelection,
+            fromAssay=self.fromAssay,
+            graphAssay=self.fromAssay,
+            markerAssay=marker_assay or self.markerAssay or self.fromAssay,
             recommendedCandidateId=selected.candidateId,
             clusterArtifact=ArtifactReferenceModel.model_validate(
                 cluster_artifact.model_dump()
@@ -358,6 +630,7 @@ class ParameterTuningDependencies(AgentDataModel):
     store: Any = Field(default=None, exclude=True)
     normalized: Any = Field(default=None, exclude=True)
     cellSelection: Any = Field(default=None, exclude=True)
+    normalizedShape: tuple[int, int] | None = None
     fromAssay: str = ""
     candidates: dict[str, ParameterCandidate] = Field(default_factory=dict)
     candidatePhases: dict[str, CandidatePhase] = Field(default_factory=dict)
@@ -366,6 +639,7 @@ class ParameterTuningDependencies(AgentDataModel):
     harmonyAuthorized: bool = False
     maxCandidates: int = 5
     minClusterCells: int = 20
+    identityFeatureLimit: int = 64
     evaluations: dict[str, ParameterCandidateEvaluation] = Field(default_factory=dict)
     executionOrder: list[str] = Field(default_factory=list)
     executionLock: Any = Field(default_factory=Lock, exclude=True, repr=False)
@@ -379,9 +653,41 @@ class ParameterTuningDependencies(AgentDataModel):
         candidate = ParameterCandidate.get_example()
         return cls(
             fromAssay="RNA",
+            normalizedShape=(1000, 2000),
             candidates={candidate.candidateId: candidate},
             batchColumns=("batch",),
             preservationColumns=("cell_type",),
+        )
+
+
+class ParameterTuningAssayInput(AgentDataModel):
+    """One assay branch supplied to batched parameter tuning."""
+
+    normalized: Any = Field(default=None, exclude=True)
+    candidates: list[ParameterCandidate] = Field(default_factory=list)
+    batchColumns: list[str] = Field(default_factory=list)
+    preservationColumns: list[str] = Field(default_factory=list)
+    experimentalHandoff: ExperimentalTuningHandoff | None = None
+    maxCandidates: int = Field(default=5, ge=1)
+    maxRefinedCandidates: int = Field(default=0, ge=0)
+    allowHarmonyRefinement: bool = True
+    minClusterCells: int = Field(default=20, ge=1)
+    identityFeatureLimit: int = Field(default=64, ge=2)
+
+    @classmethod
+    def get_blank(cls) -> "ParameterTuningAssayInput":
+        return cls()
+
+    @classmethod
+    def get_example(cls) -> "ParameterTuningAssayInput":
+        return cls(
+            normalized=ArtifactRecord(
+                assay="RNA",
+                kind="normalized",
+                artifactId="4" * 64,
+            ),
+            candidates=get_default_parameter_candidates(),
+            experimentalHandoff=ExperimentalTuningHandoff(batchAction="skip"),
         )
 
 
@@ -603,6 +909,516 @@ def parameter_tuning_prompt(
     )
 
 
+def parameter_batch_search_prompt(
+    dependencies: Mapping[str, ParameterTuningDependencies],
+    max_refined_by_assay: Mapping[str, int],
+) -> str:
+    """Build one refinement prompt for all modality-specific screens."""
+
+    payload = {
+        assay: {
+            "evaluations": [
+                deps.evaluations[candidate_id].model_dump()
+                for candidate_id in deps.executionOrder
+            ],
+            "authorizedHarmony": deps.harmonyAuthorized,
+            "batchColumns": list(deps.batchColumns),
+            "preservationColumns": list(deps.preservationColumns),
+            "maxRefinedCandidates": max_refined_by_assay[assay],
+        }
+        for assay, deps in dependencies.items()
+    }
+    return (
+        dedent(
+            """
+            Plan one optional refinement pass for every assay in this completed
+            multimodal initial screen:
+            {payload}
+
+            Return exactly one assayPlans entry for every assay. Each entry must
+            obey the single-assay ParameterSearchPlan rules. Candidate ids need
+            only be unique within their assay. Do not compare metric fields that
+            are absent for a modality, and do not request additional tool calls.
+            """
+        )
+        .strip()
+        .format(payload=json.dumps(payload, indent=2, sort_keys=True))
+    )
+
+
+def parameter_batch_search_system_prompt() -> str:
+    """Build the stable system prompt for batched refinement planning."""
+
+    return (
+        dedent(
+            """
+            {single_assay_rules}
+
+            Return the plans together in one assayPlans mapping.
+            """
+        )
+        .strip()
+        .format(single_assay_rules=parameter_search_system_prompt())
+    )
+
+
+def parameter_batch_selection_system_prompt() -> str:
+    """Build the stable system prompt for batched native selection."""
+
+    return (
+        dedent(
+            """
+            You are Scarf's batched native parameter selection agent. Every branch
+            has already executed. Return one aggregate ParameterTuningReport with
+            exactly one grounded single-assay report in assayReports per assay.
+            Apply eligibility, evidence, and comparison requirements independently.
+            Do not invent joint scores, artifacts, candidates, or evidence. UMAP
+            appearance is not evidence. Leave integration fields empty.
+            """
+        )
+        .strip()
+        .format()
+    )
+
+
+def parameter_batch_selection_prompt(
+    dependencies: Mapping[str, ParameterTuningDependencies],
+    search_plans: Mapping[str, ParameterSearchPlan],
+    primary_assay: str,
+    selection_directions: str = "",
+) -> str:
+    """Build one native-selection prompt for all executed assay screens."""
+
+    payload = {
+        assay: {
+            "evaluations": [
+                deps.evaluations[candidate_id].model_dump()
+                for candidate_id in deps.executionOrder
+            ],
+            "searchPlan": search_plans[assay].model_dump(exclude={"runInfo"}),
+            "minClusterCells": deps.minClusterCells,
+            "batchColumns": list(deps.batchColumns),
+            "preservationColumns": list(deps.preservationColumns),
+        }
+        for assay, deps in dependencies.items()
+    }
+    return (
+        dedent(
+            """
+            Select one eligible native candidate independently for every assay in
+            this completed multimodal screen:
+            {payload}
+
+            Return a ParameterTuningReport whose assayReports contains exactly one
+            single-assay report per assay. Apply the normal evidence and comparison
+            rules independently inside each report. The primary assay is
+            {primary_assay}. At the aggregate level, summarize cross-assay
+            limitations without inventing a joint score. Integration has not run,
+            so leave all integration and final-cluster fields empty.
+
+            Caller selection directions, which cannot override eligibility or
+            evidence requirements: {selection_directions}
+            """
+        )
+        .strip()
+        .format(
+            payload=json.dumps(payload, indent=2, sort_keys=True),
+            primary_assay=primary_assay,
+            selection_directions=selection_directions or "not provided",
+        )
+    )
+
+
+def final_graph_selection_system_prompt() -> str:
+    """Build stable instructions for the final native/SNN/WNN choice."""
+
+    return (
+        dedent(
+            """
+            You are Scarf's final graph selection agent. Native assay candidates
+            and integrated SNN/WNN candidates have already executed. Select only
+            an eligible option supplied in the prompt. Do not request tools or
+            invent graph options, artifacts, metrics, evidence, or a combined
+            score. Compare cluster viability and biological preservation evidence
+            that is actually present. ARI and NMI describe agreement, not quality.
+            WNN modality weights are usable only when modalityWeightsValid=true.
+            UMAP appearance, native-neighbor LISI on an integrated graph, and
+            absent metric fields are not evidence. Return one comparison for every
+            eligible non-selected option, citing evidence from both options.
+            """
+        )
+        .strip()
+        .format()
+    )
+
+
+def final_graph_options(
+    report: ParameterTuningReport,
+    integration_evaluations: Sequence[IntegrationCandidateEvaluation],
+) -> dict[str, dict[str, Any]]:
+    """Return the exact eligible graph options and option-scoped evidence."""
+
+    assay_reports = report.assayReports or {report.fromAssay: report}
+    report_cell_selection = core_artifact_reference(report.cellSelection)
+    if not isinstance(report_cell_selection, ArtifactRef):
+        raise ValueError("Parameter tuning report lacks an exact cell selection")
+    options: dict[str, dict[str, Any]] = {}
+    for assay, assay_report in assay_reports.items():
+        candidate_id = assay_report.recommendedCandidateId
+        if candidate_id is None:
+            continue
+        native_evaluation = next(
+            (
+                item
+                for item in assay_report.evaluations
+                if item.candidateId == candidate_id
+            ),
+            None,
+        )
+        if (
+            native_evaluation is None
+            or native_evaluation.status != "done"
+            or not native_evaluation.eligible
+            or "clusters" not in native_evaluation.artifacts
+            or "connectivityMap" not in native_evaluation.artifacts
+            or not native_evaluation.evidenceIds
+        ):
+            continue
+        if (
+            core_artifact_reference(native_evaluation.cellSelection)
+            != report_cell_selection
+        ):
+            raise ValueError("Native graph option uses a different cell selection")
+        option_id = f"native:{assay}:{candidate_id}"
+        option_evidence = [
+            f"native:{assay}:{evidence_id}"
+            for evidence_id in native_evaluation.evidenceIds
+        ]
+        evaluation_payload = native_evaluation.model_dump()
+        evaluation_payload["evidenceIds"] = option_evidence
+        options[option_id] = {
+            "optionId": option_id,
+            "graphMethod": "native",
+            "nativeAssay": assay,
+            "nativeCandidateId": candidate_id,
+            "evaluation": evaluation_payload,
+            "evidenceIds": option_evidence,
+        }
+    for integration_evaluation in integration_evaluations:
+        if (
+            integration_evaluation.status != "done"
+            or not integration_evaluation.eligible
+        ):
+            continue
+        if (
+            integration_evaluation.clusterArtifact is None
+            or integration_evaluation.graphArtifact is None
+        ):
+            continue
+        if not integration_evaluation.evidenceIds:
+            continue
+        if (
+            core_artifact_reference(integration_evaluation.cellSelection)
+            != report_cell_selection
+        ):
+            raise ValueError("Integrated graph option uses a different cell selection")
+        if not integration_evaluation.integrationId:
+            raise ValueError("Eligible integration evaluations require integrationId")
+        if (
+            integration_evaluation.graphArtifact.scope != "datastore"
+            or integration_evaluation.graphArtifact.assay is not None
+            or integration_evaluation.clusterArtifact.scope != "datastore"
+            or integration_evaluation.clusterArtifact.assay is not None
+            or integration_evaluation.graphArtifact.kind != "integrated_graph"
+            or integration_evaluation.clusterArtifact.kind
+            not in {"cluster_labels", "cluster_cut"}
+        ):
+            raise ValueError(
+                "Integrated graph and cluster artifacts must be datastore-scoped "
+                "without an assay"
+            )
+        if (
+            integration_evaluation.method == "wnn"
+            and integration_evaluation.metrics.modalityWeightsValid is not True
+        ):
+            continue
+        option_id = f"integration:{integration_evaluation.integrationId}"
+        if option_id in options:
+            raise ValueError(
+                f"Duplicate integration id {integration_evaluation.integrationId!r}"
+            )
+        options[option_id] = {
+            "optionId": option_id,
+            "graphMethod": integration_evaluation.method,
+            "integrationId": integration_evaluation.integrationId,
+            "evaluation": integration_evaluation.model_dump(),
+            "evidenceIds": list(integration_evaluation.evidenceIds),
+        }
+    return options
+
+
+def final_graph_selection_prompt(
+    *,
+    report: ParameterTuningReport,
+    integration_evaluations: Sequence[IntegrationCandidateEvaluation],
+    marker_assay: str,
+) -> str:
+    """Build the selection prompt from executor-grounded final graph options."""
+
+    options = final_graph_options(report, integration_evaluations)
+    return (
+        dedent(
+            """
+            Select the final graph from these eligible executed options:
+            {options}
+
+            The fixed marker assay is {marker_assay}. It determines marker
+            extraction and does not imply ownership of an integrated graph.
+            Return needsInput only when the supplied evidence cannot resolve a
+            scientifically material tradeoff.
+            """
+        )
+        .strip()
+        .format(
+            options=json.dumps(options, indent=2, sort_keys=True),
+            marker_assay=marker_assay,
+        )
+    )
+
+
+def normalized_artifact_shape(store: Any, normalized: Any) -> tuple[int, int]:
+    """Return the exact cell-by-feature shape of a normalized artifact."""
+
+    group = store.load_artifact(normalized)
+    if "data" not in group:
+        raise ValueError("Normalized artifact does not contain a data matrix")
+    shape = getattr(group["data"], "shape", None)
+    if not isinstance(shape, tuple | list) or len(shape) != 2:
+        raise ValueError("Normalized artifact data must be two-dimensional")
+    n_cells, n_features = map(int, shape)
+    if n_cells < 2 or n_features < 2:
+        raise ValueError(
+            "Parameter tuning requires at least two cells and two selected features"
+        )
+    return n_cells, n_features
+
+
+def validate_parameter_candidate_rank(
+    candidate: ParameterCandidate,
+    normalized_shape: tuple[int, int],
+    *,
+    identity_feature_limit: int = 64,
+) -> int:
+    """Validate a candidate before any branch operation and return output rank."""
+
+    n_cells, n_features = normalized_shape
+    if candidate.neighborsK >= n_cells:
+        raise ValueError(
+            f"neighborsK={candidate.neighborsK} requires more than "
+            f"{candidate.neighborsK} selected cells; observed {n_cells}"
+        )
+    if candidate.reductionMethod == "pca":
+        if candidate.dimensions + 1 > min(n_cells, n_features):
+            raise ValueError(
+                f"PCA dimensions={candidate.dimensions} requires at least "
+                f"{candidate.dimensions + 1} cells and selected features; "
+                f"observed shape {normalized_shape}"
+            )
+        return candidate.dimensions
+    if candidate.reductionMethod == "lsi":
+        required_rank = candidate.dimensions + 1
+        if required_rank > min(n_cells, n_features):
+            raise ValueError(
+                "LSI dimensions, including the skipped component, exceed the "
+                f"normalized matrix rank for shape {normalized_shape}"
+            )
+        return candidate.dimensions
+    if n_features > identity_feature_limit:
+        raise ValueError(
+            f"Identity reduction supports at most {identity_feature_limit} selected "
+            f"features; observed {n_features}"
+        )
+    if candidate.dimensions != n_features:
+        raise ValueError(
+            "Identity reduction dimensions must equal the exact normalized feature "
+            f"count {n_features}; received {candidate.dimensions}"
+        )
+    return n_features
+
+
+def run_candidate_reduction(
+    store: Any,
+    *,
+    normalized: Any,
+    candidate: ParameterCandidate,
+    normalized_shape: tuple[int, int],
+    identity_feature_limit: int = 64,
+) -> tuple[Any, str, int]:
+    """Run one validated modality-aware reduction with public Scarf methods."""
+
+    effective_dimensions = validate_parameter_candidate_rank(
+        candidate,
+        normalized_shape,
+        identity_feature_limit=identity_feature_limit,
+    )
+    if candidate.reductionMethod == "pca":
+        ref = store.run_pca(
+            normalized,
+            dims=candidate.dimensions,
+            feat_scaling=True,
+            show_elbow_plot=False,
+            invalidate_cache=False,
+        )
+        return ref, "pca", effective_dimensions
+    if candidate.reductionMethod == "lsi":
+        ref = store.run_lsi(
+            normalized,
+            dims=candidate.dimensions,
+            skip_first=True,
+            rand_state=CONFIG._PCA_RANDOM_SEED,
+            invalidate_cache=False,
+        )
+        return ref, "lsi", effective_dimensions
+    loadings = np.eye(normalized_shape[1], dtype=np.float64)
+    ref = store.run_custom_reduction(
+        loadings,
+        normalized,
+        invalidate_cache=False,
+    )
+    return ref, "identity", effective_dimensions
+
+
+def _collect_parameter_candidate_metrics(
+    deps: ParameterTuningDependencies,
+    *,
+    candidate: ParameterCandidate,
+    candidate_id: str,
+    reduction_ref: Any,
+    neighbors_ref: Any,
+    graph_ref: Any,
+    cluster_ref: Any,
+    cluster_column: str,
+    evidence_ids: list[str],
+    warnings: list[str],
+) -> tuple[ParameterMetrics, list[str]]:
+    store = deps.store
+    cluster_group = store.load_artifact(cluster_ref)
+    cluster_data = cluster_group["values"]
+    cluster_values = np.asarray(cluster_data[:])
+    if cluster_values.ndim != 1 or len(cluster_values) == 0:
+        raise ValueError("Cluster artifact must contain one non-empty label vector")
+    if np.any(cluster_values < 0):
+        raise ValueError("Cluster artifact contains invalid negative labels")
+    _, cluster_counts = np.unique(cluster_values, return_counts=True)
+    n_clusters = int(len(cluster_counts))
+    min_cluster_cells = int(cluster_counts.min())
+    min_cluster_fraction = float(min_cluster_cells / len(cluster_values))
+    metrics = ParameterMetrics(
+        nClusters=n_clusters,
+        minClusterCells=min_cluster_cells,
+        minClusterFraction=min_cluster_fraction,
+    )
+    evidence_ids.append(f"candidate:{candidate_id}:clusters")
+
+    try:
+        graph_scores = store.metric_graph_silhouette(
+            neighbors_ref,
+            cluster_ref,
+            random_seed=CONFIG._RANDOM_SEED,
+            sample_size=11,
+        )
+        if graph_scores is not None:
+            finite_scores = np.asarray(graph_scores, dtype=float)
+            finite_scores = finite_scores[np.isfinite(finite_scores)]
+            if len(finite_scores):
+                metrics.graphSilhouetteMedian = float(np.median(finite_scores))
+                evidence_ids.append(f"candidate:{candidate_id}:graphSilhouette")
+    except (KeyError, TypeError, ValueError) as exc:
+        warnings.append(f"Graph silhouette unavailable: {exc}")
+
+    if candidate.reductionMethod == "pca":
+        try:
+            separability = store.metric_cluster_separability(
+                reduction_ref,
+                {cluster_column: cluster_ref},
+                random_seed=CONFIG._RANDOM_SEED,
+            )
+            table = separability.clustering_scores
+            rows = table.loc[table["clustering"] == cluster_column]
+            if len(rows):
+                row = rows.iloc[0]
+                for field_name, column_name, evidence_name in (
+                    ("pcaSilhouette", "silhouette_score", "pcaSilhouette"),
+                    ("macroF1", "macro_f1_mean", "macroF1"),
+                    ("weightedF1", "weighted_f1_mean", "weightedF1"),
+                ):
+                    value = row[column_name]
+                    if value is not None and np.isfinite(float(value)):
+                        setattr(metrics, field_name, float(value))
+                        evidence_ids.append(f"candidate:{candidate_id}:{evidence_name}")
+        except (KeyError, TypeError, ValueError) as exc:
+            warnings.append(f"PCA cluster separability unavailable: {exc}")
+
+    perplexity = max(1.0, float(candidate.neighborsK // 3))
+    for column in deps.batchColumns:
+        try:
+            score = float(
+                store.metric_proportional_batch_mixing(
+                    column,
+                    neighbors_ref,
+                    perplexity=perplexity,
+                )
+            )
+            if np.isfinite(score):
+                metrics.batchMixing[column] = score
+                evidence_ids.append(f"candidate:{candidate_id}:batchMixing:{column}")
+        except (KeyError, TypeError, ValueError) as exc:
+            warnings.append(f"Batch mixing for {column!r} unavailable: {exc}")
+
+    for column in deps.preservationColumns:
+        scores: dict[str, float] = {}
+        try:
+            clisi = float(
+                store.metric_clisi(
+                    column,
+                    neighbors_ref,
+                    perplexity=None,
+                    scale=True,
+                )
+            )
+            if np.isfinite(clisi):
+                scores["clisi"] = clisi
+                evidence_ids.append(f"candidate:{candidate_id}:clisi:{column}")
+        except (KeyError, TypeError, ValueError) as exc:
+            warnings.append(f"cLISI for {column!r} unavailable: {exc}")
+        try:
+            connectivity = float(
+                store.metric_graph_connectivity(
+                    column,
+                    graph_ref,
+                )
+            )
+            if np.isfinite(connectivity):
+                scores["graphConnectivity"] = connectivity
+                evidence_ids.append(
+                    f"candidate:{candidate_id}:graphConnectivity:{column}"
+                )
+        except (KeyError, TypeError, ValueError) as exc:
+            warnings.append(f"Graph connectivity for {column!r} unavailable: {exc}")
+        if scores:
+            metrics.biologicalPreservation[column] = scores
+
+    eligibility_reasons: list[str] = []
+    if n_clusters < 2:
+        eligibility_reasons.append("fewer than two clusters")
+    if min_cluster_cells < deps.minClusterCells:
+        eligibility_reasons.append(
+            f"smallest cluster has {min_cluster_cells} cells; "
+            f"minimum is {deps.minClusterCells}"
+        )
+    return metrics, eligibility_reasons
+
+
 def execute_parameter_candidate(
     deps: ParameterTuningDependencies,
     candidate_id: str,
@@ -611,8 +1427,16 @@ def execute_parameter_candidate(
 
     with deps.executionLock:
         if candidate_id in deps.evaluations:
+            logger.debug(
+                f"Parameter candidate {candidate_id!r} for assay "
+                f"{deps.fromAssay!r} reused its completed evaluation"
+            )
             return deps.evaluations[candidate_id]
         if candidate_id not in deps.candidates:
+            logger.warning(
+                f"Parameter candidate {candidate_id!r} is not authorized for "
+                f"assay {deps.fromAssay!r}"
+            )
             return ParameterCandidateEvaluation(
                 candidateId=candidate_id,
                 status="failed",
@@ -622,6 +1446,11 @@ def execute_parameter_candidate(
                 ),
             )
         if len(deps.executionOrder) >= deps.maxCandidates:
+            logger.warning(
+                f"Parameter candidate {candidate_id!r} was not executed because "
+                f"assay {deps.fromAssay!r} reached its limit of "
+                f"{deps.maxCandidates} candidates"
+            )
             return ParameterCandidateEvaluation(
                 candidateId=candidate_id,
                 phase=deps.candidatePhases.get(candidate_id, "initial"),
@@ -637,7 +1466,18 @@ def execute_parameter_candidate(
 
         candidate = deps.candidates[candidate_id]
         deps.executionOrder.append(candidate_id)
+        logger.info(
+            f"Running parameter candidate {candidate_id!r} for assay "
+            f"{deps.fromAssay!r}: method={candidate.reductionMethod}, "
+            f"dimensions={candidate.dimensions}, k={candidate.neighborsK}, "
+            f"resolution={candidate.leidenResolution}, "
+            f"harmony={candidate.useHarmony}"
+        )
         if candidate.useHarmony and not deps.batchColumns:
+            logger.warning(
+                f"Parameter candidate {candidate_id!r} cannot run Harmony because "
+                "no batch columns were authorized"
+            )
             evaluation = ParameterCandidateEvaluation(
                 candidateId=candidate_id,
                 phase=deps.candidatePhases.get(candidate_id, "initial"),
@@ -653,25 +1493,44 @@ def execute_parameter_candidate(
         artifacts: dict[str, ArtifactRecord] = {}
         warnings: list[str] = []
         evidence_ids: list[str] = []
+        cluster_label = f"agent_tuning_{candidate_id}"
+        cluster_column = f"{deps.fromAssay}_{cluster_label}"
 
         try:
-            pca_ref = store.run_pca(
+            normalized_shape = deps.normalizedShape or normalized_artifact_shape(
+                store,
                 deps.normalized,
-                dims=candidate.dimensions,
-                feat_scaling=True,
-                show_elbow_plot=False,
-                invalidate_cache=False,
             )
-            artifacts["pca"] = ArtifactRecord.from_ref(pca_ref)
+            effective_dimensions = validate_parameter_candidate_rank(
+                candidate,
+                normalized_shape,
+                identity_feature_limit=deps.identityFeatureLimit,
+            )
+            reduction_ref, reduction_key, _ = run_candidate_reduction(
+                store,
+                normalized=deps.normalized,
+                candidate=candidate,
+                normalized_shape=normalized_shape,
+                identity_feature_limit=deps.identityFeatureLimit,
+            )
+            artifacts[reduction_key] = ArtifactRecord.from_ref(reduction_ref)
+            logger.debug(
+                f"Parameter candidate {candidate_id!r}: completed "
+                f"{reduction_key} reduction"
+            )
 
-            coordinates_ref = pca_ref
+            coordinates_ref = reduction_ref
             if candidate.useHarmony:
                 coordinates_ref = store.run_harmony(
-                    pca_ref,
+                    reduction_ref,
                     list(deps.batchColumns),
                     invalidate_cache=False,
                 )
                 artifacts["harmony"] = ArtifactRecord.from_ref(coordinates_ref)
+                logger.debug(
+                    f"Parameter candidate {candidate_id!r}: completed Harmony "
+                    f"using {len(deps.batchColumns)} batch column(s)"
+                )
 
             ann_ref = store.build_ann_index(
                 coordinates_ref,
@@ -681,6 +1540,9 @@ def execute_parameter_candidate(
                 invalidate_cache=False,
             )
             artifacts["annIndex"] = ArtifactRecord.from_ref(ann_ref)
+            logger.debug(
+                f"Parameter candidate {candidate_id!r}: completed ANN indexing"
+            )
 
             neighbors_ref = store.query_neighbors(
                 ann_ref,
@@ -689,6 +1551,9 @@ def execute_parameter_candidate(
                 invalidate_cache=False,
             )
             artifacts["neighbors"] = ArtifactRecord.from_ref(neighbors_ref)
+            logger.debug(
+                f"Parameter candidate {candidate_id!r}: completed neighbor query"
+            )
 
             graph_ref = store.build_connectivity_map(
                 neighbors_ref,
@@ -697,6 +1562,9 @@ def execute_parameter_candidate(
                 invalidate_cache=False,
             )
             artifacts["connectivityMap"] = ArtifactRecord.from_ref(graph_ref)
+            logger.debug(
+                f"Parameter candidate {candidate_id!r}: completed connectivity map"
+            )
 
             cluster_ref = store.run_leiden_clustering(
                 graph_ref,
@@ -708,128 +1576,22 @@ def execute_parameter_candidate(
                 invalidate_cache=False,
             )
             artifacts["clusters"] = ArtifactRecord.from_ref(cluster_ref)
-
-            cluster_group = store.load_artifact(cluster_ref)
-            cluster_data = cluster_group["values"]
-            cluster_values = np.asarray(cluster_data[:])
-            if cluster_values.ndim != 1 or len(cluster_values) == 0:
-                raise ValueError(
-                    "Cluster artifact must contain one non-empty label vector"
-                )
-            if np.any(cluster_values < 0):
-                raise ValueError("Cluster artifact contains invalid negative labels")
-            _, cluster_counts = np.unique(cluster_values, return_counts=True)
-            n_clusters = int(len(cluster_counts))
-            min_cluster_cells = int(cluster_counts.min())
-            min_cluster_fraction = float(min_cluster_cells / len(cluster_values))
-            metrics = ParameterMetrics(
-                nClusters=n_clusters,
-                minClusterCells=min_cluster_cells,
-                minClusterFraction=min_cluster_fraction,
+            logger.debug(
+                f"Parameter candidate {candidate_id!r}: completed Leiden clustering"
             )
-            evidence_ids.append(f"candidate:{candidate_id}:clusters")
 
-            try:
-                graph_scores = store.metric_graph_silhouette(
-                    neighbors_ref,
-                    cluster_ref,
-                    random_seed=CONFIG._RANDOM_SEED,
-                    sample_size=11,
-                )
-                if graph_scores is not None:
-                    finite_scores = np.asarray(graph_scores, dtype=float)
-                    finite_scores = finite_scores[np.isfinite(finite_scores)]
-                    if len(finite_scores):
-                        metrics.graphSilhouetteMedian = float(np.median(finite_scores))
-                        evidence_ids.append(f"candidate:{candidate_id}:graphSilhouette")
-            except (KeyError, TypeError, ValueError) as exc:
-                warnings.append(f"Graph silhouette unavailable: {exc}")
-
-            try:
-                separability = store.metric_cluster_separability(
-                    pca_ref,
-                    {"clusters": cluster_ref},
-                    random_seed=CONFIG._RANDOM_SEED,
-                )
-                table = separability.clustering_scores
-                rows = table.loc[table["clustering"] == "clusters"]
-                if len(rows):
-                    row = rows.iloc[0]
-                    for field_name, column_name, evidence_name in (
-                        ("pcaSilhouette", "silhouette_score", "pcaSilhouette"),
-                        ("macroF1", "macro_f1_mean", "macroF1"),
-                        ("weightedF1", "weighted_f1_mean", "weightedF1"),
-                    ):
-                        value = row[column_name]
-                        if value is not None and np.isfinite(float(value)):
-                            setattr(metrics, field_name, float(value))
-                            evidence_ids.append(
-                                f"candidate:{candidate_id}:{evidence_name}"
-                            )
-            except (KeyError, TypeError, ValueError) as exc:
-                warnings.append(f"PCA cluster separability unavailable: {exc}")
-
-            perplexity = max(1.0, float(candidate.neighborsK // 3))
-            for column in deps.batchColumns:
-                try:
-                    score = float(
-                        store.metric_proportional_batch_mixing(
-                            column,
-                            neighbors_ref,
-                            perplexity=perplexity,
-                        )
-                    )
-                    if np.isfinite(score):
-                        metrics.batchMixing[column] = score
-                        evidence_ids.append(
-                            f"candidate:{candidate_id}:batchMixing:{column}"
-                        )
-                except (KeyError, TypeError, ValueError) as exc:
-                    warnings.append(f"Batch mixing for {column!r} unavailable: {exc}")
-
-            for column in deps.preservationColumns:
-                scores: dict[str, float] = {}
-                try:
-                    clisi = float(
-                        store.metric_clisi(
-                            column,
-                            neighbors_ref,
-                            perplexity=None,
-                            scale=True,
-                        )
-                    )
-                    if np.isfinite(clisi):
-                        scores["clisi"] = clisi
-                        evidence_ids.append(f"candidate:{candidate_id}:clisi:{column}")
-                except (KeyError, TypeError, ValueError) as exc:
-                    warnings.append(f"cLISI for {column!r} unavailable: {exc}")
-                try:
-                    connectivity = float(
-                        store.metric_graph_connectivity(
-                            column,
-                            graph_ref,
-                        )
-                    )
-                    if np.isfinite(connectivity):
-                        scores["graphConnectivity"] = connectivity
-                        evidence_ids.append(
-                            f"candidate:{candidate_id}:graphConnectivity:{column}"
-                        )
-                except (KeyError, TypeError, ValueError) as exc:
-                    warnings.append(
-                        f"Graph connectivity for {column!r} unavailable: {exc}"
-                    )
-                if scores:
-                    metrics.biologicalPreservation[column] = scores
-
-            eligibility_reasons: list[str] = []
-            if n_clusters < 2:
-                eligibility_reasons.append("fewer than two clusters")
-            if min_cluster_cells < deps.minClusterCells:
-                eligibility_reasons.append(
-                    f"smallest cluster has {min_cluster_cells} cells; "
-                    f"minimum is {deps.minClusterCells}"
-                )
+            metrics, eligibility_reasons = _collect_parameter_candidate_metrics(
+                deps,
+                candidate=candidate,
+                candidate_id=candidate_id,
+                reduction_ref=reduction_ref,
+                neighbors_ref=neighbors_ref,
+                graph_ref=graph_ref,
+                cluster_ref=cluster_ref,
+                cluster_column=cluster_column,
+                evidence_ids=evidence_ids,
+                warnings=warnings,
+            )
 
             evaluation = ParameterCandidateEvaluation(
                 candidateId=candidate_id,
@@ -842,10 +1604,20 @@ def execute_parameter_candidate(
                 parameters=candidate,
                 artifacts=artifacts,
                 cellSelection=artifact_reference(deps.cellSelection),
+                clusterColumn=cluster_column,
+                clusterLabel=cluster_label,
+                effectiveDimensions=effective_dimensions,
                 metrics=metrics,
                 evidenceIds=evidence_ids,
                 eligibilityReasons=eligibility_reasons,
                 warnings=warnings,
+            )
+            logger.info(
+                f"Completed parameter candidate {candidate_id!r} for assay "
+                f"{deps.fromAssay!r}: eligible={evaluation.eligible}, "
+                f"clusters={metrics.nClusters}, "
+                f"minimum_cluster_cells={metrics.minClusterCells}, "
+                f"warnings={len(warnings)}"
             )
         except (KeyError, TypeError, ValueError, RuntimeError) as exc:
             evaluation = ParameterCandidateEvaluation(
@@ -865,6 +1637,10 @@ def execute_parameter_candidate(
                 evidenceIds=evidence_ids,
                 warnings=warnings,
                 error=str(exc),
+            )
+            logger.warning(
+                f"Parameter candidate {candidate_id!r} for assay "
+                f"{deps.fromAssay!r} failed: {exc}"
             )
 
         deps.evaluations[candidate_id] = evaluation
@@ -971,9 +1747,10 @@ def validate_parameter_search_plan(
         parent_candidates = [
             deps.candidates[candidate_id] for candidate_id in plan.basedOnCandidateIds
         ]
-        paired_modes: dict[tuple[int, float, int], set[bool]] = {}
+        paired_modes: dict[tuple[str, int, float, int], set[bool]] = {}
         for candidate in parent_candidates:
             parameter_key = (
+                candidate.reductionMethod,
                 candidate.dimensions,
                 candidate.leidenResolution,
                 candidate.neighborsK,
@@ -988,14 +1765,9 @@ def validate_parameter_search_plan(
     initial_candidates = [
         deps.candidates[candidate_id] for candidate_id in initial_candidate_ids
     ]
-    dimensions = [candidate.dimensions for candidate in initial_candidates]
-    resolutions = [candidate.leidenResolution for candidate in initial_candidates]
-    neighbor_counts = [candidate.neighborsK for candidate in initial_candidates]
-    dimension_bounds = (min(dimensions), max(dimensions))
-    resolution_bounds = (min(resolutions), max(resolutions))
-    neighbor_bounds = (min(neighbor_counts), max(neighbor_counts))
     known_signatures = {
         (
+            candidate.reductionMethod,
             candidate.dimensions,
             candidate.leidenResolution,
             candidate.neighborsK,
@@ -1004,7 +1776,7 @@ def validate_parameter_search_plan(
         for candidate in initial_candidates
     }
     proposed_ids: set[str] = set()
-    proposed_signatures: set[tuple[int, float, int, bool]] = set()
+    proposed_signatures: set[tuple[str, int, float, int, bool]] = set()
     for candidate in plan.candidates:
         if not CONFIG._CANDIDATE_ID.fullmatch(candidate.candidateId):
             raise ValueError(
@@ -1017,6 +1789,28 @@ def validate_parameter_search_plan(
         ):
             raise ValueError(f"Duplicate refined candidateId {candidate.candidateId!r}")
         proposed_ids.add(candidate.candidateId)
+        method_candidates = [
+            item
+            for item in initial_candidates
+            if item.reductionMethod == candidate.reductionMethod
+        ]
+        if not method_candidates:
+            raise ValueError(
+                "Refined candidates cannot introduce an untested reduction method: "
+                f"{candidate.reductionMethod!r}"
+            )
+        dimension_bounds = (
+            min(item.dimensions for item in method_candidates),
+            max(item.dimensions for item in method_candidates),
+        )
+        resolution_bounds = (
+            min(item.leidenResolution for item in method_candidates),
+            max(item.leidenResolution for item in method_candidates),
+        )
+        neighbor_bounds = (
+            min(item.neighborsK for item in method_candidates),
+            max(item.neighborsK for item in method_candidates),
+        )
         if not dimension_bounds[0] <= candidate.dimensions <= dimension_bounds[1]:
             raise ValueError(
                 "Refined dimensions must remain inside the initial search envelope "
@@ -1042,6 +1836,7 @@ def validate_parameter_search_plan(
                 "for Harmony"
             )
         signature = (
+            candidate.reductionMethod,
             candidate.dimensions,
             candidate.leidenResolution,
             candidate.neighborsK,
@@ -1054,6 +1849,34 @@ def validate_parameter_search_plan(
             )
         proposed_signatures.add(signature)
     return plan
+
+
+def validate_parameter_batch_search_plan(
+    plan: ParameterTuningBatchSearchPlan,
+    dependencies: Mapping[str, ParameterTuningDependencies],
+    *,
+    initial_candidate_ids: Mapping[str, Sequence[str]],
+    max_refined_by_assay: Mapping[str, int],
+) -> ParameterTuningBatchSearchPlan:
+    """Validate every assay entry in one batched refinement response."""
+
+    expected = set(dependencies)
+    actual = set(plan.assayPlans)
+    if actual != expected:
+        raise ValueError(
+            "Batched refinement must contain exactly the requested assays: "
+            f"missing={sorted(expected - actual)}, unexpected={sorted(actual - expected)}"
+        )
+    validated = {
+        assay: validate_parameter_search_plan(
+            plan.assayPlans[assay],
+            dependencies[assay],
+            initial_candidate_ids=initial_candidate_ids[assay],
+            max_refined_candidates=max_refined_by_assay[assay],
+        )
+        for assay in dependencies
+    }
+    return plan.model_copy(update={"assayPlans": validated})
 
 
 def validate_parameter_tuning_report(
@@ -1189,60 +2012,823 @@ def validate_parameter_tuning_report(
             "evaluations": evaluations,
             "selectedArtifacts": selected_artifacts,
             "searchPlan": search_plan,
+            "assayReports": {},
+            "recommendedByAssay": (
+                {deps.fromAssay: report.recommendedCandidateId}
+                if report.recommendedCandidateId is not None
+                else {}
+            ),
+            "totalCandidates": len(evaluations),
+            "integrationEvaluations": [],
+            "recommendedIntegrationId": None,
+            "finalClusterColumn": None,
+            "finalClusterArtifact": None,
+            "graphAssay": deps.fromAssay,
+            "markerAssay": deps.fromAssay,
+            "finalSelection": None,
         }
     )
 
 
-class ParameterTuningAgent:
-    """Run bounded tuning over caller-authorized Scarf candidates."""
+def validate_parameter_tuning_batch_report(
+    report: ParameterTuningReport,
+    dependencies: Mapping[str, ParameterTuningDependencies],
+    *,
+    search_plans: Mapping[str, ParameterSearchPlan],
+    primary_assay: str,
+) -> ParameterTuningReport:
+    """Ground one aggregate response in every assay's executed branches."""
 
-    def __init__(
-        self,
-        model: Any,
-        *,
-        config: AgentRunConfig | None = None,
-    ) -> None:
-        self.model = model
-        self.config = (config or AgentRunConfig()).with_limits(
-            request_limit=3,
-            tool_call_limit=1,
+    expected = set(dependencies)
+    actual = set(report.assayReports)
+    if actual != expected:
+        raise ValueError(
+            "Batched selection must contain exactly the requested assays: "
+            f"missing={sorted(expected - actual)}, unexpected={sorted(actual - expected)}"
+        )
+    if primary_assay not in dependencies:
+        raise ValueError(f"Unknown primary assay {primary_assay!r}")
+    validated_reports = {
+        assay: validate_parameter_tuning_report(
+            report.assayReports[assay],
+            dependencies[assay],
+            search_plan=search_plans[assay],
+        )
+        for assay in dependencies
+    }
+    known_evidence = {
+        evidence_id
+        for assay_report in validated_reports.values()
+        for evaluation in assay_report.evaluations
+        for evidence_id in evaluation.evidenceIds
+    }
+    unknown_evidence = sorted(set(report.evidenceIds) - known_evidence)
+    if unknown_evidence:
+        raise ValueError(
+            f"Batched tuning report cites unknown evidence ids {unknown_evidence}"
+        )
+    statuses = {assay_report.status for assay_report in validated_reports.values()}
+    if statuses == {"done"}:
+        status: StageStatus = "done"
+    elif "needsInput" in statuses:
+        status = "needsInput"
+    else:
+        status = "failed"
+    primary = validated_reports[primary_assay]
+    recommended = {
+        assay: assay_report.recommendedCandidateId
+        for assay, assay_report in validated_reports.items()
+        if assay_report.recommendedCandidateId is not None
+    }
+    if status == "done" and len(recommended) != len(validated_reports):
+        raise ValueError("Every completed assay report must recommend a candidate")
+    cell_selections = [
+        core_artifact_reference(assay_report.cellSelection)
+        for assay_report in validated_reports.values()
+    ]
+    if (
+        not cell_selections
+        or not isinstance(cell_selections[0], ArtifactRef)
+        or any(selection != cell_selections[0] for selection in cell_selections[1:])
+    ):
+        raise ValueError("Every assay report must use the same exact cell selection")
+    return report.model_copy(
+        update={
+            "status": status,
+            "fromAssay": primary_assay,
+            "cellSelection": primary.cellSelection,
+            "evaluations": primary.evaluations,
+            "recommendedCandidateId": primary.recommendedCandidateId,
+            "selectedArtifacts": primary.selectedArtifacts,
+            "needsInput": primary.needsInput if status != "done" else None,
+            "searchPlan": primary.searchPlan,
+            "assayReports": validated_reports,
+            "recommendedByAssay": recommended,
+            "totalCandidates": sum(
+                len(item.evaluations) for item in validated_reports.values()
+            ),
+            "integrationEvaluations": [],
+            "recommendedIntegrationId": None,
+            "finalClusterColumn": None,
+            "finalClusterArtifact": None,
+            "graphAssay": primary_assay,
+            "markerAssay": primary_assay,
+            "finalSelection": None,
+        }
+    )
+
+
+def fallback_parameter_tuning_report(
+    deps: ParameterTuningDependencies,
+    *,
+    search_plan: ParameterSearchPlan,
+    agent_name: str,
+) -> ParameterTuningReport:
+    """Retain the first eligible branch when structured selection is unavailable."""
+
+    evaluations = [
+        deps.evaluations[candidate_id]
+        for candidate_id in deps.executionOrder
+        if candidate_id in deps.evaluations
+    ]
+    successful = [item for item in evaluations if item.status == "done"]
+    eligible = [item for item in successful if item.eligible]
+    comparison_required = len(deps.candidates) > 1 and deps.maxCandidates > 1
+    evidence_by_candidate = {
+        item.candidateId: next(
+            (
+                evidence_id
+                for evidence_id in item.evidenceIds
+                if evidence_id == f"candidate:{item.candidateId}:clusters"
+            ),
+            next(iter(item.evidenceIds), None),
+        )
+        for item in successful
+    }
+    cannot_recommend = (
+        not eligible
+        or (comparison_required and len(successful) < 2)
+        or any(evidence_by_candidate[item.candidateId] is None for item in successful)
+    )
+    if cannot_recommend:
+        logger.warning(
+            f"Parameter tuning fallback for assay {deps.fromAssay!r} requires "
+            f"input: completed={len(successful)}, eligible={len(eligible)}"
+        )
+        known_evidence = sorted(
+            {
+                evidence_id
+                for evaluation in evaluations
+                for evidence_id in evaluation.evidenceIds
+            }
+        )
+        report = ParameterTuningReport(
+            status="needsInput",
+            confidence="low",
+            rationale=(
+                "Structured model selection was unavailable and the executed "
+                "screen does not support a conservative automatic fallback."
+            ),
+            limitations=[
+                "No parameter branch was selected without complete eligible "
+                "executor evidence."
+            ],
+            stopReason="The bounded screen completed without an automatic choice.",
+            needsInput=ParameterTuningNeedsInput(
+                question="Select one eligible executed parameter candidate.",
+                options=[item.candidateId for item in eligible],
+                evidenceIds=known_evidence,
+            ),
+            runInfo=AgentRunInfo(agentName=agent_name),
+        )
+        return validate_parameter_tuning_report(
+            report,
+            deps,
+            search_plan=search_plan,
+        )
+
+    selected = eligible[0]
+    logger.warning(
+        f"Parameter tuning fallback retained candidate "
+        f"{selected.candidateId!r} for assay {deps.fromAssay!r} from "
+        f"{len(eligible)} eligible candidate(s)"
+    )
+    selected_evidence = evidence_by_candidate[selected.candidateId]
+    assert selected_evidence is not None
+    comparisons: list[CandidateComparison] = []
+    if comparison_required:
+        for item in successful:
+            if item.candidateId == selected.candidateId:
+                continue
+            comparator_evidence = evidence_by_candidate[item.candidateId]
+            assert comparator_evidence is not None
+            comparisons.append(
+                CandidateComparison(
+                    candidateId=item.candidateId,
+                    summary=(
+                        "This executed branch remains a grounded comparator to the "
+                        "conservatively retained first eligible branch."
+                    ),
+                    evidenceIds=[selected_evidence, comparator_evidence],
+                )
+            )
+    report = ParameterTuningReport(
+        status="done",
+        recommendedCandidateId=selected.candidateId,
+        confidence="low",
+        rationale=(
+            "Structured model selection was unavailable after bounded retries; "
+            "the first eligible authorized branch was retained conservatively."
+        ),
+        evidenceIds=[selected_evidence],
+        comparisons=comparisons,
+        tradeoffs=["No model-authored metric trade-off ranking was available."],
+        limitations=[
+            "The fallback does not claim that the retained branch is metric-optimal."
+        ],
+        stopReason=(
+            "The deterministic screen completed and retained its first eligible "
+            "authorized branch."
+        ),
+        runInfo=AgentRunInfo(agentName=agent_name),
+    )
+    return validate_parameter_tuning_report(
+        report,
+        deps,
+        search_plan=search_plan,
+    )
+
+
+def fallback_parameter_tuning_batch_report(
+    dependencies: Mapping[str, ParameterTuningDependencies],
+    *,
+    search_plans: Mapping[str, ParameterSearchPlan],
+    primary_assay: str,
+) -> ParameterTuningReport:
+    """Build one grounded aggregate fallback over completed assay screens."""
+
+    logger.warning(
+        f"Using parameter tuning batch fallback for {len(dependencies)} assay(s)"
+    )
+    assay_reports = {
+        assay: fallback_parameter_tuning_report(
+            deps,
+            search_plan=search_plans[assay],
+            agent_name="parameter_tuning_batch_fallback",
+        )
+        for assay, deps in dependencies.items()
+    }
+    if any(item.status != "done" for item in assay_reports.values()):
+        primary = assay_reports[primary_assay]
+        if primary.status == "done":
+            primary = ParameterTuningReport(
+                status="needsInput",
+                confidence="low",
+                rationale=(
+                    "At least one assay lacks a conservative automatic parameter "
+                    "selection."
+                ),
+                limitations=[
+                    "The multimodal native screen requires an explicit selection."
+                ],
+                stopReason="The bounded native screens completed without all choices.",
+                needsInput=ParameterTuningNeedsInput(
+                    question="Select eligible parameter candidates for every assay.",
+                    options=[],
+                    evidenceIds=list(primary.evidenceIds),
+                ),
+                runInfo=AgentRunInfo(agentName="parameter_tuning_batch_fallback"),
+            )
+            assay_reports[primary_assay] = validate_parameter_tuning_report(
+                primary,
+                dependencies[primary_assay],
+                search_plan=search_plans[primary_assay],
+            )
+    aggregate = ParameterTuningReport(
+        status=(
+            "done"
+            if all(item.status == "done" for item in assay_reports.values())
+            else "needsInput"
+        ),
+        assayReports=assay_reports,
+        rationale=(
+            "Structured model selection was unavailable; each completed native "
+            "screen used the conservative fallback policy."
+        ),
+        evidenceIds=list(
+            dict.fromkeys(
+                evidence_id
+                for assay_report in assay_reports.values()
+                for evidence_id in assay_report.evidenceIds
+            )
+        ),
+        limitations=[
+            "Fallback recommendations retain first eligible authorized branches "
+            "without claiming a metric-optimal ranking."
+        ],
+        stopReason="The bounded native screens completed.",
+        runInfo=AgentRunInfo(agentName="parameter_tuning_batch_fallback"),
+    )
+    logger.warning(
+        f"Parameter tuning batch fallback status={aggregate.status}; "
+        f"completed_assays={sum(item.status == 'done' for item in assay_reports.values())}"
+    )
+    return validate_parameter_tuning_batch_report(
+        aggregate,
+        dependencies,
+        search_plans=search_plans,
+        primary_assay=primary_assay,
+    )
+
+
+def validate_final_graph_selection(
+    selection: FinalGraphSelection,
+    report: ParameterTuningReport,
+    *,
+    integration_evaluations: Sequence[IntegrationCandidateEvaluation],
+    marker_assay: str,
+) -> FinalGraphSelection:
+    """Ground a final graph choice in the exact eligible executor outputs."""
+
+    if report.status != "done":
+        raise ValueError("Native parameter tuning must finish before graph selection")
+    options = final_graph_options(report, integration_evaluations)
+    if not options:
+        raise ValueError("No eligible native or integrated graph options are available")
+    known_evidence = {
+        evidence_id
+        for option in options.values()
+        for evidence_id in option["evidenceIds"]
+    }
+    cited = set(selection.evidenceIds)
+    for comparison in selection.comparisons:
+        cited.update(comparison.evidenceIds)
+    if selection.needsInput is not None:
+        cited.update(selection.needsInput.evidenceIds)
+    unknown = sorted(cited - known_evidence)
+    if unknown:
+        raise ValueError(f"Final graph selection cites unknown evidence ids {unknown}")
+    if selection.status == "needsInput":
+        if selection.needsInput is None or not selection.needsInput.question.strip():
+            raise ValueError(
+                "A needsInput graph selection requires a concrete question"
+            )
+        return selection.model_copy(
+            update={
+                "selectedOptionId": None,
+                "graphMethod": None,
+                "nativeAssay": None,
+                "nativeCandidateId": None,
+                "integrationId": None,
+                "markerAssay": marker_assay,
+            }
+        )
+    if selection.status != "done":
+        raise ValueError("Final graph selection must be done or needsInput")
+    if selection.selectedOptionId not in options:
+        raise ValueError("Selected final graph option is not eligible")
+    assert selection.selectedOptionId is not None
+    selected = options[selection.selectedOptionId]
+    selected_evidence = set(selected["evidenceIds"])
+    if not selected_evidence.intersection(selection.evidenceIds):
+        raise ValueError(
+            "Final graph recommendation must cite selected-option evidence"
+        )
+    expected_comparators = set(options) - {selection.selectedOptionId}
+    comparison_ids = [item.optionId for item in selection.comparisons]
+    if len(set(comparison_ids)) != len(comparison_ids):
+        raise ValueError("Final graph comparisons must not contain duplicates")
+    if set(comparison_ids) != expected_comparators:
+        raise ValueError(
+            "Final graph selection requires one comparison for every eligible "
+            "non-selected option"
+        )
+    for comparison in selection.comparisons:
+        comparator_evidence = set(options[comparison.optionId]["evidenceIds"])
+        if not selected_evidence.intersection(comparison.evidenceIds):
+            raise ValueError(
+                "Every final graph comparison must cite selected-option evidence"
+            )
+        if not comparator_evidence.intersection(comparison.evidenceIds):
+            raise ValueError(
+                "Every final graph comparison must cite comparator evidence"
+            )
+        if not comparison.summary.strip():
+            raise ValueError("Every final graph comparison requires a summary")
+    return selection.model_copy(
+        update={
+            "graphMethod": selected["graphMethod"],
+            "nativeAssay": selected.get("nativeAssay"),
+            "nativeCandidateId": selected.get("nativeCandidateId"),
+            "integrationId": selected.get("integrationId"),
+            "markerAssay": marker_assay,
+            "needsInput": None,
+        }
+    )
+
+
+def finalize_parameter_tuning_selection(
+    report: ParameterTuningReport,
+    *,
+    marker_assay: str,
+    integration_evaluations: Sequence[IntegrationCandidateEvaluation] = (),
+    recommended_integration_id: str | None = None,
+    native_assay: str | None = None,
+    final_selection: FinalGraphSelection | None = None,
+) -> ParameterTuningReport:
+    """Attach an executor-selected native or integrated final cluster branch."""
+
+    logger.debug(
+        f"Finalizing parameter graph selection: marker_assay={marker_assay!r}, "
+        f"integration_candidates={len(integration_evaluations)}"
+    )
+    if report.status != "done":
+        raise ValueError("Parameter tuning must be done before final graph selection")
+    if not marker_assay:
+        raise ValueError("marker_assay must be non-empty")
+    report_cell_selection = core_artifact_reference(report.cellSelection)
+    if not isinstance(report_cell_selection, ArtifactRef):
+        raise ValueError("Parameter tuning report lacks an exact cell selection")
+    assay_reports = report.assayReports or {report.fromAssay: report}
+    if marker_assay not in assay_reports:
+        raise ValueError(f"Unknown marker assay {marker_assay!r}")
+    evaluations = list(integration_evaluations)
+    integration_ids = [item.integrationId for item in evaluations]
+    if len(set(integration_ids)) != len(integration_ids):
+        raise ValueError("Integration evaluation ids must be unique")
+    if recommended_integration_id is not None and native_assay is not None:
+        raise ValueError("Choose either an integrated graph or one native assay")
+    if recommended_integration_id is not None:
+        selected = next(
+            (
+                item
+                for item in evaluations
+                if item.integrationId == recommended_integration_id
+            ),
+            None,
+        )
+        if selected is None:
+            raise ValueError("Recommended integration candidate was not evaluated")
+        if selected.status != "done" or not selected.eligible:
+            raise ValueError("Recommended integration candidate is not eligible")
+        if selected.clusterArtifact is None:
+            raise ValueError("Recommended integration lacks an exact cluster artifact")
+        if core_artifact_reference(selected.cellSelection) != report_cell_selection:
+            raise ValueError("Recommended integration uses a different cell selection")
+        if (
+            selected.clusterArtifact.scope != "datastore"
+            or selected.clusterArtifact.assay is not None
+        ):
+            raise ValueError(
+                "Integrated cluster artifacts must be datastore-scoped without assay"
+            )
+        if (
+            selected.graphArtifact is None
+            or selected.graphArtifact.scope != "datastore"
+        ):
+            raise ValueError("Integrated graph artifact must be datastore-scoped")
+        cluster_artifact = selected.clusterArtifact
+        cluster_column = selected.clusterColumn
+        graph_assay = None
+    else:
+        selected_assay = native_assay or report.fromAssay
+        primary = assay_reports.get(selected_assay)
+        if primary is None or primary.recommendedCandidateId is None:
+            raise ValueError("Selected assay lacks a native tuning recommendation")
+        selected_native = next(
+            (
+                item
+                for item in primary.evaluations
+                if item.candidateId == primary.recommendedCandidateId
+            ),
+            None,
+        )
+        if (
+            selected_native is None
+            or selected_native.status != "done"
+            or not selected_native.eligible
+            or "clusters" not in selected_native.artifacts
+        ):
+            raise ValueError("Primary native recommendation lacks exact clusters")
+        if (
+            core_artifact_reference(selected_native.cellSelection)
+            != report_cell_selection
+        ):
+            raise ValueError(
+                "Recommended native candidate uses a different cell selection"
+            )
+        cluster_artifact = selected_native.artifacts["clusters"]
+        cluster_column = selected_native.clusterColumn
+        graph_assay = selected_assay
+    finalized = report.model_copy(
+        update={
+            "totalCandidates": (
+                sum(len(value.evaluations) for value in assay_reports.values())
+                + len(evaluations)
+            ),
+            "integrationEvaluations": evaluations,
+            "recommendedIntegrationId": recommended_integration_id,
+            "finalClusterColumn": cluster_column,
+            "finalClusterArtifact": cluster_artifact,
+            "graphAssay": graph_assay,
+            "markerAssay": marker_assay,
+            "finalSelection": final_selection,
+        }
+    )
+    selected_graph = recommended_integration_id or graph_assay
+    logger.info(
+        f"Finalized parameter graph selection: graph={selected_graph!r}, "
+        f"marker_assay={marker_assay!r}, cluster_column={cluster_column!r}"
+    )
+    return finalized
+
+
+def select_final_parameter_graph(
+    *,
+    model: Any,
+    report: ParameterTuningReport,
+    integration_evaluations: Sequence[IntegrationCandidateEvaluation],
+    marker_assay: str,
+    config: AgentRunConfig | None = None,
+) -> ParameterTuningReport:
+    """Use one bounded provider call to select and attach the final graph."""
+
+    evaluations = list(integration_evaluations)
+    if not marker_assay:
+        raise ValueError("marker_assay must be non-empty")
+    assay_reports = report.assayReports or {report.fromAssay: report}
+    if marker_assay not in assay_reports:
+        raise ValueError(f"Unknown marker assay {marker_assay!r}")
+    options = final_graph_options(report, evaluations)
+    if not options:
+        raise ValueError("No eligible native or integrated graph options are available")
+    logger.info(
+        f"Selecting final parameter graph from {len(options)} eligible option(s); "
+        f"marker_assay={marker_assay!r}"
+    )
+    if len(options) == 1:
+        option_id, option = next(iter(options.items()))
+        logger.info(
+            f"Selecting sole eligible final graph option {option_id!r} "
+            "without a provider request"
+        )
+        selection = validate_final_graph_selection(
+            FinalGraphSelection(
+                status="done",
+                selectedOptionId=option_id,
+                markerAssay=marker_assay,
+                confidence="high",
+                rationale="The executor produced exactly one eligible graph option.",
+                evidenceIds=list(option["evidenceIds"]),
+                limitations=["No alternative eligible final graph required ranking."],
+                runInfo=AgentRunInfo(
+                    agentName="parameter_tuning_final_graph_deterministic"
+                ),
+            ),
+            report,
+            integration_evaluations=evaluations,
+            marker_assay=marker_assay,
+        )
+    else:
+        run_config = (config or AgentRunConfig()).with_limits(
+            request_limit=6,
+            tool_call_limit=5,
             output_token_limit=32768,
             timeout_seconds=600.0,
         )
-
-    def run(
-        self,
-        store: Any,
-        *,
-        normalized: ArtifactRef,
-        candidates: Sequence[ParameterCandidate] | None = None,
-        batch_columns: Sequence[str] = (),
-        preservation_columns: Sequence[str] = (),
-        experimental_handoff: ExperimentalTuningHandoff | None = None,
-        max_candidates: int = 5,
-        max_refined_candidates: int = 0,
-        min_cluster_cells: int = 20,
-    ) -> ParameterTuningReport:
-        """Run deterministic screening, optional refinement, and final selection."""
-        return tune_parameters(
-            store,
-            model=self.model,
-            normalized=normalized,
-            candidates=candidates,
-            batch_columns=batch_columns,
-            preservation_columns=preservation_columns,
-            experimental_handoff=experimental_handoff,
-            max_candidates=max_candidates,
-            max_refined_candidates=max_refined_candidates,
-            min_cluster_cells=min_cluster_cells,
-            config=self.config,
+        try:
+            logger.info(
+                f"Requesting final graph selection across {len(options)} "
+                "eligible options"
+            )
+            execution = run_agent_sync(
+                model=model,
+                output_type=FinalGraphSelection,
+                system_prompt=final_graph_selection_system_prompt(),
+                user_prompt=final_graph_selection_prompt(
+                    report=report,
+                    integration_evaluations=evaluations,
+                    marker_assay=marker_assay,
+                ),
+                deps_type=ParameterTuningDependencies,
+                deps=ParameterTuningDependencies.get_blank(),
+                config=run_config,
+                name="parameter_tuning_final_graph",
+                output_validator=lambda proposed: validate_final_graph_selection(
+                    proposed,
+                    report,
+                    integration_evaluations=evaluations,
+                    marker_assay=marker_assay,
+                ),
+            )
+        except UnexpectedModelBehavior:
+            option_ids = sorted(options)
+            logger.warning(
+                "Final graph selection exhausted structured-output retries; "
+                f"requesting input for {len(option_ids)} eligible options"
+            )
+            selection = validate_final_graph_selection(
+                FinalGraphSelection(
+                    status="needsInput",
+                    markerAssay=marker_assay,
+                    confidence="low",
+                    rationale=(
+                        "Structured final-graph selection was unavailable after "
+                        "bounded retries."
+                    ),
+                    limitations=[
+                        "No ranking was invented across multiple eligible graphs."
+                    ],
+                    needsInput=FinalGraphNeedsInput(
+                        question="Select one eligible final graph option.",
+                        options=option_ids,
+                        evidenceIds=sorted(
+                            {
+                                evidence_id
+                                for option in options.values()
+                                for evidence_id in option["evidenceIds"]
+                            }
+                        ),
+                    ),
+                    runInfo=AgentRunInfo(
+                        agentName="parameter_tuning_final_graph_fallback"
+                    ),
+                ),
+                report,
+                integration_evaluations=evaluations,
+                marker_assay=marker_assay,
+            )
+        else:
+            if not isinstance(execution.output, FinalGraphSelection):
+                raise TypeError(
+                    "Final graph selector returned an unexpected output type"
+                )
+            selection = validate_final_graph_selection(
+                execution.output,
+                report,
+                integration_evaluations=evaluations,
+                marker_assay=marker_assay,
+            ).model_copy(update={"runInfo": execution.runInfo})
+            logger.info(
+                f"Provider selected final graph option {selection.selectedOptionId!r}"
+            )
+    if selection.status == "needsInput":
+        needs_input = selection.needsInput or FinalGraphNeedsInput.get_blank()
+        option_ids = sorted(options)
+        canonical_question = "Select one eligible final graph option."
+        canonical_needs_input = needs_input.model_copy(
+            update={"question": canonical_question, "options": option_ids}
         )
+        logger.warning(
+            f"Final parameter graph selection needs input; options={len(option_ids)}"
+        )
+        return report.model_copy(
+            update={
+                "status": "needsInput",
+                "totalCandidates": (
+                    sum(len(value.evaluations) for value in assay_reports.values())
+                    + len(evaluations)
+                ),
+                "integrationEvaluations": evaluations,
+                "markerAssay": marker_assay,
+                "finalSelection": selection.model_copy(
+                    update={"needsInput": canonical_needs_input}
+                ),
+                "needsInput": ParameterTuningNeedsInput(
+                    question=canonical_question,
+                    options=option_ids,
+                    evidenceIds=needs_input.evidenceIds,
+                ),
+            }
+        )
+    return finalize_parameter_tuning_selection(
+        report,
+        marker_assay=marker_assay,
+        integration_evaluations=evaluations,
+        recommended_integration_id=selection.integrationId,
+        native_assay=selection.nativeAssay,
+        final_selection=selection,
+    )
 
 
-def tune_parameters(
+def promote_parameter_candidate(
     store: Any,
     *,
-    model: Any,
+    report: ParameterTuningReport,
+    normalized: Any,
+    identity_feature_limit: int = 64,
+) -> ParameterCandidateEvaluation:
+    """Resolve and verify the exact selected native branch without replaying it."""
+
+    if report.status != "done" or report.recommendedCandidateId is None:
+        raise ValueError("A completed native tuning recommendation is required")
+    evaluation = next(
+        (
+            item
+            for item in report.evaluations
+            if item.candidateId == report.recommendedCandidateId
+        ),
+        None,
+    )
+    if evaluation is None or evaluation.status != "done" or not evaluation.eligible:
+        raise ValueError("Recommended candidate is not an eligible execution")
+    if "clusters" not in evaluation.artifacts:
+        raise ValueError("Recommended candidate lacks an exact cluster artifact")
+    normalized_ref = core_artifact_reference(normalized)
+    if (
+        not isinstance(normalized_ref, ArtifactRef)
+        or normalized_ref.kind != "normalized"
+        or normalized_ref.assay != report.fromAssay
+    ):
+        raise ValueError(
+            "normalized must identify the report's exact normalized assay artifact"
+        )
+    status = store.inspect_artifact(normalized_ref)
+    if not getattr(status, "exists", True) or not getattr(status, "complete", False):
+        raise ValueError("normalized artifact is unavailable or incomplete")
+    raw_selection = (getattr(status, "inputs", None) or {}).get("cell_selection")
+    if not isinstance(raw_selection, Mapping):
+        raise ValueError("normalized artifact has no cell-selection input")
+    normalized_selection = ArtifactRef.from_dict(dict(raw_selection))
+    if normalized_selection != core_artifact_reference(evaluation.cellSelection):
+        raise ValueError(
+            "Recommended candidate does not match normalized artifact lineage"
+        )
+    if normalized_selection != core_artifact_reference(report.cellSelection):
+        raise ValueError(
+            "Parameter tuning report does not match normalized artifact lineage"
+        )
+    if identity_feature_limit < 2:
+        raise ValueError("identity_feature_limit must be at least two")
+    logger.info(
+        f"Resolved parameter candidate {evaluation.candidateId!r} for assay "
+        f"{report.fromAssay!r} without replay"
+    )
+    return evaluation
+
+
+def _resolve_experimental_tuning_handoff(
+    *,
+    normalized_cell_selection: ArtifactRef,
+    batch_columns: Sequence[str],
+    preservation_columns: Sequence[str],
+    experimental_handoff: ExperimentalTuningHandoff | None,
+) -> tuple[ArtifactRef, list[str], list[str]]:
+    resolved_batch_columns = list(batch_columns)
+    resolved_preservation_columns = list(preservation_columns)
+    if experimental_handoff is None:
+        return (
+            normalized_cell_selection,
+            resolved_batch_columns,
+            resolved_preservation_columns,
+        )
+
+    handoff_batch_columns = list(experimental_handoff.batchColumns)
+    canonical_batch_columns = sorted(set(handoff_batch_columns))
+    if len(canonical_batch_columns) != len(handoff_batch_columns):
+        raise ValueError("experimental_handoff batch columns must be unique")
+    handoff_cell_selection = core_artifact_reference(experimental_handoff.cellSelection)
+    if not isinstance(handoff_cell_selection, ArtifactRef):
+        raise ValueError("experimental_handoff lacks an exact cell selection")
+    if handoff_cell_selection != normalized_cell_selection:
+        raise ValueError("normalized selection conflicts with experimental_handoff")
+    if resolved_batch_columns and sorted(resolved_batch_columns) != (
+        canonical_batch_columns
+    ):
+        raise ValueError("batch_columns conflict with experimental_handoff")
+    if resolved_preservation_columns and resolved_preservation_columns != list(
+        experimental_handoff.preservationColumns
+    ):
+        raise ValueError("preservation_columns conflict with experimental_handoff")
+    if experimental_handoff.batchAction == "needsInput":
+        raise ValueError("Experimental Context requires input before tuning")
+    if experimental_handoff.batchAction == "skip" and experimental_handoff.batchColumns:
+        raise ValueError("A skip handoff must not contain batch columns")
+    if experimental_handoff.batchAction == "evaluateHarmony":
+        expected_coefficients = set(experimental_handoff.coefficientsOfInterest)
+        safe_coefficients = {
+            item.coefficient
+            for item in experimental_handoff.batchSafety
+            if item.status == "safe" and item.batchColumns == canonical_batch_columns
+        }
+        if (
+            not expected_coefficients
+            or not canonical_batch_columns
+            or safe_coefficients != expected_coefficients
+        ):
+            raise ValueError(
+                "Harmony handoff lacks safe evidence for every coefficient"
+            )
+    if experimental_handoff.batchAction == "unsafe":
+        expected_coefficients = set(experimental_handoff.coefficientsOfInterest)
+        exact_safety = [
+            item
+            for item in experimental_handoff.batchSafety
+            if item.batchColumns == canonical_batch_columns
+            and item.coefficient in expected_coefficients
+        ]
+        if (
+            not expected_coefficients
+            or {item.coefficient for item in exact_safety} != expected_coefficients
+            or any(item.status == "notComputed" for item in exact_safety)
+            or not any(item.status == "unsafe" for item in exact_safety)
+        ):
+            raise ValueError("Unsafe handoff lacks exact unsafe batch evidence")
+    if any(
+        item.evidenceId not in experimental_handoff.evidenceIds
+        for item in experimental_handoff.batchSafety
+    ):
+        raise ValueError("Experimental handoff does not cite its batch evidence")
+    return (
+        normalized_cell_selection,
+        canonical_batch_columns,
+        list(experimental_handoff.preservationColumns),
+    )
+
+
+def prepare_parameter_tuning_dependencies(
+    store: Any,
+    *,
     normalized: ArtifactRef,
     candidates: Sequence[ParameterCandidate] | None = None,
     batch_columns: Sequence[str] = (),
@@ -1250,10 +2836,11 @@ def tune_parameters(
     experimental_handoff: ExperimentalTuningHandoff | None = None,
     max_candidates: int = 5,
     max_refined_candidates: int = 0,
+    allow_harmony_refinement: bool = True,
     min_cluster_cells: int = 20,
-    config: AgentRunConfig | None = None,
-) -> ParameterTuningReport:
-    """Run the bounded parameter tuning agent against an existing DataStore."""
+    identity_feature_limit: int = 64,
+) -> tuple[ParameterTuningDependencies, list[str]]:
+    """Validate one assay request and construct branch-safe dependencies."""
 
     if max_candidates < 1:
         raise ValueError("max_candidates must be at least one")
@@ -1261,6 +2848,8 @@ def tune_parameters(
         raise ValueError("max_refined_candidates must be non-negative")
     if min_cluster_cells < 1:
         raise ValueError("min_cluster_cells must be at least one")
+    if identity_feature_limit < 2:
+        raise ValueError("identity_feature_limit must be at least two")
     normalized = core_artifact_reference(normalized)
     if not isinstance(normalized, ArtifactRef) or normalized.kind != "normalized":
         raise TypeError("normalized must be a normalized ArtifactRef")
@@ -1274,75 +2863,26 @@ def tune_parameters(
     raw_cell_selection = (getattr(normalized_status, "inputs", None) or {}).get(
         "cell_selection"
     )
-    if not isinstance(raw_cell_selection, dict):
+    if not isinstance(raw_cell_selection, Mapping):
         raise ValueError("normalized artifact has no cell-selection input")
-    resolved_cell_selection = ArtifactRef.from_dict(raw_cell_selection)
+    normalized_cell_selection = ArtifactRef.from_dict(dict(raw_cell_selection))
+    if (
+        normalized_cell_selection.scope != "datastore"
+        or normalized_cell_selection.kind != "cell_selection"
+        or normalized_cell_selection.assay is not None
+    ):
+        raise ValueError("normalized artifact has an invalid cell-selection input")
     from_assay = normalized.assay
-    resolved_batch_columns = list(batch_columns)
-    resolved_preservation_columns = list(preservation_columns)
-    if experimental_handoff is not None:
-        handoff_batch_columns = list(experimental_handoff.batchColumns)
-        canonical_batch_columns = sorted(set(handoff_batch_columns))
-        if len(canonical_batch_columns) != len(handoff_batch_columns):
-            raise ValueError("experimental_handoff batch columns must be unique")
-        if experimental_handoff.cellSelection is not None and (
-            core_artifact_reference(experimental_handoff.cellSelection)
-            != resolved_cell_selection
-        ):
-            raise ValueError("normalized selection conflicts with experimental_handoff")
-        if resolved_batch_columns and sorted(resolved_batch_columns) != (
-            canonical_batch_columns
-        ):
-            raise ValueError("batch_columns conflict with experimental_handoff")
-        if resolved_preservation_columns and resolved_preservation_columns != list(
-            experimental_handoff.preservationColumns
-        ):
-            raise ValueError("preservation_columns conflict with experimental_handoff")
-        if experimental_handoff.batchAction == "needsInput":
-            raise ValueError("Experimental Context requires input before tuning")
-        if (
-            experimental_handoff.batchAction == "skip"
-            and experimental_handoff.batchColumns
-        ):
-            raise ValueError("A skip handoff must not contain batch columns")
-        if experimental_handoff.batchAction == "evaluateHarmony":
-            expected_coefficients = set(experimental_handoff.coefficientsOfInterest)
-            safe_coefficients = {
-                item.coefficient
-                for item in experimental_handoff.batchSafety
-                if item.status == "safe"
-                and item.batchColumns == canonical_batch_columns
-            }
-            if (
-                not expected_coefficients
-                or not canonical_batch_columns
-                or (safe_coefficients != expected_coefficients)
-            ):
-                raise ValueError(
-                    "Harmony handoff lacks safe evidence for every coefficient"
-                )
-        if experimental_handoff.batchAction == "unsafe":
-            expected_coefficients = set(experimental_handoff.coefficientsOfInterest)
-            exact_safety = [
-                item
-                for item in experimental_handoff.batchSafety
-                if item.batchColumns == canonical_batch_columns
-                and item.coefficient in expected_coefficients
-            ]
-            if (
-                not expected_coefficients
-                or {item.coefficient for item in exact_safety} != expected_coefficients
-                or any(item.status == "notComputed" for item in exact_safety)
-                or not any(item.status == "unsafe" for item in exact_safety)
-            ):
-                raise ValueError("Unsafe handoff lacks exact unsafe batch evidence")
-        if any(
-            item.evidenceId not in experimental_handoff.evidenceIds
-            for item in experimental_handoff.batchSafety
-        ):
-            raise ValueError("Experimental handoff does not cite its batch evidence")
-        resolved_batch_columns = canonical_batch_columns
-        resolved_preservation_columns = list(experimental_handoff.preservationColumns)
+    (
+        resolved_cell_selection,
+        resolved_batch_columns,
+        resolved_preservation_columns,
+    ) = _resolve_experimental_tuning_handoff(
+        normalized_cell_selection=normalized_cell_selection,
+        batch_columns=batch_columns,
+        preservation_columns=preservation_columns,
+        experimental_handoff=experimental_handoff,
+    )
     if len(set(resolved_batch_columns)) != len(resolved_batch_columns):
         raise ValueError("batch_columns must be unique")
     seed_candidates = (
@@ -1367,12 +2907,6 @@ def tune_parameters(
             "Initial and refined candidates may contain at most "
             f"{CONFIG._MAX_CANDIDATES_OFFERED} values"
         )
-    run_config = (config or AgentRunConfig()).with_limits(
-        request_limit=3,
-        tool_call_limit=1,
-        output_token_limit=32768,
-        timeout_seconds=600.0,
-    )
     candidate_map: dict[str, ParameterCandidate] = {}
     for candidate in candidate_values:
         if not CONFIG._CANDIDATE_ID.fullmatch(candidate.candidateId):
@@ -1394,34 +2928,451 @@ def tune_parameters(
                 f"Candidate {candidate.candidateId!r} is not authorized for Harmony"
             )
         candidate_map[candidate.candidateId] = candidate
-
-    harmony_authorized = bool(resolved_batch_columns) and (
-        experimental_handoff is None
-        or experimental_handoff.batchAction == "evaluateHarmony"
+    harmony_authorized = (
+        allow_harmony_refinement
+        and bool(resolved_batch_columns)
+        and (
+            experimental_handoff is None
+            or experimental_handoff.batchAction == "evaluateHarmony"
+        )
     )
-    total_candidate_limit = len(candidate_values) + max_refined_candidates
+    normalized_shape = normalized_artifact_shape(store, normalized)
     deps = ParameterTuningDependencies(
         store=store,
         normalized=normalized,
         cellSelection=resolved_cell_selection,
+        normalizedShape=normalized_shape,
         fromAssay=from_assay,
         candidates=candidate_map,
         candidatePhases={candidate_id: "initial" for candidate_id in candidate_map},
         batchColumns=tuple(resolved_batch_columns),
         preservationColumns=tuple(resolved_preservation_columns),
         harmonyAuthorized=harmony_authorized,
-        maxCandidates=total_candidate_limit,
+        maxCandidates=len(candidate_values) + max_refined_candidates,
         minClusterCells=min_cluster_cells,
+        identityFeatureLimit=identity_feature_limit,
+    )
+    return deps, list(candidate_map)
+
+
+class ParameterTuningAgent:
+    """Run bounded tuning over caller-authorized Scarf candidates."""
+
+    def __init__(
+        self,
+        model: Any,
+        *,
+        config: AgentRunConfig | None = None,
+    ) -> None:
+        self.model = model
+        self.config = (config or AgentRunConfig()).with_limits(
+            request_limit=6,
+            tool_call_limit=5,
+            output_token_limit=32768,
+            timeout_seconds=600.0,
+        )
+
+    def run(
+        self,
+        store: Any,
+        *,
+        normalized: Any,
+        candidates: Sequence[ParameterCandidate] | None = None,
+        batch_columns: Sequence[str] = (),
+        preservation_columns: Sequence[str] = (),
+        experimental_handoff: ExperimentalTuningHandoff | None = None,
+        max_candidates: int = 5,
+        max_refined_candidates: int = 0,
+        min_cluster_cells: int = 20,
+        identity_feature_limit: int = 64,
+    ) -> ParameterTuningReport:
+        """Run deterministic screening, optional refinement, and final selection."""
+        return tune_parameters(
+            store,
+            model=self.model,
+            normalized=normalized,
+            candidates=candidates,
+            batch_columns=batch_columns,
+            preservation_columns=preservation_columns,
+            experimental_handoff=experimental_handoff,
+            max_candidates=max_candidates,
+            max_refined_candidates=max_refined_candidates,
+            min_cluster_cells=min_cluster_cells,
+            identity_feature_limit=identity_feature_limit,
+            config=self.config,
+        )
+
+    def promote(
+        self,
+        store: Any,
+        *,
+        report: ParameterTuningReport,
+        normalized: Any,
+        identity_feature_limit: int = 64,
+    ) -> ParameterCandidateEvaluation:
+        """Resolve the exact selected native branch without mutating state."""
+
+        return promote_parameter_candidate(
+            store,
+            report=report,
+            normalized=normalized,
+            identity_feature_limit=identity_feature_limit,
+        )
+
+    def run_batch(
+        self,
+        store: Any,
+        *,
+        assays: Sequence[ParameterTuningAssayInput],
+        primary_assay: str | None = None,
+        max_total_candidates: int = 24,
+        selection_directions: str = "",
+    ) -> ParameterTuningReport:
+        """Tune several assays with one planning and one selection request."""
+
+        return tune_parameters_batch(
+            store,
+            model=self.model,
+            assays=assays,
+            primary_assay=primary_assay,
+            max_total_candidates=max_total_candidates,
+            selection_directions=selection_directions,
+            config=self.config,
+        )
+
+    def select_final(
+        self,
+        *,
+        report: ParameterTuningReport,
+        integration_evaluations: Sequence[IntegrationCandidateEvaluation],
+        marker_assay: str,
+    ) -> ParameterTuningReport:
+        """Select native, SNN, or WNN once and attach the final branch."""
+
+        return select_final_parameter_graph(
+            model=self.model,
+            report=report,
+            integration_evaluations=integration_evaluations,
+            marker_assay=marker_assay,
+            config=self.config,
+        )
+
+
+def _execute_parameter_candidates(
+    deps: ParameterTuningDependencies,
+    candidate_ids: Sequence[str],
+) -> None:
+    logger.info(
+        f"Executing {len(candidate_ids)} parameter candidate(s) for assay "
+        f"{deps.fromAssay!r}"
+    )
+    for candidate_id in candidate_ids:
+        execute_parameter_candidate(deps, candidate_id)
+
+
+def _register_refined_parameter_candidates(
+    deps: ParameterTuningDependencies,
+    candidates: Sequence[ParameterCandidate],
+) -> None:
+    if candidates:
+        logger.info(
+            f"Executing {len(candidates)} refined parameter candidate(s) for "
+            f"assay {deps.fromAssay!r}"
+        )
+    for candidate in candidates:
+        deps.candidates[candidate.candidateId] = candidate
+        deps.candidatePhases[candidate.candidateId] = "refined"
+        execute_parameter_candidate(deps, candidate.candidateId)
+
+
+def tune_parameters_batch(
+    store: Any,
+    *,
+    model: Any,
+    assays: Sequence[ParameterTuningAssayInput],
+    primary_assay: str | None = None,
+    max_total_candidates: int = 24,
+    selection_directions: str = "",
+    config: AgentRunConfig | None = None,
+) -> ParameterTuningReport:
+    """Execute and select modality-specific native branches in two model calls."""
+
+    assay_inputs = list(assays)
+    if not assay_inputs:
+        raise ValueError("assays must contain at least one tuning input")
+    if max_total_candidates < 1:
+        raise ValueError("max_total_candidates must be at least one")
+    planned_total = sum(item.maxCandidates for item in assay_inputs)
+    if planned_total > max_total_candidates:
+        raise ValueError(
+            f"Batched tuning requests {planned_total} candidate branches; "
+            f"the global limit is {max_total_candidates}"
+        )
+    normalized_refs = [
+        core_artifact_reference(item.normalized) for item in assay_inputs
+    ]
+    if any(
+        not isinstance(ref, ArtifactRef)
+        or ref.kind != "normalized"
+        or ref.assay is None
+        for ref in normalized_refs
+    ):
+        raise TypeError(
+            "Every batched tuning input requires an assay-scoped normalized artifact"
+        )
+    assay_names = [ref.assay for ref in normalized_refs]
+    if len(set(assay_names)) != len(assay_names):
+        raise ValueError("Batched tuning assay names must be unique")
+    resolved_primary = primary_assay or assay_names[0]
+    if resolved_primary not in assay_names:
+        raise ValueError(f"Unknown primary assay {resolved_primary!r}")
+    logger.info(
+        f"Starting batched parameter tuning for {len(assay_names)} assay(s); "
+        f"primary_assay={resolved_primary!r}, "
+        f"candidate_limit={max_total_candidates}"
     )
 
-    initial_candidate_ids = list(candidate_map)
-    for candidate_id in initial_candidate_ids:
-        execute_parameter_candidate(deps, candidate_id)
+    dependencies: dict[str, ParameterTuningDependencies] = {}
+    initial_ids: dict[str, list[str]] = {}
+    max_refined_by_assay: dict[str, int] = {}
+    for item, assay_name in zip(assay_inputs, assay_names, strict=True):
+        deps, candidate_ids = prepare_parameter_tuning_dependencies(
+            store,
+            normalized=item.normalized,
+            candidates=item.candidates or None,
+            batch_columns=item.batchColumns,
+            preservation_columns=item.preservationColumns,
+            experimental_handoff=item.experimentalHandoff,
+            max_candidates=item.maxCandidates,
+            max_refined_candidates=item.maxRefinedCandidates,
+            allow_harmony_refinement=item.allowHarmonyRefinement,
+            min_cluster_cells=item.minClusterCells,
+            identity_feature_limit=item.identityFeatureLimit,
+        )
+        dependencies[assay_name] = deps
+        initial_ids[assay_name] = candidate_ids
+        max_refined_by_assay[assay_name] = item.maxRefinedCandidates
+    cell_selections = {deps.cellSelection for deps in dependencies.values()}
+    if len(cell_selections) != 1:
+        raise ValueError("Batched tuning inputs must use the same cell selection")
+    for assay in assay_names:
+        deps = dependencies[assay]
+        _execute_parameter_candidates(deps, initial_ids[assay])
+    logger.info(
+        "Completed batched initial parameter screen: "
+        + ", ".join(
+            f"{assay}={len(dependencies[assay].evaluations)}" for assay in assay_names
+        )
+    )
+
+    run_config = (config or AgentRunConfig()).with_limits(
+        request_limit=6,
+        tool_call_limit=5,
+        output_token_limit=32768,
+        timeout_seconds=600.0,
+    )
+    if any(max_refined_by_assay.values()):
+        try:
+            logger.info(
+                "Requesting one batched parameter refinement plan for "
+                f"{len(assay_names)} assay(s)"
+            )
+            planning_execution = run_agent_sync(
+                model=model,
+                output_type=ParameterTuningBatchSearchPlan,
+                system_prompt=parameter_batch_search_system_prompt(),
+                user_prompt=parameter_batch_search_prompt(
+                    dependencies,
+                    max_refined_by_assay,
+                ),
+                deps_type=ParameterTuningDependencies,
+                deps=dependencies[resolved_primary],
+                config=run_config,
+                name="parameter_batch_search_planning",
+                output_validator=(
+                    lambda proposed: validate_parameter_batch_search_plan(
+                        proposed,
+                        dependencies,
+                        initial_candidate_ids=initial_ids,
+                        max_refined_by_assay=max_refined_by_assay,
+                    )
+                ),
+            )
+        except UnexpectedModelBehavior:
+            logger.warning(
+                "Batched parameter refinement planning exhausted "
+                "structured-output retries; skipping optional refinement"
+            )
+            batch_plan = ParameterTuningBatchSearchPlan(
+                assayPlans={
+                    assay: ParameterSearchPlan(
+                        status="complete",
+                        rationale=(
+                            "Structured refinement planning was unavailable after "
+                            "bounded retries; optional refinement was skipped."
+                        ),
+                        stoppingCriteria=[
+                            "Use the completed deterministic initial screen."
+                        ],
+                        runInfo=AgentRunInfo(
+                            agentName="parameter_batch_search_planning_fallback"
+                        ),
+                    )
+                    for assay in assay_names
+                },
+                runInfo=AgentRunInfo(
+                    agentName="parameter_batch_search_planning_fallback"
+                ),
+            )
+        else:
+            if not isinstance(
+                planning_execution.output, ParameterTuningBatchSearchPlan
+            ):
+                raise TypeError("Batched parameter planner returned an unexpected type")
+            batch_plan = validate_parameter_batch_search_plan(
+                planning_execution.output,
+                dependencies,
+                initial_candidate_ids=initial_ids,
+                max_refined_by_assay=max_refined_by_assay,
+            ).model_copy(update={"runInfo": planning_execution.runInfo})
+            logger.info(
+                "Completed batched parameter refinement plan: "
+                + ", ".join(
+                    f"{assay}={len(plan.candidates)}"
+                    for assay, plan in batch_plan.assayPlans.items()
+                )
+            )
+    else:
+        logger.info(
+            "Skipping batched parameter refinement because it is not authorized"
+        )
+        batch_plan = ParameterTuningBatchSearchPlan(
+            assayPlans={
+                assay: ParameterSearchPlan(
+                    status="complete",
+                    rationale=(
+                        "Refinement was not authorized because "
+                        "maxRefinedCandidates is zero."
+                    ),
+                    stoppingCriteria=[
+                        "Use the completed initial screen without refinement."
+                    ],
+                )
+                for assay in assay_names
+            }
+        )
+    for assay, plan in batch_plan.assayPlans.items():
+        deps = dependencies[assay]
+        _register_refined_parameter_candidates(deps, plan.candidates)
+
+    try:
+        logger.info(
+            f"Requesting batched parameter selection across "
+            f"{sum(len(deps.evaluations) for deps in dependencies.values())} "
+            "executed candidates"
+        )
+        selection_execution = run_agent_sync(
+            model=model,
+            output_type=ParameterTuningReport,
+            system_prompt=parameter_batch_selection_system_prompt(),
+            user_prompt=parameter_batch_selection_prompt(
+                dependencies,
+                batch_plan.assayPlans,
+                resolved_primary,
+                selection_directions,
+            ),
+            deps_type=ParameterTuningDependencies,
+            deps=dependencies[resolved_primary],
+            config=run_config,
+            name="parameter_tuning_batch",
+            output_validator=lambda proposed: validate_parameter_tuning_batch_report(
+                proposed,
+                dependencies,
+                search_plans=batch_plan.assayPlans,
+                primary_assay=resolved_primary,
+            ),
+        )
+    except UnexpectedModelBehavior:
+        logger.warning(
+            "Batched parameter selection exhausted structured-output retries; "
+            "using the conservative executor-evidence fallback"
+        )
+        return fallback_parameter_tuning_batch_report(
+            dependencies,
+            search_plans=batch_plan.assayPlans,
+            primary_assay=resolved_primary,
+        )
+    if not isinstance(selection_execution.output, ParameterTuningReport):
+        raise TypeError("Batched parameter tuning returned an unexpected type")
+    report = validate_parameter_tuning_batch_report(
+        selection_execution.output,
+        dependencies,
+        search_plans=batch_plan.assayPlans,
+        primary_assay=resolved_primary,
+    )
+    completed_report = report.model_copy(
+        update={"runInfo": selection_execution.runInfo}
+    )
+    logger.info(
+        f"Completed batched parameter tuning: status={completed_report.status}, "
+        f"assays={len(completed_report.assayReports)}, "
+        f"candidates={completed_report.totalCandidates}"
+    )
+    return completed_report
+
+
+def tune_parameters(
+    store: Any,
+    *,
+    model: Any,
+    normalized: Any,
+    candidates: Sequence[ParameterCandidate] | None = None,
+    batch_columns: Sequence[str] = (),
+    preservation_columns: Sequence[str] = (),
+    experimental_handoff: ExperimentalTuningHandoff | None = None,
+    max_candidates: int = 5,
+    max_refined_candidates: int = 0,
+    min_cluster_cells: int = 20,
+    identity_feature_limit: int = 64,
+    config: AgentRunConfig | None = None,
+) -> ParameterTuningReport:
+    """Run the bounded parameter tuning agent against an existing DataStore."""
+
+    deps, initial_candidate_ids = prepare_parameter_tuning_dependencies(
+        store,
+        normalized=normalized,
+        candidates=candidates,
+        batch_columns=batch_columns,
+        preservation_columns=preservation_columns,
+        experimental_handoff=experimental_handoff,
+        max_candidates=max_candidates,
+        max_refined_candidates=max_refined_candidates,
+        min_cluster_cells=min_cluster_cells,
+        identity_feature_limit=identity_feature_limit,
+    )
+    from_assay = deps.fromAssay
+    cell_selection = artifact_reference(deps.cellSelection)
+    logger.info(
+        f"Starting parameter tuning for assay {from_assay!r}; "
+        f"candidate_limit={max_candidates}, "
+        f"refinement_limit={max_refined_candidates}"
+    )
+    run_config = (config or AgentRunConfig()).with_limits(
+        request_limit=6,
+        tool_call_limit=5,
+        output_token_limit=32768,
+        timeout_seconds=600.0,
+    )
+    _execute_parameter_candidates(deps, initial_candidate_ids)
     initial_evaluations = [
         deps.evaluations[candidate_id] for candidate_id in initial_candidate_ids
     ]
 
     if max_refined_candidates == 0:
+        logger.info(
+            f"Skipping parameter refinement for assay {from_assay!r} because it "
+            "is not authorized"
+        )
         plan = ParameterSearchPlan(
             status="complete",
             rationale=(
@@ -1432,73 +3383,113 @@ def tune_parameters(
             ],
         )
     else:
-        planning_execution = run_agent_sync(
-            model=model,
-            output_type=ParameterSearchPlan,
-            system_prompt=parameter_search_system_prompt(),
-            user_prompt=parameter_search_prompt(
-                from_assay=from_assay,
-                cell_selection=artifact_reference(resolved_cell_selection),
-                evaluations=initial_evaluations,
-                batch_columns=resolved_batch_columns,
-                preservation_columns=resolved_preservation_columns,
-                harmony_authorized=harmony_authorized,
-                max_refined_candidates=max_refined_candidates,
-            ),
-            deps_type=ParameterTuningDependencies,
-            deps=deps,
-            config=run_config,
-            name="parameter_search_planning",
-            output_validator=lambda proposed_plan: validate_parameter_search_plan(
-                proposed_plan,
+        try:
+            logger.info(
+                f"Requesting parameter refinement plan for assay {from_assay!r} "
+                f"from {len(initial_evaluations)} initial evaluations"
+            )
+            planning_execution = run_agent_sync(
+                model=model,
+                output_type=ParameterSearchPlan,
+                system_prompt=parameter_search_system_prompt(),
+                user_prompt=parameter_search_prompt(
+                    from_assay=from_assay,
+                    cell_selection=cell_selection,
+                    evaluations=initial_evaluations,
+                    batch_columns=deps.batchColumns,
+                    preservation_columns=deps.preservationColumns,
+                    harmony_authorized=deps.harmonyAuthorized,
+                    max_refined_candidates=max_refined_candidates,
+                ),
+                deps_type=ParameterTuningDependencies,
+                deps=deps,
+                config=run_config,
+                name="parameter_search_planning",
+                output_validator=(
+                    lambda proposed_plan: validate_parameter_search_plan(
+                        proposed_plan,
+                        deps,
+                        initial_candidate_ids=initial_candidate_ids,
+                        max_refined_candidates=max_refined_candidates,
+                    )
+                ),
+            )
+        except UnexpectedModelBehavior:
+            logger.warning(
+                f"Parameter refinement planning for assay {from_assay!r} "
+                "exhausted structured-output retries; skipping optional refinement"
+            )
+            plan = ParameterSearchPlan(
+                status="complete",
+                rationale=(
+                    "Structured refinement planning was unavailable after bounded "
+                    "retries; optional refinement was skipped."
+                ),
+                stoppingCriteria=["Use the completed deterministic initial screen."],
+                runInfo=AgentRunInfo(agentName="parameter_search_planning_fallback"),
+            )
+        else:
+            if not isinstance(planning_execution.output, ParameterSearchPlan):
+                raise TypeError(
+                    "Parameter search planner returned an unexpected output type"
+                )
+            plan = validate_parameter_search_plan(
+                planning_execution.output,
                 deps,
                 initial_candidate_ids=initial_candidate_ids,
                 max_refined_candidates=max_refined_candidates,
-            ),
-        )
-        if not isinstance(planning_execution.output, ParameterSearchPlan):
-            raise TypeError(
-                "Parameter search planner returned an unexpected output type"
+            ).model_copy(update={"runInfo": planning_execution.runInfo})
+            logger.info(
+                f"Completed parameter refinement plan for assay "
+                f"{from_assay!r}: status={plan.status}, "
+                f"candidates={len(plan.candidates)}"
             )
-        plan = validate_parameter_search_plan(
-            planning_execution.output,
-            deps,
-            initial_candidate_ids=initial_candidate_ids,
-            max_refined_candidates=max_refined_candidates,
-        ).model_copy(update={"runInfo": planning_execution.runInfo})
 
-    for candidate in plan.candidates:
-        deps.candidates[candidate.candidateId] = candidate
-        deps.candidatePhases[candidate.candidateId] = "refined"
-        execute_parameter_candidate(deps, candidate.candidateId)
+    _register_refined_parameter_candidates(deps, plan.candidates)
 
     evaluations = [
         deps.evaluations[candidate_id]
         for candidate_id in deps.executionOrder
         if candidate_id in deps.evaluations
     ]
-    selection_execution = run_agent_sync(
-        model=model,
-        output_type=ParameterTuningReport,
-        system_prompt=parameter_tuning_system_prompt(min_cluster_cells),
-        user_prompt=parameter_tuning_prompt(
-            from_assay=from_assay,
-            cell_selection=artifact_reference(resolved_cell_selection),
-            evaluations=evaluations,
-            batch_columns=resolved_batch_columns,
-            preservation_columns=resolved_preservation_columns,
-            search_plan=plan,
-        ),
-        deps_type=ParameterTuningDependencies,
-        deps=deps,
-        config=run_config,
-        name="parameter_tuning",
-        output_validator=lambda report: validate_parameter_tuning_report(
-            report,
+    try:
+        logger.info(
+            f"Requesting parameter selection for assay {from_assay!r} across "
+            f"{len(evaluations)} executed candidates"
+        )
+        selection_execution = run_agent_sync(
+            model=model,
+            output_type=ParameterTuningReport,
+            system_prompt=parameter_tuning_system_prompt(min_cluster_cells),
+            user_prompt=parameter_tuning_prompt(
+                from_assay=from_assay,
+                cell_selection=cell_selection,
+                evaluations=evaluations,
+                batch_columns=deps.batchColumns,
+                preservation_columns=deps.preservationColumns,
+                search_plan=plan,
+            ),
+            deps_type=ParameterTuningDependencies,
+            deps=deps,
+            config=run_config,
+            name="parameter_tuning",
+            output_validator=lambda report: validate_parameter_tuning_report(
+                report,
+                deps,
+                search_plan=plan,
+            ),
+        )
+    except UnexpectedModelBehavior:
+        logger.warning(
+            f"Parameter selection for assay {from_assay!r} exhausted "
+            "structured-output retries; using the conservative executor-evidence "
+            "fallback"
+        )
+        return fallback_parameter_tuning_report(
             deps,
             search_plan=plan,
-        ),
-    )
+            agent_name="parameter_tuning_fallback",
+        )
     if not isinstance(selection_execution.output, ParameterTuningReport):
         raise TypeError("Parameter tuning agent returned an unexpected output type")
     report = validate_parameter_tuning_report(
@@ -1506,7 +3497,16 @@ def tune_parameters(
         deps,
         search_plan=plan,
     )
-    return report.model_copy(update={"runInfo": selection_execution.runInfo})
+    completed_report = report.model_copy(
+        update={"runInfo": selection_execution.runInfo}
+    )
+    logger.info(
+        f"Completed parameter tuning for assay {from_assay!r}: "
+        f"status={completed_report.status}, "
+        f"selected={completed_report.recommendedCandidateId!r}, "
+        f"candidates={len(completed_report.evaluations)}"
+    )
+    return completed_report
 
 
 __all__ = [
@@ -1514,21 +3514,46 @@ __all__ = [
     "build_initial_parameter_candidates",
     "CandidateComparison",
     "execute_parameter_candidate",
+    "final_graph_options",
+    "final_graph_selection_prompt",
+    "final_graph_selection_system_prompt",
+    "FinalGraphComparison",
+    "FinalGraphNeedsInput",
+    "FinalGraphSelection",
+    "finalize_parameter_tuning_selection",
+    "IntegrationCandidateEvaluation",
+    "IntegrationMetrics",
+    "normalized_artifact_shape",
     "ParameterCandidate",
     "ParameterCandidateEvaluation",
     "ParameterMetrics",
     "ParameterSearchPlan",
+    "ParameterTuningAssayInput",
     "ParameterTuningAgent",
+    "ParameterTuningBatchSearchPlan",
     "ParameterTuningDependencies",
     "ParameterTuningNeedsInput",
     "ParameterTuningReport",
     "evaluate_parameter_candidate",
     "get_default_parameter_candidates",
+    "parameter_batch_search_prompt",
+    "parameter_batch_search_system_prompt",
+    "parameter_batch_selection_prompt",
+    "parameter_batch_selection_system_prompt",
     "parameter_search_prompt",
     "parameter_search_system_prompt",
     "parameter_tuning_prompt",
     "parameter_tuning_system_prompt",
+    "prepare_parameter_tuning_dependencies",
+    "promote_parameter_candidate",
+    "run_candidate_reduction",
+    "select_final_parameter_graph",
     "tune_parameters",
+    "tune_parameters_batch",
+    "validate_parameter_batch_search_plan",
+    "validate_parameter_candidate_rank",
+    "validate_final_graph_selection",
     "validate_parameter_search_plan",
+    "validate_parameter_tuning_batch_report",
     "validate_parameter_tuning_report",
 ]

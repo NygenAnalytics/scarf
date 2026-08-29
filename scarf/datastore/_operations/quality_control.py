@@ -36,6 +36,8 @@ from ...metadata.arguments import (
     HtoIdentityArguments,
     PrevalentPeakArguments,
 )
+from ...metadata.rows import read_metadata_rows_chunkwise
+from ...metadata.selection import NamedCellArtifact, resolve_cell_aligned_artifact
 from ...storage.artifacts import (
     artifact_group,
     artifact_path,
@@ -66,6 +68,25 @@ if TYPE_CHECKING:
     from ..mapping_datastore import MappingDatastore as _QualityControlOperationsBase
 else:
     _QualityControlOperationsBase = object
+
+
+def _validated_named_cell_artifacts(
+    values: Iterable[NamedCellArtifact] | None,
+    *,
+    expected_kind: str,
+    label: str,
+) -> list[NamedCellArtifact]:
+    sources = list(values or ())
+    names: set[str] = set()
+    for source in sources:
+        if not isinstance(source, NamedCellArtifact):
+            raise TypeError(f"{label} must contain NamedCellArtifact values")
+        if source.artifact.kind != expected_kind:
+            raise ValueError(f"{label} must reference {expected_kind!r} artifacts")
+        if source.name in names:
+            raise ValueError(f"{label} must use unique semantic names")
+        names.add(source.name)
+    return sources
 
 
 class _QualityControlOperationsMixin(_QualityControlOperationsBase):
@@ -597,8 +618,10 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         max_p: float = 0.99,
         *,
         cell_selection: ArtifactRef | None = None,
+        artifact_metrics: Iterable[NamedCellArtifact] | None = None,
         invalidate_cache: bool = False,
         sample_column: str | None = None,
+        sample_artifact: NamedCellArtifact | None = None,
         n_mads: float = 3.0,
         min_cells_per_sample: int = 20,
     ) -> ArtifactRef:
@@ -610,22 +633,25 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         evaluates its quantiles at ``min_p`` and ``max_p``.
 
         Requested columns are read from current cell metadata when this method
-        is called. Their values are fingerprinted in provenance, and the
-        resulting immutable selection is stored.
+        is called. Exact quality-metric artifacts can be supplied alongside
+        metadata metrics. Metadata values are fingerprinted and artifact
+        references are stored in provenance.
 
-        When ``sample_column`` is supplied, thresholds are instead calculated
-        independently within each sample using median absolute deviation (MAD).
-        ``n_mads`` controls that path. ``min_p`` and ``max_p`` remain
-        global-Gaussian parameters and must stay at their defaults when
-        ``sample_column`` is set.
+        When ``sample_column`` or ``sample_artifact`` is supplied, thresholds
+        are instead calculated independently within each sample using median
+        absolute deviation (MAD). ``n_mads`` controls that path. ``min_p`` and
+        ``max_p`` remain global-Gaussian parameters and must stay at their
+        defaults for sample-aware filtering.
 
         Args:
             attrs: Column names to be used for filtering.
             min_p: Quantile used for the lower threshold (Gaussian path only).
             max_p: Quantile used for the upper threshold (Gaussian path only).
             cell_selection: Optional prior cell-selection artifact.
+            artifact_metrics: Named exact ``quality_metric`` artifact vectors.
             sample_column: Optional cell-metadata column with sample labels.
                 When set, MAD bounds are calculated within each sample.
+            sample_artifact: Optional named exact ``hto_identity`` sample vector.
             n_mads: Number of scaled MADs used for per-sample bounds.
             min_cells_per_sample: Samples with fewer active cells than this are
                 retained without MAD filtering and emit a warning.
@@ -644,18 +670,46 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         for attr in attrs_list:
             if not isinstance(attr, str):
                 raise TypeError("attrs must contain only column names")
+        metric_artifacts = _validated_named_cell_artifacts(
+            artifact_metrics,
+            expected_kind="quality_metric",
+            label="artifact_metrics",
+        )
+        resolved_sample_artifact: NamedCellArtifact | None = None
+        if sample_artifact is not None:
+            resolved_sample_artifact = _validated_named_cell_artifacts(
+                [sample_artifact],
+                expected_kind="hto_identity",
+                label="sample_artifact",
+            )[0]
+        if sample_column is not None and resolved_sample_artifact is not None:
+            raise ValueError("sample_column and sample_artifact are mutually exclusive")
+        if resolved_sample_artifact is not None and resolved_sample_artifact.name in {
+            source.name for source in metric_artifacts
+        }:
+            raise ValueError("Sample and metric artifact names must be distinct")
+        duplicate_names = sorted(
+            set(attrs_list).intersection(source.name for source in metric_artifacts)
+        )
+        if duplicate_names:
+            raise ValueError(
+                "Metadata and artifact QC metrics must use distinct names: "
+                f"{duplicate_names}"
+            )
         missing = [attr for attr in attrs_list if attr not in self.cells.columns]
         if missing:
             joined = ", ".join(repr(attr) for attr in missing)
             raise KeyError(f"Cell metadata columns not found: {joined}")
-        if sample_column is not None:
+        if sample_column is not None or resolved_sample_artifact is not None:
             return self._auto_filter_cells_sample_mad(
                 attrs=attrs_list,
+                artifact_metrics=metric_artifacts,
                 min_p=min_p,
                 max_p=max_p,
                 cell_selection=cell_selection,
                 invalidate_cache=invalidate_cache,
                 sample_column=sample_column,
+                sample_artifact=resolved_sample_artifact,
                 n_mads=n_mads,
                 min_cells_per_sample=min_cells_per_sample,
             )
@@ -672,21 +726,57 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         if not active.any():
             raise ValueError("Cell selection contains no active cells")
 
-        attrs_used: list[str] = []
-        resolved_bounds: dict[str, dict[str, float]] = {}
-        input_fingerprints: dict[str, str] = {}
-        keep = active.copy()
-        for i in attrs_list:
-            values = np.asarray(self.cells.fetch_all(i))
-            low, high = gaussian_quantile_bounds(values[active], min_p, max_p)
-            resolved_bounds[i] = {"low": float(low), "high": float(high)}
-            attrs_used.append(i)
-            keep &= _apply_bounds(values, low, high)
-            input_fingerprints[i] = (
-                fingerprint_strings(values)
-                if values.dtype.kind in {"O", "S", "U"}
-                else fingerprint_array(values)
+        active_idx = np.flatnonzero(active).astype(np.int64, copy=False)
+        values_by_name: dict[str, np.ndarray] = {}
+        metadata_fingerprints: dict[str, str] = {}
+        for attr in attrs_list:
+            values = np.asarray(
+                read_metadata_rows_chunkwise(self.cells, attr, active_idx),
+                dtype=float,
             )
+            if values.shape != (len(active_idx),):
+                raise ValueError(
+                    f"QC metadata column {attr!r} does not align with cell_selection"
+                )
+            if not np.isfinite(values).all():
+                raise ValueError(f"QC values in {attr!r} contain non-finite entries")
+            values_by_name[attr] = values
+            metadata_fingerprints[attr] = fingerprint_array(values)
+        for source in metric_artifacts:
+            resolved = resolve_cell_aligned_artifact(
+                self.zw,
+                source.artifact,
+                cell_selection=prior,
+                expected_kind="quality_metric",
+            )
+            values = np.asarray(resolved.values, dtype=float)
+            if not np.isfinite(values).all():
+                raise ValueError(
+                    f"QC artifact values in {source.name!r} contain non-finite entries"
+                )
+            values_by_name[source.name] = values
+
+        metric_names = list(values_by_name)
+        resolved_bounds: dict[str, dict[str, float]] = {}
+        compact_keep = np.ones(len(active_idx), dtype=bool)
+        for name, values in values_by_name.items():
+            low, high = gaussian_quantile_bounds(values, min_p, max_p)
+            if not np.isfinite([low, high]).all():
+                raise ValueError(
+                    f"QC metric {name!r} produced non-finite Gaussian bounds"
+                )
+            resolved_bounds[name] = {"low": float(low), "high": float(high)}
+            compact_keep &= _apply_bounds(values, low, high)
+        keep = np.zeros(self.cells.N, dtype=bool)
+        keep[active_idx] = compact_keep
+
+        metric_sources = [
+            {"name": attr, "source": "metadataColumn", "column": attr}
+            for attr in attrs_list
+        ]
+        metric_sources.extend(
+            {"name": source.name, "source": "artifact"} for source in metric_artifacts
+        )
 
         ref, stored = resolve_generated_selection_artifact(
             self.zw,
@@ -696,14 +786,18 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             row_ids=np.asarray(self.cells.fetch_all("ids")),
             operation="auto_filter_cells",
             parameters={
-                "attrs": attrs_used,
+                "attrs": metric_names,
+                "metric_sources": metric_sources,
                 "min_p": min_p,
                 "max_p": max_p,
                 "resolved_bounds": resolved_bounds,
             },
             inputs={
                 "prior_cell_selection": prior,
-                "metadata_fingerprints": input_fingerprints,
+                "metadata_fingerprints": metadata_fingerprints,
+                "artifact_metrics": {
+                    source.name: source.artifact for source in metric_artifacts
+                },
             },
             source_column="artifact",
             invalidate_cache=invalidate_cache,
@@ -715,11 +809,13 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         self,
         *,
         attrs: list[str],
+        artifact_metrics: list[NamedCellArtifact],
         min_p: float,
         max_p: float,
         cell_selection: ArtifactRef | None,
         invalidate_cache: bool,
-        sample_column: str,
+        sample_column: str | None,
+        sample_artifact: NamedCellArtifact | None,
         n_mads: float,
         min_cells_per_sample: int,
     ) -> ArtifactRef:
@@ -727,7 +823,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             raise ValueError(
                 "min_p and max_p apply only to the global Gaussian path. "
                 "Leave them at their defaults (0.01 and 0.99) when "
-                "sample_column is set, and use n_mads to control MAD bounds"
+                "a sample source is set, and use n_mads to control MAD bounds"
             )
         if isinstance(n_mads, bool) or not isinstance(n_mads, Real):
             raise TypeError("n_mads must be a positive number")
@@ -740,10 +836,12 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             or min_cells_per_sample < 2
         ):
             raise ValueError("min_cells_per_sample must be an integer >= 2")
-        if sample_column not in self.cells.columns:
+        if sample_column is not None and sample_column not in self.cells.columns:
             raise ValueError(
                 f"sample_column '{sample_column}' not found in cell metadata"
             )
+        if sample_column is None and sample_artifact is None:
+            raise ValueError("Sample-aware filtering requires an exact sample source")
 
         prior_selection = self._filter_input_selection(cell_selection)
         active = read_stored_selection_mask(
@@ -754,45 +852,104 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             assay=None,
             table_path="cellData",
         )
-        sample_labels = np.asarray(self.cells.fetch_all(sample_column))
+        active_idx = np.flatnonzero(active).astype(np.int64, copy=False)
+        compact_active = np.ones(len(active_idx), dtype=bool)
+        if sample_column is not None:
+            sample_labels = np.asarray(
+                read_metadata_rows_chunkwise(
+                    self.cells,
+                    sample_column,
+                    active_idx,
+                )
+            )
+            sample_label_name = f"sample_column '{sample_column}'"
+        else:
+            assert sample_artifact is not None
+            resolved_sample = resolve_cell_aligned_artifact(
+                self.zw,
+                sample_artifact.artifact,
+                cell_selection=prior_selection,
+                expected_kind="hto_identity",
+            )
+            sample_labels = np.asarray(resolved_sample.values)
+            sample_label_name = f"sample_artifact '{sample_artifact.name}'"
         sample_labels = _validated_sample_labels(
             sample_labels,
-            active,
-            label_name=f"sample_column '{sample_column}'",
+            compact_active,
+            label_name=sample_label_name,
         )
-        active_labels = sample_labels[active]
-        if active_labels.size == 0:
+        if sample_labels.size == 0:
             raise ValueError("No active cells are available for sample-aware filtering")
 
-        attrs_used: list[str] = []
+        metric_names: list[str] = []
         values_by_attr: dict[str, np.ndarray] = {}
         for attr in attrs:
-            values = np.asarray(self.cells.fetch_all(attr), dtype=float)
+            values = np.asarray(
+                read_metadata_rows_chunkwise(self.cells, attr, active_idx),
+                dtype=float,
+            )
             _validated_work_scale(
-                values[active],
+                values,
                 attr=attr,
                 transform=_metric_policy(attr)["transform"],
             )
-            attrs_used.append(attr)
+            metric_names.append(attr)
             values_by_attr[attr] = values
+        for source in artifact_metrics:
+            resolved = resolve_cell_aligned_artifact(
+                self.zw,
+                source.artifact,
+                cell_selection=prior_selection,
+                expected_kind="quality_metric",
+            )
+            values = np.asarray(resolved.values, dtype=float)
+            _validated_work_scale(
+                values,
+                attr=source.name,
+                transform=_metric_policy(source.name)["transform"],
+            )
+            metric_names.append(source.name)
+            values_by_attr[source.name] = values
 
         parameters: dict[str, Any] = {
-            "attrs": attrs_used,
-            "sample_column": sample_column,
+            "attrs": metric_names,
+            "metric_sources": [
+                *(
+                    {"name": attr, "source": "metadataColumn", "column": attr}
+                    for attr in attrs
+                ),
+                *(
+                    {"name": source.name, "source": "artifact"}
+                    for source in artifact_metrics
+                ),
+            ],
             "n_mads": resolved_n_mads,
             "min_cells_per_sample": int(min_cells_per_sample),
             "resolved_bounds": {},
         }
+        if sample_column is not None:
+            parameters["sample_column"] = sample_column
+            parameters["sample_source"] = {
+                "name": sample_column,
+                "source": "metadataColumn",
+                "column": sample_column,
+            }
+        else:
+            assert sample_artifact is not None
+            parameters["sample_source"] = {
+                "name": sample_artifact.name,
+                "source": "artifact",
+            }
 
         mad_provenance = None
-        if attrs_used:
-            keep, mad_provenance = _sample_aware_mad_mask(
+        if metric_names:
+            compact_keep, mad_provenance = _sample_aware_mad_mask(
                 values_by_attr=values_by_attr,
                 sample_labels=sample_labels,
-                active=active,
+                active=compact_active,
                 n_mads=resolved_n_mads,
                 min_cells_per_sample=int(min_cells_per_sample),
-                attrs=attrs_used,
+                attrs=metric_names,
             )
             parameters.update(
                 {
@@ -804,12 +961,20 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 }
             )
         fingerprint_inputs: dict[str, Any] = {
-            "sample_assignments_fingerprint": fingerprint_strings(active_labels),
             "qc_metric_fingerprints": {
-                attr: fingerprint_array(values_by_attr[attr][active])
-                for attr in attrs_used
+                attr: fingerprint_array(values_by_attr[attr]) for attr in attrs
+            },
+            "artifact_metrics": {
+                source.name: source.artifact for source in artifact_metrics
             },
         }
+        if sample_column is not None:
+            fingerprint_inputs["sample_assignments_fingerprint"] = fingerprint_strings(
+                sample_labels
+            )
+        else:
+            assert sample_artifact is not None
+            fingerprint_inputs["sample_artifact"] = sample_artifact.artifact
         canonical_bytes(
             {
                 "operation": "auto_filter_cells",
@@ -829,13 +994,14 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             }
         )
 
-        if attrs_used:
+        if metric_names:
             assert mad_provenance is not None
             for message in mad_provenance["warnings"]:
                 logger.warning(message)
-            keep &= active
         else:
-            keep = active.copy()
+            compact_keep = compact_active.copy()
+        keep = np.zeros(self.cells.N, dtype=bool)
+        keep[active_idx] = compact_keep
 
         ref, stored = resolve_generated_selection_artifact(
             self.zw,

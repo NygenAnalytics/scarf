@@ -100,7 +100,7 @@ _SIGNATURE_DIGESTS = {
     BaseDataStore: "265c58773661a006212d7c269300d4b0bd90dbb71ade2dacf785663bf1ce94f5",
     GraphDataStore: "82320f376233d84bdf9601e23334a09b7388990c9bf74aead31c49c330150be0",
     MappingDatastore: "dd7c11707d882495a767ccc3022e5053344a6c4196e5f1bd9b0a4008a55e78ff",
-    DataStore: "5cbbd6dcb88b0b5a35ae6c0a7b94de1888b85cb702b37ede4c1653b2eb656b17",
+    DataStore: "f235fec80b3c84b6287c062ca7fde36262492d9d03dbfea673839ef7a5af9af0",
 }
 
 

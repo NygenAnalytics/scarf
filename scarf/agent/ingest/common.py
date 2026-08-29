@@ -32,6 +32,7 @@ CONVERT_FORMATS = frozenset({"h5ad", "10x_h5", "10x_dir", "mtx", "loom", "seurat
 # broader set is restricted to reader and writer execution.
 DATA_LAYOUT_ERRORS = (OSError, ValueError, KeyError)
 CONVERSION_DATA_ERRORS = (*DATA_LAYOUT_ERRORS, RuntimeError)
+AGENT_PERSISTENCE_ERRORS = (*CONVERSION_DATA_ERRORS, TypeError)
 
 
 def _local_path(location: str) -> Path:
@@ -62,10 +63,13 @@ def ensure_convert_destination(
 ) -> str | IngestResult:
     """Validate conversion destination before inspect, reader, or model work."""
     if zarrPath is None:
-        return failed(
-            format_name=format_name,
-            notes=[f"zarrPath is required when converting {format_name} inputs"],
-        )
+        if source.is_dir():
+            zarrPath = source.with_name(f"{source.name}.zarr")
+        else:
+            destination_source = (
+                source.with_suffix("") if source.suffix.lower() == ".gz" else source
+            )
+            zarrPath = destination_source.with_suffix(".zarr")
 
     destination = str(zarrPath)
     overwrite = directions.get("overwrite")
@@ -154,8 +158,15 @@ def open_summary(
             resolved_default = assay_names[0]
 
     ds = DataStore(zarr_path, default_assay=resolved_default)
+    assay_names = list(ds.assay_names)
+    for assay_name in assay_names:
+        fingerprint = ds._ensure_dataset_fingerprint(assay_name)
+        if not fingerprint:
+            raise ValueError(
+                f"Dataset fingerprint for assay {assay_name!r} must be non-empty"
+            )
     summary = ds.summary().to_dict()
-    return list(ds.assay_names), ds._defaultAssay, summary
+    return assay_names, ds._defaultAssay, summary
 
 
 def open_readonly_summary(
@@ -237,14 +248,47 @@ def finish(
                 else (f"Destination may contain a converted store at {zarr_path}",)
             ),
         )
+    accepted_actions = [*convert_actions, action]
+    resolved_action_labels = list(action_labels)
+    workflow_run = None
+    if summary_mode != "r":
+        from ..persistence import create_agent_workflow
+
+        try:
+            workflow_run = create_agent_workflow(zarr_path)
+        except AGENT_PERSISTENCE_ERRORS as exc:
+            return IngestResult(
+                status="failed",
+                format=format_name,
+                zarrPath=zarr_path,
+                assayNames=assay_names,
+                summary=summary,
+                decision=decision,
+                actions=resolved_action_labels,
+                acceptedActions=accepted_actions,
+                notes=[
+                    *notes,
+                    failure_note("create agent workflow", exc),
+                    f"The converted Scarf store remains available at {zarr_path}",
+                ],
+            )
+        resolved_action_labels.append("create_agent_workflow")
+        accepted_actions.append(
+            {
+                "op": "createAgentWorkflow",
+                "zarrPath": zarr_path,
+                "workflowRunId": workflow_run.workflowRunId,
+            }
+        )
     return done(
         format_name=format_name,
         zarr_path=zarr_path,
         assay_names=assay_names,
         summary=summary,
-        accepted_actions=[*convert_actions, action],
-        action_labels=action_labels,
+        accepted_actions=accepted_actions,
+        action_labels=resolved_action_labels,
         notes=notes,
+        workflow_run=workflow_run,
         decision=decision,
     )
 

@@ -40,6 +40,7 @@ from scarf.agent.biological_interpretation import (
     validate_biological_interpretation_report,
 )
 from scarf.agent.types import (
+    AgentRunInfo,
     ArtifactReferenceModel,
     ExperimentalBiologyHandoff,
     TuningBiologyHandoff,
@@ -219,11 +220,22 @@ def context(
             store=store,
             cluster=store.cluster,
             fromAssay="RNA",
+            graphAssay="RNA",
+            markerAssay="RNA",
+            markerAssayType="RNA",
             sampleColumn="sample",
             conditionColumn="condition",
             marker=marker,
             markerFeatures=store.marker_features,
             allowMarkerSearch=allow_marker_search,
+            designHandoff=ExperimentalBiologyHandoff(
+                cellSelection=artifact_model(store.cell_selection),
+                conditionColumn="condition",
+                observationUnit="sample",
+                independentUnit="sample",
+                coefficientScope="betweenUnit",
+                estimability={"status": "ok", "coefficientEstimable": True},
+            ),
         ),
         model=TestModel(),
         usage=RunUsage(),
@@ -259,6 +271,7 @@ def test_system_prompt_does_not_embed_fictional_output_values() -> None:
     assert "alveolar macrophage" not in _SYSTEM_PROMPT
     assert "cluster-versus-rest marker specificity" in _SYSTEM_PROMPT
     assert "inspect_cluster_markers_batch exactly once" in _SYSTEM_PROMPT
+    assert "Independent units may occur in more than one condition" in _SYSTEM_PROMPT
 
 
 def test_composition_is_sample_level_and_hides_sample_identifiers() -> None:
@@ -282,6 +295,40 @@ def test_composition_is_sample_level_and_hides_sample_identifiers() -> None:
     serialized = result.model_dump_json()
     assert "s1" not in serialized
     assert "s2" not in serialized
+
+
+def test_composition_supports_paired_independent_units() -> None:
+    store = FakeStore(replicated=True)
+    donor_values = np.full(store.cells.N, "", dtype="<U2")
+    donor_values[store.cells.selected_indices] = np.repeat(
+        ["d1", "d2", "d1", "d2"],
+        4,
+    )
+    store.cells.values["donor"] = donor_values
+    store.cells.columns.append("donor")
+    run_context = context(store, marker=store.marker)
+    run_context.deps.sampleColumn = "donor"
+
+    result = asyncio.run(inspect_cluster_composition(run_context))
+
+    summaries = {
+        (summary.condition, summary.clusterId): summary
+        for summary in result.conditionSummaries
+    }
+    assert summaries[("control", "0")].nSamples == 2
+    assert summaries[("control", "0")].meanFraction == pytest.approx(0.625)
+    assert summaries[("control", "0")].minFraction == pytest.approx(0.5)
+    assert summaries[("control", "0")].maxFraction == pytest.approx(0.75)
+    assert summaries[("control", "0")].cellCount == 5
+    assert summaries[("control", "1")].meanFraction == pytest.approx(0.375)
+    assert summaries[("control", "1")].cellCount == 3
+    assert summaries[("treated", "0")].meanFraction == pytest.approx(0.25)
+    assert summaries[("treated", "0")].cellCount == 2
+    assert summaries[("treated", "1")].meanFraction == pytest.approx(0.75)
+    assert summaries[("treated", "1")].cellCount == 6
+    serialized = result.model_dump_json()
+    assert '"d1"' not in serialized
+    assert '"d2"' not in serialized
 
 
 def test_marker_tool_uses_exact_artifact_and_bounded_rows() -> None:
@@ -387,6 +434,35 @@ def test_validator_attaches_exact_marker_evidence_when_omitted() -> None:
 
     assert validated.clusterInterpretations[0].evidenceIds == [marker.evidenceId]
     assert marker.evidenceId in validated.evidenceIds
+
+
+def test_atac_markers_force_low_confidence_identity_hypotheses() -> None:
+    store = FakeStore()
+    run_context = context(store, marker=store.marker)
+    run_context.deps.markerAssayType = "ATAC"
+    asyncio.run(inspect_cluster_composition(run_context))
+    marker = asyncio.run(inspect_cluster_markers(run_context, cluster_id="0"))
+    report = BiologicalInterpretationReport(
+        status="done",
+        clusterInterpretations=[
+            ClusterInterpretation(
+                clusterId="0",
+                proposedIdentity="confident peak-only identity",
+                identityIsHypothesis=False,
+                confidence="high",
+                evidenceIds=[marker.evidenceId],
+            )
+        ],
+    )
+
+    validated = validate_biological_interpretation_report(report, run_context.deps)
+
+    interpretation = validated.clusterInterpretations[0]
+    assert interpretation.identityIsHypothesis is True
+    assert interpretation.confidence == "low"
+    assert any(
+        "ATAC peak markers are descriptive" in value for value in validated.limitations
+    )
 
 
 def test_validator_omits_interpretations_without_marker_evidence() -> None:
@@ -525,7 +601,7 @@ def test_treatment_observation_requires_sample_level_replication() -> None:
         for summary in composition.conditionSummaries
         if summary.clusterId == "0"
     ]
-    with pytest.raises(ModelRetry, match="sample-level composition"):
+    with pytest.raises(ModelRetry, match="independent-unit composition"):
         validate_biological_interpretation_report(report, run_context.deps)
 
 
@@ -562,15 +638,92 @@ def test_valid_treatment_observation_is_canonical_and_descriptive() -> None:
         ),
     )
 
+    with pytest.raises(ModelRetry, match="estimable experimental contrast"):
+        validate_biological_interpretation_report(report, run_context.deps)
+
+    run_context.deps.designHandoff = ExperimentalBiologyHandoff(
+        cellSelection=artifact_model(store.cell_selection),
+        conditionColumn="condition",
+        observationUnit="sample",
+        independentUnit="sample",
+        coefficientScope="betweenUnit",
+        estimability={"status": "ok", "coefficientEstimable": True},
+    )
     validated = validate_biological_interpretation_report(report, run_context.deps)
 
     observation = validated.treatmentObservations[0].observation
     assert observation.startswith(
-        "Cluster 0 has a lower mean sample-level fraction in treated"
+        "Cluster 0 has a lower mean independent-unit fraction in treated"
     )
     assert "caused" not in observation
     assert any("descriptive summaries" in item for item in validated.limitations)
-    assert any("does not establish" in item for item in validated.limitations)
+
+
+def test_treatment_observation_requires_the_aggregated_unit_to_be_independent() -> None:
+    store = FakeStore(replicated=True)
+    run_context = context(store, marker=store.marker)
+    run_context.deps.designHandoff = ExperimentalBiologyHandoff(
+        cellSelection=artifact_model(store.cell_selection),
+        conditionColumn="condition",
+        observationUnit="sample",
+        independentUnit="donor",
+        coefficientScope="betweenUnit",
+        estimability={"status": "ok", "coefficientEstimable": True},
+    )
+    composition = asyncio.run(inspect_cluster_composition(run_context))
+    evidence_ids = [
+        summary.evidenceId
+        for summary in composition.conditionSummaries
+        if summary.clusterId == "0"
+    ]
+    report = BiologicalInterpretationReport(
+        status="needsInput",
+        treatmentObservations=[
+            TreatmentObservation(
+                clusterId="0",
+                referenceCondition="control",
+                comparisonCondition="treated",
+                direction="lower",
+                evidenceIds=evidence_ids,
+            )
+        ],
+        needsInput=BiologicalInterpretationNeedsInput(
+            question="Aggregate by the independent donor unit."
+        ),
+    )
+
+    with pytest.raises(ModelRetry, match="aggregation at the independent unit"):
+        validate_biological_interpretation_report(report, run_context.deps)
+
+    run_context = context(store, marker=store.marker)
+    run_context.deps.sampleColumn = "donor"
+    run_context.deps.designHandoff = ExperimentalBiologyHandoff(
+        cellSelection=artifact_model(store.cell_selection),
+        conditionColumn="condition",
+        observationUnit="sample",
+        independentUnit="donor",
+        coefficientScope="betweenUnit",
+        estimability={"status": "ok", "coefficientEstimable": True},
+    )
+    donor_values = np.full(store.cells.N, "", dtype="<U2")
+    donor_values[store.cells.selected_indices] = np.repeat(
+        ["d1", "d2", "d3", "d4"],
+        4,
+    )
+    store.cells.values["donor"] = donor_values
+    store.cells.columns.append("donor")
+    composition = asyncio.run(inspect_cluster_composition(run_context))
+    evidence_ids = [
+        summary.evidenceId
+        for summary in composition.conditionSummaries
+        if summary.clusterId == "0"
+    ]
+    report.treatmentObservations[0].evidenceIds = evidence_ids
+
+    validated = validate_biological_interpretation_report(report, run_context.deps)
+
+    assert validated.treatmentObservations
+    assert "independent-unit fraction" in validated.treatmentObservations[0].observation
 
 
 def test_treatment_direction_and_condition_names_must_match_evidence() -> None:
@@ -768,5 +921,87 @@ def test_handoff_selection_must_match_exact_cluster_selection() -> None:
         BiologicalInterpretationAgent(object()).run(
             store,
             tuning_handoff=tuning_handoff,
+            marker=store.marker,
+        )
+
+
+def test_integrated_handoff_uses_marker_assay_without_claiming_graph_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scarf.agent import biological_interpretation as module
+
+    store = FakeStore()
+    store.cluster = ArtifactRef(
+        scope="datastore",
+        assay=None,
+        kind="cluster_labels",
+        artifact_id="b" * 64,
+    )
+    store.marker_cluster = store.cluster
+    handoff = TuningBiologyHandoff(
+        fromAssay="RNA",
+        graphAssay=None,
+        markerAssay="RNA",
+        cellSelection=artifact_model(store.cell_selection),
+        recommendedCandidateId="wnn_1",
+        clusterArtifact=ArtifactReferenceModel(
+            scope="datastore",
+            assay=None,
+            kind="cluster_labels",
+            artifactId="b" * 64,
+        ),
+        evidenceIds=["integration:wnn_1:clusters"],
+    )
+
+    def fake_run_agent_sync(**kwargs: object) -> SimpleNamespace:
+        deps = kwargs["deps"]
+        assert isinstance(deps, BiologicalInterpretationDependencies)
+        assert deps.graphAssay is None
+        assert deps.fromAssay == "RNA"
+        assert deps.markerAssay == "RNA"
+        deps.clusterValues = {"0": 0}
+        return SimpleNamespace(
+            output=BiologicalInterpretationReport(
+                status="needsInput",
+                needsInput=BiologicalInterpretationNeedsInput(
+                    question="Inspect markers before interpretation.",
+                    requiredInputs=["markerEvidence"],
+                ),
+            ),
+            runInfo=AgentRunInfo(agentName="biological_interpretation"),
+        )
+
+    monkeypatch.setattr(module, "run_agent_sync", fake_run_agent_sync)
+
+    result = BiologicalInterpretationAgent(object()).run(
+        store,
+        tuning_handoff=handoff,
+        marker=store.marker,
+    )
+
+    assert result.status == "needsInput"
+    assert result.graphAssay is None
+    assert result.markerAssay == "RNA"
+    assert result.clusterArtifact is not None
+    assert result.clusterArtifact.scope == "datastore"
+
+
+def test_integrated_handoff_requires_explicit_marker_assay() -> None:
+    store = FakeStore()
+    handoff = TuningBiologyHandoff(
+        fromAssay="RNA",
+        cellSelection=artifact_model(store.cell_selection),
+        clusterArtifact=ArtifactReferenceModel(
+            scope="datastore",
+            assay=None,
+            kind="cluster_labels",
+            artifactId="b" * 64,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="markerAssay"):
+        BiologicalInterpretationAgent(object()).run(
+            store,
+            tuning_handoff=handoff,
             marker=store.marker,
         )

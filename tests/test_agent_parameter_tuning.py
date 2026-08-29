@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pytest
+from pydantic_ai import UnexpectedModelBehavior
 from pydantic_ai.messages import (
     ModelMessage,
     ModelResponse,
@@ -21,19 +22,32 @@ from scarf.agent.parameter_tuning import (
     ParameterCandidateEvaluation,
     ParameterMetrics,
     ParameterSearchPlan,
+    ParameterTuningAssayInput,
     ParameterTuningAgent,
+    ParameterTuningBatchSearchPlan,
     ParameterTuningDependencies,
     ParameterTuningNeedsInput,
     ParameterTuningReport,
     build_initial_parameter_candidates,
     evaluate_parameter_candidate,
     execute_parameter_candidate,
+    FinalGraphComparison,
+    FinalGraphNeedsInput,
+    FinalGraphSelection,
+    finalize_parameter_tuning_selection,
     get_default_parameter_candidates,
+    IntegrationCandidateEvaluation,
+    IntegrationMetrics,
+    parameter_batch_selection_prompt,
     parameter_search_prompt,
     parameter_search_system_prompt,
     parameter_tuning_prompt,
     parameter_tuning_system_prompt,
+    promote_parameter_candidate,
+    select_final_parameter_graph,
     tune_parameters,
+    tune_parameters_batch,
+    validate_parameter_candidate_rank,
     validate_parameter_search_plan,
     validate_parameter_tuning_report,
 )
@@ -46,12 +60,12 @@ from scarf.agent.types import (
 from scarf.storage.refs import ArtifactRef
 
 
-def _artifact(kind: str, token: int) -> ArtifactRef:
+def _artifact(kind: str, token: int, assay: str = "RNA") -> ArtifactRef:
     return ArtifactRef(
         scope="assay",
         kind=kind,
         artifact_id=f"{token:064x}",
-        assay="RNA",
+        assay=assay,
     )
 
 
@@ -64,7 +78,12 @@ def _cell_selection(token: int = 8) -> ArtifactRef:
 
 
 class _FakeStore:
-    def __init__(self, *, cluster_values: np.ndarray | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        cluster_values: np.ndarray | None = None,
+        normalized_shape: tuple[int, int] = (100, 50),
+    ) -> None:
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
         self.normalized = _artifact("normalized", 1)
         self.cell_selection = _cell_selection()
@@ -73,8 +92,11 @@ class _FakeStore:
             if cluster_values is not None
             else np.asarray([0] * 60 + [1] * 40)
         )
+        self.normalized_shape = normalized_shape
         self._artifacts = {
             "pca": _artifact("reduction", 2),
+            "lsi": _artifact("reduction", 8),
+            "identity": _artifact("reduction", 9),
             "harmony": _artifact("batch_correction", 3),
             "ann": _artifact("ann_index", 4),
             "neighbors": _artifact("neighbors", 5),
@@ -87,7 +109,7 @@ class _FakeStore:
 
     def inspect_artifact(self, normalized: ArtifactRef) -> Any:
         self._record("inspect_artifact", normalized)
-        assert normalized == self.normalized
+        assert normalized.kind == "normalized"
         return SimpleNamespace(
             exists=True,
             complete=True,
@@ -112,6 +134,14 @@ class _FakeStore:
             invalidate_cache=invalidate_cache,
         )
         return self._artifacts["pca"]
+
+    def run_lsi(self, *args: Any, **kwargs: Any) -> ArtifactRef:
+        self._record("run_lsi", *args, **kwargs)
+        return self._artifacts["lsi"]
+
+    def run_custom_reduction(self, *args: Any, **kwargs: Any) -> ArtifactRef:
+        self._record("run_custom_reduction", *args, **kwargs)
+        return self._artifacts["identity"]
 
     def run_harmony(
         self,
@@ -204,8 +234,10 @@ class _FakeStore:
         )
         return self._artifacts["clusters"]
 
-    def load_artifact(self, ref: ArtifactRef) -> dict[str, np.ndarray]:
+    def load_artifact(self, ref: ArtifactRef) -> dict[str, Any]:
         self._record("load_artifact", ref)
+        if ref.kind == "normalized":
+            return {"data": SimpleNamespace(shape=self.normalized_shape)}
         assert ref == self._artifacts["clusters"]
         return {"values": self.cluster_values}
 
@@ -304,6 +336,7 @@ def _dependencies(
         store=store,
         normalized=store.normalized,
         cellSelection=store.cell_selection,
+        normalizedShape=store.normalized_shape,
         fromAssay="RNA",
         candidates={value.candidateId: value for value in candidate_values},
         batchColumns=("batch",),
@@ -332,7 +365,14 @@ def _evaluate(
         ParameterCandidate,
         ParameterMetrics,
         ParameterCandidateEvaluation,
+        FinalGraphComparison,
+        FinalGraphNeedsInput,
+        FinalGraphSelection,
+        IntegrationMetrics,
+        IntegrationCandidateEvaluation,
         ParameterSearchPlan,
+        ParameterTuningBatchSearchPlan,
+        ParameterTuningAssayInput,
         ParameterTuningNeedsInput,
         ParameterTuningReport,
         ParameterTuningDependencies,
@@ -450,7 +490,8 @@ def test_candidate_execution_routes_exact_artifacts_without_state_updates() -> N
     assert result.cellSelection == ArtifactReferenceModel.from_artifact_ref(
         store.cell_selection
     )
-    assert "clusterColumn" not in ParameterCandidateEvaluation.model_fields
+    assert result.clusterColumn == "RNA_agent_tuning_baseline"
+    assert result.clusterLabel == "agent_tuning_baseline"
     assert result.metrics.nClusters == 2
     assert result.metrics.minClusterCells == 40
     assert result.metrics.graphSilhouetteMedian == pytest.approx(0.3)
@@ -536,7 +577,7 @@ def test_candidate_execution_routes_exact_artifacts_without_state_updates() -> N
     )
     assert call_map["metric_cluster_separability"][0] == (
         artifacts["pca"],
-        {"clusters": artifacts["clusters"]},
+        {"RNA_agent_tuning_baseline": artifacts["clusters"]},
     )
     assert call_map["metric_proportional_batch_mixing"][0] == (
         "batch",
@@ -550,6 +591,104 @@ def test_candidate_execution_routes_exact_artifacts_without_state_updates() -> N
         ("cell_type", artifacts["graph"]),
         {},
     )
+
+
+@pytest.mark.parametrize(
+    ("candidate", "expected_call", "artifact_key"),
+    [
+        (
+            ParameterCandidate(
+                candidateId="atac_lsi",
+                reductionMethod="lsi",
+                dimensions=15,
+            ),
+            "run_lsi",
+            "lsi",
+        ),
+        (
+            ParameterCandidate(
+                candidateId="adt_identity",
+                reductionMethod="identity",
+                dimensions=50,
+            ),
+            "run_custom_reduction",
+            "identity",
+        ),
+    ],
+)
+def test_candidate_dispatches_modality_reduction_without_pca_metrics(
+    candidate: ParameterCandidate,
+    expected_call: str,
+    artifact_key: str,
+) -> None:
+    store = _FakeStore()
+    deps = _dependencies(store, candidates=[candidate])
+
+    result = _evaluate(deps, candidate.candidateId)
+
+    assert result.status == "done"
+    assert result.effectiveDimensions == candidate.dimensions
+    assert artifact_key in result.artifacts
+    call_names = [name for name, _args, _kwargs in store.calls]
+    assert expected_call in call_names
+    assert "run_pca" not in call_names
+    assert "metric_cluster_separability" not in call_names
+    assert result.metrics.pcaSilhouette is None
+    if candidate.reductionMethod == "lsi":
+        lsi_kwargs = next(
+            kwargs for name, _args, kwargs in store.calls if name == "run_lsi"
+        )
+        assert lsi_kwargs["skip_first"] is True
+    else:
+        _name, args, _kwargs = next(
+            call for call in store.calls if call[0] == "run_custom_reduction"
+        )
+        np.testing.assert_array_equal(args[0], np.eye(50))
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        ParameterCandidate(candidateId="pca_rank", dimensions=50),
+        ParameterCandidate(
+            candidateId="lsi_rank",
+            reductionMethod="lsi",
+            dimensions=50,
+        ),
+        ParameterCandidate(candidateId="neighbor_rank", neighborsK=100),
+        ParameterCandidate(
+            candidateId="identity_rank",
+            reductionMethod="identity",
+            dimensions=49,
+        ),
+    ],
+)
+def test_rank_invalid_candidates_fail_before_branch_operations(
+    candidate: ParameterCandidate,
+) -> None:
+    store = _FakeStore()
+    deps = _dependencies(store, candidates=[candidate])
+
+    result = _evaluate(deps, candidate.candidateId)
+
+    assert result.status == "failed"
+    assert result.error
+    assert store.calls == []
+
+
+def test_identity_reduction_enforces_feature_limit() -> None:
+    candidate = ParameterCandidate(
+        candidateId="identity",
+        reductionMethod="identity",
+        dimensions=50,
+    )
+
+    with pytest.raises(ValueError, match="at most 32"):
+        validate_parameter_candidate_rank(
+            candidate,
+            (100, 50),
+            identity_feature_limit=32,
+        )
 
 
 def test_duplicate_candidate_returns_recorded_execution_without_rerun() -> None:
@@ -789,6 +928,30 @@ def test_report_validation_uses_only_executed_results_and_artifacts() -> None:
         handoff.clusterArtifact.artifactId
         == evaluation.artifacts["clusters"].artifactId
     )
+
+
+def test_selected_branch_resolution_reuses_exact_artifacts_without_replay() -> None:
+    store = _FakeStore()
+    deps = _dependencies(store)
+    evaluation = _evaluate(deps, "baseline")
+    report = validate_parameter_tuning_report(
+        ParameterTuningReport(
+            status="done",
+            recommendedCandidateId="baseline",
+            evidenceIds=[evaluation.evidenceIds[0]],
+        ),
+        deps,
+    )
+    store.calls.clear()
+
+    promoted = promote_parameter_candidate(
+        store,
+        report=report,
+        normalized=_artifact("normalized", 1),
+    )
+
+    assert promoted.artifacts == evaluation.artifacts
+    assert [name for name, _args, _kwargs in store.calls] == ["inspect_artifact"]
 
 
 def test_report_validation_rejects_unknown_evidence_and_ineligible_choice() -> None:
@@ -1036,6 +1199,194 @@ def test_biology_handoff_requires_selected_cluster_artifact() -> None:
 
     with pytest.raises(ValueError, match="lacks an exact cluster artifact"):
         report.to_biological_handoff()
+
+
+def test_integrated_final_selection_separates_graph_and_marker_assays() -> None:
+    native = ParameterTuningReport.get_example()
+    aggregate = ParameterTuningReport(
+        status="done",
+        fromAssay="RNA",
+        cellSelection=native.cellSelection,
+        assayReports={"RNA": native},
+        recommendedByAssay={"RNA": "baseline"},
+    )
+    integration = IntegrationCandidateEvaluation(
+        integrationId="wnn_1",
+        method="wnn",
+        assays=["RNA", "ADT"],
+        status="done",
+        eligible=True,
+        cellSelection=native.cellSelection,
+        graphArtifact=ArtifactRecord(
+            scope="datastore",
+            kind="integrated_graph",
+            artifactId="8" * 64,
+        ),
+        clusterArtifact=ArtifactRecord(
+            scope="datastore",
+            kind="cluster_labels",
+            artifactId="9" * 64,
+        ),
+        clusterColumn="agent_wnn_cluster",
+        metrics=IntegrationMetrics(
+            nClusters=6,
+            minClusterCells=40,
+            modalityWeightsValid=True,
+        ),
+        evidenceIds=["integration:wnn_1:clusters"],
+    )
+
+    finalized = finalize_parameter_tuning_selection(
+        aggregate,
+        marker_assay="RNA",
+        integration_evaluations=[integration],
+        recommended_integration_id="wnn_1",
+    )
+    handoff = finalized.to_biological_handoff()
+
+    assert finalized.graphAssay is None
+    assert handoff.graphAssay is None
+    assert handoff.markerAssay == "RNA"
+    assert handoff.fromAssay == "RNA"
+    assert handoff.clusterArtifact is not None
+    assert handoff.clusterArtifact.scope == "datastore"
+    assert "clusterColumn" not in type(handoff).model_fields
+
+
+def test_integrated_final_selection_requires_marker_assay() -> None:
+    report = ParameterTuningReport(
+        status="done",
+        cellSelection=ArtifactReferenceModel.from_artifact_ref(_cell_selection()),
+        finalClusterColumn="integrated_cluster",
+        finalClusterArtifact=ArtifactRecord(
+            scope="datastore",
+            kind="cluster_labels",
+            artifactId="9" * 64,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="marker assay"):
+        report.to_biological_handoff()
+
+
+def test_final_graph_selector_uses_one_grounded_provider_request() -> None:
+    native_evaluation = ParameterCandidateEvaluation.get_example()
+    native_evaluation.artifacts["clusters"] = ArtifactRecord(
+        assay="RNA",
+        kind="cluster_labels",
+        artifactId="7" * 64,
+    )
+    rna_report = ParameterTuningReport(
+        status="done",
+        fromAssay="RNA",
+        cellSelection=native_evaluation.cellSelection,
+        evaluations=[native_evaluation],
+        recommendedCandidateId="baseline",
+        evidenceIds=["candidate:baseline:clusters"],
+    )
+    adt_evaluation = native_evaluation.model_copy(
+        update={
+            "clusterColumn": "ADT_agent_tuning_baseline",
+            "artifacts": {
+                **native_evaluation.artifacts,
+                "clusters": ArtifactRecord(
+                    assay="ADT",
+                    kind="cluster_labels",
+                    artifactId="6" * 64,
+                ),
+            },
+        }
+    )
+    adt_report = ParameterTuningReport(
+        status="done",
+        fromAssay="ADT",
+        cellSelection=adt_evaluation.cellSelection,
+        evaluations=[adt_evaluation],
+        recommendedCandidateId="baseline",
+        evidenceIds=["candidate:baseline:clusters"],
+    )
+    report = ParameterTuningReport(
+        status="done",
+        fromAssay="RNA",
+        cellSelection=native_evaluation.cellSelection,
+        assayReports={"RNA": rna_report, "ADT": adt_report},
+        recommendedByAssay={"RNA": "baseline", "ADT": "baseline"},
+    )
+    integration = IntegrationCandidateEvaluation(
+        integrationId="wnn_1",
+        method="wnn",
+        assays=["RNA", "ADT"],
+        status="done",
+        eligible=True,
+        cellSelection=native_evaluation.cellSelection,
+        graphArtifact=ArtifactRecord(
+            scope="datastore",
+            kind="integrated_graph",
+            artifactId="8" * 64,
+        ),
+        clusterArtifact=ArtifactRecord(
+            scope="datastore",
+            kind="cluster_labels",
+            artifactId="9" * 64,
+        ),
+        clusterColumn="agent_wnn_cluster",
+        metrics=IntegrationMetrics(modalityWeightsValid=True),
+        evidenceIds=["integration:wnn_1:clusters"],
+    )
+    model_calls = 0
+
+    async def reply(
+        _messages: list[ModelMessage],
+        info: AgentInfo,
+    ) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        selected_evidence = "integration:wnn_1:clusters"
+        selection = FinalGraphSelection(
+            status="done",
+            selectedOptionId="integration:wnn_1",
+            graphMethod="wnn",
+            integrationId="wnn_1",
+            markerAssay="invented",
+            confidence="medium",
+            rationale="The eligible WNN graph best balances the supplied evidence.",
+            evidenceIds=[selected_evidence],
+            comparisons=[
+                FinalGraphComparison(
+                    optionId=f"native:{assay}:baseline",
+                    summary="The integrated option was preferred to this native graph.",
+                    evidenceIds=[
+                        selected_evidence,
+                        f"native:{assay}:candidate:baseline:clusters",
+                    ],
+                )
+                for assay in ("RNA", "ADT")
+            ],
+        )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name,
+                    args=selection.model_dump(),
+                )
+            ]
+        )
+
+    selected_report = select_final_parameter_graph(
+        model=FunctionModel(reply),
+        report=report,
+        integration_evaluations=[integration],
+        marker_assay="RNA",
+    )
+
+    assert model_calls == 1
+    assert selected_report.finalSelection is not None
+    assert selected_report.finalSelection.runInfo.agentName == (
+        "parameter_tuning_final_graph"
+    )
+    assert selected_report.finalSelection.markerAssay == "RNA"
+    assert selected_report.recommendedIntegrationId == "wnn_1"
+    assert selected_report.finalClusterArtifact == integration.clusterArtifact
 
 
 def test_parameter_tuning_agent_delegates_with_its_model_and_config(
@@ -1322,3 +1673,330 @@ def test_two_pass_tuning_pairs_exact_multicolumn_harmony_and_runs_refinement() -
     assert result.searchPlan.harmonyBatchColumns == ["batch", "site"]
     assert result.searchPlan.runInfo.agentName == "parameter_search_planning"
     assert result.recommendedCandidateId == selected_id
+
+
+def test_batched_tuning_selects_all_assays_in_one_model_request() -> None:
+    model_calls = 0
+
+    async def reply(
+        _messages: list[ModelMessage],
+        info: AgentInfo,
+    ) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        assay_reports = {
+            assay: ParameterTuningReport(
+                status="done",
+                recommendedCandidateId="baseline",
+                confidence="medium",
+                rationale=f"The {assay} baseline is eligible.",
+                evidenceIds=["candidate:baseline:clusters"],
+                stopReason="The authorized branch was evaluated.",
+            )
+            for assay in ("RNA", "ADT")
+        }
+        report = ParameterTuningReport(
+            status="done",
+            assayReports=assay_reports,
+            rationale="Both native modality screens completed.",
+            evidenceIds=["candidate:baseline:clusters"],
+            stopReason="Native selection is complete.",
+        )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name,
+                    args=report.model_dump(),
+                )
+            ]
+        )
+
+    result = tune_parameters_batch(
+        _FakeStore(),
+        model=FunctionModel(reply),
+        assays=[
+            ParameterTuningAssayInput(
+                normalized=_artifact("normalized", 1, "RNA"),
+                candidates=[ParameterCandidate.get_example()],
+                maxCandidates=1,
+            ),
+            ParameterTuningAssayInput(
+                normalized=_artifact("normalized", 10, "ADT"),
+                candidates=[ParameterCandidate.get_example()],
+                maxCandidates=1,
+            ),
+        ],
+        primary_assay="RNA",
+    )
+
+    assert model_calls == 1
+    assert result.status == "done"
+    assert set(result.assayReports) == {"RNA", "ADT"}
+    assert result.recommendedByAssay == {"RNA": "baseline", "ADT": "baseline"}
+    assert result.totalCandidates == 2
+    assert result.fromAssay == "RNA"
+    assert result.runInfo.agentName == "parameter_tuning_batch"
+
+
+def test_batched_refinement_planning_allows_a_validator_retry() -> None:
+    model_calls = 0
+
+    async def reply(
+        _messages: list[ModelMessage],
+        info: AgentInfo,
+    ) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls == 1:
+            output: AgentDataModel = ParameterTuningBatchSearchPlan()
+        elif model_calls == 2:
+            output = ParameterTuningBatchSearchPlan(
+                assayPlans={"RNA": ParameterSearchPlan(status="complete")}
+            )
+        else:
+            output = ParameterTuningReport(
+                status="done",
+                assayReports={
+                    "RNA": ParameterTuningReport(
+                        status="done",
+                        recommendedCandidateId="baseline",
+                        confidence="medium",
+                        rationale="The baseline candidate is eligible.",
+                        evidenceIds=["candidate:baseline:clusters"],
+                        stopReason="The bounded screen completed.",
+                    )
+                },
+                rationale="The RNA native screen completed.",
+                evidenceIds=["candidate:baseline:clusters"],
+                stopReason="Native selection is complete.",
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name,
+                    args=output.model_dump(),
+                )
+            ]
+        )
+
+    result = tune_parameters_batch(
+        _FakeStore(),
+        model=FunctionModel(reply),
+        assays=[
+            ParameterTuningAssayInput(
+                normalized=_artifact("normalized", 1),
+                candidates=[ParameterCandidate.get_example()],
+                maxCandidates=2,
+                maxRefinedCandidates=1,
+            )
+        ],
+        primary_assay="RNA",
+    )
+
+    assert model_calls == 3
+    assert result.status == "done"
+    assert result.recommendedByAssay == {"RNA": "baseline"}
+
+
+def test_batched_tuning_falls_back_after_structured_output_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scarf.agent import parameter_tuning as module
+
+    calls: list[str] = []
+
+    def unavailable_structured_output(**kwargs: Any) -> None:
+        calls.append(kwargs["name"])
+        raise UnexpectedModelBehavior("structured output unavailable")
+
+    monkeypatch.setattr(module, "run_agent_sync", unavailable_structured_output)
+    result = tune_parameters_batch(
+        _FakeStore(),
+        model=object(),
+        assays=[
+            ParameterTuningAssayInput(
+                normalized=_artifact("normalized", 1),
+                candidates=[
+                    ParameterCandidate.get_example(),
+                    ParameterCandidate(candidateId="pca_15", dimensions=15),
+                ],
+                maxCandidates=3,
+                maxRefinedCandidates=1,
+            )
+        ],
+        primary_assay="RNA",
+    )
+
+    assert calls == ["parameter_batch_search_planning", "parameter_tuning_batch"]
+    assert result.status == "done"
+    assert result.recommendedByAssay == {"RNA": "baseline"}
+    assert result.assayReports["RNA"].confidence == "low"
+    assert result.assayReports["RNA"].comparisons[0].candidateId == "pca_15"
+    assert result.searchPlan is not None
+    assert result.searchPlan.status == "complete"
+    assert result.runInfo.agentName == "parameter_tuning_batch_fallback"
+
+
+def test_single_tuning_falls_back_after_structured_output_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scarf.agent import parameter_tuning as module
+
+    def unavailable_structured_output(**_kwargs: Any) -> None:
+        raise UnexpectedModelBehavior("structured output unavailable")
+
+    monkeypatch.setattr(module, "run_agent_sync", unavailable_structured_output)
+    result = tune_parameters(
+        _FakeStore(),
+        model=object(),
+        normalized=_artifact("normalized", 1),
+        candidates=[
+            ParameterCandidate.get_example(),
+            ParameterCandidate(candidateId="pca_15", dimensions=15),
+        ],
+        max_candidates=3,
+        max_refined_candidates=1,
+    )
+
+    assert result.status == "done"
+    assert result.recommendedCandidateId == "baseline"
+    assert result.confidence == "low"
+    assert result.runInfo.agentName == "parameter_tuning_fallback"
+
+
+def test_single_eligible_final_graph_skips_provider_selection() -> None:
+    evaluation = ParameterCandidateEvaluation.get_example()
+    evaluation.artifacts["clusters"] = ArtifactRecord(
+        assay="RNA",
+        kind="cluster_labels",
+        artifactId="7" * 64,
+    )
+    native_report = ParameterTuningReport(
+        status="done",
+        fromAssay="RNA",
+        cellSelection=evaluation.cellSelection,
+        evaluations=[evaluation],
+        recommendedCandidateId="baseline",
+        evidenceIds=["candidate:baseline:clusters"],
+    )
+    report = ParameterTuningReport(
+        status="done",
+        fromAssay="RNA",
+        cellSelection=evaluation.cellSelection,
+        assayReports={"RNA": native_report},
+        recommendedByAssay={"RNA": "baseline"},
+    )
+
+    selected = select_final_parameter_graph(
+        model=object(),
+        report=report,
+        integration_evaluations=[],
+        marker_assay="RNA",
+    )
+
+    assert selected.status == "done"
+    assert selected.finalSelection is not None
+    assert selected.finalSelection.selectedOptionId == "native:RNA:baseline"
+    assert selected.finalSelection.runInfo.agentName == (
+        "parameter_tuning_final_graph_deterministic"
+    )
+
+
+def test_final_graph_retry_exhaustion_pauses_when_multiple_options_exist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scarf.agent import parameter_tuning as module
+
+    reports: dict[str, ParameterTuningReport] = {}
+    for assay, token in (("RNA", "7"), ("ADT", "8")):
+        evaluation = ParameterCandidateEvaluation.get_example().model_copy(
+            update={
+                "clusterColumn": f"{assay}_agent_tuning_baseline",
+                "artifacts": {
+                    "connectivityMap": ArtifactRecord(
+                        assay=assay,
+                        kind="connectivity_map",
+                        artifactId=token * 64,
+                    ),
+                    "clusters": ArtifactRecord(
+                        assay=assay,
+                        kind="cluster_labels",
+                        artifactId=token * 64,
+                    ),
+                },
+            }
+        )
+        reports[assay] = ParameterTuningReport(
+            status="done",
+            fromAssay=assay,
+            cellSelection=evaluation.cellSelection,
+            evaluations=[evaluation],
+            recommendedCandidateId="baseline",
+            evidenceIds=["candidate:baseline:clusters"],
+        )
+    report = ParameterTuningReport(
+        status="done",
+        fromAssay="RNA",
+        cellSelection=next(iter(reports.values())).cellSelection,
+        assayReports=reports,
+        recommendedByAssay={"RNA": "baseline", "ADT": "baseline"},
+    )
+
+    def unavailable_structured_output(**_kwargs: Any) -> None:
+        raise UnexpectedModelBehavior("structured output unavailable")
+
+    monkeypatch.setattr(module, "run_agent_sync", unavailable_structured_output)
+    selected = select_final_parameter_graph(
+        model=object(),
+        report=report,
+        integration_evaluations=[],
+        marker_assay="RNA",
+    )
+
+    assert selected.status == "needsInput"
+    assert selected.needsInput is not None
+    assert selected.needsInput.options == [
+        "native:ADT:baseline",
+        "native:RNA:baseline",
+    ]
+    assert selected.finalSelection is not None
+    assert selected.finalSelection.runInfo.agentName == (
+        "parameter_tuning_final_graph_fallback"
+    )
+
+
+def test_batched_selection_prompt_includes_persisted_resume_directions() -> None:
+    dependencies = {"RNA": _dependencies(_FakeStore(), max_candidates=1)}
+    dependencies["RNA"].evaluations["baseline"] = execute_parameter_candidate(
+        dependencies["RNA"], "baseline"
+    )
+    prompt = parameter_batch_selection_prompt(
+        dependencies,
+        {"RNA": ParameterSearchPlan(status="complete")},
+        "RNA",
+        "Prefer the eligible branch that preserves the trusted label.",
+    )
+
+    assert "Prefer the eligible branch that preserves the trusted label." in prompt
+
+
+def test_batched_tuning_enforces_global_candidate_limit_before_execution() -> None:
+    store = _FakeStore()
+    assays = [
+        ParameterTuningAssayInput(
+            normalized=_artifact("normalized", 1, assay),
+            candidates=[ParameterCandidate.get_example()],
+            maxCandidates=1,
+        )
+        for assay in ("RNA", "ADT")
+    ]
+
+    with pytest.raises(ValueError, match="global limit"):
+        tune_parameters_batch(
+            store,
+            model=object(),
+            assays=assays,
+            max_total_candidates=1,
+        )
+
+    assert store.calls == []

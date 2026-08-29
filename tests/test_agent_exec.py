@@ -238,21 +238,25 @@ def test_agent_artifact_models_round_trip_to_exact_core_references() -> None:
 
 
 def test_usage_limits_are_derived_from_public_config() -> None:
-    limits = get_usage_limits(
-        AgentRunConfig(
-            requestLimit=3,
-            toolCallLimit=4,
-            inputTokenLimit=100,
-            outputTokenLimit=200,
-            totalTokenLimit=250,
-        )
+    config = AgentRunConfig(
+        requestLimit=3,
+        toolCallLimit=4,
+        inputTokenLimit=100,
+        outputTokenLimit=200,
+        totalTokenLimit=250,
     )
+    limits = get_usage_limits(config)
 
     assert limits.request_limit == 3
     assert limits.tool_calls_limit == 4
     assert limits.input_tokens_limit == 100
-    assert limits.output_tokens_limit == 200
+    assert limits.output_tokens_limit == 600
     assert limits.total_tokens_limit == 250
+    assert get_model_settings(config)["max_tokens"] == 200
+    assert (
+        get_usage_limits(AgentRunConfig(outputTokenLimit=None)).output_tokens_limit
+        is None
+    )
 
 
 def test_sync_runner_records_only_function_tool_calls() -> None:
@@ -561,3 +565,39 @@ def test_runner_converts_grounding_errors_into_model_retries() -> None:
 
     assert result.output == ExampleOutput(value="grounded")
     assert requests == 2
+
+
+def test_default_runner_allows_five_output_retries() -> None:
+    requests = 0
+
+    async def reply(
+        _messages: list[ModelMessage],
+        info: AgentInfo,
+    ) -> ModelResponse:
+        nonlocal requests
+        requests += 1
+        value = "invalid" if requests <= 5 else "grounded"
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name,
+                    args={"value": value},
+                )
+            ]
+        )
+
+    def validate_output(output: ExampleOutput) -> ExampleOutput:
+        if output.value != "grounded":
+            raise ValueError("output is not grounded")
+        return output
+
+    result = run_agent_sync(
+        model=FunctionModel(reply),
+        output_type=ExampleOutput,
+        system_prompt="Return grounded output.",
+        user_prompt="Return now.",
+        output_validator=validate_output,
+    )
+
+    assert result.output == ExampleOutput(value="grounded")
+    assert requests == 6

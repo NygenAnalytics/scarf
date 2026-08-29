@@ -1,5 +1,6 @@
 """Value-selection contracts shared by analysis and presentation layers."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -8,8 +9,12 @@ import pandas as pd
 
 from ..storage.artifacts import ArtifactRef, artifact_group, inspect_artifact
 from ..storage.selections import read_stored_selection_indices
-from .artifacts import artifact_values
-from .rows import read_metadata_missing_rows, read_metadata_rows
+from ..storage.types import as_zarr_array
+from .rows import (
+    read_array_rows_chunkwise,
+    read_metadata_missing_rows,
+    read_metadata_rows,
+)
 
 LookupBy = Literal["name", "id", "index"]
 FeatureReduction = Literal["mean", "sum"]
@@ -28,10 +33,13 @@ __all__ = [
     "NormalizationSpec",
     "NormSource",
     "NormTransform",
+    "NamedCellArtifact",
+    "ResolvedCellArtifact",
     "ResolvedGrouping",
     "Standardize",
     "StudyDesign",
     "grouping_value_name",
+    "resolve_cell_aligned_artifact",
     "resolve_grouping",
     "valid_category_mask",
 ]
@@ -134,6 +142,35 @@ class CellField:
 
 
 @dataclass(frozen=True, slots=True)
+class NamedCellArtifact:
+    """One semantic name bound to an exact cell-aligned artifact."""
+
+    name: str
+    artifact: ArtifactRef
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("Named cell artifacts require a non-empty name")
+        if self.name != self.name.strip():
+            raise ValueError(
+                "Named cell artifact names cannot have surrounding whitespace"
+            )
+        if not isinstance(self.artifact, ArtifactRef):
+            raise TypeError("Named cell artifacts require an ArtifactRef")
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedCellArtifact:
+    """Artifact values aligned to one validated cell selection."""
+
+    source: ArtifactRef
+    values: np.ndarray
+    cell_idx: np.ndarray
+    source_cell_selection: ArtifactRef
+    cell_selection: ArtifactRef
+
+
+@dataclass(frozen=True, slots=True)
 class ResolvedGrouping:
     """Categorical labels aligned to exact physical cell rows."""
 
@@ -163,6 +200,81 @@ def _selection_indices(root: Any, selection: ArtifactRef) -> np.ndarray:
         assay=None,
         table_path="cellData",
     ).astype(np.int64, copy=False)
+
+
+def resolve_cell_aligned_artifact(
+    root: Any,
+    artifact: ArtifactRef,
+    *,
+    cell_selection: ArtifactRef | None = None,
+    value_name: str = "values",
+    expected_kind: str | None = None,
+) -> ResolvedCellArtifact:
+    """Read one artifact vector in the exact requested cell order."""
+    if not isinstance(artifact, ArtifactRef):
+        raise TypeError("artifact must be an ArtifactRef")
+    if expected_kind is not None and artifact.kind != expected_kind:
+        raise ValueError(
+            f"Expected a {expected_kind!r} artifact, received {artifact.kind!r}"
+        )
+    if not isinstance(value_name, str) or not value_name:
+        raise ValueError("value_name must be a non-empty string")
+
+    status = inspect_artifact(root, artifact)
+    if not status.exists or not status.complete:
+        raise ValueError("Cell-aligned artifact is unavailable or incomplete")
+    raw_selection = (status.inputs or {}).get("cell_selection")
+    if not isinstance(raw_selection, Mapping):
+        raise ValueError("Cell-aligned artifact has no cell-selection input")
+    try:
+        source_selection = ArtifactRef.from_dict(raw_selection)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Cell-aligned artifact cell selection is malformed") from exc
+    source_idx = _selection_indices(root, source_selection)
+
+    target_selection = source_selection if cell_selection is None else cell_selection
+    if not isinstance(target_selection, ArtifactRef):
+        raise TypeError("cell_selection must be an ArtifactRef")
+    target_idx = (
+        source_idx
+        if target_selection == source_selection
+        else _selection_indices(root, target_selection)
+    )
+    if target_selection == source_selection:
+        compact_idx = np.arange(len(source_idx), dtype=np.int64)
+    else:
+        compact_idx = np.searchsorted(source_idx, target_idx).astype(
+            np.int64,
+            copy=False,
+        )
+        in_bounds = compact_idx < len(source_idx)
+        if not bool(in_bounds.all()):
+            raise ValueError(
+                "cell_selection must be a subset of the artifact cell selection"
+            )
+        if not np.array_equal(source_idx[compact_idx], target_idx):
+            raise ValueError(
+                "cell_selection must be a subset of the artifact cell selection"
+            )
+
+    group = artifact_group(root, artifact)
+    if value_name not in group:
+        raise ValueError(f"Cell-aligned artifact has no {value_name!r} value array")
+    values_array = as_zarr_array(group[value_name], name=value_name)
+    if values_array.ndim != 1 or int(values_array.shape[0]) != len(source_idx):
+        raise ValueError(
+            "Cell-aligned artifact must contain one value per source-selected cell"
+        )
+    values = read_array_rows_chunkwise(values_array, compact_idx)
+    if values.shape != (len(target_idx),):
+        raise ValueError("Cell-aligned artifact values do not match the selection")
+    return ResolvedCellArtifact(
+        source=artifact,
+        values=values,
+        cell_idx=target_idx,
+        source_cell_selection=source_selection,
+        cell_selection=target_selection,
+    )
 
 
 def resolve_grouping(
@@ -199,39 +311,19 @@ def resolve_grouping(
     if not isinstance(grouping, ArtifactRef):
         raise TypeError("grouping must be an ArtifactRef or CellField")
     value_name = grouping_value_name(grouping.kind)
-    status = inspect_artifact(root, grouping)
-    if not status.complete:
-        raise ValueError("Grouping artifact is unavailable or incomplete")
-    raw_selection = (status.inputs or {}).get("cell_selection")
-    if not isinstance(raw_selection, dict):
-        raise ValueError("Grouping artifact has no cell-selection input")
-    stored_selection = ArtifactRef.from_dict(raw_selection)
-    stored_idx = _selection_indices(root, stored_selection)
-    labels = np.asarray(artifact_values(artifact_group(root, grouping), value_name))
-    if labels.shape != (len(stored_idx),):
-        raise ValueError("Grouping labels do not align with selected cells")
-
-    resolved_selection = stored_selection
-    cell_idx = stored_idx
-    if cell_selection is not None and cell_selection != stored_selection:
-        requested_idx = _selection_indices(root, cell_selection)
-        keep = np.isin(stored_idx, requested_idx, assume_unique=True)
-        if int(keep.sum()) != len(requested_idx):
-            raise ValueError("cell_selection must be a subset of the grouping artifact")
-        selected_idx = stored_idx[keep]
-        if not np.array_equal(selected_idx, requested_idx):
-            raise ValueError(
-                "cell_selection must preserve the grouping artifact's cell order"
-            )
-        labels = labels[keep]
-        cell_idx = selected_idx
-        resolved_selection = cell_selection
+    resolved = resolve_cell_aligned_artifact(
+        root,
+        grouping,
+        cell_selection=cell_selection,
+        value_name=value_name,
+        expected_kind=grouping.kind,
+    )
 
     return ResolvedGrouping(
         source=grouping,
-        labels=labels,
-        cell_idx=cell_idx,
-        cell_selection=resolved_selection,
+        labels=resolved.values,
+        cell_idx=resolved.cell_idx,
+        cell_selection=resolved.cell_selection,
         missing_mask=None,
     )
 
