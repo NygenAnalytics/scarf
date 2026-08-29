@@ -9,6 +9,8 @@ from typing import Any, cast
 import zarr
 
 from ...datastore.datastore import DataStore
+from ...utils.logging import logger
+from .. import record_io
 from ..ingest import IngestResult, detect_format, ingest
 from ..persistence import (
     AgentWorkflowRun,
@@ -17,29 +19,12 @@ from ..persistence import (
     load_agent_report,
     load_agent_workflow,
 )
+from . import journal
 from .context import ContextStagesMixin
 from .finalization import FinalizationStagesMixin
-from .journal import (
-    _ensure_orchestration_store,
-    _join_key,
-    _load_terminal_result,
-    _parent_link,
-    _persist_terminal_result,
-    _read_model,
-    _record_checksum,
-    _request_key,
-    _resume_answer_errors,
-    _resume_key,
-    _sha256_model,
-    _stage_outcome_resolves,
-    _stage_outcomes,
-    _stage_starts,
-    _validated_done_outcome,
-    _validated_resume_record,
-    _write_model_once,
-    paused_or_failed_result,
-)
 from .models import (
+    _RUN_ID_PATTERN,
+    _STAGE_ORDER,
     AutomatedPreprocessingPlan,
     AutomatedWorkflowConfig,
     AutomatedWorkflowRequest,
@@ -53,8 +38,6 @@ from .models import (
     WorkflowQuestion,
     WorkflowStageAttempt,
     WorkflowStageName,
-    _RUN_ID_PATTERN,
-    _STAGE_ORDER,
 )
 from .preprocessing import PreprocessingStagesMixin
 from .tuning import TuningStagesMixin
@@ -80,7 +63,14 @@ class AgentOrchestrator(
     def run(self, request: AutomatedWorkflowRequest) -> AutomatedWorkflowResult:
         """Ingest the request and continue until completion or a persisted pause."""
         format_name = detect_format(request.sourcePath)
+        logger.info(
+            f"Starting automated agent workflow from {format_name!r} input "
+            f"(workspace={request.workspace is not None})"
+        )
         if request.workspace is not None and format_name != "zarr":
+            logger.warning(
+                "Automated agent workflow rejected a workspace for a converted input"
+            )
             return AutomatedWorkflowResult(
                 status="failed",
                 currentStage="ingest",
@@ -93,6 +83,9 @@ class AgentOrchestrator(
             source_path = Path(request.sourcePath).resolve()
             requested_path = Path(request.zarrPath).resolve()
             if source_path != requested_path:
+                logger.warning(
+                    "Automated agent workflow rejected an implicit Zarr copy"
+                )
                 return AutomatedWorkflowResult(
                     status="failed",
                     currentStage="ingest",
@@ -104,6 +97,10 @@ class AgentOrchestrator(
             try:
                 store = self.open_store(zarr_path, effective_request)
             except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+                logger.error(
+                    "Opening the automated workflow workspace failed "
+                    f"({type(exc).__name__})"
+                )
                 return AutomatedWorkflowResult(
                     status="failed",
                     currentStage="ingest",
@@ -131,6 +128,10 @@ class AgentOrchestrator(
             effective_request = request.model_copy(
                 update={"zarrPath": ingest_result.zarrPath}
             )
+        logger.info(
+            f"Automated workflow ingest returned status={ingest_result.status!r}, "
+            f"format={ingest_result.format!r}, assays={len(ingest_result.assayNames)}"
+        )
         if ingest_result.status != "done" or ingest_result.zarrPath is None:
             needs_input = None
             if ingest_result.needsInput is not None:
@@ -155,8 +156,12 @@ class AgentOrchestrator(
         if not (format_name == "zarr" and request.workspace is not None):
             store = self.open_store(ingest_result.zarrPath, effective_request)
         workflow = ingest_result.workflowRun or create_agent_workflow(store)
+        logger.info(
+            f"Continuing automated workflow {workflow.workflowRunId} with "
+            f"{len(store.assay_names)} datastore assays"
+        )
         request_record = self.initialize_request(store, workflow, effective_request)
-        prefix = _ensure_orchestration_store(store)
+        prefix = journal._ensure_orchestration_store(store)
         self.record_ingest_stage(
             store,
             prefix,
@@ -176,6 +181,10 @@ class AgentOrchestrator(
         request: AutomatedWorkflowResumeRequest,
     ) -> AutomatedWorkflowResult:
         """Resume a running workflow after validating its immutable request."""
+        logger.info(
+            f"Resuming automated workflow {request.workflowRunId} with "
+            f"{len(request.answers)} answer field(s)"
+        )
         record, store = self.load_request_for_resume(request)
         workflow = load_agent_workflow(
             store,
@@ -183,24 +192,28 @@ class AgentOrchestrator(
             workspace=request.workspace,
         )
         if workflow.status != "running":
-            prefix = _ensure_orchestration_store(store)
-            if _load_terminal_result(store, prefix, workflow) is not None:
+            logger.warning(
+                f"Automated workflow {workflow.workflowRunId} cannot resume from "
+                f"status={workflow.status!r}"
+            )
+            prefix = journal._ensure_orchestration_store(store)
+            if journal._load_terminal_result(store, prefix, workflow) is not None:
                 raise RuntimeError(
                     f"Cannot resume a workflow with status {workflow.status!r}"
                 )
             return self.repair_terminal_result(store, workflow, record)
-        prefix = _ensure_orchestration_store(store)
+        prefix = journal._ensure_orchestration_store(store)
         outcomes = [
             outcome
             for stage in _STAGE_ORDER
-            for outcome in _stage_outcomes(
+            for outcome in journal._stage_outcomes(
                 store.zw, prefix, workflow.workflowRunId, stage
             )
         ]
         starts = [
             started
             for stage in _STAGE_ORDER
-            for started in _stage_starts(
+            for started in journal._stage_starts(
                 store.zw, prefix, workflow.workflowRunId, stage
             )
         ]
@@ -212,6 +225,11 @@ class AgentOrchestrator(
             for started in starts
             if (started.stage, started.attemptId) not in completed_attempt_ids
         ]
+        logger.info(
+            f"Workflow {workflow.workflowRunId} resume scan found "
+            f"{len(outcomes)} outcome(s) and {len(interrupted_starts)} "
+            "interrupted attempt(s)"
+        )
         latest_outcome = (
             max(
                 outcomes,
@@ -247,7 +265,7 @@ class AgentOrchestrator(
             and latest_interrupted.stage == latest_outcome.stage
             and isinstance(interrupted_lineage, Mapping)
             and interrupted_lineage.get("answeredAttempt")
-            == _parent_link(latest_outcome).model_dump(mode="json")
+            == journal._parent_link(latest_outcome).model_dump(mode="json")
         )
         active_interrupted = (
             latest_interrupted
@@ -288,7 +306,7 @@ class AgentOrchestrator(
                     or _RUN_ID_PATTERN.fullmatch(inherited_resume_id) is None
                 ):
                     raise ValueError("Interrupted stage resumeId is malformed")
-                inherited_resume = _validated_resume_record(
+                inherited_resume = journal._validated_resume_record(
                     store,
                     prefix,
                     workflow.workflowRunId,
@@ -312,7 +330,7 @@ class AgentOrchestrator(
                     )
                 effective_answers = dict(inherited_resume.answers)
         answered_attempt = (
-            _parent_link(latest_paused) if latest_paused is not None else None
+            journal._parent_link(latest_paused) if latest_paused is not None else None
         )
         question_ids = (
             [question.questionId for question in latest_paused.needsInput.questions]
@@ -335,17 +353,27 @@ class AgentOrchestrator(
             answers=effective_answers,
         )
         resume_record = resume_record.model_copy(
-            update={"contentSha256": _record_checksum(resume_record)}
+            update={"contentSha256": journal._record_checksum(resume_record)}
         )
-        _write_model_once(
+        journal._write_model_once(
             store.zw,
-            _resume_key(prefix, workflow.workflowRunId, resume_record.resumeId),
+            journal._resume_key(prefix, workflow.workflowRunId, resume_record.resumeId),
             resume_record,
         )
+        logger.info(
+            f"Persisted resume {resume_record.resumeId} for workflow "
+            f"{workflow.workflowRunId} (questions={len(question_ids)})"
+        )
         if latest_paused is not None:
-            answer_errors = _resume_answer_errors(latest_paused, effective_answers)
+            answer_errors = journal._resume_answer_errors(
+                latest_paused, effective_answers
+            )
             if answer_errors:
-                result = paused_or_failed_result(
+                logger.warning(
+                    f"Resume answers for workflow {workflow.workflowRunId} did not "
+                    "satisfy the persisted questions"
+                )
+                result = journal.paused_or_failed_result(
                     store,
                     workflow,
                     record,
@@ -355,7 +383,7 @@ class AgentOrchestrator(
                     update={"notes": [*result.notes, *answer_errors]}
                 )
                 return result.model_copy(
-                    update={"contentSha256": _record_checksum(result)}
+                    update={"contentSha256": journal._record_checksum(result)}
                 )
         return self._continue(
             store,
@@ -372,6 +400,7 @@ class AgentOrchestrator(
         message: str = "Automated workflow cancelled by the caller",
     ) -> AutomatedWorkflowResult:
         """Finalize one running automated workflow as abandoned."""
+        logger.info(f"Cancelling automated workflow {request.workflowRunId}")
         record, store = self.load_request_for_resume(request)
         workflow = load_agent_workflow(
             store,
@@ -379,10 +408,10 @@ class AgentOrchestrator(
             workspace=request.workspace,
         )
         if workflow.status != "running":
-            prefix = _ensure_orchestration_store(store)
+            prefix = journal._ensure_orchestration_store(store)
             if (
                 workflow.status == "abandoned"
-                and _load_terminal_result(store, prefix, workflow) is None
+                and journal._load_terminal_result(store, prefix, workflow) is None
             ):
                 return self.repair_terminal_result(store, workflow, record)
             raise RuntimeError(
@@ -394,11 +423,11 @@ class AgentOrchestrator(
             status="abandoned",
             message=message,
         )
-        prefix = _ensure_orchestration_store(store)
+        prefix = journal._ensure_orchestration_store(store)
         observed = [
             outcome
             for stage in _STAGE_ORDER
-            for outcome in _stage_outcomes(
+            for outcome in journal._stage_outcomes(
                 store.zw, prefix, workflow.workflowRunId, stage
             )
         ]
@@ -415,8 +444,14 @@ class AgentOrchestrator(
             reportReferences=list(terminal.reports),
             notes=[message],
         )
-        result = result.model_copy(update={"contentSha256": _record_checksum(result)})
-        return _persist_terminal_result(store, prefix, terminal, result)
+        result = result.model_copy(
+            update={"contentSha256": journal._record_checksum(result)}
+        )
+        logger.info(
+            f"Automated workflow {workflow.workflowRunId} was abandoned at "
+            f"stage={current_stage!r}"
+        )
+        return journal._persist_terminal_result(store, prefix, terminal, result)
 
     def open_store(
         self,
@@ -443,9 +478,9 @@ class AgentOrchestrator(
         workflow: AgentWorkflowRun,
         request: AutomatedWorkflowRequest,
     ) -> OrchestrationRequestRecord:
-        prefix = _ensure_orchestration_store(store)
-        request_checksum = _sha256_model(request)
-        config_checksum = _sha256_model(self.config)
+        prefix = journal._ensure_orchestration_store(store)
+        request_checksum = journal._sha256_model(request)
+        config_checksum = journal._sha256_model(self.config)
         record = OrchestrationRequestRecord(
             workflowRunId=workflow.workflowRunId,
             createdAtNs=time.time_ns(),
@@ -454,11 +489,16 @@ class AgentOrchestrator(
             requestSha256=request_checksum,
             configSha256=config_checksum,
         )
-        record = record.model_copy(update={"contentSha256": _record_checksum(record)})
-        _write_model_once(
+        record = record.model_copy(
+            update={"contentSha256": journal._record_checksum(record)}
+        )
+        journal._write_model_once(
             store.zw,
-            _request_key(prefix, workflow.workflowRunId),
+            journal._request_key(prefix, workflow.workflowRunId),
             record,
+        )
+        logger.debug(
+            f"Persisted immutable request for workflow {workflow.workflowRunId}"
         )
         return record
 
@@ -466,17 +506,18 @@ class AgentOrchestrator(
         self,
         request: AutomatedWorkflowResumeRequest,
     ) -> tuple[OrchestrationRequestRecord, DataStore]:
+        logger.debug(f"Loading immutable request for workflow {request.workflowRunId}")
         root = zarr.open_group(request.zarrPath, mode="r")
         active = root if request.workspace is None else root[request.workspace]
         if not isinstance(active, zarr.Group):
             raise ValueError("The requested workspace is not a Zarr group")
         root_path = str(getattr(active, "path", "")).strip("/")
-        prefix = _join_key(root_path, "agents", "orchestrations")
+        prefix = record_io.join_key(root_path, "agents", "orchestrations")
         record = cast(
             OrchestrationRequestRecord,
-            _read_model(
+            journal._read_model(
                 active,
-                _request_key(prefix, request.workflowRunId),
+                journal._request_key(prefix, request.workflowRunId),
                 OrchestrationRequestRecord,
             ),
         )
@@ -489,11 +530,11 @@ class AgentOrchestrator(
             raise ValueError("Resume zarrPath does not match the stored request")
         if record.request.workspace != request.workspace:
             raise ValueError("Resume workspace does not match the stored request")
-        if record.requestSha256 != _sha256_model(record.request):
+        if record.requestSha256 != journal._sha256_model(record.request):
             raise ValueError("Stored orchestration request checksum is invalid")
-        if record.configSha256 != _sha256_model(record.config):
+        if record.configSha256 != journal._sha256_model(record.config):
             raise ValueError("Stored orchestration config checksum is invalid")
-        if record.contentSha256 != _record_checksum(record):
+        if record.contentSha256 != journal._record_checksum(record):
             raise ValueError("Stored orchestration request envelope is invalid")
         store = self.open_store(request.zarrPath, record.request)
         return record, store
@@ -505,15 +546,22 @@ class AgentOrchestrator(
         request_record: OrchestrationRequestRecord,
     ) -> AutomatedWorkflowResult:
         """Load or reconstruct the JSON result after terminal finalization."""
-        prefix = _ensure_orchestration_store(store)
-        existing = _load_terminal_result(store, prefix, workflow)
+        prefix = journal._ensure_orchestration_store(store)
+        existing = journal._load_terminal_result(store, prefix, workflow)
         if existing is not None:
+            logger.debug(
+                f"Loaded terminal result for workflow {workflow.workflowRunId}"
+            )
             return existing
+
+        logger.warning(
+            f"Repairing missing terminal result for workflow {workflow.workflowRunId}"
+        )
 
         observed = [
             outcome
             for stage in _STAGE_ORDER
-            for outcome in _stage_outcomes(
+            for outcome in journal._stage_outcomes(
                 store.zw,
                 prefix,
                 workflow.workflowRunId,
@@ -535,7 +583,7 @@ class AgentOrchestrator(
                 stage_index = _STAGE_ORDER.index(current.stage)
                 if current.stage in chain:
                     raise ValueError("Stage lineage contains a cycle")
-                if not _stage_outcome_resolves(
+                if not journal._stage_outcome_resolves(
                     store,
                     prefix,
                     workflow.workflowRunId,
@@ -631,8 +679,10 @@ class AgentOrchestrator(
             finalAnalysis=final_analysis,
             notes=notes,
         )
-        result = result.model_copy(update={"contentSha256": _record_checksum(result)})
-        return _persist_terminal_result(store, prefix, workflow, result)
+        result = result.model_copy(
+            update={"contentSha256": journal._record_checksum(result)}
+        )
+        return journal._persist_terminal_result(store, prefix, workflow, result)
 
     def _continue(
         self,
@@ -644,8 +694,9 @@ class AgentOrchestrator(
         resume_record: OrchestrationResumeRecord | None = None,
     ) -> AutomatedWorkflowResult:
         """Continue the stage machine from the latest validated checkpoint."""
-        prefix = _ensure_orchestration_store(store)
-        ingest_outcome = _validated_done_outcome(
+        logger.info(f"Running stage sequence for workflow {workflow.workflowRunId}")
+        prefix = journal._ensure_orchestration_store(store)
+        ingest_outcome = journal._validated_done_outcome(
             store,
             prefix,
             workflow.workflowRunId,
@@ -655,7 +706,7 @@ class AgentOrchestrator(
         )
         if ingest_outcome is None:
             raise RuntimeError("The persisted ingest stage is missing")
-        parents = [_parent_link(ingest_outcome)]
+        parents = [journal._parent_link(ingest_outcome)]
 
         enrichment_outcome, enrichment = self.data_enrichment_stage(
             store,
@@ -666,13 +717,13 @@ class AgentOrchestrator(
             resume_record=resume_record,
         )
         if enrichment_outcome.status != "done":
-            return paused_or_failed_result(
+            return journal.paused_or_failed_result(
                 store,
                 workflow,
                 request_record,
                 enrichment_outcome,
             )
-        parents = [_parent_link(enrichment_outcome)]
+        parents = [journal._parent_link(enrichment_outcome)]
 
         hto_outcome = self._hto_stage(
             store,
@@ -683,13 +734,13 @@ class AgentOrchestrator(
             resume_record=resume_record,
         )
         if hto_outcome.status != "done":
-            return paused_or_failed_result(
+            return journal.paused_or_failed_result(
                 store,
                 workflow,
                 request_record,
                 hto_outcome,
             )
-        parents = [_parent_link(hto_outcome)]
+        parents = [journal._parent_link(hto_outcome)]
 
         context_outcome, experimental = self.experimental_context_stage(
             store,
@@ -702,13 +753,13 @@ class AgentOrchestrator(
             resume_record=resume_record,
         )
         if context_outcome.status != "done":
-            return paused_or_failed_result(
+            return journal.paused_or_failed_result(
                 store,
                 workflow,
                 request_record,
                 context_outcome,
             )
-        parents = [_parent_link(context_outcome)]
+        parents = [journal._parent_link(context_outcome)]
 
         plan_outcome, preprocessing_plan = self.preprocessing_plan_stage(
             store,
@@ -722,14 +773,14 @@ class AgentOrchestrator(
             resume_record=resume_record,
         )
         if plan_outcome.status != "done":
-            return paused_or_failed_result(
+            return journal.paused_or_failed_result(
                 store,
                 workflow,
                 request_record,
                 plan_outcome,
                 preprocessing_plan=preprocessing_plan,
             )
-        parents = [_parent_link(plan_outcome)]
+        parents = [journal._parent_link(plan_outcome)]
 
         preprocessing_outcome, preprocessed = self.preprocessing_stage(
             store,
@@ -741,14 +792,14 @@ class AgentOrchestrator(
             resume_record=resume_record,
         )
         if preprocessing_outcome.status != "done":
-            return paused_or_failed_result(
+            return journal.paused_or_failed_result(
                 store,
                 workflow,
                 request_record,
                 preprocessing_outcome,
                 preprocessing_plan=preprocessing_plan,
             )
-        parents = [_parent_link(preprocessing_outcome)]
+        parents = [journal._parent_link(preprocessing_outcome)]
 
         tuning_outcome, tuning_report = self.parameter_tuning_stage(
             store,
@@ -764,14 +815,14 @@ class AgentOrchestrator(
             resume_record=resume_record,
         )
         if tuning_outcome.status != "done":
-            return paused_or_failed_result(
+            return journal.paused_or_failed_result(
                 store,
                 workflow,
                 request_record,
                 tuning_outcome,
                 preprocessing_plan=preprocessing_plan,
             )
-        parents = [_parent_link(tuning_outcome)]
+        parents = [journal._parent_link(tuning_outcome)]
 
         finalization_outcome, final_analysis = self.analysis_finalization_stage(
             store,
@@ -785,14 +836,14 @@ class AgentOrchestrator(
             resume_record=resume_record,
         )
         if finalization_outcome.status != "done":
-            return paused_or_failed_result(
+            return journal.paused_or_failed_result(
                 store,
                 workflow,
                 request_record,
                 finalization_outcome,
                 preprocessing_plan=preprocessing_plan,
             )
-        parents = [_parent_link(finalization_outcome)]
+        parents = [journal._parent_link(finalization_outcome)]
 
         biology_outcome = self.biological_interpretation_stage(
             store,
@@ -810,7 +861,7 @@ class AgentOrchestrator(
             resume_record=resume_record,
         )
         if biology_outcome.status != "done":
-            return paused_or_failed_result(
+            return journal.paused_or_failed_result(
                 store,
                 workflow,
                 request_record,
@@ -836,6 +887,10 @@ class AgentOrchestrator(
             notes=["Automated analysis completed"],
         )
         completed = completed.model_copy(
-            update={"contentSha256": _record_checksum(completed)}
+            update={"contentSha256": journal._record_checksum(completed)}
         )
-        return _persist_terminal_result(store, prefix, terminal, completed)
+        logger.info(
+            f"Automated workflow {workflow.workflowRunId} completed with "
+            f"{len(terminal.reports)} report(s)"
+        )
+        return journal._persist_terminal_result(store, prefix, terminal, completed)

@@ -1,7 +1,6 @@
 """Immutable orchestration journal and stage lifecycle operations."""
 
 import hashlib
-import json
 import re
 import time
 import uuid
@@ -10,9 +9,11 @@ from typing import Any, Literal, cast
 
 import zarr
 from zarr.core.buffer import default_buffer_prototype
-from zarr.core.sync import collect_aiterator, sync
+from zarr.core.sync import sync
 
 from ...datastore.datastore import DataStore
+from ...utils.logging import logger
+from .. import record_io
 from ..persistence import (
     AgentInvocation,
     AgentName,
@@ -29,6 +30,9 @@ from ..persistence import (
 )
 from ..types import AgentDataModel, ArtifactReferenceModel
 from .models import (
+    _ORCHESTRATION_FORMAT,
+    _ORCHESTRATION_VERSION,
+    _STAGE_ORDER,
     AutomatedPreprocessingPlan,
     AutomatedWorkflowResult,
     AutomatedWorkflowStatus,
@@ -39,75 +43,42 @@ from .models import (
     WorkflowStageAttempt,
     WorkflowStageLink,
     WorkflowStageName,
-    _ORCHESTRATION_FORMAT,
-    _ORCHESTRATION_VERSION,
-    _STAGE_ORDER,
     artifact_model_to_ref,
 )
 
 
-def _canonical_json_bytes(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-
-
-def _display_json_bytes(value: Any) -> bytes:
-    return (
-        json.dumps(
-            value,
-            sort_keys=True,
-            indent=2,
-            ensure_ascii=False,
-            allow_nan=False,
-        )
-        + "\n"
-    ).encode("utf-8")
-
-
 def _sha256_model(value: AgentDataModel) -> str:
     return hashlib.sha256(
-        _canonical_json_bytes(value.model_dump(mode="json"))
+        record_io.canonical_json_bytes(value.model_dump(mode="json"))
     ).hexdigest()
 
 
 def _record_checksum(value: AgentDataModel) -> str:
     return hashlib.sha256(
-        _canonical_json_bytes(value.model_dump(mode="json", exclude={"contentSha256"}))
+        record_io.canonical_json_bytes(
+            value.model_dump(mode="json", exclude={"contentSha256"})
+        )
     ).hexdigest()
 
 
-def _join_key(*parts: str) -> str:
-    return "/".join(part.strip("/") for part in parts if part.strip("/"))
-
-
-def _read_key(group: zarr.Group, key: str) -> bytes | None:
-    value = sync(group.store.get(key, prototype=default_buffer_prototype()))
-    return None if value is None else value.to_bytes()
-
-
 def _write_key_once(group: zarr.Group, key: str, payload: bytes) -> None:
-    if _read_key(group, key) is not None:
+    if record_io.read_key(group, key) is not None:
         raise FileExistsError(f"Immutable orchestration record {key!r} exists")
     buffer = default_buffer_prototype().buffer.from_bytes(payload)
     sync(group.store.set_if_not_exists(key, buffer))
-    if _read_key(group, key) != payload:
+    if record_io.read_key(group, key) != payload:
         raise FileExistsError(f"Immutable orchestration record {key!r} raced")
 
 
 def _list_keys(group: zarr.Group, prefix: str) -> list[str]:
     if not group.store.supports_listing:
         raise NotImplementedError("Orchestration persistence requires listing")
-    return sorted(collect_aiterator(group.store.list_prefix(f"{prefix.rstrip('/')}/")))
+    return record_io.list_keys(group, prefix)
 
 
 def _orchestration_prefix(store: DataStore) -> str:
     root_path = str(getattr(store.zw, "path", "")).strip("/")
-    return _join_key(root_path, "agents", "orchestrations")
+    return record_io.join_key(root_path, "agents", "orchestrations")
 
 
 def _ensure_orchestration_store(store: DataStore) -> str:
@@ -129,6 +100,7 @@ def _ensure_orchestration_store(store: DataStore) -> str:
                 "format_version": _ORCHESTRATION_VERSION,
             },
         )
+        logger.info("Initialized the automated workflow orchestration journal")
     node = agents["orchestrations"]
     if not isinstance(node, zarr.Group):
         raise ValueError("The orchestrations namespace must be a Zarr group")
@@ -141,11 +113,16 @@ def _ensure_orchestration_store(store: DataStore) -> str:
 
 
 def _request_key(prefix: str, workflow_run_id: str) -> str:
-    return _join_key(prefix, workflow_run_id, "request.json")
+    return record_io.join_key(prefix, workflow_run_id, "request.json")
 
 
 def _resume_key(prefix: str, workflow_run_id: str, resume_id: str) -> str:
-    return _join_key(prefix, workflow_run_id, "resumes", f"{resume_id}.json")
+    return record_io.join_key(
+        prefix,
+        workflow_run_id,
+        "resumes",
+        f"{resume_id}.json",
+    )
 
 
 def _stage_prefix(
@@ -153,7 +130,7 @@ def _stage_prefix(
     workflow_run_id: str,
     stage: WorkflowStageName,
 ) -> str:
-    return _join_key(prefix, workflow_run_id, "stages", stage)
+    return record_io.join_key(prefix, workflow_run_id, "stages", stage)
 
 
 def _stage_key(
@@ -163,7 +140,7 @@ def _stage_key(
     attempt_id: str,
     filename: Literal["started.json", "outcome.json"],
 ) -> str:
-    return _join_key(
+    return record_io.join_key(
         _stage_prefix(prefix, workflow_run_id, stage),
         attempt_id,
         filename,
@@ -171,7 +148,7 @@ def _stage_key(
 
 
 def _result_key(prefix: str, workflow_run_id: str) -> str:
-    return _join_key(prefix, workflow_run_id, "result.json")
+    return record_io.join_key(prefix, workflow_run_id, "result.json")
 
 
 def _read_model(
@@ -179,7 +156,7 @@ def _read_model(
     key: str,
     model_type: type[AgentDataModel],
 ) -> AgentDataModel:
-    raw = _read_key(group, key)
+    raw = record_io.read_key(group, key)
     if raw is None:
         raise FileNotFoundError(key)
     try:
@@ -192,7 +169,7 @@ def _write_model_once(group: zarr.Group, key: str, value: AgentDataModel) -> Non
     _write_key_once(
         group,
         key,
-        _display_json_bytes(value.model_dump(mode="json")),
+        record_io.display_json_bytes(value.model_dump(mode="json")),
     )
 
 
@@ -273,6 +250,10 @@ def _start_attempt(
         ),
         attempt,
     )
+    logger.info(
+        f"Workflow {workflow_run_id}: started stage={stage!r} "
+        f"attempt={attempt.attemptId}"
+    )
     return attempt
 
 
@@ -292,6 +273,35 @@ def _save_outcome(
         ),
         outcome,
     )
+    elapsed_seconds = (
+        (outcome.completedAtNs - outcome.startedAtNs) / 1_000_000_000
+        if outcome.completedAtNs is not None
+        else 0.0
+    )
+    details = (
+        f"reports={len(outcome.reportReferences)}, "
+        f"artifacts={len(outcome.artifacts)}, actions={len(outcome.actions)}"
+    )
+    if outcome.status == "failed":
+        error_kind = (outcome.error or "unknown error").partition(":")[0]
+        logger.error(
+            f"Workflow {outcome.workflowRunId}: stage={outcome.stage!r} "
+            f"failed ({error_kind}; {details}; {elapsed_seconds:.1f}s)"
+        )
+    elif outcome.status == "needsInput":
+        question_count = (
+            len(outcome.needsInput.questions) if outcome.needsInput is not None else 0
+        )
+        logger.info(
+            f"Workflow {outcome.workflowRunId}: stage={outcome.stage!r} paused "
+            f"for {question_count} input question(s) ({details}; "
+            f"{elapsed_seconds:.1f}s)"
+        )
+    else:
+        logger.info(
+            f"Workflow {outcome.workflowRunId}: completed stage={outcome.stage!r} "
+            f"({details}; {elapsed_seconds:.1f}s)"
+        )
 
 
 def _stage_outcomes(
@@ -529,6 +539,10 @@ def _validated_done_outcome(
             request_record,
             outcome,
         ):
+            logger.debug(
+                f"Workflow {workflow_run_id}: reusing stage={stage!r} "
+                f"attempt={outcome.attemptId} status={required_status!r}"
+            )
             return outcome
     return None
 
@@ -638,7 +652,7 @@ def _stage_execution_id(started: WorkflowStageAttempt) -> str:
         ],
         "inputs": inputs,
     }
-    digest = hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+    digest = hashlib.sha256(record_io.canonical_json_bytes(payload)).hexdigest()
     return f"orchestrator_{started.stage}_{digest[:40]}"
 
 
@@ -688,6 +702,10 @@ def _recover_persisted_stage_report(
         )
     for artifact in record.invocation.artifacts.values():
         store.load_artifact(artifact_model_to_ref(artifact))
+    logger.info(
+        f"Workflow {started.workflowRunId}: recovered {agent_name!r} report for "
+        f"stage={started.stage!r}"
+    )
     return report, reference
 
 
@@ -709,6 +727,10 @@ def _save_stage_report(
             invocation=tagged_invocation,
             agent_run_id=_stage_execution_id(started),
         )
+        logger.info(
+            f"Workflow {started.workflowRunId}: persisted "
+            f"{tagged_invocation.agentName!r} report for stage={started.stage!r}"
+        )
         return report, reference
     except FileExistsError:
         recovered = _recover_persisted_stage_report(
@@ -719,6 +741,10 @@ def _save_stage_report(
         )
         if recovered is None:
             raise
+        logger.debug(
+            f"Workflow {started.workflowRunId}: reused concurrently persisted "
+            f"{tagged_invocation.agentName!r} report"
+        )
         return recovered
 
 
@@ -727,7 +753,10 @@ def _load_terminal_result(
     prefix: str,
     workflow: AgentWorkflowRun,
 ) -> AutomatedWorkflowResult | None:
-    raw = _read_key(store.zw, _result_key(prefix, workflow.workflowRunId))
+    raw = record_io.read_key(
+        store.zw,
+        _result_key(prefix, workflow.workflowRunId),
+    )
     if raw is None:
         return None
     try:
@@ -768,6 +797,10 @@ def _persist_terminal_result(
 ) -> AutomatedWorkflowResult:
     existing = _load_terminal_result(store, prefix, workflow)
     if existing is not None:
+        logger.debug(
+            f"Workflow {workflow.workflowRunId}: reused terminal result "
+            f"status={workflow.status!r}"
+        )
         return existing
     if result.contentSha256 != _record_checksum(result):
         raise ValueError("Terminal result must carry its exact content checksum")
@@ -782,6 +815,10 @@ def _persist_terminal_result(
     persisted = _load_terminal_result(store, prefix, workflow)
     if persisted is None:
         raise RuntimeError("Terminal workflow result was not persisted")
+    logger.info(
+        f"Workflow {workflow.workflowRunId}: persisted terminal result "
+        f"status={workflow.status!r}"
+    )
     return persisted
 
 
@@ -820,6 +857,9 @@ def failed_stage(
     *,
     resume_record: OrchestrationResumeRecord | None = None,
 ) -> WorkflowStageAttempt:
+    logger.error(
+        f"Workflow {workflow.workflowRunId}: stage={stage!r} failed validation"
+    )
     prefix = _ensure_orchestration_store(store)
     started = _start_attempt(
         store.zw,
@@ -849,6 +889,10 @@ def finish_exception(
     notes: Sequence[str] = (),
 ) -> WorkflowStageAttempt:
     error = f"{type(exc).__name__}: {exc}"
+    logger.error(
+        f"Workflow {workflow.workflowRunId}: stage={started.stage!r} raised "
+        f"{type(exc).__name__}; details were persisted in the stage outcome"
+    )
     execution_id = _stage_execution_id(started)
     report_references = [
         reference
@@ -878,6 +922,7 @@ def finalize_failed(
 ) -> None:
     current = load_agent_workflow(store, workflow.workflowRunId)
     if current.status == "running":
+        logger.warning(f"Finalizing workflow {workflow.workflowRunId} as failed")
         finalize_agent_workflow(
             store,
             workflow.workflowRunId,
@@ -933,4 +978,8 @@ def paused_or_failed_result(
     result = result.model_copy(update={"contentSha256": _record_checksum(result)})
     if status == "failed":
         return _persist_terminal_result(store, prefix, current, result)
+    logger.info(
+        f"Workflow {workflow.workflowRunId}: returning needsInput at "
+        f"stage={outcome.stage!r}"
+    )
     return result

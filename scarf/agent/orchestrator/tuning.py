@@ -9,6 +9,7 @@ import numpy as np
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
 from ...datastore.datastore import DataStore
+from ...utils.logging import logger
 from ..experimental_context import ExperimentalContextResult
 from ..parameter_tuning import (
     ArtifactRecord,
@@ -35,21 +36,7 @@ from ..persistence import (
     save_agent_report,
 )
 from ..types import ArtifactReferenceModel, ExperimentalTuningHandoff
-from .journal import (
-    _complete_attempt,
-    _ensure_orchestration_store,
-    _recover_persisted_stage_report,
-    _report_link,
-    _safe_label,
-    _save_outcome,
-    _save_stage_report,
-    _stage_execution_id,
-    _start_attempt,
-    _validated_done_outcome,
-    finalize_failed,
-    finish_exception,
-    load_stage_report,
-)
+from . import journal
 from .models import (
     AutomatedPreprocessingPlan,
     AutomatedWorkflowConfig,
@@ -84,8 +71,8 @@ class TuningStagesMixin:
         *,
         resume_record: OrchestrationResumeRecord | None = None,
     ) -> tuple[WorkflowStageAttempt, ParameterTuningReport]:
-        prefix = _ensure_orchestration_store(store)
-        existing = _validated_done_outcome(
+        prefix = journal._ensure_orchestration_store(store)
+        existing = journal._validated_done_outcome(
             store,
             prefix,
             workflow.workflowRunId,
@@ -94,9 +81,12 @@ class TuningStagesMixin:
             parents,
         )
         if existing is not None:
-            report = load_stage_report(store, existing, ParameterTuningReport)
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: reusing Parameter Tuning report"
+            )
+            report = journal.load_stage_report(store, existing, ParameterTuningReport)
             return existing, cast(ParameterTuningReport, report)
-        paused = _validated_done_outcome(
+        paused = journal._validated_done_outcome(
             store,
             prefix,
             workflow.workflowRunId,
@@ -107,7 +97,7 @@ class TuningStagesMixin:
         )
         resumable_report: ParameterTuningReport | None = None
         if paused is not None and paused.reportReferences:
-            loaded = load_stage_report(store, paused, ParameterTuningReport)
+            loaded = journal.load_stage_report(store, paused, ParameterTuningReport)
             candidate_report = cast(ParameterTuningReport, loaded)
             if (
                 candidate_report.finalSelection is not None
@@ -126,7 +116,7 @@ class TuningStagesMixin:
             tuning_directions = tuning_answer.strip()
         else:
             tuning_directions = ""
-        started = _start_attempt(
+        started = journal._start_attempt(
             store.zw,
             prefix,
             workflow.workflowRunId,
@@ -158,12 +148,16 @@ class TuningStagesMixin:
         integration_evaluations: list[IntegrationCandidateEvaluation] = []
         candidate_payload: dict[str, list[dict[str, Any]]] = {}
         paired = list(plan.pairedAssays)
+        logger.info(
+            f"Workflow {workflow.workflowRunId}: Parameter Tuning started for "
+            f"{len(preprocessed)} assay(s), paired={len(paired)}"
+        )
         try:
             agent = ParameterTuningAgent(
                 self.model,
                 config=request_record.config.agentRunConfig,
             )
-            recovered = _recover_persisted_stage_report(
+            recovered = journal._recover_persisted_stage_report(
                 store,
                 started,
                 agent_name="parameter_tuning",
@@ -181,6 +175,10 @@ class TuningStagesMixin:
                     for assay, assay_report in report.assayReports.items()
                 }
                 actions.append("recover_persisted_parameter_tuning_report")
+                logger.info(
+                    f"Workflow {workflow.workflowRunId}: recovering completed "
+                    "Parameter Tuning provider result"
+                )
                 return self.save_parameter_tuning_outcome(
                     store,
                     prefix,
@@ -222,6 +220,10 @@ class TuningStagesMixin:
                     resumed_integration_evaluations,
                     marker_assay=plan.markerAssay,
                     answers=answers,
+                )
+                logger.info(
+                    f"Workflow {workflow.workflowRunId}: resumed final graph "
+                    "selection without rerunning candidate evaluation"
                 )
                 resumed_candidate_payload = {
                     assay: [
@@ -295,6 +297,12 @@ class TuningStagesMixin:
                 candidate_payload[handoff.assay] = [
                     value.model_dump(mode="json") for value in candidates
                 ]
+                logger.info(
+                    f"Workflow {workflow.workflowRunId}: planned "
+                    f"{len(candidates)} native candidate(s) for assay "
+                    f"{handoff.assay!r} (harmony="
+                    f"{sum(value.useHarmony for value in candidates)})"
+                )
                 assay_inputs.append(
                     ParameterTuningAssayInput(
                         normalized=artifact_model_to_ref(handoff.normalized),
@@ -335,6 +343,11 @@ class TuningStagesMixin:
                     "The native and integrated candidate plan exceeds the global "
                     f"branch limit {request_record.config.maxCandidateBranches}"
                 )
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: executing "
+                f"{planned_native} native candidate branch(es) with "
+                f"{integration_budget} reserved integration branch(es)"
+            )
             report = agent.run_batch(
                 store,
                 assays=assay_inputs,
@@ -343,6 +356,10 @@ class TuningStagesMixin:
                     request_record.config.maxCandidateBranches - integration_budget
                 ),
                 selection_directions=tuning_directions,
+            )
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: Parameter Tuning returned "
+                f"status={report.status!r}, evaluated={report.totalCandidates}"
             )
             if report.status == "done":
                 for assay, assay_report in report.assayReports.items():
@@ -355,6 +372,11 @@ class TuningStagesMixin:
                         identity_feature_limit=request_record.config.maxIdentityFeatures,
                     )
                     actions.append(f"promote_native:{assay}")
+                    logger.info(
+                        f"Workflow {workflow.workflowRunId}: promoted native "
+                        f"candidate {assay_report.recommendedCandidateId!r} for "
+                        f"assay {assay!r}"
+                    )
                 integration_evaluations = self.evaluate_integrations(
                     store,
                     workflow.workflowRunId,
@@ -364,10 +386,14 @@ class TuningStagesMixin:
                     request_record.config,
                     started=started,
                     parent_reports=[
-                        _report_link(enrichment_reference),
-                        _report_link(experimental_reference),
+                        journal._report_link(enrichment_reference),
+                        journal._report_link(experimental_reference),
                     ],
                     actions=actions,
+                )
+                logger.info(
+                    f"Workflow {workflow.workflowRunId}: evaluated "
+                    f"{len(integration_evaluations)} integration candidate(s)"
                 )
                 report = self.select_final_graph(
                     agent,
@@ -415,7 +441,7 @@ class TuningStagesMixin:
                     ] = ArtifactReferenceModel.model_validate(
                         integration_evaluation.clusterArtifact.model_dump()
                     )
-            outcome = finish_exception(
+            outcome = journal.finish_exception(
                 store,
                 prefix,
                 workflow,
@@ -444,6 +470,10 @@ class TuningStagesMixin:
     ) -> ParameterTuningReport:
         directed_option = answers.get("finalGraphOptionId")
         if not isinstance(directed_option, str) or not directed_option:
+            logger.info(
+                f"Selecting final graph from native and "
+                f"{len(integration_evaluations)} integration evaluation(s)"
+            )
             return agent.select_final(
                 report=report,
                 integration_evaluations=integration_evaluations,
@@ -452,6 +482,7 @@ class TuningStagesMixin:
         options = final_graph_options(report, integration_evaluations)
         if directed_option not in options:
             raise ValueError("finalGraphOptionId is not an eligible option")
+        logger.info(f"Applying caller-selected final graph {directed_option!r}")
         selected_evidence = list(options[directed_option]["evidenceIds"])
         selection = FinalGraphSelection(
             status="done",
@@ -539,7 +570,7 @@ class TuningStagesMixin:
                 report.finalClusterArtifact.model_dump()
             )
         checkpoint_ids = {
-            f"{_stage_execution_id(started)}_integration_{method}"
+            f"{journal._stage_execution_id(started)}_integration_{method}"
             for method in {evaluation.method for evaluation in integration_evaluations}
         }
         checkpoint_references = sorted(
@@ -555,21 +586,24 @@ class TuningStagesMixin:
             key=lambda value: value.agentRunId,
         )
         if persisted_reference is None:
-            saved_report, reference = _save_stage_report(
+            saved_report, reference = journal._save_stage_report(
                 store,
                 started,
                 report,
                 invocation=AgentInvocation(
                     agentName="parameter_tuning",
                     parentReports=[
-                        _report_link(enrichment_reference),
-                        _report_link(experimental_reference),
+                        journal._report_link(enrichment_reference),
+                        journal._report_link(experimental_reference),
                         *(
-                            [_report_link(prior_tuning_reference)]
+                            [journal._report_link(prior_tuning_reference)]
                             if prior_tuning_reference is not None
                             else []
                         ),
-                        *[_report_link(value) for value in checkpoint_references],
+                        *[
+                            journal._report_link(value)
+                            for value in checkpoint_references
+                        ],
                     ],
                     inputs={
                         "assays": dict(candidate_payload),
@@ -665,7 +699,7 @@ class TuningStagesMixin:
         if report.status == "needsInput":
             needs_input = report.needsInput
             assert needs_input is not None
-            outcome = _complete_attempt(
+            outcome = journal._complete_attempt(
                 started,
                 status="needsInput",
                 report_references=stage_report_references,
@@ -693,7 +727,7 @@ class TuningStagesMixin:
                 notes=report.limitations,
             )
         elif report.status == "failed":
-            outcome = _complete_attempt(
+            outcome = journal._complete_attempt(
                 started,
                 status="failed",
                 report_references=stage_report_references,
@@ -706,7 +740,7 @@ class TuningStagesMixin:
                 error="; ".join(report.limitations) or "Parameter Tuning failed",
             )
         else:
-            outcome = _complete_attempt(
+            outcome = journal._complete_attempt(
                 started,
                 status="done",
                 report_references=stage_report_references,
@@ -726,9 +760,14 @@ class TuningStagesMixin:
                 actions=actions,
                 notes=[*report.tradeoffs, *report.limitations],
             )
-        _save_outcome(store.zw, prefix, outcome)
+        journal._save_outcome(store.zw, prefix, outcome)
+        logger.info(
+            f"Workflow {workflow.workflowRunId}: Parameter Tuning outcome "
+            f"status={outcome.status!r}, candidates={report.totalCandidates}, "
+            f"integrations={len(integration_evaluations)}"
+        )
         if outcome.status == "failed":
-            finalize_failed(store, workflow, outcome.error or "tuning failed")
+            journal.finalize_failed(store, workflow, outcome.error or "tuning failed")
         return outcome, report
 
     def initial_parameter_candidates(
@@ -779,7 +818,7 @@ class TuningStagesMixin:
                 break
             specifications.append((unique_dimensions[0], resolution))
         token = workflow_run_id[:10]
-        assay_token = _safe_label(handoff.assay).lower()
+        assay_token = journal._safe_label(handoff.assay).lower()
         if len(assay_token) > 32:
             digest = hashlib.blake2b(
                 handoff.assay.encode("utf-8"), digest_size=4
@@ -836,7 +875,7 @@ class TuningStagesMixin:
         started: WorkflowStageAttempt,
         method: Literal["snn", "wnn"],
     ) -> tuple[list[IntegrationCandidateEvaluation], AgentReportReference] | None:
-        checkpoint_id = f"{_stage_execution_id(started)}_integration_{method}"
+        checkpoint_id = f"{journal._stage_execution_id(started)}_integration_{method}"
         matches = [
             reference
             for reference in list_agent_reports(
@@ -855,7 +894,7 @@ class TuningStagesMixin:
         if (
             record.invocation.inputs.get("orchestrationExecutionId") != checkpoint_id
             or record.invocation.inputs.get("stageExecutionId")
-            != _stage_execution_id(started)
+            != journal._stage_execution_id(started)
             or record.invocation.inputs.get("method") != method
         ):
             raise ValueError("Integration checkpoint identity is stale")
@@ -867,6 +906,10 @@ class TuningStagesMixin:
         evaluations = list(report.integrationEvaluations)
         if not evaluations or any(value.method != method for value in evaluations):
             raise ValueError("Integration checkpoint contains the wrong method")
+        logger.info(
+            f"Workflow {started.workflowRunId}: recovered {method.upper()} "
+            f"checkpoint with {len(evaluations)} evaluation(s)"
+        )
         return evaluations, reference
 
     def save_integration_checkpoint(
@@ -878,7 +921,7 @@ class TuningStagesMixin:
         evaluations: Sequence[IntegrationCandidateEvaluation],
         parent_reports: Sequence[AgentReportLink],
     ) -> AgentReportReference:
-        checkpoint_id = f"{_stage_execution_id(started)}_integration_{method}"
+        checkpoint_id = f"{journal._stage_execution_id(started)}_integration_{method}"
         checkpoint_report = report.model_copy(
             update={
                 "integrationEvaluations": list(evaluations),
@@ -907,19 +950,24 @@ class TuningStagesMixin:
             parentReports=list(parent_reports),
             inputs={
                 "orchestrationExecutionId": checkpoint_id,
-                "stageExecutionId": _stage_execution_id(started),
+                "stageExecutionId": journal._stage_execution_id(started),
                 "method": method,
             },
             artifacts=artifacts,
         )
         try:
-            return save_agent_report(
+            reference = save_agent_report(
                 store,
                 started.workflowRunId,
                 checkpoint_report,
                 invocation=invocation,
                 agent_run_id=checkpoint_id,
             )
+            logger.info(
+                f"Workflow {started.workflowRunId}: persisted {method.upper()} "
+                f"checkpoint with {len(evaluations)} evaluation(s)"
+            )
+            return reference
         except FileExistsError:
             recovered = self.load_integration_checkpoint(store, started, method)
             if recovered is None:
@@ -941,6 +989,7 @@ class TuningStagesMixin:
     ) -> list[IntegrationCandidateEvaluation]:
         assays = list(plan.pairedAssays)
         if len(assays) < 2:
+            logger.info("Skipping SNN/WNN evaluation: fewer than two paired assays")
             return []
         selected_k = {
             next(
@@ -965,6 +1014,10 @@ class TuningStagesMixin:
         resolutions = list(
             dict.fromkeys(max(0.05, round(center * value, 6)) for value in multipliers)
         )
+        logger.info(
+            f"Evaluating SNN and WNN across {len(resolutions)} resolution(s) "
+            f"for {len(assays)} paired assay(s)"
+        )
         native_labels: dict[str, np.ndarray[Any, Any]] = {}
         for assay, assay_report in report.assayReports.items():
             if assay not in assays:
@@ -984,190 +1037,233 @@ class TuningStagesMixin:
         evaluations: list[IntegrationCandidateEvaluation] = []
         integration_methods: tuple[Literal["snn", "wnn"], ...] = ("snn", "wnn")
         for method in integration_methods:
-            typed_method = method
-            if started is not None:
-                recovered = self.load_integration_checkpoint(
+            evaluations.extend(
+                self.evaluate_integration_method(
                     store,
-                    started,
-                    typed_method,
-                )
-                if recovered is not None:
-                    evaluations.extend(recovered[0])
-                    if actions is not None:
-                        actions.append(f"recover_integration_checkpoint:{method}")
-                    continue
-            method_start = len(evaluations)
-            graph_label = f"agent_{token}_{method}"
-            try:
-                graph_ref = store.integrate_assays(
+                    method,
+                    token,
                     assays,
-                    graph_label,
-                    method=method,
-                    invalidate_cache=True,
-                    l2_normalize=True,
+                    resolutions,
+                    native_labels,
+                    plan,
+                    report,
+                    experimental_handoff,
+                    config,
+                    started=started,
+                    parent_reports=parent_reports,
+                    actions=actions,
                 )
-                weights_valid: bool | None = None
-                if method == "wnn":
-                    graph_group = store.load_artifact(graph_ref)
-                    stored_weights = cast(Any, graph_group["modality_weights"])
-                    weights = np.asarray(stored_weights[:], dtype=float)
-                    weights_valid = bool(
-                        weights.shape
-                        == (len(next(iter(native_labels.values()))), len(assays))
-                        and np.all(np.isfinite(weights))
-                        and np.all(weights >= 0)
-                        and np.allclose(weights.sum(axis=1), 1.0, rtol=1e-5, atol=1e-6)
-                    )
-            except Exception as exc:
-                for index, resolution in enumerate(resolutions):
-                    evaluations.append(
-                        IntegrationCandidateEvaluation(
-                            integrationId=f"{method}_{token}_{index}",
-                            method=cast(Any, method),
-                            assays=assays,
-                            status="failed",
-                            resolution=resolution,
-                            error=f"{type(exc).__name__}: {exc}",
-                        )
-                    )
-                if started is not None:
-                    self.save_integration_checkpoint(
-                        store,
-                        started,
-                        report,
-                        typed_method,
-                        evaluations[method_start:],
-                        parent_reports,
-                    )
-                    if actions is not None:
-                        actions.append(f"checkpoint_integration:{method}")
-                continue
+            )
+        return evaluations
+
+    def evaluate_integration_method(
+        self,
+        store: DataStore,
+        method: Literal["snn", "wnn"],
+        token: str,
+        assays: list[str],
+        resolutions: Sequence[float],
+        native_labels: Mapping[str, np.ndarray[Any, Any]],
+        plan: AutomatedPreprocessingPlan,
+        report: ParameterTuningReport,
+        experimental_handoff: ExperimentalTuningHandoff,
+        config: AutomatedWorkflowConfig,
+        *,
+        started: WorkflowStageAttempt | None,
+        parent_reports: Sequence[AgentReportLink],
+        actions: list[str] | None,
+    ) -> list[IntegrationCandidateEvaluation]:
+        if started is not None:
+            recovered = self.load_integration_checkpoint(store, started, method)
+            if recovered is not None:
+                if actions is not None:
+                    actions.append(f"recover_integration_checkpoint:{method}")
+                return recovered[0]
+        logger.info(
+            f"Evaluating {method.upper()} integration across "
+            f"{len(resolutions)} resolution(s)"
+        )
+        evaluations: list[IntegrationCandidateEvaluation] = []
+        graph_label = f"agent_{token}_{method}"
+        try:
+            graph_ref = store.integrate_assays(
+                assays,
+                graph_label,
+                method=method,
+                invalidate_cache=True,
+                l2_normalize=True,
+            )
+            weights_valid: bool | None = None
+            if method == "wnn":
+                graph_group = store.load_artifact(graph_ref)
+                stored_weights = cast(Any, graph_group["modality_weights"])
+                weights = np.asarray(stored_weights[:], dtype=float)
+                weights_valid = bool(
+                    weights.shape
+                    == (len(next(iter(native_labels.values()))), len(assays))
+                    and np.all(np.isfinite(weights))
+                    and np.all(weights >= 0)
+                    and np.allclose(weights.sum(axis=1), 1.0, rtol=1e-5, atol=1e-6)
+                )
+        except Exception as exc:
+            logger.warning(
+                f"{method.upper()} graph construction failed "
+                f"({type(exc).__name__}); persisting failed evaluations"
+            )
             for index, resolution in enumerate(resolutions):
-                integration_id = f"{method}_{token}_{index}"
-                cluster_label = f"agent_{token}_{method}_r_{index}"
-                warnings: list[str] = []
-                evidence_ids = [f"integration:{integration_id}:clusters"]
-                try:
-                    cluster_ref = store.run_leiden_clustering(
-                        graph=graph_ref,
-                        from_assay=plan.primaryAssay,
-                        cell_key="I",
+                evaluations.append(
+                    IntegrationCandidateEvaluation(
+                        integrationId=f"{method}_{token}_{index}",
+                        method=cast(Any, method),
+                        assays=assays,
+                        status="failed",
                         resolution=resolution,
-                        backend="igraph",
-                        symmetric_graph=False,
-                        graph_upper_only=False,
-                        label=cluster_label,
-                        random_seed=4444,
-                        invalidate_cache=False,
+                        error=f"{type(exc).__name__}: {exc}",
                     )
-                    cluster_column = f"{graph_label}_{cluster_label}"
-                    cluster_group = store.load_artifact(cluster_ref)
-                    cluster_values = cast(Any, cluster_group["values"])
-                    values = np.asarray(cluster_values[:])
-                    _labels, counts = np.unique(values, return_counts=True)
-                    metrics = IntegrationMetrics(
-                        nClusters=int(len(counts)),
-                        minClusterCells=int(counts.min()),
-                        minClusterFraction=float(counts.min() / len(values)),
-                        modalityWeightsValid=weights_valid,
-                    )
-                    for assay, native in native_labels.items():
-                        metrics.adjustedRandByAssay[assay] = float(
-                            adjusted_rand_score(native, values)
-                        )
-                        metrics.normalizedMutualInformationByAssay[assay] = float(
-                            normalized_mutual_info_score(native, values)
-                        )
-                        evidence_ids.extend(
-                            [
-                                f"integration:{integration_id}:ari:{assay}",
-                                f"integration:{integration_id}:nmi:{assay}",
-                            ]
-                        )
-                    for column in experimental_handoff.preservationColumns:
-                        try:
-                            value = float(
-                                store.metric_graph_connectivity(
-                                    column,
-                                    graph=graph_ref,
-                                    from_assay=plan.primaryAssay,
-                                    cell_key="I",
-                                )
-                            )
-                            if np.isfinite(value):
-                                metrics.biologicalConnectivity[column] = value
-                                evidence_ids.append(
-                                    f"integration:{integration_id}:graphConnectivity:{column}"
-                                )
-                        except (KeyError, RuntimeError, TypeError, ValueError) as exc:
-                            warnings.append(
-                                f"Graph connectivity for {column!r} unavailable: {exc}"
-                            )
-                    if method == "wnn":
-                        evidence_ids.append(
-                            f"integration:{integration_id}:modalityWeights"
-                        )
-                    reasons: list[str] = []
-                    missing_connectivity = sorted(
-                        set(experimental_handoff.preservationColumns)
-                        - set(metrics.biologicalConnectivity)
-                    )
-                    if missing_connectivity:
-                        reasons.append(
-                            "trusted-label connectivity is unavailable for "
-                            + ", ".join(missing_connectivity)
-                        )
-                    if metrics.nClusters is None or metrics.nClusters < 2:
-                        reasons.append("fewer than two clusters")
-                    if (
-                        metrics.minClusterCells is None
-                        or metrics.minClusterCells < config.minClusterCells
-                    ):
-                        reasons.append(
-                            "smallest cluster is below the configured minimum"
-                        )
-                    if method == "wnn" and weights_valid is not True:
-                        reasons.append("WNN modality weights are invalid")
-                    evaluations.append(
-                        IntegrationCandidateEvaluation(
-                            integrationId=integration_id,
-                            method=cast(Any, method),
-                            assays=assays,
-                            status="done",
-                            eligible=not reasons,
-                            resolution=resolution,
-                            graphArtifact=ArtifactRecord.from_ref(graph_ref),
-                            clusterArtifact=ArtifactRecord.from_ref(cluster_ref),
-                            clusterColumn=cluster_column,
-                            metrics=metrics,
-                            evidenceIds=evidence_ids,
-                            eligibilityReasons=reasons,
-                            warnings=warnings,
-                        )
-                    )
-                except Exception as exc:
-                    evaluations.append(
-                        IntegrationCandidateEvaluation(
-                            integrationId=integration_id,
-                            method=cast(Any, method),
-                            assays=assays,
-                            status="failed",
-                            resolution=resolution,
-                            graphArtifact=ArtifactRecord.from_ref(graph_ref),
-                            evidenceIds=evidence_ids,
-                            warnings=warnings,
-                            error=f"{type(exc).__name__}: {exc}",
-                        )
-                    )
+                )
             if started is not None:
                 self.save_integration_checkpoint(
                     store,
                     started,
                     report,
-                    typed_method,
-                    evaluations[method_start:],
+                    method,
+                    evaluations,
                     parent_reports,
                 )
                 if actions is not None:
                     actions.append(f"checkpoint_integration:{method}")
+            return evaluations
+        for index, resolution in enumerate(resolutions):
+            integration_id = f"{method}_{token}_{index}"
+            cluster_label = f"agent_{token}_{method}_r_{index}"
+            warnings: list[str] = []
+            evidence_ids = [f"integration:{integration_id}:clusters"]
+            try:
+                cluster_ref = store.run_leiden_clustering(
+                    graph=graph_ref,
+                    from_assay=plan.primaryAssay,
+                    cell_key="I",
+                    resolution=resolution,
+                    backend="igraph",
+                    symmetric_graph=False,
+                    graph_upper_only=False,
+                    label=cluster_label,
+                    random_seed=4444,
+                    invalidate_cache=False,
+                )
+                cluster_column = f"{graph_label}_{cluster_label}"
+                cluster_group = store.load_artifact(cluster_ref)
+                cluster_values = cast(Any, cluster_group["values"])
+                values = np.asarray(cluster_values[:])
+                _labels, counts = np.unique(values, return_counts=True)
+                metrics = IntegrationMetrics(
+                    nClusters=int(len(counts)),
+                    minClusterCells=int(counts.min()),
+                    minClusterFraction=float(counts.min() / len(values)),
+                    modalityWeightsValid=weights_valid,
+                )
+                for assay, native in native_labels.items():
+                    metrics.adjustedRandByAssay[assay] = float(
+                        adjusted_rand_score(native, values)
+                    )
+                    metrics.normalizedMutualInformationByAssay[assay] = float(
+                        normalized_mutual_info_score(native, values)
+                    )
+                    evidence_ids.extend(
+                        [
+                            f"integration:{integration_id}:ari:{assay}",
+                            f"integration:{integration_id}:nmi:{assay}",
+                        ]
+                    )
+                for column in experimental_handoff.preservationColumns:
+                    try:
+                        value = float(
+                            store.metric_graph_connectivity(
+                                column,
+                                graph=graph_ref,
+                                from_assay=plan.primaryAssay,
+                                cell_key="I",
+                            )
+                        )
+                        if np.isfinite(value):
+                            metrics.biologicalConnectivity[column] = value
+                            evidence_ids.append(
+                                f"integration:{integration_id}:graphConnectivity:{column}"
+                            )
+                    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+                        warnings.append(
+                            f"Graph connectivity for {column!r} unavailable: {exc}"
+                        )
+                if method == "wnn":
+                    evidence_ids.append(f"integration:{integration_id}:modalityWeights")
+                reasons: list[str] = []
+                missing_connectivity = sorted(
+                    set(experimental_handoff.preservationColumns)
+                    - set(metrics.biologicalConnectivity)
+                )
+                if missing_connectivity:
+                    reasons.append(
+                        "trusted-label connectivity is unavailable for "
+                        + ", ".join(missing_connectivity)
+                    )
+                if metrics.nClusters is None or metrics.nClusters < 2:
+                    reasons.append("fewer than two clusters")
+                if (
+                    metrics.minClusterCells is None
+                    or metrics.minClusterCells < config.minClusterCells
+                ):
+                    reasons.append("smallest cluster is below the configured minimum")
+                if method == "wnn" and weights_valid is not True:
+                    reasons.append("WNN modality weights are invalid")
+                evaluations.append(
+                    IntegrationCandidateEvaluation(
+                        integrationId=integration_id,
+                        method=cast(Any, method),
+                        assays=assays,
+                        status="done",
+                        eligible=not reasons,
+                        resolution=resolution,
+                        graphArtifact=ArtifactRecord.from_ref(graph_ref),
+                        clusterArtifact=ArtifactRecord.from_ref(cluster_ref),
+                        clusterColumn=cluster_column,
+                        metrics=metrics,
+                        evidenceIds=evidence_ids,
+                        eligibilityReasons=reasons,
+                        warnings=warnings,
+                    )
+                )
+            except Exception as exc:
+                evaluations.append(
+                    IntegrationCandidateEvaluation(
+                        integrationId=integration_id,
+                        method=cast(Any, method),
+                        assays=assays,
+                        status="failed",
+                        resolution=resolution,
+                        graphArtifact=ArtifactRecord.from_ref(graph_ref),
+                        evidenceIds=evidence_ids,
+                        warnings=warnings,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+        if started is not None:
+            self.save_integration_checkpoint(
+                store,
+                started,
+                report,
+                method,
+                evaluations,
+                parent_reports,
+            )
+            if actions is not None:
+                actions.append(f"checkpoint_integration:{method}")
+        eligible_count = sum(
+            value.status == "done" and value.eligible for value in evaluations
+        )
+        failed_count = sum(value.status == "failed" for value in evaluations)
+        logger.info(
+            f"Completed {method.upper()} integration evaluation: "
+            f"eligible={eligible_count}, failed={failed_count}, "
+            f"total={len(evaluations)}"
+        )
         return evaluations

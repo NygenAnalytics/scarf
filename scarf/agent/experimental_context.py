@@ -8,19 +8,20 @@ from typing import Any, Literal
 
 import numpy as np
 
+from ..metadata.queries import reduce_observation_units
+from ..metrics.association import coefficient_estimability
 from ..quality_control.filtering import (
     _sample_aware_mad_mask,
     gaussian_quantile_bounds,
 )
-from .config._deps import AGENT_INSTALL_HINT
-from .config.agent_exec import run_agent_sync
+from ..utils.logging import logger
 from .characterize_covariates import (
     CovariateCharacterization,
     characterize_covariates,
 )
 from .config import AgentRunConfig
-from ..metadata.queries import reduce_observation_units
-from ..metrics.association import coefficient_estimability
+from .config._deps import AGENT_INSTALL_HINT
+from .config.agent_exec import run_agent_sync
 from .types import (
     AgentDataModel,
     AgentRunInfo,
@@ -632,6 +633,139 @@ def _qc_profile_id(
     return f"cellQc:{assay_type}:{assay_name}:{cell_key}:{suffix}"
 
 
+def _global_qc_profile(
+    deps: ExperimentalContextDependencies,
+    driver: tuple[str, CellQcDriverType],
+    active: np.ndarray,
+    active_cells: int,
+    values_by_attr: dict[str, np.ndarray],
+    attribute_notes: list[str],
+) -> CellQcProfileEvidence | None:
+    """Build the bounded global Gaussian QC profile when bounds are valid."""
+    resolved_bounds: dict[str, dict[str, float]] = {}
+    global_keep = active.copy()
+    global_attributes: list[str] = []
+    for attribute, values in values_by_attr.items():
+        if float(np.std(values)) == 0.0:
+            attribute_notes.append(f"Ignored constant QC column {attribute!r}")
+            continue
+        low, high = gaussian_quantile_bounds(values, 0.01, 0.99)
+        if not np.isfinite([low, high]).all():
+            attribute_notes.append(
+                f"Ignored QC column {attribute!r} with non-finite Gaussian bounds"
+            )
+            continue
+        resolved_bounds[attribute] = {"low": low, "high": high}
+        global_attributes.append(attribute)
+        global_keep &= (values > low) & (values < high)
+    if not global_attributes:
+        return None
+    retained_cells = int(global_keep.sum())
+    profile_id = _qc_profile_id(
+        "globalGaussian",
+        driver=driver,
+        cell_key=deps.cellKey,
+    )
+    return CellQcProfileEvidence(
+        profileId=profile_id,
+        action="globalGaussian",
+        driverAssay=driver[0],
+        driverAssayType=driver[1],
+        cellKey=deps.cellKey,
+        attributes=global_attributes,
+        parameters={
+            "minP": 0.01,
+            "maxP": 0.99,
+            "resolvedBounds": resolved_bounds,
+        },
+        activeCells=active_cells,
+        retainedCells=retained_cells,
+        retainedFraction=retained_cells / active_cells,
+        notes=attribute_notes,
+        evidenceId=f"qcProfile:{profile_id}",
+    )
+
+
+def _sample_qc_profiles(
+    deps: ExperimentalContextDependencies,
+    characterization: CovariateCharacterization | None,
+    driver: tuple[str, CellQcDriverType],
+    active: np.ndarray,
+    active_cells: int,
+    values_by_attr: dict[str, np.ndarray],
+) -> list[CellQcProfileEvidence]:
+    """Build bounded sample-aware MAD profiles from trusted sample columns."""
+    attributes = list(values_by_attr)
+    profiles: list[CellQcProfileEvidence] = []
+    for sample_column in _qc_sample_columns(deps, characterization):
+        if not attributes:
+            break
+        try:
+            sample_labels = np.asarray(deps.store.cells.fetch_all(sample_column))
+            keep, provenance = _sample_aware_mad_mask(
+                values_by_attr=values_by_attr,
+                sample_labels=sample_labels,
+                active=active,
+                n_mads=3.0,
+                min_cells_per_sample=20,
+                attrs=attributes,
+            )
+        except (TypeError, ValueError):
+            continue
+        retained_mask = active & keep
+        retained_cells = int(retained_mask.sum())
+        sample_retention: dict[str, int] = {}
+        seen: set[object] = set()
+        for label in sample_labels[active]:
+            value = label.item() if isinstance(label, np.generic) else label
+            if value in seen:
+                continue
+            seen.add(value)
+            key = value.decode("utf-8") if isinstance(value, bytes) else str(value)
+            sample_retention[key] = int(
+                (retained_mask & (sample_labels == label)).sum()
+            )
+        notes = list(provenance["warnings"])
+        if len(sample_retention) > _MAX_SAMPLE_RETENTION_ITEMS:
+            notes.append(
+                "Per-sample retention was truncated to the first "
+                f"{_MAX_SAMPLE_RETENTION_ITEMS} samples"
+            )
+            sample_retention = dict(
+                list(sample_retention.items())[:_MAX_SAMPLE_RETENTION_ITEMS]
+            )
+        profile_id = _qc_profile_id(
+            "sampleMad",
+            driver=driver,
+            cell_key=deps.cellKey,
+            sample_column=sample_column,
+        )
+        profiles.append(
+            CellQcProfileEvidence(
+                profileId=profile_id,
+                action="sampleMad",
+                driverAssay=driver[0],
+                driverAssayType=driver[1],
+                cellKey=deps.cellKey,
+                sampleColumn=sample_column,
+                attributes=attributes,
+                parameters={
+                    "nMads": 3.0,
+                    "minCellsPerSample": 20,
+                    "nSamples": len(provenance["sample_sizes"]),
+                    "nSkippedSamples": len(provenance["skip_reasons"]),
+                },
+                activeCells=active_cells,
+                retainedCells=retained_cells,
+                retainedFraction=retained_cells / active_cells,
+                sampleRetainedCells=sample_retention,
+                notes=notes,
+                evidenceId=f"qcProfile:{profile_id}",
+            )
+        )
+    return profiles
+
+
 def _offered_qc_profiles(
     deps: ExperimentalContextDependencies,
     characterization: CovariateCharacterization | None = None,
@@ -687,117 +821,26 @@ def _offered_qc_profiles(
             continue
         values_by_attr[attribute] = values
 
-    resolved_bounds: dict[str, dict[str, float]] = {}
-    global_keep = active.copy()
-    global_attributes: list[str] = []
-    for attribute, values in values_by_attr.items():
-        if float(np.std(values)) == 0.0:
-            attribute_notes.append(f"Ignored constant QC column {attribute!r}")
-            continue
-        low, high = gaussian_quantile_bounds(values, 0.01, 0.99)
-        if not np.isfinite([low, high]).all():
-            attribute_notes.append(
-                f"Ignored QC column {attribute!r} with non-finite Gaussian bounds"
-            )
-            continue
-        resolved_bounds[attribute] = {"low": low, "high": high}
-        global_attributes.append(attribute)
-        global_keep &= (values > low) & (values < high)
-    if global_attributes:
-        retained_cells = int(global_keep.sum())
-        profile_id = _qc_profile_id(
-            "globalGaussian",
-            driver=driver,
-            cell_key=deps.cellKey,
+    global_profile = _global_qc_profile(
+        deps,
+        driver,
+        active,
+        active_cells,
+        values_by_attr,
+        attribute_notes,
+    )
+    if global_profile is not None:
+        profiles.append(global_profile)
+    profiles.extend(
+        _sample_qc_profiles(
+            deps,
+            characterization,
+            driver,
+            active,
+            active_cells,
+            values_by_attr,
         )
-        profiles.append(
-            CellQcProfileEvidence(
-                profileId=profile_id,
-                action="globalGaussian",
-                driverAssay=driver_assay,
-                driverAssayType=driver_type,
-                cellKey=deps.cellKey,
-                attributes=global_attributes,
-                parameters={
-                    "minP": 0.01,
-                    "maxP": 0.99,
-                    "resolvedBounds": resolved_bounds,
-                },
-                activeCells=active_cells,
-                retainedCells=retained_cells,
-                retainedFraction=retained_cells / active_cells,
-                notes=attribute_notes,
-                evidenceId=f"qcProfile:{profile_id}",
-            )
-        )
-
-    sample_attributes = list(values_by_attr)
-    for sample_column in _qc_sample_columns(deps, characterization):
-        if not sample_attributes:
-            break
-        try:
-            sample_labels = np.asarray(deps.store.cells.fetch_all(sample_column))
-            keep, provenance = _sample_aware_mad_mask(
-                values_by_attr=values_by_attr,
-                sample_labels=sample_labels,
-                active=active,
-                n_mads=3.0,
-                min_cells_per_sample=20,
-                attrs=sample_attributes,
-            )
-        except (TypeError, ValueError):
-            continue
-        retained_mask = active & keep
-        retained_cells = int(retained_mask.sum())
-        sample_retention: dict[str, int] = {}
-        seen: set[object] = set()
-        for label in sample_labels[active]:
-            value = label.item() if isinstance(label, np.generic) else label
-            if value in seen:
-                continue
-            seen.add(value)
-            key = value.decode("utf-8") if isinstance(value, bytes) else str(value)
-            sample_retention[key] = int(
-                (retained_mask & (sample_labels == label)).sum()
-            )
-        notes = list(provenance["warnings"])
-        if len(sample_retention) > _MAX_SAMPLE_RETENTION_ITEMS:
-            notes.append(
-                "Per-sample retention was truncated to the first "
-                f"{_MAX_SAMPLE_RETENTION_ITEMS} samples"
-            )
-            sample_retention = dict(
-                list(sample_retention.items())[:_MAX_SAMPLE_RETENTION_ITEMS]
-            )
-        profile_id = _qc_profile_id(
-            "sampleMad",
-            driver=driver,
-            cell_key=deps.cellKey,
-            sample_column=sample_column,
-        )
-        profiles.append(
-            CellQcProfileEvidence(
-                profileId=profile_id,
-                action="sampleMad",
-                driverAssay=driver_assay,
-                driverAssayType=driver_type,
-                cellKey=deps.cellKey,
-                sampleColumn=sample_column,
-                attributes=sample_attributes,
-                parameters={
-                    "nMads": 3.0,
-                    "minCellsPerSample": 20,
-                    "nSamples": len(provenance["sample_sizes"]),
-                    "nSkippedSamples": len(provenance["skip_reasons"]),
-                },
-                activeCells=active_cells,
-                retainedCells=retained_cells,
-                retainedFraction=retained_cells / active_cells,
-                sampleRetainedCells=sample_retention,
-                notes=notes,
-                evidenceId=f"qcProfile:{profile_id}",
-            )
-        )
+    )
 
     deps.qcProfiles = {profile.profileId: profile for profile in profiles}
     return profiles
@@ -807,6 +850,10 @@ async def inspect_cell_covariates(
     ctx: RunContext[ExperimentalContextDependencies],
 ) -> CovariateEvidence:
     """Inspect cell metadata without making model-driven choices or writing data."""
+    logger.info(
+        "Experimental Context covariate inspection started: "
+        f"cellKey={ctx.deps.cellKey!r}"
+    )
     characterization = characterize_covariates(
         ctx.deps.store,
         studyContext=ctx.deps.studyContext,
@@ -824,6 +871,15 @@ async def inspect_cell_covariates(
     )
     ctx.deps.evidenceIds.update(evidence_ids)
     ctx.deps.toolCalls.append("inspect_cell_covariates")
+    logger.info(
+        "Experimental Context covariate inspection completed: "
+        f"status={characterization.status}, "
+        f"columns={len(characterization.columns)}, "
+        f"coefficients={len(characterization.coefficients)}, "
+        f"qcProfiles={len(qc_profiles)}, "
+        f"htoIdentities={len(ctx.deps.htoIdentityColumns)}, "
+        f"evidence={len(evidence_ids)}"
+    )
     return CovariateEvidence(
         characterization=characterization,
         qcProfiles=qc_profiles,
@@ -849,6 +905,16 @@ async def analyze_experimental_design(
         batch_columns: Exact technical columns proposed for Harmony evaluation.
             A single column may be supplied as either a string or a one-item list.
     """
+    proposed_batch_count = (
+        1 if isinstance(batch_columns, str) else len(batch_columns or [])
+    )
+    logger.info(
+        "Experimental Context design analysis started: "
+        f"domains={len(column_domains)}, "
+        f"coefficients={len(coefficients_of_interest)}, "
+        f"inferenceUnits={len(units_of_inference)}, "
+        f"batchColumns={proposed_batch_count}"
+    )
     directions = dict(ctx.deps.directions)
     directed_domains = dict(column_domains)
     directed_domains.update(dict(directions.get("columnDomains") or {}))
@@ -877,6 +943,7 @@ async def analyze_experimental_design(
         directions=directions,
     )
     if characterization.status == "failed":
+        logger.warning("Experimental Context design characterization failed")
         raise ModelRetry("; ".join(characterization.notes))
 
     proposed_batch_columns = (
@@ -974,6 +1041,10 @@ async def analyze_experimental_design(
                     },
                 )
             except (KeyError, TypeError, ValueError) as exc:
+                logger.debug(
+                    "Experimental Context batch estimability was not computed: "
+                    f"errorType={type(exc).__name__}"
+                )
                 estimability = {
                     "status": "notComputed",
                     "reason": type(exc).__name__,
@@ -1014,6 +1085,18 @@ async def analyze_experimental_design(
     )
     ctx.deps.evidenceIds.update(evidence_ids)
     ctx.deps.toolCalls.append("analyze_experimental_design")
+    safety_counts = {
+        status: sum(item.status == status for item in batch_safety)
+        for status in ("safe", "unsafe", "notComputed")
+    }
+    logger.info(
+        "Experimental Context design analysis completed: "
+        f"status={characterization.status}, "
+        f"batchSafetySafe={safety_counts['safe']}, "
+        f"batchSafetyUnsafe={safety_counts['unsafe']}, "
+        f"batchSafetyNotComputed={safety_counts['notComputed']}, "
+        f"qcProfiles={len(qc_profiles)}, evidence={len(evidence_ids)}"
+    )
     return CovariateEvidence(
         characterization=characterization,
         batchSafety=batch_safety,
@@ -1037,6 +1120,11 @@ async def score_current_representation(
         biological_column: Optional biological label used to assess preservation.
         from_assay: Assay whose current graph state should be scored.
     """
+    logger.info(
+        "Experimental Context representation scoring started: "
+        f"assaySpecified={from_assay is not None}, "
+        f"biologicalLabelSpecified={biological_column is not None}"
+    )
     store = ctx.deps.store
     available_columns = set(store.cells.columns)
     if batch_column not in available_columns:
@@ -1072,6 +1160,10 @@ async def score_current_representation(
         )
         ctx.deps.currentRepresentation = evaluation
         ctx.deps.toolCalls.append("score_current_representation")
+        logger.info(
+            "Experimental Context representation scoring skipped: "
+            "no current neighbors artifact"
+        )
         return evaluation
     if state.cell_key != ctx.deps.cellKey:
         evaluation = RepresentationEvaluation(
@@ -1085,6 +1177,10 @@ async def score_current_representation(
         )
         ctx.deps.currentRepresentation = evaluation
         ctx.deps.toolCalls.append("score_current_representation")
+        logger.info(
+            "Experimental Context representation scoring skipped: "
+            "cell selection mismatch"
+        )
         return evaluation
 
     metrics: dict[str, float] = {}
@@ -1104,6 +1200,10 @@ async def score_current_representation(
             metrics[f"iLISI:{batch_column}"] = value
             evidence_ids.append(f"metric:iLISI:{batch_column}:{neighbor_route}")
     except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        logger.debug(
+            "Experimental Context iLISI scoring was unavailable: "
+            f"errorType={type(exc).__name__}"
+        )
         notes.append(f"iLISI could not be scored: {exc}")
     try:
         value = float(
@@ -1120,6 +1220,10 @@ async def score_current_representation(
                 f"metric:proportionalBatchMixing:{batch_column}:{neighbor_route}"
             )
     except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        logger.debug(
+            "Experimental Context batch-mixing scoring was unavailable: "
+            f"errorType={type(exc).__name__}"
+        )
         notes.append(f"Proportional batch mixing could not be scored: {exc}")
     if biological_column is not None:
         try:
@@ -1137,6 +1241,10 @@ async def score_current_representation(
                     f"metric:cLISI:{biological_column}:{neighbor_route}"
                 )
         except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            logger.debug(
+                "Experimental Context cLISI scoring was unavailable: "
+                f"errorType={type(exc).__name__}"
+            )
             notes.append(f"cLISI could not be scored: {exc}")
         if state.connectivity_map is not None:
             try:
@@ -1156,6 +1264,10 @@ async def score_current_representation(
                         f"{state.connectivity_map.artifact_id}"
                     )
             except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+                logger.debug(
+                    "Experimental Context connectivity scoring was unavailable: "
+                    f"errorType={type(exc).__name__}"
+                )
                 notes.append(f"Graph connectivity could not be scored: {exc}")
 
     evaluation = RepresentationEvaluation(
@@ -1175,6 +1287,11 @@ async def score_current_representation(
     ctx.deps.currentRepresentation = evaluation
     ctx.deps.evidenceIds.update(evidence_ids)
     ctx.deps.toolCalls.append("score_current_representation")
+    logger.info(
+        "Experimental Context representation scoring completed: "
+        f"available={evaluation.available}, metrics={len(metrics)}, "
+        f"notes={len(notes)}, evidence={len(evidence_ids)}"
+    )
     return evaluation
 
 
@@ -1282,86 +1399,23 @@ def _canonical_cell_qc_plan(
     )
 
 
-def validate_experimental_context(
+def _validate_batch_correction_plan(
     decision: ExperimentalContextDecision,
     deps: ExperimentalContextDependencies,
-) -> ExperimentalContextDecision:
-    """Recompute and validate every model-authored design choice."""
-    directions = dict(deps.directions)
-    column_domains = dict(decision.columnDomains)
-    column_domains.update(dict(directions.get("columnDomains") or {}))
-    directions["columnDomains"] = column_domains
-    directions["coefficientsOfInterest"] = list(
-        dict.fromkeys(
-            [
-                *decision.coefficientsOfInterest,
-                *(directions.get("coefficientsOfInterest") or []),
-            ]
-        )
-    )
-    units_of_inference = {
-        name: unit.model_dump(exclude_none=True)
-        for name, unit in decision.unitsOfInference.items()
-    }
-    units_of_inference.update(dict(directions.get("unitsOfInference") or {}))
-    directions["unitsOfInference"] = units_of_inference
-
-    characterization = characterize_covariates(
-        deps.store,
-        studyContext=deps.studyContext,
-        model=None,
-        cellKey=deps.cellKey,
-        directions=directions,
-    )
-    if characterization.status == "failed":
-        raise ModelRetry("; ".join(characterization.notes))
-    deps.characterization = characterization
-    deps.evidenceIds.update(characterization_evidence(characterization))
-
-    if "inspect_cell_covariates" not in deps.toolCalls:
-        raise ModelRetry("Call inspect_cell_covariates before returning a decision")
-    if "analyze_experimental_design" not in deps.toolCalls:
-        raise ModelRetry("Call analyze_experimental_design before returning a decision")
-
-    cell_qc_plan = _canonical_cell_qc_plan(
-        decision.cellQc,
-        deps,
-        characterization,
-    )
-    deps.evidenceIds.update(profile.evidenceId for profile in deps.qcProfiles.values())
-
-    requested_coefficients = set(directions["coefficientsOfInterest"])
-    characterized_coefficients = {
-        record.get("name") for record in characterization.coefficients
-    }
-    missing_coefficients = sorted(
-        name
-        for name in requested_coefficients
-        if name not in characterized_coefficients
-    )
-    if missing_coefficients:
-        raise ModelRetry(
-            "Coefficients of interest must be classified as biological: "
-            f"{missing_coefficients}"
-        )
-
-    coefficient_records = {
-        record.get("name"): record
-        for record in characterization.coefficients
-        if isinstance(record.get("name"), str)
-    }
+    characterization: CovariateCharacterization,
+    requested_coefficients: set[str],
+    units_of_inference: dict[str, dict[str, Any]],
+    cell_qc_plan: CellQcPlan,
+    records: dict[str, dict[str, Any]],
+    coefficient_records: dict[str, dict[str, Any]],
+) -> None:
+    """Validate one batch plan against exact design, safety, and metric evidence."""
     confounding_reports = {
         report.get("coefficient"): report
         for report in characterization.confounding
         if isinstance(report.get("coefficient"), str)
     }
-
     plan = decision.batchCorrection
-    records = {
-        record["name"]: record
-        for record in characterization.columns
-        if isinstance(record.get("name"), str)
-    }
     unknown_columns = sorted(set(decision.columnDomains) - set(records))
     if unknown_columns:
         raise ModelRetry(f"Unknown column domain assignments: {unknown_columns}")
@@ -1536,6 +1590,90 @@ def validate_experimental_context(
             f"{stale_metric_evidence}"
         )
 
+
+def validate_experimental_context(
+    decision: ExperimentalContextDecision,
+    deps: ExperimentalContextDependencies,
+) -> ExperimentalContextDecision:
+    """Recompute and validate every model-authored design choice."""
+    directions = dict(deps.directions)
+    column_domains = dict(decision.columnDomains)
+    column_domains.update(dict(directions.get("columnDomains") or {}))
+    directions["columnDomains"] = column_domains
+    directions["coefficientsOfInterest"] = list(
+        dict.fromkeys(
+            [
+                *decision.coefficientsOfInterest,
+                *(directions.get("coefficientsOfInterest") or []),
+            ]
+        )
+    )
+    units_of_inference = {
+        name: unit.model_dump(exclude_none=True)
+        for name, unit in decision.unitsOfInference.items()
+    }
+    units_of_inference.update(dict(directions.get("unitsOfInference") or {}))
+    directions["unitsOfInference"] = units_of_inference
+
+    characterization = characterize_covariates(
+        deps.store,
+        studyContext=deps.studyContext,
+        model=None,
+        cellKey=deps.cellKey,
+        directions=directions,
+    )
+    if characterization.status == "failed":
+        raise ModelRetry("; ".join(characterization.notes))
+    deps.characterization = characterization
+    deps.evidenceIds.update(characterization_evidence(characterization))
+
+    if "inspect_cell_covariates" not in deps.toolCalls:
+        raise ModelRetry("Call inspect_cell_covariates before returning a decision")
+    if "analyze_experimental_design" not in deps.toolCalls:
+        raise ModelRetry("Call analyze_experimental_design before returning a decision")
+
+    cell_qc_plan = _canonical_cell_qc_plan(
+        decision.cellQc,
+        deps,
+        characterization,
+    )
+    deps.evidenceIds.update(profile.evidenceId for profile in deps.qcProfiles.values())
+
+    requested_coefficients = set(directions["coefficientsOfInterest"])
+    characterized_coefficients = {
+        record.get("name") for record in characterization.coefficients
+    }
+    missing_coefficients = sorted(
+        name
+        for name in requested_coefficients
+        if name not in characterized_coefficients
+    )
+    if missing_coefficients:
+        raise ModelRetry(
+            "Coefficients of interest must be classified as biological: "
+            f"{missing_coefficients}"
+        )
+
+    coefficient_records: dict[str, dict[str, Any]] = {}
+    for record in characterization.coefficients:
+        name = record.get("name")
+        if isinstance(name, str):
+            coefficient_records[name] = record
+    records: dict[str, dict[str, Any]] = {}
+    for record in characterization.columns:
+        name = record.get("name")
+        if isinstance(name, str):
+            records[name] = record
+    _validate_batch_correction_plan(
+        decision,
+        deps,
+        characterization,
+        requested_coefficients,
+        units_of_inference,
+        cell_qc_plan,
+        records,
+        coefficient_records,
+    )
     canonical_domains = {
         name: records[name]["domain"]
         for name in column_domains
@@ -1557,7 +1695,7 @@ def validate_experimental_context(
         for coefficient in directions["coefficientsOfInterest"]
         if coefficient in coefficient_records
     }
-    return decision.model_copy(
+    validated = decision.model_copy(
         update={
             "columnDomains": canonical_domains,
             "coefficientsOfInterest": list(directions["coefficientsOfInterest"]),
@@ -1565,6 +1703,15 @@ def validate_experimental_context(
             "cellQc": cell_qc_plan,
         }
     )
+    logger.debug(
+        "Experimental Context decision validated: "
+        f"domains={len(validated.columnDomains)}, "
+        f"coefficients={len(validated.coefficientsOfInterest)}, "
+        f"cellQc={validated.cellQc.action}, "
+        f"batchCorrection={validated.batchCorrection.action}, "
+        f"needsInput={len(validated.needsInput)}"
+    )
+    return validated
 
 
 class ExperimentalContextAgent:
@@ -1578,8 +1725,8 @@ class ExperimentalContextAgent:
     ) -> None:
         self.model = model
         self.config = (config or AgentRunConfig()).with_limits(
-            request_limit=6,
-            tool_call_limit=4,
+            request_limit=9,
+            tool_call_limit=5,
             output_token_limit=32768,
             timeout_seconds=600.0,
         )
@@ -1640,6 +1787,11 @@ class ExperimentalContextAgent:
         if len(study_context) > _CONTEXT_LIMIT:
             study_context = study_context[: _CONTEXT_LIMIT - 3] + "..."
         direction_map = dict(directions or {})
+        logger.info(
+            "Experimental Context Agent started: "
+            f"cellKey={cell_key!r}, directions={len(direction_map)}, "
+            f"studyContextProvided={bool(study_context)}"
+        )
         deps = ExperimentalContextDependencies(
             store=store,
             studyContext=study_context,
@@ -1715,6 +1867,13 @@ class ExperimentalContextAgent:
             status = "needsInput"
         else:
             status = "done"
+        logger.info(
+            "Experimental Context Agent completed: "
+            f"status={status}, cellQc={decision.cellQc.action}, "
+            f"batchCorrection={decision.batchCorrection.action}, "
+            f"coefficients={len(decision.coefficientsOfInterest)}, "
+            f"toolCalls={len(deps.toolCalls)}, evidence={len(deps.evidenceIds)}"
+        )
         return ExperimentalContextResult(
             status=status,
             decision=decision,

@@ -6,6 +6,7 @@ from typing import Any, Literal, cast
 
 from ...datastore.datastore import DataStore
 from ...storage.refs import ArtifactRef
+from ...utils.logging import logger
 from ..biological_interpretation import (
     BiologicalContext,
     BiologicalInterpretationAgent,
@@ -20,20 +21,7 @@ from ..persistence import (
     AgentWorkflowRun,
 )
 from ..types import ArtifactReferenceModel, ExperimentalBiologyHandoff
-from .journal import (
-    _complete_attempt,
-    _ensure_orchestration_store,
-    _recover_persisted_stage_report,
-    _report_link,
-    _safe_label,
-    _save_outcome,
-    _save_stage_report,
-    _start_attempt,
-    _validated_done_outcome,
-    finalize_failed,
-    finish_exception,
-    load_stage_report,
-)
+from . import journal
 from .models import (
     AutomatedPreprocessingPlan,
     FinalAnalysisHandoff,
@@ -68,8 +56,8 @@ class FinalizationStagesMixin:
         *,
         resume_record: OrchestrationResumeRecord | None = None,
     ) -> tuple[WorkflowStageAttempt, FinalAnalysisHandoff]:
-        prefix = _ensure_orchestration_store(store)
-        existing = _validated_done_outcome(
+        prefix = journal._ensure_orchestration_store(store)
+        existing = journal._validated_done_outcome(
             store,
             prefix,
             workflow.workflowRunId,
@@ -78,10 +66,13 @@ class FinalizationStagesMixin:
             parents,
         )
         if existing is not None:
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: reusing finalized analysis"
+            )
             return existing, FinalAnalysisHandoff.model_validate(
                 existing.outputs["finalAnalysis"]
             )
-        started = _start_attempt(
+        started = journal._start_attempt(
             store.zw,
             prefix,
             workflow.workflowRunId,
@@ -101,6 +92,11 @@ class FinalizationStagesMixin:
         actions: list[str] = []
         operations: list[dict[str, Any]] = []
         metadata_columns: list[str] = []
+        logger.info(
+            f"Workflow {workflow.workflowRunId}: finalizing "
+            f"{len(preprocessed)} native analysis route(s) and markers from "
+            f"assay {plan.markerAssay!r}"
+        )
         try:
             if (
                 tuning_report.status != "done"
@@ -114,197 +110,32 @@ class FinalizationStagesMixin:
                 self.model,
                 config=request_record.config.agentRunConfig,
             )
-            native_handoffs: list[NativeAnalysisHandoff] = []
-            native_umaps: dict[str, tuple[ArtifactReferenceModel, list[str]]] = {}
             token = workflow.workflowRunId[:12]
-            for assay, assay_report in tuning_report.assayReports.items():
-                preprocessed_assay = preprocessed_by_assay[assay]
-                normalized = preprocessed_assay.normalized
-                if normalized is None:
-                    raise ValueError(f"Assay {assay!r} lacks normalization")
-                promoted = agent.promote(
+            native_handoffs, native_umaps = self.finalize_native_analyses(
+                store,
+                agent,
+                request_record,
+                tuning_report,
+                preprocessed_by_assay,
+                token,
+                artifacts,
+                actions,
+                operations,
+                metadata_columns,
+            )
+            graph_method, final_graph, final_umap, final_umap_columns = (
+                self.finalize_selected_graph(
                     store,
-                    report=assay_report,
-                    normalized=artifact_model_to_ref(normalized),
-                    identity_feature_limit=request_record.config.maxIdentityFeatures,
+                    plan,
+                    tuning_report,
+                    native_handoffs,
+                    native_umaps,
+                    token,
+                    actions,
+                    operations,
+                    metadata_columns,
                 )
-                reduction_key = promoted.parameters.reductionMethod
-                reduction_record = promoted.artifacts[reduction_key]
-                reduction_ref = artifact_model_to_ref(
-                    ArtifactReferenceModel.model_validate(reduction_record.model_dump())
-                )
-                initialization_ref = store.build_embedding_initialization(
-                    reduction_ref,
-                    from_assay=assay,
-                    n_centroids=min(1000, preprocessed_assay.nCells),
-                    rand_state=4466,
-                    update_state=True,
-                    invalidate_cache=False,
-                )
-                graph_record = promoted.artifacts["connectivityMap"]
-                graph_ref = artifact_model_to_ref(
-                    ArtifactReferenceModel.model_validate(graph_record.model_dump())
-                )
-                umap_label = f"agent_{token}_{_safe_label(assay).lower()}_native_umap"
-                umap_ref = store.run_umap(
-                    graph_ref,
-                    from_assay=assay,
-                    cell_key="I",
-                    label=umap_label,
-                    parallel=False,
-                    random_seed=4444,
-                    invalidate_cache=False,
-                )
-                umap_columns = [
-                    f"{assay}_{umap_label}1",
-                    f"{assay}_{umap_label}2",
-                ]
-                metadata_columns.extend(
-                    [*umap_columns, cast(str, promoted.clusterColumn)]
-                )
-                promoted_artifacts = {
-                    name: ArtifactReferenceModel.model_validate(value.model_dump())
-                    for name, value in promoted.artifacts.items()
-                }
-                umap_model = ArtifactReferenceModel.from_artifact_ref(umap_ref)
-                initialization_model = ArtifactReferenceModel.from_artifact_ref(
-                    initialization_ref
-                )
-                native_umaps[assay] = (umap_model, umap_columns)
-                operations.extend(
-                    [
-                        {
-                            "operation": "promote_parameter_candidate",
-                            "assay": assay,
-                            "candidate": promoted.parameters.model_dump(mode="json"),
-                            "normalized": normalized.model_dump(mode="json"),
-                            "identityFeatureLimit": (
-                                request_record.config.maxIdentityFeatures
-                            ),
-                            "updateState": True,
-                            "artifacts": {
-                                name: value.model_dump(mode="json")
-                                for name, value in promoted_artifacts.items()
-                            },
-                        },
-                        {
-                            "operation": "build_embedding_initialization",
-                            "assay": assay,
-                            "reduction": ArtifactReferenceModel.model_validate(
-                                reduction_record.model_dump()
-                            ).model_dump(mode="json"),
-                            "nCentroids": min(1000, preprocessed_assay.nCells),
-                            "randomSeed": 4466,
-                            "updateState": True,
-                            "invalidateCache": False,
-                            "artifact": initialization_model.model_dump(mode="json"),
-                        },
-                        {
-                            "operation": "run_umap",
-                            "assay": assay,
-                            "graph": promoted_artifacts["connectivityMap"].model_dump(
-                                mode="json"
-                            ),
-                            "cellKey": "I",
-                            "label": umap_label,
-                            "parallel": False,
-                            "randomSeed": 4444,
-                            "invalidateCache": False,
-                            "artifact": umap_model.model_dump(mode="json"),
-                        },
-                    ]
-                )
-                handoff = NativeAnalysisHandoff(
-                    assay=assay,
-                    reductionMethod=cast(
-                        ReductionMethod, promoted.parameters.reductionMethod
-                    ),
-                    featureSelection=preprocessed_assay.graphFeatures,
-                    markerFeatures=preprocessed_assay.markerFeatures,
-                    normalized=normalized,
-                    reduction=promoted_artifacts[reduction_key],
-                    batchCorrection=promoted_artifacts.get("harmony"),
-                    annIndex=promoted_artifacts["annIndex"],
-                    embeddingInitialization=initialization_model,
-                    neighbors=promoted_artifacts["neighbors"],
-                    graph=promoted_artifacts["connectivityMap"],
-                    clusters=promoted_artifacts["clusters"],
-                    clusterColumn=cast(str, promoted.clusterColumn),
-                    umap=umap_model,
-                    umapColumns=umap_columns,
-                )
-                native_handoffs.append(handoff)
-                artifacts.update(
-                    {
-                        f"{assay}_{name}": value
-                        for name, value in {
-                            **promoted_artifacts,
-                            "embeddingInitialization": initialization_model,
-                            "umap": umap_model,
-                        }.items()
-                    }
-                )
-                actions.extend([f"promote_native:{assay}", f"run_native_umap:{assay}"])
-            graph_method: Literal["native", "snn", "wnn"] = "native"
-            final_graph: ArtifactReferenceModel
-            final_umap: ArtifactReferenceModel
-            final_umap_columns: list[str]
-            if tuning_report.recommendedIntegrationId is not None:
-                selected_integration = next(
-                    value
-                    for value in tuning_report.integrationEvaluations
-                    if value.integrationId == tuning_report.recommendedIntegrationId
-                )
-                if selected_integration.graphArtifact is None:
-                    raise ValueError("Selected integration lacks its graph artifact")
-                final_graph = ArtifactReferenceModel.model_validate(
-                    selected_integration.graphArtifact.model_dump()
-                )
-                graph_method = selected_integration.method
-                graph_ref = artifact_model_to_ref(final_graph)
-                graph_label = f"agent_{token}_{graph_method}"
-                umap_label = f"agent_{token}_{graph_method}_final_umap"
-                umap_ref = store.run_umap(
-                    graph_ref,
-                    from_assay=plan.primaryAssay,
-                    cell_key="I",
-                    label=umap_label,
-                    parallel=False,
-                    random_seed=4444,
-                    invalidate_cache=False,
-                )
-                final_umap = ArtifactReferenceModel.from_artifact_ref(umap_ref)
-                final_umap_columns = [
-                    f"{graph_label}_{umap_label}1",
-                    f"{graph_label}_{umap_label}2",
-                ]
-                metadata_columns.extend(final_umap_columns)
-                actions.append(f"run_final_umap:{graph_method}")
-                operations.append(
-                    {
-                        "operation": "run_umap",
-                        "graphMethod": graph_method,
-                        "graph": final_graph.model_dump(mode="json"),
-                        "fromAssay": plan.primaryAssay,
-                        "cellKey": "I",
-                        "label": umap_label,
-                        "parallel": False,
-                        "randomSeed": 4444,
-                        "invalidateCache": False,
-                        "artifact": final_umap.model_dump(mode="json"),
-                    }
-                )
-            else:
-                graph_assay = tuning_report.graphAssay
-                if graph_assay is None:
-                    raise ValueError("Native final selection lacks graphAssay")
-                native = next(
-                    value for value in native_handoffs if value.assay == graph_assay
-                )
-                if native.graph is None:
-                    raise ValueError("Native final selection lacks graph artifact")
-                final_graph = native.graph
-                final_umap, final_umap_columns = native_umaps[graph_assay]
+            )
             final_clusters = ArtifactReferenceModel.model_validate(
                 tuning_report.finalClusterArtifact.model_dump()
             )
@@ -385,7 +216,7 @@ class FinalizationStagesMixin:
                     "artifact": marker_model.model_dump(mode="json"),
                 }
             )
-            outcome = _complete_attempt(
+            outcome = journal._complete_attempt(
                 started,
                 status="done",
                 artifacts=artifacts,
@@ -397,10 +228,15 @@ class FinalizationStagesMixin:
                 actions=actions,
                 notes=final_analysis.limitations,
             )
-            _save_outcome(store.zw, prefix, outcome)
+            journal._save_outcome(store.zw, prefix, outcome)
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: finalized "
+                f"graphMethod={graph_method!r}, nativeLayouts="
+                f"{len(native_handoffs)}, markerAssay={plan.markerAssay!r}"
+            )
             return outcome, final_analysis
         except Exception as exc:
-            outcome = finish_exception(
+            outcome = journal.finish_exception(
                 store,
                 prefix,
                 workflow,
@@ -414,6 +250,239 @@ class FinalizationStagesMixin:
                 },
             )
             return outcome, FinalAnalysisHandoff.get_blank()
+
+    def finalize_native_analyses(
+        self,
+        store: DataStore,
+        agent: ParameterTuningAgent,
+        request_record: OrchestrationRequestRecord,
+        tuning_report: ParameterTuningReport,
+        preprocessed_by_assay: Mapping[str, PreprocessedAssayHandoff],
+        token: str,
+        artifacts: dict[str, ArtifactReferenceModel],
+        actions: list[str],
+        operations: list[dict[str, Any]],
+        metadata_columns: list[str],
+    ) -> tuple[
+        list[NativeAnalysisHandoff],
+        dict[str, tuple[ArtifactReferenceModel, list[str]]],
+    ]:
+        native_handoffs: list[NativeAnalysisHandoff] = []
+        native_umaps: dict[str, tuple[ArtifactReferenceModel, list[str]]] = {}
+        for assay, assay_report in tuning_report.assayReports.items():
+            logger.info(
+                f"Finalizing native analysis for assay {assay!r} with candidate "
+                f"{assay_report.recommendedCandidateId!r}"
+            )
+            preprocessed_assay = preprocessed_by_assay[assay]
+            normalized = preprocessed_assay.normalized
+            if normalized is None:
+                raise ValueError(f"Assay {assay!r} lacks normalization")
+            promoted = agent.promote(
+                store,
+                report=assay_report,
+                normalized=artifact_model_to_ref(normalized),
+                identity_feature_limit=request_record.config.maxIdentityFeatures,
+            )
+            reduction_key = promoted.parameters.reductionMethod
+            reduction_record = promoted.artifacts[reduction_key]
+            reduction_ref = artifact_model_to_ref(
+                ArtifactReferenceModel.model_validate(reduction_record.model_dump())
+            )
+            initialization_ref = store.build_embedding_initialization(
+                reduction_ref,
+                from_assay=assay,
+                n_centroids=min(1000, preprocessed_assay.nCells),
+                rand_state=4466,
+                update_state=True,
+                invalidate_cache=False,
+            )
+            graph_record = promoted.artifacts["connectivityMap"]
+            graph_ref = artifact_model_to_ref(
+                ArtifactReferenceModel.model_validate(graph_record.model_dump())
+            )
+            umap_label = (
+                f"agent_{token}_{journal._safe_label(assay).lower()}_native_umap"
+            )
+            umap_ref = store.run_umap(
+                graph_ref,
+                from_assay=assay,
+                cell_key="I",
+                label=umap_label,
+                parallel=False,
+                random_seed=4444,
+                invalidate_cache=False,
+            )
+            umap_columns = [
+                f"{assay}_{umap_label}1",
+                f"{assay}_{umap_label}2",
+            ]
+            metadata_columns.extend([*umap_columns, cast(str, promoted.clusterColumn)])
+            promoted_artifacts = {
+                name: ArtifactReferenceModel.model_validate(value.model_dump())
+                for name, value in promoted.artifacts.items()
+            }
+            umap_model = ArtifactReferenceModel.from_artifact_ref(umap_ref)
+            initialization_model = ArtifactReferenceModel.from_artifact_ref(
+                initialization_ref
+            )
+            native_umaps[assay] = (umap_model, umap_columns)
+            operations.extend(
+                [
+                    {
+                        "operation": "promote_parameter_candidate",
+                        "assay": assay,
+                        "candidate": promoted.parameters.model_dump(mode="json"),
+                        "normalized": normalized.model_dump(mode="json"),
+                        "identityFeatureLimit": (
+                            request_record.config.maxIdentityFeatures
+                        ),
+                        "updateState": True,
+                        "artifacts": {
+                            name: value.model_dump(mode="json")
+                            for name, value in promoted_artifacts.items()
+                        },
+                    },
+                    {
+                        "operation": "build_embedding_initialization",
+                        "assay": assay,
+                        "reduction": ArtifactReferenceModel.model_validate(
+                            reduction_record.model_dump()
+                        ).model_dump(mode="json"),
+                        "nCentroids": min(1000, preprocessed_assay.nCells),
+                        "randomSeed": 4466,
+                        "updateState": True,
+                        "invalidateCache": False,
+                        "artifact": initialization_model.model_dump(mode="json"),
+                    },
+                    {
+                        "operation": "run_umap",
+                        "assay": assay,
+                        "graph": promoted_artifacts["connectivityMap"].model_dump(
+                            mode="json"
+                        ),
+                        "cellKey": "I",
+                        "label": umap_label,
+                        "parallel": False,
+                        "randomSeed": 4444,
+                        "invalidateCache": False,
+                        "artifact": umap_model.model_dump(mode="json"),
+                    },
+                ]
+            )
+            native_handoffs.append(
+                NativeAnalysisHandoff(
+                    assay=assay,
+                    reductionMethod=cast(
+                        ReductionMethod, promoted.parameters.reductionMethod
+                    ),
+                    featureSelection=preprocessed_assay.graphFeatures,
+                    markerFeatures=preprocessed_assay.markerFeatures,
+                    normalized=normalized,
+                    reduction=promoted_artifacts[reduction_key],
+                    batchCorrection=promoted_artifacts.get("harmony"),
+                    annIndex=promoted_artifacts["annIndex"],
+                    embeddingInitialization=initialization_model,
+                    neighbors=promoted_artifacts["neighbors"],
+                    graph=promoted_artifacts["connectivityMap"],
+                    clusters=promoted_artifacts["clusters"],
+                    clusterColumn=cast(str, promoted.clusterColumn),
+                    umap=umap_model,
+                    umapColumns=umap_columns,
+                )
+            )
+            artifacts.update(
+                {
+                    f"{assay}_{name}": value
+                    for name, value in {
+                        **promoted_artifacts,
+                        "embeddingInitialization": initialization_model,
+                        "umap": umap_model,
+                    }.items()
+                }
+            )
+            actions.extend([f"promote_native:{assay}", f"run_native_umap:{assay}"])
+            logger.info(f"Finalized native UMAP and clusters for assay {assay!r}")
+        return native_handoffs, native_umaps
+
+    def finalize_selected_graph(
+        self,
+        store: DataStore,
+        plan: AutomatedPreprocessingPlan,
+        tuning_report: ParameterTuningReport,
+        native_handoffs: Sequence[NativeAnalysisHandoff],
+        native_umaps: Mapping[str, tuple[ArtifactReferenceModel, list[str]]],
+        token: str,
+        actions: list[str],
+        operations: list[dict[str, Any]],
+        metadata_columns: list[str],
+    ) -> tuple[
+        Literal["native", "snn", "wnn"],
+        ArtifactReferenceModel,
+        ArtifactReferenceModel,
+        list[str],
+    ]:
+        if tuning_report.recommendedIntegrationId is not None:
+            selected_integration = next(
+                value
+                for value in tuning_report.integrationEvaluations
+                if value.integrationId == tuning_report.recommendedIntegrationId
+            )
+            if selected_integration.graphArtifact is None:
+                raise ValueError("Selected integration lacks its graph artifact")
+            final_graph = ArtifactReferenceModel.model_validate(
+                selected_integration.graphArtifact.model_dump()
+            )
+            graph_method = selected_integration.method
+            logger.info(
+                f"Finalizing selected {graph_method.upper()} graph "
+                f"{selected_integration.integrationId!r}"
+            )
+            graph_ref = artifact_model_to_ref(final_graph)
+            graph_label = f"agent_{token}_{graph_method}"
+            umap_label = f"agent_{token}_{graph_method}_final_umap"
+            umap_ref = store.run_umap(
+                graph_ref,
+                from_assay=plan.primaryAssay,
+                cell_key="I",
+                label=umap_label,
+                parallel=False,
+                random_seed=4444,
+                invalidate_cache=False,
+            )
+            final_umap = ArtifactReferenceModel.from_artifact_ref(umap_ref)
+            final_umap_columns = [
+                f"{graph_label}_{umap_label}1",
+                f"{graph_label}_{umap_label}2",
+            ]
+            metadata_columns.extend(final_umap_columns)
+            actions.append(f"run_final_umap:{graph_method}")
+            operations.append(
+                {
+                    "operation": "run_umap",
+                    "graphMethod": graph_method,
+                    "graph": final_graph.model_dump(mode="json"),
+                    "fromAssay": plan.primaryAssay,
+                    "cellKey": "I",
+                    "label": umap_label,
+                    "parallel": False,
+                    "randomSeed": 4444,
+                    "invalidateCache": False,
+                    "artifact": final_umap.model_dump(mode="json"),
+                }
+            )
+            return graph_method, final_graph, final_umap, final_umap_columns
+        graph_assay = tuning_report.graphAssay
+        if graph_assay is None:
+            raise ValueError("Native final selection lacks graphAssay")
+        native = next(value for value in native_handoffs if value.assay == graph_assay)
+        if native.graph is None:
+            raise ValueError("Native final selection lacks graph artifact")
+        final_umap, final_umap_columns = native_umaps[graph_assay]
+        logger.info(
+            f"Reusing native graph and UMAP from assay {graph_assay!r} as final"
+        )
+        return "native", native.graph, final_umap, final_umap_columns
 
     def biological_interpretation_stage(
         self,
@@ -432,8 +501,8 @@ class FinalizationStagesMixin:
         *,
         resume_record: OrchestrationResumeRecord | None = None,
     ) -> WorkflowStageAttempt:
-        prefix = _ensure_orchestration_store(store)
-        existing = _validated_done_outcome(
+        prefix = journal._ensure_orchestration_store(store)
+        existing = journal._validated_done_outcome(
             store,
             prefix,
             workflow.workflowRunId,
@@ -442,7 +511,11 @@ class FinalizationStagesMixin:
             parents,
         )
         if existing is not None:
-            load_stage_report(store, existing, BiologicalInterpretationReport)
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: reusing Biological "
+                "Interpretation report"
+            )
+            journal.load_stage_report(store, existing, BiologicalInterpretationReport)
             return existing
         requested_coefficient = answers.get("primaryCoefficient")
         if not isinstance(requested_coefficient, str) or not requested_coefficient:
@@ -451,7 +524,11 @@ class FinalizationStagesMixin:
             )
             requested_coefficient = directed if isinstance(directed, str) else None
         coefficients = list(experimental.decision.coefficientsOfInterest)
-        started = _start_attempt(
+        logger.info(
+            f"Workflow {workflow.workflowRunId}: Biological Interpretation has "
+            f"{len(coefficients)} validated coefficient option(s)"
+        )
+        started = journal._start_attempt(
             store.zw,
             prefix,
             workflow.workflowRunId,
@@ -473,7 +550,11 @@ class FinalizationStagesMixin:
             resume_record=resume_record,
         )
         if requested_coefficient is None and len(coefficients) > 1:
-            outcome = _complete_attempt(
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: Biological Interpretation "
+                "requires a primary coefficient selection"
+            )
+            outcome = journal._complete_attempt(
                 started,
                 status="needsInput",
                 needs_input=WorkflowNeedsInput(
@@ -494,7 +575,7 @@ class FinalizationStagesMixin:
                     "coefficient is selected"
                 ],
             )
-            _save_outcome(store.zw, prefix, outcome)
+            journal._save_outcome(store.zw, prefix, outcome)
             return outcome
         try:
             experimental_handoff: ExperimentalBiologyHandoff | None = None
@@ -557,7 +638,7 @@ class FinalizationStagesMixin:
                 or final_analysis.markerFeatures is None
             ):
                 raise ValueError("Final analysis lacks clusters or marker artifacts")
-            recovered = _recover_persisted_stage_report(
+            recovered = journal._recover_persisted_stage_report(
                 store,
                 started,
                 agent_name="biological_interpretation",
@@ -571,6 +652,10 @@ class FinalizationStagesMixin:
                 ]
             else:
                 recovery_actions = []
+                logger.info(
+                    f"Workflow {workflow.workflowRunId}: invoking Biological "
+                    "Interpretation"
+                )
                 agent = BiologicalInterpretationAgent(
                     self.model,
                     config=request_record.config.agentRunConfig,
@@ -618,11 +703,11 @@ class FinalizationStagesMixin:
                         }
                     )
                 parent_reports = [
-                    _report_link(enrichment_reference),
-                    _report_link(experimental_reference),
-                    _report_link(tuning_reference),
+                    journal._report_link(enrichment_reference),
+                    journal._report_link(experimental_reference),
+                    journal._report_link(tuning_reference),
                 ]
-                saved_report, reference = _save_stage_report(
+                saved_report, reference = journal._save_stage_report(
                     store,
                     started,
                     report,
@@ -660,10 +745,16 @@ class FinalizationStagesMixin:
                     expected_type=BiologicalInterpretationReport,
                 )
                 report = cast(BiologicalInterpretationReport, saved_report)
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: Biological Interpretation "
+                f"returned status={report.status!r}, clusters="
+                f"{len(report.clusterInterpretations)}, treatments="
+                f"{len(report.treatmentObservations)}"
+            )
             if report.status == "needsInput":
                 needs_input = report.needsInput
                 assert needs_input is not None
-                outcome = _complete_attempt(
+                outcome = journal._complete_attempt(
                     started,
                     status="needsInput",
                     report_references=[reference],
@@ -685,7 +776,7 @@ class FinalizationStagesMixin:
                     notes=report.limitations,
                 )
             elif report.status == "failed":
-                outcome = _complete_attempt(
+                outcome = journal._complete_attempt(
                     started,
                     status="failed",
                     report_references=[reference],
@@ -694,7 +785,7 @@ class FinalizationStagesMixin:
                     or "Biological Interpretation failed",
                 )
             else:
-                outcome = _complete_attempt(
+                outcome = journal._complete_attempt(
                     started,
                     status="done",
                     report_references=[reference],
@@ -709,9 +800,15 @@ class FinalizationStagesMixin:
                     },
                     notes=report.limitations,
                 )
-            _save_outcome(store.zw, prefix, outcome)
+            journal._save_outcome(store.zw, prefix, outcome)
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: Biological Interpretation "
+                f"outcome status={outcome.status!r}"
+            )
             if outcome.status == "failed":
-                finalize_failed(store, workflow, outcome.error or "biology failed")
+                journal.finalize_failed(
+                    store, workflow, outcome.error or "biology failed"
+                )
             return outcome
         except Exception as exc:
-            return finish_exception(store, prefix, workflow, started, exc)
+            return journal.finish_exception(store, prefix, workflow, started, exc)

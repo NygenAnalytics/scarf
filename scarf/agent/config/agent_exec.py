@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from inspect import isawaitable, iscoroutinefunction
 from typing import Any
 
+from ...utils.logging import logger
 from ..types import (
     AgentExecutionResult,
     AgentRunInfo,
@@ -171,9 +172,17 @@ def _build_agent(
                 if isawaitable(validated):
                     return await validated
                 return validated
-            except ModelRetry:
+            except ModelRetry as exc:
+                logger.warning(
+                    f"Agent {name or 'unnamed'} requested a structured-output "
+                    f"retry: {str(exc)[:500]}"
+                )
                 raise
             except (TypeError, ValueError) as exc:
+                logger.warning(
+                    f"Agent {name or 'unnamed'} rejected structured output: "
+                    f"{str(exc)[:500]}"
+                )
                 raise ModelRetry(str(exc)) from exc
 
     return agent
@@ -189,7 +198,7 @@ def _execution_result(
 ) -> AgentExecutionResult:
     messages = result.new_messages()
     calls = _tool_calls(messages, allowed_names=_tool_names(tools))
-    return AgentExecutionResult(
+    execution = AgentExecutionResult(
         output=result.output,
         runInfo=AgentRunInfo(
             agentName=name or "",
@@ -200,6 +209,14 @@ def _execution_result(
             toolCalls=calls,
         ),
     )
+    usage = execution.runInfo.usage
+    logger.info(
+        f"Agent {name or 'unnamed'} completed in "
+        f"{execution.runInfo.durationSeconds:.2f}s: requests={usage.requests}, "
+        f"tool_calls={usage.toolCalls}, input_tokens={usage.inputTokens}, "
+        f"output_tokens={usage.outputTokens}"
+    )
+    return execution
 
 
 def run_agent_sync(
@@ -226,6 +243,15 @@ def run_agent_sync(
 
     async def execute() -> AgentExecutionResult:
         run_config = config or AgentRunConfig()
+        agent_name = name or "unnamed"
+        usage_limits = get_usage_limits(run_config)
+        logger.info(
+            f"Starting agent {agent_name}: model={_model_name(model)}, "
+            f"tools={len(tools)}, request_limit={run_config.requestLimit}, "
+            f"tool_call_limit={run_config.toolCallLimit}, retries={run_config.retries}, "
+            f"per_response_output_limit={run_config.outputTokenLimit}, "
+            f"run_output_limit={usage_limits.output_tokens_limit}"
+        )
         agent = _build_agent(
             model=model,
             output_type=output_type,
@@ -238,13 +264,20 @@ def run_agent_sync(
             normalize_sync_function_model=True,
         )
         started = time.monotonic()
-        async with agent:
-            result = await agent.run(
-                user_prompt,
-                deps=deps,
-                message_history=message_history,
-                usage_limits=get_usage_limits(run_config),
+        try:
+            async with agent:
+                result = await agent.run(
+                    user_prompt,
+                    deps=deps,
+                    message_history=message_history,
+                    usage_limits=usage_limits,
+                )
+        except Exception as exc:
+            logger.error(
+                f"Agent {agent_name} failed after {time.monotonic() - started:.2f}s: "
+                f"{type(exc).__name__}"
             )
+            raise
         return _execution_result(
             result=result,
             model=model,
@@ -278,6 +311,15 @@ async def run_agent(
 ) -> AgentExecutionResult:
     """Run one asynchronous agent loop and return its bounded audit record."""
     run_config = config or AgentRunConfig()
+    agent_name = name or "unnamed"
+    usage_limits = get_usage_limits(run_config)
+    logger.info(
+        f"Starting agent {agent_name}: model={_model_name(model)}, "
+        f"tools={len(tools)}, request_limit={run_config.requestLimit}, "
+        f"tool_call_limit={run_config.toolCallLimit}, retries={run_config.retries}, "
+        f"per_response_output_limit={run_config.outputTokenLimit}, "
+        f"run_output_limit={usage_limits.output_tokens_limit}"
+    )
     agent = _build_agent(
         model=model,
         output_type=output_type,
@@ -290,13 +332,20 @@ async def run_agent(
         normalize_sync_function_model=False,
     )
     started = time.monotonic()
-    async with agent:
-        result = await agent.run(
-            user_prompt,
-            deps=deps,
-            message_history=message_history,
-            usage_limits=get_usage_limits(run_config),
+    try:
+        async with agent:
+            result = await agent.run(
+                user_prompt,
+                deps=deps,
+                message_history=message_history,
+                usage_limits=usage_limits,
+            )
+    except Exception as exc:
+        logger.error(
+            f"Agent {agent_name} failed after {time.monotonic() - started:.2f}s: "
+            f"{type(exc).__name__}"
         )
+        raise
     return _execution_result(
         result=result,
         model=model,

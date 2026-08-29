@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 from ...datastore.datastore import DataStore
+from ...utils.logging import logger
 from ..data_enrichment import (
     DataEnrichmentAgent,
     DataEnrichmentContext,
@@ -19,22 +20,7 @@ from ..persistence import (
     AgentReportReference,
     AgentWorkflowRun,
 )
-from .journal import (
-    _complete_attempt,
-    _ensure_orchestration_store,
-    _recover_persisted_stage_report,
-    _report_link,
-    _safe_label,
-    _save_outcome,
-    _save_stage_report,
-    _start_attempt,
-    _unsafe_context_resolution,
-    _validated_done_outcome,
-    failed_stage,
-    finalize_failed,
-    finish_exception,
-    load_stage_report,
-)
+from . import journal
 from .models import (
     OrchestrationRequestRecord,
     OrchestrationResumeRecord,
@@ -58,7 +44,7 @@ class ContextStagesMixin:
         request_record: OrchestrationRequestRecord,
         ingest_result: IngestResult,
     ) -> WorkflowStageAttempt:
-        existing = _validated_done_outcome(
+        existing = journal._validated_done_outcome(
             store,
             prefix,
             workflow.workflowRunId,
@@ -67,8 +53,11 @@ class ContextStagesMixin:
             [],
         )
         if existing is not None:
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: reusing persisted ingest stage"
+            )
             return existing
-        started = _start_attempt(
+        started = journal._start_attempt(
             store.zw,
             prefix,
             workflow.workflowRunId,
@@ -82,7 +71,7 @@ class ContextStagesMixin:
                 "acceptedActions": ingest_result.acceptedActions,
             },
         )
-        outcome = _complete_attempt(
+        outcome = journal._complete_attempt(
             started,
             status="done",
             outputs={
@@ -99,7 +88,11 @@ class ContextStagesMixin:
             actions=ingest_result.actions,
             notes=ingest_result.notes,
         )
-        _save_outcome(store.zw, prefix, outcome)
+        journal._save_outcome(store.zw, prefix, outcome)
+        logger.info(
+            f"Workflow {workflow.workflowRunId}: ingest recorded "
+            f"{len(ingest_result.assayNames)} assay(s)"
+        )
         return outcome
 
     def data_enrichment_stage(
@@ -112,8 +105,8 @@ class ContextStagesMixin:
         *,
         resume_record: OrchestrationResumeRecord | None = None,
     ) -> tuple[WorkflowStageAttempt, DataEnrichmentReport]:
-        prefix = _ensure_orchestration_store(store)
-        existing = _validated_done_outcome(
+        prefix = journal._ensure_orchestration_store(store)
+        existing = journal._validated_done_outcome(
             store,
             prefix,
             workflow.workflowRunId,
@@ -122,13 +115,20 @@ class ContextStagesMixin:
             parents,
         )
         if existing is not None:
-            report = load_stage_report(store, existing, DataEnrichmentReport)
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: reusing Data Enrichment report"
+            )
+            report = journal.load_stage_report(store, existing, DataEnrichmentReport)
             return existing, cast(DataEnrichmentReport, report)
         request = request_record.request
         selected_assays = request.analysisAssays or list(store.assay_names)
+        logger.info(
+            f"Workflow {workflow.workflowRunId}: Data Enrichment will inspect "
+            f"{len(selected_assays)} assay(s)"
+        )
         unknown = sorted(set(selected_assays) - set(store.assay_names))
         if unknown:
-            return failed_stage(
+            return journal.failed_stage(
                 store,
                 workflow,
                 request_record,
@@ -137,7 +137,7 @@ class ContextStagesMixin:
                 f"Unknown requested assays: {unknown}",
                 resume_record=resume_record,
             ), DataEnrichmentReport.get_blank()
-        started = _start_attempt(
+        started = journal._start_attempt(
             store.zw,
             prefix,
             workflow.workflowRunId,
@@ -165,7 +165,7 @@ class ContextStagesMixin:
             elif isinstance(supplied_context, str) and supplied_context.strip():
                 context_payload["experimentalDetails"] = [supplied_context.strip()]
             enrichment_context = DataEnrichmentContext.model_validate(context_payload)
-            recovered = _recover_persisted_stage_report(
+            recovered = journal._recover_persisted_stage_report(
                 store,
                 started,
                 agent_name="data_enrichment",
@@ -174,6 +174,10 @@ class ContextStagesMixin:
             if reset_selection:
                 if recovered is None:
                     store.filter_cells([], [], [], reset_previous=True)
+                logger.info(
+                    f"Workflow {workflow.workflowRunId}: reset the shared cell "
+                    "selection before agent-managed QC"
+                )
                 actions.append("reset_cell_selection")
                 operations.append(
                     {
@@ -191,6 +195,9 @@ class ContextStagesMixin:
                 report = cast(DataEnrichmentReport, recovered_report)
                 actions.append("recover_persisted_data_enrichment_report")
             else:
+                logger.info(
+                    f"Workflow {workflow.workflowRunId}: invoking Data Enrichment"
+                )
                 agent = DataEnrichmentAgent(
                     self.model,
                     config=request_record.config.agentRunConfig,
@@ -202,7 +209,7 @@ class ContextStagesMixin:
                     cache_dir=request_record.config.cacheDir,
                     allow_download=request_record.config.allowDownloads,
                 )
-                saved_report, reference = _save_stage_report(
+                saved_report, reference = journal._save_stage_report(
                     store,
                     started,
                     report,
@@ -219,6 +226,11 @@ class ContextStagesMixin:
                     expected_type=DataEnrichmentReport,
                 )
                 report = cast(DataEnrichmentReport, saved_report)
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: Data Enrichment returned "
+                f"status={report.status!r}, policies={len(report.policies)}, "
+                f"inspections={len(report.inspections)}"
+            )
             if report.status == "needsInput":
                 questions = [
                     WorkflowQuestion(
@@ -230,7 +242,7 @@ class ContextStagesMixin:
                         evidenceIds=list(report.evidenceIds),
                     )
                 ]
-                outcome = _complete_attempt(
+                outcome = journal._complete_attempt(
                     started,
                     status="needsInput",
                     report_references=[reference],
@@ -240,7 +252,7 @@ class ContextStagesMixin:
                     notes=report.limitations,
                 )
             elif report.status == "failed":
-                outcome = _complete_attempt(
+                outcome = journal._complete_attempt(
                     started,
                     status="failed",
                     report_references=[reference],
@@ -249,7 +261,7 @@ class ContextStagesMixin:
                     error="; ".join(report.limitations),
                 )
             else:
-                outcome = _complete_attempt(
+                outcome = journal._complete_attempt(
                     started,
                     status="done",
                     report_references=[reference],
@@ -262,12 +274,14 @@ class ContextStagesMixin:
                     },
                     notes=report.limitations,
                 )
-            _save_outcome(store.zw, prefix, outcome)
+            journal._save_outcome(store.zw, prefix, outcome)
             if outcome.status == "failed":
-                finalize_failed(store, workflow, outcome.error or "enrichment failed")
+                journal.finalize_failed(
+                    store, workflow, outcome.error or "enrichment failed"
+                )
             return outcome, report
         except Exception as exc:
-            outcome = finish_exception(
+            outcome = journal.finish_exception(
                 store,
                 prefix,
                 workflow,
@@ -288,8 +302,8 @@ class ContextStagesMixin:
         *,
         resume_record: OrchestrationResumeRecord | None = None,
     ) -> WorkflowStageAttempt:
-        prefix = _ensure_orchestration_store(store)
-        existing = _validated_done_outcome(
+        prefix = journal._ensure_orchestration_store(store)
+        existing = journal._validated_done_outcome(
             store,
             prefix,
             workflow.workflowRunId,
@@ -298,8 +312,19 @@ class ContextStagesMixin:
             parents,
         )
         if existing is not None:
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: reusing HTO demultiplexing stage"
+            )
             return existing
-        started = _start_attempt(
+        eligible_hto = sum(
+            policy.assayModality == "HTO" and policy.demultiplexEligible
+            for policy in enrichment.policies
+        )
+        logger.info(
+            f"Workflow {workflow.workflowRunId}: HTO stage found "
+            f"{eligible_hto} eligible assay(s)"
+        )
+        started = journal._start_attempt(
             store.zw,
             prefix,
             workflow.workflowRunId,
@@ -368,7 +393,7 @@ class ContextStagesMixin:
                         )
                 if policy.assayModality != "HTO" or not policy.demultiplexEligible:
                     continue
-                label = f"agent_{token}_{_safe_label(policy.assay)}_identity"
+                label = f"agent_{token}_{journal._safe_label(policy.assay)}_identity"
                 column = store.mark_hto_identities(
                     from_assay=policy.assay,
                     cell_key="I",
@@ -393,16 +418,21 @@ class ContextStagesMixin:
                     [*metadata_columns, *cast(list[str], outputs["htoIdentityColumns"])]
                 )
             )
-            outcome = _complete_attempt(
+            outcome = journal._complete_attempt(
                 started,
                 status="done",
                 outputs=outputs,
                 actions=actions,
             )
-            _save_outcome(store.zw, prefix, outcome)
+            journal._save_outcome(store.zw, prefix, outcome)
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: HTO stage produced "
+                f"{len(cast(list[str], outputs['htoIdentityColumns']))} "
+                "identity column(s)"
+            )
             return outcome
         except Exception as exc:
-            return finish_exception(
+            return journal.finish_exception(
                 store,
                 prefix,
                 workflow,
@@ -424,8 +454,8 @@ class ContextStagesMixin:
         *,
         resume_record: OrchestrationResumeRecord | None = None,
     ) -> tuple[WorkflowStageAttempt, ExperimentalContextResult]:
-        prefix = _ensure_orchestration_store(store)
-        existing = _validated_done_outcome(
+        prefix = journal._ensure_orchestration_store(store)
+        existing = journal._validated_done_outcome(
             store,
             prefix,
             workflow.workflowRunId,
@@ -434,9 +464,15 @@ class ContextStagesMixin:
             parents,
         )
         if existing is not None:
-            report = load_stage_report(store, existing, ExperimentalContextResult)
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: reusing Experimental Context "
+                "report"
+            )
+            report = journal.load_stage_report(
+                store, existing, ExperimentalContextResult
+            )
             return existing, cast(ExperimentalContextResult, report)
-        paused = _validated_done_outcome(
+        paused = journal._validated_done_outcome(
             store,
             prefix,
             workflow.workflowRunId,
@@ -452,7 +488,7 @@ class ContextStagesMixin:
             directions.update(dict(supplied_directions))
         elif isinstance(supplied_directions, str) and supplied_directions.strip():
             directions["callerAnswer"] = supplied_directions.strip()
-        started = _start_attempt(
+        started = journal._start_attempt(
             store.zw,
             prefix,
             workflow.workflowRunId,
@@ -466,15 +502,19 @@ class ContextStagesMixin:
             },
             resume_record=resume_record,
         )
+        logger.info(
+            f"Workflow {workflow.workflowRunId}: Experimental Context will evaluate "
+            f"{len(hto_identity_columns)} HTO identity column(s)"
+        )
         try:
             unsafe_resolution = (
-                _unsafe_context_resolution(supplied_directions)
+                journal._unsafe_context_resolution(supplied_directions)
                 if paused is not None
                 and paused.outputs.get("unsafeBatchCorrection") is True
                 else None
             )
             actions: list[str] = []
-            recovered = _recover_persisted_stage_report(
+            recovered = journal._recover_persisted_stage_report(
                 store,
                 started,
                 agent_name="experimental_context",
@@ -485,7 +525,7 @@ class ContextStagesMixin:
                 report = cast(ExperimentalContextResult, recovered_report)
                 actions.append("recover_persisted_experimental_context_report")
             else:
-                parent_reports = [_report_link(enrichment_reference)]
+                parent_reports = [journal._report_link(enrichment_reference)]
                 if unsafe_resolution == "skip":
                     assert paused is not None
                     if not paused.reportReferences:
@@ -494,7 +534,7 @@ class ContextStagesMixin:
                         )
                     prior_report = cast(
                         ExperimentalContextResult,
-                        load_stage_report(
+                        journal.load_stage_report(
                             store,
                             paused,
                             ExperimentalContextResult,
@@ -530,10 +570,16 @@ class ContextStagesMixin:
                             ],
                         }
                     )
-                    parent_reports.append(_report_link(paused.reportReferences[0]))
+                    parent_reports.append(
+                        journal._report_link(paused.reportReferences[0])
+                    )
                     run_config = request_record.config.agentRunConfig
                     actions.append("resolve_unsafe_batch_correction:skip")
                 else:
+                    logger.info(
+                        f"Workflow {workflow.workflowRunId}: invoking Experimental "
+                        "Context"
+                    )
                     agent = ExperimentalContextAgent(
                         self.model,
                         config=request_record.config.agentRunConfig,
@@ -545,7 +591,7 @@ class ContextStagesMixin:
                         directions=directions,
                     )
                     run_config = agent.config
-                saved_report, reference = _save_stage_report(
+                saved_report, reference = journal._save_stage_report(
                     store,
                     started,
                     report,
@@ -563,6 +609,11 @@ class ContextStagesMixin:
                     expected_type=ExperimentalContextResult,
                 )
                 report = cast(ExperimentalContextResult, saved_report)
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: Experimental Context returned "
+                f"status={report.status!r}, batchAction="
+                f"{report.decision.batchCorrection.action!r}"
+            )
             if report.status == "needsInput":
                 questions = [
                     WorkflowQuestion(
@@ -574,7 +625,7 @@ class ContextStagesMixin:
                         evidenceIds=list(report.decision.evidenceIds),
                     )
                 ]
-                outcome = _complete_attempt(
+                outcome = journal._complete_attempt(
                     started,
                     status="needsInput",
                     report_references=[reference],
@@ -582,7 +633,7 @@ class ContextStagesMixin:
                     notes=report.notes,
                 )
             elif report.status == "failed":
-                outcome = _complete_attempt(
+                outcome = journal._complete_attempt(
                     started,
                     status="failed",
                     report_references=[reference],
@@ -590,7 +641,7 @@ class ContextStagesMixin:
                 )
             elif report.decision.batchCorrection.action == "unsafe":
                 batch_plan = report.decision.batchCorrection
-                outcome = _complete_attempt(
+                outcome = journal._complete_attempt(
                     started,
                     status="needsInput",
                     report_references=[reference],
@@ -615,7 +666,7 @@ class ContextStagesMixin:
                     notes=report.notes,
                 )
             else:
-                outcome = _complete_attempt(
+                outcome = journal._complete_attempt(
                     started,
                     status="done",
                     report_references=[reference],
@@ -630,12 +681,14 @@ class ContextStagesMixin:
                     actions=actions,
                     notes=report.notes,
                 )
-            _save_outcome(store.zw, prefix, outcome)
+            journal._save_outcome(store.zw, prefix, outcome)
             if outcome.status == "failed":
-                finalize_failed(store, workflow, outcome.error or "context failed")
+                journal.finalize_failed(
+                    store, workflow, outcome.error or "context failed"
+                )
             return outcome, report
         except Exception as exc:
-            outcome = finish_exception(store, prefix, workflow, started, exc)
+            outcome = journal.finish_exception(store, prefix, workflow, started, exc)
             return outcome, ExperimentalContextResult.get_blank()
 
     def should_reset_selection(
@@ -648,7 +701,7 @@ class ContextStagesMixin:
         request = request_record.request
         if workflow is None:
             return False
-        ingest_outcome = _validated_done_outcome(
+        ingest_outcome = journal._validated_done_outcome(
             store,
             prefix,
             workflow.workflowRunId,

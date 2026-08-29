@@ -7,6 +7,7 @@ from textwrap import dedent
 from typing import Any, Literal
 
 from ..features.gene_reference import species_registry
+from ..utils.logging import logger
 from .characterize_features import characterize_features
 from .config import CONFIG, AgentRunConfig
 from .config._deps import AGENT_INSTALL_HINT
@@ -710,6 +711,70 @@ def _valid_peak_coordinate(value: str) -> bool:
     return start >= 0 and end > start
 
 
+def _inspect_adt_features(
+    assay_name: str,
+    feature_rows: list[tuple[str, str]],
+) -> list[AdtControlEvidence]:
+    """Return control candidates from exact observed ADT features."""
+    candidates: list[AdtControlEvidence] = []
+    for feature_id, feature_name in feature_rows:
+        tokens = _feature_tokens(feature_id, feature_name)
+        matched_token: Literal["control", "isotype"] | None = None
+        if "isotype" in tokens:
+            matched_token = "isotype"
+        elif "control" in tokens:
+            matched_token = "control"
+        if matched_token is None:
+            continue
+        candidates.append(
+            AdtControlEvidence(
+                featureId=feature_id,
+                featureName=feature_name,
+                matchedToken=matched_token,
+                evidenceId=f"assay:{assay_name}:adtControl:{feature_id}",
+            )
+        )
+    return candidates
+
+
+def _inspect_hto_features(
+    assay_name: str,
+    feature_rows: list[tuple[str, str]],
+) -> list[HtoTagEvidence]:
+    """Return HTO tag evidence in exact observed order."""
+    return [
+        HtoTagEvidence(
+            featureId=feature_id,
+            featureName=feature_name,
+            evidenceId=f"assay:{assay_name}:htoTag:{feature_id}",
+        )
+        for feature_id, feature_name in feature_rows
+    ]
+
+
+def _inspect_atac_features(
+    assay_name: str,
+    feature_ids: list[str],
+) -> AtacCoordinateEvidence:
+    """Validate exact observed ATAC coordinates without inferring a build."""
+    valid_ids = [value for value in feature_ids if _valid_peak_coordinate(value)]
+    invalid_ids = [value for value in feature_ids if not _valid_peak_coordinate(value)]
+    if not feature_ids or not valid_ids:
+        coordinate_status: Literal["valid", "partial", "invalid"] = "invalid"
+    elif invalid_ids:
+        coordinate_status = "partial"
+    else:
+        coordinate_status = "valid"
+    return AtacCoordinateEvidence(
+        status=coordinate_status,
+        totalFeatures=len(feature_ids),
+        validFeatures=len(valid_ids),
+        validExamples=bounded_list(valid_ids, limit=5),
+        invalidExamples=bounded_list(invalid_ids, limit=5),
+        evidenceId=f"assay:{assay_name}:atacCoordinates",
+    )
+
+
 def _inspect_modality_features(
     *,
     assay_name: str,
@@ -745,25 +810,7 @@ def _inspect_modality_features(
         feature_rows = []
 
     if modality == "ADT":
-        control_candidates: list[AdtControlEvidence] = []
-        for feature_id, feature_name in feature_rows:
-            tokens = _feature_tokens(feature_id, feature_name)
-            matched_token: Literal["control", "isotype"] | None = None
-            if "isotype" in tokens:
-                matched_token = "isotype"
-            elif "control" in tokens:
-                matched_token = "control"
-            if matched_token is None:
-                continue
-            evidence_id = f"assay:{assay_name}:adtControl:{feature_id}"
-            control_candidates.append(
-                AdtControlEvidence(
-                    featureId=feature_id,
-                    featureName=feature_name,
-                    matchedToken=matched_token,
-                    evidenceId=evidence_id,
-                )
-            )
+        control_candidates = _inspect_adt_features(assay_name, feature_rows)
         adt_controls = bounded_list(
             control_candidates,
             limit=CONFIG._MAX_FEATURE_QUERIES,
@@ -774,40 +821,17 @@ def _inspect_modality_features(
 
     if modality == "HTO":
         limited_rows = bounded_list(feature_rows, limit=CONFIG._MAX_FEATURE_QUERIES)
-        for feature_id, feature_name in limited_rows:
-            evidence_id = f"assay:{assay_name}:htoTag:{feature_id}"
-            hto_tags.append(
-                HtoTagEvidence(
-                    featureId=feature_id,
-                    featureName=feature_name,
-                    evidenceId=evidence_id,
-                )
-            )
-            evidence_ids.append(evidence_id)
+        hto_tags = _inspect_hto_features(assay_name, limited_rows)
+        evidence_ids.extend(item.evidenceId for item in hto_tags)
         reported_features = len(hto_tags)
         truncated = len(feature_rows) > len(limited_rows)
 
     if modality == "ATAC":
-        valid_ids = [value for value in feature_ids if _valid_peak_coordinate(value)]
-        invalid_ids = [
-            value for value in feature_ids if not _valid_peak_coordinate(value)
-        ]
-        if not feature_ids or not valid_ids:
-            coordinate_status: Literal["valid", "partial", "invalid"] = "invalid"
-        elif invalid_ids:
-            coordinate_status = "partial"
-        else:
-            coordinate_status = "valid"
-        coordinate_evidence_id = f"assay:{assay_name}:atacCoordinates"
-        atac_coordinates = AtacCoordinateEvidence(
-            status=coordinate_status,
-            totalFeatures=len(feature_ids),
-            validFeatures=len(valid_ids),
-            validExamples=bounded_list(valid_ids, limit=5),
-            invalidExamples=bounded_list(invalid_ids, limit=5),
-            evidenceId=coordinate_evidence_id,
+        atac_coordinates = _inspect_atac_features(
+            assay_name,
+            feature_ids,
         )
-        evidence_ids.append(coordinate_evidence_id)
+        evidence_ids.append(atac_coordinates.evidenceId)
         reported_features = len(atac_coordinates.validExamples) + len(
             atac_coordinates.invalidExamples
         )
@@ -852,6 +876,7 @@ async def inspect_assay_features(
         allowDownload=deps.allowDownload,
     )
     if characterization.status != "done" or not characterization.assays:
+        logger.warning(f"Data Enrichment could not characterize assay {assay_name!r}")
         detail = "; ".join(characterization.notes) or "feature inspection failed"
         raise ModelRetry(detail)
 
@@ -927,6 +952,12 @@ async def inspect_assay_features(
             evidenceIds=evidence_ids,
         )
     )
+    logger.debug(
+        "Data Enrichment inspected "
+        f"assay={assay_name!r}, modality={modality_evidence.modality}, "
+        f"species={inspection.species}, families={len(family_evidence)}, "
+        f"exogenous={len(exogenous_evidence)}, evidence={len(evidence_ids)}"
+    )
     return inspection
 
 
@@ -937,6 +968,9 @@ async def inspect_assay_features_batch(
     deps = ctx.deps
     if not deps.assays:
         raise ModelRetry("No assays were requested")
+    logger.info(
+        f"Data Enrichment feature inspection started for {len(deps.assays)} assays"
+    )
     start = len(deps.toolCalls)
     inspections = [
         await inspect_assay_features(ctx, assay_name=assay_name)
@@ -956,6 +990,15 @@ async def inspect_assay_features_batch(
             assay=",".join(deps.assays),
             evidenceIds=evidence_ids,
         )
+    )
+    supported_routes = sum(
+        inspection.modalityEvidence.modality != "unsupported"
+        for inspection in inspections
+    )
+    logger.info(
+        "Data Enrichment feature inspection completed: "
+        f"assays={len(inspections)}, supportedRoutes={supported_routes}, "
+        f"evidence={len(evidence_ids)}"
     )
     return AssayFeatureInspectionBatch(
         inspections=inspections,
@@ -1078,6 +1121,11 @@ async def find_present_features_batch(
             f"{CONFIG._MAX_FEATURE_QUERIES} feature queries in total"
         )
 
+    logger.info(
+        "Data Enrichment feature lookup started: "
+        f"assays={len(clean_queries_by_assay)}, queries={query_count}"
+    )
+
     start = len(deps.toolCalls)
     lookups = [
         await find_present_features(
@@ -1100,6 +1148,16 @@ async def find_present_features_batch(
             assay=",".join(queries_by_assay),
             evidenceIds=evidence_ids,
         )
+    )
+    result_counts = {"present": 0, "ambiguous": 0, "absent": 0}
+    for lookup in lookups:
+        for result in lookup.results:
+            result_counts[result.status] += 1
+    logger.info(
+        "Data Enrichment feature lookup completed: "
+        f"present={result_counts['present']}, "
+        f"ambiguous={result_counts['ambiguous']}, "
+        f"absent={result_counts['absent']}, evidence={len(evidence_ids)}"
     )
     return FeatureLookupBatch(lookups=lookups, evidenceIds=evidence_ids)
 
@@ -1181,6 +1239,133 @@ def _ground_study_context_summary(
     )
 
 
+def _validate_feature_policy(
+    deps: DataEnrichmentDependencies,
+    policy: FeatureSelectionPolicy,
+    grounded_context: StudyContextSummary,
+) -> None:
+    """Ground and validate one feature policy in deterministic order."""
+    supported_species = {*_SUPPORTED_SPECIES, "unknown"}
+    if policy.species not in supported_species:
+        raise ValueError(
+            f"unsupported species {policy.species!r}; choose a supported key or unknown"
+        )
+    if not policy.evidenceIds:
+        raise ValueError(f"policy for assay {policy.assay!r} requires evidence IDs")
+    policy.organismName = (
+        _SUPPORTED_SPECIES[policy.species].label
+        if policy.species in _SUPPORTED_SPECIES
+        else "unknown"
+    )
+    inspection = deps.inspections.get(policy.assay)
+    if inspection is None:
+        raise ValueError(f"assay {policy.assay!r} was not inspected")
+    modality = inspection.modalityEvidence
+    policy.assayType = modality.assayType
+    policy.assayModality = modality.modality
+    policy.graphEligible = modality.graphEligible
+    policy.markerEligible = modality.markerEligible
+    policy.demultiplexEligible = modality.demultiplexEligible
+    policy.exactControlFeatures = [
+        FeatureReference(
+            featureId=item.featureId,
+            featureName=item.featureName,
+        )
+        for item in modality.adtControls
+    ]
+    policy.exactTagFeatures = [
+        FeatureReference(
+            featureId=item.featureId,
+            featureName=item.featureName,
+        )
+        for item in modality.htoTags
+    ]
+    policy.peakCoordinateStatus = modality.atacCoordinates.status
+    policy.evidenceIds = list(
+        dict.fromkeys([*policy.evidenceIds, *modality.evidenceIds])
+    )
+    if (
+        inspection.species in _SUPPORTED_SPECIES
+        and policy.species != inspection.species
+    ):
+        raise ValueError(
+            f"policy species {policy.species!r} conflicts with inspected "
+            f"species {inspection.species!r}"
+        )
+    if (
+        inspection.species == "unknown"
+        and policy.species != "unknown"
+        and not any(
+            evidence_id.startswith("context:") for evidence_id in policy.evidenceIds
+        )
+    ):
+        raise ValueError(
+            "A context-derived species decision must cite context evidence"
+        )
+    observed_families = {item.family for item in inspection.families}
+    cited_families = set(policy.excludeFamilies) | set(policy.protectFamilies)
+    unknown_families = cited_families - observed_families
+    if unknown_families:
+        raise ValueError(
+            f"policy cites unobserved families: {sorted(unknown_families)}"
+        )
+    protected_defaults = {
+        item.family for item in inspection.families if item.defaultExclude is False
+    }
+    excluded_protected = sorted(
+        set(policy.excludeFamilies).intersection(protected_defaults)
+    )
+    if excluded_protected:
+        raise ValueError(
+            "The initial enrichment policy cannot exclude families that "
+            f"deterministic evidence protects by default: {excluded_protected}"
+        )
+    confirmed = deps.confirmedFeatures.get(policy.assay, set())
+    cited_features = {
+        *policy.excludeFeatures,
+        *policy.protectFeatures,
+        *policy.artificialFeatures,
+    }
+    unknown_features = cited_features - confirmed
+    if unknown_features:
+        raise ValueError(
+            "Call find_present_features_batch before citing individual features: "
+            f"{sorted(unknown_features)}"
+        )
+    exogenous_evidence = {
+        value: item.evidenceId
+        for item in inspection.exogenous
+        for value in (item.featureId, item.featureName)
+    }
+    unsupported_artificial: list[str] = []
+    for feature in policy.artificialFeatures:
+        evidence_id = exogenous_evidence.get(feature)
+        if evidence_id is not None and evidence_id in policy.evidenceIds:
+            continue
+        matching_context_ids = {
+            f"context:experiment:{index}"
+            for index, detail in enumerate(deps.context.experimentalDetails)
+            if feature.casefold() in detail.casefold()
+        }
+        if matching_context_ids.intersection(policy.evidenceIds):
+            continue
+        unsupported_artificial.append(feature)
+    if unsupported_artificial:
+        raise ValueError(
+            "Artificial features require their exogenous evidence ID or a "
+            "feature-specific experimental-context evidence ID: "
+            f"{sorted(unsupported_artificial)}"
+        )
+    unknown_evidence = set(policy.evidenceIds) - deps.evidenceIds
+    if unknown_evidence:
+        raise ValueError(
+            f"policy cites unknown evidence IDs: {sorted(unknown_evidence)}"
+        )
+    policy.tissueReferences = list(grounded_context.tissueReferences)
+    policy.cellTypeReferences = list(grounded_context.cellTypeReferences)
+    policy.experimentalReferences = list(grounded_context.experimentalReferences)
+
+
 def validate_data_enrichment_report(
     deps: DataEnrichmentDependencies,
     report: DataEnrichmentReport,
@@ -1204,126 +1389,8 @@ def validate_data_enrichment_report(
         deps.context,
         report.studyContextSummary,
     )
-    supported_species = {*_SUPPORTED_SPECIES, "unknown"}
     for policy in report.policies:
-        if policy.species not in supported_species:
-            raise ValueError(
-                f"unsupported species {policy.species!r}; choose a supported key or unknown"
-            )
-        if not policy.evidenceIds:
-            raise ValueError(f"policy for assay {policy.assay!r} requires evidence IDs")
-        policy.organismName = (
-            _SUPPORTED_SPECIES[policy.species].label
-            if policy.species in _SUPPORTED_SPECIES
-            else "unknown"
-        )
-        inspection = deps.inspections.get(policy.assay)
-        if inspection is None:
-            raise ValueError(f"assay {policy.assay!r} was not inspected")
-        modality = inspection.modalityEvidence
-        policy.assayType = modality.assayType
-        policy.assayModality = modality.modality
-        policy.graphEligible = modality.graphEligible
-        policy.markerEligible = modality.markerEligible
-        policy.demultiplexEligible = modality.demultiplexEligible
-        policy.exactControlFeatures = [
-            FeatureReference(
-                featureId=item.featureId,
-                featureName=item.featureName,
-            )
-            for item in modality.adtControls
-        ]
-        policy.exactTagFeatures = [
-            FeatureReference(
-                featureId=item.featureId,
-                featureName=item.featureName,
-            )
-            for item in modality.htoTags
-        ]
-        policy.peakCoordinateStatus = modality.atacCoordinates.status
-        policy.evidenceIds = list(
-            dict.fromkeys([*policy.evidenceIds, *modality.evidenceIds])
-        )
-        if (
-            inspection.species in _SUPPORTED_SPECIES
-            and policy.species != inspection.species
-        ):
-            raise ValueError(
-                f"policy species {policy.species!r} conflicts with inspected "
-                f"species {inspection.species!r}"
-            )
-        if (
-            inspection.species == "unknown"
-            and policy.species != "unknown"
-            and not any(
-                evidence_id.startswith("context:") for evidence_id in policy.evidenceIds
-            )
-        ):
-            raise ValueError(
-                "A context-derived species decision must cite context evidence"
-            )
-        observed_families = {item.family for item in inspection.families}
-        cited_families = set(policy.excludeFamilies) | set(policy.protectFamilies)
-        unknown_families = cited_families - observed_families
-        if unknown_families:
-            raise ValueError(
-                f"policy cites unobserved families: {sorted(unknown_families)}"
-            )
-        protected_defaults = {
-            item.family for item in inspection.families if item.defaultExclude is False
-        }
-        excluded_protected = sorted(
-            set(policy.excludeFamilies).intersection(protected_defaults)
-        )
-        if excluded_protected:
-            raise ValueError(
-                "The initial enrichment policy cannot exclude families that "
-                f"deterministic evidence protects by default: {excluded_protected}"
-            )
-        confirmed = deps.confirmedFeatures.get(policy.assay, set())
-        cited_features = {
-            *policy.excludeFeatures,
-            *policy.protectFeatures,
-            *policy.artificialFeatures,
-        }
-        unknown_features = cited_features - confirmed
-        if unknown_features:
-            raise ValueError(
-                "Call find_present_features_batch before citing individual features: "
-                f"{sorted(unknown_features)}"
-            )
-        exogenous_evidence = {
-            value: item.evidenceId
-            for item in inspection.exogenous
-            for value in (item.featureId, item.featureName)
-        }
-        unsupported_artificial: list[str] = []
-        for feature in policy.artificialFeatures:
-            evidence_id = exogenous_evidence.get(feature)
-            if evidence_id is not None and evidence_id in policy.evidenceIds:
-                continue
-            matching_context_ids = {
-                f"context:experiment:{index}"
-                for index, detail in enumerate(deps.context.experimentalDetails)
-                if feature.casefold() in detail.casefold()
-            }
-            if matching_context_ids.intersection(policy.evidenceIds):
-                continue
-            unsupported_artificial.append(feature)
-        if unsupported_artificial:
-            raise ValueError(
-                "Artificial features require their exogenous evidence ID or a "
-                "feature-specific experimental-context evidence ID: "
-                f"{sorted(unsupported_artificial)}"
-            )
-        unknown_evidence = set(policy.evidenceIds) - deps.evidenceIds
-        if unknown_evidence:
-            raise ValueError(
-                f"policy cites unknown evidence IDs: {sorted(unknown_evidence)}"
-            )
-        policy.tissueReferences = list(grounded_context.tissueReferences)
-        policy.cellTypeReferences = list(grounded_context.cellTypeReferences)
-        policy.experimentalReferences = list(grounded_context.experimentalReferences)
+        _validate_feature_policy(deps, policy, grounded_context)
 
     report.studyContextSummary = grounded_context
     report.inspections = [deps.inspections[name] for name in deps.assays]
@@ -1341,6 +1408,12 @@ def validate_data_enrichment_report(
             ]
         )
     )
+    logger.debug(
+        "Data Enrichment report validated: "
+        f"status={report.status}, policies={len(report.policies)}, "
+        f"inspections={len(report.inspections)}, "
+        f"toolCalls={len(report.toolCalls)}, evidence={len(report.evidenceIds)}"
+    )
     return report
 
 
@@ -1355,8 +1428,8 @@ class DataEnrichmentAgent:
     ) -> None:
         self.model = model
         self.config = (config or AgentRunConfig()).with_limits(
-            request_limit=5,
-            tool_call_limit=3,
+            request_limit=8,
+            tool_call_limit=5,
             output_token_limit=32768,
             timeout_seconds=600.0,
         )
@@ -1380,6 +1453,11 @@ class DataEnrichmentAgent:
             raise ValueError(f"unknown assays: {unknown_assays}")
         if not selected_assays:
             raise ValueError("at least one assay is required")
+
+        logger.info(
+            "Data Enrichment Agent started: "
+            f"assays={len(selected_assays)}, allowDownload={allow_download}"
+        )
 
         enrichment_context = context or DataEnrichmentContext.get_blank()
         evidence_ids: set[str] = set()
@@ -1477,4 +1555,9 @@ class DataEnrichmentAgent:
         report = DataEnrichmentReport.model_validate(execution.output)
         report = validate_data_enrichment_report(deps, report)
         report.runInfo = execution.runInfo
+        logger.info(
+            "Data Enrichment Agent completed: "
+            f"status={report.status}, policies={len(report.policies)}, "
+            f"toolCalls={len(report.toolCalls)}, evidence={len(report.evidenceIds)}"
+        )
         return report

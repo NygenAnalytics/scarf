@@ -8,21 +8,19 @@ from typing import Any, cast
 import numpy as np
 
 from ...datastore.datastore import DataStore
+from ...datastore.summary import AssaySummary
 from ...storage.refs import ArtifactRef
-from ..data_enrichment import DataEnrichmentReport
+from ...utils.logging import logger
+from .. import record_io
+from ..data_enrichment import (
+    AssayFeatureInspection,
+    DataEnrichmentReport,
+    FeatureSelectionPolicy,
+)
 from ..experimental_context import ExperimentalContextResult
 from ..persistence import AgentWorkflowRun
 from ..types import ArtifactReferenceModel
-from .journal import (
-    _canonical_json_bytes,
-    _complete_attempt,
-    _ensure_orchestration_store,
-    _safe_label,
-    _save_outcome,
-    _start_attempt,
-    _validated_done_outcome,
-    finish_exception,
-)
+from . import journal
 from .models import (
     AssayPreprocessingPlan,
     AutomatedPreprocessingPlan,
@@ -53,8 +51,8 @@ class PreprocessingStagesMixin:
         *,
         resume_record: OrchestrationResumeRecord | None = None,
     ) -> tuple[WorkflowStageAttempt, AutomatedPreprocessingPlan]:
-        prefix = _ensure_orchestration_store(store)
-        existing = _validated_done_outcome(
+        prefix = journal._ensure_orchestration_store(store)
+        existing = journal._validated_done_outcome(
             store,
             prefix,
             workflow.workflowRunId,
@@ -63,10 +61,13 @@ class PreprocessingStagesMixin:
             parents,
         )
         if existing is not None:
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: reusing preprocessing plan"
+            )
             return existing, AutomatedPreprocessingPlan.model_validate(
                 existing.outputs["preprocessingPlan"]
             )
-        started = _start_attempt(
+        started = journal._start_attempt(
             store.zw,
             prefix,
             workflow.workflowRunId,
@@ -87,8 +88,17 @@ class PreprocessingStagesMixin:
                 experimental,
                 ingest_outcome,
             )
+            route_summary = ", ".join(
+                f"{value.assay}:{value.featureMethod}/{value.reductionMethod}"
+                for value in plan.assays
+            )
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: preprocessing plan built "
+                f"(primary={plan.primaryAssay!r}, marker={plan.markerAssay!r}, "
+                f"routes=[{route_summary}])"
+            )
         except Exception as exc:
-            outcome = finish_exception(store, prefix, workflow, started, exc)
+            outcome = journal.finish_exception(store, prefix, workflow, started, exc)
             return outcome, AutomatedPreprocessingPlan.get_blank()
         supplied_approval = answers.get("approvePlanChecksum")
         preapproved = bool(
@@ -102,7 +112,11 @@ class PreprocessingStagesMixin:
             or supplied_approval == plan.planChecksum
         )
         if not approved:
-            outcome = _complete_attempt(
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: preprocessing plan requires "
+                "caller approval"
+            )
+            outcome = journal._complete_attempt(
                 started,
                 status="needsInput",
                 outputs={"preprocessingPlan": plan.model_dump(mode="json")},
@@ -120,13 +134,16 @@ class PreprocessingStagesMixin:
                 ),
             )
         else:
-            outcome = _complete_attempt(
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: preprocessing plan approved"
+            )
+            outcome = journal._complete_attempt(
                 started,
                 status="done",
                 outputs={"preprocessingPlan": plan.model_dump(mode="json")},
                 actions=["approve_preprocessing_plan"],
             )
-        _save_outcome(store.zw, prefix, outcome)
+        journal._save_outcome(store.zw, prefix, outcome)
         return outcome, plan
 
     def build_preprocessing_plan(
@@ -172,183 +189,20 @@ class PreprocessingStagesMixin:
                     else "unsupported"
                 )
             )
-            excluded: list[str] = []
-            evidence_ids: list[str] = []
-            if policy is not None:
-                excluded = list(
-                    dict.fromkeys(
-                        [
-                            *policy.excludeFeatures,
-                            *policy.artificialFeatures,
-                            *(
-                                reference.featureId
-                                for reference in policy.exactControlFeatures
-                            ),
-                            *(
-                                reference.featureName
-                                for reference in policy.exactControlFeatures
-                            ),
-                        ]
-                    )
-                )
-                evidence_ids = list(policy.evidenceIds)
-            if modality == "RNA":
-                graph_eligible = summary.total_features >= 3
-                if graph_eligible:
-                    graph_assays.append(assay_name)
-                plan = AssayPreprocessingPlan(
-                    assay=assay_name,
-                    assayType=summary.assay_type,
-                    role="graph" if graph_eligible else "unsupported",
-                    graphEligible=graph_eligible,
-                    markerEligible=graph_eligible,
-                    featureMethod="hvg" if graph_eligible else "none",
-                    reductionMethod="pca" if graph_eligible else "none",
-                    featureParameters={
-                        "topN": min(1000, summary.total_features),
-                        "minCells": effective_min_cells,
-                        "excludeFamilies": (
-                            list(policy.excludeFamilies) if policy is not None else []
-                        ),
-                    },
-                    normalizationParameters={
-                        "logTransform": True,
-                        "renormalizeSubset": True,
-                    },
-                    reductionParameters={"dimensions": 21},
-                    exactExcludedFeatures=excluded,
-                    evidenceIds=evidence_ids,
-                    limitations=(
-                        []
-                        if graph_eligible
-                        else ["RNA requires at least three features for PCA"]
-                    ),
-                )
-            elif modality == "ATAC":
-                graph_eligible = summary.total_features >= 3
-                if graph_eligible:
-                    graph_assays.append(assay_name)
-                plan = AssayPreprocessingPlan(
-                    assay=assay_name,
-                    assayType=summary.assay_type,
-                    role="graph" if graph_eligible else "unsupported",
-                    graphEligible=graph_eligible,
-                    markerEligible=graph_eligible,
-                    featureMethod="prevalentPeaks" if graph_eligible else "none",
-                    reductionMethod="lsi" if graph_eligible else "none",
-                    featureParameters={"topN": min(25000, summary.total_features)},
-                    normalizationParameters={
-                        "logTransform": False,
-                        "renormalizeSubset": False,
-                    },
-                    reductionParameters={"dimensions": 50, "skipFirst": True},
-                    evidenceIds=evidence_ids,
-                    limitations=list(
-                        dict.fromkeys(
-                            [
-                                *(
-                                    []
-                                    if graph_eligible
-                                    else [
-                                        "ATAC requires at least three peak features "
-                                        "for LSI"
-                                    ]
-                                ),
-                                *(
-                                    [
-                                        "ATAC feature coordinates are not uniformly "
-                                        "valid chrom:start-end intervals; the genome "
-                                        "build remains unknown"
-                                    ]
-                                    if policy is not None
-                                    and policy.peakCoordinateStatus
-                                    in {"partial", "invalid"}
-                                    else []
-                                ),
-                            ]
-                        )
-                    ),
-                )
-            elif modality == "ADT":
-                assay = store.get_assay(assay_name)
-                feature_ids = np.asarray(assay.feats.fetch_all("ids")).astype(str)
-                feature_names = np.asarray(assay.feats.fetch_all("names")).astype(str)
-                excluded = (
-                    list(
-                        dict.fromkeys(
-                            value
-                            for reference in policy.exactControlFeatures
-                            for value in (reference.featureId, reference.featureName)
-                            if value
-                        )
-                    )
-                    if policy is not None
-                    else []
-                )
-                excluded_values = {value for value in excluded if value}
-                panel_mask = ~np.isin(feature_ids, list(excluded_values))
-                panel_mask &= ~np.isin(feature_names, list(excluded_values))
-                selected_count = int(panel_mask.sum())
-                graph_eligible = selected_count >= 2
-                if graph_eligible:
-                    graph_assays.append(assay_name)
-                reduction = (
-                    "identity"
-                    if graph_eligible
-                    and selected_count <= request_record.config.maxIdentityFeatures
-                    else ("pca" if graph_eligible else "none")
-                )
-                plan = AssayPreprocessingPlan(
-                    assay=assay_name,
-                    assayType=summary.assay_type,
-                    role="graph" if graph_eligible else "unsupported",
-                    graphEligible=graph_eligible,
-                    markerEligible=graph_eligible,
-                    featureMethod="panel" if graph_eligible else "none",
-                    reductionMethod=cast(ReductionMethod, reduction),
-                    normalizationParameters={
-                        "logTransform": False,
-                        "renormalizeSubset": False,
-                    },
-                    reductionParameters={
-                        "dimensions": (
-                            selected_count
-                            if reduction == "identity"
-                            else min(15, max(2, selected_count - 1))
-                        )
-                    },
-                    exactExcludedFeatures=excluded,
-                    evidenceIds=evidence_ids,
-                    limitations=(
-                        [
-                            "ADT control inventory was truncated; only exact observed "
-                            "control features were excluded"
-                        ]
-                        if inspections.get(assay_name) is not None
-                        and inspections[assay_name].modalityEvidence.truncated
-                        else []
-                    ),
-                )
-            elif modality == "HTO":
-                plan = AssayPreprocessingPlan(
-                    assay=assay_name,
-                    assayType=summary.assay_type,
-                    role="hto",
-                    graphEligible=False,
-                    markerEligible=False,
-                    featureMethod="none",
-                    reductionMethod="none",
-                    evidenceIds=evidence_ids,
-                )
-            else:
-                message = f"Unsupported assay {assay_name!r} ({summary.assay_type})"
-                limitations.append(message)
-                plan = AssayPreprocessingPlan(
-                    assay=assay_name,
-                    assayType=summary.assay_type,
-                    role="unsupported",
-                    limitations=[message],
-                )
+            plan = self.build_assay_preprocessing_plan(
+                store,
+                request_record,
+                assay_name,
+                summary,
+                policy,
+                inspections.get(assay_name),
+                modality,
+                effective_min_cells,
+            )
+            if plan.graphEligible:
+                graph_assays.append(assay_name)
+            if modality == "unsupported":
+                limitations.extend(plan.limitations)
             assay_plans.append(plan)
         if not graph_assays:
             raise ValueError("No supported graph-bearing assay remains")
@@ -430,11 +284,190 @@ class PreprocessingStagesMixin:
             limitations=list(dict.fromkeys(limitations)),
         )
         checksum = hashlib.sha256(
-            _canonical_json_bytes(
+            record_io.canonical_json_bytes(
                 final_plan.model_dump(mode="json", exclude={"planChecksum"})
             )
         ).hexdigest()
         return final_plan.model_copy(update={"planChecksum": checksum})
+
+    def build_assay_preprocessing_plan(
+        self,
+        store: DataStore,
+        request_record: OrchestrationRequestRecord,
+        assay_name: str,
+        summary: AssaySummary,
+        policy: FeatureSelectionPolicy | None,
+        inspection: AssayFeatureInspection | None,
+        modality: str,
+        effective_min_cells: int,
+    ) -> AssayPreprocessingPlan:
+        excluded: list[str] = []
+        evidence_ids: list[str] = []
+        if policy is not None:
+            excluded = list(
+                dict.fromkeys(
+                    [
+                        *policy.excludeFeatures,
+                        *policy.artificialFeatures,
+                        *(
+                            reference.featureId
+                            for reference in policy.exactControlFeatures
+                        ),
+                        *(
+                            reference.featureName
+                            for reference in policy.exactControlFeatures
+                        ),
+                    ]
+                )
+            )
+            evidence_ids = list(policy.evidenceIds)
+        if modality == "RNA":
+            graph_eligible = summary.total_features >= 3
+            return AssayPreprocessingPlan(
+                assay=assay_name,
+                assayType=summary.assay_type,
+                role="graph" if graph_eligible else "unsupported",
+                graphEligible=graph_eligible,
+                markerEligible=graph_eligible,
+                featureMethod="hvg" if graph_eligible else "none",
+                reductionMethod="pca" if graph_eligible else "none",
+                featureParameters={
+                    "topN": min(1000, summary.total_features),
+                    "minCells": effective_min_cells,
+                    "excludeFamilies": (
+                        list(policy.excludeFamilies) if policy is not None else []
+                    ),
+                },
+                normalizationParameters={
+                    "logTransform": True,
+                    "renormalizeSubset": True,
+                },
+                reductionParameters={"dimensions": 21},
+                exactExcludedFeatures=excluded,
+                evidenceIds=evidence_ids,
+                limitations=(
+                    []
+                    if graph_eligible
+                    else ["RNA requires at least three features for PCA"]
+                ),
+            )
+        if modality == "ATAC":
+            graph_eligible = summary.total_features >= 3
+            return AssayPreprocessingPlan(
+                assay=assay_name,
+                assayType=summary.assay_type,
+                role="graph" if graph_eligible else "unsupported",
+                graphEligible=graph_eligible,
+                markerEligible=graph_eligible,
+                featureMethod="prevalentPeaks" if graph_eligible else "none",
+                reductionMethod="lsi" if graph_eligible else "none",
+                featureParameters={"topN": min(25000, summary.total_features)},
+                normalizationParameters={
+                    "logTransform": False,
+                    "renormalizeSubset": False,
+                },
+                reductionParameters={"dimensions": 50, "skipFirst": True},
+                evidenceIds=evidence_ids,
+                limitations=list(
+                    dict.fromkeys(
+                        [
+                            *(
+                                []
+                                if graph_eligible
+                                else [
+                                    "ATAC requires at least three peak features for LSI"
+                                ]
+                            ),
+                            *(
+                                [
+                                    "ATAC feature coordinates are not uniformly "
+                                    "valid chrom:start-end intervals; the genome "
+                                    "build remains unknown"
+                                ]
+                                if policy is not None
+                                and policy.peakCoordinateStatus
+                                in {"partial", "invalid"}
+                                else []
+                            ),
+                        ]
+                    )
+                ),
+            )
+        if modality == "ADT":
+            assay = store.get_assay(assay_name)
+            feature_ids = np.asarray(assay.feats.fetch_all("ids")).astype(str)
+            feature_names = np.asarray(assay.feats.fetch_all("names")).astype(str)
+            excluded = (
+                list(
+                    dict.fromkeys(
+                        value
+                        for reference in policy.exactControlFeatures
+                        for value in (reference.featureId, reference.featureName)
+                        if value
+                    )
+                )
+                if policy is not None
+                else []
+            )
+            excluded_values = {value for value in excluded if value}
+            panel_mask = ~np.isin(feature_ids, list(excluded_values))
+            panel_mask &= ~np.isin(feature_names, list(excluded_values))
+            selected_count = int(panel_mask.sum())
+            graph_eligible = selected_count >= 2
+            reduction = (
+                "identity"
+                if graph_eligible
+                and selected_count <= request_record.config.maxIdentityFeatures
+                else ("pca" if graph_eligible else "none")
+            )
+            return AssayPreprocessingPlan(
+                assay=assay_name,
+                assayType=summary.assay_type,
+                role="graph" if graph_eligible else "unsupported",
+                graphEligible=graph_eligible,
+                markerEligible=graph_eligible,
+                featureMethod="panel" if graph_eligible else "none",
+                reductionMethod=cast(ReductionMethod, reduction),
+                normalizationParameters={
+                    "logTransform": False,
+                    "renormalizeSubset": False,
+                },
+                reductionParameters={
+                    "dimensions": (
+                        selected_count
+                        if reduction == "identity"
+                        else min(15, max(2, selected_count - 1))
+                    )
+                },
+                exactExcludedFeatures=excluded,
+                evidenceIds=evidence_ids,
+                limitations=(
+                    [
+                        "ADT control inventory was truncated; only exact observed "
+                        "control features were excluded"
+                    ]
+                    if inspection is not None and inspection.modalityEvidence.truncated
+                    else []
+                ),
+            )
+        if modality == "HTO":
+            return AssayPreprocessingPlan(
+                assay=assay_name,
+                assayType=summary.assay_type,
+                role="hto",
+                graphEligible=False,
+                markerEligible=False,
+                featureMethod="none",
+                reductionMethod="none",
+                evidenceIds=evidence_ids,
+            )
+        message = f"Unsupported assay {assay_name!r} ({summary.assay_type})"
+        return AssayPreprocessingPlan(
+            assay=assay_name,
+            assayType=summary.assay_type,
+            role="unsupported",
+            limitations=[message],
+        )
 
     def preprocessing_stage(
         self,
@@ -447,8 +480,8 @@ class PreprocessingStagesMixin:
         *,
         resume_record: OrchestrationResumeRecord | None = None,
     ) -> tuple[WorkflowStageAttempt, list[PreprocessedAssayHandoff]]:
-        prefix = _ensure_orchestration_store(store)
-        existing = _validated_done_outcome(
+        prefix = journal._ensure_orchestration_store(store)
+        existing = journal._validated_done_outcome(
             store,
             prefix,
             workflow.workflowRunId,
@@ -457,11 +490,14 @@ class PreprocessingStagesMixin:
             parents,
         )
         if existing is not None:
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: reusing preprocessing artifacts"
+            )
             return existing, [
                 PreprocessedAssayHandoff.model_validate(value)
                 for value in existing.outputs["assays"]
             ]
-        started = _start_attempt(
+        started = journal._start_attempt(
             store.zw,
             prefix,
             workflow.workflowRunId,
@@ -477,6 +513,10 @@ class PreprocessingStagesMixin:
         try:
             self.apply_cell_qc(store, experimental, actions, operations)
             active_cells = int(np.asarray(store.cells.fetch_all("I"), dtype=bool).sum())
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: preprocessing retained "
+                f"{active_cells} active cell(s)"
+            )
             if active_cells < 3:
                 raise ValueError("Preprocessing requires at least three active cells")
             handoffs: list[PreprocessedAssayHandoff] = []
@@ -484,256 +524,23 @@ class PreprocessingStagesMixin:
             for assay_plan in plan.assays:
                 if not assay_plan.graphEligible:
                     continue
-                assay = store.get_assay(assay_plan.assay)
-                label_base = f"agent_{token}_{_safe_label(assay_plan.assay).lower()}"
-                min_cells = int(assay_plan.featureParameters.get("minCells", 1))
-                marker_features: ArtifactRef
-                if assay_plan.featureMethod == "hvg":
-                    blacklist = self.rna_blacklist(assay_plan)
-                    graph_label = f"{label_base}_graph_features"
-                    actual_top_n = min(
-                        int(assay_plan.featureParameters["topN"]),
-                        max(1, assay.feats.N - 1),
-                    )
-                    hvg_features = store.mark_hvgs(
-                        from_assay=assay_plan.assay,
-                        cell_key="I",
-                        min_cells=min_cells,
-                        top_n=actual_top_n,
-                        blacklist=blacklist,
-                        show_plot=False,
-                        label=graph_label,
-                    )
-                    filtered_graph_label = f"{label_base}_filtered_graph_features"
-                    graph_features = self.exclude_exact_features(
+                logger.info(
+                    f"Workflow {workflow.workflowRunId}: preprocessing assay "
+                    f"{assay_plan.assay!r} via {assay_plan.featureMethod}/"
+                    f"{assay_plan.reductionMethod}"
+                )
+                handoffs.append(
+                    self.preprocess_assay(
                         store,
                         assay_plan,
-                        hvg_features,
-                        label=filtered_graph_label,
+                        active_cells=active_cells,
+                        token=token,
+                        actions=actions,
+                        operations=operations,
+                        artifacts=artifacts,
                     )
-                    detected_label = f"{label_base}_detected_features"
-                    detected = store.select_detected_features(
-                        from_assay=assay_plan.assay,
-                        cell_key="I",
-                        min_cells=min_cells,
-                        label=detected_label,
-                    )
-                    marker_label = f"{label_base}_marker_features"
-                    marker_features = self.exclude_exact_features(
-                        store,
-                        assay_plan,
-                        detected,
-                        label=marker_label,
-                    )
-                    actions.extend(
-                        [
-                            f"mark_hvgs:{assay_plan.assay}",
-                            f"select_marker_features:{assay_plan.assay}",
-                        ]
-                    )
-                    operations.append(
-                        {
-                            "operation": "mark_hvgs",
-                            "assay": assay_plan.assay,
-                            "cellKey": "I",
-                            "minCells": min_cells,
-                            "topN": actual_top_n,
-                            "blacklist": blacklist,
-                            "showPlot": False,
-                            "label": graph_label,
-                            "invalidateCache": False,
-                            "artifact": ArtifactReferenceModel.from_artifact_ref(
-                                hvg_features
-                            ).model_dump(mode="json"),
-                        }
-                    )
-                    operations.extend(
-                        [
-                            {
-                                "operation": "set_feature_selection",
-                                "assay": assay_plan.assay,
-                                "source": ArtifactReferenceModel.from_artifact_ref(
-                                    hvg_features
-                                ).model_dump(mode="json"),
-                                "exactExcludedFeatures": list(
-                                    assay_plan.exactExcludedFeatures
-                                ),
-                                "excludeFamilies": list(
-                                    assay_plan.featureParameters.get(
-                                        "excludeFamilies", []
-                                    )
-                                ),
-                                "label": filtered_graph_label,
-                                "artifact": ArtifactReferenceModel.from_artifact_ref(
-                                    graph_features
-                                ).model_dump(mode="json"),
-                            },
-                            {
-                                "operation": "select_detected_features",
-                                "assay": assay_plan.assay,
-                                "cellKey": "I",
-                                "minCells": min_cells,
-                                "label": detected_label,
-                                "artifact": ArtifactReferenceModel.from_artifact_ref(
-                                    detected
-                                ).model_dump(mode="json"),
-                            },
-                            {
-                                "operation": "set_feature_selection",
-                                "assay": assay_plan.assay,
-                                "source": ArtifactReferenceModel.from_artifact_ref(
-                                    detected
-                                ).model_dump(mode="json"),
-                                "exactExcludedFeatures": list(
-                                    assay_plan.exactExcludedFeatures
-                                ),
-                                "excludeFamilies": list(
-                                    assay_plan.featureParameters.get(
-                                        "excludeFamilies", []
-                                    )
-                                ),
-                                "label": marker_label,
-                                "artifact": ArtifactReferenceModel.from_artifact_ref(
-                                    marker_features
-                                ).model_dump(mode="json"),
-                            },
-                        ]
-                    )
-                    artifacts.update(
-                        {
-                            f"{assay_plan.assay}_hvg_candidates": (
-                                ArtifactReferenceModel.from_artifact_ref(hvg_features)
-                            ),
-                            f"{assay_plan.assay}_detected_features": (
-                                ArtifactReferenceModel.from_artifact_ref(detected)
-                            ),
-                        }
-                    )
-                elif assay_plan.featureMethod == "prevalentPeaks":
-                    peak_label = f"{label_base}_prevalent_peaks"
-                    actual_top_n = min(
-                        int(assay_plan.featureParameters["topN"]),
-                        assay.feats.N - 1,
-                    )
-                    graph_features = store.mark_prevalent_peaks(
-                        from_assay=assay_plan.assay,
-                        cell_key="I",
-                        top_n=actual_top_n,
-                        label=peak_label,
-                    )
-                    marker_features = graph_features
-                    actions.append(f"mark_prevalent_peaks:{assay_plan.assay}")
-                    operations.append(
-                        {
-                            "operation": "mark_prevalent_peaks",
-                            "assay": assay_plan.assay,
-                            "cellKey": "I",
-                            "topN": actual_top_n,
-                            "label": peak_label,
-                            "invalidateCache": False,
-                            "artifact": ArtifactReferenceModel.from_artifact_ref(
-                                graph_features
-                            ).model_dump(mode="json"),
-                        }
-                    )
-                elif assay_plan.featureMethod == "panel":
-                    mask = np.ones(assay.feats.N, dtype=bool)
-                    ids = np.asarray(assay.feats.fetch_all("ids")).astype(str)
-                    names = np.asarray(assay.feats.fetch_all("names")).astype(str)
-                    excluded = set(assay_plan.exactExcludedFeatures)
-                    if excluded:
-                        mask &= ~np.isin(ids, list(excluded))
-                        mask &= ~np.isin(names, list(excluded))
-                    if int(mask.sum()) < 2:
-                        raise ValueError(
-                            f"ADT assay {assay_plan.assay!r} has fewer than two non-control features"
-                        )
-                    panel_label = f"{label_base}_panel"
-                    graph_features = store.set_feature_selection(
-                        from_assay=assay_plan.assay,
-                        mask=mask,
-                        label=panel_label,
-                    )
-                    marker_features = graph_features
-                    actions.append(f"select_adt_panel:{assay_plan.assay}")
-                    operations.append(
-                        {
-                            "operation": "set_feature_selection",
-                            "assay": assay_plan.assay,
-                            "selectedFeatures": int(mask.sum()),
-                            "exactExcludedFeatures": sorted(excluded),
-                            "label": panel_label,
-                            "artifact": ArtifactReferenceModel.from_artifact_ref(
-                                graph_features
-                            ).model_dump(mode="json"),
-                        }
-                    )
-                else:
-                    raise ValueError(
-                        f"Unsupported feature route {assay_plan.featureMethod!r}"
-                    )
-                normalized = store.run_normalization(
-                    from_assay=assay_plan.assay,
-                    cell_key="I",
-                    features=graph_features,
-                    log_transform=cast(
-                        bool,
-                        assay_plan.normalizationParameters.get("logTransform"),
-                    ),
-                    renormalize_subset=cast(
-                        bool,
-                        assay_plan.normalizationParameters.get("renormalizeSubset"),
-                    ),
-                    update_state=True,
                 )
-                graph_feature_group = store.load_artifact(graph_features)
-                graph_feature_values = cast(Any, graph_feature_group["values"])
-                selected_values = np.asarray(graph_feature_values[:], dtype=bool)
-                graph_features_model = ArtifactReferenceModel.from_artifact_ref(
-                    graph_features
-                )
-                marker_features_model = ArtifactReferenceModel.from_artifact_ref(
-                    marker_features
-                )
-                normalized_model = ArtifactReferenceModel.from_artifact_ref(normalized)
-                handoff = PreprocessedAssayHandoff(
-                    assay=assay_plan.assay,
-                    assayType=assay_plan.assayType,
-                    cellKey="I",
-                    reductionMethod=assay_plan.reductionMethod,
-                    graphFeatures=graph_features_model,
-                    markerFeatures=marker_features_model,
-                    normalized=normalized_model,
-                    nCells=active_cells,
-                    nFeatures=int(selected_values.sum()),
-                )
-                handoffs.append(handoff)
-                artifacts.update(
-                    {
-                        f"{assay_plan.assay}_graph_features": graph_features_model,
-                        f"{assay_plan.assay}_marker_features": marker_features_model,
-                        f"{assay_plan.assay}_normalized": normalized_model,
-                    }
-                )
-                actions.append(f"normalize:{assay_plan.assay}")
-                operations.append(
-                    {
-                        "operation": "run_normalization",
-                        "assay": assay_plan.assay,
-                        "cellKey": "I",
-                        "features": graph_features_model.model_dump(mode="json"),
-                        "logTransform": assay_plan.normalizationParameters.get(
-                            "logTransform"
-                        ),
-                        "renormalizeSubset": assay_plan.normalizationParameters.get(
-                            "renormalizeSubset"
-                        ),
-                        "updateState": True,
-                        "invalidateCache": False,
-                        "artifact": normalized_model.model_dump(mode="json"),
-                    }
-                )
-            outcome = _complete_attempt(
+            outcome = journal._complete_attempt(
                 started,
                 status="done",
                 artifacts={
@@ -747,10 +554,14 @@ class PreprocessingStagesMixin:
                 },
                 actions=actions,
             )
-            _save_outcome(store.zw, prefix, outcome)
+            journal._save_outcome(store.zw, prefix, outcome)
+            logger.info(
+                f"Workflow {workflow.workflowRunId}: preprocessing produced "
+                f"{len(handoffs)} graph-ready assay handoff(s)"
+            )
             return outcome, handoffs
         except Exception as exc:
-            outcome = finish_exception(
+            outcome = journal.finish_exception(
                 store,
                 prefix,
                 workflow,
@@ -762,6 +573,258 @@ class PreprocessingStagesMixin:
             )
             return outcome, []
 
+    def preprocess_assay(
+        self,
+        store: DataStore,
+        assay_plan: AssayPreprocessingPlan,
+        *,
+        active_cells: int,
+        token: str,
+        actions: list[str],
+        operations: list[dict[str, Any]],
+        artifacts: dict[str, ArtifactReferenceModel],
+    ) -> PreprocessedAssayHandoff:
+        assay = store.get_assay(assay_plan.assay)
+        label_base = f"agent_{token}_{journal._safe_label(assay_plan.assay).lower()}"
+        min_cells = int(assay_plan.featureParameters.get("minCells", 1))
+        marker_features: ArtifactRef
+        if assay_plan.featureMethod == "hvg":
+            blacklist = self.rna_blacklist(assay_plan)
+            graph_label = f"{label_base}_graph_features"
+            actual_top_n = min(
+                int(assay_plan.featureParameters["topN"]),
+                max(1, assay.feats.N - 1),
+            )
+            hvg_features = store.mark_hvgs(
+                from_assay=assay_plan.assay,
+                cell_key="I",
+                min_cells=min_cells,
+                top_n=actual_top_n,
+                blacklist=blacklist,
+                show_plot=False,
+                label=graph_label,
+            )
+            filtered_graph_label = f"{label_base}_filtered_graph_features"
+            graph_features = self.exclude_exact_features(
+                store,
+                assay_plan,
+                hvg_features,
+                label=filtered_graph_label,
+            )
+            detected_label = f"{label_base}_detected_features"
+            detected = store.select_detected_features(
+                from_assay=assay_plan.assay,
+                cell_key="I",
+                min_cells=min_cells,
+                label=detected_label,
+            )
+            marker_label = f"{label_base}_marker_features"
+            marker_features = self.exclude_exact_features(
+                store,
+                assay_plan,
+                detected,
+                label=marker_label,
+            )
+            actions.extend(
+                [
+                    f"mark_hvgs:{assay_plan.assay}",
+                    f"select_marker_features:{assay_plan.assay}",
+                ]
+            )
+            operations.append(
+                {
+                    "operation": "mark_hvgs",
+                    "assay": assay_plan.assay,
+                    "cellKey": "I",
+                    "minCells": min_cells,
+                    "topN": actual_top_n,
+                    "blacklist": blacklist,
+                    "showPlot": False,
+                    "label": graph_label,
+                    "invalidateCache": False,
+                    "artifact": ArtifactReferenceModel.from_artifact_ref(
+                        hvg_features
+                    ).model_dump(mode="json"),
+                }
+            )
+            operations.extend(
+                [
+                    {
+                        "operation": "set_feature_selection",
+                        "assay": assay_plan.assay,
+                        "source": ArtifactReferenceModel.from_artifact_ref(
+                            hvg_features
+                        ).model_dump(mode="json"),
+                        "exactExcludedFeatures": list(assay_plan.exactExcludedFeatures),
+                        "excludeFamilies": list(
+                            assay_plan.featureParameters.get("excludeFamilies", [])
+                        ),
+                        "label": filtered_graph_label,
+                        "artifact": ArtifactReferenceModel.from_artifact_ref(
+                            graph_features
+                        ).model_dump(mode="json"),
+                    },
+                    {
+                        "operation": "select_detected_features",
+                        "assay": assay_plan.assay,
+                        "cellKey": "I",
+                        "minCells": min_cells,
+                        "label": detected_label,
+                        "artifact": ArtifactReferenceModel.from_artifact_ref(
+                            detected
+                        ).model_dump(mode="json"),
+                    },
+                    {
+                        "operation": "set_feature_selection",
+                        "assay": assay_plan.assay,
+                        "source": ArtifactReferenceModel.from_artifact_ref(
+                            detected
+                        ).model_dump(mode="json"),
+                        "exactExcludedFeatures": list(assay_plan.exactExcludedFeatures),
+                        "excludeFamilies": list(
+                            assay_plan.featureParameters.get("excludeFamilies", [])
+                        ),
+                        "label": marker_label,
+                        "artifact": ArtifactReferenceModel.from_artifact_ref(
+                            marker_features
+                        ).model_dump(mode="json"),
+                    },
+                ]
+            )
+            artifacts.update(
+                {
+                    f"{assay_plan.assay}_hvg_candidates": (
+                        ArtifactReferenceModel.from_artifact_ref(hvg_features)
+                    ),
+                    f"{assay_plan.assay}_detected_features": (
+                        ArtifactReferenceModel.from_artifact_ref(detected)
+                    ),
+                }
+            )
+        elif assay_plan.featureMethod == "prevalentPeaks":
+            peak_label = f"{label_base}_prevalent_peaks"
+            actual_top_n = min(
+                int(assay_plan.featureParameters["topN"]),
+                assay.feats.N - 1,
+            )
+            graph_features = store.mark_prevalent_peaks(
+                from_assay=assay_plan.assay,
+                cell_key="I",
+                top_n=actual_top_n,
+                label=peak_label,
+            )
+            marker_features = graph_features
+            actions.append(f"mark_prevalent_peaks:{assay_plan.assay}")
+            operations.append(
+                {
+                    "operation": "mark_prevalent_peaks",
+                    "assay": assay_plan.assay,
+                    "cellKey": "I",
+                    "topN": actual_top_n,
+                    "label": peak_label,
+                    "invalidateCache": False,
+                    "artifact": ArtifactReferenceModel.from_artifact_ref(
+                        graph_features
+                    ).model_dump(mode="json"),
+                }
+            )
+        elif assay_plan.featureMethod == "panel":
+            mask = np.ones(assay.feats.N, dtype=bool)
+            ids = np.asarray(assay.feats.fetch_all("ids")).astype(str)
+            names = np.asarray(assay.feats.fetch_all("names")).astype(str)
+            excluded = set(assay_plan.exactExcludedFeatures)
+            if excluded:
+                mask &= ~np.isin(ids, list(excluded))
+                mask &= ~np.isin(names, list(excluded))
+            if int(mask.sum()) < 2:
+                raise ValueError(
+                    f"ADT assay {assay_plan.assay!r} has fewer than two non-control features"
+                )
+            panel_label = f"{label_base}_panel"
+            graph_features = store.set_feature_selection(
+                from_assay=assay_plan.assay,
+                mask=mask,
+                label=panel_label,
+            )
+            marker_features = graph_features
+            actions.append(f"select_adt_panel:{assay_plan.assay}")
+            operations.append(
+                {
+                    "operation": "set_feature_selection",
+                    "assay": assay_plan.assay,
+                    "selectedFeatures": int(mask.sum()),
+                    "exactExcludedFeatures": sorted(excluded),
+                    "label": panel_label,
+                    "artifact": ArtifactReferenceModel.from_artifact_ref(
+                        graph_features
+                    ).model_dump(mode="json"),
+                }
+            )
+        else:
+            raise ValueError(f"Unsupported feature route {assay_plan.featureMethod!r}")
+        normalized = store.run_normalization(
+            from_assay=assay_plan.assay,
+            cell_key="I",
+            features=graph_features,
+            log_transform=cast(
+                bool,
+                assay_plan.normalizationParameters.get("logTransform"),
+            ),
+            renormalize_subset=cast(
+                bool,
+                assay_plan.normalizationParameters.get("renormalizeSubset"),
+            ),
+            update_state=True,
+        )
+        graph_feature_group = store.load_artifact(graph_features)
+        graph_feature_values = cast(Any, graph_feature_group["values"])
+        selected_values = np.asarray(graph_feature_values[:], dtype=bool)
+        graph_features_model = ArtifactReferenceModel.from_artifact_ref(graph_features)
+        marker_features_model = ArtifactReferenceModel.from_artifact_ref(
+            marker_features
+        )
+        normalized_model = ArtifactReferenceModel.from_artifact_ref(normalized)
+        handoff = PreprocessedAssayHandoff(
+            assay=assay_plan.assay,
+            assayType=assay_plan.assayType,
+            cellKey="I",
+            reductionMethod=assay_plan.reductionMethod,
+            graphFeatures=graph_features_model,
+            markerFeatures=marker_features_model,
+            normalized=normalized_model,
+            nCells=active_cells,
+            nFeatures=int(selected_values.sum()),
+        )
+        artifacts.update(
+            {
+                f"{assay_plan.assay}_graph_features": graph_features_model,
+                f"{assay_plan.assay}_marker_features": marker_features_model,
+                f"{assay_plan.assay}_normalized": normalized_model,
+            }
+        )
+        actions.append(f"normalize:{assay_plan.assay}")
+        operations.append(
+            {
+                "operation": "run_normalization",
+                "assay": assay_plan.assay,
+                "cellKey": "I",
+                "features": graph_features_model.model_dump(mode="json"),
+                "logTransform": assay_plan.normalizationParameters.get("logTransform"),
+                "renormalizeSubset": assay_plan.normalizationParameters.get(
+                    "renormalizeSubset"
+                ),
+                "updateState": True,
+                "invalidateCache": False,
+                "artifact": normalized_model.model_dump(mode="json"),
+            }
+        )
+        logger.info(
+            f"Preprocessed assay {assay_plan.assay!r}: "
+            f"cells={handoff.nCells}, features={handoff.nFeatures}, "
+            f"reduction={handoff.reductionMethod!r}"
+        )
+        return handoff
+
     def apply_cell_qc(
         self,
         store: DataStore,
@@ -770,6 +833,9 @@ class PreprocessingStagesMixin:
         operations: list[dict[str, Any]],
     ) -> None:
         plan = experimental.cellQc
+        logger.info(
+            f"Applying cell QC action={plan.action!r}, profile={plan.profileId!r}"
+        )
         if plan.action == "skip":
             actions.append("skip_cell_qc")
             operations.append(

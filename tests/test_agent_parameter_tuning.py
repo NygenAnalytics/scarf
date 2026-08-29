@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pytest
+from pydantic_ai import UnexpectedModelBehavior
 from pydantic_ai.messages import (
     ModelMessage,
     ModelResponse,
@@ -1565,6 +1566,171 @@ def test_batched_refinement_planning_allows_a_validator_retry() -> None:
     assert model_calls == 3
     assert result.status == "done"
     assert result.recommendedByAssay == {"RNA": "baseline"}
+
+
+def test_batched_tuning_falls_back_after_structured_output_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scarf.agent import parameter_tuning as module
+
+    calls: list[str] = []
+
+    def unavailable_structured_output(**kwargs: Any) -> None:
+        calls.append(kwargs["name"])
+        raise UnexpectedModelBehavior("structured output unavailable")
+
+    monkeypatch.setattr(module, "run_agent_sync", unavailable_structured_output)
+    result = tune_parameters_batch(
+        _FakeStore(),
+        model=object(),
+        assays=[
+            ParameterTuningAssayInput(
+                normalized=_artifact("normalized", 1),
+                fromAssay="RNA",
+                candidates=[
+                    ParameterCandidate.get_example(),
+                    ParameterCandidate(candidateId="pca_15", dimensions=15),
+                ],
+                maxCandidates=3,
+                maxRefinedCandidates=1,
+            )
+        ],
+        primary_assay="RNA",
+    )
+
+    assert calls == ["parameter_batch_search_planning", "parameter_tuning_batch"]
+    assert result.status == "done"
+    assert result.recommendedByAssay == {"RNA": "baseline"}
+    assert result.assayReports["RNA"].confidence == "low"
+    assert result.assayReports["RNA"].comparisons[0].candidateId == "pca_15"
+    assert result.searchPlan is not None
+    assert result.searchPlan.status == "complete"
+    assert result.runInfo.agentName == "parameter_tuning_batch_fallback"
+
+
+def test_single_tuning_falls_back_after_structured_output_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scarf.agent import parameter_tuning as module
+
+    def unavailable_structured_output(**_kwargs: Any) -> None:
+        raise UnexpectedModelBehavior("structured output unavailable")
+
+    monkeypatch.setattr(module, "run_agent_sync", unavailable_structured_output)
+    result = tune_parameters(
+        _FakeStore(),
+        model=object(),
+        normalized=_artifact("normalized", 1),
+        from_assay="RNA",
+        candidates=[
+            ParameterCandidate.get_example(),
+            ParameterCandidate(candidateId="pca_15", dimensions=15),
+        ],
+        max_candidates=3,
+        max_refined_candidates=1,
+    )
+
+    assert result.status == "done"
+    assert result.recommendedCandidateId == "baseline"
+    assert result.confidence == "low"
+    assert result.runInfo.agentName == "parameter_tuning_fallback"
+
+
+def test_single_eligible_final_graph_skips_provider_selection() -> None:
+    evaluation = ParameterCandidateEvaluation.get_example()
+    evaluation.artifacts["clusters"] = ArtifactRecord(
+        assay="RNA",
+        kind="cluster_labels",
+        artifactId="7" * 64,
+    )
+    native_report = ParameterTuningReport(
+        status="done",
+        fromAssay="RNA",
+        evaluations=[evaluation],
+        recommendedCandidateId="baseline",
+        evidenceIds=["candidate:baseline:clusters"],
+    )
+    report = ParameterTuningReport(
+        status="done",
+        fromAssay="RNA",
+        assayReports={"RNA": native_report},
+        recommendedByAssay={"RNA": "baseline"},
+    )
+
+    selected = select_final_parameter_graph(
+        model=object(),
+        report=report,
+        integration_evaluations=[],
+        marker_assay="RNA",
+    )
+
+    assert selected.status == "done"
+    assert selected.finalSelection is not None
+    assert selected.finalSelection.selectedOptionId == "native:RNA:baseline"
+    assert selected.finalSelection.runInfo.agentName == (
+        "parameter_tuning_final_graph_deterministic"
+    )
+
+
+def test_final_graph_retry_exhaustion_pauses_when_multiple_options_exist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scarf.agent import parameter_tuning as module
+
+    reports: dict[str, ParameterTuningReport] = {}
+    for assay, token in (("RNA", "7"), ("ADT", "8")):
+        evaluation = ParameterCandidateEvaluation.get_example().model_copy(
+            update={
+                "clusterColumn": f"{assay}_agent_tuning_baseline",
+                "artifacts": {
+                    "connectivityMap": ArtifactRecord(
+                        assay=assay,
+                        kind="connectivity_map",
+                        artifactId=token * 64,
+                    ),
+                    "clusters": ArtifactRecord(
+                        assay=assay,
+                        kind="cluster_labels",
+                        artifactId=token * 64,
+                    ),
+                },
+            }
+        )
+        reports[assay] = ParameterTuningReport(
+            status="done",
+            fromAssay=assay,
+            evaluations=[evaluation],
+            recommendedCandidateId="baseline",
+            evidenceIds=["candidate:baseline:clusters"],
+        )
+    report = ParameterTuningReport(
+        status="done",
+        fromAssay="RNA",
+        assayReports=reports,
+        recommendedByAssay={"RNA": "baseline", "ADT": "baseline"},
+    )
+
+    def unavailable_structured_output(**_kwargs: Any) -> None:
+        raise UnexpectedModelBehavior("structured output unavailable")
+
+    monkeypatch.setattr(module, "run_agent_sync", unavailable_structured_output)
+    selected = select_final_parameter_graph(
+        model=object(),
+        report=report,
+        integration_evaluations=[],
+        marker_assay="RNA",
+    )
+
+    assert selected.status == "needsInput"
+    assert selected.needsInput is not None
+    assert selected.needsInput.options == [
+        "native:ADT:baseline",
+        "native:RNA:baseline",
+    ]
+    assert selected.finalSelection is not None
+    assert selected.finalSelection.runInfo.agentName == (
+        "parameter_tuning_final_graph_fallback"
+    )
 
 
 def test_batched_selection_prompt_includes_persisted_resume_directions() -> None:

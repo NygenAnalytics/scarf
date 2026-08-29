@@ -205,6 +205,7 @@ def test_system_prompt_does_not_embed_fictional_output_values() -> None:
     assert "alveolar macrophage" not in _SYSTEM_PROMPT
     assert "cluster-versus-rest marker specificity" in _SYSTEM_PROMPT
     assert "inspect_cluster_markers_batch exactly once" in _SYSTEM_PROMPT
+    assert "Independent units may occur in more than one condition" in _SYSTEM_PROMPT
 
 
 def test_composition_is_sample_level_and_hides_sample_identifiers() -> None:
@@ -221,6 +222,35 @@ def test_composition_is_sample_level_and_hides_sample_identifiers() -> None:
     serialized = result.model_dump_json()
     assert "s1" not in serialized
     assert "s2" not in serialized
+
+
+def test_composition_supports_paired_independent_units() -> None:
+    store = FakeStore(replicated=True)
+    store.cells.values["donor"] = np.repeat(["d1", "d2", "d1", "d2"], 4)
+    store.cells.columns.append("donor")
+    run_context = context(store, marker=store.marker)
+    run_context.deps.sampleColumn = "donor"
+
+    result = asyncio.run(inspect_cluster_composition(run_context))
+
+    summaries = {
+        (summary.condition, summary.clusterId): summary
+        for summary in result.conditionSummaries
+    }
+    assert summaries[("control", "0")].nSamples == 2
+    assert summaries[("control", "0")].meanFraction == pytest.approx(0.625)
+    assert summaries[("control", "0")].minFraction == pytest.approx(0.5)
+    assert summaries[("control", "0")].maxFraction == pytest.approx(0.75)
+    assert summaries[("control", "0")].cellCount == 5
+    assert summaries[("control", "1")].meanFraction == pytest.approx(0.375)
+    assert summaries[("control", "1")].cellCount == 3
+    assert summaries[("treated", "0")].meanFraction == pytest.approx(0.25)
+    assert summaries[("treated", "0")].cellCount == 2
+    assert summaries[("treated", "1")].meanFraction == pytest.approx(0.75)
+    assert summaries[("treated", "1")].cellCount == 6
+    serialized = result.model_dump_json()
+    assert "d1" not in serialized
+    assert "d2" not in serialized
 
 
 def test_marker_tool_uses_exact_artifact_and_bounded_rows() -> None:

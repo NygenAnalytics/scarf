@@ -17,10 +17,12 @@ from typing import Any, Literal, cast
 import zarr
 from pydantic import Field, field_validator, model_validator
 from zarr.core.buffer import default_buffer_prototype
-from zarr.core.sync import collect_aiterator, sync
+from zarr.core.sync import sync
 
 from ..datastore.datastore import DataStore
 from ..storage.schema import validate_workspace_name
+from ..utils.logging import logger
+from . import record_io
 from .biological_interpretation import BiologicalInterpretationReport
 from .config import AgentRunConfig
 from .data_enrichment import DataEnrichmentReport
@@ -426,52 +428,14 @@ def _validate_run_id(value: str, label: str) -> str:
     return value
 
 
-def _join_key(*parts: str) -> str:
-    return "/".join(part.strip("/") for part in parts if part.strip("/"))
-
-
-def _canonical_json_bytes(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-
-
-def _display_json_bytes(value: Any) -> bytes:
-    return (
-        json.dumps(
-            value,
-            sort_keys=True,
-            indent=2,
-            ensure_ascii=False,
-            allow_nan=False,
-        )
-        + "\n"
-    ).encode("utf-8")
-
-
-def _read_key(group: zarr.Group, key: str) -> bytes | None:
-    value = sync(
-        group.store.get(
-            key,
-            prototype=default_buffer_prototype(),
-        )
-    )
-    return None if value is None else value.to_bytes()
-
-
 def _key_exists(group: zarr.Group, key: str) -> bool:
-    return _read_key(group, key) is not None
+    return record_io.read_key(group, key) is not None
 
 
 def _list_keys(group: zarr.Group, prefix: str) -> list[str]:
     if not group.store.supports_listing:
         raise NotImplementedError("Agent persistence requires a listable Zarr store")
-    resolved_prefix = f"{prefix.rstrip('/')}/"
-    return sorted(collect_aiterator(group.store.list_prefix(resolved_prefix)))
+    return record_io.list_keys(group, prefix)
 
 
 def _write_key_once(group: zarr.Group, key: str, payload: bytes) -> None:
@@ -484,7 +448,7 @@ def _write_key_once(group: zarr.Group, key: str, payload: bytes) -> None:
         raise FileExistsError(f"Immutable agent record {key!r} already exists")
     buffer = default_buffer_prototype().buffer.from_bytes(payload)
     sync(store.set_if_not_exists(key, buffer))
-    stored = _read_key(group, key)
+    stored = record_io.read_key(group, key)
     if stored is None:
         raise RuntimeError(f"Agent record {key!r} was not stored")
     if stored != payload:
@@ -498,7 +462,7 @@ def _read_json_model(
     key: str,
     model_type: type[AgentDataModel],
 ) -> AgentDataModel:
-    payload = _read_key(group, key)
+    payload = record_io.read_key(group, key)
     if payload is None:
         raise FileNotFoundError(key)
     try:
@@ -640,23 +604,29 @@ def _validate_dataset_binding(
 
 
 def _agents_prefix(group: zarr.Group) -> str:
-    return _join_key(str(getattr(group, "path", "")), "agents")
+    return record_io.join_key(str(getattr(group, "path", "")), "agents")
 
 
 def _manifest_key(prefix: str) -> str:
-    return _join_key(prefix, "store.json")
+    return record_io.join_key(prefix, "store.json")
 
 
 def _workflow_prefix(prefix: str, workflow_run_id: str) -> str:
-    return _join_key(prefix, "runs", workflow_run_id)
+    return record_io.join_key(prefix, "runs", workflow_run_id)
 
 
 def _workflow_key(prefix: str, workflow_run_id: str) -> str:
-    return _join_key(_workflow_prefix(prefix, workflow_run_id), "workflow.json")
+    return record_io.join_key(
+        _workflow_prefix(prefix, workflow_run_id),
+        "workflow.json",
+    )
 
 
 def _finalization_key(prefix: str, workflow_run_id: str) -> str:
-    return _join_key(_workflow_prefix(prefix, workflow_run_id), "finalization.json")
+    return record_io.join_key(
+        _workflow_prefix(prefix, workflow_run_id),
+        "finalization.json",
+    )
 
 
 def _report_key(
@@ -665,7 +635,7 @@ def _report_key(
     agent_name: AgentName,
     agent_run_id: str,
 ) -> str:
-    return _join_key(
+    return record_io.join_key(
         _workflow_prefix(prefix, workflow_run_id),
         agent_name,
         agent_run_id,
@@ -716,14 +686,14 @@ def _open_agent_store(
         )
 
     manifest_key = _manifest_key(prefix)
-    payload = _read_key(group, manifest_key)
+    payload = record_io.read_key(group, manifest_key)
     if payload is None:
         if not initialize:
             raise FileNotFoundError(manifest_key)
         metadata_keys = {
-            _join_key(prefix, "zarr.json"),
-            _join_key(prefix, ".zgroup"),
-            _join_key(prefix, ".zattrs"),
+            record_io.join_key(prefix, "zarr.json"),
+            record_io.join_key(prefix, ".zgroup"),
+            record_io.join_key(prefix, ".zattrs"),
         }
         if any(key not in metadata_keys for key in _list_keys(group, prefix)):
             raise ValueError("Refusing to initialize a non-empty agents hierarchy")
@@ -731,7 +701,7 @@ def _open_agent_store(
         _write_key_once(
             group,
             manifest_key,
-            _display_json_bytes(manifest.model_dump(mode="json")),
+            record_io.display_json_bytes(manifest.model_dump(mode="json")),
         )
     manifest = cast(
         AgentStoreManifest,
@@ -770,7 +740,10 @@ def _load_workflow_record(
         raise ValueError(
             "Immutable workflow.json must contain the running identity only"
         )
-    finalization_payload = _read_key(group, _finalization_key(prefix, workflow_run_id))
+    finalization_payload = record_io.read_key(
+        group,
+        _finalization_key(prefix, workflow_run_id),
+    )
     if finalization_payload is None:
         return workflow
     finalization = cast(
@@ -809,7 +782,7 @@ def _report_checksum(record: AgentReportRecord) -> str:
         "invocation": record.invocation.model_dump(mode="json"),
         "report": record.report,
     }
-    return hashlib.sha256(_canonical_json_bytes(content)).hexdigest()
+    return hashlib.sha256(record_io.canonical_json_bytes(content)).hexdigest()
 
 
 def _load_report_record_at(
@@ -1105,7 +1078,11 @@ def create_agent_workflow(
     _write_key_once(
         group,
         key,
-        _display_json_bytes(workflow.model_dump(mode="json")),
+        record_io.display_json_bytes(workflow.model_dump(mode="json")),
+    )
+    logger.info(
+        f"Created agent workflow {resolved_run_id}: workspace="
+        f"{resolved_workspace or 'root'}, assays={len(observed)}"
     )
     return workflow
 
@@ -1193,7 +1170,7 @@ def save_agent_report(
     _write_key_once(
         group,
         key,
-        _display_json_bytes(record.model_dump(mode="json")),
+        record_io.display_json_bytes(record.model_dump(mode="json")),
     )
     stored = _load_report_record_at(
         group,
@@ -1202,6 +1179,11 @@ def save_agent_report(
         agent_name=agent_name,
         agent_run_id=resolved_agent_run_id,
         workspace=resolved_workspace,
+    )
+    logger.info(
+        f"Saved {agent_name} report {resolved_agent_run_id} for workflow "
+        f"{resolved_workflow_id}: status={getattr(report, 'status', 'done')}, "
+        f"parents={len(invocation.parentReports)}"
     )
     return stored.reference
 
@@ -1408,7 +1390,7 @@ def list_agent_workflows(
         workspace=resolved_workspace,
         initialize=False,
     )
-    runs_prefix = _join_key(prefix, "runs")
+    runs_prefix = record_io.join_key(prefix, "runs")
     workflow_ids: set[str] = set()
     for key in _list_keys(group, runs_prefix):
         relative = key.removeprefix(f"{runs_prefix}/")
@@ -1485,13 +1467,18 @@ def finalize_agent_workflow(
     _write_key_once(
         group,
         _finalization_key(prefix, workflow_run_id),
-        _display_json_bytes(finalization.model_dump(mode="json")),
+        record_io.display_json_bytes(finalization.model_dump(mode="json")),
     )
-    return load_agent_workflow(
+    finalized = load_agent_workflow(
         target,
         workflow_run_id,
         workspace=workspace,
     )
+    logger.info(
+        f"Finalized agent workflow {workflow_run_id}: status={status}, "
+        f"reports={len(finalized.reports)}"
+    )
+    return finalized
 
 
 __all__ = [

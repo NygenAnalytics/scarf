@@ -71,13 +71,13 @@ class Config:
 class AgentRunConfig(AgentDataModel):
     """Bound one agent run without selecting a scientific workflow."""
 
-    requestLimit: int = 6
-    toolCallLimit: int = 4
+    requestLimit: int = 9
+    toolCallLimit: int = 5
     inputTokenLimit: int | None = None
-    outputTokenLimit: int | None = 32768
+    outputTokenLimit: int | None = 32768  # Per provider response.
     totalTokenLimit: int | None = None
     timeoutSeconds: float = 600.0
-    retries: int = 2
+    retries: int = 5
     temperature: float = 0.0
     seed: int = 4444
     sequentialTools: bool = True
@@ -145,7 +145,7 @@ class AgentRunConfig(AgentDataModel):
 
     @classmethod
     def get_example(cls) -> "AgentRunConfig":
-        return cls(requestLimit=6, toolCallLimit=4, outputTokenLimit=2048)
+        return cls(requestLimit=9, toolCallLimit=5, outputTokenLimit=2048)
 
 
 def get_model_settings(
@@ -186,15 +186,20 @@ def get_model_settings(
 
 
 def get_usage_limits(config: AgentRunConfig | None = None) -> Any:
-    """Translate the public run configuration into Pydantic-AI limits."""
+    """Translate per-request configuration into bounded run-wide usage limits."""
     from pydantic_ai import UsageLimits
 
     run_config = config or AgentRunConfig()
+    output_tokens_limit = (
+        None
+        if run_config.outputTokenLimit is None
+        else run_config.outputTokenLimit * run_config.requestLimit
+    )
     return UsageLimits(
         request_limit=run_config.requestLimit,
         tool_calls_limit=run_config.toolCallLimit,
         input_tokens_limit=run_config.inputTokenLimit,
-        output_tokens_limit=run_config.outputTokenLimit,
+        output_tokens_limit=output_tokens_limit,
         total_tokens_limit=run_config.totalTokenLimit,
     )
 

@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from zarr.errors import ZarrUserWarning
 
 import scarf.agent as agent_api
+import scarf.agent.record_io as record_io
 from scarf.agent.biological_interpretation import BiologicalInterpretationReport
 from scarf.agent.config import AgentRunConfig
 from scarf.agent.data_enrichment import DataEnrichmentReport
@@ -237,6 +238,24 @@ def test_public_persistence_models_have_factories_and_exports() -> None:
     assert agent_api.finalize_agent_workflow is finalize_agent_workflow
     assert agent_api.load_agent_record is load_agent_record
     assert agent_api.save_agent_report is save_agent_report
+
+
+def test_record_io_preserves_json_bytes_and_store_key_order(tmp_path: Path) -> None:
+    value = {"z": ["é", 1], "a": True}
+    assert record_io.canonical_json_bytes(value) == b'{"a":true,"z":["\xc3\xa9",1]}'
+    assert record_io.display_json_bytes(value) == (
+        '{\n  "a": true,\n  "z": [\n    "é",\n    1\n  ]\n}\n'.encode()
+    )
+    assert record_io.join_key("/agents/", "", "/runs/") == "agents/runs"
+
+    path = _create_scarf_store(tmp_path)
+    create_agent_workflow(path, workflow_run_id="workflow-1")
+    root = zarr.open_group(str(path), mode="r")
+    workflow_key = "agents/runs/workflow-1/workflow.json"
+
+    assert record_io.list_keys(root, "agents/runs") == [workflow_key]
+    assert record_io.read_key(root, workflow_key) == (path / workflow_key).read_bytes()
+    assert record_io.read_key(root, "agents/missing.json") is None
 
 
 def test_persistence_models_reject_invalid_identity_and_duplicate_parents() -> None:
