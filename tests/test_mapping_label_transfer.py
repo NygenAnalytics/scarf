@@ -26,6 +26,12 @@ from scarf.storage.artifact_writer import (
 )
 from scarf.storage.artifacts import (
     ArtifactRef,
+    fingerprint_array,
+)
+from scarf.storage.feature_selection import (
+    _feature_selection_plan,
+    _ordered_feature_ids_fingerprint,
+    _write_feature_selection,
 )
 from scarf.storage.selections import (
     read_stored_selection_indices,
@@ -105,7 +111,7 @@ def _write_projection(
     distances: np.ndarray,
     uninformative: np.ndarray,
     cell_key: str = "mapping_cells",
-    feature_coverage: float = 0.75,
+    feature_coverage: float = 1.0,
 ) -> ArtifactRef:
     index_values = np.asarray(indices, dtype=np.uint64)
     distance_values = np.asarray(distances, dtype=np.float64)
@@ -129,7 +135,32 @@ def _write_projection(
         inputs={},
         source_column=cell_key,
     )
-    feature_selection = query.select_all_features(from_assay="RNA")
+    all_features = query.select_all_features(from_assay="RNA")
+    query_feature_ids = np.asarray(query.RNA.feats.fetch_all("ids")).astype(str)
+    reference_feature_ids = np.asarray(reference.feature_ids).astype(str)
+    feature_mask = np.isin(query_feature_ids, reference_feature_ids)
+    feature_ids_fingerprint = _ordered_feature_ids_fingerprint(query.RNA)
+    feature_plan = _feature_selection_plan(
+        query.zw,
+        assay="RNA",
+        n_features=query.RNA.feats.N,
+        ordered_feature_ids_fingerprint=feature_ids_fingerprint,
+        operation="select_mapping_overlap",
+        parameters={},
+        inputs={
+            "mapping_reference": reference.external_ref,
+            "all_features": all_features,
+        },
+        execution_options={},
+        expected_payload_fingerprint=fingerprint_array(feature_mask),
+    )
+    _write_feature_selection(
+        query.zw,
+        feature_plan,
+        ordered_feature_ids_fingerprint=feature_ids_fingerprint,
+        payload={"values": feature_mask},
+    )
+    feature_selection = feature_plan.ref
     planned = plan_projection(
         query.zw,
         query_assay="RNA",
@@ -141,7 +172,9 @@ def _write_projection(
         feature_selection=feature_selection,
         selected_expression_fingerprint="e" * 64,
         query_batch_fingerprint=NO_QUERY_BATCH_FINGERPRINT,
+        query_batch_count=1,
         mapping_reference=reference.external_ref,
+        reference=reference,
         reference_cell_count=reference.selected_cell_count,
     )
     writer = ProjectionWriter(
@@ -197,6 +230,20 @@ def _write_reference_column(reference, name: str, values: np.ndarray) -> None:
         full[:] = 0
     full[indices] = compact
     reference.datastore.cells.insert(name, full, overwrite=True)
+
+
+def _attach_reference_missing_mask(
+    reference,
+    column: str,
+    compact_missing: np.ndarray,
+) -> None:
+    indices = _reference_cell_indices(reference)
+    missing = np.zeros(reference.datastore.cells.N, dtype=bool)
+    missing[indices] = np.asarray(compact_missing, dtype=bool)
+    group = reference.datastore.zw["cellData"]
+    mask_name = f"__scarf_missing__{column}"
+    group.create_array(mask_name, data=missing, chunks=(len(missing),))
+    reference.datastore.cells._get_array(column).attrs["missing_mask"] = mask_name
 
 
 def _write_reference_layout(
@@ -285,7 +332,7 @@ def test_mapping_result_requires_explicit_ref_and_reference_after_cold_reopen(
             artifact_id="0" * 64,
         ),
     )
-    with pytest.raises(ValueError, match="does not match the projection input"):
+    with pytest.raises(ValueError, match="Mapping reference artifact is missing"):
         query.get_mapping_result(result, reference=mismatched)
 
 
@@ -396,7 +443,7 @@ def test_labels_and_evidence_abstain_without_fabricating_metrics(
         indices=np.array([[0, 1], [0, 1], [1, 0]]),
         distances=np.array([[1.0, 9.0], [1.0, 9.0], [1.0, 9.0]]),
         uninformative=np.array([False, True, False]),
-        feature_coverage=0.625,
+        feature_coverage=1.0,
     )
 
     labels = query.get_target_classes(
@@ -418,7 +465,7 @@ def test_labels_and_evidence_abstain_without_fabricating_metrics(
     assert labels.tolist() == ["winner", "NA", "runner_up"]
     assert evidence["label"].tolist() == ["winner", "NA", "runner_up"]
     assert evidence["isUnknown"].tolist() == [False, True, False]
-    assert evidence["featureCoverage"].tolist() == [0.625] * 3
+    assert evidence["featureCoverage"].tolist() == [1.0] * 3
     for column in (
         "voteFraction",
         "voteEntropy",
@@ -520,6 +567,110 @@ def test_label_transfer_handles_ties_thresholds_distance_and_subsets(
         )
 
 
+def test_label_transfer_excludes_explicitly_missing_reference_labels(
+    mapping_consumer_context,
+):
+    _, reference, query = mapping_consumer_context
+    labels = np.arange(reference.selected_cell_count, dtype=np.int64)
+    _write_reference_column(reference, "nullable_labels", labels)
+    missing = np.zeros(reference.selected_cell_count, dtype=bool)
+    missing[0] = True
+    _attach_reference_missing_mask(reference, "nullable_labels", missing)
+    result = _write_projection(
+        query,
+        reference,
+        indices=np.array([[0, 1], [0, 1]]),
+        distances=np.array([[1.0, 9.0], [1.0, 9.0]]),
+        uninformative=np.array([False, False]),
+    )
+
+    transferred = query.get_target_classes(
+        result,
+        reference_class_group="nullable_labels",
+        reference=reference,
+        threshold_fraction=0.5,
+    )
+    evidence = query.get_target_label_evidence(
+        result,
+        reference_class_group="nullable_labels",
+        reference=reference,
+        threshold_fraction=0.5,
+        calibration_nonconformity=np.array([0.1, 0.2]),
+    )
+
+    assert transferred.tolist() == ["NA", "NA"]
+    assert evidence["label"].tolist() == ["NA", "NA"]
+    assert evidence["voteFraction"].max() < 0.5
+    assert all(0 not in values for values in evidence["predictionSet"])
+
+
+def test_label_transfer_excludes_nan_reference_labels(
+    mapping_consumer_context,
+):
+    _, reference, query = mapping_consumer_context
+    labels = np.ones(reference.selected_cell_count, dtype=np.float64)
+    labels[:2] = np.nan
+    _write_reference_column(reference, "sparse_labels", labels)
+    result = _write_projection(
+        query,
+        reference,
+        indices=np.array([[0, 1]]),
+        distances=np.array([[1.0, 2.0]]),
+        uninformative=np.array([False]),
+    )
+
+    evidence = query.get_target_label_evidence(
+        result,
+        reference_class_group="sparse_labels",
+        reference=reference,
+        calibration_nonconformity=np.array([0.1, 0.2]),
+    )
+
+    assert evidence.loc[0, "label"] == "NA"
+    assert evidence.loc[0, "voteFraction"] == 0.0
+    assert evidence.loc[0, "predictionSet"] == ()
+
+
+def test_label_transfer_excludes_blank_byte_reference_labels(
+    mapping_consumer_context,
+):
+    _, reference, query = mapping_consumer_context
+    labels = np.full(reference.selected_cell_count, b"known", dtype="S8")
+    labels[:2] = [b"", b"  "]
+    _write_reference_column(reference, "byte_labels", labels)
+    result = _write_projection(
+        query,
+        reference,
+        indices=np.array([[0, 1]]),
+        distances=np.array([[1.0, 2.0]]),
+        uninformative=np.array([False]),
+    )
+
+    evidence = query.get_target_label_evidence(
+        result,
+        reference_class_group="byte_labels",
+        reference=reference,
+    )
+
+    assert evidence.loc[0, "label"] == "NA"
+    assert evidence.loc[0, "voteFraction"] == 0.0
+
+
+def test_vote_entropy_is_conditional_on_available_labels() -> None:
+    _, top_vote, entropy, _, unknown, _ = DataStore._label_vote_decision(
+        np.array(["known", "missing"], dtype=object),
+        np.array([0, 1]),
+        np.array([0.01, 0.99]),
+        0.5,
+        "NA",
+        reference_label_valid=np.array([True, False]),
+    )
+
+    assert top_vote == pytest.approx(0.01)
+    assert entropy == pytest.approx(0.0)
+    assert unknown
+
+
 def test_label_transfer_calibration_is_deterministic_and_validated() -> None:
     calibrated = DataStore.calibrate_label_transfer_threshold(
         vote_fractions=np.array([0.2, 0.6, 0.8, 0.9]),
@@ -550,6 +701,29 @@ def test_label_transfer_calibration_is_deterministic_and_validated() -> None:
             np.array([0.2, 0.8]),
             np.array([False, False]),
         )
+    for invalid in (np.nan, np.inf, -0.1, 1.1):
+        with pytest.raises(ValueError, match=r"finite values in \[0, 1\]"):
+            DataStore.calibrate_label_transfer_threshold(
+                np.array([0.5, invalid]),
+                np.array([True, False]),
+            )
+    with pytest.raises(ValueError, match="real numeric"):
+        DataStore.calibrate_label_transfer_threshold(
+            np.array([True, False]),
+            np.array([True, False]),
+        )
+    with pytest.raises(ValueError, match="boolean vector"):
+        DataStore.calibrate_label_transfer_threshold(
+            np.array([0.5, 0.6]),
+            np.array([1, 0]),
+        )
+    for invalid_coverage in (True, np.nan):
+        with pytest.raises(ValueError, match="target_coverage"):
+            DataStore.calibrate_label_transfer_threshold(
+                np.array([0.5]),
+                np.array([True]),
+                target_coverage=invalid_coverage,
+            )
 
 
 def test_confidence_helpers_reject_invalid_shapes_calibration_and_alpha() -> None:
@@ -576,6 +750,24 @@ def test_confidence_helpers_reject_invalid_shapes_calibration_and_alpha() -> Non
             np.array([[np.nan, 0.2]]),
             np.array([0.1]),
         )
+    with pytest.raises(ValueError, match="scores must be in"):
+        conformal_prediction_sets(
+            np.array([[1.1, 0.2]]),
+            np.array([0.1]),
+        )
+    with pytest.raises(ValueError, match="nonconformity must be in"):
+        conformal_prediction_sets(
+            np.array([[0.8, 0.2]]),
+            np.array([-0.1]),
+        )
+
+    calibration = np.r_[np.zeros(7), np.ones(14)]
+    exact_boundary = conformal_prediction_sets(
+        np.array([[0.0]]),
+        calibration,
+        alpha=15 / 22,
+    )
+    assert not exact_boundary[0, 0]
 
 
 def test_mapping_consumers_stream_projection_arrays(
@@ -622,7 +814,7 @@ def test_mapping_consumers_stream_projection_arrays(
             assert 0 < key.stop - key.start <= 2
 
 
-def test_label_scores_are_allocated_only_for_conformal_evidence(
+def test_conformal_label_scores_are_allocated_one_row_at_a_time(
     mapping_consumer_context,
     monkeypatch,
 ):
@@ -647,13 +839,14 @@ def test_label_scores_are_allocated_only_for_conformal_evidence(
 
     monkeypatch.setattr(mapping_operations, "np", _NumpyProxy())
     score_shape = (2, len(pd.unique(labels)))
+    row_score_shape = len(pd.unique(labels))
 
     query.get_target_label_evidence(
         result,
         reference_class_group="reference_labels",
         reference=reference,
     )
-    assert score_shape not in allocations
+    assert row_score_shape not in allocations
 
     allocations.clear()
     query.get_target_label_evidence(
@@ -662,7 +855,8 @@ def test_label_scores_are_allocated_only_for_conformal_evidence(
         reference=reference,
         calibration_nonconformity=np.array([0.1, 0.2]),
     )
-    assert score_shape in allocations
+    assert score_shape not in allocations
+    assert allocations.count(row_score_shape) == 2
 
 
 def test_reference_layout_requires_an_explicit_complete_embedding(

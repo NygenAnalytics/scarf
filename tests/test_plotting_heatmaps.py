@@ -641,6 +641,39 @@ def test_pseudotime_heatmap_is_independent_of_the_live_cell_selection(
         live[:] = original
 
 
+def test_pseudotime_heatmap_uses_frozen_feature_names(
+    pseudotime_aggregation,
+    datastore,
+):
+    from scarf.plotting.heatmaps import _prepare_pseudotime_heatmap
+    from scarf.storage.artifacts import artifact_path, fingerprint_stored_strings
+
+    loaded = datastore.load_pseudotime_aggregation(pseudotime_aggregation)
+    group = datastore.zw[artifact_path(pseudotime_aggregation)]
+    inputs = datastore.inspect_artifact(pseudotime_aggregation).inputs or {}
+    assert inputs["ordered_feature_ids_fingerprint"] == fingerprint_stored_strings(
+        group["feature_ids"]
+    )
+    assert inputs["ordered_feature_names_fingerprint"] == (
+        fingerprint_stored_strings(group["feature_names"])
+    )
+    expected = np.asarray(loaded.feature_names).copy()
+    live_names = datastore.RNA.feats._get_array("names")
+    original = np.asarray(live_names[:]).copy()
+    try:
+        renamed = original.astype(str)
+        renamed[:] = [f"renamed_{index}" for index in range(len(renamed))]
+        live_names[:] = renamed
+        prepared = _prepare_pseudotime_heatmap(
+            datastore,
+            aggregation=pseudotime_aggregation,
+        )
+        order = np.argsort(np.asarray(loaded.feature_clusters))
+        np.testing.assert_array_equal(prepared["feature_labels"], expected[order])
+    finally:
+        live_names[:] = original
+
+
 def test_pseudotime_heatmap_validates_artifact_payload(
     pseudotime_aggregation,
     datastore,
@@ -661,7 +694,7 @@ def test_pseudotime_heatmap_validates_artifact_payload(
     original_value = data[valid_row, 0]
     data[valid_row, 0] = np.nan
     try:
-        with pytest.raises(ValueError, match="contains non-finite values"):
+        with pytest.raises(ValueError, match="payload is invalid"):
             prepare()
     finally:
         data[valid_row, 0] = original_value

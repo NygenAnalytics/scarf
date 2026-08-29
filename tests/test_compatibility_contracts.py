@@ -276,6 +276,19 @@ def test_result_records_reject_attribute_assignment():
         with pytest.raises(FrozenInstanceError):
             setattr(record, first_field, None)
 
+    aggregation = records[-1]
+    assert isinstance(aggregation, trajectory.PseudotimeAggregationResult)
+    assert not hasattr(aggregation, "__dict__")
+    aggregation._attach_feature_identity(
+        np.array(["g0", "g1"]),
+        np.array(["id0", "id1"]),
+    )
+    with pytest.raises(RuntimeError, match="already attached"):
+        aggregation._attach_feature_identity(
+            np.array(["g0", "g1"]),
+            np.array(["id0", "id1"]),
+        )
+
 
 def test_pseudotime_result_shape_validation_is_stable():
     feature_selection = scarf.ArtifactRef(

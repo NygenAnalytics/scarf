@@ -47,8 +47,8 @@ sink = np.isin(annotations, ["Alpha", "Beta", "Delta"])
 if not source.any() or not sink.any():
     raise ValueError("Source and sink annotations must both be present")
 source_sink_vector = np.zeros(len(annotations), dtype=float)
-source_sink_vector[source] = 1.0 / source.sum()
-source_sink_vector[sink] = -1.0 / sink.sum()
+source_sink_vector[source] = -1.0 / source.sum()
+source_sink_vector[sink] = 1.0 / sink.sum()
 
 pseudotime_ref = ds.run_pseudotime_scoring(graph, ss_vec=source_sink_vector)
 pseudotime = ds.load_pseudotime_scoring(pseudotime_ref)

@@ -9,6 +9,7 @@ from zarr.storage import MemoryStore
 
 from scarf.mapping.artifact import (
     load_artifact_mapping_reference,
+    validate_mapping_reference_sources,
     write_artifact_mapping_reference,
 )
 from scarf.mapping.models import (
@@ -383,6 +384,7 @@ def test_write_artifact_mapping_reference_persists_required_pca_arrays() -> None
         "reference_distance_values",
     }
     assert group.attrs["reference_metadata"]["method"] == "pca"
+    assert isinstance(group.attrs["payload_fingerprint"], str)
 
 
 def test_write_artifact_mapping_reference_persists_symphony_state() -> None:
@@ -432,6 +434,7 @@ def test_write_artifact_mapping_reference_persists_symphony_state() -> None:
         "cluster_mass",
         "sigma",
     }
+    assert isinstance(group.attrs["payload_fingerprint"], str)
 
 
 def test_write_artifact_mapping_reference_rejects_high_rank_arrays() -> None:
@@ -464,3 +467,52 @@ def test_write_artifact_mapping_reference_rejects_high_rank_arrays() -> None:
         )
 
     assert not group.attrs["complete"]
+
+
+def test_mapping_reference_source_validation_is_strict_and_semantic() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    means = root.create_array(
+        "means",
+        data=np.zeros(3, dtype=np.float64),
+        chunks=(2,),
+    )
+    scales = root.create_array(
+        "scales",
+        data=np.ones(3, dtype=np.float64),
+        chunks=(2,),
+    )
+    loadings = root.create_array(
+        "loadings",
+        data=np.ones((3, 2), dtype=np.float64),
+        chunks=(2, 2),
+    )
+
+    assert validate_mapping_reference_sources(
+        feature_means=means,
+        feature_scales=scales,
+        loadings=loadings,
+        symphony_sources=None,
+    ) == (3, 2)
+
+    scales[1] = 0.0
+    with pytest.raises(ValueError, match="PCA model arrays are invalid"):
+        validate_mapping_reference_sources(
+            feature_means=means,
+            feature_scales=scales,
+            loadings=loadings,
+            symphony_sources=None,
+        )
+
+    float32_loadings = root.create_array(
+        "float32_loadings",
+        data=np.ones((3, 2), dtype=np.float32),
+        chunks=(2, 2),
+    )
+    scales[1] = 1.0
+    with pytest.raises(ValueError, match="PCA model arrays are invalid"):
+        validate_mapping_reference_sources(
+            feature_means=means,
+            feature_scales=scales,
+            loadings=float32_loadings,
+            symphony_sources=None,
+        )

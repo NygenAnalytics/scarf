@@ -102,3 +102,16 @@ def test_legacy_installation_url_and_package_links_are_preserved() -> None:
         "https://scarf.readthedocs.io/en/latest/installation.html"
         in (_REPOSITORY_ROOT / "README.md").read_text()
     )
+
+
+def test_trajectory_tutorials_use_source_sink_sign_convention() -> None:
+    tutorials = (
+        "pseudotime.md",
+        "expression_dynamics.md",
+        "fate_mapping.md",
+    )
+
+    for tutorial in tutorials:
+        contents = (_DOCS_SOURCE / "tutorials" / tutorial).read_text()
+        assert "source_sink_vector[source] = -1.0 / source.sum()" in contents
+        assert "source_sink_vector[sink] = 1.0 / sink.sum()" in contents

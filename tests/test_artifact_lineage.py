@@ -477,7 +477,11 @@ def test_lineage_traverses_external_datastore_scoped_dependencies() -> None:
     assert "external reference-da / datastore" in lineage.to_markdown()
 
 
-def test_datastore_lineage_resolves_explicit_mapping_references() -> None:
+def test_datastore_lineage_resolves_explicit_mapping_references(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "scarf.mapping.artifact.validate_mapping_reference_binding",
+        lambda reference: reference,
+    )
     query_root = zarr.open_group(store=MemoryStore(), mode="w")
     first_root = zarr.open_group(store=MemoryStore(), mode="w")
     second_root = zarr.open_group(store=MemoryStore(), mode="w")
@@ -525,9 +529,13 @@ def test_datastore_lineage_resolves_explicit_mapping_references() -> None:
     assert resolved.graph.nodes[second_external]["status"].complete
 
 
-def test_datastore_lineage_validates_reference_fingerprints_and_root_conflicts() -> (
-    None
-):
+def test_datastore_lineage_validates_reference_fingerprints_and_root_conflicts(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "scarf.mapping.artifact.validate_mapping_reference_binding",
+        lambda reference: reference,
+    )
     query_root = zarr.open_group(store=MemoryStore(), mode="w")
     target = _ref("projection", "3")
     datastore = BaseDataStore.__new__(BaseDataStore)

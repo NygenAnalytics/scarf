@@ -52,6 +52,14 @@ def _is_missing_label(value: object) -> bool:
         return False
 
 
+def _is_blank_label(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip() == ""
+    if isinstance(value, bytes | np.bytes_):
+        return value.strip() == b""
+    return False
+
+
 def valid_category_mask(
     values: Any,
     *,
@@ -67,8 +75,7 @@ def valid_category_mask(
         raise ValueError("category values must be one-dimensional")
     valid = np.fromiter(
         (
-            not _is_missing_label(value)
-            and (not isinstance(value, str) or value.strip() != "")
+            not _is_missing_label(value) and not _is_blank_label(value)
             for value in array
         ),
         dtype=bool,

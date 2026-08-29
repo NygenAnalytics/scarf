@@ -1,6 +1,6 @@
 import colorsys
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import numpy as np
@@ -9,13 +9,19 @@ import zarr
 from ..storage.arrays import create_metadata_column, create_zarr_dataset
 from ..storage.artifact_writer import (
     ArrayRequirement,
+    AttributeRequirement,
     PlannedArtifact,
     finish_artifact,
     plan_artifact,
     reused_artifact_group,
     start_artifact,
 )
-from ..storage.artifacts import ArtifactRef, ArtifactScope, artifact_path
+from ..storage.artifacts import (
+    ArtifactRef,
+    ArtifactScope,
+    fingerprint_stored_arrays,
+)
+from ..storage.selections import validate_stored_selection_integrity
 from ..storage.types import as_zarr_array, as_zarr_group
 
 _CATEGORY_COLORS = (
@@ -145,18 +151,20 @@ def plan_cell_data_artifact(
     arrays: Mapping[str, tuple[tuple[int, ...], str | None]],
     assay: str | None = None,
     invalidate_cache: bool = False,
+    required_attributes: tuple[str | AttributeRequirement, ...] = (),
+    reuse_validator: Callable[[ArtifactRef, zarr.Group], bool] | None = None,
 ) -> PlannedArtifact:
     if cell_selection.kind != "cell_selection":
         raise ValueError("cell_selection must reference a cell-selection artifact")
-    selection_group = as_zarr_group(
-        root[artifact_path(cell_selection)],
-        name=artifact_path(cell_selection),
+    selection = validate_stored_selection_integrity(
+        root,
+        cell_selection,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
     )
-    mask = np.asarray(
-        as_zarr_array(selection_group["values"], name="values")[:],
-        dtype=bool,
-    )
-    selected_count = int(mask.sum())
+    selected_count = int(selection.selected_count)
     if any(shape[0] != selected_count for shape, _kind in arrays.values()):
         raise ValueError("Artifact arrays must align with the selected cell count")
     artifact_inputs = {**inputs, "cell_selection": cell_selection}
@@ -175,6 +183,8 @@ def plan_cell_data_artifact(
         execution_options=execution_options,
         invalidate_cache=invalidate_cache,
         required_arrays=requirements,
+        required_attributes=required_attributes,
+        reuse_validator=reuse_validator,
     )
 
 
@@ -182,6 +192,8 @@ def write_cell_data_artifact(
     root: zarr.Group,
     planned: PlannedArtifact,
     arrays: Mapping[str, np.ndarray],
+    *,
+    fingerprint_payload: bool = False,
 ) -> zarr.Group:
     if planned.reused:
         return reused_artifact_group(root, planned)
@@ -198,6 +210,7 @@ def write_cell_data_artifact(
                 name,
                 data=values.astype(str),
                 overwrite=True,
+                chunkSize=min(max(int(values.shape[0]), 1), 100_000),
             )
         else:
             chunks = (
@@ -212,6 +225,11 @@ def write_cell_data_artifact(
                 values.shape,
             )
             output[...] = values
+    if fingerprint_payload:
+        group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
+            group,
+            tuple(arrays),
+        )
     finish_artifact(group, planned)
     return group
 

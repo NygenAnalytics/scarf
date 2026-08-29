@@ -1,3 +1,4 @@
+import operator
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
@@ -11,7 +12,7 @@ from ...graph.feature_projection import (
     resolve_graph_source_assay,
 )
 from ...matrix import ChunkedArray
-from ...metadata.rows import read_metadata_rows_chunkwise
+from ...metadata.rows import read_array_rows_chunkwise, read_metadata_rows_chunkwise
 from ...metadata.arguments import (
     FateMappingArguments,
     PseudotimeAggregationArguments,
@@ -29,19 +30,54 @@ from ...storage.artifact_writer import (
 )
 from ...storage.artifacts import (
     ArtifactRef,
-    artifact_path,
     callable_identity,
+    fingerprint_array,
+    fingerprint_stored_arrays,
+    fingerprint_stored_strings,
+    fingerprint_strings,
     inspect_artifact,
 )
+from ...storage.copy import copy_metadata_array
+from ...storage.feature_selection import read_feature_selection_indices
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...storage.selections import (
     read_stored_selection_indices,
+    resolve_metadata_snapshot,
     validate_stored_selection_integrity,
 )
 from ...storage.arrays import create_zarr_dataset
 from ...trajectory.feature_dynamics import (
     scatter_feature_clusters as _scatter_feature_clusters_impl,
     validate_pseudotime_regressor,
+)
+from ...trajectory.parameters import resolve_aggregation_ann_params
+from ...trajectory.artifacts import (
+    AGGREGATION_INPUTS as _AGGREGATION_INPUTS,
+    AGGREGATION_PARAMETERS as _AGGREGATION_PARAMETERS,
+    AGGREGATION_PAYLOAD as _AGGREGATION_PAYLOAD,
+    FATE_INPUTS as _FATE_INPUTS,
+    FATE_PARAMETERS as _FATE_PARAMETERS,
+    MARKER_INPUTS as _MARKER_INPUTS,
+    MARKER_PARAMETERS as _MARKER_PARAMETERS,
+    MARKER_PAYLOAD as _MARKER_PAYLOAD,
+    PSEUDOTIME_INPUTS as _PSEUDOTIME_INPUTS,
+    PSEUDOTIME_PARAMETERS as _PSEUDOTIME_PARAMETERS,
+    aggregation_payload_is_valid as _aggregation_payload_is_valid,
+    artifact_ref_input as _artifact_ref_input,
+    diffusion_payload_is_valid as _diffusion_payload_is_valid,
+    fate_payload_is_valid as _fate_payload_is_valid,
+    labels_with_missing_mask as _labels_with_missing_mask,
+    load_cell_artifact_values as _load_cell_artifact_values,
+    marker_payload_is_valid as _marker_payload_is_valid,
+    pseudotime_payload_is_valid as _pseudotime_payload_is_valid,
+    require_exact_record_keys as _require_exact_record_keys,
+    selection_size as _selection_size,
+    true_array_indices as _true_array_indices,
+    validate_aggregation_parameters as _validate_aggregation_parameters,
+    validate_fate_parameters as _validate_fate_parameters,
+    validate_marker_parameters as _validate_marker_parameters,
+    validate_pseudotime_parameters as _validate_pseudotime_parameters,
+    validate_resolved_ann_parameters as _validate_resolved_ann_parameters,
 )
 from ...trajectory.fate import (
     compute_fate_probabilities as _compute_fate_probabilities_impl,
@@ -60,6 +96,7 @@ from ...trajectory.results import (
     PseudotimeMarkerResult,
     PseudotimeScoreResult,
 )
+from ...utils.arrays import array_digest
 from ...utils.compute import controlled_compute
 from ...utils.logging import logger
 
@@ -73,17 +110,88 @@ else:
     _TrajectoryOperationsBase = object
 
 
-_CELL_VALUE_NAMES = {
-    "cell_cycle": "phase",
-    "cluster_cut": "labels",
-    "pseudotime": "pseudotime",
-}
+def _assay_dataset_fingerprint(store: Any, assay: Assay) -> str:
+    stored = assay.attrs.get("dataset_fingerprint")
+    if isinstance(stored, str) and stored:
+        return stored
+    calculated = store._calculate_dataset_fingerprint(assay.name)
+    if not isinstance(calculated, str) or not calculated:
+        raise ValueError("Assay dataset fingerprint is unavailable")
+    return calculated
 
 
-def _artifact_ref_input(raw: Any, label: str) -> ArtifactRef:
-    if not isinstance(raw, dict):
-        raise ValueError(f"{label} artifact reference is malformed")
-    return ArtifactRef.from_dict(raw)
+def _validate_assay_execution_identity(
+    store: Any,
+    assay: Assay,
+    *,
+    dataset_fingerprint: str,
+    normalization_method: dict[str, str],
+    size_factor: float | None,
+    context: str,
+) -> None:
+    try:
+        current_method = callable_identity(assay.normMethod)
+    except ValueError as exc:
+        raise ValueError(
+            f"{context} normalization settings changed during computation"
+        ) from exc
+    raw_size_factor = getattr(assay, "sf", None)
+    if raw_size_factor is None:
+        current_size_factor = None
+    elif (
+        isinstance(raw_size_factor, bool | np.bool_)
+        or not isinstance(
+            raw_size_factor,
+            int | float | np.integer | np.floating,
+        )
+        or not np.isfinite(raw_size_factor)
+        or float(raw_size_factor) <= 0.0
+    ):
+        raise ValueError(f"{context} normalization settings changed during computation")
+    else:
+        current_size_factor = float(raw_size_factor)
+    if current_method != normalization_method or current_size_factor != size_factor:
+        raise ValueError(f"{context} normalization settings changed during computation")
+    if _assay_dataset_fingerprint(store, assay) != dataset_fingerprint:
+        raise ValueError(f"{context} dataset identity changed during computation")
+
+
+def _feature_identity_arrays(assay: Assay) -> tuple[Any, Any]:
+    feature_data = as_zarr_group(
+        assay.z["featureData"],
+        name=f"{assay.name}/featureData",
+    )
+    names = as_zarr_array(
+        feature_data["names"],
+        name=f"{assay.name}/featureData/names",
+    )
+    ids = as_zarr_array(
+        feature_data["ids"],
+        name=f"{assay.name}/featureData/ids",
+    )
+    if names.ndim != 1 or ids.ndim != 1 or names.shape != ids.shape:
+        raise ValueError("Feature identities do not align with the assay")
+    return names, ids
+
+
+def _optional_positive_batch_size(value: Any, name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool | np.bool_):
+        raise TypeError(f"{name} must be a positive integer or None")
+    try:
+        resolved = operator.index(value)
+    except TypeError:
+        raise TypeError(f"{name} must be a positive integer or None") from None
+    if resolved < 1:
+        raise ValueError(f"{name} must be greater than zero")
+    return int(resolved)
+
+
+def _validate_invalidate_cache(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError("invalidate_cache must be a boolean")
+    return value
 
 
 def _diffusion_power(value: Any) -> int:
@@ -95,41 +203,6 @@ def _diffusion_power(value: Any) -> int:
     return power
 
 
-def _load_cell_artifact_values(
-    root: Any,
-    ref: ArtifactRef,
-    *,
-    value_name: str | None = None,
-) -> tuple[np.ndarray, ArtifactRef]:
-    if not isinstance(ref, ArtifactRef):
-        raise TypeError("cell data input must be an ArtifactRef")
-    status = inspect_artifact(root, ref)
-    if not status.complete:
-        raise ValueError("Cell-data artifact is unavailable or incomplete")
-    raw_selection = (status.inputs or {}).get("cell_selection")
-    if not isinstance(raw_selection, dict):
-        raise ValueError("Cell-data artifact has no cell-selection input")
-    selection = ArtifactRef.from_dict(raw_selection)
-    validate_stored_selection_integrity(
-        root,
-        selection,
-        kind="cell_selection",
-        scope="datastore",
-        assay=None,
-        table_path="cellData",
-    )
-    canonical_name = value_name or _CELL_VALUE_NAMES.get(ref.kind, "values")
-    group = as_zarr_group(root[status.path], name=status.path)
-    if canonical_name not in group:
-        raise ValueError(
-            f"{ref.kind} artifact has no {canonical_name!r} cell-data array"
-        )
-    values = np.asarray(as_zarr_array(group[canonical_name], name=canonical_name)[:])
-    if values.ndim < 1:
-        raise ValueError("Cell-data artifact values must have a row axis")
-    return values, selection
-
-
 def _resolve_feature_indices(
     store: Any,
     assay: Assay,
@@ -138,18 +211,14 @@ def _resolve_feature_indices(
     if not isinstance(features, ArtifactRef):
         raise TypeError("features must be an ArtifactRef")
     feature_selection = store.resolve_features(assay.name, features)
-    selection_group = as_zarr_group(
-        store.zw[artifact_path(feature_selection)],
-        name=artifact_path(feature_selection),
+    feature_indices = read_feature_selection_indices(
+        store.zw,
+        assay.name,
+        feature_selection,
     )
-    values = np.asarray(
-        as_zarr_array(selection_group["values"], name="values")[:],
-        dtype=bool,
-    )
-    feature_indices = np.flatnonzero(values).astype(np.int64, copy=False)
     if len(feature_indices) == 0:
         raise ValueError("Feature selection contains no active features")
-    return feature_selection, feature_indices
+    return feature_selection, feature_indices.astype(np.int64, copy=False)
 
 
 class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
@@ -171,8 +240,7 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         if not isinstance(graph, ArtifactRef):
             raise TypeError("graph must be an ArtifactRef")
         power = _diffusion_power(t)
-        if not isinstance(invalidate_cache, bool):
-            raise TypeError("invalidate_cache must be a boolean")
+        invalidate_cache = _validate_invalidate_cache(invalidate_cache)
         graph_ref = graph
         graph_status = inspect_artifact(self.zw, graph_ref)
         if not graph_status.complete:
@@ -217,6 +285,14 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
                         not isinstance(value, bool) and int(value) == n_cells
                     ),
                 ),
+                AttributeRequirement(
+                    "payload_fingerprint",
+                    expected_types=(str,),
+                ),
+            ),
+            reuse_validator=lambda _ref, group: _diffusion_payload_is_valid(
+                group,
+                n_cells=n_cells,
             ),
         )
         if planned.reused:
@@ -248,6 +324,10 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             array = create_zarr_dataset(store, name, (1000000,), dtype, shape)
             array[:] = np.asarray(getattr(diff_op, name), dtype=dtype)
         store.attrs["n_cells"] = n_cells
+        store.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
+            store,
+            ("row", "col", "data"),
+        )
         finish_artifact(store, planned)
         return planned.ref
 
@@ -303,6 +383,8 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             )
 
         group = as_zarr_group(self.zw[status.path], name=status.path)
+        if not _diffusion_payload_is_valid(group, n_cells=graph_n_cells):
+            raise ValueError("Diffusion-operator sparse payload is malformed")
         raw_n_cells = group.attrs.get("n_cells")
         if (
             isinstance(raw_n_cells, bool)
@@ -463,6 +545,30 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
 
         if not isinstance(graph, ArtifactRef):
             raise TypeError("graph must be an ArtifactRef")
+        invalidate_cache = _validate_invalidate_cache(invalidate_cache)
+        if sources is not None and not isinstance(sources, list):
+            raise TypeError("sources must be a list")
+        if sinks is not None and not isinstance(sinks, list):
+            raise TypeError("sinks must be a list")
+        validated_parameters = _validate_pseudotime_parameters(
+            {
+                "n_singular_vals": n_singular_vals,
+                "sources": [] if sources is None else sources,
+                "sinks": [] if sinks is None else sinks,
+                "min_max_norm_ptime": min_max_norm_ptime,
+                "random_seed": random_seed,
+                "component_policy": component_policy,
+            }
+        )
+        n_singular_vals = validated_parameters["n_singular_vals"]
+        source_labels = list(validated_parameters["sources"])
+        sink_labels = list(validated_parameters["sinks"])
+        min_max_norm_ptime = validated_parameters["min_max_norm_ptime"]
+        random_seed = validated_parameters["random_seed"]
+        component_policy = cast(
+            Literal["largest", "error"],
+            validated_parameters["component_policy"],
+        )
         graph_ref = graph
         stored_selection = graph_cell_selection(self.zw, graph_ref)
         validate_stored_selection_integrity(
@@ -504,10 +610,6 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             )
 
         retained_n_cells = retained_graph.shape[0]
-        if not isinstance(n_singular_vals, int) or isinstance(n_singular_vals, bool):
-            raise TypeError("n_singular_vals must be an integer")
-        if n_singular_vals < 2:
-            raise ValueError("n_singular_vals must be at least 2")
         if retained_n_cells < 4:
             raise ValueError(
                 "The retained graph must contain at least 4 cells for pseudotime scoring"
@@ -534,29 +636,43 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             raise ValueError("Provide source/sink labels or a custom zero-sum ss_vec")
 
         if ss_vec is not None:
-            full_source_sink = _validate_source_sink_vector_impl(
-                ss_vec,
-                graph_matrix.shape[0],
-                "ss_vec",
+            owned_source_sink = np.array(ss_vec, copy=True)
+            full_source_sink = np.array(
+                _validate_source_sink_vector_impl(
+                    owned_source_sink,
+                    graph_matrix.shape[0],
+                    "ss_vec",
+                ),
+                dtype=np.float64,
+                copy=True,
             )
-            source_sink_input: ArtifactRef | np.ndarray = full_source_sink
+            full_source_sink.setflags(write=False)
+            selected_row_ids = read_metadata_rows_chunkwise(
+                self.cells,
+                "ids",
+                selected_cell_indices,
+            )
+            source_sink_input: ArtifactRef | np.ndarray = resolve_metadata_snapshot(
+                self.zw,
+                values=full_source_sink,
+                row_ids=selected_row_ids,
+                operation="snapshot_pseudotime_source_sink",
+                parameters={},
+                inputs={"cell_selection": stored_selection},
+                source_columns=["ss_vec"],
+                invalidate_cache=invalidate_cache,
+            )
             retained_source_sink = _validate_source_sink_vector_impl(
                 full_source_sink[retained_mask],
                 retained_n_cells,
                 "ss_vec restricted to the retained component",
             )
         else:
-            if sources is not None and not isinstance(sources, list):
-                raise TypeError("sources must be a list")
-            if sinks is not None and not isinstance(sinks, list):
-                raise TypeError("sinks must be a list")
-            source_labels = [] if sources is None else sources
-            sink_labels = [] if sinks is None else sinks
             if not source_labels and not sink_labels:
                 raise ValueError("At least one source or sink label must be provided")
 
             assert source_sink is not None
-            raw_labels, label_selection = _load_cell_artifact_values(
+            raw_labels, label_selection, label_missing = _load_cell_artifact_values(
                 self.zw,
                 source_sink,
             )
@@ -564,7 +680,13 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
                 raise ValueError("Source/sink labels do not match the graph selection")
             if raw_labels.ndim != 1 or raw_labels.shape[0] != graph_matrix.shape[0]:
                 raise ValueError("Source/sink labels do not align with graph rows")
-            selected_labels = pd.Series(raw_labels)
+            selected_labels = pd.Series(
+                _labels_with_missing_mask(
+                    raw_labels,
+                    label_missing,
+                    "Source/sink labels",
+                )
+            )
             _validate_source_sink_labels_impl(
                 selected_labels,
                 source_labels,
@@ -596,8 +718,8 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             source_sink=source_sink_input,
             cell_selection=stored_selection,
             n_singular_vals=n_singular_vals,
-            sources=tuple([] if sources is None else sources),
-            sinks=tuple([] if sinks is None else sinks),
+            sources=tuple(source_labels),
+            sinks=tuple(sink_labels),
             min_max_norm_ptime=min_max_norm_ptime,
             random_seed=random_seed,
             component_policy=component_policy,
@@ -620,6 +742,18 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
                 "valid": ((graph_matrix.shape[0],), "b"),
             },
             invalidate_cache=invalidate_cache,
+            required_attributes=(
+                AttributeRequirement(
+                    "payload_fingerprint",
+                    expected_types=(str,),
+                ),
+            ),
+            reuse_validator=lambda _ref, group: _pseudotime_payload_is_valid(
+                group,
+                n_cells=graph_matrix.shape[0],
+                min_max_normalized=min_max_norm_ptime,
+                expected_valid=retained_mask,
+            ),
         )
         if planned.reused:
             return planned.ref
@@ -653,6 +787,7 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
                 "pseudotime": ptime,
                 "valid": retained_mask,
             },
+            fingerprint_payload=True,
         )
         if not retained_mask.all():
             logger.warning("Unscored cells contain NaN pseudotime in the artifact")
@@ -672,26 +807,159 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         if ref.kind != "pseudotime":
             raise ValueError("ref must be a pseudotime artifact")
         status = inspect_artifact(self.zw, ref)
-        if not status.complete or status.operation != "run_pseudotime_scoring":
+        if (
+            not status.exists
+            or not status.complete
+            or status.operation != "run_pseudotime_scoring"
+        ):
             raise ValueError("Pseudotime artifact is unavailable or invalid")
-        raw_graph = (status.inputs or {}).get("connectivity_map")
-        raw_selection = (status.inputs or {}).get("cell_selection")
-        if not isinstance(raw_graph, dict) or not isinstance(raw_selection, dict):
-            raise ValueError("Pseudotime artifact lineage is malformed")
-        graph = ArtifactRef.from_dict(raw_graph)
-        selection = ArtifactRef.from_dict(raw_selection)
-        values, loaded_selection = _load_cell_artifact_values(
+        inputs = status.inputs or {}
+        parameters = status.parameters or {}
+        _require_exact_record_keys(inputs, _PSEUDOTIME_INPUTS, "Pseudotime inputs")
+        _require_exact_record_keys(
+            parameters,
+            _PSEUDOTIME_PARAMETERS,
+            "Pseudotime parameters",
+        )
+        try:
+            validated_parameters = _validate_pseudotime_parameters(parameters)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Pseudotime parameters are malformed") from exc
+        graph = _artifact_ref_input(inputs.get("connectivity_map"), "Pseudotime graph")
+        selection = _artifact_ref_input(
+            inputs.get("cell_selection"),
+            "Pseudotime cell selection",
+        )
+        source_sink = _artifact_ref_input(
+            inputs.get("source_sink"),
+            "Pseudotime source/sink input",
+        )
+        graph_selection = graph_cell_selection(self.zw, graph)
+        if graph_selection != selection:
+            raise ValueError("Pseudotime graph and cell selection do not match")
+        if ref.scope != graph.scope or ref.assay != graph.assay:
+            raise ValueError("Pseudotime artifact does not share its graph scope")
+        n_cells = _selection_size(self.zw, selection)
+        min_max_normalized = validated_parameters["min_max_norm_ptime"]
+        component_policy = validated_parameters["component_policy"]
+        selected_indices = read_stored_selection_indices(
+            self.zw,
+            selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
+        )
+        graph_matrix = self.load_graph(
+            graph,
+            symmetric=True,
+            upper_only=False,
+        )
+        if graph_matrix.shape != (n_cells, n_cells):
+            raise ValueError("Pseudotime graph does not match its stored selection")
+        expected_valid, _ = _select_pseudotime_component_impl(
+            graph_matrix,
+            selected_indices,
+            cast(Literal["largest", "error"], component_policy),
+        )
+        group = as_zarr_group(self.zw[status.path], name=status.path)
+        if not _pseudotime_payload_is_valid(
+            group,
+            n_cells=n_cells,
+            min_max_normalized=min_max_normalized,
+            expected_valid=expected_valid,
+        ):
+            raise ValueError("Pseudotime artifact payload is invalid")
+        values, loaded_selection, values_missing = _load_cell_artifact_values(
             self.zw,
             ref,
             value_name="pseudotime",
         )
-        valid, valid_selection = _load_cell_artifact_values(
+        valid, valid_selection, valid_missing = _load_cell_artifact_values(
             self.zw,
             ref,
             value_name="valid",
         )
-        if loaded_selection != selection or valid_selection != selection:
+        if (
+            loaded_selection != selection
+            or valid_selection != selection
+            or values_missing is not None
+            or valid_missing is not None
+        ):
             raise ValueError("Pseudotime arrays do not match their stored selection")
+        source_values, source_selection, source_missing = _load_cell_artifact_values(
+            self.zw,
+            source_sink,
+        )
+        if source_selection != selection:
+            raise ValueError("Pseudotime source/sink input uses a different selection")
+        raw_sources = list(validated_parameters["sources"])
+        raw_sinks = list(validated_parameters["sinks"])
+        if not raw_sources and not raw_sinks:
+            source_status = inspect_artifact(self.zw, source_sink)
+            source_inputs = source_status.inputs or {}
+            source_parameters = source_status.parameters or {}
+            if (
+                source_sink.kind != "metadata_snapshot"
+                or source_sink.scope != "datastore"
+                or source_sink.assay is not None
+                or source_status.operation != "snapshot_pseudotime_source_sink"
+                or set(source_inputs)
+                != {
+                    "cell_selection",
+                    "ordered_row_ids_fingerprint",
+                    "values_fingerprint",
+                }
+                or set(source_parameters) != {"shape"}
+                or source_parameters.get("shape") != [n_cells]
+                or source_inputs.get("cell_selection") != selection.to_dict()
+            ):
+                raise ValueError("Pseudotime source/sink snapshot is invalid")
+            selected_ids = read_metadata_rows_chunkwise(
+                self.cells,
+                "ids",
+                selected_indices,
+            )
+            source_vector = _validate_source_sink_vector_impl(
+                source_values,
+                n_cells,
+                "stored source/sink vector",
+            )
+            if (
+                source_missing is not None
+                or source_inputs.get("ordered_row_ids_fingerprint")
+                != fingerprint_strings(selected_ids)
+                or source_inputs.get("values_fingerprint")
+                != fingerprint_array(source_vector)
+            ):
+                raise ValueError("Pseudotime source/sink snapshot is invalid")
+            _validate_source_sink_vector_impl(
+                source_vector[expected_valid],
+                int(expected_valid.sum()),
+                "stored source/sink vector restricted to the retained component",
+            )
+        else:
+            source_labels = pd.Series(
+                _labels_with_missing_mask(
+                    source_values,
+                    source_missing,
+                    "Pseudotime source/sink labels",
+                )
+            )
+            _validate_source_sink_labels_impl(
+                source_labels,
+                raw_sources,
+                raw_sinks,
+                "the stored pseudotime cells",
+            )
+            _validate_source_sink_labels_impl(
+                source_labels.iloc[np.flatnonzero(expected_valid)].reset_index(
+                    drop=True
+                ),
+                raw_sources,
+                raw_sinks,
+                "the stored retained pseudotime component",
+            )
         return PseudotimeScoreResult(
             ref=ref,
             graph=graph,
@@ -726,12 +994,25 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         Returns:
             Reference to an artifact containing ``probabilities`` and ``valid``.
         """
+        invalidate_cache = _validate_invalidate_cache(invalidate_cache)
         if sinks is None:
             raise ValueError("sinks must be provided")
         if not isinstance(sinks, list):
             raise TypeError("sinks must be a list")
         if not sinks:
             raise ValueError("At least one sink label must be provided")
+        validated_parameters = _validate_fate_parameters(
+            {
+                "sinks": sinks,
+                "beta": beta,
+                "solver_tol": solver_tol,
+                "max_iterations": max_iterations,
+            }
+        )
+        requested_sink_labels = tuple(validated_parameters["sinks"])
+        beta = validated_parameters["beta"]
+        solver_tol = validated_parameters["solver_tol"]
+        max_iterations = validated_parameters["max_iterations"]
         if not isinstance(pseudotime, ArtifactRef):
             raise TypeError("pseudotime must be an ArtifactRef")
         if not isinstance(sink_labels, ArtifactRef):
@@ -739,12 +1020,15 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         pseudotime_result = self.load_pseudotime_scoring(pseudotime)
         graph_ref = pseudotime_result.graph
         stored_selection = pseudotime_result.cell_selection
-        sink_values, sink_selection = _load_cell_artifact_values(
+        raw_sink_values, sink_selection, sink_missing = _load_cell_artifact_values(
             self.zw,
             sink_labels,
         )
-        if sink_values.ndim != 1:
-            raise ValueError("Sink labels must be one-dimensional")
+        sink_values = _labels_with_missing_mask(
+            raw_sink_values,
+            sink_missing,
+            "Sink labels",
+        )
         if sink_selection != stored_selection:
             raise ValueError("Sink labels do not match the pseudotime cell selection")
         ptime = pseudotime_result.values
@@ -766,7 +1050,6 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         retained_ptime = ptime[ptime_valid]
         retained_sink_values = sink_values[ptime_valid]
 
-        requested_sink_labels = tuple(sinks)
         arguments = FateMappingArguments(
             connectivity_map=graph_ref,
             pseudotime=pseudotime,
@@ -797,6 +1080,20 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
                 "valid": ((len(ptime),), "b"),
             },
             invalidate_cache=invalidate_cache,
+            required_attributes=(
+                AttributeRequirement(
+                    "payload_fingerprint",
+                    expected_types=(str,),
+                ),
+            ),
+            reuse_validator=lambda _ref, group: _fate_payload_is_valid(
+                group,
+                n_cells=len(ptime),
+                n_sinks=len(requested_sink_labels),
+                pseudotime_valid=ptime_valid,
+                sink_values=sink_values,
+                sink_labels=requested_sink_labels,
+            ),
         )
         if planned.reused:
             return planned.ref
@@ -805,7 +1102,7 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
                 retained_graph,
                 retained_ptime,
                 retained_sink_values,
-                sinks,
+                list(requested_sink_labels),
                 beta=beta,
                 solver_tol=solver_tol,
                 max_iterations=max_iterations,
@@ -829,6 +1126,7 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
                 "probabilities": probabilities,
                 "valid": valid,
             },
+            fingerprint_payload=True,
         )
         logger.info(
             f"Stored fate probabilities for {len(requested_sink_labels)} sinks "
@@ -846,32 +1144,87 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         if ref.kind != "fate_map":
             raise ValueError("ref must be a fate_map artifact")
         status = inspect_artifact(self.zw, ref)
-        if not status.complete or status.operation != "run_fate_mapping":
+        if (
+            not status.exists
+            or not status.complete
+            or status.operation != "run_fate_mapping"
+        ):
             raise ValueError("Fate-map artifact is unavailable or invalid")
         inputs = status.inputs or {}
-        raw_graph = inputs.get("connectivity_map")
-        raw_pseudotime = inputs.get("pseudotime")
-        raw_sink_labels = inputs.get("sink_labels")
-        raw_selection = inputs.get("cell_selection")
-        graph = _artifact_ref_input(raw_graph, "Fate-map graph")
-        pseudotime = _artifact_ref_input(raw_pseudotime, "Fate-map pseudotime")
-        sink_labels = _artifact_ref_input(raw_sink_labels, "Fate-map sink labels")
-        selection = _artifact_ref_input(raw_selection, "Fate-map cell selection")
         parameters = status.parameters or {}
-        raw_sinks = parameters.get("sinks")
-        if not isinstance(raw_sinks, list | tuple):
-            raise ValueError("Fate-map sink labels are malformed")
-        probabilities, loaded_selection = _load_cell_artifact_values(
-            self.zw,
-            ref,
-            value_name="probabilities",
+        _require_exact_record_keys(inputs, _FATE_INPUTS, "Fate-map inputs")
+        _require_exact_record_keys(parameters, _FATE_PARAMETERS, "Fate-map parameters")
+        try:
+            validated_parameters = _validate_fate_parameters(parameters)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Fate-map parameters are malformed") from exc
+        graph = _artifact_ref_input(inputs.get("connectivity_map"), "Fate-map graph")
+        pseudotime = _artifact_ref_input(
+            inputs.get("pseudotime"),
+            "Fate-map pseudotime",
         )
-        valid, valid_selection = _load_cell_artifact_values(
+        sink_labels = _artifact_ref_input(
+            inputs.get("sink_labels"),
+            "Fate-map sink labels",
+        )
+        selection = _artifact_ref_input(
+            inputs.get("cell_selection"),
+            "Fate-map cell selection",
+        )
+        raw_sinks = list(validated_parameters["sinks"])
+        pseudotime_result = self.load_pseudotime_scoring(pseudotime)
+        if (
+            pseudotime_result.graph != graph
+            or pseudotime_result.cell_selection != selection
+        ):
+            raise ValueError("Fate-map lineage does not match its pseudotime")
+        if ref.scope != graph.scope or ref.assay != graph.assay:
+            raise ValueError("Fate-map artifact does not share its graph scope")
+        sink_values, sink_selection, sink_missing = _load_cell_artifact_values(
+            self.zw,
+            sink_labels,
+        )
+        if sink_selection != selection:
+            raise ValueError("Fate-map sink labels use a different cell selection")
+        masked_sink_values = _labels_with_missing_mask(
+            sink_values,
+            sink_missing,
+            "Fate-map sink labels",
+        )
+        retained_labels = masked_sink_values[pseudotime_result.valid]
+        for sink in raw_sinks:
+            matches = np.asarray(retained_labels == sink)
+            if matches.ndim != 1 or matches.dtype.kind != "b" or not matches.any():
+                raise ValueError("Fate-map sink labels are malformed")
+        n_cells = _selection_size(self.zw, selection)
+        group = as_zarr_group(self.zw[status.path], name=status.path)
+        if not _fate_payload_is_valid(
+            group,
+            n_cells=n_cells,
+            n_sinks=len(raw_sinks),
+            pseudotime_valid=pseudotime_result.valid,
+            sink_values=masked_sink_values,
+            sink_labels=raw_sinks,
+        ):
+            raise ValueError("Fate-map artifact payload is invalid")
+        probabilities, loaded_selection, probabilities_missing = (
+            _load_cell_artifact_values(
+                self.zw,
+                ref,
+                value_name="probabilities",
+            )
+        )
+        valid, valid_selection, valid_missing = _load_cell_artifact_values(
             self.zw,
             ref,
             value_name="valid",
         )
-        if loaded_selection != selection or valid_selection != selection:
+        if (
+            loaded_selection != selection
+            or valid_selection != selection
+            or probabilities_missing is not None
+            or valid_missing is not None
+        ):
             raise ValueError("Fate-map arrays do not match their stored selection")
         return FateMappingResult(
             ref=ref,
@@ -916,6 +1269,11 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             norm_params,
             caller="run_pseudotime_marker_search",
         )
+        gene_batch_size = _optional_positive_batch_size(
+            gene_batch_size,
+            "gene_batch_size",
+        )
+        invalidate_cache = _validate_invalidate_cache(invalidate_cache)
         if not isinstance(pseudotime, ArtifactRef):
             raise TypeError("pseudotime must be an ArtifactRef")
         if not isinstance(features, ArtifactRef):
@@ -923,11 +1281,43 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         if features.scope != "assay" or features.assay is None:
             raise ValueError("features must be an assay-scoped feature selection")
         assay = self._get_assay(features.assay)
+        frozen_feature_names, frozen_feature_ids = _feature_identity_arrays(assay)
+        ordered_feature_names_fingerprint = fingerprint_stored_strings(
+            frozen_feature_names
+        )
+        ordered_feature_ids_fingerprint = fingerprint_stored_strings(frozen_feature_ids)
+        resolved_norm_params = {
+            **norm_params,
+            "log_transform": norm_params.get("log_transform", False),
+            "renormalize_subset": norm_params.get(
+                "renormalize_subset",
+                False,
+            ),
+        }
+        validated_parameters = _validate_marker_parameters(
+            {
+                "normalization": resolved_norm_params,
+                "normalization_method": callable_identity(assay.normMethod),
+                "size_factor": getattr(assay, "sf", None),
+                "association_method": "pearson",
+                "p_value_method": "student_t",
+                "adjustment_method": "fdr_bh",
+                "adjustment_scope": "tested_features",
+                "min_cells": min_cells,
+            }
+        )
+        resolved_norm_params = validated_parameters["normalization"]
+        min_cells = validated_parameters["min_cells"]
         feature_selection, feature_index = _resolve_feature_indices(
             self,
             assay,
             features,
         )
+        if frozen_feature_names.shape != (
+            assay.feats.N,
+        ) or frozen_feature_ids.shape != (assay.feats.N,):
+            raise ValueError("Feature identities do not align with the assay")
+        dataset_fingerprint = _assay_dataset_fingerprint(self, assay)
         ptime_result = self.load_pseudotime_scoring(pseudotime)
         selected_cell_indices = read_stored_selection_indices(
             self.zw,
@@ -948,14 +1338,6 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             "pseudotime validity mask",
             has_validity_column=True,
         )
-        resolved_norm_params = {
-            **norm_params,
-            "log_transform": norm_params.get("log_transform", False),
-            "renormalize_subset": norm_params.get(
-                "renormalize_subset",
-                False,
-            ),
-        }
         n_cells = len(cell_index)
         n_feats = len(feature_index)
         logger.info(
@@ -967,13 +1349,16 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             cell_selection=ptime_result.cell_selection,
             feature_selection=feature_selection,
             pseudotime=pseudotime,
+            dataset_fingerprint=dataset_fingerprint,
+            ordered_feature_ids_fingerprint=ordered_feature_ids_fingerprint,
+            ordered_feature_names_fingerprint=ordered_feature_names_fingerprint,
             normalization=resolved_norm_params,
-            normalization_method=callable_identity(assay.normMethod),
-            size_factor=getattr(assay, "sf", None),
-            association_method="pearson",
-            p_value_method="student_t",
-            adjustment_method="fdr_bh",
-            adjustment_scope="tested_features",
+            normalization_method=validated_parameters["normalization_method"],
+            size_factor=validated_parameters["size_factor"],
+            association_method=validated_parameters["association_method"],
+            p_value_method=validated_parameters["p_value_method"],
+            adjustment_method=validated_parameters["adjustment_method"],
+            adjustment_scope=validated_parameters["adjustment_scope"],
             min_cells=min_cells,
             gene_batch_size=gene_batch_size,
             nthreads=int(
@@ -990,13 +1375,30 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             scope="assay",
             assay=assay.name,
             invalidate_cache=invalidate_cache,
-            required_arrays=tuple(
-                ArrayRequirement(
-                    name,
-                    shape=(assay.feats.N,),
-                    dtype_kind="f",
-                )
-                for name in ("r_value", "p_value", "p_value_adjusted")
+            required_arrays=(
+                *(
+                    ArrayRequirement(
+                        name,
+                        shape=(assay.feats.N,),
+                        dtype_kind="f",
+                    )
+                    for name in ("r_value", "p_value", "p_value_adjusted")
+                ),
+                ArrayRequirement("feature_names", shape=(assay.feats.N,)),
+                ArrayRequirement("feature_ids", shape=(assay.feats.N,)),
+            ),
+            required_attributes=(
+                AttributeRequirement(
+                    "payload_fingerprint",
+                    expected_types=(str,),
+                ),
+            ),
+            reuse_validator=lambda _ref, group: _marker_payload_is_valid(
+                group,
+                n_features=assay.feats.N,
+                selected_features=feature_index,
+                expected_feature_ids_fingerprint=ordered_feature_ids_fingerprint,
+                expected_feature_names_fingerprint=(ordered_feature_names_fingerprint),
             ),
         )
         if planned.reused:
@@ -1006,6 +1408,14 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
                 "Pseudotime marker search requires a DataStore opened with "
                 "zarr_mode='r+' when no reusable artifact exists"
             )
+        _validate_assay_execution_identity(
+            self,
+            assay,
+            dataset_fingerprint=dataset_fingerprint,
+            normalization_method=validated_parameters["normalization_method"],
+            size_factor=validated_parameters["size_factor"],
+            context="Pseudotime marker search",
+        )
         markers = find_markers_by_regression(
             assay=assay,
             cell_idx=cell_index,
@@ -1031,15 +1441,60 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         full_p_values_adjusted[feature_index] = np.asarray(
             markers["p_value_adjusted"].values
         )
-        write_cell_data_artifact(
-            self.zw,
-            planned,
-            {
-                "r_value": full_r_values,
-                "p_value": full_p_values,
-                "p_value_adjusted": full_p_values_adjusted,
-            },
+        marker_group = start_artifact(self.zw, planned)
+        _validate_assay_execution_identity(
+            self,
+            assay,
+            dataset_fingerprint=dataset_fingerprint,
+            normalization_method=validated_parameters["normalization_method"],
+            size_factor=validated_parameters["size_factor"],
+            context="Pseudotime marker search",
         )
+        for name, values in (
+            ("r_value", full_r_values),
+            ("p_value", full_p_values),
+            ("p_value_adjusted", full_p_values_adjusted),
+        ):
+            output = create_zarr_dataset(
+                marker_group,
+                name,
+                (min(max(len(values), 1), 100_000),),
+                values.dtype,
+                values.shape,
+            )
+            output[:] = values
+        stored_feature_names = copy_metadata_array(
+            frozen_feature_names,
+            marker_group,
+            "feature_names",
+        )
+        stored_feature_ids = copy_metadata_array(
+            frozen_feature_ids,
+            marker_group,
+            "feature_ids",
+        )
+        if (
+            fingerprint_stored_strings(stored_feature_names)
+            != ordered_feature_names_fingerprint
+            or fingerprint_stored_strings(stored_feature_ids)
+            != ordered_feature_ids_fingerprint
+        ):
+            raise ValueError(
+                "Feature identities changed during pseudotime marker computation"
+            )
+        marker_group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
+            marker_group,
+            _MARKER_PAYLOAD,
+        )
+        _validate_assay_execution_identity(
+            self,
+            assay,
+            dataset_fingerprint=dataset_fingerprint,
+            normalization_method=validated_parameters["normalization_method"],
+            size_factor=validated_parameters["size_factor"],
+            context="Pseudotime marker search",
+        )
+        finish_artifact(marker_group, planned)
         logger.info(f"Stored pseudotime marker scores for {len(markers)} features")
         return planned.ref
 
@@ -1053,50 +1508,104 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         if ref.kind != "pseudotime_markers" or ref.scope != "assay":
             raise ValueError("ref must be an assay-scoped pseudotime_markers artifact")
         status = inspect_artifact(self.zw, ref)
-        if not status.complete or status.operation != "run_pseudotime_marker_search":
+        if (
+            not status.exists
+            or not status.complete
+            or status.operation != "run_pseudotime_marker_search"
+        ):
             raise ValueError("Pseudotime-marker artifact is unavailable or invalid")
         inputs = status.inputs or {}
-        raw_cell_selection = inputs.get("cell_selection")
-        raw_feature_selection = inputs.get("feature_selection")
-        raw_pseudotime = inputs.get("pseudotime")
+        parameters = status.parameters or {}
+        _require_exact_record_keys(inputs, _MARKER_INPUTS, "Pseudotime-marker inputs")
+        _require_exact_record_keys(
+            parameters,
+            _MARKER_PARAMETERS,
+            "Pseudotime-marker parameters",
+        )
+        try:
+            _validate_marker_parameters(parameters)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Pseudotime-marker parameters are malformed") from exc
         cell_selection = _artifact_ref_input(
-            raw_cell_selection,
+            inputs.get("cell_selection"),
             "Pseudotime-marker cell selection",
         )
         feature_selection = _artifact_ref_input(
-            raw_feature_selection,
+            inputs.get("feature_selection"),
             "Pseudotime-marker feature selection",
         )
         pseudotime = _artifact_ref_input(
-            raw_pseudotime,
+            inputs.get("pseudotime"),
             "Pseudotime-marker pseudotime",
         )
         assay = self._get_assay(ref.assay)
+        _live_feature_names, live_feature_ids = _feature_identity_arrays(assay)
+        feature_ids_fingerprint = inputs.get("ordered_feature_ids_fingerprint")
+        feature_names_fingerprint = inputs.get("ordered_feature_names_fingerprint")
+        if not isinstance(feature_ids_fingerprint, str) or not isinstance(
+            feature_names_fingerprint,
+            str,
+        ):
+            raise ValueError("Pseudotime-marker feature identities are malformed")
+        if feature_ids_fingerprint != fingerprint_stored_strings(live_feature_ids):
+            raise ValueError("Pseudotime-marker feature ID identity has changed")
+        if inputs.get("dataset_fingerprint") != _assay_dataset_fingerprint(self, assay):
+            raise ValueError("Pseudotime-marker dataset identity has changed")
         _, feature_indices = _resolve_feature_indices(
             self,
             assay,
             feature_selection,
         )
+        ptime_result = self.load_pseudotime_scoring(pseudotime)
+        if ptime_result.cell_selection != cell_selection:
+            raise ValueError(
+                "Pseudotime-marker cell selection does not match pseudotime"
+            )
         group = as_zarr_group(self.zw[status.path], name=status.path)
+        if not _marker_payload_is_valid(
+            group,
+            n_features=assay.feats.N,
+            selected_features=feature_indices,
+            expected_feature_ids_fingerprint=feature_ids_fingerprint,
+            expected_feature_names_fingerprint=feature_names_fingerprint,
+        ):
+            raise ValueError("Pseudotime-marker artifact payload is invalid")
+        stored_feature_names = as_zarr_array(
+            group["feature_names"],
+            name="feature_names",
+        )
+        stored_feature_ids = as_zarr_array(
+            group["feature_ids"],
+            name="feature_ids",
+        )
+        frozen_names = read_array_rows_chunkwise(
+            stored_feature_names,
+            feature_indices,
+        ).astype(str)
+        frozen_ids = read_array_rows_chunkwise(
+            stored_feature_ids,
+            feature_indices,
+        ).astype(str)
+        r_values = read_array_rows_chunkwise(
+            as_zarr_array(group["r_value"], name="r_value"),
+            feature_indices,
+        )
+        p_values = read_array_rows_chunkwise(
+            as_zarr_array(group["p_value"], name="p_value"),
+            feature_indices,
+        )
+        adjusted_values = read_array_rows_chunkwise(
+            as_zarr_array(group["p_value_adjusted"], name="p_value_adjusted"),
+            feature_indices,
+        )
         table = pd.DataFrame(
             {
                 "feature_index": feature_indices,
-                "feature_name": np.asarray(
-                    assay.feats.fetch_all("names"),
-                    dtype=object,
-                )[feature_indices],
-                "r_value": np.asarray(
-                    as_zarr_array(group["r_value"], name="r_value")[:]
-                )[feature_indices],
-                "p_value": np.asarray(
-                    as_zarr_array(group["p_value"], name="p_value")[:]
-                )[feature_indices],
-                "p_value_adjusted": np.asarray(
-                    as_zarr_array(
-                        group["p_value_adjusted"],
-                        name="p_value_adjusted",
-                    )[:]
-                )[feature_indices],
+                "feature_name": frozen_names,
+                "feature_id": frozen_ids,
+                "r_value": r_values,
+                "p_value": p_values,
+                "p_value_adjusted": adjusted_values,
             }
         )
         return PseudotimeMarkerResult(
@@ -1154,6 +1663,8 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             norm_params,
             caller="run_pseudotime_aggregation",
         )
+        batch_size = _optional_positive_batch_size(batch_size, "batch_size")
+        invalidate_cache = _validate_invalidate_cache(invalidate_cache)
         if not isinstance(pseudotime, ArtifactRef):
             raise TypeError("pseudotime must be an ArtifactRef")
         if not isinstance(features, ArtifactRef):
@@ -1161,11 +1672,56 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         if features.scope != "assay" or features.assay is None:
             raise ValueError("features must be an assay-scoped feature selection")
         assay = self._get_assay(features.assay)
+        frozen_feature_names, frozen_feature_ids = _feature_identity_arrays(assay)
+        ordered_feature_names_fingerprint = fingerprint_stored_strings(
+            frozen_feature_names
+        )
+        ordered_feature_ids_fingerprint = fingerprint_stored_strings(frozen_feature_ids)
+        resolved_norm_params = {
+            **norm_params,
+            "log_transform": norm_params.get("log_transform", False),
+            "renormalize_subset": norm_params.get(
+                "renormalize_subset",
+                False,
+            ),
+        }
+        raw_ann_params = {} if ann_params is None else ann_params
+        validated_parameters = _validate_aggregation_parameters(
+            {
+                "normalization": resolved_norm_params,
+                "normalization_method": callable_identity(assay.normMethod),
+                "size_factor": getattr(assay, "sf", None),
+                "min_exp": min_exp,
+                "window_size": window_size,
+                "chunk_size": chunk_size,
+                "smoothen": smoothen,
+                "z_scale": z_scale,
+                "n_neighbours": n_neighbours,
+                "n_clusters": n_clusters,
+                "ann_params": raw_ann_params,
+                "nan_cluster_value": nan_cluster_value,
+            }
+        )
+        resolved_norm_params = validated_parameters["normalization"]
+        ann_overrides = validated_parameters["ann_params"]
+        min_exp = validated_parameters["min_exp"]
+        window_size = validated_parameters["window_size"]
+        chunk_size = validated_parameters["chunk_size"]
+        smoothen = validated_parameters["smoothen"]
+        z_scale = validated_parameters["z_scale"]
+        n_neighbours = validated_parameters["n_neighbours"]
+        n_clusters = validated_parameters["n_clusters"]
+        nan_cluster_value = validated_parameters["nan_cluster_value"]
         feature_selection, feature_indices = _resolve_feature_indices(
             self,
             assay,
             features,
         )
+        if frozen_feature_names.shape != (
+            assay.feats.N,
+        ) or frozen_feature_ids.shape != (assay.feats.N,):
+            raise ValueError("Feature identities do not align with the assay")
+        dataset_fingerprint = _assay_dataset_fingerprint(self, assay)
         ptime_result = self.load_pseudotime_scoring(pseudotime)
         selected_cell_indices = read_stored_selection_indices(
             self.zw,
@@ -1179,12 +1735,14 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             selected_cell_indices[ptime_result.valid],
             dtype=np.int64,
         )
-        if not isinstance(nan_cluster_value, (int, np.integer)) or isinstance(
-            nan_cluster_value,
-            (bool, np.bool_),
-        ):
-            raise TypeError("nan_cluster_value must be an integer")
-        nan_cluster_value = int(nan_cluster_value)
+        if len(feature_indices) < 2:
+            raise ValueError("At least two selected features are required")
+        if n_neighbours >= len(feature_indices):
+            raise ValueError(
+                "n_neighbours must be smaller than the selected feature count"
+            )
+        if n_clusters > len(feature_indices):
+            raise ValueError("n_clusters cannot exceed the selected feature count")
         cell_ordering = validate_pseudotime_regressor(
             ptime_result.values[ptime_result.valid],
             len(cell_indices),
@@ -1192,15 +1750,6 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             "pseudotime validity mask",
             has_validity_column=True,
         )
-        resolved_norm_params = {
-            **norm_params,
-            "log_transform": norm_params.get("log_transform", False),
-            "renormalize_subset": norm_params.get(
-                "renormalize_subset",
-                False,
-            ),
-        }
-        resolved_ann_params = {} if ann_params is None else dict(ann_params)
         (
             cell_ordering,
             cell_indices,
@@ -1220,13 +1769,20 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             z_scale=z_scale,
             norm_params=resolved_norm_params,
         )
+        resolved_ann_params = resolve_aggregation_ann_params(
+            ann_overrides,
+            dim=effective_bins,
+        )
         arguments = PseudotimeAggregationArguments(
             cell_selection=ptime_result.cell_selection,
             feature_selection=feature_selection,
             pseudotime=pseudotime,
+            dataset_fingerprint=dataset_fingerprint,
+            ordered_feature_ids_fingerprint=ordered_feature_ids_fingerprint,
+            ordered_feature_names_fingerprint=ordered_feature_names_fingerprint,
             normalization=resolved_norm_params,
-            normalization_method=callable_identity(assay.normMethod),
-            size_factor=getattr(assay, "sf", None),
+            normalization_method=validated_parameters["normalization_method"],
+            size_factor=validated_parameters["size_factor"],
             min_exp=min_exp,
             window_size=window_size,
             chunk_size=chunk_size,
@@ -1271,6 +1827,8 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
                     shape=(assay.feats.N,),
                     dtype_kind="i",
                 ),
+                ArrayRequirement("feature_names", shape=(assay.feats.N,)),
+                ArrayRequirement("feature_ids", shape=(assay.feats.N,)),
             ),
             required_attributes=(
                 AttributeRequirement(
@@ -1281,11 +1839,39 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
                     "nan_cluster_value",
                     expected_types=(int,),
                 ),
+                AttributeRequirement("effective_window", expected_types=(int,)),
+                AttributeRequirement("effective_bins", expected_types=(int,)),
+                AttributeRequirement(
+                    "payload_fingerprint",
+                    expected_types=(str,),
+                ),
+            ),
+            reuse_validator=lambda _ref, group: _aggregation_payload_is_valid(
+                group,
+                n_features=assay.feats.N,
+                selected_features=feature_indices,
+                n_bins=effective_bins,
+                n_clusters=n_clusters,
+                n_neighbours=n_neighbours,
+                nan_cluster_value=nan_cluster_value,
+                ann_params=resolved_ann_params,
+                expected_input_fingerprints=input_fingerprints,
+                expected_feature_ids_fingerprint=ordered_feature_ids_fingerprint,
+                expected_feature_names_fingerprint=(ordered_feature_names_fingerprint),
+                effective_window=effective_window,
             ),
         )
         if planned.reused:
             return planned.ref
         logger.info("Pseudotime modules: aggregating feature profiles")
+        _validate_assay_execution_identity(
+            self,
+            assay,
+            dataset_fingerprint=dataset_fingerprint,
+            normalization_method=validated_parameters["normalization_method"],
+            size_factor=validated_parameters["size_factor"],
+            context="Pseudotime aggregation",
+        )
         aggregation_group = start_artifact(self.zw, planned)
         full_data, stored_feature_indices, valid_features = (
             assay._write_aggregated_ordering_group(
@@ -1330,15 +1916,44 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             output = create_zarr_dataset(
                 aggregation_group,
                 name,
-                (max(len(values), 1),),
+                (min(max(len(values), 1), 100_000),),
                 values.dtype,
                 values.shape,
             )
             output[:] = values
+        stored_feature_names = copy_metadata_array(
+            frozen_feature_names,
+            aggregation_group,
+            "feature_names",
+        )
+        stored_feature_ids = copy_metadata_array(
+            frozen_feature_ids,
+            aggregation_group,
+            "feature_ids",
+        )
+        if (
+            fingerprint_stored_strings(stored_feature_names)
+            != ordered_feature_names_fingerprint
+            or fingerprint_stored_strings(stored_feature_ids)
+            != ordered_feature_ids_fingerprint
+        ):
+            raise ValueError("Feature identities changed during pseudotime aggregation")
         aggregation_group.attrs["input_fingerprints"] = input_fingerprints
         aggregation_group.attrs["nan_cluster_value"] = nan_cluster_value
         aggregation_group.attrs["effective_window"] = effective_window
         aggregation_group.attrs["effective_bins"] = effective_bins
+        aggregation_group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
+            aggregation_group,
+            _AGGREGATION_PAYLOAD,
+        )
+        _validate_assay_execution_identity(
+            self,
+            assay,
+            dataset_fingerprint=dataset_fingerprint,
+            normalization_method=validated_parameters["normalization_method"],
+            size_factor=validated_parameters["size_factor"],
+            context="Pseudotime aggregation",
+        )
         finish_artifact(aggregation_group, planned)
         logger.info(f"Stored {np.unique(clusts).size} pseudotime modules")
         return planned.ref
@@ -1355,49 +1970,160 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
                 "ref must be an assay-scoped pseudotime_aggregation artifact"
             )
         status = inspect_artifact(self.zw, ref)
-        if not status.complete or status.operation != "run_pseudotime_aggregation":
+        if (
+            not status.exists
+            or not status.complete
+            or status.operation != "run_pseudotime_aggregation"
+        ):
             raise ValueError(
                 "Pseudotime-aggregation artifact is unavailable or invalid"
             )
         inputs = status.inputs or {}
-        raw_cell_selection = inputs.get("cell_selection")
-        raw_feature_selection = inputs.get("feature_selection")
-        raw_pseudotime = inputs.get("pseudotime")
+        parameters = status.parameters or {}
+        _require_exact_record_keys(
+            inputs,
+            _AGGREGATION_INPUTS,
+            "Pseudotime-aggregation inputs",
+        )
+        _require_exact_record_keys(
+            parameters,
+            _AGGREGATION_PARAMETERS,
+            "Pseudotime-aggregation parameters",
+        )
+        try:
+            validated_parameters = _validate_aggregation_parameters(parameters)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Pseudotime-aggregation parameters are malformed") from exc
         cell_selection = _artifact_ref_input(
-            raw_cell_selection,
+            inputs.get("cell_selection"),
             "Pseudotime-aggregation cell selection",
         )
         feature_selection = _artifact_ref_input(
-            raw_feature_selection,
+            inputs.get("feature_selection"),
             "Pseudotime-aggregation feature selection",
         )
         pseudotime = _artifact_ref_input(
-            raw_pseudotime,
+            inputs.get("pseudotime"),
             "Pseudotime-aggregation pseudotime",
         )
+        assay = self._get_assay(ref.assay)
+        _live_feature_names, live_feature_ids = _feature_identity_arrays(assay)
+        feature_ids_fingerprint = inputs.get("ordered_feature_ids_fingerprint")
+        feature_names_fingerprint = inputs.get("ordered_feature_names_fingerprint")
+        if not isinstance(feature_ids_fingerprint, str) or not isinstance(
+            feature_names_fingerprint,
+            str,
+        ):
+            raise ValueError("Pseudotime-aggregation feature identities are malformed")
+        if feature_ids_fingerprint != fingerprint_stored_strings(live_feature_ids):
+            raise ValueError("Pseudotime-aggregation feature ID identity has changed")
+        if inputs.get("dataset_fingerprint") != _assay_dataset_fingerprint(self, assay):
+            raise ValueError("Pseudotime-aggregation dataset identity has changed")
+        _, selected_features = _resolve_feature_indices(
+            self,
+            assay,
+            feature_selection,
+        )
+        ptime_result = self.load_pseudotime_scoring(pseudotime)
+        if ptime_result.cell_selection != cell_selection:
+            raise ValueError(
+                "Pseudotime-aggregation cell selection does not match pseudotime"
+            )
+        window_size = validated_parameters["window_size"]
+        chunk_size = validated_parameters["chunk_size"]
+        n_clusters = validated_parameters["n_clusters"]
+        n_neighbours = validated_parameters["n_neighbours"]
+        nan_cluster_value = validated_parameters["nan_cluster_value"]
+        ann_params = validated_parameters["ann_params"]
+        selected_cell_indices = read_stored_selection_indices(
+            self.zw,
+            cell_selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
+        )
+        cell_indices = np.asarray(
+            selected_cell_indices[ptime_result.valid],
+            dtype=np.int64,
+        )
+        cell_ordering = np.asarray(
+            ptime_result.values[ptime_result.valid],
+            dtype=np.float64,
+        )
+        effective_window = min(window_size, len(cell_indices))
+        effective_bins = min(chunk_size, len(cell_indices))
+        try:
+            ann_params = _validate_resolved_ann_parameters(
+                ann_params,
+                dim=effective_bins,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Pseudotime-aggregation ANN parameters are malformed"
+            ) from exc
+        expected_input_fingerprints = [
+            array_digest(values)
+            for values in (cell_indices, selected_features, cell_ordering)
+        ]
         group = as_zarr_group(self.zw[status.path], name=status.path)
+        if not _aggregation_payload_is_valid(
+            group,
+            n_features=assay.feats.N,
+            selected_features=selected_features,
+            n_bins=effective_bins,
+            n_clusters=n_clusters,
+            n_neighbours=n_neighbours,
+            nan_cluster_value=nan_cluster_value,
+            ann_params=ann_params,
+            expected_input_fingerprints=expected_input_fingerprints,
+            expected_feature_ids_fingerprint=feature_ids_fingerprint,
+            expected_feature_names_fingerprint=feature_names_fingerprint,
+            effective_window=effective_window,
+        ):
+            raise ValueError("Pseudotime-aggregation artifact payload is invalid")
+        stored_feature_names = as_zarr_array(
+            group["feature_names"],
+            name="feature_names",
+        )
+        stored_feature_ids = as_zarr_array(
+            group["feature_ids"],
+            name="feature_ids",
+        )
         full_data = ChunkedArray(
             as_zarr_array(group["data"], name="data"),
             nthreads=self.nthreads,
+            resources=self.resources,
         )
-        feature_indices = np.asarray(
-            as_zarr_array(group["feature_indices"], name="feature_indices")[:]
+        valid_positions = _true_array_indices(group["valid_features"])
+        feature_indices = read_array_rows_chunkwise(
+            as_zarr_array(group["feature_indices"], name="feature_indices"),
+            valid_positions,
         )
-        valid_features = np.asarray(
-            as_zarr_array(group["valid_features"], name="valid_features")[:],
-            dtype=bool,
-        )
-        feature_clusters = np.asarray(
-            as_zarr_array(group["feature_clusters"], name="feature_clusters")[:],
-            dtype=np.int64,
-        )
-        return PseudotimeAggregationResult(
+        feature_clusters = read_array_rows_chunkwise(
+            as_zarr_array(group["feature_clusters"], name="feature_clusters"),
+            valid_positions,
+        ).astype(np.int64)
+        frozen_feature_names = read_array_rows_chunkwise(
+            stored_feature_names,
+            feature_indices,
+        ).astype(str)
+        frozen_feature_ids = read_array_rows_chunkwise(
+            stored_feature_ids,
+            feature_indices,
+        ).astype(str)
+        result = PseudotimeAggregationResult(
             ref=ref,
-            data=full_data[valid_features],
-            feature_indices=feature_indices[valid_features],
-            feature_clusters=feature_clusters[valid_features],
+            data=full_data[valid_positions],
+            feature_indices=feature_indices,
+            feature_clusters=feature_clusters,
             assay=cast(str, ref.assay),
             cell_selection=cell_selection,
             feature_selection=feature_selection,
             pseudotime=pseudotime,
         )
+        result._attach_feature_identity(
+            frozen_feature_names,
+            frozen_feature_ids,
+        )
+        return result

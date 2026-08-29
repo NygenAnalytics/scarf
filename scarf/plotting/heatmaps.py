@@ -647,7 +647,6 @@ def _prepare_pseudotime_heatmap(
     loaded = store.load_pseudotime_aggregation(aggregation)
     if loaded.ref != aggregation:
         raise ValueError("Loaded pseudotime aggregation does not match the request")
-    assay = store._get_assay(loaded.assay)
     pseudotime_result = store.load_pseudotime_scoring(loaded.pseudotime)
     if pseudotime_result.cell_selection != loaded.cell_selection:
         raise ValueError(
@@ -662,7 +661,9 @@ def _prepare_pseudotime_heatmap(
         raise ValueError("Aggregated feature clusters and indices are misaligned")
     if not np.isfinite(matrix).all():
         raise ValueError("Aggregated feature matrix contains non-finite values")
-    feature_labels = np.asarray(assay.feats.fetch_all("names"))[feature_indices]
+    feature_labels = np.asarray(loaded.feature_names).astype(str)
+    if feature_labels.shape != feature_indices.shape:
+        raise ValueError("Frozen feature labels do not align with aggregation rows")
     order = np.argsort(feature_clusters)
     pseudotime = np.asarray(
         pseudotime_result.values[pseudotime_result.valid],
@@ -676,7 +677,7 @@ def _prepare_pseudotime_heatmap(
         "feature_clusters": feature_clusters[order],
         "feature_labels": feature_labels[order],
         "pseudotime": pseudotime,
-        "assay": assay.name,
+        "assay": loaded.assay,
         "cell_selection": loaded.cell_selection,
         "feature_selection": loaded.feature_selection,
         "pseudotime_ref": loaded.pseudotime,

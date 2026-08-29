@@ -8,6 +8,7 @@ from zarr.storage import MemoryStore
 
 from scarf.matrix.chunked import ChunkedArray
 from scarf.storage.arrays import create_numeric_array
+from scarf.storage.artifacts import fingerprint_stored_strings
 from scarf.storage.budget import ResourceBudget
 from scarf.storage.copy import (
     copy_zarr_array,
@@ -901,6 +902,35 @@ def test_copy_group_tree_resolves_byte_string_metadata(tmp_path):
     assert copied["labels"].attrs["display"] == {"label": "Labels"}
     assert np.dtype(copied["labels"].dtype).kind == "U"
     assert np.dtype(copied["labels"].dtype).itemsize // 4 >= len("beta-gamma")
+    assert fingerprint_stored_strings(column) == fingerprint_stored_strings(
+        copied["labels"]
+    )
+
+
+def test_copy_group_tree_preserves_padded_byte_string_fingerprint(tmp_path):
+    source_root = zarr.open_group(
+        str(tmp_path / "padded-source.zarr"),
+        mode="w",
+        zarr_format=2,
+    )
+    target_root = zarr.open_group(
+        str(tmp_path / "padded-target.zarr"),
+        mode="w",
+        zarr_format=2,
+    )
+    metadata = source_root.create_group("metadata")
+    source = metadata.create_array(
+        "labels",
+        data=np.array([b"a", b"bb"], dtype="S10"),
+    )
+
+    copied = target_root.create_group("metadata")
+    copy_zarr_group_tree(metadata, copied)
+
+    assert np.dtype(copied["labels"].dtype) == np.dtype("U10")
+    assert fingerprint_stored_strings(source) == fingerprint_stored_strings(
+        copied["labels"]
+    )
 
 
 def test_staged_normed_array_reuses_matching_shape(tmp_path):

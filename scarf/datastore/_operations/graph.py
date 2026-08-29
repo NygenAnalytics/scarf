@@ -27,7 +27,10 @@ from ...graph.arguments import (
     PcaArguments,
     _positive_integer,
 )
-from ...graph.distances import validate_distance_provenance
+from ...graph.distances import (
+    validate_distance_provenance,
+    validate_neighbors_payload,
+)
 from ...graph.feature_projection import (
     graph_cell_selection,
     resolve_coordinate_inputs,
@@ -257,64 +260,6 @@ def _validate_integration_connectivity_payload(
     return n_cells
 
 
-def _validate_integration_neighbors_payload(
-    root: zarr.Group,
-    ref: ArtifactRef,
-) -> int:
-    try:
-        group = artifact_group(root, ref)
-        indices = as_zarr_array(group["indices"], name="indices")
-        distances = as_zarr_array(group["distances"], name="distances")
-    except Exception as error:
-        raise _integration_payload_error(
-            ref,
-            "Neighbors artifact payload is unreadable",
-        ) from error
-    n_cells, n_neighbors = _integration_payload_dimensions(group, ref)
-    expected_shape = (n_cells, n_neighbors)
-    raw_self_hit_rate = group.attrs.get("self_hit_rate")
-    if (
-        isinstance(raw_self_hit_rate, bool)
-        or not isinstance(raw_self_hit_rate, int | float | np.integer | np.floating)
-        or not math.isfinite(float(raw_self_hit_rate))
-        or not 0 <= float(raw_self_hit_rate) <= 100
-        or indices.ndim != 2
-        or tuple(map(int, indices.shape)) != expected_shape
-        or np.dtype(indices.dtype) != np.dtype(np.uint32)
-        or distances.ndim != 2
-        or tuple(map(int, distances.shape)) != expected_shape
-        or np.dtype(distances.dtype) != np.dtype(np.float32)
-    ):
-        raise _integration_payload_error(
-            ref,
-            "Neighbors arrays or metadata do not match their stored dimensions",
-        )
-
-    block_rows = _integration_array_block_rows(indices)
-    for start in range(0, n_cells, block_rows):
-        stop = min(start + block_rows, n_cells)
-        try:
-            index_block = np.asarray(indices[start:stop])
-            distance_block = np.asarray(distances[start:stop])
-        except Exception as error:
-            raise _integration_payload_error(
-                ref,
-                "Neighbors arrays are unreadable",
-            ) from error
-        row_ids = np.arange(start, stop, dtype=np.uint32)[:, None]
-        if (
-            np.any(index_block >= n_cells)
-            or np.any(index_block == row_ids)
-            or not np.all(np.isfinite(distance_block))
-            or np.any(distance_block < 0)
-        ):
-            raise _integration_payload_error(
-                ref,
-                "Neighbors arrays contain invalid indices or distances",
-            )
-    return n_cells
-
-
 def _validate_integration_source_payload(
     root: zarr.Group,
     ref: ArtifactRef,
@@ -322,7 +267,7 @@ def _validate_integration_source_payload(
     if ref.kind == "connectivity_map":
         return _validate_integration_connectivity_payload(root, ref)
     if ref.kind == "neighbors":
-        return _validate_integration_neighbors_payload(root, ref)
+        return validate_neighbors_payload(root, ref).n_cells
     raise _integration_payload_error(
         ref,
         "Integration source has an unsupported artifact kind",

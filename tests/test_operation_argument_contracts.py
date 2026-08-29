@@ -278,6 +278,9 @@ _CONTRACTS = (
         model_only=_classified(
             "resolved_input",
             "cell_selection",
+            "dataset_fingerprint",
+            "ordered_feature_ids_fingerprint",
+            "ordered_feature_names_fingerprint",
             "normalization_method",
             "size_factor",
         )
@@ -293,6 +296,9 @@ _CONTRACTS = (
         model_only=_classified(
             "resolved_input",
             "cell_selection",
+            "dataset_fingerprint",
+            "ordered_feature_ids_fingerprint",
+            "ordered_feature_names_fingerprint",
             "normalization_method",
             "size_factor",
         )

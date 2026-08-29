@@ -23,6 +23,7 @@ from scarf.trajectory.pseudotime import (
     validate_source_sink_labels as _validate_source_sink_labels,
     validate_source_sink_vector as _validate_source_sink_vector,
 )
+from scarf.trajectory.parameters import AGGREGATION_ANN_DEFAULTS
 from scarf.trajectory.results import PseudotimeMarkerResult
 
 
@@ -81,6 +82,125 @@ def test_source_sink_vector_rejects_wrong_shapes():
     ):
         with pytest.raises(ValueError):
             _validate_source_sink_vector(values, 2, "ss_vec")
+
+
+def test_raw_source_sink_scoring_round_trips_and_validates_snapshot(
+    datastore,
+    connectivity_graph,
+):
+    from scipy.sparse.csgraph import connected_components
+
+    from scarf.storage.artifacts import ArtifactRef, artifact_group
+
+    graph = datastore.load_graph(
+        connectivity_graph,
+        symmetric=True,
+        upper_only=False,
+    )
+    _, components = connected_components(graph, directed=False)
+    component_sizes = np.bincount(components)
+    retained = np.flatnonzero(components == int(np.argmax(component_sizes)))
+    source_sink = np.zeros(graph.shape[0], dtype=np.float64)
+    source_sink[retained[0]] = -1.0
+    source_sink[retained[-1]] = 1.0
+
+    with pytest.raises(TypeError, match="min_max_norm_ptime"):
+        datastore.run_pseudotime_scoring(
+            connectivity_graph,
+            ss_vec=source_sink,
+            min_max_norm_ptime=1,
+        )
+
+    ref = datastore.run_pseudotime_scoring(
+        connectivity_graph,
+        ss_vec=source_sink,
+        n_singular_vals=10,
+    )
+    result = datastore.load_pseudotime_scoring(ref)
+    assert result.graph == connectivity_graph
+    np.testing.assert_array_equal(
+        result.valid, components == np.argmax(component_sizes)
+    )
+
+    status = datastore.inspect_artifact(ref)
+    snapshot = ArtifactRef.from_dict(status.inputs["source_sink"])
+    snapshot_status = datastore.inspect_artifact(snapshot)
+    assert snapshot_status.operation == "snapshot_pseudotime_source_sink"
+    assert snapshot_status.parameters == {"shape": [graph.shape[0]]}
+    np.testing.assert_array_equal(
+        artifact_group(datastore.zw, snapshot)["values"][:],
+        source_sink,
+    )
+
+    snapshot_group = artifact_group(datastore.zw, snapshot)
+    original_provenance = dict(snapshot_group.attrs["provenance"])
+    corrupted = dict(original_provenance)
+    corrupted["parameters"] = {"shape": [graph.shape[0], 1]}
+    snapshot_group.attrs["provenance"] = corrupted
+    try:
+        with pytest.raises(ValueError, match="snapshot is invalid"):
+            datastore.load_pseudotime_scoring(ref)
+    finally:
+        snapshot_group.attrs["provenance"] = original_provenance
+
+    datastore.load_pseudotime_scoring(ref)
+
+
+def test_raw_source_sink_scoring_owns_the_vector_before_validation_and_snapshot(
+    datastore,
+    connectivity_graph,
+    monkeypatch,
+):
+    import scarf.datastore._operations.trajectory as trajectory_operations
+    from scipy.sparse.csgraph import connected_components
+
+    graph = datastore.load_graph(
+        connectivity_graph,
+        symmetric=True,
+        upper_only=False,
+    )
+    _, components = connected_components(graph, directed=False)
+    component_sizes = np.bincount(components)
+    retained = np.flatnonzero(components == int(np.argmax(component_sizes)))
+    source_sink = np.zeros(graph.shape[0], dtype=np.float64)
+    source_sink[retained[0]] = -1.0
+    source_sink[retained[-1]] = 1.0
+    expected = source_sink.copy()
+    original_validator = trajectory_operations._validate_source_sink_vector_impl
+    original_potential = trajectory_operations._truncated_pba_potential_impl
+    received: list[np.ndarray] = []
+
+    def mutate_caller_after_validation(values, n_cells, context):
+        validated = original_validator(values, n_cells, context)
+        if context == "ss_vec":
+            source_sink[:] *= -1.0
+        return validated
+
+    def capture_source_sink(laplacian, n_values, seed, values):
+        received.append(np.array(values, copy=True))
+        return original_potential(laplacian, n_values, seed, values)
+
+    monkeypatch.setattr(
+        trajectory_operations,
+        "_validate_source_sink_vector_impl",
+        mutate_caller_after_validation,
+    )
+    monkeypatch.setattr(
+        trajectory_operations,
+        "_truncated_pba_potential_impl",
+        capture_source_sink,
+    )
+    ref = datastore.run_pseudotime_scoring(
+        connectivity_graph,
+        ss_vec=source_sink,
+        n_singular_vals=10,
+        invalidate_cache=True,
+    )
+    result = datastore.load_pseudotime_scoring(ref)
+
+    assert len(received) == 1
+    np.testing.assert_array_equal(received[0], expected[result.valid])
+    np.testing.assert_array_equal(source_sink, -expected)
 
 
 def test_source_sink_vector_rejects_fully_labelled_cells():
@@ -190,7 +310,11 @@ def test_marker_search_returns_an_explicit_artifact_without_feature_writes(
     pseudotime_scoring,
     detected_features,
 ):
-    from scarf.storage.artifacts import ArtifactRef, artifact_path
+    from scarf.storage.artifacts import (
+        ArtifactRef,
+        artifact_path,
+        fingerprint_stored_strings,
+    )
 
     feature_metadata_before = _metadata_values(datastore.RNA.feats)
     ref = datastore.run_pseudotime_marker_search(
@@ -206,12 +330,375 @@ def test_marker_search_returns_an_explicit_artifact_without_feature_writes(
     assert result.pseudotime == pseudotime_scoring
     assert result.feature_selection == detected_features
     _assert_metadata_unchanged(datastore.RNA.feats, feature_metadata_before)
-    assert set(datastore.zw[artifact_path(ref)].array_keys()) == {
+    group = datastore.zw[artifact_path(ref)]
+    assert set(group.array_keys()) == {
+        "feature_ids",
+        "feature_names",
         "p_value",
         "p_value_adjusted",
         "r_value",
     }
+    inputs = datastore.inspect_artifact(ref).inputs or {}
+    assert inputs["ordered_feature_ids_fingerprint"] == fingerprint_stored_strings(
+        group["feature_ids"]
+    )
+    assert inputs["ordered_feature_names_fingerprint"] == (
+        fingerprint_stored_strings(group["feature_names"])
+    )
     assert "p_value_adjusted" in result.table.columns
+
+
+def test_trajectory_feature_selection_indices_are_read_blockwise(
+    datastore,
+    detected_features,
+    monkeypatch,
+):
+    import scarf.datastore._operations.trajectory as trajectory_operations
+    from scarf.storage.artifacts import artifact_path
+
+    selection_values_path = f"{artifact_path(detected_features)}/values"
+    original_getitem = zarr.Array.__getitem__
+
+    def reject_full_selection_read(array, key):
+        if array.path == selection_values_path and (
+            key is Ellipsis
+            or (
+                isinstance(key, slice)
+                and key.start is None
+                and key.stop is None
+                and key.step is None
+            )
+        ):
+            raise AssertionError("trajectory materialized the full feature selection")
+        return original_getitem(array, key)
+
+    monkeypatch.setattr(zarr.Array, "__getitem__", reject_full_selection_read)
+
+    resolved, indices = trajectory_operations._resolve_feature_indices(
+        datastore,
+        datastore.RNA,
+        detected_features,
+    )
+
+    assert resolved == detected_features
+    assert indices.dtype == np.int64
+    assert len(indices) > 0
+
+
+def test_marker_loader_uses_frozen_feature_names(
+    datastore,
+    pseudotime_markers,
+):
+    expected = datastore.load_pseudotime_markers(
+        pseudotime_markers
+    ).table.feature_name.to_numpy(copy=True)
+    live_names = datastore.RNA.feats._get_array("names")
+    original = np.asarray(live_names[:]).copy()
+    try:
+        renamed = original.astype(str)
+        renamed[:] = [f"renamed_{index}" for index in range(len(renamed))]
+        live_names[:] = renamed
+        loaded = datastore.load_pseudotime_markers(pseudotime_markers)
+        np.testing.assert_array_equal(
+            loaded.table.feature_name.to_numpy(),
+            expected,
+        )
+    finally:
+        live_names[:] = original
+
+
+def test_trajectory_loaders_do_not_depend_on_live_normalization_settings(
+    datastore,
+    pseudotime_markers,
+    pseudotime_aggregation,
+    pseudotime_scoring,
+    detected_features,
+    monkeypatch,
+):
+    marker_before = datastore.load_pseudotime_markers(pseudotime_markers)
+    aggregation_before = datastore.load_pseudotime_aggregation(pseudotime_aggregation)
+    monkeypatch.setattr(datastore.RNA, "sf", float(datastore.RNA.sf) * 2.0)
+
+    marker_after = datastore.load_pseudotime_markers(pseudotime_markers)
+    aggregation_after = datastore.load_pseudotime_aggregation(pseudotime_aggregation)
+    pd.testing.assert_frame_equal(marker_after.table, marker_before.table)
+    np.testing.assert_array_equal(
+        aggregation_after.feature_indices,
+        aggregation_before.feature_indices,
+    )
+    np.testing.assert_array_equal(
+        aggregation_after.feature_clusters,
+        aggregation_before.feature_clusters,
+    )
+
+    rerun = datastore.run_pseudotime_marker_search(
+        pseudotime_scoring,
+        features=detected_features,
+    )
+    assert rerun != pseudotime_markers
+
+
+def test_aggregation_provenance_records_resolved_ann_defaults(
+    datastore,
+    pseudotime_aggregation,
+):
+    status = datastore.inspect_artifact(pseudotime_aggregation)
+    expected = dict(AGGREGATION_ANN_DEFAULTS)
+    expected["dim"] = 10
+    assert (status.parameters or {})["ann_params"] == expected
+
+    result = datastore.load_pseudotime_aggregation(pseudotime_aggregation)
+    arguments = {
+        "pseudotime": result.pseudotime,
+        "features": result.feature_selection,
+        "n_clusters": 15,
+        "window_size": 50,
+        "chunk_size": 10,
+        "ann_params": {"random_seed": 445},
+    }
+    overridden = datastore.run_pseudotime_aggregation(**arguments)
+    assert overridden != pseudotime_aggregation
+    overridden_parameters = datastore.inspect_artifact(overridden).parameters or {}
+    assert overridden_parameters["ann_params"] == {
+        **expected,
+        "random_seed": 445,
+    }
+    assert datastore.run_pseudotime_aggregation(**arguments) == overridden
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "error_type"),
+    [
+        (True, TypeError),
+        (False, TypeError),
+        (0, ValueError),
+        (-1, ValueError),
+        (1.5, TypeError),
+    ],
+)
+def test_trajectory_feature_batch_sizes_are_strictly_positive_integers(
+    datastore,
+    pseudotime_scoring,
+    detected_features,
+    batch_size,
+    error_type,
+):
+    with pytest.raises(error_type, match="gene_batch_size"):
+        datastore.run_pseudotime_marker_search(
+            pseudotime_scoring,
+            features=detected_features,
+            gene_batch_size=batch_size,
+        )
+    with pytest.raises(error_type, match="batch_size"):
+        datastore.run_pseudotime_aggregation(
+            pseudotime_scoring,
+            features=detected_features,
+            batch_size=batch_size,
+        )
+
+
+def test_aggregation_rejects_nonmapping_ann_parameters(
+    datastore,
+    pseudotime_scoring,
+    detected_features,
+):
+    with pytest.raises(TypeError, match="ann_params must be a mapping"):
+        datastore.run_pseudotime_aggregation(
+            pseudotime_scoring,
+            features=detected_features,
+            ann_params=[("M", 20)],  # type: ignore[arg-type]
+        )
+
+
+def test_trajectory_operations_require_boolean_cache_invalidation(
+    datastore,
+    connectivity_graph,
+    pseudotime_scoring,
+    detected_features,
+):
+    with pytest.raises(TypeError, match="invalidate_cache"):
+        datastore.run_pseudotime_scoring(
+            connectivity_graph,
+            invalidate_cache=1,
+        )
+    with pytest.raises(TypeError, match="invalidate_cache"):
+        datastore.run_fate_mapping(
+            pseudotime_scoring,
+            pseudotime_scoring,
+            sinks=[1],
+            invalidate_cache=1,
+        )
+    with pytest.raises(TypeError, match="invalidate_cache"):
+        datastore.run_pseudotime_marker_search(
+            pseudotime_scoring,
+            features=detected_features,
+            invalidate_cache=1,
+        )
+    with pytest.raises(TypeError, match="invalidate_cache"):
+        datastore.run_pseudotime_aggregation(
+            pseudotime_scoring,
+            features=detected_features,
+            invalidate_cache=1,
+        )
+
+
+def test_marker_identity_change_during_computation_leaves_artifact_incomplete(
+    datastore,
+    pseudotime_scoring,
+    detected_features,
+    monkeypatch,
+):
+    import scarf.features.markers as marker_algorithms
+
+    before = set(
+        datastore.list_artifacts(
+            kind="pseudotime_markers",
+            from_assay="RNA",
+        )
+    )
+    live_names = datastore.RNA.feats._get_array("names")
+    original_names = np.asarray(live_names[:]).copy()
+    renamed = original_names.astype(str)
+    renamed[:] = [f"changed_{index}" for index in range(len(renamed))]
+    original_search = marker_algorithms.find_markers_by_regression
+
+    def mutate_after_computation(*args, **kwargs):
+        result = original_search(*args, **kwargs)
+        live_names[:] = renamed
+        return result
+
+    monkeypatch.setattr(
+        marker_algorithms,
+        "find_markers_by_regression",
+        mutate_after_computation,
+    )
+    try:
+        with pytest.raises(ValueError, match="identities changed"):
+            datastore.run_pseudotime_marker_search(
+                pseudotime_scoring,
+                features=detected_features,
+                min_cells=1,
+                invalidate_cache=True,
+            )
+    finally:
+        live_names[:] = original_names
+
+    created = (
+        set(
+            datastore.list_artifacts(
+                kind="pseudotime_markers",
+                from_assay="RNA",
+            )
+        )
+        - before
+    )
+    assert len(created) == 1
+    assert not datastore.inspect_artifact(created.pop()).complete
+
+
+def test_marker_normalization_change_during_computation_leaves_artifact_incomplete(
+    datastore,
+    pseudotime_scoring,
+    detected_features,
+    monkeypatch,
+):
+    import scarf.features.markers as marker_algorithms
+
+    before = set(
+        datastore.list_artifacts(
+            kind="pseudotime_markers",
+            from_assay="RNA",
+        )
+    )
+    original_size_factor = datastore.RNA.sf
+    assert original_size_factor is not None
+    original_search = marker_algorithms.find_markers_by_regression
+
+    def mutate_after_computation(*args, **kwargs):
+        result = original_search(*args, **kwargs)
+        datastore.RNA.sf = original_size_factor * 2
+        return result
+
+    monkeypatch.setattr(
+        marker_algorithms,
+        "find_markers_by_regression",
+        mutate_after_computation,
+    )
+    try:
+        with pytest.raises(ValueError, match="normalization settings changed"):
+            datastore.run_pseudotime_marker_search(
+                pseudotime_scoring,
+                features=detected_features,
+                min_cells=1,
+                invalidate_cache=True,
+            )
+    finally:
+        datastore.RNA.sf = original_size_factor
+
+    created = (
+        set(
+            datastore.list_artifacts(
+                kind="pseudotime_markers",
+                from_assay="RNA",
+            )
+        )
+        - before
+    )
+    assert len(created) == 1
+    assert not datastore.inspect_artifact(created.pop()).complete
+
+
+def test_aggregation_normalization_change_leaves_artifact_incomplete(
+    datastore,
+    pseudotime_scoring,
+    detected_features,
+    monkeypatch,
+):
+    before = set(
+        datastore.list_artifacts(
+            kind="pseudotime_aggregation",
+            from_assay="RNA",
+        )
+    )
+    original_size_factor = datastore.RNA.sf
+    assert original_size_factor is not None
+    original_writer = datastore.RNA._write_aggregated_ordering_group
+
+    def mutate_after_aggregation(*args, **kwargs):
+        result = original_writer(*args, **kwargs)
+        datastore.RNA.sf = original_size_factor * 2
+        return result
+
+    monkeypatch.setattr(
+        datastore.RNA,
+        "_write_aggregated_ordering_group",
+        mutate_after_aggregation,
+    )
+    try:
+        with pytest.raises(ValueError, match="normalization settings changed"):
+            datastore.run_pseudotime_aggregation(
+                pseudotime_scoring,
+                features=detected_features,
+                window_size=10,
+                chunk_size=5,
+                n_neighbours=3,
+                n_clusters=2,
+                invalidate_cache=True,
+            )
+    finally:
+        datastore.RNA.sf = original_size_factor
+
+    created = (
+        set(
+            datastore.list_artifacts(
+                kind="pseudotime_aggregation",
+                from_assay="RNA",
+            )
+        )
+        - before
+    )
+    assert len(created) == 1
+    assert not datastore.inspect_artifact(created.pop()).complete
 
 
 def test_incomplete_pseudotime_marker_artifact_is_recomputed(
@@ -375,6 +862,22 @@ def test_knn_clustering_rejects_infeasible_parameters():
         knn_clustering(_ShapeOnlyArray((3, 3)), np.int32(1), np.int64(4), 1)
     with pytest.raises(TypeError, match="n_clusters"):
         knn_clustering(_ShapeOnlyArray((3, 3)), 1, np.bool_(True), 1)
+    with pytest.raises(ValueError, match="effective bin count"):
+        knn_clustering(
+            _ShapeOnlyArray((3, 3)),
+            1,
+            2,
+            1,
+            {"dim": 2},
+        )
+    with pytest.raises(ValueError, match="smaller than the feature count"):
+        knn_clustering(
+            _ShapeOnlyArray((3, 3)),
+            1,
+            2,
+            1,
+            {"max_elements": 2},
+        )
 
 
 def test_feature_cluster_scatter_honors_custom_unassigned_value():

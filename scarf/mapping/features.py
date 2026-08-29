@@ -7,6 +7,7 @@ import numpy as np
 from numpy.typing import DTypeLike
 
 from ..assay import RNAassay, _read_block, norm_lib_size
+from ..metadata.rows import read_metadata_rows_chunkwise
 from ..storage.artifacts import ValueFingerprintBuilder, callable_identity
 from ..storage.budget import ResourceBudget, admit_stream
 from ..storage.geometry import ArrayGeometry, array_geometry
@@ -271,23 +272,23 @@ class AlignedFeatureStream:
         if not self.renormalize_subset:
             scalar_name = f"{query_assay.name}_nCounts"
             try:
-                all_scalars = np.asarray(
-                    query_assay.cells.fetch_all(scalar_name),
+                scalars = np.asarray(
+                    read_metadata_rows_chunkwise(
+                        query_assay.cells,
+                        scalar_name,
+                        self._query_cell_indices,
+                    ),
                     dtype=np.float64,
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError(
                     f"Query assay requires numeric {scalar_name!r} metadata"
                 ) from exc
-            if all_scalars.shape != (raw_data.shape[0],):
+            if scalars.shape != (len(self._query_cell_indices),):
                 raise ValueError(
                     f"Query assay {scalar_name!r} metadata has the wrong shape"
                 )
-            scalars = np.array(
-                all_scalars[self._query_cell_indices],
-                dtype=np.float64,
-                copy=True,
-            )
+            scalars = np.array(scalars, dtype=np.float64, copy=True)
             if not np.all(np.isfinite(scalars)) or np.any(scalars < 0):
                 raise ValueError(
                     f"Query assay {scalar_name!r} metadata must be finite "
@@ -423,6 +424,10 @@ class AlignedFeatureStream:
         if self._raw_expression_fingerprint is None:
             self._raw_expression_fingerprint = self._fingerprint_raw_expression()
         return self._raw_expression_fingerprint
+
+    def fingerprint_live_raw_expression(self) -> str:
+        """Fingerprint the current backing counts without using the cached value."""
+        return self._fingerprint_raw_expression()
 
     def _calculate_resident_bytes(self) -> int:
         arrays = [
@@ -576,4 +581,9 @@ class AlignedFeatureStream:
                 raw,
             )
         builder.end_array(self._RAW_FINGERPRINT_NAME)
+        if self._cell_scalars is not None:
+            builder.update_array(
+                "selected_query_normalization_scalars",
+                self._cell_scalars,
+            )
         return builder.hexdigest()

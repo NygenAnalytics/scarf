@@ -783,7 +783,7 @@ class Assay:
         feature_array = create_zarr_dataset(
             group,
             "feature_indices",
-            (max(len(feature_indices), 1),),
+            (min(max(len(feature_indices), 1), 100_000),),
             "uint64",
             (len(feature_indices),),
         )
@@ -791,7 +791,7 @@ class Assay:
         valid_array = create_zarr_dataset(
             group,
             "valid_features",
-            (max(len(valid), 1),),
+            (min(max(len(valid), 1), 100_000),),
             "bool",
             (len(valid),),
         )

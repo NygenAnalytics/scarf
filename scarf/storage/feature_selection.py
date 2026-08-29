@@ -710,3 +710,23 @@ def resolve_feature_selection(
     if not isinstance(features, ArtifactRef):
         raise TypeError("features must be an ArtifactRef")
     return _validate_feature_selection(root, assay, features).ref
+
+
+def read_feature_selection_indices(
+    root: zarr.Group,
+    assay: str,
+    features: ArtifactRef,
+) -> np.ndarray:
+    """Read selected feature indices without materializing the full mask."""
+    validated = _validate_feature_selection(root, assay, features)
+    values = validated.values
+    block_rows = row_band(array_geometry(values), unit="chunk", fallback=1)
+    selected: list[np.ndarray] = []
+    for start in range(0, int(values.shape[0]), block_rows):
+        stop = min(start + block_rows, int(values.shape[0]))
+        indices = np.flatnonzero(np.asarray(values[start:stop], dtype=bool))
+        if len(indices):
+            selected.append(indices.astype(np.intp, copy=False) + start)
+    if not selected:
+        return np.empty(0, dtype=np.intp)
+    return np.concatenate(selected)

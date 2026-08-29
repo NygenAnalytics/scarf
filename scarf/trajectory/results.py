@@ -8,6 +8,31 @@ from ..matrix import ChunkedArray
 from ..storage.refs import ArtifactRef
 
 
+def _immutable_array(values: np.ndarray) -> np.ndarray:
+    array = np.ascontiguousarray(np.asarray(values))
+    return np.frombuffer(array.tobytes(order="C"), dtype=array.dtype).reshape(
+        array.shape
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PseudotimeAggregationFeatureIdentity:
+    names: np.ndarray
+    ids: np.ndarray
+
+    def __post_init__(self) -> None:
+        names = np.asarray(self.names)
+        ids = np.asarray(self.ids)
+        if names.ndim != 1 or ids.ndim != 1 or names.shape != ids.shape:
+            raise ValueError("Frozen feature names and IDs must align")
+        object.__setattr__(self, "names", _immutable_array(names))
+        object.__setattr__(self, "ids", _immutable_array(ids))
+
+
+class _PseudotimeAggregationIdentityCarrier:
+    __slots__ = ("_feature_identity",)
+
+
 @dataclass(frozen=True, slots=True, eq=False)
 class FateMappingResult:
     """Fate probabilities loaded from an immutable artifact."""
@@ -86,7 +111,7 @@ class PseudotimeMarkerResult:
 
 
 @dataclass(frozen=True, slots=True, eq=False)
-class PseudotimeAggregationResult:
+class PseudotimeAggregationResult(_PseudotimeAggregationIdentityCarrier):
     """Lazy pseudotime aggregation loaded from an immutable artifact."""
 
     ref: ArtifactRef
@@ -117,3 +142,39 @@ class PseudotimeAggregationResult:
             raise ValueError("Feature indices do not align with aggregation rows")
         if len(self.feature_clusters) != n_features:
             raise ValueError("Feature clusters do not align with aggregation rows")
+
+    def _attach_feature_identity(
+        self,
+        names: np.ndarray,
+        ids: np.ndarray,
+    ) -> None:
+        if hasattr(self, "_feature_identity"):
+            raise RuntimeError("Frozen feature identity is already attached")
+        identity = _PseudotimeAggregationFeatureIdentity(names=names, ids=ids)
+        if identity.names.shape != (int(self.data.shape[0]),):
+            raise ValueError(
+                "Frozen feature identity does not align with aggregation rows"
+            )
+        object.__setattr__(self, "_feature_identity", identity)
+
+    @property
+    def feature_names(self) -> np.ndarray:
+        """Frozen feature names aligned to the aggregation rows."""
+        identity = getattr(self, "_feature_identity", None)
+        if not isinstance(identity, _PseudotimeAggregationFeatureIdentity):
+            raise RuntimeError(
+                "Frozen feature names are available on results loaded with "
+                "DataStore.load_pseudotime_aggregation"
+            )
+        return identity.names
+
+    @property
+    def feature_ids(self) -> np.ndarray:
+        """Frozen feature IDs aligned to the aggregation rows."""
+        identity = getattr(self, "_feature_identity", None)
+        if not isinstance(identity, _PseudotimeAggregationFeatureIdentity):
+            raise RuntimeError(
+                "Frozen feature IDs are available on results loaded with "
+                "DataStore.load_pseudotime_aggregation"
+            )
+        return identity.ids

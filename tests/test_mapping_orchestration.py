@@ -1,5 +1,6 @@
 from pathlib import Path
 import shutil
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
@@ -191,6 +192,7 @@ def test_plain_mapping_is_query_owned_and_reuses_exact_projection(
         "feature_selection",
         "selected_expression_fingerprint",
         "query_batch_fingerprint",
+        "query_batch_count",
         "mapping_reference",
     }
     assert (
@@ -243,6 +245,7 @@ def test_plain_mapping_is_query_owned_and_reuses_exact_projection(
         "scarf_version",
         "complete",
         "diagnostics",
+        "payload_fingerprint",
     }
     loaded = load_projection(
         query.zw,
@@ -326,6 +329,117 @@ def test_mapping_failure_leaves_projection_incomplete(
     failed = query.inspect_artifact(created.pop())
     assert failed.exists
     assert not failed.complete
+
+
+def test_mapping_rejects_expression_changes_before_projection_finish(
+    analyzed_datastore_ephemeral,
+    tmp_path,
+    monkeypatch,
+):
+    reference_store = analyzed_datastore_ephemeral
+    reference = _plain_reference(reference_store)
+    query = _copied_query(reference_store, tmp_path / "query-expression-change.zarr")
+    before = set(
+        query.list_artifacts(
+            kind="projection",
+            from_assay="RNA",
+        )
+    )
+    monkeypatch.setattr(
+        AlignedFeatureStream,
+        "fingerprint_live_raw_expression",
+        lambda _stream: "changed-during-mapping",
+    )
+
+    with pytest.raises(ValueError, match="expression changed during mapping"):
+        query.run_mapping(reference, reference.cell_selection)
+
+    created = (
+        set(
+            query.list_artifacts(
+                kind="projection",
+                from_assay="RNA",
+            )
+        )
+        - before
+    )
+    assert len(created) == 1
+    assert not query.inspect_artifact(created.pop()).complete
+
+
+def test_mapping_rejects_reference_handles_forged_from_a_stored_reference(
+    analyzed_datastore_ephemeral,
+    tmp_path,
+):
+    reference_store = analyzed_datastore_ephemeral
+    reference = _plain_reference(reference_store)
+    query = _copied_query(reference_store, tmp_path / "query-forged-reference.zarr")
+    projection = query.run_mapping(reference, reference.cell_selection)
+    forged = replace(
+        reference,
+        model=object(),  # type: ignore[arg-type]
+        cell_selection=ArtifactRef(
+            scope="datastore",
+            assay=None,
+            kind="cell_selection",
+            artifact_id="f" * 64,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="does not match its stored artifact"):
+        query.run_mapping(forged, reference.cell_selection)
+    with pytest.raises(ValueError, match="does not match its stored artifact"):
+        query.get_mapping_result(projection, reference=forged)
+    with pytest.raises(ValueError, match="does not match its stored artifact"):
+        forged.fetch_cell_column("ids")
+    with pytest.raises(ValueError, match="does not match its stored artifact"):
+        query.lineage(projection, references=forged)
+
+
+def test_mapping_rejects_feature_axis_changes_during_stream_setup(
+    analyzed_datastore_ephemeral,
+    tmp_path,
+    monkeypatch,
+):
+    reference_store = analyzed_datastore_ephemeral
+    reference = _plain_reference(reference_store)
+    query = _copied_query(reference_store, tmp_path / "query-axis-change.zarr")
+    before = set(
+        query.list_artifacts(
+            kind="projection",
+            from_assay="RNA",
+        )
+    )
+    live_ids = query.RNA.feats._get_array("ids")
+    original_ids = np.asarray(live_ids[:]).copy()
+    changed_ids = original_ids.copy()
+    changed_ids[[0, 1]] = changed_ids[[1, 0]]
+    original_init = AlignedFeatureStream.__init__
+
+    def initialize_then_change_ids(stream, *args, **kwargs):
+        original_init(stream, *args, **kwargs)
+        live_ids[:] = changed_ids
+
+    monkeypatch.setattr(
+        AlignedFeatureStream,
+        "__init__",
+        initialize_then_change_ids,
+    )
+    try:
+        with pytest.raises(ValueError, match="identities changed during mapping setup"):
+            query.run_mapping(reference, reference.cell_selection)
+    finally:
+        live_ids[:] = original_ids
+
+    assert (
+        set(
+            query.list_artifacts(
+                kind="projection",
+                from_assay="RNA",
+            )
+        )
+        == before
+    )
 
 
 def test_mapping_producer_returns_ref_without_loading_projection(
@@ -435,7 +549,7 @@ def test_mapping_guards_precede_query_writes(
     reference_store.RNA.attrs["dataset_fingerprint"] = "changed"
     fingerprint_before = _snapshot_store(writable.zarr_loc)
     try:
-        with pytest.raises(ValueError, match="dataset fingerprint mismatch"):
+        with pytest.raises(ValueError, match="dataset fingerprint does not match"):
             writable.run_mapping(reference, reference.cell_selection)
     finally:
         if had_stored_fingerprint:

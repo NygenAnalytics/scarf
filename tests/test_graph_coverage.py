@@ -577,6 +577,35 @@ def test_diffusion_operator_loader_rejects_mismatched_lineage_and_payload(
         store.load_diffusion_operator(diffusion)
 
 
+def test_diffusion_operator_content_tamper_is_rejected_and_not_reused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _memory_graph_store()
+    graph_ref = _add_test_graph(store)
+    graph = csr_matrix(
+        np.array(
+            [
+                [0.0, 1.0, 1.0],
+                [1.0, 0.0, 1.0],
+                [1.0, 1.0, 0.0],
+            ]
+        )
+    )
+    selection = _add_test_cell_selection(store)
+    _patch_trajectory_graph_resolution(monkeypatch, graph_ref, selection)
+    store.load_graph = Mock(return_value=graph)
+
+    first = store.run_diffusion_operator(graph_ref, t=1)
+    group = store.zw[artifact_path(first)]
+    group["data"][0] = float(group["data"][0]) / 2.0
+
+    with pytest.raises(ValueError, match="sparse payload is malformed"):
+        store.load_diffusion_operator(first)
+    replacement = store.run_diffusion_operator(graph_ref, t=1)
+    assert replacement != first
+    assert store.load_diffusion_operator(replacement).shape == (3, 3)
+
+
 def test_read_only_diffusion_operator_only_reuses_persisted_artifacts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

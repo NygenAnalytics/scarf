@@ -47,8 +47,8 @@ sink = np.isin(annotations, ["Alpha", "Beta", "Delta"])
 if not source.any() or not sink.any():
     raise ValueError("Source and sink annotations must both be present")
 source_sink_vector = np.zeros(len(annotations), dtype=float)
-source_sink_vector[source] = 1.0 / source.sum()
-source_sink_vector[sink] = -1.0 / sink.sum()
+source_sink_vector[source] = -1.0 / source.sum()
+source_sink_vector[sink] = 1.0 / sink.sum()
 pseudotime_ref = ds.run_pseudotime_scoring(graph, ss_vec=source_sink_vector)
 ```
 
@@ -76,11 +76,12 @@ modules = ds.load_pseudotime_aggregation(modules_ref)
 }
 ```
 
-The loader returns the valid feature rows only, their physical assay indexes, module labels, and a
-lazy binned matrix.
+The loader returns the valid feature rows only, their physical assay indexes, module labels, frozen
+feature names and IDs, and a lazy binned matrix. Use `modules.feature_names` or
+`modules.feature_ids` so later edits to live feature metadata cannot relabel the saved result.
 
 ```{code-cell} ipython3
-feature_names = np.asarray(ds.RNA.feats.fetch_all("names"))[modules.feature_indices]
+feature_names = modules.feature_names
 module_frame = pd.DataFrame(
     {
         "feature_name": feature_names,

@@ -366,12 +366,14 @@ assert not any(
 def test_algorithm_domains_do_not_import_orchestration_or_io():
     # storage.refs holds the artifact reference value type and reads no store,
     # so results that a caller persists may name it. Imported-embedding
-    # persistence is the one honest embeddings-to-storage adapter.
+    # persistence is the one honest embeddings-to-storage adapter. Trajectory
+    # artifact contracts are the corresponding narrow persistence adapter for
+    # validating domain payloads without moving their semantics into DataStore.
     forbidden = {"datastore", "plotting", "readers", "writers"}
     storage_exceptions = {
         "clustering": set(),
         "embeddings": {"imported_storage.py"},
-        "trajectory": set(),
+        "trajectory": {"artifacts.py"},
     }
     for package_name in ("clustering", "embeddings", "trajectory"):
         package_root = _SCARF_ROOT / package_name

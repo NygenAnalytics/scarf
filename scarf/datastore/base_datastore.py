@@ -209,6 +209,7 @@ class BaseDataStore:
     ) -> "ArtifactLineage":
         """Build a read-only upstream lineage report for artifact outputs."""
         from ..storage.lineage import ArtifactLineage
+        from ..mapping.artifact import validate_mapping_reference_binding
         from ..mapping.reference import MappingReference
 
         if references is None:
@@ -229,6 +230,7 @@ class BaseDataStore:
         for index, reference in enumerate(resolved_references):
             if not isinstance(reference, MappingReference):
                 raise TypeError(f"references[{index}] must be a MappingReference")
+            validate_mapping_reference_binding(reference)
             reference.validate_dataset_fingerprint()
             fingerprint = reference.external_ref.dataset_fingerprint
             root = reference.datastore.zw

@@ -1,6 +1,7 @@
 import hashlib
 import os
 import tempfile
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -20,6 +21,13 @@ _ANN_INDEX_METADATA = (
     "element_count",
     "payload_sha256",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedAnnIndexPayload:
+    source: zarr.Array
+    stored_count: int | None
+    stored_digest: str | None
 
 
 def has_ann_index(group: zarr.Group, name: str = ANN_INDEX_ARRAY) -> bool:
@@ -86,20 +94,23 @@ def save_ann_index(
         os.unlink(path)
 
 
-def load_ann_index(
+def _validate_ann_index_contract(
     group: zarr.Group,
     space: str,
     dim: int,
     expected_count: int | None = None,
     name: str = ANN_INDEX_ARRAY,
-) -> Any:
-    """Load an hnswlib index from a Zarr byte array."""
-    import hnswlib
-
+    *,
+    require_metadata: bool,
+) -> _ValidatedAnnIndexPayload:
     if name not in group:
         raise FileNotFoundError(f"ANN index array {name!r} not found in group")
     source = as_zarr_array(group[name], name=name)
-    if source.ndim != 1 or np.dtype(source.dtype) != np.dtype(np.uint8):
+    if (
+        source.ndim != 1
+        or int(source.shape[0]) < 1
+        or np.dtype(source.dtype) != np.dtype(np.uint8)
+    ):
         raise ValueError("ANN index payload must be a one-dimensional uint8 array")
     stored_byte_length = source.attrs.get("byte_length")
     if stored_byte_length is not None:
@@ -112,6 +123,8 @@ def load_ann_index(
     present_metadata = {key for key in _ANN_INDEX_METADATA if key in source.attrs}
     if present_metadata and present_metadata != set(_ANN_INDEX_METADATA):
         raise ValueError("ANN index metadata is incomplete")
+    if require_metadata and not present_metadata:
+        raise ValueError("ANN index metadata is missing")
     stored_count: int | None = None
     stored_digest: str | None = None
     if present_metadata:
@@ -144,6 +157,63 @@ def load_ann_index(
         if not isinstance(payload_digest, str):
             raise ValueError("ANN index payload digest is invalid")
         stored_digest = payload_digest
+    return _ValidatedAnnIndexPayload(
+        source=source,
+        stored_count=stored_count,
+        stored_digest=stored_digest,
+    )
+
+
+def validate_ann_index_payload(
+    group: zarr.Group,
+    space: str,
+    dim: int,
+    expected_count: int | None = None,
+    name: str = ANN_INDEX_ARRAY,
+    *,
+    require_metadata: bool = False,
+) -> None:
+    """Validate ANN bytes and metadata without instantiating hnswlib."""
+    validated = _validate_ann_index_contract(
+        group,
+        space,
+        dim,
+        expected_count,
+        name,
+        require_metadata=require_metadata,
+    )
+    if validated.stored_digest is None:
+        return
+    digest = hashlib.sha256()
+    source = validated.source
+    for start in range(0, int(source.shape[0]), ANN_INDEX_CHUNK_BYTES):
+        stop = min(start + ANN_INDEX_CHUNK_BYTES, int(source.shape[0]))
+        digest.update(np.asarray(source[start:stop], dtype=np.uint8))
+    if digest.hexdigest() != validated.stored_digest:
+        raise ValueError("ANN index payload digest does not match its metadata")
+
+
+def load_ann_index(
+    group: zarr.Group,
+    space: str,
+    dim: int,
+    expected_count: int | None = None,
+    name: str = ANN_INDEX_ARRAY,
+) -> Any:
+    """Load an hnswlib index from a Zarr byte array."""
+    import hnswlib
+
+    validated = _validate_ann_index_contract(
+        group,
+        space,
+        dim,
+        expected_count,
+        name,
+        require_metadata=False,
+    )
+    source = validated.source
+    stored_count = validated.stored_count
+    stored_digest = validated.stored_digest
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         path = tmp.name
     try:

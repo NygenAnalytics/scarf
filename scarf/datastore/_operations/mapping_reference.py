@@ -4,17 +4,21 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from ...assay import RNAassay
-from ...graph.distances import validate_distance_provenance
+from ...graph.distances import (
+    validate_distance_provenance,
+    validate_neighbors_payload,
+)
 from ...mapping.artifact import (
     _selected_feature_ids,
     load_artifact_mapping_reference,
-    write_artifact_mapping_reference,
+    mapping_reference_payload_matches_sources,
+    mapping_reference_source_fingerprint,
+    validate_artifact_mapping_reference,
+    validate_mapping_reference_sources,
+    write_artifact_mapping_reference_from_sources,
 )
 from ...mapping.confidence import _distance_quantile_summary
-from ...mapping.models import (
-    ScaledPCAProjectionModel,
-    SymphonyCorrectionModel,
-)
+from ...mapping.features import _normalization_parameters
 from ...mapping.reference import MappingReference
 from ...storage.artifact_writer import (
     AttributeRequirement,
@@ -22,6 +26,7 @@ from ...storage.artifact_writer import (
     plan_artifact,
     start_artifact,
 )
+from ...storage.ann_index import validate_ann_index_payload
 from ...storage.artifacts import (
     ArtifactRef,
     artifact_group,
@@ -222,91 +227,106 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
             )
         if (neighbors_status.parameters or {}).get("distance_metric") != ann_metric:
             raise ValueError("Neighbor and ANN distance metrics do not match")
-        normalization_parameters = normalized_status.parameters or {}
-        size_factor = normalization_parameters.get("size_factor")
-        if (
-            isinstance(size_factor, bool)
-            or not isinstance(size_factor, int | float)
-            or not np.isfinite(size_factor)
-            or float(size_factor) <= 0
-        ):
-            raise ValueError(
-                "Mapping reference normalization size_factor must be finite and positive"
-            )
+        normalization_parameters = _normalization_parameters(
+            normalized_status.parameters or {}
+        )
 
         reduction_group = artifact_group(self.zw, reduction)
         scaling_group = artifact_group(self.zw, feature_scaling)
-        neighbors_group = artifact_group(self.zw, neighbors)
-        loadings = np.asarray(
-            as_zarr_array(reduction_group["loadings"], name="loadings")[:]
+        feature_means = as_zarr_array(scaling_group["mean"], name="mean")
+        feature_scales = as_zarr_array(scaling_group["scale"], name="scale")
+        loadings = as_zarr_array(reduction_group["loadings"], name="loadings")
+        if loadings.ndim != 2:
+            raise ValueError("Reference PCA loadings have incompatible dimensions")
+        n_features = int(loadings.shape[0])
+        n_dims = int(loadings.shape[1])
+        selected_cell_count = validated_cells.selected_count
+        if selected_cell_count < 1:
+            raise ValueError("Mapping references require at least one selected cell")
+        reduction_data = as_zarr_array(reduction_group["data"], name="data")
+        if (
+            reduction_data.ndim != 2
+            or reduction_data.shape != (selected_cell_count, n_dims)
+            or np.dtype(reduction_data.dtype) != np.dtype(np.float32)
+        ):
+            raise ValueError(
+                "PCA rows must match the selected reference cells and dimensions"
+            )
+        validate_distance_provenance(self.zw, neighbors)
+        neighbor_payload = validate_neighbors_payload(self.zw, neighbors)
+        if neighbor_payload.n_cells != selected_cell_count:
+            raise ValueError("Neighbor rows must match the selected reference cells")
+        distances = neighbor_payload.distances
+        validate_ann_index_payload(
+            artifact_group(self.zw, ann_index),
+            ann_metric,
+            n_dims,
+            selected_cell_count,
+            require_metadata=True,
         )
-        model = ScaledPCAProjectionModel(
-            feature_means=np.asarray(
-                as_zarr_array(scaling_group["mean"], name="mean")[:]
-            ),
-            feature_scales=np.asarray(
-                as_zarr_array(scaling_group["scale"], name="scale")[:]
-            ),
+
+        symphony_sources: dict[str, Any] | None = None
+        if correction_status is not None and batch_correction is not None:
+            correction_group = artifact_group(self.zw, batch_correction)
+            correction_data = as_zarr_array(correction_group["data"], name="data")
+            if (
+                correction_data.ndim != 2
+                or correction_data.shape != (selected_cell_count, n_dims)
+                or np.dtype(correction_data.dtype) != np.dtype(np.float32)
+            ):
+                raise ValueError(
+                    "Harmony coordinates do not match the reference PCA dimensions"
+                )
+            symphony_sources = {
+                name: as_zarr_array(correction_group[name], name=name)
+                for name in (
+                    "centroids",
+                    "raw_centroids",
+                    "corrected_centroids",
+                    "cluster_mass",
+                    "sigma",
+                )
+            }
+            centroids = symphony_sources["centroids"]
+            if centroids.ndim != 2 or int(centroids.shape[0]) != n_dims:
+                raise ValueError(
+                    "Harmony correction dimensions do not match PCA loadings"
+                )
+            n_clusters = int(centroids.shape[1])
+            if (
+                n_clusters < 1
+                or symphony_sources["raw_centroids"].shape != (n_clusters, n_dims)
+                or symphony_sources["corrected_centroids"].shape != (n_clusters, n_dims)
+                or symphony_sources["cluster_mass"].shape != (n_clusters,)
+                or symphony_sources["sigma"].shape != (n_clusters,)
+            ):
+                raise ValueError(
+                    "Harmony correction arrays have incompatible dimensions"
+                )
+
+        n_features, n_dims = validate_mapping_reference_sources(
+            feature_means=feature_means,
+            feature_scales=feature_scales,
             loadings=loadings,
+            symphony_sources=symphony_sources,
+        )
+        source_payload_fingerprint = mapping_reference_source_fingerprint(
+            feature_means=feature_means,
+            feature_scales=feature_scales,
+            loadings=loadings,
+            symphony_sources=symphony_sources,
         )
         feature_ids = _selected_feature_ids(
             self.zw,
             assay_name,
             feature_selection,
         )
-        if len(feature_ids) != model.n_features:
+        if len(feature_ids) != n_features:
             raise ValueError("Selected reference features do not match PCA loadings")
-        selected_cell_count = validated_cells.selected_count
-        if selected_cell_count < 1:
-            raise ValueError("Mapping references require at least one selected cell")
-        reduction_data = as_zarr_array(reduction_group["data"], name="data")
-        distances = as_zarr_array(neighbors_group["distances"], name="distances")
-        if (
-            int(reduction_data.shape[0]) != selected_cell_count
-            or int(distances.shape[0]) != selected_cell_count
-        ):
-            raise ValueError(
-                "PCA and neighbor rows must match the selected reference cells"
-            )
+        string_feature_ids = np.asarray(feature_ids).astype(str)
+        if np.unique(string_feature_ids).size != len(string_feature_ids):
+            raise ValueError("Selected reference feature IDs must be unique")
 
-        symphony_state = None
-        if correction_status is not None and batch_correction is not None:
-            correction_group = artifact_group(self.zw, batch_correction)
-            symphony_state = SymphonyCorrectionModel(
-                centroids=np.asarray(
-                    as_zarr_array(
-                        correction_group["centroids"],
-                        name="centroids",
-                    )[:]
-                ).T,
-                raw_centroids=np.asarray(
-                    as_zarr_array(
-                        correction_group["raw_centroids"],
-                        name="raw_centroids",
-                    )[:]
-                ),
-                corrected_centroids=np.asarray(
-                    as_zarr_array(
-                        correction_group["corrected_centroids"],
-                        name="corrected_centroids",
-                    )[:]
-                ),
-                cluster_mass=np.asarray(
-                    as_zarr_array(
-                        correction_group["cluster_mass"],
-                        name="cluster_mass",
-                    )[:]
-                ),
-                sigma=np.asarray(
-                    as_zarr_array(correction_group["sigma"], name="sigma")[:]
-                ),
-            )
-            if symphony_state.n_dims != model.n_dims:
-                raise ValueError(
-                    "Harmony correction dimensions do not match PCA loadings"
-                )
-
-        validate_distance_provenance(self.zw, neighbors)
         distance_quantiles, distance_values = _distance_quantile_summary(distances)
         stored_dataset_fingerprint = assay.attrs.get("dataset_fingerprint")
         live_dataset_fingerprint = (
@@ -368,8 +388,12 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
                 "reference_metadata",
                 expected_types=(dict,),
             ),
+            AttributeRequirement(
+                "payload_fingerprint",
+                expected_types=(str,),
+            ),
         )
-        if symphony_state is not None:
+        if symphony_sources is not None:
             required_arrays += (
                 "centroids",
                 "raw_centroids",
@@ -379,13 +403,26 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
             )
 
         def valid_reference(candidate: ArtifactRef, _group: Any) -> bool:
-            if not bool(_group.attrs.get("complete", False)):
-                return True
             try:
-                load_artifact_mapping_reference(self, candidate)
+                validate_artifact_mapping_reference(
+                    self,
+                    candidate,
+                    require_complete=False,
+                )
             except (KeyError, TypeError, ValueError):
                 return False
-            return True
+            return mapping_reference_payload_matches_sources(
+                _group,
+                feature_means=feature_means,
+                feature_scales=feature_scales,
+                loadings=loadings,
+                symphony_sources=symphony_sources,
+                feature_ids=feature_ids,
+                metadata=metadata,
+                reference_distance_quantiles=distance_quantiles,
+                reference_distance_values=distance_values,
+                expected_source_fingerprint=source_payload_fingerprint,
+            )
 
         planned = plan_artifact(
             self.zw,
@@ -403,14 +440,16 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
         )
         if not planned.reused:
             group = start_artifact(self.zw, planned)
-            write_artifact_mapping_reference(
+            write_artifact_mapping_reference_from_sources(
                 group,
-                model,
-                symphony_state,
-                feature_ids,
-                metadata,
-                distance_quantiles,
-                distance_values,
+                feature_means=feature_means,
+                feature_scales=feature_scales,
+                loadings=loadings,
+                symphony_sources=symphony_sources,
+                feature_ids=feature_ids,
+                metadata=metadata,
+                reference_distance_quantiles=distance_quantiles,
+                reference_distance_values=distance_values,
             )
             finish_artifact(group, planned)
         return planned.ref

@@ -44,8 +44,8 @@ all_features = analysis_run["feature_universe"]
 The rebuilt catalog store contains the completed `docs_default` pipeline run. This page reuses its
 exact graph, feature universe, and UMAP. The teaching store's literal `clusters` column supplies
 external endpoint labels; it is not the clustering selected by the pipeline run. Build a zero-sum
-source/sink vector over the graph rows. Ductal cells supply positive source mass; Alpha, Beta, and
-Delta cells share negative sink mass.
+source/sink vector over the graph rows. Ductal cells supply negative source mass; Alpha, Beta, and
+Delta cells share positive sink mass.
 
 ```{code-cell} ipython3
 labels = ds.cells.fetch("clusters", key="I")
@@ -54,8 +54,8 @@ sink = np.isin(labels, ["Alpha", "Beta", "Delta"])
 if not source.any() or not sink.any():
     raise ValueError("Source and sink labels must both be present")
 source_sink_vector = np.zeros(len(labels), dtype=float)
-source_sink_vector[source] = 1.0 / source.sum()
-source_sink_vector[sink] = -1.0 / sink.sum()
+source_sink_vector[source] = -1.0 / source.sum()
+source_sink_vector[sink] = 1.0 / sink.sum()
 float(source_sink_vector.sum())
 ```
 

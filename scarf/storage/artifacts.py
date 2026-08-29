@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import zarr
 
+from .arrays import _decode_metadata_values
 from .geometry import array_geometry
 from .partition import row_band
 from .refs import (
@@ -269,7 +270,7 @@ def fingerprint_stored_strings(array: zarr.Array) -> str:
         max_length = 1
         for start in range(0, array.shape[0], chunk_rows):
             stop = min(start + chunk_rows, array.shape[0])
-            values = np.asarray(array[start:stop])
+            values = _decode_metadata_values(array[start:stop])
             if values.size:
                 max_length = max(
                     max_length,
@@ -283,7 +284,9 @@ def fingerprint_stored_strings(array: zarr.Array) -> str:
     builder.begin_array("values", array.shape, string_dtype)
     for start in range(0, array.shape[0], chunk_rows):
         stop = min(start + chunk_rows, array.shape[0])
-        block = np.asarray(array[start:stop]).astype(string_dtype)
+        block = np.asarray(
+            _decode_metadata_values(array[start:stop]),
+        ).astype(string_dtype)
         builder.update_array_block("values", (start,), block)
     builder.end_array("values")
     return builder.hexdigest()
