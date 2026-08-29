@@ -1197,7 +1197,9 @@ def test_atomic_label_claim_backend_detection(tmp_path: Any) -> None:
     finally:
         safe_wrapper.close()
         unsafe_wrapper.close()
-        zip_store.close()
+        # zarr 3.2.0 ZipStore.close() requires _lock, which exists only after open.
+        if getattr(zip_store, "_is_open", False):
+            zip_store.close()
 
 
 def test_run_view_reads_frozen_fields_and_ignores_live_i_drift() -> None:
