@@ -56,6 +56,8 @@ subtrees:
         title: Gene-set scoring
       - file: tutorials/pseudobulk_and_differential_expression
         title: Pseudobulk and DE
+      - file: tutorials/condition_comparisons
+        title: Condition comparisons
   - caption: Building blocks
     entries:
       - file: tutorials/plotting
