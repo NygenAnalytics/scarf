@@ -8,6 +8,8 @@ import pytest
 
 from scarf.embeddings.harmony import fit_harmony
 from scarf.mapping.models import (
+    MappingResult,
+    QueryCorrection,
     ScaledPCAProjectionModel,
     SymphonyCorrectionModel,
 )
@@ -22,6 +24,7 @@ from scarf.mapping.symphony import (
     weighted_centroids,
     zero_norm_rows,
 )
+from scarf.storage import ArtifactRef
 
 
 def _single_cluster_reference() -> tuple[
@@ -42,6 +45,154 @@ def _single_cluster_reference() -> tuple[
             sigma=np.array([0.1]),
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"loadings": np.ones(2)}, "two-dimensional"),
+        ({"feature_means": np.ones(3)}, "means have incompatible"),
+        ({"feature_scales": np.ones(3)}, "scales have incompatible"),
+        ({"feature_scales": np.array([1.0, 0.0])}, "scales must be positive"),
+        ({"feature_means": np.array([0.0, np.nan])}, "non-finite"),
+    ],
+)
+def test_scaled_pca_projection_model_rejects_invalid_payloads(overrides, message):
+    values = {
+        "feature_means": np.zeros(2),
+        "feature_scales": np.ones(2),
+        "loadings": np.eye(2),
+    }
+    values.update(overrides)
+
+    with pytest.raises(ValueError, match=message):
+        ScaledPCAProjectionModel(**values)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"centroids": np.ones(2)}, "centroids must be two-dimensional"),
+        ({"raw_centroids": np.ones((2, 2))}, "raw centroids have incompatible"),
+        (
+            {"corrected_centroids": np.ones((2, 2))},
+            "corrected centroids have incompatible",
+        ),
+        ({"cluster_mass": np.array([0.0])}, "cluster masses must be positive"),
+        ({"sigma": np.array([0.0])}, "kernel widths must be positive"),
+        ({"raw_centroids": np.array([[np.nan, 0.0]])}, "non-finite"),
+    ],
+)
+def test_symphony_correction_model_rejects_invalid_payloads(overrides, message):
+    values = {
+        "centroids": np.array([[1.0, 0.0]]),
+        "raw_centroids": np.zeros((1, 2)),
+        "corrected_centroids": np.zeros((1, 2)),
+        "cluster_mass": np.ones(1),
+        "sigma": np.ones(1),
+    }
+    values.update(overrides)
+
+    with pytest.raises(ValueError, match=message):
+        SymphonyCorrectionModel(**values)
+
+
+@pytest.mark.parametrize(
+    ("offsets", "counts", "message"),
+    [
+        (np.zeros((1, 2)), np.zeros((1, 2)), "batch, cluster, and dimension"),
+        (np.zeros((1, 1, 2)), np.zeros((2, 1)), "counts must match"),
+        (
+            np.array([[[np.nan, 0.0]]]),
+            np.zeros((1, 1)),
+            "offsets contain non-finite",
+        ),
+    ],
+)
+def test_query_correction_rejects_invalid_payloads(offsets, counts, message):
+    with pytest.raises(ValueError, match=message):
+        QueryCorrection(offsets, counts)
+
+
+def test_mapping_result_requires_loaded_axes_for_selection_properties():
+    result = MappingResult(
+        ref=ArtifactRef(
+            scope="assay",
+            assay="RNA",
+            kind="projection",
+            artifact_id="a" * 64,
+        ),
+        n_cells=2,
+        correction_method="none",
+        diagnostics={},
+        reference=object(),
+    )
+
+    with pytest.raises(RuntimeError, match="DataStore.get_mapping_result"):
+        result.cell_selection
+    with pytest.raises(RuntimeError, match="DataStore.get_mapping_result"):
+        result.feature_selection
+
+
+def test_symphony_primitives_reject_misaligned_and_nonfinite_inputs():
+    projection, model = _single_cluster_reference()
+    counts, sums = initialize_sufficient_statistics(1, model)
+    correction = QueryCorrection(np.zeros((1, 1, 2)), np.zeros((1, 1)))
+
+    with pytest.raises(ValueError, match="Expected query matrix"):
+        project_pca(np.ones((2, 1)), projection)
+    with pytest.raises(ValueError, match="non-finite"):
+        project_pca(np.array([[np.nan, 0.0]]), projection)
+    with pytest.raises(ValueError, match="incompatible dimensions"):
+        soft_cluster_assignments(np.ones((2, 1)), model)
+    with np.errstate(invalid="ignore"):
+        with pytest.raises(ValueError, match="non-finite"):
+            soft_cluster_assignments(np.array([[np.inf, 0.0]]), model)
+    with pytest.raises(ValueError, match="two-dimensional"):
+        zero_norm_rows(np.ones(2))
+    with pytest.raises(ValueError, match="At least one query batch"):
+        initialize_sufficient_statistics(0, model)
+
+    with pytest.raises(ValueError, match="batch codes must match"):
+        accumulate_sufficient_statistics(
+            counts, sums, np.zeros((2, 2)), np.ones((1, 1)), np.array([0])
+        )
+    with pytest.raises(ValueError, match="Assignment count"):
+        accumulate_sufficient_statistics(
+            counts, sums, np.zeros((1, 2)), np.ones((1, 2)), np.array([0])
+        )
+    with pytest.raises(ValueError, match="out of range"):
+        accumulate_sufficient_statistics(
+            counts, sums, np.zeros((1, 2)), np.ones((1, 1)), np.array([1])
+        )
+    with pytest.raises(ValueError, match="count statistics"):
+        solve_query_correction(np.zeros(1), sums, model)
+    with pytest.raises(ValueError, match="sum statistics"):
+        solve_query_correction(counts, np.zeros((1, 1, 1)), model)
+
+    with pytest.raises(ValueError, match="rows must agree"):
+        apply_query_correction(
+            np.zeros((2, 2)), np.ones((1, 1)), np.array([0]), model, correction
+        )
+    with pytest.raises(ValueError, match="cluster count"):
+        apply_query_correction(
+            np.zeros((1, 2)), np.ones((1, 2)), np.array([0]), model, correction
+        )
+    incompatible = QueryCorrection(np.zeros((1, 1, 3)), np.zeros((1, 1)))
+    with pytest.raises(ValueError, match="reference dimensions"):
+        apply_query_correction(
+            np.zeros((1, 2)), np.ones((1, 1)), np.array([0]), model, incompatible
+        )
+    with pytest.raises(ValueError, match="non-finite coordinates"):
+        apply_query_correction(
+            np.array([[np.nan, 0.0]]),
+            np.ones((1, 1)),
+            np.array([0]),
+            model,
+            correction,
+        )
+    with pytest.raises(ValueError, match="dimensions do not agree"):
+        weighted_centroids(np.zeros((2, 2)), np.ones((2, 3)))
 
 
 def test_scaled_dispersion_reads_one_for_data_matching_the_reference():

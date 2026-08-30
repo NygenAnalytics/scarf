@@ -19,6 +19,7 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage
 from zarr.storage import MemoryStore
 
+import scarf.agent.biological_interpretation as biological_module
 from scarf.agent.biological_interpretation import (
     _SYSTEM_PROMPT,
     BiologicalContext,
@@ -1005,3 +1006,322 @@ def test_integrated_handoff_requires_explicit_marker_assay() -> None:
             tuning_handoff=handoff,
             marker=store.marker,
         )
+
+
+def test_biological_scalar_and_column_validation_edges() -> None:
+    assert biological_module._finite_float(None) is None
+    assert biological_module._finite_float("not-a-number") is None
+    assert biological_module._finite_float(float("nan")) is None
+    assert biological_module._string_value(np.int64(3)) == "3"
+    with pytest.raises(ValueError, match="not present in cell metadata"):
+        biological_module._check_column(FakeStore(), "missing", "sample column")
+
+    tool = SimpleNamespace(name="future_tool")
+    deps = context(FakeStore()).deps
+    assert (
+        biological_module._prepare_biological_interpretation_tool(
+            SimpleNamespace(deps=deps), tool
+        )
+        is tool
+    )
+
+
+def test_cluster_composition_artifact_validation_edges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = FakeStore()
+
+    def run(deps: BiologicalInterpretationDependencies) -> None:
+        asyncio.run(inspect_cluster_composition(SimpleNamespace(deps=deps)))
+
+    deps = context(store).deps
+    deps.cluster = None
+    with pytest.raises(ValueError, match="exact cluster artifact"):
+        run(deps)
+
+    deps = context(store).deps
+    deps.cluster = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="neighbors",
+        artifact_id="1" * 64,
+    )
+    with pytest.raises(ValueError, match="cluster_labels or cluster_cut"):
+        run(deps)
+
+    deps = context(store).deps
+    deps.cluster = ArtifactRef(
+        scope="assay",
+        assay="ADT",
+        kind="cluster_labels",
+        artifact_id="2" * 64,
+    )
+    with pytest.raises(ValueError, match="different assay"):
+        run(deps)
+
+    original_inspect = store.inspect_artifact
+    for status, message in (
+        (SimpleNamespace(exists=False, complete=True, inputs={}), "does not exist"),
+        (SimpleNamespace(exists=True, complete=False, inputs={}), "is incomplete"),
+        (SimpleNamespace(exists=True, complete=True, inputs={}), "no cell-selection"),
+        (
+            SimpleNamespace(
+                exists=True,
+                complete=True,
+                inputs={
+                    "cell_selection": ArtifactRef(
+                        scope="assay",
+                        assay="RNA",
+                        kind="cell_selection",
+                        artifact_id="3" * 64,
+                    ).to_dict()
+                },
+            ),
+            "invalid cell-selection",
+        ),
+    ):
+        monkeypatch.setattr(store, "inspect_artifact", lambda _ref, value=status: value)
+        with pytest.raises(ValueError, match=message):
+            run(context(store).deps)
+    monkeypatch.setattr(store, "inspect_artifact", original_inspect)
+
+    deps = context(store).deps
+    deps.cellSelection = ArtifactRef(
+        scope="datastore",
+        kind="cell_selection",
+        artifact_id="4" * 64,
+    )
+    with pytest.raises(ValueError, match="conflicts with the prepared"):
+        run(deps)
+
+    monkeypatch.setattr(store, "load_artifact", lambda _ref: {})
+    with pytest.raises(ValueError, match="label vector"):
+        run(context(store).deps)
+    monkeypatch.setattr(
+        store,
+        "load_artifact",
+        lambda _ref: {"values": np.asarray([0])},
+    )
+    with pytest.raises(ValueError, match="do not align"):
+        run(context(store).deps)
+    monkeypatch.setattr(
+        store,
+        "load_artifact",
+        lambda _ref: {"values": np.asarray([], dtype=int)},
+    )
+    monkeypatch.setattr(
+        biological_module,
+        "read_stored_selection_indices",
+        lambda *_args, **_kwargs: np.asarray([], dtype=np.int64),
+    )
+    with pytest.raises(ValueError, match="selects no cells"):
+        run(context(store).deps)
+
+
+def test_cluster_composition_metadata_alignment_edges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = FakeStore()
+    original_rows = biological_module.read_metadata_rows
+    original_missing = biological_module.read_metadata_missing_rows
+
+    monkeypatch.setattr(
+        biological_module,
+        "read_metadata_rows",
+        lambda *_args, **_kwargs: np.asarray(["control"]),
+    )
+    with pytest.raises(ValueError, match="condition and cluster"):
+        asyncio.run(inspect_cluster_composition(context(store)))
+
+    monkeypatch.setattr(biological_module, "read_metadata_rows", original_rows)
+    monkeypatch.setattr(
+        biological_module,
+        "read_metadata_missing_rows",
+        lambda *_args, **_kwargs: np.asarray(
+            [True] + [False] * (len(store.cells.cluster_values) - 1)
+        ),
+    )
+    with pytest.raises(ValueError, match="condition column contains missing"):
+        asyncio.run(inspect_cluster_composition(context(store)))
+
+    monkeypatch.setattr(
+        biological_module, "read_metadata_missing_rows", original_missing
+    )
+
+    def sample_misaligned(
+        table: object, column: str, indices: np.ndarray
+    ) -> np.ndarray:
+        values = original_rows(table, column, indices)
+        return values[:-1] if column == "sample" else values
+
+    monkeypatch.setattr(biological_module, "read_metadata_rows", sample_misaligned)
+    with pytest.raises(ValueError, match="sample and cluster"):
+        asyncio.run(inspect_cluster_composition(context(store)))
+
+    monkeypatch.setattr(biological_module, "read_metadata_rows", original_rows)
+
+    def sample_missing(_table: object, column: str, indices: np.ndarray) -> np.ndarray:
+        if column == "sample":
+            return np.asarray([True] + [False] * (len(indices) - 1))
+        return np.zeros(len(indices), dtype=bool)
+
+    monkeypatch.setattr(biological_module, "read_metadata_missing_rows", sample_missing)
+    with pytest.raises(ValueError, match="sample column contains missing"):
+        asyncio.run(inspect_cluster_composition(context(store)))
+
+
+def test_marker_tool_validation_and_batch_edges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = FakeStore()
+    unprepared = context(store)
+    with pytest.raises(ModelRetry, match="composition"):
+        asyncio.run(inspect_cluster_markers(unprepared, "0"))
+    with pytest.raises(ModelRetry, match="composition"):
+        asyncio.run(inspect_cluster_markers_batch(unprepared, ["0"]))
+
+    prepared = context(store)
+    asyncio.run(inspect_cluster_composition(prepared))
+    with pytest.raises(ModelRetry, match="must be one of"):
+        asyncio.run(inspect_cluster_markers(prepared, "missing"))
+
+    prepared.deps.marker = None
+    prepared.deps.allowMarkerSearch = False
+    unavailable = asyncio.run(inspect_cluster_markers(prepared, "0"))
+    assert not unavailable.evidenceId
+
+    prepared.deps.allowMarkerSearch = True
+    prepared.deps.markerFeatures = None
+    missing_features = asyncio.run(inspect_cluster_markers(prepared, "0"))
+    assert "exact feature selection" in missing_features.warnings[0]
+
+    prepared.deps.markerFeatures = store.marker_features
+    monkeypatch.setattr(store, "run_marker_search", lambda *_args, **_kwargs: object())
+    with pytest.raises(RuntimeError, match="artifact reference"):
+        asyncio.run(inspect_cluster_markers(prepared, "0"))
+
+    for marker, message in (
+        (
+            ArtifactRef(
+                scope="assay",
+                assay="RNA",
+                kind="neighbors",
+                artifact_id="5" * 64,
+            ),
+            "marker_table",
+        ),
+        (
+            ArtifactRef(
+                scope="assay",
+                assay="ADT",
+                kind="marker_table",
+                artifact_id="6" * 64,
+            ),
+            "different assay",
+        ),
+    ):
+        prepared.deps.marker = marker
+        with pytest.raises(ModelRetry, match=message):
+            asyncio.run(inspect_cluster_markers(prepared, "0"))
+
+    prepared.deps.marker = store.marker
+    original_inspect = store.inspect_artifact
+    for status, message in (
+        (SimpleNamespace(exists=False, complete=True, inputs={}), "does not exist"),
+        (SimpleNamespace(exists=True, complete=False, inputs={}), "is incomplete"),
+    ):
+        monkeypatch.setattr(store, "inspect_artifact", lambda _ref, value=status: value)
+        with pytest.raises(ModelRetry, match=message):
+            asyncio.run(inspect_cluster_markers(prepared, "0"))
+    monkeypatch.setattr(store, "inspect_artifact", original_inspect)
+
+    with pytest.raises(ModelRetry, match="at least one"):
+        asyncio.run(inspect_cluster_markers_batch(prepared, []))
+    prepared.deps.maxClusters = 1
+    with pytest.raises(ModelRetry, match="at most"):
+        asyncio.run(inspect_cluster_markers_batch(prepared, ["0", "1"]))
+    prepared.deps.maxClusters = 4
+    with pytest.raises(ModelRetry, match="duplicates"):
+        asyncio.run(inspect_cluster_markers_batch(prepared, ["0", "0"]))
+
+
+def test_treatment_observation_validation_edges() -> None:
+    store = FakeStore(replicated=True)
+    deps = context(store).deps
+    deps.clusterValues = {"0": 0}
+    control = ConditionClusterSummary(
+        condition="control",
+        clusterId="0",
+        nSamples=2,
+        meanFraction=0.5,
+        minFraction=0.5,
+        maxFraction=0.5,
+        cellCount=4,
+        evidenceId="control:0",
+    )
+    treated = control.model_copy(
+        update={"condition": "treated", "evidenceId": "treated:0"}
+    )
+    deps.conditionEvidence = {
+        control.evidenceId: control,
+        treated.evidenceId: treated,
+    }
+    deps.evidenceIds = set(deps.conditionEvidence)
+    observation = TreatmentObservation(
+        clusterId="0",
+        referenceCondition="control",
+        comparisonCondition="treated",
+        direction="equal",
+        evidenceIds=[control.evidenceId, treated.evidenceId],
+    )
+
+    def report(value: TreatmentObservation) -> BiologicalInterpretationReport:
+        return BiologicalInterpretationReport(
+            status="needsInput",
+            treatmentObservations=[value],
+        )
+
+    without_condition = deps.model_copy(update={"conditionColumn": None})
+    with pytest.raises(ModelRetry, match="condition column"):
+        biological_module._canonicalize_treatment_observations(
+            report(observation), without_condition
+        )
+    with pytest.raises(ModelRetry, match="remain descriptive"):
+        biological_module._canonicalize_treatment_observations(
+            report(observation.model_copy(update={"isDescriptiveOnly": False})),
+            deps,
+        )
+    with pytest.raises(ModelRetry, match="exactly two distinct"):
+        biological_module._canonicalize_treatment_observations(
+            report(
+                observation.model_copy(
+                    update={"evidenceIds": [control.evidenceId, control.evidenceId]}
+                )
+            ),
+            deps,
+        )
+    with pytest.raises(ModelRetry, match="condition composition evidence"):
+        biological_module._canonicalize_treatment_observations(
+            report(
+                observation.model_copy(
+                    update={"evidenceIds": [control.evidenceId, "unknown"]}
+                )
+            ),
+            deps,
+        )
+    with pytest.raises(ModelRetry, match="distinct named conditions"):
+        biological_module._canonicalize_treatment_observations(
+            report(observation.model_copy(update={"comparisonCondition": "control"})),
+            deps,
+        )
+    canonical = biological_module._canonicalize_treatment_observations(
+        report(observation), deps
+    )
+    assert "equal mean independent-unit fractions" in canonical[0].observation
+
+    higher = treated.model_copy(update={"meanFraction": 0.75})
+    deps.conditionEvidence[treated.evidenceId] = higher
+    canonical = biological_module._canonicalize_treatment_observations(
+        report(observation.model_copy(update={"direction": "higher"})), deps
+    )
+    assert "higher mean independent-unit fraction" in canonical[0].observation

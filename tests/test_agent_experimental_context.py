@@ -7,6 +7,7 @@ from typing import Any, Literal
 import numpy as np
 import pytest
 import zarr
+from pydantic import ValidationError
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -14,6 +15,7 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage
 from zarr.storage import MemoryStore
 
+import scarf.agent.experimental_context as experimental_context_module
 from scarf.agent.experimental_context import (
     BatchCorrectionPlan,
     BatchSafetyEvidence,
@@ -1304,3 +1306,771 @@ def test_returned_decision_canonicalizes_caller_directions() -> None:
         observationUnit="sample",
         independentUnit="donor",
     )
+
+
+def test_named_artifact_and_qc_source_validation_edges() -> None:
+    metric = NamedArtifactSource.get_example()
+    identity = NamedArtifactSource(
+        name="HTO_identity",
+        artifact=ArtifactReferenceModel(
+            assay="HTO",
+            kind="hto_identity",
+            artifactId="2" * 64,
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="surrounding whitespace"):
+        NamedArtifactSource(
+            name=" metric ",
+            artifact=metric.artifact,
+        )
+    with pytest.raises(ValidationError, match="requires both name and artifact"):
+        NamedArtifactSource(name="metric")
+    with pytest.raises(ValidationError, match="requires both name and artifact"):
+        NamedArtifactSource(artifact=metric.artifact)
+
+    validate = experimental_context_module._validate_qc_sources
+    with pytest.raises(ValueError, match="metadata attributes must be unique"):
+        validate(
+            action="globalGaussian",
+            attributes=["a", "a"],
+            artifact_metrics=[],
+            sample_column=None,
+            sample_artifact=None,
+        )
+    with pytest.raises(ValueError, match="cannot be blank"):
+        validate(
+            action="globalGaussian",
+            attributes=[" a "],
+            artifact_metrics=[],
+            sample_column=None,
+            sample_artifact=None,
+        )
+    with pytest.raises(ValueError, match="artifact metric names must be unique"):
+        validate(
+            action="globalGaussian",
+            attributes=[],
+            artifact_metrics=[metric, metric],
+            sample_column=None,
+            sample_artifact=None,
+        )
+    with pytest.raises(ValueError, match="quality_metric"):
+        validate(
+            action="globalGaussian",
+            attributes=[],
+            artifact_metrics=[identity],
+            sample_column=None,
+            sample_artifact=None,
+        )
+    with pytest.raises(ValueError, match="names collide"):
+        validate(
+            action="globalGaussian",
+            attributes=[metric.name],
+            artifact_metrics=[metric],
+            sample_column=None,
+            sample_artifact=None,
+        )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        validate(
+            action="sampleMad",
+            attributes=["metric"],
+            artifact_metrics=[],
+            sample_column="sample",
+            sample_artifact=identity,
+        )
+    with pytest.raises(ValueError, match="sampleColumn cannot be blank"):
+        validate(
+            action="sampleMad",
+            attributes=["metric"],
+            artifact_metrics=[],
+            sample_column=" sample ",
+            sample_artifact=None,
+        )
+    with pytest.raises(ValueError, match="must reference an hto_identity"):
+        validate(
+            action="sampleMad",
+            attributes=["metric"],
+            artifact_metrics=[],
+            sample_column=None,
+            sample_artifact=metric,
+        )
+    colliding_identity = identity.model_copy(update={"name": metric.name})
+    with pytest.raises(ValueError, match="sample and metric artifact names"):
+        validate(
+            action="sampleMad",
+            attributes=[],
+            artifact_metrics=[metric],
+            sample_column=None,
+            sample_artifact=colliding_identity,
+        )
+    with pytest.raises(ValueError, match="skip cannot include"):
+        validate(
+            action="skip",
+            attributes=["metric"],
+            artifact_metrics=[],
+            sample_column=None,
+            sample_artifact=None,
+        )
+    with pytest.raises(ValueError, match="requires at least one metric"):
+        validate(
+            action="globalGaussian",
+            attributes=[],
+            artifact_metrics=[],
+            sample_column=None,
+            sample_artifact=None,
+        )
+    with pytest.raises(ValueError, match="requires exactly one"):
+        validate(
+            action="sampleMad",
+            attributes=["metric"],
+            artifact_metrics=[],
+            sample_column=None,
+            sample_artifact=None,
+        )
+    with pytest.raises(ValueError, match="Only sampleMad"):
+        validate(
+            action="globalGaussian",
+            attributes=["metric"],
+            artifact_metrics=[],
+            sample_column="sample",
+            sample_artifact=None,
+        )
+
+
+def test_experimental_handoff_validation_edges() -> None:
+    result = ExperimentalContextResult.get_example()
+    without_selection = result.model_copy(update={"cellSelection": None})
+    with pytest.raises(ValueError, match="lacks a cell selection"):
+        without_selection.to_parameter_tuning_handoff()
+    with pytest.raises(ValueError, match="lacks a cell selection"):
+        without_selection.to_biological_handoff()
+
+    with pytest.raises(ValueError, match="lacks exact batch safety"):
+        result.model_copy(update={"batchSafety": []}).to_parameter_tuning_handoff()
+
+    plan = result.decision.batchCorrection
+    uncited_plan = plan.model_copy(
+        update={
+            "evidenceIds": [
+                value
+                for value in plan.evidenceIds
+                if not value.startswith("batchEstimability:")
+            ]
+        }
+    )
+    with pytest.raises(ValueError, match="does not cite"):
+        result.model_copy(
+            update={
+                "decision": result.decision.model_copy(
+                    update={"batchCorrection": uncited_plan}
+                )
+            }
+        ).to_parameter_tuning_handoff()
+
+    unsafe_safety = result.batchSafety[0].model_copy(update={"status": "unsafe"})
+    with pytest.raises(ValueError, match="non-safe"):
+        result.model_copy(
+            update={"batchSafety": [unsafe_safety]}
+        ).to_parameter_tuning_handoff()
+
+    unsafe_plan = plan.model_copy(update={"action": "unsafe"})
+    with pytest.raises(ValueError, match="lacks exact unsafe"):
+        result.model_copy(
+            update={
+                "decision": result.decision.model_copy(
+                    update={"batchCorrection": unsafe_plan}
+                )
+            }
+        ).to_parameter_tuning_handoff()
+
+    with pytest.raises(ValueError, match="must be done"):
+        result.model_copy(update={"status": "failed"}).to_biological_handoff()
+    with pytest.raises(ValueError, match="Unknown coefficient"):
+        result.to_biological_handoff("unknown")
+    with pytest.raises(ValueError, match="Missing characterization"):
+        result.model_copy(
+            update={
+                "characterization": result.characterization.model_copy(
+                    update={"coefficients": []}
+                )
+            }
+        ).to_biological_handoff("treatment")
+
+
+def test_experimental_context_private_input_guards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _Store()
+    deps = _context(
+        store,
+        directions={
+            "htoIdentityColumns": ["sample", "missing"],
+            "htoIdentityColumn": "donor",
+        },
+    ).deps
+    assert experimental_context_module._hto_identity_columns(deps) == [
+        "sample",
+        "donor",
+    ]
+
+    unknown_tool = SimpleNamespace(name="future_tool")
+    assert (
+        experimental_context_module._prepare_experimental_context_tool(
+            SimpleNamespace(deps=deps),
+            unknown_tool,
+        )
+        is unknown_tool
+    )
+    characterization = CovariateCharacterization(
+        status="done",
+        confounding=[{"coefficient": 3, "pairs": []}],
+    )
+    assert (
+        experimental_context_module.characterization_evidence(characterization) == set()
+    )
+
+    deps.cellSelection = None
+    with pytest.raises(ValueError, match="exact artifact"):
+        experimental_context_module._cell_selection_ref(deps)
+    deps.cellSelection = _artifact_ref = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="cell_selection",
+        artifact_id="4" * 64,
+    )
+    with pytest.raises(ValueError, match="datastore cell selection"):
+        experimental_context_module._cell_selection_ref(deps)
+    del _artifact_ref
+
+    with pytest.raises(TypeError, match="NamedArtifactSource"):
+        experimental_context_module._source_ref(
+            object(),
+            expected_kind="quality_metric",
+        )
+    blank_source = NamedArtifactSource.model_construct(
+        name="",
+        artifact=ArtifactReferenceModel(),
+    )
+    with pytest.raises(ValueError, match="non-empty semantic name"):
+        experimental_context_module._source_ref(
+            blank_source,
+            expected_kind="quality_metric",
+        )
+    with pytest.raises(ValueError, match="quality_metric"):
+        experimental_context_module._source_ref(
+            NamedArtifactSource(
+                name="identity",
+                artifact=ArtifactReferenceModel(
+                    assay="HTO",
+                    kind="hto_identity",
+                    artifactId="5" * 64,
+                ),
+            ),
+            expected_kind="quality_metric",
+        )
+
+    duplicate = NamedArtifactSource(
+        name="identity",
+        artifact=ArtifactReferenceModel(
+            assay="HTO",
+            kind="hto_identity",
+            artifactId="6" * 64,
+        ),
+    )
+    deps.htoIdentityArtifacts = [duplicate, duplicate]
+    with pytest.raises(ValueError, match="names must be unique"):
+        experimental_context_module._hto_artifact_map(deps)
+
+    deps.cellSelection = store.cell_selection
+    monkeypatch.setattr(
+        experimental_context_module,
+        "read_stored_selection_mask",
+        lambda *_args, **_kwargs: np.ones(store.cells.N + 1, dtype=bool),
+    )
+    with pytest.raises(ValueError, match="aligned boolean selection"):
+        experimental_context_module._active_cell_count(deps)
+
+
+def test_qc_profile_degradation_and_selection_guards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _Store()
+    context = _context(store)
+    deps = context.deps
+    active = np.ones(store.cells.N, dtype=bool)
+    notes: list[str] = []
+    profile = experimental_context_module._global_qc_profile(
+        deps,
+        ("RNA", "RNA"),
+        active,
+        store.cells.N,
+        {"constant": np.ones(store.cells.N)},
+        ["constant"],
+        [],
+        notes,
+    )
+    assert profile is None
+    assert notes == ["Ignored constant QC metric 'constant'"]
+
+    monkeypatch.setattr(
+        experimental_context_module,
+        "gaussian_quantile_bounds",
+        lambda *_args, **_kwargs: (float("nan"), float("nan")),
+    )
+    notes = []
+    profile = experimental_context_module._global_qc_profile(
+        deps,
+        ("RNA", "RNA"),
+        active,
+        store.cells.N,
+        {"metric": np.arange(store.cells.N, dtype=float)},
+        ["metric"],
+        [],
+        notes,
+    )
+    assert profile is None
+    assert "non-finite Gaussian bounds" in notes[0]
+
+    skip = CellQcProfileEvidence(
+        profileId="skip",
+        action="skip",
+        activeCells=store.cells.N,
+        retainedCells=store.cells.N,
+        retainedFraction=1.0,
+        evidenceId="qcProfile:skip",
+    )
+    global_profile = CellQcProfileEvidence(
+        profileId="global",
+        action="globalGaussian",
+        driverAssay="RNA",
+        driverAssayType="RNA",
+        attributes=["RNA_nCounts"],
+        activeCells=store.cells.N,
+        retainedCells=store.cells.N - 1,
+        retainedFraction=(store.cells.N - 1) / store.cells.N,
+        evidenceId="qcProfile:global",
+    )
+    deps.qcProfiles = {"skip": skip, "global": global_profile}
+    characterization = CovariateCharacterization(status="done")
+
+    deps.directions = {"cellQc": {"profileId": 3}}
+    with pytest.raises(ModelRetry, match="profileId direction must be a string"):
+        experimental_context_module._canonical_cell_qc_plan(
+            CellQcPlan(), deps, characterization
+        )
+    deps.directions = {
+        "cellQc": {"sampleColumn": "sample", "sampleArtifactName": "identity"}
+    }
+    with pytest.raises(ModelRetry, match="cannot select both"):
+        experimental_context_module._canonical_cell_qc_plan(
+            CellQcPlan(), deps, characterization
+        )
+    deps.directions = {"cellQc": {"sampleArtifactName": 3}}
+    with pytest.raises(ModelRetry, match="sampleArtifactName must be a string"):
+        experimental_context_module._canonical_cell_qc_plan(
+            CellQcPlan(), deps, characterization
+        )
+    deps.directions = {"cellQc": {"action": "unknown"}}
+    with pytest.raises(ModelRetry, match="Unsupported cellQc.action"):
+        experimental_context_module._canonical_cell_qc_plan(
+            CellQcPlan(), deps, characterization
+        )
+    deps.directions = {"cellQc": {"action": "sampleMad"}}
+    with pytest.raises(ModelRetry, match="exactly one offered profile"):
+        experimental_context_module._canonical_cell_qc_plan(
+            CellQcPlan(), deps, characterization
+        )
+    deps.directions = {"cellQc": {"profileId": "unknown"}}
+    with pytest.raises(ModelRetry, match="was not offered"):
+        experimental_context_module._canonical_cell_qc_plan(
+            CellQcPlan(), deps, characterization
+        )
+
+    deps.directions = {}
+    selected = experimental_context_module._canonical_cell_qc_plan(
+        CellQcPlan(), deps, characterization
+    )
+    assert selected.profileId == "global"
+
+    mismatched = CellQcPlan(
+        action="globalGaussian",
+        profileId="global",
+        driverAssay="RNA",
+        driverAssayType="RNA",
+        attributes=["different_metric"],
+        evidenceIds=["qcProfile:global"],
+    )
+    with pytest.raises(ModelRetry, match="copy the selected offered profile"):
+        experimental_context_module._canonical_cell_qc_plan(
+            mismatched, deps, characterization
+        )
+    missing_evidence = mismatched.model_copy(
+        update={"attributes": ["RNA_nCounts"], "evidenceIds": []}
+    )
+    with pytest.raises(ModelRetry, match="cite its exact profile"):
+        experimental_context_module._canonical_cell_qc_plan(
+            missing_evidence, deps, characterization
+        )
+
+
+def test_design_analysis_rejects_invalid_batch_proposals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _Store()
+    decision = _design_decision()
+
+    for batch_columns, message in (
+        (["batch", "batch"], "must be unique"),
+        (["unknown"], "Unknown batch column"),
+        (["disease"], "classified as technical"),
+        (["sequencing_depth"], "categorical for Harmony"),
+    ):
+        context = _context(store)
+        with pytest.raises(ModelRetry, match=message):
+            asyncio.run(
+                analyze_experimental_design(
+                    context,
+                    column_domains=decision.columnDomains,
+                    coefficients_of_interest=decision.coefficientsOfInterest,
+                    units_of_inference=decision.unitsOfInference,
+                    batch_columns=batch_columns,
+                )
+            )
+
+    failed = CovariateCharacterization(
+        status="failed",
+        notes=["design failed"],
+    )
+    monkeypatch.setattr(
+        experimental_context_module,
+        "characterize_covariates",
+        lambda *_args, **_kwargs: failed,
+    )
+    with pytest.raises(ModelRetry, match="design failed"):
+        asyncio.run(
+            analyze_experimental_design(
+                _context(store),
+                column_domains={},
+                coefficients_of_interest=[],
+                units_of_inference={},
+            )
+        )
+
+
+def test_design_analysis_records_not_computed_estimability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _Store()
+    decision = _design_decision()
+    context = _context(store)
+    unresolved = asyncio.run(
+        analyze_experimental_design(
+            context,
+            column_domains=decision.columnDomains,
+            coefficients_of_interest=decision.coefficientsOfInterest,
+            units_of_inference={},
+            batch_columns=["batch"],
+        )
+    )
+    assert unresolved.batchSafety[0].status == "notComputed"
+    assert unresolved.batchSafety[0].estimability["reason"] == (
+        "unresolvedCoefficientDesign"
+    )
+
+    monkeypatch.setattr(
+        experimental_context_module,
+        "reduce_observation_units",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("bad design")),
+    )
+    context = _context(store)
+    failed = asyncio.run(
+        analyze_experimental_design(
+            context,
+            column_domains=decision.columnDomains,
+            coefficients_of_interest=decision.coefficientsOfInterest,
+            units_of_inference=decision.unitsOfInference,
+            batch_columns=["batch"],
+        )
+    )
+    assert failed.batchSafety[0].status == "notComputed"
+    assert failed.batchSafety[0].estimability["reason"] == "ValueError"
+
+
+def test_representation_scoring_input_and_metric_failure_edges() -> None:
+    context = _context(_Store())
+    with pytest.raises(ModelRetry, match="Unknown batch column"):
+        asyncio.run(score_current_representation(context, batch_column="unknown"))
+    with pytest.raises(ModelRetry, match="Unknown biological column"):
+        asyncio.run(
+            score_current_representation(
+                context,
+                batch_column="batch",
+                biological_column="unknown",
+            )
+        )
+
+    context.deps.neighbors = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="reduction",
+        artifact_id="7" * 64,
+    )
+    with pytest.raises(ModelRetry, match="exact neighbors"):
+        asyncio.run(score_current_representation(context, batch_column="batch"))
+
+    context.deps.neighbors = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="neighbors",
+        artifact_id="8" * 64,
+    )
+    context.deps.connectivityMap = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="reduction",
+        artifact_id="9" * 64,
+    )
+    with pytest.raises(ModelRetry, match="exact connectivity graph"):
+        asyncio.run(score_current_representation(context, batch_column="batch"))
+
+    class FailingMetricStore(_MetricStore):
+        def metric_ilisi(self, *_args: Any, **_kwargs: Any) -> float:
+            raise ValueError("ilisi unavailable")
+
+        def metric_proportional_batch_mixing(
+            self, *_args: Any, **_kwargs: Any
+        ) -> float:
+            raise RuntimeError("mixing unavailable")
+
+        def metric_clisi(self, *_args: Any, **_kwargs: Any) -> float:
+            raise KeyError("clisi unavailable")
+
+        def metric_graph_connectivity(self, *_args: Any, **_kwargs: Any) -> float:
+            raise TypeError("connectivity unavailable")
+
+    store = FailingMetricStore()
+    cell_selection, neighbors, connectivity = _configure_graph_lineage(store)
+    context = _context(
+        store,
+        cell_selection=cell_selection,
+        neighbors=neighbors,
+        connectivity_map=connectivity,
+    )
+    evaluation = asyncio.run(
+        score_current_representation(
+            context,
+            batch_column="batch",
+            biological_column="cell_type",
+        )
+    )
+    assert not evaluation.available
+    assert len(evaluation.notes) == 4
+
+
+def test_batch_correction_plan_validation_edges() -> None:
+    store = _Store()
+    context = _context(store)
+    decision = _design_decision(action="unsafe")
+    asyncio.run(inspect_cell_covariates(context))
+    asyncio.run(
+        analyze_experimental_design(
+            context,
+            column_domains=decision.columnDomains,
+            coefficients_of_interest=decision.coefficientsOfInterest,
+            units_of_inference=decision.unitsOfInference,
+            batch_columns=decision.batchCorrection.batchColumns,
+        )
+    )
+    characterization = context.deps.characterization
+    assert characterization is not None
+    records = {
+        record["name"]: dict(record)
+        for record in characterization.columns
+        if isinstance(record.get("name"), str)
+    }
+    coefficient_records = {
+        record["name"]: dict(record)
+        for record in characterization.coefficients
+        if isinstance(record.get("name"), str)
+    }
+    units = {
+        name: value.model_dump(exclude_none=True)
+        for name, value in decision.unitsOfInference.items()
+    }
+
+    def validate(
+        candidate: ExperimentalContextDecision,
+        *,
+        deps: ExperimentalContextDependencies | None = None,
+        candidate_records: dict[str, dict[str, Any]] | None = None,
+        candidate_coefficients: dict[str, dict[str, Any]] | None = None,
+        requested: set[str] | None = None,
+    ) -> None:
+        experimental_context_module._validate_batch_correction_plan(
+            candidate,
+            deps or context.deps,
+            characterization,
+            requested if requested is not None else {"disease"},
+            units,
+            candidate.cellQc,
+            candidate_records or records,
+            candidate_coefficients or coefficient_records,
+        )
+
+    validate(decision)
+
+    def changed_plan(**updates: Any) -> ExperimentalContextDecision:
+        return decision.model_copy(
+            update={
+                "batchCorrection": decision.batchCorrection.model_copy(update=updates)
+            }
+        )
+
+    cases: list[tuple[ExperimentalContextDecision, str]] = [
+        (
+            decision.model_copy(
+                update={
+                    "columnDomains": {**decision.columnDomains, "ghost": "technical"}
+                }
+            ),
+            "Unknown column domain",
+        ),
+        (changed_plan(action="evaluateHarmony", batchColumns=[]), "at least one"),
+        (changed_plan(action="unsafe", batchColumns=[]), "exact batch columns"),
+        (changed_plan(action="skip", batchColumns=["batch"]), "must not include"),
+        (
+            changed_plan(action="needsInput", batchColumns=[]).model_copy(
+                update={"needsInput": []}
+            ),
+            "concrete question",
+        ),
+        (changed_plan(batchColumns=["batch", "batch"]), "must be unique"),
+        (changed_plan(batchColumns=["ghost"]), "Unknown batch column"),
+        (changed_plan(batchColumns=["disease"]), "classified as technical"),
+        (
+            changed_plan(batchColumns=["sequencing_depth"]),
+            "must be categorical",
+        ),
+        (
+            changed_plan(
+                action="evaluateHarmony",
+                metricsRequired=["cLISI"],
+            ),
+            "requires iLISI",
+        ),
+        (
+            changed_plan(
+                action="evaluateHarmony",
+                metricsRequired=["iLISI"],
+            ),
+            "requires cLISI",
+        ),
+        (
+            changed_plan(
+                action="evaluateHarmony",
+                preserveColumns=[],
+                metricsRequired=["iLISI", "cLISI"],
+            ),
+            "preserveColumns must include",
+        ),
+        (
+            changed_plan(
+                action="evaluateHarmony",
+                preserveColumns=["disease", "ghost"],
+                metricsRequired=["iLISI", "cLISI"],
+            ),
+            "Unknown preservation column",
+        ),
+    ]
+    for candidate, message in cases:
+        with pytest.raises(ModelRetry, match=message):
+            validate(candidate)
+
+    batch_is_coefficient_records = {**records, "batch": dict(records["batch"])}
+    with pytest.raises(ModelRetry, match="cannot be a coefficient"):
+        validate(
+            decision,
+            candidate_records=batch_is_coefficient_records,
+            requested={"batch"},
+        )
+
+    unresolved = {name: dict(value) for name, value in coefficient_records.items()}
+    unresolved["disease"]["scope"] = "unresolvedUnit"
+    with pytest.raises(ModelRetry, match="between-unit coefficient"):
+        validate(
+            changed_plan(action="evaluateHarmony"),
+            candidate_coefficients=unresolved,
+        )
+
+    continuous_records = {
+        **records,
+        "continuous_biology": {
+            "name": "continuous_biology",
+            "domain": "biological",
+            "kind": "continuous",
+        },
+    }
+    with pytest.raises(ModelRetry, match="must be categorical"):
+        validate(
+            changed_plan(
+                action="evaluateHarmony",
+                preserveColumns=["disease", "continuous_biology"],
+            ),
+            candidate_records=continuous_records,
+        )
+
+    safety = next(iter(context.deps.batchSafety.values()))
+    missing_evidence = changed_plan(
+        action="evaluateHarmony",
+        evidenceIds=[
+            value
+            for value in decision.batchCorrection.evidenceIds
+            if value != safety.evidenceId
+        ],
+    )
+    with pytest.raises(ModelRetry, match="must cite exact batch"):
+        validate(missing_evidence)
+
+    not_computed_deps = context.deps.model_copy(
+        update={
+            "batchSafety": {
+                safety.evidenceId: safety.model_copy(update={"status": "notComputed"})
+            }
+        }
+    )
+    with pytest.raises(ModelRetry, match="could not be computed"):
+        validate(changed_plan(action="evaluateHarmony"), deps=not_computed_deps)
+
+    safe_deps = context.deps.model_copy(
+        update={
+            "batchSafety": {
+                safety.evidenceId: safety.model_copy(update={"status": "safe"})
+            }
+        }
+    )
+    with pytest.raises(ModelRetry, match="use action='evaluateHarmony'"):
+        validate(decision, deps=safe_deps)
+
+    unknown_evidence = changed_plan(
+        action="skip",
+        batchColumns=[],
+        evidenceIds=["unknown:evidence"],
+    )
+    with pytest.raises(ModelRetry, match="Unknown evidence IDs"):
+        validate(unknown_evidence)
+
+    no_evidence = changed_plan(action="skip", batchColumns=[], evidenceIds=[])
+    with pytest.raises(ModelRetry, match="require evidence IDs"):
+        validate(no_evidence)
+
+    stale_id = "metric:iLISI:batch:stale"
+    stale_deps = context.deps.model_copy(
+        update={"evidenceIds": {*context.deps.evidenceIds, stale_id}}
+    )
+    stale = changed_plan(
+        action="skip",
+        batchColumns=[],
+        evidenceIds=[stale_id],
+    )
+    with pytest.raises(ModelRetry, match="returned exact representation"):
+        validate(stale, deps=stale_deps)

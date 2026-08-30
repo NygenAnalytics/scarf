@@ -264,6 +264,60 @@ def test_plotting_contracts_reject_invalid_values():
         splt.CellField("group", kind="ordinal")
 
 
+@pytest.mark.parametrize(
+    ("factory", "kwargs", "message"),
+    [
+        (splt.ColorScale, {"vmin": 0, "vcenter": 2, "vmax": 1}, "vcenter"),
+        (splt.ColorScale, {"scope": "global"}, "scope"),
+        (splt.ColorScale, {"scale": "sqrt"}, "scale"),
+        (splt.CategoricalScale, {"palette_name": "pastel"}, "palette_name"),
+        (splt.DensityOverlay, {"kind": "dots"}, "kind"),
+        (splt.DensityOverlay, {"statistic": "median"}, "statistic"),
+        (splt.DensityOverlay, {"pixels": 15}, "pixels"),
+        (splt.DensityOverlay, {"sigma": -1}, "sigma"),
+        (splt.DensityOverlay, {"min_support": 0}, "min_support"),
+        (splt.DensityOverlay, {"levels": 0}, "levels"),
+        (splt.DensityOverlay, {"levels": (0.2, np.nan)}, "levels"),
+        (splt.DensityOverlay, {"groups": ("a",)}, "groups requires"),
+        (splt.DensityOverlay, {"alpha": 2}, "alpha"),
+        (splt.DensityOverlay, {"linewidth": -1}, "linewidth"),
+        (splt.DensityOverlay, {"halo_width": -1}, "halo_width"),
+        (splt.Highlight, {}, "exactly one"),
+        (splt.Highlight, {"by": ""}, "by must be non-empty"),
+        (splt.Highlight, {"indices": (-1,)}, "indices must be non-negative"),
+        (splt.Highlight, {"indices": (1,), "groups": ("a",)}, "groups requires"),
+        (splt.Highlight, {"indices": (1,), "alpha": 2}, "alpha values"),
+        (splt.Highlight, {"indices": (1,), "size_multiplier": 0}, "positive"),
+        (splt.Highlight, {"indices": (1,), "halo_width": -1}, "halo_width"),
+    ],
+)
+def test_plotting_contracts_cover_each_validation_invariant(factory, kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        factory(**kwargs)
+
+
+def test_size_scale_with_degenerate_domain_uses_the_minimum_area():
+    scale = splt.SizeScale(vmin=2.0, vmax=2.0, size_min=7.0, size_max=20.0)
+
+    np.testing.assert_array_equal(scale.areas(np.array([1.0, 2.0, 3.0])), 7.0)
+
+
+def test_plot_provenance_falls_back_when_distribution_metadata_is_unavailable(
+    monkeypatch,
+):
+    from scarf.plotting import _contracts
+
+    _contracts.installed_scarf_version.cache_clear()
+    monkeypatch.setattr(
+        _contracts,
+        "version",
+        lambda _name: (_ for _ in ()).throw(LookupError("missing metadata")),
+    )
+
+    assert _contracts.installed_scarf_version() == "unknown"
+    _contracts.installed_scarf_version.cache_clear()
+
+
 def test_equal_weight_sample_aggregation_fixture():
     """Two samples of very different size must weight equally."""
     ps = pd.DataFrame(

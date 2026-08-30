@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import scarf.embeddings as embeddings
 import scarf.embeddings.harmony as harmony
@@ -71,6 +72,141 @@ def test_run_harmony_resolves_fit_through_public_facade(monkeypatch):
 
     assert actual is corrected
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("values", "metadata", "kwargs", "message"),
+    [
+        (np.zeros(4), pd.DataFrame({"batch": ["a"] * 4}), {}, "two-dimensional"),
+        (
+            np.zeros((2, 3)),
+            pd.DataFrame({"batch": ["a"] * 4}),
+            {},
+            "metadata rows",
+        ),
+        (
+            np.zeros((2, 1)),
+            pd.DataFrame({"batch": ["a"]}),
+            {},
+            "at least two cells",
+        ),
+        (
+            np.zeros((2, 4)),
+            pd.DataFrame(index=range(4)),
+            {},
+            "at least one batch metadata column",
+        ),
+        (
+            np.zeros((2, 4)),
+            pd.DataFrame(
+                np.array([["a", "x"], ["b", "y"], ["a", "x"], ["b", "y"]]),
+                columns=["batch", "batch"],
+            ),
+            {},
+            "column names must be unique",
+        ),
+        (
+            np.zeros((2, 4)),
+            pd.DataFrame({"batch": ["a", None, "a", "b"]}),
+            {},
+            "cannot contain missing",
+        ),
+        (
+            np.array([[0.0, np.inf, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]]),
+            pd.DataFrame({"batch": ["a", "b", "a", "b"]}),
+            {},
+            "contains non-finite",
+        ),
+        (
+            np.zeros((2, 4)),
+            pd.DataFrame({"batch": ["a", "b", "a", "b"]}),
+            {"nclust": 0},
+            "nclust must be between",
+        ),
+        (
+            np.zeros((2, 4)),
+            pd.DataFrame({"batch": ["a", "b", "a", "b"]}),
+            {"nclust": 2, "sigma": np.ones(3)},
+            "sigma must be scalar",
+        ),
+        (
+            np.zeros((2, 4)),
+            pd.DataFrame({"batch": ["a", "b", "a", "b"]}),
+            {"nclust": 2, "sigma": 0.0},
+            "sigma values must be finite and positive",
+        ),
+        (
+            np.zeros((2, 4)),
+            pd.DataFrame({"batch": ["a", "b", "a", "b"]}),
+            {"nclust": 2, "theta": [1.0, 2.0, 3.0]},
+            "Each Harmony batch level must have a theta",
+        ),
+        (
+            np.zeros((2, 4)),
+            pd.DataFrame({"batch": ["a", "b", "a", "b"]}),
+            {"nclust": 2, "theta": -1.0},
+            "theta values must be finite and non-negative",
+        ),
+        (
+            np.zeros((2, 4)),
+            pd.DataFrame({"batch": ["a", "b", "a", "b"]}),
+            {"nclust": 2, "lamb": np.nan},
+            "lambda values must be finite and non-negative",
+        ),
+        (
+            np.zeros((2, 4)),
+            pd.DataFrame({"batch": ["a", "b", "a", "b"]}),
+            {"nclust": 2, "cluster_fn": "unknown"},
+            "cluster_fn must be 'kmeans'",
+        ),
+    ],
+)
+def test_fit_harmony_rejects_invalid_contracts(values, metadata, kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        harmony.fit_harmony(values, metadata, **kwargs)
+
+
+def test_fit_harmony_expands_per_column_parameters_and_records_callable(monkeypatch):
+    captured = {}
+
+    class FakeHarmony:
+        def __init__(self, *args):
+            captured["theta"] = args[5].copy()
+            captured["ridge"] = args[12].copy()
+            data_mat = args[0]
+            nclust = args[10]
+            self.Z_orig = data_mat.copy()
+            self.R = np.zeros((nclust, data_mat.shape[1]))
+            self.Y = np.zeros((data_mat.shape[0], nclust))
+
+        def result(self):
+            return self.Z_orig.copy()
+
+    def cluster_backend(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(embeddings, "Harmony", FakeHarmony)
+    metadata = pd.DataFrame(
+        {
+            "batch": ["a", "b", "a", "b"],
+            "donor": ["x", "x", "y", "y"],
+        }
+    )
+
+    result = harmony.fit_harmony(
+        np.zeros((2, 4)),
+        metadata,
+        theta=[2.0, 3.0],
+        lamb=[1.0, 2.0, 3.0, 4.0],
+        sigma=np.array([0.2, 0.3]),
+        nclust=2,
+        tau=1.0,
+        cluster_fn=cluster_backend,
+    )
+
+    assert captured["theta"].shape == (4,)
+    np.testing.assert_array_equal(np.diag(captured["ridge"])[1:], [1, 2, 3, 4])
+    assert result.parameters["clusterBackend"].endswith(".cluster_backend")
 
 
 def test_harmony_keeps_an_independent_original_coordinate_snapshot():
