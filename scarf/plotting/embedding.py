@@ -334,6 +334,32 @@ def _embedding_multiple_layouts(
     return result
 
 
+def _selected_metadata_column(
+    store: Any,
+    column: str,
+    *,
+    cell_key: str,
+    cell_indices: np.ndarray | None,
+) -> np.ndarray:
+    cells = store.cells
+    if cell_indices is None:
+        fetch = cells.fetch
+        try:
+            return np.asarray(fetch(column, key=cell_key))
+        except TypeError:
+            return np.asarray(fetch(column))
+    if getattr(cells, "_selection_ref", None) is not None:
+        fetch = cells.fetch
+        try:
+            values = np.asarray(fetch(column, key="I"))
+        except TypeError:
+            values = np.asarray(fetch(column))
+        if values.shape[0] == len(cell_indices):
+            return values
+    full = np.asarray(cells.fetch_all(column))
+    return np.asarray(full[cell_indices])
+
+
 def _prefetch_colors(
     store: Any,
     color_items: Sequence[str | ArtifactRef | FeatureRef | CellField | None],
@@ -379,10 +405,11 @@ def _prefetch_colors(
             )
             continue
         if isinstance(item, CellField):
-            vals = (
-                store.cells.fetch(item.key, key=cell_key)
-                if cell_indices is None
-                else np.asarray(store.cells.fetch_all(item.key))[cell_indices]
+            vals = _selected_metadata_column(
+                store,
+                item.key,
+                cell_key=cell_key,
+                cell_indices=cell_indices,
             )
             series = pd.Series(vals)
             out.append(
@@ -395,10 +422,11 @@ def _prefetch_colors(
             )
             continue
         if isinstance(item, str) and item in store.cells.columns:
-            vals = (
-                store.cells.fetch(item, key=cell_key)
-                if cell_indices is None
-                else np.asarray(store.cells.fetch_all(item))[cell_indices]
+            vals = _selected_metadata_column(
+                store,
+                item,
+                cell_key=cell_key,
+                cell_indices=cell_indices,
             )
             series = pd.Series(vals)
             out.append((np.asarray(vals), item, _is_categorical(series, "auto"), False))
@@ -493,10 +521,11 @@ def _resolve_highlight_mask(
         mask[indices] = True
         return mask
     assert highlight.by is not None
-    values = (
-        np.asarray(store.cells.fetch(highlight.by, key=cell_key))
-        if cell_indices is None
-        else np.asarray(store.cells.fetch_all(highlight.by))[cell_indices]
+    values = _selected_metadata_column(
+        store,
+        highlight.by,
+        cell_key=cell_key,
+        cell_indices=cell_indices,
     )
     if len(values) != n_cells:
         raise ValueError("highlight metadata length does not match selected cells")
@@ -519,10 +548,11 @@ def _density_selection_mask(
 ) -> np.ndarray | None:
     if overlay is None or overlay.group_by is None:
         return None
-    values = (
-        np.asarray(store.cells.fetch(overlay.group_by, key=cell_key))
-        if cell_indices is None
-        else np.asarray(store.cells.fetch_all(overlay.group_by))[cell_indices]
+    values = _selected_metadata_column(
+        store,
+        overlay.group_by,
+        cell_key=cell_key,
+        cell_indices=cell_indices,
     )
     if len(values) != n_cells:
         raise ValueError("density metadata length does not match selected cells")
@@ -1446,10 +1476,11 @@ def embedding(
         color_cache = clipped
 
     subset_vals = (
-        (
-            np.asarray(store.cells.fetch(subset_by, key=cell_key))
-            if artifact_cell_indices is None
-            else np.asarray(store.cells.fetch_all(subset_by))[artifact_cell_indices]
+        _selected_metadata_column(
+            store,
+            subset_by,
+            cell_key=cell_key,
+            cell_indices=artifact_cell_indices,
         )
         if subset_by is not None
         else None
@@ -1472,10 +1503,11 @@ def embedding(
     groups_category: np.ndarray | None = None
     groups_color_index: int | None = None
     if facet_by is not None:
-        facet_values = (
-            np.asarray(store.cells.fetch(facet_by, key=cell_key))
-            if artifact_cell_indices is None
-            else np.asarray(store.cells.fetch_all(facet_by))[artifact_cell_indices]
+        facet_values = _selected_metadata_column(
+            store,
+            facet_by,
+            cell_key=cell_key,
+            cell_indices=artifact_cell_indices,
         )
         if groups is not None:
             groups_category = facet_values

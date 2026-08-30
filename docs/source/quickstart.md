@@ -59,8 +59,10 @@ ds = scarf.DataStore(str(store), nthreads=4)
 The default pipeline filters cells, scores cell cycle, selects highly variable genes, normalizes
 counts, runs PCA, builds a neighbourhood graph, and calculates UMAP. It also runs Leiden at
 resolutions 0.5, 0.75, 1.0, and 1.25, plus Paris clustering, doublet scoring, and marker search.
-It compares every valid Leiden and Paris candidate with a deterministic PCA-space silhouette
-sample, then exposes the selected candidate as `clusters`.
+It scores Leiden resolutions in the graph's PCA or Harmony coordinates with a deterministic
+silhouette sample, then exposes the selected Leiden candidate as `clusters`. Paris remains
+available as `run["paris"]` for diagnosis. This automatic choice is a reproducible baseline, not
+biological validation.
 
 ```{code-cell} ipython3
 run = ds.pipeline.run(label="baseline")

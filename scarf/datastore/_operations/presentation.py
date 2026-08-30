@@ -107,6 +107,24 @@ def _raw_sparse_for_indices(
     )
 
 
+def _lift_frozen_umap_to_obsm(adata: Any) -> None:
+    umap_columns: dict[int, str] = {}
+    for column in adata.obs.columns:
+        prefix, separator, suffix = str(column).rpartition("_")
+        if prefix == "umap" and separator and suffix.isdigit():
+            component = int(suffix)
+            if component > 0:
+                umap_columns[component] = str(column)
+    if not umap_columns:
+        return
+    expected = list(range(1, max(umap_columns) + 1))
+    if sorted(umap_columns) != expected:
+        raise ValueError("Frozen UMAP fields must be consecutively numbered")
+    ordered_columns = [umap_columns[index] for index in expected]
+    adata.obsm["X_umap"] = adata.obs[ordered_columns].to_numpy(copy=True)
+    adata.obs.drop(columns=ordered_columns, inplace=True)
+
+
 class _PresentationOperationsMixin(_PresentationOperationsBase):
     def to_anndata(
         self,
@@ -121,9 +139,11 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
     ) -> Any:
         """Return an assay as an in-memory AnnData object.
 
-        Cell and feature metadata are copied to ``obs`` and ``var``. Layout
-        coordinates remain ordinary ``obs`` columns; this method does not
-        populate ``obsm``.
+        Cell and feature metadata are copied to ``obs`` and ``var``. Without
+        ``run``, layout coordinates remain ordinary ``obs`` columns and this
+        method does not populate ``obsm``. With ``run``, consecutive frozen
+        ``umap_*`` fields are written to ``obsm["X_umap"]`` and removed from
+        ``obs``. Cluster and QC labels stay in ``obs``.
 
         Args:
             from_assay: Name of assay to be used. If no value is provided then the default assay will be used.
@@ -329,6 +349,8 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
                         cell_idx,
                         layer_feat_idx,
                     )
+        if run is not None:
+            _lift_frozen_umap_to_obsm(adata)
         return adata
 
     def show_zarr_tree(self, start: str = "/", depth: int = 2) -> None:

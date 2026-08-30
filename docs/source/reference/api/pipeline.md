@@ -39,13 +39,13 @@ def run(
     assay: str | None = None,
     label: str | None = None,
     cell_key: str = "I",
-    filtering: bool | Mapping[str, object] | None = None,
+    filtering: bool | Mapping[str, object] = True,
     harmony_batch_columns: Sequence[str] | None = None,
     hvg_count: int = 1000,
     pca_dims: int = 21,
     neighbors_k: int = 11,
     umap: bool = True,
-    leiden: Mapping[str, object] | bool | None = None,
+    leiden: Mapping[str, object] | bool = True,
     cell_cycle: bool = True,
     paris: bool = True,
     doublets: bool = True,
@@ -66,18 +66,21 @@ Harmony coordinates. When doublet scoring is enabled, its graph branch still use
 PCA coordinates. The branch artifacts appear in their stage receipt, not as convenience entries in
 the run's top-level output mapping.
 
-Boolean stage options disable that stage when set to `False`. A custom Leiden request contains
-exactly `partitions`:
+Boolean stage options disable that stage when set to `False`. `True` uses that stage's defaults.
+A mapping configures the stage. `None` is rejected. An empty filtering mapping uses the same
+automatic defaults as `filtering=True`. An empty Leiden mapping is invalid; a custom Leiden
+request contains exactly `partitions`:
 
 ```python
 run = ds.pipeline.run(leiden={"partitions": [0.4, 0.8]})
 ```
 
-At least one Leiden or Paris candidate is required when doublets or markers are enabled.
-Setting `umap=False` skips both embedding initialization and UMAP, so neither artifact appears in
-the completed run.
+Doublets and markers require at least one Leiden candidate. Paris can still run as a diagnostic
+output when those stages are disabled; a Paris-only run has `run["paris"]` and no
+`run["clusters"]`. Setting `umap=False` skips both embedding initialization and UMAP, so neither
+artifact appears in the completed run.
 
-`filtering=None` uses automatic filtering over available assay QC columns. Set it to `False` to
+`filtering=True` uses automatic filtering over available assay QC columns. Set it to `False` to
 retain the captured input selection, or pass a configuration mapping. Automatic filtering accepts
 `attrs`, `min_p`, `max_p`, and optionally `sample_column`, `n_mads`, and
 `min_cells_per_sample`. Manual filtering requires aligned `attrs`, `lows`, and `highs`, with an
@@ -115,20 +118,30 @@ except PipelineExecutionError as error:
 
 ## Automatic cluster selection
 
-The `cluster_selection` stage evaluates every valid enabled Leiden and Paris candidate in PCA
-space. It uses one deterministic sample of at most 10,000 selected cells with seed `4466` for all
-candidates. Pairwise work stays within the datastore memory budget.
+The `cluster_selection` stage scores enabled Leiden resolutions in the same PCA or Harmony
+coordinates used to build the graph. Paris remains `run["paris"]` for diagnosis and comparison; it
+is never the automatic `run["clusters"]` winner. Selection uses one deterministic shared sample of
+at most 10,000 selected cells with seed `4466`. The sample reserves up to two seeded cells per
+cluster across every Leiden candidate, then fills remaining capacity without replacement. Pairwise
+work stays within the datastore memory budget.
+
+This silhouette comparison is a reproducible provisional baseline. It is not biological validation
+or ground truth. Keep alternative Leiden refs and Paris when the study question needs other
+evidence.
 
 The resulting `cluster_selection` artifact records candidate keys and refs, silhouette scores,
-the sample definition, invalid-candidate reasons, deterministic tie order, and the selected key.
-`run["clusters"]` is the selected candidate's exact ref. It is not a copied artifact or metadata
-column. If no candidate can be scored, the stage fails. A single valid candidate still receives a
-decision artifact.
+the sample definition (`sampleStrategy="sharedClusterQuota"` and `minClusterQuota=2`),
+invalid-candidate reasons, deterministic tie order, and the selected key.
+`run["clusters"]` is the selected Leiden candidate's exact ref. It is not a copied artifact or metadata
+column. If no Leiden candidate can be scored, the stage fails. A single valid Leiden candidate still
+receives a decision artifact.
 
 Persisted cluster selection is intentionally pipeline-only. The fixed recipe owns the candidate
-set, deterministic sampling policy, and run-ledger decision. Granular callers can use the public
-in-memory functions in `scarf.metrics` to evaluate their own candidates, but there is no separate
-`DataStore` persistence method that could imply the pipeline policy outside a run.
+set, deterministic sampling policy, and run-ledger decision. Granular callers can evaluate their
+own partitions with public APIs such as `evaluate_cluster_separability` in `scarf.metrics`. There
+is no public "best clustering" function and no separate `DataStore` persistence method that could
+imply the pipeline policy outside a run. The agent orchestrator is a separate multi-metric
+workflow and does not replace this baseline.
 
 ## Durable outputs and frozen views
 
@@ -171,6 +184,7 @@ columns or rewrites live `I`. Plotting, marker loading, and export stay on `Data
 ds.plots.embedding(run=run, layout="umap", color_by="clusters")
 markers = ds.get_markers(marker=run["markers"], group_id=0)
 adata = ds.to_anndata(run=run)
+# adata.obsm["X_umap"] holds frozen UMAP; cluster labels stay in adata.obs
 ```
 
 ## Open, list, and report runs

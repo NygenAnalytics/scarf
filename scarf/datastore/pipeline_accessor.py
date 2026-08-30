@@ -113,13 +113,13 @@ class PipelineAccessor:
         assay: str | None = None,
         label: str | None = None,
         cell_key: str = "I",
-        filtering: bool | Mapping[str, object] | None = None,
+        filtering: bool | Mapping[str, object] = True,
         harmony_batch_columns: Sequence[str] | None = None,
         hvg_count: int = 1000,
         pca_dims: int = 21,
         neighbors_k: int = 11,
         umap: bool = True,
-        leiden: Mapping[str, object] | bool | None = None,
+        leiden: Mapping[str, object] | bool = True,
         cell_cycle: bool = True,
         paris: bool = True,
         doublets: bool = True,
@@ -437,14 +437,13 @@ class PipelineAccessor:
             (f"leiden_{key}", artifacts[f"leiden_{key}"])
             for key, _resolution in recipe.leiden_partitions
         ]
-        if recipe.paris:
-            clustering_candidates.append(("paris", artifacts["paris"]))
         if clustering_candidates:
 
             def cluster_selection_stage() -> Sequence[tuple[str, ArtifactRef]]:
                 decision, selected_key, selected_ref = run_cluster_selection(
                     store,
-                    pca=artifacts["pca"],
+                    coordinates=coordinates,
+                    connectivity_map=artifacts["connectivity_map"],
                     cell_selection=analysis_selection,
                     candidates=clustering_candidates,
                 )

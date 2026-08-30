@@ -4,9 +4,16 @@ from typing import Any
 import numpy as np
 import zarr
 
+from ..graph.feature_projection import (
+    resolve_coordinate_inputs,
+    resolve_native_graph_inputs,
+)
 from ..metrics.cluster_selection import (
+    DEFAULT_MIN_CLUSTER_QUOTA,
+    SHARED_CLUSTER_QUOTA_STRATEGY,
     ClusterSelectionResult,
     select_clusters_by_silhouette,
+    shared_cluster_quota_sample_indices,
 )
 from ..storage.artifact_writer import (
     ArrayRequirement,
@@ -21,8 +28,14 @@ from ..storage.artifacts import (
     require_complete_artifact,
 )
 from ..storage.arrays import create_zarr_dataset
+from ..storage.errors import ArtifactResolutionError
 from ..storage.types import as_zarr_array
 from ..utils.shutdown import shutdown_checkpoint
+
+_COORDINATE_OPERATIONS = {
+    "reduction": "run_pca",
+    "batch_correction": "run_harmony",
+}
 
 
 def cluster_label_array(root: zarr.Group, ref: ArtifactRef) -> zarr.Array:
@@ -57,31 +70,66 @@ def _artifact_input_ref(
         raise ValueError(f"{owner} has a malformed {name!r} artifact input") from error
 
 
+def _lineage_error(error: ArtifactResolutionError) -> ValueError:
+    return ValueError(str(error))
+
+
+def _candidate_graph(
+    status_inputs: Mapping[str, Any] | None,
+    *,
+    key: str,
+) -> ArtifactRef:
+    owner = f"Cluster candidate {key!r}"
+    return _artifact_input_ref(status_inputs, "graph", owner=owner)
+
+
 def _validate_inputs(
     store: Any,
     *,
-    pca: ArtifactRef,
+    coordinates: ArtifactRef,
+    connectivity_map: ArtifactRef,
     cell_selection: ArtifactRef,
     candidates: Sequence[tuple[str, ArtifactRef]],
 ) -> tuple[zarr.Array, tuple[tuple[str, ArtifactRef, zarr.Array], ...]]:
-    if not isinstance(pca, ArtifactRef):
-        raise TypeError("pca must be an ArtifactRef")
-    if pca.kind != "reduction" or pca.scope != "assay" or pca.assay is None:
-        raise ValueError("pca must be an assay-scoped reduction artifact")
-    pca_status = require_complete_artifact(store.zw, pca)
-    if pca_status.operation != "run_pca":
-        raise ValueError("pca must reference a PCA reduction artifact")
+    if not isinstance(coordinates, ArtifactRef):
+        raise TypeError("coordinates must be an ArtifactRef")
+    expected_operation = _COORDINATE_OPERATIONS.get(coordinates.kind)
+    if (
+        expected_operation is None
+        or coordinates.scope != "assay"
+        or coordinates.assay is None
+    ):
+        raise ValueError(
+            "coordinates must be an assay-scoped PCA reduction or Harmony "
+            "batch-correction artifact"
+        )
+    coordinate_status = require_complete_artifact(store.zw, coordinates)
+    if coordinate_status.operation != expected_operation:
+        raise ValueError(
+            "coordinates must reference a "
+            f"{'PCA' if coordinates.kind == 'reduction' else 'Harmony'} artifact"
+        )
+    if not isinstance(connectivity_map, ArtifactRef):
+        raise TypeError("connectivity_map must be an ArtifactRef")
     if not isinstance(cell_selection, ArtifactRef):
         raise TypeError("cell_selection must be an ArtifactRef")
-    pca_cell_selection = store._validate_reduction_cell_selection(pca)
-    if pca_cell_selection != cell_selection:
-        raise ValueError("pca does not use the requested cell selection")
-    pca_group = artifact_group(store.zw, pca)
-    if "data" not in pca_group:
-        raise ValueError("PCA reduction coordinates are missing")
-    coordinates = as_zarr_array(pca_group["data"], name="PCA coordinates")
-    if coordinates.ndim != 2 or coordinates.shape[0] < 1 or coordinates.shape[1] < 1:
-        raise ValueError("PCA coordinates must be a non-empty two-dimensional array")
+    try:
+        coordinate_inputs = resolve_coordinate_inputs(store.zw, coordinates)
+        graph_inputs = resolve_native_graph_inputs(store.zw, connectivity_map)
+    except ArtifactResolutionError as error:
+        raise _lineage_error(error) from error
+    if coordinate_inputs.cell_selection != cell_selection:
+        raise ValueError("coordinates do not use the requested cell selection")
+    if graph_inputs.coordinates != coordinates:
+        raise ValueError("connectivity map was not built from the scored coordinates")
+    if graph_inputs.cell_selection != cell_selection:
+        raise ValueError("connectivity map does not use the requested cell selection")
+    coordinate_group = artifact_group(store.zw, coordinates)
+    if "data" not in coordinate_group:
+        raise ValueError("Coordinate artifact is missing its data array")
+    scored = as_zarr_array(coordinate_group["data"], name="coordinates")
+    if scored.ndim != 2 or scored.shape[0] < 1 or scored.shape[1] < 1:
+        raise ValueError("Coordinates must be a non-empty two-dimensional array")
 
     resolved_candidates = tuple(candidates)
     if not resolved_candidates:
@@ -97,15 +145,19 @@ def _validate_inputs(
         if not isinstance(ref, ArtifactRef):
             raise TypeError(f"Cluster candidate {key!r} must be an ArtifactRef")
         if (
-            ref.kind not in {"cluster_labels", "cluster_cut"}
+            ref.kind != "cluster_labels"
             or ref.scope != "assay"
-            or ref.assay != pca.assay
+            or ref.assay != coordinates.assay
         ):
             raise ValueError(
-                f"Cluster candidate {key!r} must be an assay-scoped clustering "
-                "artifact for the PCA assay"
+                f"Cluster candidate {key!r} must be an assay-scoped Leiden "
+                "cluster-label artifact for the coordinate assay"
             )
         status = require_complete_artifact(store.zw, ref)
+        if status.operation != "run_leiden_clustering":
+            raise ValueError(
+                f"Cluster candidate {key!r} must reference a Leiden clustering artifact"
+            )
         candidate_selection = _artifact_input_ref(
             status.inputs,
             "cell_selection",
@@ -113,16 +165,24 @@ def _validate_inputs(
         )
         if candidate_selection != cell_selection:
             raise ValueError(
-                f"Cluster candidate {key!r} does not use the PCA cell selection"
+                f"Cluster candidate {key!r} does not use the requested cell selection"
+            )
+        candidate_graph = _candidate_graph(status.inputs, key=key)
+        if candidate_graph != connectivity_map:
+            raise ValueError(
+                f"Cluster candidate {key!r} was not partitioned from the "
+                "requested connectivity map"
             )
         labels = cluster_label_array(store.zw, ref)
-        if labels.shape[0] != coordinates.shape[0]:
-            raise ValueError(f"Cluster candidate {key!r} does not align with PCA rows")
+        if labels.shape[0] != scored.shape[0]:
+            raise ValueError(
+                f"Cluster candidate {key!r} does not align with coordinate rows"
+            )
         candidate_keys.append(key)
         validated.append((key, ref, labels))
     if len(candidate_keys) != len(set(candidate_keys)):
         raise ValueError("Cluster selection candidate keys must be unique")
-    return coordinates, tuple(validated)
+    return scored, tuple(validated)
 
 
 def _validated_integer(value: object, name: str, *, minimum: int) -> int:
@@ -134,33 +194,24 @@ def _validated_integer(value: object, name: str, *, minimum: int) -> int:
     return resolved
 
 
-def _expected_sample_indices(
-    *,
-    seed: int,
-    population_size: int,
-    sample_size: int,
-) -> np.ndarray:
-    return np.sort(
-        np.random.default_rng(seed)
-        .choice(population_size, size=sample_size, replace=False)
-        .astype(np.int64)
-    )
-
-
 def _cluster_selection_reuse_validator(
     *,
     candidate_keys: tuple[str, ...],
     candidate_refs: tuple[ArtifactRef, ...],
+    candidate_labels: tuple[zarr.Array, ...],
     seed: int,
     population_size: int,
     max_sample_size: int,
+    min_cluster_quota: int,
     working_memory_mib: int,
 ) -> Callable[[ArtifactRef, zarr.Group], bool]:
     sample_size = min(population_size, max_sample_size)
-    expected_indices = _expected_sample_indices(
+    expected_indices = shared_cluster_quota_sample_indices(
+        tuple(zip(candidate_keys, candidate_labels, strict=True)),
+        n_cells=population_size,
         seed=seed,
-        population_size=population_size,
-        sample_size=sample_size,
+        max_sample_size=max_sample_size,
+        min_cluster_quota=min_cluster_quota,
     )
     expected_refs = [ref.to_dict() for ref in candidate_refs]
     expected_sample_definition = {
@@ -168,6 +219,8 @@ def _cluster_selection_reuse_validator(
         "populationSize": population_size,
         "sampleSize": sample_size,
         "maxSampleSize": max_sample_size,
+        "sampleStrategy": SHARED_CLUSTER_QUOTA_STRATEGY,
+        "minClusterQuota": min_cluster_quota,
     }
 
     def validate(_ref: ArtifactRef, group: zarr.Group) -> bool:
@@ -224,6 +277,7 @@ def _cluster_selection_reuse_validator(
                 population_size=population_size,
                 max_sample_size=max_sample_size,
                 working_memory_mib=working_memory_mib,
+                min_cluster_quota=min_cluster_quota,
             )
             return result.tie_order == candidate_keys
         except (KeyError, TypeError, ValueError):
@@ -235,11 +289,13 @@ def _cluster_selection_reuse_validator(
 def run_cluster_selection(
     store: Any,
     *,
-    pca: ArtifactRef,
+    coordinates: ArtifactRef,
+    connectivity_map: ArtifactRef,
     cell_selection: ArtifactRef,
     candidates: Sequence[tuple[str, ArtifactRef]],
     seed: int = 4466,
     max_sample_size: int = 10_000,
+    min_cluster_quota: int = DEFAULT_MIN_CLUSTER_QUOTA,
 ) -> tuple[ArtifactRef, str, ArtifactRef]:
     """Validate, score, and persist one bounded cluster-selection decision."""
     seed = _validated_integer(seed, "seed", minimum=0)
@@ -248,15 +304,22 @@ def run_cluster_selection(
         "max_sample_size",
         minimum=1,
     )
-    coordinates, validated = _validate_inputs(
+    min_cluster_quota = _validated_integer(
+        min_cluster_quota,
+        "min_cluster_quota",
+        minimum=1,
+    )
+    scored, validated = _validate_inputs(
         store,
-        pca=pca,
+        coordinates=coordinates,
+        connectivity_map=connectivity_map,
         cell_selection=cell_selection,
         candidates=candidates,
     )
     candidate_keys = tuple(key for key, _ref, _labels in validated)
     candidate_refs = tuple(ref for _key, ref, _labels in validated)
-    population_size = int(coordinates.shape[0])
+    candidate_labels = tuple(labels for _key, _ref, labels in validated)
+    population_size = int(scored.shape[0])
     sample_size = min(population_size, max_sample_size)
     working_memory_mib = max(
         1,
@@ -265,7 +328,7 @@ def run_cluster_selection(
     planned = plan_artifact(
         store.zw,
         scope="assay",
-        assay=pca.assay,
+        assay=coordinates.assay,
         kind="cluster_selection",
         operation="select_clusters_by_silhouette",
         parameters={
@@ -274,9 +337,12 @@ def run_cluster_selection(
             "maxSampleSize": max_sample_size,
             "metric": "euclidean",
             "tieOrder": list(candidate_keys),
+            "sampleStrategy": SHARED_CLUSTER_QUOTA_STRATEGY,
+            "minClusterQuota": min_cluster_quota,
         },
         inputs={
-            "pca": pca,
+            "coordinates": coordinates,
+            "connectivityMap": connectivity_map,
             "cellSelection": cell_selection,
             "candidates": {key: ref for key, ref, _labels in validated},
         },
@@ -304,9 +370,11 @@ def run_cluster_selection(
         reuse_validator=_cluster_selection_reuse_validator(
             candidate_keys=candidate_keys,
             candidate_refs=candidate_refs,
+            candidate_labels=candidate_labels,
             seed=seed,
             population_size=population_size,
             max_sample_size=max_sample_size,
+            min_cluster_quota=min_cluster_quota,
             working_memory_mib=working_memory_mib,
         ),
     )
@@ -318,11 +386,12 @@ def run_cluster_selection(
         return planned.ref, selected_key, refs_by_key[selected_key]
 
     result = select_clusters_by_silhouette(
-        coordinates,
+        scored,
         tuple((key, labels) for key, _ref, labels in validated),
         seed=seed,
         max_sample_size=max_sample_size,
         working_memory_mib=working_memory_mib,
+        min_cluster_quota=min_cluster_quota,
         checkpoint=shutdown_checkpoint,
     )
     group = start_artifact(store.zw, planned)

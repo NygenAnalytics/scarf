@@ -156,6 +156,7 @@ nitpick_ignore = [
     ("py:class", "scarf.storage.io_policy.StorageIoPolicy"),
     ("py:class", "scarf.storage.count_matrix.CountMatrixPolicy"),
     ("py:class", "scarf.metadata.MetaDataRowBlock"),
+    ("py:class", "scarf.metadata.selection.NamedCellArtifact"),
     ("py:class", "scarf.datastore.mapping_datastore.MappingDatastore"),
     ("py:obj", "numpy.typing.DTypeLike"),
     ("py:data", "typing.Any"),

@@ -76,11 +76,11 @@ def _canonical_resolution(value: Any) -> tuple[str, float]:
 
 
 def _resolve_leiden(
-    value: Mapping[str, object] | bool | None,
+    value: Mapping[str, object] | bool,
 ) -> tuple[tuple[str, float], ...]:
     if value is False:
         return ()
-    if value is None or value is True:
+    if value is True:
         return (
             ("0.5", 0.5),
             ("0.75", 0.75),
@@ -88,7 +88,7 @@ def _resolve_leiden(
             ("1.25", 1.25),
         )
     if not isinstance(value, Mapping):
-        raise TypeError("leiden must be a mapping, bool, or None")
+        raise TypeError("leiden must be a mapping or bool")
     if set(value) != {"partitions"}:
         raise ValueError("leiden must contain exactly 'partitions'")
     raw_partitions = value["partitions"]
@@ -137,16 +137,16 @@ def _finite_real(value: Any, name: str) -> float:
 def _resolve_filtering(
     store: Any,
     assay: str,
-    value: bool | Mapping[str, object] | None,
+    value: bool | Mapping[str, object],
 ) -> dict[str, Any]:
     if value is False:
         return {"enabled": False}
-    if value is None or value is True:
+    if value is True:
         options: dict[str, Any] = {}
     elif isinstance(value, Mapping):
         options = dict(value)
     else:
-        raise TypeError("filtering must be a mapping, bool, or None")
+        raise TypeError("filtering must be a mapping or bool")
     method = options.pop("method", "auto")
     if method not in {"auto", "manual"}:
         raise ValueError("filtering method must be 'auto' or 'manual'")
@@ -234,13 +234,13 @@ def resolve_pipeline_recipe(
     assay: str | None,
     label: str | None,
     cell_key: str,
-    filtering: bool | Mapping[str, object] | None,
+    filtering: bool | Mapping[str, object],
     harmony_batch_columns: Sequence[str] | None,
     hvg_count: int,
     pca_dims: int,
     neighbors_k: int,
     umap: bool,
-    leiden: Mapping[str, object] | bool | None,
+    leiden: Mapping[str, object] | bool,
     cell_cycle: bool,
     paris: bool,
     doublets: bool,
@@ -271,10 +271,8 @@ def resolve_pipeline_recipe(
         if not isinstance(flag, bool):
             raise TypeError(f"{name} must be a boolean")
     partitions = _resolve_leiden(leiden)
-    if not partitions and not paris and (doublets or markers):
-        raise ValueError(
-            "doublets and markers require at least one clustering candidate"
-        )
+    if not partitions and (doublets or markers):
+        raise ValueError("doublets and markers require at least one Leiden candidate")
     snapshots = _column_sequence(snapshot_columns, "snapshot_columns")
     result_fields = {
         "highly_variable_features",

@@ -101,9 +101,11 @@ This prospective boundary makes unintended writes and retrospective justificatio
 
 `ds.pipeline.run()` is a persistent baseline workflow.
 It writes immutable artifacts and a durable run ledger, but does not change live `I` or metadata
-columns. It evaluates all valid enabled Leiden and Paris
-candidates with one deterministic PCA-space silhouette sample, persists the decision as
-`run["cluster_selection"]`, and exposes the selected candidate ref as `run["clusters"]`.
+columns. It scores enabled Leiden resolutions in the same PCA or Harmony coordinates used to
+build the graph, persists the decision as `run["cluster_selection"]`, and exposes the selected
+Leiden candidate ref as `run["clusters"]`. Paris remains `run["paris"]` for diagnosis. Silhouette
+supplies a reproducible baseline, not validation or ground truth. The agent orchestrator is a
+separate multi-metric workflow and does not replace this pipeline selection.
 
 Use `run.cells` and `run.features` for frozen inspection. Keep presentation and storage mutation on
 the datastore: `ds.plots.embedding(run=run, ...)`, `ds.get_markers(marker=run["markers"], ...)`,

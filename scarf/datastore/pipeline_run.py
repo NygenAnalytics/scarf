@@ -898,6 +898,17 @@ class PipelineAxisView:
             full_missing[selection] = missing
         return self._apply_plot_missing(values, full_missing)
 
+    def _plot_fetch_selected(self, column: str) -> np.ndarray:
+        """Return one selected-row field with missing values safe for plotting."""
+        values = self.fetch(column)
+        descriptor = self._descriptor_by_key.get(column)
+        if descriptor is None:
+            return values
+        missing = self._selected_missing(descriptor)
+        if missing is None:
+            return values
+        return self._apply_plot_missing(values, missing)
+
     def _selected_prefix_indices(self, n: int) -> np.ndarray:
         if n == 0:
             return np.empty(0, dtype=np.int64)
@@ -1056,7 +1067,7 @@ class PipelineAxisView:
 class PipelineRun(Mapping[str, ArtifactRef]):
     """A datastore-bound handle for one durable pipeline invocation."""
 
-    __slots__ = ("_owner", "_outputs", "_record")
+    __slots__ = ("_cells_view", "_features_view", "_owner", "_outputs", "_record")
 
     def __init__(
         self,
@@ -1070,6 +1081,8 @@ class PipelineRun(Mapping[str, ArtifactRef]):
         self._owner = owner
         self._record = record
         self._outputs = {output.key: output.artifact for output in record.outputs}
+        self._cells_view: PipelineAxisView | None = None
+        self._features_view: PipelineAxisView | None = None
 
     @property
     def run_id(self) -> str:
@@ -1121,12 +1134,24 @@ class PipelineRun(Mapping[str, ArtifactRef]):
     @property
     def cells(self) -> PipelineAxisView:
         self._require_completed("cell views")
-        return PipelineAxisView(self._owner, self._record, axis="cells")
+        if self._cells_view is None:
+            self._cells_view = PipelineAxisView(
+                self._owner,
+                self._record,
+                axis="cells",
+            )
+        return self._cells_view
 
     @property
     def features(self) -> PipelineAxisView:
         self._require_completed("feature views")
-        return PipelineAxisView(self._owner, self._record, axis="features")
+        if self._features_view is None:
+            self._features_view = PipelineAxisView(
+                self._owner,
+                self._record,
+                axis="features",
+            )
+        return self._features_view
 
     def _report_dict(
         self,

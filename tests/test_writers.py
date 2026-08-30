@@ -1274,8 +1274,6 @@ def _completed_export_run():
                         "I": [True, True],
                         "names": ["frozen-a", "frozen-c"],
                         "batch": ["x", "x"],
-                        "umap_1": [1.5, 3.5],
-                        "umap_2": [10.5, 30.5],
                         "clusters": [0, 2],
                     },
                     index=pd.Index(["c1", "c3"], name="ids"),
@@ -1284,6 +1282,7 @@ def _completed_export_run():
                     {"names": ["frozen-g1", "frozen-g3"]},
                     index=pd.Index(["g1", "g3"], name="gene_ids"),
                 ),
+                obsm={"X_umap": np.asarray([[1.5, 10.5], [3.5, 30.5]])},
             )
 
     owner = Owner()
@@ -1335,6 +1334,41 @@ def test_to_h5ad_exports_completed_run_frozen_fields_and_artifact_layout(tmp_pat
         exported.X.toarray(),
         np.asarray([[2, 0], [5, 7]]),
     )
+
+
+def test_to_h5ad_run_export_does_not_invent_umap_when_anndata_has_none(tmp_path):
+    from anndata import AnnData, read_h5ad
+    import pandas as pd
+    from scipy.sparse import csr_matrix
+
+    from scarf.writers import to_h5ad
+
+    assay, owner, run = _completed_export_run()
+
+    def to_anndata_without_umap(*, run):
+        owner.received_run = run
+        return AnnData(
+            csr_matrix(np.asarray([[2, 0], [5, 7]], dtype=np.int32)),
+            obs=pd.DataFrame(
+                {
+                    "I": [True, True],
+                    "names": ["frozen-a", "frozen-c"],
+                    "clusters": [0, 2],
+                },
+                index=pd.Index(["c1", "c3"], name="ids"),
+            ),
+            var=pd.DataFrame(
+                {"names": ["frozen-g1", "frozen-g3"]},
+                index=pd.Index(["g1", "g3"], name="gene_ids"),
+            ),
+        )
+
+    owner.to_anndata = to_anndata_without_umap
+    path = tmp_path / "run_export_no_umap.h5ad"
+    to_h5ad(assay, str(path), run=run)
+    exported = read_h5ad(path)
+    assert "X_umap" not in exported.obsm
+    assert exported.obs["clusters"].tolist() == [0, 2]
 
 
 def test_to_h5ad_run_export_rejects_foreign_assay_and_live_options(tmp_path):

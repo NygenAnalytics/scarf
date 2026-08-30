@@ -52,6 +52,9 @@ class _FrozenRunPlotCells:
     def fetch(self, column: str, *, key: str = "I") -> np.ndarray:
         if key != "I":
             raise ValueError("Run plots use the frozen pipeline cell selection")
+        plot_selected = getattr(self._cells, "_plot_fetch_selected", None)
+        if callable(plot_selected):
+            return np.asarray(plot_selected(column))
         values = self.fetch_all(column)
         return np.asarray(values[self._cells.fetch_all("I")])
 
@@ -77,9 +80,9 @@ class _FrozenRunPlotStore:
 
     __slots__ = ("_defaultAssay", "cells", "zw")
 
-    def __init__(self, store: "DataStore", run: Any) -> None:
-        self._defaultAssay = run.assay
-        self.cells = _FrozenRunPlotCells(run.cells)
+    def __init__(self, store: "DataStore", *, assay: str, cells: Any) -> None:
+        self._defaultAssay = assay
+        self.cells = _FrozenRunPlotCells(cells)
         self.zw = store.zw
 
     def _stored_display_metadata(self, column: str) -> dict[str, Any] | None:
@@ -155,7 +158,7 @@ class DataStorePlotAccessor:
             if layout is not None and not isinstance(layout, str):
                 raise TypeError("layout must name a pipeline output")
             if not isinstance(color_by, str | type(None)):
-                raise TypeError("color_by must name a pipeline output or be None")
+                raise TypeError("color_by must name a frozen cell field or be None")
             if (
                 cell_key != "I"
                 or from_assay is not None
@@ -175,21 +178,18 @@ class DataStorePlotAccessor:
                 )
             if highlight is not None and highlight.by is not None:
                 raise ValueError("Run embedding highlights cannot use live metadata")
+            cells = run.cells
             layout_ref = run["umap" if layout is None else layout]
             if color_by is None:
-                resolved_color: str | ArtifactRef | None = None
-            elif color_by in run.cells.columns:
+                resolved_color: str | None = None
+            elif color_by in cells.columns:
                 resolved_color = color_by
-            elif color_by in run:
-                resolved_color = run[color_by]
             else:
-                raise KeyError(
-                    f"Pipeline run has no output or frozen cell field {color_by!r}"
-                )
+                raise KeyError(f"Pipeline run has no frozen cell field {color_by!r}")
             from ..plotting import embedding
 
             return embedding(
-                _FrozenRunPlotStore(self._store, run),
+                _FrozenRunPlotStore(self._store, assay=run.assay, cells=cells),
                 layout=layout_ref,
                 color_by=resolved_color,
                 point_size=point_size,
@@ -298,15 +298,18 @@ class DataStorePlotAccessor:
                 raise TypeError("layout must name a pipeline output")
             if cell_key != "I":
                 raise ValueError("Run raster uses the frozen pipeline cell selection")
-            color_key: str | None
-            if isinstance(color_by, CellField):
-                color_key = color_by.key
-            else:
-                color_key = color_by
-            plot_store = _FrozenRunPlotStore(self._store, run)
-            if color_key is not None and color_key not in plot_store.cells.columns:
+            if not isinstance(color_by, str | type(None)):
+                raise TypeError("color_by must name a frozen cell field or be None")
+            color_key = color_by
+            cells = run.cells
+            plot_store = _FrozenRunPlotStore(
+                self._store,
+                assay=run.assay,
+                cells=cells,
+            )
+            if color_key is not None and color_key not in cells.columns:
                 raise KeyError(f"Pipeline run has no frozen cell field {color_key!r}")
-            if subset_by is not None and subset_by not in plot_store.cells.columns:
+            if subset_by is not None and subset_by not in cells.columns:
                 raise KeyError(f"Pipeline run has no frozen cell field {subset_by!r}")
             return embedding_raster(
                 plot_store,

@@ -110,8 +110,9 @@ Leiden clustering
   Graph community detection via `run_leiden_clustering`.
   A manual call returns a cluster-label artifact without adding metadata columns. The RNA pipeline
   runs default resolutions `0.5`, `0.75`, `1.0`, and `1.25`, plus Paris unless disabled. Its
-  artifact-backed silhouette stage compares all valid candidates, and `run["clusters"]` is the
-  selected candidate's exact ref.
+  artifact-backed silhouette stage scores Leiden resolutions in the graph's coordinate space, and
+  `run["clusters"]` is the selected Leiden candidate's exact ref. Paris remains a diagnostic run
+  output. This automatic choice is a reproducible baseline, not biological validation.
 
 SNN integration
   Shared-nearest-neighbor merge of explicit modality-specific connectivity-map refs via

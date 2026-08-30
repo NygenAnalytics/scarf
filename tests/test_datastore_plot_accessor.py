@@ -5,6 +5,7 @@ from collections.abc import Callable
 from copy import copy
 from typing import Any, get_type_hints
 
+import numpy as np
 import pytest
 import zarr
 from zarr.storage import MemoryStore
@@ -317,7 +318,7 @@ def test_embedding_run_adapter_uses_exact_outputs_and_frozen_fields(
         artifact_id="1" * 64,
     )
     owner = type("Owner", (), {"zw": object()})()
-    frozen_cells = type("FrozenCells", (), {"columns": ("sample_id",)})()
+    frozen_cells = type("FrozenCells", (), {"columns": ("sample_id", "clusters")})()
 
     class FakeRun:
         assay = "RNA"
@@ -360,12 +361,21 @@ def test_embedding_run_adapter_uses_exact_outputs_and_frozen_fields(
     accessor.embedding(
         run=run,  # type: ignore[arg-type]
         layout="umap",
+        color_by=None,
+        show=False,
+    )
+    _, kwargs = calls.pop()
+    assert kwargs["color_by"] is None
+
+    accessor.embedding(
+        run=run,  # type: ignore[arg-type]
+        layout="umap",
         color_by="clusters",
         show=False,
     )
     _, kwargs = calls.pop()
     assert kwargs["layout"] == layout
-    assert kwargs["color_by"] == clusters
+    assert kwargs["color_by"] == "clusters"
 
     with pytest.raises(ValueError, match="mutually exclusive"):
         accessor.embedding(
@@ -373,11 +383,18 @@ def test_embedding_run_adapter_uses_exact_outputs_and_frozen_fields(
             layout=layout,
             show=False,
         )
-    with pytest.raises(KeyError, match="no output or frozen cell field"):
+    with pytest.raises(KeyError, match="no frozen cell field"):
         accessor.embedding(
             run=run,  # type: ignore[arg-type]
             layout="umap",
             color_by="live_only",
+            show=False,
+        )
+    with pytest.raises(KeyError, match="no frozen cell field"):
+        accessor.embedding(
+            run=run,  # type: ignore[arg-type]
+            layout="umap",
+            color_by="umap",
             show=False,
         )
 
@@ -408,6 +425,119 @@ def test_embedding_run_adapter_uses_exact_outputs_and_frozen_fields(
             color_by="live_only",
             show=False,
         )
+    with pytest.raises(TypeError, match="color_by must name a frozen cell field"):
+        accessor.embedding(
+            run=run,  # type: ignore[arg-type]
+            layout="umap",
+            color_by=layout,
+            show=False,
+        )
+    with pytest.raises(TypeError, match="color_by must name a frozen cell field"):
+        accessor.embedding_raster(
+            run=run,  # type: ignore[arg-type]
+            layout="umap",
+            color_by=layout,
+            show=False,
+        )
+    with pytest.raises(TypeError, match="color_by must name a frozen cell field"):
+        accessor.embedding_raster(
+            run=run,  # type: ignore[arg-type]
+            layout="umap",
+            color_by=splt.CellField("sample_id"),
+            show=False,
+        )
+
+
+def test_frozen_run_plot_cells_falls_back_without_selected_fetch() -> None:
+    from scarf.datastore._plot_accessor import _FrozenRunPlotCells
+
+    class CompactCells:
+        columns = ("clusters",)
+
+        def _plot_fetch_all(self, column: str) -> np.ndarray:
+            return np.asarray([0, -1, 1, -1])
+
+        def fetch_all(self, column: str) -> np.ndarray:
+            assert column == "I"
+            return np.asarray([True, False, True, False])
+
+    cells = _FrozenRunPlotCells(CompactCells())
+    np.testing.assert_array_equal(cells.fetch("clusters"), [0, 1])
+    with pytest.raises(ValueError, match="frozen pipeline cell selection"):
+        cells.fetch("clusters", key="filtered")
+
+
+def test_selected_metadata_column_uses_frozen_fetch_or_full_axis_fallback() -> None:
+    from types import SimpleNamespace
+
+    from scarf.plotting.embedding import _selected_metadata_column
+
+    class FrozenCells:
+        _selection_ref = object()
+
+        def fetch(self, column: str, key: str = "I") -> np.ndarray:
+            assert key == "I"
+            return np.asarray([1, 3])
+
+        def fetch_all(self, column: str) -> np.ndarray:
+            raise AssertionError("matching frozen fetch must not expand")
+
+    values = _selected_metadata_column(
+        SimpleNamespace(cells=FrozenCells()),
+        "clusters",
+        cell_key="I",
+        cell_indices=np.asarray([0, 2]),
+    )
+    np.testing.assert_array_equal(values, [1, 3])
+
+    class MismatchedCells:
+        _selection_ref = object()
+
+        def fetch(self, column: str, key: str = "I") -> np.ndarray:
+            return np.asarray([1])
+
+        def fetch_all(self, column: str) -> np.ndarray:
+            return np.asarray([10, 20, 30])
+
+    fallback = _selected_metadata_column(
+        SimpleNamespace(cells=MismatchedCells()),
+        "clusters",
+        cell_key="I",
+        cell_indices=np.asarray([0, 2]),
+    )
+    np.testing.assert_array_equal(fallback, [10, 30])
+
+    class KeylessCells:
+        def fetch(self, column: str) -> np.ndarray:
+            return np.asarray([7, 8])
+
+        def fetch_all(self, column: str) -> np.ndarray:
+            raise AssertionError("live fetch without indices must not expand")
+
+    live = _selected_metadata_column(
+        SimpleNamespace(cells=KeylessCells()),
+        "clusters",
+        cell_key="I",
+        cell_indices=None,
+    )
+    np.testing.assert_array_equal(live, [7, 8])
+
+    class KeylessFrozenCells:
+        _selection_ref = object()
+
+        def fetch(self, column: str) -> np.ndarray:
+            return np.asarray([4, 5])
+
+        def fetch_all(self, column: str) -> np.ndarray:
+            raise AssertionError("keyless frozen fetch must not expand")
+
+    keyless_frozen = _selected_metadata_column(
+        SimpleNamespace(cells=KeylessFrozenCells()),
+        "clusters",
+        cell_key="I",
+        cell_indices=np.asarray([1, 2]),
+    )
+    np.testing.assert_array_equal(keyless_frozen, [4, 5])
 
 
 def test_datastore_plots_returns_a_fresh_store_bound_namespace():

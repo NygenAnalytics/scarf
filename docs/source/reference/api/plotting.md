@@ -10,8 +10,10 @@ Diagnostics remain standalone: `qc` takes a DataFrame, `elbow` and `highly_varia
 
 A completed {py:class}`~scarf.PipelineRun` can be passed to
 `ds.plots.embedding(run=run, layout="umap", color_by="clusters")`. The datastore accessor reads only
-frozen run fields and does not require live metadata columns. `color_by` may name a run output or
-a metadata field captured with `snapshot_columns`; there is no live fallback in run mode. For large
+frozen run cell fields and does not require live metadata columns. A string `color_by` names a
+frozen run field such as `clusters` or `doublet_score`. To color by another artifact or a gene, use
+the granular `layout=ArtifactRef` route with typed refs. There is no live fallback in run mode.
+`layout_key=` remains the live-metadata source. Mixed source modes are rejected. For large
 continuous fields, `ds.plots.embedding_raster(run=run, layout="umap",
 color_by="doublet_score")` uses the same frozen run selection blockwise.
 

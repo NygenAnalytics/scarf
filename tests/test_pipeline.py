@@ -20,9 +20,12 @@ from scarf.storage.artifact_writer import finish_artifact, plan_artifact, start_
 from scarf.storage.artifacts import (
     ArtifactRef,
     artifact_group,
+    fingerprint_stored_arrays,
+    fingerprint_stored_strings,
     require_complete_artifact,
 )
 from scarf.storage.refs import ArtifactScope
+from scarf.storage.selections import resolve_stored_selection_artifact
 from scarf.utils.shutdown import ShutdownRequested, current_shutdown_token
 
 
@@ -77,12 +80,6 @@ class _ClusterSelectionStore:
     def __init__(self, root: Any) -> None:
         self.zw = root
         self.memoryBytes = 64 * 1024 * 1024
-
-    def _validate_reduction_cell_selection(self, pca: ArtifactRef) -> ArtifactRef:
-        status = require_complete_artifact(self.zw, pca)
-        raw_selection = (status.inputs or {}).get("cell_selection")
-        assert isinstance(raw_selection, Mapping)
-        return ArtifactRef.from_dict(raw_selection)
 
 
 def test_pipeline_field_display_summaries_read_stored_chunks() -> None:
@@ -154,6 +151,183 @@ def _array_artifact(
     return planned.ref
 
 
+def _cluster_selection_lineage(
+    root: Any,
+    *,
+    n_cells: int,
+    coordinates: np.ndarray,
+    harmony: bool = False,
+) -> dict[str, ArtifactRef]:
+    cell_ids = np.asarray([f"c{index}" for index in range(n_cells)])
+    feature_ids = np.asarray(["g0", "g1"])
+    cell_data = root.create_group("cellData")
+    cell_data.create_array("ids", data=cell_ids)
+    cell_data.create_array("I", data=np.ones(n_cells, dtype=bool))
+    feature_data = root.create_group("RNA").create_group("featureData")
+    feature_data.create_array("ids", data=feature_ids)
+    cell_selection = resolve_stored_selection_artifact(
+        root,
+        table_path="cellData",
+        id_column="ids",
+        source_column="I",
+        scope="datastore",
+        kind="cell_selection",
+        operation="test_cell_selection",
+        parameters={},
+        inputs={},
+    )
+    feature_fingerprint = fingerprint_stored_strings(feature_data["ids"])
+    feature_payload = np.ones(len(feature_ids), dtype=bool)
+    feature_selection = _rewrite_feature_universe(
+        root,
+        values=feature_payload,
+        fingerprint=feature_fingerprint,
+    )
+    normalized = _array_artifact(
+        root,
+        kind="normalized",
+        operation="run_normalization",
+        values={"values": np.zeros((n_cells, 2), dtype=np.float32)},
+        inputs={
+            "cell_selection": cell_selection,
+            "feature_selection": feature_selection,
+        },
+    )
+    pca = _array_artifact(
+        root,
+        kind="reduction",
+        operation="run_pca",
+        values={"data": np.asarray(coordinates, dtype=np.float32)},
+        inputs={"normalized": normalized},
+    )
+    scored = pca
+    if harmony:
+        scored = _array_artifact(
+            root,
+            kind="batch_correction",
+            operation="run_harmony",
+            values={"data": np.asarray(coordinates, dtype=np.float32) + 1},
+            inputs={"reduction": pca},
+        )
+    ann_index = _array_artifact(
+        root,
+        kind="ann_index",
+        operation="build_ann_index",
+        values={"index": np.arange(n_cells, dtype=np.int32)},
+        inputs={"coordinates": scored},
+    )
+    neighbors = _array_artifact(
+        root,
+        kind="neighbors",
+        operation="query_neighbors",
+        values={"indices": np.zeros((n_cells, 1), dtype=np.int32)},
+        inputs={"ann_index": ann_index, "coordinates": scored},
+    )
+    connectivity = _array_artifact(
+        root,
+        kind="connectivity_map",
+        operation="build_connectivity_map",
+        values={"data": np.ones(n_cells, dtype=np.float32)},
+        inputs={"neighbors": neighbors},
+    )
+    return {
+        "cell_selection": cell_selection,
+        "pca": pca,
+        "coordinates": scored,
+        "connectivity_map": connectivity,
+        "feature_selection": feature_selection,
+        "normalized": normalized,
+    }
+
+
+def _connectivity_from_coordinates(
+    root: Any,
+    *,
+    coordinates: ArtifactRef,
+    n_cells: int,
+) -> ArtifactRef:
+    ann_index = _array_artifact(
+        root,
+        kind="ann_index",
+        operation="build_ann_index",
+        values={"index": np.arange(n_cells, dtype=np.int32)},
+        inputs={"coordinates": coordinates},
+    )
+    neighbors = _array_artifact(
+        root,
+        kind="neighbors",
+        operation="query_neighbors",
+        values={"indices": np.zeros((n_cells, 1), dtype=np.int32)},
+        inputs={"ann_index": ann_index, "coordinates": coordinates},
+    )
+    return _array_artifact(
+        root,
+        kind="connectivity_map",
+        operation="build_connectivity_map",
+        values={"data": np.ones(n_cells, dtype=np.float32)},
+        inputs={"neighbors": neighbors},
+    )
+
+
+def _rewrite_feature_universe(
+    root: Any,
+    *,
+    values: np.ndarray,
+    fingerprint: str,
+) -> ArtifactRef:
+    planned = plan_artifact(
+        root,
+        scope="assay",
+        assay="RNA",
+        kind="feature_selection",
+        operation="create_all_features",
+        parameters={
+            "dataset_fingerprint": "test-dataset",
+            "ordered_feature_ids_fingerprint": fingerprint,
+        },
+        inputs={},
+        execution_options={},
+    )
+    group = start_artifact(root, planned)
+    group.create_array("values", data=values)
+    group.attrs["ordered_feature_ids_fingerprint"] = fingerprint
+    group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(group, ("values",))
+    finish_artifact(group, planned)
+    return planned.ref
+
+
+def _cluster_labels(
+    root: Any,
+    *,
+    values: np.ndarray,
+    cell_selection: ArtifactRef,
+    graph: ArtifactRef,
+) -> ArtifactRef:
+    return _array_artifact(
+        root,
+        kind="cluster_labels",
+        operation="run_leiden_clustering",
+        values={"values": values},
+        inputs={"graph": graph, "cell_selection": cell_selection},
+    )
+
+
+def _select_clusters(
+    store: Any,
+    lineage: Mapping[str, ArtifactRef],
+    candidates: tuple[tuple[str, ArtifactRef], ...],
+    **kwargs: Any,
+) -> tuple[ArtifactRef, str, ArtifactRef]:
+    return run_cluster_selection(
+        store,
+        coordinates=lineage["coordinates"],
+        connectivity_map=lineage["connectivity_map"],
+        cell_selection=lineage["cell_selection"],
+        candidates=candidates,
+        **kwargs,
+    )
+
+
 def test_pipeline_run_has_one_small_public_invocation() -> None:
     signature = inspect.signature(PipelineRun)
     assert tuple(signature.parameters) == ("owner", "record")
@@ -200,8 +374,20 @@ def test_pipeline_preflight_rejects_ambiguous_recipes_without_writes(
             doublets=False,
             markers=False,
         )
-    with pytest.raises(ValueError, match="at least one clustering candidate"):
+    with pytest.raises(
+        ValueError,
+        match="doublets and markers require at least one Leiden candidate",
+    ):
         datastore.pipeline.run(leiden=False, paris=False)
+    with pytest.raises(
+        ValueError,
+        match="doublets and markers require at least one Leiden candidate",
+    ):
+        datastore.pipeline.run(leiden=False, paris=True)
+    with pytest.raises(TypeError, match="leiden must be a mapping or bool"):
+        datastore.pipeline.run(leiden=None, doublets=False, markers=False)
+    with pytest.raises(TypeError, match="filtering must be a mapping or bool"):
+        datastore.pipeline.run(filtering=None)
     with pytest.raises(ValueError, match="reserved run fields"):
         datastore.pipeline.run(snapshot_columns=("clusters",))
     with pytest.raises(ValueError, match="reserved run fields"):
@@ -261,7 +447,7 @@ def test_pipeline_requested_filtering_requires_at_least_one_qc_column(
     before = tuple(run.run_id for run in datastore.pipeline.list_runs(limit=100))
 
     with pytest.raises(ValueError, match="pass filtering=False"):
-        datastore.pipeline.run(**{**_minimal_run_options(), "filtering": None})
+        datastore.pipeline.run(**{**_minimal_run_options(), "filtering": True})
 
     after = tuple(run.run_id for run in datastore.pipeline.list_runs(limit=100))
     assert after == before
@@ -554,7 +740,7 @@ def test_automatic_filtering_threads_one_distinct_analysis_selection(
     datastore = datastore_ephemeral
     input_count = int(np.count_nonzero(datastore.cells.fetch_all("I")))
     options = _minimal_run_options()
-    options["filtering"] = None
+    options["filtering"] = True
 
     run = datastore.pipeline.run(label="filtered", **options)
 
@@ -641,7 +827,7 @@ def test_default_clustering_is_selected_by_a_persisted_silhouette_decision(
         for column in assay.feats.columns
     }
     options = _minimal_run_options()
-    options["leiden"] = None
+    options["leiden"] = True
     run = datastore.pipeline.run(label="leiden-defaults", **options)
 
     partitions = ("leiden_0.5", "leiden_0.75", "leiden_1.0", "leiden_1.25")
@@ -650,6 +836,7 @@ def test_default_clustering_is_selected_by_a_persisted_silhouette_decision(
     decision = artifact_group(datastore.zw, run["cluster_selection"])
     assert tuple(decision.attrs["candidateKeys"]) == partitions
     assert tuple(decision.attrs["tieOrder"]) == partitions
+    assert "paris" not in decision.attrs["candidateKeys"]
     selected_key = decision.attrs["selectedKey"]
     assert selected_key in partitions
     assert run["clusters"] == run[selected_key]
@@ -657,6 +844,17 @@ def test_default_clustering_is_selected_by_a_persisted_silhouette_decision(
     assert scores.shape == (4,)
     assert np.isfinite(scores).any()
     assert decision["sample_indices"].shape[0] <= 10_000
+    assert dict(decision.attrs["sampleDefinition"])["sampleStrategy"] == (
+        "sharedClusterQuota"
+    )
+    assert dict(decision.attrs["sampleDefinition"])["minClusterQuota"] == 2
+    status = require_complete_artifact(datastore.zw, run["cluster_selection"])
+    assert status.inputs is not None
+    assert ArtifactRef.from_dict(status.inputs["coordinates"]) == run["pca"]
+    assert (
+        ArtifactRef.from_dict(status.inputs["connectivityMap"])
+        == run["connectivity_map"]
+    )
     assert run.cells.columns[-5:] == (*partitions, "clusters")
     assert "RNA_clusters" not in datastore.cells.columns
     assert "hvgs" not in datastore.get_assay("RNA").feats.columns
@@ -693,48 +891,37 @@ def test_cluster_selection_records_invalid_candidates_ties_and_reuse(
 ) -> None:
     root = zarr.open_group(store=MemoryStore(), mode="w")
     store = _ClusterSelectionStore(root)
-    selection = _array_artifact(
-        root,
-        scope="datastore",
-        kind="cell_selection",
-        values={"values": np.ones(6, dtype=bool)},
+    coordinates = np.asarray(
+        [
+            [0.0, 0.0],
+            [0.1, 0.0],
+            [0.0, 0.1],
+            [5.0, 5.0],
+            [5.1, 5.0],
+            [5.0, 5.1],
+        ],
+        dtype=np.float32,
     )
-    pca = _array_artifact(
+    lineage = _cluster_selection_lineage(root, n_cells=6, coordinates=coordinates)
+    selection = lineage["cell_selection"]
+    graph = lineage["connectivity_map"]
+    invalid = _cluster_labels(
         root,
-        kind="reduction",
-        operation="run_pca",
-        values={
-            "data": np.asarray(
-                [
-                    [0.0, 0.0],
-                    [0.1, 0.0],
-                    [0.0, 0.1],
-                    [5.0, 5.0],
-                    [5.1, 5.0],
-                    [5.0, 5.1],
-                ],
-                dtype=np.float32,
-            )
-        },
-        inputs={"cell_selection": selection},
+        values=np.zeros(6, dtype=np.int32),
+        cell_selection=selection,
+        graph=graph,
     )
-    invalid = _array_artifact(
+    first = _cluster_labels(
         root,
-        kind="cluster_labels",
-        values={"values": np.zeros(6, dtype=np.int32)},
-        inputs={"cell_selection": selection},
+        values=np.asarray([0, 0, 0, 1, 1, 1], dtype=np.int32),
+        cell_selection=selection,
+        graph=graph,
     )
-    first = _array_artifact(
+    second = _cluster_labels(
         root,
-        kind="cluster_labels",
-        values={"values": np.asarray([0, 0, 0, 1, 1, 1], dtype=np.int32)},
-        inputs={"cell_selection": selection},
-    )
-    second = _array_artifact(
-        root,
-        kind="cluster_labels",
-        values={"values": np.asarray([0, 0, 1, 1, 2, 2], dtype=np.int32)},
-        inputs={"cell_selection": selection},
+        values=np.asarray([0, 0, 1, 1, 2, 2], dtype=np.int32),
+        cell_selection=selection,
+        graph=graph,
     )
     monkeypatch.setattr(
         "sklearn.metrics.silhouette_score",
@@ -742,12 +929,7 @@ def test_cluster_selection_records_invalid_candidates_ties_and_reuse(
     )
     candidates = (("invalid", invalid), ("first", first), ("second", second))
 
-    decision, selected_key, selected = run_cluster_selection(
-        store,
-        pca=pca,
-        cell_selection=selection,
-        candidates=candidates,
-    )
+    decision, selected_key, selected = _select_clusters(store, lineage, candidates)
     group = artifact_group(root, decision)
     assert selected_key == "first"
     assert selected == first
@@ -757,44 +939,48 @@ def test_cluster_selection_records_invalid_candidates_ties_and_reuse(
     assert tuple(group.attrs["tieOrder"]) == ("invalid", "first", "second")
     np.testing.assert_allclose(group["scores"][:], [np.nan, 0.25, 0.25])
 
-    reused, reused_key, reused_selected = run_cluster_selection(
-        store,
-        pca=pca,
-        cell_selection=selection,
-        candidates=candidates,
-    )
+    reused, reused_key, reused_selected = _select_clusters(store, lineage, candidates)
     assert reused == decision
     assert reused_key == selected_key
     assert reused_selected == selected
+    status = require_complete_artifact(root, decision)
+    assert status.inputs is not None
+    assert ArtifactRef.from_dict(status.inputs["coordinates"]) == lineage["pca"]
+    assert ArtifactRef.from_dict(status.inputs["connectivityMap"]) == graph
+    assert dict(group.attrs["sampleDefinition"]) == {
+        "seed": 4466,
+        "populationSize": 6,
+        "sampleSize": 6,
+        "maxSampleSize": 10_000,
+        "sampleStrategy": "sharedClusterQuota",
+        "minClusterQuota": 2,
+    }
 
     group.attrs["selectedKey"] = "second"
-    replacement, replacement_key, _replacement_selected = run_cluster_selection(
+    replacement, replacement_key, _replacement_selected = _select_clusters(
         store,
-        pca=pca,
-        cell_selection=selection,
-        candidates=candidates,
+        lineage,
+        candidates,
     )
     assert replacement != decision
     assert replacement_key == "first"
 
     replacement_group = artifact_group(root, replacement)
     replacement_group["sample_indices"][0] = 1
-    resampled, resampled_key, _resampled_selected = run_cluster_selection(
+    resampled, resampled_key, _resampled_selected = _select_clusters(
         store,
-        pca=pca,
-        cell_selection=selection,
-        candidates=candidates,
+        lineage,
+        candidates,
     )
     assert resampled != replacement
     assert resampled_key == "first"
 
     resampled_group = artifact_group(root, resampled)
     resampled_group["scores"][1] = np.nan
-    rescored, rescored_key, _rescored_selected = run_cluster_selection(
+    rescored, rescored_key, _rescored_selected = _select_clusters(
         store,
-        pca=pca,
-        cell_selection=selection,
-        candidates=candidates,
+        lineage,
+        candidates,
     )
     assert rescored != resampled
     assert rescored_key == "first"
@@ -805,11 +991,10 @@ def test_cluster_selection_records_invalid_candidates_ties_and_reuse(
         first.to_dict(),
         invalid.to_dict(),
     ]
-    rereferenced, rereferenced_key, _rereferenced_selected = run_cluster_selection(
+    rereferenced, rereferenced_key, _rereferenced_selected = _select_clusters(
         store,
-        pca=pca,
-        cell_selection=selection,
-        candidates=candidates,
+        lineage,
+        candidates,
     )
     assert rereferenced != rescored
     assert rereferenced_key == "first"
@@ -820,11 +1005,10 @@ def test_cluster_selection_records_invalid_candidates_ties_and_reuse(
         value: object,
     ) -> ArtifactRef:
         artifact_group(root, current).attrs[attribute] = value
-        replacement, replacement_key, _replacement_selected = run_cluster_selection(
+        replacement, replacement_key, _replacement_selected = _select_clusters(
             store,
-            pca=pca,
-            cell_selection=selection,
-            candidates=candidates,
+            lineage,
+            candidates,
         )
         assert replacement != current
         assert replacement_key == "first"
@@ -850,7 +1034,7 @@ def test_cluster_selection_records_invalid_candidates_ties_and_reuse(
         "sampleDefinition",
         {
             "seed": 4466,
-            "populationSize": 7,
+            "populationSize": 6,
             "sampleSize": 6,
             "maxSampleSize": 10_000,
         },
@@ -860,82 +1044,361 @@ def test_cluster_selection_records_invalid_candidates_ties_and_reuse(
 def test_cluster_selection_adapter_rejects_detached_lineage() -> None:
     root = zarr.open_group(store=MemoryStore(), mode="w")
     store = _ClusterSelectionStore(root)
-    selection = _array_artifact(
+    coordinates = np.arange(8, dtype=np.float32).reshape(4, 2)
+    lineage = _cluster_selection_lineage(root, n_cells=4, coordinates=coordinates)
+    selection = lineage["cell_selection"]
+    graph = lineage["connectivity_map"]
+    labels = _cluster_labels(
         root,
-        scope="datastore",
-        kind="cell_selection",
-        values={"values": np.ones(4, dtype=bool)},
+        values=np.asarray([0, 0, 1, 1], dtype=np.int32),
+        cell_selection=selection,
+        graph=graph,
     )
-    other_selection = _array_artifact(
-        root,
-        scope="datastore",
-        kind="cell_selection",
-        values={"values": np.asarray([True, True, True, False])},
-    )
-    coordinates = {"data": np.arange(8, dtype=np.float32).reshape(4, 2)}
+    candidates = (("clusters", labels),)
+
     detached_pca = _array_artifact(
         root,
         kind="reduction",
-        values=coordinates,
-        inputs={"cell_selection": selection},
+        values={"data": coordinates},
+        inputs={
+            "normalized": _array_artifact(
+                root,
+                kind="normalized",
+                values={"values": np.zeros((4, 2), dtype=np.float32)},
+                inputs={
+                    "cell_selection": selection,
+                    "feature_selection": lineage["feature_selection"],
+                },
+            )
+        },
     )
-    labels = _array_artifact(
-        root,
-        kind="cluster_labels",
-        values={"values": np.asarray([0, 0, 1, 1], dtype=np.int32)},
-        inputs={"cell_selection": selection},
-    )
-
-    with pytest.raises(ValueError, match="PCA reduction"):
+    with pytest.raises(ValueError, match="must reference a PCA artifact"):
         run_cluster_selection(
             store,
-            pca=detached_pca,
+            coordinates=detached_pca,
+            connectivity_map=graph,
             cell_selection=selection,
-            candidates=(("clusters", labels),),
+            candidates=candidates,
         )
 
-    pca = _array_artifact(
-        root,
-        kind="reduction",
-        operation="run_pca",
-        values=coordinates,
-        inputs={"cell_selection": selection},
+    cell_data = root["cellData"]
+    cell_data.create_array(
+        "I2",
+        data=np.asarray([True, True, True, False]),
     )
-    detached_labels = _array_artifact(
+    other_selection = resolve_stored_selection_artifact(
         root,
-        kind="cluster_labels",
-        values={"values": np.asarray([0, 0, 1, 1], dtype=np.int32)},
-        inputs={"cell_selection": other_selection},
+        table_path="cellData",
+        id_column="ids",
+        source_column="I2",
+        scope="datastore",
+        kind="cell_selection",
+        operation="test_other_cell_selection",
+        parameters={},
+        inputs={},
     )
-    with pytest.raises(ValueError, match="does not use the PCA cell selection"):
-        run_cluster_selection(
-            store,
-            pca=pca,
-            cell_selection=selection,
-            candidates=(("clusters", detached_labels),),
-        )
-
+    detached_labels = _cluster_labels(
+        root,
+        values=np.asarray([0, 0, 1, 1], dtype=np.int32),
+        cell_selection=other_selection,
+        graph=graph,
+    )
     with pytest.raises(ValueError, match="does not use the requested cell selection"):
+        _select_clusters(store, lineage, (("clusters", detached_labels),))
+
+    with pytest.raises(ValueError, match="coordinates do not use the requested"):
         run_cluster_selection(
             store,
-            pca=pca,
+            coordinates=lineage["pca"],
+            connectivity_map=graph,
             cell_selection=other_selection,
-            candidates=(("clusters", labels),),
+            candidates=candidates,
         )
+
+    other_graph = _array_artifact(
+        root,
+        kind="connectivity_map",
+        values={"data": np.ones(4, dtype=np.float32)},
+        inputs={"neighbors": lineage["connectivity_map"]},
+    )
+    foreign_labels = _cluster_labels(
+        root,
+        values=np.asarray([0, 0, 1, 1], dtype=np.int32),
+        cell_selection=selection,
+        graph=other_graph,
+    )
+    with pytest.raises(
+        ValueError,
+        match="was not partitioned from the requested connectivity map",
+    ):
+        _select_clusters(store, lineage, (("clusters", foreign_labels),))
 
     wrong_scope = _array_artifact(
         root,
         scope="datastore",
         kind="cluster_labels",
         values={"values": np.asarray([0, 0, 1, 1], dtype=np.int32)},
-        inputs={"cell_selection": selection},
+        inputs={"graph": graph, "cell_selection": selection},
     )
-    with pytest.raises(ValueError, match="assay-scoped clustering artifact"):
+    with pytest.raises(ValueError, match="assay-scoped Leiden cluster-label artifact"):
+        _select_clusters(store, lineage, (("clusters", wrong_scope),))
+
+    with pytest.raises(TypeError, match="coordinates must be an ArtifactRef"):
         run_cluster_selection(
             store,
-            pca=pca,
+            coordinates="pca",  # type: ignore[arg-type]
+            connectivity_map=graph,
             cell_selection=selection,
-            candidates=(("clusters", wrong_scope),),
+            candidates=candidates,
+        )
+    with pytest.raises(TypeError, match="connectivity_map must be an ArtifactRef"):
+        run_cluster_selection(
+            store,
+            coordinates=lineage["pca"],
+            connectivity_map="graph",  # type: ignore[arg-type]
+            cell_selection=selection,
+            candidates=candidates,
+        )
+    with pytest.raises(TypeError, match="cell_selection must be an ArtifactRef"):
+        run_cluster_selection(
+            store,
+            coordinates=lineage["pca"],
+            connectivity_map=graph,
+            cell_selection="I",  # type: ignore[arg-type]
+            candidates=candidates,
+        )
+    with pytest.raises(TypeError, match="seed must be an integer"):
+        _select_clusters(store, lineage, candidates, seed=1.5)
+    with pytest.raises(ValueError, match="min_cluster_quota must be at least 1"):
+        _select_clusters(store, lineage, candidates, min_cluster_quota=0)
+
+    embedding = _array_artifact(
+        root,
+        kind="embedding",
+        values={"data": coordinates},
+        inputs={"coordinates": lineage["pca"]},
+    )
+    with pytest.raises(
+        ValueError,
+        match="assay-scoped PCA reduction or Harmony",
+    ):
+        run_cluster_selection(
+            store,
+            coordinates=embedding,
+            connectivity_map=graph,
+            cell_selection=selection,
+            candidates=candidates,
+        )
+
+    harmony_wrong_operation = _array_artifact(
+        root,
+        kind="batch_correction",
+        operation="test_not_harmony",
+        values={"data": coordinates},
+        inputs={"reduction": lineage["pca"]},
+    )
+    with pytest.raises(ValueError, match="must reference a Harmony artifact"):
+        run_cluster_selection(
+            store,
+            coordinates=harmony_wrong_operation,
+            connectivity_map=graph,
+            cell_selection=selection,
+            candidates=candidates,
+        )
+
+    with pytest.raises(ValueError, match="Native graph source must be"):
+        run_cluster_selection(
+            store,
+            coordinates=lineage["pca"],
+            connectivity_map=lineage["pca"],
+            cell_selection=selection,
+            candidates=candidates,
+        )
+
+    missing_data = _array_artifact(
+        root,
+        kind="reduction",
+        operation="run_pca",
+        values={"payload": coordinates},
+        inputs={"normalized": lineage["normalized"]},
+    )
+    missing_graph = _connectivity_from_coordinates(
+        root,
+        coordinates=missing_data,
+        n_cells=4,
+    )
+    with pytest.raises(ValueError, match="missing its data array"):
+        run_cluster_selection(
+            store,
+            coordinates=missing_data,
+            connectivity_map=missing_graph,
+            cell_selection=selection,
+            candidates=candidates,
+        )
+
+    flat = _array_artifact(
+        root,
+        kind="reduction",
+        operation="run_pca",
+        values={"data": np.arange(4, dtype=np.float32)},
+        inputs={"normalized": lineage["normalized"]},
+    )
+    flat_graph = _connectivity_from_coordinates(root, coordinates=flat, n_cells=4)
+    with pytest.raises(ValueError, match="non-empty two-dimensional array"):
+        run_cluster_selection(
+            store,
+            coordinates=flat,
+            connectivity_map=flat_graph,
+            cell_selection=selection,
+            candidates=candidates,
+        )
+
+    with pytest.raises(ValueError, match="at least one candidate"):
+        _select_clusters(store, lineage, ())
+    with pytest.raises(TypeError, match=r"\(key, ArtifactRef\) tuples"):
+        _select_clusters(store, lineage, ("clusters", labels))  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="non-empty strings"):
+        _select_clusters(store, lineage, (("", labels),))
+    with pytest.raises(TypeError, match="must be an ArtifactRef"):
+        _select_clusters(store, lineage, (("clusters", "labels"),))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="must be unique"):
+        _select_clusters(store, lineage, (("clusters", labels), ("clusters", labels)))
+
+    short_labels = _cluster_labels(
+        root,
+        values=np.asarray([0, 0, 1], dtype=np.int32),
+        cell_selection=selection,
+        graph=graph,
+    )
+    with pytest.raises(ValueError, match="does not align with coordinate rows"):
+        _select_clusters(store, lineage, (("clusters", short_labels),))
+
+    missing_selection = _array_artifact(
+        root,
+        kind="cluster_labels",
+        operation="run_leiden_clustering",
+        values={"values": np.asarray([0, 0, 1, 1], dtype=np.int32)},
+        inputs={"graph": graph},
+    )
+    with pytest.raises(ValueError, match="has no 'cell_selection' artifact input"):
+        _select_clusters(store, lineage, (("clusters", missing_selection),))
+
+    malformed_selection = _array_artifact(
+        root,
+        kind="cluster_labels",
+        operation="run_leiden_clustering",
+        values={"values": np.asarray([0, 0, 1, 1], dtype=np.int32)},
+        inputs={
+            "graph": graph,
+            "cell_selection": {"type": "artifact", "scope": "nope"},
+        },
+    )
+    with pytest.raises(ValueError, match="malformed 'cell_selection' artifact input"):
+        _select_clusters(store, lineage, (("clusters", malformed_selection),))
+
+    paris_cut = _array_artifact(
+        root,
+        kind="cluster_cut",
+        operation="cut_paris_tree",
+        values={"labels": np.asarray([0, 0, 1, 1], dtype=np.int32)},
+        inputs={"connectivity_map": graph, "cell_selection": selection},
+    )
+    with pytest.raises(ValueError, match="assay-scoped Leiden cluster-label artifact"):
+        _select_clusters(store, lineage, (("paris", paris_cut),))
+
+    imported_labels = _array_artifact(
+        root,
+        kind="cluster_labels",
+        operation="import_cluster_labels",
+        values={"values": np.asarray([0, 0, 1, 1], dtype=np.int32)},
+        inputs={"graph": graph, "cell_selection": selection},
+    )
+    with pytest.raises(ValueError, match="must reference a Leiden clustering artifact"):
+        _select_clusters(store, lineage, (("imported", imported_labels),))
+
+
+def test_empty_filtering_mapping_uses_automatic_defaults(
+    datastore_ephemeral,
+) -> None:
+    from scarf.datastore._pipeline_recipe import resolve_pipeline_recipe
+
+    recipe = resolve_pipeline_recipe(
+        datastore_ephemeral,
+        assay=None,
+        label=None,
+        cell_key="I",
+        filtering={},
+        harmony_batch_columns=None,
+        hvg_count=50,
+        pca_dims=3,
+        neighbors_k=3,
+        umap=False,
+        leiden=False,
+        cell_cycle=False,
+        paris=False,
+        doublets=False,
+        markers=False,
+        snapshot_columns=(),
+    )
+
+    assert recipe.filtering["enabled"] is True
+    assert recipe.filtering["method"] == "auto"
+    assert recipe.leiden_partitions == ()
+
+
+def test_cluster_selection_scores_harmony_coordinates_not_pca(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    store = _ClusterSelectionStore(root)
+    pca_values = np.arange(8, dtype=np.float32).reshape(4, 2)
+    lineage = _cluster_selection_lineage(
+        root,
+        n_cells=4,
+        coordinates=pca_values,
+        harmony=True,
+    )
+    labels = _cluster_labels(
+        root,
+        values=np.asarray([0, 0, 1, 1], dtype=np.int32),
+        cell_selection=lineage["cell_selection"],
+        graph=lineage["connectivity_map"],
+    )
+    seen: list[np.ndarray] = []
+
+    def capture_score(sampled_coordinates: np.ndarray, *_args, **_kwargs) -> float:
+        seen.append(np.asarray(sampled_coordinates, dtype=np.float64).copy())
+        return 0.4
+
+    monkeypatch.setattr("sklearn.metrics.silhouette_score", capture_score)
+    decision, selected_key, selected = _select_clusters(
+        store,
+        lineage,
+        (("clusters", labels),),
+    )
+    assert selected_key == "clusters"
+    assert selected == labels
+    status = require_complete_artifact(root, decision)
+    assert status.inputs is not None
+    assert ArtifactRef.from_dict(status.inputs["coordinates"]) == lineage["coordinates"]
+    assert lineage["coordinates"] != lineage["pca"]
+    assert seen
+    harmony_values = np.asarray(
+        artifact_group(root, lineage["coordinates"])["data"][:],
+        dtype=np.float64,
+    )
+    np.testing.assert_allclose(seen[0], harmony_values)
+
+    with pytest.raises(
+        ValueError,
+        match="was not built from the scored coordinates",
+    ):
+        run_cluster_selection(
+            store,
+            coordinates=lineage["pca"],
+            connectivity_map=lineage["connectivity_map"],
+            cell_selection=lineage["cell_selection"],
+            candidates=(("clusters", labels),),
         )
 
 
@@ -995,6 +1458,10 @@ def test_rich_pipeline_views_plots_and_markers_remain_frozen_after_live_i_drift(
     ]
     decision = artifact_group(datastore.zw, run["cluster_selection"])
     assert run["clusters"] == run[decision.attrs["selectedKey"]]
+    assert decision.attrs["selectedKey"].startswith("leiden_")
+    assert "paris" not in decision.attrs["candidateKeys"]
+    assert "paris" in run
+    assert run["clusters"] != run["paris"]
     assert set(datastore.cells.columns) == set(cell_values_before)
     assert set(assay.feats.columns) == set(feature_values_before)
     for column, values in cell_values_before.items():
@@ -1089,6 +1556,15 @@ def test_harmony_doublets_record_an_uncorrected_internal_graph_only(
 
     assert run["clusters"] == captured["clusters"]
     assert captured["connectivity"] != run["connectivity_map"]
+    decision = artifact_group(datastore.zw, run["cluster_selection"])
+    status = require_complete_artifact(datastore.zw, run["cluster_selection"])
+    assert status.inputs is not None
+    assert ArtifactRef.from_dict(status.inputs["coordinates"]) == run["harmony"]
+    assert (
+        ArtifactRef.from_dict(status.inputs["connectivityMap"])
+        == run["connectivity_map"]
+    )
+    assert tuple(decision.attrs["candidateKeys"]) == ("leiden_1.0",)
     assert not any(key.startswith("uncorrected_") for key in run)
     stage = next(
         item for item in run.report()["stages"] if item["stage"] == "doublet_graph"
@@ -1103,3 +1579,22 @@ def test_harmony_doublets_record_an_uncorrected_internal_graph_only(
         "uncorrected_connectivity_map",
     }
     assert captured["connectivity"] == stage_outputs["uncorrected_connectivity_map"]
+
+
+def test_paris_only_pipeline_keeps_paris_as_a_diagnostic_without_clusters(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    run = datastore.pipeline.run(
+        **{
+            **_minimal_run_options(),
+            "leiden": False,
+            "paris": True,
+        }
+    )
+
+    assert "paris" in run
+    assert "clusters" not in run
+    assert "cluster_selection" not in run
+    assert "leiden_1.0" not in run
+    assert list(run).count("paris") == 1

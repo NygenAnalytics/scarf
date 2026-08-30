@@ -12,6 +12,9 @@ from ._types import MatrixData
 type ClusterLabels = np.ndarray | zarr.Array
 type ClusterCandidate = tuple[str, ClusterLabels]
 
+SHARED_CLUSTER_QUOTA_STRATEGY = "sharedClusterQuota"
+DEFAULT_MIN_CLUSTER_QUOTA = 2
+
 
 def _integer(
     value: object,
@@ -27,6 +30,73 @@ def _integer(
     return resolved
 
 
+def _read_all_labels(
+    labels: ClusterLabels,
+    *,
+    expected_rows: int,
+) -> np.ndarray:
+    if len(labels.shape) != 1:
+        raise ValueError("candidate labels must be one-dimensional")
+    if int(labels.shape[0]) != expected_rows:
+        raise ValueError(
+            f"candidate has {labels.shape[0]} labels for {expected_rows} coordinate rows"
+        )
+    return np.asarray(labels[:])
+
+
+def shared_cluster_quota_sample_indices(
+    candidates: Sequence[ClusterCandidate],
+    *,
+    n_cells: int,
+    seed: int,
+    max_sample_size: int,
+    min_cluster_quota: int = DEFAULT_MIN_CLUSTER_QUOTA,
+    checkpoint: Callable[[], None] | None = None,
+) -> np.ndarray:
+    """Return one seeded sample that covers every cluster in every candidate."""
+    n_cells = _integer(n_cells, "n_cells", minimum=1)
+    seed = _integer(seed, "seed", minimum=0)
+    max_sample_size = _integer(max_sample_size, "max_sample_size", minimum=1)
+    min_cluster_quota = _integer(
+        min_cluster_quota,
+        "min_cluster_quota",
+        minimum=1,
+    )
+    if n_cells <= max_sample_size:
+        return np.arange(n_cells, dtype=np.int64)
+
+    rng = np.random.default_rng(seed)
+    required: set[int] = set()
+    for candidate in candidates:
+        if checkpoint is not None:
+            checkpoint()
+        if not isinstance(candidate, tuple) or len(candidate) != 2:
+            raise TypeError("candidates must contain (key, labels) tuples")
+        _key, labels = candidate
+        values = _read_all_labels(labels, expected_rows=n_cells)
+        unique_labels = np.unique(values)
+        for label in unique_labels:
+            cluster_indices = np.flatnonzero(values == label)
+            quota = min(int(cluster_indices.size), min_cluster_quota)
+            chosen = rng.choice(cluster_indices, size=quota, replace=False)
+            required.update(int(index) for index in chosen)
+    if len(required) > max_sample_size:
+        raise ValueError(
+            "Shared cluster-quota sample requires "
+            f"{len(required)} cells, which exceeds max_sample_size={max_sample_size}"
+        )
+    remaining = max_sample_size - len(required)
+    if remaining > 0:
+        pool = np.fromiter(
+            (index for index in range(n_cells) if index not in required),
+            dtype=np.int64,
+            count=n_cells - len(required),
+        )
+        extra = rng.choice(pool, size=remaining, replace=False)
+        required.update(int(index) for index in extra)
+    return np.sort(np.fromiter(required, dtype=np.int64, count=len(required)))
+
+
 @dataclass(frozen=True, slots=True, eq=False)
 class ClusterSelectionResult:
     """Immutable outcome of a bounded silhouette comparison."""
@@ -40,6 +110,8 @@ class ClusterSelectionResult:
     population_size: int
     max_sample_size: int
     working_memory_mib: int
+    sample_strategy: str = SHARED_CLUSTER_QUOTA_STRATEGY
+    min_cluster_quota: int = DEFAULT_MIN_CLUSTER_QUOTA
 
     def __post_init__(self) -> None:
         candidate_keys = tuple(self.candidate_keys)
@@ -101,6 +173,18 @@ class ClusterSelectionResult:
             "working_memory_mib",
             minimum=1,
         )
+        if (
+            not isinstance(self.sample_strategy, str)
+            or self.sample_strategy != SHARED_CLUSTER_QUOTA_STRATEGY
+        ):
+            raise ValueError(
+                f"sample_strategy must be {SHARED_CLUSTER_QUOTA_STRATEGY!r}"
+            )
+        min_cluster_quota = _integer(
+            self.min_cluster_quota,
+            "min_cluster_quota",
+            minimum=1,
+        )
         expected_sample_size = min(population_size, max_sample_size)
         if len(sample_indices) != expected_sample_size:
             raise ValueError("sample_indices has an unexpected size")
@@ -133,6 +217,7 @@ class ClusterSelectionResult:
         object.__setattr__(self, "population_size", population_size)
         object.__setattr__(self, "max_sample_size", max_sample_size)
         object.__setattr__(self, "working_memory_mib", working_memory_mib)
+        object.__setattr__(self, "min_cluster_quota", min_cluster_quota)
 
     @property
     def metric(self) -> Literal["euclidean"]:
@@ -143,13 +228,15 @@ class ClusterSelectionResult:
         return len(self.sample_indices)
 
     @property
-    def sample_definition(self) -> Mapping[str, int]:
+    def sample_definition(self) -> Mapping[str, int | str]:
         return MappingProxyType(
             {
                 "seed": self.seed,
                 "populationSize": self.population_size,
                 "sampleSize": self.sample_size,
                 "maxSampleSize": self.max_sample_size,
+                "sampleStrategy": self.sample_strategy,
+                "minClusterQuota": self.min_cluster_quota,
             }
         )
 
@@ -168,7 +255,7 @@ def _read_label_rows(
         raise ValueError("candidate labels must be one-dimensional")
     if int(labels.shape[0]) != expected_rows:
         raise ValueError(
-            f"candidate has {labels.shape[0]} labels for {expected_rows} PCA rows"
+            f"candidate has {labels.shape[0]} labels for {expected_rows} coordinate rows"
         )
     if isinstance(labels, zarr.Array):
         return np.asarray(labels.get_orthogonal_selection((sample_indices,)))
@@ -182,16 +269,17 @@ def select_clusters_by_silhouette(
     seed: int = 4466,
     max_sample_size: int = 10_000,
     working_memory_mib: int = 1024,
+    min_cluster_quota: int = DEFAULT_MIN_CLUSTER_QUOTA,
     checkpoint: Callable[[], None] | None = None,
 ) -> ClusterSelectionResult:
-    """Choose the first maximum silhouette score on one shared uniform sample."""
+    """Choose the first maximum silhouette on one shared cluster-quota sample."""
     if len(coordinates.shape) != 2:
-        raise ValueError("PCA coordinates must be two-dimensional")
+        raise ValueError("Coordinates must be two-dimensional")
     n_cells = int(coordinates.shape[0])
     if n_cells <= 0:
-        raise ValueError("Cluster selection has no PCA rows to sample")
+        raise ValueError("Cluster selection has no coordinate rows to sample")
     if int(coordinates.shape[1]) <= 0:
-        raise ValueError("PCA coordinates must contain at least one dimension")
+        raise ValueError("Coordinates must contain at least one dimension")
 
     seed = _integer(seed, "seed", minimum=0)
     max_sample_size = _integer(
@@ -202,6 +290,11 @@ def select_clusters_by_silhouette(
     working_memory_mib = _integer(
         working_memory_mib,
         "working_memory_mib",
+        minimum=1,
+    )
+    min_cluster_quota = _integer(
+        min_cluster_quota,
+        "min_cluster_quota",
         minimum=1,
     )
     resolved_candidates = tuple(candidates)
@@ -220,22 +313,25 @@ def select_clusters_by_silhouette(
     if len(candidate_keys) != len(set(candidate_keys)):
         raise ValueError("Cluster selection candidate keys must be unique")
 
-    sample_size = min(n_cells, max_sample_size)
-    sample_indices = np.sort(
-        np.random.default_rng(seed)
-        .choice(n_cells, size=sample_size, replace=False)
-        .astype(np.int64)
+    sample_indices = shared_cluster_quota_sample_indices(
+        resolved_candidates,
+        n_cells=n_cells,
+        seed=seed,
+        max_sample_size=max_sample_size,
+        min_cluster_quota=min_cluster_quota,
+        checkpoint=checkpoint,
     )
+    sample_size = len(sample_indices)
     sampled_coordinates = np.asarray(
         read_matrix_rows(coordinates, sample_indices),
         dtype=np.float64,
     )
     if sampled_coordinates.shape != (sample_size, int(coordinates.shape[1])):
-        raise ValueError("Sampled PCA coordinates have an unexpected shape")
+        raise ValueError("Sampled coordinates have an unexpected shape")
     coordinate_error = (
         None
         if np.all(np.isfinite(sampled_coordinates))
-        else "sampled PCA coordinates contain non-finite values"
+        else "sampled coordinates contain non-finite values"
     )
     scores = np.full(len(resolved_candidates), np.nan, dtype=np.float64)
     invalid_reasons: list[str | None] = []
@@ -301,4 +397,5 @@ def select_clusters_by_silhouette(
         population_size=n_cells,
         max_sample_size=max_sample_size,
         working_memory_mib=working_memory_mib,
+        min_cluster_quota=min_cluster_quota,
     )

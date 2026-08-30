@@ -30,10 +30,11 @@ def to_h5ad(
         skip_recalc_nfeats: Skip recalculating nFeatures per cell. (Default value: True)
         nthreads: Number of processing threads to use (Default value: 4)
         run: Completed pipeline run opened from the datastore that owns
-             ``assay``. The frozen run selections and fields are exported;
-             UMAP coordinates are written to ``obsm['X_umap']`` and cluster
-             labels remain in ``obs['clusters']``. Live embedding columns and
-             feature-count recalculation options do not apply to run export.
+             ``assay``. The frozen run selections and fields are exported.
+             Consecutive frozen UMAP fields are already in ``obsm['X_umap']``
+             from ``to_anndata(run=...)``; cluster labels remain in
+             ``obs['clusters']``. Live embedding columns and feature-count
+             recalculation options do not apply to run export.
 
     Returns:
         None
@@ -73,20 +74,6 @@ def to_h5ad(
         adata = to_anndata(run=pipeline_run)
         if adata is None:
             return None
-        umap_columns: dict[int, str] = {}
-        for column in adata.obs.columns:
-            prefix, separator, suffix = str(column).rpartition("_")
-            if prefix == "umap" and separator and suffix.isdigit():
-                component = int(suffix)
-                if component > 0:
-                    umap_columns[component] = str(column)
-        if umap_columns:
-            expected = list(range(1, max(umap_columns) + 1))
-            if sorted(umap_columns) != expected:
-                raise ValueError("Frozen UMAP fields must be consecutively numbered")
-            ordered_columns = [umap_columns[index] for index in expected]
-            adata.obsm["X_umap"] = adata.obs[ordered_columns].to_numpy(copy=True)
-            adata.obs.drop(columns=ordered_columns, inplace=True)
         adata.write_h5ad(h5ad_filename)
         logger.info(
             f"Exported pipeline run {pipeline_run.run_id} with {adata.n_obs} cells and "

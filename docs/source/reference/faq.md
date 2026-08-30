@@ -122,8 +122,11 @@ ds.plots.cluster_tree(
 )
 ```
 
-Use silhouette scores or domain knowledge to compare the candidates. The RNA pipeline performs a
-deterministic silhouette comparison automatically and exposes the selected ref as `run["clusters"]`.
+Use silhouette scores or domain knowledge to compare the candidates. The RNA pipeline scores
+Leiden resolutions automatically in graph space and exposes the selected ref as `run["clusters"]`.
+That result is a reproducible baseline, not proof that the selected resolution is biologically
+correct. Granular evaluation APIs such as `evaluate_cluster_separability` can inspect partitions
+outside the pipeline.
 
 ## Why will my existing RNA Zarr store not open?
 

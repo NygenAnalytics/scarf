@@ -145,7 +145,9 @@ scarf.to_h5ad(ds.RNA, "pipeline-analysis.h5ad", run=run)
 ```
 
 The direct run export writes frozen UMAP coordinates to `obsm["X_umap"]` and frozen cluster
-labels to `obs["clusters"]`.
+labels to `obs["clusters"]`. `ds.to_anndata(run=run)` uses the same layout, so in-memory AnnData
+and `scarf.to_h5ad(..., run=run)` stay aligned. A run with `umap=False` does not invent an
+embedding.
 
 `ds.to_anndata()` defaults to active cells (`I`) and all features.
 Pass `feature_indexes` or `feature_names` to subset features.

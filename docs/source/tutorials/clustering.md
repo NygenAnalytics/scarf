@@ -221,9 +221,11 @@ support, technical covariates, replicate coverage, and the study question.
 
 ## 6. Pipeline cluster selection
 
-When a pipeline run includes multiple Leiden candidates or Paris, it evaluates them with one
-deterministic sample of at most 10,000 cells in PCA space. Its `cluster_selection` artifact persists
-the scores, invalid-candidate reasons, tie order, and selected key:
+When a pipeline run includes multiple Leiden candidates, it scores them with one deterministic
+shared sample of at most 10,000 cells in the graph's PCA or Harmony coordinates. Paris can still
+run as `clustering_run["paris"]`, but it is not an automatic winner. The `cluster_selection`
+artifact persists the scores, sampling policy, invalid-candidate reasons, tie order, and selected
+key:
 
 ```python
 decision_ref = clustering_run["cluster_selection"]

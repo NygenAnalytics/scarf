@@ -446,9 +446,10 @@ def test_live_bucket_catalog_is_public():
 
 
 @pytest.mark.integration
-def test_live_zarr_archive_download(tmp_path):
+def test_live_zarr_archive_download(tmp_path, monkeypatch):
     from scarf import cytebase
 
+    monkeypatch.delenv("SCARF_CYTEBASE_LOCAL", raising=False)
     dataset_path = cytebase.connect("scarf_docs").download_dataset(
         "tenx_5K_pbmc_rnaseq",
         tmp_path,

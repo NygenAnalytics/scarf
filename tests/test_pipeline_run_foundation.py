@@ -11,6 +11,7 @@ from zarr.storage import FsspecStore, LoggingStore, MemoryStore, ZipStore
 import scarf.storage.pipeline_runs as pipeline_run_storage
 from scarf.datastore.pipeline_accessor import PipelineAccessor
 from scarf.datastore.pipeline_run import (
+    PipelineAxisView,
     PipelineExecutionError,
     PipelineRun,
     list_pipeline_runs,
@@ -1444,12 +1445,23 @@ def test_run_view_selected_blocks_and_head_are_bounded() -> None:
         "maximum": 40.0,
         "scale": "linear",
     }
-    plot_store = _FrozenRunPlotStore(run._owner, run)
+    plot_store = _FrozenRunPlotStore(
+        run._owner,
+        assay=run.assay,
+        cells=run.cells,
+    )
     np.testing.assert_allclose(
         plot_store.cells.fetch_all("nullable_score"),
         [10.0, 20.0, np.nan, 40.0],
         equal_nan=True,
     )
+    np.testing.assert_allclose(
+        plot_store.cells.fetch("nullable_score"),
+        [10.0, np.nan],
+        equal_nan=True,
+    )
+    np.testing.assert_array_equal(plot_store.cells.fetch("ids"), ["c1", "c3"])
+    np.testing.assert_array_equal(plot_store.cells.fetch("clusters"), [0, 2])
     assert stored_display_metadata(plot_store, "nullable_score") == {
         "kind": "continuous",
         "colormap": "viridis",
@@ -1584,6 +1596,54 @@ def test_pipeline_records_reject_extra_persisted_fields() -> None:
 
     with pytest.raises(ValueError, match="extra"):
         load_pipeline_run_record(root, record.run_id)
+
+
+def test_run_view_is_cached_and_rechecks_live_ids_on_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _root()
+    run = _completed_run(root)
+    validations: list[str] = []
+    original = PipelineAxisView._validate_contract
+
+    def spy(self) -> None:
+        validations.append(self._axis)
+        original(self)
+
+    monkeypatch.setattr(PipelineAxisView, "_validate_contract", spy)
+    cells = run.cells
+    again = run.cells
+    features = run.features
+    same_features = run.features
+
+    assert cells is again
+    assert features is same_features
+    assert validations == ["cells", "features"]
+    np.testing.assert_array_equal(cells.fetch("clusters"), [0, 2])
+    root["cellData/ids"][:] = np.asarray(["c2", "c1", "c3", "c4"])
+    with pytest.raises(ArtifactResolutionError) as caught:
+        cells.fetch("clusters")
+    assert caught.value.code == "row_identity_mismatch"
+
+
+def test_run_view_fetch_does_not_expand_compact_cluster_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _root()
+    run = _completed_run(root)
+    expanded: list[str] = []
+    original = PipelineAxisView._full_axis_values
+
+    def spy(self, descriptor):
+        expanded.append(descriptor.key)
+        return original(self, descriptor)
+
+    monkeypatch.setattr(PipelineAxisView, "_full_axis_values", spy)
+    np.testing.assert_array_equal(run.cells.fetch("clusters"), [0, 2])
+    np.testing.assert_allclose(run.cells.fetch("umap_1"), [1.0, 3.0])
+    assert expanded == []
+    run.cells.fetch_all("clusters")
+    assert expanded == ["clusters"]
 
 
 def test_pipeline_execution_error_exposes_durable_identity() -> None:
