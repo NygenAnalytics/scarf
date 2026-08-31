@@ -131,6 +131,7 @@ def configure_doc_execution_env(
         {
             "SCARF_MEM_BUDGET": "4G",
             "SCARF_WORKERS": "2",
+            "SCARF_DOCS_DATA_DIR": str(SOURCE_DIR / "scarf_datasets"),
             "OMP_NUM_THREADS": "2",
             "MKL_NUM_THREADS": "2",
             "OPENBLAS_NUM_THREADS": "2",

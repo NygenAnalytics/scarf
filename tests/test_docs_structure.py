@@ -9,6 +9,16 @@ _DOCS_SOURCE = _REPOSITORY_ROOT / "docs" / "source"
 _MARKDOWN_LINK = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
 
 
+def _toc_section(contents: str, caption: str) -> str:
+    match = re.search(
+        rf"(?ms)^  - caption: {re.escape(caption)}\s*$"
+        rf"(?P<body>.*?)(?=^  - caption: |\Z)",
+        contents,
+    )
+    assert match is not None, caption
+    return match.group("body")
+
+
 def test_llms_index_links_to_local_documentation() -> None:
     contents = (_DOCS_SOURCE / "llms.txt").read_text()
     targets = _MARKDOWN_LINK.findall(contents)
@@ -21,6 +31,72 @@ def test_llms_index_links_to_local_documentation() -> None:
         source = _DOCS_SOURCE / f"{page.removesuffix('.html')}.md"
         assert source.resolve().is_relative_to(_DOCS_SOURCE.resolve())
         assert source.is_file(), target
+
+
+def test_documentation_navigation_uses_learning_layers() -> None:
+    toctree = (_DOCS_SOURCE / "toctree.yml").read_text()
+    captions = re.findall(r"(?m)^  - caption: (.+)$", toctree)
+
+    assert captions == [
+        "Get started",
+        "Core workflows",
+        "Biological recipes",
+        "Integration and mapping",
+        "Diagnostics and method choices",
+        "Data, remote, and scale",
+        "Artifacts and automation",
+        "Advanced examples",
+        "Reference",
+        "Developers",
+    ]
+    assert re.findall(
+        r"(?m)^\s+- file: (\S+)\s*$",
+        _toc_section(toctree, "Core workflows"),
+    ) == [
+        "tutorials/scrna_seq",
+        "tutorials/scatac_seq",
+        "tutorials/cite_seq",
+    ]
+
+    get_started = _toc_section(toctree, "Get started")
+    artifacts = _toc_section(toctree, "Artifacts and automation")
+    diagnostics = _toc_section(toctree, "Diagnostics and method choices")
+    advanced = _toc_section(toctree, "Advanced examples")
+    assert "analysis_with_agents" not in get_started
+    assert "tutorials/agent_workflow" not in get_started
+    assert "analysis_with_agents" in artifacts
+    assert "tutorials/agent_workflow" in artifacts
+    assert "tutorials/multimodal_diagnostics" in diagnostics
+    assert "tutorials/tea_seq" in advanced
+    assert "tutorials/hto_demultiplexing" in advanced
+
+
+def test_focused_scanpy_and_seurat_guides_preserve_migration_routes() -> None:
+    toctree = (_DOCS_SOURCE / "toctree.yml").read_text()
+    landing = (_DOCS_SOURCE / "scanpy_and_seurat.md").read_text()
+    conf = ast.parse((_DOCS_SOURCE / "conf.py").read_text())
+    redirect_assignments = [
+        ast.literal_eval(node.value)
+        for node in conf.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "redirects"
+            for target in node.targets
+        )
+    ]
+
+    assert (_DOCS_SOURCE / "scanpy.md").is_file()
+    assert (_DOCS_SOURCE / "seurat.md").is_file()
+    assert "(scanpy_and_seurat)=" in landing
+    assert "{doc}`scanpy`" in landing
+    assert "{doc}`seurat`" in landing
+    assert re.search(r"(?m)^\s+- file: scanpy\s*$", toctree)
+    assert re.search(r"(?m)^\s+- file: seurat\s*$", toctree)
+    assert len(redirect_assignments) == 1
+    assert redirect_assignments[0]["scarf_and_scanpy"] == "scanpy.html"
+    assert redirect_assignments[0]["tutorials/multimodal_integration"] == (
+        "cite_seq.html#multimodal-integration"
+    )
 
 
 def test_agent_guide_and_llms_index_are_published() -> None:

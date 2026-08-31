@@ -1,5 +1,5 @@
 ---
-description: Compare control and IFN-beta-stimulated PBMCs with Welch's t-test, Mann-Whitney, and Kruskal-Wallis, then read the persisted artifacts back and overlay brackets on violin plots.
+description: Compare rheumatoid arthritis and control gamma-delta T cells with a paired, donor-level Wilcoxon workflow on the Binvignat PBMC dataset.
 jupytext:
   text_representation:
     extension: .md
@@ -14,232 +14,272 @@ kernelspec:
 
 # Comparing biological conditions with statistical testing
 
-Scarf can compare value distributions of genes or cell metadata across an experimental design and keep every result as a retrievable artifact.
-This page uses the classic interferon response design: peripheral blood mononuclear cells (PBMCs) left untreated versus stimulated with IFN-beta.
-Today we will compare control and IFN-beta-stimulated PBMCs with Welch's t-test, Mann-Whitney, and Kruskal-Wallis, then read the persisted variants back and overlay brackets on violin plots.
-You will run Welch's t-tests between the two conditions, cross-check them against the rank-based defaults, test across imported cell types with Kruskal-Wallis plus Dunn's post-hoc, and overlay significance brackets directly onto violin plots.
+This workflow asks one narrow question: do matched rheumatoid arthritis (RA) and control donors differ in gamma-delta T-cell expression of six selected genes?
+The donor is the unit of inference.
+Cells are averaged within donors, and a paired Wilcoxon signed-rank test compares the 18 matched RA-control pairs.
+This avoids treating 1,386 cells as independent biological replicates.
 
-Everything on this page is descriptive distribution testing on single cells.
-It tells you which genes shift between conditions and how strongly, but it is not replicate-aware differential expression; see the note at the end and {doc}`pseudobulk_and_differential_expression` for that distinction.
+The result is a sample-level distribution test on normalized expression.
+It is not a raw-count pseudobulk differential expression model.
 
-## Prerequisites
+## Dataset and prerequisites
 
-- Scarf installed (see {doc}`/quickstart`)
-- Network access to download the dataset on first run
+The data come from the [CELLxGENE collection](https://cellxgene.cziscience.com/collections/e1a9ca56-f2ee-435d-980a-4f49ab7a952b) for the [Binvignat et al. paper](https://doi.org/10.1172/jci.insight.178499).
+This page pins the versioned CELLxGENE H5AD rather than depending on a mutable collection download.
+You need enough local disk space for both the H5AD and its converted Zarr store, plus network access on the first run.
 
-## What you will learn
+The dataset URL below is used only to download a file.
+Scarf does not compute against the URL: inspection reads the local H5AD, and every analysis step reads a local Zarr count source.
 
-- Run one-sided and two-sided Welch's t-tests between two conditions
-- Read persisted results back with `get_statistical_tests` from the returned `ArtifactRef`
-- Test many genes in one call with pooled Benjamini-Hochberg correction
-- Cross-check parametric results against Mann-Whitney and Kruskal-Wallis with Dunn's post-hoc
-- Overlay significance brackets onto violin, stacked violin, and box plots
+## 1. Download, inspect, and mount the count source
 
-## Dataset
-
-`kang_29K_ctrl-ifnb_pbmc_rnaseq` is the published merge of two Kang-style PBMC stores: untreated control cells and cells stimulated with IFN-beta.
-Each cell carries a `sample_id` metadata column that records its treatment (`ctrl` or `stim`), so the column doubles as the condition label.
-Interferon-stimulated genes such as `ISG15`, `IFIT1`, and `MX1` are strongly induced in the stimulated cells, while housekeeping or lineage genes like `CD3D` and `LYZ` shift much less, which makes the dataset convenient for seeing the difference between strong, subtle, and absent effects.
-
-## 1. Open a writable copy of the store
-
-Download the published store and mount a writable analysis copy.
-Statistical results are persisted as artifacts, so the store must be writable.
-The mount copies cell metadata, including `sample_id` and the imported cell-type labels, while counts stay in the downloaded source.
+Download the H5AD if it is absent, then inspect it before conversion.
+The assertions pin the matrix choice and dimensions used for this analysis.
+`raw/X` contains integer-like counts, while `X` is also present as another matrix candidate.
 
 ```{code-cell} ipython3
+from os import environ
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib.request import urlretrieve
 
 import numpy as np
+import pandas as pd
 
 import scarf
-from scarf.plotting import CellField
+from scarf.plotting import CellField, StudyDesign
 
 scarf.configure_output(level="WARNING", progress=False)
 
-repository = scarf.cytebase.connect("scarf_docs")
-merged_path = repository.download_dataset(
-    name="kang_29K_ctrl-ifnb_pbmc_rnaseq",
-    destination="scarf_datasets",
-    zarr=True,
+DATA_URL = (
+    "https://datasets.cellxgene.cziscience.com/"
+    "3b751975-34bb-409a-a9b7-98380f0450ea.h5ad"
 )
-analysis_directory = TemporaryDirectory()
-ds = scarf.mount_datastore(
-    f"{merged_path}/data.zarr",
-    at=str(Path(analysis_directory.name) / "condition_analysis.zarr"),
+dataset_directory = Path(environ.get("SCARF_DOCS_DATA_DIR", "scarf_datasets"))
+dataset_directory.mkdir(parents=True, exist_ok=True)
+h5ad_path = dataset_directory / "binvignat_ra_pbmc.h5ad"
+source_store = dataset_directory / "binvignat_ra_pbmc.zarr"
+
+if not h5ad_path.exists():
+    partial_path = h5ad_path.with_suffix(".h5ad.part")
+    urlretrieve(DATA_URL, partial_path)
+    partial_path.replace(h5ad_path)
+
+inspection = scarf.inspect_h5ad(str(h5ad_path))
+assert inspection.matrixKey == "raw/X"
+assert {"raw/X", "X"}.issubset(inspection.matrixCandidates)
+assert inspection.integerLike is True
+assert (inspection.nCells, inspection.nFeatures) == (108_717, 21_648)
+{
+    "matrix": inspection.matrixKey,
+    "encoding": inspection.matrixEncoding,
+    "integer-like": inspection.integerLike,
+    "shape": (inspection.nCells, inspection.nFeatures),
+}
+```
+
+Convert only when the reusable local source store is absent.
+The reader is built from the inspected keys rather than from assumptions about the H5AD layout.
+
+```{code-cell} ipython3
+if not source_store.exists():
+    with TemporaryDirectory(dir=dataset_directory) as conversion_directory:
+        staged_store = Path(conversion_directory) / source_store.name
+        reader = scarf.H5adReader.from_inspect(inspection)
+        try:
+            scarf.H5adToZarr(
+                reader,
+                zarr_loc=str(staged_store),
+                assay_name="RNA",
+                nthreads=4,
+            ).dump()
+        finally:
+            reader.h5.close()
+        staged_store.replace(source_store)
+```
+
+Initialize the count source with no feature-count filter, then mount it into a temporary writable analysis store.
+The source continues to own the count matrix.
+The mounted target owns the cell selection and statistical artifacts created below.
+
+```{code-cell} ipython3
+source = scarf.DataStore(
+    str(source_store),
     default_assay="RNA",
+    min_features_per_cell=0,
     nthreads=4,
 )
-cells = ds.snapshot_cell_selection("I")
-condition = CellField("sample_id")
-```
+assert source.cells.N == 108_717
 
-## 2. Inspect the condition column
-
-`sample_id` records the treatment of every cell.
-Counting its values confirms the two-group design and gives the per-condition cell numbers.
-
-```{code-cell} ipython3
-sample_id = np.asarray(ds.cells.fetch_all("sample_id")).astype(str)
-values, counts = np.unique(sample_id, return_counts=True)
-print(dict(zip(values.tolist(), counts.tolist())))
-```
-
-With exactly two conditions, the natural parametric choice is Welch's t-test (`test="welch"`, aliased by `"t_test"`).
-It runs on raw normalized cell values, always uses unequal variances, and accepts a one-sided `alternative`.
-The rank-based `mann_whitney` covers the same two-group design without distributional assumptions, and `auto` always picks `mann_whitney` for two groups; parametric tests are opt-in only.
-
-Grouping is an explicit `CellField` or a categorical artifact, paired with the frozen cell selection.
-Do not pass a bare column name.
-
-## 3. Welch's t-test between conditions
-
-Run the test for the strongest interferon-stimulated gene.
-The returned table reports the group means, `mean_difference` (mean of `group_1` minus mean of `group_2`), the Welch statistic with its degrees of freedom, and the p-value.
-Because the store is writable, the result is persisted as an immutable artifact.
-
-```{code-cell} ipython3
-isg15 = ds.run_statistical_testing(
-    "ISG15",
-    condition,
-    cell_selection=cells,
-    test="welch",
+analysis_directory = TemporaryDirectory()
+ds = scarf.mount_datastore(
+    str(source_store),
+    at=str(Path(analysis_directory.name) / "condition_analysis.zarr"),
+    default_assay="RNA",
+    min_features_per_cell=0,
+    nthreads=4,
 )
-isg15.tables["ISG15"]
 ```
 
-`group_1` is the first category encountered in the data (`stim` here) and `group_2` the second (`ctrl`), so a positive `mean_difference` means the gene is higher in stimulated cells.
-Pass `groups=["ctrl", "stim"]` to reverse the contrast direction; the means swap sides and the statistic flips sign while the p-value stays equal.
+## 2. Freeze the matched gamma-delta T-cell cohort
 
-Reading the result back uses the exact artifact returned by the run.
-Two-sided and one-sided alternatives are distinct artifacts and remain retrievable side by side.
-
-```{code-cell} ipython3
-loaded = ds.get_statistical_tests(isg15.artifact)
-loaded.tables["ISG15"]
-```
-
-A one-sided alternative asks whether `group_1` is greater than `group_2`.
+The H5AD records the paper's fine annotation as `fine_annot` and its matched case-control index as `pair_index_CW`.
+Keep only cells labeled exactly `yd T cells` with a finite pair index, then freeze that mask as an immutable selection.
 
 ```{code-cell} ipython3
-isg15_greater = ds.run_statistical_testing(
-    "ISG15",
-    condition,
-    cell_selection=cells,
-    test="welch",
-    alternative="greater",
+GROUPS = ["normal", "rheumatoid arthritis"]
+
+fine_annotation = np.asarray(ds.cells.fetch_all("fine_annot"), dtype=object)
+pair_index = np.asarray(
+    ds.cells.fetch_all("pair_index_CW"),
+    dtype=np.float64,
 )
-loaded_greater = ds.get_statistical_tests(isg15_greater.artifact)
+matched_gamma_delta = np.isfinite(pair_index) & (
+    fine_annotation == "yd T cells"
+)
+
+ds.cells.insert(
+    "matched_yd_t_cells",
+    matched_gamma_delta,
+    overwrite=True,
+)
+cells = ds.snapshot_cell_selection("matched_yd_t_cells")
+```
+
+Check the inferential structure, not just the cell count.
+Each donor must map to one disease group and one pair, and every pair must contain one donor from each group.
+
+```{code-cell} ipython3
+donor_id = np.asarray(ds.cells.fetch_all("donor_id"), dtype=object)
+disease = np.asarray(ds.cells.fetch_all("disease"), dtype=object)
+
+donor_design = pd.DataFrame(
+    {
+        "donor_id": donor_id[matched_gamma_delta],
+        "disease": disease[matched_gamma_delta],
+        "pair_index_CW": pair_index[matched_gamma_delta],
+    }
+).drop_duplicates()
+
+assert int(matched_gamma_delta.sum()) == 1_386
+assert len(donor_design) == 36
+assert donor_design["donor_id"].nunique() == 36
+assert donor_design["pair_index_CW"].nunique() == 18
+assert set(donor_design["disease"]) == set(GROUPS)
+
+pair_balance = donor_design.groupby(
+    "pair_index_CW",
+    observed=True,
+).agg(
+    donors=("donor_id", "nunique"),
+    conditions=("disease", "nunique"),
+)
+assert pair_balance["donors"].eq(2).all()
+assert pair_balance["conditions"].eq(2).all()
+
 print(
-    "two-sided p:",
-    float(isg15.tables["ISG15"]["p_value"].iloc[0]),
-)
-print(
-    "greater    p:",
-    float(loaded_greater.tables["ISG15"]["p_value"].iloc[0]),
+    {
+        "cells": int(matched_gamma_delta.sum()),
+        "donors": donor_design["donor_id"].nunique(),
+        "matched_pairs": donor_design["pair_index_CW"].nunique(),
+    }
 )
 ```
 
-## 4. Test many genes in one call
+This selection contains 1,386 cells from 36 donors in 18 matched pairs.
 
-Passing a list of genes tests each one and pools all their p-values into a single Benjamini-Hochberg correction, recorded as `p_value_adjusted`.
-The adjusted column controls the false discovery rate across the family of tested genes, which matters once several results are inspected together.
-With a single gene the adjustment is a no-op.
+## 3. Run the paired donor-level test
+
+For each gene, Scarf first averages normalized expression within each donor.
+`pair_by` then aligns the RA donor and control donor carrying the same `pair_index_CW` value before the signed-rank test.
+The explicit group order fixes the labels as normal and RA; the test remains two-sided.
 
 ```{code-cell} ipython3
-import pandas as pd
+panel = ["IFNG", "IFIT2", "TNF", "GZMA", "ISG15", "S100A4"]
+condition = CellField("disease")
 
-panel = ["ISG15", "IFIT1", "MX1", "CD3D", "LYZ"]
-panel_result = ds.run_statistical_testing(
+paired_result = ds.run_statistical_testing(
     panel,
     condition,
     cell_selection=cells,
-    test="welch",
+    groups=GROUPS,
+    test="wilcoxon",
+    sample_by="donor_id",
+    pair_by="pair_index_CW",
+    sample_stat="mean",
+    adjustment="fdr_bh",
 )
-pd.concat(
-    {gene: panel_result.tables[gene] for gene in panel},
+
+panel_table = pd.concat(
+    {gene: paired_result.tables[gene] for gene in panel},
     names=["gene"],
-).reset_index(level="gene")[
-    ["gene", "mean_1", "mean_2", "mean_difference", "p_value", "p_value_adjusted"]
+).reset_index(level="gene")
+panel_table = panel_table[
+    [
+        "gene",
+        "group_1",
+        "group_2",
+        "n_pairs",
+        "statistic",
+        "p_value",
+        "p_value_adjusted",
+    ]
 ]
+
+assert panel_table["n_pairs"].eq(18).all()
+assert panel_table["p_value_adjusted"].notna().all()
+assert not panel_table["p_value_adjusted"].le(0.05).any()
+panel_table
 ```
 
-The induced genes move by tens of normalized counts while `CD3D` shifts by a fraction of a count; both effects are visible in one table because the pooled correction keeps the family of claims controlled.
+The Benjamini-Hochberg correction is pooled across all six tests.
+In the validated run, none of these genes passed the `p_value_adjusted <= 0.05` threshold.
 
-## 5. Overlay brackets on the distributions
+## 4. Plot the donor-level distributions
 
-`distribution` accepts the result object or its artifact and draws significance brackets over the matching panels with pure matplotlib.
-Each pairwise test row becomes one bracket between the two group positions; the bracket label prefers `p_value_adjusted` when present.
-Extremely strong effects can underflow the p-value to exactly `0.0`, so an extremely large panel may legitimately read `p=0`.
-The plotted grouping and cell selection must match the test.
+`distribution` supports the same sample and pairing identity through `StudyDesign`.
+The plot below contains donor means, not cell-level observations, and reuses the persisted adjusted p-values for its brackets.
+It does not recompute the tests.
 
 ```{code-cell} ipython3
-ds.plots.distribution(
-    "ISG15",
-    grouping=condition,
-    cell_selection=cells,
-    kind="violin",
-    stats_results=isg15,
+plot_design = StudyDesign(
+    sample_by="donor_id",
+    condition_by="disease",
+    pair_by="pair_index_CW",
 )
-```
 
-Dock a whole panel of tests onto one stacked violin by passing the multi-gene result.
-Every gene row gets its own bracket, and `share_y` keeps the value axes comparable across rows.
-
-```{code-cell} ipython3
 ds.plots.distribution(
     panel,
     grouping=condition,
     cell_selection=cells,
+    groups=GROUPS,
+    study_design=plot_design,
+    sample_stat="mean",
     kind="stacked_violin",
-    share_y=True,
-    stats_results=panel_result,
+    share_y=False,
+    max_points=100,
+    point_size=2.0,
+    point_alpha=0.55,
+    stats_results=paired_result,
+    stats_show_p=False,
+    figsize=(7.0, 9.0),
+    title="Matched donor means in gamma-delta T cells",
 )
 ```
 
-Pass `stats_show_p=False` to render `***`/`**`/`*`/`ns` thresholds instead of numeric p-values, or `orientation="horizontal"` with `kind="box"` to mirror the bracket onto the value axis.
-If the result does not describe the plotted selection (different grouping or cell selection), the plot warns and skips the bracket instead of drawing something wrong.
+Each row has its own value scale, so compare the two disease distributions within a gene, not violin heights across genes.
+Each point is one donor mean, with 18 donors in each disease group.
+The `ns` brackets reflect the paired tests and their pooled false-discovery-rate correction.
+Pairing affects the test, but this plot does not connect matched donors with lines.
 
-## 6. Cross-check with the rank-based tests
+## Interpretation and limits
 
-Single-cell values are zero-inflated and non-normal, so the rank-based tests are the appropriate defaults.
-`mann_whitney` answers the same two-group question without assuming anything about the distribution shape.
+This simple paired Wilcoxon panel did not survive pooled false-discovery-rate correction.
+It also did not reproduce the paper's count-model pseudobulk result for gamma-delta T cells.
+That is not a contradiction: this workflow tests six donor-mean normalized-expression distributions with a signed-rank test, while a count model uses raw sample-level counts and models their mean-variance relationship.
 
-```{code-cell} ipython3
-isg15_mw = ds.run_statistical_testing(
-    "ISG15",
-    condition,
-    cell_selection=cells,
-    test="mann_whitney",
-)
-isg15_mw.tables["ISG15"]
-```
+Matching does not remove every processing effect. One selected pair spans batches 2 and 3, and
+this paired Wilcoxon test has no batch term, so a batch contribution cannot be separated here.
 
-For three or more groups the design changes shape.
-Grouping by the imported cell-type labels (`orig_cluster_labels`) and running Kruskal-Wallis with Dunn's post-hoc yields one omnibus row plus every pairwise contrast between types, each with its own p-value and pooled adjustment.
-
-```{code-cell} ipython3
-cell_types = CellField("orig_cluster_labels")
-cluster_result = ds.run_statistical_testing(
-    ["ISG15"],
-    cell_types,
-    cell_selection=cells,
-    test="kruskal_wallis",
-    posthoc="dunn",
-)
-print("omnibus:", cluster_result.tables["ISG15"].to_dict("records"))
-print("pairwise rows:", len(cluster_result.posthoc_tables["ISG15"]))
-cluster_result.posthoc_tables["ISG15"].head()
-```
-
-The omnibus p-value answers only "does ISG15 differ anywhere across cell types".
-The post-hoc table is where you read which pairs of types differ; the same pattern applies to Welch's omnibus sibling, one-way ANOVA (`test="one_way_anova"`), whose single row spans all groups when annotated on a plot.
-
-## Common mistakes and limitations
-
-- Cell-level results are descriptive. Treating thousands of cells as independent observations makes tiny effect sizes significant; the emitted warning is part of the contract, not noise. For condition-level claims, aggregate to biological samples (`sample_by`) or export counts for DESeq2 or edgeR as shown in {doc}`pseudobulk_and_differential_expression`.
-- `get_statistical_tests` takes the exact `ArtifactRef` from the run. It does not look up a result by repeating variant parameters.
-- Welch requires exactly two surviving groups and one-way ANOVA at least two; neither accepts sample aggregation, and `posthoc="dunn"` belongs to Kruskal-Wallis only.
-- `test="auto"` never selects a parametric method; request `welch` or `one_way_anova` explicitly when a parametric summary is wanted beside the rank-based defaults.
-- Brackets are drawn from the persisted table, never recomputed by the plot. A result computed on a different grouping or cell selection warns and skips instead of annotating the wrong panel.
+Do not generalize this null six-gene panel to the full transcriptome, and do not treat it as a reanalysis of every paper contrast or covariate.
+For a count-model analysis, export raw counts aggregated by biological sample and carry the design into DESeq2, edgeR, or another suitable method; see {doc}`pseudobulk_and_differential_expression`.

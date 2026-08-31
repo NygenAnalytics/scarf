@@ -30,6 +30,7 @@ _STORE_PLOT_METHODS = (
     "mapping_evidence",
     "mapping_score",
     "matrixplot",
+    "modality_weights",
     "pseudotime_heatmap",
     "run_recipe",
 )
@@ -69,6 +70,11 @@ _EMBEDDING_REF = ArtifactRef(
     assay="RNA",
     kind="embedding",
     artifact_id="f" * 64,
+)
+_INTEGRATED_GRAPH_REF = ArtifactRef(
+    scope="datastore",
+    kind="integrated_graph",
+    artifact_id="2" * 64,
 )
 
 
@@ -247,6 +253,15 @@ def test_plot_accessor_type_hints_match_standalone_functions(name: str):
                 "graph": _GRAPH_REF,
                 "cell_key": "I",
                 "minimum_edge_weight": 0.1,
+            },
+        ),
+        (
+            "modality_weights",
+            (),
+            {
+                "graph": _INTEGRATED_GRAPH_REF,
+                "layout": _EMBEDDING_REF,
+                "point_alpha": 0.8,
             },
         ),
         ("run_recipe", ("recipe.toml",), {"show": False}),

@@ -22,14 +22,26 @@ inputs and parameters produced each result.
 :alt: Compressed count-matrix chunks feed graph construction, embeddings, clustering, mapping, imputation, downsampling, and trajectory analysis
 :::
 
-## Start here
+## Measured end to end at 10 million cells
+
+In three fixed reference runs, Scarf processed 10 million input cells through conversion, quality
+control, normalization, graph construction, embedding, clustering, and marker search in
+2.78 ± 0.47 hours, with 31.9 GiB mean sampled peak memory on a 16 CPU, 64 GiB container.
+
+These measurements establish execution and resource use for that dataset, workflow, software
+revision, and cloud resource envelope. They are not a general hardware guarantee, a comparison
+with another package, or biological validation. See {doc}`concepts/benchmarks` for every replicate,
+stage timing, configuration detail, and limitation.
+
+## Choose your starting point
 
 - {ref}`Install Scarf <installation>`
-- Follow the {ref}`Quick start <quickstart>`
-- Use {doc}`analysis_with_agents` to route an autonomous or AI-assisted analysis
-- Run the executable {doc}`tutorials/agent_workflow` for the four grounded agent stages
-- Read {doc}`scanpy_and_seurat` if you already use Scanpy or Seurat
-- See {doc}`concepts/benchmarks` for measured end-to-end scale and stage timings
+- Follow the {ref}`Quick start <quickstart>` to open a prepared PBMC result and inspect its
+  pipeline-selected clusters
+- Use {doc}`scanpy` to translate a Scanpy workflow and H5AD exchange
+- Use {doc}`seurat` to translate a Seurat workflow, RDS import, and WNN analysis
+- Choose the focused {doc}`tutorials/scrna_seq`, {doc}`tutorials/scatac_seq`, or
+  {doc}`tutorials/cite_seq` core workflow for your assay
 
 ## Supported workflows
 
@@ -37,7 +49,8 @@ Scarf provides complete workflows for:
 
 - scRNA-seq quality control, feature selection, normalization, graph construction, embedding, clustering, and marker discovery
 - scATAC-seq peak filtering, LSI-based graph construction, clustering, and gene-score analysis
-- CITE-seq RNA and ADT processing with shared-nearest-neighbour or weighted-nearest-neighbour integration
+- CITE-seq RNA and ADT processing with weighted-nearest-neighbour integration by default and
+  explicit shared-nearest-neighbour integration as an alternative
 - pseudotime ordering, expression dynamics, modules, and multi-sink fate probabilities
 - dataset merging, Harmony or partial-PCA correction with quantitative diagnostics, reference mapping, and label transfer
 - cell-cycle scoring, gene-set activity, imputation, downsampling, and pseudobulk export
@@ -86,7 +99,10 @@ Related branches can coexist in one datastore, and an identical request can {ter
 Execution choices such as thread count or local scratch are recorded separately and do not change the scientific identity of a result.
 
 This record is useful whenever the analysis is long-running, revisited after a gap, or executed through a pipeline or software agent, because the dependency chain can be inspected independently of the code or description that produced it.
-See {doc}`analysis_with_agents` for the scientific decision and troubleshooting framework, {doc}`concepts/provenance` for the data model, and {doc}`tutorials/reuse_and_tracing` for an executable example.
+See {doc}`analysis_with_agents` for the scientific decision and troubleshooting framework,
+{doc}`tutorials/agent_workflow` for its executable four-stage example,
+{doc}`concepts/provenance` for the data model, and {doc}`tutorials/reuse_and_tracing` for an
+executable branching example.
 
 ## Selections and multi-scale analysis
 

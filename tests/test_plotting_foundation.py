@@ -152,6 +152,7 @@ def test_import_plotting_exports():
         "mapping_evidence",
         "mapping_score",
         "matrixplot",
+        "modality_weights",
         "pseudotime_heatmap",
         "qc",
         "register_theme",

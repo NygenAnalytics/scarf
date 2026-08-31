@@ -387,6 +387,10 @@ def test_parameter_models_have_blank_and_example(
     assert all("_" not in field for field in model_type.model_fields)
 
 
+def test_blank_integration_evaluation_uses_wnn_default() -> None:
+    assert IntegrationCandidateEvaluation.get_blank().method == "wnn"
+
+
 def test_default_candidates_are_explicit_unique_one_factor_variants() -> None:
     candidates = get_default_parameter_candidates()
     assert [candidate.candidateId for candidate in candidates] == [

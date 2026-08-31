@@ -154,6 +154,7 @@ _EXPECTED_PLOTTING_EXPORTS = (
     "mapping_evidence",
     "mapping_score",
     "matrixplot",
+    "modality_weights",
     "pseudotime_heatmap",
     "qc",
     "register_theme",
@@ -328,6 +329,7 @@ concrete = (
     "scarf.plotting.embedding_raster",
     "scarf.plotting.heatmaps",
     "scarf.plotting.mapping",
+    "scarf.plotting.modality_weights",
     "scarf.plotting.recipes",
     "scarf.plotting.summary",
 )

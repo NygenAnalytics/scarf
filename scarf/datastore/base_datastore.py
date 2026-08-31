@@ -274,8 +274,11 @@ class BaseDataStore:
         from_assay: str | None = None,
         scope: ArtifactScope = "assay",
         complete_only: bool = False,
+        operation: str | None = None,
+        parameters: Mapping[str, Any] | None = None,
+        inputs: Mapping[str, Any] | None = None,
     ) -> list[ArtifactRef]:
-        """List logical artifact references in one scope."""
+        """List every artifact ref matching the exact provenance predicates."""
         if scope == "assay" and from_assay is None:
             from_assay = self._defaultAssay
         return list_artifact_refs(
@@ -284,6 +287,9 @@ class BaseDataStore:
             assay=from_assay,
             kind=kind,
             complete_only=complete_only,
+            operation=operation,
+            parameters=parameters,
+            inputs=inputs,
         )
 
     def summary(self) -> "DataStoreSummary":

@@ -1,5 +1,5 @@
 ---
-description: Open or mount remote Scarf DataStores, tune cloud storage, and stage local scratch.
+description: Distinguish direct object-store access from mounted analysis targets and local scratch.
 jupytext:
   text_representation:
     extension: .md
@@ -14,65 +14,41 @@ kernelspec:
 
 (remote_stores)=
 
-# Working with remote stores
+# Remote stores and mounted analysis targets
 
-Scarf can open a Zarr store on object storage and run analysis without first copying the full matrix to local disk.
-Counts stream in tiles sized from your memory budget.
-Published remote object-store funnel timings are in {doc}`../concepts/benchmarks`; resource controls are in {doc}`../concepts/memory_and_execution`.
+Scarf supports Zarr stores on object storage, but this page does not execute against an
+object-store URI. Its executable section downloads a documentation dataset, then uses a local
+count source and a separate local analysis target to demonstrate mounted-store mechanics.
+
+Object-store snippets are explicitly non-executed templates. They show the supported API shape,
+not proof that a particular provider, URI, credential setup, or network path was exercised.
+Measured results from a separate fixed object-store workflow are in
+{doc}`../concepts/benchmarks`; resource controls are in
+{doc}`../concepts/memory_and_execution`.
 
 ## Prerequisites
 
 - Scarf installed with the `extra` optional dependencies
-- Credentials for your bucket (except for anonymous public reads)
+- Credentials for your bucket when adapting the non-executed templates
 - Enough local disk for optional `local_cache` scratch during reduction
 
 ## What you will learn
 
-- Open a release-matched store on object storage without downloading it
-- Open `DataStore` on `s3://` or `gs://` with `storage_options`
-- Mount shared count matrices into a separate writable analysis store
+- Distinguish direct object-store access from the local mechanics executed on this page
+- Mount a count source into a separate writable analysis target
 - Reopen a durable pipeline run from its mounted target
-- Select the `cloud` storage profile
+- Adapt non-executed `s3://` and `gs://` templates for your environment
 - Stage normalized data locally for PCA with `local_cache`
 
-## 1. Open a release-matched remote store
+## 1. Executed example: download, then mount locally
 
-An unpacked store built by the same Scarf release can be opened directly instead of downloading
-an archive. Replace the URI and storage options below with those for your object store. The
-executable sections use the rebuilt documentation archive so they do not depend on a separate
-publication step.
+The defining property of a mounted datastore is the separation between its count source and its
+writable analysis target. The count source can be a local path or an object-store URI. The target
+stores copied metadata plus new artifacts, while count blocks continue to resolve from the source.
+Mounting does not by itself mean that either location is remote.
 
-```python
-import scarf
-
-ds = scarf.DataStore(
-    "s3://my-bucket/current-scarf-store.zarr",
-    zarr_mode="r",
-    storage_options={"anon": True},
-    nthreads=4,
-)
-print(ds)
-```
-
-Opening a store over object storage costs many small metadata requests, so expect this step to take a few minutes on a home connection.
-Nothing but metadata is read until you touch the counts.
-The printed summary lists active cells, assays, and the cell and feature columns already present in the remote store.
-
-Counts and metadata in a matching published store remain readable. Durable analysis is reopened
-through its pipeline label and exact artifacts. The next section mounts the rebuilt count matrices
-and records a new pipeline run in a separate target.
-
-```python
-run = ds.pipeline.open(label="docs_default")
-ds.plots.embedding(
-    run=run,
-    color_by="clusters",
-)
-```
-
-## 2. Mount read-only counts
-
-Use `mount_datastore` when count matrices must remain in a shared source store, but each analysis needs its own writable store.
+Use `mount_datastore` when count matrices must remain in a shared source store, but each analysis
+needs its own writable target.
 Scarf copies cell and feature metadata into the target.
 Mount validates and reads primary `counts` for matrix identity.
 For RNA sources, the matching gene-major `countsT` copy must already be present on Zarr v3.
@@ -80,8 +56,10 @@ It is mounted with `counts` and is not rewritten into the target.
 Non-RNA assays have no `countsT`.
 New metadata and analysis artifacts are written only to the target.
 
-The public snapshot was rebuilt from raw counts with the current paired RNA layout. Download it
-once, then mount those count arrays into a separate writable target.
+The code below downloads the documentation archive to a temporary local directory. It then mounts
+that local count source into a different local target. This verifies source resolution, target
+writes, pipeline execution, and reopening. It does not verify direct object-store analysis,
+credentials, or network performance.
 
 ```{code-cell} ipython3
 from pathlib import Path
@@ -127,9 +105,9 @@ The printed `matrixSource` record is what later reopen uses to resolve those cou
 
 ```{mermaid}
 flowchart LR
-    source["Read-only remote dataset"]
+    source["Dataset archive"]
     staged["Current local count source<br/>counts, RNA countsT, metadata"]
-    target["Writable mounted target<br/>metadata and new artifacts"]
+    target["Separate local analysis target<br/>metadata and new artifacts"]
     source -->|download once| staged
     staged -->|mount count blocks| target
 ```
@@ -143,10 +121,10 @@ print('Counts stored in target:', 'counts' in target_root['RNA'])
 print('Mounted shape:', mounted.RNA.rawData.shape)
 ```
 
-Run the standard RNA pipeline through the mount. Count blocks are read from the current source,
-while the run record and its normalized data, reductions, graph, UMAP, and
+Run the standard RNA pipeline through the local mount. Count blocks are read from the separate
+local source, while the run record and its normalized data, reductions, graph, UMAP, and
 clusters are written only to the local target. Because that target is a local path, `local_cache`
-staging is skipped here; Section 4 makes the remote-only policy explicit.
+staging is skipped here; Section 3 makes that policy explicit.
 
 ```{code-cell} ipython3
 mounted_run = mounted.pipeline.run(
@@ -167,8 +145,9 @@ pca = mounted_run["pca"]
 mounted.plots.embedding(run=mounted_run, color_by="clusters")
 ```
 
-The populated embedding demonstrates that mounted counts behave like a normal datastore input.
-The target remains much smaller than a dense local copy of the source matrix:
+The populated embedding demonstrates that supported analysis can read counts from a separate
+mounted source. The size calculation compares only the writable target with the dense logical
+size of the counts. It excludes the downloaded source and is not a remote-storage benchmark.
 
 ```{code-cell} ipython3
 target_bytes = sum(
@@ -205,7 +184,22 @@ print(
 )
 ```
 
-For a current S3 or GCS source with a complete RNA `countsT`, pass the URI directly and keep the target local:
+The mount records matrix shape, dtype, and source identity. Reopening fails if the source no
+longer matches that identity. Metadata is copied at mount time, so later source metadata changes
+are not synchronized into the target.
+
+## 2. Non-executed object-store templates
+
+Nothing in this section is executed by the documentation build. These snippets illustrate how to
+supply a URI and storage options after you have verified the provider, credentials, permissions,
+and store layout in your own environment. They provide no performance or compatibility result for
+the placeholder locations.
+
+### Mount an object-store count source
+
+A mounted analysis can keep shared counts at an object-store URI while writing metadata and
+artifacts to a local target. This is the remote form of the source/target separation demonstrated
+locally in Section 1:
 
 ```python
 mounted = scarf.mount_datastore(
@@ -216,32 +210,29 @@ mounted = scarf.mount_datastore(
 )
 ```
 
-The mount records matrix shape, dtype, and source identity.
-Reopening fails if the source no longer matches that identity.
-Metadata is copied at mount time, so later source metadata changes are not synchronized into the target.
+The source must remain available at the recorded URI whenever the target is opened. For RNA, the
+source must contain its matching current-layout `countsT` array.
 
-## 3. Open your own remote store
+### Open a datastore directly
 
-Pass the URI as `zarr_loc` and any fsspec/obstore options as `storage_options`.
-Use `zarrProfile="cloud"` when writing new arrays so they use the cloud compression profile.
-Existing arrays keep the physical layout chosen when they were created.
-
-Anonymous read-only example against your own public bucket:
+Pass an object-store URI as `zarr_loc` and provider options as `storage_options`. This anonymous
+S3 shape is a template, not a tested public dataset:
 
 ```python
 import scarf
 
 ds = scarf.DataStore(
-    "s3://example-bucket/path/to/data.zarr",
+    "s3://bucket/path/to/data.zarr",
     zarr_mode="r",
-    zarrProfile="cloud",
     storage_options={"skip_signature": True},
     mem_budget="16G",
     nthreads=8,
 )
 ```
 
-Credentialed read-write template (do not embed secrets in notebooks):
+For a writable remote store, use the `cloud` profile for newly written arrays. Existing arrays
+retain the layout chosen when they were created. Read credentials from the environment rather
+than embedding secrets in notebooks:
 
 ```python
 import os
@@ -262,13 +253,13 @@ remote_writable = scarf.DataStore(
 ```
 
 Google Cloud Storage uses a `gs://` URI.
-Pass the provider options your environment already uses for obstore/fsspec (for example application-default credentials on the VM, or an explicit token in `storage_options`).
+Pass the provider options your environment already uses for obstore or fsspec, such as
+application-default credentials on the VM or an explicit token in `storage_options`.
 
-After open, call the same analysis APIs as on a local store. Use
-`remote_writable.pipeline.run(...)` for the standard RNA workflow, and atomic producers for a
-deliberate branch or execution option.
+After a successful open in your environment, the same analysis APIs are available as for a local
+store. This page does not execute that step.
 
-## 4. Local scratch for reductions
+## 3. Local scratch for reductions
 
 PCA fitting and score projection make multiple passes over normalized expression.
 `local_cache` stages that normalized artifact to local disk when the *DataStore location* is remote (object-storage URI or non-local backend).
@@ -303,8 +294,9 @@ print('Local cache present after PCA:', scratch_dir.exists())
 print('Reduction reused:', pca_without_staging == pca)
 ```
 
-On your own writable remote store, the same path-string policy stages normalized blocks and keeps
-the cache for inspection or reuse. Only the stages needed to demonstrate the PCA option are shown:
+For a writable remote store opened from the non-executed template above, the same path-string
+policy stages normalized blocks and keeps the cache for inspection or reuse. The following is
+also a non-executed template:
 
 ```python
 cell_selection = remote_writable.snapshot_cell_selection(cell_key="I")
@@ -329,11 +321,15 @@ A path-string cache is kept for reuse or inspection.
 
 Plan local disk for float32 dense blocks roughly as `n_cells × n_features × 4` bytes (about 8 GiB for 1M cells × 2000 HVGs).
 
-## 5. Honest performance expectations
+## 4. Performance evidence and expectations
 
-Gene-wise stages and small metadata opens feel remote latency most.
-Remote-first analysis is still useful for shared stores; download-then-analyze remains available when you need local disk performance.
-Published remote object-store funnel timings and caveats are in {doc}`../concepts/benchmarks`.
+Do not infer object-store performance from this page's executable local mount. A separate fixed
+workflow measured Scarf against S3-compatible object storage in a recorded cloud environment; its
+timings, memory observations, and limits are in {doc}`../concepts/benchmarks`. Those measurements
+do not compare remote with local storage.
+
+Object-store latency, request costs, credentials, and provider behavior remain environment
+specific. Downloading first is still available when a local workflow better fits those constraints.
 Resource planning controls are in {doc}`../concepts/memory_and_execution`.
 
 For custom statistics over mounted graphs or count blocks, followed by a supported selective export, continue with {doc}`custom_analyses`.

@@ -14,7 +14,12 @@ Bug reports and feature requests for the Python package belong on [GitHub issues
 
 ## How does Scarf compare to Scanpy?
 
-See {doc}`../scanpy_and_seurat` for a stage-by-stage mapping, round-trip notes, and a short Seurat subsection.
+See {doc}`../scanpy` for a stage-by-stage workflow map and H5AD exchange notes.
+
+## How does Scarf compare to Seurat?
+
+See {doc}`../seurat` for a stage-by-stage workflow map and RDS import. The measured differences
+between Scarf and Seurat WNN are summarized below.
 
 ## How should an AI agent use Scarf?
 
@@ -32,8 +37,11 @@ See {ref}`Harmony batch correction <harmony_batch_correction>` and the {ref}`dat
 
 ## Which integration method should I choose?
 
-- Separate scRNA-seq batches: start with {doc}`../tutorials/dataset_merging`, then compare Harmony or partial PCA in {doc}`../tutorials/batch_correction`.
-- Multiple assays in the same cells (CITE-seq): SNN or WNN ({ref}`recommended workflow <multimodal_integration>` and {doc}`../tutorials/multimodal_diagnostics` for diagnostics).
+- Separate scRNA-seq batches: start with {doc}`../tutorials/dataset_merging`, then compare
+  uncorrected and Harmony embeddings in {doc}`../tutorials/batch_correction`.
+- Multiple assays in the same cells (CITE-seq): use the default WNN integration in the
+  {ref}`recommended workflow <multimodal_integration>`; compare it with explicit SNN in
+  {doc}`../tutorials/multimodal_diagnostics` when the choice matters.
 - Map onto an existing reference: {doc}`../tutorials/mapping_and_label_transfer`.
 
 Scarf does not include Scanorama, BBKNN, scVI, ComBat, or other external integration packages.
@@ -55,9 +63,10 @@ Tutorial pages show completed snapshots from their cached execution; live notebo
 ## What is the difference between SNN and WNN integration?
 
 Both use `integrate_assays` with two or more explicit source refs.
-SNN (default) consumes modality-specific connectivity maps and combines shared edge support.
-WNN (`method='wnn'`) consumes modality-specific neighbour artifacts, learns one weight per assay
-and cell, and ranks candidates by the resulting blended affinity.
+WNN is the default. It consumes modality-specific neighbour artifacts, learns one weight per
+assay and cell, and ranks candidates by the resulting blended affinity.
+SNN requires `method="snn"`; it consumes modality-specific connectivity maps and combines shared
+edge support.
 
 ### Scarf WNN versus Seurat
 

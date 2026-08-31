@@ -1,5 +1,5 @@
 ---
-description: Minimal scRNA-seq workflow in Scarf from count matrix to UMAP and clustering.
+description: Open a prepared scRNA-seq result and reach a clustered PBMC map with Scarf.
 jupytext:
   text_representation:
     extension: .md
@@ -16,99 +16,53 @@ kernelspec:
 
 # Quick start
 
-Go from a Cell Ranger count matrix to a clustered UMAP with Scarf's default RNA pipeline.
-This example uses a public 5K PBMC dataset and writes the analysis to
-`scarf_datasets/tenx_5K_pbmc_rnaseq/data.zarr`.
+Open a prepared 5K PBMC analysis and reach its pipeline-selected Leiden map. This is the shortest
+route to a familiar single-cell result; the RNA workflow explains the biological evidence behind
+the populations.
 
-Complete the {ref}`installation <installation>` with the `extra` dependencies before you begin.
-Run this notebook from the same environment so its kernel imports that Scarf installation.
-
-## Download and convert the counts
+Complete the {ref}`installation <installation>` with the `extra` dependencies first.
 
 ```{code-cell} ipython3
 import scarf
 
-counts = scarf.cytebase.connect("scarf_docs").download(
-    "tenx_5K_pbmc_rnaseq/data.h5",
+dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
+    "tenx_5K_pbmc_rnaseq",
     destination="scarf_datasets",
-)[0]
-
-store = counts.with_name("data.zarr")
-reader = scarf.CrH5Reader(str(counts))
+    zarr=True,
+)
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+run = ds.pipeline.open(label="docs_default")
 ```
 
+The named run binds the filtered cells, UMAP, selected Leiden partition, and marker result from one
+completed workflow. Plotting reads those frozen outputs directly.
+
 ```{code-cell} ipython3
-reader.nCells, reader.nFeatures
+ds.plots.embedding(
+    run=run,
+    color_by="clusters",
+    legend_loc="on_data",
+)
 ```
 
-```{code-cell} ipython3
-scarf.CrToZarr(reader, zarr_loc=str(store)).dump()
-```
+The map separates several broad PBMC populations. Continue with {doc}`tutorials/scrna_seq` to name
+them from marker evidence rather than from UMAP position alone.
 
-The same reader and writer work with a Cell Ranger H5 file from your own dataset.
-Scarf converts the counts to Zarr so later steps can stream data from disk.
+## Use your own Cell Ranger counts
 
-## Open the datastore
+The prepared result removes setup time from this first encounter. With your own filtered Cell
+Ranger H5 file, the corresponding path is:
 
-```{code-cell} ipython3
-ds = scarf.DataStore(str(store), nthreads=4)
-```
+```python
+reader = scarf.CrH5Reader("filtered_feature_bc_matrix.h5")
+scarf.CrToZarr(reader, zarr_loc="analysis.zarr").dump()
 
-## Run the RNA pipeline
-
-The default pipeline filters cells, scores cell cycle, selects highly variable genes, normalizes
-counts, runs PCA, builds a neighbourhood graph, and calculates UMAP. It also runs Leiden at
-resolutions 0.5, 0.75, 1.0, and 1.25, plus Paris clustering, doublet scoring, and marker search.
-It scores Leiden resolutions in the graph's PCA or Harmony coordinates with a deterministic
-silhouette sample, then exposes the selected Leiden candidate as `clusters`. Paris remains
-available as `run["paris"]` for diagnosis. This automatic choice is a reproducible baseline, not
-biological validation.
-
-```{code-cell} ipython3
+ds = scarf.DataStore("analysis.zarr", nthreads=4)
 run = ds.pipeline.run(label="baseline")
-run
+ds.plots.embedding(run=run, color_by="clusters")
 ```
 
-The return value is a durable {py:class}`~scarf.PipelineRun`. It maps stable result names to exact
-immutable {term}`ArtifactRef` values and keeps frozen cell and feature views. The pipeline itself
-does not change live `I` or write analytical outputs to metadata.
-
-Inspect the selected labels without copying them into live metadata:
-
-```{code-cell} ipython3
-run.cells.to_pandas_dataframe(["clusters"])["clusters"].value_counts().sort_index()
-```
-
-Use {doc}`tutorials/graph_construction` when you need stage-by-stage control and explicit refs.
-
-## Consume the frozen result
-
-Plotting stays on `DataStore` and reads only the run's frozen fields:
-
-```{code-cell} ipython3
-ds.plots.embedding(run=run, layout="umap", color_by="clusters")
-```
-
-Several broad PBMC populations should separate without every group becoming an isolated island.
-
-Marker search used the selected partition. Read its immutable table through the exact ref:
-
-```{code-cell} ipython3
-cluster_id = run.cells.fetch("clusters")[0]
-ds.get_markers(marker=run["markers"], group_id=cluster_id).head(10)
-```
-
-## Reopen a named run
-
-A completed run can be reopened by its immutable label or exact run ID:
-
-```{code-cell} ipython3
-assert ds.pipeline.open(label="baseline").run_id == run.run_id
-```
-
-Labels are bound to one successful run and cannot be moved to another run. An unlabeled run can be
-opened with its `run_id`.
-
-Continue with the complete {doc}`tutorials/scrna_seq` workflow or translate an existing workflow
-with {doc}`scanpy_and_seurat`. The {doc}`reference/api/pipeline` documents every pipeline option,
-frozen views, and failure reports.
+The stages match a familiar Scanpy or Seurat workflow: filtering, feature selection, normalization,
+PCA, neighbours, UMAP, and Leiden clustering. Use the focused {doc}`scanpy` or {doc}`seurat` guide
+when translating an existing analysis. For measured scale evidence rather than a teaching dataset,
+see {doc}`concepts/benchmarks`.

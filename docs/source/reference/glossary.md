@@ -119,8 +119,9 @@ SNN integration
   `integrate_assays(sources, method="snn")`.
 
 WNN integration
-  Hao-inspired weighted nearest-neighbor merge for two or more explicit modality neighbour refs
-  via `integrate_assays(sources, method="wnn")`.
+  Default Hao-inspired weighted nearest-neighbor merge for two or more explicit modality
+  neighbour refs via `integrate_assays(sources)` or
+  `integrate_assays(sources, method="wnn")`.
   Scarf scores the union of all existing, self-free KNN rows with affinity and the distance span from each modality's nearest to its `k`-th neighbour as bandwidth.
   During scoring it L2-normalizes modality coordinate rows; the affinities themselves are not L2-normalized.
   Unlike Seurat defaults, it does not build a wider 200-neighbour candidate pool or use SNN-far bandwidth.

@@ -2720,7 +2720,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
     def integrate_assays(
         self,
         sources: list[ArtifactRef],
-        method: str = "snn",
+        method: str = "wnn",
         chunk_size: int = 10000,
         invalidate_cache: bool = False,
         l2_normalize: bool = True,
@@ -2736,8 +2736,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
         Args:
             sources: Connectivity-map refs for SNN or neighbor refs for WNN.
-            method: Choose a method for modality integration. Available options: 'snn': Shared nearest neighbour
-                    approach and 'wnn': Hao-inspired weighted nearest neighbor integration.
+            method: Choose a method for modality integration. Available options:
+                'wnn': Hao-inspired weighted nearest neighbor integration and
+                'snn': shared nearest neighbour integration.
             chunk_size: number of cells to be loaded at a time while reading and writing the graph
             invalidate_cache: Force a new integrated-graph artifact.
             l2_normalize: L2-normalize modality coordinates during WNN scoring.

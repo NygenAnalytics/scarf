@@ -78,6 +78,12 @@ def _write_source(
     return path
 
 
+def test_doc_execution_env_uses_shared_dataset_directory() -> None:
+    env = cache_tools.configure_doc_execution_env({})
+
+    assert env["SCARF_DOCS_DATA_DIR"] == str(cache_tools.SOURCE_DIR / "scarf_datasets")
+
+
 def _source(docs_root: Path, name: str):
     return next(
         source

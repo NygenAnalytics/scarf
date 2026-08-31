@@ -26,6 +26,7 @@ Granular workflows pass exact refs to the same datastore-owned plotting surface:
 | composition | `categories=cluster_ref` |
 | distribution | `grouping=cluster_ref` |
 | cluster connectivity | `graph=graph_ref`, `groups=cluster_ref`, `layout=embedding_ref` |
+| modality weights | `graph=wnn_graph_ref`, `layout=embedding_ref` |
 | Paris hierarchy | `graph=graph_ref`, `clusters=paris_ref` |
 | marker heatmap | `marker=marker_ref` |
 | pseudotime heatmap | `aggregation=aggregation_ref` |
@@ -35,6 +36,12 @@ Granular workflows pass exact refs to the same datastore-owned plotting surface:
 inputs. Distribution grouping instead requires either an exact categorical artifact or an explicit
 `CellField`, with `cell_selection=` when a frozen metadata subset is intended.
 
+WNN is the default for `DataStore.integrate_assays`. Its integrated graph stores one weight per
+input assay and cell. Use `ds.plots.modality_weights(graph=wnn_graph, layout=embedding)` or
+{py:func}`scarf.plotting.modality_weights` to show those weights over an explicit embedding. The
+graph and layout must have the exact same cell-selection artifact. Explicit SNN graphs do not
+contain modality weights.
+
 Store-backed plotters and diagnostics generally return a `PlotResult` and render by default with `show=True`.
 Pass `show=False` before accessing, saving, or reusing an owned figure.
 `run_recipe` returns a `PlotRecipeResult` and defaults to `show=False`.
@@ -42,7 +49,7 @@ Helpers differ: `label_panels` and `register_theme` return `None`, `collect_lege
 
 ```{eval-rst}
 .. automodule:: scarf.plotting
-    :members: embedding, embedding_raster, dotplot, matrixplot, composition, distribution, cluster_connectivity, mapping_score, mapping_evidence, mapping_confusion, mapping_calibration, qc, graph_qc, elbow, highly_variable_features, label_panels, collect_legends, compose_results, register_theme, theme_context, marker_heatmap, cluster_tree, pseudotime_heatmap, run_recipe
+    :members: embedding, embedding_raster, dotplot, matrixplot, modality_weights, composition, distribution, cluster_connectivity, mapping_score, mapping_evidence, mapping_confusion, mapping_calibration, qc, graph_qc, elbow, highly_variable_features, label_panels, collect_legends, compose_results, register_theme, theme_context, marker_heatmap, cluster_tree, pseudotime_heatmap, run_recipe
     :imported-members:
     :undoc-members:
     :show-inheritance:

@@ -29,7 +29,7 @@ Most imports follow the same pattern: inspect when the source layout can vary, o
 
 Export paths write Matrix Market or H5AD.
 Scarf does not write Seurat `.rds` or `.h5seurat` files.
-See {doc}`../scanpy_and_seurat` for Scanpy and Seurat workflow mapping.
+See {doc}`../scanpy` or {doc}`../seurat` for ecosystem-specific workflow mapping.
 
 RNA writers write both a cell-major `counts` array and a gene-major `countsT` copy.
 Every newly written assay starts with an all-true physical feature column `I`.

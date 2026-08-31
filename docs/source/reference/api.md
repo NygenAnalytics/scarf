@@ -30,4 +30,5 @@ Prefer calling methods on `DataStore`.
 | Plotting | {doc}`api/plotting` |
 | Cytebase and utilities | {doc}`api/utilities` |
 
-{doc}`../scanpy_and_seurat` and {doc}`../tutorials/scrna_seq` describe related workflows; this table is this reference's own grouping and only partially overlaps those pages.
+{doc}`../scanpy`, {doc}`../seurat`, and {doc}`../tutorials/scrna_seq` describe related workflows;
+this table is this reference's own grouping and only partially overlaps those pages.

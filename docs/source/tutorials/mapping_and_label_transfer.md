@@ -1,5 +1,5 @@
 ---
-description: Map query cells to a fixed reference, inspect mapping evidence, and transfer labels with abstention.
+description: Prepare and reuse a fixed reference, map query cells, and transfer labels with abstention.
 jupytext:
   cell_metadata_filter: -all
   text_representation:
@@ -19,6 +19,8 @@ kernelspec:
 
 Mapping is the fixed-reference alternative to merging datasets and rebuilding a joint graph.
 This allows you to keep one reference atlas unchanged, place new query cells onto it, and transfer labels from reference neighbours.
+The prepared mapping reference is also the reusable atlas: later queries use the same feature panel,
+projection model, reference coordinates, and neighbour index.
 
 It does three things in order:
 
@@ -35,8 +37,6 @@ The shared author labels let us evaluate the result.
 Mapping currently supports RNA queries. The catalog stores were rebuilt with the current count
 layout, and documentation execution downloads separate writable copies. The reference and query
 must remain different stores.
-
-For a reusable Symphony-style atlas, see {doc}`reference_atlases`.
 
 ## 1. Open the reference and query
 
@@ -92,7 +92,7 @@ These UMAP layouts were fitted independently, so their coordinates are not compa
 Mapping keeps the control layout fixed and reports where query weight lands on reference cells.
 The shared label vocabulary is what we use for evaluation.
 
-## 2. Prepare a labelled reference
+## 2. Prepare a labelled, reusable reference
 
 Package the frozen reference run's neighbour chain as an immutable mapping reference.
 
@@ -108,8 +108,14 @@ Its `feature_selection` field pins the exact reference feature artifact rather t
 Its feature order, scaling, PCA loadings, neighbour index, and selected cells stay fixed in the reference datastore.
 `reference_layout` is the immutable UMAP from the same run and is used only to show where query
 weight landed.
-This example uses a plain PCA reference.
-A Symphony reference instead passes Harmony-corrected neighbours into `build_mapping_reference`.
+The mapping reference does not contain that layout or copy the reference labels.
+
+This example intentionally uses a plain PCA reference. A Harmony-backed Symphony reference is
+appropriate only when the reference neighbours were corrected using genuine technical-batch
+metadata. Query batch metadata must likewise describe a measured technical source. A constant query
+label provides no within-query comparison and, by itself, is not evidence that a batch effect was
+estimated or removed. Do not substitute stimulation, disease, or another biological condition for a
+technical batch. When no defensible technical batch exists, use the plain-PCA path shown here.
 
 ## 3. Map the query
 
@@ -337,7 +343,7 @@ If the scores were spread across multiple unrelated clusters, then it would be r
 <span id="reference-atlas-mapping"></span>
 ```
 
-## 7. Reload a prepared mapping
+## 7. Reuse and govern a prepared atlas
 
 In a later session, retain the mapping-reference and projection artifact refs, reopen both stores, and reload the exact results:
 
@@ -350,7 +356,19 @@ reloaded_mapping = ds_stim.get_mapping_result(
 reloaded_mapping.n_cells, reloaded_mapping.correction_method
 ```
 
-Building and reusing a Symphony-style fixed reference is covered in {doc}`reference_atlases`.
+For repeated use, reopen the prepared reference datastore read-only and run each mapping in a
+separate writable query datastore. If query counts come from a read-only source or the same physical
+store used to prepare the reference, use `mount_datastore` to create that separate query store.
+
+Reference labels are resolved from `reference_class_group` when labels are transferred; they are not
+frozen inside `MappingReference`. Treat a published reference store as read-only. If annotations
+must change, name their column for its biological meaning, such as `curated_cell_type`, and select
+that column explicitly in the mapping workflow. Retain the layout artifact separately when mapping
+scores must be displayed on the original reference UMAP.
+
+Validate a reused atlas with feature coverage, mapping evidence, abstention, and score concentration.
+When independent query labels exist, also inspect confusion and threshold calibration. A visually
+plausible embedding alone does not validate transferred labels.
 
 For troubleshooting, common failures include mapping before the reference exists, ignoring feature mismatch, treating vote support as a probability, using a biological condition as a correction batch, and transferring labels without an abstention path.
 

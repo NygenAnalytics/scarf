@@ -1,5 +1,5 @@
 ---
-description: Diagnose RNA and ADT agreement, then compare SNN and WNN integration.
+description: Diagnose modality agreement and compare SNN with WNN integration.
 jupytext:
   text_representation:
     extension: .md
@@ -12,26 +12,22 @@ kernelspec:
   name: python3
 ---
 
-# Multimodal diagnostics
+# Diagnose multimodal integration
 
-RNA and ADT can agree on broad cell populations while resolving different local structure.
-This guide measures that concordance and compares Scarf's SNN and WNN integration methods.
-It assumes the reader already understands the recommended CITE-seq path in {doc}`cite_seq`.
+Decide whether RNA and ADT support compatible biology, then compare equal-weight SNN with the
+recommended WNN path. This advanced page assumes the core {doc}`cite_seq` workflow. Its purpose is
+diagnosis: a clean integrated UMAP is not evidence by itself.
 
-## Standalone setup
-
-The published CITE-seq store carries literal layouts and partitions for visualization plus immutable
-SNN and WNN graph artifacts over matched cells. This page reads those values for diagnostics;
-{doc}`cite_seq` shows the current explicit-input construction API.
+## Open the matched results
 
 ```{code-cell} ipython3
 from itertools import combinations
 
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 
 import scarf
+from scarf.plotting import FeatureRef
 
 scarf.configure_output(level="WARNING", progress=False)
 
@@ -45,123 +41,85 @@ ds = scarf.DataStore(
     default_assay="RNA",
     nthreads=4,
 )
+rna_run = ds.pipeline.open(label="docs_default")
 ```
 
-The snapshot retains literal `RNA+ADT` and `RNA+ADT_wnn` layout and partition columns.
-The immutable graph artifacts themselves are distinguished by their scientific `method` parameter and exact references.
+Use exact provenance predicates to reopen each alternative and its linked results. The API returns
+all matches; one-item destructuring makes ambiguity an error instead of silently selecting a
+current or latest graph.
 
 ```{code-cell} ipython3
-integrated = []
-integrated_refs = {}
-integrated_parameters = {}
-for ref in ds.list_artifacts(
+[adt_layout] = ds.list_artifacts(
+    from_assay="ADT",
+    kind="embedding",
+    operation="run_umap",
+    complete_only=True,
+)
+[adt_clusters] = ds.list_artifacts(
+    from_assay="ADT",
+    kind="cluster_labels",
+    operation="run_leiden_clustering",
+    complete_only=True,
+)
+
+[snn_graph] = ds.list_artifacts(
     scope="datastore",
     kind="integrated_graph",
+    operation="integrate_assays",
+    parameters={"method": "snn"},
     complete_only=True,
-):
-    status = ds.inspect_artifact(ref)
-    parameters = status.parameters or {}
-    method = parameters["method"]
-    if method in integrated_refs:
-        raise RuntimeError(f"Expected one complete {method!r} graph")
-    integrated_refs[method] = ref
-    integrated_parameters[method] = parameters
-    integrated.append(
-        {
-            "method": method,
-            "artifact": ref.artifact_id[:12],
-        }
-    )
-pd.DataFrame(integrated).sort_values("method", ignore_index=True)
-```
-
-Resolve the four immutable clustering artifacts once. Their graph inputs identify
-which partition each artifact contains; the literal metadata columns below remain
-useful only for plotting and cross-tabulation.
-
-```{code-cell} ipython3
-baseline = ds.pipeline.open(label="docs_default")
-graph_names = {
-    baseline["connectivity_map"]: "RNA",
-    integrated_refs["snn"]: "SNN",
-    integrated_refs["wnn"]: "WNN",
-}
-partition_refs = {"RNA": baseline["clusters"]}
-partition_candidates = ds.list_artifacts(
-    kind="cluster_labels",
+)
+[wnn_graph] = ds.list_artifacts(
     scope="datastore",
+    kind="integrated_graph",
+    operation="integrate_assays",
+    parameters={"method": "wnn"},
     complete_only=True,
 )
-for assay in ("RNA", "ADT"):
-    partition_candidates.extend(
-        ds.list_artifacts(
-            kind="cluster_labels",
-            from_assay=assay,
-            complete_only=True,
-        )
-    )
-for ref in partition_candidates:
-    graph_value = (ds.inspect_artifact(ref).inputs or {}).get("graph")
-    if not isinstance(graph_value, dict):
-        continue
-    graph_ref = scarf.ArtifactRef.from_dict(graph_value)
-    name = graph_names.get(graph_ref)
-    if name is None and ref.assay == "ADT":
-        name = "ADT"
-    if name is None:
-        continue
-    if name in partition_refs and partition_refs[name] != ref:
-        raise RuntimeError(f"Expected one complete {name!r} partition")
-    partition_refs[name] = ref
 
-expected_partitions = {"RNA", "ADT", "SNN", "WNN"}
-if set(partition_refs) != expected_partitions:
-    raise RuntimeError("The CITE-seq snapshot is missing a required partition")
+[snn_layout] = ds.list_artifacts(
+    scope="datastore",
+    kind="embedding",
+    operation="run_umap",
+    inputs={"graph": snn_graph},
+    complete_only=True,
+)
+[wnn_layout] = ds.list_artifacts(
+    scope="datastore",
+    kind="embedding",
+    operation="run_umap",
+    inputs={"graph": wnn_graph},
+    complete_only=True,
+)
+[snn_clusters] = ds.list_artifacts(
+    scope="datastore",
+    kind="cluster_labels",
+    operation="run_leiden_clustering",
+    inputs={"graph": snn_graph},
+    complete_only=True,
+)
+[wnn_clusters] = ds.list_artifacts(
+    scope="datastore",
+    kind="cluster_labels",
+    operation="run_leiden_clustering",
+    inputs={"graph": wnn_graph},
+    complete_only=True,
+)
 ```
 
-## 1. Measure modality concordance
+## 1. Check RNA and ADT concordance
 
-First compare the cluster partitions on the two layouts.
-Agreement at broad scales supports a shared biological signal.
-Local disagreement can be useful when one modality resolves a population more clearly.
-
-A normalized cross-tabulation shows which RNA populations contribute to each ADT cluster without letting large clusters dominate the comparison.
-
-```{code-cell} ipython3
-overlap = pd.crosstab(
-    ds.cells.fetch("RNA_leiden_cluster"),
-    ds.cells.fetch("ADT_leiden_cluster"),
-    normalize="columns",
-)
-
-fig, ax = plt.subplots(figsize=(7, 5))
-image = ax.imshow(overlap.to_numpy(), aspect="auto", cmap="magma")
-ax.set(
-    xlabel="ADT cluster",
-    ylabel="RNA cluster",
-    xticks=np.arange(overlap.shape[1]),
-    yticks=np.arange(overlap.shape[0]),
-    xticklabels=overlap.columns,
-    yticklabels=overlap.index,
-)
-fig.colorbar(image, ax=ax, label="Fraction within ADT cluster")
-fig.tight_layout()
-```
-
-Plot each modality's clusters on the other layout to locate local disagreement that the table averages away.
+### Question: where do the assay-specific partitions agree or disagree?
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 2, figsize=(9, 4))
-cross_panels = (
-    ("RNA layout, ADT clusters", "RNA_UMAP", "ADT_leiden_cluster"),
-    ("ADT layout, RNA clusters", "ADT_UMAP", "RNA_leiden_cluster"),
-)
-for axis, (title, layout_key, color_by) in zip(
-    axes, cross_panels, strict=True
+for axis, layout, labels, title in (
+    (axes[0], rna_run["umap"], adt_clusters, "RNA layout, ADT clusters"),
+    (axes[1], adt_layout, rna_run["clusters"], "ADT layout, RNA clusters"),
 ):
     ds.plots.embedding(
-        layout_key=layout_key,
-        color_by=color_by,
+        layout=layout,
+        color_by=labels,
         legend_loc="on_data",
         show_titles=False,
         target=axis,
@@ -171,217 +129,99 @@ for axis, (title, layout_key, color_by) in zip(
 figure.tight_layout()
 ```
 
-Compare an antibody with its coding gene to distinguish genuine modality complementarity from a gross alignment problem.
+Broad agreement supports a shared population structure. Local differences are not automatically
+errors: protein can resolve a population whose transcript is sparse. Large contradictory regions
+should be investigated before integration.
+
+## 2. Compare SNN and WNN
+
+SNN merges connectivity maps with equal standing. WNN consumes neighbour artifacts and learns a
+per-cell contribution for each modality. Both preserve their exact source references; neither
+becomes an implicit active graph.
+
+### Question: does either integration preserve CD16 protein geography better?
 
 ```{code-cell} ipython3
-def compare_signal(feature, assay, label, layouts):
-    figure, axes = plt.subplots(1, 2, figsize=(9, 4))
-    for index, (axis, (layout_label, layout_key)) in enumerate(
-        zip(axes, layouts, strict=True)
-    ):
-        ds.plots.embedding(
-            layout_key=layout_key,
-            color_by=feature,
-            from_assay=assay,
-            point_size=5,
-            show_legend=index == 1,
-            show_titles=False,
-            target=axis,
-            show=False,
-        )
-        axis.set_title(f"{layout_label}: {label}")
-    # Top colorbars occupy the title slot; label the colorbar axes instead.
-    right_title = f"{layouts[-1][0]}: {label}"
-    for colorbar_axis in set(figure.axes) - set(axes):
-        colorbar_axis.set_title(right_title)
-        colorbar_axis.set_xlabel("")
-        colorbar_axis.set_ylabel("")
-    figure.tight_layout()
-    return figure
-
-
-modality_layouts = (
-    ("RNA layout", "RNA_UMAP"),
-    ("ADT layout", "ADT_UMAP"),
-)
-compare_signal(
-    "CD16_TotalSeqB",
-    "ADT",
-    "CD16 protein",
-    modality_layouts,
-);
-```
-
-```{code-cell} ipython3
-compare_signal(
-    "FCGR3A",
-    "RNA",
-    "FCGR3A transcript",
-    modality_layouts,
-);
-```
-
-Protein signal is commonly less sparse than the matching transcript, so exact point-wise agreement is not expected.
-Large regions with contradictory signal need inspection before integration.
-
-## 2. Compare SNN and WNN partitions
-
-SNN combines shared edge support from one connectivity-map artifact per assay.
-WNN accepts one neighbour artifact per assay and learns how strongly each cell should rely on each modality.
-Both accept two or more assays and require matched cells.
-Matched neighbour counts (`k`) are required for SNN only; WNN warns and keeps `min(k)` when they differ.
-The RNA and ADT comparison here is the two-modality special case.
-
-```{code-cell} ipython3
-figure, axes = plt.subplots(1, 2, figsize=(9, 4))
-integration_panels = (
-    ("SNN", "RNA+ADT_UMAP", "RNA+ADT_leiden_cluster"),
-    ("WNN", "RNA+ADT_wnn_UMAP", "RNA+ADT_wnn_leiden_cluster"),
-)
-for axis, (title, layout_key, color_by) in zip(
-    axes, integration_panels, strict=True
+cd16 = FeatureRef("CD16", assay="ADT", by="id", label="CD16")
+figure, axes = plt.subplots(2, 2, figsize=(9, 8))
+for row, layout, labels, method in (
+    (0, snn_layout, snn_clusters, "SNN"),
+    (1, wnn_layout, wnn_clusters, "WNN"),
 ):
     ds.plots.embedding(
-        layout_key=layout_key,
-        color_by=color_by,
+        layout=layout,
+        color_by=labels,
         legend_loc="on_data",
         show_titles=False,
-        target=axis,
+        target=axes[row, 0],
         show=False,
     )
-    axis.set_title(title)
+    axes[row, 0].set_title(f"{method} clusters")
+    ds.plots.embedding(
+        layout=layout,
+        color_by=cd16,
+        sort_values=True,
+        show_titles=False,
+        target=axes[row, 1],
+        show=False,
+    )
+    axes[row, 1].set_title(f"{method}: CD16 protein")
 figure.tight_layout()
 ```
 
+The marker should remain localized rather than being spread across unrelated integrated groups.
+Use several markers and known populations in a real study; one visually compact layout is not a
+selection criterion.
+
+Partition concordance quantifies similarity without declaring a winner:
+
 ```{code-cell} ipython3
-concordance_rows = []
-for first, second in combinations(partition_refs, 2):
-    concordance_rows.append(
+partitions = {
+    "RNA": rna_run["clusters"],
+    "ADT": adt_clusters,
+    "SNN": snn_clusters,
+    "WNN": wnn_clusters,
+}
+concordance = []
+for first, second in combinations(partitions, 2):
+    concordance.append(
         {
             "comparison": f"{first} vs {second}",
             "ARI": ds.metric_label_concordance(
-                partition_refs[first],
-                partition_refs[second],
-                metric="ari",
+                partitions[first], partitions[second], metric="ari"
             ),
             "NMI": ds.metric_label_concordance(
-                partition_refs[first],
-                partition_refs[second],
-                metric="nmi",
+                partitions[first], partitions[second], metric="nmi"
             ),
         }
     )
-pd.DataFrame(concordance_rows)
+pd.DataFrame(concordance)
 ```
 
-ARI and NMI quantify partition agreement without choosing which modality or integration method is correct.
-Compare them with marker coherence and the overlap structure above instead of selecting the cleanest layout.
-
-Plot the same protein and transcript on the two integrated layouts to check whether marker geography stays coherent after merging.
-
-```{code-cell} ipython3
-integrated_layouts = (
-    ("SNN layout", "RNA+ADT_UMAP"),
-    ("WNN layout", "RNA+ADT_wnn_UMAP"),
-)
-compare_signal(
-    "CD16_TotalSeqB",
-    "ADT",
-    "CD16 protein",
-    integrated_layouts,
-);
-```
-
-```{code-cell} ipython3
-compare_signal(
-    "FCGR3A",
-    "RNA",
-    "FCGR3A transcript",
-    integrated_layouts,
-);
-```
+ARI and NMI describe agreement. Interpret them beside marker coherence and assay design rather than
+maximizing them mechanically.
 
 ## 3. Inspect WNN modality weights
 
-WNN stores how much each cell relies on each modality inside the returned graph artifact.
-First check the weight constraints directly.
+### Question: where does each modality contribute most strongly?
 
 ```{code-cell} ipython3
-weight_values = np.asarray(
-    ds.load_artifact(integrated_refs["wnn"])["modality_weights"][:],
-    dtype=np.float64,
-)
-weight_columns = [
-    f"{assay} weight"
-    for assay in integrated_parameters["wnn"]["assays"]
-]
-weight_frame = pd.DataFrame(
-    weight_values,
-    columns=weight_columns,
-)
-pd.Series(
-    {
-        "all finite": bool(np.isfinite(weight_values).all()),
-        "all non-negative": bool((weight_values >= 0).all()),
-        "maximum row-sum error": float(
-            np.max(np.abs(weight_values.sum(axis=1) - 1))
-        ),
-    }
+ds.plots.modality_weights(
+    graph=wnn_graph,
+    layout=wnn_layout,
 )
 ```
 
-Map the weights onto the WNN layout, then inspect their distribution.
-Because the two weights sum to one per cell, the RNA-weight histogram also shows where ADT takes over.
+The plot validates the stored WNN weights and aligns them to the exact layout selection before
+drawing one panel per assay. Spatial shifts can identify regions whose local structure is better
+resolved by RNA or ADT. They can also expose noisy features, retained control antibodies, or a
+modality-specific graph problem.
 
-```{code-cell} ipython3
-wnn_layout = ds.cells.to_pandas_dataframe(
-    ["RNA+ADT_wnn_UMAP1", "RNA+ADT_wnn_UMAP2"],
-    key="I",
-)
-figure, axes = plt.subplots(1, 2, figsize=(9, 4))
-for axis, title in zip(axes, weight_frame.columns, strict=True):
-    points = axis.scatter(
-        wnn_layout["RNA+ADT_wnn_UMAP1"],
-        wnn_layout["RNA+ADT_wnn_UMAP2"],
-        c=weight_frame[title],
-        s=5,
-    )
-    axis.set_title(title)
-    figure.colorbar(points, ax=axis)
-figure.tight_layout()
-```
+## Decision guide
 
-```{code-cell} ipython3
-figure, axis = plt.subplots(figsize=(5, 3.5))
-axis.hist(weight_frame["RNA weight"], bins=40, color="C0", alpha=0.85)
-axis.set(xlabel="RNA weight", ylabel="Cells")
-figure.tight_layout()
-```
-
-Use the earlier overlap table to distinguish cells in the dominant RNA cluster for each ADT cluster from other RNA and ADT combinations.
-
-```{code-cell} ipython3
-rna_clusters = pd.Series(
-    ds.cells.fetch("RNA_leiden_cluster", key="I")
-)
-adt_clusters = pd.Series(
-    ds.cells.fetch("ADT_leiden_cluster", key="I")
-)
-dominant_rna_by_adt = overlap.idxmax(axis=0)
-weight_frame["RNA-ADT overlap"] = np.where(
-    rna_clusters == adt_clusters.map(dominant_rna_by_adt),
-    "dominant overlap",
-    "other overlap",
-)
-weight_frame.groupby("RNA-ADT overlap").agg(["count", "mean", "median"])
-```
-
-The dominant-overlap grouping is descriptive, not a reference annotation.
-Weight shifts can identify cells whose local structure is better resolved by one modality, but they can also expose noise or a graph mismatch.
-The {doc}`cite_seq` workflow covers how SNN and WNN construct the integrated graph.
-
-Choose between methods from the assay design and evidence, not from the layout that looks cleaner.
-WNN is useful when relative local informativeness varies across two or more modalities, while SNN gives all source graphs equal standing.
-Compare cluster stability, marker coherence, known populations, and the modality-concordance checks above.
-
-Common failures include integrating graphs built over different cells, using different `k` values with SNN, retaining control antibodies, and interpreting an integrated embedding as proof that all modality-specific disagreement has been resolved.
+- Prefer WNN when the relative local informativeness of matched modalities varies across cells.
+- Use SNN when equal graph support is the scientific comparison you intend.
+- Reject either result if marker geography, known populations, cell alignment, or graph quality is
+  inconsistent.
+- Use {doc}`../reference/api/integration` for algorithm and input contracts, and
+  {doc}`reuse_and_tracing` for full lineage inspection.

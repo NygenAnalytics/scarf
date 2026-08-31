@@ -216,7 +216,7 @@ class IntegrationCandidateEvaluation(AgentDataModel):
     """One executor-produced SNN or WNN graph and cluster evaluation."""
 
     integrationId: str = ""
-    method: IntegrationMethod = "snn"
+    method: IntegrationMethod = "wnn"
     assays: list[str] = Field(default_factory=list)
     status: CandidateStatus = "failed"
     eligible: bool = False

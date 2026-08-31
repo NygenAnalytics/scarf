@@ -535,6 +535,9 @@ def list_artifacts(
     assay: str | None = None,
     kind: str | None = None,
     complete_only: bool = False,
+    operation: str | None = None,
+    parameters: Mapping[str, Any] | None = None,
+    inputs: Mapping[str, Any] | None = None,
 ) -> list[ArtifactRef]:
     if scope not in {"assay", "datastore"}:
         raise ValueError(f"Invalid artifact scope: {scope!r}")
@@ -548,6 +551,37 @@ def list_artifacts(
         base_path = "artifacts"
     if kind is not None:
         _validate_artifact_kind(kind)
+    if operation is not None:
+        _validate_name(operation, "operation")
+    requested_parameters = (
+        None if parameters is None else serialize_artifact_value(parameters)
+    )
+    requested_inputs = None if inputs is None else serialize_artifact_value(inputs)
+    if requested_parameters is not None and not isinstance(
+        requested_parameters, Mapping
+    ):
+        raise TypeError("parameters must be a mapping")
+    if requested_inputs is not None and not isinstance(requested_inputs, Mapping):
+        raise TypeError("inputs must be a mapping")
+    filter_provenance = any(
+        value is not None for value in (operation, parameters, inputs)
+    )
+
+    def matches_mapping(
+        stored: Mapping[str, Any] | None,
+        requested: Mapping[str, Any] | None,
+    ) -> bool:
+        if requested is None:
+            return True
+        stored = {} if stored is None else stored
+        if not requested:
+            return not stored
+        return all(
+            key in stored
+            and canonical_bytes(stored[key]) == canonical_bytes(requested_value)
+            for key, requested_value in requested.items()
+        )
+
     if base_path not in root:
         return []
     base = as_zarr_group(root[base_path], name=base_path)
@@ -568,8 +602,16 @@ def list_artifacts(
                 )
             except ValueError:
                 continue
-            if complete_only and not artifact_exists(root, ref):
-                continue
+            if complete_only or filter_provenance:
+                status = inspect_artifact(root, ref)
+                if not status.complete:
+                    continue
+                if operation is not None and status.operation != operation:
+                    continue
+                if not matches_mapping(status.parameters, requested_parameters):
+                    continue
+                if not matches_mapping(status.inputs, requested_inputs):
+                    continue
             refs.append(ref)
     return refs
 

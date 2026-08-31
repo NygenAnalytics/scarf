@@ -81,7 +81,8 @@ Pass one returned candidate to `MtxReader`.
 Import a serialized Seurat object from an `.rds` file.
 Inspect with `inspect_seurat`, open `SeuratReader`, then write with `SeuratToZarr`.
 This path does not attach to a live R session and does not read or write `.h5seurat`.
-See {doc}`../../tutorials/import_and_export` for the worked contract and {doc}`../../scanpy_and_seurat` for workflow mapping.
+See {doc}`../../tutorials/import_and_export` for the worked contract and {doc}`../../seurat` for
+workflow mapping.
 
 ```{eval-rst}
 .. autoclass:: scarf.SeuratReader

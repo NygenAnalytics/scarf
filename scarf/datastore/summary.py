@@ -134,6 +134,9 @@ class _SummaryStore(Protocol):
         from_assay: str | None = None,
         scope: ArtifactScope = "assay",
         complete_only: bool = False,
+        operation: str | None = None,
+        parameters: Mapping[str, Any] | None = None,
+        inputs: Mapping[str, Any] | None = None,
     ) -> list[ArtifactRef]: ...
 
     def inspect_artifact(self, ref: ArtifactRef) -> ArtifactStatus: ...
@@ -231,6 +234,9 @@ class _ReadOnlySummaryStore:
         from_assay: str | None = None,
         scope: ArtifactScope = "assay",
         complete_only: bool = False,
+        operation: str | None = None,
+        parameters: Mapping[str, Any] | None = None,
+        inputs: Mapping[str, Any] | None = None,
     ) -> list[ArtifactRef]:
         if scope == "assay" and from_assay is None:
             from_assay = self._defaultAssay
@@ -240,6 +246,9 @@ class _ReadOnlySummaryStore:
             assay=from_assay,
             kind=kind,
             complete_only=complete_only,
+            operation=operation,
+            parameters=parameters,
+            inputs=inputs,
         )
 
     def inspect_artifact(self, ref: ArtifactRef) -> ArtifactStatus:

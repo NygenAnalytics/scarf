@@ -15,8 +15,7 @@ kernelspec:
 # Cell downsampling
 
 TopACeDo selects representative cells from an explicit graph and Paris clustering. It returns one
-immutable artifact with the selected mask and diagnostics. Nothing is added to cell metadata unless
-you deliberately add a column for an export tool.
+immutable artifact with the selected mask and diagnostics. Nothing is added to cell metadata.
 
 ## 1. Open the required artifacts
 
@@ -113,25 +112,19 @@ replacement for the complete dataset.
 
 ## 3. Export the selected cells
 
-`SubsetZarr` currently selects cells by a boolean metadata column. Add one explicitly, then export.
-The rebuilt store's active `I` matches the graph selection, so the compact sampler mask aligns with
-the insert. This mutation is a user-owned handoff step, not a side effect of TopACeDo.
+The sampler mask follows the graph's compact cell-selection order. Map it back to physical row
+indices, then pass those rows directly to `SubsetZarr`. No temporary metadata column is needed.
 
 ```{code-cell} ipython3
-ds.cells.insert(
-    "topacedo_selected",
-    sampled,
-    key="I",
-    fill_value=False,
-    overwrite=True,
-)
+graph_cell_indices = np.flatnonzero(run.cells.fetch_all("I"))
+sampled_cell_indices = graph_cell_indices[sampled]
 
 export_directory = TemporaryDirectory()
 subset_path = Path(export_directory.name) / "subset.zarr"
 writer = scarf.SubsetZarr(
     zarr_loc=str(subset_path),
     assays=[ds.RNA],
-    cell_key="topacedo_selected",
+    cell_idx=sampled_cell_indices,
     reset_cell_filter=False,
     overwrite_existing_file=True,
 )

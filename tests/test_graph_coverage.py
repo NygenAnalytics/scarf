@@ -1053,10 +1053,13 @@ def test_integrate_assays_persists_exact_sources(
             integrate_wnn,
         )
 
-    integrated = store.integrate_assays(
-        list(captured_sources.values()),
-        method=method,
-    )
+    if method == "wnn":
+        integrated = store.integrate_assays(list(captured_sources.values()))
+    else:
+        integrated = store.integrate_assays(
+            list(captured_sources.values()),
+            method=method,
+        )
     reused = store.integrate_assays(
         list(captured_sources.values()),
         method=method,

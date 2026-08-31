@@ -993,6 +993,41 @@ class DataStorePlotAccessor:
             show=show,
         )
 
+    def modality_weights(
+        self,
+        *,
+        graph: ArtifactRef,
+        layout: ArtifactRef,
+        point_size: float | None = None,
+        point_alpha: float = 1.0,
+        cmap: str = "viridis",
+        n_columns: int | None = None,
+        target: Any | None = None,
+        figsize: tuple[float, float] | None = None,
+        theme: str = "notebook",
+        frame: FrameStyle = "minimal",
+        rasterize_threshold: int = 50_000,
+        show: bool = True,
+    ) -> "PlotResult":
+        """Plot each assay's WNN contribution over an explicit embedding."""
+        from ..plotting import modality_weights
+
+        return modality_weights(
+            self._store,
+            graph=graph,
+            layout=layout,
+            point_size=point_size,
+            point_alpha=point_alpha,
+            cmap=cmap,
+            n_columns=n_columns,
+            target=target,
+            figsize=figsize,
+            theme=theme,
+            frame=frame,
+            rasterize_threshold=rasterize_threshold,
+            show=show,
+        )
+
     def cluster_tree(
         self,
         *,

@@ -993,6 +993,127 @@ def test_artifact_listing_validates_filters_and_malformed_paths() -> None:
         list_artifacts(root, scope="assay", assay="RNA")
 
 
+def test_artifact_listing_matches_exact_serialized_provenance_predicates() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    source = _ref(kind="neighbors", artifact_id="2" * 64)
+    expected = [
+        _complete_artifact(
+            root,
+            kind="normalized",
+            operation="run_normalization",
+            parameters={"scale": 10_000, "options": {"log": True}},
+            inputs={"source": source},
+        )
+        for _ in range(2)
+    ]
+    log_disabled = _complete_artifact(
+        root,
+        kind="normalized",
+        operation="run_normalization",
+        parameters={"scale": 10_000, "options": {"log": False}},
+        inputs={"source": source},
+    )
+    _complete_artifact(
+        root,
+        kind="normalized",
+        operation="import_normalization",
+        parameters={"scale": 10_000, "options": {"log": True}},
+        inputs={"source": source},
+    )
+    incomplete = _ref(artifact_id="3" * 64)
+    root.create_group(artifact_path(incomplete)).attrs.update(
+        {
+            "artifact_id": incomplete.artifact_id,
+            "kind": incomplete.kind,
+            "provenance": make_provenance(
+                operation="run_normalization",
+                parameters={"scale": 10_000, "options": {"log": True}},
+                inputs={"source": source},
+            ),
+            "execution_options": {},
+            "complete": False,
+        }
+    )
+
+    query = {
+        "scope": "assay",
+        "assay": "RNA",
+        "kind": "normalized",
+        "operation": "run_normalization",
+        "parameters": {"options": {"log": True}, "scale": 10_000},
+        "inputs": {"source": source},
+    }
+    assert list_artifacts(root, **query) == sorted(
+        expected,
+        key=lambda ref: ref.artifact_id,
+    )
+    assert list_artifacts(
+        root,
+        **{**query, "inputs": {"source": source.to_dict()}},
+    ) == sorted(expected, key=lambda ref: ref.artifact_id)
+    assert list_artifacts(
+        root,
+        scope="assay",
+        assay="RNA",
+        kind="normalized",
+        operation="run_normalization",
+        parameters={"scale": 10_000},
+    ) == sorted(
+        expected + [log_disabled],
+        key=lambda ref: ref.artifact_id,
+    )
+    assert (
+        list_artifacts(
+            root,
+            scope="assay",
+            assay="RNA",
+            kind="normalized",
+            parameters={},
+        )
+        == []
+    )
+    assert list_artifacts(
+        root,
+        scope="assay",
+        assay="RNA",
+        kind="normalized",
+        operation="run_normalization",
+        parameters={"options": {"log": True}},
+        inputs={"source": source.to_dict()},
+    ) == sorted(expected, key=lambda ref: ref.artifact_id)
+    with pytest.raises(TypeError, match="parameters must be a mapping"):
+        list_artifacts(
+            root,
+            scope="assay",
+            assay="RNA",
+            parameters=[],  # type: ignore[arg-type]
+        )
+
+
+def test_artifact_listing_fails_on_malformed_complete_provenance() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    malformed = _complete_artifact(
+        root,
+        kind="normalized",
+        operation="run_normalization",
+        parameters={},
+        inputs={},
+    )
+    root[artifact_path(malformed)].attrs["provenance"] = {
+        "operation": "run_normalization",
+        "parameters": [],
+        "inputs": {},
+    }
+
+    with pytest.raises(TypeError, match="provenance.*malformed"):
+        list_artifacts(
+            root,
+            scope="assay",
+            assay="RNA",
+            operation="run_normalization",
+        )
+
+
 def test_reusable_artifacts_skip_incomplete_malformed_and_mismatched_records() -> None:
     root = zarr.open_group(store=MemoryStore(), mode="w")
     provenance = make_provenance(
@@ -1320,6 +1441,11 @@ def test_datastore_exposes_artifact_inspection_without_writing() -> None:
 
     assert datastore.inspect_artifact(ref).complete
     assert datastore.list_artifacts() == [ref]
+    assert datastore.list_artifacts(
+        operation="run_normalization",
+        parameters={},
+        inputs={},
+    ) == [ref]
 
 
 def test_completed_artifact_requires_full_provenance_record() -> None:

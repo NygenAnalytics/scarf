@@ -6,13 +6,14 @@ subtrees:
         title: Installation
       - file: quickstart
         title: Quick start
-      - file: analysis_with_agents
-        title: Analysis with AI agents
-      - file: tutorials/agent_workflow
-        title: Grounded agent workflow
       - file: scanpy_and_seurat
-        title: Scanpy and Seurat users
-  - caption: Assay workflows
+        title: Coming from Scanpy or Seurat
+        entries:
+          - file: scanpy
+            title: Scanpy users
+          - file: seurat
+            title: Seurat users
+  - caption: Core workflows
     entries:
       - file: tutorials/scrna_seq
         title: scRNA-seq heterogeneity
@@ -20,33 +21,7 @@ subtrees:
         title: scATAC-seq
       - file: tutorials/cite_seq
         title: CITE-seq
-      - file: tutorials/multimodal_diagnostics
-        title: Multimodal diagnostics
-      - file: tutorials/tea_seq
-        title: TEA-seq
-      - file: tutorials/hto_demultiplexing
-        title: HTO demultiplexing
-  - caption: Trajectories
-    entries:
-      - file: tutorials/pseudotime
-        title: Pseudotime
-      - file: tutorials/expression_dynamics
-        title: Expression dynamics
-      - file: tutorials/fate_mapping
-        title: Fate mapping
-      - file: tutorials/trajectory_validation
-        title: Trajectory validation
-  - caption: Integration and mapping
-    entries:
-      - file: tutorials/dataset_merging
-        title: Dataset merging
-      - file: tutorials/batch_correction
-        title: Batch correction
-      - file: tutorials/mapping_and_label_transfer
-        title: Mapping and label transfer
-      - file: tutorials/reference_atlases
-        title: Reference atlases
-  - caption: Annotation and biology
+  - caption: Biological recipes
     entries:
       - file: tutorials/annotation
         title: Cell type annotation
@@ -58,10 +33,26 @@ subtrees:
         title: Pseudobulk and DE
       - file: tutorials/condition_comparisons
         title: Condition comparisons
-  - caption: Building blocks
+      - file: tutorials/pseudotime
+        title: Pseudotime
+      - file: tutorials/expression_dynamics
+        title: Expression dynamics
+      - file: tutorials/fate_mapping
+        title: Fate mapping
+      - file: tutorials/trajectory_validation
+        title: Trajectory validation
+      - file: tutorials/imputation
+        title: Imputation by graph diffusion
+  - caption: Integration and mapping
     entries:
-      - file: tutorials/plotting
-        title: Plotting
+      - file: tutorials/dataset_merging
+        title: Dataset merging
+      - file: tutorials/batch_correction
+        title: Batch correction
+      - file: tutorials/mapping_and_label_transfer
+        title: Mapping and label transfer
+  - caption: Diagnostics and method choices
+    entries:
       - file: tutorials/quality_control
         title: Quality control
       - file: tutorials/feature_selection
@@ -72,13 +63,9 @@ subtrees:
         title: Dimensionality reduction
       - file: tutorials/clustering
         title: Clustering
-      - file: tutorials/imputation
-        title: Imputation by graph diffusion
-      - file: tutorials/downsampling
-        title: Cell downsampling
-      - file: tutorials/custom_analyses
-        title: Custom analyses
-  - caption: Stores, scale, and provenance
+      - file: tutorials/multimodal_diagnostics
+        title: Multimodal diagnostics
+  - caption: Data, remote, and scale
     entries:
       - file: tutorials/import_and_export
         title: Import and export
@@ -86,14 +73,32 @@ subtrees:
         title: Data organization
       - file: tutorials/remote_stores
         title: Remote stores
-      - file: concepts/provenance
-        title: Provenance
-      - file: tutorials/reuse_and_tracing
-        title: Reuse and tracing
       - file: concepts/memory_and_execution
         title: Memory and execution
       - file: concepts/benchmarks
         title: Benchmarks
+  - caption: Artifacts and automation
+    entries:
+      - file: concepts/provenance
+        title: Provenance
+      - file: tutorials/reuse_and_tracing
+        title: Reuse and tracing
+      - file: analysis_with_agents
+        title: Analysis with AI agents
+      - file: tutorials/agent_workflow
+        title: Grounded agent workflow
+  - caption: Advanced examples
+    entries:
+      - file: tutorials/plotting
+        title: Plotting
+      - file: tutorials/tea_seq
+        title: TEA-seq
+      - file: tutorials/hto_demultiplexing
+        title: HTO demultiplexing
+      - file: tutorials/downsampling
+        title: Cell downsampling
+      - file: tutorials/custom_analyses
+        title: Custom analyses
   - caption: Reference
     entries:
       - file: reference/api

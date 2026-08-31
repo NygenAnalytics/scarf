@@ -2,45 +2,80 @@
 
 > Out-of-core, provenance-backed single-cell analysis for RNA, ATAC, protein, and matched multi-omic data. Follow the linked documentation for the installed release. Do not infer unsupported methods or biological conclusions.
 
-## Start here
+## Get started
 
-- [Home](index.html): design, implemented methods, validation, and current boundaries
-- [Analysis with AI agents](analysis_with_agents.html): scientific decision loop, run and artifact inspection, task routing, troubleshooting, and handoff
-- [Grounded agent workflow](tutorials/agent_workflow.html): executable enrichment, design, tuning, and biological-interpretation handoffs
-- [Quick start](quickstart.html): minimal count-to-cluster workflow
-- [API reference](reference/api.html): exact public signatures and result contracts
+- [Home](index.html): scope, measured scale, implemented methods, validation, and current boundaries
+- [Installation](installation.html): supported Python versions and installation paths
+- [Quick start](quickstart.html): open a prepared PBMC run and inspect its selected clusters
+- [Coming from Scanpy or Seurat](scanpy_and_seurat.html): shared mental model and route to the focused migration guides
+- [Scanpy users](scanpy.html): workflow mapping and H5AD exchange
+- [Seurat users](seurat.html): workflow mapping, RDS import, and WNN differences
 
-## Core analysis
+## Core workflows
 
-- [scRNA-seq heterogeneity](tutorials/scrna_seq.html): filtering through marker interpretation
+- [scRNA-seq heterogeneity](tutorials/scrna_seq.html): interpret a prepared PBMC run with marker evidence
+- [scATAC-seq](tutorials/scatac_seq.html): peak filtering, LSI, graph construction, clustering, and gene scores
+- [CITE-seq](tutorials/cite_seq.html): matched RNA and ADT analysis with WNN integration
+
+## Biological recipes
+
+- [Cell type annotation](tutorials/annotation.html): marker interpretation and label assignment
+- [Cell cycle](tutorials/cell_cycle.html): canonical phase scoring
+- [Gene-set scoring](tutorials/gene_set_scoring.html): AUCell and WAGGR activity scores
+- [Pseudobulk and differential expression](tutorials/pseudobulk_and_differential_expression.html): biological-replicate aggregation and export
+- [Condition comparisons](tutorials/condition_comparisons.html): matched donor-level testing and its limits
+- [Pseudotime](tutorials/pseudotime.html): supervised sources and sinks
+- [Expression dynamics](tutorials/expression_dynamics.html): feature profiles and modules
+- [Fate mapping](tutorials/fate_mapping.html): multiple terminal outcomes
+- [Trajectory validation](tutorials/trajectory_validation.html): boundary, graph, statistical, and numerical checks
+- [Imputation](tutorials/imputation.html): graph diffusion for exploratory visualization
+
+## Integration and mapping
+
+- [Dataset merging](tutorials/dataset_merging.html): compatible stores and an uncorrected joint baseline
+- [Batch correction](tutorials/batch_correction.html): Harmony, batch mixing, and biological conservation
+- [Mapping and label transfer](tutorials/mapping_and_label_transfer.html): fixed-reference projection
+
+## Diagnostics and method choices
+
 - [Quality control](tutorials/quality_control.html): modality-aware and sample-aware filtering
 - [Feature selection](tutorials/feature_selection.html): feature-set diagnostics
 - [Graph construction](tutorials/graph_construction.html): granular normalization, reduction, neighbours, and graphs
 - [Dimensionality reduction](tutorials/dimensionality_reduction.html): PCA dimensions and layout comparison
 - [Clustering](tutorials/clustering.html): Leiden, Paris, stability, connectivity, and markers
-- [Cell type annotation](tutorials/annotation.html): marker interpretation and label assignment
+- [Multimodal diagnostics](tutorials/multimodal_diagnostics.html): compare SNN and WNN and inspect modality weights
 
-## Integration and inference
+## Data, remote, and scale
 
-- [Dataset merging](tutorials/dataset_merging.html): compatible stores and an uncorrected joint baseline
-- [Batch correction](tutorials/batch_correction.html): partial PCA, Harmony, mixing, and structural preservation
-- [TEA-seq](tutorials/tea_seq.html): prepared RNA, ATAC, and protein analysis with three-way WNN
-- [Mapping and label transfer](tutorials/mapping_and_label_transfer.html): fixed-reference projection
-- [Pseudobulk and differential expression](tutorials/pseudobulk_and_differential_expression.html): biological-replicate aggregation and export
+- [Import and export](tutorials/import_and_export.html): source formats, saved Seurat import, and output contracts
+- [Data organization](tutorials/data_organization.html): assays, cell data, feature data, and metadata
+- [Remote stores](tutorials/remote_stores.html): local mounted-store execution and an explicit object-store template
+- [Memory and execution](concepts/memory_and_execution.html): resource budgets, concurrency, and I/O
+- [Benchmarks](concepts/benchmarks.html): measured end-to-end timings, peak memory, and limitations
 
-## Trajectory analysis
-
-- [Pseudotime](tutorials/pseudotime.html): supervised sources and sinks
-- [Expression dynamics](tutorials/expression_dynamics.html): feature profiles and modules
-- [Fate mapping](tutorials/fate_mapping.html): multiple terminal outcomes
-- [Trajectory validation](tutorials/trajectory_validation.html): boundary, graph, statistical, and numerical checks
-
-## Provenance, scale, and extension
+## Artifacts and automation
 
 - [Provenance](concepts/provenance.html): artifacts, reuse, lineage, and limits
-- [Reuse and tracing](tutorials/reuse_and_tracing.html): executable branching example
-- [Memory and execution](concepts/memory_and_execution.html): resource budgets and scale
-- [Benchmarks](concepts/benchmarks.html): measured end-to-end timings and peak memory
-- [Remote stores](tutorials/remote_stores.html): object-storage execution
+- [Reuse and tracing](tutorials/reuse_and_tracing.html): executable branching and inspection example
+- [Analysis with AI agents](analysis_with_agents.html): scientific decision loop, task routing, troubleshooting, and handoff
+- [Grounded agent workflow](tutorials/agent_workflow.html): executable enrichment, design, tuning, and interpretation stages
+
+## Advanced examples
+
+- [Plotting](tutorials/plotting.html): embedding, marker, hierarchy, and trajectory displays
+- [TEA-seq](tutorials/tea_seq.html): prepared RNA, ATAC, and protein analysis with three-way WNN
+- [HTO demultiplexing](tutorials/hto_demultiplexing.html): sample-tag classification and Seurat comparison
+- [Cell downsampling](tutorials/downsampling.html): TopACeDo and subset-store export
 - [Custom analyses](tutorials/custom_analyses.html): public extension and export boundaries
+
+## Reference
+
+- [API reference](reference/api.html): exact public signatures and result contracts
 - [FAQ](reference/faq.html): concise method and interoperability answers
+- [Glossary](reference/glossary.html): Scarf concepts and terms
+
+## Developers
+
+- [Contributing](developers/contributing.html): local workflow and required checks
+- [Architecture](developers/architecture.html): package boundaries and code placement
+- [Zarr internals](developers/zarr_internals.html): on-disk layout for maintainers

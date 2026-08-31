@@ -58,6 +58,7 @@ if TYPE_CHECKING:
         mapping_evidence as mapping_evidence,
         mapping_score as mapping_score,
     )
+    from .modality_weights import modality_weights as modality_weights
     from .summary import dotplot as dotplot
     from .summary import matrixplot as matrixplot
 
@@ -101,6 +102,7 @@ __all__ = [
     "mapping_evidence",
     "mapping_score",
     "matrixplot",
+    "modality_weights",
     "pseudotime_heatmap",
     "qc",
     "register_theme",
@@ -148,6 +150,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "mapping_evidence": (".mapping", "mapping_evidence"),
     "mapping_score": (".mapping", "mapping_score"),
     "matrixplot": (".summary", "matrixplot"),
+    "modality_weights": (".modality_weights", "modality_weights"),
     "pseudotime_heatmap": (".heatmaps", "pseudotime_heatmap"),
     "qc": (".diagnostics", "qc"),
     "register_theme": ("._style", "register_theme"),

@@ -16,8 +16,9 @@ kernelspec:
 
 # Provenance and reuse
 
-This tutorial shows when Scarf will {term}`reuse` a completed {term}`artifact` and when it builds a new one.
-Read {doc}`../concepts/provenance` for the rules that decide which of the two happens.
+This is the focused guide to artifact mechanics. It shows how to reopen one exact result, branch a
+parameter, identify reused work, force recomputation, and compare lineage. Read
+{doc}`../concepts/provenance` first for the short mental model.
 
 ## Prerequisites
 
@@ -38,8 +39,6 @@ only the parameter forks needed to demonstrate reuse.
 
 ```{code-cell} ipython3
 import scarf
-import scarf.plotting as splt
-
 scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
@@ -53,7 +52,7 @@ cell_selection = baseline_run["analysis_cell_selection"]
 hvg_ref = baseline_run["highly_variable_features"]
 ```
 
-## 1. Open the baseline chain
+## 1. Open and inspect the baseline chain
 
 The completed run retains every immutable reference needed to keep side comparisons separate.
 
@@ -63,6 +62,28 @@ pca = baseline_run["pca"]
 ann = baseline_run["ann_index"]
 neighbors_k11 = baseline_run["neighbors"]
 graph_k11 = baseline_run["connectivity_map"]
+```
+
+The catalog can also find results by exact provenance predicates. It returns every match and never
+chooses a latest result, so one-item destructuring is an explicit cardinality check:
+
+```{code-cell} ipython3
+[reopened_graph] = ds.list_artifacts(
+    from_assay="RNA",
+    kind="connectivity_map",
+    operation="build_connectivity_map",
+    inputs={"neighbors": neighbors_k11},
+    complete_only=True,
+)
+assert reopened_graph == graph_k11
+
+status = ds.inspect_artifact(reopened_graph)
+{
+    "operation": status.operation,
+    "parameters": status.parameters,
+    "inputs": status.inputs,
+    "complete": status.complete,
+}
 ```
 
 ## 2. Vary `k`: reuse upstream
@@ -83,15 +104,8 @@ graph_k15 = ds.build_connectivity_map(neighbors_k15)
 }
 ```
 
-Degree and edge-weight distributions shift with `k` even though the upstream artifacts are identical:
-
-```{code-cell} ipython3
-matrix_k11 = ds.load_graph(graph_k11)
-matrix_k15 = ds.load_graph(graph_k15)
-print("edges (nnz):", {"k11": matrix_k11.nnz, "k15": matrix_k15.nnz})
-splt.graph_qc(matrix_k11)
-splt.graph_qc(matrix_k15)
-```
+The graph-construction guide owns the scientific effect of changing `k`. Here the important result
+is where the immutable branch begins.
 
 ## 3. Vary `dims`: invalidate downstream
 
@@ -119,9 +133,11 @@ Previously completed artifacts remain on disk.
 The new reference has a different id and path.
 The operation and parameters stay the same.
 
-For normalization, `invalidate_cache` writes a fresh normalized artifact while retaining the exact immutable `cell_selection` and `feature_selection` inputs:
+For normalization, the call below would write a fresh normalized artifact while retaining the
+exact immutable `cell_selection` and `feature_selection` inputs. It is not executed here because a
+throwaway duplicate adds no evidence to the lineage figure.
 
-```{code-cell} ipython3
+```python
 forced = ds.run_normalization(
     cell_selection,
     hvg_ref,

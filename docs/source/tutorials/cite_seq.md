@@ -1,5 +1,5 @@
 ---
-description: Build RNA and ADT graphs and integrate them with immutable SNN and WNN artifacts.
+description: Interpret a prepared CITE-seq WNN map with protein-marker evidence.
 jupytext:
   text_representation:
     extension: .md
@@ -13,24 +13,22 @@ kernelspec:
 ---
 
 (multimodal_integration)=
+(wnn_integration)=
 
-# CITE-seq and matched RNA plus protein
+# Integrate RNA and protein with CITE-seq
 
-CITE-seq measures RNA and antibody-derived tags in the same cells. Scarf keeps each assay's
-normalization and graph separate, then integrates exact graph artifacts. No analytical stage adds
-layout, cluster, or modality-weight columns to shared cell metadata.
+Use weighted nearest neighbours (WNN) to interpret matched RNA and antibody-derived tag (ADT)
+measurements from the same PBMCs. This is the one recommended CITE-seq path: reopen the prepared
+WNN result, inspect its joint populations, and test them with protein markers.
 
-## 1. Open the matched assays
+SNN comparison, modality-specific alternatives, integration metrics, and modality weights belong
+in {doc}`multimodal_diagnostics`.
 
-The downloaded Zarr store was rebuilt with this Scarf version. It contains the complete RNA, ADT,
-SNN, and WNN artifacts used below, so calls with the recorded parameters reuse those artifacts.
+## Open the prepared multimodal result
 
 ```{code-cell} ipython3
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-
 import scarf
+from scarf.plotting import FeatureRef
 
 scarf.configure_output(level="WARNING", progress=False)
 
@@ -39,153 +37,98 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     destination="scarf_datasets",
     zarr=True,
 )
-ds = scarf.DataStore(f"{dataset}/data.zarr", default_assay="RNA", nthreads=4)
-ds
-```
-
-## 2. Build the RNA graph and select cells
-
-The prepared RNA pipeline run fixes the filtering, feature selection, normalization, PCA,
-neighbours, connectivity map, UMAP, and Leiden outputs used together.
-
-```{code-cell} ipython3
-rna_run = ds.pipeline.open(label="docs_default")
-cell_selection = rna_run["analysis_cell_selection"]
-rna_initialization = rna_run["embedding_initialization"]
-rna_neighbors = rna_run["neighbors"]
-rna_graph = rna_run["connectivity_map"]
-rna_umap = rna_run["umap"]
-rna_clusters = rna_run["leiden_1.0"]
-
-cell_mask = rna_run.cells.fetch_all("I")
-print(f"Selected cells: {int(cell_mask.sum())} of {len(cell_mask)}")
-```
-
-The run's immutable cell selection is shared by both assays because their rows describe the same
-cells. The live `I` column remains unchanged. ADT reduction and multimodal integration remain
-separate atomic chains.
-
-```{code-cell} ipython3
-ds.plots.embedding(layout=rna_umap, color_by=rna_clusters)
-```
-
-## 3. Build the ADT graph
-
-ADT uses centred-log-ratio normalization. Inspect the panel before excluding controls because
-naming conventions vary.
-
-```{code-cell} ipython3
-adt_names = ds.ADT.feats.fetch_all("names").astype(str)
-adt_panel = pd.DataFrame({"name": adt_names})
-adt_panel["is_control"] = adt_panel["name"].str.lower().str.contains("control")
-adt_panel[adt_panel["is_control"]]
-```
-
-```{code-cell} ipython3
-adt_features = ds.set_feature_selection(
-    from_assay="ADT",
-    mask=~adt_panel["is_control"].to_numpy(),
-)
-adt_feature_values = np.asarray(ds.load_artifact(adt_features)["values"][:])
-print(f"Selected ADT features: {int(adt_feature_values.sum())} of {len(adt_panel)}")
-
-normalized_adt = ds.run_normalization(cell_selection, adt_features)
-n_adt_features = int(ds.load_artifact(normalized_adt)["data"].shape[1])
-adt_reduction = ds.run_custom_reduction(
-    np.eye(n_adt_features, dtype=np.float64),
-    normalized_adt,
-)
-adt_initialization = ds.build_embedding_initialization(adt_reduction)
-adt_ann = ds.build_ann_index(adt_reduction)
-adt_neighbors = ds.query_neighbors(adt_ann, k=21)
-adt_graph = ds.build_connectivity_map(adt_neighbors)
-adt_umap = ds.run_umap(adt_graph, adt_initialization)
-adt_clusters = ds.run_leiden_clustering(adt_graph, resolution=1)
-```
-
-An identity reduction keeps neighbour search in normalized antibody space. PCA is unnecessary for
-a panel with only a few dozen features.
-
-```{code-cell} ipython3
-ds.plots.embedding(layout=adt_umap, color_by=adt_clusters)
-```
-
-## 4. Shared nearest-neighbour integration
-
-SNN consumes exact connectivity-map refs and requires equal neighbour degree.
-
-```{code-cell} ipython3
-snn_graph = ds.integrate_assays([rna_graph, adt_graph], method="snn")
-snn_umap = ds.run_umap(snn_graph, rna_initialization)
-snn_clusters = ds.run_leiden_clustering(snn_graph, resolution=1.75)
-```
-
-```{code-cell} ipython3
-ds.plots.embedding(layout=snn_umap, color_by=snn_clusters)
-```
-
-(wnn_integration)=
-
-## 5. Weighted nearest-neighbour integration
-
-WNN consumes modality-specific neighbour refs and learns a non-negative per-cell weight for each
-modality. The weights are stored inside the integrated artifact.
-
-```{code-cell} ipython3
-wnn_graph = ds.integrate_assays(
-    [rna_neighbors, adt_neighbors],
-    method="wnn",
-    l2_normalize=True,
-)
-wnn_umap = ds.run_umap(wnn_graph, rna_initialization)
-weight_values = np.asarray(ds.load_artifact(wnn_graph)["modality_weights"][:])
-
-pd.Series(
-    {
-        "minimum weight": float(weight_values.min()),
-        "maximum weight": float(weight_values.max()),
-        "mean RNA weight": float(weight_values[:, 0].mean()),
-        "mean ADT weight": float(weight_values[:, 1].mean()),
-        "maximum row-sum error": float(np.abs(weight_values.sum(axis=1) - 1).max()),
-    }
+ds = scarf.DataStore(
+    f"{dataset}/data.zarr",
+    default_assay="RNA",
+    nthreads=4,
 )
 ```
 
+The store contains both assay-specific neighbour results and a previously computed WNN graph.
+Focused provenance predicates reopen the WNN graph and only the UMAP and Leiden result produced
+from that graph. Destructuring each result fails loudly if the prepared store is missing a result
+or has more than one match.
+
 ```{code-cell} ipython3
-wnn_umap_values = np.asarray(ds.load_artifact(wnn_umap)["values"][:])
-figure, axes = plt.subplots(1, 2, figsize=(9, 4))
-for axis, index, title in (
-    (axes[0], 0, "RNA weight"),
-    (axes[1], 1, "ADT weight"),
-):
-    points = axis.scatter(
-        wnn_umap_values[:, 0],
-        wnn_umap_values[:, 1],
-        c=weight_values[:, index],
-        s=3,
-    )
-    axis.set_title(title)
-    figure.colorbar(points, ax=axis)
-figure.tight_layout()
-figure
+[wnn_graph] = ds.list_artifacts(
+    scope="datastore",
+    kind="integrated_graph",
+    operation="integrate_assays",
+    parameters={"method": "wnn"},
+    complete_only=True,
+)
+[wnn_umap] = ds.list_artifacts(
+    scope="datastore",
+    kind="embedding",
+    operation="run_umap",
+    inputs={"graph": wnn_graph},
+    complete_only=True,
+)
+[wnn_clusters] = ds.list_artifacts(
+    scope="datastore",
+    kind="cluster_labels",
+    operation="run_leiden_clustering",
+    inputs={"graph": wnn_graph},
+    complete_only=True,
+)
 ```
 
-WNN is Hao-inspired but not bit-identical to Seurat. Scarf scores the union of persisted KNN rows,
-retains the smallest input degree, uses each modality's nearest-to-farthest distance span as its
-bandwidth, and stores all source refs plus modality weights in one immutable integrated graph.
+### Question: what populations does the joint RNA and protein graph separate?
 
-Keep RNA, ADT, SNN, and WNN refs when comparing alternatives. No branch becomes an implicit active
-graph or writes weights into cell metadata.
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout=wnn_umap,
+    color_by=wnn_clusters,
+    legend_loc="on_data",
+)
+```
 
-## 6. HTO demultiplexing
+The WNN graph separates several broad immune populations while allowing RNA and protein to
+contribute differently from cell to cell. Cluster numbers are only partitions; marker evidence is
+needed before attaching biological names.
 
-Hashtag assignment is a separate sample-identification task, not part of the RNA/ADT integration path.
-See {doc}`hto_demultiplexing`.
+### Question: do measured proteins support the population structure?
 
-## Common mistakes and limitations
+This store uses the concise antibody labels as feature IDs, so the typed references make that
+lookup explicit while keeping the panel titles readable.
 
-- Filtering cells on one assay and then comparing modalities built from different cell sets
-- Integrating per-assay graphs built with different `k`
-- Leaving control antibodies active in the ADT panel
-- Using WNN with fewer than two assays or with graphs built over different cells
-- Reading RNA and ADT clusters as interchangeable labels for the same populations
+```{code-cell} ipython3
+protein_panel = [
+    FeatureRef(marker, assay="ADT", by="id", label=marker)
+    for marker in ("CD3", "CD4", "CD8a", "CD14", "CD19", "CD56")
+]
+ds.plots.embedding(
+    layout=wnn_umap,
+    color_by=protein_panel,
+    n_columns=3,
+    sort_values=True,
+)
+```
+
+CD3 with CD4 or CD8a identifies T-cell regions, CD14 supports monocytes, CD19 supports B cells,
+and CD56 highlights NK-like cells. Their coherent localization on the same WNN map provides the
+biological payoff that the cluster-only view cannot.
+
+## Substitute your own matched assays
+
+WNN consumes exact neighbour artifacts built over the same cells. Once RNA and ADT have each
+reached that stage, integration is one call. WNN is now the public default:
+
+```python
+wnn_graph = own_ds.integrate_assays([rna_neighbors, adt_neighbors])
+wnn_umap = own_ds.run_umap(wnn_graph, rna_initialization)
+wnn_clusters = own_ds.run_leiden_clustering(wnn_graph)
+```
+
+The source refs stay explicit because choosing the assay-specific representations is a scientific
+decision. Use {doc}`graph_construction` for the RNA and ADT neighbour chains,
+{doc}`multimodal_diagnostics` to compare integration behavior, and
+{doc}`../reference/api/integration` for the WNN contract.
+
+## Limits of this result
+
+- WNN combines neighbourhood evidence; it does not prove that a cluster is biologically valid.
+- Control antibodies and assay-specific normalization must be reviewed before building ADT
+  neighbours for another dataset.
+- The displayed labels remain broad interpretations of this marker panel, not an automated cell
+  ontology assignment.

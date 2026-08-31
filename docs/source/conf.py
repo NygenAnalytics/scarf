@@ -54,7 +54,7 @@ external_toc_exclude_missing = False
 redirects = {
     "about": "index.html",
     "install": "installation.html",
-    "scarf_and_scanpy": "scanpy_and_seurat.html",
+    "scarf_and_scanpy": "scanpy.html",
     "tutorials/atomic_graph_operations": "graph_construction.html",
     "tutorials/custom_graph_construction": "graph_construction.html",
     "concepts/graph_and_state": "../tutorials/graph_construction.html",
@@ -66,7 +66,7 @@ redirects = {
     "tutorials/choosing_integration_methods": "dataset_merging.html",
     "tutorials/data_integration": "dataset_merging.html",
     "tutorials/integration_metrics": "batch_correction.html#integration-metrics",
-    "tutorials/multimodal_integration": "multimodal_diagnostics.html",
+    "tutorials/multimodal_integration": "cite_seq.html#multimodal-integration",
     "tutorials/gene_set_enrichment": "gene_set_scoring.html",
     "tutorials/pseudotime_modules": "expression_dynamics.html",
     "tutorials/trajectory_analysis": "trajectory_validation.html",

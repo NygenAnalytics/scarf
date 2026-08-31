@@ -111,6 +111,42 @@ status.scarf_version
 be listed with `scope="datastore"`. `load_artifact(ref)` opens the payload only after Scarf confirms
 that the artifact exists and is complete.
 
+### Exact provenance filters
+
+`DataStore.list_artifacts` can match the three fields that define artifact provenance:
+
+| Filter | Match rule |
+|---|---|
+| `operation` | Exact operation name, such as `"run_normalization"` |
+| `parameters` | Exact values for each supplied top-level parameter after provenance serialization |
+| `inputs` | Exact values for each supplied top-level input after provenance serialization |
+
+Supplied filters are combined with AND. Mapping key order does not matter, and an `ArtifactRef`
+matches its serialized `to_dict()` form. Each supplied top-level entry must match exactly, while
+the stored provenance may contain other top-level entries. A supplied nested mapping is compared
+as a complete value, not as another partial query. Passing `{}` matches an empty mapping; passing
+`None` leaves that field unfiltered.
+
+Any `operation`, `parameters`, or `inputs` filter returns only complete artifacts with valid
+provenance, even when `complete_only=False`. To search with every top-level provenance entry
+available from a known result, inspect it and pass those complete fields back unchanged:
+
+```python
+refs = ds.list_artifacts(kind="reduction", complete_only=True)
+known = ds.inspect_artifact(refs[0])
+
+matching_refs = ds.list_artifacts(
+    kind=known.ref.kind,
+    from_assay=known.ref.assay,
+    operation=known.operation,
+    parameters=known.parameters,
+    inputs=known.inputs,
+)
+```
+
+This still uses containment matching. A stored artifact with the same supplied entries plus
+additional top-level entries also matches.
+
 `DataStore.lineage` follows artifact inputs upstream:
 
 ```python

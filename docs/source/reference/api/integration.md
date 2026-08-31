@@ -2,16 +2,22 @@
 
 Prefer the `DataStore` methods below in analysis code.
 
-`integrate_assays` accepts two or more exact source refs. SNN consumes connectivity-map artifacts;
-WNN consumes neighbour artifacts and follows each one's named native reduction or batch-correction
-coordinates. The returned integrated-graph reference is the exact downstream `graph` argument.
+`integrate_assays` accepts two or more exact source refs. WNN is the default; it consumes neighbour
+artifacts and follows each one's named native reduction or batch-correction coordinates. SNN is
+explicit and consumes connectivity-map artifacts. The returned integrated-graph reference is the
+exact downstream `graph` argument.
 WNN does not accept imported-coordinate ancestry. `coordinates` is a provenance input on neighbour
 and ANN artifacts, not a separate artifact kind.
 
 ```python
+wnn = ds.integrate_assays([rna_neighbors, adt_neighbors])
 snn = ds.integrate_assays([rna_graph, adt_graph], method="snn")
-wnn = ds.integrate_assays([rna_neighbors, adt_neighbors], method="wnn")
 ```
+
+The default WNN artifact stores one per-cell weight for each input assay. Plot those values with
+{py:func}`scarf.plotting.modality_weights` or the bound
+`ds.plots.modality_weights(graph=wnn, layout=wnn_layout)` accessor. An explicit SNN artifact does
+not contain modality weights.
 
 Neighbour-based metrics require `neighbors`; graph metrics require `graph`; reduction metrics
 require their exact coordinate artifact. Batch-mixing methods and biological-annotation cLISI or

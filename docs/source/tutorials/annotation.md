@@ -1,5 +1,5 @@
 ---
-description: Interpret immutable marker tables and write deliberate user-owned cell annotations.
+description: Review immutable marker evidence and write deliberate cell-type annotations.
 jupytext:
   text_representation:
     extension: .md
@@ -14,12 +14,13 @@ kernelspec:
 
 (annotation)=
 
-# Interpreting markers and assigning cell types
+# Review markers and assign cell types
 
-Cluster IDs are not cell types. This page reads one immutable marker artifact, combines several
-forms of evidence, and writes a user-owned annotation only after the labels are reviewed.
+Cluster IDs are not cell types. This recipe reads one immutable marker result, reviews several
+forms of evidence, and writes a user-owned annotation only after the cluster-to-label mapping is
+explicit. The core {doc}`scrna_seq` workflow shows the corresponding broad PBMC dotplot.
 
-## 1. Open the clustered baseline
+## Open the exact clustering and markers
 
 ```{code-cell} ipython3
 import numpy as np
@@ -36,30 +37,19 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
 )
 ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
 run = ds.pipeline.open(label="docs_default")
-cluster_ref = run["clusters"]
-marker_ref = run["markers"]
+clusters = run["clusters"]
+markers = run["markers"]
 cluster_values = np.asarray(run.cells.fetch("clusters"))
-pd.Series(cluster_values).value_counts().sort_index()
 ```
 
-The rebuilt store carries this completed run under the immutable label `docs_default`. Its frozen
-analysis selection is also the store's active `I`, so user-owned columns written below align with
-the run without rebuilding any analytical stage.
-
-The run's cluster-selection stage scores its configured Leiden partition and records the decision
-in `run["cluster_selection"]`. `cluster_ref` and `marker_ref` remain exact artifacts; neither result
-is written to live metadata.
-
-```{code-cell} ipython3
-ds.plots.embedding(run=run, layout="umap", color_by="clusters")
-```
-
-## 2. Read marker evidence
+The run binds the marker table to the pipeline-selected Leiden partition and frozen feature
+universe. Start by inspecting the strongest markers for one group rather than naming it from UMAP
+position.
 
 ```{code-cell} ipython3
 group_id = pd.Series(cluster_values).value_counts().index[0]
 group_markers = ds.get_markers(
-    marker=marker_ref,
+    marker=markers,
     group_id=group_id,
     min_score=-1,
     min_frac_exp=-1,
@@ -74,104 +64,76 @@ group_markers[
         "p_value",
         "p_value_adjusted",
     ]
-].head(10)
+].head(12)
 ```
 
-Interpret the columns together:
+Use the columns together. `score` ranks specificity, `frac_exp` reports detection in the target,
+`fold_change` compares target and reference means, and AUC summarizes cell-level separation.
+`p_value_adjusted` is Benjamini-Hochberg adjustment within this one-versus-rest marker test. It is
+not replicate-aware differential expression.
 
-- `score` ranks group specificity;
-- `frac_exp` is the detected fraction in the target group;
-- `fold_change` compares average target and reference expression;
-- `auc` measures target versus reference separation;
-- `p_value` is the two-sided Mann-Whitney result;
-- `p_value_adjusted` applies Benjamini-Hochberg correction within this one-versus-rest group.
-
-These are cell-level marker statistics, not replicate-aware differential expression.
+### Question: do several markers support each cluster interpretation?
 
 ```{code-cell} ipython3
-markers = ds.get_markers(
-    marker=marker_ref,
-    group_id=None,
-    min_score=-1,
-    min_frac_exp=-1,
+ds.plots.marker_heatmap(
+    marker=markers,
+    topn=3,
+    figsize=(6, 8),
 )
-panel_hits = (
-    markers[markers["feature_name"].astype(str).isin(["CD14", "MS4A1", "CD3D"])]
-    .sort_values(["feature_name", "score"], ascending=[True, False])
-    .groupby("feature_name", as_index=False)
-    .head(1)[["feature_name", "group_id", "score", "auc", "frac_exp"]]
-)
-panel_hits
 ```
 
-Use multiple positive and negative markers, cluster size, technical covariates, and replicate
-coverage before assigning a name.
+Look for coherent programs rather than a single winning gene. In a real study, also inspect
+expected negative markers, cluster size, technical covariates, donor coverage, and doublet scores.
 
-## 3. Write a reviewed annotation
+## Write the reviewed mapping
 
-This example labels the cluster where each panel gene ranks highest and leaves other groups as
-`Cluster {id}`. The `insert` call is an explicit user metadata edit, not an analytical side effect.
+This example records the broad teaching labels supported in {doc}`scrna_seq`. Multiple Leiden
+clusters intentionally map to the same lineage. The mapping is tied to this run and should not be
+copied to another graph or dataset.
 
 ```{code-cell} ipython3
-unique = sorted(pd.unique(cluster_values), key=str)
-label_map = {str(value): f"Cluster {value}" for value in unique}
-for gene, name in (
-    ("CD14", "Monocytes"),
-    ("MS4A1", "B cells"),
-    ("CD3D", "T cells"),
-):
-    hit = panel_hits.loc[panel_hits["feature_name"].astype(str) == gene]
-    if not hit.empty:
-        label_map[str(hit.iloc[0]["group_id"])] = name
+label_map = {
+    "1": "CD14 monocytes",
+    "2": "FCGR3A monocytes",
+    "3": "B cells",
+    "4": "T cells",
+    "5": "NK cells",
+    "6": "T cells",
+    "7": "T cells",
+    "8": "B cells",
+    "9": "T cells",
+    "10": "T cells",
+    "11": "pDC-like cells",
+    "12": "Platelets",
+}
+observed = {str(value) for value in np.unique(cluster_values)}
+assert observed == set(label_map)
 
-cell_type = np.asarray([label_map[str(value)] for value in cluster_values], dtype=object)
-ds.cells.insert("cell_type", cell_type, key="I", overwrite=True)
-pd.Series(cell_type).value_counts()
+analysis_cells = np.asarray(run.cells.fetch_all("I"), dtype=bool)
+cell_type = np.full(len(analysis_cells), "Not analyzed", dtype=object)
+cell_type[analysis_cells] = [label_map[str(value)] for value in cluster_values]
+ds.cells.insert("reviewed_cell_type", cell_type, overwrite=True)
+pd.Series(cell_type[analysis_cells]).value_counts()
 ```
+
+The insertion is an explicit user metadata edit. It does not alter the immutable clustering or
+marker artifacts.
+
+### Question: does the reviewed annotation remain spatially coherent?
 
 ```{code-cell} ipython3
 ds.plots.embedding(
     layout=run["umap"],
-    color_by="cell_type",
+    color_by="reviewed_cell_type",
+    legend_loc="right",
 )
 ```
 
-Keep `label_map`, the marker ref, and the run ID in the study record. Cluster IDs can change when
-the graph or resolution changes.
+Keep the label map, marker ref, run ID, and review rationale in the study record. Cluster IDs can
+change when the graph or partition changes. Overlap-based `smart_label` helps compare two
+partitions, but it is not ontology annotation; that partition-comparison role belongs in
+{doc}`clustering`.
 
-## 4. Smart labeling between artifacts
-
-`smart_label` consumes two compatible categorical artifacts and returns another artifact. It does
-not rename a live metadata column.
-
-```{code-cell} ipython3
-fine_clusters = ds.run_leiden_clustering(
-    run["connectivity_map"],
-    resolution=1.5,
-)
-smart_labels = ds.smart_label(fine_clusters, cluster_ref)
-smart_values = np.asarray(ds.load_artifact(smart_labels)["values"][:])
-pd.crosstab(
-    pd.Series(np.asarray(ds.load_artifact(fine_clusters)["values"][:]), name="fine"),
-    pd.Series(smart_values, name="smart label"),
-)
-```
-
-Smart labels summarize overlap. They are not ontology annotations and still require biological
-review.
-
-## 5. Annotate scATAC-seq with gene scores
-
-Peak IDs are difficult to interpret directly. `add_melded_assay` can combine peaks overlapping
-gene bodies and promoters into a `GeneScores` assay. See {doc}`scatac_seq` for the executable path.
-Gene scores are accessibility summaries, not measured RNA expression.
-
-## Common mistakes and limitations
-
-- Treating cluster IDs as biologically stable across parameter changes
-- Assigning a type from one marker gene or one statistic
-- Claiming replicate-aware differential expression from marker search
-- Overwriting a reviewed annotation without retaining its source run and marker refs
-
-Use {doc}`mapping_and_label_transfer` when query cells should inherit evidence from a fixed
-reference.
+For scATAC-seq, {doc}`scatac_seq` uses GeneScores to display marker accessibility. GeneScores are
+accessibility summaries, not measured RNA expression. Use {doc}`mapping_and_label_transfer` when a
+query should inherit labels from a fixed reference rather than be annotated de novo.

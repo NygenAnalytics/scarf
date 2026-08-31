@@ -162,7 +162,8 @@ Start with {doc}`tutorials/dataset_merging` when compatible datasets need one jo
 - Merge without correction when compatible datasets need joint inspection but no technical effect has been identified.
 - Compare an uncorrected graph with partial PCA or Harmony when a defensible technical covariate should be reduced.
 - Use fixed-reference mapping when queries must remain comparable to one reference over time.
-- Use SNN or WNN for modalities measured in the same cells, not independent batches.
+- Use WNN by default for modalities measured in the same cells. Use SNN only when equal graph
+  support is the intended comparison. Neither method integrates independent batches.
 
 The batch-correction workflow compares source mixing and structural preservation.
 Scarf's `metric_*` methods provide evidence, not an automatic winner.
