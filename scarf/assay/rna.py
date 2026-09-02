@@ -4,7 +4,7 @@ from typing import Any, Literal, cast
 import numpy as np
 import pandas as pd
 import zarr
-from numba import njit, prange
+from numba import njit
 
 from ..matrix import ChunkedArray
 from ..metadata import MetaData
@@ -33,7 +33,7 @@ def _read_facade_block(
     return _read_block(zarr_arr, row_idx, col_idx)
 
 
-@njit(parallel=True, cache=True)
+@njit(cache=True, nogil=True)
 def _hvg_stats_gene_major_kernel(
     values: np.ndarray,
     inv: np.ndarray,
@@ -47,7 +47,7 @@ def _hvg_stats_gene_major_kernel(
     """Accumulate lib-size HVG stats over selected cells in a raw block."""
     n_genes = values.shape[0]
     n_selected = selected.shape[0]
-    for g in prange(n_genes):
+    for g in range(n_genes):
         target = dest[g]
         if target < 0:
             continue
@@ -791,9 +791,6 @@ class RNAassay(Assay):
         """
         import time
 
-        import numba
-        from numba import set_num_threads
-
         from ..storage.feature_stream import map_feature_cell_bands
         from ..utils.process import process_rss_mb
 
@@ -827,15 +824,9 @@ class RNAassay(Assay):
         n_feats = int(counts_t.shape[0])
         dest_of = np.full(n_feats, -1, dtype=np.int64)
         dest_of[feat_idx] = np.arange(n_features, dtype=np.int64)
-        threads = min(
-            max(1, int(self.resources.workers)),
-            max(1, int(numba.config.NUMBA_NUM_THREADS)),
-        )
-        previous_threads = numba.get_num_threads()
         logger.info(
             f"({self.name}) feature stats consume "
             f"workers={self.resources.workers} "
-            f"numbaThreads={threads} "
             f"memoryBytes={self.resources.memoryBytes}"
         )
 
@@ -893,7 +884,6 @@ class RNAassay(Assay):
 
         consume_metrics: dict[str, object] = {}
         try:
-            set_num_threads(threads)
             for item in map_feature_cell_bands(
                 counts_t,
                 process_band,
@@ -923,7 +913,6 @@ class RNAassay(Assay):
                 s1[destinations[keep]] = merged[1][keep]
                 s2[destinations[keep]] = merged[2][keep]
         finally:
-            set_num_threads(previous_threads)
             if consume_metrics:
                 logger.info(
                     f"({self.name}) feature stats execution "

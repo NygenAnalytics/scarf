@@ -214,6 +214,7 @@ def find_markers_by_rank(
         resources = getattr(assay, "resources", None) or resolve_budget(
             workers=nthreads
         )
+        uses_parallel_numba = adapter != "rna_lib_size_unsigned"
         threads = min(
             max(1, int(resources.workers)),
             max(1, int(numba.config.NUMBA_NUM_THREADS)),
@@ -224,7 +225,8 @@ def find_markers_by_rank(
         logger.debug(
             f"Marker search bounded groups: features={len(feat_idx)} "
             f"groups={n_groups} adapter={adapter} workers={resources.workers} "
-            f"numbaThreads={threads} memoryBytes={resources.memoryBytes}"
+            f"numbaThreads={threads if uses_parallel_numba else 1} "
+            f"memoryBytes={resources.memoryBytes}"
         )
 
         def process_group(group: Any) -> None:
@@ -295,7 +297,7 @@ def find_markers_by_rank(
                 metrics=consume_metrics,
                 scratchBytes=scratch,
                 extraItemsize=extra_itemsize,
-                orderedCompute=False,
+                orderedCompute=uses_parallel_numba,
             ):
                 pass
         finally:
