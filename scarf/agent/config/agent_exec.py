@@ -273,9 +273,16 @@ def run_agent_sync(
                     usage_limits=usage_limits,
                 )
         except Exception as exc:
+            error_detail = str(exc).replace("\n", " ").strip()[:500]
+            cause = exc.__cause__
+            if cause is not None and cause is not exc:
+                cause_detail = str(cause).replace("\n", " ").strip()[:500]
+                error_detail = (
+                    f"{error_detail}; caused by {type(cause).__name__}: {cause_detail}"
+                )
             logger.error(
                 f"Agent {agent_name} failed after {time.monotonic() - started:.2f}s: "
-                f"{type(exc).__name__}"
+                f"{type(exc).__name__}: {error_detail}"
             )
             raise
         return _execution_result(
@@ -341,9 +348,16 @@ async def run_agent(
                 usage_limits=usage_limits,
             )
     except Exception as exc:
+        error_detail = str(exc).replace("\n", " ").strip()[:500]
+        cause = exc.__cause__
+        if cause is not None and cause is not exc:
+            cause_detail = str(cause).replace("\n", " ").strip()[:500]
+            error_detail = (
+                f"{error_detail}; caused by {type(cause).__name__}: {cause_detail}"
+            )
         logger.error(
             f"Agent {agent_name} failed after {time.monotonic() - started:.2f}s: "
-            f"{type(exc).__name__}"
+            f"{type(exc).__name__}: {error_detail}"
         )
         raise
     return _execution_result(

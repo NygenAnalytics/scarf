@@ -26,7 +26,13 @@ from .types import (
 from ..utils.logging import logger
 
 try:
-    from pydantic_ai import ModelRetry, RunContext, Tool
+    from pydantic_ai import (
+        ModelRetry,
+        RunContext,
+        Tool,
+        UnexpectedModelBehavior,
+        UsageLimitExceeded,
+    )
     from pydantic_ai.tools import ToolDefinition
 except ImportError as exc:
     from .config._deps import AGENT_INSTALL_HINT
@@ -383,6 +389,19 @@ class BiologicalInterpretationDependencies(AgentDataModel):
     evidenceIds: set[str] = Field(default_factory=set, exclude=True)
     clusterValues: dict[str, Any] = Field(default_factory=dict, exclude=True)
     markerEvidenceIds: dict[str, str] = Field(default_factory=dict, exclude=True)
+    markerEvidence: dict[str, ClusterMarkerEvidence] = Field(
+        default_factory=dict,
+        exclude=True,
+    )
+    compositionEvidence: ClusterCompositionEvidence | None = Field(
+        default=None,
+        exclude=True,
+    )
+    markerBatch: ClusterMarkerBatchEvidence | None = Field(
+        default=None,
+        exclude=True,
+    )
+    markerBatchClusterIds: list[str] = Field(default_factory=list, exclude=True)
     toolCalls: list[str] = Field(default_factory=list, exclude=True)
     conditionEvidence: dict[str, ConditionClusterSummary] = Field(
         default_factory=dict,
@@ -433,13 +452,16 @@ _SYSTEM_PROMPT = dedent(
         Tool calls execute Scarf operations, so wait for their results before
         drawing conclusions. Do not split marker inspection across calls.
 
-        Treat cell identities as hypotheses unless the caller supplied a trusted
-        label. Do not invent genes, cell types, statistics, artifact identifiers,
-        or evidence identifiers. Cite only evidenceIds returned by tools. For each
-        cluster interpretation, copy the exact non-empty marker evidenceId returned
-        for that cluster into its evidenceIds. Do not interpret a cluster whose
-        marker evidenceId is empty. Cluster abundance summaries are descriptive,
-        not tests of significance or causal effects. Treatment observations must
+        This API does not provide trusted per-cluster identities. Treat every cell
+        identity as a hypothesis and always set identityIsHypothesis=true. Caller
+        cell-type references are context, not assignments to clusters. Prefer
+        proposedIdentity="unresolved" when the returned markers do not ground a
+        specific hypothesis. Do not invent genes, cell types, statistics, artifact
+        identifiers, or evidence identifiers. Cite only evidenceIds returned by
+        tools. For each cluster interpretation, copy the exact non-empty marker
+        evidenceId returned for that cluster into its evidenceIds. Do not interpret
+        a cluster whose marker evidenceId is empty. Cluster abundance summaries are
+        descriptive, not tests of significance or causal effects. Treatment observations must
         compare two returned independent-unit condition summaries for the same
         cluster. Independent units may occur in more than one condition in paired
         or repeated-measure designs. Return treatmentObservations empty unless the
@@ -448,10 +470,12 @@ _SYSTEM_PROMPT = dedent(
         independent units in each cited condition.
         Marker p-values describe cluster-versus-rest marker specificity, not
         condition effects. Keep treatment content out of cluster identity
-        interpretations. Recommend a named follow-up operation when replication, a
-        covariate, or an exact artifact is missing. Do not write exploratory code,
-        use a shell, access files, or call arbitrary Scarf methods. Return only
-        fields defined by the structured output schema.
+        interpretations. Never return status=failed for uncertainty or weak
+        evidence. Return needsInput with one concrete question instead. Recommend a
+        named follow-up operation when replication, a covariate, or an exact
+        artifact is missing. Do not write exploratory code, use a shell, access
+        files, or call arbitrary Scarf methods. Return only fields defined by the
+        structured output schema.
     """
 ).strip()
 
@@ -480,6 +504,9 @@ async def inspect_cluster_composition(
 ) -> ClusterCompositionEvidence:
     """Inspect bounded cluster and condition composition without identifiers."""
     deps = ctx.deps
+    if deps.compositionEvidence is not None:
+        logger.info("Reused completed cluster composition inspection")
+        return deps.compositionEvidence
     logger.info(
         f"Inspecting cluster composition from artifact "
         f"{getattr(deps.cluster, 'artifact_id', '')!r}; "
@@ -638,6 +665,7 @@ async def inspect_cluster_composition(
         evidenceIds=sorted(deps.evidenceIds),
         warnings=warnings,
     )
+    deps.compositionEvidence = evidence
     logger.info(
         f"Completed cluster composition inspection: cells={evidence.totalCells}, "
         f"clusters={len(evidence.clusterCounts)}, "
@@ -740,6 +768,10 @@ async def inspect_cluster_markers(
         raise ModelRetry("Call inspect_cluster_composition before inspecting markers.")
     if cluster_id not in deps.clusterValues:
         raise ModelRetry(f"cluster_id must be one of {sorted(deps.clusterValues)}")
+    cached = deps.markerEvidence.get(cluster_id)
+    if cached is not None:
+        logger.debug(f"Reused cached markers for cluster {cluster_id!r}")
+        return cached
     if deps.marker is None:
         if not deps.allowMarkerSearch:
             logger.warning(
@@ -829,6 +861,7 @@ async def inspect_cluster_markers(
         evidenceId=evidence_id if markers else "",
         warnings=[] if markers else ["No markers passed the requested thresholds."],
     )
+    deps.markerEvidence[cluster_id] = evidence
     logger.debug(
         f"Completed marker inspection for cluster {cluster_id!r}: "
         f"markers={len(markers)}"
@@ -851,6 +884,14 @@ async def inspect_cluster_markers_batch(
         )
     if len(set(cluster_ids)) != len(cluster_ids):
         raise ModelRetry("cluster_ids must not contain duplicates")
+    if ctx.deps.markerBatch is not None:
+        if cluster_ids != ctx.deps.markerBatchClusterIds:
+            raise ModelRetry(
+                "Marker inspection already completed. Use the returned evidence "
+                "and do not request a different cluster batch."
+            )
+        logger.info("Reused completed cluster marker batch")
+        return ctx.deps.markerBatch
 
     logger.info(f"Inspecting markers for {len(cluster_ids)} cluster(s) in one batch")
     clusters = [
@@ -869,6 +910,8 @@ async def inspect_cluster_markers_batch(
         evidenceIds=evidence_ids,
         warnings=warnings,
     )
+    ctx.deps.markerBatch = evidence
+    ctx.deps.markerBatchClusterIds = list(cluster_ids)
     logger.info(
         f"Completed marker batch inspection: clusters={len(clusters)}, "
         f"clusters_with_markers={sum(bool(cluster.markers) for cluster in clusters)}, "
@@ -915,9 +958,9 @@ def _canonicalize_cluster_interpretations(
             interpretation.model_copy(
                 update={
                     "evidenceIds": [marker_id],
+                    "identityIsHypothesis": True,
                     **(
                         {
-                            "identityIsHypothesis": True,
                             "confidence": "low",
                         }
                         if deps.markerAssayType == "ATAC"
@@ -1049,6 +1092,17 @@ def validate_biological_interpretation_report(
     """Reject invented evidence, clusters, or completed marker-free reviews."""
     if not deps.clusterValues:
         raise ModelRetry("Call inspect_cluster_composition before returning a report.")
+    if report.status == "failed":
+        raise ModelRetry(
+            "Do not return failed for biological uncertainty; return needsInput "
+            "with one concrete question instead."
+        )
+    if report.status == "needsInput" and (
+        report.needsInput is None or not report.needsInput.question.strip()
+    ):
+        raise ModelRetry("A needsInput report requires one concrete input question.")
+    if report.status != "needsInput" and report.needsInput is not None:
+        raise ModelRetry("Only a needsInput report may include an input question.")
     expected_cluster_artifact = artifact_reference(deps.cluster)
     if (
         report.clusterArtifact is not None
@@ -1144,6 +1198,91 @@ def validate_biological_interpretation_report(
         f"cluster_interpretations={len(validated.clusterInterpretations)}, "
         f"treatment_observations={len(validated.treatmentObservations)}, "
         f"omitted_interpretations={len(omitted_interpretation_clusters)}"
+    )
+    return validated
+
+
+def fallback_biological_interpretation_report(
+    deps: BiologicalInterpretationDependencies,
+    *,
+    error: UnexpectedModelBehavior | UsageLimitExceeded,
+    model_name: str,
+) -> BiologicalInterpretationReport:
+    """Return exact unresolved identities when structured interpretation fails."""
+    if not deps.clusterValues:
+        raise error
+    error_detail = str(error).replace("\n", " ").strip()[:500]
+    interpretations = [
+        ClusterInterpretation(
+            clusterId=cluster_id,
+            proposedIdentity="unresolved",
+            identityIsHypothesis=True,
+            confidence="low",
+            rationale=(
+                "Exact marker evidence was available, but structured biological "
+                "interpretation was unavailable."
+            ),
+            evidenceIds=[evidence_id],
+        )
+        for cluster_id, evidence_id in sorted(deps.markerEvidenceIds.items())
+    ]
+    if interpretations:
+        report = BiologicalInterpretationReport(
+            status="done",
+            clusterInterpretations=interpretations,
+            evidenceIds=[
+                evidence_id
+                for interpretation in interpretations
+                for evidence_id in interpretation.evidenceIds
+            ],
+            limitations=[
+                "Cluster identities remain unresolved because structured model "
+                "interpretation exhausted its bounded correction budget.",
+                "No treatment observations were generated by the fallback.",
+                error_detail,
+            ],
+            stopReason=(
+                "Exact marker-bearing clusters were retained as unresolved "
+                "low-confidence hypotheses."
+            ),
+            runInfo=AgentRunInfo(
+                agentName="biological_interpretation_fallback",
+                modelName=model_name,
+            ),
+        )
+    else:
+        composition_evidence = sorted(
+            evidence_id
+            for evidence_id in deps.evidenceIds
+            if evidence_id.startswith("composition:")
+        )
+        report = BiologicalInterpretationReport(
+            status="needsInput",
+            evidenceIds=composition_evidence,
+            limitations=[
+                "No non-empty marker evidence was available for a grounded cluster "
+                "interpretation.",
+                error_detail,
+            ],
+            stopReason="Biological interpretation requires marker evidence.",
+            needsInput=BiologicalInterpretationNeedsInput(
+                question=(
+                    "Provide an exact marker artifact with non-empty cluster markers "
+                    "or revise the authorized marker thresholds."
+                ),
+                requiredInputs=["markerArtifactOrThresholds"],
+                evidenceIds=composition_evidence,
+            ),
+            runInfo=AgentRunInfo(
+                agentName="biological_interpretation_fallback",
+                modelName=model_name,
+            ),
+        )
+    validated = validate_biological_interpretation_report(report, deps)
+    logger.warning(
+        "Biological Interpretation used its conservative fallback: "
+        f"status={validated.status}, clusters="
+        f"{len(validated.clusterInterpretations)}, reason={error_detail}"
     )
     return validated
 
@@ -1312,6 +1451,25 @@ def _prepare_biological_interpretation_dependencies(
         assay=None,
         table_path="cellData",
     ).astype(np.int64, copy=False)
+    if isinstance(marker, ArtifactRef):
+        marker_status = store.inspect_artifact(marker)
+        if not getattr(marker_status, "exists", True):
+            raise ValueError("marker artifact does not exist")
+        if not getattr(marker_status, "complete", False):
+            raise ValueError("marker artifact is incomplete")
+        marker_inputs = getattr(marker_status, "inputs", None) or {}
+        stored_clusters = marker_inputs.get("clusters")
+        expected_cluster = artifact_reference(cluster)
+        if (
+            not isinstance(stored_clusters, Mapping)
+            or stored_clusters.get("artifact_id") != expected_cluster.artifactId
+            or stored_clusters.get("kind") != expected_cluster.kind
+            or stored_clusters.get("scope") != expected_cluster.scope
+            or stored_clusters.get("assay") != expected_cluster.assay
+        ):
+            raise ValueError(
+                "marker artifact is not linked to the exact cluster artifact"
+            )
     return BiologicalInterpretationDependencies(
         store=store,
         cluster=cluster,
@@ -1401,6 +1559,14 @@ class BiologicalInterpretationAgent:
         context = biological_context or BiologicalContext()
         cluster_artifact = artifact_reference(deps.cluster)
         marker_state = "provided" if deps.marker is not None else "not provided"
+        treatment_eligible = bool(
+            experimental_handoff is not None
+            and experimental_handoff.conditionColumn
+            and experimental_handoff.independentUnit
+            and experimental_handoff.coefficientScope == "betweenUnit"
+            and experimental_handoff.estimability.get("status") == "ok"
+            and experimental_handoff.estimability.get("coefficientEstimable") is True
+        )
         user_prompt = (
             dedent(
                 """
@@ -1409,8 +1575,9 @@ class BiologicalInterpretationAgent:
                 {graph_assay}; markers are resolved from {marker_assay}. The exact
                 marker artifact is {marker_state}; creating a marker artifact is
                 authorized={allow_marker_search}. Review no more
-                than {max_clusters} clusters and return no more than {max_markers}
-                markers per tool call.
+                than {max_clusters} clusters. The tool returns no more than
+                {max_markers} markers per cluster. Treatment observations are
+                eligible from the supplied design={treatment_eligible}.
 
                 Caller biological context:
                 {biological_context}
@@ -1418,11 +1585,19 @@ class BiologicalInterpretationAgent:
                 Experimental design context:
                 {experimental_context}
 
-                Call inspect_cluster_composition once. Then send every cluster you
-                intend to interpret in one inspect_cluster_markers_batch call. If
-                markers cannot be inspected, return needsInput and state the exact
-                missing input. Each tool is removed after it succeeds, so request
-                every required cluster in that one marker batch.
+                Call inspect_cluster_composition once. Copy every returned cluster
+                ID exactly and send the complete unique list in one
+                inspect_cluster_markers_batch call. Interpret only clusters with a
+                non-empty returned marker evidenceId. Use proposedIdentity="unresolved"
+                when markers do not ground a specific hypothesis, and always set
+                identityIsHypothesis=true. Caller cell-type references are not
+                cluster labels. If marker evidence is empty, return needsInput with
+                one populated question. If treatment eligibility is false, return
+                treatmentObservations=[]. Never return status=failed for biological
+                uncertainty; use needsInput with a concrete question. Leave artifact
+                fields null or copy only exact tool-returned values. Each tool is
+                removed after it succeeds, so request every cluster in that one
+                marker batch.
                 """
             )
             .strip()
@@ -1435,6 +1610,7 @@ class BiologicalInterpretationAgent:
                 allow_marker_search=allow_marker_search,
                 max_clusters=max_clusters,
                 max_markers=max_markers,
+                treatment_eligible=str(treatment_eligible).lower(),
                 biological_context=context.model_dump_json(),
                 experimental_context=(
                     experimental_handoff.model_dump_json()
@@ -1447,35 +1623,49 @@ class BiologicalInterpretationAgent:
             f"Requesting biological interpretation for at most "
             f"{deps.maxClusters} clusters"
         )
-        execution = run_agent_sync(
-            model=self.model,
-            output_type=BiologicalInterpretationReport,
-            system_prompt=_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            tools=(
-                Tool(
-                    inspect_cluster_composition,
-                    prepare=_prepare_biological_interpretation_tool,
-                    sequential=self.config.sequentialTools,
-                    timeout=self.config.timeoutSeconds,
+        try:
+            execution = run_agent_sync(
+                model=self.model,
+                output_type=BiologicalInterpretationReport,
+                system_prompt=_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                tools=(
+                    Tool(
+                        inspect_cluster_composition,
+                        prepare=_prepare_biological_interpretation_tool,
+                        sequential=self.config.sequentialTools,
+                        timeout=self.config.timeoutSeconds,
+                    ),
+                    Tool(
+                        inspect_cluster_markers_batch,
+                        max_retries=1,
+                        prepare=_prepare_biological_interpretation_tool,
+                        sequential=self.config.sequentialTools,
+                        timeout=self.config.timeoutSeconds,
+                    ),
                 ),
-                Tool(
-                    inspect_cluster_markers_batch,
-                    prepare=_prepare_biological_interpretation_tool,
-                    sequential=self.config.sequentialTools,
-                    timeout=self.config.timeoutSeconds,
+                deps_type=BiologicalInterpretationDependencies,
+                deps=deps,
+                config=self.config,
+                name="biological_interpretation",
+                output_validator=lambda report: (
+                    validate_biological_interpretation_report(
+                        report,
+                        deps,
+                    )
                 ),
-            ),
-            deps_type=BiologicalInterpretationDependencies,
-            deps=deps,
-            config=self.config,
-            name="biological_interpretation",
-            output_validator=lambda report: validate_biological_interpretation_report(
-                report,
+            )
+        except (UnexpectedModelBehavior, UsageLimitExceeded) as exc:
+            if not deps.clusterValues:
+                raise
+            model_name = getattr(self.model, "model_name", type(self.model).__name__)
+            return fallback_biological_interpretation_report(
                 deps,
-            ),
-        )
-        report = validate_biological_interpretation_report(execution.output, deps)
+                error=exc,
+                model_name=str(model_name),
+            )
+        report = BiologicalInterpretationReport.model_validate(execution.output)
+        report = validate_biological_interpretation_report(report, deps)
         report.runInfo = execution.runInfo
         logger.info(
             f"Completed biological interpretation: status={report.status}, "

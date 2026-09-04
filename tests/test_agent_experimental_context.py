@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import zarr
 from pydantic import ValidationError
-from pydantic_ai import ModelRetry, RunContext
+from pydantic_ai import ModelRetry, RunContext, UnexpectedModelBehavior
 from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
@@ -429,6 +429,15 @@ def test_system_prompt_does_not_embed_fictional_output_values() -> None:
     assert "estimability:treatment" not in prompt
 
 
+def test_validator_rejects_serialized_fields_inside_narrative() -> None:
+    decision = ExperimentalContextDecision(
+        rationale='Study design is unresolved.", "evidenceIds": ["column:batch"]',
+    )
+
+    with pytest.raises(ModelRetry, match="plain prose"):
+        validate_experimental_context(decision, _context(_Store()).deps)
+
+
 def test_agent_runs_only_read_only_tools_and_returns_a_grounded_report() -> None:
     store = _Store()
     tool_names: set[str] = set()
@@ -509,6 +518,63 @@ def test_agent_runs_only_read_only_tools_and_returns_a_grounded_report() -> None
     )
     assert store.assay_state_lookups == []
     assert sorted(store.zw.group_keys()) == ["artifacts", "cellData"]
+
+
+def test_agent_uses_conservative_fallback_after_tool_retry_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _Store()
+    analyze_retries: list[int | None] = []
+
+    def unavailable_design(**kwargs: Any) -> None:
+        deps = kwargs["deps"]
+        analyze_tool = next(
+            tool
+            for tool in kwargs["tools"]
+            if tool.name == "analyze_experimental_design"
+        )
+        analyze_retries.append(analyze_tool.max_retries)
+        asyncio.run(
+            inspect_cell_covariates(
+                RunContext(
+                    deps=deps,
+                    model=TestModel(),
+                    usage=RunUsage(),
+                )
+            )
+        )
+        raise UnexpectedModelBehavior(
+            "Tool 'analyze_experimental_design' exceeded max retries count of 1"
+        )
+
+    monkeypatch.setattr(
+        experimental_context_module,
+        "run_agent_sync",
+        unavailable_design,
+    )
+    result = ExperimentalContextAgent(object()).run(
+        store,
+        study_context="Case-control study with samples nested in donors.",
+        cell_selection=store.cell_selection,
+    )
+
+    assert analyze_retries == [1]
+    assert result.status == "done"
+    assert result.decision.batchCorrection.action == "skip"
+    assert result.decision.batchCorrection.batchColumns == []
+    assert result.cellSelection is not None
+    assert result.cellSelection.artifactId == store.cell_selection.artifact_id
+    assert result.cellQc.profileId in {
+        profile.profileId for profile in result.qcProfiles
+    }
+    assert result.cellQc.evidenceIds == [
+        profile.evidenceId
+        for profile in result.qcProfiles
+        if profile.profileId == result.cellQc.profileId
+    ]
+    assert result.runInfo.agentName == "experimental_context_fallback"
+    assert result.to_parameter_tuning_handoff().batchAction == "skip"
+    assert any("Harmony was skipped" in note for note in result.notes)
 
 
 def test_handoff_builders_reject_incomplete_or_ambiguous_results() -> None:

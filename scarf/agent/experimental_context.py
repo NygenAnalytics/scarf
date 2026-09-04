@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 
 try:
     from pydantic import ConfigDict, Field, model_validator
-    from pydantic_ai import ModelRetry, RunContext, Tool
+    from pydantic_ai import ModelRetry, RunContext, Tool, UnexpectedModelBehavior
     from pydantic_ai.tools import ToolDefinition
 except ImportError as exc:
     raise ImportError(AGENT_INSTALL_HINT) from exc
@@ -1240,6 +1240,57 @@ async def analyze_experimental_design(
     directed_units.update(dict(directions.get("unitsOfInference") or {}))
     directions["unitsOfInference"] = directed_units
 
+    proposed_batch_columns = (
+        [batch_columns] if isinstance(batch_columns, str) else list(batch_columns or [])
+    )
+    canonical_batch_columns = sorted(set(proposed_batch_columns))
+    if len(canonical_batch_columns) != len(proposed_batch_columns):
+        logger.warning(
+            "Experimental Context rejected duplicate proposed batch columns: "
+            f"{proposed_batch_columns[:20]}"
+        )
+        raise ModelRetry("Proposed batch columns must be unique")
+    inspected_records = {
+        record.get("name"): record
+        for record in (
+            ctx.deps.characterization.columns
+            if ctx.deps.characterization is not None
+            else []
+        )
+        if isinstance(record.get("name"), str)
+    }
+    if ctx.deps.characterization is not None:
+        for batch_column in canonical_batch_columns:
+            inspected = inspected_records.get(batch_column)
+            if inspected is None:
+                logger.warning(
+                    "Experimental Context rejected unknown proposed batch column "
+                    f"before design recomputation: {batch_column!r}"
+                )
+                raise ModelRetry(f"Unknown batch column {batch_column!r}")
+            proposed_domain = directed_domains.get(
+                batch_column,
+                inspected.get("domain"),
+            )
+            if proposed_domain != "technical":
+                logger.warning(
+                    "Experimental Context rejected proposed batch column before "
+                    f"design recomputation: {batch_column!r}, "
+                    f"domain={proposed_domain!r}, required='technical'"
+                )
+                raise ModelRetry(
+                    f"Batch column {batch_column!r} must be classified as technical"
+                )
+            if inspected.get("kind") != "categorical":
+                logger.warning(
+                    "Experimental Context rejected proposed batch column before "
+                    f"design recomputation: {batch_column!r}, "
+                    f"kind={inspected.get('kind')!r}, required='categorical'"
+                )
+                raise ModelRetry(
+                    f"Batch column {batch_column!r} must be categorical for Harmony"
+                )
+
     characterization = characterize_covariates(
         ctx.deps.store,
         cellSelection=ctx.deps.cellSelection,
@@ -1249,15 +1300,33 @@ async def analyze_experimental_design(
         groupingArtifacts=_hto_artifact_map(ctx.deps),
     )
     if characterization.status == "failed":
-        logger.warning("Experimental Context design characterization failed")
+        rejection = "; ".join(characterization.notes).strip()
+        logger.warning(
+            "Experimental Context design characterization rejected the proposed "
+            f"directions: {rejection[:1000]}; "
+            f"domainColumns={sorted(column_domains)[:50]}, "
+            f"coefficients={coefficients_of_interest[:50]}, "
+            f"inferenceUnits={sorted(units_of_inference)[:50]}"
+        )
         raise ModelRetry("; ".join(characterization.notes))
 
-    proposed_batch_columns = (
-        [batch_columns] if isinstance(batch_columns, str) else list(batch_columns or [])
+    # Retain the validated deterministic work even when the proposed Harmony
+    # columns below are rejected. A bounded fallback can then continue without
+    # rescanning the metadata or accepting an unsafe model choice.
+    ctx.deps.characterization = characterization
+    if not ctx.deps.htoIdentityColumns:
+        ctx.deps.htoIdentityColumns = _hto_identity_columns(ctx.deps)
+    qc_profiles = _offered_qc_profiles(ctx.deps, characterization)
+    evidence_ids = characterization_evidence(characterization)
+    evidence_ids.update(profile.evidenceId for profile in qc_profiles)
+    evidence_ids.update(
+        f"htoIdentity:{column}" for column in ctx.deps.htoIdentityColumns
     )
-    canonical_batch_columns = sorted(set(proposed_batch_columns))
-    if len(canonical_batch_columns) != len(proposed_batch_columns):
-        raise ModelRetry("Proposed batch columns must be unique")
+    evidence_ids.update(
+        _artifact_evidence_id(source) for source in ctx.deps.htoIdentityArtifacts
+    )
+    ctx.deps.evidenceIds.update(evidence_ids)
+
     column_records = {
         record.get("name"): record
         for record in characterization.columns
@@ -1266,12 +1335,26 @@ async def analyze_experimental_design(
     for batch_column in canonical_batch_columns:
         record = column_records.get(batch_column)
         if record is None:
+            logger.warning(
+                "Experimental Context rejected unknown proposed batch column: "
+                f"{batch_column!r}"
+            )
             raise ModelRetry(f"Unknown batch column {batch_column!r}")
         if record.get("domain") != "technical":
+            logger.warning(
+                "Experimental Context rejected proposed batch column "
+                f"{batch_column!r}: domain={record.get('domain')!r}, "
+                "required='technical'"
+            )
             raise ModelRetry(
                 f"Batch column {batch_column!r} must be classified as technical"
             )
         if record.get("kind") != "categorical":
+            logger.warning(
+                "Experimental Context rejected proposed batch column "
+                f"{batch_column!r}: kind={record.get('kind')!r}, "
+                "required='categorical'"
+            )
             raise ModelRetry(
                 f"Batch column {batch_column!r} must be categorical for Harmony"
             )
@@ -1379,19 +1462,7 @@ async def analyze_experimental_design(
         batch_safety.append(safety)
         ctx.deps.batchSafety[safety.evidenceId] = safety
 
-    ctx.deps.characterization = characterization
-    if not ctx.deps.htoIdentityColumns:
-        ctx.deps.htoIdentityColumns = _hto_identity_columns(ctx.deps)
-    qc_profiles = _offered_qc_profiles(ctx.deps, characterization)
-    evidence_ids = characterization_evidence(characterization)
     evidence_ids.update(item.evidenceId for item in batch_safety)
-    evidence_ids.update(profile.evidenceId for profile in qc_profiles)
-    evidence_ids.update(
-        f"htoIdentity:{column}" for column in ctx.deps.htoIdentityColumns
-    )
-    evidence_ids.update(
-        _artifact_evidence_id(source) for source in ctx.deps.htoIdentityArtifacts
-    )
     ctx.deps.evidenceIds.update(evidence_ids)
     ctx.deps.toolCalls.append("analyze_experimental_design")
     safety_counts = {
@@ -1898,6 +1969,34 @@ def validate_experimental_context(
     deps: ExperimentalContextDependencies,
 ) -> ExperimentalContextDecision:
     """Recompute and validate every model-authored design choice."""
+    narrative_fields = {
+        "rationale": decision.rationale,
+        "batchCorrection.rationale": decision.batchCorrection.rationale,
+        "cellQc.rationale": decision.cellQc.rationale,
+        **{
+            f"needsInput[{index}]": question
+            for index, question in enumerate(decision.needsInput)
+        },
+    }
+    serialized_field_markers = (
+        '"evidenceIds":',
+        '"needsInput":',
+        '"runInfo":',
+        '"batchCorrection":',
+        '"cellQc":',
+    )
+    invalid_narratives = [
+        name
+        for name, value in narrative_fields.items()
+        if any(
+            marker in value.replace('\\"', '"') for marker in serialized_field_markers
+        )
+    ]
+    if invalid_narratives:
+        raise ModelRetry(
+            "Narrative fields must contain plain prose without serialized sibling "
+            f"fields: {invalid_narratives}"
+        )
     directions = dict(deps.directions)
     column_domains = dict(decision.columnDomains)
     column_domains.update(dict(directions.get("columnDomains") or {}))
@@ -2017,6 +2116,123 @@ def validate_experimental_context(
     return validated
 
 
+def fallback_experimental_context_result(
+    deps: ExperimentalContextDependencies,
+    *,
+    error: UnexpectedModelBehavior,
+    model_name: str,
+) -> ExperimentalContextResult:
+    """Continue conservatively when the model exhausts its correction budget."""
+    characterization = deps.characterization
+    if characterization is None:
+        characterization = characterize_covariates(
+            deps.store,
+            cellSelection=deps.cellSelection,
+            studyContext=deps.studyContext,
+            model=None,
+            directions=deps.directions,
+            groupingArtifacts=_hto_artifact_map(deps),
+        )
+        deps.characterization = characterization
+    if not deps.htoIdentityColumns:
+        deps.htoIdentityColumns = _hto_identity_columns(deps)
+    qc_profiles = list(deps.qcProfiles.values())
+    if not qc_profiles:
+        qc_profiles = _offered_qc_profiles(deps, characterization)
+    cell_qc = _canonical_cell_qc_plan(
+        CellQcPlan.get_blank(),
+        deps,
+        characterization,
+    )
+    evidence_ids = characterization_evidence(characterization)
+    evidence_ids.update(profile.evidenceId for profile in qc_profiles)
+    evidence_ids.update(f"htoIdentity:{column}" for column in deps.htoIdentityColumns)
+    evidence_ids.update(
+        _artifact_evidence_id(source) for source in deps.htoIdentityArtifacts
+    )
+    deps.evidenceIds.update(evidence_ids)
+    column_domains = {
+        str(record["name"]): record["domain"]
+        for record in characterization.columns
+        if isinstance(record.get("name"), str)
+        and record.get("domain")
+        in {"biological", "technical", "design", "ignore", "unknown"}
+    }
+    coefficient_records = {
+        str(record["name"]): record
+        for record in characterization.coefficients
+        if isinstance(record.get("name"), str)
+    }
+    coefficients = list(coefficient_records)
+    units = {
+        coefficient: InferenceUnit(
+            observationUnit=record.get("observationUnit"),
+            independentUnit=record.get("independentUnit"),
+        )
+        for coefficient, record in coefficient_records.items()
+    }
+    batch_evidence = sorted(
+        f"column:{name}"
+        for name, domain in column_domains.items()
+        if domain == "technical"
+    )
+    if not batch_evidence:
+        batch_evidence = sorted(
+            evidence_id
+            for evidence_id in evidence_ids
+            if evidence_id.startswith("column:")
+        )[:1]
+    limitation = (
+        "The model exhausted its bounded correction budget while proposing the "
+        "experimental design. Harmony was skipped because no model proposal was "
+        "accepted as a categorical technical batch design."
+    )
+    decision = ExperimentalContextDecision(
+        columnDomains=column_domains,
+        coefficientsOfInterest=coefficients,
+        unitsOfInference=units,
+        batchCorrection=BatchCorrectionPlan(
+            action="skip",
+            rationale=(
+                "Use the native representation because bounded validation did not "
+                "authorize a safe Harmony batch column."
+            ),
+            evidenceIds=batch_evidence,
+        ),
+        cellQc=cell_qc,
+        rationale=(
+            "Retained deterministic metadata characterization and the exact bounded "
+            "cell-QC profile, while declining an unvalidated batch-correction choice."
+        ),
+        evidenceIds=sorted(evidence_ids),
+    )
+    error_detail = str(error).replace("\n", " ").strip()[:500]
+    status: StageStatus = "failed" if characterization.status == "failed" else "done"
+    logger.warning(
+        "Experimental Context used its conservative fallback: "
+        f"status={status}, cellQc={cell_qc.action}, coefficients={len(coefficients)}, "
+        f"reason={error_detail}"
+    )
+    return ExperimentalContextResult(
+        status=status,
+        decision=decision,
+        characterization=characterization,
+        cellSelection=artifact_reference(deps.cellSelection),
+        cellQc=cell_qc,
+        qcProfiles=qc_profiles,
+        qualityMetricArtifacts=deps.qualityMetricArtifacts,
+        htoIdentityColumns=deps.htoIdentityColumns,
+        htoIdentityArtifacts=deps.htoIdentityArtifacts,
+        batchSafety=list(deps.batchSafety.values()),
+        currentRepresentation=deps.currentRepresentation,
+        notes=[*characterization.notes, limitation, error_detail],
+        runInfo=AgentRunInfo(
+            agentName="experimental_context_fallback",
+            modelName=model_name,
+        ),
+    )
+
+
 class ExperimentalContextAgent:
     """A narrow agent for study design and batch-correction planning."""
 
@@ -2063,15 +2279,21 @@ class ExperimentalContextAgent:
             sample, observation-unit, independent-unit, biological, cluster, or
             embedding columns as Harmony batch columns. A biological coefficient
             that is not estimable with the exact proposed batch columns makes
-            correction unsafe.
+            correction unsafe. A sample or library identifier is not automatically
+            technical. When no exact observed column is both categorical and
+            technical, pass batch_columns=[] and recommend skipping Harmony. Every
+            observation and independent unit must be an exact observed column name
+            or null.
             LISI evaluates a representation; it does not identify which metadata
             column is a batch. Recommend evaluateHarmony, not application, because
             Parameter Tuning must compare exact uncorrected and corrected artifacts.
 
             Cite only evidenceIds returned by tools. Ask for input when study
             design cannot be resolved. Never propose Python, shell commands,
-            direct Zarr access, or any datastore mutation. Return only fields
-            defined by the structured output schema.
+            direct Zarr access, or any datastore mutation. Every rationale and
+            question must be plain prose. Never place serialized JSON, schema
+            field names, or sibling output fields inside a narrative string.
+            Return only fields defined by the structured output schema.
                 """
             )
             .strip()
@@ -2227,42 +2449,50 @@ class ExperimentalContextAgent:
                 directions=json.dumps(direction_map, sort_keys=True, default=str),
             )
         )
-        execution = run_agent_sync(
-            model=self.model,
-            output_type=ExperimentalContextDecision,
-            system_prompt=self.system_prompt,
-            user_prompt=user_prompt,
-            tools=(
-                Tool(
-                    inspect_cell_covariates,
-                    prepare=_prepare_experimental_context_tool,
-                    sequential=self.config.sequentialTools,
-                    timeout=self.config.timeoutSeconds,
+        try:
+            execution = run_agent_sync(
+                model=self.model,
+                output_type=ExperimentalContextDecision,
+                system_prompt=self.system_prompt,
+                user_prompt=user_prompt,
+                tools=(
+                    Tool(
+                        inspect_cell_covariates,
+                        prepare=_prepare_experimental_context_tool,
+                        sequential=self.config.sequentialTools,
+                        timeout=self.config.timeoutSeconds,
+                    ),
+                    Tool(
+                        analyze_experimental_design,
+                        max_retries=1,
+                        prepare=_prepare_experimental_context_tool,
+                        sequential=self.config.sequentialTools,
+                        timeout=self.config.timeoutSeconds,
+                    ),
+                    Tool(
+                        score_current_representation,
+                        prepare=_prepare_experimental_context_tool,
+                        sequential=self.config.sequentialTools,
+                        timeout=self.config.timeoutSeconds,
+                    ),
                 ),
-                Tool(
-                    analyze_experimental_design,
-                    prepare=_prepare_experimental_context_tool,
-                    sequential=self.config.sequentialTools,
-                    timeout=self.config.timeoutSeconds,
+                deps_type=ExperimentalContextDependencies,
+                deps=deps,
+                config=self.config,
+                name="experimental_context",
+                output_validator=lambda decision: validate_experimental_context(
+                    decision,
+                    deps,
                 ),
-                Tool(
-                    score_current_representation,
-                    prepare=_prepare_experimental_context_tool,
-                    sequential=self.config.sequentialTools,
-                    timeout=self.config.timeoutSeconds,
-                ),
-            ),
-            deps_type=ExperimentalContextDependencies,
-            deps=deps,
-            config=self.config,
-            name="experimental_context",
-            output_validator=lambda decision: validate_experimental_context(
-                decision,
+            )
+        except UnexpectedModelBehavior as exc:
+            model_name = getattr(self.model, "model_name", type(self.model).__name__)
+            return fallback_experimental_context_result(
                 deps,
-            ),
-        )
+                error=exc,
+                model_name=str(model_name),
+            )
         decision = ExperimentalContextDecision.model_validate(execution.output)
-        decision = validate_experimental_context(decision, deps)
         characterization = deps.characterization
         if characterization is None:
             characterization = characterize_covariates(

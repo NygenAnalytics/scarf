@@ -79,6 +79,7 @@ from .persistence import (
     load_agent_workflow,
     save_agent_report,
 )
+from .report import generate_agent_report
 from .runtime import check_runtime, load_env
 from .types import (
     BatchSafetyEvidence,
@@ -158,6 +159,7 @@ __all__ = [
     "decide",
     "detect_format",
     "get_default_parameter_candidates",
+    "generate_agent_report",
     "ingest",
     "load_env",
     "finalize_agent_workflow",

@@ -894,6 +894,14 @@ def finish_exception(
     outputs: Mapping[str, Any] | None = None,
     notes: Sequence[str] = (),
 ) -> WorkflowStageAttempt:
+    if is_retryable_model_error(exc):
+        status_code = getattr(exc, "status_code", "unknown")
+        logger.warning(
+            f"Workflow {workflow.workflowRunId}: stage={started.stage!r} was "
+            f"interrupted by retryable model HTTP status {status_code}; leaving "
+            "the workflow running for recovery"
+        )
+        raise exc
     error = f"{type(exc).__name__}: {exc}"
     logger.error(
         f"Workflow {workflow.workflowRunId}: stage={started.stage!r} raised "
@@ -919,6 +927,17 @@ def finish_exception(
     _save_outcome(store.zw, prefix, outcome)
     finalize_failed(store, workflow, error)
     return outcome
+
+
+def is_retryable_model_error(exc: BaseException) -> bool:
+    """Return whether a provider HTTP failure should leave the workflow resumable."""
+    try:
+        from pydantic_ai import ModelHTTPError
+    except ImportError:
+        return False
+    return isinstance(exc, ModelHTTPError) and (
+        exc.status_code == 429 or 500 <= exc.status_code <= 599
+    )
 
 
 def finalize_failed(

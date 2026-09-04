@@ -29,7 +29,7 @@ except ImportError as exc:
     raise ImportError(AGENT_INSTALL_HINT) from exc
 
 try:
-    from pydantic_ai import RunContext, UnexpectedModelBehavior
+    from pydantic_ai import RunContext, UnexpectedModelBehavior, UsageLimitExceeded
 except ImportError as exc:
     raise ImportError(AGENT_INSTALL_HINT) from exc
 
@@ -767,14 +767,40 @@ def parameter_search_system_prompt() -> str:
         Never return status=complete with candidates. A Harmony candidate always
         uses the exact authorized batch columns supplied in the prompt. You may
         choose between no correction and that approved Harmony configuration, but
-        you must not propose or modify batch columns.
+        you must not propose or modify batch columns. When proposing any Harmony
+        refinement, base it on one matched corrected and uncorrected initial pair
+        with otherwise identical parameters.
 
         Cite only evidenceIds from the initial evaluations. Identify the successful
         initial candidates that motivate refinement, state focused objectives, and
         provide concrete stopping criteria. Do not invent metrics, artifacts, or
-        candidate ids.
+        candidate ids. Treat pcaSilhouette, macroF1, and weightedF1 only as PCA
+        cluster-separability metrics. Biological preservation evidence exists only
+        in a non-empty biologicalPreservation map. Check every exact value before
+        stating a ranking or trend, and keep narrative fields as plain prose
+        without serialized JSON.
         """
     ).strip()
+
+
+def parameter_evaluation_payload(
+    evaluation: ParameterCandidateEvaluation,
+) -> dict[str, Any]:
+    """Return only candidate evidence needed for planning and selection."""
+    return {
+        "candidateId": evaluation.candidateId,
+        "phase": evaluation.phase,
+        "harmonyBatchColumns": evaluation.harmonyBatchColumns,
+        "status": evaluation.status,
+        "eligible": evaluation.eligible,
+        "parameters": evaluation.parameters.model_dump(mode="json"),
+        "effectiveDimensions": evaluation.effectiveDimensions,
+        "metrics": evaluation.metrics.model_dump(mode="json"),
+        "evidenceIds": evaluation.evidenceIds,
+        "eligibilityReasons": evaluation.eligibilityReasons,
+        "warnings": [warning[:500] for warning in evaluation.warnings[:10]],
+        "error": evaluation.error[:500] if evaluation.error is not None else None,
+    }
 
 
 def parameter_search_prompt(
@@ -789,7 +815,9 @@ def parameter_search_prompt(
 ) -> str:
     """Build the planning prompt from deterministic initial evaluations."""
 
-    evaluation_payload = [evaluation.model_dump() for evaluation in evaluations]
+    evaluation_payload = [
+        parameter_evaluation_payload(evaluation) for evaluation in evaluations
+    ]
     correction_modes = ["none", "harmony"] if harmony_authorized else ["none"]
     return (
         dedent(
@@ -845,10 +873,19 @@ def parameter_tuning_system_prompt(min_cluster_cells: int) -> str:
         Balance cluster separation, cluster sizes, batch mixing, and biological
         preservation. High batch mixing alone can indicate overcorrection, so do
         not collapse the metrics into an invented score. UMAP appearance is not
-        evidence for parameter quality. When multiple candidates complete,
+        evidence for parameter quality. Treat pcaSilhouette, macroF1, and
+        weightedF1 only as PCA cluster-separability metrics. Biological
+        preservation evidence exists only in a non-empty biologicalPreservation
+        map. Do not call any metric highest, lowest, improved, degraded, or
+        monotonic without checking its exact value across every relevant
+        candidate. Narrative fields contain plain prose only and must not contain
+        serialized JSON keys or objects. When multiple candidates complete,
         return one comparison for every non-selected successful candidate. Each
         comparison must cite evidence from both the selected candidate and that
-        comparator. Return a concise structured report.
+        comparator. Return only model-owned selection fields. Leave evaluations,
+        selectedArtifacts, searchPlan, assayReports, integration fields, final
+        graph fields, and runInfo at their defaults because validation fills them
+        from executor state. Return a concise structured report.
         """
         )
         .strip()
@@ -867,7 +904,9 @@ def parameter_tuning_prompt(
 ) -> str:
     """Build the final selection prompt from completed evaluations."""
 
-    evaluation_payload = [evaluation.model_dump() for evaluation in evaluations]
+    evaluation_payload = [
+        parameter_evaluation_payload(evaluation) for evaluation in evaluations
+    ]
     return (
         dedent(
             """
@@ -918,7 +957,7 @@ def parameter_batch_search_prompt(
     payload = {
         assay: {
             "evaluations": [
-                deps.evaluations[candidate_id].model_dump()
+                parameter_evaluation_payload(deps.evaluations[candidate_id])
                 for candidate_id in deps.executionOrder
             ],
             "authorizedHarmony": deps.harmonyAuthorized,
@@ -973,7 +1012,17 @@ def parameter_batch_selection_system_prompt() -> str:
             exactly one grounded single-assay report in assayReports per assay.
             Apply eligibility, evidence, and comparison requirements independently.
             Do not invent joint scores, artifacts, candidates, or evidence. UMAP
-            appearance is not evidence. Leave integration fields empty.
+            appearance is not evidence. Treat pcaSilhouette, macroF1, and
+            weightedF1 only as PCA cluster-separability metrics; biological
+            preservation exists only when biologicalPreservation is non-empty.
+            Check all exact values before making ranking or trend claims, and keep
+            narrative fields as plain prose without serialized JSON. Inside each
+            assay report, return only
+            model-owned selection, rationale, comparison, trade-off, limitation,
+            evidence, and stop fields. Leave evaluations, selectedArtifacts,
+            searchPlan, nested assayReports, integration fields, final graph fields,
+            and runInfo at their defaults because validation fills them from
+            executor state.
             """
         )
         .strip()
@@ -992,7 +1041,7 @@ def parameter_batch_selection_prompt(
     payload = {
         assay: {
             "evaluations": [
-                deps.evaluations[candidate_id].model_dump()
+                parameter_evaluation_payload(deps.evaluations[candidate_id])
                 for candidate_id in deps.executionOrder
             ],
             "searchPlan": search_plans[assay].model_dump(exclude={"runInfo"}),
@@ -1743,7 +1792,9 @@ def validate_parameter_search_plan(
             raise ValueError(
                 f"Refinement evidence must cite every parent candidate: {parent_id!r}"
             )
-    if deps.harmonyAuthorized:
+    if deps.harmonyAuthorized and any(
+        candidate.useHarmony for candidate in plan.candidates
+    ):
         parent_candidates = [
             deps.candidates[candidate_id] for candidate_id in plan.basedOnCandidateIds
         ]
@@ -2148,6 +2199,11 @@ def fallback_parameter_tuning_report(
     cannot_recommend = (
         not eligible
         or (comparison_required and len(successful) < 2)
+        or (
+            comparison_required
+            and "baseline" in deps.candidates
+            and not any(item.candidateId == "baseline" for item in successful)
+        )
         or any(evidence_by_candidate[item.candidateId] is None for item in successful)
     )
     if cannot_recommend:
@@ -2217,8 +2273,8 @@ def fallback_parameter_tuning_report(
         recommendedCandidateId=selected.candidateId,
         confidence="low",
         rationale=(
-            "Structured model selection was unavailable after bounded retries; "
-            "the first eligible authorized branch was retained conservatively."
+            "The bounded structured model selection was unavailable; the first "
+            "eligible authorized branch was retained conservatively."
         ),
         evidenceIds=[selected_evidence],
         comparisons=comparisons,
@@ -2601,10 +2657,11 @@ def select_final_parameter_graph(
                     marker_assay=marker_assay,
                 ),
             )
-        except UnexpectedModelBehavior:
+        except (UnexpectedModelBehavior, UsageLimitExceeded) as exc:
             option_ids = sorted(options)
             logger.warning(
-                "Final graph selection exhausted structured-output retries; "
+                "Final graph selection model run failed within its bounds "
+                f"({type(exc).__name__}); "
                 f"requesting input for {len(option_ids)} eligible options"
             )
             selection = validate_final_graph_selection(
@@ -2613,8 +2670,7 @@ def select_final_parameter_graph(
                     markerAssay=marker_assay,
                     confidence="low",
                     rationale=(
-                        "Structured final-graph selection was unavailable after "
-                        "bounded retries."
+                        "The bounded structured final-graph selection was unavailable."
                     ),
                     limitations=[
                         "No ranking was invented across multiple eligible graphs."
@@ -3198,18 +3254,19 @@ def tune_parameters_batch(
                     )
                 ),
             )
-        except UnexpectedModelBehavior:
+        except (UnexpectedModelBehavior, UsageLimitExceeded) as exc:
             logger.warning(
-                "Batched parameter refinement planning exhausted "
-                "structured-output retries; skipping optional refinement"
+                "Batched parameter refinement model run failed within its bounds "
+                f"({type(exc).__name__}); "
+                "skipping optional refinement"
             )
             batch_plan = ParameterTuningBatchSearchPlan(
                 assayPlans={
                     assay: ParameterSearchPlan(
                         status="complete",
                         rationale=(
-                            "Structured refinement planning was unavailable after "
-                            "bounded retries; optional refinement was skipped."
+                            "The bounded structured refinement plan was unavailable; "
+                            "optional refinement was skipped."
                         ),
                         stoppingCriteria=[
                             "Use the completed deterministic initial screen."
@@ -3229,12 +3286,23 @@ def tune_parameters_batch(
                 planning_execution.output, ParameterTuningBatchSearchPlan
             ):
                 raise TypeError("Batched parameter planner returned an unexpected type")
-            batch_plan = validate_parameter_batch_search_plan(
+            validated_batch_plan = validate_parameter_batch_search_plan(
                 planning_execution.output,
                 dependencies,
                 initial_candidate_ids=initial_ids,
                 max_refined_by_assay=max_refined_by_assay,
-            ).model_copy(update={"runInfo": planning_execution.runInfo})
+            )
+            batch_plan = validated_batch_plan.model_copy(
+                update={
+                    "assayPlans": {
+                        assay: plan.model_copy(
+                            update={"runInfo": planning_execution.runInfo}
+                        )
+                        for assay, plan in validated_batch_plan.assayPlans.items()
+                    },
+                    "runInfo": planning_execution.runInfo,
+                }
+            )
             logger.info(
                 "Completed batched parameter refinement plan: "
                 + ", ".join(
@@ -3292,9 +3360,10 @@ def tune_parameters_batch(
                 primary_assay=resolved_primary,
             ),
         )
-    except UnexpectedModelBehavior:
+    except (UnexpectedModelBehavior, UsageLimitExceeded) as exc:
         logger.warning(
-            "Batched parameter selection exhausted structured-output retries; "
+            "Batched parameter selection model run failed within its bounds "
+            f"({type(exc).__name__}); "
             "using the conservative executor-evidence fallback"
         )
         return fallback_parameter_tuning_batch_report(
@@ -3414,16 +3483,17 @@ def tune_parameters(
                     )
                 ),
             )
-        except UnexpectedModelBehavior:
+        except (UnexpectedModelBehavior, UsageLimitExceeded) as exc:
             logger.warning(
                 f"Parameter refinement planning for assay {from_assay!r} "
-                "exhausted structured-output retries; skipping optional refinement"
+                f"failed within its model-run bounds ({type(exc).__name__}); "
+                "skipping optional refinement"
             )
             plan = ParameterSearchPlan(
                 status="complete",
                 rationale=(
-                    "Structured refinement planning was unavailable after bounded "
-                    "retries; optional refinement was skipped."
+                    "The bounded structured refinement plan was unavailable; "
+                    "optional refinement was skipped."
                 ),
                 stoppingCriteria=["Use the completed deterministic initial screen."],
                 runInfo=AgentRunInfo(agentName="parameter_search_planning_fallback"),
@@ -3479,11 +3549,11 @@ def tune_parameters(
                 search_plan=plan,
             ),
         )
-    except UnexpectedModelBehavior:
+    except (UnexpectedModelBehavior, UsageLimitExceeded) as exc:
         logger.warning(
-            f"Parameter selection for assay {from_assay!r} exhausted "
-            "structured-output retries; using the conservative executor-evidence "
-            "fallback"
+            f"Parameter selection for assay {from_assay!r} failed within its "
+            f"model-run bounds ({type(exc).__name__}); using the conservative "
+            "executor-evidence fallback"
         )
         return fallback_parameter_tuning_report(
             deps,

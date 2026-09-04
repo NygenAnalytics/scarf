@@ -71,8 +71,8 @@ class Config:
 class AgentRunConfig(AgentDataModel):
     """Bound one agent run without selecting a scientific workflow."""
 
-    requestLimit: int = 9
-    toolCallLimit: int = 5
+    requestLimit: int = 10
+    toolCallLimit: int = 10
     inputTokenLimit: int | None = None
     outputTokenLimit: int | None = 32768  # Per provider response.
     totalTokenLimit: int | None = None

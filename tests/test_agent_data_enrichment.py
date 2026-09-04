@@ -1,9 +1,11 @@
 """Tests for the read-only data enrichment agent."""
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 from pydantic import BaseModel
+from pydantic_ai import ModelRetry, UnexpectedModelBehavior
 from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
@@ -28,6 +30,7 @@ from scarf.agent.data_enrichment import (
     FeatureSelectionPolicy,
     HtoTagEvidence,
     StudyContextSummary,
+    find_present_features_batch,
     validate_data_enrichment_report,
 )
 
@@ -483,6 +486,76 @@ def test_data_enrichment_retries_hallucinated_features(
     assert state["request"] == 3
 
 
+def test_data_enrichment_falls_back_from_completed_inspection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scarf.agent import data_enrichment as module
+
+    store = ReadOnlyStore()
+    monkeypatch.setattr(
+        module,
+        "characterize_features",
+        lambda *_args, **_kwargs: characterization(),
+    )
+    tool_retries: dict[str, int] = {}
+
+    def unavailable_structured_output(**kwargs: object) -> None:
+        deps = kwargs["deps"]
+        assert isinstance(deps, DataEnrichmentDependencies)
+        for tool in kwargs["tools"]:
+            tool_retries[tool.name] = tool.max_retries
+        asyncio.run(module.inspect_assay_features_batch(SimpleNamespace(deps=deps)))
+        raise UnexpectedModelBehavior("structured output unavailable")
+
+    monkeypatch.setattr(module, "run_agent_sync", unavailable_structured_output)
+    result = DataEnrichmentAgent(object()).run(
+        store,
+        context=DataEnrichmentContext(organismHint="human"),
+    )
+
+    assert result.status == "done"
+    assert result.runInfo.agentName == "data_enrichment_fallback"
+    assert result.policies[0].species == "homo_sapiens"
+    assert result.policies[0].speciesConfidence == "medium"
+    assert result.policies[0].excludeFamilies == ["mitochondrial"]
+    assert result.policies[0].protectFamilies == ["sex"]
+    assert result.policies[0].artificialFeatures == []
+    assert tool_retries == {
+        "inspect_assay_features_batch": 1,
+        "find_present_features_batch": 1,
+    }
+
+
+def test_feature_lookup_cache_rejects_different_arguments() -> None:
+    deps = DataEnrichmentDependencies(
+        store=ReadOnlyStore(),
+        assays=["RNA"],
+    )
+    run_context = SimpleNamespace(deps=deps)
+
+    first = asyncio.run(
+        find_present_features_batch(
+            run_context,
+            queries_by_assay={"RNA": ["MT-CYB"]},
+        )
+    )
+    repeated = asyncio.run(
+        find_present_features_batch(
+            run_context,
+            queries_by_assay={"RNA": ["MT-CYB"]},
+        )
+    )
+
+    assert repeated is first
+    with pytest.raises(ModelRetry, match="already completed"):
+        asyncio.run(
+            find_present_features_batch(
+                run_context,
+                queries_by_assay={"RNA": ["GAPDH"]},
+            )
+        )
+
+
 def test_data_enrichment_validates_policy_and_assay() -> None:
     with pytest.raises(ValueError, match="both excluded and protected"):
         FeatureSelectionPolicy(
@@ -534,6 +607,30 @@ def test_enrichment_copies_caller_context_instead_of_model_paraphrases() -> None
         "10x 3 prime RNA-seq",
         "single donor",
     ]
+
+
+def test_enrichment_rejects_duplicate_assay_policies() -> None:
+    inspection = AssayFeatureInspection(
+        assay="RNA",
+        species="unknown",
+        evidenceIds=["assay:RNA:species"],
+    )
+    deps = DataEnrichmentDependencies(
+        store=ReadOnlyStore(),
+        assays=["RNA"],
+        inspections={"RNA": inspection},
+        evidenceIds={"assay:RNA:species"},
+    )
+    policy = FeatureSelectionPolicy(
+        assay="RNA",
+        evidenceIds=["assay:RNA:species"],
+    )
+
+    with pytest.raises(ValueError, match="one policy for each assay"):
+        validate_data_enrichment_report(
+            deps,
+            DataEnrichmentReport(status="done", policies=[policy, policy.model_copy()]),
+        )
 
 
 def test_enrichment_rejects_protected_family_exclusion() -> None:

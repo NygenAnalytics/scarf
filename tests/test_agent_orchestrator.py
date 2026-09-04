@@ -481,6 +481,16 @@ def test_rna_h5ad_completes_public_automated_workflow(tmp_path: Path) -> None:
     assert result.currentStage == "biological_interpretation"
     assert result.workflowRun is not None
     assert result.workflowRun.status == "completed"
+    report_path = (
+        target
+        / "agents"
+        / "runs"
+        / result.workflowRun.workflowRunId
+        / "report"
+        / "index.html"
+    )
+    assert report_path.is_file()
+    assert "Nygen Analytics" in report_path.read_text(encoding="utf-8")
     assert state["requests"] == 9
     assert [reference.agentName for reference in result.reportReferences] == [
         "data_enrichment",

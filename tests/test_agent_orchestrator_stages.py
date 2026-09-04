@@ -457,6 +457,152 @@ def test_unsafe_experimental_context_pauses_and_explicit_skip_reuses_evidence(
     assert UnsafeAgent.calls == 1
 
 
+def test_explicit_no_inference_skip_resolves_context_without_provider_rerun(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = create_store(tmp_path / "no-inference-context.zarr")
+    store = DataStore(str(path), default_assay="RNA", min_features_per_cell=0)
+    workflow = create_agent_workflow(store, workflow_run_id="no-inference-context")
+    cell_selection = ArtifactReferenceModel.from_artifact_ref(
+        store.snapshot_cell_selection("I")
+    )
+    enrichment = DataEnrichmentReport.get_example().model_copy(
+        update={
+            "runInfo": AgentRunInfo(
+                agentName="data_enrichment",
+                runId=uuid.uuid4().hex,
+            )
+        }
+    )
+    enrichment_reference = save_agent_report(
+        store,
+        workflow.workflowRunId,
+        enrichment,
+        invocation=AgentInvocation(
+            agentName="data_enrichment",
+            inputs={"studyContext": "A study with unresolved replication."},
+        ),
+    )
+    request_record = OrchestrationRequestRecord(
+        workflowRunId=workflow.workflowRunId,
+        request=AutomatedWorkflowRequest(
+            sourcePath=str(path),
+            zarrPath=str(path),
+            studyContext="A study with unresolved replication.",
+            allowAssumptions=True,
+        ),
+    )
+    example = ExperimentalContextResult.get_example()
+    needs_input_plan = example.decision.batchCorrection.model_copy(
+        update={
+            "action": "needsInput",
+            "batchColumns": [],
+            "preserveColumns": [],
+            "metricsRequired": [],
+        }
+    )
+    needs_input_report = example.model_copy(
+        update={
+            "status": "needsInput",
+            "cellSelection": cell_selection,
+            "cellQc": CellQcPlan(),
+            "qcProfiles": [],
+            "qualityMetricArtifacts": [],
+            "htoIdentityColumns": [],
+            "htoIdentityArtifacts": [],
+            "decision": example.decision.model_copy(
+                update={
+                    "batchCorrection": needs_input_plan,
+                    "cellQc": CellQcPlan(),
+                    "needsInput": [
+                        "Provide replicated observation units or skip inference."
+                    ],
+                }
+            ),
+            "runInfo": AgentRunInfo(
+                agentName="experimental_context",
+                runId=uuid.uuid4().hex,
+            ),
+        }
+    )
+
+    class NeedsInputAgent:
+        calls = 0
+
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.config = AgentRunConfig()
+
+        def run(self, *_args: Any, **_kwargs: Any) -> ExperimentalContextResult:
+            type(self).calls += 1
+            return needs_input_report
+
+    monkeypatch.setattr(context_module, "ExperimentalContextAgent", NeedsInputAgent)
+    orchestrator = AgentOrchestrator(object())
+    paused_outcome, _ = orchestrator.experimental_context_stage(
+        store,
+        workflow,
+        request_record,
+        [],
+        cell_selection,
+        enrichment_reference,
+        [],
+        [],
+        {},
+    )
+
+    assert paused_outcome.status == "needsInput"
+    resolved_outcome, resolved_report = orchestrator.experimental_context_stage(
+        store,
+        workflow,
+        request_record,
+        [],
+        cell_selection,
+        enrichment_reference,
+        [],
+        [],
+        {
+            "experimentalDirections": {
+                "coefficientsOfInterest": [],
+                "unitsOfInference": {},
+                "batchCorrection": {"action": "skip"},
+            }
+        },
+    )
+
+    assert resolved_outcome.status == "done"
+    assert resolved_outcome.artifacts == paused_outcome.artifacts
+    assert resolved_outcome.actions == [
+        "resolve_experimental_context:no_inference_skip_harmony"
+    ]
+    assert resolved_report.status == "done"
+    assert resolved_report.decision.coefficientsOfInterest == []
+    assert resolved_report.decision.unitsOfInference == {}
+    assert resolved_report.decision.batchCorrection.action == "skip"
+    assert resolved_report.decision.batchCorrection.batchColumns == []
+    assert resolved_report.decision.needsInput == []
+    assert resolved_report.runInfo.agentName == "experimental_context_resolution"
+    assert resolved_report.runInfo.runId == ""
+    assert resolved_report.runInfo.usage.requests == 0
+    assert NeedsInputAgent.calls == 1
+    paused_record = load_agent_record(
+        store,
+        paused_outcome.reportReferences[0],
+    )
+    resolved_record = load_agent_record(
+        store,
+        resolved_outcome.reportReferences[0],
+    )
+    assert resolved_record.invocation.artifacts == resolved_outcome.artifacts
+    assert resolved_record.invocation.runConfig == paused_record.invocation.runConfig
+    assert resolved_record.invocation.inputs["deterministicResolution"] == (
+        "resolve_experimental_context:no_inference_skip_harmony"
+    )
+    assert resolved_record.invocation.parentReports[-1].agentRunId == (
+        paused_outcome.reportReferences[0].agentRunId
+    )
+
+
 def test_preprocessing_plan_routes_supported_modalities_and_skips_others() -> None:
     assays = {
         "peaks": (

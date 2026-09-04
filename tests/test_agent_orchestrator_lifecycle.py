@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 import zarr
+from pydantic_ai import ModelHTTPError
 
 import scarf.agent.orchestrator.context as context_module
 import scarf.agent.orchestrator.journal as journal_module
@@ -737,6 +738,119 @@ def test_failed_stage_preserves_completed_operation_journal(tmp_path: Path) -> N
         "preprocessing",
     )
     assert persisted == [outcome]
+    assert load_agent_workflow(store, workflow.workflowRunId).status == "failed"
+
+
+@pytest.mark.parametrize("status_code", [429, 500, 503, 599])
+def test_retryable_model_http_error_leaves_stage_interrupted(
+    tmp_path: Path,
+    status_code: int,
+) -> None:
+    path = create_store(tmp_path / f"retryable-model-{status_code}.zarr")
+    store = DataStore(
+        str(path),
+        default_assay="RNA",
+        min_features_per_cell=-1,
+        mito_pattern="",
+        ribo_pattern="",
+        zarr_mode="r+",
+    )
+    workflow = create_agent_workflow(
+        store,
+        workflow_run_id=f"retryable-model-{status_code}",
+    )
+    request_record = OrchestrationRequestRecord(
+        workflowRunId=workflow.workflowRunId,
+        request=AutomatedWorkflowRequest(
+            sourcePath=str(path),
+            zarrPath=str(path),
+            studyContext="A retryable model failure test.",
+            allowAssumptions=True,
+        ),
+        config=AutomatedWorkflowConfig(),
+    )
+    prefix = journal_module._ensure_orchestration_store(store)
+    started = journal_module._start_attempt(
+        store.zw,
+        prefix,
+        workflow.workflowRunId,
+        "experimental_context",
+        request_record,
+        [],
+    )
+    error = ModelHTTPError(status_code, "test-model", {"error": "transient"})
+
+    with pytest.raises(ModelHTTPError) as raised:
+        journal_module.finish_exception(
+            store,
+            prefix,
+            workflow,
+            started,
+            error,
+        )
+
+    assert raised.value is error
+    assert (
+        journal_module._stage_outcomes(
+            store.zw,
+            prefix,
+            workflow.workflowRunId,
+            "experimental_context",
+        )
+        == []
+    )
+    assert load_agent_workflow(store, workflow.workflowRunId).status == "running"
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404])
+def test_nonretryable_model_http_error_remains_terminal(
+    tmp_path: Path,
+    status_code: int,
+) -> None:
+    path = create_store(tmp_path / f"terminal-model-{status_code}.zarr")
+    store = DataStore(
+        str(path),
+        default_assay="RNA",
+        min_features_per_cell=-1,
+        mito_pattern="",
+        ribo_pattern="",
+        zarr_mode="r+",
+    )
+    workflow = create_agent_workflow(
+        store,
+        workflow_run_id=f"terminal-model-{status_code}",
+    )
+    request_record = OrchestrationRequestRecord(
+        workflowRunId=workflow.workflowRunId,
+        request=AutomatedWorkflowRequest(
+            sourcePath=str(path),
+            zarrPath=str(path),
+            studyContext="A terminal model failure test.",
+            allowAssumptions=True,
+        ),
+        config=AutomatedWorkflowConfig(),
+    )
+    prefix = journal_module._ensure_orchestration_store(store)
+    started = journal_module._start_attempt(
+        store.zw,
+        prefix,
+        workflow.workflowRunId,
+        "experimental_context",
+        request_record,
+        [],
+    )
+
+    outcome = journal_module.finish_exception(
+        store,
+        prefix,
+        workflow,
+        started,
+        ModelHTTPError(status_code, "test-model", {"error": "terminal"}),
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.error is not None
+    assert outcome.error.startswith("ModelHTTPError:")
     assert load_agent_workflow(store, workflow.workflowRunId).status == "failed"
 
 

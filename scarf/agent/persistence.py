@@ -857,6 +857,8 @@ def _report_references(
         relative = key.removeprefix(f"{run_prefix}/")
         if relative in {"workflow.json", "finalization.json"}:
             continue
+        if relative == "report" or relative.startswith("report/"):
+            continue
         parts = relative.split("/")
         if len(parts) != 3 or parts[2] != "report.json":
             raise ValueError(f"Unexpected agent workflow record {key!r}")

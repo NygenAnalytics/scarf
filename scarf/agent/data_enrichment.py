@@ -17,7 +17,13 @@ from .types import AgentDataModel, AgentRunInfo, StageStatus
 
 try:
     from pydantic import ConfigDict, Field, model_validator
-    from pydantic_ai import ModelRetry, RunContext, Tool
+    from pydantic_ai import (
+        ModelRetry,
+        RunContext,
+        Tool,
+        UnexpectedModelBehavior,
+        UsageLimitExceeded,
+    )
     from pydantic_ai.tools import ToolDefinition
 except ImportError as exc:
     raise ImportError(AGENT_INSTALL_HINT) from exc
@@ -62,12 +68,21 @@ _SYSTEM_PROMPT = (
         Call inspect_assay_features_batch once for all requested assays. Never
         invent a feature. If individual features are needed, collect all proposed
         names across assays and call find_present_features_batch once before
-        placing them in a policy. Persisted assay types determine modality routes;
-        never infer a route from an assay label. Copy exact ADT controls, HTO tags,
-        and ATAC-coordinate status from inspection evidence. Treat Ensembl release
-        misses as unresolved, not artificial. Mitochondrial, ribosomal, and histone
-        families may be exclusion candidates. Sex-linked and cell-cycle families
-        are protected by default in this initial implementation.
+        placing them in a policy. Do not call feature lookup when no individual
+        feature decision is needed. Absent or ambiguous lookup results must never
+        enter a policy. If inspection resolves a supported species, copy that exact
+        species key. Use caller organism context only when inspection leaves the
+        species unknown. Exclude only observed families with defaultExclude=true,
+        and never exclude a family with defaultExclude=false.
+
+        Persisted assay types determine modality routes; never infer a route from
+        an assay label. The validator fills assay type, modality eligibility, ADT
+        controls, HTO tags, ATAC-coordinate status, inspections, tool calls, and
+        report-level evidence. Leave those derived fields at their defaults instead
+        of copying them into the output. Treat Ensembl release misses as unresolved,
+        not artificial. Mitochondrial, ribosomal, and histone families may be
+        exclusion candidates. Sex-linked and cell-cycle families are protected by
+        default in this initial implementation.
 
         Structure studyContextSummary using only verbatim spans from the supplied
         study paragraph or exact caller references. Do not paraphrase, infer, or
@@ -609,6 +624,8 @@ class DataEnrichmentDependencies(AgentDataModel):
     evidenceIds: set[str] = Field(default_factory=set)
     inspections: dict[str, AssayFeatureInspection] = Field(default_factory=dict)
     confirmedFeatures: dict[str, set[str]] = Field(default_factory=dict)
+    lookupBatch: FeatureLookupBatch | None = Field(default=None, exclude=True)
+    lookupQueries: dict[str, list[str]] = Field(default_factory=dict, exclude=True)
     toolCalls: list[DataEnrichmentToolCall] = Field(default_factory=list)
 
     @classmethod
@@ -866,6 +883,12 @@ async def inspect_assay_features(
         raise ModelRetry(
             f"assay_name must be one of the requested assays: {deps.assays}"
         )
+    cached = deps.inspections.get(assay_name)
+    if cached is not None:
+        logger.debug(
+            f"Data Enrichment reused cached inspection for assay {assay_name!r}"
+        )
+        return cached
 
     characterization = characterize_features(
         deps.store,
@@ -968,14 +991,34 @@ async def inspect_assay_features_batch(
     deps = ctx.deps
     if not deps.assays:
         raise ModelRetry("No assays were requested")
+    if any(
+        call.name == "inspect_assay_features_batch" for call in deps.toolCalls
+    ) and all(assay_name in deps.inspections for assay_name in deps.assays):
+        inspections = [deps.inspections[assay_name] for assay_name in deps.assays]
+        evidence_ids = list(
+            dict.fromkeys(
+                evidence_id
+                for inspection in inspections
+                for evidence_id in inspection.evidenceIds
+            )
+        )
+        logger.info("Data Enrichment reused the completed feature inspection batch")
+        return AssayFeatureInspectionBatch(
+            inspections=inspections,
+            evidenceIds=evidence_ids,
+        )
     logger.info(
         f"Data Enrichment feature inspection started for {len(deps.assays)} assays"
     )
     start = len(deps.toolCalls)
-    inspections = [
-        await inspect_assay_features(ctx, assay_name=assay_name)
-        for assay_name in deps.assays
-    ]
+    try:
+        inspections = [
+            await inspect_assay_features(ctx, assay_name=assay_name)
+            for assay_name in deps.assays
+        ]
+    except Exception:
+        del deps.toolCalls[start:]
+        raise
     del deps.toolCalls[start:]
     evidence_ids = list(
         dict.fromkeys(
@@ -1120,6 +1163,14 @@ async def find_present_features_batch(
             "The batch may contain at most "
             f"{CONFIG._MAX_FEATURE_QUERIES} feature queries in total"
         )
+    if deps.lookupBatch is not None:
+        if clean_queries_by_assay != deps.lookupQueries:
+            raise ModelRetry(
+                "Feature lookup already completed. Use only the returned lookup "
+                "evidence and do not request a different batch."
+            )
+        logger.info("Data Enrichment reused the completed feature lookup batch")
+        return deps.lookupBatch
 
     logger.info(
         "Data Enrichment feature lookup started: "
@@ -1159,7 +1210,10 @@ async def find_present_features_batch(
         f"ambiguous={result_counts['ambiguous']}, "
         f"absent={result_counts['absent']}, evidence={len(evidence_ids)}"
     )
-    return FeatureLookupBatch(lookups=lookups, evidenceIds=evidence_ids)
+    batch = FeatureLookupBatch(lookups=lookups, evidenceIds=evidence_ids)
+    deps.lookupBatch = batch
+    deps.lookupQueries = clean_queries_by_assay
+    return batch
 
 
 def _ground_study_context_summary(
@@ -1376,6 +1430,8 @@ def validate_data_enrichment_report(
 
     requested = set(deps.assays)
     reported = {policy.assay for policy in report.policies}
+    if len(reported) != len(report.policies):
+        raise ValueError("reports may contain only one policy for each assay")
     if not reported.issubset(requested):
         raise ValueError(
             f"policies cite assays outside the requested set: {sorted(reported - requested)}"
@@ -1415,6 +1471,94 @@ def validate_data_enrichment_report(
         f"toolCalls={len(report.toolCalls)}, evidence={len(report.evidenceIds)}"
     )
     return report
+
+
+def fallback_data_enrichment_report(
+    deps: DataEnrichmentDependencies,
+    *,
+    error: UnexpectedModelBehavior | UsageLimitExceeded,
+    model_name: str,
+) -> DataEnrichmentReport:
+    """Build a conservative policy from completed deterministic inspections."""
+    if set(deps.inspections) != set(deps.assays):
+        raise error
+    policies: list[FeatureSelectionPolicy] = []
+    for assay_name in deps.assays:
+        inspection = deps.inspections[assay_name]
+        species = "unknown"
+        species_confidence: Literal["high", "medium", "low", "unknown"] = "unknown"
+        species_rationale = (
+            inspection.speciesReason
+            or "Deterministic feature inspection did not resolve a species."
+        )
+        policy_evidence = [f"assay:{assay_name}:species"]
+        if inspection.species in _SUPPORTED_SPECIES:
+            species = inspection.species
+            species_confidence = (
+                "high" if inspection.speciesMethod == "ensemblPrefix" else "medium"
+            )
+        else:
+            organism_hint = deps.context.organismHint.strip().casefold()
+            for key, specification in _SUPPORTED_SPECIES.items():
+                if organism_hint in {key.casefold(), specification.label.casefold()}:
+                    species = key
+                    species_confidence = "medium"
+                    species_rationale = (
+                        "Exact caller organism hint resolved an otherwise unknown "
+                        "feature-based species."
+                    )
+                    policy_evidence.append("context:organism")
+                    break
+        excluded_families = [
+            family
+            for family in inspection.families
+            if family.defaultExclude is True and family.count > 0
+        ]
+        protected_families = [
+            family for family in inspection.families if family.defaultExclude is False
+        ]
+        policy_evidence.extend(
+            family.evidenceId for family in [*excluded_families, *protected_families]
+        )
+        policies.append(
+            FeatureSelectionPolicy(
+                assay=assay_name,
+                species=species,
+                speciesConfidence=species_confidence,
+                speciesRationale=species_rationale,
+                excludeFamilies=[family.family for family in excluded_families],
+                protectFamilies=[family.family for family in protected_families],
+                rationale=(
+                    "Retained only deterministic family defaults after structured "
+                    "model output was unavailable."
+                ),
+                evidenceIds=list(dict.fromkeys(policy_evidence)),
+            )
+        )
+    error_detail = str(error).replace("\n", " ").strip()[:500]
+    report = DataEnrichmentReport(
+        status="done",
+        policies=policies,
+        studyContextSummary=StudyContextSummary.get_blank(),
+        limitations=[
+            "Structured enrichment output was unavailable; the fallback omitted "
+            "all model-selected individual and artificial features.",
+            "Free-text context extraction may be incomplete because only exact "
+            "caller fields and deterministic organism mentions were retained.",
+            error_detail,
+        ],
+        runInfo=AgentRunInfo(
+            agentName="data_enrichment_fallback",
+            modelName=model_name,
+        ),
+    )
+    validated = validate_data_enrichment_report(deps, report)
+    logger.warning(
+        "Data Enrichment used its conservative fallback: "
+        f"assays={len(validated.policies)}, evidence={len(validated.evidenceIds)}, "
+        f"reason={error_detail}"
+    )
+    return validated
 
 
 class DataEnrichmentAgent:
@@ -1502,13 +1646,21 @@ class DataEnrichmentAgent:
                 find_present_features_batch exactly once. Do not call a singular
                 assay tool or split lookups across calls. A batched tool is removed
                 after it succeeds, so use each call to request all required data.
+                If no policy needs an individual feature, do not call feature lookup
+                and keep excludeFeatures, protectFeatures, and artificialFeatures
+                empty. Return exactly one policy for every requested assay. Copy a
+                resolved inspection species exactly; otherwise use unknown unless
+                exact caller context supports a species. Exclude only observed
+                defaultExclude=true families and protect every observed
+                defaultExclude=false family.
                 Populate studyContextSummary only with exact verbatim spans from
                 the paragraph or caller references. Empty optional hint fields do
                 not erase references present in the paragraph. Before returning,
                 verify that every explicit organism, tissue, cell population,
                 experiment, hypothesis, and analysis intent has been placed in its
-                corresponding summary list. Copy modality evidence from the
-                inspection without changing feature IDs or names.
+                corresponding summary list. Leave inspections, modality-derived
+                fields, exact controls and tags, toolCalls, and report evidence at
+                their defaults because validation fills them from exact tool state.
                 """
             )
             .strip()
@@ -1524,34 +1676,46 @@ class DataEnrichmentAgent:
                 or "not provided",
             )
         )
-        execution = run_agent_sync(
-            model=self.model,
-            output_type=DataEnrichmentReport,
-            system_prompt=_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            tools=[
-                Tool(
-                    inspect_assay_features_batch,
-                    prepare=_prepare_data_enrichment_tool,
-                    sequential=self.config.sequentialTools,
-                    timeout=self.config.timeoutSeconds,
+        try:
+            execution = run_agent_sync(
+                model=self.model,
+                output_type=DataEnrichmentReport,
+                system_prompt=_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                tools=[
+                    Tool(
+                        inspect_assay_features_batch,
+                        max_retries=1,
+                        prepare=_prepare_data_enrichment_tool,
+                        sequential=self.config.sequentialTools,
+                        timeout=self.config.timeoutSeconds,
+                    ),
+                    Tool(
+                        find_present_features_batch,
+                        max_retries=1,
+                        prepare=_prepare_data_enrichment_tool,
+                        sequential=self.config.sequentialTools,
+                        timeout=self.config.timeoutSeconds,
+                    ),
+                ],
+                deps_type=DataEnrichmentDependencies,
+                deps=deps,
+                config=self.config,
+                name="data_enrichment",
+                output_validator=lambda report: validate_data_enrichment_report(
+                    deps,
+                    report,
                 ),
-                Tool(
-                    find_present_features_batch,
-                    prepare=_prepare_data_enrichment_tool,
-                    sequential=self.config.sequentialTools,
-                    timeout=self.config.timeoutSeconds,
-                ),
-            ],
-            deps_type=DataEnrichmentDependencies,
-            deps=deps,
-            config=self.config,
-            name="data_enrichment",
-            output_validator=lambda report: validate_data_enrichment_report(
+            )
+        except (UnexpectedModelBehavior, UsageLimitExceeded) as exc:
+            if set(deps.inspections) != set(deps.assays):
+                raise
+            model_name = getattr(self.model, "model_name", type(self.model).__name__)
+            return fallback_data_enrichment_report(
                 deps,
-                report,
-            ),
-        )
+                error=exc,
+                model_name=str(model_name),
+            )
         report = DataEnrichmentReport.model_validate(execution.output)
         report = validate_data_enrichment_report(deps, report)
         report.runInfo = execution.runInfo

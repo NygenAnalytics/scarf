@@ -1,5 +1,6 @@
 """Public controller for resumable automated Scarf agent workflows."""
 
+import os
 import time
 import uuid
 from collections.abc import Mapping
@@ -9,6 +10,7 @@ from typing import Any, cast
 import zarr
 
 from ...datastore.datastore import DataStore
+from ...storage.stores import zarr_root_path
 from ...utils.logging import logger
 from .. import record_io
 from ..ingest import IngestResult, detect_format, ingest
@@ -41,6 +43,32 @@ from .models import (
 )
 from .preprocessing import PreprocessingStagesMixin
 from .tuning import TuningStagesMixin
+
+
+def _generate_completed_report(
+    store: DataStore,
+    workflow: AgentWorkflowRun,
+) -> None:
+    """Generate a local report without changing the completed workflow result."""
+    if workflow.status != "completed":
+        return
+    try:
+        if zarr_root_path(store.z) is None:
+            return
+        from ..report import generate_agent_report
+
+        report_path = generate_agent_report(store, workflow.workflowRunId)
+        relative_path = os.path.relpath(report_path, start=Path.cwd())
+        logger.info(
+            f"Workflow {workflow.workflowRunId}: local HTML report saved to "
+            f"{relative_path}"
+        )
+        print(f"Agent workflow report: {relative_path}")
+    except Exception as exc:
+        logger.warning(
+            f"Workflow {workflow.workflowRunId}: local HTML report generation "
+            f"failed ({type(exc).__name__}: {exc})"
+        )
 
 
 class AgentOrchestrator(
@@ -682,7 +710,9 @@ class AgentOrchestrator(
         result = result.model_copy(
             update={"contentSha256": journal._record_checksum(result)}
         )
-        return journal._persist_terminal_result(store, prefix, workflow, result)
+        persisted = journal._persist_terminal_result(store, prefix, workflow, result)
+        _generate_completed_report(store, workflow)
+        return persisted
 
     def _continue(
         self,
@@ -912,4 +942,11 @@ class AgentOrchestrator(
             f"Automated workflow {workflow.workflowRunId} completed with "
             f"{len(terminal.reports)} report(s)"
         )
-        return journal._persist_terminal_result(store, prefix, terminal, completed)
+        persisted = journal._persist_terminal_result(
+            store,
+            prefix,
+            terminal,
+            completed,
+        )
+        _generate_completed_report(store, terminal)
+        return persisted

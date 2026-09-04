@@ -32,6 +32,7 @@ from scarf.agent.parameter_tuning import (
     build_initial_parameter_candidates,
     evaluate_parameter_candidate,
     execute_parameter_candidate,
+    fallback_parameter_tuning_report,
     FinalGraphComparison,
     FinalGraphNeedsInput,
     FinalGraphSelection,
@@ -40,6 +41,7 @@ from scarf.agent.parameter_tuning import (
     IntegrationCandidateEvaluation,
     IntegrationMetrics,
     parameter_batch_selection_prompt,
+    parameter_evaluation_payload,
     parameter_search_prompt,
     parameter_search_system_prompt,
     parameter_tuning_prompt,
@@ -1801,6 +1803,14 @@ def test_batched_refinement_planning_allows_a_validator_retry() -> None:
     assert model_calls == 3
     assert result.status == "done"
     assert result.recommendedByAssay == {"RNA": "baseline"}
+    assert result.searchPlan is not None
+    assert result.searchPlan.runInfo.agentName == "parameter_batch_search_planning"
+    assert result.searchPlan.runInfo.usage.requests == 2
+    assay_plan = result.assayReports["RNA"].searchPlan
+    assert assay_plan is not None
+    assert assay_plan.runInfo == result.searchPlan.runInfo
+    assert result.runInfo.agentName == "parameter_tuning_batch"
+    assert result.runInfo.usage.requests == 1
 
 
 def test_batched_tuning_falls_back_after_structured_output_exhaustion(
@@ -1867,6 +1877,56 @@ def test_single_tuning_falls_back_after_structured_output_exhaustion(
     assert result.recommendedCandidateId == "baseline"
     assert result.confidence == "low"
     assert result.runInfo.agentName == "parameter_tuning_fallback"
+
+
+def test_parameter_fallback_does_not_select_without_successful_baseline() -> None:
+    candidates = [
+        ParameterCandidate.get_example(),
+        ParameterCandidate(candidateId="pca_15", dimensions=15),
+        ParameterCandidate(candidateId="pca_30", dimensions=30),
+    ]
+    deps = _dependencies(
+        _FakeStore(),
+        candidates=candidates,
+        max_candidates=3,
+    )
+    for candidate in candidates:
+        execute_parameter_candidate(deps, candidate.candidateId)
+    deps.evaluations["baseline"] = deps.evaluations["baseline"].model_copy(
+        update={
+            "status": "failed",
+            "eligible": False,
+            "error": "baseline failed",
+        }
+    )
+
+    result = fallback_parameter_tuning_report(
+        deps,
+        search_plan=ParameterSearchPlan(status="complete"),
+        agent_name="parameter_tuning_fallback",
+    )
+
+    assert result.status == "needsInput"
+    assert result.recommendedCandidateId is None
+    assert result.needsInput is not None
+    assert result.needsInput.options == ["pca_15", "pca_30"]
+
+
+def test_parameter_prompt_payload_is_bounded_and_excludes_artifacts() -> None:
+    evaluation = ParameterCandidateEvaluation.get_example().model_copy(
+        update={
+            "warnings": ["w" * 700 for _index in range(12)],
+            "error": "e" * 700,
+        }
+    )
+
+    payload = parameter_evaluation_payload(evaluation)
+
+    assert "artifacts" not in payload
+    assert "cellSelection" not in payload
+    assert len(payload["warnings"]) == 10
+    assert all(len(warning) == 500 for warning in payload["warnings"])
+    assert len(payload["error"]) == 500
 
 
 def test_single_eligible_final_graph_skips_provider_selection() -> None:

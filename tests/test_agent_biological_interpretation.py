@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import zarr
-from pydantic_ai import ModelRetry, RunContext
+from pydantic_ai import ModelRetry, RunContext, UnexpectedModelBehavior
 from pydantic_ai.messages import (
     ModelMessage,
     ModelResponse,
@@ -536,6 +536,29 @@ def test_validator_rejects_unobserved_evidence() -> None:
         validate_biological_interpretation_report(report, run_context.deps)
 
 
+def test_validator_rejects_empty_input_questions_and_model_authored_failure() -> None:
+    store = FakeStore()
+    run_context = context(store, marker=store.marker)
+    asyncio.run(inspect_cluster_composition(run_context))
+
+    with pytest.raises(ModelRetry, match="concrete input question"):
+        validate_biological_interpretation_report(
+            BiologicalInterpretationReport(
+                status="needsInput",
+                needsInput=BiologicalInterpretationNeedsInput(),
+            ),
+            run_context.deps,
+        )
+    with pytest.raises(ModelRetry, match="Do not return failed"):
+        validate_biological_interpretation_report(
+            BiologicalInterpretationReport(
+                status="failed",
+                limitations=["The model was uncertain."],
+            ),
+            run_context.deps,
+        )
+
+
 def test_treatment_observation_requires_evidence_for_its_exact_cluster() -> None:
     store = FakeStore()
     run_context = context(store, marker=store.marker)
@@ -871,6 +894,70 @@ def test_agent_waits_for_tools_and_returns_audited_report() -> None:
         "inspect_cluster_composition",
         "inspect_cluster_markers_batch",
     }
+
+
+def test_biological_interpretation_falls_back_to_unresolved_hypotheses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = FakeStore()
+    marker_retries: list[int] = []
+
+    def unavailable_structured_output(**kwargs: object) -> None:
+        deps = kwargs["deps"]
+        assert isinstance(deps, BiologicalInterpretationDependencies)
+        marker_tool = next(
+            tool
+            for tool in kwargs["tools"]
+            if tool.name == "inspect_cluster_markers_batch"
+        )
+        marker_retries.append(marker_tool.max_retries)
+        run_context = SimpleNamespace(deps=deps)
+        asyncio.run(inspect_cluster_composition(run_context))
+        asyncio.run(
+            inspect_cluster_markers_batch(
+                run_context,
+                cluster_ids=list(deps.clusterValues),
+            )
+        )
+        raise UnexpectedModelBehavior("structured output unavailable")
+
+    monkeypatch.setattr(
+        biological_module,
+        "run_agent_sync",
+        unavailable_structured_output,
+    )
+    result = BiologicalInterpretationAgent(object()).run(
+        store,
+        cluster=store.cluster,
+        marker=store.marker,
+    )
+
+    assert result.status == "done"
+    assert result.runInfo.agentName == "biological_interpretation_fallback"
+    assert {item.clusterId for item in result.clusterInterpretations} == {"0", "1"}
+    assert all(
+        item.proposedIdentity == "unresolved"
+        and item.identityIsHypothesis
+        and item.confidence == "low"
+        for item in result.clusterInterpretations
+    )
+    assert result.treatmentObservations == []
+    assert marker_retries == [1]
+
+
+def test_marker_batch_cache_rejects_different_clusters() -> None:
+    store = FakeStore()
+    run_context = context(store, marker=store.marker)
+    asyncio.run(inspect_cluster_composition(run_context))
+
+    first = asyncio.run(inspect_cluster_markers_batch(run_context, cluster_ids=["0"]))
+    repeated = asyncio.run(
+        inspect_cluster_markers_batch(run_context, cluster_ids=["0"])
+    )
+
+    assert repeated is first
+    with pytest.raises(ModelRetry, match="already completed"):
+        asyncio.run(inspect_cluster_markers_batch(run_context, cluster_ids=["1"]))
 
 
 def test_exact_cluster_artifact_conflict_is_rejected_before_model_execution() -> None:

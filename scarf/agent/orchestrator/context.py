@@ -24,7 +24,7 @@ from ..persistence import (
     AgentReportReference,
     AgentWorkflowRun,
 )
-from ..types import ArtifactReferenceModel
+from ..types import AgentRunInfo, ArtifactReferenceModel
 from . import journal
 from .models import (
     OrchestrationRequestRecord,
@@ -697,6 +697,15 @@ class ContextStagesMixin:
                 and paused.outputs.get("unsafeBatchCorrection") is True
                 else None
             )
+            no_inference_resolution = (
+                paused is not None
+                and paused.outputs.get("unsafeBatchCorrection") is not True
+                and isinstance(supplied_directions, Mapping)
+                and supplied_directions.get("coefficientsOfInterest") == []
+                and supplied_directions.get("unitsOfInference") == {}
+                and isinstance(supplied_directions.get("batchCorrection"), Mapping)
+                and supplied_directions["batchCorrection"].get("action") == "skip"
+            )
             actions: list[str] = []
             recovered = journal._recover_persisted_stage_report(
                 store,
@@ -715,11 +724,11 @@ class ContextStagesMixin:
                 actions.append("recover_persisted_experimental_context_report")
             else:
                 parent_reports = [journal._report_link(enrichment_reference)]
-                if unsafe_resolution == "skip":
+                if unsafe_resolution == "skip" or no_inference_resolution:
                     assert paused is not None
                     if not paused.reportReferences:
                         raise ValueError(
-                            "Unsafe Experimental Context pause has no persisted report"
+                            "Experimental Context pause has no persisted report"
                         )
                     prior_report = cast(
                         ExperimentalContextResult,
@@ -752,20 +761,48 @@ class ContextStagesMixin:
                             "Paused Experimental Context invocation artifacts are stale"
                         )
                     prior_plan = prior_report.decision.batchCorrection
+                    if no_inference_resolution:
+                        plan_updates: dict[str, Any] = {
+                            "preserveColumns": [],
+                            "rationale": (
+                                "The caller explicitly continued without "
+                                "coefficient-level inference and skipped Harmony."
+                            ),
+                        }
+                        decision_updates: dict[str, Any] = {
+                            "coefficientsOfInterest": [],
+                            "unitsOfInference": {},
+                        }
+                        resolution_note = (
+                            "Caller explicitly continued without coefficient-level "
+                            "inference and skipped Harmony."
+                        )
+                        resolution_action = (
+                            "resolve_experimental_context:no_inference_skip_harmony"
+                        )
+                    else:
+                        plan_updates = {
+                            "rationale": (
+                                "The caller explicitly skipped Harmony after reviewing "
+                                "the persisted unsafe batch-correction evidence."
+                            )
+                        }
+                        decision_updates = {}
+                        resolution_note = (
+                            "Caller explicitly skipped Harmony after an unsafe result."
+                        )
+                        resolution_action = "resolve_unsafe_batch_correction:skip"
                     skip_plan = prior_plan.model_copy(
                         update={
                             "action": "skip",
                             "batchColumns": [],
                             "metricsRequired": [],
-                            "rationale": (
-                                "The caller explicitly skipped Harmony after "
-                                "reviewing the persisted unsafe batch-correction "
-                                "evidence."
-                            ),
+                            **plan_updates,
                         }
                     )
                     decision = prior_report.decision.model_copy(
                         update={
+                            **decision_updates,
                             "batchCorrection": skip_plan,
                             "needsInput": [],
                         }
@@ -774,18 +811,17 @@ class ContextStagesMixin:
                         update={
                             "status": "done",
                             "decision": decision,
-                            "notes": [
-                                *prior_report.notes,
-                                "Caller explicitly skipped Harmony after an unsafe "
-                                "result.",
-                            ],
+                            "notes": [*prior_report.notes, resolution_note],
+                            "runInfo": AgentRunInfo(
+                                agentName="experimental_context_resolution"
+                            ),
                         }
                     )
+                    actions.append(resolution_action)
                     parent_reports.append(
                         journal._report_link(paused.reportReferences[0])
                     )
-                    run_config = request_record.config.agentRunConfig
-                    actions.append("resolve_unsafe_batch_correction:skip")
+                    run_config = paused_record.invocation.runConfig
                 else:
                     logger.info(
                         f"Workflow {workflow.workflowRunId}: invoking Experimental "
@@ -824,6 +860,9 @@ class ContextStagesMixin:
                                 for source in hto_identity_artifacts
                             ],
                             "unsafeResolution": unsafe_resolution,
+                            "deterministicResolution": (
+                                actions[-1] if actions else None
+                            ),
                         },
                         artifacts=context_artifacts,
                         runConfig=run_config,

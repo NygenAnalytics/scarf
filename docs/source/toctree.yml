@@ -86,7 +86,7 @@ subtrees:
       - file: analysis_with_agents
         title: Analysis with AI agents
       - file: tutorials/agent_workflow
-        title: Grounded agent workflow
+        title: Automated agent workflow
   - caption: Advanced examples
     entries:
       - file: tutorials/plotting

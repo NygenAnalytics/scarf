@@ -8,7 +8,8 @@ description: Use Scarf safely in an autonomous or AI-assisted single-cell analys
 This page is a routing and reasoning guide for an AI agent that uses Scarf to analyse data.
 It does not replace the workflow tutorials or define one correct analysis.
 The study question, experimental design, and user instructions remain authoritative.
-For an executable example of the four bounded Scarf agents and their validated handoffs, see {doc}`tutorials/agent_workflow`.
+For an executable ingest-to-interpretation example with persisted checkpoints and resume, see
+{doc}`tutorials/agent_workflow`.
 
 ## Scope and authority
 
@@ -96,6 +97,50 @@ Before the first mutating operation, make a short execution record containing:
 
 Update this record before changing the cohort, inputs, or decision criteria.
 This prospective boundary makes unintended writes and retrospective justifications visible.
+`AgentOrchestrator` persists the immutable request, effective configuration, stage attempts,
+agent-report handoffs, and artifact references. The caller still owns the scientific question and
+unit of inference.
+
+### When to use the automated agent workflow
+
+Use `AgentOrchestrator` when the input is a supported dataset path and the caller can supply one
+study-context paragraph. The orchestrator owns a fixed stage order: ingest, Data Enrichment,
+optional HTO demultiplexing, Experimental Context, preprocessing-plan approval, preprocessing,
+Parameter Tuning, analysis finalization, and Biological Interpretation. The model does not write
+exploratory code or choose arbitrary `DataStore` calls. It selects only validated policies and
+candidate identifiers from bounded evidence; executor-owned public operations create and pass exact
+immutable artifact references.
+
+```python
+from scarf.agent import (
+    AgentOrchestrator,
+    AutomatedWorkflowRequest,
+    AutomatedWorkflowResumeRequest,
+)
+
+orchestrator = AgentOrchestrator(model)
+result = orchestrator.run(
+    AutomatedWorkflowRequest(
+        sourcePath="study.h5ad",
+        zarrPath="study.zarr",
+        studyContext="One paragraph describing the study and analysis intent.",
+    )
+)
+```
+
+The parameter screen uses granular public operations for each authorized branch rather than
+invoking `ds.pipeline.run()` for every candidate. This keeps normalization, reduction, neighbours,
+graph, clustering, metrics, promotion, UMAP, and marker artifacts explicit and enforces their order
+through lineage. `ds.pipeline.run()` remains the fixed baseline recipe described below.
+
+With `allowAssumptions=False`, `run()` can persist a complete preprocessing plan and return
+`needsInput` for approval. Resume only that running workflow with
+`AutomatedWorkflowResumeRequest` and the persisted question identifiers.
+`allowAssumptions=True` automatically approves the evidence-bounded preprocessing plan, but it does
+not authorize invented metadata or unsafe batch correction. Any agent can still pause for genuine
+ambiguity. A completed local workflow persists its terminal result and then creates a replaceable
+HTML report. `generate_agent_report()` can regenerate that derived view without training new
+analysis artifacts.
 
 ### When to use the pipeline
 
@@ -220,7 +265,10 @@ Classify the problem before retrying:
 - **Scientific ambiguity:** preserve branches, seek another independent form of evidence, narrow the claim, or report that the available design does not resolve the alternatives.
 
 In a granular workflow, retry the lowest failed stage. A failed pipeline run is not resumable;
-start a new run, which can reuse matching complete artifacts from the earlier attempt.
+start a new run, which can reuse matching complete artifacts from the earlier attempt. An automated
+agent workflow resumes only while it is running after `needsInput`. Failed and abandoned
+orchestrations are terminal, while completed stages in a valid running workflow are checked and
+reused on resume.
 
 ## Progress and deterministic comparisons
 
@@ -249,4 +297,7 @@ A useful handoff reports:
 
 Artifact provenance records how Scarf produced a result.
 It does not replace this study-level reasoning record.
+For an automated run, `AutomatedWorkflowResult.finalAnalysis` provides the exact final artifact
+handoff and `reportReferences` identifies the persisted agent reports. The generated local HTML
+report is a replaceable presentation of those durable records, not an additional source of truth.
 See {doc}`index` for the implemented methods and current boundaries.
