@@ -9,7 +9,6 @@ from zarr.storage import MemoryStore
 import scarf.graph.feature_projection as feature_projection_module
 from scarf.datastore.graph_datastore import GraphDataStore
 from scarf.embeddings.imported import write_imported_coordinates
-from scarf.graph.errors import IncompatibleAnalysisStateError
 from scarf.graph.feature_projection import (
     graph_cell_selection,
     graph_source_assays,
@@ -17,14 +16,12 @@ from scarf.graph.feature_projection import (
     resolve_graph_assay_inputs,
     resolve_native_graph_inputs,
 )
-from scarf.graph.state import AssayState, write_assay_state
 from scarf.storage.artifacts import (
     ArtifactRef,
     artifact_path,
     fingerprint_array,
     fingerprint_stored_arrays,
     fingerprint_stored_strings,
-    inspect_artifact,
     make_provenance,
     new_artifact_id,
 )
@@ -152,7 +149,6 @@ def _native_chain(
             payload_fingerprints={"data": fingerprint_array(coordinate_values)},
             source_cell_ids=np.asarray(root["cellData/ids"][:]),
             cell_selection=cell_selection,
-            cell_key="I",
             block_rows=2,
         )
     else:
@@ -252,7 +248,7 @@ def test_imported_projection_has_no_feature_selection(root: zarr.Group) -> None:
     assert project_normalized_feature_selections(root, connectivity) == ()
 
 
-def test_native_projection_validates_live_cell_selection(root: zarr.Group) -> None:
+def test_native_projection_ignores_live_cell_alias_drift(root: zarr.Group) -> None:
     cells = _cell_selection(root)
     connectivity, _neighbors, _coordinates = _native_chain(
         root,
@@ -261,13 +257,10 @@ def test_native_projection_validates_live_cell_selection(root: zarr.Group) -> No
     )
     root["cellData/I"][0] = False
 
-    with pytest.raises(ArtifactResolutionError) as caught:
-        resolve_native_graph_inputs(root, connectivity)
-
-    assert caught.value.code == "selection_values_changed"
+    assert resolve_native_graph_inputs(root, connectivity).cell_selection == cells
 
 
-def test_native_projection_rejects_scalar_embedded_in_coordinate_ref(
+def test_native_projection_rejects_extra_coordinate_ref_fields(
     root: zarr.Group,
 ) -> None:
     cells = _cell_selection(root)
@@ -280,14 +273,14 @@ def test_native_projection_rejects_scalar_embedded_in_coordinate_ref(
     provenance = dict(group.attrs["provenance"])
     inputs = dict(provenance["inputs"])
     coordinates = dict(inputs["coordinates"])
-    coordinates["feat_key"] = "I__hvgs"
+    coordinates["unexpected"] = True
     inputs["coordinates"] = coordinates
     provenance["inputs"] = inputs
     group.attrs["provenance"] = provenance
 
-    with pytest.raises(IncompatibleAnalysisStateError) as caught:
+    with pytest.raises(ArtifactResolutionError) as caught:
         resolve_native_graph_inputs(root, connectivity)
-    assert caught.value.code == "legacy_feature_contract"
+    assert caught.value.code == "corrupt_payload"
 
 
 def test_native_graph_classifies_missing_incomplete_and_malformed_records(
@@ -321,7 +314,7 @@ def test_native_graph_classifies_missing_incomplete_and_malformed_records(
     assert malformed.value.code == "corrupt_payload"
 
 
-def test_neighbors_string_coordinates_use_the_legacy_contract(
+def test_neighbors_reject_non_reference_coordinates(
     root: zarr.Group,
 ) -> None:
     cells = _cell_selection(root)
@@ -337,17 +330,9 @@ def test_neighbors_string_coordinates_use_the_legacy_contract(
     provenance["inputs"] = inputs
     group.attrs["provenance"] = provenance
 
-    with pytest.raises(IncompatibleAnalysisStateError) as caught:
+    with pytest.raises(ArtifactResolutionError) as caught:
         resolve_native_graph_inputs(root, connectivity)
-    assert caught.value.code == "legacy_feature_contract"
-
-    inputs["feat_key"] = "I__hvgs"
-    del inputs["coordinates"]
-    provenance["inputs"] = inputs
-    group.attrs["provenance"] = provenance
-    with pytest.raises(IncompatibleAnalysisStateError) as missing_with_feat_key:
-        resolve_native_graph_inputs(root, connectivity)
-    assert missing_with_feat_key.value.code == "legacy_feature_contract"
+    assert caught.value.code == "corrupt_payload"
 
 
 @pytest.mark.parametrize(
@@ -689,7 +674,7 @@ def test_integrated_projection_deduplicates_exact_refs_in_first_seen_order(
     )
 
 
-def test_integrated_snn_rejects_scalar_embedded_in_source_ref(
+def test_integrated_snn_rejects_extra_source_ref_fields(
     root: zarr.Group,
 ) -> None:
     cells = _cell_selection(root)
@@ -719,14 +704,14 @@ def test_integrated_snn_rejects_scalar_embedded_in_source_ref(
     provenance = dict(group.attrs["provenance"])
     inputs = dict(provenance["inputs"])
     source = dict(inputs["source_0"])
-    source["feat_key"] = "I__hvgs"
+    source["unexpected"] = True
     inputs["source_0"] = source
     provenance["inputs"] = inputs
     group.attrs["provenance"] = provenance
 
-    with pytest.raises(IncompatibleAnalysisStateError) as caught:
+    with pytest.raises(ArtifactResolutionError) as caught:
         resolve_graph_assay_inputs(root, integrated, "RNA")
-    assert caught.value.code == "legacy_feature_contract"
+    assert caught.value.code == "corrupt_payload"
 
 
 def test_integrated_wnn_projection_validates_coordinate_bundle(
@@ -797,28 +782,28 @@ def test_integrated_wnn_projection_validates_coordinate_bundle(
     inputs = dict(provenance["inputs"])
     source = dict(inputs["source_0"])
     raw_coordinates = dict(source["coordinates"])
-    raw_coordinates["feat_key"] = "I__hvgs"
+    raw_coordinates["unexpected"] = True
     source["coordinates"] = raw_coordinates
     inputs["source_0"] = source
     provenance["inputs"] = inputs
     integrated_group.attrs["provenance"] = provenance
-    with pytest.raises(IncompatibleAnalysisStateError) as malformed_coordinates:
+    with pytest.raises(ArtifactResolutionError) as malformed_coordinates:
         resolve_graph_assay_inputs(root, integrated, "RNA")
-    assert malformed_coordinates.value.code == "legacy_feature_contract"
+    assert malformed_coordinates.value.code == "corrupt_payload"
 
     integrated_group.attrs["provenance"] = original_provenance
     provenance = dict(original_provenance)
     inputs = dict(provenance["inputs"])
     source = dict(inputs["source_0"])
     raw_neighbors = dict(source["neighbors"])
-    raw_neighbors["feat_key"] = "I__hvgs"
+    raw_neighbors["unexpected"] = True
     source["neighbors"] = raw_neighbors
     inputs["source_0"] = source
     provenance["inputs"] = inputs
     integrated_group.attrs["provenance"] = provenance
-    with pytest.raises(IncompatibleAnalysisStateError) as malformed:
+    with pytest.raises(ArtifactResolutionError) as malformed:
         resolve_graph_assay_inputs(root, integrated, "RNA")
-    assert malformed.value.code == "legacy_feature_contract"
+    assert malformed.value.code == "corrupt_payload"
 
     wrong_coordinates = _artifact(root, "reduction", assay="RNA")
     broken = _artifact(
@@ -889,12 +874,12 @@ def test_integrated_wnn_rejects_imported_coordinates(root: zarr.Group) -> None:
     assert caught.value.code == "wrong_kind"
 
 
-def test_ini_embed_requires_state_initialization_from_the_graph_reduction(
+def test_ini_embed_requires_initialization_from_the_graph_reduction(
     root: zarr.Group,
 ) -> None:
     cells = _cell_selection(root)
     features = _feature_selection(root, "RNA")
-    graph, _neighbors, coordinates = _native_chain(
+    _graph, _neighbors, coordinates = _native_chain(
         root,
         "RNA",
         cell_selection=cells,
@@ -907,32 +892,16 @@ def test_ini_embed_requires_state_initialization_from_the_graph_reduction(
         feature_selection=features,
     )
     store = _bare_embedding_store(root)
-    with pytest.raises(KeyError, match="no embedding initialization"):
-        store._get_ini_embed("RNA", "I", graph, 2)
-
-    raw_normalized = (inspect_artifact(root, coordinates).inputs or {}).get(
-        "normalized"
-    )
-    assert isinstance(raw_normalized, dict)
     initialization = _artifact(
         root,
         "embedding_initialization",
         assay="RNA",
-        inputs={"reduction": coordinates},
-    )
-    write_assay_state(
-        root,
-        AssayState(
-            assay="RNA",
-            cell_key="I",
-            normalized=ArtifactRef.from_dict(raw_normalized),
-            reduction=coordinates,
-            embedding_initialization=initialization,
-        ),
+        inputs={"coordinates": coordinates},
+        operation="build_embedding_initialization",
     )
     with pytest.raises(
         ValueError,
-        match="does not belong to the graph reduction",
+        match="does not belong to the graph coordinates",
     ):
-        store._get_ini_embed("RNA", "I", other_graph, 2)
+        store._get_ini_embed(initialization, other_graph, 2)
     assert other_coordinates != coordinates

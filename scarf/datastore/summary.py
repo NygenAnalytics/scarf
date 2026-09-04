@@ -5,7 +5,6 @@ from typing import Any, Protocol
 import zarr
 
 from ..assay import Assay
-from ..graph.state import AssayState, read_assay_state
 from ..metadata import MetaData
 from ..storage.artifacts import (
     ArtifactStatus,
@@ -14,6 +13,7 @@ from ..storage.artifacts import (
 )
 from ..storage.budget import ResourceBudget, resolve_budget
 from ..storage.profiles import StorageProfile, resolve_storage_profile
+from ..storage.pipeline_runs import list_pipeline_run_records
 from ..storage.refs import ArtifactRef, ArtifactScope
 from ..storage.schema import validate_assay_name
 from ..storage.stores import load_zarr
@@ -56,7 +56,6 @@ class AssaySummary:
     active_features: int
     feature_columns: tuple[str, ...]
     dataset_fingerprint: str | None
-    state: AssayState | None
     artifacts: tuple[ArtifactSummary, ...]
 
     def to_dict(self) -> dict[str, Any]:
@@ -67,7 +66,6 @@ class AssaySummary:
             "active_features": self.active_features,
             "feature_columns": list(self.feature_columns),
             "dataset_fingerprint": self.dataset_fingerprint,
-            "state": self.state.to_dict() if self.state is not None else None,
             "artifacts": [artifact.to_dict() for artifact in self.artifacts],
         }
 
@@ -84,6 +82,8 @@ class DataStoreSummary:
     cell_columns: tuple[str, ...]
     assays: tuple[AssaySummary, ...]
     artifacts: tuple[ArtifactSummary, ...]
+    pipeline_run_counts: dict[str, int]
+    labeled_pipeline_runs: tuple[tuple[str, str], ...]
 
     def to_dict(self) -> dict[str, Any]:
         """Return a deterministic representation containing JSON-safe values."""
@@ -98,6 +98,11 @@ class DataStoreSummary:
             "cell_columns": list(self.cell_columns),
             "assays": [assay.to_dict() for assay in self.assays],
             "artifacts": [artifact.to_dict() for artifact in self.artifacts],
+            "pipeline_run_counts": dict(self.pipeline_run_counts),
+            "labeled_pipeline_runs": [
+                {"label": label, "run_id": run_id}
+                for label, run_id in self.labeled_pipeline_runs
+            ],
         }
 
 
@@ -122,8 +127,6 @@ class _SummaryStore(Protocol):
 
     def _get_assay(self, from_assay: str | None) -> Assay | _AssaySummaryView: ...
 
-    def get_assay_state(self, from_assay: str | None = None) -> AssayState | None: ...
-
     def list_artifacts(
         self,
         *,
@@ -131,6 +134,9 @@ class _SummaryStore(Protocol):
         from_assay: str | None = None,
         scope: ArtifactScope = "assay",
         complete_only: bool = False,
+        operation: str | None = None,
+        parameters: Mapping[str, Any] | None = None,
+        inputs: Mapping[str, Any] | None = None,
     ) -> list[ArtifactRef]: ...
 
     def inspect_artifact(self, ref: ArtifactRef) -> ArtifactStatus: ...
@@ -221,10 +227,6 @@ class _ReadOnlySummaryStore:
             attrs=assay_group.attrs,
         )
 
-    def get_assay_state(self, from_assay: str | None = None) -> AssayState | None:
-        assay = from_assay or self._defaultAssay
-        return read_assay_state(self.zw, assay)
-
     def list_artifacts(
         self,
         *,
@@ -232,6 +234,9 @@ class _ReadOnlySummaryStore:
         from_assay: str | None = None,
         scope: ArtifactScope = "assay",
         complete_only: bool = False,
+        operation: str | None = None,
+        parameters: Mapping[str, Any] | None = None,
+        inputs: Mapping[str, Any] | None = None,
     ) -> list[ArtifactRef]:
         if scope == "assay" and from_assay is None:
             from_assay = self._defaultAssay
@@ -241,6 +246,9 @@ class _ReadOnlySummaryStore:
             assay=from_assay,
             kind=kind,
             complete_only=complete_only,
+            operation=operation,
+            parameters=parameters,
+            inputs=inputs,
         )
 
     def inspect_artifact(self, ref: ArtifactRef) -> ArtifactStatus:
@@ -303,7 +311,6 @@ def build_datastore_summary(
                 dataset_fingerprint=(
                     str(fingerprint) if fingerprint is not None else None
                 ),
-                state=store.get_assay_state(assay_name),
                 artifacts=_summarize_artifacts(
                     store,
                     store.list_artifacts(
@@ -314,6 +321,25 @@ def build_datastore_summary(
             )
         )
 
+    runs = list_pipeline_run_records(store.zw, limit=2**31 - 1)
+    pipeline_run_counts = {
+        "total": len(runs),
+        "running": sum(run.status == "running" for run in runs),
+        "completed": sum(run.status == "completed" for run in runs),
+        "failed": sum(run.status == "failed" for run in runs),
+        "interrupted": sum(run.status == "interrupted" for run in runs),
+        "incomplete": sum(not run.complete for run in runs),
+    }
+    labeled_pipeline_runs = tuple(
+        sorted(
+            (
+                (run.label, run.run_id)
+                for run in runs
+                if run.successfully_completed and run.label is not None
+            ),
+            key=lambda item: item[0],
+        )
+    )
     return DataStoreSummary(
         zarr_mode=store.zarr_mode,
         workspace=store.workspace,
@@ -332,6 +358,8 @@ def build_datastore_summary(
             store,
             store.list_artifacts(scope="datastore"),
         ),
+        pipeline_run_counts=pipeline_run_counts,
+        labeled_pipeline_runs=labeled_pipeline_runs,
     )
 
 

@@ -188,9 +188,12 @@ class DataStore(
     def resolve_features(
         self,
         assay: str,
-        features: ArtifactRef | str,
+        features: ArtifactRef,
     ) -> ArtifactRef:
-        """Resolve an exact feature-selection reference or published label."""
+        """Validate and return one exact feature-selection reference."""
+
+        if not isinstance(features, ArtifactRef):
+            raise TypeError("features must be an ArtifactRef")
         resolved_assay = self.get_assay(assay)
         return resolve_feature_selection(self.zw, resolved_assay.name, features)
 

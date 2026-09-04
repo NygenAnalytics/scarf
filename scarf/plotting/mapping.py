@@ -32,10 +32,9 @@ from ._style import (
 
 def _mapping_result(
     store: Any,
-    result: MappingResult | ArtifactRef | str,
+    result: ArtifactRef,
     *,
-    reference: MappingReference | None,
-    query_assay: str | None,
+    reference: MappingReference,
 ) -> MappingResult:
     loader = getattr(store, "get_mapping_result", None)
     if not callable(loader):
@@ -43,29 +42,26 @@ def _mapping_result(
     loaded = loader(
         result,
         reference=reference,
-        query_assay=query_assay,
         load_arrays=False,
     )
     if not isinstance(loaded, MappingResult):
         raise TypeError("store returned an invalid mapping result")
-    if loaded.reference is None:
-        raise ValueError("Resolved mapping result has no MappingReference")
     return loaded
 
 
 def _reference_layout(
     reference: MappingReference,
-    layout_key: str,
+    layout: ArtifactRef,
 ) -> np.ndarray:
-    layout = np.asarray(reference.fetch_layout(layout_key), dtype=np.float64)
-    if layout.shape != (reference.selected_cell_count, 2):
+    values = np.asarray(reference.fetch_layout(layout), dtype=np.float64)
+    if values.shape != (reference.selected_cell_count, 2):
         raise ValueError(
             "Reference layout must have two columns and one row per selected "
             "reference cell"
         )
-    if not np.all(np.isfinite(layout) | np.isnan(layout)):
+    if not np.all(np.isfinite(values) | np.isnan(values)):
         raise ValueError("Reference layout contains infinite coordinates")
-    return layout
+    return values
 
 
 def _external_groups(
@@ -137,15 +133,14 @@ def _axis_limits(x: np.ndarray, y: np.ndarray) -> tuple[Any, Any]:
 
 def mapping_score(
     store: Any,
-    result: MappingResult | ArtifactRef | str,
+    result: ArtifactRef,
     *,
-    reference: MappingReference | None = None,
+    reference: MappingReference,
     target_groups: Sequence[Any] | np.ndarray | None = None,
-    layout_key: str | None = None,
+    layout: ArtifactRef | None = None,
     kind: Literal["embedding", "histogram", "box"] = "embedding",
     reference_class_group: str | None = None,
     size_by_score: bool = False,
-    query_assay: str | None = None,
     log_transform: bool = True,
     multiplier: float = 1000,
     weighted: bool = True,
@@ -163,8 +158,8 @@ def mapping_score(
     """Plot reference-cell mapping scores for one or more query groups."""
     if kind not in ("embedding", "histogram", "box"):
         raise ValueError("kind must be 'embedding', 'histogram', or 'box'")
-    if kind == "embedding" and layout_key is None:
-        raise ValueError("layout_key is required for an embedding mapping score")
+    if kind == "embedding" and layout is None:
+        raise ValueError("layout is required for an embedding mapping score")
     if kind == "box" and reference_class_group is None:
         raise ValueError("reference_class_group is required for a box mapping score")
     if size_by_score and kind != "embedding":
@@ -175,17 +170,17 @@ def mapping_score(
         store,
         result,
         reference=reference,
-        query_assay=query_assay,
     )
     score_loader = getattr(store, "get_mapping_score", None)
     if not callable(score_loader):
         raise TypeError("store does not provide mapping score data")
     score_rows = list(
         score_loader(
-            mapping,
+            result,
             target_groups=(
                 None if target_groups is None else np.asarray(target_groups)
             ),
+            reference=reference,
             log_transform=log_transform,
             multiplier=multiplier,
             weighted=weighted,
@@ -193,16 +188,15 @@ def mapping_score(
         )
     )
     if not score_rows:
-        raise ValueError(f"Mapping {mapping.mapping_name!r} produced no score groups")
+        raise ValueError("Mapping produced no score groups")
     labels = [row[0] for row in score_rows]
     display_labels = {label: str(label) for label in labels}
     if target_groups is None and len(labels) == 1:
-        display_labels[labels[0]] = mapping.mapping_name
+        display_labels[labels[0]] = "all query cells"
     score_arrays = [np.asarray(row[1], dtype=np.float64) for row in score_rows]
     n_reference = len(score_arrays[0])
     if any(values.shape != (n_reference,) for values in score_arrays):
         raise ValueError("Mapping score groups have incompatible lengths")
-    assert mapping.reference is not None
     if n_reference != mapping.reference.selected_cell_count:
         raise ValueError("Mapping scores do not match the selected reference cells")
     reference_classes: np.ndarray | None = None
@@ -255,10 +249,10 @@ def mapping_score(
             figsize=figsize,
         )
         if kind == "embedding":
-            assert layout_key is not None
-            layout = _reference_layout(mapping.reference, layout_key)
-            x = layout[:, 0]
-            y = layout[:, 1]
+            assert layout is not None
+            layout_values = _reference_layout(mapping.reference, layout)
+            x = layout_values[:, 0]
+            y = layout_values[:, 1]
             xlim, ylim = _axis_limits(x, y)
             shared_values = np.concatenate(
                 [values[np.isfinite(values) & (values > 0)] for values in score_arrays]
@@ -426,8 +420,7 @@ def mapping_score(
             renderer="matplotlib",
             notes=("mapping_score", kind),
             extras={
-                "mapping_name": mapping.mapping_name,
-                "layout_key": layout_key,
+                "layout": layout.to_dict() if layout is not None else None,
                 "groups": list(labels),
                 "reference_class_group": reference_class_group,
                 "size_by_score": size_by_score,
@@ -466,11 +459,10 @@ def _continuous_limits(
 
 def _label_evidence(
     store: Any,
-    result: MappingResult | ArtifactRef | str,
+    result: ArtifactRef,
     *,
-    reference: MappingReference | None,
+    reference: MappingReference,
     reference_class_group: str,
-    query_assay: str | None,
     threshold_fraction: float,
     na_val: str,
     max_distance: float | None,
@@ -482,7 +474,6 @@ def _label_evidence(
         result,
         reference_class_group=reference_class_group,
         reference=reference,
-        query_assay=query_assay,
         threshold_fraction=threshold_fraction,
         na_val=na_val,
         max_distance=max_distance,
@@ -491,9 +482,9 @@ def _label_evidence(
 
 def mapping_evidence(
     store: Any,
-    result: MappingResult | ArtifactRef | str,
+    result: ArtifactRef,
     *,
-    reference: MappingReference | None = None,
+    reference: MappingReference,
     reference_class_group: str,
     target_groups: Sequence[Any] | np.ndarray | None = None,
     metrics: Sequence[str] = (
@@ -504,7 +495,6 @@ def mapping_evidence(
     ),
     kind: Literal["histogram", "box"] = "histogram",
     bins: int = 30,
-    query_assay: str | None = None,
     threshold_fraction: float = 0.5,
     na_val: str = "NA",
     max_distance: float | None = None,
@@ -524,15 +514,12 @@ def mapping_evidence(
         store,
         result,
         reference=reference,
-        query_assay=query_assay,
     )
-    assert mapping.reference is not None
     evidence = _label_evidence(
         store,
-        mapping,
-        reference=mapping.reference,
+        result,
+        reference=reference,
         reference_class_group=reference_class_group,
-        query_assay=None,
         threshold_fraction=threshold_fraction,
         na_val=na_val,
         max_distance=max_distance,
@@ -540,7 +527,7 @@ def mapping_evidence(
     groups = _external_groups(
         target_groups,
         len(evidence),
-        default=mapping.mapping_name,
+        default="all query cells",
         argument_name="target_groups",
     )
     evidence["group"] = groups
@@ -632,7 +619,6 @@ def mapping_evidence(
             renderer="matplotlib",
             notes=("mapping_evidence", kind),
             extras={
-                "mapping_name": mapping.mapping_name,
                 "reference_class_group": reference_class_group,
                 "metrics": requested_metrics,
                 "threshold_fraction": threshold_fraction,
@@ -649,15 +635,14 @@ def mapping_evidence(
 
 def mapping_confusion(
     store: Any,
-    result: MappingResult | ArtifactRef | str,
+    result: ArtifactRef,
     *,
-    reference: MappingReference | None = None,
+    reference: MappingReference,
     reference_class_group: str,
     known_labels: Sequence[Any] | np.ndarray,
     normalize: Literal["none", "true", "predicted", "all"] = "true",
     known_order: Sequence[Any] | None = None,
     predicted_order: Sequence[Any] | None = None,
-    query_assay: str | None = None,
     threshold_fraction: float = 0.5,
     na_val: str = "NA",
     max_distance: float | None = None,
@@ -675,15 +660,12 @@ def mapping_confusion(
         store,
         result,
         reference=reference,
-        query_assay=query_assay,
     )
-    assert mapping.reference is not None
     evidence = _label_evidence(
         store,
-        mapping,
-        reference=mapping.reference,
+        result,
+        reference=reference,
         reference_class_group=reference_class_group,
-        query_assay=None,
         threshold_fraction=threshold_fraction,
         na_val=na_val,
         max_distance=max_distance,
@@ -816,7 +798,6 @@ def mapping_confusion(
             renderer="matplotlib",
             notes=("mapping_confusion",),
             extras={
-                "mapping_name": mapping.mapping_name,
                 "reference_class_group": reference_class_group,
                 "normalize": normalize,
                 "threshold_fraction": threshold_fraction,
@@ -833,9 +814,9 @@ def mapping_confusion(
 
 def mapping_calibration(
     store: Any,
-    result: MappingResult | ArtifactRef | str,
+    result: ArtifactRef,
     *,
-    reference: MappingReference | None = None,
+    reference: MappingReference,
     reference_class_group: str,
     known_labels: Sequence[Any] | np.ndarray,
     metric: str = "voteFraction",
@@ -843,7 +824,6 @@ def mapping_calibration(
     thresholds: Sequence[float] | np.ndarray | None = None,
     n_thresholds: int = 50,
     chosen_threshold: float | None = None,
-    query_assay: str | None = None,
     na_val: str = "NA",
     max_distance: float | None = None,
     target: Any | None = None,
@@ -876,15 +856,12 @@ def mapping_calibration(
         store,
         result,
         reference=reference,
-        query_assay=query_assay,
     )
-    assert mapping.reference is not None
     evidence = _label_evidence(
         store,
-        mapping,
-        reference=mapping.reference,
+        result,
+        reference=reference,
         reference_class_group=reference_class_group,
-        query_assay=None,
         threshold_fraction=0.0,
         na_val=na_val,
         max_distance=max_distance,
@@ -1073,7 +1050,6 @@ def mapping_calibration(
             renderer="matplotlib",
             notes=("mapping_calibration",),
             extras={
-                "mapping_name": mapping.mapping_name,
                 "reference_class_group": reference_class_group,
                 "metric": metric,
                 "direction": resolved_direction,

@@ -5,7 +5,7 @@ Public Scarf surfaces for analysts:
 
 - `DataStore` and its documented methods
 - Graph-construction methods and `ds.pipeline.run`
-- `ArtifactRef`, `ArtifactStatus`, `AssayState`, and strict artifact/state errors
+- `ArtifactRef`, `ArtifactStatus`, `PipelineRun`, and strict artifact-resolution errors
 - `EnrichmentResult` and `read_gmt` for gene-set scoring
 - Readers that ingest source formats; writers that create or export Zarr stores (and other exports)
 - `scarf.plotting`
@@ -22,7 +22,7 @@ Prefer calling methods on `DataStore`.
 | Import and export | {doc}`api/import_export` |
 | DataStore (all stages) | {doc}`api/datastore` |
 | Graph construction | {doc}`api/graph_construction` |
-| Artifacts and assay state | {doc}`api/artifacts` |
+| Artifacts, lineage, and summaries | {doc}`api/artifacts` |
 | Analysis pipeline | {doc}`api/pipeline` |
 | Assays and metadata | {doc}`api/assays` |
 | Integration and metrics | {doc}`api/integration` |
@@ -30,4 +30,5 @@ Prefer calling methods on `DataStore`.
 | Plotting | {doc}`api/plotting` |
 | Cytebase and utilities | {doc}`api/utilities` |
 
-{doc}`../scanpy_and_seurat` and {doc}`../tutorials/scrna_seq` describe related workflows; this table is this reference's own grouping and only partially overlaps those pages.
+{doc}`../scanpy`, {doc}`../seurat`, and {doc}`../tutorials/scrna_seq` describe related workflows;
+this table is this reference's own grouping and only partially overlaps those pages.

@@ -6,6 +6,7 @@ from scipy.sparse import csr_matrix
 
 from scarf.datastore.datastore import DataStore
 from scarf.matrix import ChunkedArray
+from scarf.metadata.artifacts import plan_cell_data_artifact, write_cell_data_artifact
 from scarf.plotting.heatmaps import _prepare_marker_heatmap
 from scarf.storage.artifacts import (
     ArtifactRef,
@@ -90,11 +91,10 @@ def test_subset_tfidf_and_feature_summary_match_reference(atac_tfidf_store):
     feat_idx = np.arange(assay.feats.N, dtype=np.int64)
     expected, expected_df = _reference_tfidf(counts, cell_idx, feat_idx)
 
-    selection = store.mark_prevalent_peaks(
+    selection = store.select_prevalent_peaks(
+        store.snapshot_cell_selection("subset"),
         from_assay="ATAC",
-        cell_key="subset",
         top_n=2,
-        label="top_peaks",
     )
     summary_ref = _feature_summary_ref(store, selection)
     summary_status = inspect_artifact(store.zw, summary_ref)
@@ -162,16 +162,15 @@ def test_atac_rejects_log_transform(atac_tfidf_store):
     feature_ref = store.set_feature_selection(
         from_assay="ATAC",
         mask=np.ones(assay.feats.N, dtype=bool),
-        label="normalization_features",
     )
+    cell_selection = store.snapshot_cell_selection("subset")
 
     with pytest.raises(ValueError, match="does not support log_transform"):
         assay.normed(cell_idx, feat_idx, log_transform=True)
     with pytest.raises(ValueError, match="does not support log_transform"):
         store.run_normalization(
-            from_assay="ATAC",
-            cell_key="subset",
-            features=feature_ref,
+            cell_selection,
+            feature_ref,
             log_transform=True,
         )
 
@@ -182,16 +181,32 @@ def test_atac_marker_heatmap_defaults_to_unlogged_tfidf(
 ):
     store, _ = atac_tfidf_store
     assay = store.ATAC
-    store.cells.insert("atac_cluster", np.array([0, 0, 1, 1]), overwrite=True)
     feature_ref = store.set_feature_selection(
         from_assay="ATAC",
         mask=np.ones(assay.feats.N, dtype=bool),
-        label="marker_features",
     )
-    store.run_marker_search(
+    cell_selection = store.snapshot_cell_selection("I")
+    cluster_plan = plan_cell_data_artifact(
+        store.zw,
+        scope="assay",
+        assay="ATAC",
+        kind="cluster_labels",
+        operation="test_atac_clusters",
+        parameters={},
+        inputs={},
+        execution_options={},
+        cell_selection=cell_selection,
+        arrays={"values": ((assay.cells.N,), "i")},
+    )
+    write_cell_data_artifact(
+        store.zw,
+        cluster_plan,
+        {"values": np.array([0, 0, 1, 1])},
+    )
+    clusters = cluster_plan.ref
+    marker = store.run_marker_search(
+        clusters,
         from_assay="ATAC",
-        group_key="atac_cluster",
-        cell_key="I",
         features=feature_ref,
     )
     observed_log_transform: list[bool] = []
@@ -204,9 +219,7 @@ def test_atac_marker_heatmap_defaults_to_unlogged_tfidf(
     monkeypatch.setattr(assay, "normed", recording_normed)
     prepared = _prepare_marker_heatmap(
         store,
-        from_assay="ATAC",
-        group_key="atac_cluster",
-        cell_key="I",
+        marker=marker,
         topn=1,
         log_transform=None,
         vmin=-1,
@@ -223,7 +236,6 @@ def test_run_normalization_uses_explicit_feature_artifact(atac_tfidf_store):
     feature_ref = store.set_feature_selection(
         from_assay="ATAC",
         mask=selected_features,
-        label="two_peaks",
     )
     cell_idx = store.cells.active_index("subset")
     feat_idx = np.flatnonzero(selected_features)
@@ -233,11 +245,11 @@ def test_run_normalization_uses_explicit_feature_artifact(atac_tfidf_store):
         feat_idx,
         renormalize_subset=True,
     )
+    cell_selection = store.snapshot_cell_selection("subset")
 
     normalized = store.run_normalization(
-        from_assay="ATAC",
-        cell_key="subset",
-        features=feature_ref,
+        cell_selection,
+        feature_ref,
         renormalize_subset=True,
     )
 
@@ -352,11 +364,10 @@ def test_custom_normalizer_feature_summary_is_an_artifact(
         pytest.fail("Custom normalizers must not use the TF-IDF fused path")
 
     monkeypatch.setattr(assay, "_streaming_tfidf_feature_stats", fail_fused)
-    selection = store.mark_prevalent_peaks(
+    selection = store.select_prevalent_peaks(
+        store.snapshot_cell_selection("subset"),
         from_assay="ATAC",
-        cell_key="subset",
         top_n=2,
-        label="custom_normalizer_peaks",
     )
     summary = store.load_artifact(_feature_summary_ref(store, selection))
     expected = counts[store.cells.active_index("subset")].sum(axis=0)
@@ -391,11 +402,10 @@ def test_cells_without_accessible_peaks_keep_summary_finite(tmp_path):
     )
     store = _build_store(tmp_path / "atac_empty_cell.zarr", counts)
     store.cells.insert("all_cells", np.ones(4, dtype=bool), overwrite=True)
-    selection = store.mark_prevalent_peaks(
+    selection = store.select_prevalent_peaks(
+        store.snapshot_cell_selection("all_cells"),
         from_assay="ATAC",
-        cell_key="all_cells",
         top_n=2,
-        label="finite_peaks",
     )
     summary = store.load_artifact(_feature_summary_ref(store, selection))
 
@@ -454,15 +464,16 @@ def test_subset_term_counts_require_data_and_handle_empty_corpora(
 
 def test_prevalent_peak_provenance_has_no_version_token(atac_tfidf_store):
     store, _ = atac_tfidf_store
-    ref = store.mark_prevalent_peaks(
+    columns_before = set(store.ATAC.feats.columns)
+    ref = store.select_prevalent_peaks(
+        store.snapshot_cell_selection("subset"),
         from_assay="ATAC",
-        cell_key="subset",
         top_n=2,
-        label="prevalent_contract",
     )
     status = inspect_artifact(store.zw, ref)
 
     assert status.parameters == {"top_n": 2}
     assert set(status.inputs or {}) == {"feature_summary"}
     assert "algorithm_version" not in status.parameters
-    assert store.resolve_features("ATAC", "prevalent_contract") == ref
+    assert store.resolve_features("ATAC", ref) == ref
+    assert set(store.ATAC.feats.columns) == columns_before

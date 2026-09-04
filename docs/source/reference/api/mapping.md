@@ -1,7 +1,19 @@
 # Mapping API reference
 
-A `MappingReference` retains an immutable `feature_selection` reference rather than a feature-key string.
-Query overlap is itself a feature-selection artifact, so mapping provenance follows exact references without reconstructing metadata paths.
+A mapping workflow retains every boundary explicitly:
+
+```python
+reference_ref = reference_ds.build_mapping_reference(neighbors_ref)
+reference = reference_ds.get_mapping_reference(reference_ref)
+query_cells = query_ds.snapshot_cell_selection("I")
+result_ref = query_ds.run_mapping(reference, query_cells)
+result = query_ds.get_mapping_result(result_ref, reference=reference)
+```
+
+`MappingReference` pins the exact feature selection and reference model. Query overlap is another
+feature-selection artifact. `run_mapping` returns only the projection ref; loaders, label-transfer
+methods, score readers, and plots require that ref plus the explicit reference. There is no named
+mapping registry, live `cell_key` routing, omitted-result lookup, or reference fallback.
 
 ```{eval-rst}
 .. autoclass:: scarf.MappingReference

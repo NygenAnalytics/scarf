@@ -6,29 +6,11 @@ from pathlib import Path
 import pytest
 
 from scarf.datastore.datastore import DataStore
-from scarf.graph.encoded_paths import parse_assay_graph_paths
 
 
 _DEFAULT_CORPUS = Path("/home/parashar/data/scarf_master_compat/1k_citeseq")
 _MASTER_COMMIT = "1ce016ed17710b7daebcf187c34c6f9b23aae0b4"
 _FINAL_TREE_DIGEST = "b27aee365d89d6653d0ac5912f0044d6fe78e5f3a5e20bd164824085c441fedd"
-
-_RNA_GRAPH_SMALL = (
-    "RNA/normed__I__compat_hvgs_100/reduction__pca__8__I/"
-    "ann__l2__50__50__48__4466/knn__7/graph__1.0__1.5"
-)
-_RNA_GRAPH_ALTERNATE = (
-    "RNA/normed__I__compat_hvgs_100/reduction__pca__12__I/"
-    "ann__l2__50__50__48__4466/knn__11/graph__1.2__1.3"
-)
-_RNA_GRAPH_HARMONY = (
-    "RNA/normed__I__compat_hvgs_200/reduction__pca__10__I/"
-    "ann__l2__50__50__48__4466/knn__9/graph__1.0__1.5"
-)
-_ADT_GRAPH = (
-    "assay2/normed__I__I/reduction__pca__8__I/"
-    "ann__l2__50__50__48__4466/knn__9/graph__1.0__1.5"
-)
 
 
 def _corpus_root() -> Path:
@@ -60,30 +42,6 @@ def master_citeseq_corpus() -> tuple[Path, dict]:
             "SCARF_MASTER_CITESEQ_CORPUS to its external directory."
         )
     return store, json.loads(manifest_path.read_text())
-
-
-def test_observed_master_graph_paths_remain_diagnostic_only() -> None:
-    small = parse_assay_graph_paths(_RNA_GRAPH_SMALL)
-    alternate = parse_assay_graph_paths(_RNA_GRAPH_ALTERNATE)
-    harmony = parse_assay_graph_paths(_RNA_GRAPH_HARMONY)
-    adt = parse_assay_graph_paths(_ADT_GRAPH)
-
-    assert (small.dims, small.k, small.local_connectivity, small.bandwidth) == (
-        8,
-        7,
-        1.0,
-        1.5,
-    )
-    assert (
-        alternate.dims,
-        alternate.k,
-        alternate.local_connectivity,
-        alternate.bandwidth,
-    ) == (12, 11, 1.2, 1.3)
-    assert harmony.harmony_contract_hash is None
-    assert harmony.k == 9
-    assert adt.from_assay == "assay2"
-    assert adt.feat_key == "I"
 
 
 @pytest.mark.integration

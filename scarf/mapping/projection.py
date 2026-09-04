@@ -19,18 +19,21 @@ from ..storage.artifact_writer import (
 from ..storage.artifacts import (
     ArtifactRef,
     ExternalArtifactRef,
+    ValueFingerprintBuilder,
     artifact_group,
+    canonical_bytes,
     fingerprint_array,
+    fingerprint_stored_arrays,
     inspect_artifact,
-    list_artifacts,
 )
 from ..storage.errors import ArtifactResolutionError
 from ..storage.feature_selection import resolve_feature_selection
 from ..storage.geometry import array_geometry
 from ..storage.partition import row_band
 from ..storage.profiles import StorageProfile
+from ..storage.selections import validate_stored_selection_integrity
 from ..storage.types import as_zarr_array
-from .models import MappingResult
+from .models import MappingResult, _MappingResultAxes
 from .reference import MappingReference
 
 PROJECTION_RERUN_MESSAGE = "Re-run run_mapping to create a new query projection."
@@ -38,7 +41,6 @@ NO_QUERY_BATCH_FINGERPRINT = fingerprint_array(np.empty(0, dtype=np.int64))
 
 _PARAMETER_NAMES = frozenset(
     {
-        "mapping_name",
         "save_k",
         "missing_feature_policy",
         "correction_method",
@@ -50,6 +52,7 @@ _INPUT_NAMES = frozenset(
         "feature_selection",
         "selected_expression_fingerprint",
         "query_batch_fingerprint",
+        "query_batch_count",
         "mapping_reference",
     }
 )
@@ -70,8 +73,10 @@ _ATTRIBUTE_NAMES = frozenset(
         "provenance",
         "execution_options",
         "created_at_ns",
+        "scarf_version",
         "complete",
         "diagnostics",
+        "payload_fingerprint",
     }
 )
 
@@ -84,6 +89,9 @@ class ProjectionPlan:
     n_cells: int
     save_k: int
     reference_cell_count: int
+    query_batch_count: int
+    feature_coverage: float
+    algorithm_variant: str
 
     @property
     def ref(self) -> ArtifactRef:
@@ -240,8 +248,15 @@ class ProjectionWriter:
                 diagnostics,
                 n_cells=self._plan.n_cells,
                 uninformative_count=self._uninformative_count,
+                expected_feature_coverage=self._plan.feature_coverage,
+                expected_algorithm_variant=self._plan.algorithm_variant,
+                expected_query_batch_count=self._plan.query_batch_count,
             )
             self._group.attrs["diagnostics"] = validated
+            self._group.attrs["payload_fingerprint"] = _payload_fingerprint(
+                self._group,
+                validated,
+            )
             finish_artifact(self._group, self._plan.artifact)
         except BaseException:
             self._group.attrs["complete"] = False
@@ -268,7 +283,6 @@ def plan_projection(
     root: zarr.Group,
     *,
     query_assay: str,
-    mapping_name: str,
     n_cells: int,
     save_k: int,
     missing_feature_policy: str,
@@ -277,13 +291,14 @@ def plan_projection(
     feature_selection: ArtifactRef,
     selected_expression_fingerprint: str,
     query_batch_fingerprint: str,
+    query_batch_count: int,
     mapping_reference: ExternalArtifactRef,
+    reference: MappingReference,
     reference_cell_count: int,
     invalidate_cache: bool = False,
 ) -> ProjectionPlan:
     """Plan one immutable query-owned projection."""
     assay = _nonempty_string(query_assay, "query_assay")
-    name = _nonempty_string(mapping_name, "mapping_name")
     resolved_n_cells = _positive_int(n_cells, "n_cells")
     resolved_save_k = _positive_int(save_k, "save_k")
     resolved_reference_cell_count = _positive_int(
@@ -296,6 +311,8 @@ def plan_projection(
             "missing_feature_policy must be 'reference_mean', 'zero', or 'error'"
         )
     correction = _nonempty_string(correction_method, "correction_method")
+    if correction not in {"none", "symphony"}:
+        raise ValueError("correction_method must be 'none' or 'symphony'")
     expression_fingerprint = _nonempty_string(
         selected_expression_fingerprint,
         "selected_expression_fingerprint",
@@ -304,18 +321,37 @@ def plan_projection(
         query_batch_fingerprint,
         "query_batch_fingerprint",
     )
-    _validate_local_selection(
+    resolved_query_batch_count = _positive_int(
+        query_batch_count,
+        "query_batch_count",
+    )
+    if resolved_query_batch_count > resolved_n_cells:
+        raise ValueError("query_batch_count cannot exceed n_cells")
+    external = _validate_external_mapping_reference(mapping_reference)
+    if not isinstance(reference, MappingReference):
+        raise TypeError("reference must be a MappingReference")
+    reference.validate_dataset_fingerprint()
+    if external != reference.external_ref:
+        raise ValueError("mapping_reference does not match reference")
+    if resolved_reference_cell_count != reference.selected_cell_count:
+        raise ValueError("reference_cell_count does not match reference")
+    expected_correction = "symphony" if reference.method == "symphony" else "none"
+    if correction != expected_correction:
+        raise ValueError("correction_method does not match reference")
+    validated_cells = _validate_cell_selection(
         root,
         cell_selection,
-        kind="cell_selection",
-        scope="datastore",
-        assay=None,
     )
-    selected_cells = _selection_count(root, cell_selection)
-    if selected_cells != resolved_n_cells:
+    if validated_cells.selected_count != resolved_n_cells:
         raise ValueError("n_cells must equal the selected row count in cell_selection")
-    resolve_feature_selection(root, assay, feature_selection)
-    external = _validate_external_mapping_reference(mapping_reference)
+    feature_coverage = _validate_mapping_overlap_selection(
+        root,
+        assay,
+        feature_selection,
+        mapping_reference=external,
+        reference_feature_ids=reference.feature_ids,
+    )
+    algorithm_variant = "symphony" if correction == "symphony" else "scaled_pca"
 
     def valid_projection(_ref: ArtifactRef, group: zarr.Group) -> bool:
         try:
@@ -324,6 +360,9 @@ def plan_projection(
                 expected_n_cells=resolved_n_cells,
                 expected_save_k=resolved_save_k,
                 reference_cell_count=resolved_reference_cell_count,
+                expected_feature_coverage=feature_coverage,
+                expected_algorithm_variant=algorithm_variant,
+                expected_query_batch_count=resolved_query_batch_count,
             )
         except (KeyError, RuntimeError, TypeError, ValueError):
             return False
@@ -336,7 +375,6 @@ def plan_projection(
         kind="projection",
         operation="map_query",
         parameters={
-            "mapping_name": name,
             "save_k": resolved_save_k,
             "missing_feature_policy": policy,
             "correction_method": correction,
@@ -346,6 +384,7 @@ def plan_projection(
             "feature_selection": feature_selection,
             "selected_expression_fingerprint": expression_fingerprint,
             "query_batch_fingerprint": batch_fingerprint,
+            "query_batch_count": resolved_query_batch_count,
             "mapping_reference": external,
         },
         execution_options={},
@@ -369,6 +408,7 @@ def plan_projection(
         ),
         required_attributes=(
             AttributeRequirement("diagnostics", expected_types=(dict,)),
+            AttributeRequirement("payload_fingerprint", expected_types=(str,)),
         ),
         reuse_validator=valid_projection,
     )
@@ -377,6 +417,9 @@ def plan_projection(
         n_cells=resolved_n_cells,
         save_k=resolved_save_k,
         reference_cell_count=resolved_reference_cell_count,
+        query_batch_count=resolved_query_batch_count,
+        feature_coverage=feature_coverage,
+        algorithm_variant=algorithm_variant,
     )
 
 
@@ -384,14 +427,14 @@ def load_projection(
     root: zarr.Group,
     ref: ArtifactRef,
     *,
+    reference: MappingReference,
     load_arrays: bool = False,
-    reference: MappingReference | None = None,
 ) -> MappingResult:
     """Load a query projection after validating the complete contract."""
     if not isinstance(load_arrays, bool):
         raise TypeError("load_arrays must be a boolean")
-    if reference is not None and not isinstance(reference, MappingReference):
-        raise TypeError("reference must be a MappingReference or None")
+    if not isinstance(reference, MappingReference):
+        raise TypeError("reference must be a MappingReference")
     try:
         return _load_projection(
             root,
@@ -405,67 +448,12 @@ def load_projection(
         raise _contract_error(str(exc)) from None
 
 
-def resolve_projection(
-    root: zarr.Group,
-    *,
-    query_assay: str,
-    mapping_name: str,
-    mapping_reference: ExternalArtifactRef,
-) -> ArtifactRef:
-    """Resolve the newest projection for one query name and reference."""
-    try:
-        assay = _nonempty_string(query_assay, "query_assay")
-        name = _nonempty_string(mapping_name, "mapping_name")
-        external = _validate_external_mapping_reference(mapping_reference)
-        candidates: list[tuple[int, ArtifactRef]] = []
-        for ref in list_artifacts(
-            root,
-            scope="assay",
-            assay=assay,
-            kind="projection",
-        ):
-            status = inspect_artifact(root, ref)
-            if not status.complete or status.operation != "map_query":
-                continue
-            parameters = status.parameters or {}
-            if parameters.get("mapping_name") != name:
-                continue
-            if set(parameters) != _PARAMETER_NAMES:
-                raise ValueError(
-                    f"Projection {name!r} has malformed map_query parameters"
-                )
-            inputs = status.inputs or {}
-            if set(inputs) != _INPUT_NAMES:
-                raise ValueError(f"Projection {name!r} has malformed map_query inputs")
-            raw_external = inputs["mapping_reference"]
-            if not isinstance(raw_external, Mapping):
-                raise TypeError("Projection mapping_reference input is malformed")
-            stored_external = ExternalArtifactRef.from_dict(raw_external)
-            _validate_external_mapping_reference(stored_external)
-            if stored_external != external:
-                continue
-            group = artifact_group(root, ref)
-            created_at_ns = _created_at_ns(group)
-            candidates.append((created_at_ns, ref))
-        if not candidates:
-            raise ValueError(
-                f"No complete projection named {name!r} matches the reference"
-            )
-        candidates.sort(
-            key=lambda item: (item[0], item[1].artifact_id),
-            reverse=True,
-        )
-        return candidates[0][1]
-    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
-        raise _contract_error(str(exc)) from None
-
-
 def _load_projection(
     root: zarr.Group,
     ref: ArtifactRef,
     *,
     load_arrays: bool,
-    reference: MappingReference | None,
+    reference: MappingReference,
 ) -> MappingResult:
     assay = _validate_projection_ref(ref)
     status = inspect_artifact(root, ref)
@@ -477,7 +465,6 @@ def _load_projection(
     parameters = status.parameters or {}
     if set(parameters) != _PARAMETER_NAMES:
         raise ValueError("Projection parameters do not match the map_query contract")
-    mapping_name = _nonempty_string(parameters["mapping_name"], "mapping_name")
     save_k = _positive_int(parameters["save_k"], "save_k")
     policy = _nonempty_string(
         parameters["missing_feature_policy"],
@@ -489,6 +476,8 @@ def _load_projection(
         parameters["correction_method"],
         "correction_method",
     )
+    if correction_method not in {"none", "symphony"}:
+        raise ValueError("Projection correction_method is unsupported")
 
     inputs = status.inputs or {}
     if set(inputs) != _INPUT_NAMES:
@@ -515,41 +504,55 @@ def _load_projection(
         inputs["query_batch_fingerprint"],
         "query_batch_fingerprint",
     )
+    query_batch_count = _positive_int(
+        inputs["query_batch_count"],
+        "query_batch_count",
+    )
     raw_external = inputs["mapping_reference"]
     if not isinstance(raw_external, Mapping):
         raise TypeError("Projection mapping_reference input is malformed")
     external = _validate_external_mapping_reference(
         ExternalArtifactRef.from_dict(raw_external)
     )
-    reference_cell_count = None
-    if reference is not None:
-        reference.validate_dataset_fingerprint()
-        provided_external = reference.external_ref
-        if provided_external != external:
-            raise ValueError(
-                "Provided mapping reference does not match the projection input; "
-                f"expected {external!r}, received {provided_external!r}"
-            )
-        reference_cell_count = _positive_int(
-            reference.selected_cell_count,
-            "Mapping reference selected_cell_count",
+    reference.validate_dataset_fingerprint()
+    provided_external = reference.external_ref
+    if provided_external != external:
+        raise ValueError(
+            "Provided mapping reference does not match the projection input; "
+            f"expected {external!r}, received {provided_external!r}"
         )
-    _validate_local_selection(
+    expected_correction = "symphony" if reference.method == "symphony" else "none"
+    if correction_method != expected_correction:
+        raise ValueError(
+            "Projection correction method does not match its mapping reference"
+        )
+    reference_cell_count = _positive_int(
+        reference.selected_cell_count,
+        "Mapping reference selected_cell_count",
+    )
+    validated_cells = _validate_cell_selection(
         root,
         cell_selection,
-        kind="cell_selection",
-        scope="datastore",
-        assay=None,
     )
-    resolve_feature_selection(root, assay, feature_selection)
+    feature_coverage = _validate_mapping_overlap_selection(
+        root,
+        assay,
+        feature_selection,
+        mapping_reference=external,
+        reference_feature_ids=reference.feature_ids,
+    )
+    algorithm_variant = "symphony" if correction_method == "symphony" else "scaled_pca"
 
     group = artifact_group(root, ref)
     n_cells, diagnostics = _validate_payload(
         group,
         expected_save_k=save_k,
         reference_cell_count=reference_cell_count,
+        expected_feature_coverage=feature_coverage,
+        expected_algorithm_variant=algorithm_variant,
+        expected_query_batch_count=query_batch_count,
     )
-    if _selection_count(root, cell_selection) != n_cells:
+    if validated_cells.selected_count != n_cells:
         raise ValueError("Projection rows do not match the stored query cell selection")
 
     indices = distances = uninformative = None
@@ -566,9 +569,8 @@ def _load_projection(
             as_zarr_array(group["uninformative"], name="uninformative")[:],
             copy=True,
         )
-    return MappingResult(
+    result = MappingResult(
         ref=ref,
-        mapping_name=mapping_name,
         n_cells=n_cells,
         correction_method=correction_method,
         diagnostics=diagnostics,
@@ -577,6 +579,15 @@ def _load_projection(
         uninformative=uninformative,
         reference=reference,
     )
+    object.__setattr__(
+        result,
+        "_axes",
+        _MappingResultAxes(
+            cell_selection=cell_selection,
+            feature_selection=feature_selection,
+        ),
+    )
+    return result
 
 
 def _validate_payload(
@@ -585,6 +596,9 @@ def _validate_payload(
     expected_n_cells: int | None = None,
     expected_save_k: int | None = None,
     reference_cell_count: int | None = None,
+    expected_feature_coverage: float | None = None,
+    expected_algorithm_variant: str | None = None,
+    expected_query_batch_count: int | None = None,
 ) -> tuple[int, dict[str, float | int | str]]:
     if set(group.group_keys()):
         raise ValueError("Projection payload contains unexpected groups")
@@ -608,6 +622,8 @@ def _validate_payload(
         group["uninformative"],
         name="uninformative",
     )
+    if any(set(array.attrs) for array in (indices, distances, uninformative)):
+        raise ValueError("Projection array attributes do not match the contract")
     if indices.ndim != 2 or indices.shape[0] < 1 or indices.shape[1] < 1:
         raise ValueError("Projection indices must be a non-empty matrix")
     if np.dtype(indices.dtype).kind != "u":
@@ -657,8 +673,31 @@ def _validate_payload(
         raw_diagnostics,
         n_cells=n_cells,
         uninformative_count=uninformative_count,
+        expected_feature_coverage=expected_feature_coverage,
+        expected_algorithm_variant=expected_algorithm_variant,
+        expected_query_batch_count=expected_query_batch_count,
     )
+    stored_fingerprint = group.attrs["payload_fingerprint"]
+    if (
+        not isinstance(stored_fingerprint, str)
+        or not stored_fingerprint
+        or stored_fingerprint != _payload_fingerprint(group, diagnostics)
+    ):
+        raise ValueError("Projection payload fingerprint does not match stored output")
     return n_cells, diagnostics
+
+
+def _payload_fingerprint(
+    group: zarr.Group,
+    diagnostics: Mapping[str, Any],
+) -> str:
+    builder = ValueFingerprintBuilder()
+    builder.update_bytes(
+        "arrays",
+        fingerprint_stored_arrays(group, tuple(sorted(_ARRAY_NAMES))).encode(),
+    )
+    builder.update_bytes("diagnostics", canonical_bytes(diagnostics))
+    return builder.hexdigest()
 
 
 def _validated_diagnostics(
@@ -666,6 +705,9 @@ def _validated_diagnostics(
     *,
     n_cells: int,
     uninformative_count: int,
+    expected_feature_coverage: float | None = None,
+    expected_algorithm_variant: str | None = None,
+    expected_query_batch_count: int | None = None,
 ) -> dict[str, float | int | str]:
     if set(diagnostics) != _DIAGNOSTIC_NAMES:
         missing = sorted(_DIAGNOSTIC_NAMES - set(diagnostics))
@@ -683,16 +725,33 @@ def _validated_diagnostics(
         or not 0 < float(feature_coverage) <= 1
     ):
         raise ValueError("featureCoverage must be a finite float in (0, 1]")
+    if expected_feature_coverage is not None and not np.isclose(
+        float(feature_coverage),
+        expected_feature_coverage,
+        rtol=0.0,
+        atol=np.finfo(np.float64).eps,
+    ):
+        raise ValueError("featureCoverage does not match the reference overlap")
     query_batch_count = _positive_int(
         diagnostics["queryBatchCount"],
         "queryBatchCount",
     )
     if query_batch_count > n_cells:
         raise ValueError("queryBatchCount cannot exceed the projection cell count")
+    if (
+        expected_query_batch_count is not None
+        and query_batch_count != expected_query_batch_count
+    ):
+        raise ValueError("queryBatchCount does not match the query-batch input")
     algorithm_variant = _nonempty_string(
         diagnostics["algorithmVariant"],
         "algorithmVariant",
     )
+    if (
+        expected_algorithm_variant is not None
+        and algorithm_variant != expected_algorithm_variant
+    ):
+        raise ValueError("algorithmVariant does not match the correction method")
     zero_norm_count = _nonnegative_int(
         diagnostics["zeroNormCellCount"],
         "zeroNormCellCount",
@@ -741,6 +800,71 @@ def _validate_external_mapping_reference(
     return reference
 
 
+def _validate_mapping_overlap_selection(
+    root: zarr.Group,
+    assay: str,
+    ref: ArtifactRef,
+    *,
+    mapping_reference: ExternalArtifactRef,
+    reference_feature_ids: np.ndarray,
+) -> float:
+    """Validate the mapping-specific feature-selection lineage and values."""
+    resolve_feature_selection(root, assay, ref)
+    status = inspect_artifact(root, ref)
+    if status.operation != "select_mapping_overlap":
+        raise ValueError(
+            "Projection feature selection was not produced by select_mapping_overlap"
+        )
+    raw_reference = (status.inputs or {}).get("mapping_reference")
+    if not isinstance(raw_reference, Mapping):
+        raise ValueError("Projection feature-selection reference is malformed")
+    try:
+        selection_reference = ExternalArtifactRef.from_dict(raw_reference)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Projection feature-selection reference is malformed") from exc
+    if selection_reference != mapping_reference:
+        raise ValueError(
+            "Projection feature selection belongs to a different mapping reference"
+        )
+    raw_reference_ids = np.asarray(reference_feature_ids)
+    if raw_reference_ids.ndim != 1 or raw_reference_ids.size == 0:
+        raise ValueError("Mapping reference feature identifiers are malformed")
+    reference_ids = raw_reference_ids.astype(str)
+    reference_id_set = set(reference_ids.tolist())
+    feature_ids = as_zarr_array(
+        root[f"{assay}/featureData/ids"],
+        name=f"{assay}/featureData/ids",
+    )
+    values = as_zarr_array(
+        artifact_group(root, ref)["values"],
+        name="feature_selection.values",
+    )
+    block_rows = min(
+        row_band(array_geometry(feature_ids), unit="chunk", fallback=1),
+        row_band(array_geometry(values), unit="chunk", fallback=1),
+    )
+    overlap_count = 0
+    for start in range(0, int(feature_ids.shape[0]), block_rows):
+        stop = min(start + block_rows, int(feature_ids.shape[0]))
+        query_ids = np.asarray(feature_ids[start:stop]).astype(str)
+        expected = np.fromiter(
+            (identifier in reference_id_set for identifier in query_ids),
+            dtype=bool,
+            count=len(query_ids),
+        )
+        overlap_count += int(np.count_nonzero(expected))
+        if not np.array_equal(
+            np.asarray(values[start:stop], dtype=bool),
+            expected,
+        ):
+            raise ValueError(
+                "Projection feature selection does not match the reference overlap"
+            )
+    if overlap_count == 0:
+        raise ValueError("Projection feature selection has no reference overlap")
+    return float(overlap_count / len(reference_ids))
+
+
 def _local_ref_from_input(
     inputs: Mapping[str, Any],
     name: str,
@@ -786,17 +910,23 @@ def _validate_local_selection(
         raise TypeError(f"{kind} values must be a boolean row vector")
 
 
-def _selection_count(root: zarr.Group, ref: ArtifactRef) -> int:
-    values = as_zarr_array(
-        artifact_group(root, ref)["values"],
-        name=f"{ref.kind}.values",
+def _validate_cell_selection(root: zarr.Group, ref: ArtifactRef) -> Any:
+    """Validate a query selection against its immutable payload and row axis."""
+    _validate_local_selection(
+        root,
+        ref,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
     )
-    block_rows = row_band(array_geometry(values), unit="chunk", fallback=1)
-    selected = 0
-    for start in range(0, int(values.shape[0]), block_rows):
-        stop = min(start + block_rows, int(values.shape[0]))
-        selected += int(np.count_nonzero(np.asarray(values[start:stop], dtype=bool)))
-    return selected
+    return validate_stored_selection_integrity(
+        root,
+        ref,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+    )
 
 
 def _created_at_ns(group: zarr.Group) -> int:

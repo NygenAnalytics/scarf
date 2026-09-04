@@ -7,11 +7,14 @@ import zarr
 from zarr.storage import MemoryStore
 
 import scarf
-from scarf.graph.state import validate_cell_selection_artifact
 from scarf.storage.artifacts import artifact_path
 from scarf.storage.errors import ArtifactResolutionError
 from scarf.storage.refs import ArtifactRef
-from scarf.storage.selections import resolve_selection_artifact
+from scarf.storage.selections import (
+    resolve_selection_artifact,
+    validate_stored_selection_integrity,
+    validate_stored_selection_live_alias,
+)
 
 
 def _root_with_selection() -> tuple[zarr.Group, MemoryStore, ArtifactRef]:
@@ -44,9 +47,30 @@ def _assert_resolution_error(
     store: MemoryStore,
     ref: ArtifactRef,
     code: str,
+    *,
+    live_alias: bool = False,
 ) -> ArtifactResolutionError:
     with pytest.raises(ArtifactResolutionError) as caught:
-        validate_cell_selection_artifact(_read_only_root(store), ref, "I")
+        root = _read_only_root(store)
+        if live_alias:
+            validate_stored_selection_live_alias(
+                root,
+                ref,
+                kind="cell_selection",
+                scope="datastore",
+                assay=None,
+                table_path="cellData",
+                column="I",
+            )
+        else:
+            validate_stored_selection_integrity(
+                root,
+                ref,
+                kind="cell_selection",
+                scope="datastore",
+                assay=None,
+                table_path="cellData",
+            )
 
     error = caught.value
     assert isinstance(error, ValueError)
@@ -59,7 +83,14 @@ def _assert_resolution_error(
 def test_selection_validation_is_read_only() -> None:
     _, store, ref = _root_with_selection()
 
-    validate_cell_selection_artifact(_read_only_root(store), ref, "I")
+    validate_stored_selection_integrity(
+        _read_only_root(store),
+        ref,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+    )
 
 
 def test_selection_error_for_reference_mismatch() -> None:
@@ -118,7 +149,12 @@ def test_selection_error_for_missing_column() -> None:
     root, store, ref = _root_with_selection()
     del root["cellData/I"]
 
-    error = _assert_resolution_error(store, ref, "selection_column_missing")
+    error = _assert_resolution_error(
+        store,
+        ref,
+        "selection_column_missing",
+        live_alias=True,
+    )
 
     assert error.context["column"] == "I"
 
@@ -154,7 +190,12 @@ def test_selection_error_for_changed_values() -> None:
     root, store, ref = _root_with_selection()
     root["cellData/I"][:] = np.array([False, True, False])
 
-    error = _assert_resolution_error(store, ref, "selection_values_changed")
+    error = _assert_resolution_error(
+        store,
+        ref,
+        "selection_values_changed",
+        live_alias=True,
+    )
 
     assert "no longer matches" in str(error)
 

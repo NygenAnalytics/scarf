@@ -16,8 +16,9 @@ kernelspec:
 
 # Provenance and reuse
 
-This tutorial shows when Scarf will {term}`reuse` a completed {term}`artifact` and when it builds a new one.
-Read {doc}`../concepts/provenance` for the rules that decide which of the two happens.
+This is the focused guide to artifact mechanics. It shows how to reopen one exact result, branch a
+parameter, identify reused work, force recomputation, and compare lineage. Read
+{doc}`../concepts/provenance` first for the short mental model.
 
 ## Prerequisites
 
@@ -32,62 +33,57 @@ Read {doc}`../concepts/provenance` for the rules that decide which of the two ha
 
 ## Dataset
 
-Structurally repack the published store into a temporary source with the current RNA count layout, then mount its count matrices into a fresh page-local target.
-This keeps the published source untouched and ensures every lineage node below is created under the current artifact contract.
+The rebuilt PBMC store carries a completed pipeline run labelled `docs_default`. Its exact
+selection, normalization, PCA, neighbour, and graph refs provide the baseline. This page creates
+only the parameter forks needed to demonstrate reuse.
 
 ```{code-cell} ipython3
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
 import scarf
-from scarf.tools.repack_zarr import repack_store
-
-scarf.configure_output(level='WARNING', progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    'tenx_5K_pbmc_rnaseq',
-    destination='scarf_datasets',
+    "tenx_5K_pbmc_rnaseq",
+    destination="scarf_datasets",
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-repacked_counts_path = Path(analysis_directory.name) / 'counts.zarr'
-analysis_path = Path(analysis_directory.name) / 'reuse_and_tracing.zarr'
-repack_store(
-    f'{dataset}/data.zarr',
-    str(repacked_counts_path),
-    nthreads=2,
-)
-ds = scarf.mount_datastore(
-    str(repacked_counts_path),
-    at=str(analysis_path),
-    default_assay='RNA',
-    nthreads=4,
-    min_features_per_cell=10,
-)
-ds.filter_cells(
-    attrs=['RNA_nCounts', 'RNA_nFeatures'],
-    highs=[15000, 4000],
-    lows=[1000, 500],
-    reset_previous=True,
-)
-# Remake HVGs after this tutorial's cell filter so lineage does not pull in a
-# feature selection that was computed under an earlier cell mask on the store.
-hvg_ref = ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+baseline_run = ds.pipeline.open(label="docs_default")
+cell_selection = baseline_run["analysis_cell_selection"]
+hvg_ref = baseline_run["highly_variable_features"]
 ```
 
-## 1. Build a baseline chain
+## 1. Open and inspect the baseline chain
 
-Keep `update_state=False` so side comparisons do not replace the current {term}`analysis chain` until you choose a branch.
+The completed run retains every immutable reference needed to keep side comparisons separate.
 
 ```{code-cell} ipython3
-normalized = ds.run_normalization(
-    features=hvg_ref,
-    update_state=False,
+normalized = baseline_run["normalized"]
+pca = baseline_run["pca"]
+ann = baseline_run["ann_index"]
+neighbors_k11 = baseline_run["neighbors"]
+graph_k11 = baseline_run["connectivity_map"]
+```
+
+The catalog can also find results by exact provenance predicates. It returns every match and never
+chooses a latest result, so one-item destructuring is an explicit cardinality check:
+
+```{code-cell} ipython3
+[reopened_graph] = ds.list_artifacts(
+    from_assay="RNA",
+    kind="connectivity_map",
+    operation="build_connectivity_map",
+    inputs={"neighbors": neighbors_k11},
+    complete_only=True,
 )
-pca = ds.run_pca(normalized, dims=15, update_state=False)
-ann = ds.build_ann_index(pca, update_state=False)
-neighbors_k11 = ds.query_neighbors(ann, k=11, update_state=False)
-graph_k11 = ds.build_connectivity_map(neighbors_k11, update_state=False)
+assert reopened_graph == graph_k11
+
+status = ds.inspect_artifact(reopened_graph)
+{
+    "operation": status.operation,
+    "parameters": status.parameters,
+    "inputs": status.inputs,
+    "complete": status.complete,
+}
 ```
 
 ## 2. Vary `k`: reuse upstream
@@ -96,27 +92,20 @@ A new neighbor count changes only the neighbors and connectivity {term}`provenan
 The normalization, PCA, and ANN references are unchanged.
 
 ```{code-cell} ipython3
-neighbors_k15 = ds.query_neighbors(ann, k=15, update_state=False)
-graph_k15 = ds.build_connectivity_map(neighbors_k15, update_state=False)
+neighbors_k15 = ds.query_neighbors(ann, k=15)
+graph_k15 = ds.build_connectivity_map(neighbors_k15)
 
-print('normalization reused:', ds.run_normalization(features=hvg_ref, update_state=False) == normalized)
-print('PCA reused:', ds.run_pca(normalized, dims=15, update_state=False) == pca)
-print('ANN index reused:', ds.build_ann_index(pca, update_state=False) == ann)
-print('neighbors recomputed:', neighbors_k15 != neighbors_k11)
-print('graph recomputed:', graph_k15 != graph_k11)
+{
+    "normalization reused": ds.run_normalization(cell_selection, hvg_ref) == normalized,
+    "PCA reused": ds.run_pca(normalized, dims=15) == pca,
+    "ANN index reused": ds.build_ann_index(pca) == ann,
+    "neighbors recomputed": neighbors_k15 != neighbors_k11,
+    "graph recomputed": graph_k15 != graph_k11,
+}
 ```
 
-Degree and edge-weight distributions shift with `k` even though the upstream artifacts are identical:
-
-```{code-cell} ipython3
-import scarf.plotting as splt
-
-matrix_k11 = ds.load_graph(graph=graph_k11)
-matrix_k15 = ds.load_graph(graph=graph_k15)
-print('edges (nnz):', {'k11': matrix_k11.nnz, 'k15': matrix_k15.nnz})
-splt.graph_qc(matrix_k11)
-splt.graph_qc(matrix_k15)
-```
+The graph-construction guide owns the scientific effect of changing `k`. Here the important result
+is where the immutable branch begins.
 
 ## 3. Vary `dims`: invalidate downstream
 
@@ -124,16 +113,17 @@ A new PCA dimensionality creates a new reduction.
 ANN, neighbors, and connectivity that depend on the old reduction are not reused for the new chain.
 
 ```{code-cell} ipython3
-pca_dims20 = ds.run_pca(normalized, dims=20, update_state=False)
-ann_dims20 = ds.build_ann_index(pca_dims20, update_state=False)
-neighbors_dims20 = ds.query_neighbors(ann_dims20, k=11, update_state=False)
-graph_dims20 = ds.build_connectivity_map(neighbors_dims20, update_state=False)
+pca_dims20 = ds.run_pca(normalized, dims=20)
+ann_dims20 = ds.build_ann_index(pca_dims20)
+neighbors_dims20 = ds.query_neighbors(ann_dims20, k=11)
+graph_dims20 = ds.build_connectivity_map(neighbors_dims20)
 
-print('PCA recomputed:', pca_dims20 != pca)
-print('ANN index recomputed:', ann_dims20 != ann)
-print('neighbors recomputed:', neighbors_dims20 != neighbors_k11)
-print('graph recomputed:', graph_dims20 != graph_k11)
-print('normalization reused:', ds.run_normalization(features=hvg_ref, update_state=False) == normalized)
+{
+    "PCA recomputed": pca_dims20 != pca,
+    "ANN index recomputed": ann_dims20 != ann,
+    "neighbors recomputed": neighbors_dims20 != neighbors_k11,
+    "graph recomputed": graph_dims20 != graph_k11,
+}
 ```
 
 ## 4. Force recompute
@@ -143,41 +133,43 @@ Previously completed artifacts remain on disk.
 The new reference has a different id and path.
 The operation and parameters stay the same.
 
-For normalization, `invalidate_cache` writes a fresh normalized artifact while retaining the exact immutable `cell_selection` and `feature_selection` inputs:
+For normalization, the call below would write a fresh normalized artifact while retaining the
+exact immutable `cell_selection` and `feature_selection` inputs. It is not executed here because a
+throwaway duplicate adds no evidence to the lineage figure.
 
-```{code-cell} ipython3
+```python
 forced = ds.run_normalization(
-    features=hvg_ref,
-    update_state=False,
+    cell_selection,
+    hvg_ref,
     invalidate_cache=True,
 )
 status = ds.inspect_artifact(forced)
-baseline = ds.inspect_artifact(normalized)
-baseline_inputs = baseline.inputs or {}
+baseline_status = ds.inspect_artifact(normalized)
+baseline_inputs = baseline_status.inputs or {}
 forced_inputs = status.inputs or {}
 
-print('new artifact:', forced != normalized)
-print('complete:', status.complete)
-print('operation:', status.operation)
-print('path:', status.path)
-print('baseline path:', baseline.path)
-print('same parameters:', status.parameters == baseline.parameters)
-print('same input roles:', set(baseline_inputs) == set(forced_inputs))
-print('same inputs:', forced_inputs == baseline_inputs)
+{
+    "new artifact": forced != normalized,
+    "complete": status.complete,
+    "operation": status.operation,
+    "path": status.path,
+    "baseline path": baseline_status.path,
+    "same parameters": status.parameters == baseline_status.parameters,
+    "same inputs": forced_inputs == baseline_inputs,
+}
 ```
 
 ## 5. Compare lineage
 
 Build one read-only report from both neighbour-count branches and the `dims=20` fork.
 Shared upstream nodes appear once; the forks show where each branch diverged.
-Because HVGs were remade after this page's cell filter, the graph should not include an older mito filter that lived on the shared store:
 
 ```{code-cell} ipython3
 lineage = ds.lineage(
     {
-        'k11 graph': graph_k11,
-        'k15 graph': graph_k15,
-        'dims20 graph': graph_dims20,
+        "k11 graph": graph_k11,
+        "k15 graph": graph_k15,
+        "dims20 graph": graph_dims20,
     }
 )
 lineage
@@ -188,12 +180,12 @@ The `k` branches should diverge after the ANN index.
 The `dims=20` branch should fork earlier, at PCA, then carry its own ANN, neighbours, and graph.
 
 Export the same report when it needs to travel with an analysis.
-`to_markdown()` is what notebook display uses; showing it here makes that export explicit:
+`to_markdown()` is what notebook display uses. Inspect a short preview before writing or sending
+the complete string elsewhere:
 
 ```{code-cell} ipython3
-from IPython.display import Markdown
-
-Markdown(lineage.to_markdown())
+lineage_markdown = lineage.to_markdown()
+lineage_markdown.splitlines()[:12]
 ```
 
 `lineage.to_mermaid()` returns only the diagram source when a tooling pipeline needs that form alone.

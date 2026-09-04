@@ -8,10 +8,9 @@ import pandas as pd
 
 from ..assay import ATACassay
 from ..features.markers.table import load_marker_table
-from ..storage.artifacts import ArtifactRef, artifact_path, inspect_artifact
+from ..storage.artifacts import ArtifactRef, artifact_path
+from ..storage.selections import read_stored_selection_indices
 from ..storage.types import as_zarr_array, as_zarr_group
-from ..matrix import ChunkedArray
-from ..utils.arrays import array_digest
 from ..utils.logging import logger
 from ._contracts import CategoricalScale, ColorScale, PlotProvenance
 from ._deps import require_matplotlib, require_seaborn
@@ -119,41 +118,49 @@ def _clip_marker_means(
 def _prepare_marker_heatmap(
     store: Any,
     *,
-    from_assay: str | None,
-    group_key: str | None,
-    cell_key: str | None,
-    marker: ArtifactRef | None = None,
+    marker: ArtifactRef,
     topn: int,
     log_transform: bool | None,
     vmin: float,
     vmax: float,
 ) -> dict[str, Any]:
-    assay = store._get_assay(from_assay)
-    if group_key is None:
-        raise ValueError("ERROR: Please provide a value for `group_key`")
-    if cell_key is None:
-        cell_key = "I"
-
-    assay_group = as_zarr_group(store.zw[assay.name], name=assay.name)
-    if "markers" not in assay_group:
-        raise KeyError("ERROR: Please run `run_marker_search` first")
-    try:
-        marker_slot = store._resolve_marker_group(
-            assay.name,
-            cell_key,
-            group_key,
-            marker,
-        )
-    except KeyError:
-        raise KeyError(
-            "ERROR: Please run `run_marker_search` first with "
-            f"{group_key} as `group_key` and {cell_key} as `cell_key`"
-        ) from None
+    if not isinstance(marker, ArtifactRef):
+        raise TypeError("marker must be an ArtifactRef")
+    assay, marker_slot = store._resolve_marker_group(marker)
+    marker_status = store.inspect_artifact(marker)
+    marker_inputs = marker_status.inputs or {}
+    raw_selection = marker_inputs.get("cell_selection")
+    raw_clusters = marker_inputs.get("clusters")
+    if not isinstance(raw_selection, dict) or not isinstance(raw_clusters, dict):
+        raise ValueError("Marker artifact lineage is incomplete")
+    selection_ref = ArtifactRef.from_dict(raw_selection)
+    clusters_ref = ArtifactRef.from_dict(raw_clusters)
+    cell_index = read_stored_selection_indices(
+        store.zw,
+        selection_ref,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+    )
+    cluster_group = as_zarr_group(
+        store.zw[artifact_path(clusters_ref)],
+        name=clusters_ref.artifact_id,
+    )
+    cluster_value_name = "values" if clusters_ref.kind == "cluster_labels" else "labels"
+    groups = np.asarray(
+        as_zarr_array(
+            cluster_group[cluster_value_name],
+            name=cluster_value_name,
+        )[:]
+    )
+    if groups.shape != (len(cell_index),):
+        raise ValueError("Marker clusters do not align with their cell selection")
 
     feature_indices: list[int] = []
     marker_rows: list[dict[str, Any]] = []
-    feature_names = np.asarray(assay.feats.fetch_all("names"))
-    feature_ids = np.asarray(assay.feats.fetch_all("ids"))
+    feature_names = np.asarray(marker_slot["feature_names"][:]).astype(str)
+    feature_ids = np.asarray(marker_slot["feature_ids"][:]).astype(str)
     for group_name in marker_slot.group_keys():
         marker_group = as_zarr_group(marker_slot[group_name], name=group_name)
         markers = load_marker_table(
@@ -168,7 +175,7 @@ def _prepare_marker_heatmap(
         unresolved = markers["feature_index"].isna()
         if bool(unresolved.any()):
             logger.warning(
-                f"Skipping {int(unresolved.sum())} unresolved legacy marker "
+                f"Skipping {int(unresolved.sum())} unresolved marker "
                 f"feature(s) for group '{group_name}'"
             )
             markers = markers.loc[~unresolved].copy()
@@ -206,15 +213,12 @@ def _prepare_marker_heatmap(
     if not feature_indices:
         raise ValueError("ERROR: Marker list is empty for all the groups")
     feature_index = np.asarray(sorted(set(feature_indices)), dtype=int)
-    cell_index = np.asarray(assay.cells.active_index(cell_key))
     resolved_log_transform = _marker_log_transform(assay, log_transform)
     normalized = assay.normed(
         cell_idx=cell_index,
         feat_idx=feature_index,
         log_transform=resolved_log_transform,
     )
-    groups = np.asarray(assay.cells.fetch(group_key, cell_key))
-
     group_sums: dict[Any, np.ndarray] = {}
     group_counts: dict[Any, int] = {}
     row_start = 0
@@ -247,7 +251,6 @@ def _prepare_marker_heatmap(
         lambda values: (values - values.mean()) / values.std(),
         axis=0,
     )
-    feature_names = np.asarray(assay.feats.fetch_all("names"))
     group_means.columns = feature_names[feature_index]
     matrix = _clip_marker_means(group_means, vmin, vmax)
 
@@ -259,8 +262,9 @@ def _prepare_marker_heatmap(
         "matrix": matrix,
         "markers": marker_table,
         "assay": assay.name,
-        "cell_key": cell_key,
-        "group_key": group_key,
+        "marker_ref": marker,
+        "clusters_ref": clusters_ref,
+        "cell_selection": selection_ref,
         "n_cells": len(cell_index),
     }
 
@@ -268,10 +272,7 @@ def _prepare_marker_heatmap(
 def marker_heatmap(
     store: Any,
     *,
-    from_assay: str | None = None,
-    group_key: str | None = None,
-    cell_key: str | None = None,
-    marker: ArtifactRef | None = None,
+    marker: ArtifactRef,
     topn: int = 5,
     log_transform: bool | None = None,
     vmin: float = -1,
@@ -339,9 +340,6 @@ def marker_heatmap(
         raise ValueError("vmax must be greater than vmin")
     prepared = _prepare_marker_heatmap(
         store,
-        from_assay=from_assay,
-        group_key=group_key,
-        cell_key=cell_key,
         marker=marker,
         topn=topn,
         log_transform=log_transform,
@@ -598,7 +596,7 @@ def marker_heatmap(
         ),
         provenance=PlotProvenance(
             assay=cast(str, prepared["assay"]),
-            cell_key=cast(str, prepared["cell_key"]),
+            cell_key=None,
             n_cells=cast(int, prepared["n_cells"]),
             renderer="matplotlib",
             notes=(
@@ -608,7 +606,15 @@ def marker_heatmap(
                 else "ordered",
             ),
             extras={
-                "group_key": prepared["group_key"],
+                "marker": cast(ArtifactRef, prepared["marker_ref"]).to_dict(),
+                "clusters": cast(
+                    ArtifactRef,
+                    prepared["clusters_ref"],
+                ).to_dict(),
+                "cell_selection": cast(
+                    ArtifactRef,
+                    prepared["cell_selection"],
+                ).to_dict(),
                 "topn": topn,
                 "log_transform": log_transform,
                 "vmin": resolved_vmin,
@@ -634,190 +640,55 @@ def marker_heatmap(
 def _prepare_pseudotime_heatmap(
     store: Any,
     *,
-    from_assay: str | None,
-    cell_key: str | None,
-    features: ArtifactRef | str,
-    feature_cluster_key: str | None,
-    pseudotime_key: str | None,
+    aggregation: ArtifactRef,
 ) -> dict[str, Any]:
-    assay = store._get_assay(from_assay)
-    if cell_key is None:
-        raise ValueError("ERROR: Please provide a value for parameter `cell_key`")
-    if feature_cluster_key is None:
+    if not isinstance(aggregation, ArtifactRef):
+        raise TypeError("aggregation must be an ArtifactRef")
+    loaded = store.load_pseudotime_aggregation(aggregation)
+    if loaded.ref != aggregation:
+        raise ValueError("Loaded pseudotime aggregation does not match the request")
+    pseudotime_result = store.load_pseudotime_scoring(loaded.pseudotime)
+    if pseudotime_result.cell_selection != loaded.cell_selection:
         raise ValueError(
-            "ERROR: Please provide a value for parameter `feature_cluster_key`"
+            "Pseudotime aggregation and scoring use different cell selections"
         )
-    if pseudotime_key is None:
-        raise ValueError("ERROR: Please provide a value for parameter `pseudotime_key`")
-
-    cell_ordering = np.asarray(
-        assay.cells.fetch(pseudotime_key, key=cell_key),
-        dtype=float,
-    )
-    cell_index = np.asarray(assay.cells.active_index(cell_key), dtype=np.int64)
-    feature_selection = store.resolve_features(assay.name, features)
-    feature_selection_group = as_zarr_group(
-        store.zw[artifact_path(feature_selection)],
-        name=artifact_path(feature_selection),
-    )
-    feature_values = np.asarray(
-        as_zarr_array(feature_selection_group["values"], name="values")[:],
-        dtype=bool,
-    )
-    feature_index = np.flatnonzero(feature_values).astype(np.int64, copy=False)
-    if len(feature_index) == 0:
-        raise ValueError("Feature selection contains no active features")
-    hashes = [
-        array_digest(np.asarray(values))
-        for values in (cell_index, feature_index, cell_ordering)
-    ]
-    feature_data = as_zarr_group(assay.z["featureData"], name="featureData")
-    if feature_cluster_key not in feature_data:
-        raise KeyError(
-            "Feature cluster column was not found. Run run_pseudotime_aggregation first"
-        )
-    cluster_column = as_zarr_array(
-        feature_data[feature_cluster_key],
-        name=feature_cluster_key,
-    )
-    raw_ref = cluster_column.attrs.get("source_artifact")
-    if not isinstance(raw_ref, dict):
-        raise ValueError(
-            "Feature cluster column is not artifact-backed. "
-            "Rerun run_pseudotime_aggregation"
-        )
-    try:
-        aggregation_ref = ArtifactRef.from_dict(raw_ref)
-        status = inspect_artifact(store.zw, aggregation_ref)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(
-            "Feature cluster column has an invalid source artifact. "
-            "Rerun run_pseudotime_aggregation"
-        ) from exc
-    source_value = cluster_column.attrs.get("source_value")
-    if (
-        aggregation_ref.kind != "pseudotime_aggregation"
-        or aggregation_ref.scope != "assay"
-        or aggregation_ref.assay != assay.name
-        or status.operation != "run_pseudotime_aggregation"
-        or not status.complete
-        or source_value != "cluster_values"
-        or "value_index" in cluster_column.attrs
-    ):
-        raise ValueError(
-            "Feature cluster column is not linked to a complete "
-            "pseudotime aggregation artifact for this assay"
-        )
-    inputs = status.inputs or {}
-    if inputs.get("feature_selection") != feature_selection.to_dict():
-        raise ValueError("Feature selection does not match the pseudotime aggregation")
-    raw_cell_selection = inputs.get("cell_selection")
-    if not isinstance(raw_cell_selection, Mapping):
-        raise ValueError("Pseudotime aggregation has no cell-selection input")
-    from ..graph.state import validate_cell_selection_artifact
-
-    validate_cell_selection_artifact(
-        store.zw,
-        ArtifactRef.from_dict(raw_cell_selection),
-        cell_key,
-    )
-    aggregation_group = as_zarr_group(
-        store.zw[status.path],
-        name=status.path,
-    )
-    location = status.path
-    if (
-        "input_fingerprints" not in aggregation_group.attrs
-        or "data" not in aggregation_group
-        or "feature_indices" not in aggregation_group
-        or "valid_features" not in aggregation_group
-    ):
-        raise ValueError(
-            f"Aggregated data at '{location}' is incomplete. "
-            "Rerun run_pseudotime_aggregation before plotting"
-        )
-    if hashes != cast(list[str], aggregation_group.attrs["input_fingerprints"]):
-        raise ValueError(
-            "Cell selection, feature selection, or pseudotime values changed "
-            "after run_pseudotime_aggregation"
-        )
-
-    data = ChunkedArray(
-        as_zarr_array(aggregation_group["data"], name="data"),
-        nthreads=store.nthreads,
-    )
-    feature_indices = np.asarray(
-        as_zarr_array(aggregation_group["feature_indices"], name="feature_indices")[:]
-    )
-    if not np.array_equal(
-        feature_indices.astype(np.int64, copy=False),
-        feature_index,
-    ):
-        raise ValueError(
-            "Aggregated feature indices do not match the feature selection"
-        )
-    if "valid_features" not in aggregation_group:
-        raise ValueError(
-            f"Aggregated data at '{location}' has no valid_features mask. "
-            "Rerun run_pseudotime_aggregation"
-        )
-    valid_features = np.asarray(
-        as_zarr_array(aggregation_group["valid_features"], name="valid_features")[:],
-        dtype=bool,
-    )
-    if valid_features.shape[0] != feature_indices.shape[0]:
-        raise ValueError("Aggregated feature indices and validity mask are misaligned")
-    matrix = np.asarray(data[: feature_indices.shape[0]])
-    if matrix.shape[0] != feature_indices.shape[0]:
-        raise ValueError("Aggregated feature matrix and feature indices are misaligned")
-    matrix = matrix[valid_features]
-    feature_indices = feature_indices[valid_features]
+    matrix = np.asarray(loaded.data[:])
+    feature_indices = np.asarray(loaded.feature_indices, dtype=np.int64)
+    feature_clusters = np.asarray(loaded.feature_clusters)
+    if matrix.ndim != 2 or matrix.shape[0] != len(feature_indices):
+        raise ValueError("Aggregated feature matrix and indices are misaligned")
+    if feature_clusters.shape != feature_indices.shape:
+        raise ValueError("Aggregated feature clusters and indices are misaligned")
     if not np.isfinite(matrix).all():
         raise ValueError("Aggregated feature matrix contains non-finite values")
-
-    all_feature_clusters = assay.feats.fetch_all(feature_cluster_key)
-    if "cluster_values" not in aggregation_group:
-        raise ValueError("Aggregation artifact has no stored feature-cluster values")
-    stored_cluster_values = np.asarray(
-        as_zarr_array(
-            aggregation_group["cluster_values"],
-            name="cluster_values",
-        )[:]
-    )
-    if not np.array_equal(stored_cluster_values, all_feature_clusters):
-        raise ValueError(
-            f"Feature cluster column '{feature_cluster_key}' changed after aggregation"
-        )
-
-    feature_clusters = np.asarray(all_feature_clusters)[feature_indices]
-    feature_labels = np.asarray(assay.feats.fetch_all("names"))[feature_indices]
+    feature_labels = np.asarray(loaded.feature_names).astype(str)
+    if feature_labels.shape != feature_indices.shape:
+        raise ValueError("Frozen feature labels do not align with aggregation rows")
     order = np.argsort(feature_clusters)
+    pseudotime = np.asarray(
+        pseudotime_result.values[pseudotime_result.valid],
+        dtype=np.float64,
+    )
+    if len(pseudotime) == 0 or not np.isfinite(pseudotime).all():
+        raise ValueError("Pseudotime artifact has no finite scored cells")
     return {
         "matrix": matrix[order],
         "feature_indices": feature_indices[order],
         "feature_clusters": feature_clusters[order],
         "feature_labels": feature_labels[order],
-        "pseudotime": np.asarray(
-            assay.cells.fetch(pseudotime_key, key=cell_key),
-            dtype=float,
-        ),
-        "assay": assay.name,
-        "cell_key": cell_key,
-        "feature_selection": feature_selection,
-        "feature_cluster_key": feature_cluster_key,
-        "pseudotime_key": pseudotime_key,
-        "aggregation_location": location,
+        "pseudotime": pseudotime,
+        "assay": loaded.assay,
+        "cell_selection": loaded.cell_selection,
+        "feature_selection": loaded.feature_selection,
+        "pseudotime_ref": loaded.pseudotime,
+        "aggregation_ref": aggregation,
     }
 
 
 def pseudotime_heatmap(
     store: Any,
     *,
-    from_assay: str | None = None,
-    cell_key: str | None = None,
-    features: ArtifactRef | str,
-    feature_cluster_key: str | None = None,
-    pseudotime_key: str | None = None,
+    aggregation: ArtifactRef,
     show_features: list[str] | None = None,
     feature_order: Sequence[str] | None = None,
     feature_cluster_order: Sequence[Any] | None = None,
@@ -860,11 +731,7 @@ def pseudotime_heatmap(
         raise ValueError("vmax must be greater than vmin")
     prepared = _prepare_pseudotime_heatmap(
         store,
-        from_assay=from_assay,
-        cell_key=cell_key,
-        features=features,
-        feature_cluster_key=feature_cluster_key,
-        pseudotime_key=pseudotime_key,
+        aggregation=aggregation,
     )
     matrix = np.asarray(prepared["matrix"])
     feature_clusters = np.asarray(prepared["feature_clusters"])
@@ -1163,10 +1030,10 @@ def pseudotime_heatmap(
                 label="standardized expression",
                 extras={"vmin": resolved_vmin, "vmax": resolved_vmax},
             ),
-            LegendSpec(kind="categorical", label=feature_cluster_key),
+            LegendSpec(kind="categorical", label="feature clusters"),
             LegendSpec(
                 kind="colorbar",
-                label=pseudotime_key,
+                label="pseudotime",
                 extras={"vmin": pseudotime_vmin, "vmax": pseudotime_vmax},
             ),
         ),
@@ -1186,7 +1053,7 @@ def pseudotime_heatmap(
         ),
         provenance=PlotProvenance(
             assay=cast(str, prepared["assay"]),
-            cell_key=cast(str, prepared["cell_key"]),
+            cell_key=None,
             n_cells=len(pseudotime),
             renderer="matplotlib",
             notes=("pseudotime_heatmap", "aggregated"),
@@ -1195,9 +1062,18 @@ def pseudotime_heatmap(
                     ArtifactRef,
                     prepared["feature_selection"],
                 ).to_dict(),
-                "feature_cluster_key": prepared["feature_cluster_key"],
-                "pseudotime_key": prepared["pseudotime_key"],
-                "aggregation_location": prepared["aggregation_location"],
+                "cell_selection": cast(
+                    ArtifactRef,
+                    prepared["cell_selection"],
+                ).to_dict(),
+                "pseudotime": cast(
+                    ArtifactRef,
+                    prepared["pseudotime_ref"],
+                ).to_dict(),
+                "aggregation": cast(
+                    ArtifactRef,
+                    prepared["aggregation_ref"],
+                ).to_dict(),
                 "n_features": matrix.shape[0],
                 "n_bins": matrix.shape[1],
                 "show_features": show_features,

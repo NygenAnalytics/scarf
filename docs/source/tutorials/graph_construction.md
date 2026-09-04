@@ -1,5 +1,5 @@
 ---
-description: Build an assay graph stage by stage, branch parameters, and control the current analysis chain.
+description: Build an assay graph stage by stage and branch parameters with explicit artifact references.
 jupytext:
   text_representation:
     extension: .md
@@ -13,7 +13,6 @@ kernelspec:
 ---
 
 (graph_construction_guide)=
-(graph_and_state)=
 
 # Building neighbourhood graphs step by step
 
@@ -45,12 +44,11 @@ The stage methods below expose the same persisted results with more control.
 
 ## 2. Build an RNA graph explicitly
 
-The downloaded store is structurally repacked and mounted as a count source so this page builds a complete current analysis chain without reading its persisted analysis state.
+The rebuilt store carries a completed `docs_default` pipeline run. This page starts from that
+run's frozen cell and feature selections, then calls every graph stage explicitly. Identical calls
+reuse the completed baseline artifacts; later sections create only the branches they discuss.
 
 ```{code-cell} ipython3
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -58,52 +56,28 @@ import pandas as pd
 import scarf
 import scarf.plotting as splt
 from scarf.embeddings import initial_embedding
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-repacked_counts = str(Path(analysis_directory.name) / "counts.zarr")
-repack_store(
-    f"{dataset}/data.zarr",
-    repacked_counts,
-    nthreads=2,
-)
-ds = scarf.mount_datastore(
-    repacked_counts,
-    at=str(Path(analysis_directory.name) / "graph_analysis.zarr"),
-    default_assay="RNA",
-    nthreads=4,
-    min_features_per_cell=10,
-)
-ds.filter_cells(
-    attrs=["RNA_nCounts", "RNA_nFeatures"],
-    highs=[15000, 4000],
-    lows=[1000, 500],
-    reset_previous=True,
-)
-hvg_ref = ds.mark_hvgs(
-    min_cells=20,
-    top_n=500,
-    show_plot=False,
-)
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+baseline = ds.pipeline.open(label="docs_default")
+cell_selection = baseline["analysis_cell_selection"]
+hvg_ref = baseline["highly_variable_features"]
+run_cells = baseline.cells
 ```
 
 Each method returns an {term}`ArtifactRef`.
 Passing it to the next method makes the dependency explicit.
 
 ```{code-cell} ipython3
-normalized = ds.run_normalization(features=hvg_ref)
+normalized = ds.run_normalization(cell_selection, hvg_ref)
 pca = ds.run_pca(normalized, dims=15)
-initialization = ds.build_embedding_initialization(
-    pca,
-    n_centroids=100,
-)
+initialization = ds.build_embedding_initialization(pca)
 ann_index = ds.build_ann_index(pca)
 neighbors = ds.query_neighbors(ann_index, k=11)
 graph = ds.build_connectivity_map(neighbors)
@@ -136,7 +110,7 @@ pd.DataFrame(stage_rows)
 `load_graph` returns the sparse cell-by-cell connectivity matrix for supported custom graph analyses.
 
 ```{code-cell} ipython3
-loaded_graph = ds.load_graph()
+loaded_graph = ds.load_graph(graph)
 loaded_graph.shape, loaded_graph.nnz
 ```
 
@@ -164,8 +138,8 @@ pd.Series(
 degree_vs_qc = pd.DataFrame(
     {
         "degree": degrees,
-        "RNA_nCounts": ds.cells.fetch("RNA_nCounts"),
-        "RNA_nFeatures": ds.cells.fetch("RNA_nFeatures"),
+        "RNA_nCounts": run_cells.fetch("RNA_nCounts"),
+        "RNA_nFeatures": run_cells.fetch("RNA_nFeatures"),
     }
 )
 degree_vs_qc.corr(numeric_only=True)
@@ -174,23 +148,20 @@ degree_vs_qc.corr(numeric_only=True)
 The graph should include every active cell and have finite nonzero connectivities.
 A disconnected graph, many isolated cells, or degree structure driven by a QC metric warrants revisiting features, PCA dimensions, or `k`.
 
-## 3. Understand the current analysis chain
+## 3. Keep the explicit artifact chain
 
-Successful stages normally update a small pointer set for the assay.
-In plain language, this is the {term}`analysis chain` that downstream calls should use when no explicit input is supplied.
-The public class representing it is `AssayState`.
+Every stage consumes the exact reference returned by its predecessor, so result choice stays explicit.
+Keep the references you need, or retain them together in a small mapping owned by your analysis code.
 
 ```{code-cell} ipython3
-state = ds.get_assay_state("RNA")
-normalized_status = ds.inspect_artifact(state.normalized)
 {
-    "cell selection": state.cell_key,
-    "feature selection": normalized_status.inputs["feature_selection"],
-    "normalization": state.normalized,
-    "reduction": state.reduction,
-    "embedding initialization": state.embedding_initialization,
-    "neighbours": state.neighbors,
-    "connectivity": state.connectivity_map,
+    "cell selection": cell_selection,
+    "feature selection": hvg_ref,
+    "normalization": normalized,
+    "reduction": pca,
+    "embedding initialization": initialization,
+    "neighbours": neighbors,
+    "connectivity": graph,
 }
 ```
 
@@ -222,57 +193,41 @@ figure.tight_layout()
 figure
 ```
 
-`run_umap` and `run_tsne` resolve the current connectivity and initialization from this chain when `graph=None`.
-Leiden and Paris resolve only the connectivity graph.
-They write their cell-metadata columns as usual.
-UMAP, t-SNE, and Leiden return the artifact they wrote; Paris returns a `ParisClusteringResult` whose `.ref` holds that artifact.
-Either way, a result can be inspected or reused without looking the column up first.
+`run_umap` and `run_tsne` require both the graph and its matching initialization.
+Leiden and Paris require the graph.
+Each returns an immutable artifact without adding cell-metadata columns. Use
+`load_paris_clustering(ref)` only when hierarchy diagnostics are needed.
 
 ```{code-cell} ipython3
-umap = ds.run_umap(
-    n_epochs=100,
-    parallel=True,
-)
-clusters = ds.run_leiden_clustering(resolution=0.5)
-ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by="RNA_leiden_cluster",
-)
+umap = ds.run_umap(graph, initialization)
+clusters = ds.run_leiden_clustering(graph, resolution=0.5)
+umap_values = np.asarray(ds.load_artifact(umap)["values"][:])
+cluster_values = np.asarray(ds.load_artifact(clusters)["values"][:])
+plt.scatter(umap_values[:, 0], umap_values[:, 1], c=cluster_values, s=3)
 ```
 
 ```{code-cell} ipython3
 ds.inspect_artifact(clusters).parameters
 ```
 
-## 4. Branch without changing the current chain
+## 4. Branch by retaining both references
 
 Suppose the PCA and ANN index are expensive but two neighbour counts need to be compared.
-Reuse the same index and set `update_state=False` on the side branch.
+Reuse the same index and retain both returned graph references.
 
 ```{code-cell} ipython3
-neighbors_k21 = ds.query_neighbors(
-    ann_index,
-    k=21,
-    update_state=False,
-)
-graph_k21 = ds.build_connectivity_map(
-    neighbors_k21,
-    update_state=False,
-)
-
-current_state = ds.get_assay_state("RNA")
-current_state.connectivity_map == graph, graph_k21 != graph
+neighbors_k21 = ds.query_neighbors(ann_index, k=21)
+graph_k21 = ds.build_connectivity_map(neighbors_k21)
+graph_k21 != graph
 ```
 
-The side branch remains a complete, addressable artifact, while downstream calls without explicit inputs still use the `k=11` graph.
-This prevents a parameter experiment from silently replacing the selected chain.
+Both branches remain complete, addressable artifacts.
+Downstream calls must receive one of them explicitly, so a parameter experiment cannot silently replace another branch.
 
 Degree and edge weight both shift when every cell sees more neighbours:
 
 ```{code-cell} ipython3
-loaded_graph_k21 = ds.load_graph(
-    graph=graph_k21,
-)
+loaded_graph_k21 = ds.load_graph(graph_k21)
 pd.Series(
     {
         "k=11 nnz": int(loaded_graph.nnz),
@@ -287,33 +242,29 @@ splt.graph_qc(loaded_graph_k21)
 ```
 
 To analyse the side branch, pass its exact graph reference.
-The current chain is untouched, so both partitions stay available for comparison.
+Retain both returned refs so neither branch replaces the other.
 
 ```{code-cell} ipython3
-ds.run_leiden_clustering(
-    graph=graph_k21,
-    resolution=0.5,
-    label="leiden_k21",
-)
+clusters_k21 = ds.run_leiden_clustering(graph_k21, resolution=0.5)
 ```
 
 Place both partitions on the shared `k=11` UMAP so absorption is visible, then quantify agreement with a crosstab:
 
 ```{code-cell} ipython3
+cluster_values_k21 = np.asarray(ds.load_artifact(clusters_k21)["values"][:])
 figure, axes = plt.subplots(1, 2, figsize=(10, 4))
-for axis, color_by, title in zip(
+for axis, values, title in zip(
     axes,
-    ("RNA_leiden_cluster", "RNA_leiden_k21"),
+    (cluster_values, cluster_values_k21),
     ("k=11 Leiden", "k=21 Leiden"),
     strict=True,
 ):
-    ds.plots.embedding(
-        layout_key="RNA_UMAP",
-        color_by=color_by,
-        legend_loc="on_data",
-        show_titles=False,
-        target=axis,
-        show=False,
+    axis.scatter(
+        umap_values[:, 0],
+        umap_values[:, 1],
+        c=values,
+        s=3,
+        cmap="tab20",
     )
     axis.set_title(title)
 figure.tight_layout()
@@ -322,8 +273,8 @@ figure
 
 ```{code-cell} ipython3
 pd.crosstab(
-    pd.Series(ds.cells.fetch("RNA_leiden_cluster"), name="k=11"),
-    pd.Series(ds.cells.fetch("RNA_leiden_k21"), name="k=21"),
+    pd.Series(cluster_values, name="k=11"),
+    pd.Series(cluster_values_k21, name="k=21"),
 )
 ```
 
@@ -340,7 +291,7 @@ Changing the cell or feature selection invalidates all dependent stages.
 Harmony fits between PCA and the ANN index:
 
 ```python
-corrected = ds.run_harmony(["technical_batch"], pca)
+corrected = ds.run_harmony(pca, ["technical_batch"])
 corrected_index = ds.build_ann_index(corrected)
 corrected_neighbors = ds.query_neighbors(corrected_index, k=21)
 corrected_graph = ds.build_connectivity_map(corrected_neighbors)

@@ -183,6 +183,33 @@ def test_download_dataset_excludes_zarr_archive_by_default(monkeypatch, tmp_path
     assert not (dataset_path / "data.zarr.tar.gz").exists()
 
 
+def test_download_dataset_copies_local_catalog_zarr(monkeypatch, tmp_path):
+    from scarf import cytebase
+
+    local_root = tmp_path / "catalog"
+    store = local_root / "alpha" / "data.zarr"
+    store.mkdir(parents=True)
+    (store / "zarr.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv(cytebase._LOCAL_CATALOG_ENV, str(local_root))
+
+    def fail_bucket(*_args, **_kwargs):
+        raise AssertionError("local catalog should not list the remote bucket")
+
+    monkeypatch.setattr(cytebase, "_bucket_files", fail_bucket)
+
+    destination = tmp_path / "downloads"
+    dataset_path = cytebase.Repository("scarf_docs").download_dataset(
+        "alpha",
+        destination,
+        zarr=True,
+    )
+
+    copied = dataset_path / "data.zarr" / "zarr.json"
+    assert dataset_path == destination / "alpha"
+    assert copied.read_text(encoding="utf-8") == "{}"
+    assert (store / "zarr.json").read_text(encoding="utf-8") == "{}"
+
+
 def test_download_dataset_selects_and_extracts_zarr_archive(monkeypatch, tmp_path):
     from scarf import cytebase
 
@@ -419,9 +446,10 @@ def test_live_bucket_catalog_is_public():
 
 
 @pytest.mark.integration
-def test_live_zarr_archive_download(tmp_path):
+def test_live_zarr_archive_download(tmp_path, monkeypatch):
     from scarf import cytebase
 
+    monkeypatch.delenv("SCARF_CYTEBASE_LOCAL", raising=False)
     dataset_path = cytebase.connect("scarf_docs").download_dataset(
         "tenx_5K_pbmc_rnaseq",
         tmp_path,

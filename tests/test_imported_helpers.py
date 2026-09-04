@@ -2,13 +2,8 @@
 
 import numpy as np
 import pytest
-import zarr
-from zarr.storage import MemoryStore
-
 from scarf.embeddings.imported import (
     _positive_block_rows,
-    _recoverable_import_state,
-    _register_named_result,
     _required_payload_fingerprints,
     _resolve_source,
     _string_block,
@@ -17,14 +12,6 @@ from scarf.embeddings.imported import (
     _validate_numeric_source,
     _validate_source_digest,
 )
-from scarf.graph.state import AssayState, read_assay_state, write_assay_state
-from scarf.storage.artifacts import (
-    ArtifactRef,
-    artifact_path,
-    make_provenance,
-    new_artifact_id,
-)
-from scarf.storage.errors import ArtifactResolutionError
 
 
 def test_positive_block_rows_and_fingerprint_validators():
@@ -132,87 +119,3 @@ def test_string_block_validates_identifiers_and_length():
         _string_block(np.array([1, 2]), 0, 2)
     with pytest.raises(ValueError, match="invalid UTF-8"):
         _string_block(np.array([b"\xff"], dtype=object), 0, 1)
-
-
-def _named_embedding(root: zarr.Group) -> ArtifactRef:
-    ref = ArtifactRef(
-        scope="assay",
-        assay="RNA",
-        kind="embedding",
-        artifact_id=new_artifact_id(),
-    )
-    group = root.create_group(artifact_path(ref))
-    group.attrs.update(
-        {
-            "artifact_id": ref.artifact_id,
-            "kind": ref.kind,
-            "provenance": make_provenance(
-                operation="test_embedding",
-                parameters={},
-                inputs={},
-            ),
-            "execution_options": {},
-            "complete": True,
-        }
-    )
-    return ref
-
-
-def test_recoverable_import_state_keeps_named_results_when_the_chain_is_missing():
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    assert _recoverable_import_state(root, "RNA") is None
-
-    umap = _named_embedding(root)
-    write_assay_state(
-        root,
-        AssayState(
-            assay="RNA",
-            cell_key="I",
-            named_results={"umap": umap},
-        ),
-    )
-    payload = dict(root["RNA/state"].attrs["state"])
-    payload["connectivity_map"] = ArtifactRef(
-        scope="assay",
-        assay="RNA",
-        kind="connectivity_map",
-        artifact_id="0" * 64,
-    ).to_dict()
-    root["RNA/state"].attrs["state"] = payload
-
-    with pytest.raises(ArtifactResolutionError) as missing:
-        read_assay_state(root, "RNA")
-    assert missing.value.code == "missing_artifact"
-
-    recovered = _recoverable_import_state(root, "RNA")
-    assert recovered is not None
-    assert recovered.cell_key == "I"
-    assert recovered.named_results["umap"] == umap
-    assert recovered.connectivity_map is None
-
-    tsne = _named_embedding(root)
-    _register_named_result(root, tsne, "tsne", cell_key="I")
-    restored = read_assay_state(root, "RNA")
-    assert restored is not None
-    assert restored.named_results == {"umap": umap, "tsne": tsne}
-    assert restored.connectivity_map is None
-
-
-def test_register_named_result_rejects_cell_key_mismatch():
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    umap = _named_embedding(root)
-    write_assay_state(
-        root,
-        AssayState(
-            assay="RNA",
-            cell_key="I",
-            named_results={"umap": umap},
-        ),
-    )
-    with pytest.raises(ValueError, match="does not match"):
-        _register_named_result(
-            root,
-            _named_embedding(root),
-            "tsne",
-            cell_key="filtered",
-        )

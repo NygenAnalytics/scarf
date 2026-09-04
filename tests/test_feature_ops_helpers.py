@@ -98,26 +98,40 @@ def test_write_marker_slot_requires_valid_counts_and_skips_empty_groups():
         0: _marker_frame([1, 0], score=0.25),
         1: _marker_frame([]),
     }
+    feature_names = np.array(["first", "second"])
+    feature_ids = np.array(["id-1", "id-2"])
 
     with pytest.raises(ValueError, match="target and reference counts"):
-        DataStore._write_marker_slot(slot, markers, group_cell_counts={})
+        DataStore._write_marker_slot(
+            slot,
+            markers,
+            group_cell_counts={},
+            feature_names=feature_names,
+            feature_ids=feature_ids,
+        )
     with pytest.raises(ValueError, match="integers >= 2"):
         DataStore._write_marker_slot(
             slot,
             markers,
             group_cell_counts={0: (1, 5)},
+            feature_names=feature_names,
+            feature_ids=feature_ids,
         )
 
     DataStore._write_marker_slot(
         slot,
         markers,
         group_cell_counts={0: (4, 8)},
+        feature_names=feature_names,
+        feature_ids=feature_ids,
     )
     np.testing.assert_array_equal(
         slot["feature_index"][:], np.array([0, 1], dtype=np.int32)
     )
     assert "0" in slot
     assert "1" not in slot
+    np.testing.assert_array_equal(slot["feature_names"][:], feature_names)
+    np.testing.assert_array_equal(slot["feature_ids"][:], feature_ids)
     assert slot["0"].attrs["n_group"] == 4
     assert slot["0"].attrs["n_reference"] == 8
     np.testing.assert_allclose(slot["0"]["stats"][:], 0.25)

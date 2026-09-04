@@ -1,10 +1,23 @@
 import pickle
+from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import zarr
 from zarr.storage import MemoryStore
 
 import scarf.metadata as metadata
+import scarf.metadata.selection as selection
+from scarf.metadata.selection import (
+    CellField,
+    FeatureRef,
+    NamedCellArtifact,
+    NormalizationSpec,
+    grouping_value_name,
+    resolve_cell_aligned_artifact,
+    resolve_grouping,
+    valid_category_mask,
+)
 from scarf.metadata.rows import MetaDataRowBlock as implementation_row_block
 from scarf.metadata.rows import (
     array_row_selection_peak_bytes,
@@ -15,6 +28,7 @@ from scarf.metadata.rows import (
     read_metadata_rows_chunkwise,
 )
 from scarf.metadata.table import MetaData as implementation_metadata
+from scarf.storage import ArtifactRef
 from tests.signature_contracts import signature_digest
 
 
@@ -327,3 +341,211 @@ def test_metadata_row_blocks_remain_pickle_resolvable():
 
     assert type(restored) is metadata.MetaDataRowBlock
     np.testing.assert_array_equal(restored.active_global_indices, [0])
+
+
+def _artifact(kind: str, token: str) -> ArtifactRef:
+    return ArtifactRef(
+        scope="datastore",
+        kind=kind,
+        artifact_id=token * 64,
+    )
+
+
+def test_metadata_selection_value_contracts_reject_ambiguous_inputs():
+    np.testing.assert_array_equal(
+        valid_category_mask(np.array([b"", b"a", np.bytes_(b" ")], dtype=object)),
+        [False, True, False],
+    )
+    with pytest.raises(ValueError, match="one-dimensional"):
+        valid_category_mask(np.ones((2, 2)))
+    with pytest.raises(ValueError, match="missing mask must align"):
+        valid_category_mask(["a", "b"], missing_mask=[True])
+    with pytest.raises(ValueError, match="by must be"):
+        FeatureRef("gene", by="label")
+    with pytest.raises(ValueError, match="reduction must be"):
+        FeatureRef("gene", reduction="median")
+    with pytest.raises(ValueError, match="non-empty name"):
+        NamedCellArtifact("", _artifact("cluster_labels", "a"))
+    with pytest.raises(ValueError, match="surrounding whitespace"):
+        NamedCellArtifact(" labels ", _artifact("cluster_labels", "a"))
+    with pytest.raises(TypeError, match="ArtifactRef"):
+        NamedCellArtifact("labels", object())
+    with pytest.raises(ValueError, match="categorical cell labels"):
+        grouping_value_name("embedding")
+    with pytest.raises(ValueError, match="transform"):
+        NormalizationSpec(transform="sqrt")
+
+
+def test_cell_aligned_artifact_validation_reports_each_broken_contract(monkeypatch):
+    artifact = _artifact("cluster_labels", "b")
+    source = _artifact("cell_selection", "c")
+    target = _artifact("cell_selection", "d")
+
+    with pytest.raises(TypeError, match="artifact must be"):
+        resolve_cell_aligned_artifact(None, object())
+    with pytest.raises(ValueError, match="Expected a 'cell_cycle'"):
+        resolve_cell_aligned_artifact(None, artifact, expected_kind="cell_cycle")
+    with pytest.raises(ValueError, match="value_name must be"):
+        resolve_cell_aligned_artifact(None, artifact, value_name="")
+
+    monkeypatch.setattr(
+        selection,
+        "inspect_artifact",
+        lambda *_: SimpleNamespace(exists=False, complete=False, inputs={}),
+    )
+    with pytest.raises(ValueError, match="unavailable or incomplete"):
+        resolve_cell_aligned_artifact(None, artifact)
+
+    status = SimpleNamespace(exists=True, complete=True, inputs={})
+    monkeypatch.setattr(selection, "inspect_artifact", lambda *_: status)
+    with pytest.raises(ValueError, match="no cell-selection input"):
+        resolve_cell_aligned_artifact(None, artifact)
+
+    status.inputs = {"cell_selection": {"type": "wrong"}}
+    with pytest.raises(ValueError, match="cell selection is malformed"):
+        resolve_cell_aligned_artifact(None, artifact)
+
+    status.inputs = {"cell_selection": source.to_dict()}
+    monkeypatch.setattr(selection, "_selection_indices", lambda *_: np.array([1, 3]))
+    with pytest.raises(TypeError, match="cell_selection must be"):
+        resolve_cell_aligned_artifact(None, artifact, cell_selection=object())
+
+    def out_of_bounds(_root, ref):
+        return np.array([1, 3]) if ref == source else np.array([5])
+
+    monkeypatch.setattr(selection, "_selection_indices", out_of_bounds)
+    with pytest.raises(ValueError, match="must be a subset"):
+        resolve_cell_aligned_artifact(None, artifact, cell_selection=target)
+
+    def not_a_member(_root, ref):
+        return np.array([1, 3]) if ref == source else np.array([2])
+
+    monkeypatch.setattr(selection, "_selection_indices", not_a_member)
+    with pytest.raises(ValueError, match="must be a subset"):
+        resolve_cell_aligned_artifact(None, artifact, cell_selection=target)
+
+    monkeypatch.setattr(selection, "_selection_indices", lambda *_: np.array([1, 3]))
+    monkeypatch.setattr(selection, "artifact_group", lambda *_: {})
+    with pytest.raises(ValueError, match="no 'values' value array"):
+        resolve_cell_aligned_artifact(None, artifact)
+
+    bad_array = SimpleNamespace(ndim=1, shape=(3,))
+    monkeypatch.setattr(selection, "artifact_group", lambda *_: {"values": bad_array})
+    monkeypatch.setattr(selection, "as_zarr_array", lambda value, **_: value)
+    with pytest.raises(ValueError, match="one value per source-selected cell"):
+        resolve_cell_aligned_artifact(None, artifact)
+
+    good_array = SimpleNamespace(ndim=1, shape=(2,))
+    monkeypatch.setattr(selection, "artifact_group", lambda *_: {"values": good_array})
+    monkeypatch.setattr(
+        selection,
+        "read_array_rows_chunkwise",
+        lambda *_: np.array([1]),
+    )
+    with pytest.raises(ValueError, match="values do not match"):
+        resolve_cell_aligned_artifact(None, artifact)
+
+
+def test_resolve_grouping_validates_field_kind_and_missing_mask(monkeypatch):
+    cells = SimpleNamespace(N=2)
+    with pytest.raises(ValueError, match="must be categorical"):
+        resolve_grouping(None, cells, CellField("score", kind="continuous"))
+
+    monkeypatch.setattr(
+        selection, "read_metadata_rows", lambda *_: np.array(["a", "b"])
+    )
+    monkeypatch.setattr(
+        selection, "read_metadata_missing_rows", lambda *_: np.array([True])
+    )
+    with pytest.raises(ValueError, match="missing mask does not align"):
+        resolve_grouping(None, cells, CellField("group", kind="categorical"))
+
+
+def test_metadata_table_mount_fill_and_error_contracts(monkeypatch):
+    empty = zarr.open_group(store=MemoryStore(), mode="w")
+    with pytest.raises(ValueError, match="empty zarr group"):
+        metadata.MetaData(empty)
+
+    primary = zarr.open_group(store=MemoryStore(), mode="w")
+    primary.create_array("I", data=np.array([True, False, True, False]), chunks=(2,))
+    primary.create_array("ids", data=np.array(["a", "b", "c", "d"]), chunks=(2,))
+    primary.create_array("score", data=np.arange(4.0), chunks=(2,))
+    primary.create_array("x_value", data=np.arange(4), chunks=(2,))
+    table = metadata.MetaData(primary)
+
+    class BrokenGroup:
+        @staticmethod
+        def keys():
+            return ["broken"]
+
+        def __getitem__(self, _key):
+            raise RuntimeError("unreadable child")
+
+    assert table._get_size(BrokenGroup()) == table.N
+    assert table._get_size(empty) == table.N
+    assert table._col_renamer("aux", "score") == "aux_score"
+    assert table._get_loc("I") == ("primary", "I")
+    with pytest.raises(KeyError, match="does not exist"):
+        table._get_loc("unknown")
+    with pytest.raises(TypeError, match="boolean type column"):
+        table._verify_bool("score")
+
+    with pytest.raises(ValueError, match="already mounted"):
+        table.mount_location(primary, "primary")
+    short = zarr.open_group(store=MemoryStore(), mode="w")
+    short.create_array("value", data=np.arange(3), chunks=(2,))
+    with pytest.raises(ValueError, match="index size"):
+        table.mount_location(short, "short")
+    conflict = zarr.open_group(store=MemoryStore(), mode="w")
+    conflict.create_array("value", data=np.arange(4), chunks=(2,))
+    with pytest.raises(ValueError, match="conflict with existing names"):
+        table.mount_location(conflict, "x")
+
+    mounted = zarr.open_group(store=MemoryStore(), mode="w")
+    mounted.create_array("other", data=np.arange(4), chunks=(2,))
+    table.mount_location(mounted, "aux")
+    assert "aux_other" in table.columns
+    with pytest.raises(ValueError, match="primary location"):
+        table.unmount_location("primary")
+    assert table.unmount_location("missing") is None
+    table.unmount_location("aux")
+    assert "aux" not in table.locations
+
+    with pytest.raises(KeyError, match="has not been mounted"):
+        table._save("value", np.arange(4), location="missing")
+    with pytest.raises(ValueError, match="Expected shape"):
+        table._save("value", np.arange(2))
+
+    np.testing.assert_array_equal(
+        table._fill_to_index([5, 6], np.nan, "I"), [5, 0, 6, 0]
+    )
+    with pytest.raises(ValueError, match="integer value"):
+        table._fill_to_index(np.array([-2, -1]), np.nan, "I")
+    with pytest.raises(ValueError, match="integer value"):
+        table._fill_to_index(np.array([1, 2]), "bad", "I")
+    with pytest.raises(ValueError, match="incorrect length"):
+        table._fill_to_index(np.array([1]), 0, "I")
+
+    with pytest.raises(TypeError, match="value_targets"):
+        table.get_index_by("a", "ids")
+    np.testing.assert_array_equal(table.get_index_by(["A"], "ids", key="I"), [0])
+    np.testing.assert_array_equal(
+        table.index_to_bool(np.array([1]), invert=True), [True, False, True, True]
+    )
+
+    with pytest.raises(ValueError, match="protected column"):
+        table.insert("I", np.ones(4, dtype=bool))
+    with pytest.raises(ValueError, match="already exists"):
+        table.insert("score", np.arange(4.0))
+    table.insert("list_values", [1, 2, 3, 4])
+    with pytest.raises(ValueError, match="protected name"):
+        table.drop("ids")
+    np.testing.assert_array_equal(
+        table.multi_sift(["score"], [0.0], [3.0]),
+        [False, True, True, False],
+    )
+    assert repr(table) == "MetaData of 2(4) elements"
+
+    monkeypatch.setattr(table, "_verify_bool", lambda _key: False)
+    with pytest.raises(ValueError, match="Unexpected error"):
+        table.active_index("I")

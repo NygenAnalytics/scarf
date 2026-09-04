@@ -5,40 +5,43 @@ import zarr
 from zarr.storage import MemoryStore
 
 import scarf.metadata.artifacts as metadata_artifacts_module
-import scarf.plotting as splt
+import scarf.metadata.selection as metadata_selection_module
 from scarf.datastore.datastore import DataStore
 from scarf.metadata.artifacts import (
+    artifact_values,
     categorical_display,
     continuous_display,
-    feature_column_display,
-    link_feature_data_column,
     plan_cell_data_artifact,
     validate_display_metadata,
     write_cell_data_artifact,
 )
-from scarf.plotting._contracts import CategoricalScale, ColorScale
-from scarf.plotting.embedding import _continuous_limits
-from scarf.storage.artifacts import ArtifactRef, artifact_path, inspect_artifact
+from scarf.metadata.selection import resolve_cell_aligned_artifact
+from scarf.storage.artifacts import (
+    ArtifactRef,
+    artifact_group,
+    artifact_path,
+    inspect_artifact,
+)
 from scarf.storage.errors import ArtifactResolutionError
 from scarf.storage.selections import resolve_selection_artifact
 from tests.fixtures_datastore import build_neighbourhood_graph
 
 
-def _ensure_graph(datastore) -> None:
-    datastore.auto_filter_cells(show_qc_plots=False)
-    feature_selection = datastore.mark_hvgs(
+def _ensure_graph(datastore) -> ArtifactRef:
+    cell_selection = datastore.auto_filter_cells()
+    feature_selection = datastore.select_hvgs(
+        cell_selection,
         from_assay="RNA",
-        cell_key="I",
         top_n=100,
-        label="metadata_hvgs",
         show_plot=False,
         min_cells=int(0.01 * datastore.cells.N),
         max_cells=np.inf,
         blacklist="^MT-|^RPS|^RPL|^MRPS|^MRPL|^CCN|^HLA-|^H2-|^HIST",
     )
-    build_neighbourhood_graph(
+    return build_neighbourhood_graph(
         datastore,
         from_assay="RNA",
+        cell_selection=cell_selection,
         features=feature_selection,
         dims=5,
         k=3,
@@ -47,9 +50,32 @@ def _ensure_graph(datastore) -> None:
     )
 
 
-def _column_ref(datastore, column: str) -> ArtifactRef:
-    raw_ref = datastore.zw["cellData"][column].attrs["source_artifact"]
-    return ArtifactRef.from_dict(raw_ref)
+def _graph_neighbors(datastore, graph: ArtifactRef) -> ArtifactRef:
+    return ArtifactRef.from_dict(datastore.inspect_artifact(graph).inputs["neighbors"])
+
+
+def _graph_coordinates(datastore, graph: ArtifactRef) -> ArtifactRef:
+    neighbors = _graph_neighbors(datastore, graph)
+    return ArtifactRef.from_dict(
+        datastore.inspect_artifact(neighbors).inputs["coordinates"]
+    )
+
+
+def _graph_initialization(datastore, graph: ArtifactRef) -> ArtifactRef:
+    coordinates = _graph_coordinates(datastore, graph)
+    matches = [
+        ref
+        for ref in datastore.list_artifacts(
+            kind="embedding_initialization",
+            from_assay=coordinates.assay,
+            scope="assay",
+            complete_only=True,
+        )
+        if ArtifactRef.from_dict(datastore.inspect_artifact(ref).inputs["coordinates"])
+        == coordinates
+    ]
+    assert len(matches) == 1
+    return matches[0]
 
 
 def _memory_metadata_root() -> tuple[zarr.Group, ArtifactRef]:
@@ -72,6 +98,23 @@ def _memory_metadata_root() -> tuple[zarr.Group, ArtifactRef]:
         source_column="I",
     )
     return root, selection_ref
+
+
+def _metadata_snapshot(datastore) -> dict[str, tuple[np.ndarray, dict]]:
+    return {
+        column: (
+            np.asarray(datastore.cells.fetch_all(column)).copy(),
+            dict(datastore.zw["cellData"][column].attrs),
+        )
+        for column in datastore.cells.columns
+    }
+
+
+def _assert_metadata_unchanged(datastore, before) -> None:
+    assert set(datastore.cells.columns) == set(before)
+    for column, (values, attrs) in before.items():
+        np.testing.assert_array_equal(datastore.cells.fetch_all(column), values)
+        assert dict(datastore.zw["cellData"][column].attrs) == attrs
 
 
 def test_cell_data_artifact_cache_hit_miss_and_payload_validation(
@@ -114,17 +157,11 @@ def test_cell_data_artifact_cache_hit_miss_and_payload_validation(
 
     changed = plan_cell_data_artifact(
         root,
-        **{
-            **common,
-            "parameters": {"label": "condition"},
-        },
+        **{**common, "parameters": {"label": "condition"}},
     )
     invalidated = plan_cell_data_artifact(
         root,
-        **{
-            **common,
-            "invalidate_cache": True,
-        },
+        **{**common, "invalidate_cache": True},
     )
     assert changed.reused is False
     assert changed.ref != first.ref
@@ -136,6 +173,89 @@ def test_cell_data_artifact_cache_hit_miss_and_payload_validation(
     assert inspect_artifact(root, first.ref).complete
     assert corrupt_miss.reused is False
     assert corrupt_miss.ref != first.ref
+
+
+def test_cell_aligned_artifact_resolver_validates_lineage_and_reads_subset(
+    monkeypatch,
+) -> None:
+    root, source_selection = _memory_metadata_root()
+    planned = plan_cell_data_artifact(
+        root,
+        scope="assay",
+        assay="RNA",
+        kind="quality_metric",
+        operation="test_resolve_cell_aligned_artifact",
+        parameters={},
+        inputs={},
+        execution_options={},
+        cell_selection=source_selection,
+        arrays={"values": ((2,), "f")},
+    )
+    write_cell_data_artifact(
+        root,
+        planned,
+        {"values": np.asarray([10.0, 30.0])},
+    )
+    cell_ids = np.asarray(root["cellData"]["ids"][:])
+    target_selection = resolve_selection_artifact(
+        root,
+        scope="datastore",
+        kind="cell_selection",
+        values=np.asarray([False, False, True]),
+        row_ids=cell_ids,
+        operation="target_subset",
+        parameters={},
+        inputs={},
+        source_column="artifact",
+    )
+    read_positions: list[np.ndarray] = []
+    read_rows = metadata_selection_module.read_array_rows_chunkwise
+
+    def capture_rows(array, rows):
+        read_positions.append(np.asarray(rows).copy())
+        return read_rows(array, rows)
+
+    monkeypatch.setattr(
+        metadata_selection_module,
+        "read_array_rows_chunkwise",
+        capture_rows,
+    )
+
+    resolved = resolve_cell_aligned_artifact(
+        root,
+        planned.ref,
+        cell_selection=target_selection,
+        expected_kind="quality_metric",
+    )
+
+    np.testing.assert_array_equal(resolved.values, [30.0])
+    np.testing.assert_array_equal(resolved.cell_idx, [2])
+    assert resolved.source_cell_selection == source_selection
+    assert resolved.cell_selection == target_selection
+    assert len(read_positions) == 1
+    np.testing.assert_array_equal(read_positions[0], [1])
+
+    outside_selection = resolve_selection_artifact(
+        root,
+        scope="datastore",
+        kind="cell_selection",
+        values=np.asarray([False, True, False]),
+        row_ids=cell_ids,
+        operation="outside_source_selection",
+        parameters={},
+        inputs={},
+        source_column="artifact",
+    )
+    with pytest.raises(ValueError, match="subset"):
+        resolve_cell_aligned_artifact(
+            root,
+            planned.ref,
+            cell_selection=outside_selection,
+        )
+
+    artifact_group(root, planned.ref).attrs["complete"] = False
+    with pytest.raises(ValueError, match="unavailable or incomplete"):
+        resolve_cell_aligned_artifact(root, planned.ref)
 
 
 def test_cell_data_artifact_validation_and_failed_write_status() -> None:
@@ -195,54 +315,13 @@ def test_cell_data_artifact_validation_and_failed_write_status() -> None:
     assert retry.ref != planned.ref
 
 
-def test_corrupt_metadata_links_and_incomplete_artifacts_are_rebuilt(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    column_name = "imported_metadata"
-    values = np.asarray([f"batch-{index % 2}" for index in range(datastore.cells.N)])
-    datastore.cells.insert(column_name, values, overwrite=True)
-    column = datastore.zw["cellData"][column_name]
-    column.attrs["source_artifact"] = {
-        "type": "artifact",
-        "scope": "datastore",
-    }
-    column.attrs["source_value"] = "values"
-
-    first = datastore._resolve_cell_data_input(column_name, cell_key="I")
-
-    assert first.kind == "metadata_snapshot"
-    linked = datastore.zw["cellData"][column_name]
-    assert ArtifactRef.from_dict(linked.attrs["source_artifact"]) == first
-    np.testing.assert_array_equal(
-        datastore.load_artifact(first)["values"][:],
-        datastore.cells.fetch(column_name, key="I"),
-    )
-
-    datastore.zw[artifact_path(first)].attrs["complete"] = False
-    replacement = datastore._resolve_cell_data_input(column_name, cell_key="I")
-
-    assert replacement != first
-    assert datastore.inspect_artifact(first).complete is False
-    assert datastore.inspect_artifact(replacement).complete
-    linked = datastore.zw["cellData"][column_name]
-    assert ArtifactRef.from_dict(linked.attrs["source_artifact"]) == replacement
-    np.testing.assert_array_equal(
-        datastore.load_artifact(replacement)["values"][:],
-        datastore.cells.fetch(column_name, key="I"),
-    )
-
-
 def test_datastore_rejects_incomplete_import_status(datastore_ephemeral) -> None:
     datastore = datastore_ephemeral
     datastore.zw.attrs["scarf:import_source"] = "synthetic"
     datastore.zw.attrs["scarf:import_complete"] = False
 
     with pytest.raises(RuntimeError, match="synthetic import is incomplete"):
-        DataStore(
-            datastore.zarr_loc,
-            default_assay="RNA",
-        )
+        DataStore(datastore.zarr_loc, default_assay="RNA")
 
 
 def test_datastore_rejects_corrupt_imported_metadata(datastore_ephemeral) -> None:
@@ -255,258 +334,68 @@ def test_datastore_rejects_corrupt_imported_metadata(datastore_ephemeral) -> Non
     )
 
     with pytest.raises(ValueError, match="Metadata table is corrupted"):
-        DataStore(
-            datastore.zarr_loc,
-            default_assay="RNA",
-        )
+        DataStore(datastore.zarr_loc, default_assay="RNA")
 
 
-def test_feature_link_validation_preserves_existing_provenance() -> None:
-    root, _selection = _memory_metadata_root()
-    feature_data = root["RNA"]["featureData"]
-    values = np.asarray([0.25, 0.75])
-    feature_data.create_array("score", data=values)
-    first = ArtifactRef(
-        scope="assay",
-        assay="RNA",
-        kind="feature_selection",
-        artifact_id="a" * 64,
-    )
-    display = continuous_display(values)
-    link_feature_data_column(
-        root["RNA"],
-        "score",
-        first,
-        value_name="values",
-        default_display=display,
-    )
-    assert feature_column_display(root["RNA"], "score") == display
-
-    target = feature_data["score"]
-    target.attrs["display"] = "invalid"
-    before = dict(target.attrs)
-    replacement = ArtifactRef(
-        scope="assay",
-        assay="RNA",
-        kind="feature_selection",
-        artifact_id="b" * 64,
-    )
-    with pytest.raises(TypeError, match="mapping"):
-        link_feature_data_column(
-            root["RNA"],
-            "score",
-            replacement,
-            value_name="replacement",
-            value_index=1,
-        )
-
-    persisted = root["RNA"]["featureData"]["score"]
-    assert dict(persisted.attrs) == before
-
-
-def test_umap_matrix_and_leiden_columns_link_authoritative_artifacts(
-    datastore_ephemeral,
-) -> None:
+def test_embedding_and_clustering_are_artifact_only(datastore_ephemeral) -> None:
     datastore = datastore_ephemeral
-    _ensure_graph(datastore)
-    hvg_column = datastore.RNA.z["featureData"]["metadata_hvgs"]
-    assert ArtifactRef.from_dict(
-        hvg_column.attrs["source_artifact"]
-    ) == datastore.resolve_features("RNA", "metadata_hvgs")
-    returned_umap = datastore.run_umap(n_epochs=10, label="metadata_umap")
-    returned_leiden = datastore.run_leiden_clustering(label="metadata_leiden")
+    graph = _ensure_graph(datastore)
+    before = _metadata_snapshot(datastore)
 
-    umap1 = datastore.zw["cellData"]["RNA_metadata_umap1"]
-    umap2 = datastore.zw["cellData"]["RNA_metadata_umap2"]
-    umap_ref = ArtifactRef.from_dict(umap1.attrs["source_artifact"])
-    leiden_ref = _column_ref(datastore, "RNA_metadata_leiden")
+    embedding = datastore.run_umap(
+        graph,
+        _graph_initialization(datastore, graph),
+        n_epochs=10,
+    )
+    leiden = datastore.run_leiden_clustering(graph)
+    paris = datastore.run_paris_clustering(graph, n_clusters=3)
 
-    assert returned_umap == umap_ref
-    assert returned_leiden == leiden_ref
-    assert ArtifactRef.from_dict(umap2.attrs["source_artifact"]) == umap_ref
-    assert umap1.attrs["value_index"] == 0
-    assert umap2.attrs["value_index"] == 1
-    first_input = datastore._resolve_cell_data_provenance_input(
-        "RNA_metadata_umap1",
-        cell_key="I",
-    )
-    second_input = datastore._resolve_cell_data_provenance_input(
-        "RNA_metadata_umap2",
-        cell_key="I",
-    )
-    assert first_input["artifact"] == second_input["artifact"]
-    assert first_input["value_index"] == 0
-    assert second_input["value_index"] == 1
-    assert first_input != second_input
-    display = dict(umap1.attrs["display"])
-    values = datastore.cells.fetch("RNA_metadata_umap1", key="I")
-    assert display["kind"] == "continuous"
-    assert display["minimum"] == float(values.min())
-    assert display["maximum"] == float(values.max())
-    assert datastore.load_artifact(umap_ref)["values"].shape[1] == 2
-    assert leiden_ref.kind == "cluster_labels"
-    assert datastore.inspect_artifact(leiden_ref).parameters["backend"] == "igraph"
-    leiden_display = dict(
-        datastore.zw["cellData"]["RNA_metadata_leiden"].attrs["display"]
-    )
-    assert leiden_display["kind"] == "categorical"
-    assert all(
-        set(category) == {"value", "label", "color"}
-        for category in leiden_display["categories"]
-    )
-    result = splt.embedding(
-        datastore,
-        layout_key="RNA_metadata_umap",
-        color_by="RNA_metadata_umap1",
-        show=False,
-    )
-    continuous = next(scale for scale in result.scales if isinstance(scale, ColorScale))
-    assert continuous.vmin == display["minimum"]
-    assert continuous.vmax == display["maximum"]
-    result.close()
-    multi = splt.embedding(
-        datastore,
-        layout_key="RNA_metadata_umap",
-        color_by=[
-            "RNA_metadata_umap1",
-            "RNA_metadata_leiden",
-        ],
-        show=False,
-    )
-    assert any(isinstance(scale, ColorScale) for scale in multi.scales)
-    assert any(isinstance(scale, CategoricalScale) for scale in multi.scales)
-    multi.close()
-    batches = np.asarray(
-        ["a" if index % 2 else "b" for index in range(datastore.cells.N)]
-    )
-    datastore.cells.insert("display_batch", batches, overwrite=True)
-    datastore.zw["cellData"]["display_batch"].attrs["display"] = categorical_display(
-        datastore.cells.fetch("display_batch", key="I")
-    )
-    leiden_values = datastore.cells.fetch(
-        "RNA_metadata_leiden",
-        key="I",
-    )
-    keep = list(np.unique(leiden_values)[:2])
-    grouped = splt.embedding(
-        datastore,
-        layout_key="RNA_metadata_umap",
-        color_by=["RNA_metadata_leiden", "display_batch"],
-        groups=keep,
-        show=False,
-    )
-    categorical_scales = [
-        scale for scale in grouped.scales if isinstance(scale, CategoricalScale)
-    ]
-    assert list(categorical_scales[0].order) == keep
-    assert set(categorical_scales[1].order) == {"a", "b"}
-    grouped.close()
+    assert embedding.kind == "embedding"
+    assert leiden.kind == "cluster_labels"
+    assert paris.kind == "cluster_cut"
+    assert datastore.load_artifact(embedding)["values"].shape[1] == 2
+    assert datastore.inspect_artifact(leiden).parameters["backend"] == "igraph"
+    _assert_metadata_unchanged(datastore, before)
 
 
-def test_leiden_backend_is_part_of_artifact_identity(
-    datastore_ephemeral,
-) -> None:
+def test_leiden_backend_is_part_of_artifact_identity(datastore_ephemeral) -> None:
     datastore = datastore_ephemeral
-    _ensure_graph(datastore)
+    graph = _ensure_graph(datastore)
 
-    native = datastore.run_leiden_clustering(label="native_leiden")
-    legacy = datastore.run_leiden_clustering(
-        backend="leidenalg",
-        label="legacy_leiden",
-    )
+    native = datastore.run_leiden_clustering(graph)
+    legacy = datastore.run_leiden_clustering(graph, backend="leidenalg")
 
     assert native != legacy
     assert datastore.inspect_artifact(native).parameters["backend"] == "igraph"
     assert datastore.inspect_artifact(legacy).parameters["backend"] == "leidenalg"
-
-
-def test_run_leiden_rejects_unknown_backend(datastore_ephemeral) -> None:
     with pytest.raises(ValueError, match="backend"):
-        datastore_ephemeral.run_leiden_clustering(
+        datastore.run_leiden_clustering(
+            graph,
             backend="unknown",  # type: ignore[arg-type]
-            label="bad_backend",
         )
 
 
-def test_membership_and_smart_labels_are_artifact_backed_and_lisi_is_read_only(
+def test_membership_smart_labels_and_lisi_are_artifact_only(
     datastore_ephemeral,
-    monkeypatch,
 ) -> None:
     datastore = datastore_ephemeral
-    _ensure_graph(datastore)
-    datastore.run_leiden_clustering(label="independent_leiden")
-    cluster_key = "RNA_independent_leiden"
-
-    datastore.calc_membership_strength(cluster_key)
-    membership_key = "RNA_I_cluster_membership_strength"
-    membership_ref = _column_ref(datastore, membership_key)
-    assert membership_ref.kind == "membership_strength"
-    state = datastore.get_assay_state("RNA")
-    assert state is not None
-    assert state.connectivity_map is not None
-    graph_loc = artifact_path(state.connectivity_map)
-    n_cells, k = datastore._get_graph_ncells_k(graph_loc)
-    edges = np.asarray(datastore.zw[graph_loc]["edges"][:]).reshape(n_cells, k, 2)
-    clusters = np.asarray(datastore.cells.fetch(cluster_key, key="I"))
-    expected_membership = np.asarray(
-        [
-            pd.Series(row).value_counts(dropna=False).iloc[0] / k
-            for row in clusters[edges[:, :, 1]]
-        ]
-    ).round(3)
-    np.testing.assert_array_equal(
-        datastore.cells.fetch(membership_key, key="I"),
-        expected_membership,
-    )
-
+    graph = _ensure_graph(datastore)
+    neighbors = _graph_neighbors(datastore, graph)
+    clusters = datastore.run_leiden_clustering(graph)
     columns_before = set(datastore.cells.columns)
-    artifacts_before = set(datastore.list_artifacts())
-    lisi = datastore.metric_lisi([cluster_key], perplexity=1)
-    repeated_lisi = datastore.metric_lisi([cluster_key], perplexity=1)
-    np.testing.assert_allclose(lisi[cluster_key], repeated_lisi[cluster_key])
+
+    membership = datastore.calc_membership_strength(clusters, graph)
+    smart = datastore.smart_label(clusters, clusters)
+    lisi = datastore.metric_lisi(["names"], neighbors, perplexity=1)
+
+    assert membership.kind == "membership_strength"
+    assert smart.kind == "smart_label"
+    assert lisi.kind == "quality_metric"
+    assert datastore.calc_membership_strength(clusters, graph) == membership
+    assert datastore.smart_label(clusters, clusters) == smart
+    loaded = datastore.load_metric_lisi(lisi)
+    assert loaded["names"].shape == (datastore.load_graph(graph).shape[0],)
     assert set(datastore.cells.columns) == columns_before
-    assert set(datastore.list_artifacts()) == artifacts_before
-
-    read_only = DataStore(
-        datastore.zarr_loc,
-        default_assay="RNA",
-        zarr_mode="r",
-    )
-    read_only_lisi = read_only.metric_lisi(
-        [cluster_key],
-        perplexity=1,
-    )
-    np.testing.assert_allclose(read_only_lisi[cluster_key], lisi[cluster_key])
-
-    unsaved_smart = datastore.smart_label(
-        cluster_key,
-        cluster_key,
-    )
-    assert unsaved_smart == datastore.smart_label(
-        cluster_key,
-        cluster_key,
-    )
-    datastore.smart_label(
-        cluster_key,
-        cluster_key,
-        new_col_name="smart_clusters",
-    )
-    smart_ref = _column_ref(datastore, "smart_clusters")
-    assert smart_ref.kind == "smart_label"
-    with monkeypatch.context() as cached:
-        cached.setattr(
-            pd,
-            "crosstab",
-            lambda *args, **kwargs: (_ for _ in ()).throw(
-                AssertionError("cached smart labels were recomputed")
-            ),
-        )
-        datastore.smart_label(
-            cluster_key,
-            cluster_key,
-            new_col_name="smart_clusters",
-        )
-    assert _column_ref(datastore, "smart_clusters") == smart_ref
 
 
 def test_hto_identity_is_artifact_backed(
@@ -514,8 +403,9 @@ def test_hto_identity_is_artifact_backed(
     monkeypatch,
 ) -> None:
     datastore = datastore_ephemeral
+    selection = datastore.snapshot_cell_selection()
     n_active = len(datastore.cells.active_index("I"))
-    column_name = "sample_id"
+    columns_before = set(datastore.cells.columns)
     expected = np.asarray(
         ["negative" if index % 2 else "tag" for index in range(n_active)]
     )
@@ -523,161 +413,157 @@ def test_hto_identity_is_artifact_backed(
         "scarf.datastore._operations.quality_control.hto_demux",
         lambda counts, **kwargs: pd.Series(expected[: len(counts)]),
     )
+    assay_types = dict(datastore.zw.attrs["assayTypes"])
+    assay_types["assay2"] = "HTO"
+    datastore.zw.attrs["assayTypes"] = assay_types
 
-    returned_label = datastore.mark_hto_identities(
-        from_assay="assay2",
-        cell_key="I",
-        label=column_name,
-    )
+    ref = datastore.run_hto_demultiplexing(selection, from_assay="assay2")
 
-    assert returned_label == column_name
-    ref = _column_ref(datastore, column_name)
     assert ref.kind == "hto_identity"
-    parameters = datastore.inspect_artifact(ref).parameters
+    status = datastore.inspect_artifact(ref)
+    assert status.operation == "run_hto_demultiplexing"
+    parameters = status.parameters
     assert parameters is not None
-    assert parameters["method"] == {
-        "normalization": "clr_per_hto",
-        "clustering": {
-            "method": "kmeans",
-            "init": "random",
-            "n_starts": 100,
-            "cluster_count": "n_htos_plus_one",
-        },
-        "background": "raw_mean",
-        "cutoff": {
-            "distribution": "negative_binomial_nb2",
-            "quantile": 0.99,
-            "location": 0,
-            "comparison": "strictly_greater",
-        },
-        "singlet_assignment": "clr_argmax",
-    }
+    assert parameters["method"]["normalization"] == "clr_per_hto"
     assert "algorithm_version" not in parameters
     np.testing.assert_array_equal(
-        datastore.cells.fetch(column_name, key="I"),
+        artifact_values(artifact_group(datastore.zw, ref), "values"),
         expected,
     )
-    monkeypatch.setattr(
-        "scarf.datastore._operations.quality_control.hto_demux",
-        lambda counts, **kwargs: (_ for _ in ()).throw(
-            AssertionError("cached HTO identities were recomputed")
+    datastore.memoryBytes = 1
+    assert (
+        datastore.run_hto_demultiplexing(
+            selection,
+            from_assay="assay2",
+        )
+        == ref
+    )
+    assert set(datastore.cells.columns) == columns_before
+
+
+def test_hto_demultiplexing_rejects_non_hto_assay(datastore_ephemeral) -> None:
+    datastore = datastore_ephemeral
+    selection = datastore.snapshot_cell_selection()
+
+    with pytest.raises(TypeError, match="declared with type 'HTO'"):
+        datastore.run_hto_demultiplexing(selection, from_assay="assay2")
+
+
+def test_hto_demultiplexing_respects_datastore_memory_budget(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    selection = datastore.snapshot_cell_selection()
+    assay_types = dict(datastore.zw.attrs["assayTypes"])
+    assay_types["assay2"] = "HTO"
+    datastore.zw.attrs["assayTypes"] = assay_types
+    datastore.memoryBytes = 1
+
+    with pytest.raises(MemoryError, match="exceeds the datastore memory budget"):
+        datastore.run_hto_demultiplexing(selection, from_assay="assay2")
+
+
+def test_cell_cycle_scoring_returns_one_artifact_without_writing_columns(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    selection = datastore.auto_filter_cells()
+    columns_before = set(datastore.cells.columns)
+
+    ref = datastore.run_cell_cycle_scoring(selection)
+
+    assert ref.kind == "cell_cycle"
+    group = artifact_group(datastore.zw, ref)
+    assert set(group.array_keys()) == {"s_score", "g2m_score", "phase"}
+    assert len(artifact_values(group, "phase")) == int(
+        artifact_values(artifact_group(datastore.zw, selection), "values").sum()
+    )
+    assert set(datastore.cells.columns) == columns_before
+
+
+def test_explicit_graph_consumers_ignore_later_live_selection_changes(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    graph = _ensure_graph(datastore)
+    graph_n = datastore.load_graph(graph).shape[0]
+    neighbors = _graph_neighbors(datastore, graph)
+    initialization = _graph_initialization(datastore, graph)
+    mask = np.asarray(datastore.cells.fetch_all("I"), dtype=bool)
+    selected = np.flatnonzero(mask)
+    assert len(selected) > 1
+    mask[selected[0]] = False
+    datastore.cells.insert("I", mask, overwrite=True, force=True)
+
+    clusters = datastore.run_leiden_clustering(graph)
+    embedding = datastore.run_umap(graph, initialization, n_epochs=10)
+    diffusion = datastore.run_diffusion_operator(graph, invalidate_cache=True)
+    operator = datastore.load_diffusion_operator(diffusion)
+    feature_name = str(datastore.RNA.feats.fetch_all("names")[0])
+    imputed = datastore.get_imputed(feature_name, diffusion)
+    lisi = datastore.metric_lisi(["names"], neighbors, perplexity=1)
+
+    assert clusters.kind == "cluster_labels"
+    assert embedding.kind == "embedding"
+    assert diffusion.kind == "diffusion_operator"
+    assert operator.shape == (graph_n, graph_n)
+    assert imputed.shape == (graph_n,)
+    assert datastore.load_metric_lisi(lisi)["names"].shape == (graph_n,)
+
+
+def test_graph_consumers_require_explicit_artifact_refs(datastore_ephemeral) -> None:
+    datastore = datastore_ephemeral
+    graph = _ensure_graph(datastore)
+    coordinates = _graph_coordinates(datastore, graph)
+    initialization = _graph_initialization(datastore, graph)
+
+    first = datastore.run_leiden_clustering(graph)
+    side_neighbors = datastore.query_neighbors(
+        ArtifactRef.from_dict(
+            datastore.inspect_artifact(_graph_neighbors(datastore, graph)).inputs[
+                "ann_index"
+            ]
         ),
+        k=5,
     )
-    cached_label = datastore.mark_hto_identities(
-        from_assay="assay2",
-        cell_key="I",
-        label=column_name,
-    )
-    assert cached_label == column_name
-    assert _column_ref(datastore, column_name) == ref
+    side_graph = datastore.build_connectivity_map(side_neighbors)
+    assert datastore.run_leiden_clustering(side_graph) != first
 
-
-def test_user_display_metadata_survives_column_refresh(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    _ensure_graph(datastore)
-    datastore.run_umap(n_epochs=10, label="display_umap")
-    datastore.run_leiden_clustering(label="display_leiden")
-    column = datastore.zw["cellData"]["RNA_display_leiden"]
-    custom = {
-        "kind": "categorical",
-        "categories": [
-            {
-                "value": int(category),
-                "label": f"Group {category}",
-                "color": "#123456",
-            }
-            for category in np.unique(
-                datastore.cells.fetch("RNA_display_leiden", key="I")
-            )
-        ],
-    }
-    column.attrs["display"] = custom
-
-    datastore.run_leiden_clustering(
-        label="display_leiden",
-        invalidate_cache=True,
-    )
-
-    assert (
-        dict(datastore.zw["cellData"]["RNA_display_leiden"].attrs["display"]) == custom
-    )
-    result = splt.embedding(
-        datastore,
-        layout_key="RNA_display_umap",
-        color_by="RNA_display_leiden",
-        show=False,
-    )
-    categorical = next(
-        scale for scale in result.scales if isinstance(scale, CategoricalScale)
-    )
-    assert categorical.palette is not None
-    assert set(categorical.palette.values()) == {"#123456"}
-    assert categorical.labels is not None
-    assert all(label.startswith("Group ") for label in categorical.labels.values())
-    result.close()
-
-
-def test_malformed_display_is_rejected_before_column_refresh(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    _ensure_graph(datastore)
-    datastore.run_leiden_clustering(label="malformed_display")
-    column_name = "RNA_malformed_display"
-    column = datastore.zw["cellData"][column_name]
-    original_ref = dict(column.attrs["source_artifact"])
-    original_values = datastore.cells.fetch_all(column_name).copy()
-    column.attrs["display"] = "invalid"
-
-    with pytest.raises(TypeError, match="mapping"):
-        datastore.run_leiden_clustering(
-            label="malformed_display",
-            invalidate_cache=True,
-        )
-
-    np.testing.assert_array_equal(
-        datastore.cells.fetch_all(column_name),
-        original_values,
-    )
-    assert (
-        dict(datastore.zw["cellData"][column_name].attrs["source_artifact"])
-        == original_ref
-    )
-
-
-def test_multicolumn_display_validation_is_atomic(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    _ensure_graph(datastore)
-    datastore.run_umap(n_epochs=10, label="atomic_display")
-    first = datastore.zw["cellData"]["RNA_atomic_display1"]
-    second = datastore.zw["cellData"]["RNA_atomic_display2"]
-    first_ref = dict(first.attrs["source_artifact"])
-    second_ref = dict(second.attrs["source_artifact"])
-    second.attrs["display"] = "invalid"
-
-    with pytest.raises(TypeError, match="mapping"):
+    with pytest.raises(TypeError, match="ArtifactRef"):
         datastore.run_umap(
+            "RNA/graph",  # type: ignore[arg-type]
+            initialization,
             n_epochs=10,
-            label="atomic_display",
-            invalidate_cache=True,
         )
+    with pytest.raises(ValueError, match="connectivity_map"):
+        datastore.run_umap(coordinates, initialization, n_epochs=10)
 
-    assert dict(first.attrs["source_artifact"]) == first_ref
-    assert dict(second.attrs["source_artifact"]) == second_ref
+
+def test_lisi_rejects_incomplete_ann_dependency(datastore_ephemeral) -> None:
+    datastore = datastore_ephemeral
+    graph = _ensure_graph(datastore)
+    neighbors = _graph_neighbors(datastore, graph)
+    ann = ArtifactRef.from_dict(
+        datastore.inspect_artifact(neighbors).inputs["ann_index"]
+    )
+    ann_group = datastore.zw[artifact_path(ann)]
+    ann_group.attrs["complete"] = False
+
+    try:
+        with pytest.raises(
+            ArtifactResolutionError,
+            match=r"(?i)artifact is incomplete",
+        ) as error:
+            datastore.metric_lisi(["names"], neighbors=neighbors, perplexity=1)
+        assert error.value.code == "incomplete_artifact"
+    finally:
+        ann_group.attrs["complete"] = True
 
 
 @pytest.mark.parametrize(
     ("display", "error_type", "message"),
     [
-        (
-            {"kind": "continuous"},
-            ValueError,
-            "incomplete",
-        ),
+        ({"kind": "continuous"}, ValueError, "incomplete"),
         (
             {
                 "kind": "continuous",
@@ -688,17 +574,6 @@ def test_multicolumn_display_validation_is_atomic(
             },
             TypeError,
             "colormap",
-        ),
-        (
-            {
-                "kind": "continuous",
-                "colormap": "viridis",
-                "minimum": 0.0,
-                "maximum": 1.0,
-                "scale": "square-root",
-            },
-            ValueError,
-            "scale",
         ),
         (
             {
@@ -724,58 +599,12 @@ def test_multicolumn_display_validation_is_atomic(
         (
             {
                 "kind": "categorical",
-                "categories": [{"value": 1, "label": "one"}],
-            },
-            ValueError,
-            "requires value, label, and color",
-        ),
-        (
-            {
-                "kind": "categorical",
-                "categories": [{"value": None, "label": "none", "color": "#123456"}],
-            },
-            TypeError,
-            "JSON scalar",
-        ),
-        (
-            {
-                "kind": "categorical",
-                "categories": [{"value": 1, "label": 1, "color": "#123456"}],
-            },
-            TypeError,
-            "label must be a string",
-        ),
-        (
-            {
-                "kind": "categorical",
                 "categories": [{"value": 1, "label": "one", "color": "red"}],
             },
             ValueError,
             "hex color",
         ),
-        (
-            {
-                "kind": "categorical",
-                "categories": [],
-                "missing_label": 1,
-            },
-            TypeError,
-            "missing_label",
-        ),
-        (
-            {
-                "kind": "categorical",
-                "categories": [],
-                "missing_color": "red",
-            },
-            ValueError,
-            "missing_color",
-        ),
-        (
-            {"kind": "unknown"},
-            ValueError,
-            "continuous or categorical",
-        ),
+        ({"kind": "unknown"}, ValueError, "continuous or categorical"),
     ],
 )
 def test_display_validation_rejects_malformed_contracts(
@@ -787,7 +616,7 @@ def test_display_validation_rejects_malformed_contracts(
         validate_display_metadata(display)
 
 
-def test_display_validation_rejects_nonfinite_and_duplicate_values() -> None:
+def test_display_validation_rejects_nonfinite_duplicates_and_collisions() -> None:
     with pytest.raises(TypeError, match="minimum"):
         validate_display_metadata(
             {
@@ -818,314 +647,15 @@ def test_display_validation_rejects_nonfinite_and_duplicate_values() -> None:
                 ],
             }
         )
-    with pytest.raises(ValueError, match="unknown fields"):
-        validate_display_metadata(
-            {
-                "kind": "continuous",
-                "colormap": "viridis",
-                "minimum": 0.0,
-                "maximum": 1.0,
-                "scale": "linear",
-                "extra": "invalid",
-            }
-        )
 
 
-def test_small_constant_log_bounds_remain_positive() -> None:
-    limits = _continuous_limits(
-        np.asarray([0.1, 0.1]),
-        ColorScale(
-            cmap="viridis",
-            vmin=0.1,
-            vmax=0.1,
-            scale="log",
-        ),
-    )
-
-    assert limits[0] > 0
-    assert limits[0] < 0.1 < limits[1]
-
-
-def test_composition_keeps_missing_category_distinct(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    n_cells = len(datastore.cells.active_index("I"))
-    values = np.asarray(
-        [
-            np.nan if index % 3 == 0 else 1.0 if index % 3 == 1 else 2.0
-            for index in range(n_cells)
-        ],
-        dtype=float,
-    )
-    datastore.cells.insert(
-        "composition_missing",
-        values,
-        key="I",
-        overwrite=True,
-    )
-    result = splt.composition(
-        datastore,
-        category_by="composition_missing",
-        categorical_scale=CategoricalScale(
-            order=(1.0, 2.0),
-            palette={1.0: "#123456", 2.0: "#654321"},
-            missing_color="#ff0000",
-            missing_label="Missing",
-        ),
-        show=False,
-    )
-
-    categories = result.tables["aggregate"]["category"].tolist()
-    assert 1.0 in categories
-    assert any(value is None for value in categories)
-    assert all(value != "\x00scarf_missing_category\x00" for value in categories)
-    returned = next(
-        scale for scale in result.scales if isinstance(scale, CategoricalScale)
-    )
-    assert returned.missing_color == "#ff0000"
-    result.close()
-
-
-def test_manual_column_edit_is_captured_as_new_artifact(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    _ensure_graph(datastore)
-    datastore.run_leiden_clustering(label="editable_leiden")
-    column = "RNA_editable_leiden"
-    original = _column_ref(datastore, column)
-    edited = np.asarray(datastore.cells.fetch(column, key="I")).copy()
-    edited[0] = int(edited.max()) + 1
-    datastore.cells.insert(column, edited, key="I", overwrite=True)
-
-    captured = datastore._resolve_cell_data_input(column, cell_key="I")
-
-    assert captured != original
-    assert captured.kind == "metadata_snapshot"
-    np.testing.assert_array_equal(
-        datastore.load_artifact(captured)["values"][:],
-        edited,
-    )
-    assert _column_ref(datastore, column) == captured
-
-
-def test_cell_cycle_columns_share_one_artifact(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    datastore.auto_filter_cells(show_qc_plots=False)
-    datastore.run_cell_cycle_scoring()
-
-    refs = {
-        _column_ref(datastore, "RNA_S_score"),
-        _column_ref(datastore, "RNA_G2M_score"),
-        _column_ref(datastore, "RNA_cell_cycle_phase"),
+def test_display_metadata_builders_are_deterministic() -> None:
+    assert continuous_display(np.asarray([0.25, np.nan, 0.75])) == {
+        "kind": "continuous",
+        "colormap": "viridis",
+        "minimum": 0.25,
+        "maximum": 0.75,
+        "scale": "linear",
     }
-
-    assert len(refs) == 1
-    ref = refs.pop()
-    assert ref.kind == "cell_cycle"
-    assert set(datastore.load_artifact(ref).array_keys()) == {
-        "s_score",
-        "g2m_score",
-        "phase",
-    }
-
-
-def test_fate_columns_share_one_reusable_artifact(
-    datastore_ephemeral,
-    monkeypatch,
-) -> None:
-    datastore = datastore_ephemeral
-    _ensure_graph(datastore)
-    n_cells = len(datastore.cells.active_index("I"))
-    pseudotime = np.linspace(0.0, 1.0, n_cells)
-    labels = np.full(n_cells, "other", dtype=object)
-    labels[-2:] = ["A", "B"]
-    datastore.cells.insert(
-        "artifact_pseudotime",
-        pseudotime,
-        key="I",
-        overwrite=True,
-    )
-    datastore.cells.insert(
-        "artifact_sinks",
-        labels,
-        key="I",
-        overwrite=True,
-    )
-
-    result = datastore.run_fate_mapping(
-        pseudotime_key="artifact_pseudotime",
-        sink_key="artifact_sinks",
-        sinks=["A", "B"],
-        label="artifact_fate",
-    )
-    refs = {
-        _column_ref(datastore, column)
-        for column in (*result.fate_keys, result.validity_key)
-    }
-    assert len(refs) == 1
-    fate_ref = refs.pop()
-    assert fate_ref.kind == "fate_map"
-
-    from scarf.datastore._operations import trajectory as trajectory_operations
-
-    def fail_if_recomputed(*_args, **_kwargs):
-        raise AssertionError("fate mapping should have been reused")
-
-    monkeypatch.setattr(
-        trajectory_operations,
-        "_compute_fate_probabilities_impl",
-        fail_if_recomputed,
-    )
-    cached = datastore.run_fate_mapping(
-        pseudotime_key="artifact_pseudotime",
-        sink_key="artifact_sinks",
-        sinks=["A", "B"],
-        label="artifact_fate_cached",
-    )
-    assert _column_ref(datastore, cached.fate_keys[0]) == fate_ref
-    np.testing.assert_allclose(cached.values, result.values, equal_nan=True)
-
-
-def test_graph_outputs_reject_equal_size_different_cell_selection(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    _ensure_graph(datastore)
-    mask = np.asarray(datastore.cells.fetch_all("I"), dtype=bool)
-    selected = np.flatnonzero(mask)
-    excluded = np.flatnonzero(~mask)
-    assert len(selected) > 0 and len(excluded) > 0
-    mask[selected[0]] = False
-    mask[excluded[0]] = True
-    datastore.cells.insert("I", mask, overwrite=True, force=True)
-
-    with pytest.raises(ValueError, match="no longer matches"):
-        datastore.run_leiden_clustering(label="misaligned")
-    with pytest.raises(ValueError, match="no longer matches"):
-        datastore.run_umap(n_epochs=10, label="misaligned_umap")
-    with pytest.raises(ValueError, match="no longer matches"):
-        datastore.get_diffusion_operator(invalidate_cache=True)
-    with pytest.raises(ValueError, match="no longer matches"):
-        datastore.metric_lisi(
-            ["names"],
-            perplexity=1,
-        )
-
-
-def test_graph_outputs_accept_content_equivalent_selection_artifacts(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    _ensure_graph(datastore)
-    equivalent = resolve_selection_artifact(
-        datastore.zw,
-        scope="datastore",
-        kind="cell_selection",
-        values=np.asarray(datastore.cells.fetch_all("I"), dtype=bool),
-        row_ids=np.asarray(datastore.cells.fetch_all("ids")),
-        operation="equivalent_selection",
-        parameters={"source": "test"},
-        inputs={},
-        source_column="I",
-    )
-    datastore.zw["cellData/I"].attrs["source_artifact"] = equivalent.to_dict()
-    datastore.zw["cellData/I"].attrs["source_value"] = "values"
-
-    datastore.run_leiden_clustering(label="equivalent_selection")
-    assert "RNA_equivalent_selection" in datastore.cells.columns
-
-
-def test_graph_consumers_accept_an_explicit_connectivity_map(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    _ensure_graph(datastore)
-    state = datastore.get_assay_state("RNA")
-    assert state is not None
-    graph = state.connectivity_map
-    assert graph is not None
-
-    implicit = datastore.run_leiden_clustering(label="implicit_leiden")
-    explicit = datastore.run_leiden_clustering(graph, label="explicit_leiden")
-
-    assert explicit == implicit
-    np.testing.assert_array_equal(
-        datastore.cells.fetch("RNA_implicit_leiden", key="I"),
-        datastore.cells.fetch("RNA_explicit_leiden", key="I"),
-    )
-    umap_ref = datastore.run_umap(graph, n_epochs=10, label="explicit_umap")
-    assert umap_ref.kind == "embedding"
-    assert "RNA_explicit_umap1" in datastore.cells.columns
-
-    side_neighbors = datastore.query_neighbors(
-        state.ann_index,
-        k=5,
-        update_state=False,
-    )
-    side_graph = datastore.build_connectivity_map(
-        side_neighbors,
-        update_state=False,
-    )
-    side = datastore.run_leiden_clustering(side_graph, label="side_leiden")
-    assert side != implicit
-    assert "RNA_side_leiden" in datastore.cells.columns
-    assert datastore.get_assay_state("RNA").connectivity_map == graph
-
-    with pytest.raises(TypeError, match="feat_key"):
-        datastore.run_leiden_clustering(graph, feat_key="I", label="mismatched")
-    with pytest.raises(TypeError, match="artifact reference"):
-        datastore.run_umap("RNA/graph", n_epochs=10, label="not_a_ref")
-    with pytest.raises(ValueError, match="connectivity map"):
-        datastore.run_umap(state.reduction, n_epochs=10, label="wrong_kind")
-
-
-def test_lisi_rejects_incomplete_ann_dependency(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    _ensure_graph(datastore)
-    state = datastore.get_assay_state("RNA")
-    assert state is not None
-    assert state.ann_index is not None
-    assert state.neighbors is not None
-    ann_group = datastore.zw[artifact_path(state.ann_index)]
-    ann_group.attrs["complete"] = False
-
-    try:
-        with pytest.raises(
-            ArtifactResolutionError,
-            match=r"(?i)artifact is incomplete",
-        ) as error:
-            datastore.metric_lisi(
-                ["names"],
-                neighbors=state.neighbors,
-                perplexity=1,
-            )
-        assert error.value.code == "incomplete_artifact"
-    finally:
-        ann_group.attrs["complete"] = True
-
-
-def test_unedited_paris_column_retains_cluster_cut_ref(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    _ensure_graph(datastore)
-    result = datastore.run_paris_clustering(
-        n_clusters=3,
-        label="metadata_paris",
-    )
-    assert result.label_key is not None
-    linked = _column_ref(datastore, result.label_key)
-
-    resolved = datastore._resolve_cell_data_input(
-        result.label_key,
-        cell_key="I",
-    )
-
-    assert linked.kind == "cluster_cut"
-    assert resolved == linked
+    categorical = categorical_display(np.asarray([2, 1, 2]))
+    assert [item["value"] for item in categorical["categories"]] == [1, 2]

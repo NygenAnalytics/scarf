@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from .cellranger import CrToZarr, MtxToZarr
     from .csv import CSVtoZarr
     from .export import to_h5ad, to_mtx
-    from .h5ad import H5adToZarr
+    from .h5ad import H5adImportResult, H5adToZarr
     from .loom import LoomToZarr
     from .seurat import SeuratImportResult, SeuratToZarr
     from .sparse import SparseToZarr, bed_to_sparse_array as bed_to_sparse_array
@@ -32,6 +32,7 @@ __all__ = [
     "SubsetZarr",
     "CrToZarr",
     "MtxToZarr",
+    "H5adImportResult",
     "H5adToZarr",
     "LoomToZarr",
     "SeuratImportResult",
@@ -56,6 +57,7 @@ _LAZY_EXPORTS = {
     "CSVtoZarr": "csv",
     "to_h5ad": "export",
     "to_mtx": "export",
+    "H5adImportResult": "h5ad",
     "H5adToZarr": "h5ad",
     "LoomToZarr": "loom",
     "SeuratImportResult": "seurat",

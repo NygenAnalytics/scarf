@@ -5,9 +5,11 @@ import pytest
 from profiling.config import (
     CORE_STAGE_ORDER,
     SELECTED_STAGE_ORDER,
+    ClusterSourceRef,
     CountMatrixConfig,
     WorkflowParameters,
     _normalize_raw_config,
+    bind_cluster_source,
     load_profiling_config,
 )
 from profiling.results import result_exists
@@ -68,14 +70,45 @@ def test_fixed_resource_map_expands_the_current_funnel():
     assert normalized["stageResources"] == {stage: fixed for stage in CORE_STAGE_ORDER}
 
 
-def test_marker_group_key_matches_leiden_column():
+def test_workflow_defaults_are_algorithmic_not_output_aliases():
     workflow = WorkflowParameters()
-    assert workflow.resolvedMarkerGroupKey == "RNA_leiden_cluster"
-    assert workflow.hvgLabel == "hvgs"
-    assert workflow.markerFeatures == "all_features"
     assert workflow.topN == 1000
     assert workflow.dims == 21
     assert workflow.k == 11
+    assert not hasattr(workflow, "hvgLabel")
+    assert not hasattr(workflow, "umapLabel")
+    assert not hasattr(workflow, "leidenLabel")
+    assert not hasattr(workflow, "markerFeatures")
+    assert not hasattr(workflow, "clusterLabelColumn")
+
+
+def test_cluster_source_requires_an_explicit_artifact_id() -> None:
+    with pytest.raises(ValueError, match="must be set together"):
+        WorkflowParameters(clusterSourceUri="s3://bucket/source.zarr")
+    with pytest.raises(ValueError, match="64-character lowercase hex"):
+        WorkflowParameters(
+            clusterSourceUri="s3://bucket/source.zarr",
+            clusterSourceArtifactId="not-an-artifact-id",
+        )
+
+
+def test_bound_cluster_source_preserves_the_explicit_artifact() -> None:
+    config = load_profiling_config(_EXAMPLE_CONFIG).model_copy(
+        update={
+            "clusterSources": (
+                ClusterSourceRef(
+                    nRows=10_000,
+                    storeUri="s3://bucket/source.zarr",
+                    artifactId="d" * 64,
+                ),
+            )
+        }
+    )
+
+    workflow = bind_cluster_source(config, 10_000)
+
+    assert workflow.clusterSourceUri == "s3://bucket/source.zarr"
+    assert workflow.clusterSourceArtifactId == "d" * 64
 
 
 def test_existing_error_result_is_terminal(monkeypatch) -> None:

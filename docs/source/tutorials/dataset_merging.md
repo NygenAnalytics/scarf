@@ -32,7 +32,7 @@ import pandas as pd
 
 import scarf
 
-scarf.configure_output(level="ERROR", progress=True)
+scarf.configure_output(level="ERROR", progress=False)
 
 repository = scarf.cytebase.connect("scarf_docs")
 ctrl_path = repository.download_dataset(
@@ -50,13 +50,11 @@ ds_ctrl = scarf.DataStore(f"{ctrl_path}/data.zarr", nthreads=4)
 ds_stim = scarf.DataStore(f"{stim_path}/data.zarr", nthreads=4)
 ```
 
-Confirm assay type, cell counts, and feature counts before merging.
-Matching gene symbols alone do not establish compatible measurements; genome builds and quantification conventions still need to match when you bring other datasets.
+Confirm assay type, cell counts, and feature counts before merging. `DataStoreMerge` validates the
+feature axes; matching gene symbols alone do not establish compatible genome builds or
+quantification conventions.
 
 ```{code-cell} ipython3
-ctrl_ids = set(ds_ctrl.RNA.feats.fetch_all("ids").astype(str))
-stim_ids = set(ds_stim.RNA.feats.fetch_all("ids").astype(str))
-
 pd.DataFrame(
     [
         {
@@ -68,12 +66,13 @@ pd.DataFrame(
         }
         for label, store in (("ctrl", ds_ctrl), ("stim", ds_stim))
     ]
-).assign(shared_features=len(ctrl_ids & stim_ids))
+)
 ```
 
 ## 2. Merge counts and metadata
 
-`names` supplies the source labels, `source_column` names their metadata column, and `prepend_text` prevents imported columns from colliding with new analysis results.
+`names` supplies the source labels, `source_column` names their metadata column, and `prepend_text`
+keeps imported metadata names distinct from columns authored in the merged store.
 `reset_cell_filter=False` preserves the source quality-control selections.
 
 ```{code-cell} ipython3
@@ -89,106 +88,63 @@ scarf.DataStoreMerge(
     overwrite=True,
 ).dump()
 
-ds = scarf.DataStore(merged_path, nthreads=4)
+merged = scarf.DataStore(merged_path, nthreads=4)
 ```
 
 `sample_id` records the source label.
-Columns imported from the sources keep the `orig_` prefix so later analysis columns can reuse their original names.
-
-```{code-cell} ipython3
-orig_cols = [
-    column
-    for column in ds.cells.columns
-    if column == "sample_id" or column.startswith("orig_")
-]
-ds.cells.to_pandas_dataframe(orig_cols, key="I").head()
-```
+Columns imported from the sources keep the `orig_` prefix so their origin remains explicit.
 
 The merged active population contains labelled cells from both sources.
 
 ```{code-cell} ipython3
-active_cells = ds.cells.to_pandas_dataframe(
+merged.cells.to_pandas_dataframe(
     ["sample_id", "orig_cluster_labels"],
     key="I",
-)
-active_cells.groupby("sample_id")["orig_cluster_labels"].agg(
+).groupby("sample_id")["orig_cluster_labels"].agg(
     cells="count",
     cell_types="nunique",
 )
 ```
 
-## 3. Build the uncorrected baseline
+## 3. Open the rebuilt uncorrected baseline
 
-The standard RNA pipeline records the complete analysis chain as reusable artifacts.
-Filtering is disabled because the source selections were retained.
-The graph uses 21 neighbours so the same graph parameters can be compared with the correction methods on the next page.
+The catalog's merged store is rebuilt with the merge recipe above and a labelled standard RNA
+run. Open that frozen run instead of repeating PCA, graph construction, clustering, and UMAP in
+this merge tutorial. Its graph uses 21 neighbours so the correction methods on the next page can
+branch from the same baseline.
 
 ```{code-cell} ipython3
-baseline = ds.pipeline.run(
-    filtering=False,
-    cell_cycle_scoring=False,
-    highly_variable_features={
-        "min_cells": 10,
-        "top_n": 2000,
-        "min_mean": -3,
-        "max_mean": 2,
-        "max_var": 6,
-    },
-    pca={"dims": 25},
-    neighbors={"k": 21},
-    umap={
-        "n_epochs": 250,
-        "spread": 5,
-        "min_dist": 1,
-        "parallel": True,
-    },
-    leiden={1.0: {"label": "integration_clusters"}},
-    paris=False,
-    doublet_scoring=False,
-    markers=False,
+prepared_path = repository.download_dataset(
+    name="kang_29K_ctrl-ifnb_pbmc_rnaseq",
+    destination="scarf_datasets",
+    zarr=True,
 )
+ds = scarf.DataStore(f"{prepared_path}/data.zarr", nthreads=4)
+baseline = ds.pipeline.open(label="docs_default")
 sorted(baseline)
 ```
 
-The return value lists each written {term}`artifact` by name.
-The selected Leiden partition is also published as `RNA_clusters` for later plotting.
+The durable run maps each output name to its exact {term}`artifact`.
+Requested metadata and results remain in its frozen view.
 
-One plotting call compares source identity with the imported cell types on the same layout.
-
-```{code-cell} ipython3
-comparison = ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by=["sample_id", "orig_cluster_labels"],
-    n_columns=2,
-    show_titles=False,
-    show=False,
-)
-for axis, title in zip(
-    comparison.axes.values(),
-    ("Source", "Imported cell type"),
-    strict=True,
-):
-    axis.set_title(title)
-comparison.show()
-```
-
-The uncorrected Leiden partition that the pipeline selected as `RNA_clusters` should track broad cell-type structure even while sources remain segregated.
+One plotting call compares source identity, imported cell types, and the exact clustering artifact
+on the same layout.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by="RNA_clusters",
+    layout=baseline["umap"],
+    color_by=["sample_id", "orig_cluster_labels", baseline["clusters"]],
+    n_columns=3,
 )
 ```
 
 A proportional composition plot makes source dominance within the uncorrected Leiden clusters explicit.
 
 ```{code-cell} ipython3
-ds.plots.composition(
-    category_by="sample_id",
-    sample_by="RNA_clusters",
-    kind="stacked",
-    show_percent_labels=True,
+pd.crosstab(
+    baseline.cells.fetch("clusters"),
+    baseline.cells.fetch("sample_id"),
+    normalize="index",
 )
 ```
 
@@ -199,23 +155,18 @@ One is the maximum mixing score across the observed sources.
 ```{code-cell} ipython3
 uncorrected_ilisi = ds.metric_ilisi(
     batch_colname="sample_id",
+    neighbors=baseline["neighbors"],
     perplexity=7,
 )
 {"uncorrected iLISI": round(uncorrected_ilisi, 3)}
 ```
 
-The value `0.000` therefore indicates essentially no source mixing in the median uncorrected neighbourhood.
-
 The stimulated sample received interferon beta, and PBMC cell types do not all respond identically to that treatment.
 Source-associated structure can therefore include biological response as well as technical variation.
 An interferon-response gene such as `ISG15` makes that stim-enriched program visible on the same uncorrected layout.
 
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by="ISG15",
-)
-```
+Inspect treatment-linked expression separately before interpreting the source mixing as purely
+technical.
 
 This page establishes the uncorrected observation; {doc}`batch_correction` compares how partial PCA and Harmony change it.
 Keep uncorrected counts for condition-level differential expression.

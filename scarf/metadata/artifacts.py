@@ -1,6 +1,6 @@
 import colorsys
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import numpy as np
@@ -9,13 +9,19 @@ import zarr
 from ..storage.arrays import create_metadata_column, create_zarr_dataset
 from ..storage.artifact_writer import (
     ArrayRequirement,
+    AttributeRequirement,
     PlannedArtifact,
     finish_artifact,
     plan_artifact,
     reused_artifact_group,
     start_artifact,
 )
-from ..storage.artifacts import ArtifactRef, ArtifactScope, artifact_path
+from ..storage.artifacts import (
+    ArtifactRef,
+    ArtifactScope,
+    fingerprint_stored_arrays,
+)
+from ..storage.selections import validate_stored_selection_integrity
 from ..storage.types import as_zarr_array, as_zarr_group
 
 _CATEGORY_COLORS = (
@@ -145,18 +151,20 @@ def plan_cell_data_artifact(
     arrays: Mapping[str, tuple[tuple[int, ...], str | None]],
     assay: str | None = None,
     invalidate_cache: bool = False,
+    required_attributes: tuple[str | AttributeRequirement, ...] = (),
+    reuse_validator: Callable[[ArtifactRef, zarr.Group], bool] | None = None,
 ) -> PlannedArtifact:
     if cell_selection.kind != "cell_selection":
         raise ValueError("cell_selection must reference a cell-selection artifact")
-    selection_group = as_zarr_group(
-        root[artifact_path(cell_selection)],
-        name=artifact_path(cell_selection),
+    selection = validate_stored_selection_integrity(
+        root,
+        cell_selection,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
     )
-    mask = np.asarray(
-        as_zarr_array(selection_group["values"], name="values")[:],
-        dtype=bool,
-    )
-    selected_count = int(mask.sum())
+    selected_count = int(selection.selected_count)
     if any(shape[0] != selected_count for shape, _kind in arrays.values()):
         raise ValueError("Artifact arrays must align with the selected cell count")
     artifact_inputs = {**inputs, "cell_selection": cell_selection}
@@ -175,6 +183,8 @@ def plan_cell_data_artifact(
         execution_options=execution_options,
         invalidate_cache=invalidate_cache,
         required_arrays=requirements,
+        required_attributes=required_attributes,
+        reuse_validator=reuse_validator,
     )
 
 
@@ -182,6 +192,8 @@ def write_cell_data_artifact(
     root: zarr.Group,
     planned: PlannedArtifact,
     arrays: Mapping[str, np.ndarray],
+    *,
+    fingerprint_payload: bool = False,
 ) -> zarr.Group:
     if planned.reused:
         return reused_artifact_group(root, planned)
@@ -198,6 +210,7 @@ def write_cell_data_artifact(
                 name,
                 data=values.astype(str),
                 overwrite=True,
+                chunkSize=min(max(int(values.shape[0]), 1), 100_000),
             )
         else:
             chunks = (
@@ -212,6 +225,11 @@ def write_cell_data_artifact(
                 values.shape,
             )
             output[...] = values
+    if fingerprint_payload:
+        group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
+            group,
+            tuple(arrays),
+        )
     finish_artifact(group, planned)
     return group
 
@@ -223,39 +241,6 @@ def artifact_values(
 ) -> np.ndarray:
     values = np.asarray(as_zarr_array(group[name], name=name)[:])
     return values if value_index is None else values[:, value_index]
-
-
-def link_cell_data_column(
-    root: zarr.Group,
-    column: str,
-    ref: ArtifactRef,
-    *,
-    value_name: str,
-    value_index: int | None = None,
-    default_display: Mapping[str, Any] | None = None,
-    preserved_display: Mapping[str, Any] | None = None,
-) -> None:
-    cell_data = as_zarr_group(root["cellData"], name="cellData")
-    target = as_zarr_array(cell_data[column], name=column)
-    display_to_write = None
-    if "display" in target.attrs:
-        current_display = target.attrs["display"]
-        if not isinstance(current_display, Mapping):
-            raise TypeError("Existing display metadata must be a mapping")
-        display_to_write = validate_display_metadata(current_display)
-    elif preserved_display is not None:
-        display_to_write = validate_display_metadata(preserved_display)
-    elif default_display is not None:
-        display_to_write = validate_display_metadata(default_display)
-    target.attrs["source_artifact"] = ref.to_dict()
-    target.attrs["source_value"] = value_name
-    if value_index is None:
-        if "value_index" in target.attrs:
-            del target.attrs["value_index"]
-    else:
-        target.attrs["value_index"] = int(value_index)
-    if display_to_write is not None:
-        target.attrs["display"] = display_to_write
 
 
 def column_display(
@@ -342,61 +327,3 @@ def categorical_display(values: np.ndarray) -> dict[str, Any]:
         display["missing_label"] = "NA"
         display["missing_color"] = "#bdbdbd"
     return display
-
-
-def link_feature_data_column(
-    assay_group: zarr.Group,
-    column: str,
-    ref: ArtifactRef,
-    *,
-    value_name: str,
-    value_index: int | None = None,
-    default_display: Mapping[str, Any] | None = None,
-    preserved_display: Mapping[str, Any] | None = None,
-) -> None:
-    feature_data = as_zarr_group(
-        assay_group["featureData"],
-        name="featureData",
-    )
-    target = as_zarr_array(feature_data[column], name=column)
-    display_to_write = None
-    if "display" in target.attrs:
-        current_display = target.attrs["display"]
-        if not isinstance(current_display, Mapping):
-            raise TypeError("Existing display metadata must be a mapping")
-        display_to_write = validate_display_metadata(current_display)
-    elif preserved_display is not None:
-        display_to_write = validate_display_metadata(preserved_display)
-    elif default_display is not None:
-        display_to_write = validate_display_metadata(default_display)
-    target.attrs["source_artifact"] = ref.to_dict()
-    target.attrs["source_value"] = value_name
-    if value_index is None:
-        if "value_index" in target.attrs:
-            del target.attrs["value_index"]
-    else:
-        target.attrs["value_index"] = int(value_index)
-    if display_to_write is not None:
-        target.attrs["display"] = display_to_write
-
-
-def feature_column_display(
-    assay_group: zarr.Group,
-    column: str,
-) -> dict[str, Any] | None:
-    feature_data = as_zarr_group(
-        assay_group["featureData"],
-        name="featureData",
-    )
-    if column not in feature_data:
-        return None
-    attrs = as_zarr_array(
-        feature_data[column],
-        name=column,
-    ).attrs
-    if "display" not in attrs:
-        return None
-    raw_display = attrs["display"]
-    if not isinstance(raw_display, Mapping):
-        raise TypeError("Existing display metadata must be a mapping")
-    return validate_display_metadata(raw_display)

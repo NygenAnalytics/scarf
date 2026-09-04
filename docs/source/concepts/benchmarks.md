@@ -1,15 +1,16 @@
 (benchmarks)=
 # Benchmarks
 
-These empirical reference runs measure one fixed workflow, dataset, software
-revision, and cloud resource envelope. The largest completed run processed
-10 million input cells through conversion, quality control, normalization,
-graph construction, embedding, clustering, and marker search in 2.78 hours,
-with 31.9 GiB mean peak memory on a 16 CPU, 64 GiB container.
+These empirical reference runs measure one fixed object-store workflow, dataset, software
+revision, and cloud resource envelope. Execution used S3-compatible object storage in the Modal
+EU region. The largest completed size processed 10 million input cells through conversion,
+quality control, normalization, graph construction, embedding, clustering, and marker search in
+2.78 hours on average, with 31.9 GiB mean sampled peak memory on a 16 CPU, 64 GiB container.
 
-The results establish execution and resource use for this configuration. They
-are not hardware guarantees, biological validation, or a comparison with
-another package.
+The results establish execution and resource use for this recorded configuration. No local
+filesystem baseline was collected, so they do not measure an object-store penalty or compare
+remote and local execution. They are not hardware guarantees, biological validation, proof for
+another object-store environment, or a comparison with another package.
 
 ## 1. End-to-end results
 
@@ -107,7 +108,7 @@ separately.
 | Initialize datastore | 17.8 | 19.6 | 20.2 | 55.4 | 75.8 | 370.4 | 686.7 |
 | Reopen datastore | 6.3 | 5.8 | 5.7 | 6.1 | 6.5 | 8.0 | 12.5 |
 | Filter cells | 17.2 | 16.0 | 14.6 | 16.7 | 18.8 | 32.1 | 62.6 |
-| Mark HVGs | 35.5 | 36.9 | 36.9 | 67.0 | 93.7 | 158.0 | 492.4 |
+| Select HVGs | 35.5 | 36.9 | 36.9 | 67.0 | 93.7 | 158.0 | 492.4 |
 | Normalize | 19.5 | 21.8 | 23.5 | 53.8 | 84.2 | 212.6 | 481.0 |
 | PCA | 20.8 | 21.5 | 21.3 | 39.5 | 51.6 | 181.6 | 370.6 |
 | Build embedding initialization | 6.2 | 6.7 | 6.3 | 10.6 | 14.3 | 62.6 | 109.8 |
@@ -151,4 +152,7 @@ despite the difference in cell count.
   hardware guarantee.
 
 See {doc}`memory_and_execution` for how `mem_budget` controls planned block
-sizes and concurrency. It is not a hard process-memory limit.
+sizes and concurrency. It is not a hard process-memory limit. See
+{doc}`../tutorials/remote_stores` for mounted source/target mechanics and non-executed direct-store
+templates. That guide's executable example downloads first and is separate from these measured
+object-store runs.

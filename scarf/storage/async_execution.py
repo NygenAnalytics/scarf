@@ -13,6 +13,8 @@ import zarr
 
 from threadpoolctl import threadpool_limits
 
+from ..utils.shutdown import shutdown_checkpoint
+
 from .budget import ResourceBudget, detect_workers
 from .execution import OperationPlan
 
@@ -276,8 +278,10 @@ class AsyncStorageRunner:
         operation_error: BaseException | None = None
         restore_numba = _install_numba_thread_cap(self.plan.threadsPerComputeWorker)
         try:
+            shutdown_checkpoint()
             with zarr.config.set({"async.concurrency": self.plan.zarrAsyncConcurrency}):
                 result = await operation(self)
+            shutdown_checkpoint()
         except BaseException as exc:
             operation_error = exc
         finally:
@@ -313,7 +317,10 @@ class AsyncStorageRunner:
             with threadpool_limits(limits=threads):
                 return fn()
 
-        return await loop.run_in_executor(self._compute_pool, _limited)
+        shutdown_checkpoint()
+        result = await loop.run_in_executor(self._compute_pool, _limited)
+        shutdown_checkpoint()
+        return result
 
     async def read_slot(self) -> asyncio.Semaphore:
         if self._read_slots is None:
@@ -329,7 +336,9 @@ class AsyncStorageRunner:
     async def reserve_bytes(self, nbytes: int) -> AsyncIterator[None]:
         """Hold a ledger charge for the complete lifetime of an owned buffer."""
         started = time.perf_counter()
+        shutdown_checkpoint()
         await self.ledger.acquire(nbytes)
+        shutdown_checkpoint()
         self.readerWaitSeconds += time.perf_counter() - started
         try:
             yield

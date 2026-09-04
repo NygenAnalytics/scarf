@@ -46,7 +46,6 @@ _EXPECTED_RESULT_FIELDS = {
         "active_features",
         "feature_columns",
         "dataset_fingerprint",
-        "state",
         "artifacts",
     ),
     datastore_summary.DataStoreSummary: (
@@ -60,72 +59,65 @@ _EXPECTED_RESULT_FIELDS = {
         "cell_columns",
         "assays",
         "artifacts",
+        "pipeline_run_counts",
+        "labeled_pipeline_runs",
     ),
     feature_algorithms.EnrichmentResult: (
         "data",
         "source_names",
         "source_sizes",
         "cell_index",
-        "label",
+        "artifact",
         "storage_path",
         "assay",
-        "cell_key",
+        "cell_selection",
         "feature_selection",
         "method",
     ),
     mapping.MappingResult: (
         "ref",
-        "mapping_name",
         "n_cells",
         "correction_method",
         "diagnostics",
+        "reference",
         "indices",
         "distances",
         "uninformative",
-        "reference",
     ),
     trajectory.FateMappingResult: (
-        "fate_keys",
-        "validity_key",
-        "sink_labels",
-        "assay",
-        "graph_cell_key",
-        "result_cell_key",
+        "ref",
         "graph",
-        "pseudotime_key",
-        "sink_key",
+        "pseudotime",
+        "sink_labels_artifact",
+        "cell_selection",
+        "sink_labels",
         "values",
         "valid",
     ),
     trajectory.PseudotimeScoreResult: (
-        "pseudotime_key",
-        "validity_key",
-        "assay",
-        "graph_cell_key",
-        "result_cell_key",
+        "ref",
         "graph",
+        "cell_selection",
         "values",
         "valid",
     ),
     trajectory.PseudotimeMarkerResult: (
+        "ref",
         "table",
-        "correlation_key",
-        "p_value_key",
         "assay",
-        "cell_key",
+        "cell_selection",
         "feature_selection",
-        "pseudotime_key",
+        "pseudotime",
     ),
     trajectory.PseudotimeAggregationResult: (
+        "ref",
         "data",
         "feature_indices",
         "feature_clusters",
-        "cluster_key",
-        "storage_path",
         "assay",
-        "cell_key",
+        "cell_selection",
         "feature_selection",
-        "pseudotime_key",
+        "pseudotime",
     ),
 }
 
@@ -153,9 +145,9 @@ def test_result_facades_and_constructor_fields_are_stable():
         "indices",
         "distances",
         "uninformative",
-        "reference",
     ):
         assert mapping_parameters[name].default is None
+    assert mapping_parameters["reference"].default is inspect.Parameter.empty
 
 
 def test_result_records_reject_attribute_assignment():
@@ -171,16 +163,40 @@ def test_result_records_reject_attribute_assignment():
         kind="connectivity_map",
         artifact_id="c" * 64,
     )
+    enrichment = scarf.ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="enrichment_scores",
+        artifact_id="e" * 64,
+    )
+    cell_selection = scarf.ArtifactRef(
+        scope="datastore",
+        assay=None,
+        kind="cell_selection",
+        artifact_id="d" * 64,
+    )
+    pseudotime = scarf.ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="pseudotime",
+        artifact_id="b" * 64,
+    )
+    sink_labels = scarf.ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="cluster_labels",
+        artifact_id="9" * 64,
+    )
     records = (
         feature_algorithms.EnrichmentResult(
             SimpleNamespace(shape=(2, 1)),
             np.array(["set"]),
             np.array([2]),
             np.array([0, 1]),
-            "label",
-            "RNA/enrichment/label",
+            enrichment,
+            "_artifacts/assays/RNA/enrichment_scores/result",
             "RNA",
-            "I",
+            cell_selection,
             feature_selection,
             "waggr",
         ),
@@ -191,35 +207,40 @@ def test_result_records_reject_attribute_assignment():
                 kind="projection",
                 artifact_id="a" * 64,
             ),
-            "projection",
             2,
             "none",
             {},
+            SimpleNamespace(),
         ),
         trajectory.FateMappingResult(
-            ("fate_A", "fate_B"),
-            "fate__valid",
-            ("A", "B"),
-            "RNA",
-            "I",
-            "I",
+            scarf.ArtifactRef(
+                scope="assay",
+                assay="RNA",
+                kind="fate_map",
+                artifact_id="8" * 64,
+            ),
             graph,
-            "pseudotime",
-            "clusters",
+            pseudotime,
+            sink_labels,
+            cell_selection,
+            ("A", "B"),
             np.array([[0.25, 0.75], [1.0, 0.0]]),
             np.array([True, True]),
         ),
         trajectory.PseudotimeScoreResult(
-            "pseudotime",
-            "valid",
-            "RNA",
-            "I",
-            "I",
+            pseudotime,
             graph,
+            cell_selection,
             np.array([0.0, 1.0]),
             np.array([True, True]),
         ),
         trajectory.PseudotimeMarkerResult(
+            scarf.ArtifactRef(
+                scope="assay",
+                assay="RNA",
+                kind="pseudotime_markers",
+                artifact_id="7" * 64,
+            ),
             pd.DataFrame(
                 {
                     "feature_index": [0],
@@ -228,23 +249,25 @@ def test_result_records_reject_attribute_assignment():
                     "p_value": [0.0],
                 }
             ),
-            "correlation",
-            "p_value",
             "RNA",
-            "I",
+            cell_selection,
             feature_selection,
-            "pseudotime",
+            pseudotime,
         ),
         trajectory.PseudotimeAggregationResult(
+            scarf.ArtifactRef(
+                scope="assay",
+                assay="RNA",
+                kind="pseudotime_aggregation",
+                artifact_id="6" * 64,
+            ),
             SimpleNamespace(shape=(2, 3)),
             np.array([0, 1]),
             np.array([0, 1]),
-            "clusters",
-            "aggregated",
             "RNA",
-            "I",
+            cell_selection,
             feature_selection,
-            "pseudotime",
+            pseudotime,
         ),
     )
 
@@ -252,6 +275,19 @@ def test_result_records_reject_attribute_assignment():
         first_field = fields(record)[0].name
         with pytest.raises(FrozenInstanceError):
             setattr(record, first_field, None)
+
+    aggregation = records[-1]
+    assert isinstance(aggregation, trajectory.PseudotimeAggregationResult)
+    assert not hasattr(aggregation, "__dict__")
+    aggregation._attach_feature_identity(
+        np.array(["g0", "g1"]),
+        np.array(["id0", "id1"]),
+    )
+    with pytest.raises(RuntimeError, match="already attached"):
+        aggregation._attach_feature_identity(
+            np.array(["g0", "g1"]),
+            np.array(["id0", "id1"]),
+        )
 
 
 def test_pseudotime_result_shape_validation_is_stable():
@@ -267,55 +303,80 @@ def test_pseudotime_result_shape_validation_is_stable():
         kind="connectivity_map",
         artifact_id="c" * 64,
     )
+    cell_selection = scarf.ArtifactRef(
+        scope="datastore",
+        assay=None,
+        kind="cell_selection",
+        artifact_id="d" * 64,
+    )
+    pseudotime = scarf.ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="pseudotime",
+        artifact_id="b" * 64,
+    )
+    sink_labels = scarf.ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="cluster_labels",
+        artifact_id="9" * 64,
+    )
     with pytest.raises(ValueError, match="rows must align"):
         trajectory.FateMappingResult(
-            ("fate_A", "fate_B"),
-            "fate__valid",
-            ("A", "B"),
-            "RNA",
-            "I",
-            "I",
+            scarf.ArtifactRef(
+                scope="assay",
+                assay="RNA",
+                kind="fate_map",
+                artifact_id="8" * 64,
+            ),
             graph,
-            "pseudotime",
-            "clusters",
+            pseudotime,
+            sink_labels,
+            cell_selection,
+            ("A", "B"),
             np.array([[0.25, 0.75], [1.0, 0.0]]),
             np.array([True]),
         )
 
     with pytest.raises(ValueError, match="same shape"):
         trajectory.PseudotimeScoreResult(
-            "pseudotime",
-            "valid",
-            "RNA",
-            "I",
-            "I",
+            pseudotime,
             graph,
+            cell_selection,
             np.array([0.0, 1.0]),
             np.array([True]),
         )
 
     with pytest.raises(ValueError, match="missing columns"):
         trajectory.PseudotimeMarkerResult(
+            scarf.ArtifactRef(
+                scope="assay",
+                assay="RNA",
+                kind="pseudotime_markers",
+                artifact_id="7" * 64,
+            ),
             pd.DataFrame({"feature_index": [0]}),
-            "correlation",
-            "p_value",
             "RNA",
-            "I",
+            cell_selection,
             feature_selection,
-            "pseudotime",
+            pseudotime,
         )
 
     with pytest.raises(ValueError, match="Feature clusters"):
         trajectory.PseudotimeAggregationResult(
+            scarf.ArtifactRef(
+                scope="assay",
+                assay="RNA",
+                kind="pseudotime_aggregation",
+                artifact_id="6" * 64,
+            ),
             SimpleNamespace(shape=(2, 3)),
             np.array([0, 1]),
             np.array([0]),
-            "clusters",
-            "aggregated",
             "RNA",
-            "I",
+            cell_selection,
             feature_selection,
-            "pseudotime",
+            pseudotime,
         )
 
 
@@ -324,9 +385,8 @@ def test_mapping_execution_contract_is_query_owned():
     assert tuple(signature.parameters) == (
         "self",
         "reference",
-        "mapping_name",
+        "cell_selection",
         "query_assay",
-        "cell_key",
         "save_k",
         "missing_feature_policy",
         "query_batches",
@@ -334,7 +394,6 @@ def test_mapping_execution_contract_is_query_owned():
     )
     params = signature.parameters
     assert params["query_assay"].default is None
-    assert params["cell_key"].default == "I"
     assert params["save_k"].default == 3
     assert params["missing_feature_policy"].default == "reference_mean"
     assert params["query_batches"].default is None
@@ -343,7 +402,7 @@ def test_mapping_execution_contract_is_query_owned():
     assert "DataFrame | None" in str(params["query_batches"].annotation)
     return_annotation = signature.return_annotation
     assert getattr(return_annotation, "__name__", str(return_annotation)).endswith(
-        "MappingResult"
+        "ArtifactRef"
     )
     with pytest.raises(TypeError, match="unexpected keyword argument 'target_assay'"):
         scarf.DataStore.run_mapping(

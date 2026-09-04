@@ -1,4 +1,5 @@
 import math
+import re
 import tomllib
 from pathlib import Path
 from typing import Any, Literal, Self
@@ -109,6 +110,7 @@ def validate_requested_stages(stages: tuple[StageName, ...]) -> None:
 
 MAX_TIMEOUT_SECONDS = 86_400
 CLUSTER_SOURCES_PATH = Path(__file__).resolve().parent / "cluster_sources.toml"
+_ARTIFACT_ID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class WorkflowParameters(BaseModel):
@@ -128,7 +130,6 @@ class WorkflowParameters(BaseModel):
     h5adBatchSize: int = 1000
     topN: int = 1000
     hvgMinCells: int = 20
-    hvgLabel: str = "hvgs"
     k: int = 11
     dims: int = 21
     nCentroids: int = 1000
@@ -139,24 +140,14 @@ class WorkflowParameters(BaseModel):
     umapEpochs: int = 300
     umapSeed: int = 4444
     umapParallel: bool = False
-    umapLabel: str = "UMAP"
     leidenResolution: float = 1.0
     leidenBackend: Literal["igraph", "leidenalg"] = "igraph"
     leidenSeed: int = 4444
-    leidenLabel: str = "leiden_cluster"
-    markerFeatures: str = "all_features"
     graphLocalCache: bool | str = "auto"
     parisNClusters: int | Literal["auto"] = "auto"
-    parisLabel: str = "paris_cluster"
     parisMinClusterSize: int | None = None
     clusterSourceUri: str | None = None
-    clusterLabelColumn: str = "RNA_leiden_cluster"
-
-    @property
-    def resolvedMarkerGroupKey(self) -> str:
-        if self.cellKey == "I":
-            return f"{self.assayName}_{self.leidenLabel}"
-        return f"{self.assayName}_{self.cellKey}_{self.leidenLabel}"
+    clusterSourceArtifactId: str | None = None
 
     @model_validator(mode="after")
     def _check_workflow(self) -> Self:
@@ -171,6 +162,10 @@ class WorkflowParameters(BaseModel):
                 raise ValueError("parisMinClusterSize must be >= 2")
             if self.parisNClusters != "auto":
                 raise ValueError("parisMinClusterSize requires parisNClusters='auto'")
+        if (self.clusterSourceUri is None) != (self.clusterSourceArtifactId is None):
+            raise ValueError(
+                "clusterSourceUri and clusterSourceArtifactId must be set together"
+            )
         if self.clusterSourceUri is not None:
             uri = self.clusterSourceUri.strip()
             if not uri:
@@ -181,8 +176,11 @@ class WorkflowParameters(BaseModel):
                 or uri.startswith("file://")
             ):
                 raise ValueError("clusterSourceUri must be an s3:// URI or local path")
-        if not self.clusterLabelColumn:
-            raise ValueError("clusterLabelColumn must be non-empty")
+            assert self.clusterSourceArtifactId is not None
+            if _ARTIFACT_ID_PATTERN.fullmatch(self.clusterSourceArtifactId) is None:
+                raise ValueError(
+                    "clusterSourceArtifactId must be a 64-character lowercase hex token"
+                )
         return self
 
 
@@ -284,7 +282,7 @@ class ClusterSourceRef(BaseModel):
 
     nRows: int
     storeUri: str
-    labelColumn: str = "RNA_leiden_cluster"
+    artifactId: str
 
     @model_validator(mode="after")
     def _check_ref(self) -> Self:
@@ -292,8 +290,10 @@ class ClusterSourceRef(BaseModel):
             raise ValueError("cluster source nRows must be positive")
         if not self.storeUri.startswith("s3://"):
             raise ValueError("cluster source storeUri must be an s3:// URI")
-        if not self.labelColumn:
-            raise ValueError("cluster source labelColumn must be non-empty")
+        if _ARTIFACT_ID_PATTERN.fullmatch(self.artifactId) is None:
+            raise ValueError(
+                "cluster source artifactId must be a 64-character lowercase hex token"
+            )
         return self
 
 
@@ -433,7 +433,7 @@ def bind_cluster_source(config: ProfilingConfig, nRows: int) -> WorkflowParamete
     return config.workflow.model_copy(
         update={
             "clusterSourceUri": source.storeUri,
-            "clusterLabelColumn": source.labelColumn,
+            "clusterSourceArtifactId": source.artifactId,
         }
     )
 

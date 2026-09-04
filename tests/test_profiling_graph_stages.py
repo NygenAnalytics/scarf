@@ -1,5 +1,6 @@
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -21,6 +22,65 @@ _FEATURE_REF = ArtifactRef(
     kind="feature_selection",
     artifact_id="a" * 64,
 )
+
+
+def _ref(kind: str, value: str, *, scope: str = "assay") -> ArtifactRef:
+    return ArtifactRef(
+        scope=scope,
+        assay="RNA" if scope == "assay" else None,
+        kind=kind,
+        artifact_id=value * 64,
+    )
+
+
+_CELL_SELECTION = _ref("cell_selection", "b", scope="datastore")
+_NORMALIZED = _ref("normalized", "c")
+_REDUCTION = _ref("reduction", "d")
+_INITIALIZATION = _ref("embedding_initialization", "e")
+_ANN_INDEX = _ref("ann_index", "f")
+_NEIGHBORS = _ref("neighbors", "1")
+_CONNECTIVITY = _ref("connectivity_map", "2")
+_EMBEDDING = _ref("embedding", "3")
+_CLUSTERS = _ref("cluster_labels", "4")
+
+_ARTIFACTS_BY_KIND = {
+    ref.kind: ref
+    for ref in (
+        _NORMALIZED,
+        _REDUCTION,
+        _INITIALIZATION,
+        _ANN_INDEX,
+        _NEIGHBORS,
+        _CONNECTIVITY,
+    )
+}
+
+_RESULT_BY_METHOD = {
+    "run_normalization": _NORMALIZED,
+    "run_pca": _REDUCTION,
+    "build_embedding_initialization": _INITIALIZATION,
+    "build_ann_index": _ANN_INDEX,
+    "query_neighbors": _NEIGHBORS,
+    "build_connectivity_map": _CONNECTIVITY,
+    "run_umap": _EMBEDDING,
+}
+
+_INPUTS_BY_STAGE: dict[StageName, dict[str, ArtifactRef]] = {
+    "runNormalization": {
+        "cells": _CELL_SELECTION,
+        "features": _FEATURE_REF,
+    },
+    "runPca": {"normalized": _NORMALIZED},
+    "buildEmbeddingInitialization": {"coordinates": _REDUCTION},
+    "buildAnnIndex": {"coordinates": _REDUCTION},
+    "queryNeighbors": {"ann_index": _ANN_INDEX},
+    "buildConnectivityMap": {"neighbors": _NEIGHBORS},
+    "runUmap": {
+        "graph": _CONNECTIVITY,
+        "initialization": _INITIALIZATION,
+    },
+    "findMarkers": {"clusters": _CLUSTERS},
+}
 
 
 def _resources() -> StageResources:
@@ -45,100 +105,104 @@ class _RecordingStore:
         self.resolved_features.append((assay, features))
         return _FEATURE_REF
 
+    def snapshot_cell_selection(self, _cell_key: str) -> ArtifactRef:
+        return _CELL_SELECTION
+
+    def list_artifacts(self, *, kind: str, **_kwargs: Any) -> list[ArtifactRef]:
+        return [_ARTIFACTS_BY_KIND[kind]]
+
     @staticmethod
     def _get_assay(_assay: str) -> object:
         return object()
 
     @staticmethod
-    def _ensure_all_features(_assay: object) -> ArtifactRef:
+    def get_assay(_assay: str) -> object:
+        return SimpleNamespace(feats=SimpleNamespace(N=10))
+
+    @staticmethod
+    def select_all_features(*, from_assay: str | None = None) -> ArtifactRef:
+        assert from_assay == "RNA"
         return _FEATURE_REF
 
     def __getattr__(self, name: str) -> Any:
-        def record(*args: Any, **kwargs: Any) -> object:
+        def record(*args: Any, **kwargs: Any) -> ArtifactRef:
             self.calls.append((name, args, kwargs))
-            return object()
+            return _RESULT_BY_METHOD.get(name, _FEATURE_REF)
 
         return record
 
 
 @pytest.mark.parametrize(
-    ("stage", "method", "expected"),
+    ("stage", "method", "expected_args", "expected_kwargs"),
     [
         (
             "runNormalization",
             "run_normalization",
+            (_CELL_SELECTION, _FEATURE_REF),
             {
-                "from_assay": "RNA",
-                "cell_key": "I",
-                "features": _FEATURE_REF,
-                "update_state": True,
                 "invalidate_cache": False,
             },
         ),
         (
             "runPca",
             "run_pca",
+            (_NORMALIZED,),
             {
-                "from_assay": "RNA",
                 "dims": 37,
                 "local_cache": False,
                 "show_elbow_plot": False,
-                "update_state": True,
                 "invalidate_cache": False,
             },
         ),
         (
             "buildEmbeddingInitialization",
             "build_embedding_initialization",
+            (_REDUCTION,),
             {
-                "from_assay": "RNA",
                 "n_centroids": 321,
                 "rand_state": 99,
                 "kmeans_sampling": 0.2,
                 "kmeans_batch_size": 5_000,
-                "update_state": True,
                 "invalidate_cache": False,
             },
         ),
         (
             "buildAnnIndex",
             "build_ann_index",
+            (_REDUCTION,),
             {
-                "from_assay": "RNA",
                 "ann_efc": 51,
                 "ann_ef": 51,
                 "ann_m": 55,
                 "ann_parallel": True,
                 "rand_state": 99,
-                "update_state": True,
                 "invalidate_cache": False,
             },
         ),
         (
             "queryNeighbors",
             "query_neighbors",
+            (_ANN_INDEX,),
             {
-                "from_assay": "RNA",
                 "k": 17,
-                "update_state": True,
                 "invalidate_cache": False,
             },
         ),
         (
             "buildConnectivityMap",
             "build_connectivity_map",
+            (_NEIGHBORS,),
             {
-                "from_assay": "RNA",
-                "update_state": True,
                 "invalidate_cache": False,
             },
         ),
     ],
 )
-def test_graph_construction_profile_stage_selects_state_and_preserves_parameters(
+def test_graph_construction_profile_stage_uses_explicit_refs_and_parameters(
     stage: StageName,
     method: str,
-    expected: dict[str, Any],
+    expected_args: tuple[ArtifactRef, ...],
+    expected_kwargs: dict[str, Any],
 ) -> None:
     store = _RecordingStore()
     workflow = WorkflowParameters(
@@ -157,14 +221,14 @@ def test_graph_construction_profile_stage_selects_state_and_preserves_parameters
         store,
         workflow,
         _resources(),
+        inputRefs=_INPUTS_BY_STAGE[stage],
     )
 
-    assert store.calls == [(method, (), expected)]
-    if stage == "runNormalization":
-        assert store.resolved_features == [("RNA", "hvgs")]
+    assert store.calls == [(method, expected_args, expected_kwargs)]
+    assert store.resolved_features == []
 
 
-def test_profile_normalization_consumes_returned_hvg_ref() -> None:
+def test_profile_normalization_consumes_explicit_feature_ref() -> None:
     store = _RecordingStore()
 
     _run_analysis(
@@ -172,42 +236,38 @@ def test_profile_normalization_consumes_returned_hvg_ref() -> None:
         store,
         WorkflowParameters(),
         _resources(),
-        hvgRef=_FEATURE_REF,
+        inputRefs={"cells": _CELL_SELECTION, "features": _FEATURE_REF},
     )
 
     assert store.resolved_features == []
     assert store.calls == [
         (
             "run_normalization",
-            (),
+            (_CELL_SELECTION, _FEATURE_REF),
             {
-                "from_assay": "RNA",
-                "cell_key": "I",
-                "features": _FEATURE_REF,
-                "update_state": True,
                 "invalidate_cache": False,
             },
         )
     ]
 
 
-@pytest.mark.parametrize("marker_features", ["all_features", "marker_panel"])
-def test_profile_marker_search_resolves_explicit_features(
-    marker_features: str,
-) -> None:
+def test_profile_marker_search_uses_explicit_cluster_and_feature_refs() -> None:
     store = _RecordingStore()
 
     _run_analysis(
         "findMarkers",
         store,
-        WorkflowParameters(markerFeatures=marker_features),
+        WorkflowParameters(),
         _resources(),
+        inputRefs={"clusters": _CLUSTERS},
     )
 
-    assert store.resolved_features == [("RNA", marker_features)]
+    assert store.resolved_features == []
     marker_calls = [call for call in store.calls if call[0] == "run_marker_search"]
     assert len(marker_calls) == 1
+    assert marker_calls[0][1] == (_CLUSTERS,)
     assert marker_calls[0][2]["features"] == _FEATURE_REF
+    assert "group_key" not in marker_calls[0][2]
 
 
 def test_forced_profile_stages_invalidate_reusable_artifacts() -> None:
@@ -220,6 +280,7 @@ def test_forced_profile_stages_invalidate_reusable_artifacts() -> None:
             workflow,
             _resources(),
             invalidateCache=True,
+            inputRefs=_INPUTS_BY_STAGE.get(stage),
         )
         assert store.calls
         assert all(
@@ -270,12 +331,12 @@ def test_run_stage_reports_store_open_as_input_setup(
     assert analysis_kwargs["invalidateCache"] is True
 
 
-def test_run_stage_session_carries_hvg_ref_to_normalization(
+def test_run_stage_session_carries_exact_ref_to_normalization(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     store = object()
-    seen_refs: list[ArtifactRef | None] = []
+    seen_refs: list[dict[str, ArtifactRef]] = []
 
     monkeypatch.setattr(
         "profiling.stages._open_datastore",
@@ -285,10 +346,12 @@ def test_run_stage_session_carries_hvg_ref_to_normalization(
     def run_analysis(
         stage: StageName,
         *_args: Any,
-        hvgRef: ArtifactRef | None = None,
+        inputRefs: dict[str, ArtifactRef] | None = None,
         **_kwargs: Any,
     ) -> dict[str, Any] | None:
-        seen_refs.append(hvgRef)
+        seen_refs.append(dict(inputRefs or {}))
+        if stage == "filterCells":
+            return {"artifact": _CELL_SELECTION.to_dict()}
         if stage == "markHvgs":
             return {"artifact": _FEATURE_REF.to_dict()}
         return None
@@ -305,36 +368,47 @@ def test_run_stage_session_carries_hvg_ref_to_normalization(
         "session": session,
     }
 
+    filtered = run_stage("filterCells", **common)
     marked = run_stage("markHvgs", **common)
     normalized = run_stage("runNormalization", **common)
 
+    assert filtered.status == "ok"
     assert marked.status == "ok"
     assert normalized.status == "ok"
-    assert seen_refs == [None, _FEATURE_REF]
-    assert session["hvgRef"] == _FEATURE_REF
+    assert seen_refs == [
+        {},
+        {"cells": _CELL_SELECTION},
+        {"cells": _CELL_SELECTION, "features": _FEATURE_REF},
+    ]
+    assert session["artifactRefs"]["filterCells"] == _CELL_SELECTION
+    assert session["artifactRefs"]["markHvgs"] == _FEATURE_REF
 
 
 @pytest.mark.slow
-def test_graph_construction_profile_stages_chain_through_persisted_assay_state(
+def test_graph_construction_profile_stages_chain_through_explicit_artifacts(
     datastore_ephemeral: DataStore,
 ) -> None:
-    datastore_ephemeral.auto_filter_cells(show_qc_plots=False)
-    datastore_ephemeral.mark_hvgs(
+    cell_selection = datastore_ephemeral.auto_filter_cells()
+    features = datastore_ephemeral.select_hvgs(
+        cell_selection,
         from_assay="RNA",
-        cell_key="I",
         top_n=100,
-        label="profile_hvgs",
         show_plot=False,
     )
     store_uri = str(datastore_ephemeral.zarr_loc)
     workflow = WorkflowParameters(
-        hvgLabel="profile_hvgs",
         dims=5,
         nCentroids=20,
         k=3,
         graphLocalCache=False,
     )
 
+    session: dict[str, Any] = {
+        "artifactRefs": {
+            "filterCells": cell_selection,
+            "markHvgs": features,
+        }
+    }
     for stage in GRAPH_CONSTRUCTION_STAGE_ORDER:
         result = run_stage(
             stage,
@@ -343,18 +417,27 @@ def test_graph_construction_profile_stages_chain_through_persisted_assay_state(
             workflow=workflow,
             resources=_resources(),
             sampleIntervalSeconds=0.01,
+            session=session,
         )
         assert result.status == "ok", result.error
 
     reopened = DataStore(store_uri)
-    state = reopened.get_assay_state("RNA")
-    assert state is not None
-    assert state.normalized is not None
-    assert state.reduction is not None
-    assert state.embedding_initialization is not None
-    assert state.ann_index is not None
-    assert state.neighbors is not None
-    assert state.connectivity_map is not None
+    for kind in (
+        "normalized",
+        "reduction",
+        "embedding_initialization",
+        "ann_index",
+        "neighbors",
+        "connectivity_map",
+    ):
+        refs = reopened.list_artifacts(
+            kind=kind,
+            from_assay="RNA",
+            scope="assay",
+            complete_only=True,
+        )
+        assert refs
+        assert reopened.inspect_artifact(refs[-1]).complete
 
 
 def test_run_stage_persists_every_execution_report_and_wire_counts(

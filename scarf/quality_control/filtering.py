@@ -173,17 +173,22 @@ def _validated_sample_labels(
     return normalized
 
 
-def _apply_exclusive_bounds(
+def _apply_bounds(
     values: np.ndarray,
     low: float | None,
     high: float | None,
+    *,
+    keep_bounds: bool = False,
 ) -> np.ndarray:
-    keep = np.ones(values.shape[0], dtype=bool)
-    if low is not None:
-        keep &= values > low
-    if high is not None:
-        keep &= values < high
-    return keep
+    """Return a boolean mask for one-dimensional values within numeric bounds."""
+    resolved = np.asarray(values)
+    if resolved.ndim != 1:
+        raise ValueError("Filter values must be a one-dimensional array")
+    lower = -np.inf if low is None else low
+    upper = np.inf if high is None else high
+    if keep_bounds:
+        return np.asarray((resolved >= lower) & (resolved <= upper), dtype=bool)
+    return np.asarray((resolved > lower) & (resolved < upper), dtype=bool)
 
 
 def _sample_aware_mad_mask(
@@ -305,7 +310,7 @@ def _sample_aware_mad_mask(
                 "bound_direction": direction,
                 "scaled_mad": scaled_mad,
             }
-            sample_keep &= _apply_exclusive_bounds(raw, low, high)
+            sample_keep &= _apply_bounds(raw, low, high)
 
         keep[sample_idx] = sample_keep
 

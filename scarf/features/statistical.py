@@ -41,7 +41,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import f_oneway, kruskal, norm, ttest_ind, wilcoxon
 
-from ..metadata.selection import valid_category_mask as _valid_group_mask
+from ..metadata.selection import CellField, valid_category_mask as _valid_group_mask
 from ..storage.refs import ArtifactRef
 from .markers.rank import mannwhitneyu_from_ranks
 
@@ -156,8 +156,8 @@ class StatisticalTestResult:
     method: str
     posthoc: str | None
     adjustment_method: str
-    group_key: str
-    cell_key: str | None
+    grouping: ArtifactRef | None
+    group_field: CellField | None
     sample_by: str | None = None
     pair_by: str | None = None
     sample_stat: str = "mean"

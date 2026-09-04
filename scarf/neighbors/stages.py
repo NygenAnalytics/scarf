@@ -13,6 +13,7 @@ from ..embeddings.harmony import HarmonyResult, fit_harmony
 from ..matrix import ChunkedArray
 from ..utils.logging import logger
 from ..utils.process import process_rss_mb
+from ..utils.shutdown import shutdown_checkpoint
 from .index import fix_knn_query, instantiate_knn_index
 
 
@@ -209,6 +210,7 @@ class BatchCorrectionStage:
         for block in self.stream.iter_coordinate_blocks(
             "Loading uncorrected latent dimensions",
         ):
+            shutdown_checkpoint()
             values = np.asarray(block)
             stop = start + int(values.shape[0])
             if values.shape != (stop - start, self.dims) or stop > self.n_cells:
@@ -219,12 +221,14 @@ class BatchCorrectionStage:
             raise ValueError(
                 f"Coordinate source contains {start} rows, expected {self.n_cells}"
             )
+        shutdown_checkpoint()
         with threadpool_limits(limits=self.nthreads):
             self.result = fit_harmony(
                 uncorrected,
                 self.batches,
                 **self.parameters,
             )
+        shutdown_checkpoint()
         self.corrected_data = ChunkedArray.from_numpy(
             self.result.corrected.T,
             block_size=self.batch_size,
@@ -282,7 +286,9 @@ class AnnIndexStage:
     @staticmethod
     def populate(index: Any, coordinates: CoordinateSource) -> Any:
         for block in coordinates.iter_coordinate_blocks("Fitting ANN"):
+            shutdown_checkpoint()
             index.add_items(block)
+            shutdown_checkpoint()
         return index
 
     @classmethod
@@ -446,6 +452,7 @@ class KMeansInitializationStage:
             blocks = iter(stream.iter_coordinate_blocks(message))
             block_idx = 0
             while True:
+                shutdown_checkpoint()
                 wall_started = time.perf_counter()
                 cpu_started = time.process_time()
                 try:
@@ -538,6 +545,7 @@ class KMeansInitializationStage:
             sample_started = time.perf_counter()
             sample_cpu_started = time.process_time()
             while True:
+                shutdown_checkpoint()
                 if (
                     block.ndim != 2
                     or int(block.shape[1]) != coordinate_dims
@@ -618,6 +626,7 @@ class KMeansInitializationStage:
             for _, block, read_seconds, read_cpu_seconds in timed_blocks(
                 "Fitting kmeans"
             ):
+                shutdown_checkpoint()
                 if (
                     block.ndim != 2
                     or int(block.shape[1]) != coordinate_dims
@@ -635,6 +644,7 @@ class KMeansInitializationStage:
                 compute_cpu_started = time.process_time()
                 block_offset = 0
                 while block_offset < block_rows:
+                    shutdown_checkpoint()
                     rows_to_copy = min(
                         effective_kmeans_batch_size - buffered_rows,
                         block_rows - block_offset,
@@ -684,6 +694,7 @@ class KMeansInitializationStage:
             for _, block, read_seconds, read_cpu_seconds in timed_blocks(
                 "Estimating seed partitions"
             ):
+                shutdown_checkpoint()
                 if (
                     block.ndim != 2
                     or int(block.shape[1]) != coordinate_dims

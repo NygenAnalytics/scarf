@@ -74,11 +74,6 @@ def test_cell_cycle_and_prevalence_records_have_exact_direct_inputs() -> None:
         control_size=1,
         n_bins=10,
         rand_seed=7,
-        from_assay="RNA",
-        cell_key="I",
-        s_score_label="S_score",
-        g2m_score_label="G2M_score",
-        phase_label="cell_cycle_phase",
         invalidate_cache=False,
     ).to_record()
     assert set(cell_cycle.inputs) == {"feature_summary", "cell_selection"}
@@ -93,9 +88,6 @@ def test_cell_cycle_and_prevalence_records_have_exact_direct_inputs() -> None:
     prevalence = PrevalentPeakArguments(
         feature_summary=summary,
         top_n=100,
-        from_assay="RNA",
-        cell_key="I",
-        label="prevalent_peaks",
         invalidate_cache=False,
     ).to_record()
     assert set(prevalence.inputs) == {"feature_summary"}
@@ -146,11 +138,11 @@ def test_prevalent_peak_kernel_pins_descending_and_tie_order() -> None:
 
 def test_corrupt_feature_summary_is_never_reused(datastore_ephemeral) -> None:
     store = datastore_ephemeral
+    cells = store.snapshot_cell_selection()
     first = store.select_detected_features(
+        cells,
         from_assay="RNA",
-        cell_key="I",
         min_cells=1,
-        label="first_detected",
     )
     first_status = inspect_artifact(store.zw, first)
     first_summary = ArtifactRef.from_dict(first_status.inputs["feature_summary"])
@@ -158,10 +150,9 @@ def test_corrupt_feature_summary_is_never_reused(datastore_ephemeral) -> None:
     first_group["normed_tot"][0] = float(first_group["normed_tot"][0]) + 1.0
 
     second = store.select_detected_features(
+        cells,
         from_assay="RNA",
-        cell_key="I",
         min_cells=1,
-        label="second_detected",
     )
     second_status = inspect_artifact(store.zw, second)
     second_summary = ArtifactRef.from_dict(second_status.inputs["feature_summary"])
@@ -174,11 +165,11 @@ def test_feature_summary_with_unexpected_payload_is_never_reused(
     datastore_ephemeral,
 ) -> None:
     store = datastore_ephemeral
+    cells = store.snapshot_cell_selection()
     first = store.select_detected_features(
+        cells,
         from_assay="RNA",
-        cell_key="I",
         min_cells=1,
-        label="first_exact_summary",
     )
     first_status = inspect_artifact(store.zw, first)
     first_summary = ArtifactRef.from_dict(first_status.inputs["feature_summary"])
@@ -189,10 +180,9 @@ def test_feature_summary_with_unexpected_payload_is_never_reused(
     )
 
     second = store.select_detected_features(
+        cells,
         from_assay="RNA",
-        cell_key="I",
         min_cells=1,
-        label="second_exact_summary",
     )
     second_status = inspect_artifact(store.zw, second)
     second_summary = ArtifactRef.from_dict(second_status.inputs["feature_summary"])
@@ -205,11 +195,11 @@ def test_rna_summary_and_detected_selection_have_exact_ledger_identity(
     datastore_ephemeral,
 ) -> None:
     store = datastore_ephemeral
+    cells = store.snapshot_cell_selection()
     detected = store.select_detected_features(
+        cells,
         from_assay="RNA",
-        cell_key="I",
         min_cells=0,
-        label="inclusive_detected",
     )
     detected_status = inspect_artifact(store.zw, detected)
     assert detected_status.parameters == {"min_cells": 0}
@@ -276,12 +266,13 @@ def test_datastore_cell_cycle_read_only_guard_precedes_planning(
         default_assay="RNA",
         zarr_mode="r",
     )
+    selection = writable.snapshot_cell_selection()
 
     with pytest.raises(
         PermissionError,
         match="Cell-cycle scoring requires a DataStore opened with zarr_mode='r\\+'",
     ):
-        read_only.run_cell_cycle_scoring()
+        read_only.run_cell_cycle_scoring(selection)
 
     assert set(writable.RNA.z.group_keys()) == assay_groups
     assert set(writable.cells.columns) == cell_columns

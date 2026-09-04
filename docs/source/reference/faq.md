@@ -14,22 +14,34 @@ Bug reports and feature requests for the Python package belong on [GitHub issues
 
 ## How does Scarf compare to Scanpy?
 
-See {doc}`../scanpy_and_seurat` for a stage-by-stage mapping, round-trip notes, and a short Seurat subsection.
+See {doc}`../scanpy` for a stage-by-stage workflow map and H5AD exchange notes.
+
+## How does Scarf compare to Seurat?
+
+See {doc}`../seurat` for a stage-by-stage workflow map and RDS import. The measured differences
+between Scarf and Seurat WNN are summarized below.
 
 ## How should an AI agent use Scarf?
 
 Start with {doc}`../analysis_with_agents`.
-It explains how to inspect and resume a datastore, create reversible branches, compare scientific evidence, route to the granular APIs, and report uncertainty without treating defaults or one metric as biological truth.
+It explains how to inspect persisted work, create reversible branches, compare scientific evidence,
+route to the granular APIs, and report uncertainty without treating defaults or one metric as
+biological truth.
 
 ## How do I run Harmony batch correction in Scarf?
 
-After PCA, call `ds.run_harmony(['batch_column'], pca)` then continue with `build_embedding_initialization`, `build_ann_index`, `query_neighbors`, and `build_connectivity_map`.
+After PCA, call `corrected = ds.run_harmony(pca, ["batch_column"])`, then pass `corrected`
+explicitly to `build_embedding_initialization` and `build_ann_index`. Continue by passing the
+returned refs to `query_neighbors` and `build_connectivity_map`.
 See {ref}`Harmony batch correction <harmony_batch_correction>` and the {ref}`dataset integration guide <integration_guide>`.
 
 ## Which integration method should I choose?
 
-- Separate scRNA-seq batches: start with {doc}`../tutorials/dataset_merging`, then compare Harmony or partial PCA in {doc}`../tutorials/batch_correction`.
-- Multiple assays in the same cells (CITE-seq): SNN or WNN ({ref}`recommended workflow <multimodal_integration>` and {doc}`../tutorials/multimodal_diagnostics` for diagnostics).
+- Separate scRNA-seq batches: start with {doc}`../tutorials/dataset_merging`, then compare
+  uncorrected and Harmony embeddings in {doc}`../tutorials/batch_correction`.
+- Multiple assays in the same cells (CITE-seq): use the default WNN integration in the
+  {ref}`recommended workflow <multimodal_integration>`; compare it with explicit SNN in
+  {doc}`../tutorials/multimodal_diagnostics` when the choice matters.
 - Map onto an existing reference: {doc}`../tutorials/mapping_and_label_transfer`.
 
 Scarf does not include Scanorama, BBKNN, scVI, ComBat, or other external integration packages.
@@ -50,9 +62,11 @@ Tutorial pages show completed snapshots from their cached execution; live notebo
 
 ## What is the difference between SNN and WNN integration?
 
-Both merge modality-specific KNN graphs with `integrate_assays`.
-SNN (default) supports two or more assays and combines shared edge support.
-WNN (`method='wnn'`) also supports two or more assays, learns one weight per assay and cell, and ranks candidates by the resulting blended affinity.
+Both use `integrate_assays` with two or more explicit source refs.
+WNN is the default. It consumes modality-specific neighbour artifacts, learns one weight per
+assay and cell, and ranks candidates by the resulting blended affinity.
+SNN requires `method="snn"`; it consumes modality-specific connectivity maps and combines shared
+edge support.
 
 ### Scarf WNN versus Seurat
 
@@ -62,7 +76,7 @@ For each cell and ordered pair of modalities, it compares within-modality and cr
 It then sums the exponentiated directed scores for each target modality and normalizes those grouped strengths across all modalities.
 
 Seurat normally searches a wider `knn.range=200` pool and uses SNN-far bandwidth.
-Scarf instead reuses the stored assay graphs.
+Scarf instead reuses the candidates in the supplied neighbour artifacts.
 With two modalities, avoiding the wider search at ten million cells saves two additional index builds, 20 million queries, and 4 billion materialized candidate records.
 
 Both differences are measured rather than assumed.
@@ -80,6 +94,8 @@ See {ref}`WNN integration <wnn_integration>` for deviations and trade-offs.
 
 Use `metric_lisi` for raw per-cell LISI values.
 Use `metric_ilisi` for a single scIB-scaled batch-mixing score and `metric_clisi` for a scIB-scaled biological-label conservation score.
+Each requires the exact neighbour artifact and reads matching metadata rows through its stored cell
+selection.
 See {ref}`LISI metrics <lisi_metrics>`.
 
 ## Should I use tSNE or UMAP?
@@ -89,11 +105,13 @@ tSNE emphasizes local structure and can reveal fine-grained diversity.
 UMAP preserves more global structure, which helps when cluster relationships matter.
 We suggest tSNE for large (>50k cells) atlas-scale datasets because of its quick runtime.
 UMAP runtime can span hours on atlas-scale datasets.
-In Scarf, UMAP and tSNE use the same initial embedding by default and share the same input graph.
+In Scarf, UMAP and tSNE both require an explicit graph and initialization. Pass the same refs when
+you want the layouts to share those inputs.
 
 ## What is densMAP?
 
-Enable density-preserving UMAP with `run_umap(use_density_map=True)`.
+Enable density-preserving UMAP with
+`run_umap(graph_ref, initialization_ref, use_density_map=True)`.
 Useful when preserving local density structure matters alongside cluster separation.
 
 ## Which clustering should we use, Paris or Leiden?
@@ -101,23 +119,34 @@ Useful when preserving local density structure matters alongside cluster separat
 Leiden is faster than Paris, especially for large datasets.
 On small datasets we have tested, Leiden results are often more concordant with UMAP clusters.
 Paris provides a hierarchy that can show relationships between clusters.
-Both methods have low computational requirements, so you can run both and view the Paris hierarchy with Leiden labels:
+Both methods have low computational requirements, so you can run both and inspect the Paris
+hierarchy from its exact clustering artifact:
 
 ```python
+leiden = ds.run_leiden_clustering(graph_ref)
+paris = ds.run_paris_clustering(graph_ref)
 ds.plots.cluster_tree(
-    cluster_key="RNA_paris_cluster",
-    fill_by_value="RNA_leiden_cluster",
+    graph=graph_ref,
+    clusters=paris,
 )
 ```
+
+Use silhouette scores or domain knowledge to compare the candidates. The RNA pipeline scores
+Leiden resolutions automatically in graph space and exposes the selected ref as `run["clusters"]`.
+That result is a reproducible baseline, not proof that the selected resolution is biologically
+correct. Granular evaluation APIs such as `evaluate_cluster_separability` can inspect partitions
+outside the pipeline.
 
 ## Why will my existing RNA Zarr store not open?
 
 Current Scarf versions write RNA counts twice: cell-major `counts` and a gene-major `countsT` copy.
 Opening an RNA assay fails if that copy is missing, incomplete, still Zarr v2, or does not match `counts`.
-There is no silent rewrite on open.
+Stores containing the retired `{assay}/state` group also fail on open. There is no silent rewrite,
+migration, or state-based result selection.
 
 Re-import the source, or write a new store with `python -m scarf.tools.repack_zarr`.
-After a rewrite, recompute HVG, normalization, PCA, graph, and marker results.
+The offline rewrite omits retired state. Afterward, recompute HVG, normalization, PCA, graph, and
+marker results with the current release.
 Non-RNA assays do not use `countsT`.
 See {doc}`../concepts/memory_and_execution`.
 

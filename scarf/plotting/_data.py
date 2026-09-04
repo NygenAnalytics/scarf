@@ -11,12 +11,163 @@ from ..features.values import (
     fetch_normalized_feature_matrix as fetch_normalized_feature_matrix,
     resolve_feature as resolve_feature,
 )
+from ..storage.artifacts import ArtifactRef, artifact_group, inspect_artifact
+from ..storage.selections import read_stored_selection_indices
+from ..storage.types import as_zarr_array
 from ._contracts import (
     FeatureRef,
     NormalizationSpec,
     StudyDesign,
 )
 from ._style import sort_categories
+
+
+def _artifact_cell_selection(
+    store: Any,
+    ref: ArtifactRef,
+    *,
+    label: str,
+) -> ArtifactRef:
+    status = inspect_artifact(store.zw, ref)
+    raw_selection = (status.inputs or {}).get("cell_selection")
+    if not isinstance(raw_selection, Mapping):
+        raise ValueError(f"{label} artifact has no cell-selection input")
+    try:
+        return ArtifactRef.from_dict(raw_selection)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{label} artifact has an invalid cell-selection input"
+        ) from exc
+
+
+def _validated_embedding_selection(
+    store: Any,
+    layout: ArtifactRef,
+) -> ArtifactRef:
+    """Validate an embedding producer and return its exact cell selection."""
+    if not isinstance(layout, ArtifactRef):
+        raise TypeError("layout must be an ArtifactRef")
+    if layout.kind != "embedding":
+        raise ValueError("layout must identify an embedding artifact")
+    status = inspect_artifact(store.zw, layout)
+    if not status.complete:
+        raise ValueError("Embedding artifact is unavailable or incomplete")
+
+    selection = _artifact_cell_selection(store, layout, label="Embedding")
+    if status.operation == "import_dimreduc":
+        from ..embeddings.imported import validate_imported_embedding_artifact
+
+        validate_imported_embedding_artifact(store.zw, layout)
+        return selection
+
+    if status.operation not in {"run_umap", "run_tsne"}:
+        raise ValueError(
+            "Embedding artifact must be produced by import_dimreduc, run_umap, "
+            "or run_tsne"
+        )
+    raw_graph = (status.inputs or {}).get("graph")
+    if not isinstance(raw_graph, Mapping):
+        raise ValueError("Embedding artifact has no graph input")
+    try:
+        graph = ArtifactRef.from_dict(raw_graph)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Embedding artifact has an invalid graph input") from exc
+    if layout.scope != graph.scope or layout.assay != graph.assay:
+        raise ValueError("Embedding artifact scope does not match its graph input")
+
+    from ..graph.feature_projection import graph_cell_selection
+
+    graph_selection = graph_cell_selection(store.zw, graph)
+    if selection != graph_selection:
+        raise ValueError(
+            "Embedding artifact and graph must share the same cell selection"
+        )
+    return selection
+
+
+def _resolve_grouping(
+    store: Any,
+    *,
+    group_by: str | tuple[str, ...] | None,
+    groups: ArtifactRef | None,
+    cell_key: str,
+) -> tuple[tuple[str, ...], np.ndarray, list[np.ndarray]]:
+    """Resolve either explicit live metadata or one immutable label artifact."""
+    if (group_by is None) == (groups is None):
+        raise ValueError("Provide exactly one of group_by or groups")
+    if groups is None:
+        group_keys = (group_by,) if isinstance(group_by, str) else tuple(group_by or ())
+        if len(group_keys) == 0 or len(group_keys) > 2:
+            raise ValueError("group_by must have 1 or 2 keys")
+        cell_idx = np.asarray(store.cells.active_index(cell_key), dtype=np.int64)
+        return (
+            group_keys,
+            cell_idx,
+            [np.asarray(store.cells.fetch(key, key=cell_key)) for key in group_keys],
+        )
+
+    if not isinstance(groups, ArtifactRef):
+        raise TypeError("groups must be an ArtifactRef")
+    if cell_key != "I":
+        raise ValueError("cell_key cannot override an artifact's stored cell selection")
+    status = inspect_artifact(store.zw, groups)
+    if not status.complete:
+        raise ValueError("Grouping artifact is unavailable or incomplete")
+    selection = _artifact_cell_selection(store, groups, label="Grouping")
+    cell_idx = read_stored_selection_indices(
+        store.zw,
+        selection,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+    ).astype(np.int64, copy=False)
+    value_name = {
+        "cell_cycle": "phase",
+        "cluster_cut": "labels",
+    }.get(groups.kind, "values")
+    group = artifact_group(store.zw, groups)
+    if value_name not in group:
+        raise ValueError(
+            f"Grouping artifact has no canonical {value_name!r} label array"
+        )
+    values = np.asarray(as_zarr_array(group[value_name], name=value_name)[:])
+    if values.ndim != 1 or values.shape != (len(cell_idx),):
+        raise ValueError("Grouping labels do not align with their cell selection")
+    return ("groups",), cell_idx, [values]
+
+
+def _resolve_layout(
+    store: Any,
+    layout: ArtifactRef,
+) -> tuple[np.ndarray, np.ndarray, ArtifactRef]:
+    """Resolve one explicit two-dimensional embedding and its stored selection."""
+    selection = _validated_embedding_selection(store, layout)
+    cell_idx = read_stored_selection_indices(
+        store.zw,
+        selection,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+    ).astype(np.int64, copy=False)
+    group = artifact_group(store.zw, layout)
+    if "values" not in group:
+        raise ValueError("Embedding artifact has no canonical values array")
+    try:
+        values = np.asarray(
+            as_zarr_array(group["values"], name="values")[:],
+            dtype=np.float64,
+        )
+    except (TypeError, ValueError) as exc:
+        raise TypeError("Embedding coordinates must be numeric") from exc
+    if values.shape != (len(cell_idx), 2):
+        raise ValueError(
+            "Embedding must have two columns and one row per selected cell"
+        )
+    if not np.isfinite(values).all():
+        raise ValueError("Embedding coordinates must be finite")
+    return values, cell_idx, selection
 
 
 def coerce_feature_list(
@@ -88,7 +239,8 @@ def summarize_features_by_group(
     store: Any,
     *,
     features: Sequence[str | FeatureRef] | Mapping[str, Sequence[str | FeatureRef]],
-    group_by: str | tuple[str, ...],
+    group_by: str | tuple[str, ...] | None = None,
+    groups: ArtifactRef | None = None,
     cell_key: str = "I",
     from_assay: str | None = None,
     sample_by: str | None = None,
@@ -120,16 +272,13 @@ def summarize_features_by_group(
     group_labels = [g for g, _ in pairs]
     feature_labels = [r.label for r in resolved]
 
-    if isinstance(group_by, str):
-        group_keys: tuple[str, ...] = (group_by,)
-    else:
-        group_keys = tuple(group_by)
-    if len(group_keys) == 0 or len(group_keys) > 2:
-        raise ValueError("group_by must have 1 or 2 keys")
-
     cells = store.cells
-    cell_idx = cells.active_index(cell_key)
-    group_cols = [cells.fetch(k, key=cell_key) for k in group_keys]
+    group_keys, cell_idx, group_cols = _resolve_grouping(
+        store,
+        group_by=group_by,
+        groups=groups,
+        cell_key=cell_key,
+    )
     n_groups = int(
         pd.DataFrame({k: c for k, c in zip(group_keys, group_cols)})
         .drop_duplicates()
@@ -151,9 +300,9 @@ def summarize_features_by_group(
     base = pd.DataFrame({gk: col for gk, col in zip(group_keys, group_cols)})
 
     if sample_by is not None:
-        samples = cells.fetch(sample_by, key=cell_key)
+        samples = np.asarray(cells.fetch_all(sample_by))[cell_idx]
         if condition_by is not None:
-            conditions = cells.fetch(condition_by, key=cell_key)
+            conditions = np.asarray(cells.fetch_all(condition_by))[cell_idx]
             check = pd.DataFrame({"sample": samples, "condition": conditions})
             nunique = check.groupby("sample", observed=False)["condition"].nunique()
             bad = nunique[nunique > 1]

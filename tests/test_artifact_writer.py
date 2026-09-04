@@ -6,6 +6,7 @@ from zarr.storage import MemoryStore
 from scarf.storage.artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
+    artifact_plan_scope,
     finish_artifact,
     plan_artifact,
     reused_artifact_group,
@@ -31,12 +32,17 @@ def test_artifact_writer_streams_to_random_path_then_reuses_provenance() -> None
     assert not inspect_artifact(root, planned.ref).complete
     group.create_array("data", data=np.array([1.0, 2.0, 3.0]))
     finish_artifact(group, planned)
-    assert inspect_artifact(root, planned.ref).complete
+    status = inspect_artifact(root, planned.ref)
+    assert status.complete
+    assert status.created_at_ns is not None
+    assert status.scarf_version is not None
+    completed_attrs = dict(group.attrs)
 
     reused = plan_artifact(root, **arguments)
     assert reused.reused
     assert reused.ref == planned.ref
     assert reused_artifact_group(root, reused).path == group.path
+    assert dict(group.attrs) == completed_attrs
 
     invalidated = plan_artifact(
         root,
@@ -52,6 +58,33 @@ def test_artifact_writer_streams_to_random_path_then_reuses_provenance() -> None
     preferred = plan_artifact(root, **arguments)
     assert preferred.reused
     assert preferred.ref == invalidated.ref
+
+
+def test_artifact_plan_scope_records_nested_created_and_reused_decisions() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    arguments = {
+        "scope": "assay",
+        "assay": "RNA",
+        "kind": "normalized",
+        "operation": "run_normalization",
+        "parameters": {},
+        "inputs": {},
+        "execution_options": {},
+    }
+    with artifact_plan_scope() as outer:
+        with artifact_plan_scope() as inner:
+            created = plan_artifact(root, **arguments)
+        group = start_artifact(root, created)
+        finish_artifact(group, created)
+        reused = plan_artifact(root, **arguments)
+
+    assert [(item.operation, item.ref, item.disposition) for item in inner] == [
+        ("run_normalization", created.ref, "created")
+    ]
+    assert [(item.operation, item.ref, item.disposition) for item in outer] == [
+        ("run_normalization", created.ref, "created"),
+        ("run_normalization", reused.ref, "reused"),
+    ]
 
 
 def test_incomplete_artifact_is_not_reused() -> None:

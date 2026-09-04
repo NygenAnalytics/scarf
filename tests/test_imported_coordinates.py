@@ -13,13 +13,7 @@ from scarf.embeddings.imported import (
     write_imported_coordinates,
     write_imported_embedding,
 )
-from scarf.graph.state import (
-    AssayState,
-    read_assay_state,
-    validate_imported_coordinates_artifact,
-    validate_neighbors_artifact_selection,
-)
-from scarf.graph.errors import IncompatibleAnalysisStateError
+from scarf.embeddings.imported_storage import validate_imported_coordinates_artifact
 from scarf.storage.errors import ArtifactResolutionError
 from scarf.storage.artifacts import (
     artifact_group,
@@ -139,7 +133,6 @@ def _write_coordinate_fixture(
         source_digest=_SOURCE_DIGEST,
         source_cell_ids=cell_ids[mask],
         cell_selection=selection,
-        cell_key="I",
         block_rows=2,
         **kwargs,
     )
@@ -166,7 +159,6 @@ def _write_embedding_fixture(
         payload_fingerprints={"values": fingerprint_array(coordinates)},
         source_cell_ids=cell_ids[mask],
         cell_selection=selection,
-        cell_key="I",
         block_rows=2,
     )
     return ref, coordinates
@@ -219,11 +211,9 @@ def test_imported_coordinates_write_blockwise_with_honest_provenance() -> None:
         ),
         source_cell_ids=selected_ids,
         cell_selection=selection,
-        cell_key="I",
         loadings=loadings,
         feature_ids=feature_ids,
         stdev=stdev,
-        named_result="seurat_pca",
         block_rows=2,
     )
 
@@ -241,84 +231,7 @@ def test_imported_coordinates_write_blockwise_with_honest_provenance() -> None:
     np.testing.assert_array_equal(group["loadings"][:], loadings)
     np.testing.assert_array_equal(group["feature_ids"][:], feature_ids)
     np.testing.assert_array_equal(group["stdev"][:], stdev)
-    validate_imported_coordinates_artifact(root, ref, cell_key="I")
-    state = read_assay_state(root, "RNA")
-    assert state is not None
-    assert state.normalized is None
-    assert state.reduction is None
-    assert not hasattr(state, "feat_key")
-    assert state.named_results["seurat_pca"] == ref
-
-
-def test_imported_coordinates_replace_an_unavailable_current_graph() -> None:
-    root, selection, cell_ids, mask = _root_with_selection()
-    missing_graph = ArtifactRef(
-        scope="assay",
-        assay="RNA",
-        kind="connectivity_map",
-        artifact_id="f" * 64,
-    )
-    state_group = root["RNA"].create_group("state")
-    state_group.attrs["state"] = AssayState(
-        assay="RNA",
-        cell_key="I",
-        connectivity_map=missing_graph,
-    ).to_dict()
-
-    coordinates = np.arange(24, dtype=np.float32).reshape(8, 3)
-    ref = write_imported_coordinates(
-        root,
-        assay="RNA",
-        dimreduc_key="pca",
-        role="pca",
-        coordinates=coordinates,
-        source_digest=_SOURCE_DIGEST,
-        payload_fingerprints={"data": fingerprint_array(coordinates)},
-        source_cell_ids=cell_ids[mask],
-        cell_selection=selection,
-        cell_key="I",
-        named_result="seurat_pca",
-    )
-
-    state = read_assay_state(root, "RNA")
-    assert state is not None
-    assert state.connectivity_map is None
-    assert state.named_results == {"seurat_pca": ref}
-
-
-def test_imported_coordinates_reject_legacy_state_before_writing() -> None:
-    root, selection, cell_ids, mask = _root_with_selection()
-    legacy_state = AssayState(assay="RNA", cell_key="I").to_dict()
-    legacy_state["feat_key"] = "I"
-    state_group = root["RNA"].create_group("state")
-    state_group.attrs["state"] = legacy_state
-    coordinates = np.arange(24, dtype=np.float32).reshape(8, 3)
-
-    with pytest.raises(IncompatibleAnalysisStateError) as caught:
-        write_imported_coordinates(
-            root,
-            assay="RNA",
-            dimreduc_key="pca",
-            role="pca",
-            coordinates=coordinates,
-            source_digest=_SOURCE_DIGEST,
-            payload_fingerprints={"data": fingerprint_array(coordinates)},
-            source_cell_ids=cell_ids[mask],
-            cell_selection=selection,
-            cell_key="I",
-            named_result="seurat_pca",
-        )
-
-    assert caught.value.code == "legacy_feature_contract"
-    assert (
-        list_artifacts(
-            root,
-            scope="assay",
-            assay="RNA",
-            kind="imported_coordinates",
-        )
-        == []
-    )
+    validate_imported_coordinates_artifact(root, ref)
 
 
 def test_imported_coordinates_validate_alignment_before_artifact_creation() -> None:
@@ -336,7 +249,6 @@ def test_imported_coordinates_validate_alignment_before_artifact_creation() -> N
             payload_fingerprints={"data": fingerprint_array(coordinates)},
             source_cell_ids=cell_ids[mask][::-1],
             cell_selection=selection,
-            cell_key="I",
         )
 
     assert caught.value.code == "dimreduc_cell_identity_mismatch"
@@ -378,7 +290,6 @@ def test_imported_coordinate_alignment_reads_cell_ids_in_blocks() -> None:
         payload_fingerprints={"data": fingerprint_array(coordinates)},
         source_cell_ids=tracked,
         cell_selection=selection,
-        cell_key="I",
         block_rows=3,
     )
 
@@ -419,7 +330,6 @@ def test_imported_coordinate_loadings_stream_feature_ids_twice() -> None:
         },
         source_cell_ids=cell_ids[mask],
         cell_selection=selection,
-        cell_key="I",
         loadings=loadings,
         feature_ids=tracked,
         block_rows=3,
@@ -444,7 +354,6 @@ def test_imported_coordinates_require_a_fixed_size_source_digest() -> None:
             payload_fingerprints={"data": fingerprint_array(coordinates)},
             source_cell_ids=cell_ids[mask],
             cell_selection=selection,
-            cell_key="I",
         )
 
 
@@ -466,7 +375,6 @@ def test_imported_coordinates_reject_unstored_payload_fingerprint() -> None:
             },
             source_cell_ids=cell_ids[mask],
             cell_selection=selection,
-            cell_key="I",
         )
 
     assert (
@@ -493,7 +401,6 @@ def test_imported_coordinate_validation_detects_payload_tampering() -> None:
         payload_fingerprints={"data": fingerprint_array(coordinates)},
         source_cell_ids=cell_ids[mask],
         cell_selection=selection,
-        cell_key="I",
     )
 
     artifact_group(root, ref)["data"][0, 0] = -1
@@ -502,7 +409,7 @@ def test_imported_coordinate_validation_detects_payload_tampering() -> None:
         validate_imported_coordinates_artifact(root, ref)
 
 
-def test_imported_embedding_writes_values_and_links_metadata_columns() -> None:
+def test_imported_embedding_writes_values_without_metadata_columns() -> None:
     mask = np.array([True, False, True, False, True, True, False, True])
     root, selection, cell_ids, mask = _root_with_selection(mask)
     coordinates = np.arange(10, dtype=np.float32).reshape(5, 2)
@@ -518,7 +425,6 @@ def test_imported_embedding_writes_values_and_links_metadata_columns() -> None:
         payload_fingerprints={"values": fingerprint_array(coordinates)},
         source_cell_ids=cell_ids[mask],
         cell_selection=selection,
-        cell_key="I",
         block_rows=2,
     )
 
@@ -526,14 +432,9 @@ def test_imported_embedding_writes_values_and_links_metadata_columns() -> None:
     assert (
         root[artifact_path(ref)].attrs["provenance"]["operation"] == "import_dimreduc"
     )
-    validate_imported_embedding_artifact(root, ref, cell_key="I")
-    for index, column_name in enumerate(("RNA_UMAP1", "RNA_UMAP2")):
-        column = root["cellData"][column_name]
-        np.testing.assert_array_equal(column[:][mask], coordinates[:, index])
-        assert np.isnan(column[:][~mask]).all()
-        assert column.attrs["source_artifact"] == ref.to_dict()
-        assert column.attrs["source_value"] == "values"
-        assert column.attrs["value_index"] == index
+    validate_imported_embedding_artifact(root, ref)
+    np.testing.assert_array_equal(artifact_group(root, ref)["values"][:], coordinates)
+    assert set(root["cellData"].array_keys()) == {"I", "ids", "names"}
 
 
 def test_ann_and_neighbor_query_accept_detached_imported_coordinates() -> None:
@@ -550,7 +451,6 @@ def test_ann_and_neighbor_query_accept_detached_imported_coordinates() -> None:
         payload_fingerprints={"data": fingerprint_array(coordinates)},
         source_cell_ids=cell_ids[mask],
         cell_selection=selection,
-        cell_key="I",
     )
     store = _graph_store(root)
 
@@ -559,20 +459,9 @@ def test_ann_and_neighbor_query_accept_detached_imported_coordinates() -> None:
         ann_efc=10,
         ann_ef=10,
         ann_m=4,
-        update_state=True,
     )
-    state = read_assay_state(root, "RNA")
-    assert state is not None
-    assert state.normalized is None
-    assert state.ann_index == ann
 
-    neighbors = store.query_neighbors(ann, k=3, update_state=True)
-    state = read_assay_state(root, "RNA")
-    assert state is not None
-    assert state.normalized is None
-    assert state.ann_index == ann
-    assert state.neighbors == neighbors
-    validate_neighbors_artifact_selection(root, neighbors, "I")
+    neighbors = store.query_neighbors(ann, k=3)
     group = artifact_group(root, neighbors)
     assert group["indices"].shape == (8, 3)
     assert group["distances"].shape == (8, 3)
@@ -594,7 +483,6 @@ def test_imported_coordinates_reject_invalid_block_rows_and_fingerprints() -> No
     common = dict(
         assay="RNA",
         cell_selection=selection,
-        cell_key="I",
         source_cell_ids=cell_ids[mask],
         coordinates=coordinates[mask],
         dimreduc_key="pca",
@@ -612,7 +500,6 @@ def test_imported_coordinates_reject_invalid_block_rows_and_fingerprints() -> No
             root,
             assay="RNA",
             cell_selection=selection,
-            cell_key="I",
             source_cell_ids=cell_ids[mask],
             coordinates=coordinates[mask],
             dimreduc_key="pca",
@@ -634,7 +521,6 @@ def test_imported_coordinates_reject_invalid_cell_ids_and_nonfinite_values() -> 
             root,
             assay="RNA",
             cell_selection=selection,
-            cell_key="I",
             source_cell_ids=bad_ids,
             coordinates=selected,
             dimreduc_key="pca",
@@ -649,7 +535,6 @@ def test_imported_coordinates_reject_invalid_cell_ids_and_nonfinite_values() -> 
             root,
             assay="RNA",
             cell_selection=selection,
-            cell_key="I",
             source_cell_ids=cell_ids[mask],
             coordinates=selected,
             dimreduc_key="pca",
@@ -670,7 +555,6 @@ def test_imported_coordinates_reject_mismatched_loadings_shape() -> None:
             root,
             assay="RNA",
             cell_selection=selection,
-            cell_key="I",
             source_cell_ids=cell_ids[mask],
             coordinates=coordinates[mask],
             dimreduc_key="pca",
@@ -724,13 +608,34 @@ def test_imported_coordinates_reject_invalid_matrix_shape_and_dtype(
             payload_fingerprints={"data": "a" * 64},
             source_cell_ids=cell_ids[mask],
             cell_selection=selection,
-            cell_key="I",
         )
 
 
-def test_imported_coordinates_report_selected_row_count_mismatch() -> None:
-    root, selection, cell_ids, _mask = _root_with_selection()
-    coordinates = np.arange(21, dtype=np.float32).reshape(7, 3)
+@pytest.mark.parametrize(
+    ("mask", "coordinate_rows", "source_rows", "selected_count"),
+    [
+        pytest.param(None, 7, 7, 8, id="selection-exceeds-source"),
+        pytest.param(None, 8, 7, None, id="coordinates-exceed-source"),
+        pytest.param(
+            (True, True, True, True, True, True, True, False),
+            8,
+            8,
+            7,
+            id="source-exceeds-selection",
+        ),
+    ],
+)
+def test_imported_coordinates_report_row_count_mismatch(
+    mask,
+    coordinate_rows,
+    source_rows,
+    selected_count,
+) -> None:
+    root, selection, cell_ids, _mask = _root_with_selection(mask)
+    coordinates = np.arange(coordinate_rows * 3, dtype=np.float32).reshape(
+        coordinate_rows,
+        3,
+    )
 
     with pytest.raises(ArtifactResolutionError) as caught:
         write_imported_coordinates(
@@ -741,15 +646,18 @@ def test_imported_coordinates_report_selected_row_count_mismatch() -> None:
             coordinates=coordinates,
             source_digest=_SOURCE_DIGEST,
             payload_fingerprints={"data": fingerprint_array(coordinates)},
-            source_cell_ids=cell_ids[:7],
+            source_cell_ids=cell_ids[:source_rows],
             cell_selection=selection,
-            cell_key="I",
             block_rows=3,
         )
 
     assert caught.value.code == "dimreduc_row_count_mismatch"
-    assert caught.value.context["coordinate_rows"] == 7
-    assert caught.value.context["source_cell_count"] == 7
+    assert caught.value.context["coordinate_rows"] == coordinate_rows
+    assert caught.value.context["source_cell_count"] == source_rows
+    if selected_count is None:
+        assert "selected_count" not in caught.value.context
+    else:
+        assert caught.value.context["selected_count"] == selected_count
 
 
 @pytest.mark.parametrize(
@@ -792,7 +700,6 @@ def test_imported_coordinate_stream_validates_declared_shape_and_dtype(
             payload_fingerprints={"data": fingerprint_array(coordinates)},
             source_cell_ids=cell_ids[mask],
             cell_selection=selection,
-            cell_key="I",
             block_rows=3,
         )
 
@@ -805,12 +712,6 @@ def test_imported_coordinate_stream_validates_declared_shape_and_dtype(
             ("operation",),
             "run_pca",
             "operation must be 'import_dimreduc'",
-        ),
-        (
-            "execution_options",
-            ("cell_key",),
-            "",
-            "has no cell selection key",
         ),
         (
             "execution_options",
@@ -998,9 +899,7 @@ def test_imported_coordinate_validator_checks_optional_flags_and_fingerprints() 
     assert caught.value.code == "corrupt_payload"
 
 
-def test_imported_coordinate_validation_detects_selection_and_cell_key_changes() -> (
-    None
-):
+def test_imported_coordinate_validation_is_independent_of_live_alias() -> None:
     root, selection, cell_ids, mask = _root_with_selection()
     ref, _coordinates = _write_coordinate_fixture(
         root,
@@ -1009,17 +908,8 @@ def test_imported_coordinate_validation_detects_selection_and_cell_key_changes()
         mask,
     )
 
-    with pytest.raises(
-        ArtifactResolutionError,
-        match="does not match imported coordinates",
-    ) as caught:
-        validate_imported_coordinates_artifact(root, ref, cell_key="other")
-    assert caught.value.code == "row_mismatch"
-
     root["cellData"]["I"][0] = False
-    with pytest.raises(ArtifactResolutionError) as caught:
-        validate_imported_coordinates_artifact(root, ref)
-    assert caught.value.code == "selection_values_changed"
+    validate_imported_coordinates_artifact(root, ref)
 
 
 def test_imported_coordinate_validation_rechecks_exact_selection_size() -> None:
@@ -1078,7 +968,6 @@ def test_imported_coordinates_reuse_without_consuming_coordinate_blocks() -> Non
         payload_fingerprints={"data": fingerprint_array(coordinates)},
         source_cell_ids=cell_ids[mask],
         cell_selection=selection,
-        cell_key="I",
         block_rows=2,
     )
 
@@ -1117,7 +1006,6 @@ def test_imported_coordinate_reuse_rejects_tampered_candidate() -> None:
         payload_fingerprints={"data": fingerprint_array(coordinates)},
         source_cell_ids=cell_ids[mask],
         cell_selection=selection,
-        cell_key="I",
         block_rows=2,
     )
 
@@ -1164,38 +1052,6 @@ def test_imported_embedding_validates_role_and_source_key(
             payload_fingerprints={"values": fingerprint_array(coordinates)},
             source_cell_ids=cell_ids[mask],
             cell_selection=selection,
-            cell_key="I",
-        )
-
-
-@pytest.mark.parametrize(
-    ("metadata_columns", "message"),
-    [
-        (("only_one",), "one name per embedding dimension"),
-        (("duplicate", "duplicate"), "invalid or duplicate"),
-        (("I", "second"), "invalid or duplicate"),
-    ],
-)
-def test_imported_embedding_validates_metadata_column_contract(
-    metadata_columns,
-    message,
-) -> None:
-    root, selection, cell_ids, mask = _root_with_selection()
-    coordinates = np.arange(16, dtype=np.float32).reshape(8, 2)
-
-    with pytest.raises(ValueError, match=message):
-        write_imported_embedding(
-            root,
-            assay="RNA",
-            dimreduc_key="umap",
-            role="umap",
-            coordinates=coordinates,
-            source_digest=_SOURCE_DIGEST,
-            payload_fingerprints={"values": fingerprint_array(coordinates)},
-            source_cell_ids=cell_ids[mask],
-            cell_selection=selection,
-            cell_key="I",
-            metadata_columns=metadata_columns,
         )
 
 
@@ -1207,12 +1063,6 @@ def test_imported_embedding_validates_metadata_column_contract(
             ("operation",),
             "run_umap",
             "operation must be 'import_dimreduc'",
-        ),
-        (
-            "execution_options",
-            ("cell_key",),
-            "",
-            "has no cell selection key",
         ),
         (
             "execution_options",
@@ -1337,7 +1187,7 @@ def test_imported_embedding_validator_rejects_payload_shape_and_dtype(
         validate_imported_embedding_artifact(root, ref)
 
 
-def test_imported_embedding_validation_rechecks_selection_and_cell_key() -> None:
+def test_imported_embedding_validation_rechecks_selection_size() -> None:
     root, selection, cell_ids, mask = _root_with_selection()
     ref, _coordinates = _write_embedding_fixture(
         root,
@@ -1345,9 +1195,6 @@ def test_imported_embedding_validation_rechecks_selection_and_cell_key() -> None
         cell_ids,
         mask,
     )
-    with pytest.raises(ValueError, match="cell_key does not match"):
-        validate_imported_embedding_artifact(root, ref, cell_key="other")
-
     replacement = np.asarray(artifact_group(root, ref)["values"][:-1])
     artifact_group(root, ref).create_array(
         "values",
@@ -1391,17 +1238,12 @@ def test_imported_embedding_reuses_payload_without_consuming_blocks() -> None:
         payload_fingerprints={"values": fingerprint_array(coordinates)},
         source_cell_ids=cell_ids[mask],
         cell_selection=selection,
-        cell_key="I",
         block_rows=2,
     )
 
     assert reused == first
     assert pulls == []
-    for index, column_name in enumerate(("RNA_UMAP1", "RNA_UMAP2")):
-        np.testing.assert_array_equal(
-            root["cellData"][column_name][:],
-            coordinates[:, index],
-        )
+    assert set(root["cellData"].array_keys()) == {"I", "ids", "names"}
 
 
 def test_imported_artifacts_validate_and_coordinates_reuse_read_only(tmp_path) -> None:
@@ -1425,8 +1267,8 @@ def test_imported_artifacts_validate_and_coordinates_reuse_read_only(tmp_path) -
 
     read_only = zarr.open_group(store=str(store_path), mode="r")
     columns_before = tuple(sorted(read_only["cellData"].keys()))
-    validate_imported_coordinates_artifact(read_only, coordinate_ref, cell_key="I")
-    validate_imported_embedding_artifact(read_only, embedding_ref, cell_key="I")
+    validate_imported_coordinates_artifact(read_only, coordinate_ref)
+    validate_imported_embedding_artifact(read_only, embedding_ref)
     pulls = []
 
     def coordinate_blocks():
@@ -1445,7 +1287,6 @@ def test_imported_artifacts_validate_and_coordinates_reuse_read_only(tmp_path) -
         payload_fingerprints={"data": fingerprint_array(coordinates)},
         source_cell_ids=cell_ids[mask],
         cell_selection=selection,
-        cell_key="I",
         block_rows=2,
     )
 

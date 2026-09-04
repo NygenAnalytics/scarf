@@ -8,7 +8,6 @@ from typing import Any, Literal, cast
 import numpy as np
 import pandas as pd
 import zarr
-from numpy.typing import NDArray
 from scipy.sparse import csr_matrix, vstack
 
 from ..matrix import ChunkedArray
@@ -39,8 +38,7 @@ def _defer_feature_props() -> Generator[None, None, None]:
 
 class Assay:
     """A generic Assay class that contains methods to calculate feature level
-    statistics. It also provides a method for saving normalized subset of data
-    for later KNN graph construction.
+    statistics and stream normalized values for downstream computation.
 
     Args:
         z (zarr.Group): Zarr hierarchy where raw data is located
@@ -79,6 +77,7 @@ class Assay:
         self.storageIo = storageIo
         matrix_root = z if matrix_root is None else matrix_root
         if workspace is None:
+            self._artifact_root = z
             counts_path = f"{name}/counts"
             counts_t_path = f"{name}/countsT"
             matrix_group = as_zarr_group(matrix_root[name], name=name)
@@ -91,6 +90,7 @@ class Assay:
             self.feats = MetaData(z[f"{name}/featureData"])  # type: ignore
             self.z = as_zarr_group(z[name], name=name)
         else:
+            self._artifact_root = as_zarr_group(z[workspace], name=workspace)
             counts_path = f"matrices/{name}/counts"
             counts_t_path = f"matrices/{name}/countsT"
             matrix_group = as_zarr_group(
@@ -129,8 +129,6 @@ class Assay:
                         "incomplete or mismatched with counts"
                     )
         self.attrs = self.z.attrs
-        if "percentFeatures" not in self.attrs:
-            self.attrs["percentFeatures"] = {}
         self.normMethod: NormMethod = norm_dummy
         self.sf: int | None = None
         self.scalar: np.ndarray | None = None
@@ -452,26 +450,39 @@ class Assay:
             overwrite=True,
         )
 
-    def add_percent_feature(self, feat_pattern: str, name: str) -> None:
-        """
-
-        Args:
-            feat_pattern: A regular expression pattern to identify the features of interest
-            name: This will be used as the name of column under which the percentages will
-                  be saved
-
-        Returns:
-
-        """
-        feat_idx = self._plan_percent_feature(feat_pattern, name)
-        if feat_idx is None:
-            return None
-        total = compute_with_progress(
-            self.rawData[:, feat_idx].sum(axis=1),
-            f"({self.name}) Computing {name}",
-            self.nthreads,
-        )
-        self._write_percent_feature(name, total)
+    def _compute_feature_percentage(
+        self,
+        cell_index: np.ndarray,
+        feature_index: np.ndarray,
+    ) -> np.ndarray:
+        """Compute selected-feature count percentages in bounded row blocks."""
+        values = np.empty(len(cell_index), dtype=np.float64)
+        offset = 0
+        selected = self.rawData[cell_index, :]
+        for block in selected.stream_blocks(
+            nthreads=self.nthreads,
+            msg=f"({self.name}) Computing selected-feature percentages",
+        ):
+            counts = np.asarray(block)
+            denominator = np.asarray(counts.sum(axis=1), dtype=np.float64)
+            numerator = np.asarray(
+                counts[:, feature_index].sum(axis=1),
+                dtype=np.float64,
+            )
+            stop = offset + len(counts)
+            values[offset:stop] = np.divide(
+                100.0 * numerator,
+                denominator,
+                out=np.zeros_like(numerator),
+                where=denominator != 0,
+            )
+            offset = stop
+        if offset != len(values):
+            raise RuntimeError(
+                f"({self.name}) Percentage-feature stream produced {offset} rows; "
+                f"expected {len(values)}"
+            )
+        return values
 
     def _get_cell_idx(self, cell_key: str) -> np.ndarray:
         """Validate and return the physical indices selected by ``cell_key``."""
@@ -496,7 +507,7 @@ class Assay:
         boundary = np.array([cells.shape[0]], dtype=np.int64)
         return array_digest(np.concatenate([boundary, cells, feats]))
 
-    def save_normalized_data(
+    def _write_normalized_payload(
         self,
         cell_idx: np.ndarray,
         feat_idx: np.ndarray,
@@ -506,7 +517,7 @@ class Assay:
         renormalize_subset: bool,
         mirror: zarr.Array | None = None,
     ) -> ChunkedArray:
-        """Materialize normalized values for explicit cell and feature indices."""
+        """Write one planned normalization artifact payload."""
 
         from ..storage.materialize import chunked_to_zarr
 
@@ -772,7 +783,7 @@ class Assay:
         feature_array = create_zarr_dataset(
             group,
             "feature_indices",
-            (max(len(feature_indices), 1),),
+            (min(max(len(feature_indices), 1), 100_000),),
             "uint64",
             (len(feature_indices),),
         )
@@ -780,7 +791,7 @@ class Assay:
         valid_array = create_zarr_dataset(
             group,
             "valid_features",
-            (max(len(valid), 1),),
+            (min(max(len(valid), 1), 100_000),),
             "bool",
             (len(valid),),
         )
@@ -794,141 +805,6 @@ class Assay:
             feature_indices,
             valid,
         )
-
-    def save_aggregated_ordering(
-        self,
-        cell_idx: np.ndarray,
-        feat_idx: np.ndarray,
-        cell_ordering: np.ndarray,
-        location: str,
-        min_exp: float = 1e-3,
-        window_size: int = 200,
-        chunk_size: int = 50,
-        smoothen: bool = True,
-        z_scale: bool = True,
-        batch_size: int | None = None,
-        **norm_params: Any,
-    ) -> tuple[ChunkedArray, NDArray[Any]]:
-        """Bin normalized expression along a cell ordering and cache the result.
-
-        Args:
-            cell_idx: Ordered physical cell indices.
-            feat_idx: Ordered physical feature indices.
-            cell_ordering: Ordering values aligned to ``cell_idx``.
-            location: Zarr group used for the explicit aggregation cache.
-            min_exp: Minimum mean expression to retain a feature.
-            window_size: Rolling window size for smoothing along ordering.
-            chunk_size: Number of ordering bins stored per feature row.
-            smoothen: Whether to apply rolling-window smoothing.
-            z_scale: Whether to z-scale values within each feature.
-            batch_size: Feature batch size for iteration. When None, selected
-                features are grouped into chunk-aligned blocks that fit the
-                operation memory budget.
-            **norm_params: Extra keyword arguments forwarded to ``normed``.
-
-        Returns:
-            None
-        """
-        import warnings
-
-        warnings.warn(
-            "Assay.save_aggregated_ordering writes the legacy cache layout; "
-            "use DataStore.run_pseudotime_aggregation for artifact-backed persistence.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
-        (
-            cell_ordering,
-            _cell_idx,
-            feat_idx,
-            effective_window,
-            effective_bins,
-            hashes,
-            params,
-        ) = Assay._prepare_aggregated_ordering(
-            self,
-            cell_idx,
-            feat_idx,
-            cell_ordering,
-            min_exp=min_exp,
-            window_size=window_size,
-            chunk_size=chunk_size,
-            smoothen=smoothen,
-            z_scale=z_scale,
-            norm_params=dict(norm_params),
-        )
-
-        def _cached_aggregation_valid() -> bool:
-            if location not in self.z:
-                return False
-            group = as_zarr_group(self.z[location], name=location)
-            attrs = group.attrs
-            if attrs.get("hashes") != hashes or attrs.get("params") != params:
-                return False
-            if not all(
-                name in group for name in ("data", "feature_indices", "valid_features")
-            ):
-                return False
-            data_arr = as_zarr_array(group["data"], name="data")
-            feat_arr = as_zarr_array(group["feature_indices"], name="feature_indices")
-            valid_arr = as_zarr_array(group["valid_features"], name="valid_features")
-            if data_arr.ndim != 2 or data_arr.shape[1] != effective_bins:
-                return False
-            if (
-                feat_arr.shape[0] != data_arr.shape[0]
-                or valid_arr.shape[0] != data_arr.shape[0]
-            ):
-                return False
-            return True
-
-        if _cached_aggregation_valid():
-            logger.debug(f"Using existing aggregated data from {location}")
-        else:
-            if location in self.z:
-                del self.z[location]
-            group = self.z.create_group(location)
-            Assay._write_aggregated_ordering_group(
-                self,
-                group,
-                cell_idx=np.asarray(cell_idx, dtype=np.int64),
-                cell_ordering=cell_ordering,
-                feat_idx=feat_idx,
-                min_exp=min_exp,
-                effective_window=effective_window,
-                effective_bins=effective_bins,
-                smoothen=smoothen,
-                z_scale=z_scale,
-                batch_size=batch_size,
-                norm_params=dict(norm_params),
-            )
-            group.attrs["hashes"] = hashes
-            group.attrs["params"] = cast(Any, params)
-
-        ret_val1 = ChunkedArray(
-            as_zarr_array(self.z[location + "/data"], name=location + "/data"),
-            nthreads=self.nthreads,
-            resources=self.resources,
-        )
-        ret_val2 = np.asarray(
-            as_zarr_array(
-                self.z[location + "/feature_indices"],
-                name=location + "/feature_indices",
-            )[:]
-        )
-
-        if location + "/valid_features" in self.z:
-            valid_feats = np.asarray(
-                as_zarr_array(
-                    self.z[location + "/valid_features"],
-                    name=location + "/valid_features",
-                )[:],
-                dtype=bool,
-            )
-            ret_val1 = ret_val1[valid_feats]
-            ret_val2 = ret_val2[valid_feats]
-
-        return ret_val1, ret_val2
 
     def mean_features(
         self,

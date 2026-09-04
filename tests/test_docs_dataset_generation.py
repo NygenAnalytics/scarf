@@ -1,6 +1,7 @@
 import hashlib
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from zipfile import ZipFile
 
 import numpy as np
@@ -8,6 +9,7 @@ import pandas as pd
 import pytest
 
 from scripts import regenerate_docs_datasets as generator
+from scarf.storage import ArtifactRef
 
 
 def test_labelled_cluster_mask_rejects_blank_and_nan_values():
@@ -16,6 +18,188 @@ def test_labelled_cluster_mask_rejects_blank_and_nan_values():
     )
 
     assert mask.tolist() == [True, False, False, False, False, True]
+
+
+def test_prepared_run_columns_are_explicit_full_axis_copies():
+    class Cells:
+        N = 3
+
+        def __init__(self) -> None:
+            self.columns = {"I": np.ones(self.N, dtype=bool)}
+
+        def insert(
+            self,
+            name: str,
+            values: np.ndarray,
+            *,
+            fill_value: object,
+            overwrite: bool,
+        ) -> None:
+            assert overwrite is True
+            if np.issubdtype(values.dtype, np.integer):
+                assert fill_value == 0
+            else:
+                assert np.isnan(fill_value)
+            self.columns[name] = np.asarray(values)
+
+        def reset_key(self, key: str) -> None:
+            self.columns[key] = np.ones(self.N, dtype=bool)
+
+        def update_key(self, values: np.ndarray, key: str) -> None:
+            self.columns[key] &= np.asarray(values, dtype=bool)
+
+    class RunCells:
+        columns = ("I", "umap_1", "clusters")
+
+        @staticmethod
+        def fetch_all(name: str) -> np.ndarray:
+            return {
+                "I": np.asarray([True, False, True]),
+                "umap_1": np.asarray([1.0, np.nan, 3.0]),
+                "clusters": np.asarray([4, -1, 7]),
+            }[name]
+
+    store = SimpleNamespace(cells=Cells())
+    run = SimpleNamespace(cells=RunCells())
+
+    generator._materialize_run_cell_columns(
+        store,
+        run,
+        {
+            "RNA_UMAP1": "umap_1",
+            "RNA_clusters": "clusters",
+        },
+        set_selection=True,
+    )
+
+    np.testing.assert_allclose(
+        store.cells.columns["RNA_UMAP1"],
+        [1.0, np.nan, 3.0],
+        equal_nan=True,
+    )
+    np.testing.assert_array_equal(
+        store.cells.columns["RNA_clusters"],
+        [4, -1, 7],
+    )
+    np.testing.assert_array_equal(store.cells.columns["I"], [True, False, True])
+
+
+def test_drop_retired_assay_state_removes_leftover_groups(tmp_path):
+    import zarr
+
+    root = zarr.open_group(str(tmp_path / "store.zarr"), mode="w")
+    rna = root.create_group("RNA")
+    rna.attrs["is_assay"] = True
+    rna.create_group("state")
+    rna.create_group("artifacts")
+    cell_data = root.create_group("cellData")
+    cell_data.create_group("ids")
+
+    removed = generator._drop_retired_assay_state(root)
+
+    assert removed == ("RNA/state",)
+    assert "state" not in root["RNA"]
+    assert "artifacts" in root["RNA"]
+
+
+def test_prepared_artifact_columns_project_the_exact_stored_selection(monkeypatch):
+    selection = ArtifactRef(
+        scope="datastore",
+        assay=None,
+        kind="cell_selection",
+        artifact_id="a" * 64,
+    )
+    embedding = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="embedding",
+        artifact_id="b" * 64,
+    )
+    calls: list[tuple[object, ArtifactRef, dict[str, object]]] = []
+
+    def selected_indices(
+        root: object,
+        ref: ArtifactRef,
+        **kwargs: object,
+    ) -> np.ndarray:
+        calls.append((root, ref, kwargs))
+        return np.asarray([0, 2], dtype=np.int64)
+
+    monkeypatch.setattr(
+        "scarf.storage.selections.read_stored_selection_indices",
+        selected_indices,
+    )
+
+    class Cells:
+        N = 3
+
+        def __init__(self) -> None:
+            self.columns: dict[str, np.ndarray] = {}
+
+        def insert(
+            self,
+            name: str,
+            values: np.ndarray,
+            *,
+            fill_value: object,
+            overwrite: bool,
+        ) -> None:
+            assert overwrite is True
+            assert np.isnan(fill_value)
+            self.columns[name] = np.asarray(values)
+
+    root = object()
+    store = SimpleNamespace(
+        zw=root,
+        cells=Cells(),
+        inspect_artifact=lambda ref: SimpleNamespace(
+            complete=ref == embedding,
+            inputs={"cell_selection": selection.to_dict()},
+        ),
+        load_artifact=lambda ref: {"values": np.asarray([[1.0, 10.0], [3.0, 30.0]])},
+    )
+
+    generator._materialize_artifact_cell_columns(
+        store,
+        embedding,
+        {
+            "RNA_UMAP1": ("values", 0),
+            "RNA_UMAP2": ("values", 1),
+        },
+    )
+
+    np.testing.assert_allclose(
+        store.cells.columns["RNA_UMAP1"],
+        [1.0, np.nan, 3.0],
+        equal_nan=True,
+    )
+    np.testing.assert_allclose(
+        store.cells.columns["RNA_UMAP2"],
+        [10.0, np.nan, 30.0],
+        equal_nan=True,
+    )
+    assert calls == [
+        (
+            root,
+            selection,
+            {
+                "kind": "cell_selection",
+                "scope": "datastore",
+                "assay": None,
+                "table_path": "cellData",
+            },
+        )
+    ]
+
+
+def test_prepared_integer_artifact_columns_use_unselected_sentinel():
+    projected = generator._prepared_full_axis_values(
+        np.asarray([4, 7], dtype=np.int32),
+        np.asarray([0, 2], dtype=np.int64),
+        3,
+    )
+
+    np.testing.assert_array_equal(projected, [4, -1, 7])
 
 
 def test_kang_recipes_physically_subset_using_legacy_annotations():

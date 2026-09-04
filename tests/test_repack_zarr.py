@@ -5,12 +5,24 @@ import pytest
 import zarr
 from zarr.codecs import ZstdCodec
 
+import scarf.storage.pipeline_runs as pipeline_run_storage
 from scarf.storage.ann_index import (
     ANN_INDEX_CHUNK_BYTES,
     ANN_INDEX_FORMAT_VERSION,
     _ANN_INDEX_METADATA,
 )
 from scarf.storage.layout import normalize_chunks
+from scarf.storage.pipeline_runs import (
+    PipelineOutputRecord,
+    PipelineStageMetrics,
+    PipelineStageOutputRecord,
+    complete_pipeline_run_record,
+    create_pipeline_run_record,
+    finish_pipeline_stage_record,
+    load_pipeline_run_record,
+    start_pipeline_stage_record,
+)
+from scarf.storage.refs import ArtifactRef, artifact_path
 from scarf.storage.types import array_metadata_shards
 from scarf.tools import repack_zarr as repack_module
 from scarf.tools.repack_zarr import repack_store
@@ -81,6 +93,50 @@ def test_repack_rebuilds_incorrect_source_counts_t(tmp_path):
     result = zarr.open_group(str(output), mode="r")
     np.testing.assert_array_equal(result["RNA/countsT"][:], values.T)
     assert result["RNA/countsT"].attrs["complete"] is True
+
+
+def test_repack_discards_retired_assay_state(tmp_path):
+    source = tmp_path / "source_with_state.zarr"
+    output = tmp_path / "output_without_state.zarr"
+    root = zarr.open_group(str(source), mode="w")
+    assay = root.create_group("RNA")
+    assay.attrs["is_assay"] = True
+    assay.create_array(
+        "counts",
+        data=np.arange(6, dtype=np.uint32).reshape(2, 3),
+    )
+    state = assay.create_group("state")
+    state.create_array("legacy", data=np.array([1], dtype=np.uint8))
+
+    repack_store(str(source), str(output))
+
+    result = zarr.open_group(str(output), mode="r")
+    assert "state" not in result["RNA"]
+    np.testing.assert_array_equal(result["RNA/counts"][:], assay["counts"][:])
+
+
+def test_repack_discards_state_from_every_workspace_sharing_an_assay(tmp_path):
+    source = tmp_path / "source_with_workspace_state.zarr"
+    output = tmp_path / "output_without_workspace_state.zarr"
+    root = zarr.open_group(str(source), mode="w")
+    for workspace_name in ("first", "second"):
+        assay = root.create_group(f"{workspace_name}/RNA")
+        assay.attrs["is_assay"] = True
+        assay.create_array("metadata", data=np.array([1], dtype=np.uint8))
+        state = assay.create_group("state")
+        state.create_array("legacy", data=np.array([1], dtype=np.uint8))
+    counts = root.create_group("matrices/RNA")
+    values = np.arange(6, dtype=np.uint32).reshape(2, 3)
+    counts.create_array("counts", data=values)
+
+    repack_store(str(source), str(output))
+
+    result = zarr.open_group(str(output), mode="r")
+    assert "state" not in result["first/RNA"]
+    assert "state" not in result["second/RNA"]
+    np.testing.assert_array_equal(result["first/RNA/metadata"][:], [1])
+    np.testing.assert_array_equal(result["second/RNA/metadata"][:], [1])
+    np.testing.assert_array_equal(result["matrices/RNA/counts"][:], values)
 
 
 def test_repack_workspace_counts_uses_requested_profile(tmp_path):
@@ -214,6 +270,182 @@ def test_repack_preserves_non_count_completion_attrs(tmp_path):
     result = zarr.open_group(str(output), mode="r")
     assert result["cellData"].attrs["complete"] is True
     assert result["artifacts/marker_table/slot"].attrs["complete"] is True
+
+
+def _seed_labeled_pipeline_records(
+    root,
+    *,
+    artifact_id,
+    completed_run_id,
+    running_run_id,
+    completed_label,
+    running_label,
+):
+    artifact = ArtifactRef(
+        scope="datastore",
+        kind="cell_selection",
+        artifact_id=artifact_id,
+    )
+    artifact_node = root.create_group(artifact_path(artifact))
+    artifact_node.attrs.update(
+        {
+            "artifact_id": artifact.artifact_id,
+            "kind": artifact.kind,
+            "provenance": {
+                "operation": "test_selection",
+                "parameters": {},
+                "inputs": {},
+            },
+            "execution_options": {},
+            "complete": True,
+        }
+    )
+    artifact_node.create_array("values", data=np.asarray([True, False]))
+
+    completed = create_pipeline_run_record(
+        root,
+        recipe="basic_rna_analysis",
+        requested_label=completed_label,
+        assay="RNA",
+        config={"filtering": False},
+        stage_order=("snapshot",),
+        scarf_version="1.0.0",
+        run_id=completed_run_id,
+        started_at_ns=100,
+    )
+    start_pipeline_stage_record(
+        root,
+        run_id=completed.run_id,
+        ordinal=0,
+        stage="snapshot",
+        started_at_ns=110,
+    )
+    finish_pipeline_stage_record(
+        root,
+        run_id=completed.run_id,
+        ordinal=0,
+        status="completed",
+        outputs=(PipelineStageOutputRecord("selection", artifact, False),),
+        metrics=PipelineStageMetrics(
+            wall_seconds=0.01,
+            rss_baseline_bytes=None,
+            rss_peak_bytes=None,
+            rss_incremental_peak_bytes=None,
+            sample_interval_seconds=0.1,
+            sample_count=0,
+            sampling_error_count=0,
+            rss_unavailable_reason="test",
+        ),
+        finished_at_ns=120,
+    )
+    complete_pipeline_run_record(
+        root,
+        run_id=completed.run_id,
+        outputs=(PipelineOutputRecord("selection", artifact),),
+        fields=(),
+        finished_at_ns=130,
+    )
+    running = create_pipeline_run_record(
+        root,
+        recipe="basic_rna_analysis",
+        requested_label=running_label,
+        assay="RNA",
+        config={"filtering": True},
+        stage_order=("snapshot",),
+        scarf_version="1.0.0",
+        run_id=running_run_id,
+        started_at_ns=200,
+    )
+    start_pipeline_stage_record(
+        root,
+        run_id=running.run_id,
+        ordinal=0,
+        stage="snapshot",
+        started_at_ns=210,
+    )
+    pipeline_run_storage._claim_pipeline_label(
+        root,
+        running_label,
+        running.run_id,
+    )
+    return completed.run_id, running.run_id
+
+
+def test_repack_copies_pipeline_records_and_label_claims_in_all_workspaces(tmp_path):
+    source = tmp_path / "source_runs.zarr"
+    output = tmp_path / "output_runs.zarr"
+    root = zarr.open_group(str(source), mode="w", zarr_format=2)
+    assay = root.create_group("RNA")
+    assay.attrs["is_assay"] = True
+    assay.create_array(
+        "counts",
+        data=np.arange(6, dtype=np.uint32).reshape(2, 3),
+        chunks=(2, 3),
+    )
+
+    root_run_ids = _seed_labeled_pipeline_records(
+        root,
+        artifact_id="c" * 64,
+        completed_run_id="a" * 64,
+        running_run_id="b" * 64,
+        completed_label="baseline",
+        running_label="interrupted",
+    )
+    workspace = root.create_group("analysis_workspace")
+    workspace_run_ids = _seed_labeled_pipeline_records(
+        workspace,
+        artifact_id="f" * 64,
+        completed_run_id="d" * 64,
+        running_run_id="e" * 64,
+        completed_label="workspace-baseline",
+        running_label="workspace-interrupted",
+    )
+    namespaces = (
+        ("", root, root_run_ids, "baseline", "interrupted"),
+        (
+            "analysis_workspace",
+            workspace,
+            workspace_run_ids,
+            "workspace-baseline",
+            "workspace-interrupted",
+        ),
+    )
+    record_paths = tuple(
+        f"{prefix + '/' if prefix else ''}pipeline/runs/{run_id}{suffix}"
+        for prefix, _namespace, run_ids, _completed_label, _running_label in namespaces
+        for run_id in run_ids
+        for suffix in ("", "/stages/0")
+    )
+    source_attrs = {path: dict(root[path].attrs) for path in record_paths}
+
+    repack_store(str(source), str(output))
+
+    result = zarr.open_group(str(output), mode="r+")
+    assert {path: dict(result[path].attrs) for path in record_paths} == source_attrs
+    for prefix, source_root, run_ids, completed_label, running_label in namespaces:
+        result_root = result if prefix == "" else result[prefix]
+        completed_run_id, running_run_id = run_ids
+        assert load_pipeline_run_record(
+            result_root,
+            completed_run_id,
+        ) == load_pipeline_run_record(source_root, completed_run_id)
+        assert load_pipeline_run_record(
+            result_root,
+            running_run_id,
+        ) == load_pipeline_run_record(source_root, running_run_id)
+
+        with pytest.raises(ValueError, match="already committed"):
+            pipeline_run_storage._claim_pipeline_label(
+                result_root,
+                completed_label,
+                "1" * 64,
+            )
+        with pytest.raises(ValueError, match="currently being finalized"):
+            pipeline_run_storage._claim_pipeline_label(
+                result_root,
+                running_label,
+                "2" * 64,
+            )
 
 
 def test_repack_skips_copying_counts_t_when_sharding(tmp_path, monkeypatch):

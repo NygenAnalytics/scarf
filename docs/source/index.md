@@ -12,7 +12,9 @@ It is designed for analyses where the count matrix is too large, too remote, or 
 
 Scarf stores counts, metadata, and persisted results in Zarr.
 Operations stream bounded blocks instead of loading a complete matrix into memory.
-The same `DataStore` can hold alternative cell selections, feature selections, {term}`analysis chains <analysis chain>`, clustering resolutions, and mappings while recording which inputs and parameters produced each result.
+The same `DataStore` can hold alternative cell and feature selections, artifact lineages,
+{py:class}`~scarf.PipelineRun` records, clustering resolutions, and mappings while recording which
+inputs and parameters produced each result.
 
 :::{image} _static/overview.svg
 :width: 75%
@@ -20,14 +22,26 @@ The same `DataStore` can hold alternative cell selections, feature selections, {
 :alt: Compressed count-matrix chunks feed graph construction, embeddings, clustering, mapping, imputation, downsampling, and trajectory analysis
 :::
 
-## Start here
+## Measured end to end at 10 million cells
+
+In three fixed reference runs, Scarf processed 10 million input cells through conversion, quality
+control, normalization, graph construction, embedding, clustering, and marker search in
+2.78 ± 0.47 hours, with 31.9 GiB mean sampled peak memory on a 16 CPU, 64 GiB container.
+
+These measurements establish execution and resource use for that dataset, workflow, software
+revision, and cloud resource envelope. They are not a general hardware guarantee, a comparison
+with another package, or biological validation. See {doc}`concepts/benchmarks` for every replicate,
+stage timing, configuration detail, and limitation.
+
+## Choose your starting point
 
 - {ref}`Install Scarf <installation>`
-- Follow the {ref}`Quick start <quickstart>`
-- Use {doc}`analysis_with_agents` to route an autonomous or AI-assisted analysis
-- Run the executable {doc}`tutorials/agent_workflow` for the four grounded agent stages
-- Read {doc}`scanpy_and_seurat` if you already use Scanpy or Seurat
-- See {doc}`concepts/benchmarks` for measured end-to-end scale and stage timings
+- Follow the {ref}`Quick start <quickstart>` to open a prepared PBMC result and inspect its
+  pipeline-selected clusters
+- Use {doc}`scanpy` to translate a Scanpy workflow and H5AD exchange
+- Use {doc}`seurat` to translate a Seurat workflow, RDS import, and WNN analysis
+- Choose the focused {doc}`tutorials/scrna_seq`, {doc}`tutorials/scatac_seq`, or
+  {doc}`tutorials/cite_seq` core workflow for your assay
 
 ## Supported workflows
 
@@ -35,7 +49,8 @@ Scarf provides complete workflows for:
 
 - scRNA-seq quality control, feature selection, normalization, graph construction, embedding, clustering, and marker discovery
 - scATAC-seq peak filtering, LSI-based graph construction, clustering, and gene-score analysis
-- CITE-seq RNA and ADT processing with shared-nearest-neighbour or weighted-nearest-neighbour integration
+- CITE-seq RNA and ADT processing with weighted-nearest-neighbour integration by default and
+  explicit shared-nearest-neighbour integration as an alternative
 - pseudotime ordering, expression dynamics, modules, and multi-sink fate probabilities
 - dataset merging, Harmony or partial-PCA correction with quantitative diagnostics, reference mapping, and label transfer
 - cell-cycle scoring, gene-set activity, imputation, downsampling, and pseudobulk export
@@ -84,16 +99,20 @@ Related branches can coexist in one datastore, and an identical request can {ter
 Execution choices such as thread count or local scratch are recorded separately and do not change the scientific identity of a result.
 
 This record is useful whenever the analysis is long-running, revisited after a gap, or executed through a pipeline or software agent, because the dependency chain can be inspected independently of the code or description that produced it.
-See {doc}`analysis_with_agents` for the scientific decision and troubleshooting framework, {doc}`concepts/provenance` for the data model, and {doc}`tutorials/reuse_and_tracing` for an executable example.
+See {doc}`analysis_with_agents` for the scientific decision and troubleshooting framework,
+{doc}`tutorials/agent_workflow` for its executable four-stage example,
+{doc}`concepts/provenance` for the data model, and {doc}`tutorials/reuse_and_tracing` for an
+executable branching example.
 
 ## Selections and multi-scale analysis
 
 Detailed work usually moves from a whole dataset to tissues, lineages, clusters, and smaller subpopulations.
 Keeping a separate in-memory object for each subset makes it easy to lose track of which cells produced which result.
 
-In Scarf, cell selections are boolean metadata columns and feature selections are immutable artifacts published under plain labels.
-Filtering marks cells inactive rather than deleting them.
-Whole-dataset and subpopulation analyses can therefore share one object and one set of count matrices, while each stored result stays tied to the exact {term}`cell key` and {term}`feature selection` artifact used to produce it.
+In Scarf, a live cell key is a Boolean metadata column; an analysis captures it as an immutable
+selection artifact. Feature selections are also immutable artifacts and are passed by exact ref.
+Filtering returns another selection artifact without changing the live column or deleting cells.
+Whole-dataset and subpopulation analyses can therefore share one object and one set of count matrices, while each stored result stays tied to the exact cell- and feature-selection artifacts used to produce it.
 Persisted outputs remain available between sessions, so an analysis can stop after an expensive stage and continue later.
 
 ## Implemented methods

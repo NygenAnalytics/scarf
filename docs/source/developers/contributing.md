@@ -116,13 +116,15 @@ Sphinx reads the committed cache via `nb_execution_mode = "cache"` in `docs/sour
 
 Use `scarf.configure_output(level='DEBUG', progress=True)` when debugging tutorial execution.
 Tutorials download datasets over the network.
-Timeout per page is 600 seconds (`nb_execution_timeout` in `conf.py`).
+Timeout per code cell is 600 seconds (`nb_execution_timeout` in `conf.py`).
 
 ### Republishing the example stores
 
-Pages that are not about building an analysis chain open a pre-analyzed store with `download_dataset(..., zarr=True)`.
+Pages that are not about building an artifact lineage open a pre-analyzed store with `download_dataset(..., zarr=True)`.
 Source stores are rebuilt from raw counts, while declared derived stores are rebuilt from their published inputs.
-`scripts/regenerate_docs_datasets.py` writes both kinds and creates a manifest under `docs/source/developers/dataset_manifests/` recording the recipe, cell counts, artifact inventory, and archive checksum:
+`scripts/regenerate_docs_datasets.py` writes both kinds and creates a manifest under
+`docs/source/developers/dataset_manifests/` recording the recipe, cell counts, artifact and
+pipeline-run inventories, and archive checksum:
 
     uv run python scripts/regenerate_docs_datasets.py --all
 

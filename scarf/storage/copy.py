@@ -5,7 +5,12 @@ import numpy as np
 import zarr
 
 from .types import as_zarr_array
-from .arrays import create_metadata_column, create_numeric_array, dtype_fix
+from .arrays import (
+    _decode_metadata_values,
+    create_metadata_column,
+    create_numeric_array,
+    dtype_fix,
+)
 from .budget import ResourceBudget
 from .geometry import array_geometry
 from .layout import PROFILE_METADATA_CHUNK, normed_array_spec
@@ -48,6 +53,8 @@ def _resolve_metadata_dtype(
     dtype: np.dtype[Any] = np.dtype(array.dtype)
     if not (dtype.kind in {"O", "S"} or dtype.hasobject):
         return dtype
+    if dtype.kind == "S":
+        return np.empty(0, dtype=dtype).astype(str).dtype
     n_rows = int(array.shape[0])
     if n_rows == 0:
         return np.dtype("U1")
@@ -100,10 +107,33 @@ def _copy_metadata_array(
         n_rows = int(src.shape[0])
         for start in range(0, n_rows, block_rows):
             stop = min(start + block_rows, n_rows)
-            target[start:stop] = np.asarray(src[start:stop], dtype=dtype)
+            values = _decode_metadata_values(src[start:stop])
+            target[start:stop] = np.asarray(values, dtype=dtype)
 
     if "display" in src.attrs:
         target.attrs["display"] = src.attrs["display"]
+
+
+def copy_metadata_array(
+    src: zarr.Array,
+    dst: zarr.Group,
+    name: str,
+    *,
+    overwrite: bool = True,
+    profile: StorageProfile | None = None,
+) -> zarr.Array:
+    """Stream-copy one metadata vector without carrying presentation attrs."""
+    _copy_metadata_array(
+        src,
+        dst,
+        name,
+        overwrite=overwrite,
+        profile=profile,
+    )
+    target = as_zarr_array(dst[name], name=name)
+    for attribute in tuple(target.attrs):
+        del target.attrs[attribute]
+    return target
 
 
 def copy_zarr_group_tree(

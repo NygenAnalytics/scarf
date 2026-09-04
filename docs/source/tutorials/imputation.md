@@ -21,52 +21,30 @@ Scarf can diffuse a feature over the neighbourhood graph to reveal coherent regi
 Imputation is a visualization and exploratory-analysis aid.
 It does not create new molecular observations and should not replace counts in differential expression.
 
-## 1. Standalone setup
+## 1. Open the prepared baseline
 
 Diffusion needs a neighbourhood graph.
-The published PBMC store supplies counts, literal metadata, and the UMAP used below.
-This setup mounts those inputs into a temporary writable analysis store and builds a current graph lineage locally.
-The catalog snapshot is structurally repacked inside the temporary directory first so the mounted counts satisfy the current RNA layout.
+The rebuilt PBMC store contains a completed standard analysis labeled `docs_default`.
+Open the downloaded store directly because this page writes new diffusion artifacts and deliberate
+cell columns, then take the graph and UMAP from that frozen run. The prepared store's active `I`
+matches the run's analysis selection.
 
 ```{code-cell} ipython3
-from tempfile import TemporaryDirectory
-
 import pandas as pd
 
 import scarf
 import scarf.plotting as splt
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-repacked_counts = f"{analysis_directory.name}/counts.zarr"
-repack_store(
-    f"{dataset}/data.zarr",
-    repacked_counts,
-    nthreads=2,
-)
-ds = scarf.mount_datastore(
-    repacked_counts,
-    at=f"{analysis_directory.name}/analysis.zarr",
-    nthreads=4,
-    default_assay="RNA",
-)
-hvg_ref = ds.mark_hvgs(
-    top_n=2000,
-    show_plot=False,
-    label="imputation_hvgs",
-)
-normalized = ds.run_normalization(features=hvg_ref)
-reduction = ds.run_pca(normalized, dims=15)
-ann_index = ds.build_ann_index(reduction)
-neighbors = ds.query_neighbors(ann_index, k=11)
-graph = ds.build_connectivity_map(neighbors)
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+run = ds.pipeline.open(label="docs_default")
+graph = run["connectivity_map"]
 ```
 
 ## 2. Diffuse one feature
@@ -75,21 +53,23 @@ graph = ds.build_connectivity_map(neighbors)
 A larger value mixes information over more graph steps and can erase real boundaries.
 
 ```{code-cell} ipython3
-for t in (1, 2, 4):
-    ds.cells.insert(
-        f"CD4_imputed_t{t}",
-        ds.get_imputed(feature_name="CD4", graph=graph, t=t),
-        overwrite=True,
-    )
+diffusion_operators = {
+    t: ds.run_diffusion_operator(graph, t=t)
+    for t in (1, 2, 4)
+}
+diffused_by_t = {
+    t: ds.get_imputed(feature_name="CD4", diffusion=diffusion)
+    for t, diffusion in diffusion_operators.items()
+}
+for t, values in diffused_by_t.items():
+    ds.cells.insert(f"CD4_imputed_t{t}", values, key="I", overwrite=True)
 ```
 
 ```{code-cell} ipython3
 observed = ds.get_cell_vals(from_assay="RNA", cell_key="I", k="CD4")
 cd4_series = {
     "Observed CD4": observed,
-    "Diffusion t=1": ds.cells.fetch("CD4_imputed_t1", key="I"),
-    "Diffusion t=2": ds.cells.fetch("CD4_imputed_t2", key="I"),
-    "Diffusion t=4": ds.cells.fetch("CD4_imputed_t4", key="I"),
+    **{f"Diffusion t={t}": values for t, values in diffused_by_t.items()},
 }
 cd4_summary = pd.DataFrame(
     {
@@ -112,18 +92,22 @@ Mean stays near the observed level while max falls with `t` as diffusion spreads
 `filled_zeros` counts active cells that were zero for observed CD4 and became nonzero after diffusion.
 That count is the size of the nonzero-as-detection mistake for this feature.
 
-Paris clusters on the published UMAP give the population context for the CD4 panels below.
+The frozen selected clustering gives population context for the CD4 panels below.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by="RNA_paris_cluster",
+    run=run,
+    layout="umap",
+    color_by="clusters",
 )
 ```
 
+The comparison uses the exact UMAP artifact from the same run while coloring by the live columns
+created above.
+
 ```{code-cell} ipython3
 imputation_comparison = ds.plots.embedding(
-    layout_key="RNA_UMAP",
+    layout=run["umap"],
     color_by=[
         "CD4",
         "CD4_imputed_t1",
@@ -151,9 +135,10 @@ Signal across unrelated clusters indicates excessive diffusion or a graph that d
 
 ## 4. Caveats
 
-The result depends on the active cell selection, feature selection, and graph.
-By default, each diffusion operator remains cached in memory for reuse across features.
-Set `cache_operator=False` when memory matters more than repeated feature speed.
+The result depends on the immutable cell selection and graph captured by each diffusion artifact.
+Repeating `run_diffusion_operator` with the same graph and `t` reuses the complete stored artifact.
+Pass that exact ref to `get_imputed`, or use `load_diffusion_operator` when direct sparse-matrix work
+is needed.
 Inserted columns such as `CD4_imputed_t2` are explicit cell metadata.
 Do not interpret a nonzero imputed value as detection in that cell, use it for marker significance, or feed it to replicate-aware differential expression.
 The `filled_zeros` column above is the concrete count of that mismatch for CD4 at each `t`.

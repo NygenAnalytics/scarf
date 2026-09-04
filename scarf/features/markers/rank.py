@@ -172,7 +172,7 @@ def _marker_stats_batch(
     return out
 
 
-@njit(parallel=True, cache=True)
+@njit(cache=True, nogil=True)
 def _marker_stats_gene_major(
     raw: np.ndarray,
     scalar: np.ndarray,
@@ -188,7 +188,7 @@ def _marker_stats_gene_major(
     n_genes = raw.shape[0]
     n_cells = raw.shape[1]
     n_groups = group_counts.shape[0]
-    for g in prange(n_genes):
+    for g in range(n_genes):
         row = destination_rows[g]
         if row < 0:
             continue

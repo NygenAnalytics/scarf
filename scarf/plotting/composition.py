@@ -5,7 +5,9 @@ from typing import Any, Hashable, Literal
 import numpy as np
 import pandas as pd
 
+from ..storage.artifacts import ArtifactRef
 from ._contracts import CategoricalScale, PlotProvenance, StudyDesign
+from ._data import _artifact_cell_selection, _resolve_grouping
 from ._deps import require_matplotlib
 from ._display import resolve_categorical_scale
 from ._figure import (
@@ -287,9 +289,11 @@ def _draw_summary_markers(
 def composition(
     store: Any,
     *,
-    category_by: str,
+    category_by: str | None = None,
+    categories: ArtifactRef | None = None,
     cell_key: str = "I",
     sample_by: str | None = None,
+    grouping: ArtifactRef | None = None,
     subject_by: str | None = None,
     pair_by: str | None = None,
     condition_by: str | None = None,
@@ -316,6 +320,9 @@ def composition(
 
     ``kind="stacked"`` draws stacked bars. With ``sample_by``, there is one bar
     per sample; without it, one bar for the whole dataset.
+    ``grouping`` is the immutable artifact counterpart to ``sample_by`` for
+    analytical groupings such as clusters. It is available only for stacked
+    composition and must share the exact selection used by ``categories``.
     ``kind="per_sample"`` draws one point per sample in each category (requires
     ``sample_by`` or a :class:`StudyDesign`).
 
@@ -348,6 +355,21 @@ def composition(
         raise ValueError("segment_linewidth must be non-negative")
     if not 0 <= label_min_fraction <= 1:
         raise ValueError("label_min_fraction must be between 0 and 1")
+    if grouping is not None:
+        if sample_by is not None or study_design is not None:
+            raise ValueError(
+                "grouping is mutually exclusive with sample_by or StudyDesign"
+            )
+        if kind != "stacked":
+            raise ValueError("grouping is supported only for kind='stacked'")
+        if subject_by is not None or pair_by is not None or condition_by is not None:
+            raise ValueError(
+                "grouping cannot be combined with subject, pair, or condition metadata"
+            )
+        if cell_key != "I":
+            raise ValueError(
+                "cell_key cannot override an artifact's stored cell selection"
+            )
     if study_design is not None:
         sample_by = study_design.sample_by
         subject_by = study_design.subject_by or subject_by
@@ -358,16 +380,70 @@ def composition(
             "Paired composition requires condition_by together with "
             "subject_by or pair_by"
         )
-    categorical_scale = resolve_categorical_scale(
-        store,
-        category_by,
-        categorical_scale,
-    )
-
-    cats = np.asarray(
-        store.cells.fetch(category_by, key=cell_key),
-        dtype=object,
-    ).copy()
+    if (category_by is None) == (categories is None):
+        raise ValueError("Provide exactly one of category_by or categories")
+    cell_indices: np.ndarray | None = None
+    grouping_values: np.ndarray | None = None
+    grouping_selection: ArtifactRef | None = None
+    if grouping is not None:
+        _, cell_indices, resolved_grouping = _resolve_grouping(
+            store,
+            group_by=None,
+            groups=grouping,
+            cell_key="I",
+        )
+        grouping_values = np.asarray(resolved_grouping[0], dtype=object)
+        grouping_selection = _artifact_cell_selection(
+            store,
+            grouping,
+            label="Grouping",
+        )
+    if categories is None:
+        assert category_by is not None
+        categorical_scale = resolve_categorical_scale(
+            store,
+            category_by,
+            categorical_scale,
+        )
+        cats = np.asarray(
+            (
+                store.cells.fetch(category_by, key=cell_key)
+                if cell_indices is None
+                else np.asarray(store.cells.fetch_all(category_by))[cell_indices]
+            ),
+            dtype=object,
+        ).copy()
+        category_axis_label = category_by
+    else:
+        if cell_key != "I":
+            raise ValueError(
+                "cell_key cannot override an artifact's stored cell selection"
+            )
+        _, category_indices, category_values = _resolve_grouping(
+            store,
+            group_by=None,
+            groups=categories,
+            cell_key="I",
+        )
+        category_selection = _artifact_cell_selection(
+            store,
+            categories,
+            label="Categories",
+        )
+        if grouping_selection is not None:
+            assert cell_indices is not None
+            if category_selection != grouping_selection:
+                raise ValueError(
+                    "categories and grouping must share the same cell selection"
+                )
+            if not np.array_equal(category_indices, cell_indices):
+                raise ValueError(
+                    "categories and grouping select cells in a different order"
+                )
+        else:
+            cell_indices = category_indices
+        cats = np.asarray(category_values[0], dtype=object).copy()
+        category_axis_label = "categories"
     if len(cats) == 0:
         raise ValueError(f"No cells selected by cell_key {cell_key!r}")
     missing_label = (
@@ -400,7 +476,7 @@ def composition(
     summary_table: pd.DataFrame | None = None
     condition_order: list[Any] | None = None
 
-    if sample_by is None:
+    if sample_by is None and grouping is None:
         if kind == "per_sample":
             raise ValueError("kind='per_sample' requires sample_by or StudyDesign")
         if subject_by is not None or pair_by is not None:
@@ -416,10 +492,17 @@ def composition(
         per_sample = None
         props_mat = None
     else:
-        samples = store.cells.fetch(sample_by, key=cell_key)
+        samples = (
+            grouping_values
+            if grouping_values is not None
+            else store.cells.fetch(sample_by, key=cell_key)
+            if cell_indices is None
+            else np.asarray(store.cells.fetch_all(sample_by))[cell_indices]
+        )
+        sample_axis_label = "grouping" if grouping is not None else sample_by
         valid = pd.notna(samples) & (np.asarray(samples, dtype=object) != "")
         if not valid.any():
-            raise ValueError(f"No cells have valid values for sample_by {sample_by!r}")
+            raise ValueError(f"No cells have valid values for {sample_axis_label!r}")
         dropped_sample_cells = int((~valid).sum())
         sample_vals_valid = np.asarray(samples)[valid]
         df = pd.DataFrame(
@@ -442,17 +525,29 @@ def composition(
         )
 
         subject_vals = (
-            np.asarray(store.cells.fetch(subject_by, key=cell_key))[valid]
+            np.asarray(
+                store.cells.fetch(subject_by, key=cell_key)
+                if cell_indices is None
+                else np.asarray(store.cells.fetch_all(subject_by))[cell_indices]
+            )[valid]
             if subject_by is not None
             else None
         )
         pair_vals = (
-            np.asarray(store.cells.fetch(pair_by, key=cell_key))[valid]
+            np.asarray(
+                store.cells.fetch(pair_by, key=cell_key)
+                if cell_indices is None
+                else np.asarray(store.cells.fetch_all(pair_by))[cell_indices]
+            )[valid]
             if pair_by is not None
             else None
         )
         condition_vals = (
-            np.asarray(store.cells.fetch(condition_by, key=cell_key))[valid]
+            np.asarray(
+                store.cells.fetch(condition_by, key=cell_key)
+                if cell_indices is None
+                else np.asarray(store.cells.fetch_all(condition_by))[cell_indices]
+            )[valid]
             if condition_by is not None
             else None
         )
@@ -532,7 +627,11 @@ def composition(
                 3.8,
                 max_width=max_figure_width,
             )
-        elif kind == "stacked" and sample_by is not None and per_sample is not None:
+        elif (
+            kind == "stacked"
+            and (sample_by is not None or grouping is not None)
+            and per_sample is not None
+        ):
             n_samples = int(per_sample["sample"].nunique())
             resolved_figsize = capped_figsize(
                 max(4.5, 0.28 * n_samples + 1.8),
@@ -562,7 +661,7 @@ def composition(
                 luminance = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
                 return "#111111" if luminance > 0.58 else "#ffffff"
 
-            if sample_by is None:
+            if sample_by is None and grouping is None:
                 bottom = 0.0
                 for cat in cat_order:
                     val = float(
@@ -631,12 +730,12 @@ def composition(
                 ax.set_xticklabels(
                     [str(s) for s in samples_order], rotation=45, ha="right"
                 )
-                ax.set_xlabel(sample_by)
+                ax.set_xlabel(sample_axis_label)
                 ax.set_ylabel("proportion")
             if show_legend:
                 legend_kwargs = {
                     "frameon": False,
-                    "title": category_by,
+                    "title": category_axis_label,
                     "ncols": max(1, int(np.ceil(len(cat_order) / 20))),
                     "columnspacing": 0.8,
                 }
@@ -759,7 +858,7 @@ def composition(
                 )
                 if show_legend:
                     blocks = [
-                        (category_by, handles),
+                        (category_axis_label, handles),
                         ("Condition", condition_handles),
                     ]
                     if summary_handle is not None:
@@ -823,7 +922,12 @@ def composition(
                     else None
                 )
                 if show_legend:
-                    blocks = [(category_by, list(ax.get_legend_handles_labels()[0]))]
+                    blocks = [
+                        (
+                            category_axis_label,
+                            list(ax.get_legend_handles_labels()[0]),
+                        )
+                    ]
                     if summary_handle is not None:
                         blocks.append(("Summary", [summary_handle]))
                     if owns:
@@ -843,7 +947,7 @@ def composition(
                         )
                     else:
                         _place_axis_legend_blocks(ax, blocks)
-            ax.set_xlabel(category_by)
+            ax.set_xlabel(category_axis_label)
             ax.set_ylabel("proportion")
             ymax = float(np.nanmax(per_sample["proportion"].to_numpy(dtype=np.float64)))
             if summary_table is not None:
@@ -866,7 +970,7 @@ def composition(
             per_sample_table["category"] == _MISSING_CATEGORY,
             None,
         )
-        tables["per_sample"] = per_sample_table
+        tables["per_group" if grouping is not None else "per_sample"] = per_sample_table
     if summary_table is not None:
         summary_output = summary_table.copy()
         summary_output["category"] = summary_output["category"].mask(
@@ -879,7 +983,7 @@ def composition(
     if pair_col is not None:
         notes.append(f"paired_by={pair_col}")
 
-    legends = [LegendSpec(kind="categorical", label=category_by)]
+    legends = [LegendSpec(kind="categorical", label=category_axis_label)]
     if condition_order is not None:
         legends.append(
             LegendSpec(
@@ -919,14 +1023,21 @@ def composition(
             ),
         ),
         provenance=PlotProvenance(
-            cell_key=cell_key,
+            cell_key=(
+                None if categories is not None or grouping is not None else cell_key
+            ),
             n_cells=int(len(cats)),
-            n_samples=int(per_sample["sample"].nunique())
-            if per_sample is not None
-            else None,
+            n_samples=(
+                int(per_sample["sample"].nunique())
+                if per_sample is not None and grouping is None
+                else None
+            ),
             renderer="matplotlib",
             notes=tuple(notes),
             extras={
+                "category_by": category_by,
+                "categories": (None if categories is None else categories.to_dict()),
+                "grouping": None if grouping is None else grouping.to_dict(),
                 "subject_by": subject_by,
                 "pair_by": pair_by,
                 "condition_by": condition_by,

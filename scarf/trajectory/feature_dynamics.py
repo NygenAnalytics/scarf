@@ -5,6 +5,7 @@ import scarf
 
 from ..utils.arrays import rolling_window
 from ..utils.logging import logger
+from .parameters import resolve_aggregation_ann_params
 
 __all__ = [
     "aggregate_feature_profiles",
@@ -244,19 +245,13 @@ def knn_clustering(
             .values
         )
 
-    default_ann_params: dict[str, Any] = {
-        "space": "l2",
-        "dim": d_array.shape[1],
-        "max_elements": d_array.shape[0],
-        "ef_construction": 80,
-        "M": 50,
-        "random_seed": 444,
-        "ef": 80,
-        "num_threads": 1,
-    }
-    if ann_params is None:
-        ann_params = {}
-    default_ann_params.update(ann_params)
+    default_ann_params = resolve_aggregation_ann_params(
+        ann_params,
+        dim=int(d_array.shape[1]),
+    )
+    default_ann_params.setdefault("max_elements", d_array.shape[0])
+    if int(default_ann_params["max_elements"]) < int(d_array.shape[0]):
+        raise ValueError("ann_params.max_elements is smaller than the feature count")
     ann_idx = instantiate_knn_index(
         space=str(default_ann_params["space"]),
         dim=int(default_ann_params["dim"]),

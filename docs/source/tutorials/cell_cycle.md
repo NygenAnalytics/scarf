@@ -32,70 +32,62 @@ Score S-phase and G2M-phase gene sets to assign a cell-cycle phase to each cell.
 ## Dataset
 
 ```{code-cell} ipython3
-from pathlib import Path
-from tempfile import TemporaryDirectory
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 
 import scarf
-import scarf.plotting as splt
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level='WARNING', progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 ```
 
-## 1. Fetch pre-analyzed data
+## 1. Open the pre-analyzed store
 
 Here we use the data from [Bastidas-Ponce et al., 2019 Development](https://journals.biologists.com/dev/article/146/12/dev173849/19483/) for E15.5 stage of differentiation of endocrine cells from a pool of endocrine progenitors-precursors.
 
-The prepared Zarr store is available from the `scarf_docs` Cytebase catalog.
-It includes cluster and UMAP columns for visualization.
-The source is structurally repacked to supply the current count layout, then mounted read-only while this page writes cell-cycle artifacts and score columns to a separate analysis store.
+The rebuilt Zarr store is available from the `scarf_docs` Cytebase catalog. It contains a completed
+pipeline run named `docs_default`. This page opens that current store directly and writes only the
+cell-cycle artifact taught below.
 
 ```{code-cell} ipython3
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    name='bastidas-ponce_4K_pancreas-d15_rnaseq',
-    destination='scarf_datasets',
+    name="bastidas-ponce_4K_pancreas-d15_rnaseq",
+    destination="scarf_datasets",
     zarr=True,
 )
-
-analysis_directory = TemporaryDirectory()
-repacked_counts = str(Path(analysis_directory.name) / 'counts.zarr')
-repack_store(
-    f'{dataset}/data.zarr',
-    repacked_counts,
-    nthreads=2,
-)
-ds = scarf.mount_datastore(
-    repacked_counts,
-    at=str(Path(analysis_directory.name) / 'cell_cycle_analysis.zarr'),
+ds = scarf.DataStore(
+    f"{dataset}/data.zarr",
     nthreads=4,
-    default_assay='RNA'
 )
+analysis_run = ds.pipeline.open(label="docs_default")
 ```
 
 ```{code-cell} ipython3
 ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='clusters',
+    run=analysis_run,
+    color_by="clusters",
 )
 ```
 
 ## 2. Run cell-cycle scoring
 
-The cell cycle scoring function in Scarf is highly inspired by the [equivalent function](https://scanpy.readthedocs.io/en/stable/generated/scanpy.tl.score_genes_cell_cycle.html) in Scanpy.
-The cell cycle phase of each individual cell is identified following steps below:
-- A list of S and G2M phase is provided to the function (Scarf already has a generic list of genes that works both for human and mouse data)
-- Per-gene averages across `cell_key` cells are calculated genome-wide from the assay's current normalized values (default RNA: library-size, not log)
-- Those averages are divided into `n_bins` bins
-- A control set of genes is identified by sampling genes from same expression bins where phase's genes are present.
-- S and G2M are then scored separately (two `score_features` calls): for each phase, the average expression of phase genes (Ep) and control genes (Ec) is calculated per cell.
-- A phase score is calculated as: Ep-Ec
-Cell cycle phase is assigned as follows (cells default to S, then rules override):
-- G2M phase: G2M score > S score
-- G1 phase: S score < 0 and G2M score < 0
-- otherwise the cell stays S
+Scarf's scorer follows the same general strategy as
+[Scanpy's cell-cycle scorer](https://scanpy.readthedocs.io/en/stable/generated/scanpy.tl.score_genes_cell_cycle.html):
+
+- Match the supplied S and G2M markers, using Scarf's human-and-mouse lists by default.
+- Bin genome-wide mean normalized expression across the selected cells.
+- Sample control genes from the same expression bins as each phase's markers.
+- Subtract mean control expression from mean marker expression for each cell and phase.
+
+Cells with two negative scores are assigned G1. Otherwise, G2M wins when its score exceeds the S
+score, and the remaining cells are assigned S.
 
 ```{code-cell} ipython3
-ds.run_cell_cycle_scoring()
+cell_cycle_ref = ds.run_cell_cycle_scoring(analysis_run["analysis_cell_selection"])
+cell_cycle_values = ds.load_artifact(cell_cycle_ref)
+s_score = np.asarray(cell_cycle_values["s_score"][:])
+g2m_score = np.asarray(cell_cycle_values["g2m_score"][:])
+phase = np.asarray(cell_cycle_values["phase"][:]).astype(str)
 ```
 
 The bundled list contains one marker that is absent from this assay.
@@ -108,63 +100,63 @@ In contrast, a direct `Assay.score_features(...)` call computes blockwise in mem
 
 ## 3. Visualize cell-cycle phases
 
-By default, the cell-cycle phase is stored in the cell metadata column `RNA_cell_cycle_phase`.
-Explicit colors keep the phase encoding consistent with the composition plot below:
+Cell-cycle phase remains in the returned artifact. Explicit colors keep the phase encoding
+consistent with the composition summary below:
 
 ```{code-cell} ipython3
-color_key = {
-    'G1': 'grey',
-    'S': 'salmon',
-    'G2M': 'green',
+phase_colors = {
+    "G1": "grey",
+    "S": "salmon",
+    "G2M": "green",
 }
 
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='RNA_cell_cycle_phase',
-    categorical_scale=splt.CategoricalScale(palette=color_key),
+umap = analysis_run.cells.to_pandas_dataframe(["umap_1", "umap_2"])
+plt.scatter(
+    umap["umap_1"],
+    umap["umap_2"],
+    c=[phase_colors[value] for value in phase],
+    s=3,
 )
 ```
 
-Cycling cells should be concentrated in the ductal region rather than spread uniformly across the embedding.
+Cycling cells should form localized regions rather than be spread uniformly across the embedding.
 
-Phase composition per cluster shows which groups are enriched for S or G2M relative to G1:
+Phase composition for the pipeline's selected clustering shows which groups are enriched for S or
+G2M relative to G1:
 
 ```{code-cell} ipython3
-ds.plots.composition(
-    category_by='RNA_cell_cycle_phase',
-    sample_by='clusters',
-    kind='stacked',
-    categorical_scale=splt.CategoricalScale(
-        palette=color_key,
-        order=['G1', 'S', 'G2M'],
-    ),
-)
+pd.crosstab(analysis_run.cells.fetch("clusters"), phase, normalize="index")
 ```
 
-Stacked bars are cluster-wise phase fractions among active cells; ductal-associated clusters should show a higher S/G2M share if the embedding pattern above holds.
+Rows are cluster-wise phase fractions among the cells captured by the run.
 
 ## 4. Visualize phase-specific scores
 
-The individual and S and G2M scores for each cell are stored under columns `RNA_S_score` and `RNA_G2M_score`.
-We can visualize the distribution of these scores on the UMAP plots.
+The S and G2M score arrays are stored in the same artifact.
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by=['RNA_S_score', 'RNA_G2M_score'],
-)
+figure, axes = plt.subplots(1, 2, figsize=(9, 4))
+for axis, values, title in (
+    (axes[0], s_score, "S score"),
+    (axes[1], g2m_score, "G2M score"),
+):
+    points = axis.scatter(umap["umap_1"], umap["umap_2"], c=values, s=3)
+    axis.set_title(title)
+    figure.colorbar(points, ax=axis)
+figure.tight_layout()
+figure
 ```
 
-## 5. Compare scores calculated with Scanpy
+## 5. Compare with Scanpy scores
 
-The dataset we downloaded, already had cell cycle scores calculated using Scanpy.
-For example, the S phase scores are stored under the column `S_score`.
-We can plot these scores on the UMAP.
+The rebuilt dataset retains cell-cycle scores calculated with Scanpy in the `S_score` and
+`G2M_score` metadata columns. Plot both on the pipeline run's exact UMAP.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='S_score',
+    layout=analysis_run["umap"],
+    color_by=["S_score", "G2M_score"],
+    n_columns=2,
 )
 ```
 
@@ -172,24 +164,13 @@ The Scanpy scores look similar to Scarf's.
 Quantify the concordance:
 
 ```{code-cell} ipython3
-import matplotlib.pyplot as plt
-from scipy.stats import linregress
-
-fig, axis  = plt.subplots(1, 2, figsize=(6,3))
-for n,i in enumerate(['S_score', 'G2M_score']):
-    x = ds.cells.fetch(f"RNA_{i}")
-    y = ds.cells.fetch(i)
-    res = linregress(x, y)
-    
-    ax = axis[n]
-    ax.scatter(x, y, color=color_key[i.split('_')[0]])
-    ax.plot(x, res.intercept + res.slope*x, label='fitted line', c='k')
-    ax.set_xlabel(f"{i} (Scarf)")
-    ax.set_ylabel(f"{i} (Scanpy)")
-    ax.set_title(f"Corr. coef.: {round(res.rvalue, 2)} (pvalue: {res.pvalue})")
-
-plt.tight_layout()
-plt.show()
+pd.Series(
+    {
+        "S": np.corrcoef(s_score, ds.cells.fetch("S_score"))[0, 1],
+        "G2M": np.corrcoef(g2m_score, ds.cells.fetch("G2M_score"))[0, 1],
+    },
+    name="Pearson r",
+)
 ```
 
 High correlation coefficients indicate a large degree of concordance between the scores obtained using Scanpy and Scarf.
@@ -200,4 +181,5 @@ High correlation coefficients indicate a large degree of concordance between the
 - Interpreting a phase score as evidence of cell proliferation without checking the underlying genes
 - Comparing scores across workflows with different gene sets or normalization
 
-`run_cell_cycle_scoring` stores `RNA_cell_cycle_phase`, `RNA_S_score`, and `RNA_G2M_score` beside the scoring step so they can be reused by plots and downstream metadata queries.
+`run_cell_cycle_scoring` stores phase and both scores in one immutable artifact. Retain its exact ref
+for loading and downstream analysis.

@@ -12,7 +12,6 @@ _EXPECTED_EXPORTS = {
     "ArtifactRef": "scarf.storage.refs",
     "ArtifactResolutionError": "scarf.storage.errors",
     "ArtifactStatus": "scarf.storage.artifacts",
-    "AssayState": "scarf.graph.state",
     "CSVReader": "scarf.readers",
     "CSVtoZarr": "scarf.writers",
     "CrDirReader": "scarf.readers",
@@ -26,9 +25,9 @@ _EXPECTED_EXPORTS = {
     "FateMappingResult": "scarf.trajectory.results",
     "GffReader": "scarf.features.genomic.gff",
     "H5adInspectResult": "scarf.readers",
+    "H5adImportResult": "scarf.writers",
     "H5adReader": "scarf.readers",
     "H5adToZarr": "scarf.writers",
-    "IncompatibleAnalysisStateError": "scarf.graph.errors",
     "LoomReader": "scarf.readers",
     "LoomToZarr": "scarf.writers",
     "MtxReader": "scarf.readers",
@@ -43,6 +42,8 @@ _EXPECTED_EXPORTS = {
     "PseudotimeAggregationResult": "scarf.trajectory.results",
     "PseudotimeMarkerResult": "scarf.trajectory.results",
     "PseudotimeScoreResult": "scarf.trajectory.results",
+    "PipelineExecutionError": "scarf.datastore.pipeline_run",
+    "PipelineRun": "scarf.datastore.pipeline_run",
     "SparseToZarr": "scarf.writers",
     "SubsetZarr": "scarf.writers",
     "clean_array": "scarf.utils",
@@ -153,6 +154,7 @@ _EXPECTED_PLOTTING_EXPORTS = (
     "mapping_evidence",
     "mapping_score",
     "matrixplot",
+    "modality_weights",
     "pseudotime_heatmap",
     "qc",
     "register_theme",
@@ -327,6 +329,7 @@ concrete = (
     "scarf.plotting.embedding_raster",
     "scarf.plotting.heatmaps",
     "scarf.plotting.mapping",
+    "scarf.plotting.modality_weights",
     "scarf.plotting.recipes",
     "scarf.plotting.summary",
 )
@@ -385,6 +388,13 @@ def test_marker_facade_does_not_export_layout_internals():
 
     assert internal_names.isdisjoint(markers.__all__)
     assert internal_names.isdisjoint(dir(markers))
+
+
+def test_graph_package_does_not_export_artifact_references():
+    graph = import_module("scarf.graph")
+
+    assert "ArtifactRef" not in graph.__all__
+    assert not hasattr(graph, "ArtifactRef")
 
 
 def test_domain_packages_export_canonical_objects():
@@ -654,9 +664,11 @@ def test_legacy_plotting_surface_remains_absent():
 
 
 def test_pipeline_accessor_has_a_public_import_path():
-    from scarf import DataStore
-    from scarf.datastore.pipeline_accessor import PipelineAccessor, StepOptions
+    from scarf import DataStore, PipelineExecutionError, PipelineRun
+    from scarf.datastore.pipeline_accessor import PipelineAccessor
 
     assert hasattr(DataStore, "pipeline")
     assert PipelineAccessor.__module__ == "scarf.datastore.pipeline_accessor"
-    assert StepOptions is not None
+    assert PipelineRun.__module__ == "scarf.datastore.pipeline_run"
+    assert PipelineExecutionError.__module__ == "scarf.datastore.pipeline_run"
+    assert {"open", "list_runs", "run"} <= set(vars(PipelineAccessor))

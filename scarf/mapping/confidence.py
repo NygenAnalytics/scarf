@@ -97,20 +97,54 @@ def conformal_prediction_sets(
 ) -> np.ndarray:
     """Return class-membership masks from split-conformal p-values."""
     scores = np.asarray(label_scores, dtype=np.float64)
-    calibration = np.asarray(calibration_nonconformity, dtype=np.float64)
     if scores.ndim != 2:
         raise ValueError("label_scores must be a two-dimensional array")
+    calibration, resolved_alpha = _validated_conformal_calibration(
+        calibration_nonconformity,
+        alpha,
+    )
+    if not np.all(np.isfinite(scores)):
+        raise ValueError("Conformal inputs must be finite")
+    if np.any(scores < 0) or np.any(scores > 1):
+        raise ValueError("Conformal scores must be in [0, 1]")
+    return _conformal_membership(scores, calibration, resolved_alpha)
+
+
+def _validated_conformal_calibration(
+    calibration_nonconformity: np.ndarray,
+    alpha: float,
+) -> tuple[np.ndarray, float]:
+    calibration = np.asarray(calibration_nonconformity, dtype=np.float64)
     if calibration.ndim != 1 or calibration.size == 0:
         raise ValueError("calibration_nonconformity must be a non-empty vector")
-    if not 0 < alpha < 1:
+    if (
+        isinstance(alpha, bool | np.bool_)
+        or not isinstance(alpha, int | float | np.integer | np.floating)
+        or not np.isfinite(alpha)
+        or not 0 < float(alpha) < 1
+    ):
         raise ValueError("alpha must be strictly between zero and one")
-    if not np.all(np.isfinite(scores)) or not np.all(np.isfinite(calibration)):
+    if not np.all(np.isfinite(calibration)):
         raise ValueError("Conformal inputs must be finite")
-    nonconformity = 1.0 - scores
-    p_values = (
-        (calibration[np.newaxis, np.newaxis, :] >= nonconformity[:, :, np.newaxis]).sum(
-            axis=2
-        )
-        + 1
-    ) / (len(calibration) + 1)
-    return cast(np.ndarray, p_values > alpha)
+    if np.any(calibration < 0) or np.any(calibration > 1):
+        raise ValueError("Conformal nonconformity must be in [0, 1]")
+    return np.sort(calibration), float(alpha)
+
+
+def _conformal_membership(
+    label_scores: np.ndarray,
+    sorted_calibration: np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    """Compare scores to prepared calibration without a three-axis temporary."""
+    nonconformity = 1.0 - label_scores
+    insertion = np.searchsorted(
+        sorted_calibration,
+        nonconformity,
+        side="left",
+    )
+    exceedances = len(sorted_calibration) - insertion
+    return cast(
+        np.ndarray,
+        (exceedances + 1) / (len(sorted_calibration) + 1) > alpha,
+    )

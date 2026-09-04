@@ -2,6 +2,7 @@
 description: Assign sample identities from hashtag oligo counts and interpret singlet, negative, and doublet labels.
 ---
 
+(hto_demultiplexing)=
 (hto_demultiplexing_guide)=
 
 # Demultiplexing cells with HTOs
@@ -9,23 +10,32 @@ description: Assign sample identities from hashtag oligo counts and interpret si
 Hashtag oligo (HTO) counts identify the sample assigned to each droplet in a pooled experiment.
 This is separate from integrating RNA and ADT measurements: demultiplexing classifies droplets as one sample, negative, or doublet before sample-level comparisons.
 
-## 1. Call `mark_hto_identities`
+## 1. Run HTO demultiplexing
 
 Scarf expects an HTO assay, named `HTO` by default, in the same datastore as the biological assays.
-`mark_hto_identities` normalizes the hashtag counts, estimates background, and writes the resulting identity to shared cell metadata.
+`run_hto_demultiplexing` normalizes the hashtag counts, estimates background, and returns an immutable
+identity artifact without changing shared cell metadata.
 
 ```python
-identity_key = ds.mark_hto_identities(
+cell_selection = ds.snapshot_cell_selection("I")
+identities = ds.run_hto_demultiplexing(
+    cell_selection,
     from_assay="HTO",
-    label="sample_id",
 )
+ds.load_artifact(identities)["values"][:]
 ```
 
 ## 2. Interpret singlet, negative, and doublet labels
 
-The returned value is the cell metadata key, `sample_id` in this example.
-Inspect that column and compare identity counts with the experiment's expected loading.
-Singlet labels can define sample-aware QC or pseudobulk groups.
+Inspect the loaded values and compare identity counts with the experiment's expected loading.
+Singlet labels can define downstream selections or pseudobulk groups. To retain all singlets
+without creating a metadata column, select the exact HTO identifiers:
+
+```python
+singlet_labels = ds.HTO.feats.fetch_all("ids").astype(str).tolist()
+singlets = ds.select_cells(identities, include=singlet_labels)
+```
+
 Negative cells do not have a confident hashtag assignment.
 Doublets carry evidence for more than one hashtag and should not be silently relabelled as one sample.
 

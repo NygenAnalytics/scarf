@@ -1,6 +1,7 @@
 import numpy as np
 
 from scarf.assay import RNAassay
+from scarf.storage.artifacts import artifact_group
 from scarf.writers import write_renorm_subset_to_zarr
 
 
@@ -18,6 +19,16 @@ def _reference_renorm_subset(rna, cell_idx, feat_idx, log_transform=False):
     if log_transform:
         out = np.log1p(out)
     return out.astype(np.float32)
+
+
+def _normalization_inputs(store, assay_name, feat_idx):
+    assay = getattr(store, assay_name)
+    mask = np.zeros(assay.feats.N, dtype=bool)
+    mask[feat_idx] = True
+    return (
+        store.snapshot_cell_selection(),
+        store.set_feature_selection(from_assay=assay_name, mask=mask),
+    )
 
 
 def test_write_renorm_subset_matches_reference(toy_crdir_ds):
@@ -54,7 +65,7 @@ def test_write_renorm_subset_log_transform(toy_crdir_ds):
     np.testing.assert_allclose(written, expected, rtol=1e-5)
 
 
-def test_save_normalized_data_renorm_uses_fused_path(toy_crdir_ds, monkeypatch):
+def test_run_normalization_renorm_uses_fused_path(toy_crdir_ds, monkeypatch):
     rna = toy_crdir_ds.RNA
     called = {"normed": 0}
     orig_normed = RNAassay.normed
@@ -65,21 +76,24 @@ def test_save_normalized_data_renorm_uses_fused_path(toy_crdir_ds, monkeypatch):
 
     monkeypatch.setattr(RNAassay, "normed", fake_normed)
     cell_idx, feat_idx = _subset_indices(rna)
-    rna.save_normalized_data(
-        cell_idx,
-        feat_idx,
-        location="normed_fused_test",
+    cells, features = _normalization_inputs(toy_crdir_ds, "RNA", feat_idx)
+    normalized = toy_crdir_ds.run_normalization(
+        cells,
+        features,
         log_transform=False,
         renormalize_subset=True,
+        invalidate_cache=True,
     )
     assert called["normed"] == 0
     expected = _reference_renorm_subset(rna, cell_idx, feat_idx)
-    np.testing.assert_allclose(rna.z["normed_fused_test/data"][:], expected, rtol=1e-5)
+    np.testing.assert_allclose(
+        artifact_group(toy_crdir_ds.zw, normalized)["data"][:],
+        expected,
+        rtol=1e-5,
+    )
 
 
-def test_save_normalized_data_without_renorm_still_uses_normed(
-    toy_crdir_ds, monkeypatch
-):
+def test_run_normalization_without_renorm_still_uses_normed(toy_crdir_ds, monkeypatch):
     rna = toy_crdir_ds.RNA
     called = {"normed": 0, "fused": 0}
     orig_normed = RNAassay.normed
@@ -97,20 +111,21 @@ def test_save_normalized_data_without_renorm_still_uses_normed(
         "scarf.storage.materialize.write_renorm_subset_to_zarr",
         fake_fused,
     )
-    cell_idx, feat_idx = _subset_indices(rna)
-    rna.save_normalized_data(
-        cell_idx,
-        feat_idx,
-        location="normed_standard_test",
+    _, feat_idx = _subset_indices(rna)
+    cells, features = _normalization_inputs(toy_crdir_ds, "RNA", feat_idx)
+    normalized = toy_crdir_ds.run_normalization(
+        cells,
+        features,
         log_transform=False,
         renormalize_subset=False,
+        invalidate_cache=True,
     )
     assert called["normed"] == 1
     assert called["fused"] == 0
-    assert "subset_params" not in rna.z["normed_standard_test"].attrs
+    assert "subset_params" not in artifact_group(toy_crdir_ds.zw, normalized).attrs
 
 
-def test_save_normalized_data_renorm_cache_hit(toy_crdir_ds, monkeypatch):
+def test_run_normalization_renorm_cache_hit(toy_crdir_ds, monkeypatch):
     from scarf.storage.materialize import (
         write_renorm_subset_to_zarr as materialize_renorm_subset,
     )
@@ -127,25 +142,25 @@ def test_save_normalized_data_renorm_cache_hit(toy_crdir_ds, monkeypatch):
         "scarf.storage.materialize.write_renorm_subset_to_zarr",
         counting_fused,
     )
-    cell_idx, feat_idx = _subset_indices(rna)
+    _, feat_idx = _subset_indices(rna)
+    cells, features = _normalization_inputs(toy_crdir_ds, "RNA", feat_idx)
     kwargs = dict(
-        cell_idx=cell_idx,
-        feat_idx=feat_idx,
-        location="normed_cache_test",
+        cell_selection=cells,
+        features=features,
         log_transform=False,
         renormalize_subset=True,
     )
-    rna.save_normalized_data(**kwargs)
-    rna.save_normalized_data(**kwargs)
+    created = toy_crdir_ds.run_normalization(**kwargs, invalidate_cache=True)
+    reused = toy_crdir_ds.run_normalization(**kwargs)
     assert called["fused"] == 1
+    assert reused == created
 
 
-def test_atac_materialization_reuses_existing_explicit_location(
+def test_atac_run_normalization_reuses_complete_artifact(
     atac_datastore,
     monkeypatch,
 ):
     assay = atac_datastore.ATAC
-    cell_idx = np.arange(8, dtype=np.int64)
     feat_idx = np.arange(min(4, assay.feats.N), dtype=np.int64)
     original = assay.normed
     calls = 0
@@ -156,21 +171,22 @@ def test_atac_materialization_reuses_existing_explicit_location(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(assay, "normed", counting_normed)
+    cells, features = _normalization_inputs(atac_datastore, "ATAC", feat_idx)
     kwargs = dict(
-        cell_idx=cell_idx,
-        feat_idx=feat_idx,
-        location="atac_normalizer_identity_cache_test",
+        cell_selection=cells,
+        features=features,
         log_transform=False,
         renormalize_subset=False,
     )
 
-    assay.save_normalized_data(**kwargs)
-    group = assay.z["atac_normalizer_identity_cache_test"]
+    created = atac_datastore.run_normalization(**kwargs, invalidate_cache=True)
+    group = artifact_group(atac_datastore.zw, created)
     assert "subset_params" not in group.attrs
-    assay.save_normalized_data(**kwargs)
-    assay.save_normalized_data(**kwargs)
+    reused = atac_datastore.run_normalization(**kwargs)
+    assert atac_datastore.run_normalization(**kwargs) == reused
 
     assert calls == 1
+    assert reused == created
 
 
 def test_feature_major_normalization_rejects_missing_or_unsorted_cells() -> None:

@@ -6,11 +6,8 @@ import zarr
 from zarr.storage import MemoryStore
 
 from scarf.datastore._operations.paris_persistence import (
-    estimate_cached_paris_peak_bytes,
     estimate_hierarchy_group_peak_bytes,
     estimate_paris_peak_bytes,
-    generation_location,
-    load_hierarchy_generation,
     load_hierarchy_group,
 )
 from scarf.storage.budget import ResourceBudget
@@ -56,20 +53,13 @@ def test_estimate_hierarchy_group_peak_bytes_rejects_unknown_cut_mode():
         estimate_hierarchy_group_peak_bytes(generation, "mystery")  # type: ignore[arg-type]
 
 
-def test_load_hierarchy_generation_rejects_incomplete_and_missing_arrays():
+def test_load_hierarchy_group_rejects_missing_arrays():
     root = zarr.open_group(store=MemoryStore(), mode="w")
-    graph_loc = "RNA/graph"
-    generation_id = "a" * 64
-    location = generation_location(graph_loc, generation_id)
+    location = "hierarchy"
     generation = root.create_group(location)
-    generation.attrs["complete"] = False
     generation.attrs["n_leaves"] = 2
     generation.attrs["total_weight"] = 1.0
 
-    with pytest.raises(ValueError, match="incomplete"):
-        load_hierarchy_generation(root, graph_loc, generation_id)
-
-    generation.attrs["complete"] = True
     with pytest.raises(ValueError, match="missing required arrays"):
         load_hierarchy_group(generation, location)
 
@@ -106,9 +96,9 @@ def test_load_hierarchy_generation_rejects_incomplete_and_missing_arrays():
     assert hierarchy.children.tolist() == [[0, 1]]
 
 
-def test_preflight_paris_fit_and_cached_cut_respect_budget():
+def test_preflight_paris_fit_and_artifact_cut_respect_budget():
     from scarf.datastore._operations.paris_persistence import (
-        preflight_cached_paris_cut,
+        preflight_hierarchy_artifact_cut,
         preflight_paris_fit,
     )
 
@@ -121,10 +111,7 @@ def test_preflight_paris_fit_and_cached_cut_respect_budget():
     with pytest.raises(MemoryError, match="Paris hierarchy fit"):
         preflight_paris_fit(graph, n_cells=2, budget=tiny)
 
-    generation_id = "b" * 64
-    location = generation_location("RNA/graph", generation_id)
-    generation = root.create_group(location)
-    generation.attrs["complete"] = True
+    generation = root.create_group("hierarchy")
     generation.attrs["n_leaves"] = 2
     generation.attrs["total_weight"] = 1.0
     for name, values in (
@@ -149,20 +136,16 @@ def test_preflight_paris_fit_and_cached_cut_respect_budget():
         plateau.create_array(name, data=values)
 
     with pytest.raises(MemoryError, match="Cached Paris fixed cut"):
-        preflight_cached_paris_cut(
-            root,
-            "RNA/graph",
-            generation_id,
+        preflight_hierarchy_artifact_cut(
+            generation,
             "fixed",
             tiny,
         )
 
     ok = ResourceBudget(memoryBytes=1024**3, workers=1)
     fit_bytes = preflight_paris_fit(graph, n_cells=2, budget=ok)
-    cut_bytes = preflight_cached_paris_cut(
-        root,
-        "RNA/graph",
-        generation_id,
+    cut_bytes = preflight_hierarchy_artifact_cut(
+        generation,
         "fixed",
         ok,
     )
@@ -173,9 +156,4 @@ def test_preflight_paris_fit_and_cached_cut_respect_budget():
         np.dtype(np.float64).itemsize,
         nthreads=1,
     )
-    assert cut_bytes == estimate_cached_paris_peak_bytes(
-        root,
-        "RNA/graph",
-        generation_id,
-        "fixed",
-    )
+    assert cut_bytes == estimate_hierarchy_group_peak_bytes(generation, "fixed")

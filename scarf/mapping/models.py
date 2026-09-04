@@ -9,6 +9,14 @@ if TYPE_CHECKING:
     from .reference import MappingReference
 
 
+def _immutable_array(values: np.ndarray) -> np.ndarray:
+    """Own one C-contiguous array through an immutable bytes buffer."""
+    array = np.ascontiguousarray(np.asarray(values))
+    return np.frombuffer(array.tobytes(order="C"), dtype=array.dtype).reshape(
+        array.shape
+    )
+
+
 @dataclass(frozen=True)
 class ScaledPCAProjectionModel:
     feature_means: np.ndarray
@@ -16,24 +24,30 @@ class ScaledPCAProjectionModel:
     loadings: np.ndarray
 
     def __post_init__(self) -> None:
-        if self.loadings.ndim != 2:
+        feature_means = np.asarray(self.feature_means)
+        feature_scales = np.asarray(self.feature_scales)
+        loadings = np.asarray(self.loadings)
+        if loadings.ndim != 2:
             raise ValueError("Reference PCA loadings must be two-dimensional")
-        n_features = self.loadings.shape[0]
-        if self.feature_means.shape != (n_features,):
+        n_features = loadings.shape[0]
+        if feature_means.shape != (n_features,):
             raise ValueError("Reference feature means have incompatible dimensions")
-        if self.feature_scales.shape != (n_features,):
+        if feature_scales.shape != (n_features,):
             raise ValueError("Reference feature scales have incompatible dimensions")
-        if np.any(self.feature_scales <= 0):
+        if np.any(feature_scales <= 0):
             raise ValueError("Reference feature scales must be positive")
         for values in (
-            self.feature_means,
-            self.feature_scales,
-            self.loadings,
+            feature_means,
+            feature_scales,
+            loadings,
         ):
             if not np.all(np.isfinite(values)):
                 raise ValueError(
                     "Reference projection model contains non-finite values"
                 )
+        object.__setattr__(self, "feature_means", _immutable_array(feature_means))
+        object.__setattr__(self, "feature_scales", _immutable_array(feature_scales))
+        object.__setattr__(self, "loadings", _immutable_array(loadings))
 
     @property
     def n_features(self) -> int:
@@ -53,29 +67,43 @@ class SymphonyCorrectionModel:
     sigma: np.ndarray
 
     def __post_init__(self) -> None:
-        if self.centroids.ndim != 2:
+        centroids = np.asarray(self.centroids)
+        raw_centroids = np.asarray(self.raw_centroids)
+        corrected_centroids = np.asarray(self.corrected_centroids)
+        cluster_mass = np.asarray(self.cluster_mass)
+        sigma = np.asarray(self.sigma)
+        if centroids.ndim != 2:
             raise ValueError("Reference centroids must be two-dimensional")
-        n_clusters = self.centroids.shape[0]
-        n_dims = self.centroids.shape[1]
-        if self.raw_centroids.shape != (n_clusters, n_dims):
+        n_clusters = centroids.shape[0]
+        n_dims = centroids.shape[1]
+        if raw_centroids.shape != (n_clusters, n_dims):
             raise ValueError("Reference raw centroids have incompatible dimensions")
-        if self.corrected_centroids.shape != (n_clusters, n_dims):
+        if corrected_centroids.shape != (n_clusters, n_dims):
             raise ValueError(
                 "Reference corrected centroids have incompatible dimensions"
             )
-        if self.cluster_mass.shape != (n_clusters,) or np.any(self.cluster_mass <= 0):
+        if cluster_mass.shape != (n_clusters,) or np.any(cluster_mass <= 0):
             raise ValueError("Reference cluster masses must be positive")
-        if self.sigma.shape != (n_clusters,) or np.any(self.sigma <= 0):
+        if sigma.shape != (n_clusters,) or np.any(sigma <= 0):
             raise ValueError("Reference kernel widths must be positive")
         for values in (
-            self.centroids,
-            self.raw_centroids,
-            self.corrected_centroids,
-            self.cluster_mass,
-            self.sigma,
+            centroids,
+            raw_centroids,
+            corrected_centroids,
+            cluster_mass,
+            sigma,
         ):
             if not np.all(np.isfinite(values)):
                 raise ValueError("Symphony correction model contains non-finite values")
+        object.__setattr__(self, "centroids", _immutable_array(centroids))
+        object.__setattr__(self, "raw_centroids", _immutable_array(raw_centroids))
+        object.__setattr__(
+            self,
+            "corrected_centroids",
+            _immutable_array(corrected_centroids),
+        )
+        object.__setattr__(self, "cluster_mass", _immutable_array(cluster_mass))
+        object.__setattr__(self, "sigma", _immutable_array(sigma))
 
     @property
     def n_dims(self) -> int:
@@ -92,31 +120,58 @@ class QueryCorrection:
     batch_counts: np.ndarray
 
     def __post_init__(self) -> None:
-        if self.batch_offsets.ndim != 3:
+        batch_offsets = np.asarray(self.batch_offsets)
+        batch_counts = np.asarray(self.batch_counts)
+        if batch_offsets.ndim != 3:
             raise ValueError(
                 "Batch offsets must have batch, cluster, and dimension axes"
             )
-        if self.batch_counts.shape != self.batch_offsets.shape[:2]:
+        if batch_counts.shape != batch_offsets.shape[:2]:
             raise ValueError("Batch counts must match batch offsets")
-        if not np.all(np.isfinite(self.batch_offsets)):
+        if not np.all(np.isfinite(batch_offsets)):
             raise ValueError("Batch offsets contain non-finite values")
+        object.__setattr__(self, "batch_offsets", _immutable_array(batch_offsets))
+        object.__setattr__(self, "batch_counts", _immutable_array(batch_counts))
+
+
+@dataclass(frozen=True, slots=True)
+class _MappingResultAxes:
+    cell_selection: ArtifactRef
+    feature_selection: ArtifactRef
 
 
 @dataclass(frozen=True)
 class MappingResult:
     ref: ArtifactRef
-    mapping_name: str
     n_cells: int
     correction_method: str
     diagnostics: dict[str, float | int | str]
+    reference: "MappingReference" = field(repr=False, compare=False)
     indices: np.ndarray | None = None
     distances: np.ndarray | None = None
     uninformative: np.ndarray | None = None
-    reference: "MappingReference | None" = field(
-        default=None,
-        repr=False,
-        compare=False,
-    )
+
+    @property
+    def cell_selection(self) -> ArtifactRef:
+        """Exact frozen query-row selection for this loaded projection."""
+        axes = getattr(self, "_axes", None)
+        if not isinstance(axes, _MappingResultAxes):
+            raise RuntimeError(
+                "Query axes are available on results loaded with "
+                "DataStore.get_mapping_result"
+            )
+        return axes.cell_selection
+
+    @property
+    def feature_selection(self) -> ArtifactRef:
+        """Exact frozen query-feature selection for this loaded projection."""
+        axes = getattr(self, "_axes", None)
+        if not isinstance(axes, _MappingResultAxes):
+            raise RuntimeError(
+                "Query axes are available on results loaded with "
+                "DataStore.get_mapping_result"
+            )
+        return axes.feature_selection
 
     def __repr__(self) -> str:
         loaded = [
@@ -126,7 +181,6 @@ class MappingResult:
         ]
         return (
             f"MappingResult(ref={self.ref!r}, "
-            f"mapping_name={self.mapping_name!r}, "
             f"n_cells={self.n_cells}, "
             f"correction_method={self.correction_method!r}, "
             f"diagnostics={self.diagnostics!r}, "

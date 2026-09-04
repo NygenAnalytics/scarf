@@ -11,7 +11,6 @@ from scipy import sparse
 from scarf.plotting._contracts import CategoricalScale, SizeScale
 from scarf.plotting._figure import PlotResult
 from scarf.plotting.cluster_connectivity import cluster_connectivity
-from scarf.graph.state import GraphSelection
 from scarf.storage.artifacts import ArtifactRef
 
 
@@ -32,6 +31,7 @@ class _FakeStore:
         self.cells = _FakeCells(values)
         self.graph = graph
         self.graph_calls = []
+        self.zw = object()
 
     def load_graph(self, graph=None, **kwargs):
         self.graph_calls.append((graph, kwargs))
@@ -82,22 +82,28 @@ def _plot(store, **kwargs):
             artifact_id="1" * 64,
         ),
     )
-    selection = GraphSelection(
-        graph_loc="RNA/artifacts/connectivity_map/" + graph_ref.artifact_id,
-        graph_ref=graph_ref,
-        from_assay=kwargs.get("from_assay") or "RNA",
-        cell_key=kwargs.get("cell_key") or "I",
-        integrated_label=None,
-    )
-    with patch(
-        "scarf.plotting.cluster_connectivity.resolve_graph_selection",
-        return_value=selection,
+    cell_key = kwargs.pop("cell_key", "I")
+    categorical_scale = kwargs.pop("categorical_scale", CategoricalScale())
+    with (
+        patch(
+            "scarf.plotting.cluster_connectivity.graph_cell_selection",
+            return_value=ArtifactRef(
+                scope="datastore",
+                kind="cell_selection",
+                artifact_id="2" * 64,
+            ),
+        ),
+        patch(
+            "scarf.plotting.cluster_connectivity.validate_stored_selection_live_alias"
+        ),
     ):
         return cluster_connectivity(
             store,
             group_by="cluster",
             layout_key="layout",
             graph=graph_ref,
+            cell_key=cell_key,
+            categorical_scale=categorical_scale,
             show=False,
             **kwargs,
         )
@@ -108,7 +114,6 @@ def test_cluster_connectivity_aggregates_reciprocals_once():
     result = _plot(
         store,
         cell_key="selected",
-        from_assay="RNA",
         minimum_edge_weight=0.0,
     )
 
@@ -128,11 +133,7 @@ def test_cluster_connectivity_aggregates_reciprocals_once():
                 kind="connectivity_map",
                 artifact_id="1" * 64,
             ),
-            {
-                "from_assay": "RNA",
-                "cell_key": "selected",
-                "symmetric": True,
-            },
+            {"symmetric": True},
         )
     ]
 

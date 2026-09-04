@@ -1,16 +1,11 @@
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 import pytest
 from scipy.sparse import csr_matrix, diags
-from zarr.storage import MemoryStore
-import zarr
 
 from scarf.datastore.graph_datastore import GraphDataStore
-from scarf.graph.state import GraphSelection
-from scarf.storage.artifacts import ArtifactRef, artifact_path
-from scarf.storage.selections import resolve_selection_artifact
+from scarf.storage.artifacts import ArtifactRef
 from scarf.trajectory.fate import (
     _make_transition,
     _normalize_pseudotime,
@@ -575,220 +570,69 @@ def test_localized_solver_error_fails_residual_validation(
         )
 
 
-class _FateCells:
-    def __init__(
-        self,
-        pseudotime: np.ndarray,
-        labels: np.ndarray,
-        root: zarr.Group,
-    ):
-        self.values: dict[str, np.ndarray] = {
-            "I": np.ones(pseudotime.shape[0], dtype=bool),
-            "ids": np.asarray([f"cell_{index}" for index in range(len(labels))]),
-            "ptime": pseudotime,
-            "state": labels,
-        }
-        self.insertions: list[str] = []
-        self.root = root
-        cell_data = root.create_group("cellData")
-        for name, values in self.values.items():
-            cell_data.create_array(name, data=values)
+def test_datastore_fate_mapping_returns_an_artifact_without_metadata_writes(
+    datastore,
+    pseudotime_scoring,
+    legacy_leiden_clustering,
+):
+    cell_columns_before = tuple(datastore.cells.columns)
+    cell_values_before = {
+        column: datastore.cells.fetch_all(column).copy()
+        for column in cell_columns_before
+    }
 
-    @property
-    def columns(self) -> list[str]:
-        return list(self.values)
-
-    def fetch(self, column: str, key: str = "I") -> np.ndarray:
-        return np.asarray(self.values[column][self.values[key].astype(bool)])
-
-    def fetch_all(self, column: str) -> np.ndarray:
-        return np.asarray(self.values[column])
-
-    def active_index(self, key: str) -> np.ndarray:
-        return np.flatnonzero(self.values[key])
-
-    def insert(
-        self,
-        column_name: str,
-        values: np.ndarray,
-        fill_value: Any = np.nan,
-        key: str = "I",
-        overwrite: bool = False,
-    ) -> None:
-        assert overwrite
-        selected = self.values[key].astype(bool)
-        if np.asarray(values).dtype.kind == "b":
-            filled = np.full(selected.shape[0], bool(fill_value), dtype=bool)
-        else:
-            filled = np.full(selected.shape[0], fill_value, dtype=np.float32)
-        filled[selected] = values
-        self.values[column_name] = filled
-        self.insertions.append(column_name)
-        cell_data = self.root["cellData"]
-        if column_name in cell_data:
-            del cell_data[column_name]
-        cell_data.create_array(column_name, data=filled)
-
-
-class _FateStore:
-    def __init__(self):
-        self.zw = zarr.open_group(store=MemoryStore(), mode="w")
-        self.graph, pseudotime, labels = _y_graph()
-        self.cells = _FateCells(pseudotime, labels, self.zw)
-        self.assay = SimpleNamespace(name="RNA", cells=self.cells)
-        self.graph_loads = 0
-        self.graph_ref = ArtifactRef(
-            scope="assay",
-            assay="RNA",
-            kind="connectivity_map",
-            artifact_id="f" * 64,
-        )
-
-    def _get_assay(self, _from_assay: str) -> SimpleNamespace:
-        return self.assay
-
-    def load_graph(
-        self,
-        _graph: ArtifactRef | None = None,
-        **_kwargs: Any,
-    ) -> csr_matrix:
-        self.graph_loads += 1
-        return self.graph.copy()
-
-    def _ensure_cell_selection(self, column: str) -> ArtifactRef:
-        return resolve_selection_artifact(
-            self.zw,
-            scope="datastore",
-            kind="cell_selection",
-            values=self.cells.fetch_all(column),
-            row_ids=self.cells.fetch_all("ids"),
-            operation="manual_selection",
-            parameters={},
-            inputs={},
-            source_column=column,
-        )
-
-    def _graph_cell_selection(self, _graph: ArtifactRef) -> ArtifactRef:
-        return self._ensure_cell_selection("I")
-
-    @staticmethod
-    def _selection_artifacts_match(
-        first: ArtifactRef,
-        second: ArtifactRef,
-    ) -> bool:
-        return first == second
-
-    @staticmethod
-    def _resolve_cell_data_provenance_input(
-        column: str,
-        *,
-        cell_key: str,
-    ) -> dict[str, str]:
-        return {"column": column, "cell_key": cell_key}
-
-    @staticmethod
-    def _col_renamer(from_assay: str, cell_key: str, suffix: str) -> str:
-        if cell_key == "I":
-            return f"{from_assay}_{suffix}"
-        return f"{from_assay}_{cell_key}_{suffix}"
-
-
-@pytest.fixture(autouse=True)
-def _resolve_fate_graph(monkeypatch: pytest.MonkeyPatch) -> None:
-    from scarf.datastore._operations import trajectory as trajectory_operations
-
-    def resolve(store, graph, *, from_assay, cell_key):
-        ref = graph or store.graph_ref
-        return GraphSelection(
-            graph_loc=artifact_path(ref),
-            graph_ref=ref,
-            from_assay=from_assay or "RNA",
-            cell_key=cell_key or "I",
-            integrated_label=None,
-        )
-
-    monkeypatch.setattr(
-        trajectory_operations,
-        "resolve_graph_selection",
-        resolve,
+    ref = datastore.run_fate_mapping(
+        pseudotime_scoring,
+        legacy_leiden_clustering,
+        sinks=[3],
     )
+    result = datastore.load_fate_mapping(ref)
 
-
-def test_datastore_method_writes_aligned_fate_and_validity_columns():
-    store = _FateStore()
-
-    result = GraphDataStore.run_fate_mapping(
-        store,
-        pseudotime_key="ptime",
-        sink_key="state",
-        sinks=["A", "B"],
-    )
-
+    assert isinstance(ref, ArtifactRef)
     assert isinstance(result, FateMappingResult)
-    assert result.fate_keys == ("RNA_fate_A", "RNA_fate_B")
-    assert result.validity_key == "RNA_fate__valid"
-    assert result.sink_labels == ("A", "B")
-    assert result.graph == store.graph_ref
-    assert store.cells.insertions == [
-        "RNA_fate_A",
-        "RNA_fate_B",
-        "RNA_fate__valid",
-    ]
-    np.testing.assert_allclose(
-        np.column_stack([store.cells.fetch_all(key) for key in result.fate_keys]),
-        result.values,
-    )
-    np.testing.assert_array_equal(
-        store.cells.fetch_all(result.validity_key),
-        result.valid,
-    )
-
-
-def test_datastore_method_aligns_subset_outputs_to_all_cells():
-    store = _FateStore()
-    store.cells.values["subset"] = np.array([True, True, True, False, False])
-    store.cells.values["ptime"][3:] = np.nan
-
-    result = GraphDataStore.run_fate_mapping(
-        store,
-        subset_cell_key="subset",
-        pseudotime_key="ptime",
-        sink_key="state",
-        sinks=["A"],
-    )
-
-    assert result.result_cell_key == "subset"
-    assert result.values.shape == (3, 1)
-    stored = store.cells.fetch_all(result.fate_keys[0])
-    np.testing.assert_array_equal(stored[:3], np.ones(3))
-    assert np.isnan(stored[3:]).all()
-    np.testing.assert_array_equal(
-        store.cells.fetch_all(result.validity_key),
-        [True, True, True, False, False],
-    )
+    assert result.ref == ref
+    assert result.pseudotime == pseudotime_scoring
+    assert result.sink_labels_artifact == legacy_leiden_clustering
+    assert result.sink_labels == (3,)
+    assert result.values.shape == (len(result.valid), 1)
+    assert set(datastore.cells.columns) == set(cell_columns_before)
+    for column, expected in cell_values_before.items():
+        np.testing.assert_array_equal(datastore.cells.fetch_all(column), expected)
 
 
 @pytest.mark.parametrize("sinks", [[], ("A",)])
 def test_datastore_rejects_invalid_sink_container_before_loading_graph(
     sinks: Any,
 ):
-    store = _FateStore()
+    ref = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="pseudotime",
+        artifact_id="f" * 64,
+    )
 
     with pytest.raises((TypeError, ValueError)):
         GraphDataStore.run_fate_mapping(
-            store,
-            pseudotime_key="ptime",
-            sink_key="state",
+            object(),
+            ref,
+            ref,
             sinks=sinks,
         )
 
-    assert store.graph_loads == 0
 
-
-def test_failed_solver_writes_no_metadata(monkeypatch: pytest.MonkeyPatch):
+def test_failed_solver_writes_no_metadata(
+    datastore,
+    pseudotime_scoring,
+    legacy_leiden_clustering,
+    monkeypatch: pytest.MonkeyPatch,
+):
     from scarf.datastore._operations import trajectory as trajectory_operations
 
-    store = _FateStore()
+    cell_columns_before = tuple(datastore.cells.columns)
+    cell_values_before = {
+        column: datastore.cells.fetch_all(column).copy()
+        for column in cell_columns_before
+    }
 
     def fail(*_args: Any, **_kwargs: Any):
         raise RuntimeError("forced non-convergence")
@@ -799,11 +643,13 @@ def test_failed_solver_writes_no_metadata(monkeypatch: pytest.MonkeyPatch):
         fail,
     )
     with pytest.raises(RuntimeError, match="forced non-convergence"):
-        GraphDataStore.run_fate_mapping(
-            store,
-            pseudotime_key="ptime",
-            sink_key="state",
-            sinks=["A", "B"],
+        datastore.run_fate_mapping(
+            pseudotime_scoring,
+            legacy_leiden_clustering,
+            sinks=[3, 6],
+            invalidate_cache=True,
         )
 
-    assert store.cells.insertions == []
+    assert set(datastore.cells.columns) == set(cell_columns_before)
+    for column, expected in cell_values_before.items():
+        np.testing.assert_array_equal(datastore.cells.fetch_all(column), expected)

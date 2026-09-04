@@ -20,26 +20,109 @@ from ...storage.artifact_writer import (
     reused_artifact_group,
     start_artifact,
 )
-from ...graph.state import resolve_graph_selection
+from ...graph.feature_projection import (
+    graph_cell_selection,
+    resolve_graph_source_assay,
+)
 from ...metadata.arguments import (
     MembershipStrengthArguments,
     SmartLabelArguments,
 )
 from ...metadata.artifacts import (
-    artifact_values,
-    categorical_display,
-    column_display,
-    continuous_display,
-    link_cell_data_column,
     plan_cell_data_artifact,
     write_cell_data_artifact,
 )
 from ...utils.logging import logger
+from ...utils.compute import controlled_compute
+from ...storage.selections import (
+    read_stored_selection_indices,
+    validate_stored_selection_integrity,
+)
 
 if TYPE_CHECKING:
     from ..mapping_datastore import MappingDatastore as _PresentationOperationsBase
+    from ..pipeline_run import PipelineRun
 else:
     _PresentationOperationsBase = object
+
+
+_CELL_LABEL_VALUE_NAMES = {
+    "cell_cycle": "phase",
+    "cluster_cut": "labels",
+}
+
+
+def _load_cell_label_artifact(
+    root: zarr.Group,
+    ref: ArtifactRef,
+) -> tuple[np.ndarray, ArtifactRef]:
+    if not isinstance(ref, ArtifactRef):
+        raise TypeError("label input must be an ArtifactRef")
+    status = inspect_artifact(root, ref)
+    if not status.complete:
+        raise ValueError("Label artifact is unavailable or incomplete")
+    raw_selection = (status.inputs or {}).get("cell_selection")
+    if not isinstance(raw_selection, dict):
+        raise ValueError("Label artifact has no cell-selection input")
+    selection = ArtifactRef.from_dict(raw_selection)
+    validate_stored_selection_integrity(
+        root,
+        selection,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+    )
+    value_name = _CELL_LABEL_VALUE_NAMES.get(ref.kind, "values")
+    group = as_zarr_group(root[status.path], name=status.path)
+    if value_name not in group:
+        raise ValueError(
+            f"{ref.kind} artifact has no canonical {value_name!r} label array"
+        )
+    values = np.asarray(as_zarr_array(group[value_name], name=value_name)[:])
+    if values.ndim != 1:
+        raise ValueError("Label artifact values must be one-dimensional")
+    return values, selection
+
+
+def _raw_sparse_for_indices(
+    assay: Any,
+    cell_idx: np.ndarray,
+    feat_idx: np.ndarray,
+) -> csr_matrix:
+    """Materialize one explicitly selected raw matrix in bounded row blocks."""
+    selected = assay.rawData[:, feat_idx][cell_idx, :]
+    blocks = [
+        csr_matrix(block)
+        for block in selected.stream_blocks(
+            nthreads=assay.nthreads,
+            msg=f"Converting {assay.name} raw data to CSR",
+        )
+    ]
+    if blocks:
+        return vstack(blocks, format="csr")
+    return csr_matrix(
+        (len(cell_idx), len(feat_idx)),
+        dtype=assay.rawData.dtype,
+    )
+
+
+def _lift_frozen_umap_to_obsm(adata: Any) -> None:
+    umap_columns: dict[int, str] = {}
+    for column in adata.obs.columns:
+        prefix, separator, suffix = str(column).rpartition("_")
+        if prefix == "umap" and separator and suffix.isdigit():
+            component = int(suffix)
+            if component > 0:
+                umap_columns[component] = str(column)
+    if not umap_columns:
+        return
+    expected = list(range(1, max(umap_columns) + 1))
+    if sorted(umap_columns) != expected:
+        raise ValueError("Frozen UMAP fields must be consecutively numbered")
+    ordered_columns = [umap_columns[index] for index in expected]
+    adata.obsm["X_umap"] = adata.obs[ordered_columns].to_numpy(copy=True)
+    adata.obs.drop(columns=ordered_columns, inplace=True)
 
 
 class _PresentationOperationsMixin(_PresentationOperationsBase):
@@ -49,21 +132,26 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         cell_key: str | None = None,
         layers: dict[str, str] | None = None,
         *,
+        run: "PipelineRun | None" = None,
         matrix: Literal["raw", "normed"] = "raw",
         feature_indexes: Sequence[int] | None = None,
         feature_names: Sequence[str] | None = None,
     ) -> Any:
         """Return an assay as an in-memory AnnData object.
 
-        Cell and feature metadata are copied to ``obs`` and ``var``. Layout
-        coordinates remain ordinary ``obs`` columns; this method does not
-        populate ``obsm``.
+        Cell and feature metadata are copied to ``obs`` and ``var``. Without
+        ``run``, layout coordinates remain ordinary ``obs`` columns and this
+        method does not populate ``obsm``. With ``run``, consecutive frozen
+        ``umap_*`` fields are written to ``obsm["X_umap"]`` and removed from
+        ``obs``. Cluster and QC labels stay in ``obs``.
 
         Args:
             from_assay: Name of assay to be used. If no value is provided then the default assay will be used.
             cell_key: Name of column from cell metadata that has boolean values. This is used to subset cells
             layers: A mapping of layer names to assay names. Ex. {'spliced': 'RNA', 'unspliced': 'URNA'}. The raw data
                     from the assays will be stored as sparse arrays in the corresponding layer in anndata.
+            run: A completed pipeline run opened from this datastore. When provided,
+                 export uses its frozen cell and feature selections and metadata.
             matrix: Whether ``X`` contains raw counts or normalized values.
             feature_indexes: Global feature rows to export, in the requested order.
             feature_names: Feature names to export, in the requested order.
@@ -81,69 +169,126 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             )
             return None
 
-        if cell_key is None:
-            cell_key = "I"
-        assay = self._get_assay(from_assay)
         if matrix not in ("raw", "normed"):
             raise ValueError("matrix must be either 'raw' or 'normed'")
         if feature_indexes is not None and feature_names is not None:
             raise ValueError("feature_indexes and feature_names are mutually exclusive")
 
-        if feature_indexes is not None:
-            if isinstance(feature_indexes, str):
-                raise TypeError(
-                    "feature_indexes must be a sequence of integer feature indexes"
-                )
-            feat_idx = np.asarray(feature_indexes)
-            if feat_idx.ndim != 1:
-                raise ValueError("feature_indexes must be one-dimensional")
-            if feat_idx.size == 0:
-                feat_idx = np.empty(0, dtype=np.int64)
-            elif not np.issubdtype(feat_idx.dtype, np.integer):
-                raise TypeError("feature_indexes must contain only integers")
-            else:
-                feat_idx = feat_idx.astype(np.int64, copy=False)
-            if np.unique(feat_idx).size != feat_idx.size:
-                raise ValueError("feature_indexes must contain unique indexes")
-            if np.any(feat_idx < 0) or np.any(feat_idx >= assay.feats.N):
-                raise IndexError("feature_indexes contains an out-of-range index")
-        elif feature_names is not None:
-            if isinstance(feature_names, str):
-                raise TypeError(
-                    "feature_names must be a sequence of feature names, not a string"
-                )
-            requested_names = list(feature_names)
-            if not all(isinstance(name, str) for name in requested_names):
-                raise TypeError("feature_names must contain only strings")
-            if len(set(requested_names)) != len(requested_names):
-                raise ValueError("feature_names must contain unique names")
-            name_positions: dict[str, list[int]] = {}
-            for index, name in enumerate(assay.feats.fetch_all("names").astype(str)):
-                name_positions.setdefault(name, []).append(index)
-            missing = [name for name in requested_names if name not in name_positions]
-            if missing:
-                raise KeyError("Feature names not found: " + ", ".join(missing))
-            ambiguous = [
-                name for name in requested_names if len(name_positions[name]) != 1
-            ]
-            if ambiguous:
+        run_cells = None
+        run_features = None
+        if run is not None:
+            from ..pipeline_run import PipelineRun
+
+            if not isinstance(run, PipelineRun):
+                raise TypeError("run must be a PipelineRun")
+            if run._owner is not self:
+                raise ValueError("run must be opened from this datastore")
+            if from_assay is not None or cell_key is not None:
                 raise ValueError(
-                    "Feature names are not unique in the assay: " + ", ".join(ambiguous)
+                    "Run-aware export uses the frozen run selection and assay"
                 )
-            feat_idx = np.asarray(
-                [name_positions[name][0] for name in requested_names],
-                dtype=np.int64,
+            if feature_indexes is not None or feature_names is not None:
+                raise ValueError(
+                    "Run-aware export uses the frozen run feature selection"
+                )
+            assay = self._get_assay(run.assay)
+            run_cells = run.cells
+            run_features = run.features
+            cell_idx = np.flatnonzero(run_cells.fetch_all("I")).astype(
+                np.int64,
+                copy=False,
+            )
+            feat_idx = np.flatnonzero(run_features.fetch_all("I")).astype(
+                np.int64,
+                copy=False,
+            )
+            obs = (
+                run_cells.to_pandas_dataframe(run_cells.columns)
+                .reset_index(drop=True)
+                .set_index("ids")
+            )
+            var = (
+                run_features.to_pandas_dataframe(run_features.columns)
+                .rename(columns={"ids": "gene_ids"})
+                .set_index("gene_ids")
             )
         else:
-            feat_idx = np.arange(assay.feats.N, dtype=np.int64)
+            if cell_key is None:
+                cell_key = "I"
+            assay = self._get_assay(from_assay)
 
-        cell_idx = self.cells.active_index(cell_key)
-        df = self.cells.to_pandas_dataframe(self.cells.columns, key=cell_key)
-        obs = df.reset_index(drop=True).set_index("ids")
-        df = assay.feats.to_pandas_dataframe(assay.feats.columns).iloc[feat_idx]
-        var = df.rename(columns={"ids": "gene_ids"}).set_index("gene_ids")
+            if feature_indexes is not None:
+                if isinstance(feature_indexes, str):
+                    raise TypeError(
+                        "feature_indexes must be a sequence of integer feature indexes"
+                    )
+                feat_idx = np.asarray(feature_indexes)
+                if feat_idx.ndim != 1:
+                    raise ValueError("feature_indexes must be one-dimensional")
+                if feat_idx.size == 0:
+                    feat_idx = np.empty(0, dtype=np.int64)
+                elif not np.issubdtype(feat_idx.dtype, np.integer):
+                    raise TypeError("feature_indexes must contain only integers")
+                else:
+                    feat_idx = feat_idx.astype(np.int64, copy=False)
+                if np.unique(feat_idx).size != feat_idx.size:
+                    raise ValueError("feature_indexes must contain unique indexes")
+                if np.any(feat_idx < 0) or np.any(feat_idx >= assay.feats.N):
+                    raise IndexError("feature_indexes contains an out-of-range index")
+            elif feature_names is not None:
+                if isinstance(feature_names, str):
+                    raise TypeError(
+                        "feature_names must be a sequence of feature names, not a string"
+                    )
+                requested_names = list(feature_names)
+                if not all(isinstance(name, str) for name in requested_names):
+                    raise TypeError("feature_names must contain only strings")
+                if len(set(requested_names)) != len(requested_names):
+                    raise ValueError("feature_names must contain unique names")
+                name_positions: dict[str, list[int]] = {}
+                for index, name in enumerate(
+                    assay.feats.fetch_all("names").astype(str)
+                ):
+                    name_positions.setdefault(name, []).append(index)
+                missing = [
+                    name for name in requested_names if name not in name_positions
+                ]
+                if missing:
+                    raise KeyError("Feature names not found: " + ", ".join(missing))
+                ambiguous = [
+                    name for name in requested_names if len(name_positions[name]) != 1
+                ]
+                if ambiguous:
+                    raise ValueError(
+                        "Feature names are not unique in the assay: "
+                        + ", ".join(ambiguous)
+                    )
+                feat_idx = np.asarray(
+                    [name_positions[name][0] for name in requested_names],
+                    dtype=np.int64,
+                )
+            else:
+                feat_idx = np.arange(assay.feats.N, dtype=np.int64)
+
+            cell_idx = self.cells.active_index(cell_key)
+            obs = (
+                self.cells.to_pandas_dataframe(self.cells.columns, key=cell_key)
+                .reset_index(drop=True)
+                .set_index("ids")
+            )
+            var = (
+                assay.feats.to_pandas_dataframe(assay.feats.columns)
+                .iloc[feat_idx]
+                .rename(columns={"ids": "gene_ids"})
+                .set_index("gene_ids")
+            )
+
         if matrix == "raw":
-            x = assay.to_raw_sparse(cell_key)[:, feat_idx].tocsr()
+            if run is None:
+                assert cell_key is not None
+                x = assay.to_raw_sparse(cell_key)[:, feat_idx].tocsr()
+            else:
+                x = _raw_sparse_for_indices(assay, cell_idx, feat_idx)
         else:
             normed = assay.normed(cell_idx=cell_idx, feat_idx=feat_idx)
             blocks = [csr_matrix(block) for block in normed.stream_blocks()]
@@ -154,14 +299,16 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             )
         adata = AnnData(x, obs=obs, var=var)
         if layers is not None:
-            selected_ids = assay.feats.fetch_all("ids").astype(str)[feat_idx]
+            if run_features is None:
+                selected_ids = assay.feats.fetch_all("ids").astype(str)[feat_idx]
+            else:
+                selected_ids = run_features.fetch("ids").astype(str)
             if np.unique(selected_ids).size != selected_ids.size:
                 raise ValueError(
                     "Selected feature IDs must be unique when exporting layers"
                 )
             for layer, assay_name in layers.items():
                 layer_assay = self._get_assay(assay_name)
-                layer_matrix = layer_assay.to_raw_sparse(cell_key)
                 layer_id_positions: dict[str, list[int]] = {}
                 for index, feature_id in enumerate(
                     layer_assay.feats.fetch_all("ids").astype(str)
@@ -192,7 +339,18 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
                     [layer_id_positions[feature_id][0] for feature_id in selected_ids],
                     dtype=np.int64,
                 )
-                adata.layers[layer] = layer_matrix[:, layer_feat_idx].tocsr()
+                if run is None:
+                    assert cell_key is not None
+                    layer_matrix = layer_assay.to_raw_sparse(cell_key)
+                    adata.layers[layer] = layer_matrix[:, layer_feat_idx].tocsr()
+                else:
+                    adata.layers[layer] = _raw_sparse_for_indices(
+                        layer_assay,
+                        cell_idx,
+                        layer_feat_idx,
+                    )
+        if run is not None:
+            _lift_frozen_umap_to_obsm(adata)
         return adata
 
     def show_zarr_tree(self, start: str = "/", depth: int = 2) -> None:
@@ -217,60 +375,54 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
 
     def calc_membership_strength(
         self,
-        clust_key: str,
+        clusters: ArtifactRef,
+        graph: ArtifactRef,
         *,
-        graph: ArtifactRef | None = None,
-        from_assay: str | None = None,
-        cell_key: str | None = None,
         invalidate_cache: bool = False,
-    ) -> None:
-        """Store per-cell cluster membership strength from a selected graph.
+    ) -> ArtifactRef:
+        """Store per-cell cluster membership strength as an artifact.
 
         For each cell, computes the fraction of KNN neighbors sharing the most
-        common cluster label and saves it in cell metadata.
+        common cluster label.
 
         Args:
-            clust_key: Cell metadata column with cluster assignments.
-            graph: Connectivity-map or integrated-graph artifact. The assay's
-                current connectivity map is used when omitted.
-            from_assay: Assay used to resolve the current graph.
-            cell_key: Optional cell key, validated against the graph lineage.
+            clusters: Explicit axis-aligned cluster-label artifact.
+            graph: Explicit connectivity-map or integrated-graph artifact.
 
         Returns:
-            None
+            Reference to the immutable membership-strength artifact.
         """
-        graph_selection = resolve_graph_selection(
-            self,
-            graph,
-            from_assay=from_assay,
-            cell_key=cell_key,
-        )
-        graph_ref = graph_selection.graph_ref
-        from_assay = graph_selection.from_assay
-        cell_key = graph_selection.cell_key
-        loc = graph_selection.graph_loc
+        if not isinstance(graph, ArtifactRef):
+            raise TypeError("graph must be an ArtifactRef")
+        graph_ref = graph
+        status = inspect_artifact(self.zw, graph_ref)
+        if not status.complete:
+            raise ValueError("Graph artifact is unavailable or incomplete")
+        loc = status.path
         n_cells, k = self._get_graph_ncells_k(graph_loc=loc)
-        selection = self._ensure_cell_selection(cell_key)
-        graph_cell_selection = self._graph_cell_selection(graph_ref)
-        if not self._selection_artifacts_match(graph_cell_selection, selection):
-            raise ValueError("cell_key does not match the graph cell selection")
-        cluster_input = self._resolve_cell_data_provenance_input(
-            clust_key,
-            cell_key=cell_key,
+        selection = graph_cell_selection(self.zw, graph_ref)
+        validate_stored_selection_integrity(
+            self.zw,
+            selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
         )
-        output_key = (
-            f"{graph_selection.output_assay}_{cell_key}_cluster_membership_strength"
+        cluster_values, cluster_selection = _load_cell_label_artifact(
+            self.zw,
+            clusters,
         )
+        if cluster_selection != selection:
+            raise ValueError("Cluster labels do not match the graph cell selection")
+        if cluster_values.shape != (n_cells,):
+            raise ValueError("Cluster labels do not align with graph rows")
         arguments = MembershipStrengthArguments(
             connectivity_map=graph_ref,
-            clusters=cluster_input,
+            clusters=clusters,
             cell_selection=selection,
             algorithm_version=2,
             decimals=3,
-            from_assay=from_assay,
-            cell_key=cell_key,
-            clust_key=clust_key,
-            output_key=output_key,
             invalidate_cache=invalidate_cache,
         )
         record = arguments.to_record()
@@ -287,33 +439,8 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             arrays={"values": ((n_cells,), "f")},
             invalidate_cache=invalidate_cache,
         )
-        preserved_display = column_display(self.zw, output_key)
         if planned.reused:
-            artifact_group = as_zarr_group(
-                self.zw[artifact_path(planned.ref)],
-                name=planned.ref.artifact_id,
-            )
-            values = artifact_values(artifact_group, "values")
-            self.cells.insert(
-                output_key,
-                values,
-                key=cell_key,
-                overwrite=True,
-            )
-            link_cell_data_column(
-                self.zw,
-                output_key,
-                planned.ref,
-                value_name="values",
-                default_display={
-                    **continuous_display(values),
-                    "minimum": 0.0,
-                    "maximum": 1.0,
-                },
-                preserved_display=preserved_display,
-            )
-            return None
-        clusts = self.cells.fetch(clust_key, key=cell_key)
+            return planned.ref
         graph_grp = as_zarr_group(self.zw[loc], name=loc)
         edges = np.asarray(as_zarr_array(graph_grp["edges"], name="edges")[:])
         if edges.shape != (n_cells * k, 2):
@@ -327,7 +454,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         )
         if not np.array_equal(edge_rows[:, :, 0], expected_sources):
             raise ValueError("Graph edges are not stored in cell-major order")
-        neighbor_clusters = np.asarray(clusts)[edge_rows[:, :, 1]]
+        neighbor_clusters = cluster_values[edge_rows[:, :, 1]]
         values = np.asarray(
             [
                 pd.Series(row).value_counts(dropna=False).iloc[0] / k
@@ -340,36 +467,18 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             planned,
             {"values": values},
         )
-        self.cells.insert(
-            output_key,
-            values,
-            key=cell_key,
-            overwrite=True,
-        )
-        link_cell_data_column(
-            self.zw,
-            output_key,
-            planned.ref,
-            value_name="values",
-            default_display={
-                **continuous_display(values),
-                "minimum": 0.0,
-                "maximum": 1.0,
-            },
-            preserved_display=preserved_display,
-        )
-        return None
+        return planned.ref
 
     def smart_label(
         self,
-        to_relabel: str,
-        base_label: str,
-        cell_key: str = "I",
-        new_col_name: str | None = None,
+        to_relabel: ArtifactRef,
+        base_label: ArtifactRef,
+        *,
         invalidate_cache: bool = False,
-    ) -> None | list[str]:
-        """A convenience function to relabel the values in a cell attribute
-        column (A) based on the values in another cell attribute column (B).
+    ) -> ArtifactRef:
+        """Relabel one cell-label artifact using another label artifact.
+
+        Values in artifact A are relabeled from their overlap with artifact B.
         For each unique value in A, the most frequently occurring value in B is
         found. If two or more values in A have maximum overlap with the same
         value in B, then they all get the same label as B along with different
@@ -379,77 +488,56 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         are delimited by hyphens.
 
         Args:
-            to_relabel: Cell attributes column to relabel
-            base_label: Cell attributes column to relabel
-            cell_key: Cell key fetching column values
-            new_col_name: Name of new column where relabeled values will be saved. If None then values
-                          are returned and not saved in cell attributes table
+            to_relabel: Explicit axis-aligned label artifact to relabel.
+            base_label: Explicit axis-aligned base-label artifact.
 
-        Returns: None or a list of relabelled values
+        Returns:
+            Reference to the immutable relabeled-values artifact.
         """
-        values_to_relabel = np.asarray(self.cells.fetch(to_relabel, key=cell_key))
-        base_values = np.asarray(self.cells.fetch(base_label, key=cell_key))
+        values_to_relabel, selection = _load_cell_label_artifact(
+            self.zw,
+            to_relabel,
+        )
+        base_values, base_selection = _load_cell_label_artifact(
+            self.zw,
+            base_label,
+        )
+        if base_selection != selection:
+            raise ValueError("Label artifacts must share one cell selection")
+        if base_values.shape != values_to_relabel.shape:
+            raise ValueError(
+                "Label artifacts must have matching one-dimensional shapes"
+            )
+        arguments = SmartLabelArguments(
+            values=to_relabel,
+            base_labels=base_label,
+            cell_selection=selection,
+            algorithm_version=2,
+            suffix_style="lowercase_letter",
+            invalidate_cache=invalidate_cache,
+        )
+        record = arguments.to_record()
+        planned = plan_cell_data_artifact(
+            self.zw,
+            scope="datastore",
+            kind=arguments.artifact_kind,
+            operation=arguments.operation,
+            parameters=record.parameters,
+            inputs=record.inputs,
+            execution_options=record.execution_options,
+            cell_selection=selection,
+            arrays={"values": (values_to_relabel.shape, None)},
+            invalidate_cache=invalidate_cache,
+        )
+        if planned.reused:
+            return planned.ref
         if len(values_to_relabel) == 0:
-            if new_col_name is None:
-                return []
-            raise ValueError(f"cell_key {cell_key!r} selects no cells")
-        planned = None
-        preserved_display = None
-        if new_col_name is not None:
-            selection = self._ensure_cell_selection(cell_key)
-            arguments = SmartLabelArguments(
-                values=self._resolve_cell_data_provenance_input(
-                    to_relabel,
-                    cell_key=cell_key,
-                ),
-                base_labels=self._resolve_cell_data_provenance_input(
-                    base_label,
-                    cell_key=cell_key,
-                ),
-                cell_selection=selection,
-                algorithm_version=2,
-                suffix_style="lowercase_letter",
-                to_relabel=to_relabel,
-                base_label=base_label,
-                cell_key=cell_key,
-                new_col_name=new_col_name,
-                invalidate_cache=invalidate_cache,
-            )
-            record = arguments.to_record()
-            planned = plan_cell_data_artifact(
+            write_cell_data_artifact(
                 self.zw,
-                scope="datastore",
-                kind=arguments.artifact_kind,
-                operation=arguments.operation,
-                parameters=record.parameters,
-                inputs=record.inputs,
-                execution_options=record.execution_options,
-                cell_selection=selection,
-                arrays={"values": ((len(self.cells.active_index(cell_key)),), None)},
-                invalidate_cache=invalidate_cache,
+                planned,
+                {"values": np.asarray([], dtype=str)},
             )
-            preserved_display = column_display(self.zw, new_col_name)
-            if planned.reused:
-                artifact_group = as_zarr_group(
-                    self.zw[artifact_path(planned.ref)],
-                    name=planned.ref.artifact_id,
-                )
-                values = artifact_values(artifact_group, "values")
-                self.cells.insert(
-                    new_col_name,
-                    values,
-                    key=cell_key,
-                    overwrite=True,
-                )
-                link_cell_data_column(
-                    self.zw,
-                    new_col_name,
-                    planned.ref,
-                    value_name="values",
-                    default_display=categorical_display(values),
-                    preserved_display=preserved_display,
-                )
-                return None
+            return planned.ref
 
         df = pd.crosstab(
             base_values,
@@ -474,39 +562,20 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             for k, v in miss_idxmax.items():
                 new_names[v] = f"{new_names[v][:-1]}-{k}{new_names[v][-1]}"
 
-        ret_val = [new_names[x] for x in values_to_relabel]
-        if new_col_name is None:
-            return ret_val
-        assert planned is not None
-        values = np.asarray(ret_val)
+        values = np.asarray([new_names[x] for x in values_to_relabel])
         write_cell_data_artifact(
             self.zw,
             planned,
             {"values": values},
         )
-        self.cells.insert(
-            new_col_name,
-            values,
-            key=cell_key,
-            overwrite=True,
-        )
-        link_cell_data_column(
-            self.zw,
-            new_col_name,
-            planned.ref,
-            value_name="values",
-            default_display=categorical_display(values),
-            preserved_display=preserved_display,
-        )
-        return None
+        return planned.ref
 
     def _prepare_artifact_cluster_tree(
         self,
         *,
         graph_ref: ArtifactRef,
+        clusters_ref: ArtifactRef,
         from_assay: str,
-        cell_key: str,
-        cluster_key: str,
         fill_by_value: str | None,
         invalidate_cache: bool,
     ) -> dict[str, Any]:
@@ -516,13 +585,21 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         from ...clustering.paris import hierarchy_to_dendrogram
         from .paris_persistence import load_hierarchy_group
 
-        cell_data = as_zarr_group(self.zw["cellData"], name="cellData")
-        cluster_column = as_zarr_array(cell_data[cluster_key], name=cluster_key)
-        raw_cut_ref = cluster_column.attrs.get("source_artifact")
-        if not isinstance(raw_cut_ref, dict):
-            raise ValueError("Cluster column has no source artifact")
-        cut_ref = ArtifactRef.from_dict(raw_cut_ref)
-        cut_inputs = inspect_artifact(self.zw, cut_ref).inputs or {}
+        if (
+            clusters_ref.scope != "assay"
+            or clusters_ref.assay != from_assay
+            or clusters_ref.kind != "cluster_cut"
+        ):
+            raise ValueError(
+                "clusters must identify an assay-scoped cluster_cut artifact "
+                "for the graph assay"
+            )
+        cut_status = inspect_artifact(self.zw, clusters_ref)
+        if not cut_status.complete or cut_status.operation != "cut_paris_hierarchy":
+            raise ValueError(
+                "clusters must identify a complete Paris cluster-cut artifact"
+            )
+        cut_inputs = cut_status.inputs or {}
         raw_graph_ref = cut_inputs.get("connectivity_map")
         expected_graph_input = graph_ref.to_dict()
         if raw_graph_ref != expected_graph_input:
@@ -531,8 +608,18 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         if not isinstance(raw_hierarchy_ref, dict):
             raise ValueError("Cluster cut has no hierarchy input")
         hierarchy_ref = ArtifactRef.from_dict(raw_hierarchy_ref)
+        hierarchy_status = inspect_artifact(self.zw, hierarchy_ref)
+        if (
+            not hierarchy_status.complete
+            or hierarchy_status.operation != "fit_paris_hierarchy"
+            or (hierarchy_status.inputs or {}).get("connectivity_map")
+            != expected_graph_input
+        ):
+            raise ValueError(
+                "Cluster cut does not have a complete hierarchy for the requested graph"
+            )
         hierarchy_group = as_zarr_group(
-            self.zw[inspect_artifact(self.zw, hierarchy_ref).path],
+            self.zw[hierarchy_status.path],
             name=hierarchy_ref.artifact_id,
         )
         hierarchy, _plateau = load_hierarchy_group(
@@ -567,22 +654,38 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             finish_artifact(dendrogram_group, dendrogram_plan)
         dendrogram = np.asarray(as_zarr_array(dendrogram_group["data"], name="data")[:])
         cut_group = as_zarr_group(
-            self.zw[artifact_path(cut_ref)],
-            name=artifact_path(cut_ref),
+            self.zw[artifact_path(clusters_ref)],
+            name=artifact_path(clusters_ref),
         )
         clusters = np.asarray(as_zarr_array(cut_group["labels"], name="labels")[:])
+        raw_selection = cut_inputs.get("cell_selection")
+        if not isinstance(raw_selection, dict):
+            raise ValueError("Cluster cut has no cell-selection input")
+        selection_ref = ArtifactRef.from_dict(raw_selection)
+        cell_indices = read_stored_selection_indices(
+            self.zw,
+            selection_ref,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
+        )
+        if clusters.shape != (len(cell_indices),):
+            raise ValueError(
+                "Cluster labels do not align with the stored cell selection"
+            )
         coalesced_plan = plan_artifact(
             self.zw,
-            scope=cut_ref.scope,
-            assay=cut_ref.assay,
+            scope=clusters_ref.scope,
+            assay=clusters_ref.assay,
             kind="coalesced_tree",
             operation="coalesce_cluster_tree",
             parameters={},
             inputs={
                 "dendrogram": dendrogram_plan.ref,
-                "cluster_cut": cut_ref,
+                "cluster_cut": clusters_ref,
             },
-            execution_options={"cluster_key": cluster_key},
+            execution_options={},
             invalidate_cache=invalidate_cache,
             required_arrays=(
                 ArrayRequirement("edgelist"),
@@ -659,23 +762,39 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             )
             partition_array[:] = partition_id_values
             finish_artifact(coalesced_group, coalesced_plan)
-        color_values = (
-            self.get_cell_vals(
-                from_assay=from_assay,
-                cell_key=cell_key,
-                k=fill_by_value,
-            )
-            if fill_by_value is not None
-            else None
-        )
+        color_values = None
+        if fill_by_value is not None:
+            if fill_by_value in self.cells.columns:
+                color_values = np.asarray(self.cells.fetch_all(fill_by_value))[
+                    cell_indices
+                ]
+            else:
+                assay = self._get_assay(from_assay)
+                feature_indices = assay.feats.get_index_by(
+                    [fill_by_value],
+                    "names",
+                )
+                if len(feature_indices) == 0:
+                    raise ValueError(
+                        f"ERROR: {fill_by_value} not found in {from_assay} assay."
+                    )
+                if len(feature_indices) > 1:
+                    logger.warning(
+                        f"Plotting mean of {len(feature_indices)} features because "
+                        f"{fill_by_value} is not unique."
+                    )
+                color_values = controlled_compute(
+                    assay.normed(cell_indices, feature_indices).mean(axis=1),
+                    self.nthreads,
+                ).astype(np.float64)
         return {
             "graph": subgraph,
             "clusters": clusters,
             "color_values": color_values,
             "from_assay": from_assay,
-            "cell_key": cell_key,
             "graph_ref": graph_ref,
-            "cluster_key": cluster_key,
+            "clusters_ref": clusters_ref,
+            "cell_selection": selection_ref,
             "coalesced_location": inspect_artifact(
                 self.zw,
                 coalesced_plan.ref,
@@ -685,29 +804,27 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
     def _prepare_cluster_tree(
         self,
         *,
-        graph: ArtifactRef | None = None,
+        graph: ArtifactRef,
+        clusters: ArtifactRef,
         from_assay: str | None = None,
-        cell_key: str | None = None,
-        cluster_key: str | None = None,
         fill_by_value: str | None = None,
         invalidate_cache: bool = False,
     ) -> dict[str, Any]:
         """Prepare an artifact-backed cluster tree for one exact graph."""
-        if cluster_key is None:
-            raise ValueError(
-                "ERROR: Please provide a value for `cluster_key` parameter"
-            )
-        selection = resolve_graph_selection(
-            self,
+        if not isinstance(graph, ArtifactRef):
+            raise TypeError("graph must be an ArtifactRef")
+        if not isinstance(clusters, ArtifactRef):
+            raise TypeError("clusters must be an ArtifactRef")
+        assay_name = resolve_graph_source_assay(
+            self.zw,
             graph,
-            from_assay=from_assay,
-            cell_key=cell_key,
+            from_assay,
+            parameter_name="from_assay",
         )
         return self._prepare_artifact_cluster_tree(
-            graph_ref=selection.graph_ref,
-            from_assay=selection.from_assay,
-            cell_key=selection.cell_key,
-            cluster_key=cluster_key,
+            graph_ref=graph,
+            clusters_ref=clusters,
+            from_assay=assay_name,
             fill_by_value=fill_by_value,
             invalidate_cache=invalidate_cache,
         )

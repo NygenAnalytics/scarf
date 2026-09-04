@@ -43,6 +43,7 @@ def ingest(
 
     destination: str | None = None
     if format_name in CONVERT_FORMATS:
+        using_default_destination = zarrPath is None
         preflight = ensure_convert_destination(
             source,
             zarrPath,
@@ -53,6 +54,8 @@ def ingest(
             preflight.notes = [*notes, *preflight.notes]
             return preflight
         destination = preflight
+        if using_default_destination:
+            notes.append(f"Using derived Zarr destination: {destination}")
         if direction_map.get("overwrite") is True:
             notes.append(f"Overwrite authorized for destination {destination}")
 

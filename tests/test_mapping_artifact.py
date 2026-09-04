@@ -9,6 +9,7 @@ from zarr.storage import MemoryStore
 
 from scarf.mapping.artifact import (
     load_artifact_mapping_reference,
+    validate_mapping_reference_sources,
     write_artifact_mapping_reference,
 )
 from scarf.mapping.models import (
@@ -34,9 +35,18 @@ def _ref(
 
 
 def _plain_reference(datastore):
-    state = datastore.get_assay_state("RNA")
-    assert state is not None and state.neighbors is not None
-    return datastore.build_mapping_reference(state.neighbors)
+    graphs = datastore.list_artifacts(
+        kind="connectivity_map",
+        from_assay="RNA",
+        scope="assay",
+        complete_only=True,
+    )
+    assert len(graphs) == 1
+    neighbors = ArtifactRef.from_dict(
+        datastore.inspect_artifact(graphs[0]).inputs["neighbors"]
+    )
+    reference_ref = datastore.build_mapping_reference(neighbors)
+    return datastore.get_mapping_reference(reference_ref)
 
 
 def test_load_rejects_non_mapping_reference_refs() -> None:
@@ -179,8 +189,6 @@ def test_load_rejects_versioned_metadata_and_bad_distance_summary(
     analyzed_datastore_ephemeral,
 ) -> None:
     datastore = analyzed_datastore_ephemeral
-    state = datastore.get_assay_state("RNA")
-    assert state is not None and state.neighbors is not None
     reference = _plain_reference(datastore)
     group = artifact_group(datastore.zw, reference.ref)
 
@@ -190,7 +198,12 @@ def test_load_rejects_versioned_metadata_and_bad_distance_summary(
     with pytest.raises(ValueError, match="versioned contract"):
         load_artifact_mapping_reference(datastore, reference.ref)
 
-    reference = datastore.build_mapping_reference(state.neighbors)
+    reference = datastore.get_mapping_reference(
+        datastore.build_mapping_reference(
+            reference.neighbors,
+            invalidate_cache=True,
+        )
+    )
     group = artifact_group(datastore.zw, reference.ref)
     metadata = dict(group.attrs["reference_metadata"])
     metadata.pop("schemaVersion", None)
@@ -253,11 +266,15 @@ def test_load_rejects_coordinate_chain_and_live_fingerprint_mismatches(
         load_artifact_mapping_reference(datastore, reference.ref)
 
     ann_group.attrs["provenance"] = original_ann_provenance
-    original_fingerprint = datastore.RNA.attrs["dataset_fingerprint"]
+    had_stored_fingerprint = "dataset_fingerprint" in datastore.RNA.attrs
+    original_fingerprint = datastore.RNA.attrs.get("dataset_fingerprint")
     datastore.RNA.attrs["dataset_fingerprint"] = "changed"
     with pytest.raises(ValueError, match="dataset fingerprint"):
         load_artifact_mapping_reference(datastore, reference.ref)
-    datastore.RNA.attrs["dataset_fingerprint"] = original_fingerprint
+    if had_stored_fingerprint:
+        datastore.RNA.attrs["dataset_fingerprint"] = original_fingerprint
+    else:
+        del datastore.RNA.attrs["dataset_fingerprint"]
 
 
 def test_load_rejects_metadata_model_and_payload_tampering(
@@ -269,9 +286,9 @@ def test_load_rejects_metadata_model_and_payload_tampering(
     original_metadata = dict(group.attrs["reference_metadata"])
 
     metadata = dict(original_metadata)
-    metadata["feature_key"] = "I"
+    metadata["unexpected"] = "value"
     group.attrs["reference_metadata"] = metadata
-    with pytest.raises(ValueError, match="removed feature-key contract"):
+    with pytest.raises(ValueError, match="current contract"):
         load_artifact_mapping_reference(datastore, reference.ref)
 
     metadata = dict(original_metadata)
@@ -348,7 +365,6 @@ def test_write_artifact_mapping_reference_persists_required_pca_arrays() -> None
         {
             "assay": "RNA",
             "method": "pca",
-            "cell_key": "I",
             "ann_metric": "l2",
             "dataset_fingerprint": "fp",
             "selected_cell_count": 2,
@@ -368,6 +384,7 @@ def test_write_artifact_mapping_reference_persists_required_pca_arrays() -> None
         "reference_distance_values",
     }
     assert group.attrs["reference_metadata"]["method"] == "pca"
+    assert isinstance(group.attrs["payload_fingerprint"], str)
 
 
 def test_write_artifact_mapping_reference_persists_symphony_state() -> None:
@@ -417,6 +434,7 @@ def test_write_artifact_mapping_reference_persists_symphony_state() -> None:
         "cluster_mass",
         "sigma",
     }
+    assert isinstance(group.attrs["payload_fingerprint"], str)
 
 
 def test_write_artifact_mapping_reference_rejects_high_rank_arrays() -> None:
@@ -449,3 +467,52 @@ def test_write_artifact_mapping_reference_rejects_high_rank_arrays() -> None:
         )
 
     assert not group.attrs["complete"]
+
+
+def test_mapping_reference_source_validation_is_strict_and_semantic() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    means = root.create_array(
+        "means",
+        data=np.zeros(3, dtype=np.float64),
+        chunks=(2,),
+    )
+    scales = root.create_array(
+        "scales",
+        data=np.ones(3, dtype=np.float64),
+        chunks=(2,),
+    )
+    loadings = root.create_array(
+        "loadings",
+        data=np.ones((3, 2), dtype=np.float64),
+        chunks=(2, 2),
+    )
+
+    assert validate_mapping_reference_sources(
+        feature_means=means,
+        feature_scales=scales,
+        loadings=loadings,
+        symphony_sources=None,
+    ) == (3, 2)
+
+    scales[1] = 0.0
+    with pytest.raises(ValueError, match="PCA model arrays are invalid"):
+        validate_mapping_reference_sources(
+            feature_means=means,
+            feature_scales=scales,
+            loadings=loadings,
+            symphony_sources=None,
+        )
+
+    float32_loadings = root.create_array(
+        "float32_loadings",
+        data=np.ones((3, 2), dtype=np.float32),
+        chunks=(2, 2),
+    )
+    scales[1] = 1.0
+    with pytest.raises(ValueError, match="PCA model arrays are invalid"):
+        validate_mapping_reference_sources(
+            feature_means=means,
+            feature_scales=scales,
+            loadings=float32_loadings,
+            symphony_sources=None,
+        )

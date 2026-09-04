@@ -8,19 +8,41 @@ from ..matrix import ChunkedArray
 from ..storage.refs import ArtifactRef
 
 
+def _immutable_array(values: np.ndarray) -> np.ndarray:
+    array = np.ascontiguousarray(np.asarray(values))
+    return np.frombuffer(array.tobytes(order="C"), dtype=array.dtype).reshape(
+        array.shape
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PseudotimeAggregationFeatureIdentity:
+    names: np.ndarray
+    ids: np.ndarray
+
+    def __post_init__(self) -> None:
+        names = np.asarray(self.names)
+        ids = np.asarray(self.ids)
+        if names.ndim != 1 or ids.ndim != 1 or names.shape != ids.shape:
+            raise ValueError("Frozen feature names and IDs must align")
+        object.__setattr__(self, "names", _immutable_array(names))
+        object.__setattr__(self, "ids", _immutable_array(ids))
+
+
+class _PseudotimeAggregationIdentityCarrier:
+    __slots__ = ("_feature_identity",)
+
+
 @dataclass(frozen=True, slots=True, eq=False)
 class FateMappingResult:
-    """Saved fate probabilities aligned to cells selected by result_cell_key."""
+    """Fate probabilities loaded from an immutable artifact."""
 
-    fate_keys: tuple[str, ...]
-    validity_key: str
-    sink_labels: tuple[Any, ...]
-    assay: str
-    graph_cell_key: str
-    result_cell_key: str
+    ref: ArtifactRef
     graph: ArtifactRef
-    pseudotime_key: str
-    sink_key: str
+    pseudotime: ArtifactRef
+    sink_labels_artifact: ArtifactRef
+    cell_selection: ArtifactRef
+    sink_labels: tuple[Any, ...]
     values: np.ndarray = field(repr=False)
     valid: np.ndarray = field(repr=False)
 
@@ -32,22 +54,17 @@ class FateMappingResult:
         if self.values.shape[0] != self.valid.shape[0]:
             raise ValueError("Fate probabilities and validity rows must align")
         n_sinks = self.values.shape[1]
-        if n_sinks != len(self.fate_keys) or n_sinks != len(self.sink_labels):
-            raise ValueError(
-                "Fate probability columns, keys, and sink labels must align"
-            )
+        if n_sinks != len(self.sink_labels):
+            raise ValueError("Fate probability columns and sink labels must align")
 
 
 @dataclass(frozen=True, slots=True, eq=False)
 class PseudotimeScoreResult:
-    """Saved pseudotime values and their metadata keys."""
+    """Pseudotime values loaded from an immutable artifact."""
 
-    pseudotime_key: str
-    validity_key: str
-    assay: str
-    graph_cell_key: str
-    result_cell_key: str
+    ref: ArtifactRef
     graph: ArtifactRef
+    cell_selection: ArtifactRef
     values: np.ndarray = field(repr=False)
     valid: np.ndarray = field(repr=False)
 
@@ -60,15 +77,14 @@ class PseudotimeScoreResult:
 
 @dataclass(frozen=True, slots=True, eq=False)
 class PseudotimeMarkerResult:
-    """Pseudotime correlation table and saved feature-metadata keys."""
+    """Pseudotime correlation table loaded from an immutable artifact."""
 
+    ref: ArtifactRef
     table: pd.DataFrame = field(repr=False)
-    correlation_key: str
-    p_value_key: str
     assay: str
-    cell_key: str
+    cell_selection: ArtifactRef
     feature_selection: ArtifactRef
-    pseudotime_key: str
+    pseudotime: ArtifactRef
 
     def __post_init__(self) -> None:
         if (
@@ -93,29 +109,19 @@ class PseudotimeMarkerResult:
                 + ", ".join(sorted(missing))
             )
 
-    @property
-    def p_value_adjusted_key(self) -> str | None:
-        if (
-            "p_value_adjusted" not in self.table.columns
-            or not self.p_value_key.endswith("__p")
-        ):
-            return None
-        return f"{self.p_value_key[:-3]}__padj"
-
 
 @dataclass(frozen=True, slots=True, eq=False)
-class PseudotimeAggregationResult:
-    """Lazy pseudotime aggregation with aligned feature metadata."""
+class PseudotimeAggregationResult(_PseudotimeAggregationIdentityCarrier):
+    """Lazy pseudotime aggregation loaded from an immutable artifact."""
 
+    ref: ArtifactRef
     data: ChunkedArray = field(repr=False)
     feature_indices: np.ndarray = field(repr=False)
     feature_clusters: np.ndarray = field(repr=False)
-    cluster_key: str
-    storage_path: str
     assay: str
-    cell_key: str
+    cell_selection: ArtifactRef
     feature_selection: ArtifactRef
-    pseudotime_key: str
+    pseudotime: ArtifactRef
 
     def __post_init__(self) -> None:
         if (
@@ -136,3 +142,39 @@ class PseudotimeAggregationResult:
             raise ValueError("Feature indices do not align with aggregation rows")
         if len(self.feature_clusters) != n_features:
             raise ValueError("Feature clusters do not align with aggregation rows")
+
+    def _attach_feature_identity(
+        self,
+        names: np.ndarray,
+        ids: np.ndarray,
+    ) -> None:
+        if hasattr(self, "_feature_identity"):
+            raise RuntimeError("Frozen feature identity is already attached")
+        identity = _PseudotimeAggregationFeatureIdentity(names=names, ids=ids)
+        if identity.names.shape != (int(self.data.shape[0]),):
+            raise ValueError(
+                "Frozen feature identity does not align with aggregation rows"
+            )
+        object.__setattr__(self, "_feature_identity", identity)
+
+    @property
+    def feature_names(self) -> np.ndarray:
+        """Frozen feature names aligned to the aggregation rows."""
+        identity = getattr(self, "_feature_identity", None)
+        if not isinstance(identity, _PseudotimeAggregationFeatureIdentity):
+            raise RuntimeError(
+                "Frozen feature names are available on results loaded with "
+                "DataStore.load_pseudotime_aggregation"
+            )
+        return identity.names
+
+    @property
+    def feature_ids(self) -> np.ndarray:
+        """Frozen feature IDs aligned to the aggregation rows."""
+        identity = getattr(self, "_feature_identity", None)
+        if not isinstance(identity, _PseudotimeAggregationFeatureIdentity):
+            raise RuntimeError(
+                "Frozen feature IDs are available on results loaded with "
+                "DataStore.load_pseudotime_aggregation"
+            )
+        return identity.ids

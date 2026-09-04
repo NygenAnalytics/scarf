@@ -2,11 +2,10 @@
 
 from collections.abc import Hashable, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 
-from ..mapping.models import MappingResult
 from ..mapping.reference import MappingReference
 from ..plotting._contracts import (
     CategoricalScale,
@@ -25,9 +24,69 @@ from ..plotting._contracts import (
 from ..plotting._figure import PlotResult
 from ..plotting.recipes import PlotRecipe, PlotRecipeResult
 from ..storage.refs import ArtifactRef
+from .pipeline_run import PipelineRun
 
 if TYPE_CHECKING:
     from .datastore import DataStore
+
+
+class _FrozenRunPlotCells:
+    """Adapt a frozen run axis to the small metadata surface plotting uses."""
+
+    __slots__ = ("_cells",)
+
+    def __init__(self, cells: Any) -> None:
+        self._cells = cells
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        return tuple(self._cells.columns)
+
+    @property
+    def _selection_ref(self) -> ArtifactRef:
+        return cast(ArtifactRef, self._cells._selection_ref)
+
+    def fetch_all(self, column: str) -> np.ndarray:
+        return np.asarray(self._cells._plot_fetch_all(column))
+
+    def fetch(self, column: str, *, key: str = "I") -> np.ndarray:
+        if key != "I":
+            raise ValueError("Run plots use the frozen pipeline cell selection")
+        plot_selected = getattr(self._cells, "_plot_fetch_selected", None)
+        if callable(plot_selected):
+            return np.asarray(plot_selected(column))
+        values = self.fetch_all(column)
+        return np.asarray(values[self._cells.fetch_all("I")])
+
+    def get_dtype(self, column: str) -> np.dtype[Any]:
+        return cast(np.dtype[Any], self._cells._field_dtype(column))
+
+    def _field_dtype(self, column: str) -> np.dtype[Any]:
+        return cast(np.dtype[Any], self._cells._field_dtype(column))
+
+    def _field_display(self, column: str) -> dict[str, Any] | None:
+        return cast(dict[str, Any] | None, self._cells._field_display(column))
+
+    def _iter_selected_blocks(
+        self,
+        columns: Sequence[str],
+        block_rows: int | None = None,
+    ) -> Any:
+        return self._cells._iter_selected_blocks(columns, block_rows)
+
+
+class _FrozenRunPlotStore:
+    """Expose only the frozen run cells needed by artifact embedding plots."""
+
+    __slots__ = ("_defaultAssay", "cells", "zw")
+
+    def __init__(self, store: "DataStore", *, assay: str, cells: Any) -> None:
+        self._defaultAssay = assay
+        self.cells = _FrozenRunPlotCells(cells)
+        self.zw = store.zw
+
+    def _stored_display_metadata(self, column: str) -> dict[str, Any] | None:
+        return self.cells._field_display(column)
 
 
 class DataStorePlotAccessor:
@@ -41,12 +100,15 @@ class DataStorePlotAccessor:
     def embedding(
         self,
         *,
-        layout_key: str | Sequence[str],
+        layout_key: str | Sequence[str] | None = None,
+        layout: str | ArtifactRef | None = None,
+        run: PipelineRun | None = None,
         color_by: (
             "str"
+            " | ArtifactRef"
             " | FeatureRef"
             " | CellField"
-            " | Sequence[str | FeatureRef | CellField]"
+            " | Sequence[str | ArtifactRef | FeatureRef | CellField]"
             " | None"
         ) = None,
         facet_by: str | None = None,
@@ -84,11 +146,87 @@ class DataStorePlotAccessor:
         show: bool = True,
     ) -> "PlotResult":
         """Plot cells in a stored two-dimensional embedding."""
+        if run is not None:
+            if not isinstance(run, PipelineRun):
+                raise TypeError("run must be a PipelineRun")
+            if run._owner is not self._store:
+                raise ValueError("run must be opened from this datastore")
+            if layout_key is not None or isinstance(layout, ArtifactRef):
+                raise ValueError(
+                    "run is mutually exclusive with layout_key or an ArtifactRef layout"
+                )
+            if layout is not None and not isinstance(layout, str):
+                raise TypeError("layout must name a pipeline output")
+            if not isinstance(color_by, str | type(None)):
+                raise TypeError("color_by must name a frozen cell field or be None")
+            if (
+                cell_key != "I"
+                or from_assay is not None
+                or normalization is not None
+                or point_sizes is not None
+                or facet_by is not None
+                or facet_order is not None
+                or subset_by is not None
+            ):
+                raise ValueError(
+                    "Run embedding uses frozen layout and color outputs; live "
+                    "selection, feature, facet, and subset inputs are unavailable"
+                )
+            if density_overlay is not None and density_overlay.group_by is not None:
+                raise ValueError(
+                    "Run embedding density filters cannot use live metadata"
+                )
+            if highlight is not None and highlight.by is not None:
+                raise ValueError("Run embedding highlights cannot use live metadata")
+            cells = run.cells
+            layout_ref = run["umap" if layout is None else layout]
+            if color_by is None:
+                resolved_color: str | None = None
+            elif color_by in cells.columns:
+                resolved_color = color_by
+            else:
+                raise KeyError(f"Pipeline run has no frozen cell field {color_by!r}")
+            from ..plotting import embedding
+
+            return embedding(
+                _FrozenRunPlotStore(self._store, assay=run.assay, cells=cells),
+                layout=layout_ref,
+                color_by=resolved_color,
+                point_size=point_size,
+                point_size_range=point_size_range,
+                point_edgecolor=point_edgecolor,
+                point_edgewidth=point_edgewidth,
+                point_alpha=point_alpha,
+                sort_values=sort_values,
+                color_scale=color_scale,
+                categorical_scale=categorical_scale,
+                default_color=default_color,
+                missing_color=missing_color,
+                clip_fraction=clip_fraction,
+                groups=groups,
+                n_columns=n_columns,
+                target=target,
+                figsize=figsize,
+                theme=theme,
+                legend_loc=legend_loc,
+                max_on_data_labels=max_on_data_labels,
+                show_legend=show_legend,
+                show_titles=show_titles,
+                frame=frame,
+                density_overlay=density_overlay,
+                highlight=highlight,
+                seed=seed,
+                rasterize_threshold=rasterize_threshold,
+                show=show,
+            )
+        if isinstance(layout, str):
+            raise TypeError("String layout names require a pipeline run")
         from ..plotting import embedding
 
         return embedding(
             self._store,
             layout_key=layout_key,
+            layout=layout,
             color_by=color_by,
             facet_by=facet_by,
             facet_order=facet_order,
@@ -128,13 +266,15 @@ class DataStorePlotAccessor:
     def embedding_raster(
         self,
         *,
-        layout_key: str,
+        layout_key: str | None = None,
+        layout: str | ArtifactRef | None = None,
+        run: PipelineRun | None = None,
         color_by: "str | CellField | None" = None,
         cell_key: str = "I",
         pixels: int = 400,
         block_rows: int | None = None,
         color_scale: "ColorScale | None" = None,
-        missing_color: str = "white",
+        missing_color: str | None = None,
         subset_by: str | None = None,
         target: Any | None = None,
         figsize: tuple[float, float] | None = None,
@@ -145,9 +285,53 @@ class DataStorePlotAccessor:
         """Rasterize continuous cell metadata over a stored embedding."""
         from ..plotting import embedding_raster
 
+        if run is not None:
+            if not isinstance(run, PipelineRun):
+                raise TypeError("run must be a PipelineRun")
+            if run._owner is not self._store:
+                raise ValueError("run must be opened from this datastore")
+            if layout_key is not None or isinstance(layout, ArtifactRef):
+                raise ValueError(
+                    "run is mutually exclusive with layout_key or an ArtifactRef layout"
+                )
+            if layout is not None and not isinstance(layout, str):
+                raise TypeError("layout must name a pipeline output")
+            if cell_key != "I":
+                raise ValueError("Run raster uses the frozen pipeline cell selection")
+            if not isinstance(color_by, str | type(None)):
+                raise TypeError("color_by must name a frozen cell field or be None")
+            color_key = color_by
+            cells = run.cells
+            plot_store = _FrozenRunPlotStore(
+                self._store,
+                assay=run.assay,
+                cells=cells,
+            )
+            if color_key is not None and color_key not in cells.columns:
+                raise KeyError(f"Pipeline run has no frozen cell field {color_key!r}")
+            if subset_by is not None and subset_by not in cells.columns:
+                raise KeyError(f"Pipeline run has no frozen cell field {subset_by!r}")
+            return embedding_raster(
+                plot_store,
+                layout=run["umap" if layout is None else layout],
+                color_by=color_by,
+                pixels=pixels,
+                block_rows=block_rows,
+                color_scale=color_scale,
+                missing_color=missing_color,
+                subset_by=subset_by,
+                target=target,
+                figsize=figsize,
+                theme=theme,
+                seed=seed,
+                show=show,
+            )
+        if isinstance(layout, str):
+            raise TypeError("String layout names require a pipeline run")
         return embedding_raster(
             self._store,
             layout_key=layout_key,
+            layout=layout,
             color_by=color_by,
             cell_key=cell_key,
             pixels=pixels,
@@ -164,15 +348,14 @@ class DataStorePlotAccessor:
 
     def mapping_score(
         self,
-        result: MappingResult | ArtifactRef | str,
+        result: ArtifactRef,
         *,
-        reference: MappingReference | None = None,
+        reference: MappingReference,
         target_groups: Sequence[Any] | np.ndarray | None = None,
-        layout_key: str | None = None,
+        layout: ArtifactRef | None = None,
         kind: Literal["embedding", "histogram", "box"] = "embedding",
         reference_class_group: str | None = None,
         size_by_score: bool = False,
-        query_assay: str | None = None,
         log_transform: bool = True,
         multiplier: float = 1000,
         weighted: bool = True,
@@ -195,11 +378,10 @@ class DataStorePlotAccessor:
             result,
             reference=reference,
             target_groups=target_groups,
-            layout_key=layout_key,
+            layout=layout,
             kind=kind,
             reference_class_group=reference_class_group,
             size_by_score=size_by_score,
-            query_assay=query_assay,
             log_transform=log_transform,
             multiplier=multiplier,
             weighted=weighted,
@@ -217,9 +399,9 @@ class DataStorePlotAccessor:
 
     def mapping_evidence(
         self,
-        result: MappingResult | ArtifactRef | str,
+        result: ArtifactRef,
         *,
-        reference: MappingReference | None = None,
+        reference: MappingReference,
         reference_class_group: str,
         target_groups: Sequence[Any] | np.ndarray | None = None,
         metrics: Sequence[str] = (
@@ -230,7 +412,6 @@ class DataStorePlotAccessor:
         ),
         kind: Literal["histogram", "box"] = "histogram",
         bins: int = 30,
-        query_assay: str | None = None,
         threshold_fraction: float = 0.5,
         na_val: str = "NA",
         max_distance: float | None = None,
@@ -253,7 +434,6 @@ class DataStorePlotAccessor:
             metrics=metrics,
             kind=kind,
             bins=bins,
-            query_assay=query_assay,
             threshold_fraction=threshold_fraction,
             na_val=na_val,
             max_distance=max_distance,
@@ -267,15 +447,14 @@ class DataStorePlotAccessor:
 
     def mapping_confusion(
         self,
-        result: MappingResult | ArtifactRef | str,
+        result: ArtifactRef,
         *,
-        reference: MappingReference | None = None,
+        reference: MappingReference,
         reference_class_group: str,
         known_labels: Sequence[Any] | np.ndarray,
         normalize: Literal["none", "true", "predicted", "all"] = "true",
         known_order: Sequence[Any] | None = None,
         predicted_order: Sequence[Any] | None = None,
-        query_assay: str | None = None,
         threshold_fraction: float = 0.5,
         na_val: str = "NA",
         max_distance: float | None = None,
@@ -298,7 +477,6 @@ class DataStorePlotAccessor:
             normalize=normalize,
             known_order=known_order,
             predicted_order=predicted_order,
-            query_assay=query_assay,
             threshold_fraction=threshold_fraction,
             na_val=na_val,
             max_distance=max_distance,
@@ -312,9 +490,9 @@ class DataStorePlotAccessor:
 
     def mapping_calibration(
         self,
-        result: MappingResult | ArtifactRef | str,
+        result: ArtifactRef,
         *,
-        reference: MappingReference | None = None,
+        reference: MappingReference,
         reference_class_group: str,
         known_labels: Sequence[Any] | np.ndarray,
         metric: str = "voteFraction",
@@ -322,7 +500,6 @@ class DataStorePlotAccessor:
         thresholds: Sequence[float] | np.ndarray | None = None,
         n_thresholds: int = 50,
         chosen_threshold: float | None = None,
-        query_assay: str | None = None,
         na_val: str = "NA",
         max_distance: float | None = None,
         target: Any | None = None,
@@ -344,7 +521,6 @@ class DataStorePlotAccessor:
             thresholds=thresholds,
             n_thresholds=n_thresholds,
             chosen_threshold=chosen_threshold,
-            query_assay=query_assay,
             na_val=na_val,
             max_distance=max_distance,
             target=target,
@@ -359,7 +535,8 @@ class DataStorePlotAccessor:
         features: (
             "Sequence[str | FeatureRef] | Mapping[str, Sequence[str | FeatureRef]]"
         ),
-        group_by: str | tuple[str, ...],
+        group_by: str | tuple[str, ...] | None = None,
+        groups: ArtifactRef | None = None,
         cell_key: str = "I",
         from_assay: str | None = None,
         sample_by: str | None = None,
@@ -391,6 +568,7 @@ class DataStorePlotAccessor:
             self._store,
             features=features,
             group_by=group_by,
+            groups=groups,
             cell_key=cell_key,
             from_assay=from_assay,
             sample_by=sample_by,
@@ -422,7 +600,8 @@ class DataStorePlotAccessor:
         features: (
             "Sequence[str | FeatureRef] | Mapping[str, Sequence[str | FeatureRef]]"
         ),
-        group_by: str | tuple[str, ...],
+        group_by: str | tuple[str, ...] | None = None,
+        groups: ArtifactRef | None = None,
         cell_key: str = "I",
         from_assay: str | None = None,
         sample_by: str | None = None,
@@ -458,6 +637,7 @@ class DataStorePlotAccessor:
             self._store,
             features=features,
             group_by=group_by,
+            groups=groups,
             cell_key=cell_key,
             from_assay=from_assay,
             sample_by=sample_by,
@@ -486,9 +666,11 @@ class DataStorePlotAccessor:
     def composition(
         self,
         *,
-        category_by: str,
+        category_by: str | None = None,
+        categories: ArtifactRef | None = None,
         cell_key: str = "I",
         sample_by: str | None = None,
+        grouping: ArtifactRef | None = None,
         subject_by: str | None = None,
         pair_by: str | None = None,
         condition_by: str | None = None,
@@ -517,8 +699,10 @@ class DataStorePlotAccessor:
         return composition(
             self._store,
             category_by=category_by,
+            categories=categories,
             cell_key=cell_key,
             sample_by=sample_by,
+            grouping=grouping,
             subject_by=subject_by,
             pair_by=pair_by,
             condition_by=condition_by,
@@ -544,9 +728,13 @@ class DataStorePlotAccessor:
 
     def distribution(
         self,
-        keys: ("str | CellField | FeatureRef | Sequence[str | CellField | FeatureRef]"),
+        keys: (
+            "str | CellField | FeatureRef | ArtifactRef"
+            " | Sequence[str | CellField | FeatureRef]"
+        ),
         *,
-        group_by: str | None = None,
+        grouping: ArtifactRef | CellField | None = None,
+        cell_selection: ArtifactRef | None = None,
         groups: Sequence[Any] | None = None,
         split_by: str | None = None,
         sample_by: str | None = None,
@@ -554,7 +742,6 @@ class DataStorePlotAccessor:
         sample_stat: Literal["mean", "median", "fraction"] = "mean",
         expression_cutoff: float = 0.0,
         subset_by: str | None = None,
-        cell_key: str | None = "I",
         from_assay: str | None = None,
         normalization: "NormalizationSpec | None" = None,
         categorical_scale: "CategoricalScale | None" = None,
@@ -598,10 +785,23 @@ class DataStorePlotAccessor:
         """
         from ..plotting import distribution
 
+        resolved_stats = stats_results
+        if isinstance(stats_results, ArtifactRef):
+            resolved_stats = self._store.get_statistical_tests(stats_results)
+        elif isinstance(stats_results, Mapping):
+            resolved_stats = {
+                key: (
+                    self._store.get_statistical_tests(value)
+                    if isinstance(value, ArtifactRef)
+                    else value
+                )
+                for key, value in stats_results.items()
+            }
         return distribution(
             self._store,
             keys,
-            group_by=group_by,
+            grouping=grouping,
+            cell_selection=cell_selection,
             groups=groups,
             split_by=split_by,
             sample_by=sample_by,
@@ -609,7 +809,6 @@ class DataStorePlotAccessor:
             sample_stat=sample_stat,
             expression_cutoff=expression_cutoff,
             subset_by=subset_by,
-            cell_key=cell_key,
             from_assay=from_assay,
             normalization=normalization,
             categorical_scale=categorical_scale,
@@ -636,7 +835,7 @@ class DataStorePlotAccessor:
             title=title,
             theme=theme,
             show_legend=show_legend,
-            stats_results=stats_results,
+            stats_results=resolved_stats,
             stats_keys=stats_keys,
             stats_bracket_height=stats_bracket_height,
             stats_show_p=stats_show_p,
@@ -646,10 +845,7 @@ class DataStorePlotAccessor:
     def marker_heatmap(
         self,
         *,
-        from_assay: str | None = None,
-        group_key: str | None = None,
-        cell_key: str | None = None,
-        marker: ArtifactRef | None = None,
+        marker: ArtifactRef,
         topn: int = 5,
         log_transform: bool | None = None,
         vmin: float = -1,
@@ -684,9 +880,6 @@ class DataStorePlotAccessor:
 
         return marker_heatmap(
             self._store,
-            from_assay=from_assay,
-            group_key=group_key,
-            cell_key=cell_key,
             marker=marker,
             topn=topn,
             log_transform=log_transform,
@@ -740,11 +933,12 @@ class DataStorePlotAccessor:
     def cluster_connectivity(
         self,
         *,
-        group_by: str,
-        layout_key: str,
-        graph: ArtifactRef | None = None,
-        cell_key: str | None = None,
-        from_assay: str | None = None,
+        group_by: str | None = None,
+        layout_key: str | None = None,
+        groups: ArtifactRef | None = None,
+        layout: ArtifactRef | None = None,
+        graph: ArtifactRef,
+        cell_key: str = "I",
         position: Literal["median", "mean"] = "median",
         positions: Mapping[Any, tuple[float, float]] | None = None,
         categorical_scale: "CategoricalScale | None" = None,
@@ -773,9 +967,10 @@ class DataStorePlotAccessor:
             self._store,
             group_by=group_by,
             layout_key=layout_key,
+            groups=groups,
+            layout=layout,
             graph=graph,
             cell_key=cell_key,
-            from_assay=from_assay,
             position=position,
             positions=positions,
             categorical_scale=categorical_scale,
@@ -798,13 +993,47 @@ class DataStorePlotAccessor:
             show=show,
         )
 
+    def modality_weights(
+        self,
+        *,
+        graph: ArtifactRef,
+        layout: ArtifactRef,
+        point_size: float | None = None,
+        point_alpha: float = 1.0,
+        cmap: str = "viridis",
+        n_columns: int | None = None,
+        target: Any | None = None,
+        figsize: tuple[float, float] | None = None,
+        theme: str = "notebook",
+        frame: FrameStyle = "minimal",
+        rasterize_threshold: int = 50_000,
+        show: bool = True,
+    ) -> "PlotResult":
+        """Plot each assay's WNN contribution over an explicit embedding."""
+        from ..plotting import modality_weights
+
+        return modality_weights(
+            self._store,
+            graph=graph,
+            layout=layout,
+            point_size=point_size,
+            point_alpha=point_alpha,
+            cmap=cmap,
+            n_columns=n_columns,
+            target=target,
+            figsize=figsize,
+            theme=theme,
+            frame=frame,
+            rasterize_threshold=rasterize_threshold,
+            show=show,
+        )
+
     def cluster_tree(
         self,
         *,
-        graph: ArtifactRef | None = None,
+        graph: ArtifactRef,
+        clusters: ArtifactRef,
         from_assay: str | None = None,
-        cell_key: str | None = None,
-        cluster_key: str | None = None,
         fill_by_value: str | None = None,
         force_ints_as_cats: bool = True,
         width: float = 1,
@@ -835,9 +1064,8 @@ class DataStorePlotAccessor:
         return cluster_tree(
             self._store,
             graph=graph,
+            clusters=clusters,
             from_assay=from_assay,
-            cell_key=cell_key,
-            cluster_key=cluster_key,
             fill_by_value=fill_by_value,
             force_ints_as_cats=force_ints_as_cats,
             width=width,
@@ -866,11 +1094,7 @@ class DataStorePlotAccessor:
     def pseudotime_heatmap(
         self,
         *,
-        from_assay: str | None = None,
-        cell_key: str | None = None,
-        features: "ArtifactRef | str",
-        feature_cluster_key: str | None = None,
-        pseudotime_key: str | None = None,
+        aggregation: ArtifactRef,
         show_features: list[str] | None = None,
         feature_order: Sequence[str] | None = None,
         feature_cluster_order: Sequence[Any] | None = None,
@@ -896,11 +1120,7 @@ class DataStorePlotAccessor:
 
         return pseudotime_heatmap(
             self._store,
-            from_assay=from_assay,
-            cell_key=cell_key,
-            features=features,
-            feature_cluster_key=feature_cluster_key,
-            pseudotime_key=pseudotime_key,
+            aggregation=aggregation,
             show_features=show_features,
             feature_order=feature_order,
             feature_cluster_order=feature_cluster_order,

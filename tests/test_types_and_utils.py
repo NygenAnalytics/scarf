@@ -23,7 +23,11 @@ from scarf.utils import (
     compute_with_progress,
     tqdmbar,
 )
-from scarf.utils.arrays import canonicalize_sparse, checked_sparse_cast
+from scarf.utils.arrays import (
+    _rolling_window_kernel,
+    canonicalize_sparse,
+    checked_sparse_cast,
+)
 from scarf.utils.progress import iter_progress
 
 
@@ -207,6 +211,21 @@ def test_rolling_window_even_and_oversized_windows():
     for window_size in (0, -1):
         with pytest.raises(ValueError, match="greater than zero"):
             rolling_window(data, w=window_size)
+
+
+def test_python_rolling_window_kernel_matches_public_compiled_path():
+    data = np.arange(12, dtype=float).reshape(6, 2)
+
+    np.testing.assert_allclose(
+        _rolling_window_kernel(data, 4),
+        rolling_window(data, 4),
+    )
+    with pytest.raises(ValueError, match="two-dimensional"):
+        _rolling_window_kernel(np.arange(3), 2)
+    with pytest.raises(ValueError, match="greater than zero"):
+        _rolling_window_kernel(data, 0)
+    with pytest.raises(ValueError, match="at least one row"):
+        _rolling_window_kernel(np.empty((0, 2)), 1)
 
 
 def test_array_digest_is_deterministic_and_shape_sensitive():

@@ -22,6 +22,7 @@ __all__ = ["Repository", "connect", "list_repositories"]
 
 _BUCKET_ID = "Nygen/cytebase"
 _ZARR_ARCHIVE_SUFFIX = ".zarr.tar.gz"
+_LOCAL_CATALOG_ENV = "SCARF_CYTEBASE_LOCAL"
 
 
 def _safe_name(name: str, *, kind: str) -> str:
@@ -169,6 +170,11 @@ class Repository:
     ) -> Path:
         """Download one dataset, optionally selecting its Zarr archive."""
         name = _safe_name(name, kind="dataset name")
+        destination = Path(destination).absolute()
+        if zarr:
+            local_dataset = _local_dataset_store(name)
+            if local_dataset is not None:
+                return _copy_local_dataset(local_dataset, destination / name)
         files = _bucket_files(self.name, name, recursive=True)
         if not files:
             choices = "\n".join(self.list_datasets())
@@ -188,7 +194,6 @@ class Repository:
                 file for file in files if not file.path.endswith(_ZARR_ARCHIVE_SUFFIX)
             ]
 
-        destination = Path(destination).absolute()
         _download_files(self.name, selected, destination)
         return destination / name
 
@@ -206,6 +211,30 @@ class Repository:
             read_only=True,
         )
         return zarr.open_group(store=store, mode="r")
+
+
+def _local_catalog_root() -> Path | None:
+    raw = os.environ.get(_LOCAL_CATALOG_ENV, "").strip()
+    if not raw:
+        return None
+    root = Path(raw).expanduser()
+    return root if root.is_dir() else None
+
+
+def _local_dataset_store(name: str) -> Path | None:
+    root = _local_catalog_root()
+    if root is None:
+        return None
+    store = root / name / "data.zarr"
+    return store if store.is_dir() else None
+
+
+def _copy_local_dataset(store: Path, target: Path) -> Path:
+    if target.exists():
+        shutil.rmtree(target)
+    target.mkdir(parents=True)
+    shutil.copytree(store, target / "data.zarr")
+    return target
 
 
 def _download_files(

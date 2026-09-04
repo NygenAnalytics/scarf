@@ -58,7 +58,6 @@ minFeaturesPerCell = 10
 h5adBatchSize = 1000
 topN = 1000
 hvgMinCells = 20
-hvgLabel = "hvgs"
 k = 11
 dims = 21
 nCentroids = 1000
@@ -67,13 +66,16 @@ annParallel = false
 umapEpochs = 300
 umapSeed = 4444
 umapParallel = false
-umapLabel = "UMAP"
 leidenResolution = 1.0
 leidenBackend = "igraph"
 leidenSeed = 4444
-leidenLabel = "leiden_cluster"
-markerFeatures = "all_features"
 graphLocalCache = "auto"
+
+# For a selected-run marker branch, provide both the source store and its
+# immutable cluster_labels artifact. Per-size sources may instead be placed in
+# the ignored profiling/cluster_sources.toml file as nRows, storeUri, artifactId.
+# clusterSourceUri = "s3://example-bucket/scarf-profiling/stores/core/10000.zarr"
+# clusterSourceArtifactId = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 # Tune memory before large runs. Values are examples.
 

@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from threadpoolctl import threadpool_limits
 
+from ..utils.shutdown import shutdown_checkpoint
+
 __all__ = ["map_shards", "stream_shards", "in_shard_context"]
 
 type Backend = Literal["thread", "serial"]
@@ -70,6 +72,7 @@ def _imap_ordered(
         pending: deque[Future[Any]] = deque()
 
         def enqueue() -> bool:
+            shutdown_checkpoint()
             try:
                 item = next(iterator)
             except StopIteration:
@@ -83,6 +86,7 @@ def _imap_ordered(
                     break
             while pending:
                 result = pending.popleft().result()
+                shutdown_checkpoint()
                 enqueue()
                 yield result
         finally:
@@ -133,7 +137,15 @@ def stream_shards(
         iterator = iter(items)
         with _io_concurrency(io_concurrency), _blas_limit(within_block_threads):
             try:
-                yield from _progress((fn(item) for item in iterator), msg, total)
+
+                def checked() -> Iterator[Any]:
+                    for item in iterator:
+                        shutdown_checkpoint()
+                        result = fn(item)
+                        shutdown_checkpoint()
+                        yield result
+
+                yield from _progress(checked(), msg, total)
             finally:
                 _close_iterator(iterator)
         return

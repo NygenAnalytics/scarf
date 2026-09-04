@@ -405,7 +405,10 @@ class ChunkedArray:
 
     @property
     def blocks(self) -> Iterator[Block]:
+        from ..utils.shutdown import shutdown_checkpoint
+
         for start, end in self._ranges():
+            shutdown_checkpoint()
             yield Block(self, start, end)
 
     def _with_io(self, array: "ChunkedArray") -> "ChunkedArray":

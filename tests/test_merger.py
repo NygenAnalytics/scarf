@@ -224,6 +224,26 @@ def test_dataset_merge(datastore, rna_raw_total, tmp_path):
     assert zarr.open_group(fn, mode="r").attrs["assayTypes"]["RNA"] == "RNA"
 
 
+def test_dataset_merge_does_not_copy_source_pipeline_runs(
+    datastore_ephemeral,
+    tmp_path,
+):
+    datastore_ephemeral.zw.create_group(f"pipeline/runs/{'d' * 64}/stages")
+    destination = str(tmp_path / "merged_without_runs.zarr")
+
+    DataStoreMerge(
+        datasets=[datastore_ephemeral, datastore_ephemeral],
+        zarr_path=destination,
+        names=["left", "right"],
+        assays=["RNA"],
+        prepend_text="",
+        overwrite=True,
+    ).dump()
+
+    assert "pipeline" in datastore_ephemeral.zw
+    assert "pipeline" not in zarr.open_group(destination, mode="r")
+
+
 def test_dataset_merge_maps_features_and_preserves_row_order(tmp_path):
     left = _MergeDataStore(
         [
@@ -1633,6 +1653,10 @@ def test_dataset_merge_workspace_overwrite_preserves_root_siblings(tmp_path):
     first.dump()
     root = zarr.open_group(path, mode="r+")
     root.create_group("sentinel")
+    root.create_group(f"merged/pipeline/runs/{'a' * 64}/stages")
+    root.create_group("merged/pipeline/keep")
+    root.create_group(f"merged/artifacts/cell_selection/{'b' * 64}")
+    root.create_group(f"other_workspace/pipeline/runs/{'c' * 64}/stages")
 
     _merge_two_rna(
         zarr_path=path,
@@ -1644,6 +1668,10 @@ def test_dataset_merge_workspace_overwrite_preserves_root_siblings(tmp_path):
     assert "sentinel" in completed
     assert "merged/cellData" in completed
     assert "matrices/RNA/counts" in completed
+    assert "merged/pipeline/runs" not in completed
+    assert "merged/pipeline/keep" in completed
+    assert "merged/artifacts" not in completed
+    assert f"other_workspace/pipeline/runs/{'c' * 64}" in completed
 
 
 def test_dataset_merge_overwrite_removes_old_assay_components(tmp_path):

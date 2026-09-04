@@ -71,3 +71,4 @@ scarf/_version.py
 # Local working notes for countsT strip-shard experiments (tmp Modal hacks).
 /performance_reconfig.md
 .env
+temp/

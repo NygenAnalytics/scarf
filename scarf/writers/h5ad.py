@@ -1,6 +1,9 @@
+import hashlib
 import math
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, cast
 
 import numpy as np
@@ -9,6 +12,7 @@ from scipy.sparse import coo_matrix
 from ..storage.types import as_zarr_group
 from ..readers import H5adReader
 from ..readers.h5ad import _H5adAssayFeatures
+from ..storage import ArtifactRef
 from ..storage.budget import ResourceBudget
 from ..storage.count_matrix import CountMatrixPolicy
 from ..storage.io_policy import StorageIoPolicy
@@ -19,6 +23,10 @@ from ..storage.profiles import (
 )
 from ..utils.logging import logger
 from ..utils.progress import iter_progress
+
+
+_DEFAULT_ANALYSIS_BLOCK_ROWS = 65_536
+_SOURCE_DIGEST_BLOCK_BYTES = 1024 * 1024
 
 
 def _count_matrix_bands(
@@ -233,6 +241,65 @@ def _validate_assay_names(names: tuple[str, ...]) -> None:
         validate_assay_name(name)
 
 
+@dataclass(frozen=True, slots=True)
+class H5adImportResult:
+    """Immutable outputs created while importing one H5AD file.
+
+    Attributes:
+        assayNames: Assay groups written to the destination store.
+        analysisAssay: Assay owning explicitly selected analytical outputs.
+        cellSelection: Artifact covering the imported cell axis.
+        embeddingArtifacts: Embedding artifacts keyed by exact ``obsm`` key.
+        clusterArtifacts: Cluster artifacts keyed by exact ``obs`` key.
+    """
+
+    assayNames: tuple[str, ...]
+    analysisAssay: str | None
+    cellSelection: ArtifactRef
+    embeddingArtifacts: Mapping[str, ArtifactRef]
+    clusterArtifacts: Mapping[str, ArtifactRef]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "embeddingArtifacts",
+            MappingProxyType(dict(self.embeddingArtifacts)),
+        )
+        object.__setattr__(
+            self,
+            "clusterArtifacts",
+            MappingProxyType(dict(self.clusterArtifacts)),
+        )
+
+    @property
+    def artifactRefs(self) -> tuple[ArtifactRef, ...]:
+        return (
+            self.cellSelection,
+            *self.embeddingArtifacts.values(),
+            *self.clusterArtifacts.values(),
+        )
+
+
+class _H5adCellIdSource(Sequence[str | bytes]):
+    def __init__(self, reader: H5adReader) -> None:
+        self._reader = reader
+        self.shape = (reader.nCells,)
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def __getitem__(self, index: int | slice) -> Any:
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            if step != 1:
+                raise ValueError("H5AD cell IDs support only contiguous reads")
+            return self._reader._cell_ids_block(start, stop)
+        resolved = index if index >= 0 else len(self) + index
+        if resolved < 0 or resolved >= len(self):
+            raise IndexError(index)
+        return self._reader._cell_ids_block(resolved, resolved + 1)[0]
+
+
 class H5adToZarr:
     """A class for converting data in anndata's H5ad format to Zarr hierarchy.
 
@@ -254,6 +321,9 @@ class H5adToZarr:
                 unitBytes and chunkBytes plan is used.
         io: Optional explicit read, compute, and write widths. Unset values
             stay under automatic planning.
+        analysis_assay: Imported assay that owns explicitly selected H5AD
+                        embeddings and clusters. Required for multi-assay
+                        imports with analytical outputs.
 
     Attributes:
         h5ad: A h5ad object (h5 file with added AnnData structure).
@@ -275,6 +345,7 @@ class H5adToZarr:
         io: StorageIoPolicy | None = None,
         assay_split_key: str | None = None,
         assay_name_map: dict[str, str] | None = None,
+        analysis_assay: str | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.schema import create_zarr_count_assay
@@ -308,10 +379,29 @@ class H5adToZarr:
             self.assayFeatures = None
             self.assayNames = (self.assayName,)
         _validate_assay_names(self.assayNames)
+        has_analysis = bool(self.h5ad.embeddingRoles or self.h5ad.clusterKeys)
+        if analysis_assay is None:
+            if has_analysis and len(self.assayNames) != 1:
+                raise ValueError(
+                    "analysis_assay is required when importing H5AD analytical "
+                    "outputs into a multi-assay store"
+                )
+            resolved_analysis_assay = self.assayNames[0] if has_analysis else None
+        else:
+            if not has_analysis:
+                raise ValueError(
+                    "analysis_assay requires at least one explicitly selected "
+                    "H5AD analytical output"
+                )
+            if analysis_assay not in self.assayNames:
+                raise ValueError("analysis_assay must name an imported assay")
+            resolved_analysis_assay = analysis_assay
+        self.analysisAssay = resolved_analysis_assay
         self.resources = resolve_budget(mem_budget, nthreads)
         self.profile = resolve_storage_profile(zarr_loc, profile)
         self.policy = policy
         self.io = io
+        self._sourceDigest = self._hash_source() if has_analysis else None
         self.h5ad.infer_storage_dtype(self.resources.memoryBytes)
         csc_peak = self.h5ad.csc_conversion_peak_bytes()
         if csc_peak > self.resources.memoryBytes:
@@ -348,6 +438,11 @@ class H5adToZarr:
                 policy=policy,
             )
         self._ini_feature_data()
+        self.root = (
+            self.z
+            if self.workspace is None
+            else as_zarr_group(self.z[self.workspace], name=self.workspace)
+        )
 
     def _ini_cell_data(self) -> None:
         from ..storage.arrays import create_zarr_obj_array
@@ -398,7 +493,7 @@ class H5adToZarr:
                     profile=self.profile,
                 )
 
-    def dump(self, batch_size: int | None = None) -> None:
+    def dump(self, batch_size: int | None = None) -> H5adImportResult:
         """Write h5ad matrix data into Zarr ``counts`` and RNA ``countsT``.
 
         Args:
@@ -409,7 +504,7 @@ class H5adToZarr:
             AssertionError: If written cell count does not match expected nCells.
 
         Returns:
-            None
+            Explicit selection, embedding, and cluster artifact references.
         """
         self._write_counts(batch_size=batch_size)
         from .counts_t import finalize_writer_counts_t_many
@@ -423,6 +518,323 @@ class H5adToZarr:
             policy=self.policy,
             io=self.io,
         )
+        cell_selection = self._write_cell_selection()
+        cluster_artifacts = self._write_cluster_artifacts(
+            cell_selection,
+            batch_size,
+        )
+        embedding_artifacts = self._write_embedding_artifacts(
+            cell_selection,
+            batch_size,
+        )
+        return H5adImportResult(
+            assayNames=self.assayNames,
+            analysisAssay=self.analysisAssay,
+            cellSelection=cell_selection,
+            embeddingArtifacts=embedding_artifacts,
+            clusterArtifacts=cluster_artifacts,
+        )
+
+    def _hash_source(self) -> bytes:
+        digest = hashlib.sha256()
+        with open(self.h5ad.h5adFn, "rb") as source:
+            while block := source.read(_SOURCE_DIGEST_BLOCK_BYTES):
+                digest.update(block)
+        return digest.digest()
+
+    def _analysis_block_rows(
+        self,
+        requested: int | None,
+        *,
+        row_bytes: int,
+    ) -> int:
+        bytes_per_row = max(1, int(row_bytes))
+        memory_rows = max(
+            1,
+            int(self.resources.memoryBytes) // (8 * bytes_per_row),
+        )
+        preferred = _DEFAULT_ANALYSIS_BLOCK_ROWS if requested is None else requested
+        return int(max(1, min(int(preferred), memory_rows)))
+
+    def _write_cell_selection(self) -> ArtifactRef:
+        from ..storage.selections import resolve_stored_selection_artifact
+
+        return resolve_stored_selection_artifact(
+            self.root,
+            table_path="cellData",
+            id_column="ids",
+            source_column="I",
+            scope="datastore",
+            kind="cell_selection",
+            operation="import_cell_selection",
+            parameters={"source": "h5ad"},
+            inputs={},
+        )
+
+    @staticmethod
+    def _floating_dtype(dtype: Any) -> np.dtype[Any]:
+        source = np.dtype(dtype)
+        if source.kind == "f":
+            resolved: np.dtype[Any] = np.dtype(source.str)
+            return resolved
+        if source.kind in "biu":
+            return np.dtype(np.float64)
+        raise TypeError(f"Embedding payload uses unsupported dtype {source}")
+
+    def _embedding_fingerprint(
+        self,
+        key: str,
+        block_rows: int,
+        dtype: np.dtype[Any],
+    ) -> str:
+        from ..storage.artifacts import ValueFingerprintBuilder
+
+        source = self.h5ad._obsm_array(key)
+        shape = tuple(int(size) for size in source.shape)
+        builder = ValueFingerprintBuilder()
+        builder.begin_array("values", shape, dtype)
+        start = 0
+        for block in self.h5ad._iter_obsm_blocks(key, block_rows, dtype):
+            if not bool(np.isfinite(block).all()):
+                raise ValueError(f"Embedding key {key!r} contains non-finite values")
+            builder.update_array_block("values", (start, 0), block)
+            start += int(block.shape[0])
+        builder.end_array("values")
+        return builder.hexdigest()
+
+    def _write_embedding_artifacts(
+        self,
+        cell_selection: ArtifactRef,
+        requested_rows: int | None,
+    ) -> dict[str, ArtifactRef]:
+        from ..embeddings.imported import write_imported_embedding
+
+        if not self.h5ad.embeddingRoles:
+            return {}
+        if self.analysisAssay is None or self._sourceDigest is None:
+            raise RuntimeError("H5AD analytical import was not initialized")
+
+        artifacts: dict[str, ArtifactRef] = {}
+        cell_ids = _H5adCellIdSource(self.h5ad)
+        for key, role in self.h5ad.embeddingRoles.items():
+            source = self.h5ad._obsm_array(key)
+            source_shape = (int(source.shape[0]), int(source.shape[1]))
+            dtype = self._floating_dtype(source.dtype)
+            block_rows = self._analysis_block_rows(
+                requested_rows,
+                row_bytes=int(source.shape[1]) * int(dtype.itemsize),
+            )
+            fingerprint = self._embedding_fingerprint(key, block_rows, dtype)
+
+            def blocks(
+                source_key: str = key,
+                rows: int = block_rows,
+                resolved_dtype: np.dtype[Any] = dtype,
+            ) -> Iterator[np.ndarray]:
+                return self.h5ad._iter_obsm_blocks(
+                    source_key,
+                    rows,
+                    resolved_dtype,
+                )
+
+            artifacts[key] = write_imported_embedding(
+                self.root,
+                assay=self.analysisAssay,
+                dimreduc_key=key,
+                role=role,
+                coordinates=blocks,
+                coordinate_shape=source_shape,
+                coordinate_dtype=dtype,
+                source_digest=self._sourceDigest,
+                payload_fingerprints={"values": fingerprint},
+                source_cell_ids=cell_ids,
+                cell_selection=cell_selection,
+                block_rows=block_rows,
+            )
+        return artifacts
+
+    @staticmethod
+    def _value_is_missing(value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, float | np.floating):
+            return not bool(np.isfinite(value))
+        return False
+
+    @staticmethod
+    def _decode_cluster_text(value: Any) -> str:
+        if isinstance(value, bytes | np.bytes_):
+            try:
+                return bytes(value).decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("H5AD cluster labels contain invalid UTF-8") from exc
+        if isinstance(value, str | np.str_):
+            return str(value)
+        raise TypeError("H5AD string cluster labels must contain strings")
+
+    def _cluster_dtype_and_missing(
+        self,
+        key: str,
+        block_rows: int,
+    ) -> tuple[np.dtype[Any], bool]:
+        source_dtype = self.h5ad._cell_column_value_dtype(key)
+        if source_dtype.kind not in "biufOSU":
+            raise TypeError(
+                f"Cluster key {key!r} uses unsupported dtype {source_dtype}"
+            )
+        has_missing = False
+        if source_dtype.kind not in "OSU":
+            for start in range(0, self.h5ad.nCells, block_rows):
+                stop = min(start + block_rows, self.h5ad.nCells)
+                values, missing = self.h5ad._cell_column_block(key, start, stop)
+                has_missing = has_missing or bool(np.asarray(missing, dtype=bool).any())
+                if np.asarray(values).dtype.kind == "O":
+                    has_missing = has_missing or any(
+                        self._value_is_missing(value) for value in values
+                    )
+            return np.dtype(source_dtype.str), has_missing
+
+        maximum = 1
+        for start in range(0, self.h5ad.nCells, block_rows):
+            stop = min(start + block_rows, self.h5ad.nCells)
+            values, raw_missing = self.h5ad._cell_column_block(key, start, stop)
+            missing = np.asarray(raw_missing, dtype=bool).copy()
+            for index, value in enumerate(values):
+                if missing[index] or self._value_is_missing(value):
+                    missing[index] = True
+                    continue
+                maximum = max(maximum, len(self._decode_cluster_text(value)))
+            has_missing = has_missing or bool(missing.any())
+        return np.dtype(f"U{maximum}"), has_missing
+
+    def _cluster_block(
+        self,
+        key: str,
+        start: int,
+        stop: int,
+        dtype: np.dtype[Any],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        raw_values, raw_missing = self.h5ad._cell_column_block(key, start, stop)
+        values = np.asarray(raw_values)
+        missing = np.asarray(raw_missing, dtype=bool).copy()
+        if values.ndim != 1 or missing.shape != values.shape:
+            raise ValueError(f"Cluster key {key!r} did not return aligned row values")
+        if values.dtype.kind == "O":
+            for index, value in enumerate(values):
+                if self._value_is_missing(value):
+                    missing[index] = True
+
+        if dtype.kind == "U":
+            normalized = np.asarray(
+                [
+                    "" if missing[index] else self._decode_cluster_text(value)
+                    for index, value in enumerate(values)
+                ],
+                dtype=dtype,
+            )
+            return normalized, missing
+
+        normalized = np.zeros(values.shape, dtype=dtype)
+        valid = ~missing
+        if bool(valid.any()):
+            normalized[valid] = np.asarray(values[valid], dtype=dtype)
+        if dtype.kind == "f":
+            nonfinite = ~np.isfinite(normalized)
+            missing |= nonfinite
+            normalized[missing] = 0
+        return normalized, missing
+
+    def _write_cluster_artifacts(
+        self,
+        cell_selection: ArtifactRef,
+        requested_rows: int | None,
+    ) -> dict[str, ArtifactRef]:
+        from ..storage.arrays import MetadataBlock, create_streamed_metadata_column
+        from ..storage.artifact_writer import (
+            ArrayRequirement,
+            finish_artifact,
+            plan_artifact,
+            start_artifact,
+        )
+
+        if not self.h5ad.clusterKeys:
+            return {}
+        if self.analysisAssay is None or self._sourceDigest is None:
+            raise RuntimeError("H5AD analytical import was not initialized")
+
+        artifacts: dict[str, ArtifactRef] = {}
+        block_rows = self._analysis_block_rows(requested_rows, row_bytes=64)
+        for key in self.h5ad.clusterKeys:
+            dtype, has_missing = self._cluster_dtype_and_missing(key, block_rows)
+            requirements = [
+                ArrayRequirement(
+                    "values",
+                    shape=(self.h5ad.nCells,),
+                    dtype=dtype,
+                )
+            ]
+            if has_missing:
+                requirements.append(
+                    ArrayRequirement(
+                        "__scarf_missing__values",
+                        shape=(self.h5ad.nCells,),
+                        dtype=bool,
+                    )
+                )
+            planned = plan_artifact(
+                self.root,
+                scope="assay",
+                assay=self.analysisAssay,
+                kind="cluster_labels",
+                operation="import_cluster_labels",
+                parameters={"source": "h5ad", "source_key": key},
+                inputs={
+                    "source_digest": self._sourceDigest,
+                    "cell_selection": cell_selection,
+                },
+                execution_options={"block_rows": block_rows},
+                required_arrays=tuple(requirements),
+            )
+            if planned.reused:
+                artifacts[key] = planned.ref
+                continue
+            group = start_artifact(self.root, planned)
+
+            def blocks() -> Iterator[MetadataBlock]:
+                for start in range(0, self.h5ad.nCells, block_rows):
+                    stop = min(start + block_rows, self.h5ad.nCells)
+                    values, missing = self._cluster_block(
+                        key,
+                        start,
+                        stop,
+                        dtype,
+                    )
+                    yield MetadataBlock(
+                        start,
+                        values,
+                        missing if has_missing else None,
+                    )
+
+            values = create_streamed_metadata_column(
+                group,
+                "values",
+                shape=self.h5ad.nCells,
+                dtype=dtype,
+                blocks=blocks(),
+                chunkSize=min(
+                    _DEFAULT_ANALYSIS_BLOCK_ROWS,
+                    max(1, self.h5ad.nCells),
+                ),
+                hasMissing=has_missing,
+                profile=self.profile,
+            )
+            if has_missing and values.attrs.get("missing_mask") != (
+                "__scarf_missing__values"
+            ):
+                raise RuntimeError("Cluster-label missing-mask link is malformed")
+            finish_artifact(group, planned)
+            artifacts[key] = planned.ref
+        return artifacts
 
     def _write_counts(self, batch_size: int | None = None) -> None:
         """Write cell-major ``counts`` only (profiling stage split helper)."""
@@ -1004,3 +1416,6 @@ class H5adToZarr:
             codes[indexes] = code
             columns[indexes] = np.arange(indexes.size, dtype=np.int64)
         return codes, columns
+
+
+__all__ = ["H5adImportResult", "H5adToZarr"]

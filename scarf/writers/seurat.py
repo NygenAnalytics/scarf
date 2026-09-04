@@ -1,4 +1,3 @@
-import re
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -20,6 +19,12 @@ from ..readers.seurat import (
     SeuratReduction,
 )
 from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.artifact_writer import (
+    ArrayRequirement,
+    finish_artifact,
+    plan_artifact,
+    start_artifact,
+)
 from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import StorageProfile, ZarrLocation
 from ..storage.refs import ArtifactRef
@@ -27,15 +32,6 @@ from ..storage.refs import ArtifactRef
 
 _RESERVED_METADATA_COLUMNS = frozenset({"I", "ids", "names"})
 _DEFAULT_BLOCK_ROWS = 65_536
-
-
-def _named_result_key(name: str) -> str:
-    normalized = re.sub(r"[^a-z0-9]+", "_", name.casefold()).strip("_")
-    if not normalized:
-        normalized = "imported_result"
-    elif not normalized[0].isalpha():
-        normalized = f"imported_{normalized}"
-    return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +42,7 @@ class SeuratImportResult:
         assayNames: Assay groups written to the destination store.
         defaultAssay: Active assay selected from the Seurat object.
         cellSelection: Artifact for the imported cell filter column.
+        activeIdentity: Imported Seurat active identity as immutable cluster labels.
         reductionArtifacts: Imported reductions keyed by result name.
         notices: Non-fatal import notices collected from the reader.
     """
@@ -53,6 +50,7 @@ class SeuratImportResult:
     assayNames: tuple[str, ...]
     defaultAssay: str
     cellSelection: ArtifactRef
+    activeIdentity: ArtifactRef
     reductionArtifacts: Mapping[str, ArtifactRef]
     notices: tuple[SeuratNotice, ...] = ()
 
@@ -65,7 +63,11 @@ class SeuratImportResult:
 
     @property
     def artifactRefs(self) -> tuple[ArtifactRef, ...]:
-        return (self.cellSelection, *self.reductionArtifacts.values())
+        return (
+            self.cellSelection,
+            self.activeIdentity,
+            *self.reductionArtifacts.values(),
+        )
 
 
 def _string_blocks(
@@ -163,14 +165,6 @@ class SeuratToZarr:
         reductions = tuple(
             reader.get_reduction(item.name) for item in inspection.reductions
         )
-        reduction_result_names = {
-            reduction.name: _named_result_key(reduction.name)
-            for reduction in reductions
-        }
-        if len(set(reduction_result_names.values())) != len(reduction_result_names):
-            raise ValueError(
-                "Selected reduction names collide after conversion to snake case"
-            )
         imported_assays = set(assay_names)
         missing_reduction_assays = tuple(
             reduction.name
@@ -243,7 +237,6 @@ class SeuratToZarr:
         self.defaultAssay = inspection.activeAssay
         self._assays = assays
         self._reductions = reductions
-        self._reductionResultNames = reduction_result_names
         self._activeIdentity = active_identity
         self._sourceDigest = source_digest
         self._notices = self._collect_notices(inspection.notices, assays, reductions)
@@ -381,6 +374,10 @@ class SeuratToZarr:
                     io=self.io,
                 )
             cell_selection = self._write_cell_selection()
+            active_identity = self._write_active_identity(
+                cell_selection,
+                metadata_rows,
+            )
             reduction_artifacts = self._write_reductions(
                 cell_selection,
                 requested_rows,
@@ -395,6 +392,7 @@ class SeuratToZarr:
             assayNames=self.assayNames,
             defaultAssay=self.defaultAssay,
             cellSelection=cell_selection,
+            activeIdentity=active_identity,
             reductionArtifacts=reduction_artifacts,
             notices=self._notices,
         )
@@ -422,11 +420,6 @@ class SeuratToZarr:
         )
         for column in self.reader.cellMetadata.columns:
             self._write_metadata_column(self.cellData, column, block_rows)
-        self._write_metadata_column(
-            self.cellData,
-            self._activeIdentity,
-            block_rows,
-        )
         for assay in self._assays:
             if assay.cellMembership.allIncluded:
                 continue
@@ -539,13 +532,15 @@ class SeuratToZarr:
         group: zarr.Group,
         column: SeuratMetadataColumn,
         block_rows: int,
+        *,
+        name: str | None = None,
     ) -> zarr.Array:
         from ..storage.arrays import create_streamed_metadata_column
 
         dtype = self._metadata_dtype(column, block_rows)
         output = create_streamed_metadata_column(
             group,
-            column.name,
+            column.name if name is None else name,
             shape=column.length,
             dtype=dtype,
             blocks=self._metadata_blocks(column, dtype, block_rows),
@@ -558,6 +553,55 @@ class SeuratToZarr:
             output.attrs["levels"] = list(column.levels)
             output.attrs["ordered"] = bool(column.ordered)
         return output
+
+    def _write_active_identity(
+        self,
+        cell_selection: ArtifactRef,
+        block_rows: int,
+    ) -> ArtifactRef:
+        """Store Seurat's analytical active identity without a live column."""
+        column = self._activeIdentity
+        dtype = self._metadata_dtype(column, block_rows)
+        missing_name = "__scarf_missing__values"
+        planned = plan_artifact(
+            self.root,
+            scope="assay",
+            assay=self.defaultAssay,
+            kind="cluster_labels",
+            operation="import_active_identity",
+            parameters={
+                "source": "seurat",
+                "source_key": "active.ident",
+                "levels": list(column.levels),
+                "ordered": bool(column.ordered),
+            },
+            inputs={
+                "source_digest": self._sourceDigest,
+                "cell_selection": cell_selection,
+            },
+            execution_options={"block_rows": block_rows},
+            required_arrays=(
+                ArrayRequirement("values", shape=(column.length,), dtype=dtype),
+                ArrayRequirement(
+                    missing_name,
+                    shape=(column.length,),
+                    dtype=bool,
+                ),
+            ),
+        )
+        if planned.reused:
+            return planned.ref
+        group = start_artifact(self.root, planned)
+        values = self._write_metadata_column(
+            group,
+            column,
+            block_rows,
+            name="values",
+        )
+        if values.attrs.get("missing_mask") != missing_name:
+            raise RuntimeError("Active identity missing-mask link is malformed")
+        finish_artifact(group, planned)
+        return planned.ref
 
     def _create_boolean_column(
         self,
@@ -832,9 +876,6 @@ class SeuratToZarr:
             parameters={"source": "seurat"},
             inputs={"source_digest": self._sourceDigest},
         )
-        included = self.cellData["I"]
-        included.attrs["source_artifact"] = ref.to_dict()
-        included.attrs["source_value"] = "values"
         return ref
 
     @staticmethod
@@ -974,9 +1015,6 @@ class SeuratToZarr:
                     payload_fingerprints={"values": coordinate_fingerprint},
                     source_cell_ids=self.reader.cellIds,
                     cell_selection=cell_selection,
-                    cell_key="I",
-                    cell_data=self.cellData,
-                    named_result=self._reductionResultNames[reduction.name],
                     block_rows=block_rows,
                 )
             else:
@@ -1038,7 +1076,6 @@ class SeuratToZarr:
                     payload_fingerprints=payload_fingerprints,
                     source_cell_ids=self.reader.cellIds,
                     cell_selection=cell_selection,
-                    cell_key="I",
                     loadings=loading_blocks,
                     loadings_shape=loading_shape,
                     loadings_dtype=loading_dtype,
@@ -1046,7 +1083,6 @@ class SeuratToZarr:
                     stdev=stdev_blocks,
                     stdev_shape=stdev_shape,
                     stdev_dtype=stdev_dtype,
-                    named_result=self._reductionResultNames[reduction.name],
                     block_rows=block_rows,
                 )
             artifacts[reduction.name] = ref

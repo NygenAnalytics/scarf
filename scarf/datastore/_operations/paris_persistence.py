@@ -10,8 +10,6 @@ from ...storage.arrays import create_zarr_dataset
 from ...storage.budget import ResourceBudget
 from ...storage.types import as_zarr_array, as_zarr_group
 
-PARIS_HIERARCHY_ROOT = "paris_hierarchy"
-LATEST_PARIS_GENERATION = "latest_paris_generation"
 _PARIS_HIERARCHY_ARRAYS = (
     "children",
     "heights",
@@ -32,10 +30,6 @@ _PARIS_PLATEAU_ARRAYS = (
 _MEMORY_HEADROOM = 1.35
 _CACHED_FIXED_TRANSIENT_BYTES_PER_CELL = 128
 _CACHED_ADAPTIVE_TRANSIENT_BYTES_PER_CELL = 96
-
-
-def generation_location(graph_loc: str, generation_id: str) -> str:
-    return f"{graph_loc}/{PARIS_HIERARCHY_ROOT}/{generation_id}"
 
 
 def _paris_memory_components(
@@ -152,18 +146,6 @@ def _zarr_array_nbytes(group: zarr.Group, name: str) -> int:
     return prod(values.shape) * np.dtype(values.dtype).itemsize
 
 
-def estimate_cached_paris_peak_bytes(
-    root: zarr.Group,
-    graph_loc: str,
-    generation_id: str,
-    cut_mode: Literal["adaptive", "fixed"],
-) -> int:
-    """Estimate hierarchy loading plus fixed or cached-adaptive cut buffers."""
-    location = generation_location(graph_loc, generation_id)
-    generation = as_zarr_group(root[location], name=location)
-    return estimate_hierarchy_group_peak_bytes(generation, cut_mode)
-
-
 def estimate_hierarchy_group_peak_bytes(
     generation: zarr.Group,
     cut_mode: Literal["adaptive", "fixed"],
@@ -236,24 +218,6 @@ def preflight_paris_fit(
         nthreads=budget.workers,
     )
     _raise_if_over_budget(estimate, budget, "Paris hierarchy fit")
-    return estimate
-
-
-def preflight_cached_paris_cut(
-    root: zarr.Group,
-    graph_loc: str,
-    generation_id: str,
-    cut_mode: Literal["adaptive", "fixed"],
-    budget: ResourceBudget,
-) -> int:
-    """Fail before loading a cached hierarchy and cut workspaces."""
-    estimate = estimate_cached_paris_peak_bytes(
-        root,
-        graph_loc,
-        generation_id,
-        cut_mode,
-    )
-    _raise_if_over_budget(estimate, budget, f"Cached Paris {cut_mode} cut")
     return estimate
 
 
@@ -348,19 +312,6 @@ def write_hierarchy_group(
 
 def _read_array(group: zarr.Group, name: str) -> np.ndarray:
     return np.asarray(as_zarr_array(group[name], name=name)[:])
-
-
-def load_hierarchy_generation(
-    root: zarr.Group,
-    graph_loc: str,
-    generation_id: str,
-) -> tuple[ParisHierarchy, PlateauForest]:
-    """Load and validate a completed hierarchy generation."""
-    location = generation_location(graph_loc, generation_id)
-    generation = as_zarr_group(root[location], name=location)
-    if generation.attrs.get("complete") is not True:
-        raise ValueError(f"Paris hierarchy generation {generation_id!r} is incomplete")
-    return load_hierarchy_group(generation, location)
 
 
 def load_hierarchy_group(

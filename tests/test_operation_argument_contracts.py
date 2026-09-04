@@ -10,7 +10,10 @@ import pytest
 
 from scarf.datastore import _operations as operations_package
 from scarf.datastore._operations.clustering import _ClusteringOperationsMixin
+from scarf.datastore._operations.embeddings import _EmbeddingOperationsMixin
+from scarf.datastore._operations.features import _FeatureOperationsMixin
 from scarf.datastore._operations.graph import _GraphOperationsMixin
+from scarf.datastore._operations.quality_control import _QualityControlOperationsMixin
 from scarf.datastore.datastore import DataStore
 from scarf.graph import arguments as graph_arguments
 from scarf.graph.arguments import OperationArguments
@@ -20,7 +23,6 @@ from scarf.metadata import arguments as metadata_arguments
 _SIGNATURE_REASONS = {
     "execution",
     "parent_stage",
-    "publication",
     "routing",
     "transformed",
 }
@@ -55,10 +57,6 @@ _CONTRACTS = (
     OperationContract(
         DataStore.build_ann_index,
         graph_arguments.AnnIndexArguments,
-        signature_only={
-            **_classified("routing", "from_assay"),
-            **_classified("publication", "update_state"),
-        },
         model_only={
             **_classified("derived", "parallel_threads"),
         },
@@ -66,10 +64,6 @@ _CONTRACTS = (
     OperationContract(
         DataStore.build_connectivity_map,
         graph_arguments.ConnectivityMapArguments,
-        signature_only={
-            **_classified("routing", "from_assay"),
-            **_classified("publication", "update_state"),
-        },
     ),
     OperationContract(
         DataStore.run_custom_reduction,
@@ -78,7 +72,6 @@ _CONTRACTS = (
         signature_only={
             **_classified("execution", "batch_size"),
             **_classified("execution", "local_cache"),
-            **_classified("routing", "from_assay"),
         },
         model_only={
             **_classified("resolved_input", "feature_scaling"),
@@ -97,28 +90,23 @@ _CONTRACTS = (
             "parent_stage",
             "custom_loadings",
             "dims",
-            "from_assay",
             "lsi_n_iter",
             "lsi_n_oversamples",
             "lsi_solver",
             "lsi_skip_first",
             "method",
-            "pca_cell_key",
+            "pca_cell_selection",
             "rand_state",
             "show_elbow_plot",
-            "update_state",
         ),
     ),
     OperationContract(
         DataStore.run_harmony,
         graph_arguments.HarmonyArguments,
+        constructor=_GraphOperationsMixin._run_harmony_artifact,
         aliases={"harmony_params": "harmony_parameters"},
-        signature_only={
-            **_classified("routing", "from_assay"),
-            **_classified("publication", "update_state"),
-        },
         model_only={
-            **_classified("resolved_input", "batch_values"),
+            **_classified("resolved_input", "batch_snapshot"),
             **_classified("algorithm_version", "algorithm_version"),
         },
     ),
@@ -128,17 +116,12 @@ _CONTRACTS = (
         constructor=_GraphOperationsMixin._run_reduction_artifact_impl,
         signature_only={
             **_classified("execution", "local_cache"),
-            **_classified("routing", "from_assay"),
         },
         model_only=_classified("resolved_input", "feature_scaling"),
     ),
     OperationContract(
         DataStore.query_neighbors,
         graph_arguments.NeighborQueryArguments,
-        signature_only={
-            **_classified("routing", "from_assay"),
-            **_classified("publication", "update_state"),
-        },
         model_only=_classified("derived", "distance_metric"),
     ),
     OperationContract(
@@ -148,7 +131,7 @@ _CONTRACTS = (
         model_only={
             **_classified(
                 "resolved_input",
-                "cell_selection",
+                "dataset_fingerprint",
             ),
             **_classified(
                 "derived",
@@ -163,12 +146,10 @@ _CONTRACTS = (
         constructor=_GraphOperationsMixin._run_reduction_artifact_impl,
         signature_only={
             **_classified("execution", "local_cache"),
-            **_classified("routing", "from_assay"),
         },
         model_only=_classified(
             "resolved_input",
             "feature_scaling",
-            "pca_cell_selection",
         ),
     ),
     OperationContract(
@@ -178,17 +159,13 @@ _CONTRACTS = (
             "features": "feature_selection",
             "net": "network_digest",
         },
-        model_only={
-            **_classified("algorithm_version", "algorithm_version"),
-            **_classified(
-                "resolved_input",
-                "cell_selection",
-            ),
-        },
+        signature_only=_classified("routing", "from_assay"),
+        model_only=_classified("algorithm_version", "algorithm_version"),
     ),
     OperationContract(
         DataStore.run_cell_cycle_scoring,
         metadata_arguments.CellCycleArguments,
+        constructor=_QualityControlOperationsMixin._run_cell_cycle_scoring_artifact,
         aliases={
             "g2m_genes": "g2m_gene_indices",
             "s_genes": "s_gene_indices",
@@ -199,41 +176,40 @@ _CONTRACTS = (
         )
         | _classified(
             "resolved_input",
-            "cell_selection",
             "feature_summary",
         ),
+        signature_only=_classified("routing", "from_assay"),
     ),
     OperationContract(
         DataStore.run_doublet_detection,
         metadata_arguments.DoubletScoreArguments,
+        constructor=_QualityControlOperationsMixin._run_doublet_detection_artifact,
         aliases={
-            "cluster_key": "clusters",
             "graph": "connectivity_map",
         },
+        signature_only=_classified("routing", "from_assay"),
         model_only=_classified("resolved_input", "neighbors"),
     ),
     OperationContract(
         DataStore.run_fate_mapping,
         metadata_arguments.FateMappingArguments,
-        aliases={"graph": "connectivity_map"},
         model_only=_classified(
             "resolved_input",
             "cell_selection",
-            "pseudotime",
-            "sink_labels",
+            "connectivity_map",
         ),
     ),
     OperationContract(
-        DataStore.mark_hto_identities,
+        DataStore.run_hto_demultiplexing,
         metadata_arguments.HtoIdentityArguments,
         model_only={
             **_classified("derived", "method"),
             **_classified(
                 "resolved_input",
-                "cell_selection",
                 "feature_ids_fingerprint",
             ),
         },
+        signature_only=_classified("routing", "from_assay"),
     ),
     OperationContract(
         DataStore.run_leiden_clustering,
@@ -243,18 +219,15 @@ _CONTRACTS = (
     OperationContract(
         DataStore.run_marker_search,
         metadata_arguments.MarkerTableArguments,
+        constructor=_FeatureOperationsMixin._run_marker_search_artifact,
         aliases={
             "features": "feature_selection",
             "norm_params": "normalization",
         },
-        signature_only={
-            **_classified("routing", "from_assay"),
-            **_classified("publication", "skip_save"),
-        },
+        signature_only=_classified("routing", "from_assay"),
         model_only=_classified(
             "resolved_input",
             "cell_selection",
-            "clusters",
             "normalization_method",
             "size_factor",
         )
@@ -277,15 +250,17 @@ _CONTRACTS = (
             **_classified(
                 "resolved_input",
                 "cell_selection",
-                "clusters",
             ),
             **_classified("derived", "decimals"),
-            **_classified("output", "output_key"),
         },
     ),
     OperationContract(
-        DataStore.mark_prevalent_peaks,
+        DataStore.select_prevalent_peaks,
         metadata_arguments.PrevalentPeakArguments,
+        signature_only={
+            **_classified("routing", "from_assay"),
+            **_classified("transformed", "cell_selection"),
+        },
         model_only={
             **_classified(
                 "resolved_input",
@@ -303,8 +278,10 @@ _CONTRACTS = (
         model_only=_classified(
             "resolved_input",
             "cell_selection",
+            "dataset_fingerprint",
+            "ordered_feature_ids_fingerprint",
+            "ordered_feature_names_fingerprint",
             "normalization_method",
-            "pseudotime",
             "size_factor",
         )
         | _classified("execution", "nthreads"),
@@ -319,8 +296,10 @@ _CONTRACTS = (
         model_only=_classified(
             "resolved_input",
             "cell_selection",
+            "dataset_fingerprint",
+            "ordered_feature_ids_fingerprint",
+            "ordered_feature_names_fingerprint",
             "normalization_method",
-            "pseudotime",
             "size_factor",
         )
         | _classified(
@@ -338,25 +317,25 @@ _CONTRACTS = (
         aliases={"graph": "connectivity_map"},
         signature_only=_classified(
             "transformed",
-            "source_sink_key",
             "ss_vec",
         ),
         model_only=_classified(
             "resolved_input",
             "cell_selection",
-            "source_sink",
         ),
     ),
     OperationContract(
         DataStore.smart_label,
         metadata_arguments.SmartLabelArguments,
+        aliases={
+            "base_label": "base_labels",
+            "to_relabel": "values",
+        },
         model_only={
             **_classified("algorithm_version", "algorithm_version"),
             **_classified(
                 "resolved_input",
-                "base_labels",
                 "cell_selection",
-                "values",
             ),
             **_classified("derived", "suffix_style"),
         },
@@ -367,25 +346,21 @@ _CONTRACTS = (
         model_only=_classified(
             "resolved_input",
             "cell_selection",
-            "clusters",
             "dendrogram",
         ),
     ),
     OperationContract(
         DataStore.run_statistical_testing,
         metadata_arguments.StatisticalTestingArguments,
-        aliases={
-            "group_by": "group_key",
-            "adjustment": "adjustment_method",
-        },
+        aliases={"adjustment": "adjustment_method"},
         signature_only={
             **_classified("transformed", "keys", "test", "study_design"),
-            **_classified("publication", "skip_save"),
+            **_classified("execution", "skip_save"),
         },
         model_only={
             **_classified(
                 "resolved_input",
-                "cell_selection",
+                "group_field",
                 "normalization_method",
                 "size_factor",
                 "source_dataset_fingerprint",
@@ -410,18 +385,13 @@ _CONTRACTS = (
     OperationContract(
         DataStore.run_tsne,
         metadata_arguments.TsneArguments,
-        aliases={
-            "ini_embed": "initialization",
-            "nthreads": "parallel_threads",
-        },
+        aliases={"nthreads": "parallel_threads"},
     ),
     OperationContract(
         DataStore.run_umap,
         metadata_arguments.UmapArguments,
-        aliases={
-            "ini_embed": "initialization",
-            "nthreads": "parallel_threads",
-        },
+        constructor=_EmbeddingOperationsMixin._run_umap_artifact,
+        aliases={"nthreads": "parallel_threads"},
     ),
     OperationContract(
         DataStore.run_waggr,
@@ -430,12 +400,9 @@ _CONTRACTS = (
             "features": "feature_selection",
             "net": "network_digest",
         },
+        signature_only=_classified("routing", "from_assay"),
         model_only={
             **_classified("algorithm_version", "algorithm_version"),
-            **_classified(
-                "resolved_input",
-                "cell_selection",
-            ),
             **_classified(
                 "derived",
                 "normalization_method",

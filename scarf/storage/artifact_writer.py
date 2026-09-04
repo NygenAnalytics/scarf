@@ -1,7 +1,9 @@
-from dataclasses import dataclass
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 import time
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import zarr
@@ -16,6 +18,51 @@ from .artifacts import (
     new_artifact_id,
     serialize_artifact_value,
 )
+
+
+type ArtifactPlanDisposition = Literal["created", "reused"]
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactPlanReceipt:
+    """One artifact planning decision observed by a pipeline stage."""
+
+    operation: str
+    ref: ArtifactRef
+    disposition: ArtifactPlanDisposition
+
+
+_PLAN_COLLECTORS: ContextVar[tuple[list[ArtifactPlanReceipt], ...]] = ContextVar(
+    "scarf_artifact_plan_collectors",
+    default=(),
+)
+
+
+@contextmanager
+def artifact_plan_scope() -> Any:
+    """Collect nested artifact planning decisions without changing producers."""
+
+    receipts: list[ArtifactPlanReceipt] = []
+    collectors = _PLAN_COLLECTORS.get()
+    token = _PLAN_COLLECTORS.set((*collectors, receipts))
+    try:
+        yield receipts
+    finally:
+        _PLAN_COLLECTORS.reset(token)
+
+
+def _record_plan(planned: "PlannedArtifact") -> "PlannedArtifact":
+    operation = planned.provenance.get("operation")
+    if not isinstance(operation, str) or not operation:
+        raise TypeError("Planned artifact operation must be a non-empty string")
+    receipt = ArtifactPlanReceipt(
+        operation=operation,
+        ref=planned.ref,
+        disposition="reused" if planned.reused else "created",
+    )
+    for collector in _PLAN_COLLECTORS.get():
+        collector.append(receipt)
+    return planned
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,14 +234,16 @@ def plan_artifact(
         reused = candidate
         break
     if reused is not None:
-        return PlannedArtifact(
-            ref=reused,
-            provenance=provenance,
-            execution_options=stored_execution_options,
-            reused=True,
-            required_arrays=required_arrays,
-            required_attributes=required_attributes,
-            reuse_validator=reuse_validator,
+        return _record_plan(
+            PlannedArtifact(
+                ref=reused,
+                provenance=provenance,
+                execution_options=stored_execution_options,
+                reused=True,
+                required_arrays=required_arrays,
+                required_attributes=required_attributes,
+                reuse_validator=reuse_validator,
+            )
         )
     while True:
         ref = ArtifactRef(
@@ -205,14 +254,16 @@ def plan_artifact(
         )
         if artifact_path(ref) not in root:
             break
-    return PlannedArtifact(
-        ref=ref,
-        provenance=provenance,
-        execution_options=stored_execution_options,
-        reused=False,
-        required_arrays=required_arrays,
-        required_attributes=required_attributes,
-        reuse_validator=reuse_validator,
+    return _record_plan(
+        PlannedArtifact(
+            ref=ref,
+            provenance=provenance,
+            execution_options=stored_execution_options,
+            reused=False,
+            required_arrays=required_arrays,
+            required_attributes=required_attributes,
+            reuse_validator=reuse_validator,
+        )
     )
 
 
@@ -223,6 +274,8 @@ def start_artifact(root: zarr.Group, planned: PlannedArtifact) -> zarr.Group:
     if path in root:
         raise FileExistsError(f"Artifact path already exists: {path}")
     group = root.create_group(path)
+    from .. import __version__
+
     group.attrs.update(
         {
             "artifact_id": planned.ref.artifact_id,
@@ -230,6 +283,7 @@ def start_artifact(root: zarr.Group, planned: PlannedArtifact) -> zarr.Group:
             "provenance": planned.provenance,
             "execution_options": planned.execution_options,
             "created_at_ns": time.time_ns(),
+            "scarf_version": __version__,
             "complete": False,
         }
     )

@@ -1,6 +1,6 @@
-from collections.abc import Generator, Mapping
+from collections.abc import Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import h5py
 import numpy as np
@@ -16,6 +16,7 @@ from ._h5ad_inspect import H5adInspectResult, _as_text, inspect_h5ad as inspect_
 # with a missingness mask.
 _CATEGORICAL_KEYS = frozenset({"codes", "categories"})
 _NULLABLE_KEYS = frozenset({"values", "mask"})
+type H5adEmbeddingRole = Literal["umap", "tsne"]
 
 
 def _column_encoding(node: h5py.Group) -> str:
@@ -66,6 +67,10 @@ class H5adReader:
         catNamesKey: Looks up this group and replaces the values in `var` and 'obs' child datasets with the
                      corresponding index value within this group.
         matrixDtype: dtype of the matrix containing the data (as indicated by matrix_key)
+        embedding_roles: Exact ``obsm`` keys to import as immutable UMAP or
+                         t-SNE artifacts.
+        cluster_keys: Exact ``obs`` keys to import as immutable cluster-label
+                      artifacts instead of raw cell metadata.
     """
 
     def __init__(
@@ -80,6 +85,8 @@ class H5adReader:
         obsm_attrs_key: str = "obsm",
         category_names_key: str = "__categories",
         dtype: str | None = None,
+        embedding_roles: Mapping[str, H5adEmbeddingRole] | None = None,
+        cluster_keys: Sequence[str] = (),
     ) -> None:
         self.h5adFn = h5ad_fn
         self.h5: h5py.File = h5py.File(h5ad_fn, mode="r")
@@ -111,6 +118,12 @@ class H5adReader:
         self.matrixDtype: Any = self.sourceMatrixDtype if dtype is None else dtype
         self.storageDtype: Any = self.matrixDtype
         self._dtypeOverridden = dtype is not None
+        try:
+            self.embeddingRoles = self._validate_embedding_roles(embedding_roles)
+            self.clusterKeys = self._validate_cluster_keys(cluster_keys)
+        except BaseException:
+            self.h5.close()
+            raise
 
     def _clone_kwargs(self) -> dict[str, Any]:
         return {
@@ -124,6 +137,8 @@ class H5adReader:
             "obsm_attrs_key": self.obsmAttrsKey,
             "category_names_key": self.catNamesKey,
             "dtype": self.matrixDtype if self._dtypeOverridden else None,
+            "embedding_roles": dict(self.embeddingRoles),
+            "cluster_keys": self.clusterKeys,
         }
 
     def open_clone(self) -> "H5adReader":
@@ -278,6 +293,105 @@ class H5adReader:
                 if self._check_exists(group, temp_key):
                     return temp_key
         return key
+
+    def _validate_embedding_roles(
+        self,
+        roles: Mapping[str, H5adEmbeddingRole] | None,
+    ) -> dict[str, H5adEmbeddingRole]:
+        if roles is None:
+            return {}
+        if not isinstance(roles, Mapping):
+            raise TypeError("embedding_roles must be a mapping")
+        resolved: dict[str, H5adEmbeddingRole] = {}
+        for raw_key, raw_role in roles.items():
+            if not isinstance(raw_key, str) or not raw_key:
+                raise ValueError("embedding_roles keys must be non-empty strings")
+            if raw_role not in {"umap", "tsne"}:
+                raise ValueError("embedding_roles values must be 'umap' or 'tsne'")
+            if not self._check_exists(self.obsmAttrsKey, raw_key):
+                raise KeyError(
+                    f"Embedding key {raw_key!r} was not found in {self.obsmAttrsKey}"
+                )
+            node = self.h5[self.obsmAttrsKey][raw_key]
+            if not isinstance(node, h5py.Dataset):
+                raise TypeError(f"Embedding key {raw_key!r} must be a dense H5AD array")
+            if node.ndim != 2 or node.shape[0] != self.nCells or node.shape[1] < 1:
+                raise ValueError(
+                    f"Embedding key {raw_key!r} has incompatible shape {node.shape}"
+                )
+            if np.dtype(node.dtype).kind not in "biuf":
+                raise TypeError(
+                    f"Embedding key {raw_key!r} must contain numeric values"
+                )
+            resolved[raw_key] = raw_role
+        return resolved
+
+    def _validate_cluster_keys(self, keys: Sequence[str]) -> tuple[str, ...]:
+        if isinstance(keys, str | bytes) or not isinstance(keys, Sequence):
+            raise TypeError("cluster_keys must be a sequence of column names")
+        resolved = tuple(keys)
+        if len(set(resolved)) != len(resolved):
+            raise ValueError("cluster_keys must be unique")
+        for key in resolved:
+            if not isinstance(key, str) or not key:
+                raise ValueError("cluster_keys must contain non-empty strings")
+            if key in {self.cellIdsKey, self.catNamesKey}:
+                raise ValueError(f"Cluster key {key!r} is reserved H5AD metadata")
+            if not self._check_exists(self.cellAttrsKey, key):
+                raise KeyError(
+                    f"Cluster key {key!r} was not found in {self.cellAttrsKey}"
+                )
+            cell_attrs = self.h5[self.cellAttrsKey]
+            if isinstance(cell_attrs, h5py.Dataset):
+                if cell_attrs.ndim != 1:
+                    raise TypeError(
+                        f"Cluster key {key!r} must contain one scalar value per cell"
+                    )
+                fields = cell_attrs.dtype.fields
+                if fields is None or key not in fields:
+                    raise TypeError(f"Cluster key {key!r} is not an H5AD column")
+                field_dtype = np.dtype(fields[key][0])
+                if field_dtype.subdtype is not None:
+                    raise TypeError(
+                        f"Cluster key {key!r} must contain one scalar value per cell; "
+                        f"found vector dtype {field_dtype}"
+                    )
+                length = int(cell_attrs.shape[0])
+                node: h5py.Dataset | h5py.Group | None = None
+            else:
+                node = cell_attrs[key]
+            if isinstance(node, h5py.Group) and not _is_decodable_column(node):
+                raise TypeError(
+                    f"Cluster key {key!r} uses unsupported H5AD encoding "
+                    f"{_column_encoding(node)!r}"
+                )
+            if node is not None and not isinstance(node, h5py.Dataset | h5py.Group):
+                raise TypeError(f"Cluster key {key!r} is not an H5AD column")
+            if isinstance(node, h5py.Dataset):
+                value_node = node
+            elif isinstance(node, h5py.Group):
+                value_node = node["codes" if "codes" in node else "values"]
+            else:
+                value_node = None
+            if value_node is not None:
+                if value_node.ndim != 1:
+                    raise TypeError(
+                        f"Cluster key {key!r} must contain one scalar value per cell"
+                    )
+                length = int(value_node.shape[0])
+            if length != self.nCells:
+                raise ValueError(
+                    f"Cluster key {key!r} has {length} rows; expected {self.nCells}"
+                )
+            if isinstance(node, h5py.Group) and _NULLABLE_KEYS.issubset(node.keys()):
+                if node["mask"].shape != node["values"].shape:
+                    raise ValueError(
+                        f"Cluster key {key!r} has a misaligned missingness mask"
+                    )
+            dtype = self._cell_column_value_dtype(key)
+            if dtype.kind not in "biufOSU":
+                raise TypeError(f"Cluster key {key!r} uses unsupported dtype {dtype}")
+        return resolved
 
     def _get_n(self, group: str) -> int:
         if self.groupCodes[group] == 0:
@@ -449,40 +563,126 @@ class H5adReader:
                     self._replace_category_values(values, i, group),
                 )
 
-    def _get_obsm_data(
-        self, group: str
-    ) -> Generator[tuple[str, np.ndarray], None, None]:
-        if self.groupCodes[group] == 2:
-            for i in iter_progress(
-                self.h5[group].keys(), desc=f"Reading attributes from group {group}"
-            ):
-                g = self.h5[group][i]
-                if not isinstance(g, h5py.Dataset):
-                    logger.warning(
-                        f"Skipping H5AD slot {i!r} because only dense "
-                        f"{group} arrays can be imported"
-                    )
-                    continue
-                if g.shape[0] != self.nCells:
-                    logger.warning(
-                        f"Skipping H5AD slot {i!r} with unexpected shape {g.shape}"
-                    )
-                    continue
-                for j in range(g.shape[1]):
-                    yield f"{i}{j + 1}", g[:, j]
+    def _legacy_category_values(self, group: str, key: str) -> np.ndarray | None:
+        if self.catNamesKey is not None and self._check_exists(group, self.catNamesKey):
+            category_group = self.h5[group][self.catNamesKey]
+            if isinstance(category_group, h5py.Group) and key in category_group:
+                return np.asarray(category_group[key][:])
+        if "uns" in self.h5 and key + "_categories" in self.h5["uns"]:
+            return np.asarray(self.h5["uns"][key + "_categories"][:])
+        return None
+
+    def _cell_column_value_dtype(self, key: str) -> np.dtype[Any]:
+        cell_attrs = self.h5[self.cellAttrsKey]
+        if isinstance(cell_attrs, h5py.Dataset):
+            categories = self._legacy_category_values(self.cellAttrsKey, key)
+            if categories is not None:
+                return np.dtype(categories.dtype)
+            fields = cell_attrs.dtype.fields
+            if fields is None or key not in fields:
+                raise KeyError(f"Cell column {key!r} was not found")
+            field_dtype: np.dtype[Any] = np.dtype(fields[key][0])
+            return field_dtype
+        node = cell_attrs[key]
+        if isinstance(node, h5py.Group):
+            value_name = "categories" if "categories" in node else "values"
+            resolved: np.dtype[Any] = np.dtype(node[value_name].dtype)
+            return resolved
+        categories = self._legacy_category_values(self.cellAttrsKey, key)
+        resolved = np.dtype(categories.dtype if categories is not None else node.dtype)
+        return resolved
+
+    def _cell_column_block(
+        self,
+        key: str,
+        start: int,
+        stop: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if start < 0 or stop < start or stop > self.nCells:
+            raise ValueError("H5AD cell-column block is outside the cell axis")
+        cell_attrs = self.h5[self.cellAttrsKey]
+        if isinstance(cell_attrs, h5py.Dataset):
+            values = np.asarray(cell_attrs.fields(key)[start:stop])
+            if values.ndim != 1:
+                raise TypeError(
+                    f"Cell column {key!r} must contain one scalar value per cell"
+                )
+            node: h5py.Group | h5py.Dataset | None = None
         else:
-            logger.warning(
-                "H5AD obsm is missing or has an unsupported format; "
-                "embeddings will be skipped"
+            node = cell_attrs[key]
+        if isinstance(node, h5py.Group):
+            if _CATEGORICAL_KEYS.issubset(node.keys()):
+                codes = np.asarray(node["codes"][start:stop])
+                categories = np.asarray(node["categories"][:])
+                valid = (codes >= 0) & (codes < len(categories))
+                values = np.empty(codes.shape, dtype=object)
+                values[valid] = categories[codes[valid]]
+                values[~valid] = None
+                return values, ~valid
+            if _NULLABLE_KEYS.issubset(node.keys()):
+                values = np.asarray(node["values"][start:stop])
+                missing = np.asarray(node["mask"][start:stop], dtype=bool)
+                if missing.shape != values.shape:
+                    raise ValueError(
+                        f"Cluster key {key!r} has a misaligned missingness mask"
+                    )
+                return values, missing
+            raise TypeError(
+                f"Cluster key {key!r} uses unsupported H5AD encoding "
+                f"{_column_encoding(node)!r}"
             )
 
+        if isinstance(node, h5py.Dataset):
+            values = np.asarray(node[start:stop])
+        legacy_categories = self._legacy_category_values(self.cellAttrsKey, key)
+        if legacy_categories is not None and np.issubdtype(values.dtype, np.integer):
+            valid = (values >= 0) & (values < len(legacy_categories))
+            decoded = np.empty(values.shape, dtype=object)
+            decoded[valid] = legacy_categories[values[valid]]
+            decoded[~valid] = None
+            return decoded, ~valid
+        missing = (
+            ~np.isfinite(values)
+            if values.dtype.kind in "fc"
+            else np.zeros(values.shape, dtype=bool)
+        )
+        return values, missing
+
+    def _cell_ids_block(self, start: int, stop: int) -> np.ndarray:
+        if self._check_exists(self.cellAttrsKey, self.cellIdsKey):
+            values, missing = self._cell_column_block(
+                self.cellIdsKey,
+                start,
+                stop,
+            )
+            if bool(missing.any()):
+                raise ValueError("H5AD cell IDs contain missing values")
+            return np.asarray(values)
+        return np.asarray([f"cell_{index}" for index in range(start, stop)])
+
+    def _obsm_array(self, key: str) -> h5py.Dataset:
+        node = self.h5[self.obsmAttrsKey][key]
+        if not isinstance(node, h5py.Dataset):
+            raise TypeError(f"Embedding key {key!r} is not a dense H5AD array")
+        return node
+
+    def _iter_obsm_blocks(
+        self,
+        key: str,
+        block_rows: int,
+        dtype: np.dtype[Any],
+    ) -> Iterator[np.ndarray]:
+        node = self._obsm_array(key)
+        for start in range(0, self.nCells, block_rows):
+            stop = min(start + block_rows, self.nCells)
+            yield np.asarray(node[start:stop], dtype=dtype)
+
     def get_cell_columns(self) -> Generator[tuple[str, np.ndarray], None, None]:
-        """Creates a Generator that yields the cell columns."""
+        """Yield raw ``obs`` metadata, excluding selected cluster artifacts."""
         for i, j in self._get_col_data(
-            self.cellAttrsKey, [self.cellIdsKey, self.catNamesKey]
+            self.cellAttrsKey,
+            [self.cellIdsKey, self.catNamesKey, *self.clusterKeys],
         ):
-            yield i, j
-        for i, j in self._get_obsm_data(self.obsmAttrsKey):
             yield i, j
 
     def get_feat_columns(self) -> Generator[tuple[str, np.ndarray], None, None]:

@@ -1,5 +1,5 @@
 ---
-description: Open or mount remote Scarf DataStores, tune cloud storage, and stage local scratch.
+description: Distinguish direct object-store access from mounted analysis targets and local scratch.
 jupytext:
   text_representation:
     extension: .md
@@ -14,67 +14,41 @@ kernelspec:
 
 (remote_stores)=
 
-# Working with remote stores
+# Remote stores and mounted analysis targets
 
-Scarf can open a Zarr store on object storage and run analysis without first copying the full matrix to local disk.
-Counts stream in tiles sized from your memory budget.
-Published remote object-store funnel timings are in {doc}`../concepts/benchmarks`; resource controls are in {doc}`../concepts/memory_and_execution`.
+Scarf supports Zarr stores on object storage, but this page does not execute against an
+object-store URI. Its executable section downloads a documentation dataset, then uses a local
+count source and a separate local analysis target to demonstrate mounted-store mechanics.
+
+Object-store snippets are explicitly non-executed templates. They show the supported API shape,
+not proof that a particular provider, URI, credential setup, or network path was exercised.
+Measured results from a separate fixed object-store workflow are in
+{doc}`../concepts/benchmarks`; resource controls are in
+{doc}`../concepts/memory_and_execution`.
 
 ## Prerequisites
 
 - Scarf installed with the `extra` optional dependencies
-- Credentials for your bucket (except for anonymous public reads)
+- Credentials for your bucket when adapting the non-executed templates
 - Enough local disk for optional `local_cache` scratch during reduction
 
 ## What you will learn
 
-- Open a public demo store on object storage without downloading it
-- Open `DataStore` on `s3://` or `gs://` with `storage_options`
-- Mount shared count matrices into a separate writable analysis store
-- Select the `cloud` storage profile
+- Distinguish direct object-store access from the local mechanics executed on this page
+- Mount a count source into a separate writable analysis target
+- Reopen a durable pipeline run from its mounted target
+- Adapt non-executed `s3://` and `gs://` templates for your environment
 - Stage normalized data locally for PCA with `local_cache`
-- Repack an older store with `scarf.tools.repack_zarr`
 
-## 1. Open the public demo store
+## 1. Executed example: download, then mount locally
 
-The `scarf_docs` Cytebase repository publishes one analyzed store unpacked, so you can open it directly instead of downloading an archive.
-`Repository.open_zarr` returns a read-only Zarr group; pass its store to `DataStore`.
+The defining property of a mounted datastore is the separation between its count source and its
+writable analysis target. The count source can be a local path or an object-store URI. The target
+stores copied metadata plus new artifacts, while count blocks continue to resolve from the source.
+Mounting does not by itself mean that either location is remote.
 
-```{code-cell} ipython3
-import scarf
-
-scarf.configure_output(level="ERROR", progress=True)
-
-repository = scarf.cytebase.connect('scarf_docs')
-remote_group = repository.open_zarr('tenx_5K_pbmc_rnaseq/data.zarr')
-
-ds = scarf.DataStore(remote_group.store, zarr_mode='r', nthreads=4)
-print(ds)
-```
-
-Opening a store over object storage costs many small metadata requests, so expect this step to take a few minutes on a home connection.
-Nothing but metadata is read until you touch the counts.
-The printed summary lists active cells, assays, and the cell and feature columns already present in the remote store.
-
-The published store predates the current artifact contract.
-Counts and literal metadata remain readable, including its UMAP columns and cluster partition, while legacy analysis state fails closed instead of being migrated silently.
-The next section mounts those count matrices and builds a current analysis chain in a separate target.
-
-```{code-cell} ipython3
-try:
-    ds.get_assay_state('RNA')
-except scarf.IncompatibleAnalysisStateError as error:
-    print('Legacy state rejected:', error.code)
-
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='RNA_clusters',
-)
-```
-
-## 2. Prepare and mount read-only counts
-
-Use `mount_datastore` when count matrices must remain in a shared source store, but each analysis needs its own writable store.
+Use `mount_datastore` when count matrices must remain in a shared source store, but each analysis
+needs its own writable target.
 Scarf copies cell and feature metadata into the target.
 Mount validates and reads primary `counts` for matrix identity.
 For RNA sources, the matching gene-major `countsT` copy must already be present on Zarr v3.
@@ -82,40 +56,36 @@ It is mounted with `counts` and is not rewritten into the target.
 Non-RNA assays have no `countsT`.
 New metadata and analysis artifacts are written only to the target.
 
-The public snapshot used here predates the required RNA `countsT` layout, so first repack it structurally into a temporary local count source.
-The repack streams from the public URI, creates the transpose, and leaves the remote source unchanged.
-Mounting that repacked source into a separate target then prevents copied legacy analysis state from becoming active.
+The code below downloads the documentation archive to a temporary local directory. It then mounts
+that local count source into a different local target. This verifies source resolution, target
+writes, pipeline execution, and reopening. It does not verify direct object-store analysis,
+credentials, or network performance.
 
 ```{code-cell} ipython3
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import numpy as np
+import scarf
 import zarr
 
-from scarf.tools.repack_zarr import repack_store
-
-source_uri = (
-    "hf://buckets/Nygen/cytebase/scarf_docs/"
-    "tenx_5K_pbmc_rnaseq/data.zarr"
-)
+scarf.configure_output(level="ERROR", progress=False)
+repository = scarf.cytebase.connect("scarf_docs")
 mount_directory = TemporaryDirectory()
-repacked_path = Path(mount_directory.name) / 'counts.zarr'
-target_path = Path(mount_directory.name) / 'analysis.zarr'
-
-repack_store(
-    source_uri,
-    str(repacked_path),
-    storage_options={"token": False},
-    nthreads=2,
+staged_dataset = repository.download_dataset(
+    'tenx_5K_pbmc_rnaseq',
+    destination=mount_directory.name,
+    zarr=True,
 )
+source_path = staged_dataset / 'data.zarr'
+target_path = Path(mount_directory.name) / 'analysis.zarr'
 ```
 
 The target path must not already exist:
 
 ```{code-cell} ipython3
 mounted = scarf.mount_datastore(
-    str(repacked_path),
+    str(source_path),
     at=str(target_path),
     default_assay='RNA',
     nthreads=4,
@@ -124,27 +94,25 @@ mounted = scarf.mount_datastore(
 matrix_source = zarr.open_group(str(target_path), mode='r').attrs['matrixSource']
 print('Target path:', target_path)
 print('Target exists:', target_path.exists())
-print('Original source URI:', source_uri)
+print('Downloaded dataset:', staged_dataset)
 print('Mounted count source:', matrix_source['location'])
 print('Mounted assays:', sorted(matrix_source['assays']))
 ```
 
-Counts and RNA `countsT` stay in the repacked count source.
+Counts and RNA `countsT` stay in the downloaded count source.
 Cell and feature metadata are copied once, while new analysis artifacts are written to the target.
-The printed `matrixSource` record is what later reopen uses to resolve the repacked counts.
+The printed `matrixSource` record is what later reopen uses to resolve those counts.
 
 ```{mermaid}
 flowchart LR
-    source["Read-only remote source<br/>legacy counts"]
-    repack["Temporary structural repack<br/>counts and RNA countsT"]
-    mount["Mounted DataStore"]
-    target["Writable target<br/>metadata and new artifacts"]
-    source -->|stream once| repack
-    repack -->|stream count blocks| mount
-    mount -->|write analysis results| target
+    source["Dataset archive"]
+    staged["Current local count source<br/>counts, RNA countsT, metadata"]
+    target["Separate local analysis target<br/>metadata and new artifacts"]
+    source -->|download once| staged
+    staged -->|mount count blocks| target
 ```
 
-The target assay has no physical count array, while `rawData` exposes the complete remote matrix:
+The target assay has no physical count array, while `rawData` exposes the complete mounted count matrix:
 
 ```{code-cell} ipython3
 target_root = zarr.open_group(str(target_path), mode='r')
@@ -153,49 +121,33 @@ print('Counts stored in target:', 'counts' in target_root['RNA'])
 print('Mounted shape:', mounted.RNA.rawData.shape)
 ```
 
-Run a complete graph and plotting checkpoint through the mount.
-Count blocks are read from the structurally repacked source.
-Normalized data, reductions, neighbours, graph, UMAP, and clusters are written only to the local target.
-Because that target is a local path, `local_cache` staging is skipped here; Section 4 makes the remote-only policy explicit and gives a writable-remote template.
+Run the standard RNA pipeline through the local mount. Count blocks are read from the separate
+local source, while the run record and its normalized data, reductions, graph, UMAP, and
+clusters are written only to the local target. Because that target is a local path, `local_cache`
+staging is skipped here; Section 3 makes that policy explicit.
 
 ```{code-cell} ipython3
-mounted_features = mounted.mark_hvgs(
-    min_cells=20,
-    top_n=500,
-    show_plot=False,
-    label='mounted_hvgs',
+mounted_run = mounted.pipeline.run(
+    filtering=False,
+    hvg_count=500,
+    pca_dims=15,
+    leiden={"partitions": [0.5]},
+    cell_cycle=False,
+    paris=False,
+    doublets=False,
+    markers=False,
 )
-normalized = mounted.run_normalization(features=mounted_features)
-pca = mounted.run_pca(normalized, dims=15)
-
-mounted.build_embedding_initialization(pca)
-ann_index = mounted.build_ann_index(pca)
-neighbors = mounted.query_neighbors(ann_index, k=11)
-graph = mounted.build_connectivity_map(neighbors)
-mounted.run_umap(
-    graph=graph,
-    n_epochs=100,
-    spread=5,
-    min_dist=1,
-    parallel=True,
-    label="mounted_UMAP",
-)
-mounted.run_leiden_clustering(
-    graph=graph,
-    resolution=0.5,
-    label="mounted_clusters",
-)
+normalized = mounted_run["normalized"]
+pca = mounted_run["pca"]
 ```
 
 ```{code-cell} ipython3
-mounted.plots.embedding(
-    layout_key="RNA_mounted_UMAP",
-    color_by="RNA_mounted_clusters",
-)
+mounted.plots.embedding(run=mounted_run, color_by="clusters")
 ```
 
-The populated embedding demonstrates that mounted counts behave like a normal datastore input.
-The target remains much smaller than a dense local copy of the source matrix:
+The populated embedding demonstrates that supported analysis can read counts from a separate
+mounted source. The size calculation compares only the writable target with the dense logical
+size of the counts. It excludes the downloaded source and is not a remote-storage benchmark.
 
 ```{code-cell} ipython3
 target_bytes = sum(
@@ -219,15 +171,35 @@ reopened = scarf.DataStore(
     str(target_path),
     nthreads=4,
 )
+reopened_run = reopened.pipeline.open(run_id=mounted_run.run_id)
 same_counts = np.array_equal(
     reopened.RNA.rawData[:20, :20].compute(),
     mounted.RNA.rawData[:20, :20].compute(),
 )
 print('Counts still resolve:', same_counts)
-print('Normalization complete:', reopened.inspect_artifact(normalized).complete)
+print('Reopened pipeline status:', reopened_run.status)
+print(
+    'Normalization complete:',
+    reopened.inspect_artifact(reopened_run['normalized']).complete,
+)
 ```
 
-For a current S3 or GCS source with a complete RNA `countsT`, pass the URI directly and keep the target local:
+The mount records matrix shape, dtype, and source identity. Reopening fails if the source no
+longer matches that identity. Metadata is copied at mount time, so later source metadata changes
+are not synchronized into the target.
+
+## 2. Non-executed object-store templates
+
+Nothing in this section is executed by the documentation build. These snippets illustrate how to
+supply a URI and storage options after you have verified the provider, credentials, permissions,
+and store layout in your own environment. They provide no performance or compatibility result for
+the placeholder locations.
+
+### Mount an object-store count source
+
+A mounted analysis can keep shared counts at an object-store URI while writing metadata and
+artifacts to a local target. This is the remote form of the source/target separation demonstrated
+locally in Section 1:
 
 ```python
 mounted = scarf.mount_datastore(
@@ -238,38 +210,35 @@ mounted = scarf.mount_datastore(
 )
 ```
 
-The mount records matrix shape, dtype, and source identity.
-Reopening fails if the source no longer matches that identity.
-Metadata is copied at mount time, so later source metadata changes are not synchronized into the target.
+The source must remain available at the recorded URI whenever the target is opened. For RNA, the
+source must contain its matching current-layout `countsT` array.
 
-## 3. Open your own remote store
+### Open a datastore directly
 
-Pass the URI as `zarr_loc` and any fsspec/obstore options as `storage_options`.
-Use `zarrProfile="cloud"` when writing new arrays so they use the cloud compression profile.
-Existing arrays keep the physical layout chosen when they were created.
-
-Anonymous read-only example against your own public bucket:
+Pass an object-store URI as `zarr_loc` and provider options as `storage_options`. This anonymous
+S3 shape is a template, not a tested public dataset:
 
 ```python
 import scarf
 
 ds = scarf.DataStore(
-    "s3://example-bucket/path/to/data.zarr",
+    "s3://bucket/path/to/data.zarr",
     zarr_mode="r",
-    zarrProfile="cloud",
     storage_options={"skip_signature": True},
     mem_budget="16G",
     nthreads=8,
 )
 ```
 
-Credentialed read-write template (do not embed secrets in notebooks):
+For a writable remote store, use the `cloud` profile for newly written arrays. Existing arrays
+retain the layout chosen when they were created. Read credentials from the environment rather
+than embedding secrets in notebooks:
 
 ```python
 import os
 import scarf
 
-ds = scarf.DataStore(
+remote_writable = scarf.DataStore(
     "s3://my-bucket/project/data.zarr",
     zarr_mode="r+",
     zarrProfile="cloud",
@@ -284,11 +253,13 @@ ds = scarf.DataStore(
 ```
 
 Google Cloud Storage uses a `gs://` URI.
-Pass the provider options your environment already uses for obstore/fsspec (for example application-default credentials on the VM, or an explicit token in `storage_options`).
+Pass the provider options your environment already uses for obstore or fsspec, such as
+application-default credentials on the VM or an explicit token in `storage_options`.
 
-After open, call the same analysis APIs as on a local store: `ds.pipeline.run(...)` or the individual graph-construction methods.
+After a successful open in your environment, the same analysis APIs are available as for a local
+store. This page does not execute that step.
 
-## 4. Local scratch for reductions
+## 3. Local scratch for reductions
 
 PCA fitting and score projection make multiple passes over normalized expression.
 `local_cache` stages that normalized artifact to local disk when the *DataStore location* is remote (object-storage URI or non-local backend).
@@ -307,16 +278,12 @@ The mounted target in this page is local, so normalized artifacts already live o
 This executable checkpoint makes that distinction explicit:
 
 ```{code-cell} ipython3
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
 scratch_directory = TemporaryDirectory()
 scratch_dir = Path(scratch_directory.name) / 'pca_scratch'
 pca_without_staging = mounted.run_pca(
     normalized,
     dims=15,
     local_cache=str(scratch_dir),
-    update_state=False,
 )
 staged_bytes = sum(
     path.stat().st_size for path in scratch_dir.rglob('*') if path.is_file()
@@ -327,24 +294,24 @@ print('Local cache present after PCA:', scratch_dir.exists())
 print('Reduction reused:', pca_without_staging == pca)
 ```
 
-On your own writable remote store, the same path-string policy stages normalized blocks and keeps the cache for inspection or reuse:
+For a writable remote store opened from the non-executed template above, the same path-string
+policy stages normalized blocks and keeps the cache for inspection or reuse. The following is
+also a non-executed template:
 
 ```python
-features = remote_writable.mark_hvgs(
+cell_selection = remote_writable.snapshot_cell_selection(cell_key="I")
+features = remote_writable.select_hvgs(
+    cell_selection,
     min_cells=20,
     top_n=2000,
     show_plot=False,
 )
-normalized = remote_writable.run_normalization(features=features)
+normalized = remote_writable.run_normalization(cell_selection, features)
 reduction = remote_writable.run_pca(
     normalized,
     dims=15,
     local_cache="/tmp/scarf_pca_scratch",
 )
-remote_writable.build_embedding_initialization(reduction)
-ann_index = remote_writable.build_ann_index(reduction)
-neighbors = remote_writable.query_neighbors(ann_index, k=11)
-remote_writable.build_connectivity_map(neighbors)
 ```
 
 `local_cache` is an execution option.
@@ -354,31 +321,15 @@ A path-string cache is kept for reuse or inspection.
 
 Plan local disk for float32 dense blocks roughly as `n_cells × n_features × 4` bytes (about 8 GiB for 1M cells × 2000 HVGs).
 
-## 5. Honest performance expectations
+## 4. Performance evidence and expectations
 
-Gene-wise stages and small metadata opens feel remote latency most.
-Remote-first analysis is still useful for shared stores; download-then-analyze remains available when you need local disk performance.
-Published remote object-store funnel timings and caveats are in {doc}`../concepts/benchmarks`.
+Do not infer object-store performance from this page's executable local mount. A separate fixed
+workflow measured Scarf against S3-compatible object storage in a recorded cloud environment; its
+timings, memory observations, and limits are in {doc}`../concepts/benchmarks`. Those measurements
+do not compare remote with local storage.
+
+Object-store latency, request costs, credentials, and provider behavior remain environment
+specific. Downloading first is still available when a local workflow better fits those constraints.
 Resource planning controls are in {doc}`../concepts/memory_and_execution`.
-
-## 6. Repack older stores
-
-New Scarf writers emit Zarr v3.
-An RNA store that predates the paired `counts` / `countsT` layout, or that is still Zarr v2, will not open as an RNA assay.
-Repack writes a new store with the current layout and storage profile, locally or on object storage:
-
-```bash
-uv run python -m scarf.tools.repack_zarr \
-  s3://bucket/input.zarr s3://bucket/output.zarr \
-  --profile cloud \
-  --mem-budget 8G \
-  --storage-options '{"skip_signature": true}'
-```
-
-Paths stay as URIs (do not pass them through `pathlib.Path`).
-Use `--storage-options` for backend credentials or public reads (`skip_signature` for anonymous S3/GCS).
-Point `DataStore` at the output URI afterward.
-Repacking rewrites physical layout; it is not an analysis step.
-After a rewrite, recompute HVG, normalization, PCA, graph, and marker results rather than resuming them from the input store.
 
 For custom statistics over mounted graphs or count blocks, followed by a supported selective export, continue with {doc}`custom_analyses`.

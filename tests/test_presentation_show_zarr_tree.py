@@ -11,13 +11,13 @@ from scipy.sparse import csr_matrix
 from zarr.storage import MemoryStore
 
 from scarf.datastore._operations.presentation import _PresentationOperationsMixin
-from scarf.graph.state import GraphSelection
 from scarf.storage.artifacts import (
     ArtifactRef,
     artifact_path,
     make_provenance,
     new_artifact_id,
 )
+from scarf.storage.selections import resolve_selection_artifact
 
 
 class _PresentationStore(_PresentationOperationsMixin):
@@ -62,6 +62,7 @@ def _write_complete_artifact(
     assay: str | None = "RNA",
     inputs: dict[str, object] | None = None,
     arrays: dict[str, np.ndarray] | None = None,
+    operation: str | None = None,
 ) -> ArtifactRef:
     ref = ArtifactRef(
         scope="assay" if assay is not None else "datastore",
@@ -75,7 +76,7 @@ def _write_complete_artifact(
             "artifact_id": ref.artifact_id,
             "kind": kind,
             "provenance": make_provenance(
-                operation=f"test_{kind}",
+                operation=operation or f"test_{kind}",
                 parameters={},
                 inputs=inputs or {},
             ),
@@ -88,23 +89,52 @@ def _write_complete_artifact(
     return ref
 
 
+def _write_cell_selection(
+    root: zarr.Group,
+    values: np.ndarray,
+    *,
+    operation: str = "test_cell_selection",
+) -> ArtifactRef:
+    if "cellData" not in root:
+        cell_data = root.create_group("cellData")
+        cell_data.create_array(
+            "ids",
+            data=np.asarray([f"cell_{index}" for index in range(len(values))]),
+        )
+    cell_data = root["cellData"]
+    return resolve_selection_artifact(
+        root,
+        scope="datastore",
+        kind="cell_selection",
+        values=np.asarray(values, dtype=bool),
+        row_ids=np.asarray(cell_data["ids"][:]),
+        operation=operation,
+        parameters={},
+        inputs={},
+        source_column="I",
+    )
+
+
 def _patch_graph_resolution(
     monkeypatch: pytest.MonkeyPatch,
     graph_ref: ArtifactRef,
     *,
-    cell_key: str = "I",
+    selection: ArtifactRef | None = None,
 ) -> None:
+    selection_ref = selection or ArtifactRef(
+        scope="datastore",
+        kind="cell_selection",
+        artifact_id="0" * 64,
+    )
     monkeypatch.setattr(
-        "scarf.datastore._operations.presentation.resolve_graph_selection",
-        Mock(
-            return_value=GraphSelection(
-                graph_loc=artifact_path(graph_ref),
-                graph_ref=graph_ref,
-                from_assay="RNA",
-                cell_key=cell_key,
-                integrated_label=None,
-            )
+        "scarf.datastore._operations.presentation.resolve_graph_source_assay",
+        lambda _root, graph, requested, **_kwargs: (
+            requested or "RNA" if graph == graph_ref else "RNA"
         ),
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.presentation.graph_cell_selection",
+        lambda _root, graph: selection_ref if graph == graph_ref else None,
     )
 
 
@@ -240,28 +270,29 @@ def test_membership_strength_rejects_a_different_graph_selection(
 ) -> None:
     store, _backing = _presentation_store()
     graph_ref = _write_complete_artifact(store.zw, "connectivity_map")
-    requested = ArtifactRef(
-        scope="datastore",
-        kind="cell_selection",
-        artifact_id="1" * 64,
+    graph_selection = _write_cell_selection(
+        store.zw,
+        np.asarray([True, True]),
+        operation="graph_selection",
     )
-    graph_selection = ArtifactRef(
-        scope="datastore",
-        kind="cell_selection",
-        artifact_id="2" * 64,
+    cluster_selection = _write_cell_selection(
+        store.zw,
+        np.asarray([True, True]),
+        operation="cluster_selection",
+    )
+    clusters = _write_complete_artifact(
+        store.zw,
+        "cluster_labels",
+        inputs={"cell_selection": cluster_selection},
+        arrays={"values": np.asarray([0, 1])},
     )
     store._get_graph_ncells_k = Mock(return_value=(2, 1))
-    store._ensure_cell_selection = Mock(return_value=requested)
-    store._graph_cell_selection = Mock(return_value=graph_selection)
-    store._selection_artifacts_match = Mock(return_value=False)
-    _patch_graph_resolution(monkeypatch, graph_ref)
+    _patch_graph_resolution(monkeypatch, graph_ref, selection=graph_selection)
 
-    with pytest.raises(ValueError, match="cell_key does not match"):
+    with pytest.raises(ValueError, match="do not match"):
         store.calc_membership_strength(
-            "clusters",
-            graph=graph_ref,
-            from_assay="RNA",
-            cell_key="I",
+            clusters,
+            graph_ref,
         )
 
 
@@ -286,126 +317,92 @@ def test_membership_strength_validates_artifact_edge_layout(
         "connectivity_map",
         arrays={"edges": edges},
     )
-    selection = ArtifactRef(
-        scope="datastore",
-        kind="cell_selection",
-        artifact_id="3" * 64,
+    selection = _write_cell_selection(
+        store.zw,
+        np.asarray([True, True]),
     )
-    result = ArtifactRef(
-        scope="assay",
-        assay="RNA",
-        kind="membership_strength",
-        artifact_id="4" * 64,
+    clusters = _write_complete_artifact(
+        store.zw,
+        "cluster_labels",
+        inputs={"cell_selection": selection},
+        arrays={"values": np.asarray([0, 1])},
     )
     store._get_graph_ncells_k = Mock(return_value=(2, 1))
-    store._ensure_cell_selection = Mock(return_value=selection)
-    store._graph_cell_selection = Mock(return_value=selection)
-    store._selection_artifacts_match = Mock(return_value=True)
-    store._resolve_cell_data_provenance_input = Mock(return_value=selection)
-    store.cells = SimpleNamespace(fetch=Mock(return_value=np.asarray([0, 1])))
-    _patch_graph_resolution(monkeypatch, graph_ref)
-    monkeypatch.setattr(
-        "scarf.datastore._operations.presentation.plan_cell_data_artifact",
-        Mock(return_value=SimpleNamespace(ref=result, reused=False)),
-    )
-    monkeypatch.setattr(
-        "scarf.datastore._operations.presentation.column_display",
-        Mock(return_value=None),
-    )
+    _patch_graph_resolution(monkeypatch, graph_ref, selection=selection)
 
     with pytest.raises(ValueError, match=message):
         store.calc_membership_strength(
-            "clusters",
-            graph=graph_ref,
-            from_assay="RNA",
-            cell_key="I",
+            clusters,
+            graph_ref,
         )
 
 
-def test_membership_strength_reuses_values_and_display_contract(
+def test_membership_strength_returns_and_reuses_an_artifact_without_columns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store, _backing = _presentation_store()
-    graph_ref = _write_complete_artifact(store.zw, "connectivity_map")
-    selection = ArtifactRef(
-        scope="datastore",
-        kind="cell_selection",
-        artifact_id="5" * 64,
+    graph_ref = _write_complete_artifact(
+        store.zw,
+        "connectivity_map",
+        arrays={"edges": np.asarray([[0, 1], [1, 0]], dtype=np.uint32)},
     )
-    result = ArtifactRef(
-        scope="assay",
-        assay="RNA",
-        kind="membership_strength",
-        artifact_id="6" * 64,
+    selection = _write_cell_selection(
+        store.zw,
+        np.asarray([True, True]),
     )
-    result_group = store.zw.create_group(artifact_path(result))
-    result_group.create_array(
-        "values",
-        data=np.asarray([0.5, 1.0], dtype=np.float32),
+    clusters = _write_complete_artifact(
+        store.zw,
+        "cluster_labels",
+        inputs={"cell_selection": selection},
+        arrays={"values": np.asarray([0, 1])},
     )
     store._get_graph_ncells_k = Mock(return_value=(2, 1))
-    store._ensure_cell_selection = Mock(return_value=selection)
-    store._graph_cell_selection = Mock(return_value=selection)
-    store._selection_artifacts_match = Mock(return_value=True)
-    store._resolve_cell_data_provenance_input = Mock(return_value=selection)
-    insert = Mock()
-    store.cells = SimpleNamespace(insert=insert)
-    link = Mock()
-    _patch_graph_resolution(monkeypatch, graph_ref)
-    monkeypatch.setattr(
-        "scarf.datastore._operations.presentation.plan_cell_data_artifact",
-        Mock(return_value=SimpleNamespace(ref=result, reused=True)),
-    )
-    monkeypatch.setattr(
-        "scarf.datastore._operations.presentation.column_display",
-        Mock(return_value={"palette": "preserved"}),
-    )
-    monkeypatch.setattr(
-        "scarf.datastore._operations.presentation.link_cell_data_column",
-        link,
-    )
+    _patch_graph_resolution(monkeypatch, graph_ref, selection=selection)
 
-    assert (
-        store.calc_membership_strength(
-            "clusters",
-            graph=graph_ref,
-            from_assay="RNA",
-            cell_key="I",
-        )
-        is None
-    )
+    first = store.calc_membership_strength(clusters, graph_ref)
+    second = store.calc_membership_strength(clusters, graph_ref)
 
-    inserted = insert.call_args.args[1]
-    np.testing.assert_allclose(inserted, [0.5, 1.0])
-    assert link.call_args.kwargs["preserved_display"] == {"palette": "preserved"}
-    assert link.call_args.kwargs["default_display"]["minimum"] == 0.0
-    assert link.call_args.kwargs["default_display"]["maximum"] == 1.0
+    assert first == second
+    assert first.kind == "membership_strength"
+    np.testing.assert_allclose(store.zw[artifact_path(first)]["values"][:], [1.0, 1.0])
+    assert set(store.zw["cellData"].array_keys()) == {"ids"}
 
 
-def test_smart_label_handles_empty_and_unmatched_base_labels() -> None:
+def test_smart_label_returns_an_artifact_and_handles_unmatched_base_labels() -> None:
     store, _backing = _presentation_store()
-    store.cells = SimpleNamespace(fetch=Mock(return_value=np.asarray([])))
-    assert store.smart_label("clusters", "base") == []
-    with pytest.raises(ValueError, match="selects no cells"):
-        store.smart_label("clusters", "base", new_col_name="labels")
+    selection = _write_cell_selection(store.zw, np.asarray([True, True, True]))
+    clusters = _write_complete_artifact(
+        store.zw,
+        "cluster_labels",
+        assay=None,
+        inputs={"cell_selection": selection},
+        arrays={"values": np.asarray(["a", "a", "a"])},
+    )
+    base = _write_complete_artifact(
+        store.zw,
+        "hto_identity",
+        assay=None,
+        inputs={"cell_selection": selection},
+        arrays={"values": np.asarray(["X", "X", "Y"])},
+    )
 
-    values = {
-        "clusters": np.asarray(["a", "a", "a"]),
-        "base": np.asarray(["X", "X", "Y"]),
-    }
-    store.cells = SimpleNamespace(fetch=lambda name, **_kwargs: values[name])
-    assert store.smart_label("clusters", "base") == ["X-Ya", "X-Ya", "X-Ya"]
+    first = store.smart_label(clusters, base)
+    second = store.smart_label(clusters, base)
+
+    assert first == second
+    assert first.kind == "smart_label"
+    assert store.zw[artifact_path(first)]["values"][:].tolist() == [
+        "X-Ya",
+        "X-Ya",
+        "X-Ya",
+    ]
+    assert set(store.zw["cellData"].array_keys()) == {"ids"}
 
 
 def test_prepare_cluster_tree_rejects_unresolved_inputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store, _backing = _presentation_store()
-    with pytest.raises(ValueError, match="provide a value for `cluster_key`"):
-        store._prepare_cluster_tree()
-
-    cell_data = store.zw.create_group("cellData")
-    cell_data.create_array("clusters", data=np.asarray([0, 1]))
     graph_ref = ArtifactRef(
         scope="assay",
         assay="RNA",
@@ -413,17 +410,23 @@ def test_prepare_cluster_tree_rejects_unresolved_inputs(
         artifact_id="7" * 64,
     )
     _patch_graph_resolution(monkeypatch, graph_ref)
-    with pytest.raises(ValueError, match="no source artifact"):
-        store._prepare_cluster_tree(graph=graph_ref, cluster_key="clusters")
+    with pytest.raises(TypeError, match="clusters must be an ArtifactRef"):
+        store._prepare_cluster_tree(
+            graph=graph_ref,
+            clusters="clusters",
+        )
+    wrong_clusters = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="cluster_labels",
+        artifact_id="6" * 64,
+    )
+    with pytest.raises(ValueError, match="cluster_cut artifact"):
+        store._prepare_cluster_tree(graph=graph_ref, clusters=wrong_clusters)
 
 
 def test_artifact_cluster_tree_requires_cut_and_hierarchy_provenance() -> None:
     store, _backing = _presentation_store()
-    cell_data = store.zw.create_group("cellData")
-    cluster_column = cell_data.create_array(
-        "clusters",
-        data=np.asarray([0, 1]),
-    )
     graph_ref = ArtifactRef(
         scope="assay",
         assay="RNA",
@@ -431,12 +434,17 @@ def test_artifact_cluster_tree_requires_cut_and_hierarchy_provenance() -> None:
         artifact_id="8" * 64,
     )
 
-    with pytest.raises(ValueError, match="no source artifact"):
+    wrong_clusters = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="cluster_labels",
+        artifact_id="9" * 64,
+    )
+    with pytest.raises(ValueError, match="cluster_cut artifact"):
         store._prepare_artifact_cluster_tree(
             graph_ref=graph_ref,
+            clusters_ref=wrong_clusters,
             from_assay="RNA",
-            cell_key="I",
-            cluster_key="clusters",
             fill_by_value=None,
             invalidate_cache=False,
         )
@@ -446,14 +454,13 @@ def test_artifact_cluster_tree_requires_cut_and_hierarchy_provenance() -> None:
         "cluster_cut",
         inputs={"connectivity_map": graph_ref},
         arrays={"labels": np.asarray([0, 1])},
+        operation="cut_paris_hierarchy",
     )
-    cluster_column.attrs["source_artifact"] = cut_ref.to_dict()
     with pytest.raises(ValueError, match="no hierarchy input"):
         store._prepare_artifact_cluster_tree(
             graph_ref=graph_ref,
+            clusters_ref=cut_ref,
             from_assay="RNA",
-            cell_key="I",
-            cluster_key="clusters",
             fill_by_value=None,
             invalidate_cache=False,
         )

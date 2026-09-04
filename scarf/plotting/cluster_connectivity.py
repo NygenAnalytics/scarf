@@ -7,10 +7,12 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 
-from ..graph.state import GraphSelection, resolve_graph_selection
-from ..storage.artifacts import ArtifactRef
+from ..graph.feature_projection import graph_cell_selection
+from ..storage.artifacts import ArtifactRef, inspect_artifact
+from ..storage.selections import validate_stored_selection_live_alias
 from ._contracts import CategoricalScale, PlotProvenance, SizeScale
 from ._deps import require_matplotlib
+from ._data import _resolve_grouping, _resolve_layout
 from ._display import resolve_categorical_scale
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
 from ._style import (
@@ -201,12 +203,10 @@ def _load_graph(
     store: Any,
     *,
     n_cells: int,
-    selection: GraphSelection,
+    graph: ArtifactRef,
 ) -> sparse.csr_matrix:
     graph_matrix = store.load_graph(
-        selection.graph_ref,
-        from_assay=selection.from_assay,
-        cell_key=selection.cell_key,
+        graph,
         symmetric=True,
     )
     if not sparse.issparse(graph_matrix):
@@ -355,11 +355,12 @@ def _axis_limits(
 def cluster_connectivity(
     store: Any,
     *,
-    group_by: str,
-    layout_key: str,
-    graph: ArtifactRef | None = None,
-    cell_key: str | None = None,
-    from_assay: str | None = None,
+    group_by: str | None = None,
+    layout_key: str | None = None,
+    groups: ArtifactRef | None = None,
+    layout: ArtifactRef | None = None,
+    graph: ArtifactRef,
+    cell_key: str = "I",
     position: Literal["median", "mean"] = "median",
     positions: Mapping[Any, tuple[float, float]] | None = None,
     categorical_scale: CategoricalScale | None = None,
@@ -419,27 +420,81 @@ def cluster_connectivity(
             "edge_width_range must be finite and satisfy 0 <= minimum <= maximum"
         )
 
-    selection = resolve_graph_selection(
-        store,
-        graph,
-        from_assay=from_assay,
-        cell_key=cell_key,
-    )
-    x, y, groups = _fetch_inputs(
-        store,
-        group_by=group_by,
-        layout_key=layout_key,
-        cell_key=selection.cell_key,
-    )
-    categorical_scale = resolve_categorical_scale(
-        store,
-        group_by,
-        categorical_scale,
-    )
+    if not isinstance(graph, ArtifactRef):
+        raise TypeError("graph must be an ArtifactRef")
+    selection = graph_cell_selection(store.zw, graph)
+    uses_artifacts = groups is not None or layout is not None
+    uses_live_metadata = group_by is not None or layout_key is not None
+    if uses_artifacts and uses_live_metadata:
+        raise ValueError(
+            "Use groups and layout together, or group_by and layout_key together"
+        )
+    if uses_artifacts:
+        if groups is None or layout is None:
+            raise ValueError("groups and layout must be provided together")
+        if cell_key != "I":
+            raise ValueError(
+                "cell_key cannot override artifacts' stored cell selection"
+            )
+        if layout.assay != graph.assay:
+            raise ValueError("layout and graph must belong to the same assay")
+        if groups.assay is not None and groups.assay != graph.assay:
+            raise ValueError("groups and graph must belong to the same assay")
+        coordinates, cell_indices, layout_selection = _resolve_layout(store, layout)
+        _, group_indices, group_values = _resolve_grouping(
+            store,
+            group_by=None,
+            groups=groups,
+            cell_key="I",
+        )
+        group_status = inspect_artifact(store.zw, groups)
+        raw_group_selection = (group_status.inputs or {}).get("cell_selection")
+        if not isinstance(raw_group_selection, Mapping):
+            raise ValueError("Grouping artifact has no cell-selection input")
+        try:
+            group_selection = ArtifactRef.from_dict(raw_group_selection)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "Grouping artifact has an invalid cell-selection input"
+            ) from exc
+        if layout_selection != selection or group_selection != selection:
+            raise ValueError(
+                "graph, groups, and layout must share the same cell selection"
+            )
+        if not np.array_equal(cell_indices, group_indices):
+            raise ValueError("groups and layout select cells in a different order")
+        x = coordinates[:, 0]
+        y = coordinates[:, 1]
+        group_values_array = np.asarray(group_values[0], dtype=object)
+        group_label = "groups"
+    else:
+        if group_by is None or layout_key is None:
+            raise ValueError("group_by and layout_key must be provided together")
+        validate_stored_selection_live_alias(
+            store.zw,
+            selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
+            column=cell_key,
+        )
+        x, y, group_values_array = _fetch_inputs(
+            store,
+            group_by=group_by,
+            layout_key=layout_key,
+            cell_key=cell_key,
+        )
+        categorical_scale = resolve_categorical_scale(
+            store,
+            group_by,
+            categorical_scale,
+        )
+        group_label = group_by
     order, palette, display_labels, resolved_categorical_scale = _resolve_categories(
-        groups, categorical_scale
+        group_values_array, categorical_scale
     )
-    codes = _category_codes(groups, order)
+    codes = _category_codes(group_values_array, order)
     node_x, node_y = _resolve_node_positions(
         x,
         y,
@@ -452,7 +507,7 @@ def cluster_connectivity(
     graph_matrix = _load_graph(
         store,
         n_cells=len(x),
-        selection=selection,
+        graph=graph,
     )
     source_index, target_index, raw_weights, normalized_weights = (
         _aggregate_intercluster_edges(graph_matrix, codes, len(order))
@@ -469,7 +524,7 @@ def cluster_connectivity(
     )
 
     counts = np.bincount(codes, minlength=len(order))
-    proportions = counts.astype(np.float64) / len(groups)
+    proportions = counts.astype(np.float64) / len(group_values_array)
     resolved_size_scale = size_scale or SizeScale(size_min=70.0, size_max=650.0)
     node_sizes = resolved_size_scale.areas(proportions)
     if not np.isfinite(node_sizes).all() or (node_sizes < 0).any():
@@ -521,7 +576,7 @@ def cluster_connectivity(
                 y,
                 s=resolved_cell_size,
                 c=(
-                    [palette[group] for group in groups]
+                    [palette[group] for group in group_values_array]
                     if cell_color is None
                     else cell_color
                 ),
@@ -611,7 +666,7 @@ def cluster_connectivity(
         legends=(
             LegendSpec(
                 kind="categorical",
-                label=group_by,
+                label=group_label,
                 extras={
                     "categories": list(order),
                     "placement": "nodes" if labels else "none",
@@ -620,15 +675,20 @@ def cluster_connectivity(
         ),
         scales=(resolved_categorical_scale, resolved_size_scale),
         provenance=PlotProvenance(
-            assay=selection.from_assay,
-            cell_key=selection.cell_key,
-            n_cells=len(groups),
+            assay=graph.assay,
+            cell_key=None if uses_artifacts else cell_key,
+            n_cells=len(group_values_array),
             renderer="matplotlib",
-            notes=("cluster_connectivity", "materialized", f"layout={layout_key}"),
+            notes=(
+                "cluster_connectivity",
+                "artifact" if uses_artifacts else "live_metadata",
+            ),
             extras={
                 "group_by": group_by,
                 "layout_key": layout_key,
-                "graph": selection.graph_ref.to_dict(),
+                "groups": None if groups is None else groups.to_dict(),
+                "layout": None if layout is None else layout.to_dict(),
+                "graph": graph.to_dict(),
                 "position": "explicit" if positions is not None else position,
                 "minimum_edge_weight": minimum_edge_weight,
                 "max_edges_per_node": max_edges_per_node,

@@ -2,8 +2,8 @@
 
 Analyst-facing artifact types and inspection helpers live here. Path builders,
 fingerprint helpers, and artifact writers stay package-internal. Prefer the
-``DataStore`` wrappers (``list_artifacts``, ``inspect_artifact``,
-``load_artifact``, ``get_assay_state``) in analysis code.
+``DataStore`` wrappers (``list_artifacts``, ``inspect_artifact``, and
+``load_artifact``) in analysis code.
 """
 
 from .artifacts import (

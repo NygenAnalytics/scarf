@@ -20,6 +20,7 @@ from scarf.features.statistical import (
     compare_group_distributions,
     resolve_group_order,
 )
+from scarf.metadata.selection import CellField
 
 pytestmark = pytest.mark.filterwarnings("ignore:Cell-level statistical testing")
 
@@ -965,8 +966,8 @@ def test_summary_scope_tracks_sample_aggregation():
         method="mann_whitney",
         posthoc=None,
         adjustment_method="fdr_bh",
-        group_key="grp",
-        cell_key="I",
+        grouping=None,
+        group_field=CellField("grp"),
         sample_by="sample",
         summary_scope="sample",
         tables={
@@ -983,8 +984,8 @@ def test_summary_scope_tracks_sample_aggregation():
             method="mann_whitney",
             posthoc=None,
             adjustment_method="fdr_bh",
-            group_key="grp",
-            cell_key="I",
+            grouping=None,
+            group_field=CellField("grp"),
         ).summary_scope
         == "cell"
     )
@@ -995,8 +996,8 @@ def test_statistical_test_result_is_frozen():
         method="mann_whitney",
         posthoc=None,
         adjustment_method="fdr_bh",
-        group_key="grp",
-        cell_key="I",
+        grouping=None,
+        group_field=CellField("grp"),
     )
     with pytest.raises(AttributeError):
         result.method = "kruskal_wallis"
@@ -1007,8 +1008,8 @@ def test_statistical_test_result_identity_defaults_are_optional():
         method="mann_whitney",
         posthoc=None,
         adjustment_method="fdr_bh",
-        group_key="grp",
-        cell_key="I",
+        grouping=None,
+        group_field=CellField("grp"),
     )
 
     assert result.artifact is None

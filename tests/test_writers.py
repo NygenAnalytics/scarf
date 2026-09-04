@@ -110,11 +110,16 @@ def test_crtozarr_preserves_exact_counts_metadata_and_transpose():
 
 
 def test_h5adtozarr(h5ad_reader, tmp_path):
-    from scarf.writers import H5adToZarr
+    from scarf.writers import H5adImportResult, H5adToZarr
 
     fn = str(tmp_path / "bastidas.zarr")
     writer = H5adToZarr(h5ad_reader, zarr_loc=fn)
-    writer.dump()
+    result = writer.dump()
+
+    assert isinstance(result, H5adImportResult)
+    assert result.analysisAssay is None
+    assert result.embeddingArtifacts == {}
+    assert result.clusterArtifacts == {}
 
 
 def test_h5adtozarr_splits_noncontiguous_feature_types():
@@ -197,7 +202,7 @@ def test_h5adtozarr_splits_noncontiguous_feature_types():
             reader.h5.close()
 
     root = zarr.open_group(store=store, mode="r")
-    assert set(root.group_keys()) == {"cellData", "RNA", "ADT"}
+    assert set(root.group_keys()) == {"artifacts", "cellData", "RNA", "ADT"}
     np.testing.assert_array_equal(root["RNA/counts"][:], values[:, [0, 2]])
     np.testing.assert_array_equal(root["ADT/counts"][:], values[:, [1, 3]])
     assert "countsT" in root["RNA"]
@@ -257,6 +262,176 @@ def _write_h5ad(
         if feature_types is not None:
             var.create_dataset("feature_types", data=np.array(feature_types))
     return path
+
+
+def test_h5ad_import_returns_cold_loadable_analytical_artifacts(
+    tmp_path,
+    monkeypatch,
+):
+    import h5py
+
+    from scarf import DataStore
+    from scarf.readers import H5adReader
+    from scarf.storage import ArtifactRef
+    from scarf.writers import H5adImportResult, H5adToZarr
+
+    counts = np.array(
+        [[1, 0, 2], [0, 3, 0], [4, 0, 5], [0, 6, 0]],
+        dtype=np.uint16,
+    )
+    umap = np.array(
+        [[0.1, 1.1], [0.2, 1.2], [0.3, 1.3], [0.4, 1.4]],
+        dtype=np.float32,
+    )
+    tsne = np.array(
+        [[1, 5], [2, 6], [3, 7], [4, 8]],
+        dtype=np.int16,
+    )
+    source = _write_h5ad(tmp_path / "analytical.h5ad", counts)
+    with h5py.File(source, mode="r+") as h5:
+        obs = h5["obs"]
+        obs.create_dataset("batch", data=np.array([b"A", b"A", b"B", b"B"]))
+        clusters = obs.create_group("leiden")
+        clusters.create_dataset("codes", data=np.array([0, 1, -1, 1], dtype=np.int8))
+        clusters.create_dataset("categories", data=np.array([b"alpha", b"beta"]))
+        obsm = h5.create_group("obsm")
+        obsm.create_dataset("X_umap", data=umap)
+        obsm.create_dataset("X_tsne", data=tsne)
+        obsm.create_dataset("X_pca", data=np.arange(12).reshape(4, 3))
+
+    destination = tmp_path / "analytical.zarr"
+    reader = H5adReader(
+        str(source),
+        feature_name_key="feature_name",
+        embedding_roles={"X_umap": "umap", "X_tsne": "tsne"},
+        cluster_keys=("leiden",),
+    )
+    embedding_block_rows: list[int] = []
+    cluster_block_rows: list[int] = []
+    original_obsm_blocks = H5adReader._iter_obsm_blocks
+    original_cell_block = H5adReader._cell_column_block
+
+    def tracked_obsm_blocks(self, key, block_rows, dtype):
+        for block in original_obsm_blocks(self, key, block_rows, dtype):
+            embedding_block_rows.append(int(block.shape[0]))
+            yield block
+
+    def tracked_cell_block(self, key, start, stop):
+        if key == "leiden":
+            cluster_block_rows.append(stop - start)
+        return original_cell_block(self, key, start, stop)
+
+    monkeypatch.setattr(H5adReader, "_iter_obsm_blocks", tracked_obsm_blocks)
+    monkeypatch.setattr(H5adReader, "_cell_column_block", tracked_cell_block)
+    try:
+        result = H5adToZarr(
+            reader,
+            zarr_loc=str(destination),
+            mem_budget="16M",
+            nthreads=1,
+        ).dump(batch_size=2)
+    finally:
+        reader.h5.close()
+
+    assert isinstance(result, H5adImportResult)
+    assert embedding_block_rows and max(embedding_block_rows) <= 2
+    assert cluster_block_rows and max(cluster_block_rows) <= 2
+    assert result.assayNames == ("RNA",)
+    assert result.analysisAssay == "RNA"
+    assert isinstance(result.cellSelection, ArtifactRef)
+    assert set(result.embeddingArtifacts) == {"X_umap", "X_tsne"}
+    assert set(result.clusterArtifacts) == {"leiden"}
+    assert {ref.kind for ref in result.embeddingArtifacts.values()} == {"embedding"}
+    assert result.clusterArtifacts["leiden"].kind == "cluster_labels"
+    assert all(isinstance(ref, ArtifactRef) for ref in result.artifactRefs)
+    with pytest.raises(TypeError):
+        result.embeddingArtifacts["alias"] = result.embeddingArtifacts["X_umap"]  # type: ignore[index]
+
+    root = zarr.open_group(str(destination), mode="r")
+    cells = root["cellData"]
+    assert set(cells.array_keys()) == {"I", "ids", "names", "batch"}
+    np.testing.assert_array_equal(cells["batch"][:], ["A", "A", "B", "B"])
+    assert "leiden" not in cells
+    assert "X_umap1" not in cells
+    assert "X_tsne1" not in cells
+    assert "X_pca1" not in cells
+
+    reopened = DataStore(str(destination), default_assay="RNA")
+
+    def metadata_snapshot() -> dict[str, tuple[list[object], dict[str, object]]]:
+        group = reopened.zw["cellData"]
+        return {
+            name: (np.asarray(group[name][:]).tolist(), dict(group[name].attrs))
+            for name in group.array_keys()
+        }
+
+    metadata_before = metadata_snapshot()
+    loaded_umap = reopened.load_artifact(result.embeddingArtifacts["X_umap"])
+    loaded_tsne = reopened.load_artifact(result.embeddingArtifacts["X_tsne"])
+    loaded_clusters = reopened.load_artifact(result.clusterArtifacts["leiden"])
+    cluster_status = reopened.inspect_artifact(result.clusterArtifacts["leiden"])
+    assert cluster_status.parameters == {"source": "h5ad", "source_key": "leiden"}
+    assert cluster_status.inputs["cell_selection"] == result.cellSelection.to_dict()
+    for group in (loaded_umap, loaded_tsne, loaded_clusters):
+        assert "source_artifact" not in group.attrs
+        assert "schema_version" not in group.attrs
+    np.testing.assert_allclose(loaded_umap["values"][:], umap)
+    np.testing.assert_allclose(loaded_tsne["values"][:], tsne.astype(np.float64))
+    np.testing.assert_array_equal(
+        loaded_clusters["values"][:],
+        ["alpha", "beta", "", "beta"],
+    )
+    assert loaded_clusters["values"].attrs["missing_mask"] == (
+        "__scarf_missing__values"
+    )
+    np.testing.assert_array_equal(
+        loaded_clusters["__scarf_missing__values"][:],
+        [False, False, True, False],
+    )
+    np.testing.assert_array_equal(
+        reopened.load_artifact(result.cellSelection)["values"][:],
+        np.ones(4, dtype=bool),
+    )
+    assert metadata_snapshot() == metadata_before
+
+
+def test_h5ad_multi_assay_analytical_import_requires_explicit_assay(tmp_path):
+    import h5py
+
+    from scarf.readers import H5adReader
+    from scarf.writers import H5adToZarr
+
+    source = _write_h5ad(
+        tmp_path / "multi_analysis.h5ad",
+        np.array([[1, 2], [3, 4]], dtype=np.uint16),
+        feature_types=[b"Gene Expression", b"Antibody Capture"],
+    )
+    with h5py.File(source, mode="r+") as h5:
+        h5["obs"].create_dataset("clusters", data=np.array([0, 1], dtype=np.int8))
+
+    reader = H5adReader(
+        str(source),
+        feature_name_key="feature_name",
+        cluster_keys=("clusters",),
+    )
+    try:
+        with pytest.raises(ValueError, match="analysis_assay is required"):
+            H5adToZarr(
+                reader,
+                zarr_loc=MemoryStore(),
+                assay_split_key="feature_types",
+            )
+        result = H5adToZarr(
+            reader,
+            zarr_loc=MemoryStore(),
+            assay_split_key="feature_types",
+            analysis_assay="RNA",
+        ).dump(batch_size=1)
+    finally:
+        reader.h5.close()
+
+    assert result.analysisAssay == "RNA"
+    assert result.clusterArtifacts["clusters"].assay == "RNA"
 
 
 # Sizes a 12-row uint32 assay into (4, n_feats) row shards.
@@ -615,7 +790,7 @@ def test_h5adtozarr_reads_the_source_once_for_all_assays(tmp_path, monkeypatch):
         covered = stop
     assert covered == values.shape[0]
     root = zarr.open_group(store=store, mode="r")
-    assert set(root.group_keys()) == {"cellData", "RNA", "ADT"}
+    assert set(root.group_keys()) == {"artifacts", "cellData", "RNA", "ADT"}
     np.testing.assert_array_equal(root["RNA/counts"][:], values[:, [0, 2]])
     np.testing.assert_array_equal(root["ADT/counts"][:], values[:, [1, 3]])
     assert "countsT" in root["RNA"]
@@ -1036,6 +1211,187 @@ def test_to_h5ad_preserves_counts_metadata_and_embeddings(export_assay_store, tm
         assert "RNA_UMAP2" not in h5["obs"]
 
 
+def test_to_h5ad_recalculates_counts_without_mutating_qc_metadata(
+    export_assay_store,
+    tmp_path,
+):
+    import h5py
+    from scipy.sparse import csr_matrix
+
+    from scarf.writers import to_h5ad
+
+    assay = export_assay_store.RNA
+    source_qc = np.full(assay.cells.N, 99, dtype=np.int64)
+    assay.cells.insert("RNA_nFeatures", source_qc, overwrite=True)
+    columns_before = set(assay.cells.columns)
+
+    path = tmp_path / "recalculated_export.h5ad"
+    to_h5ad(assay, str(path), skip_recalc_nfeats=False)
+
+    assert set(assay.cells.columns) == columns_before
+    np.testing.assert_array_equal(
+        assay.cells.fetch_all("RNA_nFeatures"),
+        source_qc,
+    )
+    expected = csr_matrix(assay.rawData.compute())
+    with h5py.File(path, "r") as h5:
+        shape = tuple(int(value) for value in h5["X"].attrs["shape"])
+        exported = csr_matrix(
+            (h5["X/data"][:], h5["X/indices"][:], h5["X/indptr"][:]),
+            shape=shape,
+        )
+        np.testing.assert_array_equal(exported.toarray(), expected.toarray())
+
+
+def _completed_export_run():
+    from types import SimpleNamespace
+
+    from anndata import AnnData
+    import pandas as pd
+    from scipy.sparse import csr_matrix
+
+    from scarf.datastore.pipeline_run import PipelineRun
+    from scarf.storage.pipeline_runs import PipelineRunRecord
+
+    assay = SimpleNamespace(name="RNA")
+
+    class Owner:
+        def __init__(self):
+            self.zw = zarr.open_group(store=MemoryStore(), mode="w")
+            self.cells = SimpleNamespace()
+            self.received_run = None
+
+        def _get_assay(self, name):
+            assert name == "RNA"
+            return assay
+
+        def to_anndata(self, *, run):
+            self.received_run = run
+            return AnnData(
+                csr_matrix(np.asarray([[2, 0], [5, 7]], dtype=np.int32)),
+                obs=pd.DataFrame(
+                    {
+                        "I": [True, True],
+                        "names": ["frozen-a", "frozen-c"],
+                        "batch": ["x", "x"],
+                        "clusters": [0, 2],
+                    },
+                    index=pd.Index(["c1", "c3"], name="ids"),
+                ),
+                var=pd.DataFrame(
+                    {"names": ["frozen-g1", "frozen-g3"]},
+                    index=pd.Index(["g1", "g3"], name="gene_ids"),
+                ),
+                obsm={"X_umap": np.asarray([[1.5, 10.5], [3.5, 30.5]])},
+            )
+
+    owner = Owner()
+    record = PipelineRunRecord(
+        run_id="a" * 64,
+        recipe="basic_rna_analysis",
+        requested_label="export",
+        label="export",
+        assay="RNA",
+        started_at_ns=1,
+        finished_at_ns=2,
+        status="completed",
+        complete=True,
+        scarf_version="1.0.0",
+        config={},
+        stage_order=("input_snapshot",),
+        outputs=(),
+        fields=(),
+        error=None,
+        interruption=None,
+    )
+    return assay, owner, PipelineRun(owner, record)
+
+
+def test_to_h5ad_exports_completed_run_frozen_fields_and_artifact_layout(tmp_path):
+    from anndata import read_h5ad
+
+    from scarf.writers import to_h5ad
+
+    assay, owner, run = _completed_export_run()
+    path = tmp_path / "run_export.h5ad"
+
+    to_h5ad(assay, str(path), run=run)
+
+    assert owner.received_run is run
+    exported = read_h5ad(path)
+    assert list(exported.obs_names) == ["c1", "c3"]
+    assert list(exported.var_names) == ["g1", "g3"]
+    assert exported.obs["names"].tolist() == ["frozen-a", "frozen-c"]
+    assert exported.obs["batch"].tolist() == ["x", "x"]
+    assert exported.obs["clusters"].tolist() == [0, 2]
+    assert "umap_1" not in exported.obs
+    assert "umap_2" not in exported.obs
+    np.testing.assert_allclose(
+        exported.obsm["X_umap"],
+        np.asarray([[1.5, 10.5], [3.5, 30.5]]),
+    )
+    np.testing.assert_array_equal(
+        exported.X.toarray(),
+        np.asarray([[2, 0], [5, 7]]),
+    )
+
+
+def test_to_h5ad_run_export_does_not_invent_umap_when_anndata_has_none(tmp_path):
+    from anndata import AnnData, read_h5ad
+    import pandas as pd
+    from scipy.sparse import csr_matrix
+
+    from scarf.writers import to_h5ad
+
+    assay, owner, run = _completed_export_run()
+
+    def to_anndata_without_umap(*, run):
+        owner.received_run = run
+        return AnnData(
+            csr_matrix(np.asarray([[2, 0], [5, 7]], dtype=np.int32)),
+            obs=pd.DataFrame(
+                {
+                    "I": [True, True],
+                    "names": ["frozen-a", "frozen-c"],
+                    "clusters": [0, 2],
+                },
+                index=pd.Index(["c1", "c3"], name="ids"),
+            ),
+            var=pd.DataFrame(
+                {"names": ["frozen-g1", "frozen-g3"]},
+                index=pd.Index(["g1", "g3"], name="gene_ids"),
+            ),
+        )
+
+    owner.to_anndata = to_anndata_without_umap
+    path = tmp_path / "run_export_no_umap.h5ad"
+    to_h5ad(assay, str(path), run=run)
+    exported = read_h5ad(path)
+    assert "X_umap" not in exported.obsm
+    assert exported.obs["clusters"].tolist() == [0, 2]
+
+
+def test_to_h5ad_run_export_rejects_foreign_assay_and_live_options(tmp_path):
+    from types import SimpleNamespace
+
+    from scarf.writers import to_h5ad
+
+    assay, _owner, run = _completed_export_run()
+    path = tmp_path / "rejected_run_export.h5ad"
+
+    with pytest.raises(ValueError, match="exact run assay"):
+        to_h5ad(SimpleNamespace(name="RNA"), str(path), run=run)
+    with pytest.raises(ValueError, match="embeddings_cols"):
+        to_h5ad(assay, str(path), embeddings_cols=[], run=run)
+    with pytest.raises(ValueError, match="skip_recalc_nfeats"):
+        to_h5ad(assay, str(path), skip_recalc_nfeats=False, run=run)
+    with pytest.raises(ValueError, match="nthreads"):
+        to_h5ad(assay, str(path), nthreads=2, run=run)
+    with pytest.raises(TypeError, match="PipelineRun"):
+        to_h5ad(assay, str(path), run=object())
+    assert not path.exists()
+
+
 def test_to_mtx_preserves_counts_barcodes_and_features(export_assay_store, tmp_path):
     from scipy.io import mmread
     from scipy.sparse import csr_matrix
@@ -1111,6 +1467,23 @@ def test_zarr_subset(datastore, tmp_path):
     subset_ds = DataStore(zarr_path, default_assay="RNA", assay_types={"RNA": "RNA"})
     assert subset_ds.RNA.rawDataT is not None
     assert subset_ds.RNA.rawDataT.shape == (root["RNA/counts"].shape[1], 4)
+
+
+def test_zarr_subset_does_not_copy_source_pipeline_runs(
+    datastore_ephemeral,
+    tmp_path,
+):
+    datastore_ephemeral.zw.create_group(f"pipeline/runs/{'e' * 64}/stages")
+    zarr_path = str(tmp_path / "subset_without_runs.zarr")
+
+    SubsetZarr(
+        zarr_loc=zarr_path,
+        assays=[datastore_ephemeral.RNA],
+        cell_idx=np.array([1, 10, 100, 500]),
+    ).dump()
+
+    assert "pipeline" in datastore_ephemeral.zw
+    assert "pipeline" not in zarr.open_group(zarr_path, mode="r")
 
 
 def test_subset_zarr_rejects_invalid_assay_inputs():

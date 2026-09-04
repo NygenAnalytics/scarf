@@ -288,8 +288,8 @@ def test_sort_categories_handles_numpy_booleans_and_missing_values():
 def test_embedding_on_data_legend(umap, leiden_clustering, datastore):
     result = splt.embedding(
         datastore,
-        layout_key="RNA_UMAP",
-        color_by="RNA_leiden_cluster",
+        layout=umap,
+        color_by=leiden_clustering,
         legend_loc="on_data",
         frame="none",
         show=False,
@@ -305,8 +305,8 @@ def test_embedding_on_data_legend(umap, leiden_clustering, datastore):
 def test_embedding_panel_is_square(umap, leiden_clustering, datastore):
     result = splt.embedding(
         datastore,
-        layout_key="RNA_UMAP",
-        color_by="RNA_leiden_cluster",
+        layout=umap,
+        color_by=leiden_clustering,
         show=False,
     )
     ax = next(iter(result.axes.values()))

@@ -7,7 +7,6 @@ import zarr
 from zarr.storage import MemoryStore
 
 from scarf.datastore.datastore import DataStore
-from scarf.graph.state import read_assay_state
 from scarf.readers._rds import R_INT_NA, RdsClosedError
 from scarf.readers.seurat import SeuratImportError, SeuratReader
 from scarf.storage.artifacts import artifact_group
@@ -264,12 +263,7 @@ def test_import_materializes_metadata_counts_membership_and_pca(
     assert cells["group"].attrs["levels"] == ["first", "second"]
     assert cells["group"].attrs["ordered"] is True
     np.testing.assert_array_equal(_missing(cells, "group"), [False, False, True])
-    assert cells["active.ident"][:].tolist() == ["zero", "", "one"]
-    assert cells["active.ident"].attrs["levels"] == ["zero", "one"]
-    np.testing.assert_array_equal(
-        _missing(cells, "active.ident"),
-        [False, True, False],
-    )
+    assert "active.ident" not in cells
     np.testing.assert_array_equal(
         _missing(cells, "character"),
         [False, True, False],
@@ -291,6 +285,15 @@ def test_import_materializes_metadata_counts_membership_and_pca(
 
     selection = artifact_group(root, result.cellSelection)
     np.testing.assert_array_equal(selection["values"][:], [True, True, True])
+    active_identity = artifact_group(root, result.activeIdentity)
+    assert result.activeIdentity.kind == "cluster_labels"
+    assert result.activeIdentity.assay == "RNA"
+    assert active_identity["values"][:].tolist() == ["zero", "", "one"]
+    assert active_identity["values"].attrs["levels"] == ["zero", "one"]
+    np.testing.assert_array_equal(
+        active_identity["__scarf_missing__values"][:],
+        [False, True, False],
+    )
     pca_ref = result.reductionArtifacts["pca"]
     pca = artifact_group(root, pca_ref)
     np.testing.assert_array_equal(
@@ -298,11 +301,11 @@ def test_import_materializes_metadata_counts_membership_and_pca(
         [[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]],
     )
     np.testing.assert_array_equal(pca["stdev"][:], [2.0, 1.0])
-    assert result.artifactRefs == (result.cellSelection, pca_ref)
-    state = read_assay_state(root, "RNA")
-    assert state is not None
-    assert state.reduction is None
-    assert state.named_results["pca"] == pca_ref
+    assert result.artifactRefs == (
+        result.cellSelection,
+        result.activeIdentity,
+        pca_ref,
+    )
     assert any(
         notice.code == "ignored_normalized_layer"
         and notice.objectPath == "assays/ADT/layers/data"
@@ -361,8 +364,12 @@ def test_imported_store_is_readable_by_datastore(tmp_path: Path) -> None:
     assert store.assay_names == ["ADT", "RNA"]
     assert store.cells.fetch_all("ids").tolist() == ["c1", "c2", "c3"]
     assert store.get_assay("RNA").rawData.shape == (3, 2)
-    assert store.get_assay_state("RNA") is not None
-    assert store.get_assay_state("RNA").reduction is None  # type: ignore[union-attr]
+    assert store.list_artifacts(
+        kind="imported_coordinates",
+        from_assay="RNA",
+        scope="assay",
+        complete_only=True,
+    )
 
 
 def test_chromatin_assay_streams_counts_and_round_trips_to_zarr(
@@ -403,7 +410,7 @@ def test_chromatin_assay_streams_counts_and_round_trips_to_zarr(
     assert store.ATAC.rawData.shape == (3, 2)
 
 
-def test_import_normalizes_seurat_reduction_name_for_assay_state(
+def test_import_preserves_source_reduction_name_in_explicit_artifact(
     tmp_path: Path,
 ) -> None:
     source = _write_partial_fixture(
@@ -421,10 +428,12 @@ def test_import_normalizes_seurat_reduction_name_for_assay_state(
             policy=CountMatrixPolicy(unitBytes=4096, chunkBytes=1024),
         ).dump(batch_size=1)
 
+    ref = result.reductionArtifacts["UMAP.RNA"]
+    assert ref.kind == "imported_coordinates"
     root = zarr.open_group(store=destination, mode="r")
-    state = read_assay_state(root, "RNA")
-    assert state is not None
-    assert result.reductionArtifacts["UMAP.RNA"] == state.named_results["umap_rna"]
+    provenance = artifact_group(root, ref).attrs["provenance"]
+    assert provenance["parameters"]["dimreduc_key"] == "UMAP.RNA"
+    assert provenance["parameters"]["role"] == "graphcoordinates"
 
 
 def test_import_persists_reduction_loadings_and_feature_ids(
@@ -448,7 +457,7 @@ def test_import_persists_reduction_loadings_and_feature_ids(
     assert reduction["feature_ids"][:].tolist() == ["g1", "g2"]
 
 
-def test_imported_umap_publishes_embedding_artifact_and_metadata(
+def test_imported_umap_writes_only_embedding_artifact(
     tmp_path: Path,
 ) -> None:
     source = _write_partial_fixture(
@@ -466,17 +475,8 @@ def test_imported_umap_publishes_embedding_artifact_and_metadata(
         embedding["values"][:],
         [[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]],
     )
-    np.testing.assert_array_equal(
-        root["cellData/RNA_UMAP1"][:],
-        [1.0, 2.0, 3.0],
-    )
-    np.testing.assert_array_equal(
-        root["cellData/RNA_UMAP2"][:],
-        [4.0, 5.0, 6.0],
-    )
-    state = read_assay_state(root, "RNA")
-    assert state is not None
-    assert state.named_results["umap"] == result.reductionArtifacts["umap"]
+    assert "RNA_UMAP1" not in root["cellData"]
+    assert "RNA_UMAP2" not in root["cellData"]
 
 
 def test_reader_must_remain_open_until_dump_finishes(tmp_path: Path) -> None:
@@ -646,7 +646,7 @@ def test_writer_rejects_reduction_for_unselected_assay_before_mutation(
         pytest.param(["---", "..."], id="empty-normalization"),
     ],
 )
-def test_writer_rejects_colliding_normalized_reduction_names(
+def test_writer_preserves_reduction_names_without_normalized_name_constraints(
     tmp_path: Path,
     reduction_names: list[str],
 ) -> None:
@@ -654,16 +654,19 @@ def test_writer_rejects_colliding_normalized_reduction_names(
         tmp_path / "colliding-reductions.rds",
         reduction_names=reduction_names,
     )
-    destination = _destination_with_sentinel()
+    destination = MemoryStore()
 
     with SeuratReader(source) as reader:
-        with pytest.raises(
-            ValueError,
-            match="reduction names collide after conversion to snake case",
-        ):
-            _new_writer(reader, destination)
+        result = _new_writer(reader, destination).dump(batch_size=1)
 
-    _assert_destination_untouched(destination)
+    assert list(result.reductionArtifacts) == reduction_names
+    refs = tuple(result.reductionArtifacts.values())
+    assert len(set(refs)) == len(reduction_names)
+    root = zarr.open_group(store=destination, mode="r")
+    assert [
+        artifact_group(root, ref).attrs["provenance"]["parameters"]["dimreduc_key"]
+        for ref in refs
+    ] == reduction_names
 
 
 @pytest.mark.parametrize(

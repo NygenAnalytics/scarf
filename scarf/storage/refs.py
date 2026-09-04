@@ -17,6 +17,7 @@ ARTIFACT_KINDS = frozenset(
         "cluster_cut",
         "cluster_hierarchy",
         "cluster_labels",
+        "cluster_selection",
         "coalesced_tree",
         "connectivity_map",
         "dendrogram",

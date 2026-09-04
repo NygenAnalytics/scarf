@@ -16,7 +16,8 @@ def build_neighbourhood_graph(
     *,
     from_assay: str | None = None,
     cell_key: str = "I",
-    features: ArtifactRef | str,
+    cell_selection: ArtifactRef | None = None,
+    features: ArtifactRef,
     reduction_method: str = "pca",
     dims: int = 11,
     pca_cell_key: str | None = None,
@@ -39,17 +40,26 @@ def build_neighbourhood_graph(
     batch_columns: list[str] | None = None,
     harmony_params: dict | None = None,
     local_cache: bool | str = "auto",
-    update_state: bool = True,
     invalidate_cache: bool = False,
 ) -> ArtifactRef:
+    assay_name = from_assay or datastore._defaultAssay
+    cell_selection = (
+        datastore.snapshot_cell_selection(cell_key)
+        if cell_selection is None
+        else cell_selection
+    )
+    feature_selection = datastore.resolve_features(assay_name, features)
     normalized = datastore.run_normalization(
-        from_assay=from_assay,
-        cell_key=cell_key,
-        features=features,
+        cell_selection,
+        feature_selection,
         log_transform=log_transform,
         renormalize_subset=renormalize_subset,
-        update_state=False,
         invalidate_cache=invalidate_cache,
+    )
+    pca_selection = (
+        datastore.snapshot_cell_selection(pca_cell_key)
+        if pca_cell_key is not None
+        else None
     )
     if reduction_method == "lsi":
         reduction = datastore.run_lsi(
@@ -58,18 +68,16 @@ def build_neighbourhood_graph(
             skip_first=lsi_skip_first,
             batch_size=batch_size,
             local_cache=local_cache,
-            update_state=False,
             invalidate_cache=invalidate_cache,
         )
     elif reduction_method == "pca":
         reduction = datastore.run_pca(
             normalized,
             dims=dims,
-            pca_cell_key=pca_cell_key or cell_key,
+            pca_cell_selection=pca_selection,
             feat_scaling=feat_scaling,
             batch_size=batch_size,
             local_cache=local_cache,
-            update_state=False,
             invalidate_cache=invalidate_cache,
         )
     else:
@@ -77,11 +85,10 @@ def build_neighbourhood_graph(
     coordinates = reduction
     if harmonize:
         coordinates = datastore.run_harmony(
-            batch_columns or [],
             reduction,
+            batch_columns or [],
             harmony_params=harmony_params,
             batch_size=batch_size,
-            update_state=False,
             invalidate_cache=invalidate_cache,
         )
     effective_ann_efc = ann_efc or min(100, max(k * 3, 50))
@@ -96,7 +103,6 @@ def build_neighbourhood_graph(
         ann_parallel=ann_parallel,
         rand_state=rand_state,
         batch_size=batch_size,
-        update_state=False,
         invalidate_cache=invalidate_cache,
     )
     datastore.build_embedding_initialization(
@@ -104,7 +110,6 @@ def build_neighbourhood_graph(
         n_centroids=n_centroids,
         rand_state=rand_state,
         batch_size=batch_size,
-        update_state=update_state,
         invalidate_cache=invalidate_cache,
     )
     neighbors = datastore.query_neighbors(
@@ -112,14 +117,12 @@ def build_neighbourhood_graph(
         coordinates=coordinates,
         k=k,
         batch_size=batch_size,
-        update_state=False,
         invalidate_cache=invalidate_cache,
     )
     connectivity = datastore.build_connectivity_map(
         neighbors,
         local_connectivity=local_connectivity,
         bandwidth=bandwidth,
-        update_state=update_state,
         invalidate_cache=invalidate_cache,
     )
     return connectivity
@@ -149,13 +152,16 @@ def _datastore_tar_path() -> str:
     return full_path("1K_pbmc_citeseq.zarr.tar.gz")
 
 
-def _has_graph(datastore) -> bool:
-    state = datastore.get_assay_state("RNA")
-    return state is not None and state.connectivity_map is not None
+def _input_ref(datastore, ref: ArtifactRef, name: str) -> ArtifactRef:
+    raw = (datastore.inspect_artifact(ref).inputs or {}).get(name)
+    if not isinstance(raw, dict):
+        raise AssertionError(f"{ref.kind} fixture artifact has no {name!r} input")
+    return ArtifactRef.from_dict(raw)
 
 
-def _cell_has(datastore, column: str) -> bool:
-    return column in datastore.cells.columns
+def _graph_coordinates(datastore, graph: ArtifactRef) -> ArtifactRef:
+    neighbors = _input_ref(datastore, graph, "neighbors")
+    return _input_ref(datastore, neighbors, "coordinates")
 
 
 @pytest.fixture(scope="session")
@@ -221,8 +227,9 @@ def analyzed_datastore_zarr_root(datastore_zarr_root, tmp_path_factory):
     zarr_root = tmp_path_factory.mktemp("scarf_analyzed_1K_pbmc_") / "data.zarr"
     shutil.copytree(datastore_zarr_root, zarr_root)
     datastore = DataStore(str(zarr_root), default_assay="RNA")
-    datastore.auto_filter_cells(show_qc_plots=False)
-    hvg_ref = datastore.mark_hvgs(
+    filtered = datastore.auto_filter_cells()
+    hvg_ref = datastore.select_hvgs(
+        filtered,
         top_n=100,
         show_plot=False,
         bin_strategy="fixed",
@@ -230,13 +237,14 @@ def analyzed_datastore_zarr_root(datastore_zarr_root, tmp_path_factory):
         max_cells=np.inf,
         blacklist="^MT-|^RPS|^RPL|^MRPS|^MRPL|^CCN|^HLA-|^H2-|^HIST",
     )
-    build_neighbourhood_graph(
+    graph = build_neighbourhood_graph(
         datastore,
+        cell_selection=filtered,
         features=hvg_ref,
         local_cache=False,
     )
-    state = datastore.get_assay_state("RNA")
-    assert state is not None and state.connectivity_map is not None
+    assert graph.kind == "connectivity_map"
+    assert datastore.inspect_artifact(graph).complete
     return str(zarr_root)
 
 
@@ -252,12 +260,13 @@ def analyzed_datastore_ephemeral(analyzed_datastore_zarr_root):
 
 @pytest.fixture(scope="session")
 def auto_filter_cells(datastore):
-    datastore.auto_filter_cells(show_qc_plots=False)
+    return datastore.auto_filter_cells()
 
 
 @pytest.fixture(scope="session")
 def mark_hvgs(auto_filter_cells, datastore):
-    return datastore.mark_hvgs(
+    return datastore.select_hvgs(
+        auto_filter_cells,
         top_n=100,
         show_plot=False,
         bin_strategy="fixed",
@@ -269,88 +278,91 @@ def mark_hvgs(auto_filter_cells, datastore):
 
 @pytest.fixture(scope="session")
 def detected_features(auto_filter_cells, datastore):
-    del auto_filter_cells
     return datastore.select_detected_features(
-        cell_key="I",
+        auto_filter_cells,
         min_cells=20,
-        label="detected_features",
     )
 
 
 @pytest.fixture(scope="session")
-def graph_artifacts(mark_hvgs, datastore):
-    build_neighbourhood_graph(datastore, features=mark_hvgs)
-    state = datastore.get_assay_state("RNA")
-    assert state is not None and state.neighbors is not None
-    yield datastore.inspect_artifact(state.neighbors).path
+def connectivity_graph(auto_filter_cells, mark_hvgs, datastore):
+    return build_neighbourhood_graph(
+        datastore,
+        cell_selection=auto_filter_cells,
+        features=mark_hvgs,
+    )
 
 
 @pytest.fixture(scope="session")
-def leiden_clustering(graph_artifacts, datastore):
-    if not _cell_has(datastore, "RNA_leiden_cluster"):
-        datastore.run_leiden_clustering()
-    yield datastore.cells.fetch("RNA_leiden_cluster")
+def graph_artifacts(connectivity_graph, datastore):
+    neighbors = _input_ref(datastore, connectivity_graph, "neighbors")
+    yield datastore.inspect_artifact(neighbors).path
 
 
 @pytest.fixture(scope="session")
-def legacy_leiden_clustering(graph_artifacts, datastore):
-    label = "legacy_leiden_cluster"
-    column = f"RNA_{label}"
-    if not _cell_has(datastore, column):
-        datastore.run_leiden_clustering(backend="leidenalg", label=label)
-    yield datastore.cells.fetch(column)
+def leiden_clustering(connectivity_graph, datastore):
+    yield datastore.run_leiden_clustering(connectivity_graph)
 
 
 @pytest.fixture(scope="session")
-def paris_clustering(graph_artifacts, datastore):
-    if not _cell_has(datastore, "RNA_cluster"):
-        datastore.run_paris_clustering(n_clusters=10, label="cluster")
-    yield datastore.cells.fetch("RNA_cluster")
+def legacy_leiden_clustering(connectivity_graph, datastore):
+    yield datastore.run_leiden_clustering(
+        connectivity_graph,
+        backend="leidenalg",
+    )
 
 
 @pytest.fixture(scope="session")
-def paris_clustering_auto(graph_artifacts, datastore):
-    if not _cell_has(datastore, "RNA_adaptive_clusters"):
-        datastore.run_paris_clustering(
-            n_clusters="auto",
-            min_cluster_size=10,
-            label="adaptive_clusters",
-        )
-    yield datastore.cells.fetch("RNA_adaptive_clusters")
+def paris_clustering(connectivity_graph, datastore):
+    yield datastore.run_paris_clustering(
+        connectivity_graph,
+        n_clusters=10,
+    )
 
 
 @pytest.fixture(scope="session")
-def umap(graph_artifacts, datastore):
-    if not _cell_has(datastore, "RNA_UMAP1"):
-        datastore.run_umap(n_epochs=50)
-    yield np.array(
-        [datastore.cells.fetch("RNA_UMAP1"), datastore.cells.fetch("RNA_UMAP2")]
-    ).T
+def paris_clustering_auto(connectivity_graph, datastore):
+    yield datastore.run_paris_clustering(
+        connectivity_graph,
+        n_clusters="auto",
+        min_cluster_size=10,
+    )
+
+
+@pytest.fixture(scope="session")
+def umap(connectivity_graph, datastore):
+    initialization = datastore.build_embedding_initialization(
+        _graph_coordinates(datastore, connectivity_graph)
+    )
+    yield datastore.run_umap(
+        connectivity_graph,
+        initialization,
+        n_epochs=50,
+    )
 
 
 @pytest.fixture(scope="session")
 def marker_search(datastore, paris_clustering, detected_features):
     return datastore.run_marker_search(
-        group_key="RNA_cluster",
+        paris_clustering,
         features=detected_features,
     )
 
 
 @pytest.fixture(scope="session")
-def pseudotime_scoring(datastore, legacy_leiden_clustering):
-    if not _cell_has(datastore, "RNA_pseudotime"):
-        datastore.run_pseudotime_scoring(
-            source_sink_key="RNA_legacy_leiden_cluster",
-            sources=[6],
-            sinks=[3],
-        )
-    yield datastore.cells.fetch("RNA_pseudotime")
+def pseudotime_scoring(datastore, connectivity_graph, legacy_leiden_clustering):
+    yield datastore.run_pseudotime_scoring(
+        connectivity_graph,
+        source_sink=legacy_leiden_clustering,
+        sources=[6],
+        sinks=[3],
+    )
 
 
 @pytest.fixture(scope="session")
 def pseudotime_markers(datastore, pseudotime_scoring, detected_features):
     result = datastore.run_pseudotime_marker_search(
-        pseudotime_key="RNA_pseudotime",
+        pseudotime_scoring,
         features=detected_features,
     )
     yield result
@@ -359,9 +371,8 @@ def pseudotime_markers(datastore, pseudotime_scoring, detected_features):
 @pytest.fixture(scope="session")
 def pseudotime_aggregation(datastore, pseudotime_scoring, detected_features):
     result = datastore.run_pseudotime_aggregation(
+        pseudotime_scoring,
         features=detected_features,
-        pseudotime_key="RNA_pseudotime",
-        cluster_label="pseudotime_clusters",
         n_clusters=15,
         window_size=50,
         chunk_size=10,
@@ -372,27 +383,27 @@ def pseudotime_aggregation(datastore, pseudotime_scoring, detected_features):
 @pytest.fixture(scope="session")
 def grouped_assay(datastore, pseudotime_aggregation):
     datastore.add_grouped_assay(
-        group_key="pseudotime_clusters", assay_label="PTIME_MODULES"
+        pseudotime_aggregation,
+        assay_label="PTIME_MODULES",
     )
+    return pseudotime_aggregation
 
 
 @pytest.fixture(scope="session")
 def cell_cycle_scoring(auto_filter_cells, datastore):
-    del auto_filter_cells
-    if not _cell_has(datastore, "RNA_cell_cycle_phase"):
-        datastore.run_cell_cycle_scoring()
-    return datastore.cells.fetch("RNA_cell_cycle_phase")
+    return datastore.run_cell_cycle_scoring(auto_filter_cells)
 
 
 @pytest.fixture(scope="session")
-def topacedo_sampler(paris_clustering, datastore):
+def topacedo_sampler(paris_clustering, connectivity_graph, datastore):
     import importlib.util
 
     if importlib.util.find_spec("topacedo") is None:
         pytest.skip("topacedo package not installed")
-    if not _cell_has(datastore, "RNA_sketched"):
-        datastore.run_topacedo_sampler(cluster_key="RNA_cluster")
-    return datastore.cells.fetch("RNA_sketched")
+    return datastore.run_topacedo_sampler(
+        connectivity_graph,
+        paris_clustering,
+    )
 
 
 @pytest.fixture(scope="session")
@@ -412,17 +423,23 @@ def atac_datastore():
 
 @pytest.fixture(scope="session")
 def mark_prevalent_peaks(atac_datastore):
-    return atac_datastore.mark_prevalent_peaks(top_n=5000)
+    return atac_datastore.select_prevalent_peaks(
+        atac_datastore.snapshot_cell_selection(),
+        top_n=5000,
+    )
 
 
 @pytest.fixture(scope="session")
-def make_atac_graph(mark_prevalent_peaks, atac_datastore):
-    build_neighbourhood_graph(
+def atac_connectivity_graph(mark_prevalent_peaks, atac_datastore):
+    return build_neighbourhood_graph(
         atac_datastore,
         features=mark_prevalent_peaks,
         reduction_method="lsi",
         feat_scaling=False,
     )
-    state = atac_datastore.get_assay_state("ATAC")
-    assert state is not None and state.neighbors is not None
-    yield atac_datastore.inspect_artifact(state.neighbors).path
+
+
+@pytest.fixture(scope="session")
+def make_atac_graph(atac_connectivity_graph, atac_datastore):
+    neighbors = _input_ref(atac_datastore, atac_connectivity_graph, "neighbors")
+    yield atac_datastore.inspect_artifact(neighbors).path

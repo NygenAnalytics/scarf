@@ -1,5 +1,5 @@
 import os
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -15,8 +15,10 @@ def to_h5ad(
     embeddings_cols: list[str] | None = None,
     skip_recalc_nfeats: bool = True,
     nthreads: int = 4,
+    *,
+    run: object | None = None,
 ) -> None:
-    """Save an assay as H5ad file.
+    """Save an assay or a completed pipeline run as an H5AD file.
 
     Args:
         assay: Assay to save in H5ad format
@@ -27,10 +29,58 @@ def to_h5ad(
                          embeddings.
         skip_recalc_nfeats: Skip recalculating nFeatures per cell. (Default value: True)
         nthreads: Number of processing threads to use (Default value: 4)
+        run: Completed pipeline run opened from the datastore that owns
+             ``assay``. The frozen run selections and fields are exported.
+             Consecutive frozen UMAP fields are already in ``obsm['X_umap']``
+             from ``to_anndata(run=...)``; cluster labels remain in
+             ``obs['clusters']``. Live embedding columns and feature-count
+             recalculation options do not apply to run export.
 
     Returns:
         None
     """
+    if run is not None:
+        from ..storage.pipeline_runs import PipelineRunRecord
+
+        if not isinstance(getattr(run, "_record", None), PipelineRunRecord):
+            raise TypeError("run must be a PipelineRun")
+        pipeline_run = cast(Any, run)
+        pipeline_run._require_completed("H5AD export")
+        owner = pipeline_run._owner
+        get_assay = getattr(owner, "_get_assay", None)
+        to_anndata = getattr(owner, "to_anndata", None)
+        if not callable(get_assay) or not callable(to_anndata):
+            raise TypeError("run must be opened from a DataStore")
+        if get_assay(pipeline_run.assay) is not assay:
+            raise ValueError(
+                "assay must be the exact run assay owned by the run datastore"
+            )
+        if embeddings_cols is not None:
+            raise ValueError(
+                "Run-aware export uses frozen embedding fields; "
+                "embeddings_cols cannot be provided"
+            )
+        if skip_recalc_nfeats is not True:
+            raise ValueError(
+                "Run-aware export uses the frozen selection; "
+                "skip_recalc_nfeats cannot be disabled"
+            )
+        if nthreads != 4:
+            raise ValueError(
+                "Run-aware export uses the datastore execution settings; "
+                "nthreads cannot be overridden"
+            )
+
+        adata = to_anndata(run=pipeline_run)
+        if adata is None:
+            return None
+        adata.write_h5ad(h5ad_filename)
+        logger.info(
+            f"Exported pipeline run {pipeline_run.run_id} with {adata.n_obs} cells and "
+            f"{adata.n_vars} features to {h5ad_filename}"
+        )
+        return None
+
     import h5py
 
     def save_attr(group: str, col: str, scarf_col: str, md: Any) -> None:
@@ -51,19 +101,19 @@ def to_h5ad(
     for i in ["X", "obs", "var", "obsm"]:
         h5.create_group(i)
 
-    # Recalculating nFeature here just to avoid potential issues with stale data.
-    if skip_recalc_nfeats is False:
-        assay.cells.insert(
-            f"{assay.name}_nFeatures",
+    # Export-time validation must not rewrite the source datastore's QC metadata.
+    n_feats_per_cell = (
+        assay.cells.fetch_all(f"{assay.name}_nFeatures").astype(int)
+        if skip_recalc_nfeats
+        else np.asarray(
             compute_with_progress(
                 assay.rawData.count_nonzero(axis=1),
                 msg="Recalculating detected feature counts",
                 nthreads=nthreads,
             ),
-            overwrite=True,
+            dtype=int,
         )
-
-    n_feats_per_cell = assay.cells.fetch_all(f"{assay.name}_nFeatures").astype(int)
+    )
     tot_counts = int(n_feats_per_cell.sum())
 
     for i, s in zip(

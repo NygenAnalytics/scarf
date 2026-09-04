@@ -1,15 +1,12 @@
+import inspect
+
 import numpy as np
 import pandas as pd
 import pytest
-import zarr
-from zarr.storage import MemoryStore
 
 import scarf.features.markers.search as marker_search_module
 from scarf.assay import norm_lib_size
-from scarf.datastore._operations.features import (
-    _marker_artifact_index,
-    _select_indexed_marker_artifact,
-)
+from scarf.datastore.datastore import DataStore
 from scipy.stats import linregress
 from scipy.stats import mannwhitneyu
 
@@ -34,50 +31,39 @@ from scarf.storage.artifacts import ArtifactRef
 from scarf.utils import controlled_compute
 
 
-def test_marker_index_fails_closed_for_multiple_feature_selections() -> None:
-    first = ArtifactRef(
+def test_marker_public_contract_requires_explicit_artifacts() -> None:
+    producer = inspect.signature(DataStore.run_marker_search)
+    assert list(producer.parameters)[:2] == ["self", "clusters"]
+    assert "features" in producer.parameters
+    assert "group_key" not in producer.parameters
+    assert "cell_key" not in producer.parameters
+    assert "skip_save" not in producer.parameters
+    loader = inspect.signature(DataStore.get_markers)
+    assert loader.parameters["marker"].default is inspect.Parameter.empty
+
+
+def _test_cluster_artifact(store, values: np.ndarray) -> ArtifactRef:
+    from scarf.metadata.artifacts import (
+        plan_cell_data_artifact,
+        write_cell_data_artifact,
+    )
+
+    cell_selection = store.snapshot_cell_selection()
+    labels = np.asarray(values)
+    planned = plan_cell_data_artifact(
+        store.zw,
         scope="assay",
         assay="RNA",
-        kind="marker_table",
-        artifact_id="1" * 64,
+        kind="cluster_labels",
+        operation="test_cluster_labels",
+        parameters={},
+        inputs={},
+        execution_options={},
+        cell_selection=cell_selection,
+        arrays={"values": (labels.shape, None)},
     )
-    second = ArtifactRef(
-        scope="assay",
-        assay="RNA",
-        kind="marker_table",
-        artifact_id="2" * 64,
-    )
-    index = {"I": {"clusters": {"features-1": first.to_dict()}}}
-
-    assert _select_indexed_marker_artifact(index, "I", "clusters") == (
-        "features-1",
-        first,
-    )
-    index["I"]["clusters"]["features-2"] = second.to_dict()
-    with pytest.raises(ValueError, match="Multiple feature-specific marker tables"):
-        _select_indexed_marker_artifact(index, "I", "clusters")
-
-
-def test_marker_artifact_index_rejects_malformed_payloads() -> None:
-    group = zarr.open_group(store=MemoryStore(), mode="w")
-    payloads: list[object] = [
-        ["not-a-dict"],
-        {"I": "not-groups"},
-        {"I": {"clusters": "not-selections"}},
-        {"I": {"clusters": {"features": "not-a-ref"}}},
-        {"I": {"clusters": {"features": {"kind": "marker_table"}}}},
-    ]
-    for payload in payloads:
-        group.attrs["artifacts"] = payload
-        with pytest.raises(ValueError, match="invalid"):
-            _marker_artifact_index(group)
-
-
-def test_select_indexed_marker_artifact_missing_slot() -> None:
-    with pytest.raises(KeyError, match="was not found"):
-        _select_indexed_marker_artifact({}, "I", "clusters")
-    with pytest.raises(KeyError, match="was not found"):
-        _select_indexed_marker_artifact({"I": {}}, "I", "clusters")
+    write_cell_data_artifact(store.zw, planned, {"values": labels})
+    return planned.ref
 
 
 def _reference_calc(
@@ -338,34 +324,31 @@ def test_saved_marker_refs_keep_feature_specific_results_addressable(
     store = datastore_ephemeral
     assay = store.RNA
     assert assay.feats.N >= 16
-    group_key = "feature_specific_marker_groups"
-    store.cells.insert(
-        group_key,
-        np.arange(store.cells.N, dtype=np.int64) % 2,
-        overwrite=True,
+    clusters = _test_cluster_artifact(
+        store,
+        np.arange(len(store.cells.active_index("I")), dtype=np.int64) % 2,
     )
     first_indices = np.arange(8, dtype=np.int64)
     second_indices = np.arange(8, 16, dtype=np.int64)
     first_selection = store.set_feature_selection(
         feature_indexes=first_indices,
-        label="first_marker_features",
     )
     second_selection = store.set_feature_selection(
         feature_indexes=second_indices,
-        label="second_marker_features",
     )
+    cell_columns = set(store.cells.columns)
+    feature_columns = set(assay.feats.columns)
+    assay_keys = set(assay.z.keys())
 
     first = store.run_marker_search(
+        clusters,
         from_assay="RNA",
-        group_key=group_key,
-        cell_key="I",
         features=first_selection,
         nthreads=1,
     )
     second = store.run_marker_search(
+        clusters,
         from_assay="RNA",
-        group_key=group_key,
-        cell_key="I",
         features=second_selection,
         nthreads=1,
     )
@@ -385,17 +368,15 @@ def test_saved_marker_refs_keep_feature_specific_results_addressable(
     )
     assert set(first_table["feature_index"]) == set(first_indices)
     assert set(second_table["feature_index"]) == set(second_indices)
-    with pytest.raises(ValueError, match="Multiple feature-specific marker tables"):
-        store.get_markers(
-            from_assay="RNA",
-            group_key=group_key,
-            cell_key="I",
-            min_score=-1,
-            min_frac_exp=-1,
-        )
-    indexed = assay.z["markers"].attrs["artifacts"]["I"][group_key]
-    assert ArtifactRef.from_dict(indexed[first_selection.artifact_id]) == first
-    assert ArtifactRef.from_dict(indexed[second_selection.artifact_id]) == second
+    assert set(store.cells.columns) == cell_columns
+    assert set(assay.feats.columns) == feature_columns
+    assert set(assay.z.keys()) == assay_keys
+    for marker in (first, second):
+        group = store.load_artifact(marker)
+        assert "feature_names" in group
+        assert "feature_ids" in group
+    with pytest.raises(TypeError, match="marker"):
+        store.get_markers()  # type: ignore[call-arg]
 
 
 @pytest.mark.parametrize(
@@ -1027,12 +1008,15 @@ def test_compact_marker_save_roundtrip():
     markers = {1: source}
     root = zarr.open_group(store=MemoryStore(), mode="w")
     slot = root.create_group("slot")
+    feature_names = np.array([f"g{i}" for i in range(11)])
+    feature_ids = np.array([f"id{i}" for i in range(11)])
     DataStore._write_marker_slot(
         slot,
         markers,
         group_cell_counts={1: (10, 40)},
+        feature_names=feature_names,
+        feature_ids=feature_ids,
     )
-    feature_names = np.array([f"g{i}" for i in range(11)])
     loaded = _load_marker_cluster_frame(
         slot,
         slot["1"],
@@ -1083,7 +1067,7 @@ def _canonical_marker_frame(feature_indices):
         ),
     ],
 )
-def test_marker_writer_rejects_invalid_indices_before_publication(
+def test_marker_writer_rejects_invalid_indices_before_writing(
     markers,
     message,
 ):
@@ -1100,6 +1084,8 @@ def test_marker_writer_rejects_invalid_indices_before_publication(
             slot,
             markers,
             group_cell_counts={0: (2, 2), 1: (2, 2)},
+            feature_names=np.array(["g0", "g1"]),
+            feature_ids=np.array(["id0", "id1"]),
         )
 
     assert dict(slot.attrs) == {}
@@ -1107,7 +1093,7 @@ def test_marker_writer_rejects_invalid_indices_before_publication(
     assert list(slot.group_keys()) == []
 
 
-def test_marker_publication_preserves_legacy_marker_subtree():
+def test_marker_artifact_write_preserves_legacy_marker_subtree():
     import zarr
     from zarr.storage import MemoryStore
 
@@ -1171,11 +1157,10 @@ def test_marker_publication_preserves_legacy_marker_subtree():
         artifact,
         {1: source},
         group_cell_counts={1: (10, 20)},
+        feature_names=np.array(["g0", "g1"]),
+        feature_ids=np.array(["id0", "id1"]),
     )
     finish_artifact(artifact, planned)
-    root["RNA/markers"].attrs["artifacts"] = {
-        "I": {"new": {"feature-id": planned.ref.to_dict()}},
-    }
 
     assert dict(legacy_slot.attrs) == legacy_attrs
     assert set(legacy_cluster.array_keys()) == set(legacy_values)
@@ -1222,44 +1207,6 @@ def test_legacy_marker_names_and_scores_are_readable():
     assert loaded["score"].tolist() == [0.9, 0.8]
     assert loaded["p_value"].isna().all()
     assert loaded["p_value_adjusted"].isna().all()
-
-
-def test_get_markers_rejects_unindexed_legacy_group_without_mutation(
-    datastore_ephemeral,
-):
-    assay = datastore_ephemeral.RNA
-    group_key = "legacy_marker_groups"
-    datastore_ephemeral.cells.insert(
-        group_key,
-        np.zeros(datastore_ephemeral.cells.N, dtype=np.int32),
-        overwrite=True,
-    )
-    markers_group = (
-        assay.z["markers"] if "markers" in assay.z else assay.z.create_group("markers")
-    )
-    slot = markers_group.create_group(f"I__{group_key}")
-    cluster = slot.create_group("0")
-    known_id = str(assay.feats.fetch_all("ids")[0])
-    stored_names = np.array([known_id, "removed_feature"])
-    stored_scores = np.array([0.9, 0.8])
-    cluster.create_array(
-        "names",
-        data=stored_names,
-    )
-    cluster.create_array("scores", data=stored_scores)
-
-    with pytest.raises(KeyError, match="Couldn't find the location of markers"):
-        datastore_ephemeral.get_markers(
-            from_assay="RNA",
-            cell_key="I",
-            group_key=group_key,
-            group_id=0,
-            min_score=0,
-            min_frac_exp=0,
-        )
-
-    np.testing.assert_array_equal(cluster["names"][:], stored_names)
-    np.testing.assert_array_equal(cluster["scores"][:], stored_scores)
 
 
 def test_load_marker_table_ignores_stale_schema_version_attribute():
@@ -1503,35 +1450,26 @@ def test_marker_cache_reuse_revalidates_canonical_payload(
 ):
     import scarf.features.markers as marker_algorithms
     from scarf.features.markers.table import MARKER_STAT_COLUMNS
-    from scarf.storage.artifacts import ArtifactRef, artifact_path
+    from scarf.storage.artifacts import artifact_path
 
     assay = datastore_ephemeral.RNA
-    group_key = f"cache_groups_{corruption}"
-    feature_label = f"cache_features_{corruption}"
-    datastore_ephemeral.cells.insert(
-        group_key,
-        np.arange(datastore_ephemeral.cells.N) % 2,
-        overwrite=True,
+    clusters = _test_cluster_artifact(
+        datastore_ephemeral,
+        np.arange(len(datastore_ephemeral.cells.active_index("I"))) % 2,
     )
     feature_mask = np.zeros(assay.feats.N, dtype=bool)
     feature_mask[:8] = True
     feature_selection = datastore_ephemeral.set_feature_selection(
         from_assay="RNA",
         mask=feature_mask,
-        label=feature_label,
     )
     arguments = {
+        "clusters": clusters,
         "from_assay": "RNA",
-        "group_key": group_key,
-        "cell_key": "I",
-        "features": feature_label,
+        "features": feature_selection,
         "nthreads": 1,
     }
-    datastore_ephemeral.run_marker_search(**arguments)
-    marker_index = assay.z["markers"].attrs["artifacts"]
-    old_ref = ArtifactRef.from_dict(
-        marker_index["I"][group_key][feature_selection.artifact_id]
-    )
+    old_ref = datastore_ephemeral.run_marker_search(**arguments)
     old_artifact = datastore_ephemeral.zw[artifact_path(old_ref)]
     first_group_name = sorted(old_artifact.group_keys())[0]
     first_group = old_artifact[first_group_name]
@@ -1585,13 +1523,7 @@ def test_marker_cache_reuse_revalidates_canonical_payload(
         "find_markers_by_rank",
         tracked_marker_search,
     )
-    datastore_ephemeral.run_marker_search(**arguments)
-
-    new_ref = ArtifactRef.from_dict(
-        assay.z["markers"].attrs["artifacts"]["I"][group_key][
-            feature_selection.artifact_id
-        ]
-    )
+    new_ref = datastore_ephemeral.run_marker_search(**arguments)
     status = datastore_ephemeral.inspect_artifact(new_ref)
     assert calls == 1
     assert new_ref != old_ref
@@ -1857,38 +1789,38 @@ def test_pseudotime_bh_excludes_untested_features():
 def test_marker_search_does_not_accept_gene_batch_size(
     datastore_ephemeral,
 ):
-    groups = np.arange(datastore_ephemeral.cells.N) % 2
-    datastore_ephemeral.cells.insert("batch_contract_groups", groups, overwrite=True)
+    clusters = _test_cluster_artifact(
+        datastore_ephemeral,
+        np.arange(len(datastore_ephemeral.cells.active_index("I"))) % 2,
+    )
     feature_ref = datastore_ephemeral.set_feature_selection(
         from_assay="RNA",
         mask=np.ones(datastore_ephemeral.RNA.feats.N, dtype=bool),
-        label="batch_contract_features",
     )
     with pytest.raises(TypeError, match="gene_batch_size"):
         datastore_ephemeral.run_marker_search(
-            group_key="batch_contract_groups",
+            clusters,
             features=feature_ref,
             gene_batch_size=100,
-            skip_save=True,
         )
 
 
 def test_marker_search_does_not_accept_n_threads(
     datastore_ephemeral,
 ):
-    groups = np.arange(datastore_ephemeral.cells.N) % 2
-    datastore_ephemeral.cells.insert("thread_contract_groups", groups, overwrite=True)
+    clusters = _test_cluster_artifact(
+        datastore_ephemeral,
+        np.arange(len(datastore_ephemeral.cells.active_index("I"))) % 2,
+    )
     feature_ref = datastore_ephemeral.set_feature_selection(
         from_assay="RNA",
         mask=np.ones(datastore_ephemeral.RNA.feats.N, dtype=bool),
-        label="thread_contract_features",
     )
     with pytest.raises(TypeError, match="n_threads"):
         datastore_ephemeral.run_marker_search(
-            group_key="thread_contract_groups",
+            clusters,
             features=feature_ref,
             n_threads=4,
-            skip_save=True,
         )
 
 

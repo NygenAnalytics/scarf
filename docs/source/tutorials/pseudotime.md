@@ -1,7 +1,6 @@
 ---
-description: Order cells along a supervised trajectory and identify genes that change with progression.
+description: Score an explicit graph for pseudotime and load immutable trajectory marker artifacts.
 jupytext:
-  formats: ipynb,md:myst
   text_representation:
     extension: .md
     format_name: myst
@@ -13,259 +12,126 @@ kernelspec:
   name: python3
 ---
 
-# Pseudotime ordering
+# Pseudotime analysis
 
-Pseudotime represents progress through a continuous biological process.
-This tutorial uses annotated start and terminal populations to orient one reliable trajectory, then identifies genes that change with that ordering.
-It does not infer terminal states or prove lineage relationships.
+Pseudotime is an oriented summary of graph structure. Source and sink choices supervise that
+orientation; Scarf does not infer terminal states or causal lineage.
 
-## Prerequisites
-
-- Scarf installed with the `extra` optional dependencies
-- An RNA assay with a neighbourhood graph and UMAP embedding
-
-## What you will learn
-
-- Score supervised pseudotime with source and sink clusters
-- Find features correlated with the ordering
-- Interpret one expression checkpoint on the embedding
-
-## Dataset
+## 1. Open the prepared graph
 
 ```{code-cell} ipython3
-from tempfile import TemporaryDirectory
+import numpy as np
+import pandas as pd
 
 import scarf
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level='WARNING', progress=True)
-```
+scarf.configure_output(level="WARNING", progress=False)
 
----
-## 1. Fetch pre-analyzed data
-
-Here we use the data from [Bastidas-Ponce et al., 2019 Development](https://journals.biologists.com/dev/article/146/12/dev173849/19483/) for E15.5 stage of differentiation of endocrine cells from a pool of endocrine progenitors-precursors.
-
-The prepared Zarr store is available from the `scarf_docs` Cytebase catalog.
-It supplies counts, literal annotations, and a UMAP embedding.
-The setup mounts them into a temporary writable analysis store and rebuilds a current graph lineage from 2000 highly variable genes.
-The catalog snapshot is structurally repacked inside the temporary directory first so it has the current RNA count layout; the mounted target does not reuse legacy analysis state.
-
-```{code-cell} ipython3
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    name='bastidas-ponce_4K_pancreas-d15_rnaseq',
-    destination='scarf_datasets',
+    name="bastidas-ponce_4K_pancreas-d15_rnaseq",
+    destination="scarf_datasets",
     zarr=True,
 )
-
-analysis_directory = TemporaryDirectory()
-repacked_counts = f'{analysis_directory.name}/counts.zarr'
-repack_store(
-    f'{dataset}/data.zarr',
-    repacked_counts,
-    nthreads=2,
-)
-ds = scarf.mount_datastore(
-    repacked_counts,
-    at=f'{analysis_directory.name}/analysis.zarr',
+ds = scarf.DataStore(
+    f"{dataset}/data.zarr",
     nthreads=4,
-    default_assay='RNA'
 )
-hvg_ref = ds.mark_hvgs(
-    top_n=2000,
-    show_plot=False,
-    label='pseudotime_hvgs',
-)
-normalized = ds.run_normalization(features=hvg_ref)
-reduction = ds.run_pca(normalized, dims=15)
-ann_index = ds.build_ann_index(reduction)
-neighbors = ds.query_neighbors(ann_index, k=11)
-graph = ds.build_connectivity_map(neighbors)
-all_features = ds.resolve_features('RNA', 'all_features')
+analysis_run = ds.pipeline.open(label="docs_default")
+graph = analysis_run["connectivity_map"]
+all_features = analysis_run["feature_universe"]
 ```
 
-The store includes cell-type annotations in the `clusters` column:
+The rebuilt catalog store contains the completed `docs_default` pipeline run. This page reuses its
+exact graph, feature universe, and UMAP. The teaching store's literal `clusters` column supplies
+external endpoint labels; it is not the clustering selected by the pipeline run. Build a zero-sum
+source/sink vector over the graph rows. Ductal cells supply negative source mass; Alpha, Beta, and
+Delta cells share positive sink mass.
 
 ```{code-cell} ipython3
-ds.cells.to_pandas_dataframe(
-    ['clusters'],
-    key='I'
-)['clusters'].value_counts()
+labels = ds.cells.fetch("clusters", key="I")
+source = labels == "Ductal"
+sink = np.isin(labels, ["Alpha", "Beta", "Delta"])
+if not source.any() or not sink.any():
+    raise ValueError("Source and sink labels must both be present")
+source_sink_vector = np.zeros(len(labels), dtype=float)
+source_sink_vector[source] = -1.0 / source.sum()
+source_sink_vector[sink] = 1.0 / sink.sum()
+float(source_sink_vector.sum())
 ```
 
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='clusters',
-    legend_loc='on_data',
-)
-```
-
----
-## 2. Estimate pseudotime ordering
-
-Scarf uses a memory-efficient implementation of the [PBA algorithm](https://github.com/AllonKleinLab/PBA) ([Weinreb et al. 2018, PNAS](https://doi.org/10.1073/pnas.1714723115)) to estimate a pseudotime ordering.
-`run_pseudotime_scoring` works with any assay that has a neighborhood graph.
-
-The method is supervised: the source groups define the beginning and the sink groups define the end.
-Those choices orient the result.
-Here, ductal cells represent the progenitor pool and the hormone-expressing states represent the endpoints.
+## 2. Score pseudotime
 
 ```{code-cell} ipython3
-pseudotime = ds.run_pseudotime_scoring(
+pseudotime_ref = ds.run_pseudotime_scoring(
     graph,
-    source_sink_key='clusters',
-    sources=['Ductal'],
-    sinks=['Alpha', 'Beta', 'Delta'],
+    ss_vec=source_sink_vector,
 )
-```
-
-Any cell metadata column with group labels works for `source_sink_key`, including a Scarf clustering such as `RNA_leiden_cluster`.
-Without provided annotations, read the cluster labels off the embedding and pick the ones at each end of the trajectory.
-Every group named in `sources` or `sinks` has to be present among the scored cells, otherwise the call fails rather than guessing.
-
-The scores are stored under the generated column named by `pseudotime.pseudotime_key` (by default `RNA_pseudotime`).
-The companion key `pseudotime.validity_key` identifies cells that were scored.
-`pseudotime.graph` records the exact graph artifact used to calculate the ordering.
-
-```{code-cell} ipython3
+pseudotime = ds.load_pseudotime_scoring(pseudotime_ref)
 {
-    "pseudotime_key": pseudotime.pseudotime_key,
-    "validity_key": pseudotime.validity_key,
-    "valid cells": int(ds.cells.fetch_all(pseudotime.validity_key).sum()),
+    "artifact": pseudotime.ref,
+    "graph": pseudotime.graph,
+    "valid cells": int(pseudotime.valid.sum()),
 }
 ```
 
-Values should progress from the ductal region toward the endocrine endpoints.
-A disconnected or internally reversed pattern is a reason to revisit the graph and endpoint choices.
-Restrict the embedding to scored cells with `subset_by=pseudotime.validity_key`.
+The producer returns an artifact. The explicit loader returns values, a validity mask, graph ref,
+and cell-selection ref. No pseudotime or validity column is added to live metadata.
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by=pseudotime.pseudotime_key,
-    subset_by=pseudotime.validity_key,
+plot_data = analysis_run.cells.to_pandas_dataframe(["umap_1", "umap_2"])
+plot_data["pseudotime"] = pseudotime.values
+plot_data.loc[pseudotime.valid].plot.scatter(
+    x="umap_1",
+    y="umap_2",
+    c="pseudotime",
+    colormap="viridis",
+    s=4,
+    figsize=(5, 4),
 )
 ```
 
-Compare the score distribution across annotated populations.
-Early source clusters should sit lower than the sink populations.
+Values should progress from the ductal region toward endocrine endpoints. A disconnected or
+reversed pattern is a reason to revisit the graph and endpoint choices.
 
 ```{code-cell} ipython3
-ds.plots.distribution(
-    keys=pseudotime.pseudotime_key,
-    group_by='clusters',
-    subset_by=pseudotime.validity_key,
-    kind='violin',
-)
+pd.DataFrame(
+    {
+        "cluster": labels[pseudotime.valid],
+        "pseudotime": pseudotime.values[pseudotime.valid],
+    }
+).groupby("cluster")["pseudotime"].describe()
 ```
 
----
-## 3. Identify pseudotime correlated features
-
-`run_pseudotime_marker_search` calculates a correlation coefficient and p-value for each selected feature against the ordering.
-Features that fail the minimum-cell or variance checks remain untested with `NaN` p-values.
-Benjamini-Hochberg adjustment runs only over tested features.
+## 3. Search for pseudotime-associated features
 
 ```{code-cell} ipython3
-markers = ds.run_pseudotime_marker_search(
+marker_ref = ds.run_pseudotime_marker_search(
+    pseudotime_ref,
     features=all_features,
-    cell_key=pseudotime.validity_key,
-    pseudotime_key=pseudotime.pseudotime_key,
 )
-```
-
-The correlations, raw p-values, and adjusted p-values are saved in feature metadata.
-Their generated column names are available as `markers.correlation_key`, `markers.p_value_key`, and `markers.p_value_adjusted_key`.
-The returned `markers.table` contains the same values with feature names, and `markers.feature_selection` retains the exact tested universe.
-
-Count how many features were tested versus left as `NaN`:
-
-```{code-cell} ipython3
-markers.table[["p_value", "p_value_adjusted"]].isna().sum()
-```
-
-```{code-cell} ipython3
+markers = ds.load_pseudotime_markers(marker_ref)
 markers.table[["p_value", "p_value_adjusted"]].notna().sum()
 ```
 
-Rank the strongest positive associations (increasing with pseudotime) and the strongest negative associations (decreasing with pseudotime) separately:
+Untested features retain `NaN` p-values. Benjamini-Hochberg adjustment covers tested features only.
 
 ```{code-cell} ipython3
 tested = markers.table.loc[
     markers.table["p_value_adjusted"].notna(),
     ["feature_name", "r_value", "p_value_adjusted"],
 ]
-(
-    tested.loc[tested["r_value"] > 0]
-    .sort_values("r_value", ascending=False)
-    .head(10)
-)
+increasing = tested.loc[tested["r_value"] > 0].nlargest(10, "r_value")
+decreasing = tested.loc[tested["r_value"] < 0].nsmallest(10, "r_value")
+pd.concat({"increasing": increasing, "decreasing": decreasing})
 ```
 
-```{code-cell} ipython3
-(
-    tested.loc[tested["r_value"] < 0]
-    .sort_values("r_value", ascending=True)
-    .head(10)
-)
-```
-
----
-## 4. Visualize pseudotime correlated features
-
-Use one decreasing ductal-associated gene and one increasing endocrine-associated gene as a biological checkpoint.
-The table confirms that their correlations point in opposite directions and that both pass the adjusted significance threshold.
-
-```{code-cell} ipython3
-checkpoint_genes = ["Spp1", "Cpe"]
-checkpoint = (
-    markers.table.set_index("feature_name")
-    .loc[checkpoint_genes, ["r_value", "p_value_adjusted"]]
-)
-checkpoint
-```
-
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by=checkpoint_genes,
-    n_columns=2,
-    sort_values=True,
-)
-```
-
-`Spp1` should be strongest near the ductal source, while `Cpe` should increase toward endocrine states.
-This agreement is a useful checkpoint, not proof of a causal lineage or evidence that every dynamic gene changes monotonically.
-
-As an optional check, scatter each checkpoint gene against the ordering among scored cells:
-
-```{code-cell} ipython3
-import matplotlib.pyplot as plt
-
-cell_key = pseudotime.validity_key
-ptime = ds.get_cell_vals(
-    from_assay="RNA",
-    cell_key=cell_key,
-    k=pseudotime.pseudotime_key,
-)
-figure, axes = plt.subplots(1, 2, figsize=(8, 3.5), sharex=True)
-for axis, gene in zip(axes, checkpoint_genes, strict=True):
-    expression = ds.get_cell_vals(
-        from_assay="RNA",
-        cell_key=cell_key,
-        k=gene,
-    )
-    axis.scatter(ptime, expression, s=4, alpha=0.35)
-    axis.set(xlabel="Pseudotime", ylabel=gene)
-figure.tight_layout()
-plt.show()
-```
+Correlation is one form of evidence and can miss nonlinear dynamics. Use {doc}`expression_dynamics`
+for smoothed feature profiles and modules, {doc}`fate_mapping` for multiple terminal outcomes, and
+{doc}`trajectory_validation` for component and endpoint checks.
 
 ## Common mistakes and limitations
 
-- Choosing source or sink clusters that do not sit at the intended ends of the trajectory
-- Interpreting linear correlation as the only form of expression dynamics along pseudotime
-- Ignoring `RNA_pseudotime__valid` when the graph has more than one connected component
-
-Use {doc}`expression_dynamics` to group nonlinear expression patterns and {doc}`trajectory_validation` for component policy, marker-testing assumptions, module diagnostics, and fate-probability validation.
+- Choosing source or sink groups that do not sit at the intended ends of the graph
+- Ignoring the validity mask when the graph has multiple components
+- Treating a strong correlation as evidence of causal lineage
+- Comparing trajectory refs built from different graphs without recording that difference

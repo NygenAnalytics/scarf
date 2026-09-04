@@ -34,6 +34,7 @@ from profiling.config import (
     ProfilingConfig,
     StageName,
     StageResources,
+    WorkflowParameters,
     bind_cluster_source,
     load_profiling_config,
 )
@@ -74,6 +75,7 @@ from profiling.spawn_wait import (
 )
 from profiling.metrics import ResourceSampler
 from profiling.stages import (
+    profile_stage_inputs,
     run_stage,
     summarize_resource_measurement,
 )
@@ -81,29 +83,52 @@ from profiling.stages import (
 _WORK = Path("/tmp/scarf-profiling")
 
 
-def _load_hvg_ref(
+def _load_stage_artifact_ref(
     config: ProfilingConfig,
     nRows: int,
-) -> ArtifactRef | None:
-    payload = load_result(config, nRows, "markHvgs")
+    stage: StageName,
+    kind: str,
+) -> ArtifactRef:
+    payload = load_result(config, nRows, stage)
     if payload is None:
-        return None
+        raise ValueError(f"{stage} stage result is unavailable")
     if payload.get("status") != "ok":
-        raise ValueError("markHvgs stage result is not complete")
+        raise ValueError(f"{stage} stage result is not complete")
     details = payload.get("details")
     if not isinstance(details, dict):
-        raise ValueError("markHvgs stage result has no details")
+        raise ValueError(f"{stage} stage result has no details")
     artifact = details.get("artifact")
     if not isinstance(artifact, dict):
-        raise ValueError("markHvgs stage result has no artifact reference")
+        raise ValueError(f"{stage} stage result has no artifact reference")
     ref = ArtifactRef.from_dict(artifact)
-    if (
-        ref.scope != "assay"
-        or ref.assay != config.workflow.assayName
-        or ref.kind != "feature_selection"
-    ):
-        raise ValueError("markHvgs stage result has an invalid feature selection")
+    expected_scope = "datastore" if kind == "cell_selection" else "assay"
+    expected_assay = (
+        None if expected_scope == "datastore" else config.workflow.assayName
+    )
+    if ref.scope != expected_scope or ref.assay != expected_assay or ref.kind != kind:
+        raise ValueError(f"{stage} stage result has an invalid {kind} artifact")
     return ref
+
+
+def _load_stage_input_refs(
+    config: ProfilingConfig,
+    nRows: int,
+    stage: StageName,
+    *,
+    workflow: WorkflowParameters | None = None,
+) -> dict[str, ArtifactRef]:
+    resolved_workflow = config.workflow if workflow is None else workflow
+    return {
+        name: _load_stage_artifact_ref(
+            config,
+            nRows,
+            source_stage,
+            kind,
+        )
+        for name, (source_stage, kind) in profile_stage_inputs(
+            resolved_workflow, stage
+        ).items()
+    }
 
 
 def _e2e_conflicting_uris(
@@ -373,7 +398,12 @@ def run_stage_job(
         workDir=work,
         invalidateCache=force,
         clientProvenance=config.clientProvenance,
-        hvgRef=(_load_hvg_ref(config, nRows) if stage == "runNormalization" else None),
+        inputRefs=_load_stage_input_refs(
+            config,
+            nRows,
+            stage,
+            workflow=workflow,
+        ),
     )
     write_result(config, result, overwrite=force)
     return result.to_json()

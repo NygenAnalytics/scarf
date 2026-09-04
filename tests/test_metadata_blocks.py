@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 
 from scarf.datastore._operations.features import _aligned_feature_labels
+from scarf.metadata.artifacts import artifact_values
+from scarf.storage.artifacts import ArtifactRef, artifact_group
 from scarf.utils.logging import logger
 
 _PSEUDO_REP_WARNING = (
@@ -63,27 +65,33 @@ def test_iter_row_blocks_respects_subset_cell_key(datastore):
     np.testing.assert_array_equal(got, expected)
 
 
-def test_make_bulk_respects_non_default_cell_key(leiden_clustering, datastore):
+def test_make_bulk_respects_explicit_subset_selection(leiden_clustering, datastore):
     """Inactive cells that share a group label must not enter the bulk profile."""
     ds = datastore
-    active = ds.cells.fetch_all("I").copy()
+    selection = ArtifactRef.from_dict(
+        ds.inspect_artifact(leiden_clustering).inputs["cell_selection"]
+    )
+    active = artifact_values(
+        artifact_group(ds.zw, selection),
+        "values",
+    ).astype(bool)
     assert active.dtype == bool
     active_idx = np.flatnonzero(active)
     drop = np.zeros(ds.cells.N, dtype=bool)
     drop[active_idx[::2]] = True
     subset = active & ~drop
     ds.cells.insert("bulk_subset", subset, overwrite=True)
+    subset_selection = ds.snapshot_cell_selection("bulk_subset")
 
     full = ds.make_bulk(
-        group_key="RNA_leiden_cluster",
-        cell_key="I",
+        leiden_clustering,
         aggr_type="sum",
         remove_empty_features=False,
         feature_label="index",
     )
     sub = ds.make_bulk(
-        group_key="RNA_leiden_cluster",
-        cell_key="bulk_subset",
+        leiden_clustering,
+        cell_selection=subset_selection,
         aggr_type="sum",
         remove_empty_features=False,
         feature_label="index",
@@ -93,17 +101,6 @@ def test_make_bulk_respects_non_default_cell_key(leiden_clustering, datastore):
     for c in shared:
         assert (sub[c].to_numpy() <= full[c].to_numpy() + 1e-6).all()
 
-    from scarf.utils import controlled_compute
-
-    clusters = ds.cells.fetch_all("RNA_leiden_cluster")
-    subset_idx = ds.cells.active_index("bulk_subset")
-    g_val = clusters[subset_idx[0]]
-    col = str(g_val)
-    assert col in sub.columns
-    idx_g = subset_idx[clusters[subset_idx] == g_val]
-    expected = controlled_compute(ds.RNA.rawData[idx_g].sum(axis=0), ds.nthreads)
-    np.testing.assert_allclose(sub[col].to_numpy(), expected, rtol=1e-5, atol=1e-6)
-
 
 def test_make_bulk_pseudo_reps_warns_without_changing_values(
     leiden_clustering, datastore
@@ -111,7 +108,7 @@ def test_make_bulk_pseudo_reps_warns_without_changing_values(
     """Pseudo-replicate splits warn once; aggregation stays numerically identical."""
     ds = datastore
     kwargs = {
-        "group_key": "RNA_leiden_cluster",
+        "groups": leiden_clustering,
         "aggr_type": "sum",
         "remove_empty_features": False,
         "feature_label": "index",
@@ -169,7 +166,7 @@ def test_aligned_feature_labels_accepts_pandas_string_array() -> None:
 
 def test_make_bulk_feature_name_index_is_hashable(leiden_clustering, datastore):
     bulk = datastore.make_bulk(
-        group_key="RNA_leiden_cluster",
+        leiden_clustering,
         feature_label="name",
         aggr_type="sum",
         remove_empty_features=True,

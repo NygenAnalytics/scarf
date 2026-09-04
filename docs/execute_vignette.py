@@ -131,6 +131,7 @@ def configure_doc_execution_env(
         {
             "SCARF_MEM_BUDGET": "4G",
             "SCARF_WORKERS": "2",
+            "SCARF_DOCS_DATA_DIR": str(SOURCE_DIR / "scarf_datasets"),
             "OMP_NUM_THREADS": "2",
             "MKL_NUM_THREADS": "2",
             "OPENBLAS_NUM_THREADS": "2",
@@ -138,6 +139,9 @@ def configure_doc_execution_env(
         }
     )
     target.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
+    local_catalog = REPO_ROOT / "build" / "cytebase"
+    if any(local_catalog.glob("*/data.zarr")):
+        target["SCARF_CYTEBASE_LOCAL"] = str(local_catalog)
     return target
 
 

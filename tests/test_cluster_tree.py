@@ -25,12 +25,19 @@ from scarf.storage.artifacts import (
     make_provenance,
     parse_artifact_path,
 )
+from scarf.storage.selections import resolve_selection_artifact
 
 
 class _ClusterTreeStore(_PresentationOperationsMixin):
-    def __init__(self, root: zarr.Group, graph_ref: ArtifactRef) -> None:
+    def __init__(
+        self,
+        root: zarr.Group,
+        graph_ref: ArtifactRef,
+        clusters_ref: ArtifactRef,
+    ) -> None:
         self.zw = root
         self.graph_ref = graph_ref
+        self.clusters_ref = clusters_ref
 
     @staticmethod
     def get_cell_vals(
@@ -75,12 +82,24 @@ def _artifact_cluster_tree_store(
 ) -> tuple[_ClusterTreeStore, dict[str, ArtifactRef], MemoryStore]:
     backing = MemoryStore()
     root = zarr.open_group(store=backing, mode="w")
+    clusters = np.asarray([0, 0, 1, 1, 2, 2, 3, 3], dtype=np.int64)
+    cell_ids = np.asarray([f"cell_{index}" for index in range(len(clusters))])
+    cell_data = root.create_group("cellData")
+    cell_data.create_array("ids", data=cell_ids)
+    cell_data.create_array("I", data=np.ones(len(clusters), dtype=bool))
+    selection = resolve_selection_artifact(
+        root,
+        scope="datastore",
+        kind="cell_selection",
+        values=np.ones(len(clusters), dtype=bool),
+        row_ids=cell_ids,
+        operation="manual_selection",
+        parameters={},
+        inputs={},
+        source_column="I",
+    )
     refs = {
-        "selection": ArtifactRef(
-            scope="datastore",
-            kind="cell_selection",
-            artifact_id="1" * 64,
-        ),
+        "selection": selection,
         "graph": ArtifactRef(
             scope="assay",
             assay="RNA",
@@ -102,12 +121,6 @@ def _artifact_cluster_tree_store(
     }
     _write_complete_artifact(
         root,
-        refs["selection"],
-        operation="manual_selection",
-        inputs={},
-    )
-    _write_complete_artifact(
-        root,
         refs["graph"],
         operation="build_connectivity_map",
         inputs={"cell_selection": refs["selection"]},
@@ -118,7 +131,6 @@ def _artifact_cluster_tree_store(
         operation="fit_paris_hierarchy",
         inputs={"connectivity_map": refs["graph"]},
     )
-    clusters = np.asarray([0, 0, 1, 1, 2, 2, 3, 3], dtype=np.int64)
     _write_complete_artifact(
         root,
         refs["cut"],
@@ -130,10 +142,6 @@ def _artifact_cluster_tree_store(
         },
         arrays={"labels": clusters},
     )
-    cell_data = root.create_group("cellData")
-    cluster_column = cell_data.create_array("clusters", data=clusters)
-    cluster_column.attrs["source_artifact"] = refs["cut"].to_dict()
-
     monkeypatch.setattr(
         paris_persistence,
         "load_hierarchy_group",
@@ -153,7 +161,7 @@ def _artifact_cluster_tree_store(
         "hierarchy_to_dendrogram",
         materialize_dendrogram,
     )
-    return _ClusterTreeStore(root, refs["graph"]), refs, backing
+    return _ClusterTreeStore(root, refs["graph"], refs["cut"]), refs, backing
 
 
 def _prepare_artifact_tree(store: _ClusterTreeStore, **kwargs: object):
@@ -161,9 +169,8 @@ def _prepare_artifact_tree(store: _ClusterTreeStore, **kwargs: object):
     fill_by_value = kwargs.pop("fill_by_value", None)
     return store._prepare_artifact_cluster_tree(
         graph_ref=store.graph_ref,
+        clusters_ref=store.clusters_ref,
         from_assay="RNA",
-        cell_key="I",
-        cluster_key="clusters",
         fill_by_value=fill_by_value,
         invalidate_cache=invalidate_cache,
         **kwargs,
@@ -203,14 +210,23 @@ def _prepared_plot_tree(color_values: np.ndarray | None) -> dict[str, object]:
         "clusters": np.asarray([0, 0, 0, 1, 1, 1]),
         "color_values": color_values,
         "from_assay": "RNA",
-        "cell_key": "I",
         "graph_ref": ArtifactRef(
             scope="assay",
             assay="RNA",
             kind="connectivity_map",
             artifact_id="9" * 64,
         ),
-        "cluster_key": "clusters",
+        "clusters_ref": ArtifactRef(
+            scope="assay",
+            assay="RNA",
+            kind="cluster_cut",
+            artifact_id="8" * 64,
+        ),
+        "cell_selection": ArtifactRef(
+            scope="datastore",
+            kind="cell_selection",
+            artifact_id="7" * 64,
+        ),
         "coalesced_location": "RNA/artifacts/cluster_tree/example",
     }
 
@@ -245,7 +261,8 @@ def test_cluster_tree_renders_categorical_pies_into_external_axis() -> None:
     figure, ax = plt.subplots(figsize=(4, 4))
     result = splt.cluster_tree(
         store,
-        cluster_key="clusters",
+        graph=prepared["graph_ref"],
+        clusters=prepared["clusters_ref"],
         fill_by_value="cell_type",
         color_key={"A": "#ff0000", "B": "#0000ff"},
         show_labels=False,
@@ -255,10 +272,9 @@ def test_cluster_tree_renders_categorical_pies_into_external_axis() -> None:
 
     assert calls == [
         {
-            "graph": None,
+            "graph": prepared["graph_ref"],
+            "clusters": prepared["clusters_ref"],
             "from_assay": None,
-            "cell_key": None,
-            "cluster_key": "clusters",
             "fill_by_value": "cell_type",
         }
     ]
@@ -291,6 +307,8 @@ def test_cluster_tree_renders_continuous_values_and_closes_owned_figure() -> Non
     store = SimpleNamespace(_prepare_cluster_tree=lambda **_kwargs: prepared)
     result = splt.cluster_tree(
         store,
+        graph=prepared["graph_ref"],
+        clusters=prepared["clusters_ref"],
         fill_by_value="score",
         force_ints_as_cats=False,
         cmap="viridis",
@@ -530,9 +548,8 @@ def test_artifact_cluster_tree_rejects_graph_from_different_selection(
     ):
         store._prepare_artifact_cluster_tree(
             graph_ref=other_graph,
+            clusters_ref=refs["cut"],
             from_assay="RNA",
-            cell_key="I",
-            cluster_key="clusters",
             fill_by_value=None,
             invalidate_cache=False,
         )
@@ -562,9 +579,8 @@ def test_artifact_cluster_tree_rejects_graph_scope_mismatch(
     ):
         store._prepare_artifact_cluster_tree(
             graph_ref=datastore_graph,
+            clusters_ref=refs["cut"],
             from_assay="RNA",
-            cell_key="I",
-            cluster_key="clusters",
             fill_by_value=None,
             invalidate_cache=False,
         )

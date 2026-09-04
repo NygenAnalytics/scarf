@@ -6,10 +6,9 @@ import zarr
 from ..storage.artifacts import ArtifactRef, ArtifactStatus, inspect_artifact
 from ..storage.errors import ArtifactResolutionError
 from ..storage.feature_selection import resolve_feature_selection
-from ..storage.selections import validate_stored_selection_artifact
-from .errors import IncompatibleAnalysisStateError
-
-_LEGACY_FEATURE_CONTRACT_KEYS = frozenset({"feat_key", "feature_key"})
+from ..storage.selections import (
+    validate_stored_selection_integrity,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +17,17 @@ class NativeGraphInputs:
 
     neighbors: ArtifactRef
     ann_index: ArtifactRef
+    coordinates: ArtifactRef
+    reduction: ArtifactRef | None
+    normalized: ArtifactRef | None
+    cell_selection: ArtifactRef
+    feature_selection: ArtifactRef | None
+
+
+@dataclass(frozen=True, slots=True)
+class CoordinateInputs:
+    """Validated immutable ancestry for one assay-scoped coordinate artifact."""
+
     coordinates: ArtifactRef
     reduction: ArtifactRef | None
     normalized: ArtifactRef | None
@@ -44,46 +54,13 @@ def _resolution_error(
     )
 
 
-def _legacy_contract_error(
-    message: str,
-    ref: ArtifactRef,
-    *,
-    input_name: str | None = None,
-) -> IncompatibleAnalysisStateError:
-    return IncompatibleAnalysisStateError(
-        message,
-        code="legacy_feature_contract",
-        context={
-            "assay": ref.assay,
-            "artifact_id": ref.artifact_id,
-            "artifact_kind": ref.kind,
-            "input_name": input_name,
-        },
-    )
-
-
-def _contains_legacy_feature_contract(value: object) -> bool:
-    if isinstance(value, Mapping):
-        if any(
-            isinstance(key, str) and key in _LEGACY_FEATURE_CONTRACT_KEYS
-            for key in value
-        ):
-            return True
-        return any(_contains_legacy_feature_contract(item) for item in value.values())
-    if isinstance(value, list | tuple):
-        return any(_contains_legacy_feature_contract(item) for item in value)
-    return False
-
-
 def _integrated_contract_error(
     message: str,
     graph: ArtifactRef,
     *,
     value: object = None,
     input_name: str | None = None,
-) -> ArtifactResolutionError | IncompatibleAnalysisStateError:
-    if _contains_legacy_feature_contract(value):
-        return _legacy_contract_error(message, graph, input_name=input_name)
+) -> ArtifactResolutionError:
     return _resolution_error(
         message,
         code="corrupt_payload",
@@ -99,18 +76,8 @@ def _named_input_contract_error(
     inputs: Mapping[str, object],
     input_name: str,
     value: object,
-) -> ArtifactResolutionError | IncompatibleAnalysisStateError:
-    """Classify a bad named edge without treating modern damage as legacy state."""
-
-    legacy_keys = {
-        key: item for key, item in inputs.items() if key in {"feat_key", "feature_key"}
-    }
-    if (
-        legacy_keys
-        or _contains_legacy_feature_contract(value)
-        or isinstance(value, str)
-    ):
-        return _legacy_contract_error(message, owner, input_name=input_name)
+) -> ArtifactResolutionError:
+    """Return one strict malformed-edge error for every invalid input shape."""
     return _resolution_error(
         message,
         code="corrupt_payload",
@@ -226,28 +193,123 @@ def _input_ref(
 
 
 def _validate_cell_selection(root: zarr.Group, selection: ArtifactRef) -> None:
-    status = _require_complete(
+    _require_complete(
         root,
         selection,
         expected_kind="cell_selection",
         expected_scope="datastore",
         expected_assay=None,
     )
-    source_column = (status.execution_options or {}).get("source_column")
-    if not isinstance(source_column, str) or not source_column:
-        raise _resolution_error(
-            "Cell-selection artifact has no source_column",
-            code="corrupt_payload",
-            ref=selection,
-        )
-    validate_stored_selection_artifact(
+    validate_stored_selection_integrity(
         root,
         selection,
         kind="cell_selection",
         scope="datastore",
         assay=None,
         table_path="cellData",
-        column=source_column,
+    )
+
+
+def resolve_coordinate_inputs(
+    root: zarr.Group,
+    coordinates: ArtifactRef,
+) -> CoordinateInputs:
+    """Resolve and validate the stored selections behind coordinates."""
+    if coordinates.assay is None:
+        raise _resolution_error(
+            "Coordinate artifact has no assay",
+            code="wrong_scope",
+            ref=coordinates,
+            expected_scope="assay",
+        )
+    assay = coordinates.assay
+    if coordinates.kind == "imported_coordinates":
+        _require_complete(
+            root,
+            coordinates,
+            expected_kind="imported_coordinates",
+            expected_scope="assay",
+            expected_assay=assay,
+        )
+        from ..embeddings.imported_storage import (
+            validate_imported_coordinates_artifact,
+        )
+
+        validate_imported_coordinates_artifact(root, coordinates)
+        cell_selection = _input_ref(
+            root,
+            coordinates,
+            "cell_selection",
+            expected_kind="cell_selection",
+            expected_scope="datastore",
+            expected_assay=None,
+        )
+        _validate_cell_selection(root, cell_selection)
+        return CoordinateInputs(
+            coordinates=coordinates,
+            reduction=None,
+            normalized=None,
+            cell_selection=cell_selection,
+            feature_selection=None,
+        )
+    if coordinates.kind not in {"reduction", "batch_correction"}:
+        raise _resolution_error(
+            "Coordinates must be reduction, batch_correction, or imported_coordinates",
+            code="unsupported_graph_kind",
+            ref=coordinates,
+            expected_kind="reduction,batch_correction,imported_coordinates",
+        )
+    _require_complete(
+        root,
+        coordinates,
+        expected_kind=coordinates.kind,
+        expected_scope="assay",
+        expected_assay=assay,
+    )
+    reduction = (
+        _input_ref(
+            root,
+            coordinates,
+            "reduction",
+            expected_kind="reduction",
+            expected_scope="assay",
+            expected_assay=assay,
+        )
+        if coordinates.kind == "batch_correction"
+        else coordinates
+    )
+    normalized = _input_ref(
+        root,
+        reduction,
+        "normalized",
+        expected_kind="normalized",
+        expected_scope="assay",
+        expected_assay=assay,
+    )
+    cell_selection = _input_ref(
+        root,
+        normalized,
+        "cell_selection",
+        expected_kind="cell_selection",
+        expected_scope="datastore",
+        expected_assay=None,
+    )
+    _validate_cell_selection(root, cell_selection)
+    feature_selection = _input_ref(
+        root,
+        normalized,
+        "feature_selection",
+        expected_kind="feature_selection",
+        expected_scope="assay",
+        expected_assay=assay,
+    )
+    feature_selection = resolve_feature_selection(root, assay, feature_selection)
+    return CoordinateInputs(
+        coordinates=coordinates,
+        reduction=reduction,
+        normalized=normalized,
+        cell_selection=cell_selection,
+        feature_selection=feature_selection,
     )
 
 
@@ -375,7 +437,9 @@ def resolve_native_graph_inputs(
         )
 
     if coordinates.kind == "imported_coordinates":
-        from .state import validate_imported_coordinates_artifact
+        from ..embeddings.imported_storage import (
+            validate_imported_coordinates_artifact,
+        )
 
         validate_imported_coordinates_artifact(root, coordinates)
         cell_selection = _input_ref(
@@ -705,6 +769,39 @@ def graph_source_assays(
         ref=graph,
         expected_kind="connectivity_map,neighbors,integrated_graph",
     )
+
+
+def resolve_graph_source_assay(
+    root: zarr.Group,
+    graph: ArtifactRef,
+    requested_assay: str | None,
+    *,
+    parameter_name: str,
+) -> str:
+    """Resolve a native or integrated graph to one validated source assay."""
+    assays = graph_source_assays(root, graph)
+    if graph.scope == "assay":
+        expected = assays[0]
+        if requested_assay is None:
+            return expected
+        if requested_assay != expected:
+            raise _resolution_error(
+                f"{parameter_name} does not match the graph assay",
+                code="wrong_assay",
+                ref=graph,
+                expected_assay=expected,
+            )
+        return expected
+    if requested_assay is None:
+        raise ValueError(f"{parameter_name} is required for an integrated graph")
+    if requested_assay not in assays:
+        raise _resolution_error(
+            f"Integrated graph has no source assay {requested_assay!r}",
+            code="wrong_assay",
+            ref=graph,
+            expected_assay=",".join(assays),
+        )
+    return requested_assay
 
 
 def resolve_graph_assay_inputs(

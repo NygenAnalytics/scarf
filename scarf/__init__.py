@@ -10,11 +10,11 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from . import cytebase as cytebase
     from .datastore.datastore import DataStore as DataStore
-    from .datastore.summary import DataStoreSummary as DataStoreSummary
-    from .graph.errors import (
-        IncompatibleAnalysisStateError as IncompatibleAnalysisStateError,
+    from .datastore.pipeline_run import (
+        PipelineExecutionError as PipelineExecutionError,
+        PipelineRun as PipelineRun,
     )
-    from .graph.state import AssayState as AssayState
+    from .datastore.summary import DataStoreSummary as DataStoreSummary
     from .storage.lineage import ArtifactLineage as ArtifactLineage
     from .features.enrichment import (
         EnrichmentResult as EnrichmentResult,
@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     from .writers import (
         CSVtoZarr as CSVtoZarr,
         CrToZarr as CrToZarr,
+        H5adImportResult as H5adImportResult,
         H5adToZarr as H5adToZarr,
         LoomToZarr as LoomToZarr,
         MtxToZarr as MtxToZarr,
@@ -118,7 +119,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "ArtifactRef": (".storage.refs", "ArtifactRef"),
     "ArtifactResolutionError": (".storage.errors", "ArtifactResolutionError"),
     "ArtifactStatus": (".storage.artifacts", "ArtifactStatus"),
-    "AssayState": (".graph.state", "AssayState"),
     "CSVReader": (".readers", "CSVReader"),
     "CSVtoZarr": (".writers", "CSVtoZarr"),
     "CrDirReader": (".readers", "CrDirReader"),
@@ -132,12 +132,9 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "FateMappingResult": (".trajectory.results", "FateMappingResult"),
     "GffReader": (".features.genomic.gff", "GffReader"),
     "H5adInspectResult": (".readers", "H5adInspectResult"),
+    "H5adImportResult": (".writers", "H5adImportResult"),
     "H5adReader": (".readers", "H5adReader"),
     "H5adToZarr": (".writers", "H5adToZarr"),
-    "IncompatibleAnalysisStateError": (
-        ".graph.errors",
-        "IncompatibleAnalysisStateError",
-    ),
     "LoomReader": (".readers", "LoomReader"),
     "LoomToZarr": (".writers", "LoomToZarr"),
     "MtxReader": (".readers", "MtxReader"),
@@ -161,6 +158,11 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         ".trajectory.results",
         "PseudotimeScoreResult",
     ),
+    "PipelineExecutionError": (
+        ".datastore.pipeline_run",
+        "PipelineExecutionError",
+    ),
+    "PipelineRun": (".datastore.pipeline_run", "PipelineRun"),
     "SparseToZarr": (".writers", "SparseToZarr"),
     "SubsetZarr": (".writers", "SubsetZarr"),
     "clean_array": (".utils", "clean_array"),

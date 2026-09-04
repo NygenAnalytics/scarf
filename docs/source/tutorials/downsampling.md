@@ -1,5 +1,5 @@
 ---
-description: Select representative cells with TopACeDo and write any cell subset to Zarr.
+description: Select representative cells with TopACeDo and export a deliberate subset.
 jupytext:
   text_representation:
     extension: .md
@@ -14,279 +14,132 @@ kernelspec:
 
 # Cell downsampling
 
-TopACeDo selects representative cells from a graph while retaining local structure.
-Use the result to create a smaller Zarr store for workflows that do not need every cell.
+TopACeDo selects representative cells from an explicit graph and Paris clustering. It returns one
+immutable artifact with the selected mask and diagnostics. Nothing is added to cell metadata.
 
-## Prerequisites
+## 1. Open the required artifacts
 
-- Scarf installed with the `extra` optional dependencies
-- The separate `topacedo` package, installed with `uv pip install topacedo`
-
-## What you will learn
-
-- Select topology-preserving representatives with `run_topacedo_sampler`
-- Export selected cells to a new Zarr store with `SubsetZarr`
-
-## Dataset
+TopACeDo requires a Paris cut from the same graph. The rebuilt PBMC store contains a completed
+standard run labeled `docs_default` and a 15-cluster Paris cut built from its graph. Calling
+`run_paris_clustering` with that graph and cut size reuses the exact stored result. A Leiden
+partition or a cut from another graph is rejected.
 
 ```{code-cell} ipython3
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 import scarf
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level='WARNING', progress=True)
-```
+scarf.configure_output(level="WARNING", progress=False)
 
-## 1. Fetch prepared data
-
-TopACeDo samples from a KNN graph and needs Paris cluster labels to balance across partitions, plus the Paris dendrogram for that graph.
-Arbitrary cluster partitions or Leiden-only labels are not enough.
-The published PBMC store supplies counts and a literal UMAP layout.
-It is structurally repacked into a temporary source with the current RNA count layout, then mounted into a fresh analysis store.
-The current graph and Paris artifacts are built there, leaving the published source untouched.
-{doc}`scrna_seq` shows how the {term}`analysis chain` is built, and {doc}`clustering` covers the Paris cut.
-
-```{code-cell} ipython3
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    name='tenx_5K_pbmc_rnaseq',
+    "tenx_5K_pbmc_rnaseq",
+    destination="scarf_datasets",
     zarr=True,
-    destination='scarf_datasets'
 )
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+run = ds.pipeline.open(label="docs_default")
+graph = run["connectivity_map"]
+umap = run["umap"]
+paris = ds.run_paris_clustering(graph, n_clusters=15)
 ```
 
+`paris` is an exact `cluster_cut` ref. Inspect its labels through the dedicated loader:
+
 ```{code-cell} ipython3
-analysis_directory = TemporaryDirectory()
-repacked_counts_path = Path(analysis_directory.name) / 'counts.zarr'
-analysis_path = Path(analysis_directory.name) / 'downsampling.zarr'
-repack_store(
-    f'{dataset}/data.zarr',
-    str(repacked_counts_path),
-    nthreads=2,
-)
-ds = scarf.mount_datastore(
-    str(repacked_counts_path),
-    at=str(analysis_path),
-    default_assay='RNA',
-    nthreads=4,
-)
-
-hvg_ref = ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
-normalized = ds.run_normalization(features=hvg_ref)
-pca = ds.run_pca(normalized, dims=15)
-ds.build_embedding_initialization(pca)
-ann = ds.build_ann_index(pca)
-neighbors = ds.query_neighbors(ann, k=11)
-graph = ds.build_connectivity_map(neighbors)
-paris = ds.run_paris_clustering(
-    graph=graph,
-    label='downsampling_paris',
-)
-paris_key = paris.label_key
-
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by=paris_key,
-)
+paris_result = ds.load_paris_clustering(paris)
+pd.Series(paris_result.labels).value_counts().sort_index()
 ```
 
-Paris clusters on the full UMAP before downsampling.
-
-## 2. Run the TopACeDo downsampler
-
-Some downstream steps remain expensive on every cell.
-TopACeDo selects a topology-preserving subset from Scarf's KNN graph while keeping heterogeneous regions.
+## 2. Sample and inspect the artifact
 
 ```{code-cell} ipython3
-ds.run_topacedo_sampler(
-    graph=graph,
-    cluster_key=paris_key,
-    max_sampling_rate=0.1
+sampling = ds.run_topacedo_sampler(
+    graph,
+    paris,
+    max_sampling_rate=0.1,
 )
-if 'RNA_sketched' not in ds.cells.columns:
-    raise RuntimeError(
-        "TopACeDo did not create RNA_sketched. Verify that topacedo is installed."
-    )
-
+sampling_data = ds.load_artifact(sampling)
+sampled = np.asarray(sampling_data["sampled"][:], dtype=bool)
+seeds = np.asarray(sampling_data["seeds"][:], dtype=bool)
+density = np.asarray(sampling_data["density"][:])
+mean_snn = np.asarray(sampling_data["mean_snn"][:])
 {
-    'active cells': int(ds.cells.fetch_all('I').sum()),
-    'seed cells': int(ds.cells.fetch_all('RNA_sketch_seeds').sum()),
-    'selected cells': int(ds.cells.fetch_all('RNA_sketched').sum()),
+    "cells": int(sampled.size),
+    "selected": int(sampled.sum()),
+    "seeds": int(seeds.sum()),
 }
 ```
 
-Selected cells are marked `True` under `RNA_sketched`.
-Seed cells used to initialize the sampler are marked under `RNA_sketch_seeds`.
-Per-cluster counts show that sampling stays balanced rather than draining one partition:
+The payload also contains `edges`, the sampled Steiner-tree edges in graph row coordinates. All
+arrays use the captured cell-selection order.
 
 ```{code-cell} ipython3
-sampling = ds.cells.to_pandas_dataframe(
-    columns=[paris_key, 'RNA_sketched', 'RNA_sketch_seeds'],
-    key='I',
+summary = pd.DataFrame(
+    {
+        "cluster": paris_result.labels,
+        "sampled": sampled,
+        "seed": seeds,
+        "density": density,
+        "mean_snn": mean_snn,
+    }
 )
-cluster_sampling = sampling.groupby(paris_key, sort=True).agg(
-    cells=(paris_key, 'size'),
-    seeds=('RNA_sketch_seeds', 'sum'),
-    selected=('RNA_sketched', 'sum'),
+summary.groupby("cluster", sort=True).agg(
+    cells=("sampled", "size"),
+    selected=("sampled", "sum"),
+    seeds=("seed", "sum"),
+    mean_density=("density", "mean"),
+    mean_snn=("mean_snn", "mean"),
 )
-cluster_sampling['sampling_rate'] = (
-    cluster_sampling['selected'] / cluster_sampling['cells']
-).round(3)
-cluster_sampling
 ```
 
-Compare the full manifold with the selected cells side by side.
-The right panel should still cover the main clusters:
-
 ```{code-cell} ipython3
+coordinates = np.asarray(ds.load_artifact(umap)["values"][:])
 figure, axes = plt.subplots(1, 2, figsize=(10, 4))
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by=paris_key,
-    legend_loc='on_data',
-    show_titles=False,
-    target=axes[0],
-    show=False,
-)
-axes[0].set_title('Full')
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by=paris_key,
-    subset_by='RNA_sketched',
-    legend_loc='on_data',
-    show_titles=False,
-    target=axes[1],
-    show=False,
-)
-axes[1].set_title('Selected')
+axes[0].scatter(coordinates[:, 0], coordinates[:, 1], s=3)
+axes[0].set_title("All selected cells")
+axes[1].scatter(coordinates[sampled, 0], coordinates[sampled, 1], s=3)
+axes[1].set_title("TopACeDo sample")
 figure.tight_layout()
-figure
 ```
 
-Seed cells are a smaller set used to initialize the sampler:
+Downsampling preserves graph coverage. It does not make the sample a statistically interchangeable
+replacement for the complete dataset.
+
+## 3. Export the selected cells
+
+The sampler mask follows the graph's compact cell-selection order. Map it back to physical row
+indices, then pass those rows directly to `SubsetZarr`. No temporary metadata column is needed.
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by=paris_key,
-    subset_by='RNA_sketch_seeds',
-)
-```
+graph_cell_indices = np.flatnonzero(run.cells.fetch_all("I"))
+sampled_cell_indices = graph_cell_indices[sampled]
 
-## 3. Inspect downsampling parameters
-
-To place seed cells, the sampler estimates density from neighbourhood degree.
-Dense regions get a sampling penalty.
-Per-cell values are stored in `RNA_cell_density`.
-
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='RNA_cell_density',
-)
-```
-
-Higher `RNA_cell_density` marks denser graph neighbourhoods.
-Selection rate by density quantile links that penalty to who was kept:
-
-```{code-cell} ipython3
-density = ds.cells.to_pandas_dataframe(
-    columns=['RNA_cell_density', 'RNA_sketched'],
-    key='I',
-)
-density['density_bin'] = pd.qcut(
-    density['RNA_cell_density'],
-    q=5,
-    duplicates='drop',
-)
-(
-    density.groupby('density_bin', observed=True)
-    .agg(
-        cells=('RNA_sketched', 'size'),
-        selected=('RNA_sketched', 'sum'),
-    )
-    .assign(
-        selection_rate=lambda frame: (
-            frame['selected'] / frame['cells']
-        ).round(3)
-    )
-)
-```
-
-The sampler also scores tight connectivity via mean shared nearest neighbours of each cell's neighbours.
-Tight regions get a sampling reward.
-Values are stored in `RNA_snn_value`.
-
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='RNA_snn_value',
-)
-```
-
-Higher `RNA_snn_value` marks more tightly connected neighbourhoods.
-
-## 4. Export downsampled data
-
-TopACeDo writes cell-metadata columns such as `RNA_sketched` and a sampling artifact in the source store.
-It does not create a smaller counts store.
-`SubsetZarr` does that: it accepts any boolean cell-metadata column, not only a TopACeDo result.
-Use it for a manually annotated population, a QC selection, or the `RNA_sketched` selection below.
-
-```{code-cell} ipython3
-subset_path = Path(analysis_directory.name) / 'subset.zarr'
+export_directory = TemporaryDirectory()
+subset_path = Path(export_directory.name) / "subset.zarr"
 writer = scarf.SubsetZarr(
     zarr_loc=str(subset_path),
     assays=[ds.RNA],
-    cell_key='RNA_sketched',
+    cell_idx=sampled_cell_indices,
     reset_cell_filter=False,
     overwrite_existing_file=True,
 )
 writer.dump()
+
+subset = scarf.DataStore(str(subset_path))
+subset.cells.N, subset.RNA.feats.N
 ```
 
-The output contains selected cells from every assay listed in `assays`.
-`SubsetZarr` retains all features in those assays; it is cell-selective, not feature-selective.
-Use `to_anndata(feature_names=...)` when both axes need to be reduced before disk export.
-
-Open the downsampled store as a new `DataStore`:
-
-```{code-cell} ipython3
-ds2 = scarf.DataStore(str(subset_path))
-{
-    "source cells": ds.cells.N,
-    "subset cells": ds2.cells.N,
-    "source RNA features": ds.RNA.feats.N,
-    "subset RNA features": ds2.RNA.feats.N,
-}
-```
-
-Cell metadata, including UMAP coordinates and cluster labels, is copied into the subset store, so the smaller object plots without recomputing the graph:
-
-```{code-cell} ipython3
-ds2.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by=paris_key,
-)
-```
-
-When the subset fits in memory, export to AnnData for tools in the [scverse](https://scverse.org/) ecosystem:
-
-```{code-cell} ipython3
-adata = ds2.to_anndata()
-adata.shape
-```
+`SubsetZarr` retains every feature in the listed assays. Use `to_anndata` when you need an in-memory
+handoff with both axes constrained.
 
 ## Common mistakes
 
-- Calling `run_topacedo_sampler` without a Paris dendrogram for the graph; Leiden-only labels or other cluster partitions alone are not enough
-- Passing a cluster column that was created from a different cell subset than the graph
-- Treating the sampled cells as a replacement for the full dataset in quantitative analysis
-- Expecting `SubsetZarr` to remove unselected features
-
-TopACeDo writes its selection and diagnostic columns to cell metadata, plus a sampling artifact.
-`SubsetZarr` writes selected cells to a new Zarr store.
+- Passing clusters that do not come from `run_paris_clustering`
+- Passing a Paris cut built from a different graph or cell selection
+- Looking for sampler-created cell columns instead of loading the returned ref
+- Interpreting a topology-preserving sample as an unbiased quantitative subsample

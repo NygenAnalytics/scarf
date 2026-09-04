@@ -19,6 +19,9 @@ class _MemoryMetadata:
     def fetch_all(self, name: str) -> np.ndarray:
         return self._values[name]
 
+    def _get_array(self, name: str) -> np.ndarray:
+        return self._values[name]
+
 
 def _normalization(
     *,
@@ -261,6 +264,42 @@ def test_raw_expression_fingerprint_includes_unmatched_query_features() -> None:
     assert after.alignment_map_fingerprint == before.alignment_map_fingerprint
     assert after.raw_expression_fingerprint != before_fingerprint
     assert before.raw_expression_fingerprint == before_fingerprint
+
+
+def test_raw_expression_fingerprint_tracks_live_normalization_scalars() -> None:
+    counts = np.array([[2, 3], [5, 7]], dtype=np.uint32)
+    assay, _, _ = _query_assay(counts, ["a", "b"])
+    options = {
+        "reference_ids": np.array(["a", "b"]),
+        "means": np.zeros(2),
+        "normalization": _normalization(renormalize_subset=False),
+        "policy": "zero",
+    }
+    before = _stream(assay, **options)
+    before_values = _collect(before)
+    before_fingerprint = before.raw_expression_fingerprint
+
+    assay.cells._values["RNA_nCounts"][0] *= 2
+    after = _stream(assay, **options)
+
+    assert after.raw_expression_fingerprint != before_fingerprint
+    assert not np.array_equal(_collect(after), before_values)
+
+
+def test_subset_renormalization_fingerprint_ignores_unused_live_scalars() -> None:
+    counts = np.array([[2, 3], [5, 7]], dtype=np.uint32)
+    assay, _, _ = _query_assay(counts, ["a", "b"])
+    options = {
+        "reference_ids": np.array(["a", "b"]),
+        "means": np.zeros(2),
+        "normalization": _normalization(renormalize_subset=True),
+        "policy": "zero",
+    }
+    before = _stream(assay, **options).raw_expression_fingerprint
+
+    assay.cells._values["RNA_nCounts"][0] *= 2
+
+    assert _stream(assay, **options).raw_expression_fingerprint == before
 
 
 def test_aligned_feature_stream_bounds_rows_under_tiny_budget() -> None:

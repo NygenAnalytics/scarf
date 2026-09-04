@@ -947,11 +947,8 @@ def test_h5ad_reader_streams_cell_and_feature_metadata(h5ad_reader):
         "clusters",
         "S_score",
         "G2M_score",
-        "X_pca1",
-        "X_pca50",
-        "X_umap1",
-        "X_umap2",
     } <= cell_columns.keys()
+    assert not any(key.startswith(("X_pca", "X_umap")) for key in cell_columns)
     assert all(
         values.shape == (h5ad_reader.nCells,) for values in cell_columns.values()
     )
@@ -959,11 +956,6 @@ def test_h5ad_reader_streams_cell_and_feature_metadata(h5ad_reader):
         cell_columns["clusters_coarse"][:3],
         np.array([b"Pre-endocrine", b"Ductal", b"Endocrine"]),
     )
-    np.testing.assert_allclose(
-        cell_columns["X_umap1"][:3],
-        np.array([6.143066, -9.906417, 7.559791], dtype=np.float32),
-    )
-
     feature_columns = dict(h5ad_reader.get_feat_columns())
     assert feature_columns.keys() == {"highly_variable_genes"}
     assert feature_columns["highly_variable_genes"].shape == (h5ad_reader.nFeatures,)
@@ -1067,13 +1059,7 @@ def test_h5ad_reader_dense_matrix_and_group_metadata(tmp_path):
         np.testing.assert_array_equal(reader.feat_names(), [b"Gene B", b"Gene A"])
 
         cell_columns = dict(reader.get_cell_columns())
-        assert cell_columns.keys() == {
-            "batch",
-            "state",
-            "nGenes",
-            "X_embed1",
-            "X_embed2",
-        }
+        assert cell_columns.keys() == {"batch", "state", "nGenes"}
         np.testing.assert_array_equal(cell_columns["batch"], [b"A", b"B", b"A"])
         np.testing.assert_array_equal(
             cell_columns["state"],
@@ -1087,7 +1073,7 @@ def test_h5ad_reader_dense_matrix_and_group_metadata(tmp_path):
             np.array([5, 7, np.nan]),
             equal_nan=True,
         )
-        np.testing.assert_array_equal(cell_columns["X_embed2"], [2, 4, 6])
+        assert not any(key.startswith("X_embed") for key in cell_columns)
 
         feature_columns = dict(reader.get_feat_columns())
         assert feature_columns.keys() == {
@@ -1112,7 +1098,6 @@ def test_h5ad_reader_dense_matrix_and_group_metadata(tmp_path):
             "per_cell_counts" in message and "dataframe" in message
             for message in messages
         )
-        assert any("sparse_embed" in message for message in messages)
         assert not any("__categories" in message for message in messages)
         assert reader.feature_types("feature_type") == [
             "Gene Expression",
@@ -1126,6 +1111,88 @@ def test_h5ad_reader_dense_matrix_and_group_metadata(tmp_path):
     finally:
         logger.remove(sink)
         reader.h5.close()
+
+    selected = H5adReader(
+        str(file_name),
+        embedding_roles={"X_embed": "umap"},
+        cluster_keys=("state",),
+    )
+    try:
+        assert selected.embeddingRoles == {"X_embed": "umap"}
+        assert selected.clusterKeys == ("state",)
+        assert set(dict(selected.get_cell_columns())) == {"batch", "nGenes"}
+        np.testing.assert_array_equal(
+            selected._cell_column_block("state", 1, 3)[0],
+            [b"resting", b"cycling"],
+        )
+    finally:
+        selected.h5.close()
+
+
+def test_h5ad_reader_streams_compound_obs_cluster_fields(tmp_path):
+    import h5py
+
+    from scarf.readers import H5adReader
+
+    file_name = tmp_path / "compound_obs.h5ad"
+    values = np.array(
+        [[1, 0], [0, 2], [3, 0], [0, 4]],
+        dtype=np.uint16,
+    )
+    _write_sparse_h5ad(file_name, values)
+    obs_dtype = np.dtype(
+        [
+            ("_index", "S8"),
+            ("state", np.int8),
+            ("batch", "S1"),
+            ("vector", np.float32, (2,)),
+        ]
+    )
+    obs_values = np.zeros(values.shape[0], dtype=obs_dtype)
+    obs_values["_index"] = [b"cell_0", b"cell_1", b"cell_2", b"cell_3"]
+    obs_values["state"] = [0, -1, 1, 9]
+    obs_values["batch"] = [b"A", b"B", b"A", b"B"]
+    obs_values["vector"] = np.arange(8, dtype=np.float32).reshape(4, 2)
+    with h5py.File(file_name, mode="r+") as h5:
+        del h5["obs"]
+        h5.create_dataset("obs", data=obs_values)
+        uns = h5.create_group("uns")
+        uns.create_dataset(
+            "state_categories",
+            data=np.array([b"cycling", b"resting"]),
+        )
+
+    reader = H5adReader(
+        str(file_name),
+        feature_name_key="feature_name",
+        cluster_keys=("state",),
+    )
+    try:
+        assert reader.clusterKeys == ("state",)
+        assert reader._cell_column_value_dtype("state") == np.dtype("S7")
+        decoded, missing = reader._cell_column_block("state", 1, 4)
+        np.testing.assert_array_equal(
+            decoded,
+            np.array([None, b"resting", None], dtype=object),
+        )
+        np.testing.assert_array_equal(missing, [True, False, True])
+        np.testing.assert_array_equal(
+            reader._cell_ids_block(1, 3),
+            [b"cell_1", b"cell_2"],
+        )
+        assert set(dict(reader.get_cell_columns())) == {"batch", "vector"}
+    finally:
+        reader.h5.close()
+
+    with pytest.raises(
+        TypeError,
+        match="Cluster key 'vector' must contain one scalar value per cell",
+    ):
+        H5adReader(
+            str(file_name),
+            feature_name_key="feature_name",
+            cluster_keys=("vector",),
+        )
 
 
 def test_h5ad_reader_sizes_axes_from_nullable_columns(tmp_path):

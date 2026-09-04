@@ -4,7 +4,7 @@ from typing import Any, Literal, cast
 import numpy as np
 import pandas as pd
 import zarr
-from numba import njit, prange
+from numba import njit
 
 from ..matrix import ChunkedArray
 from ..metadata import MetaData
@@ -33,7 +33,7 @@ def _read_facade_block(
     return _read_block(zarr_arr, row_idx, col_idx)
 
 
-@njit(parallel=True, cache=True)
+@njit(cache=True, nogil=True)
 def _hvg_stats_gene_major_kernel(
     values: np.ndarray,
     inv: np.ndarray,
@@ -47,7 +47,7 @@ def _hvg_stats_gene_major_kernel(
     """Accumulate lib-size HVG stats over selected cells in a raw block."""
     n_genes = values.shape[0]
     n_selected = selected.shape[0]
-    for g in prange(n_genes):
+    for g in range(n_genes):
         target = dest[g]
         if target < 0:
             continue
@@ -346,7 +346,7 @@ class RNAassay(Assay):
             assert pending_labels is not None
             yield emit(pending_cols, pending_labels)
 
-    def save_normalized_data(
+    def _write_normalized_payload(
         self,
         cell_idx: np.ndarray,
         feat_idx: np.ndarray,
@@ -357,7 +357,7 @@ class RNAassay(Assay):
         mirror: zarr.Array | None = None,
     ) -> ChunkedArray:
         if not renormalize_subset:
-            return super().save_normalized_data(
+            return super()._write_normalized_payload(
                 cell_idx,
                 feat_idx,
                 location,
@@ -791,9 +791,6 @@ class RNAassay(Assay):
         """
         import time
 
-        import numba
-        from numba import set_num_threads
-
         from ..storage.feature_stream import map_feature_cell_bands
         from ..utils.process import process_rss_mb
 
@@ -827,15 +824,9 @@ class RNAassay(Assay):
         n_feats = int(counts_t.shape[0])
         dest_of = np.full(n_feats, -1, dtype=np.int64)
         dest_of[feat_idx] = np.arange(n_features, dtype=np.int64)
-        threads = min(
-            max(1, int(self.resources.workers)),
-            max(1, int(numba.config.NUMBA_NUM_THREADS)),
-        )
-        previous_threads = numba.get_num_threads()
         logger.info(
             f"({self.name}) feature stats consume "
             f"workers={self.resources.workers} "
-            f"numbaThreads={threads} "
             f"memoryBytes={self.resources.memoryBytes}"
         )
 
@@ -893,7 +884,6 @@ class RNAassay(Assay):
 
         consume_metrics: dict[str, object] = {}
         try:
-            set_num_threads(threads)
             for item in map_feature_cell_bands(
                 counts_t,
                 process_band,
@@ -923,7 +913,6 @@ class RNAassay(Assay):
                 s1[destinations[keep]] = merged[1][keep]
                 s2[destinations[keep]] = merged[2][keep]
         finally:
-            set_num_threads(previous_threads)
             if consume_metrics:
                 logger.info(
                     f"({self.name}) feature stats execution "
@@ -999,6 +988,7 @@ class RNAassay(Assay):
         blacklist: str,
         keep_bounds: bool,
         bin_strategy: Literal["fixed", "adaptive"] = "adaptive",
+        feature_names: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return an HVG mask and corrected variance from sufficient stats."""
         from ..features.variability import (
@@ -1035,12 +1025,22 @@ class RNAassay(Assay):
                 lowess_frac,
                 bin_strategy=bin_strategy,
             )
+        resolved_feature_names = (
+            np.asarray(self.feats.fetch_all("names"))
+            if feature_names is None
+            else np.asarray(feature_names)
+        )
+        if resolved_feature_names.shape != expected:
+            raise ValueError(
+                f"RNA feature names must have shape {expected}, got "
+                f"{resolved_feature_names.shape}"
+            )
         values = select_highly_variable_features(
             corrected_variance=corrected_variance,
             normalized_cell_counts=normed_n,
             mean_nonzero=nz_mean,
             active_features=np.ones(self.feats.N, dtype=bool),
-            feature_names=np.asarray(self.feats.fetch_all("names")),
+            feature_names=resolved_feature_names,
             min_cells=min_cells,
             max_cells=max_cells,
             top_n=top_n,

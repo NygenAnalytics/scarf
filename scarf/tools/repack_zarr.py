@@ -23,6 +23,7 @@ from scarf.storage.layout import (
     get_compressors,
     normalize_chunks,
 )
+from scarf.storage.pipeline_runs import _copy_pipeline_label_claims
 from scarf.storage.profiles import StorageProfile
 from scarf.storage.sharding import write_counts_t, write_dense_in_shard_rows
 from scarf.storage.stores import open_store
@@ -104,6 +105,21 @@ def _count_assays(store: zarr.Group) -> list[tuple[str, str | None]]:
 
     visit(store, "")
     return assays
+
+
+def _retired_assay_state_paths(store: zarr.Group) -> frozenset[str]:
+    paths: set[str] = set()
+
+    def visit(group: zarr.Group, path: str) -> None:
+        for name in group.group_keys():
+            child_path = f"{path}/{name}" if path else name
+            child = as_zarr_group(group[name], name=child_path)
+            if child.attrs.get("is_assay") and "state" in child:
+                paths.add(f"{child_path}/state")
+            visit(child, child_path)
+
+    visit(store, "")
+    return frozenset(paths)
 
 
 def _counts_t_path(counts_path: str) -> str:
@@ -339,6 +355,9 @@ def repack_store(
 ) -> None:
     """Copy a Zarr store to v3 and shard discovered assay count matrices.
 
+    Retired per-assay ``state`` groups are omitted. They cannot identify current
+    artifacts and all analysis must be recomputed after the rewrite.
+
     Args:
         input_path: Source Zarr directory or URI.
         output_path: Destination Zarr directory or URI (created or overwritten).
@@ -364,7 +383,8 @@ def repack_store(
         f"{assay_name}/counts" if workspace is None else f"matrices/{assay_name}/counts"
         for assay_name, workspace in assays
     )
-    skip_paths = frozenset(_counts_t_path(path) for path in count_paths)
+    state_paths = _retired_assay_state_paths(src)
+    skip_paths = frozenset(_counts_t_path(path) for path in count_paths) | state_paths
     _copy_group(
         src,
         dst,
@@ -373,6 +393,7 @@ def repack_store(
         shardedCounts=count_paths,
         skipPaths=skip_paths,
     )
+    _copy_pipeline_label_claims(src, dst)
     for assay_name, workspace in assays:
         counts_path = (
             f"{assay_name}/counts"

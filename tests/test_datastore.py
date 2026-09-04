@@ -6,6 +6,7 @@ import pytest
 import zarr
 from scipy.spatial import procrustes
 from sklearn.metrics import adjusted_rand_score
+from zarr.storage import MemoryStore
 
 import scarf
 import scarf.plotting as splt
@@ -13,7 +14,8 @@ from scarf.assay import Assay
 from scarf.datastore.datastore import DataStore
 from scarf.datastore.mapping_datastore import MappingDatastore
 from scarf.metadata import MetaData
-from scarf.storage.artifacts import ArtifactRef
+from scarf.metadata.artifacts import artifact_values
+from scarf.storage.artifacts import ArtifactRef, artifact_group
 from scarf.storage.count_matrix import CountMatrixPolicy
 from scarf.trajectory.results import (
     PseudotimeAggregationResult,
@@ -198,7 +200,10 @@ def test_cached_initialization_is_read_and_write_free():
 def test_partial_initialization_preserves_feature_summary_cache(monkeypatch):
     store, expected_reads = _qc_store()
     datastore = _open_qc_store(store)
-    selection = datastore.select_detected_features(min_cells=1)
+    selection = datastore.select_detected_features(
+        datastore.snapshot_cell_selection(),
+        min_cells=1,
+    )
     summary = ArtifactRef.from_dict(
         datastore.inspect_artifact(selection).inputs["feature_summary"]
     )
@@ -219,7 +224,13 @@ def test_partial_initialization_preserves_feature_summary_cache(monkeypatch):
         "_compute_feature_summary",
         lambda *_: pytest.fail("valid feature summary should be reused"),
     )
-    assert reopened.select_detected_features(min_cells=1) == selection
+    assert (
+        reopened.select_detected_features(
+            reopened.snapshot_cell_selection(),
+            min_cells=1,
+        )
+        == selection
+    )
 
 
 def test_percent_cache_remains_attribute_only():
@@ -351,6 +362,37 @@ class TestDataStore:
         with pytest.raises(ValueError):
             DataStore(str(out_fn), zarr_mode="wrong", default_assay="RNA")
 
+    @pytest.mark.parametrize("zarr_mode", ["r", "r+"])
+    def test_init_rejects_legacy_assay_state_without_mutation(
+        self,
+        zarr_mode,
+    ):
+        store = MemoryStore()
+        root = zarr.open_group(store=store, mode="w")
+        assay = root.create_group("RNA")
+        assay.attrs["is_assay"] = True
+        assay.create_group("featureData")
+        assay.create_array("counts", shape=(1, 1), dtype=np.uint32)
+        state = assay.create_group("state")
+        state.attrs["state"] = {"assay": "RNA", "legacy": True}
+        root_attrs = dict(root.attrs)
+        state_attrs = dict(state.attrs)
+
+        with pytest.raises(
+            ValueError,
+            match=r"RNA/state.*never reads or migrates.*rebuild",
+        ):
+            DataStore(
+                store,
+                default_assay="RNA",
+                min_features_per_cell=0,
+                zarr_mode=zarr_mode,
+            )
+
+        reopened = zarr.open_group(store=store, mode="r")
+        assert dict(reopened.attrs) == root_attrs
+        assert dict(reopened["RNA/state"].attrs) == state_attrs
+
     def test_nthreads_env_and_explicit_precedence(
         self, toy_crdir_writer, tmp_path, monkeypatch
     ):
@@ -378,54 +420,33 @@ class TestDataStore:
         assert explicit.resources.workers == 2
 
     def test_auto_filter_cells(self, datastore_ephemeral):
-        assert (
-            datastore_ephemeral.auto_filter_cells(
-                attrs=["nCounts", "nFeatures", "non_existing_column"],
-                show_qc_plots=False,
-            )
-            is None
+        before = np.asarray(datastore_ephemeral.cells.fetch_all("I")).copy()
+        ref = datastore_ephemeral.auto_filter_cells(
+            attrs=["RNA_nCounts", "RNA_nFeatures"],
+        )
+        assert ref.kind == "cell_selection"
+        assert datastore_ephemeral.inspect_artifact(ref).complete
+        np.testing.assert_array_equal(
+            datastore_ephemeral.cells.fetch_all("I"),
+            before,
         )
 
-    def test_auto_filter_cells_uses_modern_distribution(
+    def test_auto_filter_cells_does_not_mix_computation_with_plotting(
         self, datastore_ephemeral, monkeypatch
     ):
-        calls = []
-        active_before = int(datastore_ephemeral.cells.fetch_all("I").sum())
-
-        def record_distribution(store, *, keys, cell_key=None, **kwargs):
-            if cell_key is None:
-                n_cells = store.cells.N
-            else:
-                n_cells = len(store.cells.active_index(cell_key))
-            calls.append(
-                {
-                    "keys": list(keys),
-                    "cell_key": cell_key,
-                    "n_cells": n_cells,
-                    "active_i": int(store.cells.fetch_all("I").sum()),
-                    **kwargs,
-                }
-            )
-
-        monkeypatch.setattr(splt, "distribution", record_distribution)
-        datastore_ephemeral.auto_filter_cells(
-            attrs=["RNA_nCounts", "RNA_nFeatures"],
-            show_qc_plots=True,
+        before = np.asarray(datastore_ephemeral.cells.fetch_all("I")).copy()
+        monkeypatch.setattr(
+            splt,
+            "distribution",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("filtering must not invoke plotting")
+            ),
         )
-
-        assert [call["title"] for call in calls] == [
-            "Pre-filtering distribution",
-            "Post-filtering distribution",
-        ]
-        assert [call["color"] for call in calls] == ["steelblue", "coral"]
-        assert [call["cell_key"] for call in calls] == [None, "I"]
-        assert all(call["keys"] == ["RNA_nCounts", "RNA_nFeatures"] for call in calls)
-        assert all(call["show"] is True for call in calls)
-        # Filtering happens before both plots; pre includes filtered-out cells.
-        assert calls[0]["active_i"] < active_before
-        assert calls[0]["n_cells"] == datastore_ephemeral.cells.N
-        assert calls[1]["n_cells"] == calls[1]["active_i"]
-        assert calls[0]["n_cells"] >= calls[1]["n_cells"]
+        ref = datastore_ephemeral.auto_filter_cells(
+            attrs=["RNA_nCounts", "RNA_nFeatures"],
+        )
+        assert ref.kind == "cell_selection"
+        np.testing.assert_array_equal(datastore_ephemeral.cells.fetch_all("I"), before)
 
     def test_auto_filter_cells_skips_qc_when_no_attrs(
         self, datastore_ephemeral, monkeypatch
@@ -437,13 +458,10 @@ class TestDataStore:
                 AssertionError("distribution should not be called")
             ),
         )
-        assert (
-            datastore_ephemeral.auto_filter_cells(
-                attrs=["missing_a", "missing_b"],
-                show_qc_plots=True,
-            )
-            is None
+        ref = datastore_ephemeral.auto_filter_cells(
+            attrs=[],
         )
+        assert ref.kind == "cell_selection"
 
     def test_assay_names_tolerates_repeated_group_listings(
         self, datastore_ephemeral, monkeypatch
@@ -473,16 +491,42 @@ class TestDataStore:
         assert datastore_ephemeral.assay_names == expected
 
     def test_filter_cells(self, datastore_ephemeral):
-        assert (
-            datastore_ephemeral.filter_cells(
-                attrs=["nCounts", "nFeatures", "non_existing_column"],
-                lows=[None, None, None],
-                highs=[None, None, None],
-                reset_previous=True,
-            )
-            is None
+        before = np.asarray(datastore_ephemeral.cells.fetch_all("I")).copy()
+        ref = datastore_ephemeral.filter_cells(
+            attrs=["RNA_nCounts", "RNA_nFeatures"],
+            lows=[None, None],
+            highs=[None, None],
         )
-        # still doesn't access `if j is None:` cases for j and k
+        assert ref.kind == "cell_selection"
+        np.testing.assert_array_equal(datastore_ephemeral.cells.fetch_all("I"), before)
+
+    def test_filtering_rejects_explicit_missing_metadata_columns(
+        self,
+        datastore_ephemeral,
+    ):
+        before = np.asarray(datastore_ephemeral.cells.fetch_all("I")).copy()
+        calls = (
+            (
+                datastore_ephemeral.filter_cells,
+                {
+                    "attrs": ["missing_a", "missing_b"],
+                    "lows": [None, None],
+                    "highs": [None, None],
+                },
+            ),
+            (
+                datastore_ephemeral.auto_filter_cells,
+                {"attrs": ["missing_a", "missing_b"]},
+            ),
+        )
+        for operation, kwargs in calls:
+            with pytest.raises(
+                KeyError,
+                match="Cell metadata columns not found: 'missing_a', 'missing_b'",
+            ):
+                operation(**kwargs)
+
+        np.testing.assert_array_equal(datastore_ephemeral.cells.fetch_all("I"), before)
 
     def test_graph_indices(self, graph_artifacts, datastore):
         expected = np.load(full_path("knn_indices.npy"))
@@ -517,7 +561,7 @@ class TestDataStore:
         relative_error = np.abs(observed - expected) / np.maximum(expected, 1e-12)
         assert np.median(relative_error) < 0.25
 
-    def test_graph_weights(self, graph_artifacts, datastore):
+    def test_graph_weights(self, graph_artifacts, connectivity_graph, datastore):
         from umap.umap_ import compute_membership_strengths, smooth_knn_dist
 
         indices = np.asarray(datastore.z[graph_artifacts]["indices"][:])
@@ -539,9 +583,7 @@ class TestDataStore:
         )
         a = np.asarray(expected, dtype=np.float32)
         a = a[a > 0]
-        state = datastore.get_assay_state("RNA")
-        assert state is not None and state.connectivity_map is not None
-        graph_path = datastore.inspect_artifact(state.connectivity_map).path
+        graph_path = datastore.inspect_artifact(connectivity_graph).path
         b = datastore.z[graph_path]["weights"][:]
         np.testing.assert_allclose(a, b, rtol=0, atol=1e-5)
 
@@ -590,52 +632,67 @@ class TestDataStore:
         )
         assert relative_mae < 0.1
 
-    def test_leiden_values(self, leiden_clustering, cell_attrs):
-        labels = np.asarray(leiden_clustering)
+    def test_leiden_values(self, leiden_clustering, cell_attrs, datastore):
+        labels = artifact_values(
+            artifact_group(datastore.zw, leiden_clustering),
+            "values",
+        )
         unique = np.unique(labels)
         assert np.array_equal(unique, np.arange(1, unique.size + 1))
         assert unique.size >= 2
         expected = cell_attrs["RNA_leiden_cluster"].values
-        agreement = adjusted_rand_score(expected, leiden_clustering)
+        agreement = adjusted_rand_score(expected, labels)
         assert agreement >= 0.6
 
-    def test_paris_values(self, paris_clustering):
-        labels = np.asarray(paris_clustering, dtype=np.int32)
+    def test_paris_values(self, paris_clustering, datastore):
+        labels = artifact_values(
+            artifact_group(datastore.zw, paris_clustering),
+            "labels",
+        ).astype(np.int32)
         assert labels.ndim == 1
         assert np.array_equal(np.unique(labels), np.arange(1, 11))
         assert np.bincount(labels)[1:].min() > 0
 
-    def test_paris_adaptive_values(self, paris_clustering_auto):
-        labels = np.asarray(paris_clustering_auto, dtype=np.int32)
+    def test_paris_adaptive_values(self, paris_clustering_auto, datastore):
+        labels = artifact_values(
+            artifact_group(datastore.zw, paris_clustering_auto),
+            "labels",
+        ).astype(np.int32)
         unique = np.unique(labels)
         assert labels.ndim == 1
         assert np.array_equal(unique, np.arange(1, unique.size + 1))
         assert np.bincount(labels)[1:].min() >= 10
 
     def test_run_cell_cycle_scoring(self, cell_cycle_scoring, datastore):
-        phase = np.asarray(cell_cycle_scoring)
-        assert phase.shape == (len(datastore.cells.active_index("I")),)
+        group = artifact_group(datastore.zw, cell_cycle_scoring)
+        phase = artifact_values(group, "phase")
+        selection = ArtifactRef.from_dict(
+            datastore.inspect_artifact(cell_cycle_scoring).inputs["cell_selection"]
+        )
+        n_selected = int(
+            artifact_values(artifact_group(datastore.zw, selection), "values").sum()
+        )
+        assert phase.shape == (n_selected,)
         assert set(np.unique(phase)) <= {"G1", "S", "G2M"}
         assert {"G1", "S"} <= set(phase)
-        source = ArtifactRef.from_dict(
-            datastore.zw["cellData/RNA_cell_cycle_phase"].attrs["source_artifact"]
-        )
-        status = datastore.inspect_artifact(source)
+        status = datastore.inspect_artifact(cell_cycle_scoring)
         assert status.operation == "run_cell_cycle_scoring"
         assert set(status.inputs or {}) == {"feature_summary", "cell_selection"}
-        for column in ("RNA_S_score", "RNA_G2M_score"):
-            assert np.isfinite(datastore.cells.fetch(column)).all()
+        assert np.isfinite(artifact_values(group, "s_score")).all()
+        assert np.isfinite(artifact_values(group, "g2m_score")).all()
+        assert "RNA_cell_cycle_phase" not in datastore.cells.columns
 
-    def test_umap_values(self, umap, cell_attrs):
+    def test_umap_values(self, umap, cell_attrs, datastore):
+        values = artifact_values(artifact_group(datastore.zw, umap), "values")
         precalc_umap = cell_attrs[["RNA_UMAP1", "RNA_UMAP2"]].values
-        assert umap.shape == precalc_umap.shape
-        _, _, disparity = procrustes(precalc_umap, umap)
+        assert values.shape == precalc_umap.shape
+        _, _, disparity = procrustes(precalc_umap, values)
         assert disparity < 0.25
+        assert "RNA_UMAP1" not in datastore.cells.columns
 
     def test_get_markers(self, marker_search, paris_clustering, datastore):
         markers = datastore.get_markers(
             marker=marker_search,
-            group_key="RNA_cluster",
             group_id=1,
         )
 
@@ -650,18 +707,22 @@ class TestDataStore:
     def test_get_markers_all_groups(self, marker_search, paris_clustering, datastore):
         all_markers = datastore.get_markers(
             marker=marker_search,
-            group_key="RNA_cluster",
             group_id=None,
         )
         assert "group_id" in all_markers.columns
-        groups = set(datastore.cells.fetch("RNA_cluster", key="I"))
+        groups = {
+            str(value)
+            for value in artifact_values(
+                artifact_group(datastore.zw, paris_clustering),
+                "labels",
+            )
+        }
         assert set(all_markers["group_id"]).issubset(groups)
         one = datastore.get_markers(
             marker=marker_search,
-            group_key="RNA_cluster",
             group_id=1,
         )
-        from_all = all_markers[all_markers["group_id"] == 1].reset_index(drop=True)
+        from_all = all_markers[all_markers["group_id"] == "1"].reset_index(drop=True)
         assert len(from_all) == len(one)
         assert from_all["feature_name"].equals(one["feature_name"])
 
@@ -670,20 +731,26 @@ class TestDataStore:
     ):
         out_file = str(tmp_path / "test_values_markers.csv")
         datastore.export_markers_to_csv(
-            group_key="RNA_cluster",
-            csv_filename=out_file,
             marker=marker_search,
+            csv_filename=out_file,
         )
         markers = pd.read_csv(out_file)
-        groups = sorted(np.unique(paris_clustering))
-        assert list(markers.columns) == [str(group) for group in groups]
+        groups = sorted(
+            str(value)
+            for value in np.unique(
+                artifact_values(
+                    artifact_group(datastore.zw, paris_clustering),
+                    "labels",
+                )
+            )
+        )
+        assert list(markers.columns) == groups
         for group in groups:
             expected = datastore.get_markers(
                 marker=marker_search,
-                group_key="RNA_cluster",
-                group_id=int(group),
+                group_id=group,
             ).feature_name.reset_index(drop=True)
-            actual = markers[str(group)].dropna().reset_index(drop=True)
+            actual = markers[group].dropna().reset_index(drop=True)
             assert actual.equals(expected)
 
     def test_repr(self, datastore):
@@ -697,43 +764,30 @@ class TestDataStore:
         assert "Cell metadata:" in text
         assert "ids" in text
 
-    def test_get_imputed(self, graph_artifacts, datastore):
-        del graph_artifacts
+    def test_get_imputed(self, connectivity_graph, datastore):
         feature_name = "CD4"
-        state = datastore.get_assay_state("RNA")
-        assert state is not None and state.connectivity_map is not None
-        raw = datastore.get_cell_vals(from_assay="RNA", cell_key="I", k=feature_name)
+        diffusion = datastore.run_diffusion_operator(connectivity_graph, t=2)
         values = datastore.get_imputed(
             feature_name=feature_name,
-            graph=state.connectivity_map,
+            diffusion=diffusion,
             from_assay="RNA",
-            cell_key="I",
-            t=2,
-            cache_operator=False,
         )
-        assert values.shape == raw.shape
-        assert np.all(np.isfinite(values))
-        assert not np.allclose(values, raw)
-
-        from scarf.neighbors.diffusion import diffusion_operator
-
         graph = datastore.load_graph(
-            graph=state.connectivity_map,
-            from_assay="RNA",
-            cell_key="I",
+            graph=connectivity_graph,
             symmetric=True,
             upper_only=False,
         )
-        expected = diffusion_operator(graph, power=2).dot(raw)
-        np.testing.assert_allclose(values, expected)
+        assert values.shape == (graph.shape[0],)
+        assert np.all(np.isfinite(values))
 
+        smoother_diffusion = datastore.run_diffusion_operator(
+            connectivity_graph,
+            t=4,
+        )
         smoother = datastore.get_imputed(
             feature_name=feature_name,
-            graph=state.connectivity_map,
+            diffusion=smoother_diffusion,
             from_assay="RNA",
-            cell_key="I",
-            t=4,
-            cache_operator=False,
         )
         assert smoother.std() < values.std()
 
@@ -761,55 +815,62 @@ class TestDataStore:
 
     def test_run_doublet_detection(
         self,
-        graph_artifacts,
+        connectivity_graph,
         paris_clustering,
         datastore,
     ):
-        score_col = datastore.run_doublet_detection(
-            cluster_key="RNA_cluster", simulation_ratio=0.5, random_seed=1
+        columns_before = set(datastore.cells.columns)
+        score_ref = datastore.run_doublet_detection(
+            paris_clustering,
+            connectivity_graph,
+            simulation_ratio=0.5,
+            random_seed=1,
         )
-        col = "RNA_doublet_score"
-        assert score_col == col
-        assert col in datastore.cells.columns
-        scores = datastore.cells.fetch(col)
-        n_active = datastore.cells.active_index("I").shape[0]
-        assert scores.shape[0] == n_active
+        assert score_ref.kind == "doublet_score"
+        scores = artifact_values(artifact_group(datastore.zw, score_ref), "values")
+        n_graph = datastore.load_graph(connectivity_graph).shape[0]
+        assert scores.shape == (n_graph,)
         assert not np.isnan(scores).any()
         assert scores.min() >= 0.0 and scores.max() <= 1.0
-        raw_ref = datastore.zw["cellData"][col].attrs["source_artifact"]
-        score_ref = ArtifactRef.from_dict(raw_ref)
-        assert score_ref.kind == "doublet_score"
-        # scratch column used for smoothing should be removed
-        assert "RNA_doublet_score__raw" not in datastore.cells.columns
-        # the temporary query owns and removes its projection
+        assert set(datastore.cells.columns) == columns_before
         assert not datastore.list_artifacts(
             kind="projection",
             from_assay="RNA",
         )
-        state = datastore.get_assay_state("RNA")
-        assert state is not None
-        assert state.connectivity_map is not None
-        assert state.neighbors is not None
         score_status = datastore.inspect_artifact(score_ref)
-        assert (
-            ArtifactRef.from_dict(score_status.inputs["neighbors"]) == state.neighbors
+        neighbors = ArtifactRef.from_dict(score_status.inputs["neighbors"])
+        reference_refs = datastore.list_artifacts(
+            kind="mapping_reference",
+            from_assay="RNA",
+            scope="assay",
+            complete_only=True,
         )
-        reference = datastore.get_mapping_reference()
-        assert reference.neighbors == state.neighbors
+        matching = [
+            ref
+            for ref in reference_refs
+            if datastore.get_mapping_reference(ref).neighbors == neighbors
+        ]
+        assert matching
+        reference = datastore.get_mapping_reference(matching[-1])
+        assert reference.neighbors == neighbors
         assert reference.symphony_state is None
 
     def test_run_doublet_detection_bad_cluster_key(
         self,
-        graph_artifacts,
+        connectivity_graph,
         datastore,
     ):
         import pytest
 
         with pytest.raises(ValueError):
-            datastore.run_doublet_detection(cluster_key="not_a_column")
+            datastore.run_doublet_detection(
+                connectivity_graph,
+                connectivity_graph,
+            )
 
-    def test_run_pseudotime_scoring(self, pseudotime_scoring):
-        values = np.asarray(pseudotime_scoring)
+    def test_run_pseudotime_scoring(self, pseudotime_scoring, datastore):
+        result = datastore.load_pseudotime_scoring(pseudotime_scoring)
+        values = result.values[result.valid]
         assert values.ndim == 1
         assert np.isfinite(values).all()
         assert values.min() >= 0
@@ -818,62 +879,44 @@ class TestDataStore:
 
     def test_run_pseudotime_scoring_current_contract(
         self,
-        leiden_clustering,
         datastore_ephemeral,
         monkeypatch,
     ):
-        datastore_ephemeral.auto_filter_cells(show_qc_plots=False)
-        features = datastore_ephemeral.mark_hvgs(
+        selection = datastore_ephemeral.auto_filter_cells()
+        features = datastore_ephemeral.select_hvgs(
+            selection,
             from_assay="RNA",
-            cell_key="I",
             top_n=100,
-            label="hvgs",
             show_plot=False,
             bin_strategy="fixed",
         )
-        build_neighbourhood_graph(
+        graph = build_neighbourhood_graph(
             datastore_ephemeral,
             features=features,
             local_cache=False,
         )
-        datastore_ephemeral.cells.insert(
-            "RNA_leiden_cluster",
-            leiden_clustering,
-            key="I",
-            overwrite=True,
+        leiden_clustering = datastore_ephemeral.run_leiden_clustering(graph)
+        labels = artifact_values(
+            artifact_group(datastore_ephemeral.zw, leiden_clustering),
+            "values",
         )
+        unique = np.unique(labels)
         arguments = {
-            "source_sink_key": "RNA_leiden_cluster",
-            "sources": [6],
-            "sinks": [3],
+            "source_sink": leiden_clustering,
+            "sources": [int(unique[0])],
+            "sinks": [int(unique[-1])],
             "n_singular_vals": 10,
         }
-        result = datastore_ephemeral.run_pseudotime_scoring(
+        ref = datastore_ephemeral.run_pseudotime_scoring(
+            graph,
             **arguments,
-            label="reliability_test",
         )
 
-        output_key = "RNA_reliability_test"
-        validity_key = f"{output_key}__valid"
+        result = datastore_ephemeral.load_pseudotime_scoring(ref)
         assert isinstance(result, PseudotimeScoreResult)
-        assert result.pseudotime_key == output_key
-        assert result.validity_key == validity_key
         assert result.values.shape == result.valid.shape
         np.testing.assert_array_equal(result.valid, np.ones_like(result.valid))
-        assert validity_key in datastore_ephemeral.cells.columns
-        pseudotime_ref = ArtifactRef.from_dict(
-            datastore_ephemeral.zw["cellData"][output_key].attrs["source_artifact"]
-        )
-        assert pseudotime_ref.kind == "pseudotime"
-        assert (
-            ArtifactRef.from_dict(
-                datastore_ephemeral.zw["cellData"][validity_key].attrs[
-                    "source_artifact"
-                ]
-            )
-            == pseudotime_ref
-        )
-        values = datastore_ephemeral.cells.fetch(output_key, key=validity_key)
+        values = result.values[result.valid]
         assert np.isfinite(values).all()
         assert values.min() >= 0.0
         assert values.max() <= 1.0
@@ -889,48 +932,30 @@ class TestDataStore:
             fail_if_recomputed,
         )
         cached = datastore_ephemeral.run_pseudotime_scoring(
+            graph,
             **arguments,
-            label="reliability_cached",
         )
-        cached_ref = ArtifactRef.from_dict(
-            datastore_ephemeral.zw["cellData"][cached.pseudotime_key].attrs[
-                "source_artifact"
-            ]
-        )
-        assert cached_ref == pseudotime_ref
-        np.testing.assert_allclose(cached.values, result.values)
+        assert cached == ref
 
     def test_run_pseudotime_marker_search(
         self,
         pseudotime_markers,
         datastore,
     ):
-        assert isinstance(pseudotime_markers, PseudotimeMarkerResult)
-        assert pseudotime_markers.feature_selection == datastore.resolve_features(
-            "RNA",
-            "detected_features",
-        )
-        expected_indices = np.flatnonzero(
-            datastore.RNA.feats.fetch_all("detected_features")
-        )
+        result = datastore.load_pseudotime_markers(pseudotime_markers)
+        assert isinstance(result, PseudotimeMarkerResult)
+        feature_mask = artifact_values(
+            artifact_group(datastore.zw, result.feature_selection),
+            "values",
+        ).astype(bool)
+        expected_indices = np.flatnonzero(feature_mask)
         np.testing.assert_array_equal(
-            pseudotime_markers.table["feature_index"].to_numpy(),
+            result.table["feature_index"].to_numpy(),
             expected_indices,
         )
-        assert np.isfinite(pseudotime_markers.table["r_value"]).all()
-        assert pseudotime_markers.table["p_value"].between(0, 1).all()
-        marker_ref = ArtifactRef.from_dict(
-            datastore.RNA.z["featureData/I__RNA_pseudotime__r"].attrs["source_artifact"]
-        )
-        assert marker_ref.kind == "pseudotime_markers"
-        assert (
-            ArtifactRef.from_dict(
-                datastore.RNA.z["featureData/I__RNA_pseudotime__p"].attrs[
-                    "source_artifact"
-                ]
-            )
-            == marker_ref
-        )
+        assert np.isfinite(result.table["r_value"]).all()
+        assert result.table["p_value"].between(0, 1).all()
+        assert pseudotime_markers.kind == "pseudotime_markers"
 
     def test_run_pseudotime_aggregation(
         self,
@@ -938,20 +963,17 @@ class TestDataStore:
         datastore,
         monkeypatch,
     ):
-        agg_group = datastore.zw[pseudotime_aggregation.storage_path]
+        result = datastore.load_pseudotime_aggregation(pseudotime_aggregation)
+        agg_group = artifact_group(datastore.zw, pseudotime_aggregation)
         test_values = agg_group["feature_indices"][:]
-        assert isinstance(pseudotime_aggregation, PseudotimeAggregationResult)
-        assert (
-            ArtifactRef.from_dict(
-                datastore.RNA.z["featureData/pseudotime_clusters"].attrs[
-                    "source_artifact"
-                ]
-            ).kind
-            == "pseudotime_aggregation"
-        )
+        assert isinstance(result, PseudotimeAggregationResult)
+        feature_mask = artifact_values(
+            artifact_group(datastore.zw, result.feature_selection),
+            "values",
+        ).astype(bool)
         np.testing.assert_array_equal(
             test_values.astype(np.int64),
-            np.flatnonzero(datastore.RNA.feats.fetch_all("detected_features")),
+            np.flatnonzero(feature_mask),
         )
 
         assert agg_group.attrs["complete"] is True
@@ -960,17 +982,17 @@ class TestDataStore:
         assert np.isfinite(agg_group["data"][:]).all()
         valid_features = np.asarray(agg_group["valid_features"][:], dtype=bool)
         np.testing.assert_array_equal(
-            pseudotime_aggregation.feature_indices,
+            result.feature_indices,
             test_values[valid_features],
         )
-        assert pseudotime_aggregation.data.shape[0] == valid_features.sum()
-        clusters = datastore.RNA.feats.fetch_all("pseudotime_clusters")
+        assert result.data.shape[0] == valid_features.sum()
+        clusters = np.asarray(agg_group["cluster_values"][:])
         assigned = clusters[test_values[valid_features].astype(int)]
         assert assigned.min() >= 1
         assert assigned.max() <= 15
         assert len(np.unique(assigned)) == 15
         np.testing.assert_array_equal(
-            pseudotime_aggregation.feature_clusters,
+            result.feature_clusters,
             assigned,
         )
         assert np.all(clusters[test_values[~valid_features].astype(int)] == -1)
@@ -983,28 +1005,21 @@ class TestDataStore:
             fail_if_recomputed,
         )
         cached = datastore.run_pseudotime_aggregation(
-            features=pseudotime_aggregation.feature_selection,
-            pseudotime_key="RNA_pseudotime",
-            cluster_label="pseudotime_clusters_cached",
+            result.pseudotime,
+            features=result.feature_selection,
             n_clusters=15,
             window_size=50,
             chunk_size=10,
         )
-        assert cached.storage_path == pseudotime_aggregation.storage_path
-        cached_ref = ArtifactRef.from_dict(
-            datastore.RNA.z["featureData/pseudotime_clusters_cached"].attrs[
-                "source_artifact"
-            ]
-        )
-        assert cached_ref == ArtifactRef.from_dict(
-            datastore.RNA.z["featureData/pseudotime_clusters"].attrs["source_artifact"]
-        )
+        assert cached == pseudotime_aggregation
 
     def test_add_grouped_assay(self, grouped_assay, datastore):
         test_values = datastore.get_cell_vals(
             from_assay="PTIME_MODULES", cell_key="I", k="group_1"
         )
-        groups = datastore.RNA.feats.fetch_all("pseudotime_clusters")
+        groups = np.asarray(
+            artifact_group(datastore.zw, grouped_assay)["cluster_values"][:]
+        )
         feature_index = np.where(groups == 1)[0]
         expected = (
             datastore.RNA.normed(
@@ -1017,8 +1032,13 @@ class TestDataStore:
         assert np.allclose(expected, test_values)
 
     def test_make_bulk(self, leiden_clustering, datastore):
-        df = datastore.make_bulk(group_key="RNA_leiden_cluster")
-        groups = np.unique(leiden_clustering)
+        df = datastore.make_bulk(leiden_clustering)
+        groups = np.unique(
+            artifact_values(
+                artifact_group(datastore.zw, leiden_clustering),
+                "values",
+            )
+        )
         assert df.shape == (18850, len(groups))
         np.testing.assert_array_equal(df.columns.to_numpy(), groups.astype(str))
         assert np.isfinite(df.values).all()
@@ -1038,16 +1058,28 @@ class TestDataStore:
             datastore.RNA.to_raw_sparse("I").toarray(),
         )
 
-    def test_run_topacedo_sampler(self, paris_clustering, topacedo_sampler):
-        assert topacedo_sampler.dtype == bool
-        assert topacedo_sampler.shape == paris_clustering.shape
-        cluster_sizes = np.bincount(paris_clustering)[1:]
-        sampled_sizes = np.bincount(
-            paris_clustering[topacedo_sampler],
-            minlength=int(paris_clustering.max()) + 1,
-        )[1:]
-        assert np.all(sampled_sizes >= 3)
-        assert np.all(sampled_sizes < cluster_sizes)
+    def test_run_topacedo_sampler(
+        self,
+        paris_clustering,
+        topacedo_sampler,
+        datastore,
+    ):
+        assert topacedo_sampler.kind == "sampling"
+        group = artifact_group(datastore.zw, topacedo_sampler)
+        sampled = artifact_values(group, "sampled").astype(bool)
+        edges = artifact_values(
+            group,
+            "edges",
+        )
+        labels = artifact_values(
+            artifact_group(datastore.zw, paris_clustering),
+            "labels",
+        )
+        assert sampled.shape == labels.shape
+        assert sampled.any()
+        assert edges.ndim == 2 and edges.shape[1] == 2
+        assert edges.min() >= 0
+        assert edges.max() < len(labels)
 
     def test_plot_distributions(self, datastore):
         result = splt.distribution(
@@ -1061,18 +1093,18 @@ class TestDataStore:
 
     def test_plot_embedding(self, umap, paris_clustering, datastore):
         result = datastore.plots.embedding(
-            layout_key="RNA_UMAP",
-            color_by="RNA_cluster",
+            layout=umap,
+            color_by=paris_clustering,
             show=False,
         )
         assert isinstance(result, splt.PlotResult)
-        assert result.provenance.notes[:2] == ("embedding", "materialized")
+        assert result.provenance.notes[:2] == ("embedding", "artifact")
         result.close()
 
     def test_plot_embedding_raster(self, umap, datastore):
         result = splt.embedding_raster(
             datastore,
-            layout_key="RNA_UMAP",
+            layout=umap,
             color_by="RNA_nCounts",
             pixels=64,
             show=False,
@@ -1081,10 +1113,16 @@ class TestDataStore:
         assert result.provenance.renderer == "matplotlib-raster"
         result.close()
 
-    def test_plot_cluster_tree(self, paris_clustering, datastore):
+    def test_plot_cluster_tree(
+        self,
+        paris_clustering,
+        connectivity_graph,
+        datastore,
+    ):
         result = splt.cluster_tree(
             datastore,
-            cluster_key="RNA_cluster",
+            graph=connectivity_graph,
+            clusters=paris_clustering,
             show=False,
         )
         assert isinstance(result, splt.PlotResult)
@@ -1095,7 +1133,6 @@ class TestDataStore:
         result = splt.marker_heatmap(
             datastore,
             marker=marker_search,
-            group_key="RNA_cluster",
             show=False,
         )
         assert isinstance(result, splt.PlotResult)
@@ -1105,10 +1142,7 @@ class TestDataStore:
     def test_plot_pseudotime_heatmap(self, pseudotime_aggregation, datastore):
         result = splt.pseudotime_heatmap(
             datastore,
-            cell_key="I",
-            features=pseudotime_aggregation.feature_selection,
-            feature_cluster_key="pseudotime_clusters",
-            pseudotime_key="RNA_pseudotime",
+            aggregation=pseudotime_aggregation,
             show_features=["Wsb1", "Rest"],
             show=False,
         )
@@ -1139,19 +1173,21 @@ class TestDataStore:
                 import_module(module_name)
 
     def test_mark_hvgs_with_atac_assay(self, atac_datastore):
-        import pytest
-
         with pytest.raises(TypeError):
-            atac_datastore.mark_hvgs()
+            atac_datastore.select_hvgs(
+                atac_datastore.snapshot_cell_selection(),
+                show_plot=False,
+            )
 
     def test_mark_hvgs_default_max_cells_excludes_ubiquitous(self, datastore_ephemeral):
         datastore = datastore_ephemeral
         n_selected = int(np.asarray(datastore.cells.fetch_all("I"), dtype=bool).sum())
         expected_max = n_selected - 20
-        default_ref = datastore.mark_hvgs(
+        selection = datastore.snapshot_cell_selection()
+        default_ref = datastore.select_hvgs(
+            selection,
             show_plot=False,
             top_n=10,
-            label="effective_default_hvgs",
         )
         default_parameters = datastore.inspect_artifact(default_ref).parameters
         assert default_parameters["max_cells"] == expected_max
@@ -1159,10 +1195,10 @@ class TestDataStore:
         assert default_parameters["top_n"] == 10
         assert default_parameters["bin_strategy"] == "adaptive"
 
-        infinite_ref = datastore.mark_hvgs(
+        infinite_ref = datastore.select_hvgs(
+            selection,
             show_plot=False,
             top_n=10,
-            label="infinite_max_hvgs",
             max_cells=np.inf,
         )
         infinite_parameters = datastore.inspect_artifact(infinite_ref).parameters
@@ -1176,8 +1212,8 @@ class TestDataStore:
         monkeypatch,
     ):
         assay = datastore.RNA
-        fixed = datastore.mark_hvgs(
-            label="fixed_summary_hvgs",
+        fixed = datastore.select_hvgs(
+            auto_filter_cells,
             show_plot=False,
             bin_strategy="fixed",
         )
@@ -1189,8 +1225,8 @@ class TestDataStore:
             pytest.fail("HVG calculation must reuse the feature-summary artifact")
 
         monkeypatch.setattr(assay, "_compute_feature_summary", fail_matrix_pass)
-        adaptive = datastore.mark_hvgs(
-            label="adaptive_summary_hvgs",
+        adaptive = datastore.select_hvgs(
+            auto_filter_cells,
             show_plot=False,
             bin_strategy="adaptive",
         )
@@ -1203,10 +1239,8 @@ class TestDataStore:
         )
 
     def test_mark_prevalent_peaks_with_rna_assay(self, datastore):
-        import pytest
-
         with pytest.raises(TypeError):
-            datastore.mark_prevalent_peaks()
+            datastore.select_prevalent_peaks(datastore.snapshot_cell_selection())
 
     def test_mark_prevalent_peaks_links_selection_artifact(
         self,
@@ -1214,22 +1248,18 @@ class TestDataStore:
         atac_datastore,
         monkeypatch,
     ):
-        column = atac_datastore.ATAC.z["featureData/prevalent_peaks"]
-        ref = ArtifactRef.from_dict(column.attrs["source_artifact"])
-
+        ref = mark_prevalent_peaks
         assert ref.kind == "feature_selection"
         status = atac_datastore.inspect_artifact(ref)
-        assert status.operation == "mark_prevalent_peaks"
+        assert status.operation == "select_prevalent_peaks"
         assert status.inputs["feature_summary"]["kind"] == "feature_summary"
         assert status.parameters == {"top_n": 5000}
-        atac_datastore.mark_prevalent_peaks(top_n=5000)
-        refreshed = ArtifactRef.from_dict(
-            atac_datastore.ATAC.z["featureData/prevalent_peaks"].attrs[
-                "source_artifact"
-            ]
+        refreshed = atac_datastore.select_prevalent_peaks(
+            atac_datastore.snapshot_cell_selection(),
+            top_n=5000,
         )
         assert refreshed == ref
-        before = np.asarray(atac_datastore.ATAC.feats.fetch_all("prevalent_peaks"))
+        columns_before = set(atac_datastore.ATAC.feats.columns)
         monkeypatch.setattr(
             atac_datastore.ATAC,
             "_prevalent_peak_mask",
@@ -1238,37 +1268,31 @@ class TestDataStore:
             ),
         )
         with pytest.raises(RuntimeError, match="interrupted selection computation"):
-            atac_datastore.mark_prevalent_peaks(top_n=4000)
-        np.testing.assert_array_equal(
-            atac_datastore.ATAC.feats.fetch_all("prevalent_peaks"),
-            before,
-        )
-        assert (
-            ArtifactRef.from_dict(
-                atac_datastore.ATAC.z["featureData/prevalent_peaks"].attrs[
-                    "source_artifact"
-                ]
+            atac_datastore.select_prevalent_peaks(
+                atac_datastore.snapshot_cell_selection(),
+                top_n=4000,
             )
-            == ref
-        )
+        assert set(atac_datastore.ATAC.feats.columns) == columns_before
+        assert atac_datastore.inspect_artifact(ref).complete
 
-    def test_run_marker_search_with_no_groupkey(self, datastore, mark_hvgs):
-        import pytest
+    def test_run_marker_search_requires_explicit_clusters(self, datastore, mark_hvgs):
+        with pytest.raises(TypeError, match="ArtifactRef"):
+            datastore.run_marker_search(
+                None,  # type: ignore[arg-type]
+                features=mark_hvgs,
+            )
 
-        with pytest.raises(ValueError):
-            datastore.run_marker_search(group_key=None, features=mark_hvgs)
-
-    def test_run_marker_search_with_cellkey(
+    def test_run_marker_search_with_explicit_refs(
         self,
         datastore,
         paris_clustering,
         mark_hvgs,
     ):
-        datastore.run_marker_search(
-            group_key="RNA_cluster",
-            cell_key="I",
+        ref = datastore.run_marker_search(
+            paris_clustering,
             features=mark_hvgs,
         )
+        assert ref.kind == "marker_table"
 
     def test_streaming_feature_stats_matches_three_pass(self, datastore):
         from scarf.utils import controlled_compute

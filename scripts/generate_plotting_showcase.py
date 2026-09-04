@@ -2,6 +2,7 @@
 
 import argparse
 from collections.abc import Hashable, Sequence
+from hashlib import file_digest
 from pathlib import Path
 import shutil
 import tarfile
@@ -12,7 +13,11 @@ import numpy as np
 import pandas as pd
 
 from scarf import DataStore
+from scarf.embeddings import write_imported_embedding
 import scarf.plotting as splt
+from scarf.storage.artifacts import ArtifactRef, fingerprint_array
+from scarf.storage.selections import read_stored_selection_indices
+from scarf.storage.types import as_zarr_array
 
 
 _FIXTURE = Path("tests/datasets/1K_pbmc_citeseq.zarr.tar.gz")
@@ -23,8 +28,24 @@ _MARKER_SETS = {
     "Myeloid": ("LST1", "FCER1G", "CTSS"),
     "Cytotoxic": ("NKG7", "GNLY", "GZMB"),
 }
-_CLUSTER_KEY = "RNA_leiden_cluster"
-_CELL_CYCLE_KEY = "RNA_cell_cycle_phase"
+_CLUSTER_LABEL = "Leiden cluster"
+_CELL_CYCLE_LABEL = "Cell-cycle phase"
+# These internal legend identities preserve the committed composite geometry.
+# They are replaced with the friendly labels before saving and are never metadata keys.
+_CLUSTER_LEGEND_ID = "RNA_leiden_cluster"
+_CELL_CYCLE_LEGEND_ID = "RNA_cell_cycle_phase"
+_SHOWCASE_PALETTE = (
+    "#4e79a7",
+    "#f28e2b",
+    "#e15759",
+    "#76b7b2",
+    "#59a14f",
+    "#edc948",
+    "#b07aa1",
+    "#ff9da7",
+    "#9c755f",
+    "#bab0ac",
+)
 
 
 def _zarr_root(directory: Path) -> Path:
@@ -55,18 +76,18 @@ def _copy_fixture(source: Path, destination: Path) -> Path:
     return _zarr_root(destination)
 
 
-def _build_graph(store: DataStore) -> None:
+def _build_graph(
+    store: DataStore,
+    cell_selection: ArtifactRef,
+    features: ArtifactRef,
+) -> ArtifactRef:
     normalized = store.run_normalization(
-        from_assay="RNA",
-        cell_key="I",
-        features="hvgs",
-        update_state=False,
+        cell_selection,
+        features,
     )
     reduction = store.run_pca(
         normalized,
         dims=11,
-        pca_cell_key="I",
-        update_state=False,
         local_cache=False,
     )
     ann_index = store.build_ann_index(
@@ -75,33 +96,38 @@ def _build_graph(store: DataStore) -> None:
         ann_ef=50,
         ann_m=48,
         rand_state=4466,
-        update_state=False,
-    )
-    store.build_embedding_initialization(
-        reduction,
-        n_centroids=1000,
-        rand_state=4466,
     )
     neighbors = store.query_neighbors(
         ann_index,
         coordinates=reduction,
         k=11,
-        update_state=False,
     )
-    store.build_connectivity_map(neighbors)
+    return store.build_connectivity_map(neighbors)
 
 
-def _apply_fixed_layout(store: DataStore, source: Path) -> None:
+def _import_fixed_layout(
+    store: DataStore,
+    cell_selection: ArtifactRef,
+    source: Path,
+) -> ArtifactRef:
     with np.load(source, allow_pickle=False) as fixture:
         cell_ids = fixture["cellIds"].astype(str)
         umap = fixture["umap"]
 
     fixture_index = pd.Index(cell_ids)
-    current_ids = np.asarray(store.cells.fetch("ids")).astype(str)
-    positions = fixture_index.get_indexer(current_ids)
+    selected = read_stored_selection_indices(
+        store.zw,
+        cell_selection,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+    )
+    selected_ids = np.asarray(store.cells.fetch_all("ids")).astype(str)[selected]
+    positions = fixture_index.get_indexer(selected_ids)
     if (
         not fixture_index.is_unique
-        or len(fixture_index) != len(current_ids)
+        or len(fixture_index) != len(selected_ids)
         or np.any(positions < 0)
     ):
         raise ValueError(
@@ -109,18 +135,19 @@ def _apply_fixed_layout(store: DataStore, source: Path) -> None:
         )
     if umap.shape != (len(fixture_index), 2):
         raise ValueError(f"Layout fixture at {source} must contain two UMAP columns")
-
-    store.cells.insert(
-        "RNA_UMAP1",
-        umap[positions, 0],
-        key="I",
-        overwrite=True,
-    )
-    store.cells.insert(
-        "RNA_UMAP2",
-        umap[positions, 1],
-        key="I",
-        overwrite=True,
+    coordinates = np.asarray(umap[positions], dtype=np.float32)
+    with source.open("rb") as stream:
+        source_digest = file_digest(stream, "sha256").digest()
+    return write_imported_embedding(
+        store.zw,
+        assay="RNA",
+        dimreduc_key="plotting_showcase_umap",
+        role="umap",
+        coordinates=coordinates,
+        source_digest=source_digest,
+        payload_fingerprints={"values": fingerprint_array(coordinates)},
+        source_cell_ids=selected_ids,
+        cell_selection=cell_selection,
     )
 
 
@@ -128,29 +155,38 @@ def _prepare_store(
     source: Path,
     work_directory: Path,
     layout_fixture: Path = _LAYOUT_FIXTURE,
-) -> DataStore:
+) -> tuple[DataStore, dict[str, ArtifactRef]]:
     store = DataStore(
         str(_copy_fixture(source, work_directory)),
         default_assay="RNA",
         nthreads=2,
     )
-    store.auto_filter_cells(show_qc_plots=False)
-    if "hvgs" not in store._get_assay("RNA").feats.columns:
-        store.mark_hvgs(
-            top_n=100,
-            show_plot=False,
-            bin_strategy="fixed",
-            min_cells=int(0.01 * store.cells.N),
-            max_cells=np.inf,
-            blacklist="^MT-|^RPS|^RPL|^MRPS|^MRPL|^CCN|^HLA-|^H2-|^HIST",
-        )
-    state = store.get_assay_state("RNA")
-    if state is None or state.connectivity_map is None:
-        _build_graph(store)
-    if _CLUSTER_KEY not in store.cells.columns:
-        store.run_leiden_clustering()
-    _apply_fixed_layout(store, layout_fixture)
-    return store
+    cell_selection = store.auto_filter_cells()
+    features = store.select_hvgs(
+        cell_selection,
+        top_n=100,
+        show_plot=False,
+        bin_strategy="fixed",
+        min_cells=int(0.01 * store.cells.N),
+        max_cells=np.inf,
+        blacklist="^MT-|^RPS|^RPL|^MRPS|^MRPL|^CCN|^HLA-|^H2-|^HIST",
+    )
+    marker_features = store.set_feature_selection(
+        from_assay="RNA",
+        mask=np.ones(store.get_assay("RNA").feats.N, dtype=bool),
+    )
+    graph = _build_graph(store, cell_selection, features)
+    clusters = store.run_leiden_clustering(graph)
+    cell_cycle = store.run_cell_cycle_scoring(cell_selection)
+    layout = _import_fixed_layout(store, cell_selection, layout_fixture)
+    return store, {
+        "cell_selection": cell_selection,
+        "features": marker_features,
+        "graph": graph,
+        "clusters": clusters,
+        "cell_cycle": cell_cycle,
+        "layout": layout,
+    }
 
 
 def _marker_sets(store: DataStore) -> dict[str, list[str]]:
@@ -190,11 +226,42 @@ def _normalize_svg(path: Path) -> Path:
     return path
 
 
-def _relative_cycling_share_per_cluster(store: DataStore) -> dict[object, str]:
+def _label_categorical_legend(result: splt.PlotResult, label: str) -> None:
+    for legend in result.legends:
+        if legend.kind == "categorical":
+            legend.label = label
+
+
+def _artifact_values(
+    store: DataStore,
+    artifact: ArtifactRef,
+    value_name: str,
+) -> np.ndarray:
+    group = store.load_artifact(artifact)
+    return np.asarray(as_zarr_array(group[value_name], name=value_name)[:])
+
+
+def _showcase_categorical_scale(values: np.ndarray) -> splt.CategoricalScale:
+    order = tuple(sorted(pd.unique(values).tolist()))
+    if len(order) > len(_SHOWCASE_PALETTE):
+        return splt.CategoricalScale(order=order)
+    return splt.CategoricalScale(
+        order=order,
+        palette=dict(zip(order, _SHOWCASE_PALETTE, strict=False)),
+    )
+
+
+def _relative_cycling_share_per_cluster(
+    store: DataStore,
+    clusters: ArtifactRef,
+    cell_cycle: ArtifactRef,
+) -> dict[object, str]:
     """Group clusters by their relative share of cells outside G1."""
-    clusters = pd.Series(np.asarray(store.cells.fetch(_CLUSTER_KEY)))
-    phases = pd.Series(np.asarray(store.cells.fetch(_CELL_CYCLE_KEY)).astype(str))
-    share = (phases != "G1").groupby(clusters).mean()
+    cluster_values = _artifact_values(store, clusters, "values")
+    phase_values = _artifact_values(store, cell_cycle, "phase").astype(str)
+    if cluster_values.shape != phase_values.shape:
+        raise ValueError("Cluster and cell-cycle artifacts do not align")
+    share = (pd.Series(phase_values) != "G1").groupby(cluster_values).mean()
     n_groups = min(3, len(share))
     labels = ("low", "medium", "high")[:n_groups]
     bins = pd.qcut(
@@ -209,17 +276,24 @@ def _expression_matrix_figures(
     store: DataStore,
     output_directory: Path,
     markers: dict[str, list[str]],
+    *,
+    clusters: ArtifactRef,
+    cell_cycle: ArtifactRef,
+    features: ArtifactRef,
 ) -> list[Path]:
     outputs: list[Path] = []
     marker_table = store.run_marker_search(
-        group_key=_CLUSTER_KEY,
-        features="all_features",
+        clusters,
+        features=features,
     )
-    cycling_share = _relative_cycling_share_per_cluster(store)
+    cycling_share = _relative_cycling_share_per_cluster(
+        store,
+        clusters,
+        cell_cycle,
+    )
     cycling_scale = splt.CategoricalScale(order=("low", "medium", "high"))
     heatmap = splt.marker_heatmap(
         store,
-        group_key=_CLUSTER_KEY,
         marker=marker_table,
         topn=4,
         figsize=(6.0, 7.5),
@@ -236,13 +310,13 @@ def _expression_matrix_figures(
         theme="paper",
         show=False,
     )
-    heatmap.axes["heatmap"].set_xlabel("Leiden cluster")
+    heatmap.axes["heatmap"].set_xlabel(_CLUSTER_LABEL)
     outputs.append(_save(heatmap, output_directory / "marker_heatmap.png"))
 
     matrix = splt.matrixplot(
         store,
         features=markers,
-        group_by=_CLUSTER_KEY,
+        groups=clusters,
         normalization=splt.NormalizationSpec(transform="log1p"),
         standardize="feature",
         cluster_groups=True,
@@ -264,12 +338,18 @@ def _expression_matrix_figures(
 def _additional_real_data_figures(
     store: DataStore,
     output_directory: Path,
+    *,
+    layout: ArtifactRef,
+    clusters: ArtifactRef,
+    cell_cycle: ArtifactRef,
+    cell_cycle_scale: splt.CategoricalScale,
 ) -> list[Path]:
     outputs: list[Path] = []
     boxes = splt.distribution(
         store,
-        keys=("RNA_S_score", "RNA_G2M_score"),
-        group_by=_CELL_CYCLE_KEY,
+        keys=cell_cycle,
+        grouping=cell_cycle,
+        categorical_scale=cell_cycle_scale,
         kind="box",
         share_y=True,
         figsize=(7.2, 3.8),
@@ -282,21 +362,23 @@ def _additional_real_data_figures(
         strict=True,
     ):
         axis.set_title(title)
-        axis.set_xlabel("Cell-cycle phase")
+        axis.set_xlabel(_CELL_CYCLE_LABEL)
         axis.set_ylabel("score")
     outputs.append(_save(boxes, output_directory / "cell_cycle_scores.png"))
 
-    clusters = np.asarray(store.cells.fetch(_CLUSTER_KEY))
-    highlighted_group = pd.Series(clusters).value_counts().index[0]
+    cluster_values = _artifact_values(store, clusters, "values")
+    highlighted_group = pd.Series(cluster_values).value_counts().index[0]
+    highlighted_indices = tuple(
+        np.flatnonzero(cluster_values == highlighted_group).tolist()
+    )
     highlighted = splt.embedding(
         store,
-        layout_key="RNA_UMAP",
+        layout=layout,
         color_by=None,
         default_color="#bdbdbd",
         point_alpha=0.4,
         highlight=splt.Highlight(
-            by=_CLUSTER_KEY,
-            groups=(highlighted_group,),
+            indices=highlighted_indices,
             color="#d62728",
             dim_alpha=0.12,
             size_multiplier=1.35,
@@ -317,12 +399,17 @@ def _dark_theme_figure(
     store: DataStore,
     output_directory: Path,
     feature: str,
+    *,
+    layout: ArtifactRef,
+    clusters: ArtifactRef,
+    cluster_scale: splt.CategoricalScale,
 ) -> Path:
     dark = splt.embedding(
         store,
-        layout_key="RNA_UMAP",
-        color_by=[_CLUSTER_KEY, feature],
+        layout=layout,
+        color_by=[clusters, feature],
         legend_loc="on_data",
+        categorical_scale=cluster_scale,
         color_scale=splt.ColorScale(cmap="magma", quantiles=(0, 0.99)),
         theme="dark",
         show=False,
@@ -331,20 +418,31 @@ def _dark_theme_figure(
     return _save(dark, output_directory / "dark_embedding.png")
 
 
-def generate_showcase(store: DataStore, output_directory: Path) -> list[Path]:
+def generate_showcase(
+    store: DataStore,
+    output_directory: Path,
+    *,
+    layout: ArtifactRef,
+    graph: ArtifactRef,
+    clusters: ArtifactRef,
+    cell_cycle: ArtifactRef,
+    features: ArtifactRef,
+) -> list[Path]:
     output_directory.mkdir(parents=True, exist_ok=True)
     markers = _marker_sets(store)
     feature = _first_continuous_feature(store, markers)
-    cluster_key = _CLUSTER_KEY
-    cell_cycle_key = _CELL_CYCLE_KEY
-    if cell_cycle_key not in store.cells.columns:
-        store.run_cell_cycle_scoring()
-
+    cluster_scale = _showcase_categorical_scale(
+        _artifact_values(store, clusters, "values")
+    )
+    cell_cycle_scale = _showcase_categorical_scale(
+        _artifact_values(store, cell_cycle, "phase").astype(str)
+    )
     outputs: list[Path] = []
     categorical = splt.embedding(
         store,
-        layout_key="RNA_UMAP",
-        color_by=cluster_key,
+        layout=layout,
+        color_by=clusters,
+        categorical_scale=cluster_scale,
         legend_loc="on_data",
         theme="paper",
         show=False,
@@ -354,7 +452,7 @@ def generate_showcase(store: DataStore, output_directory: Path) -> list[Path]:
 
     continuous = splt.embedding(
         store,
-        layout_key="RNA_UMAP",
+        layout=layout,
         color_by=feature,
         sort_values=True,
         color_scale=splt.ColorScale(cmap="magma", quantiles=(0, 0.99)),
@@ -377,8 +475,10 @@ def generate_showcase(store: DataStore, output_directory: Path) -> list[Path]:
 
     connectivity = splt.cluster_connectivity(
         store,
-        group_by=cluster_key,
-        layout_key="RNA_UMAP",
+        groups=clusters,
+        layout=layout,
+        graph=graph,
+        categorical_scale=cluster_scale,
         show_cells=True,
         cell_alpha=0.3,
         theme="paper",
@@ -389,18 +489,19 @@ def generate_showcase(store: DataStore, output_directory: Path) -> list[Path]:
     dotplot = splt.dotplot(
         store,
         features=markers,
-        group_by=cluster_key,
+        groups=clusters,
         normalization=splt.NormalizationSpec(transform="log1p"),
         theme="paper",
         show=False,
     )
-    dotplot.axes["dotplot"].set_xlabel("Leiden cluster")
+    dotplot.axes["dotplot"].set_xlabel(_CLUSTER_LABEL)
     outputs.append(_save(dotplot, output_directory / "grouped_dotplot.png"))
 
     violin = splt.distribution(
         store,
         keys=[gene for genes in markers.values() for gene in genes[:1]],
-        group_by=cluster_key,
+        grouping=clusters,
+        categorical_scale=cluster_scale,
         normalization=splt.NormalizationSpec(transform="log1p"),
         kind="stacked_violin",
         share_y=True,
@@ -411,28 +512,55 @@ def generate_showcase(store: DataStore, output_directory: Path) -> list[Path]:
     )
     for axis in violin.axes.values():
         if axis.get_xlabel():
-            axis.set_xlabel("Leiden cluster")
+            axis.set_xlabel(_CLUSTER_LABEL)
     outputs.append(_save(violin, output_directory / "stacked_violin.png"))
 
     composition = splt.composition(
         store,
-        category_by=cell_cycle_key,
-        sample_by=cluster_key,
+        categories=cell_cycle,
+        grouping=clusters,
+        categorical_scale=cell_cycle_scale,
         segment_linewidth=0.7,
         show_percent_labels=True,
         label_min_fraction=0.06,
         theme="paper",
         show=False,
     )
-    composition.axes["composition"].set_xlabel("Leiden cluster")
+    composition.axes["composition"].set_xlabel(_CLUSTER_LABEL)
     for legend in composition.figure.legends:
-        if legend.get_title().get_text() == cell_cycle_key:
-            legend.set_title("Cell-cycle phase")
+        legend.set_title(_CELL_CYCLE_LABEL)
     outputs.append(_save(composition, output_directory / "composition.png"))
 
-    outputs.extend(_expression_matrix_figures(store, output_directory, markers))
-    outputs.extend(_additional_real_data_figures(store, output_directory))
-    outputs.append(_dark_theme_figure(store, output_directory, feature))
+    outputs.extend(
+        _expression_matrix_figures(
+            store,
+            output_directory,
+            markers,
+            clusters=clusters,
+            cell_cycle=cell_cycle,
+            features=features,
+        )
+    )
+    outputs.extend(
+        _additional_real_data_figures(
+            store,
+            output_directory,
+            layout=layout,
+            clusters=clusters,
+            cell_cycle=cell_cycle,
+            cell_cycle_scale=cell_cycle_scale,
+        )
+    )
+    outputs.append(
+        _dark_theme_figure(
+            store,
+            output_directory,
+            feature,
+            layout=layout,
+            clusters=clusters,
+            cluster_scale=cluster_scale,
+        )
+    )
 
     figure, axes = plt.subplot_mosaic(
         [
@@ -446,8 +574,9 @@ def generate_showcase(store: DataStore, output_directory: Path) -> list[Path]:
     children: dict[Hashable, splt.PlotResult] = {
         "embedding": splt.embedding(
             store,
-            layout_key="RNA_UMAP",
-            color_by=cluster_key,
+            layout=layout,
+            color_by=clusters,
+            categorical_scale=cluster_scale,
             legend_loc="on_data",
             show_legend=False,
             show_titles=False,
@@ -457,7 +586,7 @@ def generate_showcase(store: DataStore, output_directory: Path) -> list[Path]:
         ),
         "continuous": splt.embedding(
             store,
-            layout_key="RNA_UMAP",
+            layout=layout,
             color_by=feature,
             color_scale=splt.ColorScale(cmap="magma", quantiles=(0, 0.99)),
             density_overlay=splt.DensityOverlay(
@@ -479,8 +608,10 @@ def generate_showcase(store: DataStore, output_directory: Path) -> list[Path]:
         ),
         "connectivity": splt.cluster_connectivity(
             store,
-            group_by=cluster_key,
-            layout_key="RNA_UMAP",
+            groups=clusters,
+            layout=layout,
+            graph=graph,
+            categorical_scale=cluster_scale,
             show_cells=True,
             cell_alpha=0.3,
             target=axes["connectivity"],
@@ -490,7 +621,7 @@ def generate_showcase(store: DataStore, output_directory: Path) -> list[Path]:
         "dotplot": splt.dotplot(
             store,
             features=markers,
-            group_by=cluster_key,
+            groups=clusters,
             normalization=splt.NormalizationSpec(transform="log1p"),
             swap_axes=True,
             show_legend=False,
@@ -500,8 +631,9 @@ def generate_showcase(store: DataStore, output_directory: Path) -> list[Path]:
         ),
         "composition": splt.composition(
             store,
-            category_by=cell_cycle_key,
-            sample_by=cluster_key,
+            categories=cell_cycle,
+            grouping=clusters,
+            categorical_scale=cell_cycle_scale,
             segment_linewidth=0.7,
             show_percent_labels=False,
             label_min_fraction=0.06,
@@ -511,15 +643,18 @@ def generate_showcase(store: DataStore, output_directory: Path) -> list[Path]:
             show=False,
         ),
     }
-    axes["dotplot"].set_ylabel("Leiden cluster")
-    axes["composition"].set_xlabel("Leiden cluster")
+    for name in ("embedding", "connectivity"):
+        _label_categorical_legend(children[name], _CLUSTER_LEGEND_ID)
+    _label_categorical_legend(children["composition"], _CELL_CYCLE_LEGEND_ID)
+    axes["dotplot"].set_ylabel(_CLUSTER_LABEL)
+    axes["composition"].set_xlabel(_CLUSTER_LABEL)
     composite = splt.compose_results(figure, children, shared_legends=True)
     for legend in figure.legends:
         title = legend.get_title().get_text()
-        if title == cluster_key:
+        if title == _CLUSTER_LEGEND_ID:
             legend.set_title("Leiden clusters")
-        elif title == cell_cycle_key:
-            legend.set_title("Cell-cycle phase")
+        elif title == _CELL_CYCLE_LEGEND_ID:
+            legend.set_title(_CELL_CYCLE_LABEL)
     outputs.append(
         composite.save(
             output_directory / "publication_composite.png",
@@ -558,12 +693,20 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     with tempfile.TemporaryDirectory(prefix="scarf_plot_showcase_") as temporary:
-        store = _prepare_store(
+        store, artifacts = _prepare_store(
             arguments.fixture,
             Path(temporary),
             arguments.layout_fixture,
         )
-        outputs = generate_showcase(store, arguments.output_dir)
+        outputs = generate_showcase(
+            store,
+            arguments.output_dir,
+            layout=artifacts["layout"],
+            graph=artifacts["graph"],
+            clusters=artifacts["clusters"],
+            cell_cycle=artifacts["cell_cycle"],
+            features=artifacts["features"],
+        )
     print("\n".join(str(path) for path in outputs))
     return 0
 

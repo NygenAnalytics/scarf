@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import zarr
 
+from .arrays import _decode_metadata_values
 from .geometry import array_geometry
 from .partition import row_band
 from .refs import (
@@ -269,7 +270,7 @@ def fingerprint_stored_strings(array: zarr.Array) -> str:
         max_length = 1
         for start in range(0, array.shape[0], chunk_rows):
             stop = min(start + chunk_rows, array.shape[0])
-            values = np.asarray(array[start:stop])
+            values = _decode_metadata_values(array[start:stop])
             if values.size:
                 max_length = max(
                     max_length,
@@ -283,7 +284,9 @@ def fingerprint_stored_strings(array: zarr.Array) -> str:
     builder.begin_array("values", array.shape, string_dtype)
     for start in range(0, array.shape[0], chunk_rows):
         stop = min(start + chunk_rows, array.shape[0])
-        block = np.asarray(array[start:stop]).astype(string_dtype)
+        block = np.asarray(
+            _decode_metadata_values(array[start:stop]),
+        ).astype(string_dtype)
         builder.update_array_block("values", (start,), block)
     builder.end_array("values")
     return builder.hexdigest()
@@ -399,6 +402,8 @@ class ArtifactStatus:
     complete: bool
     provenance: dict[str, Any] | None = None
     execution_options: dict[str, Any] | None = None
+    created_at_ns: int | None = None
+    scarf_version: str | None = None
 
     @property
     def operation(self) -> str | None:
@@ -474,6 +479,19 @@ def inspect_artifact(root: zarr.Group, ref: ArtifactRef) -> ArtifactStatus:
             )
     provenance = _mapping_attr(group, "provenance")
     execution_options = _mapping_attr(group, "execution_options")
+    raw_created_at_ns = group.attrs.get("created_at_ns")
+    if raw_created_at_ns is not None and (
+        isinstance(raw_created_at_ns, bool)
+        or not isinstance(raw_created_at_ns, int | np.integer)
+        or int(raw_created_at_ns) <= 0
+    ):
+        raise TypeError(f"Artifact created_at_ns at {path} must be a positive integer")
+    created_at_ns = None if raw_created_at_ns is None else int(raw_created_at_ns)
+    raw_scarf_version = group.attrs.get("scarf_version")
+    if raw_scarf_version is not None and (
+        not isinstance(raw_scarf_version, str) or not raw_scarf_version
+    ):
+        raise TypeError(f"Artifact scarf_version at {path} must be a non-empty string")
     if complete:
         if provenance is None or execution_options is None:
             raise KeyError(f"Completed artifact at {path} has an incomplete record")
@@ -495,6 +513,8 @@ def inspect_artifact(root: zarr.Group, ref: ArtifactRef) -> ArtifactStatus:
         complete=complete,
         provenance=provenance,
         execution_options=execution_options,
+        created_at_ns=created_at_ns,
+        scarf_version=raw_scarf_version,
     )
 
 
@@ -515,6 +535,9 @@ def list_artifacts(
     assay: str | None = None,
     kind: str | None = None,
     complete_only: bool = False,
+    operation: str | None = None,
+    parameters: Mapping[str, Any] | None = None,
+    inputs: Mapping[str, Any] | None = None,
 ) -> list[ArtifactRef]:
     if scope not in {"assay", "datastore"}:
         raise ValueError(f"Invalid artifact scope: {scope!r}")
@@ -528,6 +551,37 @@ def list_artifacts(
         base_path = "artifacts"
     if kind is not None:
         _validate_artifact_kind(kind)
+    if operation is not None:
+        _validate_name(operation, "operation")
+    requested_parameters = (
+        None if parameters is None else serialize_artifact_value(parameters)
+    )
+    requested_inputs = None if inputs is None else serialize_artifact_value(inputs)
+    if requested_parameters is not None and not isinstance(
+        requested_parameters, Mapping
+    ):
+        raise TypeError("parameters must be a mapping")
+    if requested_inputs is not None and not isinstance(requested_inputs, Mapping):
+        raise TypeError("inputs must be a mapping")
+    filter_provenance = any(
+        value is not None for value in (operation, parameters, inputs)
+    )
+
+    def matches_mapping(
+        stored: Mapping[str, Any] | None,
+        requested: Mapping[str, Any] | None,
+    ) -> bool:
+        if requested is None:
+            return True
+        stored = {} if stored is None else stored
+        if not requested:
+            return not stored
+        return all(
+            key in stored
+            and canonical_bytes(stored[key]) == canonical_bytes(requested_value)
+            for key, requested_value in requested.items()
+        )
+
     if base_path not in root:
         return []
     base = as_zarr_group(root[base_path], name=base_path)
@@ -548,8 +602,16 @@ def list_artifacts(
                 )
             except ValueError:
                 continue
-            if complete_only and not artifact_exists(root, ref):
-                continue
+            if complete_only or filter_provenance:
+                status = inspect_artifact(root, ref)
+                if not status.complete:
+                    continue
+                if operation is not None and status.operation != operation:
+                    continue
+                if not matches_mapping(status.parameters, requested_parameters):
+                    continue
+                if not matches_mapping(status.inputs, requested_inputs):
+                    continue
             refs.append(ref)
     return refs
 

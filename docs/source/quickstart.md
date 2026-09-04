@@ -1,5 +1,5 @@
 ---
-description: Minimal scRNA-seq workflow in Scarf from count matrix to UMAP and clustering.
+description: Open a prepared scRNA-seq result and reach a clustered PBMC map with Scarf.
 jupytext:
   text_representation:
     extension: .md
@@ -16,168 +16,53 @@ kernelspec:
 
 # Quick start
 
-Go from a Cell Ranger count matrix to a clustered UMAP with Scarf's default RNA pipeline.
-This example uses a public 5K PBMC dataset and writes the analysis to `scarf_datasets/tenx_5K_pbmc_rnaseq/data.zarr`.
+Open a prepared 5K PBMC analysis and reach its pipeline-selected Leiden map. This is the shortest
+route to a familiar single-cell result; the RNA workflow explains the biological evidence behind
+the populations.
 
-Complete the {ref}`installation <installation>` with the `extra` dependencies before you begin.
-Run this notebook from the same environment so its kernel imports that Scarf installation.
-
-## Download and convert the counts
+Complete the {ref}`installation <installation>` with the `extra` dependencies first.
 
 ```{code-cell} ipython3
 import scarf
 
-scarf.configure_output(level="ERROR", progress=True)
-
-counts = scarf.cytebase.connect("scarf_docs").download(
-    "tenx_5K_pbmc_rnaseq/data.h5",
+dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
+    "tenx_5K_pbmc_rnaseq",
     destination="scarf_datasets",
-)[0]
-
-store = counts.with_name("data.zarr")
-reader = scarf.CrH5Reader(str(counts))
-```
-
-```{code-cell} ipython3
-reader.nCells, reader.nFeatures
-```
-
-```{code-cell} ipython3
-scarf.CrToZarr(
-    reader,
-    zarr_loc=str(store),
-).dump()
-```
-
-The same reader and writer work with a Cell Ranger H5 file from your own dataset.
-Scarf converts the counts to Zarr so later steps can stream data from disk.
-Scarf normally uses INFO logging with progress enabled.
-Read the completed bars in this cached page as a record of the work performed during execution.
-Log level and progress are independent; batch runs can use `scarf.configure_output(progress=False, timestamps=True)`.
-See the {doc}`reference/api/utilities` for file logging and the full output contract.
-
-## Open the datastore
-
-```{code-cell} ipython3
-ds = scarf.DataStore(
-    str(store),
-    nthreads=4,
+    zarr=True,
 )
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+run = ds.pipeline.open(label="docs_default")
 ```
 
-```{code-cell} ipython3
-print(f"Active cells: {int(ds.cells.fetch_all('I').sum())} / {ds.cells.N}")
-ds.cells.to_pandas_dataframe(
-    columns=["RNA_nCounts", "RNA_nFeatures", "RNA_percentMito"],
-).describe().loc[["min", "50%", "max"]]
-```
-
-## Run the RNA pipeline
-
-The default pipeline filters cells, scores cell cycle, selects highly variable genes, normalizes counts, runs PCA, builds a neighbourhood graph, and calculates UMAP.
-It also runs Leiden at resolutions 0.5, 0.75, 1.0, and 1.25, plus Paris clustering.
-The partition with the highest PCA silhouette is copied to `RNA_clusters` and used for doublet scoring and marker search unless you choose one explicitly.
-
-```{code-cell} ipython3
-n_before = int(ds.cells.fetch_all("I").sum())
-artifacts = ds.pipeline.run()
-n_after = int(ds.cells.fetch_all("I").sum())
-print(f"Active cells before pipeline: {n_before}")
-print(f"Active cells after pipeline: {n_after}")
-
-selected = next(
-    key
-    for key, ref in artifacts.items()
-    if key != "selected_clusters" and ref == artifacts["selected_clusters"]
-)
-print(f"RNA_clusters selected from: {selected}")
-```
-
-```{code-cell} ipython3
-ds.cells.to_pandas_dataframe(
-    columns=["RNA_clusters"],
-    key="I",
-)["RNA_clusters"].value_counts().sort_index()
-```
-
-```{code-cell} ipython3
-ds.cells.to_pandas_dataframe(
-    columns=["RNA_leiden_0.5"],
-    key="I",
-)["RNA_leiden_0.5"].value_counts().sort_index()
-```
-
-The return value maps each result name to an {term}`ArtifactRef`: a handle on a stored result that names it without loading it.
-Every result the pipeline wrote is an {term}`artifact` in the Zarr store, saved together with the {term}`provenance` record of what produced it.
-`artifacts["highly_variable_features"]` is the exact immutable feature selection passed to normalization; the plain `hvgs` label is its published convenience name.
-`RNA_leiden_0.5` is one of the Leiden partitions kept alongside the selected `RNA_clusters` labels.
-
-```{code-cell} ipython3
-sorted(artifacts)
-```
-
-Most optional stages accept `False`.
-For example, cell-cycle scoring, UMAP, Paris, doublet scoring, and marker search can be disabled separately; pass an empty `leiden` mapping to skip Leiden.
-Highly variable feature selection remains required.
-Use {doc}`tutorials/graph_construction` for stage-by-stage control and {doc}`tutorials/clustering` for choosing a partition.
-
-## Plot the result
-
-Colour the embedding by `RNA_clusters` to see the partition the pipeline chose.
-The resolution-specific columns, such as `RNA_leiden_0.5`, stay available for comparison.
+The named run binds the filtered cells, UMAP, selected Leiden partition, and marker result from one
+completed workflow. Plotting reads those frozen outputs directly.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by="RNA_clusters",
+    run=run,
+    color_by="clusters",
+    legend_loc="on_data",
 )
 ```
 
-Several broad PBMC populations should separate without every group becoming an isolated island.
-Per-cluster library size flags any tiny low-count group that should be revisited in quality control before assigning a cell type:
+The map separates several broad PBMC populations. Continue with {doc}`tutorials/scrna_seq` to name
+them from marker evidence rather than from UMAP position alone.
 
-```{code-cell} ipython3
-(
-    ds.cells.to_pandas_dataframe(
-        columns=["RNA_clusters", "RNA_nCounts"],
-        key="I",
-    )
-    .groupby("RNA_clusters")["RNA_nCounts"]
-    .agg(n_cells="size", median_nCounts="median")
-    .sort_values("median_nCounts")
-)
+## Use your own Cell Ranger counts
+
+The prepared result removes setup time from this first encounter. With your own filtered Cell
+Ranger H5 file, the corresponding path is:
+
+```python
+reader = scarf.CrH5Reader("filtered_feature_bc_matrix.h5")
+scarf.CrToZarr(reader, zarr_loc="analysis.zarr").dump()
+
+ds = scarf.DataStore("analysis.zarr", nthreads=4)
+run = ds.pipeline.run(label="baseline")
+ds.plots.embedding(run=run, color_by="clusters")
 ```
 
-Marker search ran on the same partition, so its table is already in the store:
-
-```{code-cell} ipython3
-ds.plots.marker_heatmap(
-    marker=artifacts["markers"],
-    group_key="RNA_clusters",
-    topn=5,
-    figsize=(5, 9),
-)
-```
-
-Each column is a cluster and each row one of its top-scoring genes.
-The clean block structure is the signal that the partition tracks real populations.
-Inspect one cluster's ranked markers directly:
-
-```{code-cell} ipython3
-cluster_id = (
-    ds.cells.to_pandas_dataframe(columns=["RNA_clusters"], key="I")["RNA_clusters"]
-    .value_counts()
-    .index[0]
-)
-print(f"Markers for cluster {cluster_id}")
-ds.get_markers(
-    marker=artifacts["markers"],
-    group_key="RNA_clusters",
-    group_id=cluster_id,
-).head(10)
-```
-
-The Zarr store now holds the UMAP coordinates, cluster labels, marker tables, and every intermediate result.
-
-Continue with the complete {doc}`tutorials/scrna_seq` workflow or translate an existing workflow with {doc}`scanpy_and_seurat`.
-The {doc}`reference/api/pipeline` documents every option, returned artifact, and the callback contract for advanced automation.
+The stages match a familiar Scanpy or Seurat workflow: filtering, feature selection, normalization,
+PCA, neighbours, UMAP, and Leiden clustering. Use the focused {doc}`scanpy` or {doc}`seurat` guide
+when translating an existing analysis. For measured scale evidence rather than a teaching dataset,
+see {doc}`concepts/benchmarks`.

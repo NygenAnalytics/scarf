@@ -1,5 +1,5 @@
 ---
-description: Map query cells to a fixed reference, inspect mapping evidence, and transfer labels with abstention.
+description: Prepare and reuse a fixed reference, map query cells, and transfer labels with abstention.
 jupytext:
   cell_metadata_filter: -all
   text_representation:
@@ -19,6 +19,8 @@ kernelspec:
 
 Mapping is the fixed-reference alternative to merging datasets and rebuilding a joint graph.
 This allows you to keep one reference atlas unchanged, place new query cells onto it, and transfer labels from reference neighbours.
+The prepared mapping reference is also the reusable atlas: later queries use the same feature panel,
+projection model, reference coordinates, and neighbour index.
 
 It does three things in order:
 
@@ -32,65 +34,48 @@ When sources must be analysed together in one store, start with {doc}`dataset_me
 In this tutorial, we will be mapping interferon-stimulated PBMCs onto a control PBMC reference from the same Kang study.
 The shared author labels let us evaluate the result.
 
-Mapping currently supports RNA queries.
-The downloaded stores are immutable data sources. This tutorial mounts each one into a fresh writable analysis store so the artifact-era pipeline never reuses legacy analysis state. The reference and query must remain different stores.
-
-For a reusable Symphony-style atlas, see {doc}`reference_atlases`.
+Mapping currently supports RNA queries. The catalog stores were rebuilt with the current count
+layout, and documentation execution downloads separate writable copies. The reference and query
+must remain different stores.
 
 ## 1. Open the reference and query
 
 ```{code-cell} ipython3
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
 import numpy as np
 import pandas as pd
 
 import scarf
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 repository = scarf.cytebase.connect("scarf_docs")
+
 ctrl_path = repository.download_dataset(
     name="kang_15K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-stim_path = repository.download_dataset(
-    name="kang_14K_ifnb-pbmc_rnaseq",
-    destination="scarf_datasets",
-    zarr=True,
-)
-
-analysis_directory = TemporaryDirectory()
-ctrl_counts = Path(analysis_directory.name) / "control_counts.zarr"
-stim_counts = Path(analysis_directory.name) / "stimulated_counts.zarr"
-repack_store(
+ds_ctrl = scarf.DataStore(
     f"{ctrl_path}/data.zarr",
-    str(ctrl_counts),
-    nthreads=2,
-)
-repack_store(
-    f"{stim_path}/data.zarr",
-    str(stim_counts),
-    nthreads=2,
-)
-ds_ctrl = scarf.mount_datastore(
-    str(ctrl_counts),
-    at=str(Path(analysis_directory.name) / "control_analysis.zarr"),
-    default_assay="RNA",
-    nthreads=4,
-)
-ds_stim = scarf.mount_datastore(
-    str(stim_counts),
-    at=str(Path(analysis_directory.name) / "stimulated_analysis.zarr"),
     default_assay="RNA",
     nthreads=4,
 )
 ```
 
-The structural repack rebuilds the RNA transpose required for streaming and does not migrate analysis state. Mounting the repacked counts into separate targets keeps the new reference and query lineage clean.
+```{code-cell} ipython3
+stim_path = repository.download_dataset(
+    name="kang_14K_ifnb-pbmc_rnaseq",
+    destination="scarf_datasets",
+    zarr=True,
+)
+ds_stim = scarf.DataStore(
+    f"{stim_path}/data.zarr",
+    default_assay="RNA",
+    nthreads=4,
+)
+```
+
+The two page-local stores keep reference and query lineage isolated.
 
 ```{code-cell} ipython3
 ds_ctrl.plots.embedding(
@@ -107,37 +92,30 @@ These UMAP layouts were fitted independently, so their coordinates are not compa
 Mapping keeps the control layout fixed and reports where query weight lands on reference cells.
 The shared label vocabulary is what we use for evaluation.
 
-## 2. Prepare a labelled reference
+## 2. Prepare a labelled, reusable reference
 
-Build the reference graph with the standard RNA pipeline, then package the neighbour chain as an immutable mapping reference.
+Package the frozen reference run's neighbour chain as an immutable mapping reference.
 
 ```{code-cell} ipython3
-artifacts = ds_ctrl.pipeline.run(
-    filtering=False,
-    cell_cycle_scoring=False,
-    highly_variable_features={
-        "min_cells": 10,
-        "top_n": 2000,
-        "min_mean": -3,
-        "max_mean": 2,
-        "max_var": 6,
-    },
-    pca={"dims": 25},
-    neighbors={"k": 17},
-    umap=False,
-    leiden={},
-    paris=False,
-    doublet_scoring=False,
-    markers=False,
-)
-reference = ds_ctrl.build_mapping_reference(artifacts["neighbors"])
+run = ds_ctrl.pipeline.open(label="docs_default")
+reference_layout = run["umap"]
+reference_ref = ds_ctrl.build_mapping_reference(run["neighbors"])
+reference = ds_ctrl.get_mapping_reference(reference_ref)
 ```
 
 The completed `MappingReference` is immutable.
 Its `feature_selection` field pins the exact reference feature artifact rather than a metadata key.
 Its feature order, scaling, PCA loadings, neighbour index, and selected cells stay fixed in the reference datastore.
-This example uses a plain PCA reference.
-A Symphony reference instead passes Harmony-corrected neighbours into `build_mapping_reference`.
+`reference_layout` is the immutable UMAP from the same run and is used only to show where query
+weight landed.
+The mapping reference does not contain that layout or copy the reference labels.
+
+This example intentionally uses a plain PCA reference. A Harmony-backed Symphony reference is
+appropriate only when the reference neighbours were corrected using genuine technical-batch
+metadata. Query batch metadata must likewise describe a measured technical source. A constant query
+label provides no within-query comparison and, by itself, is not evidence that a batch effect was
+estimated or removed. Do not substitute stimulation, disease, or another biological condition for a
+technical batch. When no defensible technical batch exists, use the plain-PCA path shown here.
 
 ## 3. Map the query
 
@@ -146,23 +124,28 @@ It aligns query features to the reference panel, applies the reference normaliza
 Query cells are never inserted into the reference index.
 
 ```{code-cell} ipython3
-mapping = ds_stim.run_mapping(
+query_cell_selection = ds_stim.snapshot_cell_selection("I")
+mapping_ref = ds_stim.run_mapping(
     reference,
-    "stim",
+    query_cell_selection,
     query_assay="RNA",
     save_k=5,
     missing_feature_policy="reference_mean",
 )
 ```
 
-To check the neighbour arrays, reload the projection with `get_mapping_results()`. 
-Use `load_arrays=True` to get two arrays with one row per query cell and `save_k` columns. 
-`indices` identifies the nearest reference cells. 
-`distances` finite distances between the query cell and the neighbour reference cells.
+To check the neighbour arrays, reload the projection with `get_mapping_result()`.
+Use `load_arrays=True` to get two arrays with one row per query cell and `save_k` columns.
+`indices` identifies the nearest reference cells.
+`distances` contains finite distances between each query cell and its reference neighbours.
 
 ```{code-cell} ipython3
-peek = ds_stim.get_mapping_result(mapping, load_arrays=True)
-peek.n_cells, int(peek.indices.shape[1]), peek.indices[:3], peek.distances[:3]
+mapping = ds_stim.get_mapping_result(
+    mapping_ref,
+    reference=reference,
+    load_arrays=True,
+)
+mapping.n_cells, int(mapping.indices.shape[1]), mapping.indices[:3], mapping.distances[:3]
 ```
 
 `reference_mean` fills an absent query feature with the reference mean, which becomes zero after reference scaling.
@@ -190,8 +173,9 @@ score_groups = np.array(
     dtype=object,
 )
 ds_stim.plots.mapping_score(
-    mapping,
-    layout_key="RNA_UMAP",
+    mapping_ref,
+    reference=reference,
+    layout=reference_layout,
     target_groups=score_groups,
     size_by_score=True,
     figsize=(14, 3.4),
@@ -212,8 +196,9 @@ It is not a calibrated probability that the label is biologically correct.
 
 ```{code-cell} ipython3
 transferred_labels = ds_stim.get_target_classes(
-    mapping,
+    mapping_ref,
     reference_class_group="cluster_labels",
+    reference=reference,
     threshold_fraction=0.6,
 )
 ds_stim.cells.insert(
@@ -254,7 +239,8 @@ To force abstention by distance, pass `max_distance` to the evidence APIs.
 
 ```{code-cell} ipython3
 ds_stim.plots.mapping_evidence(
-    mapping,
+    mapping_ref,
+    reference=reference,
     reference_class_group="cluster_labels",
     target_groups=query_labels,
     metrics=("voteFraction", "topTwoMargin", "referenceDistancePercentile"),
@@ -264,11 +250,13 @@ ds_stim.plots.mapping_evidence(
 )
 ```
 
-Because this query daatset also carries orginal author labels, we can compare these known labels with our transferred labels.
+Because this query dataset also carries original author labels, we can compare these known labels
+with the transferred labels.
 
 ```{code-cell} ipython3
 ds_stim.plots.mapping_confusion(
-    mapping,
+    mapping_ref,
+    reference=reference,
     reference_class_group="cluster_labels",
     known_labels=query_labels,
     normalize="true",
@@ -287,7 +275,8 @@ Higher thresholds keep fewer cells and usually raise accuracy among the cells th
 
 ```{code-cell} ipython3
 ds_stim.plots.mapping_calibration(
-    mapping,
+    mapping_ref,
+    reference=reference,
     reference_class_group="cluster_labels",
     known_labels=query_labels,
     chosen_threshold=0.6,
@@ -309,15 +298,15 @@ focus_groups = np.array(
     [label if label in focus_labels else "other" for label in query_labels],
     dtype=object,
 )
-assert mapping.reference is not None
 ref_classes = np.asarray(
-    mapping.reference.fetch_cell_column("cluster_labels"),
+    reference.fetch_cell_column("cluster_labels"),
     dtype=object,
 )
 score_mass: dict[str, pd.Series] = {}
 for group, values in ds_stim.get_mapping_score(
-    mapping,
+    mapping_ref,
     target_groups=focus_groups,
+    reference=reference,
     log_transform=False,
 ):
     if group == "other":
@@ -337,8 +326,9 @@ score_mass_table.loc[
 
 ```{code-cell} ipython3
 ds_stim.plots.mapping_score(
-    mapping,
-    layout_key="RNA_UMAP",
+    mapping_ref,
+    reference=reference,
+    layout=reference_layout,
     target_groups=focus_groups,
     size_by_score=True,
     figsize=(14, 3.4),
@@ -353,21 +343,32 @@ If the scores were spread across multiple unrelated clusters, then it would be r
 <span id="reference-atlas-mapping"></span>
 ```
 
-## 7. Reload a prepared mapping
+## 7. Reuse and govern a prepared atlas
 
-In a later session you may reopen the reference store and load the named mapping reference, then reload the query mapping by name:
+In a later session, retain the mapping-reference and projection artifact refs, reopen both stores, and reload the exact results:
 
 ```{code-cell} ipython3
-reference = ds_ctrl.get_mapping_reference()
+reference = ds_ctrl.get_mapping_reference(reference_ref)
 reloaded_mapping = ds_stim.get_mapping_result(
-    "stim",
+    mapping_ref,
     reference=reference,
-    query_assay="RNA",
 )
-reloaded_mapping.mapping_name, reloaded_mapping.n_cells
+reloaded_mapping.n_cells, reloaded_mapping.correction_method
 ```
 
-Building and reusing a Symphony-style fixed reference is covered in {doc}`reference_atlases`.
+For repeated use, reopen the prepared reference datastore read-only and run each mapping in a
+separate writable query datastore. If query counts come from a read-only source or the same physical
+store used to prepare the reference, use `mount_datastore` to create that separate query store.
+
+Reference labels are resolved from `reference_class_group` when labels are transferred; they are not
+frozen inside `MappingReference`. Treat a published reference store as read-only. If annotations
+must change, name their column for its biological meaning, such as `curated_cell_type`, and select
+that column explicitly in the mapping workflow. Retain the layout artifact separately when mapping
+scores must be displayed on the original reference UMAP.
+
+Validate a reused atlas with feature coverage, mapping evidence, abstention, and score concentration.
+When independent query labels exist, also inspect confusion and threshold calibration. A visually
+plausible embedding alone does not validate transferred labels.
 
 For troubleshooting, common failures include mapping before the reference exists, ignoring feature mismatch, treating vote support as a probability, using a biological condition as a correction batch, and transferring labels without an abstention path.
 

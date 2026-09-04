@@ -1,7 +1,7 @@
 """Characterize cell covariates and study-design confounding."""
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
@@ -15,12 +15,26 @@ from ..metadata.queries import (
     columns_same_partition,
     reduce_observation_units,
 )
+from ..metadata.rows import (
+    MetaDataRowBlock,
+    read_metadata_missing_rows_chunkwise,
+    read_metadata_rows_chunkwise,
+)
+from ..metadata.selection import resolve_cell_aligned_artifact
 from ..metrics.association import directional_mapping, report_confounding
-from ..storage.types import as_zarr_array, as_zarr_group
+from ..storage.refs import ArtifactRef
+from ..storage.selections import read_stored_selection_indices
 from .config import CONFIG
 from .config._deps import AGENT_INSTALL_HINT
 from .decide import DecisionValidationError, decide
-from .types import AgentDataModel, Decision, EvidenceItem, StageStatus
+from .tools import artifact_reference
+from .types import (
+    AgentDataModel,
+    ArtifactReferenceModel,
+    Decision,
+    EvidenceItem,
+    StageStatus,
+)
 
 try:
     from pydantic import Field
@@ -79,6 +93,7 @@ _COEFFICIENT_EVIDENCE = [
 
 class CovariateCharacterization(AgentDataModel):
     status: StageStatus
+    cellSelection: ArtifactReferenceModel | None = None
     auditLog: list[dict[str, Any]] = Field(default_factory=list)
     actions: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
@@ -96,6 +111,11 @@ class CovariateCharacterization(AgentDataModel):
     def get_example(cls) -> "CovariateCharacterization":
         return cls(
             status="done",
+            cellSelection=ArtifactReferenceModel(
+                scope="datastore",
+                kind="cell_selection",
+                artifactId="c" * 64,
+            ),
             notes=["Cell covariates and confounding were characterized."],
             columns=[{"name": "batch", "domain": "technical"}],
         )
@@ -106,6 +126,141 @@ class _ColumnProfile:
     kind: ColumnKind
     summary: str
     digest: PartitionDigest
+    artifact: ArtifactRef | None = None
+
+
+class _SelectionBoundCells:
+    """Read metadata through one validated immutable cell selection."""
+
+    __slots__ = ("_artifact_sources", "_artifact_values", "_indices", "_source")
+
+    def __init__(
+        self,
+        root: Any,
+        source: Any,
+        selection: ArtifactRef,
+        *,
+        artifacts: Mapping[str, ArtifactRef] | None = None,
+    ) -> None:
+        self._source = source
+        self._indices = read_stored_selection_indices(
+            root,
+            selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
+        ).astype(np.int64, copy=False)
+        if len(self._indices) == 0:
+            raise ValueError("cellSelection selects no cells")
+        self._artifact_sources = dict(artifacts or {})
+        collisions = sorted(set(self._artifact_sources).intersection(source.columns))
+        if collisions:
+            raise ValueError(
+                f"Artifact covariate names collide with metadata columns: {collisions}"
+            )
+        self._artifact_values: dict[str, np.ndarray] = {}
+        for name, artifact in self._artifact_sources.items():
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("Artifact covariates require non-empty names")
+            resolved = resolve_cell_aligned_artifact(
+                root,
+                artifact,
+                cell_selection=selection,
+            )
+            self._artifact_values[name] = resolved.values
+
+    @property
+    def columns(self) -> list[str]:
+        return [*self._source.columns, *self._artifact_sources]
+
+    @property
+    def artifact_columns(self) -> list[str]:
+        return list(self._artifact_sources)
+
+    def artifact_source(self, column: str) -> ArtifactRef | None:
+        return self._artifact_sources.get(column)
+
+    def fetch(self, column: str, key: str = "I") -> np.ndarray:
+        if key != "I":
+            raise ValueError("A bound metadata view accepts only its stored selection")
+        return self._read(column, self._indices)
+
+    def _read(self, column: str, indices: np.ndarray) -> np.ndarray:
+        artifact_values = self._artifact_values.get(column)
+        if artifact_values is not None:
+            positions = np.searchsorted(self._indices, indices)
+            if np.any(positions >= len(self._indices)) or not np.array_equal(
+                self._indices[positions], indices
+            ):
+                raise ValueError(
+                    "Artifact covariate rows do not align with the stored selection"
+                )
+            return artifact_values[positions]
+        values = read_metadata_rows_chunkwise(self._source, column, indices)
+        missing = read_metadata_missing_rows_chunkwise(
+            self._source,
+            column,
+            indices,
+        )
+        if missing is None or not np.any(missing):
+            return values
+        if values.dtype.kind == "f":
+            output = values.astype(np.float64, copy=True)
+            output[missing] = np.nan
+            return output
+        output = values.astype(object, copy=True)
+        output[missing] = None
+        return output
+
+    def iter_row_blocks(
+        self,
+        *,
+        cell_key: str = "I",
+        columns: Sequence[str] | None = None,
+        block_rows: int | None = None,
+    ) -> Iterator[MetaDataRowBlock]:
+        if cell_key != "I":
+            raise ValueError("A bound metadata view accepts only its stored selection")
+        requested = list(columns or ())
+        unknown = [column for column in requested if column not in self.columns]
+        if unknown:
+            raise KeyError(f"Metadata columns were not found: {unknown!r}")
+        rows_per_block = (
+            int(self._source.default_block_rows("I"))
+            if block_rows is None
+            else int(block_rows)
+        )
+        if rows_per_block < 1:
+            raise ValueError("block_rows must be at least one")
+        for start in range(0, len(self._indices), rows_per_block):
+            stop = min(start + rows_per_block, len(self._indices))
+            indices = self._indices[start:stop]
+            yield MetaDataRowBlock(
+                start=int(indices[0]),
+                stop=int(indices[-1]) + 1,
+                active_global_indices=indices,
+                values={column: self._read(column, indices) for column in requested},
+            )
+
+
+class _SelectionBoundStore:
+    __slots__ = ("assay_names", "cells")
+
+    def __init__(
+        self,
+        store: Any,
+        selection: ArtifactRef,
+        *,
+        artifacts: Mapping[str, ArtifactRef] | None = None,
+    ) -> None:
+        self.cells = _SelectionBoundCells(
+            store.zw,
+            store.cells,
+            selection,
+            artifacts=artifacts,
+        )
+        self.assay_names = store.assay_names
 
 
 @dataclass
@@ -179,17 +334,6 @@ def _is_embedding_column(name: str) -> bool:
     return any(part in CONFIG._SHORT_EMBEDDING_PARTS for part in parts)
 
 
-def _has_source_artifact(store: Any, column: str) -> bool:
-    try:
-        cell_data = as_zarr_group(store.zw["cellData"], name="cellData")
-        if column not in cell_data:
-            return False
-        attrs = as_zarr_array(cell_data[column], name=column).attrs
-    except (KeyError, TypeError, ValueError):
-        return False
-    return isinstance(attrs.get("source_artifact"), dict)
-
-
 def _infer_kind(values: np.ndarray) -> ColumnKind:
     if (
         values.dtype == object
@@ -243,7 +387,13 @@ def _profile_column(
     resolved_kind = kind or _infer_kind(values)
     summary = _summarize(values, resolved_kind)
     digest = column_partition_digest(store.cells, name, cell_key=cell_key)
-    return _ColumnProfile(kind=resolved_kind, summary=summary, digest=digest)
+    artifact_source = getattr(store.cells, "artifact_source", lambda _name: None)(name)
+    return _ColumnProfile(
+        kind=resolved_kind,
+        summary=summary,
+        digest=digest,
+        artifact=artifact_source,
+    )
 
 
 def _triage_columns(
@@ -254,15 +404,16 @@ def _triage_columns(
 ) -> tuple[list[str], list[tuple[str, str]]]:
     """Split cell columns into model candidates and deterministic drops."""
     assay_prefixes = tuple(f"{name}_" for name in store.assay_names)
+    artifact_columns = set(getattr(store.cells, "artifact_columns", ()))
     candidates: list[str] = []
     dropped: list[tuple[str, str]] = []
     for name in store.cells.columns:
         if name in CONFIG._RESERVED_COLUMNS or name == cell_key or name in exclude:
             continue
-        if name.startswith(assay_prefixes):
+        if name in artifact_columns:
+            candidates.append(name)
+        elif name.startswith(assay_prefixes):
             dropped.append((name, "dropAssayStat"))
-        elif _has_source_artifact(store, name):
-            dropped.append((name, "dropProvenance"))
         elif _is_embedding_column(name):
             dropped.append((name, "dropEmbedding"))
         else:
@@ -980,56 +1131,97 @@ def _column_records(
     aliases: Mapping[str, list[str]],
     dropped: Sequence[tuple[str, str]],
 ) -> list[dict[str, Any]]:
-    records = [
-        {
+    records: list[dict[str, Any]] = []
+    for name in candidates:
+        profile = run.profiles[name]
+        record: dict[str, Any] = {
             "name": name,
-            "kind": run.kind(name),
+            "kind": profile.kind,
             "domain": run.domains[name],
-            "summary": run.summary(name),
+            "summary": profile.summary,
             "aliases": list(aliases.get(name, [])),
         }
-        for name in candidates
-    ]
-    records.extend(
-        {
+        if profile.artifact is None:
+            record.update(
+                {
+                    "sourceType": "metadataColumn",
+                    "metadataColumn": name,
+                }
+            )
+        else:
+            record.update(
+                {
+                    "sourceType": "artifact",
+                    "artifact": profile.artifact.to_dict(),
+                }
+            )
+        records.append(record)
+    for name, reason in dropped:
+        record = {
             "name": name,
             "kind": "continuous",
             "domain": "ignore",
             "summary": f"dropped before triage ({CONFIG._DROP_REASONS[reason]})",
             "aliases": [],
         }
-        for name, reason in dropped
-    )
+        dropped_profile = run.profiles.get(name)
+        if dropped_profile is not None and dropped_profile.artifact is not None:
+            record.update(
+                {
+                    "sourceType": "artifact",
+                    "artifact": dropped_profile.artifact.to_dict(),
+                }
+            )
+        else:
+            record.update(
+                {
+                    "sourceType": "metadataColumn",
+                    "metadataColumn": name,
+                }
+            )
+        records.append(record)
     return records
 
 
 def characterize_covariates(
     store: Any,
     *,
+    cellSelection: ArtifactRef,
     studyContext: str | None = None,
     model: Any | None = None,
-    cellKey: str = "I",
     directions: Mapping[str, Any] | None = None,
+    groupingArtifacts: Mapping[str, ArtifactRef] | None = None,
 ) -> CovariateCharacterization:
     """Label cell covariates and record design-level confounding."""
+    if (
+        not isinstance(cellSelection, ArtifactRef)
+        or cellSelection.kind != "cell_selection"
+    ):
+        raise TypeError("cellSelection must be a cell_selection ArtifactRef")
+    grouping_artifacts = dict(groupingArtifacts or {})
+    bound_store = _SelectionBoundStore(
+        store,
+        cellSelection,
+        artifacts=grouping_artifacts,
+    )
+    cell_key = "I"
     direction_map = dict(directions or {})
-    available = set(store.cells.columns)
-    if cellKey not in available:
-        return CovariateCharacterization(
-            status="failed",
-            notes=[f"cellKey {cellKey!r} is not present in cell metadata"],
-        )
+    available = set(bound_store.cells.columns)
     errors = _validate_directions(direction_map, available)
     if errors:
-        return CovariateCharacterization(status="failed", notes=errors)
+        return CovariateCharacterization(
+            status="failed",
+            cellSelection=artifact_reference(cellSelection),
+            notes=errors,
+        )
 
     candidates, dropped = _triage_columns(
-        store,
-        cell_key=cellKey,
+        bound_store,
+        cell_key=cell_key,
         exclude=set(direction_map.get("excludeColumns") or []),
     )
     reviewed = len(candidates) + len(dropped)
-    candidates = [name for name in candidates if name in store.cells.columns]
+    candidates = [name for name in candidates if name in bound_store.cells.columns]
     kind_directions = dict(direction_map.get("columnKinds") or {})
     directed_coefficients = set(direction_map.get("coefficientsOfInterest") or [])
 
@@ -1039,9 +1231,9 @@ def characterize_covariates(
     for name in candidates:
         directed_kind = kind_directions.get(name)
         profile = _profile_column(
-            store,
+            bound_store,
             name,
-            cell_key=cellKey,
+            cell_key=cell_key,
             kind=cast(ColumnKind, directed_kind)
             if directed_kind in CONFIG._KINDS
             else None,
@@ -1054,15 +1246,15 @@ def characterize_covariates(
         varying.append(name)
     candidates = varying
     candidates, aliases, alias_notes = _collapse_ontology_aliases(
-        store,
+        bound_store,
         candidates,
         profiles,
-        cell_key=cellKey,
+        cell_key=cell_key,
     )
 
     run = _Run(
-        store=store,
-        cell_key=cellKey,
+        store=bound_store,
+        cell_key=cell_key,
         n_rows=n_rows,
         context=_bounded_context(studyContext),
         model=model,
@@ -1082,6 +1274,9 @@ def characterize_covariates(
     run.audit.extend(alias_notes)
 
     domain_directions = dict(direction_map.get("columnDomains") or {})
+    for name in grouping_artifacts:
+        if domain_directions.get(name) != "ignore":
+            domain_directions[name] = "design"
     for name in candidates:
         run.domains[name] = _assign_domain(run, name, domain_directions)
     candidates = _collapse_equivalent_columns(run, candidates, aliases)
@@ -1107,6 +1302,7 @@ def characterize_covariates(
     ]
     return CovariateCharacterization(
         status="done",
+        cellSelection=artifact_reference(cellSelection),
         auditLog=run.audit,
         actions=run.actions,
         notes=[
@@ -1118,9 +1314,9 @@ def characterize_covariates(
         coefficients=records,
         technicalNesting=(
             _technical_nesting_reports(
-                store,
+                bound_store,
                 categorical_technical,
-                cell_key=cellKey,
+                cell_key=cell_key,
             )
             if len(categorical_technical) >= 2
             else []

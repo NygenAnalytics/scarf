@@ -30,24 +30,20 @@ On shared hosts, multiprocess jobs, or remote object stores, set `SCARF_WORKERS`
 More workers can increase concurrent buffers or remote requests, so pair a large worker budget with an explicit `mem_budget`.
 Opt-in parallel UMAP, tSNE, and ANN index builds record the resolved worker count in artifact provenance; pass `nthreads` explicitly when the same parallel request must stay reuse-eligible across machines.
 
-## Count orientations
+## Why RNA stores have two count orientations
 
 Most analysis steps walk the matrix by cell.
 Quality control, library-size normalization, and graph construction read rows of `counts`.
 Gene-wise steps such as highly variable gene selection and marker search walk the matrix by feature.
 
-Those two access patterns fight each other on a single layout.
-Scarf therefore stores RNA counts twice: `counts` is cell-major, and `countsT` is the same values in gene-major order.
-They are two orientations of one assay matrix, not two datastores.
-Import, subset, merge, and `repack_zarr` write both on Zarr v3.
-The extra copy roughly doubles stored RNA counts.
-ATAC, ADT, and other non-RNA assays keep only `counts`.
+Those two access patterns compete on a single physical layout. Scarf therefore stores RNA counts
+twice: `counts` is cell-major, and `countsT` contains the same values in gene-major order. They are
+two orientations of one assay matrix, not two datastores. The second orientation roughly doubles
+stored RNA counts. ATAC, ADT, and other non-RNA assays keep only `counts`.
 
-Opening an RNA assay fails if `countsT` is missing, incomplete, not a Zarr v3 sharded array, or does not match `counts`.
-There is no silent rewrite on open.
-Rebuild the store from the source, or run `python -m scarf.tools.repack_zarr`.
-After a rewrite, recompute HVG, normalization, PCA, graph, and marker results.
-Do not resume those artefacts from the pre-rewrite store.
+Current RNA stores require a matching current-layout `countsT`. Store inspection, import, and
+offline rewrite procedures belong to {doc}`../tutorials/import_and_export` and the
+{doc}`../reference/faq`, rather than the memory-planning model on this page.
 
 ## Storage profiles
 
@@ -60,7 +56,10 @@ Override automatic selection with a writer's `profile=`, a datastore's `zarrProf
 The profile determines the physical encoding when arrays are written.
 Changing it while reopening an existing store does not rewrite the arrays.
 
-Credentials, mounted stores, repacking, and `local_cache` scratch are covered in {doc}`../tutorials/remote_stores`.
+Direct object-store templates, the distinction between a mounted count source and analysis
+target, and `local_cache` scratch behavior are covered in
+{doc}`../tutorials/remote_stores`. Its executable example downloads first and mounts two local
+paths; it is not evidence of remote execution.
 
 ## Batch and HPC output
 
@@ -83,6 +82,11 @@ See {doc}`../reference/api/utilities` for the exact output contract.
 
 ## Measured scaling references
 
-Measured end-to-end wall times, peak memory, machine classes, and per-stage timings for a fixed object-store workflow are published in {doc}`benchmarks`.
-Dataset sparsity, selected features, graph parameters, storage latency, software version, and cache state all affect the result.
-Those rows use different machine sizes and must not be read as one same-machine scaling curve.
+Measured end-to-end wall times, sampled peak memory, machine classes, and per-stage timings for a
+fixed S3-compatible object-store workflow are published in {doc}`benchmarks`. That page records
+the exact dataset, software revision, cloud region, resource envelope, and analysis settings.
+
+Dataset sparsity, selected features, graph parameters, storage latency, software version, and
+cache state all affect the result. The rows use different machine sizes and must not be read as a
+same-machine scaling curve, a remote-versus-local comparison, or a comparison with another
+package.

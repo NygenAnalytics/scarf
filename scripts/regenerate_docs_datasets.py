@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,6 +37,7 @@ LEGACY_SUFFIX = "_legacy_master"
 # executor to one codec thread and async concurrency 1, which every
 # later stage can reuse.
 ZARR_NTHREADS = 2
+DOCS_RUN_LABEL = "docs_default"
 
 PBMC_FILTERS = {
     "method": "manual",
@@ -120,6 +121,141 @@ def _labelled_cluster_mask(values: Any) -> np.ndarray:
     return (labels != "") & (np.char.lower(labels) != "nan")
 
 
+def _set_prepared_cell_selection(store: Any, values: Any) -> None:
+    """Make one exact analysis selection the teaching store's literal ``I``."""
+    selected = np.asarray(values, dtype=bool)
+    if selected.shape != (store.cells.N,):
+        raise ValueError("Prepared cell selection must align with the full cell axis")
+    store.cells.reset_key("I")
+    store.cells.update_key(selected, "I")
+
+
+def _materialize_run_cell_columns(
+    store: Any,
+    run: Any,
+    columns: Mapping[str, str],
+    *,
+    set_selection: bool,
+) -> None:
+    """Copy explicitly named frozen run fields into a prepared teaching store."""
+    for target, source in columns.items():
+        if source not in run.cells.columns:
+            raise KeyError(f"Pipeline run has no prepared field {source!r}")
+        values = np.asarray(run.cells.fetch_all(source))
+        if values.shape != (store.cells.N,):
+            raise ValueError(f"Pipeline field {source!r} is not a full-axis vector")
+        fill_value = 0 if np.issubdtype(values.dtype, np.integer) else np.nan
+        store.cells.insert(
+            target,
+            values,
+            fill_value=fill_value,
+            overwrite=True,
+        )
+    if set_selection:
+        _set_prepared_cell_selection(store, run.cells.fetch_all("I"))
+
+
+def _prepared_full_axis_values(
+    values: np.ndarray,
+    indices: np.ndarray,
+    n_cells: int,
+) -> np.ndarray:
+    compact = np.asarray(values)
+    if compact.ndim != 1 or compact.shape != (len(indices),):
+        raise ValueError("Prepared artifact values do not align with their selection")
+    if compact.dtype.kind in {"f", "c"}:
+        output = np.full(n_cells, np.nan, dtype=compact.dtype)
+    elif compact.dtype.kind == "u":
+        compact = compact.astype(np.int64)
+        output = np.full(n_cells, -1, dtype=np.int64)
+    elif compact.dtype.kind == "i":
+        output = np.full(n_cells, -1, dtype=compact.dtype)
+    elif compact.dtype.kind == "b":
+        output = np.zeros(n_cells, dtype=bool)
+    else:
+        output = np.full(n_cells, "", dtype=compact.dtype)
+    output[indices] = compact
+    return output
+
+
+def _materialize_artifact_cell_columns(
+    store: Any,
+    artifact: Any,
+    columns: Mapping[str, tuple[str, int | None]],
+) -> None:
+    """Project exact compact artifact arrays into literal teaching columns."""
+    from scarf.storage import ArtifactRef
+    from scarf.storage.selections import read_stored_selection_indices
+
+    status = store.inspect_artifact(artifact)
+    if not status.complete:
+        raise ValueError("Prepared artifact must be complete")
+    raw_selection = (status.inputs or {}).get("cell_selection")
+    if not isinstance(raw_selection, Mapping):
+        raise ValueError("Prepared artifact has no exact cell-selection input")
+    selection = ArtifactRef.from_dict(raw_selection)
+    indices = read_stored_selection_indices(
+        store.zw,
+        selection,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+    ).astype(np.int64, copy=False)
+    group = store.load_artifact(artifact)
+    arrays: dict[str, np.ndarray] = {}
+    for target, (source, value_index) in columns.items():
+        if source not in group:
+            raise KeyError(f"Prepared artifact has no array {source!r}")
+        if source not in arrays:
+            arrays[source] = np.asarray(group[source][:])
+        values = arrays[source]
+        if value_index is None:
+            compact = values
+        else:
+            if values.ndim != 2 or not 0 <= value_index < values.shape[1]:
+                raise ValueError(
+                    f"Prepared artifact array {source!r} has no component {value_index}"
+                )
+            compact = values[:, value_index]
+        full_values = _prepared_full_axis_values(
+            compact,
+            indices,
+            store.cells.N,
+        )
+        fill_value = 0 if np.issubdtype(full_values.dtype, np.integer) else np.nan
+        store.cells.insert(
+            target,
+            full_values,
+            fill_value=fill_value,
+            overwrite=True,
+        )
+
+
+def _drop_retired_assay_state(root: Any) -> tuple[str, ...]:
+    """Delete leftover `{assay}/state` groups so the archived store can reopen."""
+    removed: list[str] = []
+    for name in list(root.group_keys()):
+        child = root[name]
+        if not hasattr(child, "group_keys"):
+            continue
+        if child.attrs.get("is_assay") and "state" in child:
+            del child["state"]
+            removed.append(f"{name}/state")
+    return tuple(removed)
+
+
+def _verify_store_opens(store: Path, *, default_assay: str) -> None:
+    from scarf import DataStore
+
+    DataStore(
+        str(store),
+        default_assay=default_assay,
+        nthreads=ZARR_NTHREADS,
+        zarr_mode="r",
+    )
+
+
 def _openable_rna_store(source_path: Path, work: Path) -> Path:
     """Return a store DataStore can open, repacking a legacy snapshot if needed."""
     import zarr
@@ -176,64 +312,93 @@ def _derive_labelled_kang_store(
 
 
 def _analyze_pbmc(store: Any) -> None:
-    store.pipeline.run(
+    run = store.pipeline.run(
+        label=DOCS_RUN_LABEL,
         filtering=PBMC_FILTERS,
-        highly_variable_features={
-            "min_cells": 20,
-            "top_n": 500,
-            "min_mean": -3,
-            "max_mean": 2,
-            "max_var": 6,
-        },
-        pca={"dims": 15, "n_centroids": 100},
-        neighbors={"k": 11},
-        umap={"n_epochs": 250, "spread": 5, "min_dist": 1, "parallel": True},
-        leiden={0.5: {"label": "leiden_cluster"}},
+        hvg_count=500,
+        pca_dims=15,
+        neighbors_k=11,
+        leiden={"partitions": [0.5]},
         paris=False,
-        markers={},
+        snapshot_columns=("RNA_nCounts", "RNA_nFeatures"),
     )
-    store.run_paris_clustering(n_clusters=15)
+    paris = store.run_paris_clustering(run["connectivity_map"], n_clusters=15)
+    _materialize_run_cell_columns(
+        store,
+        run,
+        {
+            "RNA_UMAP1": "umap_1",
+            "RNA_UMAP2": "umap_2",
+            "RNA_leiden_cluster": "leiden_0.5",
+            "RNA_clusters": "clusters",
+            "RNA_S_score": "s_score",
+            "RNA_G2M_score": "g2m_score",
+            "RNA_cell_cycle_phase": "cell_cycle_phase",
+            "RNA_doublet_score": "doublet_score",
+        },
+        set_selection=True,
+    )
+    _materialize_artifact_cell_columns(
+        store,
+        paris,
+        {"RNA_paris_cluster": ("labels", None)},
+    )
 
 
 def _analyze_pancreas(store: Any) -> None:
-    store.pipeline.run(
+    run = store.pipeline.run(
+        label=DOCS_RUN_LABEL,
         filtering=False,
-        cell_cycle_scoring=False,
-        highly_variable_features={"min_cells": 20, "top_n": 2000},
-        pca={"dims": 15, "n_centroids": 100},
-        neighbors={"k": 11},
-        umap={"n_epochs": 250, "spread": 5, "min_dist": 1, "parallel": True},
-        leiden={0.5: {"label": "leiden_cluster"}},
+        cell_cycle=False,
+        hvg_count=2000,
+        pca_dims=15,
+        neighbors_k=11,
+        leiden={"partitions": [0.5]},
         paris=False,
-        doublet_scoring=False,
-        markers=False,
+        doublets=False,
+        markers=True,
     )
-    store.run_marker_search(group_key="clusters", features="all_features")
+    _materialize_run_cell_columns(
+        store,
+        run,
+        {
+            "RNA_UMAP1": "umap_1",
+            "RNA_UMAP2": "umap_2",
+            "RNA_leiden_cluster": "leiden_0.5",
+            "RNA_clusters": "clusters",
+        },
+        set_selection=True,
+    )
 
 
 def _analyze_kang(store: Any) -> None:
-    store.pipeline.run(
+    run = store.pipeline.run(
+        label=DOCS_RUN_LABEL,
         filtering={
             "method": "manual",
             "attrs": ["RNA_nCounts", "RNA_nFeatures"],
             "highs": [15000, 4000],
             "lows": [500, 200],
         },
-        cell_cycle_scoring=False,
-        highly_variable_features={
-            "min_cells": 10,
-            "top_n": 2000,
-            "min_mean": -3,
-            "max_mean": 2,
-            "max_var": 6,
-        },
-        pca={"dims": 25, "n_centroids": 100},
-        neighbors={"k": 21},
-        umap={"n_epochs": 250, "spread": 5, "min_dist": 1, "parallel": True},
-        leiden={1.0: {"label": "leiden_cluster"}},
+        cell_cycle=False,
+        hvg_count=2000,
+        pca_dims=25,
+        neighbors_k=21,
+        leiden={"partitions": [1.0]},
         paris=False,
-        doublet_scoring=False,
-        markers=False,
+        doublets=False,
+        markers=True,
+    )
+    _materialize_run_cell_columns(
+        store,
+        run,
+        {
+            "RNA_UMAP1": "umap_1",
+            "RNA_UMAP2": "umap_2",
+            "RNA_leiden_cluster": "leiden_1.0",
+            "RNA_clusters": "clusters",
+        },
+        set_selection=True,
     )
 
 
@@ -262,95 +427,172 @@ def _merge_kang(source_paths: dict[str, Path], store: Path) -> None:
 
 
 def _analyze_kang_integration(store: Any) -> None:
-    store.pipeline.run(
+    run = store.pipeline.run(
+        label=DOCS_RUN_LABEL,
         filtering=False,
-        cell_cycle_scoring=False,
-        highly_variable_features={
-            "min_cells": 10,
-            "top_n": 2000,
-            "min_mean": -3,
-            "max_mean": 2,
-            "max_var": 6,
-        },
-        pca={"dims": 25},
-        neighbors={"k": 21},
-        umap={"n_epochs": 250, "spread": 5, "min_dist": 1, "parallel": True},
-        leiden={1.0: {"label": "integration_clusters"}},
+        cell_cycle=False,
+        hvg_count=2000,
+        pca_dims=25,
+        neighbors_k=21,
+        leiden={"partitions": [1.0]},
         paris=False,
-        doublet_scoring=False,
+        doublets=False,
         markers=False,
+        snapshot_columns=("sample_id", "orig_cluster_labels"),
+    )
+    _materialize_run_cell_columns(
+        store,
+        run,
+        {
+            "RNA_UMAP1": "umap_1",
+            "RNA_UMAP2": "umap_2",
+            "RNA_integration_clusters": "leiden_1.0",
+            "RNA_clusters": "clusters",
+        },
+        set_selection=True,
     )
 
 
 def _analyze_citeseq(store: Any) -> None:
     import numpy as np
 
-    store.auto_filter_cells(show_qc_plots=False)
-    store.pipeline.run(
-        filtering=False,
-        cell_cycle_scoring=False,
-        highly_variable_features={
-            "min_cells": 20,
-            "top_n": 1000,
-            "min_mean": -3,
-            "max_mean": 2,
-            "max_var": 6,
-        },
-        pca={"dims": 15, "n_centroids": 100},
-        neighbors={"k": 21},
-        umap={"n_epochs": 250, "spread": 5, "min_dist": 1, "parallel": True},
-        leiden={1.0: {"label": "leiden_cluster"}},
+    rna_run = store.pipeline.run(
+        label=DOCS_RUN_LABEL,
+        cell_cycle=False,
+        hvg_count=1000,
+        pca_dims=15,
+        neighbors_k=21,
+        leiden={"partitions": [1.0]},
         paris=False,
-        doublet_scoring=False,
+        doublets=False,
         markers=False,
     )
+    cell_selection = rna_run["analysis_cell_selection"]
 
     names = np.asarray(store.ADT.feats.fetch_all("names")).astype(str)
     is_control = np.char.find(np.char.lower(names), "control") >= 0
     adt_features = store.set_feature_selection(
         from_assay="ADT",
         mask=~is_control,
-        label="non_control_features",
     )
 
     normalized = store.run_normalization(
-        from_assay="ADT",
-        features=adt_features,
+        cell_selection,
+        adt_features,
     )
     n_features = int(store.load_artifact(normalized)["data"].shape[1])
     reduction = store.run_custom_reduction(
         np.eye(n_features, dtype=np.float64),
         normalized,
-        from_assay="ADT",
     )
-    store.build_embedding_initialization(reduction, n_centroids=100)
+    initialization = store.build_embedding_initialization(reduction)
     ann = store.build_ann_index(reduction)
     neighbors = store.query_neighbors(ann, k=21)
     graph = store.build_connectivity_map(neighbors)
-    store.run_umap(graph, n_epochs=250, spread=5, min_dist=1, parallel=True)
-    store.run_leiden_clustering(graph, resolution=1.0, label="leiden_cluster")
+    adt_umap = store.run_umap(graph, initialization)
+    adt_clusters = store.run_leiden_clustering(graph, resolution=1.0)
+    _materialize_artifact_cell_columns(
+        store,
+        adt_umap,
+        {
+            "ADT_UMAP1": ("values", 0),
+            "ADT_UMAP2": ("values", 1),
+        },
+    )
+    _materialize_artifact_cell_columns(
+        store,
+        adt_clusters,
+        {"ADT_leiden_cluster": ("values", None)},
+    )
 
-    for label, method in (("RNA+ADT", "snn"), ("RNA+ADT_wnn", "wnn")):
+    for method, sources in (
+        ("snn", [rna_run["connectivity_map"], graph]),
+        ("wnn", [rna_run["neighbors"], neighbors]),
+    ):
         integrated = store.integrate_assays(
-            assays=["RNA", "ADT"],
-            label=label,
+            sources,
             method=method,
         )
-        store.run_umap(integrated, n_epochs=250, spread=5, min_dist=1, parallel=True)
-        store.run_leiden_clustering(integrated, resolution=1.75, label="leiden_cluster")
+        embedding = store.run_umap(
+            integrated,
+            rna_run["embedding_initialization"],
+        )
+        clusters = store.run_leiden_clustering(integrated, resolution=1.75)
+        prefix = "RNA+ADT" if method == "snn" else "RNA+ADT_wnn"
+        _materialize_artifact_cell_columns(
+            store,
+            embedding,
+            {
+                f"{prefix}_UMAP1": ("values", 0),
+                f"{prefix}_UMAP2": ("values", 1),
+            },
+        )
+        _materialize_artifact_cell_columns(
+            store,
+            clusters,
+            {f"{prefix}_leiden_cluster": ("values", None)},
+        )
+
+    _materialize_run_cell_columns(
+        store,
+        rna_run,
+        {
+            "RNA_UMAP1": "umap_1",
+            "RNA_UMAP2": "umap_2",
+            "RNA_leiden_cluster": "leiden_1.0",
+            "RNA_clusters": "clusters",
+        },
+        set_selection=True,
+    )
 
 
 def _analyze_atac(store: Any) -> None:
-    store.auto_filter_cells(show_qc_plots=False)
-    prevalent_peaks = store.mark_prevalent_peaks(top_n=25000)
-    normalized = store.run_normalization(features=prevalent_peaks)
+    cell_selection = store.auto_filter_cells()
+    prevalent_peaks = store.select_prevalent_peaks(
+        cell_selection,
+        top_n=25000,
+    )
+    normalized = store.run_normalization(cell_selection, prevalent_peaks)
     reduction = store.run_lsi(normalized, dims=50, skip_first=True)
-    store.build_embedding_initialization(reduction)
+    initialization = store.build_embedding_initialization(reduction)
     ann = store.build_ann_index(reduction)
     neighbors = store.query_neighbors(ann, k=21)
     graph = store.build_connectivity_map(neighbors)
-    store.run_umap(graph, n_epochs=500, min_dist=0.1, spread=1, parallel=True)
-    store.run_leiden_clustering(graph, resolution=0.6, label="leiden_cluster")
+    embedding = store.run_umap(
+        graph,
+        initialization,
+        n_epochs=500,
+        min_dist=0.1,
+        spread=1,
+        parallel=True,
+    )
+    clusters = store.run_leiden_clustering(graph, resolution=0.6)
+    _materialize_artifact_cell_columns(
+        store,
+        embedding,
+        {
+            "ATAC_UMAP1": ("values", 0),
+            "ATAC_UMAP2": ("values", 1),
+        },
+    )
+    _materialize_artifact_cell_columns(
+        store,
+        clusters,
+        {"ATAC_leiden_cluster": ("values", None)},
+    )
+    from scarf.storage.selections import read_stored_selection_mask
+
+    _set_prepared_cell_selection(
+        store,
+        read_stored_selection_mask(
+            store.zw,
+            cell_selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
+        ),
+    )
 
 
 def _add_teaseq_annotations(store: Any, source: Path) -> None:
@@ -482,8 +724,9 @@ def _build_teaseq_graph(
     store: Any,
     *,
     reduction: Any,
-) -> Any:
-    store.build_embedding_initialization(
+    prefix: str,
+) -> dict[str, Any]:
+    initialization = store.build_embedding_initialization(
         reduction,
         n_centroids=100,
         rand_state=4466,
@@ -499,54 +742,72 @@ def _build_teaseq_graph(
         k=20,
     )
     graph = store.build_connectivity_map(neighbors)
-    store.run_umap(
+    embedding = store.run_umap(
         graph,
+        initialization,
         n_epochs=250,
         spread=1,
         min_dist=0.1,
         random_seed=4444,
         parallel=False,
     )
-    store.run_leiden_clustering(
+    clusters = store.run_leiden_clustering(
         graph,
         resolution=1.0,
-        label="leiden_cluster",
         random_seed=4444,
     )
-    return graph
+    _materialize_artifact_cell_columns(
+        store,
+        embedding,
+        {
+            f"{prefix}_UMAP1": ("values", 0),
+            f"{prefix}_UMAP2": ("values", 1),
+        },
+    )
+    _materialize_artifact_cell_columns(
+        store,
+        clusters,
+        {f"{prefix}_leiden_cluster": ("values", None)},
+    )
+    return {
+        "initialization": initialization,
+        "neighbors": neighbors,
+        "graph": graph,
+    }
 
 
 def _analyze_teaseq(store: Any) -> None:
-    hvgs = store.mark_hvgs(
+    cell_selection = store.snapshot_cell_selection("I")
+    hvgs = store.select_hvgs(
+        cell_selection,
         from_assay="RNA",
-        cell_key="I",
         min_cells=20,
         top_n=2_000,
         show_plot=False,
-        label="hvgs",
     )
     rna_normalized = store.run_normalization(
-        from_assay="RNA",
-        cell_key="I",
-        features=hvgs,
+        cell_selection,
+        hvgs,
     )
     rna_reduction = store.run_pca(
         rna_normalized,
         dims=30,
         feat_scaling=True,
     )
-    _build_teaseq_graph(store, reduction=rna_reduction)
+    rna_graph = _build_teaseq_graph(
+        store,
+        reduction=rna_reduction,
+        prefix="RNA",
+    )
 
-    prevalent_peaks = store.mark_prevalent_peaks(
+    prevalent_peaks = store.select_prevalent_peaks(
+        cell_selection,
         from_assay="ATAC",
-        cell_key="I",
         top_n=25_000,
-        label="prevalent_peaks",
     )
     atac_normalized = store.run_normalization(
-        from_assay="ATAC",
-        cell_key="I",
-        features=prevalent_peaks,
+        cell_selection,
+        prevalent_peaks,
     )
     atac_reduction = store.run_lsi(
         atac_normalized,
@@ -555,50 +816,78 @@ def _analyze_teaseq(store: Any) -> None:
         rand_state=4466,
         solver="streaming",
     )
-    _build_teaseq_graph(store, reduction=atac_reduction)
+    atac_graph = _build_teaseq_graph(
+        store,
+        reduction=atac_reduction,
+        prefix="ATAC",
+    )
 
     adt_names = np.asarray(store.ADT.feats.fetch_all("names")).astype(str)
     adt_controls = np.char.find(np.char.lower(adt_names), "control") >= 0
     adt_features = store.set_feature_selection(
         from_assay="ADT",
         mask=~adt_controls,
-        label="non_control_features",
     )
     adt_normalized = store.run_normalization(
-        from_assay="ADT",
-        cell_key="I",
-        features=adt_features,
+        cell_selection,
+        adt_features,
     )
     adt_reduction = store.run_pca(
         adt_normalized,
         dims=15,
         feat_scaling=True,
     )
-    _build_teaseq_graph(store, reduction=adt_reduction)
+    adt_graph = _build_teaseq_graph(
+        store,
+        reduction=adt_reduction,
+        prefix="ADT",
+    )
 
-    assays = ["RNA", "ATAC", "ADT"]
-    for label, method in (
-        ("RNA+ATAC+ADT", "snn"),
-        ("RNA+ATAC+ADT_wnn", "wnn"),
+    for method, sources in (
+        (
+            "snn",
+            [rna_graph["graph"], atac_graph["graph"], adt_graph["graph"]],
+        ),
+        (
+            "wnn",
+            [
+                rna_graph["neighbors"],
+                atac_graph["neighbors"],
+                adt_graph["neighbors"],
+            ],
+        ),
     ):
         integrated = store.integrate_assays(
-            assays=assays,
-            label=label,
+            sources,
             method=method,
         )
-        store.run_umap(
+        embedding = store.run_umap(
             integrated,
+            rna_graph["initialization"],
             n_epochs=250,
             spread=1,
             min_dist=0.1,
             random_seed=4444,
             parallel=False,
         )
-        store.run_leiden_clustering(
+        clusters = store.run_leiden_clustering(
             integrated,
             resolution=1.0,
-            label="leiden_cluster",
             random_seed=4444,
+        )
+        prefix = "RNA+ATAC+ADT" if method == "snn" else "RNA+ATAC+ADT_wnn"
+        _materialize_artifact_cell_columns(
+            store,
+            embedding,
+            {
+                f"{prefix}_UMAP1": ("values", 0),
+                f"{prefix}_UMAP2": ("values", 1),
+            },
+        )
+        _materialize_artifact_cell_columns(
+            store,
+            clusters,
+            {f"{prefix}_leiden_cluster": ("values", None)},
         )
 
 
@@ -667,7 +956,7 @@ RECIPES: dict[str, DatasetRecipe] = {
         analyze=_analyze_pancreas,
         summary=(
             "2000 HVGs, PCA 15, k=11 graph, UMAP, Leiden 0.5, markers on the "
-            "published cell-type annotations"
+            "pipeline-selected clustering"
         ),
         drop_columns=("X_pca*",),
     ),
@@ -859,6 +1148,18 @@ def _artifact_inventory(store: Any) -> list[dict[str, object]]:
     return inventory
 
 
+def _pipeline_inventory(store: Any) -> list[dict[str, object]]:
+    return [
+        {
+            "runId": run.run_id,
+            "label": run.label,
+            "recipe": run.recipe,
+            "status": run.status,
+        }
+        for run in store.pipeline.list_runs(limit=2**31 - 1)
+    ]
+
+
 def _directory_bytes(path: Path) -> int:
     return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
 
@@ -1004,6 +1305,12 @@ def build_store(
         **datastore_options,
     )
     recipe.analyze(datastore)
+    retired_state = _drop_retired_assay_state(datastore.z)
+    if retired_state:
+        print(
+            "Dropped leftover assay state before archiving: " + ", ".join(retired_state)
+        )
+    _verify_store_opens(store, default_assay=recipe.default_assay)
 
     archive = output / ARCHIVE_NAME
     with tarfile.open(archive, "w:gz") as handle:
@@ -1014,6 +1321,7 @@ def build_store(
     cells_total = int(datastore.cells.N)
     cells_active = int(datastore.cells.active_index("I").size)
     artifacts = _artifact_inventory(datastore)
+    pipeline_runs = _pipeline_inventory(datastore)
 
     manifest = {
         "dataset": dataset,
@@ -1032,6 +1340,7 @@ def build_store(
         "archiveSha256": _file_digest(archive),
         "cellColumns": sorted(datastore.cells.columns),
         "artifacts": artifacts,
+        "pipelineRuns": pipeline_runs,
         "publishNotes": [
             f"Publish with: uv run python scripts/publish_docs_datasets.py {dataset}",
             f"That preserves the published archive as {dataset}_legacy_master "

@@ -1,7 +1,6 @@
 ---
-description: Estimate cell-level probabilities for several supervised terminal states.
+description: Compute and validate immutable multi-sink fate-probability artifacts.
 jupytext:
-  formats: ipynb,md:myst
   text_representation:
     extension: .md
     format_name: myst
@@ -13,268 +12,132 @@ kernelspec:
   name: python3
 ---
 
-# Fate mapping across terminal states
+# Fate mapping
 
-Pseudotime places cells along one progression axis.
-Fate mapping complements that ordering with a probability for each user-provided terminal state.
-This notebook uses pancreatic endocrine differentiation to estimate Alpha, Beta, and Delta fates.
+Fate mapping estimates terminal-outcome probabilities on an oriented graph. It is supervised by a
+pseudotime artifact and an exact sink-label artifact. The probabilities summarize the model; they
+do not establish causal lineage.
 
-## Prerequisites
-
-- Scarf installed with the `extra` optional dependencies
-- An RNA assay with a neighbourhood graph and cluster annotations for sources and sinks
-
-## What you will learn
-
-- Define progenitor and terminal groups for multi-sink PBA
-- Estimate a shared pseudotime across branches
-- Compute absorption probabilities for each terminal fate
-
-## Dataset
+## 1. Reuse the prepared graph and sink labels
 
 ```{code-cell} ipython3
-from tempfile import TemporaryDirectory
-
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 import scarf
-import scarf.plotting as splt
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level='WARNING', progress=True)
-```
+scarf.configure_output(level="WARNING", progress=False)
 
-## 1. Load the preprocessed dataset
-
-The prepared Zarr store from the `scarf_docs` Cytebase catalog contains counts, UMAP coordinates, Scarf clusters, and the provided cell-type annotations.
-The setup mounts those inputs into a temporary writable analysis store and builds a current graph lineage locally.
-The temporary structural repack supplies the current RNA count layout, while the mounted target starts without the snapshot's legacy analysis state.
-
-```{code-cell} ipython3
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    name='bastidas-ponce_4K_pancreas-d15_rnaseq',
-    destination='scarf_datasets',
+    name="bastidas-ponce_4K_pancreas-d15_rnaseq",
+    destination="scarf_datasets",
     zarr=True,
 )
-```
-
-```{code-cell} ipython3
-analysis_directory = TemporaryDirectory()
-repacked_counts = f'{analysis_directory.name}/counts.zarr'
-repack_store(
-    f'{dataset}/data.zarr',
-    repacked_counts,
-    nthreads=2,
-)
-ds = scarf.mount_datastore(
-    repacked_counts,
-    at=f'{analysis_directory.name}/analysis.zarr',
+ds = scarf.DataStore(
+    f"{dataset}/data.zarr",
     nthreads=4,
-    default_assay='RNA',
 )
-hvg_ref = ds.mark_hvgs(
-    top_n=2000,
-    show_plot=False,
-    label='fate_hvgs',
-)
-normalized = ds.run_normalization(features=hvg_ref)
-reduction = ds.run_pca(normalized, dims=15)
-ann_index = ds.build_ann_index(reduction)
-neighbors = ds.query_neighbors(ann_index, k=11)
-graph = ds.build_connectivity_map(neighbors)
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='clusters',
-    legend_loc='on_data',
-)
+analysis_run = ds.pipeline.open(label="docs_default")
+graph = analysis_run["connectivity_map"]
+
+annotations = ds.cells.fetch("clusters", key="I")
+source = annotations == "Ductal"
+sink = np.isin(annotations, ["Alpha", "Beta", "Delta"])
+if not source.any() or not sink.any():
+    raise ValueError("Source and sink annotations must both be present")
+source_sink_vector = np.zeros(len(annotations), dtype=float)
+source_sink_vector[source] = -1.0 / source.sum()
+source_sink_vector[sink] = 1.0 / sink.sum()
+
+pseudotime_ref = ds.run_pseudotime_scoring(graph, ss_vec=source_sink_vector)
+pseudotime = ds.load_pseudotime_scoring(pseudotime_ref)
+sink_labels_ref = analysis_run["clusters"]
+sink_labels = analysis_run.cells.fetch("clusters")
 ```
 
-## 2. Define progenitor and terminal groups
+The rebuilt catalog store contains the completed `docs_default` pipeline run. This page reuses its
+exact graph, selected clustering, and UMAP. The literal `clusters` column contains the published
+cell-type annotations used only to orient pseudotime. The new pseudotime and fate results remain
+exact artifacts.
 
-These groups feed different calls.
-Progenitors are sources for `run_pseudotime_scoring` (PBA), which writes the pseudotime that fate mapping consumes.
-Terminal cell types are sinks for that PBA score and for `run_fate_mapping`, which takes only `pseudotime_key`, `sink_key`, and `sinks`.
-The provided `clusters` annotation names both: ductal cells are the progenitor pool of this stage, and the hormone-expressing states are the terminal fates.
-
-```{code-cell} ipython3
-progenitors = ['Ductal']
-terminal_cell_types = ['Alpha', 'Beta', 'Delta']
-
-ds.cells.to_pandas_dataframe(
-    ['clusters'],
-    key='I'
-)['clusters'].value_counts()
-```
-
-The panels below mark the source and sinks on the same embedding.
-Other populations, including Epsilon, stay in the background and are not used as boundaries.
+For this executable mechanics example, choose the two clusters with the greatest mean valid
+pseudotime as candidate terminal labels. A real analysis should choose and validate endpoints from
+study-specific evidence.
 
 ```{code-cell} ipython3
-figure, axes = plt.subplots(1, 2, figsize=(9, 4))
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by=None,
-    default_color='#bdbdbd',
-    point_alpha=0.4,
-    highlight=splt.Highlight(
-        by='clusters',
-        groups=tuple(progenitors),
-        color='#1f77b4',
-        dim_alpha=0.12,
-        size_multiplier=1.35,
-        halo_width=0.4,
-    ),
-    show_titles=False,
-    target=axes[0],
-    show=False,
-)
-axes[0].set_title('Source: Ductal')
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by=None,
-    default_color='#bdbdbd',
-    point_alpha=0.4,
-    highlight=splt.Highlight(
-        by='clusters',
-        groups=tuple(terminal_cell_types),
-        color='#d62728',
-        dim_alpha=0.12,
-        size_multiplier=1.35,
-        halo_width=0.4,
-    ),
-    show_titles=False,
-    target=axes[1],
-    show=False,
-)
-axes[1].set_title('Sinks: Alpha, Beta, Delta')
-figure.tight_layout()
-figure
-```
-
-## 3. Estimate a shared pseudotime
-
-PBA supplies the developmental direction.
-The terminal cell types are used as sinks so the ordering covers the branches analyzed below.
-`label='fate_pseudotime'` keeps these columns separate from any pseudotime already stored on the object.
-
-```{code-cell} ipython3
-pseudotime = ds.run_pseudotime_scoring(
-    graph,
-    source_sink_key='clusters',
-    sources=progenitors,
-    sinks=terminal_cell_types,
-    label='fate_pseudotime',
-)
-
-selected_cells = int(ds.cells.fetch_all('I').sum())
-valid_cells = int(ds.cells.fetch_all(pseudotime.validity_key).sum())
-pd.Series(
-    {
-        'pseudotime_key': pseudotime.pseudotime_key,
-        'validity_key': pseudotime.validity_key,
-        'valid cells': valid_cells,
-        'selected cells': selected_cells,
-        'valid fraction': valid_cells / selected_cells,
-    }
-)
-```
-
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by=pseudotime.pseudotime_key,
-    subset_by=pseudotime.validity_key,
-)
-```
-
-## 4. Compute fate probabilities
-
-`run_fate_mapping` biases the KNN graph toward increasing pseudotime and solves the absorption probability for each terminal cell type.
-Every cell carrying an Alpha, Beta, or Delta annotation defines the corresponding fate boundary.
-The PBA validity key excludes any unscored graph components from the fate calculation.
-Since that subset key is not `I`, Scarf includes it in the saved fate column names.
-
-```{code-cell} ipython3
-fate = ds.run_fate_mapping(
-    graph,
-    cell_key='I',
-    subset_cell_key=pseudotime.validity_key,
-    pseudotime_key=pseudotime.pseudotime_key,
-    sink_key='clusters',
-    sinks=terminal_cell_types,
-)
-
-fate_valid = int(ds.cells.fetch_all(fate.validity_key).sum())
-pd.Series(
-    {
-        'fate_keys': ', '.join(fate.fate_keys),
-        'validity_key': fate.validity_key,
-        'valid cells': fate_valid,
-        'selected cells': selected_cells,
-        'valid fraction': fate_valid / selected_cells,
-    }
-)
-```
-
-The returned `FateMappingResult.graph` pins the graph used for both pseudotime bias and absorption probabilities.
-
-```{code-cell} ipython3
-figure, axes = plt.subplots(1, 3, figsize=(11, 4))
-probability_scale = splt.ColorScale(vmin=0, vmax=1)
-for index, (axis, sink, fate_key) in enumerate(
-    zip(axes, fate.sink_labels, fate.fate_keys, strict=True)
-):
-    ds.plots.embedding(
-        layout_key="RNA_UMAP",
-        color_by=fate_key,
-        subset_by=fate.validity_key,
-        color_scale=probability_scale,
-        sort_values=True,
-        show_legend=index == 2,
-        show_titles=False,
-        target=axis,
-        show=False,
+terminal_labels = (
+    pd.Series(
+        pseudotime.values[pseudotime.valid],
+        index=sink_labels[pseudotime.valid],
     )
-    axis.set_title(f"{sink} fate probability")
-for colorbar_axis in set(figure.axes) - set(axes):
-    colorbar_axis.set_title(f"{fate.sink_labels[-1]} fate probability")
-    colorbar_axis.set_xlabel("")
-    colorbar_axis.set_ylabel("")
+    .groupby(level=0)
+    .mean()
+    .nlargest(2)
+    .index.tolist()
+)
+if len(terminal_labels) != 2:
+    raise ValueError("Fate mapping requires exactly two terminal labels in this example")
+terminal_labels
+```
+
+## 2. Compute fate probabilities
+
+```{code-cell} ipython3
+fate_ref = ds.run_fate_mapping(
+    pseudotime_ref,
+    sink_labels_ref,
+    sinks=terminal_labels,
+)
+fate = ds.load_fate_mapping(fate_ref)
+{
+    "artifact": fate.ref,
+    "pseudotime": fate.pseudotime,
+    "sink labels": fate.sink_labels,
+    "valid cells": int(fate.valid.sum()),
+}
+```
+
+The producer writes one artifact containing all probability columns and validity, leaving cell
+metadata unchanged.
+
+```{code-cell} ipython3
+valid_probabilities = fate.values[fate.valid]
+probability_summary = pd.DataFrame(
+    valid_probabilities,
+    columns=[str(label) for label in fate.sink_labels],
+)
+probability_summary["row-sum error"] = np.abs(
+    probability_summary.sum(axis=1) - 1.0
+)
+probability_summary.agg(["min", "median", "max"])
+```
+
+Probabilities should be finite, non-negative, and sum to one for valid cells.
+
+```{code-cell} ipython3
+umap = np.asarray(ds.load_artifact(analysis_run["umap"])["values"][:])
+figure, axes = plt.subplots(1, len(fate.sink_labels), figsize=(9, 4))
+for index, label in enumerate(fate.sink_labels):
+    axis = axes[index]
+    points = axis.scatter(
+        umap[fate.valid, 0],
+        umap[fate.valid, 1],
+        c=fate.values[fate.valid, index],
+        s=4,
+    )
+    axis.set_title(f"sink {label}")
+    figure.colorbar(points, ax=axis)
 figure.tight_layout()
 figure
 ```
 
-Mean probability by cluster makes the same claim numerically.
-Terminal rows should peak on their own fate, while intermediate populations such as Pre-endocrine retain probability across several outcomes.
+## Validation checklist
 
-```{code-cell} ipython3
-fate_frame = ds.cells.to_pandas_dataframe(
-    ['clusters', *fate.fate_keys],
-    key=fate.validity_key,
-)
-(
-    fate_frame.groupby('clusters', sort=True)[list(fate.fate_keys)]
-    .mean()
-    .rename(columns=dict(zip(fate.fate_keys, fate.sink_labels, strict=True)))
-    .round(3)
-)
-```
+- Confirm source and sink definitions are supported by independent biological evidence.
+- Check graph components and the pseudotime validity mask.
+- Verify terminal probabilities peak near their corresponding sink labels.
+- Compare plausible endpoint definitions when terminal states are uncertain.
+- Retain the pseudotime, sink-label, and fate refs together in the analysis record.
 
-A terminal group with low probability for its own fate indicates a mismatch between the annotations, graph, and selected boundaries.
-
-## Interpretation and limits
-
-The PBA score describes progress along the shared developmental direction.
-The fate columns separate that direction into terminal outcomes and quantify ambiguous intermediate cells.
-Sink identities remain supervised: this method does not discover terminal states automatically and does not use RNA velocity.
-
-## Common mistakes and limitations
-
-- Choosing sink clusters that mix several terminal annotations
-- Interpreting fate probabilities as lineage commitment without experimental support
-- Ignoring the pseudotime validity key when the graph has multiple components
-- Expecting the method to find terminal states on its own
-
-Fate probabilities are stored under the keys returned in `fate.fate_keys`, with a matching validity column.
-Probability-simplex checks, solver diagnostics, and tuning belong in {doc}`trajectory_validation`.
+See {doc}`pseudotime` for the ordering and {doc}`trajectory_validation` for broader diagnostics.

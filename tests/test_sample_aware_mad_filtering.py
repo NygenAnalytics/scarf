@@ -1,14 +1,68 @@
 import numpy as np
 import pytest
+from scarf.metadata.artifacts import (
+    plan_cell_data_artifact,
+    write_cell_data_artifact,
+)
+from scarf.metadata.selection import NamedCellArtifact
 from scarf.storage.artifacts import ArtifactRef
+from scarf.storage.artifacts import fingerprint_array, fingerprint_strings
+from scarf.storage.selections import read_stored_selection_mask
 from scarf.utils import logger
 
 from scarf.quality_control.filtering import (
+    _apply_bounds,
     _mad_bounds,
     _metric_policy,
     _sample_aware_mad_mask,
     gaussian_quantile_bounds,
 )
+
+
+def _selection_mask(datastore, ref: ArtifactRef) -> np.ndarray:
+    return read_stored_selection_mask(
+        datastore.zw,
+        ref,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+    )
+
+
+def _write_cell_vector(
+    datastore,
+    *,
+    selection: ArtifactRef,
+    name: str,
+    kind: str,
+    values: np.ndarray,
+    assay: str,
+) -> NamedCellArtifact:
+    resolved = np.asarray(values)
+    fingerprint = (
+        fingerprint_strings(resolved)
+        if resolved.dtype.kind in {"O", "S", "U"}
+        else fingerprint_array(resolved)
+    )
+    planned = plan_cell_data_artifact(
+        datastore.zw,
+        scope="assay",
+        assay=assay,
+        kind=kind,
+        operation=f"test_cell_vector_{kind}",
+        parameters={"name": name, "values_fingerprint": fingerprint},
+        inputs={},
+        execution_options={},
+        cell_selection=selection,
+        arrays={"values": ((len(resolved),), None)},
+    )
+    write_cell_data_artifact(
+        datastore.zw,
+        planned,
+        {"values": resolved},
+    )
+    return NamedCellArtifact(name=name, artifact=planned.ref)
 
 
 def test_mad_bounds_matches_hand_computed_example():
@@ -20,6 +74,28 @@ def test_mad_bounds_matches_hand_computed_example():
     assert reported_mad == pytest.approx(scaled_mad)
     assert low == pytest.approx(median - 3.0 * scaled_mad)
     assert high == pytest.approx(median + 3.0 * scaled_mad)
+
+
+def test_apply_bounds_supports_open_and_closed_intervals():
+    values = np.array([-np.inf, 0.0, 1.0, 2.0, np.inf, np.nan])
+
+    np.testing.assert_array_equal(
+        _apply_bounds(values, 0.0, 2.0),
+        [False, False, True, False, False, False],
+    )
+    np.testing.assert_array_equal(
+        _apply_bounds(values, 0.0, 2.0, keep_bounds=True),
+        [False, True, True, True, False, False],
+    )
+    np.testing.assert_array_equal(
+        _apply_bounds(values, None, None, keep_bounds=True),
+        [True, True, True, True, True, False],
+    )
+
+
+def test_apply_bounds_rejects_non_vector_values():
+    with pytest.raises(ValueError, match="one-dimensional"):
+        _apply_bounds(np.ones((2, 2)), 0.0, 2.0)
 
 
 def test_metric_policy_defaults_and_custom_attrs():
@@ -194,12 +270,9 @@ def test_auto_filter_cells_without_sample_column_matches_gaussian(
     }
 
     before = np.asarray(datastore_ephemeral.cells.fetch_all("I"), dtype=bool).copy()
-    datastore_ephemeral.auto_filter_cells(attrs=attrs, show_qc_plots=False)
+    cell_ref = datastore_ephemeral.auto_filter_cells(attrs=attrs)
     after = np.asarray(datastore_ephemeral.cells.fetch_all("I"), dtype=bool)
 
-    cell_ref = ArtifactRef.from_dict(
-        datastore_ephemeral.zw["cellData"]["I"].attrs["source_artifact"]
-    )
     status = datastore_ephemeral.inspect_artifact(cell_ref)
     assert status.operation == "auto_filter_cells"
     assert "sample_column" not in status.parameters
@@ -210,7 +283,95 @@ def test_auto_filter_cells_without_sample_column_matches_gaussian(
         }
         for attr in attrs
     }
-    assert after.sum() < before.sum()
+    filtered = _selection_mask(datastore_ephemeral, cell_ref)
+    assert filtered.sum() < before.sum()
+    np.testing.assert_array_equal(after, before)
+
+
+def test_auto_filter_cells_global_combines_metadata_and_exact_artifact_metrics(
+    datastore_ephemeral,
+):
+    metadata_values = np.asarray(
+        datastore_ephemeral.cells.fetch_all("RNA_nCounts"),
+        dtype=float,
+    )
+    base_active = np.asarray(
+        datastore_ephemeral.cells.fetch_all("I"),
+        dtype=bool,
+    )
+    base_indices = np.flatnonzero(base_active)
+    assert len(base_indices) > 4
+    subset = base_active.copy()
+    excluded_index = int(base_indices[0])
+    subset[excluded_index] = False
+    datastore_ephemeral.cells.insert("artifact_qc_subset", subset, overwrite=True)
+    prior = datastore_ephemeral.snapshot_cell_selection("artifact_qc_subset")
+
+    metadata_values[excluded_index] = 1e12
+    datastore_ephemeral.cells.insert(
+        "RNA_nCounts",
+        metadata_values,
+        overwrite=True,
+    )
+    selected_indices = np.flatnonzero(subset)
+    selected_counts = metadata_values[selected_indices]
+    artifact_values = np.linspace(1.0, 2.0, len(selected_indices))
+    artifact_values[-1] = 50.0
+    metric = _write_cell_vector(
+        datastore_ephemeral,
+        selection=prior,
+        name="percentMito",
+        kind="quality_metric",
+        values=artifact_values,
+        assay="RNA",
+    )
+    count_low, count_high = gaussian_quantile_bounds(selected_counts, 0.01, 0.99)
+    metric_low, metric_high = gaussian_quantile_bounds(
+        artifact_values,
+        0.01,
+        0.99,
+    )
+    expected_compact = (
+        (selected_counts > count_low)
+        & (selected_counts < count_high)
+        & (artifact_values > metric_low)
+        & (artifact_values < metric_high)
+    )
+    expected = np.zeros(datastore_ephemeral.cells.N, dtype=bool)
+    expected[selected_indices] = expected_compact
+
+    result = datastore_ephemeral.auto_filter_cells(
+        attrs=["RNA_nCounts"],
+        artifact_metrics=[metric],
+        cell_selection=prior,
+    )
+
+    np.testing.assert_array_equal(
+        _selection_mask(datastore_ephemeral, result), expected
+    )
+    status = datastore_ephemeral.inspect_artifact(result)
+    assert status.parameters["resolved_bounds"]["RNA_nCounts"] == {
+        "low": float(count_low),
+        "high": float(count_high),
+    }
+    assert status.parameters["resolved_bounds"]["percentMito"] == {
+        "low": float(metric_low),
+        "high": float(metric_high),
+    }
+    assert status.inputs["artifact_metrics"] == {
+        "percentMito": metric.artifact.to_dict()
+    }
+    assert status.parameters["metric_sources"] == [
+        {
+            "name": "RNA_nCounts",
+            "source": "metadataColumn",
+            "column": "RNA_nCounts",
+        },
+        {"name": "percentMito", "source": "artifact"},
+    ]
+    full_low, full_high = gaussian_quantile_bounds(metadata_values, 0.01, 0.99)
+    assert (count_low, count_high) != pytest.approx((full_low, full_high))
+    assert "percentMito" not in datastore_ephemeral.cells.columns
 
 
 def test_auto_filter_cells_sample_column_raises_on_conflicts(
@@ -228,14 +389,12 @@ def test_auto_filter_cells_sample_column_raises_on_conflicts(
             attrs=["RNA_nCounts"],
             sample_column="sample_id",
             min_p=0.05,
-            show_qc_plots=False,
         )
 
     with pytest.raises(ValueError, match="not found"):
         datastore_ephemeral.auto_filter_cells(
             attrs=["RNA_nCounts"],
             sample_column="missing_sample",
-            show_qc_plots=False,
         )
 
 
@@ -261,7 +420,6 @@ def test_auto_filter_cells_rejects_nonfinite_n_mads_without_mutating_selection(
             sample_column="sample_id",
             n_mads=n_mads,
             min_cells_per_sample=2,
-            show_qc_plots=False,
         )
 
     np.testing.assert_array_equal(
@@ -289,7 +447,6 @@ def test_auto_filter_cells_rejects_overflowing_finite_n_mads_without_mutation(
             sample_column="sample_id",
             n_mads=np.finfo(float).max,
             min_cells_per_sample=2,
-            show_qc_plots=False,
         )
 
     np.testing.assert_array_equal(selection[:], selection_before)
@@ -333,7 +490,6 @@ def test_auto_filter_cells_validates_provenance_before_selection_mutation(
             attrs=["RNA_nCounts"],
             sample_column="sample_id",
             min_cells_per_sample=2,
-            show_qc_plots=False,
         )
 
     np.testing.assert_array_equal(selection[:], selection_before)
@@ -364,7 +520,6 @@ def test_auto_filter_cells_rejects_negative_counts_without_selection_mutation(
             attrs=[attr],
             sample_column="sample_id",
             min_cells_per_sample=2,
-            show_qc_plots=False,
         )
 
     np.testing.assert_array_equal(
@@ -385,7 +540,6 @@ def test_auto_filter_cells_sample_column_raises_on_missing_and_nonfinite(
         datastore_ephemeral.auto_filter_cells(
             attrs=["RNA_nCounts"],
             sample_column="sample_id",
-            show_qc_plots=False,
             min_cells_per_sample=2,
         )
 
@@ -401,7 +555,6 @@ def test_auto_filter_cells_sample_column_raises_on_missing_and_nonfinite(
         datastore_ephemeral.auto_filter_cells(
             attrs=["RNA_nCounts"],
             sample_column="sample_id",
-            show_qc_plots=False,
             min_cells_per_sample=2,
         )
 
@@ -415,7 +568,7 @@ def test_auto_filter_cells_sample_column_records_provenance(
     labels = np.array(["A"] * (n - 5) + ["tiny"] * 5)
     datastore_ephemeral.cells.insert("sample_id", labels, overwrite=True)
     active = np.asarray(datastore_ephemeral.cells.fetch_all("I"), dtype=bool)
-    prior_selection = datastore_ephemeral._ensure_cell_selection("I")
+    prior_selection = datastore_ephemeral.snapshot_cell_selection("I")
     expected_sample_fingerprint = fingerprint_strings(labels[active])
     expected_metric_fingerprints = {
         attr: fingerprint_array(
@@ -430,19 +583,16 @@ def test_auto_filter_cells_sample_column_records_provenance(
         level="WARNING",
     )
     try:
-        datastore_ephemeral.auto_filter_cells(
+        cell_ref = datastore_ephemeral.auto_filter_cells(
             attrs=["RNA_nCounts", "RNA_percentMito"],
+            cell_selection=prior_selection,
             sample_column="sample_id",
             n_mads=3.0,
             min_cells_per_sample=20,
-            show_qc_plots=False,
         )
     finally:
         logger.remove(sink)
 
-    cell_ref = ArtifactRef.from_dict(
-        datastore_ephemeral.zw["cellData"]["I"].attrs["source_artifact"]
-    )
     status = datastore_ephemeral.inspect_artifact(cell_ref)
     assert status.operation == "auto_filter_cells"
     assert status.parameters["sample_column"] == "sample_id"
@@ -462,6 +612,85 @@ def test_auto_filter_cells_sample_column_records_provenance(
     assert any("tiny" in message for message in captured)
 
 
+def test_auto_filter_cells_sample_mad_combines_exact_metric_and_hto_artifacts(
+    datastore_ephemeral,
+):
+    prior = datastore_ephemeral.snapshot_cell_selection("I")
+    active = _selection_mask(datastore_ephemeral, prior)
+    active_indices = np.flatnonzero(active)
+    n_active = len(active_indices)
+    assert n_active >= 10
+    split = n_active // 2
+    labels = np.asarray(["sample-a"] * split + ["sample-b"] * (n_active - split))
+    percent_mito = np.concatenate(
+        [
+            np.linspace(1.0, 2.0, split),
+            np.linspace(2.0, 3.0, n_active - split),
+        ]
+    )
+    percent_mito[-1] = 80.0
+    sample_source = _write_cell_vector(
+        datastore_ephemeral,
+        selection=prior,
+        name="HTO_htoIdentity",
+        kind="hto_identity",
+        values=labels,
+        assay="assay2",
+    )
+    metric_source = _write_cell_vector(
+        datastore_ephemeral,
+        selection=prior,
+        name="percentMito",
+        kind="quality_metric",
+        values=percent_mito,
+        assay="RNA",
+    )
+    counts = np.asarray(
+        datastore_ephemeral.cells.fetch_all("RNA_nCounts"),
+        dtype=float,
+    )[active_indices]
+    expected_compact, expected_provenance = _sample_aware_mad_mask(
+        values_by_attr={
+            "RNA_nCounts": counts,
+            "percentMito": percent_mito,
+        },
+        sample_labels=labels,
+        active=np.ones(n_active, dtype=bool),
+        n_mads=3.0,
+        min_cells_per_sample=5,
+        attrs=["RNA_nCounts", "percentMito"],
+    )
+    expected = np.zeros(datastore_ephemeral.cells.N, dtype=bool)
+    expected[active_indices] = expected_compact
+
+    result = datastore_ephemeral.auto_filter_cells(
+        attrs=["RNA_nCounts"],
+        artifact_metrics=[metric_source],
+        cell_selection=prior,
+        sample_artifact=sample_source,
+        n_mads=3.0,
+        min_cells_per_sample=5,
+    )
+
+    np.testing.assert_array_equal(
+        _selection_mask(datastore_ephemeral, result), expected
+    )
+    status = datastore_ephemeral.inspect_artifact(result)
+    assert status.parameters["sample_source"] == {
+        "name": "HTO_htoIdentity",
+        "source": "artifact",
+    }
+    assert (
+        status.parameters["metric_policies"] == expected_provenance["metric_policies"]
+    )
+    assert status.inputs["sample_artifact"] == sample_source.artifact.to_dict()
+    assert status.inputs["artifact_metrics"] == {
+        "percentMito": metric_source.artifact.to_dict()
+    }
+    assert "percentMito" not in datastore_ephemeral.cells.columns
+    assert "HTO_htoIdentity" not in datastore_ephemeral.cells.columns
+
+
 def test_pipeline_passes_sample_column_through(datastore_ephemeral):
     n = datastore_ephemeral.cells.N
     datastore_ephemeral.cells.insert(
@@ -469,30 +698,32 @@ def test_pipeline_passes_sample_column_through(datastore_ephemeral):
         np.array(["A"] * (n // 2) + ["B"] * (n - n // 2)),
         overwrite=True,
     )
-    artifacts = datastore_ephemeral.pipeline.run(
-        pipeline_id="basic_rna_analysis",
+    run = datastore_ephemeral.pipeline.run(
         filtering={
             "sample_column": "sample_id",
             "n_mads": 3.0,
             "min_cells_per_sample": 20,
             "attrs": ["RNA_nCounts"],
         },
-        cell_cycle_scoring=False,
-        highly_variable_features={
-            "top_n": 50,
-            "label": "mad_pipeline_hvgs",
-        },
-        pca={"dims": 5, "n_centroids": 10},
-        ann_index={"ann_m": 16},
-        neighbors={"k": 3},
-        connectivity={},
+        cell_cycle=False,
+        hvg_count=50,
+        pca_dims=5,
+        neighbors_k=3,
         umap=False,
-        leiden={},
+        leiden=False,
         paris=False,
-        doublet_scoring=False,
+        doublets=False,
         markers=False,
     )
-    status = datastore_ephemeral.inspect_artifact(artifacts["cell_selection"])
-    assert status.operation == "auto_filter_cells"
-    assert status.parameters["sample_column"] == "sample_id"
-    assert status.parameters["n_mads"] == 3.0
+    status = datastore_ephemeral.inspect_artifact(run["analysis_cell_selection"])
+    assert status.operation == "filter_pipeline_cells"
+    assert status.parameters["sampleColumn"] == "sample_id"
+    assert status.parameters["nMads"] == 3.0
+    assert status.parameters["minCellsPerSample"] == 20
+    assert status.inputs is not None
+    assert set(status.inputs) == {
+        "cell_snapshot",
+        "input_cell_selection",
+        "ordered_row_ids_fingerprint",
+        "values_fingerprint",
+    }

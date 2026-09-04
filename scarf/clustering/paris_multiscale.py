@@ -35,8 +35,8 @@ class ParisClusterDiagnostic:
 class ParisClusteringResult:
     """Labels and diagnostics returned by a Paris cut.
 
-    ``ref`` and ``label_key`` are set when the cut was written to a store, and
-    stay ``None`` for cuts produced directly from a hierarchy.
+    ``ref`` is set when the cut was written to a store and stays ``None`` for
+    cuts produced directly from a hierarchy.
     """
 
     labels: np.ndarray
@@ -44,8 +44,7 @@ class ParisClusteringResult:
     n_clusters: int
     diagnostics: tuple[ParisClusterDiagnostic, ...] = ()
     min_cluster_size: int | None = None
-    label_key: str | None = None
-    hierarchy_generation_id: str | None = None
+    hierarchy_artifact_id: str | None = None
     ref: ArtifactRef | None = None
 
     def __post_init__(self) -> None:

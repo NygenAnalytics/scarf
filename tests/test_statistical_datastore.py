@@ -1,10 +1,11 @@
+from inspect import Parameter, signature
 from typing import get_type_hints
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from scarf import DataStore
+from scarf import ArtifactRef, DataStore
 from scarf.features.statistical import (
     ANOVA_COLUMNS,
     StatisticalTestResult,
@@ -28,19 +29,56 @@ def _insert_group_columns(ds):
     return groups2, groups3, samples, subjects
 
 
+def _active_metadata_grouping(
+    ds: DataStore,
+    key: str,
+) -> dict[str, ArtifactRef | CellField]:
+    return {
+        "grouping": CellField(key),
+        "cell_selection": ds.snapshot_cell_selection("I"),
+    }
+
+
+def _test_grouping_artifact(ds: DataStore, values: np.ndarray) -> ArtifactRef:
+    from scarf.metadata.artifacts import (
+        plan_cell_data_artifact,
+        write_cell_data_artifact,
+    )
+
+    cell_selection = ds.snapshot_cell_selection("I")
+    labels = np.asarray(values)
+    planned = plan_cell_data_artifact(
+        ds.zw,
+        scope="assay",
+        assay="RNA",
+        kind="cluster_labels",
+        operation="test_cluster_labels",
+        parameters={},
+        inputs={},
+        execution_options={},
+        cell_selection=cell_selection,
+        arrays={"values": (labels.shape, None)},
+    )
+    write_cell_data_artifact(ds.zw, planned, {"values": labels})
+    return planned.ref
+
+
 def test_run_statistical_testing_mann_whitney(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
+    grouping = _active_metadata_grouping(ds, "stat_group2")
     result = ds.run_statistical_testing(
         ["MALAT1", "B2M"],
-        group_by="stat_group2",
+        **grouping,
     )
     assert isinstance(result, StatisticalTestResult)
     assert result.method == "mann_whitney"
     assert result.posthoc is None
     assert result.adjustment_method == "fdr_bh"
     assert result.n_groups == 2
-    assert result.cell_key == "I"
+    assert result.grouping is None
+    assert result.group_field == CellField("stat_group2")
+    assert result.cell_selection == grouping["cell_selection"]
     assert len(result.tested_features) == 2
     assert all(
         isinstance(identity, str) and identity for identity in result.tested_features
@@ -63,31 +101,27 @@ def test_run_statistical_testing_mann_whitney(datastore_ephemeral):
         assert table["p_value"].between(0, 1).all()
         assert table["p_value_adjusted"].between(0, 1).all()
         assert table["n_1"].iloc[0] + table["n_2"].iloc[0] == result.n_cells
-    assert "statistical_tests" in ds.zw["RNA"]
 
 
 def test_get_statistical_tests_round_trip(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
+    grouping = _active_metadata_grouping(ds, "stat_group2")
     result = ds.run_statistical_testing(
         ["MALAT1", "B2M"],
-        group_by="stat_group2",
-    )
-    loaded = ds.get_statistical_tests(
-        group_key="stat_group2",
-        method="mann_whitney",
-        keys=["MALAT1", "B2M"],
+        **grouping,
     )
     assert result.artifact is not None
-    pinned = ds.get_statistical_tests(artifact=result.artifact)
+    loaded = ds.get_statistical_tests(result.artifact)
     assert isinstance(loaded, StatisticalTestResult)
     assert loaded.method == result.method
     assert loaded.adjustment_method == result.adjustment_method
     assert loaded.n_cells == result.n_cells
-    assert loaded.cell_key == "I"
+    assert loaded.grouping is None
+    assert loaded.group_field == result.group_field == CellField("stat_group2")
     assert loaded.tested_features == result.tested_features
     assert loaded.artifact == result.artifact
-    assert loaded.cell_selection == result.cell_selection
+    assert loaded.cell_selection == result.cell_selection == grouping["cell_selection"]
     assert loaded.cell_selection_fingerprint == result.cell_selection_fingerprint
     assert loaded.group_fingerprint == result.group_fingerprint
     assert loaded.group_order == result.group_order
@@ -99,8 +133,6 @@ def test_get_statistical_tests_round_trip(datastore_ephemeral):
     assert len(loaded.value_fingerprints) == 2
     assert loaded.normalization_method == result.normalization_method
     assert loaded.size_factor == result.size_factor
-    assert pinned.artifact == result.artifact
-    assert pinned.tables.keys() == result.tables.keys()
     assert set(loaded.tables) == set(result.tables)
     for key in result.tables:
         assert loaded.tables[key].to_dict("records") == result.tables[key].to_dict(
@@ -111,23 +143,24 @@ def test_get_statistical_tests_round_trip(datastore_ephemeral):
 def test_run_statistical_testing_reuses_artifact(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
-    ds.run_statistical_testing(["MALAT1"], group_by="stat_group2")
-    stats_group = ds.zw["RNA"]["statistical_tests"]
-    index_before = dict(stats_group.attrs["artifacts"])
-    ds.run_statistical_testing(["MALAT1"], group_by="stat_group2")
-    index_after = dict(ds.zw["RNA"]["statistical_tests"].attrs["artifacts"])
-    assert index_after == index_before
+    grouping = _active_metadata_grouping(ds, "stat_group2")
+    first = ds.run_statistical_testing(["MALAT1"], **grouping)
+    second = ds.run_statistical_testing(["MALAT1"], **grouping)
+    assert first.artifact is not None
+    assert second.artifact == first.artifact
+    assert ds.get_statistical_tests(first.artifact).artifact == first.artifact
 
 
-def test_statistical_value_identity_rejects_stale_raw_reuse(datastore_ephemeral):
+def test_statistical_value_identity_changes_after_raw_mutation(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
     key = FeatureRef(value=0, by="index", label="raw_feature")
     normalization = NormalizationSpec(source="raw", transform="none")
+    grouping = _active_metadata_grouping(ds, "stat_group2")
     first = ds.run_statistical_testing(
         key,
-        group_by="stat_group2",
         normalization=normalization,
+        **grouping,
     )
     assert first.artifact is not None
     assert len(first.value_fingerprints) == 1
@@ -137,25 +170,19 @@ def test_statistical_value_identity_rejects_stale_raw_reuse(datastore_ephemeral)
     original = np.asarray(backing[int(active[0]), 0]).item()
     backing[int(active[0]), 0] = original + 1
 
-    with pytest.raises(ValueError, match="stale for the current data"):
-        ds.get_statistical_tests(
-            group_key="stat_group2",
-            method="mann_whitney",
-            keys=key,
-            normalization=normalization,
-        )
-
-    historical = ds.get_statistical_tests(artifact=first.artifact)
+    historical = ds.get_statistical_tests(first.artifact)
     assert historical.artifact == first.artifact
     assert historical.value_fingerprints == first.value_fingerprints
 
     second = ds.run_statistical_testing(
         key,
-        group_by="stat_group2",
         normalization=normalization,
+        **grouping,
     )
+    assert second.artifact is not None
     assert second.artifact != first.artifact
     assert second.value_fingerprints != first.value_fingerprints
+    assert ds.get_statistical_tests(second.artifact).artifact == second.artifact
 
 
 def test_reuse_returns_persisted_without_recompute(
@@ -180,12 +207,13 @@ def test_reuse_returns_persisted_without_recompute(
 
     monkeypatch.setattr(features_module, "compare_group_distributions", counting)
     monkeypatch.setattr(ds.RNA, "normed", counting_fetch)
-    ds.run_statistical_testing(["MALAT1"], group_by="stat_group2")
+    grouping = _active_metadata_grouping(ds, "stat_group2")
+    ds.run_statistical_testing(["MALAT1"], **grouping)
     first = calls["n"]
     first_fetch = fetch_calls["n"]
     assert first >= 1
     assert first_fetch == 1
-    ds.run_statistical_testing(["MALAT1"], group_by="stat_group2")
+    ds.run_statistical_testing(["MALAT1"], **grouping)
     assert calls["n"] == first
     assert fetch_calls["n"] == first_fetch + 1
 
@@ -193,23 +221,20 @@ def test_reuse_returns_persisted_without_recompute(
 def test_run_statistical_testing_groups_restriction(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
+    grouping = _active_metadata_grouping(ds, "stat_group3")
     result = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group3",
         groups=["g0", "g2"],
         test="mann_whitney",
+        **grouping,
     )
     assert result.method == "mann_whitney"
     assert result.n_groups == 2
     row = result.tables["MALAT1"].iloc[0]
     assert row["group_1"] == "g0"
     assert row["group_2"] == "g2"
-    loaded = ds.get_statistical_tests(
-        group_key="stat_group3",
-        method="mann_whitney",
-        keys=["MALAT1"],
-        groups=["g0", "g2"],
-    )
+    assert result.artifact is not None
+    loaded = ds.get_statistical_tests(result.artifact)
     assert loaded.tables["MALAT1"].to_dict("records") == result.tables[
         "MALAT1"
     ].to_dict("records")
@@ -222,21 +247,17 @@ def test_statistical_testing_accepts_numpy_group_and_comparison_sequences(
     _insert_group_columns(ds)
     groups = np.array(["g2", "g0"], dtype=object)
     comparisons = np.array([["g2", "g0"]], dtype=object)
+    grouping = _active_metadata_grouping(ds, "stat_group3")
 
     result = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group3",
         groups=groups,
         comparisons=comparisons,
         test="mann_whitney",
+        **grouping,
     )
-    loaded = ds.get_statistical_tests(
-        group_key="stat_group3",
-        method="mann_whitney",
-        keys=["MALAT1"],
-        groups=groups,
-        comparisons=comparisons,
-    )
+    assert result.artifact is not None
+    loaded = ds.get_statistical_tests(result.artifact)
 
     assert result.tables["MALAT1"].loc[0, "group_1"] == "g2"
     assert loaded.artifact == result.artifact
@@ -245,17 +266,18 @@ def test_statistical_testing_accepts_numpy_group_and_comparison_sequences(
 def test_groups_control_contrast_direction(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
+    grouping = _active_metadata_grouping(ds, "stat_group3")
     forward = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group3",
         groups=["g2", "g0"],
         test="mann_whitney",
+        **grouping,
     )
     backward = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group3",
         groups=["g0", "g2"],
         test="mann_whitney",
+        **grouping,
     )
     assert forward.tables["MALAT1"]["group_1"].iloc[0] == "g2"
     assert backward.tables["MALAT1"]["group_1"].iloc[0] == "g0"
@@ -263,17 +285,23 @@ def test_groups_control_contrast_direction(datastore_ephemeral):
         forward.tables["MALAT1"]["mean_difference"].iloc[0],
         -backward.tables["MALAT1"]["mean_difference"].iloc[0],
     )
+    assert forward.artifact is not None
+    assert backward.artifact is not None
+    assert forward.artifact != backward.artifact
+    assert ds.get_statistical_tests(forward.artifact).artifact == forward.artifact
+    assert ds.get_statistical_tests(backward.artifact).artifact == backward.artifact
 
 
 def test_run_statistical_testing_kruskal_dunn(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
+    grouping = _active_metadata_grouping(ds, "stat_group3")
     result = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group3",
         test="kruskal_wallis",
         posthoc="dunn",
         comparisons=[("g0", "g2")],
+        **grouping,
     )
     assert result.method == "kruskal_wallis"
     assert result.posthoc == "dunn"
@@ -286,13 +314,8 @@ def test_run_statistical_testing_kruskal_dunn(datastore_ephemeral):
     assert list(posthoc["group_2"]) == ["g2"]
     assert {"z", "p_value", "p_value_adjusted"} <= set(posthoc.columns)
     assert posthoc["p_value"].between(0, 1).all()
-    loaded = ds.get_statistical_tests(
-        group_key="stat_group3",
-        method="kruskal_wallis",
-        posthoc="dunn",
-        keys=["MALAT1"],
-        comparisons=[("g0", "g2")],
-    )
+    assert result.artifact is not None
+    loaded = ds.get_statistical_tests(result.artifact)
     assert loaded.tables["MALAT1"].to_dict("records") == omnibus.to_dict("records")
     assert loaded.posthoc_tables["MALAT1"].to_dict("records") == posthoc.to_dict(
         "records"
@@ -302,14 +325,15 @@ def test_run_statistical_testing_kruskal_dunn(datastore_ephemeral):
 def test_run_statistical_testing_wilcoxon_paired(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
+    grouping = _active_metadata_grouping(ds, "stat_group2")
     result = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group2",
         test="wilcoxon",
         study_design=StudyDesign(
             sample_by="stat_sample",
             subject_by="stat_subject",
         ),
+        **grouping,
     )
     assert result.method == "wilcoxon"
     assert result.sample_by == "stat_sample"
@@ -319,13 +343,8 @@ def test_run_statistical_testing_wilcoxon_paired(datastore_ephemeral):
         table.columns
     )
     assert table["n_pairs"].iloc[0] >= 2
-    loaded = ds.get_statistical_tests(
-        group_key="stat_group2",
-        method="wilcoxon",
-        keys=["MALAT1"],
-        sample_by="stat_sample",
-        pair_by="stat_subject",
-    )
+    assert result.artifact is not None
+    loaded = ds.get_statistical_tests(result.artifact)
     assert loaded.tables["MALAT1"].to_dict("records") == table.to_dict("records")
     assert loaded.sample_fingerprint == result.sample_fingerprint
     assert loaded.pair_fingerprint == result.pair_fingerprint
@@ -340,64 +359,58 @@ def test_run_statistical_testing_rejects_missing_pair_in_selection(
     subjects[0] = ""
     ds.cells.insert("stat_subject_missing", subjects, overwrite=True)
 
+    grouping = _active_metadata_grouping(ds, "stat_group2")
     with pytest.raises(ValueError, match="valid pair value for every cell"):
         ds.run_statistical_testing(
             ["MALAT1"],
-            group_by="stat_group2",
             test="wilcoxon",
             sample_by="stat_sample",
             pair_by="stat_subject_missing",
+            **grouping,
         )
 
 
 def test_run_statistical_testing_cell_field_key(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
+    grouping = _active_metadata_grouping(ds, "stat_group2")
     result = ds.run_statistical_testing(
         "RNA_nCounts",
-        group_by="stat_group2",
+        **grouping,
     )
     assert result.method == "mann_whitney"
     assert "RNA_nCounts" in result.tables
     assert result.tables["RNA_nCounts"]["p_value"].notna().all()
     assert result.artifact is not None
     assert result.artifact.scope == "datastore"
+    assert result.grouping is None
+    assert result.group_field == CellField("stat_group2")
+    assert result.cell_selection == grouping["cell_selection"]
     assert result.source_assays == (None,)
     assert result.normalization == {}
-    assert "statistical_tests" in ds.zw
-    loaded = ds.get_statistical_tests(
-        group_key="stat_group2",
-        method="mann_whitney",
-        keys="RNA_nCounts",
-    )
+    loaded = ds.get_statistical_tests(result.artifact)
     assert loaded.tables["RNA_nCounts"].to_dict("records") == result.tables[
         "RNA_nCounts"
     ].to_dict("records")
 
 
-def test_statistical_key_labels_define_distinct_slots(datastore_ephemeral):
+def test_statistical_key_labels_define_distinct_artifacts(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
     first_key = CellField("RNA_nCounts", label="first")
     second_key = CellField("RNA_nCounts", label="second")
+    grouping = _active_metadata_grouping(ds, "stat_group2")
 
-    first = ds.run_statistical_testing(first_key, group_by="stat_group2")
-    second = ds.run_statistical_testing(second_key, group_by="stat_group2")
-    loaded_first = ds.get_statistical_tests(
-        group_key="stat_group2",
-        method="mann_whitney",
-        keys=first_key,
-    )
-    loaded_second = ds.get_statistical_tests(
-        group_key="stat_group2",
-        method="mann_whitney",
-        keys=second_key,
-    )
+    first = ds.run_statistical_testing(first_key, **grouping)
+    second = ds.run_statistical_testing(second_key, **grouping)
+    assert first.artifact is not None
+    assert second.artifact is not None
+    loaded_first = ds.get_statistical_tests(first.artifact)
+    loaded_second = ds.get_statistical_tests(second.artifact)
 
     assert first.artifact != second.artifact
     assert set(first.tables) == set(loaded_first.tables) == {"first"}
     assert set(second.tables) == set(loaded_second.tables) == {"second"}
-    assert len(ds.zw["statistical_tests"].attrs["artifacts"]) == 2
 
 
 def test_statistical_tested_metadata_rejects_effective_missing_mask(
@@ -420,10 +433,11 @@ def test_statistical_tested_metadata_rejects_effective_missing_mask(
     )
     cell_data["stat_tested_masked"].attrs["missing_mask"] = missing_name
 
+    grouping = _active_metadata_grouping(ds, "stat_group2")
     with pytest.raises(ValueError, match="effective cell selection"):
         ds.run_statistical_testing(
             CellField("stat_tested_masked"),
-            group_by="stat_group2",
+            **grouping,
         )
 
     subset = np.ones(len(active), dtype=bool)
@@ -431,8 +445,8 @@ def test_statistical_tested_metadata_rejects_effective_missing_mask(
     ds.cells.insert("stat_excludes_tested_missing", subset, overwrite=True)
     result = ds.run_statistical_testing(
         CellField("stat_tested_masked"),
-        group_by="stat_group2",
         subset_by="stat_excludes_tested_missing",
+        **grouping,
     )
     assert result.n_cells == len(active) - 1
 
@@ -440,29 +454,24 @@ def test_statistical_tested_metadata_rejects_effective_missing_mask(
 def test_summary_scope_is_persisted(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
+    grouping = _active_metadata_grouping(ds, "stat_group2")
     cell_result = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group2",
+        **grouping,
     )
     assert cell_result.summary_scope == "cell"
     sample_result = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group2",
         sample_by="stat_sample",
+        **grouping,
     )
     assert sample_result.summary_scope == "sample"
-    loaded_cell = ds.get_statistical_tests(
-        group_key="stat_group2",
-        method="mann_whitney",
-        keys=["MALAT1"],
-    )
+    assert cell_result.artifact is not None
+    assert sample_result.artifact is not None
+    assert sample_result.artifact != cell_result.artifact
+    loaded_cell = ds.get_statistical_tests(cell_result.artifact)
     assert loaded_cell.summary_scope == "cell"
-    loaded_sample = ds.get_statistical_tests(
-        group_key="stat_group2",
-        method="mann_whitney",
-        keys=["MALAT1"],
-        sample_by="stat_sample",
-    )
+    loaded_sample = ds.get_statistical_tests(sample_result.artifact)
     assert loaded_sample.summary_scope == "sample"
 
 
@@ -471,8 +480,8 @@ def test_run_statistical_testing_normalization_option(datastore_ephemeral):
     _insert_group_columns(ds)
     result = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group2",
         normalization=NormalizationSpec(source="assay", transform="log1p"),
+        **_active_metadata_grouping(ds, "stat_group2"),
     )
     assert result.tables["MALAT1"]["p_value"].notna().all()
     assert result.tables["MALAT1"]["mean_1"].iloc[0] >= 0
@@ -481,37 +490,38 @@ def test_run_statistical_testing_normalization_option(datastore_ephemeral):
 def test_run_statistical_testing_skip_save(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
+    grouping = _active_metadata_grouping(ds, "stat_group2")
     result = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group2",
         skip_save=True,
+        **grouping,
     )
     assert result.method == "mann_whitney"
     assert result.artifact is None
-    assert result.cell_selection is None
+    assert result.grouping is None
+    assert result.group_field == CellField("stat_group2")
+    assert result.cell_selection == grouping["cell_selection"]
     assert result.normalization_method is not None
-    assert "statistical_tests" not in ds.zw["RNA"]
 
 
-def test_variant_slots_are_distinct_and_retrievable(datastore_ephemeral):
+def test_result_variants_have_distinct_artifacts_and_exact_retrieval(
+    datastore_ephemeral,
+):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
-    ds.run_statistical_testing(["MALAT1"], group_by="stat_group2")
-    ds.run_statistical_testing(["MALAT1", "B2M"], group_by="stat_group2")
-    index = ds.zw["RNA"]["statistical_tests"].attrs["artifacts"]
-    assert len(index) == 2
-    single = ds.get_statistical_tests(
-        group_key="stat_group2",
-        method="mann_whitney",
-        keys=["MALAT1"],
-    )
-    double = ds.get_statistical_tests(
-        group_key="stat_group2",
-        method="mann_whitney",
-        keys=["MALAT1", "B2M"],
-    )
-    assert set(single.tables) == {"MALAT1"}
-    assert set(double.tables) == {"MALAT1", "B2M"}
+    grouping = _active_metadata_grouping(ds, "stat_group2")
+    single = ds.run_statistical_testing(["MALAT1"], **grouping)
+    double = ds.run_statistical_testing(["MALAT1", "B2M"], **grouping)
+    assert single.artifact is not None
+    assert double.artifact is not None
+    assert single.artifact != double.artifact
+
+    loaded_single = ds.get_statistical_tests(single.artifact)
+    loaded_double = ds.get_statistical_tests(double.artifact)
+    assert loaded_single.artifact == single.artifact
+    assert loaded_double.artifact == double.artifact
+    assert set(loaded_single.tables) == {"MALAT1"}
+    assert set(loaded_double.tables) == {"MALAT1", "B2M"}
 
 
 def test_subset_by_change_recomputes(datastore_ephemeral):
@@ -521,53 +531,49 @@ def test_subset_by_change_recomputes(datastore_ephemeral):
     subset = np.ones(n, dtype=bool)
     subset[::3] = False
     ds.cells.insert("stat_subset", subset, overwrite=True)
+    grouping = _active_metadata_grouping(ds, "stat_group2")
     first_result = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group2",
         subset_by="stat_subset",
+        **grouping,
     )
-    stats_group = ds.zw["RNA"]["statistical_tests"]
-    slot = next(iter(stats_group.attrs["artifacts"]))
-    first_id = stats_group.attrs["artifacts"][slot]["artifact_id"]
     ds.cells.insert("stat_subset", ~subset, overwrite=True)
     second_result = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group2",
         subset_by="stat_subset",
+        **grouping,
     )
-    second_id = ds.zw["RNA"]["statistical_tests"].attrs["artifacts"][slot][
-        "artifact_id"
-    ]
-    assert first_id != second_id
     assert first_result.artifact is not None
     assert second_result.artifact is not None
-    pinned_first = ds.get_statistical_tests(artifact=first_result.artifact)
-    assert pinned_first.artifact == first_result.artifact
+    assert first_result.artifact != second_result.artifact
+    loaded_first = ds.get_statistical_tests(first_result.artifact)
+    loaded_second = ds.get_statistical_tests(second_result.artifact)
+    assert loaded_first.artifact == first_result.artifact
+    assert loaded_second.artifact == second_result.artifact
     assert (
-        pinned_first.cell_selection_fingerprint
+        loaded_first.cell_selection_fingerprint
         == first_result.cell_selection_fingerprint
         != second_result.cell_selection_fingerprint
     )
 
 
-def test_cell_key_none_uses_all_cells(datastore_ephemeral):
+def test_cell_field_without_selection_uses_all_physical_rows(datastore_ephemeral):
     ds = datastore_ephemeral
-    _insert_group_columns(ds)
     total = ds.cells.N
+    all_groups = np.array([f"g{i % 2}" for i in range(total)], dtype=object)
+    ds.cells.insert("stat_all_groups", all_groups, overwrite=True)
     result = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group2",
-        cell_key=None,
+        CellField("stat_all_groups"),
     )
-    assert result.cell_key is None
+    assert result.grouping is None
+    assert result.group_field == CellField("stat_all_groups")
+    assert result.cell_selection is None
     assert result.n_cells == total
-    loaded = ds.get_statistical_tests(
-        cell_key=None,
-        group_key="stat_group2",
-        method="mann_whitney",
-        keys=["MALAT1"],
-    )
-    assert loaded.cell_key is None
+    assert result.artifact is not None
+    loaded = ds.get_statistical_tests(result.artifact)
+    assert loaded.cell_selection is None
+    assert loaded.group_field == CellField("stat_all_groups")
     assert loaded.n_cells == total
 
 
@@ -578,18 +584,18 @@ def test_int_and_bool_group_labels_roundtrip(datastore_ephemeral):
     bool_groups = np.array([i % 2 == 0 for i in range(n)], dtype=bool)
     ds.cells.insert("stat_int_group", int_groups, overwrite=True)
     ds.cells.insert("stat_bool_group", bool_groups, overwrite=True)
-    ds.run_statistical_testing(["MALAT1"], group_by="stat_int_group")
-    ds.run_statistical_testing(["MALAT1"], group_by="stat_bool_group")
-    loaded_int = ds.get_statistical_tests(
-        group_key="stat_int_group",
-        method="mann_whitney",
-        keys=["MALAT1"],
+    int_result = ds.run_statistical_testing(
+        ["MALAT1"],
+        **_active_metadata_grouping(ds, "stat_int_group"),
     )
-    loaded_bool = ds.get_statistical_tests(
-        group_key="stat_bool_group",
-        method="mann_whitney",
-        keys=["MALAT1"],
+    bool_result = ds.run_statistical_testing(
+        ["MALAT1"],
+        **_active_metadata_grouping(ds, "stat_bool_group"),
     )
+    assert int_result.artifact is not None
+    assert bool_result.artifact is not None
+    loaded_int = ds.get_statistical_tests(int_result.artifact)
+    loaded_bool = ds.get_statistical_tests(bool_result.artifact)
     int_group = loaded_int.tables["MALAT1"]["group_1"]
     bool_group = loaded_bool.tables["MALAT1"]["group_1"]
     assert pd.api.types.is_integer_dtype(int_group)
@@ -608,8 +614,8 @@ def test_auto_counts_surviving_groups_after_dropout(datastore_ephemeral):
     ds.cells.insert("stat_samp_drop", samples, overwrite=True)
     result = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_grp_drop",
         sample_by="stat_samp_drop",
+        **_active_metadata_grouping(ds, "stat_grp_drop"),
     )
     assert result.method == "mann_whitney"
     assert result.n_groups == 2
@@ -624,117 +630,119 @@ def test_explicit_test_rejects_filtered_requested_group(datastore_ephemeral):
     samples = np.where(groups3 == "g2", "", samples).astype(object)
     ds.cells.insert("stat_grp_drop", groups3, overwrite=True)
     ds.cells.insert("stat_samp_drop", samples, overwrite=True)
+    grouping = _active_metadata_grouping(ds, "stat_grp_drop")
     with pytest.warns(UserWarning, match="removed because all of its cells"):
         with pytest.raises(ValueError, match="must all retain at least one valid cell"):
             ds.run_statistical_testing(
                 ["MALAT1"],
-                group_by="stat_grp_drop",
                 groups=["g0", "g1", "g2"],
                 test="kruskal_wallis",
                 sample_by="stat_samp_drop",
+                **grouping,
             )
 
 
 def test_run_statistical_testing_errors(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
-    with pytest.raises(ValueError, match="group_by"):
-        ds.run_statistical_testing(["MALAT1"], group_by=None)
+    group2 = _active_metadata_grouping(ds, "stat_group2")
+    group3 = _active_metadata_grouping(ds, "stat_group3")
+    with pytest.raises(TypeError, match="grouping must be"):
+        ds.run_statistical_testing(["MALAT1"], None)
     with pytest.raises(NotImplementedError, match="non-parametric"):
-        ds.run_statistical_testing(["MALAT1"], group_by="stat_group2", test="anova")
+        ds.run_statistical_testing(["MALAT1"], test="anova", **group2)
     with pytest.raises(ValueError, match="requires.*sample"):
         ds.run_statistical_testing(
             ["MALAT1"],
-            group_by="stat_group2",
             test="wilcoxon",
+            **group2,
         )
     with pytest.raises(ValueError, match="at least three groups"):
         ds.run_statistical_testing(
             ["MALAT1"],
-            group_by="stat_group2",
             test="kruskal_wallis",
+            **group2,
         )
     with pytest.raises(ValueError, match="requires test"):
         ds.run_statistical_testing(
             ["MALAT1"],
-            group_by="stat_group2",
             test="mann_whitney",
             posthoc="dunn",
+            **group2,
         )
     with pytest.raises(ValueError, match="adjustment must be"):
         ds.run_statistical_testing(
             ["MALAT1"],
-            group_by="stat_group2",
             adjustment="bogus",
+            **group2,
         )
     with pytest.raises(ValueError, match="alternative is only supported"):
         ds.run_statistical_testing(
             ["MALAT1"],
-            group_by="stat_group2",
             alternative="greater",
+            **group2,
         )
     with pytest.raises(ValueError, match="pair_by is only supported"):
         ds.run_statistical_testing(
             ["MALAT1"],
-            group_by="stat_group2",
             pair_by="stat_subject",
             sample_by="stat_sample",
             test="mann_whitney",
+            **group2,
         )
     with pytest.raises(ValueError, match="sample_stat requires sample_by"):
         ds.run_statistical_testing(
             ["MALAT1"],
-            group_by="stat_group2",
             sample_stat="median",
+            **group2,
         )
     with pytest.raises(ValueError, match="only used.*fraction"):
         ds.run_statistical_testing(
             ["MALAT1"],
-            group_by="stat_group2",
             sample_by="stat_sample",
             expression_cutoff=1.0,
+            **group2,
         )
     with pytest.raises(ValueError, match="comparisons requires a pairwise test"):
         ds.run_statistical_testing(
             ["MALAT1"],
-            group_by="stat_group3",
             test="kruskal_wallis",
             comparisons=[("g0", "g1")],
+            **group3,
         )
     with pytest.raises(KeyError, match="not found"):
         ds.run_statistical_testing(
             ["NOT_A_REAL_GENE_123"],
-            group_by="stat_group2",
+            **group2,
         )
 
 
 def test_get_statistical_tests_errors(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
-    with pytest.raises(ValueError, match="group_key"):
-        ds.get_statistical_tests(group_key=None, keys=["MALAT1"])
-    with pytest.raises(ValueError, match="test method"):
-        ds.get_statistical_tests(
-            group_key="stat_group2",
-            method=None,
-            keys=["MALAT1"],
-        )
-    with pytest.raises(KeyError, match="Couldn't find"):
-        ds.get_statistical_tests(
-            group_key="stat_group2",
-            method="wilcoxon",
-            keys=["MALAT1"],
-        )
+    with pytest.raises(TypeError, match="artifact must be an ArtifactRef"):
+        ds.get_statistical_tests("not-an-artifact")
+    with pytest.raises(ValueError, match="must reference statistical_tests"):
+        ds.get_statistical_tests(ds.snapshot_cell_selection("I"))
+    missing = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="statistical_tests",
+        artifact_id="0" * 64,
+    )
+    with pytest.raises(KeyError, match="does not exist"):
+        ds.get_statistical_tests(missing)
 
 
 def test_run_statistical_testing_welch_cell_level(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
+    grouping = _active_metadata_grouping(ds, "stat_group2")
     result = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group2",
         test="welch",
         alternative="less",
+        **grouping,
     )
     assert result.method == "welch"
     assert result.alternative == "less"
@@ -743,12 +751,8 @@ def test_run_statistical_testing_welch_cell_level(datastore_ephemeral):
     assert tuple(table.columns) == (*WELCH_COLUMNS, "p_value_adjusted")
     assert table["p_value"].between(0, 1).all()
     assert bool((table["df"] > 0).all())
-    loaded = ds.get_statistical_tests(
-        group_key="stat_group2",
-        method="welch",
-        keys=["MALAT1"],
-        alternative="less",
-    )
+    assert result.artifact is not None
+    loaded = ds.get_statistical_tests(result.artifact)
     assert loaded.alternative == "less"
     assert loaded.tables["MALAT1"].to_dict("records") == table.to_dict("records")
 
@@ -756,11 +760,12 @@ def test_run_statistical_testing_welch_cell_level(datastore_ephemeral):
 def test_welch_groups_restriction_and_contrast_direction(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
+    grouping = _active_metadata_grouping(ds, "stat_group3")
     forward = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group3",
         groups=["g2", "g0"],
         test="welch",
+        **grouping,
     )
     assert forward.n_groups == 2
     row = forward.tables["MALAT1"].iloc[0]
@@ -770,18 +775,19 @@ def test_welch_groups_restriction_and_contrast_direction(datastore_ephemeral):
     with pytest.raises(ValueError, match="exactly two groups"):
         ds.run_statistical_testing(
             ["MALAT1"],
-            group_by="stat_group3",
             test="welch",
+            **grouping,
         )
 
 
 def test_one_way_anova_omnibus_roundtrip(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
+    grouping = _active_metadata_grouping(ds, "stat_group3")
     result = ds.run_statistical_testing(
         ["MALAT1", "B2M"],
-        group_by="stat_group3",
         test="one_way_anova",
+        **grouping,
     )
     assert result.method == "one_way_anova"
     assert result.n_groups == 3
@@ -790,11 +796,8 @@ def test_one_way_anova_omnibus_roundtrip(datastore_ephemeral):
         assert set(ANOVA_COLUMNS) <= set(table.columns)
         assert table.loc[0, "df_between"] == 2
         assert table["p_value"].between(0, 1).all()
-    loaded = ds.get_statistical_tests(
-        group_key="stat_group3",
-        method="one_way_anova",
-        keys=["MALAT1", "B2M"],
-    )
+    assert result.artifact is not None
+    loaded = ds.get_statistical_tests(result.artifact)
     assert loaded.equal_var is None
     for key in result.tables:
         assert loaded.tables[key].to_dict("records") == result.tables[key].to_dict(
@@ -802,46 +805,44 @@ def test_one_way_anova_omnibus_roundtrip(datastore_ephemeral):
         )
 
 
-def test_welch_variant_slots_distinct_by_alternative(datastore_ephemeral):
+def test_welch_alternatives_have_distinct_exact_artifacts(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
-    ds.run_statistical_testing(
+    grouping = _active_metadata_grouping(ds, "stat_group2")
+    less = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group2",
         test="welch",
         alternative="less",
+        **grouping,
     )
-    artifacts_after_less = dict(ds.zw["RNA"]["statistical_tests"].attrs["artifacts"])
-    ds.run_statistical_testing(
+    greater = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group2",
         test="welch",
         alternative="greater",
+        **grouping,
     )
-    artifacts_after_greater = dict(ds.zw["RNA"]["statistical_tests"].attrs["artifacts"])
-    new_slots = set(artifacts_after_greater) - set(artifacts_after_less)
-    assert len(new_slots) == 1
-    distinct_ids = {
-        artifacts_after_less[key]["artifact_id"] for key in artifacts_after_less
-    } | {artifacts_after_greater[key]["artifact_id"] for key in new_slots}
-    assert len(distinct_ids) >= 2
+    assert less.artifact is not None
+    assert greater.artifact is not None
+    assert less.artifact != greater.artifact
+    loaded_less = ds.get_statistical_tests(less.artifact)
+    loaded_greater = ds.get_statistical_tests(greater.artifact)
+    assert loaded_less.alternative == "less"
+    assert loaded_greater.alternative == "greater"
+    assert loaded_less.artifact == less.artifact
+    assert loaded_greater.artifact == greater.artifact
 
 
 def test_welch_alternative_roundtrip_dtypes(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
-    ds.run_statistical_testing(
+    result = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group2",
         test="welch",
         alternative="greater",
+        **_active_metadata_grouping(ds, "stat_group2"),
     )
-    loaded = ds.get_statistical_tests(
-        group_key="stat_group2",
-        method="welch",
-        keys=["MALAT1"],
-        alternative="greater",
-    )
+    assert result.artifact is not None
+    loaded = ds.get_statistical_tests(result.artifact)
     table = loaded.tables["MALAT1"]
     assert table["group_1"].dtype.kind in {"O", "U"}
     assert table["group_2"].dtype.kind in {"O", "U"}
@@ -853,18 +854,20 @@ def test_welch_alternative_roundtrip_dtypes(datastore_ephemeral):
 def test_plotting_distribution_annotates_welch_brackets(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
-    baseline = ds.plots.distribution(["MALAT1"], group_by="stat_group2", show=False)
+    grouping = _active_metadata_grouping(ds, "stat_group2")
+    baseline = ds.plots.distribution(["MALAT1"], show=False, **grouping)
     baseline_lines = len(baseline.axes["MALAT1"].lines)
     result = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group2",
         test="welch",
+        **grouping,
     )
+    assert result.artifact is not None
     annotated = ds.plots.distribution(
         ["MALAT1"],
-        group_by="stat_group2",
-        stats_results=result,
+        stats_results=result.artifact,
         show=False,
+        **grouping,
     )
     texts = [text.get_text() for text in annotated.axes["MALAT1"].texts]
     assert any(text.startswith("p=") for text in texts)
@@ -873,7 +876,7 @@ def test_plotting_distribution_annotates_welch_brackets(datastore_ephemeral):
     assert annotated.provenance.extras.get("stats_annotated") is True
 
 
-def test_statistical_index_distinguishes_selection_and_group_aliases(
+def test_explicit_identity_uses_group_fields_and_selection_snapshots(
     datastore_ephemeral,
 ):
     ds = datastore_ephemeral
@@ -883,35 +886,50 @@ def test_statistical_index_distinguishes_selection_and_group_aliases(
     ds.cells.insert("all_cells", base_selection, overwrite=True)
     ds.cells.insert("stat_selection_alias", base_selection, overwrite=True)
 
-    group_a = ds.run_statistical_testing(["MALAT1"], group_by="stat_group2")
-    group_b = ds.run_statistical_testing(["MALAT1"], group_by="stat_group_alias")
+    active = ds.snapshot_cell_selection("I")
+    alias_selection_a = ds.snapshot_cell_selection("all_cells")
+    alias_selection_b = ds.snapshot_cell_selection("stat_selection_alias")
+    assert active == alias_selection_a == alias_selection_b
+
+    group_a = ds.run_statistical_testing(
+        ["MALAT1"],
+        CellField("stat_group2"),
+        cell_selection=active,
+    )
+    group_b = ds.run_statistical_testing(
+        ["MALAT1"],
+        CellField("stat_group_alias"),
+        cell_selection=active,
+    )
     select_a = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group2",
-        cell_key="all_cells",
+        CellField("stat_group2"),
+        cell_selection=alias_selection_a,
     )
     select_b = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group2",
-        cell_key="stat_selection_alias",
+        CellField("stat_group2"),
+        cell_selection=alias_selection_b,
     )
     all_cells = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_group2",
-        cell_key=None,
+        CellField("stat_group2"),
     )
 
-    refs = {
-        result.artifact for result in (group_a, group_b, select_a, select_b, all_cells)
-    }
-    assert None not in refs
-    assert len(refs) == 5
-    index = ds.zw["RNA"]["statistical_tests"].attrs["artifacts"]
-    assert len(index) == 5
-    assert all(len(slot) == 64 and "__" not in slot for slot in index)
-    assert group_b.group_key == "stat_group_alias"
-    assert select_a.cell_key == "all_cells"
-    assert all_cells.cell_key is None
+    assert all(
+        result.artifact is not None
+        for result in (group_a, group_b, select_a, select_b, all_cells)
+    )
+    assert group_a.artifact != group_b.artifact
+    assert group_a.artifact == select_a.artifact == select_b.artifact
+    assert all_cells.artifact != group_a.artifact
+    assert group_b.grouping is None
+    assert group_b.group_field == CellField("stat_group_alias")
+    assert select_a.cell_selection == alias_selection_a
+    assert all_cells.cell_selection is None
+    for result in (group_a, group_b, select_a, all_cells):
+        assert result.artifact is not None
+        assert ds.get_statistical_tests(result.artifact).artifact == result.artifact
 
 
 def test_statistical_source_assay_scope_and_mixed_assay_policy(
@@ -921,22 +939,18 @@ def test_statistical_source_assay_scope_and_mixed_assay_policy(
     _insert_group_columns(ds)
     assay2 = ds.assay2.name
     ref = FeatureRef(value=0, assay=assay2, by="index")
-    result = ds.run_statistical_testing(ref, group_by="stat_group2")
+    grouping = _active_metadata_grouping(ds, "stat_group2")
+    result = ds.run_statistical_testing(ref, **grouping)
     assert result.artifact is not None
     assert result.artifact.scope == "assay"
     assert result.artifact.assay == assay2
     assert result.source_assays == (assay2,)
-    assert "statistical_tests" in ds.zw[assay2]
-    loaded = ds.get_statistical_tests(
-        group_key="stat_group2",
-        method="mann_whitney",
-        keys=ref,
-    )
+    loaded = ds.get_statistical_tests(result.artifact)
     assert loaded.artifact == result.artifact
     with pytest.raises(ValueError, match="multiple assays"):
         ds.run_statistical_testing(
             ["MALAT1", ref],
-            group_by="stat_group2",
+            **grouping,
         )
 
 
@@ -949,9 +963,10 @@ def test_statistical_effective_selection_identity_and_n_cells(
     groups[::7] = None
     groups[1::11] = ""
     ds.cells.insert("stat_groups_missing", groups, overwrite=True)
+    grouping = _active_metadata_grouping(ds, "stat_groups_missing")
     result = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_groups_missing",
+        **grouping,
     )
     expected = int(sum(value not in (None, "") for value in groups))
     assert result.n_cells == expected
@@ -979,15 +994,16 @@ def test_statistical_selection_honors_metadata_missing_mask(datastore_ephemeral)
     )
     cell_data["stat_groups_masked"].attrs["missing_mask"] = missing_name
 
+    grouping = _active_metadata_grouping(ds, "stat_groups_masked")
     result = ds.run_statistical_testing(
         ["MALAT1"],
-        group_by="stat_groups_masked",
+        **grouping,
     )
     figure = ds.plots.distribution(
         ["MALAT1"],
-        group_by="stat_groups_masked",
         stats_results=result,
         show=False,
+        **grouping,
     )
 
     assert result.n_cells == int((~missing[active]).sum())
@@ -1006,14 +1022,11 @@ def test_statistical_numeric_dtypes_and_infinite_statistic_roundtrip(
     ds.cells.insert("stat_constant_value", values, overwrite=True)
     result = ds.run_statistical_testing(
         "stat_constant_value",
-        group_by="stat_constant_group",
         test="welch",
+        **_active_metadata_grouping(ds, "stat_constant_group"),
     )
-    loaded = ds.get_statistical_tests(
-        group_key="stat_constant_group",
-        method="welch",
-        keys="stat_constant_value",
-    )
+    assert result.artifact is not None
+    loaded = ds.get_statistical_tests(result.artifact)
     original = result.tables["stat_constant_value"]
     restored = loaded.tables["stat_constant_value"]
     assert np.isinf(restored["t_statistic"]).all()
@@ -1024,18 +1037,39 @@ def test_statistical_numeric_dtypes_and_infinite_statistic_roundtrip(
 def test_statistical_public_annotations_resolve_at_runtime():
     assert get_type_hints(DataStore.run_statistical_testing)
     assert get_type_hints(DataStore.get_statistical_tests)
+    producer = signature(DataStore.run_statistical_testing)
+    assert list(producer.parameters)[:4] == [
+        "self",
+        "keys",
+        "grouping",
+        "cell_selection",
+    ]
+    assert producer.parameters["grouping"].default is Parameter.empty
+    assert producer.parameters["cell_selection"].kind is Parameter.KEYWORD_ONLY
+    assert "group_by" not in producer.parameters
+    assert "cell_key" not in producer.parameters
+    loader = signature(DataStore.get_statistical_tests)
+    assert list(loader.parameters) == ["self", "artifact"]
+    assert loader.parameters["artifact"].default is Parameter.empty
 
 
-def test_statistical_slot_key_is_structured_and_unambiguous():
-    from scarf.datastore._operations.features import _statistical_slot_key
+def test_artifact_grouping_identity_and_exact_retrieval(datastore_ephemeral):
+    ds = datastore_ephemeral
+    n = len(ds.cells.active_index("I"))
+    labels = np.array([f"g{i % 2}" for i in range(n)], dtype=object)
+    grouping = _test_grouping_artifact(ds, labels)
+    result = ds.run_statistical_testing(["MALAT1"], grouping)
 
-    variants = {
-        _statistical_slot_key(None, "group__name", "mann_whitney", None, "digest"),
-        _statistical_slot_key(
-            "all_cells", "group__name", "mann_whitney", None, "digest"
-        ),
-        _statistical_slot_key(None, "group", "name__mann_whitney", None, "digest"),
-        _statistical_slot_key(None, "group__name", "mann_whitney", "dunn", "digest"),
-    }
-    assert len(variants) == 4
-    assert all(len(slot) == 64 and "__" not in slot for slot in variants)
+    assert result.artifact is not None
+    assert result.grouping == grouping
+    assert result.group_field is None
+    assert result.cell_selection == ds.snapshot_cell_selection("I")
+
+    loaded = ds.get_statistical_tests(result.artifact)
+    assert loaded.artifact == result.artifact
+    assert loaded.grouping == grouping
+    assert loaded.group_field is None
+    assert loaded.cell_selection == result.cell_selection
+    assert loaded.tables["MALAT1"].to_dict("records") == result.tables[
+        "MALAT1"
+    ].to_dict("records")

@@ -4,11 +4,10 @@
 ```{glossary}
 :sorted:
 
-analysis chain
-  Record, kept per assay, of which results a workflow is currently building on.
-  `AssayState` tracks `normalized`, `feature_scaling`, `reduction`, `batch_correction`, `ann_index`, `embedding_initialization`, `neighbors`, `connectivity_map`, and `named_results`, together with the assay and cell key.
-  ANN and neighbors are separate fields.
-  A method called without an explicit input takes its input from this chain, which is what lets `ds.run_umap()` know which graph to lay out.
+artifact lineage
+  Directed record of the exact selections and upstream artifacts that produced a stored result.
+  Granular methods pass returned `ArtifactRef` values explicitly; no result is selected
+  implicitly for an assay.
 
 artifact
   A persisted analysis result such as a normalization, PCA, neighbourhood graph, or marker table.
@@ -21,13 +20,13 @@ ArtifactRef
 
 feature selection
   Immutable Boolean artifact aligned to the complete feature order of one assay.
-  Producers such as `mark_hvgs` return an `ArtifactRef` and may publish the same values under a plain metadata label such as `hvgs`.
-  Direct feature consumers require `features=` and accept either the exact label or the returned reference.
+  Producers such as `select_hvgs` return an `ArtifactRef` and leave feature metadata unchanged.
+  Direct feature consumers require the exact ref through `features=`.
 
 all features
-  Assay-wide all-true feature-selection artifact, published internally as `all_features`.
-  Use `ds.resolve_features(assay, "all_features")` when an analysis should include the complete feature universe.
-  It is distinct from the physical feature metadata column `I`, which is also all true in newly created stores.
+  Assay-wide all-true feature-selection artifact returned by `DataStore.select_all_features` and
+  used by complete-universe operations.
+  It is distinct from the physical feature metadata column `I`.
 
 provenance
   Record stored with every artifact naming the operation that produced it, the scientific parameters it used, and the artifacts it consumed.
@@ -37,10 +36,10 @@ reuse
   Returning an existing artifact instead of recomputing it, when the requested operation, parameters, and inputs match its provenance.
   Changing a parameter produces a new artifact, and the steps that depended on the previous one are recomputed rather than reused.
 
-update_state
-  Keyword on graph-construction methods deciding whether their result joins the assay's analysis chain.
-  Leave it at `True` for a linear workflow.
-  Pass `False` to try a parameter without changing what later calls default to.
+PipelineRun
+  Durable handle returned by `ds.pipeline.run()` and reopened through `ds.pipeline.open(...)`.
+  It maps stable output names to artifacts and exposes frozen cell and feature views plus reports.
+  Plotting, marker loading, and export remain `DataStore` operations.
 
 count matrix
   Sparse matrix of primary counts stored cell-major (`n_cells` × `n_features`), for features such as genes, peaks, or ADTs.
@@ -48,16 +47,17 @@ count matrix
   RNA assays also store `countsT`, the same values in gene-major order, so gene-wise stages can stream without scanning every cell.
 
 highly variable genes
-  Features selected with `mark_hvgs` for neighbourhood-graph construction.
+  Features selected with `select_hvgs` for neighbourhood-graph construction.
 
 neighbourhood graph
   KNN graph of cells built by individual graph-construction methods or `ds.pipeline.run`.
   Embeddings, clustering, mapping, and multimodal integration reuse this graph.
 
 cell key
-  Boolean column in cell metadata selecting which cells participate in a step.
+  Boolean column in cell metadata that can be captured as an analytical input.
   Default is `I`.
-  Filtering marks cells inactive rather than deleting them.
+  Filtering snapshots it into an immutable selection artifact, combines thresholds with that
+  selection, and leaves the column unchanged.
 
 DataStore
   Primary Scarf object that opens a Zarr store and exposes analysis methods.
@@ -69,7 +69,7 @@ Harmony
   Batch correction applied to PCA embeddings with `run_harmony` before ANN construction.
 
 partial PCA
-  PCA trained on a subset of cells via `pca_cell_key`.
+  PCA trained on an immutable cell subset via `pca_cell_selection`.
   A lightweight batch-correction option when one sample is the reference.
 
 LISI
@@ -108,18 +108,20 @@ Paris clustering
 
 Leiden clustering
   Graph community detection via `run_leiden_clustering`.
-  Labels are stored as `{assay}_{label}` for the default cell key `I`.
-  A manual call defaults to label `leiden_cluster` (for example `RNA_leiden_cluster`).
-  The RNA pipeline defaults each Leiden job to `leiden_<resolution>` (for example `RNA_leiden_0.5`) and also runs Paris unless `paris=False`.
-  After clustering, the pipeline copies the chosen partition to `{assay}_clusters` (for example `RNA_clusters`) and uses that column for doublet scoring and marker search unless another partition is named.
-  With more than one partition, the copy is the silhouette winner on PCA coordinates and can be a Leiden or Paris result.
-  Pass `label=` to choose the suffix; when comparing resolutions manually, use distinct labels for each run.
+  A manual call returns a cluster-label artifact without adding metadata columns. The RNA pipeline
+  runs default resolutions `0.5`, `0.75`, `1.0`, and `1.25`, plus Paris unless disabled. Its
+  artifact-backed silhouette stage scores Leiden resolutions in the graph's coordinate space, and
+  `run["clusters"]` is the selected Leiden candidate's exact ref. Paris remains a diagnostic run
+  output. This automatic choice is a reproducible baseline, not biological validation.
 
 SNN integration
-  Shared-nearest-neighbor merge of modality-specific KNN graphs via `integrate_assays(method='snn')`.
+  Shared-nearest-neighbor merge of explicit modality-specific connectivity-map refs via
+  `integrate_assays(sources, method="snn")`.
 
 WNN integration
-  Hao-inspired weighted nearest-neighbor merge for two or more modalities via `integrate_assays(method='wnn')`.
+  Default Hao-inspired weighted nearest-neighbor merge for two or more explicit modality
+  neighbour refs via `integrate_assays(sources)` or
+  `integrate_assays(sources, method="wnn")`.
   Scarf scores the union of all existing, self-free KNN rows with affinity and the distance span from each modality's nearest to its `k`-th neighbour as bandwidth.
   During scoring it L2-normalizes modality coordinate rows; the affinities themselves are not L2-normalized.
   Unlike Seurat defaults, it does not build a wider 200-neighbour candidate pool or use SNN-far bandwidth.
@@ -128,7 +130,8 @@ TopACeDo
   Manifold-preserving cell subsampling using the KNN graph (`run_topacedo_sampler`).
 
 densMAP
-  Density-preserving UMAP variant enabled with `run_umap(use_density_map=True)`.
+  Density-preserving UMAP variant enabled by passing explicit graph and initialization refs to
+  `run_umap(..., use_density_map=True)`.
 
 LSI
   Latent Semantic Indexing.

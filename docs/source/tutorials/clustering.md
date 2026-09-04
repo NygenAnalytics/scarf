@@ -1,5 +1,5 @@
 ---
-description: Compare Leiden resolutions and Paris cuts, validate partitions, and recluster a selected population.
+description: Compare immutable Leiden and Paris clustering artifacts and inspect cluster evidence.
 jupytext:
   text_representation:
     extension: .md
@@ -12,549 +12,226 @@ kernelspec:
   name: python3
 ---
 
-# Choosing and validating clusters
+# Clustering and cluster evidence
 
-Clustering turns a neighbourhood graph into a discrete partition.
-It does not reveal one universally optimal number of cell types.
-A useful partition should be stable enough for the question, preserve known biology, avoid groups driven only by technical covariates, and support interpretable markers.
+Clustering is a model of graph structure, not a cell-type verdict. This page keeps one graph fixed,
+compares several Leiden resolutions with a Paris hierarchy, and reads every result through its
+exact immutable artifact ref.
 
-This guide compares Leiden resolutions and Paris cuts with several diagnostics.
-The downloaded PBMC store is structurally repacked and used only as the matrix and metadata source; a separate mounted store owns every selection, graph, layout, and clustering artifact created below.
-
-## 1. Build the shared graph
+## 1. Open one graph
 
 ```{code-cell} ipython3
 from dataclasses import asdict
 from itertools import combinations
-from pathlib import Path
-from tempfile import TemporaryDirectory
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
 import scarf
-import scarf.plotting as splt
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-repacked_counts = str(Path(analysis_directory.name) / "counts.zarr")
-repack_store(
-    f"{dataset}/data.zarr",
-    repacked_counts,
-    nthreads=2,
-)
-ds = scarf.mount_datastore(
-    repacked_counts,
-    at=str(Path(analysis_directory.name) / "clustering_analysis.zarr"),
-    default_assay="RNA",
-    nthreads=4,
-    min_features_per_cell=10,
-)
-ds.filter_cells(
-    attrs=["RNA_nCounts", "RNA_nFeatures", "RNA_percentMito"],
-    highs=[15000, 4000, 15],
-    lows=[1000, 500, 0],
-    reset_previous=True,
-)
-hvg_ref = ds.mark_hvgs(
-    min_cells=20,
-    top_n=500,
-    show_plot=False,
-)
-ds.run_normalization(features=hvg_ref)
-pca = ds.run_pca(dims=15)
-ds.build_embedding_initialization()
-ds.build_ann_index()
-ds.query_neighbors(k=11)
-ds.build_connectivity_map()
-ds.run_umap(
-    n_epochs=150,
-    spread=5,
-    min_dist=1,
-    parallel=True,
-)
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+clustering_run = ds.pipeline.open(label="docs_default")
+graph = clustering_run["connectivity_map"]
+umap = clustering_run["umap"]
+umap_values = np.asarray(ds.load_artifact(umap)["values"][:])
 ```
 
-Every partition below consumes this same graph.
-That keeps differences in cluster labels separate from differences caused by changing features, PCA, or neighbours.
+The rebuilt store carries one completed pipeline run under the immutable label `docs_default`.
+Its exact graph and UMAP refs are the baseline below. Only the additional clustering choices are
+created on this page, so feature, PCA, graph, and layout effects stay out of the comparison.
 
 ## 2. Sweep Leiden resolution
 
-Higher Leiden resolution usually produces more and smaller groups.
-Keep each candidate under a distinct label.
-
 ```{code-cell} ipython3
-leiden_candidates = {
-    0.3: "leiden_r03",
-    0.5: "leiden_r05",
-    0.8: "leiden_r08",
+leiden_refs = {
+    0.3: ds.run_leiden_clustering(graph, resolution=0.3),
+    0.5: clustering_run["leiden_0.5"],
+    0.8: ds.run_leiden_clustering(graph, resolution=0.8),
 }
-for resolution, label in leiden_candidates.items():
-    ds.run_leiden_clustering(
-        resolution=resolution,
-        label=label,
-    )
-chosen_key = "RNA_leiden_r05"
-```
+leiden_values = {
+    resolution: np.asarray(ds.load_artifact(ref)["values"][:])
+    for resolution, ref in leiden_refs.items()
+}
 
-```{code-cell} ipython3
-cluster_sizes = pd.DataFrame(
+pd.DataFrame(
     {
-        label: pd.Series(
-            ds.cells.fetch(f"RNA_{label}", key="I")
-        ).value_counts()
-        for label in leiden_candidates.values()
+        resolution: pd.Series(values).value_counts()
+        for resolution, values in leiden_values.items()
     }
 ).fillna(0).astype(int)
-cluster_sizes
 ```
 
 ```{code-cell} ipython3
-leiden_comparison = ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by=[f"RNA_{label}" for label in leiden_candidates.values()],
-    n_columns=3,
-    legend_loc="on_data",
-    show_titles=False,
-    show=False,
-)
-for axis, resolution in zip(
-    leiden_comparison.axes.values(), leiden_candidates, strict=True
-):
-    axis.set_title(f"Leiden resolution {resolution}")
-leiden_comparison.figure
+figure, axes = plt.subplots(1, 3, figsize=(12, 4))
+for axis, resolution in zip(axes, leiden_values, strict=True):
+    axis.scatter(
+        umap_values[:, 0],
+        umap_values[:, 1],
+        c=leiden_values[resolution],
+        s=3,
+        cmap="tab20",
+    )
+    axis.set_title(f"Leiden {resolution}")
+figure.tight_layout()
+figure
 ```
 
-Reject a resolution when new groups are tiny, spatially diffuse, dominated by low-count cells, or unsupported by markers.
-A coarse partition can still be appropriate when the question concerns broad lineages.
+Higher resolution usually produces more and smaller groups. Reject a split when it is driven by a
+technical covariate, has weak marker evidence, or disappears under a modest parameter change.
 
-Check whether small groups in the working partition are QC outliers before treating them as cell types.
-
-```{code-cell} ipython3
-chosen_sizes = (
-    pd.Series(ds.cells.fetch(chosen_key, key="I"))
-    .value_counts()
-    .sort_values()
-)
-chosen_sizes
-```
+ARI and NMI quantify agreement without selecting a winner:
 
 ```{code-cell} ipython3
-ds.plots.distribution(
-    keys=["RNA_nCounts", "RNA_percentMito"],
-    group_by=chosen_key,
-    kind="violin",
-)
-```
-
-Tiny groups that also sit at low `RNA_nCounts` or high `RNA_percentMito` need QC review.
-Marker support for the smallest group is checked after `run_marker_search` below.
-
-## 3. Compare partitions and separation
-
-ARI and NMI quantify agreement between pairs of partitions.
-They do not say which partition is biologically correct.
-Graph silhouette asks whether each group is closer to itself than to neighbouring groups and can penalize transitional populations that are biologically real.
-
-```{code-cell} ipython3
-agreement_rows = []
-for first, second in combinations(leiden_candidates.values(), 2):
-    columns = [f"RNA_{first}", f"RNA_{second}"]
-    agreement_rows.append(
+agreement = []
+for first, second in combinations(leiden_values, 2):
+    agreement.append(
         {
             "comparison": f"{first} vs {second}",
-            "ARI": ds.metric_label_concordance(
-                columns,
-                metric="ari",
+            "ARI": adjusted_rand_score(
+                leiden_values[first],
+                leiden_values[second],
             ),
-            "NMI": ds.metric_label_concordance(
-                columns,
-                metric="nmi",
+            "NMI": normalized_mutual_info_score(
+                leiden_values[first],
+                leiden_values[second],
             ),
         }
     )
-pd.DataFrame(agreement_rows)
+pd.DataFrame(agreement)
 ```
 
-```{code-cell} ipython3
-silhouette_rows = []
-for label in leiden_candidates.values():
-    scores = ds.metric_graph_silhouette(res_label=label)
-    silhouette_rows.append(
-        {
-            "partition": label,
-            "mean graph silhouette": float(np.nanmean(scores)),
-            "minimum graph silhouette": float(np.nanmin(scores)),
-        }
-    )
-pd.DataFrame(silhouette_rows)
-```
+## 3. Inspect membership strength
 
-Per-cluster graph silhouette for the working partition, then the same scores mapped onto the UMAP so weak groups are visible in embedding space.
+Use the chosen cluster ref directly. The result is another axis-aligned artifact, not a metadata
+column. Resolution `0.5` is fixed here for the diagnostic walkthrough.
 
 ```{code-cell} ipython3
-graph_scores = ds.metric_graph_silhouette(res_label="leiden_r05")
-clusters_all = ds.cells.fetch_all(chosen_key)
-active_mask = ds.cells.fetch_all("I").astype(bool)
-active_labels = pd.Series(clusters_all[active_mask])
-categories = pd.Categorical(active_labels).categories
-per_cluster_silhouette = pd.DataFrame(
-    {
-        "cluster": list(categories),
-        "graph_silhouette": graph_scores,
-        "n_cells": active_labels.value_counts()
-        .reindex(categories)
-        .to_numpy(),
-    }
+chosen = leiden_refs[0.5]
+chosen_values = leiden_values[0.5]
+membership = ds.calc_membership_strength(chosen, graph)
+membership_values = np.asarray(ds.load_artifact(membership)["values"][:])
+
+figure, axis = plt.subplots(figsize=(5, 4))
+points = axis.scatter(
+    umap_values[:, 0],
+    umap_values[:, 1],
+    c=membership_values,
+    s=3,
 )
-per_cluster_silhouette
+figure.colorbar(points, ax=axis, label="membership strength")
+figure.tight_layout()
+figure
 ```
-
-```{code-cell} ipython3
-score_map = dict(zip(categories, graph_scores, strict=True))
-mapped_silhouette = np.full(len(clusters_all), np.nan, dtype=float)
-mapped_silhouette[active_mask] = (
-    active_labels.map(score_map).to_numpy(dtype=float)
-)
-ds.cells.insert(
-    "graph_silhouette",
-    mapped_silhouette,
-    overwrite=True,
-)
-ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by="graph_silhouette",
-)
-```
-
-Coordinate separability asks whether the PCA values can recover each partition.
-Macro F1 gives each cluster equal influence, weighted F1 follows cluster size, and coordinate silhouette compares within-cluster and between-cluster distances.
-
-```{code-cell} ipython3
-separability = ds.metric_cluster_separability(
-    pca,
-    cluster_columns=[
-        f"RNA_{label}" for label in leiden_candidates.values()
-    ],
-)
-separability.clustering_scores
-```
-
-Per-cluster F1 and the confusion table show which groups drive a weak aggregate score.
-
-```{code-cell} ipython3
-separability.cluster_scores.query(
-    "clustering == @chosen_key"
-).sort_values("f1_score")
-```
-
-```{code-cell} ipython3
-separability.confusion.query("clustering == @chosen_key")
-```
-
-Graph silhouette uses the neighbourhood graph to identify each cluster's nearest neighbour, then compares within- and between-cluster distances in the reduced embedding.
-These coordinate separability scores evaluate the PCA coordinates directly.
-The labels were derived from a graph built from the same PCA, so strong separability supports internal coherence but is not independent biological validation.
-
-The standard pipeline compares Leiden resolutions and Paris (unless `paris=False`) and selects the partition with the highest PCA silhouette when it needs labels for markers or doublet scoring.
-Treat that automatic choice as a starting point, not a declared optimum.
-
-## 4. Inspect per-cell membership strength
-
-Membership strength is the fraction of a cell's graph neighbours assigned to its most common cluster.
-Low values often occur near boundaries or in weakly supported groups.
-
-```{code-cell} ipython3
-ds.calc_membership_strength(chosen_key)
-membership_key = "RNA_I_cluster_membership_strength"
-```
-
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by=membership_key,
-)
-ds.plots.distribution(
-    keys=membership_key,
-    group_by=chosen_key,
-    kind="violin",
-)
-```
-
-Low membership throughout one cluster suggests that its boundary is not well supported.
-A few low values between otherwise coherent groups can instead represent continuous biology.
-
-## 5. Inspect graph connectivity between groups
 
 ```{code-cell} ipython3
 ds.plots.cluster_connectivity(
-    group_by=chosen_key,
-    layout_key="RNA_UMAP",
-    from_assay="RNA",
-    show_cells=True,
+    graph=graph,
+    groups=chosen,
+    layout=umap,
 )
 ```
 
-This view summarizes weighted graph connections between groups.
-It is not a lineage graph and is distinct from the Paris hierarchy below.
+Low values throughout one cluster suggest a weak boundary. A narrow band of low values between
+otherwise coherent groups may represent continuous biology.
 
-## 6. Compare Paris adaptive and fixed cuts
+## 4. Compare Paris cuts
 
-Paris builds a hierarchy by repeatedly contracting the graph.
-The automatic cut retains persistent branches subject to a minimum size and a modularity `split_gate`.
-A fixed cut requests an exact cluster count from the same hierarchy.
+`run_paris_clustering` returns a `cluster_cut` ref. Load the domain result explicitly when
+hierarchy diagnostics are needed.
 
 ```{code-cell} ipython3
-paris_auto = ds.run_paris_clustering(
-    n_clusters="auto",
-    label="paris_auto",
-)
-pd.DataFrame(
-    [asdict(item) for item in paris_auto.diagnostics]
-)[
-    [
-        "label",
-        "size",
-        "persistence",
-        "decision_margin",
-        "forced",
-    ]
+paris_auto = ds.run_paris_clustering(graph)
+paris_result = ds.load_paris_clustering(paris_auto)
+pd.DataFrame([asdict(item) for item in paris_result.diagnostics])[
+    ["label", "size", "persistence", "decision_margin", "forced"]
 ]
 ```
 
-Persistence is the size-weighted keep score for a selected branch.
-`resolution_lower` and `resolution_upper` describe the resolution interval over which that branch survives.
-The decision margin measures how strongly the adaptive objective favoured retaining that branch.
-Forced groups satisfy structural constraints and should not be interpreted as strongly supported solely from that flag.
+```{code-cell} ipython3
+ds.plots.cluster_tree(graph=graph, clusters=paris_auto)
+```
+
+Persistence measures how long a selected branch survives in the hierarchy. The decision margin
+measures the preference for retaining it. A forced group satisfies a structural constraint and is
+not, by itself, strong biological evidence.
 
 ```{code-cell} ipython3
 paris_fixed = ds.run_paris_clustering(
-    n_clusters=paris_auto.n_clusters,
-    label="paris_fixed",
+    graph,
+    n_clusters=paris_result.n_clusters,
 )
-ds.metric_label_concordance(
-    [paris_auto.label_key, paris_fixed.label_key],
-    metric="ari",
-)
-```
-
-```{code-cell} ipython3
-paris_comparison = ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by=[paris_auto.label_key, paris_fixed.label_key],
-    n_columns=2,
-    legend_loc="on_data",
-    show_titles=False,
-    show=False,
-)
-for axis, title in zip(
-    paris_comparison.axes.values(),
-    ["Paris auto cut", "Paris fixed cut"],
-    strict=True,
-):
-    axis.set_title(title)
-paris_comparison.figure
-```
-
-```{code-cell} ipython3
-ds.plots.cluster_tree(
-    cluster_key=paris_auto.label_key,
-    width=1.7,
-    fontsize=9,
-    figsize=(7, 5),
-)
-```
-
-The tree represents hierarchical merges, while `plots.cluster_connectivity` represents direct inter-group graph structure.
-
-Optionally place Leiden and Paris on the same embedding frame, and colour the Paris tree by Leiden membership.
-
-```{code-cell} ipython3
-leiden_paris = ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by=[chosen_key, paris_auto.label_key],
-    n_columns=2,
-    legend_loc="on_data",
-    show_titles=False,
-    show=False,
-)
-for axis, title in zip(
-    leiden_paris.axes.values(),
-    ["Leiden (chosen)", "Paris auto"],
-    strict=True,
-):
-    axis.set_title(title)
-print(
-    "ARI:",
-    ds.metric_label_concordance(
-        [chosen_key, paris_auto.label_key],
-        metric="ari",
-    ),
-)
-leiden_paris.figure
-```
-
-```{code-cell} ipython3
-ds.plots.cluster_tree(
-    cluster_key=paris_auto.label_key,
-    fill_by_value=chosen_key,
-    width=1.7,
-    fontsize=9,
-    figsize=(7, 5),
-)
-```
-
-## 7. Review marker specificity
-
-```{code-cell} ipython3
-all_features = ds.resolve_features("RNA", "all_features")
-marker_ref = ds.run_marker_search(group_key=chosen_key, features=all_features)
-largest_group = chosen_sizes.index[-1]
-smallest_group = chosen_sizes.index[0]
-markers = ds.get_markers(
-    marker=marker_ref,
-    group_key=chosen_key,
-    group_id=largest_group,
-)
-print(f"Largest group: {largest_group} (n={int(chosen_sizes.loc[largest_group])})")
-markers[
-    [
-        "feature_name",
-        "score",
-        "auc",
-        "p_value",
-        "p_value_adjusted",
-    ]
-].head(10)
-```
-
-```{code-cell} ipython3
-small_markers = ds.get_markers(
-    marker=marker_ref,
-    group_key=chosen_key,
-    group_id=smallest_group,
-)
-print(
-    f"Smallest group: {smallest_group} "
-    f"(n={int(chosen_sizes.loc[smallest_group])})"
-)
-small_markers[
-    [
-        "feature_name",
-        "score",
-        "auc",
-        "p_value",
-        "p_value_adjusted",
-    ]
-].head(10)
-```
-
-```{code-cell} ipython3
-ds.plots.marker_heatmap(
-    marker=marker_ref,
-    group_key=chosen_key,
-    topn=5,
-    figsize=(5, 9),
-)
-```
-
-```{code-cell} ipython3
-top_genes = markers["feature_name"].astype(str).head(3).tolist()
-ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by=top_genes,
-    n_columns=3,
-    sort_values=True,
-)
-```
-
-AUC measures how often a randomly selected cell in the group has a higher value than a cell outside it.
-Review AUC, specificity score, expression fraction, and known biology together.
-Adjusted p-values are within-group cell-level tests, not replicate-aware differential expression.
-Groups with fewer than two target or reference cells fail marker testing rather than returning a misleading table.
-
-## 8. Subset and recluster
-
-Subclustering should rebuild feature selection and the graph within the selected population.
-Reusing the full-dataset graph can preserve boundaries that are irrelevant inside the subset.
-
-Highlight the focus population on the full embedding before rebuilding the subset graph.
-
-```{code-cell} ipython3
-clusters = ds.cells.fetch_all(chosen_key)
-active = ds.cells.fetch_all("I").astype(bool)
-focus = pd.Series(clusters[active]).value_counts().index[0]
-ds.cells.insert(
-    "focus_cells",
-    active & (clusters == focus),
-    overwrite=True,
-)
-print(f"Focus cluster: {focus}")
-print(f"Focus cells: {int(ds.cells.fetch_all('focus_cells').sum())}")
-ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by=None,
-    default_color="#bdbdbd",
-    point_alpha=0.4,
-    highlight=splt.Highlight(
-        by="focus_cells",
-        groups=(True,),
-        color="#d62728",
-        dim_alpha=0.12,
-        size_multiplier=1.35,
-        halo_width=0.4,
-    ),
-)
-```
-
-```{code-cell} ipython3
-focus_features = ds.mark_hvgs(
-    cell_key="focus_cells",
-    min_cells=10,
-    top_n=500,
-    show_plot=False,
-)
-ds.run_normalization(
-    cell_key="focus_cells",
-    features=focus_features,
-)
-ds.run_pca(dims=15)
-ds.build_embedding_initialization()
-ds.build_ann_index()
-ds.query_neighbors(k=11)
-ds.build_connectivity_map()
-ds.run_umap(
-    cell_key="focus_cells",
-    n_epochs=100,
-    spread=5,
-    min_dist=1,
-    parallel=True,
-    label="UMAP",
-)
-ds.run_leiden_clustering(
-    cell_key="focus_cells",
-    resolution=0.4,
-    label="leiden_cluster",
-)
+paris_auto_values = np.asarray(ds.load_artifact(paris_auto)["labels"][:])
+paris_fixed_values = np.asarray(ds.load_artifact(paris_fixed)["labels"][:])
 pd.Series(
-    ds.cells.fetch("RNA_focus_cells_leiden_cluster", key="focus_cells")
-).value_counts()
-```
-
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key="RNA_focus_cells_UMAP",
-    color_by="RNA_focus_cells_leiden_cluster",
-    cell_key="focus_cells",
+    {
+        "auto vs fixed ARI": adjusted_rand_score(
+            paris_auto_values,
+            paris_fixed_values,
+        ),
+        "Leiden vs Paris ARI": adjusted_rand_score(
+            chosen_values,
+            paris_auto_values,
+        ),
+    }
 )
 ```
 
-The resulting columns apply only to `focus_cells`.
-Revisit QC, feature selection, marker support, and stability before assigning finer biological labels.
+## 5. Review marker evidence
+
+Marker search requires exact cluster and feature-selection refs and returns one immutable marker
+table artifact.
+
+```{code-cell} ipython3
+markers = ds.run_marker_search(
+    chosen,
+    features=clustering_run["feature_universe"],
+)
+sizes = pd.Series(chosen_values).value_counts()
+largest = sizes.index[0]
+smallest = sizes.index[-1]
+
+largest_markers = ds.get_markers(marker=markers, group_id=largest)
+smallest_markers = ds.get_markers(marker=markers, group_id=smallest)
+```
+
+```{code-cell} ipython3
+largest_markers[
+    ["feature_name", "score", "auc", "p_value", "p_value_adjusted"]
+].head(10)
+```
+
+```{code-cell} ipython3
+smallest_markers[
+    ["feature_name", "score", "auc", "p_value", "p_value_adjusted"]
+].head(10)
+```
+
+The p-values are cell-level one-versus-rest marker tests with within-group adjustment. They are not
+replicate-aware differential expression. A defensible partition combines marker evidence, graph
+support, technical covariates, replicate coverage, and the study question.
+
+## 6. Pipeline cluster selection
+
+When a pipeline run includes multiple Leiden candidates, it scores them with one deterministic
+shared sample of at most 10,000 cells in the graph's PCA or Harmony coordinates. Paris can still
+run as `clustering_run["paris"]`, but it is not an automatic winner. The `cluster_selection`
+artifact persists the scores, sampling policy, invalid-candidate reasons, tie order, and selected
+key:
+
+```python
+decision_ref = clustering_run["cluster_selection"]
+selected_cluster_ref = clustering_run["clusters"]
+```
+
+This automatic choice is a reproducible baseline, not proof that the selected resolution is best
+for every biological question. Retain alternative refs when the decision needs domain-specific
+evidence.

@@ -1,11 +1,12 @@
 """Embedding scatter plots."""
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, Hashable
 
 import numpy as np
 import pandas as pd
 
+from ..storage.artifacts import ArtifactRef, inspect_artifact
 from ._contracts import (
     CategoricalScale,
     CellField,
@@ -17,6 +18,8 @@ from ._contracts import (
     PlotProvenance,
 )
 from ._data import (
+    _resolve_grouping,
+    _resolve_layout,
     fetch_normalized_feature_matrix,
     resolve_cell_selection,
     resolve_feature,
@@ -65,14 +68,15 @@ def _is_categorical(values: pd.Series, kind: str) -> bool:
 
 def _coerce_color_items(
     color_by: str
+    | ArtifactRef
     | FeatureRef
     | CellField
-    | Sequence[str | FeatureRef | CellField]
+    | Sequence[str | ArtifactRef | FeatureRef | CellField]
     | None,
-) -> list[str | FeatureRef | CellField | None]:
+) -> list[str | ArtifactRef | FeatureRef | CellField | None]:
     if color_by is None:
         return [None]
-    if isinstance(color_by, (str, FeatureRef, CellField)):
+    if isinstance(color_by, (str, ArtifactRef, FeatureRef, CellField)):
         return [color_by]
     return list(color_by)
 
@@ -92,7 +96,7 @@ def _coerce_layout_items(layout_key: str | Sequence[str]) -> list[str]:
 
 def _color_labels(
     store: Any,
-    color_items: Sequence[str | FeatureRef | CellField | None],
+    color_items: Sequence[str | ArtifactRef | FeatureRef | CellField | None],
     *,
     from_assay: str | None,
 ) -> list[str]:
@@ -100,6 +104,8 @@ def _color_labels(
     for item in color_items:
         if item is None:
             labels.append("cells")
+        elif isinstance(item, ArtifactRef):
+            labels.append(item.kind)
         elif isinstance(item, CellField):
             labels.append(item.label or item.key)
         elif isinstance(item, str) and item in store.cells.columns:
@@ -163,9 +169,10 @@ def _embedding_multiple_layouts(
     *,
     layout_keys: Sequence[str],
     color_by: str
+    | ArtifactRef
     | FeatureRef
     | CellField
-    | Sequence[str | FeatureRef | CellField]
+    | Sequence[str | ArtifactRef | FeatureRef | CellField]
     | None,
     facet_by: str | None,
     facet_order: Sequence[Any] | None,
@@ -327,14 +334,41 @@ def _embedding_multiple_layouts(
     return result
 
 
+def _selected_metadata_column(
+    store: Any,
+    column: str,
+    *,
+    cell_key: str,
+    cell_indices: np.ndarray | None,
+) -> np.ndarray:
+    cells = store.cells
+    if cell_indices is None:
+        fetch = cells.fetch
+        try:
+            return np.asarray(fetch(column, key=cell_key))
+        except TypeError:
+            return np.asarray(fetch(column))
+    if getattr(cells, "_selection_ref", None) is not None:
+        fetch = cells.fetch
+        try:
+            values = np.asarray(fetch(column, key="I"))
+        except TypeError:
+            values = np.asarray(fetch(column))
+        if values.shape[0] == len(cell_indices):
+            return values
+    full = np.asarray(cells.fetch_all(column))
+    return np.asarray(full[cell_indices])
+
+
 def _prefetch_colors(
     store: Any,
-    color_items: Sequence[str | FeatureRef | CellField | None],
+    color_items: Sequence[str | ArtifactRef | FeatureRef | CellField | None],
     *,
     from_assay: str | None,
     cell_key: str,
     n_cells: int,
     normalization: NormalizationSpec,
+    cell_indices: np.ndarray | None = None,
 ) -> list[tuple[np.ndarray, str, bool, bool]]:
     """Return list of (values, label, is_categorical, is_uniform)."""
     out: list[tuple[np.ndarray, str, bool, bool]] = []
@@ -345,8 +379,38 @@ def _prefetch_colors(
         if item is None:
             out.append((np.ones(n_cells), "cells", False, True))
             continue
+        if isinstance(item, ArtifactRef):
+            if cell_indices is None:
+                raise ValueError(
+                    "ArtifactRef color_by requires an explicit layout ArtifactRef"
+                )
+            _, grouping_indices, grouping_values = _resolve_grouping(
+                store,
+                group_by=None,
+                groups=item,
+                cell_key="I",
+            )
+            if not np.array_equal(grouping_indices, cell_indices):
+                raise ValueError(
+                    "color_by and layout artifacts select cells in a different order"
+                )
+            values = np.asarray(grouping_values[0])
+            out.append(
+                (
+                    values,
+                    item.kind,
+                    _is_categorical(pd.Series(values), "auto"),
+                    False,
+                )
+            )
+            continue
         if isinstance(item, CellField):
-            vals = store.cells.fetch(item.key, key=cell_key)
+            vals = _selected_metadata_column(
+                store,
+                item.key,
+                cell_key=cell_key,
+                cell_indices=cell_indices,
+            )
             series = pd.Series(vals)
             out.append(
                 (
@@ -358,7 +422,12 @@ def _prefetch_colors(
             )
             continue
         if isinstance(item, str) and item in store.cells.columns:
-            vals = store.cells.fetch(item, key=cell_key)
+            vals = _selected_metadata_column(
+                store,
+                item,
+                cell_key=cell_key,
+                cell_indices=cell_indices,
+            )
             series = pd.Series(vals)
             out.append((np.asarray(vals), item, _is_categorical(series, "auto"), False))
             continue
@@ -371,7 +440,9 @@ def _prefetch_colors(
             resolve_feature(store, item, from_assay=from_assay)
             for _, item in feature_slots
         ]
-        cell_idx = store.cells.active_index(cell_key)
+        cell_idx = (
+            store.cells.active_index(cell_key) if cell_indices is None else cell_indices
+        )
         mat = fetch_normalized_feature_matrix(
             store,
             resolved,
@@ -438,6 +509,7 @@ def _resolve_highlight_mask(
     *,
     cell_key: str,
     n_cells: int,
+    cell_indices: np.ndarray | None = None,
 ) -> np.ndarray | None:
     if highlight is None:
         return None
@@ -449,7 +521,12 @@ def _resolve_highlight_mask(
         mask[indices] = True
         return mask
     assert highlight.by is not None
-    values = np.asarray(store.cells.fetch(highlight.by, key=cell_key))
+    values = _selected_metadata_column(
+        store,
+        highlight.by,
+        cell_key=cell_key,
+        cell_indices=cell_indices,
+    )
     if len(values) != n_cells:
         raise ValueError("highlight metadata length does not match selected cells")
     if highlight.groups is None:
@@ -467,10 +544,16 @@ def _density_selection_mask(
     *,
     cell_key: str,
     n_cells: int,
+    cell_indices: np.ndarray | None = None,
 ) -> np.ndarray | None:
     if overlay is None or overlay.group_by is None:
         return None
-    values = np.asarray(store.cells.fetch(overlay.group_by, key=cell_key))
+    values = _selected_metadata_column(
+        store,
+        overlay.group_by,
+        cell_key=cell_key,
+        cell_indices=cell_indices,
+    )
     if len(values) != n_cells:
         raise ValueError("density metadata length does not match selected cells")
     if overlay.groups is None:
@@ -1095,11 +1178,13 @@ def _soft_clip(values: np.ndarray, clip_fraction: float) -> np.ndarray:
 def embedding(
     store: Any,
     *,
-    layout_key: str | Sequence[str],
+    layout_key: str | Sequence[str] | None = None,
+    layout: ArtifactRef | None = None,
     color_by: str
+    | ArtifactRef
     | FeatureRef
     | CellField
-    | Sequence[str | FeatureRef | CellField]
+    | Sequence[str | ArtifactRef | FeatureRef | CellField]
     | None = None,
     facet_by: str | None = None,
     facet_order: Sequence[Any] | None = None,
@@ -1168,7 +1253,17 @@ def embedding(
     Returns a :class:`PlotResult`. Access ``.figure`` in notebooks, or call
     ``.save(...)`` / ``.close()`` when you own the figure.
     """
-    layout_keys = _coerce_layout_items(layout_key)
+    if (layout_key is None) == (layout is None):
+        raise ValueError("Provide exactly one of layout_key or layout")
+    if layout is None:
+        assert layout_key is not None
+        layout_keys = _coerce_layout_items(layout_key)
+    else:
+        if cell_key != "I":
+            raise ValueError(
+                "cell_key cannot override an artifact's stored cell selection"
+            )
+        layout_keys = []
     if len(layout_keys) > 1:
         return _embedding_multiple_layouts(
             store,
@@ -1209,7 +1304,50 @@ def embedding(
                 "rasterize_threshold": rasterize_threshold,
             },
         )
-    layout_key = layout_keys[0]
+    artifact_cell_indices: np.ndarray | None = None
+    layout_selection: ArtifactRef | None = None
+    if layout is None:
+        layout_name = layout_keys[0]
+        x = np.asarray(
+            store.cells.fetch(f"{layout_name}1", key=cell_key),
+            dtype=np.float64,
+        )
+        y = np.asarray(
+            store.cells.fetch(f"{layout_name}2", key=cell_key),
+            dtype=np.float64,
+        )
+    else:
+        coordinates, artifact_cell_indices, layout_selection = _resolve_layout(
+            store,
+            layout,
+        )
+        x = coordinates[:, 0]
+        y = coordinates[:, 1]
+        layout_name = "Embedding"
+        for item in _coerce_color_items(color_by):
+            if not isinstance(item, ArtifactRef):
+                continue
+            status = inspect_artifact(store.zw, item)
+            raw_selection = (status.inputs or {}).get("cell_selection")
+            if not isinstance(raw_selection, Mapping):
+                raise ValueError("color_by artifact has no cell-selection input")
+            try:
+                color_selection = ArtifactRef.from_dict(raw_selection)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "color_by artifact has an invalid cell-selection input"
+                ) from exc
+            if color_selection != layout_selection:
+                raise ValueError(
+                    "color_by and layout artifacts must share the same cell selection"
+                )
+    resolved_from_assay = (
+        from_assay
+        if from_assay is not None
+        else layout.assay
+        if layout is not None
+        else None
+    )
 
     plt, mpl = require_matplotlib()
     if rasterize_threshold < 0:
@@ -1228,14 +1366,12 @@ def embedding(
     color_scale = color_scale or ColorScale(cmap="viridis", scope="feature")
     resolved_missing_color = missing_color or "#bdbdbd"
 
-    x = np.asarray(store.cells.fetch(f"{layout_key}1", key=cell_key), dtype=np.float64)
-    y = np.asarray(store.cells.fetch(f"{layout_key}2", key=cell_key), dtype=np.float64)
     n = len(x)
     if n == 0:
         raise ValueError(f"No cells selected by cell_key {cell_key!r}")
     finite_coordinates = np.isfinite(x) & np.isfinite(y)
     if not finite_coordinates.any():
-        raise ValueError(f"Layout {layout_key!r} has no finite coordinates")
+        raise ValueError(f"Layout {layout_name!r} has no finite coordinates")
     if point_sizes is not None and len(point_sizes) != n:
         raise ValueError("point_sizes length must match number of selected cells")
     if point_size is not None and (not np.isfinite(point_size) or point_size <= 0):
@@ -1274,10 +1410,11 @@ def embedding(
     color_cache = _prefetch_colors(
         store,
         color_items,
-        from_assay=from_assay,
+        from_assay=resolved_from_assay,
         cell_key=cell_key,
         n_cells=n,
         normalization=normalization,
+        cell_indices=artifact_cell_indices,
     )
     classified_cache: list[tuple[np.ndarray, str, bool, bool]] = []
     for index, entry in enumerate(color_cache):
@@ -1339,7 +1476,12 @@ def embedding(
         color_cache = clipped
 
     subset_vals = (
-        np.asarray(store.cells.fetch(subset_by, key=cell_key))
+        _selected_metadata_column(
+            store,
+            subset_by,
+            cell_key=cell_key,
+            cell_indices=artifact_cell_indices,
+        )
         if subset_by is not None
         else None
     )
@@ -1348,18 +1490,25 @@ def embedding(
         highlight,
         cell_key=cell_key,
         n_cells=n,
+        cell_indices=artifact_cell_indices,
     )
     density_filter = _density_selection_mask(
         store,
         density_overlay,
         cell_key=cell_key,
         n_cells=n,
+        cell_indices=artifact_cell_indices,
     )
     facet_values: np.ndarray | None = None
     groups_category: np.ndarray | None = None
     groups_color_index: int | None = None
     if facet_by is not None:
-        facet_values = np.asarray(store.cells.fetch(facet_by, key=cell_key))
+        facet_values = _selected_metadata_column(
+            store,
+            facet_by,
+            cell_key=cell_key,
+            cell_indices=artifact_cell_indices,
+        )
         if groups is not None:
             groups_category = facet_values
     elif groups is not None:
@@ -1858,8 +2007,8 @@ def embedding(
                     ax,
                     xlim=xlim,
                     ylim=ylim,
-                    xlabel=f"{layout_key}1" if row == nrows - 1 else "",
-                    ylabel=f"{layout_key}2" if col == 0 else "",
+                    xlabel=f"{layout_name}1" if row == nrows - 1 else "",
+                    ylabel=f"{layout_name}2" if col == 0 else "",
                     title=title or None,
                     frame=frame,
                 )
@@ -1919,7 +2068,7 @@ def embedding(
         assay_name = (
             item.assay
             if isinstance(item, FeatureRef) and item.assay is not None
-            else from_assay or getattr(store, "_defaultAssay", None)
+            else resolved_from_assay or getattr(store, "_defaultAssay", None)
         )
         if assay_name is not None:
             feature_assays.add(assay_name)
@@ -1931,12 +2080,30 @@ def embedding(
         legends=tuple(legends),
         scales=tuple(scales_out),
         provenance=PlotProvenance(
-            assay=next(iter(feature_assays)) if len(feature_assays) == 1 else None,
-            cell_key=cell_key,
+            assay=(
+                layout.assay
+                if layout is not None
+                else next(iter(feature_assays))
+                if len(feature_assays) == 1
+                else None
+            ),
+            cell_key=None if layout is not None else cell_key,
             n_cells=int(base_mask.sum()),
             renderer="matplotlib",
-            notes=("embedding", "materialized", f"layout={layout_key}"),
+            notes=(
+                "embedding",
+                "artifact" if layout is not None else "live_metadata",
+            ),
             extras={
+                "layout": None if layout is None else layout.to_dict(),
+                "color_artifacts": [
+                    item.to_dict()
+                    for item in color_items
+                    if isinstance(item, ArtifactRef)
+                ],
+                "cell_selection": (
+                    None if layout_selection is None else layout_selection.to_dict()
+                ),
                 "sort_values": sort_values,
                 "color_scale_scope": color_scale.scope,
                 "color_limits": color_limits,

@@ -1,22 +1,14 @@
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, cast
 
 import numpy as np
 import zarr
 
-from ..graph.state import (
-    ArtifactRef,
-    ArtifactResolutionError,
-    AssayState,
+from ..storage.refs import ArtifactRef
+from .imported_storage import (
     ImportedArtifactStorage,
-    fingerprint_selected_stored_strings,
-    named_result_mismatch,
-    read_assay_state,
-    read_assay_state_document,
-    validate_cell_selection_artifact,
     validate_imported_coordinates_artifact,
-    write_assay_state,
 )
 
 type ImportedBlockSource = (
@@ -217,26 +209,22 @@ def _selection_alignment(
     root: zarr.Group,
     *,
     cell_selection: ArtifactRef,
-    cell_key: str,
     source_cell_ids: ImportedStringSource,
     coordinate_rows: int,
     block_rows: int,
 ) -> tuple[zarr.Array, int, str]:
     storage = ImportedArtifactStorage(root)
-    validate_cell_selection_artifact(root, cell_selection, cell_key)
-    selection_group = storage.artifact_group(cell_selection)
-    selection = storage.as_array(selection_group["values"], "values")
-    cell_data = storage.as_group(root["cellData"], "cellData")
-    stored_ids = storage.as_array(cell_data["ids"], "ids")
+    validated = storage.validate_cell_selection(cell_selection)
+    selection = validated.values
+    stored_ids = validated.row_ids
     source_count = _string_source_length(source_cell_ids)
     context: dict[str, str | int | float | bool | None] = {
-        "cell_key": cell_key,
         "coordinate_rows": int(coordinate_rows),
         "source_cell_count": source_count,
         "artifact_id": cell_selection.artifact_id,
     }
     if source_count != coordinate_rows:
-        raise ArtifactResolutionError(
+        raise storage.resolution_error(
             "Imported coordinates do not match the source cell count",
             code="dimreduc_row_count_mismatch",
             context=context,
@@ -250,7 +238,7 @@ def _selection_alignment(
         source_stop = source_start + selected
         if source_stop > source_count:
             context["selected_count"] = source_stop
-            raise ArtifactResolutionError(
+            raise storage.resolution_error(
                 "Imported coordinates do not match the selected cell count",
                 code="dimreduc_row_count_mismatch",
                 context=context,
@@ -263,7 +251,7 @@ def _selection_alignment(
         )
         if not np.array_equal(expected, actual):
             context["selected_count"] = selected_count + selected
-            raise ArtifactResolutionError(
+            raise storage.resolution_error(
                 "Imported cell IDs do not match the selected cell order",
                 code="dimreduc_cell_identity_mismatch",
                 context=context,
@@ -272,12 +260,12 @@ def _selection_alignment(
         selected_count += selected
     context["selected_count"] = selected_count
     if selected_count != coordinate_rows or source_start != source_count:
-        raise ArtifactResolutionError(
+        raise storage.resolution_error(
             "Imported coordinates do not match the selected cell count",
             code="dimreduc_row_count_mismatch",
             context=context,
         )
-    fingerprint, fingerprint_count = fingerprint_selected_stored_strings(
+    fingerprint, fingerprint_count = storage.fingerprint_selected_strings(
         stored_ids,
         selection,
     )
@@ -460,69 +448,6 @@ def _payloads_match(
     return True
 
 
-def _register_named_result(
-    root: zarr.Group,
-    ref: ArtifactRef,
-    name: str,
-    *,
-    cell_key: str,
-) -> None:
-    if not isinstance(name, str) or not name:
-        raise ValueError("named_result must be a non-empty string")
-    if ref.assay is None:
-        raise ValueError("Named imported results must be assay-scoped")
-    state = _recoverable_import_state(root, ref.assay)
-    if state is None:
-        state = AssayState(
-            assay=ref.assay,
-            cell_key=cell_key,
-        )
-    elif state.cell_key != cell_key:
-        raise ValueError(
-            f"Imported result cell_key {cell_key!r} does not match "
-            f"AssayState cell_key {state.cell_key!r}"
-        )
-    named_results = {}
-    for existing_name, existing_ref in state.named_results.items():
-        try:
-            fits = (
-                named_result_mismatch(
-                    root,
-                    existing_name,
-                    existing_ref,
-                    state,
-                )
-                is None
-            )
-        except (KeyError, RuntimeError, TypeError, ValueError):
-            continue
-        if fits:
-            named_results[existing_name] = existing_ref
-    named_results[name] = ref
-    write_assay_state(
-        root,
-        replace(state, named_results=named_results),
-    )
-
-
-def _recoverable_import_state(
-    root: zarr.Group,
-    assay: str,
-) -> AssayState | None:
-    """Read state while allowing an unavailable current chain to be replaced."""
-    document = read_assay_state_document(root, assay)
-    if document is None:
-        return None
-    try:
-        return read_assay_state(root, assay)
-    except ArtifactResolutionError:
-        return AssayState(
-            assay=document.assay,
-            cell_key=document.cell_key,
-            named_results=document.named_results,
-        )
-
-
 def write_imported_coordinates(
     root: zarr.Group,
     *,
@@ -534,7 +459,6 @@ def write_imported_coordinates(
     payload_fingerprints: Mapping[str, str],
     source_cell_ids: ImportedStringSource,
     cell_selection: ArtifactRef,
-    cell_key: str,
     coordinate_shape: tuple[int, int] | None = None,
     coordinate_dtype: Any | None = None,
     loadings: ImportedBlockSource | None = None,
@@ -546,12 +470,10 @@ def write_imported_coordinates(
     stdev: ImportedBlockSource | None = None,
     stdev_shape: tuple[int] | None = None,
     stdev_dtype: Any | None = None,
-    named_result: str | None = None,
     block_rows: int = 100_000,
     invalidate_cache: bool = False,
 ) -> ArtifactRef:
     storage = ImportedArtifactStorage(root)
-    _recoverable_import_state(root, assay)
     source_digest = _validate_source_digest(source_digest)
     if not isinstance(dimreduc_key, str) or not dimreduc_key:
         raise ValueError("dimreduc_key must be a non-empty string")
@@ -570,7 +492,6 @@ def write_imported_coordinates(
     _selection, selected_count, ordered_cell_ids_fingerprint = _selection_alignment(
         root,
         cell_selection=cell_selection,
-        cell_key=cell_key,
         source_cell_ids=source_cell_ids,
         coordinate_rows=data_source.shape[0],
         block_rows=block_rows,
@@ -662,10 +583,7 @@ def write_imported_coordinates(
             "ordered_cell_ids_fingerprint": ordered_cell_ids_fingerprint,
             "cell_selection": cell_selection,
         },
-        execution_options={
-            "cell_key": cell_key,
-            "block_rows": block_rows,
-        },
+        execution_options={"block_rows": block_rows},
         invalidate_cache=invalidate_cache,
         required_arrays=requirements,
         reuse_validator=lambda _ref, group: _payloads_match(
@@ -712,18 +630,7 @@ def write_imported_coordinates(
                 block_rows,
             )
         storage.finish(group, planned)
-    validate_imported_coordinates_artifact(
-        root,
-        planned.ref,
-        cell_key=cell_key,
-    )
-    if named_result is not None:
-        _register_named_result(
-            root,
-            planned.ref,
-            named_result,
-            cell_key=cell_key,
-        )
+    validate_imported_coordinates_artifact(root, planned.ref)
     if selected_count != data_source.shape[0]:
         raise RuntimeError("Imported coordinate selection changed during writing")
     return planned.ref
@@ -732,8 +639,6 @@ def write_imported_coordinates(
 def validate_imported_embedding_artifact(
     root: zarr.Group,
     ref: ArtifactRef,
-    *,
-    cell_key: str | None = None,
 ) -> None:
     storage = ImportedArtifactStorage(root)
     if ref.kind != "embedding" or ref.scope != "assay" or ref.assay is None:
@@ -742,11 +647,6 @@ def validate_imported_embedding_artifact(
     if status.operation != "import_dimreduc":
         raise ValueError("Imported embedding operation must be 'import_dimreduc'")
     execution = status.execution_options or {}
-    stored_cell_key = execution.get("cell_key")
-    if not isinstance(stored_cell_key, str) or not stored_cell_key:
-        raise ValueError("Imported embedding has no cell selection key")
-    if cell_key is not None and cell_key != stored_cell_key:
-        raise ValueError("cell_key does not match the imported embedding")
     block_rows = execution.get("block_rows")
     if (
         isinstance(block_rows, bool)
@@ -759,7 +659,7 @@ def validate_imported_embedding_artifact(
     if not isinstance(raw_selection, Mapping):
         raise ValueError("Imported embedding has no cell selection input")
     selection = ArtifactRef.from_dict(raw_selection)
-    validate_cell_selection_artifact(root, selection, stored_cell_key)
+    validated_selection = storage.validate_cell_selection(selection)
     group = storage.artifact_group(ref)
     if "values" not in group:
         raise ValueError("Imported embedding has no values array")
@@ -781,15 +681,9 @@ def validate_imported_embedding_artifact(
         or role not in {"umap", "tsne"}
     ):
         raise ValueError("Imported embedding payload is malformed")
-    selection_values = storage.as_array(
-        storage.artifact_group(selection)["values"],
-        "values",
-    )
-    cell_data = storage.as_group(root["cellData"], "cellData")
-    ids = storage.as_array(cell_data["ids"], "ids")
-    selected_fingerprint, selected_count = fingerprint_selected_stored_strings(
-        ids,
-        selection_values,
+    selected_fingerprint, selected_count = storage.fingerprint_selected_strings(
+        validated_selection.row_ids,
+        validated_selection.values,
     )
     if int(values.shape[0]) != selected_count:
         raise ValueError("Imported embedding rows do not match its cell selection")
@@ -817,74 +711,6 @@ def validate_imported_embedding_artifact(
         raise ValueError("Imported embedding payload fingerprint does not match")
 
 
-def _default_embedding_columns(
-    assay: str,
-    cell_key: str,
-    role: str,
-    dims: int,
-) -> tuple[str, ...]:
-    label = "UMAP" if role == "umap" else "tSNE"
-    prefix = f"{assay}_{label}" if cell_key == "I" else f"{assay}_{cell_key}_{label}"
-    return tuple(f"{prefix}{index + 1}" for index in range(dims))
-
-
-def _publish_embedding_columns(
-    root: zarr.Group,
-    ref: ArtifactRef,
-    *,
-    selection: zarr.Array,
-    columns: Sequence[str],
-    cell_data: zarr.Group,
-    block_rows: int,
-) -> None:
-    storage = ImportedArtifactStorage(root)
-    group = storage.artifact_group(ref)
-    values = storage.as_array(group["values"], "values")
-    if len(columns) != int(values.shape[1]):
-        raise ValueError(
-            "metadata_columns must contain one name per embedding dimension"
-        )
-    if len(set(columns)) != len(columns) or any(
-        not isinstance(column, str) or not column or column in {"I", "ids", "names"}
-        for column in columns
-    ):
-        raise ValueError("metadata_columns contains invalid or duplicate names")
-    n_rows = int(selection.shape[0])
-    outputs = [
-        storage.create_metadata(
-            cell_data,
-            column,
-            dtype=values.dtype,
-            shape=n_rows,
-            block_rows=block_rows,
-        )
-        for column in columns
-    ]
-    for output in outputs:
-        output[:] = np.nan
-    source_row = 0
-    for start in range(0, n_rows, block_rows):
-        stop = min(start + block_rows, n_rows)
-        block_mask = np.asarray(selection[start:stop], dtype=bool)
-        selected = int(block_mask.sum())
-        source_stop = source_row + selected
-        source_values = np.asarray(values[source_row:source_stop])
-        if source_values.shape != (selected, len(columns)):
-            raise ValueError("Imported embedding values ended before cell metadata")
-        if selected:
-            for index, output in enumerate(outputs):
-                block = np.full(stop - start, np.nan, dtype=values.dtype)
-                block[block_mask] = source_values[:, index]
-                output[start:stop] = block
-        source_row = source_stop
-    if source_row != int(values.shape[0]):
-        raise ValueError("Imported embedding values exceed the cell selection")
-    for index, output in enumerate(outputs):
-        output.attrs["source_artifact"] = ref.to_dict()
-        output.attrs["source_value"] = "values"
-        output.attrs["value_index"] = index
-
-
 def write_imported_embedding(
     root: zarr.Group,
     *,
@@ -896,17 +722,12 @@ def write_imported_embedding(
     payload_fingerprints: Mapping[str, str],
     source_cell_ids: ImportedStringSource,
     cell_selection: ArtifactRef,
-    cell_key: str,
     coordinate_shape: tuple[int, int] | None = None,
     coordinate_dtype: Any | None = None,
-    metadata_columns: Sequence[str] | None = None,
-    cell_data: zarr.Group | None = None,
-    named_result: str | None = None,
     block_rows: int = 100_000,
     invalidate_cache: bool = False,
 ) -> ArtifactRef:
     storage = ImportedArtifactStorage(root)
-    _recoverable_import_state(root, assay)
     if not isinstance(role, str):
         raise TypeError("role must be a string")
     normalized_role = role.lower()
@@ -924,10 +745,9 @@ def write_imported_embedding(
         block_rows=block_rows,
     )
     _validate_numeric_source(source, "coordinates", 2)
-    selection, _selected_count, ordered_cell_ids_fingerprint = _selection_alignment(
+    _selection, _selected_count, ordered_cell_ids_fingerprint = _selection_alignment(
         root,
         cell_selection=cell_selection,
-        cell_key=cell_key,
         source_cell_ids=source_cell_ids,
         coordinate_rows=source.shape[0],
         block_rows=block_rows,
@@ -950,10 +770,7 @@ def write_imported_embedding(
             "ordered_cell_ids_fingerprint": ordered_cell_ids_fingerprint,
             "cell_selection": cell_selection,
         },
-        execution_options={
-            "cell_key": cell_key,
-            "block_rows": block_rows,
-        },
+        execution_options={"block_rows": block_rows},
         invalidate_cache=invalidate_cache,
         required_arrays=(
             storage.requirement("values", shape=source.shape, dtype_kind="f"),
@@ -976,40 +793,5 @@ def write_imported_embedding(
             block_rows,
         )
         storage.finish(group, planned)
-    validate_imported_embedding_artifact(
-        root,
-        planned.ref,
-        cell_key=cell_key,
-    )
-    resolved_cell_data = cell_data
-    if resolved_cell_data is None and "cellData" in root:
-        resolved_cell_data = storage.as_group(root["cellData"], "cellData")
-    if resolved_cell_data is not None:
-        columns = (
-            tuple(metadata_columns)
-            if metadata_columns is not None
-            else _default_embedding_columns(
-                assay,
-                cell_key,
-                normalized_role,
-                int(source.shape[1]),
-            )
-        )
-        _publish_embedding_columns(
-            root,
-            planned.ref,
-            selection=selection,
-            columns=columns,
-            cell_data=resolved_cell_data,
-            block_rows=block_rows,
-        )
-    elif metadata_columns is not None:
-        raise ValueError("cell_data is required when metadata_columns are provided")
-    if named_result is not None:
-        _register_named_result(
-            root,
-            planned.ref,
-            named_result,
-            cell_key=cell_key,
-        )
+    validate_imported_embedding_artifact(root, planned.ref)
     return planned.ref

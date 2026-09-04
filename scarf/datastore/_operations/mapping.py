@@ -16,6 +16,7 @@ from ...storage.artifacts import (
 )
 from ...storage.types import as_zarr_array
 from ...assay import RNAassay
+from ...mapping.artifact import validate_mapping_reference_binding
 from ...mapping.features import AlignedFeatureStream
 from ...mapping.models import MappingResult
 from ...mapping.projection import (
@@ -23,7 +24,6 @@ from ...mapping.projection import (
     ProjectionWriter,
     load_projection,
     plan_projection,
-    resolve_projection,
 )
 from ...mapping.reference import MappingReference
 from ...mapping.symphony import (
@@ -44,6 +44,10 @@ from ...neighbors.stages import (
 from ...storage.ann_index import has_ann_index, load_ann_index
 from ...storage.geometry import array_geometry
 from ...storage.partition import row_band
+from ...storage.selections import (
+    read_stored_selection_indices,
+    validate_stored_selection_integrity,
+)
 from ...storage.stores import zarr_root_path
 from ...utils.logging import logger
 from ...storage.feature_selection import (
@@ -199,6 +203,7 @@ def _mapping_memory_reservations(
 def _reference_available_k(reference: MappingReference) -> int:
     root = reference.datastore.zw
     rebuild = "Rebuild it with build_mapping_reference(neighbors)."
+    reference.validate_frozen_axes()
     if reference.ref.assay != reference.assay_name:
         raise ValueError(f"Mapping reference assay identity is inconsistent. {rebuild}")
     if reference.model.n_features != len(reference.feature_ids):
@@ -315,26 +320,24 @@ class _MappingOperationsMixin(_MappingOperationsBase):
     def run_mapping(
         self,
         reference: MappingReference,
-        mapping_name: str,
+        cell_selection: ArtifactRef,
         *,
         query_assay: str | None = None,
-        cell_key: str = "I",
         save_k: int = 3,
         missing_feature_policy: str = "reference_mean",
         query_batches: pd.DataFrame | None = None,
         invalidate_cache: bool = False,
-    ) -> MappingResult:
+    ) -> ArtifactRef:
         """Map selected query cells into an immutable prepared reference."""
         if not isinstance(reference, MappingReference):
             raise TypeError("reference must be a MappingReference")
-        if not isinstance(mapping_name, str) or not mapping_name.strip():
-            raise TypeError("mapping_name must be a non-empty string")
+        reference = validate_mapping_reference_binding(reference)
+        if not isinstance(cell_selection, ArtifactRef):
+            raise TypeError("cell_selection must be an ArtifactRef")
         if query_assay is not None and (
             not isinstance(query_assay, str) or not query_assay.strip()
         ):
             raise TypeError("query_assay must be a non-empty string or None")
-        if not isinstance(cell_key, str) or not cell_key.strip():
-            raise TypeError("cell_key must be a non-empty string")
         if isinstance(save_k, bool) or not isinstance(save_k, int | np.integer):
             raise TypeError("save_k must be an integer")
         save_k = int(save_k)
@@ -367,19 +370,25 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         assay = self._get_assay(assay_name)
         if not isinstance(assay, RNAassay):
             raise TypeError("Mapping currently supports RNA query assays only")
-        from ...graph.state import read_assay_state_document
-
-        read_assay_state_document(self.zw, assay_name)
-
-        cell_mask = np.asarray(self.cells.fetch_all(cell_key))
-        if cell_mask.ndim != 1 or cell_mask.dtype != np.dtype(bool):
-            raise TypeError("cell_key must identify a one-dimensional boolean column")
-        if len(cell_mask) != self.cells.N:
-            raise ValueError("cell_key does not align with query cell metadata")
-        query_cell_indices = np.flatnonzero(cell_mask).astype(np.int64, copy=False)
-        n_cells = len(query_cell_indices)
+        validated_cells = validate_stored_selection_integrity(
+            self.zw,
+            cell_selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
+        )
+        query_cell_indices = read_stored_selection_indices(
+            self.zw,
+            cell_selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
+        ).astype(np.int64, copy=False)
+        n_cells = validated_cells.selected_count
         if n_cells < 1:
-            raise ValueError("cell_key must select at least one query cell")
+            raise ValueError("cell_selection must select at least one query cell")
 
         symphony_state = reference.symphony_state
         if symphony_state is None:
@@ -398,6 +407,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 n_batches = 1
                 query_batch_fingerprint = NO_QUERY_BATCH_FINGERPRINT
             else:
+                query_batches = query_batches.copy(deep=True)
                 batch_codes, n_batches = self._query_batch_codes(
                     query_batches,
                     n_cells,
@@ -417,6 +427,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             save_k=save_k,
             batch_codes=batch_codes,
         )
+        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay)
         stream = AlignedFeatureStream(
             query_assay=assay,
             query_cell_indices=query_cell_indices,
@@ -428,13 +439,15 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             reserved_resident_bytes=reserved_resident,
             reserved_per_row_bytes=reserved_per_row,
         )
+        if _ordered_feature_ids_fingerprint(assay) != feature_ids_fingerprint:
+            raise ValueError("Query feature identities changed during mapping setup")
         selected_expression_fingerprint = stream.raw_expression_fingerprint
 
-        cell_selection = self._ensure_cell_selection(cell_key)
-        all_features = cast(Any, self)._ensure_all_features(assay)
+        all_features = cast(Any, self).select_all_features(
+            from_assay=assay.name,
+        )
         feature_mask = np.zeros(assay.feats.N, dtype=bool)
         feature_mask[stream.query_feature_indices] = True
-        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay)
         selection_plan = _feature_selection_plan(
             self.zw,
             assay=assay_name,
@@ -459,7 +472,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         projection_plan = plan_projection(
             self.zw,
             query_assay=assay_name,
-            mapping_name=mapping_name,
             n_cells=n_cells,
             save_k=save_k,
             missing_feature_policy=missing_feature_policy,
@@ -468,16 +480,14 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             feature_selection=feature_selection,
             selected_expression_fingerprint=selected_expression_fingerprint,
             query_batch_fingerprint=query_batch_fingerprint,
+            query_batch_count=n_batches,
             mapping_reference=reference.external_ref,
+            reference=reference,
             reference_cell_count=reference.selected_cell_count,
             invalidate_cache=invalidate_cache,
         )
         if projection_plan.reused:
-            return load_projection(
-                self.zw,
-                projection_plan.ref,
-                reference=reference,
-            )
+            return projection_plan.ref
 
         writer = ProjectionWriter(
             self.zw,
@@ -574,6 +584,23 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 expected_start = block.row_offset + len(coordinates)
             if expected_start != n_cells:
                 raise RuntimeError("Mapping did not cover all selected query cells")
+            if (
+                stream.fingerprint_live_raw_expression()
+                != selected_expression_fingerprint
+            ):
+                raise ValueError("Query expression changed during mapping")
+            if _ordered_feature_ids_fingerprint(assay) != feature_ids_fingerprint:
+                raise ValueError("Query feature identities changed during mapping")
+            final_cells = validate_stored_selection_integrity(
+                self.zw,
+                cell_selection,
+                kind="cell_selection",
+                scope="datastore",
+                assay=None,
+                table_path="cellData",
+            )
+            if final_cells.selected_count != n_cells:
+                raise ValueError("Query cell selection changed during mapping")
             denominator = informative_total * reference.model.n_features
             writer.finish(
                 {
@@ -590,11 +617,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             if not writer.finished:
                 writer.abort()
             raise
-        return load_projection(
-            self.zw,
-            projection_plan.ref,
-            reference=reference,
-        )
+        return projection_plan.ref
 
     @staticmethod
     def _query_batch_codes(
@@ -623,21 +646,43 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         threshold_fraction: float,
         na_val: str,
         force_unknown: bool = False,
+        reference_label_valid: np.ndarray | None = None,
     ) -> tuple[Any, float, float, float, bool, dict[Any, float]]:
+        if reference_label_valid is not None and reference_label_valid.shape != (
+            len(reference_labels),
+        ):
+            raise ValueError("reference label validity must align with labels")
         votes: dict[Any, float] = {}
         for neighbor, weight in zip(neighbors, weights):
+            if (
+                reference_label_valid is not None
+                and not reference_label_valid[neighbor]
+            ):
+                continue
             label = reference_labels[neighbor]
             votes[label] = votes.get(label, 0.0) + float(weight)
-        total = float(sum(votes.values()))
-        if total <= 0 or not votes:
+        labeled_total = float(sum(votes.values()))
+        if labeled_total <= 0 or not votes:
             return na_val, 0.0, 0.0, 0.0, True, {}
+        total = (
+            float(np.sum(weights, dtype=np.float64))
+            if reference_label_valid is not None
+            else labeled_total
+        )
+        if total <= 0:
+            return na_val, 0.0, 0.0, 0.0, True, {}
+        conditional_votes = {
+            label: value / labeled_total for label, value in votes.items()
+        }
         votes = {label: value / total for label, value in votes.items()}
         ordered = sorted(votes.items(), key=lambda item: item[1], reverse=True)
         top_vote = ordered[0][1]
         second_vote = ordered[1][1] if len(ordered) > 1 else 0.0
         winners = [label for label, vote in ordered if np.isclose(vote, top_vote)]
         is_unknown = force_unknown or top_vote < threshold_fraction or len(winners) != 1
-        entropy = -sum(value * np.log(value) for _, value in ordered if value > 0)
+        entropy = -sum(
+            value * np.log(value) for value in conditional_votes.values() if value > 0
+        )
         prediction = na_val if is_unknown else winners[0]
         return (
             prediction,
@@ -650,73 +695,31 @@ class _MappingOperationsMixin(_MappingOperationsBase):
 
     def get_mapping_result(
         self,
-        result: MappingResult | ArtifactRef | str,
+        result: ArtifactRef,
         *,
-        reference: MappingReference | None = None,
-        query_assay: str | None = None,
+        reference: MappingReference,
         load_arrays: bool = False,
     ) -> MappingResult:
         """Load one complete query-owned mapping projection."""
-        if reference is not None and not isinstance(reference, MappingReference):
-            raise TypeError("reference must be a MappingReference or None")
-        if query_assay is not None and not isinstance(result, str):
-            raise ValueError("query_assay is only valid when result is a string")
-
-        projection_ref: ArtifactRef
-        session_reference: MappingReference | None = None
-        if isinstance(result, MappingResult):
-            projection_ref = result.ref
-            session_reference = result.reference
-        elif isinstance(result, ArtifactRef):
-            projection_ref = result
-        elif isinstance(result, str):
-            if not result.strip():
-                raise TypeError("result must be a non-empty mapping name")
-        else:
-            raise TypeError(
-                "result must be a MappingResult, ArtifactRef, or mapping name"
-            )
-
-        if reference is not None and session_reference is not None:
-            if reference.external_ref != session_reference.external_ref:
-                raise ValueError(
-                    "Explicit reference does not match the MappingResult "
-                    "reference handle"
-                )
-        resolved_reference = reference or session_reference
-        if resolved_reference is None:
-            raise ValueError(
-                "A MappingReference is required unless result is an in-session "
-                "MappingResult carrying its reference"
-            )
-
-        if isinstance(result, str):
-            assay_name = query_assay or self._defaultAssay
-            if assay_name is None:
-                raise ValueError(
-                    "query_assay is required when the query store has no default assay"
-                )
-            projection_ref = resolve_projection(
-                self.zw,
-                query_assay=assay_name,
-                mapping_name=result,
-                mapping_reference=resolved_reference.external_ref,
-            )
+        if not isinstance(result, ArtifactRef):
+            raise TypeError("result must be an ArtifactRef")
+        if not isinstance(reference, MappingReference):
+            raise TypeError("reference must be a MappingReference")
+        reference = validate_mapping_reference_binding(reference)
 
         return load_projection(
             self.zw,
-            projection_ref,
+            result,
             load_arrays=load_arrays,
-            reference=resolved_reference,
+            reference=reference,
         )
 
     def get_mapping_score(
         self,
-        result: MappingResult | ArtifactRef | str,
+        result: ArtifactRef,
         target_groups: np.ndarray | None = None,
         *,
-        reference: MappingReference | None = None,
-        query_assay: str | None = None,
+        reference: MappingReference,
         log_transform: bool = True,
         multiplier: float = 1000,
         weighted: bool = True,
@@ -742,10 +745,8 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         loaded = self.get_mapping_result(
             result,
             reference=reference,
-            query_assay=query_assay,
             load_arrays=False,
         )
-        assert loaded.reference is not None
         indices, distances, uninformative = self._projection_arrays(loaded.ref)
         n_cells = loaded.n_cells
         n_k = int(indices.shape[1])
@@ -808,11 +809,10 @@ class _MappingOperationsMixin(_MappingOperationsBase):
 
     def get_target_classes(
         self,
-        result: MappingResult | ArtifactRef | str,
+        result: ArtifactRef,
         reference_class_group: str,
         *,
-        reference: MappingReference | None = None,
-        query_assay: str | None = None,
+        reference: MappingReference,
         threshold_fraction: float = 0.5,
         target_subset: list[int] | None = None,
         na_val: str = "NA",
@@ -832,12 +832,12 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         loaded = self.get_mapping_result(
             result,
             reference=reference,
-            query_assay=query_assay,
             load_arrays=False,
         )
-        assert loaded.reference is not None
         indices, distances, uninformative = self._projection_arrays(loaded.ref)
-        reference_labels = loaded.reference.fetch_cell_column(reference_class_group)
+        reference_labels, reference_label_valid = loaded.reference._fetch_cell_labels(
+            reference_class_group
+        )
 
         target_subset_set: dict[int, None] | None = None
         if target_subset is not None:
@@ -904,6 +904,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                         informative_weights[informative_position],
                         threshold,
                         na_val,
+                        reference_label_valid=reference_label_valid,
                     )
                     informative_position += 1
                 preds.append(prediction)
@@ -912,11 +913,10 @@ class _MappingOperationsMixin(_MappingOperationsBase):
 
     def get_target_label_evidence(
         self,
-        result: MappingResult | ArtifactRef | str,
+        result: ArtifactRef,
         reference_class_group: str,
         *,
-        reference: MappingReference | None = None,
-        query_assay: str | None = None,
+        reference: MappingReference,
         threshold_fraction: float = 0.5,
         na_val: str = "NA",
         max_distance: float | None = None,
@@ -951,31 +951,43 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         loaded = self.get_mapping_result(
             result,
             reference=reference,
-            query_assay=query_assay,
             load_arrays=False,
         )
-        assert loaded.reference is not None
         indices, distances, uninformative = self._projection_arrays(loaded.ref)
-        reference_labels = loaded.reference.fetch_cell_column(reference_class_group)
-        class_labels = np.asarray(pd.unique(reference_labels), dtype=object)
+        reference_labels, reference_label_valid = loaded.reference._fetch_cell_labels(
+            reference_class_group
+        )
+        class_labels = np.asarray(
+            pd.unique(reference_labels[reference_label_valid]),
+            dtype=object,
+        )
         class_positions = {
             label: position for position, label in enumerate(class_labels)
         }
 
-        from ...mapping.confidence import distance_weights
+        from ...mapping.confidence import (
+            _conformal_membership,
+            _validated_conformal_calibration,
+            distance_weights,
+        )
+
+        prepared_calibration: np.ndarray | None = None
+        resolved_conformal_alpha = 0.0
+        if calibration_nonconformity is not None:
+            prepared_calibration, resolved_conformal_alpha = (
+                _validated_conformal_calibration(
+                    calibration_nonconformity,
+                    conformal_alpha,
+                )
+            )
 
         predictions = np.full(loaded.n_cells, na_val, dtype=object)
         vote_fraction = np.full(loaded.n_cells, np.nan, dtype=np.float64)
         vote_entropy = np.full(loaded.n_cells, np.nan, dtype=np.float64)
         top_two_margin = np.full(loaded.n_cells, np.nan, dtype=np.float64)
         best_distances = np.full(loaded.n_cells, np.nan, dtype=np.float64)
-        label_scores = (
-            np.zeros(
-                (loaded.n_cells, len(class_labels)),
-                dtype=np.float64,
-            )
-            if calibration_nonconformity is not None
-            else None
+        prediction_sets: list[tuple[Any, ...]] | None = (
+            [()] * loaded.n_cells if prepared_calibration is not None else None
         )
         is_unknown = np.ones(loaded.n_cells, dtype=bool)
         block_size = self._projection_block_size(indices)
@@ -1006,6 +1018,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                     block_weights[position],
                     threshold,
                     na_val,
+                    reference_label_valid=reference_label_valid,
                 )
                 best_distance = float(block_distances[position, 0])
                 if distance_limit is not None and best_distance > distance_limit:
@@ -1017,9 +1030,19 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 top_two_margin[row_index] = margin
                 best_distances[row_index] = best_distance
                 is_unknown[row_index] = row_unknown
-                if label_scores is not None:
+                if prediction_sets is not None and votes:
+                    assert prepared_calibration is not None
+                    label_scores = np.zeros(len(class_labels), dtype=np.float64)
                     for label, score in votes.items():
-                        label_scores[row_index, class_positions[label]] = score
+                        label_scores[class_positions[label]] = score
+                    prediction_mask = _conformal_membership(
+                        label_scores,
+                        prepared_calibration,
+                        resolved_conformal_alpha,
+                    )
+                    prediction_sets[row_index] = tuple(
+                        class_labels[prediction_mask].tolist()
+                    )
 
         distance_quantiles = loaded.reference.reference_distance_quantiles
         distance_values = loaded.reference.reference_distance_values
@@ -1057,19 +1080,8 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 "isUnknown": is_unknown,
             }
         )
-        if calibration_nonconformity is not None:
-            from ...mapping.confidence import conformal_prediction_sets
-
-            assert label_scores is not None
-            prediction_masks = conformal_prediction_sets(
-                label_scores,
-                calibration_nonconformity,
-                alpha=conformal_alpha,
-            )
-            evidence["predictionSet"] = [
-                tuple(class_labels[mask].tolist()) if informative[row_index] else ()
-                for row_index, mask in enumerate(prediction_masks)
-            ]
+        if prediction_sets is not None:
+            evidence["predictionSet"] = prediction_sets
         return evidence
 
     @staticmethod
@@ -1079,18 +1091,35 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         target_coverage: float = 0.9,
     ) -> dict[str, float]:
         """Choose a vote threshold on held-out, donor-level validation data."""
-        fractions = np.asarray(vote_fractions, dtype=np.float64)
-        correct = np.asarray(correct, dtype=bool)
-        if fractions.ndim != 1 or correct.shape != fractions.shape:
+        raw_fractions = np.asarray(vote_fractions)
+        raw_correct = np.asarray(correct)
+        if raw_fractions.ndim != 1 or raw_correct.shape != raw_fractions.shape:
             raise ValueError("vote_fractions and correct must be matching vectors")
-        if not 0 < target_coverage <= 1:
-            raise ValueError("target_coverage must be in (0, 1]")
-        valid = fractions[correct]
+        if raw_fractions.dtype.kind not in {"i", "u", "f"}:
+            raise ValueError("vote_fractions must be real numeric values in [0, 1]")
+        if raw_correct.dtype != np.dtype(bool):
+            raise ValueError("correct must be a boolean vector")
+        fractions = np.asarray(raw_fractions, dtype=np.float64)
+        if (
+            not np.all(np.isfinite(fractions))
+            or np.any(fractions < 0)
+            or np.any(fractions > 1)
+        ):
+            raise ValueError("vote_fractions must be finite values in [0, 1]")
+        coverage = _finite_in_range(
+            target_coverage,
+            "target_coverage must be in (0, 1]",
+            low=0.0,
+            high=1.0,
+            low_open=True,
+        )
+        correct_values = np.asarray(raw_correct, dtype=bool)
+        valid = fractions[correct_values]
         if valid.size == 0:
             raise ValueError("At least one correct held-out prediction is required")
-        threshold = float(np.quantile(valid, 1 - target_coverage))
+        threshold = float(np.quantile(valid, 1 - coverage))
         selected = fractions >= threshold
-        accuracy = float(correct[selected].mean()) if selected.any() else 0.0
+        accuracy = float(correct_values[selected].mean()) if selected.any() else 0.0
         return {
             "voteThreshold": threshold,
             "validationCoverage": float(selected.mean()),

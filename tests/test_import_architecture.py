@@ -365,13 +365,28 @@ assert not any(
 
 def test_algorithm_domains_do_not_import_orchestration_or_io():
     # storage.refs holds the artifact reference value type and reads no store,
-    # so results that a caller persists may name it.
-    forbidden = {"datastore", "plotting", "readers", "storage", "writers"}
-    allowed = frozenset({"storage.refs"})
+    # so results that a caller persists may name it. Imported-embedding
+    # persistence is the one honest embeddings-to-storage adapter. Trajectory
+    # artifact contracts are the corresponding narrow persistence adapter for
+    # validating domain payloads without moving their semantics into DataStore.
+    forbidden = {"datastore", "plotting", "readers", "writers"}
+    storage_exceptions = {
+        "clustering": set(),
+        "embeddings": {"imported_storage.py"},
+        "trajectory": {"artifacts.py"},
+    }
     for package_name in ("clustering", "embeddings", "trajectory"):
         package_root = _SCARF_ROOT / package_name
         if package_root.is_dir():
-            assert _upward_imports(package_name, forbidden, allowed) == set()
+            assert _upward_imports(package_name, forbidden) == set()
+            storage_edges = _upward_imports(
+                package_name,
+                {"storage"},
+                frozenset({"storage.refs"}),
+            )
+            assert {path for path, _target in storage_edges} == storage_exceptions[
+                package_name
+            ]
     assert {path for path, _target in _upward_imports("clustering", {"storage"})} == {
         "paris_multiscale.py"
     }
@@ -581,6 +596,7 @@ def test_compatibility_only_modules_are_removed():
         _SCARF_ROOT / "clustering" / "_paris_mdl.py",
         _SCARF_ROOT / "clustering" / "feature_graph.py",
         _SCARF_ROOT / "clustering" / "hierarchy.py",
+        _SCARF_ROOT / "graph" / "imported_storage.py",
         _SCARF_ROOT / "parallel.py",
         _SCARF_ROOT / "plotting" / "unified.py",
         _SCARF_ROOT / "results.py",
@@ -609,6 +625,7 @@ def test_retired_root_import_paths_do_not_resolve():
         "scarf.clustering.feature_graph",
         "scarf.clustering.hierarchy",
         "scarf.features.lowess",
+        "scarf.graph.imported_storage",
         "scarf.trajectory.aggregation",
         "scarf.lineage",
     ):
@@ -1077,9 +1094,47 @@ def test_datastore_operation_mixins_are_runtime_isolated():
     assert all(mixin.__bases__ == (object,) for mixin in mixins)
 
 
-def test_assay_graph_path_grammar_is_centralized():
-    encoded_paths = _SCARF_ROOT / "graph" / "encoded_paths.py"
-    path_markers = ("normed__", "reduction__", "ann__", "knn__", "graph__")
+def test_analytical_producers_do_not_mutate_live_metadata():
+    """Keep analytical results behind immutable refs at the module boundary."""
+    operation_paths = sorted((_SCARF_ROOT / "datastore" / "_operations").glob("*.py"))
+    producer_paths = [
+        *operation_paths,
+        _SCARF_ROOT / "embeddings" / "imported.py",
+    ]
+    forbidden_helpers = {
+        "link_cell_data_column",
+        "link_feature_data_column",
+        "publish_feature_selection_alias",
+    }
+    forbidden_table_methods = {"drop", "insert", "reset_key", "update_key"}
+    violations: list[tuple[str, int, str]] = []
+
+    for path in producer_paths:
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            parts = _attribute_parts(node.func)
+            if not parts:
+                continue
+            called = parts[-1]
+            if called in forbidden_helpers or (
+                len(parts) >= 2
+                and parts[-2] in {"cells", "feats"}
+                and called in forbidden_table_methods
+            ):
+                violations.append(
+                    (
+                        path.relative_to(_SCARF_ROOT).as_posix(),
+                        node.lineno,
+                        ".".join(parts),
+                    )
+                )
+
+    assert violations == []
+
+
+def test_graph_latest_pointer_reads_are_absent():
     pointer_names = {
         "latest_reduction",
         "latest_ann",
@@ -1090,36 +1145,9 @@ def test_assay_graph_path_grammar_is_centralized():
     violations: list[tuple[str, int, str]] = []
 
     for path in _SCARF_ROOT.rglob("*.py"):
-        if path == encoded_paths:
-            continue
         tree = ast.parse(path.read_text(), filename=str(path))
-        docstring_constants = {
-            id(owner.body[0].value)
-            for owner in ast.walk(tree)
-            if isinstance(
-                owner,
-                ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
-            )
-            and owner.body
-            and isinstance(owner.body[0], ast.Expr)
-            and isinstance(owner.body[0].value, ast.Constant)
-            and isinstance(owner.body[0].value.value, str)
-        }
         for node in ast.walk(tree):
             if (
-                isinstance(node, ast.Constant)
-                and isinstance(node.value, str)
-                and id(node) not in docstring_constants
-                and any(marker in node.value for marker in path_markers)
-            ):
-                violations.append(
-                    (
-                        path.relative_to(_SCARF_ROOT).as_posix(),
-                        node.lineno,
-                        "path construction",
-                    )
-                )
-            elif (
                 isinstance(node, ast.Subscript)
                 and isinstance(node.ctx, ast.Load)
                 and isinstance(node.slice, ast.Constant)

@@ -10,15 +10,12 @@ import pytest
 from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from scipy.sparse import csr_matrix
-import zarr
-from zarr.storage import MemoryStore
 
 from scarf.agent import CovariateCharacterization, characterize_covariates
 from scarf.agent.characterize_covariates import (
     _Run,
     _assign_domain,
     _characterize_coefficient,
-    _has_source_artifact,
     _infer_kind,
     _is_embedding_column,
     _profile_column,
@@ -29,8 +26,9 @@ from scarf.agent.characterize_covariates import (
     _validate_directions,
 )
 from scarf.agent.decide import DecisionValidationError
-from scarf.agent.types import Decision, EvidenceItem
+from scarf.agent.types import ArtifactReferenceModel, Decision, EvidenceItem
 from scarf.datastore.datastore import DataStore
+from scarf.storage import ArtifactRef, ArtifactResolutionError
 from scarf.writers import SparseToZarr
 
 
@@ -132,8 +130,10 @@ def test_embedding_column_name_patterns() -> None:
 
 def test_characterize_covariates_directions_only(tmp_path: Path) -> None:
     store = _store_with_design(tmp_path)
+    cell_selection = store.snapshot_cell_selection("I")
     result = characterize_covariates(
         store,
+        cellSelection=cell_selection,
         studyContext="Case/control retina study across two donors.",
         model=None,
         directions={
@@ -156,6 +156,9 @@ def test_characterize_covariates_directions_only(tmp_path: Path) -> None:
     )
     assert isinstance(result, CovariateCharacterization)
     assert result.status == "done"
+    assert result.cellSelection == ArtifactReferenceModel.from_artifact_ref(
+        cell_selection
+    )
     names = {column["name"]: column for column in result.columns}
     assert names["disease"]["aliases"] == ["disease_ontology_term_id"]
     assert "disease_ontology_term_id" not in {
@@ -214,11 +217,16 @@ def test_characterize_covariates_directions_only(tmp_path: Path) -> None:
 
 def test_characterize_covariates_invalid_direction_fails(tmp_path: Path) -> None:
     store = _store_with_design(tmp_path)
+    cell_selection = store.snapshot_cell_selection("I")
     result = characterize_covariates(
         store,
+        cellSelection=cell_selection,
         directions={"columnDomains": {"not_a_column": "biological"}},
     )
     assert result.status == "failed"
+    assert result.cellSelection == ArtifactReferenceModel.from_artifact_ref(
+        cell_selection
+    )
     assert any("unknown columns" in note for note in result.notes)
 
 
@@ -226,8 +234,10 @@ def test_characterize_covariates_rejects_unsupported_domain_value(
     tmp_path: Path,
 ) -> None:
     store = _store_with_design(tmp_path)
+    cell_selection = store.snapshot_cell_selection("I")
     result = characterize_covariates(
         store,
+        cellSelection=cell_selection,
         directions={"columnDomains": {"batch": "nuisance"}},
     )
     assert result.status == "failed"
@@ -236,7 +246,8 @@ def test_characterize_covariates_rejects_unsupported_domain_value(
 
 def test_characterize_covariates_stays_headless_without_model(tmp_path: Path) -> None:
     store = _store_with_design(tmp_path)
-    result = characterize_covariates(store)
+    cell_selection = store.snapshot_cell_selection("I")
+    result = characterize_covariates(store, cellSelection=cell_selection)
     assert result.status == "done"
     assert result.decisions == []
     assert result.coefficients == []
@@ -249,6 +260,7 @@ def test_characterize_covariates_stays_headless_without_model(tmp_path: Path) ->
 
 def test_characterize_covariates_function_model_path(tmp_path: Path) -> None:
     store = _store_with_design(tmp_path)
+    cell_selection = store.snapshot_cell_selection("I")
     answers = {
         "Assign a domain for cell metadata column donor": Decision(
             selectedId="domain:design",
@@ -318,6 +330,7 @@ def test_characterize_covariates_function_model_path(tmp_path: Path) -> None:
     }
     result = characterize_covariates(
         store,
+        cellSelection=cell_selection,
         studyContext="Case control across donors.",
         model=_function_model(answers),
     )
@@ -342,9 +355,11 @@ def test_characterize_covariates_function_model_path(tmp_path: Path) -> None:
 
 def test_characterize_covariates_does_not_mutate_store(tmp_path: Path) -> None:
     store = _store_with_design(tmp_path)
+    cell_selection = store.snapshot_cell_selection("I")
     before = list(store.cells.columns)
     result = characterize_covariates(
         store,
+        cellSelection=cell_selection,
         directions={
             "columnDomains": {"disease": "biological", "batch": "technical"},
             "coefficientsOfInterest": ["disease"],
@@ -358,8 +373,10 @@ def test_characterize_covariates_does_not_mutate_store(tmp_path: Path) -> None:
 def test_characterize_covariates_rejects_finer_independent_unit(tmp_path: Path) -> None:
     """Independent unit must be coarser than observation unit, never finer."""
     store = _store_with_design(tmp_path)
+    cell_selection = store.snapshot_cell_selection("I")
     result = characterize_covariates(
         store,
+        cellSelection=cell_selection,
         directions={
             "columnDomains": {
                 "donor": "design",
@@ -388,8 +405,10 @@ def test_characterize_covariates_drops_directed_constant_coefficient(
     tmp_path: Path,
 ) -> None:
     store = _store_with_design(tmp_path)
+    cell_selection = store.snapshot_cell_selection("I")
     result = characterize_covariates(
         store,
+        cellSelection=cell_selection,
         directions={
             "columnDomains": {"protocol": "technical", "disease": "biological"},
             "coefficientsOfInterest": ["protocol", "disease"],
@@ -415,8 +434,10 @@ def test_characterize_covariates_rejects_vacuous_cell_id_unit(tmp_path: Path) ->
     store = _store_with_design(tmp_path)
     cell_ids = store.cells.fetch_all("ids")
     store.cells.insert("barcode", cell_ids, overwrite=True)
+    cell_selection = store.snapshot_cell_selection("I")
     result = characterize_covariates(
         store,
+        cellSelection=cell_selection,
         directions={
             "columnDomains": {
                 "barcode": "design",
@@ -447,8 +468,10 @@ def test_characterize_covariates_rejects_auto_unique_per_cell_unit(
     store.cells.insert(
         "barcode", np.array([f"bc{i}" for i in range(n)]), overwrite=True
     )
+    cell_selection = store.snapshot_cell_selection("I")
     result = characterize_covariates(
         store,
+        cellSelection=cell_selection,
         directions={
             "columnDomains": {
                 "barcode": "design",
@@ -463,14 +486,17 @@ def test_characterize_covariates_rejects_auto_unique_per_cell_unit(
     assert coeff["scope"] == "unresolvedUnit"
 
 
-def test_characterize_covariates_respects_subset_cell_key(tmp_path: Path) -> None:
+def test_characterize_covariates_respects_subset_cell_selection(
+    tmp_path: Path,
+) -> None:
     store = _store_with_design(tmp_path)
     keep = np.zeros(store.cells.N, dtype=bool)
     keep[:6] = True  # donor d1 only; disease is constant (case)
     store.cells.insert("subset", keep, overwrite=True)
+    cell_selection = store.snapshot_cell_selection("subset")
     result = characterize_covariates(
         store,
-        cellKey="subset",
+        cellSelection=cell_selection,
         directions={
             "columnDomains": {
                 "donor": "design",
@@ -483,6 +509,9 @@ def test_characterize_covariates_respects_subset_cell_key(tmp_path: Path) -> Non
         },
     )
     assert result.status == "done"
+    assert result.cellSelection == ArtifactReferenceModel.from_artifact_ref(
+        cell_selection
+    )
     assert "disease" not in {item["name"] for item in result.coefficients}
     assert any(
         entry["kind"].startswith("drop") and entry.get("column") == "disease"
@@ -497,12 +526,16 @@ def test_characterize_covariates_avoids_bulk_metadata_loads(
     tmp_path: Path, monkeypatch
 ) -> None:
     store = _store_with_design(tmp_path)
+    cell_selection = store.snapshot_cell_selection("I")
+    characterize_covariates_module = import_module(
+        "scarf.agent.characterize_covariates"
+    )
     original_fetch = store.cells.fetch
     original_fetch_all = store.cells.fetch_all
-    original_blocks = store.cells.iter_row_blocks
+    original_read_rows = characterize_covariates_module.read_metadata_rows_chunkwise
     inside_fetch = False
     direct_full_fetches: list[str] = []
-    block_widths: list[int] = []
+    chunkwise_columns: list[str] = []
 
     def reject_frame(*_args, **_kwargs):
         raise AssertionError("characterization must not build a cell-level dataframe")
@@ -520,21 +553,21 @@ def test_characterize_covariates_avoids_bulk_metadata_loads(
             direct_full_fetches.append(column)
         return original_fetch_all(column)
 
-    def blocks_spy(*, cell_key="I", columns=None, block_rows=None):
-        names = tuple(columns or ())
-        block_widths.append(len(names))
-        return original_blocks(
-            cell_key=cell_key,
-            columns=names,
-            block_rows=block_rows,
-        )
+    def read_rows_spy(metadata, column: str, rows: np.ndarray):
+        chunkwise_columns.append(column)
+        return original_read_rows(metadata, column, rows)
 
     monkeypatch.setattr(store.cells, "to_pandas_dataframe", reject_frame)
     monkeypatch.setattr(store.cells, "fetch", fetch_spy)
     monkeypatch.setattr(store.cells, "fetch_all", fetch_all_spy)
-    monkeypatch.setattr(store.cells, "iter_row_blocks", blocks_spy)
+    monkeypatch.setattr(
+        characterize_covariates_module,
+        "read_metadata_rows_chunkwise",
+        read_rows_spy,
+    )
     result = characterize_covariates(
         store,
+        cellSelection=cell_selection,
         directions={
             "columnDomains": {
                 "donor": "design",
@@ -553,8 +586,7 @@ def test_characterize_covariates_avoids_bulk_metadata_loads(
     )
     assert result.status == "done"
     assert direct_full_fetches == []
-    assert block_widths
-    assert max(block_widths) < len(store.cells.columns)
+    assert chunkwise_columns
 
 
 @pytest.mark.parametrize(
@@ -645,28 +677,17 @@ def test_covariate_kind_and_summary_handle_non_numeric_and_nonfinite_values() ->
     )
 
 
-def test_source_artifact_detection_and_triage_use_metadata_links() -> None:
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    cell_data = root.create_group("cellData")
-    derived = cell_data.create_array("derived", shape=(2,), dtype="f8")
-    derived.attrs["source_artifact"] = {"artifact_id": "artifact-1"}
+def test_triage_treats_non_assay_metadata_as_user_owned() -> None:
     store = SimpleNamespace(
-        zw=root,
         assay_names=["RNA"],
         cells=SimpleNamespace(
             columns=["I", "RNA_nCounts", "derived", "donor"],
         ),
     )
 
-    assert _has_source_artifact(store, "derived")
-    assert not _has_source_artifact(store, "missing")
-    assert not _has_source_artifact(SimpleNamespace(zw={}), "derived")
     candidates, dropped = _triage_columns(store, cell_key="I", exclude=set())
-    assert candidates == ["donor"]
-    assert dropped == [
-        ("RNA_nCounts", "dropAssayStat"),
-        ("derived", "dropProvenance"),
-    ]
+    assert candidates == ["derived", "donor"]
+    assert dropped == [("RNA_nCounts", "dropAssayStat")]
 
 
 def test_assign_domain_rejects_unsupported_mock_choice(monkeypatch) -> None:
@@ -747,8 +768,10 @@ def test_characterize_covariates_auto_selects_single_observation_unit(
     tmp_path: Path,
 ) -> None:
     store = _store_with_design(tmp_path)
+    cell_selection = store.snapshot_cell_selection("I")
     result = characterize_covariates(
         store,
+        cellSelection=cell_selection,
         directions={
             "columnDomains": {
                 "sample": "design",
@@ -819,9 +842,34 @@ def test_characterize_coefficient_rejects_cell_level_observation_unit(
     assert run.audit[-1]["designRows"] == store.cells.N
 
 
-def test_characterize_covariates_rejects_missing_cell_key(tmp_path: Path) -> None:
+def test_characterize_covariates_rejects_invalid_cell_selection_artifacts(
+    tmp_path: Path,
+) -> None:
     store = _store_with_design(tmp_path)
-    result = characterize_covariates(store, cellKey="missing")
 
-    assert result.status == "failed"
-    assert result.notes == ["cellKey 'missing' is not present in cell metadata"]
+    wrong_kind = ArtifactRef(
+        scope="datastore",
+        kind="feature_selection",
+        artifact_id="e" * 64,
+    )
+    with pytest.raises(
+        TypeError,
+        match="cellSelection must be a cell_selection ArtifactRef",
+    ):
+        characterize_covariates(store, cellSelection=wrong_kind)
+
+    missing = ArtifactRef(
+        scope="datastore",
+        kind="cell_selection",
+        artifact_id="f" * 64,
+    )
+    with pytest.raises(ArtifactResolutionError) as missing_error:
+        characterize_covariates(store, cellSelection=missing)
+    assert missing_error.value.code == "artifact_missing"
+
+    incomplete = store.snapshot_cell_selection("I")
+    status = store.inspect_artifact(incomplete)
+    store.zw[status.path].attrs["complete"] = False
+    with pytest.raises(ArtifactResolutionError) as incomplete_error:
+        characterize_covariates(store, cellSelection=incomplete)
+    assert incomplete_error.value.code == "artifact_incomplete"

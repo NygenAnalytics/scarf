@@ -1,12 +1,11 @@
-import re
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import zarr
 
-from .arrays import create_metadata_column, create_zarr_dataset
+from .arrays import create_zarr_dataset
 from .artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
@@ -28,12 +27,9 @@ from .geometry import array_geometry
 from .partition import row_band
 from .types import as_zarr_array, as_zarr_group
 from .refs import ExternalArtifactRef
-from .selections import validate_stored_selection_artifact
-
-_PENDING_ALIASES_ATTR = "pending_feature_selection_aliases"
-_LABEL_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
-_RESERVED_LABELS = frozenset(
-    {"I", "ids", "names", "nCells", "dropOuts", "all_features"}
+from .selections import (
+    validate_run_metadata_snapshot,
+    validate_stored_selection_integrity,
 )
 
 
@@ -173,17 +169,6 @@ def _ref_context(ref: ArtifactRef, *, assay: str) -> dict[str, str | None]:
     }
 
 
-def _label_context(
-    assay: str,
-    label: str,
-    ref: ArtifactRef | None = None,
-) -> dict[str, str | None]:
-    context: dict[str, str | None] = {"assay": assay, "label": label}
-    if ref is not None:
-        context["artifact_id"] = ref.artifact_id
-    return context
-
-
 def _feature_data(root: zarr.Group, assay: str) -> zarr.Group:
     path = f"{assay}/featureData"
     if path not in root:
@@ -264,8 +249,8 @@ _FEATURE_SELECTION_CONTRACTS = {
         frozenset({"min_cells"}),
         ("values",),
     ),
-    "mark_hvgs": (
-        frozenset({"feature_summary"}),
+    "select_hvgs": (
+        frozenset({"feature_snapshot", "feature_summary"}),
         frozenset(
             {
                 "min_cells",
@@ -284,7 +269,7 @@ _FEATURE_SELECTION_CONTRACTS = {
         ),
         ("values", "corrected_variance"),
     ),
-    "mark_prevalent_peaks": (
+    "select_prevalent_peaks": (
         frozenset({"feature_summary"}),
         frozenset({"top_n"}),
         ("values",),
@@ -408,22 +393,13 @@ def _validate_feature_summary_parent(
             code="incomplete_artifact",
             context=context,
         )
-    execution = cell_status.execution_options or {}
-    source_column = execution.get("source_column")
-    if not isinstance(source_column, str) or not source_column:
-        raise ArtifactResolutionError(
-            "Feature-summary cell-selection source is malformed",
-            code="corrupt_payload",
-            context=context,
-        )
-    validate_stored_selection_artifact(
+    validate_stored_selection_integrity(
         root,
         cell_selection,
         kind="cell_selection",
         scope="datastore",
         assay=None,
         table_path="cellData",
-        column=source_column,
     )
     feature_data = _feature_data(root, assay)
     ids = as_zarr_array(feature_data["ids"], name=f"{assay}/featureData/ids")
@@ -497,7 +473,8 @@ def _validate_feature_selection_provenance(
     input_names, parameter_names, payload_names = contract
     inputs = status.inputs or {}
     parameters = status.parameters or {}
-    if set(inputs) != input_names or set(parameters) != parameter_names:
+    received_inputs = set(inputs)
+    if received_inputs != input_names or set(parameters) != parameter_names:
         raise ArtifactResolutionError(
             "Feature-selection provenance does not match its operation",
             code="corrupt_payload",
@@ -538,6 +515,27 @@ def _validate_feature_selection_provenance(
                 context=context,
             )
         _validate_feature_summary_parent(root, assay, summary)
+    if "feature_snapshot" in inputs:
+        snapshot = _local_input_ref(inputs["feature_snapshot"])
+        if (
+            snapshot is None
+            or snapshot.kind != "metadata_snapshot"
+            or snapshot.scope != "assay"
+            or snapshot.assay != assay
+        ):
+            raise ArtifactResolutionError(
+                "Feature-selection metadata snapshot input is malformed",
+                code="corrupt_payload",
+                context=context,
+            )
+        validate_run_metadata_snapshot(
+            root,
+            snapshot,
+            axis="feature",
+            assay=assay,
+            table_path=f"{assay}/featureData",
+            ordered_columns=("names",),
+        )
     if "mapping_reference" in inputs:
         raw_mapping = inputs["mapping_reference"]
         if not isinstance(raw_mapping, Mapping):
@@ -703,419 +701,32 @@ def _validate_feature_selection(
     return _ValidatedFeatureSelection(ref=ref, values=values, operation=operation)
 
 
-def validate_feature_selection_label(
-    label: str,
-    *,
-    allow_all_features: bool = False,
-) -> None:
-    """Validate one exact published feature-selection label."""
-    if not isinstance(label, str):
-        raise TypeError("Feature selection labels must be strings")
-    if (
-        (label == "all_features" and not allow_all_features)
-        or label in (_RESERVED_LABELS - {"all_features"})
-        or "__" in label
-        or _LABEL_PATTERN.fullmatch(label) is None
-    ):
-        raise ArtifactResolutionError(
-            f"Invalid feature selection label: {label!r}",
-            code="invalid_label",
-            context={"label": label},
-        )
-
-
-def _parse_ref(
-    raw_ref: Any,
-    *,
-    assay: str,
-    label: str,
-    code: str,
-) -> ArtifactRef:
-    if not isinstance(raw_ref, Mapping) or set(raw_ref) != {
-        "type",
-        "scope",
-        "assay",
-        "kind",
-        "artifact_id",
-    }:
-        raise ArtifactResolutionError(
-            f"Feature selection label {label!r} has no valid artifact link",
-            code=code,
-            context=_label_context(assay, label),
-        )
-    try:
-        return ArtifactRef.from_dict(raw_ref)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ArtifactResolutionError(
-            f"Feature selection label {label!r} has a malformed artifact link",
-            code=code,
-            context=_label_context(assay, label),
-        ) from exc
-
-
-def _load_pending_aliases(
-    root: zarr.Group,
-    feature_data: zarr.Group,
-    *,
-    assay: str,
-    label: str,
-) -> dict[str, ArtifactRef]:
-    raw = feature_data.attrs.get(_PENDING_ALIASES_ATTR)
-    if raw is None:
-        return {}
-    if not isinstance(raw, Mapping):
-        raise ArtifactResolutionError(
-            "Feature selection publication journal is malformed",
-            code="pending_alias",
-            context=_label_context(assay, label),
-        )
-    pending: dict[str, ArtifactRef] = {}
-    for raw_label, raw_ref in raw.items():
-        if not isinstance(raw_label, str):
-            raise ArtifactResolutionError(
-                "Feature selection publication journal is malformed",
-                code="pending_alias",
-                context=_label_context(assay, label),
-            )
-        try:
-            validate_feature_selection_label(raw_label, allow_all_features=True)
-        except (ArtifactResolutionError, TypeError) as exc:
-            raise ArtifactResolutionError(
-                "Feature selection publication journal is malformed",
-                code="pending_alias",
-                context=_label_context(assay, label),
-            ) from exc
-        pending_ref = _parse_ref(
-            raw_ref,
-            assay=assay,
-            label=raw_label,
-            code="pending_alias",
-        )
-        try:
-            validated = _validate_feature_selection(root, assay, pending_ref)
-        except ArtifactResolutionError as exc:
-            raise ArtifactResolutionError(
-                "Feature selection publication journal has an invalid target",
-                code="pending_alias",
-                context={
-                    **_label_context(assay, label, pending_ref),
-                    "journal_label": raw_label,
-                    "journal_error_code": exc.code,
-                },
-            ) from exc
-        if raw_label == "all_features" and (
-            validated.operation != "create_all_features"
-        ):
-            raise ArtifactResolutionError(
-                "The all_features journal entry does not target the feature universe",
-                code="pending_alias",
-                context={
-                    **_label_context(assay, label, pending_ref),
-                    "journal_label": raw_label,
-                    "operation": validated.operation,
-                },
-            )
-        pending[raw_label] = pending_ref
-    return pending
-
-
-def _write_pending_aliases(
-    feature_data: zarr.Group,
-    pending: Mapping[str, ArtifactRef],
-) -> None:
-    if pending:
-        feature_data.attrs[_PENDING_ALIASES_ATTR] = {
-            label: ref.to_dict() for label, ref in pending.items()
-        }
-    elif _PENDING_ALIASES_ATTR in feature_data.attrs:
-        del feature_data.attrs[_PENDING_ALIASES_ATTR]
-
-
-def _alias_matches(
-    feature_data: zarr.Group,
-    label: str,
-    validated: _ValidatedFeatureSelection,
-) -> bool:
-    if label not in feature_data:
-        return False
-    try:
-        column = as_zarr_array(feature_data[label], name=label)
-    except TypeError:
-        return False
-    raw_ref = column.attrs.get("source_artifact")
-    if not isinstance(raw_ref, Mapping) or set(raw_ref) != {
-        "type",
-        "scope",
-        "assay",
-        "kind",
-        "artifact_id",
-    }:
-        return False
-    try:
-        source_ref = ArtifactRef.from_dict(raw_ref)
-    except (KeyError, TypeError, ValueError):
-        return False
-    if (
-        source_ref != validated.ref
-        or column.attrs.get("source_value") != "values"
-        or "value_index" in column.attrs
-        or column.ndim != 1
-        or np.dtype(column.dtype) != np.dtype(bool)
-        or column.shape != validated.values.shape
-    ):
-        return False
-    block_rows = min(
-        row_band(array_geometry(column), unit="chunk", fallback=1),
-        row_band(array_geometry(validated.values), unit="chunk", fallback=1),
-    )
-    for start in range(0, int(column.shape[0]), block_rows):
-        stop = min(start + block_rows, int(column.shape[0]))
-        if not np.array_equal(
-            np.asarray(column[start:stop], dtype=bool),
-            np.asarray(validated.values[start:stop], dtype=bool),
-        ):
-            return False
-    return True
-
-
-def _validated_alias(
-    root: zarr.Group,
-    feature_data: zarr.Group,
-    assay: str,
-    label: str,
-    ref: ArtifactRef,
-) -> _ValidatedFeatureSelection | None:
-    try:
-        validated = _validate_feature_selection(root, assay, ref)
-    except ArtifactResolutionError:
-        return None
-    return validated if _alias_matches(feature_data, label, validated) else None
-
-
 def resolve_feature_selection(
     root: zarr.Group,
     assay: str,
-    features: ArtifactRef | str,
+    features: ArtifactRef,
 ) -> ArtifactRef:
-    """Resolve a feature-selection ref or exact published label without writes."""
-    if isinstance(features, ArtifactRef):
-        return _validate_feature_selection(root, assay, features).ref
-    if not isinstance(features, str):
-        raise TypeError("features must be an ArtifactRef or feature label")
-    validate_feature_selection_label(features, allow_all_features=True)
-    feature_data = _feature_data(root, assay)
-    pending = _load_pending_aliases(
-        root,
-        feature_data,
-        assay=assay,
-        label=features,
-    )
-    pending_ref = pending.get(features)
-    if pending_ref is not None:
-        validated = _validated_alias(
-            root,
-            feature_data,
-            assay,
-            features,
-            pending_ref,
-        )
-        if validated is not None:
-            return validated.ref
-        raise ArtifactResolutionError(
-            f"Feature selection label {features!r} is pending publication",
-            code="pending_alias",
-            context=_label_context(assay, features, pending_ref),
-        )
-    if features not in feature_data:
-        raise ArtifactResolutionError(
-            f"Feature selection label {features!r} does not exist",
-            code=(
-                "missing_universe" if features == "all_features" else "missing_label"
-            ),
-            context=_label_context(assay, features),
-        )
-    try:
-        column = as_zarr_array(feature_data[features], name=features)
-    except TypeError as exc:
-        raise ArtifactResolutionError(
-            f"Feature selection label {features!r} is not a metadata column",
-            code="unlinked_label",
-            context=_label_context(assay, features),
-        ) from exc
-    raw_ref = column.attrs.get("source_artifact")
-    ref = _parse_ref(
-        raw_ref,
-        assay=assay,
-        label=features,
-        code="unlinked_label" if raw_ref is None else "stale_label",
-    )
-    validated = _validate_feature_selection(root, assay, ref)
-    if features == "all_features" and validated.operation != "create_all_features":
-        raise ArtifactResolutionError(
-            "The all_features label does not target the feature universe",
-            code="stale_label",
-            context={
-                **_label_context(assay, features, ref),
-                "operation": validated.operation,
-            },
-        )
-    if not _alias_matches(feature_data, features, validated):
-        raise ArtifactResolutionError(
-            f"Feature selection label {features!r} no longer matches its artifact",
-            code="stale_label",
-            context=_label_context(assay, features, ref),
-        )
-    return ref
+    """Validate and return one explicit feature-selection artifact."""
+    if not isinstance(features, ArtifactRef):
+        raise TypeError("features must be an ArtifactRef")
+    return _validate_feature_selection(root, assay, features).ref
 
 
-def publish_feature_selection_alias(
+def read_feature_selection_indices(
     root: zarr.Group,
     assay: str,
-    label: str,
-    ref: ArtifactRef,
-    *,
-    _checkpoint: Callable[[str], None] | None = None,
-) -> None:
-    """Publish a feature selection through a crash-recoverable metadata alias."""
-    validate_feature_selection_label(label, allow_all_features=True)
-    validated = _validate_feature_selection(root, assay, ref)
-    if label == "all_features" and validated.operation != "create_all_features":
-        raise ArtifactResolutionError(
-            "Only the baseline feature selection may publish 'all_features'",
-            code="invalid_label",
-            context=_label_context(assay, label, ref),
-        )
-    feature_data = _feature_data(root, assay)
-    pending = _load_pending_aliases(
-        root,
-        feature_data,
-        assay=assay,
-        label=label,
-    )
-    pending_ref = pending.get(label)
-    if pending_ref is not None:
-        committed = _validated_alias(
-            root,
-            feature_data,
-            assay,
-            label,
-            pending_ref,
-        )
-        if committed is not None:
-            if pending_ref == ref:
-                del pending[label]
-                _write_pending_aliases(feature_data, pending)
-                return
-        elif pending_ref != ref:
-            raise ArtifactResolutionError(
-                f"Feature selection label {label!r} has another pending target",
-                code="pending_alias",
-                context=_label_context(assay, label, pending_ref),
-            )
-
-    owned = False
-    if label in feature_data:
-        try:
-            existing = as_zarr_array(feature_data[label], name=label)
-        except TypeError:
-            existing = None
-        if existing is not None:
-            raw_source = existing.attrs.get("source_artifact")
-            if isinstance(raw_source, Mapping) and set(raw_source) == {
-                "type",
-                "scope",
-                "assay",
-                "kind",
-                "artifact_id",
-            }:
-                try:
-                    source_ref = ArtifactRef.from_dict(raw_source)
-                except (KeyError, TypeError, ValueError):
-                    source_ref = None
-                if (
-                    source_ref is not None
-                    and source_ref.scope == "assay"
-                    and source_ref.assay == assay
-                    and source_ref.kind == "feature_selection"
-                ):
-                    owned = True
-                    if source_ref == ref and _alias_matches(
-                        feature_data,
-                        label,
-                        validated,
-                    ):
-                        if label in pending:
-                            del pending[label]
-                            _write_pending_aliases(feature_data, pending)
-                        return
-        if pending_ref == ref:
-            owned = True
-        if not owned:
-            raise ArtifactResolutionError(
-                f"Feature metadata column {label!r} is not a Scarf-owned alias",
-                code="label_collision",
-                context=_label_context(assay, label),
-            )
-    pending[label] = ref
-    _write_pending_aliases(feature_data, pending)
-    if _checkpoint is not None:
-        _checkpoint("journaled")
-
-    existing_display = None
-    if label in feature_data:
-        try:
-            current = as_zarr_array(feature_data[label], name=label)
-        except TypeError:
-            current = None
-        if current is not None:
-            raw_display = current.attrs.get("display")
-            if isinstance(raw_display, Mapping):
-                existing_display = dict(raw_display)
-    if (
-        label not in feature_data
-        or current is None
-        or current.ndim != 1
-        or np.dtype(current.dtype) != np.dtype(bool)
-        or current.shape != validated.values.shape
-    ):
-        column = create_metadata_column(
-            feature_data,
-            label,
-            dtype=bool,
-            shape=int(validated.values.shape[0]),
-            chunkSize=row_band(
-                array_geometry(validated.values),
-                unit="chunk",
-                fallback=1,
-            ),
-            overwrite=True,
-        )
-        if existing_display is not None:
-            column.attrs["display"] = existing_display
-    else:
-        column = current
-    if _checkpoint is not None:
-        _checkpoint("column_ready")
-
-    block_rows = min(
-        row_band(array_geometry(column), unit="chunk", fallback=1),
-        row_band(array_geometry(validated.values), unit="chunk", fallback=1),
-    )
-    for start in range(0, int(column.shape[0]), block_rows):
-        stop = min(start + block_rows, int(column.shape[0]))
-        column[start:stop] = validated.values[start:stop]
-    if _checkpoint is not None:
-        _checkpoint("values_written")
-
-    column.attrs["source_value"] = "values"
-    if "value_index" in column.attrs:
-        del column.attrs["value_index"]
-    if _checkpoint is not None:
-        _checkpoint("source_metadata_written")
-
-    column.attrs["source_artifact"] = ref.to_dict()
-    if _checkpoint is not None:
-        _checkpoint("committed")
-
-    del pending[label]
-    _write_pending_aliases(feature_data, pending)
+    features: ArtifactRef,
+) -> np.ndarray:
+    """Read selected feature indices without materializing the full mask."""
+    validated = _validate_feature_selection(root, assay, features)
+    values = validated.values
+    block_rows = row_band(array_geometry(values), unit="chunk", fallback=1)
+    selected: list[np.ndarray] = []
+    for start in range(0, int(values.shape[0]), block_rows):
+        stop = min(start + block_rows, int(values.shape[0]))
+        indices = np.flatnonzero(np.asarray(values[start:stop], dtype=bool))
+        if len(indices):
+            selected.append(indices.astype(np.intp, copy=False) + start)
+    if not selected:
+        return np.empty(0, dtype=np.intp)
+    return np.concatenate(selected)

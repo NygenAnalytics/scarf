@@ -2,15 +2,40 @@
 
 Prefer the `DataStore` methods below in analysis code.
 
-`integrate_assays` captures its inputs from each named assay's `AssayState` before planning.
-SNN captures each current connectivity map; WNN captures each current neighbor artifact and its exact native reduction or batch-correction coordinates.
-The returned integrated-graph reference is the downstream `graph=` argument.
-WNN does not accept imported-coordinate ancestry.
-`coordinates` is a named provenance input on neighbor and ANN artifacts, not an artifact kind.
+`integrate_assays` accepts two or more exact source refs. WNN is the default; it consumes neighbour
+artifacts and follows each one's named native reduction or batch-correction coordinates. SNN is
+explicit and consumes connectivity-map artifacts. The returned integrated-graph reference is the
+exact downstream `graph` argument.
+WNN does not accept imported-coordinate ancestry. `coordinates` is a provenance input on neighbour
+and ANN artifacts, not a separate artifact kind.
 
-Neighbor-based metrics accept `neighbors=`; `None` resolves the assay's current neighbors.
-Graph metrics accept `graph=`; `None` resolves the current connectivity map.
-Neither interface accepts storage paths or an implicit latest-result selector.
+```python
+wnn = ds.integrate_assays([rna_neighbors, adt_neighbors])
+snn = ds.integrate_assays([rna_graph, adt_graph], method="snn")
+```
+
+The default WNN artifact stores one per-cell weight for each input assay. Plot those values with
+{py:func}`scarf.plotting.modality_weights` or the bound
+`ds.plots.modality_weights(graph=wnn, layout=wnn_layout)` accessor. An explicit SNN artifact does
+not contain modality weights.
+
+Neighbour-based metrics require `neighbors`; graph metrics require `graph`; reduction metrics
+require their exact coordinate artifact. Batch-mixing methods and biological-annotation cLISI or
+graph connectivity intentionally read imported metadata columns over the rows selected by artifact
+lineage. They are not an indirect path for scoring Scarf-produced clusterings. Concordance instead
+accepts two exact clustering refs with the same frozen cell selection. None accepts a storage path
+or an omitted artifact input.
+
+```python
+mixing_ref = ds.metric_lisi(["batch"], rna_neighbors)
+mixing = ds.load_metric_lisi(mixing_ref)["batch"]
+connectivity = ds.metric_graph_connectivity("cell_type", snn)
+agreement = ds.metric_label_concordance(rna_clusters, adt_clusters, metric="ari")
+```
+
+Per-cell LISI is axis-aligned analytical data, so `metric_lisi` returns an artifact and
+`load_metric_lisi` reads its scores. Dataset-level scalar summaries such as iLISI and graph
+connectivity remain direct values.
 
 ## DataStore methods
 
@@ -20,6 +45,7 @@ Neither interface accepts storage paths or an implicit latest-result selector.
 
    scarf.DataStore.integrate_assays
    scarf.DataStore.metric_lisi
+   scarf.DataStore.load_metric_lisi
    scarf.DataStore.metric_ilisi
    scarf.DataStore.metric_clisi
    scarf.DataStore.metric_proportional_batch_mixing
@@ -32,6 +58,7 @@ Neither interface accepts storage paths or an implicit latest-result selector.
 ```{eval-rst}
 .. automethod:: scarf.DataStore.integrate_assays
 .. automethod:: scarf.DataStore.metric_lisi
+.. automethod:: scarf.DataStore.load_metric_lisi
 .. automethod:: scarf.DataStore.metric_ilisi
 .. automethod:: scarf.DataStore.metric_clisi
 .. automethod:: scarf.DataStore.metric_proportional_batch_mixing
