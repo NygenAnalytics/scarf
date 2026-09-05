@@ -31,6 +31,24 @@ You need enough local disk space for both the H5AD and its converted Zarr store,
 The dataset URL below is used only to download a file.
 Scarf does not compute against the URL: inspection reads the local H5AD, and every analysis step reads a local Zarr count source.
 
+## Crash course on cell-specific stats testing
+
+Before you apply yourself to running the statistical testing between different groups & conditions, it is imperative you understand and gain a strong understanding of the assumptions, limitations, and benefits of running condition comparisons like this. We discuss here not to scare you, but to make you aware of factors that *MAY* be driving deviation in data.
+
+This workflow already reflects the main lesson: the donor is the unit of inference, so cells are averaged within donors and the paired test compares 18 matched pairs. That choice is what keeps 1,386 cells from counting as 1,386 independent replicates.
+
+### Limitations
+
+- It is imperative to consider that cells are not technically independent replicates. If you ran cell-level testing here instead, treating each cell as a replicate, cells from one run would still share donor, capture depth, ambient RNA, and batch effects, and treating *n* cells as *n* independent samples makes tiny shifts incredibly significant. Both Welch and Mann-Whitney pseudoreplicate when the question is condition-level.
+
+- Single-cell values are sparse with many zeros and skewed, so a Welch mean sits on a distribution it does not perfectly represent. To adjust, you may try rank-based statistical testing. However, rank tests still assume the groups look identical under the null hypothesis. When you process or handle the groups in a way that alters their variances or distributions differently, you break this assumption (called exchangeability).
+
+### Benefits
+
+- For example, if you are searching for expression changes in rare cell populations with a small *n*, averaging across a coarse mixture into biological replicates can dilute that signal away. Cell-level views retain the signal from a tiny specialized subpopulation, which enables the sensitivity required to spot these small shifts. Small *n* still limits power, so treat the finding as a flag for independent evidence, not proof.
+
+- Beyond the average, single-cell views can reveal multi-modal distributions that bulk means hide. Here, violins can suggest whether a condition shifts a gene from unimodal (everyone expresses it a little) to bimodal (one specific subpopulation turns it on completely), even if the overall population average barely moves. The location tests on this page rank shifts; they do not prove a modality change, which needs a mixture or dip test outside Scarf.
+
 ## 1. Download, inspect, and mount the count source
 
 Download the H5AD if it is absent, then inspect it before conversion.
