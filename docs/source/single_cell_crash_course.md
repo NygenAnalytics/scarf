@@ -254,6 +254,7 @@ top = ds.get_markers(marker=analysis_run["markers"], group_id=labels[0],
                      min_score=0.1, min_frac_exp=0.1)  # positives AND negatives both matter
 ```
 
+It is important to note that when you assign an identity to a cluster/community you are applying a heavy subjectivity, as rooting cell type annotations in ground truths can be a difficult task.
 
 ## Section 8 — Testing differences, counting cells, and proving things with replicates.
 
@@ -293,145 +294,80 @@ bulk = ds.make_bulk(groups=analysis_run["clusters"], aggr_type="sum")
 # bulk rows are replicates now: export to DESeq2/edgeR, not a cell-level test.
 ```
 
-Resist the pseudo-replicate shortcut. Randomly splitting one donor's cells into groups
-produces resamples of the same cells, not independent replicates. Testing them as
-replicates is pseudoreplication wearing a lab coat. Aggregate within type, never across
-the whole mixture, or the rare signal dissolves into the average it was meant to escape.
-Name the N, the denominator, and the family before running anything. Remember, do what
-fits the question being asked: cells answer cell-level questions, and donors answer
-condition-level ones.
 
+## Section 9 — Gene programs, cell states, cell talk, and predicting a cells "journey" through time.
 
-## Section 9 — Gene programs, cell states, cell talk, and journeys through time.
-
-Genes act in teams. Scoring a set per cell turns noisy flickers into one activity number:
-the team can read confidently up while each player stays borderline. Score T activation
-and `T1` with `T2` run high even where members read 0, because the rank pattern holds,
-while `B1` stays low despite sharing `GAPDH`. Cite the set definition, the overlap with
-measured genes, and member spot checks, never the score alone:
+We know that genes, when they result in some affect, don't act alone. 
+They often set of some cascade, acting in coordinated networks. 
+These coordinated networks are often gene programs, and programing scoring in in single cell transcriptomics can transform the noisy dropout heavy data into something with potential meaning.
+Some gene set can show high activity with strong confidence even if some individual genes don't reach significance on their own. The concerted shift, however macro or minor, can be found with program scoring. 
+Below, we use AUCell, which allows to evalute whether a gene program is active inside of a cell. 
 
 ```python
-act = ds.run_aucell(net, sel, features=universe)  # net: gene-set table, universe: all_features ref
-# Then spot-check members: the team claim needs at least some players visible.
+act = ds.run_aucell(net, sel, features=universe) # Using AUcell; allows us to evalute whether a gene program is active inside of a cell
 ```
 
-A program sharing 90 percent of its genes with cell cycle is measuring cell cycle. A
-five-gene set with four unmeasured genes measures nothing. Know which scorer you ran.
-AUCell walks down each cell's ranked genes and measures how fast set members accumulate,
-so it asks about rank recovery and tolerates dropout. WAGGR takes a weighted average over
-the set, so it asks about magnitude and leans on detected values. Different questions,
-different sensitivities, same duty to check members. See
-{doc}`tutorials/gene_set_scoring` for the full call. Name the scorer, the overlap, and
-one surviving member before believing any program.
+While tools like AUCell can help determine gene programs enabled inside of individual cells, performing cell-cell communication analysis can allow you to speculate what cells may be sending signals and what cells may be receiving these signals. 
+
+Cell-cell communication tools match senders and receivers against prior ligand-receptor
+databases. Every inferred interaction is some speculation rooted in some ground-truth biology. The key thing to note is that with how cells are processed for single-cell transcriptomics, the dissociation destroys our spatial context, so co-expression alone cannot confirm proximity, direction, or downstream activation. Meaning that even if your ligand and receptor pairs appear to be near each other in terms of your 2d visualization, those actual cells may be milimeters apart inside of the actual tissue. 
 
 
-States are graded overlays on discrete identity. Score them as numbers per cell rather
-than forcing new clusters: a proliferating T cell stays a T cell with a high cycle score.
-`T2`'s `MKI67` against `T1`'s zero is same identity, different state, so score both and
-cluster neither apart; see {doc}`tutorials/cell_cycle`. Splitting G2M off as a novel type
-is one error. Regressing cycle out when cycle is the biology is the other.
 
-Cell-cell communication matches ligands in candidate senders against receptors in receivers
-from prior databases. Every arrow is opportunity, not proof. Dissociated co-expression
-cannot show contact, direction, or causation. `Mono1`'s ligand against T-cell receptors
-proposes Mono-to-T talk without saying they ever neighbored. Scarf stops at export by
-design:
+Pseudotime is a statistical measure of transcriptional similarity, not elapsed wall-clock time. Because single-cell sequencing captures a static snapshot of destroyed cells, trajectory inference projects those cells along a path by stretching graph-based similarities into a continuum. That continuum has no intrinsic direction: no algorithm can infer biological origins de novo, and simply swapping the declared root flips the trajectory arrow across completely unchanged data. In classic pancreas development models, progenitors resolve cleanly toward alpha, beta, and delta fates only because the start and endpoints are anchored with externally validated marker phenotypes. To structure this properly from initial graph construction through continuous modeling, see {doc}tutorials/pseudotime and track downstream shifts in {doc}tutorials/expression_dynamics.
+
+Supervision looks like this in practice: a zero-sum source/sink vector built from declared labels, scored on the graph.
 
 ```python
-adata = ds.to_anndata()  # active cells with labels; CCC runs externally from here
+import numpy as np
+
+graph = analysis_run["connectivity_map"]  # trails are walked on the graph, not the matrix
+labels = ds.cells.fetch("clusters", key="I")
+source = labels == "Ductal"  # declared root: supervision, not discovery
+sink = np.isin(labels, ["Alpha", "Beta", "Delta"])  # declared termini
+ss_vec = np.zeros(len(labels), dtype=float)
+ss_vec[source] = -1.0 / source.sum()
+ss_vec[sink] = 1.0 / sink.sum()  # must sum to zero: sources negative, sinks positive
+
+ptime_ref = ds.run_pseudotime_scoring(graph, ss_vec=ss_vec)
+ptime = ds.load_pseudotime_scoring(ptime_ref)  # .values, .valid mask, .graph, .ref
+print("valid cells:", int(ptime.valid.sum()))  # disconnected cells score NaN, valid False
 ```
 
-Write "consistent with signaling" with the missing evidence named in the same sentence.
-Keep pairs whose receptor appears in 2 percent of receivers out of the main figure unless
-a rule puts them there.
-
-Trajectories order cells along a continuum where biology moves them along a path. The
-graph stretches into a trail and pseudotime walks it from a declared start. Sources and
-sinks supervise the orientation. No method discovers termini from nothing, and reversing
-the declared source reverses the "trajectory" while the data never changes. Real pancreas
-work orders progenitors toward alpha, beta, and delta fates from supplied termini with
-validity keys; the full arc is {doc}`tutorials/pseudotime`,
-{doc}`tutorials/expression_dynamics`, {doc}`tutorials/fate_mapping`, and
-{doc}`tutorials/trajectory_validation`. Demand all four validity readings before
-believing: connected graph components along the path, markers trending monotonically,
-coherent modules along the axis, and fate probabilities that stay valid instead of leaking
-everywhere. Every trajectory sentence carries its supervision. Pseudotime tracking total
-counts is a depth gradient until two graph-level checks say otherwise. Components,
-trends, modules, validity keys, or no trajectory sentence.
+Every trajectory claim must explicitly state how the root was supervised. Before presenting any path as real biology, demand four internal validity checks: the graph must maintain connected components across densely populated manifold space rather than jumping across empty voids; established lineage markers must trend monotonically along the axis; co-regulated gene modules must turn on and off in coordinated succession; and branching fate probabilities must resolve into distinct lineages rather than leaking indiscriminately across states. You can evaluate and verify these transitions in {doc}tutorials/fate_mapping and {doc}tutorials/trajectory_validation. Finally, test your ordering against basic library metrics: if your pseudotime axis strongly correlates with total UMI counts, you have mapped a technical sequencing depth gradient rather than a biological transition. Require graph continuity, monotonic marker trends, coordinated modules, and validated termini before reporting any trajectory conclusion.
 
 ## Section 10 — Batch effects, replicates, and knowing when to trust your results.
 
-Batches shift measurements globally, and correction pulls them together while trying to
-preserve type structure. Under-correction leaves batch clusters. Over-correction erases
-real biology. Correcting a variable confounded with condition deletes the finding while
-claiming to preserve it. Our cast sequenced across two days at 20 percent offset needs day
-correction to realign. With all T cells on day one and all B on day two, no method
-separates type from day and the honest answer is a new experiment. Correct, then diagnose
-mixing gained against structure kept, never one score alone:
+Batches shift measurements vastly, and correction pulls them together while trying to
+preserve type structure. 
+Most batch effects can be described as technical artifacts, such as sequencing different tissues on different days, sequencing on different lanes, or some minor handling differences in terms of the tissue. 
+Single-cell datasets that contain multiple donors will require batch-correction methods to regress out the technical effects while also preserving true biological information. 
+Undercorrecting for batch effects can leave the data plagued with noise, while overcorrecting can remove true biological differences.
+One method you can utilize to regress out technical effects is harmony as shown below.
 
 ```python
 fixed = ds.run_harmony(analysis_run["pca"], batch_columns=["batch"])
 # Harmony corrects reduced coordinates between PCA and neighbor search, where the graph is built.
-# Compare uncorrected vs corrected graphs on mixing AND structure kept. Never one score.
 ```
 
-Harmony edits coordinates, not counts, and it edits them blind. With no batch term for a
-confounded design there is nothing innocent to remove, so check the uncorrected baseline
-first and keep it in the figure. Rankings should survive new data, new seeds, and one
-held-out diagnostic nobody tuned against. Otherwise the benchmark measured tuning effort
-instead of methods. Baseline kept, both diagnostics quoted, seeds fixed.
-
-
-The unit of inference follows the question. Cells answer annotation and ranking. Subjects
-and runs answer whether treatment works. Thousands of cells as independent observations
-manufacture significance. Neither Welch nor rank tests escape, because the dependence
-lives in the design, not the formula. The RA workflow averages within donors and tests 18
-matched pairs, refusing 1,386 cells as replicates. Every claim carries its unit, and every
-figure that matters shows both Ns:
+We can visualize the before and after of batch effect correction, with the plot on the left being the uncorrected graph, whereas the graph on the right shows the results after harmony batch correction.
 
 ```python
-res = ds.run_statistical_testing("ISG15", grouping=CellField("sample_id"),
-                                 test="wilcoxon", sample_by="donor_id",
-                                 pair_by="pair_index")  # N is donors now, not cells
+fixed_index = ds.build_ann_index(fixed)
+fixed_graph = ds.build_connectivity_map(ds.query_neighbors(fixed_index, k=11))
+fixed_init = ds.build_embedding_initialization(fixed)
+fixed_umap = ds.run_umap(fixed_graph, fixed_init)
+
+ds.plots.embedding(layout=analysis_run["umap"], color_by="batch")  # before: batches apart
+ds.plots.embedding(layout=fixed_umap, color_by="batch")  # after: batches mixed, types kept
 ```
 
-Findings that need cell N to survive are descriptive and should say so. Labels earn trust
-from positives present, negatives absent, reference and method agreement, and replicate
-support. Build references once with diagnostics beside every transferred label:
-
-```python
-ref = ds.build_mapping_reference(neighbors)  # fixed reference; queries stay comparable
-```
-
-Compare methods on fixed data with fixed seeds, one change at a time, judged by several
-independent diagnostics. Use `metric_ilisi` for mixing against `metric_graph_connectivity`
-for structure kept, letting the pair argue instead of either ruling. Computation proposes
-and independent data disposes. Climb from held-out donors through orthogonal assays to
-perturbation, with every sentence carrying its rung. Reproducibility is provenance plus
-environment plus data identity, written where the next reader trips over it. Lineage
-reports turn any headline result into a diagram from counts to claim:
-
-```python
-rep = ds.lineage(analysis_run["markers"])
-print(rep.to_markdown())  # counts to claim, published beside the figure it supports
-```
-
-Nearly every disaster is one of ten familiar confusions: soup called cells, doublets
-called types, depth called biology, batch called condition, resolution called discovery,
-means called distributions, cells called subjects, correlation called circuit, layout
-distances called measurements, and parameters called defaults-that-must-be-right. Tape the
-two honesty colorings, total counts and batch, to every embedding forever. Add one
-crosstab per clustering decision, and prosecute each presentable figure under all ten
-headings. Finish by posing one narrow question on the 5K PBMC data with its population,
-comparison, unit of inference, and kill criterion stated before any code runs, in three
-figures maximum. Ship the strongest objection you could not dismiss alongside the
-claim.
-
+## Write up an ending here
 ---
 
 ## Where to go next
 
-Finished the course? The tool tutorials assume exactly what you now know. Start with
+Finished the short reading? The tool tutorials assume exactly what you now know. Start with
 {ref}`Quick start <quickstart>`, then the complete {doc}`tutorials/scrna_seq` workflow.
 Coming from another ecosystem, read {doc}`scanpy_and_seurat` first. For method-choice depth,
 work through {doc}`tutorials/quality_control`, {doc}`tutorials/feature_selection`,
