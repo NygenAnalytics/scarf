@@ -4,6 +4,8 @@ subtrees:
     entries:
       - file: installation
         title: Installation
+      - file: single_cell_crash_course
+        title: Single Cell Crash Course
       - file: quickstart
         title: Quick start
       - file: scanpy_and_seurat

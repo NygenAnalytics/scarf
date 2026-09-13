@@ -36,6 +36,8 @@ stage timing, configuration detail, and limitation.
 ## Choose your starting point
 
 - {ref}`Install Scarf <installation>`
+- New to single-cell analysis? Start with {doc}`single_cell_crash_course` for the concepts
+  behind every workflow below
 - Follow the {ref}`Quick start <quickstart>` to open a prepared PBMC result and inspect its
   pipeline-selected clusters
 - Use {doc}`scanpy` to translate a Scanpy workflow and H5AD exchange
