@@ -11,6 +11,7 @@ Public Scarf surfaces for analysts:
 - `scarf.plotting`
 - Documented integration metrics (`DataStore.metric_*`; `scarf.metrics` holds the underlying functions)
 - `MappingReference` / `MappingResult` for atlas-style mapping
+- `scarf.agent.analyze_rna` and its completed result, with the optional agent dependency
 
 Inheritance helpers (`BaseDataStore`, `GraphDataStore`, `MappingDatastore`) are listed under {doc}`api/datastore` for completeness.
 Prefer calling methods on `DataStore`.
@@ -24,6 +25,7 @@ Prefer calling methods on `DataStore`.
 | Graph construction | {doc}`api/graph_construction` |
 | Artifacts, lineage, and summaries | {doc}`api/artifacts` |
 | Analysis pipeline | {doc}`api/pipeline` |
+| Agent analysis | {doc}`api/agent` |
 | Assays and metadata | {doc}`api/assays` |
 | Integration and metrics | {doc}`api/integration` |
 | Mapping | {doc}`api/mapping` |

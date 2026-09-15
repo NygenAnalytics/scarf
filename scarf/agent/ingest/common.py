@@ -7,7 +7,7 @@ from typing import Any
 
 from ...storage.profiles import is_local_zarr_path
 from ...storage.stores import zarr_location_has_content
-from ..decide import DecisionValidationError, decide
+from ..decisions.selection import DecisionValidationError, decide
 from ..types import Decision, EvidenceItem
 from .result import (
     IngestResult,
@@ -250,36 +250,6 @@ def finish(
         )
     accepted_actions = [*convert_actions, action]
     resolved_action_labels = list(action_labels)
-    workflow_run = None
-    if summary_mode != "r":
-        from ..persistence import create_agent_workflow
-
-        try:
-            workflow_run = create_agent_workflow(zarr_path)
-        except AGENT_PERSISTENCE_ERRORS as exc:
-            return IngestResult(
-                status="failed",
-                format=format_name,
-                zarrPath=zarr_path,
-                assayNames=assay_names,
-                summary=summary,
-                decision=decision,
-                actions=resolved_action_labels,
-                acceptedActions=accepted_actions,
-                notes=[
-                    *notes,
-                    failure_note("create agent workflow", exc),
-                    f"The converted Scarf store remains available at {zarr_path}",
-                ],
-            )
-        resolved_action_labels.append("create_agent_workflow")
-        accepted_actions.append(
-            {
-                "op": "createAgentWorkflow",
-                "zarrPath": zarr_path,
-                "workflowRunId": workflow_run.workflowRunId,
-            }
-        )
     return done(
         format_name=format_name,
         zarr_path=zarr_path,
@@ -288,7 +258,6 @@ def finish(
         accepted_actions=accepted_actions,
         action_labels=resolved_action_labels,
         notes=notes,
-        workflow_run=workflow_run,
         decision=decision,
     )
 

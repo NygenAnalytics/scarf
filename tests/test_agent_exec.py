@@ -1,5 +1,7 @@
 """Tests for shared Scarf agent execution and configuration."""
 
+from tests.agent_examples import example
+
 import asyncio
 import json
 import threading
@@ -20,9 +22,17 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.exceptions import ModelHTTPError, UserError
 
-from scarf.agent import CovariateCharacterization, FeatureCharacterization, IngestResult
-from scarf.agent.config.agent_exec import _model_name, run_agent, run_agent_sync
+from scarf.agent.experimental_context.contracts import CovariateCharacterization
+from scarf.agent.data_enrichment.characterization import FeatureCharacterization
+from scarf.agent.ingest import IngestResult
+from scarf.agent.config.agent_exec import (
+    _image_input_is_unsupported,
+    _model_name,
+    run_agent,
+    run_agent_sync,
+)
 from scarf.agent.config import AgentRunConfig, get_model_settings, get_usage_limits
 from scarf.agent.tools import artifact_reference, core_artifact_reference
 from scarf.agent.types import (
@@ -47,6 +57,24 @@ class ExampleOutput(AgentDataModel):
         return cls(value="complete")
 
 
+def test_image_input_rejection_is_distinguished_from_other_provider_errors() -> None:
+    unsupported = ModelHTTPError(
+        400,
+        "text-model",
+        {
+            "message": "This model does not support multimodal (image/video/audio) inputs."
+        },
+    )
+    authentication = ModelHTTPError(401, "text-model", {"message": "Unauthorized"})
+    unsupported_local = UserError("This model does not support binary content")
+    unrelated_local = UserError("max_retries must be greater than or equal to zero")
+
+    assert _image_input_is_unsupported(unsupported) is True
+    assert _image_input_is_unsupported(authentication) is False
+    assert _image_input_is_unsupported(unsupported_local) is True
+    assert _image_input_is_unsupported(unrelated_local) is False
+
+
 def test_shared_models_have_blank_and_example_constructors() -> None:
     models = (
         AgentRunConfig,
@@ -66,19 +94,24 @@ def test_shared_models_have_blank_and_example_constructors() -> None:
     )
     for model in models:
         assert isinstance(model.get_blank(), model)
-        assert isinstance(model.get_example(), model)
+        assert isinstance(example(model), model)
         assert all("_" not in field_name for field_name in model.model_fields)
 
 
-def test_four_agent_objects_are_public() -> None:
-    import scarf.agent as agent_package
+def test_focused_scientific_agents_remain_available_in_their_subpackages() -> None:
+    from scarf.agent.biological_interpretation import BiologicalInterpretationAgent
+    from scarf.agent.data_enrichment import DataEnrichmentAgent
+    from scarf.agent.experimental_context import ExperimentalContextAgent
+    from scarf.agent.parameter_tuning import ParameterTuningAgent
 
-    assert agent_package.DataEnrichmentAgent.__name__ == "DataEnrichmentAgent"
-    assert agent_package.ExperimentalContextAgent.__name__ == "ExperimentalContextAgent"
-    assert agent_package.ParameterTuningAgent.__name__ == "ParameterTuningAgent"
-    assert (
-        agent_package.BiologicalInterpretationAgent.__name__
-        == "BiologicalInterpretationAgent"
+    assert all(
+        callable(agent)
+        for agent in (
+            DataEnrichmentAgent,
+            ExperimentalContextAgent,
+            ParameterTuningAgent,
+            BiologicalInterpretationAgent,
+        )
     )
 
 
@@ -281,7 +314,7 @@ def test_sync_runner_records_only_function_tool_calls() -> None:
             parts=[
                 ToolCallPart(
                     tool_name=info.output_tools[0].name,
-                    args=ExampleOutput.get_example().model_dump(),
+                    args=example(ExampleOutput).model_dump(),
                 )
             ]
         )
@@ -295,7 +328,7 @@ def test_sync_runner_records_only_function_tool_calls() -> None:
         name="example-agent",
     )
 
-    assert result.output == ExampleOutput.get_example()
+    assert result.output == example(ExampleOutput)
     assert result.runInfo.agentName == "example-agent"
     assert result.runInfo.usage.toolCalls == 1
     assert [call.toolName for call in result.runInfo.toolCalls] == ["inspect_value"]
@@ -373,7 +406,7 @@ def test_sync_runner_works_when_an_event_loop_is_already_running() -> None:
             parts=[
                 ToolCallPart(
                     tool_name=info.output_tools[0].name,
-                    args=ExampleOutput.get_example().model_dump(),
+                    args=example(ExampleOutput).model_dump(),
                 )
             ]
         )
@@ -390,7 +423,7 @@ def test_sync_runner_works_when_an_event_loop_is_already_running() -> None:
 
     result = asyncio.run(call_from_running_loop())
 
-    assert result.output == ExampleOutput.get_example()
+    assert result.output == example(ExampleOutput)
     assert result.runInfo.agentName == "notebook-host"
     assert [call.toolName for call in result.runInfo.toolCalls] == ["inspect_value"]
 
@@ -425,7 +458,7 @@ def test_sync_runner_closes_and_reopens_owned_client_between_notebook_calls(
                                     "function": {
                                         "name": output_tool_name,
                                         "arguments": json.dumps(
-                                            ExampleOutput.get_example().model_dump()
+                                            example(ExampleOutput).model_dump()
                                         ),
                                     },
                                 }
@@ -474,8 +507,8 @@ def test_sync_runner_closes_and_reopens_owned_client_between_notebook_calls(
     results = asyncio.run(call_twice_from_running_loop())
 
     assert [result.output for result in results] == [
-        ExampleOutput.get_example(),
-        ExampleOutput.get_example(),
+        example(ExampleOutput),
+        example(ExampleOutput),
     ]
     assert len(clients) == 2
     assert all(client.is_closed for client in clients)
@@ -513,7 +546,7 @@ def test_async_runner_does_not_run_sync_function_model_on_event_loop() -> None:
             parts=[
                 ToolCallPart(
                     tool_name=info.output_tools[0].name,
-                    args=ExampleOutput.get_example().model_dump(),
+                    args=example(ExampleOutput).model_dump(),
                 )
             ]
         )
@@ -527,7 +560,7 @@ def test_async_runner_does_not_run_sync_function_model_on_event_loop() -> None:
         )
     )
 
-    assert result.output == ExampleOutput.get_example()
+    assert result.output == example(ExampleOutput)
     assert callback_thread != event_loop_thread
 
 

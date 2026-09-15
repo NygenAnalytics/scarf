@@ -2,7 +2,7 @@
 
 from typing import Any, Literal
 
-from .config._deps import AGENT_INSTALL_HINT
+from ._deps import AGENT_INSTALL_HINT
 
 try:
     from pydantic import BaseModel, ConfigDict, Field
@@ -10,7 +10,7 @@ except ImportError as exc:
     raise ImportError(AGENT_INSTALL_HINT) from exc
 
 
-type StageStatus = Literal["done", "needsInput", "failed"]
+type StageStatus = Literal["done", "needsInput", "abstained", "failed"]
 type BatchCorrectionAction = Literal[
     "skip",
     "evaluateHarmony",
@@ -30,11 +30,6 @@ class AgentDataModel(BaseModel):
         """Return an empty but valid value for fallback paths."""
         return cls()
 
-    @classmethod
-    def get_example(cls) -> "AgentDataModel":
-        """Return a small representative value for tests and fixtures."""
-        return cls.get_blank()
-
 
 class ArtifactReferenceModel(AgentDataModel):
     type: Literal["artifact"] = "artifact"
@@ -53,14 +48,6 @@ class ArtifactReferenceModel(AgentDataModel):
             artifactId=str(getattr(ref, "artifact_id", "")),
         )
 
-    @classmethod
-    def get_example(cls) -> "ArtifactReferenceModel":
-        return cls(
-            assay="RNA",
-            kind="reduction",
-            artifactId="0" * 64,
-        )
-
 
 class BatchSafetyEvidence(AgentDataModel):
     """Estimability for one coefficient and exact proposed batch-column set."""
@@ -77,23 +64,6 @@ class BatchSafetyEvidence(AgentDataModel):
     @classmethod
     def get_blank(cls) -> "BatchSafetyEvidence":
         return cls()
-
-    @classmethod
-    def get_example(cls) -> "BatchSafetyEvidence":
-        return cls(
-            coefficient="treatment",
-            coefficientKind="categorical",
-            observationUnit="sample",
-            batchColumns=["batch"],
-            unitConstantBatchColumns=["batch"],
-            status="safe",
-            estimability={
-                "status": "ok",
-                "coefficientEstimable": True,
-                "rankDeficient": False,
-            },
-            evidenceId="batchEstimability:treatment:batch",
-        )
 
 
 class ExperimentalTuningHandoff(AgentDataModel):
@@ -135,36 +105,11 @@ class TuningBiologyHandoff(AgentDataModel):
     def get_blank(cls) -> "TuningBiologyHandoff":
         return cls()
 
-    @classmethod
-    def get_example(cls) -> "TuningBiologyHandoff":
-        return cls(
-            cellSelection=ArtifactReferenceModel(
-                scope="datastore",
-                assay=None,
-                kind="cell_selection",
-                artifactId="c" * 64,
-            ),
-            fromAssay="RNA",
-            graphAssay="RNA",
-            markerAssay="RNA",
-            recommendedCandidateId="baseline",
-            clusterArtifact=ArtifactReferenceModel(
-                assay="RNA",
-                kind="cluster_labels",
-                artifactId="1" * 64,
-            ),
-            evidenceIds=["candidate:baseline:clusters"],
-        )
-
 
 class ToolCallInfo(AgentDataModel):
     toolName: str = ""
     callId: str = ""
     arguments: dict[str, Any] = Field(default_factory=dict)
-
-    @classmethod
-    def get_example(cls) -> "ToolCallInfo":
-        return cls(toolName="inspect_store", callId="tool-call-1")
 
 
 class AgentUsageInfo(AgentDataModel):
@@ -173,16 +118,27 @@ class AgentUsageInfo(AgentDataModel):
     totalTokens: int = 0
     requests: int = 0
     toolCalls: int = 0
+    availability: Literal["reported", "partial", "unavailable"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
-    @classmethod
-    def get_example(cls) -> "AgentUsageInfo":
-        return cls(
-            inputTokens=100,
-            outputTokens=50,
-            totalTokens=150,
-            requests=2,
-            toolCalls=1,
-        )
+
+class AgentValidationRetry(AgentDataModel):
+    """A rejected response or tool call and the feedback supplied for repair."""
+
+    source: Literal["output", "tool", "schema"]
+    requestIndex: int = 0
+    message: str
+    response: dict[str, Any] | str | None = None
+
+
+class AgentProviderFailure(AgentDataModel):
+    """One failed model request, distinct from rejected scientific output."""
+
+    requestIndex: int
+    statusCode: int | None = None
+    error: str
+    retryDelaySeconds: float | None = None
 
 
 class AgentRunInfo(AgentDataModel):
@@ -192,26 +148,22 @@ class AgentRunInfo(AgentDataModel):
     durationSeconds: float = 0.0
     usage: AgentUsageInfo = Field(default_factory=AgentUsageInfo)
     toolCalls: list[ToolCallInfo] = Field(default_factory=list)
-
-    @classmethod
-    def get_example(cls) -> "AgentRunInfo":
-        return cls(
-            agentName="data_enrichment",
-            modelName="example-model",
-            runId="example-run",
-            durationSeconds=0.1,
-            usage=AgentUsageInfo.get_example(),
-            toolCalls=[ToolCallInfo.get_example()],
-        )
+    status: Literal["done", "failed"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    validationRetries: list[AgentValidationRetry] = Field(
+        default_factory=list, exclude_if=lambda value: not value
+    )
+    providerFailures: list[AgentProviderFailure] = Field(
+        default_factory=list, exclude_if=lambda value: not value
+    )
+    errorType: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    error: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class AgentExecutionResult(AgentDataModel):
     output: Any = None
     runInfo: AgentRunInfo = Field(default_factory=AgentRunInfo)
-
-    @classmethod
-    def get_example(cls) -> "AgentExecutionResult":
-        return cls(output={}, runInfo=AgentRunInfo.get_example())
 
 
 class EvidenceItem(AgentDataModel):
@@ -222,14 +174,6 @@ class EvidenceItem(AgentDataModel):
     @classmethod
     def get_blank(cls) -> "EvidenceItem":
         return cls(id="", label="", summary="")
-
-    @classmethod
-    def get_example(cls) -> "EvidenceItem":
-        return cls(
-            id="evidence:example",
-            label="example",
-            summary="A bounded observed fact.",
-        )
 
 
 class Decision(AgentDataModel):
@@ -246,14 +190,6 @@ class Decision(AgentDataModel):
     def get_blank(cls) -> "Decision":
         return cls(selectedId="", rationale="")
 
-    @classmethod
-    def get_example(cls) -> "Decision":
-        return cls(
-            selectedId="evidence:example",
-            rationale="The evidence directly answers the question.",
-            evidenceIds=["evidence:example"],
-        )
-
 
 class NeedsInput(AgentDataModel):
     question: str
@@ -263,13 +199,6 @@ class NeedsInput(AgentDataModel):
     @classmethod
     def get_blank(cls) -> "NeedsInput":
         return cls(question="")
-
-    @classmethod
-    def get_example(cls) -> "NeedsInput":
-        return cls(
-            question="Which condition column should be used?",
-            options=["condition", "treatment"],
-        )
 
 
 class StageResult(AgentDataModel):
@@ -282,7 +211,3 @@ class StageResult(AgentDataModel):
     @classmethod
     def get_blank(cls) -> "StageResult":
         return cls(status="needsInput")
-
-    @classmethod
-    def get_example(cls) -> "StageResult":
-        return cls(status="done", decision=Decision.get_example())

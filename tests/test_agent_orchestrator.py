@@ -1,6 +1,9 @@
 """Public facade, model, and end-to-end orchestrator contracts."""
 
-import re
+from tests.agent_examples import example
+from tests.agent_comparison_examples import observed_action
+
+import json
 from pathlib import Path
 from typing import Any
 
@@ -16,33 +19,36 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 import scarf.agent as agent_module
 import scarf.agent.orchestrator as orchestrator_module
-from scarf.agent.biological_interpretation import (
-    BiologicalInterpretationReport,
-    ClusterCompositionEvidence,
-    ClusterInterpretation,
-    ClusterMarkerBatchEvidence,
-)
 from scarf.agent.data_enrichment import (
     DataEnrichmentReport,
     FeatureSelectionPolicy,
     StudyContextSummary,
 )
+from scarf.agent.decisions.kernel import DecisionSelection
 from scarf.agent.experimental_context import (
     BatchCorrectionPlan,
     CellQcPlan,
-    CovariateEvidence,
     ExperimentalContextDecision,
 )
+from scarf.agent.parameter_tuning import ParameterTuningReport
+from scarf.agent.parameter_tuning.contracts import ParameterCandidateEvaluation
+from scarf.agent.orchestrator.journal import (
+    analysis_snapshot,
+    load_checkpoint,
+    _ensure_orchestration_store,
+)
+from scarf.agent.orchestrator.rna_tuning import TuningAction
 from scarf.agent.orchestrator import (
     AgentOrchestrator,
-    AssayPreprocessingPlan,
-    AutomatedPreprocessingPlan,
     AutomatedWorkflowConfig,
     AutomatedWorkflowRequest,
-    AutomatedWorkflowResult,
     AutomatedWorkflowResumeRequest,
+)
+from scarf.agent.orchestrator.models import (
+    AssayPreprocessingPlan,
+    AutomatedPreprocessingPlan,
+    AutomatedWorkflowResult,
     FinalAnalysisHandoff,
-    NativeAnalysisHandoff,
     PreprocessedAssayHandoff,
     WorkflowNeedsInput,
     WorkflowQuestion,
@@ -50,37 +56,36 @@ from scarf.agent.orchestrator import (
     WorkflowStageLink,
     artifact_model_to_ref,
 )
-from scarf.agent.persistence import (
-    load_agent_record,
-    load_agent_report,
-)
-from scarf.agent.parameter_tuning import (
-    FinalGraphSelection,
-    ParameterTuningReport,
-)
 from scarf.datastore.datastore import DataStore
+from scarf.storage.refs import ArtifactRef
+from scarf.storage.selections import read_stored_selection_indices
 from tests.test_agent_ingest import _write_h5ad
 
 
 _PLAN_CHECKSUM = "a" * 64
 
 
-def _rna_workflow_model() -> tuple[FunctionModel, dict[str, int]]:
-    state = {
+def _rna_workflow_model() -> tuple[FunctionModel, dict[str, Any]]:
+    state: dict[str, Any] = {
         "enrichment": 0,
         "context": 0,
         "parameter": 0,
+        "pca_pauses": 0,
+        "pca_prompts": 0,
         "biology": 0,
         "requests": 0,
     }
 
     def prompt_text(messages: list[ModelMessage]) -> str:
-        return "\n".join(
-            part.content
-            for message in messages
-            for part in message.parts
-            if isinstance(getattr(part, "content", None), str)
-        )
+        values: list[str] = []
+        for message in messages:
+            for part in message.parts:
+                content = getattr(part, "content", None)
+                if isinstance(content, str):
+                    values.append(content)
+                elif isinstance(content, tuple):
+                    values.extend(item for item in content if isinstance(item, str))
+        return "\n".join(values)
 
     def tool_result(
         messages: list[ModelMessage],
@@ -93,6 +98,10 @@ def _rna_workflow_model() -> tuple[FunctionModel, dict[str, int]]:
                     content = part.content
                     if isinstance(content, model_type):
                         return content
+                    if model_type is dict:
+                        return (
+                            json.loads(content) if isinstance(content, str) else content
+                        )
                     if isinstance(content, str):
                         return model_type.model_validate_json(content)
                     return model_type.model_validate(content)
@@ -178,28 +187,18 @@ def _rna_workflow_model() -> tuple[FunctionModel, dict[str, int]]:
             context_evidence = tool_result(
                 messages,
                 "analyze_experimental_design",
-                CovariateEvidence,
+                dict,
             )
             profile = next(
                 value
-                for value in context_evidence.qcProfiles
-                if value.action == "globalGaussian"
+                for value in context_evidence["qcProfiles"]
+                if value["registeredProfile"] is not None
             )
-            evidence_id = profile.evidenceId
+            evidence_id = profile["evidenceId"]
             decision = ExperimentalContextDecision(
                 batchCorrection=BatchCorrectionPlan(
                     action="skip",
                     rationale="No trusted technical batch column was supplied.",
-                    evidenceIds=[evidence_id],
-                ),
-                cellQc=CellQcPlan(
-                    action=profile.action,
-                    profileId=profile.profileId,
-                    driverAssay=profile.driverAssay,
-                    driverAssayType=profile.driverAssayType,
-                    attributes=profile.attributes,
-                    artifactMetrics=profile.artifactMetrics,
-                    rationale="Apply the bounded global RNA QC profile.",
                     evidenceIds=[evidence_id],
                 ),
                 rationale="No experimental covariates were supplied.",
@@ -214,131 +213,91 @@ def _rna_workflow_model() -> tuple[FunctionModel, dict[str, int]]:
                 ]
             )
 
-        if (
-            tools.intersection(
-                {"inspect_cluster_composition", "inspect_cluster_markers_batch"}
-            )
-            or state["biology"]
-        ):
-            if state["biology"] == 0:
-                state["biology"] = 1
-                return ModelResponse(
-                    parts=[
-                        ToolCallPart(
-                            tool_name="inspect_cluster_composition",
-                            args={},
-                        )
-                    ]
-                )
-            if state["biology"] == 1:
-                composition = tool_result(
-                    messages,
-                    "inspect_cluster_composition",
-                    ClusterCompositionEvidence,
-                )
-                state["biology"] = 2
-                return ModelResponse(
-                    parts=[
-                        ToolCallPart(
-                            tool_name="inspect_cluster_markers_batch",
-                            args={"cluster_ids": list(composition.clusterCounts)},
-                        )
-                    ]
-                )
-            batch = tool_result(
-                messages,
-                "inspect_cluster_markers_batch",
-                ClusterMarkerBatchEvidence,
-            )
-            interpretations = []
-            for cluster in batch.clusters:
-                if cluster.evidenceId and cluster.markers:
-                    marker = cluster.markers[0]
-                    marker_name = marker.featureName or marker.featureId
-                    interpretations.append(
-                        ClusterInterpretation(
-                            clusterId=cluster.clusterId,
-                            proposedIdentity=f"{marker_name}-high RNA state",
-                            identityIsHypothesis=True,
-                            confidence="low",
-                            rationale=(
-                                f"The observed marker panel is led by {marker_name}."
-                            ),
-                            evidenceIds=[cluster.evidenceId],
-                        )
-                    )
-            state["biology"] = 3
-            report = BiologicalInterpretationReport(
-                status="done",
-                clusterInterpretations=interpretations,
-                evidenceIds=[item.evidenceIds[0] for item in interpretations],
-                limitations=["Synthetic data supports marker-linked hypotheses only."],
-                stopReason=(
-                    "Every cluster with returned marker evidence was reviewed."
-                ),
-            )
-            return ModelResponse(
-                parts=[
-                    ToolCallPart(
-                        tool_name=info.output_tools[0].name,
-                        args=report.model_dump(),
-                    )
-                ]
-            )
-
         prompt = prompt_text(messages)
-        if state["parameter"] == 0:
-            match = re.search(
-                r'"candidateId"\s*:\s*"([A-Za-z0-9_]+)"',
-                prompt,
+        payload, _ = json.JSONDecoder().raw_decode(prompt[prompt.index("{") :])
+        if any(
+            {"selectedCandidateId", "correctionNeed", "comparisonConclusions"}.issubset(
+                tool.parameters_json_schema.get("properties", {})
             )
-            assert match is not None
-            candidate_id = match.group(1)
-            evidence_id = f"candidate:{candidate_id}:clusters"
-            assay_report = ParameterTuningReport(
-                status="done",
-                recommendedCandidateId=candidate_id,
-                confidence="high",
-                rationale="The only authorized native branch is eligible.",
-                evidenceIds=[evidence_id],
-                stopReason="The bounded one-candidate screen completed.",
+            for tool in info.output_tools
+        ):
+            state["pca_prompts"] += 1
+            selected = next(
+                (
+                    row["candidateId"]
+                    for row in payload["candidates"]
+                    if row["parameters"]["leidenResolution"] == 0.5
+                ),
+                payload["currentCandidateId"],
             )
-            report = ParameterTuningReport(
-                status="done",
-                assayReports={"RNA": assay_report},
-                rationale="The RNA native screen completed.",
-                evidenceIds=[evidence_id],
-                stopReason="Native selection completed.",
+            if payload["comparisonCoverage"]["phase"] == "sensitivity":
+                selected = payload["currentCandidateId"]
+            action = TuningAction.model_validate(
+                observed_action(payload, selected=selected)
             )
-            state["parameter"] = 1
+            if action.action == "accept" and state["pca_pauses"] == 0:
+                state["answer"] = action.model_dump(mode="json")
+                action = action.model_copy(
+                    update={
+                        "action": "defer",
+                        "rationale": "Review the completed comparisons before validating the selected combination on all retained cells.",
+                    }
+                )
+                state["pca_pauses"] += 1
             return ModelResponse(
                 parts=[
                     ToolCallPart(
-                        tool_name=info.output_tools[0].name,
-                        args=report.model_dump(),
+                        tool_name=info.output_tools[0].name, args=action.model_dump()
                     )
                 ]
             )
-
-        match = re.search(
-            r'"optionId"\s*:\s*"(native:RNA:([A-Za-z0-9_]+))"',
-            prompt,
+        payload, _ = json.JSONDecoder().raw_decode(prompt[prompt.index("{") :])
+        decision = payload["spec"]
+        decision_id = decision["decisionId"]
+        if decision_id == "pcaPrefix":
+            state["pca_prompts"] += 1
+        evidence_by_class: dict[str, str] = {}
+        evidence_class_by_id: dict[str, str] = {}
+        for item in payload["evidence"]["evidence"]:
+            evidence_by_class.setdefault(
+                item["evidenceClass"],
+                item["evidenceId"],
+            )
+            evidence_class_by_id[item["evidenceId"]] = item["evidenceClass"]
+        preferred = decision.get("metricPreferredOptionId")
+        selected = (
+            next(
+                option for option in decision["options"] if option["status"] == "defer"
+            )
+            if decision_id == "pcaPrefix" and state["pca_pauses"] == 0
+            else next(
+                option
+                for option in decision["options"]
+                if option["optionId"] == preferred
+            )
+            if preferred is not None
+            else next(
+                option
+                for option in decision["options"]
+                if option["status"] in {"apply", "skip"}
+            )
         )
-        assert match is not None
-        option_id, candidate_id = match.groups()
-        evidence_id = f"native:RNA:candidate:{candidate_id}:clusters"
-        selection = FinalGraphSelection(
-            status="done",
-            selectedOptionId=option_id,
-            graphMethod="native",
-            nativeAssay="RNA",
-            nativeCandidateId=candidate_id,
-            markerAssay="RNA",
+        if decision_id == "pcaPrefix" and selected["status"] == "defer":
+            state["pca_pauses"] += 1
+        evidence_ids = list(selected.get("requiredEvidenceIds", []))
+        cited_classes = {
+            evidence_class_by_id[evidence_id] for evidence_id in evidence_ids
+        }
+        for evidence_class in selected["requiredEvidenceClasses"]:
+            if evidence_class not in cited_classes:
+                evidence_ids.append(evidence_by_class[evidence_class])
+        selection = DecisionSelection(
+            selectedOptionId=selected["optionId"],
+            evidenceIds=evidence_ids,
+            rationale="Select the first eligible registered option for this test.",
             confidence="high",
-            rationale="The sole eligible native graph is selected.",
-            evidenceIds=[evidence_id],
         )
-        state["parameter"] = 2
+        state["parameter"] += 1
         return ModelResponse(
             parts=[
                 ToolCallPart(
@@ -360,7 +319,6 @@ def test_public_orchestrator_models_have_factories_and_camelcase_fields() -> Non
         AutomatedWorkflowResult,
         AutomatedWorkflowResumeRequest,
         FinalAnalysisHandoff,
-        NativeAnalysisHandoff,
         PreprocessedAssayHandoff,
         StudyContextSummary,
         CellQcPlan,
@@ -372,7 +330,7 @@ def test_public_orchestrator_models_have_factories_and_camelcase_fields() -> Non
 
     for model in models:
         assert isinstance(model.get_blank(), model)
-        assert isinstance(model.get_example(), model)
+        assert isinstance(example(model), model)
         assert all("_" not in field_name for field_name in model.model_fields)
     for model in (
         AutomatedPreprocessingPlan,
@@ -381,36 +339,30 @@ def test_public_orchestrator_models_have_factories_and_camelcase_fields() -> Non
     ):
         assert "cellSelection" in model.model_fields
         assert "cellKey" not in model.model_fields
-    for model in (NativeAnalysisHandoff, FinalAnalysisHandoff):
+    for model in (FinalAnalysisHandoff,):
         assert "clusterColumn" not in model.model_fields
         assert "umapColumns" not in model.model_fields
 
 
 def test_orchestrator_package_preserves_the_public_facade() -> None:
-    assert agent_module.AgentOrchestrator is orchestrator_module.AgentOrchestrator
+    assert not hasattr(agent_module, "AgentOrchestrator")
     assert orchestrator_module.__all__ == [
         "AgentOrchestrator",
-        "AssayPreprocessingPlan",
-        "AutomatedPreprocessingPlan",
         "AutomatedWorkflowConfig",
         "AutomatedWorkflowRequest",
-        "AutomatedWorkflowResult",
         "AutomatedWorkflowResumeRequest",
-        "FinalAnalysisHandoff",
-        "NativeAnalysisHandoff",
-        "PreprocessedAssayHandoff",
-        "WorkflowNeedsInput",
-        "WorkflowQuestion",
-        "WorkflowStageAttempt",
-        "WorkflowStageLink",
-        "artifact_model_to_ref",
     ]
 
 
 @pytest.mark.slow
-def test_rna_h5ad_completes_public_automated_workflow(tmp_path: Path) -> None:
+def test_rna_h5ad_completes_public_automated_workflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scarf.agent.orchestrator import rna_tuning as tuning_module
+
     rng = np.random.default_rng(4444)
-    values = rng.poisson(1.0, size=(80, 50)).astype(np.uint16)
+    values = rng.poisson(0.2, size=(80, 50)).astype(np.uint16)
     values[:40, :12] += rng.poisson(9.0, size=(40, 12)).astype(np.uint16)
     values[40:, 12:24] += rng.poisson(9.0, size=(40, 12)).astype(np.uint16)
     feature_names = [
@@ -449,61 +401,89 @@ def test_rna_h5ad_completes_public_automated_workflow(tmp_path: Path) -> None:
         feature_names=feature_names,
     )
     model, state = _rna_workflow_model()
+    pca_diagnostic_calls: list[ArtifactRef] = []
+    augment_pca = tuning_module.augment_pca_evaluations
+
+    def track_pca_diagnostics(*args: Any, **kwargs: Any) -> Any:
+        pca_diagnostic_calls.append(kwargs["feature_selection"])
+        return augment_pca(*args, **kwargs)
+
+    monkeypatch.setattr(tuning_module, "augment_pca_evaluations", track_pca_diagnostics)
     orchestrator = AgentOrchestrator(
         model,
-        config=AutomatedWorkflowConfig(
-            primaryInitialCandidates=1,
-            secondaryInitialCandidates=1,
-            maxRefinedCandidatesPerAssay=0,
-            maxHarmonyCandidatesPerAssay=0,
-            integrationResolutionCandidates=1,
-            maxCandidateBranches=1,
-            minClusterCells=2,
-        ),
+        config=AutomatedWorkflowConfig(screeningCells=60, maxScreeningCells=70),
     )
 
-    result = orchestrator.run(
-        AutomatedWorkflowRequest(
-            sourcePath=str(source),
-            zarrPath=str(target),
-            studyContext=(
-                "A human peripheral blood RNA study for a deterministic "
-                "acceptance test."
-            ),
-            allowAssumptions=True,
-            primaryAssay="RNA",
-            markerAssay="RNA",
-            analysisAssays=["RNA"],
-        )
+    request = AutomatedWorkflowRequest(
+        sourcePath=str(source),
+        zarrPath=str(target),
+        studyContext=(
+            "A human peripheral blood RNA study for a deterministic acceptance test."
+        ),
+        studyObjective="Discover stable RNA populations.",
+        primaryAssay="RNA",
+        markerAssay="RNA",
+        analysisAssays=["RNA"],
     )
+    paused = orchestrator.run(request)
+
+    assert paused.status == "needsInput"
+    assert paused.currentStage == "parameter_tuning"
+    assert paused.workflowRunId is not None
+    assert paused.needsInput is not None
+    assert len(paused.needsInput.questions) == 1
+    question = paused.needsInput.questions[0]
+    assert question.questionId == "parameter_tuning"
+    pca_diagnostics_before_resume = list(pca_diagnostic_calls)
+    resume_request = AutomatedWorkflowResumeRequest(
+        zarrPath=str(target),
+        workflowRunId=paused.workflowRunId,
+        answers={"parameter_tuning": state["answer"]},
+    )
+    editable = DataStore(
+        str(target),
+        default_assay="RNA",
+        min_features_per_cell=-1,
+        mito_pattern="",
+        ribo_pattern="",
+    )
+    original_counts = editable.cells.fetch_all("RNA_nCounts")
+    changed_counts = original_counts.copy()
+    changed_counts[0] += 1
+    editable.cells.insert("RNA_nCounts", changed_counts, overwrite=True)
+    rejected = orchestrator.resume(resume_request)
+    assert rejected.status == "failed"
+    assert any("metadata" in note for note in rejected.notes)
+    assert pca_diagnostic_calls == pca_diagnostics_before_resume
+    editable.cells.insert("RNA_nCounts", original_counts, overwrite=True)
+    execute_candidate = tuning_module.RnaTuningRun.execute
+
+    def interrupt_before_full(self: Any, scope: str, *args: Any, **kwargs: Any) -> Any:
+        if scope == "full":
+            monkeypatch.setattr(
+                tuning_module.RnaTuningRun, "execute", execute_candidate
+            )
+            raise KeyboardInterrupt(
+                "interrupt after the screening answer was committed"
+            )
+        return execute_candidate(self, scope, *args, **kwargs)
+
+    monkeypatch.setattr(tuning_module.RnaTuningRun, "execute", interrupt_before_full)
+    with pytest.raises(KeyboardInterrupt, match="screening answer"):
+        orchestrator.resume(resume_request)
+    assert pca_diagnostic_calls == pca_diagnostics_before_resume
+    result = orchestrator.resume(resume_request)
 
     assert result.status == "completed", result.notes
-    assert result.currentStage == "biological_interpretation"
-    assert result.workflowRun is not None
-    assert result.workflowRun.status == "completed"
-    assert state["requests"] == 9
-    assert [reference.agentName for reference in result.reportReferences] == [
-        "data_enrichment",
-        "experimental_context",
-        "parameter_tuning",
-        "biological_interpretation",
-    ]
-    assert result.finalAnalysis is not None
-    assert result.preprocessingPlan is not None
-    final = result.finalAnalysis
-    assert final.graphMethod == "native"
-    assert final.primaryAssay == final.markerAssay == "RNA"
-    assert final.graph is not None
-    assert final.clusters is not None
-    assert final.cellSelection is not None
-    assert final.embeddingInitialization is not None
-    assert final.umap is not None
-    assert final.markers is not None
-    assert final.cellSelection.kind == "cell_selection"
-    assert final.clusters.kind == "cluster_labels"
-    assert final.embeddingInitialization.kind == "embedding_initialization"
-    assert final.umap.kind == "embedding"
-    assert final.cellSelection != result.preprocessingPlan.cellSelection
+    assert len(pca_diagnostic_calls) == len(pca_diagnostics_before_resume) + 1
+    assert state["pca_prompts"] >= 3
+    assert result.currentStage == "analysis_finalization"
+    assert result.workflowRunId is not None
+    report_path = result.report()
+    assert report_path.is_file()
+    assert "Scarf analysis summary" in report_path.read_text(encoding="utf-8")
+    assert state["requests"] >= 8
+    assert state["biology"] == 0
     persisted = DataStore(
         str(target),
         default_assay="RNA",
@@ -512,6 +492,39 @@ def test_rna_h5ad_completes_public_automated_workflow(tmp_path: Path) -> None:
         ribo_pattern="",
         zarr_mode="r",
     )
+    snapshot = analysis_snapshot(persisted, result.workflowRunId)
+    stages = {stage["stage"]: stage for stage in snapshot["stages"]}
+    preprocessing_plan = AutomatedPreprocessingPlan.model_validate(
+        stages["preprocessing_plan"]["outputs"]["preprocessingPlan"]
+    )
+    assert preprocessing_plan.cellQualityPayload is not None
+    final = FinalAnalysisHandoff.model_validate(snapshot["finalAnalysis"])
+    assert final.primaryAssay == final.markerAssay == "RNA"
+    assert final.graph is not None and final.clusters is not None
+    assert final.cellSelection is not None and final.umap is not None
+    assert final.embeddingInitialization is not None and final.markers is not None
+    assert len(final.doubletScores) == 1
+    assert final.cellSelection != preprocessing_plan.cellSelection
+    parameter_report = ParameterTuningReport.model_validate(
+        stages["parameter_tuning"]["report"]
+    )
+    tuning_evaluations = parameter_report.evaluations
+    pca_evidence = next(
+        evaluation
+        for evaluation in tuning_evaluations
+        if evaluation.metrics.componentVariance
+    )
+    assert "representationDiagnostic" in pca_evidence.artifacts
+    assert any(
+        evidence_id.endswith(":pcaLoadings") for evidence_id in pca_evidence.evidenceIds
+    )
+    cluster_evidence = next(
+        evaluation
+        for evaluation in tuning_evaluations
+        if evaluation.metrics.doubletHighScoreConcentration is not None
+    )
+    assert cluster_evidence.metrics.markerCoherence is not None
+    assert "doubletScore:0" in cluster_evidence.artifacts
     umap_inputs = persisted.inspect_artifact(artifact_model_to_ref(final.umap)).inputs
     assert umap_inputs is not None
     assert umap_inputs["graph"] == artifact_model_to_ref(final.graph).to_dict()
@@ -528,24 +541,103 @@ def test_rna_h5ad_completes_public_automated_workflow(tmp_path: Path) -> None:
         marker_inputs["cell_selection"]
         == artifact_model_to_ref(final.cellSelection).to_dict()
     )
-
-    biology_reference = next(
-        reference
-        for reference in result.reportReferences
-        if reference.agentName == "biological_interpretation"
+    doublet_inputs = persisted.inspect_artifact(
+        artifact_model_to_ref(final.doubletScores[0])
+    ).inputs
+    assert doublet_inputs is not None
+    assert (
+        doublet_inputs["connectivity_map"]
+        == artifact_model_to_ref(final.graph).to_dict()
     )
-    biology = load_agent_report(target, biology_reference)
-    assert isinstance(biology, BiologicalInterpretationReport)
-    assert biology.status == "done"
-    assert biology.clusterInterpretations
-    assert biology.markerArtifact == final.markers
-    record = load_agent_record(target, biology_reference)
-    assert len(record.invocation.parentReports) == 3
-    assert record.invocation.tuningBiologyHandoff is not None
-    assert set(record.invocation.artifacts) == {
-        "cellSelection",
-        "clusters",
-        "markers",
-        "markerFeatures",
+    scored_partition = ArtifactRef.from_dict(doublet_inputs["clusters"])
+    assert scored_partition.kind == "cluster_labels"
+    assert persisted.inspect_artifact(scored_partition).complete
+    selected_evaluation = tuning_evaluations[0]
+    assert (
+        persisted.inspect_artifact(
+            artifact_model_to_ref(selected_evaluation.artifacts["normalized"])
+        ).inputs["cell_selection"]
+        == artifact_model_to_ref(final.cellSelection).to_dict()
+    )
+    assert len(tuning_evaluations) == 1
+    snapshot = analysis_snapshot(persisted, result.workflowRunId)
+    evidence = next(
+        stage for stage in snapshot["stages"] if stage["stage"] == "parameter_tuning"
+    )["outputs"]["tuningEvidence"]
+    assert 4 < evidence["budget"]["scopes"]["sample0"]["reserved"]["partitions"] <= 24
+    compared = {
+        row["comparisonId"]
+        for review in snapshot["analysisReviews"]
+        for row in review["comparisonCoverage"]["comparisons"]
     }
-    assert record.invocation.artifacts["cellSelection"] == final.cellSelection
+    assert {
+        "hvgCount:2000",
+        "hvgCount:4000",
+        "dimensions:10",
+        "dimensions:30",
+        "neighborsK:21",
+        "neighborsK:41",
+        "hvgRanking",
+        "featurePolicy",
+    } <= compared
+    assert evidence["budget"]["scopes"]["full"]["reserved"]["graphs"] == 1
+    assert evidence["budget"]["scopes"]["full"]["reserved"]["partitions"] == 1
+    sample_record = load_checkpoint(
+        persisted,
+        _ensure_orchestration_store(persisted),
+        result.workflowRunId,
+        "parameter_tuning/sample0/evaluation0/complete",
+        inputs=None,
+    )
+    assert sample_record is not None
+    sample_evaluation = ParameterCandidateEvaluation.model_validate(
+        sample_record["evaluation"]
+    )
+    assert (
+        sample_evaluation.parameters.leidenResolution
+        == selected_evaluation.parameters.leidenResolution
+        == 0.5
+    )
+    assert sample_evaluation.cellSelection != final.cellSelection
+
+    def selected_rows(reference: Any) -> np.ndarray:
+        return read_stored_selection_indices(
+            persisted.zw,
+            artifact_model_to_ref(reference),
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
+        )
+
+    sample_rows = selected_rows(sample_evaluation.cellSelection)
+    full_rows = selected_rows(final.cellSelection)
+    sample_labels = np.asarray(
+        persisted.load_artifact(
+            artifact_model_to_ref(sample_evaluation.artifacts["clusters"])
+        )["values"][:]
+    )
+    full_labels = np.asarray(
+        persisted.load_artifact(artifact_model_to_ref(final.clusters))["values"][:]
+    )
+    from sklearn.metrics import adjusted_rand_score
+
+    assert adjusted_rand_score(
+        sample_labels, full_labels[np.searchsorted(full_rows, sample_rows)]
+    ) == pytest.approx(1.0)
+    markers = result.get_markers(min_score=0.0, min_frac_exp=0.0)
+    assert {"CD3D", "MS4A1"}.issubset(set(markers.feature_name))
+    plotted = result.plot_embedding(show=False)
+    assert plotted.figure is not None
+    plotted.close()
+    requests_before = state["requests"]
+    diagnostics_before = list(pca_diagnostic_calls)
+    completed = orchestrator.run(request)
+    assert completed.status == "completed"
+    assert completed.workflowRunId == result.workflowRunId
+    assert analysis_snapshot(persisted, result.workflowRunId)[
+        "finalAnalysis"
+    ] == final.model_dump(mode="json")
+    assert state["requests"] == requests_before
+    assert pca_diagnostic_calls == diagnostics_before
+    assert "pipeline" not in persisted.zw

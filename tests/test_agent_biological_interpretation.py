@@ -1,5 +1,7 @@
 """Tests for the bounded Biological Interpretation Agent."""
 
+from tests.agent_examples import example
+
 import asyncio
 from types import SimpleNamespace
 
@@ -7,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import zarr
-from pydantic_ai import ModelRetry, RunContext
+from pydantic_ai import ModelRetry, RunContext, UnexpectedModelBehavior
 from pydantic_ai.messages import (
     ModelMessage,
     ModelResponse,
@@ -19,12 +21,13 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage
 from zarr.storage import MemoryStore
 
-import scarf.agent.biological_interpretation as biological_module
+import scarf.agent.biological_interpretation.agent as biological_agent
+import scarf.agent.biological_interpretation.tools as biological_tools
+import scarf.agent.biological_interpretation.validation as biological_validation
+from scarf.agent.biological_interpretation.agent import _SYSTEM_PROMPT
 from scarf.agent.biological_interpretation import (
-    _SYSTEM_PROMPT,
     BiologicalContext,
     BiologicalInterpretationAgent,
-    BiologicalInterpretationDependencies,
     BiologicalInterpretationNeedsInput,
     BiologicalInterpretationReport,
     ClusterCompositionEvidence,
@@ -39,6 +42,9 @@ from scarf.agent.biological_interpretation import (
     inspect_cluster_markers_batch,
     inspect_cluster_markers,
     validate_biological_interpretation_report,
+)
+from scarf.agent.biological_interpretation.contracts import (
+    BiologicalInterpretationDependencies,
 )
 from scarf.agent.types import (
     AgentRunInfo,
@@ -262,7 +268,7 @@ def test_models_have_blank_and_example_constructors() -> None:
     )
     for model in models:
         assert isinstance(model.get_blank(), model)
-        assert isinstance(model.get_example(), model)
+        assert isinstance(example(model), model)
         assert all("_" not in field_name for field_name in model.model_fields)
 
 
@@ -534,6 +540,29 @@ def test_validator_rejects_unobserved_evidence() -> None:
 
     with pytest.raises(Exception, match="Unknown evidenceIds"):
         validate_biological_interpretation_report(report, run_context.deps)
+
+
+def test_validator_rejects_empty_input_questions_and_model_authored_failure() -> None:
+    store = FakeStore()
+    run_context = context(store, marker=store.marker)
+    asyncio.run(inspect_cluster_composition(run_context))
+
+    with pytest.raises(ModelRetry, match="concrete input question"):
+        validate_biological_interpretation_report(
+            BiologicalInterpretationReport(
+                status="needsInput",
+                needsInput=BiologicalInterpretationNeedsInput(),
+            ),
+            run_context.deps,
+        )
+    with pytest.raises(ModelRetry, match="Do not return failed"):
+        validate_biological_interpretation_report(
+            BiologicalInterpretationReport(
+                status="failed",
+                limitations=["The model was uncertain."],
+            ),
+            run_context.deps,
+        )
 
 
 def test_treatment_observation_requires_evidence_for_its_exact_cluster() -> None:
@@ -873,6 +902,67 @@ def test_agent_waits_for_tools_and_returns_audited_report() -> None:
     }
 
 
+def test_biological_interpretation_preserves_evidence_without_completed_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = FakeStore()
+    marker_retries: list[int] = []
+
+    def unavailable_structured_output(**kwargs: object) -> None:
+        deps = kwargs["deps"]
+        assert isinstance(deps, BiologicalInterpretationDependencies)
+        marker_tool = next(
+            tool
+            for tool in kwargs["tools"]
+            if tool.name == "inspect_cluster_markers_batch"
+        )
+        marker_retries.append(marker_tool.max_retries)
+        run_context = SimpleNamespace(deps=deps)
+        asyncio.run(inspect_cluster_composition(run_context))
+        asyncio.run(
+            inspect_cluster_markers_batch(
+                run_context,
+                cluster_ids=list(deps.clusterValues),
+            )
+        )
+        raise UnexpectedModelBehavior("structured output unavailable")
+
+    monkeypatch.setattr(
+        biological_agent,
+        "run_agent_sync",
+        unavailable_structured_output,
+    )
+    result = BiologicalInterpretationAgent(object()).run(
+        store,
+        cluster=store.cluster,
+        marker=store.marker,
+    )
+
+    assert result.status == "failed"
+    assert result.runInfo.agentName == "biological_interpretation_failed"
+    assert result.clusterInterpretations == []
+    assert result.clusterArtifact == artifact_model(store.cluster)
+    assert result.markerArtifact == artifact_model(store.marker)
+    assert result.evidenceIds
+    assert result.treatmentObservations == []
+    assert marker_retries == [1]
+
+
+def test_marker_batch_cache_rejects_different_clusters() -> None:
+    store = FakeStore()
+    run_context = context(store, marker=store.marker)
+    asyncio.run(inspect_cluster_composition(run_context))
+
+    first = asyncio.run(inspect_cluster_markers_batch(run_context, cluster_ids=["0"]))
+    repeated = asyncio.run(
+        inspect_cluster_markers_batch(run_context, cluster_ids=["0"])
+    )
+
+    assert repeated is first
+    with pytest.raises(ModelRetry, match="already completed"):
+        asyncio.run(inspect_cluster_markers_batch(run_context, cluster_ids=["1"]))
+
+
 def test_exact_cluster_artifact_conflict_is_rejected_before_model_execution() -> None:
     store = FakeStore()
     tuning_handoff = TuningBiologyHandoff(
@@ -929,7 +1019,7 @@ def test_handoff_selection_must_match_exact_cluster_selection() -> None:
 def test_integrated_handoff_uses_marker_assay_without_claiming_graph_ownership(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from scarf.agent import biological_interpretation as module
+    from scarf.agent.biological_interpretation import agent as module
 
     store = FakeStore()
     store.cluster = ArtifactRef(
@@ -1009,17 +1099,17 @@ def test_integrated_handoff_requires_explicit_marker_assay() -> None:
 
 
 def test_biological_scalar_and_column_validation_edges() -> None:
-    assert biological_module._finite_float(None) is None
-    assert biological_module._finite_float("not-a-number") is None
-    assert biological_module._finite_float(float("nan")) is None
-    assert biological_module._string_value(np.int64(3)) == "3"
+    assert biological_tools._finite_float(None) is None
+    assert biological_tools._finite_float("not-a-number") is None
+    assert biological_tools._finite_float(float("nan")) is None
+    assert biological_tools._string_value(np.int64(3)) == "3"
     with pytest.raises(ValueError, match="not present in cell metadata"):
-        biological_module._check_column(FakeStore(), "missing", "sample column")
+        biological_tools._check_column(FakeStore(), "missing", "sample column")
 
     tool = SimpleNamespace(name="future_tool")
     deps = context(FakeStore()).deps
     assert (
-        biological_module._prepare_biological_interpretation_tool(
+        biological_validation._prepare_biological_interpretation_tool(
             SimpleNamespace(deps=deps), tool
         )
         is tool
@@ -1110,7 +1200,7 @@ def test_cluster_composition_artifact_validation_edges(
         lambda _ref: {"values": np.asarray([], dtype=int)},
     )
     monkeypatch.setattr(
-        biological_module,
+        biological_tools,
         "read_stored_selection_indices",
         lambda *_args, **_kwargs: np.asarray([], dtype=np.int64),
     )
@@ -1122,20 +1212,20 @@ def test_cluster_composition_metadata_alignment_edges(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = FakeStore()
-    original_rows = biological_module.read_metadata_rows
-    original_missing = biological_module.read_metadata_missing_rows
+    original_rows = biological_tools.read_metadata_rows
+    original_missing = biological_tools.read_metadata_missing_rows
 
     monkeypatch.setattr(
-        biological_module,
+        biological_tools,
         "read_metadata_rows",
         lambda *_args, **_kwargs: np.asarray(["control"]),
     )
     with pytest.raises(ValueError, match="condition and cluster"):
         asyncio.run(inspect_cluster_composition(context(store)))
 
-    monkeypatch.setattr(biological_module, "read_metadata_rows", original_rows)
+    monkeypatch.setattr(biological_tools, "read_metadata_rows", original_rows)
     monkeypatch.setattr(
-        biological_module,
+        biological_tools,
         "read_metadata_missing_rows",
         lambda *_args, **_kwargs: np.asarray(
             [True] + [False] * (len(store.cells.cluster_values) - 1)
@@ -1145,7 +1235,7 @@ def test_cluster_composition_metadata_alignment_edges(
         asyncio.run(inspect_cluster_composition(context(store)))
 
     monkeypatch.setattr(
-        biological_module, "read_metadata_missing_rows", original_missing
+        biological_tools, "read_metadata_missing_rows", original_missing
     )
 
     def sample_misaligned(
@@ -1154,18 +1244,18 @@ def test_cluster_composition_metadata_alignment_edges(
         values = original_rows(table, column, indices)
         return values[:-1] if column == "sample" else values
 
-    monkeypatch.setattr(biological_module, "read_metadata_rows", sample_misaligned)
+    monkeypatch.setattr(biological_tools, "read_metadata_rows", sample_misaligned)
     with pytest.raises(ValueError, match="sample and cluster"):
         asyncio.run(inspect_cluster_composition(context(store)))
 
-    monkeypatch.setattr(biological_module, "read_metadata_rows", original_rows)
+    monkeypatch.setattr(biological_tools, "read_metadata_rows", original_rows)
 
     def sample_missing(_table: object, column: str, indices: np.ndarray) -> np.ndarray:
         if column == "sample":
             return np.asarray([True] + [False] * (len(indices) - 1))
         return np.zeros(len(indices), dtype=bool)
 
-    monkeypatch.setattr(biological_module, "read_metadata_missing_rows", sample_missing)
+    monkeypatch.setattr(biological_tools, "read_metadata_missing_rows", sample_missing)
     with pytest.raises(ValueError, match="sample column contains missing"):
         asyncio.run(inspect_cluster_composition(context(store)))
 
@@ -1283,16 +1373,16 @@ def test_treatment_observation_validation_edges() -> None:
 
     without_condition = deps.model_copy(update={"conditionColumn": None})
     with pytest.raises(ModelRetry, match="condition column"):
-        biological_module._canonicalize_treatment_observations(
+        biological_validation._canonicalize_treatment_observations(
             report(observation), without_condition
         )
     with pytest.raises(ModelRetry, match="remain descriptive"):
-        biological_module._canonicalize_treatment_observations(
+        biological_validation._canonicalize_treatment_observations(
             report(observation.model_copy(update={"isDescriptiveOnly": False})),
             deps,
         )
     with pytest.raises(ModelRetry, match="exactly two distinct"):
-        biological_module._canonicalize_treatment_observations(
+        biological_validation._canonicalize_treatment_observations(
             report(
                 observation.model_copy(
                     update={"evidenceIds": [control.evidenceId, control.evidenceId]}
@@ -1301,7 +1391,7 @@ def test_treatment_observation_validation_edges() -> None:
             deps,
         )
     with pytest.raises(ModelRetry, match="condition composition evidence"):
-        biological_module._canonicalize_treatment_observations(
+        biological_validation._canonicalize_treatment_observations(
             report(
                 observation.model_copy(
                     update={"evidenceIds": [control.evidenceId, "unknown"]}
@@ -1310,18 +1400,18 @@ def test_treatment_observation_validation_edges() -> None:
             deps,
         )
     with pytest.raises(ModelRetry, match="distinct named conditions"):
-        biological_module._canonicalize_treatment_observations(
+        biological_validation._canonicalize_treatment_observations(
             report(observation.model_copy(update={"comparisonCondition": "control"})),
             deps,
         )
-    canonical = biological_module._canonicalize_treatment_observations(
+    canonical = biological_validation._canonicalize_treatment_observations(
         report(observation), deps
     )
     assert "equal mean independent-unit fractions" in canonical[0].observation
 
     higher = treated.model_copy(update={"meanFraction": 0.75})
     deps.conditionEvidence[treated.evidenceId] = higher
-    canonical = biological_module._canonicalize_treatment_observations(
+    canonical = biological_validation._canonicalize_treatment_observations(
         report(observation.model_copy(update={"direction": "higher"})), deps
     )
     assert "higher mean independent-unit fraction" in canonical[0].observation

@@ -1,13 +1,20 @@
 """Tests for the read-only data enrichment agent."""
 
+from tests.agent_examples import example
+
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 from pydantic import BaseModel
+from pydantic_ai import ModelRetry, UnexpectedModelBehavior
 from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from scarf.agent.characterize_features import FeatureCharacterization
+import scarf.agent.data_enrichment.agent as data_enrichment_agent_module
+import scarf.agent.data_enrichment.tools as data_enrichment_tools
+import scarf.agent.data_enrichment.validation as data_enrichment_validation
+from scarf.agent.data_enrichment.characterization import FeatureCharacterization
 from scarf.agent.data_enrichment import (
     AdtControlEvidence,
     AssayFeatureInspection,
@@ -28,6 +35,8 @@ from scarf.agent.data_enrichment import (
     FeatureSelectionPolicy,
     HtoTagEvidence,
     StudyContextSummary,
+    find_present_features,
+    find_present_features_batch,
     validate_data_enrichment_report,
 )
 
@@ -126,14 +135,14 @@ def test_data_enrichment_models_have_factories_and_camelcase_fields() -> None:
 
     for model_type in model_types:
         assert isinstance(model_type.get_blank(), model_type)
-        assert isinstance(model_type.get_example(), model_type)
+        assert isinstance(example(model_type), model_type)
         assert all("_" not in field_name for field_name in model_type.model_fields)
 
 
 def test_data_enrichment_agent_uses_only_read_tools_and_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from scarf.agent import data_enrichment as module
+    from scarf.agent.data_enrichment import tools as module
 
     store = ReadOnlyStore()
     tool_names: set[str] = set()
@@ -253,7 +262,7 @@ def test_data_enrichment_agent_uses_only_read_tools_and_context(
 def test_data_enrichment_batches_grounded_multimodal_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from scarf.agent import data_enrichment as module
+    from scarf.agent.data_enrichment import tools as module
 
     assay_features = {
         "RNA": (
@@ -407,7 +416,7 @@ def test_data_enrichment_batches_grounded_multimodal_evidence(
 def test_data_enrichment_retries_hallucinated_features(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from scarf.agent import data_enrichment as module
+    from scarf.agent.data_enrichment import tools as module
 
     store = ReadOnlyStore()
     monkeypatch.setattr(
@@ -483,6 +492,308 @@ def test_data_enrichment_retries_hallucinated_features(
     assert state["request"] == 3
 
 
+def test_data_enrichment_fails_after_completed_inspection_without_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scarf.agent.data_enrichment import tools as module
+
+    store = ReadOnlyStore()
+    monkeypatch.setattr(
+        module,
+        "characterize_features",
+        lambda *_args, **_kwargs: characterization(),
+    )
+    tool_retries: dict[str, int] = {}
+
+    def unavailable_structured_output(**kwargs: object) -> None:
+        deps = kwargs["deps"]
+        assert isinstance(deps, DataEnrichmentDependencies)
+        for tool in kwargs["tools"]:
+            tool_retries[tool.name] = tool.max_retries
+        asyncio.run(module.inspect_assay_features_batch(SimpleNamespace(deps=deps)))
+        raise UnexpectedModelBehavior("structured output unavailable")
+
+    monkeypatch.setattr(
+        data_enrichment_agent_module,
+        "run_agent_sync",
+        unavailable_structured_output,
+    )
+    result = DataEnrichmentAgent(object()).run(
+        store,
+        context=DataEnrichmentContext(organismHint="human"),
+    )
+
+    assert result.status == "failed"
+    assert result.runInfo.agentName == "data_enrichment_failed"
+    assert result.policies == []
+    assert result.unresolvedQuestions == []
+    assert result.inspections[0].species == "unknown"
+    assert "No scientific feature policy was selected" in result.limitations[0]
+    assert tool_retries == {
+        "inspect_assay_features_batch": 1,
+        "find_present_features_batch": 1,
+    }
+
+
+def test_data_enrichment_preserves_validated_policy_uncertainty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scarf.agent.data_enrichment import tools as module
+    from scarf.agent.types import AgentRunInfo
+
+    store = ReadOnlyStore()
+    monkeypatch.setattr(
+        module,
+        "characterize_features",
+        lambda *_args, **_kwargs: characterization(),
+    )
+
+    def unresolved_structured_output(**kwargs: object) -> SimpleNamespace:
+        deps = kwargs["deps"]
+        assert isinstance(deps, DataEnrichmentDependencies)
+        asyncio.run(module.inspect_assay_features_batch(SimpleNamespace(deps=deps)))
+        return SimpleNamespace(
+            output=DataEnrichmentReport(
+                status="needsInput",
+                unresolvedQuestions=[
+                    "The objective does not resolve which response genes must be protected."
+                ],
+            ),
+            runInfo=AgentRunInfo(agentName="data_enrichment", modelName="test-model"),
+        )
+
+    monkeypatch.setattr(
+        data_enrichment_agent_module,
+        "run_agent_sync",
+        unresolved_structured_output,
+    )
+    result = DataEnrichmentAgent(object()).run(
+        store,
+        context=DataEnrichmentContext(organismHint="human"),
+    )
+
+    assert result.status == "needsInput"
+    assert result.policies == []
+    assert result.unresolvedQuestions == [
+        "The objective does not resolve which response genes must be protected."
+    ]
+    assert result.runInfo.agentName == "data_enrichment"
+
+
+def test_feature_lookup_cache_rejects_different_arguments() -> None:
+    deps = DataEnrichmentDependencies(
+        store=ReadOnlyStore(),
+        assays=["RNA"],
+    )
+    run_context = SimpleNamespace(deps=deps)
+
+    first = asyncio.run(
+        find_present_features_batch(
+            run_context,
+            queries_by_assay={"RNA": ["MT-CYB"]},
+        )
+    )
+    repeated = asyncio.run(
+        find_present_features_batch(
+            run_context,
+            queries_by_assay={"RNA": ["MT-CYB"]},
+        )
+    )
+
+    assert repeated is first
+    with pytest.raises(ModelRetry, match="already completed"):
+        asyncio.run(
+            find_present_features_batch(
+                run_context,
+                queries_by_assay={"RNA": ["GAPDH"]},
+            )
+        )
+
+
+def test_data_enrichment_tool_helpers_cover_resolution_edges() -> None:
+    assert data_enrichment_tools._assay_modality(None, "RNAassay") == (
+        "RNA",
+        "RNAassay",
+        "assayClass",
+    )
+    assert data_enrichment_tools._assay_modality(None, "ATACassay") == (
+        "ATAC",
+        "ATACassay",
+        "assayClass",
+    )
+    assert data_enrichment_tools._assay_modality(None, "CustomAssay") == (
+        "unsupported",
+        "CustomAssay",
+        "assayClass",
+    )
+    assert data_enrichment_tools._assay_modality(None, "") == (
+        "unsupported",
+        "Assay",
+        "unknown",
+    )
+    assert data_enrichment_tools._valid_peak_coordinate("chr1:10") is False
+    assert data_enrichment_tools._valid_peak_coordinate("chr1:start-20") is False
+    controls = data_enrichment_tools._inspect_adt_features(
+        "ADT",
+        [("control-1", "IgG control")],
+    )
+    assert controls[0].matchedToken == "control"
+    assert data_enrichment_tools._inspect_atac_features("ATAC", []).status == "invalid"
+    assert (
+        data_enrichment_tools._inspect_atac_features(
+            "ATAC",
+            ["chr1:10-20"],
+        ).status
+        == "valid"
+    )
+    future_tool = SimpleNamespace(name="future_tool")
+    assert (
+        data_enrichment_tools._prepare_data_enrichment_tool(
+            SimpleNamespace(deps=DataEnrichmentDependencies()),
+            future_tool,
+        )
+        is future_tool
+    )
+
+
+def test_find_present_features_reports_casefold_ambiguity_and_absence() -> None:
+    class LookupFeatures:
+        @staticmethod
+        def fetch_all(column: str) -> list[str]:
+            return {
+                "ids": ["GENE1", "GENE2", "GAPDH"],
+                "names": ["shared", "shared", "GAPDH"],
+            }[column]
+
+    store = SimpleNamespace(
+        get_assay=lambda _name: SimpleNamespace(feats=LookupFeatures())
+    )
+    deps = DataEnrichmentDependencies(store=store, assays=["RNA"])
+
+    result = asyncio.run(
+        find_present_features(
+            SimpleNamespace(deps=deps),
+            assay_name="RNA",
+            queries=["gapdh", "shared", "missing"],
+        )
+    )
+
+    assert [item.status for item in result.results] == [
+        "present",
+        "ambiguous",
+        "absent",
+    ]
+    assert deps.confirmedFeatures["RNA"] == {"GAPDH"}
+    assert result.results[1].evidenceIds == []
+    assert result.results[2].matches == []
+
+
+def test_feature_lookup_tools_reject_invalid_requests() -> None:
+    with pytest.raises(ModelRetry, match="datastore is unavailable"):
+        asyncio.run(
+            find_present_features(
+                SimpleNamespace(
+                    deps=DataEnrichmentDependencies(store=None, assays=["RNA"])
+                ),
+                assay_name="RNA",
+                queries=["GAPDH"],
+            )
+        )
+    deps = DataEnrichmentDependencies(store=ReadOnlyStore(), assays=["RNA"])
+    context = SimpleNamespace(deps=deps)
+    with pytest.raises(ModelRetry, match="requested assays"):
+        asyncio.run(
+            find_present_features(
+                context,
+                assay_name="ADT",
+                queries=["CD3"],
+            )
+        )
+    with pytest.raises(ModelRetry, match="between 1 and 50"):
+        asyncio.run(
+            find_present_features(
+                context,
+                assay_name="RNA",
+                queries=[],
+            )
+        )
+    with pytest.raises(ModelRetry, match="Unknown requested assays"):
+        asyncio.run(
+            find_present_features_batch(
+                context,
+                queries_by_assay={"ADT": ["CD3"]},
+            )
+        )
+    with pytest.raises(ModelRetry, match="at least one assay"):
+        asyncio.run(find_present_features_batch(context, queries_by_assay={}))
+    with pytest.raises(ModelRetry, match="cannot be empty"):
+        asyncio.run(
+            find_present_features_batch(
+                context,
+                queries_by_assay={"RNA": []},
+            )
+        )
+    with pytest.raises(ModelRetry, match="at most 50"):
+        asyncio.run(
+            find_present_features_batch(
+                context,
+                queries_by_assay={
+                    "RNA": [f"gene-{index}" for index in range(51)],
+                },
+            )
+        )
+    with pytest.raises(ModelRetry, match="requested assays"):
+        asyncio.run(
+            data_enrichment_tools.inspect_assay_features(
+                context,
+                assay_name="ADT",
+            )
+        )
+    empty = SimpleNamespace(
+        deps=DataEnrichmentDependencies(store=ReadOnlyStore(), assays=[])
+    )
+    with pytest.raises(ModelRetry, match="No assays were requested"):
+        asyncio.run(data_enrichment_tools.inspect_assay_features_batch(empty))
+
+
+def test_assay_inspection_rejects_failed_or_modified_characterization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = SimpleNamespace(
+        deps=DataEnrichmentDependencies(store=ReadOnlyStore(), assays=["RNA"])
+    )
+    monkeypatch.setattr(
+        data_enrichment_tools,
+        "characterize_features",
+        lambda *_args, **_kwargs: FeatureCharacterization(
+            status="failed",
+            notes=["feature inspection failed"],
+        ),
+    )
+    with pytest.raises(ModelRetry, match="feature inspection failed"):
+        asyncio.run(
+            data_enrichment_tools.inspect_assay_features(
+                context,
+                assay_name="RNA",
+            )
+        )
+
+    modified = characterization()
+    modified.assays[0]["defaultFeatureInventory"] = {"blacklist": "modified"}
+    monkeypatch.setattr(
+        data_enrichment_tools,
+        "characterize_features",
+        lambda *_args, **_kwargs: modified,
+    )
+    with pytest.raises(ModelRetry, match="exact default HVG blacklist"):
+        asyncio.run(
+            data_enrichment_tools.inspect_assay_features(
+                context,
+                assay_name="RNA",
+            )
+        )
+
+
 def test_data_enrichment_validates_policy_and_assay() -> None:
     with pytest.raises(ValueError, match="both excluded and protected"):
         FeatureSelectionPolicy(
@@ -534,6 +845,30 @@ def test_enrichment_copies_caller_context_instead_of_model_paraphrases() -> None
         "10x 3 prime RNA-seq",
         "single donor",
     ]
+
+
+def test_enrichment_rejects_duplicate_assay_policies() -> None:
+    inspection = AssayFeatureInspection(
+        assay="RNA",
+        species="unknown",
+        evidenceIds=["assay:RNA:species"],
+    )
+    deps = DataEnrichmentDependencies(
+        store=ReadOnlyStore(),
+        assays=["RNA"],
+        inspections={"RNA": inspection},
+        evidenceIds={"assay:RNA:species"},
+    )
+    policy = FeatureSelectionPolicy(
+        assay="RNA",
+        evidenceIds=["assay:RNA:species"],
+    )
+
+    with pytest.raises(ValueError, match="one policy for each assay"):
+        validate_data_enrichment_report(
+            deps,
+            DataEnrichmentReport(status="done", policies=[policy, policy.model_copy()]),
+        )
 
 
 def test_enrichment_rejects_protected_family_exclusion() -> None:
@@ -596,3 +931,210 @@ def test_artificial_feature_requires_feature_specific_evidence() -> None:
 
     with pytest.raises(ValueError, match="feature-specific"):
         validate_data_enrichment_report(deps, report)
+
+
+def test_study_context_summary_rejects_unbounded_or_ungrounded_references() -> None:
+    context = DataEnrichmentContext(studyContext="Human lung study")
+    with pytest.raises(ValueError, match="verbatim caller text"):
+        data_enrichment_validation._ground_study_context_summary(
+            context,
+            StudyContextSummary(hypothesisReferences=["invented hypothesis"]),
+        )
+    with pytest.raises(ValueError, match="at most 12"):
+        data_enrichment_validation._ground_study_context_summary(
+            context,
+            StudyContextSummary(
+                tissueReferences=[f"tissue-{index}" for index in range(13)]
+            ),
+        )
+    long_reference = "x" * 241
+    with pytest.raises(ValueError, match="may not exceed 240"):
+        data_enrichment_validation._ground_study_context_summary(
+            DataEnrichmentContext(studyContext=long_reference),
+            StudyContextSummary(analysisIntentReferences=[long_reference]),
+        )
+
+
+def test_feature_policy_validation_rejects_ungrounded_contracts() -> None:
+    inspection = AssayFeatureInspection(
+        assay="RNA",
+        species="unknown",
+        families=[
+            FeatureFamilyEvidence(
+                family="mitochondrial",
+                defaultExclude=True,
+                evidenceId="assay:RNA:family:mitochondrial",
+            )
+        ],
+        evidenceIds=["assay:RNA:species"],
+    )
+    deps = DataEnrichmentDependencies(
+        store=ReadOnlyStore(),
+        context=DataEnrichmentContext(),
+        assays=["RNA"],
+        inspections={"RNA": inspection},
+        evidenceIds={"assay:RNA:species"},
+    )
+    grounded = StudyContextSummary()
+    validate = data_enrichment_validation._validate_feature_policy
+
+    unsupported = FeatureSelectionPolicy.model_construct(
+        assay="RNA",
+        species="unsupported",
+        evidenceIds=["assay:RNA:species"],
+    )
+    with pytest.raises(ValueError, match="unsupported species"):
+        validate(deps, unsupported, grounded)
+    with pytest.raises(ValueError, match="requires evidence IDs"):
+        validate(deps, FeatureSelectionPolicy(assay="RNA"), grounded)
+    with pytest.raises(ValueError, match="was not inspected"):
+        validate(
+            deps.model_copy(update={"inspections": {}}),
+            FeatureSelectionPolicy(
+                assay="RNA",
+                evidenceIds=["assay:RNA:species"],
+            ),
+            grounded,
+        )
+    with pytest.raises(ValueError, match="must cite context evidence"):
+        validate(
+            deps,
+            FeatureSelectionPolicy(
+                assay="RNA",
+                species="homo_sapiens",
+                evidenceIds=["assay:RNA:species"],
+            ),
+            grounded,
+        )
+    with pytest.raises(ValueError, match="conflicts with inspected"):
+        validate(
+            deps.model_copy(
+                update={
+                    "inspections": {
+                        "RNA": inspection.model_copy(update={"species": "homo_sapiens"})
+                    }
+                }
+            ),
+            FeatureSelectionPolicy(
+                assay="RNA",
+                species="mus_musculus",
+                evidenceIds=["assay:RNA:species"],
+            ),
+            grounded,
+        )
+    with pytest.raises(ValueError, match="unobserved families"):
+        validate(
+            deps,
+            FeatureSelectionPolicy(
+                assay="RNA",
+                protectFamilies=["cellCycle"],
+                evidenceIds=["assay:RNA:species"],
+            ),
+            grounded,
+        )
+    with pytest.raises(ValueError, match="unknown evidence IDs"):
+        validate(
+            deps,
+            FeatureSelectionPolicy(
+                assay="RNA",
+                evidenceIds=["evidence:unknown"],
+            ),
+            grounded,
+        )
+
+
+def test_feature_policy_accepts_feature_specific_context_evidence() -> None:
+    inspection = AssayFeatureInspection(
+        assay="RNA",
+        species="unknown",
+        evidenceIds=["assay:RNA:species"],
+    )
+    deps = DataEnrichmentDependencies(
+        store=ReadOnlyStore(),
+        context=DataEnrichmentContext(
+            experimentalDetails=["ERCC-00002 spike-in"],
+        ),
+        assays=["RNA"],
+        inspections={"RNA": inspection},
+        confirmedFeatures={"RNA": {"ERCC-00002"}},
+        evidenceIds={"assay:RNA:species", "context:experiment:0"},
+    )
+    policy = FeatureSelectionPolicy(
+        assay="RNA",
+        artificialFeatures=["ERCC-00002"],
+        evidenceIds=["assay:RNA:species", "context:experiment:0"],
+    )
+
+    data_enrichment_validation._validate_feature_policy(
+        deps,
+        policy,
+        StudyContextSummary(),
+    )
+
+    assert policy.artificialFeatures == ["ERCC-00002"]
+
+
+def test_data_enrichment_report_rejects_incomplete_assay_inventory() -> None:
+    inspection = AssayFeatureInspection(
+        assay="RNA",
+        species="unknown",
+        evidenceIds=["assay:RNA:species"],
+    )
+    with pytest.raises(ValueError, match="Inspect every requested assay"):
+        validate_data_enrichment_report(
+            DataEnrichmentDependencies(store=ReadOnlyStore(), assays=["RNA"]),
+            DataEnrichmentReport(
+                status="needsInput",
+                unresolvedQuestions=["Inspect the requested assays."],
+            ),
+        )
+    deps = DataEnrichmentDependencies(
+        store=ReadOnlyStore(),
+        assays=["RNA"],
+        inspections={"RNA": inspection},
+        evidenceIds={"assay:RNA:species"},
+    )
+    with pytest.raises(ValueError, match="outside the requested set"):
+        validate_data_enrichment_report(
+            deps,
+            DataEnrichmentReport(
+                status="needsInput",
+                unresolvedQuestions=["Resolve the assay mismatch."],
+                policies=[
+                    FeatureSelectionPolicy(
+                        assay="ADT",
+                        evidenceIds=["assay:RNA:species"],
+                    )
+                ],
+            ),
+        )
+    with pytest.raises(ValueError, match="one policy for every requested assay"):
+        validate_data_enrichment_report(
+            deps.model_copy(update={"assays": ["RNA", "ADT"]}),
+            DataEnrichmentReport(
+                status="done",
+                policies=[
+                    FeatureSelectionPolicy(
+                        assay="RNA",
+                        evidenceIds=["assay:RNA:species"],
+                    )
+                ],
+            ),
+        )
+
+
+def test_failed_enrichment_retains_partial_evidence_without_inventing_policy() -> None:
+    incomplete = DataEnrichmentDependencies(store=ReadOnlyStore(), assays=["RNA"])
+    for inspections in (
+        {},
+        {"RNA": AssayFeatureInspection(assay="RNA", species="unknown")},
+    ):
+        failed = data_enrichment_validation.failed_data_enrichment_report(
+            incomplete.model_copy(update={"inspections": inspections}),
+            error=RuntimeError("model failed"),
+            model_name="test",
+        )
+        assert failed.status == "failed"
+        assert failed.policies == []
+        assert failed.inspections == list(inspections.values())
+        assert "RuntimeError: model failed" in failed.limitations

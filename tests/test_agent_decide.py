@@ -8,8 +8,9 @@ from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.function import AgentInfo
 from pydantic_ai.models.test import TestModel
 
-from scarf.agent import DecisionValidationError, EvidenceItem, decide
-from scarf.agent.decide import _SYSTEM_PROMPT, validate_decision
+from scarf.agent.decisions.selection import DecisionValidationError, decide
+from scarf.agent.types import EvidenceItem
+from scarf.agent.decisions.selection import _SYSTEM_PROMPT, validate_decision
 from scarf.agent.types import Decision
 
 
@@ -71,26 +72,24 @@ def test_decide_with_test_model_returns_schema_valid_decision() -> None:
     validate_decision(result, _evidence())
 
 
-def test_validate_decision_coerces_selected_id_embedded_in_line() -> None:
+def test_validate_decision_rejects_selected_id_embedded_in_line() -> None:
     decision = Decision(
         selectedId="id=matrix:raw/X | label=raw/X | summary=integer-like",
         rationale="integer-like",
         evidenceIds=[],
     )
-    result = validate_decision(decision, _evidence())
-    assert result.selectedId == "matrix:raw/X"
-    assert result.evidenceIds == ["matrix:raw/X"]
+    with pytest.raises(DecisionValidationError, match="not in evidence ids"):
+        validate_decision(decision, _evidence())
 
 
-def test_validate_decision_coerces_id_equals_prefix_in_evidence_ids() -> None:
+def test_validate_decision_rejects_id_equals_prefix_in_evidence_ids() -> None:
     decision = Decision(
         selectedId="id=matrix:raw/X",
         rationale="echoed prompt scaffolding",
         evidenceIds=["id=matrix:raw/X"],
     )
-    result = validate_decision(decision, _evidence())
-    assert result.selectedId == "matrix:raw/X"
-    assert result.evidenceIds == ["matrix:raw/X"]
+    with pytest.raises(DecisionValidationError, match="not in evidence ids"):
+        validate_decision(decision, _evidence())
 
 
 def test_decide_rejects_unknown_selected_id() -> None:
@@ -99,12 +98,13 @@ def test_decide_rejects_unknown_selected_id() -> None:
         rationale="guess",
         evidenceIds=["matrix:missing"],
     )
-    with pytest.raises(DecisionValidationError, match="selectedId"):
+    with pytest.raises(DecisionValidationError) as caught:
         decide(
             model=_function_model(bad),
             question="Which matrix looks like raw counts?",
             evidence=_evidence(),
         )
+    assert "selectedId" in caught.value.agent_run_info.error
 
 
 def test_validate_decision_rejects_unknown_evidence_ids() -> None:

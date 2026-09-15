@@ -8,7 +8,8 @@ description: Use Scarf safely in an autonomous or AI-assisted single-cell analys
 This page is a routing and reasoning guide for an AI agent that uses Scarf to analyse data.
 It does not replace the workflow tutorials or define one correct analysis.
 The study question, experimental design, and user instructions remain authoritative.
-For an executable example of the four bounded Scarf agents and their validated handoffs, see {doc}`tutorials/agent_workflow`.
+For an executable ingest-to-finalization example with persisted decisions and report generation,
+see {doc}`tutorials/agent_workflow`.
 
 ## Scope and authority
 
@@ -96,6 +97,123 @@ Before the first mutating operation, make a short execution record containing:
 
 Update this record before changing the cohort, inputs, or decision criteria.
 This prospective boundary makes unintended writes and retrospective justifications visible.
+`AgentOrchestrator` keeps one authoritative stage history containing the immutable request,
+effective configuration, evidence, decisions, checks, and final artifact references. The caller still owns the scientific question and
+unit of inference.
+
+### When to use the automated agent workflow
+
+Use `analyze_rna` with a dataset, a configured model, study context, and a study objective.
+The workflow analyzes one RNA assay, even when other modalities coexist in the store. Pass
+`assay` explicitly when several RNA assays exist. Automated integration, HTO assignment, and
+biological significance or differential-expression hypothesis execution are outside this
+workflow; ordinary Scarf APIs remain available for them. Experimental Context still explores
+individual and joint covariate patterns and possible explanations of the study design.
+
+```python
+from scarf.agent import analyze_rna
+
+result = analyze_rna(
+    "study.h5ad",
+    model=model,
+    study_context="One paragraph describing the study design and metadata roles.",
+    study_objective="Discover stable populations relevant to the study.",
+    zarr_path="study.zarr",
+)
+result.plot_embedding()
+markers = result.get_markers()
+report_path = result.report()
+```
+
+The beginner call returns a completed result or raises `AnalysisError`. Its result address is
+available as `error.result` when work remains unresolved. There is no separate candidate-budget
+argument on this interface. Advanced callers import the orchestrator and configuration from
+`scarf.agent.orchestrator` for explicit workspaces, numerical limits, and resumable pauses.
+See {doc}`reference/api/agent` for that boundary.
+
+The model first interprets observed study metadata and proposes at most eight objective-led
+design comparisons, with one follow-up round of at most four. Comparisons may use a single
+explanatory variable, a joint categorical group, or conditioning within categorical strata.
+Continuous conditioning bins and regression adjustments are not invented. Continuous biological
+variables without a supported preservation measure remain explicitly unresolved.
+
+Scarf starts from its RNA settings and four partitions of the same graph. The model reviews
+quantitative diagnostics, marker and loading-gene evidence, and supplied images before accepting
+or requesting one registered experiment. The model cannot generate executable analysis code or
+arbitrary `DataStore` calls. When the design permits correction, a matched native/Harmony
+evaluation is required even when correction initially appears unnecessary. Accepting correction
+requires measured improvement while preserving protected biology, including supported joint
+groups, and passing the existing doublet checks. Unsafe or unknown designs cannot license
+correction.
+
+New workflows use an immutable uniform screening cohort containing 10% of retained cells,
+rounded up and bounded to 10,000–100,000 cells, never exceeding the retained population.
+One larger nested screen may use up to 100,000 cells when the first is smaller. Existing
+explicit integer screening sizes retain their exact meaning on resume. A compatible interrupted
+run configured for 50,000 screening cells keeps that setting and its matching admitted work;
+it does not switch to the new fractional default. Coverage and
+rare-population concerns can require targeted full-cohort recovery of measured settings;
+a missing screening comparison does not authorize an unbounded full-cohort search.
+Screening selects settings; it does not replace the final QC-retained cohort. Selected settings
+are executed and assessed on the full cohort. Each screening population must compare the
+baseline against 2,000 and 4,000 variable genes, 10 and 30 PCA dimensions, and 21 and 41
+neighbors, changing one setting at a time. The four baseline resolutions share one graph.
+Supported batch-aware ranking and an evidence-nominated feature policy provide additional
+comparisons. The agent interprets these results, proposes combined settings, and assesses their
+actual execution and resolution alternatives before accepting them. A list of reviewed domains
+or a general preference for defaults does not establish sufficient evidence.
+
+The default limits allow 24 screening evaluations per population and 48 overall, with four
+additional final-validation graphs, eight additional partitions, and one targeted repair.
+For small cohorts, discovery uses every retained cell; these are full-sized comparisons counted
+in the screening allowance. Exact completed artifacts are reused for final validation without
+another admission. Report the analyzed population and diagnostic operations separately; the
+candidate allowance does not bound doublet calculations, elapsed time, or provider cost.
+A proposed recovery panel and its matched native controls must fit together before execution.
+Four corrected resolutions and four native controls consume all eight additional partitions;
+the one-repair limit does not reserve a ninth partition.
+
+Advanced history records attempted, completed and failed operation calls separately from metric
+cache hits, saved-evidence restores and confirmed artifact reuse, for each invocation. These
+observed calls differ from counts of unique saved artifacts, and a core operation may itself
+reuse earlier work. Older histories without operation records have unknown counts, not zero.
+
+Experimental Context records objective evidence requirements before tuning. Explicit joint
+or conditional covariate requests remain unresolved when only marginal comparisons were
+nominated. Full study text is retained; compact model views deduplicate shared sources and
+capture-design evidence while complete measurements remain in the stage journal. These
+summaries retain adverse findings, missingness, protected-group loss and design constraints.
+The agent can retrieve one exact saved policy/capture or design record when detailed thresholds
+or donor examples are needed. This lookup performs no scientific recomputation. Completed
+metadata inspection and design rounds are checkpointed before further model requests, so
+interruption does not reset the eight-initial/four-follow-up allowance. Repeated donors and
+incomplete pairing receive descriptive counts and support summaries without treating cells or
+repeated samples as independent replicates. A method that cannot compute an association does
+not establish that an effect is absent or unidentifiable. Essential unresolved evidence blocks
+a consequential decision; measured confounding may prohibit correction while descriptive
+population discovery remains possible.
+
+RNA percentages use explicit gene-selection artifacts. Imported percentage columns remain
+available for comparison but do not override a validated definition. In particular, a
+mitochondrial symbol definition matches `MT-` rather than every gene beginning with `MT`.
+Changing the metric definition requires new QC thresholds and dependent evidence.
+
+All saved execution and decisions belong to the orchestration stage history. Identical calls
+reuse completed work or resume matching interrupted work; changed inputs and identity checks
+prevent silent reuse of stale evidence. The result's plot and marker methods use the exact saved
+workspace and artifacts read-only. The cluster map displays at most 50,000 cells while retaining
+full counts and provenance. `report()` returns or regenerates one local analysis summary from
+saved evidence, with no new model calls or numerical analysis.
+
+This release deliberately breaks the earlier agent imports and persistence contracts. The root
+agent facade exports only `analyze_rna`, `AutomatedWorkflowResult`, and `AnalysisError`. Runs using removed configuration or incompatible saved contracts must be restarted; their
+numerical artifacts remain readable through ordinary Scarf APIs.
+There are no implicit migrations. Compatible histories with newly uncovered objective questions
+receive an explicit context-evidence revision, preserving prior records and artifacts; essential
+unanswered questions still prevent completion. Model attempt records include known provider
+usage, output-validation feedback and failures, with unavailable usage labeled explicitly.
+Standalone scientific agent APIs remain in their concrete
+packages, such as `scarf.agent.biological_interpretation`.
 
 ### When to use the pipeline
 
@@ -220,7 +338,11 @@ Classify the problem before retrying:
 - **Scientific ambiguity:** preserve branches, seek another independent form of evidence, narrow the claim, or report that the available design does not resolve the alternatives.
 
 In a granular workflow, retry the lowest failed stage. A failed pipeline run is not resumable;
-start a new run, which can reuse matching complete artifacts from the earlier attempt.
+start a new run, which can reuse matching complete artifacts from the earlier attempt. An automated
+agent workflow validates its exact request and stage history before reusing completed work or
+resuming an interruption. Explicit questions require grounded answers through the advanced
+resume interface. A changed dataset, model identity, or configuration cannot be silently attached
+to an older history.
 
 ## Progress and deterministic comparisons
 
@@ -249,4 +371,8 @@ A useful handoff reports:
 
 Artifact provenance records how Scarf produced a result.
 It does not replace this study-level reasoning record.
+For an automated run, the result's plotting, markers, and report helpers resolve the exact final
+artifacts from the authoritative stage history. The result is a small address, not a second saved
+copy of requests, reports, decisions, or finalization state. The HTML report is a replaceable
+presentation of that history.
 See {doc}`index` for the implemented methods and current boundaries.

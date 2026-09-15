@@ -11,8 +11,9 @@ from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from scipy.sparse import csr_matrix
 
-from scarf.agent import CovariateCharacterization, characterize_covariates
-from scarf.agent.characterize_covariates import (
+from scarf.agent.experimental_context.contracts import CovariateCharacterization
+from scarf.agent.experimental_context.characterization import characterize_covariates
+from scarf.agent.experimental_context.characterization import (
     _Run,
     _assign_domain,
     _characterize_coefficient,
@@ -25,7 +26,7 @@ from scarf.agent.characterize_covariates import (
     _triage_columns,
     _validate_directions,
 )
-from scarf.agent.decide import DecisionValidationError
+from scarf.agent.decisions.selection import DecisionValidationError
 from scarf.agent.types import ArtifactReferenceModel, Decision, EvidenceItem
 from scarf.datastore.datastore import DataStore
 from scarf.storage import ArtifactRef, ArtifactResolutionError
@@ -528,7 +529,7 @@ def test_characterize_covariates_avoids_bulk_metadata_loads(
     store = _store_with_design(tmp_path)
     cell_selection = store.snapshot_cell_selection("I")
     characterize_covariates_module = import_module(
-        "scarf.agent.characterize_covariates"
+        "scarf.agent.experimental_context.characterization"
     )
     original_fetch = store.cells.fetch
     original_fetch_all = store.cells.fetch_all
@@ -630,7 +631,7 @@ def test_covariate_direction_validation_reports_structural_errors(
 
 def test_run_ask_audits_invalid_mocked_decision(monkeypatch) -> None:
     characterize_covariates_module = import_module(
-        "scarf.agent.characterize_covariates"
+        "scarf.agent.experimental_context.characterization"
     )
     run = _Run(
         store=object(),

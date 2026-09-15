@@ -57,8 +57,8 @@
 
 - [Provenance](concepts/provenance.html): artifacts, reuse, lineage, and limits
 - [Reuse and tracing](tutorials/reuse_and_tracing.html): executable branching and inspection example
-- [Analysis with AI agents](analysis_with_agents.html): scientific decision loop, task routing, troubleshooting, and handoff
-- [Grounded agent workflow](tutorials/agent_workflow.html): executable enrichment, design, tuning, and interpretation stages
+- [Analysis with AI agents](analysis_with_agents.html): scientific decision loop, run and artifact inspection, task routing, troubleshooting, and handoff
+- [Automated agent workflow](tutorials/agent_workflow.html): executable ingest, preprocessing, tuning, finalization, interpretation, resume, and local report
 
 ## Advanced examples
 

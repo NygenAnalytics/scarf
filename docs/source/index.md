@@ -100,7 +100,7 @@ Execution choices such as thread count or local scratch are recorded separately 
 
 This record is useful whenever the analysis is long-running, revisited after a gap, or executed through a pipeline or software agent, because the dependency chain can be inspected independently of the code or description that produced it.
 See {doc}`analysis_with_agents` for the scientific decision and troubleshooting framework,
-{doc}`tutorials/agent_workflow` for its executable four-stage example,
+{doc}`tutorials/agent_workflow` for its executable automated workflow,
 {doc}`concepts/provenance` for the data model, and {doc}`tutorials/reuse_and_tracing` for an
 executable branching example.
 

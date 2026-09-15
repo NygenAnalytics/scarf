@@ -134,12 +134,29 @@ ledger under `pipeline/runs`; it does not write live metadata. DataStore-owned p
 loading, and export consume narrow frozen-run views. Completed runs can be reopened by their
 immutable label or exact run ID.
 
+`agent/` owns the optional single-RNA workflow. Its lazy root facade exposes `analyze_rna`,
+`AutomatedWorkflowResult`, and `AnalysisError`. Standalone scientific agent contracts and runners
+remain in their concrete packages: `data_enrichment`, `experimental_context`, `parameter_tuning`,
+and `biological_interpretation`. Internal modules import concrete owners rather than the root
+facade. `agent/tools/` contains only infrastructure shared by more than one agent.
+
+The orchestration stage history is the sole owner of the immutable request, scientific evidence,
+choices, checks, work reservations, recovery, and final artifact references. Checkpoints belong
+to their exact stage inputs; they do not create a second workflow lifecycle. The result is a small
+address that resolves this history. `report/` renders one replaceable analysis page from saved
+evidence. It does not call a provider or recompute scientific results.
+
 ### Presentation
 
-`plotting/` is the only plotting package.
+`plotting/` owns the reusable plotting APIs.
 It has no import dependency on `datastore`.
 The removed `scarf.plots`, `scarf.plotting._legacy`, and `DataStore.plot_*` APIs must not be restored.
 New plots should return the established plotting result types, accept documented data contracts, and use narrow adapters instead of adding storage-path knowledge.
+
+The single-RNA agent keeps its bounded final-map display in `agent/_plots.py`. This limited report
+view reads exact final artifact references, samples only displayed coordinates and labels, and
+returns the existing public `PlotResult` and provenance types. It introduces no core plotting API
+or module-load dependency from plotting to datastore.
 
 `DataStore.plots` is a thin, store-bound accessor over the canonical store-first functions in `scarf.plotting`.
 The accessor imports concrete plot implementations only when a method is called, so this convenience namespace does not reverse the dependency from plotting to datastore.

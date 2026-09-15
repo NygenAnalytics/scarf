@@ -1,1337 +1,973 @@
-"""Parameter tuning and multimodal integration workflow stages."""
+"""Sequential RNA parameter tuning and review stages."""
 
-import hashlib
-import json
+import io
 from collections.abc import Mapping, Sequence
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 import numpy as np
-from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
 from ...datastore.datastore import DataStore
-from ...utils.logging import logger
-from ..experimental_context import ExperimentalContextResult
-from ..parameter_tuning import (
-    ArtifactRecord,
-    FinalGraphComparison,
-    FinalGraphSelection,
-    IntegrationCandidateEvaluation,
-    IntegrationMetrics,
-    ParameterCandidate,
-    ParameterTuningAgent,
-    ParameterTuningAssayInput,
+from ...metadata.rows import read_metadata_rows_chunkwise
+from ...storage.refs import ArtifactRef
+from ...storage.selections import read_stored_selection_indices
+from ...storage.types import as_zarr_array
+from ..config.agent_exec import (
+    ImageEvidence,
+)
+from ..experimental_context.contracts import ExperimentalContextResult
+from ..experimental_context.study import StudyContract
+from ..parameter_tuning.contracts import (
+    ParameterCandidateEvaluation,
     ParameterTuningReport,
-    final_graph_options,
-    finalize_parameter_tuning_selection,
-    validate_final_graph_selection,
 )
-from ..persistence import (
-    AgentInvocation,
-    AgentReportLink,
-    AgentReportReference,
-    AgentWorkflowRun,
-    list_agent_reports,
-    load_agent_record,
-    load_agent_report,
-    save_agent_report,
+from ..parameter_tuning.execution import (
+    _metadata_column_fingerprint,
+    candidate_metric_cache,
 )
-from ..types import ArtifactReferenceModel, ExperimentalTuningHandoff
+from ..types import ArtifactReferenceModel
 from . import journal
+from .decisions import DecisionStagesMixin
 from .models import (
     AutomatedPreprocessingPlan,
-    AutomatedWorkflowConfig,
     OrchestrationRequestRecord,
     OrchestrationResumeRecord,
     PreprocessedAssayHandoff,
+    StageEvidenceReference,
+    WorkflowIdentity,
     WorkflowNeedsInput,
     WorkflowQuestion,
     WorkflowStageAttempt,
     WorkflowStageLink,
+    WorkflowStageName,
     artifact_model_to_ref,
 )
 
 
-class TuningStagesMixin:
-    """Execute parameter searches, integration comparisons, and graph selection."""
+def _analysis_visual_content(
+    store: DataStore,
+    selected: ParameterCandidateEvaluation,
+    candidates: Sequence[ParameterCandidateEvaluation],
+    *,
+    qc_columns: Sequence[str] = (),
+    qc_artifact_metrics: Sequence[tuple[str, ArtifactReferenceModel]] = (),
+) -> list[ImageEvidence]:
+    """Render one bounded diagnostic board for multimodal review."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError(
+            "Visual adjudication requires the installed plotting dependencies"
+        ) from exc
 
-    model: Any
+    def image_content(figure: Any, identifier: str) -> ImageEvidence:
+        buffer = io.BytesIO()
+        figure.savefig(buffer, format="png", dpi=120)
+        plt.close(figure)
+        return ImageEvidence(
+            identifier=identifier,
+            data=buffer.getvalue(),
+            media_type="image/png",
+        )
+
+    def sampled_values(array: Any, selection: tuple[Any, ...]) -> np.ndarray:
+        return np.asarray(
+            cast(Any, as_zarr_array(array, name="diagnostic")).get_orthogonal_selection(
+                selection
+            )
+        )
+
+    coordinate_name = (
+        "harmony"
+        if selected.parameters.useHarmony
+        else selected.parameters.reductionMethod
+    )
+    coordinate_record = selected.artifacts.get(coordinate_name)
+    cluster_record = selected.artifacts.get("clusters")
+    if coordinate_record is None or cluster_record is None:
+        raise ValueError(
+            "Selected candidate lacks visualizable coordinates or clusters"
+        )
+    coordinate_group = store.load_artifact(
+        artifact_model_to_ref(
+            ArtifactReferenceModel.model_validate(coordinate_record.model_dump())
+        )
+    )
+    cluster_group = store.load_artifact(
+        artifact_model_to_ref(
+            ArtifactReferenceModel.model_validate(cluster_record.model_dump())
+        )
+    )
+    coordinate_values = as_zarr_array(coordinate_group["data"], name="data")
+    cluster_values = as_zarr_array(cluster_group["values"], name="values")
+    if len(coordinate_values.shape) != 2 or coordinate_values.shape[1] < 2:
+        raise ValueError("Selected coordinates need at least two dimensions")
+    if coordinate_values.shape[0] != cluster_values.shape[0]:
+        raise ValueError("Selected coordinates and clusters do not align")
+    sample_count = min(5_000, coordinate_values.shape[0])
+    sample_indices = np.linspace(
+        0,
+        coordinate_values.shape[0] - 1,
+        sample_count,
+        dtype=np.int64,
+    )
+    coordinates = sampled_values(
+        coordinate_values,
+        (sample_indices, slice(0, 2)),
+    ).astype(np.float32, copy=False)
+    labels = sampled_values(cluster_values, (sample_indices,))
+    _, label_codes = np.unique(labels, return_inverse=True)
+
+    comparison = max(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.candidateId != selected.candidateId
+            and candidate.status == "done"
+            and candidate.eligible
+            and candidate.parameters.dimensions == selected.parameters.dimensions
+            and candidate.parameters.neighborsK == selected.parameters.neighborsK
+            and candidate.parameters.useHarmony == selected.parameters.useHarmony
+            and candidate.artifacts.get("graphFeatures")
+            == selected.artifacts.get("graphFeatures")
+            and candidate.cellSelection == selected.cellSelection
+        ),
+        key=lambda value: (
+            value.metrics.markerCoherence or 0.0,
+            value.metrics.seedStability or 0.0,
+        ),
+        default=None,
+    )
+
+    figure, axes = plt.subplots(2, 3, figsize=(15, 9), constrained_layout=True)
+    variance = np.asarray(selected.metrics.componentVariance, dtype=float)
+    if variance.size:
+        axes[0, 0].plot(np.arange(1, variance.size + 1), variance, marker=".")
+        axes[0, 0].set_title("PCA explained variance")
+        axes[0, 0].set_xlabel("Component")
+    else:
+        axes[0, 0].text(0.5, 0.5, "Variance unavailable", ha="center")
+        axes[0, 0].set_axis_off()
+
+    axes[0, 1].scatter(
+        coordinates[:, 0],
+        coordinates[:, 1],
+        c=label_codes,
+        cmap="tab20",
+        s=2,
+        alpha=0.65,
+        rasterized=True,
+    )
+    axes[0, 1].set_title(f"Selected partition: {selected.candidateId}")
+
+    if comparison is not None and "clusters" in comparison.artifacts:
+        comparison_group = store.load_artifact(
+            artifact_model_to_ref(
+                ArtifactReferenceModel.model_validate(
+                    comparison.artifacts["clusters"].model_dump()
+                )
+            )
+        )
+        comparison_labels = sampled_values(
+            comparison_group["values"],
+            (sample_indices,),
+        )
+        _, comparison_codes = np.unique(
+            comparison_labels,
+            return_inverse=True,
+        )
+        axes[0, 2].scatter(
+            coordinates[:, 0],
+            coordinates[:, 1],
+            c=comparison_codes,
+            cmap="tab20",
+            s=2,
+            alpha=0.65,
+            rasterized=True,
+        )
+        axes[0, 2].set_title(f"Matched alternative: {comparison.candidateId}")
+    else:
+        axes[0, 2].text(0.5, 0.5, "No matched alternative", ha="center")
+        axes[0, 2].set_axis_off()
+
+    completed = [
+        candidate
+        for candidate in candidates
+        if candidate.status == "done"
+        and candidate.eligible
+        and candidate.parameters.dimensions == selected.parameters.dimensions
+        and candidate.parameters.neighborsK == selected.parameters.neighborsK
+        and candidate.parameters.useHarmony == selected.parameters.useHarmony
+    ]
+    resolutions = [value.parameters.leidenResolution for value in completed]
+    axes[1, 0].plot(
+        resolutions,
+        [value.metrics.markerCoherence or 0.0 for value in completed],
+        marker="o",
+        label="marker coherence",
+    )
+    axes[1, 0].plot(
+        resolutions,
+        [value.metrics.seedStability or 0.0 for value in completed],
+        marker="o",
+        label="seed stability",
+    )
+    axes[1, 0].plot(
+        resolutions,
+        [value.metrics.crossUnitSupport or 0.0 for value in completed],
+        marker="o",
+        label="cross-unit support",
+    )
+    axes[1, 0].set_title("Partition evidence")
+    axes[1, 0].set_xlabel("Leiden resolution")
+    axes[1, 0].legend(fontsize=8)
+
+    doublet_records = {
+        name.removeprefix("doubletScore:"): value
+        for name, value in selected.artifacts.items()
+        if name.startswith("doubletScore:")
+    }
+    doublet_selections = {
+        name.removeprefix("doubletCellSelection:"): value
+        for name, value in selected.artifacts.items()
+        if name.startswith("doubletCellSelection:")
+    }
+    doublet_sample = np.full(sample_count, np.nan, dtype=np.float64)
+    doublet_hist_values: list[np.ndarray] = []
+    if doublet_records:
+        if selected.cellSelection is None:
+            raise ValueError("Doublet visuals require an exact cell selection")
+        parent_selection = artifact_model_to_ref(selected.cellSelection)
+        parent_indices = read_stored_selection_indices(
+            store.zw,
+            parent_selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
+        ).astype(np.int64, copy=False)
+        sampled_global_indices = parent_indices[sample_indices]
+        for score_index, record in sorted(doublet_records.items()):
+            score_group = store.load_artifact(
+                artifact_model_to_ref(
+                    ArtifactReferenceModel.model_validate(record.model_dump())
+                )
+            )
+            score_values = as_zarr_array(score_group["values"], name="values")
+            selection_record = doublet_selections.get(score_index)
+            if selection_record is None:
+                if score_values.shape != parent_indices.shape:
+                    raise ValueError(
+                        "Doublet score artifact lacks its exact cell selection"
+                    )
+                local_positions = sample_indices
+                matched_positions = np.arange(sample_count, dtype=np.int64)
+            else:
+                score_selection = artifact_model_to_ref(
+                    ArtifactReferenceModel.model_validate(selection_record.model_dump())
+                )
+                score_indices = read_stored_selection_indices(
+                    store.zw,
+                    score_selection,
+                    kind="cell_selection",
+                    scope="datastore",
+                    assay=None,
+                    table_path="cellData",
+                ).astype(np.int64, copy=False)
+                if score_values.shape != score_indices.shape:
+                    raise ValueError(
+                        "Doublet scores do not align with their cell selection"
+                    )
+                candidate_positions = np.searchsorted(
+                    score_indices,
+                    sampled_global_indices,
+                )
+                within = candidate_positions < len(score_indices)
+                matched = np.zeros(sample_count, dtype=bool)
+                matched[within] = (
+                    score_indices[candidate_positions[within]]
+                    == sampled_global_indices[within]
+                )
+                matched_positions = np.flatnonzero(matched)
+                local_positions = candidate_positions[matched]
+            sampled_scores = sampled_values(score_values, (local_positions,)).astype(
+                np.float64,
+                copy=False,
+            )
+            doublet_sample[matched_positions] = sampled_scores
+            doublet_hist_values.append(sampled_scores)
+        finite_doublets = np.concatenate(doublet_hist_values)
+        finite_doublets = finite_doublets[np.isfinite(finite_doublets)]
+        axes[1, 1].hist(finite_doublets, bins=40)
+        axes[1, 1].set_title("Advisory doublet scores")
+    else:
+        axes[1, 1].text(0.5, 0.5, "Doublet scores unavailable", ha="center")
+        axes[1, 1].set_axis_off()
+
+    family_values = {
+        **selected.metrics.loadingFamilyEnrichment,
+        **selected.metrics.markerFamilyEnrichment,
+    }
+    if family_values:
+        ordered = sorted(
+            family_values.items(),
+            key=lambda item: (-item[1], item[0]),
+        )[:12]
+        axes[1, 2].barh(
+            [name for name, _value in reversed(ordered)],
+            [value for _name, value in reversed(ordered)],
+        )
+        axes[1, 2].set_title("Feature-family enrichment")
+    else:
+        axes[1, 2].text(0.5, 0.5, "Family evidence unavailable", ha="center")
+        axes[1, 2].set_axis_off()
+
+    content = [image_content(figure, "analysis-overview")]
+
+    paired_corrections: list[
+        tuple[ParameterCandidateEvaluation, ParameterCandidateEvaluation]
+    ] = []
+    candidates_by_parameters: dict[
+        tuple[str, int, int, float, str, str],
+        dict[bool, ParameterCandidateEvaluation],
+    ] = {}
+    for candidate in candidates:
+        if candidate.status != "done" or not candidate.eligible:
+            continue
+        key = (
+            candidate.parameters.reductionMethod,
+            candidate.parameters.dimensions,
+            candidate.parameters.neighborsK,
+            candidate.parameters.leidenResolution,
+            candidate.artifacts["graphFeatures"].model_dump_json()
+            if "graphFeatures" in candidate.artifacts
+            else "",
+            candidate.cellSelection.model_dump_json()
+            if candidate.cellSelection is not None
+            else "",
+        )
+        candidates_by_parameters.setdefault(key, {})[
+            candidate.parameters.useHarmony
+        ] = candidate
+    for correction_pair in candidates_by_parameters.values():
+        if False in correction_pair and True in correction_pair:
+            paired_corrections.append((correction_pair[False], correction_pair[True]))
+    if paired_corrections:
+        native, harmony = min(
+            paired_corrections,
+            key=lambda pair: (
+                abs(pair[0].parameters.dimensions - selected.parameters.dimensions),
+                abs(pair[0].parameters.neighborsK - selected.parameters.neighborsK),
+                abs(
+                    pair[0].parameters.leidenResolution
+                    - selected.parameters.leidenResolution
+                ),
+            ),
+        )
+        correction_figure, correction_axes = plt.subplots(
+            2,
+            2,
+            figsize=(11, 10),
+            constrained_layout=True,
+        )
+        batch_columns = [
+            column
+            for column in (
+                *native.metrics.batchMixing,
+                *harmony.metrics.batchMixing,
+            )
+            if column in store.cells.columns
+        ]
+        batch_codes: np.ndarray | None = None
+        batch_label = "Batch unavailable"
+        if batch_columns and selected.cellSelection is not None:
+            parent_selection = artifact_model_to_ref(selected.cellSelection)
+            parent_indices = read_stored_selection_indices(
+                store.zw,
+                parent_selection,
+                kind="cell_selection",
+                scope="datastore",
+                assay=None,
+                table_path="cellData",
+            ).astype(np.int64, copy=False)
+            batch_label = batch_columns[0]
+            batch_values = read_metadata_rows_chunkwise(
+                store.cells,
+                batch_label,
+                parent_indices[sample_indices],
+            ).astype(str)
+            _, batch_codes = np.unique(batch_values, return_inverse=True)
+        for column_index, candidate in enumerate((native, harmony)):
+            name = (
+                "harmony"
+                if candidate.parameters.useHarmony
+                else candidate.parameters.reductionMethod
+            )
+            candidate_coordinate = candidate.artifacts.get(name)
+            candidate_cluster = candidate.artifacts.get("clusters")
+            if candidate_coordinate is None or candidate_cluster is None:
+                raise ValueError("Matched correction candidate lacks visual artifacts")
+            candidate_coordinate_group = store.load_artifact(
+                artifact_model_to_ref(
+                    ArtifactReferenceModel.model_validate(
+                        candidate_coordinate.model_dump()
+                    )
+                )
+            )
+            candidate_cluster_group = store.load_artifact(
+                artifact_model_to_ref(
+                    ArtifactReferenceModel.model_validate(
+                        candidate_cluster.model_dump()
+                    )
+                )
+            )
+            candidate_coordinates = sampled_values(
+                candidate_coordinate_group["data"],
+                (sample_indices, slice(0, 2)),
+            )
+            candidate_labels = sampled_values(
+                candidate_cluster_group["values"],
+                (sample_indices,),
+            )
+            _, candidate_codes = np.unique(
+                candidate_labels,
+                return_inverse=True,
+            )
+            title = "Harmony" if candidate.parameters.useHarmony else "Native PCA"
+            correction_axes[0, column_index].scatter(
+                candidate_coordinates[:, 0],
+                candidate_coordinates[:, 1],
+                c=candidate_codes,
+                cmap="tab20",
+                s=2,
+                alpha=0.65,
+                rasterized=True,
+            )
+            correction_axes[0, column_index].set_title(f"{title}, partition colors")
+            if batch_codes is not None:
+                correction_axes[1, column_index].scatter(
+                    candidate_coordinates[:, 0],
+                    candidate_coordinates[:, 1],
+                    c=batch_codes,
+                    cmap="tab20",
+                    s=2,
+                    alpha=0.65,
+                    rasterized=True,
+                )
+                correction_axes[1, column_index].set_title(
+                    f"{title}, {batch_label} colors"
+                )
+            else:
+                correction_axes[1, column_index].text(
+                    0.5,
+                    0.5,
+                    batch_label,
+                    ha="center",
+                )
+                correction_axes[1, column_index].set_axis_off()
+        correction_figure.suptitle(
+            "Parameter-matched native and Harmony representations"
+        )
+        content.append(image_content(correction_figure, "native-harmony-comparison"))
+
+    marker_record = selected.artifacts.get("markerTable")
+    marker_genes = list(
+        dict.fromkeys(
+            gene for genes in selected.metrics.topMarkerGenes.values() for gene in genes
+        )
+    )[:24]
+    if marker_record is not None and marker_genes:
+        marker_ref = artifact_model_to_ref(
+            ArtifactReferenceModel.model_validate(marker_record.model_dump())
+        )
+        marker_table = store.get_markers(
+            marker_ref,
+            min_score=0.25,
+            min_frac_exp=0.2,
+        )
+        required_marker_columns = {"group_id", "feature_name", "score"}
+        if required_marker_columns.issubset(marker_table.columns):
+            marker_groups = sorted(
+                selected.metrics.topMarkerGenes,
+                key=lambda value: (
+                    (0, int(value)) if value.lstrip("-").isdigit() else (1, value)
+                ),
+            )
+            marker_scores = np.zeros(
+                (len(marker_groups), len(marker_genes)),
+                dtype=np.float64,
+            )
+            group_positions = {
+                value: index for index, value in enumerate(marker_groups)
+            }
+            gene_positions = {value: index for index, value in enumerate(marker_genes)}
+            for row in marker_table.itertuples(index=False):
+                group = str(getattr(row, "group_id"))
+                gene = str(getattr(row, "feature_name"))
+                if group not in group_positions or gene not in gene_positions:
+                    continue
+                score = float(getattr(row, "score"))
+                if np.isfinite(score):
+                    marker_scores[group_positions[group], gene_positions[gene]] = max(
+                        marker_scores[
+                            group_positions[group],
+                            gene_positions[gene],
+                        ],
+                        score,
+                    )
+
+            def tagged_gene(gene: str) -> str:
+                upper = gene.upper()
+                if upper.startswith("MT-"):
+                    return f"{gene} [mitochondrial]"
+                if upper.startswith(("MRPS", "MRPL")):
+                    return f"{gene} [mitoribosomal]"
+                if upper.startswith(("RPS", "RPL")):
+                    return f"{gene} [ribosomal]"
+                if upper.startswith("CCN"):
+                    return f"{gene} [CCN]"
+                if upper.startswith("HLA-"):
+                    return f"{gene} [HLA]"
+                if upper.startswith("H2-"):
+                    return f"{gene} [H2]"
+                if upper.startswith("HIST"):
+                    return f"{gene} [histone]"
+                if upper in {
+                    "XIST",
+                    "DDX3Y",
+                    "USP9Y",
+                    "EIF1AY",
+                    "KDM5D",
+                    "SRY",
+                    "ZFY",
+                    "UTY",
+                    "TMSB4Y",
+                    "NLGN4Y",
+                }:
+                    return f"{gene} [sex-linked]"
+                return gene
+
+            marker_figure, marker_axis = plt.subplots(
+                figsize=(max(9, len(marker_genes) * 0.45), 6),
+                constrained_layout=True,
+            )
+            marker_image = marker_axis.imshow(
+                marker_scores,
+                aspect="auto",
+                interpolation="nearest",
+                cmap="viridis",
+            )
+            marker_axis.set_xticks(
+                np.arange(len(marker_genes)),
+                [tagged_gene(gene) for gene in marker_genes],
+                rotation=75,
+                ha="right",
+                fontsize=8,
+            )
+            marker_axis.set_yticks(
+                np.arange(len(marker_groups)),
+                marker_groups,
+            )
+            marker_axis.set_xlabel("Top marker feature")
+            marker_axis.set_ylabel("Cluster")
+            marker_axis.set_title("Feature-level marker score heatmap")
+            marker_figure.colorbar(marker_image, ax=marker_axis, label="marker score")
+            content.append(image_content(marker_figure, "marker-score-heatmap"))
+
+    available_qc_columns = [
+        column
+        for column in dict.fromkeys([*qc_columns, *selected.metrics.qcPcaAssociation])
+        if column in store.cells.columns
+    ]
+    qc_sources: list[tuple[str, ArtifactReferenceModel | None]] = [
+        (column, None) for column in available_qc_columns
+    ]
+    known_qc_names = set(available_qc_columns)
+    for qc_name, reference in qc_artifact_metrics:
+        if qc_name not in known_qc_names:
+            qc_sources.append((qc_name, reference))
+            known_qc_names.add(qc_name)
+    qc_sources = qc_sources[:4]
+    if qc_sources or np.isfinite(doublet_sample).any():
+        diagnostic_count = len(qc_sources) + 1
+        qc_figure, qc_axes = plt.subplots(
+            1,
+            diagnostic_count,
+            figsize=(max(5, diagnostic_count * 3.2), 4),
+            constrained_layout=True,
+        )
+        qc_axis_list = np.atleast_1d(qc_axes).tolist()
+        if selected.cellSelection is None:
+            raise ValueError("QC visuals require an exact cell selection")
+        parent_selection = artifact_model_to_ref(selected.cellSelection)
+        parent_indices = read_stored_selection_indices(
+            store.zw,
+            parent_selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
+        ).astype(np.int64, copy=False)
+        sampled_parent_indices = parent_indices[sample_indices]
+        for axis, (qc_name, artifact) in zip(
+            qc_axis_list,
+            qc_sources,
+            strict=False,
+        ):
+            if artifact is None:
+                values = np.asarray(
+                    read_metadata_rows_chunkwise(
+                        store.cells,
+                        qc_name,
+                        sampled_parent_indices,
+                    ),
+                    dtype=np.float64,
+                )
+            else:
+                artifact_ref = artifact_model_to_ref(artifact)
+                artifact_group = store.load_artifact(artifact_ref)
+                artifact_values = as_zarr_array(
+                    artifact_group["values"],
+                    name="values",
+                )
+                if artifact_values.shape == parent_indices.shape:
+                    artifact_positions = sample_indices
+                else:
+                    artifact_status = store.inspect_artifact(artifact_ref)
+                    raw_selection = (
+                        getattr(artifact_status, "inputs", None) or {}
+                    ).get("cell_selection")
+                    if not isinstance(raw_selection, Mapping):
+                        raise ValueError(
+                            f"QC artifact {qc_name!r} lacks its cell selection"
+                        )
+                    artifact_selection = ArtifactRef.from_dict(dict(raw_selection))
+                    artifact_indices = read_stored_selection_indices(
+                        store.zw,
+                        artifact_selection,
+                        kind="cell_selection",
+                        scope="datastore",
+                        assay=None,
+                        table_path="cellData",
+                    ).astype(np.int64, copy=False)
+                    candidate_positions = np.searchsorted(
+                        artifact_indices,
+                        sampled_parent_indices,
+                    )
+                    if np.any(
+                        candidate_positions >= len(artifact_indices)
+                    ) or not np.array_equal(
+                        artifact_indices[candidate_positions],
+                        sampled_parent_indices,
+                    ):
+                        raise ValueError(
+                            f"QC artifact {qc_name!r} does not cover selected cells"
+                        )
+                    artifact_positions = candidate_positions
+                values = sampled_values(
+                    artifact_values,
+                    (artifact_positions,),
+                ).astype(np.float64, copy=False)
+            finite_values = values[np.isfinite(values)]
+            axis.violinplot(finite_values, showmedians=True)
+            jitter = (
+                (np.arange(len(finite_values), dtype=np.float64) % 23.0) - 11.0
+            ) / 115.0
+            axis.scatter(
+                np.ones(len(finite_values)) + jitter,
+                finite_values,
+                s=1,
+                alpha=0.15,
+                rasterized=True,
+            )
+            axis.set_xticks([])
+            axis.set_title(qc_name)
+        doublet_axis = qc_axis_list[-1]
+        finite_doublet_mask = np.isfinite(doublet_sample)
+        if finite_doublet_mask.any():
+            doublet_plot = doublet_axis.scatter(
+                coordinates[finite_doublet_mask, 0],
+                coordinates[finite_doublet_mask, 1],
+                c=doublet_sample[finite_doublet_mask],
+                cmap="magma",
+                s=2,
+                alpha=0.7,
+                rasterized=True,
+            )
+            doublet_axis.set_title("Advisory doublet score")
+            qc_figure.colorbar(
+                doublet_plot,
+                ax=doublet_axis,
+                label="score",
+            )
+        else:
+            doublet_axis.text(
+                0.5,
+                0.5,
+                "Doublet embedding unavailable",
+                ha="center",
+            )
+            doublet_axis.set_axis_off()
+        qc_figure.suptitle("Selected-cell QC and non-removing doublet evidence")
+        content.append(image_content(qc_figure, "qc-doublet-diagnostics"))
+    return content
+
+
+def _tuning_revision_provenances(
+    store: DataStore,
+    prefix: str,
+    workflow_run_id: str,
+    request: OrchestrationRequestRecord,
+    experimental_reference: StageEvidenceReference,
+    inputs: dict[str, Any],
+    previous_starts: Sequence[WorkflowStageAttempt],
+) -> list[dict[str, Any]]:
+    """Authorize changed interpretation only along committed context revisions."""
+    previous_inputs = [
+        {
+            key: value
+            for key, value in previous.inputs.items()
+            if key not in {"resumeAnswers", "answeredAttempt"}
+        }
+        for previous in previous_starts
+    ]
+    changed = [value for value in previous_inputs if value != inputs]
+    if not changed:
+        return []
+    contexts = journal._stage_outcomes(
+        store.zw, prefix, workflow_run_id, "experimental_context"
+    )
+    current = next(
+        (row for row in contexts if experimental_reference in row.reportReferences),
+        None,
+    )
+    if (
+        current is None
+        or current.status != "done"
+        or current.outputs.get("studyContract") != inputs["studyContract"]
+        or current.requestSha256 != request.requestSha256
+        or current.configSha256 != request.configSha256
+    ):
+        raise ValueError(
+            "Tuning inputs changed; changed evidence requires its exact completed context revision"
+        )
+    ancestors: list[dict[str, Any]] = []
+    visited: set[str] = set()
+    while current is not None and "reassessContextReport" in current.inputs:
+        if current.attemptId in visited:
+            raise ValueError("Context revision ancestry contains a cycle")
+        visited.add(current.attemptId)
+        previous_ref = current.inputs["reassessContextReport"]
+        current = next(
+            (
+                row
+                for row in contexts
+                if any(
+                    ref.model_dump(mode="json") == previous_ref
+                    for ref in row.reportReferences
+                )
+            ),
+            None,
+        )
+        if current is None or current.status != "done":
+            raise ValueError(
+                "Context revision is missing its committed previous evidence"
+            )
+        if (
+            current.requestSha256 != request.requestSha256
+            or current.configSha256 != request.configSha256
+        ):
+            raise ValueError(
+                "Context revision belongs to different request or configuration inputs"
+            )
+        ancestors.append(current.outputs["studyContract"])
+    authorized: list[dict[str, Any]] = []
+    for previous in changed:
+        if (
+            previous.get("studyContract") not in ancestors
+            or previous.get("preprocessedAssays") != inputs["preprocessedAssays"]
+            or previous.get("featureMetadataFingerprints")
+            != inputs["featureMetadataFingerprints"]
+            or any(
+                inputs["metadataFingerprints"].get(column) != fingerprint
+                for column, fingerprint in previous.get(
+                    "metadataFingerprints", {}
+                ).items()
+            )
+            or set(previous) != set(inputs)
+        ):
+            raise ValueError(
+                "Tuning inputs changed beyond an explicit context-evidence revision; "
+                "restore the original cohort, feature inputs and metadata or start a new workflow"
+            )
+        provenance = {
+            **previous,
+            "requestSha256": request.requestSha256,
+            "configSha256": request.configSha256,
+        }
+        if provenance not in authorized:
+            authorized.append(provenance)
+    return authorized
+
+
+class TuningStagesMixin(DecisionStagesMixin):
+    """Run bounded experiments and return validated full-cohort artifacts."""
 
     def parameter_tuning_stage(
         self,
         store: DataStore,
-        workflow: AgentWorkflowRun,
+        workflow: WorkflowIdentity,
         request_record: OrchestrationRequestRecord,
         parents: Sequence[WorkflowStageLink],
         plan: AutomatedPreprocessingPlan,
         preprocessed: Sequence[PreprocessedAssayHandoff],
         experimental: ExperimentalContextResult,
-        enrichment_reference: AgentReportReference,
-        experimental_reference: AgentReportReference,
+        enrichment_reference: StageEvidenceReference,
+        experimental_reference: StageEvidenceReference,
         answers: Mapping[str, Any],
         *,
+        study_contract: StudyContract | None = None,
         resume_record: OrchestrationResumeRecord | None = None,
+        stage_name: WorkflowStageName = "parameter_tuning",
     ) -> tuple[WorkflowStageAttempt, ParameterTuningReport]:
+        from .rna_tuning import RnaTuningRun
+
+        del enrichment_reference
+        if len(preprocessed) != 1 or study_contract is None:
+            raise ValueError("RNA tuning requires one assay and a study contract")
+        handoff = preprocessed[0]
+        if handoff.cellSelection is None:
+            raise ValueError("RNA tuning requires a frozen full-cohort selection")
+        columns = {
+            *study_contract.technicalBatchColumns,
+            *study_contract.protectedColumns,
+            *study_contract.independentUnitColumns,
+            *study_contract.conditionColumns,
+            *plan.cellQc.attributes,
+        }
+        if study_contract.physicalCaptureColumn is not None:
+            columns.add(study_contract.physicalCaptureColumn)
+        metadata_fingerprints = {
+            column: _metadata_column_fingerprint(store.cells, column)
+            for column in sorted(columns)
+            if column in store.cells.columns
+        }
+        feature_metadata = store.get_assay(plan.primaryAssay).feats
+        feature_fingerprints = {
+            column: _metadata_column_fingerprint(feature_metadata, column)
+            for column in ("ids", "names")
+        }
+        inputs = {
+            "preprocessedAssays": [handoff.model_dump(mode="json")],
+            "studyContract": study_contract.model_dump(mode="json"),
+            "metadataFingerprints": metadata_fingerprints,
+            "featureMetadataFingerprints": feature_fingerprints,
+        }
         prefix = journal._ensure_orchestration_store(store)
+        previous_provenances = _tuning_revision_provenances(
+            store,
+            prefix,
+            workflow.workflowRunId,
+            request_record,
+            experimental_reference,
+            inputs,
+            journal._stage_starts(store.zw, prefix, workflow.workflowRunId, stage_name),
+        )
         existing = journal._validated_done_outcome(
             store,
             prefix,
             workflow.workflowRunId,
-            "parameter_tuning",
+            stage_name,
             request_record,
             parents,
         )
         if existing is not None:
-            logger.info(
-                f"Workflow {workflow.workflowRunId}: reusing Parameter Tuning report"
+            return existing, cast(
+                ParameterTuningReport,
+                journal.load_stage_report(store, existing, ParameterTuningReport),
             )
-            report = journal.load_stage_report(store, existing, ParameterTuningReport)
-            return existing, cast(ParameterTuningReport, report)
-        paused = journal._validated_done_outcome(
-            store,
-            prefix,
-            workflow.workflowRunId,
-            "parameter_tuning",
-            request_record,
-            parents,
-            required_status="needsInput",
-        )
-        resumable_report: ParameterTuningReport | None = None
-        if paused is not None and paused.reportReferences:
-            loaded = journal.load_stage_report(store, paused, ParameterTuningReport)
-            candidate_report = cast(ParameterTuningReport, loaded)
-            if (
-                candidate_report.finalSelection is not None
-                and candidate_report.finalSelection.status == "needsInput"
-                and candidate_report.assayReports
-            ):
-                resumable_report = candidate_report
-        cell_selection = preprocessed[0].cellSelection if preprocessed else None
-        if cell_selection is None or any(
-            value.cellSelection != cell_selection for value in preprocessed
-        ):
-            raise ValueError("Preprocessed assays must share one exact cell selection")
-        experimental_handoff = experimental.to_parameter_tuning_handoff().model_copy(
-            update={"cellSelection": cell_selection}
-        )
-        tuning_answer = answers.get("parameter_tuning")
-        if isinstance(tuning_answer, Mapping):
-            tuning_directions = json.dumps(
-                dict(tuning_answer),
-                sort_keys=True,
-            )
-        elif isinstance(tuning_answer, str):
-            tuning_directions = tuning_answer.strip()
-        else:
-            tuning_directions = ""
         started = journal._start_attempt(
             store.zw,
             prefix,
             workflow.workflowRunId,
-            "parameter_tuning",
+            stage_name,
             request_record,
             parents,
-            inputs={
-                "preprocessedAssays": [
-                    value.model_dump(mode="json") for value in preprocessed
-                ],
-                "experimentalTuningHandoff": experimental_handoff.model_dump(
-                    mode="json"
-                ),
-                "cellSelection": cell_selection.model_dump(mode="json"),
-                "primaryAssay": plan.primaryAssay,
-                "markerAssay": plan.markerAssay,
-                "pairedAssays": plan.pairedAssays,
-                "finalGraphOptionId": answers.get("finalGraphOptionId"),
-                "parameterTuning": tuning_answer,
-                "resumeFromAttempt": (
-                    paused.attemptId
-                    if paused is not None and resumable_report is not None
-                    else None
-                ),
-            },
+            inputs=inputs,
             resume_record=resume_record,
         )
-        report = ParameterTuningReport.get_blank()
-        actions: list[str] = []
-        integration_evaluations: list[IntegrationCandidateEvaluation] = []
-        candidate_payload: dict[str, list[dict[str, Any]]] = {}
-        paired = list(plan.pairedAssays)
-        logger.info(
-            f"Workflow {workflow.workflowRunId}: Parameter Tuning started for "
-            f"{len(preprocessed)} assay(s), paired={len(paired)}"
+        runner = RnaTuningRun(
+            self,
+            store,
+            workflow,
+            request_record,
+            plan,
+            handoff,
+            study_contract,
+            answers,
+            {
+                **inputs,
+                "requestSha256": request_record.requestSha256,
+                "configSha256": request_record.configSha256,
+            },
+            design_comparisons=experimental.characterization.comparisons,
+            previous_provenances=previous_provenances,
         )
         try:
-            agent = ParameterTuningAgent(
-                self.model,
-                config=request_record.config.agentRunConfig,
-            )
-            recovered = journal._recover_persisted_stage_report(
+            with candidate_metric_cache():
+                report, evidence = runner.run()
+            saved_report, reference = journal._save_stage_report(
                 store,
-                started,
-                agent_name="parameter_tuning",
-                expected_type=ParameterTuningReport,
-            )
-            if recovered is not None:
-                recovered_report, recovered_reference = recovered
-                report = cast(ParameterTuningReport, recovered_report)
-                integration_evaluations = list(report.integrationEvaluations)
-                candidate_payload = {
-                    assay: [
-                        evaluation.parameters.model_dump(mode="json")
-                        for evaluation in assay_report.evaluations
-                    ]
-                    for assay, assay_report in report.assayReports.items()
-                }
-                actions.append("recover_persisted_parameter_tuning_report")
-                logger.info(
-                    f"Workflow {workflow.workflowRunId}: recovering completed "
-                    "Parameter Tuning provider result"
-                )
-                return self.save_parameter_tuning_outcome(
-                    store,
-                    prefix,
-                    workflow,
-                    request_record,
-                    started,
-                    report,
-                    plan,
-                    preprocessed,
-                    integration_evaluations,
-                    candidate_payload,
-                    paired,
-                    enrichment_reference,
-                    experimental_reference,
-                    experimental_handoff,
-                    agent,
-                    actions,
-                    persisted_reference=recovered_reference,
-                )
-            if resumable_report is not None:
-                assert paused is not None
-                resumed_integration_evaluations = list(
-                    resumable_report.integrationEvaluations
-                )
-                report = resumable_report.model_copy(
-                    update={
-                        "status": "done",
-                        "needsInput": None,
-                        "finalSelection": None,
-                        "recommendedIntegrationId": None,
-                        "finalClusterColumn": None,
-                        "finalClusterArtifact": None,
-                        "graphAssay": None,
-                    }
-                )
-                report = self.select_final_graph(
-                    agent,
-                    report,
-                    resumed_integration_evaluations,
-                    marker_assay=plan.markerAssay,
-                    answers=answers,
-                )
-                logger.info(
-                    f"Workflow {workflow.workflowRunId}: resumed final graph "
-                    "selection without rerunning candidate evaluation"
-                )
-                resumed_candidate_payload = {
-                    assay: [
-                        evaluation.parameters.model_dump(mode="json")
-                        for evaluation in assay_report.evaluations
-                    ]
-                    for assay, assay_report in report.assayReports.items()
-                }
-                return self.save_parameter_tuning_outcome(
-                    store,
-                    prefix,
-                    workflow,
-                    request_record,
-                    started,
-                    report,
-                    plan,
-                    preprocessed,
-                    resumed_integration_evaluations,
-                    resumed_candidate_payload,
-                    list(plan.pairedAssays),
-                    enrichment_reference,
-                    experimental_reference,
-                    experimental_handoff,
-                    agent,
-                    ["reuse_parameter_screen_and_integrations"],
-                    prior_tuning_reference=paused.reportReferences[0],
-                )
-            handoff_by_assay = {value.assay: value for value in preprocessed}
-            common_k = None
-            if paired:
-                common_k = min(
-                    21,
-                    min(handoff_by_assay[assay].nCells - 1 for assay in paired),
-                )
-                if common_k < 2:
-                    raise ValueError("Paired integration requires at least three cells")
-            integration_budget = (
-                2 * request_record.config.integrationResolutionCandidates
-                if len(paired) >= 2
-                else 0
-            )
-            assay_inputs: list[ParameterTuningAssayInput] = []
-            for handoff in preprocessed:
-                if handoff.normalized is None:
-                    raise ValueError(f"Assay {handoff.assay!r} lacks normalization")
-                initial_count = (
-                    request_record.config.primaryInitialCandidates
-                    if handoff.assay == plan.primaryAssay
-                    else request_record.config.secondaryInitialCandidates
-                )
-                neighbors_k = common_k or min(11, handoff.nCells - 1)
-                candidates = self.initial_parameter_candidates(
-                    workflow.workflowRunId,
-                    handoff,
-                    count=initial_count,
-                    neighbors_k=neighbors_k,
-                )
-                if (
-                    experimental_handoff.batchAction == "evaluateHarmony"
-                    and request_record.config.maxHarmonyCandidatesPerAssay == 1
-                ):
-                    baseline = candidates[0]
-                    candidates.append(
-                        baseline.model_copy(
-                            update={
-                                "candidateId": f"{baseline.candidateId}_harmony",
-                                "useHarmony": True,
-                            }
-                        )
-                    )
-                candidate_payload[handoff.assay] = [
-                    value.model_dump(mode="json") for value in candidates
-                ]
-                logger.info(
-                    f"Workflow {workflow.workflowRunId}: planned "
-                    f"{len(candidates)} native candidate(s) for assay "
-                    f"{handoff.assay!r} (harmony="
-                    f"{sum(value.useHarmony for value in candidates)})"
-                )
-                assay_inputs.append(
-                    ParameterTuningAssayInput(
-                        normalized=artifact_model_to_ref(handoff.normalized),
-                        candidates=candidates,
-                        batchColumns=(
-                            list(experimental_handoff.batchColumns)
-                            if experimental_handoff.batchAction == "evaluateHarmony"
-                            else []
-                        ),
-                        preservationColumns=list(
-                            experimental_handoff.preservationColumns
-                        ),
-                        experimentalHandoff=(
-                            None
-                            if experimental_handoff.batchAction == "evaluateHarmony"
-                            else experimental_handoff
-                        ),
-                        maxCandidates=(
-                            len(candidates)
-                            + request_record.config.maxRefinedCandidatesPerAssay
-                        ),
-                        maxRefinedCandidates=(
-                            request_record.config.maxRefinedCandidatesPerAssay
-                        ),
-                        allowHarmonyRefinement=False,
-                        minClusterCells=request_record.config.minClusterCells,
-                        identityFeatureLimit=request_record.config.maxIdentityFeatures,
-                    )
-                )
-            planned_native = sum(value.maxCandidates for value in assay_inputs)
-            if (
-                planned_native + integration_budget
-                > request_record.config.maxCandidateBranches
-            ):
-                raise ValueError(
-                    "The native and integrated candidate plan exceeds the global "
-                    f"branch limit {request_record.config.maxCandidateBranches}"
-                )
-            logger.info(
-                f"Workflow {workflow.workflowRunId}: executing "
-                f"{planned_native} native candidate branch(es) with "
-                f"{integration_budget} reserved integration branch(es)"
-            )
-            report = agent.run_batch(
-                store,
-                assays=assay_inputs,
-                primary_assay=plan.primaryAssay,
-                max_total_candidates=(
-                    request_record.config.maxCandidateBranches - integration_budget
-                ),
-                selection_directions=tuning_directions,
-            )
-            logger.info(
-                f"Workflow {workflow.workflowRunId}: Parameter Tuning returned "
-                f"status={report.status!r}, evaluated={report.totalCandidates}"
-            )
-            if report.status == "done":
-                for assay, assay_report in report.assayReports.items():
-                    normalized = handoff_by_assay[assay].normalized
-                    assert normalized is not None
-                    agent.promote(
-                        store,
-                        report=assay_report,
-                        normalized=artifact_model_to_ref(normalized),
-                        identity_feature_limit=request_record.config.maxIdentityFeatures,
-                    )
-                    actions.append(f"promote_native:{assay}")
-                    logger.info(
-                        f"Workflow {workflow.workflowRunId}: promoted native "
-                        f"candidate {assay_report.recommendedCandidateId!r} for "
-                        f"assay {assay!r}"
-                    )
-                integration_evaluations = self.evaluate_integrations(
-                    store,
-                    workflow.workflowRunId,
-                    plan,
-                    report,
-                    experimental_handoff,
-                    request_record.config,
-                    started=started,
-                    parent_reports=[
-                        journal._report_link(enrichment_reference),
-                        journal._report_link(experimental_reference),
-                    ],
-                    actions=actions,
-                )
-                logger.info(
-                    f"Workflow {workflow.workflowRunId}: evaluated "
-                    f"{len(integration_evaluations)} integration candidate(s)"
-                )
-                report = self.select_final_graph(
-                    agent,
-                    report,
-                    integration_evaluations,
-                    marker_assay=plan.markerAssay,
-                    answers=answers,
-                )
-            return self.save_parameter_tuning_outcome(
-                store,
-                prefix,
-                workflow,
-                request_record,
                 started,
                 report,
-                plan,
-                preprocessed,
-                integration_evaluations,
-                candidate_payload,
-                paired,
-                enrichment_reference,
-                experimental_reference,
-                experimental_handoff,
-                agent,
-                actions,
+                expected_type=ParameterTuningReport,
+                attempt_owned=True,
             )
-        except Exception as exc:
-            failure_artifacts: dict[str, ArtifactReferenceModel] = {
-                "cellSelection": cell_selection
+            report = cast(ParameterTuningReport, saved_report)
+            artifacts = {
+                f"{candidate.candidateId}:{name}": ArtifactReferenceModel.model_validate(
+                    value.model_dump()
+                )
+                for candidate in report.evaluations
+                for name, value in candidate.artifacts.items()
             }
-            for assay, assay_report in report.assayReports.items():
-                for evaluation in assay_report.evaluations:
-                    for name, artifact in evaluation.artifacts.items():
-                        failure_artifacts[
-                            f"{assay}_{evaluation.parameters.candidateId}_{name}"
-                        ] = ArtifactReferenceModel.model_validate(artifact.model_dump())
-            for integration_evaluation in integration_evaluations:
-                if integration_evaluation.graphArtifact is not None:
-                    failure_artifacts[
-                        f"{integration_evaluation.integrationId}_graph"
-                    ] = ArtifactReferenceModel.model_validate(
-                        integration_evaluation.graphArtifact.model_dump()
-                    )
-                if integration_evaluation.clusterArtifact is not None:
-                    failure_artifacts[
-                        f"{integration_evaluation.integrationId}_clusters"
-                    ] = ArtifactReferenceModel.model_validate(
-                        integration_evaluation.clusterArtifact.model_dump()
-                    )
+            pending = None
+            if report.status == "needsInput":
+                assert report.needsInput is not None
+                pending = WorkflowNeedsInput(
+                    questions=[
+                        WorkflowQuestion(
+                            questionId="parameter_tuning",
+                            question=report.needsInput.question,
+                            options=report.needsInput.options,
+                            evidenceIds=report.needsInput.evidenceIds,
+                        )
+                    ]
+                )
+            outcome = journal._complete_attempt(
+                started,
+                status=report.status,
+                report_references=[reference],
+                artifacts=artifacts,
+                outputs={
+                    "tuningEvidence": evidence,
+                    "candidateCount": report.totalCandidates,
+                },
+                needs_input=pending,
+                actions=[
+                    "assess_rna_defaults",
+                    "execute_evidence_requested_experiments",
+                    "validate_full_cohort",
+                ],
+            )
+            journal._save_outcome(store.zw, prefix, outcome)
+            return outcome, report
+        except Exception as exc:
             outcome = journal.finish_exception(
                 store,
                 prefix,
                 workflow,
                 started,
                 exc,
-                artifacts=failure_artifacts,
-                actions=actions,
-                outputs={
-                    "candidatePlan": candidate_payload,
-                    "integrationEvaluations": [
-                        value.model_dump(mode="json")
-                        for value in integration_evaluations
-                    ],
-                },
+                outputs={"tuningEvidence": runner.summary()},
             )
             return outcome, ParameterTuningReport.get_blank()
-
-    def select_final_graph(
-        self,
-        agent: ParameterTuningAgent,
-        report: ParameterTuningReport,
-        integration_evaluations: Sequence[IntegrationCandidateEvaluation],
-        *,
-        marker_assay: str,
-        answers: Mapping[str, Any],
-    ) -> ParameterTuningReport:
-        directed_option = answers.get("finalGraphOptionId")
-        if not isinstance(directed_option, str) or not directed_option:
-            logger.info(
-                f"Selecting final graph from native and "
-                f"{len(integration_evaluations)} integration evaluation(s)"
-            )
-            return agent.select_final(
-                report=report,
-                integration_evaluations=integration_evaluations,
-                marker_assay=marker_assay,
-            )
-        options = final_graph_options(report, integration_evaluations)
-        if directed_option not in options:
-            raise ValueError("finalGraphOptionId is not an eligible option")
-        logger.info(f"Applying caller-selected final graph {directed_option!r}")
-        selected_evidence = list(options[directed_option]["evidenceIds"])
-        selection = FinalGraphSelection(
-            status="done",
-            selectedOptionId=directed_option,
-            markerAssay=marker_assay,
-            confidence="high",
-            rationale="The caller selected this persisted eligible option.",
-            evidenceIds=selected_evidence,
-            comparisons=[
-                FinalGraphComparison(
-                    optionId=option_id,
-                    summary="The caller preferred the selected eligible option.",
-                    evidenceIds=[
-                        *selected_evidence,
-                        *cast(list[str], option["evidenceIds"]),
-                    ],
-                )
-                for option_id, option in options.items()
-                if option_id != directed_option
-            ],
-        )
-        selection = validate_final_graph_selection(
-            selection,
-            report,
-            integration_evaluations=integration_evaluations,
-            marker_assay=marker_assay,
-        )
-        return finalize_parameter_tuning_selection(
-            report,
-            marker_assay=marker_assay,
-            integration_evaluations=integration_evaluations,
-            recommended_integration_id=selection.integrationId,
-            native_assay=selection.nativeAssay,
-            final_selection=selection,
-        )
-
-    def save_parameter_tuning_outcome(
-        self,
-        store: DataStore,
-        prefix: str,
-        workflow: AgentWorkflowRun,
-        request_record: OrchestrationRequestRecord,
-        started: WorkflowStageAttempt,
-        report: ParameterTuningReport,
-        plan: AutomatedPreprocessingPlan,
-        preprocessed: Sequence[PreprocessedAssayHandoff],
-        integration_evaluations: Sequence[IntegrationCandidateEvaluation],
-        candidate_payload: Mapping[str, list[dict[str, Any]]],
-        paired: Sequence[str],
-        enrichment_reference: AgentReportReference,
-        experimental_reference: AgentReportReference,
-        experimental_handoff: ExperimentalTuningHandoff,
-        agent: ParameterTuningAgent,
-        actions: Sequence[str],
-        *,
-        prior_tuning_reference: AgentReportReference | None = None,
-        persisted_reference: AgentReportReference | None = None,
-    ) -> tuple[WorkflowStageAttempt, ParameterTuningReport]:
-        if experimental_handoff.cellSelection is None:
-            raise ValueError("Parameter tuning handoff lacks an exact cell selection")
-        if report.cellSelection != experimental_handoff.cellSelection:
-            raise ValueError("Parameter tuning report uses a different cell selection")
-        invocation_artifacts: dict[str, ArtifactReferenceModel] = {}
-        for value in preprocessed:
-            if value.normalized is not None:
-                invocation_artifacts[f"{value.assay}_normalized"] = value.normalized
-        invocation_artifacts["cellSelection"] = experimental_handoff.cellSelection
-        for integration_evaluation in integration_evaluations:
-            if integration_evaluation.graphArtifact is not None:
-                invocation_artifacts[
-                    f"{integration_evaluation.integrationId}_graph"
-                ] = ArtifactReferenceModel.model_validate(
-                    integration_evaluation.graphArtifact.model_dump()
-                )
-            if integration_evaluation.clusterArtifact is not None:
-                invocation_artifacts[
-                    f"{integration_evaluation.integrationId}_clusters"
-                ] = ArtifactReferenceModel.model_validate(
-                    integration_evaluation.clusterArtifact.model_dump()
-                )
-        stage_artifacts = dict(invocation_artifacts)
-        for assay, assay_report in report.assayReports.items():
-            for name, artifact in assay_report.selectedArtifacts.items():
-                stage_artifacts[f"{assay}_{name}"] = (
-                    ArtifactReferenceModel.model_validate(artifact.model_dump())
-                )
-        if report.finalClusterArtifact is not None:
-            stage_artifacts["final_clusters"] = ArtifactReferenceModel.model_validate(
-                report.finalClusterArtifact.model_dump()
-            )
-        if report.recommendedIntegrationId is not None:
-            selected_integration = next(
-                value
-                for value in integration_evaluations
-                if value.integrationId == report.recommendedIntegrationId
-            )
-            if selected_integration.graphArtifact is not None:
-                stage_artifacts["final_graph"] = ArtifactReferenceModel.model_validate(
-                    selected_integration.graphArtifact.model_dump()
-                )
-        elif report.graphAssay is not None:
-            assay_reports = report.assayReports or {report.fromAssay: report}
-            graph_artifact = assay_reports[report.graphAssay].selectedArtifacts[
-                "connectivityMap"
-            ]
-            stage_artifacts["final_graph"] = ArtifactReferenceModel.model_validate(
-                graph_artifact.model_dump()
-            )
-        checkpoint_ids = {
-            f"{journal._stage_execution_id(started)}_integration_{method}"
-            for method in {evaluation.method for evaluation in integration_evaluations}
-        }
-        checkpoint_references = sorted(
-            (
-                reference
-                for reference in list_agent_reports(
-                    store,
-                    started.workflowRunId,
-                    agent_name="parameter_tuning",
-                )
-                if reference.agentRunId in checkpoint_ids
-            ),
-            key=lambda value: value.agentRunId,
-        )
-        if persisted_reference is None:
-            saved_report, reference = journal._save_stage_report(
-                store,
-                started,
-                report,
-                invocation=AgentInvocation(
-                    agentName="parameter_tuning",
-                    parentReports=[
-                        journal._report_link(enrichment_reference),
-                        journal._report_link(experimental_reference),
-                        *(
-                            [journal._report_link(prior_tuning_reference)]
-                            if prior_tuning_reference is not None
-                            else []
-                        ),
-                        *[
-                            journal._report_link(value)
-                            for value in checkpoint_references
-                        ],
-                    ],
-                    inputs={
-                        "assays": dict(candidate_payload),
-                        "primaryAssay": plan.primaryAssay,
-                        "markerAssay": plan.markerAssay,
-                        "pairedAssays": list(paired),
-                        "cellSelection": (
-                            experimental_handoff.cellSelection.model_dump(mode="json")
-                            if experimental_handoff.cellSelection is not None
-                            else None
-                        ),
-                        "maxCandidateBranches": request_record.config.maxCandidateBranches,
-                    },
-                    artifacts=stage_artifacts,
-                    runConfig=agent.config,
-                    experimentalTuningHandoff=experimental_handoff,
-                ),
-                expected_type=ParameterTuningReport,
-            )
-            report = cast(ParameterTuningReport, saved_report)
-        else:
-            reference = persisted_reference
-        stage_report_references = [reference, *checkpoint_references]
-        operations: list[dict[str, Any]] = []
-        for assay, assay_report in report.assayReports.items():
-            for candidate_evaluation in assay_report.evaluations:
-                operations.append(
-                    {
-                        "operation": "execute_parameter_candidate",
-                        "assay": assay,
-                        "candidate": candidate_evaluation.parameters.model_dump(
-                            mode="json"
-                        ),
-                        "phase": candidate_evaluation.phase,
-                        "cellSelection": (
-                            experimental_handoff.cellSelection.model_dump(mode="json")
-                        ),
-                        "harmonyBatchColumns": list(
-                            candidate_evaluation.harmonyBatchColumns
-                        ),
-                        "identityFeatureLimit": (
-                            request_record.config.maxIdentityFeatures
-                        ),
-                        "status": candidate_evaluation.status,
-                        "artifacts": {
-                            name: value.model_dump(mode="json")
-                            for name, value in candidate_evaluation.artifacts.items()
-                        },
-                    }
-                )
-        seen_integrated_graphs: set[tuple[str, str]] = set()
-        for integration_evaluation in integration_evaluations:
-            integration_graph = integration_evaluation.graphArtifact
-            graph_id = (
-                integration_graph.artifactId if integration_graph is not None else ""
-            )
-            graph_key = (integration_evaluation.method, graph_id)
-            if graph_id and graph_key not in seen_integrated_graphs:
-                assert integration_graph is not None
-                seen_integrated_graphs.add(graph_key)
-                source_key = (
-                    "connectivityMap"
-                    if integration_evaluation.method == "snn"
-                    else "neighbors"
-                )
-                source_artifacts = []
-                for assay in integration_evaluation.assays:
-                    assay_report = report.assayReports[assay]
-                    selected = next(
-                        value
-                        for value in assay_report.evaluations
-                        if value.candidateId == assay_report.recommendedCandidateId
-                    )
-                    source_artifacts.append(
-                        selected.artifacts[source_key].model_dump(mode="json")
-                    )
-                operations.append(
-                    {
-                        "operation": "integrate_assays",
-                        "method": integration_evaluation.method,
-                        "sources": source_artifacts,
-                        "invalidateCache": True,
-                        "l2Normalize": True,
-                        "artifact": integration_graph.model_dump(mode="json"),
-                    }
-                )
-            if integration_graph is None:
-                continue
-            operations.append(
-                {
-                    "operation": "run_leiden_clustering",
-                    "integrationId": integration_evaluation.integrationId,
-                    "status": integration_evaluation.status,
-                    "resolution": integration_evaluation.resolution,
-                    "graph": integration_graph.model_dump(mode="json"),
-                    "cellSelection": (
-                        integration_evaluation.cellSelection.model_dump(mode="json")
-                        if integration_evaluation.cellSelection is not None
-                        else None
-                    ),
-                    "backend": "igraph",
-                    "symmetricGraph": False,
-                    "graphUpperOnly": False,
-                    "randomSeed": 4444,
-                    "invalidateCache": False,
-                    "artifact": (
-                        integration_evaluation.clusterArtifact.model_dump(mode="json")
-                        if integration_evaluation.clusterArtifact is not None
-                        else None
-                    ),
-                }
-            )
-        if report.status == "needsInput":
-            needs_input = report.needsInput
-            assert needs_input is not None
-            outcome = journal._complete_attempt(
-                started,
-                status="needsInput",
-                report_references=stage_report_references,
-                artifacts=stage_artifacts,
-                outputs={
-                    "candidateCount": report.totalCandidates,
-                    "operations": operations,
-                },
-                actions=actions,
-                needs_input=WorkflowNeedsInput(
-                    questions=[
-                        WorkflowQuestion(
-                            questionId=(
-                                "finalGraphOptionId"
-                                if report.finalSelection is not None
-                                and report.finalSelection.status == "needsInput"
-                                else "parameter_tuning"
-                            ),
-                            question=needs_input.question,
-                            options=list(needs_input.options),
-                            evidenceIds=list(needs_input.evidenceIds),
-                        )
-                    ]
-                ),
-                notes=report.limitations,
-            )
-        elif report.status == "failed":
-            outcome = journal._complete_attempt(
-                started,
-                status="failed",
-                report_references=stage_report_references,
-                artifacts=stage_artifacts,
-                outputs={
-                    "candidateCount": report.totalCandidates,
-                    "operations": operations,
-                },
-                actions=actions,
-                error="; ".join(report.limitations) or "Parameter Tuning failed",
-            )
-        else:
-            outcome = journal._complete_attempt(
-                started,
-                status="done",
-                report_references=stage_report_references,
-                artifacts=stage_artifacts,
-                outputs={
-                    "candidateCount": report.totalCandidates,
-                    "recommendedByAssay": report.recommendedByAssay,
-                    "recommendedIntegrationId": report.recommendedIntegrationId,
-                    "operations": operations,
-                },
-                actions=actions,
-                notes=[*report.tradeoffs, *report.limitations],
-            )
-        journal._save_outcome(store.zw, prefix, outcome)
-        logger.info(
-            f"Workflow {workflow.workflowRunId}: Parameter Tuning outcome "
-            f"status={outcome.status!r}, candidates={report.totalCandidates}, "
-            f"integrations={len(integration_evaluations)}"
-        )
-        if outcome.status == "failed":
-            journal.finalize_failed(store, workflow, outcome.error or "tuning failed")
-        return outcome, report
-
-    def initial_parameter_candidates(
-        self,
-        workflow_run_id: str,
-        handoff: PreprocessedAssayHandoff,
-        *,
-        count: int,
-        neighbors_k: int,
-    ) -> list[ParameterCandidate]:
-        max_dimensions = min(handoff.nCells, handoff.nFeatures) - 1
-        if neighbors_k < 2 or neighbors_k >= handoff.nCells:
-            raise ValueError(
-                f"Assay {handoff.assay!r} has no rank-valid graph candidate"
-            )
-        if handoff.reductionMethod == "identity":
-            if handoff.nFeatures < 2:
-                raise ValueError(
-                    f"Assay {handoff.assay!r} has no rank-valid graph candidate"
-                )
-            dimensions = handoff.nFeatures
-            dimension_values = [dimensions]
-        elif max_dimensions < 2:
-            raise ValueError(
-                f"Assay {handoff.assay!r} has no rank-valid graph candidate"
-            )
-        elif handoff.reductionMethod == "lsi":
-            dimensions = min(50, max_dimensions)
-            dimension_values = [
-                dimensions,
-                min(30, max_dimensions),
-                min(70, max_dimensions),
-            ]
-        else:
-            dimensions = min(21, max_dimensions)
-            dimension_values = [
-                dimensions,
-                min(15, max_dimensions),
-                min(30, max_dimensions),
-            ]
-        unique_dimensions = list(
-            dict.fromkeys(value for value in dimension_values if value >= 2)
-        )
-        specifications: list[tuple[int, float]] = [(unique_dimensions[0], 1.0)]
-        specifications.extend((value, 1.0) for value in unique_dimensions[1:])
-        for resolution in (0.5, 1.5, 0.75, 1.25, 0.35, 1.75):
-            if len(specifications) >= count:
-                break
-            specifications.append((unique_dimensions[0], resolution))
-        token = workflow_run_id[:10]
-        assay_token = journal._safe_label(handoff.assay).lower()
-        if len(assay_token) > 32:
-            digest = hashlib.blake2b(
-                handoff.assay.encode("utf-8"), digest_size=4
-            ).hexdigest()
-            assay_token = f"{assay_token[:23]}_{digest}"
-        if handoff.reductionMethod == "identity":
-            candidates = [
-                ParameterCandidate(
-                    candidateId=f"w_{token}_{assay_token}_0",
-                    reductionMethod="identity",
-                    dimensions=handoff.nFeatures,
-                    leidenResolution=1.0,
-                    neighborsK=neighbors_k,
-                )
-            ]
-            if count > 1 and max_dimensions >= 2:
-                candidates.append(
-                    ParameterCandidate(
-                        candidateId=f"w_{token}_{assay_token}_1",
-                        reductionMethod="pca",
-                        dimensions=min(21, max_dimensions),
-                        leidenResolution=1.0,
-                        neighborsK=neighbors_k,
-                    )
-                )
-            for resolution in (0.5, 1.5, 0.75, 1.25, 0.35, 1.75):
-                if len(candidates) >= count:
-                    break
-                index = len(candidates)
-                candidates.append(
-                    ParameterCandidate(
-                        candidateId=f"w_{token}_{assay_token}_{index}",
-                        reductionMethod="identity",
-                        dimensions=handoff.nFeatures,
-                        leidenResolution=resolution,
-                        neighborsK=neighbors_k,
-                    )
-                )
-            return candidates
-        return [
-            ParameterCandidate(
-                candidateId=f"w_{token}_{assay_token}_{index}",
-                reductionMethod=cast(Any, handoff.reductionMethod),
-                dimensions=dimension,
-                leidenResolution=resolution,
-                neighborsK=neighbors_k,
-            )
-            for index, (dimension, resolution) in enumerate(specifications[:count])
-        ]
-
-    def load_integration_checkpoint(
-        self,
-        store: DataStore,
-        started: WorkflowStageAttempt,
-        method: Literal["snn", "wnn"],
-    ) -> tuple[list[IntegrationCandidateEvaluation], AgentReportReference] | None:
-        checkpoint_id = f"{journal._stage_execution_id(started)}_integration_{method}"
-        matches = [
-            reference
-            for reference in list_agent_reports(
-                store,
-                started.workflowRunId,
-                agent_name="parameter_tuning",
-            )
-            if reference.agentRunId == checkpoint_id
-        ]
-        if not matches:
-            return None
-        if len(matches) != 1:
-            raise ValueError("An integration checkpoint has multiple reports")
-        reference = matches[0]
-        record = load_agent_record(store, reference)
-        if (
-            record.invocation.inputs.get("orchestrationExecutionId") != checkpoint_id
-            or record.invocation.inputs.get("stageExecutionId")
-            != journal._stage_execution_id(started)
-            or record.invocation.inputs.get("method") != method
-        ):
-            raise ValueError("Integration checkpoint identity is stale")
-        for artifact in record.invocation.artifacts.values():
-            store.load_artifact(artifact_model_to_ref(artifact))
-        report = load_agent_report(store, reference)
-        if not isinstance(report, ParameterTuningReport):
-            raise TypeError("Integration checkpoint is not a Parameter Tuning report")
-        evaluations = list(report.integrationEvaluations)
-        if not evaluations or any(value.method != method for value in evaluations):
-            raise ValueError("Integration checkpoint contains the wrong method")
-        logger.info(
-            f"Workflow {started.workflowRunId}: recovered {method.upper()} "
-            f"checkpoint with {len(evaluations)} evaluation(s)"
-        )
-        return evaluations, reference
-
-    def save_integration_checkpoint(
-        self,
-        store: DataStore,
-        started: WorkflowStageAttempt,
-        report: ParameterTuningReport,
-        method: Literal["snn", "wnn"],
-        evaluations: Sequence[IntegrationCandidateEvaluation],
-        parent_reports: Sequence[AgentReportLink],
-    ) -> AgentReportReference:
-        checkpoint_id = f"{journal._stage_execution_id(started)}_integration_{method}"
-        checkpoint_report = report.model_copy(
-            update={
-                "integrationEvaluations": list(evaluations),
-                "recommendedIntegrationId": None,
-                "finalClusterColumn": None,
-                "finalClusterArtifact": None,
-                "finalSelection": None,
-            }
-        )
-        artifacts: dict[str, ArtifactReferenceModel] = {}
-        cell_selection = next(
-            (
-                evaluation.cellSelection
-                for evaluation in evaluations
-                if evaluation.cellSelection is not None
-            ),
-            None,
-        )
-        if cell_selection is not None:
-            artifacts["cellSelection"] = cell_selection
-        for evaluation in evaluations:
-            if evaluation.graphArtifact is not None:
-                artifacts[f"{evaluation.integrationId}_graph"] = (
-                    ArtifactReferenceModel.model_validate(
-                        evaluation.graphArtifact.model_dump()
-                    )
-                )
-            if evaluation.clusterArtifact is not None:
-                artifacts[f"{evaluation.integrationId}_clusters"] = (
-                    ArtifactReferenceModel.model_validate(
-                        evaluation.clusterArtifact.model_dump()
-                    )
-                )
-        invocation = AgentInvocation(
-            agentName="parameter_tuning",
-            parentReports=list(parent_reports),
-            inputs={
-                "orchestrationExecutionId": checkpoint_id,
-                "stageExecutionId": journal._stage_execution_id(started),
-                "method": method,
-                "cellSelection": (
-                    cell_selection.model_dump(mode="json")
-                    if cell_selection is not None
-                    else None
-                ),
-            },
-            artifacts=artifacts,
-        )
-        try:
-            reference = save_agent_report(
-                store,
-                started.workflowRunId,
-                checkpoint_report,
-                invocation=invocation,
-                agent_run_id=checkpoint_id,
-            )
-            logger.info(
-                f"Workflow {started.workflowRunId}: persisted {method.upper()} "
-                f"checkpoint with {len(evaluations)} evaluation(s)"
-            )
-            return reference
-        except FileExistsError:
-            recovered = self.load_integration_checkpoint(store, started, method)
-            if recovered is None:
-                raise
-            return recovered[1]
-
-    def evaluate_integrations(
-        self,
-        store: DataStore,
-        workflow_run_id: str,
-        plan: AutomatedPreprocessingPlan,
-        report: ParameterTuningReport,
-        experimental_handoff: ExperimentalTuningHandoff,
-        config: AutomatedWorkflowConfig,
-        *,
-        started: WorkflowStageAttempt | None = None,
-        parent_reports: Sequence[AgentReportLink] = (),
-        actions: list[str] | None = None,
-    ) -> list[IntegrationCandidateEvaluation]:
-        assays = list(plan.pairedAssays)
-        if len(assays) < 2:
-            logger.info("Skipping SNN/WNN evaluation: fewer than two paired assays")
-            return []
-        selected_k = {
-            next(
-                evaluation.parameters.neighborsK
-                for evaluation in assay_report.evaluations
-                if evaluation.candidateId == assay_report.recommendedCandidateId
-            )
-            for assay, assay_report in report.assayReports.items()
-            if assay in assays
-        }
-        if len(selected_k) != 1:
-            raise ValueError("SNN and WNN require one common selected neighborsK")
-        primary_report = report.assayReports[plan.primaryAssay]
-        primary_evaluation = next(
-            value
-            for value in primary_report.evaluations
-            if value.candidateId == primary_report.recommendedCandidateId
-        )
-        center = primary_evaluation.parameters.leidenResolution
-        count = config.integrationResolutionCandidates
-        multipliers = [1.0] if count == 1 else np.linspace(0.5, 1.5, count).tolist()
-        resolutions = list(
-            dict.fromkeys(max(0.05, round(center * value, 6)) for value in multipliers)
-        )
-        logger.info(
-            f"Evaluating SNN and WNN across {len(resolutions)} resolution(s) "
-            f"for {len(assays)} paired assay(s)"
-        )
-        if report.cellSelection is None:
-            raise ValueError("Parameter tuning report lacks an exact cell selection")
-        cell_selection = report.cellSelection
-        native_labels: dict[str, np.ndarray[Any, Any]] = {}
-        for assay, assay_report in report.assayReports.items():
-            if assay not in assays:
-                continue
-            selected = next(
-                value
-                for value in assay_report.evaluations
-                if value.candidateId == assay_report.recommendedCandidateId
-            )
-            cluster_model = ArtifactReferenceModel.model_validate(
-                selected.artifacts["clusters"].model_dump()
-            )
-            cluster_group = store.load_artifact(artifact_model_to_ref(cluster_model))
-            cluster_values = cast(Any, cluster_group["values"])
-            native_labels[assay] = np.asarray(cluster_values[:])
-        token = workflow_run_id[:12]
-        evaluations: list[IntegrationCandidateEvaluation] = []
-        integration_methods: tuple[Literal["snn", "wnn"], ...] = ("snn", "wnn")
-        for method in integration_methods:
-            evaluations.extend(
-                self.evaluate_integration_method(
-                    store,
-                    method,
-                    token,
-                    assays,
-                    resolutions,
-                    native_labels,
-                    report,
-                    experimental_handoff,
-                    config,
-                    cell_selection,
-                    started=started,
-                    parent_reports=parent_reports,
-                    actions=actions,
-                )
-            )
-        return evaluations
-
-    def evaluate_integration_method(
-        self,
-        store: DataStore,
-        method: Literal["snn", "wnn"],
-        token: str,
-        assays: list[str],
-        resolutions: Sequence[float],
-        native_labels: Mapping[str, np.ndarray[Any, Any]],
-        report: ParameterTuningReport,
-        experimental_handoff: ExperimentalTuningHandoff,
-        config: AutomatedWorkflowConfig,
-        cell_selection: ArtifactReferenceModel,
-        *,
-        started: WorkflowStageAttempt | None,
-        parent_reports: Sequence[AgentReportLink],
-        actions: list[str] | None,
-    ) -> list[IntegrationCandidateEvaluation]:
-        if started is not None:
-            recovered = self.load_integration_checkpoint(store, started, method)
-            if recovered is not None:
-                if actions is not None:
-                    actions.append(f"recover_integration_checkpoint:{method}")
-                return recovered[0]
-        logger.info(
-            f"Evaluating {method.upper()} integration across "
-            f"{len(resolutions)} resolution(s)"
-        )
-        evaluations: list[IntegrationCandidateEvaluation] = []
-        source_key = "connectivityMap" if method == "snn" else "neighbors"
-        sources = []
-        for assay in assays:
-            assay_report = report.assayReports[assay]
-            selected = next(
-                value
-                for value in assay_report.evaluations
-                if value.candidateId == assay_report.recommendedCandidateId
-            )
-            source_model = ArtifactReferenceModel.model_validate(
-                selected.artifacts[source_key].model_dump()
-            )
-            sources.append(artifact_model_to_ref(source_model))
-        try:
-            graph_ref = store.integrate_assays(
-                sources,
-                method=method,
-                invalidate_cache=True,
-                l2_normalize=True,
-            )
-            weights_valid: bool | None = None
-            if method == "wnn":
-                graph_group = store.load_artifact(graph_ref)
-                stored_weights = cast(Any, graph_group["modality_weights"])
-                weights = np.asarray(stored_weights[:], dtype=float)
-                weights_valid = bool(
-                    weights.shape
-                    == (len(next(iter(native_labels.values()))), len(assays))
-                    and np.all(np.isfinite(weights))
-                    and np.all(weights >= 0)
-                    and np.allclose(weights.sum(axis=1), 1.0, rtol=1e-5, atol=1e-6)
-                )
-        except Exception as exc:
-            logger.warning(
-                f"{method.upper()} graph construction failed "
-                f"({type(exc).__name__}); persisting failed evaluations"
-            )
-            for index, resolution in enumerate(resolutions):
-                evaluations.append(
-                    IntegrationCandidateEvaluation(
-                        integrationId=f"{method}_{token}_{index}",
-                        method=cast(Any, method),
-                        assays=assays,
-                        status="failed",
-                        cellSelection=cell_selection,
-                        resolution=resolution,
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
-                )
-            if started is not None:
-                self.save_integration_checkpoint(
-                    store,
-                    started,
-                    report,
-                    method,
-                    evaluations,
-                    parent_reports,
-                )
-                if actions is not None:
-                    actions.append(f"checkpoint_integration:{method}")
-            return evaluations
-        for index, resolution in enumerate(resolutions):
-            integration_id = f"{method}_{token}_{index}"
-            warnings: list[str] = []
-            evidence_ids = [f"integration:{integration_id}:clusters"]
-            try:
-                cluster_ref = store.run_leiden_clustering(
-                    graph_ref,
-                    resolution=resolution,
-                    backend="igraph",
-                    symmetric_graph=False,
-                    graph_upper_only=False,
-                    random_seed=4444,
-                    invalidate_cache=False,
-                )
-                cluster_group = store.load_artifact(cluster_ref)
-                cluster_values = cast(Any, cluster_group["values"])
-                values = np.asarray(cluster_values[:])
-                _labels, counts = np.unique(values, return_counts=True)
-                metrics = IntegrationMetrics(
-                    nClusters=int(len(counts)),
-                    minClusterCells=int(counts.min()),
-                    minClusterFraction=float(counts.min() / len(values)),
-                    modalityWeightsValid=weights_valid,
-                )
-                for assay, native in native_labels.items():
-                    metrics.adjustedRandByAssay[assay] = float(
-                        adjusted_rand_score(native, values)
-                    )
-                    metrics.normalizedMutualInformationByAssay[assay] = float(
-                        normalized_mutual_info_score(native, values)
-                    )
-                    evidence_ids.extend(
-                        [
-                            f"integration:{integration_id}:ari:{assay}",
-                            f"integration:{integration_id}:nmi:{assay}",
-                        ]
-                    )
-                for column in experimental_handoff.preservationColumns:
-                    try:
-                        value = float(
-                            store.metric_graph_connectivity(
-                                column,
-                                graph_ref,
-                            )
-                        )
-                        if np.isfinite(value):
-                            metrics.biologicalConnectivity[column] = value
-                            evidence_ids.append(
-                                f"integration:{integration_id}:graphConnectivity:{column}"
-                            )
-                    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
-                        warnings.append(
-                            f"Graph connectivity for {column!r} unavailable: {exc}"
-                        )
-                if method == "wnn":
-                    evidence_ids.append(f"integration:{integration_id}:modalityWeights")
-                reasons: list[str] = []
-                missing_connectivity = sorted(
-                    set(experimental_handoff.preservationColumns)
-                    - set(metrics.biologicalConnectivity)
-                )
-                if missing_connectivity:
-                    reasons.append(
-                        "trusted-label connectivity is unavailable for "
-                        + ", ".join(missing_connectivity)
-                    )
-                if metrics.nClusters is None or metrics.nClusters < 2:
-                    reasons.append("fewer than two clusters")
-                if (
-                    metrics.minClusterCells is None
-                    or metrics.minClusterCells < config.minClusterCells
-                ):
-                    reasons.append("smallest cluster is below the configured minimum")
-                if method == "wnn" and weights_valid is not True:
-                    reasons.append("WNN modality weights are invalid")
-                evaluations.append(
-                    IntegrationCandidateEvaluation(
-                        integrationId=integration_id,
-                        method=cast(Any, method),
-                        assays=assays,
-                        status="done",
-                        eligible=not reasons,
-                        cellSelection=cell_selection,
-                        resolution=resolution,
-                        graphArtifact=ArtifactRecord.from_ref(graph_ref),
-                        clusterArtifact=ArtifactRecord.from_ref(cluster_ref),
-                        metrics=metrics,
-                        evidenceIds=evidence_ids,
-                        eligibilityReasons=reasons,
-                        warnings=warnings,
-                    )
-                )
-            except Exception as exc:
-                evaluations.append(
-                    IntegrationCandidateEvaluation(
-                        integrationId=integration_id,
-                        method=cast(Any, method),
-                        assays=assays,
-                        status="failed",
-                        cellSelection=cell_selection,
-                        resolution=resolution,
-                        graphArtifact=ArtifactRecord.from_ref(graph_ref),
-                        evidenceIds=evidence_ids,
-                        warnings=warnings,
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
-                )
-        if started is not None:
-            self.save_integration_checkpoint(
-                store,
-                started,
-                report,
-                method,
-                evaluations,
-                parent_reports,
-            )
-            if actions is not None:
-                actions.append(f"checkpoint_integration:{method}")
-        eligible_count = sum(
-            value.status == "done" and value.eligible for value in evaluations
-        )
-        failed_count = sum(value.status == "failed" for value in evaluations)
-        logger.info(
-            f"Completed {method.upper()} integration evaluation: "
-            f"eligible={eligible_count}, failed={failed_count}, "
-            f"total={len(evaluations)}"
-        )
-        return evaluations

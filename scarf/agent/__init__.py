@@ -1,173 +1,22 @@
-"""Optional grounded decision helpers for Scarf workflows."""
+"""Optional automated RNA analysis with a small, lazy public interface."""
 
-from .biological_interpretation import (
-    BiologicalContext,
-    BiologicalInterpretationAgent,
-    BiologicalInterpretationReport,
-)
-from .characterize_covariates import (
-    CovariateCharacterization,
-    characterize_covariates,
-)
-from .characterize_features import (
-    FeatureCharacterization,
-    characterize_features,
-)
-from .config import AgentRunConfig
-from .config import _deps as _deps
-from .config.agent_exec import run_agent, run_agent_sync
-from .data_enrichment import (
-    DataEnrichmentAgent,
-    DataEnrichmentContext,
-    DataEnrichmentReport,
-    StudyContextSummary,
-)
-from .decide import DecisionValidationError, decide
-from .experimental_context import (
-    CellQcPlan,
-    ExperimentalContextAgent,
-    ExperimentalContextResult,
-    NamedArtifactSource,
-)
-from .ingest import IngestResult, detect_format, ingest
-from .orchestrator import (
-    AgentOrchestrator,
-    AssayPreprocessingPlan,
-    AutomatedPreprocessingPlan,
-    AutomatedWorkflowConfig,
-    AutomatedWorkflowRequest,
-    AutomatedWorkflowResult,
-    AutomatedWorkflowResumeRequest,
-    FinalAnalysisHandoff,
-    NativeAnalysisHandoff,
-    PreprocessedAssayHandoff,
-    WorkflowNeedsInput,
-    WorkflowQuestion,
-    WorkflowStageAttempt,
-    WorkflowStageLink,
-)
-from .parameter_tuning import (
-    FinalGraphSelection,
-    IntegrationCandidateEvaluation,
-    IntegrationMetrics,
-    ParameterCandidate,
-    ParameterSearchPlan,
-    ParameterTuningAgent,
-    ParameterTuningAssayInput,
-    ParameterTuningReport,
-    get_default_parameter_candidates,
-    tune_parameters,
-)
-from .persistence import (
-    AgentInvocation,
-    AgentName,
-    AgentPersistenceTarget,
-    AgentReport,
-    AgentReportLink,
-    AgentReportRecord,
-    AgentReportReference,
-    AgentReportType,
-    AgentTerminalStatus,
-    AgentWorkflowRun,
-    AgentWorkflowStatus,
-    create_agent_workflow,
-    finalize_agent_workflow,
-    list_agent_reports,
-    list_agent_workflows,
-    load_agent_record,
-    load_agent_report,
-    load_agent_workflow,
-    save_agent_report,
-)
-from .runtime import check_runtime, load_env
-from .types import (
-    BatchSafetyEvidence,
-    Decision,
-    EvidenceItem,
-    ExperimentalBiologyHandoff,
-    ExperimentalTuningHandoff,
-    NeedsInput,
-    StageResult,
-    StageStatus,
-    TuningBiologyHandoff,
-)
+from importlib import import_module
+from typing import Any
 
-__all__ = [
-    "AgentInvocation",
-    "AgentOrchestrator",
-    "AgentRunConfig",
-    "AgentName",
-    "AgentPersistenceTarget",
-    "AgentReport",
-    "AgentReportLink",
-    "AgentReportRecord",
-    "AgentReportReference",
-    "AgentReportType",
-    "AgentTerminalStatus",
-    "AgentWorkflowRun",
-    "AgentWorkflowStatus",
-    "AssayPreprocessingPlan",
-    "AutomatedPreprocessingPlan",
-    "AutomatedWorkflowConfig",
-    "AutomatedWorkflowRequest",
-    "AutomatedWorkflowResult",
-    "AutomatedWorkflowResumeRequest",
-    "BatchSafetyEvidence",
-    "BiologicalContext",
-    "BiologicalInterpretationAgent",
-    "BiologicalInterpretationReport",
-    "CellQcPlan",
-    "CovariateCharacterization",
-    "DataEnrichmentAgent",
-    "DataEnrichmentContext",
-    "DataEnrichmentReport",
-    "Decision",
-    "DecisionValidationError",
-    "EvidenceItem",
-    "ExperimentalBiologyHandoff",
-    "ExperimentalContextAgent",
-    "ExperimentalContextResult",
-    "ExperimentalTuningHandoff",
-    "FinalAnalysisHandoff",
-    "FinalGraphSelection",
-    "FeatureCharacterization",
-    "IngestResult",
-    "IntegrationCandidateEvaluation",
-    "IntegrationMetrics",
-    "NativeAnalysisHandoff",
-    "NamedArtifactSource",
-    "NeedsInput",
-    "ParameterCandidate",
-    "ParameterSearchPlan",
-    "ParameterTuningAssayInput",
-    "ParameterTuningAgent",
-    "ParameterTuningReport",
-    "PreprocessedAssayHandoff",
-    "StageResult",
-    "StageStatus",
-    "StudyContextSummary",
-    "TuningBiologyHandoff",
-    "WorkflowNeedsInput",
-    "WorkflowQuestion",
-    "WorkflowStageAttempt",
-    "WorkflowStageLink",
-    "characterize_covariates",
-    "characterize_features",
-    "check_runtime",
-    "create_agent_workflow",
-    "decide",
-    "detect_format",
-    "get_default_parameter_candidates",
-    "ingest",
-    "load_env",
-    "finalize_agent_workflow",
-    "list_agent_reports",
-    "list_agent_workflows",
-    "load_agent_record",
-    "load_agent_report",
-    "load_agent_workflow",
-    "run_agent",
-    "run_agent_sync",
-    "save_agent_report",
-    "tune_parameters",
-]
+__all__ = ["analyze_rna", "AutomatedWorkflowResult", "AnalysisError"]
+
+for _export in __all__:
+    globals().pop(_export, None)
+
+
+def __getattr__(name: str) -> Any:
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = ".orchestrator.api" if name == "analyze_rna" else ".orchestrator.models"
+    value = getattr(import_module(module, __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))

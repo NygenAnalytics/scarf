@@ -16,6 +16,7 @@ python:
     - method: uv
       command: sync
       extras:
+        - agent
         - docs
         - extra
 

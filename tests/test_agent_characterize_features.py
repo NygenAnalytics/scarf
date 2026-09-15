@@ -7,8 +7,11 @@ from types import SimpleNamespace
 import numpy as np
 from scipy.sparse import csr_matrix
 
-from scarf.agent import FeatureCharacterization, characterize_features
-from scarf.agent.characterize_features import (
+from scarf.agent.data_enrichment.characterization import (
+    FeatureCharacterization,
+    characterize_features,
+)
+from scarf.agent.data_enrichment.characterization import (
     _assist_species,
     _load_or_fetch_reference,
     _sex_coefficient_note,
@@ -333,7 +336,9 @@ def test_reference_loading_audits_mocked_download_success_and_failure(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    characterize_features_module = import_module("scarf.agent.characterize_features")
+    characterize_features_module = import_module(
+        "scarf.agent.data_enrichment.characterization"
+    )
     reference = GeneReference(
         species="homo_sapiens",
         release="test",

@@ -72,3 +72,9 @@ scarf/_version.py
 /performance_reconfig.md
 .env
 temp/
+# Dev testing scard reports
+modal_scarf/
+notebook/
+PR/
+scarf/agent/*.md
+.cache/

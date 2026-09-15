@@ -1,5 +1,7 @@
 """Tests for bounded parameter tuning agent execution."""
 
+from tests.agent_examples import example
+
 import asyncio
 from types import SimpleNamespace
 from typing import Any
@@ -15,7 +17,9 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-import scarf.agent.parameter_tuning as parameter_tuning_module
+import scarf.agent.parameter_tuning.agent as parameter_tuning_agent
+import scarf.agent.parameter_tuning.execution as parameter_tuning_execution
+import scarf.agent.parameter_tuning.selection as parameter_tuning_selection
 from scarf.agent.parameter_tuning import (
     ArtifactRecord,
     CandidateComparison,
@@ -52,6 +56,8 @@ from scarf.agent.parameter_tuning import (
     validate_parameter_search_plan,
     validate_parameter_tuning_report,
 )
+from scarf.agent.parameter_tuning.prompts import parameter_evaluation_payload
+from scarf.agent.parameter_tuning.selection import pending_parameter_tuning_report
 from scarf.agent.types import (
     AgentDataModel,
     ArtifactReferenceModel,
@@ -332,7 +338,7 @@ def _dependencies(
     max_candidates: int = 5,
     min_cluster_cells: int = 20,
 ) -> ParameterTuningDependencies:
-    candidate_values = candidates or [ParameterCandidate.get_example()]
+    candidate_values = candidates or [example(ParameterCandidate)]
     return ParameterTuningDependencies(
         store=store,
         normalized=store.normalized,
@@ -383,7 +389,7 @@ def test_parameter_models_have_blank_and_example(
     model_type: type[AgentDataModel],
 ) -> None:
     assert isinstance(model_type.get_blank(), model_type)
-    assert isinstance(model_type.get_example(), model_type)
+    assert isinstance(example(model_type), model_type)
     assert all("_" not in field for field in model_type.model_fields)
 
 
@@ -431,7 +437,7 @@ def test_harmony_pairing_covers_every_initial_candidate() -> None:
 
 
 def test_prompts_include_only_explicit_candidate_context() -> None:
-    evaluation = ParameterCandidateEvaluation.get_example()
+    evaluation = example(ParameterCandidateEvaluation)
     plan = ParameterSearchPlan(status="complete")
     cell_selection = ArtifactReferenceModel.from_artifact_ref(_cell_selection())
     planning_system_prompt = parameter_search_system_prompt()
@@ -712,7 +718,7 @@ def test_duplicate_candidate_returns_recorded_execution_without_rerun() -> None:
 def test_candidate_budget_prevents_another_execution() -> None:
     store = _FakeStore()
     candidates = [
-        ParameterCandidate.get_example(),
+        example(ParameterCandidate),
         ParameterCandidate(candidateId="pca_15", dimensions=15),
     ]
     deps = _dependencies(store, candidates=candidates, max_candidates=1)
@@ -729,7 +735,7 @@ def test_candidate_budget_prevents_another_execution() -> None:
 def test_refinement_plan_is_bounded_by_initial_evidence_and_envelope() -> None:
     store = _FakeStore()
     candidates = [
-        ParameterCandidate.get_example(),
+        example(ParameterCandidate),
         ParameterCandidate(candidateId="pca_15", dimensions=15),
     ]
     deps = _dependencies(store, candidates=candidates, max_candidates=3)
@@ -766,7 +772,7 @@ def test_refinement_plan_is_bounded_by_initial_evidence_and_envelope() -> None:
 def test_refinement_plan_canonicalizes_status_from_candidate_presence() -> None:
     store = _FakeStore()
     candidates = [
-        ParameterCandidate.get_example(),
+        example(ParameterCandidate),
         ParameterCandidate(candidateId="pca_15", dimensions=15),
     ]
     deps = _dependencies(store, candidates=candidates, max_candidates=3)
@@ -812,7 +818,7 @@ def test_refinement_plan_canonicalizes_status_from_candidate_presence() -> None:
 def test_refinement_plan_requires_authorized_matched_harmony_evidence() -> None:
     store = _FakeStore()
     candidates = [
-        ParameterCandidate.get_example(),
+        example(ParameterCandidate),
         ParameterCandidate(candidateId="pca_15", dimensions=15),
     ]
     deps = _dependencies(store, candidates=candidates, max_candidates=3)
@@ -913,7 +919,7 @@ def test_report_validation_uses_only_executed_results_and_artifacts() -> None:
         status="done",
         evaluations=[ParameterCandidateEvaluation.get_blank()],
         recommendedCandidateId="baseline",
-        selectedArtifacts={"invented": ArtifactRecord.get_example()},
+        selectedArtifacts={"invented": example(ArtifactRecord)},
         confidence="medium",
         rationale="Balanced candidate.",
         evidenceIds=[evaluation.evidenceIds[0]],
@@ -988,7 +994,7 @@ def test_report_validation_rejects_unknown_evidence_and_ineligible_choice() -> N
 def test_done_report_requires_a_successful_comparator_when_available() -> None:
     store = _FakeStore()
     candidates = [
-        ParameterCandidate.get_example(),
+        example(ParameterCandidate),
         ParameterCandidate(candidateId="pca_15", dimensions=15),
     ]
     deps = _dependencies(store, candidates=candidates, max_candidates=2)
@@ -1029,7 +1035,7 @@ def test_done_report_requires_a_successful_comparator_when_available() -> None:
 def test_comparison_requires_selected_and_comparator_evidence() -> None:
     store = _FakeStore()
     candidates = [
-        ParameterCandidate.get_example(),
+        example(ParameterCandidate),
         ParameterCandidate(candidateId="pca_15", dimensions=15),
     ]
     deps = _dependencies(store, candidates=candidates, max_candidates=2)
@@ -1065,7 +1071,7 @@ def test_comparison_requires_selected_and_comparator_evidence() -> None:
 def test_comparison_rejects_unknown_or_duplicate_candidate_ids() -> None:
     store = _FakeStore()
     candidates = [
-        ParameterCandidate.get_example(),
+        example(ParameterCandidate),
         ParameterCandidate(candidateId="pca_15", dimensions=15),
     ]
     deps = _dependencies(store, candidates=candidates, max_candidates=2)
@@ -1207,7 +1213,7 @@ def test_biology_handoff_requires_selected_cluster_artifact() -> None:
 
 
 def test_integrated_final_selection_separates_graph_and_marker_assays() -> None:
-    native = ParameterTuningReport.get_example()
+    native = example(ParameterTuningReport)
     aggregate = ParameterTuningReport(
         status="done",
         fromAssay="RNA",
@@ -1275,7 +1281,7 @@ def test_integrated_final_selection_requires_marker_assay() -> None:
 
 
 def test_final_graph_selector_uses_one_grounded_provider_request() -> None:
-    native_evaluation = ParameterCandidateEvaluation.get_example()
+    native_evaluation = example(ParameterCandidateEvaluation)
     native_evaluation.artifacts["clusters"] = ArtifactRecord(
         assay="RNA",
         kind="cluster_labels",
@@ -1397,7 +1403,7 @@ def test_final_graph_selector_uses_one_grounded_provider_request() -> None:
 def test_parameter_tuning_agent_delegates_with_its_model_and_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from scarf.agent import parameter_tuning as module
+    from scarf.agent.parameter_tuning import agent as module
 
     model = object()
     expected = ParameterTuningReport.get_blank()
@@ -1457,7 +1463,7 @@ def test_parameter_tuning_skips_unrequested_refinement_planning() -> None:
     result = ParameterTuningAgent(FunctionModel(reply)).run(
         _FakeStore(),
         normalized=_artifact("normalized", 1),
-        candidates=[ParameterCandidate.get_example()],
+        candidates=[example(ParameterCandidate)],
         experimental_handoff=ExperimentalTuningHandoff(
             cellSelection=ArtifactReferenceModel.from_artifact_ref(_cell_selection()),
             batchAction="skip",
@@ -1722,12 +1728,12 @@ def test_batched_tuning_selects_all_assays_in_one_model_request() -> None:
         assays=[
             ParameterTuningAssayInput(
                 normalized=_artifact("normalized", 1, "RNA"),
-                candidates=[ParameterCandidate.get_example()],
+                candidates=[example(ParameterCandidate)],
                 maxCandidates=1,
             ),
             ParameterTuningAssayInput(
                 normalized=_artifact("normalized", 10, "ADT"),
-                candidates=[ParameterCandidate.get_example()],
+                candidates=[example(ParameterCandidate)],
                 maxCandidates=1,
             ),
         ],
@@ -1790,7 +1796,7 @@ def test_batched_refinement_planning_allows_a_validator_retry() -> None:
         assays=[
             ParameterTuningAssayInput(
                 normalized=_artifact("normalized", 1),
-                candidates=[ParameterCandidate.get_example()],
+                candidates=[example(ParameterCandidate)],
                 maxCandidates=2,
                 maxRefinedCandidates=1,
             )
@@ -1801,12 +1807,20 @@ def test_batched_refinement_planning_allows_a_validator_retry() -> None:
     assert model_calls == 3
     assert result.status == "done"
     assert result.recommendedByAssay == {"RNA": "baseline"}
+    assert result.searchPlan is not None
+    assert result.searchPlan.runInfo.agentName == "parameter_batch_search_planning"
+    assert result.searchPlan.runInfo.usage.requests == 2
+    assay_plan = result.assayReports["RNA"].searchPlan
+    assert assay_plan is not None
+    assert assay_plan.runInfo == result.searchPlan.runInfo
+    assert result.runInfo.agentName == "parameter_tuning_batch"
+    assert result.runInfo.usage.requests == 1
 
 
-def test_batched_tuning_falls_back_after_structured_output_exhaustion(
+def test_batched_tuning_pauses_after_structured_output_exhaustion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from scarf.agent import parameter_tuning as module
+    from scarf.agent.parameter_tuning import agent as module
 
     calls: list[str] = []
 
@@ -1822,7 +1836,7 @@ def test_batched_tuning_falls_back_after_structured_output_exhaustion(
             ParameterTuningAssayInput(
                 normalized=_artifact("normalized", 1),
                 candidates=[
-                    ParameterCandidate.get_example(),
+                    example(ParameterCandidate),
                     ParameterCandidate(candidateId="pca_15", dimensions=15),
                 ],
                 maxCandidates=3,
@@ -1832,20 +1846,22 @@ def test_batched_tuning_falls_back_after_structured_output_exhaustion(
         primary_assay="RNA",
     )
 
-    assert calls == ["parameter_batch_search_planning", "parameter_tuning_batch"]
-    assert result.status == "done"
-    assert result.recommendedByAssay == {"RNA": "baseline"}
+    assert calls == ["parameter_batch_search_planning"]
+    assert result.status == "needsInput"
+    assert result.recommendedByAssay == {}
     assert result.assayReports["RNA"].confidence == "low"
-    assert result.assayReports["RNA"].comparisons[0].candidateId == "pca_15"
+    assert result.assayReports["RNA"].recommendedCandidateId is None
+    assert result.assayReports["RNA"].needsInput is not None
+    assert result.assayReports["RNA"].needsInput.options == ["baseline", "pca_15"]
     assert result.searchPlan is not None
     assert result.searchPlan.status == "complete"
-    assert result.runInfo.agentName == "parameter_tuning_batch_fallback"
+    assert result.runInfo.agentName == "parameter_batch_search_planning_needs_input"
 
 
-def test_single_tuning_falls_back_after_structured_output_exhaustion(
+def test_single_tuning_pauses_after_structured_output_exhaustion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from scarf.agent import parameter_tuning as module
+    from scarf.agent.parameter_tuning import agent as module
 
     def unavailable_structured_output(**_kwargs: Any) -> None:
         raise UnexpectedModelBehavior("structured output unavailable")
@@ -1856,21 +1872,73 @@ def test_single_tuning_falls_back_after_structured_output_exhaustion(
         model=object(),
         normalized=_artifact("normalized", 1),
         candidates=[
-            ParameterCandidate.get_example(),
+            example(ParameterCandidate),
             ParameterCandidate(candidateId="pca_15", dimensions=15),
         ],
         max_candidates=3,
         max_refined_candidates=1,
     )
 
-    assert result.status == "done"
-    assert result.recommendedCandidateId == "baseline"
+    assert result.status == "needsInput"
+    assert result.recommendedCandidateId is None
     assert result.confidence == "low"
-    assert result.runInfo.agentName == "parameter_tuning_fallback"
+    assert result.needsInput is not None
+    assert result.needsInput.options == ["baseline", "pca_15"]
+    assert result.runInfo.agentName == "parameter_search_planning_needs_input"
+
+
+def test_pending_parameter_report_does_not_select_without_successful_baseline() -> None:
+    candidates = [
+        example(ParameterCandidate),
+        ParameterCandidate(candidateId="pca_15", dimensions=15),
+        ParameterCandidate(candidateId="pca_30", dimensions=30),
+    ]
+    deps = _dependencies(
+        _FakeStore(),
+        candidates=candidates,
+        max_candidates=3,
+    )
+    for candidate in candidates:
+        execute_parameter_candidate(deps, candidate.candidateId)
+    deps.evaluations["baseline"] = deps.evaluations["baseline"].model_copy(
+        update={
+            "status": "failed",
+            "eligible": False,
+            "error": "baseline failed",
+        }
+    )
+
+    result = pending_parameter_tuning_report(
+        deps,
+        search_plan=ParameterSearchPlan(status="complete"),
+        agent_name="parameter_tuning_needs_input",
+    )
+
+    assert result.status == "needsInput"
+    assert result.recommendedCandidateId is None
+    assert result.needsInput is not None
+    assert result.needsInput.options == ["pca_15", "pca_30"]
+
+
+def test_parameter_prompt_payload_is_bounded_and_excludes_artifacts() -> None:
+    evaluation = example(ParameterCandidateEvaluation).model_copy(
+        update={
+            "warnings": ["w" * 700 for _index in range(12)],
+            "error": "e" * 700,
+        }
+    )
+
+    payload = parameter_evaluation_payload(evaluation)
+
+    assert "artifacts" not in payload
+    assert "cellSelection" not in payload
+    assert len(payload["warnings"]) == 10
+    assert all(len(warning) == 500 for warning in payload["warnings"])
+    assert len(payload["error"]) == 500
 
 
 def test_single_eligible_final_graph_skips_provider_selection() -> None:
-    evaluation = ParameterCandidateEvaluation.get_example()
+    evaluation = example(ParameterCandidateEvaluation)
     evaluation.artifacts["clusters"] = ArtifactRecord(
         assay="RNA",
         kind="cluster_labels",
@@ -1910,11 +1978,11 @@ def test_single_eligible_final_graph_skips_provider_selection() -> None:
 def test_final_graph_retry_exhaustion_pauses_when_multiple_options_exist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from scarf.agent import parameter_tuning as module
+    from scarf.agent.parameter_tuning import selection as module
 
     reports: dict[str, ParameterTuningReport] = {}
     for assay, token in (("RNA", "7"), ("ADT", "8")):
-        evaluation = ParameterCandidateEvaluation.get_example().model_copy(
+        evaluation = example(ParameterCandidateEvaluation).model_copy(
             update={
                 "clusterColumn": f"{assay}_agent_tuning_baseline",
                 "artifacts": {
@@ -1966,7 +2034,7 @@ def test_final_graph_retry_exhaustion_pauses_when_multiple_options_exist(
     ]
     assert selected.finalSelection is not None
     assert selected.finalSelection.runInfo.agentName == (
-        "parameter_tuning_final_graph_fallback"
+        "parameter_tuning_final_graph_needs_input"
     )
 
 
@@ -1990,7 +2058,7 @@ def test_batched_tuning_enforces_global_candidate_limit_before_execution() -> No
     assays = [
         ParameterTuningAssayInput(
             normalized=_artifact("normalized", 1, assay),
-            candidates=[ParameterCandidate.get_example()],
+            candidates=[example(ParameterCandidate)],
             maxCandidates=1,
         )
         for assay in ("RNA", "ADT")
@@ -2008,7 +2076,7 @@ def test_batched_tuning_enforces_global_candidate_limit_before_execution() -> No
 
 
 def test_parameter_tuning_handoff_validation_edges() -> None:
-    report = ParameterTuningReport.get_example()
+    report = example(ParameterTuningReport)
     with pytest.raises(ValueError, match="must be done"):
         report.model_copy(update={"status": "failed"}).to_biological_handoff()
     with pytest.raises(ValueError, match="must recommend"):
@@ -2076,9 +2144,9 @@ def test_parameter_tuning_handoff_validation_edges() -> None:
 
 
 def test_final_graph_option_filtering_and_validation_edges() -> None:
-    report = ParameterTuningReport.get_example()
+    report = example(ParameterTuningReport)
     with pytest.raises(ValueError, match="lacks an exact cell selection"):
-        parameter_tuning_module.final_graph_options(
+        parameter_tuning_selection.final_graph_options(
             report.model_copy(update={"cellSelection": None}),
             [],
         )
@@ -2090,7 +2158,7 @@ def test_final_graph_option_filtering_and_validation_edges() -> None:
             "assayReports": {},
         }
     )
-    assert parameter_tuning_module.final_graph_options(skipped_report, []) == {}
+    assert parameter_tuning_selection.final_graph_options(skipped_report, []) == {}
     ineligible_report = report.model_copy(
         update={
             "evaluations": [
@@ -2099,7 +2167,7 @@ def test_final_graph_option_filtering_and_validation_edges() -> None:
             "assayReports": {},
         }
     )
-    assert parameter_tuning_module.final_graph_options(ineligible_report, []) == {}
+    assert parameter_tuning_selection.final_graph_options(ineligible_report, []) == {}
     mismatched_native = report.evaluations[0].model_copy(
         update={
             "cellSelection": ArtifactReferenceModel(
@@ -2110,14 +2178,14 @@ def test_final_graph_option_filtering_and_validation_edges() -> None:
         }
     )
     with pytest.raises(ValueError, match="Native graph option uses a different"):
-        parameter_tuning_module.final_graph_options(
+        parameter_tuning_selection.final_graph_options(
             report.model_copy(
                 update={"evaluations": [mismatched_native], "assayReports": {}}
             ),
             [],
         )
 
-    integration = IntegrationCandidateEvaluation.get_example()
+    integration = example(IntegrationCandidateEvaluation)
     for ignored in (
         integration.model_copy(update={"status": "failed"}),
         integration.model_copy(update={"graphArtifact": None}),
@@ -2131,11 +2199,11 @@ def test_final_graph_option_filtering_and_validation_edges() -> None:
             }
         ),
     ):
-        options = parameter_tuning_module.final_graph_options(report, [ignored])
+        options = parameter_tuning_selection.final_graph_options(report, [ignored])
         assert all(not key.startswith("integration:") for key in options)
 
     with pytest.raises(ValueError, match="Integrated graph option uses a different"):
-        parameter_tuning_module.final_graph_options(
+        parameter_tuning_selection.final_graph_options(
             report,
             [
                 integration.model_copy(
@@ -2150,12 +2218,12 @@ def test_final_graph_option_filtering_and_validation_edges() -> None:
             ],
         )
     with pytest.raises(ValueError, match="require integrationId"):
-        parameter_tuning_module.final_graph_options(
+        parameter_tuning_selection.final_graph_options(
             report,
             [integration.model_copy(update={"integrationId": ""})],
         )
     with pytest.raises(ValueError, match="must be datastore-scoped"):
-        parameter_tuning_module.final_graph_options(
+        parameter_tuning_selection.final_graph_options(
             report,
             [
                 integration.model_copy(
@@ -2171,7 +2239,9 @@ def test_final_graph_option_filtering_and_validation_edges() -> None:
             ],
         )
     with pytest.raises(ValueError, match="Duplicate integration id"):
-        parameter_tuning_module.final_graph_options(report, [integration, integration])
+        parameter_tuning_selection.final_graph_options(
+            report, [integration, integration]
+        )
 
 
 def test_normalized_shape_and_candidate_metric_failure_edges() -> None:
@@ -2183,14 +2253,14 @@ def test_normalized_shape_and_candidate_metric_failure_edges() -> None:
             return self.payload
 
     with pytest.raises(ValueError, match="does not contain"):
-        parameter_tuning_module.normalized_artifact_shape(ShapeStore({}), object())
+        parameter_tuning_execution.normalized_artifact_shape(ShapeStore({}), object())
     with pytest.raises(ValueError, match="two-dimensional"):
-        parameter_tuning_module.normalized_artifact_shape(
+        parameter_tuning_execution.normalized_artifact_shape(
             ShapeStore({"data": SimpleNamespace(shape=(4,))}),
             object(),
         )
     with pytest.raises(ValueError, match="at least two cells"):
-        parameter_tuning_module.normalized_artifact_shape(
+        parameter_tuning_execution.normalized_artifact_shape(
             ShapeStore({"data": SimpleNamespace(shape=(1, 4))}),
             object(),
         )
@@ -2230,7 +2300,7 @@ def test_normalized_shape_and_candidate_metric_failure_edges() -> None:
         assert invalid.status == "failed"
         assert message in (invalid.error or "")
 
-    harmony = ParameterCandidate.get_example().model_copy(
+    harmony = example(ParameterCandidate).model_copy(
         update={"candidateId": "baseline_harmony", "useHarmony": True}
     )
     harmony_deps = _dependencies(_FakeStore(), candidates=[harmony])
@@ -2242,7 +2312,7 @@ def test_normalized_shape_and_candidate_metric_failure_edges() -> None:
 
 def test_parameter_search_plan_validation_edges() -> None:
     candidates = [
-        ParameterCandidate.get_example(),
+        example(ParameterCandidate),
         ParameterCandidate(candidateId="pca_15", dimensions=15),
     ]
     deps = _dependencies(_FakeStore(), candidates=candidates, max_candidates=4)
@@ -2469,8 +2539,8 @@ def test_parameter_tuning_report_validation_status_edges() -> None:
 
 
 def test_final_graph_selection_validation_edges() -> None:
-    report = ParameterTuningReport.get_example()
-    integration = IntegrationCandidateEvaluation.get_example()
+    report = example(ParameterTuningReport)
+    integration = example(IntegrationCandidateEvaluation)
     native_evidence = "native:RNA:candidate:baseline:clusters"
     integration_evidence = integration.evidenceIds[0]
     comparison = FinalGraphComparison(
@@ -2485,7 +2555,7 @@ def test_final_graph_selection_validation_edges() -> None:
         evidenceIds=[native_evidence],
         comparisons=[comparison],
     )
-    validated = parameter_tuning_module.validate_final_graph_selection(
+    validated = parameter_tuning_selection.validate_final_graph_selection(
         valid,
         report,
         integration_evaluations=[integration],
@@ -2494,7 +2564,7 @@ def test_final_graph_selection_validation_edges() -> None:
     assert validated.graphMethod == "native"
 
     with pytest.raises(ValueError, match="must finish"):
-        parameter_tuning_module.validate_final_graph_selection(
+        parameter_tuning_selection.validate_final_graph_selection(
             valid,
             report.model_copy(update={"status": "failed"}),
             integration_evaluations=[integration],
@@ -2504,63 +2574,63 @@ def test_final_graph_selection_validation_edges() -> None:
         update={"evaluations": [], "recommendedCandidateId": None, "assayReports": {}}
     )
     with pytest.raises(ValueError, match="No eligible"):
-        parameter_tuning_module.validate_final_graph_selection(
+        parameter_tuning_selection.validate_final_graph_selection(
             valid,
             no_options,
             integration_evaluations=[],
             marker_assay="RNA",
         )
     with pytest.raises(ValueError, match="unknown evidence"):
-        parameter_tuning_module.validate_final_graph_selection(
+        parameter_tuning_selection.validate_final_graph_selection(
             valid.model_copy(update={"evidenceIds": ["unknown"]}),
             report,
             integration_evaluations=[integration],
             marker_assay="RNA",
         )
     with pytest.raises(ValueError, match="concrete question"):
-        parameter_tuning_module.validate_final_graph_selection(
+        parameter_tuning_selection.validate_final_graph_selection(
             FinalGraphSelection(status="needsInput"),
             report,
             integration_evaluations=[integration],
             marker_assay="RNA",
         )
     with pytest.raises(ValueError, match="done or needsInput"):
-        parameter_tuning_module.validate_final_graph_selection(
+        parameter_tuning_selection.validate_final_graph_selection(
             valid.model_copy(update={"status": "failed"}),
             report,
             integration_evaluations=[integration],
             marker_assay="RNA",
         )
     with pytest.raises(ValueError, match="not eligible"):
-        parameter_tuning_module.validate_final_graph_selection(
+        parameter_tuning_selection.validate_final_graph_selection(
             valid.model_copy(update={"selectedOptionId": "missing"}),
             report,
             integration_evaluations=[integration],
             marker_assay="RNA",
         )
     with pytest.raises(ValueError, match="cite selected-option"):
-        parameter_tuning_module.validate_final_graph_selection(
+        parameter_tuning_selection.validate_final_graph_selection(
             valid.model_copy(update={"evidenceIds": []}),
             report,
             integration_evaluations=[integration],
             marker_assay="RNA",
         )
     with pytest.raises(ValueError, match="must not contain duplicates"):
-        parameter_tuning_module.validate_final_graph_selection(
+        parameter_tuning_selection.validate_final_graph_selection(
             valid.model_copy(update={"comparisons": [comparison, comparison]}),
             report,
             integration_evaluations=[integration],
             marker_assay="RNA",
         )
     with pytest.raises(ValueError, match="one comparison for every"):
-        parameter_tuning_module.validate_final_graph_selection(
+        parameter_tuning_selection.validate_final_graph_selection(
             valid.model_copy(update={"comparisons": []}),
             report,
             integration_evaluations=[integration],
             marker_assay="RNA",
         )
     with pytest.raises(ValueError, match="cite selected-option evidence"):
-        parameter_tuning_module.validate_final_graph_selection(
+        parameter_tuning_selection.validate_final_graph_selection(
             valid.model_copy(
                 update={
                     "comparisons": [
@@ -2575,7 +2645,7 @@ def test_final_graph_selection_validation_edges() -> None:
             marker_assay="RNA",
         )
     with pytest.raises(ValueError, match="cite comparator evidence"):
-        parameter_tuning_module.validate_final_graph_selection(
+        parameter_tuning_selection.validate_final_graph_selection(
             valid.model_copy(
                 update={
                     "comparisons": [
@@ -2588,7 +2658,7 @@ def test_final_graph_selection_validation_edges() -> None:
             marker_assay="RNA",
         )
     with pytest.raises(ValueError, match="requires a summary"):
-        parameter_tuning_module.validate_final_graph_selection(
+        parameter_tuning_selection.validate_final_graph_selection(
             valid.model_copy(
                 update={"comparisons": [comparison.model_copy(update={"summary": ""})]}
             ),
@@ -2617,7 +2687,7 @@ def test_experimental_tuning_handoff_resolution_edges() -> None:
         batchSafety=[safety],
         evidenceIds=[safety.evidenceId],
     )
-    resolved = parameter_tuning_module._resolve_experimental_tuning_handoff(
+    resolved = parameter_tuning_agent._resolve_experimental_tuning_handoff(
         normalized_cell_selection=selection,
         batch_columns=[],
         preservation_columns=[],
@@ -2650,21 +2720,21 @@ def test_experimental_tuning_handoff_resolution_edges() -> None:
     ]
     for updates, message in changes:
         with pytest.raises(ValueError, match=message):
-            parameter_tuning_module._resolve_experimental_tuning_handoff(
+            parameter_tuning_agent._resolve_experimental_tuning_handoff(
                 normalized_cell_selection=selection,
                 batch_columns=[],
                 preservation_columns=[],
                 experimental_handoff=handoff.model_copy(update=updates),
             )
     with pytest.raises(ValueError, match="batch_columns conflict"):
-        parameter_tuning_module._resolve_experimental_tuning_handoff(
+        parameter_tuning_agent._resolve_experimental_tuning_handoff(
             normalized_cell_selection=selection,
             batch_columns=["other"],
             preservation_columns=[],
             experimental_handoff=handoff,
         )
     with pytest.raises(ValueError, match="preservation_columns conflict"):
-        parameter_tuning_module._resolve_experimental_tuning_handoff(
+        parameter_tuning_agent._resolve_experimental_tuning_handoff(
             normalized_cell_selection=selection,
             batch_columns=[],
             preservation_columns=["other"],
@@ -2675,7 +2745,7 @@ def test_experimental_tuning_handoff_resolution_edges() -> None:
 def test_prepare_parameter_tuning_dependencies_validation_edges() -> None:
     store = _FakeStore()
     normalized = store.normalized
-    candidate = ParameterCandidate.get_example()
+    candidate = example(ParameterCandidate)
 
     for kwargs, message in (
         ({"max_candidates": 0}, "max_candidates"),
@@ -2684,18 +2754,18 @@ def test_prepare_parameter_tuning_dependencies_validation_edges() -> None:
         ({"identity_feature_limit": 1}, "identity_feature_limit"),
     ):
         with pytest.raises(ValueError, match=message):
-            parameter_tuning_module.prepare_parameter_tuning_dependencies(
+            parameter_tuning_agent.prepare_parameter_tuning_dependencies(
                 store,
                 normalized=normalized,
                 **kwargs,
             )
     with pytest.raises(TypeError, match="normalized ArtifactRef"):
-        parameter_tuning_module.prepare_parameter_tuning_dependencies(
+        parameter_tuning_agent.prepare_parameter_tuning_dependencies(
             store,
             normalized=_artifact("reduction", 10),
         )
     with pytest.raises(ValueError, match="has no assay"):
-        parameter_tuning_module.prepare_parameter_tuning_dependencies(
+        parameter_tuning_agent.prepare_parameter_tuning_dependencies(
             store,
             normalized=ArtifactRef(
                 scope="datastore",
@@ -2735,25 +2805,25 @@ def test_prepare_parameter_tuning_dependencies_validation_edges() -> None:
     for status, message in statuses:
         with pytest.raises(ValueError, match=message):
             invalid_store = StatusStore(status)
-            parameter_tuning_module.prepare_parameter_tuning_dependencies(
+            parameter_tuning_agent.prepare_parameter_tuning_dependencies(
                 invalid_store,
                 normalized=invalid_store.normalized,
             )
 
     with pytest.raises(ValueError, match="batch_columns must be unique"):
-        parameter_tuning_module.prepare_parameter_tuning_dependencies(
+        parameter_tuning_agent.prepare_parameter_tuning_dependencies(
             store,
             normalized=normalized,
             batch_columns=["batch", "batch"],
         )
     with pytest.raises(ValueError, match="candidates must be non-empty"):
-        parameter_tuning_module.prepare_parameter_tuning_dependencies(
+        parameter_tuning_agent.prepare_parameter_tuning_dependencies(
             store,
             normalized=normalized,
             candidates=[],
         )
     with pytest.raises(ValueError, match="exceeds max_candidates"):
-        parameter_tuning_module.prepare_parameter_tuning_dependencies(
+        parameter_tuning_agent.prepare_parameter_tuning_dependencies(
             store,
             normalized=normalized,
             candidates=[
@@ -2763,13 +2833,13 @@ def test_prepare_parameter_tuning_dependencies_validation_edges() -> None:
             max_candidates=1,
         )
     with pytest.raises(ValueError, match="only ASCII"):
-        parameter_tuning_module.prepare_parameter_tuning_dependencies(
+        parameter_tuning_agent.prepare_parameter_tuning_dependencies(
             store,
             normalized=normalized,
             candidates=[candidate.model_copy(update={"candidateId": "bad-id"})],
         )
     with pytest.raises(ValueError, match="Duplicate candidateId"):
-        parameter_tuning_module.prepare_parameter_tuning_dependencies(
+        parameter_tuning_agent.prepare_parameter_tuning_dependencies(
             store,
             normalized=normalized,
             candidates=[candidate, candidate],

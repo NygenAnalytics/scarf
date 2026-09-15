@@ -1,5 +1,7 @@
 """Tests for the tool-driven Experimental Context Agent."""
 
+from tests.agent_examples import example
+
 import asyncio
 from types import SimpleNamespace
 from typing import Any, Literal
@@ -8,19 +10,25 @@ import numpy as np
 import pytest
 import zarr
 from pydantic import ValidationError
-from pydantic_ai import ModelRetry, RunContext
+from pydantic_ai import ModelRetry, RunContext, UnexpectedModelBehavior
 from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage
 from zarr.storage import MemoryStore
 
-import scarf.agent.experimental_context as experimental_context_module
+import scarf.agent.experimental_context.agent as experimental_context_agent
+import scarf.agent.experimental_context.contracts as experimental_context_contracts
+import scarf.agent.experimental_context.qc_evidence as experimental_context_qc
+import scarf.agent.experimental_context.tools as experimental_context_tools
+import scarf.agent.experimental_context.validation as experimental_context_validation
 from scarf.agent.experimental_context import (
     BatchCorrectionPlan,
     BatchSafetyEvidence,
+    CaptureFailureEvidence,
     CellQcPlan,
     CellQcProfileEvidence,
+    ContrastPlan,
     CovariateEvidence,
     ExperimentalContextAgent,
     ExperimentalContextDecision,
@@ -34,10 +42,11 @@ from scarf.agent.experimental_context import (
     score_current_representation,
     validate_experimental_context,
 )
-from scarf.agent.characterize_covariates import (
+from scarf.agent.experimental_context.characterization import (
     CovariateCharacterization,
     _SelectionBoundCells,
 )
+from scarf.agent.experimental_context.study import StudyContract, build_study_contract
 from scarf.agent.types import (
     ArtifactReferenceModel,
     ExperimentalBiologyHandoff,
@@ -177,6 +186,15 @@ class _Store:
         )
 
 
+def _replace_store_cells(store: _Store, values: dict[str, np.ndarray]) -> None:
+    store.cells = _Cells(values)
+    store.zw = zarr.open_group(store=MemoryStore(), mode="w")
+    cell_data = store.zw.create_group("cellData")
+    cell_data.create_array("ids", data=np.asarray(values["ids"]).astype("U16"))
+    cell_data.create_array("I", data=np.asarray(values["I"], dtype=bool))
+    store.refresh_cell_selection()
+
+
 def _write_cell_artifact(
     store: _Store,
     *,
@@ -184,15 +202,17 @@ def _write_cell_artifact(
     kind: Literal["quality_metric", "hto_identity"],
     values: np.ndarray,
     assay: str,
+    operation: str | None = None,
+    inputs: dict[str, Any] | None = None,
 ) -> NamedArtifactSource:
     planned = plan_cell_data_artifact(
         store.zw,
         scope="assay",
         assay=assay,
         kind=kind,
-        operation=f"test_{kind}_source",
+        operation=operation or f"test_{kind}_source",
         parameters={"name": name},
-        inputs={},
+        inputs=dict(inputs or {}),
         execution_options={},
         cell_selection=store.cell_selection,
         arrays={"values": ((len(values),), None)},
@@ -238,7 +258,7 @@ class _MetricStore(_Store):
 
 @pytest.fixture(autouse=True)
 def _resolve_fake_graph_selection(monkeypatch: pytest.MonkeyPatch) -> None:
-    from scarf.agent import experimental_context as module
+    from scarf.agent.experimental_context import agent as module
 
     def resolve(root: zarr.Group, _graph: ArtifactRef) -> ArtifactRef:
         return ArtifactRef.from_dict(root.attrs["_test_cell_selection"])
@@ -407,7 +427,7 @@ def test_agent_models_have_blank_and_example_constructors() -> None:
     )
     for model in models:
         assert isinstance(model.get_blank(), model)
-        assert isinstance(model.get_example(), model)
+        assert isinstance(example(model), model)
         assert all("_" not in field_name for field_name in model.model_fields)
     assert set(RepresentationEvaluation.model_fields) == {
         "available",
@@ -427,6 +447,98 @@ def test_system_prompt_does_not_embed_fictional_output_values() -> None:
     assert "Output contract example" not in prompt
     assert "column:batch" not in prompt
     assert "estimability:treatment" not in prompt
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"studyContext": ""}, "studyContext must be non-empty"),
+        ({"studyObjective": ""}, "studyObjective must be non-empty"),
+        (
+            {"independentUnitColumns": ["donor", "donor"]},
+            "must not contain duplicates",
+        ),
+        (
+            {
+                "physicalCaptureColumn": "sample",
+                "conditionColumns": ["sample"],
+            },
+            "cannot be the physical capture",
+        ),
+        (
+            {
+                "technicalBatchColumns": ["batch"],
+                "conditionColumns": ["batch"],
+            },
+            "cannot also be condition columns",
+        ),
+        (
+            {
+                "correctionLicense": "safe",
+                "technicalBatchColumns": [],
+            },
+            "requires batch columns",
+        ),
+    ],
+)
+def test_study_contract_rejects_inconsistent_design_authority(
+    changes: dict[str, object],
+    message: str,
+) -> None:
+    values = StudyContract.get_blank().model_dump()
+    values.update(changes)
+
+    with pytest.raises(ValidationError, match=message):
+        StudyContract.model_validate(values)
+
+
+def test_study_contract_builder_records_correction_and_label_policies() -> None:
+    with pytest.raises(ValueError, match="must be done"):
+        build_study_contract(
+            study_context="Study context",
+            study_objective="Study objective",
+            experimental_result=SimpleNamespace(status="needsInput"),
+        )
+
+    def result(action: TestAction) -> SimpleNamespace:
+        return SimpleNamespace(
+            status="done",
+            decision=_design_decision(action=action),
+            characterization=CovariateCharacterization(status="done"),
+            batchSafety=[],
+            notes=[],
+        )
+
+    unsafe = build_study_contract(
+        study_context="Study context",
+        study_objective="Study objective",
+        experimental_result=result("unsafe"),
+    )
+    unresolved = build_study_contract(
+        study_context="Study context",
+        study_objective="Study objective",
+        experimental_result=result("needsInput"),
+    )
+    preservation = build_study_contract(
+        study_context="Study context",
+        study_objective="Study objective",
+        experimental_result=result("skip"),
+        author_label_policy="preservation",
+    )
+
+    assert unsafe.correctionLicense == "unsafeConfounded"
+    assert unresolved.correctionLicense == "indeterminate"
+    assert preservation.authorLabelPolicy == "preservation"
+    assert any("ineligible" in item for item in preservation.limitations)
+
+
+def test_validator_rejects_serialized_fields_inside_narrative() -> None:
+    decision = ExperimentalContextDecision(
+        rationale='Study design is unresolved.", "evidenceIds": ["column:batch"]',
+    )
+
+    with pytest.raises(ModelRetry, match="plain prose"):
+        validate_experimental_context(decision, _context(_Store()).deps)
 
 
 def test_agent_runs_only_read_only_tools_and_returns_a_grounded_report() -> None:
@@ -465,6 +577,26 @@ def test_agent_runs_only_read_only_tools_and_returns_a_grounded_report() -> None
                     )
                 ]
             )
+        if request == 2:
+            decision = _design_decision()
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="analyze_experimental_design",
+                        args={
+                            "column_domains": decision.columnDomains,
+                            "coefficients_of_interest": (
+                                decision.coefficientsOfInterest
+                            ),
+                            "units_of_inference": {
+                                name: unit.model_dump()
+                                for name, unit in decision.unitsOfInference.items()
+                            },
+                            "batch_columns": decision.batchCorrection.batchColumns,
+                        },
+                    )
+                ]
+            )
         return ModelResponse(
             parts=[
                 ToolCallPart(
@@ -496,9 +628,11 @@ def test_agent_runs_only_read_only_tools_and_returns_a_grounded_report() -> None
     assert [call.toolName for call in result.runInfo.toolCalls] == [
         "inspect_cell_covariates",
         "analyze_experimental_design",
+        "analyze_experimental_design",
     ]
     assert tool_names == {
         "inspect_cell_covariates",
+        "inspect_context_evidence",
         "analyze_experimental_design",
         "score_current_representation",
     }
@@ -511,12 +645,158 @@ def test_agent_runs_only_read_only_tools_and_returns_a_grounded_report() -> None
     assert sorted(store.zw.group_keys()) == ["artifacts", "cellData"]
 
 
+def test_agent_fails_after_design_tool_retry_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _Store()
+    analyze_retries: list[int | None] = []
+
+    def unavailable_design(**kwargs: Any) -> None:
+        deps = kwargs["deps"]
+        analyze_tool = next(
+            tool
+            for tool in kwargs["tools"]
+            if tool.name == "analyze_experimental_design"
+        )
+        analyze_retries.append(analyze_tool.max_retries)
+        asyncio.run(
+            inspect_cell_covariates(
+                RunContext(
+                    deps=deps,
+                    model=TestModel(),
+                    usage=RunUsage(),
+                )
+            )
+        )
+        raise UnexpectedModelBehavior(
+            "Tool 'analyze_experimental_design' exceeded max retries count of 1"
+        )
+
+    monkeypatch.setattr(
+        experimental_context_agent,
+        "run_agent_sync",
+        unavailable_design,
+    )
+    result = ExperimentalContextAgent(object()).run(
+        store,
+        study_context="Case-control study with samples nested in donors.",
+        cell_selection=store.cell_selection,
+    )
+
+    assert analyze_retries == [3]
+    assert result.status == "failed"
+    assert result.decision.batchCorrection.action == "needsInput"
+    assert result.decision.batchCorrection.batchColumns == []
+    assert result.cellSelection is not None
+    assert result.cellSelection.artifactId == store.cell_selection.artifact_id
+    assert result.cellQc.profileId == ""
+    assert result.qcProfiles
+    assert result.runInfo.agentName == "experimental_context_failed"
+    with pytest.raises(ValueError, match="must be done"):
+        result.to_parameter_tuning_handoff()
+    assert any("did not produce" in note for note in result.notes)
+
+
+def test_agent_rejects_malformed_batch_tool_call_without_default_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _Store()
+
+    def unavailable_design(**kwargs: Any) -> None:
+        deps = kwargs["deps"]
+        asyncio.run(
+            inspect_cell_covariates(
+                RunContext(
+                    deps=deps,
+                    model=TestModel(),
+                    usage=RunUsage(),
+                )
+            )
+        )
+        raise UnexpectedModelBehavior(
+            "Tool 'analyze_experimental_design' exceeded max retries count of 3; "
+            "caused by ModelRetry: Unknown batch column 'batchassay'"
+        )
+
+    monkeypatch.setattr(
+        experimental_context_agent,
+        "run_agent_sync",
+        unavailable_design,
+    )
+    result = ExperimentalContextAgent(object()).run(
+        store,
+        study_context="Population discovery across sequencing batches.",
+        study_objective="Discover stable cell populations.",
+        cell_selection=store.cell_selection,
+        directions={
+            "columnDomains": {
+                "batch": "technical",
+                "donor": "design",
+                "sample": "design",
+            },
+            "coefficientsOfInterest": [],
+            "unitsOfInference": {},
+            "batchColumns": ["batch"],
+        },
+    )
+
+    assert result.status == "failed"
+    assert result.decision.batchCorrection.batchColumns == []
+    with pytest.raises(ValueError, match="must be done"):
+        result.to_parameter_tuning_handoff()
+    assert result.runInfo.agentName == "experimental_context_failed"
+    assert any("batchassay" in note for note in result.notes)
+
+
+def test_agent_preserves_validated_design_uncertainty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _Store()
+
+    def unresolved_design(**kwargs: Any) -> SimpleNamespace:
+        deps = kwargs["deps"]
+        context = RunContext(deps=deps, model=TestModel(), usage=RunUsage())
+        asyncio.run(inspect_cell_covariates(context))
+        planned = _design_decision("needsInput")
+        asyncio.run(
+            analyze_experimental_design(
+                context,
+                column_domains=planned.columnDomains,
+                coefficients_of_interest=planned.coefficientsOfInterest,
+                units_of_inference=planned.unitsOfInference,
+                batch_columns=planned.batchCorrection.batchColumns,
+            )
+        )
+        planned.needsInput = ["Physical capture provenance remains unresolved."]
+        decision = kwargs["output_validator"](planned)
+        return SimpleNamespace(
+            output=decision,
+            runInfo=experimental_context_contracts.AgentRunInfo(
+                agentName="experimental_context", modelName="test"
+            ),
+        )
+
+    monkeypatch.setattr(experimental_context_agent, "run_agent_sync", unresolved_design)
+    result = ExperimentalContextAgent(object()).run(
+        store,
+        study_context="Case-control study with samples nested in donors.",
+        cell_selection=store.cell_selection,
+    )
+    assert result.status == "needsInput"
+    assert result.decision.needsInput == [
+        "Physical capture provenance remains unresolved."
+    ]
+    assert result.runInfo.agentName == "experimental_context"
+    with pytest.raises(ValueError, match="must be done"):
+        result.to_parameter_tuning_handoff()
+
+
 def test_handoff_builders_reject_incomplete_or_ambiguous_results() -> None:
     incomplete = ExperimentalContextResult.get_blank()
     with pytest.raises(ValueError, match="must be done"):
         incomplete.to_parameter_tuning_handoff()
 
-    ambiguous = ExperimentalContextResult.get_example()
+    ambiguous = example(ExperimentalContextResult)
     ambiguous.decision.coefficientsOfInterest.append("second_coefficient")
     with pytest.raises(ValueError, match="Select one coefficient explicitly"):
         ambiguous.to_biological_handoff()
@@ -564,6 +844,36 @@ def test_tools_build_a_grounded_design_report_without_mutation() -> None:
     assert sorted(store.zw.group_keys()) == ["artifacts", "cellData"]
 
 
+def test_exact_batch_direction_overrides_model_tool_arguments() -> None:
+    store = _Store()
+    context = _context(store, directions={"batchColumns": ["batch"]})
+    decision = _design_decision()
+
+    asyncio.run(inspect_cell_covariates(context))
+    analyzed = asyncio.run(
+        analyze_experimental_design(
+            context,
+            column_domains=decision.columnDomains,
+            coefficients_of_interest=decision.coefficientsOfInterest,
+            units_of_inference=decision.unitsOfInference,
+            batch_columns=[],
+        )
+    )
+
+    assert analyzed.batchSafety[0].batchColumns == ["batch"]
+    skip = decision.model_copy(
+        update={
+            "batchCorrection": BatchCorrectionPlan(
+                action="skip",
+                rationale="Skip the declared batch condition.",
+                evidenceIds=["column:batch"],
+            )
+        }
+    )
+    with pytest.raises(ModelRetry, match="exact directed batch"):
+        validate_experimental_context(skip, context.deps)
+
+
 def test_qc_profiles_use_persisted_modality_and_shared_cell_selection() -> None:
     store = _Store()
     store.assay_names = ["protein", "peaks", "transcript"]
@@ -590,6 +900,7 @@ def test_qc_profiles_use_persisted_modality_and_shared_cell_selection() -> None:
     assert {profile.action for profile in inspected.qcProfiles} == {
         "skip",
         "globalGaussian",
+        "registeredMad",
     }
     for profile in inspected.qcProfiles:
         assert profile.driverAssay == "transcript"
@@ -659,23 +970,12 @@ def test_design_tool_offers_only_grounded_sample_mad_profiles() -> None:
     assert sample_profile.retainedCells == 12
     assert sample_profile.evidenceId in analyzed.evidenceIds
 
-    decision.cellQc = CellQcPlan(
-        action=sample_profile.action,
-        profileId=sample_profile.profileId,
-        driverAssay=sample_profile.driverAssay,
-        driverAssayType=sample_profile.driverAssayType,
-        sampleColumn=sample_profile.sampleColumn,
-        sampleArtifact=sample_profile.sampleArtifact,
-        attributes=sample_profile.attributes,
-        artifactMetrics=sample_profile.artifactMetrics,
-        rationale="Use sample-aware retention evidence.",
-        evidenceIds=[sample_profile.evidenceId],
-    )
     validated = validate_experimental_context(decision, context.deps)
-    assert validated.cellQc == decision.cellQc
+    assert validated.cellQc == CellQcPlan.get_blank()
+    assert sample_profile in context.deps.qcProfiles.values()
 
 
-def test_caller_qc_direction_overrides_model_profile_selection() -> None:
+def test_caller_qc_direction_shapes_evidence_without_preselection() -> None:
     store = _Store()
     store.cells._values["RNA_nCounts"] = np.arange(12, dtype=float) + 1
     store.cells._values["RNA_nFeatures"] = np.arange(12, dtype=float) + 5
@@ -695,23 +995,13 @@ def test_caller_qc_direction_overrides_model_profile_selection() -> None:
             batch_columns=decision.batchCorrection.batchColumns,
         )
     )
-    decision.cellQc = CellQcPlan(
-        action="skip",
-        profileId="model-authored-profile",
-        evidenceIds=["model-authored-evidence"],
-    )
-
     validated = validate_experimental_context(decision, context.deps)
 
-    assert validated.cellQc.action == "sampleMad"
-    assert validated.cellQc.sampleColumn == "sample"
-    assert validated.cellQc.evidenceIds == [
-        next(
-            profile.evidenceId
-            for profile in context.deps.qcProfiles.values()
-            if profile.action == "sampleMad"
-        )
-    ]
+    assert validated.cellQc == CellQcPlan.get_blank()
+    assert any(
+        profile.action == "sampleMad" and profile.sampleColumn == "sample"
+        for profile in context.deps.qcProfiles.values()
+    )
 
 
 def test_adt_and_hto_do_not_drive_qc_and_hto_identity_remains_metadata() -> None:
@@ -820,6 +1110,348 @@ def test_artifact_metrics_and_hto_grouping_are_exact_context_evidence() -> None:
     assert "HTO_htoIdentity" not in store.cells.columns
 
 
+def test_qc_metric_sources_report_metadata_artifact_concordance() -> None:
+    store = _Store()
+    counts = np.linspace(10.0, 100.0, store.cells.N)
+    features = np.linspace(5.0, 50.0, store.cells.N)
+    store.cells._values["RNA_nCounts"] = counts
+    store.cells._values["RNA_nFeatures"] = features
+    count_artifact = _write_cell_artifact(
+        store,
+        name="RNA_nCounts",
+        kind="quality_metric",
+        values=counts.copy(),
+        assay="RNA",
+    )
+    feature_artifact = _write_cell_artifact(
+        store,
+        name="RNA_nFeatures",
+        kind="quality_metric",
+        values=features + 1e-9,
+        assay="RNA",
+    )
+    context = _context(
+        store,
+        quality_metric_artifacts=[count_artifact, feature_artifact],
+    )
+
+    inspected = asyncio.run(inspect_cell_covariates(context))
+
+    concordance = {item.metricRole: item for item in inspected.qcSourceConcordance}
+    assert concordance["count"].exactlyEqual is True
+    assert concordance["count"].numericallyClose is True
+    assert concordance["count"].meanAbsoluteDifference == 0.0
+    assert concordance["feature"].exactlyEqual is False
+    assert concordance["feature"].numericallyClose is True
+    assert concordance["feature"].pearsonCorrelation == pytest.approx(1.0)
+    assert {item.evidenceId for item in inspected.qcSourceConcordance}.issubset(
+        inspected.evidenceIds
+    )
+
+
+def test_capture_failure_evidence_preserves_paired_design_after_exclusion() -> None:
+    store = _Store()
+    captures = np.repeat(["capture-a", "capture-b", "failed"], 20)
+    donors = np.repeat(["donor-a", "donor-b", "donor-c"], 20)
+    disease = np.tile(np.repeat(["case", "control"], 10), 3)
+    samples = np.asarray(
+        [
+            f"{donor}-{condition}"
+            for donor, condition in zip(donors, disease, strict=True)
+        ]
+    )
+    counts = np.concatenate(
+        [
+            np.linspace(90.0, 110.0, 20),
+            np.linspace(95.0, 115.0, 20),
+            np.linspace(3.0, 7.0, 20),
+        ]
+    )
+    features = np.concatenate(
+        [
+            np.linspace(45.0, 55.0, 20),
+            np.linspace(48.0, 58.0, 20),
+            np.linspace(2.0, 6.0, 20),
+        ]
+    )
+    mito = np.concatenate(
+        [
+            np.linspace(1.0, 3.0, 20),
+            np.linspace(1.0, 4.0, 20),
+            np.linspace(25.0, 35.0, 20),
+        ]
+    )
+    n_cells = len(captures)
+    _replace_store_cells(
+        store,
+        {
+            "I": np.ones(n_cells, dtype=bool),
+            "ids": np.asarray([f"cell-{index}" for index in range(n_cells)]),
+            "names": np.asarray([f"cell-{index}" for index in range(n_cells)]),
+            "capture": captures,
+            "donor": donors,
+            "sample": samples,
+            "disease": disease,
+            "RNA_nCounts": counts,
+            "RNA_nFeatures": features,
+            "RNA_percentMito": mito,
+        },
+    )
+    context = _context(
+        store,
+        directions={"physicalCaptureColumn": "capture"},
+    )
+    domains = {
+        "capture": "design",
+        "donor": "design",
+        "sample": "design",
+        "disease": "biological",
+    }
+    units = {
+        "disease": InferenceUnit(
+            observationUnit="sample",
+            independentUnit="donor",
+        )
+    }
+
+    asyncio.run(inspect_cell_covariates(context))
+    analyzed = asyncio.run(
+        analyze_experimental_design(
+            context,
+            column_domains=domains,
+            coefficients_of_interest=["disease"],
+            units_of_inference=units,
+            batch_columns=[],
+        )
+    )
+
+    profile = next(
+        item for item in analyzed.qcProfiles if item.registeredProfile == "captureMad5"
+    )
+    failure = next(
+        item for item in profile.captureFailureEvidence if item.capture == "failed"
+    )
+    assert failure.wholeCaptureFailure is True
+    assert failure.independentAdverseAxes >= 2
+    assert failure.preservesConditionCoverage is True
+    assert failure.preservesIndependentUnitCoverage is True
+    assert failure.exclusionEligible is True
+    assert failure.conditionAndUnitSafety[0]["completePairsAfterExclusion"] == 2
+    assert failure.conditionAndUnitSafety[0]["incompletePairsAfterExclusion"] == 0
+    assert "failed" in profile.failedCaptureCandidates
+    assert "failed" in profile.excludableCaptureCandidates
+    for source in profile.metricSources:
+        assert source.missingCellsByCapture == {
+            "capture-a": 0,
+            "capture-b": 0,
+            "failed": 0,
+        }
+
+
+def test_unusable_qc_sources_preserve_provenance_and_degradation_evidence() -> None:
+    store = _Store()
+    store.cells._values["RNA_nCounts"] = np.asarray(["bad"] * store.cells.N)
+    store.cells._values["RNA_nFeatures"] = np.asarray(
+        [*np.linspace(10.0, 20.0, store.cells.N - 1), np.nan]
+    )
+    artifact = _write_cell_artifact(
+        store,
+        name="RNA_percentMito",
+        kind="quality_metric",
+        values=np.asarray([*np.linspace(1.0, 2.0, store.cells.N - 1), np.inf]),
+        assay="RNA",
+        operation="run_feature_percentage",
+        inputs={
+            "lineage": [
+                {
+                    "scope": "invalid",
+                    "kind": "invalid",
+                    "artifact_id": "invalid",
+                },
+                store.cell_selection.to_dict(),
+                store.cell_selection.to_dict(),
+            ]
+        },
+    )
+    context = _context(store, quality_metric_artifacts=[artifact])
+
+    inspected = asyncio.run(inspect_cell_covariates(context))
+
+    sources = {
+        (source.sourceType, source.metricName): source
+        for source in inspected.qcMetricSources
+    }
+    nonnumeric = sources[("metadataColumn", "RNA_nCounts")]
+    assert nonnumeric.usableForFiltering is False
+    assert nonnumeric.missingCells == store.cells.N
+    assert nonnumeric.notes == ["Metric is not numeric and cannot drive filtering"]
+    nonfinite = sources[("metadataColumn", "RNA_nFeatures")]
+    assert nonfinite.usableForFiltering is False
+    assert nonfinite.missingCells == 1
+    derived = sources[("artifact", "RNA_percentMito")]
+    assert derived.origin == "derivedArtifact"
+    assert derived.usableForFiltering is False
+    assert derived.missingCells == 1
+    assert derived.inputArtifacts == [
+        ArtifactReferenceModel.from_artifact_ref(store.cell_selection)
+    ]
+    skip = next(profile for profile in inspected.qcProfiles if profile.action == "skip")
+    assert any("not numeric" in note for note in skip.notes)
+    assert any("non-finite" in note for note in skip.notes)
+
+
+def test_directed_capture_artifact_enables_pooled_reference_profile() -> None:
+    store = _Store()
+    labels = np.repeat(["capture-a", "capture-b", "capture-c"], 20)
+    counts = np.concatenate(
+        [
+            np.linspace(90.0, 110.0, 20),
+            np.linspace(95.0, 115.0, 20),
+            np.linspace(100.0, 120.0, 20),
+        ]
+    )
+    n_cells = len(labels)
+    _replace_store_cells(
+        store,
+        {
+            "I": np.ones(n_cells, dtype=bool),
+            "ids": np.asarray([f"cell-{index}" for index in range(n_cells)]),
+            "names": np.asarray([f"cell-{index}" for index in range(n_cells)]),
+            "RNA_nCounts": counts,
+        },
+    )
+    capture = _write_cell_artifact(
+        store,
+        name="capture",
+        kind="hto_identity",
+        values=labels,
+        assay="HTO",
+    )
+    context = _context(
+        store,
+        directions={
+            "physicalCaptureColumn": "capture",
+            "cellQc": {
+                "pooledReferenceCaptures": ["capture-a", "capture-b"],
+            },
+        },
+        hto_identity_artifacts=[capture],
+    )
+
+    inspected = asyncio.run(inspect_cell_covariates(context))
+
+    profile = next(
+        item
+        for item in inspected.qcProfiles
+        if item.registeredProfile == "pooledReferenceMad5"
+    )
+    assert profile.captureColumn is None
+    assert profile.captureArtifact == capture
+    assert profile.sampleArtifact == capture
+    assert profile.parameters["pooledReferenceCaptures"] == [
+        "capture-a",
+        "capture-b",
+    ]
+    assert profile.activeCellsByCapture == {
+        "capture-a": 20,
+        "capture-b": 20,
+        "capture-c": 20,
+    }
+
+
+def test_registered_only_without_qc_driver_returns_explicit_skip() -> None:
+    store = _Store()
+    store.assay_names = []
+    context = _context(store, directions={"registeredQcOnly": True})
+
+    inspected = asyncio.run(inspect_cell_covariates(context))
+
+    assert len(inspected.qcProfiles) == 1
+    profile = inspected.qcProfiles[0]
+    assert profile.action == "skip"
+    assert profile.driverAssay is None
+    assert profile.driverAssayType is None
+    assert profile.notes == [
+        "No RNA or ATAC assay is eligible to drive automatic cell QC"
+    ]
+
+
+def test_missing_rna_percentage_metrics_are_derived_through_public_artifacts() -> None:
+    store = _Store()
+    feature_values = {
+        "ids": np.asarray(["MT-CO1", "RPS3", "GAPDH"]),
+        "names": np.asarray(["MT-CO1", "RPS3", "GAPDH"]),
+    }
+    assay = SimpleNamespace(
+        feats=SimpleNamespace(
+            N=3,
+            fetch_all=lambda column: feature_values[column],
+        )
+    )
+    selection_calls: list[dict[str, object]] = []
+    percentage_calls: list[dict[str, object]] = []
+
+    def set_feature_selection(**kwargs: object) -> ArtifactRef:
+        selection_calls.append(kwargs)
+        return ArtifactRef(
+            scope="assay",
+            assay="RNA",
+            kind="feature_selection",
+            artifact_id=str(len(selection_calls)) * 64,
+        )
+
+    def run_feature_percentage(
+        cell_selection: ArtifactRef,
+        feature_selection: ArtifactRef,
+        *,
+        invalidate_cache: bool,
+    ) -> ArtifactRef:
+        percentage_calls.append(
+            {
+                "cellSelection": cell_selection,
+                "featureSelection": feature_selection,
+                "invalidateCache": invalidate_cache,
+            }
+        )
+        return ArtifactRef(
+            scope="assay",
+            assay="RNA",
+            kind="quality_metric",
+            artifact_id=str(len(percentage_calls) + 2) * 64,
+        )
+
+    store.get_assay = lambda assay_name: assay
+    store.set_feature_selection = set_feature_selection
+    store.run_feature_percentage = run_feature_percentage
+
+    sources = experimental_context_qc._derive_missing_percentage_artifacts(
+        store,
+        cell_selection=store.cell_selection,
+        driver=("RNA", "RNA"),
+        quality_sources=[],
+    )
+
+    assert [source.name for source in sources] == [
+        "RNA_percentMito",
+        "RNA_percentRibo",
+    ]
+    np.testing.assert_array_equal(
+        selection_calls[0]["mask"],
+        [True, False, False],
+    )
+    np.testing.assert_array_equal(
+        selection_calls[1]["mask"],
+        [False, True, False],
+    )
+    assert all(call["from_assay"] == "RNA" for call in selection_calls)
+    assert all(call["invalidate_cache"] is False for call in selection_calls)
+    assert [call["cellSelection"] for call in percentage_calls] == [
+        store.cell_selection,
+        store.cell_selection,
+    ]
+    assert all(call["invalidateCache"] is False for call in percentage_calls)
+
+
 def test_validator_rejects_harmony_when_batch_confounds_biology() -> None:
     store = _Store()
     context = _context(store)
@@ -885,7 +1517,7 @@ def test_harmony_safety_uses_only_exact_proposed_batch_columns() -> None:
 def test_batch_safety_does_not_depend_on_pairwise_selected_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from scarf.agent import experimental_context as module
+    from scarf.agent.experimental_context import tools as module
 
     store = _Store()
     decision = _design_decision(action="evaluateHarmony")
@@ -968,6 +1600,8 @@ def test_batch_safety_checks_multiple_columns_jointly() -> None:
             batch_columns=["plate"],
         )
     )
+    context = _context(store, directions={"columnKinds": {"disease": "continuous"}})
+    asyncio.run(inspect_cell_covariates(context))
     joint = asyncio.run(
         analyze_experimental_design(
             context,
@@ -1208,7 +1842,7 @@ def test_agent_uses_exact_graph_lineage_without_current_state_lookup(
 def test_harmony_requires_resolved_units_and_estimability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from scarf.agent import experimental_context as module
+    from scarf.agent.experimental_context import validation as module
 
     characterization = CovariateCharacterization(
         status="needsInput",
@@ -1228,7 +1862,7 @@ def test_harmony_requires_resolved_units_and_estimability(
     )
     monkeypatch.setattr(
         module,
-        "characterize_covariates",
+        "characterize_context",
         lambda *_args, **_kwargs: characterization,
     )
     store = _Store()
@@ -1309,7 +1943,7 @@ def test_returned_decision_canonicalizes_caller_directions() -> None:
 
 
 def test_named_artifact_and_qc_source_validation_edges() -> None:
-    metric = NamedArtifactSource.get_example()
+    metric = example(NamedArtifactSource)
     identity = NamedArtifactSource(
         name="HTO_identity",
         artifact=ArtifactReferenceModel(
@@ -1329,7 +1963,7 @@ def test_named_artifact_and_qc_source_validation_edges() -> None:
     with pytest.raises(ValidationError, match="requires both name and artifact"):
         NamedArtifactSource(artifact=metric.artifact)
 
-    validate = experimental_context_module._validate_qc_sources
+    validate = experimental_context_contracts._validate_qc_sources
     with pytest.raises(ValueError, match="metadata attributes must be unique"):
         validate(
             action="globalGaussian",
@@ -1437,8 +2071,252 @@ def test_named_artifact_and_qc_source_validation_edges() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"coefficient": " disease "}, "coefficient cannot contain"),
+        ({"sampleBy": " "}, "sampleBy must be"),
+        ({"pairBy": " donor "}, "pairBy must be"),
+        ({"groupOrder": ["case", "case"]}, "groupOrder must contain unique"),
+        ({"groupOrder": ["case", np.inf]}, "cannot contain non-finite"),
+        ({"expressionCutoff": np.nan}, "expressionCutoff must be finite"),
+        (
+            {"expressionCutoff": 0.1},
+            "expressionCutoff is only used with fraction",
+        ),
+        (
+            {"groupOrder": ["a", "b", "c"], "test": "mann_whitney"},
+            "mann_whitney requires exactly two",
+        ),
+        (
+            {"groupOrder": ["a", "b"], "test": "kruskal_wallis"},
+            "kruskal_wallis requires at least three",
+        ),
+        ({"test": "wilcoxon"}, "wilcoxon requires exactly two groups"),
+        (
+            {"test": "mann_whitney", "pairBy": "donor"},
+            "paired contrast must use the wilcoxon",
+        ),
+        ({"replicationPassed": False}, "licensed contrast requires resolved"),
+        (
+            {"status": "blocked", "blockedReasons": []},
+            "non-licensed contrast requires blockedReasons",
+        ),
+    ],
+)
+def test_contrast_plan_rejects_inconsistent_licenses(
+    changes: dict[str, object],
+    message: str,
+) -> None:
+    values: dict[str, object] = {
+        "coefficient": "disease",
+        "groupOrder": ["case", "control"],
+        "sampleBy": "sample",
+        "test": "mann_whitney",
+        "status": "licensed",
+        "betweenUnitDesign": True,
+        "replicationPassed": True,
+        "estimabilityPassed": True,
+    }
+    values.update(changes)
+    with pytest.raises(ValidationError, match=message):
+        ContrastPlan.model_validate(values)
+
+
+def test_contrast_plan_accepts_complete_paired_license() -> None:
+    plan = ContrastPlan(
+        coefficient="treatment",
+        groupOrder=["treated", "control"],
+        sampleBy="sample",
+        pairBy="donor",
+        test="wilcoxon",
+        status="licensed",
+        betweenUnitDesign=True,
+        replicationPassed=True,
+        estimabilityPassed=True,
+        pairedCoveragePassed=True,
+    )
+
+    assert plan.status == "licensed"
+    assert plan.test == "wilcoxon"
+
+
+@pytest.mark.parametrize(
+    ("registered_profile", "action", "sample_column", "sample_artifact", "message"),
+    [
+        (
+            "retainWithFlags",
+            "registeredMad",
+            None,
+            None,
+            "non-filtering skip",
+        ),
+        (
+            "retainWithFlags",
+            "skip",
+            "capture",
+            None,
+            "cannot include a capture source",
+        ),
+        ("globalMad5", "globalGaussian", None, None, "registeredMad action"),
+        (
+            "captureMad5",
+            "registeredMad",
+            None,
+            None,
+            "requires exactly one proven capture source",
+        ),
+        (
+            "globalMad5",
+            "registeredMad",
+            "capture",
+            None,
+            "cannot include a capture source",
+        ),
+    ],
+)
+def test_registered_qc_source_contract_rejects_inconsistent_modes(
+    registered_profile: str,
+    action: str,
+    sample_column: str | None,
+    sample_artifact: NamedArtifactSource | None,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        experimental_context_contracts._validate_qc_sources(
+            action=action,
+            attributes=["RNA_nCounts"],
+            artifact_metrics=[],
+            sample_column=sample_column,
+            sample_artifact=sample_artifact,
+            registered_profile=registered_profile,
+        )
+
+
+def test_registered_qc_source_contract_accepts_global_capture_and_retain_modes() -> (
+    None
+):
+    capture = NamedArtifactSource(
+        name="capture",
+        artifact=ArtifactReferenceModel(
+            assay="HTO",
+            kind="hto_identity",
+            artifactId="4" * 64,
+        ),
+    )
+    validate = experimental_context_contracts._validate_qc_sources
+
+    validate(
+        action="skip",
+        attributes=[],
+        artifact_metrics=[],
+        sample_column=None,
+        sample_artifact=None,
+        registered_profile="retainWithFlags",
+    )
+    validate(
+        action="registeredMad",
+        attributes=["RNA_nCounts"],
+        artifact_metrics=[],
+        sample_column=None,
+        sample_artifact=None,
+        registered_profile="globalMad5",
+    )
+    validate(
+        action="registeredMad",
+        attributes=["RNA_nCounts"],
+        artifact_metrics=[],
+        sample_column=None,
+        sample_artifact=capture,
+        registered_profile="captureMad5",
+    )
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        (
+            {"independentAdverseAxes": 1},
+            "axis count must match",
+        ),
+        (
+            {"wholeCaptureFailure": False},
+            "requires at least two independent",
+        ),
+        (
+            {"preservesConditionCoverage": False},
+            "exclusion requires failure and preserved",
+        ),
+    ],
+)
+def test_capture_failure_evidence_rejects_inconsistent_state(
+    changes: dict[str, object],
+    message: str,
+) -> None:
+    values: dict[str, object] = {
+        "capture": "failed",
+        "activeCells": 20,
+        "retainedCells": 2,
+        "retainedFraction": 0.1,
+        "adverseAxes": ["count", "feature"],
+        "independentAdverseAxes": 2,
+        "wholeCaptureFailure": True,
+        "preservesConditionCoverage": True,
+        "preservesIndependentUnitCoverage": True,
+        "exclusionEligible": True,
+    }
+    values.update(changes)
+    with pytest.raises(ValidationError, match=message):
+        CaptureFailureEvidence.model_validate(values)
+
+
+def test_cell_qc_profile_requires_exact_capture_failure_inventory() -> None:
+    capture = NamedArtifactSource(
+        name="capture",
+        artifact=ArtifactReferenceModel(
+            assay="HTO",
+            kind="hto_identity",
+            artifactId="5" * 64,
+        ),
+    )
+    failure = CaptureFailureEvidence(
+        capture="failed",
+        activeCells=20,
+        retainedCells=2,
+        retainedFraction=0.1,
+        adverseAxes=["count", "feature"],
+        independentAdverseAxes=2,
+        wholeCaptureFailure=True,
+        preservesConditionCoverage=True,
+        preservesIndependentUnitCoverage=True,
+        exclusionEligible=True,
+    )
+    with pytest.raises(ValidationError, match="mutually exclusive"):
+        CellQcProfileEvidence(
+            action="skip",
+            captureColumn="capture",
+            captureArtifact=capture,
+        )
+    with pytest.raises(ValidationError, match="failure evidence must be unique"):
+        CellQcProfileEvidence(
+            action="skip",
+            captureFailureEvidence=[failure, failure],
+        )
+    with pytest.raises(ValidationError, match="failed captures must match"):
+        CellQcProfileEvidence(
+            action="skip",
+            captureFailureEvidence=[failure],
+        )
+    with pytest.raises(ValidationError, match="excludable captures must match"):
+        CellQcProfileEvidence(
+            action="skip",
+            captureFailureEvidence=[failure],
+            failedCaptureCandidates=["failed"],
+        )
+
+
 def test_experimental_handoff_validation_edges() -> None:
-    result = ExperimentalContextResult.get_example()
+    result = example(ExperimentalContextResult)
     without_selection = result.model_copy(update={"cellSelection": None})
     with pytest.raises(ValueError, match="lacks a cell selection"):
         without_selection.to_parameter_tuning_handoff()
@@ -1508,14 +2386,14 @@ def test_experimental_context_private_input_guards(
             "htoIdentityColumn": "donor",
         },
     ).deps
-    assert experimental_context_module._hto_identity_columns(deps) == [
+    assert experimental_context_qc._hto_identity_columns(deps) == [
         "sample",
         "donor",
     ]
 
     unknown_tool = SimpleNamespace(name="future_tool")
     assert (
-        experimental_context_module._prepare_experimental_context_tool(
+        experimental_context_tools._prepare_experimental_context_tool(
             SimpleNamespace(deps=deps),
             unknown_tool,
         )
@@ -1526,12 +2404,13 @@ def test_experimental_context_private_input_guards(
         confounding=[{"coefficient": 3, "pairs": []}],
     )
     assert (
-        experimental_context_module.characterization_evidence(characterization) == set()
+        experimental_context_contracts.characterization_evidence(characterization)
+        == set()
     )
 
     deps.cellSelection = None
     with pytest.raises(ValueError, match="exact artifact"):
-        experimental_context_module._cell_selection_ref(deps)
+        experimental_context_qc._cell_selection_ref(deps)
     deps.cellSelection = _artifact_ref = ArtifactRef(
         scope="assay",
         assay="RNA",
@@ -1539,11 +2418,11 @@ def test_experimental_context_private_input_guards(
         artifact_id="4" * 64,
     )
     with pytest.raises(ValueError, match="datastore cell selection"):
-        experimental_context_module._cell_selection_ref(deps)
+        experimental_context_qc._cell_selection_ref(deps)
     del _artifact_ref
 
     with pytest.raises(TypeError, match="NamedArtifactSource"):
-        experimental_context_module._source_ref(
+        experimental_context_qc._source_ref(
             object(),
             expected_kind="quality_metric",
         )
@@ -1552,12 +2431,12 @@ def test_experimental_context_private_input_guards(
         artifact=ArtifactReferenceModel(),
     )
     with pytest.raises(ValueError, match="non-empty semantic name"):
-        experimental_context_module._source_ref(
+        experimental_context_qc._source_ref(
             blank_source,
             expected_kind="quality_metric",
         )
     with pytest.raises(ValueError, match="quality_metric"):
-        experimental_context_module._source_ref(
+        experimental_context_qc._source_ref(
             NamedArtifactSource(
                 name="identity",
                 artifact=ArtifactReferenceModel(
@@ -1579,19 +2458,19 @@ def test_experimental_context_private_input_guards(
     )
     deps.htoIdentityArtifacts = [duplicate, duplicate]
     with pytest.raises(ValueError, match="names must be unique"):
-        experimental_context_module._hto_artifact_map(deps)
+        experimental_context_qc._hto_artifact_map(deps)
 
     deps.cellSelection = store.cell_selection
     monkeypatch.setattr(
-        experimental_context_module,
+        experimental_context_qc,
         "read_stored_selection_mask",
         lambda *_args, **_kwargs: np.ones(store.cells.N + 1, dtype=bool),
     )
     with pytest.raises(ValueError, match="aligned boolean selection"):
-        experimental_context_module._active_cell_count(deps)
+        experimental_context_qc._active_cell_count(deps)
 
 
-def test_qc_profile_degradation_and_selection_guards(
+def test_core_qc_reports_unavailable_default_bounds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _Store()
@@ -1599,7 +2478,7 @@ def test_qc_profile_degradation_and_selection_guards(
     deps = context.deps
     active = np.ones(store.cells.N, dtype=bool)
     notes: list[str] = []
-    profile = experimental_context_module._global_qc_profile(
+    profile = experimental_context_qc._global_qc_profile(
         deps,
         ("RNA", "RNA"),
         active,
@@ -1610,15 +2489,15 @@ def test_qc_profile_degradation_and_selection_guards(
         notes,
     )
     assert profile is None
-    assert notes == ["Ignored constant QC metric 'constant'"]
+    assert "constant metric 'constant'" in notes[0]
 
     monkeypatch.setattr(
-        experimental_context_module,
+        experimental_context_qc,
         "gaussian_quantile_bounds",
         lambda *_args, **_kwargs: (float("nan"), float("nan")),
     )
     notes = []
-    profile = experimental_context_module._global_qc_profile(
+    profile = experimental_context_qc._global_qc_profile(
         deps,
         ("RNA", "RNA"),
         active,
@@ -1630,87 +2509,6 @@ def test_qc_profile_degradation_and_selection_guards(
     )
     assert profile is None
     assert "non-finite Gaussian bounds" in notes[0]
-
-    skip = CellQcProfileEvidence(
-        profileId="skip",
-        action="skip",
-        activeCells=store.cells.N,
-        retainedCells=store.cells.N,
-        retainedFraction=1.0,
-        evidenceId="qcProfile:skip",
-    )
-    global_profile = CellQcProfileEvidence(
-        profileId="global",
-        action="globalGaussian",
-        driverAssay="RNA",
-        driverAssayType="RNA",
-        attributes=["RNA_nCounts"],
-        activeCells=store.cells.N,
-        retainedCells=store.cells.N - 1,
-        retainedFraction=(store.cells.N - 1) / store.cells.N,
-        evidenceId="qcProfile:global",
-    )
-    deps.qcProfiles = {"skip": skip, "global": global_profile}
-    characterization = CovariateCharacterization(status="done")
-
-    deps.directions = {"cellQc": {"profileId": 3}}
-    with pytest.raises(ModelRetry, match="profileId direction must be a string"):
-        experimental_context_module._canonical_cell_qc_plan(
-            CellQcPlan(), deps, characterization
-        )
-    deps.directions = {
-        "cellQc": {"sampleColumn": "sample", "sampleArtifactName": "identity"}
-    }
-    with pytest.raises(ModelRetry, match="cannot select both"):
-        experimental_context_module._canonical_cell_qc_plan(
-            CellQcPlan(), deps, characterization
-        )
-    deps.directions = {"cellQc": {"sampleArtifactName": 3}}
-    with pytest.raises(ModelRetry, match="sampleArtifactName must be a string"):
-        experimental_context_module._canonical_cell_qc_plan(
-            CellQcPlan(), deps, characterization
-        )
-    deps.directions = {"cellQc": {"action": "unknown"}}
-    with pytest.raises(ModelRetry, match="Unsupported cellQc.action"):
-        experimental_context_module._canonical_cell_qc_plan(
-            CellQcPlan(), deps, characterization
-        )
-    deps.directions = {"cellQc": {"action": "sampleMad"}}
-    with pytest.raises(ModelRetry, match="exactly one offered profile"):
-        experimental_context_module._canonical_cell_qc_plan(
-            CellQcPlan(), deps, characterization
-        )
-    deps.directions = {"cellQc": {"profileId": "unknown"}}
-    with pytest.raises(ModelRetry, match="was not offered"):
-        experimental_context_module._canonical_cell_qc_plan(
-            CellQcPlan(), deps, characterization
-        )
-
-    deps.directions = {}
-    selected = experimental_context_module._canonical_cell_qc_plan(
-        CellQcPlan(), deps, characterization
-    )
-    assert selected.profileId == "global"
-
-    mismatched = CellQcPlan(
-        action="globalGaussian",
-        profileId="global",
-        driverAssay="RNA",
-        driverAssayType="RNA",
-        attributes=["different_metric"],
-        evidenceIds=["qcProfile:global"],
-    )
-    with pytest.raises(ModelRetry, match="copy the selected offered profile"):
-        experimental_context_module._canonical_cell_qc_plan(
-            mismatched, deps, characterization
-        )
-    missing_evidence = mismatched.model_copy(
-        update={"attributes": ["RNA_nCounts"], "evidenceIds": []}
-    )
-    with pytest.raises(ModelRetry, match="cite its exact profile"):
-        experimental_context_module._canonical_cell_qc_plan(
-            missing_evidence, deps, characterization
-        )
 
 
 def test_design_analysis_rejects_invalid_batch_proposals(
@@ -1742,7 +2540,7 @@ def test_design_analysis_rejects_invalid_batch_proposals(
         notes=["design failed"],
     )
     monkeypatch.setattr(
-        experimental_context_module,
+        experimental_context_tools,
         "characterize_covariates",
         lambda *_args, **_kwargs: failed,
     )
@@ -1753,6 +2551,7 @@ def test_design_analysis_rejects_invalid_batch_proposals(
                 column_domains={},
                 coefficients_of_interest=[],
                 units_of_inference={},
+                batch_columns=[],
             )
         )
 
@@ -1778,7 +2577,7 @@ def test_design_analysis_records_not_computed_estimability(
     )
 
     monkeypatch.setattr(
-        experimental_context_module,
+        experimental_context_tools,
         "reduce_observation_units",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("bad design")),
     )
@@ -1906,13 +2705,12 @@ def test_batch_correction_plan_validation_edges() -> None:
         candidate_coefficients: dict[str, dict[str, Any]] | None = None,
         requested: set[str] | None = None,
     ) -> None:
-        experimental_context_module._validate_batch_correction_plan(
+        experimental_context_validation._validate_batch_correction_plan(
             candidate,
             deps or context.deps,
             characterization,
             requested if requested is not None else {"disease"},
             units,
-            candidate.cellQc,
             candidate_records or records,
             candidate_coefficients or coefficient_records,
         )
@@ -2010,7 +2808,7 @@ def test_batch_correction_plan_validation_edges() -> None:
             "kind": "continuous",
         },
     }
-    with pytest.raises(ModelRetry, match="must be categorical"):
+    with pytest.raises(ModelRetry, match="Batch correction is unsafe"):
         validate(
             changed_plan(
                 action="evaluateHarmony",

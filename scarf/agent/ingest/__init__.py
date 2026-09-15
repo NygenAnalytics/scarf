@@ -9,6 +9,12 @@ from .common import CONVERT_FORMATS, ensure_convert_destination
 from .detect import detect_format
 from .h5ad import ingest_h5ad
 from .loom import ingest_loom
+from .manifest import (
+    DatasetManifest,
+    DatasetManifestDecision,
+    inspect_h5ad_manifest,
+    is_author_label_column,
+)
 from .mtx import ingest_mtx
 from .result import IngestResult, needs_input
 from .seurat import ingest_seurat
@@ -16,8 +22,12 @@ from .zarr_store import ingest_zarr
 
 __all__ = [
     "IngestResult",
+    "DatasetManifest",
+    "DatasetManifestDecision",
     "detect_format",
     "ingest",
+    "inspect_h5ad_manifest",
+    "is_author_label_column",
 ]
 
 

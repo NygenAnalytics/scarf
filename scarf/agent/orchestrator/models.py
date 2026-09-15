@@ -1,53 +1,105 @@
 """Public data models for resumable automated agent workflows."""
 
 import re
-from typing import Any, Literal
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
 from ...storage.refs import ArtifactRef
+from ..cell_quality.profiles import cell_qc_policy
 from ..config import AgentRunConfig
-from ..experimental_context import CellQcPlan
-from ..persistence import AgentReportReference, AgentWorkflowRun
+from ..decisions.rna import CellQualityExecutorPayload
+from ..experimental_context.contracts import CellQcPlan
+from ..experimental_context.study import AuthorLabelPolicy
 from ..types import AgentDataModel, ArtifactReferenceModel
 
-type AutomatedWorkflowStatus = Literal["completed", "needsInput", "failed", "abandoned"]
-type WorkflowStageStatus = Literal["started", "done", "needsInput", "failed"]
+if TYPE_CHECKING:
+    import pandas as pd
+
+    from ...datastore.datastore import DataStore
+    from ...plotting._figure import PlotResult
+
+type AutomatedWorkflowStatus = Literal[
+    "completed",
+    "needsInput",
+    "abstained",
+    "failed",
+    "abandoned",
+]
+type WorkflowInputPolicy = Literal["pause", "unattended"]
+type WorkflowStageStatus = Literal[
+    "started", "done", "needsInput", "abstained", "failed"
+]
 type WorkflowStageName = Literal[
     "ingest",
     "data_enrichment",
-    "hto_demultiplexing",
+    "rna_quality_metrics",
     "experimental_context",
     "preprocessing_plan",
     "preprocessing",
     "parameter_tuning",
     "analysis_finalization",
-    "biological_interpretation",
+    "report",
 ]
 type AssayRole = Literal["graph", "hto", "unsupported"]
 type ReductionMethod = Literal["pca", "lsi", "identity", "none"]
 
 _RUN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-_ORCHESTRATION_FORMAT = "scarf_agent_orchestrations"
-_ORCHESTRATION_VERSION = 1
 _STAGE_ORDER: tuple[WorkflowStageName, ...] = (
     "ingest",
     "data_enrichment",
-    "hto_demultiplexing",
+    "rna_quality_metrics",
     "experimental_context",
     "preprocessing_plan",
     "preprocessing",
     "parameter_tuning",
     "analysis_finalization",
-    "biological_interpretation",
 )
+
+
+@dataclass(frozen=True)
+class WorkflowIdentity:
+    """Runtime address of a workflow whose state belongs to its journal."""
+
+    workflowRunId: str
+    workspace: str | None = None
+
+
+class StageEvidenceReference(AgentDataModel):
+    """Exact evidence checkpoint owned by an orchestration stage."""
+
+    workflowRunId: str
+    stage: WorkflowStageName
+    key: str
+    contentSha256: str
+
+
+class AnalysisError(RuntimeError):
+    """An unattended analysis could not produce a supported completed result."""
+
+    def __init__(self, result: "AutomatedWorkflowResult") -> None:
+        self.result = result
+        detail = "; ".join(result.notes) or "Required scientific evidence is unresolved"
+        address = (
+            f" Resume workflow {result.workflowRunId!r} in {result.zarrPath!r}"
+            f" (workspace={result.workspace!r})."
+            if result.workflowRunId and result.zarrPath
+            else ""
+        )
+        super().__init__(
+            f"RNA analysis {result.status} during {result.currentStage}: {detail}.{address}"
+        )
 
 
 class WorkflowQuestion(AgentDataModel):
     """One stable question that can be answered by a resume request."""
 
     questionId: str = ""
+    decisionId: str | None = None
     question: str = ""
     options: list[str] = Field(default_factory=list)
     evidenceIds: list[str] = Field(default_factory=list)
@@ -56,14 +108,6 @@ class WorkflowQuestion(AgentDataModel):
     @classmethod
     def get_blank(cls) -> "WorkflowQuestion":
         return cls()
-
-    @classmethod
-    def get_example(cls) -> "WorkflowQuestion":
-        return cls(
-            questionId="approvePlanChecksum",
-            question="Approve this preprocessing plan?",
-            planChecksum="0" * 64,
-        )
 
 
 class WorkflowNeedsInput(AgentDataModel):
@@ -74,10 +118,6 @@ class WorkflowNeedsInput(AgentDataModel):
     @classmethod
     def get_blank(cls) -> "WorkflowNeedsInput":
         return cls()
-
-    @classmethod
-    def get_example(cls) -> "WorkflowNeedsInput":
-        return cls(questions=[WorkflowQuestion.get_example()])
 
 
 class WorkflowStageLink(AgentDataModel):
@@ -105,10 +145,6 @@ class WorkflowStageLink(AgentDataModel):
     def get_blank(cls) -> "WorkflowStageLink":
         return cls()
 
-    @classmethod
-    def get_example(cls) -> "WorkflowStageLink":
-        return cls(stage="ingest", attemptId="attempt-1", contentSha256="0" * 64)
-
 
 class WorkflowStageAttempt(AgentDataModel):
     """Append-only record for one orchestration stage attempt."""
@@ -122,7 +158,7 @@ class WorkflowStageAttempt(AgentDataModel):
     requestSha256: str = ""
     configSha256: str = ""
     parentAttempts: list[WorkflowStageLink] = Field(default_factory=list)
-    reportReferences: list[AgentReportReference] = Field(default_factory=list)
+    reportReferences: list[StageEvidenceReference] = Field(default_factory=list)
     artifacts: dict[str, ArtifactReferenceModel] = Field(default_factory=dict)
     inputs: dict[str, Any] = Field(default_factory=dict)
     outputs: dict[str, Any] = Field(default_factory=dict)
@@ -148,20 +184,6 @@ class WorkflowStageAttempt(AgentDataModel):
     def get_blank(cls) -> "WorkflowStageAttempt":
         return cls()
 
-    @classmethod
-    def get_example(cls) -> "WorkflowStageAttempt":
-        return cls(
-            workflowRunId="workflow-1",
-            stage="ingest",
-            attemptId="attempt-1",
-            status="done",
-            startedAtNs=1,
-            completedAtNs=2,
-            requestSha256="0" * 64,
-            configSha256="1" * 64,
-            contentSha256="2" * 64,
-        )
-
 
 class AssayPreprocessingPlan(AgentDataModel):
     """Exact allowlisted preprocessing route for one assay."""
@@ -174,28 +196,12 @@ class AssayPreprocessingPlan(AgentDataModel):
     featureMethod: Literal["hvg", "prevalentPeaks", "panel", "none"] = "none"
     reductionMethod: ReductionMethod = "none"
     featureParameters: dict[str, Any] = Field(default_factory=dict)
-    normalizationParameters: dict[str, Any] = Field(default_factory=dict)
-    reductionParameters: dict[str, Any] = Field(default_factory=dict)
-    exactExcludedFeatures: list[str] = Field(default_factory=list)
     evidenceIds: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
 
     @classmethod
     def get_blank(cls) -> "AssayPreprocessingPlan":
         return cls()
-
-    @classmethod
-    def get_example(cls) -> "AssayPreprocessingPlan":
-        return cls(
-            assay="RNA",
-            assayType="RNA",
-            role="graph",
-            graphEligible=True,
-            markerEligible=True,
-            featureMethod="hvg",
-            reductionMethod="pca",
-            featureParameters={"topN": 1000, "minCells": 20},
-        )
 
 
 class AutomatedPreprocessingPlan(AgentDataModel):
@@ -205,28 +211,27 @@ class AutomatedPreprocessingPlan(AgentDataModel):
     markerAssay: str = ""
     cellSelection: ArtifactReferenceModel | None = None
     cellQc: CellQcPlan = Field(default_factory=CellQcPlan.get_blank)
+    cellQualityPayload: CellQualityExecutorPayload | None = None
     assays: list[AssayPreprocessingPlan] = Field(default_factory=list)
     pairedAssays: list[str] = Field(default_factory=list)
     planChecksum: str = ""
     limitations: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def validate_cell_quality_payload(self) -> "AutomatedPreprocessingPlan":
+        if (
+            self.cellQualityPayload is not None
+            and cell_qc_policy(self.cellQc.action, self.cellQc.registeredProfile)
+            != self.cellQualityPayload.profile
+        ):
+            raise ValueError(
+                "cellQualityPayload must match the exact selected QC policy"
+            )
+        return self
+
     @classmethod
     def get_blank(cls) -> "AutomatedPreprocessingPlan":
         return cls()
-
-    @classmethod
-    def get_example(cls) -> "AutomatedPreprocessingPlan":
-        return cls(
-            primaryAssay="RNA",
-            markerAssay="RNA",
-            cellSelection=ArtifactReferenceModel(
-                scope="datastore",
-                kind="cell_selection",
-                artifactId="c" * 64,
-            ),
-            assays=[AssayPreprocessingPlan.get_example()],
-            planChecksum="0" * 64,
-        )
 
 
 class PreprocessedAssayHandoff(AgentDataModel):
@@ -239,6 +244,13 @@ class PreprocessedAssayHandoff(AgentDataModel):
     graphFeatures: ArtifactReferenceModel | None = None
     markerFeatures: ArtifactReferenceModel | None = None
     normalized: ArtifactReferenceModel | None = None
+    graphFeatureCandidates: dict[str, ArtifactReferenceModel] = Field(
+        default_factory=dict
+    )
+    normalizedCandidates: dict[str, ArtifactReferenceModel] = Field(
+        default_factory=dict
+    )
+    featureCandidateEvaluations: list[dict[str, Any]] = Field(default_factory=list)
     nCells: int = 0
     nFeatures: int = 0
 
@@ -246,123 +258,115 @@ class PreprocessedAssayHandoff(AgentDataModel):
     def get_blank(cls) -> "PreprocessedAssayHandoff":
         return cls()
 
-    @classmethod
-    def get_example(cls) -> "PreprocessedAssayHandoff":
-        return cls(
-            assay="RNA",
-            assayType="RNA",
-            cellSelection=ArtifactReferenceModel(
-                scope="datastore",
-                kind="cell_selection",
-                artifactId="c" * 64,
-            ),
-            reductionMethod="pca",
-            graphFeatures=ArtifactReferenceModel.get_example(),
-            markerFeatures=ArtifactReferenceModel.get_example(),
-            normalized=ArtifactReferenceModel(
-                assay="RNA", kind="normalized", artifactId="1" * 64
-            ),
-            nCells=100,
-            nFeatures=1000,
-        )
-
-
-class NativeAnalysisHandoff(AgentDataModel):
-    """Selected immutable native analysis chain for one assay."""
-
-    assay: str = ""
-    reductionMethod: ReductionMethod = "none"
-    featureSelection: ArtifactReferenceModel | None = None
-    markerFeatures: ArtifactReferenceModel | None = None
-    normalized: ArtifactReferenceModel | None = None
-    reduction: ArtifactReferenceModel | None = None
-    batchCorrection: ArtifactReferenceModel | None = None
-    annIndex: ArtifactReferenceModel | None = None
-    embeddingInitialization: ArtifactReferenceModel | None = None
-    neighbors: ArtifactReferenceModel | None = None
-    graph: ArtifactReferenceModel | None = None
-    clusters: ArtifactReferenceModel | None = None
-    umap: ArtifactReferenceModel | None = None
-
-    @classmethod
-    def get_blank(cls) -> "NativeAnalysisHandoff":
-        return cls()
-
-    @classmethod
-    def get_example(cls) -> "NativeAnalysisHandoff":
-        return cls(assay="RNA", reductionMethod="pca")
-
 
 class FinalAnalysisHandoff(AgentDataModel):
-    """Replayable final analysis used by Biological Interpretation."""
+    """Exact final RNA artifacts validated by the concluding journal checkpoint."""
 
     workflowRunId: str = ""
     primaryAssay: str = ""
     markerAssay: str = ""
     cellSelection: ArtifactReferenceModel | None = None
-    nativeAnalyses: list[NativeAnalysisHandoff] = Field(default_factory=list)
     graph: ArtifactReferenceModel | None = None
-    graphMethod: Literal["native", "snn", "wnn"] = "native"
+    graphMethod: Literal["native"] = "native"
     clusters: ArtifactReferenceModel | None = None
     embeddingInitialization: ArtifactReferenceModel | None = None
     umap: ArtifactReferenceModel | None = None
     markerFeatures: ArtifactReferenceModel | None = None
     markers: ArtifactReferenceModel | None = None
-    parameterReport: AgentReportReference | None = None
+    doubletScores: list[ArtifactReferenceModel] = Field(default_factory=list)
+    doubletScoreSelections: list[ArtifactReferenceModel] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
 
     @classmethod
     def get_blank(cls) -> "FinalAnalysisHandoff":
         return cls()
 
-    @classmethod
-    def get_example(cls) -> "FinalAnalysisHandoff":
-        return cls(
-            workflowRunId="workflow-1",
-            primaryAssay="RNA",
-            markerAssay="RNA",
-            cellSelection=ArtifactReferenceModel(
-                scope="datastore",
-                kind="cell_selection",
-                artifactId="c" * 64,
-            ),
-            nativeAnalyses=[NativeAnalysisHandoff.get_example()],
-            graph=ArtifactReferenceModel(
-                assay="RNA", kind="connectivity_map", artifactId="2" * 64
-            ),
-            embeddingInitialization=ArtifactReferenceModel(
-                assay="RNA",
-                kind="embedding_initialization",
-                artifactId="5" * 64,
-            ),
-            clusters=ArtifactReferenceModel(
-                assay="RNA", kind="cluster_labels", artifactId="3" * 64
-            ),
-        )
-
 
 class AutomatedWorkflowConfig(AgentDataModel):
     """Bounded execution policy for automated workflows."""
 
-    primaryInitialCandidates: int = Field(default=5, ge=1)
-    secondaryInitialCandidates: int = Field(default=3, ge=1)
-    maxRefinedCandidatesPerAssay: int = Field(default=1, ge=0, le=1)
-    maxHarmonyCandidatesPerAssay: int = Field(default=1, ge=0, le=1)
-    integrationResolutionCandidates: int = Field(default=3, ge=1)
-    maxCandidateBranches: int = Field(default=24, ge=1)
-    minClusterCells: int = Field(default=20, ge=1)
-    maxIdentityFeatures: int = Field(default=64, ge=2)
-    maxGraphAssays: int = Field(default=3, ge=1)
+    inputPolicy: WorkflowInputPolicy = Field(
+        default="pause",
+        exclude_if=lambda value: value == "pause",
+    )
+    # Older requests always scored doublets. Keep their serialized defaults exact.
+    scoreDoublets: bool = Field(
+        default=True,
+        strict=True,
+        exclude_if=lambda value: value is True,
+        description="Score advisory doublets; Harmony-eligible runs always retain required doublet diagnostics. The beginner API defaults to false; absent saved fields retain enabled scoring.",
+    )
+    screeningCells: int | None = Field(
+        default=None,
+        ge=20,
+        description="Fixed initial screening size; null uses 10% of retained cells bounded to 10,000–100,000.",
+    )
+    maxScreeningCells: int = Field(default=100_000, ge=20)
+    maxScreeningEvaluations: int = Field(default=24, ge=4)
+    maxTotalScreeningEvaluations: int = Field(default=48, ge=4)
+    maxFullGraphs: int = Field(default=4, ge=1)
+    maxFullPartitions: int = Field(default=8, ge=1)
+    maxFullRepairs: int = Field(default=1, ge=0, le=1)
+    randomSeed: int = Field(default=4444, ge=0)
     allowDownloads: bool = False
     cacheDir: str | None = None
     agentRunConfig: AgentRunConfig = Field(default_factory=AgentRunConfig)
 
+    @model_validator(mode="before")
     @classmethod
-    def get_blank(cls) -> "AutomatedWorkflowConfig":
-        return cls()
+    def reject_obsolete_configuration(cls, value: Any) -> Any:
+        if isinstance(value, Mapping):
+            obsolete = sorted(
+                set(value)
+                & {
+                    "maxRefinedCandidatesPerAssay",
+                    "maxHarmonyCandidatesPerAssay",
+                    "runConfoundedHarmonyDiagnostic",
+                    "maxCandidateEvaluations",
+                    "maxIdentityFeatures",
+                    "minClusterCells",
+                    "hvgCandidateCounts",
+                    "pcaCandidateDimensions",
+                    "graphNeighborCandidates",
+                    "leidenResolutionCandidates",
+                    "maxRevisions",
+                    "primaryInitialCandidates",
+                    "secondaryInitialCandidates",
+                    "integrationResolutionCandidates",
+                    "maxCandidateBranches",
+                    "maxGraphAssays",
+                    "leidenSeeds",
+                    "clusterSubsamples",
+                    "clusterSubsampleFraction",
+                }
+            )
+            if obsolete:
+                raise ValueError(
+                    "Unsupported legacy workflow configuration fields: "
+                    + ", ".join(obsolete)
+                    + ". Create a new single-RNA workflow configuration with "
+                    "screening and full-cohort work limits. "
+                    "Saved workflows using these fields cannot be resumed or "
+                    "regenerated with this release; their analysis artifacts "
+                    "remain available through Scarf's artifact APIs."
+                )
+        return value
+
+    @model_validator(mode="after")
+    def validate_work_limits(self) -> "AutomatedWorkflowConfig":
+        if (
+            self.screeningCells is not None
+            and self.maxScreeningCells < self.screeningCells
+        ):
+            raise ValueError("maxScreeningCells must be at least screeningCells")
+        if self.maxTotalScreeningEvaluations < self.maxScreeningEvaluations:
+            raise ValueError(
+                "Whole-workflow screening allowance must cover one screening population"
+            )
+        return self
 
     @classmethod
-    def get_example(cls) -> "AutomatedWorkflowConfig":
+    def get_blank(cls) -> "AutomatedWorkflowConfig":
         return cls()
 
 
@@ -372,8 +376,9 @@ class AutomatedWorkflowRequest(AgentDataModel):
     sourcePath: str = ""
     zarrPath: str | None = None
     studyContext: str = ""
+    studyObjective: str = ""
+    authorLabelPolicy: AuthorLabelPolicy = "holdout"
     workspace: str | None = None
-    allowAssumptions: bool = False
     primaryAssay: str | None = None
     markerAssay: str | None = None
     analysisAssays: list[str] = Field(default_factory=list)
@@ -387,24 +392,21 @@ class AutomatedWorkflowRequest(AgentDataModel):
             raise ValueError("sourcePath must be non-empty")
         if not self.studyContext.strip():
             raise ValueError("studyContext must be non-empty")
+        if not self.studyObjective.strip():
+            raise ValueError("studyObjective must be non-empty")
         if len(set(self.analysisAssays)) != len(self.analysisAssays):
             raise ValueError("analysisAssays must be unique")
-        if len(set(self.pairedAssays)) != len(self.pairedAssays):
-            raise ValueError("pairedAssays must be unique")
-        if self.pairedAssays and len(self.pairedAssays) < 2:
-            raise ValueError("pairedAssays must contain at least two assays")
+        from .rna import validate_rna_request_fields
+
+        validate_rna_request_fields(self)
         return self
 
     @classmethod
     def get_blank(cls) -> "AutomatedWorkflowRequest":
-        return cls(sourcePath="dataset.h5", studyContext="Study context")
-
-    @classmethod
-    def get_example(cls) -> "AutomatedWorkflowRequest":
         return cls(
-            sourcePath="dataset.h5ad",
-            zarrPath="dataset.zarr",
-            studyContext="Single-cell profiling of treated human blood.",
+            sourcePath="dataset.h5",
+            studyContext="Study context",
+            studyObjective="Discover stable population structure.",
         )
 
 
@@ -428,49 +430,114 @@ class AutomatedWorkflowResumeRequest(AgentDataModel):
     def get_blank(cls) -> "AutomatedWorkflowResumeRequest":
         return cls(zarrPath="dataset.zarr", workflowRunId="workflow-1")
 
-    @classmethod
-    def get_example(cls) -> "AutomatedWorkflowResumeRequest":
-        return cls(
-            zarrPath="dataset.zarr",
-            workflowRunId="workflow-1",
-            answers={"approvePlanChecksum": "0" * 64},
-        )
-
 
 class AutomatedWorkflowResult(AgentDataModel):
-    """Bounded result of running or resuming an automated workflow."""
+    """Small result address; scientific evidence remains in the stage journal."""
 
     status: AutomatedWorkflowStatus = "failed"
     currentStage: WorkflowStageName = "ingest"
     zarrPath: str | None = None
-    workflowRun: AgentWorkflowRun | None = None
-    reportReferences: list[AgentReportReference] = Field(default_factory=list)
-    preprocessingPlan: AutomatedPreprocessingPlan | None = None
-    finalAnalysis: FinalAnalysisHandoff | None = None
+    workspace: str | None = None
+    workflowRunId: str | None = None
     needsInput: WorkflowNeedsInput | None = None
+    limitations: list[str] = Field(default_factory=list)
+    unresolvedClaims: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
-    contentSha256: str = ""
+
+    def _analysis_store(self) -> "DataStore":
+        from .journal import open_analysis_store
+
+        if self.status != "completed":
+            raise AnalysisError(self)
+        if self.zarrPath is None or self.workflowRunId is None:
+            raise RuntimeError("Completed analysis lacks its exact store and workflow")
+        return open_analysis_store(
+            self.zarrPath, self.workflowRunId, workspace=self.workspace
+        )
+
+    def _completed_analysis(self, store: "DataStore") -> FinalAnalysisHandoff:
+        from .journal import analysis_snapshot
+
+        assert self.workflowRunId is not None
+        snapshot = analysis_snapshot(store, self.workflowRunId)
+        if snapshot["status"] != "completed":
+            raise RuntimeError(
+                "The referenced workflow has no validated final analysis"
+            )
+        return FinalAnalysisHandoff.model_validate(snapshot["finalAnalysis"])
+
+    def plot_embedding(self, **kwargs: Any) -> "PlotResult":
+        """Display the saved cluster map with bounded reads and full-count provenance."""
+        from .._plots import plot_final_umap
+
+        store = self._analysis_store()
+        final = self._completed_analysis(store)
+        if (
+            final.umap is None
+            or final.clusters is None
+            or final.cellSelection is None
+            or final.graph is None
+        ):
+            raise RuntimeError("Completed analysis lacks its final map artifacts")
+        for name in (
+            "layout",
+            "run",
+            "color_by",
+            "umap",
+            "clusters",
+            "cell_selection",
+            "graph",
+        ):
+            if name in kwargs:
+                raise ValueError("plot_embedding uses the exact completed cluster map")
+        return plot_final_umap(
+            store,
+            umap=artifact_model_to_ref(final.umap),
+            clusters=artifact_model_to_ref(final.clusters),
+            cell_selection=artifact_model_to_ref(final.cellSelection),
+            graph=artifact_model_to_ref(final.graph),
+            **kwargs,
+        )
+
+    def get_markers(
+        self,
+        *,
+        group_id: str | int | None = None,
+        min_score: float = 0.25,
+        min_frac_exp: float = 0.2,
+    ) -> "pd.DataFrame":
+        """Load the final markers using Scarf's established marker filters."""
+        store = self._analysis_store()
+        final = self._completed_analysis(store)
+        if final.markers is None:
+            raise RuntimeError("Completed analysis lacks its marker artifact")
+        return store.get_markers(
+            marker=artifact_model_to_ref(final.markers),
+            group_id=group_id,
+            min_score=min_score,
+            min_frac_exp=min_frac_exp,
+        )
+
+    def report(self) -> Path:
+        """Return or regenerate the compact report from saved evidence only."""
+        from ..report.generator import generate_agent_report
+
+        store = self._analysis_store()
+        self._completed_analysis(store)
+        assert self.workflowRunId is not None
+        return generate_agent_report(store, self.workflowRunId)
 
     @classmethod
     def get_blank(cls) -> "AutomatedWorkflowResult":
         return cls()
-
-    @classmethod
-    def get_example(cls) -> "AutomatedWorkflowResult":
-        return cls(
-            status="completed",
-            currentStage="biological_interpretation",
-            zarrPath="dataset.zarr",
-            workflowRun=AgentWorkflowRun.get_example(),
-            finalAnalysis=FinalAnalysisHandoff.get_example(),
-        )
 
 
 class OrchestrationRequestRecord(AgentDataModel):
     """Stored immutable request and effective configuration."""
 
     recordType: Literal["automatedWorkflowRequest"] = "automatedWorkflowRequest"
-    formatVersion: Literal[1] = 1
+    inputIdentity: dict[str, Any]
+    modelIdentity: str
     workflowRunId: str = ""
     createdAtNs: int = Field(default=0, ge=0)
     request: AutomatedWorkflowRequest = Field(
@@ -483,46 +550,18 @@ class OrchestrationRequestRecord(AgentDataModel):
     configSha256: str = ""
     contentSha256: str = ""
 
-    @classmethod
-    def get_blank(cls) -> "OrchestrationRequestRecord":
-        return cls()
-
-    @classmethod
-    def get_example(cls) -> "OrchestrationRequestRecord":
-        return cls(
-            workflowRunId="workflow-1",
-            createdAtNs=1,
-            request=AutomatedWorkflowRequest.get_example(),
-            config=AutomatedWorkflowConfig.get_example(),
-            requestSha256="0" * 64,
-            configSha256="1" * 64,
-        )
-
 
 class OrchestrationResumeRecord(AgentDataModel):
-    """One append-only set of answers supplied during resume."""
+    """Runtime answers committed as inputs of their owning stage attempt."""
 
-    recordType: Literal["automatedWorkflowResume"] = "automatedWorkflowResume"
     workflowRunId: str = ""
-    resumeId: str = ""
-    createdAtNs: int = Field(default=0, ge=0)
     answeredAttempt: WorkflowStageLink | None = None
     questionIds: list[str] = Field(default_factory=list)
     answers: dict[str, Any] = Field(default_factory=dict)
-    contentSha256: str = ""
 
     @classmethod
     def get_blank(cls) -> "OrchestrationResumeRecord":
         return cls()
-
-    @classmethod
-    def get_example(cls) -> "OrchestrationResumeRecord":
-        return cls(
-            workflowRunId="workflow-1",
-            resumeId="resume-1",
-            createdAtNs=1,
-            answers={"approvePlanChecksum": "0" * 64},
-        )
 
 
 def artifact_model_to_ref(value: ArtifactReferenceModel) -> ArtifactRef:

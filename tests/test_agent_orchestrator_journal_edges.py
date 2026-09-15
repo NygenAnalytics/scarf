@@ -1,704 +1,386 @@
-"""Focused edge coverage for orchestration journal contracts."""
+"""Immutable evidence, integrity, and exact stage lineage contracts."""
 
+import json
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
-import zarr
-from pydantic import ValidationError
-from zarr.storage import MemoryStore
+from zarr.core.buffer import default_buffer_prototype
+from zarr.core.sync import sync
 
-import scarf.agent.orchestrator.journal as journal_module
-from scarf.agent.orchestrator import (
-    AutomatedWorkflowRequest,
-    AutomatedWorkflowResult,
-    AutomatedWorkflowResumeRequest,
+from scarf.agent.orchestrator import journal
+from scarf.agent.orchestrator.models import (
+    OrchestrationResumeRecord,
+    StageEvidenceReference,
     WorkflowNeedsInput,
     WorkflowQuestion,
     WorkflowStageAttempt,
-    WorkflowStageLink,
 )
-from scarf.agent.orchestrator.models import (
-    OrchestrationRequestRecord,
-    OrchestrationResumeRecord,
-)
-from scarf.agent.persistence import (
-    AgentInvocation,
-    AgentReportReference,
-    AgentWorkflowRun,
-)
+from scarf.agent.types import AgentDataModel
+from tests.agent_journal_store import memory_journal
 
 
-def _started(
-    *,
-    stage: str = "ingest",
-    parents: list[WorkflowStageLink] | None = None,
-    inputs: dict[str, Any] | None = None,
-) -> WorkflowStageAttempt:
-    attempt = WorkflowStageAttempt(
-        workflowRunId="workflow-1",
-        stage=stage,
-        attemptId="attempt-1",
-        status="started",
-        startedAtNs=1,
-        requestSha256="a" * 64,
-        configSha256="b" * 64,
-        parentAttempts=parents or [],
-        inputs=inputs or {},
-    )
-    return attempt.model_copy(
-        update={"contentSha256": journal_module._stage_checksum(attempt)}
-    )
+class Evidence(AgentDataModel):
+    rationale: str
+    nCells: int
 
 
-def _request_record() -> OrchestrationRequestRecord:
-    return OrchestrationRequestRecord(
-        workflowRunId="workflow-1",
-        requestSha256="a" * 64,
-        configSha256="b" * 64,
-    )
-
-
-def _with_checksum(record: Any) -> Any:
-    return record.model_copy(
-        update={"contentSha256": journal_module._record_checksum(record)}
-    )
-
-
-def _terminal_workflow() -> AgentWorkflowRun:
-    return AgentWorkflowRun(
-        workflowRunId="workflow-1",
-        createdAtNs=1,
-        finalizedAtNs=2,
-        status="completed",
-        finalizationMessage="completed",
-        analysisStore="analysis.zarr",
-        datasetFingerprints={"RNA": "fingerprint"},
-    )
-
-
-def _terminal_result(workflow: AgentWorkflowRun) -> AutomatedWorkflowResult:
-    return _with_checksum(
-        AutomatedWorkflowResult(
-            status="completed",
-            currentStage="biological_interpretation",
-            zarrPath="analysis.zarr",
-            workflowRun=workflow,
-            reportReferences=list(workflow.reports),
-        )
-    )
-
-
-def test_orchestration_model_validation_edges() -> None:
-    for field, value, message in (
-        ("attemptId", "UPPER CASE", "lowercase run identifier"),
-        ("contentSha256", "not-a-checksum", "lowercase SHA-256"),
-    ):
-        with pytest.raises(ValidationError, match=message):
-            WorkflowStageLink(**{field: value})
-
-    invalid_attempts = (
-        ({"status": "started", "completedAtNs": 1}, "cannot have completedAtNs"),
-        (
-            {"status": "done", "startedAtNs": 2, "completedAtNs": 1},
-            "must not precede",
-        ),
-        ({"status": "needsInput"}, "require questions"),
-        ({"status": "failed"}, "require an error"),
-    )
-    for updates, message in invalid_attempts:
-        with pytest.raises(ValidationError, match=message):
-            WorkflowStageAttempt(**updates)
-
-    invalid_requests = (
-        ({"sourcePath": " ", "studyContext": "study"}, "sourcePath"),
-        ({"sourcePath": "data", "studyContext": " "}, "studyContext"),
-        (
-            {
-                "sourcePath": "data",
-                "studyContext": "study",
-                "analysisAssays": ["RNA", "RNA"],
-            },
-            "analysisAssays",
-        ),
-        (
-            {
-                "sourcePath": "data",
-                "studyContext": "study",
-                "pairedAssays": ["RNA", "RNA"],
-            },
-            "pairedAssays must be unique",
-        ),
-        (
-            {
-                "sourcePath": "data",
-                "studyContext": "study",
-                "pairedAssays": ["RNA"],
-            },
-            "at least two",
-        ),
-    )
-    for values, message in invalid_requests:
-        with pytest.raises(ValidationError, match=message):
-            AutomatedWorkflowRequest(**values)
-
-    with pytest.raises(ValidationError, match="zarrPath"):
-        AutomatedWorkflowResumeRequest(zarrPath=" ", workflowRunId="workflow-1")
-    with pytest.raises(ValidationError, match="workflowRunId"):
-        AutomatedWorkflowResumeRequest(zarrPath="data.zarr", workflowRunId="BAD")
-
-    assert OrchestrationRequestRecord.get_blank().workflowRunId == ""
-    assert OrchestrationRequestRecord.get_example().workflowRunId == "workflow-1"
-    assert OrchestrationResumeRecord.get_blank().resumeId == ""
-    assert OrchestrationResumeRecord.get_example().resumeId == "resume-1"
-
-
-def test_journal_storage_guards(monkeypatch: pytest.MonkeyPatch) -> None:
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    journal_module._write_key_once(root, "record.json", b"first")
-    with pytest.raises(FileExistsError, match="exists"):
-        journal_module._write_key_once(root, "record.json", b"second")
-
-    with monkeypatch.context() as patch:
-        observed = iter((None, b"different"))
-        patch.setattr(
-            journal_module.record_io,
-            "read_key",
-            lambda *_args: next(observed),
-        )
-        with pytest.raises(FileExistsError, match="raced"):
-            journal_module._write_key_once(root, "raced.json", b"payload")
-
-    unsupported = SimpleNamespace(store=SimpleNamespace(supports_listing=False))
-    with pytest.raises(NotImplementedError, match="requires listing"):
-        journal_module._list_keys(unsupported, "prefix")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(journal_module.record_io, "read_key", lambda *_args: b"{")
-        with pytest.raises(ValueError, match="Malformed orchestration record"):
-            journal_module._read_model(root, "bad.json", WorkflowQuestion)
-
-
-def test_orchestration_namespace_validation(monkeypatch: pytest.MonkeyPatch) -> None:
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    with pytest.raises(RuntimeError, match="Create the agent workflow"):
-        journal_module._ensure_orchestration_store(SimpleNamespace(zw=root))
-
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    root.create_array("agents", shape=(1,), dtype="i1")
-    with pytest.raises(ValueError, match="agents namespace"):
-        journal_module._ensure_orchestration_store(SimpleNamespace(zw=root))
-
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    root.create_group("agents")
-    with monkeypatch.context() as patch:
-        patch.setattr(journal_module, "_list_keys", lambda *_args: ["occupied"])
-        with pytest.raises(ValueError, match="non-Zarr object"):
-            journal_module._ensure_orchestration_store(SimpleNamespace(zw=root))
-
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    agents = root.create_group("agents")
-    agents.create_array("orchestrations", shape=(1,), dtype="i1")
-    with pytest.raises(ValueError, match="orchestrations namespace"):
-        journal_module._ensure_orchestration_store(SimpleNamespace(zw=root))
-
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    agents = root.create_group("agents")
-    agents.create_group(
-        "orchestrations",
-        attributes={"format": "foreign", "format_version": 99},
-    )
-    with pytest.raises(ValueError, match="Unrecognized orchestration"):
-        journal_module._ensure_orchestration_store(SimpleNamespace(zw=root))
-
-
-def test_stage_record_identity_and_checksum_guards(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    outcome_key = "root/workflow-1/stages/ingest/attempt-1/outcome.json"
-    start_key = "root/workflow-1/stages/ingest/attempt-1/started.json"
-    done = journal_module._complete_attempt(_started(), status="done")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(journal_module, "_list_keys", lambda *_args: [outcome_key])
-        patch.setattr(
-            journal_module,
-            "_read_model",
-            lambda *_args: done.model_copy(update={"attemptId": "other"}),
-        )
-        with pytest.raises(ValueError, match="outcome identity"):
-            journal_module._stage_outcomes(object(), "root", "workflow-1", "ingest")
-        patch.setattr(
-            journal_module,
-            "_read_model",
-            lambda *_args: done.model_copy(update={"contentSha256": "0" * 64}),
-        )
-        with pytest.raises(ValueError, match="outcome checksum"):
-            journal_module._stage_outcomes(object(), "root", "workflow-1", "ingest")
-
-    started = _started()
-    with monkeypatch.context() as patch:
-        patch.setattr(journal_module, "_list_keys", lambda *_args: [start_key])
-        patch.setattr(
-            journal_module,
-            "_read_model",
-            lambda *_args: started.model_copy(update={"status": "done"}),
-        )
-        with pytest.raises(ValueError, match="start identity"):
-            journal_module._stage_starts(object(), "root", "workflow-1", "ingest")
-        patch.setattr(
-            journal_module,
-            "_read_model",
-            lambda *_args: started.model_copy(update={"contentSha256": "0" * 64}),
-        )
-        with pytest.raises(ValueError, match="start checksum"):
-            journal_module._stage_starts(object(), "root", "workflow-1", "ingest")
-
-
-def test_resume_answer_helper_edges() -> None:
-    assert not journal_module._has_resume_answer(None)
-    assert not journal_module._has_resume_answer("  ")
-    assert journal_module._has_resume_answer("answer")
-    assert not journal_module._has_resume_answer({})
-    assert journal_module._has_resume_answer({"answer": 1})
-    assert not journal_module._has_resume_answer([])
-    assert journal_module._has_resume_answer([1])
-    assert journal_module._has_resume_answer(0)
-
-    assert journal_module._unsafe_context_resolution("skipHarmony") == "skip"
+def test_checkpoint_is_immutable_idempotent_and_input_bound() -> None:
+    store, prefix, record = memory_journal("analysis")
+    inputs = {"selection": "cells-1", "metadata": {"age": "continuous"}}
+    value = {"decision": "retain", "evidence": [1, 2]}
+    key = "parameter_tuning/sample0/eval0"
     assert (
-        journal_module._unsafe_context_resolution(
-            {"batchCorrection": {"action": "skip"}}
-        )
-        == "skip"
+        journal.save_checkpoint(store, prefix, record.workflowRunId, key, inputs, value)
+        == value
     )
-    assert journal_module._unsafe_context_resolution({"selection": "other"}) is None
+    before = journal._list_keys(store.zw, prefix)
+    assert (
+        journal.save_checkpoint(store, prefix, record.workflowRunId, key, inputs, value)
+        == value
+    )
+    assert journal._list_keys(store.zw, prefix) == before
+    assert (
+        journal.load_checkpoint(store, prefix, record.workflowRunId, key, inputs)
+        == value
+    )
+    checkpoint = journal.read_checkpoint(store, prefix, record.workflowRunId, key)
+    assert checkpoint["inputs"] == inputs
+    assert checkpoint["outputs"] == value
+    with pytest.raises(ValueError, match="different scientific inputs"):
+        journal.load_checkpoint(
+            store, prefix, record.workflowRunId, key, {**inputs, "selection": "cells-2"}
+        )
+    with pytest.raises(ValueError, match="different outcome"):
+        journal.save_checkpoint(
+            store, prefix, record.workflowRunId, key, inputs, {"decision": "exclude"}
+        )
+    assert all(path.startswith("analysis/agents/orchestrations/") for path in before)
 
-    assert journal_module._resume_answer_errors(_started(), {}) == [
-        "The latest paused stage does not contain persisted questions"
-    ]
-    choice = journal_module._complete_attempt(
-        _started(),
+
+def test_checkpoint_corruption_is_not_silently_repaired() -> None:
+    store, prefix, record = memory_journal()
+    key = "preprocessing/decision"
+    journal.save_checkpoint(
+        store, prefix, record.workflowRunId, key, {"input": 1}, {"chosen": 2}
+    )
+    path = journal._checkpoint_key(prefix, record.workflowRunId, key)
+    raw = journal.record_io.read_key(store.zw, path)
+    data = json.loads(raw)
+    data["outputs"]["chosen"] = 3
+    altered = journal.record_io.display_json_bytes(data)
+    sync(
+        store.zw.store.set(path, default_buffer_prototype().buffer.from_bytes(altered))
+    )
+    with pytest.raises(ValueError, match="checksum"):
+        journal.load_checkpoint(store, prefix, record.workflowRunId, key, None)
+    assert journal.record_io.read_key(store.zw, path) == altered
+
+
+@pytest.mark.parametrize("key", ["../escape", "x//y", "/root", "x/../y", "x\\y"])
+def test_checkpoint_path_cannot_escape_owner(key: str) -> None:
+    with pytest.raises(ValueError, match="path components"):
+        journal._checkpoint_key("agents/orchestrations", "workflow-1", key)
+
+
+def test_committed_evidence_survives_interruption_before_stage_outcome() -> None:
+    store, prefix, request = memory_journal()
+    first = journal._start_attempt(
+        store.zw,
+        prefix,
+        request.workflowRunId,
+        "experimental_context",
+        request,
+        [],
+        inputs={"columns": ["condition"]},
+    )
+    report = Evidence(rationale="Condition crosses donors", nCells=100)
+    _, reference = journal._save_stage_report(
+        store, first, report, expected_type=Evidence
+    )
+    restarted = journal._start_attempt(
+        store.zw,
+        prefix,
+        request.workflowRunId,
+        "experimental_context",
+        request,
+        [],
+        inputs=first.inputs,
+    )
+    recovered, recovered_ref = journal._recover_persisted_stage_report(
+        store, restarted, expected_type=Evidence
+    )
+    assert recovered == report
+    assert recovered_ref == reference
+    changed = journal._start_attempt(
+        store.zw,
+        prefix,
+        request.workflowRunId,
+        "experimental_context",
+        request,
+        [],
+        inputs={"columns": ["condition", "age"]},
+    )
+    assert (
+        journal._recover_persisted_stage_report(store, changed, expected_type=Evidence)
+        is None
+    )
+    assert journal.read_stage_evidence(store, reference) == report.model_dump(
+        mode="json"
+    )
+    with pytest.raises(ValueError, match="owned"):
+        journal.read_stage_evidence(
+            store,
+            StageEvidenceReference.model_validate(
+                {**reference.model_dump(), "stage": "preprocessing"}
+            ),
+        )
+    assert not any(
+        "/runs/" in key or "snapshot" in key or "verification" in key
+        for key in journal._list_keys(store.zw, "agents")
+    )
+
+
+def test_stage_reuse_requires_exact_parent_and_resolving_evidence() -> None:
+    store, prefix, request = memory_journal()
+    start = journal._start_attempt(
+        store.zw, prefix, request.workflowRunId, "ingest", request, []
+    )
+    parent = journal._complete_attempt(start, status="done")
+    journal._save_outcome(store.zw, prefix, parent)
+    link = journal._parent_link(parent)
+    child = journal._start_attempt(
+        store.zw, prefix, request.workflowRunId, "data_enrichment", request, [link]
+    )
+    _, ref = journal._save_stage_report(
+        store,
+        child,
+        Evidence(rationale="RNA identified", nCells=100),
+        expected_type=Evidence,
+    )
+    outcome = journal._complete_attempt(child, status="done", report_references=[ref])
+    journal._save_outcome(store.zw, prefix, outcome)
+    assert (
+        journal._validated_done_outcome(
+            store, prefix, request.workflowRunId, "data_enrichment", request, [link]
+        )
+        == outcome
+    )
+    assert (
+        journal._validated_done_outcome(
+            store, prefix, request.workflowRunId, "data_enrichment", request, []
+        )
+        is None
+    )
+    sync(
+        store.zw.store.delete(
+            journal._checkpoint_key(prefix, request.workflowRunId, ref.key)
+        )
+    )
+    assert (
+        journal._validated_done_outcome(
+            store, prefix, request.workflowRunId, "data_enrichment", request, [link]
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="unresolved"):
+        journal.analysis_snapshot(store, request.workflowRunId)
+
+
+def test_resume_answers_are_committed_in_stage_inputs_without_another_ledger() -> None:
+    store, prefix, request = memory_journal()
+    start = journal._start_attempt(
+        store.zw, prefix, request.workflowRunId, "preprocessing_plan", request, []
+    )
+    pause = journal._complete_attempt(
+        start,
         status="needsInput",
         needs_input=WorkflowNeedsInput(
             questions=[
                 WorkflowQuestion(
-                    questionId="finalGraphOptionId",
-                    options=["graph-a", "graph-b"],
+                    questionId="decision:cellQuality",
+                    decisionId="cellQuality",
+                    options=["keep"],
+                    question="Which supported QC policy?",
                 )
             ]
         ),
     )
-    assert (
-        "must be one of"
-        in journal_module._resume_answer_errors(
-            choice, {"finalGraphOptionId": "graph-c"}
-        )[0]
+    answers = {
+        "decision:cellQuality": {
+            "decisionId": "cellQuality",
+            "optionId": "keep",
+            "rationale": "Preserves replicated populations",
+        }
+    }
+    assert journal._resume_answer_errors(pause, answers) == []
+    assert journal._resume_answer_errors(pause, {"unrelated": 1})
+    bad = {
+        "decision:cellQuality": {
+            **answers["decision:cellQuality"],
+            "optionId": "invented",
+        }
+    }
+    assert journal._resume_answer_errors(pause, bad)
+    resume = OrchestrationResumeRecord(
+        workflowRunId=request.workflowRunId,
+        answeredAttempt=journal._parent_link(pause),
+        answers=answers,
+        questionIds=list(answers),
     )
-    generic = journal_module._complete_attempt(
-        _started(),
-        status="needsInput",
-        needs_input=WorkflowNeedsInput(
-            questions=[WorkflowQuestion(questionId="freeText")]
-        ),
+    answered = journal._start_attempt(
+        store.zw,
+        prefix,
+        request.workflowRunId,
+        "preprocessing_plan",
+        request,
+        [],
+        resume_record=resume,
     )
-    assert (
-        "must be non-empty"
-        in journal_module._resume_answer_errors(generic, {"freeText": " "})[0]
+    replay = journal._start_attempt(
+        store.zw,
+        prefix,
+        request.workflowRunId,
+        "preprocessing_plan",
+        request,
+        [],
+        resume_record=resume,
     )
+    assert answered.inputs["resumeAnswers"] == answers
+    assert journal._stage_execution_id(answered) == journal._stage_execution_id(replay)
+    assert not any("/resumes/" in key for key in journal._list_keys(store.zw, prefix))
 
 
-def test_persisted_resume_record_validation_edges(
-    monkeypatch: pytest.MonkeyPatch,
+def test_stage_checksums_and_original_start_are_required() -> None:
+    store, prefix, request = memory_journal()
+    start = journal._start_attempt(
+        store.zw, prefix, request.workflowRunId, "ingest", request, []
+    )
+    outcome = journal._complete_attempt(start, status="done")
+    journal._save_outcome(store.zw, prefix, outcome)
+    altered = outcome.model_copy(update={"inputs": {"different": True}})
+    with pytest.raises(ValueError, match="started and outcome"):
+        journal._stage_outcome_resolves(
+            store, prefix, request.workflowRunId, request, altered
+        )
+    with pytest.raises(FileExistsError, match="exists"):
+        journal._save_outcome(store.zw, prefix, outcome)
+    no_listing = SimpleNamespace(store=SimpleNamespace(supports_listing=False))
+    with pytest.raises(NotImplementedError, match="listing"):
+        journal._list_keys(no_listing, prefix)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"status": "started", "completedAtNs": 1},
+        {"status": "done", "startedAtNs": 2, "completedAtNs": 1},
+        {"status": "needsInput"},
+        {"status": "failed"},
+    ],
+)
+def test_invalid_stage_lifecycle_is_rejected(values) -> None:
+    with pytest.raises(ValueError):
+        WorkflowStageAttempt(**values)
+
+
+@pytest.mark.parametrize(
+    "mismatch", [None, "missingMarker", "differentCohort", "unaccepted"]
+)
+def test_final_checkpoint_requires_exact_artifacts_cohort_and_acceptance(
+    monkeypatch, mismatch
 ) -> None:
-    store = SimpleNamespace(zw=object())
+    from scarf.agent.orchestrator.models import FinalAnalysisHandoff, _STAGE_ORDER
+    from scarf.agent.types import ArtifactReferenceModel
 
-    def validate(record: OrchestrationResumeRecord) -> OrchestrationResumeRecord:
-        monkeypatch.setattr(journal_module, "_read_model", lambda *_args: record)
-        return journal_module._validated_resume_record(
-            store, "root", "workflow-1", "resume-1"
+    class TuningProof(AgentDataModel):
+        recommendedCandidateId: str
+        finalClusterArtifact: ArtifactReferenceModel
+
+    store, prefix, request = memory_journal()
+    artifacts = {
+        name: ArtifactReferenceModel(
+            scope="datastore" if name == "cellSelection" else "assay",
+            assay=None if name == "cellSelection" else "RNA",
+            kind=kind,
+            artifactId=f"{index:064x}",
         )
-
-    mismatched = _with_checksum(
-        OrchestrationResumeRecord(workflowRunId="other", resumeId="resume-1")
-    )
-    with pytest.raises(ValueError, match="identity"):
-        validate(mismatched)
-
-    with pytest.raises(ValueError, match="checksum"):
-        validate(
-            OrchestrationResumeRecord(
-                workflowRunId="workflow-1",
-                resumeId="resume-1",
-                contentSha256="0" * 64,
-            )
+        for index, (name, kind) in enumerate(
+            {
+                "cellSelection": "cell_selection",
+                "graph": "connectivity_map",
+                "clusters": "cluster_labels",
+                "umap": "embedding",
+                "embeddingInitialization": "embedding_initialization",
+                "markerFeatures": "feature_selection",
+                "markers": "marker_table",
+            }.items(),
+            1,
         )
-
-    unanswered = _with_checksum(
-        OrchestrationResumeRecord(
-            workflowRunId="workflow-1",
-            resumeId="resume-1",
-            answers={"unexpected": "answer"},
-        )
+    }
+    final = FinalAnalysisHandoff(
+        workflowRunId=request.workflowRunId,
+        primaryAssay="RNA",
+        markerAssay="RNA",
+        **artifacts,
     )
-    with pytest.raises(ValueError, match="without an answered attempt"):
-        validate(unanswered)
-
-    empty = _with_checksum(
-        OrchestrationResumeRecord(workflowRunId="workflow-1", resumeId="resume-1")
-    )
-    assert validate(empty) == empty
-
-    paused = journal_module._complete_attempt(
-        _started(),
-        status="needsInput",
-        needs_input=WorkflowNeedsInput(
-            questions=[WorkflowQuestion(questionId="freeText")]
-        ),
-    )
-    link = journal_module._parent_link(paused)
-    answered = _with_checksum(
-        OrchestrationResumeRecord(
-            workflowRunId="workflow-1",
-            resumeId="resume-1",
-            answeredAttempt=link,
-            questionIds=["freeText"],
-            answers={"freeText": "answer"},
-        )
-    )
-
-    monkeypatch.setattr(journal_module, "_stage_outcomes", lambda *_args: [])
-    with pytest.raises(ValueError, match="does not cite one paused"):
-        validate(answered)
-
-    monkeypatch.setattr(journal_module, "_stage_outcomes", lambda *_args: [paused])
-    stale = _with_checksum(answered.model_copy(update={"questionIds": ["stale"]}))
-    with pytest.raises(ValueError, match="question IDs are stale"):
-        validate(stale)
-
-    invalid = _with_checksum(answered.model_copy(update={"answers": {"freeText": ""}}))
-    with pytest.raises(ValueError, match="invalid answers"):
-        validate(invalid)
-
-
-def test_stage_outcome_resolution_edges(monkeypatch: pytest.MonkeyPatch) -> None:
-    request = _request_record()
-    store = SimpleNamespace(
-        zw=object(),
-        cells=SimpleNamespace(columns=[]),
-        load_artifact=lambda *_args: object(),
-    )
-    done = journal_module._complete_attempt(_started(), status="done")
-
-    with pytest.raises(ValueError, match="checksum is stale"):
-        journal_module._stage_outcome_resolves(
-            store,
-            "root",
-            "workflow-1",
+    inputs = {
+        "preprocessedAssays": [
+            {"cellSelection": artifacts["cellSelection"].model_dump(mode="json")}
+        ]
+    }
+    if mismatch == "missingMarker":
+        final = final.model_copy(update={"markers": None})
+    if mismatch == "differentCohort":
+        inputs["preprocessedAssays"][0]["cellSelection"]["artifactId"] = "e" * 64
+    parents = []
+    for stage in _STAGE_ORDER:
+        start = journal._start_attempt(
+            store.zw,
+            prefix,
+            request.workflowRunId,
+            stage,
             request,
-            done.model_copy(update={"requestSha256": "c" * 64}),
+            parents,
+            inputs=inputs if stage == "analysis_finalization" else {},
         )
-    with pytest.raises(ValueError, match="cannot retain started"):
-        journal_module._stage_outcome_resolves(
-            store, "root", "workflow-1", request, _started()
-        )
-
-    monkeypatch.setattr(
-        journal_module,
-        "_read_model",
-        lambda *_args: _started().model_copy(update={"inputs": {"changed": True}}),
-    )
-    with pytest.raises(ValueError, match="do not match"):
-        journal_module._stage_outcome_resolves(
-            store, "root", "workflow-1", request, done
-        )
-
-    parent_outcome = journal_module._complete_attempt(_started(), status="done")
-    parent = journal_module._parent_link(parent_outcome)
-    child_started = _started(stage="data_enrichment", parents=[parent])
-    child = journal_module._complete_attempt(child_started, status="done")
-    monkeypatch.setattr(journal_module, "_read_model", lambda *_args: child_started)
-    monkeypatch.setattr(journal_module, "_stage_outcomes", lambda *_args: [])
-    assert not journal_module._stage_outcome_resolves(
-        store, "root", "workflow-1", request, child
-    )
-
-    reference = AgentReportReference.get_example().model_copy(
-        update={"workflowRunId": "other-workflow"}
-    )
-    report_outcome = journal_module._complete_attempt(
-        _started(), status="done", report_references=[reference]
-    )
-    monkeypatch.setattr(journal_module, "_read_model", lambda *_args: _started())
-    assert not journal_module._stage_outcome_resolves(
-        store, "root", "workflow-1", request, report_outcome
-    )
-
-    metadata_outcome = journal_module._complete_attempt(
-        _started(), status="done", outputs={"metadataColumns": ["missing"]}
-    )
-    assert not journal_module._stage_outcome_resolves(
-        store, "root", "workflow-1", request, metadata_outcome
-    )
-
-    monkeypatch.setattr(
-        journal_module,
-        "_stage_outcomes",
-        lambda *_args: [done.model_copy(update={"configSha256": "c" * 64})],
-    )
-    with pytest.raises(ValueError, match="checksum is stale"):
-        journal_module._validated_done_outcome(
-            store, "root", "workflow-1", "ingest", request, []
-        )
-
-
-def test_stage_invocation_and_report_loading_edges(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    started = _started(stage="parameter_tuning")
-    with pytest.raises(ValueError, match="conflicting orchestration identity"):
-        journal_module._stage_invocation(
-            started,
-            AgentInvocation(inputs={"orchestrationExecutionId": "other"}),
-        )
-
-    with pytest.raises(ValueError, match="exactly one report reference"):
-        journal_module.load_stage_report(object(), started, WorkflowQuestion)
-
-    execution_id = journal_module._stage_execution_id(started)
-    matching = AgentReportReference.get_example().model_copy(
-        update={"agentRunId": execution_id}
-    )
-    other = AgentReportReference.get_example().model_copy(
-        update={"agentRunId": "other-report"}
-    )
-    tuning = started.model_copy(update={"reportReferences": [matching, other]})
-    monkeypatch.setattr(
-        journal_module,
-        "load_agent_report",
-        lambda *_args: WorkflowQuestion(questionId="answer"),
-    )
-    assert isinstance(
-        journal_module.load_stage_report(object(), tuning, WorkflowQuestion),
-        WorkflowQuestion,
-    )
-
-    wrong = started.model_copy(update={"reportReferences": [matching]})
-    monkeypatch.setattr(
-        journal_module,
-        "load_agent_report",
-        lambda *_args: WorkflowNeedsInput(),
-    )
-    with pytest.raises(TypeError, match="report is not WorkflowQuestion"):
-        journal_module.load_stage_report(object(), wrong, WorkflowQuestion)
-
-
-def test_persisted_stage_report_recovery_edges(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    started = _started(stage="data_enrichment")
-    execution_id = journal_module._stage_execution_id(started)
-    reference = AgentReportReference.get_example().model_copy(
-        update={"agentRunId": execution_id}
-    )
-    store = SimpleNamespace(load_artifact=lambda *_args: object())
-
-    monkeypatch.setattr(
-        journal_module,
-        "list_agent_reports",
-        lambda *_args, **_kwargs: [reference, reference],
-    )
-    with pytest.raises(ValueError, match="multiple persisted reports"):
-        journal_module._recover_persisted_stage_report(
-            store,
-            started,
-            agent_name="data_enrichment",
-            expected_type=WorkflowQuestion,
-        )
-
-    monkeypatch.setattr(
-        journal_module,
-        "list_agent_reports",
-        lambda *_args, **_kwargs: [reference],
-    )
-    monkeypatch.setattr(
-        journal_module,
-        "load_agent_record",
-        lambda *_args: SimpleNamespace(
-            invocation=AgentInvocation(
-                agentName="data_enrichment",
-                inputs={"orchestrationExecutionId": "stale"},
-            )
-        ),
-    )
-    with pytest.raises(ValueError, match="stale execution identity"):
-        journal_module._recover_persisted_stage_report(
-            store,
-            started,
-            agent_name="data_enrichment",
-            expected_type=WorkflowQuestion,
-        )
-
-    monkeypatch.setattr(
-        journal_module,
-        "load_agent_record",
-        lambda *_args: SimpleNamespace(
-            invocation=AgentInvocation(
-                agentName="data_enrichment",
-                inputs={"orchestrationExecutionId": execution_id},
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        journal_module,
-        "load_agent_report",
-        lambda *_args: WorkflowNeedsInput(),
-    )
-    with pytest.raises(TypeError, match="is not WorkflowQuestion"):
-        journal_module._recover_persisted_stage_report(
-            store,
-            started,
-            agent_name="data_enrichment",
-            expected_type=WorkflowQuestion,
-        )
-
-    report = WorkflowQuestion(questionId="question")
-    invocation = AgentInvocation(agentName="data_enrichment")
-    monkeypatch.setattr(
-        journal_module,
-        "save_agent_report",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(FileExistsError),
-    )
-    monkeypatch.setattr(
-        journal_module,
-        "_recover_persisted_stage_report",
-        lambda *_args, **_kwargs: None,
-    )
-    with pytest.raises(FileExistsError):
-        journal_module._save_stage_report(
-            store,
-            started,
-            report,
-            invocation=invocation,
-            expected_type=WorkflowQuestion,
-        )
-
-    monkeypatch.setattr(
-        journal_module,
-        "_recover_persisted_stage_report",
-        lambda *_args, **_kwargs: (report, reference),
-    )
-    assert journal_module._save_stage_report(
-        store,
-        started,
-        report,
-        invocation=invocation,
-        expected_type=WorkflowQuestion,
-    ) == (report, reference)
-
-
-def test_terminal_result_validation_and_persistence_edges(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    workflow = _terminal_workflow()
-    result = _terminal_result(workflow)
-    store = SimpleNamespace(zw=object())
-
-    def load(payload: bytes) -> AutomatedWorkflowResult | None:
-        monkeypatch.setattr(
-            journal_module.record_io, "read_key", lambda *_args: payload
-        )
-        return journal_module._load_terminal_result(store, "root", workflow)
-
-    with pytest.raises(ValueError, match="Malformed automated workflow result"):
-        load(b"{")
-    with pytest.raises(ValueError, match="checksum is invalid"):
-        load(
-            journal_module.record_io.display_json_bytes(
-                result.model_dump(mode="json") | {"contentSha256": "0" * 64}
-            )
-        )
-
-    missing_workflow = _with_checksum(
-        AutomatedWorkflowResult(
-            status="completed", currentStage="biological_interpretation"
-        )
-    )
-    with pytest.raises(ValueError, match="missing its workflow identity"):
-        load(
-            journal_module.record_io.display_json_bytes(
-                missing_workflow.model_dump(mode="json")
-            )
-        )
-
-    stale = _with_checksum(
-        result.model_copy(
-            update={
-                "workflowRun": workflow.model_copy(
-                    update={"analysisStore": "other.zarr"}
-                )
-            }
-        )
-    )
-    with pytest.raises(ValueError, match="stale workflow metadata"):
-        load(journal_module.record_io.display_json_bytes(stale.model_dump(mode="json")))
-
-    wrong_status = _with_checksum(result.model_copy(update={"status": "failed"}))
-    with pytest.raises(ValueError, match="stale terminal status"):
-        load(
-            journal_module.record_io.display_json_bytes(
-                wrong_status.model_dump(mode="json")
-            )
-        )
-
-    wrong_reports = _with_checksum(
-        result.model_copy(
-            update={"reportReferences": [AgentReportReference.get_example()]}
-        )
-    )
-    with pytest.raises(ValueError, match="stale report references"):
-        load(
-            journal_module.record_io.display_json_bytes(
-                wrong_reports.model_dump(mode="json")
-            )
-        )
-
-    with monkeypatch.context() as patch:
-        patch.setattr(journal_module, "_load_terminal_result", lambda *_args: result)
-        assert (
-            journal_module._persist_terminal_result(store, "root", workflow, result)
-            == result
-        )
-
-    with monkeypatch.context() as patch:
-        patch.setattr(journal_module, "_load_terminal_result", lambda *_args: None)
-        with pytest.raises(ValueError, match="exact content checksum"):
-            journal_module._persist_terminal_result(
+        references = []
+        if stage == "parameter_tuning":
+            _, ref = journal._save_stage_report(
                 store,
-                "root",
-                workflow,
-                result.model_copy(update={"contentSha256": ""}),
+                start,
+                TuningProof(
+                    recommendedCandidateId="selected",
+                    finalClusterArtifact=artifacts["clusters"],
+                ),
+                expected_type=TuningProof,
             )
-
-    with monkeypatch.context() as patch:
-        persisted = iter((None, result))
-        patch.setattr(
-            journal_module,
-            "_load_terminal_result",
-            lambda *_args: next(persisted),
+            references.append(ref)
+        outcome = journal._complete_attempt(
+            start,
+            status="done",
+            report_references=references,
+            artifacts=artifacts if stage == "analysis_finalization" else {},
+            outputs={"finalAnalysis": final.model_dump(mode="json")}
+            if stage == "analysis_finalization"
+            else {},
         )
-        patch.setattr(
-            journal_module,
-            "_write_model_once",
-            lambda *_args: (_ for _ in ()).throw(FileExistsError),
-        )
-        assert (
-            journal_module._persist_terminal_result(store, "root", workflow, result)
-            == result
-        )
-
-    with monkeypatch.context() as patch:
-        patch.setattr(journal_module, "_load_terminal_result", lambda *_args: None)
-        patch.setattr(journal_module, "_write_model_once", lambda *_args: None)
-        with pytest.raises(RuntimeError, match="was not persisted"):
-            journal_module._persist_terminal_result(store, "root", workflow, result)
+        journal._save_outcome(store.zw, prefix, outcome)
+        parents = [journal._parent_link(outcome)]
+    monkeypatch.setattr(
+        journal,
+        "_analysis_review_views",
+        lambda *args: [
+            {
+                "scope": "full",
+                "action": "defer" if mismatch == "unaccepted" else "accept",
+                "selectedCandidateId": "selected",
+            }
+        ],
+    )
+    if mismatch:
+        with pytest.raises(ValueError, match="Final analysis"):
+            journal.analysis_snapshot(store, request.workflowRunId)
+    else:
+        snapshot = journal.analysis_snapshot(store, request.workflowRunId)
+        assert snapshot["status"] == "completed"
+        assert snapshot["finalAnalysis"] == final.model_dump(mode="json")
