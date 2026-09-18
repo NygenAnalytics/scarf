@@ -53,7 +53,7 @@ def _analysis_visual_content(
 ) -> list[ImageEvidence]:
     """Render one bounded diagnostic board for multimodal review."""
     try:
-        import matplotlib.pyplot as plt
+        from matplotlib.figure import Figure
     except ImportError as exc:
         raise RuntimeError(
             "Visual adjudication requires the installed plotting dependencies"
@@ -62,7 +62,7 @@ def _analysis_visual_content(
     def image_content(figure: Any, identifier: str) -> ImageEvidence:
         buffer = io.BytesIO()
         figure.savefig(buffer, format="png", dpi=120)
-        plt.close(figure)
+        figure.clear()
         return ImageEvidence(
             identifier=identifier,
             data=buffer.getvalue(),
@@ -138,7 +138,8 @@ def _analysis_visual_content(
         default=None,
     )
 
-    figure, axes = plt.subplots(2, 3, figsize=(15, 9), constrained_layout=True)
+    figure = Figure(figsize=(15, 9), constrained_layout=True)
+    axes = figure.subplots(2, 3)
     variance = np.asarray(selected.metrics.componentVariance, dtype=float)
     if variance.size:
         axes[0, 0].plot(np.arange(1, variance.size + 1), variance, marker=".")
@@ -363,12 +364,11 @@ def _analysis_visual_content(
                 ),
             ),
         )
-        correction_figure, correction_axes = plt.subplots(
-            2,
-            2,
+        correction_figure = Figure(
             figsize=(11, 10),
             constrained_layout=True,
         )
+        correction_axes = correction_figure.subplots(2, 2)
         batch_columns = [
             column
             for column in (
@@ -546,10 +546,11 @@ def _analysis_visual_content(
                     return f"{gene} [sex-linked]"
                 return gene
 
-            marker_figure, marker_axis = plt.subplots(
+            marker_figure = Figure(
                 figsize=(max(9, len(marker_genes) * 0.45), 6),
                 constrained_layout=True,
             )
+            marker_axis = marker_figure.subplots()
             marker_image = marker_axis.imshow(
                 marker_scores,
                 aspect="auto",
@@ -589,12 +590,11 @@ def _analysis_visual_content(
     qc_sources = qc_sources[:4]
     if qc_sources or np.isfinite(doublet_sample).any():
         diagnostic_count = len(qc_sources) + 1
-        qc_figure, qc_axes = plt.subplots(
-            1,
-            diagnostic_count,
+        qc_figure = Figure(
             figsize=(max(5, diagnostic_count * 3.2), 4),
             constrained_layout=True,
         )
+        qc_axes = qc_figure.subplots(1, diagnostic_count)
         qc_axis_list = np.atleast_1d(qc_axes).tolist()
         if selected.cellSelection is None:
             raise ValueError("QC visuals require an exact cell selection")

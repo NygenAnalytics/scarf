@@ -21,6 +21,7 @@ from scarf.storage.stores import open_store
 from scarf.storage.types import as_zarr_array, as_zarr_group
 
 from profiling.config import (
+    CONSUME_STAGES,
     CountMatrixConfig,
     StageName,
     StageResources,
@@ -56,6 +57,16 @@ PROFILE_STAGE_INPUTS: dict[StageName, dict[str, tuple[StageName, str]]] = {
         ),
     },
     "runLeiden": {"graph": ("buildConnectivityMap", "connectivity_map")},
+    "makeBulkMean": {"clusters": ("runLeiden", "cluster_labels")},
+    "makeBulkSum": {"clusters": ("runLeiden", "cluster_labels")},
+    "runDoublets": {
+        "clusters": ("runLeiden", "cluster_labels"),
+        "graph": ("buildConnectivityMap", "connectivity_map"),
+    },
+    "runDoubletsRatio01": {
+        "clusters": ("runLeiden", "cluster_labels"),
+        "graph": ("buildConnectivityMap", "connectivity_map"),
+    },
 }
 
 
@@ -1322,6 +1333,97 @@ def _validate_experiment(
     }
 
 
+_LEIDEN_OPERATION = "run_leiden_clustering"
+
+
+def _leiden_cluster_rank(
+    status: Any,
+    workflow: WorkflowParameters,
+) -> tuple[int, int]:
+    params = status.parameters or {}
+    resolution_ok = params.get("resolution") == workflow.leidenResolution
+    seed_ok = params.get("random_seed") == workflow.leidenSeed
+    backend = params.get("backend")
+    backend_ok = backend == workflow.leidenBackend
+    rank = int(resolution_ok and seed_ok and backend_ok)
+    created = status.created_at_ns or 0
+    return (rank, created)
+
+
+def _select_leiden_clusters(
+    root: Any,
+    workflow: WorkflowParameters,
+) -> ArtifactRef:
+    from scarf.storage.artifacts import inspect_artifact, list_artifacts
+
+    refs = list_artifacts(
+        root,
+        scope="assay",
+        assay=workflow.assayName,
+        kind="cluster_labels",
+        complete_only=True,
+        operation=_LEIDEN_OPERATION,
+    )
+    if not refs:
+        raise ValueError(
+            "Consume stage needs a complete run_leiden_clustering artifact "
+            f"on assay {workflow.assayName!r}"
+        )
+    ranked = [
+        (_leiden_cluster_rank(inspect_artifact(root, ref), workflow), ref)
+        for ref in refs
+    ]
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    best_rank, chosen = ranked[0]
+    if best_rank[0] == 0:
+        raise ValueError(
+            "No Leiden cluster artifact matches resolution "
+            f"{workflow.leidenResolution}, backend {workflow.leidenBackend!r}, "
+            f"and seed {workflow.leidenSeed}"
+        )
+    return chosen
+
+
+def _graph_from_clusters(root: Any, clusters: ArtifactRef) -> ArtifactRef:
+    from scarf.storage.artifacts import inspect_artifact
+
+    status = inspect_artifact(root, clusters)
+    raw_graph = (status.inputs or {}).get("graph")
+    if not isinstance(raw_graph, dict):
+        raise ValueError("Leiden artifact has no connectivity_map input")
+    graph = ArtifactRef.from_dict(raw_graph)
+    if (
+        graph.scope != "assay"
+        or graph.assay != clusters.assay
+        or graph.kind != "connectivity_map"
+    ):
+        raise ValueError("Leiden artifact graph input is not a connectivity_map")
+    graph_status = inspect_artifact(root, graph)
+    if not graph_status.exists or not graph_status.complete:
+        raise ValueError(f"Leiden graph artifact is unavailable: {graph_status.path}")
+    return graph
+
+
+def discover_consume_inputs(
+    storeUri: str,
+    workflow: WorkflowParameters,
+    stage: StageName,
+) -> dict[str, ArtifactRef]:
+    """Resolve Leiden and graph refs from an existing store for consume stages."""
+    if stage not in CONSUME_STAGES:
+        raise ValueError(f"{stage} is not a consume stage")
+    root = open_store(
+        storeUri,
+        mode="r",
+        storage_options=storage_options(storeUri),
+    )
+    clusters = _select_leiden_clusters(root, workflow)
+    inputs = {"clusters": clusters}
+    if stage in {"runDoublets", "runDoubletsRatio01"}:
+        inputs["graph"] = _graph_from_clusters(root, clusters)
+    return inputs
+
+
 def _profile_input(
     inputs: dict[str, ArtifactRef],
     *,
@@ -1568,4 +1670,59 @@ def _run_analysis(
             clusters=clusters,
             markers=markers,
         )
+    if stage in {"makeBulkMean", "makeBulkSum"}:
+        clusters = _profile_input(
+            inputs,
+            name="clusters",
+            kind="cluster_labels",
+            assay=workflow.assayName,
+        )
+        aggr_type = "mean" if stage == "makeBulkMean" else "sum"
+        bulk = store.make_bulk(
+            clusters,
+            from_assay=workflow.assayName,
+            aggr_type=aggr_type,
+            return_fraction=False,
+            feature_label="index",
+            remove_empty_features=True,
+            pseudo_reps=1,
+        )
+        n_groups = int(bulk.shape[1])
+        n_features = int(bulk.shape[0])
+        del bulk
+        return {
+            "nGroups": n_groups,
+            "nFeatures": n_features,
+            "aggrType": aggr_type,
+            "clusters": clusters.to_dict(),
+            "kind": "observed",
+        }
+    if stage in {"runDoublets", "runDoubletsRatio01"}:
+        clusters = _profile_input(
+            inputs,
+            name="clusters",
+            kind="cluster_labels",
+            assay=workflow.assayName,
+        )
+        graph = _profile_input(
+            inputs,
+            name="graph",
+            kind="connectivity_map",
+            assay=workflow.assayName,
+        )
+        simulation_ratio = 1.0 if stage == "runDoublets" else 0.1
+        ref = store.run_doublet_detection(
+            clusters,
+            graph,
+            from_assay=workflow.assayName,
+            simulation_ratio=simulation_ratio,
+            invalidate_cache=invalidateCache,
+        )
+        return {
+            "artifact": ref.to_dict(),
+            "simulationRatio": simulation_ratio,
+            "clusters": clusters.to_dict(),
+            "graph": graph.to_dict(),
+            "kind": "observed",
+        }
     raise ValueError(f"No analysis operation for {stage}")

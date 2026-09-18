@@ -76,9 +76,14 @@ def orchestrator_function_options(
     compete with the real stage workers for scarce high-memory capacity.
     """
     # Borrow secrets/region/env from a stage resource block, then shrink compute.
+    donor = config.stageResources.get("reopenStore")
+    if donor is None:
+        if not config.stageResources:
+            raise ValueError("orchestrator needs at least one stageResources block")
+        donor = next(iter(config.stageResources.values()))
     options = modal_function_options(
         config,
-        config.resourcesFor("reopenStore"),
+        donor,
         maxContainers=maxContainers,
         retries=0,
     )

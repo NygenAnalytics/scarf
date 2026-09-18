@@ -1317,6 +1317,23 @@ def test_csv_reader_rejects_features_along_rows(tmp_path):
         CSVReader(str(path), rows_are_cells=False)
 
 
+def test_csv_reader_preserves_cell_ids_across_batches(tmp_path):
+    from scarf.readers import CSVReader
+
+    path = tmp_path / "counts.csv"
+    path.write_text("cell,g1,g2\ncell_A,1,2\ncell_B,3,4\n")
+    reader = CSVReader(str(path), id_column=0, batch_size=1)
+
+    assert reader.nCells == 2
+    assert reader.nFeatures == 2
+    np.testing.assert_array_equal(reader.cell_ids(), ["cell_A", "cell_B"])
+    np.testing.assert_array_equal(reader.feature_ids(), ["g1", "g2"])
+    np.testing.assert_array_equal(
+        np.concatenate([counts for counts, _metadata in reader.consume()]),
+        [[1, 2], [3, 4]],
+    )
+
+
 def test_csv_reader_rejects_non_mapping_pandas_kwargs(tmp_path):
     from scarf.readers import CSVReader
 

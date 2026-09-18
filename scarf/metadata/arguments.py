@@ -68,6 +68,7 @@ class LeidenArguments(OperationArguments):
     graph: ArtifactRef = artifact_input()
     resolution: float = parameter()
     backend: Literal["igraph", "leidenalg"] = parameter()
+    edge_weighting: Literal["graph"] = parameter()
     symmetric_graph: bool = parameter()
     graph_upper_only: bool = parameter()
     random_seed: int = parameter()
@@ -113,6 +114,7 @@ class DoubletScoreArguments(OperationArguments):
     save_k: int = parameter()
     smoothing_t: int = parameter()
     normalize_scores: bool = parameter()
+    count_arithmetic: Literal["checked_integer_sum"] = parameter()
     random_seed: int = parameter()
     invalidate_cache: bool = execution()
 

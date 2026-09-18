@@ -15,6 +15,7 @@ _COMMON_ARRAYS = {
     "feature_ids",
     "feature_means",
     "feature_scales",
+    "center",
     "loadings",
     "reference_distance_quantiles",
     "reference_distance_values",
@@ -123,6 +124,7 @@ def _mapping_reference_source_paths(datastore, neighbors):
         {
             f"{artifact_path(reduction)}/data",
             f"{artifact_path(reduction)}/loadings",
+            f"{artifact_path(reduction)}/center",
             f"{artifact_path(scaling)}/mean",
             f"{artifact_path(scaling)}/scale",
             f"{artifact_path(cell_selection)}/values",
@@ -323,6 +325,7 @@ def test_loaded_mapping_reference_is_deeply_immutable(
     arrays = (
         reference.model.feature_means,
         reference.model.feature_scales,
+        reference.model.center,
         reference.model.loadings,
         reference.feature_ids,
         reference.reference_distance_quantiles,
@@ -395,6 +398,11 @@ def test_mapping_reference_source_streaming_uses_bounded_explicit_slices(
         data=np.ones(n_features, dtype=np.float64),
         chunks=(1_000,),
     )
+    center = source_group.create_array(
+        "center",
+        data=np.linspace(-1.0, 1.0, n_features, dtype=np.float64),
+        chunks=(1_000,),
+    )
     loadings = source_group.create_array(
         "loadings",
         data=np.ones((n_features, n_dims), dtype=np.float64),
@@ -403,6 +411,7 @@ def test_mapping_reference_source_streaming_uses_bounded_explicit_slices(
     sources = {
         feature_means.path,
         feature_scales.path,
+        center.path,
         loadings.path,
     }
     row_spans = _reject_full_array_reads(monkeypatch, sources)
@@ -414,12 +423,14 @@ def test_mapping_reference_source_streaming_uses_bounded_explicit_slices(
     assert mapping_artifact.validate_mapping_reference_sources(
         feature_means=feature_means,
         feature_scales=feature_scales,
+        center=center,
         loadings=loadings,
         symphony_sources=None,
     ) == (n_features, n_dims)
     source_fingerprint = mapping_artifact.mapping_reference_source_fingerprint(
         feature_means=feature_means,
         feature_scales=feature_scales,
+        center=center,
         loadings=loadings,
         symphony_sources=None,
     )
@@ -427,6 +438,7 @@ def test_mapping_reference_source_streaming_uses_bounded_explicit_slices(
         target_group,
         feature_means=feature_means,
         feature_scales=feature_scales,
+        center=center,
         loadings=loadings,
         symphony_sources=None,
         feature_ids=feature_ids,
@@ -438,6 +450,7 @@ def test_mapping_reference_source_streaming_uses_bounded_explicit_slices(
         target_group,
         feature_means=feature_means,
         feature_scales=feature_scales,
+        center=center,
         loadings=loadings,
         symphony_sources=None,
         feature_ids=feature_ids,
@@ -450,20 +463,25 @@ def test_mapping_reference_source_streaming_uses_bounded_explicit_slices(
     assert max(row_spans[feature_means.path]) <= 10_000
     assert row_spans[feature_scales.path]
     assert max(row_spans[feature_scales.path]) <= 10_000
+    assert row_spans[center.path]
+    assert max(row_spans[center.path]) <= 10_000
     assert row_spans[loadings.path]
     assert max(row_spans[loadings.path]) <= 1_000
 
 
+@pytest.mark.parametrize("array_name", ["loadings", "center"])
 def test_mapping_reference_rejects_valid_shaped_payload_tampering(
     analyzed_datastore_ephemeral,
+    array_name,
 ):
     datastore = analyzed_datastore_ephemeral
     reference = datastore.get_mapping_reference(
         datastore.build_mapping_reference(_selected_neighbors(datastore))
     )
     group = artifact_group(datastore.zw, reference.ref)
-    loadings = group["loadings"]
-    loadings[0, 0] = float(loadings[0, 0]) + 0.25
+    values = group[array_name]
+    index = (0, 0) if array_name == "loadings" else 0
+    values[index] = float(values[index]) + 0.25
 
     with pytest.raises(ValueError, match="PCA model changed from its inputs"):
         datastore.get_mapping_reference(reference.ref)
@@ -558,9 +576,11 @@ def test_mapping_reference_validates_payload_before_finish(
     assert not datastore.inspect_artifact(created.pop()).complete
 
 
+@pytest.mark.parametrize("array_name", ["loadings", "center"])
 def test_mapping_reference_rejects_source_mutation_during_publication(
     analyzed_datastore_ephemeral,
     monkeypatch,
+    array_name,
 ):
     import scarf.datastore._operations.mapping_reference as reference_operations
 
@@ -575,8 +595,9 @@ def test_mapping_reference_rejects_source_mutation_during_publication(
     original_writer = reference_operations.write_artifact_mapping_reference_from_sources
 
     def mutate_source_then_write(group, *args, **kwargs):
-        source = kwargs["loadings"]
-        source[0, 0] = float(source[0, 0]) + 0.25
+        source = kwargs[array_name]
+        index = (0, 0) if array_name == "loadings" else 0
+        source[index] = float(source[index]) + 0.25
         original_writer(group, *args, **kwargs)
 
     monkeypatch.setattr(

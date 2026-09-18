@@ -188,7 +188,10 @@ _CONTRACTS = (
             "graph": "connectivity_map",
         },
         signature_only=_classified("routing", "from_assay"),
-        model_only=_classified("resolved_input", "neighbors"),
+        model_only={
+            **_classified("resolved_input", "neighbors"),
+            **_classified("algorithm_version", "count_arithmetic"),
+        },
     ),
     OperationContract(
         DataStore.run_fate_mapping,
@@ -215,6 +218,7 @@ _CONTRACTS = (
         DataStore.run_leiden_clustering,
         metadata_arguments.LeidenArguments,
         constructor=_ClusteringOperationsMixin._prepare_leiden_clustering,
+        model_only=_classified("algorithm_version", "edge_weighting"),
     ),
     OperationContract(
         DataStore.run_marker_search,

@@ -160,6 +160,7 @@ def _mapping_memory_reservations(
     model_arrays = (
         reference.model.feature_means,
         reference.model.feature_scales,
+        reference.model.center,
         reference.model.loadings,
         reference.feature_ids,
     )

@@ -29,6 +29,7 @@ from scarf.storage import ArtifactRef
 
 from profiling.config import (
     ALL_STAGE_CHOICES,
+    CONSUME_STAGES,
     CORE_STAGE_ORDER,
     MAX_TIMEOUT_SECONDS,
     ProfilingConfig,
@@ -75,6 +76,7 @@ from profiling.spawn_wait import (
 )
 from profiling.metrics import ResourceSampler
 from profiling.stages import (
+    discover_consume_inputs,
     profile_stage_inputs,
     run_stage,
     summarize_resource_measurement,
@@ -118,6 +120,12 @@ def _load_stage_input_refs(
     workflow: WorkflowParameters | None = None,
 ) -> dict[str, ArtifactRef]:
     resolved_workflow = config.workflow if workflow is None else workflow
+    if stage in CONSUME_STAGES:
+        return discover_consume_inputs(
+            config.storeUri(nRows),
+            resolved_workflow,
+            stage,
+        )
     return {
         name: _load_stage_artifact_ref(
             config,
@@ -817,6 +825,21 @@ def run_size_jobs(
                         "callError": str(exc),
                     }
                     break
+                if stage in CONSUME_STAGES:
+                    print(
+                        f"consume stage {stage} call failed ({exc}); "
+                        "continuing remaining consume stages",
+                        flush=True,
+                    )
+                    result = {
+                        "nRows": nRows,
+                        "stage": stage,
+                        "status": "error",
+                        "error": str(exc),
+                        "resultUri": config.resultUri(nRows, stage),
+                        "spawnAttempt": attempt,
+                    }
+                    break
                 if attempt >= spawn_attempts:
                     raise
                 print(
@@ -830,7 +853,7 @@ def run_size_jobs(
                 + (f" after error: {last_error}" if last_error else "")
             )
         outcomes.append(result)
-        if result.get("status") == "error":
+        if result.get("status") == "error" and stage not in CONSUME_STAGES:
             return {
                 "nRows": nRows,
                 "stopped": True,
@@ -838,7 +861,11 @@ def run_size_jobs(
                 "outcomes": outcomes,
             }
 
-    return {"nRows": nRows, "stopped": False, "outcomes": outcomes}
+    return {
+        "nRows": nRows,
+        "stopped": any(item.get("status") == "error" for item in outcomes),
+        "outcomes": outcomes,
+    }
 
 
 @app.function(
@@ -939,6 +966,10 @@ def _print_spawned(label: str, call: Any) -> None:
         "  uv run --group profiling modal app logs "
         "scarf-profiling --env scarf_profiling"
     )
+
+
+def _wait_ephemeral(call: Any, *, deadlineSeconds: float = 86_400.0) -> None:
+    print(await_function_call(call, deadlineSeconds=deadlineSeconds))
 
 
 @app.local_entrypoint()
@@ -1100,6 +1131,8 @@ def main(*arg_list: str) -> None:
             spawn_args += (True,)
         call = target.with_options(**options).spawn(*spawn_args)
         _print_spawned(f"run_stage_job {args.size}/{args.stage}", call)
+        if args.ephemeral:
+            _wait_ephemeral(call)
         return
 
     if args.command == "run-all":
@@ -1117,6 +1150,8 @@ def main(*arg_list: str) -> None:
         )
         call = target.with_options(**coordinator_options).spawn(payload, sizes, stages)
         _print_spawned("run_all_jobs", call)
+        if args.ephemeral:
+            _wait_ephemeral(call)
         return
 
     if args.command == "run-e2e":

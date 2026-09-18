@@ -543,6 +543,13 @@ def test_targeted_run_requires_force_to_overwrite_an_existing_result(
     config = _config()
     captured: dict[str, Any] = {}
 
+    class _Call:
+        object_id = "fc-force"
+
+        def get(self, *, timeout: float) -> dict[str, str]:
+            captured["waitTimeout"] = timeout
+            return {"status": "ok"}
+
     class _Target:
         def with_options(self, **options: Any) -> "_Target":
             captured["options"] = options
@@ -550,7 +557,7 @@ def test_targeted_run_requires_force_to_overwrite_an_existing_result(
 
         def spawn(self, *args: Any) -> Any:
             captured["spawnArgs"] = args
-            return SimpleNamespace(object_id="fc-force")
+            return _Call()
 
     monkeypatch.setattr(modal_app, "_load_config", lambda _path: config)
     monkeypatch.setattr(modal_app, "result_exists", lambda *_args: True)
@@ -575,6 +582,7 @@ def test_targeted_run_requires_force_to_overwrite_an_existing_result(
     )
     modal_app.main(*base_args)
     assert "spawnArgs" not in captured
+    assert "waitTimeout" not in captured
 
     modal_app.main(*base_args, "--force")
     payload, n_rows, stage, force = captured["spawnArgs"]
@@ -582,6 +590,7 @@ def test_targeted_run_requires_force_to_overwrite_an_existing_result(
     assert n_rows == 10_000
     assert stage == "findMarkers"
     assert force is True
+    assert 0 < captured["waitTimeout"] <= 20
 
 
 def test_stage_zarr_runtime_is_installed_once() -> None:

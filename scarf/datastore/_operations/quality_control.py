@@ -1218,6 +1218,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         from ...quality_control.doublets import (
             sample_cluster_pool,
             simulate_doublet_pairs,
+            sum_doublet_pairs,
             write_doublet_target_zarr,
         )
 
@@ -1279,6 +1280,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             save_k=save_k,
             smoothing_t=smoothing_t,
             normalize_scores=normalize_scores,
+            count_arithmetic="checked_integer_sum",
             random_seed=random_seed,
             invalidate_cache=invalidate_cache,
         )
@@ -1346,7 +1348,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             heterotypic_fraction,
             rng,
         )
-        sim_counts = (pool_csr[left] + pool_csr[right]).tocsr()
+        sim_counts = sum_doublet_pairs(pool_csr, left, right)
         logger.debug(f"Simulated {n_sim} synthetic doublets")
 
         temp_dir = tempfile.mkdtemp(prefix="scarf_doublet_")
@@ -1361,7 +1363,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                     if feature_names is None
                     else np.asarray(feature_names)
                 ),
-                dtype=str(source_assay.rawData.dtype),
+                dtype=str(sim_counts.dtype),
                 mem_budget=self.memoryBytes,
                 nthreads=self.nthreads,
                 profile="fast_local",

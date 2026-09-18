@@ -206,6 +206,7 @@ def _mapping_reference(
         selected_cell_count=3,
         model=ScaledPCAProjectionModel(
             feature_means=np.zeros(2),
+            center=np.zeros_like(np.zeros(2)),
             feature_scales=np.ones(2),
             loadings=np.ones((2, 1)),
         ),

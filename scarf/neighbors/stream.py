@@ -54,6 +54,7 @@ class AnnStream:
         harmonized_data: ChunkedArray | None = None,
         batches: pd.DataFrame | None = None,
         harmony_params: dict[str, Any] | None = None,
+        center: np.ndarray | None = None,
     ) -> None:
         self.data = data
         self.k = min(k, self.data.shape[0] - 1)
@@ -97,6 +98,7 @@ class AnnStream:
                 disable_scaling=disable_scaling,
                 lsi_skip_first=lsi_skip_first,
                 lsi_params=lsi_params,
+                center=center,
             )
             self.dims = self.reduction.dims
             self.loadings = self.reduction.loadings

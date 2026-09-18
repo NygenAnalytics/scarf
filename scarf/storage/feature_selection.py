@@ -473,6 +473,31 @@ def _validate_feature_selection_provenance(
     input_names, parameter_names, payload_names = contract
     inputs = status.inputs or {}
     parameters = status.parameters or {}
+    if status.operation == "select_hvgs" and "variance_estimator" in parameters:
+        if (
+            parameters.get("bin_strategy") != "adaptive"
+            or parameters["variance_estimator"] != "regularized_local_quantile"
+        ):
+            raise ArtifactResolutionError(
+                "HVG variance estimator is incompatible",
+                code="corrupt_payload",
+                context=context,
+            )
+        # Selections without this field remain readable with their original scores.
+        parameter_names = parameter_names | {"variance_estimator"}
+        if "variance_quantile" in parameters:
+            quantile = parameters["variance_quantile"]
+            if (
+                isinstance(quantile, bool)
+                or not isinstance(quantile, (int, float))
+                or not 0 < quantile < 1
+            ):
+                raise ArtifactResolutionError(
+                    "HVG variance quantile is incompatible",
+                    code="corrupt_payload",
+                    context=context,
+                )
+            parameter_names = parameter_names | {"variance_quantile"}
     received_inputs = set(inputs)
     if received_inputs != input_names or set(parameters) != parameter_names:
         raise ArtifactResolutionError(

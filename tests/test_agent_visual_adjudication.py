@@ -138,6 +138,7 @@ def test_native_harmony_visuals_preserve_matching_and_exact_qc_projection(
     savefig = plt.Figure.savefig
 
     def save(figure, *args, **kwargs):
+        assert figure.canvas.manager is None
         captured.extend(
             text.get_text() for axis in figure.axes for text in axis.get_xticklabels()
         )

@@ -72,6 +72,8 @@ def test_select_hvgs_returns_ref_without_creating_alias(
         "blacklist": "",
         "keep_bounds": True,
         "bin_strategy": "adaptive",
+        "variance_estimator": "regularized_local_quantile",
+        "variance_quantile": 0.25,
     }
     group = store.load_artifact(ref)
     values = np.asarray(group["values"][:])
@@ -98,6 +100,128 @@ def test_select_hvgs_returns_ref_without_creating_alias(
     )
     assert reused == ref
     assert set(store.RNA.feats.columns) == columns_before
+
+
+@pytest.mark.parametrize("bin_strategy", ["adaptive", "fixed"])
+def test_select_hvgs_reuse_accounts_for_variance_estimator(
+    datastore_ephemeral, bin_strategy
+) -> None:
+    store = datastore_ephemeral
+    cell_selection = store.snapshot_cell_selection()
+    options = {
+        "min_cells": 0,
+        "top_n": 5,
+        "n_bins": 20,
+        "lowess_frac": 0.2,
+        "blacklist": "",
+        "show_plot": False,
+        "max_cells": np.inf,
+        "bin_strategy": bin_strategy,
+    }
+    existing = store.select_hvgs(cell_selection, **options)
+    group = store.zw[artifact_path(existing)]
+    provenance = dict(group.attrs["provenance"])
+    parameters = dict(provenance["parameters"])
+    if bin_strategy == "adaptive":
+        parameters.pop("variance_estimator")
+        parameters.pop("variance_quantile")
+        group.attrs["provenance"] = {**provenance, "parameters": parameters}
+    else:
+        assert "variance_estimator" not in parameters
+    stored_attributes = dict(group.attrs)
+    stored_values = np.asarray(group["values"][:])
+    stored_scores = np.asarray(group["corrected_variance"][:])
+
+    selected = store.select_hvgs(cell_selection, **options)
+
+    assert (selected != existing) == (bin_strategy == "adaptive")
+    assert store.select_hvgs(cell_selection, **options) == selected
+    assert store.resolve_features("RNA", existing) == existing
+    preserved = store.load_artifact(existing)
+    assert dict(preserved.attrs) == stored_attributes
+    np.testing.assert_array_equal(preserved["values"][:], stored_values)
+    np.testing.assert_array_equal(preserved["corrected_variance"][:], stored_scores)
+    assert inspect_artifact(store.zw, selected).inputs == provenance["inputs"]
+
+
+@pytest.mark.parametrize("stored_quantile", [None, 0.1])
+def test_select_hvgs_recomputes_when_background_quantile_changes(
+    datastore_ephemeral, stored_quantile
+) -> None:
+    store = datastore_ephemeral
+    cells = store.snapshot_cell_selection()
+    existing = store.select_hvgs(cells, show_plot=False)
+    group = store.zw[artifact_path(existing)]
+    provenance = dict(group.attrs["provenance"])
+    parameters = dict(provenance["parameters"])
+    if stored_quantile is None:
+        parameters.pop("variance_quantile")
+    else:
+        parameters["variance_quantile"] = stored_quantile
+    group.attrs["provenance"] = {**provenance, "parameters": parameters}
+    stored_attributes = dict(group.attrs)
+    stored_scores = np.asarray(group["corrected_variance"][:])
+
+    selected = store.select_hvgs(cells, show_plot=False)
+
+    assert selected != existing
+    assert store.select_hvgs(cells, show_plot=False) == selected
+    assert store.resolve_features("RNA", existing) == existing
+    assert dict(group.attrs) == stored_attributes
+    np.testing.assert_array_equal(group["corrected_variance"][:], stored_scores)
+    assert inspect_artifact(store.zw, selected).parameters["variance_quantile"] == 0.25
+
+
+@pytest.mark.parametrize("quantile", [True, 0, 1, -0.1, "0.25"])
+def test_hvg_artifact_rejects_invalid_background_quantile(
+    datastore_ephemeral, quantile
+) -> None:
+    store = datastore_ephemeral
+    ref = store.select_hvgs(store.snapshot_cell_selection(), show_plot=False)
+    group = store.zw[artifact_path(ref)]
+    provenance = dict(group.attrs["provenance"])
+    parameters = {**provenance["parameters"], "variance_quantile": quantile}
+    group.attrs["provenance"] = {**provenance, "parameters": parameters}
+
+    with pytest.raises(ArtifactResolutionError, match="variance quantile"):
+        store.resolve_features("RNA", ref)
+
+
+def test_select_hvgs_default_calibrates_pbmc_malat1(datastore_ephemeral) -> None:
+    store = datastore_ephemeral
+    ref = store.select_hvgs(store.snapshot_cell_selection(), show_plot=False)
+    names = np.asarray(store.RNA.feats.fetch_all("names"))
+    index = int(np.flatnonzero(names == "MALAT1")[0])
+    corrected = np.asarray(store.load_artifact(ref)["corrected_variance"][:])
+
+    assert 0.9 < corrected[index] < 1.1
+
+
+@pytest.mark.parametrize(
+    ("estimator", "bin_strategy"),
+    [("unknown", "adaptive"), ("regularized_local_quantile", "fixed")],
+)
+def test_hvg_artifact_rejects_incompatible_variance_estimator(
+    datastore_ephemeral, estimator, bin_strategy
+) -> None:
+    store = datastore_ephemeral
+    ref = store.select_hvgs(
+        store.snapshot_cell_selection(),
+        min_cells=0,
+        max_cells=np.inf,
+        top_n=5,
+        n_bins=20,
+        blacklist="",
+        show_plot=False,
+    )
+    group = store.zw[artifact_path(ref)]
+    provenance = dict(group.attrs["provenance"])
+    parameters = dict(provenance["parameters"])
+    parameters.update(variance_estimator=estimator, bin_strategy=bin_strategy)
+    group.attrs["provenance"] = {**provenance, "parameters": parameters}
+
+    with pytest.raises(ArtifactResolutionError, match="variance estimator"):
+        store.resolve_features("RNA", ref)
 
 
 def test_select_hvgs_persists_effective_default_max_cells(

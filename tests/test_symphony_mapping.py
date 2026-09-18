@@ -34,6 +34,7 @@ def _single_cluster_reference() -> tuple[
     return (
         ScaledPCAProjectionModel(
             feature_means=np.zeros(2),
+            center=np.zeros_like(np.zeros(2)),
             feature_scales=np.ones(2),
             loadings=np.eye(2),
         ),
@@ -53,14 +54,17 @@ def _single_cluster_reference() -> tuple[
         ({"loadings": np.ones(2)}, "two-dimensional"),
         ({"feature_means": np.ones(3)}, "means have incompatible"),
         ({"feature_scales": np.ones(3)}, "scales have incompatible"),
+        ({"center": np.ones(3)}, "center has incompatible"),
         ({"feature_scales": np.array([1.0, 0.0])}, "scales must be positive"),
         ({"feature_means": np.array([0.0, np.nan])}, "non-finite"),
+        ({"center": np.array([0.0, np.nan])}, "non-finite"),
     ],
 )
 def test_scaled_pca_projection_model_rejects_invalid_payloads(overrides, message):
     values = {
         "feature_means": np.zeros(2),
         "feature_scales": np.ones(2),
+        "center": np.zeros(2),
         "loadings": np.eye(2),
     }
     values.update(overrides)
@@ -200,6 +204,7 @@ def test_scaled_dispersion_reads_one_for_data_matching_the_reference():
     reference = rng.normal(size=(400, 6))
     model = ScaledPCAProjectionModel(
         feature_means=reference.mean(axis=0),
+        center=np.zeros_like(reference.mean(axis=0)),
         feature_scales=reference.std(axis=0),
         loadings=np.eye(6),
     )
@@ -218,6 +223,11 @@ def test_scaled_dispersion_reads_one_for_data_matching_the_reference():
     assert dispersion(widened) == pytest.approx(4.0)
     # An offset query is not narrow, so a pure shift must not look compressed.
     assert dispersion(reference + 3.0 * model.feature_scales) == pytest.approx(10.0)
+
+    centered_model = replace(model, center=np.arange(n_features, dtype=np.float64))
+    assert scaled_dispersion_sum(reference, centered_model) == pytest.approx(
+        scaled_dispersion_sum(reference, model)
+    )
 
     with pytest.raises(ValueError, match="Expected query matrix"):
         scaled_dispersion_sum(reference[:, :2], model)
@@ -294,6 +304,7 @@ def test_symphony_handles_empty_cluster_batch_statistics_without_nan():
 def test_symphony_no_shift_composition_subset_stays_stable():
     projection = ScaledPCAProjectionModel(
         feature_means=np.zeros(2),
+        center=np.zeros_like(np.zeros(2)),
         feature_scales=np.ones(2),
         loadings=np.eye(2),
     )
@@ -319,6 +330,7 @@ def test_symphony_no_shift_composition_subset_stays_stable():
 def test_symphony_composition_imbalance_preserves_distinct_populations():
     projection = ScaledPCAProjectionModel(
         feature_means=np.zeros(2),
+        center=np.zeros_like(np.zeros(2)),
         feature_scales=np.ones(2),
         loadings=np.eye(2),
     )
@@ -517,6 +529,7 @@ def test_symphony_r_0_1_3_static_golden_fixture():
     reference = fixture["reference"]
     projection = ScaledPCAProjectionModel(
         feature_means=np.asarray(reference["featureMeans"]),
+        center=np.zeros_like(np.asarray(reference["featureMeans"])),
         feature_scales=np.asarray(reference["featureScales"]),
         loadings=np.asarray(reference["loadings"]),
     )
@@ -557,6 +570,7 @@ def test_symphony_r_0_1_3_static_golden_fixture():
     nonzero_reference = nonzero["reference"]
     nonzero_projection = ScaledPCAProjectionModel(
         feature_means=np.asarray(nonzero_reference["featureMeans"]),
+        center=np.zeros_like(np.asarray(nonzero_reference["featureMeans"])),
         feature_scales=np.asarray(nonzero_reference["featureScales"]),
         loadings=np.asarray(nonzero_reference["loadings"]),
     )

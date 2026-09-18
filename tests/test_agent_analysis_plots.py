@@ -162,6 +162,7 @@ def test_small_map_draws_every_frozen_cell(monkeypatch: pytest.MonkeyPatch) -> N
     store, refs, _ = display_store(monkeypatch, n=12)
     plot = _plots.plot_final_umap(store, **refs, show=False)
     try:
+        assert plot.figure.canvas.manager is None
         assert plot.provenance.n_cells == 12
         offsets = np.concatenate(
             [artist.get_offsets()[:, 0] for artist in plot.axes["clusters"].collections]

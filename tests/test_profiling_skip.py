@@ -3,10 +3,13 @@ from pathlib import Path
 import pytest
 
 from profiling.config import (
+    CONSUME_STAGE_ORDER,
     CORE_STAGE_ORDER,
     SELECTED_STAGE_ORDER,
     ClusterSourceRef,
     CountMatrixConfig,
+    ProfilingConfig,
+    StageName,
     WorkflowParameters,
     _normalize_raw_config,
     bind_cluster_source,
@@ -191,6 +194,42 @@ def test_selected_stage_graph_is_available_and_rejects_gaps() -> None:
     payload = config.model_dump(mode="python")
     payload["stages"] = ("filterCells", "importClusters")
     with pytest.raises(ValueError, match="requires"):
+        ProfilingConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "requested",
+    [
+        ("runLeiden", "makeBulkMean"),
+        (*CORE_STAGE_ORDER, *CONSUME_STAGE_ORDER),
+        (*SELECTED_STAGE_ORDER, *CONSUME_STAGE_ORDER),
+        CONSUME_STAGE_ORDER,
+    ],
+)
+def test_config_accepts_consume_stages_with_pipeline_stages(
+    requested: tuple[StageName, ...],
+) -> None:
+    payload = load_profiling_config(_EXAMPLE_CONFIG).model_dump(mode="python")
+    payload["stages"] = requested
+
+    assert ProfilingConfig.model_validate(payload).effectiveStages == requested
+
+
+@pytest.mark.parametrize(
+    ("requested", "message"),
+    [
+        (("runLeiden", "makeBulkMean", "runPca"), "CORE stages"),
+        (("filterCells", "importClusters", "makeBulkMean"), "requires reopenStore"),
+        (("makeBulkMean", "runLeiden", "makeBulkMean"), "must be unique"),
+    ],
+)
+def test_consume_stages_preserve_pipeline_validation(
+    requested: tuple[StageName, ...], message: str
+) -> None:
+    payload = load_profiling_config(_EXAMPLE_CONFIG).model_dump(mode="python")
+    payload["stages"] = requested
+
+    with pytest.raises(ValueError, match=message):
         ProfilingConfig.model_validate(payload)
 
 

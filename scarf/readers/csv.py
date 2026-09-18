@@ -113,6 +113,8 @@ class CSVReader:
             desc="Checking CSV consistency",
         ):
             n_cells += df.shape[0]
+            if collected_cell_ids is not None:
+                collected_cell_ids.extend(df.index.to_numpy())
             if n_features == 0:
                 n_features = df.shape[1]
                 if self.pandas_kwargs["header"] is not None:
@@ -136,6 +138,8 @@ class CSVReader:
                         " Maybe a problem with the delimiter."
                     )
         if collected_cell_ids is not None:
+            if len(collected_cell_ids) != n_cells:
+                raise ValueError("Number of cell IDs does not match the CSV row count")
             cell_ids = np.asarray(collected_cell_ids)
         keep_cols: list[int] | None = None
         if feature_ids is not None:

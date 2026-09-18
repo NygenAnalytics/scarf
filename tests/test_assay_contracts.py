@@ -5,6 +5,7 @@ from typing import get_type_hints
 import numpy as np
 import pytest
 import zarr
+from scipy.sparse import csr_matrix
 from zarr.storage import MemoryStore
 
 import scarf.assay as assay_module
@@ -20,6 +21,9 @@ from scarf.assay import (
     norm_tf_idf,
 )
 from scarf.storage.artifacts import ArtifactRef, artifact_group
+from scarf.matrix import ChunkedArray
+from scarf.datastore.datastore import DataStore
+from scarf.writers import SparseToZarr
 from tests.signature_contracts import signature_digest
 
 
@@ -197,6 +201,49 @@ def test_normalization_numerical_contracts_are_stable():
         norm_lib_size(rna, counts),
         1000.0 * counts / rna.scalar.reshape(-1, 1),
     )
+
+
+def test_clr_normalizes_features_when_chunked_selection_is_square():
+    values = np.array([[1.0, 4.0, 9.0], [2.0, 20.0, 3.0], [12.0, 2.0, 2.0]])
+    counts = ChunkedArray.from_numpy(values, block_size=2)
+    expected_scale = np.exp(np.log1p(values).sum(axis=0) / len(values))
+
+    actual = norm_clr(None, counts).compute()
+
+    np.testing.assert_allclose(actual, np.log1p(values / expected_scale[None, :]))
+
+
+def test_clr_does_not_reuse_artifacts_with_ambiguous_axis(monkeypatch):
+    values = np.array([[1.0, 4.0, 9.0], [2.0, 20.0, 3.0], [12.0, 2.0, 2.0]])
+    store = MemoryStore()
+    SparseToZarr(
+        csr_matrix(values),
+        store,
+        ["a", "b", "c"],
+        ["x", "y", "z"],
+        assay_name="ADT",
+        nthreads=1,
+    ).dump()
+    datastore = DataStore(store, default_assay="ADT", nthreads=1)
+    cells = datastore.snapshot_cell_selection()
+    features = datastore.select_all_features(from_assay="ADT")
+    scale = np.exp(np.log1p(values).sum(axis=0) / len(values))
+    with monkeypatch.context() as previous_identity:
+        previous_identity.delattr(norm_clr, "artifact_identity")
+        previous = datastore.run_normalization(cells, features)
+    artifact_group(datastore.zw, previous)["data"][:] = np.log1p(
+        values / scale[:, None]
+    )
+
+    actual = datastore.run_normalization(cells, features)
+
+    assert actual != previous
+    np.testing.assert_allclose(
+        artifact_group(datastore.zw, actual)["data"][:],
+        np.log1p(values / scale[None, :]),
+        rtol=1e-6,
+    )
+    assert datastore.run_normalization(cells, features) == actual
 
 
 def test_assay_read_block_facade_remains_patchable(monkeypatch):

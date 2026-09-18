@@ -117,18 +117,19 @@ def get_feature_mappings(
             continue
 
         peaks_chrom_idx = (peaks_bed_df[0] == chrom).values
-        match_indices = binary_search(
-            get_ranges(peaks_bed_df, peaks_chrom_idx),
-            get_ranges(features_bed_df, feats_chrom_idx),
-        ).astype(int)
+        peak_ranges = get_ranges(peaks_bed_df, peaks_chrom_idx)
+        feature_ranges = get_ranges(features_bed_df, feats_chrom_idx)
+        match_indices = binary_search(peak_ranges, feature_ranges).astype(int)
 
         peak_idx = np.array(peaks_bed_df.index[peaks_chrom_idx])
-        for match in match_indices:
+        for match, query in zip(match_indices, feature_ranges):
             if match[0] == -1:
                 assert match[1] == -1
                 n_no_match += 1
             else:
-                peaks_for_feat = peak_idx[match[0] : match[1]]
+                candidates = peak_ranges[match[0] : match[1]]
+                overlaps = (query[0] < candidates[:, 1]) & (query[1] > candidates[:, 0])
+                peaks_for_feat = peak_idx[match[0] : match[1]][overlaps]
                 map_peak_rows.extend(peaks_for_feat.tolist())
                 map_feat_cols.extend([feat_col] * peaks_for_feat.shape[0])
             feat_col += 1

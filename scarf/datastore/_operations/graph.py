@@ -301,6 +301,23 @@ def _streaming_lsi_block_rows(
     return max(1, min(n_rows, available // row_bytes))
 
 
+def _read_pca_center(group: zarr.Group) -> np.ndarray:
+    if "center" not in group:
+        raise ValueError("PCA artifact has no fitted center. Re-run run_pca.")
+    loadings = as_zarr_array(group["loadings"], name="loadings")
+    center = as_zarr_array(group["center"], name="center")
+    if (
+        loadings.ndim != 2
+        or center.shape != (loadings.shape[0],)
+        or np.dtype(center.dtype) != np.dtype(np.float64)
+    ):
+        raise ValueError("PCA center has incompatible shape or dtype. Re-run run_pca.")
+    values = np.asarray(center[:])
+    if not np.all(np.isfinite(values)):
+        raise ValueError("PCA center contains non-finite values. Re-run run_pca.")
+    return values
+
+
 def _sampling_fraction(value: Any, name: str) -> float:
     if isinstance(value, bool):
         raise TypeError(f"{name} must be a number")
@@ -617,6 +634,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             harmonize=correction_ref is not None,
             harmonized_data=corrected,
             batches=None,
+            center=(
+                _read_pca_center(reduction_group) if reduction_method == "pca" else None
+            ),
         )
         persisted_ann_threads = int(ann_params.get("parallel_threads") or 1)
         AnnIndexStage.configure(
@@ -932,6 +952,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 )
             ),
             lsi_params={},
+            center=_read_pca_center(reduction_group) if method == "pca" else None,
         )
         stream = LazyTransformStream(
             data=normalized,
@@ -947,7 +968,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         *,
         batch_size: int | None,
     ) -> tuple[CoordinateSource, int, int]:
-        resolve_coordinate_inputs(self.zw, coordinates)
+        lineage = resolve_coordinate_inputs(self.zw, coordinates)
+        if lineage.reduction is not None:
+            reduction_status = inspect_artifact(self.zw, lineage.reduction)
+            if reduction_status.operation == "run_pca":
+                _read_pca_center(artifact_group(self.zw, lineage.reduction))
         if coordinates.kind == "imported_coordinates":
             status = self._require_complete_artifact(
                 coordinates,
@@ -1571,6 +1596,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 dtype=np.float32,
             ),
         )
+        if method == "pca":
+            required_arrays += (
+                ArrayRequirement("center", shape=(n_features,), dtype=np.float64),
+            )
         planned = self._plan_assay_artifact(
             assay_name,
             arguments,
@@ -1603,6 +1632,16 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 },
             )
             reduction_group = start_artifact(self.zw, planned)
+            if method == "pca":
+                assert transform.center is not None
+                center_array = create_zarr_dataset(
+                    reduction_group,
+                    "center",
+                    (n_features,),
+                    "f8",
+                    (n_features,),
+                )
+                center_array[:] = transform.center
             if transform.loadings is not None:
                 output = create_zarr_dataset(
                     reduction_group,
@@ -2843,6 +2882,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 table_path="cellData",
             )
             source_n_cells = _validate_integration_source_payload(self.zw, source)
+            if method == "wnn" and ancestry.reduction is not None:
+                reduction_status = inspect_artifact(self.zw, ancestry.reduction)
+                if reduction_status.operation == "run_pca":
+                    _read_pca_center(artifact_group(self.zw, ancestry.reduction))
             if shared_source_n_cells is None:
                 shared_source_n_cells = source_n_cells
             elif source_n_cells != shared_source_n_cells:

@@ -9,7 +9,11 @@ import pandas as pd
 import zarr
 from numpy.typing import NDArray
 
-from ...features.variability import DEFAULT_HVG_BLACKLIST, HVG_UBIQUITOUS_SLACK
+from ...features.variability import (
+    DEFAULT_HVG_BLACKLIST,
+    HVG_UBIQUITOUS_SLACK,
+    _ADAPTIVE_QUANTILE,
+)
 from ...assay.feature_summary import (
     ensure_feature_summary,
     feature_summary_selected_count,
@@ -591,6 +595,14 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 "blacklist": blacklist,
                 "keep_bounds": keep_bounds,
                 "bin_strategy": bin_strategy,
+                **(
+                    {
+                        "variance_estimator": "regularized_local_quantile",
+                        "variance_quantile": _ADAPTIVE_QUANTILE,
+                    }
+                    if bin_strategy == "adaptive"
+                    else {}
+                ),
             },
             inputs={
                 "feature_summary": summary_ref,

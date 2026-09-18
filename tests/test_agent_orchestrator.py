@@ -401,11 +401,13 @@ def test_rna_h5ad_completes_public_automated_workflow(
         feature_names=feature_names,
     )
     model, state = _rna_workflow_model()
-    pca_diagnostic_calls: list[ArtifactRef] = []
+    pca_diagnostic_calls: list[str] = []
     augment_pca = tuning_module.augment_pca_evaluations
 
     def track_pca_diagnostics(*args: Any, **kwargs: Any) -> Any:
-        pca_diagnostic_calls.append(kwargs["feature_selection"])
+        for evaluation in args[1]:
+            assert evaluation.candidateId not in pca_diagnostic_calls
+            pca_diagnostic_calls.append(evaluation.candidateId)
         return augment_pca(*args, **kwargs)
 
     monkeypatch.setattr(tuning_module, "augment_pca_evaluations", track_pca_diagnostics)
@@ -471,11 +473,11 @@ def test_rna_h5ad_completes_public_automated_workflow(
     monkeypatch.setattr(tuning_module.RnaTuningRun, "execute", interrupt_before_full)
     with pytest.raises(KeyboardInterrupt, match="screening answer"):
         orchestrator.resume(resume_request)
-    assert pca_diagnostic_calls == pca_diagnostics_before_resume
+    pca_diagnostics_before_full = len(pca_diagnostic_calls)
     result = orchestrator.resume(resume_request)
 
     assert result.status == "completed", result.notes
-    assert len(pca_diagnostic_calls) == len(pca_diagnostics_before_resume) + 1
+    assert len(pca_diagnostic_calls) > pca_diagnostics_before_full
     assert state["pca_prompts"] >= 3
     assert result.currentStage == "analysis_finalization"
     assert result.workflowRunId is not None
@@ -552,14 +554,18 @@ def test_rna_h5ad_completes_public_automated_workflow(
     scored_partition = ArtifactRef.from_dict(doublet_inputs["clusters"])
     assert scored_partition.kind == "cluster_labels"
     assert persisted.inspect_artifact(scored_partition).complete
-    selected_evaluation = tuning_evaluations[0]
+    selected_evaluation = next(
+        evaluation
+        for evaluation in tuning_evaluations
+        if evaluation.candidateId == parameter_report.recommendedCandidateId
+    )
     assert (
         persisted.inspect_artifact(
             artifact_model_to_ref(selected_evaluation.artifacts["normalized"])
         ).inputs["cell_selection"]
         == artifact_model_to_ref(final.cellSelection).to_dict()
     )
-    assert len(tuning_evaluations) == 1
+    assert 1 <= len(tuning_evaluations) <= orchestrator.config.maxFullPartitions
     snapshot = analysis_snapshot(persisted, result.workflowRunId)
     evidence = next(
         stage for stage in snapshot["stages"] if stage["stage"] == "parameter_tuning"
@@ -581,7 +587,9 @@ def test_rna_h5ad_completes_public_automated_workflow(
         "featurePolicy",
     } <= compared
     assert evidence["budget"]["scopes"]["full"]["reserved"]["graphs"] == 1
-    assert evidence["budget"]["scopes"]["full"]["reserved"]["partitions"] == 1
+    assert evidence["budget"]["scopes"]["full"]["reserved"]["partitions"] == len(
+        tuning_evaluations
+    )
     sample_record = load_checkpoint(
         persisted,
         _ensure_orchestration_store(persisted),

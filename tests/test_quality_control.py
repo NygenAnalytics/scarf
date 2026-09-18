@@ -2,9 +2,15 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from scipy.sparse import csr_matrix
 
 from scarf.quality_control.cell_cycle import assign_cell_cycle_phase
-from scarf.quality_control.doublets import sample_cluster_pool, simulate_doublet_pairs
+from scarf.quality_control.doublets import (
+    sample_cluster_pool,
+    simulate_doublet_pairs,
+    sum_doublet_pairs,
+    write_doublet_target_zarr,
+)
 from scarf.quality_control.filtering import gaussian_quantile_bounds
 from scarf.graph.feature_projection import resolve_native_graph_inputs
 from scarf.metadata.artifacts import (
@@ -22,6 +28,64 @@ from scarf.storage.selections import (
     read_stored_selection_mask,
     resolve_selection_artifact,
 )
+from scarf.storage.schema import load_count_array
+
+
+def test_doublet_pair_counts_are_widened_and_stored_without_overflow(tmp_path):
+    counts = csr_matrix(np.array([[200, 0], [200, 9]], dtype=np.uint8))
+    summed = sum_doublet_pairs(counts, np.array([0]), np.array([1]))
+    root = write_doublet_target_zarr(
+        str(tmp_path / "doublets.zarr"),
+        "RNA",
+        summed,
+        np.array(["g1", "g2"]),
+        np.array(["g1", "g2"]),
+        dtype=str(summed.dtype),
+        nthreads=1,
+    )
+
+    stored = load_count_array(root, "RNA", None)
+    assert stored.dtype == np.dtype("uint16")
+    np.testing.assert_array_equal(stored[:], [[400, 9]])
+
+
+@pytest.mark.parametrize(
+    ("dtype", "left", "right"),
+    [
+        ("uint64", 2**63, 2**63),
+        ("int64", 2**62, 2**62),
+        ("int64", -(2**62) - 1, -(2**62)),
+    ],
+)
+def test_doublet_pair_counts_reject_unrepresentable_integer_sums(dtype, left, right):
+    counts = csr_matrix(np.array([[0, left], [1, right]], dtype=dtype))
+
+    with pytest.raises(OverflowError, match="Synthetic doublet counts exceed"):
+        sum_doublet_pairs(counts, np.array([0]), np.array([1]))
+
+
+@pytest.mark.parametrize(
+    ("dtype", "values", "expected", "output_dtype"),
+    [
+        ("uint64", [[2**64 - 2, 0], [1, 2**64 - 1]], [[2**64 - 1] * 2], "uint64"),
+        ("int64", [[-(2**63), 2**63 - 1], [0, -(2**63)]], [[-(2**63), -1]], "int64"),
+        ("uint64", [[0, 0], [1, 2]], [[1, 2]], "uint64"),
+        ("int8", [[100, -100], [100, -100]], [[200, -200]], "int16"),
+        ("float32", [[1.5, 0], [2.25, 3.5]], [[3.75, 3.5]], "float32"),
+        ("bool", [[True, False], [True, True]], [[2, 1]], "uint8"),
+    ],
+)
+def test_doublet_pair_counts_preserve_representable_sums(
+    dtype, values, expected, output_dtype
+):
+    counts = csr_matrix(np.array(values, dtype=dtype))
+
+    actual = sum_doublet_pairs(counts, np.array([0]), np.array([1]))
+
+    assert actual.dtype == np.dtype(output_dtype)
+    np.testing.assert_array_equal(
+        actual.toarray(), np.array(expected, dtype=output_dtype)
+    )
 
 
 def test_simulate_doublet_pairs_is_seeded_and_heterotypic():
@@ -391,6 +455,36 @@ def test_doublet_mapping_is_query_owned_and_leaves_reference_unprojected(
     datastore = analyzed_datastore_ephemeral
     selected_connectivity = _fixture_graph(datastore)
     clusters = _doublet_clusters(datastore, selected_connectivity)
+    lineage = resolve_native_graph_inputs(datastore.zw, selected_connectivity)
+    n_cells = artifact_group(datastore.zw, clusters)["values"].shape[0]
+    previous = plan_cell_data_artifact(
+        datastore.zw,
+        scope="assay",
+        assay="RNA",
+        kind="doublet_score",
+        operation="run_doublet_detection",
+        parameters={
+            "cluster_sample_fraction": 0.01,
+            "max_cells_per_cluster": 2,
+            "simulation_ratio": 0.01,
+            "heterotypic_fraction": 0.8,
+            "save_k": 3,
+            "smoothing_t": 1,
+            "normalize_scores": True,
+            "random_seed": 19,
+        },
+        inputs={
+            "clusters": clusters,
+            "connectivity_map": selected_connectivity,
+            "neighbors": lineage.neighbors,
+        },
+        execution_options={},
+        cell_selection=lineage.cell_selection,
+        arrays={"values": ((n_cells,), "f")},
+    )
+    write_cell_data_artifact(
+        datastore.zw, previous, {"values": np.full(n_cells, np.nan)}
+    )
     metadata_before = _snapshot_store(str(Path(datastore.zarr_loc) / "cellData"))
     reference_projections = set(
         datastore.list_artifacts(
@@ -436,6 +530,10 @@ def test_doublet_mapping_is_query_owned_and_leaves_reference_unprojected(
     )
 
     assert mapping_calls == 1
+    assert score_ref != previous.ref
+    assert datastore.inspect_artifact(score_ref).parameters["count_arithmetic"] == (
+        "checked_integer_sum"
+    )
     assert temporary_paths and all(not path.exists() for path in temporary_paths)
     assert (
         set(

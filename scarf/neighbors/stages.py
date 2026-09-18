@@ -34,6 +34,7 @@ class ReductionTransform:
         disable_scaling: bool,
         lsi_skip_first: bool,
         lsi_params: dict[str, Any],
+        center: np.ndarray | None = None,
     ) -> None:
         self.data = data
         self.method = method
@@ -46,6 +47,7 @@ class ReductionTransform:
         self.rand_state = rand_state
         self.feature_scaling = not disable_scaling
         self.pca: Any | None = None
+        self.center = center
         disable_reduction = self.dims is not None and self.dims < 1
 
         if self.method == "pca":
@@ -85,17 +87,21 @@ class ReductionTransform:
         disable_scaling: bool,
         disable_reduction: bool,
     ) -> Callable[[np.ndarray], np.ndarray]:
-        if disable_scaling:
-            if disable_reduction:
-                return lambda values: values
-            assert self.loadings is not None
-            loadings = self.loadings
-            return lambda values: np.asarray(values.dot(loadings))
         if disable_reduction:
-            return self.transform_z
+            return (lambda values: values) if disable_scaling else self.transform_z
+        if self.center is None:
+            raise ValueError("PCA loadings require a fitted center. Re-run run_pca.")
+        center = np.asarray(self.center, dtype=np.float64)
+        if center.shape != (self.data.shape[1],) or not np.all(np.isfinite(center)):
+            raise ValueError("PCA center must contain one finite value per feature")
+        self.center = center
         assert self.loadings is not None
         loadings = self.loadings
-        return lambda values: np.asarray(self.transform_z(values).dot(loadings))
+        if disable_scaling:
+            return lambda values: np.asarray((values - center).dot(loadings))
+        return lambda values: np.asarray(
+            (self.transform_z(values) - center).dot(loadings)
+        )
 
     def _linear_transform(
         self,
@@ -130,6 +136,7 @@ class ReductionTransform:
             scale=scale,
             nthreads=self.nthreads,
         )
+        self.center = np.asarray(self.pca.mean_, dtype=np.float64)
 
     def _fit_lsi(
         self,

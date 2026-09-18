@@ -13,6 +13,7 @@ from ..utils.logging import logger
 __all__ = [
     "sample_cluster_pool",
     "simulate_doublet_pairs",
+    "sum_doublet_pairs",
     "write_doublet_target_zarr",
 ]
 
@@ -55,6 +56,35 @@ def simulate_doublet_pairs(
                 break
             right[clash] = rng.integers(0, pool_size, size=int(clash.sum()))
     return left, right
+
+
+def sum_doublet_pairs(
+    pool_counts: csr_matrix,
+    left: NDArray[np.int64],
+    right: NDArray[np.int64],
+) -> csr_matrix:
+    """Add sampled count rows without overflowing integer counts."""
+    dtype = pool_counts.dtype
+    if dtype.kind == "b":
+        dtype = np.dtype("uint8")
+    elif dtype.kind in "iu" and dtype.itemsize < 8:
+        dtype = np.dtype(f"{dtype.kind}{dtype.itemsize * 2}")
+    first = pool_counts[left].astype(dtype, copy=False)
+    second = pool_counts[right].astype(dtype, copy=False)
+    if dtype.kind in "iu" and pool_counts.dtype.itemsize == 8 and first.nnz:
+        entries = first.tocoo(copy=False)
+        other_values = np.asarray(second[entries.row, entries.col]).ravel()
+        limits = np.iinfo(dtype)
+        positive = other_values > 0
+        overflow = np.any(entries.data[positive] > limits.max - other_values[positive])
+        if dtype.kind == "i":
+            negative = other_values < 0
+            overflow |= np.any(
+                entries.data[negative] < limits.min - other_values[negative]
+            )
+        if overflow:
+            raise OverflowError(f"Synthetic doublet counts exceed the range of {dtype}")
+    return (first + second).tocsr()
 
 
 def write_doublet_target_zarr(

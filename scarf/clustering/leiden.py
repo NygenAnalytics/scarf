@@ -24,21 +24,18 @@ def _igraph_membership(
             "dependencies before running Leiden clustering."
         ) from None
 
-    coo = graph.tocoo(copy=False)
-    if np.count_nonzero(coo.data) == coo.nnz:
-        sources = coo.row
-        targets = coo.col
-    else:
-        sources, targets = graph.nonzero()
+    coo = graph.tocoo(copy=True)
+    coo.eliminate_zeros()
     igraph_graph = igraph.Graph(
         n=graph.shape[0],
-        edges=zip(sources, targets),
+        edges=zip(coo.row, coo.col),
         directed=False,
     )
     with _IGRAPH_RNG_LOCK:
         igraph.set_random_number_generator(random.Random(random_seed))
         try:
             partition = igraph_graph.community_leiden(
+                weights=coo.data,
                 objective_function="modularity",
                 resolution=resolution,
                 n_iterations=2,
@@ -65,14 +62,16 @@ def _leidenalg_membership(
             "running Paris with the `run_paris_clustering` method"
         ) from None
 
-    sources, targets = graph.nonzero()
+    coo = graph.tocoo(copy=True)
+    coo.eliminate_zeros()
     igraph_graph = igraph.Graph()
     igraph_graph.add_vertices(graph.shape[0])
-    igraph_graph.add_edges(list(zip(sources, targets)))
-    igraph_graph.es["weight"] = graph[sources, targets].A1
+    igraph_graph.add_edges(list(zip(coo.row, coo.col)))
+    igraph_graph.es["weight"] = coo.data
     partition = leidenalg.find_partition(
         igraph_graph,
         leidenalg.RBConfigurationVertexPartition,
+        weights="weight",
         resolution_parameter=resolution,
         seed=random_seed,
     )

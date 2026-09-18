@@ -186,6 +186,73 @@ def _selection_mask(datastore, selection: ArtifactRef) -> np.ndarray:
     )
 
 
+@pytest.mark.parametrize("feat_scaling", [False, True])
+def test_pca_reopens_with_center_and_rebuilds_legacy_artifacts(
+    tmp_path, feat_scaling: bool
+) -> None:
+    from scipy.sparse import csr_matrix
+
+    from scarf import DataStore
+    from scarf.writers import SparseToZarr
+
+    values = np.random.default_rng(31).integers(10, 100, size=(30, 6))
+    values[15:, :3] += 200
+    path = str(tmp_path / "pca.zarr")
+    SparseToZarr(
+        csr_matrix(values),
+        path,
+        cell_ids=[f"c{i}" for i in range(30)],
+        feature_ids=[f"g{i}" for i in range(6)],
+        nthreads=1,
+    ).dump()
+    datastore = DataStore(
+        path, default_assay="RNA", min_features_per_cell=0, nthreads=1
+    )
+    cells = datastore.snapshot_cell_selection("I")
+    datastore.cells.insert("pca_fit", np.arange(30) < 15)
+    fit_cells = datastore.snapshot_cell_selection("pca_fit")
+    features = datastore.select_all_features(from_assay="RNA")
+    normalized = datastore.run_normalization(cells, features)
+    arguments = dict(
+        dims=2,
+        pca_cell_selection=fit_cells,
+        feat_scaling=feat_scaling,
+        batch_size=10,
+        local_cache=False,
+    )
+    reduction = datastore.run_pca(normalized, **arguments)
+    group = artifact_group(datastore.zw, reduction)
+    center = np.asarray(group["center"][:])
+    assert center.shape == (6,)
+    assert center.dtype == np.dtype(np.float64)
+    assert np.linalg.norm(center) > 0.1
+    expected = np.asarray(group["data"][:])
+    np.testing.assert_allclose(expected[:15].mean(axis=0), 0, atol=1e-6)
+
+    reopened = DataStore(path, default_assay="RNA", nthreads=1)
+    _, stream = reopened._load_reduction_stream(reduction, batch_size=10)
+    np.testing.assert_allclose(
+        np.vstack(list(stream.iter_coordinate_blocks(""))),
+        expected,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert reopened.run_pca(normalized, **arguments) == reduction
+
+    del group["center"]
+    with pytest.raises(ValueError, match="PCA artifact has no fitted center"):
+        reopened.build_ann_index(reduction)
+    with pytest.raises(ValueError, match="PCA artifact has no fitted center"):
+        reopened._load_reduction_stream(reduction, batch_size=10)
+    rebuilt = reopened.run_pca(normalized, **arguments)
+    assert rebuilt != reduction
+    assert "center" not in group
+    np.testing.assert_allclose(
+        artifact_group(reopened.zw, rebuilt)["data"][:], expected
+    )
+    reopened.build_ann_index(rebuilt)
+
+
 def test_graph_construction_methods_chain_explicit_refs_and_persist_artifacts(
     datastore_ephemeral,
 ) -> None:
@@ -217,6 +284,8 @@ def test_graph_construction_methods_chain_explicit_refs_and_persist_artifacts(
     )
     reduction_group = datastore.zw[artifact_path(pca)]
     assert reduction_group["loadings"].dtype == np.dtype(np.float64)
+    assert reduction_group["center"].dtype == np.dtype(np.float64)
+    assert reduction_group["center"].shape == (normalized_values.shape[1],)
     assert reduction_group["data"].dtype == np.dtype(np.float32)
     assert reduction_group["data"].shape == (
         int(np.count_nonzero(_selection_mask(datastore, cell_selection))),

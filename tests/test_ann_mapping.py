@@ -17,6 +17,7 @@ def _ann_stream() -> AnnStream:
         reduction_method="pca",
         dims=2,
         loadings=np.eye(2),
+        center=np.zeros(2),
         use_for_pca=np.ones(3, dtype=bool),
         mu=np.array([0.5, 0.5]),
         sigma=np.array([0.5, 0.5]),

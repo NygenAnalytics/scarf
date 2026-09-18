@@ -13,8 +13,8 @@ __all__ = [
     "select_highly_variable_features",
 ]
 
-_ADAPTIVE_MIN_BIN_SIZE = 25
-_ADAPTIVE_ANCHOR_QUANTILE = 0.1
+_ADAPTIVE_MIN_SUPPORT = 50
+_ADAPTIVE_QUANTILE = 0.25
 
 # Case-insensitive via uppercasing in select_highly_variable_features / MetaData.grep.
 DEFAULT_HVG_BLACKLIST = (
@@ -24,14 +24,103 @@ DEFAULT_HVG_BLACKLIST = (
 HVG_UBIQUITOUS_SLACK = 20
 
 
+def _fit_local_quantile(
+    log_means: np.ndarray,
+    log_variances: np.ndarray,
+    noise_residual: np.ndarray,
+    center: float,
+    bandwidth: float,
+    minimum_bandwidth: float,
+) -> float:
+    from scipy.optimize import minimize
+
+    reference: tuple[np.ndarray, np.ndarray] | None = None
+    for _ in range(2):
+        keep = np.abs(log_means - center) < bandwidth
+        relative = (log_means[keep] - center) / bandwidth
+        weight = 0.5 + 0.5 * (1 - np.abs(relative) ** 3) ** 3
+        if reference is not None:
+            weight *= np.interp(log_means[keep], reference[0], reference[1])
+        weight /= weight.sum()
+        degree = min(2, max(1, len(np.unique(relative)) - 3))
+        design = np.stack([relative**power for power in range(degree + 1)], axis=1)
+
+        # Limit the influence of isolated genes at the ends of a fitting window.
+        for _ in range(3):
+            inverse = np.linalg.pinv(design.T @ (weight[:, None] * design))
+            leverage = weight * np.sum((design @ inverse) * design, axis=1)
+            limit = 1.25 * (degree + 1) * (weight @ weight)
+            weight *= np.minimum(1, limit / np.maximum(leverage, 1e-15))
+            weight /= weight.sum()
+
+        origin = np.median(log_variances[keep])
+        observed = log_variances[keep] - origin
+        initial = np.linalg.lstsq(
+            design * np.sqrt(weight[:, None]), observed * np.sqrt(weight), rcond=None
+        )[0]
+        local_noise = noise_residual[keep]
+        noise = np.median(local_noise[np.isfinite(local_noise)]) if degree == 2 else 0.0
+        penalty = noise * np.sqrt(weight @ weight)
+
+        def objective(coefficients: np.ndarray) -> tuple[float, np.ndarray]:
+            residual = observed - design @ coefficients
+            absolute = np.sqrt(residual**2 + 1e-8)
+            value = weight @ (0.5 * absolute + (_ADAPTIVE_QUANTILE - 0.5) * residual)
+            gradient = -design.T @ (
+                weight * (0.5 * residual / absolute + _ADAPTIVE_QUANTILE - 0.5)
+            )
+            if degree == 2:
+                value += penalty * coefficients[2] ** 2
+                gradient[2] += 2 * penalty * coefficients[2]
+            return float(value), gradient
+
+        result = minimize(
+            objective,
+            initial,
+            jac=True,
+            method="L-BFGS-B",
+            options={"ftol": 1e-15, "gtol": 1e-10, "maxiter": 300, "maxls": 50},
+        )
+        if not result.success or not np.all(np.isfinite(result.x)):
+            raise ValueError(f"Adaptive variance trend fit failed: {result.message}")
+
+        # Continue linearly outside the interior support instead of extrapolating
+        # poorly constrained curvature across an isolated endpoint.
+        edge = np.clip(0.0, *np.quantile(relative, [0.1, 0.9]))
+        prediction = result.x[0] + origin
+        if degree == 2:
+            prediction -= result.x[2] * edge**2
+        if reference is not None or minimum_bandwidth >= bandwidth or degree < 2:
+            break
+
+        residual = observed - design @ result.x
+        model_noise = np.median(np.abs(residual - np.median(residual)))
+        if model_noise <= max(2 * noise, 1e-4):
+            break
+
+        # Narrow only when smooth curvature exceeds local scatter. Carry an
+        # outlier guard from the wider window into the smaller fit.
+        unique, groups = np.unique(log_means[keep], return_inverse=True)
+        values = np.array(
+            [np.median(observed[groups == index]) for index in range(len(unique))]
+        )
+        slopes = np.diff(values) / np.diff(unique)
+        curvature = np.diff(slopes) / (unique[2:] - unique[:-2])
+        curvature = np.abs(np.r_[curvature[0], curvature, curvature[-1]])
+        scale = max(3 * np.median(curvature), 1e-8)
+        robust_weight = np.minimum(1, (scale / np.maximum(curvature, 1e-15)) ** 2)
+        reference = (log_means[keep], robust_weight[groups])
+        bandwidth = minimum_bandwidth
+
+    return float(prediction)
+
+
 def _fit_lowess_adaptive(
     a: np.ndarray,
     b: np.ndarray,
     n_bins: int,
     lowess_frac: float,
 ) -> np.ndarray:
-    from statsmodels.nonparametric.smoothers_lowess import lowess
-
     means = np.asarray(a, dtype=float)
     variances = np.asarray(b, dtype=float)
     if means.ndim != 1 or variances.ndim != 1 or means.shape != variances.shape:
@@ -55,6 +144,11 @@ def _fit_lowess_adaptive(
     valid = np.isfinite(means) & np.isfinite(variances) & (means > 0) & (variances > 0)
     if not valid.any():
         return corrected
+    if valid.sum() < 3:
+        raise ValueError(
+            "At least three genes with positive finite means and variances "
+            "are needed to estimate an adaptive variance trend"
+        )
 
     log_means = np.log(means[valid])
     log_variances = np.log(variances[valid])
@@ -62,63 +156,79 @@ def _fit_lowess_adaptive(
     sorted_means = log_means[order]
     sorted_variances = log_variances[order]
 
-    bin_slices: list[slice] = []
-    bins_left = max(1, min(n_bins, len(order) // _ADAPTIVE_MIN_BIN_SIZE))
-    start = 0
-    while start < len(order):
-        remaining = len(order) - start
-        if bins_left == 1:
-            end = len(order)
-        else:
-            target_size = (remaining + bins_left - 1) // bins_left
-            end = start + target_size
-        while end < len(order) and sorted_means[end] == sorted_means[end - 1]:
-            end += 1
-        bins_after = min(
-            bins_left - 1,
-            (len(order) - end) // _ADAPTIVE_MIN_BIN_SIZE,
+    unique, starts, counts = np.unique(
+        sorted_means, return_index=True, return_counts=True
+    )
+    if len(unique) == 1:
+        correction = np.full(
+            log_means.shape, np.quantile(log_variances, _ADAPTIVE_QUANTILE)
         )
-        if bins_after == 0:
-            end = len(order)
-        bin_slices.append(slice(start, end))
-        start = end
-        bins_left = bins_after
-
-    anchor_means = np.fromiter(
-        (np.median(sorted_means[indices]) for indices in bin_slices),
-        dtype=float,
-        count=len(bin_slices),
-    )
-    anchor_variances = np.fromiter(
-        (
-            np.quantile(
-                sorted_variances[indices],
-                _ADAPTIVE_ANCHOR_QUANTILE,
-            )
-            for indices in bin_slices
-        ),
-        dtype=float,
-        count=len(bin_slices),
-    )
-
-    if len(anchor_means) == 1:
-        correction = np.full(log_means.shape, anchor_variances[0], dtype=float)
     else:
-        fitted = np.asarray(
-            lowess(
-                anchor_variances,
-                anchor_means,
-                return_sorted=False,
-                frac=lowess_frac,
-                it=100,
-            ),
-            dtype=float,
+        span = np.ptp(unique)
+        rank = (starts + (counts - 1) / 2) / (len(order) - 1)
+        coordinate = 0.5 * rank + 0.5 * (unique - unique[0]) / span
+        coordinate = (coordinate - coordinate[0]) / np.ptp(coordinate)
+        labels = np.repeat(
+            np.minimum(np.floor(n_bins * coordinate).astype(int), n_bins - 1), counts
         )
-        if fitted.shape != anchor_means.shape or not np.all(np.isfinite(fitted)):
-            raise ValueError("LOWESS returned invalid adaptive trend values")
-        correction = np.interp(log_means, anchor_means, fitted)
+        boundaries = np.r_[0, np.flatnonzero(np.diff(labels)) + 1, len(order)]
+        centers = [
+            np.median(sorted_means[start:end])
+            for start, end in zip(boundaries[:-1], boundaries[1:])
+        ]
+        # Fit both endpoints instead of clamping the sparse tail to an inner bin.
+        anchors = np.unique(np.r_[unique[0], centers, unique[-1]])
 
-    corrected[valid] = np.exp(log_variances - correction)
+        median_variance = sorted_variances[starts].copy()
+        for index in np.flatnonzero(counts > 1):
+            start = starts[index]
+            median_variance[index] = np.median(
+                sorted_variances[start : start + counts[index]]
+            )
+        neighbor_prediction = np.full(len(unique), np.nan)
+        if len(unique) > 2:
+            position = (unique[1:-1] - unique[:-2]) / (unique[2:] - unique[:-2])
+            neighbor_prediction[1:-1] = median_variance[:-2] + position * (
+                median_variance[2:] - median_variance[:-2]
+            )
+        noise_residual = np.abs(
+            sorted_variances - np.repeat(neighbor_prediction, counts)
+        )
+
+        fitted = np.empty(len(anchors))
+        support = min(_ADAPTIVE_MIN_SUPPORT, len(order))
+        minimum_support = min(8, len(order))
+        for anchor_index, center in enumerate(anchors):
+            distances = np.abs(sorted_means - center)
+            bandwidth = max(
+                lowess_frac * span,
+                np.partition(distances, support - 1)[support - 1] * 1.05,
+            )
+            if bandwidth == 0:
+                bandwidth = distances[distances > 0].min() * 1.05
+            minimum_bandwidth = max(
+                lowess_frac * span,
+                np.partition(distances, minimum_support - 1)[minimum_support - 1]
+                * 1.05,
+            )
+            if minimum_bandwidth == 0:
+                minimum_bandwidth = distances[distances > 0].min() * 1.05
+            fitted[anchor_index] = _fit_local_quantile(
+                sorted_means,
+                sorted_variances,
+                noise_residual,
+                center,
+                bandwidth,
+                minimum_bandwidth,
+            )
+        correction = np.interp(log_means, anchors, fitted)
+
+    with np.errstate(over="ignore", under="ignore"):
+        corrected[valid] = np.exp(log_variances - correction)
+    if not np.all(np.isfinite(corrected[valid]) & (corrected[valid] > 0)):
+        raise ValueError(
+            "Adaptive variance correction produced nonfinite or zero scores"
+        )
     return corrected
 
 
@@ -130,7 +240,14 @@ def fit_lowess(
     *,
     bin_strategy: Literal["fixed", "adaptive"] = "adaptive",
 ) -> np.ndarray:
-    """Fit a LOWESS curve and return corrected variance estimates."""
+    """Divide variance by an expression-dependent background.
+
+    Adaptive fits use local quantile regression: ``n_bins`` controls evaluation
+    density and ``lowess_frac`` is the window radius as a fraction of log-mean
+    range. Minimum support is 50 genes, or 8 where smooth curvature warrants it.
+    Smaller inputs use all available genes. The background is the lower quartile.
+    Fixed fits use LOWESS over the minimum-variance gene in each equal-width bin.
+    """
     if bin_strategy == "adaptive":
         return _fit_lowess_adaptive(a, b, n_bins, lowess_frac)
     if bin_strategy != "fixed":

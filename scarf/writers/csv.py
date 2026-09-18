@@ -74,12 +74,14 @@ class CSVtoZarr:
         self.io = io
         self.workspace = workspace
         self.storage_options = storage_options
-        self.z = load_zarr(zarr_loc, mode="w", storage_options=storage_options)
+        cell_ids = self.csvr.cell_ids()
+        if len(cell_ids) != self.csvr.nCells:
+            raise ValueError("Number of cell IDs does not match the CSV row count")
         if dtype is not None:
             self.dtype = dtype
         else:
             self.dtype = next(self.csvr.consume())[0].dtype
-        cell_ids = self.csvr.cell_ids()
+        self.z = load_zarr(zarr_loc, mode="w", storage_options=storage_options)
         _ = create_cell_data(
             root=self.z,
             workspace=workspace,

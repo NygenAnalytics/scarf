@@ -372,6 +372,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             graph=graph_input,
             resolution=resolution,
             backend=backend,
+            edge_weighting="graph",
             symmetric_graph=symmetric_graph,
             graph_upper_only=graph_upper_only,
             random_seed=random_seed,

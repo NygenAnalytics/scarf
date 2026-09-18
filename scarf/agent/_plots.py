@@ -182,6 +182,7 @@ def plot_final_umap(
     import matplotlib.pyplot as plt
     import pandas as pd
     from matplotlib.colors import to_hex
+    from matplotlib.figure import Figure
     from matplotlib.lines import Line2D
 
     categories = tuple(counts)
@@ -198,7 +199,11 @@ def plot_final_umap(
         )
         for index, label in enumerate(categories)
     }
-    figure, axis = plt.subplots(figsize=figsize, constrained_layout=True)
+    if show:
+        figure, axis = plt.subplots(figsize=figsize, constrained_layout=True)
+    else:
+        figure = Figure(figsize=figsize, constrained_layout=True)
+        axis = figure.subplots()
     try:
         order = np.random.Generator(np.random.PCG64(seed)).permutation(len(rows))
         axis.scatter(

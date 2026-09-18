@@ -25,6 +25,19 @@ def _features_bed(rows):
     )
 
 
+def test_feature_mappings_exclude_nonoverlapping_peaks_between_matches():
+    peaks = create_bed_from_coord_ids(
+        ["chr1:0-100", "chr1:10-20", "chr1:50-90", "chr1:70-80"]
+    )
+    features = _features_bed([("chr1", 60, 70, "gene", "Gene", "+")])
+
+    _, _, mapping = get_feature_mappings(peaks, features)
+
+    np.testing.assert_array_equal(mapping.toarray(), [[1], [0], [1], [0]])
+    counts = np.array([[5, 100, 7, 200]])
+    np.testing.assert_array_equal(counts @ mapping, [[12]])
+
+
 class _FakeMeta:
     def __init__(self, columns):
         self._columns = columns

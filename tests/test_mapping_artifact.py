@@ -173,16 +173,41 @@ def test_load_rejects_incomplete_input_set_and_pca_with_batch_correction() -> No
         load_artifact_mapping_reference(datastore, with_batch.ref)
 
 
+@pytest.mark.parametrize("array_name", ["loadings", "center"])
 def test_write_and_load_reject_missing_payload_arrays_after_corruption(
     analyzed_datastore_ephemeral,
+    array_name,
 ) -> None:
     datastore = analyzed_datastore_ephemeral
     reference = _plain_reference(datastore)
     group = artifact_group(datastore.zw, reference.ref)
-    del group["loadings"]
+    del group[array_name]
 
-    with pytest.raises(ValueError, match="build_mapping_reference\\(neighbors\\)"):
+    message = (
+        "center.*Recompute PCA"
+        if array_name == "center"
+        else "build_mapping_reference\\(neighbors\\)"
+    )
+    with pytest.raises(ValueError, match=message):
         load_artifact_mapping_reference(datastore, reference.ref)
+
+    replacement = datastore.build_mapping_reference(reference.neighbors)
+    assert replacement != reference.ref
+    restored = datastore.get_mapping_reference(replacement)
+    np.testing.assert_array_equal(restored.model.center, reference.model.center)
+
+
+def test_mapping_reference_rejects_source_pca_without_fitted_center(
+    analyzed_datastore_ephemeral,
+) -> None:
+    datastore = analyzed_datastore_ephemeral
+    reference = _plain_reference(datastore)
+    del artifact_group(datastore.zw, reference.reduction)["center"]
+
+    with pytest.raises(ValueError, match="no fitted center.*recompute PCA"):
+        datastore.get_mapping_reference(reference.ref)
+    with pytest.raises(ValueError, match="no fitted center.*Recompute PCA"):
+        datastore.build_mapping_reference(reference.neighbors)
 
 
 def test_load_rejects_versioned_metadata_and_bad_distance_summary(
@@ -357,6 +382,7 @@ def test_write_artifact_mapping_reference_persists_required_pca_arrays() -> None
         group,
         ScaledPCAProjectionModel(
             feature_means=np.zeros(2),
+            center=np.zeros_like(np.zeros(2)),
             feature_scales=np.ones(2),
             loadings=np.eye(2),
         ),
@@ -379,6 +405,7 @@ def test_write_artifact_mapping_reference_persists_required_pca_arrays() -> None
         "feature_ids",
         "feature_means",
         "feature_scales",
+        "center",
         "loadings",
         "reference_distance_quantiles",
         "reference_distance_values",
@@ -404,6 +431,7 @@ def test_write_artifact_mapping_reference_persists_symphony_state() -> None:
         group,
         ScaledPCAProjectionModel(
             feature_means=np.zeros(2),
+            center=np.zeros_like(np.zeros(2)),
             feature_scales=np.ones(2),
             loadings=np.eye(2),
         ),
@@ -425,6 +453,7 @@ def test_write_artifact_mapping_reference_persists_symphony_state() -> None:
         "feature_ids",
         "feature_means",
         "feature_scales",
+        "center",
         "loadings",
         "reference_distance_quantiles",
         "reference_distance_values",
@@ -456,6 +485,7 @@ def test_write_artifact_mapping_reference_rejects_high_rank_arrays() -> None:
             group,
             ScaledPCAProjectionModel(
                 feature_means=np.zeros(2),
+                center=np.zeros_like(np.zeros(2)),
                 feature_scales=np.ones(2),
                 loadings=np.eye(2),
             ),
@@ -481,6 +511,11 @@ def test_mapping_reference_source_validation_is_strict_and_semantic() -> None:
         data=np.ones(3, dtype=np.float64),
         chunks=(2,),
     )
+    center = root.create_array(
+        "center",
+        data=np.zeros(3, dtype=np.float64),
+        chunks=(2,),
+    )
     loadings = root.create_array(
         "loadings",
         data=np.ones((3, 2), dtype=np.float64),
@@ -490,6 +525,7 @@ def test_mapping_reference_source_validation_is_strict_and_semantic() -> None:
     assert validate_mapping_reference_sources(
         feature_means=means,
         feature_scales=scales,
+        center=center,
         loadings=loadings,
         symphony_sources=None,
     ) == (3, 2)
@@ -499,6 +535,7 @@ def test_mapping_reference_source_validation_is_strict_and_semantic() -> None:
         validate_mapping_reference_sources(
             feature_means=means,
             feature_scales=scales,
+            center=center,
             loadings=loadings,
             symphony_sources=None,
         )
@@ -513,6 +550,7 @@ def test_mapping_reference_source_validation_is_strict_and_semantic() -> None:
         validate_mapping_reference_sources(
             feature_means=means,
             feature_scales=scales,
+            center=center,
             loadings=float32_loadings,
             symphony_sources=None,
         )

@@ -2,16 +2,20 @@ import json
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import pytest
+import zarr
 
 from profiling import leiden_worker
 from profiling.config import StageResources, WorkflowParameters
 from profiling.stages import (
     _monitor_child_process,
     _run_leiden_in_subprocess,
+    discover_consume_inputs,
     run_stage,
 )
 from scarf.storage import ArtifactRef
+from scarf.storage.artifacts import artifact_path, make_provenance
 
 
 _GRAPH_REF = ArtifactRef(
@@ -26,6 +30,60 @@ _CLUSTER_REF = ArtifactRef(
     kind="cluster_labels",
     artifact_id="b" * 64,
 )
+
+
+@pytest.mark.parametrize(
+    "backends",
+    [
+        ("leidenalg",),
+        (None,),
+        ("igraph", "leidenalg"),
+        ("igraph", None),
+        ("igraph", "igraph"),
+    ],
+)
+def test_consume_requires_matching_leiden_backend(
+    tmp_path: Path, backends: tuple[str | None, ...]
+) -> None:
+    path = tmp_path / "clusters.zarr"
+    root = zarr.open_group(str(path), mode="w")
+    matching: list[ArtifactRef] = []
+    workflow = WorkflowParameters(leidenBackend="igraph")
+    for index, backend in enumerate(backends, start=1):
+        ref = ArtifactRef(
+            scope="assay",
+            assay="RNA",
+            kind="cluster_labels",
+            artifact_id=f"{index:064x}",
+        )
+        parameters = {
+            "resolution": workflow.leidenResolution,
+            "random_seed": workflow.leidenSeed,
+        }
+        if backend is not None:
+            parameters["backend"] = backend
+        group = root.create_group(artifact_path(ref))
+        group.create_array("values", data=np.array([1, 1, 2]))
+        group.attrs.update(
+            artifact_id=ref.artifact_id,
+            kind=ref.kind,
+            complete=True,
+            created_at_ns=index,
+            execution_options={},
+            provenance=make_provenance(
+                operation="run_leiden_clustering", parameters=parameters, inputs={}
+            ),
+        )
+        if backend == workflow.leidenBackend:
+            matching.append(ref)
+
+    if matching:
+        assert discover_consume_inputs(str(path), workflow, "makeBulkMean") == {
+            "clusters": matching[-1]
+        }
+    else:
+        with pytest.raises(ValueError, match="No Leiden cluster artifact matches"):
+            discover_consume_inputs(str(path), workflow, "makeBulkMean")
 
 
 def _resources() -> StageResources:

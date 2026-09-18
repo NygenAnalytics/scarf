@@ -90,7 +90,10 @@ def norm_clr(_: "Assay", counts: ChunkedArray) -> ChunkedArray:
     Returns: A chunked array (delayed matrix) containing normalized data.
     """
     f = np.exp(cast(NDArray[Any], np.log1p(counts).sum(axis=0)) / len(counts))
-    return cast(ChunkedArray, np.log1p(counts / f))
+    return cast(ChunkedArray, np.log1p(counts / f.reshape(1, -1)))
+
+
+norm_clr.artifact_identity = "scarf.assay.norm_clr:feature-axis"  # type: ignore[attr-defined]
 
 
 def norm_tf_idf(assay: "Assay", counts: ChunkedArray) -> ChunkedArray:

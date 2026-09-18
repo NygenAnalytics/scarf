@@ -235,6 +235,12 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
         scaling_group = artifact_group(self.zw, feature_scaling)
         feature_means = as_zarr_array(scaling_group["mean"], name="mean")
         feature_scales = as_zarr_array(scaling_group["scale"], name="scale")
+        if "center" not in reduction_group:
+            raise ValueError(
+                "Reference PCA has no fitted center. Recompute PCA and its "
+                "descendants before building a mapping reference."
+            )
+        center = as_zarr_array(reduction_group["center"], name="center")
         loadings = as_zarr_array(reduction_group["loadings"], name="loadings")
         if loadings.ndim != 2:
             raise ValueError("Reference PCA loadings have incompatible dimensions")
@@ -307,12 +313,14 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
         n_features, n_dims = validate_mapping_reference_sources(
             feature_means=feature_means,
             feature_scales=feature_scales,
+            center=center,
             loadings=loadings,
             symphony_sources=symphony_sources,
         )
         source_payload_fingerprint = mapping_reference_source_fingerprint(
             feature_means=feature_means,
             feature_scales=feature_scales,
+            center=center,
             loadings=loadings,
             symphony_sources=symphony_sources,
         )
@@ -379,6 +387,7 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
             "feature_ids",
             "feature_means",
             "feature_scales",
+            "center",
             "loadings",
             "reference_distance_quantiles",
             "reference_distance_values",
@@ -415,6 +424,7 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
                 _group,
                 feature_means=feature_means,
                 feature_scales=feature_scales,
+                center=center,
                 loadings=loadings,
                 symphony_sources=symphony_sources,
                 feature_ids=feature_ids,
@@ -444,6 +454,7 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
                 group,
                 feature_means=feature_means,
                 feature_scales=feature_scales,
+                center=center,
                 loadings=loadings,
                 symphony_sources=symphony_sources,
                 feature_ids=feature_ids,

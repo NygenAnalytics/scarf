@@ -102,6 +102,67 @@ def test_reduction_transform_keeps_cell_coordinates_lazy() -> None:
     assert 1 <= data.read_count <= 3
 
 
+@pytest.mark.parametrize("disable_scaling", [False, True])
+@pytest.mark.parametrize("fit_subset", [False, True])
+@pytest.mark.parametrize("block_size", [10, 30])
+def test_pca_projection_preserves_fitted_center_on_reload(
+    disable_scaling: bool, fit_subset: bool, block_size: int
+) -> None:
+    values = np.random.default_rng(31).normal(size=(30, 5))
+    values[15:] += np.array([4, 8, 2, 10, 6])
+    use_for_pca = np.arange(30) < (15 if fit_subset else 30)
+    arguments = dict(
+        data=ChunkedArray.from_numpy(values, block_size=block_size, nthreads=1),
+        method="pca",
+        dims=2,
+        use_for_pca=use_for_pca,
+        mu=values.mean(axis=0),
+        sigma=values.std(axis=0),
+        batch_size=block_size,
+        nthreads=1,
+        rand_state=4466,
+        disable_scaling=disable_scaling,
+        lsi_skip_first=False,
+        lsi_params={},
+    )
+    fitted = ReductionTransform(loadings=None, **arguments)
+    fit_values = values if disable_scaling else fitted.transform_z(values)
+    expected = (fit_values - fit_values[use_for_pca].mean(axis=0)) @ fitted.loadings
+
+    np.testing.assert_allclose(fitted.transform(values), expected, atol=1e-12)
+    np.testing.assert_allclose(
+        fitted.transform(values)[use_for_pca].mean(axis=0), 0, atol=1e-12
+    )
+    reloaded = ReductionTransform(
+        loadings=fitted.loadings, center=fitted.center, **arguments
+    )
+    np.testing.assert_allclose(reloaded.transform(values), expected, atol=1e-12)
+
+
+@pytest.mark.parametrize(
+    "center", [None, np.zeros(3), np.full(4, np.nan), np.full(4, np.inf)]
+)
+def test_reloading_pca_loadings_requires_valid_center(center) -> None:
+    values, loadings = _custom_inputs()
+    with pytest.raises(ValueError, match="PCA.*center"):
+        ReductionTransform(
+            data=ChunkedArray.from_numpy(values, block_size=4, nthreads=1),
+            method="pca",
+            dims=2,
+            loadings=loadings,
+            center=center,
+            use_for_pca=np.ones(values.shape[0], dtype=bool),
+            mu=values.mean(axis=0),
+            sigma=values.std(axis=0),
+            batch_size=4,
+            nthreads=1,
+            rand_state=4466,
+            disable_scaling=False,
+            lsi_skip_first=False,
+            lsi_params={},
+        )
+
+
 def test_lsi_persisted_loadings_are_not_sliced_again() -> None:
     values, loadings = _custom_inputs()
     reduction = ReductionTransform(

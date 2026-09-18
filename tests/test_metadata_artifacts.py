@@ -375,6 +375,39 @@ def test_leiden_backend_is_part_of_artifact_identity(datastore_ephemeral) -> Non
         )
 
 
+def test_leiden_does_not_reuse_artifacts_without_edge_weighting(datastore_ephemeral):
+    datastore = datastore_ephemeral
+    graph = _ensure_graph(datastore)
+    prepared = datastore._prepare_leiden_clustering(graph)
+    provenance = prepared.planned.provenance
+    parameters = dict(provenance["parameters"])
+    assert parameters.pop("edge_weighting") == "graph"
+    selection = ArtifactRef.from_dict(provenance["inputs"]["cell_selection"])
+    previous = plan_cell_data_artifact(
+        datastore.zw,
+        scope="assay",
+        assay="RNA",
+        kind="cluster_labels",
+        operation="run_leiden_clustering",
+        parameters=parameters,
+        inputs=provenance["inputs"],
+        execution_options={},
+        cell_selection=selection,
+        arrays={"values": ((prepared.n_cells,), "i")},
+    )
+    write_cell_data_artifact(
+        datastore.zw,
+        previous,
+        {"values": np.full(prepared.n_cells, -1, dtype=np.int64)},
+    )
+
+    actual = datastore.run_leiden_clustering(graph)
+
+    assert actual != previous.ref
+    assert np.all(artifact_group(datastore.zw, actual)["values"][:] > 0)
+    assert datastore.run_leiden_clustering(graph) == actual
+
+
 def test_membership_smart_labels_and_lisi_are_artifact_only(
     datastore_ephemeral,
 ) -> None:

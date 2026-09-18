@@ -44,6 +44,7 @@ def _ref(
 def _model() -> ScaledPCAProjectionModel:
     return ScaledPCAProjectionModel(
         feature_means=np.array([0.0, 1.0]),
+        center=np.zeros_like(np.array([0.0, 1.0])),
         feature_scales=np.array([1.0, 2.0]),
         loadings=np.eye(2),
     )
@@ -1007,10 +1008,12 @@ def test_mapping_artifact_writer_contract_edges(monkeypatch) -> None:
 
     means = _array(root, "means", np.array([0.0, 1.0]))
     scales = _array(root, "scales", np.array([1.0, 2.0]))
+    center = _array(root, "center", np.zeros(2))
     loadings = _array(root, "loadings", np.eye(2))
     common = {
         "feature_means": means,
         "feature_scales": scales,
+        "center": center,
         "loadings": loadings,
         "feature_ids": np.array(["g0", "g1"]),
         "reference_distance_quantiles": np.array([0.0, 1.0]),
@@ -1089,12 +1092,14 @@ def test_mapping_artifact_source_validation_edges(monkeypatch) -> None:
     root = _root()
     means = _array(root, "means", np.zeros(2))
     scales = _array(root, "scales", np.ones(2))
+    center = _array(root, "center", np.zeros(2))
     loadings = _array(root, "loadings", np.eye(2))
 
     with pytest.raises(ValueError, match="incompatible dimensions"):
         mapping_artifact.validate_mapping_reference_sources(
             feature_means=means,
             feature_scales=scales,
+            center=center,
             loadings=means,
             symphony_sources=None,
         )
@@ -1102,6 +1107,7 @@ def test_mapping_artifact_source_validation_edges(monkeypatch) -> None:
         mapping_artifact.validate_mapping_reference_sources(
             feature_means=means,
             feature_scales=scales,
+            center=center,
             loadings=loadings,
             symphony_sources={"centroids": loadings},
         )
@@ -1109,6 +1115,7 @@ def test_mapping_artifact_source_validation_edges(monkeypatch) -> None:
         mapping_artifact.validate_mapping_reference_sources(
             feature_means=means,
             feature_scales=scales,
+            center=center,
             loadings=loadings,
             symphony_sources=_symphony_sources(
                 root,
@@ -1120,6 +1127,7 @@ def test_mapping_artifact_source_validation_edges(monkeypatch) -> None:
         mapping_artifact.validate_mapping_reference_sources(
             feature_means=means,
             feature_scales=scales,
+            center=center,
             loadings=loadings,
             symphony_sources=_symphony_sources(
                 root,
@@ -1133,6 +1141,7 @@ def test_mapping_artifact_source_validation_edges(monkeypatch) -> None:
         mapping_artifact.validate_mapping_reference_sources(
             feature_means=means,
             feature_scales=scales,
+            center=center,
             loadings=loadings,
             symphony_sources=invalid,
         )
@@ -1141,6 +1150,7 @@ def test_mapping_artifact_source_validation_edges(monkeypatch) -> None:
         mapping_artifact.mapping_reference_source_fingerprint(
             feature_means=means,
             feature_scales=scales,
+            center=center,
             loadings=loadings,
             symphony_sources={"centroids": loadings},
         )
@@ -1211,6 +1221,7 @@ def test_mapping_artifact_payload_matching_and_contract_helpers(monkeypatch) -> 
     group["feature_ids"] = _FakeArray(np.array(["g0", "g1"]))
     group["feature_means"] = _FakeArray(model.feature_means)
     group["feature_scales"] = _FakeArray(model.feature_scales)
+    group["center"] = _FakeArray(model.center)
     group["loadings"] = _FakeArray(model.loadings)
     group["reference_distance_quantiles"] = _FakeArray(quantiles)
     group["reference_distance_values"] = _FakeArray(distances)
@@ -1241,6 +1252,7 @@ def test_mapping_artifact_payload_matching_and_contract_helpers(monkeypatch) -> 
     symphony_group["feature_ids"] = _FakeArray(np.array(["g0", "g1"]))
     symphony_group["feature_means"] = _FakeArray(model.feature_means)
     symphony_group["feature_scales"] = _FakeArray(model.feature_scales)
+    symphony_group["center"] = _FakeArray(model.center)
     symphony_group["loadings"] = _FakeArray(model.loadings)
     symphony_group["reference_distance_quantiles"] = _FakeArray(quantiles)
     symphony_group["reference_distance_values"] = _FakeArray(distances)
@@ -1285,6 +1297,7 @@ def test_mapping_artifact_payload_matching_and_contract_helpers(monkeypatch) -> 
         symphony_group,
         feature_means=symphony_group["feature_means"],
         feature_scales=symphony_group["feature_scales"],
+        center=symphony_group["center"],
         loadings=symphony_group["loadings"],
         symphony_sources={"centroids": symphony_group["centroids"]},
         feature_ids=np.array(["g0", "g1"]),

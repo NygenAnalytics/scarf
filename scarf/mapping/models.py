@@ -21,11 +21,13 @@ def _immutable_array(values: np.ndarray) -> np.ndarray:
 class ScaledPCAProjectionModel:
     feature_means: np.ndarray
     feature_scales: np.ndarray
+    center: np.ndarray
     loadings: np.ndarray
 
     def __post_init__(self) -> None:
         feature_means = np.asarray(self.feature_means)
         feature_scales = np.asarray(self.feature_scales)
+        center = np.asarray(self.center)
         loadings = np.asarray(self.loadings)
         if loadings.ndim != 2:
             raise ValueError("Reference PCA loadings must be two-dimensional")
@@ -34,11 +36,14 @@ class ScaledPCAProjectionModel:
             raise ValueError("Reference feature means have incompatible dimensions")
         if feature_scales.shape != (n_features,):
             raise ValueError("Reference feature scales have incompatible dimensions")
+        if center.shape != (n_features,):
+            raise ValueError("Reference PCA center has incompatible dimensions")
         if np.any(feature_scales <= 0):
             raise ValueError("Reference feature scales must be positive")
         for values in (
             feature_means,
             feature_scales,
+            center,
             loadings,
         ):
             if not np.all(np.isfinite(values)):
@@ -47,6 +52,7 @@ class ScaledPCAProjectionModel:
                 )
         object.__setattr__(self, "feature_means", _immutable_array(feature_means))
         object.__setattr__(self, "feature_scales", _immutable_array(feature_scales))
+        object.__setattr__(self, "center", _immutable_array(center))
         object.__setattr__(self, "loadings", _immutable_array(loadings))
 
     @property

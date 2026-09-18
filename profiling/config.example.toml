@@ -250,3 +250,45 @@ scarfMemoryBudget = 12884901888
 workers = 4
 timeoutSeconds = 3600
 ephemeralDiskMb = 524288
+
+# Consume stages reuse an existing store. Same 8 CPU / 32 GiB pin as the
+# 1M createStore / writeCountsT / markHvgs / findMarkers envelope.
+[stageResources.makeBulkMean]
+modalMemoryRequestMb = 32768
+modalMemoryLimitMb = 32768
+modalCpuRequest = 8.0
+modalCpuLimit = 8.0
+scarfMemoryBudget = 25769803776
+workers = 8
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.makeBulkSum]
+modalMemoryRequestMb = 32768
+modalMemoryLimitMb = 32768
+modalCpuRequest = 8.0
+modalCpuLimit = 8.0
+scarfMemoryBudget = 25769803776
+workers = 8
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.runDoublets]
+modalMemoryRequestMb = 32768
+modalMemoryLimitMb = 32768
+modalCpuRequest = 8.0
+modalCpuLimit = 8.0
+scarfMemoryBudget = 25769803776
+workers = 8
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.runDoubletsRatio01]
+modalMemoryRequestMb = 32768
+modalMemoryLimitMb = 32768
+modalCpuRequest = 8.0
+modalCpuLimit = 8.0
+scarfMemoryBudget = 25769803776
+workers = 8
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288

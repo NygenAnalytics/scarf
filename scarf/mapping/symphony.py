@@ -20,7 +20,9 @@ def project_pca(values: np.ndarray, model: ScaledPCAProjectionModel) -> np.ndarr
         raise ValueError(
             f"Expected query matrix with {model.n_features} features, got {values.shape}"
         )
-    projected = ((values - model.feature_means) / model.feature_scales) @ model.loadings
+    projected = (
+        (values - model.feature_means) / model.feature_scales - model.center
+    ) @ model.loadings
     if not np.all(np.isfinite(projected)):
         raise ValueError("PCA projection produced non-finite values")
     return cast(np.ndarray, projected)

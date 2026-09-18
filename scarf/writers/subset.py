@@ -1,4 +1,3 @@
-import os
 from typing import Any
 
 import numpy as np
@@ -12,29 +11,17 @@ from ..storage.layout import count_array_spec
 from ..storage.profiles import (
     StorageProfile,
     ZarrLocation,
-    is_local_zarr_path,
     resolve_storage_profile,
 )
 from ..storage.schema import create_zarr_count_assay
 from ..storage.sharding import write_dense_in_shard_rows
-from ..storage.stores import load_zarr
+from ..storage.stores import load_zarr, zarr_location_has_content
 from ..utils.logging import logger
 
 
-def _source_assay_types(assay: Any, _in_workspace: str | None = None) -> dict[str, str]:
-    """Read persisted ``assayTypes`` from the source store when available.
-
-    ``assay.z`` is the assay group. For legacy stores its parent is the Zarr
-    root; for workspace stores the parent is the workspace group. Both places
-    hold ``assayTypes``.
-    """
-    try:
-        parent = assay.z.parent
-    except Exception:
-        return {}
-    if parent is None:
-        return {}
-    raw = parent.attrs.get("assayTypes", {})
+def _source_assay_types(assay: Any) -> dict[str, str]:
+    """Read persisted assay types from the source root or workspace."""
+    raw = assay._artifact_root.attrs.get("assayTypes", {})
     if isinstance(raw, dict):
         return {str(k): str(v) for k, v in raw.items()}
     return {}
@@ -87,7 +74,7 @@ def subset_assay_zarr(
     spec = count_array_spec(
         len(cells_idx),
         len(feat_idx),
-        dtype="uint32",
+        dtype=ig.dtype,
         profile=resolved_profile,
         policy=policy,
     )
@@ -158,6 +145,8 @@ class SubsetZarr:
         self.inWorkspace = in_workspace
         self.outWorkspace = out_workspace
         self.storage_options = storage_options
+        self.assays = self._check_assays(assays)
+        self.cellIdx = self._check_idx(cell_key, cell_idx)
         assay_resources = [
             assay.resources for assay in assays if hasattr(assay, "resources")
         ]
@@ -185,15 +174,10 @@ class SubsetZarr:
         self.policy = policy
         self.io = io
         self.z = self._check_files(zarr_loc)
-        self.assays = self._check_assays(assays)
-        self.cellIdx = self._check_idx(cell_key, cell_idx)
 
     def _check_files(self, zarr_loc: ZarrLocation) -> zarr.Group:
-        if (
-            is_local_zarr_path(zarr_loc)
-            and isinstance(zarr_loc, str)
-            and os.path.isdir(zarr_loc)
-            and self.overFn is False
+        if self.overFn is False and zarr_location_has_content(
+            zarr_loc, storage_options=self.storage_options
         ):
             raise ValueError(
                 f"Zarr file with name: {zarr_loc} already exists.\n"
@@ -333,27 +317,23 @@ class SubsetZarr:
                 resources=self.resources,
                 io=self.io,
             )
-            from ..assay.classification import (
-                is_rna_assay_type,
-                lookup_persisted_assay_type,
-            )
+            from ..assay.classification import lookup_persisted_assay_type
             from .counts_t import finalize_writer_counts_t
 
-            if is_rna_assay_type(assay):
-                source_types = _source_assay_types(assay, self.inWorkspace)
-                finalize_writer_counts_t(
-                    self.z,
+            source_types = _source_assay_types(assay)
+            finalize_writer_counts_t(
+                self.z,
+                assay.name,
+                self.outWorkspace,
+                assay_type=lookup_persisted_assay_type(
                     assay.name,
-                    self.outWorkspace,
-                    assay_type=lookup_persisted_assay_type(
-                        assay.name,
-                        source_types,
-                    ),
-                    resources=self.resources,
-                    profile=self.profile,
-                    policy=self.policy,
-                    io=self.io,
-                )
+                    source_types,
+                ),
+                resources=self.resources,
+                profile=self.profile,
+                policy=self.policy,
+                io=self.io,
+            )
         logger.info(
             f"Wrote a subset of {len(self.cellIdx)} cells across "
             f"{len(self.assays)} assay(s)"

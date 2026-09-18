@@ -72,6 +72,18 @@ def test_leiden_membership_preserves_disconnected_partitions(backend):
     assert adjusted_rand_score([1, 1, 1, 1, 2, 2, 2, 2], actual) == pytest.approx(1.0)
 
 
+@pytest.mark.parametrize("backend", ["igraph", "leidenalg"])
+def test_leiden_membership_uses_edge_weights(backend):
+    weights = np.full((8, 8), 0.001)
+    weights[:4, :4] = 1.0
+    weights[4:, 4:] = 1.0
+    np.fill_diagonal(weights, 0)
+
+    actual = leiden_membership(csr_matrix(weights), 1.0, 11, backend)
+
+    assert adjusted_rand_score([0, 0, 0, 0, 1, 1, 1, 1], actual) == 1.0
+
+
 def test_native_leiden_membership_is_seeded_and_repeatable():
     graph = _simple_knn_graph(100)
 
@@ -93,7 +105,8 @@ def test_leiden_membership_rejects_unknown_backend():
         )
 
 
-def test_igraph_leiden_ignores_explicit_zero_weight_edges():
+@pytest.mark.parametrize("backend", ["igraph", "leidenalg"])
+def test_leiden_ignores_explicit_zero_weight_edges(backend):
     solid = _grouped_knn_graph([[0, 1, 2, 3], [4, 5, 6, 7]]).tocoo()
     padded = coo_matrix(
         (
@@ -108,8 +121,12 @@ def test_igraph_leiden_ignores_explicit_zero_weight_edges():
 
     assert np.count_nonzero(padded.data) != padded.nnz
 
-    actual = leiden_membership(padded, resolution=1.0, random_seed=4444)
-    expected = leiden_membership(solid, resolution=1.0, random_seed=4444)
+    actual = leiden_membership(
+        padded, resolution=1.0, random_seed=4444, backend=backend
+    )
+    expected = leiden_membership(
+        solid, resolution=1.0, random_seed=4444, backend=backend
+    )
 
     np.testing.assert_array_equal(actual, expected)
 

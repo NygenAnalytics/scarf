@@ -26,6 +26,10 @@ StageName = Literal[
     "findMarkers",
     "importClusters",
     "validateExperiment",
+    "makeBulkMean",
+    "makeBulkSum",
+    "runDoublets",
+    "runDoubletsRatio01",
 ]
 
 GRAPH_CONSTRUCTION_STAGE_ORDER: tuple[StageName, ...] = (
@@ -78,8 +82,16 @@ SELECTED_STAGE_DEPENDENCIES: dict[StageName, tuple[StageName, ...]] = {
     "validateExperiment": ("runPca", "findMarkers"),
 }
 
+CONSUME_STAGE_ORDER: tuple[StageName, ...] = (
+    "makeBulkMean",
+    "makeBulkSum",
+    "runDoublets",
+    "runDoubletsRatio01",
+)
+CONSUME_STAGES = frozenset(CONSUME_STAGE_ORDER)
+
 ALL_STAGE_CHOICES: tuple[StageName, ...] = tuple(
-    dict.fromkeys((*CORE_STAGE_ORDER, *SELECTED_STAGE_ORDER))
+    dict.fromkeys((*CORE_STAGE_ORDER, *SELECTED_STAGE_ORDER, *CONSUME_STAGE_ORDER))
 )
 
 
@@ -88,6 +100,9 @@ def validate_requested_stages(stages: tuple[StageName, ...]) -> None:
         raise ValueError("stages must not be empty")
     if len(set(stages)) != len(stages):
         raise ValueError("stages must be unique")
+    stages = tuple(stage for stage in stages if stage not in CONSUME_STAGES)
+    if not stages:
+        return
     selected = set(stages)
     positions = {stage: index for index, stage in enumerate(stages)}
     core_set = set(CORE_STAGE_ORDER)
@@ -311,6 +326,8 @@ class ProfilingConfig(BaseModel):
     # When set, stage jobs read/write this store instead of stores/{runTag}/...
     # Useful for consume A/B runs against an existing store with a fresh result tag.
     storeUriOverride: str | None = None
+    # Per-size existing stores for consume stages. Wins over storeUriOverride.
+    storeUriBySize: dict[int, str] = Field(default_factory=dict)
     countMatrix: CountMatrixConfig | None = None
     storageIo: StorageIoConfig | None = None
     clusterSources: tuple[ClusterSourceRef, ...] = ()
@@ -328,6 +345,18 @@ class ProfilingConfig(BaseModel):
     def effectiveStages(self) -> tuple[StageName, ...]:
         return self.stages if self.stages is not None else CORE_STAGE_ORDER
 
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_store_uri_by_size(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        raw = data.get("storeUriBySize")
+        if not isinstance(raw, dict):
+            return data
+        payload = dict(data)
+        payload["storeUriBySize"] = {int(key): value for key, value in raw.items()}
+        return payload
+
     @model_validator(mode="after")
     def _check_config(self) -> Self:
         if self.modalEnvironmentName != "scarf_profiling":
@@ -337,17 +366,11 @@ class ProfilingConfig(BaseModel):
         if not self.resultsUri.startswith("s3://"):
             raise ValueError("resultsUri must be an s3:// URI")
         if self.storeUriOverride is not None:
-            override = self.storeUriOverride.strip()
-            if not override:
-                raise ValueError("storeUriOverride must be non-empty when set")
-            if not (
-                override.startswith("s3://")
-                or override.startswith("/")
-                or override.startswith("file://")
-            ):
-                raise ValueError(
-                    "storeUriOverride must be an s3:// URI or a local filesystem path"
-                )
+            _require_store_uri(self.storeUriOverride, "storeUriOverride")
+        for n_rows, uri in self.storeUriBySize.items():
+            if n_rows <= 0:
+                raise ValueError("storeUriBySize keys must be positive")
+            _require_store_uri(uri, f"storeUriBySize[{n_rows}]")
         if "/" in self.runTag or "\\" in self.runTag or self.runTag in {".", ".."}:
             raise ValueError("runTag must be a single path segment")
         if not self.targetSizes:
@@ -385,6 +408,9 @@ class ProfilingConfig(BaseModel):
         return base
 
     def storeUri(self, nRows: int) -> str:
+        sized = self.storeUriBySize.get(nRows)
+        if sized is not None:
+            return sized.rstrip("/")
         if self.storeUriOverride is not None:
             return self.storeUriOverride.rstrip("/")
         return f"{self._tagged_prefix('stores')}/{nRows}.zarr"
@@ -436,6 +462,19 @@ def bind_cluster_source(config: ProfilingConfig, nRows: int) -> WorkflowParamete
             "clusterSourceArtifactId": source.artifactId,
         }
     )
+
+
+def _require_store_uri(uri: str, name: str) -> str:
+    value = uri.strip()
+    if not value:
+        raise ValueError(f"{name} must be non-empty when set")
+    if not (
+        value.startswith("s3://")
+        or value.startswith("/")
+        or value.startswith("file://")
+    ):
+        raise ValueError(f"{name} must be an s3:// URI or a local filesystem path")
+    return value
 
 
 def _normalize_raw_config(raw: dict[str, Any]) -> dict[str, Any]:

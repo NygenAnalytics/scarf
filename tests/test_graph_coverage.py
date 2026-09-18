@@ -990,6 +990,7 @@ def test_integrate_assays_persists_exact_sources(
         "resolve_native_graph_inputs",
         lambda _root, source: SimpleNamespace(
             coordinates=coordinate_by_source[source],
+            reduction=coordinate_by_source[source],
             cell_selection=selection,
         ),
     )
@@ -1469,6 +1470,7 @@ def test_wnn_input_helpers_fail_before_integration_compute(
         "scarf.datastore._operations.graph.resolve_native_graph_inputs",
         lambda _root, source: SimpleNamespace(
             coordinates=coordinates_by_assay[source.assay],
+            reduction=coordinates_by_assay[source.assay],
             cell_selection=selection,
         ),
     )
@@ -1537,6 +1539,57 @@ def test_wnn_input_helpers_fail_before_integration_compute(
             stored_paths(store.zw),
         ) == before
         assert "integratedGraphs" not in store.zw
+
+
+def test_wnn_rejects_missing_pca_center_before_reusing_cached_graph() -> None:
+    from scarf.storage.schema import create_zarr_count_assay
+    from scarf.writers import SparseToZarr
+    from scarf.writers.counts_t import finalize_writer_counts_t
+
+    rng = np.random.default_rng(223)
+    counts = rng.integers(1, 30, size=(12, 5), dtype=np.uint16)
+    source = MemoryStore()
+    writer = SparseToZarr(
+        csr_matrix(counts),
+        source,
+        cell_ids=[f"c{i}" for i in range(12)],
+        feature_ids=[f"g{i}" for i in range(5)],
+        nthreads=1,
+    )
+    writer.dump()
+    adt_counts = create_zarr_count_assay(
+        z=writer.z,
+        assay_name="ADT",
+        workspace=None,
+        n_cells=12,
+        feat_ids=[f"p{i}" for i in range(5)],
+        feat_names=[f"p{i}" for i in range(5)],
+        dtype="uint16",
+    )
+    adt_counts[:] = rng.integers(1, 30, size=(12, 5), dtype=np.uint16)
+    finalize_writer_counts_t(writer.z, "ADT", None, nthreads=1)
+    store = DataStore(source, default_assay="RNA", min_features_per_cell=0, nthreads=1)
+    cells = store.snapshot_cell_selection()
+    neighbors = []
+    reductions = []
+    for assay_name in ("RNA", "ADT"):
+        features = store.select_all_features(from_assay=assay_name)
+        normalized = store.run_normalization(cells, features)
+        reduction = store.run_pca(normalized, dims=2)
+        reductions.append(reduction)
+        neighbors.append(store.query_neighbors(store.build_ann_index(reduction), k=3))
+    integrated = store.integrate_assays(neighbors)
+    assert store.integrate_assays(neighbors) == integrated
+    before = list_artifacts(store.zw, scope="datastore", kind="integrated_graph")
+    del store.zw[artifact_path(reductions[-1])]["center"]
+
+    for invalidate_cache in (False, True):
+        with pytest.raises(ValueError, match="PCA artifact has no fitted center"):
+            store.integrate_assays(neighbors, invalidate_cache=invalidate_cache)
+
+    assert (
+        list_artifacts(store.zw, scope="datastore", kind="integrated_graph") == before
+    )
 
 
 def test_artifact_ann_stream_rejects_detached_ref_before_lineage_load(
