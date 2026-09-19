@@ -4,12 +4,13 @@ from typing import Any, Literal
 
 import h5py
 import numpy as np
-from scipy.sparse import coo_matrix, csc_matrix, csr_matrix
+from scipy.sparse import coo_matrix, csr_matrix
 
 from ..utils.logging import logger
 from ..utils.progress import iter_progress
 from ._assay_names import auto_name_feat_table, make_feat_table_from_types
 from ._h5ad_inspect import H5adInspectResult, _as_text, inspect_h5ad as inspect_h5ad
+from ._sparse import SparseRowStore
 
 # AnnData writes a column as a group when it needs more than one array: a
 # categorical needs codes with categories, a pandas nullable dtype needs values
@@ -103,7 +104,7 @@ class H5adReader:
             self.matrixKey: self._validate_group(self.matrixKey),
         }
         self.matrixOrientation = self._validate_sparse_matrix()
-        self._convertedCsr: csr_matrix | None = None
+        self._convertedCsr: SparseRowStore | None = None
         self._indptrCache: np.ndarray | None = None
         self._cumulativeRowNnz: np.ndarray | None = None
         self.nCells, self.nFeatures = (
@@ -154,6 +155,12 @@ class H5adReader:
         if self._cumulativeRowNnz is not None:
             clone._cumulativeRowNnz = self._cumulativeRowNnz
         return clone
+
+    def close(self) -> None:
+        self.h5.close()
+        self._convertedCsr = None
+        self._indptrCache = None
+        self._cumulativeRowNnz = None
 
     @classmethod
     def from_inspect(
@@ -861,53 +868,20 @@ class H5adReader:
         return storage_dtype
 
     def csc_conversion_peak_bytes(self) -> int:
-        """Return a conservative peak estimate for one CSC to CSR conversion."""
+        """Return the default bounded CSC conversion workspace."""
         if self.matrixOrientation != "csc":
             return 0
         group = self.h5[self.matrixKey]
         if not isinstance(group, h5py.Group):
             raise TypeError("CSC matrix slot must be an HDF5 group")
-        data_node = group["data"]
-        indices_node = group["indices"]
-        indptr_node = group["indptr"]
-        source = sum(
-            int(dataset.size) * int(dataset.dtype.itemsize)
-            for dataset in (data_node, indices_node, indptr_node)
-        )
-        index_itemsize = int(indices_node.dtype.itemsize)
-        if (
-            max(self.nCells, self.nFeatures, int(data_node.size))
-            <= np.iinfo(np.int32).max
-        ):
-            index_itemsize = np.dtype("int32").itemsize
-        normalized = (
-            int(data_node.size) * np.dtype(self.storageDtype).itemsize
-            + int(indices_node.size) * index_itemsize
-            + int(indptr_node.size) * index_itemsize
-        )
-        canonical_value_itemsize = max(
-            int(data_node.dtype.itemsize),
-            np.dtype(np.int64).itemsize,
-        )
-        canonicalization = int(data_node.size) * (
-            4 * canonical_value_itemsize + 6 * np.dtype(np.int64).itemsize + 4
-        )
-        destination = (
-            int(data_node.size)
-            * (np.dtype(self.storageDtype).itemsize + index_itemsize)
-            + (self.nCells + 1) * index_itemsize
-        )
-        return int(source + normalized + canonicalization + destination)
+        metadata = (self.nCells + 1) * 32 + (self.nFeatures + 1) * 8
+        return metadata + min(64 * 1024 * 1024, max(1, int(group["data"].size)) * 384)
 
     def materialized_csr_bytes(self) -> int:
         """Return bytes retained by the materialized CSC-to-CSR conversion."""
         if self._convertedCsr is None:
             return 0
-        return int(
-            self._convertedCsr.data.nbytes
-            + self._convertedCsr.indices.nbytes
-            + self._convertedCsr.indptr.nbytes
-        )
+        return int(self._convertedCsr.indptr.nbytes)
 
     def _csr_indptr(self) -> np.ndarray | None:
         if self.matrixOrientation == "dense":
@@ -976,35 +950,47 @@ class H5adReader:
         normalized_itemsize = np.dtype(np.int32).itemsize
         return int((rows + 1) * (2 * itemsize + normalized_itemsize))
 
-    def materialize_csc(self) -> None:
-        """Convert the complete CSC source to CSR once."""
-        from ..utils.arrays import canonicalize_sparse
-
+    def materialize_csc(self, maxBytes: int = 64 * 1024 * 1024) -> None:
+        """Convert CSC into temporary row storage in bounded blocks."""
         if self.matrixOrientation != "csc" or self._convertedCsr is not None:
             return
         group = self.h5[self.matrixKey]
         if not isinstance(group, h5py.Group):
             raise TypeError("CSC matrix slot must be an HDF5 group")
         data_node = group["data"]
-        data = np.asarray(data_node[:])
-        indices = np.asarray(group["indices"][:])
-        indptr = np.asarray(group["indptr"][:])
-        if max(self.nCells, self.nFeatures, data.size) <= np.iinfo(np.int32).max:
-            indices = indices.astype(np.int32, copy=False)
-            indptr = indptr.astype(np.int32, copy=False)
+        metadata = (self.nCells + 1) * 32 + (self.nFeatures + 1) * 8
+        if maxBytes < metadata + 384:
+            raise MemoryError("CSC row conversion exceeds the memory limit")
+        chunk_nnz = min(1024 * 1024, (maxBytes - metadata) // 384)
+        indptr = np.asarray(group["indptr"][:], dtype=np.int64)
+        shape = (self.nCells, self.nFeatures)
 
-        source = csc_matrix(
-            (data, indices, indptr),
-            shape=(self.nCells, self.nFeatures),
-        )
-        canonical = canonicalize_sparse(
-            source.tocoo(copy=False),
+        def chunks() -> Iterator[coo_matrix]:
+            for start in range(0, int(data_node.size), chunk_nnz):
+                stop = min(int(data_node.size), start + chunk_nnz)
+                columns = (
+                    np.searchsorted(
+                        indptr, np.arange(start, stop, dtype=np.int64), side="right"
+                    )
+                    - 1
+                )
+                yield coo_matrix(
+                    (
+                        np.asarray(data_node[start:stop]),
+                        (np.asarray(group["indices"][start:stop]), columns),
+                    ),
+                    shape=shape,
+                )
+
+        self._convertedCsr = SparseRowStore(
+            chunks,
+            shape,
             self.storageDtype,
+            source_dtype=data_node.dtype,
+            max_bytes=maxBytes - indptr.nbytes,
         )
-        self._convertedCsr = canonical.tocsr()
         logger.debug(
-            f"Materialized H5AD CSR matrix for conversion with "
-            f"dtype={self.storageDtype}"
+            f"Prepared H5AD row storage for conversion with dtype={self.storageDtype}"
         )
 
     def consume_group(
@@ -1052,7 +1038,7 @@ class H5adReader:
         row_start: int = 0,
         row_end: int | None = None,
     ) -> Generator[coo_matrix, None, None]:
-        """Convert the complete CSC matrix once before yielding row batches."""
+        """Yield row batches from the temporary CSC conversion."""
         if self._convertedCsr is None:
             self.materialize_csc()
         if self._convertedCsr is None:
@@ -1061,7 +1047,7 @@ class H5adReader:
         stop = int(self.nCells if row_end is None else row_end)
         for offset in range(start, stop, batch_size):
             end = min(offset + batch_size, stop)
-            yield self._convertedCsr[offset:end].tocoo(copy=False)
+            yield self._convertedCsr.read(offset, end).tocoo(copy=False)
 
     def consume_row_range(
         self,

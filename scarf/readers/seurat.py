@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, overload
 
 import numpy as np
@@ -762,6 +763,10 @@ class _OwnedMatrixSource:
 
     def read_cells(self, start: int, stop: int) -> MatrixBlock:
         self._ensure_open()
+        if 0 <= start < stop <= self._source.shape[1]:
+            from ._seurat.sources import prepare_matrix_sources
+
+            prepare_matrix_sources(self._source)
         return self._source.read_cells(start, stop)
 
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
@@ -2061,7 +2066,16 @@ class SeuratReader:
             raise RdsClosedError("RDS document is closed", path="$")
 
     def close(self) -> None:
+        from ._seurat.sources import release_temporary_storage
+
+        for assay in self._assayModels.values():
+            release_temporary_storage(assay.counts)
         self._document.close()
+
+    def _prepare_assay(self, name: str, max_bytes: int) -> None:
+        from ._seurat.sources import prepare_matrix_sources
+
+        prepare_matrix_sources(self.get_assay(name).counts, max_bytes=max_bytes)
 
     def __enter__(self) -> "SeuratReader":
         self._ensure_open()
@@ -2709,6 +2723,13 @@ class SeuratReader:
             else:
                 assay = self._build_legacy_assay(name, node)
             self._assayModels[name] = assay
+            from ._seurat.sources import BaseMatrixSource, _matrix_sources
+
+            for matrix in _matrix_sources(assay.counts):
+                if isinstance(matrix, BaseMatrixSource):
+                    matrix._tempDir = (
+                        None if self._scratchDir is None else Path(self._scratchDir)
+                    )
             source = getattr(assay.counts, "_source", assay.counts)
             estimate = assay.counts.estimate_read_memory(
                 0,

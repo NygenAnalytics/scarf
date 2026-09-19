@@ -943,6 +943,7 @@ def test_reader_implementations_are_runtime_isolated():
     required_files = {
         "__init__.py",
         "_text.py",
+        "_sparse.py",
         "cellranger.py",
         "csv.py",
         "h5ad.py",
@@ -968,7 +969,11 @@ def test_reader_implementations_are_runtime_isolated():
     reader_edges = {
         "readers.cellranger": {"readers.mtx"},
         "readers.mtx": {"readers.cellranger"},
-        "readers.seurat": {"readers._rds", "readers._seurat"},
+        "readers.seurat": {
+            "readers._rds",
+            "readers._seurat",
+            "readers._seurat.sources",
+        },
     }
     format_names = {name.rsplit(".", 1)[-1] for name in format_modules}
     implementation_paths = [
@@ -1010,7 +1015,7 @@ def test_reader_implementations_are_runtime_isolated():
             allowed_reader_imports.update({"readers._assay_names", "readers.read_file"})
         elif path.name == "h5ad.py":
             allowed_reader_imports.update(
-                {"readers._assay_names", "readers._h5ad_inspect"}
+                {"readers._assay_names", "readers._h5ad_inspect", "readers._sparse"}
             )
         assert not {
             module_name

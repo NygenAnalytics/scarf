@@ -1,7 +1,7 @@
 import math
 import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -42,21 +42,19 @@ def _unpack_bp128_block(
         raise MatrixSourceError(
             f"BP128 block has {packed.size} words; expected {expected}"
         )
-    output: NDArray[np.uint32] = np.zeros(128, dtype=np.uint32)
     if bits == 0:
-        return output
+        return np.zeros(128, dtype=np.uint32)
     vectors = packed.reshape(bits, 4).astype(np.uint64)
     mask = np.uint64(0xFFFFFFFF if bits == 32 else (1 << bits) - 1)
-    for vector_index in range(32):
-        bit_position = vector_index * bits
-        word_index = bit_position // 32
-        shift = bit_position & 31
-        values = vectors[word_index] >> np.uint64(shift)
-        if shift + bits > 32:
-            values |= vectors[word_index + 1] << np.uint64(32 - shift)
-        output[vector_index * 4 : vector_index * 4 + 4] = (values & mask).astype(
-            np.uint32
-        )
+    positions = np.arange(32, dtype=np.uint64) * np.uint64(bits)
+    word_indexes = positions // np.uint64(32)
+    shifts = (positions & np.uint64(31))[:, None]
+    values = vectors[word_indexes] >> shifts
+    crossing = (shifts[:, 0] + np.uint64(bits)) > 32
+    values[crossing] |= vectors[word_indexes[crossing] + 1] << (
+        np.uint64(32) - shifts[crossing]
+    )
+    output: NDArray[np.uint32] = (values & mask).astype(np.uint32).reshape(-1)
     return output
 
 
@@ -670,18 +668,6 @@ class _StoredBP128Array:
         boundaries = self.indexOffsets[1:-1]
         return int(np.searchsorted(boundaries, position, side="right")) << 32
 
-    def _expanded_idx_pair(self, block: int) -> tuple[int, int]:
-        raw = self.store.read_numeric(f"{self.prefix}_idx", block, block + 2).astype(
-            np.uint64, copy=False
-        )
-        first = int(raw[0]) + self._idx_high(block)
-        second = int(raw[1]) + self._idx_high(block + 1)
-        if second < first:
-            raise MatrixSourceError(
-                f"BPCells {self.prefix}_idx decreases at block {block}"
-            )
-        return first, second
-
     def _validate_index_end(self) -> None:
         first = self.store.read_numeric(f"{self.prefix}_idx", 0, 1)
         if first.size != 1 or int(first[0]) != 0:
@@ -707,46 +693,47 @@ class _StoredBP128Array:
             return np.empty(0, dtype=np.uint32)
         first_block = start // 128
         final_block = (stop - 1) // 128
-        output: list[NDArray[np.uint32]] = []
-        for block in range(first_block, final_block + 1):
-            word_start, word_stop = self._expanded_idx_pair(block)
-            word_count = word_stop - word_start
-            if word_count % 4:
-                raise MatrixSourceError(
-                    f"BPCells {self.prefix} block {block} has invalid word count"
-                )
-            values = _unpack_bp128_block(
-                self.store.read_numeric(f"{self.prefix}_data", word_start, word_stop),
-                word_count // 4,
+        output = np.empty(stop - start, dtype=np.uint32)
+        blocks_per_read = max(
+            1,
+            min(
+                self.limits.compressedChunkNnz // 128, self.limits.maxBlockBytes // 8192
+            ),
+        )
+        for first in range(first_block, final_block + 1, blocks_per_read):
+            end = min(final_block + 1, first + blocks_per_read)
+            indexes = self.store.read_numeric(
+                f"{self.prefix}_idx", first, end + 1
+            ).astype(np.uint64)
+            high = np.searchsorted(
+                self.indexOffsets[1:-1], np.arange(first, end + 1), side="right"
+            ).astype(np.uint64)
+            indexes += high << np.uint64(32)
+            if np.any(indexes[1:] < indexes[:-1]):
+                raise MatrixSourceError(f"BPCells {self.prefix}_idx decreases")
+            sizes = np.diff(indexes)
+            if np.any(sizes % 4) or np.any(sizes > 128):
+                raise MatrixSourceError(f"BPCells {self.prefix} has invalid word count")
+            packed = self.store.read_numeric(
+                f"{self.prefix}_data", int(indexes[0]), int(indexes[-1])
             )
-            if self.transform == "m1":
-                widened = values.astype(np.uint64) + 1
-                if np.any(widened > np.iinfo(np.uint32).max):
-                    raise MatrixSourceError("BP128 m1 decode overflows uint32")
-                values = widened.astype(np.uint32)
-            elif self.transform in {"d1", "d1z"}:
-                encoded = values.astype(np.uint64)
-                if self.transform == "d1z":
-                    deltas = (encoded >> np.uint64(1)).astype(np.int64) ^ -(
-                        (encoded & np.uint64(1)).astype(np.int64)
-                    )
-                else:
-                    deltas = encoded.astype(np.int64)
-                start_value = int(
-                    self.store.read_numeric(f"{self.prefix}_starts", block, block + 1)[
-                        0
-                    ]
-                )
-                decoded = np.cumsum(deltas, dtype=np.int64) + start_value
-                if np.any(decoded < 0) or np.any(decoded > np.iinfo(np.uint32).max):
-                    raise MatrixSourceError(
-                        f"BP128 {self.transform} decode leaves uint32 range"
-                    )
-                values = decoded.astype(np.uint32)
-            output.append(values)
-        combined = np.concatenate(output)
-        local_start = start - first_block * 128
-        return combined[local_start : local_start + stop - start]
+            indexes -= indexes[0]
+            starts = (
+                self.store.read_numeric(f"{self.prefix}_starts", first, end)
+                if self.transform in {"d1", "d1z"}
+                else None
+            )
+            left, right = max(start, first * 128), min(stop, end * 128)
+            output[left - start : right - start] = decode_bp128(
+                packed,
+                indexes,
+                (end - first) * 128,
+                transform=self.transform,
+                starts=starts,
+                start=left - first * 128,
+                stop=right - first * 128,
+            )
+        return output
 
 
 class BPCellsMatrixSource(BaseMatrixSource):
@@ -929,13 +916,9 @@ class BPCellsMatrixSource(BaseMatrixSource):
             output = nnz * (self.dtype.itemsize + index_size) + pointers.nbytes
             working = output + 128 * np.dtype(np.uint32).itemsize
             return MemoryEstimate(self.resident_bytes, working, output)
-        max_output_nnz = min(self.nnz, (stop - start) * self.n_features)
-        output = max_output_nnz * (self.dtype.itemsize + 2 * index_size)
-        output += (stop - start + 1) * index_size
-        working = min(self.nnz, self._limits.compressedChunkNnz) * (
-            self.dtype.itemsize + 2 * index_size
+        return self._row_store_memory(
+            start, stop, nnz=self.nnz, source_bytes=(self.n_features + 1) * 8
         )
-        return MemoryEstimate(self.resident_bytes, working, output)
 
     def read_cells(self, start: int, stop: int) -> csr_matrix:
         start, stop = self._window(start, stop)
@@ -954,57 +937,44 @@ class BPCellsMatrixSource(BaseMatrixSource):
                 shape=(stop - start, self.n_features),
                 dtype=self.dtype,
             )
-        return self._read_row_stored(start, stop)
-
-    def _read_row_stored(self, start: int, stop: int) -> csr_matrix:
         if start == stop:
             return csr_matrix((0, self.n_features), dtype=self.dtype)
-        data_parts: list[NDArray[Any]] = []
-        row_parts: list[NDArray[np.int64]] = []
-        column_parts: list[NDArray[np.int64]] = []
-        retained = 0
-        for feature in range(self.n_features):
-            bounds = self.store.read_numeric("idxptr", feature, feature + 2)
-            vector_start = int(bounds[0])
-            vector_stop = int(bounds[1])
-            for chunk_start in range(
-                vector_start,
-                vector_stop,
+        self._prepare_for_read()
+        assert self._rowStore is not None
+        return self._rowStore.read(start, stop)
+
+    def _prepare_for_read(self) -> None:
+        if self.storageOrder != "col" and self.n_cells:
+            self._prepare_row_store(
+                self._column_chunks, source_bytes=(self.n_features + 1) * 8
+            )
+
+    def _column_chunks(self) -> Iterator[coo_matrix]:
+        chunk_nnz = max(
+            1,
+            min(
                 self._limits.compressedChunkNnz,
-            ):
-                chunk_stop = min(
-                    vector_stop,
-                    chunk_start + self._limits.compressedChunkNnz,
+                (
+                    self._limits.maxBlockBytes
+                    - (self.n_cells + 1) * 32
+                    - (self.n_features + 1) * 8
                 )
-                cells = self._read_indexes(chunk_start, chunk_stop).astype(
-                    np.int64, copy=False
-                )
-                keep = (cells >= start) & (cells < stop)
-                count = int(np.count_nonzero(keep))
-                if count == 0:
-                    continue
-                retained += count
-                required = retained * (
-                    self.dtype.itemsize + 2 * np.dtype(np.int64).itemsize
-                )
-                if required > self._limits.maxBlockBytes:
-                    raise ResourceLimitError(
-                        "BPCells sparse block exceeds "
-                        f"maxBlockBytes={self._limits.maxBlockBytes}"
-                    )
-                data_parts.append(self._read_values(chunk_start, chunk_stop)[keep])
-                row_parts.append(cells[keep] - start)
-                column_parts.append(np.full(count, feature, dtype=np.int64))
-        if not data_parts:
-            return csr_matrix((stop - start, self.n_features), dtype=self.dtype)
-        return coo_matrix(
-            (
-                np.concatenate(data_parts),
-                (np.concatenate(row_parts), np.concatenate(column_parts)),
+                // 384,
             ),
-            shape=(stop - start, self.n_features),
-            dtype=self.dtype,
-        ).tocsr()
+        )
+        pointers = self.store.read_numeric("idxptr").astype(np.int64, copy=False)
+        for start in range(0, self.nnz, chunk_nnz):
+            stop = min(self.nnz, start + chunk_nnz)
+            features = (
+                np.searchsorted(pointers, np.arange(start, stop), side="right") - 1
+            )
+            yield coo_matrix(
+                (
+                    self._read_values(start, stop),
+                    (self._read_indexes(start, stop), features),
+                ),
+                shape=(self.n_cells, self.n_features),
+            )
 
 
 class BPCellsMemoryMatrixSource(BPCellsMatrixSource):

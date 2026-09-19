@@ -1,4 +1,5 @@
 import gc
+import tracemalloc
 import weakref
 
 import numpy as np
@@ -27,6 +28,7 @@ from scarf.utils.arrays import (
     _rolling_window_kernel,
     canonicalize_sparse,
     checked_sparse_cast,
+    sum_and_squared_sum,
 )
 from scarf.utils.progress import iter_progress
 
@@ -63,12 +65,30 @@ def test_array_metadata_shards_returns_none_without_sharding():
     assert array_metadata_shards(arr) is None
 
 
-def test_clean_array_replaces_nan_inf_and_zero():
+@pytest.mark.parametrize("fill_val", [0.0, 1.0, -1.0])
+def test_clean_array_replaces_nan_inf_and_zero(fill_val):
     raw = np.array([1.0, np.nan, np.inf, -np.inf, 0.0])
-    cleaned = clean_array(raw, fill_val=-1.0)
-    assert cleaned[0] == 1.0
-    assert cleaned[-1] == -1.0
-    assert np.all(np.isfinite(cleaned))
+    cleaned = clean_array(raw, fill_val=fill_val)
+    np.testing.assert_array_equal(
+        cleaned, [1.0, fill_val, fill_val, fill_val, fill_val]
+    )
+    np.testing.assert_array_equal(raw, [1.0, np.nan, np.inf, -np.inf, 0.0])
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64, np.uint32, np.uint64])
+@pytest.mark.parametrize("axis", [None, 0, 1])
+def test_squared_sum_avoids_matrix_sized_temporaries(dtype, axis):
+    values = (np.arange(1024 * 512).reshape(1024, 512) % 251).astype(dtype)
+    reference = values.astype(np.float64)
+    tracemalloc.start()
+    try:
+        total, squared = sum_and_squared_sum(values, axis)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 512 * 1024
+    np.testing.assert_allclose(total, reference.sum(axis=axis))
+    np.testing.assert_allclose(squared, np.square(reference).sum(axis=axis))
 
 
 def test_rescale_array_trims_extreme_values():

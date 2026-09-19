@@ -302,6 +302,8 @@ def _validate_feature_summary_parent(
     root: zarr.Group,
     assay: str,
     ref: ArtifactRef,
+    *,
+    row_fingerprint: str | None = None,
 ) -> None:
     context = _ref_context(ref, assay=assay)
     if ref.kind != "feature_summary":
@@ -429,9 +431,9 @@ def _validate_feature_summary_parent(
             code="corrupt_payload",
             context=context,
         )
-    if group.attrs.get("ordered_feature_ids_fingerprint") != (
-        fingerprint_stored_strings(ids)
-    ):
+    if row_fingerprint is None:
+        row_fingerprint = fingerprint_stored_strings(ids)
+    if group.attrs.get("ordered_feature_ids_fingerprint") != row_fingerprint:
         raise ArtifactResolutionError(
             "Feature-summary row identity does not match the assay",
             code="row_mismatch",
@@ -461,6 +463,7 @@ def _validate_feature_selection_provenance(
     group: zarr.Group,
     *,
     seen: set[ArtifactRef],
+    row_fingerprint: str | None = None,
 ) -> tuple[str, ...]:
     context = _ref_context(ref, assay=assay)
     contract = _FEATURE_SELECTION_CONTRACTS.get(status.operation or "")
@@ -524,6 +527,7 @@ def _validate_feature_selection_provenance(
             assay,
             all_features,
             seen=seen,
+            row_fingerprint=row_fingerprint,
         )
         if validated.operation != "create_all_features":
             raise ArtifactResolutionError(
@@ -539,7 +543,9 @@ def _validate_feature_selection_provenance(
                 code="corrupt_payload",
                 context=context,
             )
-        _validate_feature_summary_parent(root, assay, summary)
+        _validate_feature_summary_parent(
+            root, assay, summary, row_fingerprint=row_fingerprint
+        )
     if "feature_snapshot" in inputs:
         snapshot = _local_input_ref(inputs["feature_snapshot"])
         if (
@@ -592,6 +598,7 @@ def _validate_feature_selection(
     ref: ArtifactRef,
     *,
     seen: set[ArtifactRef] | None = None,
+    row_fingerprint: str | None = None,
 ) -> _ValidatedFeatureSelection:
     _validate_ref_scope(ref, assay)
     context = _ref_context(ref, assay=assay)
@@ -650,7 +657,11 @@ def _validate_feature_selection(
 
     expected_rows = group.attrs.get("ordered_feature_ids_fingerprint")
     try:
-        current_rows = fingerprint_stored_strings(ids)
+        current_rows = (
+            fingerprint_stored_strings(ids)
+            if row_fingerprint is None
+            else row_fingerprint
+        )
     except (TypeError, ValueError) as exc:
         raise ArtifactResolutionError(
             "Assay feature row identifiers are malformed",
@@ -672,6 +683,7 @@ def _validate_feature_selection(
             status,
             group,
             seen=seen,
+            row_fingerprint=current_rows,
         )
         actual_payload = fingerprint_stored_arrays(group, payload_names)
     except (KeyError, TypeError, ValueError) as exc:

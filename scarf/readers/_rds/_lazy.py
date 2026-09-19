@@ -217,20 +217,54 @@ class LazyStringVector(LazyVector, Sequence[str | bytes | None]):
                 f"invalid block [{start}:{stop}] for vector of length {self.length}"
             )
         result: list[str | bytes | None] = []
-        for index in range(start, stop):
-            source, offset, length, gp = self._descriptor(index)
-            if length == -1:
-                result.append(None)
-                continue
-            storage = (
-                self._payload_storage
-                if source == STRING_SOURCE_PAYLOAD
-                else self._decoded_storage
+        for block_start in range(start, stop, 1024):
+            block_stop = min(stop, block_start + 1024)
+            descriptors = list(
+                _STRING_DESCRIPTOR.iter_unpack(
+                    self._index_storage.read_at(
+                        self.descriptor_offset + block_start * STRING_DESCRIPTOR_BYTES,
+                        (block_stop - block_start) * STRING_DESCRIPTOR_BYTES,
+                        path=self.path,
+                    )
+                )
             )
-            if storage is None:
-                raise RuntimeError("decoded string storage is unavailable")
-            raw = storage.read_at(offset, length, path=f"{self.path}[{index}]")
-            result.append(self._decode(raw, gp))
+            index = 0
+            while index < len(descriptors):
+                source, offset, length, _gp = descriptors[index]
+                if length == -1:
+                    result.append(None)
+                    index += 1
+                    continue
+                end = offset + length
+                last = index + 1
+                while last < len(descriptors):
+                    next_source, next_offset, next_length, _ = descriptors[last]
+                    if (
+                        next_source != source
+                        or next_length < 0
+                        or next_offset < offset
+                        or next_offset + next_length > offset + max(length, 1024 * 1024)
+                    ):
+                        break
+                    end = max(end, next_offset + next_length)
+                    last += 1
+                storage = (
+                    self._payload_storage
+                    if source == STRING_SOURCE_PAYLOAD
+                    else self._decoded_storage
+                )
+                if storage is None:
+                    raise RuntimeError("decoded string storage is unavailable")
+                raw = storage.read_at(
+                    offset, end - offset, path=f"{self.path}[{block_start + index}]"
+                )
+                for _, position, size, gp in descriptors[index:last]:
+                    result.append(
+                        self._decode(
+                            raw[position - offset : position - offset + size], gp
+                        )
+                    )
+                index = last
         return result
 
     @overload

@@ -55,6 +55,8 @@ class CSVReader:
             raise TypeError("pandas_kwargs must be a dictionary")
         header_row: int | None
         if has_header is False:
+            if skip_cols or cell_data_cols:
+                raise ValueError("Named columns require a CSV header")
             header_row = None
         else:
             header_row = 0
@@ -126,11 +128,9 @@ class CSVReader:
                         )
                     if len(self.cellDataCols) > 0:
                         cell_data_dtypes = list(df[self.cellDataCols].dtypes.values)
-                        cell_data_idx = [
-                            n
-                            for n, x in enumerate(feature_ids)
-                            if x in self.cellDataCols
-                        ]
+                        cell_data_idx = df.columns.get_indexer(
+                            self.cellDataCols
+                        ).tolist()
             else:
                 if n_features != df.shape[1]:
                     raise ValueError(
@@ -183,7 +183,10 @@ class CSVReader:
         else:
             if self.cellDataIdx is not None:
                 for df in stream:
-                    yield df.values[:, self.keepCols], df.values[:, self.cellDataIdx]
+                    yield (
+                        df.iloc[:, self.keepCols].to_numpy(),
+                        df.iloc[:, self.cellDataIdx].to_numpy(dtype=object),
+                    )
             else:
                 for df in stream:
-                    yield df.values[:, self.keepCols], None
+                    yield df.iloc[:, self.keepCols].to_numpy(), None

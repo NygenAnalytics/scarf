@@ -213,6 +213,27 @@ def test_xdr_numeric_vector_is_lazy_and_matches_rdata(tmp_path: Path) -> None:
         np.testing.assert_array_equal(vector.materialize(), oracle.object.value)
 
 
+@pytest.mark.parametrize("encoding", ["xdr", "ascii"])
+def test_lazy_strings_batch_descriptor_and_payload_reads(encoding, monkeypatch):
+    from scarf.readers._rds._storage import RandomAccessStorage
+
+    wire = Wire(encoding)
+    expected = [f"cell-{index}" for index in range(4097)]
+    payload = wire.document(wire.string_vector([value.encode() for value in expected]))
+    with open_rds(io.BytesIO(payload)) as document:
+        reads = []
+        original = RandomAccessStorage.read_at
+
+        def read_at(storage, offset, size, **kwargs):
+            reads.append(size)
+            return original(storage, offset, size, **kwargs)
+
+        monkeypatch.setattr(RandomAccessStorage, "read_at", read_at)
+        assert document.root.value.read_block(0, len(expected)) == expected
+        assert len(reads) <= 10
+        assert max(reads) <= 1024 * 1024
+
+
 @pytest.mark.parametrize("encoding", ["xdr", "native", "ascii"])
 @pytest.mark.parametrize("version", [2, 3])
 def test_wire_encodings_and_versions(encoding: str, version: int) -> None:

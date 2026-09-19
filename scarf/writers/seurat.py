@@ -657,6 +657,17 @@ class SeuratToZarr:
         n_cells = len(self.reader.cellIds)
         if n_cells == 0:
             return
+        other_sources = sum(
+            max(0, int(item.counts.resident_bytes))
+            for item in self._assays
+            if item is not assay
+        )
+        self.reader._prepare_assay(
+            assay.name, max_bytes=int(self.resources.memoryBytes) - other_sources
+        )
+        self._residentSourceBytes = sum(
+            max(0, int(item.counts.resident_bytes)) for item in self._assays
+        )
         if source.is_sparse:
             self._write_sparse_counts(
                 assay.name,

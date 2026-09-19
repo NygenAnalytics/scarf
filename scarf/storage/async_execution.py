@@ -3,9 +3,9 @@
 import asyncio
 import threading
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from typing import Any, TypeVar, cast
 
@@ -23,10 +23,33 @@ T = TypeVar("T")
 # Zarr's sync ThreadPoolExecutor is created on first use and never resized.
 # This is the process thread ceiling, not an operation plan.
 _HOST_THREAD_CEILING: int | None = None
+_ZARR_CONFIG_LOCK = threading.RLock()
+_ACTIVE_IO_LIMITS: dict[object, int] = {}
+_IDLE_IO_LIMIT: int | None = None
 
 
 _NUMBA_THREAD_LOCK = threading.Lock()
 _WORKER_NUMBA_CAP = threading.local()
+
+
+@contextmanager
+def zarr_io_concurrency(limit: int) -> Iterator[None]:
+    global _IDLE_IO_LIMIT
+    token = object()
+    with _ZARR_CONFIG_LOCK:
+        if not _ACTIVE_IO_LIMITS:
+            _IDLE_IO_LIMIT = zarr.config.get("async.concurrency")
+        _ACTIVE_IO_LIMITS[token] = max(1, int(limit))
+        zarr.config.set({"async.concurrency": min(_ACTIVE_IO_LIMITS.values())})
+    try:
+        yield
+    finally:
+        with _ZARR_CONFIG_LOCK:
+            del _ACTIVE_IO_LIMITS[token]
+            restored = (
+                min(_ACTIVE_IO_LIMITS.values()) if _ACTIVE_IO_LIMITS else _IDLE_IO_LIMIT
+            )
+            zarr.config.set({"async.concurrency": restored})
 
 
 def _install_numba_thread_cap(threads: int) -> Callable[[], None] | None:
@@ -115,10 +138,11 @@ def ensure_zarr_host_ceiling(maxWorkers: int | None = None) -> int:
     global _HOST_THREAD_CEILING
     host = max(1, detect_workers())
     requested = host if maxWorkers is None else max(1, int(maxWorkers))
-    if _HOST_THREAD_CEILING is None:
-        ceiling = max(host, requested)
-        zarr.config.set({"threading.max_workers": ceiling})
-        _HOST_THREAD_CEILING = ceiling
+    with _ZARR_CONFIG_LOCK:
+        if _HOST_THREAD_CEILING is None:
+            ceiling = max(host, requested)
+            zarr.config.set({"threading.max_workers": ceiling})
+            _HOST_THREAD_CEILING = ceiling
     return _HOST_THREAD_CEILING
 
 
@@ -142,8 +166,13 @@ def configure_zarr_runtime(
     async_concurrency = int(asyncConcurrency)
     if codec_workers < 1 or async_concurrency < 1:
         raise ValueError("Zarr runtime limits must be positive")
-    ensure_zarr_host_ceiling(codec_workers)
-    zarr.config.set({"async.concurrency": async_concurrency})
+    with _ZARR_CONFIG_LOCK:
+        if _ACTIVE_IO_LIMITS:
+            raise RuntimeError(
+                "Cannot reconfigure Zarr during active storage operations"
+            )
+        ensure_zarr_host_ceiling(codec_workers)
+        zarr.config.set({"async.concurrency": async_concurrency})
 
 
 def reset_zarr_runtime_for_tests() -> None:
@@ -279,7 +308,7 @@ class AsyncStorageRunner:
         restore_numba = _install_numba_thread_cap(self.plan.threadsPerComputeWorker)
         try:
             shutdown_checkpoint()
-            with zarr.config.set({"async.concurrency": self.plan.zarrAsyncConcurrency}):
+            with zarr_io_concurrency(self.plan.zarrAsyncConcurrency):
                 result = await operation(self)
             shutdown_checkpoint()
         except BaseException as exc:

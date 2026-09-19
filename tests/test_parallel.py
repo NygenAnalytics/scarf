@@ -148,7 +148,7 @@ def test_stream_shards_cancels_pending_work_after_failure():
     assert set(started).issubset({0, 1})
 
 
-def test_io_concurrency_isolated_across_parallel_runtimes():
+def test_overlapping_parallel_runtimes_share_the_lower_io_limit():
     before = zarr.config.get("async.concurrency")
     barrier = threading.Barrier(2)
     seen = {3: [], 7: []}
@@ -157,6 +157,7 @@ def test_io_concurrency_isolated_across_parallel_runtimes():
         def inspect_config(value):
             barrier.wait()
             seen[io_concurrency].append(zarr.config.get("async.concurrency"))
+            barrier.wait()
             return value
 
         list(
@@ -174,7 +175,7 @@ def test_io_concurrency_isolated_across_parallel_runtimes():
     second.start()
     first.join()
     second.join()
-    assert seen == {3: [3], 7: [7]}
+    assert seen == {3: [3], 7: [3]}
     assert zarr.config.get("async.concurrency") == before
 
 

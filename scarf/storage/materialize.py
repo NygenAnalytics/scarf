@@ -6,6 +6,7 @@ import numpy as np
 import zarr
 
 from ..utils.compute import controlled_compute
+from ..utils.arrays import sum_and_squared_sum
 from .arrays import create_numeric_array, create_zarr_dataset
 from .budget import ResourceBudget
 from .layout import normed_array_spec
@@ -14,18 +15,7 @@ from .sharding import write_dense_from_row_batches, write_dense_in_shard_rows
 
 
 def _feature_summary(block: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    return (
-        np.asarray(np.sum(block, axis=0, dtype=np.float64)),
-        np.asarray(
-            np.einsum(
-                "ij,ij->j",
-                block,
-                block,
-                dtype=np.float64,
-                optimize=True,
-            )
-        ),
-    )
+    return sum_and_squared_sum(block)
 
 
 def _merge_feature_summaries(

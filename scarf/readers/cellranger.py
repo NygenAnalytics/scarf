@@ -433,21 +433,29 @@ class CrH5Reader(CrReader):
                 np.arange(len(v_pos)),
                 counts,
             )
-            nonempty = np.flatnonzero(counts)
-            idx = (
-                np.concatenate([np.arange(starts[i], ends[i]) for i in nonempty])
-                if nonempty.size
-                else np.array([], dtype=np.int64)
-            )
-            if idx.size == 0:
+            nnz = int(counts.sum())
+            if nnz == 0:
                 yield coo_matrix(
                     ([], ([], [])),
                     shape=(len(v_pos), self.nFeatures),
                     dtype=self.matrix_dtype,
                 )
                 continue
-            data = np.asarray(self.grp["data"][idx])
-            indices = np.asarray(self.grp["indices"][idx])
+            data = np.empty(nnz, dtype=self.matrix_dtype)
+            indices = np.empty(nnz, dtype=self.grp["indices"].dtype)
+            boundaries = np.r_[
+                0, np.flatnonzero(starts[1:] != ends[:-1]) + 1, len(v_pos)
+            ]
+            offset = 0
+            for first, stop in zip(boundaries[:-1], boundaries[1:]):
+                start, end = int(starts[first]), int(ends[stop - 1])
+                size = end - start
+                if size:
+                    source = np.s_[start:end]
+                    destination = np.s_[offset : offset + size]
+                    self.grp["data"].read_direct(data, source, destination)
+                    self.grp["indices"].read_direct(indices, source, destination)
+                    offset += size
             yield coo_matrix(
                 (data, (cell_idx, indices)), shape=(len(v_pos), self.nFeatures)
             )

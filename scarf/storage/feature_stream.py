@@ -6,7 +6,8 @@ import operator
 import queue
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
+from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
@@ -366,30 +367,31 @@ def _plan_feature_consume(
 def _iter_bounded_handoff(
     *,
     in_flight: int,
-    run: Callable[[Callable[[Any], None], threading.Event], None],
+    run: Callable[[Callable[[Any], Awaitable[None]], threading.Event], None],
 ) -> Iterator[Any]:
     handoff: queue.Queue[Any] = queue.Queue(maxsize=max(1, int(in_flight)))
-    release: queue.Queue[None] = queue.Queue()
     stop = threading.Event()
     sentinel = object()
     error: list[BaseException] = []
 
-    def deliver(item: Any) -> None:
+    async def deliver(item: Any) -> None:
         if stop.is_set():
             return
+        released: Future[None] = Future()
         while not stop.is_set():
             try:
-                handoff.put(item, timeout=0.05)
+                handoff.put_nowait((item, released))
                 break
             except queue.Full:
-                continue
+                await asyncio.sleep(0.01)
         else:
             return
+        acknowledged = asyncio.wrap_future(released)
         while not stop.is_set():
             try:
-                release.get(timeout=0.05)
+                await asyncio.wait_for(asyncio.shield(acknowledged), timeout=0.05)
                 return
-            except queue.Empty:
+            except TimeoutError:
                 continue
 
     def _worker() -> None:
@@ -406,7 +408,8 @@ def _iter_bounded_handoff(
                     if not stop.is_set():
                         continue
                     try:
-                        handoff.get_nowait()
+                        _, released = handoff.get_nowait()
+                        released.set_result(None)
                     except queue.Empty:
                         continue
 
@@ -414,22 +417,24 @@ def _iter_bounded_handoff(
     thread.start()
     try:
         while True:
-            item = handoff.get()
-            if item is sentinel:
+            entry = handoff.get()
+            if entry is sentinel:
                 break
+            item, released = entry
             try:
                 yield item
             finally:
-                release.put(None)
+                released.set_result(None)
     finally:
         stop.set()
         while thread.is_alive():
             try:
-                item = handoff.get(timeout=0.05)
-                if item is not sentinel:
-                    release.put(None)
+                entry = handoff.get(timeout=0.05)
+                if entry is not sentinel:
+                    _, released = entry
+                    released.set_result(None)
             except queue.Empty:
-                release.put(None)
+                continue
         thread.join()
     if error:
         raise error[0]
@@ -544,7 +549,7 @@ def map_feature_read_groups(
         scratchBytes=scratchBytes,
         innerReadBytes=max_band_bytes,
         maxInnerReads=requested_inner_reads,
-        chunksPerShard=max(1, len(bands)),
+        chunksPerShard=max(1, geometry.axisShard(0) // feat_chunk),
         ordered=orderedCompute,
     )
     in_flight = plan.readWorkers
@@ -573,7 +578,7 @@ def map_feature_read_groups(
 
     progress_bar = tqdmbar(desc=progress, total=len(merged)) if progress else None
 
-    def _run(deliver: Callable[[T], None], stop: threading.Event) -> None:
+    def _run(deliver: Callable[[T], Awaitable[None]], stop: threading.Event) -> None:
         nonlocal fetch_seconds, compute_seconds, compute_wait_seconds, units_completed
 
         async def _operation(runner: AsyncStorageRunner) -> None:
@@ -642,14 +647,14 @@ def map_feature_read_groups(
                             compute_started = time.perf_counter()
                             item = await runner.compute(lambda: process(group))
                             compute_seconds += time.perf_counter() - compute_started
-                            await asyncio.to_thread(deliver, item)
+                            await deliver(item)
                             next_idx += 1
                             turn.notify_all()
                     else:
                         compute_started = time.perf_counter()
                         item = await runner.compute(lambda: process(group))
                         compute_seconds += time.perf_counter() - compute_started
-                        await asyncio.to_thread(deliver, item)
+                        await deliver(item)
                     units_completed += 1
                     if progress_bar is not None:
                         progress_bar.update(1)
@@ -673,8 +678,6 @@ def map_feature_read_groups(
         runner = AsyncStorageRunner(
             budget,
             operation=plan,
-            chunksPerShard=max(1, geometry.axisShard(0) // feat_chunk),
-            readGroupsInFlight=in_flight,
         )
         try:
             runner.run(_operation)
@@ -780,6 +783,7 @@ def map_feature_cell_bands(
         nUnits=len(work),
         unitBytes=max_band_bytes,
         scratchBytes=scratchBytes,
+        chunksPerShard=max(1, geometry.axisShard(0) // feat_chunk),
         ordered=orderedCompute,
     )
     in_flight = plan.readWorkers
@@ -808,7 +812,7 @@ def map_feature_cell_bands(
 
     progress_bar = tqdmbar(desc=progress, total=len(work)) if progress else None
 
-    def _run(deliver: Callable[[T], None], stop: threading.Event) -> None:
+    def _run(deliver: Callable[[T], Awaitable[None]], stop: threading.Event) -> None:
         nonlocal fetch_seconds, compute_seconds, compute_wait_seconds, units_completed
 
         async def _operation(runner: AsyncStorageRunner) -> None:
@@ -872,14 +876,14 @@ def map_feature_cell_bands(
                             compute_started = time.perf_counter()
                             item = await runner.compute(lambda: process(band))
                             compute_seconds += time.perf_counter() - compute_started
-                            await asyncio.to_thread(deliver, item)
+                            await deliver(item)
                             next_idx += 1
                             turn.notify_all()
                     else:
                         compute_started = time.perf_counter()
                         item = await runner.compute(lambda: process(band))
                         compute_seconds += time.perf_counter() - compute_started
-                        await asyncio.to_thread(deliver, item)
+                        await deliver(item)
                     units_completed += 1
                     if progress_bar is not None:
                         progress_bar.update(1)
@@ -901,8 +905,6 @@ def map_feature_cell_bands(
         runner = AsyncStorageRunner(
             budget,
             operation=plan,
-            chunksPerShard=max(1, geometry.axisShard(0) // feat_chunk),
-            readGroupsInFlight=in_flight,
         )
         try:
             runner.run(_operation)

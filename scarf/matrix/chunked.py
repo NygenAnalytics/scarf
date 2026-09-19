@@ -7,6 +7,7 @@ import numpy as np
 import zarr
 from numpy.typing import NDArray
 
+from ..utils.arrays import sum_and_squared_sum
 from ..storage.budget import (
     DEFAULT_READ_AHEAD_BLOCKS,
     ResourceBudget,
@@ -604,16 +605,7 @@ class ChunkedArray:
             raise NotImplementedError("mean_and_std only supports axis=0")
 
         def summarize(_: int, start: int, end: int) -> NDArray[Any]:
-            array = self._materialize_range(start, end).astype(
-                np.float64,
-                copy=False,
-            )
-            return np.array(
-                [
-                    array.sum(axis=0),
-                    np.square(array).sum(axis=0),
-                ]
-            )
+            return np.asarray(sum_and_squared_sum(self._materialize_range(start, end)))
 
         parts = self._map_blocks(summarize, nthreads, msg)
         stacked = np.sum(parts, axis=0)
@@ -656,13 +648,11 @@ class ChunkedArray:
                 )
             if op == "var":
                 if axis is None:
-                    values = array.astype(np.float64, copy=False)
-                    return np.asarray([values.sum(), np.square(values).sum()])
+                    return np.asarray(sum_and_squared_sum(array, axis=None))
                 return np.asarray(array.var(axis=axis))
             if op == "std":
                 if axis is None:
-                    values = array.astype(np.float64, copy=False)
-                    return np.asarray([values.sum(), np.square(values).sum()])
+                    return np.asarray(sum_and_squared_sum(array, axis=None))
                 return np.asarray(array.std(axis=axis))
             if op == "count_nonzero":
                 return np.asarray(np.count_nonzero(array, axis=axis))
@@ -718,15 +708,8 @@ class ChunkedArray:
         if op in ("var", "std"):
 
             def variance_block(_: int, start: int, end: int) -> NDArray[Any]:
-                array = self._materialize_range(start, end).astype(
-                    np.float64,
-                    copy=False,
-                )
-                return np.array(
-                    [
-                        array.sum(axis=0),
-                        np.square(array).sum(axis=0),
-                    ]
+                return np.asarray(
+                    sum_and_squared_sum(self._materialize_range(start, end))
                 )
 
             parts = self._map_blocks(variance_block, nthreads, msg)

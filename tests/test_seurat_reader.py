@@ -1290,9 +1290,14 @@ def test_assay5_reads_serialized_bpcells_memory_leaf(tmp_path: Path) -> None:
 
 def test_assay5_reads_serialized_fragment_matrix_graph(tmp_path: Path) -> None:
     source = _write_fragment_matrix_fixture(tmp_path / "fragments.rds")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
 
-    with SeuratReader(source, reductions=[]) as reader:
+    with SeuratReader(source, reductions=[], temp_dir=scratch) as reader:
         assay = reader.get_assay("ATAC")
+        fragment = assay.counts._source.layers[0].source
+        assert fragment._rowStore is None
+        assert not list(scratch.glob("scarf-sparse-*"))
         np.testing.assert_array_equal(
             assay.counts.read_cells(0, 3).toarray(),
             [
@@ -1301,6 +1306,11 @@ def test_assay5_reads_serialized_fragment_matrix_graph(tmp_path: Path) -> None:
                 [0, 1, 2, 2, 2],
             ],
         )
+        directory = Path(fragment._rowStore._directory.name)
+        assert directory.is_relative_to(scratch)
+        assert directory.is_dir()
+    assert not directory.exists()
+    reader.close()
 
 
 def test_save_seurat_rds_cache_restores_generated_bpcells_cbind_recipe(

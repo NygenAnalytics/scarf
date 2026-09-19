@@ -1,5 +1,5 @@
 import os
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 import h5py
@@ -427,12 +427,9 @@ class HDF5CompressedMatrixSource(BaseMatrixSource):
             nnz = data_stop - data_start
             output = nnz * (self.dtype.itemsize + index_size) + pointers.nbytes
             return MemoryEstimate(self.resident_bytes, output, output)
-        max_output_nnz = min(self.nnz, (stop - start) * self.n_features)
-        output = max_output_nnz * (self.dtype.itemsize + 2 * index_size)
-        output += (stop - start + 1) * index_size
-        working_nnz = min(self.nnz, self._limits.compressedChunkNnz)
-        working = working_nnz * (self.dtype.itemsize + 2 * index_size)
-        return MemoryEstimate(self.resident_bytes, working, output)
+        return self._row_store_memory(
+            start, stop, nnz=self.nnz, source_bytes=(self.n_features + 1) * 8
+        )
 
     def read_cells(self, start: int, stop: int) -> csr_matrix:
         start, stop = self._window(start, stop)
@@ -440,7 +437,17 @@ class HDF5CompressedMatrixSource(BaseMatrixSource):
         self._admit(estimate)
         if self._direct:
             return self._read_direct(start, stop)
-        return self._read_scanned(start, stop)
+        if start == stop:
+            return csr_matrix((0, self.n_features), dtype=self.dtype)
+        self._prepare_for_read()
+        assert self._rowStore is not None
+        return self._rowStore.read(start, stop)
+
+    def _prepare_for_read(self) -> None:
+        if not self._direct and self.n_cells:
+            self._prepare_row_store(
+                self._column_chunks, source_bytes=(self.n_features + 1) * 8
+            )
 
     def _read_direct(self, start: int, stop: int) -> csr_matrix:
         pointers, data_start, data_stop = self._direct_bounds(start, stop)
@@ -458,13 +465,19 @@ class HDF5CompressedMatrixSource(BaseMatrixSource):
             dtype=self.dtype,
         )
 
-    def _read_scanned(self, start: int, stop: int) -> csr_matrix:
-        if start == stop:
-            return csr_matrix((0, self.n_features), dtype=self.dtype)
-        data_parts: list[NDArray[Any]] = []
-        row_parts: list[NDArray[np.int64]] = []
-        column_parts: list[NDArray[np.int64]] = []
-        retained_nnz = 0
+    def _column_chunks(self) -> Iterator[coo_matrix]:
+        chunk_nnz = max(
+            1,
+            min(
+                self._limits.compressedChunkNnz,
+                (
+                    self._limits.maxBlockBytes
+                    - (self.n_cells + 1) * 32
+                    - (self.n_features + 1) * 8
+                )
+                // 384,
+            ),
+        )
         with h5py.File(self.path, mode="r") as handle:
             group = require_hdf5_group(handle, self.group)
             data_node = group[self.dataName]
@@ -473,53 +486,19 @@ class HDF5CompressedMatrixSource(BaseMatrixSource):
             assert isinstance(data_node, h5py.Dataset)
             assert isinstance(index_node, h5py.Dataset)
             assert isinstance(pointer_node, h5py.Dataset)
-            for feature in range(self.n_features):
-                bounds = np.asarray(pointer_node[feature : feature + 2], dtype=np.int64)
-                vector_start = int(bounds[0])
-                vector_stop = int(bounds[1])
-                for chunk_start in range(
-                    vector_start,
-                    vector_stop,
-                    self._limits.compressedChunkNnz,
-                ):
-                    chunk_stop = min(
-                        vector_stop,
-                        chunk_start + self._limits.compressedChunkNnz,
-                    )
-                    cell_indexes = np.asarray(
-                        index_node[chunk_start:chunk_stop], dtype=np.int64
-                    )
-                    keep = (cell_indexes >= start) & (cell_indexes < stop)
-                    count = int(np.count_nonzero(keep))
-                    if count == 0:
-                        continue
-                    retained_nnz += count
-                    required = retained_nnz * (
-                        self.dtype.itemsize + 2 * np.dtype(np.int64).itemsize
-                    )
-                    if required > self._limits.maxBlockBytes:
-                        raise ResourceLimitError(
-                            "sparse block exceeds "
-                            f"maxBlockBytes={self._limits.maxBlockBytes}"
-                        )
-                    data_parts.append(
-                        np.asarray(
-                            data_node[chunk_start:chunk_stop],
-                            dtype=self.dtype,
-                        )[keep]
-                    )
-                    row_parts.append(cell_indexes[keep] - start)
-                    column_parts.append(np.full(count, feature, dtype=np.int64))
-        if not data_parts:
-            return csr_matrix((stop - start, self.n_features), dtype=self.dtype)
-        return coo_matrix(
-            (
-                np.concatenate(data_parts),
-                (np.concatenate(row_parts), np.concatenate(column_parts)),
-            ),
-            shape=(stop - start, self.n_features),
-            dtype=self.dtype,
-        ).tocsr()
+            pointers = np.asarray(pointer_node[:], dtype=np.int64)
+            for start in range(0, self.nnz, chunk_nnz):
+                stop = min(self.nnz, start + chunk_nnz)
+                features = (
+                    np.searchsorted(pointers, np.arange(start, stop), side="right") - 1
+                )
+                yield coo_matrix(
+                    (
+                        np.asarray(data_node[start:stop], dtype=self.dtype),
+                        (np.asarray(index_node[start:stop]), features),
+                    ),
+                    shape=(self.n_cells, self.n_features),
+                )
 
 
 class H5SparseMatrixSource(HDF5CompressedMatrixSource):

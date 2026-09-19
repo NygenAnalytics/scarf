@@ -350,9 +350,7 @@ def plan_operation(
     read_limit = max(1, read_limit)
 
     if inner_read > 0:
-        inner_limit = chunks
-        if max_inner_reads is not None:
-            inner_limit = min(inner_limit, max_inner_reads)
+        inner_limit = chunks if max_inner_reads is None else max_inner_reads
         if requested_read is not None:
             inner_limit = min(inner_limit, requested_read)
         minimum_outer = max(

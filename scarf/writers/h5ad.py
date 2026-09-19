@@ -137,7 +137,7 @@ def _read_h5ad_process_window(
             pass
     finally:
         if reader is not None:
-            reader.h5.close()
+            reader.close()
         connection.close()
 
 
@@ -230,7 +230,7 @@ def _write_h5ad_process_window(
             pass
     finally:
         if reader is not None:
-            reader.h5.close()
+            reader.close()
         connection.close()
 
 
@@ -403,14 +403,7 @@ class H5adToZarr:
         self.io = io
         self._sourceDigest = self._hash_source() if has_analysis else None
         self.h5ad.infer_storage_dtype(self.resources.memoryBytes)
-        csc_peak = self.h5ad.csc_conversion_peak_bytes()
-        if csc_peak > self.resources.memoryBytes:
-            raise MemoryError(
-                f"CSC to CSR conversion needs about {csc_peak} bytes, but the "
-                f"conversion memory limit is {self.resources.memoryBytes} bytes"
-            )
-        if csc_peak:
-            self.h5ad.materialize_csc()
+        self.h5ad.materialize_csc(self.resources.memoryBytes)
         self.storageDtype = getattr(
             self.h5ad,
             "storageDtype",

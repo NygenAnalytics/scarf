@@ -3,12 +3,13 @@ import os
 import re
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.sparse import csr_matrix
+from scipy.sparse import coo_matrix, csr_matrix
 
 from .bpcells import (
     _BPArrayStore,
@@ -35,7 +36,6 @@ from .sources import (
 
 _FRAGMENT_VERSION_PATTERN = re.compile(r"^(packed|unpacked)-fragments-v([12])$")
 _UINT32_MAX = int(np.iinfo(np.uint32).max)
-_DICT_ENTRY_BYTES = 160
 _FRAGMENT_BLOCK_SAFETY_FACTOR = 4
 
 
@@ -2045,23 +2045,31 @@ class FragmentDerivedMatrixSource(BaseMatrixSource):
 
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
         start, stop = self._window(start, stop)
-        rows = stop - start
-        base_working = self.fragments.blockWorkingBytes + rows * 64
+        base_working = self.fragments.blockWorkingBytes
         if self.matrixType == "PeakMatrix":
             base_working += self.n_features * 96
-        minimum_output = (rows + 1) * np.dtype(np.int64).itemsize
-        if rows == 0:
-            return MemoryEstimate(self.resident_bytes, base_working, minimum_output)
-        if base_working + minimum_output > self._limits.maxBlockBytes:
-            return MemoryEstimate(self.resident_bytes, base_working, minimum_output)
-        events = sum(1 for _event in self._contributions(start, stop))
-        possible_nnz = min(events, rows * self.n_features)
-        output = (
-            possible_nnz * (np.dtype(np.uint32).itemsize + np.dtype(np.int64).itemsize)
-            + (rows + 1) * np.dtype(np.int64).itemsize
+        events_per_fragment = self.starts.size if self.matrixType == "PeakMatrix" else 2
+        return self._row_store_memory(
+            start,
+            stop,
+            nnz=self.fragments.recordCount * events_per_fragment,
+            source_bytes=base_working,
         )
-        working = base_working + possible_nnz * _DICT_ENTRY_BYTES
-        return MemoryEstimate(self.resident_bytes, working, output)
+
+    def _contribution_chunks(self) -> Iterator[coo_matrix]:
+        available = self._limits.maxBlockBytes - self.fragments.blockWorkingBytes
+        available -= (self.n_cells + 1) * 32
+        if self.matrixType == "PeakMatrix":
+            available -= self.n_features * 96
+        chunk_nnz = max(1, min(self._limits.compressedChunkNnz, available // 2048))
+        events = self._contributions(0, self.n_cells)
+        while batch := list(islice(events, chunk_nnz)):
+            values = np.asarray(batch, dtype=np.int64)
+            del batch
+            yield coo_matrix(
+                (values[:, 2].astype(np.uint32), (values[:, 0], values[:, 1])),
+                shape=(self.n_cells, self.n_features),
+            )
 
     def read_cells(self, start: int, stop: int) -> csr_matrix:
         start, stop = self._window(start, stop)
@@ -2069,55 +2077,24 @@ class FragmentDerivedMatrixSource(BaseMatrixSource):
         self._admit(estimate)
         if start == stop:
             return csr_matrix((0, self.n_features), dtype=np.uint32)
-        rows: list[dict[int, int]] = [{} for _index in range(stop - start)]
-        nnz = 0
-        for row, column, value in self._contributions(start, stop):
-            row_values = rows[row]
-            previous = row_values.get(column)
-            if previous is None:
-                if nnz >= self._limits.maxNnz:
-                    raise ResourceLimitError(
-                        f"fragment-derived block exceeds maxNnz={self._limits.maxNnz}"
-                    )
-                row_values[column] = value
-                nnz += 1
-                dynamic_bytes = (
-                    self.fragments.blockWorkingBytes
-                    + nnz
-                    * (
-                        _DICT_ENTRY_BYTES
-                        + np.dtype(np.uint32).itemsize
-                        + np.dtype(np.int64).itemsize
-                    )
-                    + (len(rows) + 1) * np.dtype(np.int64).itemsize
-                )
-                if dynamic_bytes > self._limits.maxBlockBytes:
-                    raise ResourceLimitError(
-                        "fragment-derived block exceeds "
-                        f"maxBlockBytes={self._limits.maxBlockBytes}"
-                    )
-            else:
-                updated = previous + value
-                if updated > _UINT32_MAX:
-                    raise MatrixSourceError("fragment-derived count overflows uint32")
-                row_values[column] = updated
-        data = np.empty(nnz, dtype=np.uint32)
-        indices = np.empty(nnz, dtype=np.int64)
-        indptr = np.empty(len(rows) + 1, dtype=np.int64)
-        indptr[0] = 0
-        position = 0
-        for row_index, row_values in enumerate(rows):
-            for column, value in row_values.items():
-                data[position] = value
-                indices[position] = column
-                position += 1
-            indptr[row_index + 1] = position
-        return csr_matrix(
-            (data, indices, indptr),
-            shape=(stop - start, self.n_features),
-            dtype=np.uint32,
-            copy=False,
-        )
+        self._prepare_for_read()
+        assert self._rowStore is not None
+        return self._rowStore.read(start, stop)
+
+    def _prepare_for_read(self) -> None:
+        if not self.n_cells:
+            return
+        source_bytes = self.fragments.blockWorkingBytes
+        if self.matrixType == "PeakMatrix":
+            source_bytes += self.n_features * 96
+        try:
+            self._prepare_row_store(
+                self._contribution_chunks, source_bytes=source_bytes
+            )
+        except OverflowError as error:
+            raise MatrixSourceError(
+                "fragment-derived count overflows uint32"
+            ) from error
 
 
 def build_fragment_matrix_source(

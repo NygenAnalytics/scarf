@@ -450,9 +450,10 @@ def require_complete_artifact(
 
 def inspect_artifact(root: zarr.Group, ref: ArtifactRef) -> ArtifactStatus:
     path = artifact_path(ref)
-    if path not in root:
+    try:
+        group = group_at(root, path)
+    except KeyError:
         return ArtifactStatus(ref=ref, path=path, exists=False, complete=False)
-    group = group_at(root, path)
     stored_id = group.attrs.get("artifact_id")
     stored_kind = group.attrs.get("kind")
     if stored_id is not None and stored_id != ref.artifact_id:
@@ -650,15 +651,7 @@ def find_reusable_artifacts(
         if provenance_hash(status.provenance) != requested_hash:
             continue
         if canonical_bytes(status.provenance) == requested_bytes:
-            group = group_at(root, status.path)
-            raw_created = group.attrs.get("created_at_ns", 0)
-            created_at_ns = (
-                int(raw_created)
-                if not isinstance(raw_created, bool)
-                and isinstance(raw_created, (int, np.integer))
-                else 0
-            )
-            reusable.append((created_at_ns, ref))
+            reusable.append((status.created_at_ns or 0, ref))
     reusable.sort(
         key=lambda item: (item[0], item[1].artifact_id),
         reverse=True,

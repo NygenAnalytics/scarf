@@ -858,7 +858,7 @@ def test_h5adtozarr_propagates_band_write_failure(
     assert ("set", "RNA/counts/c/2/0") in store.ops
 
 
-def test_h5adtozarr_counts_materialized_csr_as_resident_memory(tmp_path):
+def test_h5adtozarr_spills_csc_with_bounded_resident_memory(tmp_path):
     from scarf.readers import H5adReader
     from scarf.writers import H5adToZarr
 
@@ -869,18 +869,38 @@ def test_h5adtozarr_counts_materialized_csr_as_resident_memory(tmp_path):
     reader = H5adReader(str(path), feature_name_key="feature_name")
     try:
         reader.infer_storage_dtype()
-        conversion_peak = reader.csc_conversion_peak_bytes()
         writer = H5adToZarr(
             reader,
             zarr_loc=MemoryStore(),
-            mem_budget=conversion_peak,
-            nthreads=4,
+            mem_budget=4 * 1024 * 1024,
+            nthreads=2,
+            policy=CountMatrixPolicy(unitBytes=64 * 1024, chunkBytes=16 * 1024),
         )
-        assert reader.materialized_csr_bytes() > 0
-        with pytest.raises(MemoryError, match="operation limit"):
-            writer.dump(batch_size=values.shape[0])
+        assert reader.materialized_csr_bytes() == (values.shape[0] + 1) * 8
+        writer.dump(batch_size=8)
+        np.testing.assert_array_equal(writer.z["RNA/counts"][:], values)
+        np.testing.assert_array_equal(writer.z["RNA/countsT"][:], values.T)
     finally:
-        reader.h5.close()
+        reader.close()
+
+
+def test_h5ad_clones_share_spill_until_the_last_reader_closes(tmp_path):
+    from pathlib import Path
+    from scarf.readers import H5adReader
+
+    values = np.array([[1, 0], [0, 2], [3, 4]], dtype=np.uint16)
+    path = _write_h5ad(tmp_path / "shared_csc.h5ad", values, encoding="csc")
+    reader = H5adReader(str(path), feature_name_key="feature_name")
+    reader.materialize_csc()
+    directory = Path(reader._convertedCsr._directory.name)
+    clone = reader.open_clone()
+    try:
+        reader.close()
+        assert directory.exists()
+        np.testing.assert_array_equal(next(clone.consume(3)).toarray(), values)
+    finally:
+        clone.close()
+    assert not directory.exists()
 
 
 def test_loomtozarr(loom_reader, tmp_path):
@@ -1063,6 +1083,45 @@ def test_csv_to_zarr_writes_extra_cell_columns_into_workspace(tmp_path):
         root["matrices/RNA/counts"][:],
         np.array([[1, 2], [3, 4], [5, 6]], dtype=np.uint16),
     )
+
+
+@pytest.mark.parametrize(
+    "columns",
+    [
+        ["quality", "batch", "score"],
+        ["score", "batch", "quality"],
+        ["score", "quality"],
+    ],
+)
+def test_csv_to_zarr_preserves_metadata_column_order_and_counts(tmp_path, columns):
+    path = tmp_path / "counts.csv"
+    path.write_text(
+        "cell,quality,g1,batch,score,g2,drop\n"
+        "c1,9007199254740993,1,batch_A,0.5,2,unused_A\n"
+        "c2,8,3,batch_B,1.5,4,unused_B\n"
+        "c3,9,5,batch_C,2.5,6,unused_C\n"
+    )
+    reader = CSVReader(
+        str(path),
+        id_column=0,
+        cell_data_cols=columns,
+        skip_cols=["drop"] + ([] if "batch" in columns else ["batch"]),
+        batch_size=2,
+    )
+    store = MemoryStore()
+    CSVtoZarr(reader, store, assay_name="RNA", nthreads=1).dump()
+
+    root = zarr.open_group(store=store, mode="r")
+    counts = np.array([[1, 2], [3, 4], [5, 6]])
+    np.testing.assert_array_equal(root["RNA/counts"][:], counts)
+    np.testing.assert_array_equal(root["RNA/countsT"][:], counts.T)
+    np.testing.assert_array_equal(root["cellData/ids"][:], ["c1", "c2", "c3"])
+    np.testing.assert_array_equal(root["cellData/quality"][:], [2**53 + 1, 8, 9])
+    np.testing.assert_array_equal(root["cellData/score"][:], [0.5, 1.5, 2.5])
+    if "batch" in columns:
+        np.testing.assert_array_equal(
+            root["cellData/batch"][:], ["batch_A", "batch_B", "batch_C"]
+        )
 
 
 def test_csv_to_zarr_preserves_supplied_cell_ids(tmp_path):

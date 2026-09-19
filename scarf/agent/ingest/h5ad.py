@@ -142,7 +142,7 @@ def ingest_h5ad(
         )
     finally:
         if reader is not None:
-            reader.h5.close()
+            reader.close()
 
     convert_action: dict[str, Any] = {
         "op": "H5adToZarr",

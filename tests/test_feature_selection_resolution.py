@@ -85,6 +85,26 @@ def test_feature_selection_resolves_exact_ref_read_only() -> None:
     assert resolve_feature_selection(read_only, "RNA", ref) == ref
 
 
+def test_feature_row_fingerprint_is_reused_only_within_one_resolution(monkeypatch):
+    import scarf.storage.feature_selection as selection
+
+    root, _, ref = _selection_store()
+    reads = []
+    original = selection.fingerprint_stored_strings
+
+    def fingerprint(array):
+        reads.append(array.path)
+        return original(array)
+
+    monkeypatch.setattr(selection, "fingerprint_stored_strings", fingerprint)
+    assert resolve_feature_selection(root, "RNA", ref) == ref
+    assert reads == ["RNA/featureData/ids"]
+    root["RNA/featureData/ids"][0] = "xx"
+    with pytest.raises(ArtifactResolutionError, match="row identity"):
+        resolve_feature_selection(root, "RNA", ref)
+    assert len(reads) == 2
+
+
 @pytest.mark.parametrize("value", ["selected", "all_features", 1, None])
 def test_feature_selection_rejects_aliases_and_non_refs(value: object) -> None:
     root, _store, _ref = _selection_store()

@@ -1302,10 +1302,21 @@ def test_csv_reader_preserves_batches_skipped_columns_and_cell_metadata(tmp_path
     np.testing.assert_array_equal(reader.cell_ids(), ["cell_0", "cell_1", "cell_2"])
     np.testing.assert_array_equal(reader.feature_ids(), ["g1", "g2"])
     batches = list(reader.consume())
+    assert all(counts.dtype.kind in "iu" for counts, _ in batches)
     np.testing.assert_array_equal(batches[0][0], [[1, 2], [3, 4]])
     np.testing.assert_array_equal(batches[0][1], [["a"], ["b"]])
     np.testing.assert_array_equal(batches[1][0], [[5, 6]])
     np.testing.assert_array_equal(batches[1][1], [["c"]])
+
+
+@pytest.mark.parametrize("option", ["skip_cols", "cell_data_cols"])
+def test_csv_reader_requires_header_for_named_columns(tmp_path, option):
+    from scarf.readers import CSVReader
+
+    path = tmp_path / "counts.csv"
+    path.write_text("1,2,3\n4,5,6\n")
+    with pytest.raises(ValueError, match="header"):
+        CSVReader(str(path), has_header=False, **{option: ["2"]})
 
 
 def test_csv_reader_rejects_features_along_rows(tmp_path):

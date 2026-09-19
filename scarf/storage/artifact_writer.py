@@ -276,7 +276,7 @@ def start_artifact(root: zarr.Group, planned: PlannedArtifact) -> zarr.Group:
     group = root.create_group(path)
     from .. import __version__
 
-    group.attrs.update(
+    group.attrs.put(
         {
             "artifact_id": planned.ref.artifact_id,
             "kind": planned.ref.kind,

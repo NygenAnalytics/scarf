@@ -1,4 +1,6 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 import numpy as np
 import pytest
@@ -11,6 +13,7 @@ from scarf.storage.async_execution import (
     configure_zarr_runtime,
     ensure_zarr_host_ceiling,
     reset_zarr_runtime_for_tests,
+    zarr_io_concurrency,
 )
 from scarf.storage.budget import ResourceBudget, detect_workers
 from scarf.storage.count_matrix import (
@@ -336,6 +339,29 @@ def test_runner_scopes_async_concurrency_and_restores_configured_default() -> No
     assert runner.run(_current_async_concurrency) == 1
     assert zarr.config.get("async.concurrency") == 3
     assert int(zarr.config.get("threading.max_workers")) >= 3
+
+
+def test_overlapping_io_limits_restore_the_remaining_operation() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def limited() -> None:
+        with zarr_io_concurrency(2):
+            entered.set()
+            assert release.wait(5)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(limited)
+        assert entered.wait(5)
+        try:
+            with zarr_io_concurrency(7):
+                assert zarr.config.get("async.concurrency") == 2
+                release.set()
+                pending.result(timeout=5)
+                assert zarr.config.get("async.concurrency") == 7
+        finally:
+            release.set()
+    assert zarr.config.get("async.concurrency") == 10
 
 
 def test_runner_restores_async_concurrency_after_failure() -> None:

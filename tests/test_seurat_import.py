@@ -19,6 +19,7 @@ from tests.test_seurat_reader import (
     _write_delayed_hdf5array_fixture,
     _write_chromatin_fixture,
     _write_fixture,
+    _write_fragment_matrix_fixture,
     _write_single_assay_fixture,
 )
 
@@ -794,6 +795,38 @@ def test_dense_assay_import_rejects_a_budget_below_one_output_band(
     root = zarr.open_group(store=destination, mode="r")
     assert root.attrs["complete"] is False
     assert root.attrs["scarf:import_complete"] is False
+
+
+@pytest.mark.parametrize("mem_budget", ["64M", "1K"])
+def test_fragment_preparation_obeys_import_budget(tmp_path: Path, mem_budget: str):
+    source = _write_fragment_matrix_fixture(tmp_path / "fragments.rds")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    destination = MemoryStore()
+    with SeuratReader(source, temp_dir=scratch) as reader:
+        fragment = reader.get_assay("ATAC").counts._source.layers[0].source
+        assert fragment._rowStore is None
+        writer = SeuratToZarr(
+            reader,
+            destination,
+            mem_budget=mem_budget,
+            nthreads=1,
+            policy=CountMatrixPolicy(unitBytes=4096, chunkBytes=1024),
+        )
+        if mem_budget == "1K":
+            with pytest.raises(MemoryError, match="preparation exceeds mem_budget"):
+                writer.dump()
+            assert fragment._rowStore is None
+            assert not list(scratch.glob("scarf-sparse-*"))
+        else:
+            writer.dump(batch_size=2)
+            root = zarr.open_group(store=destination, mode="r")
+            np.testing.assert_array_equal(
+                root["ATAC/counts"][:],
+                [[2, 0, 2, 3, 1], [1, 0, 1, 3, 0], [0, 1, 2, 2, 2]],
+            )
+            assert root.attrs["complete"] is True
+    assert not list(scratch.glob("scarf-sparse-*"))
 
 
 @pytest.mark.parametrize(

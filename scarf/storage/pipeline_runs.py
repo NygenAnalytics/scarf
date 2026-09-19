@@ -975,8 +975,7 @@ def _write_terminal_attrs(group: zarr.Group, value: Mapping[str, Any]) -> None:
     final_complete = payload.pop("complete")
     if final_complete is not True:
         raise ValueError("terminal writes require complete=True")
-    group.attrs["complete"] = False
-    group.attrs.update(payload)
+    group.attrs.put({**_read_attrs(group), **payload, "complete": False})
     group.attrs["complete"] = True
 
 
@@ -1018,7 +1017,7 @@ def create_pipeline_run_record(
     if path in root:
         raise FileExistsError(f"Pipeline run already exists: {record.run_id}")
     group = _ensure_group(root, PIPELINE_RUNS_PATH).create_group(record.run_id)
-    group.attrs.update(record.to_dict())
+    group.attrs.put(record.to_dict())
     group.create_group("stages")
     return record
 
@@ -1369,7 +1368,7 @@ def start_pipeline_stage_record(
         f"{pipeline_run_path(run_id)}/stages",
         "Pipeline stages",
     )
-    stages.create_group(str(ordinal)).attrs.update(record.to_dict())
+    stages.create_group(str(ordinal)).attrs.put(record.to_dict())
     return record
 
 

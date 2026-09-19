@@ -1,5 +1,7 @@
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Protocol, cast, runtime_checkable
 
 import numpy as np
@@ -13,6 +15,7 @@ from scipy.sparse import (
 )
 
 from .errors import MatrixSourceError, ResourceLimitError
+from .._sparse import SparseRowStore
 
 
 type MatrixBlock = NDArray[Any] | coo_matrix | csr_matrix
@@ -126,6 +129,84 @@ class MatrixSource(Protocol):
     def read_cells(self, start: int, stop: int) -> MatrixBlock: ...
 
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate: ...
+
+
+def _matrix_sources(source: MatrixSource) -> Iterator[MatrixSource]:
+    from .operations import _ResolvedSubassignment
+
+    pending: list[tuple[Any, bool]] = [(source, False)]
+    visited: set[int] = set()
+    while pending:
+        current, expanded = pending.pop()
+        if expanded:
+            yield current
+            continue
+        if id(current) in visited:
+            continue
+        visited.add(id(current))
+        if isinstance(current, LayerPlacement | _ResolvedLayerPlacement):
+            pending.append((current.source, False))
+            continue
+        if isinstance(current, _ResolvedSubassignment):
+            if isinstance(current.value, MatrixSource):
+                pending.append((current.value, False))
+            continue
+        pending.append((current, True))
+        for value in getattr(current, "__dict__", {}).values():
+            if isinstance(
+                value,
+                MatrixSource
+                | LayerPlacement
+                | _ResolvedLayerPlacement
+                | _ResolvedSubassignment,
+            ):
+                pending.append((value, False))
+            elif (
+                isinstance(value, list | tuple)
+                and value
+                and isinstance(
+                    value[0],
+                    MatrixSource
+                    | LayerPlacement
+                    | _ResolvedLayerPlacement
+                    | _ResolvedSubassignment,
+                )
+            ):
+                pending.extend((item, False) for item in value)
+
+
+def release_temporary_storage(source: MatrixSource) -> None:
+    for current in _matrix_sources(source):
+        if isinstance(current, BaseMatrixSource) and current._rowStore is not None:
+            current._rowStore.close()
+            current._rowStore = None
+        if (
+            isinstance(current, TransposeMatrixSource)
+            and current._transposeDirectory is not None
+        ):
+            current._transposeDirectory.cleanup()
+            current._transposeDirectory = None
+
+
+def prepare_matrix_sources(source: MatrixSource, max_bytes: int | None = None) -> None:
+    for current in _matrix_sources(source):
+        if not isinstance(current, BaseMatrixSource):
+            continue
+        limits = current._limits
+        try:
+            if max_bytes is not None:
+                available = max_bytes - source.resident_bytes
+                if available <= 0:
+                    raise MemoryError("Seurat source preparation exceeds mem_budget")
+                current._limits = replace(
+                    limits, maxBlockBytes=min(limits.maxBlockBytes, available)
+                )
+                estimate = current.estimate_read_memory(0, min(1, current.n_cells))
+                if estimate.workingBytes + estimate.outputBytes > available:
+                    raise MemoryError("Seurat source preparation exceeds mem_budget")
+            current._prepare_for_read()
+        finally:
+            current._limits = limits
 
 
 def _metadata_bytes(names: tuple[str, ...] | None) -> int:
@@ -370,6 +451,8 @@ class BaseMatrixSource:
             )
         self._is_sparse = bool(is_sparse)
         self._zero_preserving = bool(zero_preserving)
+        self._rowStore: SparseRowStore | None = None
+        self._tempDir: Path | None = None
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -421,7 +504,11 @@ class BaseMatrixSource:
 
     @property
     def resident_bytes(self) -> int:
-        return _metadata_bytes(self.row_names) + _metadata_bytes(self.column_names)
+        return (
+            _metadata_bytes(self.row_names)
+            + _metadata_bytes(self.column_names)
+            + (0 if self._rowStore is None else self._rowStore.indptr.nbytes)
+        )
 
     @property
     def residentBytes(self) -> int:
@@ -437,6 +524,61 @@ class BaseMatrixSource:
                 f"{estimate.workingBytes + estimate.outputBytes} bytes; "
                 f"maxBlockBytes={self._limits.maxBlockBytes}"
             )
+
+    def _row_store_memory(
+        self,
+        start: int,
+        stop: int,
+        *,
+        nnz: int,
+        source_bytes: int = 0,
+    ) -> MemoryEstimate:
+        if start == stop:
+            return MemoryEstimate(self.resident_bytes, 0, 8)
+        preparation = 0
+        if self._rowStore is None:
+            count = min(nnz, (stop - start) * self.n_features)
+            minimum = (self.n_cells + 1) * 32 + source_bytes + 192
+            preparation = max(
+                minimum,
+                min(self._limits.maxBlockBytes, minimum + nnz * 192),
+            )
+        else:
+            count = int(self._rowStore.indptr[stop] - self._rowStore.indptr[start])
+        output = count * (self.dtype.itemsize + 8) + (stop - start + 1) * 8
+        return MemoryEstimate(
+            self.resident_bytes, max(output, preparation - output), output
+        )
+
+    def _prepare_for_read(self) -> None:
+        pass
+
+    def _prepare_row_store(
+        self,
+        chunks: Callable[[], Iterator[coo_matrix]],
+        *,
+        source_bytes: int = 0,
+    ) -> SparseRowStore:
+        if self._rowStore is None:
+            metadata = _metadata_bytes(self.row_names) + _metadata_bytes(
+                self.column_names
+            )
+            if (self.n_cells + 1) * 8 + metadata > self._limits.maxMetadataBytes:
+                raise ResourceLimitError("Sparse row pointers exceed maxMetadataBytes")
+            try:
+                self._rowStore = SparseRowStore(
+                    chunks,
+                    (self.n_cells, self.n_features),
+                    self.dtype,
+                    max_bytes=self._limits.maxBlockBytes - source_bytes,
+                    max_nnz=self._limits.maxNnz,
+                    temp_dir=self._tempDir,
+                )
+            except MemoryError as error:
+                raise ResourceLimitError(
+                    f"{error}; maxBlockBytes={self._limits.maxBlockBytes}"
+                ) from error
+        return self._rowStore
 
     def read_cells(self, start: int, stop: int) -> MatrixBlock:
         raise NotImplementedError
@@ -829,6 +971,7 @@ class TransposeMatrixSource(BaseMatrixSource):
     ) -> None:
         self.source = source
         self.tile_cells = limits.tileCells if tile_cells is None else int(tile_cells)
+        self._transposeDirectory: TemporaryDirectory[str] | None = None
         if self.tile_cells <= 0:
             raise ValueError("tile_cells must be positive")
         super().__init__(
@@ -847,16 +990,120 @@ class TransposeMatrixSource(BaseMatrixSource):
 
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
         start, stop = self._window(start, stop)
+        if self.is_sparse:
+            return self._row_store_memory(
+                start, stop, nnz=self.n_cells * self.n_features
+            )
         output = (stop - start) * self.n_features * self.dtype.itemsize
-        tile = min(self.tile_cells, self.source.shape[1])
-        working = 0
-        for source_start in range(0, self.source.shape[1], max(1, tile)):
-            source_stop = min(self.source.shape[1], source_start + max(1, tile))
+        working = output
+        if (
+            start != stop
+            and self.n_features
+            and self._transposeDirectory is None
+            and not (
+                type(self.source) is DenseMatrixSource
+                and isinstance(self.source._values, np.ndarray)
+            )
+        ):
             working = max(
                 working,
-                self.source.estimate_read_memory(source_start, source_stop).peakBytes,
+                max(
+                    estimate.workingBytes + 2 * estimate.outputBytes
+                    for _, _, estimate in self._source_windows()
+                )
+                + min(
+                    1024 * 1024,
+                    max(1, self._limits.maxBlockBytes // 4),
+                    self.n_cells * self.n_features * self.dtype.itemsize,
+                )
+                - output,
             )
         return MemoryEstimate(self.resident_bytes, working, output)
+
+    def _source_windows(self) -> Iterator[tuple[int, int, MemoryEstimate]]:
+        start = 0
+        available = self._limits.maxBlockBytes
+        if self.is_sparse:
+            available -= (self.n_cells + 1) * 32
+        while start < self.source.shape[1]:
+            width = min(self.tile_cells, self.source.shape[1] - start)
+            while True:
+                estimate = self.source.estimate_read_memory(start, start + width)
+                if estimate.workingBytes + estimate.outputBytes <= available // 2:
+                    break
+                if width == 1:
+                    raise ResourceLimitError(
+                        "Transpose source tile exceeds maxBlockBytes"
+                    )
+                width = max(1, width // 2)
+            yield start, start + width, estimate
+            start += width
+
+    def _source_blocks(self) -> Iterator[tuple[int, MatrixBlock]]:
+        for start, stop, _ in self._source_windows():
+            yield start, self.source.read_cells(start, stop)
+
+    def _transposed_chunks(self) -> Iterator[coo_matrix]:
+        for start, block in self._source_blocks():
+            values = coo_matrix(block)
+            yield coo_matrix(
+                (values.data, (values.col, values.row + start)),
+                shape=(self.n_cells, self.n_features),
+            )
+
+    def _prepare_for_read(self) -> None:
+        if not self.n_cells or not self.n_features:
+            return
+        self._admit(self.estimate_read_memory(0, 1))
+        if self.is_sparse:
+            self._prepare_row_store(self._transposed_chunks)
+        elif not (
+            type(self.source) is DenseMatrixSource
+            and isinstance(self.source._values, np.ndarray)
+        ):
+            self._prepare_dense()
+
+    def _prepare_dense(self) -> Path:
+        import h5py
+
+        if self._transposeDirectory is None:
+            directory = TemporaryDirectory(prefix="scarf-transpose-", dir=self._tempDir)
+            path = Path(directory.name) / "matrix.h5"
+            try:
+                required = self.n_cells * self.n_features * self.dtype.itemsize
+                import shutil
+
+                if required > shutil.disk_usage(directory.name).free:
+                    raise OSError(f"Dense transpose needs {required} temporary bytes")
+                with h5py.File(path, "w") as handle:
+                    chunk_bytes = min(
+                        1024 * 1024, max(1, self._limits.maxBlockBytes // 4)
+                    )
+                    width = min(
+                        self.tile_cells,
+                        self.n_features,
+                        max(1, chunk_bytes // self.dtype.itemsize),
+                    )
+                    height = min(
+                        self.n_cells,
+                        max(1, chunk_bytes // (width * self.dtype.itemsize)),
+                    )
+                    target = handle.create_dataset(
+                        "matrix",
+                        shape=(self.n_cells, self.n_features),
+                        chunks=(height, width),
+                        dtype=self.dtype,
+                    )
+                    for source_start, block in self._source_blocks():
+                        values = _block_to_dense(block, dtype=self.dtype)
+                        target[:, source_start : source_start + values.shape[0]] = (
+                            values.T
+                        )
+                self._transposeDirectory = directory
+            except BaseException:
+                directory.cleanup()
+                raise
+        return Path(self._transposeDirectory.name) / "matrix.h5"
 
     def read_cells(self, start: int, stop: int) -> MatrixBlock:
         start, stop = self._window(start, stop)
@@ -865,29 +1112,20 @@ class TransposeMatrixSource(BaseMatrixSource):
         if start == stop:
             return _empty_block(0, self.n_features, self.dtype, self.is_sparse)
         if self.is_sparse:
-            pieces: list[csr_matrix] = []
-            for source_start in range(0, self.source.shape[1], self.tile_cells):
-                source_stop = min(self.source.shape[1], source_start + self.tile_cells)
-                block = _block_to_csr(
-                    self.source.read_cells(source_start, source_stop),
-                    dtype=self.dtype,
-                )
-                pieces.append(block[:, start:stop].T.tocsr())
-            if not pieces:
-                return csr_matrix((stop - start, self.n_features), dtype=self.dtype)
-            return cast(
-                MatrixBlock,
-                hstack(pieces, format="csr", dtype=self.dtype),
-            )
-        output = np.empty((stop - start, self.source.shape[1]), dtype=self.dtype)
-        for source_start in range(0, self.source.shape[1], self.tile_cells):
-            source_stop = min(self.source.shape[1], source_start + self.tile_cells)
-            block = _block_to_dense(
-                self.source.read_cells(source_start, source_stop),
-                dtype=self.dtype,
-            )
-            output[:, source_start:source_stop] = block[:, start:stop].T
-        return output
+            return self._prepare_row_store(self._transposed_chunks).read(start, stop)
+        if self.n_features == 0:
+            return np.empty((stop - start, 0), dtype=self.dtype)
+        if type(self.source) is DenseMatrixSource and isinstance(
+            self.source._values, np.ndarray
+        ):
+            values = self.source._values
+            if self.source._flat:
+                values = values.reshape(self.source.shape, order="F")
+            return np.ascontiguousarray(values[start:stop], dtype=self.dtype)
+        import h5py
+
+        with h5py.File(self._prepare_dense(), "r") as handle:
+            return np.asarray(handle["matrix"][start:stop])
 
 
 TransposeSource = TransposeMatrixSource

@@ -78,3 +78,4 @@ notebook/
 PR/
 scarf/agent/*.md
 .cache/
+review/

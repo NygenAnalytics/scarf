@@ -1199,18 +1199,13 @@ class _MtxEngine:
                         np.array([grouped_cells.size], dtype=np.int64),
                     )
                 )
-                positions_sorted = np.empty(grouped_cells.size, dtype=np.int64)
-                for left, right in zip(edges[:-1], edges[1:], strict=True):
-                    cell = int(grouped_cells[left])
-                    width = int(right - left)
-                    positions_sorted[left:right] = cursor[cell] + np.arange(
-                        width, dtype=np.int64
-                    )
-                    cursor[cell] += width
-                positions = np.empty_like(positions_sorted)
-                positions[order] = positions_sorted
-                data[positions] = selected_values
-                indices[positions] = selected_features
+                widths = np.diff(edges)
+                positions = cursor[grouped_cells]
+                positions += np.arange(grouped_cells.size, dtype=np.int64)
+                positions -= np.repeat(edges[:-1], widths)
+                cursor[grouped_cells[edges[:-1]]] += widths
+                data[positions] = selected_values[order]
+                indices[positions] = selected_features[order]
             if not np.array_equal(cursor, self._cumulativeRowNnz[1:]):
                 raise RuntimeError(
                     "Feature-major CSR preparation produced inconsistent row pointers"

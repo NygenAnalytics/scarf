@@ -37,9 +37,9 @@ def _io_concurrency(io: int | None) -> Iterator[None]:
     if io is None:
         yield
         return
-    import zarr
+    from .async_execution import zarr_io_concurrency
 
-    with zarr.config.set({"async.concurrency": max(1, int(io))}):
+    with zarr_io_concurrency(io):
         yield
 
 

@@ -395,7 +395,9 @@ def test_feature_selection_snapshot_and_mapping_input_contracts(
         parameters=hvg_parameters,
     )
     monkeypatch.setattr(
-        feature_selection, "_validate_feature_summary_parent", lambda *_args: None
+        feature_selection,
+        "_validate_feature_summary_parent",
+        lambda *_args, **_kwargs: None,
     )
     with pytest.raises(ArtifactResolutionError, match="snapshot input"):
         feature_selection._validate_feature_selection_provenance(
