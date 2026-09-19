@@ -448,7 +448,7 @@ def test_selection_equality_uses_validated_immutable_fingerprints(
     assert not store._selection_artifacts_match(first, same_values)
 
 
-def test_doublet_mapping_is_query_owned_and_leaves_reference_unprojected(
+def test_doublet_scores_preserve_artifacts_without_materializing_queries(
     analyzed_datastore_ephemeral,
     monkeypatch,
 ) -> None:
@@ -492,31 +492,19 @@ def test_doublet_mapping_is_query_owned_and_leaves_reference_unprojected(
             from_assay="RNA",
         )
     )
-    temporary_paths: list[Path] = []
-    mapping_calls = 0
-    original_run_mapping = type(datastore).run_mapping
+    from scarf.quality_control import doublets
 
-    def observe_mapping(query, reference, cell_selection, **kwargs):
-        nonlocal mapping_calls
-        mapping_calls += 1
-        assert query is not datastore
-        assert isinstance(cell_selection, ArtifactRef)
-        assert cell_selection.kind == "cell_selection"
-        assert kwargs == {"query_assay": "RNA", "save_k": 3}
-        temporary_path = Path(query.zarr_loc)
-        temporary_paths.append(temporary_path)
-        assert temporary_path.exists()
-        before = _snapshot_store(datastore.zarr_loc)
-        result = original_run_mapping(
-            query,
-            reference,
-            cell_selection,
-            **kwargs,
+    def forbidden(*args, **kwargs):
+        raise AssertionError(
+            "Doublet scoring must not create a query store or projection"
         )
-        assert _snapshot_store(datastore.zarr_loc) == before
-        return result
 
-    monkeypatch.setattr(type(datastore), "run_mapping", observe_mapping)
+    monkeypatch.setattr(type(datastore), "run_mapping", forbidden)
+    monkeypatch.setattr(type(datastore), "_create_temporary_datastore", forbidden)
+    monkeypatch.setattr(doublets, "write_doublet_target_zarr", forbidden)
+    diffusion_before = set(
+        datastore.list_artifacts(kind="diffusion_operator", from_assay="RNA")
+    )
 
     score_ref = datastore.run_doublet_detection(
         clusters,
@@ -529,12 +517,10 @@ def test_doublet_mapping_is_query_owned_and_leaves_reference_unprojected(
         random_seed=19,
     )
 
-    assert mapping_calls == 1
     assert score_ref != previous.ref
     assert datastore.inspect_artifact(score_ref).parameters["count_arithmetic"] == (
         "checked_integer_sum"
     )
-    assert temporary_paths and all(not path.exists() for path in temporary_paths)
     assert (
         set(
             datastore.list_artifacts(
@@ -578,6 +564,11 @@ def test_doublet_mapping_is_query_owned_and_leaves_reference_unprojected(
     reference = matching[-1]
     assert reference.method == "pca"
     assert reference.symphony_state is None
+    assert (
+        set(datastore.list_artifacts(kind="diffusion_operator", from_assay="RNA"))
+        == diffusion_before
+    )
+    monkeypatch.setattr(doublets, "score_synthetic_doublets", forbidden)
 
     assert (
         datastore.run_doublet_detection(
@@ -592,42 +583,33 @@ def test_doublet_mapping_is_query_owned_and_leaves_reference_unprojected(
         )
         == score_ref
     )
-    assert mapping_calls == 1
     assert (
         _snapshot_store(str(Path(datastore.zarr_loc) / "cellData")) == metadata_before
     )
 
 
-def test_doublet_mapping_failure_removes_temporary_query_store(
+def test_doublet_query_failure_leaves_no_complete_score(
     analyzed_datastore_ephemeral,
     monkeypatch,
 ) -> None:
     datastore = analyzed_datastore_ephemeral
     graph = _fixture_graph(datastore)
     clusters = _doublet_clusters(datastore, graph)
-    selected_count = len(
-        artifact_values(artifact_group(datastore.zw, clusters), "values")
-    )
+    from scarf.neighbors.stages import NeighborQueryStage
+
     metadata_before = _snapshot_store(str(Path(datastore.zarr_loc) / "cellData"))
-    temporary_paths: list[Path] = []
-    original_run_mapping = type(datastore).run_mapping
-
-    def capture_mapping(query, reference, cell_selection, **kwargs):
-        temporary_paths.append(Path(query.zarr_loc))
-        return original_run_mapping(
-            query,
-            reference,
-            cell_selection,
-            **kwargs,
+    scores_before = set(
+        datastore.list_artifacts(
+            kind="doublet_score", from_assay="RNA", complete_only=True
         )
+    )
 
-    def wrong_length_score(_query, _result, *_args, **_kwargs):
-        yield 0, np.zeros(selected_count - 1)
+    def failed_query(*args, **kwargs):
+        raise RuntimeError("neighbor query failed")
 
-    monkeypatch.setattr(type(datastore), "run_mapping", capture_mapping)
-    monkeypatch.setattr(type(datastore), "get_mapping_score", wrong_length_score)
+    monkeypatch.setattr(NeighborQueryStage, "query", failed_query)
 
-    with pytest.raises(RuntimeError, match="selected cells"):
+    with pytest.raises(RuntimeError, match="neighbor query failed"):
         datastore.run_doublet_detection(
             clusters,
             graph,
@@ -639,7 +621,14 @@ def test_doublet_mapping_failure_removes_temporary_query_store(
             random_seed=23,
         )
 
-    assert temporary_paths and all(not path.exists() for path in temporary_paths)
+    assert (
+        set(
+            datastore.list_artifacts(
+                kind="doublet_score", from_assay="RNA", complete_only=True
+            )
+        )
+        == scores_before
+    )
     assert not datastore.list_artifacts(
         kind="projection",
         from_assay="RNA",

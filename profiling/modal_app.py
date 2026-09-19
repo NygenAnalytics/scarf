@@ -1168,6 +1168,8 @@ def main(*arg_list: str) -> None:
         call = target.with_options(**options).spawn(payload, args.size)
         _print_spawned(f"run_e2e_funnel_job {args.size}", call)
         print(f"result URI (when done): {config.funnelResultUri(args.size)}")
+        if args.ephemeral:
+            _wait_ephemeral(call)
         return
 
     if args.command == "run-local":

@@ -12,11 +12,14 @@ from ...storage.artifacts import (
     artifact_group,
     canonical_bytes,
     fingerprint_array,
-    inspect_artifact,
 )
 from ...storage.types import as_zarr_array
 from ...assay import RNAassay
-from ...mapping.artifact import validate_mapping_reference_binding
+from ...mapping.artifact import (
+    _load_reference_neighbor_query,
+    _reference_available_k,
+    validate_mapping_reference_binding,
+)
 from ...mapping.features import AlignedFeatureStream
 from ...mapping.models import MappingResult
 from ...mapping.projection import (
@@ -37,11 +40,6 @@ from ...mapping.symphony import (
     solve_query_correction,
     zero_norm_rows,
 )
-from ...neighbors.stages import (
-    AnnIndexStage,
-    NeighborQueryStage,
-)
-from ...storage.ann_index import has_ann_index, load_ann_index
 from ...storage.geometry import array_geometry
 from ...storage.partition import row_band
 from ...storage.selections import (
@@ -199,103 +197,6 @@ def _mapping_memory_reservations(
         3 * symphony.n_clusters + 3 * symphony.n_dims
     ) * float_bytes + symphony.n_clusters * symphony.n_dims * float_bytes
     return resident, per_row
-
-
-def _reference_available_k(reference: MappingReference) -> int:
-    root = reference.datastore.zw
-    rebuild = "Rebuild it with build_mapping_reference(neighbors)."
-    reference.validate_frozen_axes()
-    if reference.ref.assay != reference.assay_name:
-        raise ValueError(f"Mapping reference assay identity is inconsistent. {rebuild}")
-    if reference.model.n_features != len(reference.feature_ids):
-        raise ValueError(
-            f"Mapping reference feature dimensions are inconsistent. {rebuild}"
-        )
-    if reference.method == "pca":
-        if reference.symphony_state is not None:
-            raise ValueError(f"Plain mapping reference has Symphony state. {rebuild}")
-    elif reference.method == "symphony":
-        if reference.symphony_state is None:
-            raise ValueError(
-                f"Symphony mapping reference has no correction state. {rebuild}"
-            )
-    else:
-        raise ValueError(f"Mapping reference method is unsupported. {rebuild}")
-
-    expected = (
-        (reference.ref, "build_mapping_reference"),
-        (reference.reduction, "run_pca"),
-        (reference.ann_index, "build_ann_index"),
-        (reference.neighbors, "query_neighbors"),
-    )
-    statuses = {}
-    for ref, operation in expected:
-        status = inspect_artifact(root, ref)
-        if not status.exists or not status.complete or status.operation != operation:
-            raise ValueError(f"Mapping reference graph chain is incomplete. {rebuild}")
-        statuses[ref] = status
-
-    ann_status = statuses[reference.ann_index]
-    ann_parameters = ann_status.parameters or {}
-    if ann_parameters.get("ann_metric") != reference.ann_metric:
-        raise ValueError(f"Mapping reference ANN metric is inconsistent. {rebuild}")
-    ann_ef = ann_parameters.get("ann_ef", 50)
-    if isinstance(ann_ef, bool) or not isinstance(ann_ef, int) or ann_ef < 1:
-        raise ValueError(f"Mapping reference ANN search depth is invalid. {rebuild}")
-
-    neighbors_status = statuses[reference.neighbors]
-    raw_ann = (neighbors_status.inputs or {}).get("ann_index")
-    if (
-        not isinstance(raw_ann, dict)
-        or ArtifactRef.from_dict(raw_ann) != reference.ann_index
-    ):
-        raise ValueError(
-            f"Mapping reference neighbors use another ANN index. {rebuild}"
-        )
-    if (neighbors_status.parameters or {}).get(
-        "distance_metric"
-    ) != reference.ann_metric:
-        raise ValueError(
-            f"Mapping reference neighbor metric is inconsistent. {rebuild}"
-        )
-
-    neighbors_group = artifact_group(root, reference.neighbors)
-    indices = as_zarr_array(neighbors_group["indices"], name="indices")
-    distances = as_zarr_array(neighbors_group["distances"], name="distances")
-    if (
-        indices.ndim != 2
-        or distances.shape != indices.shape
-        or int(indices.shape[0]) != reference.selected_cell_count
-        or int(indices.shape[1]) < 1
-    ):
-        raise ValueError(f"Mapping reference neighbor payload is invalid. {rebuild}")
-    ann_group = artifact_group(root, reference.ann_index)
-    if not has_ann_index(ann_group):
-        raise ValueError(f"Mapping reference ANN index is missing. {rebuild}")
-    return int(indices.shape[1])
-
-
-def _load_reference_neighbor_query(
-    reference: MappingReference,
-    *,
-    save_k: int,
-    workers: int,
-) -> NeighborQueryStage:
-    root = reference.datastore.zw
-    ann_status = inspect_artifact(root, reference.ann_index)
-    parameters = ann_status.parameters or {}
-    index = load_ann_index(
-        artifact_group(root, reference.ann_index),
-        reference.ann_metric,
-        reference.model.n_dims,
-        expected_count=reference.selected_cell_count,
-    )
-    configured = AnnIndexStage.configure(
-        index,
-        ef=int(parameters.get("ann_ef", 50)),
-        threads=workers,
-    )
-    return NeighborQueryStage(configured, save_k, reference.ann_metric)
 
 
 class _MappingOperationsMixin(_MappingOperationsBase):

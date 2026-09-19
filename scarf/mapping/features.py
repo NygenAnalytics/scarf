@@ -144,6 +144,31 @@ def _normalization_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
     return values
 
 
+def normalize_reference_counts(
+    raw: np.ndarray,
+    *,
+    size_factor: float,
+    log_transform: bool,
+    denominator: np.ndarray | None = None,
+) -> np.ndarray:
+    if denominator is None:
+        denominator = raw.sum(axis=1, dtype=np.float64)
+    if (
+        denominator.shape != (len(raw),)
+        or not np.all(np.isfinite(denominator))
+        or np.any(denominator < 0)
+    ):
+        raise ValueError("Query normalization totals must be finite and non-negative")
+    if np.any(denominator == 0):
+        denominator = np.where(denominator == 0, 1, denominator)
+    normalized = raw.astype(np.float64, copy=True)
+    normalized *= size_factor
+    normalized /= denominator[:, None]
+    if log_transform:
+        np.log1p(normalized, out=normalized)
+    return normalized
+
+
 class AlignedFeatureStream:
     """Replay normalized query rows in immutable reference feature order."""
 
@@ -526,17 +551,16 @@ class AlignedFeatureStream:
             total=len(self._row_geometry.boundaries),
         )
         for start, raw in raw_blocks:
-            normalized = raw.astype(np.float64, copy=True)
-            normalized *= self.size_factor
-            if self.renormalize_subset:
-                denominator = raw.sum(axis=1, dtype=np.float64)
-                denominator[denominator == 0] = 1
-            else:
-                assert self._cell_scalars is not None
-                denominator = self._cell_scalars[start : start + len(raw)]
-            normalized /= denominator[:, np.newaxis]
-            if self.log_transform:
-                np.log1p(normalized, out=normalized)
+            normalized = normalize_reference_counts(
+                raw,
+                size_factor=self.size_factor,
+                log_transform=self.log_transform,
+                denominator=(
+                    None
+                    if self._cell_scalars is None
+                    else self._cell_scalars[start : start + len(raw)]
+                ),
+            )
 
             values = np.empty(
                 (len(raw), len(self._reference_feature_ids)),

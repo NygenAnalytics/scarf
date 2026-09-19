@@ -2164,14 +2164,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             from_assay = groups.assay
         assay = self._get_assay(from_assay)
 
-        vals: dict[str, NDArray[Any]] = {}
-        fracs: dict[str, NDArray[Any]] = {}
-        all_feat_idx = np.arange(assay.feats.N)
-        for g in iter_progress(
-            groups_set,
-            desc="Aggregating pseudo-replicates",
-            total=len(groups_set),
-        ):
+        column_rows: dict[str, NDArray[Any]] = {}
+        for g in groups_set:
             if g in null_vals:
                 continue
             for sg in sec_groups_set:  # type: ignore
@@ -2192,28 +2186,76 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                         col_name = f"{g}_{sg}"
                     if pseudo_reps > 1:
                         col_name += f"_Rep{n + 1}"
-                    if len(idx) == 0:
-                        vals[col_name] = np.zeros(assay.feats.N)
-                        continue
-                    if aggr_type == "sum":
-                        vals[col_name] = controlled_compute(
-                            assay.rawData[idx].sum(axis=0), self.nthreads
-                        )
-                    elif aggr_type == "mean":
-                        vals[col_name] = controlled_compute(
-                            assay.normed(cell_idx=idx, feat_idx=all_feat_idx).mean(
-                                axis=0
-                            ),
-                            self.nthreads,
-                        )
-                    else:
-                        raise ValueError(
-                            "ERROR: `aggr_type` can only be either 'sum' or 'mean'"
-                        )
+                    column_rows[col_name] = idx
+
+        vals: dict[str, NDArray[Any]] = {}
+        fracs: dict[str, NDArray[Any]] = {}
+        stream_rna = isinstance(assay, RNAassay) and (
+            aggr_type == "sum"
+            or (aggr_type == "mean" and lib_size_feature_stream_eligible(assay))
+        )
+        if stream_rna and column_rows:
+            from ...features.aggregation import aggregate_rna_groups
+            from ...metadata.rows import read_metadata_rows_chunkwise
+
+            assert isinstance(assay, RNAassay)
+            codes = np.full(len(active_idx), -1, dtype=np.int64)
+            for code, idx in enumerate(column_rows.values()):
+                codes[np.searchsorted(active_idx, idx)] = code
+            included = codes >= 0
+            cell_idx = active_idx[included]
+            codes = codes[included]
+            scalars = (
+                np.asarray(
+                    read_metadata_rows_chunkwise(
+                        self.cells, f"{assay.name}_nCounts", cell_idx
+                    ),
+                    dtype=np.float64,
+                )
+                if aggr_type == "mean"
+                else None
+            )
+            values, fractions = aggregate_rna_groups(
+                assay.rawDataT,
+                cell_idx,
+                codes,
+                len(column_rows),
+                scalars=scalars,
+                size_factor=assay.sf,
+                return_fraction=return_fraction,
+                resources=self.resources,
+                io=assay.storageIo,
+            )
+            vals = {name: values[:, i] for i, name in enumerate(column_rows)}
+            if fractions is not None:
+                fracs = {name: fractions[:, i] for i, name in enumerate(column_rows)}
+        else:
+            all_feat_idx = np.arange(assay.feats.N)
+            for col_name, idx in iter_progress(
+                column_rows.items(),
+                desc="Aggregating pseudo-replicates",
+                total=len(column_rows),
+            ):
+                if len(idx) == 0:
+                    vals[col_name] = np.zeros(assay.feats.N)
                     if return_fraction:
-                        fracs[col_name] = (
-                            (assay.rawData[idx] > 0).mean(axis=0).compute()
-                        )
+                        fracs[col_name] = np.zeros(assay.feats.N)
+                    continue
+                if aggr_type == "sum":
+                    vals[col_name] = controlled_compute(
+                        assay.rawData[idx].sum(axis=0), self.nthreads
+                    )
+                elif aggr_type == "mean":
+                    vals[col_name] = controlled_compute(
+                        assay.normed(cell_idx=idx, feat_idx=all_feat_idx).mean(axis=0),
+                        self.nthreads,
+                    )
+                else:
+                    raise ValueError(
+                        "ERROR: `aggr_type` can only be either 'sum' or 'mean'"
+                    )
+                if return_fraction:
+                    fracs[col_name] = (assay.rawData[idx] > 0).mean(axis=0).compute()
 
         vals_df = pd.DataFrame(vals).fillna(0)
 

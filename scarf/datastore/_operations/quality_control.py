@@ -49,6 +49,7 @@ from ...storage.feature_selection import (
     _feature_selection_plan,
     _ordered_feature_ids_fingerprint,
     _write_feature_selection,
+    read_feature_selection_indices,
     resolve_feature_selection,
 )
 from ...storage.refs import ArtifactRef
@@ -64,7 +65,6 @@ from ...utils.compute import controlled_compute
 from ...utils.logging import logger
 
 if TYPE_CHECKING:
-    from ...storage.profiles import ZarrLocation
     from ..mapping_datastore import MappingDatastore as _QualityControlOperationsBase
 else:
     _QualityControlOperationsBase = object
@@ -90,17 +90,6 @@ def _validated_named_cell_artifacts(
 
 
 class _QualityControlOperationsMixin(_QualityControlOperationsBase):
-    if TYPE_CHECKING:
-
-        def _create_temporary_datastore(
-            self,
-            zarr_loc: ZarrLocation,
-            *,
-            default_assay: str,
-            assay_types: dict[str, str],
-            nthreads: int,
-        ) -> _QualityControlOperationsBase: ...
-
     def _run_cell_cycle_scoring_artifact(
         self,
         *,
@@ -1210,17 +1199,11 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
         """Create doublet scores without creating metadata columns."""
-        import shutil
-        import tempfile
-
-        from scipy.sparse import csr_matrix
-
         from ...quality_control.doublets import (
-            sample_cluster_pool,
-            simulate_doublet_pairs,
-            sum_doublet_pairs,
-            write_doublet_target_zarr,
+            score_synthetic_doublets,
+            smooth_doublet_scores,
         )
+        from ...storage.budget import admit_stream
 
         assay_name = source_assay.name
         if feature_names is not None and np.asarray(feature_names).shape != (
@@ -1323,99 +1306,83 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 "The mapping reference does not match the uncorrected RNA graph"
             )
 
-        rng = np.random.default_rng(random_seed)
-        pool_positions = sample_cluster_pool(
-            labels,
-            cluster_sample_fraction,
-            max_cells_per_cluster,
-            rng,
+        feature_indices = read_feature_selection_indices(
+            self.zw,
+            assay_name,
+            feature_selection,
         )
-        pool_clusters = labels[pool_positions]
-        pool_raw_rows = active_idx[pool_positions]
-        logger.debug(
-            f"Sampled {len(pool_positions)} cells across "
-            f"{len(np.unique(pool_clusters))} clusters to seed doublet simulation"
+        feature_ids = read_metadata_rows_chunkwise(
+            source_assay.feats,
+            "ids",
+            feature_indices,
         )
-        pool_counts = controlled_compute(
-            source_assay.rawData[pool_raw_rows, :],
-            self.nthreads,
-        )
-        pool_csr = csr_matrix(pool_counts)
-        n_sim = max(1, int(round(simulation_ratio * n_active)))
-        left, right = simulate_doublet_pairs(
-            pool_clusters,
-            n_sim,
-            heterotypic_fraction,
-            rng,
-        )
-        sim_counts = sum_doublet_pairs(pool_csr, left, right)
-        logger.debug(f"Simulated {n_sim} synthetic doublets")
+        if not np.array_equal(
+            np.asarray(feature_ids).astype(str), reference.feature_ids
+        ):
+            raise ValueError(
+                "Doublet features do not match the mapping reference order"
+            )
 
-        temp_dir = tempfile.mkdtemp(prefix="scarf_doublet_")
-        try:
-            write_doublet_target_zarr(
-                zarr_loc=temp_dir,
-                assay_name=assay_name,
-                sim_counts=sim_counts,
-                feat_ids=source_assay.feats.fetch_all("ids"),
-                feat_names=(
-                    source_assay.feats.fetch_all("names")
-                    if feature_names is None
-                    else np.asarray(feature_names)
-                ),
-                dtype=str(sim_counts.dtype),
-                mem_budget=self.memoryBytes,
-                nthreads=self.nthreads,
-                profile="fast_local",
-            )
-            target_ds = self._create_temporary_datastore(
-                temp_dir,
-                default_assay=assay_name,
-                assay_types={assay_name: "RNA"},
-                nthreads=self.nthreads,
-            )
-            target_selection = target_ds.snapshot_cell_selection("I")
-            result = target_ds.run_mapping(
-                reference,
-                target_selection,
-                query_assay=assay_name,
-                save_k=save_k,
-            )
-            try:
-                _, raw_scores = next(
-                    target_ds.get_mapping_score(
-                        result,
-                        reference=reference,
-                        log_transform=True,
-                    )
+        cached_bytes = 0
+        cache = getattr(self, "_graphMemoryCache", None)
+        if cache is not None:
+            with self._graphMemoryCacheLock:
+                matrices = {id(value): value for value in cache.values()}
+                cached_bytes = sum(
+                    matrix.data.nbytes + matrix.indices.nbytes + matrix.indptr.nbytes
+                    for matrix in matrices.values()
                 )
-            except StopIteration:
-                raise RuntimeError(
-                    "Mapping scores could not be computed for simulated doublets"
-                ) from None
-            raw_scores = np.asarray(raw_scores)
-            if raw_scores.shape != (n_active,):
-                raise RuntimeError(
-                    "Doublet mapping scores do not match the selected cells"
-                )
-            diffusion_ref = self.run_diffusion_operator(
-                connectivity,
-                t=smoothing_t,
-                invalidate_cache=invalidate_cache,
-            )
-            diffusion = self.load_diffusion_operator(diffusion_ref)
-            scores = np.asarray(diffusion.dot(raw_scores), dtype=float)
-            if normalize_scores:
-                lo, hi = scores.min(), scores.max()
-                scores = (scores - lo) / (hi - lo) if hi > lo else np.zeros_like(scores)
-            write_cell_data_artifact(
-                self.zw,
-                planned,
-                {"values": scores},
-            )
-            logger.info(f"Stored doublet scores using {n_sim} synthetic doublets")
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        raw_scores = score_synthetic_doublets(
+            source_assay,
+            reference,
+            active_idx,
+            labels,
+            feature_indices,
+            cluster_sample_fraction=cluster_sample_fraction,
+            max_cells_per_cluster=max_cells_per_cluster,
+            simulation_ratio=simulation_ratio,
+            heterotypic_fraction=heterotypic_fraction,
+            save_k=save_k,
+            random_seed=random_seed,
+            resources=self.resources,
+            reserved_resident_bytes=cached_bytes,
+        )
+        del reference
+        if raw_scores.shape != (n_active,):
+            raise RuntimeError("Doublet mapping scores do not match the selected cells")
+        graph_group = artifact_group(self.zw, connectivity)
+        edges = as_zarr_array(graph_group["edges"], name="edges")
+        weights = as_zarr_array(graph_group["weights"], name="weights")
+        # Loading, symmetrizing and row-normalizing may hold several sparse copies.
+        graph_bytes = (
+            int(edges.nbytes)
+            + int(weights.nbytes)
+            + 8 * int(weights.shape[0]) * (weights.dtype.itemsize + 8)
+            + 128 * (n_active + 1)
+        )
+        admit_stream(
+            self.resources,
+            nBlocks=1,
+            blockBytes=graph_bytes,
+            residentBytes=cached_bytes
+            + active_idx.nbytes
+            + labels.nbytes
+            + raw_scores.nbytes
+            + feature_ids.nbytes
+            + feature_indices.nbytes,
+            requested=1,
+        )
+        graph = self.load_graph(connectivity, symmetric=True, upper_only=False)
+        if graph.shape != (n_active, n_active):
+            raise ValueError("Doublet graph does not match the selected cells")
+        scores = smooth_doublet_scores(
+            graph,
+            raw_scores,
+            power=smoothing_t,
+            normalize=normalize_scores,
+        )
+        write_cell_data_artifact(self.zw, planned, {"values": scores})
+        logger.info("Stored doublet scores")
         return planned.ref
 
     def run_doublet_detection(
