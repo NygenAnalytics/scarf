@@ -1,5 +1,6 @@
 """Regression tests for mapping reference artifact load contracts."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -8,6 +9,7 @@ import zarr
 from zarr.storage import MemoryStore
 
 from scarf.mapping.artifact import (
+    _reference_available_k,
     load_artifact_mapping_reference,
     validate_mapping_reference_sources,
     write_artifact_mapping_reference,
@@ -17,6 +19,7 @@ from scarf.mapping.models import (
     SymphonyCorrectionModel,
 )
 from scarf.storage.artifact_writer import finish_artifact, plan_artifact, start_artifact
+from scarf.storage.ann_index import ANN_INDEX_ARRAY
 from scarf.storage.artifacts import ArtifactRef, artifact_group
 
 
@@ -47,6 +50,88 @@ def _plain_reference(datastore):
     )
     reference_ref = datastore.build_mapping_reference(neighbors)
     return datastore.get_mapping_reference(reference_ref)
+
+
+def test_reference_query_rejects_inconsistent_handles(analyzed_datastore_ephemeral):
+    reference = _plain_reference(analyzed_datastore_ephemeral)
+    assert _reference_available_k(reference) > 0
+    for changes, message in (
+        ({"ref": replace(reference.ref, assay="other")}, "assay identity"),
+        ({"feature_ids": reference.feature_ids[:-1]}, "feature dimensions"),
+        ({"symphony_state": object()}, "Plain mapping reference has Symphony state"),
+        (
+            {"metadata": dict(reference.metadata) | {"method": "symphony"}},
+            "no correction state",
+        ),
+        (
+            {"metadata": dict(reference.metadata) | {"method": "unknown"}},
+            "method is unsupported",
+        ),
+    ):
+        with pytest.raises(ValueError, match=message):
+            _reference_available_k(replace(reference, **changes))
+
+
+@pytest.mark.parametrize(
+    ("source", "section", "key", "value", "message"),
+    [
+        (
+            "ann_index",
+            "parameters",
+            "ann_metric",
+            "cosine",
+            "ANN metric is inconsistent",
+        ),
+        ("ann_index", "parameters", "ann_ef", 0, "search depth is invalid"),
+        ("ann_index", "parameters", "ann_ef", True, "search depth is invalid"),
+        ("neighbors", "inputs", "ann_index", None, "another ANN index"),
+        (
+            "neighbors",
+            "parameters",
+            "distance_metric",
+            "cosine",
+            "neighbor metric is inconsistent",
+        ),
+    ],
+)
+def test_reference_query_rejects_corrupted_provenance(
+    analyzed_datastore_ephemeral, source, section, key, value, message
+):
+    reference = _plain_reference(analyzed_datastore_ephemeral)
+    group = artifact_group(reference.datastore.zw, getattr(reference, source))
+    provenance = dict(group.attrs["provenance"])
+    provenance[section] = dict(provenance[section]) | {key: value}
+    group.attrs["provenance"] = provenance
+    with pytest.raises(ValueError, match=message):
+        _reference_available_k(reference)
+
+
+@pytest.mark.parametrize("source", ["ref", "reduction", "ann_index", "neighbors"])
+def test_reference_query_rejects_incomplete_graph_chain(
+    analyzed_datastore_ephemeral, source
+):
+    reference = _plain_reference(analyzed_datastore_ephemeral)
+    artifact_group(reference.datastore.zw, getattr(reference, source)).attrs[
+        "complete"
+    ] = False
+    with pytest.raises(ValueError, match="graph chain is incomplete"):
+        _reference_available_k(reference)
+
+
+@pytest.mark.parametrize("payload", ["neighbors", "ann_index"])
+def test_reference_query_rejects_corrupted_payload(
+    analyzed_datastore_ephemeral, payload
+):
+    reference = _plain_reference(analyzed_datastore_ephemeral)
+    group = artifact_group(reference.datastore.zw, getattr(reference, payload))
+    if payload == "neighbors":
+        group["distances"].resize((reference.selected_cell_count, 1))
+        message = "neighbor payload is invalid"
+    else:
+        del group[ANN_INDEX_ARRAY]
+        message = "ANN index is missing"
+    with pytest.raises(ValueError, match=message):
+        _reference_available_k(reference)
 
 
 def test_load_rejects_non_mapping_reference_refs() -> None:

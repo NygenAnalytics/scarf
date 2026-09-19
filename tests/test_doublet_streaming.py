@@ -10,6 +10,28 @@ from scarf.storage.budget import ResourceBudget
 from scarf.storage.count_matrix import CountMatrixPolicy
 
 
+@pytest.mark.parametrize(
+    "save_k,error",
+    [(0, ValueError), (-1, ValueError), (True, TypeError), (1.5, TypeError)],
+)
+def test_doublet_scoring_rejects_invalid_k_before_reading_counts(save_k, error):
+    with pytest.raises(error, match="save_k must be a positive integer"):
+        doublets.score_synthetic_doublets(
+            None,
+            None,
+            np.arange(2),
+            np.array([0, 1]),
+            np.arange(3),
+            cluster_sample_fraction=1,
+            max_cells_per_cluster=2,
+            simulation_ratio=1,
+            heterotypic_fraction=0.8,
+            save_k=save_k,
+            random_seed=91,
+            resources=ResourceBudget(1_000_000, 1),
+        )
+
+
 @pytest.mark.parametrize("detected", [[0, 9, 10, 11], [9, 10, 10, 11], [10, 10]])
 def test_doublet_statistics_preserve_feature_filter_and_batch_results(detected):
     counts = -np.ones((len(detected), 14), dtype=np.int16)
@@ -97,16 +119,17 @@ def test_doublet_smoothing_rejects_invalid_power(power, error):
 
 
 @pytest.mark.parametrize(
-    "log,subset,constant",
+    "log,subset,constant,filtered",
     [
-        (False, False, False),
-        (True, False, False),
-        (True, True, False),
-        (False, False, True),
+        (False, False, False, False),
+        (True, False, False, False),
+        (True, True, False, False),
+        (False, False, True, False),
+        (False, False, False, True),
     ],
 )
 def test_streamed_doublets_match_materialized_mapping(
-    tmp_path, monkeypatch, log, subset, constant
+    tmp_path, monkeypatch, log, subset, constant, filtered
 ):
     rng = np.random.default_rng(73)
     counts = (
@@ -114,6 +137,8 @@ def test_streamed_doublets_match_materialized_mapping(
         if constant
         else rng.integers(0, 200, (30, 24), dtype=np.uint16)
     )
+    if filtered:
+        counts[:15, 4:] = 0
     ids = np.array([f"g{i}" for i in range(counts.shape[1])])
     path = str(tmp_path / "reference.zarr")
     doublets.write_doublet_target_zarr(
@@ -151,6 +176,10 @@ def test_streamed_doublets_match_materialized_mapping(
     parents = doublets.sample_cluster_pool(labels, 0.5, 3, rng)
     left, right = doublets.simulate_doublet_pairs(labels[parents], 60, 0.8, rng)
     simulated = doublets.sum_doublet_pairs(csr_matrix(counts[parents]), left, right)
+    if filtered:
+        detected = np.asarray((simulated > 0).sum(axis=1)).ravel()
+        assert np.median(detected) > 10
+        assert np.any(detected <= 10)
     query_path = str(tmp_path / "query.zarr")
     doublets.write_doublet_target_zarr(
         query_path,
@@ -183,7 +212,7 @@ def test_streamed_doublets_match_materialized_mapping(
     original = doublets._doublet_batch_rows
 
     def smaller_batches(*args, **kwargs):
-        return min(2, original(*args, **kwargs))
+        return min(1 if filtered else 2, original(*args, **kwargs))
 
     monkeypatch.setattr(doublets, "_doublet_batch_rows", smaller_batches)
     repeated = doublets.score_synthetic_doublets(

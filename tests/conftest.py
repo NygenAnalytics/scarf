@@ -6,6 +6,7 @@ os.environ["SCARF_WORKERS"] = "2"
 import sys
 
 import pytest
+from threadpoolctl import threadpool_limits
 
 from scarf.utils import configure_output, logger
 
@@ -14,6 +15,12 @@ pytest_plugins = [
     "tests.fixtures_readers",
     "tests.fixtures_datastore",
 ]
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _limit_blas_threads():
+    with threadpool_limits(limits=1, user_api="blas"):
+        yield
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -163,6 +163,33 @@ def test_reloading_pca_loadings_requires_valid_center(center) -> None:
         )
 
 
+@pytest.mark.parametrize("disable_scaling", [False, True])
+def test_pca_without_reduction_preserves_features(disable_scaling):
+    values, _ = _custom_inputs()
+    reduction = ReductionTransform(
+        data=ChunkedArray.from_numpy(values, nthreads=1),
+        method="pca",
+        dims=0,
+        loadings=None,
+        use_for_pca=np.ones(len(values), dtype=bool),
+        mu=values.mean(axis=0),
+        sigma=values.std(axis=0),
+        batch_size=4,
+        nthreads=1,
+        rand_state=4466,
+        disable_scaling=disable_scaling,
+        lsi_skip_first=False,
+        lsi_params={},
+    )
+    expected = (
+        values
+        if disable_scaling
+        else (values - values.mean(axis=0)) / values.std(axis=0)
+    )
+    np.testing.assert_allclose(reduction.transform(values), expected)
+    assert reduction.center is None
+
+
 def test_lsi_persisted_loadings_are_not_sliced_again() -> None:
     values, loadings = _custom_inputs()
     reduction = ReductionTransform(

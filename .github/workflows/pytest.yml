@@ -127,19 +127,11 @@ jobs:
         echo "installed_cpu_count=$(nproc --all)"
     - name: Test with pytest (parallel)
       run: |
-        if [ "${{ matrix.resolution }}" = "lowest-direct" ]; then
-          uv run --no-sync pytest \
-            --durations=25 \
-            --cov=scarf \
-            --cov-report=xml \
-            --cov-report=term
-        else
-          uv run pytest \
-            --durations=25 \
-            --cov=scarf \
-            --cov-report=xml \
-            --cov-report=term
+        pytest_args=(-n logical --durations=25)
+        if [ "${{ matrix.resolution }}" = "locked" ] && [ "${{ matrix.python-version }}" = "3.14" ]; then
+          pytest_args+=(--cov=scarf --cov-report=xml --cov-report=term)
         fi
+        uv run --no-sync pytest "${pytest_args[@]}"
     - name: Build and smoke-test wheel
       if: matrix.resolution == 'locked' && matrix.python-version == '3.14'
       run: |

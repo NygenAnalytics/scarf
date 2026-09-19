@@ -70,6 +70,28 @@ def test_fit_lowess_fixed_regression():
     np.testing.assert_allclose(corrected, expected, rtol=1e-12, atol=1e-12)
 
 
+def test_fit_lowess_rejects_unconverged_adaptive_fit(monkeypatch):
+    import scipy.optimize
+
+    minimize = scipy.optimize.minimize
+
+    def stop_after_one_iteration(*args, **kwargs):
+        kwargs["options"] = dict(kwargs["options"], maxiter=1)
+        return minimize(*args, **kwargs)
+
+    monkeypatch.setattr(scipy.optimize, "minimize", stop_after_one_iteration)
+    means = np.geomspace(1, 100, 30)
+    variances = means**1.4 * np.exp(np.random.default_rng(7).normal(0, 0.2, 30))
+    with pytest.raises(ValueError, match="Adaptive variance trend fit failed"):
+        fit_lowess(means, variances, n_bins=10, lowess_frac=0.5)
+
+
+def test_fit_lowess_rejects_unrepresentable_adaptive_scores():
+    variance = np.array([np.nextafter(0.0, 1.0), 1.0, np.finfo(float).max])
+    with pytest.raises(ValueError, match="nonfinite or zero scores"):
+        fit_lowess(np.ones(3), variance, n_bins=10, lowess_frac=0.5)
+
+
 @pytest.mark.parametrize("trend", ["power", "curved", "steep_tail"])
 @pytest.mark.parametrize(
     ("n_genes", "seed"), [(2_000, 17), (5_000, 23), (20_000, 17), (20_000, 23)]

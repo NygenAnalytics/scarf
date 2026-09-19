@@ -102,9 +102,7 @@ label_map = {
     "7": "T cells",
     "8": "B cells",
     "9": "T cells",
-    "10": "T cells",
-    "11": "pDC-like cells",
-    "12": "Platelets",
+    "10": "pDC-like cells",
 }
 observed = {str(value) for value in np.unique(cluster_values)}
 assert observed == set(label_map)

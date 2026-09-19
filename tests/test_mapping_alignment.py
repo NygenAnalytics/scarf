@@ -5,11 +5,21 @@ import pytest
 import zarr
 
 from scarf.assay import RNAassay, norm_lib_size
-from scarf.mapping.features import AlignedFeatureStream
+from scarf.mapping.features import AlignedFeatureStream, normalize_reference_counts
 from scarf.matrix import ChunkedArray
 from scarf.storage.artifacts import callable_identity
 from scarf.storage.budget import ResourceBudget
 from tests.store_probes import RecordingStore
+
+
+@pytest.mark.parametrize("totals", [[1], [-1, 1], [np.nan, 1], [np.inf, 1]])
+def test_reference_normalization_rejects_invalid_totals(totals):
+    counts = np.array([[1, 2], [3, 4]], dtype=np.uint16)
+    with pytest.raises(ValueError, match="totals must be finite and non-negative"):
+        normalize_reference_counts(
+            counts, size_factor=100, log_transform=False, denominator=np.array(totals)
+        )
+    np.testing.assert_array_equal(counts, [[1, 2], [3, 4]])
 
 
 class _MemoryMetadata:

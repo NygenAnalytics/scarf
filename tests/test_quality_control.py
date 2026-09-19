@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -506,16 +507,18 @@ def test_doublet_scores_preserve_artifacts_without_materializing_queries(
         datastore.list_artifacts(kind="diffusion_operator", from_assay="RNA")
     )
 
-    score_ref = datastore.run_doublet_detection(
-        clusters,
-        selected_connectivity,
-        cluster_sample_fraction=0.01,
-        max_cells_per_cluster=2,
-        simulation_ratio=0.01,
-        save_k=3,
-        smoothing_t=1,
-        random_seed=19,
-    )
+    with datastore._graph_memory_cache_scope():
+        datastore.load_graph(selected_connectivity, symmetric=True, upper_only=False)
+        score_ref = datastore.run_doublet_detection(
+            clusters,
+            selected_connectivity,
+            cluster_sample_fraction=0.01,
+            max_cells_per_cluster=2,
+            simulation_ratio=0.01,
+            save_k=3,
+            smoothing_t=1,
+            random_seed=19,
+        )
 
     assert score_ref != previous.ref
     assert datastore.inspect_artifact(score_ref).parameters["count_arithmetic"] == (
@@ -588,9 +591,21 @@ def test_doublet_scores_preserve_artifacts_without_materializing_queries(
     )
 
 
-def test_doublet_query_failure_leaves_no_complete_score(
+@pytest.mark.parametrize(
+    ("failure", "error", "message"),
+    [
+        ("query", RuntimeError, "neighbor query failed"),
+        ("features", ValueError, "reference order"),
+        ("scores", RuntimeError, "mapping scores do not match"),
+        ("graph", ValueError, "graph does not match"),
+    ],
+)
+def test_doublet_failure_leaves_no_complete_score(
     analyzed_datastore_ephemeral,
     monkeypatch,
+    failure,
+    error,
+    message,
 ) -> None:
     datastore = analyzed_datastore_ephemeral
     graph = _fixture_graph(datastore)
@@ -607,9 +622,29 @@ def test_doublet_query_failure_leaves_no_complete_score(
     def failed_query(*args, **kwargs):
         raise RuntimeError("neighbor query failed")
 
-    monkeypatch.setattr(NeighborQueryStage, "query", failed_query)
+    if failure == "query":
+        monkeypatch.setattr(NeighborQueryStage, "query", failed_query)
+    else:
+        from scarf.quality_control import doublets
 
-    with pytest.raises(RuntimeError, match="neighbor query failed"):
+        owner, name = {
+            "features": (datastore, "get_mapping_reference"),
+            "scores": (doublets, "score_synthetic_doublets"),
+            "graph": (datastore, "load_graph"),
+        }[failure]
+        original = getattr(owner, name)
+
+        def corrupt_result(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if failure == "features":
+                return replace(result, feature_ids=result.feature_ids[::-1])
+            if failure == "scores":
+                return result[:-1]
+            return result[:-1, :-1]
+
+        monkeypatch.setattr(owner, name, corrupt_result)
+
+    with pytest.raises(error, match=message):
         datastore.run_doublet_detection(
             clusters,
             graph,

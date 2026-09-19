@@ -20,6 +20,18 @@ from tests import full_path
 
 pytestmark = pytest.mark.slow
 
+
+@pytest.mark.parametrize(
+    "center", [np.zeros(2), np.zeros(3, dtype=np.float32), np.full(3, np.nan)]
+)
+def test_read_pca_center_rejects_corrupt_values(center):
+    group = zarr.open_group(store=MemoryStore(), mode="w")
+    group.create_array("loadings", data=np.eye(3, 2))
+    group.create_array("center", data=center)
+    with pytest.raises(ValueError, match="PCA center.*Re-run run_pca"):
+        graph_operations._read_pca_center(group)
+
+
 _RELEASED_KNN_FEATURE_INDICES = (
     57,
     1363,
