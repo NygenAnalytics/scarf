@@ -145,6 +145,21 @@ class Assay:
             return {}
         return {str(k): str(v) for k, v in raw.items()}
 
+    def _cell_count_totals(self, cell_idx: np.ndarray) -> np.ndarray:
+        """Read cell totals, computing missing read-only totals from raw counts."""
+        if len(cell_idx) == 0:
+            return np.empty(0, dtype=np.float64)
+        column = self.name + "_nCounts"
+        if column in self.cells.columns or not self.z.read_only:
+            totals = self.cells.fetch_all(column)[cell_idx]
+        else:
+            totals = compute_with_progress(
+                self.rawData[cell_idx, :].sum(axis=1),
+                f"({self.name}) Computing total counts for normalization",
+                self.nthreads,
+            )
+        return np.asarray(totals, dtype=np.float64)
+
     def normed(
         self,
         cell_idx: np.ndarray | None = None,
@@ -456,11 +471,6 @@ class Assay:
         feature_fingerprint: str,
         n_counts: np.ndarray | None = None,
     ) -> None:
-        if total.sum() == 0:
-            logger.warning(
-                f"Percentage feature {name} not added because not detected in any cell"
-            )
-            return
         if n_counts is None:
             n_counts = self.cells.fetch_all(self.name + "_nCounts")
         self.cells.insert(

@@ -663,17 +663,20 @@ def _auto_bound_flags(
     low: float | None,
     high: float | None,
     flags: dict[str, np.ndarray],
+    keep_bounds: bool = False,
 ) -> None:
     if low is not None:
+        below = values < low if keep_bounds else values <= low
         flags.setdefault(
             f"{metric}:low",
             np.zeros(target.shape[0], dtype=bool),
-        )[target & (values <= low)] = True
+        )[target & below] = True
     if high is not None:
+        above = values > high if keep_bounds else values >= high
         flags.setdefault(
             f"{metric}:high",
             np.zeros(target.shape[0], dtype=bool),
-        )[target & (values >= high)] = True
+        )[target & above] = True
 
 
 def project_auto_filter_profile(
@@ -718,7 +721,7 @@ def project_auto_filter_profile(
                     f"QC metric {metric!r} produced non-finite Gaussian bounds"
                 )
             resolved_bounds[metric] = {"low": low, "high": high}
-            keep &= _apply_bounds(metric_values, low, high)
+            keep &= _apply_bounds(metric_values, low, high, keep_bounds=low == high)
             _auto_bound_flags(
                 metric=metric,
                 values=metric_values,
@@ -726,6 +729,7 @@ def project_auto_filter_profile(
                 low=low,
                 high=high,
                 flags=flags,
+                keep_bounds=low == high,
             )
         parameters = {
             "minP": float(min_p),

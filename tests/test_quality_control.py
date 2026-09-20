@@ -174,6 +174,21 @@ def test_gaussian_quantile_bounds_uses_median_and_population_deviation():
     )
 
 
+@pytest.mark.parametrize("value", [0.0, 10.0, -3.0])
+def test_gaussian_constant_metrics_have_finite_equal_bounds(value):
+    from scarf.quality_control.filtering import _apply_bounds
+
+    values = np.full(5, value)
+    assert gaussian_quantile_bounds(values) == (value, value)
+    assert not _apply_bounds(values, value, value).any()
+
+
+@pytest.mark.parametrize("min_p,max_p", [(0, 0.99), (0.01, 1), (0.9, 0.1), (0.5, 0.5)])
+def test_gaussian_constant_metrics_reject_invalid_quantiles(min_p, max_p):
+    with pytest.raises(ValueError, match="0 < min_p < max_p < 1"):
+        gaussian_quantile_bounds(np.zeros(5), min_p, max_p)
+
+
 def _snapshot_store(path: str) -> dict[str, bytes]:
     root = Path(path)
     return {

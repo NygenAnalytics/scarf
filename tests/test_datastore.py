@@ -208,6 +208,63 @@ def test_fresh_import_opens_read_only_without_initializing_qc():
     assert [operation for operation, _ in store.ops if operation == "set"] == []
 
 
+@pytest.mark.parametrize("assay_type", ["RNA", "ATAC"])
+@pytest.mark.parametrize("rows", [[3, 1, 0], []])
+def test_fresh_read_only_normalization_uses_all_features_for_totals(assay_type, rows):
+    from scarf.features.values import fetch_normalized_feature_matrix, resolve_feature
+    from scarf.metadata.selection import FeatureRef
+
+    store, _ = _qc_store()
+    dataset = _open_qc_store(store, zarr_mode="r", assay_types={"RNA": assay_type})
+    cell_idx = np.asarray(rows, dtype=np.int64)
+    feat_idx = np.array([0, 3])
+    counts = _QC_VALUES[np.ix_(cell_idx, feat_idx)].astype(np.float64)
+    totals = _QC_VALUES.sum(axis=1)[cell_idx]
+    expected = counts / totals[:, None]
+    if assay_type == "RNA":
+        expected *= dataset.RNA.sf
+    else:
+        expected *= np.log2(1 + len(rows) / (np.count_nonzero(counts, axis=0) + 1))
+
+    actual = dataset.RNA.normed(cell_idx=cell_idx, feat_idx=feat_idx).compute()
+    np.testing.assert_allclose(actual, expected)
+    features = [
+        resolve_feature(dataset, FeatureRef(f"f{index}", by="id")) for index in feat_idx
+    ]
+    np.testing.assert_allclose(
+        fetch_normalized_feature_matrix(dataset, features, cell_idx), expected
+    )
+    assert "RNA_nCounts" not in dataset.cells.columns
+    assert [operation for operation, _ in store.ops if operation == "set"] == []
+
+
+def test_fresh_read_only_rna_feature_streams_compute_missing_totals():
+    store, _ = _qc_store()
+    dataset = _open_qc_store(store, zarr_mode="r")
+    rows = np.array([3, 1, 0])
+    features = np.array([0, 3])
+    expected = (
+        1000 * _QC_VALUES[np.ix_(rows, features)] / _QC_VALUES.sum(axis=1)[rows, None]
+    )
+    blocks = list(
+        dataset.RNA.iter_normed_feature_wise(
+            rows, features, batch_size=1, msg=None, as_dataframe=False
+        )
+    )
+    np.testing.assert_array_equal(
+        np.concatenate([indices for _, indices in blocks]), features
+    )
+    np.testing.assert_allclose(
+        np.concatenate([values for values, _ in blocks]).T, expected
+    )
+    means = dataset.RNA._mean_normed_feature_groups(rows, {"pair": features})
+    np.testing.assert_allclose(means["pair"], expected.mean(axis=1))
+    stats = dataset.RNA._streaming_feature_stats(rows, features)
+    np.testing.assert_allclose(stats["normed_tot"], expected.sum(axis=0))
+    assert "RNA_nCounts" not in dataset.cells.columns
+    assert [operation for operation, _ in store.ops if operation == "set"] == []
+
+
 def test_default_mito_pattern_excludes_other_mt_prefixes():
     store, _ = _qc_store()
     root = zarr.open_group(store=store, mode="r+")
@@ -326,16 +383,37 @@ def test_percent_no_matches_removes_stale_values(pattern):
     assert _count_chunk_gets(store) == []
 
 
-def test_percent_matched_but_unexpressed_features_remove_stale_values():
+def test_percent_unexpressed_features_replace_stale_values_and_reuse_cache():
     store, expected_reads = _qc_store()
     _open_qc_store(store)
     store.reset()
 
     reopened = _open_qc_store(store, mito_pattern="^ZERO$")
 
-    assert "RNA_percentMito" not in reopened.cells.columns
-    assert "RNA_percentMito" not in reopened.RNA.attrs["percentFeatures"]
+    expected = np.where(_QC_VALUES.sum(axis=1) == 0, np.nan, 0.0)
+    np.testing.assert_allclose(reopened.cells.fetch_all("RNA_percentMito"), expected)
+    assert reopened.RNA.attrs["percentFeatures"]["RNA_percentMito"] == "^ZERO$"
     _assert_one_counts_stream(store, expected_reads)
+    store.reset()
+    cached = _open_qc_store(store, mito_pattern="^ZERO$", default_assay=None)
+    np.testing.assert_allclose(cached.cells.fetch_all("RNA_percentMito"), expected)
+    assert _count_chunk_gets(store) == []
+    assert [operation for operation, _ in store.ops if operation == "set"] == []
+
+
+def test_auto_filter_keeps_cells_with_zero_feature_percentages():
+    store, _ = _qc_store()
+    dataset = _open_qc_store(store, mito_pattern="^ZERO$")
+    expected = _QC_VALUES.sum(axis=1) > 0
+    dataset.cells.insert("has_counts", expected)
+    cells = dataset.snapshot_cell_selection("has_counts")
+
+    result = dataset.auto_filter_cells(attrs=["RNA_percentMito"], cell_selection=cells)
+
+    np.testing.assert_array_equal(dataset.load_artifact(result)["values"][:], expected)
+    assert dataset.inspect_artifact(result).parameters["resolved_bounds"] == {
+        "RNA_percentMito": {"low": 0.0, "high": 0.0}
+    }
 
 
 @pytest.mark.parametrize(

@@ -104,7 +104,9 @@ def filter_pipeline_selection(
                 config["maxP"],
             )
             bounds[attr] = {"low": low, "high": high}
-            keep &= _apply_bounds(values_by_attr[attr], low, high)
+            keep &= _apply_bounds(
+                values_by_attr[attr], low, high, keep_bounds=low == high
+            )
         parameters["resolvedBounds"] = bounds
     else:
         sample_column = config["sampleColumn"]

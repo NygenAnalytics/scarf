@@ -670,6 +670,8 @@ def test_rna_raw_feature_columns_log_and_normalize_batches():
 
 
 def test_rna_streaming_stats_and_group_means_handle_missing_inputs():
+    from scarf.metadata import MetaData
+
     root = zarr.open_group(store=MemoryStore(), mode="w")
     counts = root.create_array(
         "counts",
@@ -679,7 +681,9 @@ def test_rna_streaming_stats_and_group_means_handle_missing_inputs():
     rna.name = "RNA"
     rna.normMethod = norm_lib_size
     rna.sf = None
-    rna.cells = SimpleNamespace(fetch_all=lambda _key: np.array([2.0, 3.0]))
+    cell_data = root.create_group("cellData")
+    cell_data.create_array("RNA_nCounts", data=np.array([2.0, 3.0]))
+    rna.cells = MetaData(cell_data)
     rna.rawData = SimpleNamespace(_backing=counts)
     rna.rawDataT = None
 

@@ -25,7 +25,12 @@ def gaussian_quantile_bounds(
     min_p: float = 0.01,
     max_p: float = 0.99,
 ) -> tuple[float, float]:
-    dist = norm(np.median(values), np.std(values))
+    if not 0 < min_p < max_p < 1:
+        raise ValueError("Gaussian filtering requires 0 < min_p < max_p < 1")
+    median, deviation = float(np.median(values)), float(np.std(values))
+    if deviation == 0:
+        return median, median
+    dist = norm(median, deviation)
     return float(dist.ppf(min_p)), float(dist.ppf(max_p))
 
 

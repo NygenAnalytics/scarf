@@ -139,10 +139,7 @@ class ATACassay(Assay):
                     dtype=np.float64,
                 )
         else:
-            terms = np.asarray(
-                self.cells.fetch_all(self.name + "_nCounts")[cell_idx],
-                dtype=np.float64,
-            )
+            terms = self._cell_count_totals(cell_idx)
         terms[terms == 0] = 1
         return terms
 

@@ -2470,7 +2470,7 @@ def test_experimental_context_private_input_guards(
         experimental_context_qc._active_cell_count(deps)
 
 
-def test_core_qc_reports_unavailable_default_bounds(
+def test_core_qc_accepts_constant_metrics_and_rejects_nonfinite_bounds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _Store()
@@ -2488,8 +2488,11 @@ def test_core_qc_reports_unavailable_default_bounds(
         [],
         notes,
     )
-    assert profile is None
-    assert "constant metric 'constant'" in notes[0]
+    assert profile is not None
+    assert profile.retainedCells == store.cells.N
+    assert profile.resolvedBounds == {"constant": {"low": 1.0, "high": 1.0}}
+    assert profile.flaggedCells == {"constant:low": 0, "constant:high": 0}
+    assert notes == []
 
     monkeypatch.setattr(
         experimental_context_qc,

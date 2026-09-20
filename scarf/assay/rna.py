@@ -251,7 +251,7 @@ class RNAassay(Assay):
         sf = self.sf
         if sf is None:
             raise ValueError("RNA library-size normalization requires a size factor")
-        scalar = self.cells.fetch_all(self.name + "_nCounts")[cell_idx]
+        scalar = self._cell_count_totals(cell_idx)
         log_transform = bool(norm_params.get("log_transform", False))
         counts_t = self.rawDataT
         if counts_t is None:
@@ -447,7 +447,7 @@ class RNAassay(Assay):
                 scalar[scalar == 0] = 1
                 self.scalar = scalar
             else:
-                self.scalar = self.cells.fetch_all(self.name + "_nCounts")[cell_idx]
+                self.scalar = self._cell_count_totals(cell_idx)
             return self.normMethod(self, counts)
         finally:
             self.normMethod = norm_method_cache
@@ -719,9 +719,7 @@ class RNAassay(Assay):
                 "RNA library-size normalization requires a size factor (sf), got None"
             )
         sf = float(self.sf) if self.sf is not None else 1.0
-        scalar = np.asarray(
-            self.cells.fetch_all(self.name + "_nCounts")[cell_idx], dtype=np.float64
-        )
+        scalar = self._cell_count_totals(cell_idx)
         scalar[scalar == 0] = 1
 
         union = np.unique(
@@ -802,9 +800,7 @@ class RNAassay(Assay):
                 "RNA library-size normalization requires a size factor (sf), got None"
             )
         sf = float(self.sf) if self.sf is not None else 1.0
-        scalar = np.asarray(
-            self.cells.fetch_all(self.name + "_nCounts")[cell_idx], dtype=np.float64
-        )
+        scalar = self._cell_count_totals(cell_idx)
         scalar[scalar == 0] = 1
         inv_scalar = 1.0 / scalar
 

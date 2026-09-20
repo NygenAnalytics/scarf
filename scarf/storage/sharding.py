@@ -590,12 +590,24 @@ def _writer_count(
     io: StorageIoPolicy | None = None,
 ) -> tuple[int, int]:
     dense_bytes, inner_bytes, n_chunks = _band_geometry(destination)
+    # Keep encoded chunks and the assembled shard alongside each dense band.
+    unit_bytes = (
+        _row_band_task_peak(
+            sourceBytes=0,
+            denseBytes=dense_bytes,
+            innerChunkBytes=inner_bytes,
+            nChunks=n_chunks,
+            innerConcurrency=1,
+        )
+        - inner_bytes
+    )
     operation = plan_operation(
         resources,
         WorkShape(
             nUnits=max(1, int(nTasks)),
-            unitBytes=max(1, dense_bytes),
-            decodeBytes=max(0, inner_bytes),
+            unitBytes=unit_bytes,
+            innerReadBytes=inner_bytes,
+            maxInnerReads=n_chunks,
             writes=True,
             chunksPerShard=max(1, n_chunks),
         ),

@@ -785,6 +785,22 @@ def test_pipeline_filtering_excludes_nullable_integer_metric_rows(
     np.testing.assert_array_equal(run.cells.fetch_all("I"), expected)
 
 
+def test_pipeline_auto_filtering_retains_constant_metric(datastore_ephemeral):
+    datastore = datastore_ephemeral
+    expected = datastore.cells.fetch_all("I")
+    datastore.cells.insert("constant_qc", np.zeros(datastore.cells.N))
+    options = _minimal_run_options()
+    options["filtering"] = {"attrs": ["constant_qc"]}
+
+    run = datastore.pipeline.run(**options)
+
+    np.testing.assert_array_equal(run.cells.fetch_all("I"), expected)
+    status = datastore.inspect_artifact(run["analysis_cell_selection"])
+    assert status.parameters["resolvedBounds"] == {
+        "constant_qc": {"low": 0.0, "high": 0.0}
+    }
+
+
 def test_pipeline_filtering_rejects_nullable_active_sample_label(
     datastore_ephemeral,
 ) -> None:

@@ -775,8 +775,13 @@ def test_datastore_rejects_modified_registered_bounds() -> None:
         )
 
 
-def test_execute_auto_cell_qc_global_gaussian_persists_exact_outputs() -> None:
+@pytest.mark.parametrize("constant_metric", [False, True])
+def test_execute_auto_cell_qc_global_gaussian_persists_exact_outputs(
+    constant_metric: bool,
+) -> None:
     values = _quality_values()
+    if constant_metric:
+        values = {"RNA_percentMito": np.zeros_like(values["RNA_percentMito"])}
     store, source = _memory_qc_store(values)
     active = np.ones(store.cells.N, dtype=bool)
     projection = project_auto_filter_profile(
@@ -784,6 +789,12 @@ def test_execute_auto_cell_qc_global_gaussian_persists_exact_outputs() -> None:
         values_by_metric=values,
         active=active,
     )
+    if constant_metric:
+        np.testing.assert_array_equal(projection.keep, active)
+        assert projection.flagCounts == {
+            "RNA_percentMito:low": 0,
+            "RNA_percentMito:high": 0,
+        }
     live_before = store.cells.fetch_all("I").copy()
 
     selected, flags = execute_auto_cell_qc(

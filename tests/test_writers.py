@@ -970,6 +970,40 @@ def test_dense_loom_import_fits_a_bounded_memory_budget(tmp_path):
         reader.h5.close()
 
 
+@pytest.mark.parametrize("budget", ["10M", "32M"])
+def test_loom_admits_memory_for_incompressible_shard_writes(tmp_path, budget):
+    import h5py
+    from scarf.readers import LoomReader
+    from scarf.writers import LoomToZarr
+
+    values = np.random.default_rng(17).integers(
+        0, 2**32, size=(1024, 1024), dtype=np.uint32
+    )
+    path = tmp_path / "counts.loom"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("matrix", data=values.T, chunks=(128, 128))
+    reader = LoomReader(str(path))
+    try:
+        writer = LoomToZarr(
+            reader,
+            str(tmp_path / "counts.zarr"),
+            mem_budget=budget,
+            nthreads=4,
+            profile="fast_local",
+            policy=CountMatrixPolicy(unitBytes=4 * 1024**2, chunkBytes=512 * 1024),
+        )
+        if budget == "10M":
+            with pytest.raises(MemoryError, match="Loom import cannot fit"):
+                writer.dump(batch_size=1)
+            assert writer.z["RNA/counts"].nchunks_initialized == 0
+        else:
+            writer.dump(batch_size=1)
+            np.testing.assert_array_equal(writer.z["RNA/counts"][:], values)
+            np.testing.assert_array_equal(writer.z["RNA/countsT"][:], values.T)
+    finally:
+        reader.h5.close()
+
+
 def test_sparsetozarr(tmp_path):
     from scipy.sparse import csr_matrix
 

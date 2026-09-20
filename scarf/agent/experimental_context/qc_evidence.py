@@ -1492,11 +1492,6 @@ def _global_qc_profile(
     source_concordance = list(source_concordance or [])
     for name, values in values_by_attr.items():
         selected = np.asarray(values)[active]
-        if selected.size and np.all(selected == selected[0]):
-            attribute_notes.append(
-                f"Scarf default global QC is unavailable: constant metric {name!r} produces non-finite Gaussian bounds"
-            )
-            return None
         low, high = gaussian_quantile_bounds(selected, 0.01, 0.99)
         if not np.isfinite([low, high]).all():
             attribute_notes.append(

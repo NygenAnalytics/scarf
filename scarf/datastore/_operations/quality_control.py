@@ -755,7 +755,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                     f"QC metric {name!r} produced non-finite Gaussian bounds"
                 )
             resolved_bounds[name] = {"low": float(low), "high": float(high)}
-            compact_keep &= _apply_bounds(values, low, high)
+            compact_keep &= _apply_bounds(values, low, high, keep_bounds=low == high)
         keep = np.zeros(self.cells.N, dtype=bool)
         keep[active_idx] = compact_keep
 
