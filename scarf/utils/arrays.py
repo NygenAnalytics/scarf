@@ -1,8 +1,19 @@
 import hashlib
+import re
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
+
+
+def regex_match_mask(values: Sequence[str] | np.ndarray, pattern: str) -> np.ndarray:
+    expression = re.compile(pattern, re.IGNORECASE)
+    return np.fromiter(
+        (expression.match(str(value)) is not None for value in values),
+        dtype=bool,
+        count=len(values),
+    )
 
 
 def checked_sparse_cast(values: np.ndarray, dtype: Any) -> np.ndarray:

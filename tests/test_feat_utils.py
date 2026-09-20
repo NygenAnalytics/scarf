@@ -375,6 +375,29 @@ def _hvg_kwargs(**overrides):
     return values
 
 
+@pytest.mark.parametrize(
+    ("names", "blacklist", "expected"),
+    [
+        (["RPS3", "RPSX", "GENE"], r"^RPS\d+$", [False, True, True]),
+        (["g_a", "g-", "GENE"], r"^g_\w+$", [False, True, True]),
+        (["x y", "xy", "GENE"], r"^x\sy$", [False, True, True]),
+        (["MT-CO1", "mt-Co1", "GENE"], r"(?-i:^MT-)", [False, True, True]),
+        (["MT-CO1", "mt-Co1", "GENE"], r"(?i)^mt-", [False, False, True]),
+    ],
+)
+def test_hvg_blacklist_preserves_regex_semantics(names, blacklist, expected):
+    selected = select_highly_variable_features(
+        corrected_variance=np.array([3.0, 2.0, 1.0]),
+        normalized_cell_counts=np.full(3, 5),
+        mean_nonzero=np.ones(3),
+        active_features=np.ones(3, dtype=bool),
+        feature_names=np.array(names),
+        top_n=3,
+        **_hvg_kwargs(blacklist=blacklist),
+    )
+    np.testing.assert_array_equal(selected, expected)
+
+
 def test_hvg_exact_top_n_selects_all_when_top_n_equals_valid_count():
     selected = select_highly_variable_features(
         corrected_variance=np.array([3.0, 1.0, 2.0]),

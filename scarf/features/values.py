@@ -56,7 +56,7 @@ def resolve_feature(
     *,
     from_assay: str | None = None,
 ) -> ResolvedFeature:
-    """Resolve a feature against one assay. Case-sensitive. No silent averaging."""
+    """Resolve exact feature IDs or case-insensitive names without implicit reduction."""
     if isinstance(feature, FeatureRef):
         ref = feature
     else:
@@ -74,7 +74,9 @@ def resolve_feature(
             )
         indices = [idx]
     elif ref.by == "id":
-        indices = list(assay.feats.get_index_by([str(ref.value)], "ids"))
+        indices = np.flatnonzero(
+            assay.feats.fetch_all("ids") == str(ref.value)
+        ).tolist()
     else:
         indices = list(assay.feats.get_index_by([str(ref.value)], "names"))
 

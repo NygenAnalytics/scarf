@@ -27,7 +27,7 @@ def to_h5ad(
                          (for example UMAP, tSNE). When None, uses
                          ``["UMAP", "tSNE"]``. Pass an empty list to skip
                          embeddings.
-        skip_recalc_nfeats: Skip recalculating nFeatures per cell. (Default value: True)
+        skip_recalc_nfeats: Skip a preliminary nonzero-count pass. (Default value: True)
         nthreads: Number of processing threads to use (Default value: 4)
         run: Completed pipeline run opened from the datastore that owns
              ``assay``. The frozen run selections and fields are exported.
@@ -97,117 +97,133 @@ def to_h5ad(
                 f"Skipping metadata column {col!r} with unsupported dtype {d.dtype}"
             )
 
-    h5 = h5py.File(h5ad_filename, "w")
-    for i in ["X", "obs", "var", "obsm"]:
-        h5.create_group(i)
+    with h5py.File(h5ad_filename, "w") as h5:
+        for i in ["X", "obs", "var", "obsm"]:
+            h5.create_group(i)
 
-    # Export-time validation must not rewrite the source datastore's QC metadata.
-    n_feats_per_cell = (
-        assay.cells.fetch_all(f"{assay.name}_nFeatures").astype(int)
-        if skip_recalc_nfeats
-        else np.asarray(
-            compute_with_progress(
-                assay.rawData.count_nonzero(axis=1),
-                msg="Recalculating detected feature counts",
-                nthreads=nthreads,
-            ),
-            dtype=int,
+        # The stream defines CSR row boundaries, even when stored QC is stale.
+        capacity = 0
+        if not skip_recalc_nfeats:
+            capacity = int(
+                compute_with_progress(
+                    assay.rawData.count_nonzero(),
+                    msg="Counting nonzero entries",
+                    nthreads=nthreads,
+                )
+            )
+        indptr = h5["X"].create_dataset(
+            "indptr",
+            (assay.cells.N + 1,),
+            chunks=True,
+            compression="gzip",
+            dtype="int64",
         )
-    )
-    tot_counts = int(n_feats_per_cell.sum())
-
-    for i, s in zip(
-        ["indptr", "indices", "data"], [assay.cells.N + 1, tot_counts, tot_counts]
-    ):
-        if i == "data":
-            mat_dtype = assay.rawData.dtype
-        else:
-            mat_dtype = int
-        h5["X"].create_dataset(
-            i, (s,), chunks=True, compression="gzip", dtype=mat_dtype
+        data = h5["X"].create_dataset(
+            "data",
+            (capacity,),
+            maxshape=(None,),
+            chunks=True,
+            compression="gzip",
+            dtype=assay.rawData.dtype,
         )
+        indices = h5["X"].create_dataset(
+            "indices",
+            (capacity,),
+            maxshape=(None,),
+            chunks=True,
+            compression="gzip",
+            dtype="int64",
+        )
+        row = offset = 0
+        indptr[0] = 0
+        for values in assay.rawData.stream_blocks(
+            nthreads=nthreads,
+            msg="Writing raw counts",
+        ):
+            block = csr_matrix(values)
+            end_row = row + block.shape[0]
+            if end_row > assay.cells.N or block.shape[1] != assay.feats.N:
+                raise ValueError("Count matrix shape does not match assay metadata")
+            end = offset + block.nnz
+            if end > data.shape[0]:
+                data.resize((end,))
+                indices.resize((end,))
+            data[offset:end] = block.data
+            indices[offset:end] = block.indices
+            indptr[row + 1 : end_row + 1] = block.indptr[1:].astype(np.int64) + offset
+            row, offset = end_row, end
+        if row != assay.cells.N:
+            raise ValueError("Count matrix row count does not match assay metadata")
+        data.resize((offset,))
+        indices.resize((offset,))
+        attrs = {
+            "encoding-type": "csr_matrix",
+            "encoding-version": "0.1.0",
+            "shape": np.array([assay.cells.N, assay.feats.N]),
+        }
+        for i, j in attrs.items():
+            h5["X"].attrs[i] = j
 
-    h5["X/indptr"][:] = np.array([0] + list(n_feats_per_cell.cumsum())).astype(int)
+        out_cols = []
+        emb_cols = []
+        if embeddings_cols is None:
+            embeddings_cols = ["UMAP", "tSNE"]
+        for i in assay.cells.columns:
+            if i == "ids":
+                save_attr("obs", "_index", "ids", assay.cells)
+                out_cols.append("_index")
+            else:
+                is_emb = False
+                if len(embeddings_cols) > 0:
+                    for j in embeddings_cols:
+                        if i.startswith(f"{assay.name}_{j}"):
+                            emb_cols.append(i)
+                            is_emb = True
+                            break
+                if is_emb is False:
+                    save_attr("obs", i, i, assay.cells)
+                    out_cols.append(i)
 
-    s, e = 0, 0
-    for values in assay.rawData.stream_blocks(
-        nthreads=nthreads,
-        msg="Writing raw counts",
-    ):
-        block = csr_matrix(values)
-        e += block.data.shape[0]
-        h5["X/data"][s:e] = block.data
-        h5["X/indices"][s:e] = block.indices
-        s = e
-    attrs = {
-        "encoding-type": "csr_matrix",
-        "encoding-version": "0.1.0",
-        "shape": np.array([assay.cells.N, assay.feats.N]),
-    }
-    for i, j in attrs.items():
-        h5["X"].attrs[i] = j
+        attrs = {
+            "_index": "_index",
+            "column-order": np.array(out_cols, dtype=object),
+            "encoding-type": "dataframe",
+            "encoding-version": "0.1.0",
+        }
+        for i, j in attrs.items():
+            h5["obs"].attrs[i] = j
 
-    out_cols = []
-    emb_cols = []
-    if embeddings_cols is None:
-        embeddings_cols = ["UMAP", "tSNE"]
-    for i in assay.cells.columns:
-        if i == "ids":
-            save_attr("obs", "_index", "ids", assay.cells)
-            out_cols.append("_index")
-        else:
-            is_emb = False
-            if len(embeddings_cols) > 0:
-                for j in embeddings_cols:
-                    if i.startswith(f"{assay.name}_{j}"):
-                        emb_cols.append(i)
-                        is_emb = True
-                        break
-            if is_emb is False:
-                save_attr("obs", i, i, assay.cells)
+        out_cols = []
+        for i in assay.feats.columns:
+            if i == "ids":
+                save_attr("var", "_index", "ids", assay.feats)
+                out_cols.append("_index")
+            elif i == "names":
+                save_attr("var", "gene_short_name", "names", assay.feats)
+                out_cols.append("gene_short_name")
+            else:
+                save_attr("var", i, i, assay.feats)
                 out_cols.append(i)
 
-    attrs = {
-        "_index": "_index",
-        "column-order": np.array(out_cols, dtype=object),
-        "encoding-type": "dataframe",
-        "encoding-version": "0.1.0",
-    }
-    for i, j in attrs.items():
-        h5["obs"].attrs[i] = j
+        attrs = {
+            "_index": "_index",
+            "column-order": np.array(out_cols, dtype=object),
+            "encoding-type": "dataframe",
+            "encoding-version": "0.1.0",
+        }
+        for i, j in attrs.items():
+            h5["var"].attrs[i] = j
 
-    out_cols = []
-    for i in assay.feats.columns:
-        if i == "ids":
-            save_attr("var", "_index", "ids", assay.feats)
-            out_cols.append("_index")
-        elif i == "names":
-            save_attr("var", "gene_short_name", "names", assay.feats)
-            out_cols.append("gene_short_name")
-        else:
-            save_attr("var", i, i, assay.feats)
-            out_cols.append(i)
+        if len(emb_cols) > 0:
+            emb_names = np.array(emb_cols)
+            c = pd.Series([x[:-1] for x in emb_names])
+            for i in c.unique():
+                matched = sorted(str(name) for name in emb_names[c == i])
+                data = np.array([assay.cells.fetch_all(x) for x in matched]).T
+                h5["obsm"].create_dataset(
+                    i.lower().replace(f"{assay.name.lower()}_", "X_"), data=data
+                )
 
-    attrs = {
-        "_index": "_index",
-        "column-order": np.array(out_cols, dtype=object),
-        "encoding-type": "dataframe",
-        "encoding-version": "0.1.0",
-    }
-    for i, j in attrs.items():
-        h5["var"].attrs[i] = j
-
-    if len(emb_cols) > 0:
-        emb_names = np.array(emb_cols)
-        c = pd.Series([x[:-1] for x in emb_names])
-        for i in c.unique():
-            matched = sorted(str(name) for name in emb_names[c == i])
-            data = np.array([assay.cells.fetch_all(x) for x in matched]).T
-            h5["obsm"].create_dataset(
-                i.lower().replace(f"{assay.name.lower()}_", "X_"), data=data
-            )
-
-    h5.close()
     logger.info(
         f"Exported {assay.cells.N} cells and {assay.feats.N} features "
         f"to {h5ad_filename}"
@@ -233,8 +249,13 @@ def to_mtx(assay: Any, mtx_directory: str, compress: bool = False) -> None:
     if os.path.isdir(mtx_directory) is False:
         os.mkdir(mtx_directory)
 
-    n_feats_per_cell = assay.cells.fetch_all(f"{assay.name}_nFeatures").astype(int)
-    tot_counts = int(n_feats_per_cell.sum())
+    tot_counts = int(
+        compute_with_progress(
+            assay.rawData.count_nonzero(),
+            msg="Counting nonzero entries",
+            nthreads=assay.nthreads,
+        )
+    )
     if compress:
         barcodes_fn = "barcodes.tsv.gz"
         features_fn = "features.tsv.gz"

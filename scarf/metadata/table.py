@@ -84,14 +84,22 @@ class MetaData:
         return col_map
 
     def _get_loc(self, column: str) -> tuple[str, str]:
-        col_map = self._column_map()
-        if column not in col_map:
-            raise KeyError(f"{column} does not exist in the metadata columns.")
-        entry = col_map[column]
-        if isinstance(entry, str):
+        if column in {"I", "ids", "names"}:
             return "primary", column
-        location, stored_column = entry
-        return location, stored_column
+        for location, group in reversed(self.locations.items()):
+            if location == "primary":
+                stored_column = column
+            elif column.startswith(f"{location}_"):
+                stored_column = column[len(location) + 1 :]
+            else:
+                continue
+            if (
+                "/" not in stored_column
+                and not stored_column.startswith(_INTERNAL_METADATA_PREFIX)
+                and stored_column in group
+            ):
+                return location, stored_column
+        raise KeyError(f"{column} does not exist in the metadata columns.")
 
     def _get_array(self, column: str) -> zarr.Array:
         location, stored_column = self._get_loc(column)
@@ -103,7 +111,7 @@ class MetaData:
     def _get_missing_mask_array(self, column: str) -> zarr.Array | None:
         location, stored_column = self._get_loc(column)
         group = self.locations[location]
-        output = self._get_array(column)
+        output = as_zarr_array(group[stored_column], name=stored_column)
         if "missing_mask" not in output.attrs:
             return None
         missing_name = output.attrs["missing_mask"]

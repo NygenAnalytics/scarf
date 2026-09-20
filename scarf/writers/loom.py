@@ -138,7 +138,7 @@ class LoomToZarr:
         """Write Loom matrix data into the Zarr counts array.
 
         Args:
-            batch_size: Number of cells read from the source per batch.
+            batch_size: Maximum number of cells read from the source per batch.
 
         Raises:
             AssertionError: If written cell count does not match expected nCells.
@@ -146,37 +146,75 @@ class LoomToZarr:
         Returns:
             None
         """
-        from ..storage.layout import array_shard_rows
-        from ..storage.sharding import (
-            accumulate_sparse_to_shards,
-            sparse_producer_peak_bytes,
-        )
+        from ..storage.budget import ResourceBudget
+        from ..storage.partition import affordable_width
+        from ..storage.sharding import _writer_count, write_dense_from_row_batches
         from ..storage.schema import load_count_array
 
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
         store = load_count_array(self.z, self.assayName, self.workspace)
-        source_rows = min(batch_size, self.loom.nCells)
-        buffered_rows = min(
-            self.loom.nCells,
-            batch_size + array_shard_rows(store),
+        matrix = self.loom.h5[self.loom.matrixKey]
+        source_bytes = np.dtype(self.loom.sourceMatrixDtype).itemsize
+        target_bytes = np.dtype(self.loom.matrixDtype).itemsize
+        chunk_bytes = (
+            0 if matrix.chunks is None else int(np.prod(matrix.chunks)) * source_bytes
         )
-        source_nnz = source_rows * self.loom.nFeatures
-        buffered_nnz = buffered_rows * self.loom.nFeatures
-        value_bytes = max(
-            np.dtype(self.loom.sourceMatrixDtype).itemsize,
-            np.dtype(self.loom.matrixDtype).itemsize,
-            np.dtype(store.dtype).itemsize,
-        )
-        dense_source_bytes = source_nnz * np.dtype(self.loom.sourceMatrixDtype).itemsize
-        total_cells_written = accumulate_sparse_to_shards(
-            store,
-            self.loom.consume(batch_size),
-            resources=self.resources,
-            producerReserveBytes=sparse_producer_peak_bytes(
-                buffered_nnz,
-                source_nnz,
-                value_bytes,
+        cache_bytes = int(matrix.id.get_access_plist().get_chunk_cache()[1])
+        if matrix.chunks is None:
+            cache_bytes = 0
+        else:
+            n_chunks = int(
+                np.prod(
+                    [
+                        (size + chunk - 1) // chunk
+                        for size, chunk in zip(matrix.shape, matrix.chunks, strict=True)
+                    ]
+                )
             )
-            + dense_source_bytes,
+            cache_bytes = min(cache_bytes, n_chunks * chunk_bytes)
+
+        def producer_bytes(rows: int) -> int:
+            # A yielded batch may remain live while the next HDF5 slice is read.
+            return int(
+                2 * rows * self.loom.nFeatures * (source_bytes + target_bytes)
+                + chunk_bytes
+                + cache_bytes
+            )
+
+        def fits(rows: int) -> bool:
+            remaining = self.resources.memoryBytes - producer_bytes(rows)
+            if remaining < 1:
+                return False
+            try:
+                _writer_count(
+                    store,
+                    ResourceBudget(remaining, self.resources.workers),
+                    1,
+                    io=self.io,
+                )
+            except MemoryError:
+                return False
+            return True
+
+        rows = affordable_width(fits, min(batch_size, self.loom.nCells))
+        if self.loom.nCells and rows == 0:
+            raise MemoryError(
+                "Loom import cannot fit one source row and one destination row band "
+                "within mem_budget"
+            )
+        writer_resources = (
+            ResourceBudget(
+                self.resources.memoryBytes - producer_bytes(rows),
+                self.resources.workers,
+            )
+            if rows
+            else self.resources
+        )
+        total_cells_written = write_dense_from_row_batches(
+            store,
+            self.loom.consume_dense(max(1, rows)),
+            resources=writer_resources,
             msg="Writing Loom counts",
             io=self.io,
         )

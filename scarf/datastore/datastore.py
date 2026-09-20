@@ -95,7 +95,7 @@ class DataStore(
                        when DataStore loads a Zarr file for the first time.
         min_features_per_cell: Minimum number of non-zero features in a cell. If lower than this then the cell
                                will be filtered out.
-        mito_pattern: Regex pattern to capture mitochondrial genes. When None, uses ``MT-|mt``.
+        mito_pattern: Regex pattern to capture mitochondrial genes. When None, uses ``^MT-``.
         ribo_pattern: Regex pattern to capture ribosomal genes. When None, uses
                       ``RPS|RPL|MRPS|MRPL``.
         nthreads: Maximum worker budget for multi-threaded methods. When None, auto-detected

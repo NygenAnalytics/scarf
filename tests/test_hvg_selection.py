@@ -1,4 +1,5 @@
 import inspect
+import re
 
 import numpy as np
 import pytest
@@ -26,6 +27,63 @@ def test_hvg_public_contract_removed_assay_persistence_methods() -> None:
     assert tuple(all_features.parameters) == ("self", "from_assay")
     assert all_features.return_annotation in {ArtifactRef, "ArtifactRef"}
     assert not hasattr(DataStore, "_ensure_all_features")
+
+
+def test_hvg_regex_correction_recomputes_without_rewriting_saved_selection(
+    datastore_ephemeral, monkeypatch
+) -> None:
+    import scarf.datastore._operations.features as operations
+    import scarf.features.variability as variability
+
+    store = datastore_ephemeral
+    indices = np.flatnonzero(store.RNA.feats.fetch_all("nCells") > 2)[:2]
+    names = np.array([f"GENE_{index}" for index in range(store.RNA.feats.N)])
+    names[indices] = ["RPS3", "RPSX"]
+    store.RNA.feats.insert("names", names, overwrite=True)
+    cells = store.snapshot_cell_selection()
+    options = dict(
+        min_cells=0,
+        max_cells=np.inf,
+        top_n=store.RNA.feats.N,
+        n_bins=20,
+        blacklist=r"^RPS\d+$",
+        keep_bounds=True,
+        show_plot=False,
+    )
+    plan_selection = operations._feature_selection_plan
+
+    def plan_without_blacklist_fingerprint(*args, **kwargs):
+        kwargs["parameters"] = dict(kwargs["parameters"])
+        kwargs["parameters"].pop("blacklist_fingerprint", None)
+        return plan_selection(*args, **kwargs)
+
+    def uppercase_matches(values, pattern):
+        expression = re.compile(pattern.upper())
+        return np.array(
+            [expression.match(str(value).upper()) is not None for value in values]
+        )
+
+    with monkeypatch.context() as context:
+        context.setattr(
+            operations, "_feature_selection_plan", plan_without_blacklist_fingerprint
+        )
+        context.setattr(variability, "regex_match_mask", uppercase_matches)
+        original = store.select_hvgs(cells, **options)
+    old_group = store.load_artifact(original)
+    old_attributes = dict(old_group.attrs)
+    old_values = np.asarray(old_group["values"][:])
+    np.testing.assert_array_equal(old_values[indices], [True, False])
+
+    corrected = store.select_hvgs(cells, **options)
+
+    assert corrected != original
+    np.testing.assert_array_equal(
+        store.load_artifact(corrected)["values"][:][indices], [False, True]
+    )
+    assert store.select_hvgs(cells, **options) == corrected
+    assert store.resolve_features("RNA", original) == original
+    assert dict(old_group.attrs) == old_attributes
+    np.testing.assert_array_equal(old_group["values"][:], old_values)
 
 
 def test_select_hvgs_returns_ref_without_creating_alias(

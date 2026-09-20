@@ -476,6 +476,21 @@ def _validate_feature_selection_provenance(
     input_names, parameter_names, payload_names = contract
     inputs = status.inputs or {}
     parameters = status.parameters or {}
+    if status.operation == "select_hvgs" and "blacklist_fingerprint" in parameters:
+        fingerprint = parameters["blacklist_fingerprint"]
+        if (
+            not isinstance(fingerprint, str)
+            or len(fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in fingerprint)
+            or not parameters.get("blacklist")
+        ):
+            raise ArtifactResolutionError(
+                "HVG blacklist fingerprint is incompatible",
+                code="corrupt_payload",
+                context=context,
+            )
+        # Older selections remain readable; new requests bind the matched features.
+        parameter_names = parameter_names | {"blacklist_fingerprint"}
     if status.operation == "select_hvgs" and "variance_estimator" in parameters:
         if (
             parameters.get("bin_strategy") != "adaptive"

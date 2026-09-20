@@ -905,3 +905,32 @@ def test_ini_embed_requires_initialization_from_the_graph_reduction(
     ):
         store._get_ini_embed(initialization, other_graph, 2)
     assert other_coordinates != coordinates
+
+
+@pytest.mark.parametrize("damage", ["incomplete", "row_ids", "selection"])
+def test_native_resolution_reuses_records_only_within_one_call(
+    root, monkeypatch, damage
+):
+    from collections import Counter
+
+    cells = _cell_selection(root)
+    graph, neighbors, coordinates = _native_chain(root, "RNA", cell_selection=cells)
+    inspections = Counter()
+    original = feature_projection_module.inspect_artifact
+
+    def inspect(group, ref):
+        inspections[ref] += 1
+        return original(group, ref)
+
+    monkeypatch.setattr(feature_projection_module, "inspect_artifact", inspect)
+    result = resolve_native_graph_inputs(root, graph)
+    assert result.cell_selection == cells
+    assert inspections[neighbors] == inspections[coordinates] == 1
+    if damage == "incomplete":
+        root[artifact_path(neighbors)].attrs["complete"] = False
+    elif damage == "row_ids":
+        root["cellData/ids"][:] = np.array(["c2", "c1", "c0"])
+    else:
+        root[artifact_path(cells)]["values"][0] = False
+    with pytest.raises(ArtifactResolutionError):
+        resolve_native_graph_inputs(root, graph)

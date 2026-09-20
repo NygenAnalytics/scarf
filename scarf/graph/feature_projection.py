@@ -93,6 +93,7 @@ def _require_complete(
     expected_kind: str,
     expected_scope: str,
     expected_assay: str | None,
+    statuses: dict[ArtifactRef, ArtifactStatus] | None = None,
 ) -> ArtifactStatus:
     if ref.kind != expected_kind:
         raise _resolution_error(
@@ -116,7 +117,12 @@ def _require_complete(
             expected_assay=expected_assay,
         )
     try:
-        status = inspect_artifact(root, ref)
+        if statuses is not None and ref in statuses:
+            status = statuses[ref]
+        else:
+            status = inspect_artifact(root, ref)
+            if statuses is not None:
+                statuses[ref] = status
     except (KeyError, TypeError, ValueError) as error:
         raise _resolution_error(
             "Artifact record is malformed",
@@ -146,6 +152,7 @@ def _input_ref(
     expected_kind: str,
     expected_scope: str,
     expected_assay: str | None,
+    statuses: dict[ArtifactRef, ArtifactStatus] | None = None,
 ) -> ArtifactRef:
     status = _require_complete(
         root,
@@ -153,6 +160,7 @@ def _input_ref(
         expected_kind=owner.kind,
         expected_scope=owner.scope,
         expected_assay=owner.assay,
+        statuses=statuses,
     )
     inputs = status.inputs or {}
     raw = inputs.get(name)
@@ -188,6 +196,7 @@ def _input_ref(
         expected_kind=expected_kind,
         expected_scope=expected_scope,
         expected_assay=expected_assay,
+        statuses=statuses,
     )
     return value
 
@@ -215,6 +224,7 @@ def resolve_coordinate_inputs(
     coordinates: ArtifactRef,
 ) -> CoordinateInputs:
     """Resolve and validate the stored selections behind coordinates."""
+    statuses: dict[ArtifactRef, ArtifactStatus] = {}
     if coordinates.assay is None:
         raise _resolution_error(
             "Coordinate artifact has no assay",
@@ -230,6 +240,7 @@ def resolve_coordinate_inputs(
             expected_kind="imported_coordinates",
             expected_scope="assay",
             expected_assay=assay,
+            statuses=statuses,
         )
         from ..embeddings.imported_storage import (
             validate_imported_coordinates_artifact,
@@ -243,6 +254,7 @@ def resolve_coordinate_inputs(
             expected_kind="cell_selection",
             expected_scope="datastore",
             expected_assay=None,
+            statuses=statuses,
         )
         _validate_cell_selection(root, cell_selection)
         return CoordinateInputs(
@@ -265,6 +277,7 @@ def resolve_coordinate_inputs(
         expected_kind=coordinates.kind,
         expected_scope="assay",
         expected_assay=assay,
+        statuses=statuses,
     )
     reduction = (
         _input_ref(
@@ -274,6 +287,7 @@ def resolve_coordinate_inputs(
             expected_kind="reduction",
             expected_scope="assay",
             expected_assay=assay,
+            statuses=statuses,
         )
         if coordinates.kind == "batch_correction"
         else coordinates
@@ -285,6 +299,7 @@ def resolve_coordinate_inputs(
         expected_kind="normalized",
         expected_scope="assay",
         expected_assay=assay,
+        statuses=statuses,
     )
     cell_selection = _input_ref(
         root,
@@ -293,6 +308,7 @@ def resolve_coordinate_inputs(
         expected_kind="cell_selection",
         expected_scope="datastore",
         expected_assay=None,
+        statuses=statuses,
     )
     _validate_cell_selection(root, cell_selection)
     feature_selection = _input_ref(
@@ -302,6 +318,7 @@ def resolve_coordinate_inputs(
         expected_kind="feature_selection",
         expected_scope="assay",
         expected_assay=assay,
+        statuses=statuses,
     )
     feature_selection = resolve_feature_selection(root, assay, feature_selection)
     return CoordinateInputs(
@@ -319,6 +336,7 @@ def resolve_native_graph_inputs(
 ) -> NativeGraphInputs:
     """Resolve one native connectivity or neighbor branch through named inputs."""
 
+    statuses: dict[ArtifactRef, ArtifactStatus] = {}
     if source.kind == "connectivity_map":
         _require_complete(
             root,
@@ -326,6 +344,7 @@ def resolve_native_graph_inputs(
             expected_kind="connectivity_map",
             expected_scope="assay",
             expected_assay=source.assay,
+            statuses=statuses,
         )
         neighbors = _input_ref(
             root,
@@ -334,6 +353,7 @@ def resolve_native_graph_inputs(
             expected_kind="neighbors",
             expected_scope="assay",
             expected_assay=source.assay,
+            statuses=statuses,
         )
     elif source.kind == "neighbors":
         _require_complete(
@@ -342,6 +362,7 @@ def resolve_native_graph_inputs(
             expected_kind="neighbors",
             expected_scope="assay",
             expected_assay=source.assay,
+            statuses=statuses,
         )
         neighbors = source
     else:
@@ -366,6 +387,7 @@ def resolve_native_graph_inputs(
         expected_kind="ann_index",
         expected_scope="assay",
         expected_assay=assay,
+        statuses=statuses,
     )
     neighbor_status = _require_complete(
         root,
@@ -373,6 +395,7 @@ def resolve_native_graph_inputs(
         expected_kind="neighbors",
         expected_scope="assay",
         expected_assay=assay,
+        statuses=statuses,
     )
     neighbor_inputs = neighbor_status.inputs or {}
     raw_coordinates = neighbor_inputs.get("coordinates")
@@ -419,6 +442,7 @@ def resolve_native_graph_inputs(
         expected_kind=coordinates.kind,
         expected_scope="assay",
         expected_assay=assay,
+        statuses=statuses,
     )
     ann_coordinates = _input_ref(
         root,
@@ -427,6 +451,7 @@ def resolve_native_graph_inputs(
         expected_kind=coordinates.kind,
         expected_scope="assay",
         expected_assay=assay,
+        statuses=statuses,
     )
     if ann_coordinates != coordinates:
         raise _resolution_error(
@@ -449,6 +474,7 @@ def resolve_native_graph_inputs(
             expected_kind="cell_selection",
             expected_scope="datastore",
             expected_assay=None,
+            statuses=statuses,
         )
         _validate_cell_selection(root, cell_selection)
         return NativeGraphInputs(
@@ -469,6 +495,7 @@ def resolve_native_graph_inputs(
             expected_kind="reduction",
             expected_scope="assay",
             expected_assay=assay,
+            statuses=statuses,
         )
     else:
         reduction = coordinates
@@ -479,6 +506,7 @@ def resolve_native_graph_inputs(
         expected_kind="normalized",
         expected_scope="assay",
         expected_assay=assay,
+        statuses=statuses,
     )
     cell_selection = _input_ref(
         root,
@@ -487,6 +515,7 @@ def resolve_native_graph_inputs(
         expected_kind="cell_selection",
         expected_scope="datastore",
         expected_assay=None,
+        statuses=statuses,
     )
     _validate_cell_selection(root, cell_selection)
     feature_selection = _input_ref(
@@ -496,6 +525,7 @@ def resolve_native_graph_inputs(
         expected_kind="feature_selection",
         expected_scope="assay",
         expected_assay=assay,
+        statuses=statuses,
     )
     feature_selection = resolve_feature_selection(root, assay, feature_selection)
     return NativeGraphInputs(

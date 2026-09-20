@@ -4281,3 +4281,47 @@ def test_layer_placements_validate_mappings_and_names() -> None:
             row_names=["f1"],
             column_names=["other"],
         )
+
+
+def test_seurat_import_planning_does_not_read_every_cell_pointer(tmp_path, monkeypatch):
+    import zarr
+    from zarr.storage import MemoryStore
+    from scarf.storage.budget import ResourceBudget
+    from scarf.writers.seurat import SeuratToZarr
+
+    values = np.arange(4000, dtype=np.uint16).reshape(4, 1000) % 7
+    path = tmp_path / "counts.h5"
+    with h5py.File(path, "w") as handle:
+        _write_h5_sparse_group(handle, "X", values, "csc")
+    source = HDF5CompressedMatrixSource(
+        path,
+        "X",
+        physical_shape=values.shape,
+        physical_layout="csc",
+        physical_order="feature_by_cell",
+    )
+    reads = []
+    original = source._direct_bounds
+
+    def bounds(start, stop):
+        reads.append((start, stop))
+        return original(start, stop)
+
+    monkeypatch.setattr(source, "_direct_bounds", bounds)
+    root = zarr.open_group(MemoryStore(), mode="w")
+    destination = root.create_array(
+        "counts",
+        shape=(1000, 4),
+        dtype=values.dtype,
+        chunks=(100, 4),
+        shards=(1000, 4),
+    )
+    writer = object.__new__(SeuratToZarr)
+    writer.resources = ResourceBudget(64 * 1024**2, 1)
+    writer._residentSourceBytes = 0
+    writer._lastImportPlans = {}
+    writer.io = None
+    writer._write_sparse_counts("RNA", source, destination, None)
+    np.testing.assert_array_equal(destination[:], values.T)
+    assert len(reads) < 10
+    assert all(stop - start == 1000 for start, stop in reads)

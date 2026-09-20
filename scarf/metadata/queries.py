@@ -1,10 +1,11 @@
-import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any, Hashable, Protocol, cast
 
 import numpy as np
 import pandas as pd
+
+from ..utils.arrays import regex_match_mask
 
 
 class _QueryableMetaData(Protocol):
@@ -107,11 +108,11 @@ def grep(
     only_valid: bool = False,
 ) -> list[str]:
     """Return feature names that match a case-insensitive regex."""
-    names = np.array(list(map(str.upper, metadata.fetch_all("names"))))
+    names = metadata.fetch_all("names")
     if only_valid:
         names = names[metadata.active_index("I")]
     return sorted(
-        {name for name in names if re.match(pattern.upper(), name) is not None}
+        {str(name).upper() for name in names[regex_match_mask(names, pattern)]}
     )
 
 

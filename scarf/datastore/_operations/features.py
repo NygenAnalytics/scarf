@@ -94,7 +94,7 @@ from ...metadata.selection import (
     valid_category_mask,
 )
 from ...metadata.rows import read_metadata_missing_rows, read_metadata_rows
-from ...utils.arrays import array_digest
+from ...utils.arrays import array_digest, regex_match_mask
 from ...utils.compute import controlled_compute
 from ...utils.logging import logger
 from ...utils.progress import iter_progress
@@ -543,6 +543,11 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
     ) -> ArtifactRef:
         """Create or reuse an HVG artifact without creating a mutable alias."""
         self._require_feature_write("select_hvgs")
+        blacklist_fingerprint = (
+            fingerprint_array(regex_match_mask(feature_names, blacklist))
+            if blacklist
+            else None
+        )
         summary_ref = ensure_feature_summary(
             self.zw,
             assay,
@@ -593,6 +598,11 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 "n_bins": n_bins,
                 "lowess_frac": lowess_frac,
                 "blacklist": blacklist,
+                **(
+                    {"blacklist_fingerprint": blacklist_fingerprint}
+                    if blacklist_fingerprint is not None
+                    else {}
+                ),
                 "keep_bounds": keep_bounds,
                 "bin_strategy": bin_strategy,
                 **(

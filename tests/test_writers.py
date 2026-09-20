@@ -944,6 +944,32 @@ def test_loomtozarr_preserves_exact_counts_and_transpose(tmp_path):
     assert root["RNA/countsT"].attrs["complete"] is True
 
 
+def test_dense_loom_import_fits_a_bounded_memory_budget(tmp_path):
+    import h5py
+    from scarf.readers import LoomReader
+    from scarf.writers import LoomToZarr
+
+    values = np.ones((2000, 512), dtype=np.uint16)
+    values[::3, ::5] = 0
+    path = tmp_path / "dense.loom"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("matrix", data=values.T, chunks=(128, 128))
+    reader = LoomReader(str(path), dtype="uint32")
+    try:
+        writer = LoomToZarr(
+            reader,
+            MemoryStore(),
+            mem_budget="8M",
+            nthreads=1,
+            policy=CountMatrixPolicy(unitBytes=256 * 1024, chunkBytes=64 * 1024),
+        )
+        writer.dump()
+        np.testing.assert_array_equal(writer.z["RNA/counts"][:], values)
+        np.testing.assert_array_equal(writer.z["RNA/countsT"][:], values.T)
+    finally:
+        reader.h5.close()
+
+
 def test_sparsetozarr(tmp_path):
     from scipy.sparse import csr_matrix
 
@@ -1325,9 +1351,13 @@ def test_to_h5ad_preserves_counts_metadata_and_embeddings(export_assay_store, tm
         assert "RNA_UMAP2" not in h5["obs"]
 
 
+@pytest.mark.parametrize("skip_recalc", [True, False])
+@pytest.mark.parametrize("preserve_total", [True, False])
 def test_to_h5ad_recalculates_counts_without_mutating_qc_metadata(
     export_assay_store,
     tmp_path,
+    skip_recalc,
+    preserve_total,
 ):
     import h5py
     from scipy.sparse import csr_matrix
@@ -1336,11 +1366,16 @@ def test_to_h5ad_recalculates_counts_without_mutating_qc_metadata(
 
     assay = export_assay_store.RNA
     source_qc = np.full(assay.cells.N, 99, dtype=np.int64)
+    if preserve_total:
+        source_qc = np.count_nonzero(assay.rawData.compute(), axis=1)
+        donor = int(np.flatnonzero(source_qc)[0])
+        source_qc[donor] -= 1
+        source_qc[(donor + 1) % assay.cells.N] += 1
     assay.cells.insert("RNA_nFeatures", source_qc, overwrite=True)
     columns_before = set(assay.cells.columns)
 
     path = tmp_path / "recalculated_export.h5ad"
-    to_h5ad(assay, str(path), skip_recalc_nfeats=False)
+    to_h5ad(assay, str(path), skip_recalc_nfeats=skip_recalc)
 
     assert set(assay.cells.columns) == columns_before
     np.testing.assert_array_equal(
@@ -1513,6 +1548,7 @@ def test_to_mtx_preserves_counts_barcodes_and_features(export_assay_store, tmp_p
     from scarf.writers import to_mtx
 
     assay = export_assay_store.RNA
+    assay.cells.insert("RNA_nFeatures", np.full(assay.cells.N, 99), overwrite=True)
     out_dir = tmp_path / "toy_mtx"
     to_mtx(assay, str(out_dir), compress=False)
 
@@ -1546,6 +1582,7 @@ def test_to_mtx_compress_writes_gzipped_matrix_market(export_assay_store, tmp_pa
     from scarf.writers import to_mtx
 
     assay = export_assay_store.RNA
+    assay.cells.insert("RNA_nFeatures", np.full(assay.cells.N, 99), overwrite=True)
     out_dir = tmp_path / "toy_mtx_gz"
     to_mtx(assay, str(out_dir), compress=True)
 
@@ -1755,6 +1792,16 @@ def test_subset_zarr_resolves_consistent_cell_key():
         subset._check_idx("selected", None),
         np.array([0, 2]),
     )
+
+
+def test_subset_zarr_rejects_different_cell_masks():
+    subset = object.__new__(SubsetZarr)
+    subset.assays = [
+        _FakeAssay("RNA", 2, {"selected": np.array([True, False])}),
+        _FakeAssay("ATAC", 2, {"selected": np.array([False, True])}),
+    ]
+    with pytest.raises(ValueError):
+        subset._check_idx("selected", None)
 
 
 def test_subset_zarr_local_path_guard(tmp_path):

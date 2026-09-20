@@ -24,6 +24,64 @@ def bucket_folder(path: str) -> BucketFolder:
     )
 
 
+@pytest.mark.parametrize("member_name", ["notes.txt", "other.zarr/zarr.json"])
+def test_archive_cannot_replace_unrelated_siblings(tmp_path, member_name):
+    from scarf.cytebase import _extract_and_replace
+
+    notes = tmp_path / "notes.txt"
+    notes.write_text("keep this")
+    output = tmp_path / "data.zarr"
+    output.mkdir()
+    (output / "zarr.json").write_text("original")
+    staged = tmp_path / "download"
+    with tarfile.open(staged, "w:gz") as archive:
+        for name in ["data.zarr/zarr.json", member_name]:
+            member = tarfile.TarInfo(name)
+            member.size = 7
+            archive.addfile(member, io.BytesIO(b"replace"))
+    destination = tmp_path / "data.zarr.tar.gz"
+    with pytest.raises(ValueError, match="must contain only the directory"):
+        _extract_and_replace(staged, destination)
+    assert notes.read_text() == "keep this"
+    assert (output / "zarr.json").read_text() == "original"
+    assert not destination.exists()
+
+
+def test_archive_replaces_only_its_named_output_directory(tmp_path):
+    from scarf.cytebase import _extract_and_replace
+
+    output = tmp_path / "data.zarr"
+    output.mkdir()
+    (output / "old").write_text("old data")
+    notes = tmp_path / "notes.txt"
+    notes.write_text("keep this")
+    staged = tmp_path / "download"
+    with tarfile.open(staged, "w:gz") as archive:
+        member = tarfile.TarInfo("data.zarr/zarr.json")
+        member.size = 2
+        archive.addfile(member, io.BytesIO(b"{}"))
+    destination = tmp_path / "data.zarr.tar.gz"
+    _extract_and_replace(staged, destination)
+    assert (output / "zarr.json").read_text() == "{}"
+    assert not (output / "old").exists()
+    assert notes.read_text() == "keep this"
+    assert destination.is_file()
+
+
+def test_archive_output_directory_cannot_be_a_symlink(tmp_path):
+    from scarf.cytebase import _extract_and_replace
+
+    staged = tmp_path / "download"
+    with tarfile.open(staged, "w:gz") as archive:
+        member = tarfile.TarInfo("data.zarr")
+        member.type = tarfile.SYMTYPE
+        member.linkname = "."
+        archive.addfile(member)
+    with pytest.raises(ValueError, match="must contain only the directory"):
+        _extract_and_replace(staged, tmp_path / "data.zarr.tar.gz")
+    assert not (tmp_path / "data.zarr").exists()
+
+
 def test_list_repositories_is_sorted_and_anonymous(monkeypatch):
     from scarf import cytebase
 

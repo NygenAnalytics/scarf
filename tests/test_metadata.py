@@ -31,6 +31,20 @@ def test_metadata_fetch(dummy_metadata):
     assert len(dummy_metadata.fetch_all("I")) == 9
 
 
+def test_metadata_grep_preserves_regex_character_classes(dummy_metadata):
+    dummy_metadata.insert(
+        "names",
+        np.array(["RPS3", "RPSX", "mt-Co1", "MT1A", "g_a", "g-", "x y", "xy", "RPS4"]),
+        overwrite=True,
+    )
+
+    assert dummy_metadata.grep(r"^RPS\d+$") == ["RPS3", "RPS4"]
+    assert dummy_metadata.grep(r"^g_\w+$") == ["G_A"]
+    assert dummy_metadata.grep(r"^x\sy$") == ["X Y"]
+    assert dummy_metadata.grep("^MT-") == ["MT-CO1"]
+    assert dummy_metadata.grep(r"^RPS\d+$", only_valid=True) == ["RPS3", "RPS4"]
+
+
 def test_metadata_insert_encodes_none_as_missing_text(dummy_metadata):
     values = np.array(["a", None, "b", "", "a", "b", "a", "b", "a"], dtype=object)
 

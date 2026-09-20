@@ -23,7 +23,6 @@ from ...storage.artifacts import (
     inspect_artifact,
 )
 from ...storage.types import as_zarr_array, as_zarr_group
-from ...storage.selections import validate_stored_selection_integrity
 from ...utils.logging import logger, progress_enabled
 from ...utils.shutdown import shutdown_checkpoint
 
@@ -148,14 +147,6 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
             raise TypeError("graph must be an ArtifactRef")
         graph_input = graph
         cell_selection = graph_cell_selection(self.zw, graph_input)
-        validate_stored_selection_integrity(
-            self.zw,
-            cell_selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )
         graph_matrix = self.load_graph(
             graph_input,
             symmetric=symmetric_graph,
@@ -340,14 +331,6 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
             raise TypeError("graph must be an ArtifactRef")
         graph_input = graph
         cell_selection = graph_cell_selection(self.zw, graph_input)
-        validate_stored_selection_integrity(
-            self.zw,
-            cell_selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )
         graph_matrix = self.load_graph(
             graph_input,
             symmetric=symmetric_graph,

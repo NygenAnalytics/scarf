@@ -1,9 +1,9 @@
-import re
 from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
 
+from ..utils.arrays import regex_match_mask
 from ..utils.logging import logger
 
 __all__ = [
@@ -16,7 +16,7 @@ __all__ = [
 _ADAPTIVE_MIN_SUPPORT = 50
 _ADAPTIVE_QUANTILE = 0.25
 
-# Case-insensitive via uppercasing in select_highly_variable_features / MetaData.grep.
+# Patterns match names case-insensitively unless a scoped regex flag overrides it.
 DEFAULT_HVG_BLACKLIST = (
     "^MT-|^RPS|^RPL|^MRPS|^MRPL|^CCN|^HLA-|^H2-|^HIST|"
     "^XIST$|^DDX3Y$|^USP9Y$|^EIF1AY$|^KDM5D$|^SRY$|^ZFY$|^UTY$|^TMSB4Y$|^NLGN4Y$"
@@ -344,12 +344,7 @@ def select_highly_variable_features(
     max_mean = _linear_threshold(max_mean, np.inf)
 
     if blacklist:
-        pattern = re.compile(blacklist.upper())
-        allowed = np.fromiter(
-            (pattern.match(str(name).upper()) is None for name in feature_names),
-            dtype=bool,
-            count=size,
-        )
+        allowed = ~regex_match_mask(feature_names, blacklist)
     else:
         allowed = np.ones(size, dtype=bool)
 

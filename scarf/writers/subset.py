@@ -231,7 +231,7 @@ class SubsetZarr:
                     )
                 if resolved is None:
                     resolved = idx
-                elif np.all(resolved == idx) is False:
+                elif not np.array_equal(resolved, idx):
                     raise ValueError(
                         f"ERROR: Provided cell_key {cell_key} is not consistent across the assays. "
                         f"Please make sure that the assays are from the same DataStore."

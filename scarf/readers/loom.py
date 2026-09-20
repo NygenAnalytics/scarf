@@ -155,12 +155,19 @@ class LoomReader:
         ]
         return self._stream_attrs(self.featureAttrsKey, ignore_keys)
 
+    def consume_dense(
+        self, batch_size: int = 1000
+    ) -> Generator[np.ndarray, None, None]:
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        dset = self.h5[self.matrixKey]
+        for start in range(0, self.nCells, batch_size):
+            yield np.asarray(
+                dset[:, start : min(start + batch_size, self.nCells)].T,
+                dtype=self.matrixDtype,
+            )
+
     def consume(self, batch_size: int = 1000) -> Generator[np.ndarray, None, None]:
         """Returns a generator that yield chunks of data."""
-        dset = self.h5[self.matrixKey]
-        s = 0
-        for e in range(batch_size, dset.shape[1] + batch_size, batch_size):
-            if e > dset.shape[1]:
-                e = dset.shape[1]
-            yield coo_matrix(dset[:, s:e]).T.astype(self.matrixDtype)
-            s = e
+        for values in self.consume_dense(batch_size):
+            yield coo_matrix(values)

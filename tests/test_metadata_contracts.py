@@ -128,6 +128,32 @@ def test_metadata_rows_and_queries_match_table_contract():
     assert table.head(2)["score"].tolist() == [0.5, 2.0]
 
 
+def test_metadata_fetch_reads_only_the_requested_column():
+    from tests.store_probes import RecordingStore
+
+    store = RecordingStore()
+    group = zarr.open_group(store=store, mode="w")
+    for index in range(20):
+        group.create_array(f"value{index}", data=np.arange(3))
+    table = metadata.MetaData(group)
+    store.reset()
+    np.testing.assert_array_equal(table.fetch_all("value4"), np.arange(3))
+    metadata_reads = [
+        key
+        for operation, key in store.ops
+        if operation == "get" and key.endswith("zarr.json")
+    ]
+    assert metadata_reads and set(metadata_reads) == {"value4/zarr.json"}
+    group.create_array("added", data=np.ones(3))
+    np.testing.assert_array_equal(table.fetch_all("added"), np.ones(3))
+    del group["added"]
+    with pytest.raises(KeyError):
+        table.fetch_all("added")
+    group.create_array("nested/hidden", data=np.ones(3))
+    with pytest.raises(KeyError):
+        table.fetch_all("nested/hidden")
+
+
 def test_metadata_row_helpers_read_permutations_and_missing_masks():
     table = _metadata_fixture()
     group = table.locations["primary"]

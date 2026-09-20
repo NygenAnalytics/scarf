@@ -128,6 +128,12 @@ def test_affordable_width_finds_the_largest_accepted_width() -> None:
     assert affordable_width(lambda _width: False, 10) == 0
 
 
+@pytest.mark.parametrize("limit", [0, 1, 2, 10, 1000])
+def test_affordable_width_preserves_budget_boundaries(limit):
+    for budget in range(limit + 1):
+        assert affordable_width(lambda rows: rows <= budget, limit) == budget
+
+
 def test_partition_indices_emits_one_block_per_chunk_by_default() -> None:
     geometry = _geometry(shape=(12, 20), chunks=(5, 5))
 

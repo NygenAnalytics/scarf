@@ -380,6 +380,16 @@ def _extract_and_replace(
             archive.extractall(staging_path, members=members, filter="data")
 
         extracted_paths = sorted(staging_path.iterdir(), key=lambda path: path.name)
+        output_name = destination.name.removesuffix(".tar.gz")
+        if (
+            len(extracted_paths) != 1
+            or extracted_paths[0].name != output_name
+            or extracted_paths[0].is_symlink()
+            or not extracted_paths[0].is_dir()
+        ):
+            raise ValueError(
+                f"Tar archive must contain only the directory {output_name!r}"
+            )
         extracted_replacements = [
             (path, destination.parent / path.name) for path in extracted_paths
         ]

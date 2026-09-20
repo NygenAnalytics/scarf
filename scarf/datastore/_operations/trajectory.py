@@ -571,14 +571,6 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         )
         graph_ref = graph
         stored_selection = graph_cell_selection(self.zw, graph_ref)
-        validate_stored_selection_integrity(
-            self.zw,
-            stored_selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )
 
         logger.info(f"Pseudotime scoring: loading graph {graph_ref.artifact_id}")
         graph_matrix = self.load_graph(

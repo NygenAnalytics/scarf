@@ -186,15 +186,43 @@ def test_initialization_concurrency_respects_a_tight_memory_budget():
     _assert_one_counts_stream(store, expected_reads)
 
 
-def test_cached_initialization_is_read_and_write_free():
+@pytest.mark.parametrize("mode", ["r", "r+"])
+def test_cached_initialization_is_read_and_write_free(mode):
     store, _ = _qc_store()
     _open_qc_store(store)
     store.reset()
 
-    _open_qc_store(store, zarr_mode="r")
+    _open_qc_store(store, zarr_mode=mode, default_assay=None)
 
     assert _count_chunk_gets(store) == []
     assert [operation for operation, _ in store.ops if operation == "set"] == []
+
+
+def test_fresh_import_opens_read_only_without_initializing_qc():
+    store, _ = _qc_store()
+    dataset = _open_qc_store(store, zarr_mode="r")
+    np.testing.assert_array_equal(dataset.RNA.rawData.compute(), _QC_VALUES)
+    assert "RNA_nFeatures" not in dataset.cells.columns
+    assert "nCells" not in dataset.RNA.feats.columns
+    assert dataset.RNA.sf == 1000
+    assert [operation for operation, _ in store.ops if operation == "set"] == []
+
+
+def test_default_mito_pattern_excludes_other_mt_prefixes():
+    store, _ = _qc_store()
+    root = zarr.open_group(store=store, mode="r+")
+    root["RNA/featureData/names"][:] = np.array(
+        ["mt-Co1", "MTOR", "MT1A", "RPL5", "ZERO", "GENE_B"]
+    )
+    dataset = _open_qc_store(store, mito_pattern=None)
+    totals = _QC_VALUES.sum(axis=1)
+    expected = np.divide(
+        100 * _QC_VALUES[:, 0],
+        totals,
+        out=np.full(len(totals), np.nan),
+        where=totals != 0,
+    )
+    np.testing.assert_allclose(dataset.cells.fetch_all("RNA_percentMito"), expected)
 
 
 def test_partial_initialization_preserves_feature_summary_cache(monkeypatch):
@@ -233,7 +261,7 @@ def test_partial_initialization_preserves_feature_summary_cache(monkeypatch):
     )
 
 
-def test_percent_cache_remains_attribute_only():
+def test_missing_percent_column_is_recomputed():
     store, expected_reads = _qc_store()
     datastore = _open_qc_store(store)
     datastore.cells.drop("RNA_percentMito")
@@ -241,14 +269,137 @@ def test_percent_cache_remains_attribute_only():
 
     cached = _open_qc_store(store)
 
-    assert _count_chunk_gets(store) == []
-    assert "RNA_percentMito" not in cached.cells.columns
+    _assert_one_counts_stream(store, expected_reads)
+    assert "RNA_percentMito" in cached.cells.columns
     store.reset()
 
     refreshed = _open_qc_store(store, mito_pattern="^MT-|^GENE_A$")
 
     _assert_one_counts_stream(store, expected_reads)
     assert "RNA_percentMito" in refreshed.cells.columns
+
+
+def test_percent_cache_without_matched_features_is_recomputed():
+    store, expected_reads = _qc_store()
+    root = zarr.open_group(store=store, mode="r+")
+    root["RNA/featureData/names"][:] = np.array(
+        ["RPSX", "RPS3", "GENE_A", "RPL5", "ZERO", "GENE_B"]
+    )
+    dataset = _open_qc_store(store, mito_pattern="", ribo_pattern=r"^RPS\d+$")
+    column = dataset.cells._get_array("RNA_percentRibo")
+    totals = _QC_VALUES.sum(axis=1)
+    column[:] = np.divide(
+        100 * _QC_VALUES[:, 0],
+        totals,
+        out=np.full(len(totals), np.nan),
+        where=totals != 0,
+    )
+    del column.attrs["feature_selection_fingerprint"]
+    store.reset()
+
+    reopened = _open_qc_store(store, mito_pattern="", ribo_pattern=r"^RPS\d+$")
+
+    expected = np.divide(
+        100 * _QC_VALUES[:, 1],
+        totals,
+        out=np.full(len(totals), np.nan),
+        where=totals != 0,
+    )
+    np.testing.assert_allclose(reopened.cells.fetch_all("RNA_percentRibo"), expected)
+    _assert_one_counts_stream(store, expected_reads)
+
+
+@pytest.mark.parametrize("pattern", [r"^MT-", r"^ABSENT$"])
+def test_percent_no_matches_removes_stale_values(pattern):
+    store, _ = _qc_store()
+    root = zarr.open_group(store=store, mode="r+")
+    root["RNA/featureData/names"][:] = np.array(
+        ["MTOR", "MT1A", "GENE_A", "RPL5", "ZERO", "GENE_B"]
+    )
+    _open_qc_store(store, mito_pattern="MT-|mt")
+    store.reset()
+
+    reopened = _open_qc_store(store, mito_pattern=pattern)
+
+    assert "RNA_percentMito" not in reopened.cells.columns
+    assert "RNA_percentMito" not in reopened.RNA.attrs["percentFeatures"]
+    assert _count_chunk_gets(store) == []
+
+
+def test_percent_matched_but_unexpressed_features_remove_stale_values():
+    store, expected_reads = _qc_store()
+    _open_qc_store(store)
+    store.reset()
+
+    reopened = _open_qc_store(store, mito_pattern="^ZERO$")
+
+    assert "RNA_percentMito" not in reopened.cells.columns
+    assert "RNA_percentMito" not in reopened.RNA.attrs["percentFeatures"]
+    _assert_one_counts_stream(store, expected_reads)
+
+
+@pytest.mark.parametrize(
+    ("pattern", "indices"),
+    [("^mt-", [0, 1]), (r"(?-i:^MT-)", [1]), (r"\ARPS\d+\Z", [2, 3])],
+)
+def test_percent_matching_preserves_regex_and_selected_rows(pattern, indices):
+    store, _ = _qc_store()
+    root = zarr.open_group(store=store, mode="r+")
+    root["RNA/featureData/names"][:] = np.array(
+        ["mt-Co1", "MT-CO1", "RPS3", "rps4", "MTOR", "GENE_B"]
+    )
+    dataset = _open_qc_store(store, mito_pattern=pattern)
+
+    totals = _QC_VALUES.sum(axis=1)
+    expected = np.divide(
+        100 * _QC_VALUES[:, indices].sum(axis=1),
+        totals,
+        out=np.full(len(totals), np.nan),
+        where=totals != 0,
+    )
+    np.testing.assert_allclose(dataset.cells.fetch_all("RNA_percentMito"), expected)
+
+
+def test_percent_cache_tracks_renamed_features():
+    store, expected_reads = _qc_store()
+    dataset = _open_qc_store(store)
+    dataset.RNA.feats.insert(
+        "names",
+        np.array(["GENE_C", "MT-CO2", "GENE_A", "RPL5", "ZERO", "GENE_B"]),
+        overwrite=True,
+    )
+    store.reset()
+
+    reopened = _open_qc_store(store)
+
+    totals = _QC_VALUES.sum(axis=1)
+    expected = np.divide(
+        100 * _QC_VALUES[:, 1],
+        totals,
+        out=np.full(len(totals), np.nan),
+        where=totals != 0,
+    )
+    np.testing.assert_allclose(reopened.cells.fetch_all("RNA_percentMito"), expected)
+    _assert_one_counts_stream(store, expected_reads)
+
+
+def test_percent_failed_computation_does_not_cache_a_new_pattern(monkeypatch):
+    store, _ = _qc_store()
+    _open_qc_store(store)
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("count read failed")
+
+    with monkeypatch.context() as context:
+        context.setattr(Assay, "_stream_initialization_stats", fail)
+        with pytest.raises(RuntimeError, match="count read failed"):
+            _open_qc_store(store, mito_pattern="^GENE_A$")
+
+    root = zarr.open_group(store=store, mode="r")
+    assert "RNA_percentMito" not in root["cellData"]
+    assert "RNA_percentMito" not in root["RNA"].attrs["percentFeatures"]
+    reopened = _open_qc_store(store, mito_pattern="^GENE_A$")
+    assert "RNA_percentMito" in reopened.cells.columns
 
 
 def test_partial_feature_props_are_recomputed_together():

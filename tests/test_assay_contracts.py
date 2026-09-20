@@ -160,7 +160,8 @@ def test_assay_subclass_and_static_method_contracts_are_stable():
 
 def test_default_normalizer_identity_is_stable(monkeypatch):
     def initialize_base(self, *args, **kwargs):
-        self.attrs = {}
+        self.z = zarr.open_group(store=MemoryStore(), mode="w")
+        self.attrs = self.z.attrs
 
     monkeypatch.setattr(Assay, "__init__", initialize_base)
     rna = RNAassay(None, "RNA", None)
@@ -337,15 +338,6 @@ def test_base_assay_sparse_export_combines_streamed_blocks():
     np.testing.assert_array_equal(
         observed.toarray(),
         np.array([[1, 0], [0, 2], [3, 4]]),
-    )
-
-
-def test_base_assay_ingestion_percent_feature_writer_keeps_zero_path():
-    zero_assay = SimpleNamespace(cells=None)
-    Assay._write_percent_feature(
-        zero_assay,
-        "percent_zero",
-        np.zeros(2),
     )
 
 

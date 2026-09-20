@@ -120,6 +120,61 @@ def _merge_two_rna(**kwargs):
     return DataStoreMerge(**defaults)
 
 
+def test_merged_case_distinct_ids_resolve_and_fetch_exactly():
+    from scarf.datastore.datastore import DataStore
+    from scarf.features.values import fetch_normalized_feature_matrix, resolve_feature
+    from scarf.metadata.selection import FeatureRef, NormalizationSpec
+
+    sources = []
+    for label, symbol, counts in [
+        ("left", "GeneA", [[5, 2]]),
+        ("right", "genea", [[7, 3]]),
+    ]:
+        sources.append(
+            _MergeDataStore(
+                [
+                    _MergeAssay(
+                        "RNA",
+                        np.array(counts, dtype=np.uint32),
+                        [label],
+                        [symbol, "shared"],
+                        [symbol, "shared"],
+                        block_size=1,
+                    )
+                ],
+                zarr_loc=f"memory://{label}",
+            )
+        )
+    output = MemoryStore()
+    DataStoreMerge(
+        sources, output, ["left", "right"], seed=None, nthreads=1, profile="fast_local"
+    ).dump()
+    merged = DataStore(
+        output,
+        default_assay="RNA",
+        min_features_per_cell=0,
+        mito_pattern="",
+        ribo_pattern="",
+        nthreads=1,
+        zarrProfile="fast_local",
+    )
+
+    resolved = [
+        resolve_feature(merged, FeatureRef(value, by="id", reduction="sum"))
+        for value in ("GeneA", "genea")
+    ]
+    assert [feature.ids for feature in resolved] == [("GeneA",), ("genea",)]
+    values = fetch_normalized_feature_matrix(
+        merged, resolved, np.arange(2), NormalizationSpec(source="raw")
+    )
+    np.testing.assert_array_equal(values, [[5, 0], [0, 7]])
+    with pytest.raises(KeyError, match="not found"):
+        resolve_feature(merged, FeatureRef("GENEA", by="id"))
+    with pytest.raises(ValueError, match="matches 2 entries"):
+        resolve_feature(merged, FeatureRef("GENEA", by="name"))
+    assert resolve_feature(merged, "SHARED").ids == ("shared",)
+
+
 def _two_assay_sources():
     cell_ids = ["c0", "c1"]
     left = _MergeDataStore(
@@ -315,7 +370,7 @@ def test_dataset_merge_maps_features_and_preserves_row_order(tmp_path):
 
 
 @pytest.mark.parametrize("dtype", [None, "uint16"])
-def test_dataset_merge_widens_before_consolidating_features(tmp_path, dtype):
+def test_dataset_merge_preserves_suffixed_feature_ids(tmp_path, dtype):
     feature_ids = ["gene_0", "gene_1"]
     left = _MergeDataStore(
         [
@@ -343,7 +398,7 @@ def test_dataset_merge_widens_before_consolidating_features(tmp_path, dtype):
         ],
         zarr_loc="memory://right",
     )
-    path = str(tmp_path / "consolidated_features.zarr")
+    path = str(tmp_path / "suffixed_features.zarr")
     DataStoreMerge(
         datasets=[left, right],
         zarr_path=path,
@@ -352,9 +407,14 @@ def test_dataset_merge_widens_before_consolidating_features(tmp_path, dtype):
         dtype=dtype,
         overwrite=True,
     ).dump()
-    counts = zarr.open_group(path, mode="r")["RNA/counts"]
-    assert counts.dtype == np.dtype("uint16")
-    np.testing.assert_array_equal(counts[:], [[300], [300]])
+    root = zarr.open_group(path, mode="r")
+    counts = root["RNA/counts"]
+    assert counts.dtype == np.dtype("uint8" if dtype is None else dtype)
+    np.testing.assert_array_equal(root["RNA/featureData/ids"][:], feature_ids)
+    expected = {"left__left": [200, 100], "right__right": [150, 150]}
+    for cell_id, row in zip(root["cellData/ids"][:], counts[:], strict=True):
+        np.testing.assert_array_equal(row, expected[cell_id])
+    np.testing.assert_array_equal(root["RNA/countsT"][:], counts[:].T)
 
 
 def test_dataset_merge_keeps_source_metadata_aligned_after_permutation(tmp_path):
@@ -2509,7 +2569,7 @@ def test_dataset_merge_producer_reserve_uses_source_feature_width():
             cell_ids,
         ),
     ]
-    collapsed = [
+    suffixed = [
         assay(
             np.ones((4, 2), dtype=np.uint16),
             ["gene_0", "gene_1"],
@@ -2566,15 +2626,15 @@ def test_dataset_merge_producer_reserve_uses_source_feature_width():
         4
     ) > dense_requirements.extraProducerBytes(2)
 
-    collapsed_alignment, collapsed_requirements = requirements_for(collapsed)
-    assert collapsed_alignment.nFeats == 1
-    collapsed_expected = 2 * 2 * value_bytes + 2 * 2 * (value_bytes + index_bytes)
+    suffixed_alignment, suffixed_requirements = requirements_for(suffixed)
+    assert suffixed_alignment.nFeats == 2
+    suffixed_expected = 2 * 2 * value_bytes + 2 * 2 * (value_bytes + index_bytes)
     destination_only = (
-        2 * collapsed_alignment.nFeats * value_bytes
-        + 2 * collapsed_alignment.nFeats * (value_bytes + index_bytes)
+        2 * suffixed_alignment.nFeats * value_bytes
+        + 2 * suffixed_alignment.nFeats * (value_bytes + index_bytes)
     )
-    assert collapsed_requirements.extraProducerBytes(2) >= collapsed_expected
-    assert collapsed_requirements.extraProducerBytes(2) > destination_only
+    assert suffixed_requirements.extraProducerBytes(2) >= suffixed_expected
+    assert suffixed_requirements.extraProducerBytes(2) >= destination_only
 
     with pytest.raises(ValueError, match="No overlapping features"):
         align_features(
@@ -2761,7 +2821,7 @@ def test_dataset_merge_preserves_typed_fill_values_and_missing_masks():
         assert np.isnan(score[position])
 
 
-def test_dataset_merge_widens_signed_counts_before_feature_consolidation():
+def test_dataset_merge_preserves_signed_counts_and_feature_identity():
     left = _MergeDataStore(
         [
             _MergeAssay(
@@ -2798,17 +2858,19 @@ def test_dataset_merge_widens_signed_counts_before_feature_consolidation():
     )
 
     plan = merger.plan()
-    assert plan.assays[0].dtype == "int16"
-    assert plan.assays[0].nFeatures == 1
+    assert plan.assays[0].dtype == "int8"
+    assert plan.assays[0].nFeatures == 2
     merger.dump()
 
     root = zarr.open_group(destination, mode="r")
     ids = np.asarray(root["cellData/ids"][:]).astype(str)
     counts = np.asarray(root["RNA/counts"][:])
-    assert counts.dtype == np.dtype(np.int16)
-    assert {cell_id: int(row[0]) for cell_id, row in zip(ids, counts, strict=True)} == {
-        "left__c0": 200,
-        "right__c0": -200,
+    assert counts.dtype == np.dtype(np.int8)
+    assert {
+        cell_id: row.tolist() for cell_id, row in zip(ids, counts, strict=True)
+    } == {
+        "left__c0": [100, 100],
+        "right__c0": [-100, -100],
     }
 
 
@@ -2851,7 +2913,7 @@ def test_dataset_merge_uses_float_counts_for_mixed_source_dtypes():
         ),
     ],
 )
-def test_dataset_merge_normalizes_duplicate_feature_suffixes(
+def test_dataset_merge_matches_suffixed_features_by_exact_id(
     left_ids,
     left_names,
     right_ids,
@@ -2892,22 +2954,32 @@ def test_dataset_merge_normalizes_duplicate_feature_suffixes(
         seed=0,
     )
 
+    if not set(left_ids).intersection(right_ids):
+        with pytest.raises(ValueError, match="No overlapping features"):
+            merger.plan()
+        return
     plan = merger.plan()
-    assert plan.assays[0].nFeatures == 1
-    assert plan.assays[0].featureOverlapFraction == 1.0
+    assert plan.assays[0].nFeatures == 3
+    assert plan.assays[0].featureOverlapFraction == pytest.approx(1 / 3)
     merger.dump()
 
     root = zarr.open_group(destination, mode="r")
-    assert np.asarray(root["RNA/featureData/ids"][:]).astype(str).tolist() == ["gene"]
+    assert np.asarray(root["RNA/featureData/ids"][:]).astype(str).tolist() == [
+        "gene_1",
+        "gene_2",
+        "gene_0",
+    ]
     ids = np.asarray(root["cellData/ids"][:]).astype(str)
     counts = np.asarray(root["RNA/counts"][:])
-    assert {cell_id: int(row[0]) for cell_id, row in zip(ids, counts, strict=True)} == {
-        "left__c0": 11,
-        "right__c0": 22,
+    assert {
+        cell_id: row.tolist() for cell_id, row in zip(ids, counts, strict=True)
+    } == {
+        "left__c0": [1, 10, 0],
+        "right__c0": [20, 0, 2],
     }
 
 
-def test_dataset_merge_rejects_feature_numbering_that_starts_at_two():
+def test_dataset_merge_rejects_disjoint_suffixed_feature_ids():
     left = _MergeDataStore(
         [
             _MergeAssay(
@@ -2934,7 +3006,7 @@ def test_dataset_merge_rejects_feature_numbering_that_starts_at_two():
         ],
         zarr_loc="memory://right",
     )
-    with pytest.raises(ValueError, match="Feature Numbering starts with 2"):
+    with pytest.raises(ValueError, match="No overlapping features"):
         DataStoreMerge(
             datasets=[left, right],
             zarr_path=MemoryStore(),
@@ -3169,3 +3241,15 @@ def test_resolve_assay_type_classifies_rna_instances_without_type_attr() -> None
         DataStoreMerge._resolve_assay_type(SimpleNamespace(), "custom", [TinyRNA()])
         == "RNA"
     )
+
+
+@pytest.mark.parametrize("feature_ids", [["a", "a"], ["different_a", "different_b"]])
+def test_merge_rejects_ambiguous_feature_identity(feature_ids):
+    from scarf.merge.features import align_features
+
+    left = _MergeAssay("RNA", [[1, 2]], ["c"], ["a", "b"], ["A", "B"], 1)
+    right = _MergeAssay("RNA", [[3, 4]], ["c"], feature_ids, ["A", "B"], 1)
+    with pytest.raises(
+        ValueError, match="Duplicate feature IDs|No overlapping features"
+    ):
+        align_features([left, right], ["left", "right"])

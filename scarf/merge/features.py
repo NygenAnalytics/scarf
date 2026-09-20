@@ -1,4 +1,3 @@
-import re
 import sys
 from collections import Counter
 from dataclasses import dataclass
@@ -32,109 +31,22 @@ def _is_missing_source(assay: Any) -> bool:
     return bool(getattr(assay, "isMissing", False))
 
 
-def _get_feat_ids(assays: list[Any]) -> list[dict[str, str]]:
+def _get_feat_ids(assays: list[Any], names: list[str]) -> list[dict[str, str]]:
     ret_val: list[dict[str, str]] = []
-    for assay in assays:
+    for assay, source_name in zip(assays, names, strict=True):
         if _is_missing_source(assay) or int(assay.feats.N) == 0:
             ret_val.append({})
             continue
         frame = assay.feats.to_pandas_dataframe(["names", "ids"])
+        if frame["ids"].duplicated().any():
+            raise ValueError(
+                f"Duplicate feature IDs in assay {assay.name!r} of source "
+                f"{source_name!r}; assign unique feature IDs before merging"
+            )
         ret_val.append(
             dict(zip(frame["ids"].to_numpy(), frame["names"].to_numpy(), strict=True))
         )
     return ret_val
-
-
-def _check_feat_ids(
-    feat_collection: list[dict[str, str]],
-    assays: list[Any],
-    names: list[str],
-) -> bool:
-    for i, mapping in enumerate(feat_collection):
-        keys = np.array(list(mapping.keys()))
-        values = np.array(list(mapping.values()))
-        if keys.size and np.equal(keys, values).all():
-            logger.warning(
-                f"Feature names and IDs are identical for assay "
-                f"{assays[i].name} in dataset {names[i]}; "
-                "feature names will be used as IDs"
-            )
-            return True
-    return False
-
-
-def _feat_suffix(feat_collection: list[dict[str, str]]) -> dict[int, int]:
-    feat_suffix: dict[int, int] = {}
-    for i, mapping in enumerate(feat_collection):
-        keys = np.array(list(mapping.keys()))
-        ends_0 = np.array([x.endswith("_0") for x in keys]).sum()
-        ends_1 = np.array([x.endswith("_1") for x in keys]).sum()
-        ends_2 = np.array([x.endswith("_2") for x in keys]).sum()
-        if ends_0 > 0:
-            feat_suffix[i] = 0
-        elif ends_1 > 0:
-            feat_suffix[i] = 1
-        elif ends_2 > 0:
-            raise ValueError(
-                "Feature Numbering starts with 2, this is erroneous. Kindly check the data"
-            )
-        else:
-            feat_suffix[i] = -1
-    return feat_suffix
-
-
-def _update_feat_ids(
-    feat_collection: list[dict[str, str]],
-    feat_suffix: dict[int, int],
-) -> list[dict[str, str]]:
-    pattern = re.compile(r"_\d+$")
-    vals = np.array(list(feat_suffix.values()))
-    vals = vals[vals > -1]
-    min_val = int(vals.min()) if len(vals) > 0 else 0
-    new_feat_collection = []
-    for i, mapping in enumerate(feat_collection):
-        in_dict: dict[str, str] = {}
-        counter = Counter(mapping.values())
-        if feat_suffix[i] == -1:
-            sum_counter = {x: 0 for x in np.unique(list(mapping.values()))}
-            for val in mapping.values():
-                if counter[val] == 1:
-                    in_dict[val] = val
-                else:
-                    updated_val = f"{val}_{min_val + sum_counter[val]}"
-                    in_dict[updated_val] = updated_val
-                sum_counter[val] += 1
-        else:
-            for val in mapping.values():
-                if pattern.search(val):
-                    num = int(val.split("_")[-1])
-                    updated_val = pattern.sub(
-                        f"_{min_val - feat_suffix[i] + num}",
-                        val,
-                    )
-                    in_dict[updated_val] = updated_val
-                else:
-                    in_dict[val] = val
-        new_feat_collection.append(in_dict)
-    return new_feat_collection
-
-
-def _update_feat_ids_for_map(
-    feat_collection: list[dict[str, str]],
-) -> list[dict[str, str]]:
-    pattern = re.compile(r"_\d+$")
-    new_feat_collection = []
-    for mapping in feat_collection:
-        in_dict: dict[str, str] = {}
-        for feat_val in mapping.values():
-            if pattern.search(feat_val):
-                base_val = "_".join(feat_val.split("_")[:-1])
-                if base_val not in in_dict:
-                    in_dict[base_val] = base_val
-            else:
-                in_dict[feat_val] = feat_val
-        new_feat_collection.append(in_dict)
-    return new_feat_collection
 
 
 def _merge_order_feats(
@@ -176,31 +88,11 @@ def _ref_order_feat_idx(
     feat_collection: list[dict[str, str]],
     merged_feats: pd.DataFrame,
 ) -> list[np.ndarray]:
-    ret_val = []
-    for ids in feat_collection:
-        ordered_ids = pd.DataFrame({"ids": list(ids.keys())})
-        vals = ordered_ids.merge(merged_feats, on="ids", how="left")["idx"].to_numpy()
-        ret_val.append(np.asarray(vals))
-    return ret_val
-
-
-def _ref_order_feat_idx_map(
-    feat_collection: list[dict[str, str]],
-    merged_feats_map: pd.DataFrame,
-) -> list[np.ndarray]:
-    pattern = re.compile(r"_\d+$")
-    name_to_idx = dict(
-        zip(merged_feats_map["names"], merged_feats_map["idx"], strict=True)
-    )
-    feat_order = []
-    for mapping in feat_collection:
-        values_list = []
-        for val in mapping.values():
-            if pattern.search(val):
-                val = "_".join(val.split("_")[:-1])
-            values_list.append(val)
-        feat_order.append(np.asarray([name_to_idx[name] for name in values_list]))
-    return feat_order
+    positions = dict(zip(merged_feats["ids"], merged_feats["idx"], strict=True))
+    return [
+        np.fromiter((positions[feature_id] for feature_id in mapping), dtype=np.int64)
+        for mapping in feat_collection
+    ]
 
 
 def align_features(assays: list[Any], names: list[str]) -> FeatureAlignment:
@@ -219,39 +111,12 @@ def align_features(assays: list[Any], names: list[str]) -> FeatureAlignment:
             overlapFraction=0.0,
         )
 
-    feat_collection = _get_feat_ids(assays)
-    feat_name_ids_same = _check_feat_ids(feat_collection, assays, names)
-    if feat_name_ids_same:
-        # Only consider non-empty collections for suffix logic.
-        non_empty = [mapping for mapping in feat_collection if mapping]
-        feat_suffix_raw = _feat_suffix(non_empty)
-        feat_suffix = {}
-        non_empty_idx = 0
-        for i, mapping in enumerate(feat_collection):
-            if mapping:
-                feat_suffix[i] = feat_suffix_raw[non_empty_idx]
-                non_empty_idx += 1
-            else:
-                feat_suffix[i] = -1
-        feat_collection = _update_feat_ids(feat_collection, feat_suffix)
-        feat_collection_map = _update_feat_ids_for_map(feat_collection)
-    else:
-        feat_collection_map = [mapping.copy() for mapping in feat_collection]
-
-    # Overlap uses only real feature maps; missing carriers stay empty slots.
-    real_maps = [mapping for mapping in feat_collection if mapping]
-    real_maps_for_names = [mapping for mapping in feat_collection_map if mapping]
-    merged_feats, overlap = _merge_order_feats(real_maps)
-    merged_feats_map, _ = _merge_order_feats(real_maps_for_names)
-    feat_order = _ref_order_feat_idx(feat_collection, merged_feats)
-    if feat_name_ids_same:
-        feat_order_map = _ref_order_feat_idx_map(feat_collection, merged_feats_map)
-    else:
-        feat_order_map = [array.copy() for array in feat_order]
+    feat_collection = _get_feat_ids(assays, names)
+    merged_feats, overlap = _merge_order_feats(feat_collection)
     return FeatureAlignment(
-        mergedFeatsMap=merged_feats_map,
-        featOrderMap=feat_order_map,
-        nFeats=int(merged_feats_map.shape[0]),
+        mergedFeatsMap=merged_feats,
+        featOrderMap=_ref_order_feat_idx(feat_collection, merged_feats),
+        nFeats=int(merged_feats.shape[0]),
         overlapFraction=overlap,
     )
 

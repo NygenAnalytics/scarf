@@ -2740,15 +2740,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
         if not isinstance(graph, ArtifactRef):
             raise TypeError("graph must be an ArtifactRef")
-        selection = graph_cell_selection(self.zw, graph)
-        validate_stored_selection_integrity(
-            self.zw,
-            selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )
+        graph_cell_selection(self.zw, graph)
         return self._load_graph_artifact(
             graph,
             symmetric=symmetric,
@@ -2873,14 +2865,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                         "expected_kind": "reduction,batch_correction",
                     },
                 )
-            validate_stored_selection_integrity(
-                self.zw,
-                ancestry.cell_selection,
-                kind="cell_selection",
-                scope="datastore",
-                assay=None,
-                table_path="cellData",
-            )
             source_n_cells = _validate_integration_source_payload(self.zw, source)
             if method == "wnn" and ancestry.reduction is not None:
                 reduction_status = inspect_artifact(self.zw, ancestry.reduction)

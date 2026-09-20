@@ -67,10 +67,12 @@ def is_contiguous(indices: np.ndarray) -> bool:
 def affordable_width(fits: Fits, maxWidth: int) -> int:
     """Return the largest width up to ``maxWidth`` that ``fits`` accepts."""
     limit = max(0, int(maxWidth))
-    if limit == 0 or not fits(1):
+    if limit == 0:
         return 0
-    low = 1
-    high = limit
+    if fits(limit):
+        return limit
+    low = 0
+    high = limit - 1
     while low < high:
         candidate = (low + high + 1) // 2
         if fits(candidate):

@@ -187,7 +187,8 @@ class RNAassay(Assay):
             self.sf = int(cast(int, self.attrs["size_factor"]))
         else:
             self.sf = 1000
-            self.attrs["size_factor"] = self.sf
+            if not self.z.read_only:
+                self.attrs["size_factor"] = self.sf
         self.scalar: np.ndarray | None = None
         self._require_counts_t()
 
