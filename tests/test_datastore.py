@@ -336,6 +336,58 @@ def test_missing_percent_column_is_recomputed():
     assert "RNA_percentMito" in refreshed.cells.columns
 
 
+def test_changed_mito_pattern_warns_on_write_open_and_reuses_corrected_values():
+    from scarf.utils import logger
+
+    store, expected_reads = _qc_store()
+    root = zarr.open_group(store=store, mode="r+")
+    root["RNA/featureData/names"][:] = np.array(
+        ["mt-Co1", "MTOR", "MT1A", "RPL5", "ZERO", "GENE_B"]
+    )
+    original = _open_qc_store(store, mito_pattern="MT-|mt", ribo_pattern="")
+    previous = original.cells.fetch_all("RNA_percentMito").copy()
+    messages = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]), level="WARNING"
+    )
+    try:
+        store.reset()
+        readonly = _open_qc_store(
+            store, mito_pattern=None, ribo_pattern="", zarr_mode="r"
+        )
+        np.testing.assert_allclose(
+            readonly.cells.fetch_all("RNA_percentMito"), previous
+        )
+        assert _count_chunk_gets(store) == []
+        assert not any(operation == "set" for operation, _ in store.ops)
+        assert messages == []
+
+        store.reset()
+        corrected = _open_qc_store(store, mito_pattern=None, ribo_pattern="")
+        totals = _QC_VALUES.sum(axis=1)
+        expected = np.divide(
+            100 * _QC_VALUES[:, 0],
+            totals,
+            out=np.full(len(totals), np.nan),
+            where=totals != 0,
+        )
+        np.testing.assert_allclose(
+            corrected.cells.fetch_all("RNA_percentMito"), expected
+        )
+        _assert_one_counts_stream(store, expected_reads)
+        assert len(messages) == 1
+        for detail in ("RNA_percentMito", "'MT-|mt'", "'^MT-'"):
+            assert detail in messages[0]
+
+        store.reset()
+        cached = _open_qc_store(store, mito_pattern=None, ribo_pattern="")
+        np.testing.assert_allclose(cached.cells.fetch_all("RNA_percentMito"), expected)
+        assert _count_chunk_gets(store) == []
+        assert len(messages) == 1
+    finally:
+        logger.remove(sink)
+
+
 def test_percent_cache_without_matched_features_is_recomputed():
     store, expected_reads = _qc_store()
     root = zarr.open_group(store=store, mode="r+")

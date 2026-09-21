@@ -361,8 +361,8 @@ def build_cell_quality_decision(
         "coreGlobalGaussian": (
             "cellQuality:coreGlobalGaussian",
             "apply",
-            "Scarf default global filter",
-            "Use Scarf's default global Gaussian quantiles (0.01 and 0.99).",
+            "Scarf global Gaussian filter",
+            "Use Scarf's global Gaussian quantiles (0.01 and 0.99).",
             CellQualityExecutorPayload(
                 profile="coreGlobalGaussian",
                 groupByCapture=False,

@@ -158,7 +158,7 @@ class ExperimentalContextAgent:
             Reuse returned details instead of requesting the same record again.
             Omitted donor examples and detailed thresholds
             remain available; do not interpret their omission as passing evidence.
-            A later audited checkpoint compares the Scarf default with eligible
+            A later audited checkpoint compares the baseline cell filter with eligible
             alternatives and selects one exact policy. Never author
             or alter numeric quality bounds. RNA is the preferred QC driver and
             ATAC is the fallback. ADT and HTO never drive automatic cell filtering.

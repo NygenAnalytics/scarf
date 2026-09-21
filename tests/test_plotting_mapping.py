@@ -681,6 +681,19 @@ def test_mapping_calibration_rejects_nonfinite_or_unretained_evidence():
         )
 
 
+@pytest.mark.parametrize("bins", [0, -1])
+def test_mapping_score_rejects_nonpositive_bins(bins):
+    with pytest.raises(ValueError, match="bins must be positive"):
+        plotting_mapping.mapping_score(
+            object(),
+            _RESULT_REF,
+            reference=object(),
+            kind="histogram",
+            bins=bins,
+            show=False,
+        )
+
+
 def test_mapping_plots_reject_empty_and_misaligned_data():
     empty_store = _controlled_mapping_store(
         score_rows=[],

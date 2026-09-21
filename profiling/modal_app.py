@@ -1030,6 +1030,11 @@ def main(*arg_list: str) -> None:
     local_parser.add_argument(
         "--stages", nargs="*", choices=ALL_STAGE_CHOICES, default=None
     )
+    local_parser.add_argument(
+        "--ephemeral",
+        action="store_true",
+        help="Spawn from this modal run app (no deploy). Prefer --detach.",
+    )
 
     e2e_parser = sub.add_parser(
         "run-e2e",
@@ -1187,10 +1192,13 @@ def main(*arg_list: str) -> None:
             ),
         )
         options = modal_function_options(config, peak, maxContainers=1)
-        call = (
-            _deployed_function(config, "run_local_funnel_job")
-            .with_options(**options)
-            .spawn(payload, args.size, stages)
+        target = (
+            run_local_funnel_job
+            if args.ephemeral
+            else _deployed_function(config, "run_local_funnel_job")
         )
+        call = target.with_options(**options).spawn(payload, args.size, stages)
         _print_spawned(f"run_local_funnel_job {args.size}", call)
+        if args.ephemeral:
+            _wait_ephemeral(call)
         return

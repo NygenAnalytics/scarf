@@ -449,6 +449,11 @@ class Assay:
             logger.info(
                 f"Recomputing {name}: matched-feature provenance has changed or is missing"
             )
+        elif has_column:
+            logger.warning(
+                f"Recomputing {name}: feature pattern changed from "
+                f"{percent_features.get(name)!r} to {feat_pattern!r}"
+            )
         if name in percent_features:
             del percent_features[name]
             self.attrs["percentFeatures"] = percent_features

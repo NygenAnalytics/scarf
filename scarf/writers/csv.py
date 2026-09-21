@@ -126,7 +126,7 @@ class CSVtoZarr:
                 cell_data_grp,
                 name=x,
                 data=None,
-                dtype=y,
+                dtype="str" if y == np.dtype("O") else y,
                 shape=self.csvr.nCells,
                 profile=self.profile,
             )

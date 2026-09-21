@@ -531,6 +531,8 @@ def test_metadata_table_mount_fill_and_error_contracts(monkeypatch):
     mounted.create_array("other", data=np.arange(4), chunks=(2,))
     table.mount_location(mounted, "aux")
     assert "aux_other" in table.columns
+    np.testing.assert_array_equal(table.fetch_all("aux_other"), np.arange(4))
+    np.testing.assert_array_equal(table.fetch_all("score"), np.arange(4.0))
     with pytest.raises(ValueError, match="primary location"):
         table.unmount_location("primary")
     assert table.unmount_location("missing") is None

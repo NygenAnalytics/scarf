@@ -547,7 +547,7 @@ def _analyze_citeseq(store: Any) -> None:
 
 
 def _analyze_atac(store: Any) -> None:
-    cell_selection = store.auto_filter_cells()
+    cell_selection = store.auto_filter_cells(method="gaussian")
     prevalent_peaks = store.select_prevalent_peaks(
         cell_selection,
         top_n=25000,

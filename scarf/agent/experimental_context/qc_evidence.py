@@ -1495,7 +1495,7 @@ def _global_qc_profile(
         low, high = gaussian_quantile_bounds(selected, 0.01, 0.99)
         if not np.isfinite([low, high]).all():
             attribute_notes.append(
-                f"Scarf default global QC is unavailable: metric {name!r} produces non-finite Gaussian bounds"
+                f"Scarf global Gaussian QC is unavailable: metric {name!r} produces non-finite Gaussian bounds"
             )
             return None
     capture_column: str | None = None

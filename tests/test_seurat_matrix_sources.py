@@ -2374,6 +2374,14 @@ def test_stored_bp128_batches_real_hdf5_reads(tmp_path, monkeypatch, transform):
     monkeypatch.setattr(h5py, "File", track_open)
     np.testing.assert_array_equal(reader.read(7, values.size - 3), values[7:-3])
     assert len(opened) <= 18
+    for offset, message in (
+        (int(indexes[2]) + 4, "idx decreases"),
+        (1, "invalid word count"),
+    ):
+        with h5py.File(path, "r+") as handle:
+            handle["matrix/value_idx"][1] = offset
+        with pytest.raises(MatrixSourceError, match=message):
+            reader.read(0, 256)
 
 
 def test_fragment_conversion_does_not_rescan_for_each_window(tmp_path, monkeypatch):
@@ -2532,6 +2540,118 @@ def test_dense_transpose_does_not_reserve_sparse_row_pointers(tmp_path):
         np.testing.assert_array_equal(source.read_cells(0, 1), [[1]])
     finally:
         release_temporary_storage(source)
+
+
+def test_dense_transpose_cleans_up_after_insufficient_disk_space(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    path = tmp_path / "counts.h5"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("X", data=np.arange(12).reshape(3, 4))
+    source = TransposeMatrixSource(HDF5ArrayMatrixSource(path, "X"))
+    source._tempDir = tmp_path
+    monkeypatch.setattr("shutil.disk_usage", lambda _: SimpleNamespace(free=0))
+    with pytest.raises(OSError, match="Dense transpose needs"):
+        source.read_cells(0, 1)
+    assert source._transposeDirectory is None
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.parametrize(
+    ("limits", "message"),
+    [
+        (SourceLimits(maxMetadataBytes=16), "row pointers exceed maxMetadataBytes"),
+        (SourceLimits(maxNnz=1), "exceeds maxNnz"),
+    ],
+)
+def test_sparse_transpose_enforces_conversion_limits_and_cleans_up(
+    tmp_path, limits, message
+):
+    matrix = csc_matrix(np.ones((2, 3), dtype=np.uint16))
+    source = TransposeMatrixSource(
+        CscMatrixSource(matrix.data, matrix.indices, matrix.indptr, matrix.shape),
+        limits=limits,
+    )
+    source._tempDir = tmp_path
+    with pytest.raises(ResourceLimitError, match=message):
+        source.read_cells(0, 1)
+    assert source._rowStore is None
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("shape", [(0, 3), (3, 0)])
+def test_dense_transpose_with_empty_axes_does_not_create_temporary_storage(
+    tmp_path, shape
+):
+    from scarf.readers._seurat.sources import prepare_matrix_sources
+
+    values = np.empty(shape, dtype=np.float32)
+    source = TransposeMatrixSource(DenseMatrixSource(values))
+    source._tempDir = tmp_path
+    prepare_matrix_sources(source)
+    np.testing.assert_array_equal(source.read_cells(0, source.n_cells), values)
+    assert source._transposeDirectory is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_source_preparation_restores_limits_when_resident_data_exhausts_budget():
+    from scarf.readers._seurat.sources import prepare_matrix_sources
+
+    source = DenseMatrixSource(np.ones((3, 4), dtype=np.float64))
+    limits = source._limits
+    with pytest.raises(MemoryError, match="preparation exceeds mem_budget"):
+        prepare_matrix_sources(source, max_bytes=source.resident_bytes)
+    assert source._limits is limits
+    np.testing.assert_array_equal(source.read_cells(0, 4), np.ones((4, 3)))
+
+
+def test_shared_sparse_transpose_prepares_and_releases_one_row_store(tmp_path):
+    from scarf.readers._seurat.sources import (
+        prepare_matrix_sources,
+        release_temporary_storage,
+    )
+
+    values = np.arange(12, dtype=np.uint32).reshape(3, 4)
+    matrix = csc_matrix(values)
+    transposed = TransposeMatrixSource(
+        CscMatrixSource(matrix.data, matrix.indices, matrix.indptr, matrix.shape)
+    )
+    transposed._tempDir = tmp_path
+    source = CellBindMatrixSource([transposed, transposed])
+    try:
+        prepare_matrix_sources(source)
+        assert transposed._rowStore is not None
+        assert len(list(tmp_path.iterdir())) == 1
+        np.testing.assert_array_equal(
+            source.read_cells(0, source.n_cells).toarray(), np.vstack((values, values))
+        )
+    finally:
+        release_temporary_storage(source)
+    assert transposed._rowStore is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_dense_transpose_preserves_flat_column_major_values():
+    values = np.arange(12, dtype=np.float64).reshape(3, 4)
+    source = TransposeMatrixSource(
+        DenseMatrixSource(values.ravel(order="F"), shape=values.shape)
+    )
+    np.testing.assert_array_equal(source.read_cells(1, 3), values[1:3])
+    assert source._transposeDirectory is None
+
+
+def test_dense_transpose_rejects_budget_smaller_than_one_source_column(tmp_path):
+    path = tmp_path / "counts.h5"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("X", data=np.ones((3, 4), dtype=np.uint16))
+    source = TransposeMatrixSource(
+        HDF5ArrayMatrixSource(path, "X"), limits=SourceLimits(maxBlockBytes=1)
+    )
+    source._tempDir = tmp_path
+    with pytest.raises(ResourceLimitError, match="Transpose source tile exceeds"):
+        source.read_cells(0, 1)
+    assert source._transposeDirectory is None
+    assert list(tmp_path.iterdir()) == [path]
 
 
 @pytest.mark.parametrize("sparse", [False, True])

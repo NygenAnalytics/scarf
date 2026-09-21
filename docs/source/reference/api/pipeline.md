@@ -80,10 +80,14 @@ output when those stages are disabled; a Paris-only run has `run["paris"]` and n
 `run["clusters"]`. Setting `umap=False` skips both embedding initialization and UMAP, so neither
 artifact appears in the completed run.
 
-`filtering=True` uses automatic filtering over available assay QC columns. Set it to `False` to
-retain the captured input selection, or pass a configuration mapping. Automatic filtering accepts
-`attrs`, `min_p`, `max_p`, and optionally `sample_column`, `n_mads`, and
-`min_cells_per_sample`. Manual filtering requires aligned `attrs`, `lows`, and `highs`, with an
+`filtering=True` uses MAD filtering over available assay QC columns. The default and
+`method="auto"` both resolve to `method="mad"`. Set filtering to `False` to retain the captured
+input selection, or pass a configuration mapping. MAD filtering accepts `attrs`, `n_mads`,
+`min_cells_per_sample`, and optionally `sample_column`; without a sample column it uses pooled
+bounds. Groups with fewer than 20 active cells are retained with a warning by default, including
+small pooled selections. Pass `method="gaussian"` explicitly for the former Gaussian policy,
+with `attrs`, `min_p`, and `max_p`. Gaussian filtering does not accept a sample column.
+`method="manual"` requires aligned `attrs`, `lows`, and `highs`, with an
 optional Boolean `keep_bounds` value. Probability, MAD, and manual-bound values must be finite
 numbers when present; booleans and numeric strings are rejected rather than coerced.
 If filtering is requested and none of the default QC columns exists, validation raises instead of

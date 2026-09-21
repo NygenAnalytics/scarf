@@ -122,7 +122,7 @@ def to_h5ad(
             "data",
             (capacity,),
             maxshape=(None,),
-            chunks=True,
+            chunks=(65_536,),
             compression="gzip",
             dtype=assay.rawData.dtype,
         )
@@ -130,7 +130,7 @@ def to_h5ad(
             "indices",
             (capacity,),
             maxshape=(None,),
-            chunks=True,
+            chunks=(65_536,),
             compression="gzip",
             dtype="int64",
         )

@@ -1,5 +1,6 @@
 from collections.abc import Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 import h5py
@@ -53,6 +54,7 @@ class H5adReader:
                             corresponding index value within this group.
         dtype: Numpy dtype of the matrix data. This dtype is enforced when streaming the data through `consume`
                method. (Default value: Automatically determined)
+        temp_dir: Parent directory for temporary CSC row storage. None uses the system temporary directory.
 
     Attributes:
         h5: A File object from the h5py package.
@@ -88,8 +90,11 @@ class H5adReader:
         dtype: str | None = None,
         embedding_roles: Mapping[str, H5adEmbeddingRole] | None = None,
         cluster_keys: Sequence[str] = (),
+        *,
+        temp_dir: str | Path | None = None,
     ) -> None:
         self.h5adFn = h5ad_fn
+        self._tempDir = temp_dir
         self.h5: h5py.File = h5py.File(h5ad_fn, mode="r")
         self.matrixKey = matrix_key
         self.cellAttrsKey, self.featureAttrsKey, self.obsmAttrsKey = (
@@ -140,6 +145,7 @@ class H5adReader:
             "dtype": self.matrixDtype if self._dtypeOverridden else None,
             "embedding_roles": dict(self.embeddingRoles),
             "cluster_keys": self.clusterKeys,
+            "temp_dir": self._tempDir,
         }
 
     def open_clone(self) -> "H5adReader":
@@ -988,6 +994,7 @@ class H5adReader:
             self.storageDtype,
             source_dtype=data_node.dtype,
             max_bytes=maxBytes - indptr.nbytes,
+            temp_dir=self._tempDir,
         )
         logger.debug(
             f"Prepared H5AD row storage for conversion with dtype={self.storageDtype}"

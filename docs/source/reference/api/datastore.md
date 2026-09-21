@@ -83,8 +83,12 @@ selection explicitly. `secondary_groups=` provides an optional nested grouping w
 artifact labels to a cell column. `add_grouped_assay(groups, assay_label=...)` similarly accepts a
 pseudotime-aggregation ref or an explicit feature metadata column when constructing a new assay.
 
-{py:meth}`scarf.datastore.datastore.DataStore.auto_filter_cells` uses pooled Gaussian bounds by default.
-Supplying `sample_column` selects per-sample MAD bounds with `n_mads` and `min_cells_per_sample`; `min_p` and `max_p` do not configure that path.
+{py:meth}`scarf.datastore.datastore.DataStore.auto_filter_cells` defaults to `method="mad"`
+over the pooled selection. Supplying `sample_column` estimates MAD bounds separately per sample.
+`n_mads` controls the bounds; groups with fewer than `min_cells_per_sample=20` active cells
+are retained with a warning, including small pooled selections. Pass `method="gaussian"`
+explicitly to use the former pooled Gaussian policy and configure its `min_p` and `max_p`
+quantiles. Changing these probabilities with either MAD path raises an error.
 {py:meth}`scarf.datastore.datastore.DataStore.select_cells` thresholds the numeric `values` payload
 of an exact cell artifact, or retains categorical values with `include=[...]`, and composes the
 result with its stored source selection. An explicit `cell_selection=` may narrow, but never widen,

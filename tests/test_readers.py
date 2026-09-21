@@ -1285,15 +1285,18 @@ def test_loom_reader_streams_metadata_and_counts(loom_reader):
     assert sum(chunk.nnz for chunk in chunks) > 0
 
 
-def test_csv_reader_preserves_batches_skipped_columns_and_cell_metadata(tmp_path):
+@pytest.mark.parametrize("include_metadata", [True, False])
+def test_csv_reader_preserves_batches_skipped_columns_and_cell_metadata(
+    tmp_path, include_metadata
+):
     from scarf.readers import CSVReader
 
     path = tmp_path / "counts.csv"
     path.write_text("g1,g2,batch,drop\n1,2,a,10\n3,4,b,20\n5,6,c,30\n")
     reader = CSVReader(
         str(path),
-        skip_cols=["drop"],
-        cell_data_cols=["batch"],
+        skip_cols=["drop"] if include_metadata else ["batch", "drop"],
+        cell_data_cols=["batch"] if include_metadata else [],
         batch_size=2,
     )
 
@@ -1304,9 +1307,29 @@ def test_csv_reader_preserves_batches_skipped_columns_and_cell_metadata(tmp_path
     batches = list(reader.consume())
     assert all(counts.dtype.kind in "iu" for counts, _ in batches)
     np.testing.assert_array_equal(batches[0][0], [[1, 2], [3, 4]])
-    np.testing.assert_array_equal(batches[0][1], [["a"], ["b"]])
     np.testing.assert_array_equal(batches[1][0], [[5, 6]])
-    np.testing.assert_array_equal(batches[1][1], [["c"]])
+    if include_metadata:
+        np.testing.assert_array_equal(batches[0][1], [["a"], ["b"]])
+        np.testing.assert_array_equal(batches[1][1], [["c"]])
+    else:
+        assert all(metadata is None for _, metadata in batches)
+
+
+def test_h5ad_csc_conversion_rejects_insufficient_workspace(tmp_path):
+    from scarf.readers import H5adReader
+    from tests.test_writers import _write_h5ad
+
+    path = _write_h5ad(
+        tmp_path / "counts.h5ad", np.ones((3, 4), dtype=np.uint16), encoding="csc"
+    )
+    reader = H5adReader(str(path))
+    try:
+        with pytest.raises(MemoryError, match="CSC row conversion exceeds"):
+            reader.materialize_csc(maxBytes=1)
+        assert reader._convertedCsr is None
+        assert reader.materialized_csr_bytes() == 0
+    finally:
+        reader.close()
 
 
 @pytest.mark.parametrize("option", ["skip_cols", "cell_data_cols"])

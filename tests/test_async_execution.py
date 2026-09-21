@@ -364,6 +364,19 @@ def test_overlapping_io_limits_restore_the_remaining_operation() -> None:
     assert zarr.config.get("async.concurrency") == 10
 
 
+def test_runtime_reconfiguration_cannot_override_an_active_io_limit() -> None:
+    configure_zarr_runtime(codecWorkers=3, asyncConcurrency=6)
+    ceiling = zarr.config.get("threading.max_workers")
+    with zarr_io_concurrency(2):
+        with pytest.raises(RuntimeError, match="during active storage operations"):
+            configure_zarr_runtime(codecWorkers=5, asyncConcurrency=8)
+        assert zarr.config.get("async.concurrency") == 2
+        assert zarr.config.get("threading.max_workers") == ceiling
+    assert zarr.config.get("async.concurrency") == 6
+    configure_zarr_runtime(codecWorkers=5, asyncConcurrency=8)
+    assert zarr.config.get("async.concurrency") == 8
+
+
 def test_runner_restores_async_concurrency_after_failure() -> None:
     runner = AsyncStorageRunner(ResourceBudget(1024, 4), chunksPerShard=10)
 

@@ -129,7 +129,12 @@ class SparseRowStore:
                         ).tocsr()
                         matrix.data.tofile(data_stream)
                         matrix.indices.astype(np.int64, copy=False).tofile(index_stream)
-                        self.indptr[start + 1 : stop + 1] = matrix.indptr[1:] + offset
+                        np.add(
+                            matrix.indptr[1:],
+                            offset,
+                            out=self.indptr[start + 1 : stop + 1],
+                            dtype=np.int64,
+                        )
                         offset += int(matrix.nnz)
                         if offset > max_nnz:
                             raise MemoryError(

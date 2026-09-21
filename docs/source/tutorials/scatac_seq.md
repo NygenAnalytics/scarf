@@ -118,7 +118,7 @@ small panel alone.
 For another peak-count matrix, the corresponding atomic path is:
 
 ```python
-cells = own_ds.auto_filter_cells()
+cells = own_ds.auto_filter_cells(method="gaussian")
 peaks = own_ds.select_prevalent_peaks(cells, top_n=25_000)
 normalized = own_ds.run_normalization(cells, peaks)
 lsi = own_ds.run_lsi(normalized, dims=50, skip_first=True)

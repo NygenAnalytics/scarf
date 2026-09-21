@@ -1016,7 +1016,10 @@ def test_plotting_fetch_matches_atac_normed(atac_datastore):
     )
 
 
-def test_plotting_fetch_preserves_assay_groups_order_and_reduction(toy_crdir_ds):
+@pytest.mark.parametrize("reduction", ["sum", "mean"])
+def test_plotting_fetch_preserves_assay_groups_order_and_reduction(
+    toy_crdir_ds, reduction
+):
     from dataclasses import replace
 
     from scarf.plotting._data import (
@@ -1040,16 +1043,16 @@ def test_plotting_fetch_preserves_assay_groups_order_and_reduction(toy_crdir_ds)
         )
         for index in (0, 1)
     ]
-    rna_sum = replace(
+    reduced_rna = replace(
         rna[0],
         indices=(0, 1),
         ids=rna[0].ids + rna[1].ids,
         names=rna[0].names + rna[1].names,
-        reduction="sum",
+        reduction=reduction,
     )
     fetched = fetch_normalized_feature_matrix(
         toy_crdir_ds,
-        [adt[1], rna_sum, adt[0]],
+        [adt[1], reduced_rna, adt[0]],
         cell_idx,
     )
     rna_native = controlled_compute(
@@ -1067,7 +1070,7 @@ def test_plotting_fetch_preserves_assay_groups_order_and_reduction(toy_crdir_ds)
         toy_crdir_ds.nthreads,
     )
     expected = np.column_stack(
-        (adt_native[:, 1], rna_native.sum(axis=1), adt_native[:, 0])
+        (adt_native[:, 1], getattr(rna_native, reduction)(axis=1), adt_native[:, 0])
     )
     np.testing.assert_allclose(fetched, expected)
 
@@ -1918,6 +1921,8 @@ def test_summary_adapter_validates_group_sample_and_condition_inputs(
 ):
     from scarf.plotting._data import summarize_features_by_group
 
+    with pytest.raises(ValueError, match="At least one feature"):
+        summarize_features_by_group(synthetic_plot_store, features=[], group_by="group")
     with pytest.raises(ValueError, match="Too many features"):
         summarize_features_by_group(
             synthetic_plot_store,

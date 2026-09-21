@@ -30,7 +30,7 @@ assay-specific checks.
 
 - Inspect per-cell QC columns
 - Set manual thresholds with `filter_cells`
-- Compare global Gaussian and per-sample MAD bounds
+- Compare pooled and per-sample MAD bounds with explicit Gaussian filtering
 - Compute doublet scores after an initial clustering
 - Recognize current RNA, ATAC, and ADT support boundaries
 
@@ -121,12 +121,17 @@ sanity-checking against your own expectations before continuing.
 
 ## 3. Automatic thresholds
 
-`auto_filter_cells` fits a normal distribution (`loc=median`, `scale=std`) to each QC column, then takes quantiles at `min_p` and `max_p` via `scipy.stats.norm.ppf` (defaults 0.01 and 0.99).
-Default columns are nCounts, nFeatures, percentMito, and percentRibo when present.
+`auto_filter_cells` defaults to `method="mad"`, using the median plus or minus `n_mads`
+times the scaled median absolute deviation (`1.4826 * MAD`). Without a sample source, it
+estimates these bounds over the pooled input selection. Default columns are nCounts, nFeatures,
+percentMito, and percentRibo when present. Counts and feature counts use log1p values and
+two-sided bounds; percentages use their original scale and an upper bound only.
+The default `n_mads` is 3. Groups with fewer than `min_cells_per_sample=20` active cells
+are retained with a warning, including a pooled selection with fewer than 20 cells.
 Pass the previous selection explicitly to compose filters.
 
 ```{code-cell} ipython3
-automatic_selection = ds.auto_filter_cells(cell_selection=manual_selection)
+automatic_selection = ds.auto_filter_cells(method="mad", cell_selection=manual_selection)
 automatic_mask = np.asarray(
     ds.load_artifact(automatic_selection)["values"][:],
     dtype=bool,
@@ -135,6 +140,20 @@ print(f"Cells after automatic refinement: {int(automatic_mask.sum())}")
 ```
 
 Inspect the selected values through the returned mask before accepting the thresholds.
+
+Earlier versions used pooled Gaussian filtering by default. To retain that policy, pass
+`method="gaussian"` explicitly. This fits a normal distribution with `loc=median` and
+`scale=std`, then takes quantiles at `min_p` and `max_p` (defaults 0.01 and 0.99).
+Setting either probability alone does not switch the method:
+
+```python
+gaussian_selection = ds.auto_filter_cells(
+    method="gaussian",
+    cell_selection=manual_selection,
+    min_p=0.05,
+    max_p=0.99,
+)
+```
 
 ## 4. Per-sample MAD filtering
 
@@ -147,6 +166,7 @@ same immutable-selection contract as the global filter:
 
 ```python
 sample_selection = ds.auto_filter_cells(
+    method="mad",
     attrs=qc_cols,
     cell_selection=manual_selection,
     sample_column="sample_id",
@@ -161,14 +181,15 @@ mechanics demo with no biological interpretation.
 Count-like metrics such as `nCounts` and `nFeatures` use log1p values and two-sided bounds.
 Percentage metrics such as `percentMito` and `percentRibo` use their original scale and an upper bound only.
 Samples with fewer than `min_cells_per_sample` active cells are retained with a warning because stable within-sample bounds cannot be estimated.
-`min_p` and `max_p` apply only to the global Gaussian path and must remain at their defaults when `sample_column` is used.
+`min_p` and `max_p` apply only to `method="gaussian"`, which does not accept a sample source.
+Changing either probability with pooled or per-sample MAD filtering raises an error.
 
 The same options can be forwarded through the standard pipeline:
 
 ```python
 ds.pipeline.run(
     filtering={
-        "method": "auto",
+        "method": "mad",
         "sample_column": "sample_id",
         "n_mads": 3.0,
         "min_cells_per_sample": 20,
@@ -181,6 +202,13 @@ ds.pipeline.run(
 Ingestion-owned mitochondrial and ribosomal percentage columns measure the fraction of each cell's
 counts matching configured gene-name patterns. High values can indicate damaged cells or
 study-specific biology. Inspect their distributions before applying upper thresholds.
+
+The default mitochondrial pattern is now case-insensitive `^MT-`, replacing `MT-|mt`.
+It matches names such as `MT-CO1` and `mt-Co1` without including `MTOR` or metallothioneins.
+Opening an existing store for writing recomputes a cached percentage column if its recorded
+pattern differs, and logs the old and new patterns before replacing the values. A read-only
+open retains the cached values; open the store for writing to refresh them before using the
+corrected metric in a new analysis.
 
 For another gene set, create an explicit feature selection and calculate its percentage over an
 explicit cell selection. The datastore method returns a `quality_metric` artifact and does not add
@@ -284,7 +312,7 @@ Hashtag demultiplexing is covered separately in {doc}`hto_demultiplexing`.
 
 - Copying thresholds from another dataset without checking distributions
 - Pooling samples with different depth distributions and then applying one global bound
-- Passing `min_p` or `max_p` to the sample-aware MAD path
+- Changing `min_p` or `max_p` without selecting `method="gaussian"`
 - Expecting `run_doublet_detection` to drop cells (it only scores)
 - Running doublet detection before building the neighbourhood graph and clustering
 - Claiming FRiP or TSS enrichment from the ATAC metrics Scarf currently provides

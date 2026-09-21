@@ -250,6 +250,45 @@ def test_sample_aware_mask_skips_small_and_zero_mad_groups():
     assert any("zero MAD" in message for message in provenance["warnings"])
 
 
+@pytest.mark.parametrize("n_cells", [15, 19, 20])
+def test_default_pooled_mad_retains_small_selections_with_a_warning(
+    datastore_ephemeral, n_cells
+):
+    store = datastore_ephemeral
+    before = store.cells.fetch_all("I").copy()
+    active = np.arange(store.cells.N) < n_cells
+    values = np.zeros(store.cells.N)
+    values[:n_cells] = np.r_[np.linspace(1, 2, n_cells - 1), 99.0]
+    store.cells.insert("boundary_score", values)
+    store.cells.insert("small_selection", active)
+    selection = store.snapshot_cell_selection("small_selection")
+    messages = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]), level="WARNING"
+    )
+    try:
+        result = store.auto_filter_cells(
+            attrs=["boundary_score"], cell_selection=selection
+        )
+    finally:
+        logger.remove(sink)
+    expected = active.copy()
+    if n_cells >= 20:
+        expected[n_cells - 1] = False
+    np.testing.assert_array_equal(_selection_mask(store, result), expected)
+    np.testing.assert_array_equal(store.cells.fetch_all("I"), before)
+    parameters = store.inspect_artifact(result).parameters
+    assert parameters["method"] == "mad"
+    assert parameters["sample_source"] == {"source": "pooled"}
+    if n_cells < 20:
+        assert parameters["skip_reasons"] == {"all": "insufficient_cells"}
+        assert len(messages) == 1
+        assert "retaining them without MAD filtering" in messages[0]
+    else:
+        assert parameters["skip_reasons"] == {}
+        assert messages == []
+
+
 def test_auto_filter_cells_explicit_gaussian_matches_quantile_bounds(
     datastore_ephemeral,
 ):
@@ -407,6 +446,19 @@ def test_auto_filter_cells_sample_column_raises_on_conflicts(
     ):
         with pytest.raises(ValueError, match=message):
             datastore_ephemeral.auto_filter_cells(attrs=["RNA_nCounts"], **options)
+
+
+def test_auto_filter_cells_rejects_an_empty_selection_without_mutating_live_cells(
+    datastore_ephemeral,
+):
+    store = datastore_ephemeral
+    before = store.cells.fetch_all("I").copy()
+    store.cells.insert("empty_selection", np.zeros(store.cells.N, dtype=bool))
+    selection = store.snapshot_cell_selection("empty_selection")
+    with pytest.raises(ValueError, match="Cell selection contains no active cells"):
+        store.auto_filter_cells(attrs=["RNA_nCounts"], cell_selection=selection)
+    np.testing.assert_array_equal(store.cells.fetch_all("I"), before)
+    assert not _selection_mask(store, selection).any()
 
 
 @pytest.mark.parametrize("n_mads", [np.nan, np.inf, -np.inf])

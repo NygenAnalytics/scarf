@@ -1,4 +1,5 @@
 import signal
+import threading
 
 import pytest
 
@@ -28,6 +29,7 @@ def test_shutdown_scope_raises_only_at_a_checkpoint_and_resets_context() -> None
 def test_signal_guard_respects_ignored_signals_and_restores_handlers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(threading, "current_thread", threading.main_thread)
     installed: dict[int, object] = {}
     prior = {
         int(signal.SIGTERM): signal.SIG_IGN,
@@ -59,6 +61,7 @@ def test_signal_guard_respects_ignored_signals_and_restores_handlers(
 def test_second_signal_escalates_to_the_prior_handler(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(threading, "current_thread", threading.main_thread)
     installed: dict[int, object] = {}
     propagated: list[int] = []
 

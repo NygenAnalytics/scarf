@@ -140,8 +140,8 @@ def _qc_section(payload: Mapping[str, Any]) -> str:
     qc = mapping(payload.get("qc"))
     profiles = mappings(payload.get("qcProfiles"))
     names = {
-        "coreGlobalGaussian": "Scarf default global filter",
-        "globalGaussian": "Scarf default global filter",
+        "coreGlobalGaussian": "Scarf global Gaussian filter",
+        "globalGaussian": "Scarf global Gaussian filter",
         "coreSampleMad3": "Scarf filter within samples",
         "sampleMad": "Scarf filter within samples",
         "retainWithFlags": "Retain cells with quality flags",

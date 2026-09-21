@@ -884,23 +884,38 @@ def test_h5adtozarr_spills_csc_with_bounded_resident_memory(tmp_path):
         reader.close()
 
 
-def test_h5ad_clones_share_spill_until_the_last_reader_closes(tmp_path):
+@pytest.mark.parametrize("convert_clone", [False, True])
+def test_h5ad_clones_share_spill_until_the_last_reader_closes(tmp_path, convert_clone):
     from pathlib import Path
-    from scarf.readers import H5adReader
+    from scarf.readers import H5adReader, inspect_h5ad
 
     values = np.array([[1, 0], [0, 2], [3, 4]], dtype=np.uint16)
     path = _write_h5ad(tmp_path / "shared_csc.h5ad", values, encoding="csc")
-    reader = H5adReader(str(path), feature_name_key="feature_name")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    if convert_clone:
+        parent = H5adReader.from_inspect(inspect_h5ad(path), temp_dir=scratch)
+        try:
+            reader = parent.open_clone()
+        finally:
+            parent.close()
+    else:
+        reader = H5adReader(
+            str(path), feature_name_key="feature_name", temp_dir=str(scratch)
+        )
     reader.materialize_csc()
     directory = Path(reader._convertedCsr._directory.name)
     clone = reader.open_clone()
     try:
+        assert directory.parent == scratch
         reader.close()
         assert directory.exists()
         np.testing.assert_array_equal(next(clone.consume(3)).toarray(), values)
     finally:
+        reader.close()
         clone.close()
     assert not directory.exists()
+    assert list(scratch.iterdir()) == []
 
 
 def test_loomtozarr(loom_reader, tmp_path):
@@ -942,6 +957,45 @@ def test_loomtozarr_preserves_exact_counts_and_transpose(tmp_path):
     np.testing.assert_array_equal(root["RNA/counts"][:], values)
     assert "countsT" in root["RNA"]
     assert root["RNA/countsT"].attrs["complete"] is True
+
+
+@pytest.mark.parametrize("batch_size", [0, -1])
+def test_loom_reader_and_writer_reject_nonpositive_batch_sizes(tmp_path, batch_size):
+    import h5py
+    from scarf.readers import LoomReader
+    from scarf.writers import LoomToZarr
+
+    path = tmp_path / "counts.loom"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("matrix", data=np.ones((3, 2), dtype=np.uint16))
+    reader = LoomReader(str(path))
+    try:
+        writer = LoomToZarr(reader, MemoryStore(), nthreads=1)
+        with pytest.raises(ValueError, match="batch_size must be positive"):
+            list(reader.consume_dense(batch_size))
+        with pytest.raises(ValueError, match="batch_size must be positive"):
+            writer.dump(batch_size)
+        assert writer.z["RNA/counts"].nchunks_initialized == 0
+    finally:
+        reader.h5.close()
+
+
+def test_loom_import_rejects_budget_smaller_than_a_source_row(tmp_path):
+    import h5py
+    from scarf.readers import LoomReader
+    from scarf.writers import LoomToZarr
+
+    path = tmp_path / "counts.loom"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("matrix", data=np.ones((3, 2), dtype=np.uint16))
+    reader = LoomReader(str(path))
+    try:
+        writer = LoomToZarr(reader, MemoryStore(), mem_budget=1, nthreads=1)
+        with pytest.raises(MemoryError, match="Loom import cannot fit"):
+            writer.dump(batch_size=1)
+        assert writer.z["RNA/counts"].nchunks_initialized == 0
+    finally:
+        reader.h5.close()
 
 
 def test_dense_loom_import_fits_a_bounded_memory_budget(tmp_path):
@@ -1153,13 +1207,16 @@ def test_csv_to_zarr_writes_extra_cell_columns_into_workspace(tmp_path):
         ["score", "quality"],
     ],
 )
-def test_csv_to_zarr_preserves_metadata_column_order_and_counts(tmp_path, columns):
+@pytest.mark.parametrize("text_dtype", [None, object])
+def test_csv_to_zarr_preserves_metadata_column_order_and_counts(
+    tmp_path, columns, text_dtype
+):
     path = tmp_path / "counts.csv"
     path.write_text(
         "cell,quality,g1,batch,score,g2,drop\n"
         "c1,9007199254740993,1,batch_A,0.5,2,unused_A\n"
         "c2,8,3,batch_B,1.5,4,unused_B\n"
-        "c3,9,5,batch_C,2.5,6,unused_C\n"
+        "c3,9,5,batch_γ_longer,2.5,6,unused_C\n"
     )
     reader = CSVReader(
         str(path),
@@ -1167,6 +1224,7 @@ def test_csv_to_zarr_preserves_metadata_column_order_and_counts(tmp_path, column
         cell_data_cols=columns,
         skip_cols=["drop"] + ([] if "batch" in columns else ["batch"]),
         batch_size=2,
+        pandas_kwargs={"dtype": {"batch": text_dtype}} if text_dtype else None,
     )
     store = MemoryStore()
     CSVtoZarr(reader, store, assay_name="RNA", nthreads=1).dump()
@@ -1180,7 +1238,7 @@ def test_csv_to_zarr_preserves_metadata_column_order_and_counts(tmp_path, column
     np.testing.assert_array_equal(root["cellData/score"][:], [0.5, 1.5, 2.5])
     if "batch" in columns:
         np.testing.assert_array_equal(
-            root["cellData/batch"][:], ["batch_A", "batch_B", "batch_C"]
+            root["cellData/batch"][:], ["batch_A", "batch_B", "batch_γ_longer"]
         )
 
 
@@ -1419,11 +1477,39 @@ def test_to_h5ad_recalculates_counts_without_mutating_qc_metadata(
     expected = csr_matrix(assay.rawData.compute())
     with h5py.File(path, "r") as h5:
         shape = tuple(int(value) for value in h5["X"].attrs["shape"])
+        assert h5["X/data"].chunks == (65_536,)
+        assert h5["X/indices"].chunks == (65_536,)
         exported = csr_matrix(
             (h5["X/data"][:], h5["X/indices"][:], h5["X/indptr"][:]),
             shape=shape,
         )
         np.testing.assert_array_equal(exported.toarray(), expected.toarray())
+
+
+@pytest.mark.parametrize(("row_delta", "column_delta"), [(1, 0), (-1, 0), (0, 1)])
+def test_to_h5ad_rejects_count_metadata_shape_mismatches_and_closes_output(
+    export_assay_store, tmp_path, row_delta, column_delta
+):
+    import h5py
+
+    from scarf.matrix import ChunkedArray
+    from scarf.writers import to_h5ad
+
+    assay = export_assay_store.RNA
+    values = np.ones(
+        (assay.cells.N + row_delta, assay.feats.N + column_delta), dtype=np.uint16
+    )
+    group = zarr.group(store=MemoryStore())
+    assay.rawData = ChunkedArray(group.create_array("counts", data=values), nthreads=1)
+    path = tmp_path / "invalid.h5ad"
+    handles = h5py.h5f.get_obj_count()
+    with pytest.raises(
+        ValueError, match="Count matrix .* does not match assay metadata"
+    ):
+        to_h5ad(assay, str(path), nthreads=1)
+    assert h5py.h5f.get_obj_count() == handles
+    with h5py.File(path, "r") as handle:
+        assert "encoding-type" not in handle["X"].attrs
 
 
 def _completed_export_run():

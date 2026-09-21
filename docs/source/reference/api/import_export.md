@@ -49,6 +49,12 @@ Pass `embedding_roles` and `cluster_keys` to select analytical H5AD values for a
 Selected `obsm` arrays and cluster labels are excluded from live metadata and returned as exact
 refs by `H5adToZarr.dump()`. Other supported `obs` columns remain literal metadata.
 
+CSC input is converted to temporary row storage on local disk. Pass `temp_dir` to
+`H5adReader` or `H5adReader.from_inspect` to choose its parent directory; the default uses
+the system temporary directory, including `TMPDIR`. Cloned readers inherit this setting
+and share an existing conversion. The temporary files are removed when the last reader
+using them closes.
+
 ```{eval-rst}
 .. autofunction:: scarf.inspect_h5ad
 ```
@@ -226,6 +232,10 @@ Explicit positive values remain supported.
 
 Use `DataStoreMerge` to merge DataStores.
 Pass `assays=["RNA"]` when only one assay type is needed.
+Features are matched by exact feature ID. Gene symbols are display labels and do not merge
+distinct IDs; suffixes such as `_1` are preserved. An assay present in multiple inputs raises
+an error if none of its IDs overlap.
+If inputs use different identifier conventions, align their IDs explicitly before merging.
 RNA assays write both `counts` and a gene-major `countsT` copy, which roughly doubles stored counts for those assays.
 Non-RNA assays never write `countsT`.
 Interrupted merges resume at whole-component boundaries (`cellData`, each assay `counts`, and each RNA `countsT`) rather than mid-matrix.

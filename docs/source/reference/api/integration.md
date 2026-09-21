@@ -37,6 +37,18 @@ Per-cell LISI is axis-aligned analytical data, so `metric_lisi` returns an artif
 `load_metric_lisi` reads its scores. Dataset-level scalar summaries such as iLISI and graph
 connectivity remain direct values.
 
+All LISI entry points now resolve `perplexity=None` to `floor(k / 3)`, where `k` is the
+number of neighbours. `compute_lisi` and `metric_lisi` previously defaulted to 30. Pass
+`perplexity=30` explicitly to retain that policy; explicit values are capped at `k / 3`
+with a warning when the graph is too small. With three to five neighbours, the new default
+is 1, so scores can approach 1 when the nearest distance is unique. Tied distances can
+produce larger values. The resolved perplexity is part of a saved metric's identity.
+
+Cluster separability summaries now expose `macro_f1_fold_sd`, the sample standard deviation
+of macro F1 across validation folds. This replaces `macro_f1_standard_error`, which reported
+that deviation divided by the square root of the fold count. Update consumers of the old
+column name and interpret the new value as fold variability.
+
 ## DataStore methods
 
 ```{eval-rst}

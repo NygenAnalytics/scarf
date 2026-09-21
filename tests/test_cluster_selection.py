@@ -38,6 +38,44 @@ def test_quota_grouping_preserves_seeded_row_selection(seed):
     np.testing.assert_array_equal(actual, sorted(required))
 
 
+def test_cluster_quota_does_not_reserve_samples_for_missing_labels():
+    labels = np.array([0] * 4 + [1] * 4 + [np.nan] * 8)
+    sampled = shared_cluster_quota_sample_indices(
+        (("clusters", labels),),
+        n_cells=len(labels),
+        seed=91,
+        max_sample_size=4,
+        min_cluster_quota=2,
+    )
+    assert len(sampled) == 4
+    assert np.count_nonzero(labels[sampled] == 0) == 2
+    assert np.count_nonzero(labels[sampled] == 1) == 2
+
+
+@pytest.mark.parametrize(
+    "sample_indices",
+    [
+        np.array([[0, 1, 3, 4]]),
+        np.array([0, 1, 3, 4], dtype=float),
+        np.array([0, 1, 3]),
+        np.array([-1, 1, 3, 4]),
+        np.array([0, 1, 3, 6]),
+        np.array([0, 1, 1, 4]),
+        np.array([4, 3, 1, 0]),
+    ],
+)
+def test_cluster_selection_rejects_invalid_reused_samples(sample_indices):
+    coordinates = np.arange(12, dtype=float).reshape(6, 2)
+    labels = np.array([0, 0, 0, 1, 1, 1])
+    with pytest.raises(ValueError, match="sorted, unique sample of the requested size"):
+        select_clusters_by_silhouette(
+            coordinates,
+            (("clusters", labels),),
+            max_sample_size=4,
+            sample_indices=sample_indices,
+        )
+
+
 def test_cluster_selection_uses_one_deterministic_sample_and_first_tie(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
