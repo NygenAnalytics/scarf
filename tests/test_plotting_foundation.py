@@ -349,6 +349,200 @@ def test_equal_weight_sample_aggregation_fixture():
     assert agg["mean"].iloc[0] != pytest.approx(cell_weighted)
 
 
+@pytest.mark.parametrize("block_size", [1, 3, 7])
+@pytest.mark.parametrize("sample_by", [None, "sample_with_missing"])
+def test_feature_summary_matches_cell_table_across_blocks(
+    synthetic_plot_store, block_size, sample_by
+):
+    import zarr
+
+    from scarf.matrix import ChunkedArray
+    from scarf.plotting._data import summarize_features_by_group
+
+    store = synthetic_plot_store
+    values = store.RNA._values.copy()
+    values[1, 0] = np.nan
+    store.RNA.rawData = ChunkedArray(zarr.array(values, chunks=(block_size, 2)))
+    features = {
+        "markers": [
+            splt.FeatureRef(0, by="index", label="shared"),
+            splt.FeatureRef(1, by="index", label="shared"),
+        ],
+        "control": [splt.FeatureRef(1, by="index", label="other")],
+    }
+    normalized = np.log1p(values)
+    frames = []
+    for feature_group, items in features.items():
+        for feature in items:
+            frame = pd.DataFrame(
+                {
+                    "category": store.cells.fetch_all("category"),
+                    "split": store.cells.fetch_all("split"),
+                    "feature": feature.label,
+                    "feature_group": feature_group,
+                    "value": normalized[:, int(feature.value)],
+                    "detected": normalized[:, int(feature.value)] > 0.5,
+                }
+            )
+            if sample_by is not None:
+                frame["sample"] = store.cells.fetch_all(sample_by)
+                frame = frame.loc[frame["sample"].notna()]
+            frames.append(frame)
+    keys = ["category", "split", "feature", "feature_group"]
+    expected = (
+        pd.concat(frames)
+        .groupby((["sample"] if sample_by else []) + keys, dropna=False)
+        .agg(
+            mean=("value", "mean"),
+            fraction=("detected", "mean"),
+            n_cells=("value", "size"),
+            variance=("value", "var"),
+        )
+        .reset_index()
+    )
+
+    aggregate, per_sample = summarize_features_by_group(
+        store,
+        features=features,
+        group_by=("category", "split"),
+        sample_by=sample_by,
+        normalization=splt.NormalizationSpec(source="raw", transform="log1p"),
+        expression_cutoff=0.5,
+    )
+
+    if sample_by is not None:
+        pd.testing.assert_frame_equal(per_sample, expected)
+        expected = (
+            expected.groupby(keys, dropna=False)
+            .agg(
+                mean=("mean", "mean"),
+                fraction=("fraction", "mean"),
+                n_cells=("n_cells", "sum"),
+                n_samples=("sample", "nunique"),
+                variance=("variance", "mean"),
+            )
+            .reset_index()
+        )
+    else:
+        assert per_sample is None
+    pd.testing.assert_frame_equal(aggregate, expected)
+
+
+@pytest.mark.parametrize("block_size", [1, 2, 4])
+@pytest.mark.parametrize("value", [np.inf, -np.inf])
+def test_feature_summary_rejects_infinite_values(
+    synthetic_plot_store, block_size, value
+):
+    import zarr
+
+    from scarf.matrix import ChunkedArray
+    from scarf.plotting._data import summarize_features_by_group
+
+    store = synthetic_plot_store
+    values = store.RNA._values.copy()
+    values[0, 0] = value
+    store.RNA.rawData = ChunkedArray(zarr.array(values, chunks=(block_size, 2)))
+
+    with pytest.raises(ValueError, match="infinity after normalization"):
+        summarize_features_by_group(
+            store,
+            features=["GeneA"],
+            group_by="group",
+            sample_by="sample",
+            normalization=splt.NormalizationSpec(source="raw"),
+        )
+
+
+def test_feature_summary_excludes_invalid_samples_before_infinity_check(
+    synthetic_plot_store,
+):
+    from scarf.plotting._data import summarize_features_by_group
+
+    store = synthetic_plot_store
+    store.RNA.rawData[0, 0] = np.inf
+    aggregate, _ = summarize_features_by_group(
+        store,
+        features=["GeneA"],
+        group_by="group",
+        sample_by="sample_with_missing",
+        normalization=splt.NormalizationSpec(source="raw"),
+    )
+
+    assert np.isfinite(aggregate["mean"]).all()
+
+
+def test_feature_summary_releases_source_blocks(synthetic_plot_store, monkeypatch):
+    import weakref
+
+    import zarr
+
+    from scarf.matrix import ChunkedArray
+    from scarf.plotting._data import summarize_features_by_group
+
+    store = synthetic_plot_store
+    store.RNA.rawData = ChunkedArray(zarr.array(store.RNA._values, chunks=(1, 2)))
+    references = []
+    peak_blocks = 0
+    original = ChunkedArray._materialize_range
+
+    def materialize(array, start, stop):
+        nonlocal peak_blocks
+        block = original(array, start, stop)
+        references.append(weakref.ref(block))
+        peak_blocks = max(peak_blocks, sum(ref() is not None for ref in references))
+        return block
+
+    monkeypatch.setattr(ChunkedArray, "_materialize_range", materialize)
+    aggregate, _ = summarize_features_by_group(
+        store,
+        features=["GeneA", "GeneB"],
+        group_by="group",
+        normalization=splt.NormalizationSpec(source="raw"),
+    )
+
+    assert len(references) == store.cells.N
+    assert peak_blocks <= 3
+    np.testing.assert_allclose(
+        aggregate.groupby("feature")["mean"].mean(),
+        store.RNA._values.mean(axis=0),
+    )
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "assay_name"),
+    [("datastore", "RNA"), ("toy_crdir_ds", "ADT"), ("atac_datastore", "ATAC")],
+)
+def test_feature_summary_preserves_assay_normalization(
+    request, fixture_name, assay_name
+):
+    from scarf.plotting._data import summarize_features_by_group
+
+    store = request.getfixturevalue(fixture_name)
+    cell_idx = store.cells.active_index("I")
+    expected = np.log1p(
+        store._get_assay(assay_name)
+        .normed(cell_idx=cell_idx, feat_idx=np.array([0, 1]))
+        .compute()
+    )
+    aggregate, per_sample = summarize_features_by_group(
+        store,
+        features=[
+            splt.FeatureRef(index, by="index", label=f"feature-{index}")
+            for index in (1, 0)
+        ],
+        from_assay=assay_name,
+        group_by="I",
+        normalization=splt.NormalizationSpec(transform="log1p"),
+    )
+
+    assert per_sample is None
+    assert aggregate["feature"].tolist() == ["feature-0", "feature-1"]
+    np.testing.assert_allclose(aggregate["mean"], expected.mean(axis=0))
+    np.testing.assert_allclose(aggregate["variance"], expected.var(axis=0, ddof=1))
+    np.testing.assert_allclose(aggregate["fraction"], (expected > 0).mean(axis=0))
+    np.testing.assert_array_equal(aggregate["n_cells"], len(cell_idx))
+
+
 def test_embedding_keeps_square_panel_with_side_legend():
     rng = np.random.default_rng(0)
     n_cells = 48

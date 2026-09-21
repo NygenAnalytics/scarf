@@ -796,9 +796,97 @@ def test_pipeline_auto_filtering_retains_constant_metric(datastore_ephemeral):
 
     np.testing.assert_array_equal(run.cells.fetch_all("I"), expected)
     status = datastore.inspect_artifact(run["analysis_cell_selection"])
-    assert status.parameters["resolvedBounds"] == {
-        "constant_qc": {"low": 0.0, "high": 0.0}
-    }
+    assert status.parameters["method"] == "mad"
+    bounds = status.parameters["mad"]["resolved_bounds"]["all"]["constant_qc"]
+    assert bounds["low"] is None
+    assert bounds["high"] is None
+    assert bounds["skip_reason"] == "zero_mad"
+
+
+def test_pooled_mad_defaults_match_pipeline_and_preserve_gaussian_option(
+    datastore_ephemeral,
+):
+    from scarf.datastore._pipeline_filtering import filter_pipeline_selection
+    from scarf.datastore._pipeline_recipe import resolve_pipeline_recipe
+    from scarf.storage.selections import (
+        read_stored_selection_mask,
+        snapshot_run_metadata,
+    )
+
+    store = datastore_ephemeral
+    active = np.asarray(store.cells.fetch_all("I"), dtype=bool)
+    selected = np.flatnonzero(active)
+    counts = np.random.default_rng(817).lognormal(np.log(4000), 0.65, store.cells.N)
+    low_count_cells = selected[-30:]
+    counts[low_count_cells] = 100
+    mito = np.linspace(1.0, 3.0, store.cells.N)
+    healthy, high_mito = selected[:2]
+    counts[[healthy, high_mito]] = 4000
+    mito[healthy] = 0
+    mito[high_mito] = 90
+    store.cells.insert("RNA_nCounts", counts, overwrite=True)
+    store.cells.insert("RNA_percentMito", mito, overwrite=True)
+    attrs = ["RNA_nCounts", "RNA_percentMito"]
+    prior = store.snapshot_cell_selection("I")
+    snapshot = snapshot_run_metadata(
+        store.zw,
+        table_path="cellData",
+        id_column="ids",
+        columns=attrs,
+        axis="cell",
+    )
+
+    refs = {}
+    for method in ("mad", "gaussian"):
+        options = {} if method == "mad" else {"method": method}
+        direct = store.auto_filter_cells(attrs=attrs, cell_selection=prior, **options)
+        assert (
+            store.auto_filter_cells(attrs=attrs, cell_selection=prior, **options)
+            == direct
+        )
+        recipe = resolve_pipeline_recipe(
+            store,
+            assay=None,
+            label=None,
+            cell_key="I",
+            harmony_batch_columns=None,
+            snapshot_columns=(),
+            **{
+                **_minimal_run_options(),
+                "filtering": {"attrs": attrs, **options},
+            },
+        )
+        pipeline = filter_pipeline_selection(
+            store,
+            recipe=recipe,
+            input_selection=prior,
+            cell_snapshot=snapshot,
+        )
+        masks = []
+        for ref in (direct, pipeline):
+            masks.append(
+                read_stored_selection_mask(
+                    store.zw,
+                    ref,
+                    kind="cell_selection",
+                    scope="datastore",
+                    assay=None,
+                    table_path="cellData",
+                )
+            )
+            assert store.inspect_artifact(ref).parameters["method"] == method
+        np.testing.assert_array_equal(*masks)
+        assert masks[0][healthy]
+        assert not masks[0][high_mito]
+        assert np.all(masks[0][low_count_cells] == (method == "gaussian"))
+        if method == "mad":
+            bounds = store.inspect_artifact(direct).parameters["resolved_bounds"]["all"]
+            assert bounds["RNA_nCounts"]["low"] > 100
+            assert bounds["RNA_percentMito"]["low"] is None
+        refs[method] = direct
+
+    assert refs["mad"] != refs["gaussian"]
+    np.testing.assert_array_equal(store.cells.fetch_all("I"), active)
 
 
 def test_pipeline_filtering_rejects_nullable_active_sample_label(
@@ -1377,7 +1465,7 @@ def test_empty_filtering_mapping_uses_automatic_defaults(
     )
 
     assert recipe.filtering["enabled"] is True
-    assert recipe.filtering["method"] == "auto"
+    assert recipe.filtering["method"] == "mad"
     assert recipe.leiden_partitions == ()
 
 

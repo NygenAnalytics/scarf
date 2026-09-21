@@ -1457,6 +1457,7 @@ def _run_analysis(
     if stage == "filterCells":
         ref = store.auto_filter_cells(
             attrs=workflow.filterAttrs,
+            method="gaussian",
             min_p=workflow.filterMinQuantile,
             max_p=workflow.filterMaxQuantile,
             invalidate_cache=invalidateCache,

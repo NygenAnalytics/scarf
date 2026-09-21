@@ -9,6 +9,7 @@ import pandas as pd
 from ..features.values import (
     ResolvedFeature as ResolvedFeature,
     fetch_normalized_feature_matrix as fetch_normalized_feature_matrix,
+    iter_normalized_feature_blocks,
     resolve_feature as resolve_feature,
 )
 from ..storage.artifacts import ArtifactRef, artifact_group, inspect_artifact
@@ -235,6 +236,105 @@ def resolve_cell_selection(
     return mask, group_order
 
 
+def _summarize_feature_blocks(
+    store: Any,
+    resolved: Sequence[ResolvedFeature],
+    cell_idx: np.ndarray,
+    base: pd.DataFrame,
+    group_keys: list[str],
+    feature_groups: list[str | None],
+    normalization: NormalizationSpec | None,
+    expression_cutoff: float,
+) -> pd.DataFrame:
+    grouped = base.groupby(group_keys, observed=True, dropna=False)
+    codes = np.full(len(cell_idx), -1, dtype=np.int64)
+    codes[base.index.to_numpy()] = grouped.ngroup().to_numpy()
+    group_table = grouped.size().reset_index(name="n_cells")
+    feature_table = pd.DataFrame(
+        {
+            "feature": [feature.label for feature in resolved],
+            "feature_group": feature_groups,
+        }
+    )
+    grouped_features = feature_table.groupby(["feature", "feature_group"], dropna=False)
+    feature_codes = grouped_features.ngroup().to_numpy()
+    feature_table = grouped_features.size().reset_index(name="multiplicity")
+    shape = (len(group_table), len(feature_table))
+    counts = np.zeros(shape, dtype=np.int64)
+    means = np.zeros(shape, dtype=np.float64)
+    squared_deviations = np.zeros(shape, dtype=np.float64)
+    detected = np.zeros(shape, dtype=np.int64)
+
+    for slots, start, values in iter_normalized_feature_blocks(
+        store, resolved, cell_idx, normalization
+    ):
+        block_codes = codes[start : start + len(values)]
+        included = block_codes >= 0
+        if not included.any():
+            continue
+        block_values = values[included]
+        if np.isinf(block_values).any():
+            raise ValueError("Expression values contain infinity after normalization")
+        block = pd.DataFrame(block_values)
+        grouped = block.groupby(block_codes[included])
+        block_means = grouped.mean()
+        rows = block_means.index.to_numpy()
+        block_counts = grouped.count().to_numpy()
+        block_deviations = grouped.var().to_numpy() * np.maximum(block_counts - 1, 0)
+        block_deviations[block_counts < 2] = 0
+        block_means = block_means.to_numpy(copy=True)
+        block_means[block_counts == 0] = 0
+        block_detected = (
+            (block > expression_cutoff).groupby(block_codes[included]).sum().to_numpy()
+        )
+        for column, slot in enumerate(slots):
+            target = feature_codes[slot]
+            previous = counts[rows, target]
+            incoming = block_counts[:, column]
+            total = previous + incoming
+            weight = np.divide(
+                incoming, total, out=np.zeros(len(rows)), where=total > 0
+            )
+            delta = block_means[:, column] - means[rows, target]
+            means[rows, target] += delta * weight
+            # Include the shift between block means when combining variances.
+            squared_deviations[rows, target] += (
+                block_deviations[:, column] + delta**2 * previous * weight
+            )
+            counts[rows, target] = total
+            detected[rows, target] += block_detected[:, column]
+
+    means[counts == 0] = np.nan
+    variance = np.divide(
+        squared_deviations,
+        counts - 1,
+        out=np.full(shape, np.nan),
+        where=counts > 1,
+    )
+    table = group_table.iloc[
+        np.repeat(np.arange(len(group_table)), len(feature_table))
+    ].reset_index(drop=True)
+    table["n_cells"] *= np.tile(
+        feature_table["multiplicity"].to_numpy(), len(group_table)
+    )
+    for name in ("feature", "feature_group"):
+        table[name] = np.tile(feature_table[name].to_numpy(), len(group_table))
+    table["mean"] = means.ravel()
+    table["fraction"] = detected.ravel() / table["n_cells"]
+    table["variance"] = variance.ravel()
+    return table[
+        [
+            *group_keys,
+            "feature",
+            "feature_group",
+            "mean",
+            "fraction",
+            "n_cells",
+            "variance",
+        ]
+    ]
+
+
 def summarize_features_by_group(
     store: Any,
     *,
@@ -261,6 +361,8 @@ def summarize_features_by_group(
         condition_by = study_design.condition_by
 
     pairs = coerce_feature_list(features)
+    if not pairs:
+        raise ValueError("At least one feature is required")
     if len(pairs) > max_features:
         raise ValueError(
             f"Too many features ({len(pairs)} > {max_features}). "
@@ -270,7 +372,6 @@ def summarize_features_by_group(
         resolve_feature(store, feat, from_assay=from_assay) for _, feat in pairs
     ]
     group_labels = [g for g, _ in pairs]
-    feature_labels = [r.label for r in resolved]
 
     cells = store.cells
     group_keys, cell_idx, group_cols = _resolve_grouping(
@@ -290,14 +391,8 @@ def summarize_features_by_group(
             "Raise max_groups explicitly if intentional."
         )
 
-    expr = fetch_normalized_feature_matrix(
-        store,
-        resolved,
-        cell_idx,
-        normalization=normalization,
-    )
-    frac_mask = expr > expression_cutoff
     base = pd.DataFrame({gk: col for gk, col in zip(group_keys, group_cols)})
+    gb_keys = list(group_keys)
 
     if sample_by is not None:
         samples = np.asarray(cells.fetch_all(sample_by))[cell_idx]
@@ -320,31 +415,24 @@ def summarize_features_by_group(
                 f"Too many samples ({len(uniq_samples)} > {max_samples}). "
                 "Raise max_samples explicitly if intentional."
             )
-        parts: list[pd.DataFrame] = []
-        base_v = base.loc[valid].copy()
-        base_v["sample"] = np.asarray(samples)[valid]
-        for j in range(len(resolved)):
-            part = base_v.copy()
-            part["feature"] = feature_labels[j]
-            part["feature_group"] = group_labels[j]
-            part["value"] = expr[valid, j]
-            part["detected"] = frac_mask[valid, j]
-            parts.append(part)
-        long = pd.concat(parts, ignore_index=True)
-        gb_keys = ["sample", *group_keys, "feature", "feature_group"]
-        per_sample = (
-            long.groupby(gb_keys, observed=False, dropna=False)
-            .agg(
-                mean=("value", "mean"),
-                fraction=("detected", "mean"),
-                n_cells=("value", "size"),
-                variance=("value", "var"),
-            )
-            .reset_index()
-        )
+        base = base.loc[valid].copy()
+        base["sample"] = np.asarray(samples)[valid]
+        gb_keys.insert(0, "sample")
+
+    summary = _summarize_feature_blocks(
+        store,
+        resolved,
+        cell_idx,
+        base,
+        gb_keys,
+        group_labels,
+        normalization,
+        expression_cutoff,
+    )
+    if sample_by is not None:
         agg_keys = [*group_keys, "feature", "feature_group"]
         aggregate = (
-            per_sample.groupby(agg_keys, observed=False, dropna=False)
+            summary.groupby(agg_keys, observed=False, dropna=False)
             .agg(
                 mean=("mean", "mean"),
                 fraction=("fraction", "mean"),
@@ -354,26 +442,5 @@ def summarize_features_by_group(
             )
             .reset_index()
         )
-        return aggregate, per_sample
-
-    parts = []
-    for j in range(len(resolved)):
-        part = base.copy()
-        part["feature"] = feature_labels[j]
-        part["feature_group"] = group_labels[j]
-        part["value"] = expr[:, j]
-        part["detected"] = frac_mask[:, j]
-        parts.append(part)
-    long = pd.concat(parts, ignore_index=True)
-    agg_keys = [*group_keys, "feature", "feature_group"]
-    aggregate = (
-        long.groupby(agg_keys, observed=False, dropna=False)
-        .agg(
-            mean=("value", "mean"),
-            fraction=("detected", "mean"),
-            n_cells=("value", "size"),
-            variance=("value", "var"),
-        )
-        .reset_index()
-    )
-    return aggregate, None
+        return aggregate, summary
+    return summary, None

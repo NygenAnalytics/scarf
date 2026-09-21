@@ -384,6 +384,26 @@ def test_run_stage_session_carries_exact_ref_to_normalization(
     assert session["artifactRefs"]["markHvgs"] == _FEATURE_REF
 
 
+def test_filter_stage_preserves_configured_gaussian_quantiles(
+    datastore_ephemeral: DataStore,
+) -> None:
+    workflow = WorkflowParameters(
+        filterAttrs=["RNA_nCounts"],
+        filterMinQuantile=0.02,
+        filterMaxQuantile=0.98,
+    )
+    expected = datastore_ephemeral.auto_filter_cells(
+        attrs=["RNA_nCounts"],
+        method="gaussian",
+        min_p=0.02,
+        max_p=0.98,
+    )
+
+    result = _run_analysis("filterCells", datastore_ephemeral, workflow, _resources())
+
+    assert result == {"artifact": expected.to_dict()}
+
+
 @pytest.mark.slow
 def test_graph_construction_profile_stages_chain_through_explicit_artifacts(
     datastore_ephemeral: DataStore,

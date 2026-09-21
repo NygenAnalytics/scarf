@@ -1,6 +1,6 @@
 """Resolve assay features and fetch their values without presentation dependencies."""
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -116,13 +116,22 @@ def fetch_normalized_feature_matrix(
     normalization: NormalizationSpec | None = None,
 ) -> np.ndarray:
     """Return assay-native or raw feature values in requested feature order."""
-    from ..utils.compute import controlled_compute
-
-    normalization = normalization or NormalizationSpec()
-    if not resolved:
-        return np.empty((len(cell_idx), 0), dtype=np.float64)
-
     output = np.empty((len(cell_idx), len(resolved)), dtype=np.float64)
+    for slots, start, values in iter_normalized_feature_blocks(
+        store, resolved, cell_idx, normalization
+    ):
+        output[start : start + len(values), slots] = values
+    return output
+
+
+def iter_normalized_feature_blocks(
+    store: Any,
+    resolved: Sequence[ResolvedFeature],
+    cell_idx: np.ndarray,
+    normalization: NormalizationSpec | None = None,
+) -> Iterator[tuple[list[int], int, np.ndarray]]:
+    """Yield feature slots, selected-row offsets, and normalized value blocks."""
+    normalization = normalization or NormalizationSpec()
     assay_slots: dict[str, list[int]] = {}
     for slot, feat in enumerate(resolved):
         assay_slots.setdefault(feat.assay, []).append(slot)
@@ -141,22 +150,31 @@ def fetch_normalized_feature_matrix(
                 cell_idx=cell_idx,
                 feat_idx=physical_indices,
             )
-        normalized = controlled_compute(values, store.nthreads).astype(np.float64)
-        if normalized.ndim == 1:
-            normalized = normalized.reshape(-1, 1)
-        if normalization.transform == "log1p":
-            normalized = np.log1p(normalized)
-
-        for slot in slots:
-            feat = resolved[slot]
-            local = np.searchsorted(
-                physical_indices, np.asarray(feat.indices, dtype=np.int64)
-            )
-            values = normalized[:, local]
-            if values.shape[1] == 1:
-                output[:, slot] = values[:, 0]
-            elif feat.reduction == "sum":
-                output[:, slot] = values.sum(axis=1)
-            else:
-                output[:, slot] = values.mean(axis=1)
-    return output
+        blocks = (
+            (values,)
+            if isinstance(values, np.ndarray)
+            else values.stream_blocks(nthreads=store.nthreads)
+        )
+        local_indices = [
+            np.searchsorted(physical_indices, resolved[slot].indices) for slot in slots
+        ]
+        start = 0
+        for block in blocks:
+            normalized = np.asarray(block, dtype=np.float64)
+            if normalized.ndim == 1:
+                normalized = normalized.reshape(-1, 1)
+            if normalization.transform == "log1p":
+                normalized = np.log1p(normalized)
+            output = np.empty((len(normalized), len(slots)), dtype=np.float64)
+            for column, (slot, local) in enumerate(
+                zip(slots, local_indices, strict=True)
+            ):
+                selected = normalized[:, local]
+                if selected.shape[1] == 1:
+                    output[:, column] = selected[:, 0]
+                elif resolved[slot].reduction == "sum":
+                    output[:, column] = selected.sum(axis=1)
+                else:
+                    output[:, column] = selected.mean(axis=1)
+            yield slots, start, output
+            start += len(normalized)

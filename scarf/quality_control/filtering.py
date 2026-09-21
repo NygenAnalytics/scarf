@@ -199,19 +199,24 @@ def _apply_bounds(
 def _sample_aware_mad_mask(
     *,
     values_by_attr: dict[str, np.ndarray],
-    sample_labels: np.ndarray,
+    sample_labels: np.ndarray | None,
     active: np.ndarray,
     n_mads: float,
     min_cells_per_sample: int,
     attrs: list[str],
 ) -> tuple[np.ndarray, _MadProvenance]:
-    """Build one cell mask from per-sample MAD bounds.
+    """Build one cell mask from pooled or per-sample MAD bounds.
 
     Inactive cells are left ``True`` in the returned mask so callers can
     intersect with the current selection via ``update_key``.
     """
     n_cells = active.shape[0]
-    sample_labels = _validated_sample_labels(sample_labels, active)
+    pooled = sample_labels is None
+    sample_labels = (
+        np.full(n_cells, "all")
+        if sample_labels is None
+        else _validated_sample_labels(sample_labels, active)
+    )
     keep = np.ones(n_cells, dtype=bool)
     policies = {attr: _metric_policy(attr) for attr in attrs}
     raw_values_by_attr: dict[str, np.ndarray] = {}
@@ -253,12 +258,13 @@ def _sample_aware_mad_mask(
         sample_idx = np.flatnonzero(sample_mask)
         sample_sizes[sample_key] = int(sample_idx.shape[0])
         resolved_bounds[sample_key] = {}
+        group_label = "Selected cells" if pooled else f"Sample '{sample_key}'"
 
         if sample_idx.shape[0] < min_cells_per_sample:
             skip_reasons[sample_key] = "insufficient_cells"
             warnings.append(
-                f"Sample '{sample_key}' has fewer than {min_cells_per_sample} "
-                "active cells; retaining all of its cells without MAD filtering"
+                f"{group_label}: fewer than {min_cells_per_sample} "
+                "active cells; retaining them without MAD filtering"
             )
             continue
 
@@ -281,7 +287,7 @@ def _sample_aware_mad_mask(
                     "scaled_mad": 0.0,
                 }
                 warnings.append(
-                    f"Sample '{sample_key}' has zero MAD for '{attr}'; "
+                    f"{group_label}: zero MAD for '{attr}'; "
                     "retaining cells for this metric"
                 )
                 continue

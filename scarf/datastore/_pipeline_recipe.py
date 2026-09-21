@@ -148,8 +148,12 @@ def _resolve_filtering(
     else:
         raise TypeError("filtering must be a mapping or bool")
     method = options.pop("method", "auto")
-    if method not in {"auto", "manual"}:
-        raise ValueError("filtering method must be 'auto' or 'manual'")
+    if method == "auto":
+        method = "mad"
+    if method not in {"mad", "gaussian", "manual"}:
+        raise ValueError(
+            "filtering method must be 'auto', 'mad', 'gaussian', or 'manual'"
+        )
     attrs = _column_sequence(
         options.pop("attrs", _default_filter_columns(store, assay)),
         "filtering attrs",
@@ -214,11 +218,21 @@ def _resolve_filtering(
     )
     if min_cells < 2:
         raise ValueError("min_cells_per_sample must be at least 2")
-    if sample_column is not None and (min_p != 0.01 or max_p != 0.99):
-        raise ValueError("min_p and max_p cannot be changed with sample_column")
+    if method == "mad" and (min_p != 0.01 or max_p != 0.99):
+        raise ValueError(
+            "min_p and max_p cannot be changed with method='mad'; "
+            "use method='gaussian' for quantile bounds"
+        )
+    if method == "gaussian":
+        if sample_column is not None:
+            raise ValueError("Gaussian filtering does not support a sample source")
+        if n_mads != 3.0 or min_cells != 20:
+            raise ValueError(
+                "n_mads and min_cells_per_sample apply only to method='mad'"
+            )
     return {
         "enabled": True,
-        "method": "auto",
+        "method": method,
         "attrs": list(attrs),
         "minP": min_p,
         "maxP": max_p,

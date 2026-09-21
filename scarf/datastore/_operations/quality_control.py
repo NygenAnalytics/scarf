@@ -1,6 +1,6 @@
 from collections.abc import Iterable, Mapping, Sequence
 from numbers import Real
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -609,6 +609,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         cell_selection: ArtifactRef | None = None,
         artifact_metrics: Iterable[NamedCellArtifact] | None = None,
         invalidate_cache: bool = False,
+        method: Literal["mad", "gaussian"] = "mad",
         sample_column: str | None = None,
         sample_artifact: NamedCellArtifact | None = None,
         n_mads: float = 3.0,
@@ -616,21 +617,17 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
     ) -> ArtifactRef:
         """Create an immutable automatically filtered cell selection.
 
-        By default this is a wrapper around ``filter_cells`` that determines the
-        thresholds for each column. It models a normal distribution centered on
-        the column median and using the column standard deviation, then
-        evaluates its quantiles at ``min_p`` and ``max_p``.
+        Defaults to median absolute deviation (MAD) bounds. Counts and feature
+        counts use log1p and two-sided bounds; mitochondrial and ribosomal
+        percentages use upper bounds. Other metrics use two-sided raw bounds.
 
         Requested columns are read from current cell metadata when this method
         is called. Exact quality-metric artifacts can be supplied alongside
         metadata metrics. Metadata values are fingerprinted and artifact
         references are stored in provenance.
 
-        When ``sample_column`` or ``sample_artifact`` is supplied, thresholds
-        are instead calculated independently within each sample using median
-        absolute deviation (MAD). ``n_mads`` controls that path. ``min_p`` and
-        ``max_p`` remain global-Gaussian parameters and must stay at their
-        defaults for sample-aware filtering.
+        MAD thresholds are pooled unless a sample source is supplied. Use
+        ``method="gaussian"`` for pooled median/std Gaussian quantiles instead.
 
         Args:
             attrs: Column names to be used for filtering.
@@ -638,16 +635,26 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             max_p: Quantile used for the upper threshold (Gaussian path only).
             cell_selection: Optional prior cell-selection artifact.
             artifact_metrics: Named exact ``quality_metric`` artifact vectors.
+            method: MAD bounds by default, or explicit pooled Gaussian bounds.
             sample_column: Optional cell-metadata column with sample labels.
                 When set, MAD bounds are calculated within each sample.
             sample_artifact: Optional named exact ``hto_identity`` sample vector.
-            n_mads: Number of scaled MADs used for per-sample bounds.
-            min_cells_per_sample: Samples with fewer active cells than this are
+            n_mads: Number of scaled MADs used for bounds.
+            min_cells_per_sample: Groups with fewer active cells than this are
                 retained without MAD filtering and emit a warning.
 
         Returns:
             A complete datastore-scoped ``cell_selection`` artifact.
         """
+        if method not in ("mad", "gaussian"):
+            raise ValueError("method must be 'mad' or 'gaussian'")
+        if method == "gaussian":
+            if sample_column is not None or sample_artifact is not None:
+                raise ValueError("Gaussian filtering does not support a sample source")
+            if n_mads != 3.0 or min_cells_per_sample != 20:
+                raise ValueError(
+                    "n_mads and min_cells_per_sample apply only to method='mad'"
+                )
         if attrs is None:
             attrs = []
             for i in ["nCounts", "nFeatures", "percentMito", "percentRibo"]:
@@ -689,8 +696,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         if missing:
             joined = ", ".join(repr(attr) for attr in missing)
             raise KeyError(f"Cell metadata columns not found: {joined}")
-        if sample_column is not None or resolved_sample_artifact is not None:
-            return self._auto_filter_cells_sample_mad(
+        if method == "mad":
+            return self._auto_filter_cells_mad(
                 attrs=attrs_list,
                 artifact_metrics=metric_artifacts,
                 min_p=min_p,
@@ -775,6 +782,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             row_ids=np.asarray(self.cells.fetch_all("ids")),
             operation="auto_filter_cells",
             parameters={
+                "method": "gaussian",
                 "attrs": metric_names,
                 "metric_sources": metric_sources,
                 "min_p": min_p,
@@ -794,7 +802,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         logger.info(f"Cell filtering retained {int(stored.sum())}/{self.cells.N} cells")
         return ref
 
-    def _auto_filter_cells_sample_mad(
+    def _auto_filter_cells_mad(
         self,
         *,
         attrs: list[str],
@@ -810,9 +818,9 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
     ) -> ArtifactRef:
         if min_p != 0.01 or max_p != 0.99:
             raise ValueError(
-                "min_p and max_p apply only to the global Gaussian path. "
-                "Leave them at their defaults (0.01 and 0.99) when "
-                "a sample source is set, and use n_mads to control MAD bounds"
+                "min_p and max_p apply only to method='gaussian'. "
+                "Leave them at their defaults (0.01 and 0.99) and use n_mads "
+                "to control MAD bounds"
             )
         if isinstance(n_mads, bool) or not isinstance(n_mads, Real):
             raise TypeError("n_mads must be a positive number")
@@ -829,9 +837,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             raise ValueError(
                 f"sample_column '{sample_column}' not found in cell metadata"
             )
-        if sample_column is None and sample_artifact is None:
-            raise ValueError("Sample-aware filtering requires an exact sample source")
-
         prior_selection = self._filter_input_selection(cell_selection)
         active = read_stored_selection_mask(
             self.zw,
@@ -843,6 +848,9 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         )
         active_idx = np.flatnonzero(active).astype(np.int64, copy=False)
         compact_active = np.ones(len(active_idx), dtype=bool)
+        if len(active_idx) == 0:
+            raise ValueError("Cell selection contains no active cells")
+        sample_labels: np.ndarray | None = None
         if sample_column is not None:
             sample_labels = np.asarray(
                 read_metadata_rows_chunkwise(
@@ -852,8 +860,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 )
             )
             sample_label_name = f"sample_column '{sample_column}'"
-        else:
-            assert sample_artifact is not None
+        elif sample_artifact is not None:
             resolved_sample = resolve_cell_aligned_artifact(
                 self.zw,
                 sample_artifact.artifact,
@@ -862,13 +869,12 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             )
             sample_labels = np.asarray(resolved_sample.values)
             sample_label_name = f"sample_artifact '{sample_artifact.name}'"
-        sample_labels = _validated_sample_labels(
-            sample_labels,
-            compact_active,
-            label_name=sample_label_name,
-        )
-        if sample_labels.size == 0:
-            raise ValueError("No active cells are available for sample-aware filtering")
+        if sample_labels is not None:
+            sample_labels = _validated_sample_labels(
+                sample_labels,
+                compact_active,
+                label_name=sample_label_name,
+            )
 
         metric_names: list[str] = []
         values_by_attr: dict[str, np.ndarray] = {}
@@ -901,6 +907,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             values_by_attr[source.name] = values
 
         parameters: dict[str, Any] = {
+            "method": "mad",
             "attrs": metric_names,
             "metric_sources": [
                 *(
@@ -923,12 +930,13 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 "source": "metadataColumn",
                 "column": sample_column,
             }
-        else:
-            assert sample_artifact is not None
+        elif sample_artifact is not None:
             parameters["sample_source"] = {
                 "name": sample_artifact.name,
                 "source": "artifact",
             }
+        else:
+            parameters["sample_source"] = {"source": "pooled"}
 
         mad_provenance = None
         if metric_names:
@@ -958,11 +966,11 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             },
         }
         if sample_column is not None:
+            assert sample_labels is not None
             fingerprint_inputs["sample_assignments_fingerprint"] = fingerprint_strings(
                 sample_labels
             )
-        else:
-            assert sample_artifact is not None
+        elif sample_artifact is not None:
             fingerprint_inputs["sample_artifact"] = sample_artifact.artifact
         canonical_bytes(
             {

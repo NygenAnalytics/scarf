@@ -481,6 +481,18 @@ def test_pipeline_filtering_contract_errors() -> None:
             "Sample column",
         ),
         ({"attrs": ["RNA_nCounts"], "n_mads": 0}, ValueError, "positive"),
+        ({"attrs": ["RNA_nCounts"], "min_p": 0.05}, ValueError, "method='mad'"),
+        (
+            {"method": "gaussian", "sample_column": "sample"},
+            ValueError,
+            "sample source",
+        ),
+        ({"method": "gaussian", "n_mads": 4.0}, ValueError, "apply only"),
+        (
+            {"method": "gaussian", "min_cells_per_sample": 2},
+            ValueError,
+            "apply only",
+        ),
         (
             {"attrs": ["RNA_nCounts"], "min_cells_per_sample": 1},
             ValueError,
@@ -513,6 +525,9 @@ def test_pipeline_filtering_contract_errors() -> None:
     )
     assert manual["lows"] == [None]
     assert manual["keepBounds"] is True
+    assert recipe_module._resolve_filtering(store, "RNA", {"method": "auto"}) == (
+        recipe_module._resolve_filtering(store, "RNA", {"method": "mad"})
+    )
 
 
 def test_resolve_pipeline_recipe_contract_errors(

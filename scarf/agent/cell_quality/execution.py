@@ -641,6 +641,7 @@ def execute_auto_cell_qc(
 
     result = store.auto_filter_cells(
         attrs_list,
+        method="gaussian" if action == "globalGaussian" else "mad",
         min_p=min_p,
         max_p=max_p,
         cell_selection=prior,

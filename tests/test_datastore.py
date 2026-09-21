@@ -408,12 +408,17 @@ def test_auto_filter_keeps_cells_with_zero_feature_percentages():
     dataset.cells.insert("has_counts", expected)
     cells = dataset.snapshot_cell_selection("has_counts")
 
-    result = dataset.auto_filter_cells(attrs=["RNA_percentMito"], cell_selection=cells)
+    result = dataset.auto_filter_cells(
+        attrs=["RNA_percentMito"], cell_selection=cells, min_cells_per_sample=2
+    )
 
     np.testing.assert_array_equal(dataset.load_artifact(result)["values"][:], expected)
-    assert dataset.inspect_artifact(result).parameters["resolved_bounds"] == {
-        "RNA_percentMito": {"low": 0.0, "high": 0.0}
-    }
+    status = dataset.inspect_artifact(result)
+    assert status.parameters["method"] == "mad"
+    bounds = status.parameters["resolved_bounds"]["all"]["RNA_percentMito"]
+    assert bounds["low"] is None
+    assert bounds["high"] is None
+    assert bounds["skip_reason"] == "zero_mad"
 
 
 @pytest.mark.parametrize(

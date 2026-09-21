@@ -161,7 +161,8 @@ def _prepare_store(
         default_assay="RNA",
         nthreads=2,
     )
-    cell_selection = store.auto_filter_cells()
+    # Match the cell IDs in the fixed layout fixture.
+    cell_selection = store.auto_filter_cells(method="gaussian")
     features = store.select_hvgs(
         cell_selection,
         top_n=100,

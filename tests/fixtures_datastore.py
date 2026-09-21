@@ -260,7 +260,8 @@ def analyzed_datastore_ephemeral(analyzed_datastore_zarr_root):
 
 @pytest.fixture(scope="session")
 def auto_filter_cells(datastore):
-    return datastore.auto_filter_cells()
+    # Saved numerical references use the Gaussian-filtered cell selection.
+    return datastore.auto_filter_cells(method="gaussian")
 
 
 @pytest.fixture(scope="session")

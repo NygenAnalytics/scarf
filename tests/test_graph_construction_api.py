@@ -987,7 +987,7 @@ def test_graph_chain_matches_released_knn_golden(
     analyzed_datastore_ephemeral,
 ) -> None:
     datastore = analyzed_datastore_ephemeral
-    cell_selection = datastore.auto_filter_cells()
+    cell_selection = datastore.auto_filter_cells(method="gaussian")
     features = datastore.set_feature_selection(
         from_assay="RNA",
         feature_indexes=_RELEASED_KNN_FEATURE_INDICES,

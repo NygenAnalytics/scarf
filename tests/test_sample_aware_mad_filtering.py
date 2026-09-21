@@ -250,7 +250,7 @@ def test_sample_aware_mask_skips_small_and_zero_mad_groups():
     assert any("zero MAD" in message for message in provenance["warnings"])
 
 
-def test_auto_filter_cells_without_sample_column_matches_gaussian(
+def test_auto_filter_cells_explicit_gaussian_matches_quantile_bounds(
     datastore_ephemeral,
 ):
     attrs = ["RNA_nCounts", "RNA_nFeatures"]
@@ -270,7 +270,7 @@ def test_auto_filter_cells_without_sample_column_matches_gaussian(
     }
 
     before = np.asarray(datastore_ephemeral.cells.fetch_all("I"), dtype=bool).copy()
-    cell_ref = datastore_ephemeral.auto_filter_cells(attrs=attrs)
+    cell_ref = datastore_ephemeral.auto_filter_cells(attrs=attrs, method="gaussian")
     after = np.asarray(datastore_ephemeral.cells.fetch_all("I"), dtype=bool)
 
     status = datastore_ephemeral.inspect_artifact(cell_ref)
@@ -344,6 +344,7 @@ def test_auto_filter_cells_global_combines_metadata_and_exact_artifact_metrics(
         attrs=["RNA_nCounts"],
         artifact_metrics=[metric],
         cell_selection=prior,
+        method="gaussian",
     )
 
     np.testing.assert_array_equal(
@@ -396,6 +397,16 @@ def test_auto_filter_cells_sample_column_raises_on_conflicts(
             attrs=["RNA_nCounts"],
             sample_column="missing_sample",
         )
+
+    for options, message in (
+        ({"method": "unknown"}, "method must be"),
+        ({"min_p": 0.05}, "min_p and max_p"),
+        ({"method": "gaussian", "sample_column": "sample_id"}, "sample source"),
+        ({"method": "gaussian", "n_mads": 4.0}, "apply only"),
+        ({"method": "gaussian", "min_cells_per_sample": 2}, "apply only"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            datastore_ephemeral.auto_filter_cells(attrs=["RNA_nCounts"], **options)
 
 
 @pytest.mark.parametrize("n_mads", [np.nan, np.inf, -np.inf])

@@ -90,7 +90,7 @@ def filter_pipeline_selection(
                 high,
                 keep_bounds=keep_bounds,
             )
-    elif config["sampleColumn"] is None:
+    elif config["method"] == "gaussian":
         if not filter_active.any():
             raise ValueError(
                 "Pipeline filtering has no selected cells with complete metrics"
@@ -109,18 +109,24 @@ def filter_pipeline_selection(
             )
         parameters["resolvedBounds"] = bounds
     else:
-        sample_column = config["sampleColumn"]
-        labels, sample_missing = snapshot_column_values(snapshot, sample_column)
-        if sample_missing is not None and np.any(active & sample_missing):
+        if not filter_active.any():
             raise ValueError(
-                f"sample column {sample_column!r} contains missing labels "
-                "among active cells"
+                "Pipeline filtering has no selected cells with complete metrics"
             )
-        labels = _validated_sample_labels(
-            labels,
-            active,
-            label_name=f"sample column {sample_column!r}",
-        )
+        sample_column = config["sampleColumn"]
+        labels = None
+        if sample_column is not None:
+            labels, sample_missing = snapshot_column_values(snapshot, sample_column)
+            if sample_missing is not None and np.any(active & sample_missing):
+                raise ValueError(
+                    f"sample column {sample_column!r} contains missing labels "
+                    "among active cells"
+                )
+            labels = _validated_sample_labels(
+                labels,
+                active,
+                label_name=f"sample column {sample_column!r}",
+            )
         keep, provenance = _sample_aware_mad_mask(
             values_by_attr=values_by_attr,
             sample_labels=labels,
