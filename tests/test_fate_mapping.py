@@ -2,10 +2,15 @@ from typing import Any
 
 import numpy as np
 import pytest
-from scipy.sparse import csr_matrix, diags
+from scipy.sparse import block_diag, csr_matrix, diags
 
 from scarf.datastore.graph_datastore import GraphDataStore
-from scarf.storage.artifacts import ArtifactRef
+from scarf.metadata import MetaData
+from scarf.storage.artifacts import ArtifactRef, artifact_group
+from scarf.storage.selections import (
+    resolve_metadata_snapshot,
+    resolve_stored_selection_artifact,
+)
 from scarf.trajectory.fate import (
     _make_transition,
     _normalize_pseudotime,
@@ -13,6 +18,9 @@ from scarf.trajectory.fate import (
     make_sink_tokens,
 )
 from scarf.trajectory.results import FateMappingResult
+
+from .test_graph_coverage import _memory_graph_store
+from .test_graph_feature_projection import _native_chain
 
 
 def _y_graph() -> tuple[csr_matrix, np.ndarray, np.ndarray]:
@@ -568,6 +576,85 @@ def test_localized_solver_error_fails_residual_validation(
             beta=0.0,
             solver_tol=1e-3,
         )
+
+
+@pytest.mark.parametrize(
+    "include_disconnected_cells", [False, True], ids=["all-cells", "largest-component"]
+)
+def test_datastore_fate_mapping_preserves_cached_graph(
+    include_disconnected_cells: bool,
+):
+    graph, _, label_values = _y_graph()
+    source_sink = np.array([-1.0, 0.0, 0.6, 0.0, 0.4])
+    if include_disconnected_cells:
+        graph = block_diag((graph, csr_matrix([[0.0, 1.0], [1.0, 0.0]])))
+        label_values = np.concatenate((label_values, ["other", "other"]))
+        source_sink = np.concatenate((source_sink, [0.0, 0.0]))
+    store = _memory_graph_store()
+    cells = store.z.create_group("cellData")
+    cell_ids = np.array([f"c{i}" for i in range(graph.shape[0])])
+    cells.create_array("ids", data=cell_ids)
+    cells.create_array("I", data=np.ones(len(cell_ids), dtype=bool))
+    store.cells = MetaData(cells)
+    selection = resolve_stored_selection_artifact(
+        store.zw,
+        table_path="cellData",
+        id_column="ids",
+        source_column="I",
+        scope="datastore",
+        kind="cell_selection",
+        operation="test_selection",
+        parameters={},
+        inputs={},
+    )
+    graph_ref, _, _ = _native_chain(store.zw, "RNA", cell_selection=selection)
+    graph_group = artifact_group(store.zw, graph_ref)
+    edges = np.column_stack(graph.nonzero()).astype(np.uint64)
+    graph_group.create_array("edges", data=edges)
+    graph_group.create_array("weights", data=np.full(len(edges), 0.5))
+    graph_group.attrs.update({"n_cells": len(cell_ids), "n_neighbors": 2})
+    pseudotime = store.run_pseudotime_scoring(
+        graph_ref, ss_vec=source_sink, n_singular_vals=3
+    )
+    labels = resolve_metadata_snapshot(
+        store.zw,
+        values=label_values,
+        row_ids=cell_ids,
+        operation="test_labels",
+        parameters={},
+        inputs={"cell_selection": selection},
+        source_columns=["label"],
+    )
+
+    with store._graph_memory_cache_scope():
+        cached_graph = store.load_graph(graph_ref, symmetric=True, upper_only=False)
+        original_graph = cached_graph.copy()
+        cached_results = {}
+        for beta in (10.0, 5.0):
+            ref = store.run_fate_mapping(
+                pseudotime, labels, sinks=["A", "B"], beta=beta
+            )
+            cached_results[beta] = store.load_fate_mapping(ref)
+        assert (
+            store.run_fate_mapping(pseudotime, labels, sinks=["A", "B"], beta=5.0)
+            == cached_results[5.0].ref
+        )
+        assert (
+            store.load_graph(graph_ref, symmetric=True, upper_only=False)
+            is cached_graph
+        )
+        np.testing.assert_array_equal(cached_graph.data, original_graph.data)
+        np.testing.assert_array_equal(cached_graph.indices, original_graph.indices)
+        np.testing.assert_array_equal(cached_graph.indptr, original_graph.indptr)
+
+    for beta, cached_result in cached_results.items():
+        fresh = store.run_fate_mapping(
+            pseudotime, labels, sinks=["A", "B"], beta=beta, invalidate_cache=True
+        )
+        fresh_result = store.load_fate_mapping(fresh)
+        np.testing.assert_array_equal(cached_result.valid, np.arange(len(cell_ids)) < 5)
+        np.testing.assert_array_equal(cached_result.valid, fresh_result.valid)
+        np.testing.assert_array_equal(cached_result.values, fresh_result.values)
 
 
 def test_datastore_fate_mapping_returns_an_artifact_without_metadata_writes(

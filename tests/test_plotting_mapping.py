@@ -12,12 +12,17 @@ import pytest
 import scarf.mapping.confidence as mapping_confidence
 import scarf.plotting as splt
 import scarf.plotting.mapping as plotting_mapping
+from scarf.storage import ArtifactRef
 from tests.test_mapping_label_transfer import (
     _copied_query,
     _plain_reference,
     _write_reference_column,
     _write_projection,
     _write_reference_layout,
+)
+
+_RESULT_REF = ArtifactRef(
+    scope="assay", assay="RNA", kind="projection", artifact_id="a" * 64
 )
 
 
@@ -103,7 +108,6 @@ def _sorted_rows(values: np.ndarray) -> np.ndarray:
 
 
 def _controlled_mapping_store(
-    monkeypatch: pytest.MonkeyPatch,
     *,
     evidence: pd.DataFrame | None = None,
     score_rows: list[tuple[object, np.ndarray]] | None = None,
@@ -121,22 +125,40 @@ def _controlled_mapping_store(
         reference=reference,
         ref=SimpleNamespace(assay="RNA"),
     )
-    monkeypatch.setattr(
-        plotting_mapping,
-        "_mapping_result",
-        lambda *_args, **_kwargs: mapping,
-    )
     methods = {}
     if evidence is not None:
         methods["get_target_label_evidence"] = lambda *_args, **_kwargs: evidence.copy()
     if score_rows is not None:
-        methods["get_mapping_score"] = lambda *_args, **_kwargs: list(score_rows)
+        methods["_mapping_score_data"] = lambda *_args, **_kwargs: (
+            mapping,
+            list(score_rows),
+            None,
+            None,
+        )
     return SimpleNamespace(**methods)
 
 
 def test_mapping_plot_families_use_query_result_and_reference_semantics(
     plotting_mapping_context,
+    monkeypatch,
 ):
+    import scarf.datastore._operations.mapping as mapping_operations
+    import scarf.mapping.artifact as mapping_artifact
+
+    binding_checks = 0
+    original_binding = mapping_artifact.validate_mapping_reference_binding
+
+    def observe_binding(reference):
+        nonlocal binding_checks
+        binding_checks += 1
+        return original_binding(reference)
+
+    monkeypatch.setattr(
+        mapping_artifact, "validate_mapping_reference_binding", observe_binding
+    )
+    monkeypatch.setattr(
+        mapping_operations, "validate_mapping_reference_binding", observe_binding
+    )
     context = plotting_mapping_context
     query = context["query"]
     result = context["result"]
@@ -228,6 +250,7 @@ def test_mapping_plot_families_use_query_result_and_reference_semantics(
         calibration.tables["calibration"]
     )
     assert calibration.tables["calibration"]["coverage"].between(0, 1).all()
+    assert binding_checks == 6
 
     for plot in (
         score,
@@ -433,7 +456,7 @@ def test_mapping_plots_do_not_project_or_weight_coordinates(
     def unexpected(*args, **kwargs):
         raise AssertionError("plotting attempted mapping computation")
 
-    monkeypatch.setattr(type(query), "get_mapping_score", cached_scores)
+    monkeypatch.setattr(type(query), "_mapping_scores", cached_scores)
     monkeypatch.setattr(type(query), "get_target_label_evidence", cached_evidence)
     monkeypatch.setattr(mapping_confidence, "distance_weights", unexpected)
 
@@ -488,9 +511,7 @@ def test_mapping_plots_do_not_project_or_weight_coordinates(
         plot.close()
 
 
-def test_mapping_calibration_respects_direction_and_draws_uncertainty(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_mapping_calibration_respects_direction_and_draws_uncertainty():
     evidence = pd.DataFrame(
         {
             "label": ["A", "B", "B", "A"],
@@ -500,12 +521,12 @@ def test_mapping_calibration_respects_direction_and_draws_uncertainty(
             "customConfidence": [0.9, 0.7, 0.4, 0.1],
         }
     )
-    store = _controlled_mapping_store(monkeypatch, evidence=evidence)
+    store = _controlled_mapping_store(evidence=evidence)
     known = np.asarray(["A", "B", "A", "B"])
 
     higher = plotting_mapping.mapping_calibration(
         store,
-        object(),
+        _RESULT_REF,
         reference=object(),
         reference_class_group="label",
         known_labels=known,
@@ -517,7 +538,7 @@ def test_mapping_calibration_respects_direction_and_draws_uncertainty(
     )
     lower = plotting_mapping.mapping_calibration(
         store,
-        object(),
+        _RESULT_REF,
         reference=object(),
         reference_class_group="label",
         known_labels=known,
@@ -528,7 +549,7 @@ def test_mapping_calibration_respects_direction_and_draws_uncertainty(
     )
     explicit = plotting_mapping.mapping_calibration(
         store,
-        object(),
+        _RESULT_REF,
         reference=object(),
         reference_class_group="label",
         known_labels=known,
@@ -602,7 +623,6 @@ def test_mapping_calibration_respects_direction_and_draws_uncertainty(
     ],
 )
 def test_mapping_calibration_rejects_malformed_threshold_controls(
-    monkeypatch: pytest.MonkeyPatch,
     kwargs,
     message,
 ):
@@ -614,12 +634,12 @@ def test_mapping_calibration_rejects_malformed_threshold_controls(
             "customConfidence": [0.8, 0.2],
         }
     )
-    store = _controlled_mapping_store(monkeypatch, evidence=evidence)
+    store = _controlled_mapping_store(evidence=evidence)
 
     with pytest.raises(ValueError, match=message):
         plotting_mapping.mapping_calibration(
             store,
-            object(),
+            _RESULT_REF,
             reference=object(),
             reference_class_group="label",
             known_labels=np.asarray(["A", "B"]),
@@ -628,9 +648,7 @@ def test_mapping_calibration_rejects_malformed_threshold_controls(
         )
 
 
-def test_mapping_calibration_rejects_nonfinite_or_unretained_evidence(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_mapping_calibration_rejects_nonfinite_or_unretained_evidence():
     evidence = pd.DataFrame(
         {
             "label": ["A", "B"],
@@ -638,11 +656,11 @@ def test_mapping_calibration_rejects_nonfinite_or_unretained_evidence(
             "voteFraction": [np.nan, np.nan],
         }
     )
-    store = _controlled_mapping_store(monkeypatch, evidence=evidence)
+    store = _controlled_mapping_store(evidence=evidence)
     with pytest.raises(ValueError, match="No finite metric values"):
         plotting_mapping.mapping_calibration(
             store,
-            object(),
+            _RESULT_REF,
             reference=object(),
             reference_class_group="label",
             known_labels=np.asarray(["A", "B"]),
@@ -650,11 +668,11 @@ def test_mapping_calibration_rejects_nonfinite_or_unretained_evidence(
         )
 
     finite_evidence = evidence.assign(voteFraction=[0.8, 0.2])
-    store = _controlled_mapping_store(monkeypatch, evidence=finite_evidence)
+    store = _controlled_mapping_store(evidence=finite_evidence)
     with pytest.raises(ValueError, match="No threshold retained"):
         plotting_mapping.mapping_calibration(
             store,
-            object(),
+            _RESULT_REF,
             reference=object(),
             reference_class_group="label",
             known_labels=np.asarray(["A", "B"]),
@@ -663,25 +681,21 @@ def test_mapping_calibration_rejects_nonfinite_or_unretained_evidence(
         )
 
 
-def test_mapping_plots_reject_empty_and_misaligned_data(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_mapping_plots_reject_empty_and_misaligned_data():
     empty_store = _controlled_mapping_store(
-        monkeypatch,
         score_rows=[],
         n_reference=2,
     )
     with pytest.raises(ValueError, match="produced no score groups"):
         plotting_mapping.mapping_score(
             empty_store,
-            object(),
+            _RESULT_REF,
             reference=object(),
             kind="histogram",
             show=False,
         )
 
     mismatched_store = _controlled_mapping_store(
-        monkeypatch,
         score_rows=[
             ("first", np.asarray([0.1, 0.2])),
             ("second", np.asarray([0.3])),
@@ -691,7 +705,7 @@ def test_mapping_plots_reject_empty_and_misaligned_data(
     with pytest.raises(ValueError, match="incompatible lengths"):
         plotting_mapping.mapping_score(
             mismatched_store,
-            object(),
+            _RESULT_REF,
             reference=object(),
             kind="histogram",
             show=False,
@@ -704,11 +718,11 @@ def test_mapping_plots_reject_empty_and_misaligned_data(
             "voteFraction": [0.8, 0.2],
         }
     )
-    evidence_store = _controlled_mapping_store(monkeypatch, evidence=evidence)
+    evidence_store = _controlled_mapping_store(evidence=evidence)
     with pytest.raises(ValueError, match="one value per mapped cell"):
         plotting_mapping.mapping_evidence(
             evidence_store,
-            object(),
+            _RESULT_REF,
             reference=object(),
             reference_class_group="label",
             target_groups=["only-one"],
@@ -718,7 +732,7 @@ def test_mapping_plots_reject_empty_and_misaligned_data(
     with pytest.raises(ValueError, match="cannot contain missing values"):
         plotting_mapping.mapping_evidence(
             evidence_store,
-            object(),
+            _RESULT_REF,
             reference=object(),
             reference_class_group="label",
             target_groups=["first", None],
@@ -728,7 +742,7 @@ def test_mapping_plots_reject_empty_and_misaligned_data(
     with pytest.raises(ValueError, match="metrics must be non-empty"):
         plotting_mapping.mapping_evidence(
             evidence_store,
-            object(),
+            _RESULT_REF,
             reference=object(),
             reference_class_group="label",
             metrics=(),
@@ -737,7 +751,7 @@ def test_mapping_plots_reject_empty_and_misaligned_data(
     with pytest.raises(KeyError, match="Unknown evidence metrics"):
         plotting_mapping.mapping_evidence(
             evidence_store,
-            object(),
+            _RESULT_REF,
             reference=object(),
             reference_class_group="label",
             metrics=("missingMetric",),
@@ -746,23 +760,14 @@ def test_mapping_plots_reject_empty_and_misaligned_data(
 
 
 def test_mapping_layout_rejects_wrong_shape_and_infinite_coordinates():
-    wrong_shape = SimpleNamespace(
-        selected_cell_count=2,
-        fetch_layout=lambda _key: np.zeros((2, 3)),
-    )
     with pytest.raises(ValueError, match="two columns"):
-        plotting_mapping._reference_layout(wrong_shape, "layout")
+        plotting_mapping._reference_layout(np.zeros((2, 3)), 2)
 
-    infinite = SimpleNamespace(
-        selected_cell_count=2,
-        fetch_layout=lambda _key: np.asarray([[0.0, 1.0], [np.inf, 2.0]]),
-    )
     with pytest.raises(ValueError, match="infinite coordinates"):
-        plotting_mapping._reference_layout(infinite, "layout")
+        plotting_mapping._reference_layout(np.asarray([[0.0, 1.0], [np.inf, 2.0]]), 2)
 
 
 def test_mapping_categorical_legends_serialize_and_owned_figures_close(
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ):
     import json
@@ -781,7 +786,6 @@ def test_mapping_categorical_legends_serialize_and_owned_figures_close(
         ("alpha", np.asarray([0.4, 0.5, 0.6])),
     ]
     store = _controlled_mapping_store(
-        monkeypatch,
         evidence=evidence,
         score_rows=score_rows,
     )
@@ -791,7 +795,7 @@ def test_mapping_categorical_legends_serialize_and_owned_figures_close(
     )
     scores = plotting_mapping.mapping_score(
         store,
-        object(),
+        _RESULT_REF,
         reference=object(),
         kind="histogram",
         categorical_scale=scale,
@@ -800,7 +804,7 @@ def test_mapping_categorical_legends_serialize_and_owned_figures_close(
     )
     evidence_plot = plotting_mapping.mapping_evidence(
         store,
-        object(),
+        _RESULT_REF,
         reference=object(),
         reference_class_group="label",
         target_groups=["beta", "alpha", "beta"],
@@ -847,7 +851,6 @@ def test_mapping_score_surfaces_missing_matplotlib_without_opening_a_figure(
     import matplotlib.pyplot as plt
 
     store = _controlled_mapping_store(
-        monkeypatch,
         score_rows=[("all", np.asarray([0.1, 0.2]))],
     )
 
@@ -863,7 +866,7 @@ def test_mapping_score_surfaces_missing_matplotlib_without_opening_a_figure(
     with pytest.raises(ImportError, match="requires matplotlib"):
         plotting_mapping.mapping_score(
             store,
-            object(),
+            _RESULT_REF,
             reference=object(),
             kind="histogram",
             show=False,

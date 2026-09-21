@@ -149,3 +149,70 @@ def test_feature_alignment_rejects_duplicate_identifiers():
             np.array(["gene_a", "gene_a"]),
             name="Reference feature identifiers",
         )
+
+
+@pytest.mark.parametrize("n_neighbors", [1, 3, 11, 100])
+@pytest.mark.parametrize("threshold", [0.0, 0.5, 1.0])
+def test_block_label_votes_match_scalar_categorical_votes(n_neighbors, threshold):
+    from scarf.mapping.confidence import _label_vote_block
+
+    rng = np.random.default_rng(91)
+    codes = rng.integers(-1, 9, (80, n_neighbors))
+    weights = rng.uniform(size=codes.shape)
+    weights[rng.random(codes.shape) < 0.2] = 0
+    codes[0] = -1
+    weights[1] = 0
+    actual = _label_vote_block(codes, weights, threshold)
+    for row in range(len(codes)):
+        mass = {}
+        for code, weight in zip(codes[row], weights[row], strict=True):
+            if code >= 0:
+                mass[code] = mass.get(code, 0.0) + float(weight)
+        labeled_total = sum(mass.values())
+        if labeled_total <= 0:
+            assert actual.is_unknown[row]
+            assert (
+                actual.vote_fraction[row]
+                == actual.vote_entropy[row]
+                == actual.top_two_margin[row]
+                == 0
+            )
+            continue
+        fractions = {
+            code: value / float(weights[row].sum()) for code, value in mass.items()
+        }
+        ordered = sorted(fractions.items(), key=lambda item: item[1], reverse=True)
+        top = ordered[0][1]
+        winners = [code for code, fraction in ordered if np.isclose(fraction, top)]
+        entropy = -sum(
+            (value / labeled_total) * np.log(value / labeled_total)
+            for value in mass.values()
+            if value > 0
+        )
+        margin = top - (ordered[1][1] if len(ordered) > 1 else 0)
+        assert actual.is_unknown[row] == (top < threshold or len(winners) != 1)
+        if not actual.is_unknown[row]:
+            assert actual.prediction_codes[row] == winners[0]
+        assert actual.vote_fraction[row] == top
+        assert actual.top_two_margin[row] == margin
+        assert actual.vote_entropy[row] == pytest.approx(entropy, rel=0, abs=1e-12)
+
+
+def test_label_votes_preserve_ties_thresholds_and_large_class_codes():
+    from scarf.mapping.confidence import _label_vote_block
+
+    codes = np.array(
+        [[1000000, 2000000, -1], [1000000, 1000000, -1], [1000000, 2000000, -1]]
+    )
+    weights = np.array(
+        [[0.500001, 0.499999, 0], [0.1, 0.2, 0.7], [1e-12, 0, 1 - 1e-12]]
+    )
+    votes = _label_vote_block(codes, weights, 0.0)
+    assert votes.fractions.shape == codes.shape
+    assert votes.is_unknown.tolist() == [True, False, True]
+    at_threshold = _label_vote_block(codes[1:2], weights[1:2], votes.vote_fraction[1])
+    above_threshold = _label_vote_block(
+        codes[1:2], weights[1:2], np.nextafter(votes.vote_fraction[1], np.inf)
+    )
+    assert not at_threshold.is_unknown[0]
+    assert above_threshold.is_unknown[0]

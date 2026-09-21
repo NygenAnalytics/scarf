@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Any, cast
 
 import numpy as np
@@ -88,6 +89,80 @@ def distance_weights(distances: np.ndarray) -> np.ndarray:
             keepdims=True,
         )
     return weights
+
+
+@dataclass(slots=True)
+class _LabelVotes:
+    class_codes: np.ndarray
+    fractions: np.ndarray
+    prediction_codes: np.ndarray
+    vote_fraction: np.ndarray
+    vote_entropy: np.ndarray
+    top_two_margin: np.ndarray
+    is_unknown: np.ndarray
+
+
+def _label_vote_block(
+    neighbor_codes: np.ndarray,
+    weights: np.ndarray,
+    threshold: float,
+) -> _LabelVotes:
+    """Aggregate categorical votes in neighbor order using bounded row buffers."""
+    n_rows, n_neighbors = neighbor_codes.shape
+    rows = np.arange(n_rows)[:, None]
+    order = np.argsort(neighbor_codes, axis=1, kind="stable")
+    codes = np.take_along_axis(neighbor_codes, order, axis=1)
+    sorted_weights = np.take_along_axis(weights, order, axis=1)
+    sorted_weights[codes < 0] = 0.0
+    starts = np.ones(codes.shape, dtype=bool)
+    starts[:, 1:] = codes[:, 1:] != codes[:, :-1]
+    groups = np.cumsum(starts, axis=1) - 1
+    mass = np.zeros_like(weights, dtype=np.float64)
+    np.add.at(mass, (rows, groups), sorted_weights)
+    first_positions = np.full(codes.shape, n_neighbors, dtype=np.intp)
+    np.minimum.at(first_positions, (rows, groups), order)
+    class_codes = np.full(codes.shape, -1, dtype=np.int64)
+    class_codes[rows, groups] = codes
+    first_order = np.argsort(first_positions, axis=1, kind="stable")
+    mass = np.take_along_axis(mass, first_order, axis=1)
+    class_codes = np.take_along_axis(class_codes, first_order, axis=1)
+
+    labeled_total = np.zeros(n_rows, dtype=np.float64)
+    for column in range(n_neighbors):
+        labeled_total += mass[:, column]
+    entropy = np.zeros(n_rows, dtype=np.float64)
+    for column in range(n_neighbors):
+        probabilities = np.divide(
+            mass[:, column],
+            labeled_total,
+            out=np.zeros(n_rows, dtype=np.float64),
+            where=labeled_total > 0,
+        )
+        positive = probabilities > 0
+        entropy[positive] -= probabilities[positive] * np.log(probabilities[positive])
+    total = weights.sum(axis=1, dtype=np.float64)
+    fractions = np.divide(
+        mass, total[:, None], out=np.zeros_like(mass), where=total[:, None] > 0
+    )
+    best = fractions.argmax(axis=1)
+    top = fractions[np.arange(n_rows), best]
+    second = (
+        np.partition(fractions, -2, axis=1)[:, -2]
+        if n_neighbors > 1
+        else np.zeros(n_rows, dtype=np.float64)
+    )
+    ties = np.count_nonzero(
+        (class_codes >= 0) & np.isclose(fractions, top[:, None]), axis=1
+    )
+    return _LabelVotes(
+        class_codes=class_codes,
+        fractions=fractions,
+        prediction_codes=class_codes[np.arange(n_rows), best],
+        vote_fraction=top,
+        vote_entropy=entropy,
+        top_two_margin=top - second,
+        is_unknown=(labeled_total <= 0) | (top < threshold) | (ties != 1),
+    )
 
 
 def conformal_prediction_sets(

@@ -657,18 +657,17 @@ def test_label_transfer_excludes_blank_byte_reference_labels(
 
 
 def test_vote_entropy_is_conditional_on_available_labels() -> None:
-    _, top_vote, entropy, _, unknown, _ = DataStore._label_vote_decision(
-        np.array(["known", "missing"], dtype=object),
-        np.array([0, 1]),
-        np.array([0.01, 0.99]),
+    from scarf.mapping.confidence import _label_vote_block
+
+    votes = _label_vote_block(
+        np.array([[0, -1]]),
+        np.array([[0.01, 0.99]]),
         0.5,
-        "NA",
-        reference_label_valid=np.array([True, False]),
     )
 
-    assert top_vote == pytest.approx(0.01)
-    assert entropy == pytest.approx(0.0)
-    assert unknown
+    assert votes.vote_fraction[0] == pytest.approx(0.01)
+    assert votes.vote_entropy[0] == pytest.approx(0.0)
+    assert votes.is_unknown[0]
 
 
 def test_label_transfer_calibration_is_deterministic_and_validated() -> None:

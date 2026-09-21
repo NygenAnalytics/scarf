@@ -13,6 +13,31 @@ from scarf.metrics.cluster_selection import (
 )
 
 
+@pytest.mark.parametrize("seed", [0, 91, 4466])
+def test_quota_grouping_preserves_seeded_row_selection(seed):
+    rng = np.random.default_rng(13)
+    labels = [rng.integers(0, 47, 10003), rng.integers(0, 9, 10003)]
+    expected_rng = np.random.default_rng(seed)
+    required = set()
+    for values in labels:
+        for label in np.unique(values):
+            rows = np.flatnonzero(values == label)
+            required.update(
+                expected_rng.choice(rows, size=min(2, len(rows)), replace=False)
+            )
+    available = np.array([row for row in range(10003) if row not in required])
+    required.update(
+        expected_rng.choice(available, size=701 - len(required), replace=False)
+    )
+    actual = shared_cluster_quota_sample_indices(
+        tuple((str(index), values) for index, values in enumerate(labels)),
+        n_cells=10003,
+        seed=seed,
+        max_sample_size=701,
+    )
+    np.testing.assert_array_equal(actual, sorted(required))
+
+
 def test_cluster_selection_uses_one_deterministic_sample_and_first_tie(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

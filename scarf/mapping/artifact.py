@@ -126,52 +126,6 @@ def _selected_feature_ids(
     return np.concatenate(selected)
 
 
-def write_artifact_mapping_reference(
-    group: zarr.Group,
-    model: ScaledPCAProjectionModel,
-    symphony_state: SymphonyCorrectionModel | None,
-    feature_ids: np.ndarray,
-    metadata: dict[str, Any],
-    reference_distance_quantiles: np.ndarray,
-    reference_distance_values: np.ndarray,
-) -> None:
-    """Write the conditional payload of one planned mapping reference."""
-    create_zarr_obj_array(group, "feature_ids", np.asarray(feature_ids))
-    _write_array(group, "feature_means", model.feature_means)
-    _write_array(group, "feature_scales", model.feature_scales)
-    _write_array(group, "center", model.center)
-    _write_array(group, "loadings", model.loadings)
-    _write_array(
-        group,
-        "reference_distance_quantiles",
-        reference_distance_quantiles,
-    )
-    _write_array(
-        group,
-        "reference_distance_values",
-        reference_distance_values,
-    )
-    if symphony_state is not None:
-        _write_array(group, "centroids", symphony_state.centroids)
-        _write_array(group, "raw_centroids", symphony_state.raw_centroids)
-        _write_array(
-            group,
-            "corrected_centroids",
-            symphony_state.corrected_centroids,
-        )
-        _write_array(group, "cluster_mass", symphony_state.cluster_mass)
-        _write_array(group, "sigma", symphony_state.sigma)
-    group.attrs["reference_metadata"] = metadata
-    method = metadata.get("method")
-    if method not in {"pca", "symphony"}:
-        raise ValueError("Mapping reference metadata has an unsupported method")
-    group.attrs["payload_fingerprint"] = _payload_fingerprint(
-        group,
-        method,
-        metadata,
-    )
-
-
 def write_artifact_mapping_reference_from_sources(
     group: zarr.Group,
     *,
@@ -895,61 +849,6 @@ def validate_mapping_reference_binding(
             "Reload it with get_mapping_reference(reference.ref)."
         )
     return reference
-
-
-def mapping_reference_payload_matches_expected(
-    group: zarr.Group,
-    *,
-    model: ScaledPCAProjectionModel,
-    symphony_state: SymphonyCorrectionModel | None,
-    feature_ids: np.ndarray,
-    metadata: Mapping[str, Any],
-    reference_distance_quantiles: np.ndarray,
-    reference_distance_values: np.ndarray,
-) -> bool:
-    try:
-        raw_metadata = group.attrs.get("reference_metadata")
-        matches = isinstance(raw_metadata, Mapping) and canonical_bytes(
-            raw_metadata
-        ) == canonical_bytes(metadata)
-        matches = (
-            matches
-            and all(
-                _stored_array_matches_values(group[name], getattr(model, name))
-                for name in ("feature_means", "feature_scales", "center", "loadings")
-            )
-            and _stored_array_matches_values(
-                group["feature_ids"],
-                feature_ids,
-                strings=True,
-                require_dtype=False,
-            )
-            and _stored_array_matches_values(
-                group["reference_distance_quantiles"],
-                reference_distance_quantiles,
-            )
-            and _stored_array_matches_values(
-                group["reference_distance_values"],
-                reference_distance_values,
-            )
-        )
-        if symphony_state is None:
-            return matches and not any(name in group for name in _SYMPHONY_ARRAYS)
-        return matches and all(
-            _stored_array_matches_values(
-                group[name],
-                getattr(symphony_state, name),
-            )
-            for name in (
-                "centroids",
-                "raw_centroids",
-                "corrected_centroids",
-                "cluster_mass",
-                "sigma",
-            )
-        )
-    except (IndexError, KeyError, TypeError, ValueError):
-        return False
 
 
 def mapping_reference_payload_matches_sources(

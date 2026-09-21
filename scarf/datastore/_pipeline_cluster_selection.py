@@ -198,7 +198,7 @@ def _cluster_selection_reuse_validator(
     *,
     candidate_keys: tuple[str, ...],
     candidate_refs: tuple[ArtifactRef, ...],
-    candidate_labels: tuple[zarr.Array, ...],
+    expected_indices: np.ndarray,
     seed: int,
     population_size: int,
     max_sample_size: int,
@@ -206,13 +206,6 @@ def _cluster_selection_reuse_validator(
     working_memory_mib: int,
 ) -> Callable[[ArtifactRef, zarr.Group], bool]:
     sample_size = min(population_size, max_sample_size)
-    expected_indices = shared_cluster_quota_sample_indices(
-        tuple(zip(candidate_keys, candidate_labels, strict=True)),
-        n_cells=population_size,
-        seed=seed,
-        max_sample_size=max_sample_size,
-        min_cluster_quota=min_cluster_quota,
-    )
     expected_refs = [ref.to_dict() for ref in candidate_refs]
     expected_sample_definition = {
         "seed": seed,
@@ -325,6 +318,14 @@ def run_cluster_selection(
         1,
         min(1024, int(store.memoryBytes // 4 // (1024**2))),
     )
+    sample_indices = shared_cluster_quota_sample_indices(
+        tuple(zip(candidate_keys, candidate_labels, strict=True)),
+        n_cells=population_size,
+        seed=seed,
+        max_sample_size=max_sample_size,
+        min_cluster_quota=min_cluster_quota,
+        checkpoint=shutdown_checkpoint,
+    )
     planned = plan_artifact(
         store.zw,
         scope="assay",
@@ -370,7 +371,7 @@ def run_cluster_selection(
         reuse_validator=_cluster_selection_reuse_validator(
             candidate_keys=candidate_keys,
             candidate_refs=candidate_refs,
-            candidate_labels=candidate_labels,
+            expected_indices=sample_indices,
             seed=seed,
             population_size=population_size,
             max_sample_size=max_sample_size,
@@ -393,6 +394,7 @@ def run_cluster_selection(
         working_memory_mib=working_memory_mib,
         min_cluster_quota=min_cluster_quota,
         checkpoint=shutdown_checkpoint,
+        sample_indices=sample_indices,
     )
     group = start_artifact(store.zw, planned)
     sample_array = create_zarr_dataset(

@@ -66,7 +66,7 @@ def shared_cluster_quota_sample_indices(
         return np.arange(n_cells, dtype=np.int64)
 
     rng = np.random.default_rng(seed)
-    required: set[int] = set()
+    required = np.zeros(n_cells, dtype=bool)
     for candidate in candidates:
         if checkpoint is not None:
             checkpoint()
@@ -74,27 +74,30 @@ def shared_cluster_quota_sample_indices(
             raise TypeError("candidates must contain (key, labels) tuples")
         _key, labels = candidate
         values = _read_all_labels(labels, expected_rows=n_cells)
-        unique_labels = np.unique(values)
-        for label in unique_labels:
-            cluster_indices = np.flatnonzero(values == label)
+        unique_labels, codes, counts = np.unique(
+            values, return_inverse=True, return_counts=True
+        )
+        order = np.argsort(codes, kind="stable")
+        boundaries = np.r_[0, np.cumsum(counts)]
+        for index, label in enumerate(unique_labels):
+            if label != label:
+                continue
+            cluster_indices = order[boundaries[index] : boundaries[index + 1]]
             quota = min(int(cluster_indices.size), min_cluster_quota)
             chosen = rng.choice(cluster_indices, size=quota, replace=False)
-            required.update(int(index) for index in chosen)
-    if len(required) > max_sample_size:
+            required[chosen] = True
+    required_count = int(np.count_nonzero(required))
+    if required_count > max_sample_size:
         raise ValueError(
             "Shared cluster-quota sample requires "
-            f"{len(required)} cells, which exceeds max_sample_size={max_sample_size}"
+            f"{required_count} cells, which exceeds max_sample_size={max_sample_size}"
         )
-    remaining = max_sample_size - len(required)
+    remaining = max_sample_size - required_count
     if remaining > 0:
-        pool = np.fromiter(
-            (index for index in range(n_cells) if index not in required),
-            dtype=np.int64,
-            count=n_cells - len(required),
-        )
+        pool = np.flatnonzero(~required)
         extra = rng.choice(pool, size=remaining, replace=False)
-        required.update(int(index) for index in extra)
-    return np.sort(np.fromiter(required, dtype=np.int64, count=len(required)))
+        required[extra] = True
+    return np.flatnonzero(required).astype(np.int64, copy=False)
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -271,6 +274,7 @@ def select_clusters_by_silhouette(
     working_memory_mib: int = 1024,
     min_cluster_quota: int = DEFAULT_MIN_CLUSTER_QUOTA,
     checkpoint: Callable[[], None] | None = None,
+    sample_indices: np.ndarray | None = None,
 ) -> ClusterSelectionResult:
     """Choose the first maximum silhouette on one shared cluster-quota sample."""
     if len(coordinates.shape) != 2:
@@ -313,14 +317,28 @@ def select_clusters_by_silhouette(
     if len(candidate_keys) != len(set(candidate_keys)):
         raise ValueError("Cluster selection candidate keys must be unique")
 
-    sample_indices = shared_cluster_quota_sample_indices(
-        resolved_candidates,
-        n_cells=n_cells,
-        seed=seed,
-        max_sample_size=max_sample_size,
-        min_cluster_quota=min_cluster_quota,
-        checkpoint=checkpoint,
-    )
+    if sample_indices is None:
+        sample_indices = shared_cluster_quota_sample_indices(
+            resolved_candidates,
+            n_cells=n_cells,
+            seed=seed,
+            max_sample_size=max_sample_size,
+            min_cluster_quota=min_cluster_quota,
+            checkpoint=checkpoint,
+        )
+    else:
+        sample_indices = np.asarray(sample_indices)
+        if (
+            sample_indices.ndim != 1
+            or not np.issubdtype(sample_indices.dtype, np.integer)
+            or len(sample_indices) != min(n_cells, max_sample_size)
+            or np.any(sample_indices < 0)
+            or np.any(sample_indices >= n_cells)
+            or np.any(sample_indices[1:] <= sample_indices[:-1])
+        ):
+            raise ValueError(
+                "sample_indices must be a sorted, unique sample of the requested size"
+            )
     sample_size = len(sample_indices)
     sampled_coordinates = np.asarray(
         read_matrix_rows(coordinates, sample_indices),

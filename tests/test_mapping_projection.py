@@ -308,6 +308,40 @@ def _replace_array(
     group.create_array(name, data=values, chunks=chunks)
 
 
+@pytest.mark.parametrize("load_arrays", [False, True])
+def test_projection_validation_reads_payload_once(monkeypatch, load_arrays) -> None:
+    from collections import Counter
+
+    root, cells, features = _query_inputs()
+    reference, _ = _mapping_reference()
+    plan = _plan(root, cells, features, reference.external_ref)
+    writer = ProjectionWriter(root, plan, chunk_rows=2)
+    blocks = _blocks()
+    writer.write_block(0, *blocks)
+    writer.finish(_diagnostics())
+    group = artifact_group(root, plan.ref)
+    expected_bytes = {
+        name: np.prod(group[name].shape) * np.dtype(group[name].dtype).itemsize
+        for name in ("indices", "distances", "uninformative")
+    }
+    reads = Counter()
+    original = zarr.Array.__getitem__
+
+    def observe(array, selection):
+        values = original(array, selection)
+        name = array.path.rsplit("/", 1)[-1]
+        if name in {"indices", "distances", "uninformative"}:
+            reads[name] += values.nbytes
+        return values
+
+    monkeypatch.setattr(zarr.Array, "__getitem__", observe)
+    loaded = load_projection(
+        root, plan.ref, reference=reference, load_arrays=load_arrays
+    )
+    assert loaded.n_cells == 4
+    assert reads == expected_bytes
+
+
 def test_projection_writer_persists_exact_contract_and_loads_copies() -> None:
     root, cell_selection, feature_selection = _query_inputs()
     reference, reference_root = _mapping_reference()
@@ -726,6 +760,7 @@ def _manual_projection(
     mapping_reference: ArtifactRef | ExternalArtifactRef,
     *,
     operation: str = "map_query",
+    correction_method: str = "none",
 ) -> ArtifactRef:
     planned = plan_artifact(
         root,
@@ -736,7 +771,7 @@ def _manual_projection(
         parameters={
             "save_k": 2,
             "missing_feature_policy": "reference_mean",
-            "correction_method": "none",
+            "correction_method": correction_method,
         },
         inputs={
             "cell_selection": cell_selection,
@@ -778,6 +813,16 @@ def test_projection_loader_rejects_old_and_local_reference_contracts() -> None:
     for ref in (old, local):
         with pytest.raises(ValueError, match="run_mapping"):
             load_projection(root, ref, reference=reference)
+
+
+def test_projection_loader_requires_additive_symphony_provenance() -> None:
+    root, cells, features = _query_inputs()
+    reference, _ = _mapping_reference()
+    old = _manual_projection(
+        root, cells, features, reference.external_ref, correction_method="symphony"
+    )
+    with pytest.raises(ValueError, match="Remap the query with run_mapping"):
+        load_projection(root, old, reference=reference)
 
 
 @pytest.mark.parametrize(

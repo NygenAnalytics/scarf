@@ -8,6 +8,7 @@ import zarr
 
 from ...graph.distances import validate_distance_provenance
 from ...graph.feature_projection import (
+    NativeGraphInputs,
     graph_cell_selection,
     resolve_native_graph_inputs,
 )
@@ -20,6 +21,7 @@ from ...metadata.rows import (
     read_metadata_missing_rows_chunkwise,
     read_metadata_rows_chunkwise,
 )
+from ...metrics.lisi import _effective_perplexity
 from ...storage.artifacts import (
     ArtifactRef,
     group_at,
@@ -114,10 +116,9 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
     def _resolve_metric_neighbors(
         self,
         neighbors: ArtifactRef,
-    ) -> tuple[ArtifactRef, str, np.ndarray]:
+    ) -> tuple[NativeGraphInputs, np.ndarray]:
         if not isinstance(neighbors, ArtifactRef):
             raise TypeError("neighbors must be an artifact reference")
-        assay = neighbors.assay or ""
         if neighbors.kind != "neighbors":
             raise ArtifactResolutionError(
                 "neighbors must reference a neighbors artifact",
@@ -139,16 +140,6 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
                     "expected_scope": "assay",
                 },
             )
-        if neighbors.assay != assay:
-            raise ArtifactResolutionError(
-                "neighbors belongs to a different assay",
-                code="wrong_assay",
-                context={
-                    "assay": neighbors.assay,
-                    "expected_assay": assay,
-                    "artifact_id": neighbors.artifact_id,
-                },
-            )
         lineage = resolve_native_graph_inputs(self.zw, neighbors)
         cell_indices = read_stored_selection_indices(
             self.zw,
@@ -158,29 +149,29 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
             assay=None,
             table_path="cellData",
         )
-        return neighbors, assay, cell_indices
+        return lineage, cell_indices
 
     def _load_metric_knn(
         self,
         neighbors: ArtifactRef,
-    ) -> tuple[ArtifactRef, str, np.ndarray, zarr.Array, zarr.Array]:
-        ref, assay, cell_indices = self._resolve_metric_neighbors(neighbors)
-        status = inspect_artifact(self.zw, ref)
-        validate_distance_provenance(self.zw, ref)
+    ) -> tuple[NativeGraphInputs, np.ndarray, zarr.Array, zarr.Array]:
+        lineage, cell_indices = self._resolve_metric_neighbors(neighbors)
+        status = inspect_artifact(self.zw, neighbors)
+        validate_distance_provenance(self.zw, neighbors)
         knn_grp = as_zarr_group(
             self.zw[status.path],
             name=status.path,
         )
         distances = as_zarr_array(knn_grp["distances"], name="distances")
         indices = as_zarr_array(knn_grp["indices"], name="indices")
-        return ref, assay, cell_indices, distances, indices
+        return lineage, cell_indices, distances, indices
 
     def metric_lisi(
         self,
         label_columns: Sequence[str],
         neighbors: ArtifactRef,
         *,
-        perplexity: float = 30,
+        perplexity: float | None = None,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
         """Calculate Local Inverse Simpson Index (LISI) scores for cell populations.
@@ -191,7 +182,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
         Args:
             label_columns: Column names from cell metadata containing population labels
             neighbors: Explicit neighbor artifact to score.
-            perplexity: Effective neighborhood size used by LISI. It is reduced
+            perplexity: Effective neighborhood size; None uses floor(k / 3). It is reduced
                 with a warning when the graph has fewer than three times this
                 many neighbors.
             invalidate_cache: Force creation of a new metric artifact.
@@ -223,9 +214,8 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
         if len(set(label_cols)) != len(label_cols):
             raise ValueError("label_columns contains duplicate names")
 
-        neighbors, assay, cell_indices, distances, indices = self._load_metric_knn(
-            neighbors
-        )
+        lineage, cell_indices, distances, indices = self._load_metric_knn(neighbors)
+        perplexity = _effective_perplexity(perplexity, int(distances.shape[1]))
         try:
             labels = {
                 column: _read_complete_metric_metadata(
@@ -261,11 +251,10 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
             }
             for column in label_cols
         ]
-        selection = resolve_native_graph_inputs(self.zw, neighbors).cell_selection
         planned = plan_cell_data_artifact(
             self.zw,
             scope="assay",
-            assay=assay,
+            assay=neighbors.assay,
             kind="quality_metric",
             operation="metric_lisi",
             parameters={
@@ -277,7 +266,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
                 "label_snapshots": label_snapshots,
             },
             execution_options={},
-            cell_selection=selection,
+            cell_selection=lineage.cell_selection,
             arrays={"values": ((len(cell_indices), len(label_cols)), "f")},
             invalidate_cache=invalidate_cache,
         )
@@ -353,7 +342,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
         """
         from ...metrics import ilisi_knn
 
-        _, _, cell_indices, distances, indices = self._load_metric_knn(neighbors)
+        _, cell_indices, distances, indices = self._load_metric_knn(neighbors)
         batch_labels = _read_complete_metric_metadata(
             self.cells,
             batch_colname,
@@ -397,7 +386,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
         """
         from ...metrics import clisi_knn
 
-        _, _, cell_indices, distances, indices = self._load_metric_knn(neighbors)
+        _, cell_indices, distances, indices = self._load_metric_knn(neighbors)
         cell_labels = _read_complete_metric_metadata(
             self.cells,
             annotation_column,
@@ -504,10 +493,9 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
 
         from ...metrics import silhouette_scoring
 
-        neighbors, from_assay, cell_indices, neighbor_distances, neighbor_indices = (
+        lineage, cell_indices, neighbor_distances, neighbor_indices = (
             self._load_metric_knn(neighbors)
         )
-        lineage = resolve_native_graph_inputs(self.zw, neighbors)
         cluster_selection, cluster_labels = self._load_metric_clustering(
             clusters,
             name="clusters",
@@ -550,7 +538,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
             ann_obj,
             None,
             metric_data,
-            from_assay,
+            cast(str, neighbors.assay),
             "clusters",
             cell_key="I",
             random_seed=random_seed,
@@ -732,7 +720,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
         label_colname: str,
         neighbors: ArtifactRef,
         *,
-        perplexity: float = 30,
+        perplexity: float | None = None,
     ) -> float:
         """Summarize batch LISI as a normalized neighborhood-mixing score.
 
@@ -744,7 +732,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
         Args:
             label_colname: Cell metadata column holding the batch assignment.
             neighbors: Explicit neighbor artifact to score.
-            perplexity: Effective neighborhood size passed to LISI.
+            perplexity: Effective neighborhood size; None uses floor(k / 3).
 
         Returns:
             A value in ``[0, 1]``. Scores near 1 indicate that neighborhoods mix
@@ -757,7 +745,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
         """
         from ...metrics import compute_lisi, lisi_batch_mixing_score
 
-        _, _, cell_indices, distances, indices = self._load_metric_knn(neighbors)
+        _, cell_indices, distances, indices = self._load_metric_knn(neighbors)
         batch_labels = _read_complete_metric_metadata(
             self.cells,
             label_colname,

@@ -378,6 +378,7 @@ def plan_projection(
             "save_k": resolved_save_k,
             "missing_feature_policy": policy,
             "correction_method": correction,
+            **({"query_batch_model": "additive"} if correction == "symphony" else {}),
         },
         inputs={
             "cell_selection": cell_selection,
@@ -463,7 +464,15 @@ def _load_projection(
         raise ValueError("Projection artifact has an old operation")
 
     parameters = status.parameters or {}
-    if set(parameters) != _PARAMETER_NAMES:
+    parameter_names = _PARAMETER_NAMES
+    if parameters.get("correction_method") == "symphony":
+        if parameters.get("query_batch_model") != "additive":
+            raise ValueError(
+                "Symphony projection requires additive query batch correction. "
+                "Remap the query with run_mapping using the prepared reference."
+            )
+        parameter_names = parameter_names | {"query_batch_model"}
+    if set(parameters) != parameter_names:
         raise ValueError("Projection parameters do not match the map_query contract")
     save_k = _positive_int(parameters["save_k"], "save_k")
     policy = _nonempty_string(
@@ -544,39 +553,26 @@ def _load_projection(
     algorithm_variant = "symphony" if correction_method == "symphony" else "scaled_pca"
 
     group = artifact_group(root, ref)
-    n_cells, diagnostics = _validate_payload(
+    n_cells, diagnostics, arrays = _validate_payload(
         group,
         expected_save_k=save_k,
         reference_cell_count=reference_cell_count,
         expected_feature_coverage=feature_coverage,
         expected_algorithm_variant=algorithm_variant,
         expected_query_batch_count=query_batch_count,
+        load_arrays=load_arrays,
     )
     if validated_cells.selected_count != n_cells:
         raise ValueError("Projection rows do not match the stored query cell selection")
 
-    indices = distances = uninformative = None
-    if load_arrays:
-        indices = np.array(
-            as_zarr_array(group["indices"], name="indices")[:],
-            copy=True,
-        )
-        distances = np.array(
-            as_zarr_array(group["distances"], name="distances")[:],
-            copy=True,
-        )
-        uninformative = np.array(
-            as_zarr_array(group["uninformative"], name="uninformative")[:],
-            copy=True,
-        )
     result = MappingResult(
         ref=ref,
         n_cells=n_cells,
         correction_method=correction_method,
         diagnostics=diagnostics,
-        indices=indices,
-        distances=distances,
-        uninformative=uninformative,
+        indices=arrays.get("indices"),
+        distances=arrays.get("distances"),
+        uninformative=arrays.get("uninformative"),
         reference=reference,
     )
     object.__setattr__(
@@ -599,7 +595,8 @@ def _validate_payload(
     expected_feature_coverage: float | None = None,
     expected_algorithm_variant: str | None = None,
     expected_query_batch_count: int | None = None,
-) -> tuple[int, dict[str, float | int | str]]:
+    load_arrays: bool = False,
+) -> tuple[int, dict[str, float | int | str], dict[str, np.ndarray]]:
     if set(group.group_keys()):
         raise ValueError("Projection payload contains unexpected groups")
     arrays = set(group.array_keys())
@@ -643,29 +640,44 @@ def _validate_payload(
     ):
         raise TypeError("Projection uninformative must be a boolean row vector")
 
-    block_rows = min(
-        row_band(array_geometry(indices), unit="chunk", fallback=1),
-        row_band(array_geometry(distances), unit="chunk", fallback=1),
-        row_band(array_geometry(uninformative), unit="chunk", fallback=1),
-    )
+    fingerprint = ValueFingerprintBuilder()
+    loaded_arrays: dict[str, np.ndarray] = {}
     uninformative_count = 0
-    for start in range(0, n_cells, block_rows):
-        stop = min(start + block_rows, n_cells)
-        if reference_cell_count is not None:
-            index_block = np.asarray(indices[start:stop])
-            if np.any(index_block >= reference_cell_count):
+    # Match the canonical array order used by fingerprint_stored_arrays.
+    for name, array in (
+        ("distances", distances),
+        ("indices", indices),
+        ("uninformative", uninformative),
+    ):
+        fingerprint.begin_array(name, array.shape, array.dtype)
+        if load_arrays:
+            loaded_arrays[name] = np.empty(array.shape, dtype=array.dtype)
+        block_rows = row_band(array_geometry(array), unit="chunk", fallback=1)
+        for start in range(0, n_cells, block_rows):
+            stop = min(start + block_rows, n_cells)
+            block = np.asarray(array[start:stop])
+            if (
+                name == "indices"
+                and reference_cell_count is not None
+                and np.any(block >= reference_cell_count)
+            ):
                 raise ValueError(
                     "Projection indices contain a neighbor outside the selected "
                     "reference cell range"
                 )
-        distance_block = np.asarray(distances[start:stop])
-        if not np.all(np.isfinite(distance_block)):
-            raise ValueError("Projection distances must be finite")
-        if np.any(distance_block < 0):
-            raise ValueError("Projection distances must be non-negative")
-        uninformative_count += int(
-            np.count_nonzero(np.asarray(uninformative[start:stop], dtype=bool))
-        )
+            if name == "distances":
+                if not np.all(np.isfinite(block)):
+                    raise ValueError("Projection distances must be finite")
+                if np.any(block < 0):
+                    raise ValueError("Projection distances must be non-negative")
+            if name == "uninformative":
+                uninformative_count += int(np.count_nonzero(block))
+            fingerprint.update_array_block(
+                name, (start,) + (0,) * (array.ndim - 1), block
+            )
+            if load_arrays:
+                loaded_arrays[name][start:stop] = block
+        fingerprint.end_array(name)
     raw_diagnostics = group.attrs["diagnostics"]
     if not isinstance(raw_diagnostics, Mapping):
         raise TypeError("Projection diagnostics must be a mapping")
@@ -681,20 +693,29 @@ def _validate_payload(
     if (
         not isinstance(stored_fingerprint, str)
         or not stored_fingerprint
-        or stored_fingerprint != _payload_fingerprint(group, diagnostics)
+        or stored_fingerprint
+        != _payload_fingerprint(
+            group, diagnostics, array_fingerprint=fingerprint.hexdigest()
+        )
     ):
         raise ValueError("Projection payload fingerprint does not match stored output")
-    return n_cells, diagnostics
+    return n_cells, diagnostics, loaded_arrays
 
 
 def _payload_fingerprint(
     group: zarr.Group,
     diagnostics: Mapping[str, Any],
+    *,
+    array_fingerprint: str | None = None,
 ) -> str:
+    if array_fingerprint is None:
+        array_fingerprint = fingerprint_stored_arrays(
+            group, tuple(sorted(_ARRAY_NAMES))
+        )
     builder = ValueFingerprintBuilder()
     builder.update_bytes(
         "arrays",
-        fingerprint_stored_arrays(group, tuple(sorted(_ARRAY_NAMES))).encode(),
+        array_fingerprint.encode(),
     )
     builder.update_bytes("diagnostics", canonical_bytes(diagnostics))
     return builder.hexdigest()

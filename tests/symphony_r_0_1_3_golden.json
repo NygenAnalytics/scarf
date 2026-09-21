@@ -55,7 +55,7 @@
       "correctedCentroids": [[0.0, 0.0]],
       "clusterMass": [4.0],
       "sigma": [0.1],
-      "correctionRidge": 2.0
+      "correctionRidge": 1.0
     },
     "query": [
       [2.0, -2.0],

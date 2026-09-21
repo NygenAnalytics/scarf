@@ -12,7 +12,7 @@ _CLUSTERING_SCORE_COLUMNS = (
     "n_sampled_cells",
     "n_clusters",
     "macro_f1_mean",
-    "macro_f1_standard_error",
+    "macro_f1_fold_sd",
     "weighted_f1_mean",
     "silhouette_score",
     "status",
@@ -124,8 +124,10 @@ def _stratified_sample_indices(
         quotas[candidates[int(np.argmax(deficits))]] += 1
 
     sampled = []
+    order = np.argsort(codes, kind="stable")
+    boundaries = np.r_[0, np.cumsum(counts)]
     for cluster_code, quota in enumerate(quotas):
-        cluster_indices = np.flatnonzero(codes == cluster_code)
+        cluster_indices = order[boundaries[cluster_code] : boundaries[cluster_code + 1]]
         sampled.append(
             rng.choice(cluster_indices, size=int(quota), replace=False).astype(
                 np.int64,
@@ -256,7 +258,7 @@ def evaluate_cluster_separability(
                     "n_sampled_cells": len(sample_indices),
                     "n_clusters": n_clusters,
                     "macro_f1_mean": np.nan,
-                    "macro_f1_standard_error": np.nan,
+                    "macro_f1_fold_sd": np.nan,
                     "weighted_f1_mean": np.nan,
                     "silhouette_score": silhouette,
                     "status": "unscorable",
@@ -383,9 +385,7 @@ def evaluate_cluster_separability(
                 "n_sampled_cells": len(sample_indices),
                 "n_clusters": n_clusters,
                 "macro_f1_mean": float(macro_values.mean()),
-                "macro_f1_standard_error": float(
-                    macro_values.std(ddof=1) / np.sqrt(n_folds)
-                ),
+                "macro_f1_fold_sd": float(macro_values.std(ddof=1)),
                 "weighted_f1_mean": float(np.mean(weighted_f1)),
                 "silhouette_score": silhouette,
                 "status": "scored",

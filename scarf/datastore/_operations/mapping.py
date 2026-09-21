@@ -1,10 +1,12 @@
 import os
 from collections.abc import Generator
-from typing import TYPE_CHECKING, Any, cast
+from tempfile import TemporaryFile
+from typing import TYPE_CHECKING, Any, BinaryIO, cast
 
 import numpy as np
 import pandas as pd
 import zarr
+from scipy.sparse import csr_matrix
 
 from ...storage.artifacts import (
     ArtifactRef,
@@ -21,6 +23,7 @@ from ...mapping.artifact import (
     validate_mapping_reference_binding,
 )
 from ...mapping.features import AlignedFeatureStream
+from ...mapping.confidence import _LabelVotes, _label_vote_block, distance_weights
 from ...mapping.models import MappingResult
 from ...mapping.projection import (
     NO_QUERY_BATCH_FINGERPRINT,
@@ -153,6 +156,7 @@ def _mapping_memory_reservations(
     n_batches: int,
     save_k: int,
     batch_codes: np.ndarray | None,
+    batch_design: csr_matrix | None,
 ) -> tuple[int, int]:
     float_bytes = np.dtype(np.float64).itemsize
     model_arrays = (
@@ -189,14 +193,39 @@ def _mapping_memory_reservations(
     resident += sum(np.asarray(values).nbytes for values in correction_arrays)
     count_bytes = n_batches * symphony.n_clusters * float_bytes
     sum_bytes = count_bytes * symphony.n_dims
-    solve_bytes = (n_batches + 1) ** 2 * float_bytes + 2 * (
-        n_batches + 1
-    ) * symphony.n_dims * float_bytes
-    resident += 2 * count_bytes + 2 * sum_bytes + solve_bytes
+    n_terms = n_batches if batch_design is None else batch_design.shape[1]
+    if batch_design is not None:
+        resident += 4 * (
+            batch_design.data.nbytes
+            + batch_design.indices.nbytes
+            + batch_design.indptr.nbytes
+        )
+    solve_bytes = (
+        4 * (n_terms + 1) ** 2 * float_bytes
+        + 2 * (n_terms + 1) * symphony.n_dims * float_bytes
+    )
+    # Statistics, fitted offsets, and immutable output buffers overlap in the solve.
+    resident += 2 * count_bytes + 3 * sum_bytes + solve_bytes
     per_row += (
         3 * symphony.n_clusters + 3 * symphony.n_dims
     ) * float_bytes + symphony.n_clusters * symphony.n_dims * float_bytes
     return resident, per_row
+
+
+def _read_projected_blocks(
+    coordinates_file: BinaryIO,
+    *,
+    n_cells: int,
+    n_dims: int,
+    block_rows: int,
+) -> Generator[tuple[int, np.ndarray], None, None]:
+    coordinates_file.seek(0)
+    for start in range(0, n_cells, block_rows):
+        n_rows = min(block_rows, n_cells - start)
+        values = np.fromfile(coordinates_file, dtype=np.float64, count=n_rows * n_dims)
+        if values.size != n_rows * n_dims:
+            raise RuntimeError("Temporary mapping coordinates are incomplete")
+        yield start, values.reshape(n_rows, n_dims)
 
 
 class _MappingOperationsMixin(_MappingOperationsBase):
@@ -293,6 +322,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             raise ValueError("cell_selection must select at least one query cell")
 
         symphony_state = reference.symphony_state
+        batch_design = None
         if symphony_state is None:
             if query_batches is not None:
                 raise ValueError(
@@ -310,10 +340,11 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 query_batch_fingerprint = NO_QUERY_BATCH_FINGERPRINT
             else:
                 query_batches = query_batches.copy(deep=True)
-                batch_codes, n_batches = self._query_batch_codes(
+                batch_codes, batch_design = self._query_batch_design(
                     query_batches,
                     n_cells,
                 )
+                n_batches = batch_design.shape[0]
                 query_batch_fingerprint = _query_batch_fingerprint(query_batches)
             correction_method = "symphony"
             algorithm_variant = SYMPHONY_ALGORITHM
@@ -328,6 +359,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             n_batches=n_batches,
             save_k=save_k,
             batch_codes=batch_codes,
+            batch_design=batch_design,
         )
         feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay)
         stream = AlignedFeatureStream(
@@ -397,52 +429,13 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             chunk_rows=stream.row_geometry.block_rows,
             profile=self.storageProfile,
         )
-        try:
-            neighbor_query = _load_reference_neighbor_query(
-                reference,
-                save_k=save_k,
-                workers=self.resources.workers,
-            )
-            if symphony_state is not None:
-                assert batch_codes is not None
-                counts, sums = initialize_sufficient_statistics(
-                    n_batches,
-                    symphony_state,
-                )
-                expected_start = 0
-                for block in stream:
-                    if block.row_offset != expected_start:
-                        raise RuntimeError("Aligned query blocks are not contiguous")
-                    coordinates = project_pca(block.values, reference.model)
-                    assignments = soft_cluster_assignments(
-                        coordinates,
-                        symphony_state,
-                    )
-                    stop = block.row_offset + len(coordinates)
-                    informative = ~zero_norm_rows(coordinates)
-                    if informative.any():
-                        accumulate_sufficient_statistics(
-                            counts,
-                            sums,
-                            coordinates[informative],
-                            assignments[informative],
-                            batch_codes[block.row_offset : stop][informative],
-                        )
-                    expected_start = stop
-                if expected_start != n_cells:
-                    raise RuntimeError(
-                        "Symphony statistics did not cover all query cells"
-                    )
-                correction = solve_query_correction(
-                    counts,
-                    sums,
-                    symphony_state,
-                )
+        dispersion_total = 0.0
+        informative_total = 0
+        zero_norm_count = 0
 
-            zero_norm_count = 0
+        def projected_blocks() -> Generator[tuple[int, np.ndarray], None, None]:
+            nonlocal dispersion_total, informative_total, zero_norm_count
             expected_start = 0
-            dispersion_total = 0.0
-            informative_total = 0
             for block in stream:
                 if block.row_offset != expected_start:
                     raise RuntimeError("Aligned query blocks are not contiguous")
@@ -452,10 +445,63 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 informative = ~uninformative
                 if informative.any():
                     dispersion_total += scaled_dispersion_sum(
-                        block.values[informative],
-                        reference.model,
+                        block.values[informative], reference.model
                     )
                     informative_total += int(np.count_nonzero(informative))
+                expected_start += len(coordinates)
+                yield block.row_offset, coordinates
+            if expected_start != n_cells:
+                raise RuntimeError("Mapping did not cover all selected query cells")
+
+        coordinates_file: BinaryIO | None = None
+        try:
+            neighbor_query = _load_reference_neighbor_query(
+                reference,
+                save_k=save_k,
+                workers=self.resources.workers,
+            )
+            coordinate_blocks = projected_blocks()
+            if symphony_state is not None:
+                assert batch_codes is not None
+                coordinates_file = TemporaryFile()
+                counts, sums = initialize_sufficient_statistics(
+                    n_batches,
+                    symphony_state,
+                )
+                for row_offset, coordinates in coordinate_blocks:
+                    coordinates.tofile(coordinates_file)
+                    assignments = soft_cluster_assignments(
+                        coordinates,
+                        symphony_state,
+                    )
+                    stop = row_offset + len(coordinates)
+                    informative = ~zero_norm_rows(coordinates)
+                    if informative.any():
+                        accumulate_sufficient_statistics(
+                            counts,
+                            sums,
+                            coordinates[informative],
+                            assignments[informative],
+                            batch_codes[row_offset:stop][informative],
+                        )
+                correction = solve_query_correction(
+                    counts,
+                    sums,
+                    symphony_state,
+                    batch_design=batch_design,
+                )
+                coordinate_blocks = _read_projected_blocks(
+                    coordinates_file,
+                    n_cells=n_cells,
+                    n_dims=reference.model.n_dims,
+                    block_rows=stream.row_geometry.block_rows,
+                )
+
+            expected_start = 0
+            for row_offset, coordinates in coordinate_blocks:
+                if row_offset != expected_start:
+                    raise RuntimeError("Projected query blocks are not contiguous")
+                uninformative = zero_norm_rows(coordinates)
                 query_coordinates = coordinates
                 if symphony_state is not None:
                     assert batch_codes is not None
@@ -463,11 +509,11 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                         coordinates,
                         symphony_state,
                     )
-                    stop = block.row_offset + len(coordinates)
+                    stop = row_offset + len(coordinates)
                     query_coordinates = apply_query_correction(
                         coordinates,
                         assignments,
-                        batch_codes[block.row_offset : stop],
+                        batch_codes[row_offset:stop],
                         symphony_state,
                         correction,
                     )
@@ -478,12 +524,12 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 )
                 indices, distances = queried
                 writer.write_block(
-                    block.row_offset,
+                    row_offset,
                     np.asarray(indices, dtype=np.uint64),
                     np.asarray(distances, dtype=np.float64),
                     np.asarray(uninformative, dtype=bool),
                 )
-                expected_start = block.row_offset + len(coordinates)
+                expected_start = row_offset + len(coordinates)
             if expected_start != n_cells:
                 raise RuntimeError("Mapping did not cover all selected query cells")
             if (
@@ -519,12 +565,15 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             if not writer.finished:
                 writer.abort()
             raise
+        finally:
+            if coordinates_file is not None:
+                coordinates_file.close()
         return projection_plan.ref
 
     @staticmethod
-    def _query_batch_codes(
+    def _query_batch_design(
         query_batches: pd.DataFrame, n_cells: int
-    ) -> tuple[np.ndarray, int]:
+    ) -> tuple[np.ndarray, csr_matrix]:
         if len(query_batches) != n_cells:
             raise ValueError("query_batches must have one row per selected query cell")
         if query_batches.shape[1] == 0:
@@ -538,62 +587,25 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         resolved = np.asarray(codes, dtype=np.int64)
         if np.any(resolved < 0):
             raise ValueError("query_batches contain an unencodable row")
-        return resolved, len(levels)
-
-    @staticmethod
-    def _label_vote_decision(
-        reference_labels: np.ndarray,
-        neighbors: np.ndarray,
-        weights: np.ndarray,
-        threshold_fraction: float,
-        na_val: str,
-        force_unknown: bool = False,
-        reference_label_valid: np.ndarray | None = None,
-    ) -> tuple[Any, float, float, float, bool, dict[Any, float]]:
-        if reference_label_valid is not None and reference_label_valid.shape != (
-            len(reference_labels),
-        ):
-            raise ValueError("reference label validity must align with labels")
-        votes: dict[Any, float] = {}
-        for neighbor, weight in zip(neighbors, weights):
-            if (
-                reference_label_valid is not None
-                and not reference_label_valid[neighbor]
-            ):
-                continue
-            label = reference_labels[neighbor]
-            votes[label] = votes.get(label, 0.0) + float(weight)
-        labeled_total = float(sum(votes.values()))
-        if labeled_total <= 0 or not votes:
-            return na_val, 0.0, 0.0, 0.0, True, {}
-        total = (
-            float(np.sum(weights, dtype=np.float64))
-            if reference_label_valid is not None
-            else labeled_total
+        n_groups = len(levels)
+        n_variables = query_batches.shape[1]
+        columns = np.empty((n_groups, n_variables), dtype=np.int64)
+        n_terms = 0
+        for variable in range(n_variables):
+            variable_codes, categories = pd.factorize(
+                levels.get_level_values(variable), sort=False
+            )
+            columns[:, variable] = variable_codes + n_terms
+            n_terms += len(categories)
+        design = csr_matrix(
+            (
+                np.ones(columns.size, dtype=np.float64),
+                columns.ravel(),
+                np.arange(n_groups + 1, dtype=np.int64) * n_variables,
+            ),
+            shape=(n_groups, n_terms),
         )
-        if total <= 0:
-            return na_val, 0.0, 0.0, 0.0, True, {}
-        conditional_votes = {
-            label: value / labeled_total for label, value in votes.items()
-        }
-        votes = {label: value / total for label, value in votes.items()}
-        ordered = sorted(votes.items(), key=lambda item: item[1], reverse=True)
-        top_vote = ordered[0][1]
-        second_vote = ordered[1][1] if len(ordered) > 1 else 0.0
-        winners = [label for label, vote in ordered if np.isclose(vote, top_vote)]
-        is_unknown = force_unknown or top_vote < threshold_fraction or len(winners) != 1
-        entropy = -sum(
-            value * np.log(value) for value in conditional_votes.values() if value > 0
-        )
-        prediction = na_val if is_unknown else winners[0]
-        return (
-            prediction,
-            top_vote,
-            float(entropy),
-            top_vote - second_vote,
-            is_unknown,
-            votes,
-        )
+        return resolved, design
 
     def get_mapping_result(
         self,
@@ -628,6 +640,63 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         fixed_weight: float = 0.1,
     ) -> Generator[tuple[Any, np.ndarray], None, None]:
         """Yield reference-sized mapping scores for each requested query group."""
+        loaded = self.get_mapping_result(result, reference=reference, load_arrays=False)
+        yield from self._mapping_scores(
+            loaded,
+            target_groups=target_groups,
+            log_transform=log_transform,
+            multiplier=multiplier,
+            weighted=weighted,
+            fixed_weight=fixed_weight,
+        )
+
+    def _mapping_score_data(
+        self,
+        result: ArtifactRef,
+        *,
+        reference: MappingReference,
+        target_groups: np.ndarray | None = None,
+        layout: ArtifactRef | None = None,
+        reference_class_group: str | None = None,
+        log_transform: bool = True,
+        multiplier: float = 1000,
+        weighted: bool = True,
+        fixed_weight: float = 0.1,
+    ) -> tuple[
+        MappingResult,
+        list[tuple[Any, np.ndarray]],
+        np.ndarray | None,
+        np.ndarray | None,
+    ]:
+        loaded = self.get_mapping_result(result, reference=reference, load_arrays=False)
+        scores = list(
+            self._mapping_scores(
+                loaded,
+                target_groups=target_groups,
+                log_transform=log_transform,
+                multiplier=multiplier,
+                weighted=weighted,
+                fixed_weight=fixed_weight,
+            )
+        )
+        classes = None
+        if reference_class_group is not None:
+            classes, _ = loaded.reference._selected_cell_values(
+                reference_class_group, validate_binding=False
+            )
+        coordinates = None if layout is None else loaded.reference._fetch_layout(layout)
+        return loaded, scores, classes, coordinates
+
+    def _mapping_scores(
+        self,
+        loaded: MappingResult,
+        *,
+        target_groups: np.ndarray | None,
+        log_transform: bool,
+        multiplier: float,
+        weighted: bool,
+        fixed_weight: float,
+    ) -> Generator[tuple[Any, np.ndarray], None, None]:
         if not isinstance(log_transform, bool):
             raise TypeError("log_transform must be a boolean")
         if not isinstance(weighted, bool):
@@ -644,11 +713,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             low_open=True,
         )
 
-        loaded = self.get_mapping_result(
-            result,
-            reference=reference,
-            load_arrays=False,
-        )
         indices, distances, uninformative = self._projection_arrays(loaded.ref)
         n_cells = loaded.n_cells
         n_k = int(indices.shape[1])
@@ -709,6 +773,47 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 score = np.log1p(score)
             yield group, score
 
+    @staticmethod
+    def _reference_label_codes(
+        reference: MappingReference, column: str
+    ) -> tuple[np.ndarray, np.ndarray]:
+        labels, valid = reference._fetch_cell_labels(column)
+        codes = np.full(len(labels), -1, dtype=np.int64)
+        valid_codes, categories = pd.factorize(labels[valid], sort=False)
+        codes[valid] = valid_codes
+        return np.asarray(categories, dtype=object), codes
+
+    def _iter_label_votes(
+        self,
+        loaded: MappingResult,
+        reference_codes: np.ndarray,
+        threshold: float,
+        selected_rows: np.ndarray | None = None,
+    ) -> Generator[tuple[np.ndarray, np.ndarray, _LabelVotes], None, None]:
+        indices, distances, uninformative = self._projection_arrays(loaded.ref)
+        block_size = self._projection_block_size(indices)
+        for start in range(0, loaded.n_cells, block_size):
+            stop = min(start + block_size, loaded.n_cells)
+            if selected_rows is None:
+                offsets = np.arange(stop - start)
+            else:
+                left, right = np.searchsorted(selected_rows, (start, stop))
+                offsets = selected_rows[left:right] - start
+            if not offsets.size:
+                continue
+            block_uninformative = np.asarray(uninformative[start:stop], dtype=bool)
+            offsets = offsets[~block_uninformative[offsets]]
+            if not offsets.size:
+                continue
+            block_indices = np.asarray(indices[start:stop])[offsets]
+            block_distances = np.asarray(distances[start:stop])[offsets]
+            votes = _label_vote_block(
+                reference_codes[block_indices],
+                distance_weights(block_distances),
+                threshold,
+            )
+            yield start + offsets, block_distances[:, 0], votes
+
     def get_target_classes(
         self,
         result: ArtifactRef,
@@ -736,9 +841,8 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             reference=reference,
             load_arrays=False,
         )
-        indices, distances, uninformative = self._projection_arrays(loaded.ref)
-        reference_labels, reference_label_valid = loaded.reference._fetch_cell_labels(
-            reference_class_group
+        class_labels, reference_codes = self._reference_label_codes(
+            loaded.reference, reference_class_group
         )
 
         target_subset_set: dict[int, None] | None = None
@@ -757,61 +861,19 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                     raise ValueError("target_subset contains an out-of-range index")
                 target_subset_set[resolved_index] = None
 
-        from ...mapping.confidence import distance_weights
-
-        preds: list[Any] = []
-        prediction_indices: list[int] = []
-        block_size = self._projection_block_size(indices)
-        for start in range(0, loaded.n_cells, block_size):
-            stop = min(start + block_size, loaded.n_cells)
-            if target_subset_set is None:
-                selected_offsets = np.arange(stop - start, dtype=np.intp)
-            else:
-                selected_offsets = np.asarray(
-                    [
-                        offset
-                        for offset in range(stop - start)
-                        if start + offset in target_subset_set
-                    ],
-                    dtype=np.intp,
-                )
-            if not selected_offsets.size:
-                continue
-            block_uninformative = np.asarray(
-                uninformative[start:stop],
-                dtype=bool,
-            )
-            selected_uninformative = block_uninformative[selected_offsets]
-            informative_offsets = selected_offsets[~selected_uninformative]
-            informative_neighbors: np.ndarray | None = None
-            informative_weights: np.ndarray | None = None
-            if informative_offsets.size:
-                informative_neighbors = np.asarray(indices[start:stop])[
-                    informative_offsets
-                ]
-                informative_weights = distance_weights(
-                    np.asarray(distances[start:stop])[informative_offsets]
-                )
-            informative_position = 0
-            for selected_position, offset in enumerate(selected_offsets):
-                row_index = start + int(offset)
-                if selected_uninformative[selected_position]:
-                    prediction = na_val
-                else:
-                    assert informative_neighbors is not None
-                    assert informative_weights is not None
-                    prediction, _, _, _, _, _ = self._label_vote_decision(
-                        reference_labels,
-                        informative_neighbors[informative_position],
-                        informative_weights[informative_position],
-                        threshold,
-                        na_val,
-                        reference_label_valid=reference_label_valid,
-                    )
-                    informative_position += 1
-                preds.append(prediction)
-                prediction_indices.append(row_index)
-        return pd.Series(preds, index=prediction_indices)
+        selected_rows = (
+            np.arange(loaded.n_cells, dtype=np.int64)
+            if target_subset_set is None
+            else np.asarray(sorted(target_subset_set), dtype=np.int64)
+        )
+        predictions = np.full(len(selected_rows), na_val, dtype=object)
+        for rows, _distances, votes in self._iter_label_votes(
+            loaded, reference_codes, threshold, selected_rows
+        ):
+            known = ~votes.is_unknown
+            positions = np.searchsorted(selected_rows, rows[known])
+            predictions[positions] = class_labels[votes.prediction_codes[known]]
+        return pd.Series(predictions.tolist(), index=selected_rows)
 
     def get_target_label_evidence(
         self,
@@ -855,22 +917,13 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             reference=reference,
             load_arrays=False,
         )
-        indices, distances, uninformative = self._projection_arrays(loaded.ref)
-        reference_labels, reference_label_valid = loaded.reference._fetch_cell_labels(
-            reference_class_group
+        class_labels, reference_codes = self._reference_label_codes(
+            loaded.reference, reference_class_group
         )
-        class_labels = np.asarray(
-            pd.unique(reference_labels[reference_label_valid]),
-            dtype=object,
-        )
-        class_positions = {
-            label: position for position, label in enumerate(class_labels)
-        }
 
         from ...mapping.confidence import (
             _conformal_membership,
             _validated_conformal_calibration,
-            distance_weights,
         )
 
         prepared_calibration: np.ndarray | None = None
@@ -892,57 +945,31 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             [()] * loaded.n_cells if prepared_calibration is not None else None
         )
         is_unknown = np.ones(loaded.n_cells, dtype=bool)
-        block_size = self._projection_block_size(indices)
-        for start in range(0, loaded.n_cells, block_size):
-            stop = min(start + block_size, loaded.n_cells)
-            block_uninformative = np.asarray(
-                uninformative[start:stop],
-                dtype=bool,
-            )
-            informative_offsets = np.flatnonzero(~block_uninformative)
-            if not informative_offsets.size:
-                continue
-            block_indices = np.asarray(indices[start:stop])[informative_offsets]
-            block_distances = np.asarray(distances[start:stop])[informative_offsets]
-            block_weights = distance_weights(block_distances)
-            for position, offset in enumerate(informative_offsets):
-                row_index = start + int(offset)
-                (
-                    prediction,
-                    top_vote,
-                    entropy,
-                    margin,
-                    row_unknown,
-                    votes,
-                ) = self._label_vote_decision(
-                    reference_labels,
-                    block_indices[position],
-                    block_weights[position],
-                    threshold,
-                    na_val,
-                    reference_label_valid=reference_label_valid,
-                )
-                best_distance = float(block_distances[position, 0])
-                if distance_limit is not None and best_distance > distance_limit:
-                    prediction = na_val
-                    row_unknown = True
-                predictions[row_index] = prediction
-                vote_fraction[row_index] = top_vote
-                vote_entropy[row_index] = entropy
-                top_two_margin[row_index] = margin
-                best_distances[row_index] = best_distance
-                is_unknown[row_index] = row_unknown
-                if prediction_sets is not None and votes:
-                    assert prepared_calibration is not None
+        for rows, distances, votes in self._iter_label_votes(
+            loaded, reference_codes, threshold
+        ):
+            unknown = votes.is_unknown.copy()
+            if distance_limit is not None:
+                unknown |= distances > distance_limit
+            known = ~unknown
+            predictions[rows[known]] = class_labels[votes.prediction_codes[known]]
+            vote_fraction[rows] = votes.vote_fraction
+            vote_entropy[rows] = votes.vote_entropy
+            top_two_margin[rows] = votes.top_two_margin
+            best_distances[rows] = distances
+            is_unknown[rows] = unknown
+            if prediction_sets is not None:
+                assert prepared_calibration is not None
+                for position in np.flatnonzero(votes.vote_fraction > 0):
                     label_scores = np.zeros(len(class_labels), dtype=np.float64)
-                    for label, score in votes.items():
-                        label_scores[class_positions[label]] = score
+                    valid = votes.class_codes[position] >= 0
+                    label_scores[votes.class_codes[position, valid]] = votes.fractions[
+                        position, valid
+                    ]
                     prediction_mask = _conformal_membership(
-                        label_scores,
-                        prepared_calibration,
-                        resolved_conformal_alpha,
+                        label_scores, prepared_calibration, resolved_conformal_alpha
                     )
-                    prediction_sets[row_index] = tuple(
+                    prediction_sets[int(rows[position])] = tuple(
                         class_labels[prediction_mask].tolist()
                     )
 

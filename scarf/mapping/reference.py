@@ -222,6 +222,9 @@ class MappingReference:
         from .artifact import validate_mapping_reference_binding
 
         validate_mapping_reference_binding(self)
+        return self._fetch_layout(layout)
+
+    def _fetch_layout(self, layout: ArtifactRef) -> np.ndarray:
         self.validate_dataset_fingerprint()
         self.validate_frozen_axes()
         if not isinstance(layout, ArtifactRef):

@@ -68,8 +68,27 @@ def test_sampling_is_deterministic_stratified_and_shared():
     ).all()
 
 
+def test_stratified_grouping_preserves_first_seen_label_order():
+    from scarf.metrics.cluster_separability import _stratified_sample_indices
+
+    labels = np.array(["z"] * 8 + ["a"] * 5 + ["m"] * 3)
+    rng = np.random.default_rng(91)
+    expected = np.sort(
+        np.concatenate(
+            [
+                rng.choice(np.flatnonzero(labels == label), size=quota, replace=False)
+                for label, quota in (("z", 4), ("a", 3), ("m", 1))
+            ]
+        )
+    )
+    np.testing.assert_array_equal(
+        _stratified_sample_indices(labels, 8, np.random.default_rng(91)), expected
+    )
+
+
 def test_scores_are_held_out_and_cover_every_sampled_cell():
     from sklearn.metrics import f1_score
+    from sklearn.model_selection import StratifiedKFold, cross_val_score
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
     from sklearn.svm import LinearSVC
@@ -106,6 +125,15 @@ def test_scores_are_held_out_and_cover_every_sampled_cell():
     assert score["macro_f1_mean"] < 0.5
     assert result.confusion["n_cells"].sum() == len(labels)
     assert result.cluster_scores["n_sampled_cells"].sum() == len(labels)
+    fold_scores = cross_val_score(
+        in_sample,
+        coordinates,
+        labels,
+        cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=4444),
+        scoring="f1_macro",
+    )
+    assert "macro_f1_standard_error" not in result.clustering_scores
+    assert score["macro_f1_fold_sd"] == pytest.approx(np.std(fold_scores, ddof=1))
 
 
 def test_separable_labels_score_higher_than_overlapping_labels():

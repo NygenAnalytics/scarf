@@ -3,6 +3,7 @@
 from typing import cast
 
 import numpy as np
+from scipy.sparse import csr_matrix, eye
 
 from .models import (
     QueryCorrection,
@@ -112,40 +113,59 @@ def solve_query_correction(
     counts: np.ndarray,
     sums: np.ndarray,
     model: SymphonyCorrectionModel,
+    *,
+    batch_design: csr_matrix | None = None,
 ) -> QueryCorrection:
-    """Fit Symphony's joint cluster-aware query batch correction."""
+    """Fit additive batch effects; design rows correspond to statistic groups."""
     if counts.ndim != 2 or counts.shape[1] != model.n_clusters:
         raise ValueError("Query count statistics have incompatible dimensions")
     if sums.shape != (counts.shape[0], model.n_clusters, model.n_dims):
         raise ValueError("Query sum statistics have incompatible dimensions")
     n_batches = counts.shape[0]
+    if batch_design is None:
+        batch_design = eye(n_batches, format="csr", dtype=np.float64)
+    if not isinstance(batch_design, csr_matrix):
+        raise TypeError("Query batch design must be a CSR indicator matrix")
+    if (
+        batch_design.shape[0] != n_batches
+        or batch_design.shape[1] < 1
+        or not batch_design.has_canonical_format
+        or np.any(np.diff(batch_design.indptr) == 0)
+        or np.any(batch_design.data != 1)
+    ):
+        raise ValueError("Query batch design must contain indicators for every group")
+    n_terms = batch_design.shape[1]
     offsets = np.zeros_like(sums)
     for cluster in range(model.n_clusters):
         cluster_counts = counts[:, cluster]
         design_crossproduct = np.zeros(
-            (n_batches + 1, n_batches + 1),
+            (n_terms + 1, n_terms + 1),
             dtype=np.float64,
         )
         design_crossproduct[0, 0] = cluster_counts.sum() + model.cluster_mass[cluster]
-        design_crossproduct[0, 1:] = cluster_counts
-        design_crossproduct[1:, 0] = cluster_counts
-        design_crossproduct[1:, 1:] = np.diag(cluster_counts + 1.0)
+        design_crossproduct[0, 1:] = batch_design.T @ cluster_counts
+        design_crossproduct[1:, 0] = design_crossproduct[0, 1:]
+        design_crossproduct[1:, 1:] = (
+            batch_design.T @ batch_design.multiply(cluster_counts[:, None])
+        ).toarray()
+        diagonal = np.arange(1, n_terms + 1)
+        design_crossproduct[diagonal, diagonal] += 1.0
 
         coordinate_crossproduct = np.empty(
-            (n_batches + 1, model.n_dims),
+            (n_terms + 1, model.n_dims),
             dtype=np.float64,
         )
         coordinate_crossproduct[0] = (
             sums[:, cluster].sum(axis=0)
             + model.cluster_mass[cluster] * model.corrected_centroids[cluster]
         )
-        coordinate_crossproduct[1:] = sums[:, cluster]
+        coordinate_crossproduct[1:] = batch_design.T @ sums[:, cluster]
         coefficients = np.linalg.solve(
             design_crossproduct,
             coordinate_crossproduct,
         )
-        offsets[:, cluster] = coefficients[1:]
-    return QueryCorrection(batch_offsets=offsets, batch_counts=counts.copy())
+        offsets[:, cluster] = batch_design @ coefficients[1:]
+    return QueryCorrection(batch_offsets=offsets, batch_counts=counts)
 
 
 def apply_query_correction(

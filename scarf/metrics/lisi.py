@@ -11,11 +11,13 @@ from ._types import ZarrArray
 _LISI_BATCH_SIZE = 10_000
 
 
-def _effective_perplexity(perplexity: float, n_neighbors: int) -> float:
-    if not np.isfinite(perplexity) or perplexity < 1:
-        raise ValueError("Perplexity must be a finite value greater than or equal to 1")
+def _effective_perplexity(perplexity: float | None, n_neighbors: int) -> float:
     if n_neighbors < 3:
         raise ValueError("LISI requires at least three neighbors per cell")
+    if perplexity is None:
+        return float(n_neighbors // 3)
+    if not np.isfinite(perplexity) or perplexity < 1:
+        raise ValueError("Perplexity must be a finite value greater than or equal to 1")
 
     max_perplexity = n_neighbors / 3
     if perplexity > max_perplexity:
@@ -114,7 +116,7 @@ def compute_lisi(
     indices: np.ndarray | ZarrArray,
     metadata: pd.DataFrame,
     label_colnames: Iterable[str],
-    perplexity: float = 30,
+    perplexity: float | None = None,
 ) -> np.ndarray:
     """Compute the Local Inverse Simpson Index (LISI) for each column in metadata.
 
@@ -126,7 +128,7 @@ def compute_lisi(
         indices: Pre-computed nearest neighbor indices, stored in zarr array format
         metadata: DataFrame containing categorical labels for each cell
         label_colnames: Column names in metadata to compute LISI for
-        perplexity: Parameter controlling the effective number of neighbors (default: 30)
+        perplexity: Effective neighborhood size; None uses floor(neighbor count / 3).
 
     Returns:
         np.ndarray: Matrix of LISI scores with shape (n_cells, n_labels)
@@ -220,16 +222,13 @@ def _lisi_knn_summary(
     if n_categories < 2:
         raise ValueError(f"{label_name} LISI requires at least two categories")
 
-    resolved_perplexity = (
-        float(np.floor(n_neighbors / 3)) if perplexity is None else perplexity
-    )
     metadata = pd.DataFrame({"labels": categorical})
     per_cell = compute_lisi(
         distances,
         indices,
         metadata,
         ["labels"],
-        perplexity=resolved_perplexity,
+        perplexity=perplexity,
     )[:, 0]
     summary = float(np.nanmedian(per_cell))
     if not scale:

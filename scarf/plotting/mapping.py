@@ -7,7 +7,6 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from ..mapping.models import MappingResult
 from ..mapping.reference import MappingReference
 from ..storage.refs import ArtifactRef
 from ._contracts import (
@@ -30,31 +29,12 @@ from ._style import (
 )
 
 
-def _mapping_result(
-    store: Any,
-    result: ArtifactRef,
-    *,
-    reference: MappingReference,
-) -> MappingResult:
-    loader = getattr(store, "get_mapping_result", None)
-    if not callable(loader):
-        raise TypeError("store does not provide mapping result data")
-    loaded = loader(
-        result,
-        reference=reference,
-        load_arrays=False,
-    )
-    if not isinstance(loaded, MappingResult):
-        raise TypeError("store returned an invalid mapping result")
-    return loaded
-
-
 def _reference_layout(
-    reference: MappingReference,
-    layout: ArtifactRef,
+    coordinates: np.ndarray,
+    n_cells: int,
 ) -> np.ndarray:
-    values = np.asarray(reference.fetch_layout(layout), dtype=np.float64)
-    if values.shape != (reference.selected_cell_count, 2):
+    values = np.asarray(coordinates, dtype=np.float64)
+    if values.shape != (n_cells, 2):
         raise ValueError(
             "Reference layout must have two columns and one row per selected "
             "reference cell"
@@ -166,26 +146,23 @@ def mapping_score(
         raise ValueError("size_by_score is only supported for kind='embedding'")
     if bins < 1:
         raise ValueError("bins must be positive")
-    mapping = _mapping_result(
-        store,
-        result,
-        reference=reference,
-    )
-    score_loader = getattr(store, "get_mapping_score", None)
+    if reference_class_group is not None and (
+        not isinstance(reference_class_group, str) or not reference_class_group
+    ):
+        raise TypeError("reference_class_group must be a non-empty string")
+    score_loader = getattr(store, "_mapping_score_data", None)
     if not callable(score_loader):
         raise TypeError("store does not provide mapping score data")
-    score_rows = list(
-        score_loader(
-            result,
-            target_groups=(
-                None if target_groups is None else np.asarray(target_groups)
-            ),
-            reference=reference,
-            log_transform=log_transform,
-            multiplier=multiplier,
-            weighted=weighted,
-            fixed_weight=fixed_weight,
-        )
+    mapping, score_rows, reference_classes, layout_values = score_loader(
+        result,
+        target_groups=(None if target_groups is None else np.asarray(target_groups)),
+        reference=reference,
+        layout=layout if kind == "embedding" else None,
+        reference_class_group=reference_class_group,
+        log_transform=log_transform,
+        multiplier=multiplier,
+        weighted=weighted,
+        fixed_weight=fixed_weight,
     )
     if not score_rows:
         raise ValueError("Mapping produced no score groups")
@@ -199,14 +176,8 @@ def mapping_score(
         raise ValueError("Mapping score groups have incompatible lengths")
     if n_reference != mapping.reference.selected_cell_count:
         raise ValueError("Mapping scores do not match the selected reference cells")
-    reference_classes: np.ndarray | None = None
-    if reference_class_group is not None:
-        if not isinstance(reference_class_group, str) or not reference_class_group:
-            raise TypeError("reference_class_group must be a non-empty string")
-        reference_classes = np.asarray(
-            mapping.reference.fetch_cell_column(reference_class_group),
-            dtype=object,
-        )
+    if reference_classes is not None:
+        reference_classes = np.asarray(reference_classes, dtype=object)
         if reference_classes.shape != (n_reference,):
             raise ValueError(
                 "Reference class labels must contain one value per reference cell"
@@ -249,8 +220,8 @@ def mapping_score(
             figsize=figsize,
         )
         if kind == "embedding":
-            assert layout is not None
-            layout_values = _reference_layout(mapping.reference, layout)
+            assert layout_values is not None
+            layout_values = _reference_layout(layout_values, n_reference)
             x = layout_values[:, 0]
             y = layout_values[:, 1]
             xlim, ylim = _axis_limits(x, y)
@@ -510,11 +481,6 @@ def mapping_evidence(
         raise ValueError("kind must be 'histogram' or 'box'")
     if bins < 1:
         raise ValueError("bins must be positive")
-    mapping = _mapping_result(
-        store,
-        result,
-        reference=reference,
-    )
     evidence = _label_evidence(
         store,
         result,
@@ -613,7 +579,7 @@ def mapping_evidence(
         legends=tuple(legend_specs),
         scales=(resolved_categorical,),
         provenance=PlotProvenance(
-            assay=mapping.ref.assay,
+            assay=result.assay,
             cell_key=None,
             n_cells=len(evidence),
             renderer="matplotlib",
@@ -656,11 +622,6 @@ def mapping_confusion(
     """Plot known query labels against transferred labels."""
     if normalize not in ("none", "true", "predicted", "all"):
         raise ValueError("normalize must be 'none', 'true', 'predicted', or 'all'")
-    mapping = _mapping_result(
-        store,
-        result,
-        reference=reference,
-    )
     evidence = _label_evidence(
         store,
         result,
@@ -792,7 +753,7 @@ def mapping_confusion(
         ),
         scales=(color_scale,),
         provenance=PlotProvenance(
-            assay=mapping.ref.assay,
+            assay=result.assay,
             cell_key=None,
             n_cells=int(valid.sum()),
             renderer="matplotlib",
@@ -852,11 +813,6 @@ def mapping_calibration(
             )
     else:
         resolved_direction = direction
-    mapping = _mapping_result(
-        store,
-        result,
-        reference=reference,
-    )
     evidence = _label_evidence(
         store,
         result,
@@ -1044,7 +1000,7 @@ def mapping_calibration(
         legends=(),
         scales=(),
         provenance=PlotProvenance(
-            assay=mapping.ref.assay,
+            assay=result.assay,
             cell_key=None,
             n_cells=int(valid.sum()),
             renderer="matplotlib",

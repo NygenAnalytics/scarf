@@ -905,6 +905,23 @@ def test_custom_leiden_uses_only_the_requested_candidate_set(
 def test_cluster_selection_records_invalid_candidates_ties_and_reuse(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import scarf.datastore._pipeline_cluster_selection as selection_store
+    import scarf.metrics.cluster_selection as selection_metrics
+
+    sample_calls = 0
+    original_sample = selection_metrics.shared_cluster_quota_sample_indices
+
+    def observe_sample(*args, **kwargs):
+        nonlocal sample_calls
+        sample_calls += 1
+        return original_sample(*args, **kwargs)
+
+    monkeypatch.setattr(
+        selection_store, "shared_cluster_quota_sample_indices", observe_sample
+    )
+    monkeypatch.setattr(
+        selection_metrics, "shared_cluster_quota_sample_indices", observe_sample
+    )
     root = zarr.open_group(store=MemoryStore(), mode="w")
     store = _ClusterSelectionStore(root)
     coordinates = np.asarray(
@@ -946,6 +963,7 @@ def test_cluster_selection_records_invalid_candidates_ties_and_reuse(
     candidates = (("invalid", invalid), ("first", first), ("second", second))
 
     decision, selected_key, selected = _select_clusters(store, lineage, candidates)
+    assert sample_calls == 1
     group = artifact_group(root, decision)
     assert selected_key == "first"
     assert selected == first
@@ -956,6 +974,7 @@ def test_cluster_selection_records_invalid_candidates_ties_and_reuse(
     np.testing.assert_allclose(group["scores"][:], [np.nan, 0.25, 0.25])
 
     reused, reused_key, reused_selected = _select_clusters(store, lineage, candidates)
+    assert sample_calls == 2
     assert reused == decision
     assert reused_key == selected_key
     assert reused_selected == selected

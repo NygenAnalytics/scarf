@@ -12,11 +12,9 @@ from scarf.mapping.artifact import (
     _reference_available_k,
     load_artifact_mapping_reference,
     validate_mapping_reference_sources,
-    write_artifact_mapping_reference,
-)
-from scarf.mapping.models import (
-    ScaledPCAProjectionModel,
-    SymphonyCorrectionModel,
+    write_artifact_mapping_reference_from_sources,
+    mapping_reference_payload_matches_sources,
+    mapping_reference_source_fingerprint,
 )
 from scarf.storage.artifact_writer import finish_artifact, plan_artifact, start_artifact
 from scarf.storage.ann_index import ANN_INDEX_ARRAY
@@ -450,43 +448,57 @@ def test_load_rejects_metadata_model_and_payload_tampering(
     group.attrs["reference_metadata"] = original_metadata
 
 
-def test_write_artifact_mapping_reference_persists_required_pca_arrays() -> None:
+def _reference_source_arrays(root, *, symphony=False):
+    source_group = root.create_group("sources")
+    arrays = {
+        name: source_group.create_array(name, data=values)
+        for name, values in {
+            "feature_means": np.zeros(2),
+            "feature_scales": np.ones(2),
+            "center": np.zeros(2),
+            "loadings": np.eye(2),
+        }.items()
+    }
+    arrays["symphony_sources"] = None
+    if symphony:
+        arrays["symphony_sources"] = {
+            name: source_group.create_array(name, data=values)
+            for name, values in {
+                "centroids": np.array([[1.0, 2.0], [3.0, 4.0]]),
+                "raw_centroids": np.eye(2),
+                "corrected_centroids": np.eye(2) * 2,
+                "cluster_mass": np.array([1.0, 2.0]),
+                "sigma": np.array([0.5, 1.0]),
+            }.items()
+        }
+    return arrays
+
+
+@pytest.mark.parametrize("symphony", [False, True])
+def test_mapping_reference_stream_writer_preserves_model_arrays(symphony):
     root = zarr.open_group(store=MemoryStore(), mode="w")
+    sources = _reference_source_arrays(root, symphony=symphony)
+    method = "symphony" if symphony else "pca"
     planned = plan_artifact(
         root,
         scope="assay",
         assay="RNA",
         kind="mapping_reference",
         operation="build_mapping_reference",
-        parameters={"method": "pca"},
+        parameters={"method": method},
         inputs={},
         execution_options={},
     )
     group = start_artifact(root, planned)
-    write_artifact_mapping_reference(
-        group,
-        ScaledPCAProjectionModel(
-            feature_means=np.zeros(2),
-            center=np.zeros_like(np.zeros(2)),
-            feature_scales=np.ones(2),
-            loadings=np.eye(2),
-        ),
-        None,
-        np.array(["g0", "g1"], dtype=object),
-        {
-            "assay": "RNA",
-            "method": "pca",
-            "ann_metric": "l2",
-            "dataset_fingerprint": "fp",
-            "selected_cell_count": 2,
-            "normalization_parameters": {"size_factor": 1000.0},
-        },
-        np.array([0.0, 1.0]),
-        np.array([0.1, 0.2]),
-    )
+    payload = {
+        "feature_ids": np.array(["g0", "g1"]),
+        "metadata": {"method": method},
+        "reference_distance_quantiles": np.array([0.0, 1.0]),
+        "reference_distance_values": np.array([0.1, 0.2]),
+    }
+    write_artifact_mapping_reference_from_sources(group, **sources, **payload)
     finish_artifact(group, planned)
-
-    assert set(group.array_keys()) == {
+    expected_arrays = {
         "feature_ids",
         "feature_means",
         "feature_scales",
@@ -495,92 +507,62 @@ def test_write_artifact_mapping_reference_persists_required_pca_arrays() -> None
         "reference_distance_quantiles",
         "reference_distance_values",
     }
-    assert group.attrs["reference_metadata"]["method"] == "pca"
-    assert isinstance(group.attrs["payload_fingerprint"], str)
-
-
-def test_write_artifact_mapping_reference_persists_symphony_state() -> None:
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    planned = plan_artifact(
-        root,
-        scope="assay",
-        assay="RNA",
-        kind="mapping_reference",
-        operation="build_mapping_reference",
-        parameters={"method": "symphony"},
-        inputs={},
-        execution_options={},
-    )
-    group = start_artifact(root, planned)
-    write_artifact_mapping_reference(
-        group,
-        ScaledPCAProjectionModel(
-            feature_means=np.zeros(2),
-            center=np.zeros_like(np.zeros(2)),
-            feature_scales=np.ones(2),
-            loadings=np.eye(2),
-        ),
-        SymphonyCorrectionModel(
-            centroids=np.eye(2),
-            raw_centroids=np.eye(2),
-            corrected_centroids=np.eye(2) * 2,
-            cluster_mass=np.array([1.0, 2.0]),
-            sigma=np.array([0.5, 1.0]),
-        ),
-        np.array(["g0", "g1"], dtype=object),
-        {"method": "symphony"},
-        np.array([0.0, 1.0]),
-        np.array([0.1, 0.2]),
-    )
-    finish_artifact(group, planned)
-
-    assert set(group.array_keys()) == {
-        "feature_ids",
-        "feature_means",
-        "feature_scales",
-        "center",
-        "loadings",
-        "reference_distance_quantiles",
-        "reference_distance_values",
-        "centroids",
-        "raw_centroids",
-        "corrected_centroids",
-        "cluster_mass",
-        "sigma",
-    }
-    assert isinstance(group.attrs["payload_fingerprint"], str)
-
-
-def test_write_artifact_mapping_reference_rejects_high_rank_arrays() -> None:
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    planned = plan_artifact(
-        root,
-        scope="assay",
-        assay="RNA",
-        kind="mapping_reference",
-        operation="build_mapping_reference",
-        parameters={"method": "pca"},
-        inputs={},
-        execution_options={},
-    )
-    group = start_artifact(root, planned)
-
-    with pytest.raises(ValueError, match="one or two axes"):
-        write_artifact_mapping_reference(
-            group,
-            ScaledPCAProjectionModel(
-                feature_means=np.zeros(2),
-                center=np.zeros_like(np.zeros(2)),
-                feature_scales=np.ones(2),
-                loadings=np.eye(2),
-            ),
-            None,
-            np.array(["g0", "g1"], dtype=object),
-            {"method": "pca"},
-            np.ones((1, 1, 1)),
-            np.ones(1),
+    if symphony:
+        expected_arrays.update(sources["symphony_sources"])
+        np.testing.assert_array_equal(
+            group["centroids"][:], sources["symphony_sources"]["centroids"][:].T
         )
+    assert set(group.array_keys()) == expected_arrays
+    assert group.attrs["reference_metadata"]["method"] == method
+    assert isinstance(group.attrs["payload_fingerprint"], str)
+    fingerprint = mapping_reference_source_fingerprint(**sources)
+    assert mapping_reference_payload_matches_sources(
+        group, **sources, **payload, expected_source_fingerprint=fingerprint
+    )
+    if symphony:
+        incomplete_sources = dict(
+            sources,
+            symphony_sources={"centroids": sources["symphony_sources"]["centroids"]},
+        )
+        assert not mapping_reference_payload_matches_sources(
+            group,
+            **incomplete_sources,
+            **payload,
+            expected_source_fingerprint=fingerprint,
+        )
+    group["loadings"][0, 0] += 1
+    assert not mapping_reference_payload_matches_sources(
+        group, **sources, **payload, expected_source_fingerprint=fingerprint
+    )
+    del group["loadings"]
+    assert not mapping_reference_payload_matches_sources(
+        group, **sources, **payload, expected_source_fingerprint=fingerprint
+    )
 
+
+def test_mapping_reference_stream_writer_rejects_high_rank_summaries():
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    sources = _reference_source_arrays(root)
+    planned = plan_artifact(
+        root,
+        scope="assay",
+        assay="RNA",
+        kind="mapping_reference",
+        operation="build_mapping_reference",
+        parameters={"method": "pca"},
+        inputs={},
+        execution_options={},
+    )
+    group = start_artifact(root, planned)
+    with pytest.raises(ValueError, match="one or two axes"):
+        write_artifact_mapping_reference_from_sources(
+            group,
+            **sources,
+            feature_ids=np.array(["g0", "g1"]),
+            metadata={"method": "pca"},
+            reference_distance_quantiles=np.ones((1, 1, 1)),
+            reference_distance_values=np.ones(1),
+        )
     assert not group.attrs["complete"]
 
 

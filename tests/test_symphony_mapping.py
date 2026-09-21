@@ -527,6 +527,7 @@ def test_symphony_r_0_1_3_static_golden_fixture():
         (Path(__file__).parent / "symphony_r_0_1_3_golden.json").read_text()
     )
     reference = fixture["reference"]
+    assert reference["correctionRidge"] == 1.0
     projection = ScaledPCAProjectionModel(
         feature_means=np.asarray(reference["featureMeans"]),
         center=np.zeros_like(np.asarray(reference["featureMeans"])),
@@ -568,6 +569,7 @@ def test_symphony_r_0_1_3_static_golden_fixture():
 
     nonzero = fixture["nonzeroCorrection"]
     nonzero_reference = nonzero["reference"]
+    assert nonzero_reference["correctionRidge"] == 1.0
     nonzero_projection = ScaledPCAProjectionModel(
         feature_means=np.asarray(nonzero_reference["featureMeans"]),
         center=np.zeros_like(np.asarray(nonzero_reference["featureMeans"])),
@@ -608,3 +610,77 @@ def test_symphony_r_0_1_3_static_golden_fixture():
         atol=1e-12,
     )
     assert not np.allclose(nonzero_corrected, nonzero_query)
+
+
+@pytest.mark.parametrize("n_variables", [1, 2, 3])
+def test_additive_batch_correction_matches_direct_cell_design(n_variables):
+    from scarf.datastore._operations.mapping import _MappingOperationsMixin
+
+    rng = np.random.default_rng(4466)
+    batches = pd.DataFrame(
+        {
+            "donor": np.resize(["a", "b", "c"], 31),
+            "technology": np.resize(["x", "x", "y", "y"], 31),
+            "constant": "same",
+        }
+    ).iloc[:, :n_variables]
+    codes, design = _MappingOperationsMixin._query_batch_design(batches, len(batches))
+    coordinates = rng.normal(size=(len(batches), 3))
+    assignments = rng.uniform(size=(len(batches), 2))
+    assignments /= assignments.sum(axis=1, keepdims=True)
+    model = SymphonyCorrectionModel(
+        centroids=rng.normal(size=(2, 3)),
+        raw_centroids=np.zeros((2, 3)),
+        corrected_centroids=rng.normal(size=(2, 3)),
+        cluster_mass=np.array([4.0, 9.0]),
+        sigma=np.array([0.1, 0.2]),
+    )
+    counts, sums = initialize_sufficient_statistics(design.shape[0], model)
+    for start in range(0, len(batches), 7):
+        stop = start + 7
+        accumulate_sufficient_statistics(
+            counts,
+            sums,
+            coordinates[start:stop],
+            assignments[start:stop],
+            codes[start:stop],
+        )
+    correction = solve_query_correction(counts, sums, model, batch_design=design)
+    actual = apply_query_correction(coordinates, assignments, codes, model, correction)
+
+    indicators = pd.get_dummies(batches, dtype=float).to_numpy()
+    cell_design = np.column_stack((np.ones(len(batches)), indicators))
+    expected = coordinates.copy()
+    for cluster in range(model.n_clusters):
+        weighted_design = assignments[:, cluster, None] * cell_design
+        crossproduct = cell_design.T @ weighted_design
+        crossproduct[0, 0] += model.cluster_mass[cluster]
+        crossproduct += np.diag(np.r_[0.0, np.ones(indicators.shape[1])])
+        rhs = weighted_design.T @ coordinates
+        rhs[0] += model.cluster_mass[cluster] * model.corrected_centroids[cluster]
+        coefficients = np.linalg.solve(crossproduct, rhs)
+        coefficients[0] = 0
+        expected -= weighted_design @ coefficients
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+    if n_variables == 1:
+        implicit = solve_query_correction(counts, sums, model)
+        np.testing.assert_allclose(
+            correction.batch_offsets, implicit.batch_offsets, atol=1e-12
+        )
+
+
+def test_batch_correction_rejects_invalid_designs():
+    from scipy.sparse import csr_matrix
+
+    _, model = _single_cluster_reference()
+    counts, sums = initialize_sufficient_statistics(2, model)
+    for values in (
+        np.ones((1, 2)),
+        np.zeros((2, 1)),
+        np.full((2, 1), np.nan),
+        np.full((2, 1), 0.5),
+    ):
+        with pytest.raises(ValueError, match="indicators"):
+            solve_query_correction(counts, sums, model, batch_design=csr_matrix(values))
+    with pytest.raises(TypeError, match="CSR"):
+        solve_query_correction(counts, sums, model, batch_design=np.eye(2))
