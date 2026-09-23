@@ -1,5 +1,5 @@
 ---
-description: Interpret prepared scATAC-seq clusters with GeneScore marker maps.
+description: Interpret scATAC-seq clusters with GeneScore marker maps.
 jupytext:
   formats: ipynb,md:myst
   text_representation:
@@ -12,6 +12,9 @@ kernelspec:
   language: python
   name: python3
 ---
+# sc-ATAC Seq Primer
+
+Single cell Assay for Transposase-Accessible Chromatin with sequencing (sc-ATAC seq) is a method that is used to map open and accessible chromatin regions across the entire genome (i.e. where DNA is available for transcription factors and transcription machinery). In ATAC-seq, the features of the data are the p**eaks**, which are segments of open chromatin. A good way to conceptualize this is that 1 peak is equivalent to 1 candidate regulatory element that was open in the sample. When you plot the peaks against a linear representation of the genome, you get the accessibility graph. To identify where each peak is in the genome, you require a **genomic coordinate**, which is where the peak is located on the genome. Lots of peaks at one genomic coordinate represent areas of high chromatin accessibility, vice versa for less peaks.
 
 # Identify accessibility populations with scATAC-seq
 
@@ -21,7 +24,7 @@ expensive wide-matrix reduction.
 
 ## Open the prepared ATAC result
 
-```{code-cell} ipython3
+```{code-cell}
 import scarf
 
 scarf.configure_output(level="WARNING", progress=False)
@@ -41,7 +44,7 @@ ds = scarf.DataStore(
 The prepared store contains one complete Leiden result and its linked UMAP. Exact provenance
 filters reopen them without walking the full LSI ancestry in notebook code.
 
-```{code-cell} ipython3
+```{code-cell}
 [clusters] = ds.list_artifacts(
     from_assay="ATAC",
     kind="cluster_labels",
@@ -58,7 +61,7 @@ filters reopen them without walking the full LSI ancestry in notebook code.
 
 ### Question: does the accessibility graph contain distinct populations?
 
-```{code-cell} ipython3
+```{code-cell}
 ds.plots.embedding(
     layout=umap,
     color_by=clusters,
@@ -74,7 +77,7 @@ so the next figure asks whether known lineage loci support a PBMC interpretation
 GeneScores summarize TF-IDF-normalized accessibility over gene bodies and their promoter regions.
 The downloaded BED file uses the same GRCh37 coordinate build as this peak matrix.
 
-```{code-cell} ipython3
+```{code-cell}
 annotations = scarf.cytebase.connect("scarf_docs").download_dataset(
     "annotations",
     destination="scarf_datasets",
@@ -97,7 +100,7 @@ the interpretation below relies only on the displayed loci with observed signal.
 
 ### Question: which broad lineages explain the accessibility regions?
 
-```{code-cell} ipython3
+```{code-cell}
 ds.plots.embedding(
     layout=umap,
     from_assay="GeneScores",
