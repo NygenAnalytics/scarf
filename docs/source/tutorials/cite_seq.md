@@ -80,11 +80,11 @@ ds.plots.embedding(
 )
 ```
 
-In this UMAP embedding, which is simply a 2D representation of the WNN graph, we can notice that certain groups of cell separate into distinct, well-defined clusters rather than one continous smear. This separation once again indicates that the combined RNA and protein evidence suggest distinctly resolved cellular states. But to actually identify the different cell identites, we can visualize the RNA and protein expession. 
+In this UMAP embedding, which is simply a 2D representation of the WNN graph, we can notice that certain groups of cell separate into distinct, well-defined clusters rather than one continous smear. This separation once again indicates that the combined RNA and protein evidence suggest distinctly resolved cellular states. But to actually identify the different cell identites, we can visualize the RNA and protein expession.
 
 ### Does the measured protein and RNA expression support the population structure?
 
-One important thing to consider before you visualize the protein expression is that the ADT counts rarely contain true zeros. Unbound antibodies stick nonspecifically to every droplet (background binding), so each cell carries low-level signal for every antibody. This is because every antibody is highly **specific to one sequence**, but that sequence is **not highly specific**. 
+One important thing to consider before you visualize the protein expression is that the ADT counts rarely contain true zeros. Unbound antibodies stick nonspecifically to every droplet (background binding), so each cell carries low-level signal for every antibody. This is because every antibody is highly **specific to one sequence**, but that sequence is **not highly specific**.
 
 ```{code-cell}
 protein_panel = [
@@ -110,6 +110,15 @@ To generally interpret the values on the graph, in our example, the panels with 
 
 Here, our co-expression of CD3, CD4 and CD8a on both the RNA and protein graph indicates the cluster being T-cells, with CD14 supporting regions of monocytes, CD19 supporting the regions of B cells, and CD56/NCAM1 highlighting NK-like cells. The coherent localization on the same embedding provides further evidence of identifying cell states.
 
+For further information regarding the markers chosen for our cell identification purposes, refer to resources in {doc}`annotation`.
+
+## Limits of this result
+
+- WNN combines neighbourhood evidence; it does not prove that a cluster is biologically valid.
+- Control antibodies and assay-specific normalization must be reviewed before building ADT
+  neighbours for another dataset.
+- The displayed labels remain broad interpretations of this marker panel, not an automated cell
+  ontology assignment.
 
 ## Substitute your own matched assays
 
@@ -126,11 +135,3 @@ The source refs stay explicit because choosing the assay-specific representation
 decision. Use {doc}`graph_construction` for the RNA and ADT neighbour chains,
 {doc}`multimodal_diagnostics` to compare integration behavior, and
 {doc}`../reference/api/integration` for the WNN contract.
-
-## Limits of this result
-
-- WNN combines neighbourhood evidence; it does not prove that a cluster is biologically valid.
-- Control antibodies and assay-specific normalization must be reviewed before building ADT
-  neighbours for another dataset.
-- The displayed labels remain broad interpretations of this marker panel, not an automated cell
-  ontology assignment.
