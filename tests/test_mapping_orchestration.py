@@ -1,3 +1,4 @@
+import gc
 from pathlib import Path
 import shutil
 from dataclasses import replace
@@ -5,6 +6,7 @@ from dataclasses import replace
 import numpy as np
 import pandas as pd
 import pytest
+import zarr
 
 import scarf.datastore._operations.mapping as mapping_operations
 from scarf.datastore.datastore import DataStore, mount_datastore
@@ -324,8 +326,18 @@ def test_mapping_failure_leaves_projection_incomplete(
         "_load_reference_neighbor_query",
         lambda *_args, **_kwargs: FailingNeighborQuery(),
     )
-    with pytest.raises(RuntimeError, match="injected ANN failure"):
-        query.run_mapping(reference, reference.cell_selection)
+    # Without a collection to rescue it, a stream left suspended by the failure
+    # would keep Zarr's process-wide I/O limit lowered for later work.
+    gc_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        with zarr.config.set({"async.concurrency": 37}):
+            with pytest.raises(RuntimeError, match="injected ANN failure"):
+                query.run_mapping(reference, reference.cell_selection)
+            assert zarr.config.get("async.concurrency") == 37
+    finally:
+        if gc_enabled:
+            gc.enable()
     assert len(files) == (1 if method == "symphony" else 0)
     assert all(file.closed for file in files)
 

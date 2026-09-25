@@ -1178,8 +1178,15 @@ def test_datastore_metrics_reject_malformed_metadata_missing_masks(
         None if mask_case == "non_string_link" else missing_name
     )
 
-    with pytest.raises(ValueError, match="missing-mask"):
-        datastore.metric_ilisi(column, neighbors)
+    try:
+        with pytest.raises(ValueError, match="missing-mask"):
+            datastore.metric_ilisi(column, neighbors)
+    finally:
+        # The session datastore is shared, and copying rejects this column, so
+        # remove it directly; drop() refuses a malformed missing-value link.
+        for name in (column, missing_name):
+            if name in cell_data:
+                del cell_data[name]
 
 
 def test_metric_lisi_rejects_invalid_inputs(datastore, connectivity_graph):

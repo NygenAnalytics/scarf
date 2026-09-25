@@ -1,7 +1,7 @@
 import threading
 import sys
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from typing import Any, Literal
@@ -142,7 +142,7 @@ def stream_shards(
     msg: str | None = None,
     total: int | None = None,
     backend: Backend = "thread",
-) -> Iterator[Any]:
+) -> Generator[Any, None, None]:
     """Yield transformed items in order with bounded read-ahead."""
     workers = max(1, int(workers))
     if backend == "serial" or workers <= 1 or in_shard_context():
