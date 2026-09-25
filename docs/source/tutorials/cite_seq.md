@@ -84,7 +84,7 @@ In this UMAP embedding, which is simply a 2D representation of the WNN graph, we
 
 ### Does the measured protein and RNA expression support the population structure?
 
-One important thing to consider before you visualize the protein expression is that the ADT counts rarely contain true zeros. Unbound antibodies stick nonspecifically to every droplet (background binding), so each cell carries low-level signal for every antibody. This is because every antibody is highly **specific to one sequence**, but that sequence is **not highly specific**.
+One important thing to consider before you visualize the protein expression is that the ADT counts rarely contain true zeros. Unbound antibodies stick nonspecifically to every droplet (background binding), so each cell carries low-level signal for every antibody. This is because the antibodies may get trapped in the droplet alongside cell debris, the antibodies sticking non-specificially to the cell membranes, or antibodies binding to diferent receptors that their intended. 
 
 ```{code-cell}
 protein_panel = [
@@ -106,19 +106,17 @@ ds.plots.embedding(
 )
 ```
 
-To generally interpret the values on the graph, in our example, the panels with RNA expression are log1p library-sized-normalization expression; a standarf approach for scRNA-seq data. For the protein (ADT) panels, we have centered-log-ratio normalized abundance. Higher expression on the protein panels means their is more surface protein expression releative to the background, in which the background is the extremely low values nearing zero, but neber true zero.
+To generally interpret the values on the graph, in our example, the panels with RNA expression are log1p library-sized-normalization expression; a standarf approach for scRNA-seq data. For the protein (ADT) panels, we have centered-log-ratio normalized abundance. Higher expression on the protein panels means their is more surface protein expression releative to the background, in which the background is the extremely low values nearing zero, but never truly zero.
 
-Here, our co-expression of CD3, CD4 and CD8a on both the RNA and protein graph indicates the cluster being T-cells, with CD14 supporting regions of monocytes, CD19 supporting the regions of B cells, and CD56/NCAM1 highlighting NK-like cells. The coherent localization on the same embedding provides further evidence of identifying cell states.
+Here, our co-expression of CD3 on the RNA and protein indicate the cluster likely being T-cells. Our co-expression of CD4 and CD8a helps in differentiating between subtypes of type T-cells. Genes and proteins like CD14 support regions of monocytes, while CD19 supports the regions of B cells, and CD56/NCAM1 highlights NK-like cells. The coherent localization on the same embedding provides further evidence of identifying cell states.
 
 For further information regarding the markers chosen for our cell identification purposes, refer to resources in {doc}`annotation`.
 
 ## Limits of this result
 
-- WNN combines neighbourhood evidence; it does not prove that a cluster is biologically valid.
-- Control antibodies and assay-specific normalization must be reviewed before building ADT
-  neighbours for another dataset.
-- The displayed labels remain broad interpretations of this marker panel, not an automated cell
-  ontology assignment.
+- **Panel Pre-Selection & Biological Blind Spots:** Unlike RNA-seq, which measures the whole transcriptome (~20,000 genes) without bias, CITE-seq surface protein panels are strictly targeted to a set of proteins (typically 10 to 200 antibodies). If a novel cell type or activation state is driven by a surface marker not included in your selected panel, the protein modality is completely blind to it and integration must rely solely on RNA expression.
+- **Ambient Antibodies & Non-Specific Background Binding:** ADT counts do not equal zero even in cells that do not express the protein. High ambient antibody concentrations or unblocked Fc receptors can create false-positive protein signals. Advanced workflows often require isotype controls or ambient-subtraction algorithms to adjust for technical effects like this
+- **Temporality of RNA expression vs. Protein expression:** CITE-seq is transcriptomics performed on dead cells, meaning we only capture 1 singular snapshot of the cell's state. High mRNA abundance does not guarantee high surface protein levels. Differences in translation efficiency, post-transcriptional repression, and protein half-lives mean RNA and protein operate on different biological timelines, thus why we may see differences in our data. Its important to keep this idea in mind when interpreting results, and identify if this is a question that can answer the potential observations in your data.
 
 ## Substitute your own matched assays
 
