@@ -84,16 +84,7 @@ In this UMAP embedding, which is simply a 2D representation of the WNN graph, we
 
 ### Does the measured protein and RNA expression support the population structure?
 
-One important note before you begin to 
-
-One reading rule first: ADT counts rarely contain true zeros. Unbound antibodies stick
-nonspecifically to every droplet (background binding), so each cell carries low-level signal
-for every antibody. Read relative enrichment across the map, not presence versus absence.
-
-This store uses the concise antibody labels as feature IDs, so the typed references make that
-lookup explicit while keeping the panel titles readable. Each row below pairs one protein
-(left) with its RNA counterpart (right) on the same WNN map, so dropout and background can be
-compared directly.
+One important thing to consider before you visualize the protein expression is that the ADT counts rarely contain true zeros. Unbound antibodies stick nonspecifically to every droplet (background binding), so each cell carries low-level signal for every antibody. This is because every antibody is highly **specific to one sequence**, but that sequence is **not highly specific**. 
 
 ```{code-cell}
 protein_panel = [
@@ -115,10 +106,10 @@ ds.plots.embedding(
 )
 ```
 
-CD3 with CD4 or CD8a identifies T-cell regions, CD14 supports monocytes, CD19 supports B cells,
-and CD56 highlights NK-like cells. Their coherent localization on the same WNN map provides the
-biological payoff that the cluster-only view cannot. Where RNA drops out but protein persists,
-protein rescues the assignment; where both agree, confidence is highest.
+To generally interpret the values on the graph, in our example, the panels with RNA expression are log1p library-sized-normalization expression; a standarf approach for scRNA-seq data. For the protein (ADT) panels, we have centered-log-ratio normalized abundance. Higher expression on the protein panels means their is more surface protein expression releative to the background, in which the background is the extremely low values nearing zero, but neber true zero.
+
+Here, our co-expression of CD3, CD4 and CD8a on both the RNA and protein graph indicates the cluster being T-cells, with CD14 supporting regions of monocytes, CD19 supporting the regions of B cells, and CD56/NCAM1 highlighting NK-like cells. The coherent localization on the same embedding provides further evidence of identifying cell states.
+
 
 ## Substitute your own matched assays
 
