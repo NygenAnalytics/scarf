@@ -516,3 +516,29 @@ def test_live_zarr_archive_download(tmp_path, monkeypatch):
 
     assert (dataset_path / "data.zarr.tar.gz").is_file()
     assert (dataset_path / "data.zarr").is_dir()
+
+
+def test_lazy_exports_import_and_cache_catalog_classes(monkeypatch):
+    from scarf import cytebase
+    from scarf.cytebase.catalog import Catalog
+    from scarf.cytebase.dataset import CytebaseDataset
+
+    monkeypatch.delitem(vars(cytebase), "Catalog", raising=False)
+    monkeypatch.delitem(vars(cytebase), "CytebaseDataset", raising=False)
+    assert cytebase.Catalog is Catalog
+    assert cytebase.CytebaseDataset is CytebaseDataset
+    assert vars(cytebase)["Catalog"] is Catalog
+    assert vars(cytebase)["CytebaseDataset"] is CytebaseDataset
+
+
+def test_unknown_module_attributes_raise():
+    from scarf import cytebase
+
+    with pytest.raises(AttributeError, match="has no attribute 'missing'"):
+        cytebase.missing
+
+
+def test_dir_lists_lazy_exports():
+    from scarf import cytebase
+
+    assert {"Catalog", "CytebaseDataset", "Repository", "connect"} <= set(dir(cytebase))

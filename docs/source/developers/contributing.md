@@ -42,7 +42,7 @@ For full CI parity, also run the visual regression step (or see `AGENTS.md`):
 ## Contributions to the documentation
 
 You may contribute to the documentation by either adding new sections or modifying existing sections.
-Install the documentation and test dependencies with `uv sync --extra agent --extra docs --extra test --extra extra`.
+Install the documentation and test dependencies with `uv sync --extra agent --extra docs --extra test --extra extra --extra cytebase`.
 
 Executable docs are MyST markdown files with `{code-cell}` blocks, not standalone `.ipynb` files.
 Sources live in `docs/source/quickstart.md` and `docs/source/tutorials/`.
@@ -97,6 +97,16 @@ Force every page and run a strict Sphinx build:
 2. Register it in `docs/source/toctree.yml`.
 3. Execute the page locally with `JOBS=1`, or use the optional Modal target when its environment is available.
 4. Commit the `.md` file and `docs/.jupyter_cache/`.
+
+For Cytebase, `Catalog()` defaults to the public `Nygen/cytebase` bucket. To refresh
+the development snapshot, configure `CYTEBASE_BUCKET` and Hugging Face authentication
+in the execution environment, then run `make -C docs execute-page PAGE=cytebase JOBS=1`.
+The tutorial reads the selected bucket; it does not invoke the
+ingestion pipeline or write to remote stores. Keep private connection values
+out of sources and cached outputs. Its explicit notebook download link uses
+MyST-NB's generated `docs/build/jupyter_execute/tutorials/cytebase.ipynb`, so the
+MyST source and executed cache remain the maintained tutorial. Read the Docs
+renders the matching cache without needing bucket credentials.
 
 Suggested chapter outline:
 

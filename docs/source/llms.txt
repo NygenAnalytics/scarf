@@ -47,6 +47,7 @@
 
 ## Data, remote, and scale
 
+- [Explore Cytebase](tutorials/cytebase.html): connect directly to cloud-hosted Scarf DataStores without a full dataset download; search, plot, and mount for analysis
 - [Import and export](tutorials/import_and_export.html): source formats, saved Seurat import, and output contracts
 - [Data organization](tutorials/data_organization.html): assays, cell data, feature data, and metadata
 - [Remote stores](tutorials/remote_stores.html): local mounted-store execution and an explicit object-store template
@@ -71,6 +72,7 @@
 ## Reference
 
 - [API reference](reference/api.html): exact public signatures and result contracts
+- [Cytebase API](reference/api/cytebase.html): catalog queries, remote DataStore access, dataset handles, result tables, and writable mounts with remote counts
 - [FAQ](reference/faq.html): concise method and interoperability answers
 - [Glossary](reference/glossary.html): Scarf concepts and terms
 

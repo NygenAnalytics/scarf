@@ -1,12 +1,12 @@
 """Browse and download public data from Cytebase."""
 
 import os
-from dataclasses import dataclass
-from pathlib import Path, PurePosixPath, PureWindowsPath
 import shutil
 import tarfile
 import tempfile
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import TYPE_CHECKING, Any
 
 from huggingface_hub import (
     BucketFile,
@@ -18,11 +18,32 @@ from huggingface_hub import (
 if TYPE_CHECKING:
     import zarr
 
-__all__ = ["Repository", "connect", "list_repositories"]
+    from .catalog import Catalog as Catalog
+    from .dataset import CytebaseDataset as CytebaseDataset
+
+__all__ = ["Catalog", "CytebaseDataset", "Repository", "connect", "list_repositories"]
 
 _BUCKET_ID = "Nygen/cytebase"
 _ZARR_ARCHIVE_SUFFIX = ".zarr.tar.gz"
 _LOCAL_CATALOG_ENV = "SCARF_CYTEBASE_LOCAL"
+
+
+def __getattr__(name: str) -> Any:
+    if name == "Catalog":
+        from .catalog import Catalog
+
+        globals()[name] = Catalog
+        return Catalog
+    if name == "CytebaseDataset":
+        from .dataset import CytebaseDataset
+
+        globals()[name] = CytebaseDataset
+        return CytebaseDataset
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
 
 
 def _safe_name(name: str, *, kind: str) -> str:

@@ -40,6 +40,8 @@ stage timing, configuration detail, and limitation.
   pipeline-selected clusters
 - Use {doc}`scanpy` to translate a Scanpy workflow and H5AD exchange
 - Use {doc}`seurat` to translate a Seurat workflow, RDS import, and WNN analysis
+- {doc}`Explore Cytebase <tutorials/cytebase>` to connect directly to cloud-hosted
+  Scarf DataStores without downloading a complete dataset first
 - Choose the focused {doc}`tutorials/scrna_seq`, {doc}`tutorials/scatac_seq`, or
   {doc}`tutorials/cite_seq` core workflow for your assay
 
@@ -65,6 +67,23 @@ Object storage is often used for distribution and archiving, with a full local c
 A Scarf datastore can live on local disk, S3-compatible object storage, Google Cloud Storage, or Hugging Face, and be analysed in place.
 When the source is read-only, `mount_datastore` creates a writable analysis layer: counts stay in the source while new cell metadata, feature metadata, and results are written to a target you control.
 This is a logical mount rather than a filesystem symbolic link, and it does not copy the count matrices into each project.
+
+### Cytebase: cloud-hosted Scarf DataStores
+
+Cytebase provides ready-to-use Scarf DataStores in cloud object storage.
+Search its catalog, choose a dataset, and connect directly to its `data.zarr` for
+metadata queries, plotting, and analysis without first downloading an H5AD or a
+complete Zarr store. Published stores include RNA counts, source annotations,
+and imported embeddings where available.
+
+Run your Python session locally or on cloud compute. Scarf reads the metadata
+and count blocks needed by each operation over the network; computation runs
+where your Python session runs. Open a dataset read-only to explore it, or mount
+it to save new analysis results while keeping counts in Cytebase.
+
+A planned extension will also host `data.zarr` stores processed and annotated
+through Scarf's agent workflow, so users can connect to those published results
+as well. See {doc}`tutorials/cytebase` for the current connection and analysis workflow.
 
 ### Scratch acceleration with local_cache
 

@@ -9,6 +9,7 @@ Public Scarf surfaces for analysts:
 - `EnrichmentResult` and `read_gmt` for gene-set scoring
 - Readers that ingest source formats; writers that create or export Zarr stores (and other exports)
 - `scarf.plotting`
+- `scarf.cytebase.Catalog` and dataset handles for direct access to cloud-hosted Scarf DataStores
 - Documented integration metrics (`DataStore.metric_*`; `scarf.metrics` holds the underlying functions)
 - `MappingReference` / `MappingResult` for atlas-style mapping
 - `scarf.agent.analyze_rna` and its completed result, with the optional agent dependency
@@ -30,7 +31,8 @@ Prefer calling methods on `DataStore`.
 | Integration and metrics | {doc}`api/integration` |
 | Mapping | {doc}`api/mapping` |
 | Plotting | {doc}`api/plotting` |
-| Cytebase and utilities | {doc}`api/utilities` |
+| Cytebase datasets | {doc}`api/cytebase` |
+| Utilities | {doc}`api/utilities` |
 
 {doc}`../scanpy`, {doc}`../seurat`, and {doc}`../tutorials/scrna_seq` describe related workflows;
 this table is this reference's own grouping and only partially overlaps those pages.

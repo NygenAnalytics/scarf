@@ -124,6 +124,7 @@ matplotlib.use("agg")
 
 # Suppress noisy autodoc type cross-refs until intersphinx inventories are complete (P7).
 nitpick_ignore = [
+    ("py:class", "_duckdb.DuckDBPyConnection"),
     ("py:class", "numpy.ndarray"),
     ("py:class", "numpy.dtype"),
     ("py:class", "pandas.DataFrame"),

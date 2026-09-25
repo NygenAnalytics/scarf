@@ -57,6 +57,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+cytebase = [
+    "duckdb>=1.5.5",
+    "matplotlib>=3.9",
+    "pytz>=2026.3.post1",
+    "seaborn>=0.13",
+]
 agent = [
     "pydantic-ai-slim[openai]>=2.19.0",
 ]
@@ -163,6 +169,15 @@ generate-badge = '.'
 badge-format = "svg"
 
 [dependency-groups]
+cytebase = [
+    "modal>=1.5.2",
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "pydantic>=2.13.4",
+    "duckdb>=1.5.5",
+    "natsort>=8.4.0",
+    "pytz>=2026.3.post1",
+]
 profiling = [
     "anndata>=0.12.18",
     "modal>=1.5.2",
