@@ -7,6 +7,7 @@ from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import StorageProfile, ZarrLocation
 from ..storage.refs import ArtifactRef
 from ..storage.stores import create_matrix_source
+from ..storage.validation_scope import scope_public_methods
 from ._operations.features import _FeatureOperationsMixin
 from ._operations.integration_metrics import _IntegrationMetricsOperationsMixin
 from ._operations.presentation import _PresentationOperationsMixin
@@ -56,11 +57,25 @@ def mount_datastore(
             f"{zarr_mode!r}. Reopen the target with DataStore to read it."
         )
 
+    source_store = DataStore(
+        source,
+        workspace=workspace,
+        zarr_mode="r",
+        storage_options=storage_options,
+        default_assay=datastore_options.get("default_assay"),
+    )
+    required_transposes = frozenset(
+        name
+        for name in source_store.assay_names
+        if source_store._get_assay(name).requiresCountsT
+    )
     create_matrix_source(
         source,
         at,
+        required_transposes=required_transposes,
         workspace=workspace,
         storage_options=storage_options,
+        profile=datastore_options.get("zarrProfile"),
     )
     return DataStore(
         at,
@@ -181,10 +196,9 @@ class DataStore(
         Returns:
             Assay object
         """
-        if assay_name not in self.assay_names:
+        if assay_name not in self._assayNames:
             raise ValueError(f"ERROR: Assay {assay_name} not found in the Zarr file")
-        else:
-            return cast(Assay, getattr(self, assay_name))
+        return cast(Assay, getattr(self, assay_name))
 
     def resolve_features(
         self,
@@ -214,3 +228,8 @@ class DataStore(
             mem_budget=self.memoryBytes,
             storageIo=getattr(self, "storageIo", None),
         )
+
+
+# One public call validates each input artifact once, however many lineage
+# paths reach it.
+scope_public_methods(DataStore, module_prefix="scarf.datastore")

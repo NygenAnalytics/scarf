@@ -25,7 +25,6 @@ DEFAULT_TARGET_SIZES = (
     10_000_000,
 )
 
-_MASK_64 = (1 << 64) - 1
 _SPLITMIX_INCREMENT = 0x9E3779B97F4A7C15
 _SPLITMIX_MULTIPLIER_1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_MULTIPLIER_2 = 0x94D049BB133111EB
@@ -178,14 +177,6 @@ SOURCE_SPEC = SourceSpec(
     nnz=19_516_755_155,
     sourceBytes=46_292_192_475,
 )
-
-
-def splitmix64(value: int) -> int:
-    """Return SplitMix64 for one unsigned 64-bit input."""
-    mixed = (value + _SPLITMIX_INCREMENT) & _MASK_64
-    mixed = ((mixed ^ (mixed >> 30)) * _SPLITMIX_MULTIPLIER_1) & _MASK_64
-    mixed = ((mixed ^ (mixed >> 27)) * _SPLITMIX_MULTIPLIER_2) & _MASK_64
-    return mixed ^ (mixed >> 31)
 
 
 def sampling_salt(
@@ -1273,24 +1264,6 @@ def write_h5ad_sample(
     )
 
 
-def read_csr_row(
-    path: str | Path,
-    row: int,
-    *,
-    matrixKey: str = SOURCE_SPEC.matrixKey,
-) -> tuple[np.ndarray, np.ndarray]:
-    with h5py.File(path, mode="r") as h5:
-        matrix = _require_group(h5, matrixKey)
-        shape = tuple(int(value) for value in matrix.attrs.get("shape", ()))
-        if len(shape) != 2 or row < 0 or row >= shape[0]:
-            raise IndexError(f"CSR row {row} is outside matrix shape {shape}")
-        indptr = _require_dataset(h5, f"{matrixKey}/indptr")
-        start, end = (int(value) for value in indptr[row : row + 2])
-        indices = np.asarray(_require_dataset(h5, f"{matrixKey}/indices")[start:end])
-        data = np.asarray(_require_dataset(h5, f"{matrixKey}/data")[start:end])
-    return indices, data
-
-
 def _attribute_strings(value: Any) -> list[str]:
     return [_decode_text(item) for item in np.asarray(value).reshape(-1)]
 
@@ -1465,10 +1438,8 @@ def prepare_local_datasets(
     seed: int = DEFAULT_SAMPLING_SEED,
     spec: SourceSpec = SOURCE_SPEC,
     rowBatchSize: int = _DEFAULT_ROW_BATCH_SIZE,
-    copyBufferBytes: int = _DEFAULT_COPY_BUFFER_BYTES,
     onArtifact: Callable[[PreparedArtifact], None] | None = None,
 ) -> PreparationResult:
-    del copyBufferBytes  # retained for call-site compatibility; unused in-memory path
     source_path = Path(sourcePath)
     output_directory = Path(outputDirectory)
     output_directory.mkdir(parents=True, exist_ok=True)

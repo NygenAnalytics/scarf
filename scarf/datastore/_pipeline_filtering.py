@@ -11,7 +11,7 @@ from ..quality_control.filtering import (
 from ..storage.artifacts import ArtifactRef, artifact_group
 from ..storage.selections import (
     read_stored_selection_mask,
-    resolve_selection_artifact,
+    resolve_generated_selection_artifact,
 )
 from ..storage.types import as_zarr_array
 from ..utils.logging import logger
@@ -142,12 +142,12 @@ def filter_pipeline_selection(
     values = np.asarray(active & keep, dtype=bool)
     if not values.any():
         raise ValueError("Pipeline filtering removed every selected cell")
-    return resolve_selection_artifact(
+    return resolve_generated_selection_artifact(
         store.zw,
         scope="datastore",
         kind="cell_selection",
         values=values,
-        row_ids=np.asarray(store.cells.fetch_all("ids")),
+        row_ids=store.cells._get_array("ids"),
         operation="filter_pipeline_cells",
         parameters=parameters,
         inputs={
@@ -155,4 +155,4 @@ def filter_pipeline_selection(
             "cell_snapshot": cell_snapshot,
         },
         source_column=recipe.cell_key,
-    )
+    )[0]

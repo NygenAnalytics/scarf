@@ -265,10 +265,6 @@ class UnaryTransformMatrixSource(BaseMatrixSource):
             return np.asarray(self.kernel.function(values), dtype=self.dtype)
 
 
-UnaryMatrixSource = UnaryTransformMatrixSource
-LocalUnaryMatrixSource = UnaryTransformMatrixSource
-
-
 class BinaryTransformMatrixSource(BaseMatrixSource):
     def __init__(
         self,
@@ -437,10 +433,6 @@ class BinaryTransformMatrixSource(BaseMatrixSource):
                 ),
                 dtype=self.dtype,
             )
-
-
-BinaryMatrixSource = BinaryTransformMatrixSource
-LocalBinaryMatrixSource = BinaryTransformMatrixSource
 
 
 class MaskMatrixSource(BaseMatrixSource):
@@ -686,9 +678,6 @@ class DelayedSubassignmentMatrixSource(BaseMatrixSource):
                 ).T
             output[np.ix_(output_rows, assignment.featureIndices)] = assignment_values
         return output
-
-
-SubassignmentMatrixSource = DelayedSubassignmentMatrixSource
 
 
 def _parameter_vector(
@@ -1068,71 +1057,6 @@ class LinearResidualMatrixSource(BaseMatrixSource):
         return values - prediction
 
 
-class UnsupportedExecutionMatrixSource(BaseMatrixSource):
-    def __init__(
-        self,
-        source: MatrixSource | None,
-        operation: str,
-        *,
-        object_path: str,
-        class_name: str | None,
-        reason: str,
-        shape: Sequence[int] | None = None,
-        dtype: DTypeLike | None = None,
-        row_names: Sequence[str | bytes] | NDArray[Any] | None = None,
-        column_names: Sequence[str | bytes] | NDArray[Any] | None = None,
-        limits: SourceLimits = DEFAULT_LIMITS,
-    ) -> None:
-        if source is None and (shape is None or dtype is None):
-            raise TypeError("unsupported source requires a source or shape and dtype")
-        resolved_shape = source.shape if shape is None and source is not None else shape
-        resolved_dtype = source.dtype if dtype is None and source is not None else dtype
-        if resolved_shape is None or resolved_dtype is None:
-            raise TypeError("unsupported source metadata is incomplete")
-        self.source = source
-        self.operation = operation
-        self.objectPath = object_path
-        self.className = class_name
-        self.reason = reason
-        super().__init__(
-            resolved_shape,
-            resolved_dtype,
-            row_names=(
-                source.row_names
-                if row_names is None and source is not None
-                else row_names
-            ),
-            column_names=(
-                source.column_names
-                if column_names is None and source is not None
-                else column_names
-            ),
-            is_sparse=source.is_sparse if source is not None else True,
-            zero_preserving=(source.zero_preserving if source is not None else True),
-            limits=limits,
-        )
-
-    @property
-    def resident_bytes(self) -> int:
-        source_bytes = 0 if self.source is None else self.source.resident_bytes
-        return super().resident_bytes + source_bytes
-
-    def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
-        self._window(start, stop)
-        if self.source is None:
-            return MemoryEstimate(self.resident_bytes)
-        return self.source.estimate_read_memory(start, stop)
-
-    def read_cells(self, start: int, stop: int) -> MatrixBlock:
-        self._window(start, stop)
-        raise UnsupportedMatrixOperation(
-            self.objectPath,
-            self.operation,
-            self.className,
-            self.reason,
-        )
-
-
 def _rank_values(values: NDArray[Any], total_size: int) -> NDArray[np.float64]:
     numeric = np.asarray(values)
     if numeric.ndim != 1 or numeric.size > total_size:
@@ -1417,9 +1341,6 @@ class MatrixMultiplySource(BaseMatrixSource):
             )
             output += right_values[:, inner_start:inner_stop] @ left_values
         return output
-
-
-MultiplyMatrixSource = MatrixMultiplySource
 
 
 _CAPABILITIES = (

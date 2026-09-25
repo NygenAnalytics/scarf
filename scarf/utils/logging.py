@@ -17,11 +17,6 @@ _config = _OutputConfig()
 _handler_id: int | None = None
 
 
-def stdout_is_interactive() -> bool:
-    """Return whether stdout is an interactive terminal."""
-    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
-
-
 def _flushing_stdout_sink(message: Any) -> None:
     sys.stdout.write(str(message))
     sys.stdout.flush()

@@ -6,15 +6,11 @@ import numpy as np
 import zarr
 from scipy.sparse import coo_matrix
 
-from ..metadata.rows import (
-    metadata_row_selection_peak_bytes,
-    read_metadata_rows_chunkwise,
-)
-from ..storage.budget import ResourceBudget, admitted_worker_split
+from ..storage.budget import ResourceBudget
+from ..storage.identity import CountSummary, finalize_counts, load_count_summaries
 from ..storage.count_matrix import CountMatrixPolicy
 from ..storage.io_policy import StorageIoPolicy
 from ..storage.layout import ZarrArraySpec
-from ..storage.partition import affordable_width
 from ..storage.profiles import StorageProfile
 from ..storage.schema import create_zarr_count_assay, load_count_array
 from ..storage.sharding import (
@@ -29,7 +25,7 @@ from ..utils.compute import controlled_compute
 from ..utils.logging import logger
 from ..utils.progress import iter_progress
 from .features import FeatureAlignment
-from .row_plan import RowPlan, iter_row_plan_segments, max_row_plan_block_rows
+from .row_plan import RowPlan, iter_row_plan_segments
 
 
 CountsTReuseOutcome = Literal[
@@ -66,49 +62,6 @@ class _MergeImportRequirements:
     sourceDtype: np.dtype[Any]
     residentBytes: int
     extraProducerBytes: Callable[[int], int]
-    nnzScanRows: int
-
-
-class MissingAssay:
-    """Carrier for a source that lacks an assay modality.
-
-    Holds the source cell table and a reference feature space so DataStoreMerge
-    can emit empty sparse blocks without allocating a dummy Zarr array.
-    """
-
-    def __init__(
-        self,
-        cells: Any,
-        feats: Any,
-        name: str,
-        n_cells: int,
-        dtype: np.dtype[Any],
-    ) -> None:
-        self.cells = cells
-        self.feats = feats
-        self.name = name
-        self._nCells = int(n_cells)
-        self._dtype = np.dtype(dtype)
-        self.rawData = _EmptyRawData(self._nCells, int(feats.N), self._dtype)
-
-    @property
-    def isMissing(self) -> bool:
-        return True
-
-
-class _EmptyRawData:
-    def __init__(self, n_cells: int, n_feats: int, dtype: np.dtype[Any]) -> None:
-        self.shape = (int(n_cells), int(n_feats))
-        self.dtype = np.dtype(dtype)
-        self.chunksize = (max(1, int(n_cells)), max(1, int(n_feats)))
-
-    @property
-    def blocks(self) -> list[Any]:
-        return []
-
-
-def _is_missing(assay: Any) -> bool:
-    return isinstance(assay, MissingAssay) or bool(getattr(assay, "isMissing", False))
 
 
 def remap_block_to_coo(
@@ -166,62 +119,61 @@ def create_assay_counts(
     return counts
 
 
-def _nnz_profile_bytes(n_cells: int) -> int:
-    return (max(0, int(n_cells)) + 1) * np.dtype(np.int64).itemsize
+def _row_nnz_load_bytes(assay: Any) -> int:
+    """Bound loading one source's count summaries for the NNZ profile."""
+    n_rows, n_columns = (int(value) for value in assay.rawData.shape)
+    itemsize = np.dtype(np.int64).itemsize
+    # Row sums, row positives, and column positives are loaded together, and
+    # decoding one of them briefly holds a decoded and an encoded copy.
+    return itemsize * (2 * n_rows + n_columns + 2 * max(n_rows, n_columns))
 
 
-def _resolve_nnz_scan_rows(
-    assays: list[Any],
+def _cumulative_row_nnz(
+    assays: list[Any | None],
     row_plan: RowPlan,
     resources: ResourceBudget,
     *,
     resident_bytes: int,
-) -> int:
-    """Admit the NNZ profile and choose a bounded metadata scan width."""
-    profile_bytes = _nnz_profile_bytes(row_plan.nCells)
-    preferred = max(1, max_row_plan_block_rows(row_plan))
-    int64_bytes = np.dtype(np.int64).itemsize
-    resident = max(0, int(resident_bytes)) + profile_bytes
-    if resident >= int(resources.memoryBytes):
-        raise MemoryError(
-            "Merged assay NNZ profile cannot fit within the operation memory budget"
-        )
+) -> np.ndarray:
+    """Return cumulative nonzero counts over merged rows.
 
-    def fits(width: int) -> bool:
-        task_bytes = [max(1, int(width)) * int64_bytes]
-        task_bytes.extend(
-            metadata_row_selection_peak_bytes(
-                assay.cells,
-                f"{assay.name}_nFeatures",
-                width,
-            )
-            for assay in assays
-            if not _is_missing(assay)
-            and f"{assay.name}_nFeatures" in assay.cells.columns
+    Each row count is the source row's positive-entry count, read once per
+    source from its saved count summaries. Missing sources contribute zeros.
+    """
+    profile_bytes = (row_plan.nCells + 1) * np.dtype(np.int64).itemsize
+    needed = (
+        max(0, int(resident_bytes))
+        + profile_bytes
+        + max(
+            (_row_nnz_load_bytes(assay) for assay in assays if assay is not None),
+            default=0,
         )
-        try:
-            admitted_worker_split(
-                resources,
-                nTasks=1,
-                residentBytes=resident,
-                taskBytes=lambda _: max(task_bytes),
-                requested=1,
-            )
-        except MemoryError:
-            return False
-        return True
-
-    rows = affordable_width(fits, preferred)
-    if rows < 1:
+    )
+    if needed > int(resources.memoryBytes):
         raise MemoryError(
-            "Merged assay NNZ profile cannot fit one metadata row within the "
-            "operation memory budget"
+            f"Merged assay NNZ profile needs about {needed} bytes, but the "
+            f"operation limit is {int(resources.memoryBytes)} bytes"
         )
-    return int(rows)
+    cumulative = np.zeros(row_plan.nCells + 1, dtype=np.int64)
+    row_nnz = cumulative[1:]
+    for source_idx, assay in enumerate(assays):
+        if assay is None:
+            continue
+        matrix = assay.matrixGroup
+        counts = as_zarr_array(matrix["counts"], name="counts")
+        _, row_positive, _ = load_count_summaries(matrix, counts)
+        for segment in iter_row_plan_segments(row_plan):
+            if segment.sourceIdx != source_idx:
+                continue
+            stop = segment.destStart + int(segment.localRows.size)
+            row_nnz[segment.destStart : stop] = row_positive[segment.localRows]
+        del row_positive
+    np.cumsum(row_nnz, out=row_nnz)
+    return cumulative
 
 
 def _merge_import_requirements(
-    assays: list[Any],
+    assays: list[Any | None],
     row_plan: RowPlan,
     alignment: FeatureAlignment,
     destination_dtype: Any,
@@ -229,51 +181,20 @@ def _merge_import_requirements(
     resources: ResourceBudget,
     additionalResidentBytes: int = 0,
 ) -> _MergeImportRequirements:
+    # The destination CountSummary exists for the whole write, so planning and
+    # execution both count it through this one function.
     base_resident = (
         row_plan.resident_bytes()
         + alignment.resident_bytes()
+        + CountSummary.nbytes_for(row_plan.nCells, alignment.nFeats)
         + max(0, int(additionalResidentBytes))
     )
-    scan_rows = _resolve_nnz_scan_rows(
+    cumulative = _cumulative_row_nnz(
         assays,
         row_plan,
         resources,
         resident_bytes=base_resident,
     )
-    profile_bytes = _nnz_profile_bytes(row_plan.nCells)
-    cumulative = np.empty(row_plan.nCells + 1, dtype=np.int64)
-    cumulative[0] = 0
-    for segment in iter_row_plan_segments(row_plan, segment_rows=scan_rows):
-        assay = assays[segment.sourceIdx]
-        n_rows = int(segment.localRows.size)
-        dest_start = int(segment.destStart)
-        dest_stop = dest_start + n_rows
-        if _is_missing(assay):
-            cumulative[dest_start + 1 : dest_stop + 1] = cumulative[dest_start]
-            continue
-        column = f"{assay.name}_nFeatures"
-        if column in assay.cells.columns:
-            counts = np.asarray(
-                read_metadata_rows_chunkwise(
-                    assay.cells,
-                    column,
-                    segment.localRows,
-                ),
-                dtype=np.int64,
-            )
-        else:
-            counts = np.full(
-                n_rows,
-                int(assay.rawData.shape[1]),
-                dtype=np.int64,
-            )
-        if counts.size != n_rows:
-            raise ValueError(
-                f"Source assay {assay.name!r} has an invalid {column!r} column"
-            )
-        segment_cumulative = cumulative[dest_start + 1 : dest_stop + 1]
-        np.cumsum(counts, dtype=np.int64, out=segment_cumulative)
-        segment_cumulative += cumulative[dest_start]
     n_ordered = row_plan.nCells
 
     def max_window_nnz(window_rows: int) -> int:
@@ -284,7 +205,7 @@ def _merge_import_requirements(
             return 0
         return int(np.max(cumulative[width:] - cumulative[:-width]))
 
-    present = [assay for assay in assays if not _is_missing(assay)]
+    present = [assay for assay in assays if assay is not None]
     source_dtype = (
         np.result_type(*(assay.rawData.dtype for assay in present))
         if present
@@ -302,14 +223,13 @@ def _merge_import_requirements(
         ),
         default=0,
     )
-    value_candidates = [np.dtype(destination_dtype).itemsize]
-    value_candidates.extend(
-        np.dtype(assay.rawData.dtype).itemsize
-        for assay in assays
-        if not _is_missing(assay)
+    value_bytes = max(
+        [
+            np.dtype(destination_dtype).itemsize,
+            *(np.dtype(assay.rawData.dtype).itemsize for assay in present),
+        ]
     )
-    value_bytes = max(value_candidates)
-    resident_bytes = base_resident + profile_bytes
+    resident_bytes = base_resident + int(cumulative.nbytes)
 
     def extra_producer_bytes(width: int) -> int:
         rows = max(0, int(width))
@@ -327,13 +247,12 @@ def _merge_import_requirements(
         sourceDtype=np.dtype(source_dtype),
         residentBytes=resident_bytes,
         extraProducerBytes=extra_producer_bytes,
-        nnzScanRows=scan_rows,
     )
 
 
 def preflight_assay_counts(
     spec: ZarrArraySpec,
-    assays: list[Any],
+    assays: list[Any | None],
     row_plan: RowPlan,
     alignment: FeatureAlignment,
     *,
@@ -364,7 +283,7 @@ def write_assay_counts(
     root: zarr.Group,
     assay_name: str,
     workspace: str | None,
-    assays: list[Any],
+    assays: list[Any | None],
     row_plan: RowPlan,
     alignment: FeatureAlignment,
     *,
@@ -376,6 +295,7 @@ def write_assay_counts(
     """Stream remapped source blocks into the destination counts array."""
     destination = load_count_array(root, assay_name, workspace)
     _ = profile
+    summary = CountSummary(destination)
     requirements = _merge_import_requirements(
         assays,
         row_plan,
@@ -384,14 +304,6 @@ def write_assay_counts(
         resources=resources,
         additionalResidentBytes=additionalResidentBytes,
     )
-    expected_start = 0
-    for segment in iter_row_plan_segments(row_plan):
-        if segment.destStart != expected_start:
-            raise AssertionError(
-                "ERROR: Merged block order does not match the cell metadata order."
-            )
-        expected_start += int(segment.localRows.size)
-
     plan = resolve_sparse_import_batch(
         (destination,),
         nRows=row_plan.nCells,
@@ -405,7 +317,7 @@ def write_assay_counts(
 
     def convert_rows(assay_idx: int, perm_order: np.ndarray) -> coo_matrix:
         assay = assays[assay_idx]
-        if _is_missing(assay) or int(assay.feats.N) == 0:
+        if assay is None or int(assay.feats.N) == 0:
             return empty_block_coo(int(perm_order.size), alignment.nFeats)
         block = assay.rawData[np.asarray(perm_order, dtype=np.int64), :]
         return remap_block_to_coo(
@@ -446,14 +358,16 @@ def write_assay_counts(
         residentBytes=requirements.residentBytes,
         producerReserveBytes=plan.producerReserveBytes,
         io=io,
+        countSummary=summary,
     )
-    if counter != row_plan.nCells or expected_start != row_plan.nCells:
+    if counter != row_plan.nCells:
         raise AssertionError(
             "ERROR: Mismatch in number of cells in the merged assay. "
             "Please report this issue."
         )
     matrix_path = _matrix_group_path(assay_name, workspace)
     matrix_group = as_zarr_group(root[matrix_path], name=matrix_path)
+    finalize_counts(destination, summary=summary)
     matrix_group.attrs["complete"] = True
     return counter
 
@@ -478,6 +392,9 @@ def write_assay_counts_t(
         raise ValueError(
             "countsT requires a Zarr v3 destination. Repack the store to Zarr v3."
         )
+    from ..assay.classification import default_feature_sets
+
+    metadata_path = _assay_metadata_path(assay_name, workspace)
     result = write_counts_t(
         counts,
         group,
@@ -486,6 +403,10 @@ def write_assay_counts_t(
         residentBytes=residentBytes,
         policy=policy,
         io=io,
+        overwrite=True,
+        featureSets=default_feature_sets(
+            as_zarr_group(root[metadata_path], name=metadata_path)
+        ),
     )
     logger.debug(f"Wrote countsT for assay {assay_name}")
     return result
@@ -538,6 +459,12 @@ def validate_assay_counts(
     if "counts" not in matrix_group:
         return f"counts array is missing from {matrix_path!r}"
     counts = as_zarr_array(matrix_group["counts"], name=f"{matrix_path}/counts")
+    from ..storage.counts_t_contract import validate_count_matrix
+
+    try:
+        validate_count_matrix(matrix_group, require_transpose=False)
+    except ValueError as error:
+        return str(error)
     expected_shape = (int(n_cells), int(alignment.nFeats))
     if tuple(int(value) for value in counts.shape) != expected_shape:
         return (
@@ -598,33 +525,6 @@ def validate_assay_counts(
     return None
 
 
-def validate_counts_t(
-    root: zarr.Group,
-    assay_name: str,
-    workspace: str | None,
-    *,
-    n_cells: int,
-    n_features: int,
-    dtype: str,
-) -> str | None:
-    """Return why a completed countsT component cannot be reused.
-
-    Prefer :func:`assess_counts_t_reuse` for structured outcomes. This wrapper
-    keeps a human-readable reason for blocked-plan messages.
-    """
-    assessment = assess_counts_t_reuse(
-        root,
-        assay_name,
-        workspace,
-        n_cells=n_cells,
-        n_features=n_features,
-        dtype=dtype,
-    )
-    if assessment.outcome == "reusable":
-        return None
-    return assessment.reason
-
-
 def assess_counts_t_reuse(
     root: zarr.Group,
     assay_name: str,
@@ -642,8 +542,7 @@ def assess_counts_t_reuse(
     - ``incomplete``: missing or ``complete`` is not True
     - ``block-shape/dtype``: complete array that disagrees with the merge plan
     """
-    from ..storage.count_matrix import require_count_matrix_layout
-    from ..storage.schema import load_count_array
+    from ..storage.counts_t_contract import validate_count_matrix
 
     matrix_path = _matrix_group_path(assay_name, workspace)
     if matrix_path not in root:
@@ -685,8 +584,7 @@ def assess_counts_t_reuse(
             ),
         )
     try:
-        counts = load_count_array(root, assay_name, workspace)
-        require_count_matrix_layout(matrix_group, counts, counts_t)
+        validate_count_matrix(matrix_group, require_transpose=True)
     except ValueError as exc:
         return CountsTReuseAssessment(
             outcome="rewrite-layout",

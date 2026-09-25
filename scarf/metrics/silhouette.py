@@ -1,10 +1,9 @@
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
 
-from ..neighbors.stream import AnnStream
 from ..utils.logging import logger
 from ..utils.progress import iter_progress
 from ._rows import read_matrix_rows
@@ -19,56 +18,40 @@ if TYPE_CHECKING:
     from ..datastore.datastore import DataStore
 
 
-def _embed_rows(
-    row_indices: np.ndarray,
-    data: MatrixData,
-    ann_obj: AnnStream,
-    *,
-    data_is_reduced: bool,
-) -> np.ndarray:
-    rows = read_matrix_rows(data, np.sort(row_indices))
-    if data_is_reduced:
-        return np.asarray(rows)
-    return np.asarray(ann_obj.reducer(rows))
+def _sorted_rows(data: MatrixData, row_indices: np.ndarray) -> np.ndarray:
+    return read_matrix_rows(data, np.sort(row_indices))
 
 
-def _sample_cluster_embeddings(
+def _sample_cluster_rows(
     cluster_cells: np.ndarray,
     data: MatrixData,
-    ann_obj: AnnStream,
     count: int,
     rng: np.random.Generator,
-    *,
-    data_is_reduced: bool,
 ) -> np.ndarray:
     if count < 1 or count > len(cluster_cells):
         raise ValueError("Sample count must fit within the cluster")
     sampled = rng.choice(cluster_cells, size=count, replace=False)
-    return _embed_rows(sampled, data, ann_obj, data_is_reduced=data_is_reduced)
+    return _sorted_rows(data, sampled)
 
 
 def process_cluster(
     cluster_cells: np.ndarray,
     hvg_data: MatrixData,
-    ann_obj: AnnStream,
     k: int,
     *,
     rng: np.random.Generator | None = None,
-    data_is_reduced: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Process a cluster of cells to prepare data for silhouette scoring.
-
-    Randomly splits cluster cells into two groups and applies dimensionality reduction.
+    """Sample two disjoint groups of cells from one cluster for silhouette scoring.
 
     Args:
         cluster_cells: Indices of cells belonging to the cluster
-        hvg_data: Expression data for highly variable genes
-        ann_obj: Object containing dimensionality reduction method
-        k: Number of cells to sample from cluster
+        hvg_data: Cell-by-dimension matrix whose rows are compared, such as the
+            coordinates behind a KNN graph
+        k: Number of cells in each sampled group
+        rng: Random generator used for sampling
 
     Returns:
-        tuple[np.ndarray, np.ndarray]: Two arrays containing reduced data for
-        different subsets of cells from the cluster
+        tuple[np.ndarray, np.ndarray]: The rows of the two sampled groups of cells
     """
     if k < 1 or len(cluster_cells) < 2 * k:
         raise ValueError("A cluster must contain at least 2 * k cells")
@@ -76,24 +59,11 @@ def process_cluster(
         rng = np.random.default_rng(4444)
 
     selected = rng.choice(cluster_cells, size=2 * k, replace=False)
-    data_cells = _embed_rows(
-        selected[:k],
-        hvg_data,
-        ann_obj,
-        data_is_reduced=data_is_reduced,
-    )
-    data_cells_2 = _embed_rows(
-        selected[k:],
-        hvg_data,
-        ann_obj,
-        data_is_reduced=data_is_reduced,
-    )
-    return data_cells, data_cells_2
+    return _sorted_rows(hvg_data, selected[:k]), _sorted_rows(hvg_data, selected[k:])
 
 
 def silhouette_scoring(
     ds: "DataStore",
-    ann_obj: AnnStream,
     graph: csr_matrix | None,
     hvg_data: MatrixData,
     assay_type: str,
@@ -102,8 +72,7 @@ def silhouette_scoring(
     cell_key: str = "I",
     random_seed: int = 4444,
     sample_size: int = 11,
-    data_is_reduced: bool = False,
-    distance_metric: NeighborMetric | None = None,
+    distance_metric: NeighborMetric,
     neighbor_indices: np.ndarray | ZarrArray | None = None,
     neighbor_distances: np.ndarray | ZarrArray | None = None,
 ) -> np.ndarray | None:
@@ -114,11 +83,13 @@ def silhouette_scoring(
 
     Args:
         ds: DataStore object containing cell metadata
-        ann_obj: Object containing dimensionality reduction method
         graph: Optional CSR matrix representing the weighted KNN graph
-        hvg_data: Expression data for highly variable genes
+        hvg_data: Cell-by-dimension matrix whose rows are compared, such as the
+            coordinates behind the KNN graph
         assay_type: Type of assay (e.g., 'RNA', 'ATAC')
         res_label: Label for clustering resolution
+        distance_metric: Neighbor metric used to compare sampled rows: 'l2',
+            'cosine', or 'ip'
 
     Returns:
         np.ndarray | None: Array of silhouette scores for each cluster,
@@ -175,9 +146,8 @@ def silhouette_scoring(
     starts = np.concatenate(([0], boundaries[:-1]))
     cluster_cells = [order[start:end] for start, end in zip(starts, boundaries)]
 
-    metric = distance_metric or cast(NeighborMetric, ann_obj.annMetric)
-    if metric not in {"l2", "cosine", "ip"}:
-        raise ValueError(f"Unsupported neighbor metric: {metric}")
+    if distance_metric not in {"l2", "cosine", "ip"}:
+        raise ValueError(f"Unsupported neighbor metric: {distance_metric}")
 
     rng = np.random.default_rng(random_seed)
     score: list[float] = []
@@ -198,17 +168,15 @@ def silhouette_scoring(
         data_this_cells, data_this_cells_2 = process_cluster(
             this_cluster_cells,
             hvg_data,
-            ann_obj,
             k,
             rng=rng,
-            data_is_reduced=data_is_reduced,
         )
 
         self_dist = calculate_top_k_neighbor_distances(
             data_this_cells,
             data_this_cells_2,
             min(k, len(data_this_cells_2)),
-            metric=metric,
+            metric=distance_metric,
         ).mean()
 
         other_similarities = similarities.copy()
@@ -216,20 +184,18 @@ def silhouette_scoring(
         nearest_cluster = int(np.argmax(other_similarities))
         nearest_cluster_cells = cluster_cells[nearest_cluster]
         nearest_sample_size = min(k, len(nearest_cluster_cells))
-        data_nearest_cells = _sample_cluster_embeddings(
+        data_nearest_cells = _sample_cluster_rows(
             nearest_cluster_cells,
             hvg_data,
-            ann_obj,
             nearest_sample_size,
             rng,
-            data_is_reduced=data_is_reduced,
         )
 
         other_dist = calculate_top_k_neighbor_distances(
             data_this_cells,
             data_nearest_cells,
             min(k, len(data_nearest_cells)),
-            metric=metric,
+            metric=distance_metric,
         ).mean()
 
         denominator = max(self_dist, other_dist)

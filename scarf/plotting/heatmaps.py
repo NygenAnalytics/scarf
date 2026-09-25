@@ -11,7 +11,6 @@ from ..features.markers.table import load_marker_table
 from ..storage.artifacts import ArtifactRef, artifact_path
 from ..storage.selections import read_stored_selection_indices
 from ..storage.types import as_zarr_array, as_zarr_group
-from ..utils.logging import logger
 from ._contracts import CategoricalScale, ColorScale, PlotProvenance
 from ._deps import require_matplotlib, require_seaborn
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
@@ -160,7 +159,6 @@ def _prepare_marker_heatmap(
     feature_indices: list[int] = []
     marker_rows: list[dict[str, Any]] = []
     feature_names = np.asarray(marker_slot["feature_names"][:]).astype(str)
-    feature_ids = np.asarray(marker_slot["feature_ids"][:]).astype(str)
     for group_name in marker_slot.group_keys():
         marker_group = as_zarr_group(marker_slot[group_name], name=group_name)
         markers = load_marker_table(
@@ -168,27 +166,12 @@ def _prepare_marker_heatmap(
             marker_group,
             feature_names,
             group_id=group_name,
-            feature_ids=feature_ids,
         )
-        if markers.empty:
-            continue
-        unresolved = markers["feature_index"].isna()
-        if bool(unresolved.any()):
-            logger.warning(
-                f"Skipping {int(unresolved.sum())} unresolved marker "
-                f"feature(s) for group '{group_name}'"
-            )
-            markers = markers.loc[~unresolved].copy()
-        if markers.empty:
-            continue
-        if "score" in markers.columns and markers["score"].notna().any():
-            ranked = markers.sort_values(
-                ["score", "feature_name"],
-                ascending=[False, True],
-                kind="mergesort",
-            ).head(topn)
-        else:
-            ranked = markers.head(topn)
+        ranked = markers.sort_values(
+            ["score", "feature_name"],
+            ascending=[False, True],
+            kind="mergesort",
+        ).head(topn)
         selected = ranked["feature_index"].to_numpy(dtype=int)
         feature_indices.extend(selected.tolist())
         marker_rows.extend(
@@ -196,16 +179,10 @@ def _prepare_marker_heatmap(
                 "group": group_name,
                 "rank": rank,
                 "feature_index": int(feature_index),
-                "score": float(score) if pd.notna(score) else np.nan,
+                "score": float(score),
             }
             for rank, (feature_index, score) in enumerate(
-                zip(
-                    selected,
-                    ranked["score"].to_numpy(dtype=float)
-                    if "score" in ranked.columns
-                    else np.full(len(selected), np.nan),
-                    strict=True,
-                ),
+                zip(selected, ranked["score"].to_numpy(dtype=float), strict=True),
                 start=1,
             )
         )

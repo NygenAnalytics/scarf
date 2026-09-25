@@ -67,6 +67,7 @@ from ...trajectory.artifacts import (
     aggregation_payload_is_valid as _aggregation_payload_is_valid,
     artifact_ref_input as _artifact_ref_input,
     diffusion_payload_is_valid as _diffusion_payload_is_valid,
+    load_diffusion_payload,
     fate_payload_is_valid as _fate_payload_is_valid,
     labels_with_missing_mask as _labels_with_missing_mask,
     load_cell_artifact_values as _load_cell_artifact_values,
@@ -111,16 +112,6 @@ else:
     _TrajectoryOperationsBase = object
 
 
-def _assay_dataset_fingerprint(store: Any, assay: Assay) -> str:
-    stored = assay.attrs.get("dataset_fingerprint")
-    if isinstance(stored, str) and stored:
-        return stored
-    calculated = store._calculate_dataset_fingerprint(assay.name)
-    if not isinstance(calculated, str) or not calculated:
-        raise ValueError("Assay dataset fingerprint is unavailable")
-    return calculated
-
-
 def _validate_assay_execution_identity(
     store: Any,
     assay: Assay,
@@ -153,7 +144,7 @@ def _validate_assay_execution_identity(
         current_size_factor = float(raw_size_factor)
     if current_method != normalization_method or current_size_factor != size_factor:
         raise ValueError(f"{context} normalization settings changed during computation")
-    if _assay_dataset_fingerprint(store, assay) != dataset_fingerprint:
+    if store._ensure_dataset_fingerprint(assay.name) != dataset_fingerprint:
         raise ValueError(f"{context} dataset identity changed during computation")
 
 
@@ -305,10 +296,11 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
                 "zarr_mode='r+' unless a matching artifact already exists"
             )
 
-        graph_matrix = self.load_graph(
+        graph_matrix = self._load_graph_artifact(
             graph_ref,
             symmetric=True,
             upper_only=False,
+            use_k=None,
         )
         if graph_matrix.shape != (n_cells, n_cells):
             raise ValueError(
@@ -386,72 +378,11 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             )
 
         group = as_zarr_group(self.zw[status.path], name=status.path)
-        raw_n_cells = group.attrs.get("n_cells")
-        if (
-            isinstance(raw_n_cells, bool)
-            or not isinstance(raw_n_cells, int | np.integer)
-            or int(raw_n_cells) != graph_n_cells
-        ):
-            raise ValueError(
-                "Diffusion-operator cell count does not match its graph lineage"
-            )
-        arrays = {
-            name: as_zarr_array(group[name], name=name) if name in group else None
-            for name in ("row", "col", "data")
-        }
-        if any(array is None for array in arrays.values()):
-            raise ValueError("Diffusion-operator sparse payload is incomplete")
-        row_array = arrays["row"]
-        col_array = arrays["col"]
-        data_array = arrays["data"]
-        assert (
-            row_array is not None and col_array is not None and data_array is not None
-        )
-        if (
-            row_array.ndim != 1
-            or col_array.ndim != 1
-            or data_array.ndim != 1
-            or row_array.shape != col_array.shape
-            or row_array.shape != data_array.shape
-            or np.dtype(row_array.dtype) != np.dtype(np.uint64)
-            or np.dtype(col_array.dtype) != np.dtype(np.uint64)
-            or np.dtype(data_array.dtype) != np.dtype(np.float64)
-        ):
-            raise ValueError("Diffusion-operator sparse payload is malformed")
-        nnz = int(data_array.size)
-        index_bytes = np.dtype(
-            np.int32 if max(graph_n_cells, nnz) <= np.iinfo(np.int32).max else np.int64
-        ).itemsize
-        coo_bytes = nnz * (8 + 2 * index_bytes)
-        load_bytes = nnz * (24 + 2 * index_bytes)
-        if imputed_features:
-            csc_bytes = nnz * (8 + index_bytes) + (graph_n_cells + 1) * index_bytes
-            output_bytes = graph_n_cells * imputed_features * 8
-            load_bytes = max(
-                load_bytes,
-                coo_bytes + 2 * csc_bytes,
-                3 * output_bytes + 2 * csc_bytes,
-            )
-        if load_bytes >= self.memoryBytes:
-            raise MemoryError(
-                "Diffusion operator and imputed output exceed the memory budget "
-                "during loading or sparse conversion; increase the memory budget "
-                "or request fewer features per call."
-            )
-        if not _diffusion_payload_is_valid(group, n_cells=graph_n_cells):
-            raise ValueError("Diffusion-operator sparse payload is malformed")
-        rows = np.asarray(row_array[:], dtype=np.uint64)
-        cols = np.asarray(col_array[:], dtype=np.uint64)
-        data = np.asarray(data_array[:], dtype=np.float64)
-        if (
-            not np.all(np.isfinite(data))
-            or np.any(rows >= graph_n_cells)
-            or np.any(cols >= graph_n_cells)
-        ):
-            raise ValueError("Diffusion-operator sparse payload is malformed")
-        operator = coo_matrix(
-            (data, (rows, cols)),
-            shape=(graph_n_cells, graph_n_cells),
+        operator = load_diffusion_payload(
+            group,
+            n_cells=graph_n_cells,
+            memory_bytes=self.memoryBytes,
+            imputed_features=imputed_features,
         )
         return operator, graph, selection
 
@@ -643,10 +574,11 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         stored_selection = graph_cell_selection(self.zw, graph_ref)
 
         logger.info(f"Pseudotime scoring: loading graph {graph_ref.artifact_id}")
-        graph_matrix = self.load_graph(
+        graph_matrix = self._load_graph_artifact(
             graph_ref,
             symmetric=True,
             upper_only=False,
+            use_k=None,
         )
 
         if graph_matrix.shape[0] == 0:
@@ -916,10 +848,11 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             assay=None,
             table_path="cellData",
         )
-        graph_matrix = self.load_graph(
+        graph_matrix = self._load_graph_artifact(
             graph,
             symmetric=True,
             upper_only=False,
+            use_k=None,
         )
         if graph_matrix.shape != (n_cells, n_cells):
             raise ValueError("Pseudotime graph does not match its stored selection")
@@ -1391,7 +1324,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             assay.feats.N,
         ) or frozen_feature_ids.shape != (assay.feats.N,):
             raise ValueError("Feature identities do not align with the assay")
-        dataset_fingerprint = _assay_dataset_fingerprint(self, assay)
+        dataset_fingerprint = self._ensure_dataset_fingerprint(assay.name)
         ptime_result = self.load_pseudotime_scoring(pseudotime)
         selected_cell_indices = read_stored_selection_indices(
             self.zw,
@@ -1623,7 +1556,9 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             raise ValueError("Pseudotime-marker feature identities are malformed")
         if feature_ids_fingerprint != fingerprint_stored_strings(live_feature_ids):
             raise ValueError("Pseudotime-marker feature ID identity has changed")
-        if inputs.get("dataset_fingerprint") != _assay_dataset_fingerprint(self, assay):
+        if inputs.get("dataset_fingerprint") != self._ensure_dataset_fingerprint(
+            assay.name
+        ):
             raise ValueError("Pseudotime-marker dataset identity has changed")
         _, feature_indices = _resolve_feature_indices(
             self,
@@ -1795,7 +1730,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             assay.feats.N,
         ) or frozen_feature_ids.shape != (assay.feats.N,):
             raise ValueError("Feature identities do not align with the assay")
-        dataset_fingerprint = _assay_dataset_fingerprint(self, assay)
+        dataset_fingerprint = self._ensure_dataset_fingerprint(assay.name)
         ptime_result = self.load_pseudotime_scoring(pseudotime)
         selected_cell_indices = read_stored_selection_indices(
             self.zw,
@@ -2091,7 +2026,9 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             raise ValueError("Pseudotime-aggregation feature identities are malformed")
         if feature_ids_fingerprint != fingerprint_stored_strings(live_feature_ids):
             raise ValueError("Pseudotime-aggregation feature ID identity has changed")
-        if inputs.get("dataset_fingerprint") != _assay_dataset_fingerprint(self, assay):
+        if inputs.get("dataset_fingerprint") != self._ensure_dataset_fingerprint(
+            assay.name
+        ):
             raise ValueError("Pseudotime-aggregation dataset identity has changed")
         _, selected_features = _resolve_feature_indices(
             self,

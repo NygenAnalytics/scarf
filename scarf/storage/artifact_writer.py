@@ -2,22 +2,25 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from functools import partial
 import time
 from typing import Any, Literal
 
 import numpy as np
 import zarr
+from zarr.errors import ContainsArrayError, ContainsGroupError
 
 from .artifacts import (
     ArtifactRef,
     ArtifactScope,
     artifact_path,
     canonical_bytes,
-    find_reusable_artifacts,
     make_provenance,
     new_artifact_id,
+    reusable_artifact_groups,
     serialize_artifact_value,
 )
+from .stores import metadata_workers, run_concurrently
 
 
 type ArtifactPlanDisposition = Literal["created", "reused"]
@@ -128,11 +131,9 @@ class ArrayRequirement:
     def matches(self, group: zarr.Group) -> bool:
         from .types import as_zarr_array
 
-        if self.name not in group:
-            return False
         try:
             array = as_zarr_array(group[self.name], name=self.name)
-        except TypeError:
+        except (KeyError, TypeError):
             return False
         if self.shape is not None:
             if len(array.shape) != len(self.shape):
@@ -168,6 +169,38 @@ class AttributeRequirement:
         return self.predicate(value) if self.predicate is not None else True
 
 
+def _array_requirements(
+    required: tuple[str | ArrayRequirement, ...],
+) -> tuple[ArrayRequirement, ...]:
+    return tuple(
+        requirement
+        if isinstance(requirement, ArrayRequirement)
+        else ArrayRequirement(str(requirement))
+        for requirement in required
+    )
+
+
+def _attribute_requirements(
+    required: tuple[str | AttributeRequirement, ...],
+) -> tuple[AttributeRequirement, ...]:
+    return tuple(
+        requirement
+        if isinstance(requirement, AttributeRequirement)
+        else AttributeRequirement(str(requirement))
+        for requirement in required
+    )
+
+
+def _requirements_met(
+    group: zarr.Group, requirements: tuple[ArrayRequirement, ...]
+) -> list[bool]:
+    # Each check opens one array; object stores overlap them.
+    return run_concurrently(
+        [partial(requirement.matches, group) for requirement in requirements],
+        workers=metadata_workers(group),
+    )
+
+
 def plan_artifact(
     root: zarr.Group,
     *,
@@ -192,7 +225,7 @@ def plan_artifact(
     if not isinstance(stored_execution_options, dict):
         raise TypeError("execution_options must serialize to a mapping")
     canonical_bytes(stored_execution_options)
-    candidates = find_reusable_artifacts(
+    candidates = reusable_artifact_groups(
         root,
         scope=scope,
         assay=assay,
@@ -200,27 +233,11 @@ def plan_artifact(
         provenance=provenance,
         invalidate_cache=invalidate_cache,
     )
-    requirements = tuple(
-        requirement
-        if isinstance(requirement, ArrayRequirement)
-        else ArrayRequirement(requirement)
-        for requirement in required_arrays
-    )
-    attribute_requirements = tuple(
-        requirement
-        if isinstance(requirement, AttributeRequirement)
-        else AttributeRequirement(requirement)
-        for requirement in required_attributes
-    )
-    from .artifacts import artifact_group
-
+    requirements = _array_requirements(required_arrays)
+    attribute_requirements = _attribute_requirements(required_attributes)
     reused = None
-    for candidate in candidates:
-        try:
-            group = artifact_group(root, candidate)
-        except KeyError:
-            continue
-        if any(not requirement.matches(group) for requirement in requirements):
+    for candidate, group in candidates:
+        if not all(_requirements_met(group, requirements)):
             continue
         if any(
             not requirement.matches(group) for requirement in attribute_requirements
@@ -245,15 +262,13 @@ def plan_artifact(
                 reuse_validator=reuse_validator,
             )
         )
-    while True:
-        ref = ArtifactRef(
-            scope=scope,
-            assay=assay,
-            kind=kind,
-            artifact_id=new_artifact_id(),
-        )
-        if artifact_path(ref) not in root:
-            break
+    # A random 256-bit ID does not collide; start_artifact refuses an existing path.
+    ref = ArtifactRef(
+        scope=scope,
+        assay=assay,
+        kind=kind,
+        artifact_id=new_artifact_id(),
+    )
     return _record_plan(
         PlannedArtifact(
             ref=ref,
@@ -271,23 +286,24 @@ def start_artifact(root: zarr.Group, planned: PlannedArtifact) -> zarr.Group:
     if planned.reused:
         raise ValueError("Cannot start a reused artifact")
     path = artifact_path(planned.ref)
-    if path in root:
-        raise FileExistsError(f"Artifact path already exists: {path}")
-    group = root.create_group(path)
     from .. import __version__
 
-    group.attrs.put(
-        {
-            "artifact_id": planned.ref.artifact_id,
-            "kind": planned.ref.kind,
-            "provenance": planned.provenance,
-            "execution_options": planned.execution_options,
-            "created_at_ns": time.time_ns(),
-            "scarf_version": __version__,
-            "complete": False,
-        }
-    )
-    return group
+    try:
+        # One metadata write creates the group with its record.
+        return root.create_group(
+            path,
+            attributes={
+                "artifact_id": planned.ref.artifact_id,
+                "kind": planned.ref.kind,
+                "provenance": planned.provenance,
+                "execution_options": planned.execution_options,
+                "created_at_ns": time.time_ns(),
+                "scarf_version": __version__,
+                "complete": False,
+            },
+        )
+    except (ContainsArrayError, ContainsGroupError) as exc:
+        raise FileExistsError(f"Artifact path already exists: {path}") from exc
 
 
 def finish_artifact(
@@ -296,28 +312,22 @@ def finish_artifact(
 ) -> None:
     if planned.reused:
         raise ValueError("Cannot finish a reused artifact")
-    group.attrs["complete"] = False
+    if group.attrs.get("complete") is not False:
+        group.attrs["complete"] = False
     if (
         group.attrs.get("artifact_id") != planned.ref.artifact_id
         or group.attrs.get("kind") != planned.ref.kind
     ):
         raise ValueError("Artifact group does not match its creation plan")
-    for requirement in planned.required_arrays:
-        resolved = (
-            requirement
-            if isinstance(requirement, ArrayRequirement)
-            else ArrayRequirement(str(requirement))
-        )
-        if not resolved.matches(group):
+    requirements = _array_requirements(planned.required_arrays)
+    for requirement, met in zip(
+        requirements, _requirements_met(group, requirements), strict=True
+    ):
+        if not met:
             raise ValueError(
-                f"Artifact array {resolved.name!r} does not satisfy its contract"
+                f"Artifact array {requirement.name!r} does not satisfy its contract"
             )
-    for requirement in planned.required_attributes:
-        attribute_requirement = (
-            requirement
-            if isinstance(requirement, AttributeRequirement)
-            else AttributeRequirement(str(requirement))
-        )
+    for attribute_requirement in _attribute_requirements(planned.required_attributes):
         if not attribute_requirement.matches(group):
             raise ValueError(
                 f"Artifact attribute {attribute_requirement.name!r} "

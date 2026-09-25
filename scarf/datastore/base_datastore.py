@@ -1,27 +1,32 @@
 import numpy as np
 import zarr
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 from ..storage.artifacts import (
     ArtifactRef,
     ArtifactScope,
     ArtifactStatus,
-    ValueFingerprintBuilder,
-    canonical_bytes,
     inspect_artifact,
     list_artifacts as list_artifact_refs,
 )
 from ..storage.types import ZarrMode, as_zarr_group
+from ..storage.validation_scope import validation_scoped
 from ..storage.budget import ResourceBudget
+from ..assay.classification import DEFAULT_PERCENT_PATTERNS
 from ..assay import RNAassay, ATACassay, ADTassay, Assay, preset_assay_types
-from ..assay.base import _defer_feature_props
 from ..metadata import MetaData
 from ..storage.schema import validate_assay_name
 from ..storage.profiles import StorageProfile, ZarrLocation
-from ..storage.stores import load_zarr, resolve_matrix_source
+from ..storage.stores import (
+    load_zarr,
+    metadata_workers,
+    resolve_matrix_source,
+    run_concurrently,
+)
 from ..storage.selections import (
-    resolve_stored_selection_artifact,
+    ValidatedStoredSelection,
+    resolve_stored_selection,
     validate_stored_selection_integrity,
 )
 from ..utils.compute import controlled_compute
@@ -51,31 +56,50 @@ def sanitize_hierarchy(
         True if assay_name is present in z and contains `counts` and `featureData` child nodes else raises error
     """
     matrix_root = z if matrix_root is None else matrix_root
+    zw = z if workspace is None else as_zarr_group(z[workspace], name=workspace)
+    assay_zw = as_zarr_group(
+        _child(zw, assay_name, f"ERROR: {assay_name} not found in zarr file"),
+        name=assay_name,
+    )
+    _child(assay_zw, "featureData", f"ERROR: 'featureData' not found in {assay_name}")
     if workspace is None:
-        zw = z
+        matrix_assay = (
+            assay_zw
+            if matrix_root is z
+            else as_zarr_group(matrix_root[assay_name], name=assay_name)
+        )
+        _child(matrix_assay, "counts", f"ERROR: 'counts' not found in {assay_name}")
     else:
-        zw = as_zarr_group(z[workspace], name=workspace)
-    if assay_name not in zw:
-        raise KeyError(f"ERROR: {assay_name} not found in zarr file")
-    assay_zw = as_zarr_group(zw[assay_name], name=assay_name)
-    if "featureData" not in assay_zw:
-        raise KeyError(f"ERROR: 'featureData' not found in {assay_name}")
-    if workspace is None:
-        matrix_assay = as_zarr_group(matrix_root[assay_name], name=assay_name)
-        if "counts" not in matrix_assay:
-            raise KeyError(f"ERROR: 'counts' not found in {assay_name}")
-    else:
-        if "matrices" not in matrix_root:
-            raise KeyError("ERROR: Workspace defined but no 'matrices' slot found")
-        matrices = as_zarr_group(matrix_root["matrices"], name="matrices")
-        if assay_name not in matrices:
-            raise KeyError(f"ERROR: {assay_name} not found in workspace matrices slot")
-        matrix_assay = as_zarr_group(matrices[assay_name], name=assay_name)
-        if "counts" not in matrix_assay:
-            raise KeyError(
-                f"ERROR: 'counts' not found in {assay_name} in workspace matrices slot"
-            )
+        matrices = as_zarr_group(
+            _child(
+                matrix_root,
+                "matrices",
+                "ERROR: Workspace defined but no 'matrices' slot found",
+            ),
+            name="matrices",
+        )
+        matrix_assay = as_zarr_group(
+            _child(
+                matrices,
+                assay_name,
+                f"ERROR: {assay_name} not found in workspace matrices slot",
+            ),
+            name=assay_name,
+        )
+        _child(
+            matrix_assay,
+            "counts",
+            f"ERROR: 'counts' not found in {assay_name} in workspace matrices slot",
+        )
     return True
+
+
+def _child(group: zarr.Group, key: str, error: str) -> zarr.Group | zarr.Array:
+    # Indexing reads the child once; a membership test first reads it twice.
+    try:
+        return group[key]
+    except KeyError:
+        raise KeyError(error) from None
 
 
 class BaseDataStore:
@@ -111,6 +135,7 @@ class BaseDataStore:
         z: The Zarr file (directory) used for this datastore instance.
     """
 
+    @validation_scoped
     def __init__(
         self,
         zarr_loc: ZarrLocation,
@@ -160,11 +185,20 @@ class BaseDataStore:
         self.memoryBytes = self.resources.memoryBytes
         self.storageProfile = storage_profile
         self.storageIo = storageIo
-        assay_names = self.assay_names
+        from ..storage.identity import REBUILD_REQUIRED
+
+        assay_groups = self._scan_assays()
+        self._assayNames = tuple(assay_groups)
+        for name, group in assay_groups.items():
+            state = group.attrs.get("prepared")
+            if (state is not True and state is not False) or (
+                self.zw.read_only and state is not True
+            ):
+                raise ValueError(f"Assay {name!r} is not prepared. {REBUILD_REQUIRED}")
         legacy_state_paths = [
             f"{assay_name}/state"
-            for assay_name in assay_names
-            if "state" in as_zarr_group(self.zw[assay_name], name=assay_name)
+            for assay_name, group in assay_groups.items()
+            if "state" in group
         ]
         if legacy_state_paths:
             paths = ", ".join(legacy_state_paths)
@@ -179,6 +213,11 @@ class BaseDataStore:
         self._load_assays(assay_types)
         # TODO: Reset all attrs, pca, dendrogram etc
         self._ini_cell_props(min_features_per_cell, mito_pattern, ribo_pattern)
+        if (
+            self.zarr_mode == "r+"
+            and self.zw.attrs.get("defaultAssay") != self._defaultAssay
+        ):
+            self.zw.attrs["defaultAssay"] = self._defaultAssay
         # TODO: Implement _caches to hold are cached data
         # TODO: Implement _defaults to hold default parameters for methods
 
@@ -245,7 +284,7 @@ class BaseDataStore:
                 )
             external_roots[fingerprint] = root
 
-        return ArtifactLineage._from_validated_external_roots(
+        return ArtifactLineage.from_store(
             self.zw,
             target,
             external_roots=external_roots,
@@ -266,6 +305,7 @@ class BaseDataStore:
             store=self.zw.store,
             path=store_path,
             mode="r",
+            zarr_format=self.zw.metadata.zarr_format,
         )
 
     def list_artifacts(
@@ -315,42 +355,51 @@ class BaseDataStore:
 
     @property
     def assay_names(self) -> list[str]:
-        """Load all assay names present in the Zarr file. Zarr writers create
-        an 'is_assay' attribute in the assay level and this function looks for
-        presence of those attributes to load assay names.
+        """Names of the assays present in the Zarr file. Zarr writers create
+        an 'is_assay' attribute in the assay level and the hierarchy is
+        scanned for those attributes when the store opens and when an assay
+        is added.
 
         Returns:
             Names of assays present in a Zarr file
         """
-        assays = []
+        return list(self._assayNames)
+
+    def _scan_assays(self) -> dict[str, zarr.Group]:
+        """Find and validate every assay group in one pass over the hierarchy."""
         # Object-store listings can repeat a group and may not preserve order
         # across calls, so keep unique names in sorted order.
-        for i in sorted(dict.fromkeys(self.zw.group_keys())):
-            if "is_assay" in self.zw[i].attrs.keys():
-                validate_assay_name(i)
-                sanitize_hierarchy(
+        assays = {
+            name: group
+            for name, group in sorted(dict(self.zw.groups()).items())
+            if "is_assay" in group.attrs
+        }
+
+        def check(name: str) -> Callable[[], bool]:
+            def run() -> bool:
+                validate_assay_name(name)
+                return sanitize_hierarchy(
                     self.z,
-                    i,
+                    name,
                     self.workspace,
-                    matrix_root=self._matrix_root_for_assay(i),
+                    matrix_root=self._matrix_root_for_assay(name),
                 )
-                assays.append(i)
+
+            return run
+
+        run_concurrently(
+            [check(name) for name in assays], workers=metadata_workers(self.zw)
+        )
         return assays
 
     def _matrix_root_for_assay(self, assay_name: str) -> zarr.Group | None:
         """Return the local or mounted root that owns one assay's counts."""
-        if self.workspace is None:
-            if assay_name in self.z:
-                local_assay = self.z[assay_name]
-                if isinstance(local_assay, zarr.Group) and "counts" in local_assay:
-                    return self.z
-        elif "matrices" in self.z:
-            matrices = self.z["matrices"]
-            if isinstance(matrices, zarr.Group) and assay_name in matrices:
-                local_assay = matrices[assay_name]
-                if isinstance(local_assay, zarr.Group) and "counts" in local_assay:
-                    return self.z
-        return self._matrix_z
+        prefix = "" if self.workspace is None else "matrices/"
+        try:
+            self.z[f"{prefix}{assay_name}/counts"]
+        except KeyError:
+            return self._matrix_z
+        return self.z
 
     def _load_default_assay(self, assay_name: str | None = None) -> str:
         """This function sets a given assay name as defaultAssay attribute. If
@@ -370,8 +419,6 @@ class BaseDataStore:
             else:
                 if len(self.assay_names) == 1:
                     assay_name = self.assay_names[0]
-                    if self.zarr_mode == "r+":
-                        self.zw.attrs["defaultAssay"] = assay_name
                 else:
                     raise ValueError(
                         "ERROR: You have more than one assay data. "
@@ -385,8 +432,6 @@ class BaseDataStore:
                         logger.info(
                             f"Default assay changed from {self.zw.attrs['defaultAssay']} to {assay_name}"
                         )
-                if self.zarr_mode == "r+":
-                    self.zw.attrs["defaultAssay"] = assay_name
             else:
                 raise ValueError(
                     f"ERROR: The provided default assay name: {assay_name} was not found. "
@@ -434,7 +479,7 @@ class BaseDataStore:
         )
         if custom_assay_types is None:
             custom_assay_types = {}
-        for i in self.assay_names:
+        for i in self._assayNames:
             if i in custom_assay_types:
                 if custom_assay_types[i] in preset_assay_types_map:
                     assay = preset_assay_types_map[custom_assay_types[i]]
@@ -468,17 +513,16 @@ class BaseDataStore:
                 else:
                     z_attrs[i] = assay_name
                     logger.debug(f"Setting assay {i} to assay type: {assay.__name__}")
-            with _defer_feature_props():
-                loaded_assay = assay(
-                    z=self.z,
-                    workspace=self.workspace,
-                    name=i,
-                    cell_data=self.cells,
-                    nthreads=self.nthreads,
-                    matrix_root=self._matrix_root_for_assay(i),
-                    resources=self.resources,
-                    storageIo=self.storageIo,
-                )
+            loaded_assay = assay(
+                z=self.z,
+                workspace=self.workspace,
+                name=i,
+                cell_data=self.cells,
+                nthreads=self.nthreads,
+                matrix_root=self._matrix_root_for_assay(i),
+                resources=self.resources,
+                storageIo=self.storageIo,
+            )
             setattr(self, i, loaded_assay)
         if not self.zw.read_only and self.zw.attrs.get("assayTypes") != z_attrs:
             self.zw.attrs["assayTypes"] = z_attrs
@@ -503,52 +547,17 @@ class BaseDataStore:
         )
 
     def _ensure_dataset_fingerprint(self, from_assay: str) -> str:
-        assay = self._get_assay(from_assay)
-        existing = assay.attrs.get("dataset_fingerprint")
-        if existing is not None:
-            return str(existing)
-        if self.zarr_mode != "r+":
-            raise PermissionError(
-                "dataset_fingerprint is missing and cannot be stored read-only"
-            )
-        fingerprint = self._calculate_dataset_fingerprint(from_assay)
-        assay.attrs["dataset_fingerprint"] = fingerprint
-        return fingerprint
+        from ..storage.identity import validate_preparation
 
-    def _calculate_dataset_fingerprint(self, from_assay: str) -> str:
         assay = self._get_assay(from_assay)
-        builder = ValueFingerprintBuilder()
-        builder.update_bytes(
-            "dataset",
-            canonical_bytes(
-                {
-                    "assay": from_assay,
-                    "shape": list(assay.rawData.shape),
-                    "dtype": np.dtype(assay.rawData.dtype).str,
-                }
-            ),
+        fingerprint = validate_preparation(
+            assay.z,
+            self.cells.locations["primary"],
+            assay.matrixGroup,
+            require_transpose=assay.requiresCountsT,
         )
-        builder.update_array(
-            "cell_ids",
-            np.asarray(self.cells.fetch_all("ids")).astype(str),
-        )
-        builder.update_array(
-            "feature_ids",
-            np.asarray(assay.feats.fetch_all("ids")).astype(str),
-        )
-        builder.update_array(
-            "cell_n_counts",
-            np.asarray(self.cells.fetch_all(f"{from_assay}_nCounts")),
-        )
-        builder.update_array(
-            "cell_n_features",
-            np.asarray(self.cells.fetch_all(f"{from_assay}_nFeatures")),
-        )
-        builder.update_array(
-            "feature_n_cells",
-            np.asarray(assay.feats.fetch_all("nCells")),
-        )
-        return builder.hexdigest()
+        assert fingerprint is not None
+        return fingerprint
 
     def snapshot_cell_selection(self, cell_key: str = "I") -> ArtifactRef:
         """Capture a live boolean cell column as an immutable selection.
@@ -563,7 +572,10 @@ class BaseDataStore:
         Returns:
             A complete datastore-scoped cell-selection artifact.
         """
-        return resolve_stored_selection_artifact(
+        return self._snapshot_cell_selection(cell_key).ref
+
+    def _snapshot_cell_selection(self, cell_key: str) -> ValidatedStoredSelection:
+        return resolve_stored_selection(
             self.zw,
             table_path="cellData",
             id_column="ids",
@@ -631,142 +643,38 @@ class BaseDataStore:
         mito_pattern: str | None,
         ribo_pattern: str | None,
     ) -> None:
-        """This function is called on class initialization. For each assay, it
-        calculates per-cell statistics i.e. nCounts, nFeatures, percentMito and
-        percentRibo. These statistics are then populated into the cell metadata
-        table.
-
-        Args:
-            min_features: Minimum features that a cell must have non-zero value before being filtered out.
-            mito_pattern: Regex pattern for identification of mitochondrial genes.
-            ribo_pattern: Regex pattern for identification of ribosomal genes.
-
-        Returns:
-        """
-        if self.zw.read_only:
-            return
-        for from_assay in self.assay_names:
+        for from_assay in self._assayNames:
+            # _load_assays opened every assay group, so its attributes are current.
             assay = self._get_assay(from_assay)
-
-            n_counts_name = from_assay + "_nCounts"
-            compute_n_counts = n_counts_name not in self.cells.columns
-            n_features_name = from_assay + "_nFeatures"
-            compute_n_features = n_features_name not in self.cells.columns
-            compute_n_cells = assay._deferred_feature_props
-
-            percent_feature_indices: dict[str, np.ndarray] = {}
-            percent_feature_provenance: dict[str, tuple[str, str]] = {}
+            prepared = assay.z.attrs.get("prepared") is True
+            patterns: dict[str, str | None] = {}
             if isinstance(assay, RNAassay):
-                percent_mito_name = from_assay + "_percentMito"
-                if mito_pattern != "" and not (
-                    mito_pattern is None and percent_mito_name in self.cells.columns
-                ):
-                    resolved_mito_pattern = (
-                        "^MT-" if mito_pattern is None else mito_pattern
-                    )
-                    mito_plan = assay._plan_percent_feature(
-                        resolved_mito_pattern,
-                        percent_mito_name,
-                    )
-                    if mito_plan is not None:
-                        mito_idx, fingerprint = mito_plan
-                        percent_feature_indices[percent_mito_name] = mito_idx
-                        percent_feature_provenance[percent_mito_name] = (
-                            resolved_mito_pattern,
-                            fingerprint,
-                        )
+                patterns = {
+                    f"{from_assay}_percentMito": mito_pattern
+                    if prepared or mito_pattern is not None
+                    else DEFAULT_PERCENT_PATTERNS["percentMito"],
+                    f"{from_assay}_percentRibo": ribo_pattern
+                    if prepared or ribo_pattern is not None
+                    else DEFAULT_PERCENT_PATTERNS["percentRibo"],
+                }
+            assay.prepare(patterns)
+        if not self.zw.read_only:
+            self._filter_cells(min_features)
 
-                percent_ribo_name = from_assay + "_percentRibo"
-                if ribo_pattern != "" and not (
-                    ribo_pattern is None and percent_ribo_name in self.cells.columns
-                ):
-                    resolved_ribo_pattern = (
-                        "RPS|RPL|MRPS|MRPL" if ribo_pattern is None else ribo_pattern
-                    )
-                    ribo_plan = assay._plan_percent_feature(
-                        resolved_ribo_pattern,
-                        percent_ribo_name,
-                    )
-                    if ribo_plan is not None:
-                        ribo_idx, fingerprint = ribo_plan
-                        percent_feature_indices[percent_ribo_name] = ribo_idx
-                        percent_feature_provenance[percent_ribo_name] = (
-                            resolved_ribo_pattern,
-                            fingerprint,
-                        )
-
-            stats: dict[str, np.ndarray] = {}
-            if (
-                compute_n_counts
-                or compute_n_features
-                or compute_n_cells
-                or percent_feature_indices
-            ):
-                stats = assay._stream_initialization_stats(
-                    compute_n_counts=compute_n_counts,
-                    compute_n_features=compute_n_features,
-                    compute_n_cells=compute_n_cells,
-                    percent_feature_indices=percent_feature_indices,
-                )
-
-            if assay._deferred_feature_props:
-                assay._store_feature_props(stats["nCells"])
-
-            computed_n_counts: np.ndarray | None = None
-            if compute_n_counts:
-                n_c = stats["nCounts"]
-                computed_n_counts = n_c.astype(np.float64)
-                self.cells.insert(
-                    n_counts_name,
-                    computed_n_counts,
-                    overwrite=True,
-                )
-                if isinstance(assay, RNAassay):
-                    min_nc = min(n_c)
-                    if min(n_c) < assay.sf:
-                        logger.warning(
-                            f"Minimum cell count ({min_nc}) is lower than "
-                            f"size factor multiplier ({assay.sf})"
-                        )
-
-            if compute_n_features:
-                self.cells.insert(
-                    n_features_name,
-                    stats["nFeatures"].astype(np.float64),
-                    overwrite=True,
-                )
-
-            for name in percent_feature_indices:
-                pattern, fingerprint = percent_feature_provenance[name]
-                assay._write_percent_feature(
-                    name,
-                    stats[name],
-                    feat_pattern=pattern,
-                    feature_fingerprint=fingerprint,
-                    n_counts=computed_n_counts,
-                )
-
-            if assay._deferred_feature_props:
-                raise RuntimeError(
-                    f"({from_assay}) Deferred feature initialization was not completed"
-                )
-
-            if from_assay == self._defaultAssay:
-                v = self.cells.fetch(from_assay + "_nFeatures", key="I")
-                if min_features > np.median(v):
-                    logger.warning(
-                        f"More than half of the cells have fewer than {min_features} features "
-                        f"for assay: {from_assay}. Will not remove low quality cells automatically."
-                    )
-                else:
-                    bv = self.cells.sift(
-                        from_assay + "_nFeatures", min_features, np.inf
-                    )
-                    # Making sure that the write operation is only done if the filtering results have changed
-                    cur_index = self.cells.fetch_all("I")
-                    nbv = bv & cur_index
-                    if all(nbv == cur_index) is False:
-                        self.cells.update_key(bv, key="I")
+    def _filter_cells(self, min_features: int) -> None:
+        from_assay = self._defaultAssay
+        n_features = self.cells.fetch_all(from_assay + "_nFeatures")
+        active = self.cells.fetch_all("I")
+        if min_features > np.median(n_features[active]):
+            logger.warning(
+                f"More than half of the cells have fewer than {min_features} features "
+                f"for assay: {from_assay}. Will not remove low quality cells automatically."
+            )
+            return
+        keep = (n_features > min_features) & (n_features < np.inf)
+        # Write only when filtering changes the active cells.
+        if not np.array_equal(keep & active, active):
+            self.cells.update_key(keep, key="I")
 
     @staticmethod
     def _col_renamer(from_assay: str, cell_key: str, suffix: str) -> str:

@@ -302,6 +302,9 @@ def test_write_counts_t_records_execution_report() -> None:
     counts[:] = values
     persist_count_matrix_plan(group, layout)
     persist_count_matrix_plan(counts, layout)
+    from scarf.storage.identity import finalize_counts
+
+    finalize_counts(counts)
     write_counts_t(
         counts,
         group,

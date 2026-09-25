@@ -90,28 +90,29 @@ def simplicial_set_embedding(
     if "disable" not in tqdm_params:
         tqdm_params["disable"] = not verbose
 
-    with threadpool_limits(limits=nthreads):
-        embedding = optimize_layout_euclidean(
-            head_embedding=embedding,
-            tail_embedding=embedding,
-            head=g.row,
-            tail=g.col,
-            n_epochs=n_epochs,
-            n_vertices=g.shape[1],
-            epochs_per_sample=epochs_per_sample,
-            a=a,
-            b=b,
-            rng_state=rng_state,
-            gamma=gamma,
-            initial_alpha=initial_alpha,
-            negative_sample_rate=negative_sample_rate,
-            parallel=parallel,
-            verbose=False,
-            densmap=densmap,
-            densmap_kwds=densmap_kwds,
-            tqdm_kwds=tqdm_params,
-            move_other=True,
-        )
+    # Numba's thread count is per thread, so the layout needs no process-wide
+    # BLAS limit and can run beside other pipeline stages.
+    embedding = optimize_layout_euclidean(
+        head_embedding=embedding,
+        tail_embedding=embedding,
+        head=g.row,
+        tail=g.col,
+        n_epochs=n_epochs,
+        n_vertices=g.shape[1],
+        epochs_per_sample=epochs_per_sample,
+        a=a,
+        b=b,
+        rng_state=rng_state,
+        gamma=gamma,
+        initial_alpha=initial_alpha,
+        negative_sample_rate=negative_sample_rate,
+        parallel=parallel,
+        verbose=False,
+        densmap=densmap,
+        densmap_kwds=densmap_kwds,
+        tqdm_kwds=tqdm_params,
+        move_other=True,
+    )
     return np.asarray(embedding)
 
 

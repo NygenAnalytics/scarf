@@ -9,7 +9,8 @@ from numpy.typing import DTypeLike
 from ..assay import RNAassay, _read_block, norm_lib_size
 from ..metadata.rows import read_metadata_rows_chunkwise
 from ..storage.artifacts import ValueFingerprintBuilder, callable_identity
-from ..storage.budget import ResourceBudget, admit_stream
+from ..storage.budget import ResourceBudget
+from ..storage.execution import admit_stream
 from ..storage.geometry import ArrayGeometry, array_geometry
 from ..storage.parallel import stream_shards
 from ..storage.partition import (

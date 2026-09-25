@@ -2,6 +2,10 @@ import os
 
 # Bound Scarf worker auto-detection before pytest plugins import NumPy or Scarf.
 os.environ["SCARF_WORKERS"] = "2"
+# Interactive backends such as TkAgg bind figures to the thread that created
+# them. Garbage collection triggered on a Zarr I/O thread then finalizes those
+# objects on the wrong thread and crashes the worker with an illegal instruction.
+os.environ["MPLBACKEND"] = "Agg"
 
 import sys
 

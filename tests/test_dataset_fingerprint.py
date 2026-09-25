@@ -1,34 +1,29 @@
 import pytest
+import zarr
 
 from scarf.storage.artifacts import ValueFingerprintBuilder
 
 
-def test_dataset_fingerprint_is_created_once_and_left_dormant(
-    datastore_ephemeral,
-    monkeypatch,
-) -> None:
-    assay = datastore_ephemeral.get_assay("RNA")
-    if "dataset_fingerprint" in assay.attrs:
-        del assay.attrs["dataset_fingerprint"]
-
+def test_dataset_fingerprint_is_read_without_recomputing(
+    datastore_ephemeral, monkeypatch
+):
     fingerprint = datastore_ephemeral._ensure_dataset_fingerprint("RNA")
-    assert assay.attrs["dataset_fingerprint"] == fingerprint
 
     def fail_if_recomputed(*_args, **_kwargs):
-        raise AssertionError("dataset_fingerprint must remain dormant")
+        raise AssertionError("prepared identity must not be recomputed")
 
     monkeypatch.setattr(ValueFingerprintBuilder, "update_array", fail_if_recomputed)
     assert datastore_ephemeral._ensure_dataset_fingerprint("RNA") == fingerprint
 
 
-def test_read_only_store_does_not_create_dataset_fingerprint(
-    datastore_ephemeral,
-) -> None:
-    assay = datastore_ephemeral.get_assay("RNA")
-    if "dataset_fingerprint" in assay.attrs:
-        del assay.attrs["dataset_fingerprint"]
-    datastore_ephemeral.zarr_mode = "r"
-
-    with pytest.raises(PermissionError, match="cannot be stored read-only"):
-        datastore_ephemeral._ensure_dataset_fingerprint("RNA")
-    assert "dataset_fingerprint" not in assay.attrs
+@pytest.mark.parametrize("mode", ["r", "r+"])
+def test_missing_prepared_identity_requires_explicit_rebuilding(
+    datastore_ephemeral, mode
+):
+    store = datastore_ephemeral
+    root = zarr.open_group(store=store.zw.store, mode="r+")
+    del root["RNA"].attrs["dataset_fingerprint"]
+    store.zarr_mode = mode
+    with pytest.raises(ValueError, match="inconsistent dataset identity"):
+        store._ensure_dataset_fingerprint("RNA")
+    assert "dataset_fingerprint" not in root["RNA"].attrs

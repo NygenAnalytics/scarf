@@ -24,7 +24,7 @@ _PUBLIC_CLASS_METHODS = {
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    DataStoreMerge: "96cfe6d07ac5536f04d1cd333a42f58957fe3ab5d89c69b65acea72b2d5bf5f6",
+    DataStoreMerge: "5c255d884a2b32b18920124c1685d1a47c1c73610dd629d7f5bcc8b63356f182",
 }
 _FACADE_METHODS = {
     MergePlan: (),

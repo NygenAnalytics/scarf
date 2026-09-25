@@ -187,14 +187,9 @@ def test_trajectory_identity_helpers_cover_drift_and_invalid_values(
         normMethod=object(),
         sf=None,
     )
-    assert (
-        trajectory_operations._assay_dataset_fingerprint(object(), stored) == "stable"
+    store = SimpleNamespace(
+        _ensure_dataset_fingerprint=lambda name: stored.attrs["dataset_fingerprint"]
     )
-    calculated_store = SimpleNamespace(_calculate_dataset_fingerprint=lambda name: "")
-    with pytest.raises(ValueError, match="fingerprint is unavailable"):
-        trajectory_operations._assay_dataset_fingerprint(
-            calculated_store, SimpleNamespace(attrs={}, name="RNA")
-        )
 
     monkeypatch.setattr(
         trajectory_operations,
@@ -202,7 +197,7 @@ def test_trajectory_identity_helpers_cover_drift_and_invalid_values(
         lambda method: {"callable": "stable"},
     )
     trajectory_operations._validate_assay_execution_identity(
-        object(),
+        store,
         stored,
         dataset_fingerprint="stable",
         normalization_method={"callable": "stable"},
@@ -212,7 +207,7 @@ def test_trajectory_identity_helpers_cover_drift_and_invalid_values(
     stored.sf = True
     with pytest.raises(ValueError, match="normalization settings changed"):
         trajectory_operations._validate_assay_execution_identity(
-            object(),
+            store,
             stored,
             dataset_fingerprint="stable",
             normalization_method={"callable": "stable"},
@@ -223,7 +218,7 @@ def test_trajectory_identity_helpers_cover_drift_and_invalid_values(
     stored.attrs["dataset_fingerprint"] = "changed"
     with pytest.raises(ValueError, match="dataset identity changed"):
         trajectory_operations._validate_assay_execution_identity(
-            object(),
+            store,
             stored,
             dataset_fingerprint="stable",
             normalization_method={"callable": "stable"},
@@ -238,7 +233,7 @@ def test_trajectory_identity_helpers_cover_drift_and_invalid_values(
     )
     with pytest.raises(ValueError, match="normalization settings changed"):
         trajectory_operations._validate_assay_execution_identity(
-            object(),
+            store,
             stored,
             dataset_fingerprint="stable",
             normalization_method={"callable": "stable"},

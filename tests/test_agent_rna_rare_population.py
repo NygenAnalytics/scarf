@@ -16,7 +16,6 @@ from scarf.agent.orchestrator.models import (
     AutomatedPreprocessingPlan,
     AutomatedWorkflowConfig,
     PreprocessedAssayHandoff,
-    artifact_model_to_ref,
 )
 from scarf.agent.parameter_tuning.hvg import core_hvg_evidence
 from scarf.agent.types import ArtifactReferenceModel
@@ -211,7 +210,7 @@ def test_rare_study_group_enlarges_then_retains_full_reference_markers(
         "partitions": 1 if maximum_sample < 400 else 0,
     }
     assert report.cellSelection == handoff.cellSelection
-    assert artifact_model_to_ref(report.finalClusterArtifact) == reference
+    assert report.finalClusterArtifact.to_artifact_ref() == reference
     np.testing.assert_array_equal(store.cells.fetch_all("I"), live_before)
     selected = next(
         row
@@ -219,7 +218,7 @@ def test_rare_study_group_enlarges_then_retains_full_reference_markers(
         if row.candidateId == report.recommendedCandidateId
     )
     markers = store.get_markers(
-        marker=artifact_model_to_ref(selected.artifacts["markerTable"]),
+        marker=selected.artifacts["markerTable"].to_artifact_ref(),
         min_score=0.0,
         min_frac_exp=0.0,
     )
@@ -234,7 +233,7 @@ def test_rare_study_group_enlarges_then_retains_full_reference_markers(
         and row.parameters.dimensions == 21
         and row.parameters.neighborsK == 11
     )
-    sample_ref = artifact_model_to_ref(screened.cellSelection)
+    sample_ref = screened.cellSelection.to_artifact_ref()
     rows = read_stored_selection_indices(
         store.zw,
         sample_ref,
@@ -244,9 +243,9 @@ def test_rare_study_group_enlarges_then_retains_full_reference_markers(
         table_path="cellData",
     )
     sample_labels = np.asarray(
-        store.load_artifact(artifact_model_to_ref(screened.artifacts["clusters"]))[
-            "values"
-        ][:]
+        store.load_artifact(screened.artifacts["clusters"].to_artifact_ref())["values"][
+            :
+        ]
     )
     # This checks numerical transfer on exactly shared cells, independently of the scripted preference.
     assert adjusted_rand_score(reference_labels[rows], sample_labels) > 0.95

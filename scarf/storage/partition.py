@@ -7,6 +7,7 @@ from typing import Literal
 
 import numpy as np
 
+from ..utils.arrays import has_duplicates
 from .geometry import ArrayGeometry
 
 type Fits = Callable[[int], bool]
@@ -19,7 +20,11 @@ __all__ = [
     "is_contiguous",
     "partition_indices",
     "row_band",
+    "scan_band",
 ]
+
+# One multi-chunk read per band: Zarr fetches a band's chunks concurrently.
+SCAN_BAND_BYTES = 64 * 1024**2
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +51,18 @@ def row_band(
         return max(1, int(fallback))
     extent = geometry.axisShard(0) if unit == "shard" else geometry.axisChunk(0)
     return max(1, extent)
+
+
+def scan_band(geometry: ArrayGeometry | None, *, fallback: int) -> int:
+    """Return rows per read for a whole-array scan: whole chunks up to 64 MiB.
+
+    Reading one chunk per request leaves object stores idle for a round trip
+    per chunk; a band of chunks costs one round trip.
+    """
+    if geometry is None:
+        return max(1, int(fallback))
+    chunks = max(1, SCAN_BAND_BYTES // max(1, geometry.nominalChunkBytes()))
+    return geometry.axisChunk(0) * chunks
 
 
 def contiguous_ranges(nRows: int, band: int) -> list[tuple[int, int]]:
@@ -99,7 +116,7 @@ def checked_indices(
     indexes = indexes.astype(np.int64, copy=False)
     if np.any(indexes < 0) or np.any(indexes >= limit):
         raise IndexError(f"{name} contains an out-of-range index")
-    if np.unique(indexes).size != indexes.size:
+    if has_duplicates(indexes):
         raise ValueError(f"{name} cannot contain duplicate indexes")
     return indexes
 

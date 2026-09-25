@@ -1,4 +1,3 @@
-import asyncio
 from typing import Any
 
 import numpy as np
@@ -122,6 +121,7 @@ def test_selection_summary_reuse_and_block_guards() -> None:
         row_ids=validated.row_ids,
         selected_count=validated.selected_count + 1,
         table_path=validated.table_path,
+        row_ids_fingerprint=validated.row_ids_fingerprint,
     )
     with pytest.raises(ArtifactResolutionError) as caught:
         list(selections._iter_validated_selection_blocks(inconsistent, block_rows=2))
@@ -134,22 +134,8 @@ def test_selection_integrity_wraps_dependency_failures(
     root, ref = _selection_root()
     monkeypatch.setattr(
         selections,
-        "inspect_artifact",
+        "open_artifact",
         lambda *_args: (_ for _ in ()).throw(ValueError("bad status")),
-    )
-    with pytest.raises(ArtifactResolutionError) as caught:
-        selections.validate_stored_selection_integrity(
-            root,
-            ref,
-            **_selection_kwargs(),
-        )
-    assert caught.value.code == "artifact_missing"
-
-    monkeypatch.undo()
-    monkeypatch.setattr(
-        selections,
-        "artifact_group",
-        lambda *_args: (_ for _ in ()).throw(KeyError("missing")),
     )
     with pytest.raises(ArtifactResolutionError) as caught:
         selections.validate_stored_selection_integrity(
@@ -191,7 +177,7 @@ def test_selection_integrity_wraps_dependency_failures(
     assert caught.value.code == "selection_values_changed"
 
 
-def test_selection_detects_late_row_and_live_alias_changes(
+def test_selection_rechecks_rows_on_each_request_and_live_alias_changes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, ref = _selection_root()
@@ -202,6 +188,7 @@ def test_selection_detects_late_row_and_live_alias_changes(
         "fingerprint_stored_strings",
         lambda *_args: next(fingerprints),
     )
+    selections.validate_stored_selection_integrity(root, ref, **_selection_kwargs())
     with pytest.raises(ArtifactResolutionError) as caught:
         selections.validate_stored_selection_integrity(
             root,
@@ -326,16 +313,9 @@ def test_selection_producers_reject_drift_and_invalid_sources(
         )
 
     root, _ref = _selection_root()
-    calls = 0
-    original = selections._stored_selection_fingerprint
-
-    def drifting_fingerprint(array: zarr.Array) -> str:
-        nonlocal calls
-        calls += 1
-        return original(array) if calls == 1 else "f" * 64
-
+    # The copied payload is fingerprinted again after the copy.
     monkeypatch.setattr(
-        selections, "_stored_selection_fingerprint", drifting_fingerprint
+        selections, "_stored_selection_fingerprint", lambda _array: "f" * 64
     )
     with pytest.raises(RuntimeError, match="changed"):
         selections.resolve_stored_selection_artifact(
@@ -607,35 +587,12 @@ def _spec(
     )
 
 
-def test_run_async_uses_worker_thread_inside_running_loop() -> None:
-    seen: list[str] = []
-
-    async def success() -> None:
-        seen.append("done")
-
-    async def outer() -> None:
-        sharding._run_async(success)
-
-    asyncio.run(outer())
-    assert seen == ["done"]
-
-    async def failure() -> None:
-        raise ValueError("thread failure")
-
-    async def failing_outer() -> None:
-        with pytest.raises(ValueError, match="thread failure"):
-            sharding._run_async(failure)
-
-    asyncio.run(failing_outer())
-
-
 def test_sparse_geometry_and_batch_contracts(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(ValueError, match="two-dimensional"):
         sharding._destination_geometry(_spec((3,), (3,)))
     assert sharding.row_band_task_count(0, 2) == 0
     with pytest.raises(ValueError, match="positive"):
         sharding.row_band_task_count(3, 0)
-    assert sharding.sparse_write_task_count((), 3) == 0
 
     resources = ResourceBudget(memoryBytes=10**8, workers=2)
     geometry = ArrayGeometry((4, 3), (2, 3), None, 8)
@@ -726,7 +683,7 @@ def test_dense_and_sparse_empty_destination_contracts(
     )
     monkeypatch.setattr(
         sharding,
-        "_writer_count",
+        "plan_dense_write",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(MemoryError("budget")),
     )
     with pytest.raises(MemoryError, match="budget"):

@@ -32,7 +32,6 @@ CONVERT_FORMATS = frozenset({"h5ad", "10x_h5", "10x_dir", "mtx", "loom", "seurat
 # broader set is restricted to reader and writer execution.
 DATA_LAYOUT_ERRORS = (OSError, ValueError, KeyError)
 CONVERSION_DATA_ERRORS = (*DATA_LAYOUT_ERRORS, RuntimeError)
-AGENT_PERSISTENCE_ERRORS = (*CONVERSION_DATA_ERRORS, TypeError)
 
 
 def _local_path(location: str) -> Path:

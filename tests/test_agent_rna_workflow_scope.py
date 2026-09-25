@@ -62,9 +62,14 @@ def _add_assay(path: Path, name: str, assay_type: str) -> None:
         profile="fast_local",
     )
     counts[:] = values
+    from scarf.storage.identity import finalize_counts
+
+    finalize_counts(counts)
     write_counts_t(counts, root[name], resources=ResourceBudget(1024**3, 2))
     root.attrs["assayTypes"] = {**dict(root.attrs["assayTypes"]), name: assay_type}
-    root[name].attrs["dataset_fingerprint"] = f"dataset-{name.lower()}"
+    from scarf import DataStore
+
+    DataStore(str(path), default_assay="RNA", min_features_per_cell=0, nthreads=1)
 
 
 @pytest.mark.parametrize(

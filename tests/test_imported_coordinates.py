@@ -22,9 +22,8 @@ from scarf.storage.artifacts import (
     fingerprint_strings,
     list_artifacts,
 )
-from scarf.storage.budget import ResourceBudget
 from scarf.storage.refs import ArtifactRef
-from scarf.storage.selections import resolve_selection_artifact
+from scarf.storage.selections import resolve_generated_selection_artifact
 
 _SOURCE_DIGEST = hashlib.sha256(b"source-rds").digest()
 
@@ -49,7 +48,7 @@ def _root_with_selection(
     cell_data.create_array("ids", data=cell_ids)
     cell_data.create_array("names", data=cell_ids)
     cell_data.create_array("I", data=selection)
-    ref = resolve_selection_artifact(
+    ref = resolve_generated_selection_artifact(
         root,
         scope="datastore",
         kind="cell_selection",
@@ -59,7 +58,7 @@ def _root_with_selection(
         parameters={},
         inputs={},
         source_column="I",
-    )
+    )[0]
     return root, ref, cell_ids, selection
 
 
@@ -81,15 +80,27 @@ def _fingerprints(
 
 
 def _graph_store(root: zarr.Group) -> DataStore:
-    store = DataStore.__new__(DataStore)
-    store.z = root
-    store.workspace = None
-    store.zarr_mode = "r+"
-    store.storageProfile = "fast_local"
-    store.resources = ResourceBudget(memoryBytes=64 * 1024 * 1024, workers=1)
-    store.nthreads = 1
-    store._defaultAssay = "RNA"
-    return store
+    from scarf.storage.count_matrix import create_product_counts_array
+    from scarf.writers.counts_t import finalize_writer_counts_t
+
+    assay = root["RNA"]
+    counts = create_product_counts_array(
+        assay, root["cellData/ids"].shape[0], 4, np.uint32, profile="fast_local"
+    )
+    counts[:] = 1
+    features = assay.require_group("featureData")
+    for name in ("ids", "names"):
+        features.create_array(name, data=np.array([f"g{i}" for i in range(4)]))
+    features.create_array("I", data=np.ones(4, dtype=bool))
+    assay.attrs.update({"prepared": False, "is_assay": True})
+    root.attrs["assayTypes"] = {"RNA": "RNA"}
+    from scarf.storage.identity import finalize_counts
+
+    finalize_counts(counts)
+    finalize_writer_counts_t(root, "RNA", None, nthreads=1)
+    return DataStore(
+        root.store, default_assay="RNA", min_features_per_cell=0, nthreads=1
+    )
 
 
 def _write_coordinate_fixture(

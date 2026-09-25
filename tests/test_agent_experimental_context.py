@@ -60,7 +60,7 @@ from scarf.metadata.artifacts import (
 from scarf.quality_control.filtering import gaussian_quantile_bounds
 from scarf.storage.pipeline_runs import PipelineOutputRecord, PipelineRunRecord
 from scarf.storage.refs import ArtifactRef
-from scarf.storage.selections import resolve_selection_artifact
+from scarf.storage.selections import resolve_generated_selection_artifact
 
 type TestAction = Literal["skip", "evaluateHarmony", "unsafe", "needsInput"]
 
@@ -140,7 +140,7 @@ class _Store:
         row_ids = np.asarray(self.cells._values["ids"], dtype="U16")
         cell_data.create_array("ids", data=row_ids)
         cell_data.create_array("I", data=self.cells._values["I"])
-        self.cell_selection = resolve_selection_artifact(
+        self.cell_selection = resolve_generated_selection_artifact(
             self.zw,
             scope="datastore",
             kind="cell_selection",
@@ -150,12 +150,12 @@ class _Store:
             parameters={},
             inputs={},
             source_column="I",
-        )
+        )[0]
         self.zw.attrs["_test_cell_selection"] = self.cell_selection.to_dict()
 
     def refresh_cell_selection(self) -> None:
         row_ids = np.asarray(self.cells._values["ids"], dtype="U16")
-        self.cell_selection = resolve_selection_artifact(
+        self.cell_selection = resolve_generated_selection_artifact(
             self.zw,
             scope="datastore",
             kind="cell_selection",
@@ -165,7 +165,7 @@ class _Store:
             parameters={},
             inputs={},
             source_column="I",
-        )
+        )[0]
         self.zw.attrs["_test_cell_selection"] = self.cell_selection.to_dict()
 
     def get_assay_state(self, from_assay: str | None = None) -> None:

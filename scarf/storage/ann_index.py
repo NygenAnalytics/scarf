@@ -13,6 +13,9 @@ from .profiles import StorageProfile
 
 ANN_INDEX_ARRAY = "ann_idx_bytes"
 ANN_INDEX_CHUNK_BYTES = 8 * 1024 * 1024
+# Reads and writes move several chunks per call so Zarr transfers them
+# concurrently; memory stays bounded by one window.
+ANN_INDEX_IO_BYTES = 8 * ANN_INDEX_CHUNK_BYTES
 ANN_INDEX_FORMAT_VERSION = 1
 _ANN_INDEX_METADATA = (
     "ann_index_format_version",
@@ -35,13 +38,6 @@ def has_ann_index(group: zarr.Group, name: str = ANN_INDEX_ARRAY) -> bool:
     return name in group
 
 
-def legacy_ann_index_path(zw_root: str | None, ann_loc: str) -> str | None:
-    """Return the legacy filesystem path for an ANN index."""
-    if zw_root is None:
-        return None
-    return os.path.join(zw_root, ann_loc, "ann_idx")
-
-
 def save_ann_index(
     group: zarr.Group,
     ann_idx: Any,
@@ -60,41 +56,43 @@ def save_ann_index(
     try:
         ann_idx.save_index(path)
         byte_length = os.path.getsize(path)
-        if name in group:
-            del group[name]
-        chunk_size = min(ANN_INDEX_CHUNK_BYTES, max(byte_length, 1))
-        zarr_format = _group_zarr_format(group)
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            for block in iter(lambda: source.read(ANN_INDEX_CHUNK_BYTES), b""):
+                digest.update(block)
+        # The local file is hashed first so the array and its record are
+        # created with one metadata write; overwrite replaces an older index.
         array = group.create_array(
             name,
             shape=(byte_length,),
-            chunks=(chunk_size,),
+            chunks=(min(ANN_INDEX_CHUNK_BYTES, max(byte_length, 1)),),
             dtype="uint8",
             overwrite=True,
             compressors=get_compressors(
                 profile,
-                zarrFormat=zarr_format,
+                zarrFormat=_group_zarr_format(group),
             ),
+            attributes={
+                "byte_length": byte_length,
+                "ann_index_format_version": ANN_INDEX_FORMAT_VERSION,
+                "metric": str(metric),
+                "dimensions": int(dimensions),
+                "element_count": int(element_count),
+                "payload_sha256": digest.hexdigest(),
+            },
         )
-        digest = hashlib.sha256()
         with open(path, "rb") as source:
-            for start in range(0, byte_length, ANN_INDEX_CHUNK_BYTES):
+            for start in range(0, byte_length, ANN_INDEX_IO_BYTES):
                 values = np.frombuffer(
-                    source.read(min(ANN_INDEX_CHUNK_BYTES, byte_length - start)),
+                    source.read(min(ANN_INDEX_IO_BYTES, byte_length - start)),
                     dtype=np.uint8,
                 )
-                digest.update(values)
                 array[start : start + len(values)] = values
-        array.attrs["byte_length"] = byte_length
-        array.attrs["ann_index_format_version"] = ANN_INDEX_FORMAT_VERSION
-        array.attrs["metric"] = str(metric)
-        array.attrs["dimensions"] = int(dimensions)
-        array.attrs["element_count"] = int(element_count)
-        array.attrs["payload_sha256"] = digest.hexdigest()
     finally:
         os.unlink(path)
 
 
-def _validate_ann_index_contract(
+def validate_ann_index_contract(
     group: zarr.Group,
     space: str,
     dim: int,
@@ -174,7 +172,7 @@ def validate_ann_index_payload(
     require_metadata: bool = False,
 ) -> None:
     """Validate ANN bytes and metadata without instantiating hnswlib."""
-    validated = _validate_ann_index_contract(
+    validated = validate_ann_index_contract(
         group,
         space,
         dim,
@@ -203,7 +201,7 @@ def load_ann_index(
     """Load an hnswlib index from a Zarr byte array."""
     import hnswlib
 
-    validated = _validate_ann_index_contract(
+    validated = validate_ann_index_contract(
         group,
         space,
         dim,
@@ -219,11 +217,11 @@ def load_ann_index(
     try:
         digest = hashlib.sha256()
         with open(path, "wb") as destination:
-            for start in range(0, int(source.shape[0]), ANN_INDEX_CHUNK_BYTES):
+            for start in range(0, int(source.shape[0]), ANN_INDEX_IO_BYTES):
                 values = np.asarray(
                     source[
                         start : min(
-                            start + ANN_INDEX_CHUNK_BYTES,
+                            start + ANN_INDEX_IO_BYTES,
                             int(source.shape[0]),
                         )
                     ],
@@ -242,21 +240,3 @@ def load_ann_index(
         return index
     finally:
         os.unlink(path)
-
-
-def load_ann_index_from_path(
-    path: str,
-    space: str,
-    dim: int,
-    expected_count: int | None = None,
-) -> Any:
-    """Load an hnswlib index from a legacy filesystem path."""
-    import hnswlib
-
-    index = hnswlib.Index(space=space, dim=dim)
-    index.load_index(path)
-    if expected_count is not None and int(index.get_current_count()) != int(
-        expected_count
-    ):
-        raise ValueError("ANN index element count does not match coordinates")
-    return index

@@ -1,7 +1,8 @@
 import threading
+import sys
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from typing import Any, Literal
 
@@ -44,7 +45,7 @@ def _io_concurrency(io: int | None) -> Iterator[None]:
 
 
 def _blas_limit(within: int | None) -> Any:
-    if within is None or within < 1:
+    if within is None or within < 1 or in_shard_context():
         return nullcontext()
     return threadpool_limits(limits=within)
 
@@ -87,24 +88,35 @@ def _imap_ordered(
             while pending:
                 result = pending.popleft().result()
                 shutdown_checkpoint()
-                enqueue()
                 yield result
+                del result
+                enqueue()
         finally:
+            original = sys.exception()
+            errors: list[BaseException] = []
             for future in pending:
                 future.cancel()
-            executor.shutdown(wait=True, cancel_futures=True)
-            _close_iterator(iterator)
-
-
-def _resolve_plan(
-    workers: int,
-    n_shards: int,
-    backend: Backend,
-) -> tuple[int, int, int]:
-    if backend == "serial" or in_shard_context():
-        return 1, 1, 1
-    outer_workers = min(max(1, int(workers)), max(1, int(n_shards)))
-    return outer_workers, outer_workers, 1
+            try:
+                executor.shutdown(wait=True, cancel_futures=True)
+            except BaseException as exc:
+                errors.append(exc)
+            for future in pending:
+                try:
+                    future.result()
+                except CancelledError:
+                    pass
+                except BaseException as exc:
+                    errors.append(exc)
+            try:
+                _close_iterator(iterator)
+            except BaseException as exc:
+                errors.append(exc)
+            if errors:
+                if original is not None and not isinstance(original, GeneratorExit):
+                    errors.insert(0, original)
+                if len(errors) == 1:
+                    raise errors[0]
+                raise BaseExceptionGroup("Block stream failed during cleanup", errors)
 
 
 def _progress(
@@ -141,7 +153,8 @@ def stream_shards(
                 def checked() -> Iterator[Any]:
                     for item in iterator:
                         shutdown_checkpoint()
-                        result = fn(item)
+                        with _shard_context():
+                            result = fn(item)
                         shutdown_checkpoint()
                         yield result
 
@@ -173,33 +186,25 @@ def map_shards(
     n_ranges = len(ranges)
     if n_ranges == 0:
         return []
-    worker_count, planned_io, planned_within = _resolve_plan(
-        workers,
-        n_ranges,
-        backend,
-    )
     if io_concurrency is None:
-        io_concurrency = planned_io
+        io_concurrency = min(max(1, workers), n_ranges)
     if within_block_threads is None:
-        within_block_threads = planned_within
+        within_block_threads = 1
     indexed = list(enumerate(ranges))
 
     def call(item: tuple[int, tuple[int, int]]) -> Any:
         index, (start, end) = item
         return produce(index, start, end)
 
-    if worker_count <= 1:
-        with _io_concurrency(io_concurrency), _blas_limit(within_block_threads):
-            return list(_progress((call(item) for item in indexed), msg, n_ranges))
-
-    with (
-        _shard_context(),
-        _io_concurrency(io_concurrency),
-    ):
-        stream = _imap_ordered(
+    return list(
+        stream_shards(
             indexed,
             call,
-            workers=worker_count,
+            workers=min(max(1, workers), n_ranges),
             within_block_threads=within_block_threads,
+            io_concurrency=io_concurrency,
+            msg=msg,
+            total=n_ranges,
+            backend=backend,
         )
-        return list(_progress(stream, msg, n_ranges))
+    )

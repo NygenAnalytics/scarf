@@ -202,11 +202,7 @@ def test_worker_records_error(
         leiden_worker.run_leiden_worker(request_path)
 
     status = json.loads(status_path.read_text(encoding="utf-8"))
-    assert status["status"] == "error"
-    assert status["error"] == "ValueError: bad graph"
-    assert status["inputSetupSeconds"] >= 0
-    assert status["operationSeconds"] >= 0
-    assert status["wholeWorkerSeconds"] >= status["operationSeconds"]
+    assert status == {"status": "error", "error": "ValueError: bad graph"}
 
 
 def test_monitor_warns_without_terminating(
@@ -305,7 +301,6 @@ def test_run_stage_routes_leiden_to_child(
             "inputSetupSeconds": 0.5,
             "operationSeconds": 1.5,
             "wholeWorkerSeconds": 2.25,
-            "childCpuSeconds": 1.1,
             "processCpuSeconds": 1.05,
         }
 
@@ -325,6 +320,7 @@ def test_run_stage_routes_leiden_to_child(
         sampleIntervalSeconds=0.01,
         invalidateCache=True,
         inputRefs={"graph": _GRAPH_REF},
+        submissionId="testsubmission",
     )
 
     assert result.status == "ok"
@@ -334,7 +330,9 @@ def test_run_stage_routes_leiden_to_child(
     assert result.details["artifact"] == _CLUSTER_REF.to_dict()
     assert result.details["workerWholeSeconds"] == 2.25
     assert result.details["workerProcessCpuSeconds"] == 1.05
-    assert result.childCpuSeconds == 1.1
+    assert result.details["subprocessSeconds"] >= 0
+    # The child opens its own store, so the parent probe reports nothing.
+    assert result.details["storeOperations"] is None
     assert called["storeUri"] == "s3://bucket/store.zarr"
     assert called["workDir"] == tmp_path
     assert called["invalidateCache"] is True

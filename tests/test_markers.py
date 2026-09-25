@@ -28,7 +28,6 @@ from scarf.features.markers.regression import (
     _regression_r_batch,
 )
 from scarf.storage.artifacts import ArtifactRef
-from scarf.utils import controlled_compute
 
 
 def test_marker_public_contract_requires_explicit_artifacts() -> None:
@@ -905,24 +904,15 @@ def test_find_markers_fast_raw_path_computes_groupwise_statistics(
             self.raw[:] = values
             persist_count_matrix_plan(root, plan)
             persist_count_matrix_plan(self.raw, plan)
+            from scarf.storage.identity import finalize_counts
+
+            finalize_counts(self.raw)
             counts_t = write_counts_t(self.raw, root)
             assert counts_t is not None
             self.rawDataT = counts_t
 
         def _raw_feature_stream_source(self):
             return self.raw, 1, 0
-
-        @staticmethod
-        def iter_raw_feature_major_blocks(cell_idx, plan, **_kwargs):
-            for block in plan.blocks:
-                yield (
-                    block,
-                    np.ascontiguousarray(
-                        data[np.asarray(cell_idx)][:, block.indices].T
-                    ),
-                    0.01,
-                    "memory",
-                )
 
     monkeypatch.setattr(marker_search_module, "RNAassay", FakeRNA)
 
@@ -946,38 +936,6 @@ def test_find_markers_fast_raw_path_computes_groupwise_statistics(
     for frame in results.values():
         assert len(frame) == 3
         assert np.isfinite(frame["p_value"]).all()
-
-
-def test_iter_raw_feature_columns_matches_normed(datastore):
-    assay = datastore.RNA
-    cell_idx = assay.cells.active_index("I")
-    n_features = int(assay.feats.N)
-    batch_size = 37
-    head = np.arange(min(3 * batch_size, n_features), dtype=np.int64)
-    tail = np.arange(max(n_features - batch_size, 0), n_features, dtype=np.int64)
-    feat_idx = np.unique(np.concatenate([head, tail]))
-    scalar = assay.cells.fetch_all(assay.name + "_nCounts")[cell_idx]
-
-    streamed = controlled_compute(
-        assay.normed(cell_idx=cell_idx, feat_idx=feat_idx), assay.nthreads
-    )
-
-    cols = []
-    mats = []
-    for mat, batch_cols in assay.iter_raw_feature_columns(
-        cell_idx=cell_idx,
-        feat_idx=feat_idx,
-        batch_size=batch_size,
-        scalar=scalar,
-        sf=float(assay.sf),
-    ):
-        mats.append(mat)
-        cols.append(batch_cols)
-
-    fast = np.hstack(mats)
-    assert np.array_equal(np.concatenate(cols), feat_idx)
-    assert fast.shape == streamed.shape
-    assert np.allclose(fast, streamed, rtol=1e-4, atol=1e-4)
 
 
 def test_compact_marker_save_roundtrip():
@@ -1176,39 +1134,6 @@ def test_marker_artifact_write_preserves_legacy_marker_subtree():
     assert "schema_version" not in artifact.attrs
 
 
-def test_legacy_marker_names_and_scores_are_readable():
-    import zarr
-    from zarr.storage import MemoryStore
-
-    from scarf.datastore._operations.features import _load_marker_cluster_frame
-
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    slot = root.create_group("slot")
-    cluster = slot.create_group("1")
-    cluster.create_array(
-        "names",
-        data=np.array(["id2", "id0"]),
-    )
-    cluster.create_array(
-        "scores",
-        data=np.array([0.9, 0.8]),
-    )
-
-    loaded = _load_marker_cluster_frame(
-        slot,
-        cluster,
-        np.array(["gene0", "gene1", "gene2"]),
-        group_id=1,
-        feature_ids=np.array(["id0", "id1", "id2"]),
-    )
-
-    assert loaded["feature_index"].tolist() == [2, 0]
-    assert loaded["feature_name"].tolist() == ["gene2", "gene0"]
-    assert loaded["score"].tolist() == [0.9, 0.8]
-    assert loaded["p_value"].isna().all()
-    assert loaded["p_value_adjusted"].isna().all()
-
-
 def test_load_marker_table_ignores_stale_schema_version_attribute():
     from scarf.features.markers.table import load_marker_table
 
@@ -1222,94 +1147,6 @@ def test_load_marker_table_ignores_stale_schema_version_attribute():
     )
 
     assert loaded["feature_name"].tolist() == ["g1", "g0"]
-
-
-def test_legacy_compact_marker_uses_stored_stat_columns():
-    import zarr
-    from zarr.storage import MemoryStore
-
-    from scarf.features.markers.table import load_marker_table
-
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    slot = root.create_group("slot")
-    slot.attrs["stat_columns"] = [
-        "p_value",
-        "score",
-        "mean_rest",
-        "frac_exp_rest",
-        "fold_change",
-        "mean",
-        "frac_exp",
-    ]
-    slot.create_array("feature_index", data=np.array([1, 0], dtype=np.int32))
-    cluster = slot.create_group("1")
-    stats = np.array(
-        [
-            [0.01, 0.8, 0.5, 0.2, 2.0, 1.0, 0.9],
-            [0.04, 0.4, 0.5, 0.2, 1.0, 0.5, 0.3],
-        ],
-        dtype=np.float64,
-    )
-    cluster.create_array("stats", data=stats)
-    loaded = load_marker_table(
-        slot,
-        cluster,
-        np.array(["g0", "g1", "g2"]),
-        group_id=1,
-    )
-    assert loaded.iloc[0]["feature_name"] == "g1"
-    assert loaded.iloc[0]["score"] == 0.8
-    from statsmodels.stats.multitest import multipletests
-
-    _, expected, _, _ = multipletests([0.01, 0.04], method="fdr_bh")
-    assert loaded["p_value_adjusted"].tolist() == pytest.approx(list(expected))
-
-
-def test_unversioned_compact_marker_roundtrip_preserves_reordered_named_stats():
-    import zarr
-    from zarr.storage import MemoryStore
-
-    from scarf.features.markers.table import (
-        MARKER_STAT_COLUMNS,
-        load_marker_table,
-    )
-
-    source = pd.DataFrame(
-        {
-            "score": [0.4, 0.8],
-            "mean": [0.5, 1.0],
-            "mean_rest": [0.5, 0.5],
-            "frac_exp": [0.3, 0.9],
-            "frac_exp_rest": [0.2, 0.2],
-            "fold_change": [1.0, 2.0],
-            "p_value": [0.04, 0.01],
-            "auc": [0.6, 0.9],
-            "p_value_adjusted": [0.04, 0.02],
-        }
-    )
-    stored_columns = tuple(reversed(MARKER_STAT_COLUMNS))
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    slot = root.create_group("slot")
-    slot.attrs["stat_columns"] = list(stored_columns)
-    slot.create_array("feature_index", data=np.array([0, 1], dtype=np.int32))
-    cluster = slot.create_group("1")
-    cluster.create_array(
-        "stats",
-        data=np.column_stack([source[column].to_numpy() for column in stored_columns]),
-    )
-
-    loaded = load_marker_table(
-        slot,
-        cluster,
-        np.array(["g0", "g1"]),
-        group_id=1,
-    )
-
-    assert "schema_version" not in slot.attrs
-    assert loaded["feature_index"].tolist() == [1, 0]
-    expected = source.iloc[[1, 0]]
-    for column in MARKER_STAT_COLUMNS:
-        np.testing.assert_allclose(loaded[column], expected[column])
 
 
 def _make_canonical_marker_slot(columns=None):
@@ -1625,51 +1462,17 @@ def test_canonical_marker_reader_rejects_malformed_stat_columns():
         )
 
 
-def test_legacy_marker_reader_preserves_unresolved_feature_identity():
-    import zarr
-    from zarr.storage import MemoryStore
-
+def test_canonical_marker_reader_rejects_negative_feature_index():
     from scarf.features.markers.table import load_marker_table
 
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    slot = root.create_group("slot")
-    cluster = slot.create_group("1")
-    cluster.create_array("names", data=np.array(["known", "missing"]))
-    cluster.create_array("scores", data=np.array([0.8, 0.7]))
+    slot, cluster = _make_canonical_marker_slot()
+    slot["feature_index"][:] = np.array([-1, 0], dtype=np.int32)
 
-    loaded = load_marker_table(
-        slot,
-        cluster,
-        np.array(["known"]),
-        group_id=1,
-    )
-
-    assert loaded["feature_name"].tolist() == ["known", "missing"]
-    assert loaded["feature_index"].dtype == pd.Int64Dtype()
-    assert loaded.iloc[0]["feature_index"] == 0
-    assert pd.isna(loaded.iloc[1]["feature_index"])
-
-
-def test_legacy_marker_reader_rejects_negative_feature_index():
-    import zarr
-    from zarr.storage import MemoryStore
-
-    from scarf.features.markers.table import LEGACY_STAT_COLUMNS, load_marker_table
-
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    slot = root.create_group("slot")
-    slot.create_array("feature_index", data=np.array([-1], dtype=np.int32))
-    cluster = slot.create_group("1")
-    cluster.create_array(
-        "stats",
-        data=np.zeros((1, len(LEGACY_STAT_COLUMNS))),
-    )
-
-    with pytest.raises(ValueError, match="unresolved or out-of-range"):
+    with pytest.raises(ValueError, match="out-of-range"):
         load_marker_table(
             slot,
             cluster,
-            np.array(["known"]),
+            np.array(["g0", "g1"]),
             group_id=1,
         )
 

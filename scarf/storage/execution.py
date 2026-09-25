@@ -1,13 +1,13 @@
 """One planner and one execution report for Scarf storage work."""
 
 import os
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
 from ..utils.logging import logger
-from .budget import ResourceBudget
+from .budget import ResourceBudget, detect_workers
 from .io_policy import DEFAULT_STORAGE_IO_POLICY, StorageIoPolicy
 
 AUTO_READ_WIDTH_MULTIPLIER = 8
@@ -71,6 +71,8 @@ class OperationPlan:
     chunksPerShard: int
     ordered: bool
     writes: bool
+    codecWorkers: int
+    residentBytes: int
 
     def as_metrics(self) -> dict[str, Any]:
         return {
@@ -86,8 +88,10 @@ class OperationPlan:
             "ioConcurrency": self.ioConcurrency,
             "prefetch": self.prefetch,
             "innerReads": self.innerReads,
+            "codecWorkers": self.codecWorkers,
             "unitBytes": self.unitBytes,
             "reservedBytes": self.reservedBytes,
+            "residentBytes": self.residentBytes,
             "reductionReason": self.reductionReason,
             "chunksPerShard": self.chunksPerShard,
             "kind": "plan",
@@ -313,6 +317,12 @@ def plan_operation(
         )
 
     per_unit = unit_bytes + decode
+    units = max(1, n_units)
+    write_limit = min(requested_write or workers, workers, units) if shape.writes else 1
+    write_workers = min(
+        write_limit,
+        max(1, available // max(1, per_unit + inner_read)),
+    )
     if per_unit > available:
         raise MemoryError(
             f"One unit needs about {per_unit} bytes in addition to "
@@ -320,7 +330,6 @@ def plan_operation(
             f"{resources.memoryBytes} bytes"
         )
     memory_live = max(1, available // per_unit)
-    units = max(1, n_units) if n_units else 1
     read_auto = min(units, memory_live, auto_read_width(workers))
 
     if shape.ordered:
@@ -332,15 +341,7 @@ def plan_operation(
         if requested_compute is not None
         else compute_auto
     )
-    compute_workers = max(1, compute_workers)
-
-    write_auto = min(units, workers, memory_live) if shape.writes else 1
-    write_workers = (
-        min(requested_write, units, memory_live, workers)
-        if requested_write is not None
-        else write_auto
-    )
-    write_workers = max(1, write_workers)
+    compute_workers = 1 if shape.ordered else max(1, compute_workers)
 
     read_limit = (
         min(requested_read, units, memory_live)
@@ -370,6 +371,7 @@ def plan_operation(
         inner_reads = 1
     if shape.writes:
         write_workers = min(write_workers, read_workers)
+    compute_workers = min(compute_workers, read_workers)
 
     active = max(compute_workers, write_workers if shape.writes else 1, 1)
     threads = max(1, workers // active)
@@ -470,4 +472,64 @@ def plan_operation(
         chunksPerShard=chunks,
         ordered=bool(shape.ordered),
         writes=bool(shape.writes),
+        codecWorkers=min(workers, max(1, detect_workers())),
+        residentBytes=resident + scratch,
+    )
+
+
+def admitted_worker_split(
+    resources: ResourceBudget,
+    *,
+    nTasks: int,
+    taskBytes: Callable[[int], int],
+    residentBytes: int = 0,
+    requested: int | None = None,
+) -> tuple[int, int]:
+    """Split worker slots between outer tasks and each task's inner work."""
+    cpu = min(
+        resources.workers,
+        resources.workers if requested is None else max(1, int(requested)),
+    )
+    tasks = max(1, int(nTasks))
+    resident = max(0, int(residentBytes))
+    available = resources.memoryBytes - resident
+    if available <= 0:
+        raise MemoryError(
+            f"Resident data needs about {resident} bytes, but the operation "
+            f"limit is {resources.memoryBytes} bytes"
+        )
+
+    for outer in range(min(cpu, tasks), 0, -1):
+        for inner in range(max(1, cpu // outer), 0, -1):
+            per_task = max(1, int(taskBytes(inner)))
+            if outer * per_task <= available:
+                return outer, inner
+
+    one_task = max(1, int(taskBytes(1)))
+    raise MemoryError(
+        f"One task needs about {one_task} bytes in addition to {resident} "
+        f"resident bytes, but the operation limit is {resources.memoryBytes} bytes"
+    )
+
+
+def admit_stream(
+    resources: ResourceBudget,
+    *,
+    nBlocks: int,
+    blockBytes: int,
+    decodeBytes: int = 0,
+    residentBytes: int = 0,
+    requested: int | None = None,
+) -> OperationPlan:
+    return plan_operation(
+        resources,
+        WorkShape(
+            nUnits=nBlocks,
+            unitBytes=blockBytes,
+            residentBytes=residentBytes,
+            innerReadBytes=decodeBytes,
+            maxInnerReads=resources.workers,
+            chunksPerShard=resources.workers,
+        ),
+        policy=StorageIoPolicy(readWorkers=requested or resources.workers),
     )

@@ -1,19 +1,15 @@
 """Spawn-safe waits: never use Function.remote() for long profiling work."""
 
 import time
-from collections.abc import Callable
 from typing import Any
 
 from profiling.config import ProfilingConfig, StageName
-from profiling.r2 import get_json, object_exists
-from profiling.results import result_exists
+from profiling.results import load_result
 
 # How often orchestrators poll R2 / call status. Short polls keep heartbeats alive.
 DEFAULT_POLL_SECONDS = 20.0
 # Extra grace after stage timeout for scheduling + result upload.
 DEFAULT_GRACE_SECONDS = 600.0
-# Re-spawn a stage this many times if the Modal call dies without an R2 result.
-DEFAULT_STAGE_SPAWN_ATTEMPTS = 3
 
 # Modal sometimes surfaces failed calls as empty TimeoutError from get(timeout=...).
 # Detect terminal statuses via the call graph instead of spinning until deadline.
@@ -67,29 +63,6 @@ def _raise_if_terminal_failure(call: Any) -> None:
         )
 
 
-def await_function_call(
-    call: Any,
-    *,
-    pollSeconds: float = DEFAULT_POLL_SECONDS,
-    deadlineSeconds: float,
-) -> Any:
-    """Wait on a spawned FunctionCall with short get() polls (not .remote())."""
-    if pollSeconds <= 0:
-        raise ValueError("pollSeconds must be positive")
-    if deadlineSeconds <= 0:
-        raise ValueError("deadlineSeconds must be positive")
-    deadline = time.monotonic() + deadlineSeconds
-    while time.monotonic() < deadline:
-        remaining = max(0.1, deadline - time.monotonic())
-        timeout = min(pollSeconds, remaining)
-        try:
-            return call.get(timeout=timeout)
-        except TimeoutError:
-            _raise_if_terminal_failure(call)
-            continue
-    raise TimeoutError(f"Spawned call did not finish within {deadlineSeconds:.0f}s")
-
-
 def await_many_function_calls(
     calls: list[Any],
     *,
@@ -125,83 +98,62 @@ def await_many_function_calls(
     return [item for item in results]
 
 
+def await_function_call(
+    call: Any,
+    *,
+    pollSeconds: float = DEFAULT_POLL_SECONDS,
+    deadlineSeconds: float,
+) -> Any:
+    """Wait on a spawned FunctionCall with short get() polls (not .remote())."""
+    return await_many_function_calls(
+        [call], pollSeconds=pollSeconds, deadlineSeconds=deadlineSeconds
+    )[0]
+
+
 def await_stage_result(
     config: ProfilingConfig,
     nRows: int,
     stage: StageName,
     call: Any,
     *,
+    submissionId: str,
     pollSeconds: float = DEFAULT_POLL_SECONDS,
     deadlineSeconds: float,
-    onPoll: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
-    """Prefer durable R2 result JSON; fall back to the call return value."""
-    if pollSeconds <= 0:
-        raise ValueError("pollSeconds must be positive")
-    if deadlineSeconds <= 0:
-        raise ValueError("deadlineSeconds must be positive")
-    deadline = time.monotonic() + deadlineSeconds
-    last_error: BaseException | None = None
+    """Wait for a spawned stage, preferring its durable result JSON on R2.
 
-    while time.monotonic() < deadline:
-        if result_exists(config, nRows, stage):
-            return get_json(config.resultUri(nRows, stage))
-        if onPoll is not None:
-            onPoll()
-        remaining = max(0.1, deadline - time.monotonic())
-        timeout = min(pollSeconds, remaining)
+    The JSON is read before every short poll and after a call error, because a
+    call can fail or stall after it persisted its result.
+    """
+    deadline = time.monotonic() + deadlineSeconds
+    while (
+        stored := load_result(config, nRows, stage, submissionId=submissionId)
+    ) is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Timed out waiting for {stage} result at "
+                f"{config.resultUri(nRows, stage)}"
+            )
         try:
-            payload = call.get(timeout=timeout)
+            payload = await_function_call(
+                call,
+                pollSeconds=pollSeconds,
+                deadlineSeconds=min(pollSeconds, remaining),
+            )
         except TimeoutError:
-            try:
-                _raise_if_terminal_failure(call)
-            except RuntimeError as exc:
-                last_error = exc
-                if result_exists(config, nRows, stage):
-                    return get_json(config.resultUri(nRows, stage))
-                raise
             continue
-        except Exception as exc:  # noqa: BLE001 - Modal surfaces many failure types
-            last_error = exc
-            # Call may have died after writing R2; check once more.
-            if result_exists(config, nRows, stage):
-                return get_json(config.resultUri(nRows, stage))
+        except Exception:
+            if (
+                stored := load_result(config, nRows, stage, submissionId=submissionId)
+            ) is not None:
+                return stored
             raise
-
-        if result_exists(config, nRows, stage):
-            return get_json(config.resultUri(nRows, stage))
-        if isinstance(payload, dict):
-            return payload
-        raise TypeError(
-            f"Stage {stage} returned non-dict payload: {type(payload).__name__}"
-        )
-
-    if result_exists(config, nRows, stage):
-        return get_json(config.resultUri(nRows, stage))
-    if last_error is not None:
-        raise TimeoutError(
-            f"Timed out waiting for {stage} after call error: {last_error}"
-        ) from last_error
-    raise TimeoutError(
-        f"Timed out waiting for {stage} result at {config.resultUri(nRows, stage)}"
-    )
-
-
-def await_json_uri(
-    uri: str,
-    *,
-    pollSeconds: float = DEFAULT_POLL_SECONDS,
-    deadlineSeconds: float,
-) -> dict[str, Any]:
-    """Wait for a create-only JSON object to appear on R2."""
-    if pollSeconds <= 0:
-        raise ValueError("pollSeconds must be positive")
-    if deadlineSeconds <= 0:
-        raise ValueError("deadlineSeconds must be positive")
-    deadline = time.monotonic() + deadlineSeconds
-    while time.monotonic() < deadline:
-        if object_exists(uri):
-            return get_json(uri)
-        remaining = max(0.1, deadline - time.monotonic())
-        time.sleep(min(pollSeconds, remaining))
-    raise TimeoutError(f"Timed out waiting for JSON object at {uri}")
+        if not isinstance(payload, dict):
+            raise TypeError(
+                f"Stage {stage} returned non-dict payload: {type(payload).__name__}"
+            )
+        if payload.get("submissionId") != submissionId:
+            raise ValueError(f"Stage {stage} returned a result from another submission")
+        return payload
+    return stored

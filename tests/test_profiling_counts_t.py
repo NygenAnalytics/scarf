@@ -49,6 +49,9 @@ def _seed_counts(root_path, values: np.ndarray) -> None:
         overwrite=True,
     )
     counts[:] = values
+    from scarf.storage.identity import finalize_counts
+
+    finalize_counts(counts)
     persist_count_matrix_plan(group, plan)
     persist_count_matrix_plan(counts, plan)
 
@@ -73,6 +76,7 @@ def test_write_counts_t_rewrites_incomplete_array(tmp_path):
         workflow=WorkflowParameters(),
         resources=_resources(),
         sampleIntervalSeconds=0.01,
+        submissionId="testsubmission",
     )
 
     assert result.status == "ok"
@@ -97,6 +101,7 @@ def test_write_counts_t_runs_as_standard_profile_stage(tmp_path):
         workflow=WorkflowParameters(),
         resources=_resources(),
         sampleIntervalSeconds=0.01,
+        submissionId="testsubmission",
     )
 
     assert result.status == "ok"
@@ -123,6 +128,7 @@ def test_write_counts_t_accounts_for_process_resident_memory(tmp_path):
         workflow=WorkflowParameters(),
         resources=resources,
         sampleIntervalSeconds=0.01,
+        submissionId="testsubmission",
     )
 
     assert result.status == "error"
@@ -150,6 +156,7 @@ def test_write_counts_t_forwards_storage_io(tmp_path):
             computeWorkers=1,
         ),
         sampleIntervalSeconds=0.01,
+        submissionId="testsubmission",
     )
 
     assert result.status == "ok", result.error
@@ -202,11 +209,11 @@ def test_create_store_defers_counts_t_to_write_stage(tmp_path):
         resources=_resources(),
         localH5adPath=h5ad_path,
         sampleIntervalSeconds=0.01,
+        submissionId="testsubmission",
     )
     assert create.status == "ok"
     assert create.details is not None
-    assert create.details["countsOnly"] is True
-    assert create.details["countsTPresent"] is False
+    assert create.details["storeOperations"]["sets"] > 0
     after_create = zarr.open_group(str(store_path), mode="r")
     assert "countsT" not in after_create["RNA"]
     np.testing.assert_array_equal(after_create["RNA/counts"][:], values)
@@ -218,6 +225,7 @@ def test_create_store_defers_counts_t_to_write_stage(tmp_path):
         workflow=WorkflowParameters(),
         resources=_resources(),
         sampleIntervalSeconds=0.01,
+        submissionId="testsubmission",
     )
     assert write.status == "ok"
     assert write.details is not None
@@ -250,6 +258,7 @@ def test_write_counts_t_clears_complete_when_validation_fails(
         workflow=WorkflowParameters(),
         resources=_resources(),
         sampleIntervalSeconds=0.01,
+        submissionId="testsubmission",
     )
 
     assert result.status == "error"

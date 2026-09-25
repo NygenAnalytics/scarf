@@ -3,9 +3,6 @@ import pandas as pd
 from numba import njit, prange
 from scipy.stats import norm
 
-_MARKER_SORT_BY = ("score", "p_value")
-_MARKER_SORT_ASCENDING = (False, True)
-
 __all__ = [
     "_batch_stats",
     "_batch_stats_gene_major",
@@ -18,18 +15,24 @@ __all__ = [
 
 
 def sort_marker_results(df: pd.DataFrame) -> pd.DataFrame:
-    frame = df.copy()
-    if "feature_index" not in frame.columns:
-        frame["feature_index"] = frame.index
-    sort_by = list(_MARKER_SORT_BY)
-    ascending = list(_MARKER_SORT_ASCENDING)
-    if "feature_name" in frame.columns:
-        sort_by.append("feature_name")
-        ascending.append(True)
-    else:
-        sort_by.append("feature_index")
-        ascending.append(True)
-    return frame.sort_values(by=sort_by, ascending=ascending)
+    """Order markers by descending score, then p-value, then feature.
+
+    A stable NumPy lexsort gives the same order as the equivalent pandas sort,
+    including NaNs last, without factorizing every key column.
+    """
+    frame = df if "feature_index" in df.columns else df.assign(feature_index=df.index)
+    tie = "feature_name" if "feature_name" in frame.columns else "feature_index"
+    keys = frame[tie].to_numpy()
+    if keys.dtype == object:
+        keys = keys.astype(str)
+    order = np.lexsort(
+        (
+            keys,
+            frame["p_value"].to_numpy(dtype=np.float64),
+            -frame["score"].to_numpy(dtype=np.float64),
+        )
+    )
+    return frame.iloc[order]
 
 
 def mannwhitneyu_from_ranks(
@@ -173,6 +176,47 @@ def _marker_stats_batch(
 
 
 @njit(cache=True, nogil=True)
+def _argsort_positive(
+    values: np.ndarray,
+    n: int,
+    order: np.ndarray,
+    scratch: np.ndarray,
+    buckets: np.ndarray,
+) -> None:
+    """Stably argsort ``values[:n]`` into ``order[:n]``.
+
+    Positive float32 values sort like their bit patterns read as unsigned
+    integers, so three counting passes of 11, 11, and 10 bits replace a
+    comparison sort.
+    """
+    keys = values.view(np.uint32)
+    for index in range(n):
+        order[index] = index
+    source = order
+    target = scratch
+    shift = 0
+    for bits in (11, 11, 10):
+        mask = np.uint32((1 << bits) - 1)
+        buckets[: mask + 1] = 0
+        for index in range(n):
+            buckets[(keys[source[index]] >> np.uint32(shift)) & mask] += 1
+        total = 0
+        for bucket in range(mask + 1):
+            count = buckets[bucket]
+            buckets[bucket] = total
+            total += count
+        for index in range(n):
+            position = source[index]
+            bucket = (keys[position] >> np.uint32(shift)) & mask
+            target[buckets[bucket]] = position
+            buckets[bucket] += 1
+        source, target = target, source
+        shift += bits
+    if source is not order:
+        order[:n] = source[:n]
+
+
+@njit(cache=True, nogil=True)
 def _marker_stats_gene_major(
     raw: np.ndarray,
     scalar: np.ndarray,
@@ -188,31 +232,37 @@ def _marker_stats_gene_major(
     n_genes = raw.shape[0]
     n_cells = raw.shape[1]
     n_groups = group_counts.shape[0]
+    nz_values = np.empty(n_cells, dtype=np.float32)
+    nz_cells = np.empty(n_cells, dtype=np.int64)
+    order = np.empty(n_cells, dtype=np.int64)
+    order_scratch = np.empty(n_cells, dtype=np.int64)
+    buckets = np.empty(2048, dtype=np.int64)
+    zero_g = np.zeros(n_groups)
     for g in range(n_genes):
         row = destination_rows[g]
         if row < 0:
             continue
-        nz_values = np.empty(n_cells, dtype=np.float32)
-        nz_cells = np.empty(n_cells, dtype=np.int64)
-        zero_g = np.zeros(n_groups)
         sum_g = np.zeros(n_groups)
         nz_g = np.zeros(n_groups)
         rank_g = np.zeros(n_groups)
         drank_g = np.zeros(n_groups)
         n_nz = 0
         for c in range(n_cells):
-            grp = int_indices[c]
-            value = (size_factor * np.float32(raw[g, c])) / scalar[c]
+            count = raw[g, c]
+            if count == 0:
+                continue
+            value = (size_factor * np.float32(count)) / scalar[c]
             if log_transform:
                 value = np.log1p(value)
             if value > 0.0:
+                grp = int_indices[c]
                 nz_values[n_nz] = value
                 nz_cells[n_nz] = c
                 n_nz += 1
                 sum_g[grp] += value
                 nz_g[grp] += 1.0
-            else:
-                zero_g[grp] += 1.0
+        for x in range(n_groups):
+            zero_g[x] = group_counts[x] - nz_g[x]
 
         n_zero = n_cells - n_nz
         tie_sum = 0.0
@@ -225,7 +275,7 @@ def _marker_stats_gene_major(
                 rank_g[x] = zero_g[x] * zero_rank
                 drank_g[x] = zero_g[x]
 
-        order = np.argsort(nz_values[:n_nz])
+        _argsort_positive(nz_values, n_nz, order, order_scratch, buckets)
         i = 0
         dense_rank = 1.0 if n_zero > 0 else 0.0
         while i < n_nz:
@@ -307,8 +357,11 @@ def gene_major_rank_scratch_bytes(
     cells = max(0, int(n_cells))
     groups = max(0, int(n_groups))
     threads = max(1, int(nthreads))
+    int64 = np.dtype(np.int64).itemsize
+    # Values, their cells, and the radix sort's order and scratch arrays.
     per_thread = (
-        cells * (np.dtype(np.float32).itemsize + 2 * np.dtype(np.int64).itemsize)
+        cells * (np.dtype(np.float32).itemsize + 3 * int64)
+        + 2048 * int64
         + groups * 6 * np.dtype(np.float64).itemsize
     )
     return threads * per_thread

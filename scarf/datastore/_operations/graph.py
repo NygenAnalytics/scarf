@@ -36,9 +36,6 @@ from ...graph.feature_projection import (
     resolve_coordinate_inputs,
     resolve_native_graph_inputs,
 )
-from ...embeddings.imported_storage import (
-    validate_imported_coordinates_artifact,
-)
 from ...matrix import ChunkedArray
 from ...neighbors.stages import (
     AnnIndexStage,
@@ -46,11 +43,9 @@ from ...neighbors.stages import (
     ChunkedCoordinateStream,
     CoordinateSource,
     KMeansInitializationStage,
-    LazyTransformStream,
     NeighborQueryStage,
     ReductionTransform,
 )
-from ...neighbors.stream import AnnStream
 from ...storage.ann_index import (
     has_ann_index,
     load_ann_index,
@@ -67,12 +62,10 @@ from ...storage.artifact_writer import (
 )
 from ...storage.artifacts import (
     ArtifactRef,
-    ArtifactScope,
     artifact_group,
     artifact_path,
     group_at,
     inspect_artifact,
-    list_artifacts,
     require_complete_artifact,
 )
 from ...storage.errors import ArtifactResolutionError
@@ -95,7 +88,6 @@ from ...storage.selections import (
     ValidatedStoredSelection,
     iter_selected_axis_selection_blocks,
     read_stored_selection_mask,
-    resolve_selection_artifact,
     snapshot_run_metadata,
     validate_run_metadata_snapshot,
     validate_stored_selection_integrity,
@@ -486,168 +478,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             element_count=element_count,
         )
 
-    def _load_artifact_ann_stream(
-        self,
-        neighbors_ref: ArtifactRef,
-        feat_scaling: bool,
-    ) -> AnnStream:
-        if neighbors_ref.scope != "assay" or neighbors_ref.assay is None:
-            raise ValueError("neighbors must be assay-scoped")
-        lineage = resolve_native_graph_inputs(self.zw, neighbors_ref)
-        if lineage.normalized is None or lineage.reduction is None:
-            raise ValueError(
-                "Graph silhouette requires neighbors built from normalized data"
-            )
-        correction_ref = None
-        ann_ref = lineage.ann_index
-        reduction_ref = lineage.reduction
-        normalized_ref = lineage.normalized
-        coordinates_ref = lineage.coordinates
-        if coordinates_ref.kind == "batch_correction":
-            correction_ref = coordinates_ref
-        reduction_status = inspect_artifact(self.zw, reduction_ref)
-        raw_scaling = (reduction_status.inputs or {}).get("feature_scaling")
-        if not isinstance(raw_scaling, dict):
-            raise ValueError("reduction has no 'feature_scaling' artifact input")
-        scaling_ref = ArtifactRef.from_dict(raw_scaling)
-        normalized_group = artifact_group(self.zw, normalized_ref)
-        scaling_group = artifact_group(self.zw, scaling_ref)
-        reduction_group = artifact_group(self.zw, reduction_ref)
-        neighbors_group = artifact_group(self.zw, neighbors_ref)
-        data = ChunkedArray(
-            as_zarr_array(normalized_group["data"], name="data"),
-            nthreads=self.nthreads,
-            resources=self.resources,
-        )
-        mu = np.asarray(as_zarr_array(scaling_group["mean"], name="mean")[:])
-        sigma = np.asarray(as_zarr_array(scaling_group["scale"], name="scale")[:])
-        loadings = (
-            np.asarray(as_zarr_array(reduction_group["loadings"], name="loadings")[:])
-            if "loadings" in reduction_group
-            else None
-        )
-        reduction_status = inspect_artifact(self.zw, reduction_ref)
-        reduction_params = reduction_status.parameters or {}
-        operation = reduction_status.operation
-        reduction_method = (
-            {
-                "run_pca": "pca",
-                "run_lsi": "lsi",
-                "run_custom_reduction": "custom",
-            }.get(operation)
-            if operation is not None
-            else None
-        )
-        if reduction_method is None:
-            reduction_method = str(reduction_params.get("reduction_method", "pca"))
-        ann_params = inspect_artifact(self.zw, ann_ref).parameters or {}
-        neighbor_params = inspect_artifact(self.zw, neighbors_ref).parameters or {}
-        cached_scaling = bool(
-            reduction_params.get(
-                "feat_scaling",
-                reduction_method == "pca",
-            )
-        )
-        if cached_scaling != feat_scaling:
-            raise ValueError(
-                f"Reduction was built with feat_scaling={cached_scaling}, "
-                f"not {feat_scaling}"
-            )
-        corrected = None
-        if correction_ref is not None:
-            correction_group = artifact_group(self.zw, correction_ref)
-            corrected = ChunkedArray(
-                as_zarr_array(correction_group["data"], name="data"),
-                nthreads=self.nthreads,
-                resources=self.resources,
-            )
-        ann_metric = str(ann_params.get("ann_metric", "l2"))
-        raw_dims = reduction_params.get("dims")
-        dims = int(
-            raw_dims
-            if raw_dims is not None
-            else loadings.shape[1]
-            if loadings is not None
-            else data.shape[1]
-        )
-        ann_idx = self._resolve_ann_index(
-            ann_ref,
-            ann_metric,
-            dims if dims > 0 else data.shape[1],
-            expected_count=int(data.shape[0]),
-        )
-        neighbor_indices = as_zarr_array(
-            neighbors_group["indices"],
-            name="indices",
-        )
-        k_value = neighbor_params.get("k")
-        ann_obj = AnnStream(
-            data=data,
-            k=int(neighbor_indices.shape[1] if k_value is None else k_value),
-            n_cluster=2,
-            reduction_method=reduction_method,
-            dims=dims,
-            loadings=loadings,
-            use_for_pca=(
-                read_stored_selection_mask(
-                    self.zw,
-                    self._artifact_input_ref(
-                        reduction_ref,
-                        "pca_cell_selection",
-                        "cell_selection",
-                    ),
-                    kind="cell_selection",
-                    scope="datastore",
-                    assay=None,
-                    table_path="cellData",
-                )[
-                    read_stored_selection_mask(
-                        self.zw,
-                        lineage.cell_selection,
-                        kind="cell_selection",
-                        scope="datastore",
-                        assay=None,
-                        table_path="cellData",
-                    )
-                ]
-                if reduction_method == "pca"
-                else np.ones(data.shape[0], dtype=bool)
-            ),
-            mu=mu,
-            sigma=sigma,
-            ann_metric=ann_metric,
-            ann_efc=int(ann_params.get("ann_efc", 50)),
-            ann_ef=int(ann_params.get("ann_ef", 50)),
-            ann_m=int(ann_params.get("ann_m", 48)),
-            nthreads=self.nthreads,
-            ann_parallel=bool(ann_params.get("ann_parallel", False)),
-            rand_state=int(ann_params.get("rand_state", 4466)),
-            do_kmeans_fit=False,
-            disable_scaling=not cached_scaling,
-            ann_idx=ann_idx,
-            lsi_skip_first=bool(
-                reduction_params.get(
-                    "skip_first",
-                    reduction_params.get("lsi_skip_first", True),
-                )
-            ),
-            lsi_params={},
-            harmonize=correction_ref is not None,
-            harmonized_data=corrected,
-            batches=None,
-            center=(
-                _read_pca_center(reduction_group) if reduction_method == "pca" else None
-            ),
-        )
-        persisted_ann_threads = int(ann_params.get("parallel_threads") or 1)
-        AnnIndexStage.configure(
-            ann_obj.annIdx,
-            ef=int(ann_params.get("ann_ef", 50)),
-            threads=persisted_ann_threads,
-        )
-        ann_obj.annThreads = persisted_ann_threads
-        return ann_obj
-
     def _get_graph_ncells_k(self, graph_loc: str) -> tuple[int, int]:
         """
 
@@ -750,43 +580,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             self._require_complete_artifact(input_ref, kind)
         return input_ref
 
-    def _resolve_selection_input(
-        self,
-        *,
-        metadata_group: zarr.Group,
-        column: str,
-        values: np.ndarray,
-        row_ids: np.ndarray,
-        scope: ArtifactScope,
-        kind: str,
-        assay: str | None,
-        invalidate_cache: bool,
-    ) -> ArtifactRef:
-        del metadata_group
-        if getattr(self, "zarr_mode", "r+") != "r+":
-            raise PermissionError(
-                f"Snapshotting selection column {column!r} requires a writable store"
-            )
-        return resolve_selection_artifact(
-            self.zw,
-            scope=scope,
-            assay=assay,
-            kind=kind,
-            values=values,
-            row_ids=row_ids,
-            operation="snapshot_manual_selection",
-            parameters={},
-            inputs={},
-            source_column=column,
-            invalidate_cache=invalidate_cache,
-        )
-
-    def _graph_cell_selection(
-        self,
-        graph_ref: ArtifactRef,
-    ) -> ArtifactRef:
-        return graph_cell_selection(self.zw, graph_ref)
-
     def _load_normalized_artifact(
         self,
         ref: ArtifactRef,
@@ -874,95 +667,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
                 shutil.rmtree(cache_base, ignore_errors=True)
 
-    def _load_reduction_stream(
-        self,
-        reduction_ref: ArtifactRef,
-        *,
-        batch_size: int | None,
-    ) -> tuple[ReductionTransform, LazyTransformStream]:
-        status = self._require_complete_artifact(
-            reduction_ref,
-            "reduction",
-        )
-        parameters = status.parameters or {}
-        operation = status.operation
-        method = (
-            {
-                "run_pca": "pca",
-                "run_lsi": "lsi",
-                "run_custom_reduction": "custom",
-            }.get(operation)
-            if operation is not None
-            else None
-        )
-        if method is None:
-            method = str(parameters.get("reduction_method", "pca"))
-        normalized_ref = self._artifact_input_ref(
-            reduction_ref,
-            "normalized",
-            "normalized",
-        )
-        scaling_ref = self._artifact_input_ref(
-            reduction_ref,
-            "feature_scaling",
-            "feature_scaling",
-        )
-        normalized = self._load_normalized_artifact(
-            normalized_ref,
-            batch_size=batch_size,
-        )
-        block_rows = int(normalized.chunksize[0])
-        scaling_group = artifact_group(self.zw, scaling_ref)
-        mu = np.asarray(as_zarr_array(scaling_group["mean"], name="mean")[:])
-        sigma = np.asarray(as_zarr_array(scaling_group["scale"], name="scale")[:])
-        reduction_group = group_at(self.zw, status.path)
-        loadings = (
-            np.asarray(
-                as_zarr_array(
-                    reduction_group["loadings"],
-                    name="loadings",
-                )[:]
-            )
-            if "loadings" in reduction_group
-            else None
-        )
-        raw_dims = parameters.get("dims")
-        dims = int(
-            raw_dims
-            if raw_dims is not None
-            else loadings.shape[1]
-            if loadings is not None
-            else 0
-        )
-        transform = ReductionTransform(
-            data=normalized,
-            method=method,
-            dims=dims,
-            loadings=loadings,
-            use_for_pca=np.ones(normalized.shape[0], dtype=bool),
-            mu=mu,
-            sigma=sigma,
-            batch_size=block_rows,
-            nthreads=self.nthreads,
-            rand_state=int(parameters.get("rand_state", 4466)),
-            disable_scaling=not bool(parameters.get("feat_scaling", method == "pca")),
-            lsi_skip_first=bool(
-                parameters.get(
-                    "skip_first",
-                    parameters.get("lsi_skip_first", True),
-                )
-            ),
-            lsi_params={},
-            center=_read_pca_center(reduction_group) if method == "pca" else None,
-        )
-        stream = LazyTransformStream(
-            data=normalized,
-            transform=transform.transform,
-            nthreads=self.nthreads,
-            batch_size=block_rows,
-        )
-        return transform, stream
-
     def _coordinate_source(
         self,
         coordinates: ArtifactRef,
@@ -974,102 +678,18 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             reduction_status = inspect_artifact(self.zw, lineage.reduction)
             if reduction_status.operation == "run_pca":
                 _read_pca_center(artifact_group(self.zw, lineage.reduction))
-        if coordinates.kind == "imported_coordinates":
-            status = self._require_complete_artifact(
-                coordinates,
-                "imported_coordinates",
-            )
-            validate_imported_coordinates_artifact(self.zw, coordinates)
-            group = group_at(self.zw, status.path)
-            backing = as_zarr_array(group["data"], name="data")
-            data = ChunkedArray(
-                backing,
-                block_size=_row_block(backing, batch_size),
-                nthreads=self.nthreads,
-                resources=self.resources,
-            )
-            logger.debug(
-                f"Using imported coordinates from {status.path} "
-                f"(shape={data.shape[0]} x {data.shape[1]})"
-            )
-            return (
-                ChunkedCoordinateStream(data, self.nthreads),
-                int(data.shape[0]),
-                int(data.shape[1]),
-            )
-        if coordinates.kind == "batch_correction":
-            status = self._require_complete_artifact(
-                coordinates,
-                "batch_correction",
-            )
-            group = group_at(self.zw, status.path)
-            backing = as_zarr_array(group["data"], name="data")
-            data = ChunkedArray(
-                backing,
-                block_size=_row_block(backing, batch_size),
-                nthreads=self.nthreads,
-                resources=self.resources,
-            )
-            logger.debug(
-                f"Using materialized batch-correction coordinates from "
-                f"{status.path} (shape={data.shape[0]} x {data.shape[1]})"
-            )
-            return (
-                ChunkedCoordinateStream(data, self.nthreads),
-                int(data.shape[0]),
-                int(data.shape[1]),
-            )
-        if coordinates.kind == "reduction":
-            status = self._require_complete_artifact(
-                coordinates,
-                "reduction",
-            )
-            group = group_at(self.zw, status.path)
-            method_label = {
-                "run_pca": "PCA",
-                "run_lsi": "LSI",
-                "run_custom_reduction": "custom reduction",
-            }.get(
-                status.operation or "",
-                str((status.parameters or {}).get("reduction_method", "reduction")),
-            )
-            if "data" in group:
-                backing = as_zarr_array(group["data"], name="data")
-                data = ChunkedArray(
-                    backing,
-                    block_size=_row_block(backing, batch_size),
-                    nthreads=self.nthreads,
-                    resources=self.resources,
-                )
-                logger.debug(
-                    f"Using materialized {method_label} coordinates from "
-                    f"{status.path} (shape={data.shape[0]} x {data.shape[1]})"
-                )
-                return (
-                    ChunkedCoordinateStream(data, self.nthreads),
-                    int(data.shape[0]),
-                    int(data.shape[1]),
-                )
-            logger.warning(
-                f"Materialized {method_label} coordinates missing at "
-                f"{status.path} (no 'data' array); falling back to on-the-fly "
-                f"projection from normalized data. Downstream ANN, neighbors, "
-                f"and embedding init will re-read normalized features instead "
-                f"of stored reduced coordinates."
-            )
-            transform, stream = self._load_reduction_stream(
-                coordinates,
-                batch_size=batch_size,
-            )
-            dims = (
-                int(transform.dims)
-                if transform.dims is not None and transform.dims > 0
-                else int(stream.data.shape[1])
-            )
-            return stream, int(stream.data.shape[0]), dims
-        raise ValueError(
-            "Coordinates must reference reduction, batch_correction, "
-            "or imported_coordinates"
+        group = artifact_group(self.zw, coordinates)
+        backing = as_zarr_array(group["data"], name="data")
+        data = ChunkedArray(
+            backing,
+            block_size=_row_block(backing, batch_size),
+            nthreads=self.nthreads,
+            resources=self.resources,
+        )
+        return (
+            ChunkedCoordinateStream(data, self.nthreads),
+            int(data.shape[0]),
+            int(data.shape[1]),
         )
 
     def _plan_assay_artifact(
@@ -1179,40 +799,14 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             if raw_size_factor is not None
             else None
         )
-        normalization_parameters: dict[str, Any] = {
-            "normalization_method": normalization_method,
-            "size_factor": size_factor,
-            "log_transform": log_transform,
-            "renormalize_subset": renormalize_subset,
-        }
-        raw_dataset_fingerprint = assay.attrs.get("dataset_fingerprint")
-        if raw_dataset_fingerprint is None and not invalidate_cache:
-            candidates = [
-                inspect_artifact(self.zw, ref)
-                for ref in list_artifacts(
-                    self.zw,
-                    scope="assay",
-                    assay=assay_name,
-                    kind="normalized",
-                    operation="run_normalization",
-                    parameters=normalization_parameters,
-                    inputs={
-                        "cell_selection": cell_selection,
-                        "feature_selection": features,
-                    },
-                    complete_only=True,
-                )
-            ]
-            if candidates:
-                latest = max(candidates, key=lambda status: status.created_at_ns or 0)
-                raw_dataset_fingerprint = (latest.inputs or {}).get(
-                    "dataset_fingerprint"
-                )
-        dataset_fingerprint = (
-            raw_dataset_fingerprint
-            if isinstance(raw_dataset_fingerprint, str) and raw_dataset_fingerprint
-            else self._calculate_dataset_fingerprint(assay_name)
+        from ...assay.normalization import load_normalization_selections
+
+        dataset_fingerprint = self._ensure_dataset_fingerprint(assay_name)
+        selections = load_normalization_selections(
+            self.zw, assay_name, cell_selection, features
         )
+        n_cells = selections.cells.selected_count
+        n_features = int(selections.featureMask.sum())
         arguments = NormalizationArguments(
             cell_selection=cell_selection,
             feature_selection=feature_selection,
@@ -1226,7 +820,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
         def valid_shape(_ref: ArtifactRef, group: zarr.Group) -> bool:
             data = as_zarr_array(group["data"], name="data")
-            return min(data.shape) > 0 and all(
+            return data.shape == (n_cells, n_features) and all(
                 as_zarr_array(group[name], name=name).shape == (data.shape[1],)
                 for name in ("feature_sum", "feature_squared_sum")
             )
@@ -1254,31 +848,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             invalidate_cache=invalidate_cache,
             reuse_validator=valid_shape,
         )
-        if planned.reused:
-            data = as_zarr_array(
-                artifact_group(self.zw, planned.ref)["data"], name="data"
-            )
-            n_cells, n_features = map(int, data.shape)
-        else:
-            feature_selection = self.resolve_features(assay_name, features)
-            validated_cells = validate_stored_selection_integrity(
-                self.zw,
-                cell_selection,
-                kind="cell_selection",
-                scope="datastore",
-                assay=None,
-                table_path="cellData",
-            )
-            cell_values = np.asarray(validated_cells.values[:], dtype=bool)
-            feature_group = artifact_group(self.zw, feature_selection)
-            feature_values = np.asarray(
-                as_zarr_array(feature_group["values"], name="values")[:],
-                dtype=bool,
-            )
-            n_cells = validated_cells.selected_count
-            n_features = int(feature_values.sum())
-            if n_cells < 1 or n_features < 1:
-                raise ValueError("Normalization requires selected cells and features")
+        if not planned.reused:
+            cell_values = np.asarray(selections.cells.values[:], dtype=bool)
+            feature_values = selections.featureMask
             group = start_artifact(self.zw, planned)
             relative_path = artifact_path(planned.ref).removeprefix(f"{assay_name}/")
             assay._write_normalized_payload(
@@ -1382,27 +954,14 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         lsi_n_oversamples: int = 10,
     ) -> ArtifactRef:
         normalized_ref = normalized
-        normalized_status = self._require_complete_artifact(
-            normalized_ref,
-            "normalized",
-        )
+        from ...assay.normalization import load_normalized_inputs
+
         if normalized_ref.assay is None:
             raise ValueError("Normalized artifact has no assay")
         assay_name = normalized_ref.assay
-        normalized_cell_selection = self._artifact_input_ref(
-            normalized_ref,
-            "cell_selection",
-            "cell_selection",
-        )
-        normalized_feature_selection = self._artifact_input_ref(
-            normalized_ref,
-            "feature_selection",
-            "feature_selection",
-        )
-        data_group = as_zarr_group(
-            self.zw[normalized_status.path],
-            name=normalized_status.path,
-        )
+        self._ensure_dataset_fingerprint(assay_name)
+        data_group, selections = load_normalized_inputs(self.zw, normalized_ref)
+        normalized_cell_selection = selections.cells.ref
         data_array = as_zarr_array(data_group["data"], name="data")
         n_cells, n_features = map(int, data_array.shape)
         effective_batch_size = min(
@@ -1419,6 +978,45 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             if effective_dims < 1:
                 raise ValueError("Custom loadings must contain at least one dimension")
         pca_selection = pca_cell_selection or normalized_cell_selection
+        pca_use_values: np.ndarray | None = None
+        if method == "pca":
+            normalized_mask = np.asarray(selections.cells.values[:], dtype=bool)
+            pca_mask = (
+                normalized_mask
+                if pca_cell_selection is None
+                else read_stored_selection_mask(
+                    self.zw,
+                    pca_cell_selection,
+                    kind="cell_selection",
+                    scope="datastore",
+                    assay=None,
+                    table_path="cellData",
+                )
+            )
+            if np.any(pca_mask & ~normalized_mask):
+                raise ArtifactResolutionError(
+                    "PCA cell selection must be a subset of normalized cells",
+                    code="row_mismatch",
+                    context={
+                        "assay": assay_name,
+                        "artifact_id": pca_selection.artifact_id,
+                    },
+                )
+            pca_use_values = pca_mask[normalized_mask]
+            selected_pca_cells = int(pca_use_values.sum())
+            if selected_pca_cells < effective_dims + 1:
+                raise ValueError("PCA requires at least dims + 1 selected cells")
+            if n_features < effective_dims + 1:
+                raise ValueError("PCA requires at least dims + 1 selected features")
+            if effective_batch_size < effective_dims + 1:
+                raise ValueError("PCA batch_size must be at least dims + 1")
+        elif method == "lsi":
+            required_rank = effective_dims + int(lsi_skip_first)
+            if required_rank > min(n_cells, n_features):
+                raise ValueError(
+                    "LSI dimensions, including the skipped component, exceed "
+                    "the normalized matrix rank"
+                )
         enabled_scaling = method == "pca" and feat_scaling
         scaling_arguments = FeatureScalingArguments(
             normalized=normalized_ref,
@@ -1511,95 +1109,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             )
             return planned.ref
 
-        normalized_feature_selection = self.resolve_features(
-            assay_name,
-            normalized_feature_selection,
-        )
-        validated_normalized_cells = validate_stored_selection_integrity(
-            self.zw,
-            normalized_cell_selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )
-        feature_group = artifact_group(self.zw, normalized_feature_selection)
-        selected_features = int(
-            np.count_nonzero(
-                np.asarray(
-                    as_zarr_array(feature_group["values"], name="values")[:],
-                    dtype=bool,
-                )
-            )
-        )
-        if selected_features != n_features:
-            raise ArtifactResolutionError(
-                "Normalized columns do not match its feature selection",
-                code="column_mismatch",
-                context={
-                    "assay": assay_name,
-                    "artifact_id": normalized_ref.artifact_id,
-                    "normalized_columns": n_features,
-                    "selected_count": selected_features,
-                },
-            )
-        if validated_normalized_cells.selected_count != n_cells:
-            raise ArtifactResolutionError(
-                "Normalized rows do not match its cell selection",
-                code="row_mismatch",
-                context={
-                    "assay": assay_name,
-                    "artifact_id": normalized_ref.artifact_id,
-                    "normalized_rows": n_cells,
-                    "selected_count": validated_normalized_cells.selected_count,
-                },
-            )
-        pca_use_values: np.ndarray | None = None
-        if method == "pca":
-            normalized_mask = read_stored_selection_mask(
-                self.zw,
-                normalized_cell_selection,
-                kind="cell_selection",
-                scope="datastore",
-                assay=None,
-                table_path="cellData",
-            )
-            pca_mask = (
-                normalized_mask
-                if pca_cell_selection is None
-                else read_stored_selection_mask(
-                    self.zw,
-                    pca_cell_selection,
-                    kind="cell_selection",
-                    scope="datastore",
-                    assay=None,
-                    table_path="cellData",
-                )
-            )
-            if np.any(pca_mask & ~normalized_mask):
-                raise ArtifactResolutionError(
-                    "PCA cell selection must be a subset of normalized cells",
-                    code="row_mismatch",
-                    context={
-                        "assay": assay_name,
-                        "artifact_id": pca_selection.artifact_id,
-                    },
-                )
-            pca_use_values = pca_mask[normalized_mask]
-            selected_pca_cells = int(pca_use_values.sum())
-            if selected_pca_cells < effective_dims + 1:
-                raise ValueError("PCA requires at least dims + 1 selected cells")
-            if n_features < effective_dims + 1:
-                raise ValueError("PCA requires at least dims + 1 selected features")
-            if effective_batch_size < effective_dims + 1:
-                raise ValueError("PCA batch_size must be at least dims + 1")
-        elif method == "lsi":
-            required_rank = effective_dims + int(lsi_skip_first)
-            if required_rank > min(n_cells, n_features):
-                raise ValueError(
-                    "LSI dimensions, including the skipped component, exceed "
-                    "the normalized matrix rank"
-                )
         with self._cache_normalized_artifact(
             normalized_ref, local_cache, effective_batch_size
         ):
@@ -1723,11 +1232,43 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     "data",
                     score_spec,
                 )
+                from ...storage.sharding import plan_dense_write
+                from ...storage.io_policy import StorageIoPolicy
+
+                transform_bytes = sum(
+                    value.nbytes
+                    for value in (
+                        transform.loadings,
+                        transform.mu,
+                        transform.sigma,
+                        transform.center,
+                    )
+                    if isinstance(value, np.ndarray)
+                )
+                producer_bytes = (
+                    normalized_data._resident_bytes()
+                    + 3 * normalized_data._block_task_bytes()
+                    + normalized_data.chunksize[0] * effective_dims * 4
+                    + transform_bytes
+                )
+                writer_plan = plan_dense_write(
+                    scores,
+                    self.resources,
+                    1,
+                    io=StorageIoPolicy(readWorkers=1),
+                    residentBytes=producer_bytes,
+                )
+                write_bytes = writer_plan.reservedBytes - producer_bytes
 
                 def score_blocks() -> Iterator[np.ndarray]:
-                    for block in normalized_data.stream_blocks(
+                    for block in normalized_data._stream_blocks(
                         nthreads=self.nthreads,
                         msg="Calculating reduced coordinates",
+                        prefetch=1,
+                        row_mask=None,
+                        resident_bytes=write_bytes
+                        + producer_bytes
+                        - normalized_data._block_task_bytes(),
                     ):
                         yield np.asarray(
                             transform.transform(block),
@@ -1741,6 +1282,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     msg="Writing reduced coordinates",
                     resources=self.resources,
                     io=self.storageIo,
+                    producerReserveBytes=producer_bytes,
                 )
             finish_artifact(reduction_group, planned)
         if show_elbow_plot and method == "pca":
@@ -2279,12 +1821,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 n_clusters=effective_clusters,
                 rand_state=resolved_rand_state,
                 nthreads=self.nthreads,
-                enabled=True,
                 kmeans_sampling=resolved_kmeans_sampling,
                 kmeans_batch_size=effective_kmeans_batch_size,
             )
-            if initialization.model is None:
-                raise RuntimeError("K-means initialization did not fit")
             group = start_artifact(self.zw, planned)
             centers = create_zarr_dataset(
                 group,
@@ -2387,23 +1926,15 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             raise ValueError(
                 "Coordinates must reference reduction, batch_correction, or imported_coordinates"
             )
-        coordinate_status = self._require_complete_artifact(
-            coordinates, coordinates.kind
+        self._ensure_dataset_fingerprint(coordinates.assay)
+        coordinate_source, n_cells, dims = self._coordinate_source(
+            coordinates,
+            batch_size=resolved_batch_size,
         )
-        coordinate_group = group_at(self.zw, coordinate_status.path)
-        coordinate_source = None
-        if "data" in coordinate_group:
-            data = as_zarr_array(coordinate_group["data"], name="data")
-            n_cells, dims = map(int, data.shape)
-            source_batch_size = _row_block(data, resolved_batch_size)
-        else:
-            coordinate_source, n_cells, dims = self._coordinate_source(
-                coordinates, batch_size=resolved_batch_size
-            )
-            source_data = getattr(coordinate_source, "data", None)
-            source_batch_size = (
-                int(source_data.chunksize[0]) if source_data is not None else n_cells
-            )
+        source_data = getattr(coordinate_source, "data", None)
+        source_batch_size = (
+            int(source_data.chunksize[0]) if source_data is not None else n_cells
+        )
         requested_batch_size = (
             source_batch_size if resolved_batch_size is None else resolved_batch_size
         )
@@ -2426,10 +1957,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             _ref: ArtifactRef,
             group: zarr.Group,
         ) -> bool:
-            from ...storage.ann_index import _validate_ann_index_contract
+            from ...storage.ann_index import validate_ann_index_contract
 
             try:
-                _validate_ann_index_contract(
+                validate_ann_index_contract(
                     group,
                     ann_metric,
                     dims,
@@ -2448,10 +1979,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             reuse_validator=valid_ann_artifact,
         )
         if not planned.reused:
-            if coordinate_source is None:
-                coordinate_source, n_cells, dims = self._coordinate_source(
-                    coordinates, batch_size=resolved_batch_size
-                )
             ann_idx = AnnIndexStage.fit(
                 coordinates=coordinate_source,
                 metric=ann_metric,
@@ -2539,6 +2066,15 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         ann_metric = ann_parameters.get("ann_metric")
         if ann_metric not in {"l2", "cosine"}:
             raise ValueError("ANN artifact has no supported distance metric")
+        from ...storage.ann_index import validate_ann_index_contract
+
+        validate_ann_index_contract(
+            artifact_group(self.zw, ann_ref),
+            str(ann_metric),
+            dims,
+            expected_count=n_cells,
+            require_metadata=True,
+        )
         arguments = NeighborQueryArguments(
             ann_index=ann_ref,
             coordinates=stored_coordinates,

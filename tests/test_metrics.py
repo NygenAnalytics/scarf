@@ -780,13 +780,6 @@ def test_small_cluster_does_not_invalidate_other_silhouette_scores():
     class Store:
         cells = Cells()
 
-    class Ann:
-        annMetric = "l2"
-
-        @staticmethod
-        def reducer(values):
-            return values
-
     data = np.array(
         [
             [20.0, 20.0],
@@ -804,7 +797,6 @@ def test_small_cluster_does_not_invalidate_other_silhouette_scores():
 
     scores = silhouette_scoring(
         Store(),
-        Ann(),
         graph,
         data,
         "RNA",
@@ -812,6 +804,7 @@ def test_small_cluster_does_not_invalidate_other_silhouette_scores():
         cell_key="subset",
         sample_size=2,
         random_seed=42,
+        distance_metric="l2",
     )
 
     assert scores is not None
@@ -1309,10 +1302,10 @@ def test_metric_lisi_snapshots_mutable_label_inputs(
 def test_silhouette_scoring_missing_cluster_labels(datastore):
     result = silhouette_scoring(
         datastore,
-        ann_obj=None,
         graph=None,
         hvg_data=None,
         assay_type="RNA",
         res_label="missing_resolution_label",
+        distance_metric="l2",
     )
     assert result is None

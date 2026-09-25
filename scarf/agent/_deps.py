@@ -9,14 +9,6 @@ AGENT_INSTALL_HINT = (
 )
 
 
-def require_pydantic() -> tuple[Any, Any]:
-    try:
-        from pydantic import BaseModel, Field
-    except ImportError as exc:
-        raise ImportError(AGENT_INSTALL_HINT) from exc
-    return BaseModel, Field
-
-
 def require_pydantic_ai() -> Any:
     try:
         import pydantic_ai

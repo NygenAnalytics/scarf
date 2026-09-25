@@ -7,10 +7,7 @@ from typing import Any, Hashable, cast
 import numpy as np
 
 from ..metadata import MetaDataRowBlock
-from ..metadata.rows import (
-    read_metadata_missing_rows_chunkwise,
-    read_metadata_rows_chunkwise,
-)
+from ..metadata.rows import read_metadata_rows_chunkwise
 from ..storage import ArtifactRef
 from ..storage.artifacts import artifact_group
 from ..storage.selections import (
@@ -25,6 +22,7 @@ from ._display import stored_display_metadata
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
 from ._raster import (
     _apply_raster_missing_mask,
+    _MissingMaskRows,
     draw_raster_canvas,
     raster_from_metadata,
 )
@@ -92,7 +90,8 @@ class _ArtifactRasterCells:
                 "cell_key cannot override an artifact's stored cell selection"
             )
         requested = list(columns or ())
-        unknown = [column for column in requested if column not in self.columns]
+        available = set(self.columns)
+        unknown = [column for column in requested if column not in available]
         if unknown:
             raise KeyError(f"Raster fields were not found: {unknown!r}")
         resolved_rows = None if block_rows is None else int(block_rows)
@@ -116,6 +115,7 @@ class _ArtifactRasterCells:
                 block_rows=resolved_rows,
             )
 
+        missing_masks = _MissingMaskRows(self._cells)
         compact_start = 0
         for block in source_blocks:
             if isinstance(block, MetaDataRowBlock):
@@ -150,11 +150,7 @@ class _ArtifactRasterCells:
                         column,
                         row_indices,
                     )
-                    missing = read_metadata_missing_rows_chunkwise(
-                        self._cells,
-                        column,
-                        row_indices,
-                    )
+                    missing = missing_masks.read(column, row_indices)
                     values[column] = _apply_raster_missing_mask(
                         live_values,
                         missing,
@@ -293,8 +289,9 @@ def embedding_raster(
         layout_name = layout_key
         layout_source = "live_metadata"
         field_source = "live_metadata" if color_by is not None or subset_by else None
+        available_columns = set(raster_cells.columns)
         for key in (x_key, y_key):
-            if key not in raster_cells.columns:
+            if key not in available_columns:
                 raise KeyError(f"Layout column {key!r} not found in cell metadata")
     else:
         if cell_key != "I":
@@ -305,6 +302,7 @@ def embedding_raster(
             store,
             layout,
         )
+        available_columns = set(raster_cells.columns)
         x_key = _ARTIFACT_X
         y_key = _ARTIFACT_Y
         layout_name = "Embedding"
@@ -323,7 +321,7 @@ def embedding_raster(
         color_key = color_by
         color_label = color_by
         color_kind = "auto"
-    if color_key is not None and color_key not in raster_cells.columns:
+    if color_key is not None and color_key not in available_columns:
         raise KeyError(
             f"color_by {color_key!r} must be a cell-metadata column for "
             "embedding_raster (gene coloring uses embedding() for now)"
@@ -377,7 +375,7 @@ def embedding_raster(
             "embedding_raster currently supports only linear color scales"
         )
 
-    if subset_by is not None and subset_by not in raster_cells.columns:
+    if subset_by is not None and subset_by not in available_columns:
         raise KeyError(f"subset_by {subset_by!r} not found in cell metadata")
 
     quantiles = color_scale.quantiles

@@ -4,6 +4,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import zarr
+from zarr.core.buffer import default_buffer_prototype
+from zarr.core.sync import sync
 from zarr.storage import MemoryStore
 
 import scarf.metadata as metadata
@@ -487,7 +489,7 @@ def test_resolve_grouping_validates_field_kind_and_missing_mask(monkeypatch):
         resolve_grouping(None, cells, CellField("group", kind="categorical"))
 
 
-def test_metadata_table_mount_fill_and_error_contracts(monkeypatch):
+def test_metadata_table_mount_fill_and_error_contracts():
     empty = zarr.open_group(store=MemoryStore(), mode="w")
     with pytest.raises(ValueError, match="empty zarr group"):
         metadata.MetaData(empty)
@@ -499,15 +501,16 @@ def test_metadata_table_mount_fill_and_error_contracts(monkeypatch):
     primary.create_array("x_value", data=np.arange(4), chunks=(2,))
     table = metadata.MetaData(primary)
 
-    class BrokenGroup:
-        @staticmethod
-        def keys():
-            return ["broken"]
-
-        def __getitem__(self, _key):
-            raise RuntimeError("unreadable child")
-
-    assert table._get_size(BrokenGroup()) == table.N
+    # Listing a group reads every column's metadata, so a corrupt column fails loudly.
+    corrupt = zarr.open_group(store=MemoryStore(), mode="w")
+    corrupt.create_array("value", data=np.arange(4), chunks=(2,))
+    sync(
+        corrupt.store.set(
+            "value/zarr.json", default_buffer_prototype().buffer.from_bytes(b"{")
+        )
+    )
+    with pytest.raises(ValueError):
+        table._get_size(corrupt)
     assert table._get_size(empty) == table.N
     assert table._col_renamer("aux", "score") == "aux_score"
     assert table._get_loc("I") == ("primary", "I")
@@ -574,6 +577,5 @@ def test_metadata_table_mount_fill_and_error_contracts(monkeypatch):
     )
     assert repr(table) == "MetaData of 2(4) elements"
 
-    monkeypatch.setattr(table, "_verify_bool", lambda _key: False)
-    with pytest.raises(ValueError, match="Unexpected error"):
-        table.active_index("I")
+    with pytest.raises(TypeError, match="boolean type column"):
+        table.active_index("score")

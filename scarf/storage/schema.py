@@ -24,6 +24,21 @@ _ASSAY_NAME_OWNERS = {
 RESERVED_ASSAY_NAMES = frozenset(_ASSAY_NAME_OWNERS)
 
 
+def validate_new_assay(z: zarr.Group, assay_name: str, workspace: str | None) -> None:
+    from .identity import fresh_group
+
+    validate_assay_name(assay_name)
+    validate_workspace_name(workspace)
+    logical = assay_name if workspace is None else f"{workspace}/{assay_name}"
+    physical = assay_name if workspace is None else f"matrices/{assay_name}"
+    manifest = fresh_group(z).attrs.get("matrixSource", {})
+    mounted = manifest.get("assays", {}) if isinstance(manifest, dict) else {}
+    if logical in z or physical in z or assay_name in mounted:
+        raise ValueError(
+            f"Assay {assay_name!r} already has metadata or a count matrix; choose a new name"
+        )
+
+
 def validate_assay_name(assay_name: str) -> None:
     """Reject invalid assay names and names reserved by the datastore layout."""
     if not assay_name or not assay_name.strip():
@@ -69,12 +84,13 @@ def create_zarr_count_assay(
     profile: StorageProfile | None = None,
     policy: CountMatrixPolicy | None = None,
 ) -> zarr.Array:
-    validate_assay_name(assay_name)
+    validate_new_assay(z, assay_name, workspace)
     if workspace is None:
-        group = z.create_group(assay_name, overwrite=True)
+        group = z.create_group(assay_name)
     else:
-        group = z.create_group(f"{workspace}/{assay_name}", overwrite=True)
+        group = z.create_group(f"{workspace}/{assay_name}")
     group.attrs["is_assay"] = True
+    group.attrs["prepared"] = False
     group.attrs["misc"] = {}
     resolved_profile = profile or resolve_storage_profile(group.store)
     create_zarr_obj_array(
@@ -97,7 +113,7 @@ def create_zarr_count_assay(
         profile=resolved_profile,
     )
     if workspace is not None:
-        group = z.create_group(f"matrices/{assay_name}", overwrite=True)
+        group = z.create_group(f"matrices/{assay_name}")
     n_feats = len(feat_ids)
     zarr_format = _group_zarr_format(group)
     if zarr_format >= 3:
@@ -144,12 +160,13 @@ def create_empty_zarr_count_assay(
     policy: CountMatrixPolicy | None = None,
 ) -> tuple[zarr.Array, zarr.Group]:
     """Create an assay whose feature metadata can be filled blockwise."""
-    validate_assay_name(assay_name)
+    validate_new_assay(z, assay_name, workspace)
     if n_cells < 0 or n_features < 0:
         raise ValueError("Assay dimensions must be non-negative")
     assay_path = assay_name if workspace is None else f"{workspace}/{assay_name}"
-    assay_group = z.create_group(assay_path, overwrite=True)
+    assay_group = z.create_group(assay_path)
     assay_group.attrs["is_assay"] = True
+    assay_group.attrs["prepared"] = False
     assay_group.attrs["misc"] = {}
     resolved_profile = profile or resolve_storage_profile(assay_group.store)
     feature_group = assay_group.create_group("featureData")
@@ -180,9 +197,7 @@ def create_empty_zarr_count_assay(
     included[:] = True
 
     matrix_group = (
-        assay_group
-        if workspace is None
-        else z.create_group(f"matrices/{assay_name}", overwrite=True)
+        assay_group if workspace is None else z.create_group(f"matrices/{assay_name}")
     )
     zarr_format = _group_zarr_format(matrix_group)
     if zarr_format >= 3:

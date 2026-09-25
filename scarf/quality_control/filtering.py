@@ -131,51 +131,58 @@ def _validated_sample_labels(
     if labels.ndim != 1 or active_mask.ndim != 1 or labels.shape != active_mask.shape:
         raise ValueError("Sample labels and active selection must be aligned vectors")
     normalized = labels.astype(object, copy=True)
-    kinds: set[str] = set()
-    for index in np.flatnonzero(active_mask):
-        value = labels[index]
-        if isinstance(value, np.generic):
-            value = value.item()
-        missing = pd.isna(value)
-        if isinstance(missing, bool | np.bool_) and bool(missing):
-            raise ValueError(f"{label_name} contains missing labels among active cells")
-        if isinstance(value, bytes):
-            try:
-                decoded = value.decode("utf-8")
-            except UnicodeDecodeError as exc:
-                raise ValueError(
-                    f"{label_name} contains a non-UTF-8 bytes label"
-                ) from exc
-            if decoded.strip() == "":
-                raise ValueError(
-                    f"{label_name} contains missing labels among active cells"
-                )
-            kind = "bytes"
-        elif isinstance(value, str):
-            if value.strip() == "":
-                raise ValueError(
-                    f"{label_name} contains missing labels among active cells"
-                )
-            kind = "str"
-        elif isinstance(value, bool):
-            kind = "bool"
-        elif isinstance(value, int):
-            kind = "int"
-        elif isinstance(value, float):
-            if not np.isfinite(value):
-                raise ValueError(f"{label_name} must contain finite labels")
-            kind = "float"
-        else:
-            raise TypeError(
-                f"{label_name} contains unsupported label type {type(value).__name__!r}"
-            )
-        normalized[index] = value
-        kinds.add(kind)
+    # A typed array holds one kind of label, so each distinct value needs one
+    # check; object arrays can mix kinds and are checked cell by cell.
+    if labels.dtype != object:
+        kinds = {
+            _sample_label_kind(value, label_name)
+            for value in pd.unique(labels[active_mask])
+        }
+    else:
+        kinds = set()
+        for index in np.flatnonzero(active_mask):
+            value = labels[index]
+            if isinstance(value, np.generic):
+                value = value.item()
+            kinds.add(_sample_label_kind(value, label_name))
+            normalized[index] = value
     if len(kinds) > 1:
         raise ValueError(
             f"{label_name} must use one consistent label type among active cells"
         )
     return normalized
+
+
+def _sample_label_kind(value: object, label_name: str) -> str:
+    """Return the kind of one sample label, rejecting missing labels."""
+    if isinstance(value, np.generic):
+        value = value.item()
+    missing = pd.isna(value)
+    if isinstance(missing, bool | np.bool_) and bool(missing):
+        raise ValueError(f"{label_name} contains missing labels among active cells")
+    if isinstance(value, bytes):
+        try:
+            decoded = value.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{label_name} contains a non-UTF-8 bytes label") from exc
+        if decoded.strip() == "":
+            raise ValueError(f"{label_name} contains missing labels among active cells")
+        return "bytes"
+    if isinstance(value, str):
+        if value.strip() == "":
+            raise ValueError(f"{label_name} contains missing labels among active cells")
+        return "str"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            raise ValueError(f"{label_name} must contain finite labels")
+        return "float"
+    raise TypeError(
+        f"{label_name} contains unsupported label type {type(value).__name__!r}"
+    )
 
 
 def _apply_bounds(
@@ -236,16 +243,16 @@ def _sample_aware_mad_mask(
     resolved_bounds: dict[str, dict[str, dict[str, object]]] = {}
     warnings: list[str] = []
 
-    # Preserve first-seen label order for deterministic provenance.
-    ordered_samples: list[object] = []
-    seen: set[object] = set()
-    for label in sample_labels[active]:
-        key = label if not isinstance(label, np.generic) else label.item()
-        if key not in seen:
-            seen.add(key)
-            ordered_samples.append(key)
+    # Factorizing keeps first-seen order, which keeps provenance deterministic,
+    # and turns per-sample label comparisons into integer comparisons.
+    active_idx = np.flatnonzero(active)
+    sample_codes, sample_uniques = pd.factorize(sample_labels[active])
+    ordered_samples = [
+        label.item() if isinstance(label, np.generic) else label
+        for label in sample_uniques
+    ]
 
-    for sample in ordered_samples:
+    for code, sample in enumerate(ordered_samples):
         sample_key = (
             sample.decode("utf-8") if isinstance(sample, bytes) else str(sample)
         )
@@ -253,9 +260,7 @@ def _sample_aware_mad_mask(
             raise ValueError(
                 "Sample labels collide after deterministic provenance encoding"
             )
-        sample_mask = np.zeros(n_cells, dtype=bool)
-        sample_mask[active] = sample_labels[active] == sample
-        sample_idx = np.flatnonzero(sample_mask)
+        sample_idx = active_idx[sample_codes == code]
         sample_sizes[sample_key] = int(sample_idx.shape[0])
         resolved_bounds[sample_key] = {}
         group_label = "Selected cells" if pooled else f"Sample '{sample_key}'"

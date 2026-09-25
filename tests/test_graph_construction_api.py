@@ -242,7 +242,8 @@ def test_pca_reopens_with_center_and_rebuilds_legacy_artifacts(
     np.testing.assert_allclose(expected[:15].mean(axis=0), 0, atol=1e-6)
 
     reopened = DataStore(path, default_assay="RNA", nthreads=1)
-    _, stream = reopened._load_reduction_stream(reduction, batch_size=10)
+    stream, n_rows, n_dims = reopened._coordinate_source(reduction, batch_size=10)
+    assert (n_rows, n_dims) == expected.shape
     np.testing.assert_allclose(
         np.vstack(list(stream.iter_coordinate_blocks(""))),
         expected,
@@ -255,7 +256,7 @@ def test_pca_reopens_with_center_and_rebuilds_legacy_artifacts(
     with pytest.raises(ValueError, match="PCA artifact has no fitted center"):
         reopened.build_ann_index(reduction)
     with pytest.raises(ValueError, match="PCA artifact has no fitted center"):
-        reopened._load_reduction_stream(reduction, batch_size=10)
+        reopened._coordinate_source(reduction, batch_size=10)
     rebuilt = reopened.run_pca(normalized, **arguments)
     assert rebuilt != reduction
     assert "center" not in group
@@ -304,26 +305,24 @@ def test_graph_construction_methods_chain_explicit_refs_and_persist_artifacts(
         5,
     )
     stored_scores = reduction_group["data"][:]
-    _, legacy_projection = datastore._load_reduction_stream(
-        pca,
-        batch_size=100,
-    )
-    legacy_scores = np.concatenate(
-        tuple(legacy_projection.iter_coordinate_blocks("")),
-        axis=0,
-    )
-    np.testing.assert_allclose(
-        stored_scores,
-        legacy_scores,
-        rtol=2e-5,
-        atol=2e-6,
-    )
     reduction_inputs = datastore.inspect_artifact(pca).inputs
     assert reduction_inputs is not None
     scaling = ArtifactRef.from_dict(reduction_inputs["feature_scaling"])
     scaling_group = datastore.load_artifact(scaling)
     assert scaling_group["mean"].dtype == np.dtype(np.float64)
     assert scaling_group["scale"].dtype == np.dtype(np.float64)
+    standardized = (normalized_values - scaling_group["mean"][:]) / scaling_group[
+        "scale"
+    ][:]
+    expected_scores = (standardized - reduction_group["center"][:]) @ reduction_group[
+        "loadings"
+    ][:]
+    np.testing.assert_allclose(
+        stored_scores,
+        expected_scores,
+        rtol=2e-5,
+        atol=2e-6,
+    )
     neighbors_group = datastore.zw[artifact_path(neighbors)]
     assert neighbors_group["indices"].dtype == np.dtype(np.uint32)
     assert neighbors_group["distances"].dtype == np.dtype(np.float32)
@@ -896,13 +895,13 @@ def test_graph_harmony_is_an_explicit_ann_coordinate_source(
         nclust=5,
     )
 
-    def fail_legacy_projection(*_args, **_kwargs):
+    def fail_projection(*_args, **_kwargs):
         raise AssertionError("persisted coordinates should be used")
 
     monkeypatch.setattr(
-        datastore,
-        "_load_reduction_stream",
-        fail_legacy_projection,
+        graph_operations.ReductionTransform,
+        "transform",
+        fail_projection,
     )
 
     corrected = datastore.run_harmony(

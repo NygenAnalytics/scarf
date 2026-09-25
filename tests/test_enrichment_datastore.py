@@ -400,6 +400,9 @@ def test_workspace_results_live_in_the_assay_artifact_tree(tmp_path) -> None:
         ],
         dtype=np.uint32,
     )
+    from scarf.storage.identity import finalize_counts
+
+    finalize_counts(counts)
     write_counts_t(
         counts,
         root["matrices/RNA"],

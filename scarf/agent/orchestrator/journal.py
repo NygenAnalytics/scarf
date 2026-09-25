@@ -32,7 +32,6 @@ from .models import (
     WorkflowStageAttempt,
     WorkflowStageLink,
     WorkflowStageName,
-    artifact_model_to_ref,
 )
 
 _INCOMPATIBLE = (
@@ -713,10 +712,11 @@ def _stage_outcome_resolves(
                 raise ValueError("Stage report belongs to a different workflow")
             read_stage_evidence(store, reference)
         for artifact_reference in outcome.artifacts.values():
-            store.load_artifact(artifact_model_to_ref(artifact_reference))
+            store.load_artifact(artifact_reference.to_artifact_ref())
         metadata_columns = outcome.outputs.get("metadataColumns", [])
+        available = set(store.cells.columns) if metadata_columns else set()
         if not isinstance(metadata_columns, list) or any(
-            not isinstance(column, str) or column not in store.cells.columns
+            not isinstance(column, str) or column not in available
             for column in metadata_columns
         ):
             raise ValueError("Stage metadata columns no longer resolve")
@@ -818,8 +818,8 @@ def open_analysis_store(
         default_assay=record.request.primaryAssay,
         zarr_mode="r",
         min_features_per_cell=-1,
-        mito_pattern="",
-        ribo_pattern="",
+        mito_pattern=None,
+        ribo_pattern=None,
     )
 
 

@@ -25,7 +25,7 @@ _CYTEBASE_FIXTURES = {
         "e3dd57c5a8c3426dc5a7dc012a78608554facbddf4c6d1d62671089d197b1053"
     ),
     "500_pbmc_atac.zarr.tar.gz": (
-        "f54c79229e674ea2956c048a931aadb4a9d54e75778df17b4bd84608c0e06493"
+        "d702f22d4a6bb21010b0f568ae4ec9872bcafb3ba0e2922c9c6a241dfe3fb571"
     ),
     "toy_cr_dir.tar.gz": (
         "8f7a509f577d23bb8b14947bf01ae66dcc44cbf0263aa070fe5759d51e7fddac"
@@ -144,24 +144,29 @@ def _download_cytebase_fixtures(target: Path, *, force: bool) -> None:
 
 
 def _citeseq_zarr_ready(archive: Path) -> bool:
-    """Return True when the archive opens as current RNA count-matrix layout."""
+    """Return True when the archive opens under the current storage contract."""
     if not archive.is_file():
         return False
     import zarr
 
-    from scarf.storage.counts_t_contract import inspect_counts_t
+    from scarf.storage.counts_t_contract import validate_count_matrix
 
     with tempfile.TemporaryDirectory(prefix="scarf_citeseq_zarr_check_") as tmp:
         with tarfile.open(archive, "r:gz") as tar:
             tar.extractall(tmp, filter="data")
         root = zarr.open_group(tmp, mode="r")
-        if "RNA" not in root or "assay2" not in root:
+        try:
+            for name, transpose in (("RNA", True), ("assay2", False)):
+                if root[name].attrs.get("prepared") is not True:
+                    return False
+                validate_count_matrix(root[name], require_transpose=transpose)
+        except (KeyError, ValueError):
             return False
-        return inspect_counts_t(root, "RNA").status == "ready"
+        return True
 
 
 def build_citeseq_zarr_fixture(*, force: bool = False) -> None:
-    """Write ``1K_pbmc_citeseq.zarr.tar.gz`` from the Cell Ranger H5.
+    """Write a prepared ``1K_pbmc_citeseq.zarr.tar.gz`` from the Cell Ranger H5.
 
     Tests expect the Antibody Capture assay to be named ``assay2``. The
     published Cytebase archive is not rebuilt here because its persisted
@@ -179,14 +184,17 @@ def build_citeseq_zarr_fixture(*, force: bool = False) -> None:
         )
 
     from scarf.readers import CrH5Reader
+    from scarf.tools.repack_zarr import repack_store
     from scarf.writers import CrToZarr
 
     with tempfile.TemporaryDirectory(prefix="scarf_citeseq_zarr_build_") as tmp:
+        written = Path(tmp) / "written.zarr"
         store = Path(tmp) / "store.zarr"
         reader = CrH5Reader(str(h5_path))
         if "ADT" in reader.assayFeats.columns:
             reader.rename_assays({"ADT": "assay2"})
-        CrToZarr(reader, zarr_loc=str(store), nthreads=2).dump()
+        CrToZarr(reader, zarr_loc=str(written), nthreads=2).dump()
+        repack_store(str(written), str(store), data_only=True, nthreads=2)
         staging = Path(tmp) / "archive.tar.gz"
         with tarfile.open(staging, "w:gz") as tar:
             for item in sorted(store.iterdir(), key=lambda path: path.name):

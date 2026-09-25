@@ -149,10 +149,11 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 n_cells,
                 budget,
             )
-            fitted_graph = self.load_graph(
+            fitted_graph = self._load_graph_artifact(
                 graph_ref,
                 symmetric=False,
                 upper_only=False,
+                use_k=None,
             )
             shutdown_checkpoint()
             hierarchy = fit_paris_hierarchy(
@@ -246,8 +247,11 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                         n_cells,
                         budget,
                     )
-                    fitted_graph = self.load_graph(
+                    fitted_graph = self._load_graph_artifact(
                         graph_ref,
+                        symmetric=None,
+                        upper_only=None,
+                        use_k=None,
                     )
                 split_gate = modularity_split_gains(
                     hierarchy,
@@ -389,10 +393,11 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         self,
         prepared: _PreparedLeidenClustering,
     ) -> Any:
-        graph = self.load_graph(
+        graph = self._load_graph_artifact(
             prepared.graph,
             symmetric=prepared.symmetric_graph,
             upper_only=prepared.graph_upper_only,
+            use_k=None,
         )
         return graph.tocsr()
 
@@ -784,7 +789,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 context={"artifact_id": clusters.artifact_id},
             )
 
-        graph_matrix = self.load_graph(
+        graph_matrix = self._load_graph_artifact(
             graph_input,
             symmetric=False,
             upper_only=False,

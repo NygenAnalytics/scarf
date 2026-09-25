@@ -33,6 +33,7 @@ from ...storage.artifacts import (
 )
 from ...storage.types import as_zarr_array
 from ...storage.selections import validate_stored_selection_integrity
+from ...utils.arrays import has_duplicates
 
 if TYPE_CHECKING:
     from .graph import _GraphOperationsMixin as _MappingReferenceOperationsBase
@@ -332,17 +333,11 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
         if len(feature_ids) != n_features:
             raise ValueError("Selected reference features do not match PCA loadings")
         string_feature_ids = np.asarray(feature_ids).astype(str)
-        if np.unique(string_feature_ids).size != len(string_feature_ids):
+        if has_duplicates(string_feature_ids):
             raise ValueError("Selected reference feature IDs must be unique")
 
         distance_quantiles, distance_values = _distance_quantile_summary(distances)
-        stored_dataset_fingerprint = assay.attrs.get("dataset_fingerprint")
-        live_dataset_fingerprint = (
-            stored_dataset_fingerprint
-            if isinstance(stored_dataset_fingerprint, str)
-            and stored_dataset_fingerprint
-            else self._calculate_dataset_fingerprint(assay_name)
-        )
+        live_dataset_fingerprint = self._ensure_dataset_fingerprint(assay_name)
         if live_dataset_fingerprint != lineage_dataset_fingerprint:
             raise ValueError(
                 "Normalized artifact does not match the current reference dataset"

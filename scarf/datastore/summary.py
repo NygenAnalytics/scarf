@@ -300,7 +300,11 @@ def build_datastore_summary(
     assays = []
     for assay_name in sorted(store.assay_names):
         assay = store._get_assay(assay_name)
-        fingerprint = assay.attrs.get("dataset_fingerprint")
+        from ..storage.identity import fresh_group
+
+        fingerprint = fresh_group(
+            as_zarr_group(store.zw[assay_name], name=assay_name)
+        ).attrs.get("dataset_fingerprint")
         assays.append(
             AssaySummary(
                 name=assay_name,

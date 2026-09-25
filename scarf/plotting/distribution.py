@@ -1,7 +1,7 @@
 """Distribution plots for metadata and feature values."""
 
 import warnings
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 from typing import Any, Hashable, Literal
@@ -37,6 +37,7 @@ from ._contracts import (
 )
 from ._data import (
     _artifact_cell_selection,
+    _cell_metadata_columns,
     fetch_normalized_feature_matrix,
     resolve_cell_selection,
     resolve_feature,
@@ -102,11 +103,16 @@ def _fetch_series(
     store: Any,
     key: str | CellField | FeatureRef,
     *,
+    metadata_columns: Collection[str],
     cell_indices: np.ndarray,
     from_assay: str | None,
     normalization: NormalizationSpec,
 ) -> tuple[np.ndarray, str, bool, str, str | None]:
-    """Return values, label, feature flag, stable identity, and source assay."""
+    """Return values, label, feature flag, stable identity, and source assay.
+
+    ``metadata_columns`` lists the cell-metadata columns that a plain string
+    key may name; any other string key is resolved as a feature.
+    """
     if isinstance(key, CellField):
         values, identity = _fetch_metadata_series(store, key.key, cell_indices)
         return (
@@ -117,7 +123,7 @@ def _fetch_series(
             None,
         )
     if isinstance(key, FeatureRef) or (
-        isinstance(key, str) and key not in store.cells.columns
+        isinstance(key, str) and key not in metadata_columns
     ):
         resolved = resolve_feature(store, key, from_assay=from_assay)
         mat = fetch_normalized_feature_matrix(
@@ -1178,11 +1184,12 @@ def distribution(
             split_by,
             split_scale,
         )
+    metadata_columns = _cell_metadata_columns(store, key_list)
     feature_assays: set[str] = set()
     for key in key_list:
         if not (
             isinstance(key, FeatureRef)
-            or (isinstance(key, str) and key not in store.cells.columns)
+            or (isinstance(key, str) and key not in metadata_columns)
         ):
             continue
         assay_name = (
@@ -1306,6 +1313,7 @@ def distribution(
             _fetch_series(
                 store,
                 k,
+                metadata_columns=metadata_columns,
                 cell_indices=base_cell_idx,
                 from_assay=from_assay,
                 normalization=normalization,

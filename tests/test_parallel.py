@@ -1,4 +1,5 @@
 import threading
+import weakref
 import time
 
 import numpy as np
@@ -10,10 +11,72 @@ from scarf.matrix import ChunkedArray
 from scarf.storage.parallel import in_shard_context, map_shards, stream_shards
 
 
+def test_progress_closes_display_after_producer_cleanup_fails(monkeypatch):
+    from scarf.utils import progress
+
+    closed = []
+
+    class Display:
+        def update(self):
+            pass
+
+        def close(self):
+            closed.append("display")
+            raise OSError("display cleanup")
+
+    def blocks():
+        try:
+            yield 1
+        finally:
+            closed.append("producer")
+            raise RuntimeError("producer cleanup")
+
+    monkeypatch.setattr(progress, "tqdmbar", lambda **kwargs: Display())
+    stream = progress.iter_progress(blocks())
+    assert next(stream) == 1
+    with pytest.raises(ExceptionGroup) as caught:
+        stream.close()
+    assert closed == ["producer", "display"]
+    assert [str(error) for error in caught.value.exceptions] == [
+        "producer cleanup",
+        "display cleanup",
+    ]
+
+
 def test_map_shards_preserves_order():
     ranges = [(i * 10, i * 10 + 10) for i in range(6)]
     out = map_shards(ranges, lambda idx, s, e: (idx, s, e), workers=8)
     assert out == [(i, i * 10, i * 10 + 10) for i in range(6)]
+
+
+def test_array_explicit_thread_limit_is_respected():
+    from scarf.storage.budget import ResourceBudget
+
+    array = ChunkedArray.from_numpy(
+        np.ones((32, 4)), block_size=4, nthreads=4, resources=ResourceBudget(1024**2, 4)
+    )
+    caller = threading.get_ident()
+    threads = []
+
+    def block(index, start, end):
+        threads.append(threading.get_ident())
+        return np.asarray([index])
+
+    array.map_blocks(block, nthreads=1)
+    assert threads == [caller] * 8
+
+
+def test_array_budget_includes_storage_retained_by_operand_views():
+    from scarf.storage.budget import ResourceBudget
+
+    backing = np.ones((4, 8))
+    large = np.ones((10_000, 8))
+    array = ChunkedArray.from_numpy(
+        backing, block_size=2, resources=ResourceBudget(16_384, 1)
+    )
+    with pytest.raises(MemoryError, match="Resident data"):
+        (array + large[:1]).compute()
+    np.testing.assert_array_equal((array + large[:1].copy()).compute(), backing * 2)
 
 
 def test_map_shards_empty():
@@ -38,6 +101,27 @@ def test_map_shards_bounds_in_flight():
 
     map_shards(ranges, produce, workers=8)
     assert 1 < max_seen <= 8
+
+
+def test_paused_serial_stream_does_not_mark_its_consumer_as_a_worker():
+    contexts = []
+
+    def produce(value):
+        contexts.append(in_shard_context())
+        return value
+
+    stream = stream_shards([1, 2], produce, workers=1)
+    try:
+        assert next(stream) == 1
+        assert not in_shard_context()
+        assert contexts == [True]
+        worker_threads = map_shards(
+            [(0, 1), (1, 2)], lambda *_: threading.get_ident(), workers=2
+        )
+        assert all(worker != threading.get_ident() for worker in worker_threads)
+    finally:
+        stream.close()
+    assert not in_shard_context()
 
 
 def test_map_shards_serial_backend_runs_inline():
@@ -246,3 +330,56 @@ def test_compute_matches_source_across_threads():
     data = rng.standard_normal((40, 4)).astype(np.float32)
     assert np.array_equal(_toy_chunked(data, 8, 1).compute(1), data)
     assert np.array_equal(_toy_chunked(data, 8, 5).compute(5), data)
+
+
+def test_stream_counts_the_consumed_block_toward_its_limit():
+    alive = []
+    maximum = 0
+    lock = threading.Lock()
+
+    def produce(index):
+        nonlocal maximum
+        block = np.full(512, index)
+        with lock:
+            alive.append(weakref.ref(block))
+            maximum = max(maximum, sum(ref() is not None for ref in alive))
+        return block
+
+    stream = stream_shards(range(12), produce, workers=2)
+    try:
+        for index in range(12):
+            block = next(stream)
+            np.testing.assert_array_equal(block, index)
+            time.sleep(0.001)
+            del block
+    finally:
+        stream.close()
+    assert maximum == 2
+
+
+def test_serial_source_observes_previous_consumption():
+    consumed = []
+
+    def source():
+        for _ in range(4):
+            yield len(consumed)
+
+    for item in stream_shards(source(), lambda value: value, workers=1):
+        consumed.append(item)
+    assert consumed == [0, 1, 2, 3]
+
+
+def test_early_close_surfaces_worker_failure():
+    failed = threading.Event()
+
+    def produce(index):
+        if index:
+            failed.set()
+            raise ValueError("producer failed")
+        return index
+
+    stream = stream_shards(range(2), produce, workers=2)
+    assert next(stream) == 0
+    assert failed.wait(5)
+    with pytest.raises(ValueError, match="producer failed"):
+        stream.close()

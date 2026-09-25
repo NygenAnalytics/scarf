@@ -19,7 +19,6 @@ if TYPE_CHECKING:
         find_markers_by_rank as find_markers_by_rank,
         find_markers_by_regression as find_markers_by_regression,
         mannwhitneyu_from_ranks as mannwhitneyu_from_ranks,
-        resolve_marker_gene_batch_size as resolve_marker_gene_batch_size,
         sort_marker_results as sort_marker_results,
     )
     from .scoring import binned_sampling as binned_sampling
@@ -57,7 +56,6 @@ __all__ = [
     "mannwhitneyu_from_ranks",
     "read_gmt",
     "resolve_group_order",
-    "resolve_marker_gene_batch_size",
     "select_highly_variable_features",
     "sort_marker_results",
 ]
@@ -86,7 +84,6 @@ _LAZY_EXPORTS = {
     "mannwhitneyu_from_ranks": (".markers", "mannwhitneyu_from_ranks"),
     "read_gmt": (".enrichment", "read_gmt"),
     "resolve_group_order": (".statistical", "resolve_group_order"),
-    "resolve_marker_gene_batch_size": (".markers", "resolve_marker_gene_batch_size"),
     "select_highly_variable_features": (
         ".variability",
         "select_highly_variable_features",

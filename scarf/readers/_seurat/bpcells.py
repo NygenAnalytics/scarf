@@ -1086,9 +1086,3 @@ class BPCellsHDF5MatrixSource(BPCellsMatrixSource):
         super().__init__(store, limits=limits)
         self.path = store.path
         self.group = store.group
-
-
-BPCellsDirectorySource = BPCellsDirectoryMatrixSource
-BPCellsDirMatrixSource = BPCellsDirectoryMatrixSource
-BPCellsH5MatrixSource = BPCellsHDF5MatrixSource
-BPCellsHDF5Source = BPCellsHDF5MatrixSource

@@ -41,8 +41,6 @@ _PUBLIC_CLASS_METHODS = {
         "__init__",
         "iter_normed_feature_wise",
         "normed",
-        "iter_raw_column_blocks",
-        "iter_raw_feature_columns",
     ),
     ATACassay: (
         "__init__",
@@ -55,7 +53,7 @@ _PUBLIC_CLASS_METHODS = {
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
     Assay: "6920d1d6370b3265a68a6c5d9a866118711e3dc3310a1cb0bf800e312a2cef6b",
-    RNAassay: "65d2d9b4f58fd79139db2deebc35b4629b1177781e47fb08abd71b7bb5e699a1",
+    RNAassay: "7fee4d6cc6d35bad8be0cfc6cb0728272cc6bf4d075b2ba53ce1018951f34246",
     ATACassay: "1732f9ac8b4f368185e0965becb94b9472186db4ee53d372a8a2852d30dd42a4",
     ADTassay: "1732f9ac8b4f368185e0965becb94b9472186db4ee53d372a8a2852d30dd42a4",
 }
@@ -251,14 +249,15 @@ def test_assay_read_block_facade_remains_patchable(monkeypatch):
     from scarf.storage.budget import ResourceBudget
 
     root = zarr.open_group(store=MemoryStore(), mode="w")
-    counts_t = root.create_array(
-        "countsT",
-        data=np.arange(12, dtype=np.uint32).reshape(4, 3),
-    )
+    values = np.arange(1, 13, dtype=np.uint32).reshape(3, 4)
+    counts = root.create_array("counts", data=values)
+    totals = values.sum(axis=1).astype(np.float64)
     rna = RNAassay.__new__(RNAassay)
     rna.name = "RNA"
-    rna.z = root
-    rna.rawDataT = counts_t
+    rna.normMethod = norm_lib_size
+    rna.sf = 10
+    rna.cells = SimpleNamespace(fetch_all=lambda _column: totals)
+    rna.rawData = SimpleNamespace(_backing=counts)
     rna.resources = ResourceBudget(memoryBytes=1024**2, workers=1)
 
     original = assay_module._read_block
@@ -269,17 +268,14 @@ def test_assay_read_block_facade_remains_patchable(monkeypatch):
         return original(array, rows, columns)
 
     monkeypatch.setattr(assay_module, "_read_block", counted_read)
-    blocks = list(
-        rna.iter_raw_column_blocks(
-            cell_idx=np.array([0, 2]),
-            feat_idx=np.array([1, 3]),
-            batch_size=2,
-        )
+    means = rna._mean_normed_feature_groups(
+        np.array([0, 2]),
+        {"pair": np.array([1, 3])},
     )
 
     assert len(calls) == 1
-    expected = np.asarray(counts_t[:])[[1, 3], :][:, [0, 2]].T
-    np.testing.assert_array_equal(blocks[0][1], expected)
+    expected = (10 * values[[0, 2]][:, [1, 3]] / totals[[0, 2], None]).mean(axis=1)
+    np.testing.assert_allclose(means["pair"], expected)
 
 
 def test_base_assay_defaults_validation_and_representation():
@@ -295,7 +291,10 @@ def test_base_assay_defaults_validation_and_representation():
         get_dtype=lambda _key: bool,
         fetch_all=lambda _key: np.array([True, False, True]),
     )
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    root.attrs.update({"prepared": True, "dataset_fingerprint": "test-dataset"})
     assay = SimpleNamespace(
+        z=root,
         attrs={"percentFeatures": "invalid"},
         cells=cells,
         feats=feats,
@@ -591,122 +590,13 @@ def test_corrected_variance_column_rejects_invalid_parameters(
 
 
 def test_rna_requires_zarr_v3_counts_t():
-    rna = RNAassay.__new__(RNAassay)
-    rna.name = "RNA"
-    rna.rawDataT = SimpleNamespace(
-        metadata=SimpleNamespace(zarr_format=2),
-    )
+    from scarf.storage.counts_t_contract import validate_count_matrix
 
-    with pytest.raises(ValueError, match="requires Zarr v3"):
-        rna._require_counts_t()
-
-
-def test_rna_feature_major_reads_support_both_raw_orientations():
-    from scarf.storage.partition import IndexBlock
-
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    feature_major = root.create_array(
-        "countsT",
-        data=np.array(
-            [
-                [1, 2, 3],
-                [4, 5, 6],
-                [7, 8, 9],
-            ],
-            dtype=np.uint32,
-        ),
-    )
-    cell_major = root.create_array(
-        "counts",
-        data=np.asarray(feature_major[:]).T,
-    )
-    block = IndexBlock(
-        indices=np.array([0, 2], dtype=np.int64),
-        destinations=np.array([0, 1], dtype=np.int64),
-        bins=(0,),
-    )
-    plan_feature_major = SimpleNamespace(
-        featureAxis=0,
-        blocks=(block,),
-        readWorkers=1,
-        ioConcurrency=1,
-    )
-    plan_cell_major = SimpleNamespace(
-        featureAxis=1,
-        blocks=(block,),
-        readWorkers=1,
-        ioConcurrency=1,
-    )
-    rna = RNAassay.__new__(RNAassay)
-    rna.name = "RNA"
-    rna.rawDataT = feature_major
-    rna.rawData = SimpleNamespace(_backing=cell_major)
-    cells = np.array([0, 2], dtype=np.int64)
-
-    feature_blocks = list(
-        rna.iter_raw_feature_major_blocks(cells, plan_feature_major, "Reading")
-    )
-    np.testing.assert_array_equal(
-        feature_blocks[0][1],
-        np.array([[1, 3], [7, 9]], dtype=np.uint32),
-    )
-    with pytest.raises(ValueError, match="does not match"):
-        list(rna.iter_raw_feature_major_blocks(cells, plan_cell_major))
-
-    rna.rawDataT = None
-    cell_blocks = list(
-        rna.iter_raw_feature_major_blocks(cells, plan_cell_major, "Reading")
-    )
-    np.testing.assert_array_equal(cell_blocks[0][1], feature_blocks[0][1])
-
-    column_blocks = list(
-        rna._iter_raw_column_blocks(
-            cells,
-            np.array([0, 2]),
-            batch_size=None,
-            plan=plan_cell_major,
-        )
-    )
-    np.testing.assert_array_equal(
-        column_blocks[0][1],
-        np.array([[1, 7], [3, 9]], dtype=np.uint32),
-    )
-
-
-def test_rna_raw_feature_columns_log_and_normalize_batches():
-    rna = RNAassay.__new__(RNAassay)
-    rna.name = "RNA"
-    rna._iter_raw_column_blocks = lambda **_kwargs: iter(
-        [
-            (
-                0,
-                np.array([[2, 4], [6, 8]], dtype=np.uint32),
-                np.array([1, 3]),
-                0.1,
-                "memory",
-            )
-        ]
-    )
-    plan = SimpleNamespace(blocks=(object(),))
-
-    batches = list(
-        rna._iter_raw_feature_columns(
-            np.array([0, 1]),
-            np.array([1, 3]),
-            batch_size=None,
-            scalar=np.array([2.0, 4.0]),
-            sf=2.0,
-            log_transform=True,
-            msg="Normalizing",
-            plan=plan,
-        )
-    )
-
-    np.testing.assert_allclose(
-        batches[0][0],
-        np.log1p(np.array([[2.0, 4.0], [3.0, 4.0]])),
-    )
-    np.testing.assert_array_equal(batches[0][1], np.array([1, 3]))
+    root = zarr.open_group(store=MemoryStore(), mode="w", zarr_format=2)
+    root.create_array("counts", data=np.ones((2, 3), dtype=np.uint32))
+    root.create_array("countsT", data=np.ones((3, 2), dtype=np.uint32))
+    with pytest.raises(ValueError, match="Zarr v3|not finalized"):
+        validate_count_matrix(root, require_transpose=True)
 
 
 def test_rna_streaming_stats_and_group_means_handle_missing_inputs():

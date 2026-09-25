@@ -1,6 +1,8 @@
 """Plotting functions bound to a datastore instance."""
 
 from collections.abc import Hashable, Mapping, Sequence
+from functools import cache
+from inspect import Parameter, signature
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -61,9 +63,6 @@ class _FrozenRunPlotCells:
     def get_dtype(self, column: str) -> np.dtype[Any]:
         return cast(np.dtype[Any], self._cells._field_dtype(column))
 
-    def _field_dtype(self, column: str) -> np.dtype[Any]:
-        return cast(np.dtype[Any], self._cells._field_dtype(column))
-
     def _field_display(self, column: str) -> dict[str, Any] | None:
         return cast(dict[str, Any] | None, self._cells._field_display(column))
 
@@ -89,6 +88,35 @@ class _FrozenRunPlotStore:
         return self.cells._field_display(column)
 
 
+@cache
+def _forwarding_layout(
+    name: str,
+) -> tuple[tuple[str, ...], tuple[str, ...], str | None]:
+    """Return an accessor method's positional, keyword, and ``**`` parameters.
+
+    Parameters after ``self`` keep their call style: positional-or-keyword
+    parameters are passed positionally, keyword-only parameters other than
+    ``run`` by keyword, and a ``**`` parameter is flattened into the keywords.
+    """
+    positional: list[str] = []
+    keywords: list[str] = []
+    var_keyword: str | None = None
+    method = getattr(DataStorePlotAccessor, name)
+    for parameter in list(signature(method).parameters.values())[1:]:
+        if parameter.kind is Parameter.POSITIONAL_OR_KEYWORD:
+            positional.append(parameter.name)
+        elif parameter.kind is Parameter.KEYWORD_ONLY:
+            if parameter.name != "run":
+                keywords.append(parameter.name)
+        elif parameter.kind is Parameter.VAR_KEYWORD:
+            var_keyword = parameter.name
+        else:
+            raise TypeError(
+                f"{name}() has an unsupported {parameter.kind.description} parameter"
+            )
+    return tuple(positional), tuple(keywords), var_keyword
+
+
 class DataStorePlotAccessor:
     """Datastore-bound facade for store-first plotting functions."""
 
@@ -96,6 +124,40 @@ class DataStorePlotAccessor:
 
     def __init__(self, store: "DataStore") -> None:
         self._store = store
+
+    def _forward[R](
+        self,
+        result_type: type[R],
+        name: str,
+        arguments: Mapping[str, Any],
+        /,
+        *,
+        store: Any = None,
+        **overrides: Any,
+    ) -> R:
+        """Call ``scarf.plotting.<name>`` with a method's declared arguments.
+
+        ``arguments`` is the calling method's ``locals()``. Only that method's
+        declared parameters are read from it, and ``run`` is never forwarded.
+        ``store`` replaces the bound datastore, and ``overrides`` replace
+        keyword arguments.
+        """
+        from .. import plotting
+
+        positional, keywords, var_keyword = _forwarding_layout(name)
+        call_kwargs = {key: arguments[key] for key in keywords}
+        call_kwargs.update(overrides)
+        if var_keyword is not None:
+            call_kwargs.update(arguments[var_keyword])
+        function = getattr(plotting, name)
+        return cast(
+            R,
+            function(
+                self._store if store is None else store,
+                *(arguments[key] for key in positional),
+                **call_kwargs,
+            ),
+        )
 
     def embedding(
         self,
@@ -186,82 +248,18 @@ class DataStorePlotAccessor:
                 resolved_color = color_by
             else:
                 raise KeyError(f"Pipeline run has no frozen cell field {color_by!r}")
-            from ..plotting import embedding
-
-            return embedding(
-                _FrozenRunPlotStore(self._store, assay=run.assay, cells=cells),
+            # The live-only inputs validated above equal their canonical defaults.
+            return self._forward(
+                PlotResult,
+                "embedding",
+                locals(),
+                store=_FrozenRunPlotStore(self._store, assay=run.assay, cells=cells),
                 layout=layout_ref,
                 color_by=resolved_color,
-                point_size=point_size,
-                point_size_range=point_size_range,
-                point_edgecolor=point_edgecolor,
-                point_edgewidth=point_edgewidth,
-                point_alpha=point_alpha,
-                sort_values=sort_values,
-                color_scale=color_scale,
-                categorical_scale=categorical_scale,
-                default_color=default_color,
-                missing_color=missing_color,
-                clip_fraction=clip_fraction,
-                groups=groups,
-                n_columns=n_columns,
-                target=target,
-                figsize=figsize,
-                theme=theme,
-                legend_loc=legend_loc,
-                max_on_data_labels=max_on_data_labels,
-                show_legend=show_legend,
-                show_titles=show_titles,
-                frame=frame,
-                density_overlay=density_overlay,
-                highlight=highlight,
-                seed=seed,
-                rasterize_threshold=rasterize_threshold,
-                show=show,
             )
         if isinstance(layout, str):
             raise TypeError("String layout names require a pipeline run")
-        from ..plotting import embedding
-
-        return embedding(
-            self._store,
-            layout_key=layout_key,
-            layout=layout,
-            color_by=color_by,
-            facet_by=facet_by,
-            facet_order=facet_order,
-            cell_key=cell_key,
-            from_assay=from_assay,
-            normalization=normalization,
-            point_size=point_size,
-            point_sizes=point_sizes,
-            point_size_range=point_size_range,
-            point_edgecolor=point_edgecolor,
-            point_edgewidth=point_edgewidth,
-            point_alpha=point_alpha,
-            sort_values=sort_values,
-            color_scale=color_scale,
-            categorical_scale=categorical_scale,
-            default_color=default_color,
-            missing_color=missing_color,
-            clip_fraction=clip_fraction,
-            subset_by=subset_by,
-            groups=groups,
-            n_columns=n_columns,
-            target=target,
-            figsize=figsize,
-            theme=theme,
-            legend_loc=legend_loc,
-            max_on_data_labels=max_on_data_labels,
-            show_legend=show_legend,
-            show_titles=show_titles,
-            frame=frame,
-            density_overlay=density_overlay,
-            highlight=highlight,
-            seed=seed,
-            rasterize_threshold=rasterize_threshold,
-            show=show,
-        )
+        return self._forward(PlotResult, "embedding", locals())
 
     def embedding_raster(
         self,
@@ -283,8 +281,6 @@ class DataStorePlotAccessor:
         show: bool = True,
     ) -> "PlotResult":
         """Rasterize continuous cell metadata over a stored embedding."""
-        from ..plotting import embedding_raster
-
         if run is not None:
             if not isinstance(run, PipelineRun):
                 raise TypeError("run must be a PipelineRun")
@@ -311,40 +307,17 @@ class DataStorePlotAccessor:
                 raise KeyError(f"Pipeline run has no frozen cell field {color_key!r}")
             if subset_by is not None and subset_by not in cells.columns:
                 raise KeyError(f"Pipeline run has no frozen cell field {subset_by!r}")
-            return embedding_raster(
-                plot_store,
+            # layout_key and cell_key were validated to their canonical defaults.
+            return self._forward(
+                PlotResult,
+                "embedding_raster",
+                locals(),
+                store=plot_store,
                 layout=run["umap" if layout is None else layout],
-                color_by=color_by,
-                pixels=pixels,
-                block_rows=block_rows,
-                color_scale=color_scale,
-                missing_color=missing_color,
-                subset_by=subset_by,
-                target=target,
-                figsize=figsize,
-                theme=theme,
-                seed=seed,
-                show=show,
             )
         if isinstance(layout, str):
             raise TypeError("String layout names require a pipeline run")
-        return embedding_raster(
-            self._store,
-            layout_key=layout_key,
-            layout=layout,
-            color_by=color_by,
-            cell_key=cell_key,
-            pixels=pixels,
-            block_rows=block_rows,
-            color_scale=color_scale,
-            missing_color=missing_color,
-            subset_by=subset_by,
-            target=target,
-            figsize=figsize,
-            theme=theme,
-            seed=seed,
-            show=show,
-        )
+        return self._forward(PlotResult, "embedding_raster", locals())
 
     def mapping_score(
         self,
@@ -371,31 +344,7 @@ class DataStorePlotAccessor:
         show: bool = True,
     ) -> PlotResult:
         """Plot reference-cell mapping scores for one or more query groups."""
-        from ..plotting import mapping_score
-
-        return mapping_score(
-            self._store,
-            result,
-            reference=reference,
-            target_groups=target_groups,
-            layout=layout,
-            kind=kind,
-            reference_class_group=reference_class_group,
-            size_by_score=size_by_score,
-            log_transform=log_transform,
-            multiplier=multiplier,
-            weighted=weighted,
-            fixed_weight=fixed_weight,
-            bins=bins,
-            point_size=point_size,
-            color_scale=color_scale,
-            categorical_scale=categorical_scale,
-            target=target,
-            figsize=figsize,
-            theme=theme,
-            show_legend=show_legend,
-            show=show,
-        )
+        return self._forward(PlotResult, "mapping_score", locals())
 
     def mapping_evidence(
         self,
@@ -423,27 +372,7 @@ class DataStorePlotAccessor:
         show: bool = True,
     ) -> PlotResult:
         """Plot query-level label-transfer evidence."""
-        from ..plotting import mapping_evidence
-
-        return mapping_evidence(
-            self._store,
-            result,
-            reference=reference,
-            reference_class_group=reference_class_group,
-            target_groups=target_groups,
-            metrics=metrics,
-            kind=kind,
-            bins=bins,
-            threshold_fraction=threshold_fraction,
-            na_val=na_val,
-            max_distance=max_distance,
-            categorical_scale=categorical_scale,
-            target=target,
-            figsize=figsize,
-            theme=theme,
-            show_legend=show_legend,
-            show=show,
-        )
+        return self._forward(PlotResult, "mapping_evidence", locals())
 
     def mapping_confusion(
         self,
@@ -466,27 +395,7 @@ class DataStorePlotAccessor:
         show: bool = True,
     ) -> PlotResult:
         """Plot known query labels against transferred labels."""
-        from ..plotting import mapping_confusion
-
-        return mapping_confusion(
-            self._store,
-            result,
-            reference=reference,
-            reference_class_group=reference_class_group,
-            known_labels=known_labels,
-            normalize=normalize,
-            known_order=known_order,
-            predicted_order=predicted_order,
-            threshold_fraction=threshold_fraction,
-            na_val=na_val,
-            max_distance=max_distance,
-            color_scale=color_scale,
-            target=target,
-            figsize=figsize,
-            theme=theme,
-            show_legend=show_legend,
-            show=show,
-        )
+        return self._forward(PlotResult, "mapping_confusion", locals())
 
     def mapping_calibration(
         self,
@@ -508,26 +417,7 @@ class DataStorePlotAccessor:
         show: bool = True,
     ) -> PlotResult:
         """Plot held-out label accuracy against retained mapping coverage."""
-        from ..plotting import mapping_calibration
-
-        return mapping_calibration(
-            self._store,
-            result,
-            reference=reference,
-            reference_class_group=reference_class_group,
-            known_labels=known_labels,
-            metric=metric,
-            direction=direction,
-            thresholds=thresholds,
-            n_thresholds=n_thresholds,
-            chosen_threshold=chosen_threshold,
-            na_val=na_val,
-            max_distance=max_distance,
-            target=target,
-            figsize=figsize,
-            theme=theme,
-            show=show,
-        )
+        return self._forward(PlotResult, "mapping_calibration", locals())
 
     def dotplot(
         self,
@@ -562,37 +452,7 @@ class DataStorePlotAccessor:
         show: bool = True,
     ) -> "PlotResult":
         """Summarize feature expression as a dot plot."""
-        from ..plotting import dotplot
-
-        return dotplot(
-            self._store,
-            features=features,
-            group_by=group_by,
-            groups=groups,
-            cell_key=cell_key,
-            from_assay=from_assay,
-            sample_by=sample_by,
-            study_design=study_design,
-            normalization=normalization,
-            expression_cutoff=expression_cutoff,
-            standardize=standardize,
-            color_scale=color_scale,
-            size_scale=size_scale,
-            categorical_scale=categorical_scale,
-            group_order=group_order,
-            feature_order=feature_order,
-            swap_axes=swap_axes,
-            marker_edgecolor=marker_edgecolor,
-            marker_linewidth=marker_linewidth,
-            label_wrap=label_wrap,
-            italicize_features=italicize_features,
-            target=target,
-            figsize=figsize,
-            max_figure_width=max_figure_width,
-            theme=theme,
-            show_legend=show_legend,
-            show=show,
-        )
+        return self._forward(PlotResult, "dotplot", locals())
 
     def matrixplot(
         self,
@@ -631,37 +491,7 @@ class DataStorePlotAccessor:
         show: bool = True,
     ) -> "PlotResult":
         """Summarize feature expression as a matrix plot."""
-        from ..plotting import matrixplot
-
-        return matrixplot(
-            self._store,
-            features=features,
-            group_by=group_by,
-            groups=groups,
-            cell_key=cell_key,
-            from_assay=from_assay,
-            sample_by=sample_by,
-            study_design=study_design,
-            normalization=normalization,
-            expression_cutoff=expression_cutoff,
-            value=value,
-            standardize=standardize,
-            color_scale=color_scale,
-            feature_order=feature_order,
-            group_order=group_order,
-            cluster_features=cluster_features,
-            cluster_groups=cluster_groups,
-            cluster_method=cluster_method,
-            cluster_metric=cluster_metric,
-            row_annotations=row_annotations,
-            column_annotations=column_annotations,
-            annotation_scales=annotation_scales,
-            target=target,
-            figsize=figsize,
-            theme=theme,
-            show_legend=show_legend,
-            show=show,
-        )
+        return self._forward(PlotResult, "matrixplot", locals())
 
     def composition(
         self,
@@ -694,37 +524,7 @@ class DataStorePlotAccessor:
         show: bool = True,
     ) -> "PlotResult":
         """Plot category composition for the selected cells."""
-        from ..plotting import composition
-
-        return composition(
-            self._store,
-            category_by=category_by,
-            categories=categories,
-            cell_key=cell_key,
-            sample_by=sample_by,
-            grouping=grouping,
-            subject_by=subject_by,
-            pair_by=pair_by,
-            condition_by=condition_by,
-            study_design=study_design,
-            kind=kind,
-            show_summary=show_summary,
-            uncertainty=uncertainty,
-            categorical_scale=categorical_scale,
-            bar_width=bar_width,
-            bar_gap=bar_gap,
-            segment_edgecolor=segment_edgecolor,
-            segment_linewidth=segment_linewidth,
-            show_percent_labels=show_percent_labels,
-            label_min_fraction=label_min_fraction,
-            percent_format=percent_format,
-            target=target,
-            figsize=figsize,
-            max_figure_width=max_figure_width,
-            theme=theme,
-            show_legend=show_legend,
-            show=show,
-        )
+        return self._forward(PlotResult, "composition", locals())
 
     def distribution(
         self,
@@ -783,64 +583,7 @@ class DataStorePlotAccessor:
         disables the point overlay for stacked violins and otherwise uses
         ``10000``.
         """
-        from ..plotting import distribution
-
-        resolved_stats = stats_results
-        if isinstance(stats_results, ArtifactRef):
-            resolved_stats = self._store.get_statistical_tests(stats_results)
-        elif isinstance(stats_results, Mapping):
-            resolved_stats = {
-                key: (
-                    self._store.get_statistical_tests(value)
-                    if isinstance(value, ArtifactRef)
-                    else value
-                )
-                for key, value in stats_results.items()
-            }
-        return distribution(
-            self._store,
-            keys,
-            grouping=grouping,
-            cell_selection=cell_selection,
-            groups=groups,
-            split_by=split_by,
-            sample_by=sample_by,
-            study_design=study_design,
-            sample_stat=sample_stat,
-            expression_cutoff=expression_cutoff,
-            subset_by=subset_by,
-            from_assay=from_assay,
-            normalization=normalization,
-            categorical_scale=categorical_scale,
-            split_scale=split_scale,
-            kind=kind,
-            bins=bins,
-            max_points=max_points,
-            point_size=point_size,
-            point_alpha=point_alpha,
-            seed=seed,
-            color=color,
-            color_by=color_by,
-            color_scale=color_scale,
-            orientation=orientation,
-            row_standardize=row_standardize,
-            share_y=share_y,
-            violin_inner=violin_inner,
-            violin_linewidth=violin_linewidth,
-            violin_alpha=violin_alpha,
-            italicize_features=italicize_features,
-            target=target,
-            figsize=figsize,
-            max_figure_width=max_figure_width,
-            title=title,
-            theme=theme,
-            show_legend=show_legend,
-            stats_results=resolved_stats,
-            stats_keys=stats_keys,
-            stats_bracket_height=stats_bracket_height,
-            stats_show_p=stats_show_p,
-            show=show,
-        )
+        return self._forward(PlotResult, "distribution", locals())
 
     def marker_heatmap(
         self,
@@ -876,36 +619,7 @@ class DataStorePlotAccessor:
         **heatmap_kwargs: Any,
     ) -> "PlotResult":
         """Plot the stored marker table as a heatmap."""
-        from ..plotting import marker_heatmap
-
-        return marker_heatmap(
-            self._store,
-            marker=marker,
-            topn=topn,
-            log_transform=log_transform,
-            vmin=vmin,
-            vmax=vmax,
-            figsize=figsize,
-            fontsize=fontsize,
-            width_factor=width_factor,
-            height_factor=height_factor,
-            cmap=cmap,
-            color_scale=color_scale,
-            row_order=row_order,
-            column_order=column_order,
-            cluster_rows=cluster_rows,
-            cluster_columns=cluster_columns,
-            cluster_method=cluster_method,
-            cluster_metric=cluster_metric,
-            row_annotations=row_annotations,
-            column_annotations=column_annotations,
-            annotation_scales=annotation_scales,
-            target=target,
-            theme=theme,
-            show_legend=show_legend,
-            show=show,
-            **heatmap_kwargs,
-        )
+        return self._forward(PlotResult, "marker_heatmap", locals())
 
     def run_recipe(
         self,
@@ -918,17 +632,7 @@ class DataStorePlotAccessor:
         continue_on_error: bool = False,
     ) -> "PlotRecipeResult":
         """Run a declarative plotting recipe against this datastore."""
-        from ..plotting import run_recipe
-
-        return run_recipe(
-            self._store,
-            recipe,
-            artifacts=artifacts,
-            targets=targets,
-            output_dir=output_dir,
-            show=show,
-            continue_on_error=continue_on_error,
-        )
+        return self._forward(PlotRecipeResult, "run_recipe", locals())
 
     def cluster_connectivity(
         self,
@@ -961,37 +665,7 @@ class DataStorePlotAccessor:
         show: bool = True,
     ) -> "PlotResult":
         """Summarize cell graph connectivity between embedding clusters."""
-        from ..plotting import cluster_connectivity
-
-        return cluster_connectivity(
-            self._store,
-            group_by=group_by,
-            layout_key=layout_key,
-            groups=groups,
-            layout=layout,
-            graph=graph,
-            cell_key=cell_key,
-            position=position,
-            positions=positions,
-            categorical_scale=categorical_scale,
-            size_scale=size_scale,
-            minimum_edge_weight=minimum_edge_weight,
-            max_edges_per_node=max_edges_per_node,
-            show_cells=show_cells,
-            cell_size=cell_size,
-            cell_alpha=cell_alpha,
-            cell_color=cell_color,
-            node_edgecolor=node_edgecolor,
-            node_linewidth=node_linewidth,
-            edge_color=edge_color,
-            edge_alpha=edge_alpha,
-            edge_width_range=edge_width_range,
-            labels=labels,
-            target=target,
-            figsize=figsize,
-            theme=theme,
-            show=show,
-        )
+        return self._forward(PlotResult, "cluster_connectivity", locals())
 
     def modality_weights(
         self,
@@ -1010,23 +684,7 @@ class DataStorePlotAccessor:
         show: bool = True,
     ) -> "PlotResult":
         """Plot each assay's WNN contribution over an explicit embedding."""
-        from ..plotting import modality_weights
-
-        return modality_weights(
-            self._store,
-            graph=graph,
-            layout=layout,
-            point_size=point_size,
-            point_alpha=point_alpha,
-            cmap=cmap,
-            n_columns=n_columns,
-            target=target,
-            figsize=figsize,
-            theme=theme,
-            frame=frame,
-            rasterize_threshold=rasterize_threshold,
-            show=show,
-        )
+        return self._forward(PlotResult, "modality_weights", locals())
 
     def cluster_tree(
         self,
@@ -1059,37 +717,7 @@ class DataStorePlotAccessor:
         show: bool = True,
     ) -> "PlotResult":
         """Plot a stored hierarchical clustering tree."""
-        from ..plotting import cluster_tree
-
-        return cluster_tree(
-            self._store,
-            graph=graph,
-            clusters=clusters,
-            from_assay=from_assay,
-            fill_by_value=fill_by_value,
-            force_ints_as_cats=force_ints_as_cats,
-            width=width,
-            lvr_factor=lvr_factor,
-            vert_gap=vert_gap,
-            min_node_size=min_node_size,
-            node_size_multiplier=node_size_multiplier,
-            node_power=node_power,
-            root_size=root_size,
-            non_leaf_size=non_leaf_size,
-            show_labels=show_labels,
-            fontsize=fontsize,
-            root_color=root_color,
-            non_leaf_color=non_leaf_color,
-            cmap=cmap,
-            color_key=color_key,
-            edgecolors=edgecolors,
-            edgewidth=edgewidth,
-            alpha=alpha,
-            figsize=figsize,
-            ax=ax,
-            theme=theme,
-            show=show,
-        )
+        return self._forward(PlotResult, "cluster_tree", locals())
 
     def pseudotime_heatmap(
         self,
@@ -1116,28 +744,4 @@ class DataStorePlotAccessor:
         show: bool = True,
     ) -> "PlotResult":
         """Plot feature profiles ordered by stored pseudotime."""
-        from ..plotting import pseudotime_heatmap
-
-        return pseudotime_heatmap(
-            self._store,
-            aggregation=aggregation,
-            show_features=show_features,
-            feature_order=feature_order,
-            feature_cluster_order=feature_cluster_order,
-            figsize=figsize,
-            vmin=vmin,
-            vmax=vmax,
-            heatmap_cmap=heatmap_cmap,
-            pseudotime_cmap=pseudotime_cmap,
-            clusterbar_cmap=clusterbar_cmap,
-            color_scale=color_scale,
-            feature_cluster_scale=feature_cluster_scale,
-            pseudotime_scale=pseudotime_scale,
-            tick_fontsize=tick_fontsize,
-            axis_fontsize=axis_fontsize,
-            feature_label_fontsize=feature_label_fontsize,
-            target=target,
-            theme=theme,
-            show_legend=show_legend,
-            show=show,
-        )
+        return self._forward(PlotResult, "pseudotime_heatmap", locals())

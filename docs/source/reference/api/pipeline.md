@@ -58,8 +58,12 @@ def run(
 The default recipe snapshots its inputs, filters cells, scores cell cycle, selects highly variable
 genes, normalizes, runs PCA, builds ANN, neighbour, and connectivity artifacts, initializes UMAP,
 runs UMAP, evaluates Leiden at `0.5`, `0.75`, `1.0`, and `1.25`, runs Paris, selects a clustering,
-scores doublets, and searches for markers. Atomic stages run sequentially so each stage has an
-honest memory and cache receipt.
+scores doublets, and searches for markers. Stages start in a fixed order. UMAP runs on a worker
+thread beside the Leiden, Paris, and cluster-selection stages; doublet scoring and marker search
+plan their memory against the budget, so they start only after UMAP has finished. Each stage keeps
+its own wall time and artifact receipt; resident-memory figures are process-wide, so stages that
+overlap report a shared peak. Without a thread-safe Numba threading layer (TBB or OpenMP), every
+stage runs in sequence.
 
 Harmony is enabled by a non-empty `harmony_batch_columns` sequence. The main graph then uses the
 Harmony coordinates. When doublet scoring is enabled, its graph branch still uses the uncorrected

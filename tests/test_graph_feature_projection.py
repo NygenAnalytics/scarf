@@ -137,8 +137,12 @@ def _native_chain(
     batch_corrected: bool = False,
     imported: bool = False,
 ) -> tuple[ArtifactRef, ArtifactRef, ArtifactRef]:
+    root.require_group(assay).attrs.update(
+        {"prepared": True, "dataset_fingerprint": "test-dataset"}
+    )
+    n_cells = int(root[artifact_path(cell_selection)]["values"][:].sum())
     if imported:
-        coordinate_values = np.arange(6, dtype=np.float32).reshape(3, 2)
+        coordinate_values = np.arange(n_cells * 2, dtype=np.float32).reshape(n_cells, 2)
         coordinates = write_imported_coordinates(
             root,
             assay=assay,
@@ -161,13 +165,23 @@ def _native_chain(
             inputs={
                 "cell_selection": cell_selection,
                 "feature_selection": feature_selection,
+                "dataset_fingerprint": "test-dataset",
             },
+        )
+        root[artifact_path(normalized)].create_array(
+            "data", data=np.zeros((n_cells, 4), dtype=np.float32)
         )
         reduction = _artifact(
             root,
             "reduction",
             assay=assay,
             inputs={"normalized": normalized},
+        )
+        root[artifact_path(reduction)].create_array(
+            "data", data=np.zeros((n_cells, 2), dtype=np.float64)
+        )
+        root[artifact_path(reduction)].create_array(
+            "loadings", data=np.zeros((4, 2), dtype=np.float64)
         )
         coordinates = (
             _artifact(
@@ -178,6 +192,10 @@ def _native_chain(
             )
             if batch_corrected
             else reduction
+        )
+    if batch_corrected and not imported:
+        root[artifact_path(coordinates)].create_array(
+            "data", data=np.zeros((n_cells, 2), dtype=np.float64)
         )
     ann_index = _artifact(
         root,

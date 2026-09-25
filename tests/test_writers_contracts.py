@@ -157,6 +157,8 @@ def test_writer_static_method_contracts_are_stable():
 def test_writer_storage_wrappers_remain_distinct_objects(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    from scarf.assay import normalization
+
     assert writers_module.create_zarr_dataset is not storage_arrays.create_zarr_dataset
     assert (
         writers_module.create_zarr_obj_array is not storage_arrays.create_zarr_obj_array
@@ -169,7 +171,7 @@ def test_writer_storage_wrappers_remain_distinct_objects(
     assert writers_module.chunked_to_zarr is not storage_materialize.chunked_to_zarr
     assert (
         writers_module.write_renorm_subset_to_zarr
-        is not storage_materialize.write_renorm_subset_to_zarr
+        is not normalization.write_renorm_subset_to_zarr
     )
     assert (
         "stats_group"

@@ -1,12 +1,6 @@
 """Bounded parameter tuning over explicit Scarf analysis candidates."""
 
-from .agent import (
-    ParameterTuningAgent,
-    execute_parameter_search_plan,
-    prepare_parameter_tuning_dependencies,
-    tune_parameters,
-    tune_parameters_batch,
-)
+from .agent import prepare_parameter_tuning_dependencies
 from .contracts import (
     ArtifactRecord,
     CandidateComparison,
@@ -19,14 +13,11 @@ from .contracts import (
     ParameterCandidateEvaluation,
     ParameterMetrics,
     ParameterSearchPlan,
-    ParameterTuningAssayInput,
-    ParameterTuningBatchSearchPlan,
     ParameterTuningDependencies,
     ParameterTuningNeedsInput,
     ParameterTuningReport,
 )
 from .execution import (
-    evaluate_parameter_candidate,
     execute_parameter_candidate,
     normalized_artifact_shape,
     run_candidate_reduction,
@@ -34,32 +25,13 @@ from .execution import (
 )
 from .prompts import (
     build_initial_parameter_candidates,
-    final_graph_selection_prompt,
-    final_graph_selection_system_prompt,
     get_default_parameter_candidates,
-    parameter_batch_search_prompt,
-    parameter_batch_search_system_prompt,
-    parameter_batch_selection_prompt,
-    parameter_batch_selection_system_prompt,
-    parameter_search_prompt,
-    parameter_search_system_prompt,
-    parameter_tuning_prompt,
-    parameter_tuning_system_prompt,
 )
 from .selection import (
     annotate_candidate_dominance,
-    final_graph_options,
     finalize_parameter_tuning_selection,
     harmony_acceptance_gate,
-    parameter_evidence_classes,
     promote_parameter_candidate,
-    require_dominated_candidate_evidence,
-    select_final_parameter_graph,
-    validate_final_graph_selection,
-    validate_parameter_batch_search_plan,
-    validate_parameter_search_plan,
-    validate_parameter_tuning_batch_report,
-    validate_parameter_tuning_report,
 )
 
 __all__ = [
@@ -68,10 +40,6 @@ __all__ = [
     "build_initial_parameter_candidates",
     "CandidateComparison",
     "execute_parameter_candidate",
-    "execute_parameter_search_plan",
-    "final_graph_options",
-    "final_graph_selection_prompt",
-    "final_graph_selection_system_prompt",
     "FinalGraphComparison",
     "FinalGraphNeedsInput",
     "FinalGraphSelection",
@@ -83,35 +51,13 @@ __all__ = [
     "ParameterCandidateEvaluation",
     "ParameterMetrics",
     "ParameterSearchPlan",
-    "ParameterTuningAssayInput",
-    "ParameterTuningAgent",
-    "ParameterTuningBatchSearchPlan",
     "ParameterTuningDependencies",
     "ParameterTuningNeedsInput",
     "ParameterTuningReport",
-    "evaluate_parameter_candidate",
     "get_default_parameter_candidates",
     "harmony_acceptance_gate",
-    "parameter_batch_search_prompt",
-    "parameter_batch_search_system_prompt",
-    "parameter_batch_selection_prompt",
-    "parameter_batch_selection_system_prompt",
-    "parameter_search_prompt",
-    "parameter_search_system_prompt",
-    "parameter_evidence_classes",
-    "parameter_tuning_prompt",
-    "parameter_tuning_system_prompt",
     "prepare_parameter_tuning_dependencies",
     "promote_parameter_candidate",
     "run_candidate_reduction",
-    "require_dominated_candidate_evidence",
-    "select_final_parameter_graph",
-    "tune_parameters",
-    "tune_parameters_batch",
-    "validate_parameter_batch_search_plan",
     "validate_parameter_candidate_rank",
-    "validate_final_graph_selection",
-    "validate_parameter_search_plan",
-    "validate_parameter_tuning_batch_report",
-    "validate_parameter_tuning_report",
 ]

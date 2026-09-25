@@ -44,7 +44,6 @@ from scarf.agent.types import (
     Decision,
     EvidenceItem,
     NeedsInput,
-    StageResult,
     ToolCallInfo,
 )
 
@@ -88,7 +87,6 @@ def test_shared_models_have_blank_and_example_constructors() -> None:
         Decision,
         EvidenceItem,
         NeedsInput,
-        StageResult,
         ToolCallInfo,
         ExampleOutput,
     )
@@ -102,14 +100,12 @@ def test_focused_scientific_agents_remain_available_in_their_subpackages() -> No
     from scarf.agent.biological_interpretation import BiologicalInterpretationAgent
     from scarf.agent.data_enrichment import DataEnrichmentAgent
     from scarf.agent.experimental_context import ExperimentalContextAgent
-    from scarf.agent.parameter_tuning import ParameterTuningAgent
 
     assert all(
         callable(agent)
         for agent in (
             DataEnrichmentAgent,
             ExperimentalContextAgent,
-            ParameterTuningAgent,
             BiologicalInterpretationAgent,
         )
     )

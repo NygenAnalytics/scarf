@@ -11,7 +11,7 @@ from scarf.storage.artifacts import artifact_path
 from scarf.storage.errors import ArtifactResolutionError
 from scarf.storage.refs import ArtifactRef
 from scarf.storage.selections import (
-    resolve_selection_artifact,
+    resolve_generated_selection_artifact,
     validate_stored_selection_integrity,
     validate_stored_selection_live_alias,
 )
@@ -25,7 +25,7 @@ def _root_with_selection() -> tuple[zarr.Group, MemoryStore, ArtifactRef]:
     selection = np.array([True, False, True])
     cells.create_array("ids", data=cell_ids)
     cells.create_array("I", data=selection)
-    ref = resolve_selection_artifact(
+    ref = resolve_generated_selection_artifact(
         root,
         scope="datastore",
         kind="cell_selection",
@@ -35,7 +35,7 @@ def _root_with_selection() -> tuple[zarr.Group, MemoryStore, ArtifactRef]:
         parameters={},
         inputs={},
         source_column="I",
-    )
+    )[0]
     return root, store, ref
 
 

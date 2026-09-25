@@ -130,15 +130,19 @@ decision persistence. The reusable bounded silhouette comparison lives in
 the immutable decision. `metrics.cluster_selection` is not part of the public `scarf.metrics`
 facade. `datastore.pipeline_run` exposes the narrow durable `PipelineRun` handle and its frozen
 cell and feature views. Pipeline execution creates immutable artifacts and a strict run/stage
-ledger under `pipeline/runs`; it does not write live metadata. DataStore-owned plotting, marker
+ledger under `pipeline/runs`; it does not write live metadata. The ledger starts stages in recipe
+order and can run one on a worker thread (`utils.background`) while later stages run; it writes
+every record and callback from the calling thread. DataStore-owned plotting, marker
 loading, and export consume narrow frozen-run views. Completed runs can be reopened by their
 immutable label or exact run ID.
 
 `agent/` owns the optional single-RNA workflow. Its lazy root facade exposes `analyze_rna`,
 `AutomatedWorkflowResult`, and `AnalysisError`. Standalone scientific agent contracts and runners
-remain in their concrete packages: `data_enrichment`, `experimental_context`, `parameter_tuning`,
-and `biological_interpretation`. Internal modules import concrete owners rather than the root
-facade. `agent/tools/` contains only infrastructure shared by more than one agent.
+remain in their concrete packages: `data_enrichment`, `experimental_context`, and
+`biological_interpretation`. `parameter_tuning` has no standalone runner; it owns the candidate
+contracts, execution, diagnostics, and selection checks used by the orchestrator's RNA tuning
+stage. Internal modules import concrete owners rather than the root facade. `agent/tools/`
+contains only infrastructure shared by more than one agent.
 
 The orchestration stage history is the sole owner of the immutable request, scientific evidence,
 choices, checks, work reservations, recovery, and final artifact references. Checkpoints belong

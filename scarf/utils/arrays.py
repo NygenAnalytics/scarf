@@ -16,6 +16,19 @@ def regex_match_mask(values: Sequence[str] | np.ndarray, pattern: str) -> np.nda
     )
 
 
+def has_duplicates(values: Any) -> bool:
+    """Return whether a one-dimensional array repeats a value.
+
+    Sorting and comparing neighbours stays fast where ``np.unique`` is slow on
+    many distinct integers; increasing values skip the sort.
+    """
+    array = np.asarray(values)
+    if array.size < 2:
+        return False
+    ordered = array if np.all(array[1:] > array[:-1]) else np.sort(array)
+    return bool(np.any(ordered[1:] == ordered[:-1]))
+
+
 def checked_sparse_cast(values: np.ndarray, dtype: Any) -> np.ndarray:
     destination_dtype = np.dtype(dtype)
     if destination_dtype.kind in "biu" and values.size:

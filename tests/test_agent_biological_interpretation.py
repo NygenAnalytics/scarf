@@ -53,7 +53,7 @@ from scarf.agent.types import (
     TuningBiologyHandoff,
 )
 from scarf.storage.refs import ArtifactRef
-from scarf.storage.selections import resolve_selection_artifact
+from scarf.storage.selections import resolve_generated_selection_artifact
 
 
 class FakeCells:
@@ -120,7 +120,7 @@ class FakeStore:
         cell_data = self.zw.create_group("cellData")
         cell_data.create_array("ids", data=self.cells.values["ids"])
         cell_data.create_array("I", data=self.cells.values["I"])
-        self.cell_selection = resolve_selection_artifact(
+        self.cell_selection = resolve_generated_selection_artifact(
             self.zw,
             scope="datastore",
             kind="cell_selection",
@@ -130,7 +130,7 @@ class FakeStore:
             parameters={},
             inputs={},
             source_column="I",
-        )
+        )[0]
         self.marker_calls = 0
         self.marker = ArtifactRef(
             scope="assay",
@@ -990,7 +990,7 @@ def test_handoff_selection_must_match_exact_cluster_selection() -> None:
     other_values = np.asarray(store.cells.values["I"], dtype=bool).copy()
     other_values[0] = True
     other_values[1] = False
-    other_selection = resolve_selection_artifact(
+    other_selection = resolve_generated_selection_artifact(
         store.zw,
         scope="datastore",
         kind="cell_selection",
@@ -1000,7 +1000,7 @@ def test_handoff_selection_must_match_exact_cluster_selection() -> None:
         parameters={},
         inputs={},
         source_column="other",
-    )
+    )[0]
     tuning_handoff = TuningBiologyHandoff(
         cellSelection=artifact_model(other_selection),
         clusterArtifact=artifact_model(store.cluster),

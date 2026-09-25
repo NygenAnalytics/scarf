@@ -873,16 +873,6 @@ class H5adReader:
         logger.debug(f"Resolved H5AD storage dtype={storage_dtype}")
         return storage_dtype
 
-    def csc_conversion_peak_bytes(self) -> int:
-        """Return the default bounded CSC conversion workspace."""
-        if self.matrixOrientation != "csc":
-            return 0
-        group = self.h5[self.matrixKey]
-        if not isinstance(group, h5py.Group):
-            raise TypeError("CSC matrix slot must be an HDF5 group")
-        metadata = (self.nCells + 1) * 32 + (self.nFeatures + 1) * 8
-        return metadata + min(64 * 1024 * 1024, max(1, int(group["data"].size)) * 384)
-
     def materialized_csr_bytes(self) -> int:
         """Return bytes retained by the materialized CSC-to-CSR conversion."""
         if self._convertedCsr is None:
@@ -936,13 +926,6 @@ class H5adReader:
         if self.nCells == 0:
             return 0
         return int(np.max(cumulative[batch_rows:] - cumulative[:-batch_rows]))
-
-    def max_batch_nnz_peak_bytes(self) -> int:
-        """Bound temporary row-pointer arrays used to plan sparse batches."""
-        if self.matrixOrientation == "dense":
-            return 0
-        self._prepare_sparse_import()
-        return self._sparse_import_resident_bytes()
 
     def producer_batch_staging_bytes(self, batch_size: int) -> int:
         """Bound sparse row pointers retained while one batch is produced."""

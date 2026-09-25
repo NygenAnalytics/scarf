@@ -363,6 +363,7 @@ def test_distribution_fetch_and_drawing_edge_cases(monkeypatch) -> None:
     fetched = distribution_plot._fetch_series(
         store,
         CellField("metric", label="Metric"),
+        metadata_columns=(),
         cell_indices=indices,
         from_assay=None,
         normalization=NormalizationSpec(),

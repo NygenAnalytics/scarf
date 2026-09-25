@@ -299,7 +299,7 @@ def test_to_anndata_rejects_duplicate_primary_ids_when_exporting_layers(
 ) -> None:
     feature_ids = export_store.RNA.feats.fetch_all("ids").astype(str)
     feature_ids[1] = feature_ids[0]
-    export_store.RNA.feats.insert("ids", feature_ids, overwrite=True, force=True)
+    export_store.RNA.feats._get_array("ids")[:] = feature_ids
 
     with pytest.warns(UserWarning, match="Variable names are not unique"):
         with pytest.raises(ValueError, match="Selected feature IDs must be unique"):

@@ -6,8 +6,15 @@ import zarr
 from ..storage.types import as_zarr_array, as_zarr_group
 from ..storage.arrays import create_numeric_array, create_zarr_obj_array
 from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.copy import copy_zarr_group_tree
+from ..storage.identity import (
+    GENERATED_FEATURE_COLUMNS,
+    CountSummary,
+    finalize_counts,
+    generated_cell_columns,
+)
 from ..storage.io_policy import StorageIoPolicy
-from ..storage.layout import count_array_spec
+from ..storage.layout import array_shard_rows, count_array_spec
 from ..storage.profiles import (
     StorageProfile,
     ZarrLocation,
@@ -79,6 +86,7 @@ def subset_assay_zarr(
         policy=policy,
     )
     og = create_numeric_array(z, out_grp, spec)
+    summary = CountSummary(og)
     write_dense_in_shard_rows(
         og,
         lambda start, end: np.asarray(
@@ -87,7 +95,11 @@ def subset_assay_zarr(
         msg="Subsetting assay",
         resources=resources,
         io=io,
+        producerBytes=int(np.prod(ig.chunks)) * ig.dtype.itemsize,
+        residentBytes=cells_idx.nbytes + feat_idx.nbytes + summary.nbytes,
+        countSummary=summary,
     )
+    finalize_counts(og, summary=summary)
     return None
 
 
@@ -176,6 +188,17 @@ class SubsetZarr:
         self.z = self._check_files(zarr_loc)
 
     def _check_files(self, zarr_loc: ZarrLocation) -> zarr.Group:
+        from ..storage.stores import locations_overlap, zarr_root_path
+
+        for assay in self.assays:
+            for group in (assay.z, assay.matrixGroup):
+                path = zarr_root_path(group)
+                if zarr_loc is group.store or (
+                    isinstance(zarr_loc, str)
+                    and path is not None
+                    and locations_overlap(path, zarr_loc)
+                ):
+                    raise ValueError("Subset destination overlaps a source store")
         if self.overFn is False and zarr_location_has_content(
             zarr_loc, storage_options=self.storage_options
         ):
@@ -263,17 +286,33 @@ class SubsetZarr:
 
         cell_data = self.assays[0].cells.locations["primary"]
 
-        n_cells = len(self.cellIdx)
-        for i in cell_data.keys():
-            if i in cell_group and self.overCells is False:
-                continue
-            if i in ["I"] and self.resetCells:
-                create_zarr_obj_array(
-                    cell_group, "I", [True for _ in range(n_cells)], "bool"
+        source_root = self.assays[0]._artifact_root
+        names = set(source_root.attrs.get("assayTypes", {})) | {
+            assay.name for assay in self.assays
+        }
+        generated = set().union(
+            *(
+                generated_cell_columns(
+                    name, source_root[name].attrs.get("percentFeatures")
                 )
-                continue
-            v = cell_data[i][:][self.cellIdx]
-            create_zarr_obj_array(cell_group, i, v, dtype=v.dtype)
+                for name in names
+            )
+        )
+        if self.resetCells:
+            generated.add("I")
+        if not self.overCells:
+            generated.update(cell_group.keys())
+        copy_zarr_group_tree(
+            cell_data,
+            cell_group,
+            row_indices=self.cellIdx,
+            exclude_members=generated,
+            profile=self.profile,
+        )
+        if self.resetCells:
+            create_zarr_obj_array(
+                cell_group, "I", np.ones(len(self.cellIdx), dtype=bool), "bool"
+            )
 
     def _prep_counts(self) -> None:
         n_cells = len(self.cellIdx)
@@ -289,6 +328,20 @@ class SubsetZarr:
                 profile=self.profile,
                 policy=self.policy,
             )
+            path = (
+                assay.name
+                if self.outWorkspace is None
+                else f"{self.outWorkspace}/{assay.name}"
+            )
+            destination = as_zarr_group(self.z[path], name=path)
+            copy_zarr_group_tree(
+                assay.feats.locations["primary"],
+                as_zarr_group(destination["featureData"], name="featureData"),
+                exclude_members={"ids", "names", *GENERATED_FEATURE_COLUMNS},
+                profile=self.profile,
+            )
+            if "size_factor" in assay.attrs:
+                destination.attrs["size_factor"] = assay.attrs["size_factor"]
 
     def dump(self) -> None:
         """Write subsetted cell metadata and count matrices, including RNA ``countsT``.
@@ -310,13 +363,20 @@ class SubsetZarr:
                     self.z[f"matrices/{assay.name}/counts"],
                     name=f"matrices/{assay.name}/counts",
                 )
+            summary = CountSummary(store)
             write_dense_in_shard_rows(
                 store,
                 lambda start, end: raw_data[start:end, :].compute(),
                 msg=f"Subsetting assay: {assay.name}",
                 resources=self.resources,
                 io=self.io,
+                producerBytes=raw_data._with_block_size(
+                    array_shard_rows(store)
+                )._block_task_bytes(),
+                residentBytes=raw_data._resident_bytes() + summary.nbytes,
+                countSummary=summary,
             )
+            finalize_counts(store, summary=summary)
             from ..assay.classification import lookup_persisted_assay_type
             from .counts_t import finalize_writer_counts_t
 

@@ -15,10 +15,20 @@ from scarf.storage.layout import ZarrArraySpec, array_shard_rows, get_compressor
 from scarf.storage.sharding import (
     resolve_sparse_import_batch,
     resolve_sparse_import_spec,
-    sparse_write_task_count,
+    row_band_task_count,
 )
 from scarf.storage.types import array_metadata_shards
 from scarf.writers import CrToZarr, H5adToZarr, SparseToZarr
+
+
+def sparse_write_task_count(destinations, n_rows: int) -> int:
+    """Count the destination row bands an import writes, as the planner should."""
+    if n_rows <= 0:
+        return 0
+    return sum(
+        row_band_task_count(n_rows, array_shard_rows(destination))
+        for destination in destinations
+    )
 
 
 def _planner_destinations() -> tuple[zarr.Array, zarr.Array]:

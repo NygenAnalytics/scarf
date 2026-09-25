@@ -58,11 +58,10 @@ def selected_rna_assay(request: Any, assay_types: Mapping[str, str]) -> str:
 
 
 def selected_store_rna_assay(store: Any, request: Any) -> str:
-    """Resolve the workflow assay from the store's persisted summary."""
-    return selected_rna_assay(
-        request,
-        {value.name: value.assay_type for value in store.summary().assays},
-    )
+    """Resolve the workflow assay from the store's persisted assay types."""
+    from ..tools import persisted_assay_types
+
+    return selected_rna_assay(request, persisted_assay_types(store))
 
 
 def validate_rna_plan(plan: Any, selected: str) -> None:

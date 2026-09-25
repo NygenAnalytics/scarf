@@ -596,10 +596,9 @@ def test_matrix_source_public_accessors_bounds_and_dtype_validation() -> None:
     assert source.residentBytes == source.resident_bytes
 
     estimate = source.memory_estimate(0, 1)
-    assert estimate.resident_bytes == estimate.residentBytes
-    assert estimate.working_bytes == estimate.workingBytes
-    assert estimate.output_bytes == estimate.outputBytes
-    assert estimate.peak_bytes == estimate.peakBytes
+    assert estimate.peakBytes == (
+        estimate.residentBytes + estimate.workingBytes + estimate.outputBytes
+    )
     assert source.estimate_memory(0, 1) == estimate
     assert source.estimate_read_bytes(0, 1) == estimate.peakBytes
     assert source.estimated_peak_bytes(0, 1) == estimate.peakBytes
@@ -4192,22 +4191,6 @@ def test_operation_registry_rejects_malformed_recipes() -> None:
 
 
 def test_core_sources_validate_names_shapes_indexes_and_bind_contracts() -> None:
-    limits = SourceLimits(
-        maxFeatures=4,
-        maxCells=5,
-        maxNnz=6,
-        maxBlockBytes=7,
-        maxMetadataBytes=8,
-        tileCells=9,
-        compressedChunkNnz=10,
-    )
-    assert limits.max_features == 4
-    assert limits.max_cells == 5
-    assert limits.max_nnz == 6
-    assert limits.max_block_bytes == 7
-    assert limits.max_metadata_bytes == 8
-    assert limits.tile_cells == 9
-    assert limits.compressed_chunk_nnz == 10
     with pytest.raises(ValueError, match="maxFeatures must be positive"):
         SourceLimits(maxFeatures=0)
 
@@ -4441,7 +4424,11 @@ def test_seurat_import_planning_does_not_read_every_cell_pointer(tmp_path, monke
     writer._residentSourceBytes = 0
     writer._lastImportPlans = {}
     writer.io = None
-    writer._write_sparse_counts("RNA", source, destination, None)
+    from scarf.storage.identity import CountSummary
+
+    writer._write_sparse_counts(
+        "RNA", source, destination, None, CountSummary(destination)
+    )
     np.testing.assert_array_equal(destination[:], values.T)
     assert len(reads) < 10
     assert all(stop - start == 1000 for start, stop in reads)

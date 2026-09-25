@@ -7,7 +7,6 @@ from scarf.metadata import MetaData
 from scarf.storage.arrays import MetadataBlock, create_streamed_metadata_column
 from scarf.storage.artifacts import (
     artifact_group,
-    fingerprint_string_blocks,
     fingerprint_strings,
 )
 from scarf.storage.schema import (
@@ -89,17 +88,6 @@ def test_empty_assay_schema_accepts_blockwise_feature_metadata():
     assert counts.shape == (3, 2)
     assert feature_data["ids"][:].tolist() == ["g1", "g2"]
     assert feature_data["I"][:].tolist() == [True, True]
-
-
-def test_string_block_fingerprint_matches_materialized_values():
-    values = np.array(["c1", "cell-two", "c3"], dtype="U8")
-    digest = fingerprint_string_blocks(
-        ((0, values[:2]), (2, values[2:])),
-        length=3,
-        max_length=8,
-    )
-
-    assert digest == fingerprint_strings(values)
 
 
 def test_stored_selection_artifact_copies_values_blockwise():

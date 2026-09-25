@@ -4,7 +4,7 @@ import json
 import math
 import secrets
 import struct
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,7 +14,7 @@ import zarr
 
 from .arrays import _decode_metadata_values
 from .geometry import array_geometry
-from .partition import row_band
+from .partition import scan_band
 from .refs import (
     ARTIFACT_KINDS as ARTIFACT_KINDS,
     ArtifactRef as ArtifactRef,
@@ -207,7 +207,8 @@ class ValueFingerprintBuilder:
         stop = next_row + array.shape[0]
         if stop > shape[0]:
             raise ValueError("Array block exceeds declared shape")
-        self._digest.update(array.view(np.uint8).tobytes())
+        # A byte view of the contiguous block hashes without copying it.
+        self._digest.update(array.view(np.uint8))
         self._active_array = (active_name, dtype, shape, stop)
 
     def end_array(self, name: str) -> None:
@@ -234,17 +235,22 @@ def fingerprint_array(values: np.ndarray) -> str:
     return builder.hexdigest()
 
 
-def _stored_array_chunk_rows(array: zarr.Array) -> int:
-    return row_band(array_geometry(array), unit="chunk", fallback=1)
+def _stored_array_chunk_rows(array: Any) -> int:
+    return scan_band(array_geometry(array), fallback=max(1, int(array.shape[0])))
 
 
 def fingerprint_stored_arrays(
     group: zarr.Group,
     names: Sequence[str],
+    *,
+    arrays: Mapping[str, zarr.Array] | None = None,
 ) -> str:
+    """Fingerprint stored arrays; pass ``arrays`` already opened to skip reopening."""
     builder = ValueFingerprintBuilder()
     for name in names:
-        array = as_zarr_array(group[name], name=name)
+        array = as_zarr_array(
+            group[name] if arrays is None else arrays[name], name=name
+        )
         builder.begin_array(name, array.shape, array.dtype)
         chunk_rows = _stored_array_chunk_rows(array)
         for start in range(0, array.shape[0], chunk_rows):
@@ -259,8 +265,8 @@ def fingerprint_stored_arrays(
     return builder.hexdigest()
 
 
-def fingerprint_stored_strings(array: zarr.Array) -> str:
-    """Fingerprint a stored string column without loading it in full."""
+def fingerprint_stored_strings(array: Any) -> str:
+    """Fingerprint a stored or in-memory string column in bounded bands."""
     if array.ndim != 1:
         raise ValueError("Stored string fingerprints require a one-dimensional array")
 
@@ -295,36 +301,6 @@ def fingerprint_stored_strings(array: zarr.Array) -> str:
 def fingerprint_strings(values: np.ndarray) -> str:
     strings = np.asarray(values).astype(str)
     return fingerprint_array(strings)
-
-
-def fingerprint_string_blocks(
-    blocks: Iterable[tuple[int, np.ndarray]],
-    *,
-    length: int,
-    max_length: int,
-) -> str:
-    """Fingerprint ordered strings without collecting the full column."""
-    if length < 0:
-        raise ValueError("length must be non-negative")
-    if max_length < 1:
-        raise ValueError("max_length must be positive")
-    dtype = np.dtype(f"U{max_length}")
-    builder = ValueFingerprintBuilder()
-    builder.begin_array("values", (length,), dtype)
-    next_row = 0
-    for start, raw_values in blocks:
-        if int(start) != next_row:
-            raise ValueError(
-                f"String blocks must be contiguous; expected {next_row}, "
-                f"received {start}"
-            )
-        values = np.asarray(raw_values).astype(dtype)
-        if values.ndim != 1:
-            raise ValueError("String blocks must be one-dimensional")
-        builder.update_array_block("values", (next_row,), values)
-        next_row += len(values)
-    builder.end_array("values")
-    return builder.hexdigest()
 
 
 def callable_identity(value: Any) -> dict[str, str]:
@@ -449,11 +425,22 @@ def require_complete_artifact(
 
 
 def inspect_artifact(root: zarr.Group, ref: ArtifactRef) -> ArtifactStatus:
+    return open_artifact(root, ref)[0]
+
+
+def open_artifact(
+    root: zarr.Group, ref: ArtifactRef
+) -> tuple[ArtifactStatus, zarr.Group | None]:
+    """Inspect an artifact and return its group from the same metadata read."""
     path = artifact_path(ref)
     try:
         group = group_at(root, path)
     except KeyError:
-        return ArtifactStatus(ref=ref, path=path, exists=False, complete=False)
+        return ArtifactStatus(ref=ref, path=path, exists=False, complete=False), None
+    return _artifact_status(group, ref, path), group
+
+
+def _artifact_status(group: zarr.Group, ref: ArtifactRef, path: str) -> ArtifactStatus:
     stored_id = group.attrs.get("artifact_id")
     stored_kind = group.attrs.get("kind")
     if stored_id is not None and stored_id != ref.artifact_id:
@@ -540,18 +527,6 @@ def list_artifacts(
     parameters: Mapping[str, Any] | None = None,
     inputs: Mapping[str, Any] | None = None,
 ) -> list[ArtifactRef]:
-    if scope not in {"assay", "datastore"}:
-        raise ValueError(f"Invalid artifact scope: {scope!r}")
-    if scope == "assay":
-        if assay is None or not assay or "/" in assay:
-            raise ValueError("assay is required for assay-scoped artifact listing")
-        base_path = f"{assay}/artifacts"
-    else:
-        if assay is not None:
-            raise ValueError("assay cannot be set for datastore-scoped listing")
-        base_path = "artifacts"
-    if kind is not None:
-        _validate_artifact_kind(kind)
     if operation is not None:
         _validate_name(operation, "operation")
     requested_parameters = (
@@ -583,17 +558,60 @@ def list_artifacts(
             for key, requested_value in requested.items()
         )
 
-    if base_path not in root:
-        return []
-    base = as_zarr_group(root[base_path], name=base_path)
-    kinds = [kind] if kind is not None else sorted(base.group_keys())
     refs = []
-    for artifact_kind in kinds:
-        if artifact_kind not in base:
-            continue
+    for ref, group in _artifact_groups(root, scope=scope, assay=assay, kind=kind):
+        if complete_only or filter_provenance:
+            status = _artifact_status(group, ref, artifact_path(ref))
+            if not status.complete:
+                continue
+            if operation is not None and status.operation != operation:
+                continue
+            if not matches_mapping(status.parameters, requested_parameters):
+                continue
+            if not matches_mapping(status.inputs, requested_inputs):
+                continue
+        refs.append(ref)
+    return refs
+
+
+def _artifact_groups(
+    root: zarr.Group,
+    *,
+    scope: ArtifactScope,
+    assay: str | None,
+    kind: str | None,
+) -> list[tuple[ArtifactRef, zarr.Group]]:
+    """Return every artifact group in a scope, sorted by kind and ID.
+
+    ``groups()`` reads every child's metadata concurrently, so callers inspect
+    artifact attributes without reopening each group.
+    """
+    if scope not in {"assay", "datastore"}:
+        raise ValueError(f"Invalid artifact scope: {scope!r}")
+    if scope == "assay":
+        if assay is None or not assay or "/" in assay:
+            raise ValueError("assay is required for assay-scoped artifact listing")
+        base_path = f"{assay}/artifacts"
+    else:
+        if assay is not None:
+            raise ValueError("assay cannot be set for datastore-scoped listing")
+        base_path = "artifacts"
+    if kind is not None:
+        _validate_artifact_kind(kind)
+    try:
+        base = group_at(root, base_path)
+        kind_groups = (
+            sorted(dict(base.groups()).items())
+            if kind is None
+            else [(kind, group_at(base, kind))]
+        )
+    except KeyError:
+        return []
+    found = []
+    for artifact_kind, kind_group in kind_groups:
         _validate_artifact_kind(artifact_kind)
-        kind_group = as_zarr_group(base[artifact_kind], name=artifact_kind)
-        for artifact_id in sorted(kind_group.group_keys()):
+        # Object-store listings can repeat a group, so keep one entry per ID.
+        for artifact_id, group in sorted(dict(kind_group.groups()).items()):
             try:
                 ref = ArtifactRef(
                     scope=scope,
@@ -603,18 +621,8 @@ def list_artifacts(
                 )
             except ValueError:
                 continue
-            if complete_only or filter_provenance:
-                status = inspect_artifact(root, ref)
-                if not status.complete:
-                    continue
-                if operation is not None and status.operation != operation:
-                    continue
-                if not matches_mapping(status.parameters, requested_parameters):
-                    continue
-                if not matches_mapping(status.inputs, requested_inputs):
-                    continue
-            refs.append(ref)
-    return refs
+            found.append((ref, group))
+    return found
 
 
 def find_reusable_artifacts(
@@ -626,6 +634,29 @@ def find_reusable_artifacts(
     assay: str | None = None,
     invalidate_cache: bool = False,
 ) -> list[ArtifactRef]:
+    return [
+        ref
+        for ref, _group in reusable_artifact_groups(
+            root,
+            scope=scope,
+            kind=kind,
+            provenance=provenance,
+            assay=assay,
+            invalidate_cache=invalidate_cache,
+        )
+    ]
+
+
+def reusable_artifact_groups(
+    root: zarr.Group,
+    *,
+    scope: ArtifactScope,
+    kind: str,
+    provenance: Mapping[str, Any],
+    assay: str | None = None,
+    invalidate_cache: bool = False,
+) -> list[tuple[ArtifactRef, zarr.Group]]:
+    """Complete artifacts with exactly this provenance, newest first, with groups."""
     if invalidate_cache:
         return []
     requested = make_provenance(
@@ -635,15 +666,10 @@ def find_reusable_artifacts(
     )
     requested_hash = provenance_hash(requested)
     requested_bytes = canonical_bytes(requested)
-    reusable: list[tuple[int, ArtifactRef]] = []
-    for ref in list_artifacts(
-        root,
-        scope=scope,
-        assay=assay,
-        kind=kind,
-    ):
+    reusable: list[tuple[int, ArtifactRef, zarr.Group]] = []
+    for ref, group in _artifact_groups(root, scope=scope, assay=assay, kind=kind):
         try:
-            status = inspect_artifact(root, ref)
+            status = _artifact_status(group, ref, artifact_path(ref))
         except (KeyError, TypeError, ValueError):
             continue
         if not status.complete or status.provenance is None:
@@ -651,9 +677,9 @@ def find_reusable_artifacts(
         if provenance_hash(status.provenance) != requested_hash:
             continue
         if canonical_bytes(status.provenance) == requested_bytes:
-            reusable.append((status.created_at_ns or 0, ref))
+            reusable.append((status.created_at_ns or 0, ref, group))
     reusable.sort(
         key=lambda item: (item[0], item[1].artifact_id),
         reverse=True,
     )
-    return [ref for _, ref in reusable]
+    return [(ref, group) for _, ref, group in reusable]

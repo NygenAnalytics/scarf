@@ -16,6 +16,7 @@ from scipy.sparse import (
 
 from .errors import MatrixSourceError, ResourceLimitError
 from .._sparse import SparseRowStore
+from ...utils.arrays import has_duplicates
 
 
 type MatrixBlock = NDArray[Any] | coo_matrix | csr_matrix
@@ -30,22 +31,6 @@ class MemoryEstimate:
     @property
     def peakBytes(self) -> int:
         return self.residentBytes + self.workingBytes + self.outputBytes
-
-    @property
-    def resident_bytes(self) -> int:
-        return self.residentBytes
-
-    @property
-    def working_bytes(self) -> int:
-        return self.workingBytes
-
-    @property
-    def output_bytes(self) -> int:
-        return self.outputBytes
-
-    @property
-    def peak_bytes(self) -> int:
-        return self.peakBytes
 
 
 @dataclass(frozen=True)
@@ -70,34 +55,6 @@ class SourceLimits:
         ):
             if getattr(self, field_name) <= 0:
                 raise ValueError(f"{field_name} must be positive")
-
-    @property
-    def max_features(self) -> int:
-        return self.maxFeatures
-
-    @property
-    def max_cells(self) -> int:
-        return self.maxCells
-
-    @property
-    def max_nnz(self) -> int:
-        return self.maxNnz
-
-    @property
-    def max_block_bytes(self) -> int:
-        return self.maxBlockBytes
-
-    @property
-    def max_metadata_bytes(self) -> int:
-        return self.maxMetadataBytes
-
-    @property
-    def tile_cells(self) -> int:
-        return self.tileCells
-
-    @property
-    def compressed_chunk_nnz(self) -> int:
-        return self.compressedChunkNnz
 
 
 DEFAULT_LIMITS = SourceLimits()
@@ -690,11 +647,6 @@ class DenseMatrixSource(BaseMatrixSource):
         return np.ascontiguousarray(feature_by_cell.T, dtype=self.dtype)
 
 
-RColumnMajorMatrixSource = DenseMatrixSource
-InMemoryDenseMatrixSource = DenseMatrixSource
-LazyDenseMatrixSource = DenseMatrixSource
-
-
 class CscMatrixSource(BaseMatrixSource):
     _SUPPORTED_CLASSES = frozenset(
         {
@@ -844,10 +796,6 @@ class CscMatrixSource(BaseMatrixSource):
         )
 
 
-CSCMatrixSource = CscMatrixSource
-MatrixCscSource = CscMatrixSource
-
-
 class MappedMatrixSource(BaseMatrixSource):
     def __init__(
         self,
@@ -955,10 +903,6 @@ class MappedMatrixSource(BaseMatrixSource):
                 block.tocsr(copy=False)[:, self.feature_indices].tocsr(),
             )
         return np.ascontiguousarray(np.asarray(block)[:, self.feature_indices])
-
-
-SubsetMatrixSource = MappedMatrixSource
-ReorderedMatrixSource = MappedMatrixSource
 
 
 class TransposeMatrixSource(BaseMatrixSource):
@@ -1126,9 +1070,6 @@ class TransposeMatrixSource(BaseMatrixSource):
 
         with h5py.File(self._prepare_dense(), "r") as handle:
             return np.asarray(handle["matrix"][start:stop])
-
-
-TransposeSource = TransposeMatrixSource
 
 
 def _matching_names(
@@ -1302,12 +1243,6 @@ class CellBindMatrixSource(BaseMatrixSource):
         return np.vstack([_block_to_dense(block, dtype=self.dtype) for block in blocks])
 
 
-RowBindMatrixSource = FeatureBindMatrixSource
-ColumnBindMatrixSource = CellBindMatrixSource
-FeatureBindSource = FeatureBindMatrixSource
-CellBindSource = CellBindMatrixSource
-
-
 @dataclass(frozen=True, init=False)
 class LayerPlacement:
     source: MatrixSource
@@ -1426,9 +1361,9 @@ class LayerStitchMatrixSource(BaseMatrixSource):
                     f"layer {index} maps {cells.size} cells; "
                     f"source has {placement.source.shape[1]}"
                 )
-            if np.unique(features).size != features.size:
+            if has_duplicates(features):
                 raise MatrixSourceError(f"layer {index} repeats a global feature")
-            if np.unique(cells).size != cells.size:
+            if has_duplicates(cells):
                 raise MatrixSourceError(f"layer {index} repeats a global cell")
             self._validate_layer_names(
                 placement.source,
@@ -1570,9 +1505,6 @@ class LayerStitchMatrixSource(BaseMatrixSource):
         ).tocsr()
 
 
-LayerStitchSource = LayerStitchMatrixSource
-
-
 class RenamedMatrixSource(BaseMatrixSource):
     def __init__(
         self,
@@ -1644,7 +1576,3 @@ class DtypeMatrixSource(BaseMatrixSource):
         if isinstance(block, spmatrix):
             return cast(MatrixBlock, block.astype(self.dtype, copy=False))
         return np.asarray(block).astype(self.dtype, copy=False)
-
-
-RenameMatrixSource = RenamedMatrixSource
-CastMatrixSource = DtypeMatrixSource

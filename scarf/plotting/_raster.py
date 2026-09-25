@@ -5,7 +5,7 @@ from typing import Any
 
 import numpy as np
 
-from ..metadata.rows import read_metadata_missing_rows_chunkwise
+from ..metadata.rows import metadata_missing_mask, read_array_rows_chunkwise
 from ._deps import require_matplotlib
 from ._style import continuous_norm, square_axis_limits
 
@@ -43,13 +43,31 @@ def _apply_raster_missing_mask(
     return output
 
 
-def _raster_block_values(cells: Any, block: Any, key: str) -> np.ndarray:
+class _MissingMaskRows:
+    """Resolve each column's missing mask on first use, then read rows per block."""
+
+    __slots__ = ("_cells", "_masks")
+
+    def __init__(self, cells: Any) -> None:
+        self._cells = cells
+        self._masks: dict[str, Any] = {}
+
+    def read(self, column: str, rows: np.ndarray) -> np.ndarray | None:
+        if column not in self._masks:
+            self._masks[column] = metadata_missing_mask(self._cells, column)
+        mask = self._masks[column]
+        if mask is None:
+            return None
+        return np.asarray(read_array_rows_chunkwise(mask, rows), dtype=bool)
+
+
+def _raster_block_values(
+    missing_masks: _MissingMaskRows,
+    block: Any,
+    key: str,
+) -> np.ndarray:
     values = np.asarray(block.values[key])
-    missing = read_metadata_missing_rows_chunkwise(
-        cells,
-        key,
-        block.active_global_indices,
-    )
+    missing = missing_masks.read(key, block.active_global_indices)
     return _apply_raster_missing_mask(values, missing)
 
 
@@ -163,6 +181,7 @@ def raster_from_metadata(
             raise KeyError(f"subset_by {subset_by!r} not found in cell metadata")
         cols.append(subset_by)
     rng = np.random.default_rng(seed)
+    missing_masks = _MissingMaskRows(cells)
 
     # --- Pass 1: bounds + color scale ---
     xmin = ymin = np.inf
@@ -180,11 +199,15 @@ def raster_from_metadata(
         n_blocks += 1
         if len(block.active_global_indices) == 0:
             continue
-        x = np.asarray(_raster_block_values(cells, block, x_key), dtype=np.float64)
-        y = np.asarray(_raster_block_values(cells, block, y_key), dtype=np.float64)
+        x = np.asarray(
+            _raster_block_values(missing_masks, block, x_key), dtype=np.float64
+        )
+        y = np.asarray(
+            _raster_block_values(missing_masks, block, y_key), dtype=np.float64
+        )
         finite = np.isfinite(x) & np.isfinite(y)
         if subset_by is not None:
-            sub = _raster_block_values(cells, block, subset_by)
+            sub = _raster_block_values(missing_masks, block, subset_by)
             if sub.dtype != bool:
                 raise TypeError(
                     f"subset_by {subset_by!r} must be boolean; got {sub.dtype}"
@@ -199,7 +222,7 @@ def raster_from_metadata(
         ymax = max(ymax, float(y[finite].max()))
         if color_key is not None:
             c = np.asarray(
-                _raster_block_values(cells, block, color_key),
+                _raster_block_values(missing_masks, block, color_key),
                 dtype=np.float64,
             )[finite]
             mm = _finite_minmax(c)
@@ -270,11 +293,15 @@ def raster_from_metadata(
     ):
         if len(block.active_global_indices) == 0:
             continue
-        x = np.asarray(_raster_block_values(cells, block, x_key), dtype=np.float64)
-        y = np.asarray(_raster_block_values(cells, block, y_key), dtype=np.float64)
+        x = np.asarray(
+            _raster_block_values(missing_masks, block, x_key), dtype=np.float64
+        )
+        y = np.asarray(
+            _raster_block_values(missing_masks, block, y_key), dtype=np.float64
+        )
         finite = np.isfinite(x) & np.isfinite(y)
         if subset_by is not None:
-            sub = _raster_block_values(cells, block, subset_by)
+            sub = _raster_block_values(missing_masks, block, subset_by)
             if sub.dtype != bool:
                 raise TypeError(
                     f"subset_by {subset_by!r} must be boolean; got {sub.dtype}"
@@ -300,7 +327,7 @@ def raster_from_metadata(
             np.add.at(counts, (iy_img, ix), 1)
         else:
             c = np.asarray(
-                _raster_block_values(cells, block, color_key),
+                _raster_block_values(missing_masks, block, color_key),
                 dtype=np.float64,
             )[finite]
             finite_color = np.isfinite(c)

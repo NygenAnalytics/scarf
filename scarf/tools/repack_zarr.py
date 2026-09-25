@@ -2,17 +2,26 @@
 
 import argparse
 import json
-import posixpath
 from collections.abc import Callable
-from pathlib import Path, PurePosixPath
-from urllib.parse import urlsplit, urlunsplit
 
 import numpy as np
 import zarr
 
 from scarf.storage.arrays import create_numeric_array
 from scarf.storage.budget import ResourceBudget, resolve_budget
-from scarf.storage.copy import _copy_metadata_array
+from scarf.storage.copy import (
+    _copy_metadata_array,
+    copy_zarr_group_tree,
+    validate_metadata_dependencies,
+)
+from scarf.storage.identity import (
+    GENERATED_FEATURE_COLUMNS,
+    CountSummary,
+    finalize_counts,
+    generated_cell_columns,
+    publish_preparation,
+    validate_preparation,
+)
 from scarf.storage.count_matrix import (
     COUNT_MATRIX_LAYOUT_KEY,
     create_product_counts_array,
@@ -26,85 +35,27 @@ from scarf.storage.layout import (
 from scarf.storage.pipeline_runs import _copy_pipeline_label_claims
 from scarf.storage.profiles import StorageProfile
 from scarf.storage.sharding import write_counts_t, write_dense_in_shard_rows
-from scarf.storage.stores import open_store
+from scarf.storage.stores import (
+    open_store,
+    resolve_matrix_source,
+    locations_overlap,
+    MATRIX_SOURCE_ATTR,
+)
 from scarf.storage.types import array_metadata_shards, as_zarr_array, as_zarr_group
-
-
-def _location_identity(location: str) -> tuple[str, str]:
-    parsed = urlsplit(location)
-    if parsed.scheme in ("", "file"):
-        path = parsed.path if parsed.scheme == "file" else location
-        return "file", str(Path(path).expanduser().resolve())
-    normalized_path = posixpath.normpath(parsed.path or "/")
-    return "uri", urlunsplit(
-        (
-            parsed.scheme.lower(),
-            parsed.netloc,
-            normalized_path,
-            parsed.query,
-            parsed.fragment,
-        )
-    )
-
-
-def _locations_overlap(first: str, second: str) -> bool:
-    first_kind, first_identity = _location_identity(first)
-    second_kind, second_identity = _location_identity(second)
-    if (first_kind, first_identity) == (second_kind, second_identity):
-        return True
-    if first_kind != second_kind:
-        return False
-    if first_kind == "file":
-        first_path: Path | PurePosixPath = Path(first_identity)
-        second_path: Path | PurePosixPath = Path(second_identity)
-    else:
-        first_uri = urlsplit(first_identity)
-        second_uri = urlsplit(second_identity)
-        if (first_uri.scheme, first_uri.netloc) != (
-            second_uri.scheme,
-            second_uri.netloc,
-        ):
-            return False
-        first_path = PurePosixPath(first_uri.path)
-        second_path = PurePosixPath(second_uri.path)
-    if first_path == second_path:
-        return True
-    return first_path in second_path.parents or second_path in first_path.parents
 
 
 def _count_assays(store: zarr.Group) -> list[tuple[str, str | None]]:
     assays: list[tuple[str, str | None]] = []
-    for name in store.group_keys():
-        group = as_zarr_group(store[name], name=name)
-        if group.attrs.get("is_assay") and "counts" in group:
+    for name, group in store.groups():
+        if group.attrs.get("is_assay") is True:
             assays.append((name, None))
-
-    if "matrices" not in store:
-        return assays
-    matrices = as_zarr_group(store["matrices"], name="matrices")
-    workspace_assays: set[str] = set()
-
-    def visit(group: zarr.Group, path: str) -> None:
-        for name in group.group_keys():
-            if path == "" and name == "matrices":
-                continue
-            child_path = f"{path}/{name}" if path else name
-            child = as_zarr_group(group[name], name=child_path)
-            if child.attrs.get("is_assay"):
-                if path == "" and "counts" in child:
-                    continue
-                if (
-                    name not in workspace_assays
-                    and name in matrices
-                    and "counts" in as_zarr_group(matrices[name], name=name)
-                ):
-                    workspace_assays.add(name)
-                    assays.append((name, path or "."))
-                continue
-            visit(child, child_path)
-
-    visit(store, "")
-    return assays
+        elif name not in {"matrices", "artifacts", "pipeline"}:
+            assays.extend(
+                (assay_name, name)
+                for assay_name, assay in group.groups()
+                if assay.attrs.get("is_assay") is True
+            )
+    return sorted(assays, key=lambda item: (item[1] or "", item[0]))
 
 
 def _retired_assay_state_paths(store: zarr.Group) -> frozenset[str]:
@@ -120,15 +71,6 @@ def _retired_assay_state_paths(store: zarr.Group) -> frozenset[str]:
 
     visit(store, "")
     return frozenset(paths)
-
-
-def _counts_t_path(counts_path: str) -> str:
-    if counts_path == "counts" or counts_path.endswith("/counts"):
-        return f"{counts_path[: -len('counts')]}countsT"
-    raise ValueError(f"Not a counts path: {counts_path!r}")
-
-
-_STRIPPED_COUNT_ATTRS = frozenset({"complete", COUNT_MATRIX_LAYOUT_KEY})
 
 
 def _copy_array_attrs(
@@ -243,6 +185,7 @@ def _copy_numeric_2d(
         _row_block_producer(array),
         msg=f"Repacking {path}",
         resources=resources,
+        producerBytes=int(np.prod(array.chunks)) * array.dtype.itemsize,
     )
     return dst_array
 
@@ -254,7 +197,7 @@ def _copy_group(
     *,
     resources: ResourceBudget,
     path: str = "",
-    shardedCounts: frozenset[str] = frozenset(),
+    keepPaths: frozenset[str] | None = None,
     skipPaths: frozenset[str] = frozenset(),
 ) -> None:
     for key in src.keys():
@@ -262,51 +205,60 @@ def _copy_group(
         child_path = f"{path}/{key}" if path else key
         if child_path in skipPaths:
             continue
+        if keepPaths is not None and not any(
+            candidate == child_path
+            or candidate.startswith(child_path + "/")
+            or child_path.startswith(candidate + "/")
+            for candidate in keepPaths
+        ):
+            continue
         if isinstance(node, zarr.Group):
             new_group = dst.create_group(key, overwrite=True)
-            rewritten_counts = f"{child_path}/counts" in shardedCounts
+            is_dataset = (
+                node.attrs.get("is_assay") is True
+                or f"{child_path}/counts" in skipPaths
+            )
             for attr_key, attr_val in node.attrs.items():
-                if rewritten_counts and attr_key in _STRIPPED_COUNT_ATTRS:
+                if is_dataset and attr_key in {
+                    COUNT_MATRIX_LAYOUT_KEY,
+                    "prepared",
+                    "dataset_fingerprint",
+                    "counts_fingerprint",
+                    MATRIX_SOURCE_ATTR,
+                }:
+                    continue
+                if keepPaths is not None and attr_key not in {
+                    "is_assay",
+                    "size_factor",
+                    "defaultAssay",
+                    "assayTypes",
+                }:
                     continue
                 new_group.attrs[attr_key] = attr_val
+            if node.attrs.get("is_assay") is True:
+                new_group.attrs["prepared"] = False
+            if key in {"cellData", "featureData"}:
+                excluded = {
+                    member
+                    for member in node.keys()
+                    if f"{child_path}/{member}" in skipPaths
+                }
+                copy_zarr_group_tree(
+                    node, new_group, exclude_members=excluded, profile=profile
+                )
+                continue
             _copy_group(
                 node,
                 new_group,
                 profile,
                 resources=resources,
                 path=child_path,
-                shardedCounts=shardedCounts,
+                keepPaths=keepPaths,
                 skipPaths=skipPaths,
             )
             continue
 
         array = as_zarr_array(node, name=child_path)
-        if child_path in shardedCounts:
-            dst_array = create_product_counts_array(
-                dst,
-                int(array.shape[0]),
-                int(array.shape[1]),
-                array.dtype,
-                profile=profile,
-            )
-            write_dense_in_shard_rows(
-                dst_array,
-                _row_block_producer(array),
-                msg=f"Repacking {child_path}",
-                resources=resources,
-            )
-            stored_shards = array_metadata_shards(dst_array)
-            dst.attrs["scarf:zarr_spec"] = {
-                "profile": profile,
-                "dtype": np.dtype(array.dtype).str,
-                "chunks": list(dst_array.chunks),
-                "shards": None if stored_shards is None else list(stored_shards),
-                "zarr_format": 3,
-            }
-            dst.attrs.pop("complete", None)
-            _copy_array_attrs(array, dst_array, strip_keys=_STRIPPED_COUNT_ATTRS)
-            continue
-
         if array.ndim == 1:
             if _is_string_like(np.dtype(array.dtype)):
                 _copy_metadata_array(
@@ -352,74 +304,203 @@ def repack_store(
     storage_options: dict | None = None,
     mem_budget: int | str | None = None,
     nthreads: int | None = None,
+    *,
+    data_only: bool = False,
 ) -> None:
-    """Copy a Zarr store to v3 and shard discovered assay count matrices.
+    """Copy prepared data, or rebuild raw data, into a fresh Zarr v3 destination."""
+    from ..assay import RNAassay, preset_assay_types
+    from ..assay.classification import (
+        DEFAULT_PERCENT_PATTERNS,
+        is_rna_assay_type,
+        lookup_persisted_assay_type,
+    )
+    from ..metadata import MetaData
+    from ..assay.classification import default_feature_sets
 
-    Retired per-assay ``state`` groups are omitted. They cannot identify current
-    artifacts and all analysis must be recomputed after the rewrite.
-
-    Args:
-        input_path: Source Zarr directory or URI.
-        output_path: Destination Zarr directory or URI (created or overwritten).
-        profile: Storage profile for compressors and count shard sizes.
-        storage_options: Backend options for remote stores (for example credentials).
-        mem_budget: Memory budget for streaming writers (bytes, size string, or None).
-        nthreads: Worker count for streaming writers (or None for auto-detect).
-    """
-    if _locations_overlap(input_path, output_path):
-        raise ValueError(
-            "input_path and output_path must refer to different stores "
-            "and must not overlap"
-        )
-
+    if locations_overlap(input_path, output_path):
+        raise ValueError("input_path and output_path must not overlap")
     resources = resolve_budget(mem_budget, nthreads)
     src = open_store(input_path, mode="r", storage_options=storage_options)
-    dst = open_store(output_path, mode="w", storage_options=storage_options)
-    for attr_key, attr_val in src.attrs.items():
-        dst.attrs[attr_key] = attr_val
-
+    manifest = src.attrs.get(MATRIX_SOURCE_ATTR)
+    if manifest is not None:
+        if not isinstance(manifest, dict) or not isinstance(
+            manifest.get("location"), str
+        ):
+            raise ValueError("Malformed matrix source location")
+        if locations_overlap(manifest["location"], output_path):
+            raise ValueError("The destination overlaps the mounted count owner")
+    resolved = resolve_matrix_source(src, storage_options=storage_options)
+    mounted_owner = None if resolved is None else resolved[0]
     assays = _count_assays(src)
-    count_paths = frozenset(
-        f"{assay_name}/counts" if workspace is None else f"matrices/{assay_name}/counts"
-        for assay_name, workspace in assays
-    )
-    state_paths = _retired_assay_state_paths(src)
-    skip_paths = frozenset(_counts_t_path(path) for path in count_paths) | state_paths
+    if not assays:
+        raise ValueError("No logical assays found in source")
+
+    counts_to_copy: dict[str, zarr.Array] = {}
+    feature_tables: dict[str, str] = {}
+    required_transposes: set[str] = set()
+    source_fingerprints: dict[tuple[str, str | None], str] = {}
+    assay_types: dict[tuple[str, str | None], str] = {}
+    skip_paths: set[str] = set(_retired_assay_state_paths(src))
+    keep_paths: set[str] = set()
+    for name, workspace in assays:
+        attr_root = (
+            src if workspace is None else as_zarr_group(src[workspace], name=workspace)
+        )
+        if attr_root.attrs.get("scarf:import_complete") is False:
+            raise ValueError("An incomplete import cannot be repacked as complete data")
+        assay = as_zarr_group(attr_root[name], name=name)
+        prefix = "" if workspace is None else f"{workspace}/"
+        matrix_path = name if workspace is None else f"matrices/{name}"
+        owner = (
+            mounted_owner
+            if manifest is not None and name in manifest["assays"]
+            else src
+        )
+        assert owner is not None
+        matrix = as_zarr_group(owner[matrix_path], name=matrix_path)
+        counts = as_zarr_array(matrix["counts"], name="counts")
+        if counts.attrs.get("complete") is False:
+            raise ValueError(
+                "An incomplete count matrix cannot be repacked as complete data"
+            )
+        path = f"{matrix_path}/counts"
+        counts_to_copy[path] = counts
+        feature_tables[path] = f"{prefix}{name}"
+        skip_paths.update({path, f"{matrix_path}/countsT"})
+        raw_types = attr_root.attrs.get("assayTypes", {})
+        type_name = lookup_persisted_assay_type(
+            name, raw_types if isinstance(raw_types, dict) else None
+        )
+        assay_types[name, workspace] = type_name
+        required = is_rna_assay_type(type_name)
+        if required:
+            required_transposes.add(path)
+        cells = as_zarr_group(attr_root["cellData"], name="cellData")
+        features = as_zarr_group(assay["featureData"], name="featureData")
+        if not data_only:
+            validate_metadata_dependencies(cells)
+            validate_metadata_dependencies(features)
+            fingerprint = validate_preparation(
+                assay, cells, matrix, require_transpose=required
+            )
+            assert fingerprint is not None
+            source_fingerprints[name, workspace] = fingerprint
+        else:
+            skip_paths.update(
+                f"{prefix}cellData/{column}"
+                for column in generated_cell_columns(
+                    name, assay.attrs.get("percentFeatures")
+                )
+            )
+            skip_paths.update(
+                f"{prefix}{name}/featureData/{column}"
+                for column in GENERATED_FEATURE_COLUMNS
+            )
+            keep_paths.update(
+                {f"{prefix}cellData", f"{prefix}{name}/featureData", path}
+            )
+
+    for name, workspace in assays:
+        prefix = "" if workspace is None else f"{workspace}/"
+        for table in (f"{prefix}cellData", f"{prefix}{name}/featureData"):
+            excluded = {
+                path[len(table) + 1 :]
+                for path in skip_paths
+                if path.startswith(f"{table}/")
+            }
+            validate_metadata_dependencies(
+                as_zarr_group(src[table], name=table), exclude_members=excluded
+            )
+
+    dst = open_store(output_path, mode="w-", storage_options=storage_options)
+    for key, value in src.attrs.items():
+        if key == MATRIX_SOURCE_ATTR or (
+            data_only and key not in {"defaultAssay", "assayTypes"}
+        ):
+            continue
+        dst.attrs[key] = value
     _copy_group(
         src,
         dst,
         profile,
         resources=resources,
-        shardedCounts=count_paths,
-        skipPaths=skip_paths,
+        skipPaths=frozenset(skip_paths),
+        keepPaths=frozenset(keep_paths) if data_only else None,
     )
-    _copy_pipeline_label_claims(src, dst)
-    for assay_name, workspace in assays:
-        counts_path = (
-            f"{assay_name}/counts"
-            if workspace is None
-            else f"matrices/{assay_name}/counts"
+    for path, source_counts in counts_to_copy.items():
+        group_path = path.rsplit("/", 1)[0]
+        group = dst.require_group(group_path)
+        counts = create_product_counts_array(
+            group,
+            source_counts.shape[0],
+            source_counts.shape[1],
+            source_counts.dtype,
+            profile=profile,
         )
-        group_path = assay_name if workspace is None else f"matrices/{assay_name}"
-        counts = as_zarr_array(dst[counts_path], name=counts_path)
-        from ..assay.classification import is_rna_assay_type
-
-        # Prefer persisted assayTypes; fall back to assay group name.
-        type_name = assay_name
+        summary = CountSummary(counts)
+        write_dense_in_shard_rows(
+            counts,
+            _row_block_producer(source_counts),
+            resources=resources,
+            msg=f"Repacking {path}",
+            producerBytes=int(np.prod(source_counts.chunks))
+            * source_counts.dtype.itemsize,
+            residentBytes=summary.nbytes,
+            countSummary=summary,
+        )
+        finalize_counts(counts, summary=summary)
+        if path in required_transposes:
+            write_counts_t(
+                counts,
+                group,
+                resources=resources,
+                profile=profile,
+                featureSets=default_feature_sets(
+                    as_zarr_group(dst[feature_tables[path]], name=feature_tables[path])
+                ),
+            )
+        print(f"  {path}: {array_info(counts)}")
+    for name, workspace in assays:
         attr_root = (
             dst if workspace is None else as_zarr_group(dst[workspace], name=workspace)
         )
+        assay_group = as_zarr_group(attr_root[name], name=name)
+        cells = as_zarr_group(attr_root["cellData"], name="cellData")
+        matrix_path = name if workspace is None else f"matrices/{name}"
+        matrix = as_zarr_group(dst[matrix_path], name=matrix_path)
+        type_name = assay_types[name, workspace]
         raw_types = attr_root.attrs.get("assayTypes", {})
-        if isinstance(raw_types, dict) and assay_name in raw_types:
-            type_name = str(raw_types[assay_name])
-        if is_rna_assay_type(type_name):
-            write_counts_t(
-                counts,
-                as_zarr_group(dst[group_path], name=group_path),
-                profile=profile,
+        types = dict(raw_types) if isinstance(raw_types, dict) else {}
+        types[name] = type_name
+        attr_root.attrs["assayTypes"] = types
+        if data_only:
+            assay = preset_assay_types()[type_name](
+                z=dst,
+                workspace=workspace,
+                name=name,
+                cell_data=MetaData(cells),
+                nthreads=resources.workers,
                 resources=resources,
             )
-        print(f"  {counts_path}: {array_info(counts)}")
+            patterns = (
+                {
+                    f"{name}_{suffix}": pattern
+                    for suffix, pattern in DEFAULT_PERCENT_PATTERNS.items()
+                }
+                if isinstance(assay, RNAassay)
+                else {}
+            )
+            assay.prepare(patterns)
+        else:
+            publish_preparation(
+                assay_group,
+                cells,
+                matrix,
+                require_transpose=is_rna_assay_type(type_name),
+                expected_fingerprint=source_fingerprints[name, workspace],
+            )
+    if not data_only:
+        _copy_pipeline_label_claims(src, dst)
 
 
 def _parse_storage_options(raw: str | None) -> dict | None:
@@ -470,6 +551,11 @@ def main() -> None:
             "'{\"skip_signature\": true}' for public S3/GCS"
         ),
     )
+    parser.add_argument(
+        "--data-only",
+        action="store_true",
+        help="Rebuild raw data without saved analyses or generated summaries",
+    )
     args = parser.parse_args()
     repack_store(
         args.input,
@@ -478,6 +564,7 @@ def main() -> None:
         storage_options=_parse_storage_options(args.storage_options),
         mem_budget=args.mem_budget,
         nthreads=args.nthreads,
+        data_only=args.data_only,
     )
     print(f"Repacked {args.input} -> {args.output}")
 

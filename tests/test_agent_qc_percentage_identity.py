@@ -23,7 +23,7 @@ from tests.agent_orchestrator_store import create_store
 def test_exact_mitochondrial_artifact_owns_filtering_without_overwriting_metadata(
     tmp_path: Path,
 ) -> None:
-    path = create_store(tmp_path / "percentages.zarr")
+    path = create_store(tmp_path / "percentages.zarr", mito_pattern="", ribo_pattern="")
     store = DataStore(
         str(path),
         default_assay="RNA",
@@ -123,7 +123,7 @@ def test_changed_gene_definition_invalidates_percentage_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    path = create_store(tmp_path / "changed.zarr")
+    path = create_store(tmp_path / "changed.zarr", mito_pattern="", ribo_pattern="")
     store = DataStore(
         str(path),
         default_assay="RNA",
@@ -176,7 +176,9 @@ def test_unresolved_mitochondrial_definition_cannot_use_imported_percentages(
     tmp_path: Path,
 ) -> None:
     store = DataStore(
-        str(create_store(tmp_path / "unresolved.zarr")),
+        str(
+            create_store(tmp_path / "unresolved.zarr", mito_pattern="", ribo_pattern="")
+        ),
         default_assay="RNA",
         min_features_per_cell=-1,
         mito_pattern="",

@@ -32,7 +32,11 @@ from ..cell_quality.profiles import (
     qc_metric_execution_name,
     registered_qc_metric_role,
 )
-from ..tools import artifact_reference, core_artifact_reference
+from ..tools import (
+    artifact_reference,
+    core_artifact_reference,
+    persisted_assay_types,
+)
 from ..types import ArtifactReferenceModel
 from .contracts import (
     CaptureFailureEvidence,
@@ -50,35 +54,23 @@ from .contracts import (
 _MAX_QC_SAMPLE_PROFILES = 4
 
 
-def _persisted_assay_type(store: Any, assay_name: str) -> str:
-    """Read one persisted assay type without inferring modality from features."""
-    root = getattr(store, "zw", None)
-    attrs = getattr(root, "attrs", {})
-    raw_types = attrs.get("assayTypes", {}) if isinstance(attrs, Mapping) else {}
-    if isinstance(raw_types, Mapping):
-        assay_type = raw_types.get(assay_name)
-        if isinstance(assay_type, str):
-            return assay_type
-    return assay_name if assay_name in {"RNA", "ATAC", "ADT", "HTO"} else "Assay"
-
-
 def _qc_driver(
     store: Any, selected_assay: str | None = None
 ) -> tuple[str, CellQcDriverType] | None:
     """Use an explicit QC assay, otherwise the first RNA or ATAC assay."""
-    assay_names = [str(name) for name in getattr(store, "assay_names", [])]
+    assay_types = persisted_assay_types(store)
     if selected_assay is not None:
-        if selected_assay not in assay_names:
+        if selected_assay not in assay_types:
             raise ValueError(f"Unknown QC assay {selected_assay!r}")
-        selected_type = _persisted_assay_type(store, selected_assay)
+        selected_type = assay_types[selected_assay]
         if selected_type == "RNA":
             return selected_assay, "RNA"
         if selected_type == "ATAC":
             return selected_assay, "ATAC"
         raise ValueError("The selected QC assay must have persisted RNA or ATAC type")
     for assay_type in ("RNA", "ATAC"):
-        for assay_name in assay_names:
-            if _persisted_assay_type(store, assay_name) == assay_type:
+        for assay_name, persisted_type in assay_types.items():
+            if persisted_type == assay_type:
                 return assay_name, assay_type
     return None
 
@@ -216,6 +208,7 @@ def _artifact_input_references(
 def _qc_metric_sources(
     deps: ExperimentalContextDependencies,
     driver: tuple[str, CellQcDriverType],
+    active_cells: int | None = None,
 ) -> tuple[
     dict[str, np.ndarray],
     list[str],
@@ -229,7 +222,8 @@ def _qc_metric_sources(
     del assay_type
     selection = _cell_selection_ref(deps)
     selection_model = artifact_reference(selection)
-    active_cells = _active_cell_count(deps)
+    if active_cells is None:
+        active_cells = _active_cell_count(deps)
     metadata_names = _qc_attributes(deps.store, assay_name, driver[1])
     artifact_candidates: list[NamedArtifactSource] = []
     for source in deps.qualityMetricArtifacts:
@@ -792,10 +786,13 @@ class _QcDesignData:
         default_factory=dict
     )
     combinations: dict[tuple[str, ...], np.ndarray] = field(default_factory=dict)
+    columnNames: list[str] | None = None
 
     @property
     def columns(self) -> list[str]:
-        return list(self.cells.columns)
+        if self.columnNames is None:
+            self.columnNames = list(self.cells.columns)
+        return self.columnNames
 
     def fetch(self, column: str) -> np.ndarray:
         if column not in self.values:
@@ -1231,6 +1228,7 @@ def _design_retention(
         kinds = {
             record["name"]: record.get("kind") for record in characterization.columns
         }
+        available = set(cells.columns) if characterization.coefficients else set()
         for coefficient in characterization.coefficients:
             name = coefficient.get("name")
             for value in (
@@ -1238,7 +1236,7 @@ def _design_retention(
                 coefficient.get("observationUnit"),
                 coefficient.get("independentUnit"),
             ):
-                if isinstance(value, str) and value in cells.columns:
+                if isinstance(value, str) and value in available:
                     retention_columns.append(value)
     retained_by_column: dict[str, dict[str, int]] = {}
     unsafe_groups: list[str] = []
@@ -1766,7 +1764,7 @@ def _project_qc_profiles(
         source_concordance,
         attribute_notes,
         values_by_source,
-    ) = _qc_metric_sources(deps, driver)
+    ) = _qc_metric_sources(deps, driver, active_cells)
     capture = _directed_capture_source(deps)
     capture_column: str | None = None
     capture_artifact: NamedArtifactSource | None = None

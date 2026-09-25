@@ -361,7 +361,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             batch_codes=batch_codes,
             batch_design=batch_design,
         )
-        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay)
+        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay.z)
         stream = AlignedFeatureStream(
             query_assay=assay,
             query_cell_indices=query_cell_indices,
@@ -373,7 +373,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             reserved_resident_bytes=reserved_resident,
             reserved_per_row_bytes=reserved_per_row,
         )
-        if _ordered_feature_ids_fingerprint(assay) != feature_ids_fingerprint:
+        if _ordered_feature_ids_fingerprint(assay.z) != feature_ids_fingerprint:
             raise ValueError("Query feature identities changed during mapping setup")
         selected_expression_fingerprint = stream.raw_expression_fingerprint
 
@@ -537,7 +537,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 != selected_expression_fingerprint
             ):
                 raise ValueError("Query expression changed during mapping")
-            if _ordered_feature_ids_fingerprint(assay) != feature_ids_fingerprint:
+            if _ordered_feature_ids_fingerprint(assay.z) != feature_ids_fingerprint:
                 raise ValueError("Query feature identities changed during mapping")
             final_cells = validate_stored_selection_integrity(
                 self.zw,

@@ -19,7 +19,8 @@ from ..matrix import ChunkedArray
 from ..neighbors.diffusion import diffusion_operator
 from ..storage.ann_index import ANN_INDEX_ARRAY, ANN_INDEX_CHUNK_BYTES
 from ..storage.artifacts import artifact_group
-from ..storage.budget import ResourceBudget, admit_stream
+from ..storage.budget import ResourceBudget
+from ..storage.execution import admit_stream
 from ..storage.geometry import array_geometry
 from ..storage.parallel import stream_shards
 from ..storage.partition import affordable_width, row_band
@@ -466,18 +467,29 @@ def write_doublet_target_zarr(
         policy=policy,
     )
     store = load_count_array(z, assay_name, None)
+    from ..storage.identity import CountSummary, finalize_counts
+
+    summary = CountSummary(store)
     write_dense_in_shard_rows(
         store,
         lambda s, e: sim_counts[s:e].toarray().astype(dtype),
         msg="Writing simulated doublets",
         resources=resources,
         io=io,
+        residentBytes=sim_counts.data.nbytes
+        + sim_counts.indices.nbytes
+        + sim_counts.indptr.nbytes
+        + summary.nbytes,
+        producerBytes=min(n_sim, store.shards[0] if store.shards else store.chunks[0])
+        * sim_counts.shape[1]
+        * sim_counts.dtype.itemsize,
+        countSummary=summary,
     )
     from ..assay.classification import (
         is_rna_assay_type,
         resolve_persisted_assay_type,
     )
-    from ..storage.sharding import finalize_rna_counts_t
+    from ..storage.sharding import write_counts_t
     from ..storage.types import as_zarr_group
 
     type_name = resolve_persisted_assay_type(assay_name)
@@ -489,9 +501,10 @@ def write_doublet_target_zarr(
     )
     types[assay_name] = type_name
     z.attrs["assayTypes"] = types
+    finalize_counts(store, summary=summary)
     if is_rna_assay_type(type_name):
         group = as_zarr_group(z[assay_name], name=assay_name)
-        finalize_rna_counts_t(
+        write_counts_t(
             store,
             group,
             profile=resolved_profile,

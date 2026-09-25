@@ -19,7 +19,7 @@ from scarf.storage.artifacts import (
 )
 from scarf.storage.selections import (
     read_stored_selection_indices,
-    resolve_selection_artifact,
+    resolve_generated_selection_artifact,
 )
 
 
@@ -90,7 +90,7 @@ def _query_selection_matching_reference(query, reference) -> ArtifactRef:
         artifact_group(reference.datastore.zw, reference.cell_selection)["values"][:],
         dtype=bool,
     )
-    return resolve_selection_artifact(
+    return resolve_generated_selection_artifact(
         query.zw,
         scope="datastore",
         kind="cell_selection",
@@ -100,7 +100,7 @@ def _query_selection_matching_reference(query, reference) -> ArtifactRef:
         parameters={},
         inputs={"mapping_reference": reference.external_ref},
         source_column="mapping_reference",
-    )
+    )[0]
 
 
 def _changed_files(

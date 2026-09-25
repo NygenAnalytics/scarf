@@ -1,4 +1,8 @@
 import os
+import posixpath
+from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit, urlunsplit
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import numpy as np
@@ -7,8 +11,10 @@ from zarr.abc.store import Store
 
 from .types import ZarrMode, as_zarr_array, as_zarr_group
 from .profiles import (
+    StorageProfile,
     ZarrLocation,
     is_remote_zarr_location,
+    resolve_storage_profile,
 )
 
 MATRIX_SOURCE_ATTR = "matrixSource"
@@ -16,9 +22,51 @@ _ASSAY_COPY_ATTRS = ("is_assay", "misc", "percentFeatures", "size_factor")
 _WORKSPACE_COPY_ATTRS = ("defaultAssay", "assayTypes")
 
 
+def _location_identity(location: str) -> tuple[str, str]:
+    parsed = urlsplit(location)
+    if parsed.scheme in ("", "file"):
+        path = parsed.path if parsed.scheme == "file" else location
+        return "file", str(Path(path).expanduser().resolve())
+    normalized_path = posixpath.normpath(parsed.path or "/")
+    return "uri", urlunsplit(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc,
+            normalized_path,
+            parsed.query,
+            parsed.fragment,
+        )
+    )
+
+
+def locations_overlap(first: str, second: str) -> bool:
+    first_kind, first_identity = _location_identity(first)
+    second_kind, second_identity = _location_identity(second)
+    if (first_kind, first_identity) == (second_kind, second_identity):
+        return True
+    if first_kind != second_kind:
+        return False
+    if first_kind == "file":
+        first_path: Path | PurePosixPath = Path(first_identity)
+        second_path: Path | PurePosixPath = Path(second_identity)
+    else:
+        first_uri = urlsplit(first_identity)
+        second_uri = urlsplit(second_identity)
+        if (first_uri.scheme, first_uri.netloc) != (
+            second_uri.scheme,
+            second_uri.netloc,
+        ):
+            return False
+        first_path = PurePosixPath(first_uri.path)
+        second_path = PurePosixPath(second_uri.path)
+    if first_path == second_path:
+        return True
+    return first_path in second_path.parents or second_path in first_path.parents
+
+
 def zarr_group_root(group: zarr.Group, mode: ZarrMode = "r+") -> zarr.Group:
     """Open the root Zarr group sharing the same store as ``group``."""
-    return zarr.open_group(store=group.store, mode=mode)
+    return open_store(group.store, mode=mode)
 
 
 def zarr_root_path(node: zarr.Group | zarr.Array) -> str | None:
@@ -46,6 +94,27 @@ def is_remote_datastore(
     if store_name in ("MemoryStore", "LocalStore"):
         return False
     return True
+
+
+# Small requests worth overlapping against an object store, where every group,
+# array, or attribute access pays a network round trip.
+REMOTE_METADATA_WORKERS = 32
+
+
+def metadata_workers(node: zarr.Group | zarr.Array) -> int:
+    """Return how many small metadata requests to overlap on ``node``'s store."""
+    return REMOTE_METADATA_WORKERS if is_remote_datastore(None, node) else 1
+
+
+def run_concurrently[T](tasks: Sequence[Callable[[], T]], *, workers: int) -> list[T]:
+    """Run independent storage tasks in order, overlapping them when useful."""
+    if workers <= 1 or len(tasks) <= 1:
+        return [task() for task in tasks]
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(tasks))) as pool:
+        futures = [pool.submit(task) for task in tasks]
+        return [future.result() for future in futures]
 
 
 def _is_obstore_native_store(obj: object) -> bool:
@@ -97,6 +166,9 @@ def open_store(
     storage_options: dict[str, Any] | None = None,
 ) -> zarr.Group:
     """Open a Zarr group from a path, URI, or store object."""
+    from .async_execution import ensure_zarr_host_ceiling
+
+    ensure_zarr_host_ceiling()
     store = make_store(path, storage_options=storage_options, read_only=(mode == "r"))
     if isinstance(store, str):
         return zarr.open_group(store, mode=mode)
@@ -174,94 +246,14 @@ def _list_assay_names(root: zarr.Group, workspace: str | None) -> list[str]:
     return assays
 
 
-def _assay_identity(
-    source_root: zarr.Group,
-    assay: zarr.Group,
-    assay_name: str,
-    workspace: str | None,
-    *,
-    cell_ids_fingerprint: str | None,
-) -> dict[str, Any]:
-    from .artifacts import fingerprint_stored_strings
-    from .schema import load_count_array
-
-    counts = load_count_array(source_root, assay_name, workspace)
-    entry: dict[str, Any] = {
-        "shape": [int(counts.shape[0]), int(counts.shape[1])],
-        "dtype": np.dtype(counts.dtype).str,
-        "datasetFingerprint": None,
-        "cellIdsFingerprint": None,
-        "featureIdsFingerprint": None,
-    }
-    fingerprint = assay.attrs.get("dataset_fingerprint")
-    if fingerprint is not None:
-        entry["datasetFingerprint"] = str(fingerprint)
-        return entry
-    if cell_ids_fingerprint is None:
-        raise RuntimeError("Cell identifier fingerprint was not calculated")
-    feature_data = as_zarr_group(
-        assay["featureData"],
-        name=f"{assay_name}/featureData",
-    )
-    feature_ids = as_zarr_array(feature_data["ids"], name="ids")
-    entry["cellIdsFingerprint"] = cell_ids_fingerprint
-    entry["featureIdsFingerprint"] = fingerprint_stored_strings(feature_ids)
-    return entry
-
-
-def _validate_assay_identity(
-    source_root: zarr.Group,
-    assay: zarr.Group,
-    assay_name: str,
-    workspace: str | None,
-    expected: dict[str, Any],
-    *,
-    cell_ids_fingerprint: str | None,
-) -> None:
-    from .artifacts import fingerprint_stored_strings
-    from .schema import load_count_array
-
-    counts = load_count_array(source_root, assay_name, workspace)
-    shape = [int(counts.shape[0]), int(counts.shape[1])]
-    dtype = np.dtype(counts.dtype).str
-    if shape != list(expected.get("shape", [])) or dtype != expected.get("dtype"):
-        raise ValueError(
-            f"Matrix source assay {assay_name!r} no longer matches the mounted "
-            "count matrix identity"
-        )
-    expected_fingerprint = expected.get("datasetFingerprint")
-    if expected_fingerprint is not None:
-        current = assay.attrs.get("dataset_fingerprint")
-        if current is None or str(current) != str(expected_fingerprint):
-            raise ValueError(
-                f"Matrix source assay {assay_name!r} dataset fingerprint no longer "
-                "matches the mounted store"
-            )
-        return
-    if cell_ids_fingerprint is None:
-        raise RuntimeError("Cell identifier fingerprint was not calculated")
-    feature_data = as_zarr_group(
-        assay["featureData"],
-        name=f"{assay_name}/featureData",
-    )
-    feature_ids = as_zarr_array(feature_data["ids"], name="ids")
-    if cell_ids_fingerprint != expected.get(
-        "cellIdsFingerprint"
-    ) or fingerprint_stored_strings(feature_ids) != expected.get(
-        "featureIdsFingerprint"
-    ):
-        raise ValueError(
-            f"Matrix source assay {assay_name!r} cell or feature identifiers no "
-            "longer match the mounted store"
-        )
-
-
 def create_matrix_source(
     source: str,
     at: ZarrLocation,
     *,
     workspace: str | None = None,
+    required_transposes: frozenset[str],
     storage_options: dict[str, Any] | None = None,
+    profile: StorageProfile | None = None,
 ) -> zarr.Group:
     """Create a writable store that mounts count matrices from ``source``."""
     from .arrays import create_metadata_column
@@ -270,58 +262,51 @@ def create_matrix_source(
     if not isinstance(source, str) or not source:
         raise TypeError("Matrix source location must be a non-empty string")
     source = _persistable_location(source)
+    if isinstance(at, str) and locations_overlap(source, at):
+        raise ValueError("Source and destination must not overlap")
     source_root = load_zarr(
         source,
         mode="r",
         storage_options=storage_options,
     )
+    if MATRIX_SOURCE_ATTR in source_root.attrs:
+        raise ValueError(
+            "Mounting a mounted target requires repacking it into a store that owns its counts first"
+        )
     assay_names = _list_assay_names(source_root, workspace)
     if not assay_names:
         raise ValueError("No assays found in the matrix source")
 
+    from .identity import count_fingerprint, validate_preparation, publish_preparation
+    from .copy import validate_metadata_dependencies
+
     source_zw = _workspace_group(source_root, workspace)
-    from .counts_t_contract import require_rna_counts_t_ready
-
-    for assay_name in assay_names:
-        require_rna_counts_t_ready(source_root, assay_name, workspace)
-
-    source_cell_data = as_zarr_group(
-        source_zw["cellData"],
-        name="cellData",
-    )
-    cell_ids = as_zarr_array(source_cell_data["ids"], name="ids")
-    source_assays: dict[str, zarr.Group] = {}
-    needs_id_fingerprint = False
-    for assay_name in assay_names:
-        source_assay = as_zarr_group(source_zw[assay_name], name=assay_name)
-        feature_data = as_zarr_group(
-            source_assay["featureData"],
-            name=f"{assay_name}/featureData",
+    source_cell_data = as_zarr_group(source_zw["cellData"], name="cellData")
+    validate_metadata_dependencies(source_cell_data)
+    source_assays = {}
+    source_matrices = {}
+    assay_manifest = {}
+    for name in assay_names:
+        assay = as_zarr_group(source_zw[name], name=name)
+        path = name if workspace is None else f"matrices/{name}"
+        matrix = as_zarr_group(source_root[path], name=path)
+        required = name in required_transposes
+        fingerprint = validate_preparation(
+            assay, source_cell_data, matrix, require_transpose=required
         )
-        as_zarr_array(feature_data["ids"], name="ids")
-        source_assays[assay_name] = source_assay
-        needs_id_fingerprint = (
-            needs_id_fingerprint
-            or source_assay.attrs.get("dataset_fingerprint") is None
+        validate_metadata_dependencies(
+            as_zarr_group(assay["featureData"], name="featureData")
         )
+        counts = as_zarr_array(matrix["counts"], name="counts")
+        source_assays[name] = assay
+        source_matrices[name] = matrix
+        assay_manifest[name] = {
+            "datasetFingerprint": fingerprint,
+            "countsFingerprint": count_fingerprint(counts),
+            "requiresTranspose": required,
+        }
 
-    cell_ids_fingerprint: str | None = None
-    if needs_id_fingerprint:
-        from .artifacts import fingerprint_stored_strings
-
-        cell_ids_fingerprint = fingerprint_stored_strings(cell_ids)
-
-    assay_manifest = {
-        assay_name: _assay_identity(
-            source_root,
-            source_assays[assay_name],
-            assay_name,
-            workspace,
-            cell_ids_fingerprint=cell_ids_fingerprint,
-        )
-        for assay_name in assay_names
-    }
-
+    profile = resolve_storage_profile(at, profile)
     target = load_zarr(at, mode="w-", storage_options=storage_options)
     try:
         target_zw = target if workspace is None else target.create_group(workspace)
@@ -330,10 +315,11 @@ def create_matrix_source(
                 target_zw.attrs[key] = source_zw.attrs[key]
 
         cell_data = target_zw.create_group("cellData")
-        copy_zarr_group_tree(source_cell_data, cell_data)
+        copy_zarr_group_tree(source_cell_data, cell_data, profile=profile)
         for assay_name in assay_names:
             source_assay = source_assays[assay_name]
             target_assay = target_zw.create_group(assay_name)
+            target_assay.attrs["prepared"] = False
             for key in _ASSAY_COPY_ATTRS:
                 if key in source_assay.attrs:
                     target_assay.attrs[key] = source_assay.attrs[key]
@@ -349,6 +335,7 @@ def create_matrix_source(
                 source_feature_data,
                 feature_data,
                 exclude_members={"I"},
+                profile=profile,
             )
             source_feature_ids = as_zarr_array(
                 source_feature_data["ids"],
@@ -360,6 +347,17 @@ def create_matrix_source(
                 data=np.ones(int(source_feature_ids.shape[0]), dtype=bool),
                 dtype=bool,
                 chunkSize=100_000,
+                profile=profile,
+            )
+
+            publish_preparation(
+                target_assay,
+                cell_data,
+                source_matrices[assay_name],
+                require_transpose=assay_name in required_transposes,
+                expected_fingerprint=str(
+                    assay_manifest[assay_name]["datasetFingerprint"]
+                ),
             )
 
         target.attrs[MATRIX_SOURCE_ATTR] = {
@@ -409,26 +407,38 @@ def resolve_matrix_source(
             )
         entries.append((assay_name, expected))
 
+    from .identity import REBUILD_REQUIRED, count_fingerprint, validate_preparation
+
     source_zw = _workspace_group(source_root, workspace)
-    cell_ids_fingerprint: str | None = None
-    if any(expected.get("datasetFingerprint") is None for _, expected in entries):
-        from .artifacts import fingerprint_stored_strings
-
-        cell_data = as_zarr_group(source_zw["cellData"], name="cellData")
-        cell_ids = as_zarr_array(cell_data["ids"], name="ids")
-        cell_ids_fingerprint = fingerprint_stored_strings(cell_ids)
-
-    from .counts_t_contract import require_rna_counts_t_ready
-
-    for assay_name, expected in entries:
-        source_assay = as_zarr_group(source_zw[assay_name], name=assay_name)
-        _validate_assay_identity(
-            source_root,
-            source_assay,
-            assay_name,
-            workspace,
-            expected,
-            cell_ids_fingerprint=cell_ids_fingerprint,
+    source_cells = as_zarr_group(source_zw["cellData"], name="cellData")
+    if MATRIX_SOURCE_ATTR in source_root.attrs:
+        raise ValueError(
+            "The mounted source must own its count matrices; create a fresh target"
         )
-        require_rna_counts_t_ready(source_root, assay_name, workspace)
+    for assay_name, expected in entries:
+        if set(expected) != {
+            "datasetFingerprint",
+            "countsFingerprint",
+            "requiresTranspose",
+        } or not isinstance(expected["requiresTranspose"], bool):
+            raise ValueError(
+                f"Existing mount has an unsupported identity contract; create a fresh target. {REBUILD_REQUIRED}"
+            )
+        source_assay = as_zarr_group(source_zw[assay_name], name=assay_name)
+        path = assay_name if workspace is None else f"matrices/{assay_name}"
+        matrix = as_zarr_group(source_root[path], name=path)
+        fingerprint = validate_preparation(
+            source_assay,
+            source_cells,
+            matrix,
+            require_transpose=expected["requiresTranspose"],
+        )
+        counts = as_zarr_array(matrix["counts"], name="counts")
+        if (
+            fingerprint != expected["datasetFingerprint"]
+            or count_fingerprint(counts) != expected["countsFingerprint"]
+        ):
+            raise ValueError(
+                f"Matrix source assay {assay_name!r} no longer matches the mounted identity"
+            )
     return source_root, workspace

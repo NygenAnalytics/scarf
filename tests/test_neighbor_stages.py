@@ -7,12 +7,11 @@ from scarf.matrix import ChunkedArray
 from scarf.neighbors.stages import (
     AnnIndexStage,
     BatchCorrectionStage,
+    ChunkedCoordinateStream,
     KMeansInitializationStage,
-    LazyTransformStream,
     NeighborQueryStage,
     ReductionTransform,
 )
-from scarf.neighbors.stream import AnnStream
 
 
 class _CountingChunkedArray(ChunkedArray):
@@ -43,35 +42,15 @@ def _custom_inputs() -> tuple[np.ndarray, np.ndarray]:
     return data, loadings
 
 
-def _ann_stream() -> AnnStream:
-    values, loadings = _custom_inputs()
-    return AnnStream(
-        data=ChunkedArray.from_numpy(values, block_size=4, nthreads=1),
-        k=3,
-        n_cluster=3,
-        reduction_method="custom",
-        dims=2,
-        loadings=loadings,
-        use_for_pca=np.ones(values.shape[0], dtype=bool),
-        mu=np.zeros(values.shape[1]),
-        sigma=np.ones(values.shape[1]),
-        ann_metric="l2",
-        ann_efc=50,
-        ann_ef=50,
-        ann_m=16,
-        nthreads=1,
-        ann_parallel=False,
-        rand_state=4466,
-        do_kmeans_fit=True,
-        disable_scaling=True,
-        ann_idx=None,
-        lsi_skip_first=False,
-        lsi_params={},
-        harmonize=False,
-    )
+def _coordinate_stream(
+    coordinates: np.ndarray,
+    block_size: int,
+) -> tuple[ChunkedCoordinateStream, _CountingChunkedArray]:
+    data = _CountingChunkedArray(coordinates, block_size=block_size)
+    return ChunkedCoordinateStream(data, 1), data
 
 
-def test_reduction_transform_keeps_cell_coordinates_lazy() -> None:
+def test_reduction_transform_with_loadings_reads_no_cells() -> None:
     values, loadings = _custom_inputs()
     data = _CountingChunkedArray(values, block_size=3)
     reduction = ReductionTransform(
@@ -89,17 +68,11 @@ def test_reduction_transform_keeps_cell_coordinates_lazy() -> None:
         lsi_skip_first=False,
         lsi_params={},
     )
-    stream = LazyTransformStream(
-        data=data,
-        transform=reduction.transform,
-        nthreads=1,
-        batch_size=3,
-    )
 
+    np.testing.assert_allclose(
+        reduction.transform(values[:3]), values[:3].dot(loadings)
+    )
     assert data.read_count == 0
-    first = next(stream.iter_transformed())
-    np.testing.assert_allclose(first, values[:3].dot(loadings))
-    assert 1 <= data.read_count <= 3
 
 
 @pytest.mark.parametrize("disable_scaling", [False, True])
@@ -229,26 +202,9 @@ def test_lsi_dims_are_final_output_dimensions(skip_first: bool) -> None:
     assert loadings.shape == (values.shape[1], 2)
 
 
-def test_ann_stream_adapter_preserves_reduction_numerics() -> None:
-    values, loadings = _custom_inputs()
-    stream = _ann_stream()
-    expected = values.dot(loadings)
-
-    np.testing.assert_allclose(stream.transform_query(values), expected)
-    assert stream.clusterLabels.shape == (values.shape[0],)
-    indices, distances = stream.transform_ann(expected, k=3)
-    assert indices.shape == distances.shape == (values.shape[0], 3)
-
-
 def test_lazy_coordinate_stages_do_not_hide_a_cross_stage_cache() -> None:
     values, loadings = _custom_inputs()
-    data = _CountingChunkedArray(values, block_size=3)
-    stream = LazyTransformStream(
-        data=data,
-        transform=lambda block: block.dot(loadings),
-        nthreads=1,
-        batch_size=3,
-    )
+    stream, data = _coordinate_stream(values.dot(loadings), block_size=3)
 
     index = AnnIndexStage.fit(
         coordinates=stream,
@@ -263,10 +219,11 @@ def test_lazy_coordinate_stages_do_not_hide_a_cross_stage_cache() -> None:
     )
     initialization = KMeansInitializationStage.fit(
         stream=stream,
+        n_rows=values.shape[0],
+        batch_size=3,
         n_clusters=3,
         rand_state=4466,
         nthreads=1,
-        enabled=True,
     )
 
     assert data.read_count == 12
@@ -293,35 +250,20 @@ def test_neighbor_query_validates_and_converts_metric_distances() -> None:
         cosine._metric_distances(np.array([[0.1, np.nan]], dtype=np.float32))
 
 
-def test_kmeans_initialization_runs_on_demand_without_ann() -> None:
+def test_kmeans_initialization_reads_each_block_once_per_pass() -> None:
     values, loadings = _custom_inputs()
-    data = _CountingChunkedArray(values, block_size=3)
-    stream = LazyTransformStream(
-        data=data,
-        transform=lambda block: block.dot(loadings),
-        nthreads=1,
+    stream, data = _coordinate_stream(values.dot(loadings), block_size=3)
+
+    result = KMeansInitializationStage.fit(
+        stream=stream,
+        n_rows=values.shape[0],
         batch_size=3,
-    )
-
-    disabled = KMeansInitializationStage.fit(
-        stream=stream,
         n_clusters=3,
         rand_state=4466,
         nthreads=1,
-        enabled=False,
     )
-    assert disabled.model is None
-    assert data.read_count == 0
-
-    enabled = KMeansInitializationStage.fit(
-        stream=stream,
-        n_clusters=3,
-        rand_state=4466,
-        nthreads=1,
-        enabled=True,
-    )
-    assert enabled.model is not None
-    assert enabled.labels.shape == (values.shape[0],)
+    assert result.model is not None
+    assert result.labels.shape == (values.shape[0],)
     assert data.read_count == 9
 
 
@@ -329,12 +271,9 @@ def test_kmeans_initialization_uses_true_minibatches_for_one_full_block(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     values, loadings = _custom_inputs()
-    data = _CountingChunkedArray(values, block_size=values.shape[0])
-    stream = LazyTransformStream(
-        data=data,
-        transform=lambda block: block.dot(loadings),
-        nthreads=1,
-        batch_size=values.shape[0],
+    stream, data = _coordinate_stream(
+        values.dot(loadings),
+        block_size=values.shape[0],
     )
     closed_progress: list[tuple[int, int]] = []
 
@@ -356,10 +295,11 @@ def test_kmeans_initialization_uses_true_minibatches_for_one_full_block(
 
     result = KMeansInitializationStage.fit(
         stream=stream,
+        n_rows=values.shape[0],
+        batch_size=values.shape[0],
         n_clusters=3,
         rand_state=4466,
         nthreads=1,
-        enabled=True,
         kmeans_sampling=0.5,
         kmeans_batch_size=3,
     )
@@ -382,13 +322,7 @@ def test_kmeans_streaming_samples_all_blocks_and_coalesces_updates(
 
     values, loadings = _custom_inputs()
     transformed = values.dot(loadings)
-    data = _CountingChunkedArray(values, block_size=2)
-    stream = LazyTransformStream(
-        data=data,
-        transform=lambda block: block.dot(loadings),
-        nthreads=1,
-        batch_size=2,
-    )
+    stream, data = _coordinate_stream(transformed, block_size=2)
     sampled: list[np.ndarray] = []
 
     def capture_kmeans_plusplus(
@@ -407,10 +341,11 @@ def test_kmeans_streaming_samples_all_blocks_and_coalesces_updates(
     monkeypatch.setattr("sklearn.cluster.kmeans_plusplus", capture_kmeans_plusplus)
     result = KMeansInitializationStage.fit(
         stream=stream,
+        n_rows=values.shape[0],
+        batch_size=2,
         n_clusters=3,
         rand_state=4466,
         nthreads=1,
-        enabled=True,
         kmeans_sampling=0.5,
         kmeans_batch_size=5,
     )
@@ -431,18 +366,14 @@ def test_kmeans_streaming_samples_all_blocks_and_coalesces_updates(
     assert result.labels.shape == (values.shape[0],)
     assert data.read_count == 12
 
-    other_data = _CountingChunkedArray(values, block_size=3)
+    other_stream, other_data = _coordinate_stream(transformed, block_size=3)
     other_result = KMeansInitializationStage.fit(
-        stream=LazyTransformStream(
-            data=other_data,
-            transform=lambda block: block.dot(loadings),
-            nthreads=1,
-            batch_size=3,
-        ),
+        stream=other_stream,
+        n_rows=values.shape[0],
+        batch_size=3,
         n_clusters=3,
         rand_state=4466,
         nthreads=1,
-        enabled=True,
         kmeans_sampling=0.5,
         kmeans_batch_size=5,
     )
@@ -457,39 +388,29 @@ def test_kmeans_streaming_samples_all_blocks_and_coalesces_updates(
 
 def test_kmeans_initialization_rejects_single_row_and_empty_inputs() -> None:
     values, loadings = _custom_inputs()
-    single_data = ChunkedArray.from_numpy(values[:1], block_size=1, nthreads=1)
-    single_stream = LazyTransformStream(
-        data=single_data,
-        transform=lambda block: block.dot(loadings),
-        nthreads=1,
-        batch_size=1,
-    )
+    single_stream, _ = _coordinate_stream(values[:1].dot(loadings), block_size=1)
     with pytest.raises(ValueError, match="at least two rows"):
         KMeansInitializationStage.fit(
             stream=single_stream,
+            n_rows=1,
+            batch_size=1,
             n_clusters=5,
             rand_state=4466,
             nthreads=1,
-            enabled=True,
         )
 
-    empty_stream = LazyTransformStream(
-        data=ChunkedArray.from_numpy(
-            np.empty((0, values.shape[1])),
-            block_size=1,
-            nthreads=1,
-        ),
-        transform=lambda block: block.dot(loadings),
-        nthreads=1,
-        batch_size=1,
+    empty_stream, _ = _coordinate_stream(
+        np.empty((0, loadings.shape[1])),
+        block_size=1,
     )
     with pytest.raises(ValueError, match="at least one row"):
         KMeansInitializationStage.fit(
             stream=empty_stream,
+            n_rows=0,
+            batch_size=1,
             n_clusters=2,
             rand_state=4466,
             nthreads=1,
-            enabled=True,
         )
 
 
@@ -497,13 +418,7 @@ def test_harmony_stage_materializes_uncorrected_coordinates_once(
     monkeypatch,
 ) -> None:
     values, loadings = _custom_inputs()
-    data = _CountingChunkedArray(values, block_size=3)
-    stream = LazyTransformStream(
-        data=data,
-        transform=lambda block: block.dot(loadings),
-        nthreads=1,
-        batch_size=3,
-    )
+    stream, data = _coordinate_stream(values.dot(loadings), block_size=3)
     corrected_values = values.dot(loadings) + 1.0
 
     def fake_harmony(
@@ -543,47 +458,3 @@ def test_harmony_stage_materializes_uncorrected_coordinates_once(
     np.testing.assert_allclose(first.compute(), corrected_values)
     assert second is first
     assert data.read_count == 3
-
-
-def test_invalid_ann_configuration_fails_before_harmony_reads(
-    monkeypatch,
-) -> None:
-    values, loadings = _custom_inputs()
-    data = _CountingChunkedArray(values, block_size=3)
-    harmony_called = False
-
-    def fail_if_called(*_args, **_kwargs):
-        nonlocal harmony_called
-        harmony_called = True
-        raise AssertionError("Harmony should not run")
-
-    monkeypatch.setattr("scarf.neighbors.stages.fit_harmony", fail_if_called)
-    with pytest.raises(RuntimeError):
-        AnnStream(
-            data=data,
-            k=3,
-            n_cluster=3,
-            reduction_method="custom",
-            dims=2,
-            loadings=loadings,
-            use_for_pca=np.ones(values.shape[0], dtype=bool),
-            mu=np.zeros(values.shape[1]),
-            sigma=np.ones(values.shape[1]),
-            ann_metric="not_a_metric",
-            ann_efc=50,
-            ann_ef=50,
-            ann_m=16,
-            nthreads=1,
-            ann_parallel=False,
-            rand_state=4466,
-            do_kmeans_fit=False,
-            disable_scaling=True,
-            ann_idx=None,
-            lsi_skip_first=False,
-            lsi_params={},
-            harmonize=True,
-            batches=pd.DataFrame({"batch": ["a", "b"] * 4}),
-        )
-
-    assert not harmony_called
-    assert data.read_count == 0

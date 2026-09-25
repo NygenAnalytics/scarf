@@ -16,11 +16,15 @@ from ..storage.arrays import (
     MetadataBlock,
     create_streamed_metadata_column,
 )
-from ..storage.budget import ResourceBudget, admitted_worker_split
+from ..storage.budget import ResourceBudget
+from ..storage.copy import COLUMN_METADATA_ATTRIBUTES
+from ..storage.execution import admitted_worker_split
+from ..storage.identity import GENERATED_FEATURE_COLUMNS, clear_column
 from ..storage.layout import PROFILE_METADATA_CHUNK, _encoded_chunk_bound
 from ..storage.partition import affordable_width
 from ..storage.profiles import StorageProfile
 from ..storage.types import as_zarr_array, as_zarr_group
+from ..utils.logging import logger
 from .row_plan import (
     RowPlan,
     RowPlanSegment,
@@ -31,6 +35,10 @@ from .row_plan import (
 
 
 _PROTECTED = frozenset({"ids", "I", "names"})
+
+
+class _SourceConflict(ValueError):
+    """Merged sources disagree on a column value or its metadata."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,48 +82,37 @@ def _column_working_bytes(
     return max(peaks, default=1)
 
 
+def _band_write_bytes(spec: MetadataColumnSpec, rows: int, chunk_rows: int) -> int:
+    """Bound writing one column through whole destination chunk bands.
+
+    A band holds one chunk of values and missing flags while source segments
+    of ``rows`` rows fill it. The full chunk is then copied and encoded once.
+    """
+    chunk = max(1, int(chunk_rows))
+    values = chunk * max(1, int(spec.dtype.itemsize))
+    missing = chunk * np.dtype(bool).itemsize if spec.hasMissing else 0
+    encode = max(
+        values + _encoded_chunk_bound(values),
+        missing + _encoded_chunk_bound(missing) if missing else 0,
+    )
+    return values + missing + max(_column_working_bytes(spec, rows), encode)
+
+
 @dataclass(frozen=True, slots=True)
 class CellMetadataPlan:
     columns: tuple[MetadataColumnSpec, ...]
     blockRows: int
 
-    def peak_block_bytes_at(self, rows: int) -> int:
-        return max(
-            (_column_working_bytes(spec, rows) for spec in self.columns),
-            default=1,
-        )
-
     def peak_write_bytes_at(self, rows: int, *, chunk_rows: int) -> int:
-        width = max(1, int(rows))
-        destination_peak = max(
-            (
-                width * max(1, int(spec.dtype.itemsize))
-                + (width * np.dtype(bool).itemsize if spec.hasMissing else 0)
-                + max(
-                    _chunk_resident_bytes(spec.dtype, chunk_rows),
-                    (
-                        _chunk_resident_bytes(np.dtype(bool), chunk_rows)
-                        if spec.hasMissing
-                        else 0
-                    ),
-                )
-                for spec in self.columns
-            ),
+        return max(
+            (_band_write_bytes(spec, rows, chunk_rows) for spec in self.columns),
             default=1,
         )
-        return max(self.peak_block_bytes_at(width), destination_peak)
 
 
 def metadata_chunk_rows(row_plan: RowPlan) -> int:
     """Return the deterministic chunk width for merged cell metadata."""
-    return max(
-        1,
-        min(
-            PROFILE_METADATA_CHUNK,
-            max(1, max_row_plan_block_rows(row_plan)),
-            max(1, int(row_plan.nCells)),
-        ),
-    )
+    return max(1, min(PROFILE_METADATA_CHUNK, int(row_plan.nCells)))
 
 
 def effective_metadata_segment_rows(
@@ -197,23 +194,22 @@ def resolve_identity_validation_rows(
         max(1, max_row_plan_block_rows(row_plan)),
     )
     ids_spec = next(spec for spec in metadata_plan.columns if spec.name == "ids")
-    stored_fixed, stored_per_row = array_row_selection_parts(stored_ids)
-    expected_per_row = max(1, int(ids_spec.dtype.itemsize))
-    index_per_row = np.dtype(np.int64).itemsize
+    stored_fixed, _ = array_row_selection_parts(stored_ids)
+    band_rows = min(max(1, int(stored_ids.chunks[0])), max(1, row_plan.nCells))
+    band_bytes = band_rows * max(1, int(np.dtype(stored_ids.dtype).itemsize))
 
     def fits(width: int) -> bool:
-        source_phase = _column_working_bytes(ids_spec, width)
-        destination_phase = (
-            stored_fixed
-            + width * stored_per_row
-            + width * (expected_per_row + index_per_row)
+        # One decoded chunk band of stored ids stays resident while the
+        # expected ids of its segments are read and compared.
+        task_bytes = band_bytes + max(
+            stored_fixed, _column_working_bytes(ids_spec, width)
         )
         try:
             admitted_worker_split(
                 resources,
                 nTasks=1,
                 residentBytes=max(0, int(resident_bytes)),
-                taskBytes=lambda _: max(source_phase, destination_phase),
+                taskBytes=lambda _: task_bytes,
                 requested=1,
             )
         except MemoryError:
@@ -283,7 +279,6 @@ def _string_itemsize_bound(dtype: np.dtype[Any]) -> int:
 
 def resolve_metadata_schema_scan_rows(
     source_cell_tables: list[Any],
-    row_plan: RowPlan,
     resources: ResourceBudget,
     *,
     resident_bytes: int,
@@ -376,6 +371,7 @@ def plan_cell_metadata(
     membership_assays: list[str] | None = None,
     block_rows: int = 100_000,
     scan_rows: int | None = None,
+    excluded_columns: list[frozenset[str]] | None = None,
 ) -> CellMetadataPlan:
     """Resolve the destination cell-metadata schema without writing."""
     block_rows = max(1, int(block_rows))
@@ -393,9 +389,11 @@ def plan_cell_metadata(
 
     # Collect public columns per source.
     per_source: list[dict[str, str]] = []
-    for table in source_cell_tables:
+    for index, table in enumerate(source_cell_tables):
         mapping: dict[str, str] = {}
         for column in table.columns:
+            if excluded_columns is not None and column in excluded_columns[index]:
+                continue
             public = _public_column_name(column, prepend_text)
             mapping[public] = column
         per_source.append(mapping)
@@ -582,6 +580,144 @@ def _fill_value(dtype: np.dtype[Any]) -> Any:
     return ""
 
 
+def _merged_column_attributes(arrays: Iterable[Any], name: str) -> dict[str, Any]:
+    attributes: dict[str, Any] = {}
+    for array in arrays:
+        for key, value in getattr(array, "attrs", {}).items():
+            if (
+                key not in COLUMN_METADATA_ATTRIBUTES
+                or key == "feature_selection_fingerprint"
+            ):
+                continue
+            if key in attributes and attributes[key] != value:
+                raise _SourceConflict(
+                    f"Conflicting metadata for column {name!r}: {key}"
+                )
+            attributes[key] = value
+    return attributes
+
+
+def write_feature_metadata(
+    tables: list[Any],
+    mappings: list[np.ndarray],
+    destination: zarr.Group,
+    n_features: int,
+    *,
+    resources: ResourceBudget,
+    resident_bytes: int,
+    profile: StorageProfile,
+) -> None:
+    """Merge feature annotations that agree across sources.
+
+    A column whose values or metadata differ for a shared feature describes
+    the source datasets rather than the features, so it is left out with a
+    warning. Per-dataset analysis outputs such as highly variable gene flags
+    usually fall in this group.
+    """
+    excluded = {"ids", "names", "I", *GENERATED_FEATURE_COLUMNS}
+    table_columns = [set(table.columns) for table in tables]
+    columns = sorted(set().union(*table_columns) - excluded)
+    mapping_bytes = max((mapping.nbytes * 3 for mapping in mappings), default=0)
+    scan_rows = resolve_metadata_schema_scan_rows(
+        tables,
+        resources,
+        resident_bytes=resident_bytes + mapping_bytes,
+        preferred_rows=PROFILE_METADATA_CHUNK,
+    )
+    skipped: list[str] = []
+    for name in columns:
+        sources = [
+            (table, mapping)
+            for table, mapping, present in zip(
+                tables, mappings, table_columns, strict=True
+            )
+            if name in present
+        ]
+        arrays = [table._get_array(name) for table, _ in sources]
+        dtype = _promote_dtypes([np.dtype(array.dtype) for array in arrays])
+        if dtype.kind in {"U", "S", "O"}:
+            width = max(
+                (np.dtype(array.dtype).itemsize // 4)
+                if np.dtype(array.dtype).kind == "U"
+                else _max_text_width(table, name, block_rows=scan_rows)
+                for (table, _), array in zip(sources, arrays, strict=True)
+            )
+            dtype = np.dtype(f"U{width}")
+        masks = [metadata_missing_mask(table, name) for table, _ in sources]
+        spec = _metadata_column_spec(
+            name,
+            dtype,
+            True,
+            value_arrays=arrays,
+            mask_arrays=[mask for mask in masks if mask is not None],
+        )
+        available = resources.memoryBytes - resident_bytes - mapping_bytes
+
+        def fits(rows: int) -> bool:
+            return (
+                _column_working_bytes(spec, rows)
+                + rows * (4 * dtype.itemsize + 32)
+                + _chunk_resident_bytes(dtype, rows)
+            ) <= available
+
+        block_rows = affordable_width(
+            fits, min(PROFILE_METADATA_CHUNK, max(1, n_features))
+        )
+        if block_rows < 1:
+            raise MemoryError(
+                f"Merged feature column {name!r} cannot fit the memory budget"
+            )
+
+        def blocks() -> Iterator[MetadataBlock]:
+            for start in range(0, n_features, block_rows):
+                stop = min(start + block_rows, n_features)
+                values = np.full(stop - start, _fill_value(dtype), dtype=dtype)
+                missing = np.ones(stop - start, dtype=bool)
+                for table, mapping in sources:
+                    rows = np.flatnonzero((mapping >= start) & (mapping < stop))
+                    incoming = read_metadata_rows_chunkwise(table, name, rows).astype(
+                        dtype
+                    )
+                    absent = read_metadata_missing_rows_chunkwise(table, name, rows)
+                    positions = mapping[rows] - start
+                    present = (
+                        np.ones(len(rows), dtype=bool) if absent is None else ~absent
+                    )
+                    if dtype.kind == "f":
+                        present &= ~np.isnan(incoming)
+                    conflict = (
+                        present & ~missing[positions] & (values[positions] != incoming)
+                    )
+                    if np.any(conflict):
+                        raise _SourceConflict(name)
+                    values[positions[present]] = incoming[present]
+                    missing[positions[present]] = False
+                yield MetadataBlock(start=start, values=values, missing=missing)
+
+        try:
+            attributes = _merged_column_attributes(arrays, name)
+            column = create_streamed_metadata_column(
+                destination,
+                name,
+                shape=n_features,
+                dtype=dtype,
+                blocks=blocks(),
+                chunkSize=block_rows,
+                hasMissing=True,
+                profile=profile,
+            )
+        except _SourceConflict:
+            clear_column(destination, name)
+            skipped.append(name)
+            continue
+        column.attrs.update(attributes)
+    if skipped:
+        logger.warning(
+            "Feature columns that differ between merged sources were not merged: "
+            + ", ".join(skipped)
+        )
+
+
 def _iter_destination_chunk_segments(
     row_plan: RowPlan,
     *,
@@ -630,6 +766,11 @@ def _iter_column_blocks(
             mapping[public] = column
         per_source_map.append(mapping)
 
+    # Segments fill one destination chunk band at a time, so each band is
+    # written with a single whole-chunk write instead of partial updates.
+    band_start = 0
+    band_values: np.ndarray | None = None
+    band_missing: np.ndarray | None = None
     for segment in _iter_destination_chunk_segments(
         row_plan,
         segment_rows=segment_rows,
@@ -690,11 +831,19 @@ def _iter_column_blocks(
                         else source_missing
                     )
 
-        yield MetadataBlock(
-            segment.destStart,
-            values,
-            missing,
-        )
+        if band_values is None:
+            band_rows = min(chunk_rows, row_plan.nCells - band_start)
+            band_values = np.empty(band_rows, dtype=spec.dtype)
+            band_missing = np.zeros(band_rows, dtype=bool) if spec.hasMissing else None
+        offset = segment.destStart - band_start
+        band_values[offset : offset + n] = values
+        if band_missing is not None and missing is not None:
+            band_missing[offset : offset + n] = missing
+        del values, missing
+        if offset + n == band_values.size:
+            yield MetadataBlock(band_start, band_values, band_missing)
+            band_start += band_values.size
+            band_values = band_missing = None
 
 
 def write_cell_metadata(
@@ -718,7 +867,15 @@ def write_cell_metadata(
     group = root.create_group(cell_slot)
     segment_rows = effective_metadata_segment_rows(metadata_plan, row_plan)
     chunk_size = metadata_chunk_rows(row_plan)
+    source_arrays: dict[str, list[Any]] = {}
+    for table in source_cell_tables:
+        for name in table.columns:
+            public = _public_column_name(name, prepend_text or None)
+            source_arrays.setdefault(public, []).append(table._get_array(name))
     for spec in metadata_plan.columns:
+        attributes = _merged_column_attributes(
+            source_arrays.get(spec.name, []), spec.name
+        )
         blocks = _iter_column_blocks(
             spec,
             row_plan,
@@ -745,6 +902,7 @@ def write_cell_metadata(
             array.attrs["role"] = spec.role
         if spec.assay is not None:
             array.attrs["assay"] = spec.assay
+        array.attrs.update(attributes)
     group.attrs["complete"] = True
     return group
 
