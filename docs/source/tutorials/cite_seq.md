@@ -44,11 +44,6 @@ ds = scarf.DataStore(
 
 The prepared result already contains all of the complete analysis, thus all we do is grab the WNN graph, the UMAP, and the [Leiden] clustering results.
 
-The store contains both assay-specific neighbour results and a previously computed WNN graph.
-Focused provenance predicates reopen the WNN graph and only the UMAP and Leiden result produced
-from that graph. Destructuring each result fails loudly if the prepared store is missing a result
-or has more than one match.
-
 ```{code-cell}
 [wnn_graph] = ds.list_artifacts(
     scope="datastore",
@@ -73,7 +68,9 @@ or has more than one match.
 )
 ```
 
-### Question: what populations does the joint RNA and protein graph separate?
+### What unique populations do the joint RNA and protein graph identify?
+
+Before clustering, single-cell workflows construct a k-nearest-neighbors graph, connecting cells that share similar profiles. In CITE-seq, we have 2 different views, that when combined, provide more thorough pieces of information. The information from the RNA provides information of thousands of genes, but specific marker genes may often drop out, and not be sequenced. CITE-seq comes in here to provide a clean, and stable way to detect the protein expression of these genes on the surface of the cell, but you only get a minuscule portion of genes in comparison to the RNA. When combined, differentiating between cell identities becomes more smooth, as we now possess protein evidence.
 
 ```{code-cell}
 ds.plots.embedding(
@@ -83,31 +80,45 @@ ds.plots.embedding(
 )
 ```
 
-The WNN graph separates several broad immune populations while allowing RNA and protein to
-contribute differently from cell to cell. Cluster numbers are only partitions; marker evidence is
-needed before attaching biological names.
+In this UMAP embedding, which is simply a 2D representation of the WNN graph, we can notice that certain groups of cell separate into distinct, well-defined clusters rather than one continous smear. This separation once again indicates that the combined RNA and protein evidence suggest distinctly resolved cellular states. But to actually identify the different cell identites, we can visualize the RNA and protein expession. 
 
-### Question: do measured proteins support the population structure?
+### Does the measured protein and RNA expression support the population structure?
+
+One important note before you begin to 
+
+One reading rule first: ADT counts rarely contain true zeros. Unbound antibodies stick
+nonspecifically to every droplet (background binding), so each cell carries low-level signal
+for every antibody. Read relative enrichment across the map, not presence versus absence.
 
 This store uses the concise antibody labels as feature IDs, so the typed references make that
-lookup explicit while keeping the panel titles readable.
+lookup explicit while keeping the panel titles readable. Each row below pairs one protein
+(left) with its RNA counterpart (right) on the same WNN map, so dropout and background can be
+compared directly.
 
 ```{code-cell}
 protein_panel = [
-    FeatureRef(marker, assay="ADT", by="id", label=marker)
+    FeatureRef(marker, assay="ADT", by="id", label=f"{marker} protein")
     for marker in ("CD3", "CD4", "CD8a", "CD14", "CD19", "CD56")
+]
+rna_panel = [
+    FeatureRef(gene, assay="RNA", label=f"{gene} RNA")
+    for gene in ("CD3D", "CD4", "CD8A", "CD14", "CD19", "NCAM1")
+]
+paired_panel = [
+    panel for pair in zip(protein_panel, rna_panel, strict=True) for panel in pair
 ]
 ds.plots.embedding(
     layout=wnn_umap,
-    color_by=protein_panel,
-    n_columns=3,
+    color_by=paired_panel,
+    n_columns=2,
     sort_values=True,
 )
 ```
 
 CD3 with CD4 or CD8a identifies T-cell regions, CD14 supports monocytes, CD19 supports B cells,
 and CD56 highlights NK-like cells. Their coherent localization on the same WNN map provides the
-biological payoff that the cluster-only view cannot.
+biological payoff that the cluster-only view cannot. Where RNA drops out but protein persists,
+protein rescues the assignment; where both agree, confidence is highest.
 
 ## Substitute your own matched assays
 
@@ -124,10 +135,6 @@ The source refs stay explicit because choosing the assay-specific representation
 decision. Use {doc}`graph_construction` for the RNA and ADT neighbour chains,
 {doc}`multimodal_diagnostics` to compare integration behavior, and
 {doc}`../reference/api/integration` for the WNN contract.
-
-SNN comparison, modality-specific alternatives, integration metrics, and modality weights belong
-
-in {doc}multimodal_diagnostics.
 
 ## Limits of this result
 
