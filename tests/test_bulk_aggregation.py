@@ -8,6 +8,7 @@ from scarf.features.aggregation import _accumulate_group_counts, aggregate_rna_g
 from scarf.quality_control.doublets import write_doublet_target_zarr
 from scarf.storage.budget import ResourceBudget
 from scarf.storage.count_matrix import CountMatrixPolicy
+from scarf.writers import SparseToZarr
 
 from .test_feature_stream import _counts_t_with_plan
 
@@ -197,6 +198,44 @@ def test_bulk_mean_retains_other_normalizers(tmp_path, normalizer, replicates):
         )
         np.testing.assert_allclose(actual[column], expected)
         np.testing.assert_array_equal(fractions[column], expected_fraction)
+
+
+def test_bulk_rejects_colliding_column_names(tmp_path):
+    store, cells = _bulk_store(tmp_path, np.ones((4, 3), dtype=np.uint16))
+    store.cells.insert("group", np.array(["a_b", "a_b", "a", "a"]))
+    store.cells.insert("secondary", np.array(["c", "c", "b_c", "b_c"]))
+
+    with pytest.raises(ValueError, match="'a_b_c' is produced by more than one"):
+        store.make_bulk("group", cell_selection=cells, secondary_groups="secondary")
+
+
+def test_bulk_mean_fits_non_rna_normalization_once(tmp_path):
+    counts = np.random.default_rng(5).integers(0, 30, (12, 5)).astype(np.uint32)
+    counts[:, 0] += 1
+    path = str(tmp_path / "adt.zarr")
+    SparseToZarr(
+        csr_matrix(counts),
+        zarr_loc=path,
+        cell_ids=[f"c{i}" for i in range(12)],
+        feature_ids=[f"p{i}" for i in range(5)],
+        assay_name="ADT",
+        nthreads=1,
+    ).dump(batch_size=4)
+    store = DataStore(path, default_assay="ADT", min_features_per_cell=0)
+    store.cells.insert("all_cells", np.ones(12, dtype=bool))
+    cells = store.snapshot_cell_selection("all_cells")
+    store.cells.insert("group", np.repeat(["a", "b", "c"], 4))
+    options = {"cell_selection": cells, "remove_empty_features": False}
+
+    every_group = store.make_bulk("group", **options)
+    without_b = store.make_bulk("group", null_vals=["b"], **options)
+
+    # CLR geometric means come from every selected cell, not from each group.
+    normalized = np.log1p(counts / np.exp(np.log1p(counts).mean(axis=0)))
+    for group, rows in (("a", slice(0, 4)), ("b", slice(4, 8)), ("c", slice(8, 12))):
+        np.testing.assert_allclose(every_group[group], normalized[rows].mean(axis=0))
+    assert list(without_b.columns) == ["a", "c"]
+    np.testing.assert_allclose(without_b["a"], every_group["a"])
 
 
 def test_bulk_rejects_unknown_aggregation(tmp_path):

@@ -208,6 +208,78 @@ The complete hard-break inventory is:
   `metric_label_concordance(first, second, metric=...)` compares exact clustering artifacts.
   Their former `label_colname` keywords and column- or array-based concordance inputs are
   unsupported.
+- Derived assays are published atomically. `add_grouped_assay` and `add_melded_assay` stage the
+  assay under a `scarf:pending_assay` marker and remove it on failure. Counts written by
+  `create_zarr_count_assay` carry `complete=False` until they are finalized. A pending group left
+  by a hard kill blocks its name, and repack refuses it, until
+  `DataStore.discard_interrupted_assay` removes it.
+- Public cell filters apply the pipeline filtering rules. `filter_cells` and `auto_filter_cells`
+  exclude rows whose metric is missing and raise on missing sample labels among active cells,
+  non-finite metrics used for automatic bounds, invalid bounds, duplicate attributes, and empty
+  inputs or results. Selections over masked metadata columns record
+  `missing_mask_fingerprints`; identities on unmasked stores are unchanged. Earlier selections
+  over masked columns remain valid artifacts and must be recomputed.
+- Cell-aligned artifact readers carry the linked missing mask. `select_cells`, groupings used by
+  statistical testing and distribution plots, and integration metrics exclude or reject missing
+  labels, and `run_doublet_detection` rejects clusterings with missing labels. These readers and
+  pipeline filtering accept only the canonical `__scarf_missing__<name>` mask link.
+- Query projections record the input `query_dataset_fingerprint`, which replaces
+  `selected_expression_fingerprint`. A query cell with no counts in any shared reference feature
+  is uninformative. The diagnostic `zeroNormCellCount` is renamed `uninformativeCellCount`, and
+  `queryScaledDispersion` uses shared features only. Older projections fail to load with a
+  request to rerun `run_mapping`. `array_hash` and `array_store_hash` use a length-prefixed
+  encoding, so their values change.
+- Mann-Whitney uses the exact permutation null when the two groups can be formed in at most
+  100,000 ways. Its statistical-test artifacts record `p_value_policy`, and results carry
+  `p_value_method`; identities of other tests are unchanged. Saved Mann-Whitney results without
+  `p_value_method` fail to load with a request to recompute. A `StudyDesign`
+  pairing column applies only to the paired Wilcoxon test.
+- densMAP embeddings symmetrize neighbor distances and record `densmap_algorithm_version`, so
+  earlier densMAP artifacts are not reused. Standard UMAP identities are unchanged.
+- Clustering inputs are canonical and strict. `run_leiden_clustering` records resolutions as finite
+  positive floats and requires a non-negative integer `random_seed`. Paris is never refitted
+  silently: a reused hierarchy that cannot be read raises
+  `ArtifactResolutionError(code="corrupt_payload")`, hierarchies missing required arrays or
+  attributes and cuts whose diagnostics do not match the schema are not reused, and
+  `load_paris_clustering` rejects such cuts with the same error. A
+  fixed Paris cut needs `n_clusters` of 1 or at least the number of connected components; merges
+  tied at the cut height are applied in hierarchy order, so exactly `n_clusters` clusters are
+  returned. `run_topacedo_sampler` accepts `use_k` from 2 to the graph's `k`, and `use_k` equal to
+  `k` shares the default identity. Clustering, sampling, and doublet entry points reject graph
+  references that are not connectivity maps or integrated graphs.
+- `get_markers` returns string `group_id` values in plot category order (numeric labels first in
+  numeric order) and raises for an unknown group. `export_markers_to_csv` uses the same column
+  order.
+- `run_waggr` and `run_aucell` take `ambiguous_targets="drop"` and record
+  `dropped_ambiguous_targets`. Enrichment artifacts written before this change load but are not
+  reused.
+- `scarf.metrics.silhouette_scoring` and `process_cluster` take no positional `ann_obj` and no
+  `data_is_reduced` keyword. `silhouette_scoring` requires the keyword-only `distance_metric` and
+  compares rows as given.
+- `run_fate_mapping` treats `solver_tol` as an absolute bound on the largest Bellman residual of
+  each solved sink column. Existing fate artifacts remain valid and are reused.
+- Producers that cannot reuse a saved result raise `PermissionError` before computing on a
+  read-only store. This covers statistical testing, enrichment, feature percentages, HTO
+  demultiplexing, doublet detection, and `set_default_assay`.
+- Public arguments are validated before any artifact is written: `load_graph(use_k=...)`,
+  `run_lsi` `skip_first` and `rand_state`, `run_custom_reduction` loadings, `run_harmony`
+  parameters, `integrate_assays(chunk_size=...)`, `select_hvgs` keywords, `run_umap` array
+  initializations, and `make_bulk` column names.
+- Library-size and CLR normalization promote integer counts to float64 before scaling or taking
+  logarithms, so uint8 and int8 stores no longer raise and uint16 and int16 stores no longer wrap.
+  Artifacts computed through `normed` from integer counts narrower than 32 bits record
+  `count_arithmetic="float64"`, so earlier results on those stores are not reused. This covers
+  `run_normalization` payloads for RNA with `renormalize_subset=False` and for CLR, marker tables
+  on the fallback path, pseudotime markers and aggregations that call `normed`, statistical tests
+  of assay-normalized features, and cell-cycle scores computed through `normed`. Identities on
+  32-bit, 64-bit, and floating-point stores and every pipeline artifact identity are unchanged.
+  Grouped ADT assays built from narrow counts must be rebuilt.
+- RNA `normed` without subset renormalization maps a zero library total to 1, so zero-count cells
+  normalize to 0 instead of NaN. Normalizations written earlier with `renormalize_subset=False`
+  over selections that contain zero-count cells keep their identity and their NaN rows; PCA rejects
+  them, and `invalidate_cache=True` recomputes them.
+- Operations trust that prepared counts and artifacts do not change during a call. Writing to
+  prepared data in place is outside the contract and is not detected.
 
 Compatibility exists only where a current public facade or an explicit file-schema test says it
 does. There are no silent migrations, implicit compatibility branches, or forwarding shims for

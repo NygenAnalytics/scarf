@@ -996,6 +996,31 @@ def test_dense_writer_reserves_encoding_and_retained_memory_before_production(
     assert not np.any(destination[:])
 
 
+def test_dense_write_plan_from_a_specification_matches_the_created_array():
+    from scarf.storage.layout import row_sharded_array_spec
+    from scarf.storage.sharding import plan_dense_write
+
+    spec = row_sharded_array_spec(
+        (1_000, 21),
+        np.float32,
+        profile="fast_local",
+        band_rows=1_000,
+        fill_value=0.0,
+    )
+    destination = create_numeric_array(
+        zarr.open_group(store=MemoryStore(), mode="w"),
+        "data",
+        spec,
+    )
+    budget = ResourceBudget(1_000_000, 1)
+
+    planned = plan_dense_write(spec, budget, 1, residentBytes=50_000)
+
+    assert planned == plan_dense_write(destination, budget, 1, residentBytes=50_000)
+    with pytest.raises(MemoryError):
+        plan_dense_write(spec, ResourceBudget(60_000, 1), 1, residentBytes=50_000)
+
+
 def test_dense_mirror_budget_includes_its_larger_encoding_buffers():
     from scarf.storage.sharding import plan_dense_write
 

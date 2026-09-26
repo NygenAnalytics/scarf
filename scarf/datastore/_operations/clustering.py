@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import numpy as np
 
 from ...graph.feature_projection import graph_cell_selection
+from ...graph.kinds import require_graph_kind
 from ...metadata.artifacts import (
     artifact_values,
     plan_cell_data_artifact,
@@ -17,6 +18,7 @@ from ...storage.artifacts import (
 )
 from ...storage.artifact_writer import (
     ArrayRequirement,
+    AttributeRequirement,
     PlannedArtifact,
     finish_artifact,
     plan_artifact,
@@ -58,6 +60,17 @@ class _PreparedLeidenClustering:
 
 
 class _ClusteringOperationsMixin(_ClusteringOperationsBase):
+    def _clustering_graph(self, graph: ArtifactRef) -> tuple[str, int, int]:
+        """Return a complete clustering graph's location, cell count, and k."""
+        if not isinstance(graph, ArtifactRef):
+            raise TypeError("graph must be an ArtifactRef")
+        require_graph_kind(graph)
+        status = inspect_artifact(self.zw, graph)
+        if not status.complete:
+            raise ValueError("Graph artifact is unavailable or incomplete")
+        n_cells, k = self._get_graph_ncells_k(status.path)
+        return status.path, n_cells, k
+
     def _run_paris_from_artifacts(
         self,
         *,
@@ -67,24 +80,30 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         effective_min_cluster_size: int | None,
         invalidate_cache: bool,
     ) -> "ParisClusteringResult":
+        from ...clustering._paris_core import ParisHierarchy
         from ...clustering._paris_modularity import modularity_split_gains
         from ...clustering.paris import (
             fit_paris_hierarchy,
+            fixed_cut,
             hierarchy_to_dendrogram,
-            straight_cut,
         )
         from ...clustering.paris_multiscale import (
-            ParisClusterDiagnostic,
             ParisClusteringResult,
+            PlateauForest,
             adaptive_cut,
             collapse_equal_height_plateaus,
         )
         from .paris_persistence import (
+            hierarchy_array_requirements,
+            hierarchy_attribute_requirements,
             load_hierarchy_group,
+            plan_paris_dendrogram,
             preflight_hierarchy_artifact_cut,
             preflight_paris_adaptive_cut,
             preflight_paris_fit,
+            read_paris_cut_diagnostics,
             write_hierarchy_group,
+            write_paris_dendrogram,
         )
 
         artifact_scope = graph_ref.scope
@@ -94,8 +113,12 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         cut_mode: Literal["adaptive", "fixed"] = (
             "fixed" if fixed_cluster_count is not None else "adaptive"
         )
+        mode: Literal["auto", "fixed"] = (
+            "fixed" if fixed_cluster_count is not None else "auto"
+        )
         graph_group = as_zarr_group(self.zw[graph_loc], name=graph_loc)
         budget = self.resources
+        # Structurally incomplete hierarchies are skipped here and refitted.
         hierarchy_plan = plan_artifact(
             self.zw,
             scope=artifact_scope,
@@ -106,70 +129,65 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             inputs={"connectivity_map": graph_ref},
             execution_options={"invalidate_cache": invalidate_cache},
             invalidate_cache=invalidate_cache,
-            required_arrays=(
-                ArrayRequirement("children"),
-                ArrayRequirement("heights"),
-                ArrayRequirement("sizes"),
-                ArrayRequirement("component_roots"),
-                ArrayRequirement("synthetic_joins"),
-            ),
+            required_arrays=hierarchy_array_requirements(),
+            required_attributes=hierarchy_attribute_requirements(n_cells),
         )
-        hierarchy = plateau_forest = None
+        loaded: tuple[ParisHierarchy, PlateauForest] | None = None
         fitted_graph = None
-        if hierarchy_plan.reused:
-            try:
-                hierarchy_group = reused_artifact_group(
-                    self.zw,
-                    hierarchy_plan,
-                )
+
+        def hierarchy_payload() -> tuple[ParisHierarchy, PlateauForest]:
+            # Load or fit the hierarchy only when a cut or dendrogram needs it.
+            nonlocal loaded, fitted_graph
+            if loaded is not None:
+                return loaded
+            if hierarchy_plan.reused:
+                hierarchy_group = reused_artifact_group(self.zw, hierarchy_plan)
                 preflight_hierarchy_artifact_cut(
                     hierarchy_group,
                     cut_mode,
                     budget,
                 )
-                hierarchy, plateau_forest = load_hierarchy_group(
-                    hierarchy_group,
-                    hierarchy_plan.ref.artifact_id,
+                try:
+                    loaded = load_hierarchy_group(
+                        hierarchy_group,
+                        hierarchy_plan.ref.artifact_id,
+                    )
+                except (KeyError, TypeError, ValueError) as error:
+                    raise ArtifactResolutionError(
+                        f"Paris hierarchy artifact {hierarchy_plan.ref.artifact_id} "
+                        "is unreadable. Rerun with invalidate_cache=True to "
+                        "recompute it.",
+                        code="corrupt_payload",
+                        context={"artifact_id": hierarchy_plan.ref.artifact_id},
+                    ) from error
+            else:
+                estimated_peak_bytes = preflight_paris_fit(
+                    graph_group,
+                    n_cells,
+                    budget,
                 )
-            except (KeyError, TypeError, ValueError):
-                hierarchy_plan = plan_artifact(
-                    self.zw,
-                    scope=artifact_scope,
-                    assay=artifact_assay,
-                    kind="cluster_hierarchy",
-                    operation="fit_paris_hierarchy",
-                    parameters={},
-                    inputs={"connectivity_map": graph_ref},
-                    execution_options={"invalidate_cache": invalidate_cache},
-                    invalidate_cache=True,
+                fitted_graph = self._load_graph_artifact(
+                    graph_ref,
+                    symmetric=False,
+                    upper_only=False,
+                    use_k=None,
                 )
-        if hierarchy is None or plateau_forest is None:
-            estimated_peak_bytes = preflight_paris_fit(
-                graph_group,
-                n_cells,
-                budget,
-            )
-            fitted_graph = self._load_graph_artifact(
-                graph_ref,
-                symmetric=False,
-                upper_only=False,
-                use_k=None,
-            )
-            shutdown_checkpoint()
-            hierarchy = fit_paris_hierarchy(
-                fitted_graph,
-                nthreads=budget.workers,
-            )
-            shutdown_checkpoint()
-            plateau_forest = collapse_equal_height_plateaus(hierarchy)
-            hierarchy_group = start_artifact(self.zw, hierarchy_plan)
-            write_hierarchy_group(hierarchy_group, hierarchy, plateau_forest)
-            hierarchy_group.attrs["estimated_peak_bytes"] = estimated_peak_bytes
-            finish_artifact(hierarchy_group, hierarchy_plan)
-        if hierarchy.n_leaves != n_cells:
-            raise ValueError("Paris hierarchy size does not match graph")
+                shutdown_checkpoint()
+                hierarchy = fit_paris_hierarchy(
+                    fitted_graph,
+                    nthreads=budget.workers,
+                )
+                shutdown_checkpoint()
+                plateau_forest = collapse_equal_height_plateaus(hierarchy)
+                hierarchy_group = start_artifact(self.zw, hierarchy_plan)
+                write_hierarchy_group(hierarchy_group, hierarchy, plateau_forest)
+                hierarchy_group.attrs["estimated_peak_bytes"] = estimated_peak_bytes
+                finish_artifact(hierarchy_group, hierarchy_plan)
+                loaded = hierarchy, plateau_forest
+            if loaded[0].n_leaves != n_cells:
+                raise ValueError("Paris hierarchy size does not match graph")
+            return loaded
 
-        mode = "fixed" if fixed_cluster_count is not None else "auto"
         cut_parameters = (
             {"mode": mode, "n_clusters": fixed_cluster_count}
             if fixed_cluster_count is not None
@@ -183,6 +201,20 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             "connectivity_map": graph_ref,
             "cell_selection": cell_selection,
         }
+
+        def valid_cluster_count(value: object) -> bool:
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                return False
+            return fixed_cluster_count is None or value == fixed_cluster_count
+
+        def readable_cut(_ref: ArtifactRef, group: Any) -> bool:
+            try:
+                read_paris_cut_diagnostics(group, mode)
+            except (TypeError, ValueError):
+                return False
+            return True
+
+        # A new hierarchy has a fresh identity, so its cut is never reused.
         cut_plan = plan_artifact(
             self.zw,
             scope=artifact_scope,
@@ -196,49 +228,25 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             required_arrays=(
                 ArrayRequirement("labels", shape=(n_cells,), dtype_kind="i"),
             ),
+            required_attributes=(
+                AttributeRequirement("n_clusters", predicate=valid_cluster_count),
+            ),
+            reuse_validator=readable_cut,
         )
-        result = None
         if cut_plan.reused:
             cut_group = reused_artifact_group(self.zw, cut_plan)
-            try:
-                raw_diagnostics = cut_group.attrs.get("diagnostics", [])
-                if not isinstance(raw_diagnostics, list) or any(
-                    not isinstance(diagnostic, dict) for diagnostic in raw_diagnostics
-                ):
-                    raise TypeError("Paris diagnostics must be mappings")
-                diagnostics = tuple(
-                    ParisClusterDiagnostic(**diagnostic)
-                    for diagnostic in raw_diagnostics
-                )
-                labels = np.asarray(
+            result = ParisClusteringResult(
+                labels=np.asarray(
                     as_zarr_array(cut_group["labels"], name="labels")[:],
                     dtype=np.int32,
-                )
-                result = ParisClusteringResult(
-                    labels=labels,
-                    mode=cast(Literal["auto", "fixed"], mode),
-                    n_clusters=int(
-                        cast(
-                            int | float | str,
-                            cut_group.attrs["n_clusters"],
-                        )
-                    ),
-                    diagnostics=diagnostics,
-                    min_cluster_size=effective_min_cluster_size,
-                )
-            except (KeyError, TypeError, ValueError):
-                cut_plan = plan_artifact(
-                    self.zw,
-                    scope=artifact_scope,
-                    assay=artifact_assay,
-                    kind="cluster_cut",
-                    operation="cut_paris_hierarchy",
-                    parameters=cut_parameters,
-                    inputs=cut_inputs,
-                    execution_options={"invalidate_cache": True},
-                    invalidate_cache=True,
-                )
-        if result is None:
+                ),
+                mode=mode,
+                n_clusters=int(cast(int, cut_group.attrs["n_clusters"])),
+                diagnostics=read_paris_cut_diagnostics(cut_group, mode),
+                min_cluster_size=effective_min_cluster_size,
+            )
+        else:
+            hierarchy, plateau_forest = hierarchy_payload()
             if fixed_cluster_count is None:
                 assert effective_min_cluster_size is not None
                 if fitted_graph is None:
@@ -267,9 +275,15 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 )
                 shutdown_checkpoint()
             else:
-                dendrogram = hierarchy_to_dendrogram(hierarchy)
-                shutdown_checkpoint()
-                labels = straight_cut(dendrogram, fixed_cluster_count).astype(
+                n_components = len(hierarchy.component_roots)
+                if 1 < fixed_cluster_count < n_components:
+                    raise ValueError(
+                        f"The graph has {n_components} connected components, so a "
+                        f"fixed Paris cut cannot produce {fixed_cluster_count} "
+                        f"clusters. Request n_clusters=1, at least "
+                        f"{n_components} clusters, or n_clusters='auto'."
+                    )
+                labels = fixed_cut(hierarchy, fixed_cluster_count).astype(
                     np.int32,
                     copy=False,
                 )
@@ -277,7 +291,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 result = ParisClusteringResult(
                     labels=labels,
                     mode="fixed",
-                    n_clusters=int(np.unique(labels).size),
+                    n_clusters=fixed_cluster_count,
                 )
             cut_group = start_artifact(self.zw, cut_plan)
             labels_array = create_zarr_dataset(
@@ -295,32 +309,16 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             finish_artifact(cut_group, cut_plan)
 
         if fixed_cluster_count is not None:
-            dendrogram_plan = plan_artifact(
-                self.zw,
-                scope=artifact_scope,
-                assay=artifact_assay,
-                kind="dendrogram",
-                operation="materialize_paris_dendrogram",
-                parameters={"compatibility": True},
-                inputs={"cluster_hierarchy": hierarchy_plan.ref},
-                execution_options={},
-                required_arrays=(ArrayRequirement("data", dtype_kind="f"),),
-            )
+            dendrogram_plan = plan_paris_dendrogram(self.zw, hierarchy_plan.ref)
             if not dendrogram_plan.reused:
-                dendrogram = hierarchy_to_dendrogram(
-                    hierarchy,
-                    compatibility=True,
+                write_paris_dendrogram(
+                    self.zw,
+                    dendrogram_plan,
+                    hierarchy_to_dendrogram(
+                        hierarchy_payload()[0],
+                        compatibility=True,
+                    ),
                 )
-                dendrogram_group = start_artifact(self.zw, dendrogram_plan)
-                dendrogram_array = create_zarr_dataset(
-                    dendrogram_group,
-                    "data",
-                    (min(max(dendrogram.shape[0], 1), 5000), 4),
-                    "f8",
-                    dendrogram.shape,
-                )
-                dendrogram_array[:] = dendrogram
-                finish_artifact(dendrogram_group, dendrogram_plan)
 
         action = "Reused" if cut_plan.reused else "Stored"
         logger.info(f"{action} Paris clustering with {result.n_clusters} clusters")
@@ -341,16 +339,14 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         random_seed: int = 4444,
         invalidate_cache: bool = False,
     ) -> _PreparedLeidenClustering:
+        from ...clustering.leiden import canonical_random_seed, canonical_resolution
+
         if backend not in {"igraph", "leidenalg"}:
             raise ValueError("backend must be 'igraph' or 'leidenalg'")
-        if not isinstance(graph, ArtifactRef):
-            raise TypeError("graph must be an ArtifactRef")
+        resolution = canonical_resolution(resolution)
+        random_seed = canonical_random_seed(random_seed)
+        graph_loc, n_cells, _k = self._clustering_graph(graph)
         graph_input = graph
-        status = inspect_artifact(self.zw, graph_input)
-        if not status.complete:
-            raise ValueError("Graph artifact is unavailable or incomplete")
-        graph_loc = status.path
-        n_cells, _effective_k = self._get_graph_ncells_k(graph_loc)
         artifact_scope = graph_input.scope
         selection = graph_cell_selection(self.zw, graph_input)
         arguments = LeidenArguments(
@@ -467,11 +463,11 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
 
         Args:
             graph: Explicit connectivity map or integrated graph to partition.
-            resolution: Leiden resolution parameter.
+            resolution: Finite positive Leiden resolution, recorded as a float.
             backend: Leiden implementation. Native igraph is the default.
             symmetric_graph: Forwarded to `load_graph`.
             graph_upper_only: Forwarded to `load_graph`.
-            random_seed: Seed for the Leiden optimizer.
+            random_seed: Non-negative integer seed for the Leiden optimizer.
             invalidate_cache: Force a new cluster-labels artifact.
 
         Returns:
@@ -504,7 +500,12 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         random_seed: int = 4444,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
-        """Build and return immutable Leiden cluster labels."""
+        """Build and return immutable Leiden cluster labels.
+
+        ``resolution`` must be a finite positive number and is recorded as a
+        float, so ``1`` and ``1.0`` identify the same artifact. ``random_seed``
+        must be a non-negative integer because stored labels are reused.
+        """
         return self._run_leiden_artifact(
             graph,
             resolution=resolution,
@@ -543,13 +544,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             raise TypeError("n_clusters must be an integer or 'auto'")
         if fixed_cluster_count is not None and min_cluster_size is not None:
             raise ValueError("min_cluster_size is only valid when n_clusters='auto'")
-        if not isinstance(graph, ArtifactRef):
-            raise TypeError("graph must be an ArtifactRef")
-        status = inspect_artifact(self.zw, graph)
-        if not status.complete:
-            raise ValueError("Graph artifact is unavailable or incomplete")
-        graph_loc = status.path
-        n_cells, effective_k = self._get_graph_ncells_k(graph_loc)
+        graph_loc, n_cells, effective_k = self._clustering_graph(graph)
         if fixed_cluster_count is not None and fixed_cluster_count > n_cells:
             raise ValueError(f"n_clusters must not exceed the graph size ({n_cells})")
 
@@ -583,10 +578,8 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         self,
         ref: ArtifactRef,
     ) -> "ParisClusteringResult":
-        from ...clustering.paris_multiscale import (
-            ParisClusterDiagnostic,
-            ParisClusteringResult,
-        )
+        from ...clustering.paris_multiscale import ParisClusteringResult
+        from .paris_persistence import read_paris_cut_diagnostics
 
         status = inspect_artifact(self.zw, ref)
         if not status.complete or status.operation != "cut_paris_hierarchy":
@@ -596,16 +589,23 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             as_zarr_array(group["labels"], name="labels")[:],
             dtype=np.int32,
         )
-        raw_diagnostics = group.attrs.get("diagnostics", [])
-        if not isinstance(raw_diagnostics, list):
-            raise ValueError("Paris cut diagnostics are invalid")
-        diagnostics = tuple(
-            ParisClusterDiagnostic(**diagnostic) for diagnostic in raw_diagnostics
-        )
         parameters = status.parameters or {}
         mode = parameters.get("mode")
         if mode not in {"auto", "fixed"}:
             raise ValueError("Paris cut mode is invalid")
+        try:
+            diagnostics = read_paris_cut_diagnostics(
+                group,
+                cast(Literal["auto", "fixed"], mode),
+            )
+        except (TypeError, ValueError) as error:
+            raise ArtifactResolutionError(
+                f"Paris cut artifact {ref.artifact_id} does not match the current "
+                "diagnostics schema. Recompute it with run_paris_clustering("
+                "invalidate_cache=True).",
+                code="corrupt_payload",
+                context={"artifact_id": ref.artifact_id},
+            ) from error
         raw_hierarchy = (status.inputs or {}).get("cluster_hierarchy")
         hierarchy_id = (
             ArtifactRef.from_dict(raw_hierarchy).artifact_id
@@ -645,7 +645,13 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         min_cluster_size: int | None = None,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
-        """Build and return an immutable Paris cut artifact."""
+        """Build and return an immutable Paris cut artifact.
+
+        A fixed integer ``n_clusters`` must be 1 or at least the number of
+        connected components in ``graph``, and the hierarchy must split into
+        exactly that many clusters at one height. Otherwise a ``ValueError``
+        names the alternatives, such as ``n_clusters='auto'``.
+        """
         return self._run_paris_artifact(
             graph,
             n_clusters=n_clusters,
@@ -682,7 +688,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             graph: Explicit connectivity map or integrated graph to sample.
             clusters: Explicit Paris ``cluster_cut`` artifact for this graph.
             use_k: Number of top k-nearest neighbours to retain in the graph over which downsampling is performed.
-                   BY default all neighbours are used. (Default value: None)
+                   Must be an integer from 2 to the graph's k. By default all neighbours are used. (Default value: None)
             density_depth: Same as 'search_depth' parameter in `calc_neighbourhood_density`. (Default value: 2)
             density_bandwidth: This value is used to scale the penalty affected by neighbourhood density. Higher values
                                will lead to a larger penalty. (Default value: 5.0)
@@ -707,14 +713,32 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             to read the ``edges`` array of Steiner tree edges over graph row
             indices.
         """
+        from .paris_persistence import (
+            load_hierarchy_group,
+            plan_paris_dendrogram,
+            write_paris_dendrogram,
+        )
 
-        if not isinstance(graph, ArtifactRef):
-            raise TypeError("graph must be an ArtifactRef")
+        _graph_loc, n_cells, graph_k = self._clustering_graph(graph)
         if not isinstance(clusters, ArtifactRef):
             raise TypeError("clusters must be an ArtifactRef")
         if clusters.kind != "cluster_cut":
             raise ValueError("clusters must be a Paris cluster_cut artifact")
         graph_input = graph
+        # Validate before any plan or write; out-of-range values fail or alias.
+        if use_k is not None:
+            if isinstance(use_k, bool | np.bool_) or not isinstance(
+                use_k,
+                int | np.integer,
+            ):
+                raise TypeError("use_k must be an integer or None")
+            if not 2 <= use_k <= graph_k:
+                raise ValueError(
+                    f"use_k must be between 2 and the graph's k ({graph_k}), "
+                    "or None to use every neighbour"
+                )
+            # Every neighbour is the default, so use_k=k shares its identity.
+            use_k = None if use_k == graph_k else int(use_k)
         selection = graph_cell_selection(self.zw, graph_input)
         cut_status = inspect_artifact(self.zw, clusters)
         if not cut_status.complete or cut_status.operation != "cut_paris_hierarchy":
@@ -730,83 +754,29 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             raise ValueError("Cluster cut does not belong to the requested graph")
         if cut_inputs.get("cell_selection") != selection.to_dict():
             raise ValueError("Cluster cut does not match the graph cell selection")
-        cut_group = as_zarr_group(
-            self.zw[cut_status.path],
-            name=clusters.artifact_id,
-        )
-        cluster_values = np.asarray(
-            as_zarr_array(cut_group["labels"], name="labels")[:]
-        )
-        if isinstance(raw_hierarchy_ref, dict):
-            from ...clustering.paris import hierarchy_to_dendrogram
-            from .paris_persistence import load_hierarchy_group
-
-            hierarchy_ref = ArtifactRef.from_dict(raw_hierarchy_ref)
-            dendrogram_plan = plan_artifact(
-                self.zw,
-                scope=hierarchy_ref.scope,
-                assay=hierarchy_ref.assay,
-                kind="dendrogram",
-                operation="materialize_paris_dendrogram",
-                parameters={"compatibility": True},
-                inputs={"cluster_hierarchy": hierarchy_ref},
-                execution_options={},
-                required_arrays=(ArrayRequirement("data", dtype_kind="f"),),
-            )
-            if not dendrogram_plan.reused:
-                hierarchy_group = as_zarr_group(
-                    self.zw[inspect_artifact(self.zw, hierarchy_ref).path],
-                    name=hierarchy_ref.artifact_id,
-                )
-                hierarchy, _plateau = load_hierarchy_group(
-                    hierarchy_group,
-                    hierarchy_ref.artifact_id,
-                )
-                dendrogram = hierarchy_to_dendrogram(
-                    hierarchy,
-                    compatibility=True,
-                )
-                dendrogram_group = start_artifact(self.zw, dendrogram_plan)
-                output = create_zarr_dataset(
-                    dendrogram_group,
-                    "data",
-                    (min(max(dendrogram.shape[0], 1), 5000), 4),
-                    "f8",
-                    dendrogram.shape,
-                )
-                output[:] = dendrogram
-                finish_artifact(dendrogram_group, dendrogram_plan)
-            else:
-                dendrogram_group = reused_artifact_group(self.zw, dendrogram_plan)
-            dendrogram = np.asarray(
-                as_zarr_array(dendrogram_group["data"], name="data")[:]
-            )
-            dendrogram_input = dendrogram_plan.ref
-        else:
+        if not isinstance(raw_hierarchy_ref, dict):
             raise ArtifactResolutionError(
                 "TopACeDo cluster cut does not name its Paris hierarchy",
                 code="corrupt_payload",
                 context={"artifact_id": clusters.artifact_id},
             )
-
-        graph_matrix = self._load_graph_artifact(
-            graph_input,
-            symmetric=False,
-            upper_only=False,
-            use_k=use_k,
-        ).copy()
-        graph_matrix.eliminate_zeros()
-
-        if len(cluster_values) != graph_matrix.shape[0]:
+        cut_group = as_zarr_group(
+            self.zw[cut_status.path],
+            name=clusters.artifact_id,
+        )
+        cluster_labels = as_zarr_array(cut_group["labels"], name="labels")
+        if tuple(cluster_labels.shape) != (n_cells,):
             raise ValueError(
-                f"Cluster labels contain {len(cluster_values)} cells while graph has "
-                f"{graph_matrix.shape[0]} cells."
+                f"Cluster labels contain {cluster_labels.shape[0]} cells while "
+                f"graph has {n_cells} cells."
             )
+        hierarchy_ref = ArtifactRef.from_dict(raw_hierarchy_ref)
+        dendrogram_plan = plan_paris_dendrogram(self.zw, hierarchy_ref)
         artifact_scope = graph_input.scope
         arguments = TopacedoArguments(
             graph=graph_input,
             clusters=cluster_input,
-            dendrogram=dendrogram_input,
+            dendrogram=dendrogram_plan.ref,
             cell_selection=selection,
             use_k=use_k,
             density_depth=density_depth,
@@ -828,103 +798,122 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             assay=(graph_input.assay if graph_input.scope == "assay" else None),
             invalidate_cache=invalidate_cache,
             required_arrays=(
-                ArrayRequirement(
-                    "sampled",
-                    shape=(graph_matrix.shape[0],),
-                    dtype_kind="b",
-                ),
-                ArrayRequirement(
-                    "density",
-                    shape=(graph_matrix.shape[0],),
-                    dtype_kind="f",
-                ),
-                ArrayRequirement(
-                    "mean_snn",
-                    shape=(graph_matrix.shape[0],),
-                    dtype_kind="f",
-                ),
-                ArrayRequirement(
-                    "seeds",
-                    shape=(graph_matrix.shape[0],),
-                    dtype_kind="b",
-                ),
-                ArrayRequirement(
-                    "edges",
-                    shape=(None, 2),
-                    dtype_kind="i",
-                ),
+                ArrayRequirement("sampled", shape=(n_cells,), dtype_kind="b"),
+                ArrayRequirement("density", shape=(n_cells,), dtype_kind="f"),
+                ArrayRequirement("mean_snn", shape=(n_cells,), dtype_kind="f"),
+                ArrayRequirement("seeds", shape=(n_cells,), dtype_kind="b"),
+                ArrayRequirement("edges", shape=(None, 2), dtype_kind="i"),
             ),
         )
         if planned.reused:
+            logger.info("Reused TopACeDo sampling artifact")
             return planned.ref
+        try:
+            from topacedo import TopacedoSampler
+        except ImportError as error:
+            raise ImportError("Could not find topacedo package") from error
+
+        if dendrogram_plan.reused:
+            dendrogram_group = reused_artifact_group(self.zw, dendrogram_plan)
+            dendrogram = np.asarray(
+                as_zarr_array(dendrogram_group["data"], name="data")[:]
+            )
         else:
-            try:
-                from topacedo import TopacedoSampler
-            except ImportError as error:
-                raise ImportError("Could not find topacedo package") from error
-            sampler = TopacedoSampler(
-                graph_matrix,
-                cluster_values,
-                dendrogram,
-                density_depth,
-                density_bandwidth,
-                max_sampling_rate,
-                min_sampling_rate,
-                min_cells_per_group,
-                snn_bandwidth,
-                seed_reward,
-                non_seed_reward,
-                edge_cost_multiplier,
-                edge_cost_bandwidth,
-                rand_state,
-            )
-            nodes, edges = sampler.run()
-            raw_node_indices = np.asarray(nodes)
-            if raw_node_indices.dtype.kind not in {"i", "u"}:
-                raise ValueError("TopACeDo returned non-integer sampled-cell indices")
-            node_indices = raw_node_indices.astype(np.int64, copy=False)
-            if node_indices.ndim != 1 or np.any(
-                (node_indices < 0) | (node_indices >= graph_matrix.shape[0])
+            from ...clustering.paris import hierarchy_to_dendrogram
+
+            hierarchy_status = inspect_artifact(self.zw, hierarchy_ref)
+            if (
+                not hierarchy_status.complete
+                or hierarchy_status.operation != "fit_paris_hierarchy"
             ):
-                raise ValueError("TopACeDo returned invalid sampled-cell indices")
-            sampled = np.zeros(graph_matrix.shape[0], dtype=bool)
-            sampled[node_indices] = True
-            density = np.asarray(sampler.densities, dtype=np.float64)
-            mean_snn = np.asarray(sampler.meanSnn, dtype=np.float64)
-            if density.shape != (graph_matrix.shape[0],):
-                raise ValueError("TopACeDo returned invalid cell-density values")
-            if mean_snn.shape != (graph_matrix.shape[0],):
-                raise ValueError("TopACeDo returned invalid mean-SNN values")
-            raw_seed_indices = np.asarray(sampler.seeds)
-            if raw_seed_indices.dtype.kind not in {"i", "u"}:
-                raise ValueError("TopACeDo returned non-integer seed-cell indices")
-            seed_indices = raw_seed_indices.astype(np.int64, copy=False)
-            if seed_indices.ndim != 1 or np.any(
-                (seed_indices < 0) | (seed_indices >= graph_matrix.shape[0])
-            ):
-                raise ValueError("TopACeDo returned invalid seed-cell indices")
-            seeds = np.zeros(graph_matrix.shape[0], dtype=bool)
-            seeds[seed_indices] = True
-            raw_edge_values = np.asarray(edges)
-            if raw_edge_values.size and raw_edge_values.dtype.kind not in {"i", "u"}:
-                raise ValueError("TopACeDo returned non-integer edge pairs")
-            edge_values = raw_edge_values.astype(np.int64, copy=False)
-            if edge_values.size == 0:
-                edge_values = edge_values.reshape(0, 2)
-            elif edge_values.ndim != 2 or edge_values.shape[1] != 2:
-                raise ValueError("TopACeDo returned invalid edge pairs")
-            if np.any((edge_values < 0) | (edge_values >= graph_matrix.shape[0])):
-                raise ValueError("TopACeDo returned out-of-range edge endpoints")
-            write_cell_data_artifact(
-                self.zw,
-                planned,
-                {
-                    "sampled": sampled,
-                    "density": density,
-                    "mean_snn": mean_snn,
-                    "seeds": seeds,
-                    "edges": edge_values,
-                },
+                raise ArtifactResolutionError(
+                    "TopACeDo requires the complete Paris hierarchy named by "
+                    "the cluster cut",
+                    code="corrupt_payload",
+                    context={"artifact_id": hierarchy_ref.artifact_id},
+                )
+            hierarchy_group = as_zarr_group(
+                self.zw[hierarchy_status.path],
+                name=hierarchy_ref.artifact_id,
             )
+            hierarchy, _plateau = load_hierarchy_group(
+                hierarchy_group,
+                hierarchy_ref.artifact_id,
+            )
+            dendrogram = hierarchy_to_dendrogram(hierarchy, compatibility=True)
+            write_paris_dendrogram(self.zw, dendrogram_plan, dendrogram)
+        cluster_values = np.asarray(cluster_labels[:])
+        graph_matrix = self._load_graph_artifact(
+            graph_input,
+            symmetric=False,
+            upper_only=False,
+            use_k=use_k,
+        ).copy()
+        graph_matrix.eliminate_zeros()
+
+        sampler = TopacedoSampler(
+            graph_matrix,
+            cluster_values,
+            dendrogram,
+            density_depth,
+            density_bandwidth,
+            max_sampling_rate,
+            min_sampling_rate,
+            min_cells_per_group,
+            snn_bandwidth,
+            seed_reward,
+            non_seed_reward,
+            edge_cost_multiplier,
+            edge_cost_bandwidth,
+            rand_state,
+        )
+        nodes, edges = sampler.run()
+        raw_node_indices = np.asarray(nodes)
+        if raw_node_indices.dtype.kind not in {"i", "u"}:
+            raise ValueError("TopACeDo returned non-integer sampled-cell indices")
+        node_indices = raw_node_indices.astype(np.int64, copy=False)
+        if node_indices.ndim != 1 or np.any(
+            (node_indices < 0) | (node_indices >= n_cells)
+        ):
+            raise ValueError("TopACeDo returned invalid sampled-cell indices")
+        sampled = np.zeros(n_cells, dtype=bool)
+        sampled[node_indices] = True
+        density = np.asarray(sampler.densities, dtype=np.float64)
+        mean_snn = np.asarray(sampler.meanSnn, dtype=np.float64)
+        if density.shape != (n_cells,):
+            raise ValueError("TopACeDo returned invalid cell-density values")
+        if mean_snn.shape != (n_cells,):
+            raise ValueError("TopACeDo returned invalid mean-SNN values")
+        raw_seed_indices = np.asarray(sampler.seeds)
+        if raw_seed_indices.dtype.kind not in {"i", "u"}:
+            raise ValueError("TopACeDo returned non-integer seed-cell indices")
+        seed_indices = raw_seed_indices.astype(np.int64, copy=False)
+        if seed_indices.ndim != 1 or np.any(
+            (seed_indices < 0) | (seed_indices >= n_cells)
+        ):
+            raise ValueError("TopACeDo returned invalid seed-cell indices")
+        seeds = np.zeros(n_cells, dtype=bool)
+        seeds[seed_indices] = True
+        raw_edge_values = np.asarray(edges)
+        if raw_edge_values.size and raw_edge_values.dtype.kind not in {"i", "u"}:
+            raise ValueError("TopACeDo returned non-integer edge pairs")
+        edge_values = raw_edge_values.astype(np.int64, copy=False)
+        if edge_values.size == 0:
+            edge_values = edge_values.reshape(0, 2)
+        elif edge_values.ndim != 2 or edge_values.shape[1] != 2:
+            raise ValueError("TopACeDo returned invalid edge pairs")
+        if np.any((edge_values < 0) | (edge_values >= n_cells)):
+            raise ValueError("TopACeDo returned out-of-range edge endpoints")
+        write_cell_data_artifact(
+            self.zw,
+            planned,
+            {
+                "sampled": sampled,
+                "density": density,
+                "mean_snn": mean_snn,
+                "seeds": seeds,
+                "edges": edge_values,
+            },
+        )
         logger.info(f"Stored TopACeDo sampling artifact for {int(sampled.sum())} cells")
         return planned.ref

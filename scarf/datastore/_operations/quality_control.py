@@ -15,14 +15,11 @@ from ...graph.feature_projection import (
     graph_cell_selection,
     resolve_graph_assay_inputs,
 )
+from ...graph.kinds import require_graph_kind
 from ...quality_control.cell_cycle import assign_cell_cycle_phase
 from ...quality_control.filtering import (
-    _apply_bounds,
-    _metric_policy,
-    _sample_aware_mad_mask,
-    _validated_sample_labels,
-    _validated_work_scale,
-    gaussian_quantile_bounds,
+    filter_cell_metrics,
+    validate_filter_bounds,
 )
 from ...quality_control.hto import _hto_demux_method, hto_demux
 from ...metadata.artifacts import (
@@ -36,8 +33,17 @@ from ...metadata.arguments import (
     HtoIdentityArguments,
     PrevalentPeakArguments,
 )
-from ...metadata.rows import read_metadata_rows_chunkwise
-from ...metadata.selection import NamedCellArtifact, resolve_cell_aligned_artifact
+from ...metadata.rows import (
+    metadata_missing_mask,
+    read_metadata_missing_rows_chunkwise,
+    read_metadata_rows_chunkwise,
+)
+from ...metadata.selection import (
+    NamedCellArtifact,
+    require_complete_cluster_labels,
+    resolve_cell_aligned_artifact,
+)
+from ...storage.arrays import linked_missing_mask
 from ...storage.artifacts import (
     artifact_group,
     artifact_path,
@@ -107,10 +113,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
         """Create or reuse cell-cycle scores without creating metadata columns."""
-        if self.zarr_mode != "r+":
-            raise PermissionError(
-                "Cell-cycle scoring requires a DataStore opened with zarr_mode='r+'"
-            )
+        self._require_writable("run_cell_cycle_scoring")
         if not isinstance(assay, RNAassay):
             raise TypeError(
                 "Cell-cycle scoring can only be applied to an RNAassay; "
@@ -187,6 +190,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             n_bins=n_bins,
             rand_seed=rand_seed,
             invalidate_cache=invalidate_cache,
+            count_arithmetic=assay._count_arithmetic("feature_scores"),
         )
         record = arguments.to_record()
         inputs = dict(record.inputs)
@@ -273,15 +277,26 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         snapshotted when ``cell_selection`` is omitted. Pass a prior selection
         explicitly to compose multiple filtering steps.
 
+        Cells whose value is recorded as missing in a nullable column never
+        pass its bounds. The fingerprint of such a column's missing-value mask
+        is also recorded in provenance.
+
         Args:
-            attrs: Names of columns to be used for filtering
-            lows: Lower bounds, in the same order as ``attrs``.
-            highs: Upper bounds, in the same order as ``attrs``.
+            attrs: Names of distinct columns to be used for filtering
+            lows: Lower bounds, in the same order as ``attrs``. Each bound is a
+                finite number, text for a text column, or None.
+            highs: Upper bounds, in the same order as ``attrs``. A lower bound
+                cannot exceed its upper bound.
             cell_selection: Optional prior cell-selection artifact.
             keep_bounds: Retain values exactly equal to a bound.
 
         Returns:
             A complete datastore-scoped ``cell_selection`` artifact.
+
+        Raises:
+            TypeError: If a bound or ``keep_bounds`` has an invalid type.
+            ValueError: If a bound is invalid, the input selection is empty,
+                or no cell passes the filter.
         """
         attrs = list(attrs)
         lows = list(lows)
@@ -291,23 +306,51 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         for attr in attrs:
             if not isinstance(attr, str):
                 raise TypeError("attrs must contain only column names")
+        if len(set(attrs)) != len(attrs):
+            raise ValueError("attrs must not contain duplicate columns")
+        validate_filter_bounds(lows, highs, keep_bounds=keep_bounds)
         available = set(self.cells.columns)
         missing = [attr for attr in attrs if attr not in available]
         if missing:
             joined = ", ".join(repr(attr) for attr in missing)
             raise KeyError(f"Cell metadata columns not found: {joined}")
-        prior = self._filter_input_selection(cell_selection)
-        new_bool = selection_mask(prior)
+        prior, active_idx = self._filter_input_cells(cell_selection)
+        # Provenance fingerprints cover whole columns, so each is read in full.
         input_fingerprints: dict[str, str] = {}
-        for i, j, k, values in zip(
-            attrs, lows, highs, self.cells.fetch_all_columns(attrs), strict=True
+        missing_fingerprints: dict[str, str] = {}
+        values_by_attr: dict[str, np.ndarray] = {}
+        missing_by_attr: dict[str, np.ndarray] = {}
+        for attr, values in zip(
+            attrs, self.cells.fetch_all_columns(attrs), strict=True
         ):
-            input_fingerprints[i] = (
+            input_fingerprints[attr] = (
                 fingerprint_strings(values)
                 if values.dtype.kind in {"O", "S", "U"}
                 else fingerprint_array(values)
             )
-            new_bool &= _apply_bounds(values, j, k, keep_bounds=keep_bounds)
+            values_by_attr[attr] = values[active_idx]
+            mask_array = metadata_missing_mask(self.cells, attr)
+            if mask_array is not None:
+                mask = np.asarray(mask_array[:], dtype=bool)
+                missing_fingerprints[attr] = fingerprint_array(mask)
+                missing_by_attr[attr] = mask[active_idx]
+        result = filter_cell_metrics(
+            values_by_attr,
+            missing_by_attr,
+            np.ones(len(active_idx), dtype=bool),
+            method="manual",
+            lows=lows,
+            highs=highs,
+            keep_bounds=keep_bounds,
+        )
+        new_bool = np.zeros(self.cells.N, dtype=bool)
+        new_bool[active_idx] = result.retained
+        inputs: dict[str, Any] = {
+            "prior_cell_selection": prior.ref,
+            "metadata_fingerprints": input_fingerprints,
+        }
+        if missing_fingerprints:
+            inputs["missing_mask_fingerprints"] = missing_fingerprints
         ref, stored = resolve_generated_selection_artifact(
             self.zw,
             scope="datastore",
@@ -322,10 +365,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 "highs": highs,
                 "keep_bounds": keep_bounds,
             },
-            inputs={
-                "prior_cell_selection": prior.ref,
-                "metadata_fingerprints": input_fingerprints,
-            },
+            inputs=inputs,
             source_column="artifact",
             invalidate_cache=invalidate_cache,
         )
@@ -350,7 +390,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         The artifact must identify its source cell selection in provenance. By
         default the new selection is composed with that source selection. An
         explicit ``cell_selection`` may narrow it further, but cannot add cells
-        that were absent from the source artifact.
+        that were absent from the source artifact. Cells whose value the
+        artifact records as missing are never selected.
 
         Args:
             values: Complete artifact with one scalar value per selected cell.
@@ -443,6 +484,12 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             raise ValueError(
                 "values artifact must contain one value per source-selected cell"
             )
+        source_missing = linked_missing_mask(
+            group,
+            "values",
+            label="values artifact",
+            values=source_values,
+        )
         value_kind = np.dtype(source_values.dtype).kind
         if raw_include is None and value_kind not in {"i", "u", "f"}:
             raise TypeError(
@@ -561,10 +608,20 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                         if keep_bounds
                         else compact < resolved_high
                     )
+            if source_missing is not None:
+                keep &= ~np.asarray(
+                    source_missing[block.compact_start : block.compact_stop],
+                    dtype=bool,
+                )
             block_selected = np.zeros(block.stop - block.start, dtype=bool)
             block_selected[block.mask] = keep
             selected[block.start : block.stop] = block_selected & prior_block
 
+        inputs: dict[str, Any] = {
+            "values": values,
+            "source_cell_selection": source_selection,
+            "prior_cell_selection": prior_selection,
+        }
         ref, stored = resolve_generated_selection_artifact(
             self.zw,
             scope="datastore",
@@ -579,16 +636,56 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 "include": resolved_include,
                 "keep_bounds": keep_bounds,
             },
-            inputs={
-                "values": values,
-                "source_cell_selection": source_selection,
-                "prior_cell_selection": prior_selection,
-            },
+            inputs=inputs,
             source_column="artifact",
             invalidate_cache=invalidate_cache,
         )
         logger.info(f"Cell selection retained {int(stored.sum())}/{self.cells.N} cells")
         return ref
+
+    def _read_filter_metrics(
+        self,
+        attrs: list[str],
+        artifact_metrics: list[NamedCellArtifact],
+        prior: ValidatedStoredSelection,
+        active_idx: np.ndarray,
+    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, str]]:
+        """Read QC metrics and missing-value masks for the active cells.
+
+        Returns float values and masks keyed by metric name, and the
+        fingerprints of the metadata-column masks that exist. An artifact
+        metric's reference already identifies its mask.
+        """
+        values_by_name: dict[str, np.ndarray] = {}
+        missing_by_name: dict[str, np.ndarray] = {}
+        for attr in attrs:
+            values_by_name[attr] = np.asarray(
+                read_metadata_rows_chunkwise(self.cells, attr, active_idx),
+                dtype=float,
+            )
+            missing = read_metadata_missing_rows_chunkwise(
+                self.cells,
+                attr,
+                active_idx,
+            )
+            if missing is not None:
+                missing_by_name[attr] = missing
+        for source in artifact_metrics:
+            resolved = resolve_cell_aligned_artifact(
+                self.zw,
+                source.artifact,
+                cell_selection=prior.ref,
+                expected_kind="quality_metric",
+            )
+            values_by_name[source.name] = np.asarray(resolved.values, dtype=float)
+            if resolved.missing_mask is not None:
+                missing_by_name[source.name] = resolved.missing_mask
+        fingerprints = {
+            name: fingerprint_array(missing)
+            for name, missing in missing_by_name.items()
+            if name in attrs
+        }
+        return values_by_name, missing_by_name, fingerprints
 
     def _filter_input_selection(
         self,
@@ -607,6 +704,17 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             assay=None,
             table_path="cellData",
         )
+
+    def _filter_input_cells(
+        self,
+        selection: ArtifactRef | None,
+    ) -> tuple[ValidatedStoredSelection, np.ndarray]:
+        """Resolve the input cell selection and its active row indices."""
+        prior = self._filter_input_selection(selection)
+        active_idx = np.flatnonzero(selection_mask(prior)).astype(np.int64, copy=False)
+        if len(active_idx) == 0:
+            raise ValueError("Cell selection contains no active cells")
+        return prior, active_idx
 
     def auto_filter_cells(
         self,
@@ -636,6 +744,13 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
 
         MAD thresholds are pooled unless a sample source is supplied. Use
         ``method="gaussian"`` for pooled median/std Gaussian quantiles instead.
+
+        These are the pipeline filtering rules. A cell whose metric is recorded
+        as missing never passes and does not inform the bounds; the
+        fingerprints of metadata-column missing-value masks are recorded in
+        provenance.
+        Non-finite metrics among the remaining active cells, missing sample
+        labels among active cells, and an empty result raise ``ValueError``.
 
         Args:
             attrs: Column names to be used for filtering.
@@ -675,6 +790,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         for attr in attrs_list:
             if not isinstance(attr, str):
                 raise TypeError("attrs must contain only column names")
+        if len(set(attrs_list)) != len(attrs_list):
+            raise ValueError("attrs must not contain duplicate columns")
         metric_artifacts = _validated_named_cell_artifacts(
             artifact_metrics,
             expected_kind="quality_metric",
@@ -719,53 +836,23 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 min_cells_per_sample=min_cells_per_sample,
             )
 
-        prior = self._filter_input_selection(cell_selection)
-        active = selection_mask(prior)
-        if not active.any():
-            raise ValueError("Cell selection contains no active cells")
-
-        active_idx = np.flatnonzero(active).astype(np.int64, copy=False)
-        values_by_name: dict[str, np.ndarray] = {}
-        metadata_fingerprints: dict[str, str] = {}
-        for attr, column in zip(
-            attrs_list, self.cells.fetch_all_columns(attrs_list), strict=True
-        ):
-            values = np.asarray(column, dtype=float)[active_idx]
-            if values.shape != (len(active_idx),):
-                raise ValueError(
-                    f"QC metadata column {attr!r} does not align with cell_selection"
-                )
-            if not np.isfinite(values).all():
-                raise ValueError(f"QC values in {attr!r} contain non-finite entries")
-            values_by_name[attr] = values
-            metadata_fingerprints[attr] = fingerprint_array(values)
-        for source in metric_artifacts:
-            resolved = resolve_cell_aligned_artifact(
-                self.zw,
-                source.artifact,
-                cell_selection=prior.ref,
-                expected_kind="quality_metric",
-            )
-            values = np.asarray(resolved.values, dtype=float)
-            if not np.isfinite(values).all():
-                raise ValueError(
-                    f"QC artifact values in {source.name!r} contain non-finite entries"
-                )
-            values_by_name[source.name] = values
-
-        metric_names = list(values_by_name)
-        resolved_bounds: dict[str, dict[str, float]] = {}
-        compact_keep = np.ones(len(active_idx), dtype=bool)
-        for name, values in values_by_name.items():
-            low, high = gaussian_quantile_bounds(values, min_p, max_p)
-            if not np.isfinite([low, high]).all():
-                raise ValueError(
-                    f"QC metric {name!r} produced non-finite Gaussian bounds"
-                )
-            resolved_bounds[name] = {"low": float(low), "high": float(high)}
-            compact_keep &= _apply_bounds(values, low, high, keep_bounds=low == high)
+        prior, active_idx = self._filter_input_cells(cell_selection)
+        values_by_name, missing_by_name, missing_fingerprints = (
+            self._read_filter_metrics(attrs_list, metric_artifacts, prior, active_idx)
+        )
+        metadata_fingerprints = {
+            attr: fingerprint_array(values_by_name[attr]) for attr in attrs_list
+        }
+        result = filter_cell_metrics(
+            values_by_name,
+            missing_by_name,
+            np.ones(len(active_idx), dtype=bool),
+            method="gaussian",
+            min_p=min_p,
+            max_p=max_p,
+        )
         keep = np.zeros(self.cells.N, dtype=bool)
-        keep[active_idx] = compact_keep
+        keep[active_idx] = result.retained
 
         metric_sources = [
             {"name": attr, "source": "metadataColumn", "column": attr}
@@ -774,6 +861,15 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         metric_sources.extend(
             {"name": source.name, "source": "artifact"} for source in metric_artifacts
         )
+        inputs: dict[str, Any] = {
+            "prior_cell_selection": prior.ref,
+            "metadata_fingerprints": metadata_fingerprints,
+            "artifact_metrics": {
+                source.name: source.artifact for source in metric_artifacts
+            },
+        }
+        if missing_fingerprints:
+            inputs["missing_mask_fingerprints"] = missing_fingerprints
 
         ref, stored = resolve_generated_selection_artifact(
             self.zw,
@@ -785,19 +881,13 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             operation="auto_filter_cells",
             parameters={
                 "method": "gaussian",
-                "attrs": metric_names,
+                "attrs": list(values_by_name),
                 "metric_sources": metric_sources,
                 "min_p": min_p,
                 "max_p": max_p,
-                "resolved_bounds": resolved_bounds,
+                "resolved_bounds": result.gaussian_bounds,
             },
-            inputs={
-                "prior_cell_selection": prior.ref,
-                "metadata_fingerprints": metadata_fingerprints,
-                "artifact_metrics": {
-                    source.name: source.artifact for source in metric_artifacts
-                },
-            },
+            inputs=inputs,
             source_column="artifact",
             invalidate_cache=invalidate_cache,
         )
@@ -839,70 +929,47 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             raise ValueError(
                 f"sample_column '{sample_column}' not found in cell metadata"
             )
-        prior = self._filter_input_selection(cell_selection)
-        prior_selection = prior.ref
-        active_idx = np.flatnonzero(selection_mask(prior)).astype(np.int64, copy=False)
-        compact_active = np.ones(len(active_idx), dtype=bool)
-        if len(active_idx) == 0:
-            raise ValueError("Cell selection contains no active cells")
-        sample_labels: np.ndarray | None = None
+        prior, active_idx = self._filter_input_cells(cell_selection)
+        sample_options: dict[str, Any] = {}
         if sample_column is not None:
-            sample_labels = np.asarray(
-                read_metadata_rows_chunkwise(
+            sample_options = {
+                "sample_labels": np.asarray(
+                    read_metadata_rows_chunkwise(self.cells, sample_column, active_idx)
+                ),
+                "sample_missing": read_metadata_missing_rows_chunkwise(
                     self.cells,
                     sample_column,
                     active_idx,
-                )
-            )
-            sample_label_name = f"sample_column '{sample_column}'"
+                ),
+                "sample_label_name": f"sample_column '{sample_column}'",
+            }
         elif sample_artifact is not None:
             resolved_sample = resolve_cell_aligned_artifact(
                 self.zw,
                 sample_artifact.artifact,
-                cell_selection=prior_selection,
+                cell_selection=prior.ref,
                 expected_kind="hto_identity",
             )
-            sample_labels = np.asarray(resolved_sample.values)
-            sample_label_name = f"sample_artifact '{sample_artifact.name}'"
-        if sample_labels is not None:
-            sample_labels = _validated_sample_labels(
-                sample_labels,
-                compact_active,
-                label_name=sample_label_name,
-            )
-
-        metric_names: list[str] = []
-        values_by_attr: dict[str, np.ndarray] = {}
-        for attr, column in zip(
-            attrs, self.cells.fetch_all_columns(attrs), strict=True
-        ):
-            values = np.asarray(column, dtype=float)[active_idx]
-            _validated_work_scale(
-                values,
-                attr=attr,
-                transform=_metric_policy(attr)["transform"],
-            )
-            metric_names.append(attr)
-            values_by_attr[attr] = values
-        for source in artifact_metrics:
-            resolved = resolve_cell_aligned_artifact(
-                self.zw,
-                source.artifact,
-                cell_selection=prior_selection,
-                expected_kind="quality_metric",
-            )
-            values = np.asarray(resolved.values, dtype=float)
-            _validated_work_scale(
-                values,
-                attr=source.name,
-                transform=_metric_policy(source.name)["transform"],
-            )
-            metric_names.append(source.name)
-            values_by_attr[source.name] = values
-
+            sample_options = {
+                "sample_labels": np.asarray(resolved_sample.values),
+                "sample_missing": resolved_sample.missing_mask,
+                "sample_label_name": f"sample_artifact '{sample_artifact.name}'",
+            }
+        values_by_attr, missing_by_attr, missing_fingerprints = (
+            self._read_filter_metrics(attrs, artifact_metrics, prior, active_idx)
+        )
+        result = filter_cell_metrics(
+            values_by_attr,
+            missing_by_attr,
+            np.ones(len(active_idx), dtype=bool),
+            method="mad",
+            n_mads=resolved_n_mads,
+            min_cells_per_sample=int(min_cells_per_sample),
+            **sample_options,
+        )
         parameters: dict[str, Any] = {
             "method": "mad",
-            "attrs": metric_names,
+            "attrs": list(values_by_attr),
             "metric_sources": [
                 *(
                     {"name": attr, "source": "metadataColumn", "column": attr}
@@ -932,24 +999,12 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         else:
             parameters["sample_source"] = {"source": "pooled"}
 
-        mad_provenance = None
-        if metric_names:
-            compact_keep, mad_provenance = _sample_aware_mad_mask(
-                values_by_attr=values_by_attr,
-                sample_labels=sample_labels,
-                active=compact_active,
-                n_mads=resolved_n_mads,
-                min_cells_per_sample=int(min_cells_per_sample),
-                attrs=metric_names,
-            )
+        if result.mad_provenance is not None:
+            # Warnings are logged below rather than recorded.
             parameters.update(
-                {
-                    "mad_scale": mad_provenance["mad_scale"],
-                    "metric_policies": mad_provenance["metric_policies"],
-                    "sample_sizes": mad_provenance["sample_sizes"],
-                    "skip_reasons": mad_provenance["skip_reasons"],
-                    "resolved_bounds": mad_provenance["resolved_bounds"],
-                }
+                (key, value)
+                for key, value in result.mad_provenance.items()
+                if key != "warnings"
             )
         fingerprint_inputs: dict[str, Any] = {
             "qc_metric_fingerprints": {
@@ -959,10 +1014,12 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 source.name: source.artifact for source in artifact_metrics
             },
         }
+        if missing_fingerprints:
+            fingerprint_inputs["missing_mask_fingerprints"] = missing_fingerprints
         if sample_column is not None:
-            assert sample_labels is not None
+            assert result.sample_labels is not None
             fingerprint_inputs["sample_assignments_fingerprint"] = fingerprint_strings(
-                sample_labels
+                result.sample_labels
             )
         elif sample_artifact is not None:
             fingerprint_inputs["sample_artifact"] = sample_artifact.artifact
@@ -974,7 +1031,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             }
         )
         inputs: dict[str, Any] = {
-            "prior_cell_selection": prior_selection,
+            "prior_cell_selection": prior.ref,
             **fingerprint_inputs,
         }
         canonical_bytes(
@@ -985,14 +1042,11 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             }
         )
 
-        if metric_names:
-            assert mad_provenance is not None
-            for message in mad_provenance["warnings"]:
+        if result.mad_provenance is not None:
+            for message in result.mad_provenance["warnings"]:
                 logger.warning(message)
-        else:
-            compact_keep = compact_active.copy()
         keep = np.zeros(self.cells.N, dtype=bool)
-        keep[active_idx] = compact_keep
+        keep[active_idx] = result.retained
 
         ref, stored = resolve_generated_selection_artifact(
             self.zw,
@@ -1080,6 +1134,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         )
         if planned.reused:
             return planned.ref
+        self._require_writable("run_feature_percentage")
         values = assay._compute_feature_percentage(cell_index, feature_index)
         write_cell_data_artifact(self.zw, planned, {"values": values})
         return planned.ref
@@ -1158,6 +1213,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         )
         if planned.reused:
             return planned.ref
+        self._require_writable("run_hto_demultiplexing")
         matrix_bytes = n_cells * assay.feats.N * np.dtype(np.float64).itemsize
         estimated_peak_bytes = 6 * matrix_bytes + 16 * n_cells
         if estimated_peak_bytes > self.memoryBytes:
@@ -1208,6 +1264,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         )
         from ...storage.execution import admit_stream
 
+        require_graph_kind(connectivity)
         assay_name = source_assay.name
         if feature_names is not None and np.asarray(feature_names).shape != (
             source_assay.feats.N,
@@ -1289,6 +1346,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         )
         if planned.reused:
             return planned.ref
+        self._require_writable("run_doublet_detection")
 
         feature_selection = lineage.feature_selection
         if feature_selection is None:
@@ -1459,6 +1517,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             name=clusters.artifact_id,
         )
         value_name = "values" if clusters.kind == "cluster_labels" else "labels"
+        require_complete_cluster_labels(cluster_group, value_name, name="clusters")
         cluster_values = artifact_values(cluster_group, value_name)
         ref = self._run_doublet_detection_artifact(
             source_assay=assay,
@@ -1498,10 +1557,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         Returns:
             The persisted prevalent-peak feature-selection artifact.
         """
-        if self.zarr_mode != "r+":
-            raise PermissionError(
-                "select_prevalent_peaks requires a DataStore opened with zarr_mode='r+'"
-            )
+        self._require_writable("select_prevalent_peaks")
         if not isinstance(cell_selection, ArtifactRef):
             raise TypeError("cell_selection must be an ArtifactRef")
         assay = self._get_assay(from_assay)
@@ -1594,10 +1650,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         Returns:
             A complete ``cell_cycle`` artifact containing S, G2M, and phase values.
         """
-        if self.zarr_mode != "r+":
-            raise PermissionError(
-                "Cell-cycle scoring requires a DataStore opened with zarr_mode='r+'"
-            )
+        self._require_writable("run_cell_cycle_scoring")
         if from_assay is None:
             from_assay = self._defaultAssay
         assay = self._get_assay(from_assay)

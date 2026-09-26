@@ -5,6 +5,7 @@ import pytest
 
 from scarf.features.enrichment.aucell import (
     GeneSetIndex,
+    _score_ranked_row,
     build_gene_set_index,
     make_rank_permutation,
     resolve_n_up,
@@ -135,6 +136,63 @@ def test_aucell_is_block_and_thread_count_invariant():
 
     np.testing.assert_array_equal(single_thread, two_threads)
     np.testing.assert_array_equal(single_thread, blocked)
+
+
+def _reference_score_aucell_block(matrix, permutation, sets, n_up):
+    # Copy of the former per-cell loop around the serial row scorer.
+    scores = np.zeros((matrix.shape[0], len(sets.starts)), dtype=np.float64)
+    ordinal = np.arange(1, matrix.shape[1] + 1, dtype=np.int64)
+    for row_index, row in enumerate(matrix):
+        if not np.any(row != 0):
+            continue
+        permuted = np.asarray(row[permutation], dtype=np.float64)
+        order = np.argsort(-permuted, kind="stable")
+        ranks = np.empty(matrix.shape[1], dtype=np.int64)
+        ranks[order] = ordinal
+        scores[row_index] = _score_ranked_row.py_func(
+            ranks,
+            sets.connections,
+            sets.starts,
+            sets.offsets,
+            n_up,
+        )
+    return np.clip(scores, 0.0, 1.0)
+
+
+@pytest.mark.parametrize("dtype", [np.uint32, np.int64, np.float32, np.float64])
+def test_aucell_block_kernel_matches_reference_with_ties(dtype):
+    rng = np.random.default_rng(29)
+    n_features = 60
+    names = np.array([f"g{index}" for index in range(n_features)])
+    sources = np.repeat(["A", "B", "C", "D"], [3, 7, 12, 25])
+    targets = np.concatenate(
+        [
+            rng.choice(n_features, size=int((sources == source).sum()), replace=False)
+            for source in ("A", "B", "C", "D")
+        ]
+    )
+    network = prepare_network(
+        pd.DataFrame({"source": sources, "target": names[targets]}),
+        active_feature_names=names,
+        active_feature_index=np.arange(n_features),
+        tmin=2,
+        weighted=False,
+    )
+    permutation = make_rank_permutation(n_features, 5)
+    sets = build_gene_set_index(network, np.arange(n_features)[permutation])
+    # Low Poisson counts tie heavily; some rows are entirely zero.
+    values = rng.poisson(0.7, size=(40, n_features)).astype(dtype)
+    values[[3, 17, 31]] = 0
+    values[5] = 2
+
+    for n_up in (2, 9, 30, n_features):
+        expected = _reference_score_aucell_block(values, permutation, sets, n_up)
+        observed = score_aucell_block(values, permutation, sets, n_up=n_up)
+        assert observed.dtype == expected.dtype
+        np.testing.assert_array_equal(
+            observed.view(np.uint64),
+            expected.view(np.uint64),
+        )
 
 
 def test_resolve_n_up_validates_the_ranking_universe():

@@ -83,6 +83,8 @@ gene_sets
 Targets are matched to active RNA feature names without case sensitivity.
 `tmin` is applied after matching, so a source is retained only when enough of its targets are present.
 Missing targets do not need to be removed from the input table first.
+A target that matches several active features, such as a gene symbol shared by two feature ids, is ambiguous.
+By default its edges are dropped with a warning and recorded in the result's `dropped_ambiguous_targets` attribute; pass `ambiguous_targets='error'` to reject such a network instead.
 
 ```{code-cell} ipython3
 available = {str(name).upper() for name in ds.RNA.feats.fetch_all('names')}

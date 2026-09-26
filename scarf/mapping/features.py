@@ -8,6 +8,7 @@ import numpy as np
 from numpy.typing import DTypeLike
 
 from ..assay import RNAassay, _read_block, norm_lib_size
+from ..assay.normalization import recorded_count_arithmetic
 from ..metadata.rows import read_metadata_rows_chunkwise
 from ..storage.artifacts import ValueFingerprintBuilder, callable_identity
 from ..storage.budget import ResourceBudget
@@ -27,10 +28,17 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class AlignedFeatureBlock:
-    """One aligned row block and its offset in the selected query rows."""
+    """One aligned row block and its offset in the selected query rows.
+
+    ``observed`` marks rows with at least one nonzero raw count in the
+    reference features present in the query. Other rows carry no query
+    evidence: every aligned value is a normalized zero or a missing-feature
+    fill.
+    """
 
     row_offset: int
     values: np.ndarray
+    observed: np.ndarray
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,12 +111,15 @@ def _normalization_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
             "Reference normalization parameters are missing: "
             + ", ".join(sorted(missing))
         )
-    unknown = set(values) - required
+    # Normalizations computed through ``normed`` from integer counts narrower
+    # than 32 bits record their float64 count arithmetic.
+    unknown = set(values) - required - {"count_arithmetic"}
     if unknown:
         raise ValueError(
             "Unsupported reference normalization parameters: "
             + ", ".join(sorted(unknown))
         )
+    recorded_count_arithmetic(values)
 
     method = values["normalization_method"]
     supported_method = callable_identity(norm_lib_size)
@@ -174,8 +185,6 @@ def normalize_reference_counts(
 class AlignedFeatureStream:
     """Replay normalized query rows in immutable reference feature order."""
 
-    _RAW_FINGERPRINT_NAME = "selected_raw_query_expression"
-
     def __init__(
         self,
         query_assay: "Assay",
@@ -240,7 +249,6 @@ class AlignedFeatureStream:
         self._resources = resources
         self._query_assay = query_assay
         self._raw_backing = raw_data._backing
-        self._raw_dtype = raw_dtype
         self._source_geometry = array_geometry(self._raw_backing)
         if self._source_geometry is not None and len(self._source_geometry.shape) != 2:
             raise ValueError("Query raw count geometry must be two-dimensional")
@@ -293,7 +301,6 @@ class AlignedFeatureStream:
         self._alignment_map_fingerprint = self._fingerprint_alignment_map(
             query_feature_ids
         )
-        self._n_query_features = int(raw_data.shape[1])
 
         self._cell_scalars: np.ndarray | None = None
         if not self.renormalize_subset:
@@ -338,6 +345,7 @@ class AlignedFeatureStream:
             len(self._query_index_map) * (raw_dtype.itemsize + normalized_bytes)
             + len(self._reference_feature_ids) * normalized_bytes
             + (normalized_bytes if self.renormalize_subset else 0)
+            + np.dtype(bool).itemsize
             + int(reserved_per_row_bytes)
         )
         block_rows, boundaries, io_concurrency = self._plan_rows(
@@ -349,7 +357,6 @@ class AlignedFeatureStream:
             boundaries=boundaries,
         )
         self._io_concurrency = io_concurrency
-        self._raw_expression_fingerprint: str | None = None
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -446,16 +453,6 @@ class AlignedFeatureStream:
     def stream_row_bytes(self) -> int:
         return self._stream_row_bytes
 
-    @property
-    def raw_expression_fingerprint(self) -> str:
-        if self._raw_expression_fingerprint is None:
-            self._raw_expression_fingerprint = self._fingerprint_raw_expression()
-        return self._raw_expression_fingerprint
-
-    def fingerprint_live_raw_expression(self) -> str:
-        """Fingerprint the current backing counts without using the cached value."""
-        return self._fingerprint_raw_expression()
-
     def _calculate_resident_bytes(self) -> int:
         arrays = [
             self._query_cell_indices,
@@ -483,10 +480,9 @@ class AlignedFeatureStream:
         self,
         *,
         bytes_per_row: int,
-        resident_extra: int = 0,
     ) -> tuple[int, tuple[tuple[int, int], ...], int]:
         n_rows = len(self._query_cell_indices)
-        resident = self._resident_bytes + max(0, int(resident_extra))
+        resident = self._resident_bytes
         preferred = min(
             n_rows,
             row_band(
@@ -557,6 +553,7 @@ class AlignedFeatureStream:
             )
         ) as raw_blocks:
             for start, raw in raw_blocks:
+                observed = np.count_nonzero(raw, axis=1) > 0
                 normalized = normalize_reference_counts(
                     raw,
                     size_factor=self.size_factor,
@@ -577,43 +574,8 @@ class AlignedFeatureStream:
                 else:
                     values.fill(0)
                 values[:, self._reference_index_map] = normalized
-                yield AlignedFeatureBlock(row_offset=start, values=values)
-
-    def _fingerprint_raw_expression(self) -> str:
-        all_columns = np.arange(self._n_query_features, dtype=np.int64)
-        raw_row_bytes = self._n_query_features * self._raw_dtype.itemsize
-        _, boundaries, io_concurrency = self._plan_rows(
-            bytes_per_row=max(1, 2 * raw_row_bytes),
-            resident_extra=all_columns.nbytes,
-        )
-        builder = ValueFingerprintBuilder()
-        builder.begin_array(
-            self._RAW_FINGERPRINT_NAME,
-            self.shape[:1] + (self._n_query_features,),
-            self._raw_dtype,
-        )
-
-        def read(boundary: tuple[int, int]) -> tuple[int, np.ndarray]:
-            start, end = boundary
-            return start, self._read_raw(start, end, all_columns)
-
-        raw_blocks = stream_shards(
-            boundaries,
-            read,
-            workers=1,
-            io_concurrency=io_concurrency,
-            total=len(boundaries),
-        )
-        for start, raw in raw_blocks:
-            builder.update_array_block(
-                self._RAW_FINGERPRINT_NAME,
-                (start, 0),
-                raw,
-            )
-        builder.end_array(self._RAW_FINGERPRINT_NAME)
-        if self._cell_scalars is not None:
-            builder.update_array(
-                "selected_query_normalization_scalars",
-                self._cell_scalars,
-            )
-        return builder.hexdigest()
+                yield AlignedFeatureBlock(
+                    row_offset=start,
+                    values=values,
+                    observed=observed,
+                )

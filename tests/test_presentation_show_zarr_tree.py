@@ -7,10 +7,10 @@ import numpy as np
 import pandas as pd
 import pytest
 import zarr
-from scipy.sparse import csr_matrix
 from zarr.storage import MemoryStore
 
 from scarf.datastore._operations.presentation import _PresentationOperationsMixin
+from scarf.matrix import ChunkedArray
 from scarf.storage.artifacts import (
     ArtifactRef,
     artifact_path,
@@ -249,7 +249,9 @@ def test_to_anndata_exports_an_empty_feature_selection() -> None:
     )
     assay = SimpleNamespace(
         feats=features,
-        to_raw_sparse=Mock(return_value=csr_matrix([[1, 2], [3, 4]])),
+        rawData=ChunkedArray(np.asarray([[1, 2], [3, 4]], dtype=np.uint32)),
+        nthreads=1,
+        name="RNA",
     )
     store._get_assay = Mock(return_value=assay)
     store.cells = SimpleNamespace(
@@ -262,7 +264,59 @@ def test_to_anndata_exports_an_empty_feature_selection() -> None:
 
     assert exported.shape == (2, 0)
     assert list(exported.obs_names) == ["c0", "c1"]
-    assay.to_raw_sparse.assert_called_once_with("I")
+    store.cells.active_index.assert_called_once_with("I")
+
+
+@pytest.mark.parametrize("label_kind", ["integer", "string", "float_with_nan"])
+def test_membership_strength_matches_reference_counts(
+    monkeypatch: pytest.MonkeyPatch,
+    label_kind: str,
+) -> None:
+    import scarf.datastore._operations.presentation as presentation
+
+    rng = np.random.default_rng(17)
+    n_cells, k = 61, 7
+    store, _backing = _presentation_store()
+    selection = _write_cell_selection(store.zw, np.ones(n_cells, dtype=bool))
+    neighbours = rng.integers(0, n_cells, size=(n_cells, k))
+    edges = np.stack(
+        (np.repeat(np.arange(n_cells), k), neighbours.ravel()),
+        axis=1,
+    ).astype(np.uint64)
+    graph_ref = _write_complete_artifact(
+        store.zw,
+        "connectivity_map",
+        arrays={"edges": edges},
+    )
+    codes = rng.integers(0, 4, size=n_cells)
+    labels = {
+        "integer": codes.astype(np.int64),
+        "string": np.asarray(["a", "b", "c", "d"])[codes],
+        "float_with_nan": np.asarray([0.5, 1.5, np.nan, np.nan])[codes],
+    }[label_kind]
+    clusters = _write_complete_artifact(
+        store.zw,
+        "cluster_labels",
+        inputs={"cell_selection": selection},
+        arrays={"values": labels},
+    )
+    store._get_graph_ncells_k = Mock(return_value=(n_cells, k))
+    _patch_graph_resolution(monkeypatch, graph_ref, selection=selection)
+    # Small blocks exercise several edge blocks and a partial final block.
+    monkeypatch.setattr(presentation, "_MEMBERSHIP_BLOCK_EDGES", 3 * k + 2)
+
+    ref = store.calc_membership_strength(clusters, graph_ref)
+
+    stored = np.asarray(store.zw[artifact_path(ref)]["values"][:])
+    reference = np.asarray(
+        [
+            pd.Series(row).value_counts(dropna=False).iloc[0] / k
+            for row in labels[neighbours]
+        ],
+        dtype=np.float64,
+    ).round(3)
+    assert stored.dtype == np.float64
+    assert stored.tobytes() == reference.tobytes()
 
 
 def test_membership_strength_rejects_a_different_graph_selection(

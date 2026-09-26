@@ -1,5 +1,6 @@
-import os
 import shutil
+import subprocess
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from uuid import uuid4
 
@@ -8,8 +9,10 @@ import pandas as pd
 from scipy.sparse import coo_matrix, csr_matrix
 
 from ..utils.logging import logger
-from ..utils.process import system_call
+from ..utils.process import suppress_native_output
 from ..utils.progress import iter_progress
+
+_STDERR_TAIL_LINES = 20
 
 
 def export_knn_to_mtx(
@@ -54,6 +57,29 @@ def export_knn_to_mtx(
             )
 
 
+def _run_sgtsne_executable(command: list[str], *, verbose: bool) -> None:
+    """Run the SG-t-SNE executable and fail on a non-zero exit status."""
+    completed = subprocess.run(
+        command,
+        stdout=subprocess.PIPE if verbose else subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+        check=False,
+    )
+    if verbose:
+        for stream in (completed.stdout, completed.stderr):
+            for line in (stream or "").splitlines():
+                if line.strip():
+                    logger.debug(line.strip())
+    if completed.returncode != 0:
+        tail = "\n".join(
+            (completed.stderr or "").strip().splitlines()[-_STDERR_TAIL_LINES:]
+        )
+        message = f"sgtsne exited with status {completed.returncode}"
+        raise RuntimeError(f"{message}: {tail}" if tail else message)
+
+
 def run_sgtsne(
     graph: csr_matrix | coo_matrix,
     ini_embed: np.ndarray,
@@ -81,25 +107,33 @@ def run_sgtsne(
     graph = graph.tocsr(copy=True)
     graph.eliminate_zeros()
 
-    if shutil.which("sgtsne") is not None:
+    executable = shutil.which("sgtsne")
+    if executable is not None:
         uid = str(uuid4())
         knn_mtx_fn = Path(temp_file_loc, f"{uid}.mtx").resolve()
-        export_knn_to_mtx(str(knn_mtx_fn), graph)
         ini_emb_fn = Path(temp_file_loc, f"{uid}.txt").resolve()
-        with open(ini_emb_fn, "w") as handle:
-            handle.write("\n".join(map(str, ini_embed.flatten())))
         out_fn = Path(temp_file_loc, f"{uid}_output.txt").resolve()
-        threads = nthreads if parallel else 1
-        command = (
-            f"sgtsne -m {max_iter} -l {lambda_scale} -d {tsne_dims} "
-            f"-e {early_iter} -p {threads} -a {alpha} -h {box_h} "
-            f"-i {ini_emb_fn} -o {out_fn} {knn_mtx_fn}"
+        options = (
+            ("-m", max_iter),
+            ("-l", lambda_scale),
+            ("-d", tsne_dims),
+            ("-e", early_iter),
+            ("-p", nthreads if parallel else 1),
+            ("-a", alpha),
+            ("-h", box_h),
+            ("-i", ini_emb_fn),
+            ("-o", out_fn),
         )
-        if verbose:
-            system_call(command)
-        else:
-            os.system(command)
+        command = [
+            executable,
+            *(str(part) for option in options for part in option),
+            str(knn_mtx_fn),
+        ]
         try:
+            export_knn_to_mtx(str(knn_mtx_fn), graph)
+            with open(ini_emb_fn, "w") as handle:
+                handle.write("\n".join(map(str, ini_embed.flatten())))
+            _run_sgtsne_executable(command, verbose=verbose)
             embedding = np.asarray(
                 pd.read_csv(out_fn, header=None, sep=" ")[
                     list(range(tsne_dims))
@@ -124,8 +158,13 @@ def run_sgtsne(
             "running single-threaded"
         )
 
-    return np.asarray(
-        sgtsnepi(
+    # sgtsnepi's own silent mode closes descriptors 1 and 2 for the rest of
+    # the process, so quiet runs redirect them around the call instead.
+    output: AbstractContextManager[None] = (
+        nullcontext() if verbose else suppress_native_output()
+    )
+    with output:
+        embedding = sgtsnepi(
             graph,
             y0=ini_embed.T,
             d=tsne_dims,
@@ -134,6 +173,6 @@ def run_sgtsne(
             lambda_par=lambda_scale,
             h=box_h,
             alpha=alpha,
-            silent=not verbose,
+            silent=False,
         )
-    )
+    return np.asarray(embedding)

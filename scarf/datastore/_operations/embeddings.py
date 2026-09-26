@@ -1,7 +1,6 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
-from scipy.sparse import csr_matrix
 
 from ...graph.distances import validate_distance_provenance
 from ...graph.feature_projection import (
@@ -10,7 +9,6 @@ from ...graph.feature_projection import (
     resolve_native_graph_inputs,
 )
 from ...metadata.artifacts import (
-    artifact_values,
     plan_cell_data_artifact,
     write_cell_data_artifact,
 )
@@ -18,7 +16,6 @@ from ...metadata.arguments import TsneArguments, UmapArguments
 from ...storage.artifacts import (
     ArtifactRef,
     artifact_group,
-    artifact_path,
     fingerprint_array,
     inspect_artifact,
 )
@@ -30,6 +27,21 @@ if TYPE_CHECKING:
     from .graph import _GraphOperationsMixin as _EmbeddingOperationsBase
 else:
     _EmbeddingOperationsBase = object
+
+
+def _checked_initialization(
+    values: np.ndarray,
+    dtype: type[np.floating[Any]] | None = None,
+) -> np.ndarray:
+    """Return a private C-ordered copy of finite, real initial coordinates."""
+    if values.dtype.kind not in "iuf":
+        raise TypeError("Initial embedding must contain real numbers")
+    # Values that overflow ``dtype`` become infinite and are rejected below.
+    with np.errstate(over="ignore"):
+        copy = np.array(values, dtype=dtype, order="C", copy=True)
+    if not np.all(np.isfinite(copy)):
+        raise ValueError("Initial embedding must contain only finite values")
+    return copy
 
 
 class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
@@ -122,7 +134,8 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
 
         Args:
             graph: Explicit connectivity map or integrated graph to embed.
-            initialization: Explicit initialization artifact or coordinate array.
+            initialization: Explicit initialization artifact or coordinate array. An array must hold finite real
+                            values.
             symmetric_graph: This parameter is forwarded to `load_graph` and is same as there. (Default value: False)
             graph_upper_only: This parameter is forwarded to `load_graph` and is same as there. (Default value: False)
             tsne_dims: Number of tSNE dimensions to compute (Default value: 2)
@@ -134,7 +147,8 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
                    the algorithm (Default value: 0.7)
             temp_file_loc: Location of temporary file. By default, these files will be created in the current working
                            directory. These files are deleted before the method returns.
-            verbose: If True (default) then the full log from SGtSNEpi algorithm is shown.
+            verbose: If True (default) then the full log from SGtSNEpi algorithm is shown. If False, the log is
+                     discarded and the process's standard output and error are restored afterwards.
             parallel: Whether to run tSNE in parallel mode. Setting value to True will use `nthreads` threads.
                       The results are not reproducible in parallel mode. (Default value: False)
             nthreads: If parallel=True then this number of threads will be used to run tSNE. By default the `nthreads`
@@ -161,7 +175,7 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
                 tsne_dims,
             )
         elif isinstance(initialization, np.ndarray):
-            ini_embed = np.asarray(initialization)
+            ini_embed = _checked_initialization(initialization)
             initialization_input = {"value_fingerprint": fingerprint_array(ini_embed)}
         else:
             raise TypeError("initialization must be an ArtifactRef or numpy array")
@@ -290,7 +304,8 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
 
         Args:
             graph: Explicit connectivity map or integrated graph to embed.
-            initialization: Explicit initialization artifact or coordinate array.
+            initialization: Explicit initialization artifact or coordinate array. An array must hold finite real
+                            values; UMAP optimizes a C-ordered float32 copy and leaves the caller's array unchanged.
             symmetric_graph: This parameter is forwarded to `load_graph` and is same as there. (Default value: False)
             graph_upper_only: This parameter is forwarded to `load_graph` and is same as there. (Default value: False)
             umap_dims: Number of dimensions of UMAP embedding (Default value: 2)
@@ -326,7 +341,11 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
         Returns:
             Reference to the immutable embedding artifact.
         """
-        from ...embeddings.umap import fit_transform
+        from ...embeddings.umap import (
+            DENSMAP_ALGORITHM_VERSION,
+            densmap_distance_graph,
+            fit_transform,
+        )
 
         if not isinstance(graph, ArtifactRef):
             raise TypeError("graph must be an ArtifactRef")
@@ -346,7 +365,9 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
                 umap_dims,
             )
         elif isinstance(initialization, np.ndarray):
-            ini_embed = np.asarray(initialization)
+            # UMAP optimizes its initialization in place and requires
+            # C-contiguous float32 coordinates, so it works on a private copy.
+            ini_embed = _checked_initialization(initialization, np.float32)
             initialization_input = {"value_fingerprint": fingerprint_array(ini_embed)}
         else:
             raise TypeError("initialization must be an ArtifactRef or numpy array")
@@ -381,6 +402,9 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
             parallel=parallel,
             parallel_threads=nthreads if parallel else None,
             invalidate_cache=invalidate_cache,
+            densmap_algorithm_version=(
+                DENSMAP_ALGORITHM_VERSION if effective_density_map else None
+            ),
         )
         record = arguments.to_record()
         planned = plan_cell_data_artifact(
@@ -402,46 +426,28 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
             logger.warning(
                 "DensMap is not available for integrated graphs. Running standard UMAP."
             )
-        if effective_density_map:
-            lineage = resolve_native_graph_inputs(self.zw, graph_input)
-            knn_status = inspect_artifact(self.zw, lineage.neighbors)
-            knn_loc = knn_status.path
-            logger.trace(f"Loading KNN dists and indices from {knn_loc}")
-            validate_distance_provenance(self.zw, lineage.neighbors)
-            knn_group = as_zarr_group(self.zw[knn_loc], name=knn_loc)
-            dists = np.asarray(
-                as_zarr_array(knn_group["distances"], name="distances")[:]
-            )
-            indices = np.asarray(as_zarr_array(knn_group["indices"], name="indices")[:])
-            dmat = csr_matrix(
-                (
-                    dists.flatten(),
-                    (
-                        np.repeat(range(indices.shape[0]), indices.shape[1]),
-                        indices.flatten(),
-                    ),
-                ),
-                shape=(indices.shape[0], indices.shape[0]),
-            )
-            # dmat = dmat.maximum(dmat.transpose()).todok()
-            logger.trace("Created sparse KNN dists and indices")
-            densmap_kwds = {
-                "lambda": dens_lambda,
-                "frac": dens_frac,
-                "var_shift": dens_var_shift,
-                "n_neighbors": dists.shape[1],
-                "knn_dists": dmat,
-            }
-        else:
-            densmap_kwds = {}
-
-        if planned.reused:
-            artifact_group = as_zarr_group(
-                self.zw[artifact_path(planned.ref)],
-                name=planned.ref.artifact_id,
-            )
-            t = artifact_values(artifact_group, "values")
-        else:
+        if not planned.reused:
+            densmap_kwds: dict[str, Any] = {}
+            if effective_density_map:
+                lineage = resolve_native_graph_inputs(self.zw, graph_input)
+                knn_loc = inspect_artifact(self.zw, lineage.neighbors).path
+                logger.trace(f"Loading KNN dists and indices from {knn_loc}")
+                validate_distance_provenance(self.zw, lineage.neighbors)
+                knn_group = as_zarr_group(self.zw[knn_loc], name=knn_loc)
+                dists = np.asarray(
+                    as_zarr_array(knn_group["distances"], name="distances")[:]
+                )
+                indices = np.asarray(
+                    as_zarr_array(knn_group["indices"], name="indices")[:]
+                )
+                densmap_kwds = {
+                    "lambda": dens_lambda,
+                    "frac": dens_frac,
+                    "var_shift": dens_var_shift,
+                    "n_neighbors": dists.shape[1],
+                    "knn_dists": densmap_distance_graph(indices, dists),
+                }
+                logger.trace("Created symmetric sparse KNN distances")
             shutdown_checkpoint()
             t, _a, _b = fit_transform(
                 graph=graph_matrix.tocoo(),
@@ -467,7 +473,8 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
 
         action = "Reused" if planned.reused else "Stored"
         logger.info(
-            f"{action} {umap_dims}-dimensional UMAP embedding for {len(t)} cells"
+            f"{action} {umap_dims}-dimensional UMAP embedding for "
+            f"{graph_matrix.shape[0]} cells"
         )
         return planned.ref
 

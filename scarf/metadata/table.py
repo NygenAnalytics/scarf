@@ -8,7 +8,7 @@ import zarr
 
 from ..storage.stores import metadata_workers, run_concurrently
 from ..storage.types import as_zarr_array
-from ..storage.arrays import create_zarr_obj_array
+from ..storage.arrays import create_zarr_obj_array, linked_missing_mask
 from ..utils.logging import logger
 from .queries import (
     _all_true,
@@ -130,19 +130,11 @@ class MetaData:
 
     def _get_missing_mask_array(self, column: str) -> zarr.Array | None:
         location, stored_column = self._get_loc(column)
-        group = self.locations[location]
-        output = as_zarr_array(group[stored_column], name=stored_column)
-        if "missing_mask" not in output.attrs:
-            return None
-        missing_name = output.attrs["missing_mask"]
-        if not isinstance(missing_name, str) or not missing_name:
-            raise ValueError(f"Column {column!r} has a malformed missing-mask link")
-        if missing_name not in group:
-            raise ValueError(f"Column {column!r} has a missing missing-mask array")
-        mask = as_zarr_array(group[missing_name], name=missing_name)
-        if mask.dtype != np.dtype(bool) or mask.shape != output.shape:
-            raise ValueError(f"Column {column!r} has a malformed missing-mask array")
-        return mask
+        return linked_missing_mask(
+            self.locations[location],
+            stored_column,
+            label=f"Column {column!r}",
+        )
 
     def get_dtype(self, column: str) -> np.dtype[Any]:
         """Return the dtype of a metadata column."""

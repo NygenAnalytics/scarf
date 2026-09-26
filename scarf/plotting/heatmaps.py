@@ -20,11 +20,11 @@ from ._heatmap_utils import (
     normalize_annotations,
     order_heatmap,
 )
+from ..utils.arrays import sort_categories
 from ._style import (
     apply_figure_chrome,
     categorical_color_map,
     continuous_norm,
-    sort_categories,
     theme_context,
 )
 

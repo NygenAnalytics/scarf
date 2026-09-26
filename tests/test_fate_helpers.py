@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+from scipy.linalg import solve_triangular
 from scipy.sparse import csr_matrix
 
 from scarf.trajectory import fate as fate_module
@@ -156,6 +157,42 @@ def test_transition_rejects_weights_that_underflow_during_float_conversion():
             np.array([False, True]),
             beta=1.0,
         )
+
+
+def test_singular_coarse_system_uses_sweeps_with_absorbing_boundaries():
+    transition = csr_matrix(
+        [
+            [0.0, 0.0, 0.0, 0.0],
+            [1e-20, 0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0, 1e-20],
+            [0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    absorbing = np.array([True, False, False, True])
+    pseudotime = np.array([0.0, 0.25, 0.75, 1.0])
+    residual = np.array([1.0, 2.0, 3.0, 4.0])
+    operator = fate_module._dirichlet_operator(transition, absorbing)
+    preconditioner = fate_module._fate_preconditioner(
+        transition, pseudotime, absorbing, operator
+    )
+
+    # Escape weights round away in the coarse system. Triangular solves
+    # independently give the two smoothing corrections used in this case.
+    system = np.eye(4) - transition.toarray()
+    expected = np.zeros(4)
+    for permutation in (np.array([0, 3, 2, 1]), np.array([0, 3, 1, 2])):
+        remainder = residual - system @ expected
+        expected[permutation] += solve_triangular(
+            system[np.ix_(permutation, permutation)],
+            remainder[permutation],
+            lower=True,
+        )
+
+    actual = preconditioner @ residual
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-14)
+    np.testing.assert_array_equal(actual[absorbing], residual[absorbing])
+    np.testing.assert_allclose(preconditioner @ (2 * residual), 2 * actual)
 
 
 def test_fate_solver_rejects_nonfinite_backend_output(monkeypatch):

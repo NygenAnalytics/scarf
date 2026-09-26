@@ -12,6 +12,7 @@ from .layout import (
     normalize_chunks,
 )
 from .profiles import StorageProfile, resolve_storage_profile
+from .types import as_zarr_array
 
 _MISSING_COLUMN_PREFIX = "__scarf_missing__"
 
@@ -23,6 +24,42 @@ class MetadataBlock:
     start: int
     values: np.ndarray
     missing: np.ndarray | None = None
+
+
+def linked_missing_mask(
+    group: zarr.Group,
+    name: str,
+    *,
+    label: str | None = None,
+    values: zarr.Array | None = None,
+) -> zarr.Array | None:
+    """Return the missing-value mask linked to ``group[name]``, if it has one.
+
+    A nullable array names its mask in ``attrs["missing_mask"]``. The link must
+    name the canonical ``__scarf_missing__<name>`` sibling, and that sibling
+    must be a boolean array with the same shape. ``label`` names the array in
+    errors and defaults to ``Array '<name>'``. Pass the already opened
+    ``values`` array to skip reopening it.
+    """
+    if values is None:
+        values = as_zarr_array(group[name], name=name)
+    if "missing_mask" not in values.attrs:
+        return None
+    subject = f"Array {name!r}" if label is None else label
+    missing_name = f"{_MISSING_COLUMN_PREFIX}{name}"
+    if values.attrs["missing_mask"] != missing_name:
+        raise ValueError(f"{subject} has a malformed missing-mask link")
+    try:
+        mask = group[missing_name]
+    except KeyError:
+        raise ValueError(f"{subject} has a missing missing-mask array") from None
+    if (
+        not isinstance(mask, zarr.Array)
+        or mask.dtype != np.dtype(bool)
+        or mask.shape != values.shape
+    ):
+        raise ValueError(f"{subject} has a malformed missing-mask array")
+    return mask
 
 
 def _checked_shards(

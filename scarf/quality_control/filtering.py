@@ -1,10 +1,15 @@
-from typing import TypedDict
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from numbers import Real
+from typing import Literal, TypedDict
 
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
 
 __all__ = ["gaussian_quantile_bounds"]
+
+FilterMethod = Literal["manual", "gaussian", "mad"]
 
 _MAD_SCALE = 1.4826
 _COUNT_SUFFIXES = ("nCounts", "nFeatures")
@@ -339,3 +344,171 @@ def _sample_aware_mad_mask(
         "warnings": warnings,
     }
     return keep, provenance
+
+
+@dataclass(frozen=True, slots=True)
+class CellFilterResult:
+    """Rows retained by one QC filtering rule and the bounds it resolved.
+
+    ``retained`` aligns with the rows given to ``filter_cell_metrics``.
+    ``gaussian_bounds`` and ``mad_provenance`` hold the resolved Gaussian
+    bounds or the MAD provenance of those methods. ``sample_labels`` holds the
+    validated MAD sample labels, normalized to Python scalars.
+    """
+
+    retained: np.ndarray
+    gaussian_bounds: dict[str, dict[str, float]] | None
+    mad_provenance: _MadProvenance | None
+    sample_labels: np.ndarray | None
+
+
+def _check_filter_bound(value: object, name: str) -> None:
+    if value is None or isinstance(value, str):
+        return
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"{name} values must be finite numbers, text, or None")
+    if not np.isfinite(float(value)):
+        raise ValueError(f"{name} values must be finite; use None for no bound")
+
+
+def validate_filter_bounds(
+    lows: Sequence[object],
+    highs: Sequence[object],
+    *,
+    keep_bounds: object,
+) -> None:
+    """Check manual filtering bounds before any metadata is read.
+
+    Numeric bounds must be finite and cannot be booleans. Text bounds compare
+    text columns lexically. A lower bound cannot exceed its upper bound.
+    """
+    if not isinstance(keep_bounds, bool):
+        raise TypeError("keep_bounds must be a boolean")
+    for low, high in zip(lows, highs, strict=True):
+        _check_filter_bound(low, "lows")
+        _check_filter_bound(high, "highs")
+        if low is None or high is None:
+            continue
+        if isinstance(low, str) != isinstance(high, str):
+            raise TypeError("Paired lows and highs must both be numbers or both text")
+        if low > high:  # type: ignore[operator]
+            raise ValueError("A lower bound cannot exceed its upper bound")
+
+
+def _require_finite_metrics(
+    values_by_attr: Mapping[str, np.ndarray],
+    complete: np.ndarray,
+) -> None:
+    """Reject non-finite values among rows that inform automatic bounds."""
+    n_complete = int(np.count_nonzero(complete))
+    for attr, values in values_by_attr.items():
+        array = np.asarray(values)
+        if array.dtype.kind not in "fc":
+            continue
+        n_nonfinite = int(np.count_nonzero(~np.isfinite(array[complete])))
+        if n_nonfinite:
+            raise ValueError(
+                f"QC metric {attr!r} has {n_nonfinite} non-finite value(s) among "
+                f"{n_complete} selected cells with recorded values. Percentages "
+                "are undefined for cells without counts, so exclude zero-count "
+                "cells first: pass a cell selection that requires nCounts > 0, or "
+                "open the DataStore with min_features_per_cell of 0 or more."
+            )
+
+
+def filter_cell_metrics(
+    values_by_attr: Mapping[str, np.ndarray],
+    missing_by_attr: Mapping[str, np.ndarray],
+    active: np.ndarray,
+    *,
+    method: FilterMethod,
+    lows: Sequence[float | None] = (),
+    highs: Sequence[float | None] = (),
+    keep_bounds: bool = False,
+    min_p: float = 0.01,
+    max_p: float = 0.99,
+    sample_labels: np.ndarray | None = None,
+    sample_missing: np.ndarray | None = None,
+    sample_label_name: str = "sample labels",
+    n_mads: float = 3.0,
+    min_cells_per_sample: int = 20,
+) -> CellFilterResult:
+    """Apply one QC filtering rule to metric rows aligned with ``active``.
+
+    Every metric, mask, and label vector must align with ``active``. A row
+    flagged in ``missing_by_attr`` has no recorded value for that metric. It
+    never passes a filter and does not inform Gaussian or MAD bounds.
+    Automatic bounds require finite metrics on the remaining active rows. MAD
+    filtering rejects an active row flagged in ``sample_missing``. The result
+    must retain at least one active row.
+    """
+    active_mask = np.asarray(active, dtype=bool)
+    attrs = list(values_by_attr)
+    metric_missing = np.zeros(active_mask.shape[0], dtype=bool)
+    for missing in missing_by_attr.values():
+        metric_missing |= np.asarray(missing, dtype=bool)
+    complete = active_mask & ~metric_missing
+    keep = ~metric_missing
+    gaussian_bounds: dict[str, dict[str, float]] | None = None
+    mad_provenance: _MadProvenance | None = None
+    validated_labels: np.ndarray | None = None
+    if method == "manual":
+        for attr, low, high in zip(attrs, lows, highs, strict=True):
+            keep &= _apply_bounds(
+                values_by_attr[attr],
+                low,
+                high,
+                keep_bounds=keep_bounds,
+            )
+    elif method in ("gaussian", "mad"):
+        if not complete.any():
+            raise ValueError(
+                "Cell filtering has no selected cells with complete metrics"
+            )
+        if method == "mad" and sample_labels is not None:
+            if sample_missing is not None and np.any(
+                active_mask & np.asarray(sample_missing, dtype=bool)
+            ):
+                raise ValueError(
+                    f"{sample_label_name} contains missing labels among active cells"
+                )
+            validated_labels = _validated_sample_labels(
+                sample_labels,
+                active_mask,
+                label_name=sample_label_name,
+            )
+        _require_finite_metrics(values_by_attr, complete)
+        if method == "gaussian":
+            gaussian_bounds = {}
+            for attr in attrs:
+                values = np.asarray(values_by_attr[attr])
+                low, high = gaussian_quantile_bounds(values[complete], min_p, max_p)
+                if not np.isfinite([low, high]).all():
+                    raise ValueError(
+                        f"QC metric {attr!r} produced non-finite Gaussian bounds"
+                    )
+                gaussian_bounds[attr] = {"low": low, "high": high}
+                keep &= _apply_bounds(values, low, high, keep_bounds=low == high)
+        elif attrs:
+            # Typed labels keep their dtype so the second validation checks
+            # each distinct label once instead of every cell.
+            mad_keep, mad_provenance = _sample_aware_mad_mask(
+                values_by_attr=dict(values_by_attr),
+                sample_labels=sample_labels,
+                active=complete,
+                n_mads=n_mads,
+                min_cells_per_sample=min_cells_per_sample,
+                attrs=attrs,
+            )
+            keep &= mad_keep
+    else:
+        raise ValueError("method must be 'manual', 'gaussian', or 'mad'")
+    retained = np.asarray(active_mask & keep, dtype=bool)
+    if not retained.any():
+        raise ValueError("Cell filtering removed every selected cell")
+    return CellFilterResult(
+        retained=retained,
+        gaussian_bounds=gaussian_bounds,
+        mad_provenance=mad_provenance,
+        sample_labels=validated_labels,
+    )

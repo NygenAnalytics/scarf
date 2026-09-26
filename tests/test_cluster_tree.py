@@ -1,3 +1,5 @@
+import shutil
+from pathlib import Path
 from types import SimpleNamespace
 
 import matplotlib
@@ -5,6 +7,7 @@ import networkx as nx
 import numpy as np
 import pytest
 import zarr
+from scipy.sparse import csr_matrix
 from zarr.storage import MemoryStore
 
 matplotlib.use("Agg")
@@ -26,6 +29,70 @@ from scarf.storage.artifacts import (
     parse_artifact_path,
 )
 from scarf.storage.selections import resolve_generated_selection_artifact
+
+_WNN_GROUP_SIZE = 20
+
+
+@pytest.fixture(scope="module")
+def wnn_store_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    from scarf.datastore.datastore import DataStore
+    from scarf.writers import SparseToZarr
+
+    path = tmp_path_factory.mktemp("cluster_tree_wnn") / "cells.zarr"
+    rng = np.random.default_rng(5)
+    n_groups, n_genes = 3, 24
+    rates = rng.uniform(1, 4, size=(n_groups, n_genes))
+    for group in range(n_groups):
+        rates[group, group * 8 : group * 8 + 8] *= 12
+    counts = np.vstack(
+        [
+            rng.poisson(rates[group], size=(_WNN_GROUP_SIZE, n_genes))
+            for group in range(n_groups)
+        ]
+    ).astype(np.uint32)
+    SparseToZarr(
+        csr_matrix(counts),
+        str(path),
+        cell_ids=[f"cell_{index}" for index in range(counts.shape[0])],
+        feature_ids=[f"gene_{index}" for index in range(n_genes)],
+        nthreads=1,
+    ).dump()
+    shutil.copytree(path / "RNA", path / "ADT")
+    store = DataStore(
+        str(path),
+        default_assay="RNA",
+        assay_types={"RNA": "RNA", "ADT": "ADT"},
+        min_features_per_cell=0,
+        nthreads=1,
+    )
+    cells = store.snapshot_cell_selection("I")
+    neighbors = []
+    for assay in ("RNA", "ADT"):
+        normalized = store.run_normalization(
+            cells,
+            store.select_all_features(from_assay=assay),
+        )
+        index = store.build_ann_index(store.run_pca(normalized, dims=4))
+        neighbors.append(store.query_neighbors(index, k=5))
+    store.integrate_assays(neighbors)
+    return path
+
+
+def _wnn_store(template: Path, tmp_path: Path, *, zarr_mode: str = "r+"):
+    from scarf.datastore.datastore import DataStore
+
+    path = tmp_path / "cells.zarr"
+    if not path.exists():
+        shutil.copytree(template, path)
+    store = DataStore(
+        str(path),
+        default_assay="RNA",
+        min_features_per_cell=0,
+        nthreads=1,
+        zarr_mode=zarr_mode,
+    )
+    (graph,) = store.list_artifacts(scope="datastore", kind="integrated_graph")
+    return store, graph
 
 
 class _ClusterTreeStore(_PresentationOperationsMixin):
@@ -411,6 +478,11 @@ def test_artifact_cluster_tree_cache_hit_is_compute_free_and_read_only(
         "CoalesceTree",
         fail_recompute,
     )
+    monkeypatch.setattr(
+        paris_persistence,
+        "load_hierarchy_group",
+        fail_recompute,
+    )
     store.zw = zarr.open_group(store=backing.with_read_only(True), mode="r")
 
     cached = _prepare_artifact_tree(store)
@@ -584,3 +656,104 @@ def test_artifact_cluster_tree_rejects_graph_scope_mismatch(
             fill_by_value=None,
             invalidate_cache=False,
         )
+
+
+def test_artifact_cluster_tree_accepts_integrated_graph_cut(
+    wnn_store_template: Path,
+    tmp_path: Path,
+) -> None:
+    store, wnn = _wnn_store(wnn_store_template, tmp_path)
+    clusters = store.run_paris_clustering(wnn, n_clusters=3)
+    assert clusters.scope == "datastore"
+
+    result = store.plots.cluster_tree(
+        graph=wnn,
+        clusters=clusters,
+        from_assay="ADT",
+        fill_by_value="gene_0",
+        show=False,
+    )
+
+    assert result.provenance.assay == "ADT"
+    assert result.tables["cluster_summary"]["n_cells"].tolist() == [_WNN_GROUP_SIZE] * 3
+    result.close()
+    with pytest.raises(ValueError, match="from_assay is required"):
+        store.plots.cluster_tree(graph=wnn, clusters=clusters, show=False)
+
+
+def test_artifact_cluster_tree_single_cluster_cache_hit(
+    wnn_store_template: Path,
+    tmp_path: Path,
+) -> None:
+    store, wnn = _wnn_store(wnn_store_template, tmp_path)
+    clusters = store.run_paris_clustering(wnn, n_clusters=1)
+
+    first = store._prepare_cluster_tree(
+        graph=wnn,
+        clusters=clusters,
+        from_assay="RNA",
+    )
+    cached = store._prepare_cluster_tree(
+        graph=wnn,
+        clusters=clusters,
+        from_assay="RNA",
+    )
+
+    assert first["graph"].number_of_nodes() == 1
+    assert first["graph"].number_of_edges() == 0
+    assert cached["coalesced_location"] == first["coalesced_location"]
+    assert set(cached["graph"].nodes) == set(first["graph"].nodes)
+    assert (
+        _partition_ids(cached["graph"])
+        == _partition_ids(first["graph"])
+        == {next(iter(first["graph"].nodes)): 1}
+    )
+    assert [data["nleaves"] for _node, data in cached["graph"].nodes(data=True)] == [
+        3 * _WNN_GROUP_SIZE
+    ]
+
+
+def test_artifact_cluster_tree_first_call_on_read_only_store(
+    wnn_store_template: Path,
+    tmp_path: Path,
+) -> None:
+    writable, wnn = _wnn_store(wnn_store_template, tmp_path)
+    # An adaptive cut stores no dendrogram, so the first tree call misses both
+    # the dendrogram and the coalesced tree.
+    clusters = writable.run_paris_clustering(wnn, min_cluster_size=5)
+    derived_kinds = ("dendrogram", "coalesced_tree")
+    assert all(
+        writable.list_artifacts(scope="datastore", kind=kind) == []
+        for kind in derived_kinds
+    )
+    store, _graph = _wnn_store(wnn_store_template, tmp_path, zarr_mode="r")
+    assert store.zw.read_only
+
+    prepared = store._prepare_cluster_tree(
+        graph=wnn,
+        clusters=clusters,
+        from_assay="RNA",
+    )
+    result = store.plots.cluster_tree(
+        graph=wnn,
+        clusters=clusters,
+        from_assay="RNA",
+        show=False,
+    )
+
+    assert prepared["coalesced_location"] is None
+    assert result.provenance.extras["coalesced_location"] is None
+    assert sum(result.tables["cluster_summary"]["n_cells"]) == 3 * _WNN_GROUP_SIZE
+    result.close()
+    assert all(
+        store.list_artifacts(scope="datastore", kind=kind) == []
+        for kind in derived_kinds
+    )
+    persisted = writable._prepare_cluster_tree(
+        graph=wnn,
+        clusters=clusters,
+        from_assay="RNA",
+    )
+    assert persisted["coalesced_location"] is not None
+    assert set(persisted["graph"].edges) == set(prepared["graph"].edges)
+    assert _partition_ids(persisted["graph"]) == _partition_ids(prepared["graph"])

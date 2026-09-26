@@ -1011,6 +1011,28 @@ def test_statistical_selection_honors_metadata_missing_mask(datastore_ephemeral)
     figure.close()
 
 
+def test_statistical_testing_excludes_missing_artifact_labels(tmp_path):
+    from tests.test_quality_control_missing_values import (
+        import_nullable_cluster_h5ad,
+    )
+
+    ds, imported, codes, missing = import_nullable_cluster_h5ad(tmp_path)
+    clusters = imported.clusterArtifacts["clusters"]
+    assert np.all(np.asarray(ds.load_artifact(clusters)["values"][:])[missing] == 0)
+
+    result = ds.run_statistical_testing(
+        ["G0"],
+        clusters,
+        groups=[0, 1],
+        test="mann_whitney",
+    )
+
+    expected = {group: int(np.sum(~missing & (codes == group))) for group in (0, 1)}
+    row = result.tables["G0"].iloc[0]
+    assert {row["group_1"]: row["n_1"], row["group_2"]: row["n_2"]} == expected
+    assert result.n_cells == sum(expected.values())
+
+
 def test_statistical_numeric_dtypes_and_infinite_statistic_roundtrip(
     datastore_ephemeral,
 ):
@@ -1073,3 +1095,285 @@ def test_artifact_grouping_identity_and_exact_retrieval(datastore_ephemeral):
     assert loaded.tables["MALAT1"].to_dict("records") == result.tables[
         "MALAT1"
     ].to_dict("records")
+
+
+def _read_only_store(ds: DataStore) -> DataStore:
+    return DataStore(ds.zarr_loc, default_assay="RNA", zarr_mode="r")
+
+
+def test_statistical_testing_read_only_fails_before_compute(
+    datastore_ephemeral,
+    monkeypatch,
+):
+    from scarf.datastore._operations import features as features_module
+
+    ds = datastore_ephemeral
+    _insert_group_columns(ds)
+    grouping = _active_metadata_grouping(ds, "stat_group2")
+    read_only = _read_only_store(ds)
+    calls = {"compare": 0, "normed": 0}
+    original_compare = features_module.compare_group_distributions
+    original_normed = read_only.RNA.normed
+
+    def counting_compare(*args, **kwargs):
+        calls["compare"] += 1
+        return original_compare(*args, **kwargs)
+
+    def counting_normed(*args, **kwargs):
+        calls["normed"] += 1
+        return original_normed(*args, **kwargs)
+
+    monkeypatch.setattr(
+        features_module,
+        "compare_group_distributions",
+        counting_compare,
+    )
+    monkeypatch.setattr(read_only.RNA, "normed", counting_normed)
+
+    with pytest.raises(PermissionError, match=r"zarr_mode='r\+'"):
+        read_only.run_statistical_testing(["MALAT1", "B2M"], **grouping)
+    assert calls == {"compare": 0, "normed": 0}
+
+    unsaved = read_only.run_statistical_testing(
+        ["MALAT1", "B2M"],
+        skip_save=True,
+        **grouping,
+    )
+    assert unsaved.artifact is None
+    assert calls == {"compare": 2, "normed": 1}
+
+
+def test_statistical_testing_read_only_reuses_existing(datastore_ephemeral):
+    ds = datastore_ephemeral
+    _insert_group_columns(ds)
+    grouping = _active_metadata_grouping(ds, "stat_group2")
+    saved = ds.run_statistical_testing(["MALAT1", "B2M"], **grouping)
+    assert saved.artifact is not None
+
+    reused = _read_only_store(ds).run_statistical_testing(
+        ["MALAT1", "B2M"],
+        **grouping,
+    )
+
+    assert reused.artifact == saved.artifact
+    assert reused.value_fingerprints == saved.value_fingerprints
+    for key in saved.tables:
+        assert reused.tables[key].to_dict("records") == saved.tables[key].to_dict(
+            "records"
+        )
+
+
+def test_statistical_testing_resolves_each_key_once(
+    datastore_ephemeral,
+    monkeypatch,
+):
+    from collections import Counter
+
+    from scarf.datastore._operations import features as features_module
+
+    ds = datastore_ephemeral
+    _insert_group_columns(ds)
+    grouping = _active_metadata_grouping(ds, "stat_group2")
+    feature_id = str(ds.RNA.feats.fetch_all("ids")[7])
+    keys = [
+        "MALAT1",
+        "B2M",
+        "RNA_nCounts",
+        "CD3D",
+        FeatureRef(value=5, by="index", label="by_index"),
+        FeatureRef(value=feature_id, by="id", label="by_id"),
+    ]
+    column_reads: Counter[str] = Counter()
+    batches: list[int] = []
+    calls = {"normed": 0}
+    original_fetch_all = ds.RNA.feats.fetch_all
+    original_resolve = features_module.resolve_feature_batch
+    original_normed = ds.RNA.normed
+
+    def counting_fetch_all(column, *args, **kwargs):
+        column_reads[column] += 1
+        return original_fetch_all(column, *args, **kwargs)
+
+    def counting_resolve(store, features, **kwargs):
+        batches.append(len(features))
+        return original_resolve(store, features, **kwargs)
+
+    def counting_normed(*args, **kwargs):
+        calls["normed"] += 1
+        return original_normed(*args, **kwargs)
+
+    monkeypatch.setattr(ds.RNA.feats, "fetch_all", counting_fetch_all)
+    monkeypatch.setattr(features_module, "resolve_feature_batch", counting_resolve)
+    monkeypatch.setattr(ds.RNA, "normed", counting_normed)
+
+    computed = ds.run_statistical_testing(keys, **grouping)
+    # One resolution of the five feature keys and one read of each index
+    # column; every feature value comes from one blockwise pass.
+    assert batches == [5]
+    assert column_reads["names"] == 1
+    assert column_reads["ids"] == 1
+    assert calls["normed"] == 1
+
+    batches.clear()
+    column_reads.clear()
+    calls["normed"] = 0
+    reused = ds.run_statistical_testing(keys, **grouping)
+    assert reused.artifact == computed.artifact
+    assert batches == [5]
+    assert column_reads["names"] == 1
+    assert column_reads["ids"] == 1
+    assert calls["normed"] == 1
+
+    # A memory budget that holds two keys per batch fetches three batches.
+    # test_statistical_value_fingerprints_match_single_key_fetch checks that
+    # batching leaves the values unchanged.
+    monkeypatch.setattr(ds, "memoryBytes", 2 * 4 * 8 * computed.n_cells)
+    calls["normed"] = 0
+    ds.run_statistical_testing(keys, skip_save=True, **grouping)
+    assert calls["normed"] == 3
+
+
+def test_statistical_value_fingerprints_match_single_key_fetch(
+    datastore_ephemeral,
+    monkeypatch,
+):
+    from scarf.datastore._operations.features import _value_fingerprint
+    from scarf.features.values import fetch_normalized_feature_matrix, resolve_feature
+
+    ds = datastore_ephemeral
+    _insert_group_columns(ds)
+    grouping = _active_metadata_grouping(ds, "stat_group2")
+    names = np.char.upper(np.asarray(ds.RNA.feats.fetch_all("names")).astype(str))
+    unique_names, counts = np.unique(names, return_counts=True)
+    duplicated = str(unique_names[counts > 1][0])
+    keys = [
+        "MALAT1",
+        "B2M",
+        FeatureRef(value=duplicated, reduction="mean", label="duplicated_mean"),
+    ]
+    cells = np.asarray(ds.cells.active_index("I"), dtype=np.int64)
+    monkeypatch.setattr(ds, "memoryBytes", 2 * 4 * 8 * len(cells))
+
+    for normalization in (None, NormalizationSpec(source="raw", transform="log1p")):
+        result = ds.run_statistical_testing(
+            keys,
+            normalization=normalization,
+            skip_save=True,
+            **grouping,
+        )
+        # The former path fetched and fingerprinted one key at a time.
+        single_key = tuple(
+            _value_fingerprint(
+                np.asarray(
+                    fetch_normalized_feature_matrix(
+                        ds,
+                        [resolve_feature(ds, key, from_assay="RNA")],
+                        cells,
+                        normalization,
+                    )[:, 0],
+                    dtype=np.float64,
+                )
+            )
+            for key in keys
+        )
+        assert result.value_fingerprints == single_key
+
+    # Recorded before batched fetching: artifacts that stored these
+    # fingerprints still match the realized values.
+    default = ds.run_statistical_testing(keys, skip_save=True, **grouping)
+    assert default.value_fingerprints == (
+        "c902ebd8a95056a226b5f53693c057c28b7b12e6805c745861a2345232d815bc",
+        "3d24fd2ccf83290dd29cf2bc01b34ca344f7f2a28e991149a4224a76713888d6",
+        "680e33ff1fc381638980349e214b3fab43cb2e1d590a52f146d64ae1980953b3",
+    )
+
+
+def test_sample_level_mann_whitney_records_p_value_method(datastore_ephemeral):
+    from scarf.features.statistical import MANN_WHITNEY_P_VALUE_POLICY
+
+    ds = datastore_ephemeral
+    _insert_group_columns(ds)
+    grouping = _active_metadata_grouping(ds, "stat_group2")
+
+    cell_level = ds.run_statistical_testing(["MALAT1"], **grouping)
+    sample_level = ds.run_statistical_testing(
+        ["MALAT1", "B2M"],
+        sample_by="stat_sample",
+        **grouping,
+    )
+    welch = ds.run_statistical_testing(["MALAT1"], test="welch", **grouping)
+
+    assert cell_level.p_value_method == "asymptotic"
+    assert sample_level.method == "mann_whitney"
+    assert sample_level.p_value_method == "exact"
+    assert welch.p_value_method is None
+    for table in sample_level.tables.values():
+        assert (table.loc[0, "n_1"], table.loc[0, "n_2"]) == (3, 3)
+        # Exact p-values are multiples of 1 / C(6, 3), at least 2 / 20.
+        scaled = table.loc[0, "p_value"] * 20
+        assert scaled == pytest.approx(round(scaled))
+        assert table.loc[0, "p_value"] >= 0.1
+    assert sample_level.artifact is not None
+    assert ds.get_statistical_tests(sample_level.artifact).p_value_method == "exact"
+    assert cell_level.artifact is not None
+    assert ds.get_statistical_tests(cell_level.artifact).p_value_method == "asymptotic"
+    assert welch.artifact is not None
+    assert ds.get_statistical_tests(welch.artifact).p_value_method is None
+    status = ds.inspect_artifact(sample_level.artifact)
+    assert status.parameters["p_value_policy"] == MANN_WHITNEY_P_VALUE_POLICY
+    # Other tests leave the policy out, so their identities are unchanged.
+    assert "p_value_policy" not in ds.inspect_artifact(welch.artifact).parameters
+
+    # A Mann-Whitney artifact without a recorded p-value method predates
+    # exact small-sample p-values and must be recomputed.
+    del ds.zw[status.path].attrs["p_value_method"]
+    with pytest.raises(ValueError, match="Rerun run_statistical_testing"):
+        ds.get_statistical_tests(sample_level.artifact)
+
+
+def test_study_design_pairs_subjects_only_for_wilcoxon(datastore_ephemeral):
+    ds = datastore_ephemeral
+    _groups2, _groups3, samples, _subjects = _insert_group_columns(ds)
+    # Each sample maps to one subject, and each subject to one condition.
+    sample_index = np.array([int(sample[1:]) for sample in samples])
+    nested = np.array(
+        [f"n{index % 2}{index // 4}" for index in sample_index],
+        dtype=object,
+    )
+    ds.cells.insert("stat_nested_subject", nested, overwrite=True)
+    design = StudyDesign(sample_by="stat_sample", subject_by="stat_subject")
+    group2 = _active_metadata_grouping(ds, "stat_group2")
+    group3 = _active_metadata_grouping(ds, "stat_group3")
+
+    paired = ds.run_statistical_testing(["MALAT1"], study_design=design, **group2)
+    assert paired.method == "wilcoxon"
+    assert paired.pair_by == "stat_subject"
+
+    with pytest.raises(ValueError, match="the design has 3 conditions"):
+        ds.run_statistical_testing(["MALAT1"], study_design=design, **group3)
+    for test in ("mann_whitney", "kruskal_wallis"):
+        with pytest.raises(ValueError, match="treats samples as independent"):
+            ds.run_statistical_testing(
+                ["MALAT1"],
+                study_design=design,
+                test=test,
+                **group3,
+            )
+    nested_design = StudyDesign(
+        sample_by="stat_sample",
+        subject_by="stat_nested_subject",
+    )
+    with pytest.raises(
+        ValueError,
+        match="only one condition.*sample_by='stat_nested_subject'",
+    ):
+        ds.run_statistical_testing(["MALAT1"], study_design=nested_design, **group2)
+
+    by_subject = ds.run_statistical_testing(
+        ["MALAT1"],
+        sample_by="stat_nested_subject",
+        **group2,
+    )
+    assert by_subject.method == "mann_whitney"
+    assert by_subject.pair_by is None
+    assert by_subject.p_value_method == "exact"

@@ -8,7 +8,8 @@ not plan artifacts or write metadata. Persistent cell-cycle outputs belong to
 Feature-count percentages belong to
 `DataStore.run_feature_percentage(cell_selection, features)`. It derives the assay from the exact
 feature-selection ref and returns an assay-scoped `quality_metric` ref whose `values` array is the
-per-cell percentage. It does not add a metadata column.
+per-cell percentage. It does not add a metadata column. A read-only `DataStore` returns an
+identical existing result but raises `PermissionError` instead of computing a new one.
 
 Persisted normalization belongs to
 `DataStore.run_normalization(cell_selection, features)`, which returns an immutable artifact ref.

@@ -1,4 +1,4 @@
-"""RNA bulk aggregation over the stored feature-major count matrix."""
+"""Bulk aggregation of cell groups over stored or normalized matrices."""
 
 from dataclasses import replace
 
@@ -6,6 +6,7 @@ import numpy as np
 import zarr
 from numba import njit, prange
 
+from ..matrix import ChunkedArray
 from ..storage.budget import ResourceBudget
 from ..storage.execution import WorkShape, plan_operation
 from ..storage.feature_stream import (
@@ -140,3 +141,45 @@ def aggregate_rna_groups(
     return values.T.astype(result_dtype, copy=False), (
         None if fractions is None else fractions.T
     )
+
+
+def aggregate_normalized_groups(
+    normalized: ChunkedArray,
+    group_codes: np.ndarray,
+    n_groups: int,
+    *,
+    nthreads: int,
+) -> np.ndarray:
+    """Average normalized rows within each cell group in one streaming pass.
+
+    ``normalized`` holds one row per entry of ``group_codes``. Its
+    normalization was fitted once over all of its rows, so a group's profile
+    does not depend on which other groups are requested. Rows coded ``-1``
+    contribute to the fit but to no group.
+
+    Args:
+        normalized: Lazy normalized matrix with cells as rows.
+        group_codes: Group code of each row, or ``-1``.
+        n_groups: Number of groups.
+        nthreads: Worker count for streaming row blocks.
+
+    Returns:
+        A features-by-groups array of means. Empty groups are zero.
+    """
+    codes = np.asarray(group_codes, dtype=np.int64)
+    if codes.shape != (normalized.shape[0],) or np.any(
+        (codes < -1) | (codes >= n_groups)
+    ):
+        raise ValueError("Bulk group codes must align with normalized rows")
+    sums = np.zeros((n_groups, normalized.shape[1]), dtype=np.float64)
+    start = 0
+    for block in normalized.stream_blocks(
+        nthreads=nthreads, msg="Aggregating normalized groups"
+    ):
+        values = np.asarray(block, dtype=np.float64)
+        block_codes = codes[start : start + len(values)]
+        for code in np.unique(block_codes[block_codes >= 0]):
+            sums[code] += values[block_codes == code].sum(axis=0)
+        start += len(values)
+    sizes = np.bincount(codes[codes >= 0], minlength=n_groups)
+    return (sums / np.maximum(sizes, 1)[:, None]).T

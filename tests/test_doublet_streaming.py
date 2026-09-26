@@ -206,9 +206,16 @@ def test_streamed_doublets_match_materialized_mapping(
         feature_indices,
         **options,
     )
-    np.testing.assert_allclose(actual, expected, rtol=1e-8, atol=1e-9)
     if constant:
+        # Every simulated doublet has counts in the reference features, so
+        # mapping keeps it informative. Doublet scoring still skips rows that
+        # project onto the reference PCA center, which here is every row.
+        mapped = query.get_mapping_result(result, reference=reference)
+        assert mapped.diagnostics["uninformativeCellCount"] == 0
+        assert np.any(expected > 0)
         np.testing.assert_array_equal(actual, 0)
+        expected = actual
+    np.testing.assert_allclose(actual, expected, rtol=1e-8, atol=1e-9)
     original = doublets._doublet_batch_rows
 
     def smaller_batches(*args, **kwargs):

@@ -775,7 +775,8 @@ def validate_mapping_reference_binding(
     a handle. Later operations compare the artifact record and its attributes
     with the handle and the handle's arrays with the digest recorded at load,
     so a bound handle costs a few metadata reads per operation rather than a
-    pass over the payload, the index and the neighbours.
+    pass over the payload, the index and the neighbours. Callers check the
+    live reference dataset with ``MappingReference.validate_dataset_fingerprint``.
     """
     if not isinstance(reference, MappingReference):
         raise TypeError("reference must be a MappingReference")
@@ -797,19 +798,6 @@ def validate_mapping_reference_binding(
         raise _contract_error("Mapping reference artifact is missing or incomplete")
     if status.operation != "build_mapping_reference":
         raise mismatch
-    get_assay = getattr(reference.datastore, "_get_assay", None)
-    if callable(get_assay):
-        stored_dataset_fingerprint = get_assay(reference.assay_name).attrs.get(
-            "dataset_fingerprint"
-        )
-        if (
-            isinstance(stored_dataset_fingerprint, str)
-            and stored_dataset_fingerprint
-            and stored_dataset_fingerprint != reference.dataset_fingerprint
-        ):
-            raise _contract_error(
-                "Live assay dataset fingerprint does not match the mapping reference"
-            )
     method = (status.parameters or {}).get("method")
     if method not in {"pca", "symphony"}:
         raise mismatch

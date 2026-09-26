@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from scarf.agent.parameter_tuning import diagnostics as d
@@ -13,6 +14,8 @@ from scarf.agent.parameter_tuning.contracts import (
 )
 from scarf.storage.refs import ArtifactRef
 from tests.agent_examples import example
+from tests.test_datastore import _open_qc_store, _qc_store
+from tests.test_pipeline import _insert_nullable_cell_column
 
 
 class _Blocks:
@@ -861,3 +864,35 @@ def test_pca_feature_evidence_requires_an_assay_owned_selection() -> None:
         d._selected_feature_names(
             None, ArtifactRef("datastore", "feature_selection", "a" * 64)
         )
+
+
+def test_capture_selection_skips_missing_labels_and_accepts_boolean_labels() -> None:
+    ds = _open_qc_store(_qc_store()[0])
+    parent = ds.snapshot_cell_selection()
+    active = np.flatnonzero(ds.cells.fetch_all("I"))
+    rows = np.arange(ds.cells.N)
+    ds.cells.insert("is_even", rows % 2 == 0)
+    # Missing rows keep the placeholder 0, which is also a recorded label.
+    missing = rows % 3 == 0
+    _insert_nullable_cell_column(ds, "lane", np.where(missing, 0, rows % 2), missing)
+
+    for column, value in (("is_even", np.True_), ("lane", 0)):
+        values = d._aligned_metadata(
+            ds, active, column, aligned_with="cells", mark_missing=True
+        )
+        reference, count = d._select_capture_cells(
+            ds,
+            parent,
+            column=column,
+            value=value,
+            active_indices=active,
+            active_values=values,
+        )
+        stored = np.asarray(ds.load_artifact(reference)["values"][:], dtype=bool)
+        expected = np.zeros(ds.cells.N, dtype=bool)
+        recorded = ~pd.isna(values)
+        expected[active[recorded]] = values[recorded].astype(str) == str(value)
+        assert np.array_equal(stored, expected)
+        assert count == int(expected.sum()) > 0
+        if column == "lane":
+            assert not np.any(stored & missing)

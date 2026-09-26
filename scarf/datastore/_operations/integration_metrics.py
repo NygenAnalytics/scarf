@@ -12,6 +12,7 @@ from ...graph.feature_projection import (
     graph_cell_selection,
     resolve_native_graph_inputs,
 )
+from ...graph.kinds import require_graph_kind
 from ...metadata.artifacts import (
     artifact_values,
     plan_cell_data_artifact,
@@ -21,6 +22,7 @@ from ...metadata.rows import (
     read_metadata_missing_rows_chunkwise,
     read_metadata_rows_chunkwise,
 )
+from ...metadata.selection import require_complete_cluster_labels
 from ...metrics.lisi import _effective_perplexity
 from ...storage.artifacts import (
     ArtifactRef,
@@ -99,18 +101,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
         labels = np.asarray(values[:])
         if labels.ndim != 1 or len(labels) != stored_selection.selected_count:
             raise ValueError(f"{name} must contain one label per selected cell")
-        if "missing_mask" in values.attrs:
-            missing_name = values.attrs["missing_mask"]
-            if not isinstance(missing_name, str) or missing_name not in group:
-                raise ValueError(f"{name} has a malformed missing-label mask")
-            missing_array = as_zarr_array(group[missing_name], name=missing_name)
-            if (
-                missing_array.dtype != np.dtype(bool)
-                or missing_array.shape != labels.shape
-            ):
-                raise ValueError(f"{name} has a malformed missing-label mask")
-            if np.asarray(missing_array[:], dtype=bool).any():
-                raise ValueError(f"{name} contains missing cluster labels")
+        require_complete_cluster_labels(group, value_name, name=name, values=values)
         return selection, labels
 
     def _resolve_metric_neighbors(
@@ -426,10 +417,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
 
         if not isinstance(graph, ArtifactRef):
             raise TypeError("graph must be an ArtifactRef")
-        if graph.kind not in {"connectivity_map", "integrated_graph"}:
-            raise ValueError(
-                "graph must reference a connectivity map or an integrated graph"
-            )
+        require_graph_kind(graph)
         selection = graph_cell_selection(self.zw, graph)
         cell_indices = read_stored_selection_indices(
             self.zw,

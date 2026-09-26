@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from numba import njit, prange
+from numpy.typing import NDArray
 
 from .net import PreparedNetwork
 
@@ -137,7 +138,7 @@ def build_gene_set_index(
     )
 
 
-@njit(cache=True, parallel=True)
+@njit(cache=True)
 def _score_ranked_row(
     ranks: np.ndarray,
     connections: np.ndarray,
@@ -147,7 +148,7 @@ def _score_ranked_row(
 ) -> np.ndarray:
     n_sources = starts.size
     scores = np.zeros(n_sources, dtype=np.float64)
-    for source in prange(n_sources):
+    for source in range(n_sources):
         start = starts[source]
         size = offsets[source]
 
@@ -177,6 +178,49 @@ def _score_ranked_row(
                 right = selected_values[index + 1]
             area += (right - left) * (index + 1)
         scores[source] = area / max_auc
+    return scores
+
+
+@njit(cache=True, parallel=True)
+def _score_ranked_block(
+    matrix: np.ndarray,
+    permutation: np.ndarray,
+    connections: np.ndarray,
+    starts: np.ndarray,
+    offsets: np.ndarray,
+    n_up: int,
+) -> np.ndarray:
+    """Rank and score every row of one block in one parallel region.
+
+    Each row is permuted, ranked by decreasing value with a stable merge sort
+    so ties keep their permuted order, and scored serially. Rows without a
+    non-zero value score zero.
+    """
+    n_rows, n_features = matrix.shape
+    scores = np.zeros((n_rows, starts.size), dtype=np.float64)
+    for row_index in prange(n_rows):
+        row = matrix[row_index]
+        has_signal = False
+        for feature in range(n_features):
+            if row[feature] != 0:
+                has_signal = True
+                break
+        if not has_signal:
+            continue
+        negated = np.empty(n_features, dtype=np.float64)
+        for position in range(n_features):
+            negated[position] = -np.float64(row[permutation[position]])
+        order = np.argsort(negated, kind="mergesort")
+        ranks = np.empty(n_features, dtype=np.int64)
+        for position in range(n_features):
+            ranks[order[position]] = position + 1
+        scores[row_index] = _score_ranked_row(
+            ranks,
+            connections,
+            starts,
+            offsets,
+            n_up,
+        )
     return scores
 
 
@@ -211,22 +255,17 @@ def score_aucell_block(
     if np.any(sets.connections < 0) or np.any(sets.connections >= matrix.shape[1]):
         raise ValueError("Gene-set connections are outside the ranking universe")
 
-    scores = np.zeros((matrix.shape[0], len(sets.starts)), dtype=np.float64)
-    ordinal = np.arange(1, matrix.shape[1] + 1, dtype=np.int64)
-    for row_index, row in enumerate(matrix):
-        if not np.any(row != 0):
-            continue
-        permuted = np.asarray(row[permutation_array], dtype=np.float64)
-        order = np.argsort(-permuted, kind="stable")
-        ranks = np.empty(matrix.shape[1], dtype=np.int64)
-        ranks[order] = ordinal
-        scores[row_index] = _score_ranked_row(
-            ranks,
-            sets.connections,
-            sets.starts,
-            sets.offsets,
-            resolved_n_up,
-        )
+    if matrix.dtype == np.float16:
+        # Numba kernels take float32; the widening is exact.
+        matrix = matrix.astype(np.float32)
+    scores: NDArray[np.float64] = _score_ranked_block(
+        np.ascontiguousarray(matrix),
+        np.ascontiguousarray(permutation_array),
+        np.ascontiguousarray(sets.connections, dtype=np.int64),
+        np.ascontiguousarray(sets.starts, dtype=np.int64),
+        np.ascontiguousarray(sets.offsets, dtype=np.int64),
+        resolved_n_up,
+    )
 
     tolerance = 1e-12
     if np.any(scores < -tolerance) or np.any(scores > 1.0 + tolerance):

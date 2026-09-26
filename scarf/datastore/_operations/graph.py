@@ -12,7 +12,11 @@ import zarr
 from numpy.typing import NDArray
 from scipy.sparse import coo_matrix, csr_matrix
 
-from ...embeddings.reduction import _streaming_lsi_accumulator_bytes
+from ...embeddings.reduction import (
+    _nonnegative_integer,
+    _streaming_lsi_accumulator_bytes,
+    require_materialized_lsi_budget,
+)
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...graph.arguments import (
     AnnIndexArguments,
@@ -36,6 +40,7 @@ from ...graph.feature_projection import (
     resolve_coordinate_inputs,
     resolve_native_graph_inputs,
 )
+from ...graph.kinds import require_graph_kind
 from ...matrix import ChunkedArray
 from ...neighbors.stages import (
     AnnIndexStage,
@@ -76,6 +81,7 @@ from ...storage.copy import (
 from ...storage.budget import ResourceBudget
 from ...storage.geometry import array_geometry
 from ...storage.layout import (
+    ZarrArraySpec,
     _group_zarr_format,
     array_shard_rows,
     iter_shard_row_slices,
@@ -292,6 +298,38 @@ def _streaming_lsi_block_rows(
             f"but the operation limit is {resources.memoryBytes} bytes"
         )
     return max(1, min(n_rows, available // row_bytes))
+
+
+def _reduction_write_bytes(
+    spec: ZarrArraySpec,
+    data: ChunkedArray,
+    resources: ResourceBudget,
+    *,
+    dims: int,
+    transform_bytes: int,
+) -> tuple[int, int]:
+    """Plan the reduced-coordinate write and return producer and writer bytes.
+
+    Raises MemoryError when the budget cannot hold the streamed input, the
+    fitted transform, and one written band together.
+    """
+    from ...storage.io_policy import StorageIoPolicy
+    from ...storage.sharding import plan_dense_write
+
+    producer_bytes = (
+        data._resident_bytes()
+        + 3 * data._block_task_bytes()
+        + data.chunksize[0] * dims * 4
+        + transform_bytes
+    )
+    writer_plan = plan_dense_write(
+        spec,
+        resources,
+        1,
+        io=StorageIoPolicy(readWorkers=1),
+        residentBytes=producer_bytes,
+    )
+    return producer_bytes, writer_plan.reservedBytes - producer_bytes
 
 
 def _read_pca_center(group: zarr.Group) -> np.ndarray:
@@ -816,6 +854,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             log_transform=log_transform,
             renormalize_subset=renormalize_subset,
             invalidate_cache=invalidate_cache,
+            count_arithmetic=assay._count_arithmetic(
+                "payload",
+                log_transform=log_transform,
+                renormalize_subset=renormalize_subset,
+            ),
         )
 
         def valid_shape(_ref: ArtifactRef, group: zarr.Group) -> bool:
@@ -1108,6 +1151,15 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 f"with {effective_dims} dimensions"
             )
             return planned.ref
+        if method == "lsi" and lsi_solver == "materialized":
+            require_materialized_lsi_budget(
+                n_rows=n_cells,
+                n_features=n_features,
+                itemsize=int(np.dtype(data_array.dtype).itemsize),
+                n_components=effective_dims + int(lsi_skip_first),
+                n_oversamples=lsi_n_oversamples,
+                memory_bytes=self.resources.memoryBytes,
+            )
 
         with self._cache_normalized_artifact(
             normalized_ref, local_cache, effective_batch_size
@@ -1115,6 +1167,30 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             normalized_data = self._load_normalized_artifact(
                 normalized_ref,
                 batch_size=effective_batch_size,
+            )
+            score_spec = row_sharded_array_spec(
+                (n_cells, effective_dims),
+                np.float32,
+                profile=resolve_storage_profile(self.zw.store),
+                band_rows=min(n_cells, 1_000_000),
+                zarr_format=_group_zarr_format(self.zw),
+                fill_value=0.0,
+            )
+            # Plan the coordinate write against an upper bound on the fitted
+            # transform, so a budget that cannot hold it fails before the fit.
+            float_bytes = np.dtype(np.float64).itemsize
+            producer_bytes, write_bytes = _reduction_write_bytes(
+                score_spec,
+                normalized_data,
+                self.resources,
+                dims=effective_dims,
+                transform_bytes=(
+                    custom_loadings.nbytes
+                    if custom_loadings is not None
+                    else n_features * effective_dims * float_bytes
+                )
+                + (2 * n_features * float_bytes if enabled_scaling else 0)
+                + (n_features * float_bytes if method == "pca" else 0),
             )
             if scaling_plan.reused:
                 scaling_group = reused_artifact_group(
@@ -1199,6 +1275,13 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     "n_oversamples": lsi_n_oversamples,
                 },
             )
+            loadings = transform.loadings
+            if loadings is None or loadings.shape != (n_features, effective_dims):
+                raise ValueError(
+                    f"{method.upper()} loadings have shape "
+                    f"{None if loadings is None else loadings.shape}; expected "
+                    f"{(n_features, effective_dims)}"
+                )
             reduction_group = start_artifact(self.zw, planned)
             if method == "pca":
                 assert transform.center is not None
@@ -1210,80 +1293,44 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     (n_features,),
                 )
                 center_array[:] = transform.center
-            if transform.loadings is not None:
-                output = create_zarr_dataset(
-                    reduction_group,
-                    "loadings",
-                    normalized_data.chunksize,
-                    "f8",
-                    transform.loadings.shape,
-                )
-                output[:, :] = transform.loadings
-                score_spec = row_sharded_array_spec(
-                    (n_cells, effective_dims),
-                    np.float32,
-                    profile=resolve_storage_profile(reduction_group.store),
-                    band_rows=min(n_cells, 1_000_000),
-                    zarr_format=_group_zarr_format(reduction_group),
-                    fill_value=0.0,
-                )
-                scores = create_numeric_array(
-                    reduction_group,
-                    "data",
-                    score_spec,
-                )
-                from ...storage.sharding import plan_dense_write
-                from ...storage.io_policy import StorageIoPolicy
+            output = create_zarr_dataset(
+                reduction_group,
+                "loadings",
+                normalized_data.chunksize,
+                "f8",
+                loadings.shape,
+            )
+            output[:, :] = loadings
+            scores = create_numeric_array(
+                reduction_group,
+                "data",
+                score_spec,
+            )
 
-                transform_bytes = sum(
-                    value.nbytes
-                    for value in (
-                        transform.loadings,
-                        transform.mu,
-                        transform.sigma,
-                        transform.center,
+            def score_blocks() -> Iterator[np.ndarray]:
+                for block in normalized_data._stream_blocks(
+                    nthreads=self.nthreads,
+                    msg="Calculating reduced coordinates",
+                    prefetch=1,
+                    row_mask=None,
+                    resident_bytes=write_bytes
+                    + producer_bytes
+                    - normalized_data._block_task_bytes(),
+                ):
+                    yield np.asarray(
+                        transform.transform(block),
+                        dtype=np.float32,
                     )
-                    if isinstance(value, np.ndarray)
-                )
-                producer_bytes = (
-                    normalized_data._resident_bytes()
-                    + 3 * normalized_data._block_task_bytes()
-                    + normalized_data.chunksize[0] * effective_dims * 4
-                    + transform_bytes
-                )
-                writer_plan = plan_dense_write(
-                    scores,
-                    self.resources,
-                    1,
-                    io=StorageIoPolicy(readWorkers=1),
-                    residentBytes=producer_bytes,
-                )
-                write_bytes = writer_plan.reservedBytes - producer_bytes
 
-                def score_blocks() -> Iterator[np.ndarray]:
-                    for block in normalized_data._stream_blocks(
-                        nthreads=self.nthreads,
-                        msg="Calculating reduced coordinates",
-                        prefetch=1,
-                        row_mask=None,
-                        resident_bytes=write_bytes
-                        + producer_bytes
-                        - normalized_data._block_task_bytes(),
-                    ):
-                        yield np.asarray(
-                            transform.transform(block),
-                            dtype=np.float32,
-                        )
-
-                write_dense_from_row_batches(
-                    scores,
-                    score_blocks(),
-                    dtype=np.float32,
-                    msg="Writing reduced coordinates",
-                    resources=self.resources,
-                    io=self.storageIo,
-                    producerReserveBytes=producer_bytes,
-                )
+            write_dense_from_row_batches(
+                scores,
+                score_blocks(),
+                dtype=np.float32,
+                msg="Writing reduced coordinates",
+                resources=self.resources,
+                io=self.storageIo,
+                producerReserveBytes=producer_bytes,
+            )
             finish_artifact(reduction_group, planned)
         if show_elbow_plot and method == "pca":
             from ...plotting import elbow
@@ -1370,9 +1417,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             normalized: Normalized artifact to reduce.
             dims: Requested number of retained LSI dimensions.
             skip_first: Whether to omit the first singular component.
-            rand_state: Seed used by the randomized decomposition.
+            rand_state: Non-negative integer seed used by the randomized
+                decomposition.
             solver: Memory-bounded streaming solver or materialized compatibility
-                solver.
+                solver. The materialized solver holds the whole matrix and raises
+                MemoryError before reading it when that exceeds the memory budget.
             n_iter: Power iterations used by randomized LSI.
             n_oversamples: Extra random vectors used to stabilize the fitted
                 singular subspace.
@@ -1386,24 +1435,18 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         """
         if solver not in {"streaming", "materialized"}:
             raise ValueError("solver must be 'streaming' or 'materialized'")
-        if isinstance(n_iter, bool) or not isinstance(n_iter, (int, np.integer)):
-            raise TypeError("n_iter must be an integer")
-        if isinstance(n_oversamples, bool) or not isinstance(
-            n_oversamples,
-            (int, np.integer),
-        ):
-            raise TypeError("n_oversamples must be an integer")
-        if n_iter < 0:
-            raise ValueError("n_iter must be nonnegative")
-        if n_oversamples < 0:
-            raise ValueError("n_oversamples must be nonnegative")
+        n_iter = _nonnegative_integer(n_iter, "n_iter")
+        n_oversamples = _nonnegative_integer(n_oversamples, "n_oversamples")
+        if not isinstance(skip_first, bool | np.bool_):
+            raise TypeError("skip_first must be a boolean")
+        rand_state = _nonnegative_integer(rand_state, "rand_state")
         return self._run_reduction_artifact(
             method="lsi",
             normalized=normalized,
             dims=dims,
             pca_cell_selection=None,
             feat_scaling=False,
-            lsi_skip_first=skip_first,
+            lsi_skip_first=bool(skip_first),
             custom_loadings=None,
             rand_state=rand_state,
             batch_size=batch_size,
@@ -1411,8 +1454,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             show_elbow_plot=False,
             invalidate_cache=invalidate_cache,
             lsi_solver=solver,
-            lsi_n_iter=int(n_iter),
-            lsi_n_oversamples=int(n_oversamples),
+            lsi_n_iter=n_iter,
+            lsi_n_oversamples=n_oversamples,
         )
 
     def run_custom_reduction(
@@ -1427,8 +1470,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         """Register custom feature loadings as a reusable reduction.
 
         Args:
-            loadings: Two-dimensional feature-by-dimension loading matrix. Its
-                row count must match the normalized feature selection.
+            loadings: Two-dimensional feature-by-dimension matrix of finite real
+                loadings. Its row count must match the normalized feature
+                selection.
             normalized: Normalized artifact associated with the loadings.
             batch_size: Number of selected cells processed per block.
             local_cache: Local staging policy for normalized data on remote
@@ -1439,10 +1483,14 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             Reference to the custom reduction artifact.
         """
         loading_values = np.asarray(loadings)
+        if loading_values.dtype.kind not in "iuf":
+            raise TypeError("Custom loadings must contain real numbers")
         if loading_values.ndim != 2 or loading_values.shape[1] < 1:
             raise ValueError(
                 "Custom loadings must be a two-dimensional matrix with columns"
             )
+        if not np.all(np.isfinite(loading_values)):
+            raise ValueError("Custom loadings must contain only finite values")
         return self._run_reduction_artifact(
             method="custom",
             normalized=normalized,
@@ -1468,6 +1516,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
         """Snapshot live batch columns, then fit or reuse Harmony correction."""
+        from ...embeddings.harmony.api import validate_harmony_parameters
+
         self._resolve_harmony_reduction(reduction)
         if not isinstance(batch_columns, list) or not batch_columns:
             raise ValueError("batch_columns must be a non-empty list")
@@ -1475,6 +1525,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             raise ValueError("batch_columns must contain non-empty strings")
         if len(set(batch_columns)) != len(batch_columns):
             raise ValueError("batch_columns must be unique")
+        if batch_size is not None:
+            _positive_integer(batch_size, "batch_size")
+        validate_harmony_parameters(harmony_params)
         batch_snapshot = snapshot_run_metadata(
             self.zw,
             table_path="cellData",
@@ -1535,8 +1588,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
         """Fit Harmony from an explicit immutable metadata snapshot."""
+        from ...embeddings.harmony.api import validate_harmony_parameters
+
         if not isinstance(batch_snapshot, ArtifactRef):
             raise TypeError("batch_snapshot must be an ArtifactRef")
+        resolved_harmony_params = validate_harmony_parameters(harmony_params)
         reduction_ref = reduction
         reduction_assay, cell_selection, validated_cells = (
             self._resolve_harmony_reduction(reduction_ref)
@@ -1639,7 +1695,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             reduction=reduction_ref,
             batch_snapshot=batch_snapshot,
             batch_columns=tuple(batch_columns),
-            harmony_parameters=harmony_params or {},
+            harmony_parameters=resolved_harmony_params,
             algorithm_version="centroid_snapshot_v2",
             batch_size=effective_batch_size,
             invalidate_cache=invalidate_cache,
@@ -1669,7 +1725,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 dims=dims,
                 batch_size=effective_batch_size,
                 batches=batches,
-                parameters=harmony_params or {},
+                parameters=resolved_harmony_params,
                 corrected_data=None,
                 nthreads=self.nthreads,
             )
@@ -2288,6 +2344,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         logger.info(f"{action} connectivity map for {n_cells} cells")
         return planned.ref
 
+    def _graph_location(self, graph: ArtifactRef) -> str:
+        """Return a complete graph's location."""
+        require_graph_kind(graph)
+        return require_complete_artifact(self.zw, graph).path
+
     def _load_graph_artifact(
         self,
         graph: ArtifactRef,
@@ -2305,11 +2366,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
         from scipy.sparse import triu
 
-        if graph.kind not in {"connectivity_map", "integrated_graph"}:
-            raise ValueError(
-                "Graph reference must be connectivity_map or integrated_graph"
-            )
-        graph_loc = require_complete_artifact(self.zw, graph).path
+        graph_loc = self._graph_location(graph)
         cache_key = (
             graph_loc,
             symmetric is True,
@@ -2350,8 +2407,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             symmetric: If True, makes the graph symmetric by adding it to its transpose.
             upper_only: If True, then only the values from upper triangular of the matrix are returned. This is only
                        used when symmetric is True.
-            use_k: Number of top k-nearest neighbours to keep in the graph. This value must be greater than 0 and less
-                   the parameter k used. By default, all neighbours are used. (Default value: None)
+            use_k: Number of top k-nearest neighbours to keep in the graph. It must be an integer from 1 to the
+                   graph's k. By default, all neighbours are used. (Default value: None)
 
         Returns:
             A scipy sparse matrix representing cell neighbourhood graph.
@@ -2359,7 +2416,18 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
         if not isinstance(graph, ArtifactRef):
             raise TypeError("graph must be an ArtifactRef")
+        if use_k is not None and (
+            isinstance(use_k, bool) or not isinstance(use_k, int | np.integer)
+        ):
+            raise TypeError("use_k must be an integer or None")
         graph_cell_selection(self.zw, graph)
+        if use_k is not None:
+            k = self._get_graph_ncells_k(self._graph_location(graph))[1]
+            if not 1 <= use_k <= k:
+                raise ValueError(
+                    f"use_k must be between 1 and the graph's k ({k}), "
+                    "or None to use every neighbour"
+                )
         return self._load_graph_artifact(
             graph,
             symmetric=symmetric,
@@ -2389,7 +2457,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             method: Choose a method for modality integration. Available options:
                 'wnn': Hao-inspired weighted nearest neighbor integration and
                 'snn': shared nearest neighbour integration.
-            chunk_size: number of cells to be loaded at a time while reading and writing the graph
+            chunk_size: Number of cells per stored chunk of the integrated edge,
+                weight, and modality-weight arrays. It does not bound memory:
+                integration holds every source graph, and for WNN every
+                source's coordinates, in memory.
             invalidate_cache: Force a new integrated-graph artifact.
             l2_normalize: L2-normalize modality coordinates during WNN scoring.
                 This algorithmic setting is stored in artifact provenance.
@@ -2408,6 +2479,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             raise ValueError(
                 f"Method {method} not supported, choose one of these: 'snn', 'wnn'"
             )
+        chunk_size = _positive_integer(chunk_size, "chunk_size")
         if len(sources) < 2:
             raise ValueError("Assay integration requires at least two assays")
         if not all(isinstance(source, ArtifactRef) for source in sources):

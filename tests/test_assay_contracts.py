@@ -52,8 +52,8 @@ _PUBLIC_CLASS_METHODS = {
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    Assay: "6920d1d6370b3265a68a6c5d9a866118711e3dc3310a1cb0bf800e312a2cef6b",
-    RNAassay: "7fee4d6cc6d35bad8be0cfc6cb0728272cc6bf4d075b2ba53ce1018951f34246",
+    Assay: "85f3baba45ac65e46add4ad3f01845d02fd267601b3cee4419661c91a0302bd7",
+    RNAassay: "74fc5e54bc871c516fa8adca9cd8bcdec92bbcba94c118965b933159b2ef19ac",
     ATACassay: "1732f9ac8b4f368185e0965becb94b9472186db4ee53d372a8a2852d30dd42a4",
     ADTassay: "1732f9ac8b4f368185e0965becb94b9472186db4ee53d372a8a2852d30dd42a4",
 }
@@ -597,6 +597,42 @@ def test_rna_requires_zarr_v3_counts_t():
     root.create_array("countsT", data=np.ones((3, 2), dtype=np.uint32))
     with pytest.raises(ValueError, match="Zarr v3|not finalized"):
         validate_count_matrix(root, require_transpose=True)
+
+
+def test_rna_normed_zero_total_cells_are_zero(tmp_path):
+    raw = np.array([[3, 1, 0], [0, 0, 0], [2, 0, 2]], dtype=np.uint32)
+    path = tmp_path / "rna.zarr"
+    SparseToZarr(
+        csr_matrix(raw),
+        zarr_loc=str(path),
+        cell_ids=["c0", "c1", "c2"],
+        feature_ids=["g0", "g1", "g2"],
+        assay_name="RNA",
+        nthreads=1,
+    ).dump(batch_size=3)
+    store = DataStore(str(path), default_assay="RNA", min_features_per_cell=0)
+    cells = np.arange(3)
+    expressed = raw[[0, 2]]
+    lib_size = store.RNA.sf * expressed / expressed.sum(axis=1, keepdims=True)
+
+    for log_transform in (False, True):
+        values = store.RNA.normed(
+            cell_idx=cells,
+            feat_idx=np.arange(3),
+            log_transform=log_transform,
+        ).compute()
+        assert np.isfinite(values).all()
+        np.testing.assert_array_equal(values[1], 0.0)
+        np.testing.assert_allclose(
+            values[[0, 2]],
+            np.log1p(lib_size) if log_transform else lib_size,
+        )
+
+    store.cells.insert("everyone", np.ones(3, dtype=bool), overwrite=True)
+    np.testing.assert_allclose(
+        store.get_cell_vals(from_assay="RNA", cell_key="everyone", k="g0"),
+        [store.RNA.sf * 3 / 4, 0.0, store.RNA.sf * 2 / 4],
+    )
 
 
 def test_rna_streaming_stats_and_group_means_handle_missing_inputs():

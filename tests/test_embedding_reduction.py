@@ -419,3 +419,54 @@ def test_materialized_lsi_preserves_sklearn_compatibility():
         rtol=1e-12,
         atol=1e-12,
     )
+
+
+def test_materialized_lsi_does_not_depend_on_block_size():
+    values = np.random.default_rng(37).normal(size=(28, 9))
+    expected = fit_lsi(
+        ChunkedArray.from_numpy(values, block_size=28),
+        dims=3,
+        skip_first=True,
+        params={"solver": "materialized", "n_iter": 3, "n_oversamples": 2},
+        random_state=7,
+        nthreads=1,
+    )
+    observed = fit_lsi(
+        ChunkedArray.from_numpy(values, block_size=5),
+        dims=3,
+        skip_first=True,
+        params={"solver": "materialized", "n_iter": 3, "n_oversamples": 2},
+        random_state=7,
+        nthreads=1,
+    )
+
+    np.testing.assert_array_equal(observed, expected)
+
+
+def test_materialized_lsi_budget_counts_matrix_copies_and_svd_bases():
+    required = reduction_module._materialized_lsi_bytes(
+        n_rows=100,
+        n_features=20,
+        itemsize=4,
+        n_components=4,
+        n_oversamples=6,
+    )
+
+    assert required == 2 * 100 * 20 * 4 + 4 * 120 * 10 * 8 + 2 * 10 * 10 * 8
+    reduction_module.require_materialized_lsi_budget(
+        n_rows=100,
+        n_features=20,
+        itemsize=4,
+        n_components=4,
+        n_oversamples=6,
+        memory_bytes=required,
+    )
+    with pytest.raises(MemoryError, match="solver='streaming'"):
+        reduction_module.require_materialized_lsi_budget(
+            n_rows=100,
+            n_features=20,
+            itemsize=4,
+            n_components=4,
+            n_oversamples=6,
+            memory_bytes=required - 1,
+        )

@@ -1,14 +1,17 @@
 import hashlib
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
 from numpy.typing import DTypeLike
 from ...utils.arrays import has_duplicates
+from ...utils.logging import logger
 
-__all__ = ["PreparedNetwork", "prepare_network", "read_gmt"]
+__all__ = ["AmbiguousTargets", "PreparedNetwork", "prepare_network", "read_gmt"]
+
+AmbiguousTargets = Literal["drop", "error"]
 
 
 def _owned_readonly(values: np.ndarray, dtype: DTypeLike) -> np.ndarray:
@@ -52,6 +55,14 @@ def _network_digest(
 
 @dataclass(frozen=True, slots=True)
 class PreparedNetwork:
+    """A matched, pruned, and canonically ordered gene-set network.
+
+    ``network_digest`` hashes the retained sources, matched edges, and, for
+    weighted networks, their weights. ``dropped_ambiguous_targets`` lists the
+    sorted targets whose edges were dropped because each matched several
+    active features.
+    """
+
     source_names: np.ndarray
     source_sizes: np.ndarray
     matched_feature_index: np.ndarray
@@ -59,6 +70,7 @@ class PreparedNetwork:
     edge_feature_index: np.ndarray
     edge_weight: np.ndarray
     network_digest: str
+    dropped_ambiguous_targets: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         one_dimensional = (
@@ -126,6 +138,15 @@ class PreparedNetwork:
             raise ValueError("Prepared network weights must be finite")
         if not isinstance(self.network_digest, str) or not self.network_digest:
             raise ValueError("Prepared network digest must be a non-empty string")
+        dropped = self.dropped_ambiguous_targets
+        if (
+            not isinstance(dropped, tuple)
+            or not all(isinstance(target, str) and target for target in dropped)
+            or list(dropped) != sorted(set(dropped))
+        ):
+            raise ValueError(
+                "Prepared network dropped targets must be sorted unique strings"
+            )
 
 
 def read_gmt(path: str | os.PathLike[str]) -> pd.DataFrame:
@@ -170,14 +191,25 @@ def prepare_network(
     active_feature_index: np.ndarray,
     tmin: int,
     weighted: bool,
+    ambiguous_targets: AmbiguousTargets = "drop",
 ) -> PreparedNetwork:
-    """Validate, match, prune, and canonically order a gene-set network."""
+    """Validate, match, prune, and canonically order a gene-set network.
+
+    Targets match active feature names without case sensitivity. A target
+    that matches several active features, such as a gene symbol shared by
+    two feature ids, is ambiguous. With ``ambiguous_targets="drop"`` its
+    edges are removed before ``tmin`` pruning, a warning names it, and the
+    result lists it in ``dropped_ambiguous_targets``. With ``"error"`` it
+    raises ``ValueError``. Only the retained edges enter the network digest.
+    """
     if not isinstance(net, pd.DataFrame):
         raise TypeError("net must be a pandas DataFrame")
     if isinstance(tmin, bool) or not isinstance(tmin, int) or tmin < 1:
         raise ValueError("tmin must be an integer greater than or equal to 1")
     if not isinstance(weighted, bool):
         raise TypeError("weighted must be a boolean")
+    if ambiguous_targets not in ("drop", "error"):
+        raise ValueError("ambiguous_targets must be 'drop' or 'error'")
     if not {"source", "target"}.issubset(net.columns):
         raise ValueError("net must contain 'source' and 'target' columns")
     if any(
@@ -238,19 +270,37 @@ def prepare_network(
 
     matched_rows: list[int] = []
     matched_indices: list[int] = []
+    ambiguous: set[str] = set()
     for row_index, target in zip(frame.index, frame["target"], strict=True):
         matches = name_to_indices.get(str(target).upper(), [])
         if not matches:
             continue
         if len(matches) > 1:
-            raise ValueError(
-                f"Network target {target!r} matches multiple active assay features"
-            )
+            if ambiguous_targets == "error":
+                raise ValueError(
+                    f"Network target {target!r} matches multiple active assay "
+                    "features. Pass ambiguous_targets='drop' to drop its edges."
+                )
+            ambiguous.add(str(target))
+            continue
         matched_rows.append(int(row_index))
         matched_indices.append(matches[0])
 
+    dropped_ambiguous_targets = tuple(sorted(ambiguous))
+    if dropped_ambiguous_targets:
+        logger.warning(
+            f"Dropped {len(dropped_ambiguous_targets)} network targets that match "
+            "multiple active assay features: " + ", ".join(dropped_ambiguous_targets)
+        )
     if not matched_rows:
-        raise ValueError("Network has no targets overlapping the active assay features")
+        raise ValueError(
+            "Network has no targets overlapping the active assay features"
+            + (
+                f" after dropping {len(dropped_ambiguous_targets)} ambiguous targets"
+                if dropped_ambiguous_targets
+                else ""
+            )
+        )
     frame = frame.loc[matched_rows].copy()
     frame["feature_index"] = np.asarray(matched_indices, dtype=np.int64)
     if frame.duplicated(subset=["source", "feature_index"]).any():
@@ -299,4 +349,5 @@ def prepare_network(
         edge_feature_index=_owned_readonly(edge_feature_index, np.int64),
         edge_weight=_owned_readonly(edge_weight, np.float64),
         network_digest=digest,
+        dropped_ambiguous_targets=dropped_ambiguous_targets,
     )

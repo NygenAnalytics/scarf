@@ -317,6 +317,54 @@ def test_marker_stats_python_kernel_handles_single_cell_population():
     assert np.isnan(stats[:, 0, 7]).all()
 
 
+def test_marker_groups_use_natural_order_and_string_ids(
+    datastore_ephemeral, tmp_path
+) -> None:
+    store = datastore_ephemeral
+    n_cells = len(store.cells.active_index("I"))
+    clusters = _test_cluster_artifact(store, np.arange(n_cells, dtype=np.int64) % 12)
+    marker = store.run_marker_search(
+        clusters,
+        from_assay="RNA",
+        features=store.set_feature_selection(feature_indexes=np.arange(20)),
+        nthreads=1,
+    )
+    natural = [str(value) for value in range(12)]
+
+    table = store.get_markers(marker=marker, min_score=-1, min_frac_exp=-1)
+    assert list(dict.fromkeys(table["group_id"])) == natural
+    assert all(isinstance(value, str) for value in table["group_id"])
+    one = store.get_markers(marker=marker, group_id=10, min_score=-1, min_frac_exp=-1)
+    assert set(one["group_id"]) == {"10"}
+    pd.testing.assert_frame_equal(
+        one,
+        table[table["group_id"] == "10"].reset_index(drop=True),
+    )
+    with pytest.raises(ValueError, match="no group '12'"):
+        store.get_markers(marker=marker, group_id=12)
+
+    out_file = tmp_path / "markers.csv"
+    store.export_markers_to_csv(marker, str(out_file), min_score=-1, min_frac_exp=-1)
+    assert list(pd.read_csv(out_file).columns) == natural
+
+
+def test_marker_group_order_matches_plot_category_order() -> None:
+    from scarf.utils.arrays import sort_categories
+
+    assert sort_categories(["10", "2", "-1", "1.5"]) == ["-1", "1.5", "2", "10"]
+    # Mixed labels put numbers first by value, then natural text.
+    assert sort_categories(["b", "10", "a10", "2", "a2"]) == [
+        "2",
+        "10",
+        "a2",
+        "a10",
+        "b",
+    ]
+    # A "nan" label is text, so its position does not depend on input order.
+    assert sort_categories(["nan", "2", "10"]) == ["2", "10", "nan"]
+    assert sort_categories(["10", "nan", "2"]) == ["2", "10", "nan"]
+
+
 def test_saved_marker_refs_keep_feature_specific_results_addressable(
     datastore_ephemeral,
 ) -> None:
@@ -554,11 +602,16 @@ def test_sort_marker_results_adds_deterministic_tie_breakers():
     assert sorted_unnamed["feature_index"].tolist() == [7, 9]
 
 
+def _feature_batch(columns: dict[str, list[float]]):
+    """Return a feature-major batch as ``iter_normed_feature_wise`` yields it."""
+    return np.array(list(columns.values())), np.array(list(columns))
+
+
 def test_find_markers_by_regression_handles_expression_threshold():
     class Assay:
         @staticmethod
         def iter_normed_feature_wise(**_kwargs):
-            yield pd.DataFrame(
+            yield _feature_batch(
                 {
                     "correlated": [0.0, 1.0, 2.0, 3.0],
                     "at_threshold": [0.0, 1.0, 2.0, 0.0],
@@ -667,8 +720,8 @@ def test_find_markers_by_regression_two_cell_batches_are_unadjusted():
     class Assay:
         @staticmethod
         def iter_normed_feature_wise(**_kwargs):
-            yield pd.DataFrame({"a": [0.0, 1.0], "b": [1.0, 1.0]})
-            yield pd.DataFrame({"c": [1.0, 0.0]})
+            yield _feature_batch({"a": [0.0, 1.0], "b": [1.0, 1.0]})
+            yield _feature_batch({"c": [1.0, 0.0]})
 
     result = find_markers_by_regression(
         Assay(),
@@ -685,27 +738,11 @@ def test_find_markers_by_regression_two_cell_batches_are_unadjusted():
     assert result["p_value_adjusted"].isna().all()
 
 
-def test_find_markers_by_regression_rejects_non_dataframe_batches():
-    class Assay:
-        @staticmethod
-        def iter_normed_feature_wise(**_kwargs):
-            yield np.ones((3, 1))
-
-    with pytest.raises(TypeError, match="DataFrames"):
-        find_markers_by_regression(
-            Assay(),
-            cell_idx=np.arange(3),
-            feat_idx=np.arange(1),
-            regressor=np.arange(3),
-            min_cells=1,
-        )
-
-
 def test_find_markers_by_regression_identifies_nonfinite_feature():
     class Assay:
         @staticmethod
         def iter_normed_feature_wise(**_kwargs):
-            yield pd.DataFrame({"bad_feature": [0.0, np.nan, 1.0]})
+            yield _feature_batch({"bad_feature": [0.0, np.nan, 1.0]})
 
     with pytest.raises(ValueError, match="bad_feature"):
         find_markers_by_regression(
@@ -1567,7 +1604,7 @@ def test_pseudotime_bh_excludes_untested_features():
     class Assay:
         @staticmethod
         def iter_normed_feature_wise(**_kwargs):
-            yield pd.DataFrame(
+            yield _feature_batch(
                 {
                     "tested": [0.0, 1.0, 2.0, 3.0],
                     "untested": [0.0, 0.0, 0.0, 0.0],

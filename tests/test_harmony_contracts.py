@@ -9,6 +9,7 @@ import scarf.embeddings as embeddings
 import scarf.embeddings.harmony as harmony
 from scarf.embeddings.harmony.api import fit_harmony as implementation_fit_harmony
 from scarf.embeddings.harmony.api import run_harmony as implementation_run_harmony
+from scarf.embeddings.harmony.api import validate_harmony_parameters
 from scarf.embeddings.harmony.models import HarmonyResult as implementation_result
 from scarf.embeddings.harmony.optimizer import Harmony as implementation_optimizer
 from tests.signature_contracts import signature_digest
@@ -151,7 +152,7 @@ def test_run_harmony_resolves_fit_through_public_facade(monkeypatch):
             np.zeros((2, 4)),
             pd.DataFrame({"batch": ["a", "b", "a", "b"]}),
             {"nclust": 2, "lamb": np.nan},
-            "lambda values must be finite and non-negative",
+            "lamb values must be finite and non-negative",
         ),
         (
             np.zeros((2, 4)),
@@ -164,6 +165,64 @@ def test_run_harmony_resolves_fit_through_public_facade(monkeypatch):
 def test_fit_harmony_rejects_invalid_contracts(values, metadata, kwargs, message):
     with pytest.raises(ValueError, match=message):
         harmony.fit_harmony(values, metadata, **kwargs)
+
+
+def test_harmony_parameters_are_validated_without_data():
+    def cluster(values, count):
+        return values[:count]
+
+    parameters = {
+        "nclust": np.int64(3),
+        "sigma": [0.1, 0.2, 0.3],
+        "theta": None,
+        "lamb": 1,
+        "tau": 0,
+        "block_size": 0.5,
+        "max_iter_harmony": 0,
+        "max_iter_kmeans": 5,
+        "epsilon_cluster": 0.0,
+        "epsilon_harmony": 1e-3,
+        "random_state": 4,
+        "cluster_fn": cluster,
+    }
+
+    resolved = validate_harmony_parameters(parameters)
+
+    assert resolved == parameters
+    assert resolved is not parameters
+    assert validate_harmony_parameters(None) == {}
+
+
+@pytest.mark.parametrize(
+    ("parameters", "error", "message"),
+    [
+        ([("nclust", 2)], TypeError, "mapping"),
+        ({"data_mat": np.zeros((2, 2))}, ValueError, "Unsupported .*data_mat"),
+        ({"n_clusters": 2}, ValueError, "Unsupported .*n_clusters"),
+        ({"nclust": 0}, ValueError, "nclust must be at least 1"),
+        ({"nclust": True}, TypeError, "nclust must be an integer"),
+        ({"max_iter_harmony": -1}, ValueError, "max_iter_harmony"),
+        ({"max_iter_kmeans": 2.0}, TypeError, "max_iter_kmeans"),
+        ({"random_state": None}, TypeError, "random_state"),
+        ({"random_state": -3}, ValueError, "random_state"),
+        ({"tau": -1.0}, ValueError, "tau must be finite"),
+        ({"block_size": 0}, ValueError, "block_size must be finite and positive"),
+        ({"epsilon_harmony": np.nan}, ValueError, "epsilon_harmony"),
+        ({"epsilon_cluster": "small"}, TypeError, "epsilon_cluster"),
+        ({"sigma": 0.0}, ValueError, "sigma values must be finite and positive"),
+        ({"sigma": None}, TypeError, "sigma must contain real numbers"),
+        ({"theta": [1.0, -1.0]}, ValueError, "theta values"),
+        ({"lamb": np.inf}, ValueError, "lamb values"),
+        ({"cluster_fn": "unknown"}, ValueError, "cluster_fn"),
+    ],
+)
+def test_harmony_parameter_validation_rejects_invalid_values(
+    parameters,
+    error,
+    message,
+):
+    with pytest.raises(error, match=message):
+        validate_harmony_parameters(parameters)
 
 
 def test_fit_harmony_expands_per_column_parameters_and_records_callable(monkeypatch):

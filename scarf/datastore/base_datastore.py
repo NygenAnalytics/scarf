@@ -115,10 +115,11 @@ class BaseDataStore:
                        when DataStore loads a Zarr file for the first time
         min_features_per_cell: Minimum number of non-zero features in a cell. If lower than this then the cell
                                will be filtered out.
-        mito_pattern: Pattern for missing mitochondrial percentages. None preserves existing values
-                      and uses ``^MT-`` for new values. Explicit patterns must match existing provenance.
-        ribo_pattern: Pattern for missing ribosomal percentages. None preserves existing values
-                      and uses ``RPS|RPL|MRPS|MRPL`` for new values.
+        mito_pattern: Feature-name pattern for the ``{assay}_percentMito`` column of each RNA assay.
+                      The first writable open replaces any existing column with values computed from
+                      this pattern, or ``^MT-`` when None. Later opens keep the stored values when
+                      None and reject a pattern that differs from the recorded one.
+        ribo_pattern: The same for ``{assay}_percentRibo``, using ``RPS|RPL|MRPS|MRPL`` when None.
         zarr_mode: For read-write mode use ``r+`` or for read-only use ``r``.
                    (Default value: ``r+``)
         workspace: Workspace name within the Zarr store (None for legacy single-workspace layout).
@@ -539,12 +540,27 @@ class BaseDataStore:
             from_assay: Name of the assay whose object is to be returned.
 
         Returns:
+
+        Raises:
+            ValueError: if ``from_assay`` names no assay in this datastore.
         """
         if from_assay is None or from_assay == "":
             from_assay = self._defaultAssay
-        return cast(
-            Assay | RNAassay | ADTassay | ATACassay, self.__getattribute__(from_assay)
-        )
+        # Only scanned assay names resolve; other attributes such as ``cells``
+        # are not assays.
+        if from_assay not in self._assayNames:
+            available = ", ".join(self._assayNames)
+            raise ValueError(
+                f"Assay {from_assay!r} not found. Available assays: {available}"
+            )
+        return cast(Assay | RNAassay | ADTassay | ATACassay, getattr(self, from_assay))
+
+    def _require_writable(self, operation: str) -> None:
+        """Refuse an operation that writes to a store opened read-only."""
+        if self.zarr_mode != "r+":
+            raise PermissionError(
+                f"{operation} requires a DataStore opened with zarr_mode='r+'"
+            )
 
     def _ensure_dataset_fingerprint(self, from_assay: str) -> str:
         from ..storage.identity import validate_preparation
@@ -705,14 +721,18 @@ class BaseDataStore:
 
         Raises:
             ValueError: if `assay_name` is not found in attribute `assayNames`
+            PermissionError: if the datastore is read-only. The default assay
+                is left unchanged.
         """
         if assay_name not in self.assay_names:
             available = ", ".join(self.assay_names)
             raise ValueError(
-                f"Assay '{assay_name}' not found. Available assays: {available}"
+                f"Assay {assay_name!r} not found. Available assays: {available}"
             )
-        self._defaultAssay = assay_name
+        self._require_writable("set_default_assay")
+        # Persist first so a failed write leaves the in-memory default unchanged.
         self.zw.attrs["defaultAssay"] = assay_name
+        self._defaultAssay = assay_name
 
     def get_cell_vals(
         self,

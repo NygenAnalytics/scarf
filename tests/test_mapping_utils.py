@@ -1,5 +1,7 @@
 import numpy as np
 import pytest
+import zarr
+from zarr.storage import MemoryStore
 
 from scarf.mapping.confidence import (
     _distance_quantile_summary,
@@ -12,25 +14,53 @@ from scarf.mapping.hashing import array_hash, array_store_hash
 
 
 def test_mapping_array_hashes_match_golden_values():
+    # The length-prefixed encoding replaced separator-joined identifiers, so
+    # these values intentionally differ from the previous release.
     numeric = np.array([[1.5, -2.0], [0.0, 4.25]], dtype=np.float64)
     identifiers = np.array(["gene_a", "gene_b"], dtype="<U6")
 
     assert (
         array_hash(numeric)
-        == "ab342d324ef6a1e409055ac301654f1472817f569ab4c0df2c10464bad546a49"
+        == "cd8f2c493797778faf739739e7e7e5fd535f0d772d001c0e92099a81d9399faf"
     )
     assert (
         array_store_hash(numeric)
-        == "ab342d324ef6a1e409055ac301654f1472817f569ab4c0df2c10464bad546a49"
+        == "cd8f2c493797778faf739739e7e7e5fd535f0d772d001c0e92099a81d9399faf"
     )
     assert (
         array_hash(identifiers)
-        == "7b628da091bfd6a5c5f8c6dd644c3fefc482779799a9e51018f9f0c290215ad2"
+        == "5c78c9ed0b0ce3f452f5592d9a6be9de0456ab14aa165d5738dddc074c6316a7"
     )
     assert (
         array_store_hash(identifiers)
-        == "7b628da091bfd6a5c5f8c6dd644c3fefc482779799a9e51018f9f0c290215ad2"
+        == "5c78c9ed0b0ce3f452f5592d9a6be9de0456ab14aa165d5738dddc074c6316a7"
     )
+
+
+def test_mapping_identifier_hashes_are_unambiguous():
+    assert array_hash(["a\x1fb", "c"]) != array_hash(["a", "b\x1fc"])
+    assert array_hash(["ab", ""]) != array_hash(["a", "b"])
+    assert array_hash(["a", "b"]) != array_hash([["a", "b"]])
+
+
+def test_mapping_identifier_hashes_agree_across_string_storage():
+    identifiers = ["gene_a", "gene_bb", "g"]
+    expected = array_hash(identifiers)
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    stored = root.create_array(
+        "ids",
+        shape=(len(identifiers),),
+        dtype=np.dtypes.StringDType(),
+        chunks=(2,),
+    )
+    stored[:] = np.array(identifiers, dtype=np.dtypes.StringDType())
+    assert np.dtype(stored.dtype).kind == "T"
+
+    assert array_store_hash(stored) == expected
+    for dtype in (object, "U", "S", np.dtypes.StringDType()):
+        values = np.array(identifiers, dtype=dtype)
+        assert array_hash(values) == expected
+        assert array_store_hash(values) == expected
 
 
 def test_mapping_score_weights_stay_absolute_across_query_cells():

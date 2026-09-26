@@ -518,7 +518,7 @@ def test_auto_filter_cells_validates_provenance_before_selection_mutation(
     datastore_ephemeral,
     monkeypatch,
 ):
-    import scarf.datastore._operations.quality_control as qc_operations
+    import scarf.quality_control.filtering as qc_filtering
 
     n = datastore_ephemeral.cells.N
     datastore_ephemeral.cells.insert(
@@ -531,8 +531,7 @@ def test_auto_filter_cells_validates_provenance_before_selection_mutation(
     provenance_before = dict(selection.attrs)
 
     def malformed_provenance(**kwargs):
-        del kwargs
-        return np.ones(n, dtype=bool), {
+        return np.ones_like(kwargs["active"], dtype=bool), {
             "mad_scale": 1.4826,
             "metric_policies": {"RNA_nCounts": {"transform": object()}},
             "sample_sizes": {"A": n},
@@ -542,7 +541,7 @@ def test_auto_filter_cells_validates_provenance_before_selection_mutation(
         }
 
     monkeypatch.setattr(
-        qc_operations,
+        qc_filtering,
         "_sample_aware_mad_mask",
         malformed_provenance,
     )

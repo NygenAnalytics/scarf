@@ -34,6 +34,7 @@ from scarf.storage.layout import (
 )
 from scarf.storage.pipeline_runs import _copy_pipeline_label_claims
 from scarf.storage.profiles import StorageProfile
+from scarf.storage.schema import pending_assay_message, pending_assays
 from scarf.storage.sharding import write_counts_t, write_dense_in_shard_rows
 from scarf.storage.stores import (
     open_store,
@@ -331,6 +332,12 @@ def repack_store(
             raise ValueError("The destination overlaps the mounted count owner")
     resolved = resolve_matrix_source(src, storage_options=storage_options)
     mounted_owner = None if resolved is None else resolved[0]
+    pending = pending_assays(src)
+    if pending:
+        raise ValueError(
+            "An interrupted derived assay cannot be repacked. "
+            + pending_assay_message(*pending[0])
+        )
     assays = _count_assays(src)
     if not assays:
         raise ValueError("No logical assays found in source")

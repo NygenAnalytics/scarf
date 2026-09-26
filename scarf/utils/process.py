@@ -1,6 +1,7 @@
 import resource
 import shlex
 import subprocess
+import sys
 import threading
 import os
 from collections.abc import Callable, Iterable, Iterator
@@ -221,6 +222,51 @@ def system_call(command: str) -> None:
         if output:
             logger.debug(output.strip())
     process.poll()
+
+
+def _flush_output_streams() -> None:
+    """Flush Python and C stdio buffers before file descriptors change."""
+    for stream in (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__):
+        flush = getattr(stream, "flush", None)
+        if flush is None:
+            continue
+        try:
+            flush()
+        except (OSError, ValueError):
+            pass
+    try:
+        import ctypes
+
+        ctypes.CDLL(None).fflush(None)
+    except (AttributeError, OSError, TypeError):
+        pass
+
+
+@contextmanager
+def suppress_native_output() -> Iterator[None]:
+    """Send process-level stdout and stderr to the null device.
+
+    Native extensions write to file descriptors 1 and 2 directly, so
+    redirecting ``sys.stdout`` cannot silence them. Both descriptors are
+    duplicated on entry and restored on exit; every other open file keeps its
+    descriptor. Output written by other threads while the context is active is
+    also discarded.
+    """
+    _flush_output_streams()
+    null_fd = os.open(os.devnull, os.O_WRONLY)
+    saved: list[tuple[int, int]] = []
+    try:
+        for fd in (1, 2):
+            saved.append((fd, os.dup(fd)))
+        for fd, _copy in saved:
+            os.dup2(null_fd, fd)
+        yield
+    finally:
+        _flush_output_streams()
+        for fd, copy in saved:
+            os.dup2(copy, fd)
+            os.close(copy)
+        os.close(null_fd)
 
 
 def process_rss_mb() -> float:

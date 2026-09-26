@@ -2277,9 +2277,11 @@ def test_distribution_stats_rejects_sample_and_split_mismatches():
         )
     result.close()
 
+    # A study-design pairing column applies only to paired Wilcoxon results.
     matching_paired_stats = _synthetic_stats_result(
         store,
         table,
+        method="wilcoxon",
         sample_by="sample",
         pair_by="pair",
     )
@@ -2295,6 +2297,27 @@ def test_distribution_stats_rejects_sample_and_split_mismatches():
     try:
         assert result.provenance.extras["stats_annotated"] is True
         assert result.provenance.extras["pair_by"] == "pair"
+    finally:
+        result.close()
+
+    independent_sample_stats = _synthetic_stats_result(
+        store,
+        table,
+        method="mann_whitney",
+        sample_by="sample",
+    )
+    result = splt.distribution(
+        store,
+        "metric",
+        grouping=splt.CellField("group"),
+        study_design=splt.StudyDesign(sample_by="sample", subject_by="pair"),
+        max_points=0,
+        stats_results=independent_sample_stats,
+        show=False,
+    )
+    try:
+        assert result.provenance.extras["stats_annotated"] is True
+        assert result.provenance.extras["pair_by"] is None
     finally:
         result.close()
 

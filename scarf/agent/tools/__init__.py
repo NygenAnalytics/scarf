@@ -3,12 +3,15 @@
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+import numpy as np
+
 from ..types import ArtifactReferenceModel
 
 __all__ = [
     "artifact_reference",
     "bounded_list",
     "core_artifact_reference",
+    "label_filter_bound",
     "persisted_assay_types",
 ]
 
@@ -23,6 +26,15 @@ def bounded_list(values: Iterable[Any], *, limit: int) -> list[Any]:
         if len(output) == limit:
             break
     return output
+
+
+def label_filter_bound(value: Any) -> Any:
+    """Return a ``filter_cells`` bound that selects rows equal to ``value``.
+
+    Manual filter bounds reject booleans, so a boolean label becomes 0 or 1,
+    which selects the same rows of a boolean column.
+    """
+    return int(value) if isinstance(value, bool | np.bool_) else value
 
 
 def artifact_reference(ref: Any) -> ArtifactReferenceModel:

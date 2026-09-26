@@ -45,13 +45,13 @@ from ._data import (
 from ._deps import require_matplotlib, require_seaborn
 from ._display import resolve_categorical_scale
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
+from ..utils.arrays import sort_categories
 from ._style import (
     MAX_FIGURE_WIDTH_INCHES,
     apply_figure_chrome,
     capped_figsize,
     categorical_color_map,
     continuous_norm,
-    sort_categories,
     theme_context,
 )
 
@@ -985,8 +985,10 @@ def distribution(
     orientation, the same option shares the x-axis value scale.
 
     Set ``sample_by`` or ``study_design`` to summarize cells within biological
-    samples before plotting. ``split_by`` draws two violin halves for a second
-    categorical variable.
+    samples before plotting. A study design's ``subject_by`` or ``pair_by``
+    column is used only with paired Wilcoxon ``stats_results``, matching
+    ``run_statistical_testing``. ``split_by`` draws two violin halves for a
+    second categorical variable.
 
     Pass ``stats_results`` (a single
     :class:`~scarf.features.statistical.StatisticalTestResult`, or a mapping
@@ -1149,7 +1151,14 @@ def distribution(
         if sample_by is not None and sample_by != study_design.sample_by:
             raise ValueError("sample_by conflicts with study_design.sample_by")
         sample_by = study_design.sample_by
-        if stats_results is not None:
+        # As in run_statistical_testing, a study-design pairing column applies
+        # only to paired Wilcoxon results.
+        results = (
+            stats_results.values()
+            if isinstance(stats_results, Mapping)
+            else [stats_results]
+        )
+        if any(getattr(result, "method", None) == "wilcoxon" for result in results):
             plot_pair_by = study_design.subject_by or study_design.pair_by
     if kind in ("violin", "stacked_violin", "box"):
         sns = require_seaborn()

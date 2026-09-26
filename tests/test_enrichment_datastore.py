@@ -303,6 +303,99 @@ def test_aucell_returns_ref_ignores_weights_and_restores_threads(
     assert cached == ref
 
 
+def test_enrichment_refuses_inconsistent_counts_identity(datastore_ephemeral) -> None:
+    _cells, selection, features, _targets, net = _configure_enrichment_inputs(
+        datastore_ephemeral
+    )
+    datastore_ephemeral.RNA.z.attrs["counts_fingerprint"] = "counts-were-replaced"
+
+    with pytest.raises(ValueError, match="inconsistent dataset identity"):
+        datastore_ephemeral.run_waggr(net, selection, features=features, tmin=3)
+    with pytest.raises(ValueError, match="inconsistent dataset identity"):
+        datastore_ephemeral.run_aucell(
+            net,
+            selection,
+            features=features,
+            tmin=3,
+            n_up=4,
+        )
+    assert not datastore_ephemeral.list_artifacts(kind="enrichment_scores")
+
+
+def test_enrichment_drops_ambiguous_targets_and_records_them(
+    datastore_ephemeral,
+) -> None:
+    ds = datastore_ephemeral
+    _cells, selection, _features, targets, net = _configure_enrichment_inputs(ds)
+    names = np.asarray(ds.RNA.feats.fetch_all("names")).astype(str)
+    upper = np.char.upper(names)
+    unique_names, counts = np.unique(upper, return_counts=True)
+    duplicated = str(unique_names[counts > 1][0])
+    duplicate_index = np.flatnonzero(upper == duplicated)
+    assert len(duplicate_index) == 2
+    features = ds.set_feature_selection(
+        from_assay="RNA",
+        feature_indexes=np.unique(np.concatenate([targets, duplicate_index])),
+    )
+    ambiguous_net = pd.concat(
+        [
+            net,
+            pd.DataFrame(
+                {"source": ["Alpha"], "target": [duplicated], "weight": [3.0]}
+            ),
+        ],
+        ignore_index=True,
+    )
+
+    waggr = ds.run_waggr(ambiguous_net, selection, features=features, tmin=3)
+    aucell = ds.run_aucell(ambiguous_net, selection, features=features, tmin=3, n_up=4)
+    clean = ds.run_waggr(net, selection, features=features, tmin=3)
+
+    for ref in (waggr, aucell):
+        slot = ds.load_artifact(ref)
+        assert slot.attrs["dropped_ambiguous_targets"] == [duplicated]
+        result = ds.get_enrichment(ref)
+        np.testing.assert_array_equal(result.source_sizes, [3, 3])
+    assert ds.load_artifact(clean).attrs["dropped_ambiguous_targets"] == []
+    np.testing.assert_array_equal(
+        ds.get_enrichment(waggr).data.compute(),
+        ds.get_enrichment(clean).data.compute(),
+    )
+    for run in (ds.run_waggr, ds.run_aucell):
+        with pytest.raises(ValueError, match="multiple active assay features"):
+            run(
+                ambiguous_net,
+                selection,
+                features=features,
+                tmin=3,
+                ambiguous_targets="error",
+            )
+
+
+def test_waggr_loader_checks_the_fixed_waggr_normalization(
+    datastore_ephemeral,
+) -> None:
+    from scarf.assay import norm_lib_size
+    from scarf.storage.artifacts import callable_identity
+
+    _cells, selection, features, _targets, net = _configure_enrichment_inputs(
+        datastore_ephemeral
+    )
+    ref = datastore_ephemeral.run_waggr(net, selection, features=features, tmin=3)
+    status = datastore_ephemeral.inspect_artifact(ref)
+    assert status.parameters["normalization_method"] == callable_identity(norm_lib_size)
+    expected = datastore_ephemeral.get_enrichment(ref).data.compute()
+
+    original_norm = datastore_ephemeral.RNA.normMethod
+    datastore_ephemeral.RNA.normMethod = norm_lib_size_log
+    try:
+        loaded = datastore_ephemeral.get_enrichment(ref)
+    finally:
+        datastore_ephemeral.RNA.normMethod = original_norm
+
+    np.testing.assert_array_equal(loaded.data.compute(), expected)
+
+
 def test_enrichment_loader_is_read_only_and_validates_artifact(
     datastore_ephemeral,
 ) -> None:
@@ -328,7 +421,7 @@ def test_enrichment_loader_is_read_only_and_validates_artifact(
     )
     loaded = read_only.get_enrichment(ref, sources=["Alpha"])
     assert loaded.data.shape == (8, 1)
-    with pytest.raises(ValueError, match=r"zarr_mode='r\+'"):  # producer only
+    with pytest.raises(PermissionError, match=r"zarr_mode='r\+'"):  # producer only
         read_only.run_waggr(net, selection, features=features, tmin=3)
 
 

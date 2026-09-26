@@ -1,6 +1,7 @@
 import hashlib
+import math
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 import numpy as np
@@ -27,6 +28,52 @@ def has_duplicates(values: Any) -> bool:
         return False
     ordered = array if np.all(array[1:] > array[:-1]) else np.sort(array)
     return bool(np.any(ordered[1:] == ordered[:-1]))
+
+
+def _category_sort_key(value: Any) -> tuple[Any, ...]:
+    """Sort key: numbers in numeric order, then natural text, then missing."""
+    import pandas as pd
+
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return (2, ())
+    try:
+        if pd.isna(value):
+            return (2, ())
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(value, (bool, np.bool_)):
+        return (1, (str(bool(value)).lower(),))
+    if isinstance(value, (int, np.integer)):
+        return (0, (float(value),))
+    if isinstance(value, (float, np.floating)) and math.isfinite(float(value)):
+        return (0, (float(value),))
+
+    text = str(value)
+    try:
+        number = float(text)
+    except ValueError:
+        number = math.nan
+    # A "nan" label is text: a NaN key would make the order depend on input.
+    if not math.isnan(number):
+        return (0, (number,))
+
+    tokens = tuple(
+        int(part) if part.isdigit() else part.casefold()
+        for part in re.split(r"(\d+)", text)
+        if part != ""
+    )
+    return (1, tokens)
+
+
+def sort_categories(values: Iterable[Any]) -> list[Any]:
+    """Order categories naturally, as plots and marker tables show them.
+
+    Numbers and numeric labels come first by value, so ``"2"`` precedes
+    ``"10"``. Other labels follow in natural text order (``"A2"`` before
+    ``"A10"``), and missing values come last.
+    """
+    return sorted(values, key=_category_sort_key)
 
 
 def checked_sparse_cast(values: np.ndarray, dtype: Any) -> np.ndarray:

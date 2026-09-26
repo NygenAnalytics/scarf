@@ -36,6 +36,7 @@ from ...storage.refs import ArtifactRef
 from ...storage.selections import read_stored_selection_indices
 from ...storage.types import as_zarr_array
 from ...utils.logging import logger
+from ..tools import label_filter_bound
 from .contracts import ArtifactRecord, ParameterCandidateEvaluation
 from .execution import (
     _cached_candidate_metric,
@@ -1232,16 +1233,16 @@ def _select_capture_cells(
 ) -> tuple[ArtifactRef, int]:
     if active_indices.shape != active_values.shape:
         raise ValueError("Capture values must align with the selected cells")
-    labels = active_values.astype(str)
-    selected = labels == str(value)
+    selected = ~pd.isna(active_values) & (active_values.astype(str) == str(value))
     expected = np.zeros(store.cells.N, dtype=bool)
     expected[active_indices] = selected
+    bound = label_filter_bound(value)
     reference = diagnostic_call(
         "core.captureSelection",
         store.filter_cells,
         [column],
-        [value],
-        [value],
+        [bound],
+        [bound],
         cell_selection=parent,
         keep_bounds=True,
         invalidate_cache=False,
@@ -1369,7 +1370,37 @@ def score_advisory_doublets(
         )
     limitations: list[str] = []
     selection_indices = _SelectionIndices(store)
-    if capture_column is None or capture_column not in store.cells.columns:
+    capture_groups: list[str] = []
+    if capture_column is not None and capture_column in store.cells.columns:
+        active_indices = selection_indices(parent_selection)
+        capture_values = _aligned_metadata(
+            store,
+            active_indices,
+            capture_column,
+            aligned_with="the parent selection",
+            mark_missing=True,
+        )
+        # Cells without a recorded capture label never form a capture group.
+        recorded_captures = capture_values[~pd.isna(capture_values)]
+        unique_capture_labels, first_capture_indices = np.unique(
+            recorded_captures.astype(str),
+            return_index=True,
+        )
+        capture_groups = unique_capture_labels.tolist()
+        raw_capture_values = {
+            str(label): recorded_captures[int(index)]
+            for label, index in zip(
+                unique_capture_labels,
+                first_capture_indices,
+                strict=True,
+            )
+        }
+        if len(capture_groups) > _MAX_DOUBLET_CAPTURES:
+            raise ValueError(
+                "Physical capture column exceeds the advisory doublet limit of "
+                f"{_MAX_DOUBLET_CAPTURES} values"
+            )
+    if len(capture_groups) <= 1:
         score = diagnostic_call(
             "core.doubletDetection",
             store.run_doublet_detection,
@@ -1378,10 +1409,11 @@ def score_advisory_doublets(
             from_assay=assay,
             invalidate_cache=False,
         )
-        limitations.append(
-            "Physical capture identity was unavailable, so advisory doublet "
-            "scores were computed across the selected dataset."
-        )
+        if not capture_groups:
+            limitations.append(
+                "Physical capture identity was unavailable, so advisory doublet "
+                "scores were computed across the selected dataset."
+            )
         return _build_advisory_doublet_scores(
             store,
             scores=(score,),
@@ -1389,59 +1421,13 @@ def score_advisory_doublets(
             native_graph=native_graph,
             native_clusters=native_clusters,
             parent_selection=parent_selection,
-            capture_values=("allSelectedCells",),
-            capture_column=None,
+            capture_values=tuple(capture_groups) or ("allSelectedCells",),
+            capture_column=capture_column if capture_groups else None,
             limitations=limitations,
             selection_indices=selection_indices,
         )
 
-    active_indices = selection_indices(parent_selection)
-    capture_values = read_metadata_rows_chunkwise(
-        store.cells,
-        capture_column,
-        active_indices,
-    )
-    capture_labels = capture_values.astype(str)
-    unique_capture_labels, first_capture_indices = np.unique(
-        capture_labels,
-        return_index=True,
-    )
-    capture_groups = unique_capture_labels.tolist()
-    raw_capture_values = {
-        str(label): capture_values[int(index)]
-        for label, index in zip(
-            unique_capture_labels,
-            first_capture_indices,
-            strict=True,
-        )
-    }
-    if len(capture_groups) > _MAX_DOUBLET_CAPTURES:
-        raise ValueError(
-            "Physical capture column exceeds the advisory doublet limit of "
-            f"{_MAX_DOUBLET_CAPTURES} values"
-        )
-    if len(capture_groups) == 1:
-        score = diagnostic_call(
-            "core.doubletDetection",
-            store.run_doublet_detection,
-            native_clusters,
-            native_graph,
-            from_assay=assay,
-            invalidate_cache=False,
-        )
-        return _build_advisory_doublet_scores(
-            store,
-            scores=(score,),
-            cell_selections=(parent_selection,),
-            native_graph=native_graph,
-            native_clusters=native_clusters,
-            parent_selection=parent_selection,
-            capture_values=(capture_groups[0],),
-            capture_column=capture_column,
-            limitations=limitations,
-            selection_indices=selection_indices,
-        )
-
+    assert capture_column is not None
     n_features = len(read_feature_selection_indices(store.zw, assay, feature_selection))
     scores: list[ArtifactRef] = []
     selections: list[ArtifactRef] = []

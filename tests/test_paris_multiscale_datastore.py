@@ -25,6 +25,7 @@ from scarf.storage.artifacts import (
     make_provenance,
     new_artifact_id,
 )
+from scarf.storage.errors import ArtifactResolutionError
 from scarf.storage.selections import resolve_generated_selection_artifact
 from scarf.storage.budget import ResourceBudget
 
@@ -272,6 +273,60 @@ def _disconnected_graph() -> csr_matrix:
         ),
         shape=(8, 8),
     )
+
+
+def _three_component_graph() -> csr_matrix:
+    edges = []
+    # Distinct weights per component keep every merge height unique.
+    for offset, scale in ((0, 1.0), (4, 1.7), (8, 2.9)):
+        edges.extend(
+            (
+                (offset, offset + 1, 9.0 * scale),
+                (offset + 1, offset + 2, 4.0 * scale),
+                (offset + 2, offset + 3, 1.0 / scale),
+            )
+        )
+    return csr_matrix(
+        (
+            [weight for _left, _right, weight in edges],
+            (
+                [left for left, _right, _weight in edges],
+                [right for _left, right, _weight in edges],
+            ),
+        ),
+        shape=(12, 12),
+    )
+
+
+def _equal_weight_ring() -> csr_matrix:
+    ring = np.zeros((4, 4), dtype=np.float64)
+    for node in range(4):
+        ring[node, (node + 1) % 4] = 1.0
+        ring[(node + 1) % 4, node] = 1.0
+    return csr_matrix(ring)
+
+
+def _artifacts(store: _Store, kind: str, scope: str = "assay") -> list[ArtifactRef]:
+    return list_artifacts(
+        store.zw,
+        scope=scope,
+        assay="RNA" if scope == "assay" else None,
+        kind=kind,
+    )
+
+
+def _count_hierarchy_loads(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    import scarf.datastore._operations.paris_persistence as persistence
+
+    calls = {"hierarchy": 0}
+    original = persistence.load_hierarchy_group
+
+    def counted(*args: object, **kwargs: object):
+        calls["hierarchy"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(persistence, "load_hierarchy_group", counted)
+    return calls
 
 
 def _load_artifact_hierarchy(
@@ -610,14 +665,17 @@ def test_cached_hierarchy_adaptive_preflight_fails_before_graph_load() -> None:
     assert f"{store.graph_loc}/adaptive_clustering/guarded" not in store.zw
 
 
-def test_cached_fixed_and_adaptive_cuts_preflight_hierarchy_loading() -> None:
+def test_cached_fixed_and_adaptive_cuts_preflight_hierarchy_loading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store = _Store(_block_graph())
-    _run_paris(store, n_clusters=2)
-    _run_paris(
+    fixed = _run_paris(store, n_clusters=2)
+    adaptive = _run_paris(
         store,
         n_clusters="auto",
         min_cluster_size=2,
     )
+    calls = _count_hierarchy_loads(monkeypatch)
     writes_before = store.cells.writes.copy()
     loads_before = store.load_graph_calls
 
@@ -628,9 +686,19 @@ def test_cached_fixed_and_adaptive_cuts_preflight_hierarchy_loading() -> None:
         _run_paris(
             store,
             n_clusters="auto",
-            min_cluster_size=2,
+            min_cluster_size=3,
         )
+    # Cached cuts are reused without loading their hierarchy, so they need no
+    # hierarchy preflight.
+    assert _run_paris(store, n_clusters=2).ref == fixed.ref
+    reused = _run_paris(
+        store,
+        n_clusters="auto",
+        min_cluster_size=2,
+    )
 
+    assert reused.ref == adaptive.ref
+    assert calls["hierarchy"] == 0
     assert store.cells.writes == writes_before
     assert store.load_graph_calls == loads_before
 
@@ -887,3 +955,345 @@ def test_run_paris_clustering_accepts_numpy_integer_cut_parameters() -> None:
 
     assert fixed.n_clusters == 2
     assert adaptive.labels.shape == (14,)
+
+
+def test_unreadable_reused_hierarchy_fails_closed() -> None:
+    store = _Store(_block_graph())
+    first = _run_paris(store, min_cluster_size=2)
+    assert first.hierarchy_artifact_id is not None
+    hierarchy_ref = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="cluster_hierarchy",
+        artifact_id=first.hierarchy_artifact_id,
+    )
+    hierarchy_group = store.zw[artifact_path(hierarchy_ref)]
+    # The array is present, so planning reuses it, but it cannot be loaded.
+    hierarchy_group.create_array(
+        "children",
+        data=np.zeros((3, 2), dtype=np.int64),
+        overwrite=True,
+    )
+    hierarchies_before = _artifacts(store, "cluster_hierarchy")
+    cuts_before = _artifacts(store, "cluster_cut")
+
+    with pytest.raises(ArtifactResolutionError, match="invalidate_cache=True") as err:
+        _run_paris(store, min_cluster_size=3)
+
+    assert err.value.code == "corrupt_payload"
+    assert err.value.context == {"artifact_id": hierarchy_ref.artifact_id}
+    assert _artifacts(store, "cluster_hierarchy") == hierarchies_before
+    assert _artifacts(store, "cluster_cut") == cuts_before
+    assert store.load_graph_calls == 1
+
+    repaired = _run_paris(store, min_cluster_size=3, invalidate_cache=True)
+    assert repaired.hierarchy_artifact_id != hierarchy_ref.artifact_id
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["missing_plateau_array", "missing_leaf_count", "wrong_leaf_count"],
+)
+def test_structurally_incomplete_hierarchy_is_refitted(damage: str) -> None:
+    store = _Store(_block_graph())
+    first = _run_paris(store, min_cluster_size=2)
+    assert first.hierarchy_artifact_id is not None
+    hierarchy_ref = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="cluster_hierarchy",
+        artifact_id=first.hierarchy_artifact_id,
+    )
+    hierarchy_group = store.zw[artifact_path(hierarchy_ref)]
+    if damage == "missing_plateau_array":
+        del hierarchy_group["plateau/child_refs"]
+    elif damage == "missing_leaf_count":
+        del hierarchy_group.attrs["n_leaves"]
+    else:
+        hierarchy_group.attrs["n_leaves"] = 13
+
+    second = _run_paris(store, min_cluster_size=2)
+
+    assert second.hierarchy_artifact_id != first.hierarchy_artifact_id
+    assert second.ref != first.ref
+    assert np.array_equal(second.labels, first.labels)
+    assert store.load_graph_calls == 2
+
+
+def test_cut_with_unknown_diagnostic_fields_fails_closed() -> None:
+    store = _Store(_block_graph())
+    first = _run_paris(store, min_cluster_size=2)
+    assert first.ref is not None
+    assert first.diagnostics
+    cut_group = store.zw[artifact_path(first.ref)]
+    diagnostics = list(cut_group.attrs["diagnostics"])
+    diagnostics[0] = {**diagnostics[0], "retired_field": 1.0}
+    cut_group.attrs["diagnostics"] = diagnostics
+
+    with pytest.raises(ArtifactResolutionError, match="invalidate_cache=True") as err:
+        store.load_paris_clustering(first.ref)
+    assert err.value.code == "corrupt_payload"
+
+    second = _run_paris(store, min_cluster_size=2)
+
+    assert second.ref != first.ref
+    assert second.hierarchy_artifact_id == first.hierarchy_artifact_id
+    assert np.array_equal(second.labels, first.labels)
+    assert second.diagnostics == first.diagnostics
+
+
+def test_fixed_cut_rejects_counts_below_component_count() -> None:
+    store = _Store(_three_component_graph())
+
+    with pytest.raises(ValueError, match="3 connected components"):
+        _run_paris(store, n_clusters=2)
+    assert _artifacts(store, "cluster_cut") == []
+
+    single = _run_paris(store, n_clusters=1)
+    per_component = _run_paris(store, n_clusters=3)
+    finer = _run_paris(store, n_clusters=5)
+
+    assert single.n_clusters == 1
+    assert np.unique(single.labels).size == 1
+    assert per_component.n_clusters == 3
+    assert [
+        np.unique(per_component.labels[start : start + 4]).size for start in (0, 4, 8)
+    ] == [1, 1, 1]
+    assert np.unique(per_component.labels).size == 3
+    assert finer.n_clusters == np.unique(finer.labels).size == 5
+
+
+def test_fixed_cut_merges_tied_heights_to_the_requested_count() -> None:
+    store = _Store(_equal_weight_ring())
+
+    for n_clusters in (2, 3):
+        result = _run_paris(store, n_clusters=n_clusters)
+        assert result.n_clusters == n_clusters
+        assert np.unique(result.labels).size == n_clusters
+
+
+@pytest.mark.parametrize("recorded_count", [3, 0, True, "2"])
+def test_fixed_cut_recording_another_count_is_not_reused(recorded_count) -> None:
+    store = _Store(_block_graph())
+    first = _run_paris(store, n_clusters=2)
+    assert first.ref is not None
+    store.zw[artifact_path(first.ref)].attrs["n_clusters"] = recorded_count
+
+    second = _run_paris(store, n_clusters=2)
+
+    assert second.ref != first.ref
+    assert second.n_clusters == 2
+    assert second.hierarchy_artifact_id == first.hierarchy_artifact_id
+    np.testing.assert_array_equal(second.labels, first.labels)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "diagnostics"),
+    [({"n_clusters": 2}, [{}]), ({"min_cluster_size": 2}, {})],
+)
+def test_invalid_cut_diagnostics_are_recomputed(arguments, diagnostics):
+    store = _Store(_block_graph())
+    first = _run_paris(store, **arguments)
+    store.zw[artifact_path(first.ref)].attrs["diagnostics"] = diagnostics
+
+    with pytest.raises(ArtifactResolutionError, match="invalidate_cache=True"):
+        store.load_paris_clustering(first.ref)
+
+    second = _run_paris(store, **arguments)
+
+    assert second.ref != first.ref
+    assert second.hierarchy_artifact_id == first.hierarchy_artifact_id
+    np.testing.assert_array_equal(second.labels, first.labels)
+    assert second.diagnostics == first.diagnostics
+
+
+def _install_topacedo(
+    monkeypatch: pytest.MonkeyPatch,
+    constructed: list[int],
+) -> None:
+    class Sampler:
+        def __init__(
+            self,
+            _graph: csr_matrix,
+            clusters: np.ndarray,
+            _dendrogram: np.ndarray,
+            *_args: object,
+        ) -> None:
+            constructed.append(len(clusters))
+            self.densities = np.ones(len(clusters))
+            self.meanSnn = np.ones(len(clusters))
+            self.seeds = np.asarray([0], dtype=np.int64)
+
+        @staticmethod
+        def run() -> tuple[np.ndarray, list[tuple[int, int]]]:
+            return np.asarray([0, 1], dtype=np.int64), [(0, 1)]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "topacedo",
+        SimpleNamespace(TopacedoSampler=Sampler),
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid", "message"),
+    [
+        ("nodes", [0.5], "non-integer sampled-cell indices"),
+        ("nodes", [[0, 1]], "invalid sampled-cell indices"),
+        ("nodes", [14], "invalid sampled-cell indices"),
+        ("densities", [1.0], "invalid cell-density values"),
+        ("meanSnn", [1.0], "invalid mean-SNN values"),
+        ("seeds", [0.5], "non-integer seed-cell indices"),
+        ("seeds", [-1], "invalid seed-cell indices"),
+        ("seeds", [[0]], "invalid seed-cell indices"),
+        ("edges", [[0.0, 1.0]], "non-integer edge pairs"),
+        ("edges", [0, 1], "invalid edge pairs"),
+        ("edges", [[0, 14]], "out-of-range edge endpoints"),
+    ],
+)
+def test_invalid_topacedo_output_is_not_persisted(monkeypatch, field, invalid, message):
+    store = _Store(_block_graph())
+    clusters = _run_paris(store, min_cluster_size=2).ref
+    assert clusters is not None
+    _install_topacedo(monkeypatch, [])
+    sampler_class = sys.modules["topacedo"].TopacedoSampler
+
+    def invalid_result(self):
+        nodes = np.array([0, 1], dtype=np.int64)
+        edges = np.array([[0, 1]], dtype=np.int64)
+        if field == "nodes":
+            nodes = np.asarray(invalid)
+        elif field == "edges":
+            edges = np.asarray(invalid)
+        else:
+            setattr(self, field, np.asarray(invalid))
+        return nodes, edges
+
+    monkeypatch.setattr(sampler_class, "run", invalid_result)
+
+    with pytest.raises(ValueError, match=message):
+        _run_topacedo(store, clusters)
+
+    assert _artifacts(store, "sampling") == []
+    assert store.cells.writes == []
+    np.testing.assert_array_equal(
+        store.load_paris_clustering(clusters).labels,
+        _run_paris(store, min_cluster_size=2).labels,
+    )
+
+
+def test_topacedo_missing_dependency_does_not_publish_artifacts(monkeypatch):
+    store = _Store(_block_graph())
+    clusters = _run_paris(store, min_cluster_size=2).ref
+    assert clusters is not None
+    graph_loads = store.load_graph_calls
+    monkeypatch.setitem(sys.modules, "topacedo", None)
+
+    with pytest.raises(ImportError, match="Could not find topacedo"):
+        _run_topacedo(store, clusters)
+
+    assert _artifacts(store, "sampling") == []
+    assert _artifacts(store, "dendrogram") == []
+    assert store.load_graph_calls == graph_loads
+
+
+def test_topacedo_rejects_an_incomplete_hierarchy(monkeypatch):
+    store = _Store(_block_graph())
+    result = _run_paris(store, min_cluster_size=2)
+    assert result.ref is not None
+    hierarchy = _artifacts(store, "cluster_hierarchy")[0]
+    store.zw[artifact_path(hierarchy)].attrs["complete"] = False
+    constructed = []
+    _install_topacedo(monkeypatch, constructed)
+
+    with pytest.raises(ArtifactResolutionError, match="complete Paris hierarchy"):
+        _run_topacedo(store, result.ref)
+
+    assert constructed == []
+    assert _artifacts(store, "sampling") == []
+    assert _artifacts(store, "dendrogram") == []
+
+
+def test_cached_topacedo_does_not_load_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _Store(_block_graph())
+    clusters = _run_paris(store, min_cluster_size=2).ref
+    assert clusters is not None
+    constructed: list[int] = []
+    _install_topacedo(monkeypatch, constructed)
+    calls = _count_hierarchy_loads(monkeypatch)
+    first = _run_topacedo(store, clusters)
+    graph_loads = store.load_graph_calls
+    hierarchy_loads = calls["hierarchy"]
+
+    second = _run_topacedo(store, clusters)
+
+    assert second == first
+    assert constructed == [14]
+    assert store.load_graph_calls == graph_loads
+    assert calls["hierarchy"] == hierarchy_loads
+
+
+@pytest.mark.parametrize(
+    ("use_k", "error_type"),
+    [
+        (0, ValueError),
+        (1, ValueError),
+        (-3, ValueError),
+        (4, ValueError),
+        (True, TypeError),
+        (2.0, TypeError),
+    ],
+)
+def test_topacedo_rejects_out_of_range_use_k_before_writing(
+    monkeypatch: pytest.MonkeyPatch,
+    use_k: object,
+    error_type: type[Exception],
+) -> None:
+    store = _Store(_block_graph())
+    clusters = _run_paris(store, min_cluster_size=2).ref
+    assert clusters is not None
+    constructed: list[int] = []
+    _install_topacedo(monkeypatch, constructed)
+    graph_loads = store.load_graph_calls
+
+    with pytest.raises(error_type, match="use_k"):
+        _run_topacedo(store, clusters, use_k=use_k)
+
+    assert constructed == []
+    assert store.load_graph_calls == graph_loads
+    assert _artifacts(store, "dendrogram") == []
+    assert _artifacts(store, "sampling") == []
+
+
+def test_topacedo_use_k_equal_to_k_shares_the_default_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _Store(_block_graph())
+    clusters = _run_paris(store, min_cluster_size=2).ref
+    assert clusters is not None
+    _install_topacedo(monkeypatch, [])
+    k = store._get_graph_ncells_k(store.graph_loc)[1]
+    default = _run_topacedo(store, clusters)
+
+    assert default.kind == "sampling"
+    assert _run_topacedo(store, clusters, use_k=k) == default
+    assert _run_topacedo(store, clusters, use_k=np.int64(k)) == default
+
+
+@pytest.mark.parametrize("method", ["run_paris_clustering", "run_leiden_clustering"])
+def test_clustering_rejects_non_graph_references(method: str) -> None:
+    store = _Store(_block_graph())
+    neighbors = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="neighbors",
+        artifact_id=new_artifact_id(),
+    )
+
+    with pytest.raises(ValueError, match="connectivity_map or integrated_graph"):
+        getattr(store, method)(neighbors)
+
+    assert _artifacts(store, "cluster_hierarchy") == []
+    assert store.load_graph_calls == 0

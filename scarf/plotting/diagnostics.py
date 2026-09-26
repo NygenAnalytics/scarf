@@ -8,7 +8,8 @@ import pandas as pd
 from ._contracts import CategoricalScale, PlotProvenance
 from ._deps import require_kneed, require_matplotlib, require_seaborn
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
-from ._style import apply_figure_chrome, sort_categories, theme_context
+from ..utils.arrays import sort_categories
+from ._style import apply_figure_chrome, theme_context
 
 
 def _clean_axis(ax: Any, *, tick_size: float = 10.0) -> None:

@@ -171,7 +171,7 @@ def _write_projection(
         correction_method="none",
         cell_selection=cell_selection,
         feature_selection=feature_selection,
-        selected_expression_fingerprint="e" * 64,
+        query_dataset_fingerprint=query._ensure_dataset_fingerprint("RNA"),
         query_batch_fingerprint=NO_QUERY_BATCH_FINGERPRINT,
         query_batch_count=1,
         mapping_reference=reference.external_ref,
@@ -194,7 +194,7 @@ def _write_projection(
             "featureCoverage": float(feature_coverage),
             "queryBatchCount": 1,
             "algorithmVariant": "scaled_pca",
-            "zeroNormCellCount": int(np.count_nonzero(uninformative_values)),
+            "uninformativeCellCount": int(np.count_nonzero(uninformative_values)),
             "queryScaledDispersion": 1.0,
         }
     )
@@ -431,6 +431,62 @@ def test_mapping_scores_keep_missing_target_groups_distinct(
     np.testing.assert_allclose(scores[1][1][:3], [0.5, 0.0, 0.5])
     np.testing.assert_array_equal(scores[0][1][3:], 0.0)
     np.testing.assert_array_equal(scores[1][1][3:], 0.0)
+
+
+@pytest.mark.parametrize("weighted", [True, False])
+def test_mapping_score_data_reads_projection_once(
+    mapping_consumer_context,
+    monkeypatch,
+    weighted,
+):
+    _, reference, query = mapping_consumer_context
+    indices = np.array([[0, 1], [2, 3], [1, 2], [3, 0], [0, 2], [1, 3], [2, 1]])
+    distances = np.arange(1, 15, dtype=np.float64).reshape(7, 2)
+    uninformative = np.array([False, False, True, False, False, False, False])
+    result = _write_projection(
+        query,
+        reference,
+        indices=indices,
+        distances=distances,
+        uninformative=uninformative,
+    )
+    # None and NaN are one missing group in both the generator and the table.
+    groups = np.array(["b", "a", "a", np.nan, "c", "b", None], dtype=object)
+    options = {
+        "target_groups": groups,
+        "log_transform": True,
+        "multiplier": 10.0,
+        "weighted": weighted,
+        "fixed_weight": 0.3,
+    }
+    expected = list(query.get_mapping_score(result, reference=reference, **options))
+    reads: list[tuple[str, object]] = []
+    _record_projection_reads(monkeypatch, reads)
+
+    loaded, scores, classes, coordinates = query._mapping_score_data(
+        result,
+        reference=reference,
+        **options,
+    )
+
+    assert loaded.ref == result
+    assert classes is None and coordinates is None
+    assert [str(group) for group, _ in scores] == ["b", "a", "nan", "c"]
+    for (group, values), (expected_group, expected_values) in zip(
+        scores, expected, strict=True
+    ):
+        assert str(group) == str(expected_group)
+        np.testing.assert_array_equal(values, expected_values)
+    rows_read = Counter()
+    for name, key in reads:
+        assert isinstance(key, slice)
+        rows_read[name] += key.stop - key.start
+    # Loading validates each payload array once, then one pass scores all four
+    # groups. Unweighted scores never read distances.
+    n_cells = len(indices)
+    assert rows_read["indices"] == 2 * n_cells
+    assert rows_read["uninformative"] == 2 * n_cells
+    assert rows_read["distances"] == (2 if weighted else 1) * n_cells
 
 
 def test_labels_and_evidence_abstain_without_fabricating_metrics(
