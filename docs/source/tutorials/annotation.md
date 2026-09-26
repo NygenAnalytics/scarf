@@ -146,13 +146,17 @@ ds.plots.marker_heatmap(
 
 Look for coherent programs rather than a single gene by comparing against the literature or existing databases (resources can be found at the end of this document). By using multiple markers, we can also begin to bridge towards not only identifying the identity of a cluster, but the state it may be in.
 
-In the heatmap, we can see that Cluster 1 displays a clear triplet of CD14, VCAN, and S100A12, which confirms our CD14-monocyte signature, while Cluster 2 expresses a distinct CTSL and TCF7L2 program with only residual CD14, indicating the prescense of a second monocyte state.
+In the heatmap, we can see that Cluster 1 displays a clear triplet of CD14, VCAN, and S100A12, which confirms our CD14-monocyte signature, while Cluster 2 expresses a distinct CTSL and TCF7L2 program with only residual CD14, indicating the prescense of a second monocyte state (potentially non-classical monocytes). 
 
- Cluster 3 shows an FCER2, IGHD, and TNFRSF13B trio, which is a classic naive B-cell program. Looking at cytotoxicity, we can see the signal split across clusters 6 and 7: Cluster 6 is topped by KLRF1, FGFBP2, and ADGRG1, whereas Cluster 7 is led by TRGC2, GZMK, KLRG1, and CD8B, meaning the decision between an NK cell and a cytotoxic T-cell identity rests on which specific exclusive markers lead each column. The large Cluster 4 is dominated by ADTRP, ANKRD55, and FHIT, a program it partly shares with Cluster 5 (LMNA and TNFRSF4); while these gene names may seem less familiar than canonical markers, their exclusivity to the T-cell block helps rule out alternative B-cell, monocyte, or NK identities. Lastly, clusters with less expected marker combinations—such as Cluster 9's TCL1A and FCER2 signal, or Cluster 8's NELL2-led program—highlight the exact places where we must combine our canonical UMAP panels with external database lookups to arbitrate cell identities before finalizing our label mapping
+Cluster 3 shows an FCER2, IGHD, and TNFRSF13B trio, which is a classic naive B-cell program. Looking at cytotoxicity linked genes, we can see the signal split across clusters 6 and 7: Cluster 6 is topped by KLRF1, FGFBP2, and ADGRG1, whereas Cluster 7 is led by TRGC2, GZMK, KLRG1, and CD8B, meaning the decision between an NK cell and a cytotoxic T-cell identity rests on which exclusive markers in the markers table, or through the use of negative controls.
+
+The (large) Cluster 4 is dominated by ADTRP, ANKRD55, and FHIT, a program it partly shares with Cluster 5 (LMNA and TNFRSF4); while these gene names may seem less familiar than canonical markers, their exclusivity to the T-cell annotation helps rule out alternative B-cell, monocyte, or NK identities. 
+
+Lastly, clusters with unique marker combinations, like Cluster 9's TCL1A and FCER2 signals, or Cluster 8's NELL2-dominated program, provide a key example where we our existing UMAPS can help in visualizing the spatial orientation of the expression of these genes.
 
 ## Validate annotations against negative controls
 
-Going a step further, as you would in a real study, negative controls validate annotations by adding a layer of cell-type exclusivity: confirming that a cluster not only turns on the right genes, but also properly silences the genes belonging to competing or mutually execlusive lineages.
+Going a step further, as you would in a real study, negative controls validate annotations by adding a layer of cell-type exclusivity: confirming that a cluster not only turns on the right genes, but also properly silences the genes belonging to competing or mutually execlusive lineages. In the several markers section above, we hint at the idea of negative markers as a way to differeniate between different cell states, and even see it in use for cluster 4, in how we validate that cluster 4 & 5 are likely T cells vs. B-cells, monocytes, or even NK cells. 
 
 **Negative controls can be verified by simply searching for them in our marker tables and analyzing their metrics:**
 
@@ -160,6 +164,11 @@ Going a step further, as you would in a real study, negative controls validate a
 - `score` for low exclusivity; a `score` near 0 means almost none of the gene's expression rank exists in the cluster you are studying
 
 For our examples, the negative controls we use are... []**FILL THIS IN!]**
+
+
+ **Cluster 6 is topped by KLRF1, FGFBP2, and ADGRG1, whereas Cluster 7 is led by TRGC2, GZMK, KLRG1, and CD8B, meaning the decision between an NK cell and a cytotoxic T-cell identity rests on which specific exclusive markers lead each column, or through the use of negative controls**
+
+USE THE NEGATIVE CONTROLS AS AN EXAMPLE FOR THIS AS IT WORKS SUPER NICELY SUPER SUPER NICELY
 
 ## Write the reviewed mapping
 
