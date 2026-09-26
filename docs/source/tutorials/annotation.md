@@ -99,7 +99,7 @@ ds.plots.embedding(
 
 Here, we can see the UMAP of our select marker genes for our predicted cell types alongside the clusters they may be present inside off.
 
-CD3D lights up clusters that may our candidate T-cells. MS4A1 marks a separate block of potential B-cells, CD14 marks the monocyte likely block, and NKG7 marks the NK-like block. Newer literature indicates there may be a circulating subset of plasmacytoid dendritic cells (pDCs), which light up here for IL3RA.
+CD3D lights up clusters that may our candidate T-cells. MS4A1 marks a separate block of potential B-cells, CD14 marks the monocyte likely block, and NKG7 marks the NK-like block. Newer literature indicates there may be a circulating subset of plasmacytoid dendritic cells (pDCs), which light up here for IL3RA. FCGR3A is also used to identify specific type of monocytes, thus why we include it.
 
 To confirm the visual readings on the UMAP, we can now utilize the marker table
 
@@ -119,7 +119,7 @@ Clusters with these localized gene expression take an initial name for now as de
 ```{code-cell}
 proposed_labels = {
     "1": "CD14 monocytes",
-    "2": "GFCGR3A monocytes", # der
+    "2": "FCGR3A monocytes",
     "3": "B cells",
     "4": "T cells",
     "5": "NK cells",
@@ -241,6 +241,9 @@ pd.Series(cell_type[analysis_cells]).value_counts()
 With all our updated annotations, we can now visualize them to see the difference between our initial cell types versus our final.
 
 ```{code-cell}
+initial_cell_type = np.full(len(analysis_cells), "Not analyzed", dtype=object)
+initial_cell_type[analysis_cells] = [proposed_labels[str(value)] for value in cluster_values]
+ds.cells.insert("proposed_cell_type", initial_cell_type, overwrite=True)
 ds.plots.embedding(
     layout=run["umap"],
     color_by="proposed_cell_type",
@@ -254,12 +257,10 @@ ds.plots.embedding(
 )
 ```
 
-
 ## Important caveats to consider regarding annotation
 
-# Alternative annotation steps / depth [create title]
+# Annotation Resources
 
-ehh maybe required maybe not
 
 [Placeholder]: [Placeholder]
 [Placeholder]: [Placeholder]
