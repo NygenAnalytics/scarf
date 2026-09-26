@@ -293,6 +293,56 @@ def test_derived_assay_transaction_publishes_only_finalized_counts():
     assert "SCORES" in root
 
 
+def test_empty_derived_assay_transaction_leaves_no_assay():
+    root = _memory_root()
+
+    with pytest.raises(RuntimeError, match="no counts to publish"):
+        with derived_assay_transaction(
+            root, "SCORES", None, operation="add_grouped_assay"
+        ):
+            pass
+
+    assert "SCORES" not in root
+    assert pending_assays(root) == []
+
+
+def test_derived_assay_cannot_create_counts_twice():
+    root = _memory_root()
+
+    with pytest.raises(RuntimeError, match="already created"):
+        with derived_assay_transaction(
+            root, "SCORES", None, operation="add_grouped_assay"
+        ) as transaction:
+            transaction.create_counts(3, ["f0"], ["f0"])
+            transaction.create_counts(3, ["f1"], ["f1"])
+
+    assert "SCORES" not in root
+    assert pending_assays(root) == []
+
+
+def test_failed_rollback_keeps_pending_assay_recoverable(monkeypatch):
+    from scarf.storage import schema
+
+    root = _memory_root()
+
+    def denied_cleanup(*_args, **_kwargs):
+        raise PermissionError("storage temporarily unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(schema, "discard_pending_assay", denied_cleanup)
+        with pytest.raises(RuntimeError, match="count write failed"):
+            with derived_assay_transaction(
+                root, "SCORES", None, operation="add_grouped_assay"
+            ) as transaction:
+                transaction.create_counts(3, ["f0"], ["f0"])
+                raise RuntimeError("count write failed")
+
+    assert pending_assays(root) == [("SCORES", None, "add_grouped_assay")]
+    assert root["SCORES"].attrs.get("is_assay") is not True
+    assert discard_pending_assay(root, "SCORES", None)
+    assert "SCORES" not in root
+
+
 def test_pending_assay_names_its_discard_path():
     root = _memory_root()
     context = derived_assay_transaction(root, "SCORES", None, operation="op")
@@ -364,6 +414,29 @@ def _tfidf_group_means(counts: np.ndarray, groups: list[np.ndarray]) -> np.ndarr
     idf = np.log2(1 + counts.shape[0] / (np.count_nonzero(counts, axis=0) + 1))
     normalized = counts / totals[:, None] * idf
     return np.column_stack([normalized[:, group].mean(axis=1) for group in groups])
+
+
+@pytest.mark.parametrize("block_rows", [1, 7])
+def test_rna_grouped_means_honor_a_different_normalizer(
+    tmp_path, monkeypatch, block_rows
+):
+    from scarf.assay.normalization import norm_clr
+
+    counts = _counts(n_features=6)
+    store = _write_store(tmp_path / "rna.zarr", counts)
+    monkeypatch.setattr(store.RNA, "normMethod", norm_clr)
+    cells = np.arange(1, store.cells.N, 2)
+    groups = [np.array([0, 3, 5]), np.array([1, 2, 4])]
+    selected = counts[cells].astype(np.float64)
+    geometric_means = np.exp(np.log1p(selected).mean(axis=0))
+    normalized = np.log1p(selected / geometric_means)
+    expected = np.column_stack([normalized[:, group].mean(axis=1) for group in groups])
+
+    actual = np.vstack(
+        list(store.RNA._iter_feature_group_means(cells, groups, block_rows=block_rows))
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-14, atol=1e-14)
 
 
 def test_atac_grouped_means_fit_idf_once_and_ignore_band_size(tmp_path):

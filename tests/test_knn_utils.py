@@ -196,6 +196,37 @@ def test_bounded_diffusion_operator_matches_public_operator_and_checks_budget():
         bounded_diffusion_operator(graph, 0, memory_bytes=1024**3)
 
 
+def test_bounded_diffusion_uses_exact_count_when_upper_bound_exceeds_budget():
+    from scarf.neighbors.diffusion import bounded_diffusion_operator
+
+    graph = csr_matrix(
+        [
+            [0.0, 1.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    # Repeated paths give an upper bound of twelve entries but only six
+    # distinct outputs. The exact product and working arrays need 340 bytes.
+    actual = bounded_diffusion_operator(graph, 2, memory_bytes=341)
+
+    np.testing.assert_array_equal(
+        actual.toarray(), diffusion_operator(graph, 2).toarray()
+    )
+    np.testing.assert_array_equal(np.asarray(actual.sum(axis=1)).ravel(), [1, 1, 1, 0])
+    with pytest.raises(MemoryError, match="6 operator entries.*340 bytes"):
+        bounded_diffusion_operator(graph, 2, memory_bytes=340)
+
+
+@pytest.mark.parametrize("power", [True, 1.5, "2"])
+def test_bounded_diffusion_rejects_noninteger_powers(power):
+    from scarf.neighbors.diffusion import bounded_diffusion_operator
+
+    with pytest.raises(TypeError, match="positive integer"):
+        bounded_diffusion_operator(_simple_knn_graph(4), power, memory_bytes=1024**2)
+
+
 def _multimodal_wnn_inputs() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     indices1 = _grouped_knn_indices([[0, 1, 2, 3], [4, 5, 6, 7]])
     indices2 = _grouped_knn_indices([[0, 2, 4, 6], [1, 3, 5, 7]])

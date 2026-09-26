@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from scarf import DataStore
+from scarf.quality_control.filtering import filter_cell_metrics
 from scarf.datastore.pipeline_accessor import PipelineExecutionError
 from scarf.storage.artifacts import ArtifactRef, fingerprint_array, fingerprint_strings
 from scarf.storage.selections import read_stored_selection_mask
@@ -83,6 +84,49 @@ def import_nullable_cluster_h5ad(
         nthreads=1,
     )
     return store, result, codes, missing
+
+
+def test_integer_qc_metrics_exclude_missing_values_from_gaussian_bounds():
+    result = filter_cell_metrics(
+        {"counts": np.array([1, 2, 3, 1000])},
+        {"counts": np.array([False, False, False, True])},
+        np.ones(4, dtype=bool),
+        method="gaussian",
+    )
+
+    np.testing.assert_array_equal(result.retained, [True, True, True, False])
+    bounds = result.gaussian_bounds["counts"]
+    assert bounds["low"] == pytest.approx(0.10054491479716932)
+    assert bounds["high"] == pytest.approx(3.8994550852028307)
+
+
+@pytest.mark.parametrize("method", ["gaussian", "mad"])
+def test_automatic_qc_rejects_selections_with_no_complete_metrics(method):
+    with pytest.raises(ValueError, match="no selected cells with complete metrics"):
+        filter_cell_metrics(
+            {"counts": np.array([1.0, 2.0])},
+            {"counts": np.array([True, True])},
+            np.ones(2, dtype=bool),
+            method=method,
+        )
+
+
+def test_gaussian_qc_rejects_bounds_that_overflow_on_finite_metrics():
+    with np.errstate(over="ignore", invalid="ignore"):
+        with pytest.raises(ValueError, match="non-finite Gaussian bounds"):
+            filter_cell_metrics(
+                {"counts": np.array([1e308, 1e308, -1e308, -1e308])},
+                {},
+                np.ones(4, dtype=bool),
+                method="gaussian",
+            )
+
+
+def test_qc_rejects_unknown_filter_method():
+    with pytest.raises(ValueError, match="method must be"):
+        filter_cell_metrics(
+            {"counts": np.array([1, 2])}, {}, np.ones(2, dtype=bool), method="unknown"
+        )
 
 
 def _imported_graph(store: DataStore, cells: ArtifactRef) -> ArtifactRef:

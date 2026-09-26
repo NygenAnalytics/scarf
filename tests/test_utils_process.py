@@ -1,6 +1,7 @@
 """Behavioral tests for process helpers."""
 
 import os
+import io
 import subprocess
 import sys
 from unittest.mock import MagicMock
@@ -209,3 +210,36 @@ def test_suppress_native_output_restores_descriptors_after_errors(capfd):
     assert _standard_descriptors() == before
     os.write(2, b"visible\n")
     assert capfd.readouterr().err == "visible\n"
+
+
+@pytest.mark.parametrize("missing_libc", [False, True])
+def test_suppress_native_output_handles_closed_streams(
+    capfd, monkeypatch, missing_libc
+):
+    import ctypes
+
+    stream = io.TextIOWrapper(io.BytesIO())
+    stream.close()
+    before = _standard_descriptors()
+
+    def unavailable_libc(*_args):
+        raise OSError("C standard library unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sys, "stdout", stream)
+        patch.setattr(sys, "stderr", stream)
+        patch.setattr(sys, "__stdout__", None)
+        patch.setattr(sys, "__stderr__", None)
+        if missing_libc:
+            patch.setattr(ctypes, "CDLL", unavailable_libc)
+        with suppress_native_output():
+            assert _standard_descriptors() == _null_descriptors()
+            os.write(1, b"hidden\n")
+            os.write(2, b"hidden error\n")
+
+    assert _standard_descriptors() == before
+    os.write(1, b"visible\n")
+    os.write(2, b"visible error\n")
+    captured = capfd.readouterr()
+    assert captured.out == "visible\n"
+    assert captured.err == "visible error\n"

@@ -217,6 +217,23 @@ def test_three_sink_branch_matches_direct_dirichlet_reference():
     np.testing.assert_allclose(probabilities.sum(axis=1), 1.0)
 
 
+def test_fate_coarsening_preserves_direct_solution(monkeypatch):
+    from scarf.trajectory import fate
+
+    graph, pseudotime, labels = _y_graph()
+    monkeypatch.setattr(fate, "_MAX_COARSE_AGGREGATES", 1)
+
+    actual, valid, _ = compute_fate_probabilities(graph, pseudotime, labels, ["A", "B"])
+
+    assert valid.all()
+    np.testing.assert_allclose(
+        actual,
+        _direct_fate_reference(graph, pseudotime, labels, ["A", "B"]),
+        rtol=0,
+        atol=1e-6,
+    )
+
+
 def test_computation_does_not_mutate_input_graph():
     graph, pseudotime, labels = _y_graph()
     graph = graph.astype(np.float32)
@@ -497,6 +514,40 @@ def test_invalid_sink_definitions_fail_clearly(
             labels,
             sinks,
         )
+
+
+def test_fate_solver_reports_backend_breakdown(monkeypatch):
+    from scarf.trajectory import fate
+
+    graph, pseudotime, labels = _y_graph()
+
+    def failed_gmres(_operator, boundary, **_kwargs):
+        return boundary.copy(), -1
+
+    monkeypatch.setattr(fate, "gmres", failed_gmres)
+
+    with pytest.raises(RuntimeError, match="sink index 0 broke down"):
+        compute_fate_probabilities(graph, pseudotime, labels, ["A", "B"])
+
+
+def test_fate_restart_cycles_preserve_dirichlet_solution(monkeypatch):
+    from scarf.trajectory import fate
+
+    n_cells = 40
+    graph = diags([np.ones(n_cells - 1), np.ones(n_cells - 1)], [-1, 1], format="csr")
+    labels = np.full(n_cells, "other", dtype=object)
+    labels[0], labels[-1] = "A", "B"
+    pseudotime = np.linspace(0, 1, n_cells)
+    monkeypatch.setattr(fate, "_GMRES_RESTART", 1)
+
+    actual, valid, _ = compute_fate_probabilities(
+        graph, pseudotime, labels, ["A", "B"], beta=0.0, solver_tol=1e-4
+    )
+
+    assert valid.all()
+    expected = np.column_stack([1 - pseudotime, pseudotime])
+    np.testing.assert_allclose(actual, expected, rtol=0, atol=0.002)
+    np.testing.assert_array_equal(actual[[0, -1]], [[1, 0], [0, 1]])
 
 
 def test_max_iterations_limits_gmres_inner_iterations():

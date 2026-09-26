@@ -1,11 +1,15 @@
 import numpy as np
+import pytest
+from scipy.linalg import solve_triangular
 from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
 
 from scarf.clustering import _paris_core as paris_core
 from scarf.clustering import _paris_modularity as paris_modularity
 from scarf.features.enrichment import aucell
 from scarf.features.genomic import intervals
 from scarf.metrics import connectivity
+from scarf.neighbors import diffusion
 from scarf.trajectory import fate
 
 
@@ -300,6 +304,109 @@ def test_fate_python_support_kernel_accepts_symmetric_and_rejects_directed() -> 
 
     assert fate._has_symmetric_support.py_func(symmetric.indices, symmetric.indptr)
     assert not fate._has_symmetric_support.py_func(directed.indices, directed.indptr)
+
+
+@pytest.mark.parametrize("descending", [False, True])
+def test_fate_ordered_sweeps_match_triangular_solve(descending):
+    transition = np.array(
+        [
+            [0, 0.2, 0.3, 0.1, 0.4, 0],
+            [0.3, 0, 0.2, 0.1, 0, 0.4],
+            [0, 0, 0, 0, 0, 0],
+            [0.1, 0.2, 0, 0, 0.3, 0.4],
+            [0.2, 0.3, 0.1, 0.4, 0, 0],
+            [0, 0, 0, 0, 0, 0],
+        ],
+        dtype=np.float64,
+    )
+    graph = csr_matrix(transition)
+    order = np.array([4, 1, 3, 0], dtype=np.int64)
+    rank = np.full(6, -1, dtype=np.int64)
+    rank[order] = np.arange(len(order))
+    residual = np.array([2.0, -1.0, 0.5, 3.0, -2.0, 1.5])
+    permutation = np.concatenate(([2, 5], order if descending else order[::-1]))
+    system = np.eye(6) - transition
+    expected = np.empty(6)
+    expected[permutation] = solve_triangular(
+        system[np.ix_(permutation, permutation)],
+        residual[permutation],
+        lower=True,
+    )
+
+    for kernel in (fate._ordered_sweep, fate._ordered_sweep.py_func):
+        actual = np.full(6, np.nan)
+        kernel(
+            graph.data,
+            graph.indices,
+            graph.indptr,
+            order,
+            rank,
+            residual,
+            actual,
+            descending,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-14, atol=1e-14)
+        np.testing.assert_array_equal(actual[[2, 5]], residual[[2, 5]])
+
+
+@pytest.mark.parametrize("n_bins", [1, 2, 3, 7])
+def test_fate_aggregates_match_connected_components_within_bins(n_bins):
+    adjacency = np.zeros((8, 8))
+    for left, right in [(0, 3), (1, 2), (2, 3), (4, 5), (5, 6), (3, 7), (6, 7)]:
+        adjacency[left, right] = adjacency[right, left] = 1
+    graph = csr_matrix(adjacency)
+    rank = np.array([0, 1, 2, 3, 4, 5, 6, -1])
+    bins = rank[:7] * n_bins // 7
+    expected = np.full(8, -1)
+    count = 0
+    for current in np.unique(bins):
+        cells = np.flatnonzero(bins == current)
+        n_components, labels = connected_components(
+            graph[cells][:, cells], directed=False
+        )
+        expected[cells] = labels + count
+        count += n_components
+
+    for kernel in (
+        fate._pseudotime_bin_aggregates,
+        fate._pseudotime_bin_aggregates.py_func,
+    ):
+        actual, n_aggregates = kernel(graph.indptr, graph.indices, rank, n_bins)
+        assert n_aggregates == count
+        assert actual[7] == -1
+        np.testing.assert_array_equal(np.unique(actual[:7]), np.arange(count))
+        np.testing.assert_array_equal(
+            actual[:, None] == actual[None, :],
+            expected[:, None] == expected[None, :],
+        )
+
+
+@pytest.mark.parametrize("seed", [0, 1, 5])
+def test_diffusion_product_counts_match_sparse_multiplication(seed):
+    rng = np.random.default_rng(seed)
+    left_values = (rng.random((7, 5)) < 0.35).astype(np.float64)
+    right_values = (rng.random((5, 9)) < 0.35).astype(np.float64)
+    left_values[0] = 1
+    left_values[-1] = 0
+    right_values[1] = right_values[0]
+    right_values[:, -1] = 0
+    left, right = csr_matrix(left_values), csr_matrix(right_values)
+    expected = (left @ right).nnz
+
+    for kernel in (diffusion._product_nnz, diffusion._product_nnz.py_func):
+        assert (
+            kernel(left.indptr, left.indices, right.indptr, right.indices, 9)
+            == expected
+        )
+    bounds = [
+        kernel(left.indptr, left.indices, np.diff(right.indptr), 9)
+        for kernel in (
+            diffusion._product_nnz_bound,
+            diffusion._product_nnz_bound.py_func,
+        )
+    ]
+    assert bounds[0] == bounds[1]
+    assert expected < bounds[0] <= 7 * 9
 
 
 def test_interval_python_kernel_matches_compiled_overlap_search() -> None:
