@@ -267,6 +267,23 @@ ds.plots.embedding(
 
 # Annotation Resources
 
-[Placeholder]: [Placeholder]
-[Placeholder]: [Placeholder]
-[Placeholder]: [Placeholder]
+### Curated Single-Cell Marker Databases
+* **[CellMarker 2.0](http://bio-bigdata.hrbmu.edu.cn/CellMarker/):** A comprehensive, manually curated database cataloging over 13,000 cell markers across human and mouse tissues, including both normal and clinical disease models.
+* **[PanglaoDB](https://panglaodb.se/):** An open database of single-cell RNA-seq markers covering hundreds of cell types across major mammalian organs, providing computational specificity scores for each marker.
+* **[Azimuth / HuBMAP Reference Atlases](https://azimuth.hubmapconsortium.org/):** Pre-annotated, expert-verified reference maps for single-cell data across organs (kidney, lung, pancreas, motor cortex, PBMC). Azimuth allows you to inspect canonical marker hierarchies directly.
+* **[The Human Protein Atlas (Blood & Single-Cell Atlas)](https://www.proteinatlas.org/):** Combines single-cell RNA sequencing data with antibody-based protein profiling across tissues and circulating blood compartments.
+
+### Automated Annotation & Label-Transfer Frameworks
+* **[ScType](https://github.com/IanevskiAleksandr/sc-type):** An automated marker-based annotation tool supported by a curated database that explicitly documents both **positive marker sets** and **negative control markers** for hundreds of cell lineages.
+* **[CellTypist](https://www.celltypist.org/):** A machine-learning platform with specialized, pre-trained logistic regression models for immune cell phenotyping across healthy and diseased tissues.
+* **[SingleR](https://bioconductor.org/packages/release/bioc/html/SingleR.html):** Performs unbiased, automated cell-type assignment by computing Spearman rank correlations between your single-cell clusters and bulk/microarray reference datasets (such as Blueprint-ENCODE and HPCA).
+* **[CyteType](https://www.nygen.io/products/cytetype):** SCARF's founding teams' private access automated annotation and clustering tool. 
+
+### Marker-Set Enrichment Platforms
+If you have computed the top 10–20 marker genes for an uncharacterized cluster and need to query potential candidate identities:
+* **[Enrichr](https://maayanlab.cloud/Enrichr/):** Paste your top marker gene list and evaluate over-representation against the **CellMarker Augmented**, **PanglaoDB Augmented**, or **ARCHS4 Tissues** gene-set libraries.
+* **[ToppGene Suite (ToppFun)](https://toppgene.cchmc.org/):** Matches custom gene lists against cell-type specific signatures, Gene Ontology (GO) terms, and pathway databases to infer functional state and lineage.
+
+### Immunophenotyping & Negative-Gating References
+* **[BioLegend Cell Markers](https://www.biolegend.com/en-us/cell-markers) & [BD Biosciences CD Marker Handbooks](https://www.bdbiosciences.com/):** Reference posters and technical guides defining classical immunophenotyping panels, lineage-negative ($\text{Lin}^-$) gating exclusion cocktails, and surface marker hierarchies.
+* **[Optimized Multicolor Immunofluorescence Panels (OMIPs)](https://onlinelibrary.wiley.com/journal/15524930):** Peer-reviewed flow and mass cytometry gating panels published in *Cytometry Part A*, detailing validated gating trees and the negative markers used to dump non-target lineages.
