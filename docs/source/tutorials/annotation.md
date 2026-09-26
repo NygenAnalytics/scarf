@@ -85,7 +85,7 @@ After we have the marker table, we can begin to assign our initial cell types. W
 ```{code-cell}
 ds.plots.embedding(
     layout=run["umap"],
-    color_by=["CD3D", "CD4", "CD8A", "MS4A1", "CD14", "NKG7", "KLF4"],
+    color_by=["CD3D", "CD4", "CD8A", "MS4A1", "CD14", "NKG7", "IL3RA"],
     n_columns=3,
     sort_values=True,
 )
@@ -99,12 +99,12 @@ ds.plots.embedding(
 
 Here, we can see the UMAP of our select marker genes for our predicted cell types alongside the clusters they may be present inside off.
 
-CD3D lights up clusters that may our candidate T-cells. MS4A1 marks a separate block of potential B-cells, CD14 marks the monocyte likely block, and NKG7 marks the NK-like block. Newer literature indicates there may be a circulating subset of plasmacytoid dendritic cells (pDCs), which are represented here by KLF4.
+CD3D lights up clusters that may our candidate T-cells. MS4A1 marks a separate block of potential B-cells, CD14 marks the monocyte likely block, and NKG7 marks the NK-like block. Newer literature indicates there may be a circulating subset of plasmacytoid dendritic cells (pDCs), which light up here for IL3RA.
 
 To confirm the visual readings on the UMAP, we can now utilize the marker table
 
 ```{code-cell}
-panel_genes = ["CD3D", "CD4", "CD8A", "MS4A1", "CD14", "NKG7", "KLF4"]
+panel_genes = ["CD3D", "CD4", "CD8A", "MS4A1", "CD14", "NKG7", "IL3RA"]
 panel_markers = ds.get_markers(marker=markers, min_score=-1, min_frac_exp=-1)
 panel_stats = panel_markers[panel_markers["feature_name"].isin(panel_genes)]
 panel_stats.pivot(index="feature_name", columns="group_id", values="score").reindex(
@@ -146,29 +146,56 @@ ds.plots.marker_heatmap(
 
 Look for coherent programs rather than a single gene by comparing against the literature or existing databases (resources can be found at the end of this document). By using multiple markers, we can also begin to bridge towards not only identifying the identity of a cluster, but the state it may be in.
 
-In the heatmap, we can see that Cluster 1 displays a clear triplet of CD14, VCAN, and S100A12, which confirms our CD14-monocyte signature, while Cluster 2 expresses a distinct CTSL and TCF7L2 program with only residual CD14, indicating the prescense of a second monocyte state (potentially non-classical monocytes). 
+In the heatmap, we can see that Cluster 1 displays a clear triplet of CD14, VCAN, and S100A12, which confirms our CD14-monocyte signature, while Cluster 2 expresses a distinct CTSL and TCF7L2 program with only residual CD14, indicating the presence of a second monocyte state (potentially non-classical monocytes).
 
-Cluster 3 shows an FCER2, IGHD, and TNFRSF13B trio, which is a classic naive B-cell program. Looking at cytotoxicity linked genes, we can see the signal split across clusters 6 and 7: Cluster 6 is topped by KLRF1, FGFBP2, and ADGRG1, whereas Cluster 7 is led by TRGC2, GZMK, KLRG1, and CD8B, meaning the decision between an NK cell and a cytotoxic T-cell identity rests on which exclusive markers in the markers table, or through the use of negative controls.
+Cluster 3 shows an FCER2, IGHD, and TNFRSF13B trio, which is a classic naive B-cell program. Looking at cytotoxicity-linked genes, the signal spans clusters 5, 6, and 7 with different leading genes; cluster 5 is dominated by KLRF1, FGFBP2, and GNLY (NK program), cluster 6 is led by GZMK, TRGC2, and CD8A, and cluster 7 by CD8A with CD3D/CD3E (cytotoxic-T programs), meaning the decision between an NK-cell and a cytotoxic T-cell identity rests on which exclusive markers lead each column, confirmed through the negative controls below.
 
-The (large) Cluster 4 is dominated by ADTRP, ANKRD55, and FHIT, a program it partly shares with Cluster 5 (LMNA and TNFRSF4); while these gene names may seem less familiar than canonical markers, their exclusivity to the T-cell annotation helps rule out alternative B-cell, monocyte, or NK identities. 
+The (large) Cluster 4 is dominated by ADTRP, ANKRD55, and FHIT, a program it partly shares with Cluster 5 (LMNA and TNFRSF4); while these gene names may seem less familiar than canonical markers, cluster 4 can be identified as T cells by the process of elimination of B-cell, monocyte, and NK cells based on the genes above. On the other hand, cluster 5 is now denoted as NK cells by its NKG7, GNLY, KLRF1, and FGFBP2 detection.
 
 Lastly, clusters with unique marker combinations, like Cluster 9's TCL1A and FCER2 signals, or Cluster 8's NELL2-dominated program, provide a key example where we our existing UMAPS can help in visualizing the spatial orientation of the expression of these genes.
 
+```{code-cell}
+heatmap_genes = [
+    "CD14", "VCAN", "S100A12", "CTSL", "TCF7L2", "FCER2", "IGHD",
+    "TNFRSF13B", "KLRF1", "FGFBP2", "GNLY", "GZMK", "TRGC2", "CD8A",
+    "CD3D", "CD3E", "ADTRP", "ANKRD55", "FHIT", "LMNA", "TNFRSF4",
+    "NKG7", "TCL1A", "NELL2",
+]
+heatmap_markers = ds.get_markers(marker=markers, min_score=-1, min_frac_exp=-1)
+heatmap_hits = heatmap_markers[heatmap_markers["feature_name"].isin(heatmap_genes)]
+heatmap_table = (
+    heatmap_hits.sort_values("score", ascending=False)
+    .groupby("feature_name", sort=False)
+    .head(1)
+    .sort_values("score", ascending=False)
+)
+heatmap_table["proposed_identity"] = (
+    heatmap_table["group_id"].astype(str).map(proposed_labels)
+)
+heatmap_table[["feature_name", "group_id", "score", "frac_exp", "proposed_identity"]]
+```
+
 ## Validate annotations against negative controls
 
-Going a step further, as you would in a real study, negative controls validate annotations by adding a layer of cell-type exclusivity: confirming that a cluster not only turns on the right genes, but also properly silences the genes belonging to competing or mutually execlusive lineages. In the several markers section above, we hint at the idea of negative markers as a way to differeniate between different cell states, and even see it in use for cluster 4, in how we validate that cluster 4 & 5 are likely T cells vs. B-cells, monocytes, or even NK cells. 
+Going a step further, as you would in a real study, negative controls validate annotations by adding a layer of cell-type exclusivity, as  confirming that a cluster not only has the right genes, but also properly silences the genes belonging to competing or mutually exclusive lineages. In the several markers section above, we hint at the idea of negative markers as a way to differentiate between different cell states, and even see it in use for cluster 4, in how we validate that cluster 4 is likely T cells, and cluster 5 NK cells, versus B-cell or monocyte alternatives.
 
 **Negative controls can be verified by simply searching for them in our marker tables and analyzing their metrics:**
 
 - `frac_exp` for low expression prevalence; our negative controls should have low detection within the target cluster (`frac_exp` $\approx 0$‬).
 - `score` for low exclusivity; a `score` near 0 means almost none of the gene's expression rank exists in the cluster you are studying
 
-For our examples, the negative controls we use are... []**FILL THIS IN!]**
+For our examples, the negative controls we use are CD3D/CD3E in cluster 5 (NK cells), CD4 in cluster 7 (cytotoxic CD8 T cells), and MS4A1/CD14 in clusters 6 and 7. This is becaUse true NK cells lack T-cell receptors, thus we can use CD3D/CD3E, and for c
 
+```{code-cell}
+neg_genes = ["CD3D", "CD3E"]
+neg_markers = ds.get_markers(marker=markers, min_score=-1, min_frac_exp=-1)
+neg_stats = neg_markers[neg_markers["feature_name"].isin(neg_genes)]
+neg_stats[["group_id", "feature_name", "score", "frac_exp", "auc"]].sort_values(
+    ["feature_name", "group_id"]
+)
+```
 
- **Cluster 6 is topped by KLRF1, FGFBP2, and ADGRG1, whereas Cluster 7 is led by TRGC2, GZMK, KLRG1, and CD8B, meaning the decision between an NK cell and a cytotoxic T-cell identity rests on which specific exclusive markers lead each column, or through the use of negative controls**
-
-USE THE NEGATIVE CONTROLS AS AN EXAMPLE FOR THIS AS IT WORKS SUPER NICELY SUPER SUPER NICELY
+The table above runs CD3D/CD3E across all ten clusters: both genes hit ceiling detection almost everywhere T cells live, yet in cluster 5 their exclusivity collapses to background (scores 0.12/0.11 against 0.10 uniform) with AUC below 0.5 (0.40/0.40, depleted not enriched), despite ambient detection in a minority of cells (frac_exp 0.31/0.43). Set against NKG7, GNLY, KLRF1, and FGFBP2 detection above 0.92 in the same cluster, this rules out T-cell identity for NK cells. The same lookup pattern covers the remaining controls: CD4 in cluster 7 sits at frac_exp 0.02 with score near zero, confirming the helper program is silenced while CD8A (0.52/0.92) cements the cytotoxic CD8 identity; MS4A1 and CD14 sit near zero in clusters 6 and 7 (detection 0.01-0.08, scores at most 0.008), confirming neither cluster carries B-cell or monocyte contamination from doublets.
 
 ## Write the reviewed mapping
 
@@ -177,7 +204,6 @@ clusters intentionally map to the same lineage. The mapping is tied to this run 
 copied to another graph or dataset.
 
 ```{code-cell}
-# Proposal from step 2, confirmed against the heatmap in step 3.
 label_map = dict(proposed_labels)
 observed = {str(value) for value in np.unique(cluster_values)}
 assert observed == set(label_map)
