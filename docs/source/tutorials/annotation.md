@@ -1,5 +1,5 @@
 ---
-description: Review immutable marker evidence and write deliberate cell-type annotations.
+description: Review marker evidence for cell-type annotations.
 jupytext:
   text_representation:
     extension: .md
@@ -11,18 +11,19 @@ kernelspec:
   language: python
   name: python3
 ---
-
 (annotation)=
 
-# Review markers and assign cell types
+# Cell-Type & State Annotation Primer
 
-Cluster IDs are not cell types. This recipe reads one immutable marker result, reviews several
-forms of evidence, and writes a user-owned annotation only after the cluster-to-label mapping is
-explicit. The core {doc}`scrna_seq` workflow shows the corresponding broad PBMC dotplot.
+After the clustering process, you are left with numbers separating groups of potentially distinct cell types or cell states. To proceed with the analysis process, annotating the cell types that may exist inside your dataset is critical. Approaching this problem requires biological context, in terms of the tissue or sample where you obtained your sample. For example, if you did sequencing on PBMCs versus the brain, you would expect vastly different cell types, and by having this context, you enable yourself to have some for a ground truth of what you cell types you can expect versus what you can not.
+
+# Review cell-type markers and assign cell types
+
+The tutorial here today simply guides you through the basic annotation process for PBMCs. The marker genes we use here in the tutorial are generally accepted to be broad markers of PBMCs; Further resources on where to find markers for your unique samples can be found at the bottom of this document.
 
 ## Open the exact clustering and markers
 
-```{code-cell} ipython3
+```{code-cell}
 import numpy as np
 import pandas as pd
 
@@ -46,7 +47,9 @@ The run binds the marker table to the pipeline-selected Leiden partition and fro
 universe. Start by inspecting the strongest markers for one group rather than naming it from UMAP
 position.
 
-```{code-cell} ipython3
+## 1. Find the markers
+
+```{code-cell}
 group_id = pd.Series(cluster_values).value_counts().index[0]
 group_markers = ds.get_markers(
     marker=markers,
@@ -72,9 +75,35 @@ Use the columns together. `score` ranks specificity, `frac_exp` reports detectio
 `p_value_adjusted` is Benjamini-Hochberg adjustment within this one-versus-rest marker test. It is
 not replicate-aware differential expression.
 
-### Question: do several markers support each cluster interpretation?
+## 2. Assign cell types from marker UMAPs
 
-```{code-cell} ipython3
+Naming comes before validation: propose a cell type for each cluster from where its markers are
+expressed, then test that proposal in the next step. Color the cluster map by canonical lineage
+genes and read which clusters light up together.
+
+```{code-cell}
+ds.plots.embedding(
+    layout=run["umap"],
+    color_by=["CD3D", "CD4", "CD8A", "MS4A1", "CD14", "NKG7"],
+    n_columns=3,
+    sort_values=True,
+)
+```
+
+CD3D lights up one block of clusters (the T-cell candidates); within it, CD4 and CD8A separate
+helper-leaning from cytotoxic-leaning regions, which is how similar T clusters are told apart.
+MS4A1 marks a separate block (the B-cell candidates), CD14 marks the monocyte block, and NKG7
+marks the NK-like block. Clusters sharing one program take one provisional name: T cells, B
+cells, CD14 monocytes, FCGR3A monocytes (CD14-low in the heatmap below), NK cells, and the small
+pDC-like group. Similar clusters are therefore split or merged by expression distribution, not by
+UMAP distance alone.
+
+## 3. Do several markers support each cluster interpretation?
+
+One gene never carries an annotation. Check that multiple independent markers agree with each
+provisional name before writing it down.
+
+```{code-cell}
 ds.plots.marker_heatmap(
     marker=markers,
     topn=3,
@@ -85,13 +114,13 @@ ds.plots.marker_heatmap(
 Look for coherent programs rather than a single winning gene. In a real study, also inspect
 expected negative markers, cluster size, technical covariates, donor coverage, and doublet scores.
 
-## Write the reviewed mapping
+## 4. Write the reviewed mapping
 
 This example records the broad teaching labels supported in {doc}`scrna_seq`. Multiple Leiden
 clusters intentionally map to the same lineage. The mapping is tied to this run and should not be
 copied to another graph or dataset.
 
-```{code-cell} ipython3
+```{code-cell}
 label_map = {
     "1": "CD14 monocytes",
     "2": "FCGR3A monocytes",
@@ -115,11 +144,13 @@ pd.Series(cell_type[analysis_cells]).value_counts()
 ```
 
 The insertion is an explicit user metadata edit. It does not alter the immutable clustering or
-marker artifacts.
+marker artifacts. To update cell types later, edit `label_map` and re-run the cell above:
+`overwrite=True` replaces the `reviewed_cell_type` column in place, so revision is one edit plus
+one re-execution, with the clustering and marker evidence untouched.
 
 ### Question: does the reviewed annotation remain spatially coherent?
 
-```{code-cell} ipython3
+```{code-cell}
 ds.plots.embedding(
     layout=run["umap"],
     color_by="reviewed_cell_type",
@@ -135,3 +166,11 @@ partitions, but it is not ontology annotation; that partition-comparison role be
 For scATAC-seq, {doc}`scatac_seq` uses GeneScores to display marker accessibility. GeneScores are
 accessibility summaries, not measured RNA expression. Use {doc}`mapping_and_label_transfer` when a
 query should inherit labels from a fixed reference rather than be annotated de novo.
+
+## Important caveats to consider regarding annotation
+
+- **[Placeholder]:** [Placeholder]
+- **[Placeholder]:** [Placeholder]
+- **[Placeholder]:** [Placeholder]
+
+## Resources for marker-based annotation
