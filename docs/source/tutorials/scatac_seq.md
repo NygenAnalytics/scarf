@@ -111,7 +111,7 @@ ds.plots.embedding(
 )
 ```
 
-Our observation of CD3D and LEF1 appearing in the same clusters supports T-cell accessibility (the chromatin identified behind the identified "T cell"), with MS4A1 supporting B cells and NKG7 highlighting cytotoxic or NK-like regions. TREM1 alongside LYZ supports presence of myeloid populations. These maps support broad lineage interpretation, but they do not assign every cluster a definitive cell type from this small panel of genes. To gain more confidence in assigning a definitive cell type, you can utilize a larger panel of genes alongside positive/negative controls (signal you would expect in a cell type versus signal you would not.)
+Our observation of CD3D and LEF1 appearing in the same clusters supports T-cell accessibility (the chromatin identified behind the identified "T cell"), with MS4A1 supporting B cells and NKG7 highlighting cytotoxic or NK-like regions. TREM1 alongside LYZ supports presence of myeloid populations. These maps support broad lineage interpretation, but they do not assign every cluster a definitive cell type from this small panel of genes. To gain more confidence in assigning a definitive cell type, you can utilize a larger panel of genes alongside positive/negative controls (signal you would expect in a cell type versus signal you would not.) For further information regarding the sample markers we chose for this analysis, refer to resources in {doc}`annotation`.
 
 ## Limits of this result
 
