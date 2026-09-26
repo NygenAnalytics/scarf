@@ -1,3 +1,5 @@
+so i
+
 ---
 description: Review marker evidence for cell-type annotations.
 jupytext:
@@ -15,13 +17,15 @@ kernelspec:
 
 # Cell-Type & State Annotation Primer
 
-After the clustering process, you are left with numbers separating groups of potentially distinct cell types or cell states. To proceed with the analysis process, annotating the cell types that may exist inside your dataset is critical. Approaching this problem requires biological context, in terms of the tissue or sample where you obtained your sample. For example, if you did sequencing on PBMCs versus the brain, you would expect vastly different cell types, and by having this context, you enable yourself to have some for a ground truth of what you cell types you can expect versus what you can not.
+After the clustering process, you are left with numbers separating groups of potentially distinct cell types or cell states. To proceed with the analysis process, annotating the cell types that may exist inside your dataset is critical. Approaching this problem requires biological context, in terms of the tissue or sample where you obtained your sample. For example, if you did sequencing on PBMCs versus the brain, you would expect vastly different cell types, and by having this context, you enable yourself to have some for a ground truth of what you cell types you can expect versus what you can not. Annotation generally requires marker genes for each cluster, in which marker genes are genes that have significantly differing expression across cell types. 
+
+The tutorial here today simply guides you through the basic annotation process for PBMCs by determining the marker genes for each cluster, and using the corresponding metrics to assign cell types. Marker gene determination genneraly functions through Mann-Whitney U testing gene expression differences across all clusters, after which it is followed by a Benjamini-Hochberg correction for multiple hypothesis correction. SCARF takes on the liberty to calculate other metrics that can be utilized for identifying marker genes for each cluster.
+
+Further resources on where to find markers for your unique samples can be found at the bottom of this document.
 
 # Review cell-type markers and assign cell types
 
-The tutorial here today simply guides you through the basic annotation process for PBMCs. The marker genes we use here in the tutorial are generally accepted to be broad markers of PBMCs; Further resources on where to find markers for your unique samples can be found at the bottom of this document.
-
-## Open the exact clustering and markers
+To begin, you must generally reach a point where clustering and marker search has been performed. Here, we grab the results of clustering and marker search for a pre-completed analysis.
 
 ```{code-cell}
 import numpy as np
@@ -43,9 +47,7 @@ markers = run["markers"]
 cluster_values = np.asarray(run.cells.fetch("clusters"))
 ```
 
-The run binds the marker table to the pipeline-selected Leiden partition and frozen feature
-universe. Start by inspecting the strongest markers for one group rather than naming it from UMAP
-position.
+We first begin by inspecting the calculated markers, and gaining a strong conceptual understanding of the metrics available.
 
 ## 1. Find the markers
 
