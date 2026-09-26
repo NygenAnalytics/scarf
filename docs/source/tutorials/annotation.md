@@ -1,4 +1,3 @@
-so i
 
 ---
 description: Review marker evidence for cell-type annotations.
@@ -49,7 +48,7 @@ cluster_values = np.asarray(run.cells.fetch("clusters"))
 
 We first begin by inspecting the calculated markers, and gaining a strong conceptual understanding of the metrics available.
 
-## 1. Find the markers
+## Identify and interpret the markers
 
 ```{code-cell}
 group_id = pd.Series(cluster_values).value_counts().index[0]
@@ -72,12 +71,17 @@ group_markers[
 ].head(12)
 ```
 
-Use the columns together. `score` ranks specificity, `frac_exp` reports detection in the target,
-`fold_change` compares target and reference means, and AUC summarizes cell-level separation.
-`p_value_adjusted` is Benjamini-Hochberg adjustment within this one-versus-rest marker test. It is
-not replicate-aware differential expression.
+SCARF automatically calculates other metrics for like marker identification, and understanding their function and pitfalls is crucial when weighing the difference between cell type x and y on the same cluster n. 
 
-## 2. Assign cell types from marker UMAPs
+- `fold_change` compares the average expression in a target cluster vs. all other cells; However, this can be skewed by high-expression noise or by a few extreme outliers.
+- `frac_exp` helps to report the percentage of cells in a cluster with non-zero counts for a gene. This helps as say a gene has a 10 fold change, but has a small expressed fraction, it may not be the most useful marker to identify a cell type.
+- `auc`measures how well a single gene's expression level predicts whether a cell belonds to a cluster, with values near 0.5 meaning this gene can be a marker for any clusters, and 1 meaning that this gene can be perfectly identified with a specific cluster. This approach is insensitive to outliers and can be a more impartial metric to utilize
+- `score` is SCARF's unique specificity rank, which measures how uniquely a gene's expression is confined to this cluster on a 0–1 scale (summing to 1 across all clusters for each gene). A score near 1 flags a highly cluster-exclusive marker; a score near ‭$1 / n_{\text{clusters}}$‬‭‬ indicates a ubiquitous housekeeping gene that is useless for naming; and a score near 0 indicates absence.
+- `p_value_adjusted` is simply the Benjamini-Hochberg p value correction we discussed earlier to correct for the multiple hypothesis testing the Mann-Whitney U test employs. 
+
+## Assign initial cell types 
+
+After we have the marker table, assignment runs in three moves: read the numbered cluster map against the marker panels, pull each panel gene's statistics from the marker table, and record one provisional name per cluster. 
 
 Naming comes before validation: propose a cell type for each cluster from where its markers are
 expressed, then test that proposal in the next step. Color the cluster map by canonical lineage
@@ -92,6 +96,17 @@ ds.plots.embedding(
 )
 ```
 
+Read this numbered map against the marker panels above: the IDs sitting on each lit-up region are
+the clusters that panel gene nominates.
+
+```{code-cell}
+ds.plots.embedding(
+    layout=run["umap"],
+    color_by=clusters,
+    legend_loc="on_data",
+)
+```
+
 CD3D lights up one block of clusters (the T-cell candidates); within it, CD4 and CD8A separate
 helper-leaning from cytotoxic-leaning regions, which is how similar T clusters are told apart.
 MS4A1 marks a separate block (the B-cell candidates), CD14 marks the monocyte block, and NKG7
@@ -99,6 +114,37 @@ marks the NK-like block. Clusters sharing one program take one provisional name:
 cells, CD14 monocytes, FCGR3A monocytes (CD14-low in the heatmap below), NK cells, and the small
 pDC-like group. Similar clusters are therefore split or merged by expression distribution, not by
 UMAP distance alone.
+
+Confirm the visual read against the stored statistics: each row is one panel gene, each column
+one cluster, and each entry its specificity score.
+
+```{code-cell}
+panel_genes = ["CD3D", "CD4", "CD8A", "MS4A1", "CD14", "NKG7"]
+panel_markers = ds.get_markers(marker=markers, min_score=-1, min_frac_exp=-1)
+panel_stats = panel_markers[panel_markers["feature_name"].isin(panel_genes)]
+panel_stats.pivot(index="feature_name", columns="group_id", values="score").reindex(
+    panel_genes
+)
+```
+
+Record one provisional name per cluster from the panels and the table above. This proposal is
+data, not yet annotation: step 3 tests it, and step 4 writes it.
+
+```{code-cell}
+proposed_labels = {
+    "1": "CD14 monocytes",
+    "2": "FCGR3A monocytes",
+    "3": "B cells",
+    "4": "T cells",
+    "5": "NK cells",
+    "6": "T cells",
+    "7": "T cells",
+    "8": "B cells",
+    "9": "T cells",
+    "10": "pDC-like cells",
+}
+pd.Series(proposed_labels, name="proposed_cell_type")
+```
 
 ## 3. Do several markers support each cluster interpretation?
 
@@ -123,18 +169,8 @@ clusters intentionally map to the same lineage. The mapping is tied to this run 
 copied to another graph or dataset.
 
 ```{code-cell}
-label_map = {
-    "1": "CD14 monocytes",
-    "2": "FCGR3A monocytes",
-    "3": "B cells",
-    "4": "T cells",
-    "5": "NK cells",
-    "6": "T cells",
-    "7": "T cells",
-    "8": "B cells",
-    "9": "T cells",
-    "10": "pDC-like cells",
-}
+# Proposal from step 2, confirmed against the heatmap in step 3.
+label_map = dict(proposed_labels)
 observed = {str(value) for value in np.unique(cluster_values)}
 assert observed == set(label_map)
 
