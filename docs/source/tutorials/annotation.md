@@ -112,7 +112,7 @@ panel_stats.pivot(index="feature_name", columns="group_id", values="score").rein
 )
 ```
 
-With the information in the markers table supporting our intepretation, we can move forward. 
+With the information in the markers table supporting our intepretation, we can move forward.
 
 Clusters with these localized gene expression take an initial name for now as described below:
 
@@ -132,9 +132,9 @@ proposed_labels = {
 pd.Series(proposed_labels, name="proposed_cell_type")
 ```
 
-## Do several markers support each cluster interpretation?
+## Using several markers to support cluster interpretation and identify cell states
 
-One gene can never be used to annotate a cell, thus we dig further by using alternative markers to validate our initial interpretations. 
+One gene can never be used to annotate a cell, thus we dig further by using alternative markers to validate our initial interpretations.
 
 ```{code-cell}
 ds.plots.marker_heatmap(
@@ -144,11 +144,22 @@ ds.plots.marker_heatmap(
 )
 ```
 
-Look for coherent programs rather than a single winning gene by comparing against the literature or existing databases.
+Look for coherent programs rather than a single gene by comparing against the literature or existing databases (resources can be found at the end of this document). By using multiple markers, we can also begin to bridge towards not only identifying the identity of a cluster, but the state it may be in.
 
+In the heatmap, we can see that Cluster 1 displays a clear triplet of CD14, VCAN, and S100A12, which confirms our CD14-monocyte signature, while Cluster 2 expresses a distinct CTSL and TCF7L2 program with only residual CD14, indicating the prescense of a second monocyte state.
 
+ Cluster 3 shows an FCER2, IGHD, and TNFRSF13B trio, which is a classic naive B-cell program. Looking at cytotoxicity, we can see the signal split across clusters 6 and 7: Cluster 6 is topped by KLRF1, FGFBP2, and ADGRG1, whereas Cluster 7 is led by TRGC2, GZMK, KLRG1, and CD8B, meaning the decision between an NK cell and a cytotoxic T-cell identity rests on which specific exclusive markers lead each column. The large Cluster 4 is dominated by ADTRP, ANKRD55, and FHIT, a program it partly shares with Cluster 5 (LMNA and TNFRSF4); while these gene names may seem less familiar than canonical markers, their exclusivity to the T-cell block helps rule out alternative B-cell, monocyte, or NK identities. Lastly, clusters with less expected marker combinations—such as Cluster 9's TCL1A and FCER2 signal, or Cluster 8's NELL2-led program—highlight the exact places where we must combine our canonical UMAP panels with external database lookups to arbitrate cell identities before finalizing our label mapping
 
- In a real study, also inspect expected negative markers, cluster size, technical covariates, donor coverage, and doublet scores.
+## Validate annotations against negative controls
+
+Going a step further, as you would in a real study, negative controls validate annotations by adding a layer of cell-type exclusivity: confirming that a cluster not only turns on the right genes, but also properly silences the genes belonging to competing or mutually execlusive lineages.
+
+**Negative controls can be verified by simply searching for them in our marker tables and analyzing their metrics:**
+
+- `frac_exp` for low expression prevalence; our negative controls should have low detection within the target cluster (`frac_exp` $\approx 0$‬).
+- `score` for low exclusivity; a `score` near 0 means almost none of the gene's expression rank exists in the cluster you are studying
+
+For our examples, the negative controls we use are... []**FILL THIS IN!]**
 
 ## Write the reviewed mapping
 
@@ -174,7 +185,7 @@ marker artifacts. To update cell types later, edit `label_map` and re-run the ce
 `overwrite=True` replaces the `reviewed_cell_type` column in place, so revision is one edit plus
 one re-execution, with the clustering and marker evidence untouched.
 
-### Question: does the reviewed annotation remain spatially coherent?
+### Do the final annotations remain spatially coherent?
 
 ```{code-cell}
 ds.plots.embedding(
@@ -193,15 +204,12 @@ For scATAC-seq, {doc}`scatac_seq` uses GeneScores to display marker accessibilit
 accessibility summaries, not measured RNA expression. Use {doc}`mapping_and_label_transfer` when a
 query should inherit labels from a fixed reference rather than be annotated de novo.
 
-## A step further: Distinguishing granular cell states
-
-here we introduce the ideas off within it, CD4 and CD8A separate
-helper-leaning from cytotoxic-leaning regions, which is how similar T clusters are told apart and then redo the annotation process or smth
-
 ## Important caveats to consider regarding annotation
 
 - **[Placeholder]:** [Placeholder]
 - **[Placeholder]:** [Placeholder]
 - **[Placeholder]:** [Placeholder]
 
-## Resources for marker-based annotation
+# Alternative annotation steps / depth [create title]
+
+ehh maybe required maybe not
