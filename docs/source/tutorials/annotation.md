@@ -85,7 +85,7 @@ After we have the marker table, we can begin to assign our initial cell types. W
 ```{code-cell}
 ds.plots.embedding(
     layout=run["umap"],
-    color_by=["CD3D", "CD4", "CD8A", "MS4A1", "CD14", "NKG7", "IL3RA"],
+    color_by=["CD3D", "CD4", "CD8A", "MS4A1", "CD14", "NKG7", "IL3RA", "FCGR3A"],
     n_columns=3,
     sort_values=True,
 )
@@ -104,7 +104,7 @@ CD3D lights up clusters that may our candidate T-cells. MS4A1 marks a separate b
 To confirm the visual readings on the UMAP, we can now utilize the marker table
 
 ```{code-cell}
-panel_genes = ["CD3D", "CD4", "CD8A", "MS4A1", "CD14", "NKG7", "IL3RA"]
+panel_genes = ["CD3D", "CD4", "CD8A", "MS4A1", "CD14", "NKG7", "IL3RA", "FCGR3A"]
 panel_markers = ds.get_markers(marker=markers, min_score=-1, min_frac_exp=-1)
 panel_stats = panel_markers[panel_markers["feature_name"].isin(panel_genes)]
 panel_stats.pivot(index="feature_name", columns="group_id", values="score").reindex(
@@ -119,7 +119,7 @@ Clusters with these localized gene expression take an initial name for now as de
 ```{code-cell}
 proposed_labels = {
     "1": "CD14 monocytes",
-    "2": "FCGR3A monocytes",
+    "2": "GFCGR3A monocytes", # der
     "3": "B cells",
     "4": "T cells",
     "5": "NK cells",
@@ -211,32 +211,42 @@ anchor_stats[["group_id", "feature_name", "score", "frac_exp", "auc"]].sort_valu
 )
 ```
 
-## Write the reviewed mapping
+## Write & visualize the final reviewed mapping
 
-This example records the broad teaching labels supported in {doc}`scrna_seq`. Multiple Leiden
-clusters intentionally map to the same lineage. The mapping is tied to this run and should not be
-copied to another graph or dataset.
+With all of the analysis we performed above, we can now finalize our final annotations to:
 
 ```{code-cell}
-label_map = dict(proposed_labels)
+final_labels = {
+    "1": "CD14 monocytes",
+    "2": "FCGR3A monocytes",
+    "3": "naive B cells",
+    "4": "T cells",
+    "5": "NK cells",
+    "6": "CD8+ T cells",
+    "7": "CD8+ T cells",
+    "8": "B cells",
+    "9": "T cells",
+    "10": "pDC-like cells",
+}
 observed = {str(value) for value in np.unique(cluster_values)}
-assert observed == set(label_map)
+assert observed == set(final_labels)
 
 analysis_cells = np.asarray(run.cells.fetch_all("I"), dtype=bool)
 cell_type = np.full(len(analysis_cells), "Not analyzed", dtype=object)
-cell_type[analysis_cells] = [label_map[str(value)] for value in cluster_values]
+cell_type[analysis_cells] = [final_labels[str(value)] for value in cluster_values]
 ds.cells.insert("reviewed_cell_type", cell_type, overwrite=True)
 pd.Series(cell_type[analysis_cells]).value_counts()
 ```
 
-The insertion is an explicit user metadata edit. It does not alter the immutable clustering or
-marker artifacts. To update cell types later, edit `label_map` and re-run the cell above:
-`overwrite=True` replaces the `reviewed_cell_type` column in place, so revision is one edit plus
-one re-execution, with the clustering and marker evidence untouched.
-
-### Do the final annotations remain spatially coherent?
+With all our updated annotations, we can now visualize them to see the difference between our initial cell types versus our final.
 
 ```{code-cell}
+ds.plots.embedding(
+    layout=run["umap"],
+    color_by="proposed_cell_type",
+    legend_loc="right",
+)
+
 ds.plots.embedding(
     layout=run["umap"],
     color_by="reviewed_cell_type",
@@ -244,21 +254,13 @@ ds.plots.embedding(
 )
 ```
 
-Keep the label map, marker ref, run ID, and review rationale in the study record. Cluster IDs can
-change when the graph or partition changes. Overlap-based `smart_label` helps compare two
-partitions, but it is not ontology annotation; that partition-comparison role belongs in
-{doc}`clustering`.
-
-For scATAC-seq, {doc}`scatac_seq` uses GeneScores to display marker accessibility. GeneScores are
-accessibility summaries, not measured RNA expression. Use {doc}`mapping_and_label_transfer` when a
-query should inherit labels from a fixed reference rather than be annotated de novo.
 
 ## Important caveats to consider regarding annotation
-
-- **[Placeholder]:** [Placeholder]
-- **[Placeholder]:** [Placeholder]
-- **[Placeholder]:** [Placeholder]
 
 # Alternative annotation steps / depth [create title]
 
 ehh maybe required maybe not
+
+[Placeholder]: [Placeholder]
+[Placeholder]: [Placeholder]
+[Placeholder]: [Placeholder]
