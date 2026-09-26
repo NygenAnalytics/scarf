@@ -259,8 +259,13 @@ ds.plots.embedding(
 
 ## Important caveats to consider regarding annotation
 
-# Annotation Resources
+**Clustering algorithms discretize continuous biological spectrums:** Graph clustering (such as Leiden) forces cells into rigid, separate categories. In reality, biological processes, such as T-cell activation, monocyte differentiation, and exhausted states, exist along continuous transcriptional trajectories. Neighboring clusters often represent transitional points along a gradient rather than isolated, distinct cell types.
 
+* **Heterotypic doublets may mimic"novel" transitional populations:** Droplets that capture two different cells (e.g., a T cell and a B cell) generate hybrid transcriptomes. Because they express moderate levels of conflicting marker programs, they frequently group into small, intermediate clusters. Always evaluate doublet scores and negative markers before proceeding, thus why quality control is so critical.
+* **Ambient RNA contaminates negative controls:** Cell lysis during tissue dissociation releases highly abundant transcripts (such as lysozyme, hemoglobin, or ribosomal proteins) into the cell suspension. These ambient transcripts enter droplets indiscriminately, meaning negative markers rarely display a literal mathematical zero( `frac_exp` = 0.00) This why we use other metrics like `score`and `auc` become key in ensuring our negative controls stay negative.
+* **Granularity depends on clustering resolution:** The number of clusters discovered is a mathematical function of graph resolution, not an objective count of biological lineages. Coarse resolutions will merge rare populations (such as pDCs or innate lymphoid cells) into dominant clusters, while fine resolutions will artificially fracture homogenous populations into arbitrary sub-clusters. Thus, probing across multiple clusters can be useful to determine the cell types that exist inside of your dataset.
+
+# Annotation Resources
 
 [Placeholder]: [Placeholder]
 [Placeholder]: [Placeholder]
