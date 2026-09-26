@@ -131,11 +131,8 @@ def _scale_count_rows(
 def _library_size_scaled(assay: "Assay", counts: ChunkedArray) -> ChunkedArray:
     """Scale each cell's counts by the size factor over its total.
 
-    NumPy keeps an integer dtype when it multiplies by an integer size factor,
-    so uint16 products wrap and uint8 products raise. Integer counts are
-    therefore scaled in float64. For 32- and 64-bit counts that do not
-    overflow, the result is bit-identical to the integer product followed by
-    the division. Floating-point counts keep their dtype and rounding.
+    Integer counts are promoted to float64 before multiplication to prevent
+    overflow. Floating-point counts keep their dtype and rounding.
     """
     assert assay.sf is not None and assay.scalar is not None
     totals = assay.scalar.reshape(-1, 1)
@@ -248,8 +245,6 @@ norm_tf_idf.artifact_identity = (  # type: ignore[attr-defined]
 )
 
 
-# Recorded only by artifacts whose values changed when narrow integer counts
-# were promoted to float64 before normalization.
 COUNT_ARITHMETIC: Literal["float64"] = "float64"
 
 type NormalizedValueSource = Literal[
@@ -263,24 +258,23 @@ def normalizer_count_arithmetic(
 ) -> Literal["float64"] | None:
     """Return the count-arithmetic marker of values ``method`` computes.
 
-    Library-size and CLR normalization once scaled and logged integer counts
-    in their stored dtype, so counts narrower than 32 bits wrapped, overflowed,
-    or lost precision. Artifacts computed by these functions from such counts
-    record ``COUNT_ARITHMETIC`` so that results written before the fix are
-    never reused. Every other artifact keeps its identity, because its values
-    did not change.
+    Library-size scaling records the marker for every integer dtype because
+    the integer product could overflow. CLR records it only for integers
+    narrower than 32 bits, whose logarithms were not already float64.
 
     Args:
         assay: Assay whose counts ``method`` normalizes.
         method: Normalization function applied to the counts.
 
     Returns:
-        ``COUNT_ARITHMETIC``, or None when the values did not change.
+        ``COUNT_ARITHMETIC``, or None when the arithmetic did not change.
     """
     if method not in (norm_lib_size, norm_lib_size_log, norm_clr):
         return None
     dtype = np.dtype(assay.rawData.dtype)
-    return COUNT_ARITHMETIC if dtype.kind in "iu" and dtype.itemsize < 4 else None
+    if dtype.kind not in "iu" or (method is norm_clr and dtype.itemsize >= 4):
+        return None
+    return COUNT_ARITHMETIC
 
 
 def recorded_count_arithmetic(parameters: Mapping[str, Any]) -> dict[str, str]:

@@ -1,11 +1,4 @@
-"""Count arithmetic on narrow integer stores and bit-identity on wide stores.
-
-H5AD imports store integral counts in the smallest lossless unsigned dtype,
-so most imported scRNA-seq stores hold uint8 or uint16 counts. Normalization
-must promote them before scaling or taking logarithms. Stores with 32- or
-64-bit integer or floating-point counts must keep their previous values
-bit for bit.
-"""
+"""Integer normalization arithmetic and reuse of saved results."""
 
 import itertools
 import pickle
@@ -21,7 +14,12 @@ import pytest
 from scipy.sparse import csr_matrix
 
 from scarf.assay.feature_summary import ensure_feature_summary
-from scarf.assay.normalization import norm_clr, norm_lib_size, norm_lib_size_log
+from scarf.assay.normalization import (
+    norm_clr,
+    norm_lib_size,
+    norm_lib_size_log,
+    normalizer_count_arithmetic,
+)
 from scarf.datastore.datastore import DataStore
 from scarf.mapping.features import _normalization_parameters
 from scarf.matrix import ChunkedArray
@@ -146,8 +144,7 @@ def _feature_mask(store: DataStore, assay: str, feat_idx: np.ndarray) -> Any:
     return store.set_feature_selection(from_assay=assay, mask=mask)
 
 
-# Old expressions, kept verbatim to prove that wide and floating-point counts
-# keep their previous values bit for bit.
+# Old expressions for checking arithmetic and reuse of saved results.
 def _old_lib_size(assay: Any, counts: ChunkedArray) -> ChunkedArray:
     return assay.sf * counts / assay.scalar.reshape(-1, 1)
 
@@ -381,12 +378,15 @@ def test_chunked_ufuncs_honor_a_requested_dtype():
     np.testing.assert_array_equal(restored.compute(), expected)
 
 
-WIDE_AND_FLOAT = ["uint32", "int32", "int64", "float32", "float64"]
+WIDE_INTEGERS = ["uint32", "int32", "uint64", "int64"]
+WIDE_AND_FLOAT = [*WIDE_INTEGERS, "float32", "float64"]
 
 
 @pytest.mark.parametrize("block_size", [1, 3, 64])
 @pytest.mark.parametrize("dtype", WIDE_AND_FLOAT)
-def test_normalizers_are_bit_identical_for_wide_and_float_counts(dtype, block_size):
+def test_normalizers_are_bit_identical_for_small_wide_and_float_counts(
+    dtype, block_size
+):
     rng = np.random.default_rng(5)
     raw = rng.poisson(rng.gamma(0.8, 20.0, size=17), size=(41, 17))
     raw[:, 0] += rng.integers(1_000, 100_000, size=41)
@@ -396,7 +396,7 @@ def test_normalizers_are_bit_identical_for_wide_and_float_counts(dtype, block_si
         values = raw.astype(dtype)
     counts = ChunkedArray.from_numpy(values, block_size=block_size)
     scalar = np.asarray(values.sum(axis=1), dtype=np.float64)
-    assay = SimpleNamespace(sf=SIZE_FACTOR, scalar=scalar)
+    assay = SimpleNamespace(sf=SIZE_FACTOR, scalar=scalar, rawData=counts)
 
     for new, old in (
         (norm_lib_size, _old_lib_size),
@@ -407,6 +407,42 @@ def test_normalizers_are_bit_identical_for_wide_and_float_counts(dtype, block_si
         previous = old(assay, counts).compute()
         assert actual.dtype == previous.dtype
         np.testing.assert_array_equal(actual, previous)
+        expected_marker = (
+            "float64" if dtype in WIDE_INTEGERS and new is not norm_clr else None
+        )
+        assert normalizer_count_arithmetic(assay, new) == expected_marker
+
+
+@pytest.mark.parametrize("dtype", WIDE_INTEGERS)
+@pytest.mark.parametrize("log_transform", [False, True])
+@pytest.mark.parametrize("block_size", [1, 3])
+@pytest.mark.filterwarnings("ignore:invalid value encountered in log1p:RuntimeWarning")
+def test_library_size_normalization_at_integer_overflow(
+    dtype, log_transform, block_size
+):
+    largest_safe = int(np.iinfo(dtype).max) // SIZE_FACTOR
+    values = np.array([[largest_safe, 1], [largest_safe + 1, 1]], dtype=dtype)
+    counts = ChunkedArray.from_numpy(values, block_size=block_size)
+    assay = SimpleNamespace(
+        sf=SIZE_FACTOR,
+        scalar=values.sum(axis=1).astype(np.float64),
+        rawData=counts,
+    )
+    method = norm_lib_size_log if log_transform else norm_lib_size
+    old_method = _old_lib_size_log if log_transform else _old_lib_size
+
+    actual = method(assay, counts).compute()
+    previous = old_method(assay, counts).compute()
+
+    assert actual.dtype == np.float64
+    assert np.isfinite(actual).all()
+    np.testing.assert_allclose(
+        actual,
+        _lib_size_reference(values, log_transform=log_transform),
+        rtol=1e-15,
+    )
+    assert not np.isclose(actual[1, 0], previous[1, 0])
+    assert normalizer_count_arithmetic(assay, method) == "float64"
 
 
 @pytest.mark.parametrize(
@@ -568,8 +604,7 @@ def _identity_scenario(zarr_path: str) -> dict[str, str]:
         }
 
 
-# Provenance hashes computed by the code before narrow counts recorded a
-# count-arithmetic marker. Wide-count identities must not change.
+# Unmarked provenance hashes used to check which artifact identities change.
 WIDE_COUNT_IDENTITIES = {
     "adt": ("6782383c63a5a3acfce86825ae70954d07d6ae74a8ce3aa14adc6ffbd2c21093"),
     "cells": ("b822a10791dd96fc4aeb1817b5abe1a153e4a6f30e4200853e456070e4de5c18"),
@@ -619,13 +654,26 @@ WIDE_COUNT_IDENTITIES = {
 
 
 @pytest.mark.filterwarnings("ignore:Cell-level statistical testing:UserWarning")
-def test_wide_count_identities_match_the_code_before_the_marker(
+def test_wide_count_identities_change_only_for_library_size_normed_values(
     datastore_zarr_root, tmp_path
 ):
-    # The fixture stores uint32 counts, so no artifact records the marker.
     shutil.copytree(datastore_zarr_root, tmp_path / "store")
 
-    assert _identity_scenario(str(tmp_path / "store")) == WIDE_COUNT_IDENTITIES
+    actual = _identity_scenario(str(tmp_path / "store"))
+
+    assert actual.keys() == WIDE_COUNT_IDENTITIES.keys()
+    assert {
+        name
+        for name, identity in actual.items()
+        if identity != WIDE_COUNT_IDENTITIES[name]
+    } == {
+        "normalized_rna_False_False",
+        "normalized_rna_False_True",
+        "markers_rna_renormalized",
+        "pseudotime_markers_rna_renormalized",
+        "pseudotime_aggregation_rna_renormalized",
+        "statistical_tests_rna",
+    }
 
 
 # Artifacts whose values ``normed`` computes on narrow counts. Every other
@@ -651,8 +699,6 @@ def test_narrow_counts_record_count_arithmetic_only_where_values_changed(tmp_pat
     from scarf.metadata.selection import NormalizationSpec
     from tests.fixtures_datastore import _input_ref, build_neighbourhood_graph
 
-    # The marker depends only on counts narrower than 32 bits, so one narrow
-    # dtype covers it.
     store = _h5ad_store(
         tmp_path, _multimodal_counts(3000), feature_type=MULTIMODAL_TYPES
     )
@@ -773,6 +819,81 @@ def test_stale_narrow_normalizations_are_not_reused(tmp_path):
         artifact_group(store.zw, stale_rna)["data"][:], stale_values
     )
     assert normalize() == (fresh_rna, fresh_adt)
+
+
+@pytest.mark.parametrize("dtype", WIDE_AND_FLOAT)
+@pytest.mark.filterwarnings("ignore:invalid value encountered in log1p:RuntimeWarning")
+def test_saved_normalizations_and_pca_track_count_arithmetic(tmp_path, dtype):
+    integer_counts = dtype in WIDE_INTEGERS
+    count = int(np.iinfo(dtype).max) // SIZE_FACTOR + 1 if integer_counts else 5_000_000
+    values = np.array(
+        [
+            [count, 1, 100],
+            [count + 1000, 200, 200],
+            [count // 2, 400, 300],
+            [count // 3, 250, 400],
+        ],
+        dtype=dtype,
+    )
+    if not integer_counts:
+        values += 0.5
+    store = _h5ad_store(tmp_path, values, source_dtype=dtype)
+    assert store.RNA.rawData.dtype == np.dtype(dtype)
+    assert store.RNA.sf == SIZE_FACTOR
+    cells = store.snapshot_cell_selection()
+    features = store.select_all_features(from_assay="RNA")
+    pca_options = {"dims": 1, "feat_scaling": False, "local_cache": False}
+
+    def normalize(log_transform):
+        return store.run_normalization(
+            cells,
+            features,
+            renormalize_subset=False,
+            log_transform=log_transform,
+        )
+
+    with _code_before_the_fix(store):
+        saved = [normalize(log_transform) for log_transform in (False, True)]
+        saved_pca = store.run_pca(saved[0], **pca_options)
+        saved_subset = store.run_normalization(cells, features)
+    saved_values = [
+        np.asarray(artifact_group(store.zw, ref)["data"][:]) for ref in saved
+    ]
+
+    fresh = [normalize(log_transform) for log_transform in (False, True)]
+    for log_transform, before, after, previous in zip(
+        (False, True), saved, fresh, saved_values
+    ):
+        assert (after != before) == integer_counts
+        parameters = store.inspect_artifact(after).parameters or {}
+        assert parameters.get("count_arithmetic") == (
+            "float64" if integer_counts else None
+        )
+        actual = np.asarray(artifact_group(store.zw, after)["data"][:])
+        assert np.isfinite(actual).all()
+        np.testing.assert_allclose(
+            actual,
+            _lib_size_reference(values, log_transform=log_transform).astype(np.float32),
+            rtol=1e-6,
+        )
+        np.testing.assert_array_equal(
+            artifact_group(store.zw, before)["data"][:], previous
+        )
+        assert normalize(log_transform) == after
+
+    if integer_counts:
+        assert abs(saved_values[0][0, 0] - _lib_size_reference(values)[0, 0]) > 100
+    fresh_pca = store.run_pca(fresh[0], **pca_options)
+    assert (fresh_pca != saved_pca) == integer_counts
+    expected_center = np.asarray(artifact_group(store.zw, fresh[0])["data"][:]).mean(
+        axis=0, dtype=np.float64
+    )
+    np.testing.assert_allclose(
+        artifact_group(store.zw, fresh_pca)["center"][:], expected_center
+    )
+    assert store.run_pca(fresh[0], **pca_options) == fresh_pca
+    assert store.run_pca(saved[0], **pca_options) == saved_pca
+    assert store.run_normalization(cells, features) == saved_subset
 
 
 def test_uint16_pipeline_reuses_every_artifact_written_before_the_fix(tmp_path):
