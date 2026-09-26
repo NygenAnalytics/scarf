@@ -1,6 +1,6 @@
 """Embedding scatter plots."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from typing import Any, Hashable
 
 import numpy as np
@@ -18,6 +18,7 @@ from ._contracts import (
     PlotProvenance,
 )
 from ._data import (
+    _cell_metadata_columns,
     _resolve_grouping,
     _resolve_layout,
     fetch_normalized_feature_matrix,
@@ -100,6 +101,7 @@ def _color_labels(
     *,
     from_assay: str | None,
 ) -> list[str]:
+    metadata_columns = _cell_metadata_columns(store, color_items)
     labels: list[str] = []
     for item in color_items:
         if item is None:
@@ -108,7 +110,7 @@ def _color_labels(
             labels.append(item.kind)
         elif isinstance(item, CellField):
             labels.append(item.label or item.key)
-        elif isinstance(item, str) and item in store.cells.columns:
+        elif isinstance(item, str) and item in metadata_columns:
             labels.append(item)
         else:
             labels.append(resolve_feature(store, item, from_assay=from_assay).label)
@@ -364,13 +366,18 @@ def _prefetch_colors(
     store: Any,
     color_items: Sequence[str | ArtifactRef | FeatureRef | CellField | None],
     *,
+    metadata_columns: Collection[str],
     from_assay: str | None,
     cell_key: str,
     n_cells: int,
     normalization: NormalizationSpec,
     cell_indices: np.ndarray | None = None,
 ) -> list[tuple[np.ndarray, str, bool, bool]]:
-    """Return list of (values, label, is_categorical, is_uniform)."""
+    """Return list of (values, label, is_categorical, is_uniform).
+
+    ``metadata_columns`` lists the cell-metadata columns that a plain string
+    item may name; any other string item is resolved as a feature.
+    """
     out: list[tuple[np.ndarray, str, bool, bool]] = []
 
     # Batch RNA-like feature refs / gene strings for one matrix read.
@@ -421,7 +428,7 @@ def _prefetch_colors(
                 )
             )
             continue
-        if isinstance(item, str) and item in store.cells.columns:
+        if isinstance(item, str) and item in metadata_columns:
             vals = _selected_metadata_column(
                 store,
                 item,
@@ -1407,9 +1414,11 @@ def embedding(
         stored_displays.append(
             None if column is None else stored_display_metadata(store, column)
         )
+    metadata_columns = _cell_metadata_columns(store, color_items)
     color_cache = _prefetch_colors(
         store,
         color_items,
+        metadata_columns=metadata_columns,
         from_assay=resolved_from_assay,
         cell_key=cell_key,
         n_cells=n,
@@ -2062,7 +2071,7 @@ def embedding(
     for item in color_items:
         if not (
             isinstance(item, FeatureRef)
-            or (isinstance(item, str) and item not in store.cells.columns)
+            or (isinstance(item, str) and item not in metadata_columns)
         ):
             continue
         assay_name = (

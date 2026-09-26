@@ -1,8 +1,4 @@
 from collections.abc import Generator, Sequence
-from contextlib import contextmanager
-from contextvars import ContextVar
-import threading
-import time
 from typing import Any, Literal, cast
 
 import numpy as np
@@ -16,25 +12,12 @@ from ..storage.artifacts import provenance_hash
 from ..storage.budget import ResourceBudget, resolve_budget
 from ..storage.types import as_zarr_array, as_zarr_group
 from ..utils.arrays import array_digest, regex_match_mask
-from ..utils.compute import controlled_compute, compute_with_progress
+from ..utils.compute import controlled_compute
 from ..utils.logging import logger
 from .normalization import NormMethod, norm_dummy, norm_lib_size
+from ..utils.arrays import has_duplicates
 
 type PercentFeatures = dict[str, str]
-
-_DEFER_FEATURE_PROPS: ContextVar[bool] = ContextVar(
-    "scarf_defer_feature_props",
-    default=False,
-)
-
-
-@contextmanager
-def _defer_feature_props() -> Generator[None, None, None]:
-    token = _DEFER_FEATURE_PROPS.set(True)
-    try:
-        yield
-    finally:
-        _DEFER_FEATURE_PROPS.reset(token)
 
 
 class Assay:
@@ -80,7 +63,6 @@ class Assay:
         if workspace is None:
             self._artifact_root = z
             counts_path = f"{name}/counts"
-            counts_t_path = f"{name}/countsT"
             matrix_group = as_zarr_group(matrix_root[name], name=name)
             self.rawData = ChunkedArray(
                 as_zarr_array(matrix_root[counts_path], name=counts_path),
@@ -93,7 +75,6 @@ class Assay:
         else:
             self._artifact_root = as_zarr_group(z[workspace], name=workspace)
             counts_path = f"matrices/{name}/counts"
-            counts_t_path = f"matrices/{name}/countsT"
             matrix_group = as_zarr_group(
                 matrix_root[f"matrices/{name}"],
                 name=f"matrices/{name}",
@@ -107,28 +88,12 @@ class Assay:
             self.feats = MetaData(z[f"{workspace}/{name}/featureData"])  # type: ignore
             self.z = as_zarr_group(z[f"{workspace}/{name}"], name=f"{workspace}/{name}")
         self.matrixGroup = matrix_group
-        self.rawDataT: zarr.Array | None = None
-        if "countsT" in matrix_group:
-            try:
-                counts_t = as_zarr_array(matrix_group["countsT"], name=counts_t_path)
-            except TypeError:
-                logger.warning(
-                    f"({self.name}) Ignoring countsT at {counts_t_path}: "
-                    "expected a Zarr array"
-                )
-            else:
-                expected_shape = (self.rawData.shape[1], self.rawData.shape[0])
-                if (
-                    counts_t.attrs.get("complete") is True
-                    and tuple(counts_t.shape) == expected_shape
-                    and np.dtype(counts_t.dtype) == np.dtype(self.rawData.dtype)
-                ):
-                    self.rawDataT = counts_t
-                else:
-                    logger.warning(
-                        f"({self.name}) Ignoring countsT at {counts_t_path}: "
-                        "incomplete or mismatched with counts"
-                    )
+        from ..storage.counts_t_contract import validate_count_matrix
+
+        _, self.rawDataT = validate_count_matrix(
+            matrix_group,
+            require_transpose=self.requiresCountsT or "countsT" in matrix_group,
+        )
         self.attrs = self.z.attrs
         self.normMethod: NormMethod = norm_dummy
         self.sf: int | None = None
@@ -136,8 +101,6 @@ class Assay:
         self.n_term_per_doc: np.ndarray | None = None
         self.n_docs: int | None = None
         self.n_docs_per_term: np.ndarray | None = None
-        self._deferred_feature_props = False
-        self._ini_feature_props()
 
     def _percent_features(self) -> PercentFeatures:
         raw = self.attrs.get("percentFeatures", {})
@@ -146,18 +109,11 @@ class Assay:
         return {str(k): str(v) for k, v in raw.items()}
 
     def _cell_count_totals(self, cell_idx: np.ndarray) -> np.ndarray:
-        """Read cell totals, computing missing read-only totals from raw counts."""
+        """Read the prepared cell totals."""
         if len(cell_idx) == 0:
             return np.empty(0, dtype=np.float64)
         column = self.name + "_nCounts"
-        if column in self.cells.columns or not self.z.read_only:
-            totals = self.cells.fetch_all(column)[cell_idx]
-        else:
-            totals = compute_with_progress(
-                self.rawData[cell_idx, :].sum(axis=1),
-                f"({self.name}) Computing total counts for normalization",
-                self.nthreads,
-            )
+        totals = self.cells.fetch_all(column)[cell_idx]
         return np.asarray(totals, dtype=np.float64)
 
     def normed(
@@ -179,6 +135,9 @@ class Assay:
 
         Returns: A chunked array (delayed matrix) containing normalized data.
         """
+        from ..storage.identity import read_dataset_fingerprint
+
+        read_dataset_fingerprint(self.z)
         if cell_idx is None:
             cell_idx = self.cells.active_index("I")
         if feat_idx is None:
@@ -210,218 +169,152 @@ class Assay:
                 sm = vstack([sm, s])
         return sm  # type: ignore
 
-    def _ini_feature_props(self) -> None:
-        """ """
-        if self.z.read_only:
-            return
-        if "nCells" in self.feats.columns and "dropOuts" in self.feats.columns:
-            return
-        if _DEFER_FEATURE_PROPS.get():
-            self._deferred_feature_props = True
-            return
-        ncells = compute_with_progress(
-            (self.rawData > 0).sum(axis=0),
-            f"({self.name}) Computing nCells and dropOuts",
-            self.nthreads,
+    requiresCountsT = False
+
+    def prepare(self, percent_patterns: dict[str, str | None]) -> None:
+        from ..storage.identity import (
+            REBUILD_REQUIRED,
+            clear_column,
+            fresh_group,
+            load_count_summaries,
+            publish_preparation,
+            validate_preparation,
         )
-        self._store_feature_props(ncells)
 
-    def _store_feature_props(self, ncells: np.ndarray) -> None:
-        self.feats.insert("nCells", ncells, overwrite=True)
-        self.feats.insert(
-            "dropOuts",
-            abs(self.cells.N - self.feats.fetch_all("nCells")),
-            overwrite=True,
-        )
-        self._deferred_feature_props = False
-
-    def _stream_initialization_stats(
-        self,
-        *,
-        compute_n_counts: bool,
-        compute_n_features: bool,
-        compute_n_cells: bool,
-        percent_feature_indices: dict[str, np.ndarray],
-    ) -> dict[str, np.ndarray]:
-        n_cells, n_features = self.rawData.shape
-        sum_dtype = np.asarray(np.empty(0, dtype=self.rawData.dtype).sum()).dtype
-        stats: dict[str, np.ndarray] = {}
-        if compute_n_counts:
-            stats["nCounts"] = np.empty(n_cells, dtype=sum_dtype)
-        if compute_n_features:
-            stats["nFeatures"] = np.empty(n_cells, dtype=np.int64)
-        if compute_n_cells:
-            stats["nCells"] = np.zeros(n_features, dtype=np.int64)
-        for name in percent_feature_indices:
-            stats[name] = np.empty(n_cells, dtype=sum_dtype)
-
-        from ..storage.execution import (
-            ExecutionReport,
-            WorkShape,
-            plan_operation,
-            record_execution_report,
-        )
-        from ..storage.parallel import map_shards
-        from ..utils.compute import pairwise_merge_tree
-
-        ranges = self.rawData._ranges()
-        largest_rows = max((end - start for start, end in ranges), default=1)
-        matrix_elements = largest_rows * max(1, n_features)
-        geometry = self.rawData._geometry()
-        chunks_per_range = (
-            1
-            if geometry is None
-            else max(
-                1,
-                -(-largest_rows // geometry.axisChunk(0))
-                * -(-n_features // geometry.axisChunk(1)),
+        self.z = fresh_group(self.z)
+        self.attrs = self.z.attrs
+        state = self.attrs.get("prepared")
+        cells = self.cells.locations["primary"]
+        if state is True:
+            validate_preparation(
+                self.z,
+                cells,
+                self.matrixGroup,
+                require_transpose=self.requiresCountsT,
             )
+            for name, pattern in percent_patterns.items():
+                if pattern and self._plan_percent_feature(pattern, name) is not None:
+                    raise ValueError(
+                        f"Required percentage {name!r} is missing. {REBUILD_REQUIRED}"
+                    )
+            return
+        if state is not False or self.z.read_only:
+            raise ValueError(f"Assay {self.name!r} is not prepared. {REBUILD_REQUIRED}")
+
+        for name in set(percent_patterns) | set(self._percent_features()):
+            clear_column(cells, name)
+        self.attrs["percentFeatures"] = {}
+        planned = {
+            name: result
+            for name, pattern in percent_patterns.items()
+            if pattern
+            and (result := self._plan_percent_feature(pattern, name)) is not None
+        }
+        n_counts, n_features, n_cells = load_count_summaries(
+            self.matrixGroup, as_zarr_array(self.matrixGroup["counts"], name="counts")
         )
-        decode_bytes = self.rawData._max_decode_bytes()
-        unit_bytes = matrix_elements * max(1, int(self.rawData.dtype.itemsize))
-        if compute_n_features or compute_n_cells:
-            unit_bytes += matrix_elements
-        if compute_n_counts:
-            unit_bytes += largest_rows * max(1, int(sum_dtype.itemsize))
-        if compute_n_features:
-            unit_bytes += largest_rows * np.dtype(np.int64).itemsize
-        if compute_n_cells:
-            unit_bytes += n_features * np.dtype(np.int64).itemsize
-        unit_bytes += (
-            len(percent_feature_indices)
-            * largest_rows
-            * max(1, int(sum_dtype.itemsize))
+        totals = self._feature_totals(
+            {name: result[0] for name, result in planned.items()}
         )
-        plan = plan_operation(
-            self.resources,
-            WorkShape(
-                nUnits=max(1, len(ranges)),
-                unitBytes=max(1, unit_bytes),
-                innerReadBytes=decode_bytes,
-                chunksPerShard=chunks_per_range,
-                ordered=False,
+        self.cells.insert(f"{self.name}_nCounts", n_counts, overwrite=True)
+        self.cells.insert(
+            f"{self.name}_nFeatures", n_features.astype(np.float64), overwrite=True
+        )
+        self.feats.insert("nCells", n_cells, overwrite=True)
+        self.feats.insert("dropOuts", self.cells.N - n_cells, overwrite=True)
+        for name, (_, fingerprint) in planned.items():
+            pattern = percent_patterns[name]
+            assert pattern is not None
+            self._write_percent_feature(
+                name,
+                totals[name],
+                feat_pattern=pattern,
+                feature_fingerprint=fingerprint,
+                n_counts=n_counts,
+            )
+        publish_preparation(
+            self.z,
+            cells,
+            self.matrixGroup,
+            require_transpose=self.requiresCountsT,
+        )
+        self.z = fresh_group(self.z)
+        self.attrs = self.z.attrs
+
+    def _feature_totals(self, indices: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        """Sum each feature set per cell, reading only the selected features.
+
+        Sums saved while ``countsT`` was written are reused when they cover
+        exactly the same features of the same counts.
+        """
+        from ..storage.execution import WorkShape, plan_operation
+        from ..storage.identity import load_feature_sums
+        from ..storage.parallel import stream_shards
+
+        counts = as_zarr_array(self.matrixGroup["counts"], name="counts")
+        saved = {
+            name: load_feature_sums(self.matrixGroup, counts, np.unique(values))
+            for name, values in indices.items()
+        }
+        found = {name: sums for name, sums in saved.items() if sums is not None}
+        indices = {
+            name: values for name, values in indices.items() if name not in found
+        }
+        if not indices:
+            return found
+        wanted = np.unique(np.concatenate(list(indices.values())))
+        positions = {
+            name: np.searchsorted(wanted, values) for name, values in indices.items()
+        }
+        totals = {name: np.zeros(self.cells.N, dtype=np.float64) for name in indices}
+        if self.rawDataT is None:
+            offset = 0
+            for block in self.rawData[:, wanted].stream_blocks(nthreads=self.nthreads):
+                values = np.asarray(block, dtype=np.float64)
+                for name, position in positions.items():
+                    totals[name][offset : offset + len(values)] = values[
+                        :, position
+                    ].sum(axis=1)
+                offset += len(values)
+            return {**found, **totals}
+        source = self.rawDataT
+        cell_chunk = max(1, int(source.chunks[1]))
+        column_bytes = 2 * len(wanted) * np.dtype(np.float64).itemsize
+        target = min(64 * 1024**2, self.resources.memoryBytes // 4)
+        band = max(
+            1,
+            min(
+                self.cells.N,
+                cell_chunk * max(1, target // (cell_chunk * column_bytes)),
             ),
+        )
+        bands = [
+            (start, min(start + band, self.cells.N))
+            for start in range(0, self.cells.N, band)
+        ]
+        operation = plan_operation(
+            self.resources,
+            WorkShape(nUnits=len(bands), unitBytes=band * column_bytes),
             policy=self.storageIo,
         )
-        compute_slots = threading.Semaphore(plan.computeWorkers)
 
-        def produce(
-            index: int, start: int, end: int
-        ) -> tuple[
-            int,
-            int,
-            int,
-            np.ndarray | None,
-            np.ndarray | None,
-            np.ndarray | None,
-            dict[str, np.ndarray],
-            float,
-            float,
-        ]:
-            fetch_started = time.perf_counter()
-            raw = self.rawData._materialize_range(start, end)
-            fetch_seconds = time.perf_counter() - fetch_started
-            with compute_slots:
-                compute_started = time.perf_counter()
-                n_counts = raw.sum(axis=1) if compute_n_counts else None
-                positive = None
-                if compute_n_features or compute_n_cells:
-                    positive = raw > 0
-                n_features = (
-                    positive.sum(axis=1)
-                    if compute_n_features and positive is not None
-                    else None
-                )
-                n_cells_partial = (
-                    positive.sum(axis=0)
-                    if compute_n_cells and positive is not None
-                    else None
-                )
-                percents = {
-                    name: raw[:, feat_idx].sum(axis=1)
-                    for name, feat_idx in percent_feature_indices.items()
-                }
-                compute_seconds = time.perf_counter() - compute_started
-            return (
-                index,
-                start,
-                end,
-                n_counts,
-                n_features,
-                n_cells_partial,
-                percents,
-                fetch_seconds,
-                compute_seconds,
+        def add(bounds: tuple[int, int]) -> None:
+            start, stop = bounds
+            values = np.asarray(
+                source.get_orthogonal_selection((wanted, slice(start, stop))),
+                dtype=np.float64,
             )
+            for name, position in positions.items():
+                totals[name][start:stop] = values[position].sum(axis=0)
 
-        worker_count = min(plan.readWorkers, max(1, len(ranges)))
-        results = map_shards(
-            ranges,
-            produce,
-            workers=worker_count,
-            within_block_threads=plan.threadsPerComputeWorker,
-            io_concurrency=plan.ioConcurrency,
-            msg=f"Computing {self.name} initialization statistics",
-        )
-        covered = 0
-        fetch_seconds = 0.0
-        compute_seconds = 0.0
-        n_cell_partials: list[tuple[int, np.ndarray]] = []
-        for (
-            index,
-            start,
-            end,
-            n_counts,
-            n_features,
-            n_cells_partial,
-            percents,
-            unit_fetch_seconds,
-            unit_compute_seconds,
-        ) in results:
-            covered += end - start
-            fetch_seconds += unit_fetch_seconds
-            compute_seconds += unit_compute_seconds
-            if compute_n_counts:
-                assert n_counts is not None
-                stats["nCounts"][start:end] = n_counts
-            if compute_n_features:
-                assert n_features is not None
-                stats["nFeatures"][start:end] = n_features
-            if compute_n_cells:
-                assert n_cells_partial is not None
-                n_cell_partials.append((index, np.asarray(n_cells_partial)))
-            for name, values in percents.items():
-                stats[name][start:end] = values
-        record_execution_report(
-            ExecutionReport(
-                plan=plan,
-                unitKind="initializationRowBand",
-                actualReadWorkers=worker_count,
-                actualComputeWorkers=min(plan.computeWorkers, worker_count),
-                actualWriteWorkers=1,
-                fetchSeconds=fetch_seconds,
-                computeSeconds=compute_seconds,
-                unitsCompleted=len(results),
-                extra={
-                    "effectiveChunkReadsInFlight": (worker_count * plan.ioConcurrency),
-                    "fusedReadCompute": True,
-                },
-            )
-        )
-        if compute_n_cells and n_cell_partials:
-            n_cell_partials.sort(key=lambda item: item[0])
-            stats["nCells"] = pairwise_merge_tree(
-                [item[1] for item in n_cell_partials],
-                lambda left, right: left + right,
-            )
-        row_start = covered
-
-        if row_start != n_cells:
-            raise RuntimeError(
-                f"({self.name}) Initialization stream produced {row_start} rows; "
-                f"expected {n_cells}"
-            )
-        return stats
+        for _ in stream_shards(
+            bands,
+            add,
+            workers=operation.computeWorkers,
+            io_concurrency=operation.ioConcurrency,
+        ):
+            pass
+        return {**found, **totals}
 
     def _plan_percent_feature(
         self,
@@ -707,10 +600,10 @@ class Assay:
         if (
             np.any(cell_idx < 0)
             or np.any(cell_idx >= self.cells.N)
-            or np.unique(cell_idx).size != len(cell_idx)
+            or has_duplicates(cell_idx)
             or np.any(feat_idx < 0)
             or np.any(feat_idx >= self.feats.N)
-            or np.unique(feat_idx).size != len(feat_idx)
+            or has_duplicates(feat_idx)
         ):
             raise ValueError("Aggregation indices are invalid")
         n_cells = cell_ordering.shape[0]

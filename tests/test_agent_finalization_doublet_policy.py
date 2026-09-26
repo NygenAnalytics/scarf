@@ -13,7 +13,6 @@ from scarf.agent.orchestrator.models import (
     StageEvidenceReference,
     WorkflowIdentity,
     WorkflowStageAttempt,
-    artifact_model_to_ref,
 )
 from scarf.agent.parameter_tuning.contracts import (
     ArtifactRecord,
@@ -71,11 +70,11 @@ def _fixture(monkeypatch, *, scored=False, warning=None):
     statuses = {}
 
     def bind(ref, **inputs):
-        statuses[artifact_model_to_ref(ref)] = SimpleNamespace(
+        statuses[ref.to_artifact_ref()] = SimpleNamespace(
             exists=True,
             complete=True,
             inputs={
-                name: artifact_model_to_ref(value).to_dict()
+                name: value.to_artifact_ref().to_dict()
                 for name, value in inputs.items()
             },
         )
@@ -90,17 +89,15 @@ def _fixture(monkeypatch, *, scored=False, warning=None):
 
     def initialize(ref, **kwargs):
         layouts.append(("initialize", ref))
-        return artifact_model_to_ref(reference("embedding_initialization"))
+        return reference("embedding_initialization").to_artifact_ref()
 
     def umap(ref, initialization, **kwargs):
         layouts.append(("umap", ref))
-        return artifact_model_to_ref(reference("embedding"))
+        return reference("embedding").to_artifact_ref()
 
     store = SimpleNamespace(
-        zw=None,
-        summary=lambda: SimpleNamespace(
-            assays=[SimpleNamespace(name="RNA", assay_type="RNA")]
-        ),
+        zw=SimpleNamespace(attrs={"assayTypes": {"RNA": "RNA"}}),
+        assay_names=["RNA"],
         inspect_artifact=statuses.__getitem__,
         load_artifact=lambda ref: {},
         build_embedding_initialization=initialize,
@@ -109,7 +106,7 @@ def _fixture(monkeypatch, *, scored=False, warning=None):
     monkeypatch.setattr(
         finalization,
         "graph_cell_selection",
-        lambda root, graph: artifact_model_to_ref(cells),
+        lambda root, graph: cells.to_artifact_ref(),
     )
     monkeypatch.setattr(
         finalization.journal, "_ensure_orchestration_store", lambda store: "agents"

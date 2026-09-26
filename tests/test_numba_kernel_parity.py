@@ -348,3 +348,87 @@ def test_connectivity_python_union_find_kernels_cover_all_edge_cases() -> None:
     parents = np.array([1, 2, 2, 3], dtype=np.int64)
     connectivity._compress_paths.py_func(parents)
     np.testing.assert_array_equal(parents, [2, 2, 2, 3])
+
+
+def test_transpose_kernel_fills_ragged_tiles_of_a_strided_target() -> None:
+    from scarf.utils.strided import transpose_into
+
+    source = np.random.default_rng(3).integers(0, 50, (70, 45), dtype=np.uint16)
+    compiled = np.zeros((60, 90), dtype=np.uint16)
+    python = np.zeros_like(compiled)
+    transpose_into(source, compiled[5:50, 10:80])
+    transpose_into.py_func(source, python[5:50, 10:80])
+
+    np.testing.assert_array_equal(compiled[5:50, 10:80], source.T)
+    np.testing.assert_array_equal(python, compiled)
+    compiled[5:50, 10:80] = 0
+    assert not compiled.any()
+
+
+def test_row_summary_python_kernel_matches_compiled_kernel(monkeypatch) -> None:
+    from scarf.utils import digest
+
+    values = np.array([[0, 3, 0, 1], [0, 0, 0, 0], [2, -1, 0, 5]], dtype=np.int32)
+
+    def run(kernel):
+        outputs = (
+            np.zeros((3, 2), dtype=np.uint64),
+            np.zeros(3),
+            np.zeros(3, dtype=np.int64),
+            np.zeros(4, dtype=np.int64),
+        )
+        kernel(values, values.view(np.uint32), *outputs)
+        return outputs
+
+    compiled = run(digest.summarize_rows)
+    # Called from Python, the compiled mixer would type small ints as int64.
+    monkeypatch.setattr(digest, "_mix", digest._mix.py_func)
+    with np.errstate(over="ignore"):
+        python = run(digest.summarize_rows.py_func)
+
+    for expected, actual in zip(compiled, python, strict=True):
+        np.testing.assert_array_equal(actual, expected)
+    digests, row_sums, row_positive, column_positive = compiled
+    np.testing.assert_array_equal(row_sums, [4, 0, 6])
+    np.testing.assert_array_equal(row_positive, [2, 0, 2])
+    np.testing.assert_array_equal(column_positive, [1, 1, 0, 2])
+    assert len({tuple(row) for row in digests.tolist()}) == 3
+
+
+def test_column_copy_kernel_matches_fancy_assignment() -> None:
+    from scarf.utils.strided import copy_columns
+
+    source = np.random.default_rng(4).integers(0, 50, (6, 9), dtype=np.uint16)
+    columns = np.array([0, 2, 3, 7], dtype=np.int64)
+    positions = np.array([5, 1, 2, 9], dtype=np.int64)
+    expected = np.zeros((6, 12), dtype=np.uint16)
+    expected[:, positions] = source[:, columns]
+    for kernel in (copy_columns, copy_columns.py_func):
+        target = np.zeros_like(expected)
+        kernel(source, columns, target, positions)
+        np.testing.assert_array_equal(target, expected)
+
+
+def test_radix_argsort_matches_stable_argsort_for_positive_values() -> None:
+    from scarf.features.markers.rank import _argsort_positive
+
+    rng = np.random.default_rng(5)
+    values = np.concatenate(
+        [
+            rng.random(300).astype(np.float32) * 20 + 1e-3,
+            np.full(40, 2.5, dtype=np.float32),
+            np.float32([1e-30, 3e38, 7.0, 7.0]),
+        ]
+    )
+    rng.shuffle(values)
+    expected = np.argsort(values, kind="stable")
+    for kernel in (_argsort_positive, _argsort_positive.py_func):
+        order = np.full(values.size + 3, -1, dtype=np.int64)
+        kernel(
+            values,
+            values.size,
+            order,
+            np.empty_like(order),
+            np.empty(2048, dtype=np.int64),
+        )
+        np.testing.assert_array_equal(order[: values.size], expected)

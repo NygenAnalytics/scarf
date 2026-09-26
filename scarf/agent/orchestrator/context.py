@@ -36,7 +36,6 @@ from .models import (
     WorkflowQuestion,
     WorkflowStageAttempt,
     WorkflowStageLink,
-    artifact_model_to_ref,
 )
 from .rna import (
     selected_store_rna_assay,
@@ -45,20 +44,38 @@ from .rna import (
 )
 
 
+def _dataset_columns(assay: str) -> tuple[frozenset[str], frozenset[str]]:
+    """Return the cell and feature columns bound by the persisted dataset identity.
+
+    Identifiers and count summaries enter the dataset fingerprint directly. The
+    remaining generated feature summaries derive only from those protected counts.
+    """
+    from ...storage.identity import GENERATED_FEATURE_COLUMNS, generated_cell_columns
+
+    return (
+        frozenset({"ids", *generated_cell_columns(assay, None)}),
+        frozenset({"ids", *GENERATED_FEATURE_COLUMNS}),
+    )
+
+
 def _context_metadata_identity(
     store: DataStore, request_record: OrchestrationRequestRecord
 ) -> dict[str, str]:
     """Bind added metadata without repeating the original resume fingerprint scan."""
     from ..parameter_tuning.execution import _metadata_column_fingerprint
 
-    original = request_record.inputIdentity.get("data", {}).get("metadata", {})
-    # Public resume already validates every original column against this identity.
-    # Enrichment may add columns afterward; those also bind committed context work.
+    data = request_record.inputIdentity.get("data", {})
+    original = data.get("metadata", {})
+    assay = data.get("assay")
+    covered = _dataset_columns(assay)[0] if isinstance(assay, str) else frozenset()
+    # Public resume already validates the dataset identity and every original
+    # column. Enrichment may add columns afterward; those also bind context work.
     return {
         column: original[column]
         if column in original
         else _metadata_column_fingerprint(store.cells, column)
         for column in sorted(store.cells.columns)
+        if column not in covered
     }
 
 
@@ -470,7 +487,7 @@ class ContextStagesMixin:
                 )
             logger.info("Reusing RNA quality metrics")
             return existing
-        cell_selection_ref = artifact_model_to_ref(cell_selection)
+        cell_selection_ref = cell_selection.to_artifact_ref()
         logger.info("Computing RNA quality metrics")
         started = journal._start_attempt(
             store.zw,
@@ -680,7 +697,7 @@ class ContextStagesMixin:
                 )
             if not context_revision:
                 return existing, resolved_report
-        cell_selection_ref = artifact_model_to_ref(cell_selection)
+        cell_selection_ref = cell_selection.to_artifact_ref()
         paused = journal._validated_done_outcome(
             store,
             prefix,

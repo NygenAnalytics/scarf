@@ -650,6 +650,7 @@ def _artifact_color_cache(monkeypatch, values, *, kind, grouping_indices=None):
     cache = embedding_module._prefetch_colors(
         object(),
         [ref],
+        metadata_columns=(),
         from_assay=None,
         cell_key="I",
         n_cells=len(indices),

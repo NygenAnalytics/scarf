@@ -11,7 +11,6 @@ import numpy as np
 from ._contracts import FrameStyle, LegendLoc
 
 # Shared Scarf figure defaults used by embedding-like plots.
-DEFAULT_POINT_SIZE = 10.0
 DEFAULT_POINT_EDGEWIDTH = 0.1
 DEFAULT_RASTERIZE_THRESHOLD = 50_000
 DEFAULT_PANEL_INCHES = 3.2

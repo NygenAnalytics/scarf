@@ -1,16 +1,15 @@
 import math
 import os
 import resource
-import shutil
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from io import TextIOBase
 from pathlib import Path
 from types import TracebackType
-from typing import Literal, Self
+from typing import Any, Literal, Self
 
 from scarf.utils.process import (
     read_process_tree_rss_bytes as _read_process_tree_rss_bytes,
@@ -21,21 +20,10 @@ type LimitValue = int | Literal["max"] | None
 type _ReadText = Callable[[Path], str]
 type _WriteText = Callable[[Path, str], None]
 type _ListPids = Callable[[Path], Iterable[int]]
-type _AffinityReader = Callable[[int], Iterable[int]]
-type _DiskUsageReader = Callable[[Path], object]
-
-
-@dataclass(frozen=True, slots=True)
-class DiskUsage:
-    totalBytes: int
-    freeBytes: int
-    usedBytes: int
 
 
 @dataclass(frozen=True, slots=True)
 class ResourceMeasurement:
-    sampleCount: int
-    sampleIntervalSeconds: float
     operationBaselineBytes: int | None = None
     operationPeakBytes: int | None = None
     operationIncrementalPeakBytes: int | None = None
@@ -44,31 +32,14 @@ class ResourceMeasurement:
     processTreeRssPeakBytes: int | None = None
     processTreeRssIncrementalPeakBytes: int | None = None
     processTreeRssAfterBytes: int | None = None
-    cgroupPath: str | None = None
     cgroupMemoryCurrentBaselineBytes: int | None = None
     cgroupMemoryCurrentPeakBytes: int | None = None
     cgroupMemoryCurrentAfterBytes: int | None = None
     cgroupMemoryPeakBytes: int | None = None
     cgroupMemoryPeakScope: PeakScope = "unavailable"
     memoryMaxBytes: LimitValue = None
-    memorySwapCurrentBeforeBytes: int | None = None
-    memorySwapCurrentAfterBytes: int | None = None
-    memorySwapCurrentPeakBytes: int | None = None
-    memorySwapMaxBytes: LimitValue = None
-    memoryEventsBefore: dict[str, int] | None = None
-    memoryEventsAfter: dict[str, int] | None = None
     memoryEventsDelta: dict[str, int] | None = None
-    cpuQuotaMicros: LimitValue = None
-    cpuPeriodMicros: int | None = None
     cpuQuotaCores: float | None = None
-    cpuAffinityCpus: tuple[int, ...] | None = None
-    cpuAffinityCount: int | None = None
-    cpuAffinitySource: str | None = None
-    ephemeralDiskPath: str | None = None
-    ephemeralDiskBefore: DiskUsage | None = None
-    ephemeralDiskAfter: DiskUsage | None = None
-    ephemeralDiskPeak: DiskUsage | None = None
-    samplingErrorCount: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,17 +54,6 @@ class StageTimings:
 class _Sample:
     processTreeRssBytes: int | None
     cgroupMemoryCurrentBytes: int | None
-    memorySwapCurrentBytes: int | None
-    ephemeralDisk: DiskUsage | None
-
-
-@dataclass(frozen=True, slots=True)
-class _CpuSnapshot:
-    quotaMicros: LimitValue = None
-    periodMicros: int | None = None
-    quotaCores: float | None = None
-    affinityCpus: tuple[int, ...] | None = None
-    affinitySource: str | None = None
 
 
 def _default_read_text(path: Path) -> str:
@@ -110,17 +70,6 @@ def _default_list_pids(procRoot: Path) -> list[int]:
         for entry in procRoot.iterdir()
         if entry.name.isdigit() and entry.is_dir()
     ]
-
-
-def _default_affinity_reader(pid: int) -> Iterable[int]:
-    reader = getattr(os, "sched_getaffinity", None)
-    if reader is None:
-        raise OSError("CPU affinity is unavailable")
-    return reader(pid)
-
-
-def _default_disk_usage_reader(path: Path) -> object:
-    return shutil.disk_usage(path)
 
 
 def _optional_read(path: Path, readText: _ReadText) -> str | None:
@@ -202,46 +151,6 @@ def read_process_tree_rss_bytes(
     )
 
 
-def _coerce_disk_usage(value: object) -> DiskUsage | None:
-    if isinstance(value, DiskUsage):
-        return value
-    try:
-        if all(hasattr(value, name) for name in ("total", "used", "free")):
-            total = getattr(value, "total")
-            used = getattr(value, "used")
-            free = getattr(value, "free")
-        else:
-            total, used, free = value
-    except (AttributeError, TypeError, ValueError):
-        return None
-    values = (total, free, used)
-    if any(isinstance(item, bool) or not isinstance(item, int) for item in values):
-        return None
-    if any(item < 0 for item in values):
-        return None
-    return DiskUsage(totalBytes=total, freeBytes=free, usedBytes=used)
-
-
-def _parse_cpuset(value: str | None) -> tuple[int, ...] | None:
-    if value is None:
-        return None
-    cpus: set[int] = set()
-    try:
-        for item in value.strip().split(","):
-            if not item:
-                continue
-            if "-" not in item:
-                cpus.add(int(item))
-                continue
-            start, end = (int(part) for part in item.split("-", 1))
-            if start > end:
-                return None
-            cpus.update(range(start, end + 1))
-    except ValueError:
-        return None
-    return tuple(sorted(cpus)) if cpus else None
-
-
 def _relative_cgroup_path(value: str) -> tuple[str, ...] | None:
     for line in value.splitlines():
         parts = line.split(":", 2)
@@ -273,8 +182,6 @@ _V1_MEMORY_FILES = {
     "memory.current": "memory.usage_in_bytes",
     "memory.peak": "memory.max_usage_in_bytes",
     "memory.max": "memory.limit_in_bytes",
-    "memory.swap.current": "memory.memsw.usage_in_bytes",
-    "memory.swap.max": "memory.memsw.limit_in_bytes",
 }
 
 
@@ -287,13 +194,10 @@ class ResourceSampler:
         procRoot: str | Path = "/proc",
         cgroupRoot: str | Path = "/sys/fs/cgroup",
         cgroupPath: str | Path | None = None,
-        ephemeralDiskPath: str | Path | None = "/tmp",
         resetCgroupPeak: bool = True,
         readText: _ReadText | None = None,
         writeText: _WriteText | None = None,
         listPids: _ListPids | None = None,
-        affinityReader: _AffinityReader | None = None,
-        diskUsageReader: _DiskUsageReader | None = None,
     ) -> None:
         if isinstance(sampleIntervalSeconds, bool):
             raise ValueError("sampleIntervalSeconds must be a positive finite number")
@@ -309,19 +213,10 @@ class ResourceSampler:
         self.procRoot = Path(procRoot)
         self.cgroupRoot = Path(cgroupRoot)
         self._explicitCgroupPath = None if cgroupPath is None else Path(cgroupPath)
-        self.ephemeralDiskPath = (
-            None if ephemeralDiskPath is None else Path(ephemeralDiskPath)
-        )
         self.resetCgroupPeak = resetCgroupPeak
         self._readText = _default_read_text if readText is None else readText
         self._writeText = _default_write_text if writeText is None else writeText
         self._listPids = _default_list_pids if listPids is None else listPids
-        self._affinityReader = (
-            _default_affinity_reader if affinityReader is None else affinityReader
-        )
-        self._diskUsageReader = (
-            _default_disk_usage_reader if diskUsageReader is None else diskUsageReader
-        )
         self._usesDefaultTextIo = readText is None and writeText is None
 
         self._stateLock = threading.Lock()
@@ -336,23 +231,17 @@ class ResourceSampler:
     def _reset_values(self) -> None:
         self._result: ResourceMeasurement | None = None
         self._sampleCount = 0
-        self._samplingErrorCount = 0
         self._cgroupPath: Path | None = None
         self._cgroupVersion: Literal[1, 2] | None = None
         self._processTreeBaselineRssBytes: int | None = None
         self._processTreePeakRssBytes: int | None = None
         self._cgroupMemoryCurrentBaselineBytes: int | None = None
         self._cgroupMemoryCurrentPeakBytes: int | None = None
-        self._memorySwapCurrentBeforeBytes: int | None = None
-        self._memorySwapCurrentPeakBytes: int | None = None
         self._memoryEventsBefore: dict[str, int] | None = None
         self._memoryMaxBytes: LimitValue = None
-        self._memorySwapMaxBytes: LimitValue = None
+        self._cpuQuotaCores: float | None = None
         self._cgroupMemoryPeakInitialBytes: int | None = None
         self._cgroupMemoryPeakScope: PeakScope = "unavailable"
-        self._cpuSnapshot = _CpuSnapshot()
-        self._ephemeralDiskBefore: DiskUsage | None = None
-        self._ephemeralDiskPeak: DiskUsage | None = None
 
     @property
     def isRunning(self) -> bool:
@@ -368,10 +257,6 @@ class ResourceSampler:
     def result(self) -> ResourceMeasurement | None:
         with self._stateLock:
             return self._result
-
-    def _note_error(self) -> None:
-        with self._stateLock:
-            self._samplingErrorCount += 1
 
     def _cgroup_file_name(self, name: str) -> str:
         if self._cgroupVersion == 1:
@@ -470,54 +355,18 @@ class ResourceSampler:
         value = _optional_read(self._cgroupPath / "memory.events", self._readText)
         return None if value is None else parse_memory_events(value)
 
-    def _read_disk_usage(self) -> DiskUsage | None:
-        if self.ephemeralDiskPath is None:
+    def _read_cpu_quota_cores(self) -> float | None:
+        if self._cgroupPath is None:
             return None
-        try:
-            value = self._diskUsageReader(self.ephemeralDiskPath)
-        except Exception:
+        value = _optional_read(self._cgroupPath / "cpu.max", self._readText)
+        parts = [] if value is None else value.split()
+        if len(parts) < 2:
             return None
-        return _coerce_disk_usage(value)
-
-    def _read_cpu_snapshot(self) -> _CpuSnapshot:
-        quota: LimitValue = None
-        period: int | None = None
-        if self._cgroupPath is not None:
-            value = _optional_read(self._cgroupPath / "cpu.max", self._readText)
-            if value is not None:
-                parts = value.split()
-                if len(parts) >= 2:
-                    quota = _limit_value(parts[0])
-                    period = _nonnegative_int(parts[1])
-                    if period == 0:
-                        period = None
-        quota_cores = (
-            quota / period if isinstance(quota, int) and period is not None else None
-        )
-
-        affinity: tuple[int, ...] | None = None
-        source: str | None = None
-        try:
-            values = self._affinityReader(self.rootPid)
-            affinity = tuple(sorted({int(value) for value in values}))
-            source = "schedGetaffinity"
-        except Exception:
-            pass
-        if affinity is None and self._cgroupPath is not None:
-            for name in ("cpuset.cpus.effective", "cpuset.cpus"):
-                affinity = _parse_cpuset(
-                    _optional_read(self._cgroupPath / name, self._readText)
-                )
-                if affinity is not None:
-                    source = "cgroupCpuset"
-                    break
-        return _CpuSnapshot(
-            quotaMicros=quota,
-            periodMicros=period,
-            quotaCores=quota_cores,
-            affinityCpus=affinity,
-            affinitySource=source,
-        )
+        quota = _limit_value(parts[0])
+        period = _nonnegative_int(parts[1])
+        if not isinstance(quota, int) or not period:
+            return None
+        return quota / period
 
     @staticmethod
     def _verified_peak_reset(
@@ -660,8 +509,6 @@ class ResourceSampler:
         return _Sample(
             processTreeRssBytes=process_rss,
             cgroupMemoryCurrentBytes=self._read_cgroup_int("memory.current"),
-            memorySwapCurrentBytes=self._read_cgroup_int("memory.swap.current"),
-            ephemeralDisk=self._read_disk_usage(),
         )
 
     def _sample_and_record(
@@ -674,8 +521,7 @@ class ResourceSampler:
         try:
             sample = self._collect_sample()
         except Exception:
-            self._note_error()
-            sample = _Sample(None, None, None, None)
+            sample = _Sample(None, None)
         with self._stateLock:
             if generation != self._generation:
                 return sample
@@ -685,8 +531,6 @@ class ResourceSampler:
             if isBaseline:
                 self._processTreeBaselineRssBytes = sample.processTreeRssBytes
                 self._cgroupMemoryCurrentBaselineBytes = sample.cgroupMemoryCurrentBytes
-                self._memorySwapCurrentBeforeBytes = sample.memorySwapCurrentBytes
-                self._ephemeralDiskBefore = sample.ephemeralDisk
             if sample.processTreeRssBytes is not None:
                 current = self._processTreePeakRssBytes
                 self._processTreePeakRssBytes = max(
@@ -703,19 +547,6 @@ class ResourceSampler:
                         else sample.cgroupMemoryCurrentBytes
                     ),
                 )
-            if sample.memorySwapCurrentBytes is not None:
-                current = self._memorySwapCurrentPeakBytes
-                self._memorySwapCurrentPeakBytes = max(
-                    sample.memorySwapCurrentBytes,
-                    (current if current is not None else sample.memorySwapCurrentBytes),
-                )
-            if sample.ephemeralDisk is not None:
-                if (
-                    self._ephemeralDiskPeak is None
-                    or sample.ephemeralDisk.usedBytes
-                    > self._ephemeralDiskPeak.usedBytes
-                ):
-                    self._ephemeralDiskPeak = sample.ephemeralDisk
         return sample
 
     def _thread_main(
@@ -752,8 +583,7 @@ class ResourceSampler:
             self._cgroupPath = self._resolve_cgroup_path()
             self._memoryEventsBefore = self._read_memory_events()
             self._memoryMaxBytes = self._read_cgroup_limit("memory.max")
-            self._memorySwapMaxBytes = self._read_cgroup_limit("memory.swap.max")
-            self._cpuSnapshot = self._read_cpu_snapshot()
+            self._cpuQuotaCores = self._read_cpu_quota_cores()
 
             ready_event = threading.Event()
             thread = threading.Thread(
@@ -765,7 +595,7 @@ class ResourceSampler:
             try:
                 thread.start()
             except Exception:
-                self._note_error()
+                pass  # Without a thread, only the start and stop samples remain.
             else:
                 with self._stateLock:
                     self._thread = thread
@@ -800,22 +630,10 @@ class ResourceSampler:
         cgroupMemoryPeakBytes: int | None,
     ) -> ResourceMeasurement:
         with self._stateLock:
-            sample_count = self._sampleCount
-            error_count = self._samplingErrorCount
             process_baseline = self._processTreeBaselineRssBytes
             process_peak = self._processTreePeakRssBytes
             cgroup_baseline = self._cgroupMemoryCurrentBaselineBytes
             cgroup_current_peak = self._cgroupMemoryCurrentPeakBytes
-            swap_before = self._memorySwapCurrentBeforeBytes
-            swap_peak = self._memorySwapCurrentPeakBytes
-            events_before = (
-                None
-                if self._memoryEventsBefore is None
-                else dict(self._memoryEventsBefore)
-            )
-            disk_before = self._ephemeralDiskBefore
-            disk_peak = self._ephemeralDiskPeak
-            cpu = self._cpuSnapshot
 
         operation_baseline = cgroup_baseline
         operation_peak = cgroup_current_peak
@@ -847,11 +665,7 @@ class ResourceSampler:
             else None
         )
 
-        events_after = None if memoryEventsAfter is None else dict(memoryEventsAfter)
-        affinity_count = None if cpu.affinityCpus is None else len(cpu.affinityCpus)
         return ResourceMeasurement(
-            sampleCount=sample_count,
-            sampleIntervalSeconds=self.sampleIntervalSeconds,
             operationBaselineBytes=operation_baseline,
             operationPeakBytes=operation_peak,
             operationIncrementalPeakBytes=incremental_peak,
@@ -860,55 +674,26 @@ class ResourceSampler:
             processTreeRssPeakBytes=process_peak,
             processTreeRssIncrementalPeakBytes=process_incremental_peak,
             processTreeRssAfterBytes=finalSample.processTreeRssBytes,
-            cgroupPath=(None if self._cgroupPath is None else str(self._cgroupPath)),
             cgroupMemoryCurrentBaselineBytes=cgroup_baseline,
             cgroupMemoryCurrentPeakBytes=cgroup_current_peak,
             cgroupMemoryCurrentAfterBytes=(finalSample.cgroupMemoryCurrentBytes),
             cgroupMemoryPeakBytes=cgroupMemoryPeakBytes,
             cgroupMemoryPeakScope=self._cgroupMemoryPeakScope,
             memoryMaxBytes=self._memoryMaxBytes,
-            memorySwapCurrentBeforeBytes=swap_before,
-            memorySwapCurrentAfterBytes=finalSample.memorySwapCurrentBytes,
-            memorySwapCurrentPeakBytes=swap_peak,
-            memorySwapMaxBytes=self._memorySwapMaxBytes,
-            memoryEventsBefore=events_before,
-            memoryEventsAfter=events_after,
             memoryEventsDelta=_memory_event_delta(
-                events_before,
-                events_after,
+                self._memoryEventsBefore,
+                memoryEventsAfter,
             ),
-            cpuQuotaMicros=cpu.quotaMicros,
-            cpuPeriodMicros=cpu.periodMicros,
-            cpuQuotaCores=cpu.quotaCores,
-            cpuAffinityCpus=cpu.affinityCpus,
-            cpuAffinityCount=affinity_count,
-            cpuAffinitySource=cpu.affinitySource,
-            ephemeralDiskPath=(
-                None if self.ephemeralDiskPath is None else str(self.ephemeralDiskPath)
-            ),
-            ephemeralDiskBefore=disk_before,
-            ephemeralDiskAfter=finalSample.ephemeralDisk,
-            ephemeralDiskPeak=disk_peak,
-            samplingErrorCount=error_count,
+            cpuQuotaCores=self._cpuQuotaCores,
         )
 
     def stop(self) -> ResourceMeasurement:
         with self._lifecycleLock:
             with self._stateLock:
                 if not self._running:
-                    if self._result is not None:
-                        return self._result
-                    result = ResourceMeasurement(
-                        sampleCount=0,
-                        sampleIntervalSeconds=self.sampleIntervalSeconds,
-                        ephemeralDiskPath=(
-                            None
-                            if self.ephemeralDiskPath is None
-                            else str(self.ephemeralDiskPath)
-                        ),
-                    )
-                    self._result = result
-                    return result
+                    if self._result is None:
+                        self._result = ResourceMeasurement()
+                    return self._result
                 self._running = False
                 generation = self._generation
                 stop_event = self._stopEvent
@@ -917,15 +702,7 @@ class ResourceSampler:
             if stop_event is not None:
                 stop_event.set()
             if thread is not None and thread is not threading.current_thread():
-                try:
-                    thread.join(
-                        timeout=max(
-                            0.25,
-                            min(2.0, self.sampleIntervalSeconds * 2),
-                        )
-                    )
-                except RuntimeError:
-                    self._note_error()
+                thread.join(timeout=max(0.25, min(2.0, self.sampleIntervalSeconds * 2)))
 
             final_sample = self._sample_and_record(
                 isBaseline=False,
@@ -1055,8 +832,40 @@ def child_cpu_seconds() -> float:
     return float(usage.ru_utime) + float(usage.ru_stime)
 
 
+def stage_utilization(result: Mapping[str, Any]) -> dict[str, float | None]:
+    """Summarize how much of its CPU and memory allowance a stage result used.
+
+    CPU cores are ``(processCpuSeconds + childCpuSeconds) / wholeFunctionSeconds``,
+    reported as a percentage of ``modalCpuLimit`` and of ``workers``. Peak cgroup
+    and RSS bytes are reported as a percentage of the container memory limit
+    (``modalMemoryMb``) and of ``scarfMemoryBudget``. A value is None when an
+    input was not recorded.
+    """
+
+    def percent(value: float | None, limit: float | None) -> float | None:
+        return None if value is None or not limit else round(100 * value / limit, 1)
+
+    wall = result.get("wholeFunctionSeconds")
+    cpu = result.get("processCpuSeconds")
+    cores = None
+    if wall and cpu is not None:
+        cores = (cpu + (result.get("childCpuSeconds") or 0.0)) / wall
+    container_mb = result.get("modalMemoryMb")
+    container = container_mb * 1024**2 if container_mb else None
+    budget = result.get("scarfMemoryBudget")
+    summary = {
+        "cpuCores": None if cores is None else round(cores, 2),
+        "cpuPercentOfLimit": percent(cores, result.get("modalCpuLimit")),
+        "cpuPercentOfWorkers": percent(cores, result.get("workers")),
+    }
+    for name in ("peakCgroup", "peakRss"):
+        peak = result.get(f"{name}Bytes")
+        summary[f"{name}PercentOfContainer"] = percent(peak, container)
+        summary[f"{name}PercentOfBudget"] = percent(peak, budget)
+    return summary
+
+
 __all__ = [
-    "DiskUsage",
     "LimitValue",
     "PeakScope",
     "ResourceMeasurement",
@@ -1066,4 +875,5 @@ __all__ = [
     "child_cpu_seconds",
     "parse_memory_events",
     "read_process_tree_rss_bytes",
+    "stage_utilization",
 ]

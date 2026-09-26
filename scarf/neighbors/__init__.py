@@ -14,10 +14,8 @@ if TYPE_CHECKING:
         instantiate_knn_index as instantiate_knn_index,
     )
     from .integration import wnn_integration as wnn_integration
-    from .stream import AnnStream as AnnStream
 
 __all__ = [
-    "AnnStream",
     "calc_snn",
     "diffusion_operator",
     "fix_knn_query",
@@ -29,7 +27,6 @@ __all__ = [
 ]
 
 _LAZY_EXPORTS = {
-    "AnnStream": (".stream", "AnnStream"),
     "calc_snn": (".graph", "calc_snn"),
     "diffusion_operator": (".diffusion", "diffusion_operator"),
     "fix_knn_query": (".index", "fix_knn_query"),

@@ -29,7 +29,7 @@ from scarf.storage.artifacts import (
     list_artifacts,
 )
 from scarf.storage.errors import ArtifactResolutionError
-from scarf.storage.selections import resolve_selection_artifact
+from scarf.storage.selections import resolve_generated_selection_artifact
 
 
 def _selection(
@@ -48,7 +48,7 @@ def _selection(
             cell_data.create_array("I", data=np.ones(len(values), dtype=bool))
         else:
             row_ids = np.asarray(root["cellData/ids"][:])
-        return resolve_selection_artifact(
+        return resolve_generated_selection_artifact(
             root,
             scope="datastore",
             kind=kind,
@@ -58,7 +58,7 @@ def _selection(
             parameters={},
             inputs={},
             source_column="manual",
-        )
+        )[0]
     planned = plan_artifact(
         root,
         scope=scope,
@@ -87,6 +87,7 @@ def _feature_selection(
 ) -> ArtifactRef:
     selected = np.asarray(values, dtype=bool)
     feature_data = root.create_group(f"{assay}/featureData")
+    root[assay].attrs.update({"prepared": True, "dataset_fingerprint": "query-dataset"})
     ids = np.asarray([f"g{i}" for i in range(len(selected))])
     feature_data.create_array("ids", data=ids)
     feature_data.create_array("names", data=ids)
@@ -179,6 +180,9 @@ def _artifact_ref(
 class _ReferenceDatastore:
     def __init__(self, root: zarr.Group) -> None:
         self.zw = root
+
+    def _ensure_dataset_fingerprint(self, name: str) -> str:
+        return self.zw[name].attrs["dataset_fingerprint"]
 
     def _get_assay(self, name: str) -> SimpleNamespace:
         return SimpleNamespace(attrs=self.zw[name].attrs)

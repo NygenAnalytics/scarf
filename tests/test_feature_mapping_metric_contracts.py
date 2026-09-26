@@ -20,5 +20,5 @@ def test_feature_mapping_and_metric_entry_point_signatures_are_stable():
     }
 
     assert signature_digest(methods) == (
-        "28fd8e0555ac0b2574272beebbd48c0a984b49bd0bad1bba3c9dc090c742c622"
+        "75e8fbb44a3439c1744485621f15507b091883208316397db219cf44cece0e6c"
     )

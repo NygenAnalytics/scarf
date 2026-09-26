@@ -21,6 +21,7 @@ from ...storage.feature_selection import resolve_feature_selection
 from ...storage.selections import validate_stored_selection_integrity
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...utils.arrays import array_digest
+from ...utils.arrays import has_duplicates
 
 
 _ENRICHMENT_LAYOUT = "cells_by_sources"
@@ -441,13 +442,13 @@ def _load_enrichment_result(
         raise ValueError(f"Enrichment slot {label!r} score shape is misaligned")
     if len(source_names) == 0 or len(source_names) != len(source_sizes):
         raise ValueError(f"Enrichment slot {label!r} source metadata is misaligned")
-    if np.unique(source_names).size != len(source_names):
+    if has_duplicates(source_names):
         raise ValueError(f"Enrichment slot {label!r} contains duplicate sources")
     if np.any(source_names == ""):
         raise ValueError(f"Enrichment slot {label!r} contains empty source names")
     if np.any(source_sizes <= 0):
         raise ValueError(f"Enrichment slot {label!r} contains invalid source sizes")
-    if np.any(cell_index < 0) or np.unique(cell_index).size != len(cell_index):
+    if np.any(cell_index < 0) or has_duplicates(cell_index):
         raise ValueError(f"Enrichment slot {label!r} contains duplicate cell indices")
     if array_digest(cell_index) != slot.attrs["cell_digest"]:
         raise ValueError(f"Enrichment slot {label!r} has a mismatched cell digest")
@@ -468,7 +469,7 @@ def _load_enrichment_result(
         if (
             len(rank_feature_index) < 2
             or np.any(rank_feature_index < 0)
-            or np.unique(rank_feature_index).size != len(rank_feature_index)
+            or has_duplicates(rank_feature_index)
             or stored_n_up is None
             or stored_n_up > len(rank_feature_index)
         ):

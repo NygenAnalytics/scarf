@@ -14,7 +14,8 @@ from typing import Any, TypeVar
 import numpy as np
 
 from .async_execution import AsyncStorageRunner
-from .budget import ResourceBudget, admit_stream, resolve_budget
+from .budget import ResourceBudget, resolve_budget
+from .execution import admit_stream
 from .execution import (
     ExecutionReport,
     OperationPlan,
@@ -83,9 +84,11 @@ class FeatureReadGroup:
 class FeatureCellBand:
     """One feature group intersected with one physical cell band.
 
-    ``values`` is the raw decoded band. ``selectedLocal`` indexes active cells
-    inside that band. ``selectedDestinations`` maps those cells onto the
-    caller-requested selected-cell order.
+    ``values`` is the raw decoded band. When ``rows`` is set, ``values`` holds
+    only those group-local feature rows; otherwise it holds every row of the
+    group. ``selectedLocal`` indexes active cells inside that band.
+    ``selectedDestinations`` maps those cells onto the caller-requested
+    selected-cell order.
     """
 
     featStart: int
@@ -98,6 +101,13 @@ class FeatureCellBand:
     readSec: float
     blockBytes: int
     unitIndex: int = 0
+    rows: np.ndarray | None = None
+
+    def featureRows(self) -> np.ndarray:
+        """Return the group-local feature row of each row in ``values``."""
+        if self.rows is not None:
+            return self.rows
+        return np.arange(self.featEnd - self.featStart, dtype=np.int64)
 
 
 def _axis(value: int, *, name: str) -> int:
@@ -226,37 +236,19 @@ def plan_feature_stream(
         )
 
     block_bytes = max(_owned_bytes(blockBytes, block.indices.size) for block in blocks)
-    prefetchable = len(blocks) - 1
-    # A read-ahead stream holds the block being consumed while the next ones load.
-    # A single-block stream holds nothing before its own read.
-    held = resident + (block_bytes + decode_bytes if prefetchable else 0)
-    read_workers = 1
-    io_concurrency = 1
-    try:
-        admission = admit_stream(
-            resources,
-            nBlocks=max(1, prefetchable),
-            blockBytes=block_bytes,
-            decodeBytes=decode_bytes,
-            residentBytes=held,
-        )
-    except MemoryError:
-        # A second materialized block may not fit, while the current block can
-        # still use the remaining budget for concurrent chunk decodes.
-        current_admission = admit_stream(
-            resources,
-            nBlocks=1,
-            blockBytes=block_bytes,
-            decodeBytes=decode_bytes,
-            residentBytes=resident,
-        )
-        io_concurrency = current_admission.ioConcurrency
-    else:
-        io_concurrency = admission.ioConcurrency
-        if prefetchable:
-            read_workers = admission.outerWorkers
+    admission = admit_stream(
+        resources,
+        nBlocks=len(blocks),
+        blockBytes=block_bytes,
+        decodeBytes=decode_bytes,
+        residentBytes=resident,
+    )
+    read_workers = admission.readWorkers
+    io_concurrency = admission.ioConcurrency
 
-    cell_bins = int(np.unique(geometry.binOf(cell_axis, cell_indices)).size)
+    cell_bins = int(
+        np.count_nonzero(np.bincount(geometry.binOf(cell_axis, cell_indices)))
+    )
     return FeatureStreamPlan(
         geometry=geometry,
         featureAxis=feature_axis,
@@ -334,6 +326,29 @@ def _feature_group_ranges(
         else:
             merged.append((start, feat_end))
     return merged
+
+
+def _sparse_group_rows(
+    groups: list[tuple[int, int]],
+    feat_idx: Sequence[int] | np.ndarray | None,
+    *,
+    n_feats: int,
+) -> dict[tuple[int, int], np.ndarray]:
+    """Return the selected local rows of groups where fewer than half are wanted.
+
+    Zarr copies every decoded row it returns, so reading only the selected rows
+    of a sparse selection avoids copying the rest of each group.
+    """
+    if feat_idx is None:
+        return {}
+    selected = np.zeros(n_feats, dtype=bool)
+    selected[np.asarray(feat_idx, dtype=np.int64)] = True
+    sparse: dict[tuple[int, int], np.ndarray] = {}
+    for start, stop in groups:
+        rows = np.flatnonzero(selected[start:stop])
+        if 2 * rows.size < stop - start:
+            sparse[(start, stop)] = rows
+    return sparse
 
 
 def _plan_feature_consume(
@@ -436,8 +451,22 @@ def _iter_bounded_handoff(
             except queue.Empty:
                 continue
         thread.join()
-    if error:
-        raise error[0]
+        if error:
+            raise error[0]
+
+
+def _copy_band(
+    dest: np.ndarray, block: np.ndarray, local: np.ndarray, destinations: np.ndarray
+) -> None:
+    """Copy selected band columns into their destination columns."""
+    if destinations[-1] - destinations[0] + 1 == len(destinations) and np.array_equal(
+        local, np.arange(block.shape[1])
+    ):
+        np.copyto(dest[:, destinations[0] : destinations[-1] + 1], block)
+        return
+    from ..utils.strided import copy_columns
+
+    copy_columns(block, local, dest, destinations)
 
 
 def _selected_cell_bands(
@@ -615,15 +644,19 @@ def map_feature_read_groups(
                             async with runner.reserve_bytes(read_bytes):
                                 started = time.perf_counter()
                                 block = np.asarray(
-                                    await source.getitem(
-                                        (
-                                            slice(feat_start, feat_end),
-                                            slice(cell_start, cell_end),
+                                    await runner.io(
+                                        source.getitem(
+                                            (
+                                                slice(feat_start, feat_end),
+                                                slice(cell_start, cell_end),
+                                            )
                                         )
                                     )
                                 )
                                 read_seconds = time.perf_counter() - started
-                                dest[:, destinations] = block[:, local]
+                                await asyncio.to_thread(
+                                    _copy_band, dest, block, local, destinations
+                                )
                         return read_seconds
 
                     read_seconds = sum(
@@ -676,7 +709,6 @@ def map_feature_read_groups(
                             completed.result()
 
         runner = AsyncStorageRunner(
-            budget,
             operation=plan,
         )
         try:
@@ -689,7 +721,7 @@ def map_feature_read_groups(
                     plan=plan,
                     unitKind="countsTReadGroup",
                     actualReadWorkers=in_flight,
-                    actualComputeWorkers=runner.plan.computeWorkerLimit,
+                    actualComputeWorkers=runner.plan.computeWorkers,
                     actualWriteWorkers=1,
                     fetchSeconds=fetch_seconds,
                     computeSeconds=compute_seconds,
@@ -733,7 +765,7 @@ def map_feature_cell_bands(
     """Map ``process`` over cell-band slices in deterministic traversal order."""
     array = as_zarr_array(counts_t)
     geometry = _plane(array)
-    _n_feats, n_cells = (int(value) for value in geometry.shape)
+    n_feats, n_cells = (int(value) for value in geometry.shape)
     feat_chunk = geometry.axisChunk(0)
     cell_chunk = geometry.axisChunk(1)
     feature_width, read_group_bytes = persisted_read_group(array)
@@ -745,6 +777,7 @@ def map_feature_cell_bands(
     )
     if not merged:
         return iter(())
+    sparse_rows = _sparse_group_rows(merged, feat_idx, n_feats=n_feats)
 
     if cell_idx is None:
         selected_cells = np.arange(n_cells, dtype=np.int64)
@@ -842,17 +875,25 @@ def map_feature_cell_bands(
                     return
                 n_local = feat_end - feat_start
                 read_bytes = max(1, n_local * (cell_end - cell_start) * itemsize)
+                rows = sparse_rows.get((feat_start, feat_end))
                 async with runner.reserve_bytes(read_bytes):
                     async with runner.read_lane():
                         started = time.perf_counter()
-                        block = np.asarray(
-                            await source.getitem(
-                                (
-                                    slice(feat_start, feat_end),
-                                    slice(cell_start, cell_end),
+                        cells = slice(cell_start, cell_end)
+                        if rows is None:
+                            block = np.asarray(
+                                await runner.io(
+                                    source.getitem((slice(feat_start, feat_end), cells))
                                 )
                             )
-                        )
+                        else:
+                            block = np.asarray(
+                                await runner.io(
+                                    source.get_orthogonal_selection(
+                                        (rows + feat_start, cells)
+                                    )
+                                )
+                            )
                         read_seconds = time.perf_counter() - started
                     band = FeatureCellBand(
                         featStart=int(feat_start),
@@ -865,6 +906,7 @@ def map_feature_cell_bands(
                         readSec=read_seconds,
                         blockBytes=int(block.nbytes),
                         unitIndex=idx,
+                        rows=rows,
                     )
                     fetch_seconds += band.readSec
                     wait_started = time.perf_counter()
@@ -903,7 +945,6 @@ def map_feature_cell_bands(
                             completed.result()
 
         runner = AsyncStorageRunner(
-            budget,
             operation=plan,
         )
         try:
@@ -916,7 +957,7 @@ def map_feature_cell_bands(
                     plan=plan,
                     unitKind="countsTCellBand",
                     actualReadWorkers=in_flight,
-                    actualComputeWorkers=runner.plan.computeWorkerLimit,
+                    actualComputeWorkers=runner.plan.computeWorkers,
                     actualWriteWorkers=1,
                     fetchSeconds=fetch_seconds,
                     computeSeconds=compute_seconds,

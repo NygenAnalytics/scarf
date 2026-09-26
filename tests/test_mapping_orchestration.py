@@ -1,3 +1,4 @@
+import gc
 from pathlib import Path
 import shutil
 from dataclasses import replace
@@ -5,6 +6,7 @@ from dataclasses import replace
 import numpy as np
 import pandas as pd
 import pytest
+import zarr
 
 import scarf.datastore._operations.mapping as mapping_operations
 from scarf.datastore.datastore import DataStore, mount_datastore
@@ -19,7 +21,7 @@ from scarf.storage.artifacts import (
 )
 from scarf.storage.selections import (
     read_stored_selection_indices,
-    resolve_selection_artifact,
+    resolve_generated_selection_artifact,
 )
 
 
@@ -90,7 +92,7 @@ def _query_selection_matching_reference(query, reference) -> ArtifactRef:
         artifact_group(reference.datastore.zw, reference.cell_selection)["values"][:],
         dtype=bool,
     )
-    return resolve_selection_artifact(
+    return resolve_generated_selection_artifact(
         query.zw,
         scope="datastore",
         kind="cell_selection",
@@ -100,7 +102,7 @@ def _query_selection_matching_reference(query, reference) -> ArtifactRef:
         parameters={},
         inputs={"mapping_reference": reference.external_ref},
         source_column="mapping_reference",
-    )
+    )[0]
 
 
 def _changed_files(
@@ -324,8 +326,18 @@ def test_mapping_failure_leaves_projection_incomplete(
         "_load_reference_neighbor_query",
         lambda *_args, **_kwargs: FailingNeighborQuery(),
     )
-    with pytest.raises(RuntimeError, match="injected ANN failure"):
-        query.run_mapping(reference, reference.cell_selection)
+    # Without a collection to rescue it, a stream left suspended by the failure
+    # would keep Zarr's process-wide I/O limit lowered for later work.
+    gc_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        with zarr.config.set({"async.concurrency": 37}):
+            with pytest.raises(RuntimeError, match="injected ANN failure"):
+                query.run_mapping(reference, reference.cell_selection)
+            assert zarr.config.get("async.concurrency") == 37
+    finally:
+        if gc_enabled:
+            gc.enable()
     assert len(files) == (1 if method == "symphony" else 0)
     assert all(file.closed for file in files)
 

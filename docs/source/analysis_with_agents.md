@@ -212,8 +212,10 @@ There are no implicit migrations. Compatible histories with newly uncovered obje
 receive an explicit context-evidence revision, preserving prior records and artifacts; essential
 unanswered questions still prevent completion. Model attempt records include known provider
 usage, output-validation feedback and failures, with unavailable usage labeled explicitly.
-Standalone scientific agent APIs remain in their concrete
-packages, such as `scarf.agent.biological_interpretation`.
+Standalone Data Enrichment, Experimental Context, and Biological Interpretation agent APIs remain
+in their concrete packages, such as `scarf.agent.biological_interpretation`. Parameter tuning has
+no standalone API; it runs only inside the workflow started by `analyze_rna` or
+`AgentOrchestrator`.
 
 ### When to use the pipeline
 

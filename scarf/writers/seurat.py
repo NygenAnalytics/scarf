@@ -1,7 +1,7 @@
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import zarr
@@ -28,9 +28,12 @@ from ..storage.artifact_writer import (
 from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import StorageProfile, ZarrLocation
 from ..storage.refs import ArtifactRef
+from ._store import RESERVED_METADATA_COLUMNS
+
+if TYPE_CHECKING:
+    from ..storage.identity import CountSummary
 
 
-_RESERVED_METADATA_COLUMNS = frozenset({"I", "ids", "names"})
 _DEFAULT_BLOCK_ROWS = 65_536
 
 
@@ -296,7 +299,7 @@ class SeuratToZarr:
 
     @staticmethod
     def _validate_metadata_name(name: str, axis: str) -> None:
-        if name in _RESERVED_METADATA_COLUMNS:
+        if name in RESERVED_METADATA_COLUMNS:
             raise ValueError(f"{axis} metadata column {name!r} is reserved")
         if name.startswith("__scarf_missing__"):
             raise ValueError(
@@ -652,20 +655,27 @@ class SeuratToZarr:
         assay: SeuratAssay,
         requested_rows: int | None,
     ) -> None:
+        from ..storage.identity import CountSummary, finalize_counts
+
         source = assay.counts
         destination = self.counts[assay.name]
+        summary = CountSummary(destination)
         n_cells = len(self.reader.cellIds)
         if n_cells == 0:
+            finalize_counts(destination, summary=summary)
             return
         other_sources = sum(
             max(0, int(item.counts.resident_bytes))
             for item in self._assays
             if item is not assay
         )
+        # The summary is allocated before source preparation and stays
+        # resident through the write, so preparation must fit beside it.
         self.reader._prepare_assay(
-            assay.name, max_bytes=int(self.resources.memoryBytes) - other_sources
+            assay.name,
+            max_bytes=int(self.resources.memoryBytes) - other_sources - summary.nbytes,
         )
-        self._residentSourceBytes = sum(
+        self._residentSourceBytes = summary.nbytes + sum(
             max(0, int(item.counts.resident_bytes)) for item in self._assays
         )
         if source.is_sparse:
@@ -674,6 +684,7 @@ class SeuratToZarr:
                 source,
                 destination,
                 requested_rows,
+                summary,
             )
         else:
             self._write_dense_counts(
@@ -681,7 +692,9 @@ class SeuratToZarr:
                 source,
                 destination,
                 requested_rows,
+                summary,
             )
+        finalize_counts(destination, summary=summary)
 
     def _write_sparse_counts(
         self,
@@ -689,6 +702,7 @@ class SeuratToZarr:
         source: Any,
         destination: zarr.Array,
         requested_rows: int | None,
+        summary: "CountSummary",
     ) -> None:
         from ..storage.sharding import (
             accumulate_sparse_to_shards,
@@ -753,32 +767,12 @@ class SeuratToZarr:
             producerReserveBytes=plan.producerReserveBytes,
             msg=f"Writing {assay_name} counts",
             io=self.io,
+            countSummary=summary,
         )
         if rows != n_cells:
             raise ValueError(
                 f"Assay {assay_name!r} wrote {rows} count rows, expected {n_cells}"
             )
-
-    @staticmethod
-    def _dense_write_reserve(destination: zarr.Array) -> int:
-        from ..storage.layout import array_shard_rows
-
-        rows = min(int(destination.shape[0]), array_shard_rows(destination))
-        columns = max(1, int(destination.shape[1]))
-        itemsize = max(1, int(np.dtype(destination.dtype).itemsize))
-        chunk_rows = min(max(1, rows), int(destination.chunks[0]))
-        chunk_columns = min(columns, int(destination.chunks[1]))
-        chunks = (
-            (max(1, rows) + chunk_rows - 1)
-            // chunk_rows
-            * ((columns + chunk_columns - 1) // chunk_columns)
-        )
-        band_bytes = max(1, rows) * columns * itemsize
-        chunk_bytes = chunk_rows * chunk_columns * itemsize
-        encoded_chunk = chunk_bytes + chunk_bytes // 128 + 1024
-        return int(
-            band_bytes + chunk_bytes + 2 * chunks * encoded_chunk + chunks * 16 + 1024
-        )
 
     def _resolve_dense_batch_rows(
         self,
@@ -790,7 +784,12 @@ class SeuratToZarr:
         from ..storage.partition import affordable_width
 
         n_cells = int(source.shape[1])
-        task_reserve = self._dense_write_reserve(destination)
+        from ..storage.sharding import plan_dense_write
+        from ..storage.io_policy import StorageIoPolicy
+
+        task_reserve = plan_dense_write(
+            destination, self.resources, 1, io=StorageIoPolicy(readWorkers=1)
+        ).reservedBytes
         staging_cache: dict[int, int] = {}
 
         def staging(rows: int) -> int:
@@ -826,8 +825,8 @@ class SeuratToZarr:
         source: Any,
         destination: zarr.Array,
         requested_rows: int | None,
+        summary: "CountSummary",
     ) -> None:
-        from ..storage.budget import ResourceBudget
         from ..storage.sharding import write_dense_from_row_batches
 
         n_cells = int(source.shape[1])
@@ -837,15 +836,6 @@ class SeuratToZarr:
             requested_rows,
         )
         self._lastDenseBatchRows[assay_name] = rows
-        writer_memory = (
-            self.resources.memoryBytes - self._residentSourceBytes - producer_reserve
-        )
-        if writer_memory < 1:
-            raise MemoryError("Dense Seurat import has no memory left for Zarr writes")
-        writer_resources = ResourceBudget(
-            memoryBytes=writer_memory,
-            workers=self.resources.workers,
-        )
 
         def batches() -> Iterator[np.ndarray]:
             for start in range(0, n_cells, rows):
@@ -865,8 +855,11 @@ class SeuratToZarr:
             batches(),
             dtype=destination.dtype,
             msg=f"Writing {assay_name} counts",
-            resources=writer_resources,
+            resources=self.resources,
+            residentBytes=self._residentSourceBytes,
+            producerReserveBytes=producer_reserve,
             io=self.io,
+            countSummary=summary,
         )
         if written != n_cells:
             raise ValueError(

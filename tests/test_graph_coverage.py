@@ -475,7 +475,7 @@ def test_diffusion_operator_round_trip_and_explicit_imputation(
     )
     selection = _add_test_cell_selection(store, feature_values=values)
     _patch_trajectory_graph_resolution(monkeypatch, graph_ref, selection)
-    store.load_graph = Mock(return_value=graph)
+    store._load_graph_artifact = Mock(return_value=graph)
 
     first_ref = store.run_diffusion_operator(graph_ref, t=1)
     operator = store.load_diffusion_operator(first_ref)
@@ -492,17 +492,18 @@ def test_diffusion_operator_round_trip_and_explicit_imputation(
         diffusion=first_ref,
     )
     np.testing.assert_allclose(first, np.array([3.0, 2.5, 1.5]))
-    store.load_graph.assert_called_once_with(
+    store._load_graph_artifact.assert_called_once_with(
         graph_ref,
         symmetric=True,
         upper_only=False,
+        use_k=None,
     )
 
     reused_ref = store.run_diffusion_operator(graph_ref, t=1)
     second = store.get_imputed(feature_name="gene", diffusion=reused_ref)
     assert reused_ref == first_ref
     np.testing.assert_allclose(second, first)
-    assert store.load_graph.call_count == 1
+    assert store._load_graph_artifact.call_count == 1
 
     squared_ref = store.run_diffusion_operator(graph_ref, t=2)
     squared = store.get_imputed(
@@ -511,7 +512,7 @@ def test_diffusion_operator_round_trip_and_explicit_imputation(
     )
     np.testing.assert_allclose(squared, np.array([2.0, 2.25, 2.75]))
     assert squared_ref != first_ref
-    assert store.load_graph.call_count == 2
+    assert store._load_graph_artifact.call_count == 2
 
     invalidated_ref = store.run_diffusion_operator(
         graph_ref,
@@ -519,7 +520,7 @@ def test_diffusion_operator_round_trip_and_explicit_imputation(
         invalidate_cache=True,
     )
     assert invalidated_ref not in {first_ref, squared_ref}
-    assert store.load_graph.call_count == 3
+    assert store._load_graph_artifact.call_count == 3
     assert (
         len(
             list_artifacts(
@@ -541,7 +542,9 @@ def test_imputation_rejects_budget_before_reading_sparse_payload(
         store, feature_values=np.array([1.0, 2.0, 4.0])
     )
     _patch_trajectory_graph_resolution(monkeypatch, graph_ref, selection)
-    store.load_graph = Mock(return_value=csr_matrix(np.ones((3, 3)) - np.eye(3)))
+    store._load_graph_artifact = Mock(
+        return_value=csr_matrix(np.ones((3, 3)) - np.eye(3))
+    )
     diffusion = store.run_diffusion_operator(graph_ref, t=1)
     payload_path = artifact_path(diffusion)
     reads: list[str] = []
@@ -554,6 +557,8 @@ def test_imputation_rejects_budget_before_reading_sparse_payload(
 
     monkeypatch.setattr(zarr.Array, "__getitem__", getitem)
     store.memoryBytes = 128
+    assert store.run_diffusion_operator(graph_ref, t=1) == diffusion
+    reads.clear()
 
     with pytest.raises(MemoryError, match="loading or sparse conversion"):
         store.get_imputed("gene", diffusion)
@@ -570,7 +575,9 @@ def test_imputation_rejects_invalid_names_and_budget_after_sparse_conversion(
         store, feature_values=np.array([1.0, 2.0, 4.0])
     )
     _patch_trajectory_graph_resolution(monkeypatch, graph_ref, selection)
-    store.load_graph = Mock(return_value=csr_matrix(np.ones((3, 3)) - np.eye(3)))
+    store._load_graph_artifact = Mock(
+        return_value=csr_matrix(np.ones((3, 3)) - np.eye(3))
+    )
     diffusion = store.run_diffusion_operator(graph_ref, t=1)
 
     with pytest.raises(TypeError, match="string or a sequence of strings"):
@@ -605,7 +612,7 @@ def test_diffusion_operator_loader_rejects_mismatched_lineage_and_payload(
     )
     selection = _add_test_cell_selection(store)
     _patch_trajectory_graph_resolution(monkeypatch, graph_ref, selection)
-    store.load_graph = Mock(return_value=graph)
+    store._load_graph_artifact = Mock(return_value=graph)
 
     diffusion = store.run_diffusion_operator(graph_ref, t=1)
     group = store.zw[artifact_path(diffusion)]
@@ -651,7 +658,7 @@ def test_diffusion_operator_content_tamper_is_rejected_and_not_reused(
     )
     selection = _add_test_cell_selection(store)
     _patch_trajectory_graph_resolution(monkeypatch, graph_ref, selection)
-    store.load_graph = Mock(return_value=graph)
+    store._load_graph_artifact = Mock(return_value=graph)
 
     first = store.run_diffusion_operator(graph_ref, t=1)
     group = store.zw[artifact_path(first)]
@@ -680,20 +687,20 @@ def test_read_only_diffusion_operator_only_reuses_persisted_artifacts(
     )
     selection = _add_test_cell_selection(store)
     _patch_trajectory_graph_resolution(monkeypatch, graph_ref, selection)
-    store.load_graph = Mock(return_value=graph)
+    store._load_graph_artifact = Mock(return_value=graph)
 
     persisted = store.run_diffusion_operator(graph_ref, t=1)
     store.zarr_mode = "r"
     reused = store.run_diffusion_operator(graph_ref, t=1)
     assert reused == persisted
     assert store.load_diffusion_operator(reused).shape == (3, 3)
-    assert store.load_graph.call_count == 1
+    assert store._load_graph_artifact.call_count == 1
 
     with pytest.raises(PermissionError, match=r"zarr_mode='r\+'"):
         store.run_diffusion_operator(graph_ref, t=2)
     with pytest.raises(PermissionError, match=r"zarr_mode='r\+'"):
         store.run_diffusion_operator(graph_ref, t=1, invalidate_cache=True)
-    assert store.load_graph.call_count == 1
+    assert store._load_graph_artifact.call_count == 1
 
 
 def test_filter_cells_open_bounds_composition_and_boundaries(
@@ -822,11 +829,8 @@ def test_run_tsne_orchestration_and_error_paths(
         "scarf.datastore._operations.embeddings.graph_cell_selection",
         lambda _root, selected: selection_ref if selected == graph_ref else None,
     )
-    monkeypatch.setattr(store, "load_graph", load_graph)
+    monkeypatch.setattr(store, "_load_graph_artifact", load_graph)
     monkeypatch.setattr(store, "_get_ini_embed", get_initial)
-    monkeypatch.setattr(
-        store, "_graph_cell_selection", Mock(return_value=selection_ref)
-    )
     monkeypatch.setattr("scarf.embeddings.sgtsne.run_sgtsne", runner)
     metadata_before = _metadata_snapshot(store.cells)
 
@@ -912,7 +916,6 @@ def test_integrate_assays_snn_writes_and_reuses_exact_sources(
         kind="cell_selection",
         artifact_id="a" * 64,
     )
-    store._graph_cell_selection = Mock(return_value=selection_ref)
     graphs = {
         "RNA": csr_matrix(
             np.array(
@@ -1309,6 +1312,20 @@ def test_query_neighbors_guards_ann_indices_and_coordinate_row_count(
         kind="ann_index",
         artifact_id="a" * 64,
     )
+    import hnswlib
+    from scarf.storage.ann_index import save_ann_index
+
+    index = hnswlib.Index(space="l2", dim=2)
+    index.init_index(max_elements=3, ef_construction=10, M=4)
+    index.add_items(np.arange(6, dtype=np.float32).reshape(3, 2))
+    save_ann_index(
+        store.zw.require_group(artifact_path(ann)),
+        index,
+        profile="fast_local",
+        metric="l2",
+        dimensions=2,
+        element_count=3,
+    )
     result = ArtifactRef(
         scope="assay",
         assay="RNA",
@@ -1373,12 +1390,14 @@ def test_query_neighbors_guards_ann_indices_and_coordinate_row_count(
         )
 
 
-def test_reused_graph_stages_skip_expensive_compute(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = _memory_graph_store()
-    selection = _add_test_cell_selection(store)
-    coordinate_values = np.zeros((3, 2), dtype=np.float32)
+def test_reused_graph_stages_skip_expensive_compute(tmp_path, monkeypatch) -> None:
+    from tests.test_preparation import _create_store
+    from scarf.storage.artifacts import artifact_group
+
+    store = _create_store(tmp_path / "reuse")
+    store.cells.reset_key("I")
+    selection = store.snapshot_cell_selection("I")
+    coordinate_values = np.arange(12, dtype=np.float32).reshape(6, 2)
     coordinates = write_imported_coordinates(
         store.zw,
         assay="RNA",
@@ -1387,97 +1406,31 @@ def test_reused_graph_stages_skip_expensive_compute(
         coordinates=coordinate_values,
         source_digest=hashlib.sha256(b"reused-graph-stage").digest(),
         payload_fingerprints={"data": fingerprint_array(coordinate_values)},
-        source_cell_ids=np.asarray(store.zw["cellData/ids"][:]),
+        source_cell_ids=store.cells.fetch_all("ids"),
         cell_selection=selection,
-        block_rows=2,
     )
-    ann = _add_complete_artifact(
-        store,
-        "ann_index",
-        inputs={"coordinates": coordinates},
-    )
-    neighbor_indices = np.array(
-        [[1, 2], [0, 2], [0, 1]],
-        dtype=np.uint32,
-    )
-    neighbors = _add_complete_artifact(
-        store,
-        "neighbors",
-        inputs={"ann_index": ann, "coordinates": coordinates},
-        arrays={"indices": neighbor_indices},
-    )
-    connectivity = ArtifactRef(
-        scope="assay",
-        assay="RNA",
-        kind="connectivity_map",
-        artifact_id="f" * 64,
-    )
-    coordinate_source = _CoordinateBlocks([np.zeros((3, 2), dtype=np.float32)])
-    store._coordinate_source = Mock(return_value=(coordinate_source, 3, 2))
+    ann = store.build_ann_index(coordinates)
+    neighbors = store.query_neighbors(ann, k=2)
+    connectivity = store.build_connectivity_map(neighbors)
     fit_ann = Mock(side_effect=AssertionError("ANN fit must be skipped"))
-    monkeypatch.setattr(
-        "scarf.datastore._operations.graph.AnnIndexStage.fit",
-        fit_ann,
-    )
-
-    store._plan_assay_artifact = Mock(
-        return_value=SimpleNamespace(ref=ann, reused=True)
-    )
-    assert (
-        store.build_ann_index(
-            coordinates,
-        )
-        == ann
-    )
-    fit_ann.assert_not_called()
-
-    store._require_complete_artifact = Mock(
-        return_value=SimpleNamespace(
-            inputs={"coordinates": coordinates.to_dict()},
-            parameters={"ann_metric": "l2"},
-            path="ann",
-        )
-    )
-    store._plan_assay_artifact = Mock(
-        return_value=SimpleNamespace(ref=neighbors, reused=True)
-    )
-    store._resolve_ann_index = Mock(
-        side_effect=AssertionError("ANN index must not be loaded")
-    )
-    assert (
-        store.query_neighbors(
-            ann,
-            k=2,
-        )
-        == neighbors
-    )
-    store._resolve_ann_index.assert_not_called()
-
-    store._require_complete_artifact = Mock(
-        return_value=SimpleNamespace(path=artifact_path(neighbors))
-    )
-    store._plan_assay_artifact = Mock(
-        return_value=SimpleNamespace(ref=connectivity, reused=True)
-    )
-    monkeypatch.setattr(
-        "scarf.datastore._operations.graph.validate_distance_provenance",
-        Mock(),
-    )
+    monkeypatch.setattr("scarf.datastore._operations.graph.AnnIndexStage.fit", fit_ann)
+    load_ann = Mock(side_effect=AssertionError("ANN index must not be loaded"))
+    monkeypatch.setattr(store, "_resolve_ann_index", load_ann)
     build_connectivity = Mock(
         side_effect=AssertionError("connectivity build must be skipped")
     )
     monkeypatch.setattr(
-        "scarf.neighbors.graph.build_connectivity_arrays",
-        build_connectivity,
+        "scarf.neighbors.graph.build_connectivity_arrays", build_connectivity
     )
-
-    assert (
-        store.build_connectivity_map(
-            neighbors,
-        )
-        == connectivity
-    )
+    assert store.build_ann_index(coordinates) == ann
+    assert store.query_neighbors(ann, k=2) == neighbors
+    assert store.build_connectivity_map(neighbors) == connectivity
+    fit_ann.assert_not_called()
+    load_ann.assert_not_called()
     build_connectivity.assert_not_called()
+    artifact_group(store.zw, ann)["ann_idx_bytes"].attrs["dimensions"] = 99
+    with pytest.raises(ValueError, match="dimensions"):
+        store.query_neighbors(ann, k=2)
 
 
 @pytest.mark.parametrize(
@@ -1625,6 +1578,9 @@ def test_wnn_rejects_missing_pca_center_before_reusing_cached_graph() -> None:
         dtype="uint16",
     )
     adt_counts[:] = rng.integers(1, 30, size=(12, 5), dtype=np.uint16)
+    from scarf.storage.identity import finalize_counts
+
+    finalize_counts(adt_counts)
     finalize_writer_counts_t(writer.z, "ADT", None, nthreads=1)
     store = DataStore(source, default_assay="RNA", min_features_per_cell=0, nthreads=1)
     cells = store.snapshot_cell_selection()
@@ -1648,25 +1604,6 @@ def test_wnn_rejects_missing_pca_center_before_reusing_cached_graph() -> None:
     assert (
         list_artifacts(store.zw, scope="datastore", kind="integrated_graph") == before
     )
-
-
-def test_artifact_ann_stream_rejects_detached_ref_before_lineage_load(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = _memory_graph_store()
-    neighbors = ArtifactRef(
-        scope="datastore",
-        kind="neighbors",
-        artifact_id="1" * 64,
-    )
-    resolve_lineage = Mock(side_effect=AssertionError("lineage must not load"))
-    monkeypatch.setattr(
-        "scarf.datastore._operations.graph.resolve_native_graph_inputs",
-        resolve_lineage,
-    )
-    with pytest.raises(ValueError, match="neighbors must be assay-scoped"):
-        store._load_artifact_ann_stream(neighbors, True)
-    resolve_lineage.assert_not_called()
 
 
 def test_ann_storage_fails_closed(

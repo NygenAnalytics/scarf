@@ -17,7 +17,7 @@ from scarf.storage.artifacts import (
     make_provenance,
     new_artifact_id,
 )
-from scarf.storage.selections import resolve_selection_artifact
+from scarf.storage.selections import resolve_generated_selection_artifact
 
 
 class _PresentationStore(_PresentationOperationsMixin):
@@ -102,7 +102,7 @@ def _write_cell_selection(
             data=np.asarray([f"cell_{index}" for index in range(len(values))]),
         )
     cell_data = root["cellData"]
-    return resolve_selection_artifact(
+    return resolve_generated_selection_artifact(
         root,
         scope="datastore",
         kind="cell_selection",
@@ -112,7 +112,7 @@ def _write_cell_selection(
         parameters={},
         inputs={},
         source_column="I",
-    )
+    )[0]
 
 
 def _patch_graph_resolution(

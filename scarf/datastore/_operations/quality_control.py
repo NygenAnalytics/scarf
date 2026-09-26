@@ -55,9 +55,10 @@ from ...storage.feature_selection import (
 from ...storage.refs import ArtifactRef
 from ...storage.selections import (
     iter_stored_selection_blocks,
+    ValidatedStoredSelection,
     read_stored_selection_indices,
-    read_stored_selection_mask,
     resolve_generated_selection_artifact,
+    selection_mask,
     validate_stored_selection_integrity,
 )
 from ...storage.types import as_zarr_array, as_zarr_group
@@ -290,22 +291,17 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         for attr in attrs:
             if not isinstance(attr, str):
                 raise TypeError("attrs must contain only column names")
-        missing = [attr for attr in attrs if attr not in self.cells.columns]
+        available = set(self.cells.columns)
+        missing = [attr for attr in attrs if attr not in available]
         if missing:
             joined = ", ".join(repr(attr) for attr in missing)
             raise KeyError(f"Cell metadata columns not found: {joined}")
         prior = self._filter_input_selection(cell_selection)
-        new_bool = read_stored_selection_mask(
-            self.zw,
-            prior,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )
+        new_bool = selection_mask(prior)
         input_fingerprints: dict[str, str] = {}
-        for i, j, k in zip(attrs, lows, highs, strict=True):
-            values = np.asarray(self.cells.fetch_all(i))
+        for i, j, k, values in zip(
+            attrs, lows, highs, self.cells.fetch_all_columns(attrs), strict=True
+        ):
             input_fingerprints[i] = (
                 fingerprint_strings(values)
                 if values.dtype.kind in {"O", "S", "U"}
@@ -317,7 +313,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             scope="datastore",
             kind="cell_selection",
             values=new_bool,
-            row_ids=np.asarray(self.cells.fetch_all("ids")),
+            row_ids=prior.row_ids,
+            row_ids_fingerprint=prior.row_ids_fingerprint,
             operation="filter_cells",
             parameters={
                 "attrs": attrs,
@@ -326,7 +323,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 "keep_bounds": keep_bounds,
             },
             inputs={
-                "prior_cell_selection": prior,
+                "prior_cell_selection": prior.ref,
                 "metadata_fingerprints": input_fingerprints,
             },
             source_column="artifact",
@@ -508,16 +505,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         if cell_selection is not None:
             if not isinstance(cell_selection, ArtifactRef):
                 raise TypeError("cell_selection must be an ArtifactRef")
-            validate_stored_selection_integrity(
-                self.zw,
-                cell_selection,
-                kind="cell_selection",
-                scope="datastore",
-                assay=None,
-                table_path="cellData",
-            )
             prior_selection = cell_selection
-        prior_mask = read_stored_selection_mask(
+        prior = validate_stored_selection_integrity(
             self.zw,
             prior_selection,
             kind="cell_selection",
@@ -525,6 +514,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             assay=None,
             table_path="cellData",
         )
+        prior_mask = selection_mask(prior)
 
         selected = np.zeros(self.cells.N, dtype=bool)
         for block in iter_stored_selection_blocks(
@@ -580,7 +570,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             scope="datastore",
             kind="cell_selection",
             values=selected,
-            row_ids=np.asarray(self.cells.fetch_all("ids")),
+            row_ids=prior.row_ids,
+            row_ids_fingerprint=prior.row_ids_fingerprint,
             operation="select_cells",
             parameters={
                 "low": resolved_low,
@@ -602,19 +593,20 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
     def _filter_input_selection(
         self,
         selection: ArtifactRef | None,
-    ) -> ArtifactRef:
-        ref = self.snapshot_cell_selection("I") if selection is None else selection
-        if not isinstance(ref, ArtifactRef):
+    ) -> ValidatedStoredSelection:
+        """Resolve the input cell selection, validated exactly once."""
+        if selection is None:
+            return self._snapshot_cell_selection("I")
+        if not isinstance(selection, ArtifactRef):
             raise TypeError("cell_selection must be an ArtifactRef")
-        validate_stored_selection_integrity(
+        return validate_stored_selection_integrity(
             self.zw,
-            ref,
+            selection,
             kind="cell_selection",
             scope="datastore",
             assay=None,
             table_path="cellData",
         )
-        return ref
 
     def auto_filter_cells(
         self,
@@ -671,11 +663,12 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 raise ValueError(
                     "n_mads and min_cells_per_sample apply only to method='mad'"
                 )
+        available = set(self.cells.columns)
         if attrs is None:
             attrs = []
             for i in ["nCounts", "nFeatures", "percentMito", "percentRibo"]:
                 i = f"{self._defaultAssay}_{i}"
-                if i in self.cells.columns:
+                if i in available:
                     attrs.append(i)
 
         attrs_list = list(attrs)
@@ -708,7 +701,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 "Metadata and artifact QC metrics must use distinct names: "
                 f"{duplicate_names}"
             )
-        missing = [attr for attr in attrs_list if attr not in self.cells.columns]
+        missing = [attr for attr in attrs_list if attr not in available]
         if missing:
             joined = ", ".join(repr(attr) for attr in missing)
             raise KeyError(f"Cell metadata columns not found: {joined}")
@@ -727,25 +720,17 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             )
 
         prior = self._filter_input_selection(cell_selection)
-        active = read_stored_selection_mask(
-            self.zw,
-            prior,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )
+        active = selection_mask(prior)
         if not active.any():
             raise ValueError("Cell selection contains no active cells")
 
         active_idx = np.flatnonzero(active).astype(np.int64, copy=False)
         values_by_name: dict[str, np.ndarray] = {}
         metadata_fingerprints: dict[str, str] = {}
-        for attr in attrs_list:
-            values = np.asarray(
-                read_metadata_rows_chunkwise(self.cells, attr, active_idx),
-                dtype=float,
-            )
+        for attr, column in zip(
+            attrs_list, self.cells.fetch_all_columns(attrs_list), strict=True
+        ):
+            values = np.asarray(column, dtype=float)[active_idx]
             if values.shape != (len(active_idx),):
                 raise ValueError(
                     f"QC metadata column {attr!r} does not align with cell_selection"
@@ -758,7 +743,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             resolved = resolve_cell_aligned_artifact(
                 self.zw,
                 source.artifact,
-                cell_selection=prior,
+                cell_selection=prior.ref,
                 expected_kind="quality_metric",
             )
             values = np.asarray(resolved.values, dtype=float)
@@ -795,7 +780,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             scope="datastore",
             kind="cell_selection",
             values=keep,
-            row_ids=np.asarray(self.cells.fetch_all("ids")),
+            row_ids=prior.row_ids,
+            row_ids_fingerprint=prior.row_ids_fingerprint,
             operation="auto_filter_cells",
             parameters={
                 "method": "gaussian",
@@ -806,7 +792,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 "resolved_bounds": resolved_bounds,
             },
             inputs={
-                "prior_cell_selection": prior,
+                "prior_cell_selection": prior.ref,
                 "metadata_fingerprints": metadata_fingerprints,
                 "artifact_metrics": {
                     source.name: source.artifact for source in metric_artifacts
@@ -853,16 +839,9 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             raise ValueError(
                 f"sample_column '{sample_column}' not found in cell metadata"
             )
-        prior_selection = self._filter_input_selection(cell_selection)
-        active = read_stored_selection_mask(
-            self.zw,
-            prior_selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )
-        active_idx = np.flatnonzero(active).astype(np.int64, copy=False)
+        prior = self._filter_input_selection(cell_selection)
+        prior_selection = prior.ref
+        active_idx = np.flatnonzero(selection_mask(prior)).astype(np.int64, copy=False)
         compact_active = np.ones(len(active_idx), dtype=bool)
         if len(active_idx) == 0:
             raise ValueError("Cell selection contains no active cells")
@@ -894,11 +873,10 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
 
         metric_names: list[str] = []
         values_by_attr: dict[str, np.ndarray] = {}
-        for attr in attrs:
-            values = np.asarray(
-                read_metadata_rows_chunkwise(self.cells, attr, active_idx),
-                dtype=float,
-            )
+        for attr, column in zip(
+            attrs, self.cells.fetch_all_columns(attrs), strict=True
+        ):
+            values = np.asarray(column, dtype=float)[active_idx]
             _validated_work_scale(
                 values,
                 attr=attr,
@@ -1021,7 +999,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             scope="datastore",
             kind="cell_selection",
             values=keep,
-            row_ids=np.asarray(self.cells.fetch_all("ids")),
+            row_ids=prior.row_ids,
+            row_ids_fingerprint=prior.row_ids_fingerprint,
             operation="auto_filter_cells",
             parameters=parameters,
             inputs=inputs,
@@ -1227,7 +1206,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             score_synthetic_doublets,
             smooth_doublet_scores,
         )
-        from ...storage.budget import admit_stream
+        from ...storage.execution import admit_stream
 
         assay_name = source_assay.name
         if feature_names is not None and np.asarray(feature_names).shape != (
@@ -1253,9 +1232,9 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             assay_name,
         )
         neighbors = lineage.neighbors
-        graph_cell_selection = self._graph_cell_selection(connectivity)
+        graph_selection = graph_cell_selection(self.zw, connectivity)
         if not self._selection_artifacts_match(
-            graph_cell_selection,
+            graph_selection,
             cell_selection,
         ):
             raise ValueError("Cell selection does not match the graph")
@@ -1396,7 +1375,9 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             + feature_indices.nbytes,
             requested=1,
         )
-        graph = self.load_graph(connectivity, symmetric=True, upper_only=False)
+        graph = self._load_graph_artifact(
+            connectivity, symmetric=True, upper_only=False, use_k=None
+        )
         if graph.shape != (n_active, n_active):
             raise ValueError("Doublet graph does not match the selected cells")
         scores = smooth_doublet_scores(
@@ -1541,7 +1522,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             invalidate_cache=invalidate_cache,
         )
         record = arguments.to_record()
-        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay)
+        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay.z)
         planned = _feature_selection_plan(
             self.zw,
             assay=assay.name,

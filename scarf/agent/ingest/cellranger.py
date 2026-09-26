@@ -18,7 +18,8 @@ def ingest_cellranger(
     directions: Mapping[str, Any],
     notes: list[str],
 ) -> IngestResult:
-    from ...readers.cellranger import CrDirReader, CrH5Reader
+    from ...readers.cellranger import CrH5Reader
+    from ...readers.mtx import CrDirReader
     from ...writers.cellranger import CrToZarr
 
     zarr_path = str(zarrPath)

@@ -98,4 +98,9 @@ result JSON under the run's `runTag`. Expect hours of Modal time and real cost.
 - Compare runs only when dataset, code revision, settings, storage conditions, and resource
   envelope are stated.
 - Do not present measurements from different machine sizes as one scaling curve.
+- `run-e2e` and `run-local` run UMAP beside Leiden, as `DataStore.pipeline` does. Stage
+  `seconds` remain per stage, but the CPU, memory, and store figures of stages that list
+  `concurrentStages` share one window, and background stages record no store operations.
+  `funnelSeconds` is the funnel's wall time; funnels recorded before this change ran every
+  stage in sequence. Use `run --stage` to measure one stage alone.
 - Do not generalize one run into a hardware guarantee or a biological correctness claim.

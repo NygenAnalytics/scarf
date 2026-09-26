@@ -46,7 +46,6 @@ class StoreOperationSummary:
     requestedBytes: int
     transferredBytes: int
     maxInFlight: int
-    keysTouched: int
 
 
 class StoreProbe:
@@ -151,7 +150,6 @@ class StoreProbe:
 
     def summary(self) -> StoreOperationSummary:
         with self._lock:
-            keys = {key for _kind, key in self.ops}
             return StoreOperationSummary(
                 gets=int(self._count_by_kind.get("get", 0)),
                 sets=int(self._count_by_kind.get("set", 0)),
@@ -161,7 +159,6 @@ class StoreProbe:
                 requestedBytes=int(self._requested_total),
                 transferredBytes=int(self._transferred_total),
                 maxInFlight=int(self.max_in_flight),
-                keysTouched=len(keys),
             )
 
     def to_json(self) -> dict[str, int]:
@@ -181,7 +178,6 @@ class StoreProbe:
             "readTransferredBytes": int(self._read_transferred_total),
             "writeTransferredBytes": int(self._write_transferred_total),
             "maxInFlight": summary.maxInFlight,
-            "keysTouched": summary.keysTouched,
         }
 
 

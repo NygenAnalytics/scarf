@@ -147,10 +147,11 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
             raise TypeError("graph must be an ArtifactRef")
         graph_input = graph
         cell_selection = graph_cell_selection(self.zw, graph_input)
-        graph_matrix = self.load_graph(
+        graph_matrix = self._load_graph_artifact(
             graph_input,
             symmetric=symmetric_graph,
             upper_only=graph_upper_only,
+            use_k=None,
         )
         initialization_input: object
         if isinstance(initialization, ArtifactRef):
@@ -331,10 +332,11 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
             raise TypeError("graph must be an ArtifactRef")
         graph_input = graph
         cell_selection = graph_cell_selection(self.zw, graph_input)
-        graph_matrix = self.load_graph(
+        graph_matrix = self._load_graph_artifact(
             graph_input,
             symmetric=symmetric_graph,
             upper_only=graph_upper_only,
+            use_k=None,
         )
         initialization_input: object
         if isinstance(initialization, ArtifactRef):

@@ -31,10 +31,6 @@ class BiologicalContext(AgentDataModel):
     experimentalDetails: list[str] = Field(default_factory=list)
     treatmentQuestion: str = ""
 
-    @classmethod
-    def get_blank(cls) -> "BiologicalContext":
-        return cls()
-
 
 class ConditionClusterSummary(AgentDataModel):
     """Aggregate cluster abundance for one condition without sample identifiers."""
@@ -95,10 +91,6 @@ class ClusterMarkerBatchEvidence(AgentDataModel):
     clusters: list[ClusterMarkerEvidence] = Field(default_factory=list)
     evidenceIds: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
-
-    @classmethod
-    def get_blank(cls) -> "ClusterMarkerBatchEvidence":
-        return cls()
 
 
 class ClusterInterpretation(AgentDataModel):

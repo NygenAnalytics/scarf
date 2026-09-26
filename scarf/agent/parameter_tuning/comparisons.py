@@ -8,7 +8,6 @@ from typing import Any, Literal, get_args
 import numpy as np
 from pydantic import Field
 
-from ...storage.refs import ArtifactRef
 from ..types import AgentDataModel
 from .contracts import ParameterCandidateEvaluation
 
@@ -227,20 +226,9 @@ def partition_comparison_evidence(
     arrays = []
     for candidate in (left, right):
         reference = candidate.artifacts["clusters"]
-        ref = ArtifactRef(
-            scope=reference.scope,
-            assay=reference.assay,
-            kind=reference.kind,
-            artifact_id=reference.artifactId,
-        )
+        ref = reference.to_artifact_ref()
         status = store.inspect_artifact(ref)
-        cells = left.cellSelection
-        cell_ref = ArtifactRef(
-            scope=cells.scope,
-            assay=cells.assay,
-            kind=cells.kind,
-            artifact_id=cells.artifactId,
-        )
+        cell_ref = left.cellSelection.to_artifact_ref()
         if (
             not status.complete
             or status.inputs.get("cell_selection") != cell_ref.to_dict()

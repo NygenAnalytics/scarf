@@ -50,10 +50,7 @@ def report_directory(root: Path, run_id: str, workspace: str | None) -> Path:
 
 
 def artifact_ref(value: Any) -> ArtifactRef:
-    ref = ArtifactReferenceModel.model_validate(value)
-    return ArtifactRef(
-        scope=ref.scope, assay=ref.assay, kind=ref.kind, artifact_id=ref.artifactId
-    )
+    return ArtifactReferenceModel.model_validate(value).to_artifact_ref()
 
 
 def scientific_summary(snapshot: Mapping[str, Any]) -> dict[str, Any]:

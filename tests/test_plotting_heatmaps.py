@@ -192,7 +192,6 @@ def test_marker_heatmap_selects_features_by_named_score(
 
     _, marker_slot = datastore._resolve_marker_group(marker_search)
     feature_names = np.asarray(marker_slot["feature_names"][:])
-    feature_ids = np.asarray(marker_slot["feature_ids"][:])
     expected_by_group: dict[str, list[str]] = {}
     for group_name in marker_slot.group_keys():
         markers = load_marker_table(
@@ -200,7 +199,6 @@ def test_marker_heatmap_selects_features_by_named_score(
             marker_slot[group_name],
             feature_names,
             group_id=group_name,
-            feature_ids=feature_ids,
         )
         ranked = markers.sort_values(
             ["score", "feature_name"],

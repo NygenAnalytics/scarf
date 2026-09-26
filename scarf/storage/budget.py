@@ -1,7 +1,6 @@
 """Resource limits used by one storage or analysis operation."""
 
 import os
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -230,93 +229,5 @@ def resolve_budget(
     )
 
 
-def admitted_worker_count(
-    resources: ResourceBudget,
-    *,
-    taskBytes: int,
-    residentBytes: int = 0,
-    requested: int | None = None,
-) -> int:
-    """Bound concurrent tasks by CPU and live byte estimates."""
-    workers, _ = admitted_worker_split(
-        resources,
-        nTasks=resources.workers if requested is None else requested,
-        taskBytes=lambda _: taskBytes,
-        residentBytes=residentBytes,
-        requested=requested,
-    )
-    return workers
-
-
-def admitted_worker_split(
-    resources: ResourceBudget,
-    *,
-    nTasks: int,
-    taskBytes: Callable[[int], int],
-    residentBytes: int = 0,
-    requested: int | None = None,
-) -> tuple[int, int]:
-    """Split worker slots between outer tasks and each task's inner work."""
-    cpu = min(
-        resources.workers,
-        resources.workers if requested is None else max(1, int(requested)),
-    )
-    tasks = max(1, int(nTasks))
-    resident = max(0, int(residentBytes))
-    available = resources.memoryBytes - resident
-    if available <= 0:
-        raise MemoryError(
-            f"Resident data needs about {resident} bytes, but the operation "
-            f"limit is {resources.memoryBytes} bytes"
-        )
-
-    for outer in range(min(cpu, tasks), 0, -1):
-        for inner in range(max(1, cpu // outer), 0, -1):
-            per_task = max(1, int(taskBytes(inner)))
-            if outer * per_task <= available:
-                return outer, inner
-
-    one_task = max(1, int(taskBytes(1)))
-    raise MemoryError(
-        f"One task needs about {one_task} bytes in addition to {resident} "
-        f"resident bytes, but the operation limit is {resources.memoryBytes} bytes"
-    )
-
-
 DEFAULT_READ_AHEAD_BLOCKS = 2
 """Read depth a public streaming API uses when the caller has not planned one."""
-
-
-@dataclass(frozen=True, slots=True)
-class StreamAdmission:
-    """Read depth and per-read concurrency admitted for one block stream."""
-
-    outerWorkers: int
-    ioConcurrency: int
-
-
-def admit_stream(
-    resources: ResourceBudget,
-    *,
-    nBlocks: int,
-    blockBytes: int,
-    decodeBytes: int = 0,
-    residentBytes: int = 0,
-    requested: int | None = None,
-) -> StreamAdmission:
-    """Admit read depth for a block stream that also decodes stored chunks.
-
-    Each in-flight read owns its block buffer plus as many decoded chunks as its
-    own concurrency allows, so ``decodeBytes`` is charged per concurrent decode
-    rather than once per read.
-    """
-    block = max(1, int(blockBytes))
-    decode = max(0, int(decodeBytes))
-    outer, inner = admitted_worker_split(
-        resources,
-        nTasks=nBlocks,
-        taskBytes=lambda concurrency: block + concurrency * decode,
-        residentBytes=residentBytes,
-        requested=requested,
-    )
-    return StreamAdmission(outerWorkers=outer, ioConcurrency=inner)

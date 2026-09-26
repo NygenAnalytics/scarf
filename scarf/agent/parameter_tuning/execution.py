@@ -1,6 +1,6 @@
 import hashlib
 import json
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Literal, cast
@@ -12,23 +12,14 @@ from ...metrics import graph_connectivity
 from ...storage.refs import ArtifactRef
 from ...storage.types import as_zarr_array
 from ...utils.logging import logger
-from .._deps import AGENT_INSTALL_HINT
 from ..tools import artifact_reference, core_artifact_reference
 from .contracts import (
     ArtifactRecord,
-    IntegrationCandidateEvaluation,
     ParameterCandidate,
     ParameterCandidateEvaluation,
     ParameterMetrics,
     ParameterTuningDependencies,
-    ParameterTuningReport,
 )
-
-try:
-    from pydantic_ai import RunContext
-except ImportError as exc:
-    raise ImportError(AGENT_INSTALL_HINT) from exc
-
 
 _RANDOM_SEED = 4444
 _PCA_RANDOM_SEED = 4466
@@ -145,111 +136,6 @@ def _metadata_column_fingerprint(metadata: Any, column: str) -> str:
                 np.asarray(missing[start : start + 65_536], dtype=bool).tobytes()
             )
     return digest.hexdigest()
-
-
-def _final_graph_options(
-    report: ParameterTuningReport,
-    integration_evaluations: Sequence[IntegrationCandidateEvaluation],
-) -> dict[str, dict[str, Any]]:
-    """Return the exact eligible graph options and option-scoped evidence."""
-
-    assay_reports = report.assayReports or {report.fromAssay: report}
-    report_cell_selection = core_artifact_reference(report.cellSelection)
-    if not isinstance(report_cell_selection, ArtifactRef):
-        raise ValueError("Parameter tuning report lacks an exact cell selection")
-    options: dict[str, dict[str, Any]] = {}
-    for assay, assay_report in assay_reports.items():
-        candidate_id = assay_report.recommendedCandidateId
-        if candidate_id is None:
-            continue
-        native_evaluation = next(
-            (
-                item
-                for item in assay_report.evaluations
-                if item.candidateId == candidate_id
-            ),
-            None,
-        )
-        if (
-            native_evaluation is None
-            or native_evaluation.status != "done"
-            or not native_evaluation.eligible
-            or "clusters" not in native_evaluation.artifacts
-            or "connectivityMap" not in native_evaluation.artifacts
-            or not native_evaluation.evidenceIds
-        ):
-            continue
-        if (
-            core_artifact_reference(native_evaluation.cellSelection)
-            != report_cell_selection
-        ):
-            raise ValueError("Native graph option uses a different cell selection")
-        option_id = f"native:{assay}:{candidate_id}"
-        option_evidence = [
-            f"native:{assay}:{evidence_id}"
-            for evidence_id in native_evaluation.evidenceIds
-        ]
-        evaluation_payload = native_evaluation.model_dump()
-        evaluation_payload["evidenceIds"] = option_evidence
-        options[option_id] = {
-            "optionId": option_id,
-            "graphMethod": "native",
-            "nativeAssay": assay,
-            "nativeCandidateId": candidate_id,
-            "evaluation": evaluation_payload,
-            "evidenceIds": option_evidence,
-        }
-    for integration_evaluation in integration_evaluations:
-        if (
-            integration_evaluation.status != "done"
-            or not integration_evaluation.eligible
-        ):
-            continue
-        if (
-            integration_evaluation.clusterArtifact is None
-            or integration_evaluation.graphArtifact is None
-        ):
-            continue
-        if not integration_evaluation.evidenceIds:
-            continue
-        if (
-            core_artifact_reference(integration_evaluation.cellSelection)
-            != report_cell_selection
-        ):
-            raise ValueError("Integrated graph option uses a different cell selection")
-        if not integration_evaluation.integrationId:
-            raise ValueError("Eligible integration evaluations require integrationId")
-        if (
-            integration_evaluation.graphArtifact.scope != "datastore"
-            or integration_evaluation.graphArtifact.assay is not None
-            or integration_evaluation.clusterArtifact.scope != "datastore"
-            or integration_evaluation.clusterArtifact.assay is not None
-            or integration_evaluation.graphArtifact.kind != "integrated_graph"
-            or integration_evaluation.clusterArtifact.kind
-            not in {"cluster_labels", "cluster_cut"}
-        ):
-            raise ValueError(
-                "Integrated graph and cluster artifacts must be datastore-scoped "
-                "without an assay"
-            )
-        if (
-            integration_evaluation.method == "wnn"
-            and integration_evaluation.metrics.modalityWeightsValid is not True
-        ):
-            continue
-        option_id = f"integration:{integration_evaluation.integrationId}"
-        if option_id in options:
-            raise ValueError(
-                f"Duplicate integration id {integration_evaluation.integrationId!r}"
-            )
-        options[option_id] = {
-            "optionId": option_id,
-            "graphMethod": integration_evaluation.method,
-            "integrationId": integration_evaluation.integrationId,
-            "evaluation": integration_evaluation.model_dump(),
-            "evidenceIds": list(integration_evaluation.evidenceIds),
-        }
-    return options
 
 
 def normalized_artifact_shape(store: Any, normalized: Any) -> tuple[int, int]:
@@ -602,6 +488,14 @@ def _collect_covariate_metrics(
     """Measure exact typed design effects on an existing graph and neighborhood."""
     store = deps.store
     perplexity = max(1.0, float(candidate.neighborsK // 3))
+    metadata_keys: dict[str, str | None] = {}
+
+    def live_metadata_key(column: str) -> str | None:
+        # One fingerprint per column and candidate; later candidates still see edits.
+        if column not in metadata_keys:
+            metadata_keys[column] = _metric_metadata_key(store, column)
+        return metadata_keys[column]
+
     for column in deps.batchColumns:
         try:
             score = float(
@@ -611,7 +505,7 @@ def _collect_covariate_metrics(
                         "batch_mixing",
                         neighbors_ref,
                         column,
-                        _metric_metadata_key(store, column),
+                        live_metadata_key(column),
                         perplexity,
                     ),
                     lambda: diagnostic_call(
@@ -645,7 +539,7 @@ def _collect_covariate_metrics(
                         "clisi",
                         neighbors_ref,
                         column,
-                        _metric_metadata_key(store, column),
+                        live_metadata_key(column),
                         None,
                         True,
                     ),
@@ -672,7 +566,7 @@ def _collect_covariate_metrics(
                         "protected_connectivity",
                         graph_ref,
                         column,
-                        _metric_metadata_key(store, column),
+                        live_metadata_key(column),
                     ),
                     lambda: diagnostic_call(
                         "core.graphConnectivity",
@@ -702,9 +596,7 @@ def _collect_covariate_metrics(
         graph_group = store.load_artifact(graph_ref)
         for columns in deps.protectedCombinations:
             name = "joint:" + json.dumps(list(columns), separators=(",", ":"))
-            metadata_key = tuple(
-                _metric_metadata_key(store, column) for column in columns
-            )
+            metadata_key = tuple(live_metadata_key(column) for column in columns)
             labels = combination_labels(bound_cells, columns)
             scores = _cached_candidate_metric(
                 (
@@ -1023,12 +915,3 @@ def execute_parameter_candidate(
 
         deps.evaluations[candidate_id] = evaluation
         return evaluation
-
-
-async def evaluate_parameter_candidate(
-    ctx: RunContext[ParameterTuningDependencies],
-    candidate_id: str,
-) -> ParameterCandidateEvaluation:
-    """Expose deterministic candidate execution as a bounded agent tool."""
-
-    return execute_parameter_candidate(ctx.deps, candidate_id)

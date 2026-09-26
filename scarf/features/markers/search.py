@@ -29,6 +29,7 @@ from .regression import (
     _regression_batch_results,
 )
 from .table import MARKER_STAT_COLUMNS
+from ...utils.arrays import has_duplicates
 
 __all__ = ["find_markers_by_rank", "find_markers_by_regression"]
 
@@ -116,9 +117,9 @@ def find_markers_by_rank(
         raise ValueError("Marker search requires non-empty cell and feature indices")
     if (
         np.any(cell_idx < 0)
-        or np.unique(cell_idx).size != len(cell_idx)
+        or has_duplicates(cell_idx)
         or np.any(feat_idx < 0)
-        or np.unique(feat_idx).size != len(feat_idx)
+        or has_duplicates(feat_idx)
     ):
         raise ValueError(
             "cell_idx and feat_idx must contain unique non-negative indices"
@@ -336,25 +337,14 @@ def find_markers_by_rank(
             )
             batch_stats.append(stats)
         stats_matrix = np.vstack(batch_stats)
-    pval_col = "p_value"
     for n, i in enumerate(group_set):
-        kernel = pd.DataFrame(
-            stats_matrix[:, n, :],
-            columns=list(_KERNEL_STAT_COLUMNS),
-            index=feat_idx,
-        )
-        adjusted = _bh_adjusted_pvalues(
-            kernel[pval_col].to_numpy(dtype=np.float64, copy=False)
-        )
-        df = kernel.copy()
-        df["p_value_adjusted"] = adjusted
-        df = df.loc[:, list(MARKER_STAT_COLUMNS)]
-        cols_to_round = [
-            col for col in df.columns if col not in {pval_col, "p_value_adjusted"}
-        ]
-        df.loc[:, cols_to_round] = df.loc[:, cols_to_round].round(5)
-        df["feature_index"] = df.index
-        results[i] = sort_marker_results(df)[out_cols]
+        columns: dict[str, np.ndarray] = {"feature_index": np.asarray(feat_idx)}
+        for position, name in enumerate(_KERNEL_STAT_COLUMNS):
+            values = np.asarray(stats_matrix[:, n, position], dtype=np.float64)
+            columns[name] = values if name == "p_value" else np.round(values, 5)
+        columns["p_value_adjusted"] = _bh_adjusted_pvalues(columns["p_value"])
+        frame = pd.DataFrame(columns, index=feat_idx)
+        results[i] = sort_marker_results(frame)[out_cols]
     return results
 
 
@@ -381,9 +371,9 @@ def find_markers_by_regression(
         raise ValueError("Marker regression requires non-empty indices")
     if (
         np.any(cell_idx < 0)
-        or np.unique(cell_idx).size != len(cell_idx)
+        or has_duplicates(cell_idx)
         or np.any(feat_idx < 0)
-        or np.unique(feat_idx).size != len(feat_idx)
+        or has_duplicates(feat_idx)
     ):
         raise ValueError(
             "cell_idx and feat_idx must contain unique non-negative indices"

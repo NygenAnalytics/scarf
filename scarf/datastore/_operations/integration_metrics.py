@@ -513,30 +513,14 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
                 "l2",
             )
         )
-        metric_data: Any
-        if "data" in coordinate_group:
-            metric_data = as_zarr_array(
-                coordinate_group["data"],
-                name="coordinates",
-            )
-            data_is_reduced = True
-            ann_obj = cast(Any, SimpleNamespace(annMetric=ann_metric))
-        else:
-            ann_obj = self._load_artifact_ann_stream(
-                neighbors,
-                True,
-            )
-            if ann_obj.harmonize:
-                raise ValueError("Harmony coordinates are missing for this KNN graph")
-            metric_data = ann_obj.data
-            data_is_reduced = False
+        # Neighbor lineage validation guarantees the coordinate data array.
+        metric_data = as_zarr_array(coordinate_group["data"], name="coordinates")
         selected_cells = SimpleNamespace(
             columns=("clusters",),
             fetch=lambda column, key="I": cluster_labels,
         )
         scores = silhouette_scoring(
             SimpleNamespace(cells=selected_cells),  # type: ignore[arg-type]
-            ann_obj,
             None,
             metric_data,
             cast(str, neighbors.assay),
@@ -544,7 +528,6 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
             cell_key="I",
             random_seed=random_seed,
             sample_size=sample_size,
-            data_is_reduced=data_is_reduced,
             distance_metric=cast(Any, ann_metric),
             neighbor_indices=neighbor_indices,
             neighbor_distances=neighbor_distances,

@@ -3,6 +3,28 @@
 from collections.abc import Mapping
 from typing import Any
 
+import numpy as np
+import zarr
+
+from ..storage.types import as_zarr_array
+from ..utils.arrays import regex_match_mask
+
+DEFAULT_PERCENT_PATTERNS = {"percentMito": "^MT-", "percentRibo": "RPS|RPL|MRPS|MRPL"}
+
+
+def default_feature_sets(assay: zarr.Group) -> list[np.ndarray]:
+    """Return the features each default RNA percentage pattern matches.
+
+    Writers total these sets while transposing counts, so preparation with the
+    default patterns needs no second read of the matrix.
+    """
+    names = as_zarr_array(assay["featureData/names"], name="featureData/names")
+    values = np.asarray(names[:]).astype(str)
+    return [
+        np.flatnonzero(regex_match_mask(values, pattern))
+        for pattern in DEFAULT_PERCENT_PATTERNS.values()
+    ]
+
 
 def preset_assay_types() -> dict[str, type]:
     """Return the DataStore assay-type preset map (single source of truth).

@@ -1,8 +1,39 @@
+import tracemalloc
+
 import numpy as np
+import pytest
 
 from scarf.assay import RNAassay
+from scarf.matrix import ChunkedArray
 from scarf.storage.artifacts import artifact_group
 from scarf.writers import write_renorm_subset_to_zarr
+
+
+@pytest.mark.parametrize(
+    "dtype", ["uint8", "uint16", "uint32", "uint64", "float32", "float64"]
+)
+def test_count_normalization_limits_promoted_work_arrays(dtype):
+    from scarf.assay.normalization import _normalize_count_block
+
+    values = np.random.default_rng(34).integers(0, 20, size=(10_000, 64)).astype(dtype)
+    totals = values.sum(axis=1)
+    expected = np.log1p(1000.0 * values / totals[:, None]).astype(np.float32)
+    allocation_limit = (
+        expected.nbytes
+        + values.size * max(8, values.dtype.itemsize)
+        + len(values) * (max(8, totals.dtype.itemsize) + 1)
+        + 128 * 1024
+    )
+    # Compile the integer kernel before tracing the steady-state allocations.
+    _normalize_count_block(values[:1], scaleFactor=1000.0, logTransform=True)
+    tracemalloc.start()
+    try:
+        actual = _normalize_count_block(values, scaleFactor=1000.0, logTransform=True)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    np.testing.assert_array_equal(actual, expected)
+    assert peak <= allocation_limit
 
 
 def _subset_indices(rna):
@@ -108,7 +139,7 @@ def test_run_normalization_without_renorm_still_uses_normed(toy_crdir_ds, monkey
 
     monkeypatch.setattr(RNAassay, "normed", fake_normed)
     monkeypatch.setattr(
-        "scarf.storage.materialize.write_renorm_subset_to_zarr",
+        "scarf.assay.normalization.write_renorm_subset_to_zarr",
         fake_fused,
     )
     _, feat_idx = _subset_indices(rna)
@@ -126,7 +157,7 @@ def test_run_normalization_without_renorm_still_uses_normed(toy_crdir_ds, monkey
 
 
 def test_run_normalization_renorm_cache_hit(toy_crdir_ds, monkeypatch):
-    from scarf.storage.materialize import (
+    from scarf.assay.normalization import (
         write_renorm_subset_to_zarr as materialize_renorm_subset,
     )
 
@@ -139,7 +170,7 @@ def test_run_normalization_renorm_cache_hit(toy_crdir_ds, monkeypatch):
         return orig_fused(*args, **kwargs)
 
     monkeypatch.setattr(
-        "scarf.storage.materialize.write_renorm_subset_to_zarr",
+        "scarf.assay.normalization.write_renorm_subset_to_zarr",
         counting_fused,
     )
     _, feat_idx = _subset_indices(rna)
@@ -198,7 +229,7 @@ def test_feature_major_normalization_rejects_missing_or_unsorted_cells() -> None
 
     from scarf.storage.budget import ResourceBudget
     from scarf.storage.feature_stream import FeatureCellBand
-    from scarf.storage.materialize import (
+    from scarf.assay.normalization import (
         _counts_t_renormalized_batches,
         write_renorm_subset_to_zarr,
     )
@@ -322,6 +353,7 @@ def test_feature_major_normalization_rejects_missing_or_unsorted_cells() -> None
 
     root = zarr.open_group(store=MemoryStore(), mode="w")
     raw = np.arange(12, dtype=np.float32).reshape(3, 4)
+    root.attrs.update({"prepared": True, "dataset_fingerprint": "test-dataset"})
     missing_sf = SimpleNamespace(rawData=raw, rawDataT=None, sf=None)
     with pytest.raises(ValueError, match="size factor"):
         write_renorm_subset_to_zarr(
@@ -334,7 +366,8 @@ def test_feature_major_normalization_rejects_missing_or_unsorted_cells() -> None
         )
     write_renorm_subset_to_zarr(
         SimpleNamespace(
-            rawData=raw,
+            rawData=ChunkedArray.from_numpy(raw),
+            z=root,
             rawDataT=None,
             sf=1000.0,
             resources=ResourceBudget(8 * 1024 * 1024, 1),

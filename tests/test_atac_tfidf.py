@@ -102,7 +102,7 @@ def test_subset_tfidf_and_feature_summary_match_reference(atac_tfidf_store):
     assert summary_status.parameters == {
         "normalization_method": callable_identity(assay.normMethod),
     }
-    assert set(summary_status.inputs or {}) == {"cell_selection"}
+    assert set(summary_status.inputs or {}) == {"cell_selection", "dataset_fingerprint"}
     summary = store.load_artifact(summary_ref)
     assert set(summary.array_keys()) == {"prevalence", "document_frequency"}
     assert isinstance(summary.attrs["ordered_feature_ids_fingerprint"], str)

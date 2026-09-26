@@ -513,6 +513,7 @@ def test_embedding_feature_matrix_prefetch_batches_feature_slots(monkeypatch):
             splt.CellField("category", kind="categorical"),
             "gene_b",
         ],
+        metadata_columns=set(store.cells.columns),
         from_assay="RNA",
         cell_key="I",
         n_cells=4,
@@ -2534,6 +2535,7 @@ def test_distribution_masks_metadata_placeholders_per_panel():
     masked_values, _label, _is_feature, masked_identity, _assay = _fetch_series(
         masked_store,
         "metric",
+        metadata_columns=set(masked_store.cells.columns),
         cell_indices=np.arange(6, dtype=np.int64),
         from_assay=None,
         normalization=splt.NormalizationSpec(),
@@ -2541,6 +2543,7 @@ def test_distribution_masks_metadata_placeholders_per_panel():
     _values, _label, _is_feature, plain_identity, _assay = _fetch_series(
         plain_store,
         "metric",
+        metadata_columns=set(plain_store.cells.columns),
         cell_indices=np.arange(6, dtype=np.int64),
         from_assay=None,
         normalization=splt.NormalizationSpec(),

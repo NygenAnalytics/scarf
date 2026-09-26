@@ -228,10 +228,11 @@ def test_scaled_variance_denominator_requires_exact_normalization(
 def test_pca_covariate_evidence_rejects_wrong_type_or_selection(
     monkeypatch: pytest.MonkeyPatch, damage: str
 ) -> None:
+    monkeypatch.setattr(d, "_selection_indices", lambda *_: np.arange(4))
     monkeypatch.setattr(
         d,
-        "_aligned_metadata_values",
-        lambda *_: np.arange(3 if damage == "rows" else 4),
+        "_aligned_metadata",
+        lambda *_, **__: np.arange(3 if damage == "rows" else 4),
     )
     monkeypatch.setattr(
         d,
@@ -647,14 +648,26 @@ def test_metadata_diagnostics_preserve_missing_masks_and_reject_misalignment(
         d, "read_metadata_missing_rows_chunkwise", lambda *_: np.asarray([False, True])
     )
     store = SimpleNamespace(zw=None, cells=None)
-    values = d._aligned_metadata_values(store, _ref("cell_selection"), "age")
+    indices = d._selection_indices(store, _ref("cell_selection"))
+    values = d._aligned_metadata(
+        store, indices, "age", aligned_with="PCA", mark_missing=True
+    )
     assert values.tolist() == [20.0, None]
+    assert d._aligned_metadata(
+        store, indices, "age", aligned_with="clusters"
+    ).tolist() == [20.0, 40.0]
     monkeypatch.setattr(
         d, "read_metadata_rows_chunkwise", lambda *_: np.asarray([20.0])
     )
-    for read in (d._aligned_metadata_values, d._aligned_metadata):
+    for mark_missing in (True, False):
         with pytest.raises(ValueError, match="align"):
-            read(store, _ref("cell_selection"), "age")
+            d._aligned_metadata(
+                store,
+                indices,
+                "age",
+                aligned_with="PCA",
+                mark_missing=mark_missing,
+            )
 
 
 def test_topology_overlap_requires_same_neighborhood_axis(

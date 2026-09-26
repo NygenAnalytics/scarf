@@ -23,7 +23,7 @@ from scarf.storage.artifacts import (
     inspect_artifact,
 )
 from scarf.storage.errors import ArtifactResolutionError
-from scarf.storage.selections import resolve_selection_artifact
+from scarf.storage.selections import resolve_generated_selection_artifact
 from tests.fixtures_datastore import build_neighbourhood_graph
 
 
@@ -86,7 +86,7 @@ def _memory_metadata_root() -> tuple[zarr.Group, ArtifactRef]:
     selection = np.asarray([True, False, True])
     cell_data.create_array("ids", data=cell_ids)
     cell_data.create_array("I", data=selection)
-    selection_ref = resolve_selection_artifact(
+    selection_ref = resolve_generated_selection_artifact(
         root,
         scope="datastore",
         kind="cell_selection",
@@ -96,7 +96,7 @@ def _memory_metadata_root() -> tuple[zarr.Group, ArtifactRef]:
         parameters={},
         inputs={},
         source_column="I",
-    )
+    )[0]
     return root, selection_ref
 
 
@@ -197,7 +197,7 @@ def test_cell_aligned_artifact_resolver_validates_lineage_and_reads_subset(
         {"values": np.asarray([10.0, 30.0])},
     )
     cell_ids = np.asarray(root["cellData"]["ids"][:])
-    target_selection = resolve_selection_artifact(
+    target_selection = resolve_generated_selection_artifact(
         root,
         scope="datastore",
         kind="cell_selection",
@@ -207,7 +207,7 @@ def test_cell_aligned_artifact_resolver_validates_lineage_and_reads_subset(
         parameters={},
         inputs={},
         source_column="artifact",
-    )
+    )[0]
     read_positions: list[np.ndarray] = []
     read_rows = metadata_selection_module.read_array_rows_chunkwise
 
@@ -235,7 +235,7 @@ def test_cell_aligned_artifact_resolver_validates_lineage_and_reads_subset(
     assert len(read_positions) == 1
     np.testing.assert_array_equal(read_positions[0], [1])
 
-    outside_selection = resolve_selection_artifact(
+    outside_selection = resolve_generated_selection_artifact(
         root,
         scope="datastore",
         kind="cell_selection",
@@ -245,7 +245,7 @@ def test_cell_aligned_artifact_resolver_validates_lineage_and_reads_subset(
         parameters={},
         inputs={},
         source_column="artifact",
-    )
+    )[0]
     with pytest.raises(ValueError, match="subset"):
         resolve_cell_aligned_artifact(
             root,

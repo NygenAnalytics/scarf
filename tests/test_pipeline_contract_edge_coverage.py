@@ -599,6 +599,7 @@ def test_run_ledger_records_and_interruption_helpers(
     with pytest.raises(TypeError, match="handled"):
         ledger._finish_interrupted(
             stage="stage",
+            ordinal=0,
             error=ValueError("bad"),
             metrics=_metrics(),
         )

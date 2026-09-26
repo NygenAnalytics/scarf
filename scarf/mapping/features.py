@@ -1,5 +1,6 @@
 import copy
-from collections.abc import Iterator, Mapping
+from collections.abc import Generator, Iterator, Mapping
+from contextlib import closing
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -9,7 +10,8 @@ from numpy.typing import DTypeLike
 from ..assay import RNAassay, _read_block, norm_lib_size
 from ..metadata.rows import read_metadata_rows_chunkwise
 from ..storage.artifacts import ValueFingerprintBuilder, callable_identity
-from ..storage.budget import ResourceBudget, admit_stream
+from ..storage.budget import ResourceBudget
+from ..storage.execution import admit_stream
 from ..storage.geometry import ArrayGeometry, array_geometry
 from ..storage.parallel import stream_shards
 from ..storage.partition import (
@@ -532,7 +534,7 @@ class AlignedFeatureStream:
     def __iter__(self) -> Iterator[AlignedFeatureBlock]:
         return self.iter_blocks()
 
-    def iter_blocks(self) -> Iterator[AlignedFeatureBlock]:
+    def iter_blocks(self) -> Generator[AlignedFeatureBlock, None, None]:
         """Return a fresh iterator over normalized aligned row blocks."""
 
         def read(boundary: tuple[int, int]) -> tuple[int, np.ndarray]:
@@ -543,35 +545,39 @@ class AlignedFeatureStream:
                 self._query_index_map,
             )
 
-        raw_blocks = stream_shards(
-            self._row_geometry.boundaries,
-            read,
-            workers=1,
-            io_concurrency=self._io_concurrency,
-            total=len(self._row_geometry.boundaries),
-        )
-        for start, raw in raw_blocks:
-            normalized = normalize_reference_counts(
-                raw,
-                size_factor=self.size_factor,
-                log_transform=self.log_transform,
-                denominator=(
-                    None
-                    if self._cell_scalars is None
-                    else self._cell_scalars[start : start + len(raw)]
-                ),
+        # The block reader holds Zarr's process-wide I/O limit while suspended,
+        # so close it when this iterator closes rather than at collection.
+        with closing(
+            stream_shards(
+                self._row_geometry.boundaries,
+                read,
+                workers=1,
+                io_concurrency=self._io_concurrency,
+                total=len(self._row_geometry.boundaries),
             )
+        ) as raw_blocks:
+            for start, raw in raw_blocks:
+                normalized = normalize_reference_counts(
+                    raw,
+                    size_factor=self.size_factor,
+                    log_transform=self.log_transform,
+                    denominator=(
+                        None
+                        if self._cell_scalars is None
+                        else self._cell_scalars[start : start + len(raw)]
+                    ),
+                )
 
-            values = np.empty(
-                (len(raw), len(self._reference_feature_ids)),
-                dtype=self.dtype,
-            )
-            if self._missing_feature_policy == "reference_mean":
-                values[:] = self._reference_normalized_means
-            else:
-                values.fill(0)
-            values[:, self._reference_index_map] = normalized
-            yield AlignedFeatureBlock(row_offset=start, values=values)
+                values = np.empty(
+                    (len(raw), len(self._reference_feature_ids)),
+                    dtype=self.dtype,
+                )
+                if self._missing_feature_policy == "reference_mean":
+                    values[:] = self._reference_normalized_means
+                else:
+                    values.fill(0)
+                values[:, self._reference_index_map] = normalized
+                yield AlignedFeatureBlock(row_offset=start, values=values)
 
     def _fingerprint_raw_expression(self) -> str:
         all_columns = np.arange(self._n_query_features, dtype=np.int64)

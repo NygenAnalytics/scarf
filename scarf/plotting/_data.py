@@ -184,6 +184,18 @@ def coerce_feature_list(
     return [(None, item) for item in features]
 
 
+def _cell_metadata_columns(store: Any, keys: Sequence[object]) -> frozenset[str]:
+    """Return cell-metadata column names when a plain string key needs them.
+
+    A string key names a cell-metadata column when one exists and a feature
+    otherwise. Callers classify every key against this one read of the column
+    list instead of listing the metadata columns again for each key.
+    """
+    if any(isinstance(key, str) for key in keys):
+        return frozenset(store.cells.columns)
+    return frozenset()
+
+
 def resolve_cell_selection(
     n: int,
     *,
@@ -335,6 +347,26 @@ def _summarize_feature_blocks(
     ]
 
 
+_MAX_SUMMARY_GROUPS = 500
+_MAX_SUMMARY_FEATURES = 2000
+_MAX_SUMMARY_SAMPLES = 500
+
+
+def _check_feature_count(
+    pairs: Sequence[tuple[str | None, str | FeatureRef]],
+    *,
+    max_features: int = _MAX_SUMMARY_FEATURES,
+) -> None:
+    """Reject an empty feature list or one longer than ``max_features``."""
+    if not pairs:
+        raise ValueError("At least one feature is required")
+    if len(pairs) > max_features:
+        raise ValueError(
+            f"Too many features ({len(pairs)} > {max_features}). "
+            "Raise max_features explicitly if intentional."
+        )
+
+
 def summarize_features_by_group(
     store: Any,
     *,
@@ -347,39 +379,64 @@ def summarize_features_by_group(
     study_design: StudyDesign | None = None,
     normalization: NormalizationSpec | None = None,
     expression_cutoff: float = 0.0,
-    max_groups: int = 500,
-    max_features: int = 2000,
-    max_samples: int = 500,
+    max_groups: int = _MAX_SUMMARY_GROUPS,
+    max_features: int = _MAX_SUMMARY_FEATURES,
+    max_samples: int = _MAX_SUMMARY_SAMPLES,
 ) -> tuple[pd.DataFrame, pd.DataFrame | None]:
     """Aggregate features by group. With sample_by, samples get equal weight.
 
     Missing group combinations are omitted (not filled with zeros).
+    """
+    pairs = coerce_feature_list(features)
+    _check_feature_count(pairs, max_features=max_features)
+    resolved = [
+        resolve_feature(store, feat, from_assay=from_assay) for _, feat in pairs
+    ]
+    grouping = _resolve_grouping(
+        store,
+        group_by=group_by,
+        groups=groups,
+        cell_key=cell_key,
+    )
+    return _summarize_resolved_features(
+        store,
+        resolved,
+        [g for g, _ in pairs],
+        grouping,
+        sample_by=sample_by,
+        study_design=study_design,
+        normalization=normalization,
+        expression_cutoff=expression_cutoff,
+        max_groups=max_groups,
+        max_samples=max_samples,
+    )
+
+
+def _summarize_resolved_features(
+    store: Any,
+    resolved: Sequence[ResolvedFeature],
+    group_labels: list[str | None],
+    grouping: tuple[tuple[str, ...], np.ndarray, list[np.ndarray]],
+    *,
+    sample_by: str | None = None,
+    study_design: StudyDesign | None = None,
+    normalization: NormalizationSpec | None = None,
+    expression_cutoff: float = 0.0,
+    max_groups: int = _MAX_SUMMARY_GROUPS,
+    max_samples: int = _MAX_SUMMARY_SAMPLES,
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    """Aggregate resolved features over a grouping from ``_resolve_grouping``.
+
+    ``group_labels`` holds each feature's bracket group, aligned with
+    ``resolved``.
     """
     condition_by: str | None = None
     if study_design is not None:
         sample_by = study_design.sample_by
         condition_by = study_design.condition_by
 
-    pairs = coerce_feature_list(features)
-    if not pairs:
-        raise ValueError("At least one feature is required")
-    if len(pairs) > max_features:
-        raise ValueError(
-            f"Too many features ({len(pairs)} > {max_features}). "
-            "Raise max_features explicitly if intentional."
-        )
-    resolved = [
-        resolve_feature(store, feat, from_assay=from_assay) for _, feat in pairs
-    ]
-    group_labels = [g for g, _ in pairs]
-
     cells = store.cells
-    group_keys, cell_idx, group_cols = _resolve_grouping(
-        store,
-        group_by=group_by,
-        groups=groups,
-        cell_key=cell_key,
-    )
+    group_keys, cell_idx, group_cols = grouping
     n_groups = int(
         pd.DataFrame({k: c for k, c in zip(group_keys, group_cols)})
         .drop_duplicates()

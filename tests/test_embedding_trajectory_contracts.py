@@ -4,7 +4,6 @@ from inspect import signature
 
 from scarf.datastore.datastore import DataStore
 from scarf.embeddings.sgtsne import run_sgtsne
-from scarf.neighbors.stream import AnnStream
 from scarf.trajectory.feature_dynamics import validate_pseudotime_regressor
 from scarf.trajectory.results import (
     FateMappingResult,
@@ -17,12 +16,11 @@ from tests.signature_contracts import signature_digest
 
 def test_embedding_and_trajectory_entry_point_signatures_are_stable() -> None:
     methods = {
-        "AnnStream.__init__": AnnStream.__init__,
         "run_sgtsne": run_sgtsne,
         "validate_pseudotime_regressor": validate_pseudotime_regressor,
     }
     assert signature_digest(methods) == (
-        "3c6e95fff8b6df1dde233957035f5aca44e3e6a7e46eaaaca6f48d77e7aecab1"
+        "044d9c29d6a994394de6c0ca5d6151b552203e034e24d0b1f3d77d766ac3f9ae"
     )
 
 

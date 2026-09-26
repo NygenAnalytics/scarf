@@ -5,25 +5,16 @@ from typing import Any
 import zarr
 
 from ..assay.classification import (
+    default_feature_sets,
     is_rna_assay_type,
     resolve_persisted_assay_type,
 )
-from ..storage.budget import ResourceBudget
+from ..storage.budget import ResourceBudget, resolve_budget
 from ..storage.count_matrix import CountMatrixPolicy
 from ..storage.io_policy import StorageIoPolicy
-from ..storage.counts_t_contract import (
-    CountsTInspectResult as CountsTInspectResult,
-)
-from ..storage.counts_t_contract import (
-    CountsTInspectStatus as CountsTInspectStatus,
-)
-from ..storage.counts_t_contract import inspect_counts_t as inspect_counts_t
-from ..storage.counts_t_contract import (
-    require_rna_counts_t_ready as require_rna_counts_t_ready,
-)
 from ..storage.profiles import StorageProfile
 from ..storage.schema import load_count_array
-from ..storage.sharding import finalize_rna_counts_t
+from ..storage.sharding import write_counts_t
 from ..storage.types import as_zarr_group
 from ..utils.logging import logger
 
@@ -119,21 +110,27 @@ def finalize_writer_counts_t(
     Returns:
         The ``countsT`` array, or None when the assay is not RNA.
     """
+    logical = as_zarr_group(_workspace_root(z, workspace)[assay_name], name=assay_name)
+    if logical.attrs.get("prepared") is True:
+        raise ValueError(
+            "Prepared counts cannot be finalized again; rebuild into a fresh destination"
+        )
     type_name = resolve_persisted_assay_type(assay_name, assay_type)
     seed_assay_type(z, assay_name, workspace, type_name)
+    counts = load_count_array(z, assay_name, workspace)
+    resources = resources or resolve_budget(mem_budget, nthreads)
     if not is_rna_assay_type(type_name):
         return None
-    counts = load_count_array(z, assay_name, workspace)
     group = matrix_group_for_assay(z, assay_name, workspace)
-    counts_t = finalize_rna_counts_t(
+    counts_t = write_counts_t(
         counts,
         group,
         profile=profile,
         resources=resources,
-        mem_budget=mem_budget,
-        nthreads=nthreads,
         policy=policy,
         io=io,
+        overwrite="countsT" in group,
+        featureSets=default_feature_sets(logical),
     )
     logger.debug(f"Wrote paired countsT for RNA assay {assay_name}")
     return counts_t

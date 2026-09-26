@@ -23,10 +23,6 @@ class DataEnrichmentContext(AgentDataModel):
     cellTypeReferences: list[str] = Field(default_factory=list)
     experimentalDetails: list[str] = Field(default_factory=list)
 
-    @classmethod
-    def get_blank(cls) -> "DataEnrichmentContext":
-        return cls()
-
 
 class StudyContextSummary(AgentDataModel):
     """Verbatim, evidence-backed references extracted from the study context."""
@@ -40,10 +36,6 @@ class StudyContextSummary(AgentDataModel):
     hypothesisReferences: list[str] = Field(default_factory=list)
     analysisIntentReferences: list[str] = Field(default_factory=list)
     evidenceIds: SkipJsonSchema[list[str]] = Field(default_factory=list)
-
-    @classmethod
-    def get_blank(cls) -> "StudyContextSummary":
-        return cls()
 
 
 class AdtControlEvidence(AgentDataModel):
@@ -89,10 +81,6 @@ class AtacCoordinateEvidence(AgentDataModel):
     genomeBuild: Literal["unknown"] = "unknown"
     evidenceId: str = ""
 
-    @classmethod
-    def get_blank(cls) -> "AtacCoordinateEvidence":
-        return cls()
-
 
 class AssayModalityEvidence(AgentDataModel):
     """Bounded deterministic routing evidence for one persisted assay type."""
@@ -112,10 +100,6 @@ class AssayModalityEvidence(AgentDataModel):
     reportedFeatures: int = 0
     truncated: bool = False
     evidenceIds: list[str] = Field(default_factory=list)
-
-    @classmethod
-    def get_blank(cls) -> "AssayModalityEvidence":
-        return cls()
 
 
 class FeatureFamilyEvidence(AgentDataModel):
@@ -149,10 +133,6 @@ class DefaultHvgFamilyEvidence(AgentDataModel):
     examples: list[str] = Field(default_factory=list)
     evidenceId: str = ""
 
-    @classmethod
-    def get_blank(cls) -> "DefaultHvgFamilyEvidence":
-        return cls()
-
 
 class RnaFeatureInventoryEvidence(AgentDataModel):
     """Exact name-column matches for Scarf's default HVG blacklist."""
@@ -167,10 +147,6 @@ class RnaFeatureInventoryEvidence(AgentDataModel):
     families: list[DefaultHvgFamilyEvidence] = Field(default_factory=list)
     evidenceId: str = ""
     evidenceIds: list[str] = Field(default_factory=list)
-
-    @classmethod
-    def get_blank(cls) -> "RnaFeatureInventoryEvidence":
-        return cls()
 
 
 class ExogenousFeatureEvidence(AgentDataModel):
@@ -216,10 +192,6 @@ class AssayFeatureInspectionBatch(AgentDataModel):
     inspections: list[AssayFeatureInspection] = Field(default_factory=list)
     evidenceIds: list[str] = Field(default_factory=list)
 
-    @classmethod
-    def get_blank(cls) -> "AssayFeatureInspectionBatch":
-        return cls()
-
 
 class FeatureReference(AgentDataModel):
     """An exact feature identifier and name observed in one assay."""
@@ -262,10 +234,6 @@ class FeatureLookupBatch(AgentDataModel):
 
     lookups: list[FeatureLookupResult] = Field(default_factory=list)
     evidenceIds: list[str] = Field(default_factory=list)
-
-    @classmethod
-    def get_blank(cls) -> "FeatureLookupBatch":
-        return cls()
 
 
 class FeatureSelectionPolicy(AgentDataModel):
@@ -389,7 +357,3 @@ class DataEnrichmentDependencies(AgentDataModel):
     lookupBatch: FeatureLookupBatch | None = Field(default=None, exclude=True)
     lookupQueries: dict[str, list[str]] = Field(default_factory=dict, exclude=True)
     toolCalls: list[DataEnrichmentToolCall] = Field(default_factory=list)
-
-    @classmethod
-    def get_blank(cls) -> "DataEnrichmentDependencies":
-        return cls()

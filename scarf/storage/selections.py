@@ -23,11 +23,13 @@ from .artifacts import (
     fingerprint_stored_strings,
     fingerprint_strings,
     inspect_artifact,
+    open_artifact,
 )
 from .errors import ArtifactErrorContextValue, ArtifactResolutionError
 from .geometry import array_geometry
-from .partition import row_band
+from .partition import row_band, scan_band
 from .types import as_zarr_array, as_zarr_group
+from .validation_scope import store_key, validated_once
 
 
 _MISSING_COLUMN_PREFIX = "__scarf_missing__"
@@ -42,6 +44,7 @@ class ValidatedStoredSelection:
     row_ids: zarr.Array
     selected_count: int
     table_path: str
+    row_ids_fingerprint: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,7 +91,7 @@ def _stored_selection_summary(array: zarr.Array) -> tuple[str, int]:
         raise TypeError("Stored selection columns must be one-dimensional booleans")
     builder = ValueFingerprintBuilder()
     builder.begin_array("values", array.shape, array.dtype)
-    block_rows = row_band(array_geometry(array), unit="chunk", fallback=1)
+    block_rows = scan_band(array_geometry(array), fallback=1)
     selected_count = 0
     for start in range(0, int(array.shape[0]), block_rows):
         stop = min(start + block_rows, int(array.shape[0]))
@@ -127,6 +130,30 @@ def validate_stored_selection_integrity(
     id_column: str = "ids",
 ) -> ValidatedStoredSelection:
     """Validate immutable selection payload and ordered row identity."""
+    return validated_once(
+        ("selection", *store_key(root), ref, kind, scope, assay, table_path, id_column),
+        lambda: _validate_stored_selection_integrity(
+            root,
+            ref,
+            kind=kind,
+            scope=scope,
+            assay=assay,
+            table_path=table_path,
+            id_column=id_column,
+        ),
+    )
+
+
+def _validate_stored_selection_integrity(
+    root: zarr.Group,
+    ref: ArtifactRef,
+    *,
+    kind: str,
+    scope: ArtifactScope,
+    assay: str | None,
+    table_path: str,
+    id_column: str,
+) -> ValidatedStoredSelection:
     context = _selection_context(ref, table_path=table_path)
     if ref.kind != kind or ref.scope != scope or ref.assay != assay:
         raise ArtifactResolutionError(
@@ -142,15 +169,17 @@ def validate_stored_selection_integrity(
                 "actual_kind": ref.kind,
             },
         )
+    # Each node is read once: membership tests before indexing double the
+    # round trips on object stores.
     try:
-        status = inspect_artifact(root, ref)
+        status, selection_group = open_artifact(root, ref)
     except (KeyError, TypeError, ValueError) as exc:
         raise ArtifactResolutionError(
             f"{kind} artifact record is malformed",
             code="artifact_missing",
             context=context,
         ) from exc
-    if not status.exists:
+    if selection_group is None:
         raise ArtifactResolutionError(
             f"{kind} artifact does not exist",
             code="artifact_missing",
@@ -162,36 +191,33 @@ def validate_stored_selection_integrity(
             code="artifact_incomplete",
             context=context,
         )
-    if table_path not in root:
+    try:
+        table = as_zarr_group(root[table_path], name=table_path)
+    except KeyError:
         raise ArtifactResolutionError(
             f"Selection table {table_path!r} is unavailable",
             code="selection_table_missing",
             context=context,
-        )
-    table = as_zarr_group(root[table_path], name=table_path)
-    if id_column not in table:
+        ) from None
+    try:
+        row_ids_node = table[id_column]
+    except KeyError:
         raise ArtifactResolutionError(
             f"Selection row identifier column {id_column!r} is unavailable",
             code="selection_row_ids_missing",
             context=context,
-        )
+        ) from None
     try:
-        selection_group = artifact_group(root, ref)
-    except (KeyError, TypeError) as exc:
-        raise ArtifactResolutionError(
-            f"{kind} artifact does not exist",
-            code="artifact_missing",
-            context=context,
-        ) from exc
-    if "values" not in selection_group:
+        values_node = selection_group["values"]
+    except KeyError:
         raise ArtifactResolutionError(
             f"{kind} artifact has no values",
             code="selection_values_missing",
             context=context,
-        )
+        ) from None
     try:
-        stored_values = as_zarr_array(selection_group["values"], name="values")
-        row_ids = as_zarr_array(table[id_column], name=id_column)
+        stored_values = as_zarr_array(values_node, name="values")
+        row_ids = as_zarr_array(row_ids_node, name=id_column)
     except TypeError as exc:
         raise ArtifactResolutionError(
             f"{kind} selection payload is malformed",
@@ -230,18 +256,13 @@ def validate_stored_selection_integrity(
             code="selection_values_changed",
             context=context,
         )
-    if fingerprint_stored_strings(row_ids) != expected_row_ids:
-        raise ArtifactResolutionError(
-            f"{kind} row identity changed while the artifact was validated",
-            code="row_identity_mismatch",
-            context=context,
-        )
     return ValidatedStoredSelection(
         ref=ref,
         values=stored_values,
         row_ids=row_ids,
         selected_count=selected_count,
         table_path=table_path,
+        row_ids_fingerprint=expected_row_ids,
     )
 
 
@@ -294,8 +315,8 @@ def validate_stored_selection_live_alias(
             context=context,
         )
     block_rows = min(
-        row_band(array_geometry(stored_values), unit="chunk", fallback=1),
-        row_band(array_geometry(current_values), unit="chunk", fallback=1),
+        scan_band(array_geometry(stored_values), fallback=1),
+        scan_band(array_geometry(current_values), fallback=1),
     )
     for start in range(0, int(stored_values.shape[0]), block_rows):
         stop = min(start + block_rows, int(stored_values.shape[0]))
@@ -315,19 +336,13 @@ def _selection_block_rows(
     selection: ValidatedStoredSelection,
     block_rows: int | None,
 ) -> int:
-    chunk_rows = int(
-        row_band(
-            array_geometry(selection.values),
-            unit="chunk",
-            fallback=1,
-        )
-    )
+    band_rows = scan_band(array_geometry(selection.values), fallback=1)
     if block_rows is None:
-        return chunk_rows
+        return band_rows
     requested = int(block_rows)
     if requested < 1:
         raise ValueError("block_rows must be >= 1")
-    return min(requested, chunk_rows)
+    return min(requested, band_rows)
 
 
 def _iter_validated_selection_blocks(
@@ -410,6 +425,15 @@ def read_stored_selection_mask(
         table_path=table_path,
         id_column=id_column,
     )
+    return selection_mask(selection, block_rows=block_rows)
+
+
+def selection_mask(
+    selection: ValidatedStoredSelection,
+    *,
+    block_rows: int | None = None,
+) -> np.ndarray:
+    """Read the full mask of a selection that was already validated."""
     output: np.ndarray = np.empty((int(selection.values.shape[0]),), dtype=bool)
     for block in _iter_validated_selection_blocks(selection, block_rows=block_rows):
         output[block.start : block.stop] = block.mask
@@ -547,8 +571,8 @@ def fingerprint_selected_stored_strings(
         raise TypeError("Stored row IDs must contain strings")
 
     block_rows = min(
-        row_band(array_geometry(ids), unit="chunk", fallback=1),
-        row_band(array_geometry(selection), unit="chunk", fallback=1),
+        scan_band(array_geometry(ids), fallback=1),
+        scan_band(array_geometry(selection), fallback=1),
     )
     selected_count = 0
     if source_dtype.hasobject:
@@ -598,6 +622,41 @@ def resolve_stored_selection_artifact(
     invalidate_cache: bool = False,
 ) -> ArtifactRef:
     """Create a selection artifact by copying a stored column blockwise."""
+    return resolve_stored_selection(
+        root,
+        table_path=table_path,
+        id_column=id_column,
+        source_column=source_column,
+        scope=scope,
+        kind=kind,
+        operation=operation,
+        parameters=parameters,
+        inputs=inputs,
+        assay=assay,
+        invalidate_cache=invalidate_cache,
+    ).ref
+
+
+def resolve_stored_selection(
+    root: zarr.Group,
+    *,
+    table_path: str,
+    id_column: str,
+    source_column: str,
+    scope: ArtifactScope,
+    kind: str,
+    operation: str,
+    parameters: dict[str, Any],
+    inputs: dict[str, Any],
+    assay: str | None = None,
+    invalidate_cache: bool = False,
+) -> ValidatedStoredSelection:
+    """Snapshot a stored column and return it already validated.
+
+    The snapshot fingerprints the live values and row IDs, and reuse requires
+    a stored payload with the same fingerprints, so callers need not read the
+    artifact again to validate it.
+    """
     table = as_zarr_group(root[table_path], name=table_path)
     source = as_zarr_array(table[source_column], name=source_column)
     ids = as_zarr_array(table[id_column], name=id_column)
@@ -605,11 +664,12 @@ def resolve_stored_selection_artifact(
         raise TypeError("Selection source column must be one-dimensional booleans")
     if ids.ndim != 1 or ids.shape != source.shape:
         raise ValueError("Selection row IDs must align with source values")
-    values_fingerprint = _stored_selection_fingerprint(source)
+    values_fingerprint, selected_count = _stored_selection_summary(source)
+    row_ids_fingerprint = fingerprint_stored_strings(ids)
     selection_inputs = dict(inputs)
     selection_inputs.update(
         {
-            "ordered_row_ids_fingerprint": fingerprint_stored_strings(ids),
+            "ordered_row_ids_fingerprint": row_ids_fingerprint,
             "values_fingerprint": values_fingerprint,
         }
     )
@@ -627,79 +687,34 @@ def resolve_stored_selection_artifact(
         reuse_validator=_selection_reuse_validator(values_fingerprint),
     )
     if planned.reused:
-        return planned.ref
-    group = start_artifact(root, planned)
-    output = create_metadata_column(
-        group,
-        "values",
-        dtype=bool,
-        shape=int(source.shape[0]),
-        chunkSize=row_band(array_geometry(source), unit="chunk", fallback=1),
-        overwrite=True,
+        values = as_zarr_array(
+            reused_artifact_group(root, planned)["values"], name="values"
+        )
+    else:
+        group = start_artifact(root, planned)
+        values = create_metadata_column(
+            group,
+            "values",
+            dtype=bool,
+            shape=int(source.shape[0]),
+            chunkSize=row_band(array_geometry(source), unit="chunk", fallback=1),
+            overwrite=True,
+        )
+        block_rows = scan_band(array_geometry(source), fallback=1)
+        for start in range(0, int(source.shape[0]), block_rows):
+            stop = min(start + block_rows, int(source.shape[0]))
+            values[start:stop] = source[start:stop]
+        if _stored_selection_fingerprint(values) != values_fingerprint:
+            raise RuntimeError("Selection source changed while it was copied")
+        finish_artifact(group, planned)
+    return ValidatedStoredSelection(
+        ref=planned.ref,
+        values=values,
+        row_ids=ids,
+        selected_count=selected_count,
+        table_path=table_path,
+        row_ids_fingerprint=row_ids_fingerprint,
     )
-    block_rows = row_band(array_geometry(source), unit="chunk", fallback=1)
-    for start in range(0, int(source.shape[0]), block_rows):
-        stop = min(start + block_rows, int(source.shape[0]))
-        output[start:stop] = source[start:stop]
-    if _stored_selection_fingerprint(output) != values_fingerprint:
-        raise RuntimeError("Selection source changed while it was copied")
-    finish_artifact(group, planned)
-    return planned.ref
-
-
-def resolve_selection_artifact(
-    root: zarr.Group,
-    *,
-    scope: ArtifactScope,
-    kind: str,
-    values: np.ndarray,
-    row_ids: np.ndarray,
-    operation: str,
-    parameters: dict[str, Any],
-    inputs: dict[str, Any],
-    source_column: str,
-    assay: str | None = None,
-    invalidate_cache: bool = False,
-) -> ArtifactRef:
-    mask = np.asarray(values)
-    if mask.ndim != 1 or mask.dtype != bool:
-        raise TypeError("Selection values must be a one-dimensional boolean array")
-    rows = np.asarray(row_ids)
-    if rows.ndim != 1 or len(rows) != len(mask):
-        raise ValueError("Selection row IDs must align with selection values")
-    values_fingerprint = fingerprint_array(mask)
-    selection_inputs = dict(inputs)
-    selection_inputs.update(
-        {
-            "ordered_row_ids_fingerprint": fingerprint_strings(rows),
-            "values_fingerprint": values_fingerprint,
-        }
-    )
-    planned = plan_artifact(
-        root,
-        scope=scope,
-        assay=assay,
-        kind=kind,
-        operation=operation,
-        parameters=parameters,
-        inputs=selection_inputs,
-        execution_options={"source_column": source_column},
-        invalidate_cache=invalidate_cache,
-        required_arrays=(ArrayRequirement("values", shape=mask.shape, dtype=bool),),
-        reuse_validator=_selection_reuse_validator(values_fingerprint),
-    )
-    if planned.reused:
-        return planned.ref
-    group = start_artifact(root, planned)
-    create_metadata_column(
-        group,
-        "values",
-        data=mask,
-        dtype=bool,
-        overwrite=True,
-    )
-    finish_artifact(group, planned)
-    return planned.ref
 
 
 def resolve_generated_selection_artifact(
@@ -708,25 +723,34 @@ def resolve_generated_selection_artifact(
     scope: ArtifactScope,
     kind: str,
     values: np.ndarray,
-    row_ids: np.ndarray,
+    row_ids: np.ndarray | zarr.Array,
     operation: str,
     parameters: dict[str, Any],
     inputs: dict[str, Any],
     source_column: str,
     assay: str | None = None,
     invalidate_cache: bool = False,
+    row_ids_fingerprint: str | None = None,
 ) -> tuple[ArtifactRef, np.ndarray]:
+    """Store a computed mask as a selection artifact over ordered row IDs.
+
+    ``row_ids_fingerprint`` skips hashing the IDs again when the caller holds
+    a validated selection over the same table.
+    """
     mask = np.asarray(values)
     if mask.ndim != 1 or mask.dtype != bool:
         raise TypeError("Selection values must be a one-dimensional boolean array")
-    rows = np.asarray(row_ids)
-    if rows.ndim != 1 or len(rows) != len(mask):
+    if row_ids.ndim != 1 or row_ids.shape != mask.shape:
         raise ValueError("Selection row IDs must align with selection values")
     selection_inputs = dict(inputs)
     values_fingerprint = fingerprint_array(mask)
     selection_inputs.update(
         {
-            "ordered_row_ids_fingerprint": fingerprint_strings(rows),
+            "ordered_row_ids_fingerprint": (
+                fingerprint_stored_strings(row_ids)
+                if row_ids_fingerprint is None
+                else row_ids_fingerprint
+            ),
             "values_fingerprint": values_fingerprint,
         }
     )

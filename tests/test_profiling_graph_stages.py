@@ -316,6 +316,7 @@ def test_run_stage_reports_store_open_as_input_setup(
         resources=_resources(),
         sampleIntervalSeconds=0.005,
         invalidateCache=True,
+        submissionId="testsubmission",
     )
 
     assert result.status == "ok"
@@ -328,6 +329,10 @@ def test_run_stage_reports_store_open_as_input_setup(
     assert result.modalMemoryMb == 4096
     assert result.modalCpuRequest == 1.0
     assert result.modalCpuLimit == 1.0
+    assert result.workers == 3
+    assert result.utilization is not None
+    assert result.utilization["cpuPercentOfLimit"] is not None
+    assert result.to_json()["utilization"] == result.utilization
     assert analysis_kwargs["invalidateCache"] is True
 
 
@@ -368,9 +373,9 @@ def test_run_stage_session_carries_exact_ref_to_normalization(
         "session": session,
     }
 
-    filtered = run_stage("filterCells", **common)
-    marked = run_stage("markHvgs", **common)
-    normalized = run_stage("runNormalization", **common)
+    filtered = run_stage("filterCells", **common, submissionId="testsubmission")
+    marked = run_stage("markHvgs", **common, submissionId="testsubmission")
+    normalized = run_stage("runNormalization", **common, submissionId="testsubmission")
 
     assert filtered.status == "ok"
     assert marked.status == "ok"
@@ -438,6 +443,7 @@ def test_graph_construction_profile_stages_chain_through_explicit_artifacts(
             resources=_resources(),
             sampleIntervalSeconds=0.01,
             session=session,
+            submissionId="testsubmission",
         )
         assert result.status == "ok", result.error
 
@@ -517,6 +523,7 @@ def test_run_stage_persists_every_execution_report_and_wire_counts(
         workflow=WorkflowParameters(),
         resources=_resources(),
         sampleIntervalSeconds=0.01,
+        submissionId="testsubmission",
     )
 
     assert result.status == "ok"

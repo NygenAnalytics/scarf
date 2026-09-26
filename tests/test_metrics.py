@@ -780,13 +780,6 @@ def test_small_cluster_does_not_invalidate_other_silhouette_scores():
     class Store:
         cells = Cells()
 
-    class Ann:
-        annMetric = "l2"
-
-        @staticmethod
-        def reducer(values):
-            return values
-
     data = np.array(
         [
             [20.0, 20.0],
@@ -804,7 +797,6 @@ def test_small_cluster_does_not_invalidate_other_silhouette_scores():
 
     scores = silhouette_scoring(
         Store(),
-        Ann(),
         graph,
         data,
         "RNA",
@@ -812,6 +804,7 @@ def test_small_cluster_does_not_invalidate_other_silhouette_scores():
         cell_key="subset",
         sample_size=2,
         random_seed=42,
+        distance_metric="l2",
     )
 
     assert scores is not None
@@ -1185,8 +1178,15 @@ def test_datastore_metrics_reject_malformed_metadata_missing_masks(
         None if mask_case == "non_string_link" else missing_name
     )
 
-    with pytest.raises(ValueError, match="missing-mask"):
-        datastore.metric_ilisi(column, neighbors)
+    try:
+        with pytest.raises(ValueError, match="missing-mask"):
+            datastore.metric_ilisi(column, neighbors)
+    finally:
+        # The session datastore is shared, and copying rejects this column, so
+        # remove it directly; drop() refuses a malformed missing-value link.
+        for name in (column, missing_name):
+            if name in cell_data:
+                del cell_data[name]
 
 
 def test_metric_lisi_rejects_invalid_inputs(datastore, connectivity_graph):
@@ -1309,10 +1309,10 @@ def test_metric_lisi_snapshots_mutable_label_inputs(
 def test_silhouette_scoring_missing_cluster_labels(datastore):
     result = silhouette_scoring(
         datastore,
-        ann_obj=None,
         graph=None,
         hvg_data=None,
         assay_type="RNA",
         res_label="missing_resolution_label",
+        distance_metric="l2",
     )
     assert result is None

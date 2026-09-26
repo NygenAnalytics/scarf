@@ -35,6 +35,4 @@ def initial_embedding(
         principal_components[:, component] = rescale_array(
             principal_components[:, component]
         )
-    return np.array([principal_components[label] for label in index_labels]).astype(
-        np.float32, order="C"
-    )
+    return np.asarray(principal_components[index_labels], dtype=np.float32, order="C")

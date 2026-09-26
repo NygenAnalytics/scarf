@@ -10,7 +10,13 @@ from scarf.storage.schema import create_cell_data, create_zarr_count_assay
 from scarf.storage.sharding import write_counts_t
 
 
-def create_store(path: Path, *, workspace: str | None = None) -> Path:
+def create_store(
+    path: Path,
+    *,
+    workspace: str | None = None,
+    mito_pattern: str | None = None,
+    ribo_pattern: str | None = None,
+) -> Path:
     root = zarr.open_group(str(path), mode="w", zarr_format=3)
     values = np.asarray(
         [
@@ -42,6 +48,9 @@ def create_store(path: Path, *, workspace: str | None = None) -> Path:
         profile="fast_local",
     )
     counts[:] = values
+    from scarf.storage.identity import finalize_counts
+
+    finalize_counts(counts)
     count_group = root["RNA"] if workspace is None else root["matrices/RNA"]
     write_counts_t(
         counts,
@@ -50,5 +59,15 @@ def create_store(path: Path, *, workspace: str | None = None) -> Path:
     )
     active = root if workspace is None else root[workspace]
     active.attrs["assayTypes"] = {"RNA": "RNA"}
-    active["RNA"].attrs["dataset_fingerprint"] = "dataset-rna"
+    from scarf import DataStore
+
+    DataStore(
+        str(path),
+        workspace=workspace,
+        default_assay="RNA",
+        min_features_per_cell=0,
+        nthreads=1,
+        mito_pattern=mito_pattern,
+        ribo_pattern=ribo_pattern,
+    )
     return path

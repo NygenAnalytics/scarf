@@ -1019,12 +1019,6 @@ def _example_70_ParameterSearchPlan(cls):
     )
 
 
-def _example_71_ParameterTuningBatchSearchPlan(cls):
-    from scarf.agent.parameter_tuning.contracts import ParameterSearchPlan
-
-    return cls(assayPlans={"RNA": example(ParameterSearchPlan)})
-
-
 def _example_72_ParameterTuningNeedsInput(cls):
     return cls(
         question="Which trusted biological label should be preserved?",
@@ -1073,20 +1067,6 @@ def _example_74_ParameterTuningDependencies(cls):
         candidates={candidate.candidateId: candidate},
         batchColumns=("batch",),
         preservationColumns=("cell_type",),
-    )
-
-
-def _example_75_ParameterTuningAssayInput(cls):
-    from scarf.agent.parameter_tuning.contracts import (
-        ArtifactRecord,
-        ExperimentalTuningHandoff,
-        _default_parameter_candidates,
-    )
-
-    return cls(
-        normalized=ArtifactRecord(assay="RNA", kind="normalized", artifactId="4" * 64),
-        candidates=_default_parameter_candidates(),
-        experimentalHandoff=ExperimentalTuningHandoff(batchAction="skip"),
     )
 
 
@@ -1184,12 +1164,6 @@ def _example_86_NeedsInput(cls):
     )
 
 
-def _example_87_StageResult(cls):
-    from scarf.agent.types import Decision
-
-    return cls(status="done", decision=example(Decision))
-
-
 _FACTORIES = {
     "scarf.agent.biological_interpretation.contracts.BiologicalContext": _example_0_BiologicalContext,
     "scarf.agent.biological_interpretation.contracts.ConditionClusterSummary": _example_1_ConditionClusterSummary,
@@ -1261,11 +1235,9 @@ _FACTORIES = {
     "scarf.agent.parameter_tuning.contracts.FinalGraphSelection": _example_68_FinalGraphSelection,
     "scarf.agent.parameter_tuning.contracts.CandidateComparison": _example_69_CandidateComparison,
     "scarf.agent.parameter_tuning.contracts.ParameterSearchPlan": _example_70_ParameterSearchPlan,
-    "scarf.agent.parameter_tuning.contracts.ParameterTuningBatchSearchPlan": _example_71_ParameterTuningBatchSearchPlan,
     "scarf.agent.parameter_tuning.contracts.ParameterTuningNeedsInput": _example_72_ParameterTuningNeedsInput,
     "scarf.agent.parameter_tuning.contracts.ParameterTuningReport": _example_73_ParameterTuningReport,
     "scarf.agent.parameter_tuning.contracts.ParameterTuningDependencies": _example_74_ParameterTuningDependencies,
-    "scarf.agent.parameter_tuning.contracts.ParameterTuningAssayInput": _example_75_ParameterTuningAssayInput,
     "scarf.agent.types.AgentDataModel": _example_76_AgentDataModel,
     "scarf.agent.types.ArtifactReferenceModel": _example_77_ArtifactReferenceModel,
     "scarf.agent.types.BatchSafetyEvidence": _example_78_BatchSafetyEvidence,
@@ -1277,5 +1249,4 @@ _FACTORIES = {
     "scarf.agent.types.EvidenceItem": _example_84_EvidenceItem,
     "scarf.agent.types.Decision": _example_85_Decision,
     "scarf.agent.types.NeedsInput": _example_86_NeedsInput,
-    "scarf.agent.types.StageResult": _example_87_StageResult,
 }

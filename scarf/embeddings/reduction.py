@@ -113,9 +113,10 @@ def _fit_gram_pca(
 ) -> tuple[np.ndarray, _GramPcaModel]:
     from scipy.linalg import blas, eigh
     from sklearn.utils.extmath import svd_flip
-    from threadpoolctl import threadpool_limits
+    from threadpoolctl import ThreadpoolController, threadpool_limits
 
     n_features = data.shape[1]
+    controller = ThreadpoolController()
     n_components = dims + 1
     gram = np.zeros(
         (n_features, n_features),
@@ -135,15 +136,18 @@ def _fit_gram_pca(
             if scale is not None:
                 block = scale(block)
             values = np.asfortranarray(block, dtype=np.float64)
-            gram = blas.dsyrk(
-                1.0,
-                values,
-                beta=1.0,
-                c=gram,
-                trans=1,
-                lower=0,
-                overwrite_c=1,
-            )
+            # The block stream clamps BLAS to one thread per reader for its
+            # whole lifetime; the rank update runs here, between blocks.
+            with controller.limit(limits=nthreads, user_api="blas"):
+                gram = blas.dsyrk(
+                    1.0,
+                    values,
+                    beta=1.0,
+                    c=gram,
+                    trans=1,
+                    lower=0,
+                    overwrite_c=1,
+                )
             column_sum += values.sum(axis=0, dtype=np.float64)
             n_samples_seen += len(values)
 

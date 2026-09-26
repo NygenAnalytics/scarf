@@ -18,9 +18,6 @@ from scarf.storage.copy import (
 from scarf.storage.layout import (
     ZarrArraySpec,
     _CODEC_MAX_BYTES,
-    DEFAULT_TARGET_CHUNK_BYTES,
-    DEFAULT_TARGET_SHARD_BYTES,
-    bounded_row_sharded_array_spec,
     count_array_spec,
     get_compressors,
     normed_array_spec,
@@ -68,6 +65,9 @@ def _planned_counts(group: zarr.Group, values: np.ndarray, name: str = "counts")
         counts[:] = values
     persist_count_matrix_plan(group, plan)
     persist_count_matrix_plan(counts, plan)
+    from scarf.storage.identity import finalize_counts
+
+    finalize_counts(counts)
     return counts
 
 
@@ -372,21 +372,6 @@ def test_row_sharded_plan_uses_full_width_divisible_chunks():
     assert spec.chunks[1] == 100
     assert spec.shards[0] % spec.chunks[0] == 0
     assert np.prod(spec.chunks) * np.dtype(spec.dtype).itemsize <= 128 * 1024**2
-
-
-def test_bounded_row_sharded_plan_caps_wide_mapping_bands():
-    spec = bounded_row_sharded_array_spec(
-        (1_000_000, 4_000),
-        np.float64,
-        profile="cloud",
-    )
-
-    assert spec.shards is not None
-    assert spec.shards[0] < spec.shape[0]
-    assert spec.shards[0] % spec.chunks[0] == 0
-    itemsize = np.dtype(spec.dtype).itemsize
-    assert np.prod(spec.chunks) * itemsize <= DEFAULT_TARGET_CHUNK_BYTES
-    assert np.prod(spec.shards) * itemsize <= DEFAULT_TARGET_SHARD_BYTES
 
 
 def test_row_sharded_plan_uses_band_chunks_for_zarr_v2():
@@ -972,4 +957,65 @@ def test_store_probe_count_only_skips_per_key_logs() -> None:
     assert payload["readTransferredBytes"] == 12
     assert payload["writeTransferredBytes"] == 8
     assert payload["requestedBytes"] == 20
-    assert payload["keysTouched"] == 0
+
+
+@pytest.mark.parametrize(
+    "resident,producer,result",
+    [(0, 0, 0), (40_000, 0, 0), (0, 40_000, 0), (0, 0, 40_000)],
+)
+def test_dense_writer_reserves_encoding_and_retained_memory_before_production(
+    resident, producer, result
+):
+    from scarf.storage.sharding import plan_dense_write
+
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    destination = root.create_array(
+        "dense", shape=(100, 100), chunks=(10, 100), shards=(100, 100), dtype="f8"
+    )
+    called = []
+    budget = ResourceBudget(100_000, 1)
+    with pytest.raises(MemoryError):
+        write_dense_in_shard_rows(
+            destination,
+            lambda start, end: called.append((start, end)),
+            resources=budget,
+            residentBytes=resident,
+            producerBytes=producer,
+            resultBytes=result,
+        )
+    assert called == []
+    plan = plan_dense_write(
+        destination,
+        ResourceBudget(1_000_000, 1),
+        1,
+        residentBytes=resident,
+        producerBytes=producer,
+        resultBytes=result,
+    )
+    assert plan.reservedBytes >= 240_000 + resident + producer + 2 * result
+    assert not np.any(destination[:])
+
+
+def test_dense_mirror_budget_includes_its_larger_encoding_buffers():
+    from scarf.storage.sharding import plan_dense_write
+
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    primary = root.create_array(
+        "primary", shape=(100, 100), chunks=(10, 100), shards=(100, 100), dtype="f4"
+    )
+    mirror = root.create_array(
+        "mirror", shape=(100, 100), chunks=(100, 100), dtype="f8"
+    )
+    budget = ResourceBudget(1_000_000, 1)
+    plain = plan_dense_write(primary, budget, 1)
+    mirrored = plan_dense_write(primary, budget, 1, mirror=mirror)
+    assert mirrored.reservedBytes > plain.reservedBytes
+    calls = []
+    with pytest.raises(MemoryError):
+        write_dense_in_shard_rows(
+            primary,
+            lambda start, end: calls.append((start, end)),
+            also_write_to=mirror,
+            resources=ResourceBudget(plain.reservedBytes, 1),
+        )
+    assert calls == []

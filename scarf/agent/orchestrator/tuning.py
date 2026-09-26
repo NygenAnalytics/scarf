@@ -39,7 +39,6 @@ from .models import (
     WorkflowStageAttempt,
     WorkflowStageLink,
     WorkflowStageName,
-    artifact_model_to_ref,
 )
 
 
@@ -88,14 +87,14 @@ def _analysis_visual_content(
             "Selected candidate lacks visualizable coordinates or clusters"
         )
     coordinate_group = store.load_artifact(
-        artifact_model_to_ref(
-            ArtifactReferenceModel.model_validate(coordinate_record.model_dump())
-        )
+        ArtifactReferenceModel.model_validate(
+            coordinate_record.model_dump()
+        ).to_artifact_ref()
     )
     cluster_group = store.load_artifact(
-        artifact_model_to_ref(
-            ArtifactReferenceModel.model_validate(cluster_record.model_dump())
-        )
+        ArtifactReferenceModel.model_validate(
+            cluster_record.model_dump()
+        ).to_artifact_ref()
     )
     coordinate_values = as_zarr_array(coordinate_group["data"], name="data")
     cluster_values = as_zarr_array(cluster_group["values"], name="values")
@@ -162,11 +161,9 @@ def _analysis_visual_content(
 
     if comparison is not None and "clusters" in comparison.artifacts:
         comparison_group = store.load_artifact(
-            artifact_model_to_ref(
-                ArtifactReferenceModel.model_validate(
-                    comparison.artifacts["clusters"].model_dump()
-                )
-            )
+            ArtifactReferenceModel.model_validate(
+                comparison.artifacts["clusters"].model_dump()
+            ).to_artifact_ref()
         )
         comparison_labels = sampled_values(
             comparison_group["values"],
@@ -237,7 +234,7 @@ def _analysis_visual_content(
     if doublet_records:
         if selected.cellSelection is None:
             raise ValueError("Doublet visuals require an exact cell selection")
-        parent_selection = artifact_model_to_ref(selected.cellSelection)
+        parent_selection = selected.cellSelection.to_artifact_ref()
         parent_indices = read_stored_selection_indices(
             store.zw,
             parent_selection,
@@ -249,9 +246,9 @@ def _analysis_visual_content(
         sampled_global_indices = parent_indices[sample_indices]
         for score_index, record in sorted(doublet_records.items()):
             score_group = store.load_artifact(
-                artifact_model_to_ref(
-                    ArtifactReferenceModel.model_validate(record.model_dump())
-                )
+                ArtifactReferenceModel.model_validate(
+                    record.model_dump()
+                ).to_artifact_ref()
             )
             score_values = as_zarr_array(score_group["values"], name="values")
             selection_record = doublet_selections.get(score_index)
@@ -263,9 +260,9 @@ def _analysis_visual_content(
                 local_positions = sample_indices
                 matched_positions = np.arange(sample_count, dtype=np.int64)
             else:
-                score_selection = artifact_model_to_ref(
-                    ArtifactReferenceModel.model_validate(selection_record.model_dump())
-                )
+                score_selection = ArtifactReferenceModel.model_validate(
+                    selection_record.model_dump()
+                ).to_artifact_ref()
                 score_indices = read_stored_selection_indices(
                     store.zw,
                     score_selection,
@@ -369,18 +366,13 @@ def _analysis_visual_content(
             constrained_layout=True,
         )
         correction_axes = correction_figure.subplots(2, 2)
-        batch_columns = [
-            column
-            for column in (
-                *native.metrics.batchMixing,
-                *harmony.metrics.batchMixing,
-            )
-            if column in store.cells.columns
-        ]
+        mixed_columns = (*native.metrics.batchMixing, *harmony.metrics.batchMixing)
+        available = set(store.cells.columns) if mixed_columns else set()
+        batch_columns = [column for column in mixed_columns if column in available]
         batch_codes: np.ndarray | None = None
         batch_label = "Batch unavailable"
         if batch_columns and selected.cellSelection is not None:
-            parent_selection = artifact_model_to_ref(selected.cellSelection)
+            parent_selection = selected.cellSelection.to_artifact_ref()
             parent_indices = read_stored_selection_indices(
                 store.zw,
                 parent_selection,
@@ -407,18 +399,14 @@ def _analysis_visual_content(
             if candidate_coordinate is None or candidate_cluster is None:
                 raise ValueError("Matched correction candidate lacks visual artifacts")
             candidate_coordinate_group = store.load_artifact(
-                artifact_model_to_ref(
-                    ArtifactReferenceModel.model_validate(
-                        candidate_coordinate.model_dump()
-                    )
-                )
+                ArtifactReferenceModel.model_validate(
+                    candidate_coordinate.model_dump()
+                ).to_artifact_ref()
             )
             candidate_cluster_group = store.load_artifact(
-                artifact_model_to_ref(
-                    ArtifactReferenceModel.model_validate(
-                        candidate_cluster.model_dump()
-                    )
-                )
+                ArtifactReferenceModel.model_validate(
+                    candidate_cluster.model_dump()
+                ).to_artifact_ref()
             )
             candidate_coordinates = sampled_values(
                 candidate_coordinate_group["data"],
@@ -476,9 +464,9 @@ def _analysis_visual_content(
         )
     )[:24]
     if marker_record is not None and marker_genes:
-        marker_ref = artifact_model_to_ref(
-            ArtifactReferenceModel.model_validate(marker_record.model_dump())
-        )
+        marker_ref = ArtifactReferenceModel.model_validate(
+            marker_record.model_dump()
+        ).to_artifact_ref()
         marker_table = store.get_markers(
             marker_ref,
             min_score=0.25,
@@ -574,10 +562,12 @@ def _analysis_visual_content(
             marker_figure.colorbar(marker_image, ax=marker_axis, label="marker score")
             content.append(image_content(marker_figure, "marker-score-heatmap"))
 
+    requested_qc_columns = list(
+        dict.fromkeys([*qc_columns, *selected.metrics.qcPcaAssociation])
+    )
+    cell_columns = set(store.cells.columns) if requested_qc_columns else set()
     available_qc_columns = [
-        column
-        for column in dict.fromkeys([*qc_columns, *selected.metrics.qcPcaAssociation])
-        if column in store.cells.columns
+        column for column in requested_qc_columns if column in cell_columns
     ]
     qc_sources: list[tuple[str, ArtifactReferenceModel | None]] = [
         (column, None) for column in available_qc_columns
@@ -598,7 +588,7 @@ def _analysis_visual_content(
         qc_axis_list = np.atleast_1d(qc_axes).tolist()
         if selected.cellSelection is None:
             raise ValueError("QC visuals require an exact cell selection")
-        parent_selection = artifact_model_to_ref(selected.cellSelection)
+        parent_selection = selected.cellSelection.to_artifact_ref()
         parent_indices = read_stored_selection_indices(
             store.zw,
             parent_selection,
@@ -623,7 +613,7 @@ def _analysis_visual_content(
                     dtype=np.float64,
                 )
             else:
-                artifact_ref = artifact_model_to_ref(artifact)
+                artifact_ref = artifact.to_artifact_ref()
                 artifact_group = store.load_artifact(artifact_ref)
                 artifact_values = as_zarr_array(
                     artifact_group["values"],
@@ -846,10 +836,11 @@ class TuningStagesMixin(DecisionStagesMixin):
         }
         if study_contract.physicalCaptureColumn is not None:
             columns.add(study_contract.physicalCaptureColumn)
+        available = set(store.cells.columns) if columns else set()
         metadata_fingerprints = {
             column: _metadata_column_fingerprint(store.cells, column)
             for column in sorted(columns)
-            if column in store.cells.columns
+            if column in available
         }
         feature_metadata = store.get_assay(plan.primaryAssay).feats
         feature_fingerprints = {

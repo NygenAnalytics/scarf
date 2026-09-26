@@ -159,6 +159,7 @@ def _write_h5ad_process_window(
     stop: Any,
 ) -> None:
     from ..storage.execution import execution_report_scope
+    from ..storage.identity import CountSummary
     from ..storage.schema import load_count_array
     from ..storage.sharding import (
         SparseShardBuffer,
@@ -186,6 +187,10 @@ def _write_h5ad_process_window(
                 startRow=row_start,
                 endRow=row_end,
             )
+            for assay_name, destination in destinations.items()
+        }
+        summaries = {
+            assay_name: CountSummary(destination, rows=(row_start, row_end))
             for assay_name, destination in destinations.items()
         }
 
@@ -217,12 +222,18 @@ def _write_h5ad_process_window(
             write_sparse_bands(
                 writes(),
                 resources=resources,
-                residentBytes=resident_bytes,
+                residentBytes=resident_bytes
+                + sum(summary.nbytes for summary in summaries.values()),
                 producerReserveBytes=producer_reserve_bytes,
                 io=io,
+                countSummaries={
+                    destinations[name].path: summary
+                    for name, summary in summaries.items()
+                },
             )
         if not stop.is_set():
-            connection.send(("done", reports))
+            windows = {name: summary.window() for name, summary in summaries.items()}
+            connection.send(("done", (reports, windows)))
     except BaseException as exc:
         try:
             connection.send(("error", f"{type(exc).__name__}: {exc}"))
@@ -440,6 +451,7 @@ class H5adToZarr:
     def _ini_cell_data(self) -> None:
         from ..storage.arrays import create_zarr_obj_array
         from ..storage.schema import create_cell_data
+        from ._store import skip_reserved_metadata_columns
 
         ids = self.h5ad.cell_ids()
         g = create_cell_data(
@@ -449,11 +461,14 @@ class H5adToZarr:
             names=ids,
             profile=self.profile,
         )
-        for i, j in self.h5ad.get_cell_columns():
+        for i, j in skip_reserved_metadata_columns(
+            self.h5ad.get_cell_columns(), "cell"
+        ):
             create_zarr_obj_array(g, i, j, j.dtype, profile=self.profile)
 
     def _ini_feature_data(self) -> None:
         from ..storage.arrays import create_zarr_obj_array
+        from ._store import skip_reserved_metadata_columns
 
         targets: list[tuple[Any, np.ndarray | None]] = []
         for assay_name in self.assayNames:
@@ -471,10 +486,10 @@ class H5adToZarr:
 
         # Stream one column at a time so a single decoded var column is held in
         # memory rather than every column for the full feature axis at once.
-        for column_name, values in self.h5ad.get_feat_columns():
+        for column_name, values in skip_reserved_metadata_columns(
+            self.h5ad.get_feat_columns(), "feature"
+        ):
             for feat_group, feature_indexes in targets:
-                if column_name in feat_group:
-                    continue
                 selected = (
                     values if feature_indexes is None else values[feature_indexes]
                 )
@@ -830,7 +845,8 @@ class H5adToZarr:
         return artifacts
 
     def _write_counts(self, batch_size: int | None = None) -> None:
-        """Write cell-major ``counts`` only (profiling stage split helper)."""
+        """Write and finalize cell-major ``counts`` (profiling stage split helper)."""
+        from ..storage.identity import CountSummary, finalize_counts
         from ..storage.layout import array_shard_rows
         from ..storage.sharding import (
             SparseShardBuffer,
@@ -851,6 +867,10 @@ class H5adToZarr:
             assay_name: SparseShardBuffer(destination)
             for assay_name, destination in destinations.items()
         }
+        summaries = {
+            assay_name: CountSummary(destination)
+            for assay_name, destination in destinations.items()
+        }
         logger.debug(
             f"Writing counts with up to {self.resources.workers} row-band writer(s)"
         )
@@ -868,6 +888,7 @@ class H5adToZarr:
         if projection is not None:
             resident_source_bytes += sum(array.nbytes for array in projection)
         resident_source_bytes += feature_index_bytes
+        resident_source_bytes += sum(summary.nbytes for summary in summaries.values())
         prepare = getattr(self.h5ad, "_prepare_sparse_import", None)
         if callable(prepare):
             prepare()
@@ -946,7 +967,17 @@ class H5adToZarr:
                     available_memory // candidate,
                     max(1, int(self.resources.workers) // candidate),
                 )
-                candidate_resident = resident_source_bytes
+                # Each writer process also holds the count summaries of its window.
+                window_rows = max(
+                    stop - start
+                    for start, stop in aligned_row_windows(
+                        self.h5ad.nCells, shard_rows, candidate
+                    )
+                )
+                candidate_resident = resident_source_bytes + sum(
+                    CountSummary.nbytes_for(window_rows, destination.shape[1])
+                    for destination in destinations.values()
+                )
                 candidate_batch_rows = None
             else:
                 candidate_resources = self.resources
@@ -1031,6 +1062,7 @@ class H5adToZarr:
                 resources=process_resources,
                 residentBytes=resident_source_bytes,
                 producerReserveBytes=self._lastImportPlan.producerReserveBytes,
+                summaries=summaries,
             )
         else:
             extra_producer_resident = max(0, n_producers - 1) * int(
@@ -1049,6 +1081,10 @@ class H5adToZarr:
                 producerReserveBytes=plan.producerReserveBytes,
                 total=plan.writeTasks,
                 io=self.io,
+                countSummaries={
+                    destinations[name].path: summary
+                    for name, summary in summaries.items()
+                },
             )
         counts_seconds = time.perf_counter() - started
 
@@ -1073,6 +1109,8 @@ class H5adToZarr:
             f"Wrote {self.h5ad.nCells} cells and {self.h5ad.nFeatures} features "
             f"from H5AD to {len(destinations)} assay(s)"
         )
+        for assay_name, summary in summaries.items():
+            finalize_counts(destinations[assay_name], summary=summary)
 
     def _write_parallel_count_windows(
         self,
@@ -1083,6 +1121,7 @@ class H5adToZarr:
         resources: ResourceBudget,
         residentBytes: int,
         producerReserveBytes: int,
+        summaries: dict[str, Any],
     ) -> None:
         from multiprocessing import get_context
         from multiprocessing.connection import wait
@@ -1155,8 +1194,11 @@ class H5adToZarr:
                         raise RuntimeError(
                             f"H5AD writer {index} sent an unknown message"
                         )
-                    for report in payload:
+                    reports, summary_windows = payload
+                    for report in reports:
                         record_execution_report(report)
+                    for assay_name, window in summary_windows.items():
+                        summaries[assay_name].merge(window)
                     active.pop(connection)
                     connection.close()
         finally:

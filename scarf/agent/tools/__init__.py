@@ -1,6 +1,6 @@
 """Small helpers shared by Scarf domain-agent tools."""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from ..types import ArtifactReferenceModel
@@ -9,6 +9,7 @@ __all__ = [
     "artifact_reference",
     "bounded_list",
     "core_artifact_reference",
+    "persisted_assay_types",
 ]
 
 
@@ -35,11 +36,16 @@ def core_artifact_reference(ref: Any) -> Any:
     """Convert an agent artifact model back to Scarf's exact core reference."""
     if not isinstance(ref, ArtifactReferenceModel):
         return ref
-    from ...storage.refs import ArtifactRef
+    return ref.to_artifact_ref()
 
-    return ArtifactRef(
-        scope=ref.scope,
-        kind=ref.kind,
-        artifact_id=ref.artifactId,
-        assay=ref.assay,
-    )
+
+def persisted_assay_types(store: Any) -> dict[str, str]:
+    """Read each assay's persisted type without building a datastore summary."""
+    from ...assay.classification import lookup_persisted_assay_type
+
+    raw = store.zw.attrs.get("assayTypes")
+    assay_types = raw if isinstance(raw, Mapping) else None
+    return {
+        str(name): lookup_persisted_assay_type(str(name), assay_types)
+        for name in store.assay_names
+    }

@@ -4,25 +4,19 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from pydantic_ai import UnexpectedModelBehavior
 
-from scarf.agent.parameter_tuning import agent, selection
+from scarf.agent.parameter_tuning import selection
 from scarf.agent.parameter_tuning.contracts import (
-    CandidateComparison,
     ParameterCandidate,
     ParameterCandidateEvaluation,
     ParameterMetrics,
-    ParameterSearchPlan,
-    ParameterTuningAssayInput,
     ParameterTuningReport,
 )
 from scarf.agent.tools import artifact_reference
-from scarf.agent.types import AgentRunInfo, AgentUsageInfo
 from tests.test_agent_parameter_tuning import (
     _FakeStore,
     _artifact,
     _cell_selection,
-    _dependencies,
 )
 
 
@@ -198,49 +192,17 @@ def test_harmony_requires_approved_batch_evidence_and_valid_tolerance() -> None:
     assert "No approved batch metric was supplied." in reasons
 
 
-def test_pareto_override_requires_independent_scientific_evidence() -> None:
+def test_pareto_dominance_marks_one_factor_superiority_idempotently() -> None:
     native = _evaluation()
     alternative = _evaluation("neighbors_21", neighborsK=21)
     alternative.metrics.seedStability = 0.95
     alternative.metrics.markerCoherence = 0.95
     native.metrics.technicalAssociation = {"depth": 0.2}
     alternative.metrics.technicalAssociation = {"depth": 0.2}
-    deps = _dependencies(
-        _FakeStore(), candidates=[native.parameters, alternative.parameters]
-    )
-    deps.evaluations = {item.candidateId: item for item in (native, alternative)}
-    deps.executionOrder = list(deps.evaluations)
-    geometric = ["candidate:baseline:geometry", "candidate:neighbors_21:geometry"]
-    report = ParameterTuningReport(
-        status="done",
-        recommendedCandidateId="baseline",
-        evidenceIds=[geometric[0]],
-        comparisons=[
-            CandidateComparison(
-                candidateId="neighbors_21",
-                summary="The wider graph has better measured stability and marker coverage.",
-                evidenceIds=geometric,
-            )
-        ],
-    )
-    with pytest.raises(ValueError, match="two independent non-geometric"):
-        selection.validate_parameter_tuning_report(report, deps)
-    report.comparisons[0].evidenceIds.extend(native.evidenceIds)
-    grounded = selection.validate_parameter_tuning_report(report, deps)
-    assert grounded.evaluations[0].metrics.dominatedByCandidateIds == ["neighbors_21"]
-    assert grounded.evaluations[1].metrics.dominatesCandidateIds == ["baseline"]
-    assert selection.parameter_evidence_classes(native.evidenceIds) == {
-        "resamplingStability",
-        "markerCoherence",
-        "crossUnitSupport",
-        "protectedVariablePreservation",
-        "qualityControl",
-        "technical",
-        "geometric",
-    }
-    assert selection.annotate_candidate_dominance(grounded.evaluations) == tuple(
-        grounded.evaluations
-    )
+    annotated = selection.annotate_candidate_dominance([native, alternative])
+    assert annotated[0].metrics.dominatedByCandidateIds == ["neighbors_21"]
+    assert annotated[1].metrics.dominatesCandidateIds == ["baseline"]
+    assert selection.annotate_candidate_dominance(annotated) == annotated
 
 
 def test_pareto_does_not_treat_incomparable_or_missing_metrics_as_superiority() -> None:
@@ -260,100 +222,6 @@ def test_pareto_does_not_treat_incomparable_or_missing_metrics_as_superiority() 
     assert all(item.metrics.paretoOptimal is None for item in result)
     with pytest.raises(ValueError, match="tolerance"):
         selection.annotate_candidate_dominance(result, tolerance=float("nan"))
-
-
-@pytest.mark.parametrize("batch", [False, True])
-def test_selection_exhaustion_preserves_completed_evidence_and_failed_usage(
-    monkeypatch: pytest.MonkeyPatch, batch: bool
-) -> None:
-    calls: list[str] = []
-    info = AgentRunInfo(
-        agentName="failed-selection",
-        status="failed",
-        runId="attempt",
-        usage=AgentUsageInfo(inputTokens=34, outputTokens=5, availability="partial"),
-    )
-
-    def fail(**kwargs: Any) -> None:
-        calls.append(kwargs["name"])
-        error = UnexpectedModelBehavior("Essential comparison remained unresolved")
-        error.agent_run_info = info
-        raise error
-
-    monkeypatch.setattr(agent, "run_agent_sync", fail)
-    store = _FakeStore()
-    candidates = [
-        ParameterCandidate(candidateId="baseline"),
-        ParameterCandidate(candidateId="pca10", dimensions=10),
-    ]
-    if batch:
-        result = agent.tune_parameters_batch(
-            store,
-            model=object(),
-            assays=[
-                ParameterTuningAssayInput(
-                    normalized=store.normalized,
-                    candidates=candidates,
-                    maxCandidates=2,
-                    maxRefinedCandidates=0,
-                )
-            ],
-        )
-        assert calls == ["parameter_tuning_batch"]
-    else:
-        result = agent.tune_parameters(
-            store,
-            model=object(),
-            normalized=store.normalized,
-            candidates=candidates,
-            max_candidates=2,
-            max_refined_candidates=0,
-        )
-        assert calls == ["parameter_tuning"]
-    assert result.status == "needsInput"
-    assert result.recommendedCandidateId is None
-    assert result.runInfo == info
-    assert len(result.evaluations) == 2
-    assert all(
-        item.status == "done" and item.artifacts["clusters"]
-        for item in result.evaluations
-    )
-    assert result.needsInput is not None
-    assert set(result.needsInput.options) == {"baseline", "pca10"}
-    assert sum(name == "run_pca" for name, _, _ in store.calls) == 2
-
-
-def test_committed_refinement_executes_only_the_nominated_branch() -> None:
-    store = _FakeStore()
-    candidates = [
-        ParameterCandidate(candidateId="baseline", dimensions=21),
-        ParameterCandidate(candidateId="pca10", dimensions=10),
-    ]
-    deps = _dependencies(store, candidates=candidates, max_candidates=3)
-    initial = [
-        agent.execute_parameter_candidate(deps, item.candidateId) for item in candidates
-    ]
-    before = len(store.calls)
-    plan = ParameterSearchPlan(
-        status="refine",
-        candidates=[ParameterCandidate(candidateId="pca15", dimensions=15)],
-        basedOnCandidateIds=[item.candidateId for item in initial],
-        objectives=["Resolve the dimension tradeoff"],
-        rationale="The initial results bracket this dimension.",
-        evidenceIds=[item.evidenceIds[0] for item in initial],
-        stoppingCriteria=["Assess this single intermediate value"],
-    )
-    validated, evaluations = agent.execute_parameter_search_plan(
-        deps,
-        plan,
-        initial_candidate_ids=[item.candidateId for item in initial],
-        max_refined_candidates=1,
-    )
-    assert validated == plan
-    assert [item.candidateId for item in evaluations] == ["pca15"]
-    assert [
-        kwargs["dims"] for name, _, kwargs in store.calls[before:] if name == "run_pca"
-    ] == [15]
 
 
 @pytest.mark.parametrize(
@@ -510,34 +378,3 @@ def test_finalization_cannot_publish_an_unexecuted_or_unmatched_native_branch(
         selection.finalize_parameter_tuning_selection(
             report, **({"marker_assay": "RNA"} | kwargs)
         )
-
-
-@pytest.mark.parametrize(
-    ("case", "reason"),
-    [
-        ("empty", "at least one tuning input"),
-        ("zero_budget", "at least one"),
-        ("wrong_kind", "assay-scoped normalized"),
-        ("duplicate", "names must be unique"),
-        ("unknown_primary", "Unknown primary assay"),
-    ],
-)
-def test_standalone_batched_inputs_fail_before_any_candidate_execution(
-    case: str, reason: str
-) -> None:
-    store = _FakeStore()
-    assays = [ParameterTuningAssayInput(normalized=store.normalized)]
-    kwargs: dict[str, Any] = {}
-    if case == "empty":
-        assays = []
-    elif case == "zero_budget":
-        kwargs["max_total_candidates"] = 0
-    elif case == "wrong_kind":
-        assays[0].normalized = _artifact("reduction", 1)
-    elif case == "duplicate":
-        assays.append(assays[0])
-    else:
-        kwargs["primary_assay"] = "ADT"
-    with pytest.raises((TypeError, ValueError), match=reason):
-        agent.tune_parameters_batch(store, model=object(), assays=assays, **kwargs)
-    assert store.calls == []

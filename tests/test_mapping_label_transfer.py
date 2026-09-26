@@ -36,7 +36,7 @@ from scarf.storage.feature_selection import (
 )
 from scarf.storage.selections import (
     read_stored_selection_indices,
-    resolve_selection_artifact,
+    resolve_generated_selection_artifact,
 )
 from scarf.storage.types import as_zarr_array as checked_zarr_array
 
@@ -125,7 +125,7 @@ def _write_projection(
         cell_mask = np.zeros(query.cells.N, dtype=bool)
         cell_mask[:n_cells] = True
         query.cells.insert(cell_key, cell_mask, overwrite=True)
-    cell_selection = resolve_selection_artifact(
+    cell_selection = resolve_generated_selection_artifact(
         query.zw,
         scope="datastore",
         kind="cell_selection",
@@ -135,12 +135,12 @@ def _write_projection(
         parameters={},
         inputs={},
         source_column=cell_key,
-    )
+    )[0]
     all_features = query.select_all_features(from_assay="RNA")
     query_feature_ids = np.asarray(query.RNA.feats.fetch_all("ids")).astype(str)
     reference_feature_ids = np.asarray(reference.feature_ids).astype(str)
     feature_mask = np.isin(query_feature_ids, reference_feature_ids)
-    feature_ids_fingerprint = _ordered_feature_ids_fingerprint(query.RNA)
+    feature_ids_fingerprint = _ordered_feature_ids_fingerprint(query.RNA.z)
     feature_plan = _feature_selection_plan(
         query.zw,
         assay="RNA",
@@ -941,7 +941,6 @@ def test_bound_reference_repeats_label_transfer_without_rereading_its_payload(
     from scarf.storage.artifacts import artifact_group
 
     reference_store, reference, query = mapping_consumer_context
-    reference_store.RNA.attrs.pop("dataset_fingerprint", None)
     _write_reference_labels(reference)
     result = _write_projection(
         query,
@@ -995,8 +994,8 @@ def test_bound_reference_repeats_label_transfer_without_rereading_its_payload(
     cell_id_reads = Counter(
         key for key in chunk_keys if key.startswith("cellData/ids/")
     )
-    # Binding and label reads each check twice; the dataset fingerprint adds one.
-    assert cell_id_reads and set(cell_id_reads.values()) == {5}
+    # Binding and label reads share one row-identity validation per call.
+    assert cell_id_reads and set(cell_id_reads.values()) == {1}
     assert not any(key.startswith("cellData/I/") for key in chunk_keys)
 
 
@@ -1044,10 +1043,6 @@ def test_reused_reference_rejects_reordered_cells(
     mapping_consumer_context, stored_fingerprint, consumer
 ):
     reference_store, reference, query = mapping_consumer_context
-    if stored_fingerprint:
-        reference_store.RNA.attrs["dataset_fingerprint"] = reference.dataset_fingerprint
-    else:
-        reference_store.RNA.attrs.pop("dataset_fingerprint", None)
     _write_reference_labels(reference)
     selected = _reference_cell_indices(reference)[:2]
     result = _write_projection(
@@ -1074,6 +1069,11 @@ def test_reused_reference_rejects_reordered_cells(
         "score": lambda: list(query.get_mapping_score(result, reference=reference)),
         "lineage": lambda: query.lineage(result, references=reference),
     }[consumer]
+    if not stored_fingerprint:
+        reference_store.RNA.z.attrs.pop("dataset_fingerprint")
+        with pytest.raises(ValueError, match="inconsistent dataset identity"):
+            consume()
+        return
     consume()
 
     for column in ("ids", "reference_labels"):
@@ -1086,12 +1086,8 @@ def test_reused_reference_rejects_reordered_cells(
         consume()
 
 
-@pytest.mark.parametrize("column", ["feature_ids", "cell_counts"])
-def test_reused_reference_recomputes_missing_dataset_fingerprint(
-    mapping_consumer_context, column
-):
+def test_reused_reference_requires_persisted_dataset_identity(mapping_consumer_context):
     reference_store, reference, query = mapping_consumer_context
-    reference_store.RNA.attrs.pop("dataset_fingerprint", None)
     result = _write_projection(
         query,
         reference,
@@ -1100,15 +1096,8 @@ def test_reused_reference_recomputes_missing_dataset_fingerprint(
         uninformative=np.array([False, False]),
     )
     query.get_mapping_result(result, reference=reference)
-
-    if column == "feature_ids":
-        array = reference_store.RNA.feats._get_array("ids")
-        array[:2] = array[:2][::-1]
-    else:
-        array = reference_store.cells._get_array("RNA_nCounts")
-        array[0] = array[0] + 1
-
-    with pytest.raises(ValueError, match="dataset fingerprint mismatch"):
+    reference_store.RNA.z.attrs.pop("dataset_fingerprint")
+    with pytest.raises(ValueError, match="inconsistent dataset identity"):
         query.get_mapping_result(result, reference=reference)
 
 

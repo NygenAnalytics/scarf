@@ -2,11 +2,11 @@ import os
 from dataclasses import dataclass, replace
 from typing import Any
 
-import numpy as np
 import zarr
 
 from ..storage.budget import resolve_budget
 from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.identity import generated_cell_columns, validate_preparation
 from ..storage.io_policy import StorageIoPolicy
 from ..storage.layout import _group_zarr_format, count_array_spec
 from ..storage.profiles import (
@@ -20,7 +20,7 @@ from ..storage.sharding import preflight_counts_t_spec, row_band_task_count
 from ..storage.stores import MATRIX_SOURCE_ATTR, load_zarr, zarr_root_path
 from ..storage.types import as_zarr_group
 from ..utils.logging import logger
-from .features import align_features, resolve_merge_dtype
+from .features import FeatureKey, align_features, resolve_merge_dtype
 from .metadata import (
     CellMetadataPlan,
     admit_cell_metadata_plan,
@@ -29,6 +29,7 @@ from .metadata import (
     resolve_metadata_schema_scan_rows,
     validate_cell_metadata,
     write_cell_metadata,
+    write_feature_metadata,
 )
 from .models import (
     AssayMergePlan,
@@ -40,7 +41,6 @@ from .models import (
 )
 from .row_plan import RowPlan, build_row_plan
 from .writer import (
-    MissingAssay,
     _assay_metadata_path,
     _cell_data_path,
     _matrix_group_path,
@@ -125,7 +125,8 @@ class DataStoreMerge:
         overwrite: If True, replace a blocked or incompatible destination.
         prepend_text: Prefix added to colliding metadata column names.
         reset_cell_filter: If True, mark every merged cell as selected.
-        seed: RNG seed for cell interleaving. None keeps source order.
+        seed: RNG seed for interleaving source cell blocks. None draws a fresh,
+              unseeded interleaving, so the merged row order differs between runs.
         storage_options: Backend options passed when opening the destination.
         source_column: Optional cell-metadata column storing source names.
         mem_budget: Memory budget for the merge. Accepts bytes, a size such
@@ -141,6 +142,11 @@ class DataStoreMerge:
             stay under automatic planning.
         missing_assay_policy: ``zero_fill`` writes zeros for a missing assay
                               in a source. ``error`` rejects that merge.
+        feature_key: ``ids`` matches features across sources by exact feature
+                     ID. ``names`` matches them by feature name, which merges
+                     sources that use different ID schemes for the same genes.
+                     The merged IDs are then the names, and features that share
+                     a name within one source are summed.
     """
 
     def __init__(
@@ -164,6 +170,7 @@ class DataStoreMerge:
         policy: CountMatrixPolicy | None = None,
         io: StorageIoPolicy | None = None,
         missing_assay_policy: MissingAssayPolicy = "zero_fill",
+        feature_key: FeatureKey = "ids",
     ) -> None:
         validate_workspace_name(out_workspace)
         if len(datasets) < 2:
@@ -178,6 +185,8 @@ class DataStoreMerge:
             raise ValueError(
                 "missing_assay_policy must be one of 'zero_fill' or 'error'"
             )
+        if feature_key not in {"ids", "names"}:
+            raise ValueError("feature_key must be one of 'ids' or 'names'")
         self.datasets = datasets
         self.names = list(names)
         self.zarr_path = zarr_path
@@ -191,6 +200,7 @@ class DataStoreMerge:
         self.storageOptions = storage_options
         self.sourceColumn = source_column
         self.missingAssayPolicy = missing_assay_policy
+        self.featureKey = feature_key
         self.policy = policy
         self.io = io
         self.resources = resolve_budget(
@@ -205,7 +215,8 @@ class DataStoreMerge:
         self.uniqueAssays = self._resolve_assays()
         self._rowPlan: RowPlan | None = None
         self._alignments: dict[str, Any] = {}
-        self._assaySources: dict[str, list[Any]] = {}
+        # A source without an assay is None in that assay's source list.
+        self._assaySources: dict[str, list[Any | None]] = {}
         self._metadataPlan: CellMetadataPlan | None = None
 
     def _resolve_assays(self) -> list[str]:
@@ -269,49 +280,34 @@ class DataStoreMerge:
             self.names,
             seed=self.seed,
         )
-        reference_feats: dict[str, Any] = {}
-        reference_dtype: dict[str, Any] = {}
         for assay_name in self.uniqueAssays:
-            for ds in self.datasets:
-                if assay_name in ds.assay_names:
-                    assay = ds.get_assay(assay_name)
-                    reference_feats[assay_name] = assay.feats
-                    reference_dtype[assay_name] = np.dtype(assay.rawData.dtype)
-                    break
-            if assay_name not in reference_feats:
-                raise ValueError(f"No source provides assay {assay_name!r}")
-
-        for assay_name in self.uniqueAssays:
-            sources: list[Any] = []
-            missing_names: list[str] = []
+            sources: list[Any | None] = []
             for ds, name in zip(self.datasets, self.names, strict=True):
                 if assay_name in ds.assay_names:
                     assay = ds.get_assay(assay_name)
-                    if not bool(getattr(assay, "isMissing", False)):
-                        raw_shape = tuple(int(value) for value in assay.rawData.shape)
-                        if len(raw_shape) != 2:
-                            raise ValueError(
-                                f"Source {name!r} assay {assay_name!r} rawData "
-                                "must be two-dimensional"
-                            )
-                        raw_rows, raw_features = raw_shape
-                        source_cells = int(ds.cells.N)
-                        source_features = int(assay.feats.N)
-                        if raw_rows != source_cells:
-                            raise ValueError(
-                                f"Source {name!r} assay {assay_name!r} rawData has "
-                                f"{raw_rows} rows, but source cells has "
-                                f"{source_cells}"
-                            )
-                        if raw_features != source_features:
-                            raise ValueError(
-                                f"Source {name!r} assay {assay_name!r} rawData has "
-                                f"{raw_features} columns, but assay features has "
-                                f"{source_features}"
-                            )
+                    raw_shape = tuple(int(value) for value in assay.rawData.shape)
+                    if len(raw_shape) != 2:
+                        raise ValueError(
+                            f"Source {name!r} assay {assay_name!r} rawData "
+                            "must be two-dimensional"
+                        )
+                    raw_rows, raw_features = raw_shape
+                    source_cells = int(ds.cells.N)
+                    source_features = int(assay.feats.N)
+                    if raw_rows != source_cells:
+                        raise ValueError(
+                            f"Source {name!r} assay {assay_name!r} rawData has "
+                            f"{raw_rows} rows, but source cells has "
+                            f"{source_cells}"
+                        )
+                    if raw_features != source_features:
+                        raise ValueError(
+                            f"Source {name!r} assay {assay_name!r} rawData has "
+                            f"{raw_features} columns, but assay features has "
+                            f"{source_features}"
+                        )
                     sources.append(assay)
                 else:
-                    missing_names.append(name)
                     if self.missingAssayPolicy == "error":
                         raise ValueError(
                             f"Source {name!r} is missing assay {assay_name!r}"
@@ -320,19 +316,13 @@ class DataStoreMerge:
                         f"Source {name!r} is missing assay {assay_name!r}; "
                         "writing zeros and marking assay membership false"
                     )
-                    sources.append(
-                        MissingAssay(
-                            cells=ds.cells,
-                            feats=reference_feats[assay_name],
-                            name=assay_name,
-                            n_cells=int(ds.cells.N),
-                            dtype=reference_dtype[assay_name],
-                        )
-                    )
+                    sources.append(None)
             self._assaySources[assay_name] = sources
-            self._alignments[assay_name] = align_features(sources, self.names)
+            self._alignments[assay_name] = align_features(
+                sources, self.names, key=self.featureKey
+            )
 
-    def _resolve_assay_type(self, assay_name: str, sources: list[Any]) -> str:
+    def _resolve_assay_type(self, assay_name: str, sources: list[Any | None]) -> str:
         from ..assay.base import Assay
         from ..assay.classification import (
             is_rna_assay_type,
@@ -340,8 +330,6 @@ class DataStoreMerge:
         )
 
         for source in sources:
-            if isinstance(source, MissingAssay):
-                continue
             if isinstance(source, Assay):
                 source_type = getattr(source, "assayType", None)
                 if isinstance(source_type, str):
@@ -351,7 +339,9 @@ class DataStoreMerge:
                 return resolve_persisted_assay_type(assay_name, "Assay")
         return resolve_persisted_assay_type(assay_name)
 
-    def _should_write_counts_t(self, assay_name: str, sources: list[Any]) -> bool:
+    def _should_write_counts_t(
+        self, assay_name: str, sources: list[Any | None]
+    ) -> bool:
         from ..assay.classification import is_rna_assay_type
 
         type_name = self._resolve_assay_type(assay_name, sources)
@@ -372,7 +362,7 @@ class DataStoreMerge:
             "sourceCellCounts": self._source_cell_counts(),
             "sourceFeatureCounts": {
                 assay_name: [
-                    0 if isinstance(source, MissingAssay) else int(source.feats.N)
+                    0 if source is None else int(source.feats.N)
                     for source in self._assaySources[assay_name]
                 ]
                 for assay_name in self.uniqueAssays
@@ -391,6 +381,7 @@ class DataStoreMerge:
                 "chunkBytes": self.policy.chunkBytes,
             },
             "missingAssayPolicy": self.missingAssayPolicy,
+            "featureKey": self.featureKey,
             "outWorkspace": self.outWorkspace,
             "nCells": self._rowPlan.nCells,
         }
@@ -567,6 +558,29 @@ class DataStoreMerge:
         if self._is_fresh_destination_shell(existing, attr_root):
             return _DestinationInspection(actions)
         assert attr_root is not None
+        for assay_plan in assay_plans:
+            name = assay_plan.assayName
+            if (
+                name not in attr_root
+                or attr_root[name].attrs.get("prepared") is not True
+            ):
+                continue
+            if self.overwrite:
+                return self._blocked_inspection(
+                    assay_plans,
+                    "Prepared datasets require a fresh destination; overwrite is not allowed",
+                )
+            try:
+                validate_preparation(
+                    as_zarr_group(attr_root[name], name=name),
+                    as_zarr_group(attr_root["cellData"], name="cellData"),
+                    as_zarr_group(
+                        existing[_matrix_group_path(name, self.outWorkspace)], name=name
+                    ),
+                    require_transpose=assay_plan.writeCountsT,
+                )
+            except ValueError as error:
+                return self._blocked_inspection(assay_plans, str(error))
         stored_manifest = attr_root.attrs.get(_MANIFEST_ATTR)
         import_source = attr_root.attrs.get("scarf:import_source")
         import_complete = attr_root.attrs.get("scarf:import_complete") is True
@@ -703,7 +717,6 @@ class DataStoreMerge:
             )
             scan_rows = resolve_metadata_schema_scan_rows(
                 [ds.cells for ds in self.datasets],
-                self._rowPlan,
                 self.resources,
                 resident_bytes=resident_bytes,
                 preferred_rows=preferred_rows,
@@ -717,6 +730,17 @@ class DataStoreMerge:
                 membership_assays=self.uniqueAssays,
                 block_rows=preferred_rows,
                 scan_rows=scan_rows,
+                excluded_columns=[
+                    frozenset().union(
+                        *(
+                            generated_cell_columns(
+                                name, ds.get_assay(name)._percent_features()
+                            )
+                            for name in ds.assay_names
+                        )
+                    )
+                    for ds in self.datasets
+                ],
             )
         assert self._metadataPlan is not None
         manifest = self._build_manifest()
@@ -727,14 +751,14 @@ class DataStoreMerge:
         for assay_name in self.uniqueAssays:
             sources = self._assaySources[assay_name]
             alignment = self._alignments[assay_name]
-            present = tuple(not isinstance(source, MissingAssay) for source in sources)
+            present = tuple(source is not None for source in sources)
             missing = tuple(
                 name
                 for name, is_present in zip(self.names, present, strict=True)
                 if not is_present
             )
             dtype = resolve_merge_dtype(
-                [source for source in sources if not isinstance(source, MissingAssay)],
+                sources,
                 alignment.featOrderMap,
                 self.dtype,
             )
@@ -815,6 +839,7 @@ class DataStoreMerge:
                         residentBytes=(
                             self._rowPlan.resident_bytes() + total_alignment_bytes
                         ),
+                        policy=self.policy,
                     )
         assay_plans = tuple(
             replace(
@@ -1019,6 +1044,19 @@ class DataStoreMerge:
             alignment = self._alignments[assay_name]
             counts_action = actions[f"counts:{assay_name}"]
             if counts_action != "skip":
+                assay_path = _assay_metadata_path(assay_name, self.outWorkspace)
+                if counts_action == "resume":
+                    matrix_path = _matrix_group_path(assay_name, self.outWorkspace)
+                    if (
+                        assay_path in root
+                        and root[assay_path].attrs.get("prepared") is True
+                    ):
+                        raise ValueError(
+                            "A damaged prepared assay requires a fresh destination"
+                        )
+                    for path in dict.fromkeys((assay_path, matrix_path)):
+                        if path in root:
+                            del root[path]
                 create_assay_counts(
                     root,
                     assay_name,
@@ -1028,6 +1066,25 @@ class DataStoreMerge:
                     assay_plan.dtype,
                     profile=self.profile,
                     policy=self.policy,
+                )
+                present_sources = [
+                    (source, mapping)
+                    for source, mapping in zip(
+                        sources, alignment.featOrderMap, strict=True
+                    )
+                    if source is not None
+                ]
+                write_feature_metadata(
+                    [source.feats for source, _ in present_sources],
+                    [mapping for _, mapping in present_sources],
+                    as_zarr_group(
+                        root[f"{assay_path}/featureData"], name="featureData"
+                    ),
+                    alignment.nFeats,
+                    resources=self.resources,
+                    resident_bytes=self._rowPlan.resident_bytes()
+                    + sum(item.resident_bytes() for item in self._alignments.values()),
+                    profile=self.profile,
                 )
                 write_assay_counts(
                     root,

@@ -5,12 +5,11 @@ import pytest
 import scarf.storage.budget as budget_module
 from scarf.storage.budget import (
     ResourceBudget,
-    admitted_worker_count,
-    admitted_worker_split,
     detect_total_memory_bytes,
     detect_workers,
     resolve_budget,
 )
+from scarf.storage.execution import admitted_worker_split
 
 
 def test_resolve_budget_parses_suffix(monkeypatch):
@@ -196,33 +195,6 @@ def test_fraction_uses_total_memory(monkeypatch):
     total = detect_total_memory_bytes()
     got = resolve_budget(memory="0.25", workers=1).memoryBytes
     assert abs(got - int(total * 0.25)) <= total * 0.01
-
-
-def test_admitted_worker_count_respects_cpu_memory_and_resident_bytes():
-    resources = ResourceBudget(memoryBytes=4 * 1024**3, workers=8)
-    assert admitted_worker_count(resources, taskBytes=1024**3) == 4
-    assert (
-        admitted_worker_count(
-            resources,
-            taskBytes=1024**3,
-            residentBytes=1024**3,
-        )
-        == 3
-    )
-    assert (
-        admitted_worker_count(
-            resources,
-            taskBytes=1024**3,
-            requested=2,
-        )
-        == 2
-    )
-
-
-def test_admitted_worker_count_rejects_oversized_task():
-    resources = ResourceBudget(memoryBytes=1024, workers=8)
-    with pytest.raises(MemoryError):
-        admitted_worker_count(resources, taskBytes=2048)
 
 
 def test_admitted_worker_split_bounds_outer_inner_and_resident_bytes():

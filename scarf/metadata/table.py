@@ -1,10 +1,12 @@
 from collections.abc import Iterable, Iterator
+from functools import partial
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import zarr
 
+from ..storage.stores import metadata_workers, run_concurrently
 from ..storage.types import as_zarr_array
 from ..storage.arrays import create_zarr_obj_array
 from ..utils.logging import logger
@@ -39,21 +41,20 @@ class MetaData:
         self.index = np.array(range(self.N))
 
     def _get_size(self, zgrp: zarrGroup, strict_mode: bool = False) -> int:
-        sizes = []
-        for key in zgrp.keys():
-            try:
-                child = zgrp[key]
-                if isinstance(child, zarr.Array):
-                    sizes.append(child.shape[0])
-            except Exception:
-                pass
+        # members() reads child metadata concurrently; opening each key in turn
+        # costs one sequential round trip per column on object stores.
+        sizes = {
+            child.shape[0]
+            for _key, child in zgrp.members()
+            if isinstance(child, zarr.Array)
+        }
         if sizes:
-            if len(set(sizes)) != 1:
+            if len(sizes) != 1:
                 raise ValueError(
                     "ERROR: Metadata table is corrupted. Not all columns are "
                     "of same length"
                 )
-            return sizes[0]
+            return sizes.pop()
         if strict_mode:
             raise ValueError("Attempted to get size of empty zarr group")
         return self.N
@@ -83,30 +84,49 @@ class MetaData:
                 col_map[public_name] = (location, column)
         return col_map
 
-    def _get_loc(self, column: str) -> tuple[str, str]:
+    def _candidate_locs(self, column: str) -> Iterator[tuple[str, str]]:
         if column in {"I", "ids", "names"}:
-            return "primary", column
-        for location, group in reversed(self.locations.items()):
+            yield "primary", column
+            return
+        for location in reversed(self.locations):
             if location == "primary":
                 stored_column = column
             elif column.startswith(f"{location}_"):
                 stored_column = column[len(location) + 1 :]
             else:
                 continue
+            if "/" not in stored_column and not stored_column.startswith(
+                _INTERNAL_METADATA_PREFIX
+            ):
+                yield location, stored_column
+
+    def _get_loc(self, column: str) -> tuple[str, str]:
+        for location, stored_column in self._candidate_locs(column):
             if (
-                "/" not in stored_column
-                and not stored_column.startswith(_INTERNAL_METADATA_PREFIX)
-                and stored_column in group
+                column in {"I", "ids", "names"}
+                or stored_column in self.locations[location]
             ):
                 return location, stored_column
         raise KeyError(f"{column} does not exist in the metadata columns.")
 
+    def _has_column(self, column: str) -> bool:
+        # Looking up one column avoids listing and opening every column.
+        try:
+            self._get_loc(column)
+        except KeyError:
+            return False
+        return True
+
     def _get_array(self, column: str) -> zarr.Array:
-        location, stored_column = self._get_loc(column)
-        return as_zarr_array(
-            self.locations[location][stored_column],
-            name=stored_column,
-        )
+        # One metadata read per column: a membership test before indexing
+        # doubles the round trips on object stores.
+        for location, stored_column in self._candidate_locs(column):
+            try:
+                node = self.locations[location][stored_column]
+            except KeyError:
+                continue
+            return as_zarr_array(node, name=stored_column)
+        raise KeyError(f"{column} does not exist in the metadata columns.")
 
     def _get_missing_mask_array(self, column: str) -> zarr.Array | None:
         location, stored_column = self._get_loc(column)
@@ -128,11 +148,16 @@ class MetaData:
         """Return the dtype of a metadata column."""
         return self._get_array(column).dtype
 
-    def _verify_bool(self, key: str) -> bool:
-        if self.get_dtype(key) != bool:  # noqa: E721
+    def _bool_array(self, key: str) -> zarr.Array:
+        array = self._get_array(key)
+        if array.dtype != bool:  # noqa: E721
             raise TypeError(
                 "ERROR: `key` should be name of a boolean type column in Metadata table"
             )
+        return array
+
+    def _verify_bool(self, key: str) -> bool:
+        self._bool_array(key)
         return True
 
     def mount_location(self, zgrp: zarrGroup, identifier: str) -> None:
@@ -173,14 +198,16 @@ class MetaData:
         """Return all values from a metadata column."""
         return np.asarray(self._get_array(column)[:])
 
+    def fetch_all_columns(self, columns: Iterable[str]) -> list[np.ndarray]:
+        """Return several whole columns; object stores read them concurrently."""
+        return run_concurrently(
+            [partial(self.fetch_all, column) for column in columns],
+            workers=metadata_workers(self.locations["primary"]),
+        )
+
     def active_index(self, key: str) -> np.ndarray:
         """Return global row indices selected by a boolean column."""
-        if self._verify_bool(key):
-            return np.asarray(self.index[self.fetch_all(key)])
-        raise ValueError(
-            "ERROR: Unexpected error when verifying boolean key. "
-            "Please report this issue"
-        )
+        return np.asarray(self.index[np.asarray(self._bool_array(key)[:])])
 
     def fetch(self, column: str, key: str = "I") -> np.ndarray:
         """Return column values for rows selected by ``key``."""
@@ -225,8 +252,14 @@ class MetaData:
                 f"ERROR: Values are of shape: {values.shape}. "
                 f"Expected shape is: ({self.N},)"
             )
+        from ..storage.identity import clear_column
+
+        if location == "primary" and self._has_column(column_name):
+            location, column_name = self._get_loc(column_name)
+        group = self.locations[location]
+        clear_column(group, column_name)
         create_zarr_obj_array(
-            self.locations[location],
+            group,
             column_name,
             values,
             values.dtype,
@@ -259,8 +292,7 @@ class MetaData:
         if n_values == self.N:
             return values
 
-        self._verify_bool(key)
-        selected = self.fetch_all(key)
+        selected = np.asarray(self._bool_array(key)[:])
         selected_count = selected.sum()
         if len(values) != selected_count:
             raise ValueError(
@@ -328,7 +360,7 @@ class MetaData:
             raise ValueError(
                 f"ERROR: {column} is a protected column name in MetaData class."
             )
-        if column in self.columns and overwrite is False:
+        if overwrite is False and self._has_column(column):
             raise ValueError(
                 f"ERROR: {column} already exists. Please set `overwrite` to "
                 "True to overwrite."
@@ -360,7 +392,9 @@ class MetaData:
                 "Cannot be deleted"
             )
         location, stored_column = self._get_loc(column)
-        del self.locations[location][stored_column]
+        from ..storage.identity import clear_column
+
+        clear_column(self.locations[location], stored_column)
 
     def sift(
         self,

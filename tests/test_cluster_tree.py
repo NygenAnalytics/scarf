@@ -25,7 +25,7 @@ from scarf.storage.artifacts import (
     make_provenance,
     parse_artifact_path,
 )
-from scarf.storage.selections import resolve_selection_artifact
+from scarf.storage.selections import resolve_generated_selection_artifact
 
 
 class _ClusterTreeStore(_PresentationOperationsMixin):
@@ -87,7 +87,7 @@ def _artifact_cluster_tree_store(
     cell_data = root.create_group("cellData")
     cell_data.create_array("ids", data=cell_ids)
     cell_data.create_array("I", data=np.ones(len(clusters), dtype=bool))
-    selection = resolve_selection_artifact(
+    selection = resolve_generated_selection_artifact(
         root,
         scope="datastore",
         kind="cell_selection",
@@ -97,7 +97,7 @@ def _artifact_cluster_tree_store(
         parameters={},
         inputs={},
         source_column="I",
-    )
+    )[0]
     refs = {
         "selection": selection,
         "graph": ArtifactRef(

@@ -26,7 +26,6 @@ from tests.fixtures_datastore import build_neighbourhood_graph
 from scarf.writers import (
     create_cell_data,
     create_zarr_count_assay,
-    create_zarr_obj_array,
 )
 
 
@@ -55,6 +54,9 @@ def _write_assay(
         counts = root[f"matrices/{assay_name}/counts"]
         assay = root[f"{workspace}/{assay_name}"]
     counts[:] = values
+    from scarf.storage.identity import finalize_counts
+
+    finalize_counts(counts)
     matrix_group = (
         root[assay_name] if workspace is None else root[f"matrices/{assay_name}"]
     )
@@ -63,6 +65,18 @@ def _write_assay(
         matrix_group,
         resources=ResourceBudget(1024**2, 2),
     )
+    from scarf.assay.classification import preset_assay_types
+    from scarf.metadata import MetaData
+
+    table = root["cellData"] if workspace is None else root[f"{workspace}/cellData"]
+    instance = preset_assay_types().get(assay_name, preset_assay_types()["Assay"])(
+        z=root,
+        workspace=workspace,
+        name=assay_name,
+        cell_data=MetaData(table),
+        nthreads=1,
+    )
+    instance.prepare({})
     if dataset_fingerprint is not None:
         assay.attrs["dataset_fingerprint"] = dataset_fingerprint
 
@@ -155,7 +169,8 @@ def test_mount_datastore_multiple_assays(tmp_path):
     np.testing.assert_array_equal(ds.ADT.rawData.compute(), adt_values)
     manifest = zarr.open_group(target, mode="r").attrs[MATRIX_SOURCE_ATTR]["assays"]
     assert (
-        manifest["RNA"]["cellIdsFingerprint"] == manifest["ADT"]["cellIdsFingerprint"]
+        manifest["RNA"]["datasetFingerprint"]
+        == source_root["RNA"].attrs["dataset_fingerprint"]
     )
     assert "counts" not in zarr.open_group(target, mode="r")["ADT"]
 
@@ -222,12 +237,16 @@ def test_failed_mount_discards_target_and_allows_retry(
 
     monkeypatch.setattr(copy_module, "copy_zarr_group_tree", fail_copy)
     with pytest.raises(OSError, match="injected metadata copy failure"):
-        create_matrix_source(source, target, workspace=None)
+        create_matrix_source(
+            source, target, required_transposes=frozenset({"RNA"}), workspace=None
+        )
     if isinstance(target, str):
         assert not Path(target).exists()
     monkeypatch.undo()
 
-    retried = create_matrix_source(source, target, workspace=None)
+    retried = create_matrix_source(
+        source, target, required_transposes=frozenset({"RNA"}), workspace=None
+    )
     assert MATRIX_SOURCE_ATTR in retried.attrs
     assert "ids" in retried["cellData"]
 
@@ -272,6 +291,30 @@ def test_mount_datastore_rejects_existing_target(tmp_path):
             default_assay="RNA",
             min_features_per_cell=1,
         )
+
+
+def test_mount_rejects_overlap_chained_mounts_and_old_contracts(tmp_path):
+    source = str(tmp_path / "source.zarr")
+    target = str(tmp_path / "target.zarr")
+    chained = str(tmp_path / "chained.zarr")
+    required = frozenset({"RNA"})
+    _write_source_store(source, workspace=None)
+    with pytest.raises(ValueError, match="must not overlap"):
+        create_matrix_source(source, f"{source}/nested", required_transposes=required)
+    assert not Path(f"{source}/nested").exists()
+
+    create_matrix_source(source, target, required_transposes=required)
+    with pytest.raises(ValueError, match="repacking"):
+        create_matrix_source(target, chained, required_transposes=required)
+    assert not Path(chained).exists()
+
+    root = zarr.open_group(target, mode="r+")
+    manifest = dict(root.attrs[MATRIX_SOURCE_ATTR])
+    fingerprint = manifest["assays"]["RNA"]["datasetFingerprint"]
+    manifest["assays"] = {"RNA": {"datasetFingerprint": fingerprint}}
+    root.attrs[MATRIX_SOURCE_ATTR] = manifest
+    with pytest.raises(ValueError, match="unsupported identity contract"):
+        resolve_matrix_source(zarr.open_group(target, mode="r"))
 
 
 def test_mounted_store_writes_only_to_target(tmp_path):
@@ -494,18 +537,24 @@ def test_matrix_source_id_mismatch_fails_closed(tmp_path, group_path, prefix):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
     _write_source_store(source, workspace=None)
-    create_matrix_source(source, target, workspace=None)
+    create_matrix_source(
+        source, target, required_transposes=frozenset({"RNA"}), workspace=None
+    )
 
     source_root = zarr.open_group(source, mode="r+")
     group = source_root[group_path]
     n_rows = group["ids"].shape[0]
-    create_zarr_obj_array(
-        group,
-        "ids",
-        np.array([f"{prefix}-{i}" for i in range(n_rows)]),
-        overwrite=True,
-    )
-    with pytest.raises(ValueError, match="cell or feature identifiers"):
+    from scarf.metadata import MetaData
+
+    with pytest.raises(ValueError, match="prepared data"):
+        MetaData(group).insert(
+            "ids",
+            np.array([f"{prefix}-{i}" for i in range(n_rows)]),
+            overwrite=True,
+            force=True,
+        )
+    source_root["RNA"].attrs["dataset_fingerprint"] = "changed"
+    with pytest.raises(ValueError, match="mounted identity"):
         DataStore(target, default_assay="RNA")
 
 
@@ -524,7 +573,9 @@ def test_matrix_source_count_identity_mismatch_fails_closed(
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
     _write_source_store(source, workspace=None)
-    create_matrix_source(source, target, workspace=None)
+    create_matrix_source(
+        source, target, required_transposes=frozenset({"RNA"}), workspace=None
+    )
 
     source_root = zarr.open_group(source, mode="r+")
     source_root["RNA"].create_array(
@@ -533,7 +584,7 @@ def test_matrix_source_count_identity_mismatch_fails_closed(
         chunks=(5, 2),
         overwrite=True,
     )
-    with pytest.raises(ValueError, match="count matrix identity"):
+    with pytest.raises(ValueError, match="not finalized"):
         DataStore(target, default_assay="RNA")
 
 
@@ -554,7 +605,9 @@ def test_invalid_source_does_not_create_target(tmp_path, parent_path, name, erro
     del parent[name]
 
     with pytest.raises(error_type):
-        create_matrix_source(source, target, workspace=None)
+        create_matrix_source(
+            source, target, required_transposes=frozenset({"RNA"}), workspace=None
+        )
     assert not Path(target).exists()
 
 
@@ -564,24 +617,30 @@ def test_matrix_source_dataset_fingerprint_fast_path(tmp_path):
     _write_source_store(
         source,
         workspace=None,
-        dataset_fingerprint="abc123",
     )
-    create_matrix_source(source, target, workspace=None)
+    create_matrix_source(
+        source, target, required_transposes=frozenset({"RNA"}), workspace=None
+    )
     manifest = zarr.open_group(target, mode="r").attrs[MATRIX_SOURCE_ATTR]
-    assert manifest["assays"]["RNA"]["datasetFingerprint"] == "abc123"
-    assert manifest["assays"]["RNA"]["cellIdsFingerprint"] is None
+    assert (
+        manifest["assays"]["RNA"]["datasetFingerprint"]
+        == zarr.open_group(source, mode="r")["RNA"].attrs["dataset_fingerprint"]
+    )
+    assert manifest["assays"]["RNA"]["countsFingerprint"]
 
     source_root = zarr.open_group(source, mode="r+")
     source_root["RNA"].attrs["dataset_fingerprint"] = "changed"
-    with pytest.raises(ValueError, match="dataset fingerprint"):
+    with pytest.raises(ValueError, match="mounted identity"):
         resolve_matrix_source(zarr.open_group(target, mode="r"))
 
 
 def test_dataset_fingerprint_fast_path_reads_no_identifiers(monkeypatch, tmp_path):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
-    _write_source_store(source, workspace=None, dataset_fingerprint="abc123")
-    create_matrix_source(source, target, workspace=None)
+    _write_source_store(source, workspace=None)
+    create_matrix_source(
+        source, target, required_transposes=frozenset({"RNA"}), workspace=None
+    )
 
     read_array = zarr.Array.__getitem__
 
@@ -600,7 +659,9 @@ def test_source_open_does_not_change_target_profile(tmp_path):
     target = str(tmp_path / "target.zarr")
     _write_source_store(source, workspace=None)
 
-    create_matrix_source(source, target, workspace=None)
+    create_matrix_source(
+        source, target, required_transposes=frozenset({"RNA"}), workspace=None
+    )
     target_ids = zarr.open_group(target, mode="r")["cellData/ids"]
     assert isinstance(target_ids.compressors[0], BloscCodec)
 
@@ -657,14 +718,9 @@ def test_mounted_datastore_reads_remote_counts_and_persists_summary_locally(
 
     cell_idx = ds.cells.active_index("I")
     feat_idx = ds.RNA.feats.active_index("I")
-    blocks = list(
-        ds.RNA.iter_raw_column_blocks(
-            cell_idx,
-            feat_idx,
-            batch_size=1,
-        )
-    )
-    observed = np.concatenate([raw for _, raw, _, _, _ in blocks], axis=1)
+    counts_t = ds.RNA.rawDataT
+    assert counts_t is not None
+    observed = np.asarray(counts_t.get_orthogonal_selection((feat_idx, cell_idx))).T
     np.testing.assert_array_equal(observed, values[np.ix_(cell_idx, feat_idx)])
 
     selection = ds.select_detected_features(
@@ -688,7 +744,9 @@ def test_workspace_mismatch_raises(tmp_path):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
     _write_source_store(source, workspace="analysis")
-    create_matrix_source(source, target, workspace="analysis")
+    create_matrix_source(
+        source, target, required_transposes=frozenset({"RNA"}), workspace="analysis"
+    )
     with pytest.raises(ValueError, match="workspace does not match"):
         DataStore(target, workspace="other", default_assay="RNA")
 

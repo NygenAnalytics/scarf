@@ -7,9 +7,7 @@ from ..types import (
     AgentDataModel,
     AgentRunInfo,
     ArtifactReferenceModel,
-    ExperimentalTuningHandoff,
     StageStatus,
-    TuningBiologyHandoff,
 )
 
 try:
@@ -41,27 +39,19 @@ class ArtifactRecord(ArtifactReferenceModel):
             assay=getattr(ref, "assay", None),
         )
 
-    @classmethod
-    def get_blank(cls) -> "ArtifactRecord":
-        return cls()
-
 
 class ParameterCandidate(AgentDataModel):
     """One exact, caller-authorized parameter candidate."""
 
     candidateId: str = Field(
         default="",
-        description="Exact candidate id supplied to the evaluation tool",
+        description="Exact candidate id supplied to candidate execution",
     )
     reductionMethod: ReductionMethod = "pca"
     dimensions: int = Field(default=21, ge=2)
     leidenResolution: float = Field(default=1.0, gt=0)
     neighborsK: int = Field(default=11, ge=2)
     useHarmony: bool = False
-
-    @classmethod
-    def get_blank(cls) -> "ParameterCandidate":
-        return cls()
 
 
 class ParameterMetrics(AgentDataModel):
@@ -118,10 +108,6 @@ class ParameterMetrics(AgentDataModel):
     dominatesCandidateIds: list[str] = Field(default_factory=list)
     dominanceMetrics: dict[str, list[str]] = Field(default_factory=dict)
 
-    @classmethod
-    def get_blank(cls) -> "ParameterMetrics":
-        return cls()
-
 
 class ParameterCandidateEvaluation(AgentDataModel):
     """Execution record returned to the model for one candidate."""
@@ -143,10 +129,6 @@ class ParameterCandidateEvaluation(AgentDataModel):
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
 
-    @classmethod
-    def get_blank(cls) -> "ParameterCandidateEvaluation":
-        return cls()
-
 
 class IntegrationMetrics(AgentDataModel):
     """Metrics that are valid for an integrated graph comparison."""
@@ -158,10 +140,6 @@ class IntegrationMetrics(AgentDataModel):
     normalizedMutualInformationByAssay: dict[str, float] = Field(default_factory=dict)
     biologicalConnectivity: dict[str, float] = Field(default_factory=dict)
     modalityWeightsValid: bool | None = None
-
-    @classmethod
-    def get_blank(cls) -> "IntegrationMetrics":
-        return cls()
 
 
 class IntegrationCandidateEvaluation(AgentDataModel):
@@ -183,10 +161,6 @@ class IntegrationCandidateEvaluation(AgentDataModel):
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
 
-    @classmethod
-    def get_blank(cls) -> "IntegrationCandidateEvaluation":
-        return cls()
-
 
 class FinalGraphComparison(AgentDataModel):
     """Evidence-backed comparison against one eligible final graph option."""
@@ -195,10 +169,6 @@ class FinalGraphComparison(AgentDataModel):
     summary: str = ""
     evidenceIds: list[str] = Field(default_factory=list)
 
-    @classmethod
-    def get_blank(cls) -> "FinalGraphComparison":
-        return cls()
-
 
 class FinalGraphNeedsInput(AgentDataModel):
     """Concrete input needed before a final graph can be selected."""
@@ -206,10 +176,6 @@ class FinalGraphNeedsInput(AgentDataModel):
     question: str = ""
     options: list[str] = Field(default_factory=list)
     evidenceIds: list[str] = Field(default_factory=list)
-
-    @classmethod
-    def get_blank(cls) -> "FinalGraphNeedsInput":
-        return cls()
 
 
 class FinalGraphSelection(AgentDataModel):
@@ -231,10 +197,6 @@ class FinalGraphSelection(AgentDataModel):
     needsInput: FinalGraphNeedsInput | None = None
     runInfo: SkipJsonSchema[AgentRunInfo] = Field(default_factory=AgentRunInfo)
 
-    @classmethod
-    def get_blank(cls) -> "FinalGraphSelection":
-        return cls()
-
 
 class CandidateComparison(AgentDataModel):
     """Evidence-backed comparison against one executed non-selected candidate."""
@@ -242,10 +204,6 @@ class CandidateComparison(AgentDataModel):
     candidateId: str = ""
     summary: str = ""
     evidenceIds: list[str] = Field(default_factory=list)
-
-    @classmethod
-    def get_blank(cls) -> "CandidateComparison":
-        return cls()
 
 
 class ParameterSearchPlan(AgentDataModel):
@@ -273,21 +231,6 @@ class ParameterSearchPlan(AgentDataModel):
     stoppingCriteria: list[str] = Field(default_factory=list)
     runInfo: SkipJsonSchema[AgentRunInfo] = Field(default_factory=AgentRunInfo)
 
-    @classmethod
-    def get_blank(cls) -> "ParameterSearchPlan":
-        return cls()
-
-
-class ParameterTuningBatchSearchPlan(AgentDataModel):
-    """One bounded refinement plan for every assay in a batched screen."""
-
-    assayPlans: dict[str, ParameterSearchPlan] = Field(default_factory=dict)
-    runInfo: SkipJsonSchema[AgentRunInfo] = Field(default_factory=AgentRunInfo)
-
-    @classmethod
-    def get_blank(cls) -> "ParameterTuningBatchSearchPlan":
-        return cls()
-
 
 class ParameterTuningNeedsInput(AgentDataModel):
     """User input required before tuning can produce a recommendation."""
@@ -295,10 +238,6 @@ class ParameterTuningNeedsInput(AgentDataModel):
     question: str = ""
     options: list[str] = Field(default_factory=list)
     evidenceIds: list[str] = Field(default_factory=list)
-
-    @classmethod
-    def get_blank(cls) -> "ParameterTuningNeedsInput":
-        return cls()
 
 
 class ParameterTuningReport(AgentDataModel):
@@ -337,114 +276,6 @@ class ParameterTuningReport(AgentDataModel):
     finalSelection: SkipJsonSchema[FinalGraphSelection | None] = None
     runInfo: SkipJsonSchema[AgentRunInfo] = Field(default_factory=AgentRunInfo)
 
-    @classmethod
-    def get_blank(cls) -> "ParameterTuningReport":
-        return cls()
-
-    def to_biological_handoff(
-        self,
-        *,
-        marker_assay: str | None = None,
-    ) -> TuningBiologyHandoff:
-        """Return the exact selected clustering branch for interpretation."""
-        if self.status != "done":
-            raise ValueError(
-                "Parameter Tuning must be done before creating a biology handoff"
-            )
-        if self.finalClusterArtifact is not None:
-            if self.cellSelection is None:
-                raise ValueError("Final branch lacks an exact cell selection")
-            resolved_marker_assay = marker_assay or self.markerAssay
-            if not resolved_marker_assay:
-                raise ValueError(
-                    "A marker assay is required for an integrated biology handoff"
-                )
-            if self.finalClusterArtifact.scope == "datastore":
-                if self.finalClusterArtifact.assay is not None:
-                    raise ValueError(
-                        "A datastore-scoped cluster artifact must not name an assay"
-                    )
-            elif (
-                self.graphAssay is not None
-                and self.finalClusterArtifact.assay != self.graphAssay
-            ):
-                raise ValueError("Final cluster artifact does not match graphAssay")
-            integration = next(
-                (
-                    item
-                    for item in self.integrationEvaluations
-                    if item.integrationId == self.recommendedIntegrationId
-                ),
-                None,
-            )
-            if self.finalSelection is not None:
-                evidence_ids = self.finalSelection.evidenceIds
-            elif integration is not None:
-                evidence_ids = integration.evidenceIds
-            else:
-                prefix = f"candidate:{self.recommendedCandidateId}:"
-                evidence_ids = [
-                    evidence_id
-                    for evidence_id in self.evidenceIds
-                    if evidence_id.startswith(prefix)
-                ]
-            return TuningBiologyHandoff(
-                cellSelection=self.cellSelection,
-                fromAssay=self.fromAssay,
-                graphAssay=self.graphAssay,
-                markerAssay=resolved_marker_assay,
-                recommendedCandidateId=(
-                    self.recommendedIntegrationId
-                    or (
-                        self.finalSelection.nativeCandidateId
-                        if self.finalSelection is not None
-                        else None
-                    )
-                    or self.recommendedCandidateId
-                    or "final"
-                ),
-                clusterArtifact=ArtifactReferenceModel.model_validate(
-                    self.finalClusterArtifact.model_dump()
-                ),
-                evidenceIds=sorted(evidence_ids),
-            )
-        if self.recommendedCandidateId is None:
-            raise ValueError(
-                "Parameter Tuning must recommend a candidate before creating a "
-                "biology handoff"
-            )
-        selected = next(
-            (
-                item
-                for item in self.evaluations
-                if item.candidateId == self.recommendedCandidateId
-            ),
-            None,
-        )
-        if selected is None or selected.status != "done" or not selected.eligible:
-            raise ValueError("Recommended candidate is not an eligible execution")
-        cluster_artifact = selected.artifacts.get("clusters")
-        if cluster_artifact is None or selected.cellSelection is None:
-            raise ValueError("Recommended candidate lacks an exact cluster artifact")
-        if not self.fromAssay or cluster_artifact.assay != self.fromAssay:
-            raise ValueError("Recommended cluster artifact does not match the assay")
-        prefix = f"candidate:{selected.candidateId}:"
-        return TuningBiologyHandoff(
-            cellSelection=selected.cellSelection,
-            fromAssay=self.fromAssay,
-            graphAssay=self.fromAssay,
-            markerAssay=marker_assay or self.markerAssay or self.fromAssay,
-            recommendedCandidateId=selected.candidateId,
-            clusterArtifact=ArtifactReferenceModel.model_validate(
-                cluster_artifact.model_dump()
-            ),
-            evidenceIds=sorted(
-                evidence_id
-                for evidence_id in self.evidenceIds
-                if evidence_id.startswith(prefix)
-            ),
-        )
-
 
 class ParameterTuningDependencies(AgentDataModel):
     """Runtime-only state hidden from the model and shared by tuning tools."""
@@ -469,29 +300,6 @@ class ParameterTuningDependencies(AgentDataModel):
     evaluations: dict[str, ParameterCandidateEvaluation] = Field(default_factory=dict)
     executionOrder: list[str] = Field(default_factory=list)
     executionLock: Any = Field(default_factory=Lock, exclude=True, repr=False)
-
-    @classmethod
-    def get_blank(cls) -> "ParameterTuningDependencies":
-        return cls()
-
-
-class ParameterTuningAssayInput(AgentDataModel):
-    """One assay branch supplied to batched parameter tuning."""
-
-    normalized: Any = Field(default=None, exclude=True)
-    candidates: list[ParameterCandidate] = Field(default_factory=list)
-    batchColumns: list[str] = Field(default_factory=list)
-    preservationColumns: list[str] = Field(default_factory=list)
-    experimentalHandoff: ExperimentalTuningHandoff | None = None
-    maxCandidates: int = Field(default=5, ge=1)
-    maxRefinedCandidates: int = Field(default=0, ge=0)
-    allowHarmonyRefinement: bool = True
-    minClusterCells: int = Field(default=20, ge=1)
-    identityFeatureLimit: int = Field(default=64, ge=2)
-
-    @classmethod
-    def get_blank(cls) -> "ParameterTuningAssayInput":
-        return cls()
 
 
 def _default_parameter_candidates() -> list[ParameterCandidate]:

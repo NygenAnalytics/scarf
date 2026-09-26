@@ -43,7 +43,8 @@ from scarf.storage.artifacts import (
 )
 from scarf.storage.selections import (
     read_stored_selection_mask,
-    resolve_selection_artifact,
+    resolve_generated_selection_artifact,
+    validate_stored_selection_integrity,
 )
 from tests.test_agent_experimental_context import _Cells, _Store, _context
 
@@ -99,6 +100,9 @@ class _MemoryQcCells:
     def fetch_all(self, column: str) -> np.ndarray:
         return np.asarray(self._group[column][:])
 
+    def fetch_all_columns(self, columns) -> list[np.ndarray]:
+        return [self.fetch_all(column) for column in columns]
+
 
 class _MemoryQcStore(_QualityControlOperationsMixin):
     def __init__(self, root: zarr.Group) -> None:
@@ -107,7 +111,7 @@ class _MemoryQcStore(_QualityControlOperationsMixin):
 
     def snapshot_cell_selection(self, column: str = "I") -> ArtifactRef:
         values = np.asarray(self.cells.fetch_all(column), dtype=bool)
-        return resolve_selection_artifact(
+        return resolve_generated_selection_artifact(
             self.zw,
             scope="datastore",
             kind="cell_selection",
@@ -117,6 +121,16 @@ class _MemoryQcStore(_QualityControlOperationsMixin):
             parameters={"column": column},
             inputs={},
             source_column=column,
+        )[0]
+
+    def _snapshot_cell_selection(self, column: str):
+        return validate_stored_selection_integrity(
+            self.zw,
+            self.snapshot_cell_selection(column),
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
         )
 
     def inspect_artifact(self, ref: ArtifactRef):

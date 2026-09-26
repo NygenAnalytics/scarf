@@ -7,6 +7,7 @@ from scipy.sparse import csc_matrix
 
 from ...assay import Assay
 from ...storage.budget import ResourceBudget
+from ...storage.identity import CountSummary, finalize_counts
 from ...storage.count_matrix import (
     DEFAULT_COUNT_MATRIX_POLICY,
     CountMatrixPolicy,
@@ -58,7 +59,8 @@ def _meld_band_cost(
     destRows: int | None = None,
 ) -> int:
     dest_rows = int(source_rows) if destRows is None else max(1, int(destRows))
-    return _source_working_bytes(
+    # The writer keeps one yielded source batch while the next is produced.
+    return 2 * _source_working_bytes(
         source_rows,
         nSourceFeatures,
         sourceItemsize,
@@ -144,7 +146,7 @@ def create_counts_mat(
     *,
     idf_cell_idx: np.ndarray | None = None,
 ) -> None:
-    """Populate a melded count matrix in a Zarr array."""
+    """Populate and finalize a melded count matrix in a Zarr array."""
     n_docs = int(store.shape[0])
     n_source_features = int(mapping.shape[0])
     n_target_features = int(store.shape[1])
@@ -244,7 +246,8 @@ def create_counts_mat(
 
     shard_rows = array_shard_rows(store)
     store_itemsize = np.dtype(store.dtype).itemsize
-    resident_bytes = mapping_bytes + n_term_per_doc.nbytes + idf.nbytes
+    summary = CountSummary(store)
+    resident_bytes = mapping_bytes + n_term_per_doc.nbytes + idf.nbytes + summary.nbytes
     source_rows = _max_meld_band_rows(
         memoryBytes=int(assay.resources.memoryBytes),
         nDocs=n_docs,
@@ -254,7 +257,7 @@ def create_counts_mat(
         storeItemsize=store_itemsize,
         mappingBytes=mapping_bytes,
         decodeBytes=decode_bytes,
-        extraResidentBytes=n_term_per_doc.nbytes + idf.nbytes,
+        extraResidentBytes=n_term_per_doc.nbytes + idf.nbytes + summary.nbytes,
         preferredRows=min(int(assay.rawData.chunksize[0]), n_docs, shard_rows),
         maxRows=min(n_docs, shard_rows),
         destRows=shard_rows,
@@ -301,9 +304,14 @@ def create_counts_mat(
         store,
         block_stream(),
         resources=ResourceBudget(assay.resources.memoryBytes, 1),
+        residentBytes=resident_bytes,
+        producerReserveBytes=2 * (source_stream_resident - resident_bytes)
+        + decode_bytes,
         msg="Writing gene scores",
         io=getattr(assay, "storageIo", None),
+        countSummary=summary,
     )
+    finalize_counts(store, summary=summary)
 
 
 def coordinate_melding(
@@ -358,6 +366,7 @@ def coordinate_melding(
         extraResidentBytes=(
             n_cells * np.dtype(np.float64).itemsize
             + n_source_features * np.dtype(np.float64).itemsize
+            + CountSummary.nbytes_for(n_cells, n_target_features)
         ),
         preferredRows=min(int(assay.rawData.chunksize[0]), n_cells),
         maxRows=n_cells,

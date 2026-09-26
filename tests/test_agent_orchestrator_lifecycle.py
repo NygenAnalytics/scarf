@@ -67,7 +67,22 @@ def test_resume_preserves_selected_rna_workspace_and_original_metadata(
         orchestrator.load_request_for_resume(resume)
 
 
-def test_resume_rejects_changed_counts_model_and_execution_settings(tmp_path) -> None:
+def test_request_identity_binds_persisted_dataset_and_user_metadata(
+    tmp_path,
+) -> None:
+    _, store, record, _ = _saved_workflow(tmp_path / "rna.zarr")
+    data = record.inputIdentity["data"]
+    assert data["datasetFingerprint"] == store._ensure_dataset_fingerprint("RNA")
+    assert "countsSha256" not in data
+    assert "condition" in data["metadata"]
+    assert {"ids", "RNA_nCounts", "RNA_nFeatures"}.isdisjoint(data["metadata"])
+    assert "names" in data["featureMetadata"]
+    assert {"ids", "nCells", "dropOuts"}.isdisjoint(data["featureMetadata"])
+
+
+def test_resume_rejects_changed_dataset_model_and_execution_settings(
+    tmp_path,
+) -> None:
     orchestrator, store, record, resume = _saved_workflow(tmp_path / "rna.zarr")
     with pytest.raises(ValueError, match="model differs"):
         AgentOrchestrator("another-model").load_request_for_resume(resume)
@@ -76,8 +91,8 @@ def test_resume_rejects_changed_counts_model_and_execution_settings(tmp_path) ->
             "test-model", config=AutomatedWorkflowConfig(randomSeed=3)
         ).load_request_for_resume(resume)
     root = zarr.open_group(str(store.zarr_loc), mode="r+")
-    counts = root["RNA/counts"]
-    counts[0, 0] = int(counts[0, 0]) + 1
+    # Rebuilding the dataset from different counts publishes a new identity.
+    root["RNA"].attrs["dataset_fingerprint"] = "rebuilt-dataset"
     with pytest.raises(ValueError, match="Selected RNA data"):
         orchestrator.load_request_for_resume(resume)
     assert (

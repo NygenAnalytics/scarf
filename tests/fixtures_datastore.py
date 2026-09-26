@@ -1,4 +1,3 @@
-import os
 import shutil
 import tempfile
 
@@ -134,17 +133,6 @@ def _extract_zarr_fixture(tar_path: str, prefix: str) -> tuple[str, str]:
     temp_dir = tempfile.mkdtemp(prefix=prefix)
     with tarfile.open(tar_path, "r:gz") as tar:
         tar.extractall(temp_dir, filter="data")
-    if os.path.isfile(os.path.join(temp_dir, ".zgroup")) or os.path.isfile(
-        os.path.join(temp_dir, "zarr.json")
-    ):
-        return temp_dir, temp_dir
-    for name in sorted(os.listdir(temp_dir)):
-        candidate = os.path.join(temp_dir, name)
-        if os.path.isdir(candidate) and (
-            os.path.isfile(os.path.join(candidate, ".zgroup"))
-            or os.path.isfile(os.path.join(candidate, "zarr.json"))
-        ):
-            return temp_dir, candidate
     return temp_dir, temp_dir
 
 

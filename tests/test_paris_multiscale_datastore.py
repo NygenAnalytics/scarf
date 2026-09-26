@@ -25,7 +25,7 @@ from scarf.storage.artifacts import (
     make_provenance,
     new_artifact_id,
 )
-from scarf.storage.selections import resolve_selection_artifact
+from scarf.storage.selections import resolve_generated_selection_artifact
 from scarf.storage.budget import ResourceBudget
 
 
@@ -162,6 +162,8 @@ class _Store(_ClusteringOperationsMixin):
         self.load_graph_calls += 1
         return self.graphs[artifact_path(graph or self.graph_ref)]
 
+    _load_graph_artifact = load_graph
+
     @staticmethod
     def _col_renamer(from_assay: str, cell_key: str, label: str) -> str:
         if cell_key == "I":
@@ -179,7 +181,7 @@ class _Store(_ClusteringOperationsMixin):
         return self.cells.fetch(k, key=cell_key)
 
     def snapshot_cell_selection(self, cell_key: str = "I") -> ArtifactRef:
-        return resolve_selection_artifact(
+        return resolve_generated_selection_artifact(
             self.zw,
             scope="datastore",
             kind="cell_selection",
@@ -189,10 +191,7 @@ class _Store(_ClusteringOperationsMixin):
             parameters={},
             inputs={},
             source_column=cell_key,
-        )
-
-    def _graph_cell_selection(self, _graph: ArtifactRef) -> ArtifactRef:
-        return self.snapshot_cell_selection("I")
+        )[0]
 
     @staticmethod
     def _selection_artifacts_match(
@@ -207,7 +206,7 @@ def _resolve_graph(monkeypatch: pytest.MonkeyPatch) -> None:
     def cell_selection(root, _graph):
         values = np.asarray(root["cellData/I"][:], dtype=bool)
         row_ids = np.asarray(root["cellData/ids"][:])
-        return resolve_selection_artifact(
+        return resolve_generated_selection_artifact(
             root,
             scope="datastore",
             kind="cell_selection",
@@ -217,7 +216,7 @@ def _resolve_graph(monkeypatch: pytest.MonkeyPatch) -> None:
             parameters={},
             inputs={},
             source_column="I",
-        )
+        )[0]
 
     monkeypatch.setattr(
         "scarf.datastore._operations.clustering.graph_cell_selection",

@@ -294,7 +294,10 @@ def test_stability_markers_and_local_metric_reuse_are_separate_operations(
     monkeypatch.setattr(
         d, "_selected_feature_names", lambda *_: (np.arange(2), np.asarray(["A", "B"]))
     )
-    monkeypatch.setattr(d, "_aligned_metadata", lambda *_: np.tile(["d1", "d2"], 8))
+    monkeypatch.setattr(d, "_selection_indices", lambda *_: np.arange(16))
+    monkeypatch.setattr(
+        d, "_aligned_metadata", lambda *_, **__: np.tile(["d1", "d2"], 8)
+    )
     evaluation = example(ParameterCandidateEvaluation)
     evaluation.artifacts.update(
         {

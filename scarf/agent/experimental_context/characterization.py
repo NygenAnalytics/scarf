@@ -264,7 +264,8 @@ class _SelectionBoundCells:
         if cell_key != "I":
             raise ValueError("A bound metadata view accepts only its stored selection")
         requested = list(columns or ())
-        unknown = [column for column in requested if column not in self.columns]
+        available = set(self.columns) if requested else set()
+        unknown = [column for column in requested if column not in available]
         if unknown:
             raise KeyError(f"Metadata columns were not found: {unknown!r}")
         rows_per_block = (
@@ -1647,7 +1648,7 @@ def characterize_covariates(
         exclude=set(direction_map.get("excludeColumns") or []),
     )
     reviewed = len(candidates) + len(dropped)
-    candidates = [name for name in candidates if name in bound_store.cells.columns]
+    candidates = [name for name in candidates if name in available]
     kind_directions = dict(direction_map.get("columnKinds") or {})
     directed_coefficients = set(direction_map.get("coefficientsOfInterest") or [])
 

@@ -12,6 +12,7 @@ from scarf.metadata import MetaData
 from scarf.quality_control.doublets import write_doublet_target_zarr
 from scarf.storage.async_execution import reset_zarr_runtime_for_tests
 from scarf.storage.budget import ResourceBudget
+from scarf.storage.counts_t_contract import validate_count_matrix
 from scarf.storage.count_matrix import (
     COUNT_MATRIX_LAYOUT_KEY,
     CountMatrixPolicy,
@@ -19,6 +20,7 @@ from scarf.storage.count_matrix import (
     persist_count_matrix_plan,
     plan_count_matrix_pair,
 )
+from scarf.storage.identity import finalize_counts
 from scarf.storage.layout import ZarrArraySpec
 from scarf.storage.profiles import resolve_storage_profile
 from scarf.storage.sharding import counts_t_spec, write_counts_t
@@ -70,6 +72,7 @@ def _write_small_assay(
     else:
         counts = root["matrices/RNA/counts"]
     counts[:] = values
+    finalize_counts(counts)
     group = root["RNA"] if workspace is None else root["matrices/RNA"]
     write_counts_t(
         counts,
@@ -149,7 +152,7 @@ def test_write_counts_t_uses_paired_layout_from_source_plan():
     np.testing.assert_array_equal(counts_t[:], values.T)
 
 
-def test_assay_loads_counts_t_and_falls_back_when_incomplete():
+def test_assay_loads_counts_t_and_rejects_incomplete_data():
     root = _memory_root()
     values = np.arange(12, dtype=np.uint32).reshape(3, 4)
     _write_small_assay(root, workspace=None, values=values)
@@ -160,15 +163,15 @@ def test_assay_loads_counts_t_and_falls_back_when_incomplete():
     np.testing.assert_array_equal(assay.rawDataT[:], values.T)
 
     root["RNA/countsT"].attrs["complete"] = False
-    broken = Assay(root, None, "RNA", cells, nthreads=1)
-    assert broken.rawDataT is None
+    with pytest.raises(ValueError, match="incomplete"):
+        Assay(root, None, "RNA", cells, nthreads=1)
 
     root["RNA/countsT"].attrs["complete"] = "false"
-    string_flag = Assay(root, None, "RNA", cells, nthreads=1)
-    assert string_flag.rawDataT is None
+    with pytest.raises(ValueError, match="incomplete"):
+        Assay(root, None, "RNA", cells, nthreads=1)
 
 
-def test_assay_falls_back_on_wrong_shape_dtype_or_group_node():
+def test_assay_rejects_wrong_shape_dtype_or_group_node():
     root = _memory_root()
     values = np.arange(12, dtype=np.uint32).reshape(3, 4)
     _write_small_assay(root, workspace=None, values=values)
@@ -183,7 +186,8 @@ def test_assay_falls_back_on_wrong_shape_dtype_or_group_node():
         fill_value=0,
     )
     root["RNA/countsT"].attrs["complete"] = True
-    assert Assay(root, None, "RNA", cells, nthreads=1).rawDataT is None
+    with pytest.raises((ValueError, TypeError)):
+        Assay(root, None, "RNA", cells, nthreads=1)
 
     del root["RNA/countsT"]
     root["RNA"].create_array(
@@ -194,11 +198,13 @@ def test_assay_falls_back_on_wrong_shape_dtype_or_group_node():
         fill_value=0,
     )
     root["RNA/countsT"].attrs["complete"] = True
-    assert Assay(root, None, "RNA", cells, nthreads=1).rawDataT is None
+    with pytest.raises((ValueError, TypeError)):
+        Assay(root, None, "RNA", cells, nthreads=1)
 
     del root["RNA/countsT"]
     root["RNA"].create_group("countsT")
-    assert Assay(root, None, "RNA", cells, nthreads=1).rawDataT is None
+    with pytest.raises((ValueError, TypeError)):
+        Assay(root, None, "RNA", cells, nthreads=1)
 
 
 def test_rna_requires_strip_counts_t():
@@ -225,7 +231,7 @@ def test_rna_requires_strip_counts_t():
     assert stats["normed_tot"].shape == (3,)
 
     del root["RNA/countsT"]
-    with pytest.raises(ValueError, match="requires a complete sharded"):
+    with pytest.raises(ValueError, match="Required countsT matrix is missing"):
         RNAassay(root, "RNA", cells, workspace=None, nthreads=1)
 
 
@@ -474,6 +480,7 @@ def test_renormalize_subset_path_batches_features():
         workspace=None,
         nthreads=1,
     )
+    assay.prepare({"RNA_percentMito": None, "RNA_percentRibo": None})
     assay.sf = 1000.0
     frames = list(
         assay.iter_normed_feature_wise(
@@ -523,6 +530,7 @@ def test_coordinate_melding_leaves_counts_t_on_demand():
     n_cells_per_peak = (values > 0).sum(axis=0).astype(np.float64)
     cells.insert("ATAC_nFeatures", n_features, overwrite=True)
     cells.insert("ATAC_nCounts", n_counts, overwrite=True)
+    finalize_counts(root["ATAC/counts"])
     assay = Assay(root, None, "ATAC", cells, nthreads=1)
     assay.feats.insert("nCells", n_cells_per_peak, overwrite=True)
 
@@ -636,6 +644,7 @@ def test_explicit_assay_type_can_declare_custom_group_as_rna(tmp_path):
         dtype="uint32",
     )
     root["CUSTOM_NAME/counts"][:] = values
+    finalize_counts(root["CUSTOM_NAME/counts"])
     finalize_writer_counts_t(root, "CUSTOM_NAME", None, assay_type="RNA")
     assert root.attrs["assayTypes"]["CUSTOM_NAME"] == "RNA"
     assert root["CUSTOM_NAME/countsT"].attrs["complete"] is True
@@ -688,6 +697,7 @@ def _counts_array(
         counts[:] = values
     persist_count_matrix_plan(group, plan)
     persist_count_matrix_plan(counts, plan)
+    finalize_counts(counts)
     return group, counts
 
 
@@ -765,6 +775,30 @@ def test_write_counts_t_is_exact_and_complete():
     np.testing.assert_array_equal(counts_t[:], values.T)
 
 
+def test_write_counts_t_saves_exact_feature_set_totals():
+    from scarf.storage.identity import load_feature_sums
+
+    values = _dense_values(22, 7)
+    group, counts = _counts_array(
+        values, policy=CountMatrixPolicy(unitBytes=64, chunkBytes=16)
+    )
+    sets = [np.array([4, 0]), np.array([6]), np.arange(7)]
+    write_counts_t(
+        counts,
+        group,
+        resources=ResourceBudget(8 * 1024**3, 4),
+        featureSets=sets,
+    )
+    for features in sets:
+        np.testing.assert_array_equal(
+            load_feature_sums(group, counts, np.unique(features)),
+            values[:, features].sum(axis=1).astype(np.float64),
+        )
+    assert load_feature_sums(group, counts, np.array([0, 5])) is None
+    counts.attrs["content_fingerprint"] = "other counts"
+    assert load_feature_sums(group, counts, np.array([6])) is None
+
+
 def test_preflight_counts_t_spec_rejects_when_one_shard_cannot_fit():
     from scarf.storage.layout import ZarrArraySpec
     from scarf.storage.sharding import preflight_counts_t_spec
@@ -794,6 +828,7 @@ def test_write_counts_t_overwrite_leaves_no_stale_chunks():
         counts,
         group,
         resources=ResourceBudget(8 * 1024**3, 4),
+        overwrite=True,
     )
     stale = sorted(k for k in store._store_dict if k.startswith("RNA/countsT/c/"))
 
@@ -810,12 +845,14 @@ def test_write_counts_t_overwrite_leaves_no_stale_chunks():
         overwrite=True,
     )
     counts[:] = smaller
+    finalize_counts(counts)
     persist_count_matrix_plan(group, plan)
     persist_count_matrix_plan(counts, plan)
     counts_t = write_counts_t(
         counts,
         group,
         resources=ResourceBudget(8 * 1024**3, 4),
+        overwrite=True,
     )
 
     live = sorted(k for k in store._store_dict if k.startswith("RNA/countsT/c/"))
@@ -857,117 +894,83 @@ def test_repack_rebuilds_complete_counts_t(tmp_path):
     _write_small_assay(root, workspace=None, values=values)
     assert root["RNA/countsT"].attrs["complete"] is True
 
-    repack_store(str(src_path), str(dst_path), profile="fast_local")
+    repack_store(str(src_path), str(dst_path), profile="fast_local", data_only=True)
     dst = zarr.open_group(str(dst_path), mode="r")
     assert "countsT" in dst["RNA"]
     assert dst["RNA/countsT"].attrs["complete"] is True
     np.testing.assert_array_equal(dst["RNA/countsT"][:], values.T)
 
 
-def test_inspect_counts_t_reports_ready_and_missing(tmp_path):
-    from scarf.storage.counts_t_contract import inspect_counts_t
-
-    path = tmp_path / "inspect.zarr"
-    root = zarr.open_group(str(path), mode="w")
-    values = np.arange(12, dtype=np.uint32).reshape(3, 4)
-    _write_small_assay(root, workspace=None, values=values)
-    ready = inspect_counts_t(root, "RNA")
-    assert ready.status == "ready"
-    assert ready.assayType == "RNA"
-
-    del root["RNA/countsT"]
-    missing = inspect_counts_t(root, "RNA")
-    assert missing.status == "missing"
-
-
-def test_inspect_counts_t_reports_shape_dtype_mismatch(tmp_path):
-    from scarf.storage.counts_t_contract import inspect_counts_t
-
-    path = tmp_path / "mismatch.zarr"
-    root = zarr.open_group(str(path), mode="w")
-    values = np.arange(12, dtype=np.uint32).reshape(3, 4)
-    _write_small_assay(root, workspace=None, values=values)
-    del root["RNA/counts"]
-    root["RNA"].create_array(
-        "counts",
-        shape=(5, 4),
-        chunks=(5, 4),
-        dtype="uint32",
-        fill_value=0,
+def _replace_counts_t(group: zarr.Group, shape: tuple[int, int], dtype: str) -> None:
+    attrs = dict(group["countsT"].attrs)
+    del group["countsT"]
+    group.create_array("countsT", shape=shape, chunks=shape, dtype=dtype).attrs.update(
+        attrs
     )
-    mismatch = inspect_counts_t(root, "RNA")
-    assert mismatch.status == "shape-dtype-mismatch"
 
 
-def test_inspect_counts_t_reports_dtype_mismatch(tmp_path):
-    from scarf.storage.counts_t_contract import inspect_counts_t
-
-    path = tmp_path / "dtype-mismatch.zarr"
-    root = zarr.open_group(str(path), mode="w")
-    values = np.arange(12, dtype=np.uint32).reshape(3, 4)
-    _write_small_assay(root, workspace=None, values=values)
-    del root["RNA/counts"]
-    root["RNA"].create_array(
-        "counts",
-        shape=(3, 4),
-        chunks=(3, 4),
-        dtype="uint16",
-        fill_value=0,
-    )
-    mismatch = inspect_counts_t(root, "RNA")
-    assert mismatch.status == "shape-dtype-mismatch"
+def _drop_layout(group: zarr.Group) -> None:
+    for node in (group, group["counts"], group["countsT"]):
+        del node.attrs[COUNT_MATRIX_LAYOUT_KEY]
 
 
-def test_inspect_counts_t_reports_missing_layout_metadata(tmp_path):
-    from scarf.storage.counts_t_contract import inspect_counts_t
-
-    path = tmp_path / "missing-layout.zarr"
-    root = zarr.open_group(str(path), mode="w")
-    values = np.arange(12, dtype=np.uint32).reshape(3, 4)
-    _write_small_assay(root, workspace=None, values=values)
-    for node in (root["RNA"], root["RNA/counts"], root["RNA/countsT"]):
-        if COUNT_MATRIX_LAYOUT_KEY in node.attrs:
-            del node.attrs[COUNT_MATRIX_LAYOUT_KEY]
-    missing = inspect_counts_t(root, "RNA")
-    assert missing.status == "missing-layout-metadata"
-    assert "Rebuild" in missing.reason or "repack" in missing.reason.lower()
-
-
-def test_inspect_counts_t_reports_layout_mismatch(tmp_path):
-    from scarf.storage.counts_t_contract import inspect_counts_t
-
-    path = tmp_path / "layout-mismatch.zarr"
-    root = zarr.open_group(str(path), mode="w")
-    values = np.arange(12, dtype=np.uint32).reshape(3, 4)
-    _write_small_assay(root, workspace=None, values=values)
-    payload = dict(root["RNA/countsT"].attrs[COUNT_MATRIX_LAYOUT_KEY])
+def _disagree_layout(group: zarr.Group) -> None:
+    payload = dict(group["countsT"].attrs[COUNT_MATRIX_LAYOUT_KEY])
     payload["fingerprint"] = "wrong"
-    root["RNA/countsT"].attrs[COUNT_MATRIX_LAYOUT_KEY] = payload
-    mismatch = inspect_counts_t(root, "RNA")
-    assert mismatch.status == "layout-mismatch"
-    assert "Rebuild" in mismatch.reason or "repack" in mismatch.reason.lower()
+    group["countsT"].attrs[COUNT_MATRIX_LAYOUT_KEY] = payload
 
 
-def test_inspect_counts_t_reports_retired_layout_keys(tmp_path):
-    from scarf.storage.counts_t_contract import inspect_counts_t
-
-    path = tmp_path / "retired-keys.zarr"
-    root = zarr.open_group(str(path), mode="w")
-    values = np.arange(12, dtype=np.uint32).reshape(3, 4)
-    _write_small_assay(root, workspace=None, values=values)
-    retired = {
-        "targetReadUnitBytes": 1_000_000_000,
-        "targetChunkBytes": 100_000_000,
-    }
-    for node in (root["RNA"], root["RNA/counts"], root["RNA/countsT"]):
-        node.attrs[COUNT_MATRIX_LAYOUT_KEY] = retired
-    missing = inspect_counts_t(root, "RNA")
-    assert missing.status == "missing-layout-metadata"
-    assert "retired" in missing.reason.lower() or "Rebuild" in missing.reason
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        (lambda group: group.__delitem__("countsT"), "countsT matrix is missing"),
+        (
+            lambda group: group["countsT"].attrs.update({"complete": False}),
+            "countsT is incomplete",
+        ),
+        (
+            lambda group: group["countsT"].attrs.update({"source_fingerprint": "old"}),
+            "does not match finalized counts",
+        ),
+        (
+            lambda group: _replace_counts_t(group, (5, 3), "uint32"),
+            "countsT is incomplete",
+        ),
+        (
+            lambda group: _replace_counts_t(group, (4, 3), "uint16"),
+            "countsT is incomplete",
+        ),
+        (
+            lambda group: group["counts"].attrs.update({"complete": False}),
+            "Raw counts are not finalized",
+        ),
+        (_drop_layout, "layout metadata is missing"),
+        (_disagree_layout, "does not agree"),
+    ],
+    ids=[
+        "missing",
+        "incomplete",
+        "stale-source",
+        "shape",
+        "dtype",
+        "unfinalized-counts",
+        "missing-layout",
+        "disagreeing-layout",
+    ],
+)
+def test_count_matrix_validation_rejects_each_damaged_component(damage, message):
+    root = _memory_root()
+    _write_small_assay(
+        root, workspace=None, values=np.arange(12, dtype=np.uint32).reshape(3, 4)
+    )
+    validate_count_matrix(root["RNA"], require_transpose=True)
+    damage(root["RNA"])
+    with pytest.raises(ValueError, match=message):
+        validate_count_matrix(root["RNA"], require_transpose=True)
 
 
 def test_assess_counts_t_reuse_outcomes(tmp_path):
-    from scarf.merge.writer import assess_counts_t_reuse, validate_counts_t
+    from scarf.merge.writer import assess_counts_t_reuse
 
     path = tmp_path / "reuse.zarr"
     root = zarr.open_group(str(path), mode="w")
@@ -978,10 +981,7 @@ def test_assess_counts_t_reuse_outcomes(tmp_path):
         root, "RNA", None, n_cells=3, n_features=4, dtype="uint32"
     )
     assert ok.outcome == "reusable"
-    assert (
-        validate_counts_t(root, "RNA", None, n_cells=3, n_features=4, dtype="uint32")
-        is None
-    )
+    assert ok.reason is None
 
     root["RNA/countsT"].attrs["complete"] = False
     incomplete = assess_counts_t_reuse(
@@ -1040,6 +1040,7 @@ def test_assess_counts_t_reuse_keeps_non_default_unit(tmp_path):
     )
     counts = root["RNA/counts"]
     counts[:] = values
+    finalize_counts(counts)
     write_counts_t(
         counts,
         root["RNA"],
@@ -1094,39 +1095,13 @@ def test_subset_preserves_gene_activity_alias(tmp_path):
     assert subset_root["GeneActivity/countsT"].attrs["complete"] is True
 
 
-def test_inspect_counts_t_reports_not_rna_incomplete_and_zarr_v2() -> None:
-    from scarf.storage.counts_t_contract import inspect_counts_t
+def test_seed_assay_type_is_idempotent() -> None:
     from scarf.writers.counts_t import seed_assay_type
 
     root = zarr.open_group(store=MemoryStore(), mode="w")
-    missing = inspect_counts_t(root, "RNA")
-    assert missing.status == "missing"
-    typed = inspect_counts_t(root, "RNA", assay_type="ADT")
-    assert typed.status == "not-rna"
-    group = root.create_group("RNA")
-    group.create_array(
-        "countsT",
-        shape=(4, 3),
-        chunks=(2, 3),
-        shards=(2, 3),
-        dtype=np.uint16,
-    )
-    incomplete = inspect_counts_t(root, "RNA")
-    assert incomplete.status == "incomplete"
     seed_assay_type(root, "RNA", None, "RNA")
     seed_assay_type(root, "RNA", None, "RNA")
-    assert root.attrs["assayTypes"]["RNA"] == "RNA"
-    v2 = zarr.open_group(store=MemoryStore(), mode="w", zarr_format=2)
-    v2_group = v2.create_group("RNA")
-    v2_counts_t = v2_group.create_array(
-        "countsT",
-        shape=(4, 3),
-        chunks=(4, 3),
-        dtype=np.uint16,
-    )
-    v2_counts_t.attrs["complete"] = True
-    seed_assay_type(v2, "RNA", None, "RNA")
-    assert inspect_counts_t(v2, "RNA").status == "zarr-v2"
+    assert root.attrs["assayTypes"] == {"RNA": "RNA"}
 
 
 def test_paired_layout_predicates_and_preflight_failures() -> None:
@@ -1193,6 +1168,10 @@ def test_paired_layout_predicates_and_preflight_failures() -> None:
         SparseShardBuffer(dest, startRow=3, endRow=1)
     empty = SparseShardBuffer(dest, startRow=2, endRow=2)
     assert empty.rows == 2
+    # An empty window that never received a batch has no trailing band.
+    assert list(empty.finish()) == []
+    no_rows = root.create_array("empty", shape=(0, 2), chunks=(1, 2), dtype=np.uint32)
+    assert list(SparseShardBuffer(no_rows).finish()) == []
 
 
 def test_counts_t_matches_plan_rejects_incomplete_or_stale_layout() -> None:
@@ -1219,10 +1198,19 @@ def test_counts_t_matches_plan_rejects_incomplete_or_stale_layout() -> None:
     assert _counts_t_matches_plan(incomplete, plan) is False
 
 
-def test_validate_counts_t_returns_reason_when_missing() -> None:
-    from scarf.merge.writer import validate_counts_t
+def test_assess_counts_t_reuse_returns_reason_when_missing() -> None:
+    from scarf.merge.writer import assess_counts_t_reuse
 
     root = zarr.open_group(store=MemoryStore(), mode="w")
-    assert validate_counts_t(root, "RNA", None, n_cells=3, n_features=4, dtype="uint16")
+    missing_group = assess_counts_t_reuse(
+        root, "RNA", None, n_cells=3, n_features=4, dtype="uint16"
+    )
+    assert missing_group.outcome == "incomplete"
+    assert missing_group.reason == "matrix group 'RNA' is missing"
+
     root.create_group("RNA")
-    assert validate_counts_t(root, "RNA", None, n_cells=3, n_features=4, dtype="uint16")
+    missing_array = assess_counts_t_reuse(
+        root, "RNA", None, n_cells=3, n_features=4, dtype="uint16"
+    )
+    assert missing_array.outcome == "incomplete"
+    assert missing_array.reason == "countsT is missing for 'RNA'"

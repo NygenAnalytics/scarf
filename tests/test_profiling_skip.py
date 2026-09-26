@@ -114,26 +114,6 @@ def test_bound_cluster_source_preserves_the_explicit_artifact() -> None:
     assert workflow.clusterSourceArtifactId == "d" * 64
 
 
-def test_existing_error_result_is_terminal(monkeypatch) -> None:
-    config = load_profiling_config(_EXAMPLE_CONFIG)
-    payload = {
-        "stage": "createStore",
-        "nRows": 10_000,
-        "status": "error",
-        "error": "boom",
-    }
-    monkeypatch.setattr(
-        "profiling.results.object_exists",
-        lambda uri: uri.endswith("/results/10000/createStore.json"),
-    )
-    monkeypatch.setattr("profiling.results.get_json", lambda uri: payload)
-    from profiling.results import existing_error_result
-
-    failed = existing_error_result(config, 10_000, "createStore")
-    assert failed == payload
-    assert existing_error_result(config, 10_000, "filterCells") is None
-
-
 def test_result_exists_skips_when_object_present(monkeypatch):
     config = load_profiling_config(_EXAMPLE_CONFIG)
     monkeypatch.setattr(
@@ -167,6 +147,7 @@ def test_stage_run_result_json_shape():
         operationIncrementalPeakBytes=1024,
         operationPeakSource="cgroupMemoryCurrent",
         cgroupPeakScope="operation",
+        submissionId="testsubmission",
     )
     payload = result.to_json()
     assert payload["stage"] == "reopenStore"

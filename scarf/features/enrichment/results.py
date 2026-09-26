@@ -4,6 +4,7 @@ import numpy as np
 
 from ...matrix import ChunkedArray
 from ...storage.refs import ArtifactRef
+from ...utils.arrays import has_duplicates
 
 __all__ = ["EnrichmentResult"]
 
@@ -75,9 +76,9 @@ class EnrichmentResult:
             raise ValueError("Enrichment source names do not align with score columns")
         if len(self.source_names) != len(self.source_sizes):
             raise ValueError("Enrichment source names and sizes must be aligned")
-        if np.unique(self.source_names).size != len(self.source_names):
+        if has_duplicates(self.source_names):
             raise ValueError("Enrichment source names must be unique")
-        if np.unique(self.cell_index).size != len(self.cell_index):
+        if has_duplicates(self.cell_index):
             raise ValueError("Enrichment cell indices must be unique")
         if np.any(self.source_sizes <= 0):
             raise ValueError("Enrichment source sizes must be positive")

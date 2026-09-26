@@ -17,15 +17,18 @@ from .artifact_writer import (
 from .artifacts import (
     ArtifactRef,
     ArtifactStatus,
+    ValueFingerprintBuilder,
     artifact_group,
     fingerprint_stored_arrays,
     fingerprint_stored_strings,
     inspect_artifact,
+    open_artifact,
 )
 from .errors import ArtifactResolutionError
 from .geometry import array_geometry
 from .partition import row_band
 from .types import as_zarr_array, as_zarr_group
+from .validation_scope import store_key, validated_once
 from .refs import ExternalArtifactRef
 from .selections import (
     validate_run_metadata_snapshot,
@@ -34,16 +37,16 @@ from .selections import (
 
 
 @dataclass(frozen=True, slots=True)
-class _ValidatedFeatureSelection:
+class ValidatedFeatureSelection:
     ref: ArtifactRef
     values: zarr.Array
     operation: str
+    mask: np.ndarray
 
 
-def _ordered_feature_ids_fingerprint(assay: Any) -> str:
-    feature_data = as_zarr_group(assay.z["featureData"], name="featureData")
+def _ordered_feature_ids_fingerprint(assay: zarr.Group) -> str:
     return fingerprint_stored_strings(
-        as_zarr_array(feature_data["ids"], name="featureData/ids")
+        as_zarr_array(assay["featureData/ids"], name="featureData/ids")
     )
 
 
@@ -169,29 +172,32 @@ def _ref_context(ref: ArtifactRef, *, assay: str) -> dict[str, str | None]:
     }
 
 
-def _feature_data(root: zarr.Group, assay: str) -> zarr.Group:
+def _feature_ids(root: zarr.Group, assay: str) -> zarr.Array:
+    """Open an assay's feature IDs in one read; explain what is missing if absent."""
     path = f"{assay}/featureData"
-    if path not in root:
+    try:
+        return as_zarr_array(root[f"{path}/ids"], name=f"{path}/ids")
+    except KeyError:
+        pass
+    try:
+        as_zarr_group(root[path], name=path)
+    except KeyError:
         raise ArtifactResolutionError(
             f"Assay {assay!r} has no feature metadata table",
             code="wrong_assay",
             context={"assay": assay},
-        )
-    try:
-        feature_data = as_zarr_group(root[path], name=path)
+        ) from None
     except TypeError as exc:
         raise ArtifactResolutionError(
             f"Assay {assay!r} has an invalid feature metadata table",
             code="corrupt_payload",
             context={"assay": assay},
         ) from exc
-    if "ids" not in feature_data:
-        raise ArtifactResolutionError(
-            f"Assay {assay!r} has no feature row identifiers",
-            code="row_mismatch",
-            context={"assay": assay},
-        )
-    return feature_data
+    raise ArtifactResolutionError(
+        f"Assay {assay!r} has no feature row identifiers",
+        code="row_mismatch",
+        context={"assay": assay},
+    )
 
 
 def _validate_ref_scope(ref: ArtifactRef, assay: str) -> None:
@@ -214,23 +220,6 @@ def _validate_ref_scope(ref: ArtifactRef, assay: str) -> None:
             code="wrong_assay",
             context=context,
         )
-
-
-def _payload_names(group: zarr.Group) -> tuple[str, ...]:
-    names = tuple(group.array_keys())
-    allowed = {"values", "corrected_variance"}
-    unexpected = set(names) - allowed
-    if unexpected:
-        raise ArtifactResolutionError(
-            "Feature selection contains unexpected payload arrays",
-            code="corrupt_payload",
-            context={"arrays": ",".join(sorted(unexpected))},
-        )
-    return (
-        ("values", "corrected_variance")
-        if "corrected_variance" in names
-        else ("values",)
-    )
 
 
 _FEATURE_SELECTION_CONTRACTS = {
@@ -356,10 +345,21 @@ def _validate_feature_summary_parent(
         )
     parameter_names, payload_names = expected
     if set(status.parameters or {}) != parameter_names or set(status.inputs or {}) != {
-        "cell_selection"
+        "cell_selection",
+        "dataset_fingerprint",
     }:
         raise ArtifactResolutionError(
             "Feature-summary provenance does not match its operation",
+            code="corrupt_payload",
+            context=context,
+        )
+    from .identity import read_dataset_fingerprint
+
+    if (status.inputs or {}).get("dataset_fingerprint") != read_dataset_fingerprint(
+        as_zarr_group(root[assay], name=assay)
+    ):
+        raise ArtifactResolutionError(
+            "Feature summary does not match the current prepared dataset",
             code="corrupt_payload",
             context=context,
         )
@@ -403,28 +403,21 @@ def _validate_feature_summary_parent(
         assay=None,
         table_path="cellData",
     )
-    feature_data = _feature_data(root, assay)
-    ids = as_zarr_array(feature_data["ids"], name=f"{assay}/featureData/ids")
+    ids = _feature_ids(root, assay)
     group = artifact_group(root, ref)
-    if set(group.array_keys()) != set(payload_names):
+    # One listing opens every payload array; reuse them below.
+    stored = dict(group.arrays())
+    if set(stored) != set(payload_names):
         raise ArtifactResolutionError(
             "Feature-summary payload arrays do not match its operation",
             code="corrupt_payload",
             context=context,
         )
-    try:
-        arrays = [as_zarr_array(group[name], name=name) for name in payload_names]
-    except (KeyError, TypeError) as exc:
-        raise ArtifactResolutionError(
-            "Feature-summary payload is malformed",
-            code="corrupt_payload",
-            context=context,
-        ) from exc
     if any(
-        array.ndim != 1
-        or array.shape != ids.shape
-        or np.dtype(array.dtype) != np.dtype(np.float64)
-        for array in arrays
+        stored[name].ndim != 1
+        or stored[name].shape != ids.shape
+        or np.dtype(stored[name].dtype) != np.dtype(np.float64)
+        for name in payload_names
     ):
         raise ArtifactResolutionError(
             "Feature-summary arrays do not align with assay features",
@@ -440,7 +433,9 @@ def _validate_feature_summary_parent(
             context=context,
         )
     try:
-        payload_fingerprint = fingerprint_stored_arrays(group, payload_names)
+        payload_fingerprint = fingerprint_stored_arrays(
+            group, payload_names, arrays=stored
+        )
     except (KeyError, TypeError, ValueError) as exc:
         raise ArtifactResolutionError(
             "Feature-summary payload is malformed",
@@ -476,6 +471,17 @@ def _validate_feature_selection_provenance(
     input_names, parameter_names, payload_names = contract
     inputs = status.inputs or {}
     parameters = status.parameters or {}
+    if status.operation == "create_all_features":
+        from .identity import read_dataset_fingerprint
+
+        if parameters.get("dataset_fingerprint") != read_dataset_fingerprint(
+            as_zarr_group(root[assay], name=assay)
+        ):
+            raise ArtifactResolutionError(
+                "Feature selection does not match the current prepared dataset",
+                code="corrupt_payload",
+                context=context,
+            )
     if status.operation == "select_hvgs" and "blacklist_fingerprint" in parameters:
         fingerprint = parameters["blacklist_fingerprint"]
         if (
@@ -537,7 +543,7 @@ def _validate_feature_selection_provenance(
                 code="corrupt_payload",
                 context=context,
             )
-        validated = _validate_feature_selection(
+        validated = validate_feature_selection(
             root,
             assay,
             all_features,
@@ -607,14 +613,14 @@ def _validate_feature_selection_provenance(
     return payload_names
 
 
-def _validate_feature_selection(
+def validate_feature_selection(
     root: zarr.Group,
     assay: str,
     ref: ArtifactRef,
     *,
     seen: set[ArtifactRef] | None = None,
     row_fingerprint: str | None = None,
-) -> _ValidatedFeatureSelection:
+) -> ValidatedFeatureSelection:
     _validate_ref_scope(ref, assay)
     context = _ref_context(ref, assay=assay)
     if seen is None:
@@ -626,20 +632,43 @@ def _validate_feature_selection(
             context=context,
         )
     seen.add(ref)
+    return validated_once(
+        ("feature_selection", *store_key(root), assay, ref),
+        lambda: _validate_feature_selection(
+            root,
+            assay,
+            ref,
+            context=context,
+            seen=seen,
+            row_fingerprint=row_fingerprint,
+        ),
+    )
+
+
+def _validate_feature_selection(
+    root: zarr.Group,
+    assay: str,
+    ref: ArtifactRef,
+    *,
+    context: dict[str, str | None],
+    seen: set[ArtifactRef],
+    row_fingerprint: str | None,
+) -> ValidatedFeatureSelection:
     try:
-        status = inspect_artifact(root, ref)
+        status, opened = open_artifact(root, ref)
     except (KeyError, TypeError, ValueError) as exc:
         raise ArtifactResolutionError(
             "Feature selection artifact record is malformed",
             code="corrupt_payload",
             context=context,
         ) from exc
-    if not status.exists:
+    if opened is None:
         raise ArtifactResolutionError(
             "Feature selection artifact does not exist",
             code="missing_artifact",
             context=context,
         )
+    group = opened
     if not status.complete:
         raise ArtifactResolutionError(
             "Feature selection artifact is incomplete",
@@ -647,10 +676,8 @@ def _validate_feature_selection(
             context=context,
         )
 
-    feature_data = _feature_data(root, assay)
+    ids = _feature_ids(root, assay)
     try:
-        ids = as_zarr_array(feature_data["ids"], name=f"{assay}/featureData/ids")
-        group = artifact_group(root, ref)
         values = as_zarr_array(group["values"], name="values")
     except (KeyError, TypeError) as exc:
         raise ArtifactResolutionError(
@@ -700,7 +727,25 @@ def _validate_feature_selection(
             seen=seen,
             row_fingerprint=current_rows,
         )
-        actual_payload = fingerprint_stored_arrays(group, payload_names)
+        mask = np.empty(values.shape, dtype=bool)
+        builder = ValueFingerprintBuilder()
+        builder.begin_array("values", values.shape, values.dtype)
+        rows = row_band(array_geometry(values), unit="chunk", fallback=1)
+        for start in range(0, values.shape[0], rows):
+            block = np.asarray(values[start : start + rows], dtype=bool)
+            mask[start : start + len(block)] = block
+            builder.update_array_block("values", (start,), block)
+        builder.end_array("values")
+        for name in payload_names[1:]:
+            array = as_zarr_array(group[name], name=name)
+            builder.begin_array(name, array.shape, array.dtype)
+            rows = row_band(array_geometry(array), unit="chunk", fallback=1)
+            for start in range(0, array.shape[0], rows):
+                builder.update_array_block(
+                    name, (start,), np.asarray(array[start : start + rows])
+                )
+            builder.end_array(name)
+        actual_payload = builder.hexdigest()
     except (KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, ArtifactResolutionError):
             raise
@@ -741,16 +786,15 @@ def _validate_feature_selection(
                 code="row_mismatch",
                 context=context,
             )
-        block_rows = row_band(array_geometry(values), unit="chunk", fallback=1)
-        for start in range(0, int(values.shape[0]), block_rows):
-            stop = min(start + block_rows, int(values.shape[0]))
-            if not bool(np.asarray(values[start:stop], dtype=bool).all()):
-                raise ArtifactResolutionError(
-                    "Feature universe must select every feature",
-                    code="corrupt_payload",
-                    context=context,
-                )
-    return _ValidatedFeatureSelection(ref=ref, values=values, operation=operation)
+        if not mask.all():
+            raise ArtifactResolutionError(
+                "Feature universe must select every feature",
+                code="corrupt_payload",
+                context=context,
+            )
+    return ValidatedFeatureSelection(
+        ref=ref, values=values, operation=operation, mask=mask
+    )
 
 
 def resolve_feature_selection(
@@ -761,7 +805,7 @@ def resolve_feature_selection(
     """Validate and return one explicit feature-selection artifact."""
     if not isinstance(features, ArtifactRef):
         raise TypeError("features must be an ArtifactRef")
-    return _validate_feature_selection(root, assay, features).ref
+    return validate_feature_selection(root, assay, features).ref
 
 
 def read_feature_selection_indices(
@@ -770,7 +814,7 @@ def read_feature_selection_indices(
     features: ArtifactRef,
 ) -> np.ndarray:
     """Read selected feature indices without materializing the full mask."""
-    validated = _validate_feature_selection(root, assay, features)
+    validated = validate_feature_selection(root, assay, features)
     values = validated.values
     block_rows = row_band(array_geometry(values), unit="chunk", fallback=1)
     selected: list[np.ndarray] = []

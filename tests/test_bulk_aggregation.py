@@ -155,7 +155,9 @@ def test_bulk_mean_uses_stored_totals_and_preserves_zero_total_behavior(
     counts = np.array([[100, 10], [200, 20], [0, 0]], dtype=np.uint16)
     store, cells = _bulk_store(tmp_path, counts, workers=workers)
     store.cells.insert("group", np.array(["a", "b", "b"]))
-    store.cells.insert("RNA_nCounts", np.array([220, 220, 0]), overwrite=True)
+    store.zw["cellData"].create_array(
+        "RNA_nCounts", data=np.array([220, 220, 0]), overwrite=True
+    )
     actual, fractions = store.make_bulk(
         "group",
         cell_selection=cells,

@@ -275,10 +275,59 @@ def test_storage_has_no_upward_dependencies():
         _upward_imports(
             "storage",
             {"assay", "datastore", "plotting", "writers"},
-            allowed_modules=frozenset({"assay.classification"}),
         )
         == set()
     )
+
+
+def test_storage_functions_do_not_hide_assays_behind_unrestricted_arguments():
+    violations = []
+    for path in (_SCARF_ROOT / "storage").glob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            for argument in (
+                *node.args.posonlyargs,
+                *node.args.args,
+                *node.args.kwonlyargs,
+            ):
+                if argument.arg not in {"assay", "datastore"}:
+                    continue
+                annotation = (
+                    ast.unparse(argument.annotation) if argument.annotation else ""
+                )
+                if annotation not in {"str", "str | None", "zarr.Group"}:
+                    violations.append((path.name, node.name, argument.arg, annotation))
+    assert violations == []
+    forbidden_attributes = {"rawData", "rawDataT", "normed", "normMethod", "_get_assay"}
+    for path in (_SCARF_ROOT / "storage").glob("*.py"):
+        assert not any(
+            isinstance(node, ast.Attribute) and node.attr in forbidden_attributes
+            for node in ast.walk(ast.parse(path.read_text()))
+        ), str(path)
+
+
+def test_execution_uses_one_resolved_contract_and_normalization_has_one_owner():
+    from scarf.storage.execution import OperationPlan
+    from scarf.storage.async_execution import AsyncStorageRunner
+    import inspect
+
+    assert (
+        inspect.signature(AsyncStorageRunner).parameters["operation"].annotation
+        is OperationPlan
+    )
+    for path in (_SCARF_ROOT / "storage").glob("*.py"):
+        tree = ast.parse(path.read_text())
+        assert not any(
+            isinstance(node, ast.ClassDef)
+            and node.name in {"ExecutionPlan", "StreamAdmission"}
+            for node in ast.walk(tree)
+        )
+        assert not any(
+            isinstance(node, ast.FunctionDef)
+            and node.name == "write_renorm_subset_to_zarr"
+            for node in ast.walk(tree)
+        )
 
 
 def test_matrix_has_no_domain_or_orchestration_dependencies():
@@ -431,10 +480,13 @@ def test_metrics_and_embedding_harmony_avoid_runtime_orchestration_and_io_import
 
 
 def test_pca_and_lsi_implementations_live_under_embeddings():
-    neighbor_source = (_SCARF_ROOT / "neighbors" / "stream.py").read_text()
+    neighbor_sources = [
+        path.read_text() for path in (_SCARF_ROOT / "neighbors").glob("*.py")
+    ]
     reduction_source = (_SCARF_ROOT / "embeddings" / "reduction.py").read_text()
 
-    assert "sklearn.decomposition" not in neighbor_source
+    assert neighbor_sources
+    assert not any("sklearn.decomposition" in source for source in neighbor_sources)
     assert "IncrementalPCA" in reduction_source
     assert "TruncatedSVD" in reduction_source
 
@@ -446,7 +498,6 @@ def test_extracted_domains_have_only_narrow_storage_dependencies():
             "aggregation.py",
             "enrichment/results.py",
             "genomic/melding.py",
-            "markers/batching.py",
             "markers/search.py",
             "statistical.py",
         },
@@ -733,7 +784,9 @@ def test_compatibility_only_modules_are_removed():
         _SCARF_ROOT / "metadata.py",
         _SCARF_ROOT / "metrics.py",
         _SCARF_ROOT / "neighbors" / "persistence.py",
+        _SCARF_ROOT / "neighbors" / "stream.py",
         _SCARF_ROOT / "features" / "lowess.py",
+        _SCARF_ROOT / "features" / "markers" / "batching.py",
         _SCARF_ROOT / "clustering" / "_paris_mdl.py",
         _SCARF_ROOT / "clustering" / "feature_graph.py",
         _SCARF_ROOT / "clustering" / "hierarchy.py",
@@ -766,6 +819,8 @@ def test_retired_root_import_paths_do_not_resolve():
         "scarf.clustering.feature_graph",
         "scarf.clustering.hierarchy",
         "scarf.features.lowess",
+        "scarf.features.markers.batching",
+        "scarf.neighbors.stream",
         "scarf.graph.imported_storage",
         "scarf.trajectory.aggregation",
         "scarf.lineage",
@@ -858,7 +913,6 @@ assert "scarf.features.enrichment.waggr" not in sys.modules
 
 _ = features.find_markers_by_rank
 assert "scarf.features.markers.search" in sys.modules
-assert "scarf.features.markers.batching" not in sys.modules
 
 _ = features.compare_group_distributions
 assert "scarf.features.statistical" in sys.modules
@@ -967,7 +1021,6 @@ def test_reader_implementations_are_runtime_isolated():
         "readers.seurat",
     }
     reader_edges = {
-        "readers.cellranger": {"readers.mtx"},
         "readers.mtx": {"readers.cellranger"},
         "readers.seurat": {
             "readers._rds",
@@ -1054,7 +1107,7 @@ def test_writer_implementations_are_runtime_isolated():
 
     forbidden_roots = {"assay", "datastore", "mapping", "merge", "plotting"}
     # Shared RNA classifier is the intentional write/load boundary for countsT.
-    allowed_assay_imports = {"assay.classification"}
+    allowed_assay_imports = {"assay.classification", "assay.normalization"}
     format_modules = {
         "writers.cellranger",
         "writers.csv",

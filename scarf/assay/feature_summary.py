@@ -22,6 +22,7 @@ from ..storage.artifacts import (
 )
 from ..storage.errors import ArtifactResolutionError
 from ..storage.selections import validate_stored_selection_integrity
+from ..storage.identity import read_dataset_fingerprint
 from ..storage.types import as_zarr_array, as_zarr_group
 
 if TYPE_CHECKING:
@@ -114,6 +115,7 @@ def ensure_feature_summary(
     operation = getattr(assay, "_feature_summary_operation", None)
     if log_transform and operation != "summarize_rna_features":
         raise TypeError("Log-transformed feature summaries require an RNA assay")
+    dataset_fingerprint = read_dataset_fingerprint(assay.z)
     cell_mask = _selection_mask(root, cell_selection, n_cells=assay.cells.N)
     cell_idx = np.flatnonzero(cell_mask).astype(np.int64, copy=False)
     n_features = int(assay.feats.N)
@@ -154,7 +156,10 @@ def ensure_feature_summary(
         kind="feature_summary",
         operation=operation,
         parameters=parameters,
-        inputs={"cell_selection": cell_selection},
+        inputs={
+            "cell_selection": cell_selection,
+            "dataset_fingerprint": dataset_fingerprint,
+        },
         execution_options={"nthreads": assay.nthreads},
         invalidate_cache=invalidate_cache,
         required_arrays=arrays,

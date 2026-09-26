@@ -1,5 +1,6 @@
 import os
 from collections.abc import Generator
+from contextlib import closing
 from tempfile import TemporaryFile
 from typing import TYPE_CHECKING, Any, BinaryIO, cast
 
@@ -361,7 +362,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             batch_codes=batch_codes,
             batch_design=batch_design,
         )
-        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay)
+        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay.z)
         stream = AlignedFeatureStream(
             query_assay=assay,
             query_cell_indices=query_cell_indices,
@@ -373,7 +374,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             reserved_resident_bytes=reserved_resident,
             reserved_per_row_bytes=reserved_per_row,
         )
-        if _ordered_feature_ids_fingerprint(assay) != feature_ids_fingerprint:
+        if _ordered_feature_ids_fingerprint(assay.z) != feature_ids_fingerprint:
             raise ValueError("Query feature identities changed during mapping setup")
         selected_expression_fingerprint = stream.raw_expression_fingerprint
 
@@ -436,31 +437,32 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         def projected_blocks() -> Generator[tuple[int, np.ndarray], None, None]:
             nonlocal dispersion_total, informative_total, zero_norm_count
             expected_start = 0
-            for block in stream:
-                if block.row_offset != expected_start:
-                    raise RuntimeError("Aligned query blocks are not contiguous")
-                coordinates = project_pca(block.values, reference.model)
-                uninformative = zero_norm_rows(coordinates)
-                zero_norm_count += int(np.count_nonzero(uninformative))
-                informative = ~uninformative
-                if informative.any():
-                    dispersion_total += scaled_dispersion_sum(
-                        block.values[informative], reference.model
-                    )
-                    informative_total += int(np.count_nonzero(informative))
-                expected_start += len(coordinates)
-                yield block.row_offset, coordinates
+            with closing(stream.iter_blocks()) as blocks:
+                for block in blocks:
+                    if block.row_offset != expected_start:
+                        raise RuntimeError("Aligned query blocks are not contiguous")
+                    coordinates = project_pca(block.values, reference.model)
+                    uninformative = zero_norm_rows(coordinates)
+                    zero_norm_count += int(np.count_nonzero(uninformative))
+                    informative = ~uninformative
+                    if informative.any():
+                        dispersion_total += scaled_dispersion_sum(
+                            block.values[informative], reference.model
+                        )
+                        informative_total += int(np.count_nonzero(informative))
+                    expected_start += len(coordinates)
+                    yield block.row_offset, coordinates
             if expected_start != n_cells:
                 raise RuntimeError("Mapping did not cover all selected query cells")
 
         coordinates_file: BinaryIO | None = None
+        coordinate_blocks = projected_blocks()
         try:
             neighbor_query = _load_reference_neighbor_query(
                 reference,
                 save_k=save_k,
                 workers=self.resources.workers,
             )
-            coordinate_blocks = projected_blocks()
             if symphony_state is not None:
                 assert batch_codes is not None
                 coordinates_file = TemporaryFile()
@@ -537,7 +539,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 != selected_expression_fingerprint
             ):
                 raise ValueError("Query expression changed during mapping")
-            if _ordered_feature_ids_fingerprint(assay) != feature_ids_fingerprint:
+            if _ordered_feature_ids_fingerprint(assay.z) != feature_ids_fingerprint:
                 raise ValueError("Query feature identities changed during mapping")
             final_cells = validate_stored_selection_integrity(
                 self.zw,
@@ -566,6 +568,9 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 writer.abort()
             raise
         finally:
+            # A failed query leaves the block stream suspended while it holds
+            # Zarr's process-wide I/O limit; release it now, not at collection.
+            coordinate_blocks.close()
             if coordinates_file is not None:
                 coordinates_file.close()
         return projection_plan.ref

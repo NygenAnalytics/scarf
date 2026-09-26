@@ -1,5 +1,5 @@
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -105,6 +105,7 @@ from .enrichment_store import (
     _load_enrichment_result,
     _write_enrichment_slot,
 )
+from ...utils.arrays import has_duplicates
 
 if TYPE_CHECKING:
     from ..mapping_datastore import MappingDatastore as _FeatureOperationsBase
@@ -285,6 +286,17 @@ def _shared_marker_feature_index(markers: dict[Any, pd.DataFrame]) -> np.ndarray
     return shared.astype(np.int32)
 
 
+def _read_arrays(
+    group: zarr.Group, names: tuple[str, ...], *, workers: int
+) -> list[np.ndarray]:
+    from ...storage.stores import run_concurrently
+
+    def reader(name: str) -> Callable[[], np.ndarray]:
+        return lambda: np.asarray(as_zarr_array(group[name], name=name)[:])
+
+    return run_concurrently([reader(name) for name in names], workers=workers)
+
+
 def _marker_stats_matrix(vals: pd.DataFrame, feature_index: np.ndarray) -> np.ndarray:
     aligned = vals.reindex(feature_index)
     stats = np.asarray(
@@ -319,15 +331,13 @@ def _load_marker_cluster_frame(
     feature_names: np.ndarray,
     *,
     group_id: Any,
-    feature_ids: np.ndarray | None = None,
 ) -> pd.DataFrame:
-    """Thin wrapper around the shared version-aware marker reader."""
+    """Thin wrapper around the shared canonical marker reader."""
     return load_marker_table(
         slot_group,
         cluster_group,
         feature_names,
         group_id=group_id,
-        feature_ids=feature_ids,
     )
 
 
@@ -360,14 +370,10 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         """
         self._require_feature_write("Feature selection")
         resolved_assay = self._get_assay(from_assay)
-        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(resolved_assay)
+        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(resolved_assay.z)
         values = np.ones(resolved_assay.feats.N, dtype=bool)
         payload_fingerprint = fingerprint_array(values)
-        dataset_fingerprint = resolved_assay.attrs.get("dataset_fingerprint")
-        if dataset_fingerprint is None:
-            dataset_fingerprint = self._calculate_dataset_fingerprint(
-                resolved_assay.name
-            )
+        dataset_fingerprint = self._ensure_dataset_fingerprint(resolved_assay.name)
         planned = _feature_selection_plan(
             self.zw,
             assay=resolved_assay.name,
@@ -422,13 +428,13 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             indexes = indexes.astype(np.int64, copy=False)
             if np.any(indexes < 0) or np.any(indexes >= assay.feats.N):
                 raise IndexError("feature_indexes contains an out-of-range index")
-            if np.unique(indexes).size != indexes.size:
+            if has_duplicates(indexes):
                 raise ValueError("feature_indexes contains duplicate indexes")
             values = np.zeros(assay.feats.N, dtype=bool)
             values[indexes] = True
         if not values.any():
             raise ValueError("Feature selection must contain at least one feature")
-        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay)
+        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay.z)
         values_fingerprint = fingerprint_array(values)
         planned = _feature_selection_plan(
             self.zw,
@@ -473,7 +479,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             cell_selection,
             invalidate_cache=invalidate_cache,
         )
-        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay)
+        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay.z)
         planned = _feature_selection_plan(
             self.zw,
             assay=assay.name,
@@ -580,7 +586,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             max_cells_int = np.inf
         else:
             max_cells_int = int(max_cells)
-        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay)
+        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay.z)
         planned = _feature_selection_plan(
             self.zw,
             assay=assay.name,
@@ -1224,7 +1230,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
     ) -> ArtifactRef:
         """Create or reuse one immutable marker-table artifact."""
         from ...features.markers import find_markers_by_rank
-        from ...storage.stores import is_remote_datastore
+        from ...storage.stores import metadata_workers
 
         reject_unknown_normalization_params(
             norm_params,
@@ -1286,16 +1292,17 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 "Snapshot feature names must align with the assay feature axis"
             )
 
+        io_workers = metadata_workers(self.zw)
+
         def marker_reuse_is_valid(
             _ref: ArtifactRef,
             candidate: zarr.Group,
         ) -> bool:
             try:
-                stored_feature_index = np.asarray(
-                    as_zarr_array(
-                        candidate["feature_index"],
-                        name="feature_index",
-                    )[:]
+                stored_feature_index, stored_names, stored_ids = _read_arrays(
+                    candidate,
+                    ("feature_index", "feature_names", "feature_ids"),
+                    workers=io_workers,
                 )
                 if stored_feature_index.dtype.kind not in {
                     "i",
@@ -1306,27 +1313,16 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 ):
                     return False
                 if not np.array_equal(
-                    np.asarray(
-                        as_zarr_array(
-                            candidate["feature_names"],
-                            name="feature_names",
-                        )[:]
-                    ).astype(str),
-                    resolved_feature_names.astype(str),
+                    stored_names.astype(str), resolved_feature_names.astype(str)
                 ) or not np.array_equal(
-                    np.asarray(
-                        as_zarr_array(
-                            candidate["feature_ids"],
-                            name="feature_ids",
-                        )[:]
-                    ).astype(str),
-                    resolved_feature_ids.astype(str),
+                    stored_ids.astype(str), resolved_feature_ids.astype(str)
                 ):
                     return False
                 _validate_marker_slot(
                     candidate,
                     resolved_feature_names,
                     expected_group_cell_counts=expected_group_cell_counts,
+                    workers=io_workers,
                 )
             except (IndexError, KeyError, TypeError, ValueError):
                 return False
@@ -1396,14 +1392,12 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             nthreads=nthreads,
             **resolved_norm_params,
         )
-        remote = is_remote_datastore(self.zarr_loc, self.z)
         t_save = time.perf_counter()
         remote_slot = start_artifact(self.zw, planned)
-        workers = max(1, int(nthreads or self.nthreads))
         self._write_marker_slot(
             remote_slot,
             markers,
-            workers=workers if remote else 1,
+            workers=io_workers,
             group_cell_counts=group_cell_counts,
             feature_names=resolved_feature_names,
             feature_ids=resolved_feature_ids,
@@ -1510,6 +1504,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         feature_ids: np.ndarray,
     ) -> None:
         from ...storage.arrays import create_metadata_column
+        from ...storage.stores import run_concurrently
 
         populated_groups = {
             cluster_id for cluster_id, values in markers.items() if len(values)
@@ -1532,55 +1527,48 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             for cluster_id, values in markers.items()
             if len(values)
         }
-        group.attrs["stat_columns"] = list(_MARKER_STAT_COLUMNS)
-        group.attrs["method"] = MARKER_METHOD
-        group.attrs["alternative"] = MARKER_ALTERNATIVE
-        group.attrs["tie_correction"] = MARKER_TIE_CORRECTION
-        group.attrs["continuity_correction"] = MARKER_CONTINUITY_CORRECTION
-        group.attrs["adjustment_method"] = MARKER_ADJUSTMENT_METHOD
-        group.attrs["adjustment_scope"] = MARKER_ADJUSTMENT_SCOPE
-        create_metadata_column(
-            group,
-            "feature_index",
-            data=feature_index,
-            dtype=np.int32,
-            overwrite=True,
+        group.attrs.update(
+            {
+                "stat_columns": list(_MARKER_STAT_COLUMNS),
+                "method": MARKER_METHOD,
+                "alternative": MARKER_ALTERNATIVE,
+                "tie_correction": MARKER_TIE_CORRECTION,
+                "continuity_correction": MARKER_CONTINUITY_CORRECTION,
+                "adjustment_method": MARKER_ADJUSTMENT_METHOD,
+                "adjustment_scope": MARKER_ADJUSTMENT_SCOPE,
+            }
         )
-        create_metadata_column(
-            group,
-            "feature_names",
-            data=np.asarray(feature_names).astype(str),
-            overwrite=True,
+        columns: dict[str, tuple[np.ndarray, Any]] = {
+            "feature_index": (feature_index, np.int32),
+            "feature_names": (np.asarray(feature_names).astype(str), None),
+            "feature_ids": (np.asarray(feature_ids).astype(str), None),
+        }
+
+        def column_writer(name: str) -> Callable[[], None]:
+            def write() -> None:
+                data, dtype = columns[name]
+                create_metadata_column(
+                    group, name, data=data, dtype=dtype, overwrite=True
+                )
+
+            return write
+
+        def cluster_writer(cluster_id: Any) -> Callable[[], None]:
+            def write() -> None:
+                n_group, n_reference = group_cell_counts[cluster_id]
+                cluster_group = group.create_group(
+                    str(cluster_id),
+                    attributes={"n_group": n_group, "n_reference": n_reference},
+                )
+                _write_compact_marker_stats(cluster_group, stats_by_group[cluster_id])
+
+            return write
+
+        run_concurrently(
+            [column_writer(name) for name in columns]
+            + [cluster_writer(cluster_id) for cluster_id in stats_by_group],
+            workers=workers,
         )
-        create_metadata_column(
-            group,
-            "feature_ids",
-            data=np.asarray(feature_ids).astype(str),
-            overwrite=True,
-        )
-
-        def write_cluster(item: tuple[Any, pd.DataFrame]) -> None:
-            cluster_id, vals = item
-            if len(vals) == 0:
-                return
-            cluster_group = group.create_group(str(cluster_id))
-            _write_compact_marker_stats(
-                cluster_group,
-                stats_by_group[cluster_id],
-            )
-            n_group, n_reference = group_cell_counts[cluster_id]
-            cluster_group.attrs["n_group"] = n_group
-            cluster_group.attrs["n_reference"] = n_reference
-
-        items = list(markers.items())
-        if workers <= 1:
-            for item in items:
-                write_cluster(item)
-        else:
-            from concurrent.futures import ThreadPoolExecutor
-
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                list(ex.map(write_cluster, items))
 
     def _resolve_marker_group(
         self,
@@ -1684,9 +1672,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         feature_names = np.asarray(
             as_zarr_array(g["feature_names"], name="feature_names")[:]
         ).astype(str)
-        feature_ids = np.asarray(
-            as_zarr_array(g["feature_ids"], name="feature_ids")[:]
-        ).astype(str)
         dfs = []
         for gid in gids:
             group_name = str(gid)
@@ -1697,7 +1682,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                     marker_grp,
                     feature_names,
                     group_id=gid,
-                    feature_ids=feature_ids,
                 )
             else:
                 logger.debug(f"No markers found for {gid} returning empty dataframe")
@@ -1862,17 +1846,23 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                     )
                 yield matrix
 
+        from ...storage.identity import CountSummary, finalize_counts
+
+        summary = CountSummary(g)
         write_dense_from_row_batches(
             g,
             grouped_batches(),
             dtype=np.float64,
             msg="Writing grouped assay",
             resources=self.resources,
+            residentBytes=summary.nbytes,
             io=self.storageIo,
+            countSummary=summary,
         )
-
+        finalize_counts(g, summary=summary)
+        self._assayNames = tuple(self._scan_assays())
         self._load_assays(custom_assay_types={assay_label: "Assay"})
-        self._ini_cell_props(min_features=0, mito_pattern="", ribo_pattern="")
+        self._ini_cell_props(min_features=0, mito_pattern=None, ribo_pattern=None)
         grouped_assay = self._get_assay(assay_label)
         grouped_assay.attrs["grouped_from_assay"] = assay.name
         if source_ref is not None:
@@ -1991,6 +1981,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             resources=self.resources,
         )
 
+        self._assayNames = tuple(self._scan_assays())
         self._load_assays(custom_assay_types={assay_label: assay_type})
         self._ini_cell_props(min_features=0, mito_pattern=None, ribo_pattern=None)
 
@@ -2816,15 +2807,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         )
         source_dataset_fingerprint: str | None = None
         if source_assay is not None:
-            if skip_save:
-                assert source_assay_obj is not None
-                existing_fingerprint = source_assay_obj.attrs.get("dataset_fingerprint")
-                if existing_fingerprint is not None:
-                    source_dataset_fingerprint = str(existing_fingerprint)
-            else:
-                source_dataset_fingerprint = self._ensure_dataset_fingerprint(
-                    source_assay
-                )
+            source_dataset_fingerprint = self._ensure_dataset_fingerprint(source_assay)
         uses_assay_normalization = normalization_digest.get("source") == "assay"
         normalization_method_identity = (
             callable_identity(source_assay_obj.normMethod)

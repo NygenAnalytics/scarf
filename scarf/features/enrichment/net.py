@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from numpy.typing import DTypeLike
+from ...utils.arrays import has_duplicates
 
 __all__ = ["PreparedNetwork", "prepare_network", "read_gmt"]
 
@@ -81,7 +82,7 @@ class PreparedNetwork:
             raise ValueError("Prepared network must contain at least one matched edge")
         if np.any(self.source_sizes <= 0):
             raise ValueError("Prepared network source sizes must be positive")
-        if np.unique(self.source_names).size != len(self.source_names):
+        if has_duplicates(self.source_names):
             raise ValueError("Prepared network source names must be unique")
         if not all(isinstance(source, str) and source for source in self.source_names):
             raise ValueError("Prepared network source names must be non-empty strings")
@@ -195,7 +196,7 @@ def prepare_network(
     if not np.issubdtype(raw_feature_index.dtype, np.integer):
         raise ValueError("Active feature indices must have an integer dtype")
     feature_index = np.asarray(raw_feature_index, dtype=np.int64)
-    if np.any(feature_index < 0) or np.unique(feature_index).size != len(feature_index):
+    if np.any(feature_index < 0) or has_duplicates(feature_index):
         raise ValueError("Active feature indices must be non-negative and unique")
 
     columns = ["source", "target"]

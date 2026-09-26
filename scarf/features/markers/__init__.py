@@ -2,9 +2,6 @@ from importlib import import_module as _import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .batching import (
-        resolve_marker_gene_batch_size as resolve_marker_gene_batch_size,
-    )
     from .rank import (
         mannwhitneyu_from_ranks as mannwhitneyu_from_ranks,
         sort_marker_results as sort_marker_results,
@@ -18,7 +15,6 @@ __all__ = [
     "find_markers_by_rank",
     "find_markers_by_regression",
     "mannwhitneyu_from_ranks",
-    "resolve_marker_gene_batch_size",
     "sort_marker_results",
 ]
 
@@ -26,7 +22,6 @@ _LAZY_EXPORTS = {
     "find_markers_by_rank": (".search", "find_markers_by_rank"),
     "find_markers_by_regression": (".search", "find_markers_by_regression"),
     "mannwhitneyu_from_ranks": (".rank", "mannwhitneyu_from_ranks"),
-    "resolve_marker_gene_batch_size": (".batching", "resolve_marker_gene_batch_size"),
     "sort_marker_results": (".rank", "sort_marker_results"),
 }
 

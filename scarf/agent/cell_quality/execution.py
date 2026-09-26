@@ -1,11 +1,13 @@
 """Persist exact outputs from a registered agent cell-quality decision."""
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from numbers import Real
 from typing import Any, cast
 
 import numpy as np
 
+from ...datastore._operations.quality_control import _validated_named_cell_artifacts
 from ...metadata.artifacts import (
     plan_cell_data_artifact,
     write_cell_data_artifact,
@@ -16,6 +18,7 @@ from ...storage.artifacts import canonical_bytes, fingerprint_array, fingerprint
 from ...storage.refs import ArtifactRef
 from ...storage.selections import (
     read_stored_selection_mask,
+    selection_mask,
     resolve_generated_selection_artifact,
 )
 from ...utils.logging import logger
@@ -29,43 +32,33 @@ from .profiles import (
 )
 
 
-def _validated_named_cell_artifacts(
-    values: Iterable[NamedCellArtifact] | None,
-    *,
-    expected_kind: str,
-    label: str,
-) -> list[NamedCellArtifact]:
-    sources = list(values or ())
-    names: set[str] = set()
-    for source in sources:
-        if not isinstance(source, NamedCellArtifact):
-            raise TypeError(f"{label} must contain NamedCellArtifact values")
-        if source.artifact.kind != expected_kind:
-            raise ValueError(f"{label} must reference {expected_kind!r} artifacts")
-        if source.name in names:
-            raise ValueError(f"{label} must use unique semantic names")
-        names.add(source.name)
-    return sources
+@dataclass(frozen=True, slots=True)
+class _MetricErrors:
+    """Messages one executor reports for metric vectors it cannot use."""
+
+    misaligned_metadata: str
+    nonfinite_metadata: str
+    nonfinite_artifact: str
 
 
-def execute_registered_cell_qc(
-    store: Any,
-    profile: RegisteredCellQcProfile,
-    *,
-    profile_parameters: Mapping[str, Any],
+_REGISTERED_METRIC_ERRORS = _MetricErrors(
+    misaligned_metadata="QC metadata column {name!r} does not align with cell_selection",
+    nonfinite_metadata="QC values in {name!r} contain non-finite entries",
+    nonfinite_artifact="QC artifact values in {name!r} contain non-finite entries",
+)
+_AUTO_METRIC_ERRORS = _MetricErrors(
+    misaligned_metadata="QC metadata column {name!r} is not a finite aligned vector",
+    nonfinite_metadata="QC metadata column {name!r} is not a finite aligned vector",
+    nonfinite_artifact="QC artifact {name!r} is not a finite aligned vector",
+)
+
+
+def _validated_expected_counts(
     expected_active_cells: int,
     expected_retained_cells: int,
     expected_flag_counts: Mapping[str, int],
-    attrs: Iterable[str] | None = None,
-    artifact_metrics: Iterable[NamedCellArtifact] | None = None,
-    cell_selection: ArtifactRef | None = None,
-    sample_column: str | None = None,
-    sample_artifact: NamedCellArtifact | None = None,
-    invalidate_cache: bool = False,
-) -> tuple[ArtifactRef, ArtifactRef | None]:
-    """Recompute, verify, and persist one registered cell-QC decision."""
-    if profile not in REGISTERED_CELL_QC_PROFILES:
-        raise ValueError(f"Unknown registered cell-QC profile {profile!r}")
+) -> dict[str, int]:
+    """Validate the evidence counts an execution must reproduce exactly."""
     if (
         isinstance(expected_active_cells, bool)
         or not isinstance(expected_active_cells, int)
@@ -90,6 +83,94 @@ def execute_registered_cell_qc(
         raise ValueError(
             "expected_flag_counts must map non-empty names to non-negative integers"
         )
+    return flag_counts
+
+
+def _execution_artifacts(
+    metric_artifacts: Sequence[NamedCellArtifact],
+    attrs: Sequence[str],
+) -> list[NamedCellArtifact]:
+    """Name artifact metrics apart from the metadata columns they would shadow."""
+    collisions = set(attrs).intersection(source.name for source in metric_artifacts)
+    return [
+        NamedCellArtifact(
+            name=qc_metric_execution_name(
+                source.name,
+                artifact_id=source.artifact.artifact_id,
+                collides_with_metadata=source.name in collisions,
+            ),
+            artifact=source.artifact,
+        )
+        for source in metric_artifacts
+    ]
+
+
+def _metric_values(
+    store: Any,
+    attrs: Sequence[str],
+    metric_artifacts: Sequence[NamedCellArtifact],
+    execution_artifacts: Sequence[NamedCellArtifact],
+    *,
+    active_idx: np.ndarray,
+    prior: ArtifactRef,
+    errors: _MetricErrors,
+) -> tuple[dict[str, np.ndarray], dict[str, str]]:
+    """Read finite metric vectors and metadata fingerprints on the active cells."""
+    values_by_name: dict[str, np.ndarray] = {}
+    metadata_fingerprints: dict[str, str] = {}
+    for attr in attrs:
+        values = np.asarray(
+            read_metadata_rows_chunkwise(store.cells, attr, active_idx),
+            dtype=float,
+        )
+        if values.shape != (len(active_idx),):
+            raise ValueError(errors.misaligned_metadata.format(name=attr))
+        if not np.isfinite(values).all():
+            raise ValueError(errors.nonfinite_metadata.format(name=attr))
+        values_by_name[attr] = values
+        metadata_fingerprints[attr] = fingerprint_array(values)
+    for source, execution_source in zip(
+        metric_artifacts,
+        execution_artifacts,
+        strict=True,
+    ):
+        resolved = resolve_cell_aligned_artifact(
+            store.zw,
+            source.artifact,
+            cell_selection=prior,
+            expected_kind="quality_metric",
+        )
+        # Resolution returns exactly one value per cell of ``prior``.
+        values = np.asarray(resolved.values, dtype=float)
+        if not np.isfinite(values).all():
+            raise ValueError(errors.nonfinite_artifact.format(name=source.name))
+        values_by_name[execution_source.name] = values
+    return values_by_name, metadata_fingerprints
+
+
+def execute_registered_cell_qc(
+    store: Any,
+    profile: RegisteredCellQcProfile,
+    *,
+    profile_parameters: Mapping[str, Any],
+    expected_active_cells: int,
+    expected_retained_cells: int,
+    expected_flag_counts: Mapping[str, int],
+    attrs: Iterable[str] | None = None,
+    artifact_metrics: Iterable[NamedCellArtifact] | None = None,
+    cell_selection: ArtifactRef | None = None,
+    sample_column: str | None = None,
+    sample_artifact: NamedCellArtifact | None = None,
+    invalidate_cache: bool = False,
+) -> tuple[ArtifactRef, ArtifactRef | None]:
+    """Recompute, verify, and persist one registered cell-QC decision."""
+    if profile not in REGISTERED_CELL_QC_PROFILES:
+        raise ValueError(f"Unknown registered cell-QC profile {profile!r}")
+    flag_counts = _validated_expected_counts(
+        expected_active_cells,
+        expected_retained_cells,
+        expected_flag_counts,
+    )
 
     parameters = dict(profile_parameters)
     required_parameter_keys = {
@@ -174,73 +255,33 @@ def execute_registered_cell_qc(
         raise ValueError(
             f"Registered cell-QC profile {profile!r} cannot use a capture source"
         )
-    if sample_column is not None and sample_column not in store.cells.columns:
+    available = set(store.cells.columns)
+    if sample_column is not None and sample_column not in available:
         raise ValueError(f"sample_column '{sample_column}' not found in cell metadata")
-    missing = [attr for attr in attrs_list if attr not in store.cells.columns]
+    missing = [attr for attr in attrs_list if attr not in available]
     if missing:
         joined = ", ".join(repr(attr) for attr in missing)
         raise KeyError(f"Cell metadata columns not found: {joined}")
-    artifact_names = {source.name for source in metric_artifacts}
-    metadata_collisions = set(attrs_list).intersection(artifact_names)
-    execution_artifacts = [
-        NamedCellArtifact(
-            name=qc_metric_execution_name(
-                source.name,
-                artifact_id=source.artifact.artifact_id,
-                collides_with_metadata=source.name in metadata_collisions,
-            ),
-            artifact=source.artifact,
-        )
-        for source in metric_artifacts
-    ]
+    execution_artifacts = _execution_artifacts(metric_artifacts, attrs_list)
 
-    prior = store._filter_input_selection(cell_selection)
-    active = read_stored_selection_mask(
-        store.zw,
-        prior,
-        kind="cell_selection",
-        scope="datastore",
-        assay=None,
-        table_path="cellData",
-    )
+    validated_prior = store._filter_input_selection(cell_selection)
+    prior = validated_prior.ref
+    active = selection_mask(validated_prior)
     active_idx = np.flatnonzero(active).astype(np.int64, copy=False)
     if len(active_idx) != expected_active_cells:
         raise ValueError(
             "Registered cell-QC active-cell count differs from its evidence"
         )
 
-    values_by_name: dict[str, np.ndarray] = {}
-    metadata_fingerprints: dict[str, str] = {}
-    for attr in attrs_list:
-        values = np.asarray(
-            read_metadata_rows_chunkwise(store.cells, attr, active_idx),
-            dtype=float,
-        )
-        if values.shape != (len(active_idx),):
-            raise ValueError(
-                f"QC metadata column {attr!r} does not align with cell_selection"
-            )
-        if not np.isfinite(values).all():
-            raise ValueError(f"QC values in {attr!r} contain non-finite entries")
-        values_by_name[attr] = values
-        metadata_fingerprints[attr] = fingerprint_array(values)
-    for source, execution_source in zip(
+    values_by_name, metadata_fingerprints = _metric_values(
+        store,
+        attrs_list,
         metric_artifacts,
         execution_artifacts,
-        strict=True,
-    ):
-        resolved = resolve_cell_aligned_artifact(
-            store.zw,
-            source.artifact,
-            cell_selection=prior,
-            expected_kind="quality_metric",
-        )
-        values = np.asarray(resolved.values, dtype=float)
-        if not np.isfinite(values).all():
-            raise ValueError(
-                f"QC artifact values in {source.name!r} contain non-finite entries"
-            )
-        values_by_name[execution_source.name] = values
+        active_idx=active_idx,
+        prior=prior,
+        errors=_REGISTERED_METRIC_ERRORS,
+    )
 
     sample_labels: np.ndarray | None = None
     sample_inputs: dict[str, Any] = {}
@@ -386,7 +427,8 @@ def execute_registered_cell_qc(
         scope="datastore",
         kind="cell_selection",
         values=keep,
-        row_ids=np.asarray(store.cells.fetch_all("ids")),
+        row_ids=validated_prior.row_ids,
+        row_ids_fingerprint=validated_prior.row_ids_fingerprint,
         operation="run_registered_cell_qc",
         parameters=execution_parameters,
         inputs=selection_inputs,
@@ -453,98 +495,41 @@ def execute_auto_cell_qc(
         sample_column is not None or resolved_sample_artifact is not None
     ):
         raise ValueError("globalGaussian cannot use a core sample source")
+    available = set(store.cells.columns)
     for column in (sample_column, capture_column):
-        if column is not None and column not in store.cells.columns:
+        if column is not None and column not in available:
             raise ValueError(f"QC grouping column {column!r} was not found")
-    missing = [attr for attr in attrs_list if attr not in store.cells.columns]
+    missing = [attr for attr in attrs_list if attr not in available]
     if missing:
         raise KeyError(f"Cell metadata columns not found: {missing}")
 
     parameters = dict(profile_parameters)
     canonical_bytes(parameters)
-    if (
-        isinstance(expected_active_cells, bool)
-        or not isinstance(expected_active_cells, int)
-        or expected_active_cells < 1
-    ):
-        raise ValueError("expected_active_cells must be a positive integer")
-    if (
-        isinstance(expected_retained_cells, bool)
-        or not isinstance(expected_retained_cells, int)
-        or expected_retained_cells < 0
-    ):
-        raise ValueError("expected_retained_cells must be a non-negative integer")
-    flag_counts = dict(expected_flag_counts)
-    if any(
-        not isinstance(name, str)
-        or not name
-        or isinstance(count, bool)
-        or not isinstance(count, int)
-        or count < 0
-        for name, count in flag_counts.items()
-    ):
-        raise ValueError(
-            "expected_flag_counts must map non-empty names to non-negative integers"
-        )
-
-    prior = store._filter_input_selection(cell_selection)
-    active = read_stored_selection_mask(
-        store.zw,
-        prior,
-        kind="cell_selection",
-        scope="datastore",
-        assay=None,
-        table_path="cellData",
+    flag_counts = _validated_expected_counts(
+        expected_active_cells,
+        expected_retained_cells,
+        expected_flag_counts,
     )
+
+    validated_prior = store._filter_input_selection(cell_selection)
+    prior = validated_prior.ref
+    active = selection_mask(validated_prior)
     active_idx = np.flatnonzero(active).astype(np.int64, copy=False)
     if len(active_idx) != expected_active_cells:
         raise ValueError(
             "Automatic cell-QC active-cell count differs from its evidence"
         )
 
-    artifact_names = {source.name for source in metric_artifacts}
-    metadata_collisions = set(attrs_list).intersection(artifact_names)
-    execution_artifacts = [
-        NamedCellArtifact(
-            name=qc_metric_execution_name(
-                source.name,
-                artifact_id=source.artifact.artifact_id,
-                collides_with_metadata=source.name in metadata_collisions,
-            ),
-            artifact=source.artifact,
-        )
-        for source in metric_artifacts
-    ]
-    values_by_name: dict[str, np.ndarray] = {}
-    metadata_fingerprints: dict[str, str] = {}
-    for attr in attrs_list:
-        values = np.asarray(
-            read_metadata_rows_chunkwise(store.cells, attr, active_idx),
-            dtype=float,
-        )
-        if values.shape != (len(active_idx),) or not np.isfinite(values).all():
-            raise ValueError(
-                f"QC metadata column {attr!r} is not a finite aligned vector"
-            )
-        values_by_name[attr] = values
-        metadata_fingerprints[attr] = fingerprint_array(values)
-    for source, execution_source in zip(
+    execution_artifacts = _execution_artifacts(metric_artifacts, attrs_list)
+    values_by_name, metadata_fingerprints = _metric_values(
+        store,
+        attrs_list,
         metric_artifacts,
         execution_artifacts,
-        strict=True,
-    ):
-        resolved = resolve_cell_aligned_artifact(
-            store.zw,
-            source.artifact,
-            cell_selection=prior,
-            expected_kind="quality_metric",
-        )
-        values = np.asarray(resolved.values, dtype=float)
-        if values.shape != (len(active_idx),) or not np.isfinite(values).all():
-            raise ValueError(
-                f"QC artifact {source.name!r} is not a finite aligned vector"
-            )
-        values_by_name[execution_source.name] = values
+        active_idx=active_idx,
+        prior=prior,
+        errors=_AUTO_METRIC_ERRORS,
+    )
 
     projection_labels: np.ndarray | None = None
     grouping_source: dict[str, Any] = {}

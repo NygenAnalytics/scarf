@@ -435,12 +435,7 @@ def _validate_and_load_artifact_mapping_reference(
     assay = datastore._get_assay(assay_name)
     if not isinstance(assay, RNAassay):
         raise _contract_error("Mapping references currently support RNA assays only")
-    stored_dataset_fingerprint = assay.attrs.get("dataset_fingerprint")
-    live_dataset_fingerprint = (
-        stored_dataset_fingerprint
-        if isinstance(stored_dataset_fingerprint, str) and stored_dataset_fingerprint
-        else datastore._calculate_dataset_fingerprint(assay_name)
-    )
+    live_dataset_fingerprint = datastore._ensure_dataset_fingerprint(assay_name)
     if live_dataset_fingerprint != dataset_fingerprint:
         raise _contract_error(
             "Live assay dataset fingerprint does not match the mapping reference"
