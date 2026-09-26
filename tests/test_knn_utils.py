@@ -175,6 +175,27 @@ def test_diffusion_operator_matches_powered_row_normalization():
     )
 
 
+def test_bounded_diffusion_operator_matches_public_operator_and_checks_budget():
+    from scarf.neighbors.diffusion import bounded_diffusion_operator
+
+    graph = _simple_knn_graph(40, k=3)
+    graph = (graph + graph.T).tocsr()
+    for power in range(1, 7):
+        expected = diffusion_operator(graph, power=power)
+        actual = bounded_diffusion_operator(graph, power, memory_bytes=1024**3).tocoo()
+        # Entries match exactly and in storage order, so persisted payloads
+        # and their fingerprints are unchanged.
+        np.testing.assert_array_equal(actual.row, expected.row)
+        np.testing.assert_array_equal(actual.col, expected.col)
+        np.testing.assert_array_equal(actual.data, expected.data)
+
+    graph_bytes = graph.data.nbytes + graph.indices.nbytes + graph.indptr.nbytes
+    with pytest.raises(MemoryError, match="Diffusion step"):
+        bounded_diffusion_operator(graph, 6, memory_bytes=4 * graph_bytes)
+    with pytest.raises(ValueError, match="positive integer"):
+        bounded_diffusion_operator(graph, 0, memory_bytes=1024**3)
+
+
 def _multimodal_wnn_inputs() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     indices1 = _grouped_knn_indices([[0, 1, 2, 3], [4, 5, 6, 7]])
     indices2 = _grouped_knn_indices([[0, 2, 4, 6], [1, 3, 5, 7]])

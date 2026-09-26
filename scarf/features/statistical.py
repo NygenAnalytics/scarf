@@ -8,9 +8,12 @@ implementation.
 
 Tests are standard for zero-inflated, non-normal single-cell values:
 
-- Two independent groups: two-sided Mann-Whitney U, reusing the rank-based
-  implementation from :mod:`scarf.features.markers.rank` (the same
-  continuity- and tie-corrected statistic the marker search reports).
+- Two independent groups: two-sided Mann-Whitney U. Small designs, where the
+  two groups can be split in at most ``MANN_WHITNEY_EXACT_MAX_SPLITS`` ways,
+  use the exact permutation null of the observed midranks, so ties are
+  handled exactly. Larger designs reuse the rank-based normal approximation
+  from :mod:`scarf.features.markers.rank` (the same continuity- and
+  tie-corrected statistic the marker search reports).
 - Three or more independent groups: Kruskal-Wallis with an optional Dunn's
   post-hoc test for pairwise significance.
 - Paired samples (aggregated to biological samples): Wilcoxon signed-rank.
@@ -31,6 +34,7 @@ testing" and is not a replacement for replicate-aware differential
 expression (for example DESeq2 or edgeR).
 """
 
+import math
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -59,6 +63,16 @@ AdjustmentMethod = Literal["fdr_bh", "bonferroni", "holm", "none"]
 SampleStatistic = Literal["mean", "median", "fraction"]
 SummaryScope = Literal["cell", "sample"]
 Alternative = Literal["two-sided", "less", "greater"]
+PValueMethod = Literal["exact", "asymptotic"]
+
+# Mann-Whitney uses the exact permutation null when the pooled observations can
+# be split into the two groups in at most this many ways.
+MANN_WHITNEY_EXACT_MAX_SPLITS = 100_000
+# Recorded with Mann-Whitney artifacts so results from another p-value policy
+# are never reused.
+MANN_WHITNEY_P_VALUE_POLICY = (
+    f"exact_permutation_up_to_{MANN_WHITNEY_EXACT_MAX_SPLITS}_splits"
+)
 
 _ALTERNATIVES = ("two-sided", "less", "greater")
 _CELL_LEVEL_PARAMETRIC_TESTS = frozenset({"welch", "t_test", "one_way_anova"})
@@ -142,16 +156,24 @@ class GroupComparisonResult:
     ``table`` is the primary test table. When ``posthoc="dunn"`` was
     requested, ``table`` holds the omnibus Kruskal-Wallis result and
     ``posthoc_table`` holds the pairwise Dunn's table; otherwise
-    ``posthoc_table`` is ``None``.
+    ``posthoc_table`` is ``None``. ``p_value_method`` is ``"exact"`` or
+    ``"asymptotic"`` for Mann-Whitney, chosen by design size as the module
+    docstring describes, and ``None`` for other tests.
     """
 
     table: pd.DataFrame
     posthoc_table: pd.DataFrame | None = None
+    p_value_method: PValueMethod | None = None
 
 
 @dataclass(frozen=True, slots=True, eq=False)
 class StatisticalTestResult:
-    """Statistical tests for one grouping across multiple value keys."""
+    """Statistical tests for one grouping across multiple value keys.
+
+    ``p_value_method`` is ``"exact"`` or ``"asymptotic"`` for Mann-Whitney,
+    chosen by design size as the module docstring describes, and ``None`` for
+    other tests.
+    """
 
     method: str
     posthoc: str | None
@@ -183,6 +205,7 @@ class StatisticalTestResult:
     pair_fingerprint: str | None = None
     tables: dict[str, pd.DataFrame] = field(default_factory=dict)
     posthoc_tables: dict[str, pd.DataFrame] = field(default_factory=dict)
+    p_value_method: PValueMethod | None = None
 
 
 def adjust_pvalues(
@@ -408,12 +431,49 @@ def aggregate_samples(
     return out
 
 
+def _mann_whitney_p_value_method(n_1: int, n_2: int) -> PValueMethod:
+    """Return how Mann-Whitney p-values are computed for two group sizes."""
+    if math.comb(int(n_1) + int(n_2), int(n_1)) <= MANN_WHITNEY_EXACT_MAX_SPLITS:
+        return "exact"
+    return "asymptotic"
+
+
+def _mann_whitney_exact_p_value(ranks: np.ndarray, n_1: int) -> float:
+    """Two-sided exact permutation p-value for the first ``n_1`` midranks.
+
+    Every split of the pooled midranks into groups of the observed sizes is
+    equally likely under the null. Doubled midranks are integers, so the null
+    distribution of the doubled rank sum is counted exactly, ties included.
+    The two-sided p-value doubles the smaller tail, as SciPy's permutation
+    tests do.
+    """
+    doubled = np.rint(np.asarray(ranks, dtype=np.float64) * 2.0).astype(np.int64)
+    n_2 = len(doubled) - n_1
+    # Count subsets of the smaller group; its tails mirror the larger group's.
+    size, observed = (
+        (n_1, int(doubled[:n_1].sum()))
+        if n_1 <= n_2
+        else (n_2, int(doubled[n_1:].sum()))
+    )
+    total = int(doubled.sum())
+    counts = np.zeros((size + 1, total + 1), dtype=np.int64)
+    counts[0, 0] = 1
+    for index, value in enumerate(doubled):
+        for chosen in range(min(size, index + 1), 0, -1):
+            counts[chosen, value:] += counts[chosen - 1, : total + 1 - value]
+    distribution = counts[size]
+    n_splits = int(distribution.sum())
+    lower = int(distribution[: observed + 1].sum())
+    upper = int(distribution[observed:].sum())
+    return min(1.0, 2.0 * min(lower, upper) / n_splits)
+
+
 def _mann_whitney(
     values: np.ndarray,
     groups: np.ndarray,
     present: list[Any],
     comparisons: Sequence[tuple[Any, Any]] | None,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, PValueMethod]:
     if len(present) != 2:
         raise ValueError(
             "mann_whitney requires exactly two groups; use groups= to select "
@@ -436,16 +496,26 @@ def _mann_whitney(
     ranked = pd.DataFrame(
         {"feature": pd.Series(np.concatenate([m1, m2])).rank(method="average")}
     )
-    group_vec = np.concatenate([np.repeat(g1, n1), np.repeat(g2, n2)]).astype(object)
-    p_values = mannwhitneyu_from_ranks(
-        ranked,
-        group_vec,
-        np.array([g1, g2], dtype=object),
-    )
+    p_value_method = _mann_whitney_p_value_method(n1, n2)
+    if p_value_method == "exact":
+        p_value = _mann_whitney_exact_p_value(
+            ranked["feature"].to_numpy(dtype=np.float64),
+            n1,
+        )
+    else:
+        group_vec = np.concatenate([np.repeat(g1, n1), np.repeat(g2, n2)]).astype(
+            object
+        )
+        p_values = mannwhitneyu_from_ranks(
+            ranked,
+            group_vec,
+            np.array([g1, g2], dtype=object),
+        )
+        p_value = float(p_values.loc[g1, "feature"])
     u1 = float(ranked.iloc[:n1]["feature"].sum()) - n1 * (n1 + 1) / 2
     mean_1 = float(np.mean(m1))
     mean_2 = float(np.mean(m2))
-    return pd.DataFrame(
+    table = pd.DataFrame(
         [
             {
                 "group_1": g1,
@@ -456,11 +526,12 @@ def _mann_whitney(
                 "mean_1": mean_1,
                 "mean_2": mean_2,
                 "mean_difference": mean_1 - mean_2,
-                "p_value": float(p_values.loc[g1, "feature"]),
+                "p_value": p_value,
             }
         ],
         columns=list(MANN_WHITNEY_COLUMNS),
     )
+    return table, p_value_method
 
 
 def _welch_ttest(
@@ -759,11 +830,12 @@ def compare_group_distributions(
 
     ``test`` is ``"auto"`` (pick by design: paired -> Wilcoxon, two groups ->
     Mann-Whitney, three or more -> Kruskal-Wallis), one of the non-parametric
-    methods, or an explicit cell-level parametric method. ``"auto"`` never
-    selects a parametric test; request ``"welch"`` (or the ``"t_test"``
-    alias) or ``"one_way_anova"`` to opt into them. The parametric options run
-    on raw unaggregated values only; passing ``samples`` or ``pairs`` with
-    them raises ``ValueError``.
+    methods, or an explicit cell-level parametric method. Mann-Whitney chooses
+    exact or asymptotic p-values by design size, as the module docstring
+    describes. ``"auto"`` never selects a parametric test; request
+    ``"welch"`` (or the ``"t_test"`` alias) or ``"one_way_anova"`` to opt into
+    them. The parametric options run on raw unaggregated values only; passing
+    ``samples`` or ``pairs`` with them raises ``ValueError``.
 
     ``alternative`` sets the alternative hypothesis direction for Welch's
     t-test; other tests require ``"two-sided"``. ``posthoc="dunn"`` adds
@@ -779,8 +851,9 @@ def compare_group_distributions(
     Returns:
         A :class:`GroupComparisonResult` whose ``table`` is the primary test
         table (one row per comparison for Mann-Whitney and Wilcoxon, a single
-        row for Kruskal-Wallis, Welch, and ANOVA) and whose ``posthoc_table``
-        holds the pairwise Dunn's table when ``posthoc="dunn"``.
+        row for Kruskal-Wallis, Welch, and ANOVA), whose ``posthoc_table``
+        holds the pairwise Dunn's table when ``posthoc="dunn"``, and whose
+        ``p_value_method`` records the Mann-Whitney p-value method.
     """
     values = np.asarray(values, dtype=np.float64)
     groups = np.asarray(groups, dtype=object)
@@ -976,9 +1049,10 @@ def compare_group_distributions(
             _maybe_adjust(table, adjustment),
         )
     if test == "mann_whitney":
-        table = _mann_whitney(values, groups, present, comparisons)
+        table, p_value_method = _mann_whitney(values, groups, present, comparisons)
         return GroupComparisonResult(
             _maybe_adjust(table, adjustment),
+            p_value_method=p_value_method,
         )
     if posthoc == "dunn":
         omnibus = _kruskal_wallis(values, groups, present)

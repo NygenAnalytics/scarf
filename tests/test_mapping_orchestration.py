@@ -105,6 +105,77 @@ def _query_selection_matching_reference(query, reference) -> ArtifactRef:
     )[0]
 
 
+def _selected_rows(datastore, cell_selection: ArtifactRef) -> np.ndarray:
+    return read_stored_selection_indices(
+        datastore.zw,
+        cell_selection,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+    )
+
+
+def _overlap_observed(query, reference, cell_selection: ArtifactRef) -> np.ndarray:
+    """Mark selected query cells with a raw count in any shared feature."""
+    query_ids = np.asarray(query.RNA.feats.fetch_all("ids")).astype(str)
+    columns = np.flatnonzero(np.isin(query_ids, reference.feature_ids))
+    counts = query.RNA.rawData._backing.oindex[
+        _selected_rows(query, cell_selection), columns
+    ]
+    return np.count_nonzero(counts, axis=1) > 0
+
+
+def _panel_query(
+    reference_store,
+    reference,
+    path: Path,
+    *,
+    n_overlap: int = 40,
+    n_informative: int = 60,
+) -> tuple[DataStore, np.ndarray]:
+    """Write a targeted-panel query of real reference cells and empty cells.
+
+    The panel measures part of the reference features plus features the
+    reference lacks. Every seventh query cell has counts only in the features
+    the reference lacks.
+    """
+    from scipy.sparse import csr_matrix
+
+    from scarf.writers import SparseToZarr
+
+    rng = np.random.default_rng(7)
+    reference_ids = np.asarray(reference_store.RNA.feats.fetch_all("ids")).astype(str)
+    columns = np.flatnonzero(np.isin(reference_ids, reference.feature_ids))[:n_overlap]
+    rows = _selected_rows(reference_store, reference.cell_selection)[:n_informative]
+    measured = np.asarray(
+        reference_store.RNA.rawData._backing.oindex[rows, columns],
+        dtype=np.uint32,
+    )
+    n_cells = n_informative + n_informative // 6
+    empty = np.arange(n_cells) % 7 == 3
+    counts = np.zeros((n_cells, n_overlap + 5), dtype=np.uint32)
+    counts[~empty, :n_overlap] = measured[: int(np.count_nonzero(~empty))]
+    counts[:, n_overlap:] = rng.integers(1, 6, size=(n_cells, 5))
+    SparseToZarr(
+        csr_matrix(counts),
+        str(path),
+        cell_ids=[f"query-{index}" for index in range(n_cells)],
+        feature_ids=[
+            *reference_ids[columns],
+            *(f"panel-only-{index}" for index in range(5)),
+        ],
+        nthreads=1,
+    ).dump()
+    query = DataStore(
+        str(path),
+        default_assay="RNA",
+        min_features_per_cell=0,
+        nthreads=1,
+    )
+    return query, empty
+
+
 def _changed_files(
     before: dict[str, bytes],
     after: dict[str, bytes],
@@ -134,14 +205,6 @@ def test_plain_mapping_is_query_owned_and_reuses_exact_projection(
     available_k = int(
         artifact_group(reference_store.zw, reference.neighbors)["indices"].shape[1]
     )
-    project_pca = mapping_operations.project_pca
-
-    def project_with_zero_row(values, model):
-        projected = project_pca(values, model)
-        projected[0] = 0
-        return projected
-
-    monkeypatch.setattr(mapping_operations, "project_pca", project_with_zero_row)
     warning_messages = []
     monkeypatch.setattr(
         "scarf.datastore._operations.mapping.logger.warning",
@@ -168,12 +231,14 @@ def test_plain_mapping_is_query_owned_and_reuses_exact_projection(
         "featureCoverage",
         "queryBatchCount",
         "algorithmVariant",
-        "zeroNormCellCount",
+        "uninformativeCellCount",
         "queryScaledDispersion",
     }
     assert result.diagnostics["algorithmVariant"] == "scaled_pca"
     assert result.diagnostics["queryBatchCount"] == 1
-    assert result.diagnostics["zeroNormCellCount"] > 0
+    assert result.diagnostics["uninformativeCellCount"] == int(
+        np.count_nonzero(~_overlap_observed(query, reference, reference.cell_selection))
+    )
     assert query.RNA.sf == query_sf
     assert query.RNA.scalar is query_scalar
     assert dict(query.RNA.attrs) == query_attrs
@@ -192,7 +257,7 @@ def test_plain_mapping_is_query_owned_and_reuses_exact_projection(
     assert set(status.inputs or {}) == {
         "cell_selection",
         "feature_selection",
-        "selected_expression_fingerprint",
+        "query_dataset_fingerprint",
         "query_batch_fingerprint",
         "query_batch_count",
         "mapping_reference",
@@ -262,7 +327,7 @@ def test_plain_mapping_is_query_owned_and_reuses_exact_projection(
     assert loaded.uninformative is not None
     assert (
         int(np.count_nonzero(loaded.uninformative))
-        == result.diagnostics["zeroNormCellCount"]
+        == result.diagnostics["uninformativeCellCount"]
     )
 
     changed = _changed_files(query_before, _snapshot_store(query.zarr_loc))
@@ -356,65 +421,6 @@ def test_mapping_failure_leaves_projection_incomplete(
     failed = query.inspect_artifact(created.pop())
     assert failed.exists
     assert not failed.complete
-
-
-@pytest.mark.parametrize("method", ["pca", "symphony"])
-def test_mapping_rejects_expression_changes_before_projection_finish(
-    analyzed_datastore_ephemeral,
-    tmp_path,
-    monkeypatch,
-    method,
-):
-    reference_store = analyzed_datastore_ephemeral
-    reference = (_plain_reference if method == "pca" else _symphony_reference)(
-        reference_store
-    )
-    query = _copied_query(reference_store, tmp_path / "query-expression-change.zarr")
-    before = set(
-        query.list_artifacts(
-            kind="projection",
-            from_assay="RNA",
-        )
-    )
-    selected_row = int(
-        read_stored_selection_indices(
-            query.zw,
-            reference.cell_selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )[0]
-    )
-    backing = query.RNA.rawData._backing
-    original_count = int(backing[selected_row, 0])
-    fingerprint_expression = AlignedFeatureStream.fingerprint_live_raw_expression
-
-    def mutate_then_fingerprint(stream):
-        backing[selected_row, 0] = original_count + 1
-        return fingerprint_expression(stream)
-
-    monkeypatch.setattr(
-        AlignedFeatureStream,
-        "fingerprint_live_raw_expression",
-        mutate_then_fingerprint,
-    )
-
-    with pytest.raises(ValueError, match="expression changed during mapping"):
-        query.run_mapping(reference, reference.cell_selection)
-    assert backing[selected_row, 0] == original_count + 1
-
-    created = (
-        set(
-            query.list_artifacts(
-                kind="projection",
-                from_assay="RNA",
-            )
-        )
-        - before
-    )
-    assert len(created) == 1
-    assert not query.inspect_artifact(created.pop()).complete
 
 
 def test_mapping_rejects_reference_handles_forged_from_a_stored_reference(
@@ -599,7 +605,7 @@ def test_mapping_guards_precede_query_writes(
     reference_store.RNA.attrs["dataset_fingerprint"] = "changed"
     fingerprint_before = _snapshot_store(writable.zarr_loc)
     try:
-        with pytest.raises(ValueError, match="dataset fingerprint does not match"):
+        with pytest.raises(ValueError, match="dataset fingerprint mismatch"):
             writable.run_mapping(reference, reference.cell_selection)
     finally:
         if had_stored_fingerprint:
@@ -912,7 +918,6 @@ def test_symphony_mapping_validates_batches_and_persists_diagnostics(
         batch_codes,
     ):
         nonlocal accumulated_rows
-        assert not mapping_operations.zero_norm_rows(coordinates).any()
         accumulated_rows += len(coordinates)
         return original_accumulate(
             counts,
@@ -945,10 +950,10 @@ def test_symphony_mapping_validates_batches_and_persists_diagnostics(
         "featureCoverage": 1.0,
         "queryBatchCount": 6,
         "algorithmVariant": "symphony",
-        "zeroNormCellCount": result.diagnostics["zeroNormCellCount"],
+        "uninformativeCellCount": result.diagnostics["uninformativeCellCount"],
         "queryScaledDispersion": result.diagnostics["queryScaledDispersion"],
     }
-    assert accumulated_rows == n_cells - result.diagnostics["zeroNormCellCount"]
+    assert accumulated_rows == n_cells - result.diagnostics["uninformativeCellCount"]
     assert projected_rows == n_cells
     assert len(files) == 1 and files[0].closed
     loaded = load_projection(query.zw, result_ref, reference=reference)
@@ -968,7 +973,7 @@ def test_symphony_mapping_validates_batches_and_persists_diagnostics(
     assert len(files) == 2 and all(file.closed for file in files)
 
 
-def test_projection_cache_tracks_counts_and_exact_references(
+def test_projection_cache_tracks_exact_references(
     analyzed_datastore_ephemeral,
     tmp_path,
 ):
@@ -997,26 +1002,169 @@ def test_projection_cache_tracks_counts_and_exact_references(
     assert load_projection(query.zw, newest, reference=first_reference).ref == (newest)
     assert load_projection(query.zw, first, reference=first_reference).ref == first
 
-    backing = query.RNA.rawData._backing
-    selected_row = int(
-        read_stored_selection_indices(
-            query.zw,
-            first_reference.cell_selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )[0]
+
+def test_zero_overlap_query_cells_are_uninformative(
+    analyzed_datastore_ephemeral,
+    tmp_path,
+):
+    reference_store = analyzed_datastore_ephemeral
+    reference_store.cells.insert(
+        "mapping_labels",
+        np.array([f"c{index % 3}" for index in range(reference_store.cells.N)]),
+        overwrite=True,
     )
-    original = int(backing[selected_row, 0])
-    backing[selected_row, 0] = original + 1
-    changed_counts = query.run_mapping(
-        first_reference,
-        first_reference.cell_selection,
+    reference = _plain_reference(reference_store)
+    query, empty = _panel_query(reference_store, reference, tmp_path / "panel.zarr")
+    cells = query.snapshot_cell_selection("I")
+    assert len(_selected_rows(query, cells)) == len(empty)
+    expected = ~_overlap_observed(query, reference, cells)
+    assert expected[empty].all()
+    assert not expected.all()
+
+    result_ref = query.run_mapping(reference, cells, save_k=5)
+    result = query.get_mapping_result(result_ref, reference=reference, load_arrays=True)
+    np.testing.assert_array_equal(result.uninformative, expected)
+    assert result.diagnostics["uninformativeCellCount"] == int(expected.sum())
+    assert result.diagnostics["featureCoverage"] < 1
+
+    labels = query.get_target_classes(
+        result_ref,
+        "mapping_labels",
+        reference=reference,
+        threshold_fraction=0.0,
+    ).to_numpy()
+    assert (labels[expected] == "NA").all()
+    evidence = query.get_target_label_evidence(
+        result_ref,
+        "mapping_labels",
+        reference=reference,
+        threshold_fraction=0.0,
     )
-    backing[selected_row, 0] = original + 2
-    changed_again = query.run_mapping(
-        first_reference,
-        first_reference.cell_selection,
+    assert evidence["isUnknown"].to_numpy()[expected].all()
+    assert evidence["voteFraction"].isna().to_numpy()[expected].all()
+    assert evidence["voteFraction"].notna().to_numpy()[~expected].all()
+    assert (labels[~expected] != "NA").any()
+
+    groups = np.where(expected, "empty", "measured")
+    scores = dict(
+        query.get_mapping_score(
+            result_ref,
+            target_groups=groups,
+            reference=reference,
+            log_transform=False,
+        )
     )
-    assert changed_again != changed_counts
+    np.testing.assert_array_equal(scores["empty"], 0.0)
+    assert scores["measured"].sum() > 0
+
+    # Symphony statistics use only informative cells, so mapping the
+    # informative cells alone reproduces their corrected neighbors.
+    symphony_reference = _symphony_reference(reference_store)
+    query.cells.insert("measured_cells", ~expected, overwrite=True)
+    measured_cells = query.snapshot_cell_selection("measured_cells")
+    with_empty = query.get_mapping_result(
+        query.run_mapping(symphony_reference, cells, save_k=3),
+        reference=symphony_reference,
+        load_arrays=True,
+    )
+    measured_only = query.get_mapping_result(
+        query.run_mapping(symphony_reference, measured_cells, save_k=3),
+        reference=symphony_reference,
+        load_arrays=True,
+    )
+    np.testing.assert_array_equal(with_empty.uninformative, expected)
+    assert not measured_only.uninformative.any()
+    np.testing.assert_array_equal(with_empty.indices[~expected], measured_only.indices)
+    np.testing.assert_allclose(
+        with_empty.distances[~expected],
+        measured_only.distances,
+        rtol=1e-9,
+        atol=1e-12,
+    )
+
+
+def test_query_scaled_dispersion_ignores_missing_feature_fill(
+    analyzed_datastore_ephemeral,
+    tmp_path,
+):
+    reference_store = analyzed_datastore_ephemeral
+    reference = _plain_reference(reference_store)
+    query, _ = _panel_query(reference_store, reference, tmp_path / "panel.zarr")
+    cells = query.snapshot_cell_selection("I")
+    dispersion = {
+        policy: query.get_mapping_result(
+            query.run_mapping(reference, cells, missing_feature_policy=policy),
+            reference=reference,
+        ).diagnostics["queryScaledDispersion"]
+        for policy in ("reference_mean", "zero")
+    }
+    assert dispersion["zero"] == pytest.approx(dispersion["reference_mean"], rel=1e-12)
+
+
+def test_mapping_reuse_does_not_read_query_counts(
+    analyzed_datastore_ephemeral,
+    tmp_path,
+    monkeypatch,
+):
+    reference_store = analyzed_datastore_ephemeral
+    reference = _plain_reference(reference_store)
+    query = _copied_query(reference_store, tmp_path / "query.zarr")
+    projection = query.run_mapping(reference, reference.cell_selection)
+
+    matrix = query.RNA.matrixGroup
+    count_paths = tuple(f"{matrix[name].path}/" for name in matrix.array_keys())
+    assert any(path.endswith("/counts/") for path in count_paths)
+    matrix_store = matrix.store
+    keys: list[str] = []
+    store_type = type(matrix_store)
+    original_get = store_type.get
+
+    async def recording_get(store, key, prototype, byte_range=None):
+        if store is matrix_store:
+            keys.append(key)
+        return await original_get(store, key, prototype, byte_range)
+
+    monkeypatch.setattr(store_type, "get", recording_get)
+    reused = query.run_mapping(reference, reference.cell_selection)
+
+    assert reused == projection
+    assert any(key.startswith("RNA/") for key in keys)
+    count_chunks = [
+        key
+        for key in keys
+        if key.startswith(count_paths) and not key.endswith("zarr.json")
+    ]
+    assert count_chunks == []
+
+    # A fresh projection streams the counts, so the recorder does see them.
+    keys.clear()
+    query.run_mapping(reference, reference.cell_selection, invalidate_cache=True)
+    assert any(
+        key.startswith(count_paths) and not key.endswith("zarr.json") for key in keys
+    )
+
+
+def test_projection_inputs_record_query_dataset_fingerprint(
+    analyzed_datastore_ephemeral,
+    tmp_path,
+):
+    reference_store = analyzed_datastore_ephemeral
+    reference = _plain_reference(reference_store)
+    query = _copied_query(reference_store, tmp_path / "query.zarr")
+    projection = query.run_mapping(reference, reference.cell_selection)
+
+    inputs = query.inspect_artifact(projection).inputs or {}
+    assert inputs["query_dataset_fingerprint"] == query._ensure_dataset_fingerprint(
+        "RNA"
+    )
+    assert "selected_expression_fingerprint" not in inputs
+
+    # Stand in for a rebuilt query dataset at the same location.
+    query.RNA.z.attrs["dataset_fingerprint"] = "rebuilt-query-dataset"
+    with pytest.raises(ValueError, match="prepared query assay 'RNA'.*run_mapping"):
+        query.get_mapping_result(projection, reference=reference)
+    remapped = query.run_mapping(reference, reference.cell_selection)
+    assert remapped != projection
+    remapped_inputs = query.inspect_artifact(remapped).inputs or {}
+    assert remapped_inputs["query_dataset_fingerprint"] == "rebuilt-query-dataset"
+    assert query.get_mapping_result(remapped, reference=reference).ref == remapped

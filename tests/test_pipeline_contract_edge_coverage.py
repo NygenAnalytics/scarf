@@ -12,6 +12,7 @@ from zarr.storage import MemoryStore
 import scarf.datastore._pipeline_ledger as ledger_module
 import scarf.datastore._pipeline_recipe as recipe_module
 import scarf.storage.pipeline_runs as run_storage
+from scarf.clustering.leiden import canonical_resolution
 from scarf.datastore._pipeline_ledger import RunLedger
 from scarf.datastore.pipeline_run import PipelineExecutionError
 from scarf.storage.artifact_writer import ArtifactPlanReceipt
@@ -420,15 +421,12 @@ def test_pipeline_recipe_helper_validation() -> None:
             recipe_module._column_sequence(value, "columns")
     for value in (True, "one", float("inf"), 0):
         with pytest.raises((TypeError, ValueError)):
-            recipe_module._canonical_resolution(value)
+            canonical_resolution(value)
     for value in (1, {}, {"partitions": "one"}, {"partitions": []}):
         with pytest.raises((TypeError, ValueError)):
             recipe_module._resolve_leiden(value)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="duplicate"):
         recipe_module._resolve_leiden({"partitions": [1, 1.0]})
-    for value in (True, "bad", float("inf")):
-        with pytest.raises((TypeError, ValueError)):
-            recipe_module._manual_bound(value, "bounds")
     for value in (False, "bad", float("nan")):
         with pytest.raises((TypeError, ValueError)):
             recipe_module._finite_real(value, "value")
@@ -471,6 +469,24 @@ def test_pipeline_filtering_contract_errors() -> None:
             },
             TypeError,
             "keep_bounds",
+        ),
+        *(
+            (
+                {
+                    "method": "manual",
+                    "attrs": ["RNA_nCounts"],
+                    "lows": [low],
+                    "highs": [high],
+                },
+                error_type,
+                message,
+            )
+            for low, high, error_type, message in (
+                (True, None, TypeError, "lows values"),
+                ("bad", None, TypeError, "lows values"),
+                (None, float("inf"), ValueError, "finite"),
+                (3, 2, ValueError, "cannot exceed"),
+            )
         ),
         ({"attrs": ["RNA_nCounts"], "unknown": 1}, ValueError, "Unknown automatic"),
         ({"attrs": ["RNA_nCounts"], "min_p": 0.999}, ValueError, "0 < min_p"),

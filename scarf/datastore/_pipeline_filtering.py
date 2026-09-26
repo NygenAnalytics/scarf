@@ -2,12 +2,8 @@ from typing import Any
 
 import numpy as np
 
-from ..quality_control.filtering import (
-    _apply_bounds,
-    _sample_aware_mad_mask,
-    _validated_sample_labels,
-    gaussian_quantile_bounds,
-)
+from ..quality_control.filtering import filter_cell_metrics
+from ..storage.arrays import linked_missing_mask
 from ..storage.artifacts import ArtifactRef, artifact_group
 from ..storage.selections import (
     read_stored_selection_mask,
@@ -27,23 +23,13 @@ def snapshot_column_values(
     values = np.asarray(source[:])
     if values.ndim != 1:
         raise ValueError(f"Snapshot column {column!r} must be one-dimensional")
-    missing_name = source.attrs.get("missing_mask")
-    if missing_name is None:
-        return values, None
-    if (
-        not isinstance(missing_name, str)
-        or not missing_name
-        or missing_name not in snapshot
-    ):
-        raise ValueError(f"Snapshot column {column!r} has an invalid missing mask")
-    missing_source = as_zarr_array(snapshot[missing_name], name=missing_name)
-    if (
-        missing_source.ndim != 1
-        or missing_source.shape != source.shape
-        or np.dtype(missing_source.dtype) != np.dtype(bool)
-    ):
-        raise ValueError(f"Snapshot column {column!r} has a malformed missing mask")
-    return values, np.asarray(missing_source[:], dtype=bool)
+    missing = linked_missing_mask(
+        snapshot,
+        column,
+        label=f"Snapshot column {column!r}",
+        values=source,
+    )
+    return values, None if missing is None else np.asarray(missing[:])
 
 
 def filter_pipeline_selection(
@@ -67,86 +53,54 @@ def filter_pipeline_selection(
         return input_selection
     snapshot = artifact_group(store.zw, cell_snapshot)
     values_by_attr: dict[str, np.ndarray] = {}
-    metric_missing = np.zeros(active.shape, dtype=bool)
+    missing_by_attr: dict[str, np.ndarray] = {}
     for attr in attrs:
         values, missing = snapshot_column_values(snapshot, attr)
         values_by_attr[attr] = values
         if missing is not None:
-            metric_missing |= missing
-    filter_active = active & ~metric_missing
-    parameters = dict(config)
-    if config["method"] == "manual":
-        keep = ~metric_missing
-        keep_bounds = config["keepBounds"]
-        for attr, low, high in zip(
-            attrs,
-            config["lows"],
-            config["highs"],
-            strict=True,
-        ):
-            keep &= _apply_bounds(
-                values_by_attr[attr],
-                low,
-                high,
-                keep_bounds=keep_bounds,
-            )
-    elif config["method"] == "gaussian":
-        if not filter_active.any():
-            raise ValueError(
-                "Pipeline filtering has no selected cells with complete metrics"
-            )
-        keep = ~metric_missing
-        bounds: dict[str, dict[str, float]] = {}
-        for attr in attrs:
-            low, high = gaussian_quantile_bounds(
-                values_by_attr[attr][filter_active],
-                config["minP"],
-                config["maxP"],
-            )
-            bounds[attr] = {"low": low, "high": high}
-            keep &= _apply_bounds(
-                values_by_attr[attr], low, high, keep_bounds=low == high
-            )
-        parameters["resolvedBounds"] = bounds
+            missing_by_attr[attr] = missing
+    method = config["method"]
+    options: dict[str, Any]
+    if method == "manual":
+        options = {
+            "lows": config["lows"],
+            "highs": config["highs"],
+            "keep_bounds": config["keepBounds"],
+        }
     else:
-        if not filter_active.any():
-            raise ValueError(
-                "Pipeline filtering has no selected cells with complete metrics"
-            )
+        options = {
+            "min_p": config["minP"],
+            "max_p": config["maxP"],
+            "n_mads": config["nMads"],
+            "min_cells_per_sample": config["minCellsPerSample"],
+        }
         sample_column = config["sampleColumn"]
-        labels = None
-        if sample_column is not None:
+        if method == "mad" and sample_column is not None:
             labels, sample_missing = snapshot_column_values(snapshot, sample_column)
-            if sample_missing is not None and np.any(active & sample_missing):
-                raise ValueError(
-                    f"sample column {sample_column!r} contains missing labels "
-                    "among active cells"
-                )
-            labels = _validated_sample_labels(
-                labels,
-                active,
-                label_name=f"sample column {sample_column!r}",
+            options.update(
+                sample_labels=labels,
+                sample_missing=sample_missing,
+                sample_label_name=f"sample column {sample_column!r}",
             )
-        keep, provenance = _sample_aware_mad_mask(
-            values_by_attr=values_by_attr,
-            sample_labels=labels,
-            active=filter_active,
-            n_mads=config["nMads"],
-            min_cells_per_sample=config["minCellsPerSample"],
-            attrs=attrs,
-        )
-        keep &= ~metric_missing
-        for message in provenance["warnings"]:
+    result = filter_cell_metrics(
+        values_by_attr,
+        missing_by_attr,
+        active,
+        method=method,
+        **options,
+    )
+    parameters = dict(config)
+    if result.gaussian_bounds is not None:
+        parameters["resolvedBounds"] = result.gaussian_bounds
+    if result.mad_provenance is not None:
+        for message in result.mad_provenance["warnings"]:
             logger.warning(message)
-        parameters["mad"] = provenance
-    values = np.asarray(active & keep, dtype=bool)
-    if not values.any():
-        raise ValueError("Pipeline filtering removed every selected cell")
+        parameters["mad"] = result.mad_provenance
     return resolve_generated_selection_artifact(
         store.zw,
         scope="datastore",
         kind="cell_selection",
-        values=values,
+        values=result.retained,
         row_ids=store.cells._get_array("ids"),
         operation="filter_pipeline_cells",
         parameters=parameters,

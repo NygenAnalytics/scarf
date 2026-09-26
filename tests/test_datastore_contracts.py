@@ -59,6 +59,7 @@ _METHODS = {
         "add_melded_assay",
         "auto_filter_cells",
         "calc_membership_strength",
+        "discard_interrupted_assay",
         "export_markers_to_csv",
         "filter_cells",
         "get_assay",
@@ -98,9 +99,9 @@ _METHODS = {
 
 _SIGNATURE_DIGESTS = {
     BaseDataStore: "c37e846f04db4d315c763923651bcca47e675527f0ff343c6d584715cc77fe46",
-    GraphDataStore: "b2de362c90ce204f13a6e9754452e50398351eeb72b05fc605b1bd969f5feaed",
+    GraphDataStore: "a03fc69081f062a311cbc4ba45c61837e7e64d8755be2b60373439c0ae9df5b8",
     MappingDatastore: "dd7c11707d882495a767ccc3022e5053344a6c4196e5f1bd9b0a4008a55e78ff",
-    DataStore: "0f0c33c90775b840cbcf5e1f96c3c399b41e70d35a59631c5da0a9edce6127e8",
+    DataStore: "556df680799d5420ad0ee0a6f5119fda795c3e5287e48db8e917b6c699f16eae",
 }
 
 

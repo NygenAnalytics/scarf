@@ -1098,7 +1098,7 @@ def test_datastore_scib_metrics(datastore, connectivity_graph):
     assert 0 <= clisi <= 1
     assert 0 <= graph_connectivity_score <= 1
     assert 0 <= mixing_score <= 1
-    with pytest.raises(ValueError, match="connectivity map or an integrated graph"):
+    with pytest.raises(ValueError, match="connectivity_map or integrated_graph"):
         datastore.metric_graph_connectivity(
             "metric_annotations",
             neighbors,

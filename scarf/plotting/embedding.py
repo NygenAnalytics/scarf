@@ -28,6 +28,7 @@ from ._data import (
 from ._deps import require_matplotlib
 from ._display import stored_display_metadata
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
+from ..utils.arrays import sort_categories
 from ._style import (
     DEFAULT_PANEL_INCHES,
     DEFAULT_POINT_EDGEWIDTH,
@@ -44,7 +45,6 @@ from ._style import (
     legend_side_columns,
     resolve_legend_loc,
     scatter_edgecolor,
-    sort_categories,
     square_axis_limits,
     theme_context,
 )

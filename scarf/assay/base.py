@@ -1,4 +1,4 @@
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Iterator, Sequence
 from typing import Any, Literal, cast
 
 import numpy as np
@@ -14,10 +14,50 @@ from ..storage.types import as_zarr_array, as_zarr_group
 from ..utils.arrays import array_digest, regex_match_mask
 from ..utils.compute import controlled_compute
 from ..utils.logging import logger
-from .normalization import NormMethod, norm_dummy, norm_lib_size
+from .normalization import (
+    NormalizedValueSource,
+    NormMethod,
+    iter_feature_group_means,
+    norm_dummy,
+    norm_lib_size,
+    normalizer_count_arithmetic,
+)
 from ..utils.arrays import has_duplicates
 
 type PercentFeatures = dict[str, str]
+
+
+def raw_csr(
+    assay: "Assay",
+    cell_idx: np.ndarray,
+    feat_idx: np.ndarray | None = None,
+) -> csr_matrix:
+    """Return the raw counts of selected cells and features as one CSR matrix.
+
+    Rows are converted in bounded blocks and stacked once, because stacking
+    per block copies the growing matrix every time. An empty cell selection
+    returns a matrix with zero rows.
+    """
+    counts = assay.rawData if feat_idx is None else assay.rawData[:, feat_idx]
+    selected = counts[cell_idx, :]
+    blocks = [
+        csr_matrix(values)
+        for values in selected.stream_blocks(
+            nthreads=assay.nthreads,
+            msg=f"Converting {assay.name} raw data to CSR",
+        )
+    ]
+    if not blocks:
+        return csr_matrix(selected.shape, dtype=assay.rawData.dtype)
+    return cast(csr_matrix, vstack(blocks, format="csr"))
+
+
+def _stream_byte_count(value: Any, name: str) -> int:
+    if isinstance(value, bool | np.bool_) or not isinstance(value, int | np.integer):
+        raise TypeError(f"{name} must be a non-negative integer")
+    if value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return int(value)
 
 
 class Assay:
@@ -153,21 +193,11 @@ class Assay:
                       type. The data will be exported for only those that have a True value
                       in this column.
 
-        Returns: A sparse matrix containing raw data.
+        Returns: A sparse matrix containing raw data. An empty cell selection
+            returns a matrix with zero rows and one column per feature.
 
         """
-        sm = None
-        selected = self.rawData[self.cells.active_index(cell_key), :]
-        for values in selected.stream_blocks(
-            nthreads=self.nthreads,
-            msg=f"Converting {self.name} raw data to CSR",
-        ):
-            s = csr_matrix(values)
-            if sm is None:
-                sm = s
-            else:
-                sm = vstack([sm, s])
-        return sm  # type: ignore
+        return raw_csr(self, self.cells.active_index(cell_key))
 
     requiresCountsT = False
 
@@ -195,13 +225,27 @@ class Assay:
             for name, pattern in percent_patterns.items():
                 if pattern and self._plan_percent_feature(pattern, name) is not None:
                     raise ValueError(
-                        f"Required percentage {name!r} is missing. {REBUILD_REQUIRED}"
+                        f"Percentage {name!r} was not computed when assay "
+                        f"{self.name!r} was first prepared, and a prepared assay "
+                        "cannot add percentage columns. To use pattern "
+                        f"{pattern!r}, import the data into a fresh store and "
+                        "pass the pattern when that store is first opened, or "
+                        "compute a separate quality-metric artifact with "
+                        "run_feature_percentage and an explicit feature selection."
                     )
             return
         if state is not False or self.z.read_only:
             raise ValueError(f"Assay {self.name!r} is not prepared. {REBUILD_REQUIRED}")
 
-        for name in set(percent_patterns) | set(self._percent_features()):
+        # First preparation derives every percentage from the counts, so any
+        # imported column with a percentage name is replaced, never trusted.
+        for name in sorted(set(percent_patterns) | set(self._percent_features())):
+            if name in cells:
+                logger.warning(
+                    f"Discarding existing cell column {name!r}: the first "
+                    f"preparation of assay {self.name!r} derives percentage "
+                    "columns from its counts with the configured patterns."
+                )
             clear_column(cells, name)
         self.attrs["percentFeatures"] = {}
         planned = {
@@ -443,6 +487,37 @@ class Assay:
         boundary = np.array([cells.shape[0]], dtype=np.int64)
         return array_digest(np.concatenate([boundary, cells, feats]))
 
+    def _count_arithmetic(
+        self,
+        values: NormalizedValueSource,
+        *,
+        log_transform: bool = False,
+        renormalize_subset: bool = False,
+    ) -> Literal["float64"] | None:
+        """Return the count-arithmetic marker of an artifact of these values.
+
+        ``values`` names what the artifact reads: ``normed`` itself, the
+        ``run_normalization`` payload, ``iter_normed_feature_wise`` batches,
+        or feature scores. This assay computes all of them with ``normed``,
+        which ignores the normalization flags.
+        """
+        return normalizer_count_arithmetic(self, self.normMethod)
+
+    def _iter_feature_group_means(
+        self,
+        cell_idx: np.ndarray,
+        feature_groups: Sequence[np.ndarray],
+        *,
+        block_rows: int | None = None,
+    ) -> Iterator[np.ndarray]:
+        """Yield per-cell group means, as ``iter_feature_group_means`` does.
+
+        ``block_rows`` is the preferred row band of assays that read counts
+        directly. Normalized blocks here keep their budgeted size, because
+        their values do not depend on it.
+        """
+        yield from iter_feature_group_means(self, cell_idx, feature_groups)
+
     def _write_normalized_payload(
         self,
         cell_idx: np.ndarray,
@@ -504,6 +579,8 @@ class Assay:
         batch_size: int | None,
         msg: str | None,
         as_dataframe: bool = True,
+        scratch_itemsize: int = 0,
+        resident_bytes: int = 0,
         **norm_params: Any,
     ) -> Generator[pd.DataFrame | tuple[np.ndarray, np.ndarray], None, None]:
         """Iterate over explicitly selected normalized features in batches.
@@ -516,6 +593,11 @@ class Assay:
                 operation memory budget.
             msg: Message to be displayed in the progress bar
             as_dataframe: If true (default) then the yielded matrices are pandas dataframe
+            scratch_itemsize: Bytes of working memory the caller needs per
+                yielded value while it processes one batch. Batches are sized
+                so that this scratch also fits the memory budget.
+            resident_bytes: Bytes the caller keeps allocated for the whole
+                iteration, such as an output buffer.
             **norm_params: Extra keyword arguments forwarded to ``normed``.
 
         Returns:
@@ -528,6 +610,8 @@ class Assay:
         feat_idx = np.asarray(feat_idx, dtype=np.int64)
         if cell_idx.ndim != 1 or feat_idx.ndim != 1:
             raise ValueError("cell_idx and feat_idx must be one-dimensional")
+        scratch_itemsize = _stream_byte_count(scratch_itemsize, "scratch_itemsize")
+        resident_bytes = _stream_byte_count(resident_bytes, "resident_bytes")
         if msg is None:
             msg = ""
         data: ChunkedArray = self.normed(
@@ -548,8 +632,9 @@ class Assay:
             resources=self.resources,
             blockBytes=lambda width: max(
                 1,
-                n_cells * width * (raw_itemsize + 2 * out_itemsize),
+                n_cells * width * (raw_itemsize + 2 * out_itemsize + scratch_itemsize),
             ),
+            residentBytes=resident_bytes,
             requestedBatchSize=batch_size,
         )
         logger.debug(
@@ -655,9 +740,8 @@ class Assay:
             params,
         )
 
-    def _write_aggregated_ordering_group(
+    def _aggregate_ordering_profiles(
         self,
-        group: zarr.Group,
         *,
         cell_idx: np.ndarray,
         cell_ordering: np.ndarray,
@@ -669,13 +753,74 @@ class Assay:
         z_scale: bool,
         batch_size: int | None,
         norm_params: dict[str, Any],
-    ) -> tuple[ChunkedArray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Aggregate normalized features along a cell ordering in memory.
+
+        Returns the features-by-bins profiles, the streamed feature indices,
+        and the mask of features that pass the expression and variability
+        filter. Nothing is written, so a caller can validate the result before
+        it starts an artifact.
+        """
+        from ..trajectory.feature_dynamics import (
+            AGGREGATION_SCRATCH_ITEMSIZE,
+            aggregate_feature_profiles,
+        )
+
+        n_features = int(feat_idx.shape[0])
+        data = np.empty((n_features, int(effective_bins)), dtype=np.float64)
+        feature_indices = np.empty(n_features, dtype=np.uint64)
+        valid = np.empty(n_features, dtype=bool)
+        ordering_idx = np.argsort(cell_ordering, kind="stable")
+        resident_bytes = (
+            data.nbytes + feature_indices.nbytes + valid.nbytes + ordering_idx.nbytes
+        )
+        offset = 0
+        for item in self.iter_normed_feature_wise(
+            cell_idx,
+            feat_idx,
+            batch_size,
+            "Binning over cell-ordering",
+            False,
+            scratch_itemsize=AGGREGATION_SCRATCH_ITEMSIZE,
+            resident_bytes=resident_bytes,
+            **norm_params,
+        ):
+            values, labels = cast(tuple[np.ndarray, np.ndarray], item)
+            del item
+            aggregated, batch_valid = aggregate_feature_profiles(
+                values.T,
+                ordering_idx,
+                labels,
+                min_expression=min_exp,
+                window_size=effective_window,
+                n_bins=effective_bins,
+                smooth=smoothen,
+                z_scale=z_scale,
+            )
+            del values
+            stop = offset + aggregated.shape[0]
+            data[offset:stop] = aggregated
+            feature_indices[offset:stop] = labels
+            valid[offset:stop] = batch_valid
+            offset = stop
+        if offset != n_features:
+            raise ValueError("Normalized features do not cover the selected features")
+        return data, feature_indices, valid
+
+    def _write_aggregated_ordering_group(
+        self,
+        group: zarr.Group,
+        *,
+        data: np.ndarray,
+        feature_indices: np.ndarray,
+        valid: np.ndarray,
+    ) -> None:
+        """Write aggregated profiles into a started artifact group."""
         from ..storage.arrays import create_numeric_array, create_zarr_dataset
         from ..storage.layout import row_sharded_array_spec
         from ..storage.profiles import resolve_storage_profile
-        from ..trajectory.feature_dynamics import aggregate_feature_profiles
 
-        aggregated_shape = (int(feat_idx.shape[0]), int(effective_bins))
+        aggregated_shape = (int(data.shape[0]), int(data.shape[1]))
         data_array = create_numeric_array(
             group,
             "data",
@@ -686,36 +831,7 @@ class Assay:
                 band_rows=max(1, aggregated_shape[0]),
             ),
         )
-        ordering_idx = np.argsort(cell_ordering, kind="stable")
-        stored_feat_idx: list[int] = []
-        valid_feat_flags: list[bool] = []
-        offset = 0
-        for item in self.iter_normed_feature_wise(
-            cell_idx,
-            feat_idx,
-            batch_size,
-            "Binning over cell-ordering",
-            True,
-            **norm_params,
-        ):
-            frame = cast(pd.DataFrame, item)
-            stored_feat_idx.extend(list(frame.columns))
-            aggregated, valid_features = aggregate_feature_profiles(
-                frame.to_numpy(dtype=float),
-                ordering_idx,
-                np.asarray(frame.columns),
-                min_expression=min_exp,
-                window_size=effective_window,
-                n_bins=effective_bins,
-                smooth=smoothen,
-                z_scale=z_scale,
-            )
-            valid_feat_flags.extend(valid_features.tolist())
-            data_array[offset : offset + aggregated.shape[0]] = aggregated
-            offset += aggregated.shape[0]
-
-        feature_indices = np.asarray(stored_feat_idx, dtype=np.uint64)
-        valid = np.asarray(valid_feat_flags, dtype=bool)
+        data_array[:] = data
         feature_array = create_zarr_dataset(
             group,
             "feature_indices",
@@ -732,15 +848,6 @@ class Assay:
             (len(valid),),
         )
         valid_array[:] = valid
-        return (
-            ChunkedArray(
-                data_array,
-                nthreads=self.nthreads,
-                resources=self.resources,
-            ),
-            feature_indices,
-            valid,
-        )
 
     def mean_features(
         self,

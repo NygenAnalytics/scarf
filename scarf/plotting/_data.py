@@ -1,6 +1,7 @@
 """Feature resolution and bounded group reducers."""
 
 from collections.abc import Mapping, Sequence
+from ..utils.arrays import sort_categories
 from typing import Any
 
 import numpy as np
@@ -20,7 +21,6 @@ from ._contracts import (
     NormalizationSpec,
     StudyDesign,
 )
-from ._style import sort_categories
 
 
 def _artifact_cell_selection(

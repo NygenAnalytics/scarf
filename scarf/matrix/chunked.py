@@ -1,6 +1,7 @@
 """Lazy blockwise matrix operations over NumPy and Zarr arrays."""
 
 from collections.abc import Callable, Iterator
+from functools import partial
 from typing import Any, cast
 
 import numpy as np
@@ -526,13 +527,17 @@ class ChunkedArray:
     ) -> Any:
         if method != "__call__" or kwargs.get("out") is not None:
             return NotImplemented
+        # A requested dtype sets the ufunc's computation dtype for each block,
+        # so integer blocks can be scaled or logged without a cast copy.
+        dtype = kwargs.get("dtype")
+        func = ufunc if dtype is None else partial(ufunc, dtype=np.dtype(dtype))
         if len(inputs) == 1:
-            return self._unary(ufunc)
+            return self._unary(func)
         if len(inputs) == 2:
             left, right = inputs
             if left is self:
-                return self._binary(ufunc, right, "left")
-            return self._binary(ufunc, left, "right")
+                return self._binary(func, right, "left")
+            return self._binary(func, left, "right")
         return NotImplemented
 
     def __mul__(self, o: object) -> "ChunkedArray":

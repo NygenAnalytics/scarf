@@ -329,6 +329,27 @@ def test_aucell_python_scoring_kernel_matches_compiled_kernel() -> None:
     np.testing.assert_allclose(actual, [1.0, 0.0, 1.0])
 
 
+def test_aucell_python_block_kernel_matches_compiled_kernel() -> None:
+    matrix = np.array(
+        [[3, 0, 3, 1, 0, 2], [0, 0, 0, 0, 0, 0], [1, 1, 1, 1, 1, 1]],
+        dtype=np.uint32,
+    )
+    permutation = np.array([2, 0, 5, 1, 4, 3], dtype=np.int64)
+    connections = np.array([0, 2, 4, 1, 3, 0], dtype=np.int64)
+    starts = np.array([0, 3, 5], dtype=np.int64)
+    offsets = np.array([3, 2, 1], dtype=np.int64)
+
+    expected = aucell._score_ranked_block(
+        matrix, permutation, connections, starts, offsets, 3
+    )
+    actual = aucell._score_ranked_block.py_func(
+        matrix, permutation, connections, starts, offsets, 3
+    )
+
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(actual[1], [0.0, 0.0, 0.0])
+
+
 def test_connectivity_python_union_find_kernels_cover_all_edge_cases() -> None:
     parents = np.array([1, 2, 2], dtype=np.int64)
     assert connectivity._find_root.py_func(parents, 0) == 2

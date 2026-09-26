@@ -10,10 +10,10 @@ from ..storage.artifacts import ArtifactRef
 from ._contracts import CategoricalScale, ColorScale, PlotProvenance, SizeScale
 from ._deps import require_matplotlib
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
+from ..utils.arrays import sort_categories
 from ._style import (
     apply_figure_chrome,
     continuous_norm,
-    sort_categories,
     theme_context,
 )
 

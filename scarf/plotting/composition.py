@@ -16,13 +16,13 @@ from ._figure import (
     _place_legend_blocks,
     normalize_axes_target,
 )
+from ..utils.arrays import sort_categories
 from ._style import (
     apply_figure_chrome,
     capped_figsize,
     categorical_color_map,
     foreground_color,
     scatter_edgecolor,
-    sort_categories,
     theme_context,
 )
 

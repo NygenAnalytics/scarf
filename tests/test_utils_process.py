@@ -1,6 +1,8 @@
 """Behavioral tests for process helpers."""
 
+import os
 import subprocess
+import sys
 from unittest.mock import MagicMock
 from pathlib import Path
 
@@ -11,6 +13,7 @@ from scarf.utils.process import (
     read_process_tree_rss_bytes,
     rss_peak_tracker,
     sample_process_tree_rss,
+    suppress_native_output,
     system_call,
 )
 
@@ -153,3 +156,56 @@ def test_process_tree_sampler_preserves_baseline_and_sampled_peak() -> None:
     assert final.baseline_bytes == 100
     assert final.peak_bytes == 140
     assert final.incremental_peak_bytes == 40
+
+
+def _standard_descriptors() -> dict[int, tuple[int, int]]:
+    """Return the device and inode behind standard output and error."""
+    return {fd: (os.fstat(fd).st_dev, os.fstat(fd).st_ino) for fd in (1, 2)}
+
+
+def _null_descriptors() -> dict[int, tuple[int, int]]:
+    """Return what ``_standard_descriptors`` reports while both are discarded."""
+    status = os.stat(os.devnull)
+    return {fd: (status.st_dev, status.st_ino) for fd in (1, 2)}
+
+
+def test_suppress_native_output_discards_descriptor_writes_and_restores(capfd):
+    import ctypes
+
+    libc = ctypes.CDLL(None)
+    before = _standard_descriptors()
+    # capfd replaces sys.stdout, so the original streams exercise the flushes
+    # that keep buffered text on the correct side of the redirection.
+    stdout = sys.__stdout__
+    stderr = sys.__stderr__
+    assert stdout is not None and stderr is not None
+    stdout.write("python-before\n")
+
+    with suppress_native_output():
+        assert _standard_descriptors() == _null_descriptors()
+        stdout.write("python-inside\n")
+        stderr.write("python-error-inside\n")
+        libc.printf(b"native-inside\n")
+        os.write(1, b"descriptor-inside\n")
+        os.write(2, b"descriptor-error-inside\n")
+
+    assert _standard_descriptors() == before
+    with open(os.devnull, "w") as later:
+        assert later.fileno() > 2
+    os.write(1, b"descriptor-after\n")
+    captured = capfd.readouterr()
+    assert captured.out == "python-before\ndescriptor-after\n"
+    assert captured.err == ""
+
+
+def test_suppress_native_output_restores_descriptors_after_errors(capfd):
+    before = _standard_descriptors()
+
+    with pytest.raises(RuntimeError, match="native failure"):
+        with suppress_native_output():
+            os.write(2, b"hidden\n")
+            raise RuntimeError("native failure")
+
+    assert _standard_descriptors() == before
+    os.write(2, b"visible\n")
+    assert capfd.readouterr().err == "visible\n"

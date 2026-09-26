@@ -278,3 +278,39 @@ def test_shared_physical_matrix_collision_fails_before_writes():
         )
     assert "second" not in root
     np.testing.assert_array_equal(counts[:], [[1, 2], [3, 4]])
+
+
+def test_first_preparation_discards_imported_percentages_with_warning():
+    storage, _ = _qc_store()
+    cells = MetaData(zarr.open_group(store=storage, mode="r+")["cellData"])
+    cells.insert("RNA_percentMito", np.full(6, 42.0))
+
+    messages: list[str] = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]),
+        level="WARNING",
+    )
+    try:
+        store = _open_qc_store(storage)
+    finally:
+        logger.remove(sink)
+
+    discarded = [message for message in messages if "Discarding existing" in message]
+    assert len(discarded) == 1
+    assert "'RNA_percentMito'" in discarded[0]
+    mito = store.cells.fetch_all("RNA_percentMito")
+    assert not np.any(mito == 42.0)
+    assert np.isnan(mito[4])
+
+
+def test_prepared_store_explains_how_to_add_a_missing_percentage():
+    storage, _ = _qc_store()
+    _open_qc_store(storage, mito_pattern="^NO_SUCH_GENE$")
+
+    with pytest.raises(ValueError) as caught:
+        _open_qc_store(storage, mito_pattern="^MT-")
+    message = str(caught.value)
+    assert "'RNA_percentMito' was not computed" in message
+    assert "fresh store" in message
+    assert "run_feature_percentage" in message
+    assert "repack" not in message

@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
 import zarr
@@ -184,9 +182,6 @@ class _ReferenceDatastore:
     def _ensure_dataset_fingerprint(self, name: str) -> str:
         return self.zw[name].attrs["dataset_fingerprint"]
 
-    def _get_assay(self, name: str) -> SimpleNamespace:
-        return SimpleNamespace(attrs=self.zw[name].attrs)
-
 
 def _mapping_reference(
     *,
@@ -257,7 +252,7 @@ def _plan(
         correction_method=correction_method,
         cell_selection=cell_selection,
         feature_selection=feature_selection,
-        selected_expression_fingerprint="e" * 64,
+        query_dataset_fingerprint="query-dataset",
         query_batch_fingerprint=NO_QUERY_BATCH_FINGERPRINT,
         query_batch_count=1,
         mapping_reference=external,
@@ -278,12 +273,12 @@ def _blocks() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     )
 
 
-def _diagnostics(*, zero_norm_cell_count: int = 2) -> dict[str, object]:
+def _diagnostics(*, uninformative_cell_count: int = 2) -> dict[str, object]:
     return {
         "featureCoverage": 1.0,
         "queryBatchCount": 1,
         "algorithmVariant": "scaled_pca",
-        "zeroNormCellCount": zero_norm_cell_count,
+        "uninformativeCellCount": uninformative_cell_count,
         "queryScaledDispersion": 1.0,
     }
 
@@ -384,11 +379,12 @@ def test_projection_writer_persists_exact_contract_and_loads_copies() -> None:
     assert set(status.inputs or {}) == {
         "cell_selection",
         "feature_selection",
-        "selected_expression_fingerprint",
+        "query_dataset_fingerprint",
         "query_batch_fingerprint",
         "query_batch_count",
         "mapping_reference",
     }
+    assert (status.inputs or {})["query_dataset_fingerprint"] == "query-dataset"
     assert (status.inputs or {})["mapping_reference"] == external.to_dict()
     group = artifact_group(root, plan.ref)
     assert set(group.array_keys()) == {"indices", "distances", "uninformative"}
@@ -610,7 +606,9 @@ def test_projection_writer_reuses_only_a_valid_complete_artifact() -> None:
     assert reused.reused
     assert reused.ref == ref
     assert (
-        load_projection(root, ref, reference=reference).diagnostics["zeroNormCellCount"]
+        load_projection(root, ref, reference=reference).diagnostics[
+            "uninformativeCellCount"
+        ]
         == 2
     )
     with pytest.raises(ValueError, match="without a writer"):
@@ -720,7 +718,7 @@ def test_projection_finish_rejects_diagnostics_inconsistent_with_rows() -> None:
     writer.write_block(0, indices, distances, uninformative)
 
     with pytest.raises(ValueError, match="number of uninformative"):
-        writer.finish(_diagnostics(zero_norm_cell_count=1))
+        writer.finish(_diagnostics(uninformative_cell_count=1))
 
     assert not inspect_artifact(root, plan.ref).complete
 
@@ -733,7 +731,7 @@ def test_projection_finish_rejects_diagnostics_inconsistent_with_rows() -> None:
         ("algorithmVariant", "other", "correction method"),
         ("queryBatchCount", 2, "query-batch input"),
         ("queryBatchCount", 5, "cannot exceed"),
-        ("zeroNormCellCount", 5, "cannot exceed"),
+        ("uninformativeCellCount", 5, "cannot exceed"),
         ("queryScaledDispersion", -1.0, "queryScaledDispersion"),
         ("unexpected", 1, "exactly"),
     ],
@@ -767,26 +765,36 @@ def _manual_projection(
     *,
     operation: str = "map_query",
     correction_method: str = "none",
+    zero_norm_contract: bool = False,
 ) -> ArtifactRef:
+    parameters: dict[str, object] = {
+        "save_k": 2,
+        "missing_feature_policy": "reference_mean",
+        "correction_method": correction_method,
+    }
+    inputs: dict[str, object] = {
+        "cell_selection": cell_selection,
+        "feature_selection": feature_selection,
+        "query_batch_fingerprint": NO_QUERY_BATCH_FINGERPRINT,
+        "query_batch_count": 1,
+        "mapping_reference": mapping_reference,
+    }
+    diagnostics = _diagnostics()
+    if zero_norm_contract:
+        # The previous contract flagged zero-norm projected rows and hashed the
+        # selected raw counts instead of recording the query dataset identity.
+        inputs["selected_expression_fingerprint"] = "e" * 64
+        diagnostics["zeroNormCellCount"] = diagnostics.pop("uninformativeCellCount")
+    else:
+        inputs["query_dataset_fingerprint"] = "query-dataset"
     planned = plan_artifact(
         root,
         scope="assay",
         assay="RNA",
         kind="projection",
         operation=operation,
-        parameters={
-            "save_k": 2,
-            "missing_feature_policy": "reference_mean",
-            "correction_method": correction_method,
-        },
-        inputs={
-            "cell_selection": cell_selection,
-            "feature_selection": feature_selection,
-            "selected_expression_fingerprint": "e" * 64,
-            "query_batch_fingerprint": NO_QUERY_BATCH_FINGERPRINT,
-            "query_batch_count": 1,
-            "mapping_reference": mapping_reference,
-        },
+        parameters=parameters,
+        inputs=inputs,
         execution_options={},
     )
     group = start_artifact(root, planned)
@@ -794,7 +802,7 @@ def _manual_projection(
     group.create_array("indices", data=indices, chunks=(2, 2))
     group.create_array("distances", data=distances, chunks=(2, 2))
     group.create_array("uninformative", data=uninformative, chunks=(2,))
-    group.attrs["diagnostics"] = _diagnostics()
+    group.attrs["diagnostics"] = diagnostics
     finish_artifact(group, planned)
     return planned.ref
 
@@ -819,6 +827,29 @@ def test_projection_loader_rejects_old_and_local_reference_contracts() -> None:
     for ref in (old, local):
         with pytest.raises(ValueError, match="run_mapping"):
             load_projection(root, ref, reference=reference)
+
+
+@pytest.mark.parametrize("correction_method", ["none", "symphony"])
+def test_projection_loader_rejects_zero_norm_contract_projections(
+    correction_method: str,
+) -> None:
+    root, cells, features = _query_inputs()
+    reference, _ = _mapping_reference()
+    old = _manual_projection(
+        root,
+        cells,
+        features,
+        reference.external_ref,
+        correction_method=correction_method,
+        zero_norm_contract=True,
+    )
+
+    with pytest.raises(ValueError, match="run_mapping"):
+        load_projection(root, old, reference=reference)
+    if correction_method == "none":
+        replacement = _plan(root, cells, features, reference.external_ref)
+        assert not replacement.reused
+        assert replacement.ref != old
 
 
 def test_projection_loader_requires_additive_symphony_provenance() -> None:
@@ -864,7 +895,7 @@ def test_projection_loader_rejects_malformed_or_extra_payload(
         group.attrs["extra"] = "invalid"
     else:
         diagnostics = dict(group.attrs["diagnostics"])
-        diagnostics["zeroNormCellCount"] = 1
+        diagnostics["uninformativeCellCount"] = 1
         group.attrs["diagnostics"] = diagnostics
 
     with pytest.raises(ValueError, match="run_mapping"):
@@ -1069,7 +1100,8 @@ def test_projection_loader_rejects_invalid_call_and_artifact_handles() -> None:
         ("policy", "missing_feature_policy is unsupported"),
         ("correction", "correction_method is unsupported"),
         ("inputs", "inputs do not match"),
-        ("fingerprint", "selected_expression_fingerprint"),
+        ("fingerprint", "query_dataset_fingerprint"),
+        ("dataset", "prepared query assay"),
         ("external", "mapping_reference input is malformed"),
         ("external_kind", "identify a mapping_reference"),
         ("selection_scope", "wrong kind or scope"),
@@ -1098,7 +1130,9 @@ def test_projection_loader_rejects_malformed_provenance(
     elif tamper == "inputs":
         inputs.pop("query_batch_fingerprint")
     elif tamper == "fingerprint":
-        inputs["selected_expression_fingerprint"] = ""
+        inputs["query_dataset_fingerprint"] = ""
+    elif tamper == "dataset":
+        inputs["query_dataset_fingerprint"] = "other-dataset"
     elif tamper == "external":
         inputs["mapping_reference"] = "invalid"
     elif tamper == "external_kind":
@@ -1159,7 +1193,7 @@ def test_plan_projection_rejects_empty_string_arguments() -> None:
             correction_method="none",
             cell_selection=cell_selection,
             feature_selection=feature_selection,
-            selected_expression_fingerprint="e" * 64,
+            query_dataset_fingerprint="query-dataset",
             query_batch_fingerprint=NO_QUERY_BATCH_FINGERPRINT,
             query_batch_count=1,
             mapping_reference=reference.external_ref,
@@ -1176,7 +1210,7 @@ def test_plan_projection_rejects_empty_string_arguments() -> None:
             correction_method="none",
             cell_selection=cell_selection,
             feature_selection=feature_selection,
-            selected_expression_fingerprint="e" * 64,
+            query_dataset_fingerprint="query-dataset",
             query_batch_fingerprint=NO_QUERY_BATCH_FINGERPRINT,
             query_batch_count=1,
             mapping_reference=reference.external_ref,

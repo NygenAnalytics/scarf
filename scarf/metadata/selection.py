@@ -7,7 +7,10 @@ from typing import Any, Literal
 import numpy as np
 import pandas as pd
 
+from ..storage.arrays import linked_missing_mask
 from ..storage.artifacts import ArtifactRef, artifact_group, inspect_artifact
+from ..storage.geometry import array_geometry
+from ..storage.partition import scan_band
 from ..storage.selections import read_stored_selection_indices
 from ..storage.types import as_zarr_array
 from .rows import (
@@ -161,13 +164,18 @@ class NamedCellArtifact:
 
 @dataclass(frozen=True, slots=True)
 class ResolvedCellArtifact:
-    """Artifact values aligned to one validated cell selection."""
+    """Artifact values aligned to one validated cell selection.
+
+    ``missing_mask`` flags rows whose stored value is a placeholder for a
+    missing entry. It is None when the artifact records no missing values.
+    """
 
     source: ArtifactRef
     values: np.ndarray
     cell_idx: np.ndarray
     source_cell_selection: ArtifactRef
     cell_selection: ArtifactRef
+    missing_mask: np.ndarray | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +197,32 @@ def grouping_value_name(kind: str) -> str:
         raise ValueError(
             "Grouping artifacts must contain categorical cell labels"
         ) from exc
+
+
+def require_complete_cluster_labels(
+    group: Any,
+    value_name: str,
+    *,
+    name: str,
+    values: Any | None = None,
+) -> None:
+    """Reject stored cluster labels whose linked mask flags a missing label.
+
+    Imported clusterings store a placeholder for each missing label, so
+    consumers that treat every row as a member of a cluster must refuse them.
+    """
+    try:
+        mask = linked_missing_mask(group, value_name, values=values)
+    except ValueError as error:
+        raise ValueError(f"{name} has a malformed missing-label mask") from error
+    if mask is None:
+        return
+    n_rows = int(mask.shape[0])
+    band = scan_band(array_geometry(mask), fallback=max(1, n_rows))
+    if any(
+        np.asarray(mask[start : start + band]).any() for start in range(0, n_rows, band)
+    ):
+        raise ValueError(f"{name} contains missing cluster labels")
 
 
 def _selection_indices(root: Any, selection: ArtifactRef) -> np.ndarray:
@@ -268,12 +302,24 @@ def resolve_cell_aligned_artifact(
     values = read_array_rows_chunkwise(values_array, compact_idx)
     if values.shape != (len(target_idx),):
         raise ValueError("Cell-aligned artifact values do not match the selection")
+    missing_array = linked_missing_mask(
+        group,
+        value_name,
+        label=f"Cell-aligned artifact array {value_name!r}",
+        values=values_array,
+    )
+    missing = (
+        None
+        if missing_array is None
+        else read_array_rows_chunkwise(missing_array, compact_idx)
+    )
     return ResolvedCellArtifact(
         source=artifact,
         values=values,
         cell_idx=target_idx,
         source_cell_selection=source_selection,
         cell_selection=target_selection,
+        missing_mask=missing,
     )
 
 
@@ -324,7 +370,7 @@ def resolve_grouping(
         labels=resolved.values,
         cell_idx=resolved.cell_idx,
         cell_selection=resolved.cell_selection,
-        missing_mask=None,
+        missing_mask=resolved.missing_mask,
     )
 
 

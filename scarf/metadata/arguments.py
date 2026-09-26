@@ -36,6 +36,16 @@ class UmapArguments(OperationArguments):
     parallel: bool = parameter()
     parallel_threads: int | None = parameter()
     invalidate_cache: bool = execution()
+    # Only densMAP records carry its algorithm revision, so standard UMAP
+    # identities are unchanged.
+    densmap_algorithm_version: str | None = parameter(None, omit_if_none=True)
+
+    def __post_init__(self) -> None:
+        if self.use_density_map != (self.densmap_algorithm_version is not None):
+            raise ValueError(
+                "densmap_algorithm_version must be set exactly when "
+                "use_density_map is True"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +143,7 @@ class CellCycleArguments(OperationArguments):
     n_bins: int = parameter()
     rand_seed: int = parameter()
     invalidate_cache: bool = execution()
+    count_arithmetic: Literal["float64"] | None = parameter(None, omit_if_none=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +165,7 @@ class MarkerTableArguments(OperationArguments):
     adjustment_scope: str = parameter()
     nthreads: int = execution()
     invalidate_cache: bool = execution()
+    count_arithmetic: Literal["float64"] | None = parameter(None, omit_if_none=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,6 +223,7 @@ class PseudotimeMarkerArguments(OperationArguments):
     gene_batch_size: int | None = execution()
     nthreads: int = execution()
     invalidate_cache: bool = execution()
+    count_arithmetic: Literal["float64"] | None = parameter(None, omit_if_none=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +252,7 @@ class PseudotimeAggregationArguments(OperationArguments):
     batch_size: int | None = execution()
     nthreads: int = execution()
     invalidate_cache: bool = execution()
+    count_arithmetic: Literal["float64"] | None = parameter(None, omit_if_none=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,3 +372,7 @@ class StatisticalTestingArguments(OperationArguments):
     key_labels: tuple[str, ...] = parameter()
     from_assay: str | None = execution()
     invalidate_cache: bool = execution()
+    count_arithmetic: Literal["float64"] | None = parameter(None, omit_if_none=True)
+    # Only Mann-Whitney records carry its p-value policy, so other tests keep
+    # their identities.
+    p_value_policy: str | None = parameter(None, omit_if_none=True)

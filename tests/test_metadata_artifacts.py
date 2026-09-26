@@ -348,7 +348,9 @@ def test_embedding_and_clustering_are_artifact_only(datastore_ephemeral) -> None
         n_epochs=10,
     )
     leiden = datastore.run_leiden_clustering(graph)
-    paris = datastore.run_paris_clustering(graph, n_clusters=3)
+    # This k=3 graph has several components, and a fixed cut cannot request
+    # fewer clusters than components, so the fixed cut asks for one cluster.
+    paris = datastore.run_paris_clustering(graph, n_clusters=1)
 
     assert embedding.kind == "embedding"
     assert leiden.kind == "cluster_labels"
@@ -582,6 +584,36 @@ def test_imputation_batches_preserve_requested_columns_and_stream_rows(
     monkeypatch.setattr(store, "memoryBytes", 1)
     with pytest.raises(MemoryError, match="fewer features"):
         store.get_imputed([metadata_name, "duplicate"], diffusion)
+
+
+def test_get_imputed_accepts_array_like_feature_names(
+    datastore,
+    connectivity_graph,
+) -> None:
+    diffusion = datastore.run_diffusion_operator(connectivity_graph, t=2)
+    names = [str(name) for name in datastore.RNA.feats.fetch_all("names")[:3]]
+    expected = datastore.get_imputed(names, diffusion)
+
+    for container in (
+        np.asarray(names),
+        np.asarray(names, dtype=object),
+        pd.Series(names),
+        pd.Series(names, index=[7, 3, 5]),
+    ):
+        actual = datastore.get_imputed(container, diffusion)
+        assert actual.shape == expected.shape
+        np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(
+        datastore.get_imputed(np.asarray(names[:1]), diffusion),
+        expected[:, :1],
+    )
+
+    with pytest.raises(ValueError, match="one-dimensional"):
+        datastore.get_imputed(np.asarray([names]), diffusion)
+    with pytest.raises(ValueError, match="non-empty strings"):
+        datastore.get_imputed(np.asarray([], dtype=str), diffusion)
+    with pytest.raises(ValueError, match="non-empty strings"):
+        datastore.get_imputed(pd.Series([names[0], 3]), diffusion)
 
 
 def test_explicit_graph_consumers_ignore_later_live_selection_changes(

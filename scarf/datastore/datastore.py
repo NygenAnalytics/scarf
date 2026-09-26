@@ -110,10 +110,11 @@ class DataStore(
                        when DataStore loads a Zarr file for the first time.
         min_features_per_cell: Minimum number of non-zero features in a cell. If lower than this then the cell
                                will be filtered out.
-        mito_pattern: Pattern for missing mitochondrial percentages. None preserves existing values
-                      and uses ``^MT-`` for new values. Explicit patterns must match existing provenance.
-        ribo_pattern: Pattern for missing ribosomal percentages. None preserves existing values
-                      and uses ``RPS|RPL|MRPS|MRPL`` for new values.
+        mito_pattern: Feature-name pattern for the ``{assay}_percentMito`` column of each RNA assay.
+                      The first writable open replaces any existing column with values computed from
+                      this pattern, or ``^MT-`` when None. Later opens keep the stored values when
+                      None and reject a pattern that differs from the recorded one.
+        ribo_pattern: The same for ``{assay}_percentRibo``, using ``RPS|RPL|MRPS|MRPL`` when None.
         nthreads: Maximum worker budget for multi-threaded methods. When None, auto-detected
                   (SCARF_WORKERS env var, else process CPU affinity and cgroup limits). An
                   explicit integer overrides environment detection.

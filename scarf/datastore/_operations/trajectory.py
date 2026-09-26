@@ -1,10 +1,11 @@
 import operator
 from collections.abc import Sequence
+from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 import pandas as pd
-from scipy.sparse import coo_matrix
+from scipy.sparse import coo_matrix, csr_matrix
 
 from ...assay import Assay
 from ...assay.normalization import reject_unknown_normalization_params
@@ -55,19 +56,19 @@ from ...trajectory.feature_dynamics import (
 from ...trajectory.parameters import resolve_aggregation_ann_params
 from ...trajectory.artifacts import (
     AGGREGATION_INPUTS as _AGGREGATION_INPUTS,
-    AGGREGATION_PARAMETERS as _AGGREGATION_PARAMETERS,
     AGGREGATION_PAYLOAD as _AGGREGATION_PAYLOAD,
     FATE_INPUTS as _FATE_INPUTS,
     FATE_PARAMETERS as _FATE_PARAMETERS,
     MARKER_INPUTS as _MARKER_INPUTS,
-    MARKER_PARAMETERS as _MARKER_PARAMETERS,
     MARKER_PAYLOAD as _MARKER_PAYLOAD,
     PSEUDOTIME_INPUTS as _PSEUDOTIME_INPUTS,
     PSEUDOTIME_PARAMETERS as _PSEUDOTIME_PARAMETERS,
     aggregation_payload_is_valid as _aggregation_payload_is_valid,
     artifact_ref_input as _artifact_ref_input,
+    diffusion_load_bytes,
     diffusion_payload_is_valid as _diffusion_payload_is_valid,
     load_diffusion_payload,
+    write_diffusion_payload,
     fate_payload_is_valid as _fate_payload_is_valid,
     labels_with_missing_mask as _labels_with_missing_mask,
     load_cell_artifact_values as _load_cell_artifact_values,
@@ -84,6 +85,7 @@ from ...trajectory.artifacts import (
 )
 from ...trajectory.fate import (
     compute_fate_probabilities as _compute_fate_probabilities_impl,
+    fate_solver_bytes,
 )
 from ...trajectory.pseudotime import (
     make_source_sink_vector as _make_source_sink_vector_impl,
@@ -112,17 +114,22 @@ else:
     _TrajectoryOperationsBase = object
 
 
-def _validate_assay_execution_identity(
-    store: Any,
+def _validate_normalization_identity(
     assay: Assay,
     *,
-    dataset_fingerprint: str,
     normalization_method: dict[str, str],
     size_factor: float | None,
+    normalization: dict[str, bool],
+    count_arithmetic: str | None,
     context: str,
 ) -> None:
+    # The dataset fingerprint is resolved once per public call, so only the
+    # live normalization settings can be rechecked while an operation runs.
     try:
         current_method = callable_identity(assay.normMethod)
+        current_count_arithmetic = assay._count_arithmetic(
+            "feature_batches", **normalization
+        )
     except ValueError as exc:
         raise ValueError(
             f"{context} normalization settings changed during computation"
@@ -142,10 +149,12 @@ def _validate_assay_execution_identity(
         raise ValueError(f"{context} normalization settings changed during computation")
     else:
         current_size_factor = float(raw_size_factor)
-    if current_method != normalization_method or current_size_factor != size_factor:
+    if (
+        current_method != normalization_method
+        or current_size_factor != size_factor
+        or current_count_arithmetic != count_arithmetic
+    ):
         raise ValueError(f"{context} normalization settings changed during computation")
-    if store._ensure_dataset_fingerprint(assay.name) != dataset_fingerprint:
-        raise ValueError(f"{context} dataset identity changed during computation")
 
 
 def _feature_identity_arrays(assay: Assay) -> tuple[Any, Any]:
@@ -226,8 +235,13 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         The returned artifact is aligned to the graph's exact stored cell
         selection. Repeating the same graph and diffusion power reuses the
         complete artifact unless ``invalidate_cache`` is true.
+
+        Raises:
+            MemoryError: A diffusion step, or loading the finished operator,
+                would exceed the datastore memory budget. The check runs
+                before anything is persisted.
         """
-        from ...neighbors.diffusion import diffusion_operator
+        from ...neighbors.diffusion import bounded_diffusion_operator
 
         if not isinstance(graph, ArtifactRef):
             raise TypeError("graph must be an ArtifactRef")
@@ -306,21 +320,22 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             raise ValueError(
                 "Loaded graph shape does not match its stored cell selection"
             )
-        diff_op = diffusion_operator(graph_matrix, power).tocoo()
-        shape = (int(diff_op.nnz),)
-        store = start_artifact(self.zw, planned)
-        for name, dtype in zip(
-            ("row", "col", "data"),
-            (np.uint64, np.uint64, np.float64),
-            strict=True,
-        ):
-            array = create_zarr_dataset(store, name, (1000000,), dtype, shape)
-            array[:] = np.asarray(getattr(diff_op, name), dtype=dtype)
-        store.attrs["n_cells"] = n_cells
-        store.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
-            store,
-            ("row", "col", "data"),
+        diff_op = bounded_diffusion_operator(
+            graph_matrix,
+            power,
+            memory_bytes=self.memoryBytes,
         )
+        del graph_matrix
+        # Persist only an operator that loaders can read under this budget.
+        nnz = int(diff_op.indptr[-1])
+        if diffusion_load_bytes(nnz, n_cells) >= self.memoryBytes:
+            raise MemoryError(
+                f"The diffusion operator has {nnz} entries and could not be "
+                f"loaded within the memory budget of {self.memoryBytes} bytes; "
+                "increase the memory budget or use a smaller diffusion power t."
+            )
+        store = start_artifact(self.zw, planned)
+        write_diffusion_payload(store, diff_op)
         finish_artifact(store, planned)
         return planned.ref
 
@@ -395,26 +410,38 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
 
     def get_imputed(
         self,
-        feature_name: str | Sequence[str],
+        feature_name: str | Sequence[str] | np.ndarray | pd.Series,
         diffusion: ArtifactRef,
         *,
         from_assay: str | None = None,
     ) -> np.ndarray:
         """Impute feature values by diffusing along the KNN graph (MAGIC-style).
 
+        Each name is resolved in two steps. A name that exactly matches a live
+        cell metadata column (case-sensitive) diffuses that column's values.
+        Any other name matches assay feature names case-insensitively, and
+        the mean of all matching features is diffused when a name is not
+        unique.
+
         Args:
             from_assay: Name of assay to be used. If no value is provided then the default assay will be used.
-            feature_name: One feature name or a sequence in the desired output order.
+            feature_name: One name, or a sequence, one-dimensional string
+                array, or Series of names in the desired output order.
             diffusion: Explicit diffusion-operator artifact returned by
                 ``run_diffusion_operator``.
 
         Returns:
-            A vector for one name, or a cells-by-features array for a sequence.
+            A vector for one name, or a cells-by-features array for several
+            names.
 
         """
         single_feature = isinstance(feature_name, str)
         if isinstance(feature_name, str):
             names = [feature_name]
+        elif isinstance(feature_name, np.ndarray | pd.Series):
+            if feature_name.ndim != 1:
+                raise ValueError("feature_name arrays must be one-dimensional")
+            names = feature_name.tolist()
         elif isinstance(feature_name, Sequence):
             names = list(feature_name)
         else:
@@ -800,6 +827,14 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         ref: ArtifactRef,
     ) -> PseudotimeScoreResult:
         """Load pseudotime values from an explicit completed artifact."""
+        result, _graph_matrix = self._load_pseudotime_scoring_with_graph(ref)
+        return result
+
+    def _load_pseudotime_scoring_with_graph(
+        self,
+        ref: ArtifactRef,
+    ) -> tuple[PseudotimeScoreResult, csr_matrix]:
+        """Load pseudotime values and the symmetric graph used to validate them."""
         if not isinstance(ref, ArtifactRef):
             raise TypeError("ref must be an ArtifactRef")
         if ref.kind != "pseudotime":
@@ -959,13 +994,14 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
                 raw_sinks,
                 "the stored retained pseudotime component",
             )
-        return PseudotimeScoreResult(
+        result = PseudotimeScoreResult(
             ref=ref,
             graph=graph,
             cell_selection=selection,
             values=np.asarray(values, dtype=np.float64),
             valid=np.asarray(valid, dtype=bool),
         )
+        return result, graph_matrix
 
     def run_fate_mapping(
         self,
@@ -986,9 +1022,15 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             sinks: Ordered sink labels. Every matching selected cell becomes a
                    fate boundary.
             beta: Strength of the penalty applied to backward graph edges.
-            solver_tol: Relative tolerance used by the GMRES solver.
-            max_iterations: Maximum number of GMRES inner iterations per sink.
-                            GMRES restart is fixed at 20.
+            solver_tol: Absolute tolerance on the Bellman residual of each
+                solved sink column. A solve stops once its largest residual
+                over all cells is at most ``solver_tol``, or half of its share
+                of the validation limit when that is smaller, independent of
+                sink size. Results are rejected when any residual exceeds
+                ``10 * solver_tol * (len(sinks) - 1)``, bounded below by
+                float32 precision and above by ``1e-3``.
+            max_iterations: Maximum number of preconditioned GMRES inner
+                iterations per sink. GMRES restart is fixed at 20.
 
         Returns:
             Reference to an artifact containing ``probabilities`` and ``valid``.
@@ -1016,7 +1058,11 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             raise TypeError("pseudotime must be an ArtifactRef")
         if not isinstance(sink_labels, ArtifactRef):
             raise TypeError("sink_labels must be an ArtifactRef")
-        pseudotime_result = self.load_pseudotime_scoring(pseudotime)
+        # Validating the pseudotime loads its symmetric graph, which is the
+        # same graph the fate solve needs, so it is loaded only once.
+        pseudotime_result, graph_matrix = self._load_pseudotime_scoring_with_graph(
+            pseudotime
+        )
         graph_ref = pseudotime_result.graph
         stored_selection = pseudotime_result.cell_selection
         raw_sink_values, sink_selection, sink_missing = _load_cell_artifact_values(
@@ -1036,26 +1082,8 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             raise ValueError("Pseudotime and sink labels must align")
         if not ptime_valid.any():
             raise ValueError("No cells were selected for fate mapping")
-
-        logger.info(f"Fate mapping: loading graph {graph_ref.artifact_id}")
-        graph_matrix = self.load_graph(
-            graph_ref,
-            symmetric=True,
-            upper_only=False,
-        )
         if graph_matrix.shape[0] != len(ptime_valid):
             raise ValueError("Pseudotime does not align with its graph")
-        retained_graph = (
-            graph_matrix
-            if ptime_valid.all()
-            else graph_matrix[ptime_valid][:, ptime_valid]
-        ).tocsr()
-        retained_graph_is_shared = (
-            retained_graph is graph_matrix
-            and getattr(self, "_graphMemoryCache", None) is not None
-        )
-        retained_ptime = ptime[ptime_valid]
-        retained_sink_values = sink_values[ptime_valid]
 
         arguments = FateMappingArguments(
             connectivity_map=graph_ref,
@@ -1104,6 +1132,28 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         )
         if planned.reused:
             return planned.ref
+        logger.info(f"Fate mapping: solving on graph {graph_ref.artifact_id}")
+        retained_graph = (
+            graph_matrix
+            if ptime_valid.all()
+            else graph_matrix[ptime_valid][:, ptime_valid]
+        ).tocsr()
+        retained_graph_is_shared = (
+            retained_graph is graph_matrix
+            and getattr(self, "_graphMemoryCache", None) is not None
+        )
+        del graph_matrix
+        solver_bytes = fate_solver_bytes(
+            retained_graph.shape[0], retained_graph.nnz, len(requested_sink_labels)
+        )
+        if solver_bytes >= self.memoryBytes:
+            raise MemoryError(
+                f"Fate mapping needs about {solver_bytes} bytes of working memory, "
+                f"which exceeds the memory budget of {self.memoryBytes} bytes. "
+                "Increase the memory budget or compute the pseudotime on fewer cells."
+            )
+        retained_ptime = ptime[ptime_valid]
+        retained_sink_values = sink_values[ptime_valid]
         retained_probabilities, retained_valid, computed_sink_labels = (
             _compute_fate_probabilities_impl(
                 retained_graph,
@@ -1315,6 +1365,18 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         )
         resolved_norm_params = validated_parameters["normalization"]
         min_cells = validated_parameters["min_cells"]
+        count_arithmetic = assay._count_arithmetic(
+            "feature_batches", **resolved_norm_params
+        )
+        check_normalization = partial(
+            _validate_normalization_identity,
+            assay,
+            normalization_method=validated_parameters["normalization_method"],
+            size_factor=validated_parameters["size_factor"],
+            normalization=resolved_norm_params,
+            count_arithmetic=count_arithmetic,
+            context="Pseudotime marker search",
+        )
         feature_selection, feature_index = _resolve_feature_indices(
             self,
             assay,
@@ -1367,6 +1429,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             adjustment_method=validated_parameters["adjustment_method"],
             adjustment_scope=validated_parameters["adjustment_scope"],
             min_cells=min_cells,
+            count_arithmetic=count_arithmetic,
             gene_batch_size=gene_batch_size,
             nthreads=int(
                 getattr(
@@ -1415,14 +1478,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
                 "Pseudotime marker search requires a DataStore opened with "
                 "zarr_mode='r+' when no reusable artifact exists"
             )
-        _validate_assay_execution_identity(
-            self,
-            assay,
-            dataset_fingerprint=dataset_fingerprint,
-            normalization_method=validated_parameters["normalization_method"],
-            size_factor=validated_parameters["size_factor"],
-            context="Pseudotime marker search",
-        )
+        check_normalization()
         markers = find_markers_by_regression(
             assay=assay,
             cell_idx=cell_index,
@@ -1449,14 +1505,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             markers["p_value_adjusted"].values
         )
         marker_group = start_artifact(self.zw, planned)
-        _validate_assay_execution_identity(
-            self,
-            assay,
-            dataset_fingerprint=dataset_fingerprint,
-            normalization_method=validated_parameters["normalization_method"],
-            size_factor=validated_parameters["size_factor"],
-            context="Pseudotime marker search",
-        )
+        check_normalization()
         for name, values in (
             ("r_value", full_r_values),
             ("p_value", full_p_values),
@@ -1493,14 +1542,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             marker_group,
             _MARKER_PAYLOAD,
         )
-        _validate_assay_execution_identity(
-            self,
-            assay,
-            dataset_fingerprint=dataset_fingerprint,
-            normalization_method=validated_parameters["normalization_method"],
-            size_factor=validated_parameters["size_factor"],
-            context="Pseudotime marker search",
-        )
+        check_normalization()
         finish_artifact(marker_group, planned)
         logger.info(f"Stored pseudotime marker scores for {len(markers)} features")
         return planned.ref
@@ -1524,11 +1566,6 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         inputs = status.inputs or {}
         parameters = status.parameters or {}
         _require_exact_record_keys(inputs, _MARKER_INPUTS, "Pseudotime-marker inputs")
-        _require_exact_record_keys(
-            parameters,
-            _MARKER_PARAMETERS,
-            "Pseudotime-marker parameters",
-        )
         try:
             _validate_marker_parameters(parameters)
         except (TypeError, ValueError) as exc:
@@ -1721,6 +1758,18 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         n_neighbours = validated_parameters["n_neighbours"]
         n_clusters = validated_parameters["n_clusters"]
         nan_cluster_value = validated_parameters["nan_cluster_value"]
+        count_arithmetic = assay._count_arithmetic(
+            "feature_batches", **resolved_norm_params
+        )
+        check_normalization = partial(
+            _validate_normalization_identity,
+            assay,
+            normalization_method=validated_parameters["normalization_method"],
+            size_factor=validated_parameters["size_factor"],
+            normalization=resolved_norm_params,
+            count_arithmetic=count_arithmetic,
+            context="Pseudotime aggregation",
+        )
         feature_selection, feature_indices = _resolve_feature_indices(
             self,
             assay,
@@ -1801,6 +1850,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             n_clusters=n_clusters,
             ann_params=resolved_ann_params,
             nan_cluster_value=nan_cluster_value,
+            count_arithmetic=count_arithmetic,
             batch_size=batch_size,
             nthreads=self.nthreads,
             invalidate_cache=invalidate_cache,
@@ -1873,18 +1923,9 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         if planned.reused:
             return planned.ref
         logger.info("Pseudotime modules: aggregating feature profiles")
-        _validate_assay_execution_identity(
-            self,
-            assay,
-            dataset_fingerprint=dataset_fingerprint,
-            normalization_method=validated_parameters["normalization_method"],
-            size_factor=validated_parameters["size_factor"],
-            context="Pseudotime aggregation",
-        )
-        aggregation_group = start_artifact(self.zw, planned)
+        check_normalization()
         full_data, stored_feature_indices, valid_features = (
-            assay._write_aggregated_ordering_group(
-                aggregation_group,
+            assay._aggregate_ordering_profiles(
                 cell_idx=cell_indices,
                 cell_ordering=cell_ordering,
                 feat_idx=feature_indices,
@@ -1897,14 +1938,35 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
                 norm_params=resolved_norm_params,
             )
         )
-        valid_data = full_data[valid_features]
+        valid_count = int(np.count_nonzero(valid_features))
+        if valid_count < 2 or n_neighbours >= valid_count or n_clusters > valid_count:
+            raise ValueError(
+                f"Only {valid_count} of {len(stored_feature_indices)} selected "
+                f"features have mean expression above min_exp={min_exp} and a "
+                "non-constant profile. Clustering needs at least two such "
+                f"features, more than n_neighbours={n_neighbours}, and at least "
+                f"n_clusters={n_clusters}. Lower min_exp or reduce n_neighbours "
+                "or n_clusters."
+            )
         valid_feature_indices = stored_feature_indices[valid_features]
         clusts = knn_clustering(
-            d_array=valid_data,
+            d_array=ChunkedArray.from_numpy(
+                full_data[valid_features],
+                nthreads=self.nthreads,
+                resources=self.resources,
+            ),
             n_neighbours=n_neighbours,
             n_clusters=n_clusters,
             nthreads=self.nthreads,
             ann_params=resolved_ann_params,
+        )
+        check_normalization()
+        aggregation_group = start_artifact(self.zw, planned)
+        assay._write_aggregated_ordering_group(
+            aggregation_group,
+            data=full_data,
+            feature_indices=stored_feature_indices,
+            valid=valid_features,
         )
         stored_feature_clusters = np.full(
             len(stored_feature_indices),
@@ -1955,14 +2017,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             aggregation_group,
             _AGGREGATION_PAYLOAD,
         )
-        _validate_assay_execution_identity(
-            self,
-            assay,
-            dataset_fingerprint=dataset_fingerprint,
-            normalization_method=validated_parameters["normalization_method"],
-            size_factor=validated_parameters["size_factor"],
-            context="Pseudotime aggregation",
-        )
+        check_normalization()
         finish_artifact(aggregation_group, planned)
         logger.info(f"Stored {np.unique(clusts).size} pseudotime modules")
         return planned.ref
@@ -1993,11 +2048,6 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             inputs,
             _AGGREGATION_INPUTS,
             "Pseudotime-aggregation inputs",
-        )
-        _require_exact_record_keys(
-            parameters,
-            _AGGREGATION_PARAMETERS,
-            "Pseudotime-aggregation parameters",
         )
         try:
             validated_parameters = _validate_aggregation_parameters(parameters)

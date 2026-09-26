@@ -681,8 +681,8 @@ def test_aggregation_normalization_change_leaves_artifact_incomplete(
                 features=detected_features,
                 window_size=10,
                 chunk_size=5,
-                n_neighbours=3,
-                n_clusters=2,
+                n_neighbours=11,
+                n_clusters=3,
                 invalidate_cache=True,
             )
     finally:
@@ -950,3 +950,179 @@ def test_aggregate_feature_profiles_orders_filters_and_bins():
             smooth=False,
             z_scale=False,
         )
+
+
+def _ring_profiles(n_features: int) -> np.ndarray:
+    theta = 2 * np.pi * np.arange(n_features) / n_features
+    return 10.0 * np.column_stack([np.cos(theta), np.sin(theta)])
+
+
+def test_knn_clustering_reports_disconnected_feature_graph():
+    from scarf.matrix import ChunkedArray
+
+    rng = np.random.default_rng(3)
+    centers = np.array([[0.0, 0.0], [100.0, 0.0], [0.0, 100.0]])
+    profiles = np.repeat(centers, 5, axis=0) + rng.normal(scale=0.01, size=(15, 2))
+
+    with pytest.raises(ValueError, match="3 disconnected components") as error:
+        knn_clustering(ChunkedArray.from_numpy(profiles), 2, 2, 1)
+    assert "n_neighbours" in str(error.value)
+
+    labels = knn_clustering(ChunkedArray.from_numpy(profiles), 2, 3, 1)
+    assert sorted(np.unique(labels)) == [1, 2, 3]
+    for group in range(3):
+        assert np.unique(labels[5 * group : 5 * group + 5]).size == 1
+
+
+def test_knn_clustering_never_exceeds_requested_clusters_on_tied_heights():
+    from scarf.matrix import ChunkedArray
+
+    n_features = 12
+    # The two nearest neighbours of each ring point are its ring neighbours,
+    # so the feature graph is a cycle whose Paris merges tie in height.
+    profiles = ChunkedArray.from_numpy(_ring_profiles(n_features))
+    for n_clusters in range(1, n_features + 1):
+        labels = knn_clustering(profiles, 2, n_clusters, 1)
+        assert sorted(np.unique(labels)) == list(range(1, n_clusters + 1))
+
+
+def _aggregation_artifacts(datastore) -> set:
+    return set(
+        datastore.list_artifacts(
+            kind="pseudotime_aggregation",
+            from_assay="RNA",
+        )
+    )
+
+
+def test_aggregation_rejects_infeasible_clustering_before_starting_artifact(
+    datastore,
+    pseudotime_scoring,
+    detected_features,
+):
+    before = _aggregation_artifacts(datastore)
+
+    # With one neighbour, mutual nearest pairs split the feature graph into
+    # far more components than two modules can hold.
+    with pytest.raises(ValueError, match="disconnected components"):
+        datastore.run_pseudotime_aggregation(
+            pseudotime_scoring,
+            features=detected_features,
+            window_size=10,
+            chunk_size=5,
+            n_neighbours=1,
+            n_clusters=2,
+            invalidate_cache=True,
+        )
+
+    assert _aggregation_artifacts(datastore) == before
+
+
+def test_aggregation_min_exp_filter_failure_creates_no_artifact(
+    datastore,
+    pseudotime_scoring,
+    detected_features,
+):
+    before = _aggregation_artifacts(datastore)
+
+    with pytest.raises(ValueError, match="min_exp") as error:
+        datastore.run_pseudotime_aggregation(
+            pseudotime_scoring,
+            features=detected_features,
+            min_exp=1e12,
+            window_size=10,
+            chunk_size=5,
+            n_neighbours=3,
+            n_clusters=2,
+            invalidate_cache=True,
+        )
+
+    assert "Only 0 of" in str(error.value)
+    assert _aggregation_artifacts(datastore) == before
+
+
+@pytest.mark.slow
+def test_aggregation_and_marker_search_respect_memory_budget(tmp_path):
+    import tracemalloc
+
+    from scipy.sparse import random as sparse_random
+
+    from scarf.datastore.datastore import DataStore
+    from scarf.writers import SparseToZarr
+    from tests.fixtures_datastore import build_neighbourhood_graph
+
+    # All 2000 features form one 128 MB read group, so a 512 MiB budget holds
+    # the reads but not every normalized value together with its scratch.
+    n_cells, n_features = 16_000, 2_000
+    budget = 512 * 1024**2
+    rng = np.random.default_rng(7)
+    counts = sparse_random(
+        n_cells,
+        n_features,
+        density=0.05,
+        format="lil",
+        random_state=rng,
+        data_rvs=lambda size: rng.integers(1, 20, size=size),
+    ).astype(np.uint32)
+    ordering = np.linspace(0.0, 1.0, n_cells)
+    counts[:, :20] = rng.poisson(5 * ordering[:, None], size=(n_cells, 20))
+    path = str(tmp_path / "budget.zarr")
+    SparseToZarr(
+        counts.tocsr(),
+        path,
+        cell_ids=[f"c{i}" for i in range(n_cells)],
+        feature_ids=[f"g{i}" for i in range(n_features)],
+        nthreads=2,
+    ).dump()
+    del counts
+    datastore = DataStore(
+        path,
+        default_assay="RNA",
+        min_features_per_cell=0,
+        nthreads=2,
+        mem_budget=budget,
+    )
+    cells = datastore.snapshot_cell_selection("I")
+    features = datastore.select_all_features(from_assay="RNA")
+    graph = build_neighbourhood_graph(
+        datastore,
+        cell_selection=cells,
+        features=datastore.select_hvgs(
+            cells,
+            top_n=100,
+            show_plot=False,
+            min_cells=5,
+            max_cells=np.inf,
+        ),
+        dims=5,
+        k=10,
+        n_centroids=10,
+        local_cache=False,
+    )
+    source_sink = np.zeros(n_cells)
+    source_sink[[0, -1]] = [-1.0, 1.0]
+    pseudotime = datastore.run_pseudotime_scoring(
+        graph,
+        ss_vec=source_sink,
+        n_singular_vals=5,
+    )
+
+    for run in (
+        lambda: datastore.run_pseudotime_aggregation(
+            pseudotime,
+            features=features,
+            n_clusters=5,
+        ),
+        lambda: datastore.run_pseudotime_marker_search(
+            pseudotime,
+            features=features,
+        ),
+    ):
+        tracemalloc.start()
+        try:
+            ref = run()
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert datastore.inspect_artifact(ref).complete
+        assert peak <= 1.1 * budget

@@ -6,6 +6,7 @@ import pandas as pd
 import zarr
 from scipy.sparse import csr_matrix, vstack
 
+from ...assay.base import raw_csr
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...storage.arrays import create_zarr_dataset
 from ...storage.artifacts import (
@@ -50,6 +51,21 @@ _CELL_LABEL_VALUE_NAMES = {
     "cell_cycle": "phase",
     "cluster_cut": "labels",
 }
+_MEMBERSHIP_BLOCK_EDGES = 1_048_576
+
+
+def _row_mode_counts(codes: np.ndarray) -> np.ndarray:
+    """Return how often the most frequent code occurs in each row."""
+    ordered = np.sort(codes, axis=1)
+    positions = np.broadcast_to(
+        np.arange(ordered.shape[1], dtype=np.int64),
+        ordered.shape,
+    )
+    run_starts = np.ones(ordered.shape, dtype=bool)
+    run_starts[:, 1:] = ordered[:, 1:] != ordered[:, :-1]
+    # Each position's run begins at the latest preceding run start.
+    run_origins = np.maximum.accumulate(np.where(run_starts, positions, 0), axis=1)
+    return np.asarray((positions - run_origins + 1).max(axis=1), dtype=np.int64)
 
 
 def _load_cell_label_artifact(
@@ -83,28 +99,6 @@ def _load_cell_label_artifact(
     if values.ndim != 1:
         raise ValueError("Label artifact values must be one-dimensional")
     return values, selection
-
-
-def _raw_sparse_for_indices(
-    assay: Any,
-    cell_idx: np.ndarray,
-    feat_idx: np.ndarray,
-) -> csr_matrix:
-    """Materialize one explicitly selected raw matrix in bounded row blocks."""
-    selected = assay.rawData[:, feat_idx][cell_idx, :]
-    blocks = [
-        csr_matrix(block)
-        for block in selected.stream_blocks(
-            nthreads=assay.nthreads,
-            msg=f"Converting {assay.name} raw data to CSR",
-        )
-    ]
-    if blocks:
-        return vstack(blocks, format="csr")
-    return csr_matrix(
-        (len(cell_idx), len(feat_idx)),
-        dtype=assay.rawData.dtype,
-    )
 
 
 def _lift_frozen_umap_to_obsm(adata: Any) -> None:
@@ -284,11 +278,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             )
 
         if matrix == "raw":
-            if run is None:
-                assert cell_key is not None
-                x = assay.to_raw_sparse(cell_key)[:, feat_idx].tocsr()
-            else:
-                x = _raw_sparse_for_indices(assay, cell_idx, feat_idx)
+            x = raw_csr(assay, cell_idx, feat_idx)
         else:
             normed = assay.normed(cell_idx=cell_idx, feat_idx=feat_idx)
             blocks = [csr_matrix(block) for block in normed.stream_blocks()]
@@ -339,16 +329,11 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
                     [layer_id_positions[feature_id][0] for feature_id in selected_ids],
                     dtype=np.int64,
                 )
-                if run is None:
-                    assert cell_key is not None
-                    layer_matrix = layer_assay.to_raw_sparse(cell_key)
-                    adata.layers[layer] = layer_matrix[:, layer_feat_idx].tocsr()
-                else:
-                    adata.layers[layer] = _raw_sparse_for_indices(
-                        layer_assay,
-                        cell_idx,
-                        layer_feat_idx,
-                    )
+                adata.layers[layer] = raw_csr(
+                    layer_assay,
+                    cell_idx,
+                    layer_feat_idx,
+                )
         if run is not None:
             _lift_frozen_umap_to_obsm(adata)
         return adata
@@ -442,26 +427,32 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         if planned.reused:
             return planned.ref
         graph_grp = as_zarr_group(self.zw[loc], name=loc)
-        edges = np.asarray(as_zarr_array(graph_grp["edges"], name="edges")[:])
-        if edges.shape != (n_cells * k, 2):
+        edges = as_zarr_array(graph_grp["edges"], name="edges")
+        if tuple(edges.shape) != (n_cells * k, 2):
             raise ValueError(
                 "Graph edges do not match the stored cell and k dimensions"
             )
-        edge_rows = edges.reshape(n_cells, k, 2)
-        expected_sources = np.broadcast_to(
-            np.arange(n_cells, dtype=edge_rows.dtype)[:, None],
-            (n_cells, k),
-        )
-        if not np.array_equal(edge_rows[:, :, 0], expected_sources):
-            raise ValueError("Graph edges are not stored in cell-major order")
-        neighbor_clusters = cluster_values[edge_rows[:, :, 1]]
-        values = np.asarray(
-            [
-                pd.Series(row).value_counts(dropna=False).iloc[0] / k
-                for row in neighbor_clusters
-            ],
-            dtype=np.float64,
-        ).round(3)
+        if k < 1:
+            raise ValueError("Graph must record at least one neighbour per cell")
+        # Integer codes keep NaN labels as one group, like value_counts(dropna=False).
+        cluster_codes, _uniques = pd.factorize(cluster_values, use_na_sentinel=False)
+        values = np.empty(n_cells, dtype=np.float64)
+        block_cells = max(1, _MEMBERSHIP_BLOCK_EDGES // k)
+        for start in range(0, n_cells, block_cells):
+            stop = min(start + block_cells, n_cells)
+            edge_rows = np.asarray(edges[start * k : stop * k]).reshape(
+                stop - start,
+                k,
+                2,
+            )
+            expected_sources = np.broadcast_to(
+                np.arange(start, stop, dtype=edge_rows.dtype)[:, None],
+                (stop - start, k),
+            )
+            if not np.array_equal(edge_rows[:, :, 0], expected_sources):
+                raise ValueError("Graph edges are not stored in cell-major order")
+            values[start:stop] = _row_mode_counts(cluster_codes[edge_rows[:, :, 1]]) / k
+        values = values.round(3)
         write_cell_data_artifact(
             self.zw,
             planned,
@@ -583,17 +574,21 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
 
         from ...clustering.cluster_tree import CoalesceTree, make_digraph
         from ...clustering.paris import hierarchy_to_dendrogram
-        from .paris_persistence import load_hierarchy_group
+        from .paris_persistence import (
+            load_hierarchy_group,
+            plan_paris_dendrogram,
+            write_paris_dendrogram,
+        )
 
+        if clusters_ref.kind != "cluster_cut":
+            raise ValueError("clusters must identify a cluster_cut artifact")
+        # A cut shares its graph's scope and assay; integrated graphs are
+        # datastore-scoped, and from_assay only supplies the fill values.
         if (
-            clusters_ref.scope != "assay"
-            or clusters_ref.assay != from_assay
-            or clusters_ref.kind != "cluster_cut"
+            clusters_ref.scope != graph_ref.scope
+            or clusters_ref.assay != graph_ref.assay
         ):
-            raise ValueError(
-                "clusters must identify an assay-scoped cluster_cut artifact "
-                "for the graph assay"
-            )
+            raise ValueError("Cluster cut does not belong to the requested graph")
         cut_status = inspect_artifact(self.zw, clusters_ref)
         if not cut_status.complete or cut_status.operation != "cut_paris_hierarchy":
             raise ValueError(
@@ -618,41 +613,6 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             raise ValueError(
                 "Cluster cut does not have a complete hierarchy for the requested graph"
             )
-        hierarchy_group = as_zarr_group(
-            self.zw[hierarchy_status.path],
-            name=hierarchy_ref.artifact_id,
-        )
-        hierarchy, _plateau = load_hierarchy_group(
-            hierarchy_group,
-            hierarchy_ref.artifact_id,
-        )
-        dendrogram_plan = plan_artifact(
-            self.zw,
-            scope=hierarchy_ref.scope,
-            assay=hierarchy_ref.assay,
-            kind="dendrogram",
-            operation="materialize_paris_dendrogram",
-            parameters={"compatibility": True},
-            inputs={"cluster_hierarchy": hierarchy_ref},
-            execution_options={},
-            invalidate_cache=invalidate_cache,
-            required_arrays=(ArrayRequirement("data", dtype_kind="f"),),
-        )
-        if dendrogram_plan.reused:
-            dendrogram_group = reused_artifact_group(self.zw, dendrogram_plan)
-        else:
-            dendrogram = hierarchy_to_dendrogram(hierarchy, compatibility=True)
-            dendrogram_group = start_artifact(self.zw, dendrogram_plan)
-            output = create_zarr_dataset(
-                dendrogram_group,
-                "data",
-                (min(max(dendrogram.shape[0], 1), 5000), 4),
-                "f8",
-                dendrogram.shape,
-            )
-            output[:] = dendrogram
-            finish_artifact(dendrogram_group, dendrogram_plan)
-        dendrogram = np.asarray(as_zarr_array(dendrogram_group["data"], name="data")[:])
         cut_group = as_zarr_group(
             self.zw[artifact_path(clusters_ref)],
             name=artifact_path(clusters_ref),
@@ -674,6 +634,11 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             raise ValueError(
                 "Cluster labels do not align with the stored cell selection"
             )
+        dendrogram_plan = plan_paris_dendrogram(
+            self.zw,
+            hierarchy_ref,
+            invalidate_cache=invalidate_cache,
+        )
         coalesced_plan = plan_artifact(
             self.zw,
             scope=clusters_ref.scope,
@@ -693,17 +658,10 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
                 ArrayRequirement("partition_id"),
             ),
         )
+        # A read-only store computes a cache miss in memory and persists nothing.
+        persist = not self.zw.read_only
         if coalesced_plan.reused:
             coalesced_group = reused_artifact_group(self.zw, coalesced_plan)
-            subgraph = DiGraph()
-            subgraph.add_edges_from(
-                np.asarray(
-                    as_zarr_array(
-                        coalesced_group["edgelist"],
-                        name="edgelist",
-                    )[:]
-                )
-            )
             nodelist = np.asarray(
                 as_zarr_array(coalesced_group["nodelist"], name="nodelist")[:]
             )
@@ -712,6 +670,17 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
                     coalesced_group["partition_id"],
                     name="partition_id",
                 )[:]
+            )
+            subgraph = DiGraph()
+            # Add nodes first so a single-node tree without edges is complete.
+            subgraph.add_nodes_from(int(node) for node in nodelist[:, 0])
+            subgraph.add_edges_from(
+                np.asarray(
+                    as_zarr_array(
+                        coalesced_group["edgelist"],
+                        name="edgelist",
+                    )[:]
+                )
             )
             cluster_labels = {str(value): value for value in set(clusters)}
             for node_data, partition_id in zip(
@@ -727,41 +696,59 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
                         partition_id,
                     )
         else:
+            if dendrogram_plan.reused:
+                dendrogram_group = reused_artifact_group(self.zw, dendrogram_plan)
+                dendrogram = np.asarray(
+                    as_zarr_array(dendrogram_group["data"], name="data")[:]
+                )
+            else:
+                hierarchy_group = as_zarr_group(
+                    self.zw[hierarchy_status.path],
+                    name=hierarchy_ref.artifact_id,
+                )
+                hierarchy, _plateau = load_hierarchy_group(
+                    hierarchy_group,
+                    hierarchy_ref.artifact_id,
+                )
+                dendrogram = hierarchy_to_dendrogram(hierarchy, compatibility=True)
+                if persist:
+                    write_paris_dendrogram(self.zw, dendrogram_plan, dendrogram)
             subgraph = CoalesceTree(make_digraph(dendrogram), clusters)
-            edge_list = to_pandas_edgelist(subgraph).values
-            coalesced_group = start_artifact(self.zw, coalesced_plan)
-            edge_array = create_zarr_dataset(
-                coalesced_group,
-                "edgelist",
-                (100000,),
-                "u8",
-                edge_list.shape,
-            )
-            edge_array[:] = edge_list
-            node_list = []
-            partition_id_values = []
-            for node in subgraph.nodes():
-                node_data = subgraph.nodes[node]
-                node_list.append((node, node_data["nleaves"]))
-                partition_id_values.append(str(node_data.get("partition_id", -1)))
-            node_values = np.asarray(node_list)
-            node_array = create_zarr_dataset(
-                coalesced_group,
-                "nodelist",
-                (100000,),
-                node_values.dtype,
-                node_values.shape,
-            )
-            node_array[:] = node_values
-            partition_array = create_zarr_dataset(
-                coalesced_group,
-                "partition_id",
-                (100000,),
-                str,
-                (len(partition_id_values),),
-            )
-            partition_array[:] = partition_id_values
-            finish_artifact(coalesced_group, coalesced_plan)
+            if persist:
+                edge_list = to_pandas_edgelist(subgraph).values
+                coalesced_group = start_artifact(self.zw, coalesced_plan)
+                edge_array = create_zarr_dataset(
+                    coalesced_group,
+                    "edgelist",
+                    (100000,),
+                    "u8",
+                    edge_list.shape,
+                )
+                edge_array[:] = edge_list
+                node_list = []
+                partition_id_values = []
+                for node in subgraph.nodes():
+                    node_data = subgraph.nodes[node]
+                    node_list.append((node, node_data["nleaves"]))
+                    partition_id_values.append(str(node_data.get("partition_id", -1)))
+                node_values = np.asarray(node_list)
+                node_array = create_zarr_dataset(
+                    coalesced_group,
+                    "nodelist",
+                    (100000,),
+                    node_values.dtype,
+                    node_values.shape,
+                )
+                node_array[:] = node_values
+                partition_array = create_zarr_dataset(
+                    coalesced_group,
+                    "partition_id",
+                    (100000,),
+                    str,
+                    (len(partition_id_values),),
+                )
+                partition_array[:] = partition_id_values
+                finish_artifact(coalesced_group, coalesced_plan)
         color_values = None
         if fill_by_value is not None:
             if fill_by_value in self.cells.columns:
@@ -795,10 +782,11 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             "graph_ref": graph_ref,
             "clusters_ref": clusters_ref,
             "cell_selection": selection_ref,
-            "coalesced_location": inspect_artifact(
-                self.zw,
-                coalesced_plan.ref,
-            ).path,
+            "coalesced_location": (
+                artifact_path(coalesced_plan.ref)
+                if coalesced_plan.reused or persist
+                else None
+            ),
         }
 
     def _prepare_cluster_tree(

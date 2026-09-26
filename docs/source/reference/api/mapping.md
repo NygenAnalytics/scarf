@@ -19,11 +19,22 @@ A handle is validated against its store in full when `get_mapping_reference` loa
 operation that takes the handle checks the stored artifact record and its attributes against the
 handle, validates the cell selection against the current ordered cell IDs, and recomputes the digest
 of the handle's arrays. Repeated label transfer and score calls
-avoid reading the reference model payload, index and neighbours. The reference dataset fingerprint
-is read from the assay when it is stored there and otherwise recomputed for each operation. Reading
+avoid reading the reference model payload, index and neighbours. Each operation also compares the
+prepared dataset fingerprint stored on the reference assay with the fingerprint the handle carries;
+an unprepared or different reference dataset is rejected. Reading
 reference cell metadata also validates the stored selection against the current ordered cell IDs.
 A handle whose arrays or references changed is rejected with `does not match its stored artifact`;
 reload it with `get_mapping_reference`.
+
+A query projection records the prepared dataset fingerprint of the query assay and reuses a complete
+projection only for the same query dataset, cells, overlap, reference, and options. A query cell is
+uninformative when its raw counts are zero in every reference feature that the query measured. Such
+a cell keeps its projection row but is flagged in `uninformative`; it receives no transferred label,
+adds no mapping score, and does not enter Symphony query-batch statistics or
+`queryScaledDispersion`. `diagnostics["uninformativeCellCount"]` counts these cells.
+`queryScaledDispersion` averages the squared reference-scaled deviation of informative cells over
+the measured reference features only, so it does not depend on `missing_feature_policy`.
+Projections written before this contract are rejected with an instruction to re-run `run_mapping`.
 
 ```{eval-rst}
 .. autoclass:: scarf.MappingReference

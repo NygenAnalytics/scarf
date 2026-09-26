@@ -254,62 +254,48 @@ def test_aligned_feature_stream_renormalizes_over_matched_reference_features() -
     )
 
 
-def test_raw_expression_fingerprint_includes_unmatched_query_features() -> None:
-    counts = np.array([[2, 3, 100], [5, 7, 200]], dtype=np.uint32)
-    assay, _, writable_counts = _query_assay(counts, ["a", "b", "extra"])
-    options = {
-        "reference_ids": np.array(["a", "b"]),
-        "means": np.zeros(2),
-        "normalization": _normalization(renormalize_subset=True),
-        "policy": "zero",
-    }
-    before = _stream(assay, **options)
-    before_values = _collect(before)
-    before_fingerprint = before.raw_expression_fingerprint
+@pytest.mark.parametrize("renormalize_subset", [False, True])
+@pytest.mark.parametrize("policy", ["reference_mean", "zero"])
+def test_aligned_blocks_flag_rows_without_overlap_counts(
+    renormalize_subset: bool,
+    policy: str,
+) -> None:
+    counts = np.array(
+        [
+            [2, 3, 100],
+            [0, 0, 7],
+            [0, 0, 0],
+            [0, 4, 0],
+            [0, 0, 9],
+        ],
+        dtype=np.uint32,
+    )
+    assay, _, _ = _query_assay(counts, ["a", "b", "extra"], chunks=(2, 2))
+    means = np.array([0.5, 11.0, 0.25])
+    stream = _stream(
+        assay,
+        reference_ids=np.array(["b", "missing", "a"]),
+        means=means,
+        normalization=_normalization(
+            size_factor=10,
+            renormalize_subset=renormalize_subset,
+        ),
+        policy=policy,
+    )
+    blocks = list(stream)
 
-    writable_counts[0, 2] = 101
-    after = _stream(assay, **options)
-
-    np.testing.assert_array_equal(_collect(after), before_values)
-    assert after.alignment_map_fingerprint == before.alignment_map_fingerprint
-    assert after.raw_expression_fingerprint != before_fingerprint
-    assert before.raw_expression_fingerprint == before_fingerprint
-
-
-def test_raw_expression_fingerprint_tracks_live_normalization_scalars() -> None:
-    counts = np.array([[2, 3], [5, 7]], dtype=np.uint32)
-    assay, _, _ = _query_assay(counts, ["a", "b"])
-    options = {
-        "reference_ids": np.array(["a", "b"]),
-        "means": np.zeros(2),
-        "normalization": _normalization(renormalize_subset=False),
-        "policy": "zero",
-    }
-    before = _stream(assay, **options)
-    before_values = _collect(before)
-    before_fingerprint = before.raw_expression_fingerprint
-
-    assay.cells._values["RNA_nCounts"][0] *= 2
-    after = _stream(assay, **options)
-
-    assert after.raw_expression_fingerprint != before_fingerprint
-    assert not np.array_equal(_collect(after), before_values)
-
-
-def test_subset_renormalization_fingerprint_ignores_unused_live_scalars() -> None:
-    counts = np.array([[2, 3], [5, 7]], dtype=np.uint32)
-    assay, _, _ = _query_assay(counts, ["a", "b"])
-    options = {
-        "reference_ids": np.array(["a", "b"]),
-        "means": np.zeros(2),
-        "normalization": _normalization(renormalize_subset=True),
-        "policy": "zero",
-    }
-    before = _stream(assay, **options).raw_expression_fingerprint
-
-    assay.cells._values["RNA_nCounts"][0] *= 2
-
-    assert _stream(assay, **options).raw_expression_fingerprint == before
+    assert len(blocks) > 1
+    for block in blocks:
+        assert block.observed.dtype == np.dtype(bool)
+        assert block.observed.shape == (len(block.values),)
+    observed = np.concatenate([block.observed for block in blocks])
+    values = np.concatenate([block.values for block in blocks])
+    # Rows 1, 2 and 4 have no counts in "a" or "b"; counts in the unmatched
+    # query feature do not make a row informative.
+    np.testing.assert_array_equal(observed, [True, False, False, True, False])
+    fill = means[1] if policy == "reference_mean" else 0.0
+    np.testing.assert_array_equal(values[~observed][:, [0, 2]], 0.0)
+    np.testing.assert_array_equal(values[~observed][:, 1], fill)
 
 
 def test_aligned_feature_stream_bounds_rows_under_tiny_budget() -> None:
@@ -362,45 +348,6 @@ def test_aligned_feature_stream_reserves_downstream_mapping_memory() -> None:
     assert sum(len(block.values) for block in reserved) == len(counts)
 
 
-def test_raw_expression_fingerprint_uses_budgeted_full_width_blocks(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    counts = np.arange(1, 141, dtype=np.uint32).reshape(7, 20)
-    assay, _, _ = _query_assay(
-        counts,
-        ["a", "b", *(f"extra-{index}" for index in range(18))],
-        chunks=(5, 4),
-    )
-    options = {
-        "reference_ids": np.array(["a", "b"]),
-        "means": np.zeros(2),
-        "policy": "zero",
-    }
-    roomy = _stream(assay, **options)
-    all_column_bytes = counts.shape[1] * np.dtype(np.int64).itemsize
-    fingerprint_row_bytes = 2 * counts.shape[1] * counts.dtype.itemsize
-    budget = ResourceBudget(
-        roomy.resident_bytes
-        + all_column_bytes
-        + roomy.decoded_chunk_bytes
-        + 2 * fingerprint_row_bytes,
-        4,
-    )
-    bounded = _stream(assay, resources=budget, **options)
-    observed: list[tuple[int, int, int]] = []
-    read_raw = bounded._read_raw
-
-    def observe(start: int, end: int, columns: np.ndarray) -> np.ndarray:
-        observed.append((start, end, len(columns)))
-        return read_raw(start, end, columns)
-
-    monkeypatch.setattr(bounded, "_read_raw", observe)
-    _ = bounded.raw_expression_fingerprint
-
-    assert max(end - start for start, end, _ in observed) == 2
-    assert all(width == counts.shape[1] for _, _, width in observed)
-
-
 def test_aligned_feature_stream_reads_read_only_counts_without_zarr_writes() -> None:
     counts = np.array([[2, 3, 4], [5, 7, 11]], dtype=np.uint32)
     assay, store, _ = _query_assay(
@@ -413,7 +360,6 @@ def test_aligned_feature_stream_reads_read_only_counts_without_zarr_writes() -> 
     stream = _stream(assay)
 
     _collect(stream)
-    _ = stream.raw_expression_fingerprint
 
     assert all(operation == "get" for operation, _ in store.ops)
     assert all("normed__" not in key for _, key in store.ops)

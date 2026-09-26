@@ -40,17 +40,21 @@ def parameter(
     default: Any = MISSING,
     *,
     default_factory: Any = MISSING,
+    omit_if_none: bool = False,
 ) -> Any:
+    """Declare an identity parameter.
+
+    ``omit_if_none`` leaves an unset parameter out of the argument record, so
+    adding it keeps the identities of artifacts that do not use it.
+    """
     if default is not MISSING and default_factory is not MISSING:
         raise ValueError("Cannot specify both default and default_factory")
+    metadata = {"argument_role": "parameter", "omit_if_none": omit_if_none}
     if default_factory is not MISSING:
-        return field(
-            default_factory=default_factory,
-            metadata={"argument_role": "parameter"},
-        )
+        return field(default_factory=default_factory, metadata=metadata)
     if default is not MISSING:
-        return field(default=default, metadata={"argument_role": "parameter"})
-    return field(metadata={"argument_role": "parameter"})
+        return field(default=default, metadata=metadata)
+    return field(metadata=metadata)
 
 
 def execution(
@@ -111,9 +115,10 @@ class OperationArguments:
                 raise TypeError(
                     f"{type(self).__name__}.{model_field.name} has no argument role"
                 )
-            partitions[role][model_field.name] = serialize_artifact_value(
-                getattr(self, model_field.name)
-            )
+            value = getattr(self, model_field.name)
+            if value is None and model_field.metadata.get("omit_if_none"):
+                continue
+            partitions[role][model_field.name] = serialize_artifact_value(value)
         return ArgumentRecord(
             parameters=partitions["parameter"],
             execution_options=partitions["execution"],
@@ -172,6 +177,7 @@ class NormalizationArguments(OperationArguments):
     log_transform: bool = parameter()
     renormalize_subset: bool = parameter()
     invalidate_cache: bool = execution(False)
+    count_arithmetic: Literal["float64"] | None = parameter(None, omit_if_none=True)
 
 
 @dataclass(frozen=True, slots=True)

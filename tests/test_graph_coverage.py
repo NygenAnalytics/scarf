@@ -703,6 +703,44 @@ def test_read_only_diffusion_operator_only_reuses_persisted_artifacts(
     assert store._load_graph_artifact.call_count == 1
 
 
+def _diffusion_artifacts(store) -> set:
+    return set(list_artifacts(store.zw, scope="datastore", kind="diffusion_operator"))
+
+
+def test_diffusion_operator_budget_is_checked_before_persisting(
+    datastore,
+    connectivity_graph,
+) -> None:
+    budgeted = DataStore(datastore.zarr_loc, default_assay="RNA", mem_budget="16M")
+    before = _diffusion_artifacts(budgeted)
+
+    # Eight steps make the operator nearly dense. It can be formed within
+    # 16 MiB but not loaded again, so nothing may be persisted.
+    with pytest.raises(MemoryError, match="could not be loaded"):
+        budgeted.run_diffusion_operator(connectivity_graph, t=8, invalidate_cache=True)
+    assert _diffusion_artifacts(budgeted) == before
+
+    # The graph fits the budget, but its first product does not fit a tiny one.
+    matrix = datastore.load_graph(connectivity_graph, symmetric=True)
+    graph_bytes = matrix.data.nbytes + matrix.indices.nbytes + matrix.indptr.nbytes
+    budgeted.memoryBytes = graph_bytes + 1024
+    with pytest.raises(MemoryError, match="Diffusion step"):
+        budgeted.run_diffusion_operator(connectivity_graph, t=2, invalidate_cache=True)
+    assert _diffusion_artifacts(budgeted) == before
+
+
+def test_persisted_diffusion_operator_is_loadable_under_same_budget(
+    datastore,
+    connectivity_graph,
+) -> None:
+    budgeted = DataStore(datastore.zarr_loc, default_assay="RNA", mem_budget="16M")
+    ref = budgeted.run_diffusion_operator(
+        connectivity_graph, t=1, invalidate_cache=True
+    )
+    operator = budgeted.load_diffusion_operator(ref)
+    assert operator.shape[0] == operator.shape[1]
+
+
 def test_filter_cells_open_bounds_composition_and_boundaries(
     isolated_toy_datastore: DataStore,
 ) -> None:
@@ -733,13 +771,22 @@ def test_filter_cells_open_bounds_composition_and_boundaries(
     )
     np.testing.assert_array_equal(store.cells.fetch_all("I"), live_before)
 
+    # Every cell left by ``first`` sits on the exclusive upper bound.
+    with pytest.raises(ValueError, match="removed every selected cell"):
+        store.filter_cells(
+            attrs=[attr],
+            lows=[None],
+            highs=[upper],
+            cell_selection=first,
+        )
     second = store.filter_cells(
         attrs=[attr],
         lows=[None],
         highs=[upper],
         cell_selection=first,
+        keep_bounds=True,
     )
-    expected &= values < upper
+    expected &= values <= upper
     np.testing.assert_array_equal(
         read_stored_selection_mask(
             store.zw,

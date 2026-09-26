@@ -1,6 +1,7 @@
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from functools import partial
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 import zarr
@@ -115,6 +116,37 @@ def reject_unknown_normalization_params(
             raise TypeError(f"{caller}() got an unexpected keyword argument {name!r}")
 
 
+def _scale_count_rows(
+    counts: NDArray[Any],
+    totals: NDArray[Any],
+    *,
+    factor: float,
+) -> NDArray[Any]:
+    """Return ``factor * counts / totals`` in float64 with one output buffer."""
+    scaled: NDArray[Any] = np.multiply(counts, factor, dtype=np.float64)
+    scaled /= totals
+    return scaled
+
+
+def _library_size_scaled(assay: "Assay", counts: ChunkedArray) -> ChunkedArray:
+    """Scale each cell's counts by the size factor over its total.
+
+    NumPy keeps an integer dtype when it multiplies by an integer size factor,
+    so uint16 products wrap and uint8 products raise. Integer counts are
+    therefore scaled in float64. For 32- and 64-bit counts that do not
+    overflow, the result is bit-identical to the integer product followed by
+    the division. Floating-point counts keep their dtype and rounding.
+    """
+    assert assay.sf is not None and assay.scalar is not None
+    totals = assay.scalar.reshape(-1, 1)
+    if counts.dtype.kind not in "iu":
+        return assay.sf * counts / totals
+    scale = partial(_scale_count_rows, factor=assay.sf)
+    if isinstance(counts, ChunkedArray):
+        return counts._binary(scale, totals, "left")
+    return cast(ChunkedArray, scale(counts, totals))
+
+
 def norm_dummy(_: "Assay", counts: ChunkedArray) -> ChunkedArray:
     """A dummy normalizer. Doesn't perform any normalization. This is useful
     when the 'raw data' is already normalized.
@@ -138,8 +170,7 @@ def norm_lib_size(assay: "Assay", counts: ChunkedArray) -> ChunkedArray:
 
     Returns:  A chunked array (delayed matrix) containing normalized data.
     """
-    assert assay.sf is not None and assay.scalar is not None
-    return assay.sf * counts / assay.scalar.reshape(-1, 1)
+    return _library_size_scaled(assay, counts)
 
 
 def lib_size_feature_stream_eligible(
@@ -165,8 +196,7 @@ def norm_lib_size_log(assay: "Assay", counts: ChunkedArray) -> ChunkedArray:
 
     Returns: A chunked array (delayed matrix) containing normalized data.
     """
-    assert assay.sf is not None and assay.scalar is not None
-    return cast(ChunkedArray, np.log1p(assay.sf * counts / assay.scalar.reshape(-1, 1)))
+    return cast(ChunkedArray, np.log1p(_library_size_scaled(assay, counts)))
 
 
 def norm_clr(_: "Assay", counts: ChunkedArray) -> ChunkedArray:
@@ -179,7 +209,13 @@ def norm_clr(_: "Assay", counts: ChunkedArray) -> ChunkedArray:
 
     Returns: A chunked array (delayed matrix) containing normalized data.
     """
-    f = np.exp(cast(NDArray[Any], np.log1p(counts).sum(axis=0)) / len(counts))
+    # log1p of uint8 or uint16 counts is float16 or float32, whose sum over
+    # many cells overflows or loses precision. Integer counts are logged in
+    # float64, as 32- and 64-bit counts already were.
+    log_dtype = np.float64 if counts.dtype.kind in "iu" else None
+    f = np.exp(
+        cast(NDArray[Any], np.log1p(counts, dtype=log_dtype).sum(axis=0)) / len(counts)
+    )
     return cast(ChunkedArray, np.log1p(counts / f.reshape(1, -1)))
 
 
@@ -210,6 +246,108 @@ def norm_tf_idf(assay: "Assay", counts: ChunkedArray) -> ChunkedArray:
 norm_tf_idf.artifact_identity = (  # type: ignore[attr-defined]
     "scarf.assay.norm_tf_idf:selected-cell-df:total-count-tf"
 )
+
+
+# Recorded only by artifacts whose values changed when narrow integer counts
+# were promoted to float64 before normalization.
+COUNT_ARITHMETIC: Literal["float64"] = "float64"
+
+type NormalizedValueSource = Literal[
+    "normed", "payload", "feature_batches", "feature_scores"
+]
+
+
+def normalizer_count_arithmetic(
+    assay: "Assay",
+    method: NormMethod,
+) -> Literal["float64"] | None:
+    """Return the count-arithmetic marker of values ``method`` computes.
+
+    Library-size and CLR normalization once scaled and logged integer counts
+    in their stored dtype, so counts narrower than 32 bits wrapped, overflowed,
+    or lost precision. Artifacts computed by these functions from such counts
+    record ``COUNT_ARITHMETIC`` so that results written before the fix are
+    never reused. Every other artifact keeps its identity, because its values
+    did not change.
+
+    Args:
+        assay: Assay whose counts ``method`` normalizes.
+        method: Normalization function applied to the counts.
+
+    Returns:
+        ``COUNT_ARITHMETIC``, or None when the values did not change.
+    """
+    if method not in (norm_lib_size, norm_lib_size_log, norm_clr):
+        return None
+    dtype = np.dtype(assay.rawData.dtype)
+    return COUNT_ARITHMETIC if dtype.kind in "iu" and dtype.itemsize < 4 else None
+
+
+def recorded_count_arithmetic(parameters: Mapping[str, Any]) -> dict[str, str]:
+    """Validate the count-arithmetic marker a stored record may carry.
+
+    Returns:
+        ``{"count_arithmetic": COUNT_ARITHMETIC}`` when the record carries the
+        marker, or an empty mapping when it does not.
+    """
+    if "count_arithmetic" not in parameters:
+        return {}
+    if parameters["count_arithmetic"] != COUNT_ARITHMETIC:
+        raise ValueError(f"count_arithmetic must be {COUNT_ARITHMETIC!r} when recorded")
+    return {"count_arithmetic": COUNT_ARITHMETIC}
+
+
+def _feature_group_positions(
+    feature_groups: Sequence[np.ndarray],
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Return the sorted union of the groups and each group's union positions."""
+    groups = [np.asarray(group, dtype=np.int64) for group in feature_groups]
+    if not groups or any(group.ndim != 1 or group.size == 0 for group in groups):
+        raise ValueError("Feature groups must be non-empty one-dimensional indices")
+    union = np.unique(np.concatenate(groups))
+    return union, [np.searchsorted(union, group) for group in groups]
+
+
+def iter_feature_group_means(
+    assay: "Assay",
+    cell_idx: np.ndarray,
+    feature_groups: Sequence[np.ndarray],
+    *,
+    block_rows: int | None = None,
+) -> Iterator[np.ndarray]:
+    """Yield the per-cell mean normalized value of each feature group.
+
+    The assay normalization is fitted once over all of ``cell_idx``, for
+    example ATAC document frequency or ADT CLR geometric means, and is then
+    applied to row blocks. Values therefore do not depend on the block size.
+    Each block reads the union of the group features once.
+
+    Args:
+        assay: Assay whose ``normed`` defines the normalization.
+        cell_idx: Ordered cells to normalize and summarize.
+        feature_groups: Feature indices of each group.
+        block_rows: Optional rows per block. Defaults to the block size of the
+            assay's normalized matrix.
+
+    Yields:
+        Arrays with one row per cell, in ``cell_idx`` order, and one column
+        per feature group.
+    """
+    union, positions = _feature_group_positions(feature_groups)
+    cell_idx = np.asarray(cell_idx, dtype=np.int64)
+    if cell_idx.size == 0:
+        return
+    normalized = assay.normed(cell_idx=cell_idx, feat_idx=union)
+    if block_rows is not None:
+        normalized = normalized._with_block_size(max(1, int(block_rows)))
+    for block in normalized.stream_blocks(
+        nthreads=assay.nthreads,
+        msg=f"({assay.name}) Averaging feature groups",
+    ):
+        values = np.asarray(block, dtype=np.float64)
+        yield np.column_stack(
+            [values[:, position].mean(axis=1) for position in positions]
+        )
 
 
 @njit(cache=True, nogil=True)

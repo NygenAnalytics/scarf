@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal, cast
 
 import numpy as np
+import pandas as pd
 from pydantic import Field, create_model, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
@@ -74,6 +75,7 @@ from ..parameter_tuning.selection import (
     finalize_parameter_tuning_selection,
     harmony_acceptance_gate,
 )
+from ..tools import label_filter_bound
 from ..types import AgentDataModel, ArtifactReferenceModel
 from . import journal
 from .budget import CandidateBudget, CandidateBudgetExceeded, candidate_identity
@@ -998,15 +1000,19 @@ class RnaTuningRun:
         from ..experimental_context.characterization import _SelectionBoundCells
 
         cells = _SelectionBoundCells(self.store.zw, self.store.cells, self.cells)
-        values, counts = np.unique(cells.fetch(column), return_counts=True)
+        labels = cells.fetch(column)
+        # Missing labels are returned as None or NaN and never form a batch.
+        recorded = ~pd.isna(labels)
+        values, counts = np.unique(labels[recorded], return_counts=True)
         groups = []
         for value, n_cells in zip(values, counts, strict=True):
             if n_cells < 20:
                 continue
+            bound = label_filter_bound(value)
             selection = self.store.filter_cells(
                 [column],
-                [value],
-                [value],
+                [bound],
+                [bound],
                 cell_selection=self.cells,
                 keep_bounds=True,
                 invalidate_cache=False,

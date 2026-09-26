@@ -285,7 +285,7 @@ def test_datastore_cell_cycle_read_only_guard_precedes_planning(
 
     with pytest.raises(
         PermissionError,
-        match="Cell-cycle scoring requires a DataStore opened with zarr_mode='r\\+'",
+        match="run_cell_cycle_scoring requires a DataStore opened with zarr_mode='r\\+'",
     ):
         read_only.run_cell_cycle_scoring(selection)
 

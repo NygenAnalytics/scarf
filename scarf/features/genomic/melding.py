@@ -13,7 +13,7 @@ from ...storage.count_matrix import (
     CountMatrixPolicy,
 )
 from ...storage.layout import array_shard_rows
-from ...storage.schema import create_zarr_count_assay
+from ...storage.schema import DerivedAssayTransaction, derived_assay_transaction
 from ...storage.sharding import sparse_matrix_bytes, write_dense_from_row_batches
 from ...utils.arrays import array_digest
 from .intervals import create_bed_from_coord_ids, get_feature_mappings
@@ -327,6 +327,9 @@ def coordinate_melding(
 ) -> None:
     """Transfer coordinate-based assay values to overlapping external features.
 
+    The new assay becomes visible to assay scans only after its counts are
+    complete. A failed or interrupted write removes the partial assay.
+
     Args:
         assay: Source assay whose features have genomic coordinates.
         workspace: Workspace name. None uses the legacy layout.
@@ -342,12 +345,47 @@ def coordinate_melding(
     Returns:
         None
     """
+    from ...storage.stores import zarr_group_root
+
+    with derived_assay_transaction(
+        zarr_group_root(assay.z, mode="r+"),
+        new_assay_name,
+        workspace,
+        operation="coordinate_melding",
+    ) as transaction:
+        write_melded_counts(
+            transaction,
+            assay,
+            feature_bed,
+            peaks_col=peaks_col,
+            scalar_coeff=scalar_coeff,
+            renormalization=renormalization,
+            peaks_coords=peaks_coords,
+            idf_cell_idx=idf_cell_idx,
+        )
+
+
+def write_melded_counts(
+    transaction: DerivedAssayTransaction,
+    assay: Assay,
+    feature_bed: pd.DataFrame,
+    *,
+    peaks_col: str,
+    scalar_coeff: float,
+    renormalization: bool,
+    peaks_coords: np.ndarray | None,
+    idf_cell_idx: np.ndarray | None,
+) -> None:
+    """Write finalized melded counts and provenance into a pending assay.
+
+    Callers own the transaction, so they can finish further writes, such as
+    RNA ``countsT``, before the assay is published.
+    """
     if peaks_coords is None:
         peaks_coords = assay.feats.fetch_all(peaks_col)
     peaks_bed = create_bed_from_coord_ids(peaks_coords)
     feat_ids, feat_names, mapping = get_feature_mappings(peaks_bed, feature_bed)
 
-    from ...storage.stores import zarr_group_root
     from ...storage.profiles import resolve_storage_profile
 
     n_cells = int(assay.rawData.shape[0])
@@ -371,16 +409,12 @@ def coordinate_melding(
         preferredRows=min(int(assay.rawData.chunksize[0]), n_cells),
         maxRows=n_cells,
     )
-    store_root = zarr_group_root(assay.z, mode="r+")
-    group = create_zarr_count_assay(
-        z=store_root,
-        assay_name=new_assay_name,
-        workspace=workspace,
-        n_cells=n_cells,
-        feat_ids=feat_ids,
-        feat_names=feat_names,
-        dtype=store_dtype,
-        profile=resolve_storage_profile(store_root.store),
+    counts = transaction.create_counts(
+        n_cells,
+        feat_ids,
+        feat_names,
+        store_dtype,
+        profile=resolve_storage_profile(transaction.root.store),
         policy=_meld_count_matrix_policy(
             nCells=n_cells,
             nFeats=n_target_features,
@@ -391,7 +425,7 @@ def coordinate_melding(
 
     create_counts_mat(
         assay=assay,
-        store=group,
+        store=counts,
         mapping=mapping,
         scalar_coeff=scalar_coeff,
         renormalization=renormalization,
@@ -402,12 +436,11 @@ def coordinate_melding(
         if idf_cell_idx is None
         else np.unique(np.asarray(idf_cell_idx, dtype=np.int64))
     )
-    assay_group_path = (
-        new_assay_name if workspace is None else f"{workspace}/{new_assay_name}"
+    transaction.group.attrs.update(
+        {
+            "idfCellIndexDigest": array_digest(selected_cells),
+            "idfCellCount": int(len(selected_cells)),
+            "sourceAssay": assay.name,
+            "tfDenominator": "total_counts",
+        }
     )
-    assay_group = store_root[assay_group_path]
-    assay_group.attrs["idfCellIndexDigest"] = array_digest(selected_cells)
-    assay_group.attrs["idfCellCount"] = int(len(selected_cells))
-    assay_group.attrs["sourceAssay"] = assay.name
-    assay_group.attrs["tfDenominator"] = "total_counts"
-    return None

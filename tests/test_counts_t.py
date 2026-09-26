@@ -403,6 +403,105 @@ def test_iter_normed_feature_wise_batches_and_rejects_missing_inputs():
         )
 
 
+def test_iter_normed_feature_wise_splits_read_groups_to_fit_consumer_scratch():
+    from scarf.storage.feature_stream import persisted_read_group
+    from scarf.storage.geometry import array_geometry
+
+    root = _memory_root()
+    values = (np.arange(40 * 24, dtype=np.uint32) % 11).reshape(40, 24)
+    _write_small_assay(root, workspace=None, values=values)
+    cells = MetaData(root["cellData"])
+    n_counts = values.sum(axis=1).astype(np.float64)
+    cells.insert("RNA_nCounts", n_counts, overwrite=True)
+    assay = RNAassay(root, "RNA", cells, workspace=None, nthreads=1)
+    assay.sf = 1000.0
+    cell_idx = np.arange(values.shape[0], dtype=np.int64)
+    feat_idx = np.arange(1, values.shape[1], 2, dtype=np.int64)
+    expected = 1000.0 * values[:, feat_idx] / n_counts[:, None]
+
+    counts_t = assay.rawDataT
+    feature_width, read_group_bytes = persisted_read_group(counts_t)
+    assert feature_width >= values.shape[1]
+    geometry = array_geometry(counts_t)
+    reader_bytes = read_group_bytes + (
+        min(values.shape[1], max(feature_width, geometry.axisChunk(0)))
+        * min(geometry.axisChunk(1), values.shape[0])
+        * 4
+    )
+    resident_bytes = 4 * values.shape[0] + 8 * values.shape[1]
+    scratch_itemsize = 64
+    item_bytes = 8 + scratch_itemsize
+    # Budget three features of scratch, so one read group must be split.
+    assay.resources = ResourceBudget(
+        memoryBytes=reader_bytes
+        + resident_bytes
+        + 3 * values.shape[0] * item_bytes
+        + values.shape[0] * item_bytes // 2,
+        workers=1,
+    )
+
+    blocks = list(
+        assay.iter_normed_feature_wise(
+            cell_idx,
+            feat_idx,
+            None,
+            None,
+            as_dataframe=False,
+            scratch_itemsize=scratch_itemsize,
+        )
+    )
+    assert [block.shape[0] for block, _labels in blocks] == [3, 3, 3, 3]
+    assert all(block.flags.c_contiguous for block, _labels in blocks)
+    np.testing.assert_array_equal(
+        np.concatenate([labels for _block, labels in blocks]),
+        feat_idx,
+    )
+    np.testing.assert_allclose(
+        np.concatenate([block for block, _labels in blocks]).T,
+        expected,
+        rtol=1e-6,
+    )
+
+    frames = list(
+        assay.iter_normed_feature_wise(
+            cell_idx,
+            feat_idx,
+            2,
+            None,
+            scratch_itemsize=scratch_itemsize,
+        )
+    )
+    assert [frame.shape for frame in frames] == [(40, 2)] * 6
+    np.testing.assert_allclose(
+        np.concatenate([frame.to_numpy() for frame in frames], axis=1),
+        expected,
+        rtol=1e-6,
+    )
+
+    with pytest.raises(MemoryError, match="affordable width is 3"):
+        list(
+            assay.iter_normed_feature_wise(
+                cell_idx,
+                feat_idx,
+                4,
+                None,
+                scratch_itemsize=scratch_itemsize,
+            )
+        )
+    with pytest.raises(ValueError, match="scratch_itemsize"):
+        list(
+            assay.iter_normed_feature_wise(
+                cell_idx, feat_idx, None, None, scratch_itemsize=-1
+            )
+        )
+    with pytest.raises(TypeError, match="resident_bytes"):
+        list(
+            assay.iter_normed_feature_wise(
+                cell_idx, feat_idx, None, None, resident_bytes=True
+            )
+        )
+
+
 def test_regression_on_strip_counts_t():
     root = _memory_root()
     values = np.array(

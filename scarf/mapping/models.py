@@ -148,6 +148,13 @@ class _MappingResultAxes:
 
 @dataclass(frozen=True)
 class MappingResult:
+    """One loaded query projection and its optional neighbor arrays.
+
+    ``uninformative`` marks query cells whose raw counts are zero in every
+    reference feature that the query measured. Their neighbor rows are stored
+    but carry no query evidence, so label transfer and mapping scores skip them.
+    """
+
     ref: ArtifactRef
     n_cells: int
     correction_method: str

@@ -233,6 +233,34 @@ def test_scaled_dispersion_reads_one_for_data_matching_the_reference():
         scaled_dispersion_sum(reference[:, :2], model)
 
 
+def test_scaled_dispersion_can_skip_filled_reference_features():
+    rng = np.random.default_rng(1)
+    values = rng.normal(size=(20, 5))
+    model = ScaledPCAProjectionModel(
+        feature_means=np.array([0.5, 1.0, -1.0, 2.0, 0.0]),
+        center=np.zeros(5),
+        feature_scales=np.array([1.0, 2.0, 0.5, 1.5, 3.0]),
+        loadings=np.eye(5),
+    )
+    measured = np.array([0, 2, 3])
+    filled = values.copy()
+    filled[:, [1, 4]] = 0.0
+    scaled = (values[:, measured] - model.feature_means[measured]) / (
+        model.feature_scales[measured]
+    )
+
+    for block in (values, filled):
+        assert scaled_dispersion_sum(block, model, features=measured) == pytest.approx(
+            float(np.square(scaled).sum())
+        )
+    assert scaled_dispersion_sum(filled, model) != pytest.approx(
+        scaled_dispersion_sum(filled, model, features=measured)
+    )
+    for invalid in (np.array([0.0, 1.0]), np.array([[0, 1]]), np.array([5])):
+        with pytest.raises(ValueError, match="reference feature column indices"):
+            scaled_dispersion_sum(values, model, features=invalid)
+
+
 def _correct(
     projection: ScaledPCAProjectionModel,
     correction_model: SymphonyCorrectionModel,

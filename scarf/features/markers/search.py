@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 
 import numba
 import numpy as np
@@ -92,6 +92,56 @@ def _validate_rank_marker_groups(group_counts: np.ndarray, n_total: int) -> None
         )
 
 
+# Normalizations whose values the rank search computes from raw-count batches.
+_NORMALIZATION_ADAPTERS = {norm_tf_idf: "tfidf", norm_clr: "clr", norm_dummy: "dummy"}
+
+
+def rank_marker_adapter(
+    assay: Assay,
+    *,
+    renormalize_subset: bool = False,
+) -> str | None:
+    """Return the raw-count adapter that rank marker search applies, if any.
+
+    Adapters compute normalized values from ``countsT`` batches themselves.
+    Without one, marker search reads ``iter_normed_feature_wise``.
+    """
+    if lib_size_feature_stream_eligible(assay, renormalize_subset=renormalize_subset):
+        if not isinstance(assay, RNAassay):
+            raise TypeError(
+                "Fast raw-count marker search requires an RNAassay instance"
+            )
+        if getattr(assay, "rawDataT", None) is None:
+            return None
+        raw_source, _, _ = assay._raw_feature_stream_source()
+        if np.issubdtype(raw_source.dtype, np.unsignedinteger):
+            return "rna_lib_size_unsigned"
+        return "lib_size"
+    if getattr(assay, "rawDataT", None) is None:
+        return None
+    return _NORMALIZATION_ADAPTERS.get(assay.normMethod)
+
+
+def marker_count_arithmetic(
+    assay: Assay,
+    *,
+    log_transform: bool,
+    renormalize_subset: bool,
+) -> Literal["float64"] | None:
+    """Return the count-arithmetic marker recorded with a rank marker table.
+
+    Raw-count adapters compute every value in floating point and never
+    changed, so only the fallback that reads ``normed`` batches can carry it.
+    """
+    if rank_marker_adapter(assay, renormalize_subset=renormalize_subset) is not None:
+        return None
+    return assay._count_arithmetic(
+        "feature_batches",
+        log_transform=log_transform,
+        renormalize_subset=renormalize_subset,
+    )
+
+
 @restore_numba_threads
 def find_markers_by_rank(
     assay: Assay,
@@ -148,60 +198,36 @@ def find_markers_by_rank(
 
     renormalize_subset = bool(norm_params.get("renormalize_subset", False))
     log_transform = bool(norm_params.get("log_transform", False))
-    use_fast = lib_size_feature_stream_eligible(
-        assay,
-        renormalize_subset=renormalize_subset,
-    )
-    if use_fast and isinstance(assay, RNAassay):
-        raw_source, _, _ = assay._raw_feature_stream_source()
-        use_fast = np.issubdtype(raw_source.dtype, np.unsignedinteger)
-    elif use_fast:
-        raise TypeError("Fast raw-count marker search requires an RNAassay instance")
-
+    adapter = rank_marker_adapter(assay, renormalize_subset=renormalize_subset)
     counts_t = getattr(assay, "rawDataT", None)
-    adapter: str | None = None
     cell_scale: np.ndarray | None = None
     feature_scale: np.ndarray | None = None
     scalar_values: np.ndarray | None = None
     size_factor = 1.0
-    if use_fast and isinstance(assay, RNAassay) and counts_t is not None:
-        adapter = "rna_lib_size_unsigned"
+    if adapter == "rna_lib_size_unsigned":
+        assert isinstance(assay, RNAassay)
         scalar = assay.cells.fetch_all(assay.name + "_nCounts")[cell_idx]
         size_factor = float(assay.sf) if assay.sf is not None else 1.0
         if assay.sf is None:
             raise ValueError("RNA library-size normalization requires a size factor")
         scalar_values = np.asarray(scalar, dtype=np.float32)
         scalar_values[scalar_values == 0] = 1
-    elif counts_t is not None and assay.normMethod is norm_tf_idf:
-        adapter = "tfidf"
+    elif adapter == "tfidf":
         assay.normed(cell_idx, feat_idx, **norm_params)
         cell_scale = np.asarray(assay.n_term_per_doc, dtype=np.float64)
         docs = float(getattr(assay, "n_docs", len(cell_idx)))
         feature_scale = np.log2(
             1.0 + (docs / (np.asarray(assay.n_docs_per_term, dtype=np.float64) + 1.0))
         )
-    elif counts_t is not None and assay.normMethod is norm_clr:
-        adapter = "clr"
-    elif counts_t is not None and assay.normMethod is norm_dummy:
-        adapter = "dummy"
-    elif (
-        counts_t is not None
-        and lib_size_feature_stream_eligible(
-            assay, renormalize_subset=renormalize_subset
-        )
-        and not use_fast
-    ):
-        adapter = "lib_size"
+    elif adapter == "lib_size":
         scalar = assay.cells.fetch_all(assay.name + "_nCounts")[cell_idx]
         size_factor = float(assay.sf) if assay.sf is not None else 1.0
         scalar_values = np.asarray(scalar, dtype=np.float32)
         scalar_values[scalar_values == 0] = 1
 
     if adapter is not None:
-        if counts_t is None:
-            raise ValueError(
-                f"Assay {assay.name!r} requires sharded countsT for marker search"
-            )
+        # Every adapter reads countsT, so its presence selects one.
+        assert counts_t is not None
         from ...storage.budget import resolve_budget
         from ...storage.feature_stream import (
             map_feature_read_groups,
@@ -399,21 +425,20 @@ def find_markers_by_regression(
     r_parts: list[np.ndarray] = []
     p_parts: list[np.ndarray] = []
     status_parts: list[np.ndarray] = []
-    for feature_batch in assay.iter_normed_feature_wise(
+    for feature_major, raw_labels in assay.iter_normed_feature_wise(
         cell_idx=cell_idx,
         feat_idx=feat_idx,
         batch_size=batch_size,
         msg="Finding correlated features",
+        as_dataframe=False,
         **norm_params,
     ):
-        if not isinstance(feature_batch, pd.DataFrame):
-            raise TypeError("Expected normalized feature batches as DataFrames.")
-        if feature_batch.shape[0] != regressor.shape[0]:
+        data = np.asarray(feature_major, dtype=np.float64).T
+        feat_labels = np.asarray(raw_labels)
+        if data.ndim != 2 or data.shape[0] != regressor.shape[0]:
             raise ValueError(
                 "Regressor length does not match the number of selected cells"
             )
-        data = np.ascontiguousarray(feature_batch.to_numpy(dtype=np.float64))
-        feat_labels = np.asarray(feature_batch.columns)
         r_vals, p_vals, status = _regression_batch_results(
             data,
             x_centered,

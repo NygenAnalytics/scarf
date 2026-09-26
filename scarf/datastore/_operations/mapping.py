@@ -42,7 +42,6 @@ from ...mapping.symphony import (
     scaled_dispersion_sum,
     soft_cluster_assignments,
     solve_query_correction,
-    zero_norm_rows,
 )
 from ...storage.geometry import array_geometry
 from ...storage.partition import row_band
@@ -184,6 +183,9 @@ def _mapping_memory_reservations(
     if symphony is None:
         return resident, per_row
 
+    if batch_codes is not None:
+        # The second pass replays one uninformative flag per selected cell.
+        resident += len(batch_codes) * np.dtype(bool).itemsize
     correction_arrays = (
         symphony.centroids,
         symphony.raw_centroids,
@@ -215,18 +217,23 @@ def _mapping_memory_reservations(
 
 def _read_projected_blocks(
     coordinates_file: BinaryIO,
+    uninformative: np.ndarray,
     *,
-    n_cells: int,
     n_dims: int,
     block_rows: int,
-) -> Generator[tuple[int, np.ndarray], None, None]:
+) -> Generator[tuple[int, np.ndarray, np.ndarray], None, None]:
+    n_cells = len(uninformative)
     coordinates_file.seek(0)
     for start in range(0, n_cells, block_rows):
         n_rows = min(block_rows, n_cells - start)
         values = np.fromfile(coordinates_file, dtype=np.float64, count=n_rows * n_dims)
         if values.size != n_rows * n_dims:
             raise RuntimeError("Temporary mapping coordinates are incomplete")
-        yield start, values.reshape(n_rows, n_dims)
+        yield (
+            start,
+            values.reshape(n_rows, n_dims),
+            uninformative[start : start + n_rows],
+        )
 
 
 class _MappingOperationsMixin(_MappingOperationsBase):
@@ -260,7 +267,13 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         query_batches: pd.DataFrame | None = None,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
-        """Map selected query cells into an immutable prepared reference."""
+        """Map selected query cells into an immutable prepared reference.
+
+        A query cell whose raw counts are zero in every reference feature that
+        the query measured is recorded as uninformative. It keeps a projection
+        row but is excluded from label transfer, mapping scores, Symphony
+        query-batch statistics, and ``queryScaledDispersion``.
+        """
         if not isinstance(reference, MappingReference):
             raise TypeError("reference must be a MappingReference")
         reference = validate_mapping_reference_binding(reference)
@@ -362,6 +375,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             batch_codes=batch_codes,
             batch_design=batch_design,
         )
+        query_dataset_fingerprint = self._ensure_dataset_fingerprint(assay_name)
         feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay.z)
         stream = AlignedFeatureStream(
             query_assay=assay,
@@ -376,7 +390,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         )
         if _ordered_feature_ids_fingerprint(assay.z) != feature_ids_fingerprint:
             raise ValueError("Query feature identities changed during mapping setup")
-        selected_expression_fingerprint = stream.raw_expression_fingerprint
 
         all_features = cast(Any, self).select_all_features(
             from_assay=assay.name,
@@ -413,7 +426,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             correction_method=correction_method,
             cell_selection=cell_selection,
             feature_selection=feature_selection,
-            selected_expression_fingerprint=selected_expression_fingerprint,
+            query_dataset_fingerprint=query_dataset_fingerprint,
             query_batch_fingerprint=query_batch_fingerprint,
             query_batch_count=n_batches,
             mapping_reference=reference.external_ref,
@@ -430,28 +443,30 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             chunk_rows=stream.row_geometry.block_rows,
             profile=self.storageProfile,
         )
+        overlap_features = stream.reference_index_map
         dispersion_total = 0.0
         informative_total = 0
-        zero_norm_count = 0
 
-        def projected_blocks() -> Generator[tuple[int, np.ndarray], None, None]:
-            nonlocal dispersion_total, informative_total, zero_norm_count
+        def projected_blocks() -> Generator[
+            tuple[int, np.ndarray, np.ndarray], None, None
+        ]:
+            nonlocal dispersion_total, informative_total
             expected_start = 0
             with closing(stream.iter_blocks()) as blocks:
                 for block in blocks:
                     if block.row_offset != expected_start:
                         raise RuntimeError("Aligned query blocks are not contiguous")
                     coordinates = project_pca(block.values, reference.model)
-                    uninformative = zero_norm_rows(coordinates)
-                    zero_norm_count += int(np.count_nonzero(uninformative))
-                    informative = ~uninformative
+                    informative = block.observed
                     if informative.any():
                         dispersion_total += scaled_dispersion_sum(
-                            block.values[informative], reference.model
+                            block.values[informative],
+                            reference.model,
+                            features=overlap_features,
                         )
                         informative_total += int(np.count_nonzero(informative))
                     expected_start += len(coordinates)
-                    yield block.row_offset, coordinates
+                    yield block.row_offset, coordinates, ~informative
             if expected_start != n_cells:
                 raise RuntimeError("Mapping did not cover all selected query cells")
 
@@ -466,24 +481,26 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             if symphony_state is not None:
                 assert batch_codes is not None
                 coordinates_file = TemporaryFile()
+                uninformative_rows = np.empty(n_cells, dtype=bool)
                 counts, sums = initialize_sufficient_statistics(
                     n_batches,
                     symphony_state,
                 )
-                for row_offset, coordinates in coordinate_blocks:
+                for row_offset, coordinates, uninformative in coordinate_blocks:
                     coordinates.tofile(coordinates_file)
-                    assignments = soft_cluster_assignments(
-                        coordinates,
-                        symphony_state,
-                    )
                     stop = row_offset + len(coordinates)
-                    informative = ~zero_norm_rows(coordinates)
+                    uninformative_rows[row_offset:stop] = uninformative
+                    informative = ~uninformative
                     if informative.any():
+                        assignments = soft_cluster_assignments(
+                            coordinates[informative],
+                            symphony_state,
+                        )
                         accumulate_sufficient_statistics(
                             counts,
                             sums,
                             coordinates[informative],
-                            assignments[informative],
+                            assignments,
                             batch_codes[row_offset:stop][informative],
                         )
                 correction = solve_query_correction(
@@ -494,16 +511,16 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 )
                 coordinate_blocks = _read_projected_blocks(
                     coordinates_file,
-                    n_cells=n_cells,
+                    uninformative_rows,
                     n_dims=reference.model.n_dims,
                     block_rows=stream.row_geometry.block_rows,
                 )
 
+            uninformative_count = 0
             expected_start = 0
-            for row_offset, coordinates in coordinate_blocks:
+            for row_offset, coordinates, uninformative in coordinate_blocks:
                 if row_offset != expected_start:
                     raise RuntimeError("Projected query blocks are not contiguous")
-                uninformative = zero_norm_rows(coordinates)
                 query_coordinates = coordinates
                 if symphony_state is not None:
                     assert batch_codes is not None
@@ -531,33 +548,19 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                     np.asarray(distances, dtype=np.float64),
                     np.asarray(uninformative, dtype=bool),
                 )
+                uninformative_count += int(np.count_nonzero(uninformative))
                 expected_start = row_offset + len(coordinates)
             if expected_start != n_cells:
                 raise RuntimeError("Mapping did not cover all selected query cells")
-            if (
-                stream.fingerprint_live_raw_expression()
-                != selected_expression_fingerprint
-            ):
-                raise ValueError("Query expression changed during mapping")
             if _ordered_feature_ids_fingerprint(assay.z) != feature_ids_fingerprint:
                 raise ValueError("Query feature identities changed during mapping")
-            final_cells = validate_stored_selection_integrity(
-                self.zw,
-                cell_selection,
-                kind="cell_selection",
-                scope="datastore",
-                assay=None,
-                table_path="cellData",
-            )
-            if final_cells.selected_count != n_cells:
-                raise ValueError("Query cell selection changed during mapping")
-            denominator = informative_total * reference.model.n_features
+            denominator = informative_total * len(overlap_features)
             writer.finish(
                 {
                     "featureCoverage": stream.feature_coverage,
                     "queryBatchCount": n_batches,
                     "algorithmVariant": algorithm_variant,
-                    "zeroNormCellCount": zero_norm_count,
+                    "uninformativeCellCount": uninformative_count,
                     "queryScaledDispersion": (
                         dispersion_total / denominator if denominator else 0.0
                     ),
@@ -682,6 +685,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 multiplier=multiplier,
                 weighted=weighted,
                 fixed_weight=fixed_weight,
+                one_pass=True,
             )
         )
         classes = None
@@ -692,16 +696,16 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         coordinates = None if layout is None else loaded.reference._fetch_layout(layout)
         return loaded, scores, classes, coordinates
 
-    def _mapping_scores(
-        self,
+    @staticmethod
+    def _mapping_score_settings(
         loaded: MappingResult,
-        *,
         target_groups: np.ndarray | None,
+        *,
         log_transform: bool,
         multiplier: float,
         weighted: bool,
         fixed_weight: float,
-    ) -> Generator[tuple[Any, np.ndarray], None, None]:
+    ) -> tuple[np.ndarray, float, float]:
         if not isinstance(log_transform, bool):
             raise TypeError("log_transform must be a boolean")
         if not isinstance(weighted, bool):
@@ -717,66 +721,94 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             low=0.0,
             low_open=True,
         )
-
-        indices, distances, uninformative = self._projection_arrays(loaded.ref)
-        n_cells = loaded.n_cells
-        n_k = int(indices.shape[1])
-
         if target_groups is None:
-            groups = np.zeros(n_cells, dtype=np.uint8)
+            groups = np.zeros(loaded.n_cells, dtype=np.uint8)
         else:
             groups = np.asarray(target_groups)
-            if groups.shape != (n_cells,):
+            if groups.shape != (loaded.n_cells,):
                 raise ValueError(
                     "target_groups must contain one value per projected query cell"
                 )
-        requested_groups = pd.unique(groups)
+        return groups, scale, weight
+
+    def _mapping_scores(
+        self,
+        loaded: MappingResult,
+        *,
+        target_groups: np.ndarray | None,
+        log_transform: bool,
+        multiplier: float,
+        weighted: bool,
+        fixed_weight: float,
+        one_pass: bool = False,
+    ) -> Generator[tuple[Any, np.ndarray], None, None]:
+        """Yield one reference-sized score row per query group.
+
+        Missing group values form one group. By default each group is scored in
+        its own pass over the projection, so one row is held at a time;
+        ``one_pass`` scores every group in a single pass instead.
+        """
+        groups, scale, weight = self._mapping_score_settings(
+            loaded,
+            target_groups,
+            log_transform=log_transform,
+            multiplier=multiplier,
+            weighted=weighted,
+            fixed_weight=fixed_weight,
+        )
+        codes, labels = pd.factorize(groups, use_na_sentinel=False)
+        batches = (
+            [np.arange(len(labels))]
+            if one_pass
+            else [np.array([code]) for code in range(len(labels))]
+        )
+        indices, distances, uninformative = self._projection_arrays(loaded.ref)
+        n_k = int(indices.shape[1])
+        block_size = self._projection_block_size(indices)
 
         from ...mapping.confidence import mapping_score_weights
 
-        for group in requested_groups:
-            score = np.zeros(
-                loaded.reference.selected_cell_count,
+        for batch in batches:
+            rows = np.full(len(labels), -1, dtype=np.int64)
+            rows[batch] = np.arange(len(batch))
+            scores = np.zeros(
+                (len(batch), loaded.reference.selected_cell_count),
                 dtype=np.float64,
             )
-            informative_count = 0
-            block_size = self._projection_block_size(indices)
-            for start in range(0, n_cells, block_size):
-                stop = min(start + block_size, n_cells)
-                block_groups = groups[start:stop]
-                block_uninformative = np.asarray(
-                    uninformative[start:stop],
-                    dtype=bool,
+            informative_counts = np.zeros(len(batch), dtype=np.int64)
+            for start in range(0, loaded.n_cells, block_size):
+                stop = min(start + block_size, loaded.n_cells)
+                block_rows = rows[codes[start:stop]]
+                keep = (block_rows >= 0) & ~np.asarray(
+                    uninformative[start:stop], dtype=bool
                 )
-                if bool(pd.isna(group)):
-                    group_mask = np.asarray(pd.isna(block_groups), dtype=bool)
-                else:
-                    group_mask = np.asarray(block_groups == group, dtype=bool)
-                informative_mask = group_mask & ~block_uninformative
-                if not informative_mask.any():
+                if not keep.any():
                     continue
-                block_indices = np.asarray(indices[start:stop])[informative_mask]
+                block_rows = block_rows[keep]
+                block_indices = np.asarray(indices[start:stop])[keep]
                 if weighted:
                     block_weights = mapping_score_weights(
-                        np.asarray(distances[start:stop])[informative_mask]
+                        np.asarray(distances[start:stop])[keep]
                     )
                 else:
                     block_weights = np.full(
-                        block_indices.shape,
-                        weight,
-                        dtype=np.float64,
+                        block_indices.shape, weight, dtype=np.float64
                     )
                 np.add.at(
-                    score,
-                    block_indices.reshape(-1),
-                    block_weights.reshape(-1),
+                    scores,
+                    (
+                        np.broadcast_to(block_rows[:, np.newaxis], block_indices.shape),
+                        block_indices,
+                    ),
+                    block_weights,
                 )
-                informative_count += int(np.count_nonzero(informative_mask))
-            if informative_count:
-                score *= scale / (informative_count * n_k)
+                informative_counts += np.bincount(block_rows, minlength=len(batch))
+            for row, informative_count in enumerate(informative_counts):
+                if informative_count:
+                    scores[row] *= scale / (int(informative_count) * n_k)
             if log_transform:
-                score = np.log1p(score)
-            yield group, score
+                np.log1p(scores, out=scores)
+            yield from zip(labels[batch], scores, strict=True)
 
     @staticmethod
     def _reference_label_codes(

@@ -49,7 +49,8 @@ from ...storage.selections import (
 )
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...assay import Assay, RNAassay, lib_size_feature_stream_eligible
-from ...assay.normalization import reject_unknown_normalization_params
+from ...assay.normalization import norm_lib_size, reject_unknown_normalization_params
+from ...features.enrichment.net import AmbiguousTargets
 from ...features.enrichment.results import EnrichmentResult
 from ...features.markers.table import (
     MARKER_ADJUSTMENT_METHOD,
@@ -68,6 +69,7 @@ from ...features.statistical import (
     GroupComparisonResult,
     KRUSKAL_WALLIS_COLUMNS,
     MANN_WHITNEY_COLUMNS,
+    MANN_WHITNEY_P_VALUE_POLICY,
     StatisticalTestResult,
     WELCH_COLUMNS,
     WILCOXON_COLUMNS,
@@ -76,7 +78,11 @@ from ...features.statistical import (
     compare_group_distributions,
     resolve_group_order,
 )
-from ...features.values import fetch_normalized_feature_matrix, resolve_feature
+from ...features.values import (
+    ResolvedFeature,
+    fetch_normalized_feature_matrix,
+    resolve_feature_batch,
+)
 from ...metadata.arguments import (
     AucellArguments,
     MarkerTableArguments,
@@ -94,7 +100,12 @@ from ...metadata.selection import (
     valid_category_mask,
 )
 from ...metadata.rows import read_metadata_missing_rows, read_metadata_rows
-from ...utils.arrays import array_digest, regex_match_mask
+from ...utils.arrays import (
+    array_digest,
+    has_duplicates,
+    regex_match_mask,
+    sort_categories,
+)
 from ...utils.compute import controlled_compute
 from ...utils.logging import logger
 from ...utils.progress import iter_progress
@@ -105,7 +116,6 @@ from .enrichment_store import (
     _load_enrichment_result,
     _write_enrichment_slot,
 )
-from ...utils.arrays import has_duplicates
 
 if TYPE_CHECKING:
     from ..mapping_datastore import MappingDatastore as _FeatureOperationsBase
@@ -113,7 +123,6 @@ else:
     _FeatureOperationsBase = object
 
 _MARKER_STAT_COLUMNS = MARKER_STAT_COLUMNS
-_MARKER_OUT_COLUMNS = ("feature_index", *_MARKER_STAT_COLUMNS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +141,46 @@ class _StatisticalSelection:
     subset_fingerprint: str | None
     sample_fingerprint: str | None
     pair_fingerprint: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _StatisticalKey:
+    """One tested key, resolved once per statistical-testing call.
+
+    Feature keys carry their resolved feature. Cell-metadata keys carry the
+    column values and missing mask read over the grouping's cells.
+    """
+
+    label: str
+    tested_feature: str
+    source_assay: str | None
+    feature: ResolvedFeature | None = None
+    column: str | None = None
+    column_values: Any = None
+    column_missing: np.ndarray | None = None
+
+
+def _study_design_pairing_error(subject_by: str, reason: str) -> ValueError:
+    return ValueError(
+        f"StudyDesign pairs samples by {subject_by!r}, but {reason}. Only the "
+        "paired Wilcoxon test models subjects, and it needs exactly two "
+        "conditions with subjects measured in both. For repeated measures "
+        "across three or more conditions, select two conditions with groups=. "
+        f"For subjects nested within conditions, pass sample_by={subject_by!r} "
+        "without a StudyDesign pairing column so each subject is one "
+        "independent sample."
+    )
+
+
+def _subjects_span_groups(pairs: np.ndarray, groups: np.ndarray) -> bool:
+    """Return whether any subject is observed in more than one group."""
+    frame = pd.DataFrame(
+        {
+            "pair": np.asarray(pairs, dtype=object),
+            "group": np.asarray(groups, dtype=object),
+        }
+    )
+    return bool((frame.groupby("pair", sort=False)["group"].nunique() > 1).any())
 
 
 def _statistical_storage_columns(
@@ -256,6 +305,21 @@ def _statistical_equal_var(method: str | None) -> bool | None:
     return False if method in ("welch", "t_test") else None
 
 
+def _reject_missing_statistical_values(
+    keys: Sequence[_StatisticalKey],
+    selection_mask: np.ndarray,
+) -> None:
+    """Reject explicit missing tested metadata in the effective selection."""
+    for key in keys:
+        if key.column_missing is not None and np.any(
+            key.column_missing[selection_mask]
+        ):
+            raise ValueError(
+                f"Tested metadata column {key.column!r} contains missing "
+                "values in the effective cell selection"
+            )
+
+
 def _shared_marker_feature_index(markers: dict[Any, pd.DataFrame]) -> np.ndarray:
     shared: np.ndarray | None = None
     populated_names: set[str] = set()
@@ -352,12 +416,6 @@ def _group_assignment_digest(values: np.ndarray) -> str:
 
 
 class _FeatureOperationsMixin(_FeatureOperationsBase):
-    def _require_feature_write(self, operation: str) -> None:
-        if self.zarr_mode != "r+":
-            raise PermissionError(
-                f"{operation} requires a DataStore opened with zarr_mode='r+'"
-            )
-
     def select_all_features(
         self,
         *,
@@ -368,7 +426,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         The universe is an artifact only. It is never mirrored into feature
         metadata or registered under a mutable label.
         """
-        self._require_feature_write("Feature selection")
+        self._require_writable("select_all_features")
         resolved_assay = self._get_assay(from_assay)
         feature_ids_fingerprint = _ordered_feature_ids_fingerprint(resolved_assay.z)
         values = np.ones(resolved_assay.feats.N, dtype=bool)
@@ -405,7 +463,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
         """Persist an explicit feature mask as an immutable artifact."""
-        self._require_feature_write("set_feature_selection")
+        self._require_writable("set_feature_selection")
         assay = self._get_assay(from_assay)
         all_features = self.select_all_features(from_assay=assay.name)
         if (mask is None) == (feature_indexes is None):
@@ -465,7 +523,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
         """Select features detected in at least ``min_cells`` selected cells."""
-        self._require_feature_write("select_detected_features")
+        self._require_writable("select_detected_features")
         if isinstance(min_cells, bool) or not isinstance(min_cells, int):
             raise TypeError("min_cells must be an integer")
         if min_cells < 0:
@@ -548,7 +606,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         **plot_kwargs: Any,
     ) -> ArtifactRef:
         """Create or reuse an HVG artifact without creating a mutable alias."""
-        self._require_feature_write("select_hvgs")
+        self._require_writable("select_hvgs")
         blacklist_fingerprint = (
             fingerprint_array(regex_match_mask(feature_names, blacklist))
             if blacklist
@@ -722,16 +780,40 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         invalidate_cache: bool = False,
         **plot_kwargs: Any,
     ) -> ArtifactRef:
-        """Persist highly variable genes as an immutable feature selection."""
+        """Persist highly variable genes as an immutable feature selection.
+
+        Extra keyword arguments are options of
+        :func:`scarf.plotting.highly_variable_features`, used when
+        ``show_plot`` is True. Any other keyword raises ``TypeError`` before
+        anything is computed or saved.
+        """
         if not isinstance(cell_selection, ArtifactRef):
             raise TypeError("cell_selection must be an ArtifactRef")
+        if plot_kwargs:
+            import inspect
+
+            from ...plotting import highly_variable_features
+
+            accepted = {
+                name
+                for name, parameter in inspect.signature(
+                    highly_variable_features
+                ).parameters.items()
+                if parameter.kind is inspect.Parameter.KEYWORD_ONLY and name != "show"
+            }
+            unknown = sorted(set(plot_kwargs) - accepted)
+            if unknown:
+                raise TypeError(
+                    "select_hvgs() got unexpected keyword arguments: "
+                    + ", ".join(repr(name) for name in unknown)
+                )
         assay = self._get_assay(from_assay)
         if not isinstance(assay, RNAassay):
             raise TypeError(
                 "HVG selection can only be applied to an RNAassay; "
                 f"received {type(assay).__name__}"
             )
-        self._require_feature_write("select_hvgs")
+        self._require_writable("select_hvgs")
         feature_snapshot = snapshot_run_metadata(
             self.zw,
             table_path=f"{assay.name}/featureData",
@@ -859,10 +941,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         cell_selection: ArtifactRef,
         features: ArtifactRef,
     ) -> tuple[RNAassay, np.ndarray, np.ndarray, ArtifactRef]:
-        if self.zarr_mode != "r+":
-            raise ValueError(
-                f"{display_name} requires a DataStore opened with zarr_mode='r+'"
-            )
+        self._require_writable(display_name)
         if not isinstance(features, ArtifactRef):
             raise TypeError("features must be an ArtifactRef")
         if not isinstance(cell_selection, ArtifactRef):
@@ -870,6 +949,9 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         assay = self._get_assay(from_assay)
         if not isinstance(assay, RNAassay):
             raise TypeError(f"{display_name} can only be run on an RNAassay")
+        # Scores are streamed from the counts, so their prepared identity must
+        # be intact. The feature-selection lineage binds it to the result.
+        self._ensure_dataset_fingerprint(assay.name)
         feature_selection = self.resolve_features(assay.name, features)
         feature_values = _feature_selection_values(self.zw, feature_selection)
         feature_index = np.flatnonzero(feature_values).astype(np.int64, copy=False)
@@ -897,6 +979,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         mode: Literal["wmean", "wsum"] = "wmean",
         tmin: int = 5,
         log_transform: bool = False,
+        ambiguous_targets: AmbiguousTargets = "drop",
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
         """Score weighted gene sets from streamed normalized RNA counts.
@@ -916,12 +999,21 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 source weights. ``"wsum"`` returns the weighted sum.
             tmin: Minimum number of matched targets required per source.
             log_transform: Apply ``log1p`` after library-size normalization.
+            ambiguous_targets: Handling of a target that matches several active
+                features, such as a gene symbol shared by two feature ids.
+                ``"drop"`` removes its edges before ``tmin`` pruning, logs a
+                warning, and records the target in the artifact's
+                ``dropped_ambiguous_targets`` attribute. ``"error"`` raises.
         Returns:
             A complete ``enrichment_scores`` artifact.
 
+        Raises:
+            PermissionError: If the store is not opened with ``zarr_mode='r+'``.
+
         Note:
             Cache identity covers selections, method parameters, normalization, and
-            the prepared network. It assumes the stored count matrix is immutable.
+            the prepared network, whose digest hashes only the retained edges. It
+            assumes the stored count matrix is immutable.
         """
         from ...features.enrichment.net import prepare_network
         from ...features.enrichment.waggr import (
@@ -949,6 +1041,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             active_feature_index=feature_index,
             tmin=tmin,
             weighted=True,
+            ambiguous_targets=ambiguous_targets,
         )
         if not lib_size_feature_stream_eligible(assay):
             raise ValueError(
@@ -971,7 +1064,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             mode=mode,
             tmin=tmin,
             log_transform=log_transform,
-            normalization_method=callable_identity(assay.normMethod),
+            normalization_method=callable_identity(norm_lib_size),
             size_factor=size_factor,
             invalidate_cache=invalidate_cache,
         )
@@ -1015,6 +1108,9 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 method="waggr",
                 algorithm_version=WAGGR_ALGORITHM_VERSION,
                 method_payload={
+                    "dropped_ambiguous_targets": list(
+                        network.dropped_ambiguous_targets
+                    ),
                     "log_transform": log_transform,
                     "network_digest": network.network_digest,
                     "normalization": "norm_lib_size",
@@ -1044,6 +1140,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         tmin: int = 5,
         n_up: int | None = None,
         tie_seed: int = 0,
+        ambiguous_targets: AmbiguousTargets = "drop",
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
         """Score gene sets by recovery among each cell's top-ranked RNA features.
@@ -1062,12 +1159,21 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 five percent of the ranking universe is used, clipped to its valid
                 range.
             tie_seed: Seed for the global feature permutation used to resolve ties.
+            ambiguous_targets: Handling of a target that matches several active
+                features, such as a gene symbol shared by two feature ids.
+                ``"drop"`` removes its edges before ``tmin`` pruning, logs a
+                warning, and records the target in the artifact's
+                ``dropped_ambiguous_targets`` attribute. ``"error"`` raises.
         Returns:
             A complete ``enrichment_scores`` artifact.
 
+        Raises:
+            PermissionError: If the store is not opened with ``zarr_mode='r+'``.
+
         Note:
             Cache identity covers selections, method parameters, and the prepared
-            network. It assumes the stored count matrix is immutable.
+            network, whose digest hashes only the retained edges. It assumes the
+            stored count matrix is immutable.
         """
         from ...features.enrichment.aucell import (
             AUCELL_ALGORITHM_VERSION,
@@ -1094,6 +1200,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             active_feature_index=feature_index,
             tmin=tmin,
             weighted=False,
+            ambiguous_targets=ambiguous_targets,
         )
         permutation = make_rank_permutation(len(feature_index), tie_seed)
         rank_feature_index = feature_index[permutation]
@@ -1155,6 +1262,9 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 method="aucell",
                 algorithm_version=AUCELL_ALGORITHM_VERSION,
                 method_payload={
+                    "dropped_ambiguous_targets": list(
+                        network.dropped_ambiguous_targets
+                    ),
                     "n_up": resolved_n_up,
                     "network_digest": network.network_digest,
                     "tie_seed": tie_seed,
@@ -1230,6 +1340,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
     ) -> ArtifactRef:
         """Create or reuse one immutable marker-table artifact."""
         from ...features.markers import find_markers_by_rank
+        from ...features.markers.search import marker_count_arithmetic
         from ...storage.stores import metadata_workers
 
         reject_unknown_normalization_params(
@@ -1328,6 +1439,11 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 return False
             return True
 
+        count_arithmetic = marker_count_arithmetic(
+            assay,
+            log_transform=bool(resolved_norm_params["log_transform"]),
+            renormalize_subset=bool(resolved_norm_params["renormalize_subset"]),
+        )
         arguments = MarkerTableArguments(
             cell_selection=cell_selection,
             feature_selection=feature_selection,
@@ -1343,6 +1459,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             adjustment_scope=MARKER_ADJUSTMENT_SCOPE,
             nthreads=nthreads,
             invalidate_cache=invalidate_cache,
+            count_arithmetic=count_arithmetic,
         )
         record = arguments.to_record()
         inputs = dict(record.inputs)
@@ -1648,60 +1765,76 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
 
         When ``group_id`` is ``None`` (default), markers for every group under
         the artifact are returned in one long table with a ``group_id`` column.
+        Groups follow the natural order of their labels, as in plots: numeric
+        labels come first by value, so ``'2'`` precedes ``'10'``, and other
+        labels follow in natural text order.
         Pass a specific ``group_id`` to return markers for that group only.
         For a wide export of marker names only, use ``export_markers_to_csv``.
 
         Args:
             marker: Exact marker-table artifact returned by ``run_marker_search``.
-            group_id: One stored group identifier, or ``None`` for all groups.
+            group_id: One stored group label, or ``None`` for all groups. An
+                integer is matched by its string form.
             min_score: This value dictates how specific the feature value has to be in a group before it is
                        considered a marker for that group. The value has to be greater than 0 but less than or equal to
                        1 (Default value: 0.25)
             min_frac_exp: Minimum fraction of cells in a group that must have a non-zero value for a gene to be
                           considered a marker for that group.
         Returns:
-            Pandas dataframe with marker statistics. All-group results include a ``group_id`` column.
-        """
+            Pandas dataframe with marker statistics and a string ``group_id``
+            column.
 
+        Raises:
+            ValueError: If ``group_id`` is not a group of the marker artifact.
+        """
+        tables = self._filtered_marker_tables(
+            marker,
+            group_id=group_id,
+            min_score=min_score,
+            min_frac_exp=min_frac_exp,
+        )
+        if not tables:
+            raise ValueError("Marker artifact contains no groups")
+        return pd.concat(list(tables.values()), ignore_index=True)
+
+    def _filtered_marker_tables(
+        self,
+        marker: ArtifactRef,
+        *,
+        group_id: str | int | None,
+        min_score: float,
+        min_frac_exp: float,
+    ) -> dict[str, pd.DataFrame]:
+        """Load and filter each requested marker group in natural label order."""
         _assay, g = self._resolve_marker_group(marker)
-        out_cols = list(_MARKER_OUT_COLUMNS)
-        gids: list[str | int] = sorted(g.group_keys())
+        gids = sort_categories(g.group_keys())
         if group_id is not None:
-            gids = [group_id]
+            requested = str(group_id)
+            if requested not in gids:
+                raise ValueError(
+                    f"Marker artifact has no group {requested!r}; "
+                    f"available groups: {', '.join(gids)}"
+                )
+            gids = [requested]
 
         feature_names = np.asarray(
             as_zarr_array(g["feature_names"], name="feature_names")[:]
         ).astype(str)
-        dfs = []
+        tables: dict[str, pd.DataFrame] = {}
         for gid in gids:
-            group_name = str(gid)
-            if group_name in g:
-                marker_grp = as_zarr_group(g[group_name], name=group_name)
-                df = _load_marker_cluster_frame(
-                    g,
-                    marker_grp,
-                    feature_names,
-                    group_id=gid,
-                )
-            else:
-                logger.debug(f"No markers found for {gid} returning empty dataframe")
-                empty_cols = [
-                    "group_id",
-                    "feature_name",
-                    "feature_index",
-                    *out_cols[1:],
-                ]
-                df = pd.DataFrame(
-                    {name: pd.Series(dtype=object) for name in empty_cols}
-                )
-            dfs.append(df)
-        dfs = pd.concat(dfs, ignore_index=True)
-        keep = np.ones(len(dfs), dtype=bool)
-        if "score" in dfs and dfs["score"].notna().any():
-            keep &= dfs["score"].fillna(-np.inf).to_numpy() >= min_score
-        if "frac_exp" in dfs and dfs["frac_exp"].notna().any():
-            keep &= dfs["frac_exp"].fillna(-np.inf).to_numpy() >= min_frac_exp
-        return dfs.loc[keep].reset_index(drop=True)
+            frame = _load_marker_cluster_frame(
+                g,
+                as_zarr_group(g[gid], name=gid),
+                feature_names,
+                group_id=gid,
+            )
+            keep = np.ones(len(frame), dtype=bool)
+            if frame["score"].notna().any():
+                keep &= frame["score"].fillna(-np.inf).to_numpy() >= min_score
+            if frame["frac_exp"].notna().any():
+                keep &= frame["frac_exp"].fillna(-np.inf).to_numpy() >= min_frac_exp
+            tables[gid] = frame.loc[keep].reset_index(drop=True)
+        return tables
 
     def export_markers_to_csv(
         self,
@@ -1713,8 +1846,9 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
     ) -> None:
         """Export markers of each cluster/group to a CSV file where each column
         contains the marker names sorted by score (descending order, highest
-        first). This function does not export the scores of markers as they can
-        be obtained using `get_markers` function.
+        first). Columns follow the natural order of the group labels, as in
+        ``get_markers``. This function does not export the scores of markers as
+        they can be obtained using `get_markers` function.
 
         Args:
             marker: Exact marker-table artifact returned by ``run_marker_search``.
@@ -1726,19 +1860,16 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                           considered a marker for that group.
         Returns:
         """
-        _assay, marker_group = self._resolve_marker_group(marker)
-        markers_table = {}
-        for group_id in sorted(marker_group.group_keys()):
-            m = self.get_markers(
-                marker,
-                group_id=group_id,
-                min_score=min_score,
-                min_frac_exp=min_frac_exp,
-            )
-            if len(m) > 0:
-                markers_table[group_id] = m["feature_name"].reset_index(drop=True)
-            else:
-                markers_table[group_id] = pd.Series([])
+        tables = self._filtered_marker_tables(
+            marker,
+            group_id=None,
+            min_score=min_score,
+            min_frac_exp=min_frac_exp,
+        )
+        markers_table = {
+            group_id: table["feature_name"].reset_index(drop=True)
+            for group_id, table in tables.items()
+        }
         pd.DataFrame(markers_table).fillna("").to_csv(csv_filename, index=False)
         return None
 
@@ -1752,127 +1883,131 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
     ) -> None:
         """Add an assay containing the mean signal for explicit feature groups.
 
+        Each new feature holds, for every cell, the mean normalized value of
+        one group's features. The source normalization is fitted once over all
+        cells, for example ATAC document frequency or ADT CLR geometric means.
+        The assay becomes visible only after its counts are complete. If the
+        write fails or is interrupted, the partial assay is removed; a hard
+        kill leaves it pending until
+        :meth:`discard_interrupted_assay` removes it.
+
         Args:
             groups: A ``pseudotime_aggregation`` artifact or an explicit feature
-                metadata column name.
+                metadata column name. Artifact inputs use only the features
+                that the aggregation clustered, so its ``nan_cluster_value``
+                never forms a group.
             assay_label: Name for the new assay.
             from_assay: Source assay. Artifact inputs derive this value and reject
                 a conflicting explicit assay.
-            exclude_values: Group values to omit. Defaults to ``[-1]``.
+            exclude_values: Metadata-column group values to omit. Defaults to
+                ``[-1]``. Missing values (``NaN``, ``None``, blank labels,
+                or values under the column's missing mask) never form a
+                group. Artifact inputs reject this argument.
 
         Returns: None
         """
 
+        from ...storage.identity import CountSummary, finalize_counts
         from ...storage.layout import array_shard_rows
-        from ...storage.schema import create_zarr_count_assay
+        from ...storage.schema import derived_assay_transaction
         from ...storage.sharding import write_dense_from_row_batches
 
-        source_ref: ArtifactRef | None
-        source_column: str | None
+        provenance: dict[str, Any]
         if isinstance(groups, ArtifactRef):
-            source_ref = groups
-            source_column = None
-            if (
-                groups.kind != "pseudotime_aggregation"
-                or groups.scope != "assay"
-                or groups.assay is None
-            ):
-                raise ValueError(
-                    "groups must reference an assay-scoped "
-                    "pseudotime_aggregation artifact"
-                )
             if from_assay is not None and from_assay != groups.assay:
                 raise ValueError("from_assay conflicts with the groups artifact")
+            if exclude_values is not None:
+                raise ValueError(
+                    "exclude_values applies only to metadata-column groups; "
+                    "pseudotime aggregation artifacts group only clustered features"
+                )
+            # The loader checks the artifact kind, scope, and feature indices.
+            aggregation = self.load_pseudotime_aggregation(groups)
             assay = self._get_assay(groups.assay)
-            status = inspect_artifact(self.zw, groups)
-            if not status.complete or status.operation != "run_pseudotime_aggregation":
-                raise ValueError(
-                    "groups must reference a complete pseudotime aggregation"
-                )
-            group_node = as_zarr_array(
-                artifact_group(self.zw, groups)["cluster_values"],
-                name="cluster_values",
-            )
-            if group_node.ndim != 1 or group_node.shape != (assay.feats.N,):
-                raise ValueError(
-                    "Pseudotime aggregation cluster_values do not align with "
-                    "the source assay"
-                )
-            group_values = np.asarray(group_node[:])
+            feature_indices = np.asarray(aggregation.feature_indices, dtype=np.int64)
+            feature_clusters = np.asarray(aggregation.feature_clusters)
+            group_set: list[Any] = sorted(set(feature_clusters.tolist()))
+            feature_groups = [
+                np.sort(feature_indices[feature_clusters == value])
+                for value in group_set
+            ]
+            provenance = {"grouped_group_artifact": groups.to_dict()}
         elif isinstance(groups, str):
             if not groups:
                 raise ValueError("groups metadata column must be non-empty")
-            source_ref = None
-            source_column = groups
             assay = self._get_assay(from_assay)
             group_values = np.asarray(assay.feats.fetch_all(groups))
+            if group_values.ndim != 1 or group_values.shape != (assay.feats.N,):
+                raise ValueError("groups must align with the complete feature axis")
+            if exclude_values is None:
+                exclude_values = [-1]
+            present = valid_category_mask(
+                group_values,
+                missing_mask=read_metadata_missing_rows(
+                    assay.feats, groups, np.arange(assay.feats.N, dtype=np.int64)
+                ),
+            )
+            group_set = sorted(
+                set(group_values[present].tolist()).difference(exclude_values)
+            )
+            feature_groups = [
+                np.flatnonzero(present & (group_values == value)) for value in group_set
+            ]
+            provenance = {
+                "grouped_group_column": groups,
+                "grouped_group_digest": _group_assignment_digest(group_values),
+            }
         else:
             raise TypeError("groups must be an ArtifactRef or metadata column name")
-        if group_values.ndim != 1 or group_values.shape != (assay.feats.N,):
-            raise ValueError("groups must align with the complete feature axis")
-        if exclude_values is None:
-            exclude_values = [-1]
-        group_set = sorted(set(group_values.tolist()).difference(exclude_values))
         if not group_set:
             raise ValueError("No feature groups remain after applying exclude_values")
 
         module_ids = [f"group_{x}" for x in group_set]
-        g = create_zarr_count_assay(
-            z=self.z,
-            assay_name=assay_label,
-            workspace=self.workspace,
-            n_cells=assay.cells.N,
-            feat_ids=module_ids,
-            feat_names=module_ids,
-            dtype="float",
-            profile=self.storageProfile,
-        )
-
+        if has_duplicates(module_ids):
+            duplicates = sorted(
+                {name for name in module_ids if module_ids.count(name) > 1}
+            )
+            raise ValueError(
+                "Feature group values produce duplicate module IDs: "
+                + ", ".join(duplicates)
+            )
         cell_idx = np.arange(assay.cells.N, dtype=np.int64)
-        n_groups = len(group_set)
-        band_rows = max(1, array_shard_rows(g))
-
-        def grouped_batches() -> Iterator[np.ndarray]:
-            for start in range(0, assay.cells.N, band_rows):
-                stop = min(start + band_rows, assay.cells.N)
-                rows = cell_idx[start:stop]
-                matrix = np.empty((len(rows), n_groups), dtype=np.float64)
-                for index, group_value in enumerate(group_set):
-                    feature_index = np.flatnonzero(group_values == group_value)
-                    matrix[:, index] = (
-                        assay.normed(cell_idx=rows, feat_idx=feature_index)
-                        .mean(axis=1)
-                        .compute(nthreads=self.nthreads)
-                    )
-                yield matrix
-
-        from ...storage.identity import CountSummary, finalize_counts
-
-        summary = CountSummary(g)
-        write_dense_from_row_batches(
-            g,
-            grouped_batches(),
-            dtype=np.float64,
-            msg="Writing grouped assay",
-            resources=self.resources,
-            residentBytes=summary.nbytes,
-            io=self.storageIo,
-            countSummary=summary,
-        )
-        finalize_counts(g, summary=summary)
+        with derived_assay_transaction(
+            self.z,
+            assay_label,
+            self.workspace,
+            operation="add_grouped_assay",
+        ) as transaction:
+            g = transaction.create_counts(
+                assay.cells.N,
+                module_ids,
+                module_ids,
+                "float",
+                profile=self.storageProfile,
+            )
+            # RNA reads one output band per call; other assays stream their
+            # normalized blocks, which the writer aligns to output bands.
+            batches = assay._iter_feature_group_means(
+                cell_idx, feature_groups, block_rows=max(1, array_shard_rows(g))
+            )
+            summary = CountSummary(g)
+            write_dense_from_row_batches(
+                g,
+                batches,
+                dtype=np.float64,
+                msg="Writing grouped assay",
+                resources=self.resources,
+                residentBytes=summary.nbytes,
+                io=self.storageIo,
+                countSummary=summary,
+            )
+            finalize_counts(g, summary=summary)
+            transaction.group.attrs.update(
+                {"grouped_from_assay": assay.name, **provenance}
+            )
         self._assayNames = tuple(self._scan_assays())
         self._load_assays(custom_assay_types={assay_label: "Assay"})
         self._ini_cell_props(min_features=0, mito_pattern=None, ribo_pattern=None)
-        grouped_assay = self._get_assay(assay_label)
-        grouped_assay.attrs["grouped_from_assay"] = assay.name
-        if source_ref is not None:
-            grouped_assay.attrs["grouped_group_artifact"] = source_ref.to_dict()
-        else:
-            assert source_column is not None
-            grouped_assay.attrs["grouped_group_column"] = source_column
-            grouped_assay.attrs["grouped_group_digest"] = _group_assignment_digest(
-                group_values
-            )
 
     def add_melded_assay(
         self,
@@ -1897,6 +2032,11 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         Features from the BED file are retained even when they do not overlap any peak; those zero-count features
         are marked invalid during assay initialization.
 
+        The new assay becomes visible only after its counts, and RNA ``countsT``,
+        are complete. If the write fails or is interrupted, the partial assay is
+        removed; a hard kill leaves it pending until
+        :meth:`discard_interrupted_assay` removes it.
+
         Args:
             from_assay: Name of assay to be used. If no value is provided then the default assay will be used.
             external_bed_fn: This is mandatory parameter. This file should be a BED format file with at least five
@@ -1919,7 +2059,10 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             None
         """
 
-        from ...features.genomic.melding import coordinate_melding
+        from ...features.genomic.melding import write_melded_counts
+        from ...storage.schema import derived_assay_transaction
+        from ...storage.stores import zarr_group_root
+        from ...writers.counts_t import finalize_writer_counts_t
 
         if assay_label is None:
             raise ValueError(
@@ -1958,32 +2101,56 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 f"The format should be chr:start-end. Please note the colon and hyphen position"
             )
 
-        coordinate_melding(
-            assay,
-            workspace=self.workspace,
-            feature_bed=feature_bed,
-            new_assay_name=assay_label,
-            peaks_col=peaks_col,
-            scalar_coeff=scalar_coeff,
-            renormalization=renormalization,
-            peaks_coords=peaks_coords,
-            idf_cell_idx=idf_cell_idx,
-        )
-
-        from ...storage.stores import zarr_group_root
-        from ...writers.counts_t import finalize_writer_counts_t
-
-        finalize_writer_counts_t(
-            zarr_group_root(self.z, mode="r+"),
+        root = zarr_group_root(self.z, mode="r+")
+        with derived_assay_transaction(
+            root,
             assay_label,
             self.workspace,
-            assay_type=assay_type,
-            resources=self.resources,
-        )
+            operation="add_melded_assay",
+        ) as transaction:
+            write_melded_counts(
+                transaction,
+                assay,
+                feature_bed,
+                peaks_col=peaks_col,
+                scalar_coeff=scalar_coeff,
+                renormalization=renormalization,
+                peaks_coords=peaks_coords,
+                idf_cell_idx=idf_cell_idx,
+            )
+            # RNA gene scores need countsT before the assay can be prepared.
+            finalize_writer_counts_t(
+                root,
+                assay_label,
+                self.workspace,
+                assay_type=assay_type,
+                resources=self.resources,
+            )
 
         self._assayNames = tuple(self._scan_assays())
         self._load_assays(custom_assay_types={assay_label: assay_type})
         self._ini_cell_props(min_features=0, mito_pattern=None, ribo_pattern=None)
+
+    def discard_interrupted_assay(self, assay_label: str) -> None:
+        """Remove a derived assay that an interrupted write left incomplete.
+
+        ``add_grouped_assay`` and ``add_melded_assay`` remove a partial assay
+        when they fail. A process killed during the write instead leaves a
+        pending assay that scans ignore and that blocks reuse of its name.
+        This removes that pending assay so the operation can be retried.
+        Complete assays are never removed.
+
+        Args:
+            assay_label: Name of the interrupted assay.
+
+        Returns:
+            None
+        """
+        from ...storage.schema import discard_pending_assay
+
+        self._require_writable("discard_interrupted_assay")
+        discard_pending_assay(self.z, assay_label, self.workspace)
+        logger.info(f"Removed the interrupted assay {assay_label!r}")
 
     def make_bulk(
         self,
@@ -2003,12 +2170,22 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
     ) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
         """Merge data from cells to create a bulk profile.
 
+        With ``aggr_type='mean'``, cells are normalized with the assay's
+        normalization fitted once over every selected cell, then averaged
+        within each group. RNA library-size normalization is per cell; ATAC
+        document frequency and ADT CLR geometric means are therefore shared by
+        all groups rather than learned separately for each group.
+
         Args:
             groups: Explicit clustering artifact or user-owned metadata column
                 used to group cells.
-            from_assay: Name of assay to be used. If no value is provided then the default assay will be used.
-            cell_selection: Explicit selection used with metadata-column
-                grouping. Artifact grouping derives its selection from lineage.
+            from_assay: Name of assay to be used. If None and ``groups`` is an
+                artifact, the artifact's assay is used; otherwise the default
+                assay is used.
+            cell_selection: Explicit selection. Artifact grouping derives its
+                selection from lineage, and this argument may only narrow it.
+                For metadata-column grouping, None snapshots the live ``I``
+                column as the selection.
             secondary_groups: Optional clustering artifact or user-owned
                 metadata column used to sub-group cells.
             aggr_type: Type of aggregation to be used. Can be either 'mean' or 'sum'. (Default value: 'mean')
@@ -2027,6 +2204,11 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         Returns:
             A pandas dataframe containing the bulk profile. If `return_fraction` is True, then a tuple of two dataframes
             is returned. The second dataframe contains the fraction of cells expressing each feature in each group.
+
+        Raises:
+            ValueError: If two groups produce the same column name, for
+                example groups ``'a_b'`` with sub-group ``'c'`` and ``'a'``
+                with sub-group ``'b_c'``.
         """
 
         def make_reps(v: NDArray[Any], n_reps: int, seed: int) -> list[NDArray[Any]]:
@@ -2187,10 +2369,19 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                         col_name = f"{g}_{sg}"
                     if pseudo_reps > 1:
                         col_name += f"_Rep{n + 1}"
+                    if col_name in column_rows:
+                        raise ValueError(
+                            f"Bulk column name {col_name!r} is produced by more "
+                            "than one group; rename the group values"
+                        )
                     column_rows[col_name] = idx
 
         vals: dict[str, NDArray[Any]] = {}
         fracs: dict[str, NDArray[Any]] = {}
+        # Bulk column of each selected cell, or -1 for cells in none.
+        codes = np.full(len(active_idx), -1, dtype=np.int64)
+        for code, idx in enumerate(column_rows.values()):
+            codes[np.searchsorted(active_idx, idx)] = code
         stream_rna = isinstance(assay, RNAassay) and (
             aggr_type == "sum"
             or (aggr_type == "mean" and lib_size_feature_stream_eligible(assay))
@@ -2200,12 +2391,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             from ...metadata.rows import read_metadata_rows_chunkwise
 
             assert isinstance(assay, RNAassay)
-            codes = np.full(len(active_idx), -1, dtype=np.int64)
-            for code, idx in enumerate(column_rows.values()):
-                codes[np.searchsorted(active_idx, idx)] = code
             included = codes >= 0
             cell_idx = active_idx[included]
-            codes = codes[included]
             scalars = (
                 np.asarray(
                     read_metadata_rows_chunkwise(
@@ -2219,7 +2406,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             values, fractions = aggregate_rna_groups(
                 assay.rawDataT,
                 cell_idx,
-                codes,
+                codes[included],
                 len(column_rows),
                 scalars=scalars,
                 size_factor=assay.sf,
@@ -2231,7 +2418,24 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             if fractions is not None:
                 fracs = {name: fractions[:, i] for i, name in enumerate(column_rows)}
         else:
-            all_feat_idx = np.arange(assay.feats.N)
+            if aggr_type not in ("sum", "mean"):
+                raise ValueError(
+                    "ERROR: `aggr_type` can only be either 'sum' or 'mean'"
+                )
+            if aggr_type == "mean" and column_rows and len(active_idx):
+                from ...features.aggregation import aggregate_normalized_groups
+
+                # Fit the normalization once over every selected cell.
+                means = aggregate_normalized_groups(
+                    assay.normed(
+                        cell_idx=active_idx,
+                        feat_idx=np.arange(assay.feats.N, dtype=np.int64),
+                    ),
+                    codes,
+                    len(column_rows),
+                    nthreads=self.nthreads,
+                )
+                vals = {name: means[:, i] for i, name in enumerate(column_rows)}
             for col_name, idx in iter_progress(
                 column_rows.items(),
                 desc="Aggregating pseudo-replicates",
@@ -2245,15 +2449,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 if aggr_type == "sum":
                     vals[col_name] = controlled_compute(
                         assay.rawData[idx].sum(axis=0), self.nthreads
-                    )
-                elif aggr_type == "mean":
-                    vals[col_name] = controlled_compute(
-                        assay.normed(cell_idx=idx, feat_idx=all_feat_idx).mean(axis=0),
-                        self.nthreads,
-                    )
-                else:
-                    raise ValueError(
-                        "ERROR: `aggr_type` can only be either 'sum' or 'mean'"
                     )
                 if return_fraction:
                     fracs[col_name] = (assay.rawData[idx] > 0).mean(axis=0).compute()
@@ -2412,86 +2607,72 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             ),
         )
 
-    def _statistical_key_series(
+    def _resolve_statistical_keys(
         self,
         keys: Sequence[str | CellField | FeatureRef],
         *,
         from_assay: str | None,
         cell_idx: np.ndarray,
-        normalization: NormalizationSpec | None,
-        fetch_values: bool,
-        fingerprint_values: bool = False,
-        reject_selected_missing: bool = False,
-        selection_mask: np.ndarray | None = None,
-    ) -> tuple[
-        list[str],
-        list[str],
-        list[str | None],
-        list[str],
-        list[np.ndarray],
-    ]:
-        """Resolve keys into labels, identities, assays, value ids, and values.
+    ) -> list[_StatisticalKey]:
+        """Resolve every key once into its label, identity, and value source.
 
         Feature identities hash the assay, resolved feature ids, and reduction
-        as structured values. Cell-metadata identities hash the column name and
-        fingerprints of its stored values and explicit missing mask. Realized
-        value fingerprints are computed from the selected float values before
-        sample aggregation. Feature values are fetched one key at a time, so a
-        fingerprint-only reuse check never materializes a multi-feature matrix.
+        as structured values. Feature keys are resolved in one batch, so each
+        assay's feature index is read once. Cell-metadata identities hash the
+        column name and fingerprints of its stored values and explicit missing
+        mask. Those values are read once and later reused for testing.
         """
-        if selection_mask is not None:
-            selection_mask = np.asarray(selection_mask, dtype=bool)
-            if selection_mask.shape != cell_idx.shape:
-                raise ValueError("selection_mask must align with selected cells")
-            feature_cell_idx = np.asarray(cell_idx[selection_mask], dtype=np.int64)
-        else:
-            feature_cell_idx = np.asarray(cell_idx, dtype=np.int64)
         cell_columns = set(self.cells.columns)
-        labels: list[str] = []
-        tested_features: list[str] = []
-        source_assays: list[str | None] = []
-        value_fingerprints: list[str] = []
-        values_list: list[np.ndarray] = []
-        for key in keys:
-            if isinstance(key, FeatureRef) or (
-                isinstance(key, str) and key not in cell_columns
-            ):
-                resolved = resolve_feature(self, key, from_assay=from_assay)
-                labels.append(resolved.label)
-                tested_features.append(
-                    provenance_hash(
-                        {
-                            "source": "feature",
-                            "assay": resolved.assay,
-                            "ids": tuple(
-                                str(identifier) for identifier in resolved.ids
-                            ),
-                            "reduction": resolved.reduction,
-                        }
+        feature_keys: dict[int, str | FeatureRef] = {
+            position: key
+            for position, key in enumerate(keys)
+            if isinstance(key, FeatureRef)
+            or (isinstance(key, str) and key not in cell_columns)
+        }
+        resolved_features = dict(
+            zip(
+                feature_keys,
+                resolve_feature_batch(
+                    self,
+                    list(feature_keys.values()),
+                    from_assay=from_assay,
+                ),
+                strict=True,
+            )
+        )
+        resolved_keys: list[_StatisticalKey] = []
+        for position, key in enumerate(keys):
+            resolved = resolved_features.get(position)
+            if resolved is not None:
+                resolved_keys.append(
+                    _StatisticalKey(
+                        label=resolved.label,
+                        tested_feature=provenance_hash(
+                            {
+                                "source": "feature",
+                                "assay": resolved.assay,
+                                "ids": tuple(
+                                    str(identifier) for identifier in resolved.ids
+                                ),
+                                "reduction": resolved.reduction,
+                            }
+                        ),
+                        source_assay=resolved.assay,
+                        feature=resolved,
                     )
                 )
-                source_assays.append(resolved.assay)
-                if fetch_values or fingerprint_values:
-                    matrix = fetch_normalized_feature_matrix(
-                        self,
-                        [resolved],
-                        feature_cell_idx,
-                        normalization,
-                    )
-                    values = np.asarray(matrix[:, 0], dtype=np.float64)
-                    if fingerprint_values:
-                        value_fingerprints.append(_value_fingerprint(values))
-                    if fetch_values:
-                        values_list.append(values)
-            else:
-                column = key.key if isinstance(key, CellField) else key
-                column_values = read_metadata_rows(self.cells, column, cell_idx)
-                missing = read_metadata_missing_rows(self.cells, column, cell_idx)
-                labels.append(
-                    key.label if isinstance(key, CellField) and key.label else column
-                )
-                tested_features.append(
-                    provenance_hash(
+                continue
+            column = key.key if isinstance(key, CellField) else key
+            column_values = read_metadata_rows(self.cells, column, cell_idx)
+            missing = read_metadata_missing_rows(self.cells, column, cell_idx)
+            resolved_keys.append(
+                _StatisticalKey(
+                    label=(
+                        key.label
+                        if isinstance(key, CellField) and key.label
+                        else column
+                    ),
+                    tested_feature=provenance_hash(
                         {
                             "source": "cell_metadata",
                             "column": column,
@@ -2502,39 +2683,52 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                                 else None
                             ),
                         }
-                    )
+                    ),
+                    source_assay=None,
+                    column=column,
+                    column_values=column_values,
+                    column_missing=missing,
                 )
-                source_assays.append(None)
-                if fetch_values or fingerprint_values or reject_selected_missing:
-                    selected_missing = missing
-                    if selection_mask is not None:
-                        selected_missing = (
-                            missing[selection_mask] if missing is not None else None
-                        )
-                    if (
-                        reject_selected_missing
-                        and selected_missing is not None
-                        and np.any(selected_missing)
-                    ):
-                        raise ValueError(
-                            f"Tested metadata column {column!r} contains missing "
-                            "values in the effective cell selection"
-                        )
-                    raw_values = np.asarray(column_values)
-                    if selection_mask is not None:
-                        raw_values = raw_values[selection_mask]
-                    values = np.asarray(raw_values, dtype=np.float64)
-                    if fingerprint_values:
-                        value_fingerprints.append(_value_fingerprint(values))
-                    if fetch_values:
-                        values_list.append(values)
-        return (
-            labels,
-            tested_features,
-            source_assays,
-            value_fingerprints,
-            values_list,
+            )
+        return resolved_keys
+
+    def _iter_statistical_values(
+        self,
+        keys: Sequence[_StatisticalKey],
+        *,
+        selection: _StatisticalSelection,
+        normalization: NormalizationSpec | None,
+    ) -> Iterator[np.ndarray]:
+        """Yield each key's selected float values in key order.
+
+        Values are realized before sample aggregation. Feature keys are
+        fetched in key batches, one blockwise pass per batch, and a batch
+        holds at most a quarter of the memory budget.
+        """
+        feature_cell_idx = selection.effective_cell_idx
+        n_cells = len(feature_cell_idx)
+        batch_size = max(
+            1,
+            int(self.memoryBytes) // (4 * np.dtype(np.float64).itemsize * n_cells),
         )
+        for start in range(0, len(keys), batch_size):
+            batch = keys[start : start + batch_size]
+            matrix = fetch_normalized_feature_matrix(
+                self,
+                [key.feature for key in batch if key.feature is not None],
+                feature_cell_idx,
+                normalization,
+            )
+            feature_column = 0
+            for key in batch:
+                if key.feature is not None:
+                    yield np.ascontiguousarray(matrix[:, feature_column])
+                    feature_column += 1
+                else:
+                    yield np.asarray(
+                        np.asarray(key.column_values)[selection.selection_mask],
+                        dtype=np.float64,
+                    )
 
     def run_statistical_testing(
         self,
@@ -2574,8 +2768,12 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         columns or feature names. The chosen test follows the single-cell
         conventions for zero-inflated, non-normal values:
 
-        - ``"mann_whitney"``: two independent groups (two-sided, tie and
-          continuity corrected, matching the marker-search statistic).
+        - ``"mann_whitney"``: two independent groups, two-sided. When the
+          two groups can be formed in at most 100,000 ways, as in typical
+          sample-level designs, p-values come from the exact permutation null
+          with ties handled exactly. Larger designs use the tie- and
+          continuity-corrected normal approximation of the marker search.
+          ``result.p_value_method`` records ``"exact"`` or ``"asymptotic"``.
         - ``"kruskal_wallis"``: three or more groups, with optional
           ``posthoc="dunn"`` for pairwise significance.
         - ``"wilcoxon"``: paired samples on aggregated (pseudobulk) data.
@@ -2597,9 +2795,17 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         pass (default ``"fdr_bh"``); post-hoc p-values are corrected
         separately.
 
+        A ``study_design`` with ``subject_by`` (or ``pair_by``) pairs samples
+        only for the Wilcoxon test: explicitly, or with ``test="auto"`` when
+        two conditions remain. Repeated measures across three or more
+        conditions, subjects nested within conditions, and independent tests
+        raise an error. For nested subjects, pass the subject column as
+        ``sample_by`` instead.
+
         Results are persisted as immutable artifacts unless ``skip_save`` is
-        ``True``. Pass ``result.artifact`` to ``get_statistical_tests`` for
-        exact retrieval.
+        ``True``. Writing requires ``zarr_mode='r+'``; a matching saved
+        result is still reused from a read-only store. Pass
+        ``result.artifact`` to ``get_statistical_tests`` for exact retrieval.
 
         Args:
             keys: Feature names or cell-metadata columns to test.
@@ -2614,7 +2820,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             alternative: Direction of the alternative hypothesis. Only the
                 Welch t-test honours it; other tests remain two-sided.
             sample_by: Cell metadata column identifying biological samples.
-            study_design: Study design supplying ``sample_by`` and ``pair_by``.
+            study_design: Study design supplying ``sample_by`` and, for the
+                Wilcoxon test only, the pairing column.
             pair_by: Cell metadata column identifying subjects or donors for
                 paired tests.
             sample_stat: Aggregation across cells within a sample.
@@ -2627,6 +2834,11 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
 
         Returns:
             A :class:`~scarf.features.statistical.StatisticalTestResult`.
+
+        Raises:
+            PermissionError: If a result must be written to a store that is
+                not opened with ``zarr_mode='r+'``. The check runs before any
+                value is computed.
         """
         resolved_grouping = resolve_grouping(
             self.zw,
@@ -2665,12 +2877,23 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 "'wilcoxon', 'welch', 't_test', or 'one_way_anova'"
             )
         normalization_digest = _statistical_normalization(normalization)
+        # A study-design pairing column applies only to the paired Wilcoxon
+        # test. With test="auto" it is decided once the conditions are known.
+        design_pair_by: str | None = None
         if study_design is not None:
             if sample_by is not None and sample_by != study_design.sample_by:
                 raise ValueError("sample_by conflicts with study_design.sample_by")
             sample_by = study_design.sample_by
             if pair_by is None:
-                pair_by = study_design.subject_by or study_design.pair_by
+                design_pair_by = study_design.subject_by or study_design.pair_by
+            if design_pair_by is not None:
+                if test == "wilcoxon":
+                    pair_by = design_pair_by
+                elif test != "auto":
+                    raise _study_design_pairing_error(
+                        design_pair_by,
+                        f"test={test!r} treats samples as independent",
+                    )
         native_groups = _normalized_variant_groups(groups)
         native_comparisons = _normalized_variant_comparisons(comparisons)
         if native_groups is not None and len(native_groups) == 0:
@@ -2694,19 +2917,14 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             raise ValueError("keys must be non-empty")
 
         cell_idx = np.asarray(resolved_grouping.cell_idx, dtype=np.int64)
-        (
-            labels,
-            tested_features,
-            source_assays,
-            _value_fingerprints,
-            _values,
-        ) = self._statistical_key_series(
+        statistical_keys = self._resolve_statistical_keys(
             key_list,
             from_assay=from_assay,
             cell_idx=cell_idx,
-            normalization=None,
-            fetch_values=False,
         )
+        labels = [key.label for key in statistical_keys]
+        tested_features = [key.tested_feature for key in statistical_keys]
+        source_assays = [key.source_assay for key in statistical_keys]
         feature_assays = {assay_name for assay_name in source_assays if assay_name}
         if len(feature_assays) > 1:
             raise ValueError(
@@ -2723,6 +2941,35 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             pair_by=pair_by,
             subset_by=subset_by,
         )
+        if (
+            design_pair_by is not None
+            and pair_by is None
+            and len(selection.group_order) >= 2
+        ):
+            # test="auto": only two conditions give the paired Wilcoxon test.
+            n_conditions = len(selection.group_order)
+            if n_conditions > 2:
+                raise _study_design_pairing_error(
+                    design_pair_by,
+                    f"the design has {n_conditions} conditions",
+                )
+            pair_by = design_pair_by
+            selection = self._statistical_selection(
+                grouping=resolved_grouping,
+                groups=native_groups,
+                sample_by=sample_by,
+                pair_by=pair_by,
+                subset_by=subset_by,
+            )
+        if (
+            design_pair_by is not None
+            and selection.pairs is not None
+            and not _subjects_span_groups(selection.pairs, selection.groups)
+        ):
+            raise _study_design_pairing_error(
+                design_pair_by,
+                "every subject is measured in only one condition",
+            )
         selection_mask = selection.selection_mask
         groups_arr_masked = selection.groups
         sample_arr_masked = selection.samples
@@ -2733,15 +2980,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
 
         # Explicit metadata masks are semantic missing values. Only rows that
         # survive the full design selection are required to be present.
-        self._statistical_key_series(
-            key_list,
-            from_assay=from_assay,
-            cell_idx=cell_idx,
-            normalization=None,
-            fetch_values=False,
-            reject_selected_missing=True,
-            selection_mask=selection_mask,
-        )
+        _reject_missing_statistical_values(statistical_keys, selection_mask)
         key_labels = _statistical_key_labels(labels)
 
         if test == "auto":
@@ -2814,6 +3053,13 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             if source_assay_obj is not None and uses_assay_normalization
             else None
         )
+        # Assay-source feature values come from ``normed`` without keyword
+        # arguments, as ``fetch_normalized_feature_matrix`` reads them.
+        count_arithmetic = (
+            source_assay_obj._count_arithmetic("normed")
+            if source_assay_obj is not None and uses_assay_normalization
+            else None
+        )
         raw_size_factor = (
             getattr(source_assay_obj, "sf", None)
             if source_assay_obj is not None and uses_assay_normalization
@@ -2827,33 +3073,14 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         def resolve_current_value_fingerprints() -> tuple[str, ...]:
             nonlocal current_value_fingerprints
             if current_value_fingerprints is None:
-                (
-                    current_labels,
-                    current_tested_features,
-                    current_source_assays,
-                    fingerprints,
-                    _current_values,
-                ) = self._statistical_key_series(
-                    key_list,
-                    from_assay=from_assay,
-                    cell_idx=cell_idx,
-                    normalization=normalization,
-                    fetch_values=False,
-                    fingerprint_values=True,
-                    reject_selected_missing=True,
-                    selection_mask=selection_mask,
-                )
-                if (
-                    _statistical_key_labels(current_labels) != key_labels
-                    or current_tested_features != tested_features
-                    or current_source_assays != source_assays
-                    or len(fingerprints) != len(key_labels)
-                    or any(not fingerprint for fingerprint in fingerprints)
-                ):
-                    raise RuntimeError(
-                        "Statistical key identity changed while values were fetched"
+                current_value_fingerprints = tuple(
+                    _value_fingerprint(values)
+                    for values in self._iter_statistical_values(
+                        statistical_keys,
+                        selection=selection,
+                        normalization=normalization,
                     )
-                current_value_fingerprints = tuple(fingerprints)
+                )
             return current_value_fingerprints
 
         planned: Any = None
@@ -2878,7 +3105,13 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 group_field=group_field.key if group_field is not None else None,
                 normalization_method=normalization_method_identity,
                 size_factor=size_factor_value,
+                count_arithmetic=count_arithmetic,
                 method=effective_method,
+                p_value_policy=(
+                    MANN_WHITNEY_P_VALUE_POLICY
+                    if effective_method == "mann_whitney"
+                    else None
+                ),
                 posthoc=posthoc,
                 adjustment_method=adjustment,
                 sample_stat=sample_stat,
@@ -2906,6 +3139,12 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                     if candidate.attrs.get("key_labels") != list(key_labels):
                         return False
                     if candidate.attrs.get("method") != effective_method:
+                        return False
+                    if candidate.attrs.get("p_value_method") not in (
+                        ("exact", "asymptotic")
+                        if effective_method == "mann_whitney"
+                        else (None,)
+                    ):
                         return False
                     if candidate.attrs.get("posthoc") != posthoc:
                         return False
@@ -3055,30 +3294,21 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                     artifact_group(self.zw, planned.ref),
                     artifact=planned.ref,
                 )
+            # Fail before computing when the result cannot be written.
+            self._require_writable("run_statistical_testing")
 
         outcomes: dict[str, GroupComparisonResult] = {}
         computed_value_fingerprints: list[str] = []
-        for key, key_label in zip(key_list, key_labels, strict=True):
-            (
-                _labels,
-                _identities,
-                _assays,
-                key_value_fingerprints,
-                values_list,
-            ) = self._statistical_key_series(
-                [key],
-                from_assay=from_assay,
-                cell_idx=cell_idx,
+        for key_label, values in zip(
+            key_labels,
+            self._iter_statistical_values(
+                statistical_keys,
+                selection=selection,
                 normalization=normalization,
-                fetch_values=True,
-                fingerprint_values=True,
-                reject_selected_missing=True,
-                selection_mask=selection_mask,
-            )
-            if len(key_value_fingerprints) != 1 or len(values_list) != 1:
-                raise RuntimeError("Statistical value fetch returned invalid results")
-            computed_value_fingerprints.append(key_value_fingerprints[0])
-            values = values_list[0]
+            ),
+            strict=True,
+        ):
+            computed_value_fingerprints.append(_value_fingerprint(values))
             outcomes[key_label] = compare_group_distributions(
                 values,
                 groups_arr_masked,
@@ -3101,6 +3331,9 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             raise RuntimeError(
                 "Statistical values changed while the result was being computed"
             )
+        # The design, not the values, sets the p-value method, so every key
+        # shares one.
+        p_value_method = next(iter(outcomes.values())).p_value_method
 
         tables = _pool_adjust(
             {label: outcome.table for label, outcome in outcomes.items()},
@@ -3146,6 +3379,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             size_factor=size_factor_value,
             tables=tables,
             posthoc_tables=posthoc_tables,
+            p_value_method=p_value_method,
         )
 
         if not skip_save:
@@ -3203,6 +3437,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         group.attrs["stat_columns"] = list(storage_columns)
         group.attrs["posthoc_stat_columns"] = list(posthoc_columns)
         group.attrs["method"] = result.method
+        group.attrs["p_value_method"] = result.p_value_method
         group.attrs["posthoc"] = result.posthoc
         group.attrs["adjustment_method"] = result.adjustment_method
         group.attrs["grouping"] = (
@@ -3277,6 +3512,16 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         posthoc = slot_group.attrs.get("posthoc")
         storage_columns = _statistical_storage_columns(method, posthoc)
         posthoc_columns = _statistical_posthoc_columns(posthoc)
+        p_value_method = slot_group.attrs.get("p_value_method")
+        if method == "mann_whitney":
+            if p_value_method not in ("exact", "asymptotic"):
+                raise ValueError(
+                    "Mann-Whitney artifact does not record its p-value method, "
+                    "so it predates exact small-sample p-values. Rerun "
+                    "run_statistical_testing to recompute it"
+                )
+        elif p_value_method is not None:
+            raise ValueError("Statistical test p-value method metadata is invalid")
         main_string_columns = [
             column for column in storage_columns if column in ("group_1", "group_2")
         ]
@@ -3411,6 +3656,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             size_factor=slot_group.attrs.get("size_factor"),
             tables=tables,
             posthoc_tables=posthoc_tables,
+            p_value_method=p_value_method,
         )
 
     def get_statistical_tests(

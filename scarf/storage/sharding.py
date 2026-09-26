@@ -95,9 +95,7 @@ def _destination_geometry(
 ) -> tuple[ArrayGeometry, np.dtype[Any]]:
     if isinstance(destination, ZarrArraySpec):
         if len(destination.shape) != 2 or len(destination.chunks) != 2:
-            raise ValueError(
-                "Sparse import destination specifications must be two-dimensional"
-            )
+            raise ValueError("Destination specifications must be two-dimensional")
         geometry = ArrayGeometry(
             shape=(int(destination.shape[0]), int(destination.shape[1])),
             chunks=(int(destination.chunks[0]), int(destination.chunks[1])),
@@ -111,7 +109,7 @@ def _destination_geometry(
         return geometry, np.dtype(destination.dtype)
     resolved = array_geometry(destination)
     if resolved is None or len(resolved.shape) != 2:
-        raise ValueError("Sparse import destinations must be two-dimensional arrays")
+        raise ValueError("Destinations must be two-dimensional arrays")
     return resolved, np.dtype(destination.dtype)
 
 
@@ -545,7 +543,7 @@ def _row_band_task_peak(
 
 
 def plan_dense_write(
-    destination: zarr.Array,
+    destination: zarr.Array | ZarrArraySpec,
     resources: ResourceBudget,
     nTasks: int,
     io: StorageIoPolicy | None = None,
@@ -555,7 +553,13 @@ def plan_dense_write(
     resultBytes: int = 0,
     mirror: zarr.Array | None = None,
 ) -> OperationPlan:
-    dense_bytes, inner_bytes, n_chunks = _band_geometry(destination)
+    # A specification lets a producer check its budget before it creates the
+    # destination or starts expensive work.
+    dense_bytes, inner_bytes, n_chunks = _band_geometry(
+        _destination_geometry(destination)[0]
+        if isinstance(destination, ZarrArraySpec)
+        else destination
+    )
     # Keep encoded chunks and the assembled shard alongside each dense band.
     unit_bytes = (
         _row_band_task_peak(

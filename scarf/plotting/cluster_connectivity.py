@@ -15,6 +15,7 @@ from ._deps import require_matplotlib
 from ._data import _resolve_grouping, _resolve_layout
 from ._display import resolve_categorical_scale
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
+from ..utils.arrays import sort_categories
 from ._style import (
     apply_figure_chrome,
     categorical_color_map,
@@ -22,7 +23,6 @@ from ._style import (
     refresh_layout_point_sizes,
     register_layout_point_size,
     scatter_edgecolor,
-    sort_categories,
     square_axis_limits,
     theme_context,
 )
