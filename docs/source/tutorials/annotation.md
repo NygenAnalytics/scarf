@@ -183,11 +183,12 @@ Going a step further, as you would in a real study, negative controls validate a
 
 - `frac_exp` for low expression prevalence; our negative controls should have low detection within the target cluster (`frac_exp` $\approx 0$‬).
 - `score` for low exclusivity; a `score` near 0 means almost none of the gene's expression rank exists in the cluster you are studying
+- `auc` for exclusivity; auc can be used as another metric for exclusivity of marker expression across multiple clusters
 
-For our examples, the negative controls we use are CD3D/CD3E in cluster 5 (NK cells), CD4 in cluster 7 (cytotoxic CD8 T cells), and MS4A1/CD14 in clusters 6 and 7. This is becaUse true NK cells lack T-cell receptors, thus we can use CD3D/CD3E, and for c
+For our examples, the negative controls we use are CD3D/CD3E in cluster 5 (NK cells), CD4 in cluster 7 (cytotoxic CD8+ T cells), and MS4A1/CD14 in clusters 6 and 7. This is because true NK cells lack T-cell receptors, thus we can use CD3D/CD3E for our negative controls. For our cytotoxic CD8+ T cells we attempt to identify, CD4 works it is dominantely expressed in helper T-cells, not cytotoxic (CD8+) T cells that we attempt to isolate here. And finally, our MS4A1 (CD20) and CD14 across both clusters
 
 ```{code-cell}
-neg_genes = ["CD3D", "CD3E"]
+neg_genes = ["CD3D", "CD3E", "CD4", "MS4A1", "CD14", ]
 neg_markers = ds.get_markers(marker=markers, min_score=-1, min_frac_exp=-1)
 neg_stats = neg_markers[neg_markers["feature_name"].isin(neg_genes)]
 neg_stats[["group_id", "feature_name", "score", "frac_exp", "auc"]].sort_values(
@@ -195,7 +196,20 @@ neg_stats[["group_id", "feature_name", "score", "frac_exp", "auc"]].sort_values(
 )
 ```
 
-The table above runs CD3D/CD3E across all ten clusters: both genes hit ceiling detection almost everywhere T cells live, yet in cluster 5 their exclusivity collapses to background (scores 0.12/0.11 against 0.10 uniform) with AUC below 0.5 (0.40/0.40, depleted not enriched), despite ambient detection in a minority of cells (frac_exp 0.31/0.43). Set against NKG7, GNLY, KLRF1, and FGFBP2 detection above 0.92 in the same cluster, this rules out T-cell identity for NK cells. The same lookup pattern covers the remaining controls: CD4 in cluster 7 sits at frac_exp 0.02 with score near zero, confirming the helper program is silenced while CD8A (0.52/0.92) cements the cytotoxic CD8 identity; MS4A1 and CD14 sit near zero in clusters 6 and 7 (detection 0.01-0.08, scores at most 0.008), confirming neither cluster carries B-cell or monocyte contamination from doublets.
+The table above shows the results of  CD3D/CD3E across all ten clusters: both genes hit ceiling detection almost everywhere T cells truly live, but in cluster 5, their exclusivity collapses to background with their low `score`(0.12/0.11) with `auc` below 0.5 (0.40/0.40, suggesting they may not be true markers of that cluster not enriched even with the moderatre ambient detection `frac_exp` = 0.31/0.43. Set against other marker genes like NKG7, GNLY, KLRF1, and FGFBP2 (which can be seen below) have detection above 0.92 in the same cluster, thus ruling out T-cell identity for conflicted cluster 5, which are now NK-cells
+
+The same pattern exists with our other genes, with CD4 in cluster 7 sitting at `frac_exp` = 0.02 with score near zero, confirming the helper program is silenced while CD8A `frac_exp` = 0.92, supprting the cytotoxic CD8 identity (as shown below)/
+
+MS4A1 and CD14 sit near zero in clusters 6 and 7  `frac_exp` detection at 0.01-0.08, with the `score` peaking at 0.008, confirming neither cluster carries B-cell or monocyte contamination.
+
+```{code-cell}
+anchor_genes = ["NKG7", "GNLY", "KLRF1", "FGFBP2", "CD8A"]
+anchor_markers = ds.get_markers(marker=markers, min_score=-1, min_frac_exp=-1)
+anchor_stats = anchor_markers[anchor_markers["feature_name"].isin(anchor_genes)]
+anchor_stats[["group_id", "feature_name", "score", "frac_exp", "auc"]].sort_values(
+    ["feature_name", "group_id"]
+)
+```
 
 ## Write the reviewed mapping
 
