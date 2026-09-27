@@ -518,17 +518,32 @@ def test_live_zarr_archive_download(tmp_path, monkeypatch):
     assert (dataset_path / "data.zarr").is_dir()
 
 
-def test_lazy_exports_import_and_cache_catalog_classes(monkeypatch):
+def test_lazy_exports_import_and_cache_sdk_objects(monkeypatch):
     from scarf import cytebase
+    from scarf.cytebase import _embeddings
     from scarf.cytebase.catalog import Catalog
-    from scarf.cytebase.dataset import CytebaseDataset
+    from scarf.cytebase.entry import DatasetEntry
 
-    monkeypatch.delitem(vars(cytebase), "Catalog", raising=False)
-    monkeypatch.delitem(vars(cytebase), "CytebaseDataset", raising=False)
-    assert cytebase.Catalog is Catalog
-    assert cytebase.CytebaseDataset is CytebaseDataset
-    assert vars(cytebase)["Catalog"] is Catalog
-    assert vars(cytebase)["CytebaseDataset"] is CytebaseDataset
+    exports = {
+        "Catalog": Catalog,
+        "DatasetEntry": DatasetEntry,
+        "embeddings": _embeddings.embeddings,
+        "embedding": _embeddings.embedding,
+        "embedding_coordinates": _embeddings.embedding_coordinates,
+    }
+    for name, value in exports.items():
+        monkeypatch.delitem(vars(cytebase), name, raising=False)
+        assert getattr(cytebase, name) is value
+        assert vars(cytebase)[name] is value
+
+
+def test_removed_dataset_wrapper_is_not_exported():
+    from scarf import cytebase
+
+    assert "CytebaseDataset" not in cytebase.__all__
+    assert "CytebaseDataset" not in dir(cytebase)
+    with pytest.raises(AttributeError, match="has no attribute 'CytebaseDataset'"):
+        cytebase.CytebaseDataset
 
 
 def test_unknown_module_attributes_raise():
@@ -541,4 +556,12 @@ def test_unknown_module_attributes_raise():
 def test_dir_lists_lazy_exports():
     from scarf import cytebase
 
-    assert {"Catalog", "CytebaseDataset", "Repository", "connect"} <= set(dir(cytebase))
+    assert {
+        "Catalog",
+        "DatasetEntry",
+        "Repository",
+        "connect",
+        "embeddings",
+        "embedding",
+        "embedding_coordinates",
+    } <= set(dir(cytebase))

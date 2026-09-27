@@ -435,6 +435,7 @@ def build_catalog(request: dict, run_id: str) -> dict:
     timeout=86400,
     retries=0,
     max_containers=PROCESS_CONTAINERS,
+    nonpreemptible=True,
 )
 def process_dataset(cytebase_id: str, run_id: str, request: dict) -> dict:
     return _execute(cytebase_id, run_id, request)
@@ -497,10 +498,11 @@ def _reset(storage: Bucket, request: dict) -> dict:
     image=image,
     secrets=[secret],
     cpu=1,
-    memory=2048,
+    memory=1024,
     timeout=86400,
     retries=0,
     max_containers=1,
+    nonpreemptible=True,
 )
 async def run_pipeline(action: str, request: dict) -> dict:
     """Queue submissions, but advance datasets independently inside each submission."""

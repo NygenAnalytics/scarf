@@ -395,10 +395,14 @@ def test_search_requires_a_positive_limit(catalog, limit):
         catalog.search("atlas", limit=limit)
 
 
-def test_dataset_returns_a_handle_or_raises(catalog):
-    dataset = catalog.dataset(BLOOD_ID)
-    assert dataset.id == BLOOD_ID
-    assert dataset.row["title"] == "Blood atlas"
+def test_dataset_returns_a_metadata_entry_or_raises(catalog):
+    from scarf.cytebase.entry import DatasetEntry
+
+    entry = catalog.dataset(BLOOD_ID)
+    assert isinstance(entry, DatasetEntry)
+    assert entry.id == BLOOD_ID
+    assert entry.row["title"] == "Blood atlas"
+    assert not hasattr(entry, "open")
     with pytest.raises(KeyError, match="No catalog dataset is registered as 'x'"):
         catalog.dataset("x")
 
@@ -427,24 +431,32 @@ def test_open_and_mount_recheck_the_catalog_then_delegate(
     calls = []
     monkeypatch.setattr(
         connector,
-        "open_dataset",
+        "open_datastore",
         lambda storage, cytebase_id, **options: (
             calls.append(("open", storage.bucket_id, cytebase_id, options)) or "opened"
         ),
     )
     monkeypatch.setattr(
         connector,
-        "mount_dataset",
+        "mount_datastore",
         lambda storage, cytebase_id, at, **options: (
             calls.append(("mount", storage.bucket_id, cytebase_id, at, options))
             or "mounted"
         ),
     )
     checks = _downloads(published, HASH_PATH)
-    assert catalog.open_dataset(CYTEBASE_ID, nthreads=1) == "opened"
-    assert catalog.mount_dataset(CYTEBASE_ID, tmp_path / "a.zarr") == "mounted"
+    assert catalog.open_datastore(CYTEBASE_ID, nthreads=1) == "opened"
+    assert catalog.mount_datastore(CYTEBASE_ID, tmp_path / "a.zarr") == "mounted"
     assert calls == [
         ("open", BUCKET_ID, CYTEBASE_ID, {"nthreads": 1}),
         ("mount", BUCKET_ID, CYTEBASE_ID, tmp_path / "a.zarr", {}),
     ]
     assert _downloads(published, HASH_PATH) == checks + 2
+
+
+def test_datastore_handoff_has_no_dataset_aliases(catalog):
+    from scarf.cytebase import connector
+
+    for owner in (catalog, connector):
+        assert not hasattr(owner, "open_dataset")
+        assert not hasattr(owner, "mount_dataset")

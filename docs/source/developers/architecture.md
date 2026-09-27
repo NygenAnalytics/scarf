@@ -83,7 +83,11 @@ A domain that persists an artifact may use a narrow, named `storage` adapter.
 
 ### Import and export
 
-- `cytebase/` lists, downloads, and opens public datasets.
+- `cytebase/` discovers datasets and connects to their Scarf datastores. `DatasetEntry` owns
+  catalog metadata and source-record descriptions. `Catalog.open_datastore` and
+  `Catalog.mount_datastore` return `DataStore` objects; module-level embedding helpers resolve
+  imported artifacts from those objects. Cell metadata and plotting use the existing `DataStore`
+  APIs. Repository helpers list and download public example datasets.
 - `readers/` parses supported input formats.
 - `writers/` materializes Scarf stores and exports supported formats.
 - `merge/` combines assays and datasets without importing `DataStore` during normal module loading.

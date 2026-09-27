@@ -567,6 +567,7 @@ def _check_plot(result: Any, panel: str, legend: str, layout: dict) -> None:
 def test_cellxgene_collection_becomes_an_openable_cytebase_dataset(
     modal_harness, cellxgene, worker_tmp, tmp_path
 ):
+    from scarf import cytebase
     from scarf.cytebase import Catalog, connector
 
     hub = modal_harness.hub
@@ -601,7 +602,7 @@ def test_cellxgene_collection_becomes_an_openable_cytebase_dataset(
         }
     ]
     with pytest.raises(RuntimeError, match="not ready for its registered version"):
-        catalog.dataset(CYTEBASE_ID).open()
+        catalog.open_datastore(CYTEBASE_ID)
 
     # 2. Processing downloads, converts, verifies, and publishes the store.
     processed = modal_harness.run(
@@ -661,45 +662,49 @@ def test_cellxgene_collection_becomes_an_openable_cytebase_dataset(
         (term["label"], term["term_id"], term["n_datasets"])
         for term in catalog.list_terms("tissue")
     ] == [("lung", "UBERON:0002048", 1)]
-    dataset = catalog.dataset(CYTEBASE_ID)
-    assert dataset.describe() == DESCRIPTION
+    entry = catalog.dataset(CYTEBASE_ID)
+    assert entry.describe() == DESCRIPTION
 
     target = tmp_path / "analysis.zarr"
     opened = []
     try:
         # 4. Read-only access returns exactly the source counts and annotations.
-        datastore = dataset.open()
+        datastore = catalog.open_datastore(entry.id)
         opened.append(datastore)
         assert datastore.zw.read_only
         assert (datastore.cells.N, datastore.RNA.feats.N) == (6, 5)
         np.testing.assert_array_equal(np.asarray(datastore.RNA.rawData[:]), COUNTS)
         np.testing.assert_array_equal(np.asarray(datastore.RNA.rawDataT[:]), COUNTS.T)
         assert datastore.RNA.feats.fetch_all("names").tolist() == GENES
-        cells = dataset.cell_metadata(["cell_type", "donor_id"])
+        cells = datastore.cells.to_pandas_dataframe(["cell_type", "donor_id"], key="I")
+        assert list(cells.columns) == ["cell_type", "donor_id"]
         assert cells["cell_type"].tolist() == CELL_TYPES
         assert cells["donor_id"].tolist() == DONORS
-        embeddings = dataset.embeddings()
+        assert {"ids", "is_primary_data", "RNA_nCounts"} <= set(datastore.cells.columns)
+        embeddings = cytebase.embeddings(datastore)
         assert list(embeddings) == ["X_umap"]
         assert embeddings["X_umap"].to_dict() == umap_ref
-        coordinates = dataset.embedding_coordinates()
+        layout = cytebase.embedding(datastore)
+        assert layout == embeddings["X_umap"]
+        coordinates = cytebase.embedding_coordinates(datastore, layout)
         assert list(coordinates.columns) == ["umap_1", "umap_2"]
         assert coordinates.index.tolist() == [f"cell{i}" for i in range(6)]
         np.testing.assert_allclose(coordinates.to_numpy(), UMAP)
         _check_plot(
-            dataset.plot_embedding(color_by="cell_type", show=False),
+            datastore.plots.embedding(layout=layout, color_by="cell_type", show=False),
             "cell_type",
             "categorical",
             umap_ref,
         )
         _check_plot(
-            dataset.plot_embedding(color_by=["CD3E"], show=False),
+            datastore.plots.embedding(layout=layout, color_by=["CD3E"], show=False),
             "CD3E",
             "colorbar",
             umap_ref,
         )
 
         # 5. A writable local mount is pinned to the verified build.
-        mounted = catalog.mount_dataset(CYTEBASE_ID, target)
+        mounted = catalog.mount_datastore(CYTEBASE_ID, target)
         opened.append(mounted)
         assert not mounted.zw.read_only
         mounted.cells.insert("e2e_group", np.array(GROUPS))
@@ -725,7 +730,7 @@ def test_cellxgene_collection_becomes_an_openable_cytebase_dataset(
         assert [row["cytebase_id"] for row in catalog.find_datasets()] == [CYTEBASE_ID]
 
         # 7. The local analysis reopens over the same published counts.
-        reopened = dataset.mount(target)
+        reopened = catalog.mount_datastore(entry.id, target)
         opened.append(reopened)
         assert reopened.cells.fetch_all("e2e_group").tolist() == GROUPS
         np.testing.assert_array_equal(np.asarray(reopened.RNA.rawData[:]), COUNTS)

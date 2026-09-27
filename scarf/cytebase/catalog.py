@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
     from scarf import DataStore
 
-    from .dataset import CytebaseDataset
+    from .entry import DatasetEntry
 
 _CATALOG_PATH = "catalog/cytebase.duckdb"
 _HASH_PATH = f"{_CATALOG_PATH}.sha256"
@@ -221,7 +221,7 @@ def _cached_catalog(storage: Bucket) -> Path:
 
 
 class Catalog:
-    """Discover and open datasets in the public Cytebase catalog or another bucket.
+    """Discover dataset entries and open their verified Scarf DataStores.
 
     ``bucket`` accepts ``namespace/name`` or an HF bucket URI and otherwise uses
     ``CYTEBASE_BUCKET``, falling back to the public ``Nygen/cytebase`` bucket.
@@ -353,14 +353,14 @@ class Catalog:
             max_cell_chars=max_cell_chars,
         )
 
-    def dataset(self, cytebase_id: str) -> "CytebaseDataset":
-        """Return a handle for one catalog dataset without opening its store."""
-        from .dataset import CytebaseDataset
+    def dataset(self, cytebase_id: str) -> "DatasetEntry":
+        """Return descriptive dataset metadata without opening a DataStore."""
+        from .entry import DatasetEntry
 
         rows = self.query("SELECT * FROM datasets WHERE cytebase_id = ?", [cytebase_id])
         if not rows:
             raise KeyError(f"No catalog dataset is registered as {cytebase_id!r}")
-        return CytebaseDataset(self, rows[0])
+        return DatasetEntry(self, rows[0])
 
     def list_terms(
         self, facet: str | None = None, *, max_cell_chars: int | None = 100
@@ -386,18 +386,22 @@ class Catalog:
             max_cell_chars=max_cell_chars,
         )
 
-    def open_dataset(self, cytebase_id: str, **datastore_options: Any) -> "DataStore":
-        """Open committed remote counts read-only after checking current provenance."""
-        from .connector import open_dataset
+    def open_datastore(self, cytebase_id: str, **datastore_options: Any) -> "DataStore":
+        """Return a new read-only DataStore after checking current provenance.
+
+        Keep the returned DataStore for repeated reads and plots. Catalog entries
+        never cache or implicitly open DataStores.
+        """
+        from .connector import open_datastore
 
         _cached_catalog(self._storage)
-        return open_dataset(self._storage, cytebase_id, **datastore_options)
+        return open_datastore(self._storage, cytebase_id, **datastore_options)
 
-    def mount_dataset(
+    def mount_datastore(
         self, cytebase_id: str, at: str | Path, **datastore_options: Any
     ) -> "DataStore":
-        """Create or reopen a local analysis with remote counts pinned to one build."""
-        from .connector import mount_dataset
+        """Create or reopen a writable local DataStore with verified remote counts."""
+        from .connector import mount_datastore
 
         _cached_catalog(self._storage)
-        return mount_dataset(self._storage, cytebase_id, at, **datastore_options)
+        return mount_datastore(self._storage, cytebase_id, at, **datastore_options)

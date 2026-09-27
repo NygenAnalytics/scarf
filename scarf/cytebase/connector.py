@@ -1,4 +1,4 @@
-"""Open verified Cytebase stores and keep writable analysis on local mounts."""
+"""Open verified Scarf DataStores and mount remote counts for local analysis."""
 
 import asyncio
 import json
@@ -199,7 +199,7 @@ def _options(options: dict, *, mode: str) -> dict:
     return result
 
 
-def open_dataset(
+def open_datastore(
     storage: Bucket, cytebase_id: str, **datastore_options: Any
 ) -> "DataStore":
     """Open current published counts read-only, failing if publication changes."""
@@ -233,7 +233,7 @@ def open_dataset(
     return datastore
 
 
-def mount_dataset(
+def mount_datastore(
     storage: Bucket, cytebase_id: str, at: str | Path, **datastore_options: Any
 ) -> "DataStore":
     """Create or reopen a local mount pinned to the current verified source build.
@@ -243,7 +243,8 @@ def mount_dataset(
     A replaced source requires a new local analysis; existing mounts are never
     silently retargeted to the replacement.
     """
-    from scarf import DataStore, mount_datastore
+    from scarf import DataStore
+    from scarf import mount_datastore as scarf_mount_datastore
 
     if "://" in str(at):
         raise ValueError("Cytebase analysis mounts require a local destination")
@@ -285,7 +286,7 @@ def mount_dataset(
             raise FileExistsError(
                 "A Cytebase mount receipt already exists at this destination; choose a new local path"
             )
-        datastore = mount_datastore(
+        datastore = scarf_mount_datastore(
             identity["zarrUri"],
             at=str(target),
             storage_options=storage_options,

@@ -58,43 +58,88 @@ catalog.search("lung", limit=10)
 
 ```{eval-rst}
 .. autoclass:: scarf.cytebase.Catalog
-   :members: connect_catalog, query, find_datasets, search, dataset, list_terms, open_dataset, mount_dataset
+   :members: connect_catalog, query, find_datasets, search, dataset, list_terms, open_datastore, mount_datastore
 ```
 
-## Explore one dataset
+## Inspect a catalog entry
 
-Create a handle with `catalog.dataset(cytebase_id)`. Its `row` dictionary contains the complete
-catalog row; `id`, `title`, `citation`, and `cell_count` provide convenient access to common
-fields. Displaying the handle in a notebook renders `describe()`, a Markdown summary that can
-fetch the published dataset record but does not open the count store.
+`catalog.dataset(cytebase_id)` returns a `DatasetEntry` containing metadata about a scientific
+dataset. Its `row` dictionary contains the complete catalog row; `id`, `title`, `citation`,
+and `cell_count` provide convenient access to common
+fields. Displaying the entry in a notebook renders `describe()`, a Markdown summary that can
+fetch the published dataset record. Entries are metadata-only: they do not open a datastore,
+read cell arrays, mount an analysis, or plot.
 
-`source_embeddings()` lists the source H5AD's embedding keys. `embeddings()` returns the subset
-available as imported Scarf artifacts, and `embedding(key="X_umap")` selects one exact artifact
-reference. `plot_embedding(color_by=None, *, key="X_umap", **plot_options)` uses that imported
-layout and accepts a cell annotation or gene name for coloring. Plot options are forwarded to
-`DataStore.plots.embedding`; see {doc}`plotting` for its controls and returned `PlotResult`.
+`record()` fetches the published `dataset.json` and caches it on the entry.
+`source_embeddings()` lists the source H5AD's embedding keys recorded in that JSON. The source
+list describes what was inspected and may include keys whose coordinates were not imported.
 
-`cell_metadata(columns=None)` returns a pandas DataFrame. Select the needed columns to limit
-metadata reads. `embedding_coordinates(key="X_umap")` returns a DataFrame of the complete
-selected embedding, indexed by cell ID, for custom plotting. These methods materialize their
-requested metadata or coordinates in memory; they do not materialize the complete count matrix.
+```{eval-rst}
+.. autoclass:: scarf.cytebase.DatasetEntry
+   :members: id, title, citation, cell_count, describe, record, source_embeddings
+   :undoc-members:
+```
 
-`open(**datastore_options)` checks the current published provenance and opens a read-only
-`DataStore` on first use. Later calls reuse that store. Supply datastore options on the first
-call, or create a new handle to use different options. Published cell annotations and embeddings
-are source results, so displaying them does not recompute an analysis.
+## Open a datastore
 
-`mount(at, **datastore_options)` creates or reopens a writable local analysis with remote counts
-pinned to one verified source build. The destination must be a local path. Keep its adjacent
+```python
+from scarf import cytebase
+
+entry = catalog.dataset(matches[0]["cytebase_id"])
+ds = catalog.open_datastore(entry.id)
+umap_ref = cytebase.embedding(ds, "X_umap")
+ds.plots.embedding(layout=umap_ref, color_by="cell_type", figsize=(10, 6))
+```
+
+`open_datastore(cytebase_id, **datastore_options)` checks the current published provenance and
+returns a read-only `DataStore`. Each call opens and validates a datastore; retain the returned
+`ds` for subsequent operations. Published cell annotations and imported embeddings are source
+results, so displaying them does not recompute an analysis.
+
+Read cell metadata through `ds.cells.to_pandas_dataframe(columns, key="I")`. This returns a
+pandas DataFrame for the cells selected by `I`. Select the needed columns to limit metadata
+reads. Plot through `ds.plots.embedding(layout=ref, ...)`, using an exact embedding artifact
+reference. See {doc}`plotting` for its controls and returned `PlotResult`.
+
+`mount_datastore(cytebase_id, at, **datastore_options)` creates or reopens a writable local
+`DataStore` with remote counts pinned to one verified source build. The destination must be a
+local path. Keep its adjacent
 `.cytebase.json` receipt with the mount; a changed source build requires a new destination.
 Mounting keeps counts remote and requires network access for subsequent reads. See
 {doc}`../../tutorials/remote_stores` for working with remote matrices and local results.
 
+A fresh mount copies cell and feature metadata, but does not copy the source analysis artifacts.
+Plot imported source embeddings through the read-only datastore; new analysis artifacts belong
+to the writable mount. Embedding helpers inspect only the datastore passed to them.
+
+## Resolve imported embeddings
+
+`cytebase.embeddings(ds, *, assay="RNA")` maps imported source embedding keys to exact
+`ArtifactRef` values in the open datastore. `cytebase.embedding(ds, key="X_umap", *, assay="RNA")`
+selects one of these references. These helpers inspect the datastore's imported artifacts.
+
+`cytebase.embedding_coordinates(ds, ref)` returns a DataFrame of the complete referenced
+embedding, indexed by cell ID. Row alignment follows the artifact's frozen cell selection,
+including when the live `I` column has changed. Join coordinates to metadata by cell ID for
+custom plotting. Metadata tables and coordinate exports materialize the requested columns or
+coordinates in memory; they do not materialize the complete count matrix.
+
 ```{eval-rst}
-.. autoclass:: scarf.cytebase.CytebaseDataset
-   :members: id, title, citation, cell_count, describe, record, source_embeddings, open, mount, cell_metadata, embeddings, embedding, embedding_coordinates, plot_embedding
-   :undoc-members:
+.. autofunction:: scarf.cytebase.embeddings
+
+.. autofunction:: scarf.cytebase.embedding
+
+.. autofunction:: scarf.cytebase.embedding_coordinates
 ```
+
+## Prerelease API change
+
+This prerelease replaces `CytebaseDataset` with the metadata-only `DatasetEntry`.
+`Catalog.open_datastore` and `Catalog.mount_datastore` replace `Catalog.open_dataset` and
+`Catalog.mount_dataset`. The former dataset-handle methods for opening, mounting, metadata,
+embeddings, and plotting are removed. These names and methods have no compatibility aliases.
+Update existing notebooks to keep the catalog entry in `entry`, open a `DataStore` as `ds`,
+and use the datastore and module-level helpers shown above.
 
 ## Work with result tables
 

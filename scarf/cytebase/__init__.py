@@ -1,4 +1,4 @@
-"""Browse and download public data from Cytebase."""
+"""Discover Cytebase datasets and connect to their Scarf DataStores."""
 
 import os
 import shutil
@@ -18,10 +18,22 @@ from huggingface_hub import (
 if TYPE_CHECKING:
     import zarr
 
+    from ._embeddings import embedding as embedding
+    from ._embeddings import embedding_coordinates as embedding_coordinates
+    from ._embeddings import embeddings as embeddings
     from .catalog import Catalog as Catalog
-    from .dataset import CytebaseDataset as CytebaseDataset
+    from .entry import DatasetEntry as DatasetEntry
 
-__all__ = ["Catalog", "CytebaseDataset", "Repository", "connect", "list_repositories"]
+__all__ = [
+    "Catalog",
+    "DatasetEntry",
+    "Repository",
+    "connect",
+    "embedding",
+    "embedding_coordinates",
+    "embeddings",
+    "list_repositories",
+]
 
 _BUCKET_ID = "Nygen/cytebase"
 _ZARR_ARCHIVE_SUFFIX = ".zarr.tar.gz"
@@ -34,11 +46,17 @@ def __getattr__(name: str) -> Any:
 
         globals()[name] = Catalog
         return Catalog
-    if name == "CytebaseDataset":
-        from .dataset import CytebaseDataset
+    if name == "DatasetEntry":
+        from .entry import DatasetEntry
 
-        globals()[name] = CytebaseDataset
-        return CytebaseDataset
+        globals()[name] = DatasetEntry
+        return DatasetEntry
+    if name in {"embedding", "embedding_coordinates", "embeddings"}:
+        from . import _embeddings
+
+        value = getattr(_embeddings, name)
+        globals()[name] = value
+        return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

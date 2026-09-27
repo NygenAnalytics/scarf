@@ -71,15 +71,17 @@ This is a logical mount rather than a filesystem symbolic link, and it does not 
 ### Cytebase: cloud-hosted Scarf DataStores
 
 Cytebase provides ready-to-use Scarf DataStores in cloud object storage.
-Search its catalog, choose a dataset, and connect directly to its `data.zarr` for
+Search its catalog, inspect a dataset's metadata with `catalog.dataset(id)`, and
+open its `DataStore` with `catalog.open_datastore(id)` for
 metadata queries, plotting, and analysis without first downloading an H5AD or a
 complete Zarr store. Published stores include RNA counts, source annotations,
 and imported embeddings where available.
 
 Run your Python session locally or on cloud compute. Scarf reads the metadata
 and count blocks needed by each operation over the network; computation runs
-where your Python session runs. Open a dataset read-only to explore it, or mount
-it to save new analysis results while keeping counts in Cytebase.
+where your Python session runs. Open a datastore read-only to explore it, or use
+`catalog.mount_datastore(id, at=...)` to save new analysis results while keeping
+counts in Cytebase.
 
 A planned extension will also host `data.zarr` stores processed and annotated
 through Scarf's agent workflow, so users can connect to those published results

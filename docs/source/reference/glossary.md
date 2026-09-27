@@ -60,7 +60,17 @@ cell key
   selection, and leaves the column unchanged.
 
 DataStore
-  Primary Scarf object that opens a Zarr store and exposes analysis methods.
+  Python interface to a Scarf datastore containing Zarr-backed counts, metadata, and analysis artifacts.
+  It exposes metadata, analysis, and plotting operations. A datastore can be local, remote, or a writable mount over remote counts.
+
+dataset
+  Scientific collection of measurements and annotations, such as the cells and genes in one study.
+  A dataset can be distributed as a source file and as a Scarf datastore.
+
+DatasetEntry
+  Metadata-only Cytebase catalog entry returned by `Catalog.dataset(cytebase_id)`.
+  It describes a dataset's identity, citation, size, and source record.
+  Use `Catalog.open_datastore(entry.id)` or `Catalog.mount_datastore(entry.id, at=...)` to access its Scarf datastore.
 
 assay
   Named modality inside a `DataStore` (for example `RNA`, `ADT`, `ATAC`).

@@ -60,7 +60,7 @@ private bucket names out of notebook source and outputs.
 - Search by text or exact ontology labels and run local catalog SQL
 - Open an RNA assay read-only and read selected cell metadata
 - Plot imported UMAP coordinates by cell type and gene expression
-- Export coordinates for custom figures and mount a dataset for writable analysis
+- Export coordinates for custom figures and mount a datastore for writable analysis
 
 ## 1. Connect and search
 
@@ -113,13 +113,14 @@ matches
 
 ```{code-cell} ipython3
 dataset_id = matches[0]["cytebase_id"]
-dataset = catalog.dataset(dataset_id)
-dataset
+entry = catalog.dataset(dataset_id)
+entry
 ```
 
-Displaying this handle reads the catalog and dataset record. It does not open
-the remote Zarr hierarchy yet. The citation and CELLxGENE links identify the
-original study; retain these when using the data.
+`entry` is a `DatasetEntry` containing metadata about the scientific dataset.
+Displaying it reads the catalog and dataset record. It does not open the remote
+Zarr hierarchy. The citation and CELLxGENE links identify the original study;
+retain these when using the data.
 
 ### Exact labels and SQL
 
@@ -158,12 +159,13 @@ catalog.query(
 
 ## 2. Open the remote DataStore
 
-`open()` validates the published dataset version and build receipt, then opens
-the store with `zarr_mode="r"`. Counts remain remote and the SDK does not write
-back to the bucket. Repeated calls on the same handle reuse this DataStore.
+`catalog.open_datastore(entry.id)` validates the published dataset version and
+build receipt, then returns a `DataStore` with `zarr_mode="r"`. Counts remain
+remote and the SDK does not write back to the bucket. Keep this object as `ds`
+for metadata queries, plotting, and other datastore operations.
 
 ```{code-cell} ipython3
-ds = dataset.open()
+ds = catalog.open_datastore(entry.id)
 ds
 ```
 
@@ -175,8 +177,9 @@ The source H5AD may contain more embeddings than the pipeline imported. Check
 the imported keys before plotting:
 
 ```{code-cell} ipython3
-print("Source embedding keys:", dataset.source_embeddings())
-print("Imported embedding keys:", sorted(dataset.embeddings()))
+print("Source embedding keys:", entry.source_embeddings())
+print("Imported embedding keys:", sorted(cytebase.embeddings(ds)))
+umap_ref = cytebase.embedding(ds, "X_umap")
 ```
 
 The current pipeline imports `obsm/X_umap`. An `X_pca` key in the source list
@@ -190,7 +193,7 @@ CELLxGENE annotations are stored beside Scarf's QC columns, such as
 ```{code-cell} ipython3
 wanted = ["cell_type", "tissue", "disease", "donor_id", "sex", "assay"]
 columns = [column for column in wanted if column in ds.cells.columns]
-meta = dataset.cell_metadata(["ids", *columns]).set_index("ids")
+meta = ds.cells.to_pandas_dataframe(["ids", *columns], key="I").set_index("ids")
 meta.head()
 ```
 
@@ -209,21 +212,23 @@ if "donor_id" in meta:
 
 ## 4. Plot the stored UMAP
 
-`plot_embedding` uses the imported coordinates without recomputing UMAP.
-Additional options are forwarded to `DataStore.plots.embedding`.
+`ds.plots.embedding(layout=umap_ref, ...)` uses the exact imported coordinates
+without recomputing UMAP.
 Give categorical legends enough space; a large atlas with many labels is
 better viewed with selected groups or `legend_loc="none"`.
 
 ```{code-cell} ipython3
-cell_type_plot = dataset.plot_embedding(color_by="cell_type", figsize=(10, 6))
+cell_type_plot = ds.plots.embedding(
+    layout=umap_ref, color_by="cell_type", figsize=(10, 6)
+)
 ```
 
 Focus on the five most common cell types without changing the source dataset:
 
 ```{code-cell} ipython3
 top_types = meta["cell_type"].value_counts().head(5).index.tolist()
-dataset.plot_embedding(
-    color_by="cell_type", groups=top_types, figsize=(10, 6)
+ds.plots.embedding(
+    layout=umap_ref, color_by="cell_type", groups=top_types, figsize=(10, 6)
 );
 ```
 
@@ -247,7 +252,8 @@ modified. Drawing high values last makes expressing cells easier to see.
 
 ```{code-cell} ipython3
 if genes:
-    dataset.plot_embedding(
+    ds.plots.embedding(
+        layout=umap_ref,
         color_by=genes[:2],
         normalization=NormalizationSpec(transform="log1p"),
         sort_values=True,
@@ -282,11 +288,12 @@ ds.plots.distribution(
 
 ## 6. Coordinates for custom plots
 
-Coordinates are indexed by cell ID. Join on those IDs instead of assuming the
-same row order as a separate metadata table:
+Coordinates follow the embedding artifact's frozen cell selection and are
+indexed by cell ID. Join on those IDs instead of assuming the same row order as
+a separate metadata table:
 
 ```{code-cell} ipython3
-coords = dataset.embedding_coordinates()
+coords = cytebase.embedding_coordinates(ds, umap_ref)
 frame = coords.join(meta)
 frame.head()
 ```
@@ -333,15 +340,20 @@ Run them in your local Python environment or on cloud compute. Create a mount
 before running Scarf operations that save new results:
 
 ```python
-analysis = dataset.mount("./analysis.zarr")
+analysis_ds = catalog.mount_datastore(entry.id, at="./analysis.zarr")
 ```
 
 The mount stores metadata and new analysis results at `./analysis.zarr` on the
 machine running Python, including when that machine is a cloud worker. Counts
-remain remote. Reopening through `dataset.mount` checks the source build identity.
+remain remote. Reopening through `catalog.mount_datastore` checks the source build identity.
 If that build has changed, choose a new mount directory. Latest-only remote
 storage cannot guarantee an immutable source during an already-open session;
-a fresh dataset handle revalidates the current published build.
+a new `catalog.open_datastore` call revalidates the current published build.
+
+A fresh mount copies cell and feature metadata, but does not copy the source
+analysis artifacts. Keep using `ds` to plot the imported UMAP; `analysis_ds`
+holds the new artifacts you create. `cytebase.embeddings(analysis_ds)` reports
+only imported embeddings present in that local datastore.
 
 The same search and plotting calls work for larger studies. A Tabula Sapiens
 plot can be substantially slower and require more memory. Hide its long tissue
@@ -350,8 +362,11 @@ legend to preserve the plotting area:
 ```python
 atlases = catalog.search("tabula sapiens", ready_only=True)
 if atlases:
-    atlas = catalog.dataset(atlases[0]["cytebase_id"])
-    atlas.plot_embedding(color_by="tissue", legend_loc="none", figsize=(8, 8))
+    atlas_ds = catalog.open_datastore(atlases[0]["cytebase_id"])
+    atlas_umap_ref = cytebase.embedding(atlas_ds, "X_umap")
+    atlas_ds.plots.embedding(
+        layout=atlas_umap_ref, color_by="tissue", legend_loc="none", figsize=(8, 8)
+    )
 ```
 
 ## Planned: agent-processed and annotated stores
@@ -366,8 +381,8 @@ above explore the currently imported CELLxGENE annotations and embeddings.
 
 - **No matching dataset:** check bucket selection, access, and whether the desired
   version is ready. `ready_only=False` includes unfinished registrations.
-- **Missing embedding:** use `dataset.embeddings()` to check imported coordinates.
-  `source_embeddings()` also lists source keys that were not imported.
+- **Missing embedding:** use `cytebase.embeddings(ds)` to check imported coordinates.
+  `entry.source_embeddings()` also lists source keys that were not imported.
 - **Crowded figure:** increase `figsize`, reduce the number of groups or panels,
   or hide the legend. The examples use explicit sizes instead of suppressing
   plotting warnings.

@@ -449,9 +449,9 @@ def test_read_store_does_not_cache_chunks_ranges_or_writable_metadata(
         store.close()
 
 
-def test_open_dataset_reads_the_published_store_without_writing(ready_dataset):
+def test_open_datastore_reads_the_published_store_without_writing(ready_dataset):
     before = _file_contents(ready_dataset.store)
-    datastore = connector.open_dataset(ready_dataset.bucket, CYTEBASE_ID)
+    datastore = connector.open_datastore(ready_dataset.bucket, CYTEBASE_ID)
     try:
         assert datastore.zw.read_only
         assert datastore.cells.N == 6
@@ -464,7 +464,7 @@ def test_open_dataset_reads_the_published_store_without_writing(ready_dataset):
     assert _file_contents(ready_dataset.store) == before
 
 
-def test_open_dataset_closes_the_store_when_the_datastore_fails(
+def test_open_datastore_closes_the_store_when_the_datastore_fails(
     ready_dataset, monkeypatch
 ):
     created = []
@@ -476,12 +476,12 @@ def test_open_dataset_closes_the_store_when_the_datastore_fails(
 
     monkeypatch.setattr(connector._HfReadStore, "from_url", from_url)
     with pytest.raises(TypeError, match="bogus_option"):
-        connector.open_dataset(ready_dataset.bucket, CYTEBASE_ID, bogus_option=True)
+        connector.open_datastore(ready_dataset.bucket, CYTEBASE_ID, bogus_option=True)
     assert len(created) == 1
     assert not created[0]._is_open
 
 
-def test_open_dataset_rejects_a_receipt_that_disagrees_with_the_store(
+def test_open_datastore_rejects_a_receipt_that_disagrees_with_the_store(
     ready_dataset, fake_hub
 ):
     record = fake_hub.read_json(RECORD_PATH)
@@ -489,7 +489,7 @@ def test_open_dataset_rejects_a_receipt_that_disagrees_with_the_store(
     record["buildReceipt"]["verification"] |= {"nObs": 7, "countsTShape": [5, 7]}
     fake_hub.put(RECORD_PATH, record)
     with pytest.raises(ValueError, match="differs from the committed build receipt"):
-        connector.open_dataset(ready_dataset.bucket, CYTEBASE_ID)
+        connector.open_datastore(ready_dataset.bucket, CYTEBASE_ID)
 
 
 def _change_record_on_read(hub, read_number: int, change) -> list[str]:
@@ -514,26 +514,28 @@ def _republish(hub):
     return change
 
 
-def test_open_dataset_fails_when_publication_changes_while_opening(
+def test_open_datastore_fails_when_publication_changes_while_opening(
     ready_dataset, fake_hub
 ):
     reads = _change_record_on_read(fake_hub, 2, _republish(fake_hub))
     with pytest.raises(RuntimeError, match="changed while opening"):
-        connector.open_dataset(ready_dataset.bucket, CYTEBASE_ID)
+        connector.open_datastore(ready_dataset.bucket, CYTEBASE_ID)
     assert len(reads) == 2
 
 
-def test_mount_dataset_creates_then_reopens_a_pinned_analysis(ready_dataset, tmp_path):
+def test_mount_datastore_creates_then_reopens_a_pinned_analysis(
+    ready_dataset, tmp_path
+):
     target = tmp_path / "analysis.zarr"
     sidecar = tmp_path / "analysis.zarr.cytebase.json"
-    datastore = connector.mount_dataset(ready_dataset.bucket, CYTEBASE_ID, target)
+    datastore = connector.mount_datastore(ready_dataset.bucket, CYTEBASE_ID, target)
     try:
         assert not datastore.zw.read_only
         assert datastore.cells.N == 6
     finally:
         connector._close(datastore)
     assert json.loads(sidecar.read_text()) == _identity_of(ready_dataset)
-    reopened = connector.mount_dataset(
+    reopened = connector.mount_datastore(
         ready_dataset.bucket, CYTEBASE_ID, str(target), zarr_mode="r+"
     )
     try:
@@ -542,32 +544,32 @@ def test_mount_dataset_creates_then_reopens_a_pinned_analysis(ready_dataset, tmp
         connector._close(reopened)
 
 
-def test_mount_dataset_requires_a_local_destination(ready_dataset):
+def test_mount_datastore_requires_a_local_destination(ready_dataset):
     with pytest.raises(ValueError, match="require a local destination"):
-        connector.mount_dataset(ready_dataset.bucket, CYTEBASE_ID, "s3://bucket/x")
+        connector.mount_datastore(ready_dataset.bucket, CYTEBASE_ID, "s3://bucket/x")
 
 
-def test_mount_dataset_refuses_unreceipted_destinations(ready_dataset, tmp_path):
+def test_mount_datastore_refuses_unreceipted_destinations(ready_dataset, tmp_path):
     existing = tmp_path / "existing.zarr"
     existing.mkdir()
     with pytest.raises(FileExistsError, match="without a Cytebase mount receipt"):
-        connector.mount_dataset(ready_dataset.bucket, CYTEBASE_ID, existing)
+        connector.mount_datastore(ready_dataset.bucket, CYTEBASE_ID, existing)
     orphan = tmp_path / "orphan.zarr"
     (tmp_path / "orphan.zarr.cytebase.json").write_text("{}")
     with pytest.raises(FileExistsError, match="receipt already exists"):
-        connector.mount_dataset(ready_dataset.bucket, CYTEBASE_ID, orphan)
+        connector.mount_datastore(ready_dataset.bucket, CYTEBASE_ID, orphan)
 
 
-def test_mount_dataset_refuses_a_receipt_for_another_build(ready_dataset, tmp_path):
+def test_mount_datastore_refuses_a_receipt_for_another_build(ready_dataset, tmp_path):
     target = tmp_path / "analysis.zarr"
     target.mkdir()
     (tmp_path / "analysis.zarr.cytebase.json").write_text('{"cytebaseId": "old"}')
     with pytest.raises(ValueError, match="refers to a different dataset build"):
-        connector.mount_dataset(ready_dataset.bucket, CYTEBASE_ID, target)
+        connector.mount_datastore(ready_dataset.bucket, CYTEBASE_ID, target)
 
 
 @pytest.mark.parametrize("attributes", [{}, {"matrixSource": {"location": "/other"}}])
-def test_mount_dataset_refuses_a_foreign_matrix_source(
+def test_mount_datastore_refuses_a_foreign_matrix_source(
     ready_dataset, tmp_path, attributes
 ):
     target = tmp_path / "analysis.zarr"
@@ -576,27 +578,27 @@ def test_mount_dataset_refuses_a_foreign_matrix_source(
         json.dumps(_identity_of(ready_dataset))
     )
     with pytest.raises(ValueError, match="does not match the Cytebase receipt"):
-        connector.mount_dataset(ready_dataset.bucket, CYTEBASE_ID, target)
+        connector.mount_datastore(ready_dataset.bucket, CYTEBASE_ID, target)
 
 
-def test_mount_dataset_closes_the_mount_when_publication_changes(
+def test_mount_datastore_closes_the_mount_when_publication_changes(
     ready_dataset, fake_hub, tmp_path
 ):
     _change_record_on_read(fake_hub, 2, _republish(fake_hub))
     with pytest.raises(RuntimeError, match="changed while opening"):
-        connector.mount_dataset(
+        connector.mount_datastore(
             ready_dataset.bucket, CYTEBASE_ID, tmp_path / "analysis.zarr"
         )
     assert not (tmp_path / "analysis.zarr.cytebase.json").exists()
 
 
-def test_mount_dataset_does_not_overwrite_a_receipt_created_meanwhile(
+def test_mount_datastore_does_not_overwrite_a_receipt_created_meanwhile(
     ready_dataset, fake_hub, tmp_path
 ):
     sidecar = tmp_path / "analysis.zarr.cytebase.json"
     _change_record_on_read(fake_hub, 2, lambda: sidecar.write_text("claimed"))
     with pytest.raises(FileExistsError):
-        connector.mount_dataset(
+        connector.mount_datastore(
             ready_dataset.bucket, CYTEBASE_ID, tmp_path / "analysis.zarr"
         )
     assert sidecar.read_text() == "claimed"
