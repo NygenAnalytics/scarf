@@ -538,8 +538,11 @@ def test_lazy_exports_import_and_cache_sdk_objects(monkeypatch):
 
 
 def test_removed_dataset_wrapper_is_not_exported():
+    from importlib.util import find_spec
+
     from scarf import cytebase
 
+    assert find_spec("scarf.cytebase.dataset") is None
     assert "CytebaseDataset" not in cytebase.__all__
     assert "CytebaseDataset" not in dir(cytebase)
     with pytest.raises(AttributeError, match="has no attribute 'CytebaseDataset'"):
