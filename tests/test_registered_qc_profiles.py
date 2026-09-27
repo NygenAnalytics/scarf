@@ -1118,29 +1118,45 @@ def test_execute_registered_capture_qc_resolves_artifact_metric_collision() -> N
 # linked missing-value masks must leave unmasked execution identities unchanged.
 _UNMASKED_EXECUTION_PROVENANCE = {
     "registeredSelection": (
-        "34d093e86d3bbbcd15f35b722dfeb8a708cf65261b3aecf2a93c5c1a43339bd7"
+        "61fa19add8a238ea31140271a496e99765c545391861e241efc7223e224acb9e"
     ),
     "registeredFlags": (
-        "b67c16db831ff746a351ccd3f6dffc97ae616a607aaaff5db20bd2a4483d0a1f"
+        "99d87b834e66e0eb451dcf570ff00164623d5ce5d15cb26fa24b8c74db9290c1"
     ),
     "gaussianSelection": (
-        "1d5f32d9a2f23e3b221e23db69b3cb284cca79ada112b8ef719ac3ea5b87ff12"
+        "67ebc2ad18a9517c1463b7a24ba78c455887e7af43f35045abbf53eff714f3be"
     ),
     "gaussianFlags": (
-        "db211ff60ab741e6824a9656de0c863e95ceb4cf83e18cff7f005b6b8fb733f2"
+        "238a2ac3937f594761e4d324a6dce3c86228a96117f85afbabb54cc9610c9163"
     ),
     "sampleSelection": (
-        "f54c00dc6fb8d04ebf5a6bafde07409a66f00400d336591836b0c24dcf48803b"
+        "f8abef51a3d2db236dbae9583fd97b5bfd522cb98f8fb99322c68cdb469483d3"
     ),
-    "sampleFlags": "bd258ffbbd80af08661d33ca56ac30d1d47839e38071232ff48e8e006a17279d",
+    "sampleFlags": "5eeda2eabf875cebcd6dc98baf8599589fa38dd07fc74116bcf8228ea7978721",
 }
+
+
+def _rounded(value: Any) -> Any:
+    """Round floats to 10 significant digits inside a provenance record."""
+    if isinstance(value, float):
+        return float(f"{value:.10g}")
+    if isinstance(value, dict):
+        return {key: _rounded(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_rounded(item) for item in value]
+    return value
 
 
 def _named_provenance_digest(
     store: _MemoryQcStore, ref: ArtifactRef, names: dict[str, ArtifactRef]
 ) -> str:
-    """Hash an artifact's provenance with its random input IDs replaced by names."""
-    text = canonical_bytes(store.inspect_artifact(ref).provenance).decode()
+    """Hash an artifact's provenance with its random input IDs replaced by names.
+
+    Floats are rounded first: NumPy's vectorized ``log1p`` and ``expm1`` can
+    differ in the last bit between CPUs, and the digest pins values, not bits.
+    """
+    provenance = _rounded(store.inspect_artifact(ref).provenance)
+    text = canonical_bytes(provenance).decode()
     for name, named in names.items():
         text = text.replace(named.artifact_id, name)
     return hashlib.sha256(text.encode()).hexdigest()

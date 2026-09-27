@@ -35,6 +35,7 @@ from ...metadata.arguments import (
 )
 from ...metadata.rows import (
     metadata_missing_mask,
+    read_metadata_missing_rows,
     read_metadata_missing_rows_chunkwise,
     read_metadata_rows_chunkwise,
 )
@@ -658,16 +659,13 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         """
         values_by_name: dict[str, np.ndarray] = {}
         missing_by_name: dict[str, np.ndarray] = {}
-        for attr in attrs:
-            values_by_name[attr] = np.asarray(
-                read_metadata_rows_chunkwise(self.cells, attr, active_idx),
-                dtype=float,
-            )
-            missing = read_metadata_missing_rows_chunkwise(
-                self.cells,
-                attr,
-                active_idx,
-            )
+        # Whole columns are read concurrently: chunk-by-chunk reads of several
+        # columns are a chain of sequential requests on object stores.
+        for attr, column in zip(
+            attrs, self.cells.fetch_all_columns(attrs), strict=True
+        ):
+            values_by_name[attr] = np.asarray(column, dtype=float)[active_idx]
+            missing = read_metadata_missing_rows(self.cells, attr, active_idx)
             if missing is not None:
                 missing_by_name[attr] = missing
         for source in artifact_metrics:

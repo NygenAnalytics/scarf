@@ -394,6 +394,26 @@ def test_auto_filter_keeps_cells_with_zero_feature_percentages():
     assert bounds["skip_reason"] == "zero_mad"
 
 
+def test_cell_filters_read_metric_columns_in_one_concurrent_batch(monkeypatch):
+    store, _ = _qc_store()
+    dataset = _open_qc_store(store)
+    attrs = ["RNA_nCounts", "RNA_nFeatures"]
+    batches: list[list[str]] = []
+    fetch_all_columns = type(dataset.cells).fetch_all_columns
+
+    def spy(cells, columns):
+        batches.append(list(columns))
+        return fetch_all_columns(cells, columns)
+
+    monkeypatch.setattr(type(dataset.cells), "fetch_all_columns", spy)
+    dataset.auto_filter_cells(attrs=attrs, method="gaussian")
+    dataset.filter_cells(attrs=attrs, lows=[0, 0], highs=[1e9, 1e9])
+
+    # Chunk-by-chunk reads of several columns are sequential requests on
+    # object stores, so each filter reads its metric columns in one batch.
+    assert batches == [attrs, attrs]
+
+
 @pytest.mark.parametrize(
     ("pattern", "indices"),
     [("^mt-", [0, 1]), (r"(?-i:^MT-)", [1]), (r"\ARPS\d+\Z", [2, 3])],
