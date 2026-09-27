@@ -3,6 +3,8 @@
 `DataStore` is the primary analyst-facing object.
 It inherits graph, mapping, and assay helpers from the classes below.
 Use this page for analyst-facing methods and consult the inheritance appendix when extending Scarf.
+A `DataStore` is not designed for concurrent use from several threads; apart from the stage overlap
+that `DataStore.pipeline.run()` manages itself, call its methods from one thread at a time.
 
 Graph-construction methods are documented on {doc}`graph_construction`.
 Artifact and run inspection, including the metadata-only `DataStore.summary()`, is documented on {doc}`artifacts`.
@@ -11,6 +13,8 @@ Those methods are excluded here rather than repeated.
 
 `summary` is reserved for `DataStore.summary()` and cannot be used as an assay name.
 Writers and `DataStore` opening reject that name before mutating store-level state.
+Assays are also available as attributes such as `ds.RNA`; an assay named like a `DataStore`
+attribute, such as `cells`, or starting with an underscore is available only through `get_assay(name)`.
 Opening also rejects the removed `{assay}/state` group. Rebuild such a store with the current
 release; Scarf does not read or migrate its former analysis state.
 
@@ -76,7 +80,9 @@ doublets = ds.run_doublet_detection(cluster_ref, graph_ref)
 the explicit diffusion-operator lineage. It accepts one name, a sequence of names, a
 one-dimensional string array, or a Series. A name that exactly matches a live cell metadata
 column, including case, diffuses that column; it takes precedence over an assay feature of the same
-name. Other names match assay feature names case-insensitively, and duplicates are averaged.
+name. Other names match assay feature names case-insensitively, and duplicates are averaged. A
+metadata column with a missing value in the operator's cell selection raises `ValueError`, because
+diffusion would spread its stored placeholder to neighbouring cells.
 `run_diffusion_operator` raises `MemoryError` before persisting an operator that could not be
 formed or loaded again within the datastore memory budget. `load_diffusion_operator(ref)` exposes
 the validated sparse operator for direct matrix work. Membership strength and doublet detection consume exact cluster
@@ -87,8 +93,9 @@ Artifact inputs derive their cell selection from lineage; `cell_selection=` can 
 selection explicitly. A metadata column without `cell_selection=` snapshots the live `I` column.
 `secondary_groups=` provides an optional nested grouping without writing artifact labels to a cell
 column. Mean profiles fit the assay normalization once over every selected cell, so ATAC document
-frequency and ADT CLR geometric means are shared by all groups. Group values that would produce the
-same column name raise an error. `add_grouped_assay(groups, assay_label=...)` similarly accepts a
+frequency and ADT CLR geometric means are shared by all groups. Cells whose group or sub-group label
+is recorded as missing join no group, as values in `null_vals` do. Group values that would produce
+the same column name raise an error. `add_grouped_assay(groups, assay_label=...)` similarly accepts a
 pseudotime-aggregation ref or an explicit feature metadata column when constructing a new assay.
 An aggregation ref groups only the features it clustered, and missing metadata values never form a
 group.
@@ -112,8 +119,17 @@ every filter raises when no cell remains.
 {py:meth}`scarf.datastore.datastore.DataStore.select_cells` thresholds the numeric `values` payload
 of an exact cell artifact, or retains categorical values with `include=[...]`, and composes the
 result with its stored source selection. An explicit `cell_selection=` may narrow, but never widen,
-that source selection. Cells whose value the artifact records as missing are never selected, and
-doublet detection rejects a clustering with missing labels.
+that source selection. Cells whose value the artifact records as missing are never selected.
+Doublet detection, `run_marker_search`, `calc_membership_strength`, and `smart_label` reject label
+artifacts with missing labels before reusing or writing a result. Select the labelled cells with
+`select_cells(labels, include=[...])` and derive complete labels for that selection.
+
+Nullable metadata columns keep a stored placeholder in each row that their linked missing mask
+flags. `cells.fetch` and `cells.fetch_all` return stored values, placeholders included.
+`cells.to_pandas_dataframe`, `cells.head`, `get_cell_vals`, plots, and exports show those rows as
+missing: numeric columns become float64 with `NaN`, and other columns hold a missing value.
+`get_imputed` and `scarf.metrics.silhouette_scoring` reject a live column with a missing value among
+the cells they use.
 
 Saved {py:meth}`scarf.datastore.datastore.DataStore.run_marker_search` calls return the exact immutable marker-table reference.
 Pass that reference as `get_markers(marker=ref)` to select the exact feature-specific result.

@@ -1,6 +1,7 @@
 """Tests for registered one-sided cell-quality profiles."""
 
 import asyncio
+import hashlib
 from copy import deepcopy
 from typing import Any
 
@@ -36,9 +37,13 @@ from scarf.metadata.artifacts import (
     write_cell_data_artifact,
 )
 from scarf.metadata.selection import NamedCellArtifact
+from scarf.storage.arrays import linked_missing_mask
 from scarf.storage.artifacts import (
     ArtifactRef,
     artifact_group,
+    canonical_bytes,
+    fingerprint_array,
+    fingerprint_strings,
     inspect_artifact,
 )
 from scarf.storage.selections import (
@@ -47,6 +52,8 @@ from scarf.storage.selections import (
     validate_stored_selection_integrity,
 )
 from tests.test_agent_experimental_context import _Cells, _Store, _context
+
+_MISSING_PREFIX = "__scarf_missing__"
 
 
 def _quality_values() -> dict[str, np.ndarray]:
@@ -92,10 +99,17 @@ class _MemoryQcCells:
 
     @property
     def columns(self) -> list[str]:
-        return list(self._group.array_keys())
+        return [
+            name
+            for name in self._group.array_keys()
+            if not name.startswith(_MISSING_PREFIX)
+        ]
 
     def _get_array(self, column: str):
         return self._group[column]
+
+    def _get_missing_mask_array(self, column: str):
+        return linked_missing_mask(self._group, column)
 
     def fetch_all(self, column: str) -> np.ndarray:
         return np.asarray(self._group[column][:])
@@ -1098,6 +1112,156 @@ def test_execute_registered_capture_qc_resolves_artifact_metric_collision() -> N
     assert flag_status.inputs["artifact_metrics"] == {
         execution_name: metric.artifact.to_dict()
     }
+
+
+# Provenance digests of the case below, with random artifact IDs named. Reading
+# linked missing-value masks must leave unmasked execution identities unchanged.
+_UNMASKED_EXECUTION_PROVENANCE = {
+    "registeredSelection": (
+        "34d093e86d3bbbcd15f35b722dfeb8a708cf65261b3aecf2a93c5c1a43339bd7"
+    ),
+    "registeredFlags": (
+        "b67c16db831ff746a351ccd3f6dffc97ae616a607aaaff5db20bd2a4483d0a1f"
+    ),
+    "gaussianSelection": (
+        "1d5f32d9a2f23e3b221e23db69b3cb284cca79ada112b8ef719ac3ea5b87ff12"
+    ),
+    "gaussianFlags": (
+        "db211ff60ab741e6824a9656de0c863e95ceb4cf83e18cff7f005b6b8fb733f2"
+    ),
+    "sampleSelection": (
+        "f54c00dc6fb8d04ebf5a6bafde07409a66f00400d336591836b0c24dcf48803b"
+    ),
+    "sampleFlags": "bd258ffbbd80af08661d33ca56ac30d1d47839e38071232ff48e8e006a17279d",
+}
+
+
+def _named_provenance_digest(
+    store: _MemoryQcStore, ref: ArtifactRef, names: dict[str, ArtifactRef]
+) -> str:
+    """Hash an artifact's provenance with its random input IDs replaced by names."""
+    text = canonical_bytes(store.inspect_artifact(ref).provenance).decode()
+    for name, named in names.items():
+        text = text.replace(named.artifact_id, name)
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def test_unmasked_qc_execution_keeps_exact_values_and_identities() -> None:
+    labels = np.asarray(["capture-a"] * 30 + ["capture-b"] * 30)
+    counts = np.concatenate(
+        [np.linspace(90.0, 110.0, 30), np.linspace(95.0, 115.0, 30)]
+    )
+    counts[0] = 1.0
+    mito = np.concatenate([np.linspace(1.0, 3.0, 30), np.linspace(2.0, 4.0, 30)])
+    mito[-1] = 50.0
+    store, source = _memory_qc_store({"RNA_nCounts": counts, "capture": labels})
+    metric = _write_memory_cell_artifact(
+        store,
+        selection=source,
+        name="RNA_percentMito",
+        kind="quality_metric",
+        values=mito,
+        assay="RNA",
+    )
+    hto = _write_memory_cell_artifact(
+        store,
+        selection=source,
+        name="hto",
+        kind="hto_identity",
+        values=labels,
+        assay="HTO",
+    )
+    values = {"RNA_nCounts": counts, "RNA_percentMito": mito}
+    active = np.ones(store.cells.N, dtype=bool)
+    shared = {
+        "expected_active_cells": store.cells.N,
+        "attrs": ["RNA_nCounts"],
+        "artifact_metrics": [metric],
+        "cell_selection": source,
+    }
+    registered = project_registered_qc_profile(
+        "captureMad5",
+        values_by_metric=values,
+        active=active,
+        capture_labels=labels,
+        grouping_proven=True,
+    )
+    registered_refs = execute_registered_cell_qc(
+        store,
+        "captureMad5",
+        profile_parameters=_profile_parameters(registered),
+        expected_retained_cells=registered.retainedCells,
+        expected_flag_counts=registered.flagCounts,
+        sample_column="capture",
+        **shared,
+    )
+    gaussian = project_auto_filter_profile(
+        "globalGaussian",
+        values_by_metric=values,
+        active=active,
+        sample_labels=labels,
+        grouping_proven=True,
+    )
+    gaussian_refs = execute_auto_cell_qc(
+        store,
+        "globalGaussian",
+        profile_parameters=gaussian.parameters,
+        expected_retained_cells=gaussian.retainedCells,
+        expected_flag_counts=gaussian.flagCounts,
+        expected_resolved_bounds=gaussian.parameters["resolvedBounds"],
+        capture_artifact=hto,
+        **shared,
+    )
+    sample = project_auto_filter_profile(
+        "sampleMad",
+        values_by_metric=values,
+        active=active,
+        sample_labels=labels,
+        grouping_proven=True,
+        n_mads=3.0,
+        min_cells_per_sample=20,
+    )
+    skip_reasons = sample.parameters["skipReasons"]
+    assert isinstance(skip_reasons, dict)
+    sample_refs = execute_auto_cell_qc(
+        store,
+        "sampleMad",
+        profile_parameters={
+            "nMads": 3.0,
+            "minCellsPerSample": 20,
+            "nSamples": len(sample.captureSizes),
+            "nSkippedSamples": len(skip_reasons),
+        },
+        expected_retained_cells=sample.retainedCells,
+        expected_flag_counts=sample.flagCounts,
+        expected_resolved_bounds=sample.parameters["resolvedBounds"],
+        sample_column="capture",
+        **shared,
+    )
+
+    refs = {"source": source, "metric": metric.artifact, "hto": hto.artifact}
+    for name, (selection, flags) in (
+        ("registered", registered_refs),
+        ("gaussian", gaussian_refs),
+        ("sample", sample_refs),
+    ):
+        assert flags is not None
+        refs[f"{name}Selection"], refs[f"{name}Flags"] = selection, flags
+        inputs = store.inspect_artifact(flags).inputs
+        assert inputs["metadata_fingerprints"] == {
+            "RNA_nCounts": fingerprint_array(counts)
+        }
+    assert store.inspect_artifact(refs["registeredSelection"]).inputs[
+        "capture_assignments_fingerprint"
+    ] == fingerprint_strings(labels)
+    assert store.inspect_artifact(refs["sampleFlags"]).inputs["grouping_source"][
+        "fingerprint"
+    ] == fingerprint_strings(labels)
+    digests = {
+        name: _named_provenance_digest(store, refs[name], refs)
+        for name in _UNMASKED_EXECUTION_PROVENANCE
+    }
+    assert digests == _UNMASKED_EXECUTION_PROVENANCE
 
 
 def test_orchestrator_executes_retain_with_flags_instead_of_plain_skip(

@@ -1,3 +1,4 @@
+import threading
 from collections.abc import Generator, Iterator, Sequence
 from typing import Any, Literal, cast
 
@@ -141,6 +142,9 @@ class Assay:
         self.n_term_per_doc: np.ndarray | None = None
         self.n_docs: int | None = None
         self.n_docs_per_term: np.ndarray | None = None
+        # Guards the normalization state above while ``normed`` hands it to
+        # ``normMethod``.
+        self._normalization_lock = threading.Lock()
 
     def _percent_features(self) -> PercentFeatures:
         raw = self.attrs.get("percentFeatures", {})

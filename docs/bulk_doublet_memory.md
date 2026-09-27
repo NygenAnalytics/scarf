@@ -64,11 +64,12 @@ Two further reviewer suggestions need narrower treatment:
    full-feature pool before loading ANN. Replay kept pairs in budgeted batches.
    Reuse normalization, `project_pca`, `zero_norm_rows`, `NeighborQueryStage`, and
    `mapping_score_weights`. Clamp positive `save_k` to the reference's available
-   neighbors. Exclude zero-norm projections. Accumulate one float64 reference
-   score vector, then globally scale by `1000 / (informative_count * k)` and
+   neighbors. Skip rows projected onto the reference PCA center; rows with no
+   counts in the selected features are scored. Accumulate one float64 reference
+   score vector, then globally scale by `1000 / (scored_count * k)` and
    apply `log1p`. Preserve checked integer addition and overflow errors.
 6. Release simulation and ANN locals before loading the symmetric graph. Build
-   `diffusion_operator(graph, power=1)` once and apply it to the score vector
+   `transition_matrix(graph)` once and apply it to the score vector
    `smoothing_t` times. Preserve isolated-row and constant-score behavior.
    Admit graph loading, symmetrization, and transition construction from stored
    edge sizes before reading those arrays. Account for resident graph caches.

@@ -267,7 +267,10 @@ def _balanced_linkage() -> np.ndarray:
     )
 
 
-def _prepared_plot_tree(color_values: np.ndarray | None) -> dict[str, object]:
+def _prepared_plot_tree(
+    color_values: np.ndarray | None,
+    color_missing: np.ndarray | None = None,
+) -> dict[str, object]:
     graph = nx.DiGraph([(2, 0), (2, 1)])
     graph.nodes[0].update(nleaves=3, partition_id=0)
     graph.nodes[1].update(nleaves=3, partition_id=1)
@@ -276,6 +279,7 @@ def _prepared_plot_tree(color_values: np.ndarray | None) -> dict[str, object]:
         "graph": graph,
         "clusters": np.asarray([0, 0, 0, 1, 1, 1]),
         "color_values": color_values,
+        "color_missing": color_missing,
         "from_assay": "RNA",
         "graph_ref": ArtifactRef(
             scope="assay",
@@ -359,10 +363,12 @@ def test_cluster_tree_renders_categorical_pies_into_external_axis() -> None:
 def test_cluster_tree_renders_continuous_values_and_closes_owned_figure() -> None:
     uniform, uniform_is_categorical = _tree_color_series(
         np.ones(4),
+        None,
         force_ints_as_cats=False,
     )
     numeric, numeric_is_categorical = _tree_color_series(
         np.asarray([1, 2, 3]),
+        None,
         force_ints_as_cats=False,
     )
     np.testing.assert_array_equal(uniform, np.ones(4))
@@ -393,6 +399,79 @@ def test_cluster_tree_renders_continuous_values_and_closes_owned_figure() -> Non
     figure_number = result.figure.number
     result.close()
     assert not plt.fignum_exists(figure_number)
+
+
+def test_cluster_tree_fill_values_show_masked_rows_as_missing() -> None:
+    missing = np.asarray([False, True, False, False])
+    labels, labels_are_categorical = _tree_color_series(
+        np.asarray([1, 0, 2, 1]),
+        missing,
+        force_ints_as_cats=True,
+    )
+    assert labels_are_categorical is True
+    assert list(labels.cat.categories) == [1, 2]
+    assert labels.isna().tolist() == missing.tolist()
+    scores, scores_are_categorical = _tree_color_series(
+        np.asarray([1, 0, 2, 1]),
+        missing,
+        force_ints_as_cats=False,
+    )
+    assert scores_are_categorical is False
+    np.testing.assert_array_equal(scores, [1.0, np.nan, 2.0, 1.0])
+
+    prepared = _prepared_plot_tree(
+        np.asarray([1, 0, 0, 2, 2, 2]),
+        np.asarray([False, True, True, False, False, False]),
+    )
+    store = SimpleNamespace(_prepare_cluster_tree=lambda **_kwargs: prepared)
+    result = splt.cluster_tree(
+        store,
+        graph=prepared["graph_ref"],
+        clusters=prepared["clusters_ref"],
+        fill_by_value="donor",
+        show=False,
+    )
+    assert result.scales[0].order == (1, 2)
+    result.close()
+
+
+def test_artifact_cluster_tree_reads_the_fill_column_missing_mask(
+    wnn_store_template: Path,
+    tmp_path: Path,
+) -> None:
+    from scarf.storage.selections import read_stored_selection_indices
+    from tests.test_pipeline import _insert_nullable_cell_column
+
+    store, wnn = _wnn_store(wnn_store_template, tmp_path)
+    clusters = store.run_paris_clustering(wnn, n_clusters=3)
+    missing = np.zeros(store.cells.N, dtype=bool)
+    missing[::4] = True
+    donor = np.where(missing, 0, np.arange(store.cells.N) % 2 + 1)
+    _insert_nullable_cell_column(store, "donor", donor.astype(np.int64), missing)
+
+    prepared = store._prepare_cluster_tree(
+        graph=wnn,
+        clusters=clusters,
+        from_assay="RNA",
+        fill_by_value="donor",
+    )
+    rows = read_stored_selection_indices(
+        store.zw,
+        prepared["cell_selection"],
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+    )
+    np.testing.assert_array_equal(prepared["color_missing"], missing[rows])
+    assert (
+        store._prepare_cluster_tree(
+            graph=wnn,
+            clusters=clusters,
+            from_assay="RNA",
+        )["color_missing"]
+        is None
+    )
 
 
 def test_make_digraph_preserves_linkage_topology_and_leaf_clusters() -> None:

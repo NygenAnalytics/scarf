@@ -5,10 +5,10 @@ from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 import numpy as np
+import pandas as pd
 
 from ...datastore.datastore import DataStore
-from ...metadata.rows import read_metadata_rows_chunkwise
-from ...storage.refs import ArtifactRef
+from ...metadata.selection import resolve_cell_aligned_artifact
 from ...storage.selections import read_stored_selection_indices
 from ...storage.types import as_zarr_array
 from ...utils.arrays import sort_categories
@@ -25,6 +25,7 @@ from ..parameter_tuning.execution import (
     _metadata_column_fingerprint,
     candidate_metric_cache,
 )
+from ..tools import mark_missing_rows, read_marked_metadata_rows
 from ..types import ArtifactReferenceModel
 from . import journal
 from .decisions import DecisionStagesMixin
@@ -371,6 +372,7 @@ def _analysis_visual_content(
         available = set(store.cells.columns) if mixed_columns else set()
         batch_columns = [column for column in mixed_columns if column in available]
         batch_codes: np.ndarray | None = None
+        batch_recorded = np.ones(len(sample_indices), dtype=bool)
         batch_label = "Batch unavailable"
         if batch_columns and selected.cellSelection is not None:
             parent_selection = selected.cellSelection.to_artifact_ref()
@@ -383,12 +385,17 @@ def _analysis_visual_content(
                 table_path="cellData",
             ).astype(np.int64, copy=False)
             batch_label = batch_columns[0]
-            batch_values = read_metadata_rows_chunkwise(
+            batch_values = read_marked_metadata_rows(
                 store.cells,
                 batch_label,
                 parent_indices[sample_indices],
-            ).astype(str)
-            _, batch_codes = np.unique(batch_values, return_inverse=True)
+            )
+            # Cells without a recorded batch are not drawn in batch colors.
+            batch_recorded = np.asarray(~pd.isna(batch_values), dtype=bool)
+            _, batch_codes = np.unique(
+                batch_values[batch_recorded].astype(str),
+                return_inverse=True,
+            )
         for column_index, candidate in enumerate((native, harmony)):
             name = (
                 "harmony"
@@ -434,8 +441,8 @@ def _analysis_visual_content(
             correction_axes[0, column_index].set_title(f"{title}, partition colors")
             if batch_codes is not None:
                 correction_axes[1, column_index].scatter(
-                    candidate_coordinates[:, 0],
-                    candidate_coordinates[:, 1],
+                    candidate_coordinates[batch_recorded, 0],
+                    candidate_coordinates[batch_recorded, 1],
                     c=batch_codes,
                     cmap="tab20",
                     s=2,
@@ -601,7 +608,7 @@ def _analysis_visual_content(
         ):
             if artifact is None:
                 values = np.asarray(
-                    read_metadata_rows_chunkwise(
+                    read_marked_metadata_rows(
                         store.cells,
                         qc_name,
                         sampled_parent_indices,
@@ -609,50 +616,18 @@ def _analysis_visual_content(
                     dtype=np.float64,
                 )
             else:
-                artifact_ref = artifact.to_artifact_ref()
-                artifact_group = store.load_artifact(artifact_ref)
-                artifact_values = as_zarr_array(
-                    artifact_group["values"],
-                    name="values",
+                resolved = resolve_cell_aligned_artifact(
+                    store.zw,
+                    artifact.to_artifact_ref(),
+                    cell_selection=parent_selection,
+                    expected_kind="quality_metric",
                 )
-                if artifact_values.shape == parent_indices.shape:
-                    artifact_positions = sample_indices
-                else:
-                    artifact_status = store.inspect_artifact(artifact_ref)
-                    raw_selection = (
-                        getattr(artifact_status, "inputs", None) or {}
-                    ).get("cell_selection")
-                    if not isinstance(raw_selection, Mapping):
-                        raise ValueError(
-                            f"QC artifact {qc_name!r} lacks its cell selection"
-                        )
-                    artifact_selection = ArtifactRef.from_dict(dict(raw_selection))
-                    artifact_indices = read_stored_selection_indices(
-                        store.zw,
-                        artifact_selection,
-                        kind="cell_selection",
-                        scope="datastore",
-                        assay=None,
-                        table_path="cellData",
-                    ).astype(np.int64, copy=False)
-                    candidate_positions = np.searchsorted(
-                        artifact_indices,
-                        sampled_parent_indices,
-                    )
-                    if np.any(
-                        candidate_positions >= len(artifact_indices)
-                    ) or not np.array_equal(
-                        artifact_indices[candidate_positions],
-                        sampled_parent_indices,
-                    ):
-                        raise ValueError(
-                            f"QC artifact {qc_name!r} does not cover selected cells"
-                        )
-                    artifact_positions = candidate_positions
-                values = sampled_values(
-                    artifact_values,
-                    (artifact_positions,),
-                ).astype(np.float64, copy=False)
+                values = np.asarray(
+                    mark_missing_rows(resolved.values, resolved.missing_mask)[
+                        sample_indices
+                    ],
+                    dtype=np.float64,
+                )
             finite_values = values[np.isfinite(values)]
             axis.violinplot(finite_values, showmedians=True)
             jitter = (

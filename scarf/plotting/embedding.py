@@ -6,6 +6,8 @@ from typing import Any, Hashable
 import numpy as np
 import pandas as pd
 
+from ..metadata.rows import apply_missing_mask
+from ..metadata.selection import CellFieldKind
 from ..storage.artifacts import ArtifactRef, inspect_artifact
 from ._contracts import (
     CategoricalScale,
@@ -18,7 +20,9 @@ from ._contracts import (
     PlotProvenance,
 )
 from ._data import (
+    _cell_column_missing,
     _cell_metadata_columns,
+    _fetch_cell_column,
     _resolve_grouping,
     _resolve_layout,
     fetch_normalized_feature_matrix,
@@ -152,9 +156,9 @@ def _multi_layout_facets(
     if facet_order is not None:
         return list(facet_order)
 
-    values = np.asarray(store.cells.fetch(facet_by, key=cell_key))
+    values = _fetch_cell_column(store, facet_by, cell_key=cell_key, labels=True)
     subset = (
-        np.asarray(store.cells.fetch(subset_by, key=cell_key))
+        _fetch_cell_column(store, subset_by, cell_key=cell_key)
         if subset_by is not None
         else None
     )
@@ -336,14 +340,13 @@ def _embedding_multiple_layouts(
     return result
 
 
-def _selected_metadata_column(
-    store: Any,
+def _stored_metadata_column(
+    cells: Any,
     column: str,
     *,
     cell_key: str,
     cell_indices: np.ndarray | None,
 ) -> np.ndarray:
-    cells = store.cells
     if cell_indices is None:
         fetch = cells.fetch
         try:
@@ -360,6 +363,39 @@ def _selected_metadata_column(
             return values
     full = np.asarray(cells.fetch_all(column))
     return np.asarray(full[cell_indices])
+
+
+def _selected_metadata_column(
+    store: Any,
+    column: str,
+    *,
+    cell_key: str,
+    cell_indices: np.ndarray | None,
+    kind: CellFieldKind | None = None,
+) -> np.ndarray:
+    """Read one metadata column for the plotted cells with masked rows missing.
+
+    A color column that ``kind`` classifies as categorical from its stored
+    values keeps its labels and shows masked rows as None. Other columns, and
+    columns read without ``kind``, follow the raster representation.
+    """
+    cells = store.cells
+    values = _stored_metadata_column(
+        cells,
+        column,
+        cell_key=cell_key,
+        cell_indices=cell_indices,
+    )
+    missing = _cell_column_missing(
+        cells,
+        column,
+        cell_key=cell_key,
+        cell_idx=cell_indices,
+    )
+    if missing is None or not missing.any():
+        return values
+    labels = kind is not None and _is_categorical(pd.Series(values), kind)
+    return apply_missing_mask(values, missing, labels=labels)
 
 
 def _prefetch_colors(
@@ -391,7 +427,7 @@ def _prefetch_colors(
                 raise ValueError(
                     "ArtifactRef color_by requires an explicit layout ArtifactRef"
                 )
-            _, grouping_indices, grouping_values = _resolve_grouping(
+            _, grouping_indices, grouping_values, _ = _resolve_grouping(
                 store,
                 group_by=None,
                 groups=item,
@@ -417,6 +453,7 @@ def _prefetch_colors(
                 item.key,
                 cell_key=cell_key,
                 cell_indices=cell_indices,
+                kind=item.kind,
             )
             series = pd.Series(vals)
             out.append(
@@ -434,6 +471,7 @@ def _prefetch_colors(
                 item,
                 cell_key=cell_key,
                 cell_indices=cell_indices,
+                kind="auto",
             )
             series = pd.Series(vals)
             out.append((np.asarray(vals), item, _is_categorical(series, "auto"), False))
@@ -1316,11 +1354,11 @@ def embedding(
     if layout is None:
         layout_name = layout_keys[0]
         x = np.asarray(
-            store.cells.fetch(f"{layout_name}1", key=cell_key),
+            _fetch_cell_column(store, f"{layout_name}1", cell_key=cell_key),
             dtype=np.float64,
         )
         y = np.asarray(
-            store.cells.fetch(f"{layout_name}2", key=cell_key),
+            _fetch_cell_column(store, f"{layout_name}2", cell_key=cell_key),
             dtype=np.float64,
         )
     else:
@@ -1517,6 +1555,7 @@ def embedding(
             facet_by,
             cell_key=cell_key,
             cell_indices=artifact_cell_indices,
+            kind="categorical",
         )
         if groups is not None:
             groups_category = facet_values

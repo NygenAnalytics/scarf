@@ -362,27 +362,6 @@ def test_pipeline_plot_dataframe_and_head_edge_paths(
     with pytest.raises(KeyError):
         cells._field_display("missing")
 
-    np.testing.assert_array_equal(
-        PipelineAxisView._apply_plot_missing(
-            np.asarray([True, True]), np.asarray([False, False])
-        ),
-        np.asarray([True, True]),
-    )
-    np.testing.assert_array_equal(
-        PipelineAxisView._apply_plot_missing(
-            np.asarray([True, True]), np.asarray([False, True])
-        ),
-        np.asarray([True, False]),
-    )
-    numeric = PipelineAxisView._apply_plot_missing(
-        np.asarray([1, 2]), np.asarray([False, True])
-    )
-    assert np.isnan(numeric[1])
-    text = PipelineAxisView._apply_plot_missing(
-        np.asarray(["a", "b"]), np.asarray([False, True])
-    )
-    assert text[1] is None
-
     with monkeypatch.context() as patch:
         patch.setattr(
             PipelineAxisView,

@@ -178,6 +178,9 @@ class NormalizationArguments(OperationArguments):
     renormalize_subset: bool = parameter()
     invalidate_cache: bool = execution(False)
     count_arithmetic: Literal["float64"] | None = parameter(None, omit_if_none=True)
+    # Recorded when RNA totals divide the counts and a selected cell has none:
+    # its total is divided as 1, so its values are zeros rather than NaN.
+    zero_total_divisor: Literal["one"] | None = parameter(None, omit_if_none=True)
 
 
 @dataclass(frozen=True, slots=True)

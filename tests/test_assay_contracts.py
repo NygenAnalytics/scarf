@@ -635,6 +635,75 @@ def test_rna_normed_zero_total_cells_are_zero(tmp_path):
     )
 
 
+def test_concurrent_rna_normed_calls_keep_their_own_normalization(
+    tmp_path, monkeypatch
+):
+    import threading
+    import time
+
+    import scarf.assay.normalization as normalization
+
+    raw = np.random.default_rng(3).integers(0, 9, (6, 4)).astype(np.uint32)
+    raw[:, 0] += 1
+    SparseToZarr(
+        csr_matrix(raw),
+        zarr_loc=str(tmp_path / "rna.zarr"),
+        cell_ids=[f"c{i}" for i in range(6)],
+        feature_ids=[f"g{i}" for i in range(4)],
+        assay_name="RNA",
+        nthreads=1,
+    ).dump(batch_size=6)
+    rna = DataStore(
+        str(tmp_path / "rna.zarr"), default_assay="RNA", min_features_per_cell=0
+    ).RNA
+    feats = np.arange(4)
+    requests = {"first": (np.arange(6), True), "second": (np.array([1, 3, 5]), False)}
+    expected = {
+        name: rna.normed(cells, feats, log_transform=log).compute()
+        for name, (cells, log) in requests.items()
+    }
+
+    # The first call reads its totals slowly, and every call builds its result
+    # slowly, so an unguarded call would read the other call's method or totals.
+    def delayed(function, seconds, thread=None):
+        def call(*args, **kwargs):
+            if thread in (None, threading.current_thread().name):
+                time.sleep(seconds)
+            return function(*args, **kwargs)
+
+        return call
+
+    monkeypatch.setattr(
+        RNAassay,
+        "_cell_count_totals",
+        delayed(RNAassay._cell_count_totals, 0.2, "first"),
+    )
+    monkeypatch.setattr(
+        normalization,
+        "_library_size_scaled",
+        delayed(normalization._library_size_scaled, 0.3),
+    )
+    results = {}
+
+    def normalize(name):
+        cells, log = requests[name]
+        results[name] = rna.normed(cells, feats, log_transform=log).compute()
+
+    threads = [
+        threading.Thread(target=normalize, args=(name,), name=name) for name in requests
+    ]
+    for thread in threads:
+        thread.start()
+        time.sleep(0.05)
+    for thread in threads:
+        thread.join()
+
+    for name in requests:
+        np.testing.assert_array_equal(results[name], expected[name])
+    assert rna.normMethod is norm_lib_size
+    assert rna.scalar is None
+
+
 def test_rna_streaming_stats_and_group_means_handle_missing_inputs():
     from scarf.metadata import MetaData
 

@@ -470,28 +470,34 @@ class RNAassay(Assay):
         if feat_idx is None:
             feat_idx = np.arange(self.feats.N, dtype=np.int64)
         counts = self.rawData[:, feat_idx][cell_idx, :]
-        norm_method_cache = self.normMethod
-        scalar_cache = self.scalar
-        try:
-            if log_transform:
-                self.normMethod = norm_lib_size_log
-            if renormalize_subset:
-                scalar = compute_with_progress(
-                    counts.sum(axis=1),
-                    "Normalizing with feature subset",
-                    self.nthreads,
-                )
-                scalar[scalar == 0] = 1
-                self.scalar = scalar
-            else:
-                scalar = self._cell_count_totals(cell_idx)
-                # Zero-total cells normalize to zero, as on every other path.
-                scalar[scalar == 0] = 1
-                self.scalar = scalar
-            return self.normMethod(self, counts)
-        finally:
-            self.normMethod = norm_method_cache
-            self.scalar = scalar_cache
+        method = norm_lib_size_log if log_transform else self.normMethod
+        if renormalize_subset:
+            scalar = compute_with_progress(
+                counts.sum(axis=1),
+                "Normalizing with feature subset",
+                self.nthreads,
+            )
+        else:
+            scalar = self._cell_count_totals(cell_idx)
+        # Zero-total cells normalize to zero, as on every other path.
+        scalar[scalar == 0] = 1
+        # The method reads the totals from ``self.scalar`` while it builds the
+        # lazy result, so concurrent calls must not interleave here.
+        with self._normalization_lock:
+            scalar_cache = self.scalar
+            self.scalar = scalar
+            try:
+                return method(self, counts)
+            finally:
+                self.scalar = scalar_cache
+
+    def _has_zero_total_cells(self, cell_idx: np.ndarray) -> bool:
+        """Return whether a selected cell has no counts in this assay.
+
+        ``normed`` without subset renormalization divides such a cell's counts
+        by 1, so its normalized values are zeros rather than NaN.
+        """
+        return bool(np.any(self._cell_count_totals(cell_idx) == 0))
 
     def _raw_feature_stream_source(self) -> tuple[zarr.Array, int, int]:
         """Return the preferred raw array and its feature and cell axes."""
@@ -518,9 +524,6 @@ class RNAassay(Assay):
         parallel and accumulated as they arrive (each writes a disjoint row
         slice, so order does not matter).
         """
-        from ..storage.parallel import stream_shards
-
-        zarr_arr = cast(zarr.Array, self.rawData._backing)
         cell_idx = np.asarray(cell_idx)
         if (self.normMethod is norm_lib_size or log_transform) and self.sf is None:
             raise ValueError(
@@ -537,9 +540,44 @@ class RNAassay(Assay):
             key: np.searchsorted(union, np.asarray(idx, dtype=int))
             for key, idx in feature_groups.items()
         }
+        return self._mean_normed_union(
+            cell_idx,
+            scalar,
+            union,
+            local_pos,
+            sf=sf,
+            block_rows=block_rows,
+            log_transform=log_transform,
+            resident_bytes=(
+                scalar.nbytes
+                + union.nbytes
+                + sum(value.nbytes for value in local_pos.values())
+            ),
+        )
 
+    def _mean_normed_union(
+        self,
+        cell_idx: np.ndarray,
+        scalar: np.ndarray,
+        union: np.ndarray,
+        local_pos: Mapping[str, np.ndarray],
+        *,
+        sf: float,
+        block_rows: int | None,
+        log_transform: bool,
+        resident_bytes: int,
+    ) -> dict[str, np.ndarray]:
+        """Average library-size normalized ``union`` columns per group position.
+
+        ``scalar`` holds the nonzero total of each cell in ``cell_idx``.
+        ``resident_bytes`` counts the arrays the caller holds for the call,
+        including ``scalar``, ``union``, and ``local_pos``.
+        """
+        from ..storage.parallel import stream_shards
+
+        zarr_arr = cast(zarr.Array, self.rawData._backing)
         n_cells = len(cell_idx)
-        out = {key: np.empty(n_cells, dtype=np.float64) for key in feature_groups}
+        out = {key: np.empty(n_cells, dtype=np.float64) for key in local_pos}
         if n_cells == 0:
             return out
 
@@ -559,18 +597,12 @@ class RNAassay(Assay):
             * max(1, len(union))
             * (np.dtype(zarr_arr.dtype).itemsize + np.dtype(np.float64).itemsize)
         )
-        resident_bytes = (
-            scalar.nbytes
-            + union.nbytes
-            + sum(value.nbytes for value in out.values())
-            + sum(value.nbytes for value in local_pos.values())
-        )
         admission = admit_stream(
             self.resources,
             nBlocks=self.resources.workers,
             blockBytes=block_bytes,
             decodeBytes=0 if geometry is None else geometry.nominalChunkBytes(),
-            residentBytes=resident_bytes,
+            residentBytes=resident_bytes + sum(value.nbytes for value in out.values()),
             requested=self.resources.workers,
         )
         for start, raw in stream_shards(
@@ -596,26 +628,35 @@ class RNAassay(Assay):
     ) -> Iterator[np.ndarray]:
         """Yield per-cell group means, as ``iter_feature_group_means`` does.
 
-        Library-size normalization depends only on each cell's total, so row
-        bands of ``block_rows`` cells use ``_mean_normed_feature_groups``,
-        which reads the union of the group features once per band. Other
-        normalizations use the fitted generic kernel.
+        Library-size normalization depends only on each cell's total, so the
+        totals are read once and each row band of ``block_rows`` cells reads
+        the union of the group features once. Other normalizations use the
+        fitted generic kernel.
         """
         if not lib_size_feature_stream_eligible(self):
             yield from super()._iter_feature_group_means(cell_idx, feature_groups)
             return
-        # Called only for its validation: empty or malformed groups are
-        # rejected exactly as the generic kernel rejects them.
-        _feature_group_positions(feature_groups)
-        keyed = {
-            str(index): np.asarray(group, dtype=np.int64)
-            for index, group in enumerate(feature_groups)
-        }
+        assert self.sf is not None
+        # Rejects empty or malformed groups exactly as the generic kernel does.
+        union, positions = _feature_group_positions(feature_groups)
+        keyed = {str(index): position for index, position in enumerate(positions)}
         cell_idx = np.asarray(cell_idx, dtype=np.int64)
+        totals = self._cell_count_totals(cell_idx)
+        totals[totals == 0] = 1
+        resident_bytes = (
+            totals.nbytes + union.nbytes + sum(value.nbytes for value in positions)
+        )
         band = max(1, len(cell_idx) if block_rows is None else int(block_rows))
         for start in range(0, len(cell_idx), band):
-            means = self._mean_normed_feature_groups(
-                cell_idx[start : start + band], keyed
+            means = self._mean_normed_union(
+                cell_idx[start : start + band],
+                totals[start : start + band],
+                union,
+                keyed,
+                sf=float(self.sf),
+                block_rows=None,
+                log_transform=False,
+                resident_bytes=resident_bytes,
             )
             yield np.column_stack([means[key] for key in keyed])
 

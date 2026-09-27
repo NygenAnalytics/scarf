@@ -1,18 +1,29 @@
 """Offered QC alternatives execute their exact frozen cohort and diagnostic flags."""
 
 from copy import deepcopy
+from typing import Any
 
 import numpy as np
 import pytest
 
-from scarf.agent.cell_quality.execution import execute_registered_cell_qc
-from scarf.agent.cell_quality.profiles import project_registered_qc_profile
+from scarf.agent.cell_quality.execution import (
+    execute_auto_cell_qc,
+    execute_registered_cell_qc,
+)
+from scarf.agent.cell_quality.profiles import (
+    project_auto_filter_profile,
+    project_registered_qc_profile,
+)
+from scarf.agent.experimental_context.characterization import _SelectionBoundCells
 from scarf.storage.artifacts import artifact_group
+from scarf.storage.refs import ArtifactRef
 from scarf.storage.selections import read_stored_selection_mask
+from tests.test_pipeline import _insert_nullable_cell_column
 from tests.test_registered_qc_profiles import (
     _memory_qc_store,
     _profile_parameters,
     _quality_values,
+    _write_memory_cell_artifact,
 )
 
 
@@ -207,3 +218,150 @@ def test_capture_provenance_cannot_merge_distinct_typed_labels() -> None:
             capture_labels=captures,
             grouping_proven=True,
         )
+
+
+_MASKED_SOURCES = [
+    "metadataMetric",
+    "artifactMetric",
+    "metadataCapture",
+    "captureArtifact",
+]
+
+
+def _stored_paths(store: Any) -> list[str]:
+    return sorted(name for name, _ in store.zw.members(max_depth=None))
+
+
+def _mask_artifact(store: Any, ref: ArtifactRef, missing: np.ndarray) -> None:
+    group = artifact_group(store.zw, ref)
+    group.create_array("__scarf_missing__values", data=missing)
+    group["values"].attrs["missing_mask"] = "__scarf_missing__values"
+
+
+def _placeholder_case(
+    masked: str,
+) -> tuple[Any, ArtifactRef, dict[str, Any], np.ndarray, np.ndarray]:
+    """Store placeholders that only a linked missing-value mask marks as missing.
+
+    Evidence reads the masked rows as missing, but the stored placeholders (0)
+    look like measured values to a reader that ignores the mask.
+    """
+    counts = np.linspace(80.0, 120.0, 60)
+    captures = np.repeat([1, 2, 3], 20)
+    missing = np.zeros(60, dtype=bool)
+    if masked.endswith("Metric"):
+        missing[[4, 33]] = True
+        counts[missing] = 0.0
+    else:
+        missing[40:] = True
+        captures[missing] = 0
+    columns: dict[str, np.ndarray] = {}
+    if masked != "metadataMetric":
+        columns["RNA_nCounts"] = counts
+    if masked != "metadataCapture":
+        columns["capture"] = captures
+    store, source = _memory_qc_store(columns)
+    sources: dict[str, Any] = {"attrs": ["RNA_nCounts"], "sample_column": "capture"}
+    if masked == "metadataMetric":
+        _insert_nullable_cell_column(store, "RNA_nCounts", counts, missing)
+    elif masked == "metadataCapture":
+        _insert_nullable_cell_column(store, "capture", captures, missing)
+    elif masked == "artifactMetric":
+        metric = _write_memory_cell_artifact(
+            store,
+            selection=source,
+            name="RNA_nCounts",
+            kind="quality_metric",
+            values=counts,
+            assay="RNA",
+        )
+        _mask_artifact(store, metric.artifact, missing)
+        sources.update(attrs=[], artifact_metrics=[metric])
+    else:
+        identity = _write_memory_cell_artifact(
+            store,
+            selection=source,
+            name="capture",
+            kind="hto_identity",
+            values=captures,
+            assay="HTO",
+        )
+        _mask_artifact(store, identity.artifact, missing)
+        del sources["sample_column"]
+        sources["sample_artifact"] = identity
+    return store, source, sources, counts, captures
+
+
+@pytest.mark.parametrize("masked", _MASKED_SOURCES)
+def test_registered_execution_refuses_masked_inputs_before_saving(masked: str) -> None:
+    store, source, sources, counts, captures = _placeholder_case(masked)
+    projection = project_registered_qc_profile(
+        "captureMad5",
+        values_by_metric={"RNA_nCounts": counts},
+        active=np.ones(60, dtype=bool),
+        capture_labels=captures,
+        grouping_proven=True,
+    )
+    before = _stored_paths(store)
+    with pytest.raises(ValueError, match="non-finite|missing labels"):
+        execute_registered_cell_qc(
+            store,
+            "captureMad5",
+            profile_parameters=_profile_parameters(projection),
+            expected_active_cells=60,
+            expected_retained_cells=projection.retainedCells,
+            expected_flag_counts=projection.flagCounts,
+            cell_selection=source,
+            **sources,
+        )
+    assert _stored_paths(store) == before
+
+
+@pytest.mark.parametrize("masked", _MASKED_SOURCES)
+def test_auto_execution_refuses_masked_inputs_before_core_filtering(
+    masked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, source, sources, counts, captures = _placeholder_case(masked)
+    # globalGaussian takes its physical capture labels as a capture source.
+    if "sample_column" in sources:
+        sources["capture_column"] = sources.pop("sample_column")
+    else:
+        sources["capture_artifact"] = sources.pop("sample_artifact")
+    projection = project_auto_filter_profile(
+        "globalGaussian",
+        values_by_metric={"RNA_nCounts": counts},
+        active=np.ones(60, dtype=bool),
+        sample_labels=captures,
+        grouping_proven=True,
+    )
+
+    def core_filtering(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("Core filtering ran on inputs with masked rows")
+
+    monkeypatch.setattr(store, "auto_filter_cells", core_filtering)
+    before = _stored_paths(store)
+    with pytest.raises(ValueError, match="finite|missing labels"):
+        execute_auto_cell_qc(
+            store,
+            "globalGaussian",
+            profile_parameters=projection.parameters,
+            expected_active_cells=60,
+            expected_retained_cells=projection.retainedCells,
+            expected_flag_counts=projection.flagCounts,
+            expected_resolved_bounds=projection.parameters["resolvedBounds"],
+            cell_selection=source,
+            **sources,
+        )
+    assert _stored_paths(store) == before
+
+
+def test_bound_evidence_reads_masked_artifact_labels_as_missing() -> None:
+    store, source, sources, _, captures = _placeholder_case("captureArtifact")
+    cells = _SelectionBoundCells(
+        store.zw,
+        store.cells,
+        source,
+        artifacts={"hto": sources["sample_artifact"].artifact},
+    )
+    expected = [None if value == 0 else value for value in captures.tolist()]
+    assert cells.fetch("hto").tolist() == expected

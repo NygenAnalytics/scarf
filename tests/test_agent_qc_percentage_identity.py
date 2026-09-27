@@ -17,6 +17,7 @@ from scarf.agent.tools import core_artifact_reference
 from scarf.agent.parameter_tuning.diagnostics import _covariate_associations
 from scarf.datastore.datastore import DataStore
 from scarf.metadata.selection import NamedCellArtifact
+from scarf.storage.artifacts import artifact_group
 from tests.agent_orchestrator_store import create_store
 
 
@@ -219,3 +220,51 @@ def test_unresolved_mitochondrial_definition_cannot_use_imported_percentages(
         "mitochondrial percentage has no exact usable artifact" in n for n in notes
     )
     np.testing.assert_array_equal(store.cells.fetch_all("RNA_percentMito"), imported)
+
+
+def test_masked_percentage_rows_keep_an_artifact_from_driving_filtering(
+    tmp_path: Path,
+) -> None:
+    store = DataStore(
+        str(create_store(tmp_path / "masked.zarr", mito_pattern="", ribo_pattern="")),
+        default_assay="RNA",
+        min_features_per_cell=-1,
+        mito_pattern="",
+        ribo_pattern="",
+        zarr_mode="r+",
+    )
+    store.get_assay("RNA").feats.insert(
+        "names", np.asarray(["MT-CO1", "MTAP", "MTOR", "RPS3"]), overwrite=True
+    )
+    selected = store.snapshot_cell_selection("I")
+    sources = _derive_missing_percentage_artifacts(
+        store,
+        cell_selection=selected,
+        driver=("RNA", "RNA"),
+        quality_sources=[],
+    )
+    mito = next(item for item in sources if item.name == "RNA_percentMito")
+    # The stored value stays finite; only the linked mask marks it missing.
+    group = artifact_group(store.zw, core_artifact_reference(mito.artifact))
+    missing = np.zeros(group["values"].shape[0], dtype=bool)
+    missing[0] = True
+    group.create_array("__scarf_missing__values", data=missing)
+    group["values"].attrs["missing_mask"] = "__scarf_missing__values"
+    deps = ExperimentalContextDependencies(
+        store=store,
+        cellSelection=selected,
+        cells=_SelectionBoundCells(store.zw, store.cells, selected),
+        qcAssay="RNA",
+        studyContext="Human nuclei with mitochondrial QC.",
+        qualityMetricArtifacts=sources,
+    )
+    values, _, artifacts, evidence, _, _, _ = _qc_metric_sources(deps, ("RNA", "RNA"))
+    source = next(
+        item
+        for item in evidence
+        if item.sourceType == "artifact" and item.metricName == "RNA_percentMito"
+    )
+    assert not source.usableForFiltering
+    assert source.missingCells == 1
+    assert "RNA_percentMito" not in values
+    assert "RNA_percentMito" not in {item.name for item in artifacts}

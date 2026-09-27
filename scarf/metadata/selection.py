@@ -374,6 +374,35 @@ def resolve_grouping(
     )
 
 
+def resolve_complete_labels(
+    root: Any,
+    labels: ArtifactRef,
+    *,
+    name: str,
+) -> ResolvedCellArtifact:
+    """Resolve artifact labels that must assign every selected cell to a group.
+
+    Producers that persist a per-group result cannot treat a stored
+    placeholder as a label, so labels whose linked mask flags a row are
+    rejected before any result is reused or written.
+    """
+    if not isinstance(labels, ArtifactRef):
+        raise TypeError(f"{name} must be an ArtifactRef")
+    resolved = resolve_cell_aligned_artifact(
+        root,
+        labels,
+        value_name=grouping_value_name(labels.kind),
+        expected_kind=labels.kind,
+    )
+    if resolved.missing_mask is not None and bool(resolved.missing_mask.any()):
+        raise ValueError(
+            f"{name} contains missing labels. Select the labelled cells with "
+            f"select_cells({name}, include=...) and derive complete labels for "
+            "that selection"
+        )
+    return resolved
+
+
 @dataclass(frozen=True, slots=True)
 class StudyDesign:
     """Describe samples and conditions for composition and summary plots.

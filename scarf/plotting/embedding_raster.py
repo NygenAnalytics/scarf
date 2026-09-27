@@ -7,7 +7,7 @@ from typing import Any, Hashable, cast
 import numpy as np
 
 from ..metadata import MetaDataRowBlock
-from ..metadata.rows import read_metadata_rows_chunkwise
+from ..metadata.rows import apply_missing_mask, read_metadata_rows_chunkwise
 from ..storage import ArtifactRef
 from ..storage.artifacts import artifact_group
 from ..storage.selections import (
@@ -21,7 +21,6 @@ from ._deps import require_matplotlib
 from ._display import stored_display_metadata
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
 from ._raster import (
-    _apply_raster_missing_mask,
     _MissingMaskRows,
     draw_raster_canvas,
     raster_from_metadata,
@@ -151,7 +150,7 @@ class _ArtifactRasterCells:
                         row_indices,
                     )
                     missing = missing_masks.read(column, row_indices)
-                    values[column] = _apply_raster_missing_mask(
+                    values[column] = apply_missing_mask(
                         live_values,
                         missing,
                     )

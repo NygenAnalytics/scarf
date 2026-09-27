@@ -234,17 +234,19 @@ def test_pca_covariate_evidence_rejects_wrong_type_or_selection(
     monkeypatch.setattr(d, "_selection_indices", lambda *_: np.arange(4))
     monkeypatch.setattr(
         d,
-        "_aligned_metadata",
+        "read_marked_metadata_rows",
         lambda *_, **__: np.arange(3 if damage == "rows" else 4),
     )
     monkeypatch.setattr(
         d,
         "resolve_cell_aligned_artifact",
-        lambda *_args, **_kwargs: SimpleNamespace(values=np.arange(4)),
+        lambda *_args, **_kwargs: SimpleNamespace(
+            values=np.arange(4), missing_mask=None
+        ),
     )
     with pytest.raises(ValueError):
         d._covariate_associations(
-            SimpleNamespace(zw=None),
+            SimpleNamespace(zw=None, cells=None),
             _ref("cell_selection"),
             np.ones((4, 2)),
             ["covariate"],
@@ -494,7 +496,7 @@ def _capture_scoring_store(
         d, "read_stored_selection_indices", lambda _root, ref, **_: selections[ref]
     )
     monkeypatch.setattr(
-        d, "read_metadata_rows_chunkwise", lambda _cells, _column, rows: labels[rows]
+        d, "read_marked_metadata_rows", lambda _cells, _column, rows: labels[rows]
     )
     monkeypatch.setattr(d, "read_feature_selection_indices", lambda *_: np.arange(5))
     monkeypatch.setattr(
@@ -638,39 +640,111 @@ def test_large_doublet_summary_identifies_sampled_quantiles(
     assert any("deterministic bounded samples" in note for note in result.limitations)
 
 
-def test_metadata_diagnostics_preserve_missing_masks_and_reject_misalignment(
+class _MaskedMetadata:
+    def __init__(
+        self, values: dict[str, np.ndarray], missing: dict[str, np.ndarray]
+    ) -> None:
+        self.values, self.missing = values, missing
+        self.columns = list(values)
+
+    def _get_array(self, column: str) -> np.ndarray:
+        return self.values[column]
+
+    def _get_missing_mask_array(self, column: str) -> np.ndarray | None:
+        return self.missing.get(column)
+
+
+def test_shared_metadata_reader_marks_missing_rows_and_rejects_misalignment() -> None:
+    from scarf.agent.tools import mark_missing_rows, read_marked_metadata_rows
+
+    cells = _MaskedMetadata(
+        {
+            "age": np.asarray([10.0, 20.0, 30.0, 40.0]),
+            "lane": np.asarray([0, 1, 0, 2]),
+            "donor": np.asarray(["a", "b", "c", "d"]),
+        },
+        {
+            "age": np.asarray([False, False, False, True]),
+            "lane": np.asarray([True, False, False, False]),
+        },
+    )
+    age = read_marked_metadata_rows(cells, "age", np.asarray([1, 3]))
+    assert age.dtype == np.float64 and age[0] == 20.0 and np.isnan(age[1])
+    assert read_marked_metadata_rows(cells, "lane", np.asarray([0, 1])).tolist() == [
+        None,
+        1,
+    ]
+    # Rows without a flagged entry keep the stored values and dtype exactly.
+    for column, rows in (("lane", [1, 3]), ("donor", [0, 2])):
+        values = read_marked_metadata_rows(cells, column, np.asarray(rows))
+        stored = cells.values[column][rows]
+        assert values.dtype == stored.dtype
+        np.testing.assert_array_equal(values, stored)
+    with pytest.raises(ValueError, match="does not align"):
+        mark_missing_rows(np.arange(2), np.zeros(3, dtype=bool))
+    cells.values["age"] = np.ones((4, 2))
+    with pytest.raises(ValueError, match="does not align"):
+        read_marked_metadata_rows(cells, "age", np.asarray([1, 3]))
+
+
+def test_unit_support_and_technical_association_leave_out_masked_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from scipy.sparse import block_diag, csr_matrix
+
+    labels = np.repeat([1, 2], 8)
+    masked = np.arange(16) >= 12
+    # Masked rows keep the integer placeholder 0, which is not a recorded unit.
+    cells = _MaskedMetadata(
+        {
+            "donor": np.asarray([1, 2] * 4 + [1] * 4 + [0] * 4),
+            "lane": np.asarray([1] * 8 + [2] * 4 + [0] * 4),
+            "plate": np.zeros(16, dtype=np.int64),
+        },
+        {"donor": masked, "lane": masked, "plate": np.ones(16, dtype=bool)},
+    )
+    community = csr_matrix(np.ones((8, 8)) - np.eye(8))
+    store = SimpleNamespace(
+        cells=cells,
+        load_graph=lambda _: block_diag((community, community), format="csr"),
+        run_leiden_clustering=lambda *_, **__: _ref("cluster_labels", 2),
+        run_marker_search=lambda *_, **__: _ref("marker_table"),
+        get_markers=lambda *_, **__: pd.DataFrame(
+            {
+                "group_id": ["1", "2"],
+                "feature_name": ["A", "B"],
+                "score": [1.0, 1.0],
+                "auc": [0.9, 0.9],
+            }
+        ),
+    )
+    monkeypatch.setattr(d, "_cluster_labels", lambda *_: labels)
     monkeypatch.setattr(
-        d, "read_stored_selection_indices", lambda *_args, **_kwargs: np.asarray([1, 3])
+        d, "_selected_feature_names", lambda *_: (np.arange(2), np.asarray(["A", "B"]))
     )
-    monkeypatch.setattr(
-        d, "read_metadata_rows_chunkwise", lambda *_: np.asarray([20.0, 40])
+    monkeypatch.setattr(d, "_selection_indices", lambda *_: np.arange(16))
+    evaluation = example(ParameterCandidateEvaluation)
+    evaluation.artifacts.update(
+        {
+            "clusters": ArtifactRecord.from_ref(_ref("cluster_labels")),
+            "connectivityMap": ArtifactRecord.from_ref(_ref("connectivity_map")),
+        }
     )
-    monkeypatch.setattr(
-        d, "read_metadata_missing_rows_chunkwise", lambda *_: np.asarray([False, True])
-    )
-    store = SimpleNamespace(zw=None, cells=None)
-    indices = d._selection_indices(store, _ref("cell_selection"))
-    values = d._aligned_metadata(
-        store, indices, "age", aligned_with="PCA", mark_missing=True
-    )
-    assert values.tolist() == [20.0, None]
-    assert d._aligned_metadata(
-        store, indices, "age", aligned_with="clusters"
-    ).tolist() == [20.0, 40.0]
-    monkeypatch.setattr(
-        d, "read_metadata_rows_chunkwise", lambda *_: np.asarray([20.0])
-    )
-    for mark_missing in (True, False):
-        with pytest.raises(ValueError, match="align"):
-            d._aligned_metadata(
-                store,
-                indices,
-                "age",
-                aligned_with="PCA",
-                mark_missing=mark_missing,
-            )
+
+    metrics = d.augment_cluster_evaluations(
+        store,
+        [evaluation],
+        marker_assay="RNA",
+        marker_features=_ref("feature_selection"),
+        independent_unit_columns=["donor"],
+        technical_columns=["lane", "plate"],
+    )[0].metrics
+
+    # Cluster 2 has one recorded donor; its placeholder is not a second unit.
+    assert metrics.crossUnitSupport == pytest.approx(0.5)
+    # Recorded lanes match the clusters exactly, and a column without any
+    # recorded value has no association to report.
+    assert metrics.technicalAssociation == {"lane": pytest.approx(1.0)}
 
 
 def test_topology_overlap_requires_same_neighborhood_axis(
@@ -877,9 +951,7 @@ def test_capture_selection_skips_missing_labels_and_accepts_boolean_labels() -> 
     _insert_nullable_cell_column(ds, "lane", np.where(missing, 0, rows % 2), missing)
 
     for column, value in (("is_even", np.True_), ("lane", 0)):
-        values = d._aligned_metadata(
-            ds, active, column, aligned_with="cells", mark_missing=True
-        )
+        values = d.read_marked_metadata_rows(ds.cells, column, active)
         reference, count = d._select_capture_cells(
             ds,
             parent,

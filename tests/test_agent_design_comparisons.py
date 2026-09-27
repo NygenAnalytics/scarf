@@ -685,14 +685,12 @@ def test_pca_associations_use_covariate_kind_independently_of_role(
     monkeypatch.setattr(diagnostics, "_selection_indices", lambda *_: np.arange(12))
     monkeypatch.setattr(
         diagnostics,
-        "_aligned_metadata",
-        lambda _store, _indices, column, **_: (
-            values % 2 if column == "qc_code" else values
-        ),
+        "read_marked_metadata_rows",
+        lambda _cells, column, _rows: values % 2 if column == "qc_code" else values,
     )
     support: dict[str, object] = {}
     scores = diagnostics._covariate_associations(
-        None,
+        SimpleNamespace(cells=None),
         None,
         coordinates,
         ["age", "technical_age", "qc_code"],
@@ -724,10 +722,12 @@ def test_pca_numeric_association_uses_complete_rows_without_loading_coordinates(
 
     values = np.asarray([0.0, 1.0, np.nan, 3.0, np.inf])
     monkeypatch.setattr(diagnostics, "_selection_indices", lambda *_: np.arange(5))
-    monkeypatch.setattr(diagnostics, "_aligned_metadata", lambda *_, **__: values)
+    monkeypatch.setattr(
+        diagnostics, "read_marked_metadata_rows", lambda *_, **__: values
+    )
     support: dict[str, object] = {}
     scores = diagnostics._covariate_associations(
-        None,
+        SimpleNamespace(cells=None),
         None,
         BoundedCoordinates(),
         ["age"],

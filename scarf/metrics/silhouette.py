@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
 
+from ..metadata.rows import metadata_missing_mask, read_array_rows_chunkwise
 from ..utils.logging import logger
 from ..utils.progress import iter_progress
 from ._rows import read_matrix_rows
@@ -95,6 +96,10 @@ def silhouette_scoring(
         np.ndarray | None: Array of silhouette scores for each cluster,
         or None if cluster labels are not found
 
+    Raises:
+        ValueError: If a selected cell has a missing cluster label, either a
+            null value or a row that the column's linked missing mask flags.
+
     Notes:
         Scores are calculated using a sampling approach for efficiency.
         NaN values indicate clusters that couldn't be scored due to size constraints.
@@ -115,8 +120,15 @@ def silhouette_scoring(
         return None
 
     categorical = pd.Categorical(raw_clusters)
-    if np.any(categorical.codes < 0):
-        raise ValueError(f"Cluster column {cluster_column!r} contains missing values")
+    mask = metadata_missing_mask(ds.cells, cluster_column)
+    if np.any(categorical.codes < 0) or (
+        mask is not None
+        and read_array_rows_chunkwise(mask, ds.cells.active_index(cell_key)).any()
+    ):
+        raise ValueError(
+            f"Cluster column {cluster_column!r} contains missing values. Use a "
+            "cell_key that selects only labelled cells"
+        )
     clusters = np.asarray(categorical.codes, dtype=np.int64)
     if hvg_data.shape[0] != len(clusters):
         raise ValueError(

@@ -12,7 +12,6 @@ from ...metadata.artifacts import (
     plan_cell_data_artifact,
     write_cell_data_artifact,
 )
-from ...metadata.rows import read_metadata_rows_chunkwise
 from ...metadata.selection import NamedCellArtifact, resolve_cell_aligned_artifact
 from ...storage.artifacts import canonical_bytes, fingerprint_array, fingerprint_strings
 from ...storage.refs import ArtifactRef
@@ -22,6 +21,7 @@ from ...storage.selections import (
     resolve_generated_selection_artifact,
 )
 from ...utils.logging import logger
+from ..tools import mark_missing_rows, read_marked_metadata_rows
 from .profiles import (
     REGISTERED_CELL_QC_PROFILES,
     AutoFilterAction,
@@ -36,18 +36,15 @@ from .profiles import (
 class _MetricErrors:
     """Messages one executor reports for metric vectors it cannot use."""
 
-    misaligned_metadata: str
     nonfinite_metadata: str
     nonfinite_artifact: str
 
 
 _REGISTERED_METRIC_ERRORS = _MetricErrors(
-    misaligned_metadata="QC metadata column {name!r} does not align with cell_selection",
     nonfinite_metadata="QC values in {name!r} contain non-finite entries",
     nonfinite_artifact="QC artifact values in {name!r} contain non-finite entries",
 )
 _AUTO_METRIC_ERRORS = _MetricErrors(
-    misaligned_metadata="QC metadata column {name!r} is not a finite aligned vector",
     nonfinite_metadata="QC metadata column {name!r} is not a finite aligned vector",
     nonfinite_artifact="QC artifact {name!r} is not a finite aligned vector",
 )
@@ -115,16 +112,18 @@ def _metric_values(
     prior: ArtifactRef,
     errors: _MetricErrors,
 ) -> tuple[dict[str, np.ndarray], dict[str, str]]:
-    """Read finite metric vectors and metadata fingerprints on the active cells."""
+    """Read finite metric vectors and metadata fingerprints on the active cells.
+
+    Rows flagged by a linked missing mask read as NaN, exactly as the QC
+    evidence reads them, so they fail the finiteness check.
+    """
     values_by_name: dict[str, np.ndarray] = {}
     metadata_fingerprints: dict[str, str] = {}
     for attr in attrs:
         values = np.asarray(
-            read_metadata_rows_chunkwise(store.cells, attr, active_idx),
+            read_marked_metadata_rows(store.cells, attr, active_idx),
             dtype=float,
         )
-        if values.shape != (len(active_idx),):
-            raise ValueError(errors.misaligned_metadata.format(name=attr))
         if not np.isfinite(values).all():
             raise ValueError(errors.nonfinite_metadata.format(name=attr))
         values_by_name[attr] = values
@@ -141,7 +140,10 @@ def _metric_values(
             expected_kind="quality_metric",
         )
         # Resolution returns exactly one value per cell of ``prior``.
-        values = np.asarray(resolved.values, dtype=float)
+        values = np.asarray(
+            mark_missing_rows(resolved.values, resolved.missing_mask),
+            dtype=float,
+        )
         if not np.isfinite(values).all():
             raise ValueError(errors.nonfinite_artifact.format(name=source.name))
         values_by_name[execution_source.name] = values
@@ -286,8 +288,10 @@ def execute_registered_cell_qc(
     sample_labels: np.ndarray | None = None
     sample_inputs: dict[str, Any] = {}
     if sample_column is not None:
-        sample_labels = np.asarray(
-            read_metadata_rows_chunkwise(store.cells, sample_column, active_idx)
+        sample_labels = read_marked_metadata_rows(
+            store.cells,
+            sample_column,
+            active_idx,
         )
         sample_inputs["capture_assignments_fingerprint"] = fingerprint_strings(
             sample_labels
@@ -299,7 +303,10 @@ def execute_registered_cell_qc(
             cell_selection=prior,
             expected_kind="hto_identity",
         )
-        sample_labels = np.asarray(resolved_sample.values)
+        sample_labels = mark_missing_rows(
+            resolved_sample.values,
+            resolved_sample.missing_mask,
+        )
         sample_inputs["capture_artifact"] = resolved_sample_artifact.artifact
 
     projection = project_registered_qc_profile(
@@ -537,12 +544,10 @@ def execute_auto_cell_qc(
     core_sample_artifact = resolved_sample_artifact
     if action == "sampleMad":
         if sample_column is not None:
-            projection_labels = np.asarray(
-                read_metadata_rows_chunkwise(
-                    store.cells,
-                    sample_column,
-                    active_idx,
-                )
+            projection_labels = read_marked_metadata_rows(
+                store.cells,
+                sample_column,
+                active_idx,
             )
             grouping_source = {
                 "source": "metadataColumn",
@@ -557,14 +562,19 @@ def execute_auto_cell_qc(
                 cell_selection=prior,
                 expected_kind="hto_identity",
             )
-            projection_labels = np.asarray(resolved.values)
+            projection_labels = mark_missing_rows(
+                resolved.values,
+                resolved.missing_mask,
+            )
             grouping_source = {
                 "source": "artifact",
                 "artifact": resolved_sample_artifact.artifact,
             }
     elif capture_column is not None:
-        projection_labels = np.asarray(
-            read_metadata_rows_chunkwise(store.cells, capture_column, active_idx)
+        projection_labels = read_marked_metadata_rows(
+            store.cells,
+            capture_column,
+            active_idx,
         )
         grouping_source = {
             "source": "metadataColumn",
@@ -578,7 +588,10 @@ def execute_auto_cell_qc(
             cell_selection=prior,
             expected_kind="hto_identity",
         )
-        projection_labels = np.asarray(resolved.values)
+        projection_labels = mark_missing_rows(
+            resolved.values,
+            resolved.missing_mask,
+        )
         grouping_source = {
             "source": "artifact",
             "artifact": resolved_capture_artifact.artifact,

@@ -176,6 +176,37 @@ def test_to_anndata_exports_empty_raw_cell_selection(export_store) -> None:
     assert subset.shape == (0, 2)
 
 
+def test_live_exports_write_masked_metadata_as_missing(export_store, tmp_path) -> None:
+    anndata = pytest.importorskip("anndata")
+    from scarf.writers import to_h5ad
+    from tests.test_pipeline import _insert_nullable_cell_column
+
+    n_cells = export_store.cells.N
+    missing = np.arange(n_cells) % 3 == 1
+    columns = {
+        "donor": np.where(missing, 0, np.arange(n_cells) % 2 + 1).astype(np.int64),
+        "site": np.where(missing, "", np.where(np.arange(n_cells) % 2, "A", "B")),
+        "flag": np.where(missing, False, np.arange(n_cells) % 2 == 0),
+    }
+    for name, values in columns.items():
+        _insert_nullable_cell_column(export_store, name, values, missing)
+    active = export_store.cells.active_index("I")
+    path = tmp_path / "live.h5ad"
+    to_h5ad(export_store.RNA, str(path))
+
+    for obs, rows in (
+        (export_store.to_anndata().obs, active),
+        (anndata.read_h5ad(path).obs, np.arange(n_cells)),
+    ):
+        for name, values in columns.items():
+            present = ~missing[rows]
+            np.testing.assert_array_equal(obs[name].isna().to_numpy(), ~present)
+            assert obs[name].to_numpy()[present].tolist() == (
+                values[rows][present].tolist()
+            )
+    assert anndata.read_h5ad(path).obs["flag"].dtype == "boolean"
+
+
 def test_raw_feature_subset_matches_full_raw_columns(export_store) -> None:
     cell_indexes = export_store.cells.active_index("I")
     full = export_store.RNA.to_raw_sparse("I")

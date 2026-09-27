@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from ..utils.arrays import regex_match_mask
+from .rows import apply_missing_mask, metadata_missing_mask
 
 
 class _QueryableMetaData(Protocol):
@@ -76,10 +77,35 @@ def multi_sift(
     )
 
 
+def missing_frame_values(values: np.ndarray, missing: np.ndarray | None) -> Any:
+    """Return one table column whose masked rows are pandas missing values.
+
+    Masked numeric and text rows follow :func:`apply_missing_mask`. Boolean
+    columns with masked rows become a nullable boolean array.
+    """
+    array = np.asarray(values)
+    if missing is None or not np.any(missing) or array.dtype.kind != "b":
+        return apply_missing_mask(array, missing)
+    return pd.arrays.BooleanArray(array, np.asarray(missing, dtype=bool))
+
+
+def _frame_column(
+    metadata: _QueryableMetaData,
+    column: str,
+    stop: int | None = None,
+) -> Any:
+    values = metadata.fetch_all(column)[:stop]
+    mask = metadata_missing_mask(metadata, column)
+    return missing_frame_values(values, None if mask is None else mask[:stop])
+
+
 def head(metadata: _QueryableMetaData, n: int = 5) -> pd.DataFrame:
-    """Return the first rows of every metadata column."""
+    """Return the first rows of every metadata column.
+
+    Rows that a column's linked missing mask flags are shown as missing.
+    """
     return pd.DataFrame(
-        {column: metadata.fetch_all(column)[:n] for column in metadata.columns}
+        {column: _frame_column(metadata, column, n) for column in metadata.columns}
     )
 
 
@@ -88,11 +114,14 @@ def to_pandas_dataframe(
     columns: list[str],
     key: str | None = None,
 ) -> pd.DataFrame:
-    """Return requested metadata columns as a pandas DataFrame."""
+    """Return requested metadata columns as a pandas DataFrame.
+
+    Rows that a column's linked missing mask flags are shown as missing.
+    """
     valid_columns = metadata.columns
     frame = pd.DataFrame(
         {
-            column: metadata.fetch_all(column)
+            column: _frame_column(metadata, column)
             for column in columns
             if column in valid_columns
         }

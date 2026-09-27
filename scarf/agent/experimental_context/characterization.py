@@ -16,18 +16,14 @@ from ...metadata.queries import (
     columns_same_partition,
     reduce_observation_units,
 )
-from ...metadata.rows import (
-    MetaDataRowBlock,
-    read_metadata_missing_rows_chunkwise,
-    read_metadata_rows_chunkwise,
-)
+from ...metadata.rows import MetaDataRowBlock
 from ...metadata.selection import resolve_cell_aligned_artifact
 from ...metrics.association import directional_mapping, report_confounding
 from ...storage.artifacts import fingerprint_array
 from ...storage.refs import ArtifactRef
 from ...storage.selections import read_stored_selection_indices
 from ..decisions.selection import DecisionValidationError, decide
-from ..tools import artifact_reference
+from ..tools import artifact_reference, mark_missing_rows, read_marked_metadata_rows
 from ..types import Decision, EvidenceItem
 from .contracts import CovariateCharacterization
 
@@ -203,7 +199,10 @@ class _SelectionBoundCells:
                 artifact,
                 cell_selection=selection,
             )
-            self._artifact_values[name] = resolved.values
+            self._artifact_values[name] = mark_missing_rows(
+                resolved.values,
+                resolved.missing_mask,
+            )
 
     @property
     def columns(self) -> list[str]:
@@ -238,21 +237,7 @@ class _SelectionBoundCells:
                     "Artifact covariate rows do not align with the stored selection"
                 )
             return artifact_values[positions]
-        values = read_metadata_rows_chunkwise(self._source, column, indices)
-        missing = read_metadata_missing_rows_chunkwise(
-            self._source,
-            column,
-            indices,
-        )
-        if missing is None or not np.any(missing):
-            return values
-        if values.dtype.kind == "f":
-            output = values.astype(np.float64, copy=True)
-            output[missing] = np.nan
-            return output
-        output = values.astype(object, copy=True)
-        output[missing] = None
-        return output
+        return read_marked_metadata_rows(self._source, column, indices)
 
     def iter_row_blocks(
         self,

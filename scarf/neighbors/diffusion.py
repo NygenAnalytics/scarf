@@ -1,6 +1,6 @@
 import numpy as np
 from numba import njit
-from scipy.sparse import coo_matrix, csr_matrix
+from scipy.sparse import csr_matrix
 
 _INT32_MAX = int(np.iinfo(np.int32).max)
 _FLOAT64_SIZE = int(np.dtype(np.float64).itemsize)
@@ -19,10 +19,14 @@ def _inverse_degree_diagonal(graph: csr_matrix) -> csr_matrix:
     )
 
 
-def diffusion_operator(graph: csr_matrix, power: int) -> coo_matrix:
-    """Construct a powered row-normalized graph diffusion operator."""
-    diagonal = _inverse_degree_diagonal(graph)
-    return diagonal.dot(graph).__pow__(power).tocoo()
+def transition_matrix(graph: csr_matrix) -> csr_matrix:
+    """Return the row-normalized graph, one step of graph diffusion.
+
+    Each row with edges sums to one and rows without edges stay empty. The
+    result has the entries of ``graph``, so it needs about as much memory as
+    the graph itself.
+    """
+    return _inverse_degree_diagonal(graph).dot(graph)
 
 
 @njit(cache=True)
@@ -98,9 +102,10 @@ def bounded_diffusion_operator(
     *,
     memory_bytes: int,
 ) -> csr_matrix:
-    """Return ``diffusion_operator(graph, power)`` in CSR form within a budget.
+    """Return ``transition_matrix(graph)`` raised to ``power`` within a budget.
 
-    The same sparse products are formed, so the values are equal. Before each
+    The products mirror ``scipy.sparse.linalg.matrix_power``, so the entries
+    and their storage order are those of the unbounded power. Before each
     product, its output entries and the operands still held, including
     ``graph``, are checked against ``memory_bytes``, and ``MemoryError`` is
     raised before a product that does not fit is allocated.
@@ -146,8 +151,8 @@ def bounded_diffusion_operator(
 
     diagonal = _inverse_degree_diagonal(graph)
     reserve(diagonal, graph, (diagonal,))
-    transition = diagonal.dot(graph)
     del diagonal
+    transition = transition_matrix(graph)
 
     def raised(exponent: int) -> csr_matrix:
         # Mirror scipy.sparse.linalg.matrix_power so values match exactly.

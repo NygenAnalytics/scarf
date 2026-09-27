@@ -122,6 +122,25 @@ def test_subset_tfidf_and_feature_summary_match_reference(atac_tfidf_store):
     assert not any(name.startswith("summary_stats_") for name in assay.z)
 
 
+def test_normed_leaves_no_fitted_state_on_the_assay(atac_tfidf_store):
+    store, counts = atac_tfidf_store
+    assay = store.ATAC
+    cell_idx = np.array([0, 2, 3])
+    feat_idx = np.array([1, 2])
+    expected, expected_df = _reference_tfidf(counts, cell_idx, feat_idx)
+
+    _, (terms, n_docs, document_frequency) = assay._fit_tf_idf(cell_idx, feat_idx)
+    observed = assay.normed(cell_idx, feat_idx).compute()
+
+    np.testing.assert_array_equal(terms, counts.sum(axis=1)[cell_idx])
+    assert n_docs == len(cell_idx)
+    np.testing.assert_array_equal(document_frequency, expected_df)
+    np.testing.assert_allclose(observed, expected, rtol=1e-12, atol=1e-12)
+    assert assay.n_term_per_doc is None
+    assert assay.n_docs is None
+    assert assay.n_docs_per_term is None
+
+
 def test_subset_renormalization_uses_only_selected_peak_counts(atac_tfidf_store):
     store, counts = atac_tfidf_store
     assay = store.ATAC
@@ -270,11 +289,10 @@ def test_document_frequency_is_feature_subset_invariant(atac_tfidf_store):
     all_features = np.arange(counts.shape[1], dtype=np.int64)
     selected_features = np.array([3, 1], dtype=np.int64)
 
-    assay.normed(cell_idx, all_features)
-    all_df = np.asarray(assay.n_docs_per_term).copy()
-    assay.normed(cell_idx, selected_features)
+    _, (_, _, all_df) = assay._fit_tf_idf(cell_idx, all_features)
+    _, (_, _, selected_df) = assay._fit_tf_idf(cell_idx, selected_features)
 
-    np.testing.assert_array_equal(assay.n_docs_per_term, all_df[selected_features])
+    np.testing.assert_array_equal(selected_df, all_df[selected_features])
 
 
 def _count_document_frequency_passes(monkeypatch) -> Callable[[], int]:
@@ -315,9 +333,10 @@ def test_normed_respects_arbitrary_cell_order(atac_tfidf_store):
     expected, expected_df = _reference_tfidf(counts, cell_idx, feat_idx)
 
     observed = controlled_compute(assay.normed(cell_idx, feat_idx), assay.nthreads)
+    _, (_, _, document_frequency) = assay._fit_tf_idf(cell_idx, feat_idx)
 
     np.testing.assert_allclose(observed, expected, rtol=1e-12, atol=1e-12)
-    np.testing.assert_array_equal(assay.n_docs_per_term, expected_df)
+    np.testing.assert_array_equal(document_frequency, expected_df)
 
 
 def test_fused_stats_accumulate_across_stream_blocks(atac_tfidf_store):
@@ -387,10 +406,12 @@ def test_custom_normalizer_skips_document_frequency_pass(
 
     monkeypatch.setattr(ChunkedArray, "count_nonzero", fail_count_nonzero)
     feat_idx = np.arange(assay.feats.N, dtype=np.int64)
-    assay.normed(store.cells.active_index("subset"), feat_idx)
+    cell_idx = store.cells.active_index("subset")
+    assay.normed(cell_idx, feat_idx)
+    _, (_, _, document_frequency) = assay._fit_tf_idf(cell_idx, feat_idx)
 
     np.testing.assert_array_equal(
-        assay.n_docs_per_term,
+        document_frequency,
         assay.feats.fetch_all("nCells")[feat_idx],
     )
 
@@ -418,14 +439,14 @@ def test_empty_cell_selection_is_shape_safe(atac_tfidf_store):
     assay = store.ATAC
     feat_idx = np.array([0, 1], dtype=np.int64)
 
-    values = controlled_compute(
-        assay.normed(np.array([], dtype=np.int64), feat_idx),
-        assay.nthreads,
-    )
+    no_cells = np.array([], dtype=np.int64)
+    values = controlled_compute(assay.normed(no_cells, feat_idx), assay.nthreads)
+    _, (_, n_docs, document_frequency) = assay._fit_tf_idf(no_cells, feat_idx)
 
     assert values.shape == (0, len(feat_idx))
+    assert n_docs == 0
     np.testing.assert_array_equal(
-        assay.n_docs_per_term,
+        document_frequency,
         np.zeros(len(feat_idx), dtype=np.int64),
     )
 

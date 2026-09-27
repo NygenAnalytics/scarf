@@ -221,8 +221,19 @@ The complete hard-break inventory is:
   over masked columns remain valid artifacts and must be recomputed.
 - Cell-aligned artifact readers carry the linked missing mask. `select_cells`, groupings used by
   statistical testing and distribution plots, and integration metrics exclude or reject missing
-  labels, and `run_doublet_detection` rejects clusterings with missing labels. These readers and
-  pipeline filtering accept only the canonical `__scarf_missing__<name>` mask link.
+  labels, and `run_doublet_detection` rejects clusterings with missing labels. These readers,
+  trajectory cell-data inputs, and pipeline filtering accept only the canonical
+  `__scarf_missing__<name>` mask link.
+- Readers show rows that a linked missing mask flags as missing. `MetaData.to_pandas_dataframe`
+  and `head`, `get_cell_vals`, live `to_anndata` and `to_h5ad`, and plots show them as missing:
+  numeric values become float64 NaN, and in H5AD files booleans become nullable booleans and text
+  gets a missing category. `MetaData.fetch` and `fetch_all` stay raw. `make_bulk` leaves masked
+  cells out of every group, dot and matrix plots report `dropped_group_cells`, and
+  `cluster_connectivity` rejects masked inputs.
+- `run_marker_search`, `calc_membership_strength`, `smart_label`, `get_imputed` of a metadata
+  column, and `silhouette_scoring` of a metadata column reject masked inputs before any reuse or
+  write, so results from unmasked inputs keep their identities. `calc_membership_strength` and
+  `smart_label` accept only categorical label kinds.
 - Query projections record the input `query_dataset_fingerprint`, which replaces
   `selected_expression_fingerprint`. A query cell with no counts in any shared reference feature
   is uninformative. The diagnostic `zeroNormCellCount` is renamed `uninformativeCellCount`, and
@@ -259,6 +270,14 @@ The complete hard-break inventory is:
   compares rows as given.
 - `run_fate_mapping` treats `solver_tol` as an absolute bound on the largest Bellman residual of
   each solved sink column. Existing fate artifacts remain valid and are reused.
+- `scarf.neighbors.diffusion_operator` is removed; it formed a powered operator with no memory
+  bound. `bounded_diffusion_operator` is the only powered builder, and
+  `neighbors.diffusion.transition_matrix` returns the graph-sized single step. Doublet scores and
+  every diffusion and pipeline artifact identity are unchanged.
+- Assays are no longer `DataStore` instance attributes. `ds.<name>` resolves an assay only when no
+  `DataStore` attribute has that name and the name does not start with an underscore;
+  `get_assay(name)` returns any assay. Assays named like members, such as `cells` or
+  `zarr_mode`, no longer break opening or replace the member.
 - Producers that cannot reuse a saved result raise `PermissionError` before computing on a
   read-only store. This covers statistical testing, enrichment, feature percentages, HTO
   demultiplexing, doublet detection, and `set_default_assay`.
@@ -278,9 +297,16 @@ The complete hard-break inventory is:
   every pipeline artifact identity are unchanged. Grouped ADT assays built from narrow counts
   must be rebuilt.
 - RNA `normed` without subset renormalization maps a zero library total to 1, so zero-count cells
-  normalize to 0 instead of NaN. Normalizations written earlier with `renormalize_subset=False`
-  over selections that contain zero-count cells keep their identity and their NaN rows; PCA rejects
-  them, and `invalidate_cache=True` recomputes them.
+  normalize to 0 instead of NaN. `run_normalization` records `zero_total_divisor="one"` for RNA
+  with `renormalize_subset=False` when the selection contains a zero-count cell, so normalizations
+  written earlier with NaN rows are not reused. Other normalization identities and every pipeline
+  artifact identity are unchanged. Grouped RNA assays built earlier hold NaN for zero-count cells
+  and must be rebuilt.
+- ATAC `normed` no longer leaves its fitted TF-IDF state (`n_term_per_doc`, `n_docs`,
+  `n_docs_per_term`) on the assay after the call, and RNA `normed` never changes `normMethod`.
+  A `DataStore` is not designed for concurrent use from several threads.
+- float16 is not a count storage dtype. Count writers reject it, and H5AD and Loom imports read
+  float16 sources as float32.
 - Operations trust that prepared counts and artifacts do not change during a call. Writing to
   prepared data in place is outside the contract and is not detected.
 

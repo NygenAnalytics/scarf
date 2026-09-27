@@ -5,7 +5,11 @@ from typing import Any
 
 import numpy as np
 
-from ..metadata.rows import metadata_missing_mask, read_array_rows_chunkwise
+from ..metadata.rows import (
+    apply_missing_mask,
+    metadata_missing_mask,
+    read_array_rows_chunkwise,
+)
 from ._deps import require_matplotlib
 from ._style import continuous_norm, square_axis_limits
 
@@ -21,26 +25,6 @@ class RasterCanvas:
     vmax: float
     n_cells: int
     n_blocks: int
-
-
-def _apply_raster_missing_mask(
-    values: np.ndarray,
-    missing: np.ndarray | None,
-) -> np.ndarray:
-    """Replace nullable metadata fill values with raster-safe missing values."""
-    if missing is None or not np.any(missing):
-        return values
-    if values.dtype.kind == "b":
-        output = values.copy()
-        output[missing] = False
-        return output
-    if values.dtype.kind in {"f", "i", "u"}:
-        output = values.astype(np.float64, copy=True)
-        output[missing] = np.nan
-        return output
-    output = values.astype(object, copy=True)
-    output[missing] = None
-    return output
 
 
 class _MissingMaskRows:
@@ -68,7 +52,7 @@ def _raster_block_values(
 ) -> np.ndarray:
     values = np.asarray(block.values[key])
     missing = missing_masks.read(key, block.active_global_indices)
-    return _apply_raster_missing_mask(values, missing)
+    return apply_missing_mask(values, missing)
 
 
 def density_canvas_from_points(

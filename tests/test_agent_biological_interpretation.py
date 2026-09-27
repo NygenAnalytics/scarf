@@ -207,9 +207,11 @@ class FakeStore:
             inputs = {}
         return SimpleNamespace(exists=True, complete=True, inputs=inputs)
 
-    def load_artifact(self, artifact: object) -> dict[str, np.ndarray]:
+    def load_artifact(self, artifact: object) -> zarr.Group:
         assert artifact == self.cluster
-        return {"values": self.cells.cluster_values}
+        group = zarr.open_group(store=MemoryStore(), mode="w")
+        group.create_array("values", data=self.cells.cluster_values)
+        return group
 
 
 def artifact_model(ref: ArtifactRef) -> ArtifactReferenceModel:
@@ -1206,6 +1208,27 @@ def test_cluster_composition_artifact_validation_edges(
     )
     with pytest.raises(ValueError, match="selects no cells"):
         run(context(store).deps)
+
+
+@pytest.mark.parametrize("flagged", [False, True])
+def test_composition_rejects_masked_cluster_labels(
+    monkeypatch: pytest.MonkeyPatch, flagged: bool
+) -> None:
+    store = FakeStore()
+    group = store.load_artifact(store.cluster)
+    missing = np.zeros(len(store.cells.cluster_values), dtype=bool)
+    missing[0] = flagged
+    group.create_array("__scarf_missing__values", data=missing)
+    group["values"].attrs["missing_mask"] = "__scarf_missing__values"
+    monkeypatch.setattr(store, "load_artifact", lambda _ref: group)
+
+    if not flagged:
+        result = asyncio.run(inspect_cluster_composition(context(store)))
+        assert result.totalCells == len(store.cells.cluster_values)
+        return
+    # A placeholder label would otherwise join a real cluster.
+    with pytest.raises(ValueError, match="contains missing cluster labels"):
+        asyncio.run(inspect_cluster_composition(context(store)))
 
 
 def test_cluster_composition_metadata_alignment_edges(

@@ -2,7 +2,6 @@ from importlib import import_module as _import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .diffusion import diffusion_operator as diffusion_operator
     from .graph import (
         calc_snn as calc_snn,
         merge_graphs as merge_graphs,
@@ -17,7 +16,6 @@ if TYPE_CHECKING:
 
 __all__ = [
     "calc_snn",
-    "diffusion_operator",
     "fix_knn_query",
     "instantiate_knn_index",
     "merge_graphs",
@@ -28,7 +26,6 @@ __all__ = [
 
 _LAZY_EXPORTS = {
     "calc_snn": (".graph", "calc_snn"),
-    "diffusion_operator": (".diffusion", "diffusion_operator"),
     "fix_knn_query": (".index", "fix_knn_query"),
     "instantiate_knn_index": (".index", "instantiate_knn_index"),
     "merge_graphs": (".graph", "merge_graphs"),

@@ -416,6 +416,48 @@ def _tfidf_group_means(counts: np.ndarray, groups: list[np.ndarray]) -> np.ndarr
     return np.column_stack([normalized[:, group].mean(axis=1) for group in groups])
 
 
+def test_rna_grouped_means_read_totals_once_across_bands(tmp_path, monkeypatch):
+    from scarf.assay import RNAassay
+
+    counts = _counts(n_features=12)
+    counts[5] = 0
+    store = _write_store(tmp_path / "rna.zarr", counts)
+    groups = [np.array([0, 3, 7]), np.array([1, 2]), np.array([4, 5, 6, 8, 9, 11])]
+    cells = np.arange(store.cells.N)
+    whole = np.vstack(list(store.RNA._iter_feature_group_means(cells, groups)))
+    keyed = {str(index): group for index, group in enumerate(groups)}
+    per_band = np.vstack(
+        [
+            np.column_stack(
+                list(
+                    store.RNA._mean_normed_feature_groups(
+                        cells[start : start + 7], keyed
+                    ).values()
+                )
+            )
+            for start in range(0, len(cells), 7)
+        ]
+    )
+    reads: list[int] = []
+    original = RNAassay._cell_count_totals
+
+    def counted(self: RNAassay, cell_idx: np.ndarray) -> np.ndarray:
+        reads.append(len(cell_idx))
+        return original(self, cell_idx)
+
+    monkeypatch.setattr(RNAassay, "_cell_count_totals", counted)
+    banded = np.vstack(
+        list(store.RNA._iter_feature_group_means(cells, groups, block_rows=7))
+    )
+
+    assert reads == [len(cells)]
+    np.testing.assert_array_equal(banded, whole)
+    np.testing.assert_array_equal(banded, per_band)
+    np.testing.assert_allclose(
+        whole, _lib_size_group_means(counts, groups, store.RNA.sf)
+    )
+
+
 @pytest.mark.parametrize("block_rows", [1, 7])
 def test_rna_grouped_means_honor_a_different_normalizer(
     tmp_path, monkeypatch, block_rows

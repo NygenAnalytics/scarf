@@ -40,7 +40,9 @@ class ATACassay(Assay):
             normMethod: Pointer to the function to be used for normalization of the raw data
             n_term_per_doc: Number of features per cell. Used for TF-IDF normalization
             n_docs: Number of cells. Used for TF-IDF normalization
-            n_docs_per_term: Number of cells per feature. Used for TF-IDF normalization
+            n_docs_per_term: Number of cells per feature. Used for TF-IDF normalization.
+                ``normed`` sets these three only while it calls ``normMethod``
+                and then restores them.
         """
         super().__init__(
             z=z,
@@ -80,6 +82,30 @@ class ATACassay(Assay):
 
         Returns: A chunked array (delayed matrix) containing normalized data.
         """
+        counts, state = self._fit_tf_idf(cell_idx, feat_idx, **kwargs)
+        # The method reads the fitted state from these attributes while it
+        # builds the lazy result, so concurrent calls must not interleave here.
+        with self._normalization_lock:
+            previous = (self.n_term_per_doc, self.n_docs, self.n_docs_per_term)
+            self.n_term_per_doc, self.n_docs, self.n_docs_per_term = state
+            try:
+                return self.normMethod(self, counts)
+            finally:
+                self.n_term_per_doc, self.n_docs, self.n_docs_per_term = previous
+
+    def _fit_tf_idf(
+        self,
+        cell_idx: np.ndarray | None = None,
+        feat_idx: np.ndarray | None = None,
+        **kwargs: Any,
+    ) -> tuple[ChunkedArray, tuple[np.ndarray, int, np.ndarray]]:
+        """Return the selected counts and the TF-IDF state fitted on them.
+
+        Arguments are those of ``normed``. The state holds each cell's
+        term-frequency denominator, the number of cells, and each feature's
+        document frequency, which ``normed`` hands to the normalization method
+        as ``n_term_per_doc``, ``n_docs``, and ``n_docs_per_term``.
+        """
         from ..storage.identity import read_dataset_fingerprint
 
         read_dataset_fingerprint(self.z)
@@ -98,24 +124,25 @@ class ATACassay(Assay):
         cell_idx = np.asarray(cell_idx, dtype=np.int64)
         feat_idx = np.asarray(feat_idx, dtype=np.int64)
         counts: ChunkedArray = self.rawData[:, feat_idx][cell_idx, :]
-        self.n_term_per_doc = self._terms_per_document(
+        n_term_per_doc = self._terms_per_document(
             cell_idx,
             counts=counts,
             renormalize_subset=bool(renormalize_subset),
         )
-        self.n_docs = len(cell_idx)
+        n_docs = len(cell_idx)
         if self.normMethod is not norm_tf_idf:
-            self.n_docs_per_term = self.feats.fetch_all("nCells")[feat_idx]
-        elif self.n_docs == 0:
-            self.n_docs_per_term = np.zeros(len(feat_idx), dtype=np.int64)
+            n_docs_per_term = self.feats.fetch_all("nCells")[feat_idx]
+        elif n_docs == 0:
+            n_docs_per_term = np.zeros(len(feat_idx), dtype=np.int64)
         else:
-            document_frequency = compute_with_progress(
-                counts.count_nonzero(axis=0),
-                f"({self.name}) Computing document frequency across selected cells",
-                self.nthreads,
+            n_docs_per_term = np.asarray(
+                compute_with_progress(
+                    counts.count_nonzero(axis=0),
+                    f"({self.name}) Computing document frequency across selected cells",
+                    self.nthreads,
+                )
             )
-            self.n_docs_per_term = np.asarray(document_frequency)
-        return self.normMethod(self, counts)
+        return counts, (n_term_per_doc, n_docs, n_docs_per_term)
 
     def _terms_per_document(
         self,

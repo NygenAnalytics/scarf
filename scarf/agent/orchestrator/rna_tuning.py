@@ -12,7 +12,6 @@ import pandas as pd
 from pydantic import Field, create_model, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
-from ...metadata.rows import read_metadata_rows_chunkwise
 from ...storage.refs import ArtifactRef
 from ...storage.selections import (
     read_stored_selection_indices,
@@ -75,7 +74,7 @@ from ..parameter_tuning.selection import (
     finalize_parameter_tuning_selection,
     harmony_acceptance_gate,
 )
-from ..tools import label_filter_bound
+from ..tools import label_filter_bound, read_marked_metadata_rows
 from ..types import AgentDataModel, ArtifactReferenceModel
 from . import journal
 from .budget import CandidateBudget, CandidateBudgetExceeded, candidate_identity
@@ -342,6 +341,12 @@ def uniform_screening_selection(
     return selection
 
 
+def _recorded_label_counts(cells: Any, column: str) -> tuple[np.ndarray, np.ndarray]:
+    """Count each recorded label; missing labels never form a group."""
+    labels = cells.fetch(column)
+    return np.unique(labels[~pd.isna(labels)], return_counts=True)
+
+
 def screening_coverage(
     store: Any,
     parent: ArtifactRef,
@@ -369,15 +374,13 @@ def screening_coverage(
         "groups": {},
     }
     concerns: list[str] = []
-    grouped = {}
-    for column in dict.fromkeys(columns):
-        full = np.asarray(
-            read_metadata_rows_chunkwise(store.cells, column, full_indices)
-        ).astype(str)
-        sampled = np.asarray(
-            read_metadata_rows_chunkwise(store.cells, column, sample_indices)
-        ).astype(str)
-        grouped[column] = (full, sampled)
+    grouped = {
+        column: (
+            read_marked_metadata_rows(store.cells, column, full_indices),
+            read_marked_metadata_rows(store.cells, column, sample_indices),
+        )
+        for column in dict.fromkeys(columns)
+    }
     if combinations:
         from ..experimental_context.characterization import _SelectionBoundCells
         from ..experimental_context.comparisons import combination_labels
@@ -391,8 +394,12 @@ def screening_coverage(
                 combination_labels(sample_cells, group_columns),
             )
     for column, (full, sampled) in grouped.items():
-        values, counts = np.unique(full, return_counts=True)
-        sample_values, sample_counts = np.unique(sampled, return_counts=True)
+        # Missing labels never form a group; fractions keep every selected cell.
+        values, counts = np.unique(full[~pd.isna(full)].astype(str), return_counts=True)
+        sample_values, sample_counts = np.unique(
+            sampled[~pd.isna(sampled)].astype(str),
+            return_counts=True,
+        )
         lookup = dict(zip(sample_values, sample_counts, strict=True))
         rows = []
         for value, count in zip(values, counts, strict=True):
@@ -1000,10 +1007,7 @@ class RnaTuningRun:
         from ..experimental_context.characterization import _SelectionBoundCells
 
         cells = _SelectionBoundCells(self.store.zw, self.store.cells, self.cells)
-        labels = cells.fetch(column)
-        # Missing labels are returned as None or NaN and never form a batch.
-        recorded = ~pd.isna(labels)
-        values, counts = np.unique(labels[recorded], return_counts=True)
+        values, counts = _recorded_label_counts(cells, column)
         groups = []
         for value, n_cells in zip(values, counts, strict=True):
             if n_cells < 20:
@@ -1365,23 +1369,21 @@ class RnaTuningRun:
         )
         ranking = None
         ranking_groups = {}
-        indices: np.ndarray | None = None
+        bound_cells: Any = None
         for column in columns:
             if self.study.columnKinds.get(column) == "continuous":
                 continue
-            if indices is None:
-                indices = read_stored_selection_indices(
-                    self.store.zw,
-                    self.cells,
-                    kind="cell_selection",
-                    scope="datastore",
-                    assay=None,
-                    table_path="cellData",
+            if bound_cells is None:
+                from ..experimental_context.characterization import (
+                    _SelectionBoundCells,
                 )
-            group_values = read_metadata_rows_chunkwise(
-                self.store.cells, column, indices
-            )
-            _, counts = np.unique(group_values, return_counts=True)
+
+                bound_cells = _SelectionBoundCells(
+                    self.store.zw,
+                    self.store.cells,
+                    self.cells,
+                )
+            _, counts = _recorded_label_counts(bound_cells, column)
             ranking_groups[column] = int((counts >= 20).sum())
             if int((counts >= 20).sum()) >= 2:
                 ranking = {

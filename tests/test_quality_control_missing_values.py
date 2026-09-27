@@ -425,6 +425,81 @@ def test_doublet_detection_rejects_missing_cluster_labels(tmp_path) -> None:
     assert store.list_artifacts(kind="doublet_score") == []
 
 
+def test_label_producers_reject_missing_cluster_labels(tmp_path) -> None:
+    store, result, _, _ = import_nullable_cluster_h5ad(tmp_path)
+    clusters = result.clusterArtifacts["clusters"]
+    graph = _imported_graph(store, result.cellSelection)
+    (features,) = store.list_artifacts(kind="feature_selection")
+    complete = store.run_leiden_clustering(graph)
+
+    with pytest.raises(
+        ValueError, match="clusters contains missing labels.*select_cells"
+    ):
+        store.run_marker_search(clusters, features=features)
+    with pytest.raises(ValueError, match="clusters contains missing labels"):
+        store.calc_membership_strength(clusters, graph)
+    with pytest.raises(ValueError, match="to_relabel contains missing labels"):
+        store.smart_label(clusters, complete)
+    with pytest.raises(ValueError, match="base_label contains missing labels"):
+        store.smart_label(complete, clusters)
+    for kind in ("marker_table", "membership_strength", "smart_label"):
+        assert store.list_artifacts(kind=kind) == []
+
+
+def test_make_bulk_excludes_missing_artifact_labels(tmp_path) -> None:
+    store, result, _, _ = import_nullable_cluster_h5ad(tmp_path)
+    clusters = result.clusterArtifacts["clusters"]
+    labelled = store.select_cells(clusters, low=-1.0)
+    options: dict[str, Any] = {
+        "aggr_type": "sum",
+        "feature_label": "id",
+        "remove_empty_features": False,
+    }
+
+    masked = store.make_bulk(clusters, **options)
+    restricted = store.make_bulk(clusters, cell_selection=labelled, **options)
+
+    assert list(masked.columns) == ["0", "1", "2"]
+    pd.testing.assert_frame_equal(masked, restricted)
+
+
+def test_live_masked_columns_are_missing_values_or_rejected(tmp_path) -> None:
+    from scarf.metrics import silhouette_scoring
+
+    store, result, _, _ = import_nullable_cluster_h5ad(tmp_path)
+    n_cells = store.cells.N
+    missing = np.zeros(n_cells, dtype=bool)
+    missing[::7] = True
+    donor = np.where(missing, 0, np.arange(n_cells) % 2 + 1).astype(np.int64)
+    _insert_nullable_cell_column(store, "donor", donor, missing)
+    active = store.cells.active_index("I")
+
+    values = store.get_cell_vals("RNA", "I", "donor")
+    assert values.dtype == np.float64
+    np.testing.assert_array_equal(np.isnan(values), missing[active])
+    np.testing.assert_array_equal(
+        values[~missing[active]], donor[active][~missing[active]]
+    )
+    counts = store.get_cell_vals("RNA", "I", "RNA_nCounts")
+    assert counts.dtype == store.cells.get_dtype("RNA_nCounts")
+
+    diffusion = store.run_diffusion_operator(
+        _imported_graph(store, result.cellSelection)
+    )
+    with pytest.raises(ValueError, match="'donor' contains missing values"):
+        store.get_imputed("donor", diffusion)
+    assert np.isfinite(store.get_imputed("RNA_nCounts", diffusion)).all()
+    with pytest.raises(ValueError, match="'donor' contains missing values"):
+        silhouette_scoring(
+            store,
+            None,
+            np.zeros((len(active), 2)),
+            "RNA",
+            "donor",
+            distance_metric="l2",
+        )
+
+
 def test_doublet_detection_requires_a_connectivity_graph_and_writable_store(
     analyzed_datastore_ephemeral,
 ) -> None:

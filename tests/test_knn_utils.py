@@ -17,7 +17,7 @@ from scarf.neighbors.graph import (
     take_nearest_per_row,
     weight_sort_indices,
 )
-from scarf.neighbors.diffusion import diffusion_operator
+from scarf.neighbors.diffusion import bounded_diffusion_operator, transition_matrix
 from scarf.neighbors.integration import _wnn_integration_many, wnn_integration
 from scarf.utils import logger
 
@@ -152,36 +152,62 @@ def test_leidenalg_membership_requires_leidenalg(monkeypatch):
         )
 
 
-def test_diffusion_operator_matches_powered_row_normalization():
+def _powered_transition(graph: csr_matrix, power: int) -> coo_matrix:
+    """Unbounded reference: SciPy's power of the row-normalized graph."""
+    inverse_degree = np.ravel(graph.sum(axis=1))
+    inverse_degree[inverse_degree != 0] = 1 / inverse_degree[inverse_degree != 0]
+    n_cells = graph.shape[0]
+    diagonal = csr_matrix(
+        (inverse_degree, (range(n_cells), range(n_cells))),
+        shape=[n_cells, n_cells],
+    )
+    return (diagonal.dot(graph) ** power).tocoo()
+
+
+def test_transition_matrix_and_its_power_row_normalize_the_graph():
     graph = csr_matrix(
         [
-            [0.0, 2.0, 0.0],
-            [1.0, 0.0, 1.0],
-            [0.0, 3.0, 0.0],
+            [0.0, 2.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0, 0.0],
+            [0.0, 3.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
         ]
     )
 
-    actual = diffusion_operator(graph, power=2)
+    transition = transition_matrix(graph)
+    squared = bounded_diffusion_operator(graph, 2, memory_bytes=1024**2)
 
+    assert isinstance(transition, csr_matrix)
+    assert transition.nnz == graph.nnz
     np.testing.assert_allclose(
-        actual.toarray(),
+        transition.toarray(),
         [
-            [0.5, 0.0, 0.5],
-            [0.0, 1.0, 0.0],
-            [0.5, 0.0, 0.5],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.5, 0.0, 0.5, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ],
+        rtol=0,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        squared.toarray(),
+        [
+            [0.5, 0.0, 0.5, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.5, 0.0, 0.5, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
         ],
         rtol=0,
         atol=1e-12,
     )
 
 
-def test_bounded_diffusion_operator_matches_public_operator_and_checks_budget():
-    from scarf.neighbors.diffusion import bounded_diffusion_operator
-
+def test_bounded_diffusion_operator_matches_unbounded_power_and_checks_budget():
     graph = _simple_knn_graph(40, k=3)
     graph = (graph + graph.T).tocsr()
     for power in range(1, 7):
-        expected = diffusion_operator(graph, power=power)
+        expected = _powered_transition(graph, power)
         actual = bounded_diffusion_operator(graph, power, memory_bytes=1024**3).tocoo()
         # Entries match exactly and in storage order, so persisted payloads
         # and their fingerprints are unchanged.
@@ -197,8 +223,6 @@ def test_bounded_diffusion_operator_matches_public_operator_and_checks_budget():
 
 
 def test_bounded_diffusion_uses_exact_count_when_upper_bound_exceeds_budget():
-    from scarf.neighbors.diffusion import bounded_diffusion_operator
-
     graph = csr_matrix(
         [
             [0.0, 1.0, 1.0, 0.0],
@@ -212,7 +236,7 @@ def test_bounded_diffusion_uses_exact_count_when_upper_bound_exceeds_budget():
     actual = bounded_diffusion_operator(graph, 2, memory_bytes=341)
 
     np.testing.assert_array_equal(
-        actual.toarray(), diffusion_operator(graph, 2).toarray()
+        actual.toarray(), _powered_transition(graph, 2).toarray()
     )
     np.testing.assert_array_equal(np.asarray(actual.sum(axis=1)).ravel(), [1, 1, 1, 0])
     with pytest.raises(MemoryError, match="6 operator entries.*340 bytes"):
@@ -221,8 +245,6 @@ def test_bounded_diffusion_uses_exact_count_when_upper_bound_exceeds_budget():
 
 @pytest.mark.parametrize("power", [True, 1.5, "2"])
 def test_bounded_diffusion_rejects_noninteger_powers(power):
-    from scarf.neighbors.diffusion import bounded_diffusion_operator
-
     with pytest.raises(TypeError, match="positive integer"):
         bounded_diffusion_operator(_simple_knn_graph(4), power, memory_bytes=1024**2)
 

@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 
 from ...metadata.rows import read_metadata_missing_rows, read_metadata_rows
+from ...metadata.selection import require_complete_cluster_labels
 from ...storage.refs import ArtifactRef
 from ...storage.selections import read_stored_selection_indices
 from ...utils.logging import logger
@@ -127,6 +128,11 @@ async def inspect_cluster_composition(
         raise ValueError("cluster artifact labels do not align with its cell selection")
     if len(cluster_values) == 0:
         raise ValueError("cluster artifact selects no cells")
+    require_complete_cluster_labels(
+        cluster_group,
+        value_name,
+        name="cluster artifact",
+    )
     counts = Counter(_string_value(value) for value in cluster_values)
     ordered_clusters = sorted(counts, key=lambda value: (-counts[value], value))
     retained_clusters = ordered_clusters[: deps.maxClusters]

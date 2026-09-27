@@ -139,7 +139,9 @@ _CONTRACTS = (
                 "normalization_method",
                 "size_factor",
             ),
-            **_classified("algorithm_version", "count_arithmetic"),
+            **_classified(
+                "algorithm_version", "count_arithmetic", "zero_total_divisor"
+            ),
         },
     ),
     OperationContract(

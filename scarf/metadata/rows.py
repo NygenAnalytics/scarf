@@ -184,6 +184,42 @@ def read_metadata_missing_rows_chunkwise(
     return np.asarray(read_array_rows_chunkwise(mask, rows), dtype=bool)
 
 
+def apply_missing_mask(
+    values: np.ndarray,
+    missing: np.ndarray | None,
+    *,
+    labels: bool = False,
+) -> np.ndarray:
+    """Show rows flagged by a linked missing mask as missing values.
+
+    Nullable columns and artifacts store a placeholder in each masked row. By
+    default, masked numeric rows become NaN in a float64 copy, masked boolean
+    rows become False so that boolean filters exclude them, and other masked
+    rows become None in an object copy. With ``labels=True``, every masked row
+    becomes None in an object copy, so categorical labels keep their values.
+    ``values`` is returned unchanged when no row is masked.
+    """
+    array = np.asarray(values)
+    if missing is None:
+        return array
+    mask = np.asarray(missing, dtype=bool)
+    if mask.shape != array.shape:
+        raise ValueError("Missing mask does not align with its values")
+    if not mask.any():
+        return array
+    kind = "O" if labels else array.dtype.kind
+    if kind == "b":
+        output = array.copy()
+        output[mask] = False
+    elif kind in {"f", "i", "u"}:
+        output = array.astype(np.float64, copy=True)
+        output[mask] = np.nan
+    else:
+        output = array.astype(object, copy=True)
+        output[mask] = None
+    return output
+
+
 @dataclass(frozen=True, slots=True)
 class MetaDataRowBlock:
     """One contiguous slice of a metadata table for blockwise scans."""

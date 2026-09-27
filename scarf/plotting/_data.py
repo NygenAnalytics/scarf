@@ -13,6 +13,12 @@ from ..features.values import (
     iter_normalized_feature_blocks,
     resolve_feature as resolve_feature,
 )
+from ..metadata.rows import (
+    apply_missing_mask,
+    metadata_missing_mask,
+    read_array_rows_chunkwise,
+)
+from ..metadata.selection import GROUPING_VALUE_NAMES, resolve_cell_aligned_artifact
 from ..storage.artifacts import ArtifactRef, artifact_group, inspect_artifact
 from ..storage.selections import read_stored_selection_indices
 from ..storage.types import as_zarr_array
@@ -86,56 +92,108 @@ def _validated_embedding_selection(
     return selection
 
 
+def _cell_column_missing(
+    cells: Any,
+    column: str,
+    *,
+    cell_key: str = "I",
+    cell_idx: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """Read one column's linked missing mask for the plotted rows, if any.
+
+    Rows pass ``cell_key`` unless ``cell_idx`` names exact physical rows.
+    Frozen run views apply their masks before values reach plotting.
+    """
+    mask = metadata_missing_mask(cells, column)
+    if mask is None:
+        return None
+    rows = cells.active_index(cell_key) if cell_idx is None else cell_idx
+    return np.asarray(read_array_rows_chunkwise(mask, rows), dtype=bool)
+
+
+def _fetch_cell_column(
+    store: Any,
+    column: str,
+    *,
+    cell_key: str = "I",
+    cell_idx: np.ndarray | None = None,
+    labels: bool = False,
+) -> np.ndarray:
+    """Read one cell-metadata column for plotting with masked rows missing.
+
+    See :func:`~scarf.metadata.rows.apply_missing_mask` for ``labels``.
+    """
+    cells = store.cells
+    values = np.asarray(
+        cells.fetch(column, key=cell_key)
+        if cell_idx is None
+        else np.asarray(cells.fetch_all(column))[cell_idx]
+    )
+    missing = _cell_column_missing(
+        cells,
+        column,
+        cell_key=cell_key,
+        cell_idx=cell_idx,
+    )
+    return apply_missing_mask(values, missing, labels=labels)
+
+
 def _resolve_grouping(
     store: Any,
     *,
     group_by: str | tuple[str, ...] | None,
     groups: ArtifactRef | None,
     cell_key: str,
-) -> tuple[tuple[str, ...], np.ndarray, list[np.ndarray]]:
-    """Resolve either explicit live metadata or one immutable label artifact."""
+) -> tuple[tuple[str, ...], np.ndarray, list[np.ndarray], np.ndarray | None]:
+    """Resolve either explicit live metadata or one immutable label artifact.
+
+    Labels that a linked missing mask flags are None. The last element marks
+    those rows, or is None when no grouping source has a mask.
+    """
     if (group_by is None) == (groups is None):
         raise ValueError("Provide exactly one of group_by or groups")
     if groups is None:
         group_keys = (group_by,) if isinstance(group_by, str) else tuple(group_by or ())
         if len(group_keys) == 0 or len(group_keys) > 2:
             raise ValueError("group_by must have 1 or 2 keys")
-        cell_idx = np.asarray(store.cells.active_index(cell_key), dtype=np.int64)
+        cells = store.cells
+        cell_idx = np.asarray(cells.active_index(cell_key), dtype=np.int64)
+        columns: list[np.ndarray] = []
+        masks: list[np.ndarray] = []
+        for key in group_keys:
+            missing = _cell_column_missing(cells, key, cell_key=cell_key)
+            columns.append(
+                apply_missing_mask(
+                    np.asarray(cells.fetch(key, key=cell_key)),
+                    missing,
+                    labels=True,
+                )
+            )
+            if missing is not None:
+                masks.append(missing)
         return (
             group_keys,
             cell_idx,
-            [np.asarray(store.cells.fetch(key, key=cell_key)) for key in group_keys],
+            columns,
+            np.logical_or.reduce(masks) if masks else None,
         )
 
     if not isinstance(groups, ArtifactRef):
         raise TypeError("groups must be an ArtifactRef")
     if cell_key != "I":
         raise ValueError("cell_key cannot override an artifact's stored cell selection")
-    status = inspect_artifact(store.zw, groups)
-    if not status.complete:
-        raise ValueError("Grouping artifact is unavailable or incomplete")
-    selection = _artifact_cell_selection(store, groups, label="Grouping")
-    cell_idx = read_stored_selection_indices(
+    resolved = resolve_cell_aligned_artifact(
         store.zw,
-        selection,
-        kind="cell_selection",
-        scope="datastore",
-        assay=None,
-        table_path="cellData",
-    ).astype(np.int64, copy=False)
-    value_name = {
-        "cell_cycle": "phase",
-        "cluster_cut": "labels",
-    }.get(groups.kind, "values")
-    group = artifact_group(store.zw, groups)
-    if value_name not in group:
-        raise ValueError(
-            f"Grouping artifact has no canonical {value_name!r} label array"
-        )
-    values = np.asarray(as_zarr_array(group[value_name], name=value_name)[:])
-    if values.ndim != 1 or values.shape != (len(cell_idx),):
-        raise ValueError("Grouping labels do not align with their cell selection")
-    return ("groups",), cell_idx, [values]
+        groups,
+        value_name=GROUPING_VALUE_NAMES.get(groups.kind, "values"),
+        expected_kind=groups.kind,
+    )
+    return (
+        ("groups",),
+        resolved.cell_idx,
+        [apply_missing_mask(resolved.values, resolved.missing_mask, labels=True)],
+        resolved.missing_mask,
+    )
 
 
 def _resolve_layout(
@@ -416,7 +474,7 @@ def _summarize_resolved_features(
     store: Any,
     resolved: Sequence[ResolvedFeature],
     group_labels: list[str | None],
-    grouping: tuple[tuple[str, ...], np.ndarray, list[np.ndarray]],
+    grouping: tuple[tuple[str, ...], np.ndarray, list[np.ndarray], np.ndarray | None],
     *,
     sample_by: str | None = None,
     study_design: StudyDesign | None = None,
@@ -428,33 +486,39 @@ def _summarize_resolved_features(
     """Aggregate resolved features over a grouping from ``_resolve_grouping``.
 
     ``group_labels`` holds each feature's bracket group, aligned with
-    ``resolved``.
+    ``resolved``. Cells whose grouping label is masked as missing belong to
+    no group.
     """
     condition_by: str | None = None
     if study_design is not None:
         sample_by = study_design.sample_by
         condition_by = study_design.condition_by
 
-    cells = store.cells
-    group_keys, cell_idx, group_cols = grouping
-    n_groups = int(
-        pd.DataFrame({k: c for k, c in zip(group_keys, group_cols)})
-        .drop_duplicates()
-        .shape[0]
+    group_keys, cell_idx, group_cols, group_missing = grouping
+    base = pd.DataFrame({gk: col for gk, col in zip(group_keys, group_cols)})
+    labelled = (
+        np.ones(len(cell_idx), dtype=bool)
+        if group_missing is None
+        else ~np.asarray(group_missing, dtype=bool)
     )
+    n_groups = int(base.loc[labelled].drop_duplicates().shape[0])
     if n_groups > max_groups:
         raise ValueError(
             f"Too many groups ({n_groups} > {max_groups}). "
             "Raise max_groups explicitly if intentional."
         )
 
-    base = pd.DataFrame({gk: col for gk, col in zip(group_keys, group_cols)})
     gb_keys = list(group_keys)
 
     if sample_by is not None:
-        samples = np.asarray(cells.fetch_all(sample_by))[cell_idx]
+        samples = _fetch_cell_column(store, sample_by, cell_idx=cell_idx, labels=True)
         if condition_by is not None:
-            conditions = np.asarray(cells.fetch_all(condition_by))[cell_idx]
+            conditions = _fetch_cell_column(
+                store,
+                condition_by,
+                cell_idx=cell_idx,
+                labels=True,
+            )
             check = pd.DataFrame({"sample": samples, "condition": conditions})
             nunique = check.groupby("sample", observed=False)["condition"].nunique()
             bad = nunique[nunique > 1]
@@ -463,7 +527,7 @@ def _summarize_resolved_features(
                     "condition_by is not constant within sample(s): "
                     + ", ".join(map(str, list(bad.index[:10])))
                 )
-        valid = pd.notna(samples) & (np.asarray(samples, dtype=object) != "")
+        valid = labelled & pd.notna(samples) & (np.asarray(samples, dtype=object) != "")
         if int(valid.sum()) == 0:
             raise ValueError("No cells with valid sample_by values")
         uniq_samples = pd.unique(np.asarray(samples)[valid])
@@ -475,6 +539,8 @@ def _summarize_resolved_features(
         base = base.loc[valid].copy()
         base["sample"] = np.asarray(samples)[valid]
         gb_keys.insert(0, "sample")
+    else:
+        base = base.loc[labelled]
 
     summary = _summarize_feature_blocks(
         store,

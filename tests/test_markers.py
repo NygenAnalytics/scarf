@@ -1752,24 +1752,25 @@ def test_marker_feature_value_adapters_and_non_rna_rank_paths() -> None:
             self.name = "RNA"
             self.resources = ResourceBudget(8 * 1024 * 1024, 2)
             self.rawDataT = counts_t
-            self.n_term_per_doc = np.ones(8)
-            self.n_docs_per_term = np.ones(12)
-            self.n_docs = 8
 
-        def normed(self, cell_idx, feat_idx, **_kwargs):
-            self.n_term_per_doc = np.ones(len(cell_idx))
-            self.n_docs_per_term = np.ones(len(feat_idx))
-            self.n_docs = len(cell_idx)
+        def _fit_tf_idf(self, cell_idx, feat_idx, **_kwargs):
+            state = (np.ones(len(cell_idx)), len(cell_idx), np.ones(len(feat_idx)))
+            return None, state
 
-    for method in (norm_clr, norm_dummy, norm_tf_idf):
-        results = find_markers_by_rank(
-            FakeAssay(method),
-            groups=np.array(["a", "a", "a", "a", "b", "b", "b", "b"]),
-            cell_idx=np.arange(8),
-            feat_idx=np.array([10, 11]),
-            nthreads=1,
-        )
-        assert set(results) == {"a", "b"}
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(marker_search_module, "ATACassay", FakeAssay)
+    try:
+        for method in (norm_clr, norm_dummy, norm_tf_idf):
+            results = find_markers_by_rank(
+                FakeAssay(method),
+                groups=np.array(["a", "a", "a", "a", "b", "b", "b", "b"]),
+                cell_idx=np.arange(8),
+                feat_idx=np.array([10, 11]),
+                nthreads=1,
+            )
+            assert set(results) == {"a", "b"}
+    finally:
+        monkeypatch.undo()
 
     import scarf.storage.feature_stream as feature_stream_module
 

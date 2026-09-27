@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import pytest
 from scipy.sparse import csr_matrix
 
@@ -200,6 +201,50 @@ def test_bulk_mean_retains_other_normalizers(tmp_path, normalizer, replicates):
         np.testing.assert_array_equal(fractions[column], expected_fraction)
 
 
+@pytest.mark.parametrize("aggregation", ["sum", "mean"])
+def test_bulk_excludes_masked_labels_like_null_values(tmp_path, aggregation):
+    from .test_pipeline import _insert_nullable_cell_column
+
+    counts = np.random.default_rng(13).integers(1, 50, (6, 8), dtype=np.uint16)
+    store, cells = _bulk_store(tmp_path, counts)
+    # Placeholders equal real labels: 0 is a group and "" would be a sub-group.
+    _insert_nullable_cell_column(
+        store,
+        "group",
+        np.array([0, 1, 0, 0, 1, 0]),
+        np.array([False, False, True, False, False, True]),
+    )
+    _insert_nullable_cell_column(
+        store,
+        "secondary",
+        np.array(["x", "x", "y", "", "y", "x"]),
+        np.array([False, False, False, True, False, False]),
+    )
+    store.cells.insert("group_nulls", np.array(["0", "1", "-", "0", "1", "-"]))
+    store.cells.insert("secondary_nulls", np.array(["x", "x", "y", "-", "y", "x"]))
+    options = {
+        "cell_selection": cells,
+        "aggr_type": aggregation,
+        "feature_label": "id",
+        "remove_empty_features": False,
+    }
+
+    masked = store.make_bulk("group", secondary_groups="secondary", **options)
+    nulled = store.make_bulk(
+        "group_nulls",
+        secondary_groups="secondary_nulls",
+        null_vals=["-"],
+        secondary_null_vals=["-"],
+        **options,
+    )
+
+    assert list(masked.columns) == ["0_x", "0_y", "1_x", "1_y"]
+    pd.testing.assert_frame_equal(masked, nulled)
+    if aggregation == "sum":
+        np.testing.assert_array_equal(masked["0_x"], counts[0])
+        np.testing.assert_array_equal(masked["0_y"], 0)
+
+
 def test_bulk_rejects_colliding_column_names(tmp_path):
     store, cells = _bulk_store(tmp_path, np.ones((4, 3), dtype=np.uint16))
     store.cells.insert("group", np.array(["a_b", "a_b", "a", "a"]))
@@ -282,10 +327,10 @@ def test_bulk_output_is_admitted_before_streaming(tmp_path):
 
 
 @pytest.mark.parametrize("aggregation", ["sum", "mean"])
-def test_bulk_preserves_half_precision_counts_and_sum_dtype(aggregation):
+def test_bulk_preserves_floating_point_counts_and_sum_dtype(aggregation):
     counts = np.array(
         [[0.25, 1.5, 2.0], [200.0, 400.0, 1.0], [1.0, 0.0, 0.25], [0.0, 1.0, 0.0]],
-        dtype=np.float16,
+        dtype=np.float32,
     )
     selected = np.array([0, 1, 3])
     codes = np.array([0, 0, 2])
@@ -300,7 +345,7 @@ def test_bulk_preserves_half_precision_counts_and_sum_dtype(aggregation):
         return_fraction=True,
         resources=ResourceBudget(16 * 1024**2, 4),
     )
-    assert actual.dtype == (np.float64 if aggregation == "mean" else np.float16)
+    assert actual.dtype == (np.float64 if aggregation == "mean" else np.float32)
     assert fractions is not None
     for code in range(4):
         members = codes == code

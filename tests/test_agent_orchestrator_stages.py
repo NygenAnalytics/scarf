@@ -1673,3 +1673,28 @@ def test_preprocessing_plan_rejects_invalid_assay_routing(
     )
     with pytest.raises(ValueError, match=message):
         AgentOrchestrator(object()).build_preprocessing_plan(*inputs)
+
+
+def test_screening_coverage_leaves_masked_labels_out_of_every_group() -> None:
+    from scarf.agent.orchestrator.rna_tuning import screening_coverage
+    from tests.test_pipeline import _insert_nullable_cell_column
+    from tests.test_registered_qc_profiles import _memory_qc_store
+
+    rows = np.arange(60)
+    missing = rows % 3 == 0
+    store, parent = _memory_qc_store({"screen": rows % 2 == 0})
+    # Masked rows keep the integer placeholder 0, which is not a recorded lane.
+    lanes = np.where(missing, 0, rows % 2 + 1)
+    _insert_nullable_cell_column(store, "lane", lanes, missing)
+    sample = store.snapshot_cell_selection("screen")
+
+    coverage, concerns = screening_coverage(store, parent, sample, ["lane"])
+
+    groups = {row["value"]: row for row in coverage["groups"]["lane"]}
+    assert list(groups) == ["1", "2"]
+    assert groups["1"]["populationCells"] == groups["2"]["populationCells"] == 20
+    assert groups["1"]["screeningCells"] == 20
+    # Fractions keep every selected cell, including those without a lane.
+    assert groups["1"]["populationFraction"] == pytest.approx(20 / 60)
+    assert groups["1"]["screeningFraction"] == pytest.approx(20 / 30)
+    assert concerns == ["lane=2: 0 sampled of 20 cells"]

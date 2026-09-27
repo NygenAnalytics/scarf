@@ -42,6 +42,7 @@ from ...graph.feature_projection import (
 )
 from ...graph.kinds import require_graph_kind
 from ...matrix import ChunkedArray
+from ...metadata.rows import apply_missing_mask
 from ...neighbors.stages import (
     AnnIndexStage,
     BatchCorrectionStage,
@@ -56,7 +57,11 @@ from ...storage.ann_index import (
     load_ann_index,
     save_ann_index,
 )
-from ...storage.arrays import create_numeric_array, create_zarr_dataset
+from ...storage.arrays import (
+    create_numeric_array,
+    create_zarr_dataset,
+    linked_missing_mask,
+)
 from ...storage.artifact_writer import (
     ArrayRequirement,
     PlannedArtifact,
@@ -795,7 +800,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         feature_selection = features
         self._require_complete_artifact(features, "feature_selection", assay=assay_name)
         self._require_complete_artifact(cell_selection, "cell_selection")
-        from ...assay import ATACassay
+        from ...assay import ATACassay, RNAassay
 
         if isinstance(assay, ATACassay):
             if log_transform is None:
@@ -845,6 +850,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         )
         n_cells = selections.cells.selected_count
         n_features = int(selections.featureMask.sum())
+        cell_idx = np.flatnonzero(np.asarray(selections.cells.values[:], dtype=bool))
         arguments = NormalizationArguments(
             cell_selection=cell_selection,
             feature_selection=feature_selection,
@@ -858,6 +864,13 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 "payload",
                 log_transform=log_transform,
                 renormalize_subset=renormalize_subset,
+            ),
+            zero_total_divisor=(
+                "one"
+                if isinstance(assay, RNAassay)
+                and not renormalize_subset
+                and assay._has_zero_total_cells(cell_idx)
+                else None
             ),
         )
 
@@ -892,13 +905,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             reuse_validator=valid_shape,
         )
         if not planned.reused:
-            cell_values = np.asarray(selections.cells.values[:], dtype=bool)
-            feature_values = selections.featureMask
             group = start_artifact(self.zw, planned)
             relative_path = artifact_path(planned.ref).removeprefix(f"{assay_name}/")
             assay._write_normalized_payload(
-                np.flatnonzero(cell_values),
-                np.flatnonzero(feature_values),
+                cell_idx,
+                np.flatnonzero(selections.featureMask),
                 relative_path,
                 log_transform=log_transform,
                 renormalize_subset=renormalize_subset,
@@ -1641,11 +1652,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 )
             )
             selected = np.concatenate(selected_blocks)
-            missing_name = values.attrs.get("missing_mask")
-            if isinstance(missing_name, str):
-                missing_values = as_zarr_array(
-                    snapshot[missing_name], name=missing_name
-                )
+            missing_values = linked_missing_mask(snapshot, column, values=values)
+            if missing_values is not None:
                 missing = np.concatenate(
                     tuple(
                         np.asarray(block.values, dtype=bool)
@@ -1661,8 +1669,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                         )
                     )
                 )
-                selected = selected.astype(object)
-                selected[missing] = None
+                selected = apply_missing_mask(selected, missing, labels=True)
             return selected.astype(object)
 
         batches = pd.DataFrame(

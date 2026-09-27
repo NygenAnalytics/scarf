@@ -16,6 +16,7 @@ from ..storage.budget import ResourceBudget
 from ..assay.classification import DEFAULT_PERCENT_PATTERNS
 from ..assay import RNAassay, ATACassay, ADTassay, Assay, preset_assay_types
 from ..metadata import MetaData
+from ..metadata.rows import apply_missing_mask, read_metadata_missing_rows
 from ..storage.schema import validate_assay_name
 from ..storage.profiles import StorageProfile, ZarrLocation
 from ..storage.stores import (
@@ -480,6 +481,7 @@ class BaseDataStore:
         )
         if custom_assay_types is None:
             custom_assay_types = {}
+        assays: dict[str, Assay] = {}
         for i in self._assayNames:
             if i in custom_assay_types:
                 if custom_assay_types[i] in preset_assay_types_map:
@@ -514,7 +516,7 @@ class BaseDataStore:
                 else:
                     z_attrs[i] = assay_name
                     logger.debug(f"Setting assay {i} to assay type: {assay.__name__}")
-            loaded_assay = assay(
+            assays[i] = assay(
                 z=self.z,
                 workspace=self.workspace,
                 name=i,
@@ -524,7 +526,9 @@ class BaseDataStore:
                 resources=self.resources,
                 storageIo=self.storageIo,
             )
-            setattr(self, i, loaded_assay)
+        # Assays are kept apart from the datastore's own attributes, so no
+        # assay name can replace one.
+        self._assays = assays
         if not self.zw.read_only and self.zw.attrs.get("assayTypes") != z_attrs:
             self.zw.attrs["assayTypes"] = z_attrs
         return None
@@ -553,7 +557,32 @@ class BaseDataStore:
             raise ValueError(
                 f"Assay {from_assay!r} not found. Available assays: {available}"
             )
-        return cast(Assay | RNAassay | ADTassay | ATACassay, getattr(self, from_assay))
+        return self._assays[from_assay]
+
+    if not TYPE_CHECKING:
+
+        def __getattr__(self, name: str) -> Assay:
+            # Python calls this only after normal lookup fails, so the
+            # datastore's own attributes always win over an assay of the same
+            # name. A class attribute reaches here only when its getter raised
+            # AttributeError; looking it up again surfaces that error. Reading
+            # ``self._assays`` here would recurse on a store that has no
+            # assays yet, such as one being copied or unpickled.
+            if hasattr(type(self), name):
+                return object.__getattribute__(self, name)
+            assays = self.__dict__.get("_assays", {})
+            if not name.startswith("_") and name in assays:
+                return assays[name]
+            raise AttributeError(
+                f"{type(self).__name__!r} object has no attribute {name!r}",
+                name=name,
+                obj=self,
+            )
+
+    def __dir__(self) -> list[str]:
+        assays = self.__dict__.get("_assays", {})
+        names = (name for name in assays if not name.startswith("_"))
+        return sorted(set(super().__dir__()).union(names))
 
     def _require_writable(self, operation: str) -> None:
         """Refuse an operation that writes to a store opened read-only."""
@@ -746,6 +775,12 @@ class BaseDataStore:
         This convenience function allows fetching values for cells from either cell metadata table or values of a
         given feature from normalized matrix.
 
+        Rows that a nullable metadata column's linked missing mask flags are
+        returned as missing values, as in run-aware plotting views: NaN for
+        numeric columns, which are then returned as float64, None for other
+        non-boolean columns, and False for boolean columns. Columns without
+        masked rows keep their stored dtype.
+
         Args:
             from_assay: Name of assay to be used.
             cell_key: Boolean column in cell metadata selecting cells. Required; pass ``'I'``
@@ -771,7 +806,10 @@ class BaseDataStore:
                 assay.normed(cell_idx, feat_idx).mean(axis=1), self.nthreads
             ).astype(np.float64)
         else:
-            vals = self.cells.fetch(k, key=cell_key)
+            vals = apply_missing_mask(
+                self.cells.fetch(k, key=cell_key),
+                read_metadata_missing_rows(self.cells, k, cell_idx),
+            )
         if clip_fraction < 0 or clip_fraction > 1:
             raise ValueError(
                 "ERROR: Value for `clip_fraction` parameter should be between 0 and 1"

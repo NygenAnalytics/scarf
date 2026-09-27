@@ -198,6 +198,12 @@ available for comparison but do not override a validated definition. In particul
 mitochondrial symbol definition matches `MT-` rather than every gene beginning with `MT`.
 Changing the metric definition requires new QC thresholds and dependent evidence.
 
+Values that a linked missing-value mask records as missing stay missing throughout the agent,
+whatever placeholder the store holds. A masked metric cannot set QC thresholds, and executing a
+QC policy over a masked metric or capture label fails instead of saving a cohort. Missing labels
+never form a capture, batch, screening group or independent unit, and a clustering with missing
+labels is not accepted for biological interpretation.
+
 All saved execution and decisions belong to the orchestration stage history. Identical calls
 reuse completed work or resume matching interrupted work; changed inputs and identity checks
 prevent silent reuse of stale evidence. The result's plot and marker methods use the exact saved

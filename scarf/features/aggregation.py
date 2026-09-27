@@ -62,15 +62,10 @@ def aggregate_rna_groups(
     geometry = array_geometry(counts_t)
     assert geometry is not None
     n_features = int(counts_t.shape[0])
-    result_dtype = (
+    dtype = (
         np.dtype(np.float64)
         if scalars is not None
         else np.empty(0, dtype=counts_t.dtype).sum().dtype
-    )
-    # Numba requires at least float32 for floating-point arrays.
-    cast_counts = np.dtype(counts_t.dtype) == np.dtype(np.float16)
-    dtype = (
-        np.dtype(np.float32) if result_dtype == np.dtype(np.float16) else result_dtype
     )
     feature_width, _ = persisted_read_group(counts_t)
     band_features = min(n_features, max(feature_width, geometry.axisChunk(0)))
@@ -83,8 +78,6 @@ def aggregate_rna_groups(
     scratch_bytes = resident_bytes + min(len(cell_indices), band_cells) * (
         group_codes.dtype.itemsize + (0 if scalars is None else scalars.dtype.itemsize)
     )
-    if cast_counts:
-        scratch_bytes += band_elements * np.dtype(np.float32).itemsize
     stream_io = replace(io or DEFAULT_STORAGE_IO_POLICY, computeWorkers=1)
     decode_bytes = (
         max(1, -(-band_features // geometry.axisChunk(0)))
@@ -113,7 +106,7 @@ def aggregate_rna_groups(
     def accumulate(band: FeatureCellBand) -> None:
         columns = slice(band.featStart, band.featEnd)
         _accumulate_group_counts(
-            band.values.astype(np.float32) if cast_counts else band.values,
+            band.values,
             band.selectedLocal,
             group_codes[band.selectedDestinations],
             None if scalars is None else scalars[band.selectedDestinations],
@@ -138,9 +131,7 @@ def aggregate_rna_groups(
         values /= denominators
     if fractions is not None:
         fractions /= denominators
-    return values.T.astype(result_dtype, copy=False), (
-        None if fractions is None else fractions.T
-    )
+    return values.T, None if fractions is None else fractions.T
 
 
 def aggregate_normalized_groups(

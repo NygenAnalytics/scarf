@@ -6,7 +6,7 @@ import pandas as pd
 from numba import set_num_threads
 from scipy.special import ndtr
 
-from ...assay import Assay, RNAassay, lib_size_feature_stream_eligible
+from ...assay import Assay, ATACassay, RNAassay, lib_size_feature_stream_eligible
 from ...assay.normalization import (
     norm_clr,
     norm_dummy,
@@ -213,11 +213,15 @@ def find_markers_by_rank(
         scalar_values = np.asarray(scalar, dtype=np.float32)
         scalar_values[scalar_values == 0] = 1
     elif adapter == "tfidf":
-        assay.normed(cell_idx, feat_idx, **norm_params)
-        cell_scale = np.asarray(assay.n_term_per_doc, dtype=np.float64)
-        docs = float(getattr(assay, "n_docs", len(cell_idx)))
+        if not isinstance(assay, ATACassay):
+            raise TypeError("TF-IDF marker search requires an ATACassay instance")
+        _, (term_totals, n_docs, document_frequency) = assay._fit_tf_idf(
+            cell_idx, feat_idx, **norm_params
+        )
+        cell_scale = np.asarray(term_totals, dtype=np.float64)
         feature_scale = np.log2(
-            1.0 + (docs / (np.asarray(assay.n_docs_per_term, dtype=np.float64) + 1.0))
+            1.0
+            + (float(n_docs) / (np.asarray(document_frequency, dtype=np.float64) + 1.0))
         )
     elif adapter == "lib_size":
         scalar = assay.cells.fetch_all(assay.name + "_nCounts")[cell_idx]

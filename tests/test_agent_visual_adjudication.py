@@ -6,6 +6,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
+import zarr
+from matplotlib.axes import Axes
+from zarr.storage import MemoryStore
 
 from scarf.agent.orchestrator import tuning
 from scarf.agent.parameter_tuning.contracts import (
@@ -15,6 +18,7 @@ from scarf.agent.parameter_tuning.contracts import (
     ParameterMetrics,
 )
 from scarf.agent.types import ArtifactReferenceModel
+from scarf.metadata import selection as metadata_selection
 
 
 class _Array:
@@ -30,7 +34,36 @@ class _Array:
         return self.values[selection]
 
 
-def _visual_fixture(monkeypatch, *, batch=True, doublet=False, qc_size=20):
+class _Cells:
+    def __init__(self, values, missing):
+        self.values, self.missing = values, missing
+        self.columns = list(values)
+
+    def _get_array(self, column):
+        return self.values[column]
+
+    def _get_missing_mask_array(self, column):
+        return self.missing.get(column)
+
+
+def _qc_group(values, missing=None):
+    group = zarr.open_group(store=MemoryStore(), mode="w")
+    group.create_array("values", data=np.asarray(values, dtype=np.float64))
+    if missing is not None:
+        group.create_array("__scarf_missing__values", data=np.asarray(missing))
+        group["values"].attrs["missing_mask"] = "__scarf_missing__values"
+    return group
+
+
+def _visual_fixture(
+    monkeypatch,
+    *,
+    batch=True,
+    doublet=False,
+    qc_size=20,
+    qc_missing=None,
+    counts_missing=None,
+):
     arrays = {}
     selections = {}
 
@@ -56,9 +89,12 @@ def _visual_fixture(monkeypatch, *, batch=True, doublet=False, qc_size=20):
         (coordinates, "data", np.arange(20).reshape(10, 2)),
         (harmony, "data", np.arange(20).reshape(10, 2) * 0.8),
         (clusters, "values", np.arange(10) % 2),
-        (qc, "values", np.linspace(0.1, 1.1, qc_size)),
     ):
         arrays[item.artifactId] = {field: _Array(value)}
+    arrays[qc.artifactId] = _qc_group(np.linspace(0.1, 1.1, qc_size), qc_missing)
+    # The QC artifact records the cohort it was computed on: all cells or the
+    # candidate's cells.
+    qc_cells = full if qc_size == 20 else cells
     genes = ["MT-CO1", "MRPL1", "RPL1", "CCN1", "HLA-A", "H2-A", "HIST1", "XIST"]
     native = ParameterCandidateEvaluation(
         candidateId="native",
@@ -89,19 +125,28 @@ def _visual_fixture(monkeypatch, *, batch=True, doublet=False, qc_size=20):
         score = ref("doublet_score", 9)
         arrays[score.artifactId] = {"values": _Array(np.linspace(0.01, 0.9, 10))}
         native.artifacts["doubletScore:all"] = score
+    counts = np.linspace(100.0, 290.0, 20)
+    columns = {"RNA_nCounts": counts}
+    if batch:
+        columns = {"batch": np.asarray(["batch-a", "batch-b"] * 10), **columns}
     store = SimpleNamespace(
         zw=object(),
-        cells=SimpleNamespace(columns=["batch"] if batch else []),
+        cells=_Cells(
+            columns,
+            {} if counts_missing is None else {"RNA_nCounts": counts_missing},
+        ),
         load_artifact=lambda item: arrays[item.artifact_id],
         inspect_artifact=lambda item: SimpleNamespace(
+            exists=True,
+            complete=True,
             inputs={
                 "cell_selection": {
                     "type": "artifact",
-                    "scope": full.scope,
-                    "kind": full.kind,
-                    "artifact_id": full.artifactId,
+                    "scope": qc_cells.scope,
+                    "kind": qc_cells.kind,
+                    "artifact_id": qc_cells.artifactId,
                 }
-            }
+            },
         ),
         get_markers=lambda *a, **k: pd.DataFrame(
             {
@@ -117,12 +162,35 @@ def _visual_fixture(monkeypatch, *, batch=True, doublet=False, qc_size=20):
         "read_stored_selection_indices",
         lambda group, item, **kwargs: selections[item.artifact_id],
     )
+    # Core resolution reads this fixture's artifact records and selections.
     monkeypatch.setattr(
-        tuning,
-        "read_metadata_rows_chunkwise",
-        lambda metadata, name, rows: np.asarray(["batch-a", "batch-b"] * 10)[rows],
+        metadata_selection,
+        "inspect_artifact",
+        lambda _root, item: store.inspect_artifact(item),
+    )
+    monkeypatch.setattr(
+        metadata_selection,
+        "_selection_indices",
+        lambda _root, item: selections[item.artifact_id],
+    )
+    monkeypatch.setattr(
+        metadata_selection,
+        "artifact_group",
+        lambda _root, item: arrays[item.artifact_id],
     )
     return store, native, corrected, qc, arrays, selections
+
+
+def _record_violins(monkeypatch):
+    violins = []
+    violinplot = Axes.violinplot
+
+    def record(axis, dataset, *args, **kwargs):
+        violins.append(np.asarray(dataset).copy())
+        return violinplot(axis, dataset, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "violinplot", record)
+    return violins
 
 
 @pytest.mark.parametrize(
@@ -145,6 +213,7 @@ def test_native_harmony_visuals_preserve_matching_and_exact_qc_projection(
         return savefig(figure, *args, **kwargs)
 
     monkeypatch.setattr(plt.Figure, "savefig", save)
+    violins = _record_violins(monkeypatch)
     outputs = tuning._analysis_visual_content(
         store,
         native,
@@ -160,8 +229,40 @@ def test_native_harmony_visuals_preserve_matching_and_exact_qc_projection(
     assert all(item.data.startswith(b"\x89PNG") for item in outputs)
     assert "MT-CO1 [mitochondrial]" in captured
     assert "XIST [sex-linked]" in captured
-    expected = np.arange(5, 15) if qc_size == 20 else np.arange(10)
-    assert np.array_equal(arrays[qc.artifactId]["values"].rows[-1], expected)
+    stored = np.linspace(0.1, 1.1, qc_size)
+    expected = stored[5:15] if qc_size == 20 else stored
+    assert len(violins) == 1
+    np.testing.assert_array_equal(violins[0], expected)
+
+
+def test_qc_visuals_leave_out_rows_flagged_by_missing_masks(monkeypatch):
+    counts_missing = np.zeros(20, dtype=bool)
+    counts_missing[[6, 11]] = True
+    qc_missing = np.zeros(20, dtype=bool)
+    qc_missing[[5, 14]] = True
+    store, native, corrected, qc, arrays, _ = _visual_fixture(
+        monkeypatch, qc_missing=qc_missing, counts_missing=counts_missing
+    )
+    # Placeholders are finite, so only the linked masks mark these rows missing.
+    store.cells.values["RNA_nCounts"][counts_missing] = 0.0
+    arrays[qc.artifactId]["values"][[5, 14]] = 0.0
+    violins = _record_violins(monkeypatch)
+    try:
+        tuning._analysis_visual_content(
+            store,
+            native,
+            [native, corrected],
+            qc_columns=["RNA_nCounts"],
+            qc_artifact_metrics=[("mitochondrial", qc)],
+        )
+    finally:
+        plt.close("all")
+    parent = np.arange(5, 15)
+    counts = store.cells.values["RNA_nCounts"]
+    mito = np.linspace(0.1, 1.1, 20)
+    assert len(violins) == 2
+    np.testing.assert_array_equal(violins[0], counts[parent][~counts_missing[parent]])
+    np.testing.assert_array_equal(violins[1], mito[parent][~qc_missing[parent]])
 
 
 @pytest.mark.parametrize(
@@ -171,8 +272,8 @@ def test_native_harmony_visuals_preserve_matching_and_exact_qc_projection(
         ("oneCoordinate", "two dimensions"),
         ("clusterLength", "do not align"),
         ("doubletSelection", "lacks its exact cell selection"),
-        ("qcSelection", "lacks its cell selection"),
-        ("qcCoverage", "does not cover selected cells"),
+        ("qcSelection", "no cell-selection input"),
+        ("qcCoverage", "must be a subset"),
         ("missingHarmony", "lacks visual artifacts"),
     ],
 )
@@ -193,7 +294,9 @@ def test_visual_evidence_rejects_unmatched_or_missing_artifact_inputs(
             np.arange(9)
         )
     elif damage == "qcSelection":
-        store.inspect_artifact = lambda item: SimpleNamespace(inputs={})
+        store.inspect_artifact = lambda item: SimpleNamespace(
+            exists=True, complete=True, inputs={}
+        )
     elif damage == "qcCoverage":
         selections[f"{2:064x}"] = np.arange(20, 40)
     elif damage == "missingHarmony":

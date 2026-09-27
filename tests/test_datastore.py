@@ -875,6 +875,114 @@ def test_get_assay_rejects_unknown_and_non_assay_names(toy_store_path) -> None:
     assert store._get_assay(None) is store.RNA
 
 
+def _store_with_assay(name: str) -> MemoryStore:
+    from scarf.storage.identity import finalize_counts
+    from scarf.writers.counts_t import finalize_writer_counts_t
+
+    store = MemoryStore()
+    root = zarr.open_group(store=store, mode="w")
+    n_cells, n_features = _QC_VALUES.shape
+    ids = np.array([f"c{i}" for i in range(n_cells)])
+    create_cell_data(root, None, ids=ids, names=ids)
+    for assay in ("RNA", name):
+        counts = create_zarr_count_assay(
+            root,
+            assay,
+            None,
+            n_cells,
+            feat_ids=np.array([f"{assay}{i}" for i in range(n_features)]),
+            feat_names=_QC_FEATURE_NAMES,
+            dtype="uint32",
+        )
+        counts[:] = _QC_VALUES
+        finalize_counts(counts)
+        finalize_writer_counts_t(root, assay, None, assay_type="RNA")
+    return store
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "cells",
+        "zw",
+        "zarr_mode",
+        "memoryBytes",
+        "assay_names",
+        "run_pca",
+        "get_assay",
+        "_defaultAssay",
+        "__class__",
+    ],
+)
+def test_assay_named_like_a_datastore_member_leaves_the_member_intact(name) -> None:
+    store = _store_with_assay(name)
+    # The first writable open prepares both assays for read-only access.
+    for mode in ("r+", "r"):
+        ds = DataStore(
+            store, default_assay="RNA", min_features_per_cell=0, zarr_mode=mode
+        )
+
+        assert type(ds) is DataStore
+        assert isinstance(ds.cells, MetaData)
+        assert isinstance(ds.zw, zarr.Group)
+        assert ds.zarr_mode == mode
+        assert ds.memoryBytes > 0
+        assert ds.assay_names == sorted(["RNA", name])
+        assert ds._defaultAssay == "RNA"
+        assert not isinstance(getattr(ds, name), Assay)
+        assay = ds.get_assay(name)
+        assert isinstance(assay, Assay) and assay.name == name
+        assert ds._get_assay(name) is assay
+        assert ds.RNA is ds.get_assay("RNA") is ds._get_assay(None)
+        assert {"RNA", name} <= set(dir(ds))
+        np.testing.assert_array_equal(ds.cells.fetch_all("I"), _QC_VALUES.any(axis=1))
+        with pytest.raises(AttributeError, match="'rna'"):
+            _ = ds.rna
+
+
+def test_property_errors_are_not_masked_by_an_assay_of_the_same_name(
+    monkeypatch,
+) -> None:
+    def broken(self):
+        raise AttributeError("inner detail")
+
+    monkeypatch.setattr(DataStore, "broken_member", property(broken), raising=False)
+    ds = DataStore(
+        _store_with_assay("broken_member"),
+        default_assay="RNA",
+        min_features_per_cell=0,
+        zarr_mode="r+",
+    )
+
+    with pytest.raises(AttributeError, match="inner detail"):
+        _ = ds.broken_member
+    assert ds.get_assay("broken_member").name == "broken_member"
+
+
+def test_grouped_assay_named_like_a_datastore_member_keeps_the_store_usable():
+    store, _ = _qc_store()
+    ds = _open_qc_store(store)
+    ds.RNA.feats.insert("group", np.array(["a", "a", "b", "b", "c", "c"]))
+
+    ds.add_grouped_assay("group", assay_label="cells")
+
+    assert isinstance(ds.cells, MetaData)
+    assert ds.get_assay("cells").feats.fetch_all("ids").tolist() == [
+        "group_a",
+        "group_b",
+        "group_c",
+    ]
+    for mode in ("r+", "r"):
+        reopened = _open_qc_store(store, zarr_mode=mode)
+        assert isinstance(reopened.cells, MetaData)
+        assert reopened.assay_names == ["RNA", "cells"]
+        assert "cells" in dir(reopened)
+        np.testing.assert_allclose(
+            reopened.get_assay("cells").rawData.compute(),
+            ds.get_assay("cells").rawData.compute(),
+        )
+
+
 @pytest.mark.parametrize(
     ("argument", "value", "error_type", "message"),
     [

@@ -6,7 +6,12 @@ import numpy as np
 import pandas as pd
 import zarr
 
-from ..metadata.rows import MetaDataRowBlock, read_array_rows_chunkwise
+from ..metadata.queries import missing_frame_values
+from ..metadata.rows import (
+    MetaDataRowBlock,
+    apply_missing_mask,
+    read_array_rows_chunkwise,
+)
 from ..storage.artifacts import (
     artifact_group,
     fingerprint_stored_strings,
@@ -824,11 +829,7 @@ class PipelineAxisView:
                             ),
                             dtype=bool,
                         )
-                    if np.any(missing):
-                        values[column] = self._apply_plot_missing(
-                            values[column],
-                            missing,
-                        )
+                    values[column] = apply_missing_mask(values[column], missing)
             yield MetaDataRowBlock(
                 start=block.start,
                 stop=block.stop,
@@ -859,28 +860,6 @@ class PipelineAxisView:
             raise KeyError(f"Pipeline run field {column!r} was not captured")
         return None if descriptor.display is None else dict(descriptor.display)
 
-    @staticmethod
-    def _apply_plot_missing(
-        values: np.ndarray,
-        missing: np.ndarray,
-    ) -> np.ndarray:
-        """Represent nullable values without turning them into real plot values."""
-        array = np.asarray(values)
-        mask = np.asarray(missing, dtype=bool)
-        if not np.any(mask):
-            return array
-        if array.dtype.kind == "b":
-            output = array.copy()
-            output[mask] = False
-            return output
-        if array.dtype.kind in {"f", "i", "u"}:
-            output = array.astype(np.float64, copy=True)
-            output[mask] = np.nan
-            return output
-        output = array.astype(object, copy=True)
-        output[mask] = None
-        return output
-
     def _plot_fetch_all(self, column: str) -> np.ndarray:
         """Return one full-axis field with missing values safe for plotting."""
         values = self.fetch_all(column)
@@ -896,7 +875,7 @@ class PipelineAxisView:
             selection = self.fetch_all("I")
             full_missing = np.zeros(int(self._live_table.N), dtype=bool)
             full_missing[selection] = missing
-        return self._apply_plot_missing(values, full_missing)
+        return apply_missing_mask(values, full_missing)
 
     def _plot_fetch_selected(self, column: str) -> np.ndarray:
         """Return one selected-row field with missing values safe for plotting."""
@@ -904,10 +883,7 @@ class PipelineAxisView:
         descriptor = self._descriptor_by_key.get(column)
         if descriptor is None:
             return values
-        missing = self._selected_missing(descriptor)
-        if missing is None:
-            return values
-        return self._apply_plot_missing(values, missing)
+        return apply_missing_mask(values, self._selected_missing(descriptor))
 
     def _selected_prefix_indices(self, n: int) -> np.ndarray:
         if n == 0:
@@ -993,12 +969,7 @@ class PipelineAxisView:
             values = self.fetch(column)
             descriptor = self._descriptor_by_key.get(column)
             missing = None if descriptor is None else self._selected_missing(descriptor)
-            if missing is not None and np.any(missing):
-                series = pd.Series(values)
-                series[missing] = pd.NA
-                data[column] = series
-            else:
-                data[column] = values
+            data[column] = missing_frame_values(values, missing)
         return pd.DataFrame(data)
 
     def head(self, n: int = 5) -> pd.DataFrame:
@@ -1049,12 +1020,7 @@ class PipelineAxisView:
                         descriptor.value_index,
                     )
                 )
-            if missing is not None and np.any(missing):
-                series = pd.Series(values)
-                series[np.asarray(missing, dtype=bool)] = pd.NA
-                data[column] = series
-            else:
-                data[column] = values
+            data[column] = missing_frame_values(values, missing)
         return pd.DataFrame(data)
 
     def __repr__(self) -> str:

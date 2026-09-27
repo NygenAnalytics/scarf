@@ -559,6 +559,16 @@ def test_retired_dask_names_are_absent():
     assert "compute_with_progress" in dir(utils_module)
 
 
+def test_unbounded_diffusion_operator_is_absent():
+    import scarf.neighbors as neighbors
+    import scarf.neighbors.diffusion as diffusion
+
+    assert "diffusion_operator" not in neighbors.__all__
+    assert "diffusion_operator" not in dir(neighbors)
+    assert not hasattr(neighbors, "diffusion_operator")
+    assert not hasattr(diffusion, "diffusion_operator")
+
+
 def test_lazy_facades_clear_cached_exports_on_reload():
     subprocess.run(
         [
@@ -574,7 +584,7 @@ cases = (
     ("scarf.writers", "CSVtoZarr"),
     ("scarf.merge", "DataStoreMerge"),
     ("scarf.utils", "clean_array"),
-    ("scarf.neighbors", "diffusion_operator"),
+    ("scarf.neighbors", "calc_snn"),
     ("scarf.clustering", "balanced_cut"),
     ("scarf.embeddings", "initial_embedding"),
     ("scarf.trajectory", "PseudotimeScoreResult"),

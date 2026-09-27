@@ -97,6 +97,11 @@ class CountSummary:
             raise ValueError("Counts must be a two-dimensional numeric array")
         self.shape = (int(counts.shape[0]), int(counts.shape[1]))
         self.dtype = np.dtype(counts.dtype).newbyteorder("=")
+        if self.dtype == np.float16:
+            raise ValueError(
+                "float16 is not a supported count storage dtype; store the "
+                "counts as float32 or wider"
+            )
         self.start, self.stop = (0, self.shape[0]) if rows is None else rows
         n_rows = self.stop - self.start
         self.digests = np.zeros((n_rows, 2), dtype=np.uint64)

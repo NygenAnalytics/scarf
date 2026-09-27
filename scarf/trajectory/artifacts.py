@@ -7,7 +7,7 @@ import zarr
 from scipy.sparse import coo_matrix, csr_matrix
 
 from ..assay.normalization import recorded_count_arithmetic
-from ..storage.arrays import create_zarr_dataset
+from ..storage.arrays import create_zarr_dataset, linked_missing_mask
 from ..storage.artifacts import (
     ArtifactRef,
     ValueFingerprintBuilder,
@@ -492,20 +492,15 @@ def load_cell_artifact_values(
     if values_array.ndim < 1 or int(values_array.shape[0]) != selected_count:
         raise ValueError("Cell-data artifact values do not match their selection")
     values = np.asarray(values_array[:])
-    raw_missing_name = values_array.attrs.get("missing_mask")
-    if raw_missing_name is None:
-        missing = None
-    else:
-        if not isinstance(raw_missing_name, str) or raw_missing_name not in group:
-            raise ValueError("Cell-data artifact missing mask is malformed")
-        missing_array = as_zarr_array(group[raw_missing_name], name=raw_missing_name)
-        if (
-            missing_array.ndim != 1
-            or tuple(missing_array.shape) != (selected_count,)
-            or np.dtype(missing_array.dtype) != np.dtype(bool)
-        ):
-            raise ValueError("Cell-data artifact missing mask is malformed")
-        missing = np.asarray(missing_array[:], dtype=bool)
+    missing_array = linked_missing_mask(
+        group,
+        canonical_name,
+        label=f"Cell-data artifact array {canonical_name!r}",
+        values=values_array,
+    )
+    missing = (
+        None if missing_array is None else np.asarray(missing_array[:], dtype=bool)
+    )
     return values, selection, missing
 
 

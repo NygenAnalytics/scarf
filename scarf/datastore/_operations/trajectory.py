@@ -15,7 +15,11 @@ from ...graph.feature_projection import (
     resolve_graph_source_assay,
 )
 from ...matrix import ChunkedArray
-from ...metadata.rows import read_array_rows_chunkwise, read_metadata_rows_chunkwise
+from ...metadata.rows import (
+    read_array_rows_chunkwise,
+    read_metadata_missing_rows_chunkwise,
+    read_metadata_rows_chunkwise,
+)
 from ...metadata.arguments import (
     FateMappingArguments,
     PseudotimeAggregationArguments,
@@ -421,7 +425,9 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         cell metadata column (case-sensitive) diffuses that column's values.
         Any other name matches assay feature names case-insensitively, and
         the mean of all matching features is diffused when a name is not
-        unique.
+        unique. A metadata column whose linked missing mask flags a cell in
+        the operator's cell selection raises ``ValueError``, because diffusion
+        would spread its stored placeholder to neighbouring cells.
 
         Args:
             from_assay: Name of assay to be used. If no value is provided then the default assay will be used.
@@ -467,6 +473,19 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         )
         metadata_columns = set(self.cells.columns)
         metadata_slots = [i for i, name in enumerate(names) if name in metadata_columns]
+        for slot in metadata_slots:
+            missing = read_metadata_missing_rows_chunkwise(
+                self.cells,
+                names[slot],
+                cell_indices,
+            )
+            if missing is not None and missing.any():
+                raise ValueError(
+                    f"Cell metadata column {names[slot]!r} contains missing values "
+                    "in the diffusion operator's cell selection. Build the "
+                    "diffusion operator over a selection without them, such as "
+                    "one from filter_cells, which excludes missing values"
+                )
         feature_slots = [
             i for i, name in enumerate(names) if name not in metadata_columns
         ]

@@ -35,6 +35,7 @@ from ..cell_quality.profiles import (
 from ..tools import (
     artifact_reference,
     core_artifact_reference,
+    mark_missing_rows,
     persisted_assay_types,
 )
 from ..types import ArtifactReferenceModel
@@ -161,7 +162,7 @@ def _resolved_artifact_values(
         cell_selection=_cell_selection_ref(deps),
         expected_kind=expected_kind,
     )
-    return np.asarray(resolved.values)
+    return mark_missing_rows(resolved.values, resolved.missing_mask)
 
 
 def _artifact_input_references(

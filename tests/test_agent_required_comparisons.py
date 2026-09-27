@@ -7,6 +7,8 @@ from typing import Any
 import numpy as np
 import pytest
 
+from scarf.agent.experimental_context import characterization
+from scarf.agent.experimental_context.characterization import _SelectionBoundCells
 from scarf.agent.orchestrator import journal, rna_tuning
 from scarf.agent.orchestrator.budget import candidate_identity, CandidateBudgetExceeded
 from scarf.agent.orchestrator.models import (
@@ -26,6 +28,8 @@ from scarf.agent.parameter_tuning.comparisons import (
 from scarf.agent.types import ArtifactReferenceModel
 from tests.agent_comparison_examples import comparison_review
 from tests.agent_examples import example
+from tests.test_pipeline import _insert_nullable_cell_column
+from tests.test_registered_qc_profiles import _memory_qc_store
 from tests.test_agent_rna_adaptive import checkpoints as memory_checkpoints  # noqa: F401
 
 
@@ -239,9 +243,9 @@ def panel_run(monkeypatch: pytest.MonkeyPatch) -> rna_tuning.RnaTuningRun:
         rna_tuning, "read_stored_selection_indices", lambda *a, **kw: np.arange(100)
     )
     monkeypatch.setattr(
-        rna_tuning,
-        "read_metadata_rows_chunkwise",
-        lambda *a, **kw: np.repeat(["a", "b"], 50),
+        characterization,
+        "_SelectionBoundCells",
+        lambda *a: SimpleNamespace(fetch=lambda _: np.repeat(["a", "b"], 50)),
     )
     store.cells = SimpleNamespace()
     monkeypatch.setattr(
@@ -341,6 +345,34 @@ def test_required_panel_executes_twelve_rows_and_holds_other_settings_fixed(
         (item.parameters.dimensions, item.parameters.neighborsK)
         for item in run.evaluations["sample0"]
     } == {(21, 11), (10, 11), (30, 11), (21, 21), (21, 41)}
+
+
+def test_batch_aware_ranking_does_not_count_masked_capture_placeholders(
+    panel_run: rna_tuning.RnaTuningRun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = np.arange(100)
+    missing = rows >= 60
+    # Only capture 1 has 20 recorded cells; the masked rows keep the placeholder
+    # 0, which would otherwise form a second capture of 40 cells.
+    captures = np.where(missing, 0, np.where(rows < 45, 1, 2))
+    store, selection = _memory_qc_store({"RNA_nCounts": np.ones(100)})
+    _insert_nullable_cell_column(store, "capture", captures, missing)
+    run = panel_run
+    run.store.cells = store.cells
+    monkeypatch.setattr(
+        characterization,
+        "_SelectionBoundCells",
+        lambda *_: _SelectionBoundCells(store.zw, store.cells, selection),
+    )
+    baseline = run._resolution_panel("sample0", run.cells, run.baseline())
+    run.resolution_candidates.clear()
+    run._sensitivity_panel("sample0", run.cells, baseline)
+    row = next(
+        row for row in run.comparison_rows["sample0"] if row["axis"] == "hvgRanking"
+    )
+    assert row["status"] == "notApplicable"
+    assert row["observedProof"]["eligibleGroupsByColumn"] == {"capture": 1}
 
 
 def test_full_validation_reuses_exact_all_cell_discovery_without_charge(

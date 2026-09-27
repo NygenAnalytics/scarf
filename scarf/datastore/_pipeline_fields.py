@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 
 from ..metadata.artifacts import categorical_display, continuous_display
+from ..storage.arrays import linked_missing_mask
 from ..storage.artifacts import ArtifactRef, artifact_group
 from ..storage.pipeline_runs import PipelineFieldDescriptor
 from ..storage.types import as_zarr_array
@@ -116,15 +117,14 @@ def _snapshot_field(
 ) -> PipelineFieldDescriptor:
     group = artifact_group(root, snapshot)
     array = as_zarr_array(group[key], name=key)
-    raw_missing = array.attrs.get("missing_mask")
-    missing = raw_missing if isinstance(raw_missing, str) else None
+    missing = linked_missing_mask(group, key, values=array)
     return _field(
         key=key,
         axis=axis,
         ref=snapshot,
         source_value=key,
         dtype=array.dtype,
-        missing_mask=missing,
+        missing_mask=None if missing is None else missing.basename,
     )
 
 

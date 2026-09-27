@@ -528,12 +528,11 @@ def test_characterize_covariates_avoids_bulk_metadata_loads(
 ) -> None:
     store = _store_with_design(tmp_path)
     cell_selection = store.snapshot_cell_selection("I")
-    characterize_covariates_module = import_module(
-        "scarf.agent.experimental_context.characterization"
-    )
+    # Bound metadata reads go through the shared agent reader.
+    shared_reader_module = import_module("scarf.agent.tools")
     original_fetch = store.cells.fetch
     original_fetch_all = store.cells.fetch_all
-    original_read_rows = characterize_covariates_module.read_metadata_rows_chunkwise
+    original_read_rows = shared_reader_module.read_metadata_rows_chunkwise
     inside_fetch = False
     direct_full_fetches: list[str] = []
     chunkwise_columns: list[str] = []
@@ -562,7 +561,7 @@ def test_characterize_covariates_avoids_bulk_metadata_loads(
     monkeypatch.setattr(store.cells, "fetch", fetch_spy)
     monkeypatch.setattr(store.cells, "fetch_all", fetch_all_spy)
     monkeypatch.setattr(
-        characterize_covariates_module,
+        shared_reader_module,
         "read_metadata_rows_chunkwise",
         read_rows_spy,
     )

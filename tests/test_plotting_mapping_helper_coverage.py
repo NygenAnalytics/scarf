@@ -217,22 +217,36 @@ def test_plot_data_grouping_and_layout_validation(monkeypatch) -> None:
             cell_key="custom",
         )
 
-    status = SimpleNamespace(complete=False)
-    monkeypatch.setattr(plotting_data, "inspect_artifact", lambda *_: status)
-    with pytest.raises(ValueError, match="unavailable or incomplete"):
-        plotting_data._resolve_grouping(
-            store,
-            group_by=None,
-            groups=groups,
-            cell_key="I",
+    resolver_calls: list[dict[str, Any]] = []
+
+    def resolve_artifact(_root: Any, artifact: ArtifactRef, **kwargs: Any) -> Any:
+        assert artifact == groups
+        resolver_calls.append(kwargs)
+        return SimpleNamespace(
+            values=np.array([3, 0, 4]),
+            cell_idx=np.array([0, 2, 5]),
+            missing_mask=np.array([False, True, False]),
         )
 
-    status.complete = True
     monkeypatch.setattr(
         plotting_data,
-        "_artifact_cell_selection",
-        lambda *_args, **_kwargs: selection,
+        "resolve_cell_aligned_artifact",
+        resolve_artifact,
     )
+    keys, cell_idx, columns, missing = plotting_data._resolve_grouping(
+        store,
+        group_by=None,
+        groups=groups,
+        cell_key="I",
+    )
+    assert resolver_calls == [
+        {"value_name": "values", "expected_kind": "cluster_labels"}
+    ]
+    assert keys == ("groups",)
+    np.testing.assert_array_equal(cell_idx, [0, 2, 5])
+    assert columns[0].tolist() == [3, None, 4]
+    np.testing.assert_array_equal(missing, [False, True, False])
+
     monkeypatch.setattr(
         plotting_data,
         "read_stored_selection_indices",
@@ -241,23 +255,6 @@ def test_plot_data_grouping_and_layout_validation(monkeypatch) -> None:
     payload: dict[str, Any] = {}
     monkeypatch.setattr(plotting_data, "artifact_group", lambda *_: payload)
     monkeypatch.setattr(plotting_data, "as_zarr_array", lambda value, **_: value)
-    with pytest.raises(ValueError, match="canonical 'values'"):
-        plotting_data._resolve_grouping(
-            store,
-            group_by=None,
-            groups=groups,
-            cell_key="I",
-        )
-
-    payload["values"] = np.array(["a"])
-    with pytest.raises(ValueError, match="do not align"):
-        plotting_data._resolve_grouping(
-            store,
-            group_by=None,
-            groups=groups,
-            cell_key="I",
-        )
-
     layout = _ref("embedding", "6")
     monkeypatch.setattr(
         plotting_data,

@@ -29,6 +29,8 @@ from ...metadata.arguments import (
     MembershipStrengthArguments,
     SmartLabelArguments,
 )
+from ...metadata.rows import read_metadata_missing_rows
+from ...metadata.selection import resolve_complete_labels
 from ...metadata.artifacts import (
     plan_cell_data_artifact,
     write_cell_data_artifact,
@@ -47,10 +49,6 @@ else:
     _PresentationOperationsBase = object
 
 
-_CELL_LABEL_VALUE_NAMES = {
-    "cell_cycle": "phase",
-    "cluster_cut": "labels",
-}
 _MEMBERSHIP_BLOCK_EDGES = 1_048_576
 
 
@@ -66,39 +64,6 @@ def _row_mode_counts(codes: np.ndarray) -> np.ndarray:
     # Each position's run begins at the latest preceding run start.
     run_origins = np.maximum.accumulate(np.where(run_starts, positions, 0), axis=1)
     return np.asarray((positions - run_origins + 1).max(axis=1), dtype=np.int64)
-
-
-def _load_cell_label_artifact(
-    root: zarr.Group,
-    ref: ArtifactRef,
-) -> tuple[np.ndarray, ArtifactRef]:
-    if not isinstance(ref, ArtifactRef):
-        raise TypeError("label input must be an ArtifactRef")
-    status = inspect_artifact(root, ref)
-    if not status.complete:
-        raise ValueError("Label artifact is unavailable or incomplete")
-    raw_selection = (status.inputs or {}).get("cell_selection")
-    if not isinstance(raw_selection, dict):
-        raise ValueError("Label artifact has no cell-selection input")
-    selection = ArtifactRef.from_dict(raw_selection)
-    validate_stored_selection_integrity(
-        root,
-        selection,
-        kind="cell_selection",
-        scope="datastore",
-        assay=None,
-        table_path="cellData",
-    )
-    value_name = _CELL_LABEL_VALUE_NAMES.get(ref.kind, "values")
-    group = as_zarr_group(root[status.path], name=status.path)
-    if value_name not in group:
-        raise ValueError(
-            f"{ref.kind} artifact has no canonical {value_name!r} label array"
-        )
-    values = np.asarray(as_zarr_array(group[value_name], name=value_name)[:])
-    if values.ndim != 1:
-        raise ValueError("Label artifact values must be one-dimensional")
-    return values, selection
 
 
 def _lift_frozen_umap_to_obsm(adata: Any) -> None:
@@ -137,7 +102,9 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         ``run``, layout coordinates remain ordinary ``obs`` columns and this
         method does not populate ``obsm``. With ``run``, consecutive frozen
         ``umap_*`` fields are written to ``obsm["X_umap"]`` and removed from
-        ``obs``. Cluster and QC labels stay in ``obs``.
+        ``obs``. Cluster and QC labels stay in ``obs``. Rows that a nullable
+        column's linked missing mask flags are missing values in ``obs`` and
+        ``var``, with or without ``run``.
 
         Args:
             from_assay: Name of assay to be used. If no value is provided then the default assay will be used.
@@ -371,7 +338,9 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         common cluster label.
 
         Args:
-            clusters: Explicit axis-aligned cluster-label artifact.
+            clusters: Explicit axis-aligned cluster-label artifact with a label
+                for every cell. Labels that its linked missing mask flags
+                raise ``ValueError``.
             graph: Explicit connectivity-map or integrated-graph artifact.
 
         Returns:
@@ -394,11 +363,9 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             assay=None,
             table_path="cellData",
         )
-        cluster_values, cluster_selection = _load_cell_label_artifact(
-            self.zw,
-            clusters,
-        )
-        if cluster_selection != selection:
+        resolved_clusters = resolve_complete_labels(self.zw, clusters, name="clusters")
+        cluster_values = resolved_clusters.values
+        if resolved_clusters.source_cell_selection != selection:
             raise ValueError("Cluster labels do not match the graph cell selection")
         if cluster_values.shape != (n_cells,):
             raise ValueError("Cluster labels do not align with graph rows")
@@ -476,7 +443,8 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         suffixes like, 'a', 'b', etc. The suffixes are ordered based on where
         the largest fraction of the B label lies. If one label from A takes up
         multiple labels from B then all the labels from B are included, and they
-        are delimited by hyphens.
+        are delimited by hyphens. Both artifacts need a label for every cell;
+        labels that a linked missing mask flags raise ``ValueError``.
 
         Args:
             to_relabel: Explicit axis-aligned label artifact to relabel.
@@ -485,15 +453,12 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         Returns:
             Reference to the immutable relabeled-values artifact.
         """
-        values_to_relabel, selection = _load_cell_label_artifact(
-            self.zw,
-            to_relabel,
-        )
-        base_values, base_selection = _load_cell_label_artifact(
-            self.zw,
-            base_label,
-        )
-        if base_selection != selection:
+        relabelled = resolve_complete_labels(self.zw, to_relabel, name="to_relabel")
+        base = resolve_complete_labels(self.zw, base_label, name="base_label")
+        values_to_relabel = relabelled.values
+        base_values = base.values
+        selection = relabelled.source_cell_selection
+        if base.source_cell_selection != selection:
             raise ValueError("Label artifacts must share one cell selection")
         if base_values.shape != values_to_relabel.shape:
             raise ValueError(
@@ -750,11 +715,17 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
                 partition_array[:] = partition_id_values
                 finish_artifact(coalesced_group, coalesced_plan)
         color_values = None
+        color_missing = None
         if fill_by_value is not None:
             if fill_by_value in self.cells.columns:
                 color_values = np.asarray(self.cells.fetch_all(fill_by_value))[
                     cell_indices
                 ]
+                color_missing = read_metadata_missing_rows(
+                    self.cells,
+                    fill_by_value,
+                    cell_indices,
+                )
             else:
                 assay = self._get_assay(from_assay)
                 feature_indices = assay.feats.get_index_by(
@@ -778,6 +749,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             "graph": subgraph,
             "clusters": clusters,
             "color_values": color_values,
+            "color_missing": color_missing,
             "from_assay": from_assay,
             "graph_ref": graph_ref,
             "clusters_ref": clusters_ref,

@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from ..storage.types import ZarrMode
 from ..assay import Assay
@@ -199,7 +199,7 @@ class DataStore(
         """
         if assay_name not in self._assayNames:
             raise ValueError(f"ERROR: Assay {assay_name} not found in the Zarr file")
-        return cast(Assay, getattr(self, assay_name))
+        return self._assays[assay_name]
 
     def resolve_features(
         self,

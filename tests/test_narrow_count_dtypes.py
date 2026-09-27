@@ -1,4 +1,4 @@
-"""Integer normalization arithmetic and reuse of saved results."""
+"""Normalization of integer counts and zero-count cells, and reuse of saved results."""
 
 import itertools
 import pickle
@@ -819,6 +819,90 @@ def test_stale_narrow_normalizations_are_not_reused(tmp_path):
         artifact_group(store.zw, stale_rna)["data"][:], stale_values
     )
     assert normalize() == (fresh_rna, fresh_adt)
+
+
+def test_zero_total_normalizations_written_with_nan_rows_are_not_reused(
+    tmp_path, monkeypatch
+):
+    from scarf.assay import RNAassay
+
+    values = _counts(12, 6, 50).astype(np.float32) + 0.5
+    zero_cells = [1, 7]
+    values[zero_cells] = 0
+    store = _h5ad_store(tmp_path, values)
+    assert store.RNA.rawData.dtype == np.float32
+    store.cells.insert("everyone", np.ones(12, dtype=bool), overwrite=True)
+    store.cells.insert("expressed", values.sum(axis=1) > 0, overwrite=True)
+    everyone = store.snapshot_cell_selection("everyone")
+    features = store.select_all_features(from_assay="RNA")
+
+    def normalize(cells: Any = everyone, **flags: Any) -> Any:
+        options = {"renormalize_subset": False, "log_transform": True, **flags}
+        return store.run_normalization(cells, features, **options)
+
+    # Earlier releases recorded no divisor and wrote NaN rows for these cells.
+    with monkeypatch.context() as patch:
+        patch.setattr(RNAassay, "_has_zero_total_cells", lambda *_: False)
+        stale = normalize()
+        subset = normalize(renormalize_subset=True)
+    stale_data = artifact_group(store.zw, stale)["data"]
+    for row in zero_cells:
+        stale_data[row] = np.nan
+
+    fresh = normalize()
+
+    assert fresh != stale
+    assert store.inspect_artifact(fresh).parameters["zero_total_divisor"] == "one"
+    data = np.asarray(artifact_group(store.zw, fresh)["data"][:])
+    np.testing.assert_array_equal(data[zero_cells], 0)
+    np.testing.assert_allclose(
+        data, _lib_size_reference(values, log_transform=True), rtol=1e-6
+    )
+    assert np.isnan(stale_data[:][zero_cells]).all()
+    assert normalize() == fresh
+    # Subset renormalization and selections without such cells keep their
+    # identities.
+    assert normalize(renormalize_subset=True) == subset
+    expressed = normalize(store.snapshot_cell_selection("expressed"))
+    assert "zero_total_divisor" not in (
+        store.inspect_artifact(expressed).parameters or {}
+    )
+
+
+def test_zero_total_divisor_is_recorded_only_when_set():
+    from scarf.graph.arguments import NormalizationArguments
+    from scarf.storage.artifacts import ArtifactRef
+
+    def arguments(**extra: Any) -> NormalizationArguments:
+        return NormalizationArguments(
+            cell_selection=ArtifactRef("datastore", "cell_selection", "2" * 64),
+            feature_selection=ArtifactRef(
+                "assay", "feature_selection", "3" * 64, assay="RNA"
+            ),
+            dataset_fingerprint="dataset-v1",
+            normalization_method="norm_lib_size",
+            size_factor=1000.0,
+            log_transform=True,
+            renormalize_subset=False,
+            **extra,
+        )
+
+    unset = arguments()
+    marked = arguments(zero_total_divisor="one")
+
+    assert "zero_total_divisor" not in unset.to_record().parameters
+    assert marked.to_record().parameters["zero_total_divisor"] == "one"
+    assert unset.provenance_hash() != marked.provenance_hash()
+
+    reference = _normalization_parameters(
+        {**_REFERENCE_RECORD, "zero_total_divisor": "one"}
+    )
+    assert reference["zero_total_divisor"] == "one"
+    for invalid in ("zero", None):
+        with pytest.raises(ValueError, match="zero_total_divisor"):
+            _normalization_parameters(
+                {**_REFERENCE_RECORD, "zero_total_divisor": invalid}
+            )
 
 
 @pytest.mark.parametrize("dtype", WIDE_AND_FLOAT)

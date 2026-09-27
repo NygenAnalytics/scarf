@@ -111,15 +111,19 @@ def _normalization_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
             "Reference normalization parameters are missing: "
             + ", ".join(sorted(missing))
         )
-    # Normalizations computed through ``normed`` from integer counts narrower
-    # than 32 bits record their float64 count arithmetic.
-    unknown = set(values) - required - {"count_arithmetic"}
+    # Library-size normalizations computed through ``normed`` from integer
+    # counts record their float64 count arithmetic. Those without subset
+    # renormalization over a selection with a zero-count cell record that its
+    # total is divided as 1.
+    unknown = set(values) - required - {"count_arithmetic", "zero_total_divisor"}
     if unknown:
         raise ValueError(
             "Unsupported reference normalization parameters: "
             + ", ".join(sorted(unknown))
         )
     recorded_count_arithmetic(values)
+    if values.get("zero_total_divisor", "one") != "one":
+        raise ValueError("zero_total_divisor must be 'one' when recorded")
 
     method = values["normalization_method"]
     supported_method = callable_identity(norm_lib_size)

@@ -209,6 +209,11 @@ Without a `run`, `to_h5ad` and `to_mtx` export a complete assay.
 For feature-selective disk export outside a pipeline run, call `to_anndata` and use AnnData's
 writer.
 
+Nullable metadata columns keep a stored placeholder in each row that their linked missing mask
+flags. `to_anndata` and `to_h5ad` export those rows as missing values with or without `run`:
+numeric columns become float64 with `NaN`, boolean columns become nullable booleans, and other
+columns hold a missing value, which H5AD files store as a missing category.
+
 Pass a completed run to write its frozen cells, feature universe, and result fields directly:
 
 ```python

@@ -89,13 +89,13 @@ from ...metadata.arguments import (
     StatisticalTestingArguments,
     WaggrArguments,
 )
-from ...metadata.artifacts import artifact_values
 from ...metadata.selection import (
     CellField,
     FeatureRef,
     NormalizationSpec,
     ResolvedGrouping,
     StudyDesign,
+    resolve_complete_labels,
     resolve_grouping,
     valid_category_mask,
 )
@@ -1541,7 +1541,9 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
 
         Args:
             from_assay: Name of the assay to be used. If no value is provided then the default assay will be used.
-            clusters: Complete ``cluster_labels`` or ``cluster_cut`` artifact.
+            clusters: Complete ``cluster_labels`` or ``cluster_cut`` artifact
+                with a label for every cell. Labels that its linked missing
+                mask flags raise ``ValueError``.
             features: Explicit feature-selection artifact.
             nthreads: Threads for marker search.
             **norm_params: Extra keyword arguments forwarded to ``normed``.
@@ -1566,31 +1568,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             or not cluster_status.complete
         ):
             raise ValueError("clusters must be a complete clustering artifact")
-        raw_selection = (cluster_status.inputs or {}).get("cell_selection")
-        if not isinstance(raw_selection, dict):
-            raise ValueError("Clustering artifact has no cell-selection input")
-        try:
-            cell_selection = ArtifactRef.from_dict(raw_selection)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("Clustering artifact cell selection is malformed") from exc
-        cell_index = read_stored_selection_indices(
-            self.zw,
-            cell_selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )
-        cluster_group = as_zarr_group(
-            self.zw[artifact_path(clusters)],
-            name=clusters.artifact_id,
-        )
-        value_name = "values" if clusters.kind == "cluster_labels" else "labels"
-        group_labels = np.asarray(
-            as_zarr_array(cluster_group[value_name], name=value_name)[:]
-        )
-        if group_labels.shape != (len(cell_index),):
-            raise ValueError("Clustering labels do not align with their cell selection")
+        resolved_clusters = resolve_complete_labels(self.zw, clusters, name="clusters")
         if nthreads is None:
             nthreads = self.nthreads
 
@@ -1601,9 +1579,9 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         )
         return self._run_marker_search_artifact(
             assay=assay,
-            cell_selection=cell_selection,
+            cell_selection=resolved_clusters.source_cell_selection,
             clusters=clusters,
-            cluster_values=group_labels,
+            cluster_values=resolved_clusters.values,
             feature_selection=feature_selection,
             nthreads=nthreads,
             invalidate_cache=invalidate_cache,
@@ -2176,6 +2154,9 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         document frequency and ADT CLR geometric means are therefore shared by
         all groups rather than learned separately for each group.
 
+        Cells whose group or sub-group label is flagged by a linked missing
+        mask join no group, like cells whose value is in ``null_vals``.
+
         Args:
             groups: Explicit clustering artifact or user-owned metadata column
                 used to group cells.
@@ -2221,97 +2202,28 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         def resolve_groups(
             source: ArtifactRef | str,
             expected_selection: ArtifactRef | None,
-        ) -> tuple[NDArray[Any], ArtifactRef, NDArray[np.int64]]:
+        ) -> tuple[NDArray[Any], ArtifactRef, NDArray[np.int64], NDArray[np.bool_]]:
             if isinstance(source, str):
-                selection = (
-                    self.snapshot_cell_selection()
-                    if expected_selection is None
-                    else expected_selection
-                )
-                validate_stored_selection_integrity(
-                    self.zw,
-                    selection,
-                    kind="cell_selection",
-                    scope="datastore",
-                    assay=None,
-                    table_path="cellData",
-                )
-                indices = read_stored_selection_indices(
-                    self.zw,
-                    selection,
-                    kind="cell_selection",
-                    scope="datastore",
-                    assay=None,
-                    table_path="cellData",
-                )
-                values = np.asarray(self.cells.fetch_all(source))[indices]
-                return values, selection, indices
-            if not isinstance(source, ArtifactRef):
+                grouping: ArtifactRef | CellField = CellField(source)
+                if expected_selection is None:
+                    expected_selection = self.snapshot_cell_selection()
+            elif isinstance(source, ArtifactRef):
+                grouping = source
+            else:
                 raise TypeError("groups must be an ArtifactRef or column name")
-            value_names = {
-                "cell_cycle": "phase",
-                "cluster_cut": "labels",
-                "cluster_labels": "values",
-                "hto_identity": "values",
-                "smart_label": "values",
-            }
-            value_name = value_names.get(source.kind)
-            if value_name is None:
-                raise ValueError(
-                    "Grouping artifacts must contain categorical cell labels"
-                )
-            status = inspect_artifact(self.zw, source)
-            if not status.complete:
-                raise ValueError("Grouping artifact is unavailable or incomplete")
-            raw_selection = (status.inputs or {}).get("cell_selection")
-            if not isinstance(raw_selection, dict):
-                raise ValueError("Grouping artifact has no cell-selection input")
-            selection = ArtifactRef.from_dict(raw_selection)
-            validate_stored_selection_integrity(
+            resolved = resolve_grouping(
                 self.zw,
-                selection,
-                kind="cell_selection",
-                scope="datastore",
-                assay=None,
-                table_path="cellData",
+                self.cells,
+                grouping,
+                cell_selection=expected_selection,
             )
-            indices = read_stored_selection_indices(
-                self.zw,
-                selection,
-                kind="cell_selection",
-                scope="datastore",
-                assay=None,
-                table_path="cellData",
+            assert resolved.cell_selection is not None
+            missing = (
+                np.zeros(len(resolved.labels), dtype=bool)
+                if resolved.missing_mask is None
+                else resolved.missing_mask
             )
-            values = artifact_values(artifact_group(self.zw, source), value_name)
-            if values.shape != (len(indices),):
-                raise ValueError("Grouping values do not align with selected cells")
-            if expected_selection is not None:
-                validate_stored_selection_integrity(
-                    self.zw,
-                    expected_selection,
-                    kind="cell_selection",
-                    scope="datastore",
-                    assay=None,
-                    table_path="cellData",
-                )
-                expected_indices = read_stored_selection_indices(
-                    self.zw,
-                    expected_selection,
-                    kind="cell_selection",
-                    scope="datastore",
-                    assay=None,
-                    table_path="cellData",
-                )
-                keep = np.isin(indices, expected_indices, assume_unique=True)
-                if int(keep.sum()) != len(expected_indices):
-                    raise ValueError(
-                        "cell_selection must be a subset of the grouping artifact"
-                    )
-                values = values[keep]
-                indices = indices[keep]
-                selection = expected_selection
-            return values, selection, indices
+            return resolved.labels, resolved.cell_selection, resolved.cell_idx, missing
 
         if pseudo_reps < 1:
             pseudo_reps = 1
@@ -2326,22 +2238,24 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             null_vals = []
         if secondary_null_vals is None:
             secondary_null_vals = []
-        group_values, resolved_selection, active_idx = resolve_groups(
+        group_values, resolved_selection, active_idx, group_missing = resolve_groups(
             groups,
             cell_selection,
         )
-        groups_set = sorted(set(group_values))
+        # Cells whose label is masked as missing join no group.
+        labelled = ~group_missing
+        groups_set = sorted(set(group_values[labelled]))
         if secondary_groups is None:
             sec_group_values: NDArray[Any] = np.array([None], dtype=object)
             sec_groups_set: list[Any] = [None]
         else:
-            sec_group_values, _secondary_selection, secondary_idx = resolve_groups(
-                secondary_groups,
-                resolved_selection,
+            sec_group_values, _secondary_selection, secondary_idx, sec_missing = (
+                resolve_groups(secondary_groups, resolved_selection)
             )
             if not np.array_equal(secondary_idx, active_idx):
                 raise ValueError("Grouping artifacts use different ordered cells")
-            sec_groups_set = sorted(set(sec_group_values))
+            sec_groups_set = sorted(set(sec_group_values[~sec_missing]))
+            labelled &= ~sec_missing
 
         if from_assay is None and isinstance(groups, ArtifactRef):
             from_assay = groups.assay
@@ -2355,10 +2269,10 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 if sg in secondary_null_vals:
                     continue
                 if sg is None and len(sec_group_values) == 1:
-                    selected_rows = np.flatnonzero(group_values == g)
+                    selected_rows = np.flatnonzero((group_values == g) & labelled)
                 else:
                     selected_rows = np.flatnonzero(
-                        (group_values == g) & (sec_group_values == sg)
+                        (group_values == g) & (sec_group_values == sg) & labelled
                     )
                 g_idx = active_idx[selected_rows]
                 rep_indices = make_reps(g_idx, pseudo_reps, random_seed)

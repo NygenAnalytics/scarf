@@ -20,6 +20,7 @@ from ._contracts import (
 )
 from ._data import (
     _check_feature_count,
+    _fetch_cell_column,
     _resolve_grouping,
     _summarize_resolved_features,
     coerce_feature_list,
@@ -239,11 +240,13 @@ def _sample_counts(
     sample_key = study_design.sample_by if study_design is not None else sample_by
     if sample_key is None:
         return None, 0
-    values = (
-        np.asarray(store.cells.fetch(sample_key, key=cell_key), dtype=object)
-        if cell_indices is None
-        else np.asarray(store.cells.fetch_all(sample_key), dtype=object)[cell_indices]
-    )
+    values = _fetch_cell_column(
+        store,
+        sample_key,
+        cell_key=cell_key,
+        cell_idx=cell_indices,
+        labels=True,
+    ).astype(object)
     valid = pd.notna(values) & (values != "")
     return int(pd.Series(values[valid]).nunique()), int((~valid).sum())
 
@@ -316,7 +319,7 @@ def dotplot(
         groups=groups,
         cell_key=cell_key,
     )
-    group_keys, cell_indices, _group_values = grouping
+    group_keys, cell_indices, _group_values, group_missing = grouping
     if marker_linewidth < 0:
         raise ValueError("marker_linewidth must be non-negative")
     if isinstance(group_by, str):
@@ -652,6 +655,9 @@ def dotplot(
                 ),
                 "expression_cutoff": expression_cutoff,
                 "dropped_sample_cells": dropped_sample_cells,
+                "dropped_group_cells": (
+                    0 if group_missing is None else int(group_missing.sum())
+                ),
                 "normalization": {
                     "source": normalization.source,
                     "transform": normalization.transform,
@@ -736,7 +742,7 @@ def matrixplot(
         groups=groups,
         cell_key=cell_key,
     )
-    group_keys, cell_indices, _group_values = grouping
+    group_keys, cell_indices, _group_values, group_missing = grouping
 
     feature_pairs = coerce_feature_list(features)
     _check_feature_count(feature_pairs)
@@ -971,6 +977,9 @@ def matrixplot(
                 ),
                 "expression_cutoff": expression_cutoff,
                 "dropped_sample_cells": dropped_sample_cells,
+                "dropped_group_cells": (
+                    0 if group_missing is None else int(group_missing.sum())
+                ),
                 "normalization": {
                     "source": normalization.source,
                     "transform": normalization.transform,

@@ -737,6 +737,115 @@ def test_h5adtozarr_uses_smallest_lossless_dtype_for_float_counts(
     assert root["RNA/countsT"].attrs["complete"] is True
 
 
+def _half_precision_h5ad(path, values: np.ndarray, encoding: str):
+    """Write ``values`` as float16, which SciPy sparse matrices cannot hold."""
+    import h5py
+
+    _write_h5ad(path, values.astype(np.float32), encoding=encoding)
+    with h5py.File(path, mode="r+") as h5:
+        parent, name = (h5, "X") if encoding == "dense" else (h5["X"], "data")
+        half = np.asarray(parent[name][...], dtype=np.float16)
+        del parent[name]
+        parent.create_dataset(name, data=half)
+    return path
+
+
+@pytest.mark.parametrize(
+    ("encoding", "fractional", "expected_dtype"),
+    [
+        ("csr", False, np.dtype("uint16")),
+        ("csr", True, np.dtype("float32")),
+        ("csc", True, np.dtype("float32")),
+        ("dense", False, np.dtype("float32")),
+    ],
+)
+def test_h5adtozarr_imports_float16_counts_as_float32(
+    tmp_path, encoding, fractional, expected_dtype
+):
+    from scarf.readers import H5adReader
+    from scarf.writers import H5adToZarr
+
+    values = _band_counts(12, 3).astype(np.float16)
+    values[0, 0] = 1.5 if fractional else 2048
+    path = _half_precision_h5ad(tmp_path / "half.h5ad", values, encoding)
+    reader = H5adReader(str(path), feature_name_key="feature_name")
+    store = MemoryStore()
+    try:
+        assert reader.sourceMatrixDtype == np.float32
+        H5adToZarr(
+            reader,
+            zarr_loc=store,
+            mem_budget=1024**2,
+            nthreads=2,
+            policy=CountMatrixPolicy(unitBytes=48, chunkBytes=48),
+        ).dump(batch_size=4)
+    finally:
+        reader.h5.close()
+
+    root = zarr.open_group(store=store, mode="r")
+    assert np.dtype(root["RNA/counts"].dtype) == expected_dtype
+    np.testing.assert_array_equal(root["RNA/counts"][:], values)
+    np.testing.assert_array_equal(root["RNA/countsT"][:], values.T)
+
+
+def test_loomtozarr_imports_float16_counts_as_float32(tmp_path):
+    import h5py
+
+    from scarf.readers import LoomReader
+    from scarf.writers import LoomToZarr
+
+    values = np.array([[1.5, 0], [0, 2], [3, 4.25]], dtype=np.float16)
+    path = tmp_path / "half.loom"
+    with h5py.File(path, mode="w") as handle:
+        handle.create_dataset("matrix", data=values.T)
+        cells = handle.create_group("col_attrs")
+        cells.create_dataset("obs_names", data=np.array([b"c1", b"c2", b"c3"]))
+        features = handle.create_group("row_attrs")
+        features.create_dataset("var_names", data=np.array([b"g1", b"g2"]))
+
+    reader = LoomReader(str(path))
+    store = MemoryStore()
+    try:
+        assert reader.matrixDtype == np.float32
+        LoomToZarr(
+            reader,
+            zarr_loc=store,
+            policy=CountMatrixPolicy(unitBytes=8, chunkBytes=8),
+        ).dump(batch_size=2)
+    finally:
+        reader.h5.close()
+
+    counts = zarr.open_group(store=store, mode="r")["RNA/counts"]
+    assert counts.dtype == np.dtype("float32")
+    np.testing.assert_array_equal(counts[:], values)
+
+
+def test_float16_is_rejected_as_a_count_storage_dtype(tmp_path):
+    from scipy.sparse import csr_matrix
+
+    from scarf.readers import H5adReader
+    from scarf.writers import H5adToZarr, SparseToZarr
+
+    values = _band_counts(6, 3).astype(np.float32)
+    message = "float16 is not a supported count storage dtype"
+    with pytest.raises(ValueError, match=message):
+        SparseToZarr(
+            csr_matrix(values),
+            zarr_loc=MemoryStore(),
+            cell_ids=[f"c{i}" for i in range(6)],
+            feature_ids=[f"g{i}" for i in range(3)],
+            matrix_dtype=np.dtype(np.float16),
+            nthreads=1,
+        ).dump()
+    path = _write_h5ad(tmp_path / "counts.h5ad", values, encoding="csr")
+    reader = H5adReader(str(path), feature_name_key="feature_name", dtype="float16")
+    try:
+        with pytest.raises(ValueError, match=message):
+            H5adToZarr(reader, zarr_loc=MemoryStore(), nthreads=1).dump()
+    finally:
+        reader.h5.close()
+
+
 @pytest.mark.parametrize("encoding", ["csr", "csc"])
 def test_h5adtozarr_preserves_duplicate_coordinate_sums(tmp_path, encoding):
     import h5py

@@ -187,7 +187,11 @@ class MetaData:
         return list(self._column_map().keys())
 
     def fetch_all(self, column: str) -> np.ndarray:
-        """Return all values from a metadata column."""
+        """Return all stored values from a metadata column.
+
+        Rows flagged by the column's linked missing mask hold stored
+        placeholders; ``to_pandas_dataframe`` shows them as missing.
+        """
         return np.asarray(self._get_array(column)[:])
 
     def fetch_all_columns(self, columns: Iterable[str]) -> list[np.ndarray]:
@@ -202,7 +206,11 @@ class MetaData:
         return np.asarray(self.index[np.asarray(self._bool_array(key)[:])])
 
     def fetch(self, column: str, key: str = "I") -> np.ndarray:
-        """Return column values for rows selected by ``key``."""
+        """Return stored column values for rows selected by ``key``.
+
+        Rows flagged by the column's linked missing mask hold stored
+        placeholders; ``to_pandas_dataframe`` shows them as missing.
+        """
         return np.asarray(self.fetch_all(column)[self.active_index(key)])
 
     def default_block_rows(self, column: str = "I") -> int:
@@ -409,7 +417,7 @@ class MetaData:
         return _multi_sift(self, columns, lows, highs, keep_bounds)
 
     def head(self, n: int = 5) -> pd.DataFrame:
-        """Return the first ``n`` rows of all metadata columns."""
+        """Return the first ``n`` rows of all columns, with masked rows missing."""
         return _head(self, n)
 
     def to_pandas_dataframe(
@@ -417,7 +425,12 @@ class MetaData:
         columns: list[str],
         key: str | None = None,
     ) -> pd.DataFrame:
-        """Return requested columns as a DataFrame, optionally filtered by key."""
+        """Return requested columns as a DataFrame, optionally filtered by key.
+
+        Rows flagged by a column's linked missing mask are shown as missing:
+        NaN for numeric columns, which become float64, a nullable boolean for
+        boolean columns, and a missing value for other columns.
+        """
         return _to_pandas_dataframe(self, columns, key)
 
     def grep(self, pattern: str, only_valid: bool = False) -> list[str]:

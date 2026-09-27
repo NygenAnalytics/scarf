@@ -1376,3 +1376,50 @@ def test_graph_latest_pointer_reads_are_absent():
                 )
 
     assert violations == []
+
+
+def _is_attrs(node: ast.AST) -> bool:
+    return isinstance(node, ast.Attribute) and node.attr == "attrs"
+
+
+def _reads_missing_mask_link(node: ast.AST) -> bool:
+    if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load):
+        target, key = node.value, node.slice
+    elif (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and node.args
+    ):
+        target, key = node.func.value, node.args[0]
+    elif (
+        isinstance(node, ast.Compare)
+        and len(node.ops) == 1
+        and isinstance(node.ops[0], ast.In | ast.NotIn)
+    ):
+        target, key = node.comparators[0], node.left
+    else:
+        return False
+    return (
+        _is_attrs(target)
+        and isinstance(key, ast.Constant)
+        and key.value == "missing_mask"
+    )
+
+
+def test_missing_mask_links_are_resolved_by_the_canonical_reader():
+    # Readers resolve a nullable array's attrs["missing_mask"] link through
+    # storage.arrays.linked_missing_mask, which accepts only the canonical
+    # __scarf_missing__<name> sibling. Storage and the materializers that write
+    # and verify that layout (writers and merge) may read the attribute.
+    allowed_packages = {"storage", "writers", "merge"}
+    offenders = set()
+    for path in _SCARF_ROOT.rglob("*.py"):
+        relative = path.relative_to(_SCARF_ROOT)
+        if relative.parts[0] in allowed_packages:
+            continue
+        for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+            if _reads_missing_mask_link(node):
+                offenders.add((relative.as_posix(), node.lineno))
+
+    assert offenders == set()
