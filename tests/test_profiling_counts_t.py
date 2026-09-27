@@ -18,12 +18,14 @@ from scarf.storage.count_matrix import (
 
 
 def _resources() -> StageResources:
+    # Leave headroom above memory retained by earlier tests in this worker.
     return StageResources(
         modalMemoryRequestMb=4096,
         modalMemoryLimitMb=4096,
         modalCpuRequest=1.0,
         modalCpuLimit=1.0,
-        scarfMemoryBudget=2 * 1024**3,
+        scarfMemoryBudget=int(profiling_stages.process_rss_mb() * 1024**2)
+        + 2 * 1024**3,
         workers=1,
         timeoutSeconds=600,
         ephemeralDiskMb=524288,

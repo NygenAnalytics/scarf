@@ -657,12 +657,13 @@ def test_shared_session_counts_store_operations_per_stage(tmp_path: Path) -> Non
         filterAttrs=("RNA_nCounts", "RNA_nFeatures"),
         minFeaturesPerCell=1,
     )
+    # Leave headroom above memory retained by earlier tests in this worker.
     resources = StageResources(
         modalMemoryRequestMb=4096,
         modalMemoryLimitMb=4096,
         modalCpuRequest=1.0,
         modalCpuLimit=1.0,
-        scarfMemoryBudget=2 * 1024**3,
+        scarfMemoryBudget=int(stages.process_rss_mb() * 1024**2) + 2 * 1024**3,
         workers=1,
         timeoutSeconds=600,
         ephemeralDiskMb=524_288,
