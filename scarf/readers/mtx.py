@@ -19,6 +19,7 @@ from numpy.typing import DTypeLike
 from scipy.sparse import coo_matrix, csr_matrix
 
 from .cellranger import CrReader
+from ..utils.arrays import has_duplicates
 
 type MatrixOrientation = Literal["featuresByCells", "cellsByFeatures"]
 type CoordinateOrder = Literal["cellMajor", "featureMajor"]
@@ -491,7 +492,7 @@ def _require_unique(values: np.ndarray, name: str) -> None:
     normalized = np.asarray(values, dtype=str)
     if normalized.ndim != 1 or np.any(np.char.strip(normalized) == ""):
         raise ValueError(f"{name} must contain non-empty one-dimensional values")
-    if np.unique(normalized).size != normalized.size:
+    if has_duplicates(normalized):
         raise ValueError(f"{name} must contain unique values")
 
 
@@ -1561,6 +1562,17 @@ class MtxReader(CrReader):
         lines_in_mem: int = 100000,
         dtype: DTypeLike | None = None,
     ) -> Generator[coo_matrix, None, None]:
+        """Yield chunks of cell rows from the Matrix Market file.
+
+        Args:
+            batch_size: Number of cells per yielded chunk.
+            lines_in_mem: Number of Matrix Market lines parsed at a time.
+            dtype: Count dtype of the yielded chunks. None keeps the dtype
+                chosen when the reader was created.
+
+        Yields:
+            scipy.sparse.coo_matrix chunks.
+        """
         yield from self._engine.consume(batch_size, lines_in_mem, dtype)
 
     def max_window_nnz(self, window_rows: int) -> int:
@@ -1594,3 +1606,48 @@ class MtxReader(CrReader):
 
     def close(self) -> None:
         self._engine.release()
+
+
+class CrDirReader(MtxReader):
+    """Read a Cell Ranger output directory in Matrix Market format.
+
+    The directory must contain exactly one complete matrix, feature, and
+    barcode triplet, such as ``matrix.mtx.gz``, ``features.tsv.gz``, and
+    ``barcodes.tsv.gz``. Use :func:`~scarf.inspect_mtx` and
+    :class:`~scarf.readers.MtxReader` to choose among several triplets. All
+    reading and streaming methods come from
+    :class:`~scarf.readers.MtxReader`.
+
+    Args:
+        loc: Path to the directory that contains the Cell Ranger output.
+        mtx_separator: Column delimiter in the MTX file.
+        index_offset: Value added to each MTX coordinate. The default turns
+            one-based coordinates into zero-based indexes.
+        is_filtered: Whether the barcodes are already filtered. When False,
+            only barcodes whose total count exceeds ``filtering_cutoff`` are
+            kept.
+        filtering_cutoff: Total count that a barcode must exceed to be kept
+            when ``is_filtered`` is False.
+    """
+
+    def __init__(
+        self,
+        loc: str,
+        mtx_separator: str = " ",
+        index_offset: int = -1,
+        is_filtered: bool = True,
+        filtering_cutoff: int = 500,
+    ) -> None:
+        candidates = inspect_mtx(loc)
+        if len(candidates) != 1:
+            raise ValueError(
+                "CrDirReader requires one complete Matrix Market triplet; "
+                "use inspect_mtx and MtxReader to select among candidates"
+            )
+        super().__init__(
+            candidates[0],
+            mtx_separator=mtx_separator,
+            index_offset=index_offset,
+            is_filtered=is_filtered,
+            filtering_cutoff=filtering_cutoff,
+        )

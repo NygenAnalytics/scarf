@@ -8,23 +8,33 @@ def result_exists(config: ProfilingConfig, nRows: int, stage: StageName) -> bool
 
 
 def load_result(
-    config: ProfilingConfig, nRows: int, stage: StageName
+    config: ProfilingConfig,
+    nRows: int,
+    stage: StageName,
+    *,
+    submissionId: str | None = None,
 ) -> dict[str, object] | None:
     uri = config.resultUri(nRows, stage)
     if not object_exists(uri):
         return None
-    return get_json(uri)
-
-
-def existing_error_result(
-    config: ProfilingConfig, nRows: int, stage: StageName
-) -> dict[str, object] | None:
-    payload = load_result(config, nRows, stage)
-    if payload is None:
+    payload = get_json(uri)
+    if submissionId is not None and payload.get("submissionId") != submissionId:
         return None
-    if payload.get("status") == "error":
-        return payload
-    return None
+    return payload
+
+
+def claim_submission(
+    config: ProfilingConfig, nRows: int, stage: str, submissionId: str
+) -> None:
+    if not submissionId or not submissionId.isalnum():
+        raise ValueError("submissionId must contain only letters and numbers")
+    uri = f"{config.funnelResultUri(nRows)}.submissions/{submissionId}/{stage}.json"
+    if not put_json_if_absent(
+        uri, {"submissionId": submissionId, "nRows": nRows, "stage": stage}
+    ):
+        raise FileExistsError(
+            f"Submission {submissionId} already claimed {nRows}/{stage}; work will not restart"
+        )
 
 
 def write_result(

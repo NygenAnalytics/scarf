@@ -73,6 +73,9 @@ class ADTassay(Assay):
 
         Returns: A chunked array (delayed matrix) containing normalized data.
         """
+        from ..storage.identity import read_dataset_fingerprint
+
+        read_dataset_fingerprint(self.z)
         if cell_idx is None:
             cell_idx = self.cells.active_index("I")
         if feat_idx is None:

@@ -30,9 +30,10 @@ def iter_column_blocks(
 
     def timed_read(block_idx: int) -> tuple[int, np.ndarray, float, str]:
         if msg:
-            logger.debug(
+            logger.opt(lazy=True).debug(
                 f"{msg}: reading block {block_idx + 1}/{n_blocks} "
-                f"(rss {process_rss_mb():.0f} MiB)"
+                "(rss {rss:.0f} MiB)",
+                rss=process_rss_mb,
             )
         started = time.perf_counter()
         array = np.asarray(read_block(block_idx))

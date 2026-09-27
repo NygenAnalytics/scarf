@@ -3,9 +3,14 @@ import operator
 from typing import Any
 
 import numpy as np
+import zarr
+from scipy.sparse import coo_matrix, csr_matrix
 
+from ..assay.normalization import recorded_count_arithmetic
+from ..storage.arrays import create_zarr_dataset, linked_missing_mask
 from ..storage.artifacts import (
     ArtifactRef,
+    ValueFingerprintBuilder,
     fingerprint_stored_arrays,
     fingerprint_stored_strings,
     inspect_artifact,
@@ -18,6 +23,7 @@ from .parameters import (
     AGGREGATION_ANN_PARAMETER_NAMES,
     AGGREGATION_ANN_STATIC_PARAMETER_NAMES,
 )
+from ..utils.arrays import has_duplicates
 
 PSEUDOTIME_INPUTS = frozenset({"connectivity_map", "source_sink", "cell_selection"})
 PSEUDOTIME_PARAMETERS = frozenset(
@@ -290,10 +296,25 @@ def validate_fate_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _normalized_value_parameter_names(
+    parameters: Mapping[str, Any],
+    names: frozenset[str],
+) -> frozenset[str]:
+    """Return ``names`` plus ``count_arithmetic`` when the record carries it.
+
+    Only results whose integer-count arithmetic ``normed`` changed record the
+    marker (see ``normalizer_count_arithmetic``), so records without it stay
+    valid.
+    """
+    if "count_arithmetic" in parameters:
+        return names | {"count_arithmetic"}
+    return names
+
+
 def validate_marker_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
     require_exact_record_keys(
         parameters,
-        MARKER_PARAMETERS,
+        _normalized_value_parameter_names(parameters, MARKER_PARAMETERS),
         "Pseudotime-marker parameters",
     )
     validated: dict[str, Any] = {
@@ -312,6 +333,7 @@ def validate_marker_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
         if parameters[name] != expected:
             raise ValueError(f"{name} must be {expected!r}")
         validated[name] = expected
+    validated.update(recorded_count_arithmetic(parameters))
     return validated
 
 
@@ -353,7 +375,7 @@ def validate_resolved_ann_parameters(
 def validate_aggregation_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
     require_exact_record_keys(
         parameters,
-        AGGREGATION_PARAMETERS,
+        _normalized_value_parameter_names(parameters, AGGREGATION_PARAMETERS),
         "Pseudotime-aggregation parameters",
     )
     n_clusters = _integer_parameter(
@@ -394,6 +416,7 @@ def validate_aggregation_parameters(parameters: Mapping[str, Any]) -> dict[str, 
         "n_clusters": n_clusters,
         "ann_params": _ann_parameters(parameters["ann_params"]),
         "nan_cluster_value": nan_cluster_value,
+        **recorded_count_arithmetic(parameters),
     }
 
 
@@ -469,20 +492,15 @@ def load_cell_artifact_values(
     if values_array.ndim < 1 or int(values_array.shape[0]) != selected_count:
         raise ValueError("Cell-data artifact values do not match their selection")
     values = np.asarray(values_array[:])
-    raw_missing_name = values_array.attrs.get("missing_mask")
-    if raw_missing_name is None:
-        missing = None
-    else:
-        if not isinstance(raw_missing_name, str) or raw_missing_name not in group:
-            raise ValueError("Cell-data artifact missing mask is malformed")
-        missing_array = as_zarr_array(group[raw_missing_name], name=raw_missing_name)
-        if (
-            missing_array.ndim != 1
-            or tuple(missing_array.shape) != (selected_count,)
-            or np.dtype(missing_array.dtype) != np.dtype(bool)
-        ):
-            raise ValueError("Cell-data artifact missing mask is malformed")
-        missing = np.asarray(missing_array[:], dtype=bool)
+    missing_array = linked_missing_mask(
+        group,
+        canonical_name,
+        label=f"Cell-data artifact array {canonical_name!r}",
+        values=values_array,
+    )
+    missing = (
+        None if missing_array is None else np.asarray(missing_array[:], dtype=bool)
+    )
     return values, selection, missing
 
 
@@ -515,55 +533,127 @@ def payload_fingerprint_matches(group: Any, names: Sequence[str]) -> bool:
         return False
 
 
-def diffusion_payload_is_valid(group: Any, *, n_cells: int) -> bool:
-    if set(group.attrs) != DIFFUSION_ATTRIBUTES:
-        return False
+_MALFORMED_DIFFUSION = "Diffusion-operator sparse payload is malformed"
+
+
+def _diffusion_payload_arrays(group: zarr.Group, *, n_cells: int) -> list[zarr.Array]:
     raw_n_cells = group.attrs.get("n_cells")
     if (
-        isinstance(raw_n_cells, bool | np.bool_)
+        set(group.attrs) != DIFFUSION_ATTRIBUTES
+        or set(group.array_keys()) != set(DIFFUSION_PAYLOAD)
+        or set(group.group_keys())
+        or isinstance(raw_n_cells, bool | np.bool_)
         or not isinstance(raw_n_cells, int | np.integer)
         or int(raw_n_cells) != n_cells
     ):
-        return False
-    try:
-        row_array = as_zarr_array(group["row"], name="row")
-        col_array = as_zarr_array(group["col"], name="col")
-        data_array = as_zarr_array(group["data"], name="data")
-    except (KeyError, TypeError):
-        return False
+        raise ValueError(_MALFORMED_DIFFUSION)
+    arrays = [as_zarr_array(group[name], name=name) for name in DIFFUSION_PAYLOAD]
+    rows, cols, data = arrays
     if (
-        row_array.ndim != 1
-        or col_array.ndim != 1
-        or data_array.ndim != 1
-        or row_array.shape != col_array.shape
-        or row_array.shape != data_array.shape
-        or np.dtype(row_array.dtype) != np.dtype(np.uint64)
-        or np.dtype(col_array.dtype) != np.dtype(np.uint64)
-        or np.dtype(data_array.dtype) != np.dtype(np.float64)
-        or set(row_array.attrs)
-        or set(col_array.attrs)
-        or set(data_array.attrs)
-        or not payload_fingerprint_matches(group, DIFFUSION_PAYLOAD)
+        any(array.ndim != 1 or set(array.attrs) for array in arrays)
+        or rows.shape != cols.shape
+        or rows.shape != data.shape
+        or rows.dtype != np.dtype(np.uint64)
+        or cols.dtype != np.dtype(np.uint64)
+        or data.dtype != np.dtype(np.float64)
     ):
-        return False
-    block_rows = min(
-        row_band(array_geometry(row_array), unit="chunk", fallback=1),
-        row_band(array_geometry(col_array), unit="chunk", fallback=1),
-        row_band(array_geometry(data_array), unit="chunk", fallback=1),
+        raise ValueError(_MALFORMED_DIFFUSION)
+    return arrays
+
+
+# Chunk length of the stored diffusion arrays, and entries written per block.
+_DIFFUSION_BLOCK_ENTRIES = 1_000_000
+
+
+def diffusion_load_bytes(nnz: int, n_cells: int, imputed_features: int = 0) -> int:
+    """Return the peak bytes needed to load a persisted diffusion operator.
+
+    Loading reads the three stored arrays and builds a COO matrix. With
+    ``imputed_features``, the estimate also covers conversion to CSC and the
+    dense imputed output.
+    """
+    index_bytes = 4 if max(n_cells, nnz) <= np.iinfo(np.int32).max else 8
+    coo_bytes = nnz * (8 + 2 * index_bytes)
+    load_bytes = nnz * (24 + 2 * index_bytes)
+    if imputed_features:
+        csc_bytes = nnz * (8 + index_bytes) + (n_cells + 1) * index_bytes
+        output_bytes = n_cells * imputed_features * 8
+        load_bytes = max(
+            load_bytes, coo_bytes + 2 * csc_bytes, 3 * output_bytes + 2 * csc_bytes
+        )
+    return load_bytes
+
+
+def write_diffusion_payload(group: zarr.Group, diffusion: csr_matrix) -> None:
+    """Write a square CSR diffusion operator as row, column, and value arrays.
+
+    Entries are written in CSR order, one bounded block at a time, so only
+    one block of widened indices is held in memory.
+    """
+    n_cells = int(diffusion.shape[0])
+    if diffusion.shape != (n_cells, n_cells):
+        raise ValueError("Diffusion operator must be square")
+    nnz = int(diffusion.indptr[-1])
+    shape = (nnz,)
+    chunks = (_DIFFUSION_BLOCK_ENTRIES,)
+    rows = create_zarr_dataset(group, "row", chunks, np.uint64, shape)
+    cols = create_zarr_dataset(group, "col", chunks, np.uint64, shape)
+    data = create_zarr_dataset(group, "data", chunks, np.float64, shape)
+    indptr = np.asarray(diffusion.indptr)
+    for start in range(0, nnz, _DIFFUSION_BLOCK_ENTRIES):
+        stop = min(start + _DIFFUSION_BLOCK_ENTRIES, nnz)
+        positions = np.arange(start, stop, dtype=np.int64)
+        rows[start:stop] = (
+            np.searchsorted(indptr, positions, side="right") - 1
+        ).astype(np.uint64)
+        del positions
+        cols[start:stop] = np.asarray(diffusion.indices[start:stop], dtype=np.uint64)
+        data[start:stop] = np.asarray(diffusion.data[start:stop], dtype=np.float64)
+    group.attrs["n_cells"] = n_cells
+    group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
+        group,
+        DIFFUSION_PAYLOAD,
     )
-    for start in range(0, int(row_array.shape[0]), block_rows):
-        stop = min(start + block_rows, int(row_array.shape[0]))
-        rows = np.asarray(row_array[start:stop], dtype=np.uint64)
-        cols = np.asarray(col_array[start:stop], dtype=np.uint64)
-        data = np.asarray(data_array[start:stop], dtype=np.float64)
-        if (
-            not np.isfinite(data).all()
-            or np.any(data < 0.0)
-            or np.any(rows >= n_cells)
-            or np.any(cols >= n_cells)
-        ):
-            return False
-    return True
+
+
+def load_diffusion_payload(
+    group: zarr.Group,
+    *,
+    n_cells: int,
+    memory_bytes: int,
+    imputed_features: int = 0,
+) -> coo_matrix:
+    arrays = _diffusion_payload_arrays(group, n_cells=n_cells)
+    nnz = int(arrays[0].size)
+    if diffusion_load_bytes(nnz, n_cells, imputed_features) >= memory_bytes:
+        raise MemoryError(
+            "Diffusion operator and imputed output exceed the memory budget "
+            "during loading or sparse conversion; increase the memory budget "
+            "or request fewer features per call."
+        )
+    loaded = [np.asarray(array[:]) for array in arrays]
+    builder = ValueFingerprintBuilder()
+    for name, values in zip(DIFFUSION_PAYLOAD, loaded, strict=True):
+        builder.update_array(name, values)
+    row_values, col_values, data_values = loaded
+    if (
+        builder.hexdigest() != group.attrs.get("payload_fingerprint")
+        or not np.isfinite(data_values).all()
+        or np.any(data_values < 0)
+        or np.any(row_values >= n_cells)
+        or np.any(col_values >= n_cells)
+    ):
+        raise ValueError(_MALFORMED_DIFFUSION)
+    return coo_matrix((data_values, (row_values, col_values)), shape=(n_cells, n_cells))
+
+
+def diffusion_payload_is_valid(group: zarr.Group, *, n_cells: int) -> bool:
+    """Validate a reusable payload blockwise without loading the operator."""
+    try:
+        _diffusion_payload_arrays(group, n_cells=n_cells)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return payload_fingerprint_matches(group, DIFFUSION_PAYLOAD)
 
 
 def _array_contract(
@@ -794,7 +884,7 @@ def marker_payload_is_valid(
         selected_indices.ndim != 1
         or np.any(selected_indices < 0)
         or np.any(selected_indices >= n_features)
-        or len(np.unique(selected_indices)) != len(selected_indices)
+        or has_duplicates(selected_indices)
     ):
         return False
     block_rows = min(

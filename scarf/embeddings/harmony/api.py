@@ -1,7 +1,116 @@
+import inspect
+import math
+from collections.abc import Mapping
+from typing import Any
+
 import numpy as np
 import pandas as pd
 
 from .models import ClusterFn, HarmonyResult
+
+_DATA_ARGUMENTS = frozenset({"data_mat", "meta_data"})
+
+
+def _require_integer(
+    values: dict[str, Any],
+    name: str,
+    minimum: int,
+    *,
+    optional: bool = False,
+) -> None:
+    if name not in values or (optional and values[name] is None):
+        return
+    value = values[name]
+    if isinstance(value, bool) or not isinstance(value, int | np.integer):
+        raise TypeError(f"Harmony {name} must be an integer")
+    if value < minimum:
+        raise ValueError(f"Harmony {name} must be at least {minimum}")
+
+
+def _require_real(
+    values: dict[str, Any],
+    name: str,
+    *,
+    positive: bool,
+) -> None:
+    if name not in values:
+        return
+    value = values[name]
+    if isinstance(value, bool) or not isinstance(value, int | float | np.number):
+        raise TypeError(f"Harmony {name} must be a real number")
+    resolved = float(value)
+    if not math.isfinite(resolved) or resolved < 0 or (positive and resolved == 0):
+        qualifier = "positive" if positive else "non-negative"
+        raise ValueError(f"Harmony {name} must be finite and {qualifier}")
+
+
+def _require_real_values(
+    values: dict[str, Any],
+    name: str,
+    *,
+    positive: bool,
+    optional: bool,
+) -> None:
+    if name not in values:
+        return
+    value = values[name]
+    message = f"Harmony {name} must contain real numbers"
+    if value is None:
+        if optional:
+            return
+        raise TypeError(message)
+    try:
+        array = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError):
+        raise TypeError(message) from None
+    if (
+        not np.all(np.isfinite(array))
+        or np.any(array < 0)
+        or (positive and np.any(array == 0))
+    ):
+        qualifier = "positive" if positive else "non-negative"
+        raise ValueError(f"Harmony {name} values must be finite and {qualifier}")
+
+
+def validate_harmony_parameters(
+    parameters: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Check Harmony keyword parameters that do not depend on the data.
+
+    Checks that need the cell count or the batch levels remain in
+    ``fit_harmony``.
+
+    Args:
+        parameters: Keyword arguments for ``fit_harmony`` other than the data
+            matrix and batch metadata.
+
+    Returns:
+        A new dictionary with the same parameters.
+    """
+    if parameters is None:
+        return {}
+    if not isinstance(parameters, Mapping):
+        raise TypeError("Harmony parameters must be a mapping of keyword arguments")
+    values = dict(parameters)
+    allowed = set(inspect.signature(fit_harmony).parameters) - _DATA_ARGUMENTS
+    unsupported = sorted(str(name) for name in values if name not in allowed)
+    if unsupported:
+        raise ValueError(f"Unsupported Harmony parameters: {', '.join(unsupported)}")
+    _require_integer(values, "nclust", 1, optional=True)
+    _require_integer(values, "max_iter_harmony", 0)
+    _require_integer(values, "max_iter_kmeans", 0)
+    _require_integer(values, "random_state", 0)
+    _require_real(values, "tau", positive=False)
+    _require_real(values, "block_size", positive=True)
+    _require_real(values, "epsilon_cluster", positive=False)
+    _require_real(values, "epsilon_harmony", positive=False)
+    _require_real_values(values, "sigma", positive=True, optional=False)
+    _require_real_values(values, "theta", positive=False, optional=True)
+    _require_real_values(values, "lamb", positive=False, optional=True)
+    cluster_fn = values.get("cluster_fn", "kmeans")
+    if not callable(cluster_fn) and cluster_fn != "kmeans":
+        raise ValueError("Harmony cluster_fn must be 'kmeans' or a callable")
+    return values
 
 
 def run_harmony(
@@ -117,11 +226,11 @@ def fit_harmony(
         return array
 
     theta_arr = _expand_parameter(theta, "theta")
-    lamb_arr = _expand_parameter(lamb, "lambda")
+    lamb_arr = _expand_parameter(lamb, "lamb")
     if not np.all(np.isfinite(theta_arr)) or np.any(theta_arr < 0):
         raise ValueError("Harmony theta values must be finite and non-negative")
     if not np.all(np.isfinite(lamb_arr)) or np.any(lamb_arr < 0):
-        raise ValueError("Harmony lambda values must be finite and non-negative")
+        raise ValueError("Harmony lamb values must be finite and non-negative")
 
     batch_counts = phi.sum(axis=1)
     batch_proportions = batch_counts / n_cells

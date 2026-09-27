@@ -8,6 +8,7 @@ import numpy as np
 import zarr
 
 from ...assay import Assay
+from ...assay.normalization import norm_lib_size
 from ...features.enrichment.results import EnrichmentResult
 from ...graph.arguments import OperationArguments
 from ...storage.artifact_writer import ArrayRequirement
@@ -21,6 +22,7 @@ from ...storage.feature_selection import resolve_feature_selection
 from ...storage.selections import validate_stored_selection_integrity
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...utils.arrays import array_digest
+from ...utils.arrays import has_duplicates
 
 
 _ENRICHMENT_LAYOUT = "cells_by_sources"
@@ -83,77 +85,71 @@ def _write_enrichment_slot(
     slot.attrs["complete"] = False
     for key, value in attrs.items():
         slot.attrs[key] = value
-    try:
+    create_metadata_column(
+        slot,
+        "cell_index",
+        data=cells,
+        dtype=np.int64,
+        chunkSize=100_000,
+    )
+    create_metadata_column(
+        slot,
+        "matched_feature_index",
+        data=matched,
+        dtype=np.int64,
+        chunkSize=100_000,
+    )
+    if rank is not None:
         create_metadata_column(
             slot,
-            "cell_index",
-            data=cells,
+            "rank_feature_index",
+            data=rank,
             dtype=np.int64,
             chunkSize=100_000,
         )
-        create_metadata_column(
-            slot,
-            "matched_feature_index",
-            data=matched,
-            dtype=np.int64,
-            chunkSize=100_000,
-        )
-        if rank is not None:
-            create_metadata_column(
-                slot,
-                "rank_feature_index",
-                data=rank,
-                dtype=np.int64,
-                chunkSize=100_000,
-            )
-        create_metadata_column(
-            slot,
-            "source_names",
-            data=names,
-            chunkSize=100_000,
-        )
-        create_metadata_column(
-            slot,
-            "source_sizes",
-            data=sizes,
-            dtype=np.int64,
-            chunkSize=100_000,
-        )
-        scores = create_numeric_array(
-            slot,
-            "scores",
-            normed_array_spec(
-                n_cells,
-                n_sources,
-                profile=resolve_storage_profile(slot.store),
-            ),
-        )
+    create_metadata_column(
+        slot,
+        "source_names",
+        data=names,
+        chunkSize=100_000,
+    )
+    create_metadata_column(
+        slot,
+        "source_sizes",
+        data=sizes,
+        dtype=np.int64,
+        chunkSize=100_000,
+    )
+    scores = create_numeric_array(
+        slot,
+        "scores",
+        normed_array_spec(
+            n_cells,
+            n_sources,
+            profile=resolve_storage_profile(slot.store),
+        ),
+    )
 
-        def checked_batches() -> Iterator[np.ndarray]:
-            for batch in score_batches:
-                values = np.asarray(batch, dtype=np.float64)
-                if values.ndim != 2 or values.shape[1] != n_sources:
-                    raise ValueError("Enrichment score batch has an invalid shape")
-                if not np.isfinite(values).all():
-                    raise ValueError(
-                        "Enrichment score batch contains non-finite values"
-                    )
-                yield values
+    def checked_batches() -> Iterator[np.ndarray]:
+        for batch in score_batches:
+            values = np.asarray(batch, dtype=np.float64)
+            if values.ndim != 2 or values.shape[1] != n_sources:
+                raise ValueError("Enrichment score batch has an invalid shape")
+            if not np.isfinite(values).all():
+                raise ValueError("Enrichment score batch contains non-finite values")
+            yield values
 
-        written = write_dense_from_row_batches(
-            scores,
-            checked_batches(),
-            dtype=np.float32,
-            msg=f"Writing {attrs['method']} enrichment",
+    written = write_dense_from_row_batches(
+        scores,
+        checked_batches(),
+        dtype=np.float32,
+        msg=f"Writing {attrs['method']} enrichment",
+    )
+    if written != n_cells:
+        raise ValueError(
+            f"Enrichment writer produced {written} rows, expected {n_cells}"
         )
-        if written != n_cells:
-            raise ValueError(
-                f"Enrichment writer produced {written} rows, expected {n_cells}"
-            )
-        slot.attrs["complete"] = True
-    except Exception:
-        slot.attrs["complete"] = False
-        raise
+    # finish_artifact validates the payload and marks the slot complete.
 
 
 def _enrichment_artifact_matches(
@@ -223,8 +219,10 @@ def _validate_enrichment_artifact_provenance(
         "tmin": group.attrs["tmin"],
     }
     if method == "waggr":
+        # WAGGR only runs with norm_lib_size, so the stored identity is fixed;
+        # the live assay normalization may have changed since.
         normalization_method = parameters.get("normalization_method")
-        if normalization_method != callable_identity(assay.normMethod):
+        if normalization_method != callable_identity(norm_lib_size):
             raise ValueError("Enrichment artifact normalization provenance is invalid")
         expected_parameters.update(
             {
@@ -441,13 +439,13 @@ def _load_enrichment_result(
         raise ValueError(f"Enrichment slot {label!r} score shape is misaligned")
     if len(source_names) == 0 or len(source_names) != len(source_sizes):
         raise ValueError(f"Enrichment slot {label!r} source metadata is misaligned")
-    if np.unique(source_names).size != len(source_names):
+    if has_duplicates(source_names):
         raise ValueError(f"Enrichment slot {label!r} contains duplicate sources")
     if np.any(source_names == ""):
         raise ValueError(f"Enrichment slot {label!r} contains empty source names")
     if np.any(source_sizes <= 0):
         raise ValueError(f"Enrichment slot {label!r} contains invalid source sizes")
-    if np.any(cell_index < 0) or np.unique(cell_index).size != len(cell_index):
+    if np.any(cell_index < 0) or has_duplicates(cell_index):
         raise ValueError(f"Enrichment slot {label!r} contains duplicate cell indices")
     if array_digest(cell_index) != slot.attrs["cell_digest"]:
         raise ValueError(f"Enrichment slot {label!r} has a mismatched cell digest")
@@ -468,7 +466,7 @@ def _load_enrichment_result(
         if (
             len(rank_feature_index) < 2
             or np.any(rank_feature_index < 0)
-            or np.unique(rank_feature_index).size != len(rank_feature_index)
+            or has_duplicates(rank_feature_index)
             or stored_n_up is None
             or stored_n_up > len(rank_feature_index)
         ):

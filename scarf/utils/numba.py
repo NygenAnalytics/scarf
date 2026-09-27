@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from functools import wraps
+from functools import cache, wraps
 
 
 def restore_numba_threads[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
@@ -16,3 +16,16 @@ def restore_numba_threads[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
             numba.set_num_threads(previous)
 
     return wrapped
+
+
+@cache
+def threadsafe_threading_layer() -> bool:
+    """Whether two threads may launch parallel kernels at the same time.
+
+    Numba's workqueue threading layer aborts the process on concurrent
+    launches; the TBB and OpenMP layers are thread-safe.
+    """
+    import numba
+
+    numba.get_num_threads()  # selects the threading layer
+    return str(numba.threading_layer()) != "workqueue"

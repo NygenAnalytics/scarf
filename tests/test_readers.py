@@ -189,22 +189,11 @@ def test_crdir_reader_filters_and_streams_selected_barcodes(tmp_path):
         filtering_cutoff=4,
     )
 
-    np.testing.assert_array_equal(reader.validBarcodeIdx, np.array([1, 2]))
+    np.testing.assert_array_equal(reader.validBarcodeIdx, np.array([0, 1]))
     assert reader.nCells == 2
+    assert reader.nFeatures == 3
+    assert reader.matrixEntryCount == 5
     assert reader.cell_names() == ["b1", "b2"]
-    assert reader.read_header().iloc[0].to_dict() == {
-        "nFeatures": 3,
-        "nCells": 4,
-        "nCounts": 5,
-    }
-    np.testing.assert_array_equal(
-        reader._get_valid_barcodes(
-            filtering_cutoff=4,
-            batch_size=2,
-            lines_in_mem=2,
-        ),
-        np.array([1, 2]),
-    )
 
     chunks = list(reader.consume(batch_size=1, lines_in_mem=2, dtype=np.uint16))
     assert [chunk.shape for chunk in chunks] == [(1, 3), (1, 3)]
@@ -324,11 +313,7 @@ def test_toy_crdir_empty(toy_crdir_empty):
         "a2",
         "g2",
     ]
-    # check for raise ValueError
-    try:
-        toy_crdir_empty.read_header()
-    except ValueError:
-        pass
+    assert list(toy_crdir_empty.consume(batch_size=10)) == []
 
 
 def test_crh5reader(crh5_reader):

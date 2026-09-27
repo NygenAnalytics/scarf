@@ -1,6 +1,7 @@
 import hashlib
+import math
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 import numpy as np
@@ -14,6 +15,68 @@ def regex_match_mask(values: Sequence[str] | np.ndarray, pattern: str) -> np.nda
         dtype=bool,
         count=len(values),
     )
+
+
+def has_duplicates(values: Any) -> bool:
+    """Return whether a one-dimensional array repeats a value.
+
+    Sorting and comparing neighbours stays fast where ``np.unique`` is slow on
+    many distinct integers; increasing values skip the sort.
+    """
+    array = np.asarray(values)
+    if array.size < 2:
+        return False
+    ordered = array if np.all(array[1:] > array[:-1]) else np.sort(array)
+    return bool(np.any(ordered[1:] == ordered[:-1]))
+
+
+# Only plain decimal notation is a numeric label, so "1_2" and "inf" are text.
+_NUMERIC_LABEL = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
+
+
+def _category_sort_key(value: Any) -> tuple[Any, ...]:
+    """Sort key: numbers in numeric order, then natural text, then missing.
+
+    Every token of a text label records whether it is a digit run, so digit
+    runs never compare with text and precede it where two labels differ in
+    kind. The exact text breaks ties between labels that differ only in case,
+    so the order never depends on input order.
+    """
+    import pandas as pd
+
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return (2, (), "")
+    try:
+        if pd.isna(value):
+            return (2, (), "")
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(value, (bool, np.bool_)):
+        text = str(bool(value))
+    elif isinstance(value, (int, np.integer, float, np.floating)):
+        return (0, (float(value),), str(value))
+    else:
+        text = str(value)
+    if _NUMERIC_LABEL.fullmatch(text):
+        return (0, (float(text),), text)
+    # Splitting on a captured pattern puts the digit runs at odd positions.
+    tokens = tuple(
+        (0, int(part)) if position % 2 else (1, part.casefold())
+        for position, part in enumerate(re.split(r"(\d+)", text))
+        if part
+    )
+    return (1, tokens, text)
+
+
+def sort_categories(values: Iterable[Any]) -> list[Any]:
+    """Order categories naturally, as plots and marker tables show them.
+
+    Numbers and decimal labels come first by value, so ``"2"`` precedes
+    ``"10"``. Other labels follow in natural text order (``"A2"`` before
+    ``"A10"``, ``"2_T"`` before ``"B"``), and missing values come last.
+    """
+    return sorted(values, key=_category_sort_key)
 
 
 def checked_sparse_cast(values: np.ndarray, dtype: Any) -> np.ndarray:

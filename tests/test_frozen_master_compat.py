@@ -67,20 +67,12 @@ def test_frozen_master_rna_open_hard_breaks_without_strip_counts_t(
     frozen_master_store: str,
 ) -> None:
     from scarf.datastore.datastore import DataStore
-    from scarf.storage.counts_t_contract import inspect_counts_t
+    from scarf.storage.counts_t_contract import validate_count_matrix
     from scarf.storage.stores import load_zarr
 
     root = load_zarr(frozen_master_store, mode="r")
-    inspected = inspect_counts_t(root, _ASSAY)
-    assert inspected.status in {
-        "missing",
-        "zarr-v2",
-        "unsupported-layout",
-        "incomplete",
-        "shape-dtype-mismatch",
-        "missing-layout-metadata",
-        "layout-mismatch",
-    }
+    with pytest.raises(ValueError, match="Rebuild"):
+        validate_count_matrix(root[_ASSAY], require_transpose=True)
 
     with pytest.raises(ValueError, match="countsT|Zarr v3|Rebuild|repack"):
         DataStore(frozen_master_store, default_assay=_ASSAY, zarr_mode="r")
@@ -92,19 +84,19 @@ def test_frozen_master_repack_preserves_data_but_not_legacy_analysis_state(
     tmp_path,
 ) -> None:
     from scarf.datastore.datastore import DataStore
-    from scarf.storage.counts_t_contract import inspect_counts_t
+    from scarf.storage.counts_t_contract import validate_count_matrix
     from scarf.storage.stores import load_zarr
     from scarf.tools.repack_zarr import repack_store
 
     before = _tree_digest(frozen_master_store)
     repacked = str(tmp_path / "repacked.zarr")
-    repack_store(frozen_master_store, repacked, nthreads=2)
+    repack_store(frozen_master_store, repacked, nthreads=2, data_only=True)
 
     assert _tree_digest(frozen_master_store) == before
 
     root = load_zarr(repacked, mode="r")
-    inspected = inspect_counts_t(root, _ASSAY)
-    assert inspected.status == "ready"
+    assert root[_ASSAY].attrs["prepared"] is True
+    validate_count_matrix(root[_ASSAY], require_transpose=True)
 
     repacked_before_open = _tree_digest(repacked)
     datastore = DataStore(repacked, default_assay=_ASSAY, zarr_mode="r")

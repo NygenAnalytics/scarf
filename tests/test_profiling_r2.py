@@ -1,14 +1,7 @@
 from pathlib import Path
 
-from profiling.r2 import download_file, join_uri, put_json, put_json_if_absent
+from profiling.r2 import download_file, put_json, put_json_if_absent
 from obstore.store import MemoryStore
-
-
-def test_join_uri():
-    assert (
-        join_uri("s3://bucket/prefix", "10000.h5ad") == "s3://bucket/prefix/10000.h5ad"
-    )
-    assert join_uri("s3://bucket/prefix/", "/a/", "b") == "s3://bucket/prefix/a/b"
 
 
 def test_memory_store_put_get_roundtrip(monkeypatch):

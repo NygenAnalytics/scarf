@@ -53,7 +53,7 @@ from scarf.storage.pipeline_runs import (
 )
 from scarf.storage.refs import ArtifactRef
 from scarf.storage.selections import (
-    resolve_selection_artifact,
+    resolve_generated_selection_artifact,
     snapshot_run_metadata,
 )
 from scarf.storage.types import as_zarr_array
@@ -271,7 +271,7 @@ def _completed_run(root: zarr.Group) -> PipelineRun:
     cell_ids = np.asarray(["c1", "c2", "c3", "c4"])
     feature_ids = np.asarray(["g1", "g2", "g3"])
     feature_fingerprint = fingerprint_strings(feature_ids)
-    cell_selection = resolve_selection_artifact(
+    cell_selection = resolve_generated_selection_artifact(
         root,
         scope="datastore",
         kind="cell_selection",
@@ -281,7 +281,7 @@ def _completed_run(root: zarr.Group) -> PipelineRun:
         parameters={},
         inputs={},
         source_column="I",
-    )
+    )[0]
     cell_data = root["cellData"]
     cell_data["names"][:] = np.asarray(["a0", "b0", "c0", "d0"])
     cell_data.create_array("batch", data=np.asarray(["x", "y", "x", "y"]))
@@ -331,6 +331,7 @@ def _completed_run(root: zarr.Group) -> PipelineRun:
         values={"values": np.asarray([0, 2], dtype=np.int32)},
         inputs={"cell_selection": cell_selection.to_dict()},
     )
+    root["RNA"].attrs.update({"prepared": True, "dataset_fingerprint": "fixture"})
     feature_universe = _fixture_feature_selection(
         root,
         np.ones(3, dtype=bool),
@@ -1291,7 +1292,7 @@ def test_run_view_rejects_tampered_metadata_snapshot(axis: str) -> None:
 def test_run_view_rejects_compact_field_from_another_selection() -> None:
     root = _root()
     run = _completed_run(root)
-    other_selection = resolve_selection_artifact(
+    other_selection = resolve_generated_selection_artifact(
         root,
         scope="datastore",
         kind="cell_selection",
@@ -1301,7 +1302,7 @@ def test_run_view_rejects_compact_field_from_another_selection() -> None:
         parameters={},
         inputs={},
         source_column="I",
-    )
+    )[0]
     clusters = run["clusters"]
     group = artifact_group(root, clusters)
     provenance = dict(group.attrs["provenance"])
@@ -1318,7 +1319,7 @@ def test_run_view_rejects_compact_field_from_another_selection() -> None:
 def test_run_view_rejects_full_axis_cell_field_from_another_selection() -> None:
     root = _root()
     run = _completed_run(root)
-    other_selection = resolve_selection_artifact(
+    other_selection = resolve_generated_selection_artifact(
         root,
         scope="datastore",
         kind="cell_selection",
@@ -1328,7 +1329,7 @@ def test_run_view_rejects_full_axis_cell_field_from_another_selection() -> None:
         parameters={},
         inputs={},
         source_column="I",
-    )
+    )[0]
     foreign = _artifact(
         root,
         scope="assay",

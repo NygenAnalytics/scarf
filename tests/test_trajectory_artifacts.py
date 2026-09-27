@@ -34,6 +34,46 @@ from scarf.trajectory.artifacts import (
 from scarf.trajectory.parameters import resolve_aggregation_ann_params
 
 
+def test_diffusion_loading_validates_and_builds_from_one_read_per_array(monkeypatch):
+    from scarf.trajectory.artifacts import load_diffusion_payload
+
+    root = zarr.group()
+    payload = {
+        "row": np.array([0, 1, 2], dtype=np.uint64),
+        "col": np.array([0, 1, 2], dtype=np.uint64),
+        "data": np.array([1.0, 2.0, 3.0], dtype=np.float64),
+    }
+    for name, values in payload.items():
+        root.create_array(name, data=values)
+    root.attrs.update(
+        {
+            "artifact_id": "a" * 64,
+            "kind": "diffusion_operator",
+            "provenance": {},
+            "execution_options": {},
+            "complete": True,
+            "created_at_ns": 1,
+            "scarf_version": "test",
+            "n_cells": 3,
+            "payload_fingerprint": fingerprint_stored_arrays(root, tuple(payload)),
+        }
+    )
+    reads = []
+    original = zarr.Array.__getitem__
+
+    def read(array, key):
+        reads.append(array.path)
+        return original(array, key)
+
+    monkeypatch.setattr(zarr.Array, "__getitem__", read)
+    with pytest.raises(MemoryError):
+        load_diffusion_payload(root, n_cells=3, memory_bytes=1)
+    assert reads == []
+    operator = load_diffusion_payload(root, n_cells=3, memory_bytes=4096)
+    assert reads == ["row", "col", "data"]
+    np.testing.assert_array_equal(operator.toarray(), np.diag([1.0, 2.0, 3.0]))
+
+
 def _payload_group(payload: dict[str, np.ndarray]) -> zarr.Group:
     root = zarr.open_group(store=MemoryStore(), mode="w")
     group = root.create_group("candidate")

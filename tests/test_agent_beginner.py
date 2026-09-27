@@ -11,6 +11,8 @@ import pytest
 
 pytest.importorskip("pydantic_ai")
 
+from pydantic import ValidationError
+
 from scarf.agent import AnalysisError, AutomatedWorkflowResult, analyze_rna
 from scarf.agent.orchestrator import api, journal
 from scarf.agent.orchestrator.main import AgentOrchestrator
@@ -19,7 +21,6 @@ from scarf.agent.orchestrator.models import (
     AutomatedWorkflowRequest,
     FinalAnalysisHandoff,
     OrchestrationRequestRecord,
-    artifact_model_to_ref,
 )
 from scarf.agent.types import ArtifactReferenceModel
 from scarf.agent.record_io import canonical_json_bytes
@@ -261,7 +262,7 @@ def test_beginner_rejects_removed_candidate_control() -> None:
 )
 def test_legacy_config_and_saved_requests_fail_explicitly(obsolete: str) -> None:
     old_config = {obsolete: 1}
-    with pytest.raises(ValueError, match="Create a new single-RNA workflow"):
+    with pytest.raises(ValidationError, match=f"{obsolete}\n.*Extra inputs"):
         AutomatedWorkflowConfig.model_validate(old_config)
     saved = OrchestrationRequestRecord(
         inputIdentity={},
@@ -269,7 +270,7 @@ def test_legacy_config_and_saved_requests_fail_explicitly(obsolete: str) -> None
         request=example(AutomatedWorkflowRequest),
     ).model_dump(mode="json")
     saved["config"].update(old_config)
-    with pytest.raises(ValueError, match="cannot be resumed or regenerated"):
+    with pytest.raises(ValidationError, match=f"config.{obsolete}\n.*Extra inputs"):
         OrchestrationRequestRecord.model_validate(saved)
 
 
@@ -348,16 +349,16 @@ def test_result_helpers_resolve_exact_journal_refs_and_workspace(
     assert final.markers is not None
     assert plotted == [
         {
-            "umap": artifact_model_to_ref(final.umap),
-            "clusters": artifact_model_to_ref(final.clusters),
-            "cell_selection": artifact_model_to_ref(final.cellSelection),
-            "graph": artifact_model_to_ref(final.graph),
+            "umap": final.umap.to_artifact_ref(),
+            "clusters": final.clusters.to_artifact_ref(),
+            "cell_selection": final.cellSelection.to_artifact_ref(),
+            "graph": final.graph.to_artifact_ref(),
             "figsize": (8, 5),
         }
     ]
     assert markers == [
         {
-            "marker": artifact_model_to_ref(final.markers),
+            "marker": final.markers.to_artifact_ref(),
             "group_id": "2",
             "min_score": 0.5,
             "min_frac_exp": 0.2,
@@ -367,7 +368,7 @@ def test_result_helpers_resolve_exact_journal_refs_and_workspace(
     assert "finalAnalysis" not in original
     assert "workflowRun" not in original
     with pytest.raises(ValueError, match="exact completed cluster map"):
-        result.plot_embedding(layout=artifact_model_to_ref(final.umap))
+        result.plot_embedding(layout=final.umap.to_artifact_ref())
     with pytest.raises(ValueError, match="exact completed cluster map"):
         result.plot_embedding(color_by="condition")
 
@@ -437,8 +438,8 @@ def test_legacy_saved_config_blocks_resume_and_report_without_changing_artifacts
         str(path),
         default_assay="RNA",
         min_features_per_cell=-1,
-        mito_pattern="",
-        ribo_pattern="",
+        mito_pattern=None,
+        ribo_pattern=None,
         nthreads=2,
         workspace=workspace,
     )
@@ -496,8 +497,8 @@ def test_legacy_saved_config_blocks_resume_and_report_without_changing_artifacts
         str(path),
         default_assay="RNA",
         min_features_per_cell=-1,
-        mito_pattern="",
-        ribo_pattern="",
+        mito_pattern=None,
+        ribo_pattern=None,
         nthreads=2,
         zarr_mode="r",
         workspace=workspace,

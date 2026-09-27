@@ -7,7 +7,8 @@ import numpy as np
 import pandas as pd
 
 from ._contracts import CategoricalScale
-from ._style import categorical_color_map, sort_categories
+from ..utils.arrays import sort_categories
+from ._style import categorical_color_map
 
 
 def _explicit_order(

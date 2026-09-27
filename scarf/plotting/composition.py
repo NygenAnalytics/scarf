@@ -7,7 +7,7 @@ import pandas as pd
 
 from ..storage.artifacts import ArtifactRef
 from ._contracts import CategoricalScale, PlotProvenance, StudyDesign
-from ._data import _artifact_cell_selection, _resolve_grouping
+from ._data import _artifact_cell_selection, _fetch_cell_column, _resolve_grouping
 from ._deps import require_matplotlib
 from ._display import resolve_categorical_scale
 from ._figure import (
@@ -16,17 +16,34 @@ from ._figure import (
     _place_legend_blocks,
     normalize_axes_target,
 )
+from ..utils.arrays import sort_categories
 from ._style import (
     apply_figure_chrome,
     capped_figsize,
     categorical_color_map,
     foreground_color,
     scatter_edgecolor,
-    sort_categories,
     theme_context,
 )
 
-_MISSING_CATEGORY = object()
+
+class _MissingCategory:
+    """Missing-category key that sorts after every label.
+
+    pandas sorts group keys, so the key must be orderable against numeric
+    labels as well as text.
+    """
+
+    __slots__ = ()
+
+    def __lt__(self, other: object) -> bool:
+        return False
+
+    def __gt__(self, other: object) -> bool:
+        return other is not self
+
+
+_MISSING_CATEGORY = _MissingCategory()
 
 
 def _constant_within_sample(
@@ -386,7 +403,7 @@ def composition(
     grouping_values: np.ndarray | None = None
     grouping_selection: ArtifactRef | None = None
     if grouping is not None:
-        _, cell_indices, resolved_grouping = _resolve_grouping(
+        _, cell_indices, resolved_grouping, _ = _resolve_grouping(
             store,
             group_by=None,
             groups=grouping,
@@ -405,21 +422,20 @@ def composition(
             category_by,
             categorical_scale,
         )
-        cats = np.asarray(
-            (
-                store.cells.fetch(category_by, key=cell_key)
-                if cell_indices is None
-                else np.asarray(store.cells.fetch_all(category_by))[cell_indices]
-            ),
-            dtype=object,
-        ).copy()
+        cats = _fetch_cell_column(
+            store,
+            category_by,
+            cell_key=cell_key,
+            cell_idx=cell_indices,
+            labels=True,
+        ).astype(object)
         category_axis_label = category_by
     else:
         if cell_key != "I":
             raise ValueError(
                 "cell_key cannot override an artifact's stored cell selection"
             )
-        _, category_indices, category_values = _resolve_grouping(
+        _, category_indices, category_values, _ = _resolve_grouping(
             store,
             group_by=None,
             groups=categories,
@@ -492,13 +508,17 @@ def composition(
         per_sample = None
         props_mat = None
     else:
-        samples = (
-            grouping_values
-            if grouping_values is not None
-            else store.cells.fetch(sample_by, key=cell_key)
-            if cell_indices is None
-            else np.asarray(store.cells.fetch_all(sample_by))[cell_indices]
-        )
+        if grouping_values is not None:
+            samples = grouping_values
+        else:
+            assert sample_by is not None
+            samples = _fetch_cell_column(
+                store,
+                sample_by,
+                cell_key=cell_key,
+                cell_idx=cell_indices,
+                labels=True,
+            )
         sample_axis_label = "grouping" if grouping is not None else sample_by
         valid = pd.notna(samples) & (np.asarray(samples, dtype=object) != "")
         if not valid.any():
@@ -525,28 +545,34 @@ def composition(
         )
 
         subject_vals = (
-            np.asarray(
-                store.cells.fetch(subject_by, key=cell_key)
-                if cell_indices is None
-                else np.asarray(store.cells.fetch_all(subject_by))[cell_indices]
+            _fetch_cell_column(
+                store,
+                subject_by,
+                cell_key=cell_key,
+                cell_idx=cell_indices,
+                labels=True,
             )[valid]
             if subject_by is not None
             else None
         )
         pair_vals = (
-            np.asarray(
-                store.cells.fetch(pair_by, key=cell_key)
-                if cell_indices is None
-                else np.asarray(store.cells.fetch_all(pair_by))[cell_indices]
+            _fetch_cell_column(
+                store,
+                pair_by,
+                cell_key=cell_key,
+                cell_idx=cell_indices,
+                labels=True,
             )[valid]
             if pair_by is not None
             else None
         )
         condition_vals = (
-            np.asarray(
-                store.cells.fetch(condition_by, key=cell_key)
-                if cell_indices is None
-                else np.asarray(store.cells.fetch_all(condition_by))[cell_indices]
+            _fetch_cell_column(
+                store,
+                condition_by,
+                cell_key=cell_key,
+                cell_idx=cell_indices,
+                labels=True,
             )[valid]
             if condition_by is not None
             else None

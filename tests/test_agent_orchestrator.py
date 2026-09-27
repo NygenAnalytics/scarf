@@ -54,7 +54,6 @@ from scarf.agent.orchestrator.models import (
     WorkflowQuestion,
     WorkflowStageAttempt,
     WorkflowStageLink,
-    artifact_model_to_ref,
 )
 from scarf.datastore.datastore import DataStore
 from scarf.storage.refs import ArtifactRef
@@ -452,12 +451,12 @@ def test_rna_h5ad_completes_public_automated_workflow(
     original_counts = editable.cells.fetch_all("RNA_nCounts")
     changed_counts = original_counts.copy()
     changed_counts[0] += 1
-    editable.cells.insert("RNA_nCounts", changed_counts, overwrite=True)
-    rejected = orchestrator.resume(resume_request)
-    assert rejected.status == "failed"
-    assert any("metadata" in note for note in rejected.notes)
+    with pytest.raises(ValueError, match="prepared data and cannot be changed"):
+        editable.cells.insert("RNA_nCounts", changed_counts, overwrite=True)
+    np.testing.assert_array_equal(
+        editable.cells.fetch_all("RNA_nCounts"), original_counts
+    )
     assert pca_diagnostic_calls == pca_diagnostics_before_resume
-    editable.cells.insert("RNA_nCounts", original_counts, overwrite=True)
     execute_candidate = tuning_module.RnaTuningRun.execute
 
     def interrupt_before_full(self: Any, scope: str, *args: Any, **kwargs: Any) -> Any:
@@ -527,30 +526,25 @@ def test_rna_h5ad_completes_public_automated_workflow(
     )
     assert cluster_evidence.metrics.markerCoherence is not None
     assert "doubletScore:0" in cluster_evidence.artifacts
-    umap_inputs = persisted.inspect_artifact(artifact_model_to_ref(final.umap)).inputs
+    umap_inputs = persisted.inspect_artifact(final.umap.to_artifact_ref()).inputs
     assert umap_inputs is not None
-    assert umap_inputs["graph"] == artifact_model_to_ref(final.graph).to_dict()
+    assert umap_inputs["graph"] == final.graph.to_artifact_ref().to_dict()
     assert (
         umap_inputs["initialization"]
-        == artifact_model_to_ref(final.embeddingInitialization).to_dict()
+        == final.embeddingInitialization.to_artifact_ref().to_dict()
     )
-    marker_inputs = persisted.inspect_artifact(
-        artifact_model_to_ref(final.markers)
-    ).inputs
+    marker_inputs = persisted.inspect_artifact(final.markers.to_artifact_ref()).inputs
     assert marker_inputs is not None
-    assert marker_inputs["clusters"] == artifact_model_to_ref(final.clusters).to_dict()
+    assert marker_inputs["clusters"] == final.clusters.to_artifact_ref().to_dict()
     assert (
         marker_inputs["cell_selection"]
-        == artifact_model_to_ref(final.cellSelection).to_dict()
+        == final.cellSelection.to_artifact_ref().to_dict()
     )
     doublet_inputs = persisted.inspect_artifact(
-        artifact_model_to_ref(final.doubletScores[0])
+        final.doubletScores[0].to_artifact_ref()
     ).inputs
     assert doublet_inputs is not None
-    assert (
-        doublet_inputs["connectivity_map"]
-        == artifact_model_to_ref(final.graph).to_dict()
-    )
+    assert doublet_inputs["connectivity_map"] == final.graph.to_artifact_ref().to_dict()
     scored_partition = ArtifactRef.from_dict(doublet_inputs["clusters"])
     assert scored_partition.kind == "cluster_labels"
     assert persisted.inspect_artifact(scored_partition).complete
@@ -561,9 +555,9 @@ def test_rna_h5ad_completes_public_automated_workflow(
     )
     assert (
         persisted.inspect_artifact(
-            artifact_model_to_ref(selected_evaluation.artifacts["normalized"])
+            selected_evaluation.artifacts["normalized"].to_artifact_ref()
         ).inputs["cell_selection"]
-        == artifact_model_to_ref(final.cellSelection).to_dict()
+        == final.cellSelection.to_artifact_ref().to_dict()
     )
     assert 1 <= len(tuning_evaluations) <= orchestrator.config.maxFullPartitions
     snapshot = analysis_snapshot(persisted, result.workflowRunId)
@@ -611,7 +605,7 @@ def test_rna_h5ad_completes_public_automated_workflow(
     def selected_rows(reference: Any) -> np.ndarray:
         return read_stored_selection_indices(
             persisted.zw,
-            artifact_model_to_ref(reference),
+            reference.to_artifact_ref(),
             kind="cell_selection",
             scope="datastore",
             assay=None,
@@ -622,11 +616,11 @@ def test_rna_h5ad_completes_public_automated_workflow(
     full_rows = selected_rows(final.cellSelection)
     sample_labels = np.asarray(
         persisted.load_artifact(
-            artifact_model_to_ref(sample_evaluation.artifacts["clusters"])
+            sample_evaluation.artifacts["clusters"].to_artifact_ref()
         )["values"][:]
     )
     full_labels = np.asarray(
-        persisted.load_artifact(artifact_model_to_ref(final.clusters))["values"][:]
+        persisted.load_artifact(final.clusters.to_artifact_ref())["values"][:]
     )
     from sklearn.metrics import adjusted_rand_score
 

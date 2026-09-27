@@ -148,6 +148,76 @@ def test_to_anndata_exports_empty_normed_cell_selection(export_store) -> None:
     assert adata.obs.empty
 
 
+def test_to_anndata_exports_empty_raw_cell_selection(export_store) -> None:
+    export_store.cells.insert(
+        "empty_export",
+        np.zeros(export_store.cells.N, dtype=bool),
+        overwrite=True,
+    )
+    n_features = export_store.RNA.feats.N
+
+    raw = export_store.RNA.to_raw_sparse("empty_export")
+    adata = export_store.to_anndata(
+        cell_key="empty_export",
+        layers={"raw": "RNA"},
+    )
+    subset = export_store.to_anndata(
+        cell_key="empty_export",
+        feature_indexes=[1, 0],
+    )
+
+    assert sparse.isspmatrix_csr(raw)
+    assert raw.shape == (0, n_features)
+    assert raw.dtype == export_store.RNA.rawData.dtype
+    assert sparse.isspmatrix_csr(adata.X)
+    assert adata.shape == (0, n_features)
+    assert adata.layers["raw"].shape == (0, n_features)
+    assert adata.obs.empty
+    assert subset.shape == (0, 2)
+
+
+def test_live_exports_write_masked_metadata_as_missing(export_store, tmp_path) -> None:
+    anndata = pytest.importorskip("anndata")
+    from scarf.writers import to_h5ad
+    from tests.test_pipeline import _insert_nullable_cell_column
+
+    n_cells = export_store.cells.N
+    missing = np.arange(n_cells) % 3 == 1
+    columns = {
+        "donor": np.where(missing, 0, np.arange(n_cells) % 2 + 1).astype(np.int64),
+        "site": np.where(missing, "", np.where(np.arange(n_cells) % 2, "A", "B")),
+        "flag": np.where(missing, False, np.arange(n_cells) % 2 == 0),
+    }
+    for name, values in columns.items():
+        _insert_nullable_cell_column(export_store, name, values, missing)
+    active = export_store.cells.active_index("I")
+    path = tmp_path / "live.h5ad"
+    to_h5ad(export_store.RNA, str(path))
+
+    for obs, rows in (
+        (export_store.to_anndata().obs, active),
+        (anndata.read_h5ad(path).obs, np.arange(n_cells)),
+    ):
+        for name, values in columns.items():
+            present = ~missing[rows]
+            np.testing.assert_array_equal(obs[name].isna().to_numpy(), ~present)
+            assert obs[name].to_numpy()[present].tolist() == (
+                values[rows][present].tolist()
+            )
+    assert anndata.read_h5ad(path).obs["flag"].dtype == "boolean"
+
+
+def test_raw_feature_subset_matches_full_raw_columns(export_store) -> None:
+    cell_indexes = export_store.cells.active_index("I")
+    full = export_store.RNA.to_raw_sparse("I")
+
+    adata = export_store.to_anndata(feature_indexes=[3, 1])
+
+    assert sparse.isspmatrix_csr(adata.X)
+    assert adata.shape == (cell_indexes.size, 2)
+    np.testing.assert_array_equal(adata.X.toarray(), full[:, [3, 1]].toarray())
+
+
 def test_to_anndata_exports_normed_csr_with_ordered_feature_indexes(export_store):
     feature_indexes = np.array([3, 0])
     cell_indexes = export_store.cells.active_index("I")
@@ -204,12 +274,13 @@ def test_to_anndata_aligns_reordered_layer_ids_without_subset(
     primary = export_store.RNA
     primary_ids = primary.feats.fetch_all("ids").astype(str)
     order = np.array([2, 0, 3, 1])
-    reordered_matrix = primary.to_raw_sparse("I")[:, order]
     reordered_assay = SimpleNamespace(
         feats=SimpleNamespace(
             fetch_all=lambda column: primary_ids[order] if column == "ids" else None
         ),
-        to_raw_sparse=lambda cell_key: reordered_matrix,
+        rawData=primary.rawData[:, order],
+        nthreads=1,
+        name="reordered",
     )
     original_get_assay = export_store._get_assay
 
@@ -299,7 +370,7 @@ def test_to_anndata_rejects_duplicate_primary_ids_when_exporting_layers(
 ) -> None:
     feature_ids = export_store.RNA.feats.fetch_all("ids").astype(str)
     feature_ids[1] = feature_ids[0]
-    export_store.RNA.feats.insert("ids", feature_ids, overwrite=True, force=True)
+    export_store.RNA.feats._get_array("ids")[:] = feature_ids
 
     with pytest.warns(UserWarning, match="Variable names are not unique"):
         with pytest.raises(ValueError, match="Selected feature IDs must be unique"):
@@ -321,7 +392,9 @@ def test_to_anndata_rejects_ambiguous_layer_feature_ids(
         feats=SimpleNamespace(
             fetch_all=lambda column: ambiguous_ids if column == "ids" else None
         ),
-        to_raw_sparse=lambda cell_key: primary.to_raw_sparse(cell_key),
+        rawData=primary.rawData,
+        nthreads=1,
+        name="ambiguous",
     )
     original_get_assay = export_store._get_assay
 

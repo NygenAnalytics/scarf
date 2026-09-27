@@ -163,7 +163,9 @@ def _cluster_selection_lineage(
     cell_data = root.create_group("cellData")
     cell_data.create_array("ids", data=cell_ids)
     cell_data.create_array("I", data=np.ones(n_cells, dtype=bool))
-    feature_data = root.create_group("RNA").create_group("featureData")
+    assay = root.create_group("RNA")
+    assay.attrs.update({"prepared": True, "dataset_fingerprint": "test-dataset"})
+    feature_data = assay.create_group("featureData")
     feature_data.create_array("ids", data=feature_ids)
     cell_selection = resolve_stored_selection_artifact(
         root,
@@ -187,17 +189,21 @@ def _cluster_selection_lineage(
         root,
         kind="normalized",
         operation="run_normalization",
-        values={"values": np.zeros((n_cells, 2), dtype=np.float32)},
+        values={"data": np.zeros((n_cells, 2), dtype=np.float32)},
         inputs={
             "cell_selection": cell_selection,
             "feature_selection": feature_selection,
+            "dataset_fingerprint": "test-dataset",
         },
     )
     pca = _array_artifact(
         root,
         kind="reduction",
         operation="run_pca",
-        values={"data": np.asarray(coordinates, dtype=np.float32)},
+        values={
+            "data": np.asarray(coordinates, dtype=np.float32),
+            "loadings": np.zeros((2, coordinates.shape[1]), dtype=np.float64),
+        },
         inputs={"normalized": normalized},
     )
     scored = pca
@@ -443,7 +449,7 @@ def test_pipeline_requested_filtering_requires_at_least_one_qc_column(
     for suffix in ("nCounts", "nFeatures", "percentMito", "percentRibo"):
         column = f"RNA_{suffix}"
         if column in datastore.cells.columns:
-            datastore.cells.drop(column)
+            del datastore.zw[f"cellData/{column}"]
     before = tuple(run.run_id for run in datastore.pipeline.list_runs(limit=100))
 
     with pytest.raises(ValueError, match="pass filtering=False"):
@@ -824,8 +830,8 @@ def test_pooled_mad_defaults_match_pipeline_and_preserve_gaussian_option(
     counts[[healthy, high_mito]] = 4000
     mito[healthy] = 0
     mito[high_mito] = 90
-    store.cells.insert("RNA_nCounts", counts, overwrite=True)
-    store.cells.insert("RNA_percentMito", mito, overwrite=True)
+    store.zw["cellData"].create_array("RNA_nCounts", data=counts, overwrite=True)
+    store.zw["cellData/RNA_percentMito"][:] = mito
     attrs = ["RNA_nCounts", "RNA_percentMito"]
     prior = store.snapshot_cell_selection("I")
     snapshot = snapshot_run_metadata(
@@ -1187,10 +1193,11 @@ def test_cluster_selection_adapter_rejects_detached_lineage() -> None:
             "normalized": _array_artifact(
                 root,
                 kind="normalized",
-                values={"values": np.zeros((4, 2), dtype=np.float32)},
+                values={"data": np.zeros((4, 2), dtype=np.float32)},
                 inputs={
                     "cell_selection": selection,
                     "feature_selection": lineage["feature_selection"],
+                    "dataset_fingerprint": "test-dataset",
                 },
             )
         },

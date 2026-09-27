@@ -12,20 +12,26 @@ disconnects:
 
 prepare / run / run-all / run-local / run-e2e spawn and return immediately.
 run-all fans out one size pipeline per container (stages stay sequential on R2).
-run-local runs the full funnel in one container on ephemeral-disk Zarr (fast_local).
-run-e2e runs the current core funnel in one container while keeping Zarr on R2.
+run-e2e and run-local run one funnel in one container, with the Zarr store on R2
+or on the container's ephemeral disk (fast_local). Like DataStore.pipeline, the
+funnel runs UMAP beside Leiden.
 Watch progress with:
   uv run --group profiling modal app logs scarf-profiling --env scarf_profiling
 """
 
 import argparse
+import dataclasses
+import functools
 import os
+import shutil
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from uuid import uuid4
 
 import modal
 from scarf.storage import ArtifactRef
+from scarf.utils.background import BackgroundTask
 
 from profiling.config import (
     ALL_STAGE_CHOICES,
@@ -62,7 +68,7 @@ from profiling.r2 import (
     upload_file,
 )
 from profiling.results import (
-    existing_error_result,
+    claim_submission,
     load_result,
     result_exists,
     write_funnel_result,
@@ -76,6 +82,7 @@ from profiling.spawn_wait import (
 )
 from profiling.metrics import ResourceSampler
 from profiling.stages import (
+    StageRunResult,
     discover_consume_inputs,
     profile_stage_inputs,
     run_stage,
@@ -83,6 +90,13 @@ from profiling.stages import (
 )
 
 _WORK = Path("/tmp/scarf-profiling")
+
+
+def _fresh_work_dir(path: Path) -> Path:
+    """Return an empty local work directory, deleting earlier contents."""
+    shutil.rmtree(path, ignore_errors=True)
+    path.mkdir(parents=True)
+    return path
 
 
 def _load_stage_artifact_ref(
@@ -142,23 +156,27 @@ def _load_stage_input_refs(
 def _e2e_conflicting_uris(
     config: ProfilingConfig,
     nRows: int,
+    stages: tuple[StageName, ...] = CORE_STAGE_ORDER,
+    *,
+    storeOnR2: bool = True,
 ) -> list[str]:
-    store_uri = config.storeUri(nRows).rstrip("/")
     candidates = [
-        f"{store_uri}/zarr.json",
-        f"{store_uri}/.zgroup",
         config.e2eClaimUri(),
         config.funnelResultUri(nRows),
-        *(config.resultUri(nRows, stage) for stage in CORE_STAGE_ORDER),
+        *(config.resultUri(nRows, stage) for stage in stages),
     ]
+    if storeOnR2:
+        candidates.insert(0, f"{config.storeUri(nRows).rstrip('/')}/zarr.json")
     return [uri for uri in candidates if object_exists(uri)]
 
 
-def _e2e_function_options(config: ProfilingConfig) -> dict[str, Any]:
-    envelope = _e2e_resource_envelope(config)
-    resources = _e2e_resources(config)
+def _e2e_function_options(
+    config: ProfilingConfig,
+    stages: tuple[StageName, ...] = CORE_STAGE_ORDER,
+) -> dict[str, Any]:
+    envelope = _e2e_resource_envelope(config, stages)
     peak = max(
-        resources,
+        _e2e_resources(config, stages),
         key=lambda item: (
             item.modalMemoryLimitMb,
             item.modalCpuLimit,
@@ -183,23 +201,30 @@ def _e2e_function_options(config: ProfilingConfig) -> dict[str, Any]:
     return options
 
 
-def _e2e_resources(config: ProfilingConfig) -> list[StageResources]:
+def _e2e_resources(
+    config: ProfilingConfig,
+    stages: tuple[StageName, ...] = CORE_STAGE_ORDER,
+) -> list[StageResources]:
     missing_resources = [
-        stage for stage in CORE_STAGE_ORDER if stage not in config.stageResources
+        stage for stage in stages if stage not in config.stageResources
     ]
     if missing_resources:
         raise ValueError(
-            "run-e2e is missing stageResources for: " + ", ".join(missing_resources)
+            "The funnel is missing stageResources for: " + ", ".join(missing_resources)
         )
-    return [config.resourcesFor(stage) for stage in CORE_STAGE_ORDER]
+    return [config.resourcesFor(stage) for stage in stages]
 
 
-def _e2e_resource_envelope(config: ProfilingConfig) -> dict[str, int | float]:
-    resources = _e2e_resources(config)
+def _e2e_resource_envelope(
+    config: ProfilingConfig,
+    stages: tuple[StageName, ...] = CORE_STAGE_ORDER,
+) -> dict[str, int | float]:
+    """Size one container to the per-field maximum of the funnel's stages."""
+    resources = _e2e_resources(config, stages)
     requested_ephemeral_disk = max(item.ephemeralDiskMb for item in resources)
     if requested_ephemeral_disk > BASE_EPHEMERAL_DISK_MB:
         raise ValueError(
-            "run-e2e cannot apply ephemeralDiskMb above "
+            "The funnel cannot apply ephemeralDiskMb above "
             f"{BASE_EPHEMERAL_DISK_MB}; Modal does not allow a dynamic "
             "ephemeral_disk override"
         )
@@ -320,14 +345,7 @@ def prepare_fixture_datasets_job(
                 f"fixture size {size} is not in config.targetSizes; "
                 "add it to config or choose an existing size"
             )
-    work = _WORK / "fixture"
-    if work.exists():
-        for path in sorted(work.rglob("*"), reverse=True):
-            if path.is_file():
-                path.unlink()
-            elif path.is_dir():
-                path.rmdir()
-    work.mkdir(parents=True, exist_ok=True)
+    work = _fresh_work_dir(_WORK / "fixture")
     uploaded: list[dict[str, Any]] = []
 
     def _upload_artifact(artifact: Any) -> None:
@@ -366,315 +384,76 @@ def run_stage_job(
     configDict: dict[str, Any],
     nRows: int,
     stage: StageName,
+    submissionId: str,
     force: bool = False,
 ) -> dict[str, Any]:
     config = ProfilingConfig.model_validate(configDict)
     resources = config.resourcesFor(stage)
     os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
     workflow = bind_cluster_source(config, nRows)
+    completed = load_result(config, nRows, stage, submissionId=submissionId)
+    if completed is not None:
+        return completed
+    claim_submission(config, nRows, stage, submissionId)
     if result_exists(config, nRows, stage) and not force:
-        return {
-            "nRows": nRows,
-            "stage": stage,
-            "status": "skipped",
-            "resultUri": config.resultUri(nRows, stage),
-        }
+        raise FileExistsError(
+            "This stage has a previous result; use force or a fresh runTag"
+        )
 
-    work = _WORK / f"{nRows}-{stage}"
-    if work.exists():
-        for path in sorted(work.rglob("*"), reverse=True):
-            if path.is_file():
-                path.unlink()
-            elif path.is_dir():
-                path.rmdir()
-    work.mkdir(parents=True, exist_ok=True)
+    work = _fresh_work_dir(_WORK / f"{submissionId}-{nRows}-{stage}")
+    try:
+        local_h5ad: Path | None = None
+        if stage == "createStore":
+            local_h5ad = work / f"{nRows}.h5ad"
+            download_file(config.datasetUri(nRows), local_h5ad)
 
-    local_h5ad: Path | None = None
-    if stage == "createStore":
-        local_h5ad = work / f"{nRows}.h5ad"
-        download_file(config.datasetUri(nRows), local_h5ad)
-
-    result = run_stage(
-        stage,
-        nRows=nRows,
-        storeUri=config.storeUri(nRows),
-        workflow=workflow,
-        resources=resources,
-        localH5adPath=local_h5ad,
-        countMatrix=config.countMatrix,
-        storageIo=config.storageIo,
-        workDir=work,
-        invalidateCache=force,
-        clientProvenance=config.clientProvenance,
-        inputRefs=_load_stage_input_refs(
-            config,
-            nRows,
+        result = run_stage(
             stage,
+            submissionId=submissionId,
+            nRows=nRows,
+            storeUri=config.storeUri(nRows),
             workflow=workflow,
-        ),
-    )
+            resources=resources,
+            localH5adPath=local_h5ad,
+            countMatrix=config.countMatrix,
+            storageIo=config.storageIo,
+            workDir=work,
+            invalidateCache=force,
+            clientProvenance=config.clientProvenance,
+            inputRefs=_load_stage_input_refs(
+                config,
+                nRows,
+                stage,
+                workflow=workflow,
+            ),
+        )
+    except Exception as exc:
+        from profiling.stages import StageRunResult
+
+        result = StageRunResult(
+            submissionId=submissionId,
+            stage=stage,
+            nRows=nRows,
+            status="error",
+            seconds=None,
+            peakRssBytes=None,
+            peakCgroupBytes=None,
+            modalMemoryMb=resources.modalMemoryLimitMb,
+            scarfMemoryBudget=resources.scarfMemoryBudget,
+            storeUri=config.storeUri(nRows),
+            error=f"{type(exc).__name__}: {exc}",
+            workers=resources.workers,
+        )
     write_result(config, result, overwrite=force)
     return result.to_json()
 
 
-@app.function(
-    **COMMON_FUNCTION_OPTIONS,
-    timeout=86_400,
-    memory=32_768,
-    cpu=8.0,
-    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
-    # The whole funnel lives on one container's ephemeral disk; a preempted
-    # container restarts the input without the store.
-    nonpreemptible=True,
-)
-def run_local_funnel_job(
-    configDict: dict[str, Any],
-    nRows: int,
-    stages: list[StageName] | None = None,
-) -> dict[str, Any]:
-    """Full funnel in one container: H5AD + Zarr on ephemeral disk (fast_local).
-
-    Downloads the prepared H5AD from R2 once, writes the store under /tmp, runs
-    stages in-process, and still persists each stage result JSON to R2.
-    """
-    config = ProfilingConfig.model_validate(configDict)
-    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
-    os.environ["SCARF_ZARR_PROFILE"] = "fast_local"
-    if nRows not in config.targetSizes:
-        raise ValueError(f"size {nRows} is not in config.targetSizes")
-    selected_stages = tuple(stages) if stages else config.effectiveStages
-
-    work = _WORK / f"local-{config.runTag or 'untagged'}-{nRows}"
-    if work.exists():
-        for path in sorted(work.rglob("*"), reverse=True):
-            if path.is_file():
-                path.unlink()
-            elif path.is_dir():
-                path.rmdir()
-    work.mkdir(parents=True, exist_ok=True)
-
-    local_h5ad = work / f"{nRows}.h5ad"
-    local_store = work / f"{nRows}.zarr"
-    store_uri = str(local_store)
-
-    if "createStore" in selected_stages and not result_exists(
-        config, nRows, "createStore"
-    ):
-        print(f"downloading dataset to {local_h5ad}", flush=True)
-        download_file(config.datasetUri(nRows), local_h5ad)
-
-    outcomes: list[dict[str, Any]] = []
-    session: dict[str, Any] = {}
-    for stage in selected_stages:
-        failed = existing_error_result(config, nRows, stage)
-        if failed is not None:
-            return {
-                "nRows": nRows,
-                "stopped": True,
-                "storeBackend": "local",
-                "storeUri": store_uri,
-                "failed": failed,
-                "outcomes": [
-                    *outcomes,
-                    {
-                        "nRows": nRows,
-                        "stage": stage,
-                        "status": "error",
-                        "resultUri": config.resultUri(nRows, stage),
-                        "storeBackend": "local",
-                        "terminalExistingError": True,
-                    },
-                ],
-            }
-        if result_exists(config, nRows, stage):
-            outcomes.append(
-                {
-                    "nRows": nRows,
-                    "stage": stage,
-                    "status": "skipped",
-                    "resultUri": config.resultUri(nRows, stage),
-                    "storeBackend": "local",
-                }
-            )
-            continue
-        if stage == "createStore" and not local_h5ad.is_file():
-            raise FileNotFoundError(
-                f"createStore needs {local_h5ad}; download failed or was skipped"
-            )
-        if stage != "createStore" and not local_store.exists():
-            raise FileNotFoundError(
-                f"stage {stage} needs local store at {local_store}; "
-                "include createStore or pre-seed the ephemeral workdir"
-            )
-        resources = config.resourcesFor(stage)
-        print(f"local funnel stage start: {stage}", flush=True)
-        result = run_stage(
-            stage,
-            nRows=nRows,
-            storeUri=store_uri,
-            workflow=bind_cluster_source(config, nRows),
-            resources=resources,
-            localH5adPath=local_h5ad if stage == "createStore" else None,
-            countMatrix=config.countMatrix,
-            storageIo=config.storageIo,
-            workDir=work / stage,
-            clientProvenance=config.clientProvenance,
-            session=session,
-        )
-        write_result(config, result)
-        payload = result.to_json()
-        payload["storeBackend"] = "local"
-        outcomes.append(payload)
-        print(
-            f"local funnel stage done: {stage} status={result.status} "
-            f"seconds={result.seconds}",
-            flush=True,
-        )
-        if result.status == "error":
-            return {
-                "nRows": nRows,
-                "stopped": True,
-                "storeBackend": "local",
-                "storeUri": store_uri,
-                "failed": payload,
-                "outcomes": outcomes,
-            }
-
-    return {
-        "nRows": nRows,
-        "stopped": False,
-        "storeBackend": "local",
-        "storeUri": store_uri,
-        "outcomes": outcomes,
-    }
-
-
-def run_e2e_funnel_body(
-    configDict: dict[str, Any],
-    nRows: int,
-) -> dict[str, Any]:
-    """Run the graph-construction core once in one container against a fresh R2 store."""
-    config = ProfilingConfig.model_validate(configDict)
-    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
-    if nRows not in config.targetSizes:
-        raise ValueError(f"size {nRows} is not in config.targetSizes")
-    if not config.runTag.strip():
-        raise ValueError("run-e2e requires a non-empty runTag")
-    resource_envelope = _e2e_resource_envelope(config)
-    conflicts = _e2e_conflicting_uris(config, nRows)
-    if conflicts:
-        raise FileExistsError(
-            "run-e2e requires a fresh runTag; existing R2 objects: "
-            + ", ".join(conflicts)
-        )
-    claimed = put_json_if_absent(
-        config.e2eClaimUri(),
-        {
-            "runTag": config.runTag,
-            "nRows": nRows,
-            "status": "claimed",
-            "storeUri": config.storeUri(nRows),
-        },
-    )
-    if not claimed:
-        raise FileExistsError(
-            f"run-e2e runTag was claimed concurrently: {config.runTag}"
-        )
-
-    work = _WORK / f"e2e-{config.runTag}-{nRows}"
-    work.mkdir(parents=True, exist_ok=False)
-    local_h5ad = work / f"{nRows}.h5ad"
-    store_uri = config.storeUri(nRows)
-
-    sampler = ResourceSampler()
-    sampler.start()
-    started = time.perf_counter()
-    download_seconds: float | None = None
-    outcomes: list[dict[str, Any]] = []
-    completed_stages: list[StageName] = []
-    status = "ok"
-    error: str | None = None
-    failed_stage: StageName | None = None
-    try:
-        download_started = time.perf_counter()
-        print(f"e2e dataset download start: {config.datasetUri(nRows)}", flush=True)
-        download_file(config.datasetUri(nRows), local_h5ad)
-        download_seconds = time.perf_counter() - download_started
-        print(
-            f"e2e dataset download done: seconds={download_seconds:.1f}",
-            flush=True,
-        )
-
-        session: dict[str, Any] = {}
-        for stage in CORE_STAGE_ORDER:
-            failed_stage = stage
-            resources = config.resourcesFor(stage)
-            stage_work = work / stage
-            stage_work.mkdir(parents=True, exist_ok=True)
-            print(f"e2e stage start: {stage}", flush=True)
-            result = run_stage(
-                stage,
-                nRows=nRows,
-                storeUri=store_uri,
-                workflow=config.workflow,
-                resources=resources,
-                localH5adPath=local_h5ad if stage == "createStore" else None,
-                countMatrix=config.countMatrix,
-                storageIo=config.storageIo,
-                workDir=stage_work,
-                containerMemoryMb=int(resource_envelope["modalMemoryLimitMb"]),
-                containerCpuRequest=float(resource_envelope["modalCpuRequest"]),
-                containerCpuLimit=float(resource_envelope["modalCpuLimit"]),
-                resetCgroupPeak=False,
-                clientProvenance=config.clientProvenance,
-                session=session,
-            )
-            result_uri = write_result(config, result)
-            payload = result.to_json()
-            payload["resultUri"] = result_uri
-            payload["storeBackend"] = "r2"
-            outcomes.append(payload)
-            print(
-                f"e2e stage done: {stage} status={result.status} "
-                f"seconds={result.seconds}",
-                flush=True,
-            )
-            if result.status != "ok":
-                status = "error"
-                error = result.error or f"{stage} failed"
-                break
-            completed_stages.append(stage)
-        else:
-            failed_stage = None
-    except Exception as exc:  # noqa: BLE001 - persist a durable failure summary
-        status = "error"
-        error = f"{type(exc).__name__}: {exc}"
-    finally:
-        measurement = sampler.stop()
-
-    summary: dict[str, Any] = {
-        "runTag": config.runTag,
-        "nRows": nRows,
-        "status": status,
-        "stopped": status != "ok",
-        "error": error,
-        "failedStage": failed_stage,
-        "storeBackend": "r2",
-        "storeUri": store_uri,
-        "datasetUri": config.datasetUri(nRows),
-        "datasetDownloadSeconds": download_seconds,
-        "wholeFunctionSeconds": time.perf_counter() - started,
-        "modalResources": resource_envelope,
-        "stageOrder": list(CORE_STAGE_ORDER),
-        "completedStages": completed_stages,
-        "outcomes": outcomes,
-        "claimUri": config.e2eClaimUri(),
-        "funnelResultUri": config.funnelResultUri(nRows),
-        **summarize_resource_measurement(measurement),
-        "provenance": provenance_from_config(config, nonpreemptible=True),
-    }
-    write_funnel_result(config, nRows, summary)
-    return summary
+# Mirrors DataStore.pipeline: each key runs on a worker thread beside the
+# listed later stages, and any other stage waits for it first. A background
+# stage must follow the threading rules of scarf's BackgroundTask.
+BACKGROUND_OVERLAPS: dict[StageName, frozenset[StageName]] = {
+    "runUmap": frozenset({"runLeiden"}),
+}
 
 
 @app.function(
@@ -683,14 +462,213 @@ def run_e2e_funnel_body(
     memory=32_768,
     cpu=8.0,
     ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
-    # Long 1M+ funnels: avoid worker preemption (Modal bills ~3x CPU/memory).
+    # One container holds the whole funnel, and run-local keeps the store on
+    # its ephemeral disk; avoid preemption (Modal bills about 3x CPU/memory).
     nonpreemptible=True,
 )
-def run_e2e_funnel_job(
+def run_funnel_job(
     configDict: dict[str, Any],
     nRows: int,
+    submissionId: str,
+    storeBackend: Literal["r2", "local"],
+    stages: list[StageName],
 ) -> dict[str, Any]:
-    return run_e2e_funnel_body(configDict, nRows)
+    """Run one funnel in one container and persist its summary to R2.
+
+    The store lives on R2 (run-e2e) or on the container's ephemeral disk
+    (run-local). The create-only runTag claim makes the funnel exclusive, so
+    its stages need no claims of their own. Stages in ``BACKGROUND_OVERLAPS``
+    overlap later stages; their CPU and memory figures then share a window,
+    and each result lists the stages it ran beside in ``concurrentStages``.
+    """
+    config = ProfilingConfig.model_validate(configDict)
+    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    selected = tuple(stages)
+    if nRows not in config.targetSizes:
+        raise ValueError(f"size {nRows} is not in config.targetSizes")
+    if not config.runTag.strip():
+        raise ValueError("A funnel requires a non-empty runTag")
+    if storeBackend not in ("r2", "local"):
+        raise ValueError(f"Unknown store backend: {storeBackend!r}")
+    if not selected or selected[0] != "createStore":
+        raise ValueError("A funnel must start with createStore")
+    local = storeBackend == "local"
+    resource_envelope = _e2e_resource_envelope(config, selected)
+    conflicts = _e2e_conflicting_uris(config, nRows, selected, storeOnR2=not local)
+    if conflicts:
+        raise FileExistsError(
+            "A funnel requires a fresh runTag; existing R2 objects: "
+            + ", ".join(conflicts)
+        )
+    store_uri = config.storeUri(nRows)
+    if not put_json_if_absent(
+        config.e2eClaimUri(),
+        {
+            "runTag": config.runTag,
+            "submissionId": submissionId,
+            "nRows": nRows,
+            "status": "claimed",
+            "storeBackend": storeBackend,
+        },
+    ):
+        raise FileExistsError(f"The runTag was claimed concurrently: {config.runTag}")
+    if local:
+        # Stages wrap the store to count its operations. A wrapped local store
+        # is not a LocalStore, so pin the profile the local path resolves to.
+        os.environ["SCARF_ZARR_PROFILE"] = "fast_local"
+
+    work = _fresh_work_dir(_WORK / f"{storeBackend}-{config.runTag}-{nRows}")
+    local_h5ad = work / f"{nRows}.h5ad"
+    if local:
+        store_uri = str(work / f"{nRows}.zarr")
+    # findMarkers reads imported clusters only when the funnel imports them.
+    workflow = (
+        bind_cluster_source(config, nRows)
+        if "importClusters" in selected
+        else config.workflow
+    )
+    label = "e2e" if not local else "local"
+
+    sampler = ResourceSampler()
+    sampler.start()
+    started = time.perf_counter()
+    download_seconds: float | None = None
+    funnel_seconds: float | None = None
+    payloads: dict[StageName, dict[str, Any]] = {}
+    windows: dict[StageName, tuple[float, float | None]] = {}
+    pending: dict[StageName, BackgroundTask[StageRunResult]] = {}
+    status = "ok"
+    error: str | None = None
+    failed_stage: StageName | None = None
+    session: dict[str, Any] = {}
+
+    def execute(stage: StageName) -> StageRunResult:
+        windows[stage] = (time.perf_counter(), None)
+        try:
+            stage_work = work / stage
+            stage_work.mkdir(parents=True, exist_ok=True)
+            return run_stage(
+                stage,
+                submissionId=submissionId,
+                nRows=nRows,
+                storeUri=store_uri,
+                workflow=workflow,
+                resources=config.resourcesFor(stage),
+                localH5adPath=local_h5ad if stage == "createStore" else None,
+                countMatrix=config.countMatrix,
+                storageIo=config.storageIo,
+                workDir=stage_work,
+                containerMemoryMb=int(resource_envelope["modalMemoryLimitMb"]),
+                containerCpuRequest=float(resource_envelope["modalCpuRequest"]),
+                containerCpuLimit=float(resource_envelope["modalCpuLimit"]),
+                resetCgroupPeak=False,
+                # The session probe is reset per stage; a background stage
+                # would read the counts of the stages beside it.
+                recordStoreOperations=stage not in BACKGROUND_OVERLAPS,
+                clientProvenance=config.clientProvenance,
+                session=session,
+            )
+        finally:
+            windows[stage] = (windows[stage][0], time.perf_counter())
+
+    def record(stage: StageName, result: StageRunResult) -> bool:
+        begin, end = windows[stage]
+        concurrent = [
+            other
+            for other, (other_begin, other_end) in windows.items()
+            if other != stage
+            and other_begin < (end or time.perf_counter())
+            and (other_end is None or other_end > begin)
+        ]
+        result = dataclasses.replace(result, concurrentStages=concurrent or None)
+        payload = result.to_json()
+        payload["resultUri"] = write_result(config, result)
+        payload["storeBackend"] = storeBackend
+        payloads[stage] = payload
+        print(
+            f"{label} stage done: {stage} status={result.status} "
+            f"seconds={result.seconds}",
+            flush=True,
+        )
+        return result.status == "ok"
+
+    try:
+        download_started = time.perf_counter()
+        print(f"{label} dataset download start: {config.datasetUri(nRows)}", flush=True)
+        download_file(config.datasetUri(nRows), local_h5ad)
+        download_seconds = time.perf_counter() - download_started
+        print(
+            f"{label} dataset download done: seconds={download_seconds:.1f}",
+            flush=True,
+        )
+        funnel_started = time.perf_counter()
+        for stage in selected:
+            for name in [
+                name for name in pending if stage not in BACKGROUND_OVERLAPS[name]
+            ]:
+                if not record(name, pending.pop(name).result()):
+                    failed_stage = failed_stage or name
+            if failed_stage is not None:
+                break
+            print(f"{label} stage start: {stage}", flush=True)
+            if stage in BACKGROUND_OVERLAPS:
+                pending[stage] = BackgroundTask(
+                    functools.partial(execute, stage),
+                    name=f"profile-{stage}",
+                )
+            elif not record(stage, execute(stage)):
+                failed_stage = stage
+                break
+        funnel_seconds = time.perf_counter() - funnel_started
+    except Exception as exc:  # noqa: BLE001 - persist a durable failure summary
+        status = "error"
+        error = f"{type(exc).__name__}: {exc}"
+    finally:
+        # Record background stages even when a later stage failed.
+        for name in list(pending):
+            try:
+                if not record(name, pending.pop(name).result()):
+                    failed_stage = failed_stage or name
+            except Exception as exc:  # noqa: BLE001 - keep the first failure
+                failed_stage = failed_stage or name
+                error = error or f"{type(exc).__name__}: {exc}"
+        measurement = sampler.stop()
+    if failed_stage is not None:
+        status = "error"
+        error = error or payloads[failed_stage].get("error") or f"{failed_stage} failed"
+
+    outcomes = [payloads[stage] for stage in selected if stage in payloads]
+    summary: dict[str, Any] = {
+        "runTag": config.runTag,
+        "submissionId": submissionId,
+        "nRows": nRows,
+        "status": status,
+        "stopped": status != "ok",
+        "error": error,
+        "failedStage": failed_stage,
+        "storeBackend": storeBackend,
+        "storeUri": store_uri,
+        "datasetUri": config.datasetUri(nRows),
+        "datasetDownloadSeconds": download_seconds,
+        "funnelSeconds": funnel_seconds,
+        "wholeFunctionSeconds": time.perf_counter() - started,
+        "modalResources": resource_envelope,
+        "stageOrder": list(selected),
+        "completedStages": [
+            item["stage"] for item in outcomes if item["status"] == "ok"
+        ],
+        "outcomes": outcomes,
+        "utilization": [
+            {"stage": item["stage"], **(item.get("utilization") or {})}
+            for item in outcomes
+        ],
+        "claimUri": config.e2eClaimUri(),
+        "funnelResultUri": config.funnelResultUri(nRows),
+        **summarize_resource_measurement(measurement),
+        "provenance": provenance_from_config(config, nonpreemptible=True),
+    }
+    write_funnel_result(config, nRows, summary)
+    return summary
 
 
 @app.function(
@@ -703,170 +681,58 @@ def run_e2e_funnel_job(
 def run_size_jobs(
     configDict: dict[str, Any],
     nRows: int,
+    submissionId: str,
     stages: list[StageName] | None = None,
 ) -> dict[str, Any]:
-    """Run stages sequentially for one size (skip if result JSON exists)."""
     config = ProfilingConfig.model_validate(configDict)
     os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
     if nRows not in config.targetSizes:
         raise ValueError(f"size {nRows} is not in config.targetSizes")
+    # The claim stops a second delivery of this coordinator. Each stage job
+    # claims itself and rejects results from earlier submissions.
+    claim_submission(config, nRows, "size", submissionId)
     selected_stages = tuple(stages) if stages else config.effectiveStages
-    parallel_sizes = max(1, len(config.targetSizes))
     outcomes: list[dict[str, Any]] = []
-
     for stage in selected_stages:
-        failed = existing_error_result(config, nRows, stage)
-        if failed is not None:
-            return {
-                "nRows": nRows,
-                "stopped": True,
-                "failed": failed,
-                "outcomes": [
-                    *outcomes,
-                    {
-                        "nRows": nRows,
-                        "stage": stage,
-                        "status": "error",
-                        "resultUri": config.resultUri(nRows, stage),
-                        "terminalExistingError": True,
-                    },
-                ],
-            }
-        if result_exists(config, nRows, stage):
-            outcomes.append(
-                {
-                    "nRows": nRows,
-                    "stage": stage,
-                    "status": "skipped",
-                    "resultUri": config.resultUri(nRows, stage),
-                }
-            )
-            continue
         resources = config.resourcesFor(stage)
         options = modal_function_options(
             config,
             resources,
-            maxContainers=parallel_sizes,
+            maxContainers=max(1, len(config.targetSizes)),
             retries=0,
         )
-        deadline_seconds = float(resources.timeoutSeconds) + DEFAULT_GRACE_SECONDS
-        result: dict[str, Any] | None = None
-        last_error: BaseException | None = None
-        spawn_attempts = 1
-        for attempt in range(1, spawn_attempts + 1):
-            if result_exists(config, nRows, stage):
-                recovered = load_result(config, nRows, stage) or {}
-                if recovered.get("status") == "error":
-                    return {
-                        "nRows": nRows,
-                        "stopped": True,
-                        "failed": recovered,
-                        "outcomes": [
-                            *outcomes,
-                            {
-                                "nRows": nRows,
-                                "stage": stage,
-                                "status": "error",
-                                "resultUri": config.resultUri(nRows, stage),
-                                "terminalExistingError": True,
-                                "spawnAttempt": attempt,
-                            },
-                        ],
-                    }
-                result = {
-                    "nRows": nRows,
-                    "stage": stage,
-                    "status": "ok",
-                    "resultUri": config.resultUri(nRows, stage),
-                    "recoveredFromR2": True,
-                    "spawnAttempt": attempt,
-                }
-                break
-            call = run_stage_job.with_options(**options).spawn(
-                configDict,
+        call = run_stage_job.with_options(**options).spawn(
+            configDict, nRows, stage, submissionId
+        )
+        try:
+            result = await_stage_result(
+                config,
                 nRows,
                 stage,
+                call,
+                submissionId=submissionId,
+                deadlineSeconds=float(resources.timeoutSeconds) + DEFAULT_GRACE_SECONDS,
             )
-            try:
-                result = await_stage_result(
-                    config,
-                    nRows,
-                    stage,
-                    call,
-                    deadlineSeconds=deadline_seconds,
-                )
-                break
-            except Exception as exc:  # noqa: BLE001 - Modal surfaces many failure types
-                last_error = exc
-                if result_exists(config, nRows, stage):
-                    recovered = load_result(config, nRows, stage) or {}
-                    if recovered.get("status") == "error":
-                        return {
-                            "nRows": nRows,
-                            "stopped": True,
-                            "failed": recovered,
-                            "outcomes": [
-                                *outcomes,
-                                {
-                                    "nRows": nRows,
-                                    "stage": stage,
-                                    "status": "error",
-                                    "resultUri": config.resultUri(nRows, stage),
-                                    "terminalExistingError": True,
-                                    "spawnAttempt": attempt,
-                                    "callError": str(exc),
-                                },
-                            ],
-                        }
-                    result = {
-                        "nRows": nRows,
-                        "stage": stage,
-                        "status": "ok",
-                        "resultUri": config.resultUri(nRows, stage),
-                        "recoveredFromR2": True,
-                        "spawnAttempt": attempt,
-                        "callError": str(exc),
-                    }
-                    break
-                if stage in CONSUME_STAGES:
-                    print(
-                        f"consume stage {stage} call failed ({exc}); "
-                        "continuing remaining consume stages",
-                        flush=True,
-                    )
-                    result = {
-                        "nRows": nRows,
-                        "stage": stage,
-                        "status": "error",
-                        "error": str(exc),
-                        "resultUri": config.resultUri(nRows, stage),
-                        "spawnAttempt": attempt,
-                    }
-                    break
-                if attempt >= spawn_attempts:
-                    raise
-                print(
-                    f"stage {stage} spawn attempt {attempt}/"
-                    f"{spawn_attempts} failed ({exc}); retrying",
-                    flush=True,
-                )
-        if result is None:
-            raise RuntimeError(
-                f"stage {stage} produced no result"
-                + (f" after error: {last_error}" if last_error else "")
-            )
+        except Exception as exc:
+            if stage not in CONSUME_STAGES:
+                raise
+            result = {
+                "submissionId": submissionId,
+                "nRows": nRows,
+                "stage": stage,
+                "status": "error",
+                "error": str(exc),
+                "resultUri": config.resultUri(nRows, stage),
+            }
         outcomes.append(result)
         if result.get("status") == "error" and stage not in CONSUME_STAGES:
-            return {
-                "nRows": nRows,
-                "stopped": True,
-                "failed": result,
-                "outcomes": outcomes,
-            }
-
+            break
+    failed = next((item for item in outcomes if item.get("status") == "error"), None)
     return {
+        "submissionId": submissionId,
         "nRows": nRows,
-        "stopped": any(item.get("status") == "error" for item in outcomes),
+        "stopped": failed is not None,
+        "failed": failed,
         "outcomes": outcomes,
     }
 
@@ -880,6 +746,7 @@ def run_size_jobs(
 )
 def run_all_jobs(
     configDict: dict[str, Any],
+    submissionId: str,
     sizes: list[int] | None = None,
     stages: list[StageName] | None = None,
 ) -> dict[str, Any]:
@@ -903,6 +770,7 @@ def run_all_jobs(
         run_size_jobs.with_options(**orchestrator_options).spawn(
             configDict,
             n_rows,
+            submissionId,
             stage_list,
         )
         for n_rows in selected_sizes
@@ -913,6 +781,7 @@ def run_all_jobs(
     )
     failed = [item for item in size_results if item.get("stopped")]
     return {
+        "submissionId": submissionId,
         "stopped": bool(failed),
         "failed": failed[0] if failed else None,
         "sizes": size_results,
@@ -971,8 +840,23 @@ def _print_spawned(label: str, call: Any) -> None:
     )
 
 
-def _wait_ephemeral(call: Any, *, deadlineSeconds: float = 86_400.0) -> None:
-    print(await_function_call(call, deadlineSeconds=deadlineSeconds))
+def _launch(
+    config: ProfilingConfig,
+    name: str,
+    options: dict[str, Any],
+    *args: Any,
+    ephemeral: bool = False,
+    label: str,
+) -> None:
+    """Spawn job ``name`` from the deployed app, or from this app when ephemeral.
+
+    An ephemeral app ends with this entrypoint, so wait for the call there.
+    """
+    function = globals()[name] if ephemeral else _deployed_function(config, name)
+    call = function.with_options(**options).spawn(*args)
+    _print_spawned(label, call)
+    if ephemeral:
+        print(await_function_call(call, deadlineSeconds=86_400.0))
 
 
 @app.local_entrypoint()
@@ -1073,16 +957,13 @@ def main(*arg_list: str) -> None:
         return
 
     if args.command == "prepare":
-        prepare_options = modal_function_options(
+        _launch(
             config,
-            config.prepareResources,
+            "prepare_datasets",
+            modal_function_options(config, config.prepareResources),
+            payload,
+            label="prepare_datasets",
         )
-        call = (
-            _deployed_function(config, "prepare_datasets")
-            .with_options(**prepare_options)
-            .spawn(payload)
-        )
-        _print_spawned("prepare_datasets", call)
         return
 
     if args.command == "prepare-fixture":
@@ -1090,57 +971,48 @@ def main(*arg_list: str) -> None:
         for size in sizes:
             if size not in config.targetSizes:
                 raise SystemExit(f"size {size} is not in config.targetSizes")
-        fixture_options = modal_function_options(
+        _launch(
             config,
-            config.resourcesFor("reopenStore"),
+            "prepare_fixture_datasets_job",
+            modal_function_options(config, config.resourcesFor("reopenStore")),
+            payload,
+            sizes,
+            args.n_columns,
+            label="prepare_fixture_datasets_job",
         )
-        call = (
-            _deployed_function(config, "prepare_fixture_datasets_job")
-            .with_options(**fixture_options)
-            .spawn(payload, sizes, args.n_columns)
-        )
-        _print_spawned("prepare_fixture_datasets_job", call)
         return
+
+    submission_id = uuid4().hex
 
     if args.command == "run":
         if args.size not in config.targetSizes:
             raise SystemExit(f"size {args.size} is not in config.targetSizes")
-        failed = existing_error_result(config, args.size, args.stage)
-        if failed is not None and not args.force:
+        # Fail fast here; the stage job itself also rejects an existing result.
+        existing = None if args.force else load_result(config, args.size, args.stage)
+        if existing is not None:
+            failed = existing.get("status") == "error"
             print(
                 {
                     "nRows": args.size,
                     "stage": args.stage,
-                    "status": "error",
-                    "resultUri": config.resultUri(args.size, args.stage),
-                    "terminalExistingError": True,
-                }
-            )
-            raise SystemExit(1)
-        if result_exists(config, args.size, args.stage) and not args.force:
-            print(
-                {
-                    "nRows": args.size,
-                    "stage": args.stage,
-                    "status": "skipped",
+                    "status": "error" if failed else "skipped",
                     "resultUri": config.resultUri(args.size, args.stage),
                 }
             )
+            if failed:
+                raise SystemExit(1)
             return
-        resources = config.resourcesFor(args.stage)
-        options = modal_function_options(config, resources, retries=0)
-        target = (
-            run_stage_job
-            if args.ephemeral
-            else _deployed_function(config, "run_stage_job")
-        )
-        spawn_args: tuple[Any, ...] = (payload, args.size, args.stage)
+        spawn_args: tuple[Any, ...] = (payload, args.size, args.stage, submission_id)
         if args.force:
             spawn_args += (True,)
-        call = target.with_options(**options).spawn(*spawn_args)
-        _print_spawned(f"run_stage_job {args.size}/{args.stage}", call)
-        if args.ephemeral:
-            _wait_ephemeral(call)
+        _launch(
+            config,
+            "run_stage_job",
+            modal_function_options(config, config.resourcesFor(args.stage), retries=0),
+            *spawn_args,
+            ephemeral=args.ephemeral,
+            label=f"run_stage_job {args.size}/{args.stage}",
+        )
         return
 
     if args.command == "run-all":
@@ -1150,58 +1022,41 @@ def main(*arg_list: str) -> None:
             for size in sizes:
                 if size not in config.targetSizes:
                     raise SystemExit(f"size {size} is not in config.targetSizes")
-        coordinator_options = orchestrator_function_options(config)
-        target = (
-            run_all_jobs
-            if args.ephemeral
-            else _deployed_function(config, "run_all_jobs")
+        _launch(
+            config,
+            "run_all_jobs",
+            orchestrator_function_options(config),
+            payload,
+            submission_id,
+            sizes,
+            stages,
+            ephemeral=args.ephemeral,
+            label="run_all_jobs",
         )
-        call = target.with_options(**coordinator_options).spawn(payload, sizes, stages)
-        _print_spawned("run_all_jobs", call)
-        if args.ephemeral:
-            _wait_ephemeral(call)
         return
 
-    if args.command == "run-e2e":
+    if args.command in {"run-e2e", "run-local"}:
         if args.size not in config.targetSizes:
             raise SystemExit(f"size {args.size} is not in config.targetSizes")
         if not config.runTag.strip():
-            raise SystemExit("run-e2e requires a non-empty runTag")
-        options = _e2e_function_options(config)
-        target = (
-            run_e2e_funnel_job
-            if args.ephemeral
-            else _deployed_function(config, "run_e2e_funnel_job")
+            raise SystemExit(f"{args.command} requires a non-empty runTag")
+        backend = "r2" if args.command == "run-e2e" else "local"
+        stages = (
+            list(CORE_STAGE_ORDER)
+            if backend == "r2"
+            else list(args.stages or config.effectiveStages)
         )
-        call = target.with_options(**options).spawn(payload, args.size)
-        _print_spawned(f"run_e2e_funnel_job {args.size}", call)
         print(f"result URI (when done): {config.funnelResultUri(args.size)}")
-        if args.ephemeral:
-            _wait_ephemeral(call)
-        return
-
-    if args.command == "run-local":
-        if args.size not in config.targetSizes:
-            raise SystemExit(f"size {args.size} is not in config.targetSizes")
-        stages = list(args.stages) if args.stages else None
-        selected = tuple(stages) if stages else config.effectiveStages
-        # Size the single container to the hungriest stage in the funnel.
-        peak = max(
-            (config.resourcesFor(stage) for stage in selected),
-            key=lambda item: (
-                item.modalMemoryLimitMb,
-                item.modalCpuLimit,
-                item.timeoutSeconds,
-            ),
+        _launch(
+            config,
+            "run_funnel_job",
+            _e2e_function_options(config, tuple(stages)),
+            payload,
+            args.size,
+            submission_id,
+            backend,
+            stages,
+            ephemeral=args.ephemeral,
+            label=f"run_funnel_job {backend} {args.size}",
         )
-        options = modal_function_options(config, peak, maxContainers=1)
-        target = (
-            run_local_funnel_job
-            if args.ephemeral
-            else _deployed_function(config, "run_local_funnel_job")
-        )
-        call = target.with_options(**options).spawn(payload, args.size, stages)
-        _print_spawned(f"run_local_funnel_job {args.size}", call)
-        if args.ephemeral:
-            _wait_ephemeral(call)
         return

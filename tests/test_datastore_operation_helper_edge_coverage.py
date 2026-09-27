@@ -178,56 +178,60 @@ def test_connectivity_payload_rejects_values_and_row_geometry() -> None:
         graph_operations._validate_integration_source_payload(root, _ref("reduction"))
 
 
+_NORMALIZATION = {"log_transform": False, "renormalize_subset": False}
+
+
 def test_trajectory_identity_helpers_cover_drift_and_invalid_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stored = SimpleNamespace(
-        attrs={"dataset_fingerprint": "stable"},
         name="RNA",
         normMethod=object(),
         sf=None,
+        _count_arithmetic=lambda *_, **__: None,
     )
-    assert (
-        trajectory_operations._assay_dataset_fingerprint(object(), stored) == "stable"
-    )
-    calculated_store = SimpleNamespace(_calculate_dataset_fingerprint=lambda name: "")
-    with pytest.raises(ValueError, match="fingerprint is unavailable"):
-        trajectory_operations._assay_dataset_fingerprint(
-            calculated_store, SimpleNamespace(attrs={}, name="RNA")
-        )
 
     monkeypatch.setattr(
         trajectory_operations,
         "callable_identity",
         lambda method: {"callable": "stable"},
     )
-    trajectory_operations._validate_assay_execution_identity(
-        object(),
+    trajectory_operations._validate_normalization_identity(
         stored,
-        dataset_fingerprint="stable",
         normalization_method={"callable": "stable"},
         size_factor=None,
+        normalization=_NORMALIZATION,
+        count_arithmetic=None,
         context="diffusion",
     )
     stored.sf = True
     with pytest.raises(ValueError, match="normalization settings changed"):
-        trajectory_operations._validate_assay_execution_identity(
-            object(),
+        trajectory_operations._validate_normalization_identity(
             stored,
-            dataset_fingerprint="stable",
             normalization_method={"callable": "stable"},
             size_factor=None,
+            normalization=_NORMALIZATION,
+            count_arithmetic=None,
+            context="diffusion",
+        )
+    stored.sf = 2.0
+    with pytest.raises(ValueError, match="normalization settings changed"):
+        trajectory_operations._validate_normalization_identity(
+            stored,
+            normalization_method={"callable": "stable"},
+            size_factor=None,
+            normalization=_NORMALIZATION,
+            count_arithmetic=None,
             context="diffusion",
         )
     stored.sf = None
-    stored.attrs["dataset_fingerprint"] = "changed"
-    with pytest.raises(ValueError, match="dataset identity changed"):
-        trajectory_operations._validate_assay_execution_identity(
-            object(),
+    with pytest.raises(ValueError, match="normalization settings changed"):
+        trajectory_operations._validate_normalization_identity(
             stored,
-            dataset_fingerprint="stable",
-            normalization_method={"callable": "stable"},
+            normalization_method={"callable": "changed"},
             size_factor=None,
+            normalization=_NORMALIZATION,
+            count_arithmetic=None,
             context="diffusion",
         )
 
@@ -237,12 +241,12 @@ def test_trajectory_identity_helpers_cover_drift_and_invalid_values(
         lambda method: (_ for _ in ()).throw(ValueError("unstable")),
     )
     with pytest.raises(ValueError, match="normalization settings changed"):
-        trajectory_operations._validate_assay_execution_identity(
-            object(),
+        trajectory_operations._validate_normalization_identity(
             stored,
-            dataset_fingerprint="stable",
             normalization_method={"callable": "stable"},
             size_factor=None,
+            normalization=_NORMALIZATION,
+            count_arithmetic=None,
             context="diffusion",
         )
 

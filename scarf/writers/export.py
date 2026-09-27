@@ -5,8 +5,50 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
 
+from ..metadata.rows import apply_missing_mask, metadata_missing_mask
 from ..utils.compute import compute_with_progress
 from ..utils.logging import logger
+
+
+def _write_masked_column(
+    group: Any,
+    name: str,
+    values: np.ndarray,
+    missing: np.ndarray,
+) -> None:
+    """Write one H5AD column whose masked rows are AnnData missing values.
+
+    Numeric columns become float64 with NaN, boolean columns use the nullable
+    boolean encoding, and other columns become categoricals whose masked rows
+    have code -1, as AnnData writes a run-aware export.
+    """
+    import h5py
+
+    if values.dtype.kind in {"f", "i", "u"}:
+        group.create_dataset(name, data=apply_missing_mask(values, missing))
+        return
+    column = group.create_group(name)
+    if values.dtype.kind == "b":
+        column.attrs["encoding-type"] = "nullable-boolean"
+        column.attrs["encoding-version"] = "0.1.0"
+        column.create_dataset("values", data=values)
+        column.create_dataset("mask", data=missing)
+        return
+    categories, observed_codes = np.unique(
+        values[~missing].astype(str),
+        return_inverse=True,
+    )
+    codes = np.full(len(values), -1, dtype=np.int32)
+    codes[~missing] = observed_codes
+    column.attrs["encoding-type"] = "categorical"
+    column.attrs["encoding-version"] = "0.2.0"
+    column.attrs["ordered"] = False
+    column.create_dataset(
+        "categories",
+        data=categories.astype(object),
+        dtype=h5py.special_dtype(vlen=str),
+    )
+    column.create_dataset("codes", data=codes)
 
 
 def to_h5ad(
@@ -19,6 +61,11 @@ def to_h5ad(
     run: object | None = None,
 ) -> None:
     """Save an assay or a completed pipeline run as an H5AD file.
+
+    Rows that a nullable metadata column's linked missing mask flags are
+    written as missing values: NaN in a float64 column for numeric columns, a
+    nullable boolean for boolean columns, and a missing category for other
+    columns.
 
     Args:
         assay: Assay to save in H5ad format
@@ -85,6 +132,11 @@ def to_h5ad(
 
     def save_attr(group: str, col: str, scarf_col: str, md: Any) -> None:
         d = md.fetch_all(scarf_col)
+        mask = metadata_missing_mask(md, scarf_col)
+        missing = None if mask is None else np.asarray(mask[:], dtype=bool)
+        if missing is not None and missing.any():
+            _write_masked_column(h5[group], col, d, missing)
+            return
         d_type = d.dtype
         if np.issubdtype(d_type, np.number) or np.issubdtype(d_type, bool):
             pass

@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 import zarr
+from zarr.errors import ContainsArrayError, ContainsGroupError
 from zarr.abc.store import Store
 from zarr.core.buffer import Buffer, default_buffer_prototype
 from zarr.core.sync import collect_aiterator, sync
@@ -947,9 +948,12 @@ class PipelineRunRecord:
 
 
 def _get_group(root: zarr.Group, path: str, name: str) -> zarr.Group:
-    if path not in root:
-        raise KeyError(f"{name} does not exist: {path}")
-    return as_zarr_group(root[path], name=path)
+    # One lookup: a membership test first reads the node twice.
+    try:
+        node = root[path]
+    except KeyError:
+        raise KeyError(f"{name} does not exist: {path}") from None
+    return as_zarr_group(node, name=path)
 
 
 def _ensure_group(root: zarr.Group, path: str) -> zarr.Group:
@@ -1013,11 +1017,13 @@ def create_pipeline_run_record(
         error=None,
         interruption=None,
     )
-    path = pipeline_run_path(record.run_id)
-    if path in root:
-        raise FileExistsError(f"Pipeline run already exists: {record.run_id}")
-    group = _ensure_group(root, PIPELINE_RUNS_PATH).create_group(record.run_id)
-    group.attrs.put(record.to_dict())
+    try:
+        # One metadata write creates the run with its record.
+        group = _ensure_group(root, PIPELINE_RUNS_PATH).create_group(
+            record.run_id, attributes=record.to_dict()
+        )
+    except (ContainsArrayError, ContainsGroupError) as exc:
+        raise FileExistsError(f"Pipeline run already exists: {record.run_id}") from exc
     group.create_group("stages")
     return record
 
@@ -1025,9 +1031,10 @@ def create_pipeline_run_record(
 def load_pipeline_run_record(root: zarr.Group, run_id: str) -> PipelineRunRecord:
     path = pipeline_run_path(run_id)
     group = _get_group(root, path, "Pipeline run")
-    if "stages" not in group:
-        raise ValueError(f"Pipeline run {run_id} has no stages group")
-    as_zarr_group(group["stages"], name=f"{path}/stages")
+    try:
+        as_zarr_group(group["stages"], name=f"{path}/stages")
+    except KeyError:
+        raise ValueError(f"Pipeline run {run_id} has no stages group") from None
     record = PipelineRunRecord.from_dict(_read_attrs(group))
     if record.run_id != run_id:
         raise ValueError(f"Pipeline run path {run_id!r} contains {record.run_id!r}")
@@ -1293,11 +1300,12 @@ def _load_pipeline_stage_record_for_run(
     root: zarr.Group,
     run: PipelineRunRecord,
     ordinal: int,
+    group: zarr.Group | None = None,
 ) -> PipelineStageRecord:
-    path = pipeline_stage_path(run.run_id, ordinal)
-    record = PipelineStageRecord.from_dict(
-        _read_attrs(_get_group(root, path, "Pipeline stage"))
-    )
+    if group is None:
+        path = pipeline_stage_path(run.run_id, ordinal)
+        group = _get_group(root, path, "Pipeline stage")
+    record = PipelineStageRecord.from_dict(_read_attrs(group))
     if record.ordinal != ordinal:
         raise ValueError(f"Pipeline stage path {ordinal} contains {record.ordinal}")
     if ordinal >= len(run.stage_order) or run.stage_order[ordinal] != record.stage:
@@ -1314,17 +1322,18 @@ def _load_pipeline_stage_records_for_run(
         f"{pipeline_run_path(run.run_id)}/stages",
         "Pipeline stages",
     )
-    ordinals: list[int] = []
-    for name in stages.group_keys():
+    # One listing opens every stage group; its attributes are the records.
+    groups: dict[int, zarr.Group] = {}
+    for name, group in stages.groups():
         if not name.isdigit() or str(int(name)) != name:
             raise ValueError(f"Invalid pipeline stage child name: {name!r}")
         ordinal = int(name)
         if ordinal >= len(run.stage_order):
             raise ValueError(f"Pipeline stage ordinal is out of range: {ordinal}")
-        ordinals.append(ordinal)
+        groups[ordinal] = group
     return tuple(
-        _load_pipeline_stage_record_for_run(root, run, ordinal)
-        for ordinal in sorted(ordinals)
+        _load_pipeline_stage_record_for_run(root, run, ordinal, groups[ordinal])
+        for ordinal in sorted(groups)
     )
 
 
@@ -1345,11 +1354,12 @@ def start_pipeline_stage_record(
     prior = _load_pipeline_stage_records_for_run(root, run)
     if any(item.ordinal >= ordinal for item in prior):
         raise FileExistsError(f"Pipeline stage {ordinal} already exists")
+    # Stages start in the persisted order. Earlier stages may still be running,
+    # but none may have failed or been interrupted.
     if len(prior) != ordinal or any(
-        not item.complete or item.status not in {"completed", "skipped"}
-        for item in prior
+        item.status not in {"completed", "skipped", "running"} for item in prior
     ):
-        raise ValueError("Pipeline stages must start sequentially")
+        raise ValueError("Pipeline stages must start in order after successful stages")
     record = PipelineStageRecord(
         stage=stage,
         ordinal=ordinal,

@@ -13,6 +13,18 @@ from typing import Any
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+# Code and config identity. The submitting client captures it once and every
+# stage and funnel result carries it under these flat keys.
+_IDENTITY_KEYS = (
+    "gitSha",
+    "gitDescribe",
+    "gitDirty",
+    "gitDiffSha256",
+    "sourceTreeSha256",
+    "lockfileSha256",
+    "configSha256",
+    "packageVersions",
+)
 
 
 def _run_git(*args: str) -> str | None:
@@ -151,8 +163,9 @@ def collect_client_code_identity(
     *,
     configPayload: dict[str, Any] | Path | str | None = None,
 ) -> dict[str, Any]:
-    """Capture code/config identity on the submitting client before Modal.
+    """Capture code/config identity, normally on the submitting client before Modal.
 
+    ``collect_run_provenance`` calls it only when no client identity was sent.
     Results that lack these fields should be treated as diagnostic only.
     """
     dirty = _run_git("status", "--porcelain")
@@ -165,11 +178,8 @@ def collect_client_code_identity(
         "lockfileSha256": _lockfile_digest(),
         "configSha256": config_digest(configPayload),
         "packageVersions": {
-            "zarr": _package_version("zarr"),
-            "numba": _package_version("numba"),
-            "numpy": _package_version("numpy"),
-            "obstore": _package_version("obstore"),
-            "scarf": _package_version("scarf"),
+            name: _package_version(name)
+            for name in ("zarr", "numba", "numpy", "obstore", "scarf")
         },
         "capturedOn": "client",
     }
@@ -194,7 +204,15 @@ def collect_run_provenance(
     clientProvenance: dict[str, Any] | None = None,
     configDigestValue: str | None = None,
 ) -> dict[str, Any]:
-    """Return a JSON-serializable provenance payload for stage/funnel results."""
+    """Return a JSON-serializable provenance payload for stage/funnel results.
+
+    Code identity comes from ``clientProvenance`` when the submitting client
+    captured it. Otherwise this process collects it.
+    """
+    identity = clientProvenance or collect_client_code_identity()
+    provenance = {key: identity.get(key) for key in _IDENTITY_KEYS}
+    if provenance["configSha256"] is None:
+        provenance["configSha256"] = configDigestValue
     zarr_pipeline = None
     zarr_async_concurrency = None
     try:
@@ -214,52 +232,25 @@ def collect_run_provenance(
     except Exception:
         pass
 
-    dirty = _run_git("status", "--porcelain")
-    provenance: dict[str, Any] = {
-        "gitSha": _run_git("rev-parse", "HEAD"),
-        "gitDescribe": _run_git("describe", "--always", "--dirty", "--tags"),
-        "gitDirty": bool(dirty) if dirty is not None else None,
-        "gitDiffSha256": _git_diff_digest(),
-        "sourceTreeSha256": _source_tree_digest(),
-        "lockfileSha256": _lockfile_digest(),
-        "configSha256": configDigestValue,
-        "pythonVersion": sys.version.split()[0],
-        "platform": platform.platform(),
-        "hostname": socket.gethostname(),
-        "modalInputId": modal_input_id,
-        "modalFunctionCallId": modal_function_call_id,
-        "cpuModel": _cpu_model(),
-        "cpuCountLogical": os.cpu_count(),
-        "packageVersions": {
-            "zarr": _package_version("zarr"),
-            "numba": _package_version("numba"),
-            "numpy": _package_version("numpy"),
-            "obstore": _package_version("obstore"),
-            "scarf": _package_version("scarf"),
-        },
-        "zarrCodecPipeline": zarr_pipeline,
-        "zarrAsyncConcurrency": zarr_async_concurrency,
-        "scarfZarrProfile": os.environ.get("SCARF_ZARR_PROFILE"),
-        "nonpreemptible": nonpreemptible,
-        "hasClientCodeIdentity": False,
-    }
+    provenance.update(
+        {
+            "pythonVersion": sys.version.split()[0],
+            "platform": platform.platform(),
+            "hostname": socket.gethostname(),
+            "modalInputId": modal_input_id,
+            "modalFunctionCallId": modal_function_call_id,
+            "cpuModel": _cpu_model(),
+            "cpuCountLogical": os.cpu_count(),
+            "zarrCodecPipeline": zarr_pipeline,
+            "zarrAsyncConcurrency": zarr_async_concurrency,
+            "scarfZarrProfile": os.environ.get("SCARF_ZARR_PROFILE"),
+            "nonpreemptible": nonpreemptible,
+            "hasClientCodeIdentity": bool(
+                clientProvenance and clientProvenance.get("sourceTreeSha256")
+            ),
+        }
+    )
     if clientProvenance:
-        for key in (
-            "gitSha",
-            "gitDescribe",
-            "gitDirty",
-            "gitDiffSha256",
-            "sourceTreeSha256",
-            "lockfileSha256",
-            "configSha256",
-            "packageVersions",
-        ):
-            value = clientProvenance.get(key)
-            if value is not None:
-                provenance[key] = value
-        provenance["hasClientCodeIdentity"] = bool(
-            clientProvenance.get("sourceTreeSha256")
-        )
         provenance["clientCapturedOn"] = clientProvenance.get("capturedOn")
     return provenance
 

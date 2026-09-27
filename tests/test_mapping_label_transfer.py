@@ -36,7 +36,7 @@ from scarf.storage.feature_selection import (
 )
 from scarf.storage.selections import (
     read_stored_selection_indices,
-    resolve_selection_artifact,
+    resolve_generated_selection_artifact,
 )
 from scarf.storage.types import as_zarr_array as checked_zarr_array
 
@@ -125,7 +125,7 @@ def _write_projection(
         cell_mask = np.zeros(query.cells.N, dtype=bool)
         cell_mask[:n_cells] = True
         query.cells.insert(cell_key, cell_mask, overwrite=True)
-    cell_selection = resolve_selection_artifact(
+    cell_selection = resolve_generated_selection_artifact(
         query.zw,
         scope="datastore",
         kind="cell_selection",
@@ -135,12 +135,12 @@ def _write_projection(
         parameters={},
         inputs={},
         source_column=cell_key,
-    )
+    )[0]
     all_features = query.select_all_features(from_assay="RNA")
     query_feature_ids = np.asarray(query.RNA.feats.fetch_all("ids")).astype(str)
     reference_feature_ids = np.asarray(reference.feature_ids).astype(str)
     feature_mask = np.isin(query_feature_ids, reference_feature_ids)
-    feature_ids_fingerprint = _ordered_feature_ids_fingerprint(query.RNA)
+    feature_ids_fingerprint = _ordered_feature_ids_fingerprint(query.RNA.z)
     feature_plan = _feature_selection_plan(
         query.zw,
         assay="RNA",
@@ -171,7 +171,7 @@ def _write_projection(
         correction_method="none",
         cell_selection=cell_selection,
         feature_selection=feature_selection,
-        selected_expression_fingerprint="e" * 64,
+        query_dataset_fingerprint=query._ensure_dataset_fingerprint("RNA"),
         query_batch_fingerprint=NO_QUERY_BATCH_FINGERPRINT,
         query_batch_count=1,
         mapping_reference=reference.external_ref,
@@ -194,7 +194,7 @@ def _write_projection(
             "featureCoverage": float(feature_coverage),
             "queryBatchCount": 1,
             "algorithmVariant": "scaled_pca",
-            "zeroNormCellCount": int(np.count_nonzero(uninformative_values)),
+            "uninformativeCellCount": int(np.count_nonzero(uninformative_values)),
             "queryScaledDispersion": 1.0,
         }
     )
@@ -431,6 +431,62 @@ def test_mapping_scores_keep_missing_target_groups_distinct(
     np.testing.assert_allclose(scores[1][1][:3], [0.5, 0.0, 0.5])
     np.testing.assert_array_equal(scores[0][1][3:], 0.0)
     np.testing.assert_array_equal(scores[1][1][3:], 0.0)
+
+
+@pytest.mark.parametrize("weighted", [True, False])
+def test_mapping_score_data_reads_projection_once(
+    mapping_consumer_context,
+    monkeypatch,
+    weighted,
+):
+    _, reference, query = mapping_consumer_context
+    indices = np.array([[0, 1], [2, 3], [1, 2], [3, 0], [0, 2], [1, 3], [2, 1]])
+    distances = np.arange(1, 15, dtype=np.float64).reshape(7, 2)
+    uninformative = np.array([False, False, True, False, False, False, False])
+    result = _write_projection(
+        query,
+        reference,
+        indices=indices,
+        distances=distances,
+        uninformative=uninformative,
+    )
+    # None and NaN are one missing group in both the generator and the table.
+    groups = np.array(["b", "a", "a", np.nan, "c", "b", None], dtype=object)
+    options = {
+        "target_groups": groups,
+        "log_transform": True,
+        "multiplier": 10.0,
+        "weighted": weighted,
+        "fixed_weight": 0.3,
+    }
+    expected = list(query.get_mapping_score(result, reference=reference, **options))
+    reads: list[tuple[str, object]] = []
+    _record_projection_reads(monkeypatch, reads)
+
+    loaded, scores, classes, coordinates = query._mapping_score_data(
+        result,
+        reference=reference,
+        **options,
+    )
+
+    assert loaded.ref == result
+    assert classes is None and coordinates is None
+    assert [str(group) for group, _ in scores] == ["b", "a", "nan", "c"]
+    for (group, values), (expected_group, expected_values) in zip(
+        scores, expected, strict=True
+    ):
+        assert str(group) == str(expected_group)
+        np.testing.assert_array_equal(values, expected_values)
+    rows_read = Counter()
+    for name, key in reads:
+        assert isinstance(key, slice)
+        rows_read[name] += key.stop - key.start
+    # Loading validates each payload array once, then one pass scores all four
+    # groups. Unweighted scores never read distances.
+    n_cells = len(indices)
+    assert rows_read["indices"] == 2 * n_cells
+    assert rows_read["uninformative"] == 2 * n_cells
+    assert rows_read["distances"] == (2 if weighted else 1) * n_cells
 
 
 def test_labels_and_evidence_abstain_without_fabricating_metrics(
@@ -941,7 +997,6 @@ def test_bound_reference_repeats_label_transfer_without_rereading_its_payload(
     from scarf.storage.artifacts import artifact_group
 
     reference_store, reference, query = mapping_consumer_context
-    reference_store.RNA.attrs.pop("dataset_fingerprint", None)
     _write_reference_labels(reference)
     result = _write_projection(
         query,
@@ -995,8 +1050,8 @@ def test_bound_reference_repeats_label_transfer_without_rereading_its_payload(
     cell_id_reads = Counter(
         key for key in chunk_keys if key.startswith("cellData/ids/")
     )
-    # Binding and label reads each check twice; the dataset fingerprint adds one.
-    assert cell_id_reads and set(cell_id_reads.values()) == {5}
+    # Binding and label reads share one row-identity validation per call.
+    assert cell_id_reads and set(cell_id_reads.values()) == {1}
     assert not any(key.startswith("cellData/I/") for key in chunk_keys)
 
 
@@ -1044,10 +1099,6 @@ def test_reused_reference_rejects_reordered_cells(
     mapping_consumer_context, stored_fingerprint, consumer
 ):
     reference_store, reference, query = mapping_consumer_context
-    if stored_fingerprint:
-        reference_store.RNA.attrs["dataset_fingerprint"] = reference.dataset_fingerprint
-    else:
-        reference_store.RNA.attrs.pop("dataset_fingerprint", None)
     _write_reference_labels(reference)
     selected = _reference_cell_indices(reference)[:2]
     result = _write_projection(
@@ -1074,6 +1125,11 @@ def test_reused_reference_rejects_reordered_cells(
         "score": lambda: list(query.get_mapping_score(result, reference=reference)),
         "lineage": lambda: query.lineage(result, references=reference),
     }[consumer]
+    if not stored_fingerprint:
+        reference_store.RNA.z.attrs.pop("dataset_fingerprint")
+        with pytest.raises(ValueError, match="inconsistent dataset identity"):
+            consume()
+        return
     consume()
 
     for column in ("ids", "reference_labels"):
@@ -1086,12 +1142,8 @@ def test_reused_reference_rejects_reordered_cells(
         consume()
 
 
-@pytest.mark.parametrize("column", ["feature_ids", "cell_counts"])
-def test_reused_reference_recomputes_missing_dataset_fingerprint(
-    mapping_consumer_context, column
-):
+def test_reused_reference_requires_persisted_dataset_identity(mapping_consumer_context):
     reference_store, reference, query = mapping_consumer_context
-    reference_store.RNA.attrs.pop("dataset_fingerprint", None)
     result = _write_projection(
         query,
         reference,
@@ -1100,15 +1152,8 @@ def test_reused_reference_recomputes_missing_dataset_fingerprint(
         uninformative=np.array([False, False]),
     )
     query.get_mapping_result(result, reference=reference)
-
-    if column == "feature_ids":
-        array = reference_store.RNA.feats._get_array("ids")
-        array[:2] = array[:2][::-1]
-    else:
-        array = reference_store.cells._get_array("RNA_nCounts")
-        array[0] = array[0] + 1
-
-    with pytest.raises(ValueError, match="dataset fingerprint mismatch"):
+    reference_store.RNA.z.attrs.pop("dataset_fingerprint")
+    with pytest.raises(ValueError, match="inconsistent dataset identity"):
         query.get_mapping_result(result, reference=reference)
 
 

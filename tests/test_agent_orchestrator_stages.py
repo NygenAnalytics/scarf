@@ -80,7 +80,6 @@ def _measured_context_characterization(store, cell_selection):
     from scarf.agent.experimental_context.characterization import (
         characterize_covariates,
     )
-    from scarf.agent.orchestrator.models import artifact_model_to_ref
 
     for name, values in {
         "sample": ["s1", "s1", "s2", "s2"],
@@ -91,7 +90,7 @@ def _measured_context_characterization(store, cell_selection):
         store.cells.insert(name, np.asarray(values))
     return characterize_covariates(
         store,
-        cellSelection=artifact_model_to_ref(cell_selection),
+        cellSelection=cell_selection.to_artifact_ref(),
         model=None,
         directions={
             "columnDomains": {
@@ -121,6 +120,7 @@ def _cell_selection_model() -> ArtifactReferenceModel:
 
 class _FeatureTable:
     def __init__(self, ids: list[str], names: list[str]) -> None:
+        self.N = len(ids)
         self._values = {
             "ids": np.asarray(ids),
             "names": np.asarray(names),
@@ -133,31 +133,20 @@ class _FeatureTable:
 class _PlanningStore:
     """Narrow datastore surface consumed by preprocessing-plan construction."""
 
-    def __init__(
-        self,
-        assays: Mapping[str, tuple[str, list[str], list[str]]],
-        *,
-        active_cells: int = 100,
-    ) -> None:
+    def __init__(self, assays: Mapping[str, tuple[str, list[str], list[str]]]) -> None:
         self.assay_names = list(assays)
+        self.zw = SimpleNamespace(
+            attrs={
+                "assayTypes": {
+                    name: assay_type
+                    for name, (assay_type, _ids, _names) in assays.items()
+                }
+            }
+        )
         self._assays = {
             name: SimpleNamespace(feats=_FeatureTable(ids, names))
             for name, (_assay_type, ids, names) in assays.items()
         }
-        self._summary = SimpleNamespace(
-            active_cells=active_cells,
-            assays=[
-                SimpleNamespace(
-                    name=name,
-                    assay_type=assay_type,
-                    total_features=len(ids),
-                )
-                for name, (assay_type, ids, _names) in assays.items()
-            ],
-        )
-
-    def summary(self) -> Any:
-        return self._summary
 
     def get_assay(self, name: str) -> Any:
         return self._assays[name]
@@ -823,13 +812,15 @@ def test_converted_input_preserves_exact_selection_and_typed_qc() -> None:
 def test_percent_features_use_exact_symbols_even_when_enrichment_omits_a_family(
     tmp_path: Path,
 ) -> None:
-    path = create_store(tmp_path / "inspected-families.zarr")
+    path = create_store(
+        tmp_path / "inspected-families.zarr", mito_pattern="", ribo_pattern=""
+    )
     store = DataStore(
         str(path),
         default_assay="RNA",
         min_features_per_cell=-1,
-        mito_pattern="",
-        ribo_pattern="",
+        mito_pattern=None,
+        ribo_pattern=None,
         zarr_mode="r+",
     )
     cell_selection = ArtifactReferenceModel.from_artifact_ref(
@@ -1012,8 +1003,8 @@ def test_hto_processing_is_not_executed_by_rna_workflow(
         str(path),
         default_assay="RNA",
         min_features_per_cell=-1,
-        mito_pattern="",
-        ribo_pattern="",
+        mito_pattern=None,
+        ribo_pattern=None,
         zarr_mode="r+",
     )
     cell_selection = ArtifactReferenceModel.from_artifact_ref(
@@ -1682,3 +1673,28 @@ def test_preprocessing_plan_rejects_invalid_assay_routing(
     )
     with pytest.raises(ValueError, match=message):
         AgentOrchestrator(object()).build_preprocessing_plan(*inputs)
+
+
+def test_screening_coverage_leaves_masked_labels_out_of_every_group() -> None:
+    from scarf.agent.orchestrator.rna_tuning import screening_coverage
+    from tests.test_pipeline import _insert_nullable_cell_column
+    from tests.test_registered_qc_profiles import _memory_qc_store
+
+    rows = np.arange(60)
+    missing = rows % 3 == 0
+    store, parent = _memory_qc_store({"screen": rows % 2 == 0})
+    # Masked rows keep the integer placeholder 0, which is not a recorded lane.
+    lanes = np.where(missing, 0, rows % 2 + 1)
+    _insert_nullable_cell_column(store, "lane", lanes, missing)
+    sample = store.snapshot_cell_selection("screen")
+
+    coverage, concerns = screening_coverage(store, parent, sample, ["lane"])
+
+    groups = {row["value"]: row for row in coverage["groups"]["lane"]}
+    assert list(groups) == ["1", "2"]
+    assert groups["1"]["populationCells"] == groups["2"]["populationCells"] == 20
+    assert groups["1"]["screeningCells"] == 20
+    # Fractions keep every selected cell, including those without a lane.
+    assert groups["1"]["populationFraction"] == pytest.approx(20 / 60)
+    assert groups["1"]["screeningFraction"] == pytest.approx(20 / 30)
+    assert concerns == ["lane=2: 0 sampled of 20 cells"]

@@ -36,6 +36,13 @@ Granular workflows pass exact refs to the same datastore-owned plotting surface:
 inputs. Distribution grouping instead requires either an exact categorical artifact or an explicit
 `CellField`, with `cell_selection=` when a frozen metadata subset is intended.
 
+Plots treat rows that a nullable metadata column or label artifact flags in its linked missing mask
+as missing, never as their stored placeholder. Dot plots and matrix plots leave those cells out of
+every group and report their number as `dropped_group_cells`. Composition plots count a missing
+category in the NA category and leave cells with a missing sample label out of every sample.
+Embeddings and cluster trees show missing colors or fill values as missing, and
+`cluster_connectivity` rejects missing group labels and coordinates.
+
 WNN is the default for `DataStore.integrate_assays`. Its integrated graph stores one weight per
 input assay and cell. Use `ds.plots.modality_weights(graph=wnn_graph, layout=embedding)` or
 {py:func}`scarf.plotting.modality_weights` to show those weights over an explicit embedding. The

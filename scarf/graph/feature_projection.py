@@ -3,12 +3,20 @@ from dataclasses import dataclass
 
 import zarr
 
-from ..storage.artifacts import ArtifactRef, ArtifactStatus, inspect_artifact
+from ..assay.normalization import load_normalized_inputs
+from ..storage.artifacts import (
+    ArtifactRef,
+    ArtifactStatus,
+    artifact_group,
+    inspect_artifact,
+)
 from ..storage.errors import ArtifactResolutionError
-from ..storage.feature_selection import resolve_feature_selection
+from ..storage.identity import read_dataset_fingerprint
 from ..storage.selections import (
     validate_stored_selection_integrity,
 )
+from ..storage.types import as_zarr_array, as_zarr_group
+from ..storage.validation_scope import store_key, validated_once
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,9 +230,12 @@ def _validate_cell_selection(root: zarr.Group, selection: ArtifactRef) -> None:
 def resolve_coordinate_inputs(
     root: zarr.Group,
     coordinates: ArtifactRef,
+    *,
+    statuses: dict[ArtifactRef, ArtifactStatus] | None = None,
 ) -> CoordinateInputs:
     """Resolve and validate the stored selections behind coordinates."""
-    statuses: dict[ArtifactRef, ArtifactStatus] = {}
+    if statuses is None:
+        statuses = {}
     if coordinates.assay is None:
         raise _resolution_error(
             "Coordinate artifact has no assay",
@@ -233,6 +244,7 @@ def resolve_coordinate_inputs(
             expected_scope="assay",
         )
     assay = coordinates.assay
+    read_dataset_fingerprint(as_zarr_group(root[assay], name=assay))
     if coordinates.kind == "imported_coordinates":
         _require_complete(
             root,
@@ -301,26 +313,50 @@ def resolve_coordinate_inputs(
         expected_assay=assay,
         statuses=statuses,
     )
-    cell_selection = _input_ref(
-        root,
-        normalized,
-        "cell_selection",
-        expected_kind="cell_selection",
-        expected_scope="datastore",
-        expected_assay=None,
-        statuses=statuses,
-    )
-    _validate_cell_selection(root, cell_selection)
-    feature_selection = _input_ref(
-        root,
-        normalized,
-        "feature_selection",
-        expected_kind="feature_selection",
-        expected_scope="assay",
-        expected_assay=assay,
-        statuses=statuses,
-    )
-    feature_selection = resolve_feature_selection(root, assay, feature_selection)
+    _, selections = load_normalized_inputs(root, normalized)
+    cell_selection = selections.cells.ref
+    feature_selection = selections.features
+    reduction_group = artifact_group(root, reduction)
+    arrays = []
+    for ref in dict.fromkeys((reduction, coordinates)):
+        group = artifact_group(root, ref)
+        if "data" not in group:
+            raise _resolution_error(
+                "Coordinate artifact is missing its data array",
+                code="payload_missing",
+                ref=ref,
+            )
+        data = as_zarr_array(group["data"], name="data")
+        if data.ndim != 2 or min(data.shape) < 1:
+            raise _resolution_error(
+                "Coordinates must be a non-empty two-dimensional array",
+                code="invalid_shape",
+                ref=ref,
+            )
+        arrays.append((ref, data))
+    if "loadings" not in reduction_group:
+        raise _resolution_error(
+            "Reduction is missing its loadings array",
+            code="payload_missing",
+            ref=reduction,
+        )
+    loadings = as_zarr_array(reduction_group["loadings"], name="loadings")
+    if loadings.ndim != 2 or loadings.shape[0] != int(selections.featureMask.sum()):
+        raise _resolution_error(
+            "Reduction loadings do not match selected features",
+            code="column_mismatch",
+            ref=reduction,
+        )
+    for ref, data in arrays:
+        if (
+            data.shape != (selections.cells.selected_count, loadings.shape[1])
+            or data.dtype.kind != "f"
+        ):
+            raise _resolution_error(
+                "Coordinates do not match selected cells or reduction dimensions",
+                code="row_mismatch",
+                ref=ref,
+            )
     return CoordinateInputs(
         coordinates=coordinates,
         reduction=reduction,
@@ -335,7 +371,16 @@ def resolve_native_graph_inputs(
     source: ArtifactRef,
 ) -> NativeGraphInputs:
     """Resolve one native connectivity or neighbor branch through named inputs."""
+    return validated_once(
+        ("graph_inputs", *store_key(root), source),
+        lambda: _resolve_native_graph_inputs(root, source),
+    )
 
+
+def _resolve_native_graph_inputs(
+    root: zarr.Group,
+    source: ArtifactRef,
+) -> NativeGraphInputs:
     statuses: dict[ArtifactRef, ArtifactStatus] = {}
     if source.kind == "connectivity_map":
         _require_complete(
@@ -461,81 +506,15 @@ def resolve_native_graph_inputs(
             input_name="coordinates",
         )
 
-    if coordinates.kind == "imported_coordinates":
-        from ..embeddings.imported_storage import (
-            validate_imported_coordinates_artifact,
-        )
-
-        validate_imported_coordinates_artifact(root, coordinates)
-        cell_selection = _input_ref(
-            root,
-            coordinates,
-            "cell_selection",
-            expected_kind="cell_selection",
-            expected_scope="datastore",
-            expected_assay=None,
-            statuses=statuses,
-        )
-        _validate_cell_selection(root, cell_selection)
-        return NativeGraphInputs(
-            neighbors=neighbors,
-            ann_index=ann_index,
-            coordinates=coordinates,
-            reduction=None,
-            normalized=None,
-            cell_selection=cell_selection,
-            feature_selection=None,
-        )
-
-    if coordinates.kind == "batch_correction":
-        reduction = _input_ref(
-            root,
-            coordinates,
-            "reduction",
-            expected_kind="reduction",
-            expected_scope="assay",
-            expected_assay=assay,
-            statuses=statuses,
-        )
-    else:
-        reduction = coordinates
-    normalized = _input_ref(
-        root,
-        reduction,
-        "normalized",
-        expected_kind="normalized",
-        expected_scope="assay",
-        expected_assay=assay,
-        statuses=statuses,
-    )
-    cell_selection = _input_ref(
-        root,
-        normalized,
-        "cell_selection",
-        expected_kind="cell_selection",
-        expected_scope="datastore",
-        expected_assay=None,
-        statuses=statuses,
-    )
-    _validate_cell_selection(root, cell_selection)
-    feature_selection = _input_ref(
-        root,
-        normalized,
-        "feature_selection",
-        expected_kind="feature_selection",
-        expected_scope="assay",
-        expected_assay=assay,
-        statuses=statuses,
-    )
-    feature_selection = resolve_feature_selection(root, assay, feature_selection)
+    lineage = resolve_coordinate_inputs(root, coordinates, statuses=statuses)
     return NativeGraphInputs(
         neighbors=neighbors,
         ann_index=ann_index,
         coordinates=coordinates,
-        reduction=reduction,
-        normalized=normalized,
-        cell_selection=cell_selection,
-        feature_selection=feature_selection,
+        reduction=lineage.reduction,
+        normalized=lineage.normalized,
+        cell_selection=lineage.cell_selection,
+        feature_selection=lineage.feature_selection,
     )
 
 

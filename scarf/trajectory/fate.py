@@ -4,11 +4,16 @@ from typing import Any
 
 import numpy as np
 from numba import njit
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, diags
 from scipy.sparse.csgraph import connected_components
-from scipy.sparse.linalg import LinearOperator, gmres
+from scipy.sparse.linalg import LinearOperator, gmres, splu
 
 from ..utils.logging import logger
+
+_GMRES_RESTART = 20
+# Coarse aggregates above this count are merged into fewer pseudotime bins so
+# the coarse factorization stays small.
+_MAX_COARSE_AGGREGATES = 8192
 
 
 @njit(cache=True, inline="always")
@@ -255,6 +260,208 @@ def _dirichlet_operator(
     )
 
 
+@njit(cache=True)
+def _ordered_sweep(
+    data: np.ndarray,
+    indices: np.ndarray,
+    indptr: np.ndarray,
+    order: np.ndarray,
+    rank: np.ndarray,
+    residual: np.ndarray,
+    out: np.ndarray,
+    descending: bool,
+) -> None:
+    """Apply one Gauss-Seidel sweep of the Dirichlet operator.
+
+    Transient cells are visited in ``order``, or in reverse, and use values
+    already updated earlier in the sweep. Absorbing cells have rank -1 and
+    keep their residual.
+    """
+    for row in range(rank.shape[0]):
+        if rank[row] < 0:
+            out[row] = residual[row]
+    count = order.shape[0]
+    for step in range(count):
+        row = order[step] if descending else order[count - 1 - step]
+        own = rank[row]
+        value = residual[row]
+        for offset in range(indptr[row], indptr[row + 1]):
+            other = rank[indices[offset]]
+            if other < 0 or (other < own if descending else other > own):
+                value += data[offset] * out[indices[offset]]
+        out[row] = value
+
+
+@njit(cache=True)
+def _pseudotime_bin_aggregates(
+    indptr: np.ndarray,
+    indices: np.ndarray,
+    rank: np.ndarray,
+    n_bins: int,
+) -> tuple[np.ndarray, int]:
+    """Label transient cells by pseudotime bin and connected piece within it."""
+    n_cells = rank.shape[0]
+    n_transient = 0
+    for row in range(n_cells):
+        if rank[row] >= 0:
+            n_transient += 1
+    parent = np.arange(n_cells)
+    for row in range(n_cells):
+        if rank[row] < 0:
+            continue
+        row_bin = (rank[row] * n_bins) // n_transient
+        for offset in range(indptr[row], indptr[row + 1]):
+            col = indices[offset]
+            if rank[col] < 0 or (rank[col] * n_bins) // n_transient != row_bin:
+                continue
+            first = row
+            while parent[first] != first:
+                parent[first] = parent[parent[first]]
+                first = parent[first]
+            second = col
+            while parent[second] != second:
+                parent[second] = parent[parent[second]]
+                second = parent[second]
+            if first < second:
+                parent[second] = first
+            elif second < first:
+                parent[first] = second
+    labels = np.full(n_cells, -1, dtype=np.int64)
+    count = 0
+    for row in range(n_cells):
+        if rank[row] < 0:
+            continue
+        root = row
+        while parent[root] != root:
+            root = parent[root]
+        if labels[root] < 0:
+            labels[root] = count
+            count += 1
+        labels[row] = labels[root]
+    return labels, count
+
+
+def _fate_preconditioner(
+    transition: csr_matrix,
+    pseudotime: np.ndarray,
+    absorbing: np.ndarray,
+    operator: LinearOperator,
+) -> LinearOperator:
+    """Build a two-level preconditioner for the fate Dirichlet system.
+
+    Symmetric Gauss-Seidel sweeps in pseudotime order resolve local coupling.
+    A coarse correction over pseudotime bins, split into connected pieces,
+    resolves the slow variation along long trajectories that restarted GMRES
+    otherwise needs many iterations for. Besides four integer arrays per
+    cell and two work vectors per application, it holds the sparse factor of
+    a coarse system with at most ``_MAX_COARSE_AGGREGATES`` rows, unless the
+    transient cells alone form more connected pieces.
+    """
+    n_cells = transition.shape[0]
+    transient = np.flatnonzero(~absorbing)
+    order = transient[np.argsort(-pseudotime[transient], kind="stable")]
+    rank = np.full(n_cells, -1, dtype=np.int64)
+    rank[order] = np.arange(order.size, dtype=np.int64)
+    n_bins = max(1, int(round(math.sqrt(order.size))))
+    while True:
+        labels, n_aggregates = _pseudotime_bin_aggregates(
+            transition.indptr,
+            transition.indices,
+            rank,
+            n_bins,
+        )
+        if n_aggregates <= _MAX_COARSE_AGGREGATES or n_bins == 1:
+            break
+        n_bins = max(1, n_bins // 2)
+    aggregates = labels[transient]
+    del labels
+    restriction = csr_matrix(
+        (np.ones(transient.size), (transient, aggregates)),
+        shape=(n_cells, n_aggregates),
+    )
+    coarse_matrix = (
+        diags(np.bincount(aggregates, minlength=n_aggregates).astype(np.float64))
+        - restriction.T @ (transition @ restriction)
+    ).tocsc()
+    del restriction
+    try:
+        coarse_factor: Any = splu(coarse_matrix)
+    except RuntimeError:
+        # A numerically singular coarse system only weakens the
+        # preconditioner, so the smoothing sweeps are used alone.
+        coarse_factor = None
+    del coarse_matrix
+
+    def apply(residual: np.ndarray) -> np.ndarray:
+        residual = np.asarray(residual, dtype=np.float64).ravel()
+        correction = np.empty(n_cells, dtype=np.float64)
+        _ordered_sweep(
+            transition.data,
+            transition.indices,
+            transition.indptr,
+            order,
+            rank,
+            residual,
+            correction,
+            True,
+        )
+        if coarse_factor is not None:
+            remainder = residual - operator.matvec(correction)
+            coarse = coarse_factor.solve(
+                np.bincount(
+                    aggregates,
+                    weights=remainder[transient],
+                    minlength=n_aggregates,
+                )
+            )
+            if np.isfinite(coarse).all():
+                correction[transient] += coarse[aggregates]
+        remainder = residual - operator.matvec(correction)
+        smoothed = np.empty(n_cells, dtype=np.float64)
+        _ordered_sweep(
+            transition.data,
+            transition.indices,
+            transition.indptr,
+            order,
+            rank,
+            remainder,
+            smoothed,
+            False,
+        )
+        correction += smoothed
+        return correction
+
+    return LinearOperator(
+        shape=(n_cells, n_cells),
+        matvec=apply,
+        dtype=np.dtype(np.float64),
+    )
+
+
+def fate_solver_bytes(n_cells: int, n_edges: int, n_sinks: int) -> int:
+    """Estimate the working memory of :func:`compute_fate_probabilities`.
+
+    Counts the biased transition matrix and its product with the coarse
+    restriction, and per cell the GMRES Krylov basis, the solver's float64
+    work vectors, the preconditioner's four int64 arrays, and the float32
+    probability output. The coarse factor is bounded separately by
+    ``_MAX_COARSE_AGGREGATES``.
+    """
+    sparse = 2 * int(n_edges) * (8 + 4)
+    krylov = (_GMRES_RESTART + 2) * 8
+    work = 8 * 8
+    preconditioner = 4 * 8
+    output = int(n_sinks) * 4
+    return sparse + int(n_cells) * (krylov + work + preconditioner + output)
+
+
+def _residual_limit(solver_tol: float, n_sinks: int) -> float:
+    """Return the Bellman residual limit that validated probabilities meet."""
+    validation_scale = 10.0 * solver_tol * max(1, n_sinks - 1)
+    float32_tolerance = 5.0 * float(np.finfo(np.float32).eps)
+    return max(float32_tolerance, min(1e-3, validation_scale))
+
+
 def _bellman_residual(
     transition: csr_matrix,
     probabilities: np.ndarray,
@@ -276,45 +483,70 @@ def _solve_fates(
     n_sinks: int,
     solver_tol: float,
     max_iterations: int,
+    pseudotime: np.ndarray,
 ) -> np.ndarray:
     n_cells = transition.shape[0]
     probabilities = np.zeros((n_cells, n_sinks), dtype=np.float32)
     last_probability = np.ones(n_cells, dtype=np.float64)
     absorbing = sink_groups >= 0
+    residual_limit = _residual_limit(solver_tol, n_sinks)
+    # The last column is one minus the others, so its residual can add up the
+    # residuals of every solved column. Each solve therefore stops at the
+    # smaller of solver_tol and half of its share of the limit, measured as
+    # the largest residual over all cells, so sink size cannot loosen it.
+    target = min(solver_tol, 0.5 * residual_limit / max(1, n_sinks - 1))
 
     operator = _dirichlet_operator(transition, absorbing)
+    preconditioner = _fate_preconditioner(transition, pseudotime, absorbing, operator)
     for group in range(n_sinks - 1):
         boundary = np.asarray(sink_groups == group, dtype=np.float64)
+        solution = boundary
         iterations = 0
 
         def count_iteration(_residual: float) -> None:
             nonlocal iterations
             iterations += 1
 
-        solution, info = gmres(
-            operator,
-            boundary,
-            x0=boundary,
-            rtol=solver_tol,
-            atol=0.0,
-            restart=20,
-            maxiter=max_iterations,
-            callback=count_iteration,
-            # This mode makes maxiter count inner iterations, not restart cycles.
-            callback_type="legacy",
-        )
-        iteration_unit = "iteration" if iterations == 1 else "iterations"
-        if info != 0:
-            reason = "broke down" if info < 0 else "did not converge"
-            raise RuntimeError(
-                f"Fate probability solve for sink index {group} {reason} "
-                f"after {iterations} {iteration_unit}"
+        while True:
+            completed = iterations
+            # Run one restart cycle at a time. GMRES reports success only when
+            # the two-norm residual, which bounds the maximum residual, meets
+            # the target. Otherwise the true maximum residual decides.
+            solution, info = gmres(
+                operator,
+                boundary,
+                x0=solution,
+                rtol=0.0,
+                atol=target,
+                restart=_GMRES_RESTART,
+                maxiter=min(_GMRES_RESTART, max_iterations - iterations),
+                M=preconditioner,
+                callback=count_iteration,
+                # This mode makes maxiter count inner iterations, not restart cycles.
+                callback_type="legacy",
             )
-        if not np.isfinite(solution).all():
-            raise RuntimeError(
-                f"Fate probability solve for sink index {group} produced "
-                "non-finite values"
-            )
+            iteration_unit = "iteration" if iterations == 1 else "iterations"
+            if info < 0:
+                raise RuntimeError(
+                    f"Fate probability solve for sink index {group} broke down "
+                    f"after {iterations} {iteration_unit}"
+                )
+            if not np.isfinite(solution).all():
+                raise RuntimeError(
+                    f"Fate probability solve for sink index {group} produced "
+                    "non-finite values"
+                )
+            if info == 0:
+                break
+            residual = float(np.max(np.abs(boundary - operator.matvec(solution))))
+            if residual <= target:
+                break
+            if iterations >= max_iterations or iterations == completed:
+                raise RuntimeError(
+                    f"Fate probability solve for sink index {group} did not "
+                    f"converge after {iterations} {iteration_unit} (maximum "
+                    f"residual {residual:.3e}, target {target:.3e})"
+                )
         probabilities[:, group] = solution
         last_probability -= solution
         logger.debug(
@@ -327,20 +559,17 @@ def _solve_fates(
     probabilities[absorbing] = 0.0
     probabilities[absorbing, sink_groups[absorbing]] = 1.0
 
-    validation_scale = 10.0 * solver_tol * max(1, n_sinks - 1)
-    float32_tolerance = 5.0 * float(np.finfo(np.float32).eps)
-    check_tol = max(float32_tolerance, min(1e-3, validation_scale))
     if not np.isfinite(probabilities).all():
         raise RuntimeError("Fate probability calculation produced non-finite values")
     minimum = float(probabilities.min())
     maximum = float(probabilities.max())
-    if minimum < -check_tol or maximum > 1.0 + check_tol:
+    if minimum < -residual_limit or maximum > 1.0 + residual_limit:
         raise RuntimeError(
             "Fate probabilities exceeded numerical bounds "
             f"(minimum={minimum:.3e}, maximum={maximum:.3e})"
         )
     row_sums = probabilities.sum(axis=1, dtype=np.float64)
-    if not np.allclose(row_sums, 1.0, rtol=0.0, atol=check_tol):
+    if not np.allclose(row_sums, 1.0, rtol=0.0, atol=residual_limit):
         deviation = float(np.max(np.abs(row_sums - 1.0)))
         raise RuntimeError(
             f"Fate probabilities do not sum to one (maximum deviation={deviation:.3e})"
@@ -352,7 +581,6 @@ def _solve_fates(
     probabilities[absorbing] = 0.0
     probabilities[absorbing, sink_groups[absorbing]] = 1.0
 
-    residual_limit = max(float32_tolerance, min(1e-3, validation_scale))
     residuals = [
         _bellman_residual(transition, probabilities, sink_groups, group)
         for group in range(n_sinks)
@@ -376,7 +604,17 @@ def compute_fate_probabilities(
     max_iterations: int = 1000,
     _copy_graph: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, tuple[Any, ...]]:
-    """Compute grouped absorption probabilities on a pseudotime-biased graph."""
+    """Compute grouped absorption probabilities on a pseudotime-biased graph.
+
+    Each sink column except the last solves a Dirichlet system with
+    preconditioned, restarted GMRES. ``solver_tol`` bounds the largest
+    absolute Bellman residual of a solved column over all cells, so its meaning
+    does not depend on sink size. ``max_iterations`` counts GMRES inner
+    iterations per solved column. The finished probabilities are checked
+    independently against a residual limit of
+    ``10 * solver_tol * (len(sinks) - 1)``, bounded below by float32 precision
+    and above by ``1e-3``.
+    """
     try:
         beta = float(beta)
     except (TypeError, ValueError) as exc:
@@ -469,6 +707,7 @@ def compute_fate_probabilities(
         len(sink_labels),
         solver_tol,
         max_iterations,
+        retained_pseudotime,
     )
 
     if all_components_retained:

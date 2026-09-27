@@ -1,4 +1,6 @@
+import math
 import random
+from numbers import Real
 from threading import Lock
 from typing import Literal
 
@@ -9,6 +11,32 @@ from scipy.sparse import spmatrix
 type LeidenBackend = Literal["igraph", "leidenalg"]
 
 _IGRAPH_RNG_LOCK = Lock()
+
+
+def canonical_resolution(value: object) -> float:
+    """Return a Leiden resolution as one finite, positive float.
+
+    Integer and float spellings of the same value share one canonical form, so
+    they also share one artifact identity.
+    """
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError("Leiden resolution must be a number")
+    resolved = float(value)
+    if not math.isfinite(resolved) or resolved <= 0:
+        raise ValueError("Leiden resolution must be finite and positive")
+    return resolved
+
+
+def canonical_random_seed(value: object) -> int:
+    """Return a Leiden random seed as a non-negative Python integer."""
+    if isinstance(value, bool | np.bool_) or not isinstance(value, int | np.integer):
+        raise TypeError(
+            "random_seed must be a non-negative integer; Leiden labels are "
+            "reused, so an unseeded run is not supported"
+        )
+    if value < 0:
+        raise ValueError("random_seed must be a non-negative integer")
+    return int(value)
 
 
 def _igraph_membership(

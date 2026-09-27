@@ -1,3 +1,4 @@
+import math
 import warnings
 
 import numpy as np
@@ -15,6 +16,8 @@ from scarf.features.markers import mannwhitneyu_from_ranks
 from scarf.features.statistical import (
     GroupComparisonResult,
     StatisticalTestResult,
+    _mann_whitney_exact_p_value,
+    _mann_whitney_p_value_method,
     adjust_pvalues,
     aggregate_samples,
     compare_group_distributions,
@@ -86,6 +89,93 @@ def test_mann_whitney_matches_scipy_and_marker_ranks():
         np.array([g1, g2], dtype=object),
     )
     assert np.isclose(table.loc[0, "p_value"], float(reference.loc[g1, "feature"]))
+
+
+def test_mann_whitney_small_samples_use_exact_null():
+    from scipy.stats import PermutationMethod
+
+    two_groups = np.array(["a"] * 3 + ["b"] * 3, dtype=object)
+
+    # Perfect separation with ties: the exact two-sided minimum is 2 / C(6, 3).
+    tied = compare_group_distributions(
+        np.array([0.0, 0.0, 0.0, 1.0, 1.0, 1.0]),
+        two_groups,
+        test="mann_whitney",
+    )
+    assert tied.p_value_method == "exact"
+    assert tied.table.loc[0, "p_value"] == pytest.approx(0.1, abs=1e-15)
+    assert tied.table.loc[0, "u_statistic"] == 0.0
+
+    untied_values = np.array([1.2, 3.4, 0.5, 2.2, 5.1, 4.0])
+    untied = compare_group_distributions(
+        untied_values,
+        two_groups,
+        test="mann_whitney",
+    )
+    expected = scipy_mannwhitneyu(
+        untied_values[:3],
+        untied_values[3:],
+        method="exact",
+    ).pvalue
+    assert untied.p_value_method == "exact"
+    assert untied.table.loc[0, "p_value"] == pytest.approx(expected, rel=1e-12)
+
+    # Ties with unequal groups match SciPy's exhaustive permutation null.
+    rng = np.random.default_rng(31)
+    for n_1, n_2 in ((2, 5), (4, 3), (6, 8)):
+        values = rng.integers(0, 3, n_1 + n_2).astype(np.float64)
+        groups = np.array(["a"] * n_1 + ["b"] * n_2, dtype=object)
+        result = compare_group_distributions(values, groups, test="mann_whitney")
+        reference = scipy_mannwhitneyu(
+            values[:n_1],
+            values[n_1:],
+            method=PermutationMethod(n_resamples=np.inf),
+        ).pvalue
+        assert result.p_value_method == "exact"
+        assert result.table.loc[0, "p_value"] == pytest.approx(reference, rel=1e-12)
+
+    # Large designs keep the marker-search normal approximation unchanged.
+    assert _mann_whitney_p_value_method(10, 10) == "asymptotic"
+    assert _mann_whitney_p_value_method(2, 445) == "exact"  # C(447, 2) = 99,681
+    assert _mann_whitney_p_value_method(2, 446) == "asymptotic"
+    for n_1, n_2 in ((3, 85), (85, 3), (9, 10), (500_000, 500_000)):
+        splits = math.comb(n_1 + n_2, min(n_1, n_2)) if n_1 < 100 else math.inf
+        expected = "exact" if splits <= 100_000 else "asymptotic"
+        assert _mann_whitney_p_value_method(n_1, n_2) == expected
+
+    # At the split limit, the exact null matches an enumeration of all pairs.
+    ranks = rankdata(rng.integers(0, 40, 447))
+    doubled = np.rint(ranks * 2).astype(np.int64)
+    pair_sums = np.add.outer(doubled, doubled)[np.triu_indices(447, 1)]
+    for pair, n_1 in (((0, 1), 2), ((445, 446), 445)):
+        observed = doubled[list(pair)].sum()
+        tail = min((pair_sums <= observed).sum(), (pair_sums >= observed).sum())
+        assert _mann_whitney_exact_p_value(ranks, n_1) == pytest.approx(
+            min(1.0, 2 * tail / len(pair_sums)), rel=1e-12
+        )
+    large_values = np.concatenate([rng.poisson(2, 60), rng.poisson(3, 60)])
+    large_groups = np.array(["a"] * 60 + ["b"] * 60, dtype=object)
+    large = compare_group_distributions(
+        large_values,
+        large_groups,
+        test="mann_whitney",
+    )
+    ranked = pd.DataFrame(
+        {"feature": pd.Series(large_values.astype(float)).rank(method="average")}
+    )
+    marker = mannwhitneyu_from_ranks(
+        ranked,
+        large_groups,
+        np.array(["a", "b"], dtype=object),
+    )
+    assert large.p_value_method == "asymptotic"
+    assert large.table.loc[0, "p_value"] == float(marker.loc["a", "feature"])
+
+    kruskal_result = compare_group_distributions(
+        np.arange(9, dtype=np.float64),
+        np.repeat(np.array(["a", "b", "c"], dtype=object), 3),
+    )
+    assert kruskal_result.p_value_method is None
 
 
 def test_mann_whitney_requires_two_groups():

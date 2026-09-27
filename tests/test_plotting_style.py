@@ -242,8 +242,8 @@ def test_density_and_legend_helpers():
         default_point_edgewidth,
         default_point_size,
         resolve_legend_loc,
-        sort_categories,
     )
+    from scarf.utils.arrays import sort_categories
 
     assert default_point_size(100) > default_point_size(20_000)
     assert default_point_edgewidth(500) > 0
@@ -265,7 +265,7 @@ def test_density_and_legend_helpers():
 
 
 def test_sort_categories_handles_numpy_booleans_and_missing_values():
-    from scarf.plotting._style import sort_categories
+    from scarf.utils.arrays import sort_categories
 
     ordered = sort_categories(
         [

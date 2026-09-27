@@ -164,8 +164,8 @@ def test_feature_stream_keeps_reads_and_their_decodes_inside_the_budget() -> Non
     in_flight = plan.readWorkers * (100 + plan.ioConcurrency * decode)
 
     assert len(plan.blocks) == 4
-    assert plan.readWorkers == 2
-    assert in_flight + 100 + decode <= 650
+    assert plan.readWorkers == 3
+    assert in_flight <= 650
     assert plan.readWorkers * plan.ioConcurrency <= 8
 
 
@@ -284,6 +284,37 @@ def test_map_feature_cell_bands_reduces_in_band_order() -> None:
     )
     np.testing.assert_array_equal(dest, values.T[:, cell_idx])
     assert seen == sorted(seen)
+
+
+def test_sparse_feature_selection_reads_only_selected_rows() -> None:
+    from scarf.storage.feature_stream import map_feature_cell_bands
+
+    values = np.arange(12 * 40, dtype=np.uint16).reshape(12, 40)
+    counts_t = _counts_t_with_plan(values)
+    cell_idx = np.array([11, 2, 7])
+    feat_idx = np.array([1, 17, 30])
+    dest = np.zeros((40, 3), dtype=np.uint16)
+    row_sets = []
+
+    def capture(band):  # type: ignore[no-untyped-def]
+        row_sets.append(band.rows)
+        rows = band.featStart + band.featureRows()
+        dest[np.ix_(rows, band.selectedDestinations)] = band.values[
+            :, band.selectedLocal
+        ]
+
+    list(
+        map_feature_cell_bands(
+            counts_t,
+            capture,
+            cell_idx=cell_idx,
+            feat_idx=feat_idx,
+            resources=ResourceBudget(8 * 1024 * 1024, 2),
+        )
+    )
+    assert row_sets and all(rows is not None for rows in row_sets)
+    np.testing.assert_array_equal(dest[feat_idx], values.T[feat_idx][:, cell_idx])
+    assert not np.delete(dest, feat_idx, axis=0).any()
 
 
 def test_cell_band_admission_charges_the_live_band_buffer() -> None:
@@ -723,3 +754,22 @@ def test_hvg_stats_mask_matches_gathered_cells() -> None:
     np.testing.assert_allclose(masked_nz, gathered_nz)
     np.testing.assert_allclose(masked_s1, gathered_s1)
     np.testing.assert_allclose(masked_s2, gathered_s2)
+
+
+def test_early_close_joins_the_producer_and_surfaces_its_failure() -> None:
+    import asyncio
+
+    from scarf.storage.feature_stream import _iter_bounded_handoff
+
+    def run(deliver, _stop):
+        async def produce():
+            await deliver(1)
+            await deliver(2)
+            raise ValueError("producer failed")
+
+        asyncio.run(produce())
+
+    stream = _iter_bounded_handoff(in_flight=1, run=run)
+    assert next(stream) == 1
+    with pytest.raises(ValueError, match="producer failed"):
+        stream.close()

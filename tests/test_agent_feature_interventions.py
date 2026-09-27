@@ -8,7 +8,6 @@ import numpy as np
 import pytest
 
 from scarf.agent.orchestrator import rna_tuning
-from scarf.agent.orchestrator.models import artifact_model_to_ref
 from scarf.agent.types import ArtifactReferenceModel
 from scarf.storage.refs import ArtifactRef
 from tests.test_agent_rna_adaptive import checkpoints as memory_checkpoints  # noqa: F401
@@ -188,9 +187,7 @@ def test_batch_ranking_requires_supported_groups_and_reuses_core_variability(
     from scarf.agent.experimental_context import characterization
 
     run, selected, _, selection = feature_run
-    eligible = artifact_model_to_ref(
-        run.settings[selected.candidateId].eligibleFeatures
-    )
+    eligible = run.settings[selected.candidateId].eligibleFeatures.to_artifact_ref()
     labels = np.repeat(["a", "b", "small"], [25, 25, 5])
     calls: list[dict[str, Any]] = []
     run.batch_columns = ["capture"]

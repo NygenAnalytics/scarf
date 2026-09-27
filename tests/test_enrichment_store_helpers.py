@@ -38,7 +38,8 @@ def test_write_enrichment_slot_persists_and_matches_exact_payload() -> None:
         **payload,
     )
 
-    assert slot.attrs["complete"] is True
+    # finish_artifact, not the payload writer, marks the artifact complete.
+    assert slot.attrs["complete"] is False
     np.testing.assert_allclose(slot["scores"][:], scores.astype(np.float32))
     np.testing.assert_array_equal(slot["cell_index"][:], [0, 2, 5])
     np.testing.assert_array_equal(slot["rank_feature_index"][:], [3, 1])

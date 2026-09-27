@@ -209,10 +209,6 @@ class InferenceUnit(AgentDataModel):
     observationUnit: str | None = None
     independentUnit: str | None = None
 
-    @classmethod
-    def get_blank(cls) -> "InferenceUnit":
-        return cls()
-
 
 class BatchCorrectionPlan(AgentDataModel):
     """A grounded recommendation about whether Harmony should be evaluated."""
@@ -242,10 +238,6 @@ class NamedArtifactSource(AgentDataModel):
         if bool(self.name.strip()) != bool(self.artifact.artifactId):
             raise ValueError("A named artifact source requires both name and artifact")
         return self
-
-    @classmethod
-    def get_blank(cls) -> "NamedArtifactSource":
-        return cls()
 
 
 class QcMetricSourceEvidence(AgentDataModel):
@@ -606,10 +598,6 @@ class CellQcProfileEvidence(AgentDataModel):
             )
         return self
 
-    @classmethod
-    def get_blank(cls) -> "CellQcProfileEvidence":
-        return cls()
-
 
 class CellQcPlan(AgentDataModel):
     """A validated selection from the bounded cell-QC profiles."""
@@ -639,10 +627,6 @@ class CellQcPlan(AgentDataModel):
         )
         return self
 
-    @classmethod
-    def get_blank(cls) -> "CellQcPlan":
-        return cls()
-
 
 class ExperimentalContextDecision(AgentDataModel):
     """Model-authored choices that are revalidated against the datastore."""
@@ -662,10 +646,6 @@ class ExperimentalContextDecision(AgentDataModel):
     evidenceIds: list[str] = Field(default_factory=list)
     needsInput: list[str] = Field(default_factory=list)
 
-    @classmethod
-    def get_blank(cls) -> "ExperimentalContextDecision":
-        return cls()
-
 
 class RepresentationEvaluation(AgentDataModel):
     """Bounded integration metrics for one exact graph representation."""
@@ -678,10 +658,6 @@ class RepresentationEvaluation(AgentDataModel):
     metrics: dict[str, float] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
     evidenceIds: list[str] = Field(default_factory=list)
-
-    @classmethod
-    def get_blank(cls) -> "RepresentationEvaluation":
-        return cls()
 
 
 class CovariateEvidence(AgentDataModel):
@@ -879,10 +855,6 @@ class ExperimentalContextDependencies(AgentDataModel):
         default_factory=RepresentationEvaluation.get_blank
     )
     toolCalls: list[str] = Field(default_factory=list)
-
-    @classmethod
-    def get_blank(cls) -> "ExperimentalContextDependencies":
-        return cls()
 
 
 def characterization_evidence(

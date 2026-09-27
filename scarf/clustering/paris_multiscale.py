@@ -5,6 +5,7 @@ import numpy as np
 
 from ..storage.refs import ArtifactRef
 from ._paris_core import ParisHierarchy
+from ..utils.arrays import has_duplicates
 
 _INFEASIBLE = np.uint8(0)
 _KEEP_SCORE = np.uint8(1)
@@ -434,7 +435,7 @@ def labels_from_selected_nodes(
         raise ValueError("selected_nodes must be a non-empty one-dimensional array")
     if not np.issubdtype(selected.dtype, np.integer):
         raise TypeError("selected_nodes must contain integers")
-    if len(np.unique(selected)) != len(selected):
+    if has_duplicates(selected):
         raise ValueError("selected_nodes must not contain duplicates")
 
     n_leaves = hierarchy.n_leaves

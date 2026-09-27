@@ -152,8 +152,14 @@ mapping.n_cells, int(mapping.indices.shape[1]), mapping.indices[:3], mapping.dis
 Use `zero` to fill with a normalized zero, or `error` when complete feature overlap is required.
 
 `mapping.diagnostics["queryScaledDispersion"]` is calculated from comparing query spread with the reference after scaling.
+Only informative query cells and the reference features the query measured enter it, so the missing-feature fill does not change it.
 Values near 1 mean the query occupies a similar region of feature space.
 Values much below 1 mean the query is compressed toward the centre of the reference cloud and neighbour labels become less trustworthy.
+RNA normalization renormalizes counts over the selected features by default (`renormalize_subset=True`).
+With that setting and `featureCoverage` below 1, query cells are renormalized over fewer features than the reference used, so the value is not comparable with 1.
+
+A query cell is uninformative when its raw counts are zero in every reference feature that the query measured.
+Such a cell carries no query evidence. It is flagged in `mapping.uninformative` and counted by `mapping.diagnostics["uninformativeCellCount"]`.
 
 ```{code-cell} ipython3
 mapping.diagnostics
@@ -218,7 +224,9 @@ In the plot below, the `NA` category is abstention geography, i.e. those cells d
 `get_target_classes()` sets `NA` under the circumstances when:
 - the winning vote fraction is below `threshold_fraction`
 - neighbour votes tie, or
-- the cell is uninformative.
+- the cell is uninformative, i.e. it has no counts in any reference feature that the query measured.
+
+Uninformative cells also add nothing to mapping scores.
 
 
 ```{code-cell} ipython3

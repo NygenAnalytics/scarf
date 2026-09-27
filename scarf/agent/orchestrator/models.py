@@ -1,14 +1,12 @@
 """Public data models for resumable automated agent workflows."""
 
 import re
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from ...storage.refs import ArtifactRef
 from ..cell_quality.profiles import cell_qc_policy
 from ..config import AgentRunConfig
 from ..decisions.rna import CellQualityExecutorPayload
@@ -105,19 +103,11 @@ class WorkflowQuestion(AgentDataModel):
     evidenceIds: list[str] = Field(default_factory=list)
     planChecksum: str | None = None
 
-    @classmethod
-    def get_blank(cls) -> "WorkflowQuestion":
-        return cls()
-
 
 class WorkflowNeedsInput(AgentDataModel):
     """All questions blocking the next workflow stage."""
 
     questions: list[WorkflowQuestion] = Field(default_factory=list)
-
-    @classmethod
-    def get_blank(cls) -> "WorkflowNeedsInput":
-        return cls()
 
 
 class WorkflowStageLink(AgentDataModel):
@@ -140,10 +130,6 @@ class WorkflowStageLink(AgentDataModel):
         if value and _SHA256_PATTERN.fullmatch(value) is None:
             raise ValueError("contentSha256 must be a lowercase SHA-256 digest")
         return value
-
-    @classmethod
-    def get_blank(cls) -> "WorkflowStageLink":
-        return cls()
 
 
 class WorkflowStageAttempt(AgentDataModel):
@@ -180,10 +166,6 @@ class WorkflowStageAttempt(AgentDataModel):
             raise ValueError("failed stage records require an error")
         return self
 
-    @classmethod
-    def get_blank(cls) -> "WorkflowStageAttempt":
-        return cls()
-
 
 class AssayPreprocessingPlan(AgentDataModel):
     """Exact allowlisted preprocessing route for one assay."""
@@ -198,10 +180,6 @@ class AssayPreprocessingPlan(AgentDataModel):
     featureParameters: dict[str, Any] = Field(default_factory=dict)
     evidenceIds: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
-
-    @classmethod
-    def get_blank(cls) -> "AssayPreprocessingPlan":
-        return cls()
 
 
 class AutomatedPreprocessingPlan(AgentDataModel):
@@ -229,10 +207,6 @@ class AutomatedPreprocessingPlan(AgentDataModel):
             )
         return self
 
-    @classmethod
-    def get_blank(cls) -> "AutomatedPreprocessingPlan":
-        return cls()
-
 
 class PreprocessedAssayHandoff(AgentDataModel):
     """Exact normalized input and selections handed to Parameter Tuning."""
@@ -254,10 +228,6 @@ class PreprocessedAssayHandoff(AgentDataModel):
     nCells: int = 0
     nFeatures: int = 0
 
-    @classmethod
-    def get_blank(cls) -> "PreprocessedAssayHandoff":
-        return cls()
-
 
 class FinalAnalysisHandoff(AgentDataModel):
     """Exact final RNA artifacts validated by the concluding journal checkpoint."""
@@ -276,10 +246,6 @@ class FinalAnalysisHandoff(AgentDataModel):
     doubletScores: list[ArtifactReferenceModel] = Field(default_factory=list)
     doubletScoreSelections: list[ArtifactReferenceModel] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
-
-    @classmethod
-    def get_blank(cls) -> "FinalAnalysisHandoff":
-        return cls()
 
 
 class AutomatedWorkflowConfig(AgentDataModel):
@@ -312,46 +278,6 @@ class AutomatedWorkflowConfig(AgentDataModel):
     cacheDir: str | None = None
     agentRunConfig: AgentRunConfig = Field(default_factory=AgentRunConfig)
 
-    @model_validator(mode="before")
-    @classmethod
-    def reject_obsolete_configuration(cls, value: Any) -> Any:
-        if isinstance(value, Mapping):
-            obsolete = sorted(
-                set(value)
-                & {
-                    "maxRefinedCandidatesPerAssay",
-                    "maxHarmonyCandidatesPerAssay",
-                    "runConfoundedHarmonyDiagnostic",
-                    "maxCandidateEvaluations",
-                    "maxIdentityFeatures",
-                    "minClusterCells",
-                    "hvgCandidateCounts",
-                    "pcaCandidateDimensions",
-                    "graphNeighborCandidates",
-                    "leidenResolutionCandidates",
-                    "maxRevisions",
-                    "primaryInitialCandidates",
-                    "secondaryInitialCandidates",
-                    "integrationResolutionCandidates",
-                    "maxCandidateBranches",
-                    "maxGraphAssays",
-                    "leidenSeeds",
-                    "clusterSubsamples",
-                    "clusterSubsampleFraction",
-                }
-            )
-            if obsolete:
-                raise ValueError(
-                    "Unsupported legacy workflow configuration fields: "
-                    + ", ".join(obsolete)
-                    + ". Create a new single-RNA workflow configuration with "
-                    "screening and full-cohort work limits. "
-                    "Saved workflows using these fields cannot be resumed or "
-                    "regenerated with this release; their analysis artifacts "
-                    "remain available through Scarf's artifact APIs."
-                )
-        return value
-
     @model_validator(mode="after")
     def validate_work_limits(self) -> "AutomatedWorkflowConfig":
         if (
@@ -364,10 +290,6 @@ class AutomatedWorkflowConfig(AgentDataModel):
                 "Whole-workflow screening allowance must cover one screening population"
             )
         return self
-
-    @classmethod
-    def get_blank(cls) -> "AutomatedWorkflowConfig":
-        return cls()
 
 
 class AutomatedWorkflowRequest(AgentDataModel):
@@ -492,10 +414,10 @@ class AutomatedWorkflowResult(AgentDataModel):
                 raise ValueError("plot_embedding uses the exact completed cluster map")
         return plot_final_umap(
             store,
-            umap=artifact_model_to_ref(final.umap),
-            clusters=artifact_model_to_ref(final.clusters),
-            cell_selection=artifact_model_to_ref(final.cellSelection),
-            graph=artifact_model_to_ref(final.graph),
+            umap=final.umap.to_artifact_ref(),
+            clusters=final.clusters.to_artifact_ref(),
+            cell_selection=final.cellSelection.to_artifact_ref(),
+            graph=final.graph.to_artifact_ref(),
             **kwargs,
         )
 
@@ -512,7 +434,7 @@ class AutomatedWorkflowResult(AgentDataModel):
         if final.markers is None:
             raise RuntimeError("Completed analysis lacks its marker artifact")
         return store.get_markers(
-            marker=artifact_model_to_ref(final.markers),
+            marker=final.markers.to_artifact_ref(),
             group_id=group_id,
             min_score=min_score,
             min_frac_exp=min_frac_exp,
@@ -526,10 +448,6 @@ class AutomatedWorkflowResult(AgentDataModel):
         self._completed_analysis(store)
         assert self.workflowRunId is not None
         return generate_agent_report(store, self.workflowRunId)
-
-    @classmethod
-    def get_blank(cls) -> "AutomatedWorkflowResult":
-        return cls()
 
 
 class OrchestrationRequestRecord(AgentDataModel):
@@ -558,17 +476,3 @@ class OrchestrationResumeRecord(AgentDataModel):
     answeredAttempt: WorkflowStageLink | None = None
     questionIds: list[str] = Field(default_factory=list)
     answers: dict[str, Any] = Field(default_factory=dict)
-
-    @classmethod
-    def get_blank(cls) -> "OrchestrationResumeRecord":
-        return cls()
-
-
-def artifact_model_to_ref(value: ArtifactReferenceModel) -> ArtifactRef:
-    """Convert an agent artifact model to a validated core artifact reference."""
-    return ArtifactRef(
-        scope=value.scope,
-        assay=value.assay,
-        kind=value.kind,
-        artifact_id=value.artifactId,
-    )

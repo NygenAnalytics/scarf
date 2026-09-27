@@ -347,10 +347,8 @@ def test_auto_filter_cells_global_combines_metadata_and_exact_artifact_metrics(
     prior = datastore_ephemeral.snapshot_cell_selection("artifact_qc_subset")
 
     metadata_values[excluded_index] = 1e12
-    datastore_ephemeral.cells.insert(
-        "RNA_nCounts",
-        metadata_values,
-        overwrite=True,
+    datastore_ephemeral.zw["cellData"].create_array(
+        "RNA_nCounts", data=metadata_values, overwrite=True
     )
     selected_indices = np.flatnonzero(subset)
     selected_counts = metadata_values[selected_indices]
@@ -520,7 +518,7 @@ def test_auto_filter_cells_validates_provenance_before_selection_mutation(
     datastore_ephemeral,
     monkeypatch,
 ):
-    import scarf.datastore._operations.quality_control as qc_operations
+    import scarf.quality_control.filtering as qc_filtering
 
     n = datastore_ephemeral.cells.N
     datastore_ephemeral.cells.insert(
@@ -533,8 +531,7 @@ def test_auto_filter_cells_validates_provenance_before_selection_mutation(
     provenance_before = dict(selection.attrs)
 
     def malformed_provenance(**kwargs):
-        del kwargs
-        return np.ones(n, dtype=bool), {
+        return np.ones_like(kwargs["active"], dtype=bool), {
             "mad_scale": 1.4826,
             "metric_policies": {"RNA_nCounts": {"transform": object()}},
             "sample_sizes": {"A": n},
@@ -544,7 +541,7 @@ def test_auto_filter_cells_validates_provenance_before_selection_mutation(
         }
 
     monkeypatch.setattr(
-        qc_operations,
+        qc_filtering,
         "_sample_aware_mad_mask",
         malformed_provenance,
     )
@@ -573,7 +570,7 @@ def test_auto_filter_cells_rejects_negative_counts_without_selection_mutation(
     bad = np.asarray(datastore_ephemeral.cells.fetch_all(attr), dtype=float)
     active = np.asarray(datastore_ephemeral.cells.fetch_all("I"), dtype=bool)
     bad[int(np.flatnonzero(active)[0])] = -2.0
-    datastore_ephemeral.cells.insert(attr, bad, overwrite=True)
+    datastore_ephemeral.zw["cellData"].create_array(attr, data=bad, overwrite=True)
     selection = datastore_ephemeral.zw["cellData"]["I"]
     selection_before = active.copy()
     provenance_before = dict(selection.attrs)
@@ -613,7 +610,9 @@ def test_auto_filter_cells_sample_column_raises_on_missing_and_nonfinite(
     )
     bad = np.asarray(datastore_ephemeral.cells.fetch_all("RNA_nCounts"), dtype=float)
     bad[0] = np.nan
-    datastore_ephemeral.cells.insert("RNA_nCounts", bad, overwrite=True)
+    datastore_ephemeral.zw["cellData"].create_array(
+        "RNA_nCounts", data=bad, overwrite=True
+    )
     with pytest.raises(ValueError, match="non-finite"):
         datastore_ephemeral.auto_filter_cells(
             attrs=["RNA_nCounts"],

@@ -3,6 +3,7 @@ import pandas as pd
 import pytest
 
 from scarf.features.enrichment.net import prepare_network, read_gmt
+from scarf.utils.logging import logger
 
 
 def test_read_gmt_parses_sets_and_ignores_descriptions(tmp_path):
@@ -115,7 +116,70 @@ def test_prepare_network_detects_duplicate_and_ambiguous_matches():
             active_feature_index=indices,
             tmin=1,
             weighted=False,
+            ambiguous_targets="error",
         )
+    with pytest.raises(ValueError, match="ambiguous_targets must be"):
+        prepare_network(
+            pd.DataFrame({"source": ["Set"], "target": ["GeneB"]}),
+            active_feature_names=features,
+            active_feature_index=indices,
+            tmin=1,
+            weighted=False,
+            ambiguous_targets="keep",  # type: ignore[arg-type]
+        )
+
+
+def test_prepare_network_drops_ambiguous_targets_by_default():
+    # 10x GRCh38 feature tables repeat symbols such as GGT1 under two ids.
+    names = np.array(["GGT1", "CD3D", "ggt1", "CD3E", "MATR3", "MATR3"])
+    indices = np.array([10, 11, 12, 13, 14, 15])
+    net = pd.DataFrame(
+        {
+            "source": ["T", "T", "T", "Other", "Other", "Other"],
+            "target": ["GGT1", "CD3D", "CD3E", "MATR3", "CD3D", "Ggt1"],
+            "weight": [5.0, 1.0, 2.0, 7.0, 3.0, 9.0],
+        }
+    )
+    kwargs = {
+        "active_feature_names": names,
+        "active_feature_index": indices,
+        "weighted": True,
+    }
+
+    messages: list[str] = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]),
+        level="WARNING",
+    )
+    try:
+        prepared = prepare_network(net, tmin=2, **kwargs)
+    finally:
+        logger.remove(sink)
+    unambiguous = prepare_network(
+        net.loc[net["target"].isin(["CD3D", "CD3E"])],
+        tmin=2,
+        **kwargs,
+    )
+
+    assert prepared.dropped_ambiguous_targets == ("GGT1", "Ggt1", "MATR3")
+    assert len(messages) == 1
+    assert "GGT1, Ggt1, MATR3" in messages[0]
+    # Dropped edges do not count toward tmin, so "Other" keeps one edge only.
+    np.testing.assert_array_equal(prepared.source_names, ["T"])
+    np.testing.assert_array_equal(prepared.matched_feature_index, [11, 13])
+    np.testing.assert_array_equal(prepared.edge_weight, [1.0, 2.0])
+    # The digest hashes only the retained edges.
+    assert prepared.network_digest == unambiguous.network_digest
+    assert unambiguous.dropped_ambiguous_targets == ()
+
+    with pytest.raises(ValueError, match="after dropping 3 ambiguous targets"):
+        prepare_network(
+            net.loc[net["target"].isin(["GGT1", "MATR3", "Ggt1"])],
+            tmin=1,
+            **kwargs,
+        )
+    with pytest.raises(ValueError, match="multiple active assay features"):
+        prepare_network(net, tmin=2, ambiguous_targets="error", **kwargs)
 
 
 def test_network_digest_only_uses_score_affecting_weights():

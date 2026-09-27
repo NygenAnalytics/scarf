@@ -202,13 +202,7 @@ class MappingReference:
 
     def validate_dataset_fingerprint(self) -> None:
         """Check the reference assay against the fingerprint the handle carries."""
-        assay = self.datastore._get_assay(self.assay_name)
-        stored = assay.attrs.get("dataset_fingerprint")
-        live = (
-            stored
-            if isinstance(stored, str) and stored
-            else self.datastore._calculate_dataset_fingerprint(self.assay_name)
-        )
+        live = self.datastore._ensure_dataset_fingerprint(self.assay_name)
         if live != self.dataset_fingerprint:
             raise ValueError(
                 f"Reference assay {self.assay_name!r} dataset fingerprint mismatch. "

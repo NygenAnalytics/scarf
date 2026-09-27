@@ -645,11 +645,12 @@ def _artifact_color_cache(monkeypatch, values, *, kind, grouping_indices=None):
     monkeypatch.setattr(
         embedding_module,
         "_resolve_grouping",
-        lambda *_args, **_kwargs: (("groups",), resolved_indices, [values]),
+        lambda *_args, **_kwargs: (("groups",), resolved_indices, [values], None),
     )
     cache = embedding_module._prefetch_colors(
         object(),
         [ref],
+        metadata_columns=(),
         from_assay=None,
         cell_key="I",
         n_cells=len(indices),

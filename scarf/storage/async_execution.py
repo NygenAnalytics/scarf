@@ -1,21 +1,23 @@
 """One async coordinator for Scarf-owned Zarr array operations."""
 
 import asyncio
+import contextvars
+import importlib
+import itertools
 import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass
 from typing import Any, TypeVar, cast
 
 import zarr
 
-from threadpoolctl import threadpool_limits
+from threadpoolctl import ThreadpoolController
 
 from ..utils.shutdown import shutdown_checkpoint
 
-from .budget import ResourceBudget, detect_workers
+from .budget import detect_workers
 from .execution import OperationPlan
 
 T = TypeVar("T")
@@ -30,6 +32,9 @@ _IDLE_IO_LIMIT: int | None = None
 
 _NUMBA_THREAD_LOCK = threading.Lock()
 _WORKER_NUMBA_CAP = threading.local()
+_IO_TASKS: contextvars.ContextVar[set[asyncio.Future[Any]] | None] = (
+    contextvars.ContextVar("storage_io_tasks", default=None)
+)
 
 
 @contextmanager
@@ -85,70 +90,142 @@ def _ensure_worker_numba_cap(threads: int) -> None:
     _WORKER_NUMBA_CAP.applied = threads
 
 
-@dataclass(frozen=True, slots=True)
-class ExecutionPlan:
-    codecWorkerLimit: int
-    zarrAsyncConcurrency: int
-    computeWorkerLimit: int
-    readGroupsInFlight: int
-    destinationCommitsInFlight: int
-    chunksPerShard: int
-    threadsPerComputeWorker: int = 1
+async def _await_completion(future: asyncio.Future[T]) -> T:
+    cancellation: asyncio.CancelledError | None = None
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        except BaseException:
+            break
+    if cancellation is not None:
+        try:
+            future.result()
+        except BaseException as exc:
+            if not isinstance(exc, asyncio.CancelledError):
+                raise BaseExceptionGroup(
+                    "Storage work failed during cancellation", [cancellation, exc]
+                ) from None
+        raise cancellation
+    return future.result()
 
 
-def resolve_execution_plan(
-    resources: ResourceBudget,
-    *,
-    chunksPerShard: int = 10,
-    readGroupsInFlight: int = 1,
-    destinationCommitsInFlight: int = 1,
-    computeWorkerLimit: int = 1,
-    threadsPerComputeWorker: int = 1,
-    operation: OperationPlan | None = None,
-) -> ExecutionPlan:
-    if operation is not None:
-        chunksPerShard = operation.chunksPerShard
-        readGroupsInFlight = operation.readWorkers * operation.innerReads
-        destinationCommitsInFlight = operation.writeWorkers
-        computeWorkerLimit = operation.computeWorkers
-        threadsPerComputeWorker = operation.threadsPerComputeWorker
-    workers = max(1, int(resources.workers))
-    host_cores = max(1, detect_workers())
-    codec_workers = min(workers, host_cores)
-    compute_workers = min(workers, max(1, int(computeWorkerLimit)))
-    threads = max(1, int(threadsPerComputeWorker))
-    if compute_workers * threads > workers:
-        threads = max(1, workers // compute_workers)
-    lanes = max(1, int(readGroupsInFlight))
-    return ExecutionPlan(
-        codecWorkerLimit=codec_workers,
-        zarrAsyncConcurrency=max(
-            lanes, min(codec_workers, max(1, int(chunksPerShard)))
-        ),
-        computeWorkerLimit=compute_workers,
-        readGroupsInFlight=lanes,
-        destinationCommitsInFlight=max(1, int(destinationCommitsInFlight)),
-        chunksPerShard=max(1, int(chunksPerShard)),
-        threadsPerComputeWorker=threads,
-    )
+def _scoped_task(
+    loop: asyncio.AbstractEventLoop,
+    coro: Coroutine[Any, Any, Any],
+    **kwargs: Any,
+) -> asyncio.Future[Any]:
+    task = asyncio.Task(coro, loop=loop, **kwargs)
+    context = kwargs.get("context")
+    scope = _IO_TASKS.get() if context is None else context.get(_IO_TASKS)
+    if scope is not None:
+        scope.add(task)
+    return task
+
+
+async def _drained(coroutine: Coroutine[Any, Any, T]) -> T:
+    """Run one storage coroutine and wait for every task it started."""
+    tasks: set[asyncio.Future[Any]] = set()
+    token = _IO_TASKS.set(tasks)
+    try:
+        root = asyncio.create_task(coroutine)
+    finally:
+        _IO_TASKS.reset(token)
+    errors: list[BaseException] = []
+    result: Any = None
+    try:
+        result = await _await_completion(root)
+    except BaseException as exc:
+        errors.append(exc)
+    observed: set[asyncio.Future[Any]] = set()
+    while outstanding := tasks - observed:
+        observed.update(outstanding)
+        try:
+            outcomes = await _await_completion(
+                asyncio.gather(*outstanding, return_exceptions=True)
+            )
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException) and not any(
+                    outcome is error for error in errors
+                ):
+                    errors.append(outcome)
+        except BaseException as exc:
+            errors.append(exc)
+    tasks.clear()
+    if len(errors) > 1:
+        raise BaseExceptionGroup("Storage I/O failed while draining work", errors)
+    if errors:
+        raise errors[0]
+    return cast(T, result)
+
+
+class _IoLoops:
+    """Event-loop threads that run storage coroutines.
+
+    Zarr copies decoded chunks into their destination on the thread that runs
+    its event loop. Spreading operations over several loops runs those copies
+    in parallel, while codec work still uses the shared codec pool.
+    """
+
+    def __init__(self, count: int, executor: ThreadPoolExecutor) -> None:
+        self._loops: list[asyncio.AbstractEventLoop] = []
+        self._threads: list[threading.Thread] = []
+        self._turn = itertools.count()
+        for index in range(max(1, count)):
+            loop = asyncio.new_event_loop()
+            loop.set_default_executor(executor)
+            loop.set_task_factory(_scoped_task)
+            thread = threading.Thread(
+                target=loop.run_forever, name=f"scarf-zarr-io_{index}", daemon=True
+            )
+            thread.start()
+            self._loops.append(loop)
+            self._threads.append(thread)
+
+    def submit(self, coroutine: Coroutine[Any, Any, T]) -> "Future[T]":
+        loop = self._loops[next(self._turn) % len(self._loops)]
+        return asyncio.run_coroutine_threadsafe(_drained(coroutine), loop)
+
+    def close(self) -> None:
+        for loop in self._loops:
+            loop.call_soon_threadsafe(loop.stop)
+        for loop, thread in zip(self._loops, self._threads, strict=True):
+            thread.join()
+            loop.close()
+
+
+def _active_zarr_workers() -> int | None:
+    sync = importlib.import_module("zarr.core.sync")
+    pool = sync._executor
+    if pool is None and sync.loop[0] is not None:
+        pool = sync.loop[0]._default_executor
+    return None if pool is None else int(pool._max_workers)
 
 
 def ensure_zarr_host_ceiling(maxWorkers: int | None = None) -> int:
-    """Install the host Zarr thread ceiling once. Later calls do not shrink it."""
+    """Keep the existing process pool, or configure it before its first use."""
     global _HOST_THREAD_CEILING
     host = max(1, detect_workers())
-    requested = host if maxWorkers is None else max(1, int(maxWorkers))
+    if maxWorkers is not None and maxWorkers < 1:
+        raise ValueError("Zarr worker ceiling must be positive")
     with _ZARR_CONFIG_LOCK:
+        active = _active_zarr_workers()
+        configured = zarr.config.get("threading.max_workers", None)
+        existing = active or _HOST_THREAD_CEILING or configured
+        if maxWorkers is not None and existing is not None and maxWorkers != existing:
+            raise RuntimeError(
+                f"Zarr already uses a ceiling of {existing}; configure "
+                f"{maxWorkers} workers before opening storage in a fresh process"
+            )
+        if active is not None:
+            _HOST_THREAD_CEILING = active
         if _HOST_THREAD_CEILING is None:
-            ceiling = min(host, requested)
-            zarr.config.set({"threading.max_workers": ceiling})
+            ceiling = int(existing or maxWorkers or host)
+            if active is None:
+                zarr.config.set({"threading.max_workers": ceiling})
             _HOST_THREAD_CEILING = ceiling
     return _HOST_THREAD_CEILING
-
-
-def zarr_runtime_installed() -> bool:
-    """Return True when this process already has a Zarr thread ceiling."""
-    return _HOST_THREAD_CEILING is not None
 
 
 def configure_zarr_runtime(
@@ -158,9 +235,8 @@ def configure_zarr_runtime(
 ) -> None:
     """Set the process Zarr thread ceiling before opening remote arrays.
 
-    ``asyncConcurrency`` becomes the restored default after each runner
-    scopes its own cap. The first ceiling wins; Zarr does not resize a
-    live thread pool.
+    ``asyncConcurrency`` becomes the restored default after each runner.
+    Conflicting explicit ceilings require a fresh process.
     """
     codec_workers = int(codecWorkers)
     async_concurrency = int(asyncConcurrency)
@@ -239,31 +315,20 @@ class AsyncStorageRunner:
 
     def __init__(
         self,
-        resources: ResourceBudget,
         *,
-        chunksPerShard: int = 10,
-        readGroupsInFlight: int = 1,
-        destinationCommitsInFlight: int = 1,
-        computeWorkerLimit: int = 1,
-        threadsPerComputeWorker: int = 1,
-        operation: OperationPlan | None = None,
+        operation: OperationPlan,
     ):
-        self.resources = resources
-        self.plan = resolve_execution_plan(
-            resources,
-            chunksPerShard=chunksPerShard,
-            readGroupsInFlight=readGroupsInFlight,
-            destinationCommitsInFlight=destinationCommitsInFlight,
-            computeWorkerLimit=computeWorkerLimit,
-            threadsPerComputeWorker=threadsPerComputeWorker,
-            operation=operation,
+        self.plan = operation
+        self.ledger = ByteLedger(
+            operation.requestedMemoryBytes - operation.residentBytes
         )
-        self.ledger = ByteLedger(resources.memoryBytes)
         self.readerWaitSeconds = 0.0
         self._compute_pool: ThreadPoolExecutor | None = None
         self._codec_pool: ThreadPoolExecutor | None = None
         self._read_slots: asyncio.Semaphore | None = None
         self._commit_slots: asyncio.Semaphore | None = None
+        self._io_loops: _IoLoops | None = None
+        self._blas: ThreadpoolController | None = None
 
     def run(self, operation: Callable[["AsyncStorageRunner"], Awaitable[T]]) -> T:
         try:
@@ -272,10 +337,11 @@ class AsyncStorageRunner:
             return asyncio.run(self._run(operation))
         error: list[BaseException] = []
         result: list[T] = []
+        context = contextvars.copy_context()
 
         def _in_thread() -> None:
             try:
-                result.append(asyncio.run(self._run(operation)))
+                result.append(context.run(lambda: asyncio.run(self._run(operation))))
             except BaseException as exc:
                 error.append(exc)
 
@@ -291,63 +357,126 @@ class AsyncStorageRunner:
         operation: Callable[["AsyncStorageRunner"], Awaitable[T]],
     ) -> T:
         loop = asyncio.get_running_loop()
-        ensure_zarr_host_ceiling(self.plan.codecWorkerLimit)
-        self._codec_pool = ThreadPoolExecutor(
-            max_workers=self.plan.codecWorkerLimit,
-            thread_name_prefix="scarf-zarr-codec",
-        )
-        loop.set_default_executor(self._codec_pool)
-        self._compute_pool = ThreadPoolExecutor(
-            max_workers=self.plan.computeWorkerLimit,
-            thread_name_prefix="scarf-compute",
-        )
-        self._read_slots = asyncio.Semaphore(self.plan.readGroupsInFlight)
-        self._commit_slots = asyncio.Semaphore(self.plan.destinationCommitsInFlight)
         result: Any = None
-        operation_error: BaseException | None = None
-        restore_numba = _install_numba_thread_cap(self.plan.threadsPerComputeWorker)
+        errors: list[BaseException] = []
+        restore_numba = None
+        blas_state: Any = None
+        io_context = zarr_io_concurrency(self.plan.ioConcurrency)
+        io_entered = False
         try:
+            ensure_zarr_host_ceiling()
+            self._codec_pool = ThreadPoolExecutor(
+                max_workers=self.plan.codecWorkers,
+                thread_name_prefix="scarf-zarr-codec",
+            )
+            loop.set_default_executor(self._codec_pool)
+            self._io_loops = _IoLoops(self.plan.codecWorkers, self._codec_pool)
+            # Scanning loaded libraries takes milliseconds under the GIL; scan
+            # once per operation instead of once per compute call.
+            self._blas = ThreadpoolController()
+            # Compute tasks limit BLAS threads process-wide, and concurrent
+            # limit scopes restore each other's values; restore the limits in
+            # force before the operation once every task has finished.
+            blas_state = self._blas.limit(limits=None)
+            self._compute_pool = ThreadPoolExecutor(
+                max_workers=self.plan.computeWorkers,
+                thread_name_prefix="scarf-compute",
+            )
+            self._read_slots = asyncio.Semaphore(
+                self.plan.readWorkers * self.plan.innerReads
+            )
+            self._commit_slots = asyncio.Semaphore(self.plan.writeWorkers)
+            restore_numba = _install_numba_thread_cap(self.plan.threadsPerComputeWorker)
+            io_context.__enter__()
+            io_entered = True
             shutdown_checkpoint()
-            with zarr_io_concurrency(self.plan.zarrAsyncConcurrency):
-                result = await operation(self)
+            result = await operation(self)
             shutdown_checkpoint()
         except BaseException as exc:
-            operation_error = exc
+            errors.append(exc)
         finally:
-            leftover = self.ledger.held_bytes()
+            pending = asyncio.all_tasks(loop) - {asyncio.current_task()}
+            for task in pending:
+                task.cancel()
+            if pending:
+                try:
+                    outcomes = await _await_completion(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+                    errors.extend(
+                        item
+                        for item in outcomes
+                        if isinstance(item, BaseException)
+                        and not isinstance(item, asyncio.CancelledError)
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+            for pool in (self._compute_pool, self._codec_pool):
+                if pool is not None:
+                    try:
+                        pool.shutdown(wait=True, cancel_futures=True)
+                    except BaseException as exc:
+                        errors.append(exc)
+            if self._io_loops is not None:
+                try:
+                    self._io_loops.close()
+                except BaseException as exc:
+                    errors.append(exc)
+                self._io_loops = None
+            if blas_state is not None:
+                blas_state.restore_original_limits()
             if restore_numba is not None:
-                restore_numba()
-            if self._compute_pool is not None:
-                self._compute_pool.shutdown(wait=True, cancel_futures=True)
-            if self._codec_pool is not None:
-                self._codec_pool.shutdown(wait=True, cancel_futures=True)
+                try:
+                    restore_numba()
+                except BaseException as exc:
+                    errors.append(exc)
+            if io_entered:
+                try:
+                    io_context.__exit__(None, None, None)
+                except BaseException as exc:
+                    errors.append(exc)
+            leftover = self.ledger.held_bytes()
         if leftover:
-            ledger_error = RuntimeError(
-                f"byte ledger still holds {leftover} bytes after the operation"
-            )
-            if operation_error is not None:
-                raise BaseExceptionGroup(
-                    "async storage operation failed and leaked admitted bytes",
-                    [operation_error, ledger_error],
+            errors.append(
+                RuntimeError(
+                    f"byte ledger still holds {leftover} bytes after the operation"
                 )
-            raise ledger_error
-        if operation_error is not None:
-            raise operation_error
+            )
+        if len(errors) > 1:
+            raise BaseExceptionGroup(
+                "Async storage failed during execution or cleanup",
+                errors,
+            )
+        if errors:
+            raise errors[0]
         return cast(T, result)
 
+    async def io(self, coroutine: Coroutine[Any, Any, T]) -> T:
+        """Run a self-contained storage coroutine on one of the I/O loops."""
+        if self._io_loops is None:
+            raise RuntimeError("I/O loops are not installed")
+        return await _await_completion(
+            asyncio.wrap_future(self._io_loops.submit(coroutine))
+        )
+
     async def compute(self, fn: Callable[[], T]) -> T:
-        if self._compute_pool is None:
+        if self._compute_pool is None or self._blas is None:
             raise RuntimeError("compute pool is not installed")
         loop = asyncio.get_running_loop()
         threads = max(1, int(self.plan.threadsPerComputeWorker))
+        blas = self._blas
 
         def _limited() -> T:
+            from .parallel import _shard_context
+
             _ensure_worker_numba_cap(threads)
-            with threadpool_limits(limits=threads):
+            with _shard_context(), blas.limit(limits=threads):
                 return fn()
 
         shutdown_checkpoint()
-        result = await loop.run_in_executor(self._compute_pool, _limited)
+        result = await _await_completion(
+            loop.run_in_executor(self._compute_pool, _limited)
+        )
         shutdown_checkpoint()
         return result
 
@@ -367,12 +496,12 @@ class AsyncStorageRunner:
         started = time.perf_counter()
         shutdown_checkpoint()
         await self.ledger.acquire(nbytes)
-        shutdown_checkpoint()
-        self.readerWaitSeconds += time.perf_counter() - started
         try:
+            shutdown_checkpoint()
+            self.readerWaitSeconds += time.perf_counter() - started
             yield
         finally:
-            await self.ledger.release(nbytes)
+            await _await_completion(asyncio.create_task(self.ledger.release(nbytes)))
 
     @asynccontextmanager
     async def read_lane(self) -> AsyncIterator[None]:
@@ -392,32 +521,3 @@ class AsyncStorageRunner:
         slot = await self.commit_slot()
         async with slot:
             yield
-
-    async def bounded_read(
-        self,
-        nbytes: int,
-        factory: Callable[[], Coroutine[Any, Any, T]],
-    ) -> T:
-        slot = await self.read_slot()
-        started = time.perf_counter()
-        await self.ledger.acquire(nbytes)
-        await slot.acquire()
-        self.readerWaitSeconds += time.perf_counter() - started
-        try:
-            return await factory()
-        finally:
-            slot.release()
-            await self.ledger.release(nbytes)
-
-    async def bounded_commit(
-        self,
-        nbytes: int,
-        factory: Callable[[], Coroutine[Any, Any, T]],
-    ) -> T:
-        slot = await self.commit_slot()
-        await self.ledger.acquire(nbytes)
-        try:
-            async with slot:
-                return await factory()
-        finally:
-            await self.ledger.release(nbytes)

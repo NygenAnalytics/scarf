@@ -11,6 +11,7 @@ from scarf.storage.ann_index import (
     ANN_INDEX_FORMAT_VERSION,
     _ANN_INDEX_METADATA,
 )
+from scarf.storage.identity import finalize_counts
 from scarf.storage.layout import normalize_chunks
 from scarf.storage.pipeline_runs import (
     PipelineOutputRecord,
@@ -28,8 +29,70 @@ from scarf.tools import repack_zarr as repack_module
 from scarf.tools.repack_zarr import repack_store
 
 
+def _add_raw_metadata(root):
+    from scarf.storage.schema import create_cell_data
+    from scarf.storage.arrays import create_metadata_column
+
+    for name, workspace in repack_module._count_assays(root):
+        namespace = root if workspace is None else root[workspace]
+        assay = namespace[name]
+        matrix = assay if workspace is None else root[f"matrices/{name}"]
+        rows, features = matrix["counts"].shape
+        if "cellData" not in namespace:
+            ids = np.array([f"c{i + 1}" for i in range(rows)])
+            create_cell_data(root, workspace, ids, ids)
+        else:
+            cells = namespace["cellData"]
+            if "names" not in cells:
+                create_metadata_column(cells, "names", data=cells["ids"][:], dtype=str)
+            if "I" not in cells:
+                create_metadata_column(
+                    cells, "I", data=np.ones(rows, dtype=bool), dtype=bool
+                )
+        if "featureData" not in assay:
+            table = assay.create_group("featureData")
+            ids = np.array([f"f{i}" for i in range(features)])
+            for column in ("ids", "names"):
+                create_metadata_column(table, column, data=ids, dtype=str)
+            create_metadata_column(
+                table, "I", data=np.ones(features, dtype=bool), dtype=bool
+            )
+
+
+def _prepare_source(root):
+    from scarf.assay.classification import preset_assay_types
+    from scarf.metadata import MetaData
+    from scarf.storage.count_matrix import create_product_counts_array
+    from scarf.writers.counts_t import finalize_writer_counts_t
+
+    _add_raw_metadata(root)
+    for name, workspace in repack_module._count_assays(root):
+        namespace = root if workspace is None else root[workspace]
+        matrix = namespace[name] if workspace is None else root[f"matrices/{name}"]
+        values = matrix["counts"][:]
+        del matrix["counts"]
+        counts = create_product_counts_array(
+            matrix, *values.shape, values.dtype, profile="fast_local"
+        )
+        counts[:] = values
+        namespace[name].attrs["prepared"] = False
+        finalize_counts(counts)
+        finalize_writer_counts_t(root, name, workspace)
+        assay = preset_assay_types()[name](
+            z=root,
+            name=name,
+            workspace=workspace,
+            cell_data=MetaData(namespace["cellData"]),
+            nthreads=1,
+        )
+        assay.prepare({})
+
+
 def test_repack_store_round_trip(toy_crdir_writer, tmp_path):
     output = tmp_path / "repacked.zarr"
+    from scarf import DataStore
+
+    DataStore(toy_crdir_writer, default_assay="RNA", nthreads=1)
     repack_store(toy_crdir_writer, str(output), profile="fast_local")
 
     src = zarr.open_group(toy_crdir_writer, mode="r")
@@ -65,7 +128,8 @@ def test_repack_v2_without_counts_t_builds_complete_transpose(tmp_path):
     values = np.arange(12, dtype=np.uint32).reshape(3, 4)
     assay.create_array("counts", data=values, chunks=(2, 2))
 
-    repack_store(str(source), str(output))
+    _add_raw_metadata(root)
+    repack_store(str(source), str(output), data_only=True)
 
     result = zarr.open_group(str(output), mode="r")
     assert result.metadata.zarr_format == 3
@@ -88,7 +152,8 @@ def test_repack_rebuilds_incorrect_source_counts_t(tmp_path):
     )
     stale.attrs["complete"] = True
 
-    repack_store(str(source), str(output))
+    _add_raw_metadata(root)
+    repack_store(str(source), str(output), data_only=True)
 
     result = zarr.open_group(str(output), mode="r")
     np.testing.assert_array_equal(result["RNA/countsT"][:], values.T)
@@ -108,7 +173,8 @@ def test_repack_discards_retired_assay_state(tmp_path):
     state = assay.create_group("state")
     state.create_array("legacy", data=np.array([1], dtype=np.uint8))
 
-    repack_store(str(source), str(output))
+    _add_raw_metadata(root)
+    repack_store(str(source), str(output), data_only=True)
 
     result = zarr.open_group(str(output), mode="r")
     assert "state" not in result["RNA"]
@@ -129,13 +195,14 @@ def test_repack_discards_state_from_every_workspace_sharing_an_assay(tmp_path):
     values = np.arange(6, dtype=np.uint32).reshape(2, 3)
     counts.create_array("counts", data=values)
 
-    repack_store(str(source), str(output))
+    _add_raw_metadata(root)
+    repack_store(str(source), str(output), data_only=True)
 
     result = zarr.open_group(str(output), mode="r")
     assert "state" not in result["first/RNA"]
     assert "state" not in result["second/RNA"]
-    np.testing.assert_array_equal(result["first/RNA/metadata"][:], [1])
-    np.testing.assert_array_equal(result["second/RNA/metadata"][:], [1])
+    assert "metadata" not in result["first/RNA"]
+    assert "metadata" not in result["second/RNA"]
     np.testing.assert_array_equal(result["matrices/RNA/counts"][:], values)
 
 
@@ -149,7 +216,8 @@ def test_repack_workspace_counts_uses_requested_profile(tmp_path):
     values = np.arange(8, dtype=np.uint32).reshape(4, 2)
     counts_group.create_array("counts", data=values, chunks=(2, 2))
 
-    repack_store(str(source), str(output), profile="cloud")
+    _add_raw_metadata(root)
+    repack_store(str(source), str(output), profile="cloud", data_only=True)
 
     result = zarr.open_group(str(output), mode="r")
     assay = result["matrices/RNA"]
@@ -157,8 +225,9 @@ def test_repack_workspace_counts_uses_requested_profile(tmp_path):
     counts_t = assay["countsT"]
     np.testing.assert_array_equal(counts_t[:], values.T)
     assert counts_t.attrs["complete"] is True
-    spec = assay.attrs["scarf:zarr_spec"]
-    assert spec["profile"] == "cloud"
+    from scarf.storage.count_matrix import load_count_matrix_plan
+
+    spec = load_count_matrix_plan(counts)["counts"]
     assert list(spec["chunks"]) == list(counts.chunks)
     stored_shards = array_metadata_shards(counts)
     assert spec["shards"] == (None if stored_shards is None else list(stored_shards))
@@ -172,7 +241,7 @@ def test_repack_rejects_source_destination_alias_before_overwrite(tmp_path):
     root.create_array("sentinel", data=np.array([1, 2, 3]))
     equivalent_path = source / ".." / source.name
 
-    with pytest.raises(ValueError, match="different stores"):
+    with pytest.raises(ValueError, match="must not overlap"):
         repack_store(str(source), str(equivalent_path))
 
     reopened = zarr.open_group(str(source), mode="r")
@@ -237,12 +306,13 @@ def test_repack_preserves_root_attrs(tmp_path):
     values = np.arange(6, dtype=np.uint32).reshape(2, 3)
     assay.create_array("counts", data=values, chunks=(2, 3))
 
-    repack_store(str(source), str(output))
+    _add_raw_metadata(root)
+    repack_store(str(source), str(output), data_only=True)
 
     result = zarr.open_group(str(output), mode="r")
     assert result.attrs["defaultAssay"] == "RNA"
     assert result.attrs["assayTypes"] == {"RNA": "RNA"}
-    assert result.attrs["complete"] is True
+    assert "complete" not in result.attrs
 
 
 def test_repack_preserves_non_count_completion_attrs(tmp_path):
@@ -265,6 +335,7 @@ def test_repack_preserves_non_count_completion_attrs(tmp_path):
     slot.attrs["complete"] = True
     slot.create_array("values", data=np.array([1.0, 2.0]))
 
+    _prepare_source(root)
     repack_store(str(source), str(output))
 
     result = zarr.open_group(str(output), mode="r")
@@ -374,7 +445,7 @@ def _seed_labeled_pipeline_records(
 def test_repack_copies_pipeline_records_and_label_claims_in_all_workspaces(tmp_path):
     source = tmp_path / "source_runs.zarr"
     output = tmp_path / "output_runs.zarr"
-    root = zarr.open_group(str(source), mode="w", zarr_format=2)
+    root = zarr.open_group(str(source), mode="w")
     assay = root.create_group("RNA")
     assay.attrs["is_assay"] = True
     assay.create_array(
@@ -418,6 +489,7 @@ def test_repack_copies_pipeline_records_and_label_claims_in_all_workspaces(tmp_p
     )
     source_attrs = {path: dict(root[path].attrs) for path in record_paths}
 
+    _prepare_source(root)
     repack_store(str(source), str(output))
 
     result = zarr.open_group(str(output), mode="r+")
@@ -467,7 +539,8 @@ def test_repack_skips_copying_counts_t_when_sharding(tmp_path, monkeypatch):
         return real_create(self, name, *args, **kwargs)
 
     monkeypatch.setattr(zarr.Group, "create_array", tracking_create)
-    repack_store(str(source), str(output))
+    _add_raw_metadata(root)
+    repack_store(str(source), str(output), data_only=True)
 
     assert created.count("countsT") == 1
     result = zarr.open_group(str(output), mode="r")
@@ -487,6 +560,7 @@ def test_repack_streams_non_count_2d_arrays(tmp_path):
     cell = root.create_group("cellData")
     cell.create_array("ids", data=np.array(["c1", "c2", "c3"]))
 
+    _prepare_source(root)
     repack_store(str(source), str(output))
 
     result = zarr.open_group(str(output), mode="r")
@@ -516,6 +590,7 @@ def test_repack_preserves_ann_like_1d_chunks_and_attrs(tmp_path):
     arr.attrs["payload_sha256"] = "abc"
     arr.attrs["byte_length"] = n_bytes
 
+    _prepare_source(root)
     repack_store(str(source), str(output))
 
     result = zarr.open_group(str(output), mode="r")["ann/ann_idx_bytes"]
@@ -543,6 +618,7 @@ def test_repack_preserves_non_count_2d_shards(tmp_path):
         fill_value=np.nan,
     )
 
+    _prepare_source(root)
     repack_store(str(source), str(output), profile="cloud")
 
     result = zarr.open_group(str(output), mode="r")["RNA/embedding"]
@@ -568,6 +644,7 @@ def test_repack_realigns_shards_when_chunks_clamp(tmp_path):
         shards=(200, 10),
     )
 
+    _prepare_source(root)
     repack_store(str(source), str(output))
 
     result = zarr.open_group(str(output), mode="r")["RNA/embedding"]

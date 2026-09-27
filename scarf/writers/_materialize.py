@@ -6,6 +6,9 @@ import zarr
 from ..storage.budget import ResourceBudget
 from ..storage.materialize import (
     chunked_to_zarr as _chunked_to_zarr,
+)
+
+from ..assay.normalization import (
     write_renorm_subset_to_zarr as _write_renorm_subset_to_zarr,
 )
 

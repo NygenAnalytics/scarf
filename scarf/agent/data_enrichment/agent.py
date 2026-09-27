@@ -9,6 +9,7 @@ from ...utils.logging import logger
 from .._deps import AGENT_INSTALL_HINT
 from ..config import AgentRunConfig
 from ..config.agent_exec import run_agent_sync
+from ..tools import persisted_assay_types
 from ..types import AgentRunInfo
 from .contracts import (
     DataEnrichmentContext,
@@ -85,16 +86,11 @@ _SYSTEM_PROMPT = (
 
 
 def _persisted_assay_types(store: Any, assays: Sequence[str]) -> dict[str, str]:
-    """Read exact persisted assay types through the public datastore summary."""
-    summary_method = getattr(store, "summary", None)
-    if not callable(summary_method):
-        return {}
-    summary = summary_method()
+    """Read the exact persisted types of the requested assays."""
+    assay_types = persisted_assay_types(store)
     requested = set(assays)
     return {
-        str(item.name): str(item.assay_type)
-        for item in getattr(summary, "assays", ())
-        if str(item.name) in requested
+        name: assay_types[name] for name in sorted(assay_types) if name in requested
     }
 
 

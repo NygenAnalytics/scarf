@@ -29,7 +29,12 @@ def project_pca(values: np.ndarray, model: ScaledPCAProjectionModel) -> np.ndarr
     return cast(np.ndarray, projected)
 
 
-def scaled_dispersion_sum(values: np.ndarray, model: ScaledPCAProjectionModel) -> float:
+def scaled_dispersion_sum(
+    values: np.ndarray,
+    model: ScaledPCAProjectionModel,
+    *,
+    features: np.ndarray | None = None,
+) -> float:
     """Return the summed squared scaled deviation of one aligned query block.
 
     The reference PCA is fitted on z-scored features, so dividing this sum by the
@@ -37,13 +42,31 @@ def scaled_dispersion_sum(values: np.ndarray, model: ScaledPCAProjectionModel) -
     that returns much less than 1 occupies a narrower region of the same space
     and its cells collect near the middle of the reference cloud, where the
     retrieved neighbors stop reflecting the query's own structure.
+
+    ``features`` optionally restricts the sum to these reference feature
+    columns, such as the ones the query measured, so that values filled for
+    absent features do not enter the statistic.
     """
     values = np.asarray(values, dtype=np.float64)
     if values.ndim != 2 or values.shape[1] != model.n_features:
         raise ValueError(
             f"Expected query matrix with {model.n_features} features, got {values.shape}"
         )
-    scaled = (values - model.feature_means) / model.feature_scales
+    means = model.feature_means
+    scales = model.feature_scales
+    if features is not None:
+        columns = np.asarray(features)
+        if (
+            columns.ndim != 1
+            or columns.dtype.kind not in {"i", "u"}
+            or np.any(columns < 0)
+            or np.any(columns >= model.n_features)
+        ):
+            raise ValueError("features must be reference feature column indices")
+        values = values[:, columns]
+        means = means[columns]
+        scales = scales[columns]
+    scaled = (values - means) / scales
     return float(np.einsum("ij,ij->", scaled, scaled))
 
 

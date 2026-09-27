@@ -8,7 +8,6 @@ import numpy as np
 
 from ...assay import RNAassay
 from ...datastore.datastore import DataStore
-from ...datastore.summary import AssaySummary
 from ...metadata.selection import NamedCellArtifact
 from ...storage.refs import ArtifactRef
 from ...storage.selections import read_stored_selection_mask
@@ -39,6 +38,7 @@ from ..experimental_context.study import StudyContract
 from ..parameter_tuning.execution import (
     candidate_metric_cache,
 )
+from ..tools import persisted_assay_types
 from ..types import ArtifactReferenceModel
 from . import journal
 from .decisions import DecisionStagesMixin
@@ -54,7 +54,6 @@ from .models import (
     WorkflowStageAttempt,
     WorkflowStageLink,
     WorkflowStageName,
-    artifact_model_to_ref,
 )
 from .rna import (
     selected_store_rna_assay,
@@ -725,11 +724,7 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
     ) -> AutomatedPreprocessingPlan:
         del ingest_outcome
         request = request_record.request
-        store_summary = store.summary()
         selected = selected_store_rna_assay(store, request)
-        summary = next(
-            value for value in store_summary.assays if value.name == selected
-        )
         policy = next(
             (value for value in enrichment.policies if value.assay == selected), None
         )
@@ -740,7 +735,8 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
             raise ValueError("Enrichment policy does not match the selected RNA assay")
         assay_plan = self.build_assay_preprocessing_plan(
             selected,
-            summary,
+            persisted_assay_types(store)[selected],
+            int(store.get_assay(selected).feats.N),
             policy,
             inspection,
         )
@@ -764,18 +760,19 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
     def build_assay_preprocessing_plan(
         self,
         assay_name: str,
-        summary: AssaySummary,
+        assay_type: str,
+        total_features: int,
         policy: FeatureSelectionPolicy | None,
         inspection: AssayFeatureInspection | None,
     ) -> AssayPreprocessingPlan:
-        if summary.assay_type != "RNA":
+        if assay_type != "RNA":
             raise ValueError("Automated preprocessing supports RNA only")
         evidence_ids = list(policy.evidenceIds) if policy is not None else []
-        graph_eligible = summary.total_features >= 3
+        graph_eligible = total_features >= 3
         proposed_families = list(policy.excludeFamilies) if policy is not None else []
         return AssayPreprocessingPlan(
             assay=assay_name,
-            assayType=summary.assay_type,
+            assayType=assay_type,
             role="graph" if graph_eligible else "unsupported",
             graphEligible=graph_eligible,
             markerEligible=graph_eligible,
@@ -864,7 +861,7 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
             raise ValueError(
                 "Preprocessing plan and Experimental Context selections differ"
             )
-        input_cell_selection = artifact_model_to_ref(plan.cellSelection)
+        input_cell_selection = plan.cellSelection.to_artifact_ref()
         started = journal._start_attempt(
             store.zw,
             prefix,
@@ -1197,7 +1194,7 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
         artifact_metrics = [
             NamedCellArtifact(
                 name=source.name,
-                artifact=artifact_model_to_ref(source.artifact),
+                artifact=source.artifact.to_artifact_ref(),
             )
             for source in plan.artifactMetrics
         ]
@@ -1206,7 +1203,7 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
             if plan.sampleArtifact is None
             else NamedCellArtifact(
                 name=plan.sampleArtifact.name,
-                artifact=artifact_model_to_ref(plan.sampleArtifact.artifact),
+                artifact=plan.sampleArtifact.artifact.to_artifact_ref(),
             )
         )
         if plan.registeredProfile is not None:
@@ -1279,7 +1276,7 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
             capture_artifact = (
                 NamedCellArtifact(
                     name=profile.captureArtifact.name,
-                    artifact=artifact_model_to_ref(profile.captureArtifact.artifact),
+                    artifact=profile.captureArtifact.artifact.to_artifact_ref(),
                 )
                 if profile.captureArtifact is not None
                 else None

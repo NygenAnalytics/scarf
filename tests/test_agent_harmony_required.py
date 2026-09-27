@@ -247,9 +247,9 @@ def test_native_recovery_choice_validates_against_matched_resolution_panel(
 ) -> None:
     run = request.getfixturevalue("panel_run")
     _set_design(run)
-    sample = rna_tuning.artifact_model_to_ref(
-        run.handoff.cellSelection.model_copy(update={"artifactId": "e" * 64})
-    )
+    sample = run.handoff.cellSelection.model_copy(
+        update={"artifactId": "e" * 64}
+    ).to_artifact_ref()
     run.scope_sizes["sample1"] = 100
     baseline = run._resolution_panel("sample1", sample, run.baseline())
     run._sensitivity_panel("sample1", sample, baseline)

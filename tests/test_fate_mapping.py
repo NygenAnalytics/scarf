@@ -32,19 +32,35 @@ def _y_graph() -> tuple[csr_matrix, np.ndarray, np.ndarray]:
     return csr_matrix(adjacency), pseudotime, labels
 
 
-def _dense_dirichlet_reference(
-    transition: csr_matrix,
+def _direct_fate_reference(
+    graph: csr_matrix,
+    pseudotime: np.ndarray,
     labels: np.ndarray,
     sinks: list[str],
+    beta: float = 10.0,
 ) -> np.ndarray:
-    matrix = np.eye(transition.shape[0]) - transition.toarray()
+    """Solve the fate Dirichlet system directly on the transient cells."""
+    from scipy.sparse import identity
+    from scipy.sparse.linalg import spsolve
+
     absorbing = np.isin(labels, sinks)
-    matrix[absorbing] = 0.0
-    matrix[np.flatnonzero(absorbing), np.flatnonzero(absorbing)] = 1.0
-    probabilities = np.empty((transition.shape[0], len(sinks)), dtype=np.float64)
-    for group, sink in enumerate(sinks):
-        boundary = np.asarray(labels == sink, dtype=np.float64)
-        probabilities[:, group] = np.linalg.solve(matrix, boundary)
+    transition = _make_transition(
+        graph.copy(),
+        _normalize_pseudotime(pseudotime),
+        absorbing,
+        beta,
+    )
+    transient = np.flatnonzero(~absorbing)
+    system = (
+        identity(transient.size, format="csc")
+        - transition[transient][:, transient].tocsc()
+    )
+    to_sinks = transition[transient][:, np.flatnonzero(absorbing)]
+    probabilities = np.zeros((graph.shape[0], len(sinks)), dtype=np.float64)
+    for column, sink in enumerate(sinks):
+        boundary = np.asarray(labels[absorbing] == sink, dtype=np.float64)
+        probabilities[transient, column] = spsolve(system, to_sinks @ boundary)
+        probabilities[absorbing, column] = boundary
     return probabilities
 
 
@@ -160,19 +176,9 @@ def test_single_sink_assigns_probability_one_without_solver(
     np.testing.assert_array_equal(probabilities, np.ones((graph.shape[0], 1)))
 
 
-def test_two_sink_branch_matches_dense_dirichlet_reference():
+def test_two_sink_branch_matches_direct_dirichlet_reference():
     graph, pseudotime, labels = _y_graph()
-    reference_transition = _make_transition(
-        graph.copy(),
-        _normalize_pseudotime(pseudotime),
-        np.isin(labels, ["A", "B"]),
-        beta=10.0,
-    )
-    expected = _dense_dirichlet_reference(
-        reference_transition,
-        labels,
-        ["A", "B"],
-    )
+    expected = _direct_fate_reference(graph, pseudotime, labels, ["A", "B"])
 
     probabilities, valid, _ = compute_fate_probabilities(
         graph,
@@ -189,7 +195,7 @@ def test_two_sink_branch_matches_dense_dirichlet_reference():
     np.testing.assert_allclose(probabilities.sum(axis=1), 1.0)
 
 
-def test_three_sink_branch_matches_dense_dirichlet_reference():
+def test_three_sink_branch_matches_direct_dirichlet_reference():
     adjacency = np.zeros((7, 7), dtype=np.float64)
     for first, second in ((0, 1), (1, 2), (0, 3), (3, 4), (0, 5), (5, 6)):
         adjacency[first, second] = adjacency[second, first] = 1.0
@@ -197,13 +203,7 @@ def test_three_sink_branch_matches_dense_dirichlet_reference():
     pseudotime = np.array([0.0, 0.5, 1.0, 0.5, 1.0, 0.5, 1.0])
     labels = np.array(["root", "a-mid", "A", "b-mid", "B", "c-mid", "C"])
     sinks = ["A", "B", "C"]
-    reference_transition = _make_transition(
-        graph.copy(),
-        _normalize_pseudotime(pseudotime),
-        np.isin(labels, sinks),
-        beta=10.0,
-    )
-    expected = _dense_dirichlet_reference(reference_transition, labels, sinks)
+    expected = _direct_fate_reference(graph, pseudotime, labels, sinks)
 
     probabilities, valid, _ = compute_fate_probabilities(
         graph,
@@ -215,6 +215,23 @@ def test_three_sink_branch_matches_dense_dirichlet_reference():
     np.testing.assert_array_equal(valid, np.ones(graph.shape[0], dtype=bool))
     np.testing.assert_allclose(probabilities, expected, rtol=1e-5, atol=1e-7)
     np.testing.assert_allclose(probabilities.sum(axis=1), 1.0)
+
+
+def test_fate_coarsening_preserves_direct_solution(monkeypatch):
+    from scarf.trajectory import fate
+
+    graph, pseudotime, labels = _y_graph()
+    monkeypatch.setattr(fate, "_MAX_COARSE_AGGREGATES", 1)
+
+    actual, valid, _ = compute_fate_probabilities(graph, pseudotime, labels, ["A", "B"])
+
+    assert valid.all()
+    np.testing.assert_allclose(
+        actual,
+        _direct_fate_reference(graph, pseudotime, labels, ["A", "B"]),
+        rtol=0,
+        atol=1e-6,
+    )
 
 
 def test_computation_does_not_mutate_input_graph():
@@ -499,6 +516,40 @@ def test_invalid_sink_definitions_fail_clearly(
         )
 
 
+def test_fate_solver_reports_backend_breakdown(monkeypatch):
+    from scarf.trajectory import fate
+
+    graph, pseudotime, labels = _y_graph()
+
+    def failed_gmres(_operator, boundary, **_kwargs):
+        return boundary.copy(), -1
+
+    monkeypatch.setattr(fate, "gmres", failed_gmres)
+
+    with pytest.raises(RuntimeError, match="sink index 0 broke down"):
+        compute_fate_probabilities(graph, pseudotime, labels, ["A", "B"])
+
+
+def test_fate_restart_cycles_preserve_dirichlet_solution(monkeypatch):
+    from scarf.trajectory import fate
+
+    n_cells = 40
+    graph = diags([np.ones(n_cells - 1), np.ones(n_cells - 1)], [-1, 1], format="csr")
+    labels = np.full(n_cells, "other", dtype=object)
+    labels[0], labels[-1] = "A", "B"
+    pseudotime = np.linspace(0, 1, n_cells)
+    monkeypatch.setattr(fate, "_GMRES_RESTART", 1)
+
+    actual, valid, _ = compute_fate_probabilities(
+        graph, pseudotime, labels, ["A", "B"], beta=0.0, solver_tol=1e-4
+    )
+
+    assert valid.all()
+    expected = np.column_stack([1 - pseudotime, pseudotime])
+    np.testing.assert_allclose(actual, expected, rtol=0, atol=0.002)
+    np.testing.assert_array_equal(actual[[0, -1]], [[1, 0], [0, 1]])
+
+
 def test_max_iterations_limits_gmres_inner_iterations():
     n_cells = 80
     graph = diags(
@@ -740,3 +791,178 @@ def test_failed_solver_writes_no_metadata(
     assert set(datastore.cells.columns) == set(cell_columns_before)
     for column, expected in cell_values_before.items():
         np.testing.assert_array_equal(datastore.cells.fetch_all(column), expected)
+
+
+def test_fate_mapping_loads_graph_once_and_not_on_reuse(
+    datastore,
+    pseudotime_scoring,
+    legacy_leiden_clustering,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    original_load = datastore._store_to_sparse
+    loaded: list[str] = []
+
+    def counted_load(location: str, *args: Any, **kwargs: Any):
+        loaded.append(location)
+        return original_load(location, *args, **kwargs)
+
+    monkeypatch.setattr(datastore, "_store_to_sparse", counted_load)
+    computed = datastore.run_fate_mapping(
+        pseudotime_scoring,
+        legacy_leiden_clustering,
+        sinks=[3, 6],
+        invalidate_cache=True,
+    )
+    # Validating the pseudotime loads its graph once and the solve reuses it.
+    assert len(loaded) == 1
+
+    loaded.clear()
+    reused = datastore.run_fate_mapping(
+        pseudotime_scoring,
+        legacy_leiden_clustering,
+        sinks=[3, 6],
+    )
+    # Reuse only validates the pseudotime; the fate solve loads nothing more.
+    assert reused == computed
+    assert len(loaded) == 1
+
+    monkeypatch.setattr(datastore, "_store_to_sparse", original_load)
+    result = datastore.load_fate_mapping(reused)
+    np.testing.assert_allclose(result.values[result.valid].sum(axis=1), 1.0, atol=1e-5)
+
+
+def _ring_sinks_with_chain(
+    ring_size: int,
+    chain_length: int,
+) -> tuple[csr_matrix, np.ndarray, np.ndarray]:
+    rows: list[int] = []
+    cols: list[int] = []
+
+    def link(first: int, second: int) -> None:
+        rows.extend((first, second))
+        cols.extend((second, first))
+
+    for offset in (0, ring_size):
+        for cell in range(ring_size):
+            for step in range(1, 4):
+                link(offset + cell, offset + (cell + step) % ring_size)
+    chain_start = 2 * ring_size
+    for cell in range(chain_length - 1):
+        link(chain_start + cell, chain_start + cell + 1)
+    link(chain_start, 0)
+    link(chain_start + chain_length - 1, ring_size)
+    n_cells = 2 * ring_size + chain_length
+    graph = csr_matrix(
+        (np.ones(len(rows)), (rows, cols)),
+        shape=(n_cells, n_cells),
+    )
+    labels = np.array(
+        ["A"] * ring_size + ["B"] * ring_size + ["chain"] * chain_length,
+        dtype=object,
+    )
+    middle = (chain_length - 1) / 2
+    distance = np.abs(np.arange(chain_length) - middle) / middle
+    pseudotime = np.concatenate([np.ones(2 * ring_size), 0.9 * distance])
+    return graph, pseudotime, labels
+
+
+def test_large_sink_groups_do_not_loosen_solver_stopping():
+    # A GMRES tolerance relative to the boundary norm grows with the square
+    # root of the sink size, so these 2000-cell sinks once stopped the solve
+    # before the chain met the residual limit.
+    graph, pseudotime, labels = _ring_sinks_with_chain(2000, 30)
+
+    probabilities, valid, _ = compute_fate_probabilities(
+        graph,
+        pseudotime,
+        labels,
+        ["A", "B"],
+    )
+
+    assert valid.all()
+    expected = _direct_fate_reference(graph, pseudotime, labels, ["A", "B"])
+    np.testing.assert_allclose(probabilities, expected, rtol=0.0, atol=1e-5)
+    chain = probabilities[labels == "chain", 0]
+    assert np.all(np.diff(chain) < 0)
+    assert chain[0] > 0.99 and chain[-1] < 0.01
+
+
+def _elongated_y_graph(
+    n_cells: int,
+    *,
+    k: int = 10,
+    seed: int = 0,
+) -> tuple[csr_matrix, np.ndarray, np.ndarray]:
+    from scipy.spatial import cKDTree
+
+    rng = np.random.default_rng(seed)
+    n_branch = n_cells // 3
+    n_stem = n_cells - 2 * n_branch
+    stem = np.column_stack([np.sort(rng.uniform(0, 1, n_stem)), np.zeros(n_stem)])
+    up = np.array([np.cos(np.pi / 6), np.sin(np.pi / 6)])
+    down = up * np.array([1.0, -1.0])
+    branch_a = np.array([1.0, 0.0]) + np.sort(rng.uniform(0, 1, n_branch))[:, None] * up
+    branch_b = (
+        np.array([1.0, 0.0]) + np.sort(rng.uniform(0, 1, n_branch))[:, None] * down
+    )
+    points = np.vstack([stem, branch_a, branch_b])
+    points += rng.normal(scale=0.02, size=points.shape)
+    # Pseudotime is the arc position of each noisy point, so it is smooth on
+    # the neighbourhood graph as a scored pseudotime would be.
+    pseudotime = np.concatenate(
+        [
+            points[:n_stem, 0],
+            1.0 + (points[n_stem : n_stem + n_branch] - [1.0, 0.0]) @ up,
+            1.0 + (points[n_stem + n_branch :] - [1.0, 0.0]) @ down,
+        ]
+    )
+    labels = np.full(n_cells, "other", dtype=object)
+    labels[:n_stem] = "stem"
+    labels[n_stem : n_stem + n_branch] = "a"
+    labels[n_stem + n_branch :] = "b"
+    tips = pseudotime > 1.97
+    labels[tips & (labels == "a")] = "A"
+    labels[tips & (labels == "b")] = "B"
+    distances, neighbors = cKDTree(points).query(points, k=k + 1)
+    rows = np.repeat(np.arange(n_cells), k)
+    weights = np.exp(-distances[:, 1:].ravel() / distances[:, 1:].mean())
+    graph = csr_matrix(
+        (weights, (rows, neighbors[:, 1:].ravel())),
+        shape=(n_cells, n_cells),
+    )
+    return graph.maximum(graph.T).tocsr(), pseudotime, labels
+
+
+@pytest.mark.slow
+def test_elongated_trajectory_converges_with_default_iterations():
+    graph, pseudotime, labels = _elongated_y_graph(9000)
+
+    probabilities, valid, _ = compute_fate_probabilities(
+        graph,
+        pseudotime,
+        labels,
+        ["A", "B"],
+    )
+
+    assert valid.all()
+    expected = _direct_fate_reference(graph, pseudotime, labels, ["A", "B"])
+    np.testing.assert_allclose(probabilities, expected, rtol=0.0, atol=1e-4)
+    root = pseudotime < 0.05
+    assert 0.4 < probabilities[root, 0].mean() < 0.6
+    assert probabilities[labels == "a", 0].mean() > 0.7
+    assert probabilities[labels == "b", 0].mean() < 0.3
+
+
+def test_fate_mapping_checks_solver_memory_before_solving(
+    datastore,
+    pseudotime_scoring,
+    legacy_leiden_clustering,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    options = {"sinks": [3, 6], "invalidate_cache": True}
+    datastore.run_fate_mapping(pseudotime_scoring, legacy_leiden_clustering, **options)
+    monkeypatch.setattr(datastore, "memoryBytes", 128 * 1024)
+    with pytest.raises(MemoryError, match="Fate mapping needs about"):
+        datastore.run_fate_mapping(
+            pseudotime_scoring, legacy_leiden_clustering, **options
+        )

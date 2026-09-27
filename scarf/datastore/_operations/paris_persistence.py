@@ -1,3 +1,4 @@
+from dataclasses import fields
 from math import prod
 from typing import Literal, cast
 
@@ -5,7 +6,16 @@ import numpy as np
 import zarr
 
 from ...clustering._paris_core import ParisHierarchy
-from ...clustering.paris_multiscale import PlateauForest
+from ...clustering.paris_multiscale import ParisClusterDiagnostic, PlateauForest
+from ...storage.artifact_writer import (
+    ArrayRequirement,
+    AttributeRequirement,
+    PlannedArtifact,
+    finish_artifact,
+    plan_artifact,
+    start_artifact,
+)
+from ...storage.artifacts import ArtifactRef
 from ...storage.arrays import create_zarr_dataset
 from ...storage.budget import ResourceBudget
 from ...storage.types import as_zarr_array, as_zarr_group
@@ -27,9 +37,59 @@ _PARIS_PLATEAU_ARRAYS = (
     "min_leaves",
     "component_roots",
 )
+_PARIS_DIAGNOSTIC_FIELDS = frozenset(
+    field.name for field in fields(ParisClusterDiagnostic)
+)
 _MEMORY_HEADROOM = 1.35
 _CACHED_FIXED_TRANSIENT_BYTES_PER_CELL = 128
 _CACHED_ADAPTIVE_TRANSIENT_BYTES_PER_CELL = 96
+
+
+def _is_integer(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def hierarchy_array_requirements() -> tuple[ArrayRequirement, ...]:
+    """Arrays a reusable Paris hierarchy artifact must contain."""
+    return tuple(ArrayRequirement(name) for name in _PARIS_HIERARCHY_ARRAYS) + tuple(
+        ArrayRequirement(f"plateau/{name}") for name in _PARIS_PLATEAU_ARRAYS
+    )
+
+
+def hierarchy_attribute_requirements(
+    n_leaves: int,
+) -> tuple[AttributeRequirement, ...]:
+    """Attributes a reusable Paris hierarchy over ``n_leaves`` cells must record."""
+    return (
+        AttributeRequirement(
+            "n_leaves",
+            (int,),
+            predicate=lambda value: _is_integer(value) and value == n_leaves,
+        ),
+        AttributeRequirement(
+            "total_weight",
+            (int, float),
+            predicate=lambda value: not isinstance(value, bool),
+        ),
+    )
+
+
+def read_paris_cut_diagnostics(
+    group: zarr.Group,
+    mode: Literal["auto", "fixed"],
+) -> tuple[ParisClusterDiagnostic, ...]:
+    """Read cut diagnostics that exactly match the current recorded schema."""
+    raw_diagnostics = group.attrs.get("diagnostics")
+    if not isinstance(raw_diagnostics, list):
+        raise ValueError("Paris cut diagnostics must be a list")
+    diagnostics = []
+    for raw in raw_diagnostics:
+        if not isinstance(raw, dict) or set(raw) != _PARIS_DIAGNOSTIC_FIELDS:
+            raise ValueError("Paris cut diagnostics do not match the current schema")
+        diagnostics.append(ParisClusterDiagnostic(**raw))
+    if mode == "fixed" and diagnostics:
+        raise ValueError("Fixed Paris cuts cannot record adaptive diagnostics")
+    return tuple(diagnostics)
 
 
 def _paris_memory_components(
@@ -308,6 +368,45 @@ def write_hierarchy_group(
                 "reciprocal_rounds": len(hierarchy.diagnostics.rounds),
             }
         )
+
+
+def plan_paris_dendrogram(
+    zw: zarr.Group,
+    hierarchy_ref: ArtifactRef,
+    *,
+    invalidate_cache: bool = False,
+) -> PlannedArtifact:
+    """Plan the compatibility dendrogram materialized from a Paris hierarchy."""
+    return plan_artifact(
+        zw,
+        scope=hierarchy_ref.scope,
+        assay=hierarchy_ref.assay,
+        kind="dendrogram",
+        operation="materialize_paris_dendrogram",
+        parameters={"compatibility": True},
+        inputs={"cluster_hierarchy": hierarchy_ref},
+        execution_options={},
+        invalidate_cache=invalidate_cache,
+        required_arrays=(ArrayRequirement("data", dtype_kind="f"),),
+    )
+
+
+def write_paris_dendrogram(
+    zw: zarr.Group,
+    plan: PlannedArtifact,
+    dendrogram: np.ndarray,
+) -> None:
+    """Write and complete a planned Paris dendrogram artifact."""
+    group = start_artifact(zw, plan)
+    output = create_zarr_dataset(
+        group,
+        "data",
+        (min(max(dendrogram.shape[0], 1), 5000), 4),
+        "f8",
+        dendrogram.shape,
+    )
+    output[:] = dendrogram
+    finish_artifact(group, plan)
 
 
 def _read_array(group: zarr.Group, name: str) -> np.ndarray:

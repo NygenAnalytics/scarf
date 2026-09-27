@@ -384,6 +384,42 @@ def test_select_hvgs_rejects_empty_result_without_metadata_mutation(
     assert set(store.RNA.feats.columns) == columns_before
 
 
+def test_select_hvgs_rejects_unknown_keywords_before_saving(
+    datastore_ephemeral,
+) -> None:
+    store = datastore_ephemeral
+    cell_selection = store.snapshot_cell_selection()
+    before = set(store.list_artifacts(kind="feature_selection", from_assay="RNA"))
+    summaries = set(store.list_artifacts(kind="feature_summary", from_assay="RNA"))
+
+    # A misspelled selection option must not vanish into the plot options.
+    with pytest.raises(TypeError, match="'top_N'"):
+        store.select_hvgs(cell_selection, top_N=5, show_plot=False)
+    with pytest.raises(TypeError, match="'show'"):
+        store.select_hvgs(cell_selection, show=False, show_plot=True)
+
+    assert set(store.list_artifacts(kind="feature_selection", from_assay="RNA")) == (
+        before
+    )
+    assert (
+        set(store.list_artifacts(kind="feature_summary", from_assay="RNA")) == summaries
+    )
+
+    ref = store.select_hvgs(
+        cell_selection,
+        min_cells=0,
+        top_n=5,
+        n_bins=20,
+        blacklist="",
+        max_cells=np.inf,
+        show_plot=False,
+        label_size=9,
+    )
+    assert inspect_artifact(store.zw, ref).execution_options["plot_kwargs"] == {
+        "label_size": 9
+    }
+
+
 def test_select_hvgs_rejects_non_rna_assay(datastore_ephemeral) -> None:
     cell_selection = datastore_ephemeral.snapshot_cell_selection()
     with pytest.raises(TypeError, match="RNAassay"):

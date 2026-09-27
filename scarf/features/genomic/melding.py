@@ -7,12 +7,13 @@ from scipy.sparse import csc_matrix
 
 from ...assay import Assay
 from ...storage.budget import ResourceBudget
+from ...storage.identity import CountSummary, finalize_counts
 from ...storage.count_matrix import (
     DEFAULT_COUNT_MATRIX_POLICY,
     CountMatrixPolicy,
 )
 from ...storage.layout import array_shard_rows
-from ...storage.schema import create_zarr_count_assay
+from ...storage.schema import DerivedAssayTransaction, derived_assay_transaction
 from ...storage.sharding import sparse_matrix_bytes, write_dense_from_row_batches
 from ...utils.arrays import array_digest
 from .intervals import create_bed_from_coord_ids, get_feature_mappings
@@ -58,7 +59,8 @@ def _meld_band_cost(
     destRows: int | None = None,
 ) -> int:
     dest_rows = int(source_rows) if destRows is None else max(1, int(destRows))
-    return _source_working_bytes(
+    # The writer keeps one yielded source batch while the next is produced.
+    return 2 * _source_working_bytes(
         source_rows,
         nSourceFeatures,
         sourceItemsize,
@@ -144,7 +146,7 @@ def create_counts_mat(
     *,
     idf_cell_idx: np.ndarray | None = None,
 ) -> None:
-    """Populate a melded count matrix in a Zarr array."""
+    """Populate and finalize a melded count matrix in a Zarr array."""
     n_docs = int(store.shape[0])
     n_source_features = int(mapping.shape[0])
     n_target_features = int(store.shape[1])
@@ -244,7 +246,8 @@ def create_counts_mat(
 
     shard_rows = array_shard_rows(store)
     store_itemsize = np.dtype(store.dtype).itemsize
-    resident_bytes = mapping_bytes + n_term_per_doc.nbytes + idf.nbytes
+    summary = CountSummary(store)
+    resident_bytes = mapping_bytes + n_term_per_doc.nbytes + idf.nbytes + summary.nbytes
     source_rows = _max_meld_band_rows(
         memoryBytes=int(assay.resources.memoryBytes),
         nDocs=n_docs,
@@ -254,7 +257,7 @@ def create_counts_mat(
         storeItemsize=store_itemsize,
         mappingBytes=mapping_bytes,
         decodeBytes=decode_bytes,
-        extraResidentBytes=n_term_per_doc.nbytes + idf.nbytes,
+        extraResidentBytes=n_term_per_doc.nbytes + idf.nbytes + summary.nbytes,
         preferredRows=min(int(assay.rawData.chunksize[0]), n_docs, shard_rows),
         maxRows=min(n_docs, shard_rows),
         destRows=shard_rows,
@@ -301,9 +304,14 @@ def create_counts_mat(
         store,
         block_stream(),
         resources=ResourceBudget(assay.resources.memoryBytes, 1),
+        residentBytes=resident_bytes,
+        producerReserveBytes=2 * (source_stream_resident - resident_bytes)
+        + decode_bytes,
         msg="Writing gene scores",
         io=getattr(assay, "storageIo", None),
+        countSummary=summary,
     )
+    finalize_counts(store, summary=summary)
 
 
 def coordinate_melding(
@@ -318,6 +326,9 @@ def coordinate_melding(
     idf_cell_idx: np.ndarray | None = None,
 ) -> None:
     """Transfer coordinate-based assay values to overlapping external features.
+
+    The new assay becomes visible to assay scans only after its counts are
+    complete. A failed or interrupted write removes the partial assay.
 
     Args:
         assay: Source assay whose features have genomic coordinates.
@@ -334,12 +345,47 @@ def coordinate_melding(
     Returns:
         None
     """
+    from ...storage.stores import zarr_group_root
+
+    with derived_assay_transaction(
+        zarr_group_root(assay.z, mode="r+"),
+        new_assay_name,
+        workspace,
+        operation="coordinate_melding",
+    ) as transaction:
+        write_melded_counts(
+            transaction,
+            assay,
+            feature_bed,
+            peaks_col=peaks_col,
+            scalar_coeff=scalar_coeff,
+            renormalization=renormalization,
+            peaks_coords=peaks_coords,
+            idf_cell_idx=idf_cell_idx,
+        )
+
+
+def write_melded_counts(
+    transaction: DerivedAssayTransaction,
+    assay: Assay,
+    feature_bed: pd.DataFrame,
+    *,
+    peaks_col: str,
+    scalar_coeff: float,
+    renormalization: bool,
+    peaks_coords: np.ndarray | None,
+    idf_cell_idx: np.ndarray | None,
+) -> None:
+    """Write finalized melded counts and provenance into a pending assay.
+
+    Callers own the transaction, so they can finish further writes, such as
+    RNA ``countsT``, before the assay is published.
+    """
     if peaks_coords is None:
         peaks_coords = assay.feats.fetch_all(peaks_col)
     peaks_bed = create_bed_from_coord_ids(peaks_coords)
     feat_ids, feat_names, mapping = get_feature_mappings(peaks_bed, feature_bed)
 
-    from ...storage.stores import zarr_group_root
     from ...storage.profiles import resolve_storage_profile
 
     n_cells = int(assay.rawData.shape[0])
@@ -358,20 +404,17 @@ def coordinate_melding(
         extraResidentBytes=(
             n_cells * np.dtype(np.float64).itemsize
             + n_source_features * np.dtype(np.float64).itemsize
+            + CountSummary.nbytes_for(n_cells, n_target_features)
         ),
         preferredRows=min(int(assay.rawData.chunksize[0]), n_cells),
         maxRows=n_cells,
     )
-    store_root = zarr_group_root(assay.z, mode="r+")
-    group = create_zarr_count_assay(
-        z=store_root,
-        assay_name=new_assay_name,
-        workspace=workspace,
-        n_cells=n_cells,
-        feat_ids=feat_ids,
-        feat_names=feat_names,
-        dtype=store_dtype,
-        profile=resolve_storage_profile(store_root.store),
+    counts = transaction.create_counts(
+        n_cells,
+        feat_ids,
+        feat_names,
+        store_dtype,
+        profile=resolve_storage_profile(transaction.root.store),
         policy=_meld_count_matrix_policy(
             nCells=n_cells,
             nFeats=n_target_features,
@@ -382,7 +425,7 @@ def coordinate_melding(
 
     create_counts_mat(
         assay=assay,
-        store=group,
+        store=counts,
         mapping=mapping,
         scalar_coeff=scalar_coeff,
         renormalization=renormalization,
@@ -393,12 +436,11 @@ def coordinate_melding(
         if idf_cell_idx is None
         else np.unique(np.asarray(idf_cell_idx, dtype=np.int64))
     )
-    assay_group_path = (
-        new_assay_name if workspace is None else f"{workspace}/{new_assay_name}"
+    transaction.group.attrs.update(
+        {
+            "idfCellIndexDigest": array_digest(selected_cells),
+            "idfCellCount": int(len(selected_cells)),
+            "sourceAssay": assay.name,
+            "tfDenominator": "total_counts",
+        }
     )
-    assay_group = store_root[assay_group_path]
-    assay_group.attrs["idfCellIndexDigest"] = array_digest(selected_cells)
-    assay_group.attrs["idfCellCount"] = int(len(selected_cells))
-    assay_group.attrs["sourceAssay"] = assay.name
-    assay_group.attrs["tfDenominator"] = "total_counts"
-    return None

@@ -18,7 +18,7 @@ from ..experimental_context.study import StudyContract, validate_objective_evide
 from ..ingest import IngestResult, detect_format, ingest
 from ..ingest.manifest import DatasetManifest, inspect_h5ad_manifest
 from . import journal
-from .context import ContextStagesMixin
+from .context import ContextStagesMixin, _dataset_columns
 from .finalization import FinalizationStagesMixin
 from .models import (
     _STAGE_ORDER,
@@ -90,22 +90,24 @@ def _data_identity(
     columns: list[str] | None = None,
     feature_columns: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Fingerprint the selected assay and original metadata in bounded blocks."""
+    """Bind the persisted dataset identity and the remaining metadata columns."""
     from ..parameter_tuning.execution import _metadata_column_fingerprint
 
     assay = store.get_assay(assay_name)
-    digest = hashlib.sha256()
-    digest.update(str(assay.rawData.shape).encode())
-    digest.update(str(assay.rawData.dtype).encode())
-    for block in assay.rawData.stream_blocks(nthreads=1, prefetch=1):
-        digest.update(block.tobytes(order="C"))
-    names = sorted(columns if columns is not None else store.cells.columns)
+    cell_covered, feature_covered = _dataset_columns(assay_name)
+    names = sorted(
+        columns
+        if columns is not None
+        else (name for name in store.cells.columns if name not in cell_covered)
+    )
     feature_names = sorted(
-        feature_columns if feature_columns is not None else assay.feats.columns
+        feature_columns
+        if feature_columns is not None
+        else (name for name in assay.feats.columns if name not in feature_covered)
     )
     return {
         "assay": assay_name,
-        "countsSha256": digest.hexdigest(),
+        "datasetFingerprint": store._ensure_dataset_fingerprint(assay_name),
         "featureMetadata": {
             name: _metadata_column_fingerprint(assay.feats, name)
             for name in feature_names
@@ -677,8 +679,8 @@ class AgentOrchestrator(
             zarr_path,
             default_assay=default_assay,
             min_features_per_cell=-1,
-            mito_pattern="",
-            ribo_pattern="",
+            mito_pattern=None,
+            ribo_pattern=None,
             zarr_mode="r+",
             workspace=request.workspace,
         )

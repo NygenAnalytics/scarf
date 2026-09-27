@@ -45,15 +45,7 @@ _PUBLIC_CLASS_METHODS = {
         "consume",
         "close",
     ),
-    CrDirReader: (
-        "__init__",
-        "read_header",
-        "process_batch",
-        "to_sparse",
-        "cell_names",
-        "rename_batches",
-        "consume",
-    ),
+    CrDirReader: ("__init__",),
     H5adReader: (
         "__init__",
         "from_inspect",
@@ -100,7 +92,7 @@ _PUBLIC_CLASS_METHODS = {
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
     CrReader: "cfeac7ccf7bc316f1db1d9e177d6556b37a0169b3cbb2800a92e561b75f4fc4a",
     CrH5Reader: "053373f2af2f2fc74a3e00cde9b067c5818aba92c09da3a9ac2e129566ca87b9",
-    CrDirReader: "51884c2390ad90fba1cdbd71808fc4dd98de548bd901e810c9caba6dbb9cf49a",
+    CrDirReader: "d1d6697ba86d1e34aeb3e176ba84000e4fc50267176cec6f922ef696050b40dc",
     H5adReader: "d8556a75fb03793e802e86bf87a07f0097d1337e55700edd9af68ec7212a2e28",
     LoomReader: "85c3ff965cb94a4fa201915b9d43890081e1f26e931327fcda6531bee4c3782a",
     CSVReader: "8aa6c17c876afb62765584fc7ff64d2838c66ef53095da10d7198ca60ab83851",
@@ -220,6 +212,7 @@ def test_matrix_market_exports_load_together_lazily():
                 "assert reader.__module__ == 'scarf.readers'; "
                 "assert readers.MtxCandidate.__module__ == 'scarf.readers'; "
                 "assert readers.inspect_mtx.__module__ == 'scarf.readers'; "
+                "assert readers.CrDirReader.__module__ == 'scarf.readers'; "
                 "assert 'scarf.readers.mtx' in sys.modules; "
                 "assert 'scarf.readers.h5ad' not in sys.modules; "
                 "assert 'scarf.readers.loom' not in sys.modules"
@@ -309,7 +302,8 @@ def test_reader_public_metadata_remains_on_facade():
 def test_cellranger_reader_hierarchy_and_abstract_contracts_are_stable():
     assert inspect.isabstract(CrReader)
     assert issubclass(CrH5Reader, CrReader)
-    assert issubclass(CrDirReader, CrReader)
+    assert issubclass(CrDirReader, MtxReader)
+    assert issubclass(MtxReader, CrReader)
     for name in ("_handle_version", "_read_dataset", "consume"):
         assert getattr(CrReader, name).__isabstractmethod__
 

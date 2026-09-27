@@ -12,9 +12,10 @@ from ..storage.artifacts import ArtifactRef, inspect_artifact
 from ..storage.selections import validate_stored_selection_live_alias
 from ._contracts import CategoricalScale, PlotProvenance, SizeScale
 from ._deps import require_matplotlib
-from ._data import _resolve_grouping, _resolve_layout
+from ._data import _fetch_cell_column, _resolve_grouping, _resolve_layout
 from ._display import resolve_categorical_scale
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
+from ..utils.arrays import sort_categories
 from ._style import (
     apply_figure_chrome,
     categorical_color_map,
@@ -22,7 +23,6 @@ from ._style import (
     refresh_layout_point_sizes,
     register_layout_point_size,
     scatter_edgecolor,
-    sort_categories,
     square_axis_limits,
     theme_context,
 )
@@ -37,16 +37,21 @@ def _fetch_inputs(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     try:
         x = np.asarray(
-            store.cells.fetch(f"{layout_key}1", key=cell_key),
+            _fetch_cell_column(store, f"{layout_key}1", cell_key=cell_key),
             dtype=np.float64,
         )
         y = np.asarray(
-            store.cells.fetch(f"{layout_key}2", key=cell_key),
+            _fetch_cell_column(store, f"{layout_key}2", cell_key=cell_key),
             dtype=np.float64,
         )
     except (TypeError, ValueError) as exc:
         raise TypeError(f"Layout {layout_key!r} coordinates must be numeric") from exc
-    groups = np.asarray(store.cells.fetch(group_by, key=cell_key), dtype=object)
+    groups = _fetch_cell_column(
+        store,
+        group_by,
+        cell_key=cell_key,
+        labels=True,
+    ).astype(object)
 
     for name, values in (
         (f"{layout_key}1", x),
@@ -441,12 +446,14 @@ def cluster_connectivity(
         if groups.assay is not None and groups.assay != graph.assay:
             raise ValueError("groups and graph must belong to the same assay")
         coordinates, cell_indices, layout_selection = _resolve_layout(store, layout)
-        _, group_indices, group_values = _resolve_grouping(
+        _, group_indices, group_values, group_missing = _resolve_grouping(
             store,
             group_by=None,
             groups=groups,
             cell_key="I",
         )
+        if group_missing is not None and group_missing.any():
+            raise ValueError("groups contains missing labels")
         group_status = inspect_artifact(store.zw, groups)
         raw_group_selection = (group_status.inputs or {}).get("cell_selection")
         if not isinstance(raw_group_selection, Mapping):

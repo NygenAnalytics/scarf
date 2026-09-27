@@ -73,8 +73,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "rss_peak_tracker": (".process", "rss_peak_tracker"),
     "array_digest": (".arrays", "array_digest"),
     "rolling_window": (".arrays", "rolling_window"),
-    "stdout_is_interactive": (".logging", "stdout_is_interactive"),
-    "is_notebook": (".progress", "is_notebook"),
 }
 
 for _export_name in _LAZY_EXPORTS:

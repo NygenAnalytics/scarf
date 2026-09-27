@@ -1,4 +1,5 @@
 from collections.abc import Iterable, Iterator
+import sys
 from typing import Any
 
 from .logging import progress_enabled
@@ -8,19 +9,6 @@ tqdm_params = {
     "dynamic_ncols": True,
     "colour": "#34abeb",
 }
-
-
-def is_notebook() -> bool:
-    """Return whether the current shell is a Jupyter kernel."""
-    try:
-        shell = get_ipython().__class__.__name__  # type: ignore[name-defined]
-        if shell == "ZMQInteractiveShell":
-            return True
-        if shell == "TerminalInteractiveShell":
-            return False
-        return False
-    except NameError:
-        return False
 
 
 def tqdmbar(*args: Any, **kwargs: Any) -> Any:
@@ -50,8 +38,9 @@ def iter_progress[T](
     kwargs: dict[str, Any] = {"desc": desc, "total": total}
     if disable is not None:
         kwargs["disable"] = disable
-    progress = tqdmbar(**kwargs)
+    progress = None
     try:
+        progress = tqdmbar(**kwargs)
         while True:
             try:
                 item = next(iterator)
@@ -63,7 +52,18 @@ def iter_progress[T](
                 del item
             progress.update()
     finally:
-        close = getattr(iterator, "close", None)
-        if callable(close):
-            close()
-        progress.close()
+        original = sys.exception()
+        errors: list[BaseException] = []
+        for resource in (iterator, progress):
+            close = getattr(resource, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except BaseException as error:
+                    errors.append(error)
+        if errors:
+            if original is not None and not isinstance(original, GeneratorExit):
+                errors.insert(0, original)
+            if len(errors) == 1:
+                raise errors[0]
+            raise BaseExceptionGroup("Progress stream cleanup failed", errors)

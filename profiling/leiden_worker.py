@@ -41,12 +41,8 @@ def run_leiden_worker(requestPath: Path) -> None:
         f"[leiden_worker] START backend={workflow.leidenBackend} store={store_uri}",
         flush=True,
     )
-    worker_started = time.perf_counter()
+    started = time.perf_counter()
     cpu_started = time.process_time()
-    setup_started = worker_started
-    input_setup_seconds: float | None = None
-    operation_started: float | None = None
-    operation_seconds: float | None = None
     try:
         store = _open_datastore(
             store_uri,
@@ -54,12 +50,11 @@ def run_leiden_worker(requestPath: Path) -> None:
             resources,
             initialize=False,
         )
-        input_setup_seconds = time.perf_counter() - setup_started
+        opened = time.perf_counter()
         print(
             "[leiden_worker] datastore open; ENTER run_leiden_clustering",
             flush=True,
         )
-        operation_started = time.perf_counter()
         raw_inputs = request.get("inputs")
         if not isinstance(raw_inputs, dict) or not isinstance(
             raw_inputs.get("graph"), dict
@@ -83,26 +78,11 @@ def run_leiden_worker(requestPath: Path) -> None:
             graph,
             **arguments,
         )
-        operation_seconds = time.perf_counter() - operation_started
+        finished = time.perf_counter()
         del store
     except BaseException as exc:
-        now = time.perf_counter()
-        if input_setup_seconds is None:
-            input_setup_seconds = now - setup_started
-        if operation_started is not None and operation_seconds is None:
-            operation_seconds = now - operation_started
         error = f"{type(exc).__name__}: {exc}"
-        _write_status(
-            status_path,
-            {
-                "status": "error",
-                "error": error,
-                "inputSetupSeconds": input_setup_seconds,
-                "operationSeconds": operation_seconds,
-                "wholeWorkerSeconds": now - worker_started,
-                "processCpuSeconds": time.process_time() - cpu_started,
-            },
-        )
+        _write_status(status_path, {"status": "error", "error": error})
         print(f"[leiden_worker] ERROR {error}", flush=True)
         raise
 
@@ -112,9 +92,9 @@ def run_leiden_worker(requestPath: Path) -> None:
             "status": "ok",
             "error": None,
             "artifact": clusters.to_dict(),
-            "inputSetupSeconds": input_setup_seconds,
-            "operationSeconds": operation_seconds,
-            "wholeWorkerSeconds": time.perf_counter() - worker_started,
+            "inputSetupSeconds": opened - started,
+            "operationSeconds": finished - opened,
+            "wholeWorkerSeconds": time.perf_counter() - started,
             "processCpuSeconds": time.process_time() - cpu_started,
         },
     )

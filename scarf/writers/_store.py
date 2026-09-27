@@ -1,3 +1,4 @@
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 import numpy as np
@@ -15,6 +16,36 @@ from ..storage.schema import (
 from ..storage.count_matrix import CountMatrixPolicy
 from ..storage.profiles import StorageProfile
 from ..storage.stores import load_zarr as load_zarr
+from ..utils.logging import logger
+
+RESERVED_METADATA_COLUMNS = frozenset({"I", "ids", "names"})
+
+
+def skip_reserved_metadata_columns[T](
+    columns: Iterable[tuple[str, T]],
+    axis: str,
+) -> Iterator[tuple[str, T]]:
+    """Yield source metadata columns except those with reserved names.
+
+    Scarf writes its own ``ids``, ``names``, and ``I`` columns into every cell
+    and feature table. A source column with one of these names is skipped with
+    a warning so that it cannot replace the identifiers or the filter column.
+
+    Args:
+        columns: Pairs of source column name and payload.
+        axis: Table description used in the warning, such as ``cell``.
+
+    Yields:
+        The pairs whose names are not reserved.
+    """
+    for name, payload in columns:
+        if name in RESERVED_METADATA_COLUMNS:
+            logger.warning(
+                f"Skipped source {axis} metadata column {name!r} because Scarf "
+                "reserves the column names 'I', 'ids', and 'names'"
+            )
+            continue
+        yield name, payload
 
 
 def create_zarr_dataset(

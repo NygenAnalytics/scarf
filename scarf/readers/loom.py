@@ -1,4 +1,5 @@
 from collections.abc import Generator
+from typing import Any
 
 import h5py
 import numpy as np
@@ -26,7 +27,8 @@ class LoomReader:
         feature_ids_key: Child node under the `feature_attrs_key` wherein the feature/gene ids are stored.
                          (Default value: None)
         dtype: Numpy dtype of the matrix data. This dtype is enforced when streaming the data through `consume`
-               method. (Default value: Automatically determined)
+               method. (Default value: Automatically determined). float16 is not a storage dtype, so float16
+               source values are read as float32.
 
     Attributes:
         h5: A File object from the h5py package.
@@ -58,7 +60,10 @@ class LoomReader:
         self.cellNamesKey, self.featureNamesKey = cell_names_key, feature_names_key
         self.featureIdsKey = feature_ids_key
         self.sourceMatrixDtype = self.h5[self.matrixKey].dtype
-        self.matrixDtype = self.sourceMatrixDtype if dtype is None else dtype
+        self.matrixDtype: Any = self.sourceMatrixDtype if dtype is None else dtype
+        if dtype is None and self.sourceMatrixDtype.newbyteorder("=") == np.float16:
+            # float16 is not a count storage dtype.
+            self.matrixDtype = np.dtype(np.float32)
         self._check_integrity()
         self.nFeatures, self.nCells = self.h5[self.matrixKey].shape
 

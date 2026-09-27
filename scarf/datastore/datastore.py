@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from ..storage.types import ZarrMode
 from ..assay import Assay
@@ -7,6 +7,7 @@ from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import StorageProfile, ZarrLocation
 from ..storage.refs import ArtifactRef
 from ..storage.stores import create_matrix_source
+from ..storage.validation_scope import scope_public_methods
 from ._operations.features import _FeatureOperationsMixin
 from ._operations.integration_metrics import _IntegrationMetricsOperationsMixin
 from ._operations.presentation import _PresentationOperationsMixin
@@ -56,11 +57,25 @@ def mount_datastore(
             f"{zarr_mode!r}. Reopen the target with DataStore to read it."
         )
 
+    source_store = DataStore(
+        source,
+        workspace=workspace,
+        zarr_mode="r",
+        storage_options=storage_options,
+        default_assay=datastore_options.get("default_assay"),
+    )
+    required_transposes = frozenset(
+        name
+        for name in source_store.assay_names
+        if source_store._get_assay(name).requiresCountsT
+    )
     create_matrix_source(
         source,
         at,
+        required_transposes=required_transposes,
         workspace=workspace,
         storage_options=storage_options,
+        profile=datastore_options.get("zarrProfile"),
     )
     return DataStore(
         at,
@@ -95,10 +110,11 @@ class DataStore(
                        when DataStore loads a Zarr file for the first time.
         min_features_per_cell: Minimum number of non-zero features in a cell. If lower than this then the cell
                                will be filtered out.
-        mito_pattern: Pattern for missing mitochondrial percentages. None preserves existing values
-                      and uses ``^MT-`` for new values. Explicit patterns must match existing provenance.
-        ribo_pattern: Pattern for missing ribosomal percentages. None preserves existing values
-                      and uses ``RPS|RPL|MRPS|MRPL`` for new values.
+        mito_pattern: Feature-name pattern for the ``{assay}_percentMito`` column of each RNA assay.
+                      The first writable open replaces any existing column with values computed from
+                      this pattern, or ``^MT-`` when None. Later opens keep the stored values when
+                      None and reject a pattern that differs from the recorded one.
+        ribo_pattern: The same for ``{assay}_percentRibo``, using ``RPS|RPL|MRPS|MRPL`` when None.
         nthreads: Maximum worker budget for multi-threaded methods. When None, auto-detected
                   (SCARF_WORKERS env var, else process CPU affinity and cgroup limits). An
                   explicit integer overrides environment detection.
@@ -181,10 +197,9 @@ class DataStore(
         Returns:
             Assay object
         """
-        if assay_name not in self.assay_names:
+        if assay_name not in self._assayNames:
             raise ValueError(f"ERROR: Assay {assay_name} not found in the Zarr file")
-        else:
-            return cast(Assay, getattr(self, assay_name))
+        return self._assays[assay_name]
 
     def resolve_features(
         self,
@@ -214,3 +229,8 @@ class DataStore(
             mem_budget=self.memoryBytes,
             storageIo=getattr(self, "storageIo", None),
         )
+
+
+# One public call validates each input artifact once, however many lineage
+# paths reach it.
+scope_public_methods(DataStore, module_prefix="scarf.datastore")

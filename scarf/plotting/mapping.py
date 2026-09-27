@@ -16,6 +16,7 @@ from ._contracts import (
 )
 from ._deps import require_matplotlib
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
+from ..utils.arrays import sort_categories
 from ._style import (
     apply_figure_chrome,
     categorical_color_map,
@@ -23,7 +24,6 @@ from ._style import (
     default_point_size,
     finish_embedding_axes,
     scatter_edgecolor,
-    sort_categories,
     square_axis_limits,
     theme_context,
 )

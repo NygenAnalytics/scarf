@@ -8,10 +8,10 @@ from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal, cast
 
 import numpy as np
+import pandas as pd
 from pydantic import Field, create_model, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
-from ...metadata.rows import read_metadata_rows_chunkwise
 from ...storage.refs import ArtifactRef
 from ...storage.selections import (
     read_stored_selection_indices,
@@ -74,6 +74,7 @@ from ..parameter_tuning.selection import (
     finalize_parameter_tuning_selection,
     harmony_acceptance_gate,
 )
+from ..tools import label_filter_bound, read_marked_metadata_rows
 from ..types import AgentDataModel, ArtifactReferenceModel
 from . import journal
 from .budget import CandidateBudget, CandidateBudgetExceeded, candidate_identity
@@ -81,7 +82,6 @@ from .models import (
     AutomatedPreprocessingPlan,
     OrchestrationRequestRecord,
     PreprocessedAssayHandoff,
-    artifact_model_to_ref,
 )
 
 _STRUCTURED_VISUAL_LIMITATION = (
@@ -332,13 +332,19 @@ def uniform_screening_selection(
         scope="datastore",
         kind="cell_selection",
         values=mask,
-        row_ids=np.asarray(store.cells.fetch_all("ids")),
+        row_ids=store.cells._get_array("ids"),
         operation="agent_uniform_rna_screen",
         parameters={"size": size, "seed": seed, "generator": "PCG64"},
         inputs={"parent_selection": parent},
         source_column="agent_screening",
     )
     return selection
+
+
+def _recorded_label_counts(cells: Any, column: str) -> tuple[np.ndarray, np.ndarray]:
+    """Count each recorded label; missing labels never form a group."""
+    labels = cells.fetch(column)
+    return np.unique(labels[~pd.isna(labels)], return_counts=True)
 
 
 def screening_coverage(
@@ -368,15 +374,13 @@ def screening_coverage(
         "groups": {},
     }
     concerns: list[str] = []
-    grouped = {}
-    for column in dict.fromkeys(columns):
-        full = np.asarray(
-            read_metadata_rows_chunkwise(store.cells, column, full_indices)
-        ).astype(str)
-        sampled = np.asarray(
-            read_metadata_rows_chunkwise(store.cells, column, sample_indices)
-        ).astype(str)
-        grouped[column] = (full, sampled)
+    grouped = {
+        column: (
+            read_marked_metadata_rows(store.cells, column, full_indices),
+            read_marked_metadata_rows(store.cells, column, sample_indices),
+        )
+        for column in dict.fromkeys(columns)
+    }
     if combinations:
         from ..experimental_context.characterization import _SelectionBoundCells
         from ..experimental_context.comparisons import combination_labels
@@ -390,8 +394,12 @@ def screening_coverage(
                 combination_labels(sample_cells, group_columns),
             )
     for column, (full, sampled) in grouped.items():
-        values, counts = np.unique(full, return_counts=True)
-        sample_values, sample_counts = np.unique(sampled, return_counts=True)
+        # Missing labels never form a group; fractions keep every selected cell.
+        values, counts = np.unique(full[~pd.isna(full)].astype(str), return_counts=True)
+        sample_values, sample_counts = np.unique(
+            sampled[~pd.isna(sampled)].astype(str),
+            return_counts=True,
+        )
         lookup = dict(zip(sample_values, sample_counts, strict=True))
         rows = []
         for value, count in zip(values, counts, strict=True):
@@ -455,8 +463,8 @@ class RnaTuningRun:
         )
         self.design_comparisons = tuple(design_comparisons)
         self.prefix = journal._ensure_orchestration_store(store)
-        self.cells = artifact_model_to_ref(handoff.cellSelection)
-        self.marker_features = artifact_model_to_ref(handoff.markerFeatures)
+        self.cells = handoff.cellSelection.to_artifact_ref()
+        self.marker_features = handoff.markerFeatures.to_artifact_ref()
         self.budget = CandidateBudget(
             store,
             self.prefix,
@@ -575,7 +583,7 @@ class RnaTuningRun:
                 saved["evaluation"]
             )
             for artifact in evaluation.artifacts.values():
-                status = self.store.inspect_artifact(artifact_model_to_ref(artifact))
+                status = self.store.inspect_artifact(artifact.to_artifact_ref())
                 if not status.exists or not status.complete:
                     raise ValueError(
                         "Saved candidate evidence is unavailable or incomplete"
@@ -585,7 +593,7 @@ class RnaTuningRun:
                 scope, setting, admission, evaluation
             )
         else:
-            features = artifact_model_to_ref(setting.features)
+            features = setting.features.to_artifact_ref()
             normalized = diagnostic_call(
                 "core.primaryNormalization",
                 self.store.run_normalization,
@@ -641,7 +649,7 @@ class RnaTuningRun:
         preserve_doublets: bool = False,
     ) -> ParameterCandidateEvaluation:
         """Attach required loading, population, stability and doublet evidence."""
-        features = artifact_model_to_ref(setting.features)
+        features = setting.features.to_artifact_ref()
         parameters = setting.parameters
         evaluation = augment_pca_evaluations(
             self.store,
@@ -659,7 +667,7 @@ class RnaTuningRun:
                 *(source.name for source in self.plan.cellQc.artifactMetrics),
             ],
             qc_artifacts={
-                source.name: artifact_model_to_ref(source.artifact)
+                source.name: source.artifact.to_artifact_ref()
                 for source in self.plan.cellQc.artifactMetrics
             },
             column_kinds={
@@ -749,7 +757,7 @@ class RnaTuningRun:
         if saved is not None:
             restored = ParameterCandidateEvaluation.model_validate(saved["evaluation"])
             for artifact in restored.artifacts.values():
-                status = self.store.inspect_artifact(artifact_model_to_ref(artifact))
+                status = self.store.inspect_artifact(artifact.to_artifact_ref())
                 if not status.exists or not status.complete:
                     raise ValueError(
                         "Revised candidate evidence is unavailable or incomplete"
@@ -763,7 +771,7 @@ class RnaTuningRun:
             "columnKinds",
         )
         if any(getattr(old, field) != getattr(self.study, field) for field in fields):
-            normalized = artifact_model_to_ref(evaluation.artifacts["normalized"])
+            normalized = evaluation.artifacts["normalized"].to_artifact_ref()
             deps, _ = prepare_parameter_tuning_dependencies(
                 self.store,
                 normalized=normalized,
@@ -933,16 +941,14 @@ class RnaTuningRun:
         names = np.asarray(assay.feats.fetch_all("names")).astype(str)
         ids = np.asarray(assay.feats.fetch_all("ids")).astype(str)
         eligible = np.asarray(
-            self.store.load_artifact(artifact_model_to_ref(setting.eligibleFeatures))[
+            self.store.load_artifact(setting.eligibleFeatures.to_artifact_ref())[
                 "values"
             ][:],
             dtype=bool,
         )
         allowed = np.asarray(
             self.store.load_artifact(
-                artifact_model_to_ref(
-                    self.handoff.graphFeatureCandidates["eligibleAll"]
-                )
+                self.handoff.graphFeatureCandidates["eligibleAll"].to_artifact_ref()
             )["values"][:],
             dtype=bool,
         )
@@ -1001,15 +1007,16 @@ class RnaTuningRun:
         from ..experimental_context.characterization import _SelectionBoundCells
 
         cells = _SelectionBoundCells(self.store.zw, self.store.cells, self.cells)
-        values, counts = np.unique(cells.fetch(column), return_counts=True)
+        values, counts = _recorded_label_counts(cells, column)
         groups = []
         for value, n_cells in zip(values, counts, strict=True):
             if n_cells < 20:
                 continue
+            bound = label_filter_bound(value)
             selection = self.store.filter_cells(
                 [column],
-                [value],
-                [value],
+                [bound],
+                [bound],
                 cell_selection=self.cells,
                 keep_bounds=True,
                 invalidate_cache=False,
@@ -1045,9 +1052,9 @@ class RnaTuningRun:
                 "Batch-aware ranking lacks two groups with sufficient cells"
             )
         mask = np.asarray(self.store.load_artifact(eligible)["values"][:], dtype=bool)
-        statistics = artifact_model_to_ref(
-            self.handoff.graphFeatureCandidates["eligibleAll"]
-        )
+        statistics = self.handoff.graphFeatureCandidates[
+            "eligibleAll"
+        ].to_artifact_ref()
         variance = np.asarray(
             self.store.load_artifact(statistics)["corrected_variance"][:],
             dtype=np.float64,
@@ -1072,7 +1079,7 @@ class RnaTuningRun:
                     "parameters": setting.parameters.model_copy(update={field: value})
                 }
             )
-        eligible = artifact_model_to_ref(setting.eligibleFeatures)
+        eligible = setting.eligibleFeatures.to_artifact_ref()
         count = int(value) if field == "hvgCount" else setting.hvgCount
         ranking_mode = value if field == "hvgRanking" else setting.ranking
         ranking_column = (
@@ -1105,9 +1112,9 @@ class RnaTuningRun:
                         "The nominated exact feature is absent from the assay"
                     )
             if field.startswith("include"):
-                all_eligible = artifact_model_to_ref(
-                    self.handoff.graphFeatureCandidates["eligibleAll"]
-                )
+                all_eligible = self.handoff.graphFeatureCandidates[
+                    "eligibleAll"
+                ].to_artifact_ref()
                 allowed = np.asarray(
                     self.store.load_artifact(all_eligible)["values"][:], dtype=bool
                 )
@@ -1148,9 +1155,9 @@ class RnaTuningRun:
         features = rank_core_hvgs(
             self.store,
             eligible=eligible,
-            statistics=artifact_model_to_ref(
-                self.handoff.graphFeatureCandidates["eligibleAll"]
-            ),
+            statistics=self.handoff.graphFeatureCandidates[
+                "eligibleAll"
+            ].to_artifact_ref(),
             top_n=count,
             ranking=indices,
         )
@@ -1244,16 +1251,14 @@ class RnaTuningRun:
         """Find one meaningful, previously justified policy intervention."""
         policy = self.plan.assays[0].featureParameters
         eligible = np.asarray(
-            self.store.load_artifact(artifact_model_to_ref(baseline.eligibleFeatures))[
+            self.store.load_artifact(baseline.eligibleFeatures.to_artifact_ref())[
                 "values"
             ][:],
             dtype=bool,
         )
         all_eligible = np.asarray(
             self.store.load_artifact(
-                artifact_model_to_ref(
-                    self.handoff.graphFeatureCandidates["eligibleAll"]
-                )
+                self.handoff.graphFeatureCandidates["eligibleAll"].to_artifact_ref()
             )["values"][:],
             dtype=bool,
         )
@@ -1364,21 +1369,21 @@ class RnaTuningRun:
         )
         ranking = None
         ranking_groups = {}
+        bound_cells: Any = None
         for column in columns:
             if self.study.columnKinds.get(column) == "continuous":
                 continue
-            indices = read_stored_selection_indices(
-                self.store.zw,
-                self.cells,
-                kind="cell_selection",
-                scope="datastore",
-                assay=None,
-                table_path="cellData",
-            )
-            group_values = read_metadata_rows_chunkwise(
-                self.store.cells, column, indices
-            )
-            _, counts = np.unique(group_values, return_counts=True)
+            if bound_cells is None:
+                from ..experimental_context.characterization import (
+                    _SelectionBoundCells,
+                )
+
+                bound_cells = _SelectionBoundCells(
+                    self.store.zw,
+                    self.store.cells,
+                    self.cells,
+                )
+            _, counts = _recorded_label_counts(bound_cells, column)
             ranking_groups[column] = int((counts >= 20).sum())
             if int((counts >= 20).sum()) >= 2:
                 ranking = {
@@ -1432,11 +1437,11 @@ class RnaTuningRun:
                     if (
                         known.features == setting.features
                         or np.array_equal(
+                            self.store.load_artifact(known.features.to_artifact_ref())[
+                                "values"
+                            ][:],
                             self.store.load_artifact(
-                                artifact_model_to_ref(known.features)
-                            )["values"][:],
-                            self.store.load_artifact(
-                                artifact_model_to_ref(setting.features)
+                                setting.features.to_artifact_ref()
                             )["values"][:],
                         )
                         or (
@@ -1500,11 +1505,11 @@ class RnaTuningRun:
                 }:
                     same_genes = np.array_equal(
                         self.store.load_artifact(
-                            artifact_model_to_ref(alternative_setting.features)
+                            alternative_setting.features.to_artifact_ref()
                         )["values"][:],
-                        self.store.load_artifact(
-                            artifact_model_to_ref(setting.features)
-                        )["values"][:],
+                        self.store.load_artifact(setting.features.to_artifact_ref())[
+                            "values"
+                        ][:],
                     )
                 if (
                     axis == "featurePolicy"
@@ -1664,7 +1669,7 @@ class RnaTuningRun:
         )
         if saved is not None:
             return RnaSetting.model_validate(saved["setting"])
-        eligible = artifact_model_to_ref(policy.eligibleFeatures)
+        eligible = policy.eligibleFeatures.to_artifact_ref()
         if (
             count == policy.hvgCount
             and ranking.ranking == policy.ranking
@@ -1685,16 +1690,16 @@ class RnaTuningRun:
                 rank_core_hvgs(
                     self.store,
                     eligible=eligible,
-                    statistics=artifact_model_to_ref(
-                        self.handoff.graphFeatureCandidates["eligibleAll"]
-                    ),
+                    statistics=self.handoff.graphFeatureCandidates[
+                        "eligibleAll"
+                    ].to_artifact_ref(),
                     top_n=count,
                     ranking=order,
                 )
             )
         actual_count = int(
             np.asarray(
-                self.store.load_artifact(artifact_model_to_ref(features))["values"][:],
+                self.store.load_artifact(features.to_artifact_ref())["values"][:],
                 dtype=bool,
             ).sum()
         )
@@ -1807,20 +1812,16 @@ class RnaTuningRun:
         if key in self.feature_evidence_cache:
             return self.feature_evidence_cache[key]
         mask = np.asarray(
-            self.store.load_artifact(artifact_model_to_ref(setting.features))["values"][
-                :
-            ],
+            self.store.load_artifact(setting.features.to_artifact_ref())["values"][:],
             dtype=bool,
         )
         eligible = np.asarray(
-            self.store.load_artifact(artifact_model_to_ref(setting.eligibleFeatures))[
+            self.store.load_artifact(setting.eligibleFeatures.to_artifact_ref())[
                 "values"
             ][:],
             dtype=bool,
         )
-        reference = artifact_model_to_ref(
-            self.handoff.graphFeatureCandidates["eligibleAll"]
-        )
+        reference = self.handoff.graphFeatureCandidates["eligibleAll"].to_artifact_ref()
         variance = np.asarray(
             self.store.load_artifact(reference)["corrected_variance"][:],
             dtype=np.float64,
@@ -2023,8 +2024,8 @@ class RnaTuningRun:
                     "diagnostic.neighborOverlap",
                     _neighbor_overlap,
                     self.store,
-                    artifact_model_to_ref(selected_neighbors),
-                    artifact_model_to_ref(other_neighbors),
+                    selected_neighbors.to_artifact_ref(),
+                    other_neighbors.to_artifact_ref(),
                 )
             else:
                 diagnostic_reuse("diagnostic.neighborOverlap", "cacheHits")
@@ -2189,7 +2190,7 @@ class RnaTuningRun:
             if previous_review is not None
             else self.full_repairs,
             "comparisonCoverage": self.comparison_coverage(
-                scope, artifact_model_to_ref(selected.cellSelection)
+                scope, selected.cellSelection.to_artifact_ref()
             )
             if selected.cellSelection is not None
             else {},
@@ -2847,12 +2848,12 @@ class RnaTuningRun:
                     )
                 prior_setting = self.settings[prior.candidateId]
                 if setting.hvgCount != prior_setting.hvgCount or np.array_equal(
-                    self.store.load_artifact(artifact_model_to_ref(setting.features))[
+                    self.store.load_artifact(setting.features.to_artifact_ref())[
                         "values"
                     ][:],
-                    self.store.load_artifact(
-                        artifact_model_to_ref(prior_setting.features)
-                    )["values"][:],
+                    self.store.load_artifact(prior_setting.features.to_artifact_ref())[
+                        "values"
+                    ][:],
                 ):
                     pending_policy.update(
                         status="notApplicable",
@@ -3033,9 +3034,7 @@ class RnaTuningRun:
                         else name.split(":", 1)[0]
                     )
                     if diagnostic in diagnostic_artifacts:
-                        diagnostic_artifacts[diagnostic].add(
-                            artifact_model_to_ref(artifact)
-                        )
+                        diagnostic_artifacts[diagnostic].add(artifact.to_artifact_ref())
         diagnostic_counts = {
             name: len(refs) for name, refs in diagnostic_artifacts.items()
         }

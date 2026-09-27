@@ -166,7 +166,7 @@ def test_reduction_entrypoints_validate_and_forward_explicit_normalized_ref() ->
         store.run_lsi(normalized, solver="mystery")
     with pytest.raises(TypeError, match="n_iter must be an integer"):
         store.run_lsi(normalized, n_iter=True)
-    with pytest.raises(ValueError, match="n_oversamples must be nonnegative"):
+    with pytest.raises(ValueError, match="n_oversamples must be non-negative"):
         store.run_lsi(normalized, n_oversamples=-1)
     with pytest.raises(ValueError, match="two-dimensional matrix"):
         store.run_custom_reduction(np.arange(4), normalized)

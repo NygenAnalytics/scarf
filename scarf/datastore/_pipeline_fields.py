@@ -2,8 +2,10 @@ from collections.abc import Iterator, Mapping
 from typing import Any, Literal
 
 import numpy as np
+import pandas as pd
 
 from ..metadata.artifacts import categorical_display, continuous_display
+from ..storage.arrays import linked_missing_mask
 from ..storage.artifacts import ArtifactRef, artifact_group
 from ..storage.pipeline_runs import PipelineFieldDescriptor
 from ..storage.types import as_zarr_array
@@ -61,26 +63,13 @@ def continuous_array_display(
 
 
 def categorical_array_display(array: Any) -> dict[str, Any]:
-    categories: list[Any] = []
-    seen: set[tuple[str, str]] = set()
-    has_missing = False
+    distinct: list[Any] = []
     for block in _iter_array_blocks(array):
-        for raw_value in np.asarray(block).reshape(-1):
-            value = raw_value.item() if isinstance(raw_value, np.generic) else raw_value
-            if isinstance(value, float) and np.isnan(value):
-                value = None
-            if value is None:
-                has_missing = True
-                continue
-            key = (type(value).__name__, repr(value))
-            if key not in seen:
-                seen.add(key)
-                categories.append(value)
-    display_values = np.asarray(
-        [*categories, *([None] if has_missing else [])],
-        dtype=object,
-    )
-    return categorical_display(display_values)
+        values = np.asarray(block).reshape(-1)
+        # Typed blocks hold one value type, so their distinct values carry the
+        # same categories in first-seen order; object blocks can mix types.
+        distinct.extend(pd.unique(values) if values.dtype != object else values)
+    return categorical_display(np.asarray(distinct, dtype=object))
 
 
 def _fill_for_dtype(dtype: np.dtype[Any]) -> str | int | bool:
@@ -128,15 +117,14 @@ def _snapshot_field(
 ) -> PipelineFieldDescriptor:
     group = artifact_group(root, snapshot)
     array = as_zarr_array(group[key], name=key)
-    raw_missing = array.attrs.get("missing_mask")
-    missing = raw_missing if isinstance(raw_missing, str) else None
+    missing = linked_missing_mask(group, key, values=array)
     return _field(
         key=key,
         axis=axis,
         ref=snapshot,
         source_value=key,
         dtype=array.dtype,
-        missing_mask=missing,
+        missing_mask=None if missing is None else missing.basename,
     )
 
 

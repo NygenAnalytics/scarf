@@ -141,12 +141,20 @@ outside the pipeline.
 
 Current Scarf versions write RNA counts twice: cell-major `counts` and a gene-major `countsT` copy.
 Opening an RNA assay fails if that copy is missing, incomplete, still Zarr v2, or does not match `counts`.
-Stores containing the retired `{assay}/state` group also fail on open. There is no silent rewrite,
+Every assay must also carry the current preparation record: finalized raw counts, summaries
+recomputed from those counts, and a dataset identity. Stores written by earlier releases, and
+stores containing the retired `{assay}/state` group, fail on open. There is no silent rewrite,
 migration, or state-based result selection.
 
-Re-import the source, or write a new store with `python -m scarf.tools.repack_zarr`.
-The offline rewrite omits retired state. Afterward, recompute HVG, normalization, PCA, graph, and
-marker results with the current release.
+Re-import the source, or rebuild it into a fresh location:
+
+```bash
+python -m scarf.tools.repack_zarr input.zarr output.zarr --data-only
+```
+
+The rebuild keeps raw counts, annotations, and selection columns, omits saved analyses and retired
+state, and prepares the new store from its own counts. Afterward, recompute HVG, normalization,
+PCA, graph, and marker results with the current release.
 Non-RNA assays do not use `countsT`.
 See {doc}`../concepts/memory_and_execution`.
 

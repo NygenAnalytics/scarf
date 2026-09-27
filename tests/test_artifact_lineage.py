@@ -63,8 +63,10 @@ class _ReferenceDatastore:
     def _get_assay(self, assay_name: str) -> zarr.Group:
         return self.zw[assay_name]
 
-    def _calculate_dataset_fingerprint(self, _assay_name: str) -> str:
-        return self._fingerprint
+    def _ensure_dataset_fingerprint(self, assay_name: str) -> str:
+        from scarf.storage.identity import read_dataset_fingerprint
+
+        return read_dataset_fingerprint(self.zw[assay_name])
 
 
 def _mapping_reference(
@@ -76,6 +78,7 @@ def _mapping_reference(
     if ref.assay not in root:
         root.create_group(ref.assay)
     root[ref.assay].attrs["dataset_fingerprint"] = fingerprint
+    root[ref.assay].attrs["prepared"] = True
     reference = object.__new__(MappingReference)
     object.__setattr__(
         reference,
@@ -572,5 +575,5 @@ def test_datastore_lineage_validates_reference_fingerprints_and_root_conflicts(
         datastore.lineage(target, references=first)
 
     del first_root["RNA"].attrs["dataset_fingerprint"]
-    lineage = datastore.lineage(target, references=first)
-    assert lineage.graph.nodes[first.external_ref]["status"].complete
+    with pytest.raises(ValueError, match="not prepared"):
+        datastore.lineage(target, references=first)

@@ -1,6 +1,8 @@
 import asyncio
+import functools
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -18,6 +20,7 @@ from ..storage.pipeline_runs import (
     load_pipeline_stage_record,
     start_pipeline_stage_record,
 )
+from ..utils.background import BackgroundTask
 from ..utils.logging import logger
 from ..utils.process import ProcessTreeRssMeasurement, sample_process_tree_rss
 from ..utils.shutdown import ShutdownRequested, shutdown_checkpoint
@@ -109,8 +112,59 @@ def interruption_record(
     return None
 
 
+@dataclass(frozen=True, slots=True)
+class _StageOutcome:
+    outputs: tuple[tuple[str, ArtifactRef], ...]
+    completed: bool
+    error: BaseException | None
+    metrics: PipelineStageMetrics
+    plans: tuple[ArtifactPlanReceipt, ...]
+
+
+def _execute_stage(
+    action: Callable[[], Sequence[tuple[str, ArtifactRef]]],
+    wall_started: float,
+) -> _StageOutcome:
+    outputs: tuple[tuple[str, ArtifactRef], ...] = ()
+    completed = False
+    caught: BaseException | None = None
+    with sample_process_tree_rss() as read_rss:
+        with artifact_plan_scope() as plans:
+            try:
+                outputs = tuple(action())
+                completed = True
+                shutdown_checkpoint()
+            except BaseException as error:
+                caught = error
+    return _StageOutcome(
+        outputs=outputs,
+        completed=completed,
+        error=caught,
+        metrics=stage_metrics(
+            wall_seconds=time.perf_counter() - wall_started,
+            rss=read_rss(),
+        ),
+        plans=tuple(plans),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _StartedStage:
+    stage: str
+    ordinal: int
+    task: BackgroundTask[_StageOutcome]
+
+
 class RunLedger:
-    __slots__ = ("events", "ordinal", "root", "run_id")
+    """Record pipeline stages durably, in order, from the calling thread.
+
+    Stages start in the persisted order. A stage started with ``overlapping``
+    runs on a worker thread while later stages run, and is recorded when its
+    block ends. Every record write and callback happens on the calling thread,
+    and background stages are recorded before the run becomes terminal.
+    """
+
+    __slots__ = ("background", "events", "ordinal", "root", "run_id")
 
     def __init__(
         self,
@@ -122,6 +176,7 @@ class RunLedger:
         self.run_id = run_id
         self.ordinal = 0
         self.events = PipelineEventEmitter(callback)
+        self.background: list[_StartedStage] = []
 
     def _records(
         self,
@@ -159,10 +214,27 @@ class RunLedger:
             for plan in plans
         )
 
+    def _settle_background(self) -> None:
+        """Wait for and record every background stage before the run ends."""
+        while self.background:
+            started = self.background.pop()
+            try:
+                self._finish(started, end_run=False)
+            except Exception:
+                logger.exception(f"Could not record pipeline stage {started.stage}")
+
+    def _check_background(self) -> None:
+        """End the run at a stage boundary once a background stage has failed."""
+        for started in list(self.background):
+            if started.task.done() and started.task.result().error is not None:
+                self.background.remove(started)
+                self._finish(started)
+
     def interrupt_pending(self, error: BaseException, stage: str) -> None:
         interruption = interruption_record(error)
         if interruption is None:
             raise TypeError("error is not a handled pipeline interruption")
+        self._settle_background()
         current = load_pipeline_run_record(self.root, self.run_id)
         if not current.complete:
             interrupt_pipeline_run_record(
@@ -185,76 +257,79 @@ class RunLedger:
         self,
         *,
         stage: str,
+        ordinal: int,
         error: BaseException,
         metrics: PipelineStageMetrics,
         plans: Sequence[PipelinePlanRecord] = (),
+        end_run: bool = True,
     ) -> None:
         interruption = interruption_record(error)
         if interruption is None:
             raise TypeError("error is not a handled pipeline interruption")
-        current_stage = load_pipeline_stage_record(
-            self.root,
-            self.run_id,
-            self.ordinal,
-        )
+        current_stage = load_pipeline_stage_record(self.root, self.run_id, ordinal)
         if current_stage.status == "running":
             finish_pipeline_stage_record(
                 self.root,
                 run_id=self.run_id,
-                ordinal=self.ordinal,
+                ordinal=ordinal,
                 status="interrupted",
                 plans=plans,
                 metrics=metrics,
                 interruption=interruption,
             )
-        current_run = load_pipeline_run_record(self.root, self.run_id)
-        if not current_run.complete:
-            interrupt_pipeline_run_record(
-                self.root,
-                run_id=self.run_id,
-                interruption=interruption,
-            )
+        if end_run:
+            self._settle_background()
+            current_run = load_pipeline_run_record(self.root, self.run_id)
+            if not current_run.complete:
+                interrupt_pipeline_run_record(
+                    self.root,
+                    run_id=self.run_id,
+                    interruption=interruption,
+                )
         self.events.emit("stage_interrupted", stage, error)
-        self.events.emit("pipeline_interrupted", stage, error)
+        if end_run:
+            self.events.emit("pipeline_interrupted", stage, error)
 
     def _finish_failed(
         self,
         *,
         stage: str,
+        ordinal: int,
         error: Exception,
         metrics: PipelineStageMetrics,
         plans: Sequence[PipelinePlanRecord] = (),
+        end_run: bool = True,
     ) -> None:
         try:
-            current_stage = load_pipeline_stage_record(
-                self.root,
-                self.run_id,
-                self.ordinal,
-            )
+            current_stage = load_pipeline_stage_record(self.root, self.run_id, ordinal)
             if current_stage.status == "running":
                 finish_pipeline_stage_record(
                     self.root,
                     run_id=self.run_id,
-                    ordinal=self.ordinal,
+                    ordinal=ordinal,
                     status="failed",
                     plans=plans,
                     metrics=metrics,
                     error=error,
                 )
         finally:
-            fail_pipeline_run_record(self.root, run_id=self.run_id, error=error)
+            if end_run:
+                self._settle_background()
+                fail_pipeline_run_record(self.root, run_id=self.run_id, error=error)
         self.events.emit("stage_failed", stage, error)
 
     def skip(self, stage: str) -> None:
         shutdown_checkpoint()
+        self._check_background()
         wall_started = time.perf_counter()
+        ordinal = self.ordinal
         stage_started = False
         metrics: PipelineStageMetrics | None = None
         try:
             start_pipeline_stage_record(
                 self.root,
                 run_id=self.run_id,
-                ordinal=self.ordinal,
+                ordinal=ordinal,
                 stage=stage,
             )
             stage_started = True
@@ -267,7 +342,7 @@ class RunLedger:
             finish_pipeline_stage_record(
                 self.root,
                 run_id=self.run_id,
-                ordinal=self.ordinal,
+                ordinal=ordinal,
                 status="skipped",
                 metrics=metrics,
             )
@@ -277,6 +352,7 @@ class RunLedger:
                 if stage_started:
                     self._finish_interrupted(
                         stage=stage,
+                        ordinal=ordinal,
                         error=error,
                         metrics=metrics or self._fallback_metrics(wall_started),
                     )
@@ -288,10 +364,12 @@ class RunLedger:
             if stage_started:
                 self._finish_failed(
                     stage=stage,
+                    ordinal=ordinal,
                     error=error,
                     metrics=metrics or self._fallback_metrics(wall_started),
                 )
             else:
+                self._settle_background()
                 fail_pipeline_run_record(self.root, run_id=self.run_id, error=error)
             raise PipelineExecutionError(self.run_id, stage, error) from error
         self.ordinal += 1
@@ -301,88 +379,131 @@ class RunLedger:
         stage: str,
         action: Callable[[], Sequence[tuple[str, ArtifactRef]]],
     ) -> tuple[tuple[str, ArtifactRef], ...]:
+        return self._finish(self._start(stage, action, background=False))
+
+    @contextmanager
+    def overlapping(
+        self,
+        stage: str,
+        action: Callable[[], Sequence[tuple[str, ArtifactRef]]],
+    ) -> Iterator[None]:
+        """Run ``stage`` on a worker thread while the block runs later stages.
+
+        Stages in the block must not read this stage's outputs, and the stage
+        must follow the threading rules of ``BackgroundTask``.
+        """
+        started = self._start(stage, action, background=True)
+        try:
+            yield
+        except BaseException:
+            self._settle_background()
+            raise
+        if started in self.background:
+            self.background.remove(started)
+            self._finish(started)
+
+    def _start(
+        self,
+        stage: str,
+        action: Callable[[], Sequence[tuple[str, ArtifactRef]]],
+        *,
+        background: bool,
+    ) -> _StartedStage:
         shutdown_checkpoint()
+        self._check_background()
         wall_started = time.perf_counter()
+        ordinal = self.ordinal
         try:
             start_pipeline_stage_record(
                 self.root,
                 run_id=self.run_id,
-                ordinal=self.ordinal,
+                ordinal=ordinal,
                 stage=stage,
             )
         except Exception as error:
+            self._settle_background()
             fail_pipeline_run_record(self.root, run_id=self.run_id, error=error)
             raise PipelineExecutionError(self.run_id, stage, error) from error
+        self.ordinal += 1
         logger.info(f"Running pipeline stage: {stage.replace('_', ' ')}")
         self.events.emit("stage_started", stage)
-        outputs: tuple[tuple[str, ArtifactRef], ...] = ()
-        action_completed = False
-        caught: BaseException | None = None
-        with sample_process_tree_rss() as read_rss:
-            with artifact_plan_scope() as plans:
-                try:
-                    outputs = tuple(action())
-                    action_completed = True
-                    shutdown_checkpoint()
-                except BaseException as error:
-                    caught = error
-        metrics = stage_metrics(
-            wall_seconds=time.perf_counter() - wall_started,
-            rss=read_rss(),
+        started = _StartedStage(
+            stage=stage,
+            ordinal=ordinal,
+            task=BackgroundTask(
+                functools.partial(_execute_stage, action, wall_started),
+                name=f"scarf-pipeline-{stage}",
+                inline=not background,
+            ),
         )
-        plan_records = self._plans(plans)
-        if caught is None:
-            try:
-                output_records = self._records(outputs, plans)
-            except Exception as error:
-                caught = error
+        if background:
+            self.background.append(started)
+        return started
+
+    def _finish(
+        self,
+        started: _StartedStage,
+        *,
+        end_run: bool = True,
+    ) -> tuple[tuple[str, ArtifactRef], ...]:
+        """Record a started stage; unless ``end_run`` is False, end the run on error."""
+        outcome = started.task.result()
+        stage, ordinal = started.stage, started.ordinal
+        plan_records = self._plans(outcome.plans)
+        caught = outcome.error
         if caught is None:
             try:
                 finish_pipeline_stage_record(
                     self.root,
                     run_id=self.run_id,
-                    ordinal=self.ordinal,
+                    ordinal=ordinal,
                     status="completed",
-                    outputs=output_records,
+                    outputs=self._records(outcome.outputs, outcome.plans),
                     plans=plan_records,
-                    metrics=metrics,
+                    metrics=outcome.metrics,
                 )
             except Exception as error:
                 caught = error
-        if caught is not None:
-            interruption = interruption_record(caught)
-            if interruption is not None and action_completed:
-                finish_pipeline_stage_record(
-                    self.root,
-                    run_id=self.run_id,
-                    ordinal=self.ordinal,
-                    status="completed",
-                    outputs=self._records(outputs, plans),
-                    plans=plan_records,
-                    metrics=metrics,
-                )
-                self.events.emit("stage_completed", stage)
-                self.ordinal += 1
-                self.interrupt_pending(caught, stage)
-                raise caught
-            if interruption is not None:
-                self._finish_interrupted(
-                    stage=stage,
-                    error=caught,
-                    metrics=metrics,
-                    plans=plan_records,
-                )
-                raise caught
-            if not isinstance(caught, Exception):
-                raise caught
+        if caught is None:
+            self.events.emit("stage_completed", stage)
+            logger.info(f"Completed pipeline stage: {stage.replace('_', ' ')}")
+            return outcome.outputs
+        interruption = interruption_record(caught)
+        if interruption is not None and outcome.completed:
+            finish_pipeline_stage_record(
+                self.root,
+                run_id=self.run_id,
+                ordinal=ordinal,
+                status="completed",
+                outputs=self._records(outcome.outputs, outcome.plans),
+                plans=plan_records,
+                metrics=outcome.metrics,
+            )
+            self.events.emit("stage_completed", stage)
+            if not end_run:
+                return outcome.outputs
+            self.interrupt_pending(caught, stage)
+            raise caught
+        if interruption is not None:
+            self._finish_interrupted(
+                stage=stage,
+                ordinal=ordinal,
+                error=caught,
+                metrics=outcome.metrics,
+                plans=plan_records,
+                end_run=end_run,
+            )
+        elif isinstance(caught, Exception):
             self._finish_failed(
                 stage=stage,
+                ordinal=ordinal,
                 error=caught,
-                metrics=metrics,
+                metrics=outcome.metrics,
                 plans=plan_records,
+                end_run=end_run,
             )
-            raise PipelineExecutionError(self.run_id, stage, caught) from caught
-        self.events.emit("stage_completed", stage)
-        logger.info(f"Completed pipeline stage: {stage.replace('_', ' ')}")
-        self.ordinal += 1
-        return outputs
+            if end_run:
+                raise PipelineExecutionError(self.run_id, stage, caught) from caught
+        if end_run:
+            raise caught
+        return ()

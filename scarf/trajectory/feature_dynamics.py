@@ -14,6 +14,11 @@ __all__ = [
     "validate_pseudotime_regressor",
 ]
 
+# Scratch bytes per input value in aggregate_feature_profiles: the ordered
+# copy, its smoothed replacement, and the temporary used by the standard
+# deviation, with room for the boolean finiteness checks.
+AGGREGATION_SCRATCH_ITEMSIZE = 3 * np.dtype(np.float64).itemsize
+
 
 def validate_pseudotime_regressor(
     values: object,
@@ -84,19 +89,28 @@ def aggregate_feature_profiles(
     smooth: bool,
     z_scale: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Order, smooth, filter, and bin normalized feature profiles."""
-    ordered = np.asarray(values, dtype=float)[ordering_indices]
-    if not np.isfinite(ordered).all():
-        invalid_columns = np.asarray(feature_indices)[~np.isfinite(ordered).all(axis=0)]
+    """Order, smooth, filter, and bin normalized feature profiles.
+
+    ``values`` is cells by features and is not modified. Besides the input,
+    the calculation holds at most :data:`AGGREGATION_SCRATCH_ITEMSIZE` bytes
+    per value, because smoothing and scaling reuse one ordered copy.
+    """
+    values = np.asarray(values, dtype=float)
+    mean_expression = values.mean(axis=0)
+    # Fancy indexing returns a new C-order array, which can be updated in
+    # place and gives the column reductions a fixed summation order.
+    ordered = np.ascontiguousarray(values[ordering_indices])
+    finite_columns = np.isfinite(ordered).all(axis=0)
+    if not finite_columns.all():
+        invalid_columns = np.asarray(feature_indices)[~finite_columns]
         raise ValueError(
             f"Normalized features contain non-finite values: {invalid_columns.tolist()}"
         )
     if smooth:
         ordered = rolling_window(ordered, window_size)
-    if not np.isfinite(ordered).all():
-        raise ValueError("Smoothed feature profiles contain non-finite values")
+        if not np.isfinite(ordered).all():
+            raise ValueError("Smoothed feature profiles contain non-finite values")
 
-    mean_expression = np.asarray(values, dtype=float).mean(axis=0)
     standard_deviation = ordered.std(axis=0)
     valid_features = (
         (mean_expression > min_expression)
@@ -104,18 +118,19 @@ def aggregate_feature_profiles(
         & (standard_deviation > np.finfo(float).eps)
     )
     if z_scale:
-        processed = np.zeros_like(ordered, dtype=float)
-        processed[:, valid_features] = (
-            ordered[:, valid_features] - ordered[:, valid_features].mean(axis=0)
-        ) / standard_deviation[valid_features]
-    else:
-        processed = ordered.copy()
-        processed[:, ~valid_features] = 0.0
+        # Scale in place. Reducing only the retained columns keeps the
+        # established floating-point summation order of their means.
+        column_mean = np.zeros(ordered.shape[1], dtype=np.float64)
+        if valid_features.any():
+            column_mean[valid_features] = ordered[:, valid_features].mean(axis=0)
+        ordered -= column_mean
+        ordered /= np.where(valid_features, standard_deviation, 1.0)
+    ordered[:, ~valid_features] = 0.0
 
     binned = np.stack(
         [
             bin_values.mean(axis=0)
-            for bin_values in np.array_split(processed, n_bins, axis=0)
+            for bin_values in np.array_split(ordered, n_bins, axis=0)
         ],
         axis=1,
     )
@@ -204,19 +219,21 @@ def knn_clustering(
         )
 
     def make_clusters(matrix: "csr_matrix", n_cluster: int) -> np.ndarray:
-        from ..clustering.paris import (
-            fit_paris_hierarchy,
-            hierarchy_to_dendrogram,
-            straight_cut,
-        )
+        from ..clustering.paris import fit_paris_hierarchy, fixed_cut
 
         logger.debug("Pseudotime modules: clustering modules")
         hierarchy = fit_paris_hierarchy(
             matrix,
             nthreads=nthreads,
         )
-        dendrogram = hierarchy_to_dendrogram(hierarchy)
-        return straight_cut(dendrogram, n_cluster)
+        n_components = int(np.count_nonzero(hierarchy.synthetic_joins)) + 1
+        if 1 < n_cluster < n_components:
+            raise ValueError(
+                f"The feature KNN graph has {n_components} disconnected "
+                f"components, which cannot form n_clusters={n_cluster} modules. "
+                "Increase n_neighbours or n_clusters."
+            )
+        return fixed_cut(hierarchy, n_cluster)
 
     def fix_cluster_order(
         data: "scarf.matrix.ChunkedArray",

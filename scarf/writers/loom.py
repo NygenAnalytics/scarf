@@ -91,6 +91,7 @@ class LoomToZarr:
     def _ini_cell_data(self) -> None:
         from ..storage.arrays import create_zarr_obj_array
         from ..storage.schema import create_cell_data
+        from ._store import skip_reserved_metadata_columns
 
         ids = np.array(self.loom.cell_ids())
         cell_group = create_cell_data(
@@ -100,7 +101,7 @@ class LoomToZarr:
             names=ids,
             profile=self.profile,
         )
-        for i, j in self.loom.get_cell_attrs():
+        for i, j in skip_reserved_metadata_columns(self.loom.get_cell_attrs(), "cell"):
             try:
                 create_zarr_obj_array(
                     cell_group,
@@ -114,6 +115,7 @@ class LoomToZarr:
 
     def _ini_feature_data(self) -> None:
         from ..storage.arrays import create_zarr_obj_array
+        from ._store import skip_reserved_metadata_columns
 
         if self.workspace is None:
             feat_group = as_zarr_group(
@@ -125,7 +127,9 @@ class LoomToZarr:
                 self.z[f"{self.workspace}/{self.assayName}/featureData"],
                 name=f"{self.workspace}/{self.assayName}/featureData",
             )
-        for i, j in self.loom.get_feature_attrs():
+        for i, j in skip_reserved_metadata_columns(
+            self.loom.get_feature_attrs(), "feature"
+        ):
             create_zarr_obj_array(
                 feat_group,
                 i,
@@ -147,8 +151,9 @@ class LoomToZarr:
             None
         """
         from ..storage.budget import ResourceBudget
+        from ..storage.identity import CountSummary, finalize_counts
         from ..storage.partition import affordable_width
-        from ..storage.sharding import _writer_count, write_dense_from_row_batches
+        from ..storage.sharding import plan_dense_write, write_dense_from_row_batches
         from ..storage.schema import load_count_array
 
         if batch_size < 1:
@@ -182,16 +187,19 @@ class LoomToZarr:
                 + cache_bytes
             )
 
+        summary = CountSummary(store)
+
         def fits(rows: int) -> bool:
             remaining = self.resources.memoryBytes - producer_bytes(rows)
             if remaining < 1:
                 return False
             try:
-                _writer_count(
+                plan_dense_write(
                     store,
                     ResourceBudget(remaining, self.resources.workers),
                     1,
                     io=self.io,
+                    residentBytes=summary.nbytes,
                 )
             except MemoryError:
                 return False
@@ -203,20 +211,15 @@ class LoomToZarr:
                 "Loom import cannot fit one source row and one destination row band "
                 "within mem_budget"
             )
-        writer_resources = (
-            ResourceBudget(
-                self.resources.memoryBytes - producer_bytes(rows),
-                self.resources.workers,
-            )
-            if rows
-            else self.resources
-        )
         total_cells_written = write_dense_from_row_batches(
             store,
             self.loom.consume_dense(max(1, rows)),
-            resources=writer_resources,
+            resources=self.resources,
+            residentBytes=summary.nbytes,
+            producerReserveBytes=producer_bytes(rows),
             msg="Writing Loom counts",
             io=self.io,
+            countSummary=summary,
         )
         if total_cells_written != self.loom.nCells:
             raise AssertionError(
@@ -227,6 +230,7 @@ class LoomToZarr:
             f"Wrote {self.loom.nCells} cells and {self.loom.nFeatures} features "
             f"from Loom to assay {self.assayName}"
         )
+        finalize_counts(store, summary=summary)
         from .counts_t import finalize_writer_counts_t
 
         finalize_writer_counts_t(

@@ -6,14 +6,15 @@ from typing import Any, cast
 import numpy as np
 import pandas as pd
 
+from ..metadata.rows import apply_missing_mask
 from ..storage.artifacts import ArtifactRef
 from ._contracts import CategoricalScale, ColorScale, PlotProvenance, SizeScale
 from ._deps import require_matplotlib
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
+from ..utils.arrays import sort_categories
 from ._style import (
     apply_figure_chrome,
     continuous_norm,
-    sort_categories,
     theme_context,
 )
 
@@ -127,18 +128,20 @@ def _hierarchy_positions(
 
 def _tree_color_series(
     values: np.ndarray,
+    missing: np.ndarray | None,
     *,
     force_ints_as_cats: bool,
 ) -> tuple[pd.Series, bool]:
-    series = pd.Series(values)
+    stored_dtype = pd.Series(values).dtype
+    categorical = (
+        pd.api.types.is_bool_dtype(stored_dtype)
+        or pd.api.types.is_string_dtype(stored_dtype)
+        or isinstance(stored_dtype, pd.CategoricalDtype)
+        or (pd.api.types.is_integer_dtype(stored_dtype) and force_ints_as_cats)
+    )
+    series = pd.Series(apply_missing_mask(values, missing, labels=categorical))
     if series.nunique() == 1:
         return pd.Series(np.ones(len(series)), index=series.index), False
-    categorical = (
-        pd.api.types.is_bool_dtype(series.dtype)
-        or pd.api.types.is_string_dtype(series.dtype)
-        or isinstance(series.dtype, pd.CategoricalDtype)
-        or (pd.api.types.is_integer_dtype(series.dtype) and force_ints_as_cats)
-    )
     if categorical:
         return series.astype("category"), True
     return series.astype(np.float64), False
@@ -235,6 +238,7 @@ def cluster_tree(
     using_clusters = prepared["color_values"] is None
     color_values, categorical = _tree_color_series(
         raw_color_values,
+        prepared["color_missing"],
         force_ints_as_cats=force_ints_as_cats,
     )
 

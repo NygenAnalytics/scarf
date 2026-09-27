@@ -56,6 +56,7 @@ class FeatureTable:
 
 class ReadOnlyStore:
     assay_names = ["RNA"]
+    zw = SimpleNamespace(attrs={"assayTypes": {"RNA": "RNA"}})
 
     def __init__(self) -> None:
         self.features = FeatureTable()
@@ -290,6 +291,17 @@ def test_data_enrichment_batches_grounded_multimodal_evidence(
 
     class Store:
         assay_names = list(assay_features)
+        zw = SimpleNamespace(
+            attrs={
+                "assayTypes": {
+                    "RNA": "RNA",
+                    "peaks": "ATAC",
+                    "proteins": "ADT",
+                    "hashes": "HTO",
+                    "guides": "CRISPR",
+                }
+            }
+        )
 
         def __init__(self) -> None:
             self.assays = {
@@ -299,21 +311,6 @@ def test_data_enrichment_batches_grounded_multimodal_evidence(
 
         def get_assay(self, assay_name: str) -> SimpleNamespace:
             return self.assays[assay_name]
-
-        def summary(self) -> SimpleNamespace:
-            assay_types = {
-                "RNA": "RNA",
-                "peaks": "ATAC",
-                "proteins": "ADT",
-                "hashes": "HTO",
-                "guides": "CRISPR",
-            }
-            return SimpleNamespace(
-                assays=[
-                    SimpleNamespace(name=name, assay_type=assay_type)
-                    for name, assay_type in assay_types.items()
-                ]
-            )
 
     def inspect_characterization(_store, **kwargs):
         assay_name = kwargs["assays"][0]

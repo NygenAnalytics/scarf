@@ -29,10 +29,11 @@ from ..storage.artifacts import (
 from ..storage.errors import ArtifactResolutionError
 from ..storage.feature_selection import resolve_feature_selection
 from ..storage.geometry import array_geometry
+from ..storage.identity import read_dataset_fingerprint
 from ..storage.partition import row_band
 from ..storage.profiles import StorageProfile
 from ..storage.selections import validate_stored_selection_integrity
-from ..storage.types import as_zarr_array
+from ..storage.types import as_zarr_array, as_zarr_group
 from .models import MappingResult, _MappingResultAxes
 from .reference import MappingReference
 
@@ -50,7 +51,7 @@ _INPUT_NAMES = frozenset(
     {
         "cell_selection",
         "feature_selection",
-        "selected_expression_fingerprint",
+        "query_dataset_fingerprint",
         "query_batch_fingerprint",
         "query_batch_count",
         "mapping_reference",
@@ -62,7 +63,7 @@ _DIAGNOSTIC_NAMES = frozenset(
         "featureCoverage",
         "queryBatchCount",
         "algorithmVariant",
-        "zeroNormCellCount",
+        "uninformativeCellCount",
         "queryScaledDispersion",
     }
 )
@@ -289,7 +290,7 @@ def plan_projection(
     correction_method: str,
     cell_selection: ArtifactRef,
     feature_selection: ArtifactRef,
-    selected_expression_fingerprint: str,
+    query_dataset_fingerprint: str,
     query_batch_fingerprint: str,
     query_batch_count: int,
     mapping_reference: ExternalArtifactRef,
@@ -313,9 +314,9 @@ def plan_projection(
     correction = _nonempty_string(correction_method, "correction_method")
     if correction not in {"none", "symphony"}:
         raise ValueError("correction_method must be 'none' or 'symphony'")
-    expression_fingerprint = _nonempty_string(
-        selected_expression_fingerprint,
-        "selected_expression_fingerprint",
+    dataset_fingerprint = _nonempty_string(
+        query_dataset_fingerprint,
+        "query_dataset_fingerprint",
     )
     batch_fingerprint = _nonempty_string(
         query_batch_fingerprint,
@@ -383,7 +384,7 @@ def plan_projection(
         inputs={
             "cell_selection": cell_selection,
             "feature_selection": feature_selection,
-            "selected_expression_fingerprint": expression_fingerprint,
+            "query_dataset_fingerprint": dataset_fingerprint,
             "query_batch_fingerprint": batch_fingerprint,
             "query_batch_count": resolved_query_batch_count,
             "mapping_reference": external,
@@ -505,9 +506,9 @@ def _load_projection(
         scope="assay",
         assay=assay,
     )
-    _nonempty_string(
-        inputs["selected_expression_fingerprint"],
-        "selected_expression_fingerprint",
+    query_dataset_fingerprint = _nonempty_string(
+        inputs["query_dataset_fingerprint"],
+        "query_dataset_fingerprint",
     )
     _nonempty_string(
         inputs["query_batch_fingerprint"],
@@ -539,6 +540,7 @@ def _load_projection(
         reference.selected_cell_count,
         "Mapping reference selected_cell_count",
     )
+    _validate_query_dataset_fingerprint(root, assay, query_dataset_fingerprint)
     validated_cells = _validate_cell_selection(
         root,
         cell_selection,
@@ -773,15 +775,17 @@ def _validated_diagnostics(
         and algorithm_variant != expected_algorithm_variant
     ):
         raise ValueError("algorithmVariant does not match the correction method")
-    zero_norm_count = _nonnegative_int(
-        diagnostics["zeroNormCellCount"],
-        "zeroNormCellCount",
+    uninformative_cell_count = _nonnegative_int(
+        diagnostics["uninformativeCellCount"],
+        "uninformativeCellCount",
     )
-    if zero_norm_count > n_cells:
-        raise ValueError("zeroNormCellCount cannot exceed the projection cell count")
-    if zero_norm_count != uninformative_count:
+    if uninformative_cell_count > n_cells:
         raise ValueError(
-            "zeroNormCellCount must equal the number of uninformative rows"
+            "uninformativeCellCount cannot exceed the projection cell count"
+        )
+    if uninformative_cell_count != uninformative_count:
+        raise ValueError(
+            "uninformativeCellCount must equal the number of uninformative rows"
         )
     dispersion = diagnostics["queryScaledDispersion"]
     if (
@@ -795,7 +799,7 @@ def _validated_diagnostics(
         "featureCoverage": float(feature_coverage),
         "queryBatchCount": query_batch_count,
         "algorithmVariant": algorithm_variant,
-        "zeroNormCellCount": zero_norm_count,
+        "uninformativeCellCount": uninformative_cell_count,
         "queryScaledDispersion": float(dispersion),
     }
 
@@ -809,6 +813,19 @@ def _validate_projection_ref(ref: ArtifactRef) -> str:
     ):
         raise ValueError("Expected an assay-scoped projection ArtifactRef")
     return ref.assay
+
+
+def _validate_query_dataset_fingerprint(
+    root: zarr.Group,
+    assay: str,
+    fingerprint: str,
+) -> None:
+    live = read_dataset_fingerprint(as_zarr_group(root[assay], name=assay))
+    if fingerprint != live:
+        raise ValueError(
+            "Projection query dataset fingerprint does not match the prepared "
+            f"query assay {assay!r}"
+        )
 
 
 def _validate_external_mapping_reference(

@@ -34,6 +34,14 @@ from scarf.writers import SparseToZarr
 def summary_datastore(toy_crdir_writer: str, tmp_path: Path) -> DataStore:
     location = tmp_path / "summary.zarr"
     shutil.copytree(toy_crdir_writer, location)
+    root = zarr.open_group(str(location), mode="r+")
+    for group in [
+        root,
+        *(group for _, group in root.groups() if group.attrs.get("is_assay")),
+    ]:
+        for name in ("artifacts", "pipeline"):
+            if name in group:
+                del group[name]
     return DataStore(
         str(location),
         default_assay="RNA",
@@ -368,7 +376,7 @@ def test_summary_does_not_mutate_read_only_store(
     location = tmp_path / "read-only.zarr"
     _create_minimal_datastore(location)
     root = zarr.open_group(str(location), mode="r+")
-    root["RNA"].attrs.pop("dataset_fingerprint", None)
+    fingerprint = root["RNA"].attrs["dataset_fingerprint"]
     del root
 
     datastore = DataStore(
@@ -383,9 +391,9 @@ def test_summary_does_not_mutate_read_only_store(
     summary = datastore.summary()
 
     assert _file_snapshot(location) == before
-    assert all(assay.dataset_fingerprint is None for assay in summary.assays)
+    assert all(assay.dataset_fingerprint == fingerprint for assay in summary.assays)
     reopened = zarr.open_group(str(location), mode="r")
-    assert "dataset_fingerprint" not in reopened["RNA"].attrs
+    assert reopened["RNA"].attrs["dataset_fingerprint"] == fingerprint
 
 
 def test_summarize_zarr_readonly_does_not_write_default_assay(tmp_path: Path) -> None:

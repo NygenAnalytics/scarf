@@ -7,6 +7,8 @@ from typing import Any
 import numpy as np
 
 from ..assay import RNAassay
+from ..clustering.leiden import canonical_resolution
+from ..quality_control.filtering import validate_filter_bounds
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,15 +68,6 @@ def _column_sequence(value: Any, name: str) -> tuple[str, ...]:
     return columns
 
 
-def _canonical_resolution(value: Any) -> tuple[str, float]:
-    if isinstance(value, bool) or not isinstance(value, Real):
-        raise TypeError("Leiden resolutions must be numbers")
-    resolved = float(value)
-    if not math.isfinite(resolved) or resolved <= 0:
-        raise ValueError("Leiden resolutions must be finite and positive")
-    return str(resolved), resolved
-
-
 def _resolve_leiden(
     value: Mapping[str, object] | bool,
 ) -> tuple[tuple[str, float], ...]:
@@ -97,7 +90,10 @@ def _resolve_leiden(
         Sequence,
     ):
         raise TypeError("leiden partitions must be a non-empty sequence")
-    partitions = tuple(_canonical_resolution(item) for item in raw_partitions)
+    partitions = tuple(
+        (str(resolution), resolution)
+        for resolution in map(canonical_resolution, raw_partitions)
+    )
     if not partitions:
         raise ValueError("leiden partitions must not be empty")
     keys = [key for key, _resolution in partitions]
@@ -115,14 +111,13 @@ def _default_filter_columns(store: Any, assay: str) -> tuple[str, ...]:
 
 
 def _manual_bound(value: Any, name: str) -> float | int | None:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, Real):
+    """Return one validated pipeline bound in canonical form.
+
+    The pipeline filters numeric QC columns, so text bounds are rejected.
+    """
+    if isinstance(value, str):
         raise TypeError(f"{name} values must be finite numbers or None")
-    resolved = float(value)
-    if not math.isfinite(resolved):
-        raise ValueError(f"{name} values must be finite; use None for no bound")
-    return int(value) if isinstance(value, int) else resolved
+    return value if value is None or isinstance(value, int) else float(value)
 
 
 def _finite_real(value: Any, name: str) -> float:
@@ -178,8 +173,7 @@ def _resolve_filtering(
         if len(lows) != len(attrs) or len(highs) != len(attrs):
             raise ValueError("Manual filtering bounds must align with attrs")
         keep_bounds = options.get("keep_bounds", False)
-        if not isinstance(keep_bounds, bool):
-            raise TypeError("keep_bounds must be a boolean")
+        validate_filter_bounds(lows, highs, keep_bounds=keep_bounds)
         return {
             "enabled": True,
             "method": "manual",

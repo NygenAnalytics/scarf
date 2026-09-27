@@ -1,4 +1,5 @@
 from collections.abc import Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 import numpy as np
@@ -18,6 +19,7 @@ from ..storage.selections import (
     snapshot_run_metadata,
 )
 from ..storage.types import as_zarr_array
+from ..storage.validation_scope import validation_scoped
 from ..utils.logging import logger
 from ..utils.shutdown import (
     ShutdownToken,
@@ -107,6 +109,9 @@ class PipelineAccessor:
         )
         return PipelineRun(self._store, record)
 
+    # One run validates each input once across its stages; artifacts are
+    # immutable and prepared cell IDs cannot change during the run.
+    @validation_scoped
     def run(
         self,
         *,
@@ -384,77 +389,82 @@ class PipelineAccessor:
 
         ledger.run("connectivity", connectivity_stage)
 
+        def initialization_stage() -> Sequence[tuple[str, ArtifactRef]]:
+            ref = store.build_embedding_initialization(coordinates)
+            artifacts["embedding_initialization"] = ref
+            return (("embedding_initialization", ref),)
+
         if recipe.umap:
-
-            def initialization_stage() -> Sequence[tuple[str, ArtifactRef]]:
-                ref = store.build_embedding_initialization(coordinates)
-                artifacts["embedding_initialization"] = ref
-                return (("embedding_initialization", ref),)
-
             ledger.run("embedding_initialization", initialization_stage)
-
-            def umap_stage() -> Sequence[tuple[str, ArtifactRef]]:
-                ref = store._run_umap_artifact(
-                    artifacts["connectivity_map"],
-                    artifacts["embedding_initialization"],
-                )
-                artifacts["umap"] = ref
-                return (("umap", ref),)
-
-            ledger.run("umap", umap_stage)
         else:
             ledger.skip("embedding_initialization")
+
+        def umap_stage() -> Sequence[tuple[str, ArtifactRef]]:
+            ref = store._run_umap_artifact(
+                artifacts["connectivity_map"],
+                artifacts["embedding_initialization"],
+            )
+            artifacts["umap"] = ref
+            return (("umap", ref),)
+
+        # UMAP runs beside the graph clustering stages. It neither scans thread
+        # pools nor loads extensions, and it finishes before the doublet and
+        # marker stages, which plan their memory against the budget.
+        umap: AbstractContextManager[None] = nullcontext()
+        if recipe.umap:
+            umap = ledger.overlapping("umap", umap_stage)
+        else:
             ledger.skip("umap")
+        with umap:
+            for key, resolution in recipe.leiden_partitions:
+                output_key = f"leiden_{key}"
 
-        for key, resolution in recipe.leiden_partitions:
-            output_key = f"leiden_{key}"
+                def leiden_stage(
+                    output_key: str = output_key,
+                    resolution: float = resolution,
+                ) -> Sequence[tuple[str, ArtifactRef]]:
+                    ref = store._run_leiden_artifact(
+                        artifacts["connectivity_map"],
+                        resolution=resolution,
+                    )
+                    artifacts[output_key] = ref
+                    return ((output_key, ref),)
 
-            def leiden_stage(
-                output_key: str = output_key,
-                resolution: float = resolution,
-            ) -> Sequence[tuple[str, ArtifactRef]]:
-                ref = store._run_leiden_artifact(
-                    artifacts["connectivity_map"],
-                    resolution=resolution,
-                )
-                artifacts[output_key] = ref
-                return ((output_key, ref),)
+                ledger.run(output_key, leiden_stage)
 
-            ledger.run(output_key, leiden_stage)
+            if recipe.paris:
 
-        if recipe.paris:
+                def paris_stage() -> Sequence[tuple[str, ArtifactRef]]:
+                    ref = store._run_paris_artifact(artifacts["connectivity_map"])
+                    artifacts["paris"] = ref
+                    return (("paris", ref),)
 
-            def paris_stage() -> Sequence[tuple[str, ArtifactRef]]:
-                ref = store._run_paris_artifact(artifacts["connectivity_map"])
-                artifacts["paris"] = ref
-                return (("paris", ref),)
+                ledger.run("paris", paris_stage)
+            else:
+                ledger.skip("paris")
 
-            ledger.run("paris", paris_stage)
-        else:
-            ledger.skip("paris")
+            clustering_candidates = [
+                (f"leiden_{key}", artifacts[f"leiden_{key}"])
+                for key, _resolution in recipe.leiden_partitions
+            ]
+            if clustering_candidates:
 
-        clustering_candidates = [
-            (f"leiden_{key}", artifacts[f"leiden_{key}"])
-            for key, _resolution in recipe.leiden_partitions
-        ]
-        if clustering_candidates:
+                def cluster_selection_stage() -> Sequence[tuple[str, ArtifactRef]]:
+                    decision, selected_key, selected_ref = run_cluster_selection(
+                        store,
+                        coordinates=coordinates,
+                        connectivity_map=artifacts["connectivity_map"],
+                        cell_selection=analysis_selection,
+                        candidates=clustering_candidates,
+                    )
+                    artifacts["cluster_selection"] = decision
+                    artifacts["clusters"] = selected_ref
+                    logger.info(f"Selected clustering candidate: {selected_key}")
+                    return (("cluster_selection", decision),)
 
-            def cluster_selection_stage() -> Sequence[tuple[str, ArtifactRef]]:
-                decision, selected_key, selected_ref = run_cluster_selection(
-                    store,
-                    coordinates=coordinates,
-                    connectivity_map=artifacts["connectivity_map"],
-                    cell_selection=analysis_selection,
-                    candidates=clustering_candidates,
-                )
-                artifacts["cluster_selection"] = decision
-                artifacts["clusters"] = selected_ref
-                logger.info(f"Selected clustering candidate: {selected_key}")
-                return (("cluster_selection", decision),)
-
-            ledger.run("cluster_selection", cluster_selection_stage)
-        else:
-            ledger.skip("cluster_selection")
+                ledger.run("cluster_selection", cluster_selection_stage)
+            else:
+                ledger.skip("cluster_selection")
 
         doublet_graph = artifacts["connectivity_map"]
         if recipe.doublets and recipe.harmony_batch_columns:

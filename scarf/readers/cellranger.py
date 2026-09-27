@@ -1,4 +1,3 @@
-import math
 from abc import ABC, abstractmethod
 from collections.abc import Generator, Iterator, Sequence
 from typing import Any
@@ -6,7 +5,6 @@ from typing import Any
 import h5py
 import numpy as np
 import pandas as pd
-from numpy.typing import DTypeLike
 from scipy.sparse import coo_matrix
 
 from ..utils.logging import logger
@@ -16,6 +14,7 @@ from ._assay_names import (
     auto_name_feat_table,
     make_feat_table_from_types,
 )
+from ..utils.arrays import has_duplicates
 
 
 class CrReader(ABC):
@@ -58,7 +57,8 @@ class CrReader(ABC):
 
         Args:
             batch_size: Number of cells per yielded chunk.
-            lines_in_mem: MTX lines buffered in memory (CrDirReader only).
+            lines_in_mem: MTX lines buffered in memory (Matrix Market readers
+                only).
 
         Yields:
             scipy.sparse.coo_matrix chunks.
@@ -153,7 +153,7 @@ class CrReader(ABC):
         if not np.issubdtype(index_array.dtype, np.integer):
             raise TypeError("indexes must contain only integers")
         index_array = index_array.astype(np.int64, copy=False)
-        if np.unique(index_array).size != index_array.size:
+        if has_duplicates(index_array):
             raise ValueError("indexes must contain unique feature indexes")
         if np.any(index_array < 0) or np.any(index_array >= self.nFeatures):
             raise IndexError("indexes contains an out-of-range feature index")
@@ -501,269 +501,3 @@ class CrH5Reader(CrReader):
     def close(self) -> None:
         """Closes file connection."""
         self.h5obj.close()
-
-
-class CrDirReader(CrReader):
-    """A class to read in CellRanger (Cr) data, in the form of a directory.
-
-    Subclass of CrReader.
-
-    Args:
-        loc (str): Path for the directory containing the cellranger output.
-        mtx_separator (str): Column delimiter in the MTX file (Default value: ' ')
-        index_offset (int): This value is added to each feature index (Default value: -1)
-
-    Attributes:
-        loc: Path for the directory containing the cellranger output.
-        matFn: The file name for the matrix file.
-        sep (str): Column delimiter in the MTX file (Default value: ' ')
-        indexOffset (int): This value is added to each feature index (Default value: -1)
-    """
-
-    def __init__(
-        self,
-        loc: str,
-        mtx_separator: str = " ",
-        index_offset: int = -1,
-        is_filtered: bool = True,
-        filtering_cutoff: int = 500,
-    ) -> None:
-        from .mtx import _MtxEngine, inspect_mtx
-
-        self.loc: str = loc.rstrip("/") + "/"
-        self.sep = mtx_separator
-        self.indexOffset = index_offset
-        candidates = inspect_mtx(loc)
-        if len(candidates) != 1:
-            raise ValueError(
-                "CrDirReader requires one complete Matrix Market triplet; "
-                "use inspect_mtx and MtxReader to select among candidates"
-            )
-        self._engine = _MtxEngine(
-            candidates[0],
-            cell_id_key=None,
-            separator=mtx_separator,
-            index_offset=index_offset,
-            is_filtered=is_filtered,
-            filtering_cutoff=filtering_cutoff,
-            temp_dir=None,
-            dtype=np.uint32,
-        )
-        self.matFn = self._engine.matrixPath
-        self.validBarcodeIdx = self._engine.validCellIndexes - self.indexOffset
-        self.matrixEntryCount = self._engine.matrixEntryCount
-        self.coordinateOrder = self._engine.coordinateOrder
-        CrReader.__init__(
-            self,
-            {
-                "feature_ids": "feature_ids",
-                "feature_names": "feature_names",
-                "feature_types": "feature_types",
-                "cell_names": "cell_names",
-            },
-        )
-        self.nCells = self._engine.nCells
-
-    def _handle_version(self) -> dict[str, str]:
-        return {
-            "feature_ids": "feature_ids",
-            "feature_names": "feature_names",
-            "feature_types": "feature_types",
-            "cell_names": "cell_names",
-        }
-
-    def _read_dataset(self, key: str | None = None) -> list[str]:
-        if key is None:
-            raise ValueError("Dataset key must be provided")
-        values = {
-            "feature_ids": self._engine.feature_ids,
-            "feature_names": self._engine.feature_names,
-            "feature_types": self._engine.feature_types,
-            "cell_names": self._engine.cell_names,
-        }
-        if key not in values:
-            raise KeyError(key)
-        return values[key]()
-
-    def read_header(self) -> pd.DataFrame:
-        return pd.DataFrame(
-            [
-                {
-                    "nFeatures": self._engine.nFeatures,
-                    "nCells": self._engine.rawCellCount,
-                    "nCounts": self._engine.matrixEntryCount,
-                }
-            ]
-        )
-
-    def process_batch(
-        self, dfs: list[pd.DataFrame], filtering_cutoff: int
-    ) -> np.ndarray:
-        """Returns a list of valid barcodes after filtering out background barcodes for a given batch.
-
-        Args:
-            dfs: A Polar DataFrame containing a chunk of data from the MTX file.
-            filtering_cutoff: The cutoff value for filtering out background barcodes
-        """
-        merged = pd.concat(dfs, ignore_index=True)
-        summed = merged.groupby("barcode")["count"].sum()
-        valid = summed[summed > filtering_cutoff].index.to_numpy()
-        return np.sort(valid)
-
-    def _get_valid_barcodes(
-        self,
-        filtering_cutoff: int,
-        batch_size: int = int(10e3),
-        lines_in_mem: int = int(10e5),
-    ) -> np.ndarray:
-        """Returns a list of valid barcodes after filtering out background barcodes.
-
-        Args:
-            filtering_cutoff: The cutoff value for filtering out background barcodes.
-            batch_size: The number of barcodes to process in each batch.
-            lines_in_mem: The number of lines to read into memory
-        """
-        test_counter = 0
-        matrixIO = pd.read_csv(
-            self.matFn,
-            comment="%",
-            sep=self.sep,
-            header=0,
-            chunksize=lines_in_mem,
-            names=["gene", "barcode", "count"],
-        )
-
-        header = self.read_header()
-        nChunks = math.ceil(header["nCounts"][0] / lines_in_mem)
-        test_counter = 0
-        valid_idx = []
-        start = 1
-
-        dfs = []
-        for chunk in iter_progress(
-            # range(nChunks),
-            matrixIO,
-            total=nChunks,
-            desc="Filtering out background barcodes",
-        ):
-            if (
-                (chunk.iloc[-1]["barcode"] - start) >= batch_size
-            ):  # If the last "cell id" is greater than the start + batch size
-                # Filter rows in the current chunk that belong to the current batch
-                idx = np.array(
-                    chunk["barcode"].values < (batch_size + start)
-                )  # This is the crucial line. This makes sure that if any cell ID is spread over multiple chunks, it is not missed, as any cell ID that is less than the batch size + start is included.
-                # If no rows belong to the current batch, move to the next batch.
-                if idx.sum() == 0:
-                    dfs.append(chunk)
-                    start += batch_size
-                    test_counter += len(chunk)
-                    continue
-                # Process the rows belonging to the current batch
-                mask_pos = np.where(idx)[0]
-                mask_neg = np.where(~idx)[0]
-                dfs.append(chunk.iloc[mask_pos])
-                valid_idx.append(self.process_batch(dfs, filtering_cutoff))
-                # Prepare for the next batch
-                del dfs
-                dfs = [chunk.iloc[mask_neg]]
-                start += batch_size
-            else:
-                # If we haven't reached the batch boundary, accumulate the chunk
-                dfs.append(chunk)
-            test_counter += len(chunk)
-        # Process any remaining data after the main loop
-        if len(dfs) > 0:
-            valid_idx.append(self.process_batch(dfs, filtering_cutoff))
-        # Verify that all rows were processed
-        assert test_counter == header["nCounts"][0]
-        return np.sort(np.unique(np.hstack(valid_idx)))
-
-    def to_sparse(self, a: np.ndarray, dtype: DTypeLike) -> coo_matrix:
-        """Returns the input data as a sparse (COO) matrix.
-
-        Args:
-            a: Sparse matrix, contains a chunk of data from the MTX file.
-            dtype:
-        """
-        c = (a[:, 1] - a[0, 1]).astype(int)
-        return coo_matrix(
-            (
-                a[:, 2],
-                (
-                    c,
-                    (a[:, 0] + self.indexOffset).astype(int),
-                ),
-            ),
-            shape=(c[-1] + 1, self.nFeatures),
-            dtype=dtype,
-        )
-
-    def cell_names(self) -> list[str]:
-        """Returns a list of names of the cells in the dataset."""
-        return self._engine.cell_names()
-
-    def rename_batches(self, collect: list[pd.DataFrame]) -> np.ndarray:
-        df = pd.concat(collect, ignore_index=True)
-        barcodes = df["barcode"].to_numpy()
-        count_hash = {}
-        for i, x in enumerate(np.unique(barcodes)):
-            count_hash[x] = i
-        cell_idx = np.array([count_hash[x] for x in barcodes])
-        df = df.copy()
-        df["barcode"] = cell_idx
-        return np.array(df)
-
-    def producer_staging_bytes(
-        self,
-        batch_size: int,
-        lines_in_mem: int,
-    ) -> int:
-        return self._engine.producer_staging_bytes(
-            batch_size,
-            lines_in_mem,
-        )
-
-    def max_window_nnz(self, window_rows: int) -> int:
-        return self._engine.max_window_nnz(window_rows)
-
-    @property
-    def matrix_dtype(self) -> np.dtype[Any]:
-        return self._engine.matrixDtype
-
-    # noinspection DuplicatedCode
-    def consume(
-        self,
-        batch_size: int,
-        lines_in_mem: int = int(1e5),
-        dtype: DTypeLike = np.uint32,
-    ) -> Generator[coo_matrix, None, None]:
-        """Yields chunks of data from the MTX file.
-
-        Args:
-            batch_size: The number of barcodes to process in each batch.
-            lines_in_mem: The number of lines to read into memory.
-            dtype: The data type of the matrix.
-        """
-        yield from self._engine.consume(batch_size, lines_in_mem, dtype)
-
-    def get_cell_columns(self) -> Iterator[tuple[str, np.ndarray]]:
-        yield from self._engine.cell_columns()
-
-    def get_feature_columns(self) -> Iterator[tuple[str, np.ndarray]]:
-        yield from self._engine.feature_columns()
-
-    def _set_sparse_import_lines_in_mem(self, lines_in_mem: int) -> None:
-        self._engine.configure_import_lines(lines_in_mem)
-
-    def _prepare_sparse_import(self) -> None:
-        self._engine.prepare()
-
-    def _release_sparse_import(self) -> None:
-        self._engine.release()
-
-    def _sparse_import_resident_bytes(self) -> int:
-        return self._engine.resident_bytes()
-
-    def close(self) -> None:
-        self._engine.release()

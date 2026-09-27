@@ -1,4 +1,4 @@
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Generator, Iterator, Mapping, Sequence
 from typing import Any, Literal, cast
 
 import numpy as np
@@ -8,18 +8,20 @@ from numba import njit
 
 from ..matrix import ChunkedArray
 from ..metadata import MetaData
-from ..storage.budget import admit_stream
-from ..storage.feature_stream import FeatureStreamPlan, plan_feature_stream
+from ..storage.execution import admit_stream
 from ..storage.geometry import array_geometry
-from ..storage.partition import IndexBlock, row_band
+from ..storage.partition import row_band
 from ..storage.types import as_zarr_array, as_zarr_group
 from ..utils.compute import compute_with_progress
 from ..utils.logging import logger
-from .base import Assay
+from .base import Assay, _stream_byte_count
 from .normalization import (
+    NormalizedValueSource,
+    _feature_group_positions,
     lib_size_feature_stream_eligible,
     norm_lib_size,
     norm_lib_size_log,
+    normalizer_count_arithmetic,
 )
 
 
@@ -56,8 +58,10 @@ def _hvg_stats_gene_major_kernel(
         c_s1 = 0.0
         c_s2 = 0.0
         for i in range(n_selected):
-            cell = selected[i]
-            value = sf * np.float64(values[g, cell]) * inv[i]
+            count = values[g, selected[i]]
+            if count == 0:
+                continue
+            value = sf * np.float64(count) * inv[i]
             if log_transform:
                 value = np.log1p(value)
             if value > 0.0:
@@ -195,31 +199,8 @@ class RNAassay(Assay):
             if not self.z.read_only:
                 self.attrs["size_factor"] = self.sf
         self.scalar: np.ndarray | None = None
-        self._require_counts_t()
 
-    def _require_counts_t(self) -> None:
-        """RNA assays require complete sharded ``countsT`` on Zarr v3."""
-        from ..storage.count_matrix import require_count_matrix_layout
-
-        # Stub construction (tests that monkeypatch Assay.__init__) skips load.
-        if not hasattr(self, "rawDataT"):
-            return
-        if self.rawDataT is None:
-            raise ValueError(
-                f"RNA assay {self.name!r} requires a complete sharded "
-                "countsT matrix. Rebuild with ingest/subset/merge on Zarr v3, "
-                "or run repack_zarr / write_counts_t."
-            )
-        counts_t = self.rawDataT
-        zarr_format = int(getattr(counts_t.metadata, "zarr_format", 3) or 3)
-        if zarr_format < 3:
-            raise ValueError(
-                f"RNA assay {self.name!r} requires Zarr v3 for sharded "
-                "countsT. Repack the store to Zarr v3."
-            )
-        counts = as_zarr_array(self.rawData._backing, name="counts")
-        matrix_group = as_zarr_group(self.matrixGroup, name="matrix")
-        require_count_matrix_layout(matrix_group, counts, counts_t)
+    requiresCountsT = True
 
     def iter_normed_feature_wise(
         self,
@@ -228,6 +209,8 @@ class RNAassay(Assay):
         batch_size: int | None,
         msg: str | None,
         as_dataframe: bool = True,
+        scratch_itemsize: int = 0,
+        resident_bytes: int = 0,
         **norm_params: Any,
     ) -> Generator[pd.DataFrame | tuple[np.ndarray, np.ndarray], None, None]:
         renormalize_subset = bool(norm_params.get("renormalize_subset", False))
@@ -241,6 +224,8 @@ class RNAassay(Assay):
                 batch_size,
                 msg,
                 as_dataframe=as_dataframe,
+                scratch_itemsize=scratch_itemsize,
+                resident_bytes=resident_bytes,
                 **norm_params,
             )
             return
@@ -249,6 +234,8 @@ class RNAassay(Assay):
         feat_idx = np.asarray(feat_idx, dtype=np.int64)
         if cell_idx.ndim != 1 or feat_idx.ndim != 1:
             raise ValueError("cell_idx and feat_idx must be one-dimensional")
+        scratch_itemsize = _stream_byte_count(scratch_itemsize, "scratch_itemsize")
+        resident_bytes = _stream_byte_count(resident_bytes, "resident_bytes")
 
         if msg is None:
             msg = ""
@@ -256,6 +243,8 @@ class RNAassay(Assay):
         sf = self.sf
         if sf is None:
             raise ValueError("RNA library-size normalization requires a size factor")
+        if feat_idx.size == 0:
+            return
         scalar = self._cell_count_totals(cell_idx)
         log_transform = bool(norm_params.get("log_transform", False))
         counts_t = self.rawDataT
@@ -272,12 +261,48 @@ class RNAassay(Assay):
         feat_labels = np.asarray(feat_idx)
         from ..storage.feature_stream import (
             map_feature_read_groups,
-            selected_feature_values,
+            persisted_read_group,
         )
 
-        extra_itemsize = int(np.dtype(np.float32).itemsize) + int(
-            np.dtype(np.float64).itemsize
+        n_cells = int(cell_idx.shape[0])
+        float32_size = int(np.dtype(np.float32).itemsize)
+        float64_size = int(np.dtype(np.float64).itemsize)
+        raw_size = int(np.dtype(counts_t.dtype).itemsize)
+        # Per emitted value: the float64 batch being filled plus, while it is
+        # filled, the previous batch still held by the caller, one raw copy,
+        # and the float32 normalization buffer. While the caller processes a
+        # batch it needs the batch and its declared scratch instead.
+        item_bytes = float64_size + max(
+            float64_size + raw_size + float32_size,
+            scratch_itemsize,
         )
+        feature_width, read_group_bytes = persisted_read_group(counts_t)
+        geometry = array_geometry(counts_t)
+        assert geometry is not None
+        # The reader keeps at least one read group and one inner read of a
+        # cell chunk, as its plan requires.
+        inner_read_bytes = (
+            min(n_feats, max(feature_width, geometry.axisChunk(0)))
+            * min(geometry.axisChunk(1), int(counts_t.shape[1]))
+            * raw_size
+        )
+        resident = resident_bytes + scalar_values.nbytes + dest_of.nbytes
+        available = (
+            self.resources.memoryBytes - resident - read_group_bytes - inner_read_bytes
+        )
+        affordable = max(0, available) // max(1, n_cells * item_bytes)
+        if batch_size is None:
+            width = min(affordable, feature_width, max(1, len(feat_idx)))
+        else:
+            width = max(1, int(batch_size))
+        if width < 1 or width > affordable:
+            raise MemoryError(
+                f"Normalized feature batches of {max(1, width)} features over "
+                f"{n_cells} cells do not fit the memory budget of "
+                f"{self.resources.memoryBytes} bytes; the affordable width is "
+                f"{affordable}. Increase the memory budget"
+                + ("." if batch_size is None else " or reduce the batch size.")
+            )
         loaded_groups = map_feature_read_groups(
             counts_t,
             lambda loaded: loaded,
@@ -286,71 +311,75 @@ class RNAassay(Assay):
             resources=self.resources,
             progress=msg or None,
             io=getattr(self, "storageIo", None),
-            extraItemsize=extra_itemsize,
+            scratchBytes=resident + width * n_cells * item_bytes,
             orderedCompute=True,
         )
 
-        def selected_values(values: np.ndarray, keep: np.ndarray) -> np.ndarray:
-            return selected_feature_values(values, keep)
-
-        resolved_batch = None if batch_size is None else max(1, int(batch_size))
-        pending_cols: np.ndarray | None = None
-        pending_labels: np.ndarray | None = None
-
         def emit(
-            cols: np.ndarray, labels: np.ndarray
+            values: np.ndarray, labels: np.ndarray
         ) -> pd.DataFrame | tuple[np.ndarray, np.ndarray]:
+            # ``values`` is a C-order features-by-cells float64 block.
             if as_dataframe:
-                return pd.DataFrame(np.asarray(cols, dtype=np.float64), columns=labels)
-            return np.asarray(cols.T, dtype=np.float64), labels
+                return pd.DataFrame(values.T, columns=labels, copy=False)
+            return values, labels
 
+        block: np.ndarray | None = None
+        block_labels = np.empty(0, dtype=feat_labels.dtype)
+        filled = 0
         for group in loaded_groups:
             local_dest = dest_of[group.featStart : group.featEnd]
-            keep = local_dest >= 0
-            if not np.any(keep):
-                continue
-            raw = selected_values(group.values, keep)
-            destinations = local_dest[keep]
-            # cells x features for downstream consumers
-            mat = raw.T.astype(np.float32, copy=False)
-            mat *= float(sf)
-            mat /= scalar_values[:, None]
-            if log_transform:
-                np.log1p(mat, out=mat)
-            labels = feat_labels[destinations]
-            cols = np.asarray(mat, dtype=np.float64)
-            del mat, raw
-            if resolved_batch is None:
-                yield emit(cols, labels)
-                continue
-            if pending_cols is not None:
-                assert pending_labels is not None
-                need = resolved_batch - int(pending_cols.shape[1])
-                if cols.shape[1] >= need:
-                    yield emit(
-                        np.concatenate((pending_cols, cols[:, :need]), axis=1),
-                        np.concatenate((pending_labels, labels[:need])),
-                    )
-                    cols = cols[:, need:]
-                    labels = labels[need:]
-                    pending_cols = None
-                    pending_labels = None
-                else:
-                    pending_cols = np.concatenate((pending_cols, cols), axis=1)
-                    pending_labels = np.concatenate((pending_labels, labels))
-                    continue
+            rows = np.flatnonzero(local_dest >= 0)
             start = 0
-            n_cols = int(cols.shape[1])
-            while start + resolved_batch <= n_cols:
-                stop = start + resolved_batch
-                yield emit(cols[:, start:stop], labels[start:stop])
-                start = stop
-            if start < n_cols:
-                pending_cols = cols[:, start:]
-                pending_labels = labels[start:]
-        if pending_cols is not None:
-            assert pending_labels is not None
-            yield emit(pending_cols, pending_labels)
+            while start < rows.size:
+                if block is None:
+                    block = np.empty((width, n_cells), dtype=np.float64)
+                    block_labels = np.empty(width, dtype=feat_labels.dtype)
+                    filled = 0
+                take = min(width - filled, int(rows.size) - start)
+                piece = rows[start : start + take]
+                normalized = group.values[piece].astype(np.float32)
+                normalized *= float(sf)
+                normalized /= scalar_values
+                if log_transform:
+                    np.log1p(normalized, out=normalized)
+                block[filled : filled + take] = normalized
+                del normalized
+                block_labels[filled : filled + take] = feat_labels[local_dest[piece]]
+                filled += take
+                start += take
+                if filled == width:
+                    yield emit(block, block_labels)
+                    block = None
+            if batch_size is None and block is not None:
+                yield emit(block[:filled], block_labels[:filled])
+                block = None
+        if block is not None:
+            yield emit(block[:filled], block_labels[:filled])
+
+    def _count_arithmetic(
+        self,
+        values: NormalizedValueSource,
+        *,
+        log_transform: bool = False,
+        renormalize_subset: bool = False,
+    ) -> Literal["float64"] | None:
+        """Return the count-arithmetic marker of an artifact of these values.
+
+        The subset-renormalized payload uses its own float64 kernel, eligible
+        feature batches stream ``countsT`` in floating point, and library-size
+        feature scores average in float64. None of them calls ``normed``, so
+        none records the marker.
+        """
+        if values == "payload" and renormalize_subset:
+            return None
+        if values == "feature_scores" and self.normMethod is norm_lib_size:
+            return None
+        if values == "feature_batches" and lib_size_feature_stream_eligible(
+            self, renormalize_subset=renormalize_subset
+        ):
+            return None
+        method = norm_lib_size_log if log_transform else self.normMethod
+        return normalizer_count_arithmetic(self, method)
 
     def _write_normalized_payload(
         self,
@@ -372,7 +401,7 @@ class RNAassay(Assay):
                 mirror=mirror,
             )
 
-        from ..storage.materialize import write_renorm_subset_to_zarr
+        from .normalization import write_renorm_subset_to_zarr
 
         cell_idx = np.asarray(cell_idx, dtype=np.int64)
         feat_idx = np.asarray(feat_idx, dtype=np.int64)
@@ -433,270 +462,48 @@ class RNAassay(Assay):
         Returns:
             A chunked array (delayed matrix) containing normalized data.
         """
+        from ..storage.identity import read_dataset_fingerprint
+
+        read_dataset_fingerprint(self.z)
         if cell_idx is None:
             cell_idx = self.cells.active_index("I")
         if feat_idx is None:
             feat_idx = np.arange(self.feats.N, dtype=np.int64)
         counts = self.rawData[:, feat_idx][cell_idx, :]
-        norm_method_cache = self.normMethod
-        scalar_cache = self.scalar
-        try:
-            if log_transform:
-                self.normMethod = norm_lib_size_log
-            if renormalize_subset:
-                scalar = compute_with_progress(
-                    counts.sum(axis=1),
-                    "Normalizing with feature subset",
-                    self.nthreads,
-                )
-                scalar[scalar == 0] = 1
-                self.scalar = scalar
-            else:
-                self.scalar = self._cell_count_totals(cell_idx)
-            return self.normMethod(self, counts)
-        finally:
-            self.normMethod = norm_method_cache
-            self.scalar = scalar_cache
+        method = norm_lib_size_log if log_transform else self.normMethod
+        if renormalize_subset:
+            scalar = compute_with_progress(
+                counts.sum(axis=1),
+                "Normalizing with feature subset",
+                self.nthreads,
+            )
+        else:
+            scalar = self._cell_count_totals(cell_idx)
+        # Zero-total cells normalize to zero, as on every other path.
+        scalar[scalar == 0] = 1
+        # The method reads the totals from ``self.scalar`` while it builds the
+        # lazy result, so concurrent calls must not interleave here.
+        with self._normalization_lock:
+            scalar_cache = self.scalar
+            self.scalar = scalar
+            try:
+                return method(self, counts)
+            finally:
+                self.scalar = scalar_cache
+
+    def _has_zero_total_cells(self, cell_idx: np.ndarray) -> bool:
+        """Return whether a selected cell has no counts in this assay.
+
+        ``normed`` without subset renormalization divides such a cell's counts
+        by 1, so its normalized values are zeros rather than NaN.
+        """
+        return bool(np.any(self._cell_count_totals(cell_idx) == 0))
 
     def _raw_feature_stream_source(self) -> tuple[zarr.Array, int, int]:
         """Return the preferred raw array and its feature and cell axes."""
         if self.rawDataT is not None:
             return self.rawDataT, 0, 1
         return cast(zarr.Array, self.rawData._backing), 1, 0
-
-    def iter_raw_column_blocks(
-        self,
-        cell_idx: np.ndarray,
-        feat_idx: np.ndarray,
-        batch_size: int,
-        msg: str | None = None,
-    ) -> Generator[tuple[int, np.ndarray, np.ndarray, float, str], None, None]:
-        """Read raw count column batches with shallow read-ahead."""
-        yield from self._iter_raw_column_blocks(
-            cell_idx=cell_idx,
-            feat_idx=feat_idx,
-            batch_size=batch_size,
-            msg=msg,
-        )
-
-    def _iter_raw_column_blocks(
-        self,
-        cell_idx: np.ndarray,
-        feat_idx: np.ndarray,
-        batch_size: int | None,
-        msg: str | None = None,
-        *,
-        plan: FeatureStreamPlan | None = None,
-    ) -> Generator[tuple[int, np.ndarray, np.ndarray, float, str], None, None]:
-        """Read raw count column batches with shallow read-ahead.
-
-        Yields ``(block_idx, raw, feat_cols, read_sec, source)`` where ``raw`` has
-        shape ``(len(cell_idx), len(feat_cols))``.
-        """
-        from ..utils.prefetch import iter_column_blocks
-
-        cell_idx = np.asarray(cell_idx)
-        feat_idx = np.asarray(feat_idx)
-        zarr_arr, feature_axis, cell_axis = self._raw_feature_stream_source()
-        if plan is None:
-            raw_itemsize = max(1, int(np.dtype(zarr_arr.dtype).itemsize))
-            plan = plan_feature_stream(
-                zarr_arr,
-                featureAxis=feature_axis,
-                cellAxis=cell_axis,
-                featureIndices=feat_idx,
-                cellIndices=cell_idx,
-                resources=self.resources,
-                blockBytes=lambda width: max(
-                    1,
-                    len(cell_idx) * width * raw_itemsize,
-                ),
-                requestedBatchSize=batch_size,
-            )
-        batches = [block.indices for block in plan.blocks]
-        n_blocks = len(plan.blocks)
-        if msg:
-            logger.debug(
-                f"({self.name}) {msg}: {len(feat_idx)} features in "
-                f"{n_blocks} geometry-planned blocks "
-                f"(repeated chunk decodes={plan.repeatedDecodeCount})"
-            )
-
-        if feature_axis == 0:
-
-            def read_block(block_idx: int) -> np.ndarray:
-                return _read_facade_block(zarr_arr, batches[block_idx], cell_idx).T
-
-        else:
-
-            def read_block(block_idx: int) -> np.ndarray:
-                return _read_facade_block(zarr_arr, cell_idx, batches[block_idx])
-
-        for block_idx, raw, read_sec, source in iter_column_blocks(
-            n_blocks,
-            read_block,
-            workers=plan.readWorkers,
-            io_concurrency=plan.ioConcurrency,
-            msg=msg,
-        ):
-            yield block_idx, raw, batches[block_idx], read_sec, source
-
-    def iter_raw_feature_major_blocks(
-        self,
-        cell_idx: np.ndarray,
-        plan: FeatureStreamPlan,
-        msg: str | None = None,
-    ) -> Generator[
-        tuple[IndexBlock, np.ndarray, float, str],
-        None,
-        None,
-    ]:
-        """Yield C-contiguous ``(features, cells)`` raw count blocks."""
-        from ..utils.prefetch import iter_column_blocks
-
-        cell_idx = np.asarray(cell_idx)
-        zarr_arr, feature_axis, _ = self._raw_feature_stream_source()
-        if feature_axis != plan.featureAxis:
-            raise ValueError("Feature stream plan does not match the raw source")
-        blocks = plan.blocks
-
-        if feature_axis == 0:
-
-            def read_block(block_idx: int) -> np.ndarray:
-                block = blocks[block_idx]
-                return np.ascontiguousarray(
-                    _read_facade_block(
-                        zarr_arr,
-                        block.indices,
-                        cell_idx,
-                    )
-                )
-
-        else:
-
-            def read_block(block_idx: int) -> np.ndarray:
-                block = blocks[block_idx]
-                raw = _read_facade_block(
-                    zarr_arr,
-                    cell_idx,
-                    block.indices,
-                )
-                return np.ascontiguousarray(raw.T)
-
-        for block_idx, raw, read_sec, source in iter_column_blocks(
-            len(blocks),
-            read_block,
-            workers=plan.readWorkers,
-            io_concurrency=plan.ioConcurrency,
-            msg=msg,
-        ):
-            yield blocks[block_idx], raw, read_sec, source
-            del raw
-
-    def iter_raw_feature_columns(
-        self,
-        cell_idx: np.ndarray,
-        feat_idx: np.ndarray,
-        batch_size: int,
-        scalar: np.ndarray,
-        sf: float,
-        log_transform: bool = False,
-        msg: str | None = None,
-    ) -> Generator[tuple[np.ndarray, np.ndarray], None, None]:
-        """Iterate library-size normalized feature columns."""
-        yield from self._iter_raw_feature_columns(
-            cell_idx=cell_idx,
-            feat_idx=feat_idx,
-            batch_size=batch_size,
-            scalar=scalar,
-            sf=sf,
-            log_transform=log_transform,
-            msg=msg,
-        )
-
-    def _iter_raw_feature_columns(
-        self,
-        cell_idx: np.ndarray,
-        feat_idx: np.ndarray,
-        batch_size: int | None,
-        scalar: np.ndarray,
-        sf: float,
-        log_transform: bool = False,
-        msg: str | None = None,
-        *,
-        plan: FeatureStreamPlan | None = None,
-    ) -> Generator[tuple[np.ndarray, np.ndarray], None, None]:
-        """Iterate library-size normalized feature columns without streaming
-        the full normalized matrix.
-
-        Raw count columns are read directly from the backing Zarr array in
-        chunk-aligned batches and normalized in memory using a precomputed
-        per-cell scalar (library size). Reads are prefetched in parallel.
-
-        Args:
-            cell_idx: Integer indices of cells to include (in output order).
-            feat_idx: Integer indices of features to iterate over.
-            batch_size: Number of feature columns per batch.
-            scalar: Per-cell normalization factor aligned to ``cell_idx``.
-            sf: Size factor multiplier applied before dividing by ``scalar``.
-            log_transform: If True, apply ``log1p`` after normalization.
-            msg: Progress bar description.
-
-        Yields:
-            Tuples of ``(normed_batch, feat_index_batch)`` where ``normed_batch``
-            has shape ``(len(cell_idx), batch_columns)``.
-        """
-        import time
-
-        from ..utils.process import process_rss_mb
-
-        cell_idx = np.asarray(cell_idx)
-        scalar_col = np.asarray(scalar, dtype=np.float32).reshape(-1, 1)
-        scalar_col[scalar_col == 0] = 1
-        feat_idx = np.asarray(feat_idx)
-        if plan is None:
-            zarr_arr, feature_axis, cell_axis = self._raw_feature_stream_source()
-            raw_itemsize = max(1, int(np.dtype(zarr_arr.dtype).itemsize))
-            plan = plan_feature_stream(
-                zarr_arr,
-                featureAxis=feature_axis,
-                cellAxis=cell_axis,
-                featureIndices=feat_idx,
-                cellIndices=cell_idx,
-                resources=self.resources,
-                blockBytes=lambda width: max(
-                    1,
-                    len(cell_idx)
-                    * width
-                    * (
-                        raw_itemsize
-                        + np.dtype(np.float32).itemsize
-                        + np.dtype(np.float64).itemsize
-                    ),
-                ),
-                requestedBatchSize=batch_size,
-            )
-        n_batches = len(plan.blocks)
-
-        for block_idx, raw, cols, read_sec, source in self._iter_raw_column_blocks(
-            cell_idx=cell_idx,
-            feat_idx=feat_idx,
-            batch_size=batch_size,
-            msg=msg,
-            plan=plan,
-        ):
-            t0 = time.perf_counter()
-            normed = (sf * raw.astype(np.float32)) / scalar_col
-            if log_transform:
-                normed = np.log1p(normed)
-            if msg:
-                logger.debug(
-                    f"({self.name}) {msg} batch {block_idx + 1}/{n_batches}: "
-                    f"cols={len(cols)} read {read_sec:.1f}s ({source}) "
-                    f"norm {time.perf_counter() - t0:.1f}s "
-                    f"rss {process_rss_mb():.0f} MiB"
-                )
-            yield normed, cols
 
     def _mean_normed_feature_groups(
         self,
@@ -717,9 +524,6 @@ class RNAassay(Assay):
         parallel and accumulated as they arrive (each writes a disjoint row
         slice, so order does not matter).
         """
-        from ..storage.parallel import stream_shards
-
-        zarr_arr = cast(zarr.Array, self.rawData._backing)
         cell_idx = np.asarray(cell_idx)
         if (self.normMethod is norm_lib_size or log_transform) and self.sf is None:
             raise ValueError(
@@ -736,9 +540,44 @@ class RNAassay(Assay):
             key: np.searchsorted(union, np.asarray(idx, dtype=int))
             for key, idx in feature_groups.items()
         }
+        return self._mean_normed_union(
+            cell_idx,
+            scalar,
+            union,
+            local_pos,
+            sf=sf,
+            block_rows=block_rows,
+            log_transform=log_transform,
+            resident_bytes=(
+                scalar.nbytes
+                + union.nbytes
+                + sum(value.nbytes for value in local_pos.values())
+            ),
+        )
 
+    def _mean_normed_union(
+        self,
+        cell_idx: np.ndarray,
+        scalar: np.ndarray,
+        union: np.ndarray,
+        local_pos: Mapping[str, np.ndarray],
+        *,
+        sf: float,
+        block_rows: int | None,
+        log_transform: bool,
+        resident_bytes: int,
+    ) -> dict[str, np.ndarray]:
+        """Average library-size normalized ``union`` columns per group position.
+
+        ``scalar`` holds the nonzero total of each cell in ``cell_idx``.
+        ``resident_bytes`` counts the arrays the caller holds for the call,
+        including ``scalar``, ``union``, and ``local_pos``.
+        """
+        from ..storage.parallel import stream_shards
+
+        zarr_arr = cast(zarr.Array, self.rawData._backing)
         n_cells = len(cell_idx)
-        out = {key: np.empty(n_cells, dtype=np.float64) for key in feature_groups}
+        out = {key: np.empty(n_cells, dtype=np.float64) for key in local_pos}
         if n_cells == 0:
             return out
 
@@ -758,24 +597,18 @@ class RNAassay(Assay):
             * max(1, len(union))
             * (np.dtype(zarr_arr.dtype).itemsize + np.dtype(np.float64).itemsize)
         )
-        resident_bytes = (
-            scalar.nbytes
-            + union.nbytes
-            + sum(value.nbytes for value in out.values())
-            + sum(value.nbytes for value in local_pos.values())
-        )
         admission = admit_stream(
             self.resources,
             nBlocks=self.resources.workers,
             blockBytes=block_bytes,
             decodeBytes=0 if geometry is None else geometry.nominalChunkBytes(),
-            residentBytes=resident_bytes,
+            residentBytes=resident_bytes + sum(value.nbytes for value in out.values()),
             requested=self.resources.workers,
         )
         for start, raw in stream_shards(
             starts,
             read,
-            workers=admission.outerWorkers,
+            workers=admission.readWorkers,
             io_concurrency=admission.ioConcurrency,
         ):
             end = start + raw.shape[0]
@@ -785,6 +618,47 @@ class RNAassay(Assay):
             for key, pos in local_pos.items():
                 out[key][start:end] = normed[:, pos].mean(axis=1)
         return out
+
+    def _iter_feature_group_means(
+        self,
+        cell_idx: np.ndarray,
+        feature_groups: Sequence[np.ndarray],
+        *,
+        block_rows: int | None = None,
+    ) -> Iterator[np.ndarray]:
+        """Yield per-cell group means, as ``iter_feature_group_means`` does.
+
+        Library-size normalization depends only on each cell's total, so the
+        totals are read once and each row band of ``block_rows`` cells reads
+        the union of the group features once. Other normalizations use the
+        fitted generic kernel.
+        """
+        if not lib_size_feature_stream_eligible(self):
+            yield from super()._iter_feature_group_means(cell_idx, feature_groups)
+            return
+        assert self.sf is not None
+        # Rejects empty or malformed groups exactly as the generic kernel does.
+        union, positions = _feature_group_positions(feature_groups)
+        keyed = {str(index): position for index, position in enumerate(positions)}
+        cell_idx = np.asarray(cell_idx, dtype=np.int64)
+        totals = self._cell_count_totals(cell_idx)
+        totals[totals == 0] = 1
+        resident_bytes = (
+            totals.nbytes + union.nbytes + sum(value.nbytes for value in positions)
+        )
+        band = max(1, len(cell_idx) if block_rows is None else int(block_rows))
+        for start in range(0, len(cell_idx), band):
+            means = self._mean_normed_union(
+                cell_idx[start : start + band],
+                totals[start : start + band],
+                union,
+                keyed,
+                sf=float(self.sf),
+                block_rows=None,
+                log_transform=False,
+                resident_bytes=resident_bytes,
+            )
+            yield np.column_stack([means[key] for key in keyed])
 
     def _streaming_feature_stats(
         self,
@@ -850,18 +724,15 @@ class RNAassay(Assay):
         def process_band(
             band: Any,
         ) -> tuple[int, int, int, np.ndarray, np.ndarray, np.ndarray] | None:
-            destinations = dest_of[band.featStart : band.featEnd]
+            rows = band.featureRows()
+            destinations = dest_of[band.featStart + rows]
             if not np.any(destinations >= 0):
                 return None
             n_local = int(band.featEnd - band.featStart)
             local_nz = np.zeros(n_local, dtype=np.float64)
             local_s1 = np.zeros(n_local, dtype=np.float64)
             local_s2 = np.zeros(n_local, dtype=np.float64)
-            local_dest = np.where(
-                destinations >= 0,
-                np.arange(n_local, dtype=np.int64),
-                np.int64(-1),
-            )
+            local_dest = np.where(destinations >= 0, rows, np.int64(-1))
             t_compute = time.perf_counter()
             _hvg_stats_gene_major(
                 band.values,
@@ -875,12 +746,13 @@ class RNAassay(Assay):
                 log_transform=log_transform,
             )
             compute_sec = time.perf_counter() - t_compute
-            logger.debug(
+            logger.opt(lazy=True).debug(
                 f"({self.name}) feature stats band "
                 f"{band.featStart}:{band.featEnd} cells "
                 f"{band.cellStart}:{band.cellEnd}: "
                 f"read {band.readSec:.1f}s compute {compute_sec:.1f}s "
-                f"rss {process_rss_mb():.0f} MiB"
+                "rss {rss:.0f} MiB",
+                rss=process_rss_mb,
             )
             return (
                 int(band.unitIndex),

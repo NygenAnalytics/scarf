@@ -257,23 +257,37 @@ def _verify_store_opens(store: Path, *, default_assay: str) -> None:
 
 
 def _openable_rna_store(source_path: Path, work: Path) -> Path:
-    """Return a store DataStore can open, repacking a legacy snapshot if needed."""
+    """Return a store DataStore can open, rebuilding a legacy snapshot if needed.
+
+    Legacy snapshots saved HVG flags as ``<cells>__hvgs`` feature columns. The
+    current format keeps feature selections as artifacts, so the rebuild drops
+    those columns instead of carrying stale flags into derived teaching stores.
+    """
     import zarr
 
-    from scarf.storage.counts_t_contract import inspect_counts_t
+    from scarf.storage.counts_t_contract import validate_count_matrix
+    from scarf.storage.identity import clear_column
     from scarf.tools.repack_zarr import repack_store
 
     store = source_path / STORE_NAME
     root = zarr.open_group(str(store), mode="r")
-    if inspect_counts_t(root, "RNA").status == "ready":
-        return store
+    try:
+        if root["RNA"].attrs.get("prepared") is True:
+            validate_count_matrix(root["RNA"], require_transpose=True)
+            return store
+    except ValueError:
+        pass
 
     work.mkdir(parents=True, exist_ok=True)
     repacked = work / f"{source_path.name}_repacked.zarr"
     if repacked.exists():
         shutil.rmtree(repacked)
     print(f"Repacking {store} so the current RNA layout can open")
-    repack_store(str(store), str(repacked), nthreads=ZARR_NTHREADS)
+    repack_store(str(store), str(repacked), nthreads=ZARR_NTHREADS, data_only=True)
+    features = zarr.open_group(str(repacked / "RNA" / "featureData"), mode="r+")
+    for column in list(features.array_keys()):
+        if column.endswith("__hvgs"):
+            clear_column(features, column)
     return repacked
 
 

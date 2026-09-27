@@ -443,7 +443,7 @@ def test_failed_execution_retries_and_doublets_bind_exact_feature_mask(
 ) -> None:
     handoff = example(PreprocessedAssayHandoff)
     handoff.graphFeatureCandidates = {"eligibleDefault": handoff.graphFeatures}
-    normalized = rna_tuning.artifact_model_to_ref(handoff.normalized)
+    normalized = handoff.normalized.to_artifact_ref()
     store = SimpleNamespace(run_normalization=lambda *args, **kwargs: normalized)
     run = rna_tuning.RnaTuningRun(
         SimpleNamespace(model=object()),

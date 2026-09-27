@@ -1,6 +1,6 @@
 """Shared Pydantic data structures for Scarf agents."""
 
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Self
 
 from ._deps import AGENT_INSTALL_HINT
 
@@ -8,6 +8,9 @@ try:
     from pydantic import BaseModel, ConfigDict, Field
 except ImportError as exc:
     raise ImportError(AGENT_INSTALL_HINT) from exc
+
+if TYPE_CHECKING:
+    from ..storage.refs import ArtifactRef
 
 
 type StageStatus = Literal["done", "needsInput", "abstained", "failed"]
@@ -26,7 +29,7 @@ class AgentDataModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     @classmethod
-    def get_blank(cls) -> "AgentDataModel":
+    def get_blank(cls) -> Self:
         """Return an empty but valid value for fallback paths."""
         return cls()
 
@@ -48,6 +51,17 @@ class ArtifactReferenceModel(AgentDataModel):
             artifactId=str(getattr(ref, "artifact_id", "")),
         )
 
+    def to_artifact_ref(self) -> "ArtifactRef":
+        """Return the exact, validated core reference this model records."""
+        from ..storage.refs import ArtifactRef
+
+        return ArtifactRef(
+            scope=self.scope,
+            kind=self.kind,
+            artifact_id=self.artifactId,
+            assay=self.assay,
+        )
+
 
 class BatchSafetyEvidence(AgentDataModel):
     """Estimability for one coefficient and exact proposed batch-column set."""
@@ -60,10 +74,6 @@ class BatchSafetyEvidence(AgentDataModel):
     status: BatchSafetyStatus = "notComputed"
     estimability: dict[str, Any] = Field(default_factory=dict)
     evidenceId: str = ""
-
-    @classmethod
-    def get_blank(cls) -> "BatchSafetyEvidence":
-        return cls()
 
 
 class ExperimentalTuningHandoff(AgentDataModel):
@@ -100,10 +110,6 @@ class TuningBiologyHandoff(AgentDataModel):
     recommendedCandidateId: str = ""
     clusterArtifact: ArtifactReferenceModel | None = None
     evidenceIds: list[str] = Field(default_factory=list)
-
-    @classmethod
-    def get_blank(cls) -> "TuningBiologyHandoff":
-        return cls()
 
 
 class ToolCallInfo(AgentDataModel):
@@ -199,15 +205,3 @@ class NeedsInput(AgentDataModel):
     @classmethod
     def get_blank(cls) -> "NeedsInput":
         return cls(question="")
-
-
-class StageResult(AgentDataModel):
-    status: StageStatus
-    decision: Decision | None = None
-    needsInput: NeedsInput | None = None
-    actions: list[str] = Field(default_factory=list)
-    notes: list[str] = Field(default_factory=list)
-
-    @classmethod
-    def get_blank(cls) -> "StageResult":
-        return cls(status="needsInput")

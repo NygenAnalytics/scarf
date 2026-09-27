@@ -32,6 +32,7 @@ def _selection_store(
     store = MemoryStore()
     root = zarr.open_group(store=store, mode="w")
     feature_data = root.create_group("RNA/featureData")
+    root["RNA"].attrs.update({"prepared": True, "dataset_fingerprint": "dataset"})
     ids = np.asarray(["g0", "g1", "g2", "g3"])
     feature_data.create_array("ids", data=ids)
     feature_data.create_array("names", data=ids)

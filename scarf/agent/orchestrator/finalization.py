@@ -20,7 +20,6 @@ from .models import (
     WorkflowIdentity,
     WorkflowStageAttempt,
     WorkflowStageLink,
-    artifact_model_to_ref,
 )
 from .rna import selected_store_rna_assay, validate_rna_handoffs, validate_rna_plan
 
@@ -101,7 +100,7 @@ class FinalizationStagesMixin:
             selected = promote_parameter_candidate(
                 store,
                 report=tuning_report,
-                normalized=artifact_model_to_ref(handoff.normalized),
+                normalized=handoff.normalized.to_artifact_ref(),
             )
             if selected.parameters.reductionMethod != "pca":
                 raise ValueError(
@@ -121,18 +120,20 @@ class FinalizationStagesMixin:
             graph = selected_artifacts["connectivityMap"]
             clusters = selected_artifacts["clusters"]
             markers = selected_artifacts["markerTable"]
-            if tuning_report.finalClusterArtifact is None or artifact_model_to_ref(
-                clusters
-            ) != artifact_model_to_ref(tuning_report.finalClusterArtifact):
+            if (
+                tuning_report.finalClusterArtifact is None
+                or clusters.to_artifact_ref()
+                != tuning_report.finalClusterArtifact.to_artifact_ref()
+            ):
                 raise ValueError("Finalization changed the selected cluster artifact")
-            cells_ref = artifact_model_to_ref(cells)
-            graph_ref = artifact_model_to_ref(graph)
+            cells_ref = cells.to_artifact_ref()
+            graph_ref = graph.to_artifact_ref()
             if graph_cell_selection(store.zw, graph_ref) != cells_ref:
                 raise ValueError(
                     "Selected graph does not contain the full-cohort selection"
                 )
             for label, ref in (("clusters", clusters), ("markers", markers)):
-                status = store.inspect_artifact(artifact_model_to_ref(ref))
+                status = store.inspect_artifact(ref.to_artifact_ref())
                 if not status.complete or ref.assay != assay_name:
                     raise ValueError(
                         f"Final {label} are incomplete or belong to another assay"
@@ -143,14 +144,14 @@ class FinalizationStagesMixin:
                 parent_key, parent = (
                     ("graph", graph) if label == "clusters" else ("clusters", clusters)
                 )
-                if inputs.get(parent_key) != artifact_model_to_ref(parent).to_dict():
+                if inputs.get(parent_key) != parent.to_artifact_ref().to_dict():
                     raise ValueError(
                         f"Final {label} do not match the selected {parent_key}"
                     )
             for ref in selected_artifacts.values():
-                store.load_artifact(artifact_model_to_ref(ref))
+                store.load_artifact(ref.to_artifact_ref())
             initialization_ref = store.build_embedding_initialization(
-                artifact_model_to_ref(selected_artifacts["pca"]),
+                selected_artifacts["pca"].to_artifact_ref(),
                 n_centroids=min(1000, handoff.nCells),
                 rand_state=4466,
                 invalidate_cache=False,

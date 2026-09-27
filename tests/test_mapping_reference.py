@@ -190,9 +190,7 @@ def test_plain_mapping_reference_packages_and_loads_existing_chain(
     assert reference.symphony_state is None
     assert reference.neighbors == neighbors
     assert not hasattr(reference, "feature_key")
-    assert reference.dataset_fingerprint == datastore._calculate_dataset_fingerprint(
-        "RNA"
-    )
+    assert reference.dataset_fingerprint == datastore._ensure_dataset_fingerprint("RNA")
     selected_cells = read_stored_selection_indices(
         datastore.zw,
         reference.cell_selection,

@@ -61,6 +61,20 @@ class _MergeAssay:
         )
         self.feats = _MergeMeta(ids=feature_ids, names=feature_names)
 
+    @property
+    def matrixGroup(self):
+        # A prepared assay's saved count summaries match its current counts.
+        from scarf.storage.identity import finalize_counts
+
+        group = zarr.open_group(store=MemoryStore(), mode="w")
+        finalize_counts(
+            group.create_array("counts", data=np.asarray(self.rawData.compute()))
+        )
+        return group
+
+    def _percent_features(self):
+        return {}
+
 
 class _MergeDataStore:
     def __init__(self, assays, *, zarr_loc="memory://test"):
@@ -793,8 +807,10 @@ def test_dataset_merge_cells(datastore, tmp_path):
     writer.dump()
     ds = DataStore(fn, default_assay="RNA")
     df = ds.cells.to_pandas_dataframe(ds.cells.columns)
-    df_diff = df[df["orig_RNA_nCounts"] != df["RNA_nCounts"]]
-    assert len(df_diff) == 0
+    assert "orig_RNA_nCounts" not in df
+    np.testing.assert_array_equal(
+        df["RNA_nCounts"], ds.RNA.rawData.sum(axis=1).compute()
+    )
     assert df["sample_id"].value_counts().to_dict() == {
         "self1": datastore.cells.N,
         "self2": datastore.cells.N,
@@ -1056,7 +1072,8 @@ def test_dataset_merge_metadata_layout_is_budget_independent_and_resumable(
 
     low_chunks = cell_chunks(low_path)
     assert low_chunks == cell_chunks(high_path)
-    assert set(low_chunks.values()) == {(10,)}
+    # Metadata chunks hold PROFILE_METADATA_CHUNK rows, capped by the 40 cells.
+    assert set(low_chunks.values()) == {(40,)}
 
     identity_widths: list[int] = []
     original_identity_read = merge_row_plan.read_metadata_rows_chunkwise
@@ -1330,10 +1347,10 @@ def test_dataset_merge_plan_reports_destination_conflict(tmp_path):
     ("case", "reason", "expectation"),
     [
         ("cell_identity", "order of cells", "block"),
-        ("counts_shape", "counts shape", "block"),
-        ("counts_dtype", "counts dtype", "block"),
-        ("counts_chunks", "counts chunks", "block"),
-        ("counts_shards", "counts shards", "block"),
+        ("counts_shape", "not finalized", "block"),
+        ("counts_dtype", "not finalized", "block"),
+        ("counts_chunks", "not finalized", "block"),
+        ("counts_shards", "not finalized", "block"),
         ("feature_ids", "featureData/ids", "block"),
         ("feature_names", "featureData/names", "block"),
         ("feature_selection", "featureData/I", "block"),
@@ -2099,6 +2116,9 @@ def test_dataset_merge_skips_counts_t_for_generic_assay_named_rna(tmp_path):
         )
         root["RNA/counts"][:] = values
         root.attrs["assayTypes"] = {"RNA": "Assay"}
+        from scarf.storage.identity import finalize_counts
+
+        finalize_counts(root["RNA/counts"])
         return DataStore(
             path,
             default_assay="RNA",
@@ -2281,14 +2301,14 @@ def test_dataset_merge_schema_scan_uses_admitted_width_without_changing_schema(
 
     def admitted_scan_rows(
         source_cell_tables,
-        row_plan,
         resources,
         *,
         resident_bytes,
         preferred_rows,
     ):
-        _ = source_cell_tables, row_plan, resources, resident_bytes
-        assert preferred_rows == 4
+        _ = source_cell_tables, resources, resident_bytes
+        # One whole merged metadata chunk covers all 16 cells.
+        assert preferred_rows == 16
         return 2
 
     monkeypatch.setattr(
@@ -2315,7 +2335,7 @@ def test_dataset_merge_schema_scan_uses_admitted_width_without_changing_schema(
     assert widths
     assert max(widths) == 2
     assert merger._metadataPlan is not None
-    assert merger._metadataPlan.blockRows == 4
+    assert merger._metadataPlan.blockRows == 16
     specs = {spec.name: spec for spec in merger._metadataPlan.columns}
     assert specs["ids"].dtype == np.dtype(f"U{len('right') + 2 + len(cell_ids[-1])}")
     assert specs["names"].dtype == np.dtype(f"U{len(cell_names[-1])}")
@@ -2421,10 +2441,6 @@ def test_dataset_merge_sparse_write_respects_admitted_batch_geometry(
         ],
         zarr_loc="memory://right",
     )
-    left.cells._columns["RNA_nFeatures"] = np.full(n_left, n_feats, dtype=np.int64)
-    left.cells.columns.append("RNA_nFeatures")
-    right.cells._columns["RNA_nFeatures"] = np.full(n_right, n_feats, dtype=np.int64)
-    right.cells.columns.append("RNA_nFeatures")
 
     DataStoreMerge(
         datasets=[left, right],
@@ -2438,20 +2454,11 @@ def test_dataset_merge_sparse_write_respects_admitted_batch_geometry(
         policy=CountMatrixPolicy(unitBytes=64, chunkBytes=32),
     ).dump()
 
-    nnz_widths: list[int] = []
     dense_rows: list[int] = []
     coo_rows: list[int] = []
     batch_rows: list[int] = []
-    nnz_scan_rows: list[int] = []
-    original_read = merge_writer.read_metadata_rows_chunkwise
     original_remap = merge_writer.remap_block_to_coo
     original_batch = merge_writer.resolve_sparse_import_batch
-    original_requirements = merge_writer._merge_import_requirements
-
-    def tracking_read(table, column, rows):
-        if column.endswith("_nFeatures"):
-            nnz_widths.append(int(np.asarray(rows).size))
-        return original_read(table, column, rows)
 
     def tracking_remap(block, order_map, n_feats, nthreads, destination_dtype=None):
         result = original_remap(
@@ -2470,23 +2477,8 @@ def test_dataset_merge_sparse_write_respects_admitted_batch_geometry(
         batch_rows.append(int(plan.batchRows))
         return plan
 
-    def tracking_requirements(*args, **kwargs):
-        requirements = original_requirements(*args, **kwargs)
-        nnz_scan_rows.append(int(requirements.nnzScanRows))
-        return requirements
-
-    monkeypatch.setattr(
-        merge_writer,
-        "read_metadata_rows_chunkwise",
-        tracking_read,
-    )
     monkeypatch.setattr(merge_writer, "remap_block_to_coo", tracking_remap)
     monkeypatch.setattr(merge_writer, "resolve_sparse_import_batch", tracking_batch)
-    monkeypatch.setattr(
-        merge_writer,
-        "_merge_import_requirements",
-        tracking_requirements,
-    )
 
     DataStoreMerge(
         datasets=[left, right],
@@ -2502,10 +2494,6 @@ def test_dataset_merge_sparse_write_respects_admitted_batch_geometry(
 
     assert batch_rows
     admitted = max(batch_rows)
-    assert nnz_scan_rows
-    assert max(nnz_scan_rows) >= 1
-    assert nnz_widths
-    assert max(nnz_widths) <= max(nnz_scan_rows)
     assert dense_rows
     assert coo_rows
     assert all(rows <= admitted for rows in dense_rows)
@@ -2521,6 +2509,158 @@ def test_dataset_merge_sparse_write_respects_admitted_batch_geometry(
         completed["cellData/ids"][:],
         reference["cellData/ids"][:],
     )
+
+
+def _sparse_rna_sources(n_cells=12, n_feats=8):
+    rng = np.random.default_rng(3)
+    sources = []
+    for label in ("left", "right"):
+        counts = rng.integers(1, 9, size=(n_cells, n_feats), dtype=np.uint16)
+        counts[rng.random(counts.shape) < 0.6] = 0
+        sources.append(
+            _MergeDataStore(
+                [
+                    _MergeAssay(
+                        "RNA",
+                        counts,
+                        [f"c{i}" for i in range(n_cells)],
+                        [f"id_{i}" for i in range(n_feats)],
+                        [f"G{i}" for i in range(n_feats)],
+                        block_size=4,
+                    )
+                ],
+                zarr_loc=f"memory://{label}",
+            )
+        )
+    return sources
+
+
+def test_dataset_merge_counts_preflight_matches_execution_accounting(
+    tmp_path, monkeypatch
+):
+    import scarf.merge.writer as merge_writer
+
+    preflight: list[int] = []
+    execution: list[int] = []
+    window_nnz: list[int] = []
+    original_spec = merge_writer.resolve_sparse_import_spec
+    original_batch = merge_writer.resolve_sparse_import_batch
+
+    def tracking_spec(*args, **kwargs):
+        preflight.append(int(kwargs["residentBytes"]))
+        return original_spec(*args, **kwargs)
+
+    def tracking_batch(*args, **kwargs):
+        execution.append(int(kwargs["residentBytes"]))
+        window_nnz.append(int(kwargs["maxWindowNnz"](3)))
+        return original_batch(*args, **kwargs)
+
+    monkeypatch.setattr(merge_writer, "resolve_sparse_import_spec", tracking_spec)
+    monkeypatch.setattr(merge_writer, "resolve_sparse_import_batch", tracking_batch)
+    path = str(tmp_path / "accounting.zarr")
+    DataStoreMerge(
+        datasets=_sparse_rna_sources(),
+        zarr_path=path,
+        names=["left", "right"],
+        prepend_text="",
+        seed=0,
+        nthreads=1,
+    ).dump()
+
+    # Preflight admits exactly the resident bytes execution holds, including
+    # the destination count summary.
+    assert preflight
+    assert preflight == execution
+    counts = zarr.open_group(path, mode="r")["RNA/counts"][:]
+    cumulative = np.concatenate([[0], np.cumsum(np.count_nonzero(counts, axis=1))])
+    assert window_nnz == [int(np.max(cumulative[3:] - cumulative[:-3]))]
+
+
+def test_dataset_merge_counts_t_preflight_uses_merge_policy(tmp_path, monkeypatch):
+    from scarf.storage.types import array_metadata_shards
+
+    admitted = []
+    original = merge_datasets.preflight_counts_t_spec
+
+    def tracking(*args, **kwargs):
+        spec = original(*args, **kwargs)
+        admitted.append(spec)
+        return spec
+
+    monkeypatch.setattr(merge_datasets, "preflight_counts_t_spec", tracking)
+    path = str(tmp_path / "policy.zarr")
+    DataStoreMerge(
+        datasets=_sparse_rna_sources(),
+        zarr_path=path,
+        names=["left", "right"],
+        prepend_text="",
+        seed=0,
+        nthreads=1,
+        policy=CountMatrixPolicy(unitBytes=64, chunkBytes=32),
+    ).dump()
+
+    counts_t = zarr.open_group(path, mode="r")["RNA/countsT"]
+    assert admitted
+    assert tuple(admitted[-1].chunks) == tuple(counts_t.chunks)
+    assert tuple(admitted[-1].shards) == tuple(array_metadata_shards(counts_t))
+
+
+def test_dataset_merge_writes_cell_metadata_in_whole_chunk_bands(tmp_path, monkeypatch):
+    import scarf.merge.metadata as merge_metadata
+
+    def merger(path):
+        left, right = _sparse_rna_sources()
+        left.cells._columns["quality"] = np.arange(12, dtype=np.int16)
+        left.cells.columns.append("quality")
+        return DataStoreMerge(
+            datasets=[left, right],
+            zarr_path=str(path),
+            names=["left", "right"],
+            prepend_text="",
+            seed=0,
+            nthreads=1,
+        )
+
+    reference_path = tmp_path / "single_chunk.zarr"
+    merger(reference_path).dump()
+
+    writes: list[tuple[int, int]] = []
+    original_create = merge_metadata.create_streamed_metadata_column
+
+    def tracking_create(group, name, *, blocks, **kwargs):
+        def tracked():
+            for block in blocks:
+                writes.append((block.start, len(block.values)))
+                yield block
+
+        return original_create(group, name, blocks=tracked(), **kwargs)
+
+    # Five-row chunks make bands straddle the four-row source blocks.
+    monkeypatch.setattr(merge_metadata, "PROFILE_METADATA_CHUNK", 5)
+    monkeypatch.setattr(
+        merge_metadata, "create_streamed_metadata_column", tracking_create
+    )
+    banded_path = tmp_path / "banded.zarr"
+    merger(banded_path).dump()
+
+    assert writes
+    assert all(start % 5 == 0 and size == min(5, 24 - start) for start, size in writes)
+    reference = zarr.open_group(reference_path, mode="r")["cellData"]
+    banded = zarr.open_group(banded_path, mode="r")["cellData"]
+    assert set(banded.array_keys()) == set(reference.array_keys())
+    for name in reference.array_keys():
+        assert banded[name].chunks == (5,)
+        np.testing.assert_array_equal(banded[name][:], reference[name][:])
+    resumed = merger(banded_path).plan()
+    assert resumed.cellDataAction == "skip"
+
+    ids = zarr.open_group(banded_path, mode="r+")["cellData/ids"]
+    swapped = np.asarray(ids[:])
+    swapped[[4, 5]] = swapped[[5, 4]]
+    ids[:] = swapped
+    blocked = merger(banded_path).plan()
+    assert blocked.canDump is False
+    assert "order of cells" in blocked.blockedReason
 
 
 def test_dataset_merge_producer_reserve_uses_source_feature_width():
@@ -3012,6 +3152,83 @@ def test_dataset_merge_rejects_disjoint_suffixed_feature_ids():
             zarr_path=MemoryStore(),
             names=["left", "right"],
         ).plan()
+
+
+def _id_scheme_sources():
+    left = _MergeDataStore(
+        [
+            _MergeAssay(
+                "RNA",
+                [[1, 10, 100]],
+                ["c0"],
+                ["ENSG01", "ENSG02", "ENSG03"],
+                ["A", "B", "B"],
+                block_size=1,
+            )
+        ],
+        zarr_loc="memory://left",
+    )
+    right = _MergeDataStore(
+        [
+            _MergeAssay(
+                "RNA",
+                [[2, 20]],
+                ["c0"],
+                ["A", "C"],
+                ["A", "C"],
+                block_size=1,
+            )
+        ],
+        zarr_loc="memory://right",
+    )
+    return left, right
+
+
+def test_dataset_merge_matches_features_by_name_across_id_schemes():
+    left, right = _id_scheme_sources()
+    with pytest.raises(ValueError, match="feature_key='names'"):
+        DataStoreMerge(
+            datasets=[left, right],
+            zarr_path=MemoryStore(),
+            names=["left", "right"],
+        ).plan()
+
+    destination = MemoryStore()
+    merger = DataStoreMerge(
+        datasets=[left, right],
+        zarr_path=destination,
+        names=["left", "right"],
+        prepend_text="",
+        seed=0,
+        feature_key="names",
+    )
+    plan = merger.plan()
+    assert plan.manifest["featureKey"] == "names"
+    assert plan.assays[0].nFeatures == 3
+    merger.dump()
+
+    root = zarr.open_group(destination, mode="r")
+    ids = np.asarray(root["RNA/featureData/ids"][:]).astype(str).tolist()
+    assert ids == ["A", "B", "C"]
+    assert np.asarray(root["RNA/featureData/names"][:]).astype(str).tolist() == ids
+    cells = np.asarray(root["cellData/ids"][:]).astype(str)
+    counts = np.asarray(root["RNA/counts"][:])
+    # The two left features named B are summed into one merged feature.
+    assert {cell: row.tolist() for cell, row in zip(cells, counts, strict=True)} == {
+        "left__c0": [1, 110, 0],
+        "right__c0": [2, 0, 20],
+    }
+
+
+def test_dataset_merge_rejects_unknown_feature_key():
+    left, right = _id_scheme_sources()
+    with pytest.raises(ValueError, match="feature_key must be one of"):
+        DataStoreMerge(
+            datasets=[left, right],
+            zarr_path=MemoryStore(),
+            names=["left", "right"],
+            feature_key="symbols",
+        )
 
 
 def test_dataset_merge_namespaces_duplicate_cell_ids_across_sources():

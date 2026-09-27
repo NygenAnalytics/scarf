@@ -164,8 +164,6 @@ def _normalize_external_roots(
 def _inspect_external_artifact(
     root: zarr.Group,
     locator: ExternalArtifactRef | _ExternalLineageRef,
-    *,
-    dataset_fingerprint_validated: bool = False,
 ) -> ArtifactStatus:
     assay_name = (
         locator.ref.assay
@@ -181,7 +179,7 @@ def _inspect_external_artifact(
         )
     assay = root[assay_name]
     received = assay.attrs.get("dataset_fingerprint")
-    if received is None and not dataset_fingerprint_validated:
+    if received is None:
         raise ValueError(
             f"External root assay {assay_name!r} has no stored "
             f"dataset_fingerprint; expected {locator.dataset_fingerprint!r}"
@@ -198,8 +196,6 @@ def _build_graph(
     root: zarr.Group,
     outputs: Mapping[str, ArtifactRef],
     external_roots: Mapping[str, zarr.Group],
-    *,
-    validated_external_fingerprints: frozenset[str] = frozenset(),
 ) -> nx.DiGraph:
     graph = nx.DiGraph()
     visited: set[_LineageLocator] = set()
@@ -216,9 +212,6 @@ def _build_graph(
                 else _inspect_external_artifact(
                     external_root,
                     locator,
-                    dataset_fingerprint_validated=(
-                        locator.dataset_fingerprint in validated_external_fingerprints
-                    ),
                 )
             )
         else:
@@ -354,27 +347,6 @@ class ArtifactLineage:
         outputs = _normalize_outputs(target)
         roots = _normalize_external_roots(external_roots)
         return cls(_build_graph(root, outputs, roots), outputs)
-
-    @classmethod
-    def _from_validated_external_roots(
-        cls,
-        root: zarr.Group,
-        target: LineageTarget,
-        *,
-        external_roots: Mapping[str, zarr.Group],
-    ) -> "ArtifactLineage":
-        """Build lineage after each external root fingerprint was validated."""
-        outputs = _normalize_outputs(target)
-        roots = _normalize_external_roots(external_roots)
-        return cls(
-            _build_graph(
-                root,
-                outputs,
-                roots,
-                validated_external_fingerprints=frozenset(roots),
-            ),
-            outputs,
-        )
 
     @property
     def graph(self) -> nx.DiGraph:

@@ -4,6 +4,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import zarr
+from zarr.core.buffer import default_buffer_prototype
+from zarr.core.sync import sync
 from zarr.storage import MemoryStore
 
 import scarf.metadata as metadata
@@ -18,8 +20,10 @@ from scarf.metadata.selection import (
     resolve_grouping,
     valid_category_mask,
 )
+from scarf.metadata.queries import missing_frame_values
 from scarf.metadata.rows import MetaDataRowBlock as implementation_row_block
 from scarf.metadata.rows import (
+    apply_missing_mask,
     array_row_selection_peak_bytes,
     iter_metadata_column_blocks,
     metadata_missing_mask,
@@ -174,6 +178,68 @@ def test_metadata_row_helpers_read_permutations_and_missing_masks():
         [True, False],
     )
     assert "__scarf_missing__score" not in table.columns
+
+
+def test_apply_missing_mask_shows_masked_rows_as_missing():
+    missing = np.array([False, True, False])
+    counts = np.array([3, 0, 5], dtype=np.int64)
+
+    assert apply_missing_mask(counts, None) is counts
+    unmasked = apply_missing_mask(counts, np.zeros(3, dtype=bool))
+    assert unmasked.dtype == np.int64
+    numeric = apply_missing_mask(counts, missing)
+    assert numeric.dtype == np.float64
+    np.testing.assert_array_equal(numeric, [3.0, np.nan, 5.0])
+    np.testing.assert_array_equal(counts, [3, 0, 5])
+    np.testing.assert_array_equal(
+        apply_missing_mask(np.array([True, True, True]), missing),
+        [True, False, True],
+    )
+    assert apply_missing_mask(np.array(["a", "", "b"]), missing).tolist() == [
+        "a",
+        None,
+        "b",
+    ]
+    assert apply_missing_mask(counts, missing, labels=True).tolist() == [3, None, 5]
+    assert apply_missing_mask(
+        np.array([True, False, True]), missing, labels=True
+    ).tolist() == [True, None, True]
+    with pytest.raises(ValueError, match="does not align"):
+        apply_missing_mask(counts, np.array([True]))
+
+
+def test_metadata_frames_show_masked_rows_as_missing_and_fetch_stays_raw():
+    table = _metadata_fixture()
+    group = table.locations["primary"]
+    missing = np.array([False, True, True, False])
+    for name, values in (
+        ("donor", np.array([1, 0, 0, 2], dtype=np.int64)),
+        ("site", np.array(["A", "", "", "B"])),
+        ("flag", np.array([True, False, False, False])),
+    ):
+        group.create_array(name, data=values, chunks=(2,))
+        group.create_array(f"__scarf_missing__{name}", data=missing, chunks=(2,))
+        group[name].attrs["missing_mask"] = f"__scarf_missing__{name}"
+
+    np.testing.assert_array_equal(table.fetch_all("donor"), [1, 0, 0, 2])
+    np.testing.assert_array_equal(table.fetch("site"), ["A", "", "B"])
+    frame = table.to_pandas_dataframe(["donor", "site", "flag", "score"], key="I")
+    assert frame["donor"].dtype == np.float64
+    assert frame["flag"].dtype == "boolean"
+    np.testing.assert_array_equal(
+        frame.isna().to_numpy(),
+        [[False, False, False, False], [True, True, True, False], [False] * 4],
+    )
+    assert frame["donor"].tolist()[::2] == [1.0, 2.0]
+    assert frame["site"].tolist()[::2] == ["A", "B"]
+    assert frame["flag"].tolist()[::2] == [True, False]
+    head = table.head(2)
+    assert head["donor"].isna().tolist() == [False, True]
+    assert head["site"].isna().tolist() == [False, True]
+    assert head["score"].tolist() == [0.5, 2.0]
+    boolean = missing_frame_values(np.array([True, True]), np.array([True, False]))
+    assert boolean.dtype == "boolean"
+    assert boolean.isna().tolist() == [True, False]
 
 
 def test_metadata_row_helpers_preserve_noncontiguous_order_without_span():
@@ -487,7 +553,7 @@ def test_resolve_grouping_validates_field_kind_and_missing_mask(monkeypatch):
         resolve_grouping(None, cells, CellField("group", kind="categorical"))
 
 
-def test_metadata_table_mount_fill_and_error_contracts(monkeypatch):
+def test_metadata_table_mount_fill_and_error_contracts():
     empty = zarr.open_group(store=MemoryStore(), mode="w")
     with pytest.raises(ValueError, match="empty zarr group"):
         metadata.MetaData(empty)
@@ -499,15 +565,16 @@ def test_metadata_table_mount_fill_and_error_contracts(monkeypatch):
     primary.create_array("x_value", data=np.arange(4), chunks=(2,))
     table = metadata.MetaData(primary)
 
-    class BrokenGroup:
-        @staticmethod
-        def keys():
-            return ["broken"]
-
-        def __getitem__(self, _key):
-            raise RuntimeError("unreadable child")
-
-    assert table._get_size(BrokenGroup()) == table.N
+    # Listing a group reads every column's metadata, so a corrupt column fails loudly.
+    corrupt = zarr.open_group(store=MemoryStore(), mode="w")
+    corrupt.create_array("value", data=np.arange(4), chunks=(2,))
+    sync(
+        corrupt.store.set(
+            "value/zarr.json", default_buffer_prototype().buffer.from_bytes(b"{")
+        )
+    )
+    with pytest.raises(ValueError):
+        table._get_size(corrupt)
     assert table._get_size(empty) == table.N
     assert table._col_renamer("aux", "score") == "aux_score"
     assert table._get_loc("I") == ("primary", "I")
@@ -574,6 +641,5 @@ def test_metadata_table_mount_fill_and_error_contracts(monkeypatch):
     )
     assert repr(table) == "MetaData of 2(4) elements"
 
-    monkeypatch.setattr(table, "_verify_bool", lambda _key: False)
-    with pytest.raises(ValueError, match="Unexpected error"):
-        table.active_index("I")
+    with pytest.raises(TypeError, match="boolean type column"):
+        table.active_index("score")

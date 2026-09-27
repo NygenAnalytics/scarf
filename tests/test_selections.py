@@ -21,7 +21,6 @@ from scarf.storage.selections import (
     read_stored_selection_mask,
     resolve_generated_selection_artifact,
     resolve_metadata_snapshot,
-    resolve_selection_artifact,
     resolve_stored_selection_artifact,
     snapshot_run_metadata,
     validate_run_metadata_snapshot,
@@ -495,45 +494,23 @@ def test_run_metadata_snapshot_rejects_ambiguous_or_misaligned_inputs() -> None:
         snapshot_run_metadata(**common, columns=["names"], assay="RNA")
 
 
-def test_resolve_selection_artifact_rejects_bad_masks_and_ids() -> None:
+def test_selection_artifact_rejects_bad_masks_and_ids() -> None:
     root = zarr.open_group(store=MemoryStore(), mode="w")
-    row_ids = np.array(["a", "b", "c"])
     common = dict(
         root=root,
         scope="datastore",
         kind="cell_selection",
-        row_ids=row_ids,
+        row_ids=np.array(["a", "b", "c"]),
         operation="manual_selection",
         parameters={},
         inputs={},
         source_column="I",
     )
-    with pytest.raises(TypeError, match="one-dimensional boolean"):
-        resolve_selection_artifact(**common, values=np.array([1, 0, 1]))
+    for values in (np.array([1, 0, 1]), np.array([[True, False, True]])):
+        with pytest.raises(TypeError, match="one-dimensional boolean"):
+            resolve_generated_selection_artifact(**common, values=values)
     with pytest.raises(ValueError, match="must align"):
-        resolve_selection_artifact(
-            **common,
-            values=np.array([True, False]),
-        )
-    with pytest.raises(TypeError, match="one-dimensional boolean"):
-        resolve_generated_selection_artifact(
-            **common,
-            values=np.array([[True, False, True]]),
-            assay="RNA",
-        )
-    with pytest.raises(ValueError, match="must align"):
-        resolve_generated_selection_artifact(
-            root=root,
-            scope="assay",
-            assay="RNA",
-            kind="feature_selection",
-            values=np.array([True, False, True]),
-            row_ids=np.array(["a", "b"]),
-            operation="select_hvgs",
-            parameters={},
-            inputs={},
-            source_column="hvgs",
-        )
+        resolve_generated_selection_artifact(**common, values=np.array([True, False]))
 
 
 def test_selection_artifacts_snapshot_values_and_reuse_by_provenance() -> None:
@@ -541,7 +518,7 @@ def test_selection_artifacts_snapshot_values_and_reuse_by_provenance() -> None:
     values = np.array([True, False, True, False])
     row_ids = np.array(["a", "b", "c", "d"])
 
-    first = resolve_selection_artifact(
+    first = resolve_generated_selection_artifact(
         root,
         scope="datastore",
         kind="cell_selection",
@@ -551,8 +528,8 @@ def test_selection_artifacts_snapshot_values_and_reuse_by_provenance() -> None:
         parameters={},
         inputs={},
         source_column="I",
-    )
-    renamed = resolve_selection_artifact(
+    )[0]
+    renamed = resolve_generated_selection_artifact(
         root,
         scope="datastore",
         kind="cell_selection",
@@ -562,7 +539,7 @@ def test_selection_artifacts_snapshot_values_and_reuse_by_provenance() -> None:
         parameters={},
         inputs={},
         source_column="renamed_mask",
-    )
+    )[0]
 
     assert renamed == first
     group = root[artifact_path(first)]
@@ -578,7 +555,7 @@ def test_changed_or_invalidated_selection_creates_another_random_artifact() -> N
     changed = np.array([True, True, False, False])
     row_ids = np.arange(4).astype(str)
 
-    first = resolve_selection_artifact(
+    first = resolve_generated_selection_artifact(
         root,
         scope="assay",
         assay="RNA",
@@ -589,8 +566,8 @@ def test_changed_or_invalidated_selection_creates_another_random_artifact() -> N
         parameters={"top_n": 2},
         inputs={},
         source_column="hvgs",
-    )
-    changed_ref = resolve_selection_artifact(
+    )[0]
+    changed_ref = resolve_generated_selection_artifact(
         root,
         scope="assay",
         assay="RNA",
@@ -601,8 +578,8 @@ def test_changed_or_invalidated_selection_creates_another_random_artifact() -> N
         parameters={"top_n": 2},
         inputs={},
         source_column="hvgs",
-    )
-    invalidated = resolve_selection_artifact(
+    )[0]
+    invalidated = resolve_generated_selection_artifact(
         root,
         scope="assay",
         assay="RNA",
@@ -614,7 +591,7 @@ def test_changed_or_invalidated_selection_creates_another_random_artifact() -> N
         inputs={},
         source_column="hvgs",
         invalidate_cache=True,
-    )
+    )[0]
 
     assert (
         len({first.artifact_id, changed_ref.artifact_id, invalidated.artifact_id}) == 3
@@ -625,7 +602,7 @@ def test_integer_selection_payload_is_not_reused() -> None:
     root = zarr.open_group(store=MemoryStore(), mode="w")
     values = np.array([True, False, True])
     row_ids = np.array(["a", "b", "c"])
-    first = resolve_selection_artifact(
+    first = resolve_generated_selection_artifact(
         root,
         scope="datastore",
         kind="cell_selection",
@@ -635,7 +612,7 @@ def test_integer_selection_payload_is_not_reused() -> None:
         parameters={},
         inputs={},
         source_column="I",
-    )
+    )[0]
     group = root[artifact_path(first)]
     del group["values"]
     create_metadata_column(
@@ -645,7 +622,7 @@ def test_integer_selection_payload_is_not_reused() -> None:
         dtype=np.int8,
     )
 
-    replacement = resolve_selection_artifact(
+    replacement = resolve_generated_selection_artifact(
         root,
         scope="datastore",
         kind="cell_selection",
@@ -655,7 +632,7 @@ def test_integer_selection_payload_is_not_reused() -> None:
         parameters={},
         inputs={},
         source_column="I",
-    )
+    )[0]
 
     assert replacement != first
     assert root[artifact_path(replacement)]["values"].dtype == np.dtype(bool)

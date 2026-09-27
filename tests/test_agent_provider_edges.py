@@ -106,7 +106,9 @@ def test_data_enrichment_cache_rollback_and_pending_branches(
         raise UnexpectedModelBehavior("no inspection completed")
 
     monkeypatch.setattr(enrichment_agent, "run_agent_sync", fail_before_inspection)
-    store = SimpleNamespace(assay_names=["RNA"])
+    store = SimpleNamespace(
+        assay_names=["RNA"], zw=SimpleNamespace(attrs={"assayTypes": {"RNA": "RNA"}})
+    )
     failed = DataEnrichmentAgent(object()).run(store)
     assert failed.status == "failed"
     assert failed.inspections == []

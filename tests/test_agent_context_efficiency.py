@@ -267,9 +267,13 @@ def test_context_identity_binds_added_columns_without_repeating_resume_scan(
         return values[column]
 
     monkeypatch.setattr(execution, "_metadata_column_fingerprint", fingerprint)
-    store = SimpleNamespace(cells=SimpleNamespace(columns=["original", "capture"]))
+    store = SimpleNamespace(
+        cells=SimpleNamespace(
+            columns=["original", "capture", "ids", "RNA_nCounts", "RNA_nFeatures"]
+        )
+    )
     request = SimpleNamespace(
-        inputIdentity={"data": {"metadata": {"original": "validated"}}}
+        inputIdentity={"data": {"assay": "RNA", "metadata": {"original": "validated"}}}
     )
     first = _context_metadata_identity(store, request)
     assert first == {"original": "validated", "capture": "first"}

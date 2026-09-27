@@ -105,11 +105,14 @@ class CrToZarr:
     ) -> None:
         from ..storage.arrays import create_zarr_obj_array
         from ..storage.types import as_zarr_group
+        from ._store import skip_reserved_metadata_columns
 
         cell_columns = getattr(self.cr, "get_cell_columns", None)
         if callable(cell_columns):
-            for name, raw_values in cell_columns():
-                if name in {"I", "ids", "names"} or name in cell_group:
+            for name, raw_values in skip_reserved_metadata_columns(
+                cell_columns(), "cell"
+            ):
+                if name in cell_group:
                     continue
                 values = np.asarray(raw_values)
                 if values.ndim != 1 or values.size != self.cr.nCells:
@@ -146,7 +149,9 @@ class CrToZarr:
                 as_zarr_group(self.z[group_path], name=group_path),
                 indexes,
             )
-        for name, raw_values in feature_columns():
+        for name, raw_values in skip_reserved_metadata_columns(
+            feature_columns(), "feature"
+        ):
             values = np.asarray(raw_values)
             if values.ndim != 1 or values.size != self.cr.nFeatures:
                 raise ValueError(
@@ -154,7 +159,7 @@ class CrToZarr:
                     f"expected ({self.cr.nFeatures},)"
                 )
             for group, indexes in targets.values():
-                if name in {"I", "ids", "names"} or name in group:
+                if name in group:
                     continue
                 selected = values[indexes]
                 create_zarr_obj_array(
@@ -216,6 +221,7 @@ class CrToZarr:
         """
         from scipy.sparse import coo_matrix
 
+        from ..storage.identity import CountSummary, finalize_counts
         from ..storage.schema import load_count_array
         from ..storage.sharding import (
             SparseShardBuffer,
@@ -235,6 +241,7 @@ class CrToZarr:
             for assay in input_ranges
         }
         buffers = {assay: SparseShardBuffer(store) for assay, store in stores.items()}
+        summaries = {assay: CountSummary(store) for assay, store in stores.items()}
         feat_offset = self._prep_feat_index_offset(input_ranges)
         configure_lines = getattr(
             self.cr,
@@ -257,6 +264,9 @@ class CrToZarr:
             )
             if callable(reader_resident):
                 resident_reader_bytes = max(0, int(reader_resident()))
+            resident_reader_bytes += sum(
+                summary.nbytes for summary in summaries.values()
+            )
             projection_value_bytes = max(
                 self.cr.matrix_dtype.itemsize,
                 *(store.dtype.itemsize for store in stores.values()),
@@ -354,6 +364,9 @@ class CrToZarr:
                 producerReserveBytes=plan.producerReserveBytes,
                 total=plan.writeTasks,
                 io=self.io,
+                countSummaries={
+                    stores[name].path: summary for name, summary in summaries.items()
+                },
             )
             if any(buffer.rows != self.cr.nCells for buffer in buffers.values()):
                 raise AssertionError(
@@ -364,6 +377,8 @@ class CrToZarr:
                 f"{sum(buffer.nColumns for buffer in buffers.values())} features "
                 f"from Cell Ranger to {len(stores)} assay(s)"
             )
+            for assay, summary in summaries.items():
+                finalize_counts(stores[assay], summary=summary)
             from .counts_t import finalize_writer_counts_t_many
 
             finalize_writer_counts_t_many(

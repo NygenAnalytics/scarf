@@ -20,12 +20,9 @@ _SELECTION_INDEX_ARRAYS = 16
 class _RowReadableMetaData(Protocol):
     N: int
 
-    @property
-    def columns(self) -> list[str]: ...
-
     def _get_array(self, column: str) -> Any: ...
 
-    def _verify_bool(self, key: str) -> bool: ...
+    def _bool_array(self, key: str) -> Any: ...
 
     def default_block_rows(self, column: str = "I") -> int: ...
 
@@ -187,6 +184,42 @@ def read_metadata_missing_rows_chunkwise(
     return np.asarray(read_array_rows_chunkwise(mask, rows), dtype=bool)
 
 
+def apply_missing_mask(
+    values: np.ndarray,
+    missing: np.ndarray | None,
+    *,
+    labels: bool = False,
+) -> np.ndarray:
+    """Show rows flagged by a linked missing mask as missing values.
+
+    Nullable columns and artifacts store a placeholder in each masked row. By
+    default, masked numeric rows become NaN in a float64 copy, masked boolean
+    rows become False so that boolean filters exclude them, and other masked
+    rows become None in an object copy. With ``labels=True``, every masked row
+    becomes None in an object copy, so categorical labels keep their values.
+    ``values`` is returned unchanged when no row is masked.
+    """
+    array = np.asarray(values)
+    if missing is None:
+        return array
+    mask = np.asarray(missing, dtype=bool)
+    if mask.shape != array.shape:
+        raise ValueError("Missing mask does not align with its values")
+    if not mask.any():
+        return array
+    kind = "O" if labels else array.dtype.kind
+    if kind == "b":
+        output = array.copy()
+        output[mask] = False
+    elif kind in {"f", "i", "u"}:
+        output = array.astype(np.float64, copy=True)
+        output[mask] = np.nan
+    else:
+        output = array.astype(object, copy=True)
+        output[mask] = None
+    return output
+
+
 @dataclass(frozen=True, slots=True)
 class MetaDataRowBlock:
     """One contiguous slice of a metadata table for blockwise scans."""
@@ -197,13 +230,13 @@ class MetaDataRowBlock:
     values: dict[str, np.ndarray]
 
 
+def _array_block_rows(array: Any, n_rows: int) -> int:
+    return row_band(array_geometry(array), unit="chunk", fallback=min(n_rows, 100_000))
+
+
 def default_block_rows(metadata: _RowReadableMetaData, column: str = "I") -> int:
     """Return a row block size aligned with the backing Zarr chunks."""
-    return row_band(
-        array_geometry(metadata._get_array(column)),
-        unit="chunk",
-        fallback=min(metadata.N, 100_000),
-    )
+    return _array_block_rows(metadata._get_array(column), metadata.N)
 
 
 def iter_row_blocks(
@@ -214,22 +247,15 @@ def iter_row_blocks(
     block_rows: int | None = None,
 ) -> Iterator[MetaDataRowBlock]:
     """Yield contiguous active row blocks from a metadata table."""
-    metadata._verify_bool(cell_key)
+    key_array = metadata._bool_array(cell_key)
     if block_rows is None:
-        block_rows = metadata.default_block_rows(cell_key)
+        block_rows = _array_block_rows(key_array, metadata.N)
     if block_rows < 1:
         raise ValueError("block_rows must be >= 1")
-
-    if columns is None:
-        column_names: list[str] = []
-    else:
-        column_names = list(columns)
-        for column in column_names:
-            if column not in metadata.columns:
-                raise KeyError(f"{column} does not exist in the metadata columns.")
-
-    key_array = metadata._get_array(cell_key)
-    column_arrays = {column: metadata._get_array(column) for column in column_names}
+    column_arrays = {
+        column: metadata._get_array(column)
+        for column in ([] if columns is None else list(columns))
+    }
 
     for start in range(0, metadata.N, block_rows):
         stop = min(start + block_rows, metadata.N)

@@ -227,7 +227,7 @@ def test_rna_summary_and_detected_selection_have_exact_ledger_identity(
         "normalization_method": callable_identity(store.RNA.normMethod),
         "size_factor": store.RNA.sf,
     }
-    assert set(summary_status.inputs or {}) == {"cell_selection"}
+    assert set(summary_status.inputs or {}) == {"cell_selection", "dataset_fingerprint"}
     summary = store.zw[artifact_path(summary_ref)]
     assert set(summary.array_keys()) == {"normed_tot", "normed_n", "sigmas"}
     assert isinstance(summary.attrs["ordered_feature_ids_fingerprint"], str)
@@ -285,7 +285,7 @@ def test_datastore_cell_cycle_read_only_guard_precedes_planning(
 
     with pytest.raises(
         PermissionError,
-        match="Cell-cycle scoring requires a DataStore opened with zarr_mode='r\\+'",
+        match="run_cell_cycle_scoring requires a DataStore opened with zarr_mode='r\\+'",
     ):
         read_only.run_cell_cycle_scoring(selection)
 

@@ -205,7 +205,8 @@ def compare_covariates(
         "independentUnit": independent,
         "declaredInCharacterization": declared_pair,
     }
-    if any(name not in cells.columns or name not in records for name in requested):
+    available = set(cells.columns)
+    if any(name not in available or name not in records for name in requested):
         reasons.append("unknownObservedColumn")
     elif any(
         records[name].get("kind") != "categorical" for name in {unit, independent}

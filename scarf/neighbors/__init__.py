@@ -2,7 +2,6 @@ from importlib import import_module as _import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .diffusion import diffusion_operator as diffusion_operator
     from .graph import (
         calc_snn as calc_snn,
         merge_graphs as merge_graphs,
@@ -14,12 +13,9 @@ if TYPE_CHECKING:
         instantiate_knn_index as instantiate_knn_index,
     )
     from .integration import wnn_integration as wnn_integration
-    from .stream import AnnStream as AnnStream
 
 __all__ = [
-    "AnnStream",
     "calc_snn",
-    "diffusion_operator",
     "fix_knn_query",
     "instantiate_knn_index",
     "merge_graphs",
@@ -29,9 +25,7 @@ __all__ = [
 ]
 
 _LAZY_EXPORTS = {
-    "AnnStream": (".stream", "AnnStream"),
     "calc_snn": (".graph", "calc_snn"),
-    "diffusion_operator": (".diffusion", "diffusion_operator"),
     "fix_knn_query": (".index", "fix_knn_query"),
     "instantiate_knn_index": (".index", "instantiate_knn_index"),
     "merge_graphs": (".graph", "merge_graphs"),

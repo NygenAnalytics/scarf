@@ -16,10 +16,11 @@ from ..mapping.features import normalize_reference_counts
 from ..mapping.reference import MappingReference
 from ..mapping.symphony import project_pca, zero_norm_rows
 from ..matrix import ChunkedArray
-from ..neighbors.diffusion import diffusion_operator
+from ..neighbors.diffusion import transition_matrix
 from ..storage.ann_index import ANN_INDEX_ARRAY, ANN_INDEX_CHUNK_BYTES
 from ..storage.artifacts import artifact_group
-from ..storage.budget import ResourceBudget, admit_stream
+from ..storage.budget import ResourceBudget
+from ..storage.execution import admit_stream
 from ..storage.geometry import array_geometry
 from ..storage.parallel import stream_shards
 from ..storage.partition import affordable_width, row_band
@@ -247,6 +248,19 @@ def score_synthetic_doublets(
     resources: ResourceBudget,
     reserved_resident_bytes: int = 0,
 ) -> np.ndarray:
+    """Score reference cells by their neighbor weights from simulated doublets.
+
+    Simulated doublets that pass the minimum-feature filter are normalized like
+    the reference and projected onto its PCA. Each scored doublet adds the
+    weights of its nearest reference neighbors, and the sums are scaled by the
+    number of scored doublets and neighbors before ``log1p``.
+
+    A doublet projected exactly onto the reference PCA center has no direction
+    in PC space and is skipped. The check is on the projection, not the counts:
+    unlike mapping, which reports query cells without counts in the shared
+    features as uninformative, doublets with no counts in the selected features
+    are deliberately scored at the projection of an empty profile.
+    """
     if isinstance(save_k, bool | np.bool_) or not isinstance(save_k, int | np.integer):
         raise TypeError("save_k must be a positive integer")
     if save_k < 1:
@@ -359,7 +373,7 @@ def score_synthetic_doublets(
         workers=resources.workers,
     )
     scores = np.zeros(reference.selected_cell_count, dtype=np.float64)
-    informative_count = 0
+    scored_count = 0
     parameters = reference.normalization_parameters
     with threadpool_limits(limits=resources.workers):
         for start in range(0, n_sim, batch_rows):
@@ -387,17 +401,20 @@ def score_synthetic_doublets(
             del raw
             coordinates = project_pca(normalized, model)
             del normalized
-            informative = ~zero_norm_rows(coordinates)
-            if informative.any():
-                result = query.query(coordinates[informative])
+            # Skip rows projected exactly onto the reference PCA center. The
+            # check is on the projection, so no row is skipped for being empty
+            # in the selected features.
+            scored = ~zero_norm_rows(coordinates)
+            if scored.any():
+                result = query.query(coordinates[scored])
                 indices, distances = result[:2]
                 weights = mapping_score_weights(distances)
                 np.add.at(scores, indices.ravel(), weights.ravel())
-                informative_count += int(informative.sum())
+                scored_count += int(scored.sum())
                 del result, indices, distances, weights
             del coordinates
-    if informative_count:
-        scores *= 1_000 / (informative_count * n_k)
+    if scored_count:
+        scores *= 1_000 / (scored_count * n_k)
     np.log1p(scores, out=scores)
     return scores
 
@@ -413,7 +430,7 @@ def smooth_doublet_scores(
         raise TypeError("t must be a positive integer")
     if power < 1:
         raise ValueError("t must be a positive integer")
-    transition = diffusion_operator(graph, power=1)
+    transition = transition_matrix(graph)
     for _ in range(power):
         scores = np.asarray(transition.dot(scores), dtype=np.float64)
     if normalize:
@@ -466,18 +483,29 @@ def write_doublet_target_zarr(
         policy=policy,
     )
     store = load_count_array(z, assay_name, None)
+    from ..storage.identity import CountSummary, finalize_counts
+
+    summary = CountSummary(store)
     write_dense_in_shard_rows(
         store,
         lambda s, e: sim_counts[s:e].toarray().astype(dtype),
         msg="Writing simulated doublets",
         resources=resources,
         io=io,
+        residentBytes=sim_counts.data.nbytes
+        + sim_counts.indices.nbytes
+        + sim_counts.indptr.nbytes
+        + summary.nbytes,
+        producerBytes=min(n_sim, store.shards[0] if store.shards else store.chunks[0])
+        * sim_counts.shape[1]
+        * sim_counts.dtype.itemsize,
+        countSummary=summary,
     )
     from ..assay.classification import (
         is_rna_assay_type,
         resolve_persisted_assay_type,
     )
-    from ..storage.sharding import finalize_rna_counts_t
+    from ..storage.sharding import write_counts_t
     from ..storage.types import as_zarr_group
 
     type_name = resolve_persisted_assay_type(assay_name)
@@ -489,9 +517,10 @@ def write_doublet_target_zarr(
     )
     types[assay_name] = type_name
     z.attrs["assayTypes"] = types
+    finalize_counts(store, summary=summary)
     if is_rna_assay_type(type_name):
         group = as_zarr_group(z[assay_name], name=assay_name)
-        finalize_rna_counts_t(
+        write_counts_t(
             store,
             group,
             profile=resolved_profile,

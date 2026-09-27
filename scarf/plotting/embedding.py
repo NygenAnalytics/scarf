@@ -1,11 +1,13 @@
 """Embedding scatter plots."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from typing import Any, Hashable
 
 import numpy as np
 import pandas as pd
 
+from ..metadata.rows import apply_missing_mask
+from ..metadata.selection import CellFieldKind
 from ..storage.artifacts import ArtifactRef, inspect_artifact
 from ._contracts import (
     CategoricalScale,
@@ -18,6 +20,9 @@ from ._contracts import (
     PlotProvenance,
 )
 from ._data import (
+    _cell_column_missing,
+    _cell_metadata_columns,
+    _fetch_cell_column,
     _resolve_grouping,
     _resolve_layout,
     fetch_normalized_feature_matrix,
@@ -27,6 +32,7 @@ from ._data import (
 from ._deps import require_matplotlib
 from ._display import stored_display_metadata
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
+from ..utils.arrays import sort_categories
 from ._style import (
     DEFAULT_PANEL_INCHES,
     DEFAULT_POINT_EDGEWIDTH,
@@ -43,7 +49,6 @@ from ._style import (
     legend_side_columns,
     resolve_legend_loc,
     scatter_edgecolor,
-    sort_categories,
     square_axis_limits,
     theme_context,
 )
@@ -100,6 +105,7 @@ def _color_labels(
     *,
     from_assay: str | None,
 ) -> list[str]:
+    metadata_columns = _cell_metadata_columns(store, color_items)
     labels: list[str] = []
     for item in color_items:
         if item is None:
@@ -108,7 +114,7 @@ def _color_labels(
             labels.append(item.kind)
         elif isinstance(item, CellField):
             labels.append(item.label or item.key)
-        elif isinstance(item, str) and item in store.cells.columns:
+        elif isinstance(item, str) and item in metadata_columns:
             labels.append(item)
         else:
             labels.append(resolve_feature(store, item, from_assay=from_assay).label)
@@ -150,9 +156,9 @@ def _multi_layout_facets(
     if facet_order is not None:
         return list(facet_order)
 
-    values = np.asarray(store.cells.fetch(facet_by, key=cell_key))
+    values = _fetch_cell_column(store, facet_by, cell_key=cell_key, labels=True)
     subset = (
-        np.asarray(store.cells.fetch(subset_by, key=cell_key))
+        _fetch_cell_column(store, subset_by, cell_key=cell_key)
         if subset_by is not None
         else None
     )
@@ -334,14 +340,13 @@ def _embedding_multiple_layouts(
     return result
 
 
-def _selected_metadata_column(
-    store: Any,
+def _stored_metadata_column(
+    cells: Any,
     column: str,
     *,
     cell_key: str,
     cell_indices: np.ndarray | None,
 ) -> np.ndarray:
-    cells = store.cells
     if cell_indices is None:
         fetch = cells.fetch
         try:
@@ -360,17 +365,55 @@ def _selected_metadata_column(
     return np.asarray(full[cell_indices])
 
 
+def _selected_metadata_column(
+    store: Any,
+    column: str,
+    *,
+    cell_key: str,
+    cell_indices: np.ndarray | None,
+    kind: CellFieldKind | None = None,
+) -> np.ndarray:
+    """Read one metadata column for the plotted cells with masked rows missing.
+
+    A color column that ``kind`` classifies as categorical from its stored
+    values keeps its labels and shows masked rows as None. Other columns, and
+    columns read without ``kind``, follow the raster representation.
+    """
+    cells = store.cells
+    values = _stored_metadata_column(
+        cells,
+        column,
+        cell_key=cell_key,
+        cell_indices=cell_indices,
+    )
+    missing = _cell_column_missing(
+        cells,
+        column,
+        cell_key=cell_key,
+        cell_idx=cell_indices,
+    )
+    if missing is None or not missing.any():
+        return values
+    labels = kind is not None and _is_categorical(pd.Series(values), kind)
+    return apply_missing_mask(values, missing, labels=labels)
+
+
 def _prefetch_colors(
     store: Any,
     color_items: Sequence[str | ArtifactRef | FeatureRef | CellField | None],
     *,
+    metadata_columns: Collection[str],
     from_assay: str | None,
     cell_key: str,
     n_cells: int,
     normalization: NormalizationSpec,
     cell_indices: np.ndarray | None = None,
 ) -> list[tuple[np.ndarray, str, bool, bool]]:
-    """Return list of (values, label, is_categorical, is_uniform)."""
+    """Return list of (values, label, is_categorical, is_uniform).
+
+    ``metadata_columns`` lists the cell-metadata columns that a plain string
+    item may name; any other string item is resolved as a feature.
+    """
     out: list[tuple[np.ndarray, str, bool, bool]] = []
 
     # Batch RNA-like feature refs / gene strings for one matrix read.
@@ -384,7 +427,7 @@ def _prefetch_colors(
                 raise ValueError(
                     "ArtifactRef color_by requires an explicit layout ArtifactRef"
                 )
-            _, grouping_indices, grouping_values = _resolve_grouping(
+            _, grouping_indices, grouping_values, _ = _resolve_grouping(
                 store,
                 group_by=None,
                 groups=item,
@@ -410,6 +453,7 @@ def _prefetch_colors(
                 item.key,
                 cell_key=cell_key,
                 cell_indices=cell_indices,
+                kind=item.kind,
             )
             series = pd.Series(vals)
             out.append(
@@ -421,12 +465,13 @@ def _prefetch_colors(
                 )
             )
             continue
-        if isinstance(item, str) and item in store.cells.columns:
+        if isinstance(item, str) and item in metadata_columns:
             vals = _selected_metadata_column(
                 store,
                 item,
                 cell_key=cell_key,
                 cell_indices=cell_indices,
+                kind="auto",
             )
             series = pd.Series(vals)
             out.append((np.asarray(vals), item, _is_categorical(series, "auto"), False))
@@ -1309,11 +1354,11 @@ def embedding(
     if layout is None:
         layout_name = layout_keys[0]
         x = np.asarray(
-            store.cells.fetch(f"{layout_name}1", key=cell_key),
+            _fetch_cell_column(store, f"{layout_name}1", cell_key=cell_key),
             dtype=np.float64,
         )
         y = np.asarray(
-            store.cells.fetch(f"{layout_name}2", key=cell_key),
+            _fetch_cell_column(store, f"{layout_name}2", cell_key=cell_key),
             dtype=np.float64,
         )
     else:
@@ -1407,9 +1452,11 @@ def embedding(
         stored_displays.append(
             None if column is None else stored_display_metadata(store, column)
         )
+    metadata_columns = _cell_metadata_columns(store, color_items)
     color_cache = _prefetch_colors(
         store,
         color_items,
+        metadata_columns=metadata_columns,
         from_assay=resolved_from_assay,
         cell_key=cell_key,
         n_cells=n,
@@ -1508,6 +1555,7 @@ def embedding(
             facet_by,
             cell_key=cell_key,
             cell_indices=artifact_cell_indices,
+            kind="categorical",
         )
         if groups is not None:
             groups_category = facet_values
@@ -2062,7 +2110,7 @@ def embedding(
     for item in color_items:
         if not (
             isinstance(item, FeatureRef)
-            or (isinstance(item, str) and item not in store.cells.columns)
+            or (isinstance(item, str) and item not in metadata_columns)
         ):
             continue
         assay_name = (

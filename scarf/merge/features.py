@@ -1,7 +1,7 @@
 import sys
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -27,80 +27,84 @@ class FeatureAlignment:
         return frame_bytes + array_bytes + sys.getsizeof(self.featOrderMap)
 
 
-def _is_missing_source(assay: Any) -> bool:
-    return bool(getattr(assay, "isMissing", False))
+type FeatureKey = Literal["ids", "names"]
+
+_NO_OVERLAP = (
+    "No overlapping features found! Will not merge the files. No feature {kind} "
+    "are shared across the sources."
+)
+_NAME_HINT = (
+    " If the sources use different ID schemes but comparable feature names (for "
+    "example Ensembl IDs in one source and gene symbols in another), pass "
+    "feature_key='names' to match features by name."
+)
 
 
-def _get_feat_ids(assays: list[Any], names: list[str]) -> list[dict[str, str]]:
-    ret_val: list[dict[str, str]] = []
+def _source_keys(
+    assays: list[Any | None], names: list[str], key: FeatureKey
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Return each source's merge keys and feature names in source order."""
+    keyed: list[tuple[np.ndarray, np.ndarray]] = []
     for assay, source_name in zip(assays, names, strict=True):
-        if _is_missing_source(assay) or int(assay.feats.N) == 0:
-            ret_val.append({})
+        if assay is None or int(assay.feats.N) == 0:
+            empty = np.asarray([], dtype=object)
+            keyed.append((empty, empty))
             continue
         frame = assay.feats.to_pandas_dataframe(["names", "ids"])
-        if frame["ids"].duplicated().any():
+        if key == "ids" and frame["ids"].duplicated().any():
             raise ValueError(
                 f"Duplicate feature IDs in assay {assay.name!r} of source "
                 f"{source_name!r}; assign unique feature IDs before merging"
             )
-        ret_val.append(
-            dict(zip(frame["ids"].to_numpy(), frame["names"].to_numpy(), strict=True))
-        )
-    return ret_val
+        keyed.append((frame[key].to_numpy(), frame["names"].to_numpy()))
+    return keyed
 
 
 def _merge_order_feats(
-    feat_collection: list[dict[str, str]],
+    keyed: list[tuple[np.ndarray, np.ndarray]], key: FeatureKey
 ) -> tuple[pd.DataFrame, float]:
-    union_set: dict[str, str] = {}
-    source_presence: Counter[str] = Counter()
-    for ids in feat_collection:
-        source_presence.update(ids.keys())
-        for feature_id, feature_name in ids.items():
-            if feature_id not in union_set:
-                union_set[feature_id] = feature_name
+    union: dict[Any, Any] = {}
+    source_presence: Counter[Any] = Counter()
+    for keys, feature_names in keyed:
+        source_presence.update(set(keys.tolist()))
+        for feature_key, feature_name in zip(
+            keys.tolist(), feature_names.tolist(), strict=True
+        ):
+            union.setdefault(feature_key, feature_name)
     ret_val = pd.DataFrame(
         {
-            "idx": list(range(len(union_set))),
-            "names": list(union_set.values()),
-            "ids": list(union_set.keys()),
+            "idx": list(range(len(union))),
+            "names": list(union.values()),
+            "ids": list(union.keys()),
         }
     )
-    non_empty = sum(1 for ids in feat_collection if ids)
+    non_empty = sum(1 for keys, _names in keyed if keys.size)
     if non_empty < 2:
         # A modality present in only one source is zero-filled elsewhere; every
         # feature is unique by construction rather than a failed overlap check.
-        overlap = 1.0 if union_set else 0.0
+        overlap = 1.0 if union else 0.0
     else:
         shared = sum(count > 1 for count in source_presence.values())
-        overlap = 0.0 if not union_set else shared / len(union_set)
+        overlap = 0.0 if not union else shared / len(union)
         if overlap == 0:
-            raise ValueError(
-                "No overlapping features found! Will not merge the files. Please check "
-                "the features ids are comparable across the assays"
-            )
+            message = _NO_OVERLAP.format(kind="IDs" if key == "ids" else "names")
+            raise ValueError(message + (_NAME_HINT if key == "ids" else ""))
         if overlap < 0.1:
             logger.warning("Fewer than 10% of features overlap across the assays")
     return ret_val, float(overlap)
 
 
-def _ref_order_feat_idx(
-    feat_collection: list[dict[str, str]],
-    merged_feats: pd.DataFrame,
-) -> list[np.ndarray]:
-    positions = dict(zip(merged_feats["ids"], merged_feats["idx"], strict=True))
-    return [
-        np.fromiter((positions[feature_id] for feature_id in mapping), dtype=np.int64)
-        for mapping in feat_collection
-    ]
+def align_features(
+    assays: list[Any | None], names: list[str], *, key: FeatureKey = "ids"
+) -> FeatureAlignment:
+    """Compute the merged feature table and remapping for one assay type.
 
-
-def align_features(assays: list[Any], names: list[str]) -> FeatureAlignment:
-    """Compute the merged feature table and remapping for one assay type."""
+    ``key="ids"`` matches features by exact ID. ``key="names"`` matches them by
+    name, uses each name as the merged ID, and sums features that share a name
+    within one source. A missing source is ``None`` and maps no features.
+    """
     present = [
-        assay
-        for assay in assays
-        if not _is_missing_source(assay) and int(assay.feats.N) > 0
+        assay for assay in assays if assay is not None and int(assay.feats.N) > 0
     ]
     if not present:
         empty = pd.DataFrame({"idx": [], "names": [], "ids": []})
@@ -111,11 +115,15 @@ def align_features(assays: list[Any], names: list[str]) -> FeatureAlignment:
             overlapFraction=0.0,
         )
 
-    feat_collection = _get_feat_ids(assays, names)
-    merged_feats, overlap = _merge_order_feats(feat_collection)
+    keyed = _source_keys(assays, names, key)
+    merged_feats, overlap = _merge_order_feats(keyed, key)
+    positions = pd.Index(merged_feats["ids"])
     return FeatureAlignment(
         mergedFeatsMap=merged_feats,
-        featOrderMap=_ref_order_feat_idx(feat_collection, merged_feats),
+        featOrderMap=[
+            np.asarray(positions.get_indexer(keys), dtype=np.int64)
+            for keys, _names in keyed
+        ],
         nFeats=int(merged_feats.shape[0]),
         overlapFraction=overlap,
     )
@@ -143,7 +151,7 @@ def dtype_for_integer_sum(dtype: np.dtype[Any], copies: int) -> np.dtype[Any]:
 
 
 def resolve_merge_dtype(
-    assays: list[Any],
+    assays: list[Any | None],
     feat_order_map: list[np.ndarray],
     explicit: str | None,
 ) -> str:
@@ -152,7 +160,7 @@ def resolve_merge_dtype(
     present = [
         assay
         for assay in assays
-        if not _is_missing_source(assay) and int(getattr(assay.feats, "N", 0)) > 0
+        if assay is not None and int(getattr(assay.feats, "N", 0)) > 0
     ]
     if not present:
         return "uint32"

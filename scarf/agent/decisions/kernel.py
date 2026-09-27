@@ -33,13 +33,6 @@ type EvidenceClass = Literal[
     "other",
 ]
 type VerificationStatus = Literal["passed", "failed", "inconclusive"]
-type DecisionWorkflowStatus = Literal[
-    "running",
-    "completed",
-    "needsInput",
-    "abstained",
-    "failed",
-]
 type ProtectedVariableEffectStatus = Literal[
     "preserved",
     "degraded",
@@ -661,7 +654,6 @@ __all__ = [
     "DecisionSource",
     "DecisionSpec",
     "DecisionStatus",
-    "DecisionWorkflowStatus",
     "DeterministicDecisionAuditor",
     "EvidenceBundle",
     "EvidenceClass",

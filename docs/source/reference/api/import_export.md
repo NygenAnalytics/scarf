@@ -15,6 +15,8 @@
 ```{eval-rst}
 .. autoclass:: scarf.readers.CrDirReader
     :members:
+    :inherited-members:
+    :show-inheritance:
 ```
 
 ```{eval-rst}
@@ -124,6 +126,10 @@ widths. Unset values stay under automatic planning from ``mem_budget`` and
 
 ## Writers
 
+Every writer owns the reserved metadata columns `ids`, `names` and `I`. Source cell or
+feature metadata columns with these names are skipped with a warning, so imported
+identifiers are never replaced.
+
 ```{eval-rst}
 .. autoclass:: scarf.writers.CrToZarr
     :members:
@@ -203,6 +209,11 @@ Without a `run`, `to_h5ad` and `to_mtx` export a complete assay.
 For feature-selective disk export outside a pipeline run, call `to_anndata` and use AnnData's
 writer.
 
+Nullable metadata columns keep a stored placeholder in each row that their linked missing mask
+flags. `to_anndata` and `to_h5ad` export those rows as missing values with or without `run`:
+numeric columns become float64 with `NaN`, boolean columns become nullable booleans, and other
+columns hold a missing value, which H5AD files store as a missing category.
+
 Pass a completed run to write its frozen cells, feature universe, and result fields directly:
 
 ```python
@@ -232,10 +243,15 @@ Explicit positive values remain supported.
 
 Use `DataStoreMerge` to merge DataStores.
 Pass `assays=["RNA"]` when only one assay type is needed.
-Features are matched by exact feature ID. Gene symbols are display labels and do not merge
-distinct IDs; suffixes such as `_1` are preserved. An assay present in multiple inputs raises
-an error if none of its IDs overlap.
-If inputs use different identifier conventions, align their IDs explicitly before merging.
+Features are matched by exact feature ID by default. Gene symbols are display labels and do not
+merge distinct IDs; suffixes such as `_1` are preserved. An assay present in multiple inputs
+raises an error if none of its IDs overlap.
+When inputs use different identifier conventions for the same genes, for example Ensembl IDs in
+one input and gene symbols in another, pass `feature_key="names"` to match features by name.
+The merged feature IDs are then the names, and features that share a name within one input are
+summed.
+Feature annotation columns are merged when the inputs agree. A column whose values differ for a
+shared feature, such as per-dataset highly variable gene flags, is left out with a warning.
 RNA assays write both `counts` and a gene-major `countsT` copy, which roughly doubles stored counts for those assays.
 Non-RNA assays never write `countsT`.
 Interrupted merges resume at whole-component boundaries (`cellData`, each assay `counts`, and each RNA `countsT`) rather than mid-matrix.

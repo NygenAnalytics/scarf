@@ -41,8 +41,6 @@ _PUBLIC_CLASS_METHODS = {
         "__init__",
         "iter_normed_feature_wise",
         "normed",
-        "iter_raw_column_blocks",
-        "iter_raw_feature_columns",
     ),
     ATACassay: (
         "__init__",
@@ -54,8 +52,8 @@ _PUBLIC_CLASS_METHODS = {
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    Assay: "6920d1d6370b3265a68a6c5d9a866118711e3dc3310a1cb0bf800e312a2cef6b",
-    RNAassay: "65d2d9b4f58fd79139db2deebc35b4629b1177781e47fb08abd71b7bb5e699a1",
+    Assay: "85f3baba45ac65e46add4ad3f01845d02fd267601b3cee4419661c91a0302bd7",
+    RNAassay: "74fc5e54bc871c516fa8adca9cd8bcdec92bbcba94c118965b933159b2ef19ac",
     ATACassay: "1732f9ac8b4f368185e0965becb94b9472186db4ee53d372a8a2852d30dd42a4",
     ADTassay: "1732f9ac8b4f368185e0965becb94b9472186db4ee53d372a8a2852d30dd42a4",
 }
@@ -251,14 +249,15 @@ def test_assay_read_block_facade_remains_patchable(monkeypatch):
     from scarf.storage.budget import ResourceBudget
 
     root = zarr.open_group(store=MemoryStore(), mode="w")
-    counts_t = root.create_array(
-        "countsT",
-        data=np.arange(12, dtype=np.uint32).reshape(4, 3),
-    )
+    values = np.arange(1, 13, dtype=np.uint32).reshape(3, 4)
+    counts = root.create_array("counts", data=values)
+    totals = values.sum(axis=1).astype(np.float64)
     rna = RNAassay.__new__(RNAassay)
     rna.name = "RNA"
-    rna.z = root
-    rna.rawDataT = counts_t
+    rna.normMethod = norm_lib_size
+    rna.sf = 10
+    rna.cells = SimpleNamespace(fetch_all=lambda _column: totals)
+    rna.rawData = SimpleNamespace(_backing=counts)
     rna.resources = ResourceBudget(memoryBytes=1024**2, workers=1)
 
     original = assay_module._read_block
@@ -269,17 +268,14 @@ def test_assay_read_block_facade_remains_patchable(monkeypatch):
         return original(array, rows, columns)
 
     monkeypatch.setattr(assay_module, "_read_block", counted_read)
-    blocks = list(
-        rna.iter_raw_column_blocks(
-            cell_idx=np.array([0, 2]),
-            feat_idx=np.array([1, 3]),
-            batch_size=2,
-        )
+    means = rna._mean_normed_feature_groups(
+        np.array([0, 2]),
+        {"pair": np.array([1, 3])},
     )
 
     assert len(calls) == 1
-    expected = np.asarray(counts_t[:])[[1, 3], :][:, [0, 2]].T
-    np.testing.assert_array_equal(blocks[0][1], expected)
+    expected = (10 * values[[0, 2]][:, [1, 3]] / totals[[0, 2], None]).mean(axis=1)
+    np.testing.assert_allclose(means["pair"], expected)
 
 
 def test_base_assay_defaults_validation_and_representation():
@@ -295,7 +291,10 @@ def test_base_assay_defaults_validation_and_representation():
         get_dtype=lambda _key: bool,
         fetch_all=lambda _key: np.array([True, False, True]),
     )
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    root.attrs.update({"prepared": True, "dataset_fingerprint": "test-dataset"})
     assay = SimpleNamespace(
+        z=root,
         attrs={"percentFeatures": "invalid"},
         cells=cells,
         feats=feats,
@@ -591,122 +590,118 @@ def test_corrected_variance_column_rejects_invalid_parameters(
 
 
 def test_rna_requires_zarr_v3_counts_t():
-    rna = RNAassay.__new__(RNAassay)
-    rna.name = "RNA"
-    rna.rawDataT = SimpleNamespace(
-        metadata=SimpleNamespace(zarr_format=2),
-    )
+    from scarf.storage.counts_t_contract import validate_count_matrix
 
-    with pytest.raises(ValueError, match="requires Zarr v3"):
-        rna._require_counts_t()
+    root = zarr.open_group(store=MemoryStore(), mode="w", zarr_format=2)
+    root.create_array("counts", data=np.ones((2, 3), dtype=np.uint32))
+    root.create_array("countsT", data=np.ones((3, 2), dtype=np.uint32))
+    with pytest.raises(ValueError, match="Zarr v3|not finalized"):
+        validate_count_matrix(root, require_transpose=True)
 
 
-def test_rna_feature_major_reads_support_both_raw_orientations():
-    from scarf.storage.partition import IndexBlock
+def test_rna_normed_zero_total_cells_are_zero(tmp_path):
+    raw = np.array([[3, 1, 0], [0, 0, 0], [2, 0, 2]], dtype=np.uint32)
+    path = tmp_path / "rna.zarr"
+    SparseToZarr(
+        csr_matrix(raw),
+        zarr_loc=str(path),
+        cell_ids=["c0", "c1", "c2"],
+        feature_ids=["g0", "g1", "g2"],
+        assay_name="RNA",
+        nthreads=1,
+    ).dump(batch_size=3)
+    store = DataStore(str(path), default_assay="RNA", min_features_per_cell=0)
+    cells = np.arange(3)
+    expressed = raw[[0, 2]]
+    lib_size = store.RNA.sf * expressed / expressed.sum(axis=1, keepdims=True)
 
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    feature_major = root.create_array(
-        "countsT",
-        data=np.array(
-            [
-                [1, 2, 3],
-                [4, 5, 6],
-                [7, 8, 9],
-            ],
-            dtype=np.uint32,
-        ),
-    )
-    cell_major = root.create_array(
-        "counts",
-        data=np.asarray(feature_major[:]).T,
-    )
-    block = IndexBlock(
-        indices=np.array([0, 2], dtype=np.int64),
-        destinations=np.array([0, 1], dtype=np.int64),
-        bins=(0,),
-    )
-    plan_feature_major = SimpleNamespace(
-        featureAxis=0,
-        blocks=(block,),
-        readWorkers=1,
-        ioConcurrency=1,
-    )
-    plan_cell_major = SimpleNamespace(
-        featureAxis=1,
-        blocks=(block,),
-        readWorkers=1,
-        ioConcurrency=1,
-    )
-    rna = RNAassay.__new__(RNAassay)
-    rna.name = "RNA"
-    rna.rawDataT = feature_major
-    rna.rawData = SimpleNamespace(_backing=cell_major)
-    cells = np.array([0, 2], dtype=np.int64)
-
-    feature_blocks = list(
-        rna.iter_raw_feature_major_blocks(cells, plan_feature_major, "Reading")
-    )
-    np.testing.assert_array_equal(
-        feature_blocks[0][1],
-        np.array([[1, 3], [7, 9]], dtype=np.uint32),
-    )
-    with pytest.raises(ValueError, match="does not match"):
-        list(rna.iter_raw_feature_major_blocks(cells, plan_cell_major))
-
-    rna.rawDataT = None
-    cell_blocks = list(
-        rna.iter_raw_feature_major_blocks(cells, plan_cell_major, "Reading")
-    )
-    np.testing.assert_array_equal(cell_blocks[0][1], feature_blocks[0][1])
-
-    column_blocks = list(
-        rna._iter_raw_column_blocks(
-            cells,
-            np.array([0, 2]),
-            batch_size=None,
-            plan=plan_cell_major,
+    for log_transform in (False, True):
+        values = store.RNA.normed(
+            cell_idx=cells,
+            feat_idx=np.arange(3),
+            log_transform=log_transform,
+        ).compute()
+        assert np.isfinite(values).all()
+        np.testing.assert_array_equal(values[1], 0.0)
+        np.testing.assert_allclose(
+            values[[0, 2]],
+            np.log1p(lib_size) if log_transform else lib_size,
         )
-    )
-    np.testing.assert_array_equal(
-        column_blocks[0][1],
-        np.array([[1, 7], [3, 9]], dtype=np.uint32),
-    )
 
-
-def test_rna_raw_feature_columns_log_and_normalize_batches():
-    rna = RNAassay.__new__(RNAassay)
-    rna.name = "RNA"
-    rna._iter_raw_column_blocks = lambda **_kwargs: iter(
-        [
-            (
-                0,
-                np.array([[2, 4], [6, 8]], dtype=np.uint32),
-                np.array([1, 3]),
-                0.1,
-                "memory",
-            )
-        ]
-    )
-    plan = SimpleNamespace(blocks=(object(),))
-
-    batches = list(
-        rna._iter_raw_feature_columns(
-            np.array([0, 1]),
-            np.array([1, 3]),
-            batch_size=None,
-            scalar=np.array([2.0, 4.0]),
-            sf=2.0,
-            log_transform=True,
-            msg="Normalizing",
-            plan=plan,
-        )
-    )
-
+    store.cells.insert("everyone", np.ones(3, dtype=bool), overwrite=True)
     np.testing.assert_allclose(
-        batches[0][0],
-        np.log1p(np.array([[2.0, 4.0], [3.0, 4.0]])),
+        store.get_cell_vals(from_assay="RNA", cell_key="everyone", k="g0"),
+        [store.RNA.sf * 3 / 4, 0.0, store.RNA.sf * 2 / 4],
     )
-    np.testing.assert_array_equal(batches[0][1], np.array([1, 3]))
+
+
+def test_concurrent_rna_normed_calls_keep_their_own_normalization(
+    tmp_path, monkeypatch
+):
+    import threading
+    import time
+
+    import scarf.assay.normalization as normalization
+
+    raw = np.random.default_rng(3).integers(0, 9, (6, 4)).astype(np.uint32)
+    raw[:, 0] += 1
+    SparseToZarr(
+        csr_matrix(raw),
+        zarr_loc=str(tmp_path / "rna.zarr"),
+        cell_ids=[f"c{i}" for i in range(6)],
+        feature_ids=[f"g{i}" for i in range(4)],
+        assay_name="RNA",
+        nthreads=1,
+    ).dump(batch_size=6)
+    rna = DataStore(
+        str(tmp_path / "rna.zarr"), default_assay="RNA", min_features_per_cell=0
+    ).RNA
+    feats = np.arange(4)
+    requests = {"first": (np.arange(6), True), "second": (np.array([1, 3, 5]), False)}
+    expected = {
+        name: rna.normed(cells, feats, log_transform=log).compute()
+        for name, (cells, log) in requests.items()
+    }
+
+    # The first call reads its totals slowly, and every call builds its result
+    # slowly, so an unguarded call would read the other call's method or totals.
+    def delayed(function, seconds, thread=None):
+        def call(*args, **kwargs):
+            if thread in (None, threading.current_thread().name):
+                time.sleep(seconds)
+            return function(*args, **kwargs)
+
+        return call
+
+    monkeypatch.setattr(
+        RNAassay,
+        "_cell_count_totals",
+        delayed(RNAassay._cell_count_totals, 0.2, "first"),
+    )
+    monkeypatch.setattr(
+        normalization,
+        "_library_size_scaled",
+        delayed(normalization._library_size_scaled, 0.3),
+    )
+    results = {}
+
+    def normalize(name):
+        cells, log = requests[name]
+        results[name] = rna.normed(cells, feats, log_transform=log).compute()
+
+    threads = [
+        threading.Thread(target=normalize, args=(name,), name=name) for name in requests
+    ]
+    for thread in threads:
+        thread.start()
+        time.sleep(0.05)
+    for thread in threads:
+        thread.join()
+
+    for name in requests:
+        np.testing.assert_array_equal(results[name], expected[name])
+    assert rna.normMethod is norm_lib_size
+    assert rna.scalar is None
 
 
 def test_rna_streaming_stats_and_group_means_handle_missing_inputs():

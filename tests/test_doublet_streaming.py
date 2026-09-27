@@ -4,7 +4,6 @@ from scipy.sparse import csr_matrix
 
 from scarf import DataStore
 from scarf.matrix import ChunkedArray
-from scarf.neighbors.diffusion import diffusion_operator
 from scarf.quality_control import doublets
 from scarf.storage.budget import ResourceBudget
 from scarf.storage.count_matrix import CountMatrixPolicy
@@ -95,8 +94,21 @@ def test_doublet_smoothing_matches_powered_diffusion_with_hub_and_isolate(power,
     dense[0, 1:100] = dense[1:100, 0] = 0.5
     graph = csr_matrix(dense)
     scores = np.linspace(0, 1, len(dense))
-    expected = diffusion_operator(graph, power=power).dot(scores)
+    inverse_degree = np.ravel(graph.sum(axis=1))
+    inverse_degree[inverse_degree != 0] = 1 / inverse_degree[inverse_degree != 0]
+    diagonal = csr_matrix(
+        (inverse_degree, (range(len(dense)), range(len(dense)))),
+        shape=[len(dense), len(dense)],
+    )
+    # Smoothing formerly stepped this operator in COO form. Its values must
+    # not change, so doublet scores and their artifacts stay identical.
+    step = diagonal.dot(graph).tocoo()
+    previous = scores
+    for _ in range(power):
+        previous = np.asarray(step.dot(previous), dtype=np.float64)
+    expected = (diagonal.dot(graph) ** power).dot(scores)
     actual = doublets.smooth_doublet_scores(graph, scores, power=power, normalize=False)
+    np.testing.assert_array_equal(actual, previous)
     np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=1e-7)
     assert actual[-1] == 0
     constant = doublets.smooth_doublet_scores(
@@ -206,9 +218,16 @@ def test_streamed_doublets_match_materialized_mapping(
         feature_indices,
         **options,
     )
-    np.testing.assert_allclose(actual, expected, rtol=1e-8, atol=1e-9)
     if constant:
+        # Every simulated doublet has counts in the reference features, so
+        # mapping keeps it informative. Doublet scoring still skips rows that
+        # project onto the reference PCA center, which here is every row.
+        mapped = query.get_mapping_result(result, reference=reference)
+        assert mapped.diagnostics["uninformativeCellCount"] == 0
+        assert np.any(expected > 0)
         np.testing.assert_array_equal(actual, 0)
+        expected = actual
+    np.testing.assert_allclose(actual, expected, rtol=1e-8, atol=1e-9)
     original = doublets._doublet_batch_rows
 
     def smaller_batches(*args, **kwargs):
@@ -233,3 +252,88 @@ def test_streamed_doublets_match_materialized_mapping(
             feature_indices,
             **(options | {"resources": ResourceBudget(1_000_000, 1)}),
         )
+
+
+def test_doublets_without_selected_feature_counts_are_scored(tmp_path, monkeypatch):
+    from scarf.mapping.features import normalize_reference_counts
+    from scarf.mapping.symphony import project_pca
+
+    counts = np.random.default_rng(29).integers(1, 200, (30, 24), dtype=np.uint16)
+    labels = np.arange(len(counts)) % 3
+    feature_indices = np.arange(0, counts.shape[1], 2)
+    # Cluster 0 has counts only outside the selected features.
+    counts[np.ix_(labels == 0, feature_indices)] = 0
+    ids = np.array([f"g{i}" for i in range(counts.shape[1])])
+    path = str(tmp_path / "reference.zarr")
+    doublets.write_doublet_target_zarr(
+        path,
+        "RNA",
+        csr_matrix(counts),
+        ids,
+        ids,
+        dtype=str(counts.dtype),
+        nthreads=1,
+        policy=CountMatrixPolicy(unitBytes=16_384, chunkBytes=1024),
+    )
+    store = DataStore(path, default_assay="RNA", min_features_per_cell=0, nthreads=1)
+    features = store.set_feature_selection(feature_indexes=feature_indices)
+    normalized = store.run_normalization(
+        store.snapshot_cell_selection("I"), features, renormalize_subset=False
+    )
+    pca = store.run_pca(normalized, dims=3, local_cache=False)
+    neighbors = store.query_neighbors(store.build_ann_index(pca), coordinates=pca, k=4)
+    reference = store.get_mapping_reference(store.build_mapping_reference(neighbors))
+    rng = np.random.default_rng(91)
+    parents = doublets.sample_cluster_pool(labels, 0.5, 3, rng)
+    left, right = doublets.simulate_doublet_pairs(labels[parents], 60, 0.0, rng)
+    simulated = doublets.sum_doublet_pairs(csr_matrix(counts[parents]), left, right)
+    empty = np.asarray(simulated[:, feature_indices].sum(axis=1)).ravel() == 0
+    assert empty.any()
+    queried = []
+    load_query = doublets._load_reference_neighbor_query
+
+    def recording_query(*args, **kwargs):
+        stage = load_query(*args, **kwargs)
+        query = stage.query
+
+        def record(values, **options):
+            queried.append(np.array(values))
+            return query(values, **options)
+
+        monkeypatch.setattr(stage, "query", record)
+        return stage
+
+    monkeypatch.setattr(doublets, "_load_reference_neighbor_query", recording_query)
+    scores = doublets.score_synthetic_doublets(
+        store.RNA,
+        reference,
+        np.arange(len(counts)),
+        labels,
+        feature_indices,
+        cluster_sample_fraction=0.5,
+        max_cells_per_cluster=3,
+        simulation_ratio=2.0,
+        heterotypic_fraction=0.0,
+        save_k=4,
+        random_seed=91,
+        resources=ResourceBudget(128 * 1024**2, 1),
+    )
+
+    # Every simulated doublet is queried, including those empty in the
+    # selected features, which query from the projection of an empty profile.
+    rows = np.vstack(queried)
+    assert len(rows) == simulated.shape[0]
+    parameters = reference.normalization_parameters
+    empty_projection = project_pca(
+        normalize_reference_counts(
+            np.zeros((1, len(feature_indices))),
+            size_factor=parameters["size_factor"],
+            log_transform=parameters["log_transform"],
+        ),
+        reference.model,
+    )
+    assert np.linalg.norm(empty_projection) > 0
+    assert np.isclose(rows, empty_projection, rtol=0, atol=1e-12).all(axis=1).sum() == (
+        empty.sum()
+    )
+    assert np.all(np.isfinite(scores)) and np.any(scores > 0)

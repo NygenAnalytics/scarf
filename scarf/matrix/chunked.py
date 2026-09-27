@@ -1,6 +1,7 @@
 """Lazy blockwise matrix operations over NumPy and Zarr arrays."""
 
 from collections.abc import Callable, Iterator
+from functools import partial
 from typing import Any, cast
 
 import numpy as np
@@ -231,6 +232,7 @@ class ChunkedArray:
         fn: BlockFn,
         nthreads: int | None,
         msg: str | None,
+        result_bytes: int | None = None,
     ) -> list[NDArray[Any]]:
         from ..storage.execution import (
             ExecutionReport,
@@ -238,7 +240,7 @@ class ChunkedArray:
             plan_operation,
             record_execution_report,
         )
-        from ..storage.parallel import map_shards
+        from ..storage.parallel import map_shards, in_shard_context
 
         ranges = self._ranges()
         workers = self._nthreads if nthreads is None else max(1, int(nthreads))
@@ -246,11 +248,19 @@ class ChunkedArray:
         io_concurrency: int | None = None
         planned = None
         if self._resources is not None:
+            retained = (
+                self._n_rows * self._out_cols * self.dtype.itemsize
+                if result_bytes is None
+                else result_bytes
+            )
             planned = plan_operation(
-                self._resources,
+                ResourceBudget(
+                    self._resources.memoryBytes, min(workers, self._resources.workers)
+                ),
                 WorkShape(
                     nUnits=max(1, len(ranges)),
                     unitBytes=self._block_task_bytes(),
+                    residentBytes=2 * retained + self._resident_bytes(),
                     ordered=False,
                 ),
                 policy=self._io,
@@ -258,6 +268,8 @@ class ChunkedArray:
             workers = planned.computeWorkers
             within = planned.threadsPerComputeWorker
             io_concurrency = planned.ioConcurrency
+        if in_shard_context():
+            workers = 1
         results = map_shards(
             ranges,
             fn,
@@ -304,7 +316,7 @@ class ChunkedArray:
         resident_bytes: int = 0,
     ) -> Iterator[np.ndarray]:
         from ..storage.execution import WorkShape, plan_operation
-        from ..storage.parallel import stream_shards
+        from ..storage.parallel import stream_shards, in_shard_context
 
         threads = self._nthreads if nthreads is None else max(1, int(nthreads))
         ranges = self._ranges()
@@ -322,17 +334,19 @@ class ChunkedArray:
         planned = None
         if self._resources is not None:
             planned = plan_operation(
-                self._resources,
+                ResourceBudget(
+                    self._resources.memoryBytes, min(threads, self._resources.workers)
+                ),
                 WorkShape(
                     nUnits=max(1, len(ranges)),
                     unitBytes=self._block_owned_bytes(),
                     decodeBytes=self._max_decode_bytes(),
-                    residentBytes=max(0, int(resident_bytes)),
-                    ordered=True,
+                    residentBytes=max(0, int(resident_bytes)) + self._resident_bytes(),
+                    ordered=False,
                 ),
                 policy=self._io,
             )
-            depth = planned.readWorkers
+            depth = min(planned.readWorkers, planned.computeWorkers)
             if prefetch is not None:
                 depth = min(depth, max(1, int(prefetch)))
             within = planned.threadsPerComputeWorker
@@ -351,6 +365,8 @@ class ChunkedArray:
             values = self._materialize_range(start, end)
             return values if mask is None else values[mask[start:end]]
 
+        if in_shard_context():
+            depth = 1
         completed = 0
         for block in stream_shards(
             ranges,
@@ -371,7 +387,7 @@ class ChunkedArray:
                     plan=planned,
                     unitKind="countsRowBlock",
                     actualReadWorkers=depth,
-                    actualComputeWorkers=planned.computeWorkers,
+                    actualComputeWorkers=min(depth, planned.computeWorkers),
                     actualWriteWorkers=1,
                     unitsCompleted=completed,
                 )
@@ -394,11 +410,43 @@ class ChunkedArray:
         if self._n_rows == 0:
             return np.empty((0, self._out_cols), dtype=self.dtype)
 
-        def materialize(_: int, start: int, end: int) -> NDArray[Any]:
-            return self._materialize_range(start, end)
+        blocks = self._stream_blocks(
+            nthreads=nthreads,
+            msg=msg,
+            prefetch=None,
+            row_mask=None,
+            resident_bytes=self._n_rows * self._out_cols * self.dtype.itemsize,
+        )
+        try:
+            first = next(blocks)
+            result = np.empty(self.shape, dtype=self.dtype)
+            offset = len(first)
+            result[:offset] = first
+            del first
+            for block in blocks:
+                result[offset : offset + len(block)] = block
+                offset += len(block)
+            return result
+        finally:
+            from ..storage.parallel import _close_iterator
 
-        parts = self._map_blocks(materialize, nthreads, msg)
-        return np.vstack(parts) if len(parts) > 1 else parts[0]
+            _close_iterator(blocks)
+
+    def _resident_bytes(self) -> int:
+        arrays = [
+            self._backing,
+            self._rows,
+            self._cols,
+            *(op.operand for op in self._ops),
+        ]
+        retained: dict[int, int] = {}
+        for array in arrays:
+            if not isinstance(array, np.ndarray):
+                continue
+            while isinstance(array.base, np.ndarray):
+                array = array.base
+            retained[id(array)] = array.nbytes
+        return sum(retained.values())
 
     def __array__(self, dtype: np.dtype[Any] | None = None) -> np.ndarray:
         array = self.compute()
@@ -479,13 +527,17 @@ class ChunkedArray:
     ) -> Any:
         if method != "__call__" or kwargs.get("out") is not None:
             return NotImplemented
+        # A requested dtype sets the ufunc's computation dtype for each block,
+        # so integer blocks can be scaled or logged without a cast copy.
+        dtype = kwargs.get("dtype")
+        func = ufunc if dtype is None else partial(ufunc, dtype=np.dtype(dtype))
         if len(inputs) == 1:
-            return self._unary(ufunc)
+            return self._unary(func)
         if len(inputs) == 2:
             left, right = inputs
             if left is self:
-                return self._binary(ufunc, right, "left")
-            return self._binary(ufunc, left, "right")
+                return self._binary(func, right, "left")
+            return self._binary(func, left, "right")
         return NotImplemented
 
     def __mul__(self, o: object) -> "ChunkedArray":
@@ -607,7 +659,12 @@ class ChunkedArray:
         def summarize(_: int, start: int, end: int) -> NDArray[Any]:
             return np.asarray(sum_and_squared_sum(self._materialize_range(start, end)))
 
-        parts = self._map_blocks(summarize, nthreads, msg)
+        parts = self._map_blocks(
+            summarize,
+            nthreads,
+            msg,
+            result_bytes=2 * self._out_cols * 8 * (len(self._ranges()) + 4),
+        )
         stacked = np.sum(parts, axis=0)
         total, squared_total = stacked[0], stacked[1]
         mean = total / self._n_rows
@@ -660,7 +717,8 @@ class ChunkedArray:
                 return np.asarray(array.argmax(axis=axis))
             raise ValueError(f"Unknown reduction {op}")
 
-        parts = self._map_blocks(reduce_block, nthreads, msg)
+        retained = 2 * len(self._ranges()) * 8 if axis is None else self._n_rows * 8
+        parts = self._map_blocks(reduce_block, nthreads, msg, result_bytes=retained)
         if axis is None:
             array = np.asarray(parts)
             if op == "sum":
@@ -692,7 +750,12 @@ class ChunkedArray:
                 array = self._materialize_range(start, end)
                 return np.asarray(array.sum(axis=0))
 
-            parts = self._map_blocks(sum_block, nthreads, msg)
+            parts = self._map_blocks(
+                sum_block,
+                nthreads,
+                msg,
+                result_bytes=self._out_cols * 8 * (len(self._ranges()) + 2),
+            )
             total = np.sum(parts, axis=0)
             if op == "mean":
                 return np.asarray(total / self._n_rows)
@@ -703,7 +766,12 @@ class ChunkedArray:
                 array = self._materialize_range(start, end)
                 return np.asarray(np.count_nonzero(array, axis=0))
 
-            parts = self._map_blocks(count_block, nthreads, msg)
+            parts = self._map_blocks(
+                count_block,
+                nthreads,
+                msg,
+                result_bytes=self._out_cols * 8 * (len(self._ranges()) + 1),
+            )
             return np.asarray(np.sum(parts, axis=0))
         if op in ("var", "std"):
 
@@ -712,7 +780,12 @@ class ChunkedArray:
                     sum_and_squared_sum(self._materialize_range(start, end))
                 )
 
-            parts = self._map_blocks(variance_block, nthreads, msg)
+            parts = self._map_blocks(
+                variance_block,
+                nthreads,
+                msg,
+                result_bytes=2 * self._out_cols * 8 * (len(self._ranges()) + 4),
+            )
             stacked = np.sum(parts, axis=0)
             total, squared_total = stacked[0], stacked[1]
             mean = total / self._n_rows

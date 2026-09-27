@@ -1566,7 +1566,3 @@ def matrix_source_from_slots(
         primary_class,
         "unknown or custom matrix class",
     )
-
-
-source_from_slot_mapping = matrix_source_from_slots
-matrix_source_from_mapping = matrix_source_from_slots

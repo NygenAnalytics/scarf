@@ -28,7 +28,6 @@ from scarf.features.markers.regression import (
     _regression_r_batch,
 )
 from scarf.storage.artifacts import ArtifactRef
-from scarf.utils import controlled_compute
 
 
 def test_marker_public_contract_requires_explicit_artifacts() -> None:
@@ -318,6 +317,90 @@ def test_marker_stats_python_kernel_handles_single_cell_population():
     assert np.isnan(stats[:, 0, 7]).all()
 
 
+def test_marker_groups_use_natural_order_and_string_ids(
+    datastore_ephemeral, tmp_path
+) -> None:
+    store = datastore_ephemeral
+    n_cells = len(store.cells.active_index("I"))
+    clusters = _test_cluster_artifact(store, np.arange(n_cells, dtype=np.int64) % 12)
+    marker = store.run_marker_search(
+        clusters,
+        from_assay="RNA",
+        features=store.set_feature_selection(feature_indexes=np.arange(20)),
+        nthreads=1,
+    )
+    natural = [str(value) for value in range(12)]
+
+    table = store.get_markers(marker=marker, min_score=-1, min_frac_exp=-1)
+    assert list(dict.fromkeys(table["group_id"])) == natural
+    assert all(isinstance(value, str) for value in table["group_id"])
+    one = store.get_markers(marker=marker, group_id=10, min_score=-1, min_frac_exp=-1)
+    assert set(one["group_id"]) == {"10"}
+    pd.testing.assert_frame_equal(
+        one,
+        table[table["group_id"] == "10"].reset_index(drop=True),
+    )
+    with pytest.raises(ValueError, match="no group '12'"):
+        store.get_markers(marker=marker, group_id=12)
+
+    out_file = tmp_path / "markers.csv"
+    store.export_markers_to_csv(marker, str(out_file), min_score=-1, min_frac_exp=-1)
+    assert list(pd.read_csv(out_file).columns) == natural
+
+
+def test_marker_group_order_matches_plot_category_order() -> None:
+    from scarf.utils.arrays import sort_categories
+
+    assert sort_categories(["10", "2", "-1", "1.5"]) == ["-1", "1.5", "2", "10"]
+    # Mixed labels put numbers first by value, then natural text.
+    assert sort_categories(["b", "10", "a10", "2", "a2"]) == [
+        "2",
+        "10",
+        "a2",
+        "a10",
+        "b",
+    ]
+    # A "nan" label is text, so its position does not depend on input order.
+    assert sort_categories(["nan", "2", "10"]) == ["2", "10", "nan"]
+    assert sort_categories(["10", "nan", "2"]) == ["2", "10", "nan"]
+    # Digit runs precede text where labels differ in kind, and only decimal
+    # notation is numeric, so "1_10" is not the number 110.
+    assert sort_categories(["B cell", "2_T", "2_1", "1_10", "1_2", "²"]) == [
+        "1_2",
+        "1_10",
+        "2_1",
+        "2_T",
+        "B cell",
+        "²",
+    ]
+    assert sort_categories(["b", "B"]) == sort_categories(["B", "b"]) == ["B", "b"]
+
+
+def test_marker_readers_accept_mixed_digit_and_text_labels(
+    datastore_ephemeral, tmp_path
+) -> None:
+    store = datastore_ephemeral
+    n_cells = len(store.cells.active_index("I"))
+    labels = np.array(["B cell", "2_T", "1_10"])[np.arange(n_cells) % 3]
+    marker = store.run_marker_search(
+        _test_cluster_artifact(store, labels),
+        from_assay="RNA",
+        features=store.set_feature_selection(feature_indexes=np.arange(20)),
+        nthreads=1,
+    )
+    expected = ["1_10", "2_T", "B cell"]
+
+    table = store.get_markers(marker=marker, min_score=-1, min_frac_exp=-1)
+    assert list(dict.fromkeys(table["group_id"])) == expected
+    one = store.get_markers(
+        marker=marker, group_id="2_T", min_score=-1, min_frac_exp=-1
+    )
+    assert set(one["group_id"]) == {"2_T"}
+    out_file = tmp_path / "markers.csv"
+    store.export_markers_to_csv(marker, str(out_file), min_score=-1, min_frac_exp=-1)
+    assert list(pd.read_csv(out_file).columns) == expected
+
+
 def test_saved_marker_refs_keep_feature_specific_results_addressable(
     datastore_ephemeral,
 ) -> None:
@@ -555,11 +638,16 @@ def test_sort_marker_results_adds_deterministic_tie_breakers():
     assert sorted_unnamed["feature_index"].tolist() == [7, 9]
 
 
+def _feature_batch(columns: dict[str, list[float]]):
+    """Return a feature-major batch as ``iter_normed_feature_wise`` yields it."""
+    return np.array(list(columns.values())), np.array(list(columns))
+
+
 def test_find_markers_by_regression_handles_expression_threshold():
     class Assay:
         @staticmethod
         def iter_normed_feature_wise(**_kwargs):
-            yield pd.DataFrame(
+            yield _feature_batch(
                 {
                     "correlated": [0.0, 1.0, 2.0, 3.0],
                     "at_threshold": [0.0, 1.0, 2.0, 0.0],
@@ -668,8 +756,8 @@ def test_find_markers_by_regression_two_cell_batches_are_unadjusted():
     class Assay:
         @staticmethod
         def iter_normed_feature_wise(**_kwargs):
-            yield pd.DataFrame({"a": [0.0, 1.0], "b": [1.0, 1.0]})
-            yield pd.DataFrame({"c": [1.0, 0.0]})
+            yield _feature_batch({"a": [0.0, 1.0], "b": [1.0, 1.0]})
+            yield _feature_batch({"c": [1.0, 0.0]})
 
     result = find_markers_by_regression(
         Assay(),
@@ -686,27 +774,11 @@ def test_find_markers_by_regression_two_cell_batches_are_unadjusted():
     assert result["p_value_adjusted"].isna().all()
 
 
-def test_find_markers_by_regression_rejects_non_dataframe_batches():
-    class Assay:
-        @staticmethod
-        def iter_normed_feature_wise(**_kwargs):
-            yield np.ones((3, 1))
-
-    with pytest.raises(TypeError, match="DataFrames"):
-        find_markers_by_regression(
-            Assay(),
-            cell_idx=np.arange(3),
-            feat_idx=np.arange(1),
-            regressor=np.arange(3),
-            min_cells=1,
-        )
-
-
 def test_find_markers_by_regression_identifies_nonfinite_feature():
     class Assay:
         @staticmethod
         def iter_normed_feature_wise(**_kwargs):
-            yield pd.DataFrame({"bad_feature": [0.0, np.nan, 1.0]})
+            yield _feature_batch({"bad_feature": [0.0, np.nan, 1.0]})
 
     with pytest.raises(ValueError, match="bad_feature"):
         find_markers_by_regression(
@@ -905,24 +977,15 @@ def test_find_markers_fast_raw_path_computes_groupwise_statistics(
             self.raw[:] = values
             persist_count_matrix_plan(root, plan)
             persist_count_matrix_plan(self.raw, plan)
+            from scarf.storage.identity import finalize_counts
+
+            finalize_counts(self.raw)
             counts_t = write_counts_t(self.raw, root)
             assert counts_t is not None
             self.rawDataT = counts_t
 
         def _raw_feature_stream_source(self):
             return self.raw, 1, 0
-
-        @staticmethod
-        def iter_raw_feature_major_blocks(cell_idx, plan, **_kwargs):
-            for block in plan.blocks:
-                yield (
-                    block,
-                    np.ascontiguousarray(
-                        data[np.asarray(cell_idx)][:, block.indices].T
-                    ),
-                    0.01,
-                    "memory",
-                )
 
     monkeypatch.setattr(marker_search_module, "RNAassay", FakeRNA)
 
@@ -946,38 +1009,6 @@ def test_find_markers_fast_raw_path_computes_groupwise_statistics(
     for frame in results.values():
         assert len(frame) == 3
         assert np.isfinite(frame["p_value"]).all()
-
-
-def test_iter_raw_feature_columns_matches_normed(datastore):
-    assay = datastore.RNA
-    cell_idx = assay.cells.active_index("I")
-    n_features = int(assay.feats.N)
-    batch_size = 37
-    head = np.arange(min(3 * batch_size, n_features), dtype=np.int64)
-    tail = np.arange(max(n_features - batch_size, 0), n_features, dtype=np.int64)
-    feat_idx = np.unique(np.concatenate([head, tail]))
-    scalar = assay.cells.fetch_all(assay.name + "_nCounts")[cell_idx]
-
-    streamed = controlled_compute(
-        assay.normed(cell_idx=cell_idx, feat_idx=feat_idx), assay.nthreads
-    )
-
-    cols = []
-    mats = []
-    for mat, batch_cols in assay.iter_raw_feature_columns(
-        cell_idx=cell_idx,
-        feat_idx=feat_idx,
-        batch_size=batch_size,
-        scalar=scalar,
-        sf=float(assay.sf),
-    ):
-        mats.append(mat)
-        cols.append(batch_cols)
-
-    fast = np.hstack(mats)
-    assert np.array_equal(np.concatenate(cols), feat_idx)
-    assert fast.shape == streamed.shape
-    assert np.allclose(fast, streamed, rtol=1e-4, atol=1e-4)
 
 
 def test_compact_marker_save_roundtrip():
@@ -1176,39 +1207,6 @@ def test_marker_artifact_write_preserves_legacy_marker_subtree():
     assert "schema_version" not in artifact.attrs
 
 
-def test_legacy_marker_names_and_scores_are_readable():
-    import zarr
-    from zarr.storage import MemoryStore
-
-    from scarf.datastore._operations.features import _load_marker_cluster_frame
-
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    slot = root.create_group("slot")
-    cluster = slot.create_group("1")
-    cluster.create_array(
-        "names",
-        data=np.array(["id2", "id0"]),
-    )
-    cluster.create_array(
-        "scores",
-        data=np.array([0.9, 0.8]),
-    )
-
-    loaded = _load_marker_cluster_frame(
-        slot,
-        cluster,
-        np.array(["gene0", "gene1", "gene2"]),
-        group_id=1,
-        feature_ids=np.array(["id0", "id1", "id2"]),
-    )
-
-    assert loaded["feature_index"].tolist() == [2, 0]
-    assert loaded["feature_name"].tolist() == ["gene2", "gene0"]
-    assert loaded["score"].tolist() == [0.9, 0.8]
-    assert loaded["p_value"].isna().all()
-    assert loaded["p_value_adjusted"].isna().all()
-
-
 def test_load_marker_table_ignores_stale_schema_version_attribute():
     from scarf.features.markers.table import load_marker_table
 
@@ -1222,94 +1220,6 @@ def test_load_marker_table_ignores_stale_schema_version_attribute():
     )
 
     assert loaded["feature_name"].tolist() == ["g1", "g0"]
-
-
-def test_legacy_compact_marker_uses_stored_stat_columns():
-    import zarr
-    from zarr.storage import MemoryStore
-
-    from scarf.features.markers.table import load_marker_table
-
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    slot = root.create_group("slot")
-    slot.attrs["stat_columns"] = [
-        "p_value",
-        "score",
-        "mean_rest",
-        "frac_exp_rest",
-        "fold_change",
-        "mean",
-        "frac_exp",
-    ]
-    slot.create_array("feature_index", data=np.array([1, 0], dtype=np.int32))
-    cluster = slot.create_group("1")
-    stats = np.array(
-        [
-            [0.01, 0.8, 0.5, 0.2, 2.0, 1.0, 0.9],
-            [0.04, 0.4, 0.5, 0.2, 1.0, 0.5, 0.3],
-        ],
-        dtype=np.float64,
-    )
-    cluster.create_array("stats", data=stats)
-    loaded = load_marker_table(
-        slot,
-        cluster,
-        np.array(["g0", "g1", "g2"]),
-        group_id=1,
-    )
-    assert loaded.iloc[0]["feature_name"] == "g1"
-    assert loaded.iloc[0]["score"] == 0.8
-    from statsmodels.stats.multitest import multipletests
-
-    _, expected, _, _ = multipletests([0.01, 0.04], method="fdr_bh")
-    assert loaded["p_value_adjusted"].tolist() == pytest.approx(list(expected))
-
-
-def test_unversioned_compact_marker_roundtrip_preserves_reordered_named_stats():
-    import zarr
-    from zarr.storage import MemoryStore
-
-    from scarf.features.markers.table import (
-        MARKER_STAT_COLUMNS,
-        load_marker_table,
-    )
-
-    source = pd.DataFrame(
-        {
-            "score": [0.4, 0.8],
-            "mean": [0.5, 1.0],
-            "mean_rest": [0.5, 0.5],
-            "frac_exp": [0.3, 0.9],
-            "frac_exp_rest": [0.2, 0.2],
-            "fold_change": [1.0, 2.0],
-            "p_value": [0.04, 0.01],
-            "auc": [0.6, 0.9],
-            "p_value_adjusted": [0.04, 0.02],
-        }
-    )
-    stored_columns = tuple(reversed(MARKER_STAT_COLUMNS))
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    slot = root.create_group("slot")
-    slot.attrs["stat_columns"] = list(stored_columns)
-    slot.create_array("feature_index", data=np.array([0, 1], dtype=np.int32))
-    cluster = slot.create_group("1")
-    cluster.create_array(
-        "stats",
-        data=np.column_stack([source[column].to_numpy() for column in stored_columns]),
-    )
-
-    loaded = load_marker_table(
-        slot,
-        cluster,
-        np.array(["g0", "g1"]),
-        group_id=1,
-    )
-
-    assert "schema_version" not in slot.attrs
-    assert loaded["feature_index"].tolist() == [1, 0]
-    expected = source.iloc[[1, 0]]
-    for column in MARKER_STAT_COLUMNS:
-        np.testing.assert_allclose(loaded[column], expected[column])
 
 
 def _make_canonical_marker_slot(columns=None):
@@ -1625,51 +1535,17 @@ def test_canonical_marker_reader_rejects_malformed_stat_columns():
         )
 
 
-def test_legacy_marker_reader_preserves_unresolved_feature_identity():
-    import zarr
-    from zarr.storage import MemoryStore
-
+def test_canonical_marker_reader_rejects_negative_feature_index():
     from scarf.features.markers.table import load_marker_table
 
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    slot = root.create_group("slot")
-    cluster = slot.create_group("1")
-    cluster.create_array("names", data=np.array(["known", "missing"]))
-    cluster.create_array("scores", data=np.array([0.8, 0.7]))
+    slot, cluster = _make_canonical_marker_slot()
+    slot["feature_index"][:] = np.array([-1, 0], dtype=np.int32)
 
-    loaded = load_marker_table(
-        slot,
-        cluster,
-        np.array(["known"]),
-        group_id=1,
-    )
-
-    assert loaded["feature_name"].tolist() == ["known", "missing"]
-    assert loaded["feature_index"].dtype == pd.Int64Dtype()
-    assert loaded.iloc[0]["feature_index"] == 0
-    assert pd.isna(loaded.iloc[1]["feature_index"])
-
-
-def test_legacy_marker_reader_rejects_negative_feature_index():
-    import zarr
-    from zarr.storage import MemoryStore
-
-    from scarf.features.markers.table import LEGACY_STAT_COLUMNS, load_marker_table
-
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    slot = root.create_group("slot")
-    slot.create_array("feature_index", data=np.array([-1], dtype=np.int32))
-    cluster = slot.create_group("1")
-    cluster.create_array(
-        "stats",
-        data=np.zeros((1, len(LEGACY_STAT_COLUMNS))),
-    )
-
-    with pytest.raises(ValueError, match="unresolved or out-of-range"):
+    with pytest.raises(ValueError, match="out-of-range"):
         load_marker_table(
             slot,
             cluster,
-            np.array(["known"]),
+            np.array(["g0", "g1"]),
             group_id=1,
         )
 
@@ -1764,7 +1640,7 @@ def test_pseudotime_bh_excludes_untested_features():
     class Assay:
         @staticmethod
         def iter_normed_feature_wise(**_kwargs):
-            yield pd.DataFrame(
+            yield _feature_batch(
                 {
                     "tested": [0.0, 1.0, 2.0, 3.0],
                     "untested": [0.0, 0.0, 0.0, 0.0],
@@ -1876,24 +1752,25 @@ def test_marker_feature_value_adapters_and_non_rna_rank_paths() -> None:
             self.name = "RNA"
             self.resources = ResourceBudget(8 * 1024 * 1024, 2)
             self.rawDataT = counts_t
-            self.n_term_per_doc = np.ones(8)
-            self.n_docs_per_term = np.ones(12)
-            self.n_docs = 8
 
-        def normed(self, cell_idx, feat_idx, **_kwargs):
-            self.n_term_per_doc = np.ones(len(cell_idx))
-            self.n_docs_per_term = np.ones(len(feat_idx))
-            self.n_docs = len(cell_idx)
+        def _fit_tf_idf(self, cell_idx, feat_idx, **_kwargs):
+            state = (np.ones(len(cell_idx)), len(cell_idx), np.ones(len(feat_idx)))
+            return None, state
 
-    for method in (norm_clr, norm_dummy, norm_tf_idf):
-        results = find_markers_by_rank(
-            FakeAssay(method),
-            groups=np.array(["a", "a", "a", "a", "b", "b", "b", "b"]),
-            cell_idx=np.arange(8),
-            feat_idx=np.array([10, 11]),
-            nthreads=1,
-        )
-        assert set(results) == {"a", "b"}
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(marker_search_module, "ATACassay", FakeAssay)
+    try:
+        for method in (norm_clr, norm_dummy, norm_tf_idf):
+            results = find_markers_by_rank(
+                FakeAssay(method),
+                groups=np.array(["a", "a", "a", "a", "b", "b", "b", "b"]),
+                cell_idx=np.arange(8),
+                feat_idx=np.array([10, 11]),
+                nthreads=1,
+            )
+            assert set(results) == {"a", "b"}
+    finally:
+        monkeypatch.undo()
 
     import scarf.storage.feature_stream as feature_stream_module
 

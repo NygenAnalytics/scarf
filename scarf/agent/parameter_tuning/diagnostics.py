@@ -2,7 +2,7 @@
 
 import hashlib
 from collections import Counter, defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -11,10 +11,6 @@ import pandas as pd
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
 from ...clustering.leiden import leiden_membership
-from ...metadata.rows import (
-    read_metadata_missing_rows_chunkwise,
-    read_metadata_rows_chunkwise,
-)
 from ...metadata.selection import resolve_cell_aligned_artifact
 from ...quality_control.cell_cycle_genes import (
     g2m_phase_genes,
@@ -36,6 +32,7 @@ from ...storage.refs import ArtifactRef
 from ...storage.selections import read_stored_selection_indices
 from ...storage.types import as_zarr_array
 from ...utils.logging import logger
+from ..tools import label_filter_bound, mark_missing_rows, read_marked_metadata_rows
 from .contracts import ArtifactRecord, ParameterCandidateEvaluation
 from .execution import (
     _cached_candidate_metric,
@@ -131,12 +128,7 @@ def _artifact_ref(
         raise ValueError(
             f"Candidate {evaluation.candidateId!r} lacks {name!r} evidence"
         )
-    return ArtifactRef(
-        scope=artifact.scope,
-        assay=artifact.assay,
-        kind=artifact.kind,
-        artifact_id=artifact.artifactId,
-    )
+    return artifact.to_artifact_ref()
 
 
 def _cluster_labels(store: Any, cluster_ref: ArtifactRef) -> np.ndarray:
@@ -407,12 +399,9 @@ def _top_loadings(
     return top_indices, top_values, enrichment
 
 
-def _aligned_metadata_values(
-    store: Any,
-    cell_selection: ArtifactRef,
-    column: str,
-) -> np.ndarray:
-    indices = read_stored_selection_indices(
+def _selection_indices(store: Any, cell_selection: ArtifactRef) -> np.ndarray:
+    """Read one validated datastore cell selection as full-axis row indices."""
+    return read_stored_selection_indices(
         store.zw,
         cell_selection,
         kind="cell_selection",
@@ -420,14 +409,32 @@ def _aligned_metadata_values(
         assay=None,
         table_path="cellData",
     ).astype(np.int64, copy=False)
-    values = np.asarray(read_metadata_rows_chunkwise(store.cells, column, indices))
-    if values.shape != (len(indices),):
-        raise ValueError(f"Metadata column {column!r} does not align with PCA")
-    missing = read_metadata_missing_rows_chunkwise(store.cells, column, indices)
-    if missing is not None and np.any(missing):
-        values = values.astype(object)
-        values[missing] = None
-    return values
+
+
+class _SelectionIndices:
+    """Validate and read each exact cell selection once per diagnostic pass."""
+
+    __slots__ = ("_indices", "_store")
+
+    def __init__(self, store: Any) -> None:
+        self._store = store
+        self._indices: dict[ArtifactRef, np.ndarray] = {}
+
+    def __call__(self, cell_selection: ArtifactRef) -> np.ndarray:
+        indices = self._indices.get(cell_selection)
+        if indices is None:
+            indices = _selection_indices(self._store, cell_selection)
+            self._indices[cell_selection] = indices
+        return indices
+
+
+def _column_fingerprint(store: Any, column: str, cache: dict[str, str] | None) -> str:
+    """Fingerprint live metadata once per diagnostic pass when a cache is given."""
+    if cache is None:
+        return _metadata_column_fingerprint(store.cells, column)
+    if column not in cache:
+        cache[column] = _metadata_column_fingerprint(store.cells, column)
+    return cache[column]
 
 
 def _numeric_association(coordinates: Any, values: np.ndarray) -> np.ndarray:
@@ -521,26 +528,33 @@ def _covariate_associations(
     column_kinds: Mapping[str, str] | None = None,
     support: dict[str, Any] | None = None,
     column_artifacts: Mapping[str, ArtifactRef] | None = None,
+    *,
+    selection_indices: Callable[[ArtifactRef], np.ndarray] | None = None,
 ) -> np.ndarray:
     if len(columns) != len(roles):
         raise ValueError("PCA covariate columns and roles must align")
     associations = np.zeros((len(columns), coordinates.shape[1]), dtype=np.float64)
     from ..experimental_context.characterization import _infer_kind
 
+    indices: np.ndarray | None = None
     for index, column in enumerate(columns):
         artifact = (column_artifacts or {}).get(column)
-        values = (
-            _aligned_metadata_values(store, cell_selection, column)
-            if artifact is None
-            else np.asarray(
-                resolve_cell_aligned_artifact(
-                    store.zw,
-                    artifact,
-                    cell_selection=cell_selection,
-                    expected_kind="quality_metric",
-                ).values
+        if artifact is None:
+            if indices is None:
+                indices = (
+                    _selection_indices(store, cell_selection)
+                    if selection_indices is None
+                    else selection_indices(cell_selection)
+                )
+            values = read_marked_metadata_rows(store.cells, column, indices)
+        else:
+            resolved = resolve_cell_aligned_artifact(
+                store.zw,
+                artifact,
+                cell_selection=cell_selection,
+                expected_kind="quality_metric",
             )
-        )
+            values = mark_missing_rows(resolved.values, resolved.missing_mask)
         if values.shape != (coordinates.shape[0],):
             raise ValueError(f"Covariate {column!r} does not align with PCA rows")
         kind = (column_kinds or {}).get(column) or (
@@ -611,6 +625,8 @@ def _write_pca_diagnostic(
     adjacent_overlap: float | None,
     column_kinds: Mapping[str, str] | None = None,
     column_artifacts: Mapping[str, ArtifactRef] | None = None,
+    fingerprints: dict[str, str] | None = None,
+    selection_indices: Callable[[ArtifactRef], np.ndarray] | None = None,
 ) -> tuple[
     ArtifactRef,
     np.ndarray,
@@ -672,7 +688,7 @@ def _write_pca_diagnostic(
                 column: (
                     column_artifacts[column].to_dict()
                     if column_artifacts and column in column_artifacts
-                    else _metadata_column_fingerprint(store.cells, column)
+                    else _column_fingerprint(store, column, fingerprints)
                 )
                 for column in covariate_columns
             },
@@ -787,18 +803,14 @@ def _write_pca_diagnostic(
             "metric.pcaCovariates",
             _covariate_associations,
             store,
-            ArtifactRef(
-                scope=evaluation.cellSelection.scope,
-                assay=evaluation.cellSelection.assay,
-                kind=evaluation.cellSelection.kind,
-                artifact_id=evaluation.cellSelection.artifactId,
-            ),
+            evaluation.cellSelection.to_artifact_ref(),
             coordinates,
             covariate_columns,
             covariate_roles,
             column_kinds,
             covariate_support,
             column_artifacts,
+            selection_indices=selection_indices,
         )
         if evaluation.cellSelection is not None
         else np.zeros((len(covariate_columns), coordinates.shape[1]), dtype=np.float64)
@@ -881,15 +893,19 @@ def augment_pca_evaluations(
     }
     columns: list[str] = []
     roles: list[str] = []
-    for role, values in (
+    role_columns = (
         ("technical", technical_columns),
         ("batch", batch_columns),
         ("protected", protected_columns),
         ("qc", qc_columns),
-    ):
+    )
+    available = (
+        set(store.cells.columns) if any(values for _, values in role_columns) else set()
+    )
+    for role, values in role_columns:
         for column in values:
             if (
-                column in store.cells.columns or column in (qc_artifacts or {})
+                column in available or column in (qc_artifacts or {})
             ) and column not in columns:
                 columns.append(column)
                 roles.append(role)
@@ -922,6 +938,8 @@ def augment_pca_evaluations(
         previous_by_id[evaluation.candidateId] = overlap
         previous = evaluation
 
+    fingerprints: dict[str, str] = {}
+    selection_indices = _SelectionIndices(store)
     augmented: list[ParameterCandidateEvaluation] = []
     for evaluation in evaluations:
         if evaluation.candidateId not in previous_by_id:
@@ -948,6 +966,8 @@ def augment_pca_evaluations(
             adjacent_overlap=previous_by_id[evaluation.candidateId],
             column_kinds=column_kinds,
             column_artifacts=qc_artifacts,
+            fingerprints=fingerprints,
+            selection_indices=selection_indices,
         )
         family_maxima = {
             family: float(family_enrichment[index].max(initial=0.0))
@@ -1108,20 +1128,15 @@ def _build_advisory_doublet_scores(
     capture_values: Sequence[str],
     capture_column: str | None,
     limitations: Sequence[str],
+    selection_indices: Callable[[ArtifactRef], np.ndarray] | None = None,
 ) -> AdvisoryDoubletScores:
     score_refs = tuple(scores)
     selections = tuple(cell_selections)
     captures = tuple(capture_values)
     if not score_refs or not (len(score_refs) == len(selections) == len(captures)):
         raise ValueError("Doublet score artifacts require aligned capture summaries")
-    parent_indices = read_stored_selection_indices(
-        store.zw,
-        parent_selection,
-        kind="cell_selection",
-        scope="datastore",
-        assay=None,
-        table_path="cellData",
-    )
+    read_indices = selection_indices or _SelectionIndices(store)
+    parent_indices = read_indices(parent_selection)
     if len(parent_indices) < 1:
         raise ValueError("Doublet evidence parent selection cannot be empty")
     score_arrays = tuple(
@@ -1135,15 +1150,8 @@ def _build_advisory_doublet_scores(
     samples: list[np.ndarray] = []
     covered_cells = 0
     for values, selection_ref in zip(score_arrays, selections, strict=True):
-        selection_indices = read_stored_selection_indices(
-            store.zw,
-            selection_ref,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )
-        if values.shape != selection_indices.shape:
+        score_indices = read_indices(selection_ref)
+        if values.shape != score_indices.shape:
             raise ValueError("Doublet scores do not align with their cell selection")
         summary, sample = diagnostic_call(
             "metric.doubletScoreSummary",
@@ -1156,7 +1164,7 @@ def _build_advisory_doublet_scores(
         )
         summaries.append(summary)
         samples.append(sample)
-        covered_cells += len(selection_indices)
+        covered_cells += len(score_indices)
     combined = np.concatenate(samples)
     aggregate = {
         "p50": float(np.quantile(combined, 0.5)),
@@ -1196,16 +1204,16 @@ def _select_capture_cells(
 ) -> tuple[ArtifactRef, int]:
     if active_indices.shape != active_values.shape:
         raise ValueError("Capture values must align with the selected cells")
-    labels = active_values.astype(str)
-    selected = labels == str(value)
+    selected = ~pd.isna(active_values) & (active_values.astype(str) == str(value))
     expected = np.zeros(store.cells.N, dtype=bool)
     expected[active_indices] = selected
+    bound = label_filter_bound(value)
     reference = diagnostic_call(
         "core.captureSelection",
         store.filter_cells,
         [column],
-        [value],
-        [value],
+        [bound],
+        [bound],
         cell_selection=parent,
         keep_bounds=True,
         invalidate_cache=False,
@@ -1305,12 +1313,7 @@ def score_advisory_doublets(
     """Score doublet evidence without making singlet or removal decisions."""
     if selected.cellSelection is None:
         raise ValueError("Doublet scoring requires an exact selected cell axis")
-    parent_selection = ArtifactRef(
-        scope=selected.cellSelection.scope,
-        assay=selected.cellSelection.assay,
-        kind=selected.cellSelection.kind,
-        artifact_id=selected.cellSelection.artifactId,
-    )
+    parent_selection = selected.cellSelection.to_artifact_ref()
     native_clusters, native_graph = resolve_native_doublet_inputs(
         store,
         selected,
@@ -1337,7 +1340,36 @@ def score_advisory_doublets(
             limitations=(limitation,),
         )
     limitations: list[str] = []
-    if capture_column is None or capture_column not in store.cells.columns:
+    selection_indices = _SelectionIndices(store)
+    capture_groups: list[str] = []
+    if capture_column is not None and capture_column in store.cells.columns:
+        active_indices = selection_indices(parent_selection)
+        capture_values = read_marked_metadata_rows(
+            store.cells,
+            capture_column,
+            active_indices,
+        )
+        # Cells without a recorded capture label never form a capture group.
+        recorded_captures = capture_values[~pd.isna(capture_values)]
+        unique_capture_labels, first_capture_indices = np.unique(
+            recorded_captures.astype(str),
+            return_index=True,
+        )
+        capture_groups = unique_capture_labels.tolist()
+        raw_capture_values = {
+            str(label): recorded_captures[int(index)]
+            for label, index in zip(
+                unique_capture_labels,
+                first_capture_indices,
+                strict=True,
+            )
+        }
+        if len(capture_groups) > _MAX_DOUBLET_CAPTURES:
+            raise ValueError(
+                "Physical capture column exceeds the advisory doublet limit of "
+                f"{_MAX_DOUBLET_CAPTURES} values"
+            )
+    if len(capture_groups) <= 1:
         score = diagnostic_call(
             "core.doubletDetection",
             store.run_doublet_detection,
@@ -1346,10 +1378,11 @@ def score_advisory_doublets(
             from_assay=assay,
             invalidate_cache=False,
         )
-        limitations.append(
-            "Physical capture identity was unavailable, so advisory doublet "
-            "scores were computed across the selected dataset."
-        )
+        if not capture_groups:
+            limitations.append(
+                "Physical capture identity was unavailable, so advisory doublet "
+                "scores were computed across the selected dataset."
+            )
         return _build_advisory_doublet_scores(
             store,
             scores=(score,),
@@ -1357,64 +1390,13 @@ def score_advisory_doublets(
             native_graph=native_graph,
             native_clusters=native_clusters,
             parent_selection=parent_selection,
-            capture_values=("allSelectedCells",),
-            capture_column=None,
+            capture_values=tuple(capture_groups) or ("allSelectedCells",),
+            capture_column=capture_column if capture_groups else None,
             limitations=limitations,
+            selection_indices=selection_indices,
         )
 
-    active_indices = read_stored_selection_indices(
-        store.zw,
-        parent_selection,
-        kind="cell_selection",
-        scope="datastore",
-        assay=None,
-        table_path="cellData",
-    ).astype(np.int64, copy=False)
-    capture_values = read_metadata_rows_chunkwise(
-        store.cells,
-        capture_column,
-        active_indices,
-    )
-    capture_labels = capture_values.astype(str)
-    unique_capture_labels, first_capture_indices = np.unique(
-        capture_labels,
-        return_index=True,
-    )
-    capture_groups = unique_capture_labels.tolist()
-    raw_capture_values = {
-        str(label): capture_values[int(index)]
-        for label, index in zip(
-            unique_capture_labels,
-            first_capture_indices,
-            strict=True,
-        )
-    }
-    if len(capture_groups) > _MAX_DOUBLET_CAPTURES:
-        raise ValueError(
-            "Physical capture column exceeds the advisory doublet limit of "
-            f"{_MAX_DOUBLET_CAPTURES} values"
-        )
-    if len(capture_groups) == 1:
-        score = diagnostic_call(
-            "core.doubletDetection",
-            store.run_doublet_detection,
-            native_clusters,
-            native_graph,
-            from_assay=assay,
-            invalidate_cache=False,
-        )
-        return _build_advisory_doublet_scores(
-            store,
-            scores=(score,),
-            cell_selections=(parent_selection,),
-            native_graph=native_graph,
-            native_clusters=native_clusters,
-            parent_selection=parent_selection,
-            capture_values=(capture_groups[0],),
-            capture_column=capture_column,
-            limitations=limitations,
-        )
-
+    assert capture_column is not None
     n_features = len(read_feature_selection_indices(store.zw, assay, feature_selection))
     scores: list[ArtifactRef] = []
     selections: list[ArtifactRef] = []
@@ -1518,6 +1500,7 @@ def score_advisory_doublets(
         capture_values=scored_captures,
         capture_column=capture_column,
         limitations=limitations,
+        selection_indices=selection_indices,
     )
 
 
@@ -1526,15 +1509,10 @@ def _doublet_concentration(
     labels: np.ndarray,
     cell_selection: ArtifactRef,
     evidence: AdvisoryDoubletScores,
+    selection_indices: Callable[[ArtifactRef], np.ndarray] | None = None,
 ) -> float | None:
-    parent_indices = read_stored_selection_indices(
-        store.zw,
-        cell_selection,
-        kind="cell_selection",
-        scope="datastore",
-        assay=None,
-        table_path="cellData",
-    ).astype(np.int64, copy=False)
+    read_indices = selection_indices or _SelectionIndices(store)
+    parent_indices = read_indices(cell_selection)
     if labels.shape != parent_indices.shape:
         raise ValueError("Cluster labels do not align with advisory doublet evidence")
     if len(parent_indices) > 1 and np.any(parent_indices[1:] <= parent_indices[:-1]):
@@ -1556,15 +1534,8 @@ def _doublet_concentration(
             store.load_artifact(score_ref)["values"],
             name="values",
         )
-        selection_indices = read_stored_selection_indices(
-            store.zw,
-            selection_ref,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        ).astype(np.int64, copy=False)
-        if score_values.shape != selection_indices.shape:
+        score_indices = read_indices(selection_ref)
+        if score_values.shape != score_indices.shape:
             raise ValueError("Doublet scores do not align with their cell selection")
         summary = (
             evidence.score_summaries[score_index]
@@ -1577,8 +1548,8 @@ def _doublet_concentration(
             )[0]
         )
         threshold = float(summary["p90"])
-        for start in range(0, len(selection_indices), 65_536):
-            local_indices = selection_indices[start : start + 65_536]
+        for start in range(0, len(score_indices), 65_536):
+            local_indices = score_indices[start : start + 65_536]
             local_positions = np.searchsorted(parent_indices, local_indices)
             if np.any(local_positions >= len(parent_indices)) or not np.array_equal(
                 parent_indices[local_positions],
@@ -1608,25 +1579,6 @@ def _doublet_concentration(
     return max(enrichments, default=0.0)
 
 
-def _aligned_metadata(
-    store: Any,
-    cell_selection: ArtifactRef,
-    column: str,
-) -> np.ndarray:
-    indices = read_stored_selection_indices(
-        store.zw,
-        cell_selection,
-        kind="cell_selection",
-        scope="datastore",
-        assay=None,
-        table_path="cellData",
-    ).astype(np.int64, copy=False)
-    values = np.asarray(read_metadata_rows_chunkwise(store.cells, column, indices))
-    if values.shape != (len(indices),):
-        raise ValueError(f"Metadata column {column!r} does not align with clusters")
-    return values.astype(str)
-
-
 def _cross_unit_support(labels: np.ndarray, units: np.ndarray) -> float | None:
     available_units = np.unique(units)
     if len(available_units) < 2:
@@ -1649,12 +1601,7 @@ def population_support_evidence(
     """
     if evaluation.status != "done" or evaluation.cellSelection is None:
         raise ValueError("Population support requires completed, cell-bound evidence")
-    selection = ArtifactRef(
-        scope=evaluation.cellSelection.scope,
-        assay=evaluation.cellSelection.assay,
-        kind=evaluation.cellSelection.kind,
-        artifact_id=evaluation.cellSelection.artifactId,
-    )
+    selection = evaluation.cellSelection.to_artifact_ref()
     clusters = _artifact_ref(evaluation, "clusters")
     status = store.inspect_artifact(clusters)
     if not status.exists or not status.complete:
@@ -1667,14 +1614,7 @@ def population_support_evidence(
         raise ValueError("Population support cluster and candidate cells differ")
     if clusters.kind not in {"cluster_labels", "cluster_cut"}:
         raise ValueError("Population support requires a clustering artifact")
-    indices = read_stored_selection_indices(
-        store.zw,
-        selection,
-        kind="cell_selection",
-        scope="datastore",
-        assay=None,
-        table_path="cellData",
-    )
+    indices = _selection_indices(store, selection)
     if not len(indices) or np.any(indices[1:] <= indices[:-1]):
         raise ValueError("Population support requires distinct ordered selected cells")
     labels = as_zarr_array(
@@ -1687,7 +1627,8 @@ def population_support_evidence(
         raise ValueError("Population labels do not align with the selected cells")
     requested = list(dict.fromkeys(columns))
     selected_columns = requested[:2]
-    available = [column for column in selected_columns if column in store.cells.columns]
+    cell_columns = set(store.cells.columns) if selected_columns else set()
+    available = [column for column in selected_columns if column in cell_columns]
     totals: Counter[int] = Counter()
     group_totals: dict[str, Counter[tuple[str, Any]]] = {
         column: Counter() for column in available
@@ -1710,24 +1651,11 @@ def population_support_evidence(
         )
         rows = indices[start:stop]
         for column in available:
-            values = np.asarray(read_metadata_rows_chunkwise(store.cells, column, rows))
-            missing = read_metadata_missing_rows_chunkwise(store.cells, column, rows)
-            if (
-                values.shape != rows.shape
-                or missing is not None
-                and missing.shape != rows.shape
-            ):
-                raise ValueError(
-                    f"Population metadata {column!r} does not align with cells"
-                )
-            for offset, (population, value) in enumerate(
-                zip(population_ids, values, strict=True)
-            ):
+            values = read_marked_metadata_rows(store.cells, column, rows)
+            for population, value in zip(population_ids, values, strict=True):
                 value = value.item() if isinstance(value, np.generic) else value
                 if (
-                    missing is not None
-                    and missing[offset]
-                    or pd.isna(value)
+                    pd.isna(value)
                     or isinstance(value, float)
                     and not np.isfinite(value)
                 ):
@@ -1876,6 +1804,29 @@ def augment_cluster_evaluations(
         for mask in [_family_mask(marker_feature_names, family)]
         if mask is not None and bool(mask.any())
     }
+    cell_columns = (
+        set(store.cells.columns)
+        if independent_unit_columns or technical_columns
+        else set()
+    )
+    selection_indices = _SelectionIndices(store)
+    cluster_metadata: dict[tuple[ArtifactRef, str], tuple[np.ndarray, np.ndarray]] = {}
+
+    def selected_labels(
+        selection: ArtifactRef, column: str
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return the recorded rows and their labels; missing rows form no unit."""
+        key = (selection, column)
+        if key not in cluster_metadata:
+            values = read_marked_metadata_rows(
+                store.cells,
+                column,
+                selection_indices(selection),
+            )
+            recorded = np.asarray(~pd.isna(values), dtype=bool)
+            cluster_metadata[key] = (recorded, values[recorded].astype(str))
+        return cluster_metadata[key]
+
     augmented: list[ParameterCandidateEvaluation] = []
     for evaluation in evaluations:
         if evaluation.status != "done" or evaluation.cellSelection is None:
@@ -2006,12 +1957,7 @@ def augment_cluster_evaluations(
             if family in protected_families and marker_fraction > 0:
                 protected_marker_families.append(family)
 
-        selection_ref = ArtifactRef(
-            scope=evaluation.cellSelection.scope,
-            assay=evaluation.cellSelection.assay,
-            kind=evaluation.cellSelection.kind,
-            artifact_id=evaluation.cellSelection.artifactId,
-        )
+        selection_ref = evaluation.cellSelection.to_artifact_ref()
         doublet_concentration = (
             diagnostic_call(
                 "metric.doubletConcentration",
@@ -2020,6 +1966,7 @@ def augment_cluster_evaluations(
                 labels,
                 selection_ref,
                 doublet_evidence,
+                selection_indices,
             )
             if doublet_evidence is not None and doublet_evidence.scores
             else None
@@ -2027,13 +1974,14 @@ def augment_cluster_evaluations(
         unit_scores = [
             score
             for column in independent_unit_columns
-            if column in store.cells.columns
+            if column in cell_columns
+            for recorded, units in [selected_labels(selection_ref, column)]
             for score in [
                 diagnostic_call(
                     "metric.crossUnitSupport",
                     _cross_unit_support,
-                    labels,
-                    _aligned_metadata(store, selection_ref, column),
+                    labels[recorded],
+                    units,
                 )
             ]
             if score is not None
@@ -2044,12 +1992,14 @@ def augment_cluster_evaluations(
                 diagnostic_call(
                     "metric.technicalAssociation",
                     normalized_mutual_info_score,
-                    labels,
-                    _aligned_metadata(store, selection_ref, column),
+                    labels[recorded],
+                    batches,
                 )
             )
             for column in technical_columns
-            if column in store.cells.columns
+            if column in cell_columns
+            for recorded, batches in [selected_labels(selection_ref, column)]
+            if recorded.any()
         }
 
         metrics = evaluation.metrics.model_copy(

@@ -156,31 +156,6 @@ class ReductionTransform:
         )
 
 
-class LazyTransformStream:
-    def __init__(
-        self,
-        *,
-        data: ChunkedArray,
-        transform: Callable[[np.ndarray], np.ndarray],
-        nthreads: int,
-        batch_size: int,
-    ) -> None:
-        self.data = data
-        self.transform = transform
-        self.nthreads = nthreads
-        self.batch_size = batch_size
-
-    def iter_raw(self, message: str = "") -> Iterator[np.ndarray]:
-        yield from self.data.stream_blocks(nthreads=self.nthreads, msg=message)
-
-    def iter_transformed(self, message: str = "") -> Iterator[np.ndarray]:
-        for block in self.iter_raw(message):
-            yield self.transform(block)
-
-    def iter_coordinate_blocks(self, message: str) -> Iterator[np.ndarray]:
-        yield from self.iter_transformed(message)
-
-
 class BatchCorrectionStage:
     def __init__(
         self,
@@ -371,7 +346,7 @@ class NeighborQueryStage:
 
 @dataclass(frozen=True, slots=True)
 class KMeansInitialization:
-    model: Any | None
+    model: Any
     labels: np.ndarray
 
 
@@ -380,30 +355,14 @@ class KMeansInitializationStage:
     def fit(
         *,
         stream: CoordinateSource,
-        n_rows: int | None = None,
-        batch_size: int | None = None,
+        n_rows: int,
+        batch_size: int,
         n_clusters: int,
         rand_state: int,
         nthreads: int,
-        enabled: bool,
         kmeans_sampling: float = 0.1,
         kmeans_batch_size: int = 10_000,
     ) -> KMeansInitialization:
-        if n_rows is None:
-            data = getattr(stream, "data", None)
-            if data is None:
-                raise ValueError("n_rows is required for this coordinate source")
-            n_rows = int(data.shape[0])
-        if batch_size is None:
-            raw_batch_size = getattr(stream, "batch_size", None)
-            if raw_batch_size is None:
-                raise ValueError("batch_size is required for this coordinate source")
-            batch_size = int(raw_batch_size)
-        if not enabled:
-            return KMeansInitialization(
-                model=None,
-                labels=np.repeat(-1, n_rows),
-            )
         if n_rows == 0:
             raise ValueError("K-means initialization requires at least one row")
         if isinstance(kmeans_sampling, bool):

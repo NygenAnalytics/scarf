@@ -111,9 +111,12 @@ class CSVtoZarr:
             None
         """
         from ..storage.arrays import create_zarr_obj_array
+        from ..storage.identity import CountSummary, finalize_counts
         from ..storage.schema import load_count_array
+        from ._store import skip_reserved_metadata_columns
 
         store = load_count_array(self.z, self.assayName, self.workspace)
+        summary = CountSummary(store)
         cell_data_path = (
             "cellData" if self.workspace is None else f"{self.workspace}/cellData"
         )
@@ -121,16 +124,27 @@ class CSVtoZarr:
             self.z[cell_data_path],
             name=cell_data_path,
         )
+        # Each entry pairs a column's position in the reader payload with its
+        # destination array, so skipped reserved columns keep the mapping exact.
         cell_data = [
-            create_zarr_obj_array(
-                cell_data_grp,
-                name=x,
-                data=None,
-                dtype="str" if y == np.dtype("O") else y,
-                shape=self.csvr.nCells,
-                profile=self.profile,
+            (
+                position,
+                create_zarr_obj_array(
+                    cell_data_grp,
+                    name=name,
+                    data=None,
+                    dtype="str" if dtype == np.dtype("O") else dtype,
+                    shape=self.csvr.nCells,
+                    profile=self.profile,
+                ),
             )
-            for x, y in zip(self.csvr.cellDataCols, self.csvr.cellDataDtypes or [])
+            for name, (position, dtype) in skip_reserved_metadata_columns(
+                zip(
+                    self.csvr.cellDataCols,
+                    enumerate(self.csvr.cellDataDtypes or []),
+                ),
+                "cell",
+            )
         ]
 
         def count_batches() -> Iterator[np.ndarray]:
@@ -138,8 +152,8 @@ class CSVtoZarr:
             for a, c in self.csvr.consume():
                 e = s + a.shape[0]
                 if c is not None:
-                    for n, i in enumerate(c.T):
-                        cell_data[n][s:e] = i
+                    for position, column in cell_data:
+                        column[s:e] = c[:, position]
                 s = e
                 if self.dtype is not None:
                     yield a.astype(self.dtype)
@@ -151,7 +165,9 @@ class CSVtoZarr:
             count_batches(),
             msg="Writing CSV counts",
             resources=self.resources,
+            residentBytes=summary.nbytes,
             io=self.io,
+            countSummary=summary,
         )
         if e != self.csvr.nCells:
             raise AssertionError(
@@ -162,6 +178,7 @@ class CSVtoZarr:
             f"Wrote {self.csvr.nCells} cells and {self.csvr.nFeatures} features "
             f"from CSV to assay {self.assayName}"
         )
+        finalize_counts(store, summary=summary)
         from .counts_t import finalize_writer_counts_t
 
         finalize_writer_counts_t(

@@ -1,7 +1,7 @@
 """Distribution plots for metadata and feature values."""
 
 import warnings
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 from typing import Any, Hashable, Literal
@@ -37,6 +37,7 @@ from ._contracts import (
 )
 from ._data import (
     _artifact_cell_selection,
+    _cell_metadata_columns,
     fetch_normalized_feature_matrix,
     resolve_cell_selection,
     resolve_feature,
@@ -44,13 +45,13 @@ from ._data import (
 from ._deps import require_matplotlib, require_seaborn
 from ._display import resolve_categorical_scale
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
+from ..utils.arrays import sort_categories
 from ._style import (
     MAX_FIGURE_WIDTH_INCHES,
     apply_figure_chrome,
     capped_figsize,
     categorical_color_map,
     continuous_norm,
-    sort_categories,
     theme_context,
 )
 
@@ -102,11 +103,16 @@ def _fetch_series(
     store: Any,
     key: str | CellField | FeatureRef,
     *,
+    metadata_columns: Collection[str],
     cell_indices: np.ndarray,
     from_assay: str | None,
     normalization: NormalizationSpec,
 ) -> tuple[np.ndarray, str, bool, str, str | None]:
-    """Return values, label, feature flag, stable identity, and source assay."""
+    """Return values, label, feature flag, stable identity, and source assay.
+
+    ``metadata_columns`` lists the cell-metadata columns that a plain string
+    key may name; any other string key is resolved as a feature.
+    """
     if isinstance(key, CellField):
         values, identity = _fetch_metadata_series(store, key.key, cell_indices)
         return (
@@ -117,7 +123,7 @@ def _fetch_series(
             None,
         )
     if isinstance(key, FeatureRef) or (
-        isinstance(key, str) and key not in store.cells.columns
+        isinstance(key, str) and key not in metadata_columns
     ):
         resolved = resolve_feature(store, key, from_assay=from_assay)
         mat = fetch_normalized_feature_matrix(
@@ -979,8 +985,10 @@ def distribution(
     orientation, the same option shares the x-axis value scale.
 
     Set ``sample_by`` or ``study_design`` to summarize cells within biological
-    samples before plotting. ``split_by`` draws two violin halves for a second
-    categorical variable.
+    samples before plotting. A study design's ``subject_by`` or ``pair_by``
+    column is used only with paired Wilcoxon ``stats_results``, matching
+    ``run_statistical_testing``. ``split_by`` draws two violin halves for a
+    second categorical variable.
 
     Pass ``stats_results`` (a single
     :class:`~scarf.features.statistical.StatisticalTestResult`, or a mapping
@@ -1143,7 +1151,14 @@ def distribution(
         if sample_by is not None and sample_by != study_design.sample_by:
             raise ValueError("sample_by conflicts with study_design.sample_by")
         sample_by = study_design.sample_by
-        if stats_results is not None:
+        # As in run_statistical_testing, a study-design pairing column applies
+        # only to paired Wilcoxon results.
+        results = (
+            stats_results.values()
+            if isinstance(stats_results, Mapping)
+            else [stats_results]
+        )
+        if any(getattr(result, "method", None) == "wilcoxon" for result in results):
             plot_pair_by = study_design.subject_by or study_design.pair_by
     if kind in ("violin", "stacked_violin", "box"):
         sns = require_seaborn()
@@ -1178,11 +1193,12 @@ def distribution(
             split_by,
             split_scale,
         )
+    metadata_columns = _cell_metadata_columns(store, key_list)
     feature_assays: set[str] = set()
     for key in key_list:
         if not (
             isinstance(key, FeatureRef)
-            or (isinstance(key, str) and key not in store.cells.columns)
+            or (isinstance(key, str) and key not in metadata_columns)
         ):
             continue
         assay_name = (
@@ -1306,6 +1322,7 @@ def distribution(
             _fetch_series(
                 store,
                 k,
+                metadata_columns=metadata_columns,
                 cell_indices=base_cell_idx,
                 from_assay=from_assay,
                 normalization=normalization,

@@ -53,7 +53,7 @@ from scarf.agent.types import (
     TuningBiologyHandoff,
 )
 from scarf.storage.refs import ArtifactRef
-from scarf.storage.selections import resolve_selection_artifact
+from scarf.storage.selections import resolve_generated_selection_artifact
 
 
 class FakeCells:
@@ -120,7 +120,7 @@ class FakeStore:
         cell_data = self.zw.create_group("cellData")
         cell_data.create_array("ids", data=self.cells.values["ids"])
         cell_data.create_array("I", data=self.cells.values["I"])
-        self.cell_selection = resolve_selection_artifact(
+        self.cell_selection = resolve_generated_selection_artifact(
             self.zw,
             scope="datastore",
             kind="cell_selection",
@@ -130,7 +130,7 @@ class FakeStore:
             parameters={},
             inputs={},
             source_column="I",
-        )
+        )[0]
         self.marker_calls = 0
         self.marker = ArtifactRef(
             scope="assay",
@@ -207,9 +207,11 @@ class FakeStore:
             inputs = {}
         return SimpleNamespace(exists=True, complete=True, inputs=inputs)
 
-    def load_artifact(self, artifact: object) -> dict[str, np.ndarray]:
+    def load_artifact(self, artifact: object) -> zarr.Group:
         assert artifact == self.cluster
-        return {"values": self.cells.cluster_values}
+        group = zarr.open_group(store=MemoryStore(), mode="w")
+        group.create_array("values", data=self.cells.cluster_values)
+        return group
 
 
 def artifact_model(ref: ArtifactRef) -> ArtifactReferenceModel:
@@ -990,7 +992,7 @@ def test_handoff_selection_must_match_exact_cluster_selection() -> None:
     other_values = np.asarray(store.cells.values["I"], dtype=bool).copy()
     other_values[0] = True
     other_values[1] = False
-    other_selection = resolve_selection_artifact(
+    other_selection = resolve_generated_selection_artifact(
         store.zw,
         scope="datastore",
         kind="cell_selection",
@@ -1000,7 +1002,7 @@ def test_handoff_selection_must_match_exact_cluster_selection() -> None:
         parameters={},
         inputs={},
         source_column="other",
-    )
+    )[0]
     tuning_handoff = TuningBiologyHandoff(
         cellSelection=artifact_model(other_selection),
         clusterArtifact=artifact_model(store.cluster),
@@ -1206,6 +1208,27 @@ def test_cluster_composition_artifact_validation_edges(
     )
     with pytest.raises(ValueError, match="selects no cells"):
         run(context(store).deps)
+
+
+@pytest.mark.parametrize("flagged", [False, True])
+def test_composition_rejects_masked_cluster_labels(
+    monkeypatch: pytest.MonkeyPatch, flagged: bool
+) -> None:
+    store = FakeStore()
+    group = store.load_artifact(store.cluster)
+    missing = np.zeros(len(store.cells.cluster_values), dtype=bool)
+    missing[0] = flagged
+    group.create_array("__scarf_missing__values", data=missing)
+    group["values"].attrs["missing_mask"] = "__scarf_missing__values"
+    monkeypatch.setattr(store, "load_artifact", lambda _ref: group)
+
+    if not flagged:
+        result = asyncio.run(inspect_cluster_composition(context(store)))
+        assert result.totalCells == len(store.cells.cluster_values)
+        return
+    # A placeholder label would otherwise join a real cluster.
+    with pytest.raises(ValueError, match="contains missing cluster labels"):
+        asyncio.run(inspect_cluster_composition(context(store)))
 
 
 def test_cluster_composition_metadata_alignment_edges(

@@ -5,7 +5,8 @@ from zarr.storage import MemoryStore
 
 from scarf.assay.persistence import _read_block
 from scarf.matrix.chunked import ChunkedArray
-from scarf.storage.budget import ResourceBudget, admit_stream
+from scarf.storage.budget import ResourceBudget
+from scarf.storage.execution import admit_stream
 from scarf.storage.feature_stream import plan_feature_stream
 from scarf.storage.geometry import ArrayGeometry, array_geometry
 from scarf.storage.partition import (
@@ -249,8 +250,8 @@ def test_admit_stream_charges_every_concurrent_chunk_decode() -> None:
         decodeBytes=100,
     )
 
-    assert (admission.outerWorkers, admission.ioConcurrency) == (2, 1)
-    peak = admission.outerWorkers * (400 + admission.ioConcurrency * 100)
+    assert (admission.readWorkers, admission.ioConcurrency) == (2, 1)
+    peak = admission.readWorkers * (400 + admission.ioConcurrency * 100)
     assert peak <= resources.memoryBytes
 
 
@@ -259,8 +260,8 @@ def test_admit_stream_without_decode_bytes_matches_a_flat_task_cost() -> None:
 
     admission = admit_stream(resources, nBlocks=8, blockBytes=250)
 
-    assert admission.outerWorkers == 4
-    assert admission.outerWorkers * 250 <= resources.memoryBytes
+    assert admission.readWorkers == 4
+    assert admission.readWorkers * 250 <= resources.memoryBytes
 
 
 def test_admit_stream_honours_resident_bytes_and_a_requested_depth() -> None:
@@ -274,12 +275,12 @@ def test_admit_stream_honours_resident_bytes_and_a_requested_depth() -> None:
         requested=2,
     )
 
-    assert admission.outerWorkers == 2
-    assert 600 + admission.outerWorkers * 100 <= resources.memoryBytes
+    assert admission.readWorkers == 2
+    assert 600 + admission.readWorkers * 100 <= resources.memoryBytes
 
 
 def test_admit_stream_reports_when_one_block_cannot_fit() -> None:
-    with pytest.raises(MemoryError, match="One task needs"):
+    with pytest.raises(MemoryError, match="One unit needs"):
         admit_stream(ResourceBudget(100, 4), nBlocks=4, blockBytes=1_000)
 
 
@@ -472,7 +473,7 @@ def test_planned_reads_never_decode_more_chunks_than_budgeted() -> None:
     )
 
     assert len(plan.blocks) == 8
-    assert (plan.readWorkers, plan.ioConcurrency) == (2, 1)
+    assert (plan.readWorkers, plan.ioConcurrency) == (3, 1)
 
     store.reset()
     blocks = list(
@@ -486,8 +487,7 @@ def test_planned_reads_never_decode_more_chunks_than_budgeted() -> None:
 
     peak = store.max_in_flight_for("get")
     decode = plan.geometry.nominalChunkBytes()
-    resident = block_bytes + decode
-    live = resident + plan.readWorkers * block_bytes + peak * decode
+    live = plan.readWorkers * block_bytes + peak * decode
 
     assert len(blocks) == 8
     assert peak >= 2, "the probe never observed overlapping reads"

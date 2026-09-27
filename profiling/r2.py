@@ -1,6 +1,5 @@
 import json
 import os
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import timedelta
@@ -19,6 +18,7 @@ _CREDENTIAL_KEYS = (
     "R2_SECRET_ACCESS_KEY",
 )
 # Large objects (Cellxgene source ~46 GiB) exceed obstore's default 30s request timeout.
+# obstore retries failed requests with backoff; callers add no second retry layer.
 _CLIENT_OPTIONS = {
     "timeout": "12h",
     "connect_timeout": "120s",
@@ -32,12 +32,6 @@ _RETRY_CONFIG = {
 
 @dataclass(frozen=True, slots=True)
 class ObjectDownload:
-    fileBytes: int
-    eTag: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class ObjectUpload:
     fileBytes: int
     eTag: str | None
 
@@ -92,12 +86,6 @@ def open_r2_object(uri: str) -> tuple[Any, str]:
     return store, key
 
 
-def join_uri(prefix: str, *parts: str) -> str:
-    base = prefix.rstrip("/")
-    suffix = "/".join(part.strip("/") for part in parts if part)
-    return f"{base}/{suffix}" if suffix else base
-
-
 def object_exists(uri: str) -> bool:
     store, key = open_r2_object(uri)
     try:
@@ -114,19 +102,6 @@ def object_size(uri: str) -> int | None:
     except FileNotFoundError:
         return None
     return int(meta["size"])
-
-
-def object_metadata(uri: str) -> dict[str, Any] | None:
-    store, key = open_r2_object(uri)
-    try:
-        meta = store.head(key)
-    except FileNotFoundError:
-        return None
-    e_tag = meta.get("e_tag")
-    return {
-        "size": int(meta["size"]),
-        "eTag": str(e_tag) if e_tag else None,
-    }
 
 
 def list_objects(
@@ -159,40 +134,12 @@ def list_objects(
     return listed
 
 
-def list_common_prefixes(prefixUri: str) -> list[str]:
-    parsed = urlsplit(prefixUri)
-    if parsed.scheme != "s3" or not parsed.netloc:
-        raise ValueError(f"Expected an s3:// object URI, got: {prefixUri}")
-    prefix = parsed.path.lstrip("/")
-    if prefix and not prefix.endswith("/"):
-        prefix += "/"
-    store, _key = open_r2_object(
-        prefixUri if parsed.path.lstrip("/") else f"{prefixUri.rstrip('/')}/."
-    )
-    result = store.list_with_delimiter(prefix or None)
-    prefixes = result.get("common_prefixes") or []
-    uris: list[str] = []
-    for item in prefixes:
-        path = str(item).strip("/")
-        uris.append(f"s3://{parsed.netloc}/{path}")
-    return uris
-
-
 def get_json(uri: str) -> dict[str, Any]:
-    body = get_bytes(uri)
-    payload = json.loads(body.decode("utf-8"))
+    store, key = open_r2_object(uri)
+    payload = json.loads(bytes(store.get(key).bytes()).decode("utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"Expected JSON object at {uri}")
     return payload
-
-
-def get_bytes(uri: str) -> bytes:
-    store, key = open_r2_object(uri)
-    return bytes(store.get(key).bytes())
-
-
-def get_text(uri: str) -> str:
-    return get_bytes(uri).decode("utf-8")
 
 
 def _encode_json(value: dict[str, Any]) -> bytes:
@@ -207,25 +154,12 @@ def put_json(uri: str, value: dict[str, Any]) -> None:
 
 
 def put_json_if_absent(uri: str, value: dict[str, Any]) -> bool:
-    return put_bytes_if_absent(uri, _encode_json(value))
-
-
-def put_bytes_if_absent(uri: str, value: bytes) -> bool:
     store, key = open_r2_object(uri)
     try:
-        store.put(
-            key,
-            value,
-            mode="create",
-            use_multipart=False,
-        )
+        store.put(key, _encode_json(value), mode="create", use_multipart=False)
     except AlreadyExistsError:
         return False
     return True
-
-
-def put_text_if_absent(uri: str, value: str) -> bool:
-    return put_bytes_if_absent(uri, value.encode("utf-8"))
 
 
 def download_file(
@@ -233,14 +167,11 @@ def download_file(
     destination: str | Path,
     *,
     chunkBytes: int = _DEFAULT_TRANSFER_CHUNK_BYTES,
-    maxAttempts: int = 8,
     maxWorkers: int | None = None,
 ) -> ObjectDownload:
     """Download with concurrent ranged GETs into a preallocated file."""
     if chunkBytes <= 0:
         raise ValueError("chunkBytes must be positive")
-    if maxAttempts <= 0:
-        raise ValueError("maxAttempts must be positive")
 
     store, key = open_r2_object(uri)
     destination_path = Path(destination)
@@ -264,28 +195,17 @@ def download_file(
         handle.truncate(total)
 
     def fetch_range(start: int, end: int) -> None:
-        attempts = 0
-        while True:
-            try:
-                local_store, local_key = open_r2_object(uri)
-                chunk = bytes(local_store.get_range(local_key, start=start, end=end))
-            except Exception:
-                attempts += 1
-                if attempts >= maxAttempts:
-                    raise
-                time.sleep(min(60.0, 2.0**attempts))
-                continue
-            if not chunk:
-                raise RuntimeError(f"Empty range response for {uri} at offset {start}")
-            if start + len(chunk) > end:
-                raise RuntimeError(
-                    f"Range response for {uri} at offset {start} exceeded "
-                    f"{end - start} bytes"
-                )
-            with part_path.open("r+b") as handle:
-                handle.seek(start)
-                handle.write(chunk)
-            return
+        chunk = bytes(store.get_range(key, start=start, end=end))
+        if not chunk:
+            raise RuntimeError(f"Empty range response for {uri} at offset {start}")
+        if start + len(chunk) > end:
+            raise RuntimeError(
+                f"Range response for {uri} at offset {start} exceeded "
+                f"{end - start} bytes"
+            )
+        with part_path.open("r+b") as handle:
+            handle.seek(start)
+            handle.write(chunk)
 
     if workers == 1 or len(ranges) == 1:
         for start, end in ranges:
@@ -305,13 +225,9 @@ def download_file(
     return ObjectDownload(fileBytes=total, eTag=str(e_tag) if e_tag else None)
 
 
-def upload_file(source: str | Path, uri: str) -> ObjectUpload:
+def upload_file(source: str | Path, uri: str) -> None:
     source_path = Path(source)
     if not source_path.is_file():
         raise FileNotFoundError(source_path)
     store, key = open_r2_object(uri)
-    file_bytes = source_path.stat().st_size
     store.put(key, source_path, use_multipart=True)
-    meta = store.head(key)
-    e_tag = meta.get("e_tag")
-    return ObjectUpload(fileBytes=file_bytes, eTag=str(e_tag) if e_tag else None)

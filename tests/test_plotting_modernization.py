@@ -513,6 +513,7 @@ def test_embedding_feature_matrix_prefetch_batches_feature_slots(monkeypatch):
             splt.CellField("category", kind="categorical"),
             "gene_b",
         ],
+        metadata_columns=set(store.cells.columns),
         from_assay="RNA",
         cell_key="I",
         n_cells=4,
@@ -2276,9 +2277,11 @@ def test_distribution_stats_rejects_sample_and_split_mismatches():
         )
     result.close()
 
+    # A study-design pairing column applies only to paired Wilcoxon results.
     matching_paired_stats = _synthetic_stats_result(
         store,
         table,
+        method="wilcoxon",
         sample_by="sample",
         pair_by="pair",
     )
@@ -2294,6 +2297,27 @@ def test_distribution_stats_rejects_sample_and_split_mismatches():
     try:
         assert result.provenance.extras["stats_annotated"] is True
         assert result.provenance.extras["pair_by"] == "pair"
+    finally:
+        result.close()
+
+    independent_sample_stats = _synthetic_stats_result(
+        store,
+        table,
+        method="mann_whitney",
+        sample_by="sample",
+    )
+    result = splt.distribution(
+        store,
+        "metric",
+        grouping=splt.CellField("group"),
+        study_design=splt.StudyDesign(sample_by="sample", subject_by="pair"),
+        max_points=0,
+        stats_results=independent_sample_stats,
+        show=False,
+    )
+    try:
+        assert result.provenance.extras["stats_annotated"] is True
+        assert result.provenance.extras["pair_by"] is None
     finally:
         result.close()
 
@@ -2534,6 +2558,7 @@ def test_distribution_masks_metadata_placeholders_per_panel():
     masked_values, _label, _is_feature, masked_identity, _assay = _fetch_series(
         masked_store,
         "metric",
+        metadata_columns=set(masked_store.cells.columns),
         cell_indices=np.arange(6, dtype=np.int64),
         from_assay=None,
         normalization=splt.NormalizationSpec(),
@@ -2541,6 +2566,7 @@ def test_distribution_masks_metadata_placeholders_per_panel():
     _values, _label, _is_feature, plain_identity, _assay = _fetch_series(
         plain_store,
         "metric",
+        metadata_columns=set(plain_store.cells.columns),
         cell_indices=np.arange(6, dtype=np.int64),
         from_assay=None,
         normalization=splt.NormalizationSpec(),
@@ -2620,3 +2646,164 @@ def test_distribution_panel_rejects_infinite_values(infinite):
             expression_cutoff=0.0,
             row_standardize=False,
         )
+
+
+class _MaskedSyntheticCells(_SyntheticCells):
+    def __init__(self, missing_masks, **columns):
+        super().__init__(**columns)
+        self._missing = {
+            key: np.asarray(value, dtype=bool) for key, value in missing_masks.items()
+        }
+
+    def _get_missing_mask_array(self, column):
+        return self._missing.get(column)
+
+
+def _masked_plot_store(missing_masks, **columns):
+    store = _synthetic_plot_store(**columns)
+    store.cells = _MaskedSyntheticCells(missing_masks, **columns)
+    return store
+
+
+def test_composition_shows_masked_categories_and_samples_as_missing():
+    store = _masked_plot_store(
+        {
+            "cluster": [False, True, False, False, False, True],
+            "sample": [False, False, False, True, False, False],
+        },
+        I=np.ones(6, dtype=bool),
+        cluster=np.array([0, 0, 1, 0, 1, 0]),
+        sample=np.array(["s1", "s1", "s1", "", "s2", "s2"]),
+    )
+
+    result = splt.composition(store, category_by="cluster", show=False)
+    try:
+        aggregate = result.tables["aggregate"]
+        assert aggregate["category"].tolist() == [0, 1, None]
+        np.testing.assert_allclose(aggregate["proportion"], [1 / 3] * 3)
+    finally:
+        result.close()
+
+    result = splt.composition(
+        store, category_by="cluster", sample_by="sample", show=False
+    )
+    try:
+        assert set(result.tables["per_sample"]["sample"]) == {"s1", "s2"}
+        assert result.provenance.extras["dropped_sample_cells"] == 1
+    finally:
+        result.close()
+
+
+def test_masked_metadata_is_missing_in_embedding_and_connectivity_inputs():
+    from scarf.plotting.cluster_connectivity import _fetch_inputs
+    from scarf.plotting.embedding import (
+        _multi_layout_facets,
+        _prefetch_colors,
+        _selected_metadata_column,
+    )
+
+    missing = [False, True, False, False]
+    store = _masked_plot_store(
+        {"donor": missing, "depth": missing, "flag": missing, "umap1": missing},
+        I=np.ones(4, dtype=bool),
+        donor=np.array([1, 0, 2, 1]),
+        depth=np.array([5, 0, 7, 9]),
+        flag=np.array([True, False, True, True]),
+        umap1=np.array([0.0, 0.0, 1.0, 2.0]),
+        umap2=np.array([0.0, 1.0, 1.0, 2.0]),
+    )
+
+    (donor, _label, donor_is_categorical, _uniform), (depth, *_rest) = _prefetch_colors(
+        store,
+        ["donor", splt.CellField("depth", kind="continuous")],
+        metadata_columns=store.cells.columns,
+        from_assay=None,
+        cell_key="I",
+        n_cells=4,
+        normalization=splt.NormalizationSpec(),
+    )
+    assert donor_is_categorical is True
+    assert donor.tolist() == [1, None, 2, 1]
+    np.testing.assert_array_equal(depth, [5.0, np.nan, 7.0, 9.0])
+    flag = _selected_metadata_column(store, "flag", cell_key="I", cell_indices=None)
+    assert flag.tolist() == [True, False, True, True]
+    assert _multi_layout_facets(
+        store,
+        facet_by="donor",
+        facet_order=None,
+        groups=None,
+        subset_by=None,
+        cell_key="I",
+    ) == [1, 2, None]
+
+    with pytest.raises(ValueError, match="non-finite coordinates"):
+        _fetch_inputs(store, group_by="donor", layout_key="umap", cell_key="I")
+    store.cells._missing.pop("umap1")
+    with pytest.raises(ValueError, match="'donor' contains missing values"):
+        _fetch_inputs(store, group_by="donor", layout_key="umap", cell_key="I")
+
+
+def test_grouping_plots_exclude_masked_labels_and_samples(tmp_path):
+    from tests.test_pipeline import _insert_nullable_cell_column
+    from tests.test_quality_control_missing_values import (
+        import_nullable_cluster_h5ad,
+    )
+
+    store, result, codes, missing = import_nullable_cluster_h5ad(tmp_path)
+    clusters = result.clusterArtifacts["clusters"]
+    donor_missing = np.zeros(store.cells.N, dtype=bool)
+    donor_missing[1::7] = True
+    donor = np.where(donor_missing, 0, np.arange(store.cells.N) % 2 + 1)
+    _insert_nullable_cell_column(store, "donor", donor.astype(np.int64), donor_missing)
+    gene = str(store.RNA.feats.fetch_all("names")[0])
+    members = {group: int(((codes == group) & ~missing).sum()) for group in range(3)}
+
+    for plot in (splt.dotplot, splt.matrixplot):
+        plotted = plot(store, features=[gene], groups=clusters, show=False)
+        try:
+            aggregate = plotted.tables["aggregate"]
+            assert dict(zip(aggregate["groups"], aggregate["n_cells"])) == members
+            assert plotted.provenance.extras["dropped_group_cells"] == missing.sum()
+        finally:
+            plotted.close()
+
+    plotted = splt.dotplot(store, features=[gene], group_by="donor", show=False)
+    try:
+        aggregate = plotted.tables["aggregate"]
+        assert dict(zip(aggregate["donor"], aggregate["n_cells"])) == {
+            label: int(((donor == label) & ~donor_missing).sum()) for label in (1, 2)
+        }
+    finally:
+        plotted.close()
+
+    plotted = splt.dotplot(
+        store, features=[gene], groups=clusters, sample_by="donor", show=False
+    )
+    try:
+        assert plotted.provenance.n_samples == 2
+        assert plotted.provenance.extras["dropped_sample_cells"] == donor_missing.sum()
+        assert set(plotted.tables["per_sample"]["sample"]) == {1, 2}
+    finally:
+        plotted.close()
+
+    plotted = splt.composition(store, categories=clusters, show=False)
+    try:
+        aggregate = plotted.tables["aggregate"]
+        assert aggregate["category"].tolist() == [0, 1, 2, None]
+        np.testing.assert_allclose(
+            aggregate["proportion"],
+            [*(np.array(list(members.values())) / len(codes)), missing.mean()],
+        )
+    finally:
+        plotted.close()
+
+    plotted = splt.composition(
+        store, categories=clusters, sample_by="donor", show=False
+    )
+    try:
+        per_sample = plotted.tables["per_sample"]
+        assert set(per_sample["sample"]) == {1, 2}
+        assert per_sample["category"].tolist()[-2:] == [None, None]
+        assert plotted.provenance.extras["dropped_sample_cells"] == donor_missing.sum()
+    finally:
+        plotted.close()

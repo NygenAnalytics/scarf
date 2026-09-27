@@ -4,10 +4,7 @@ from typing import Any
 
 import numpy as np
 
-from ..metadata.rows import (
-    read_array_rows_chunkwise,
-    read_metadata_rows_chunkwise,
-)
+from ..metadata.rows import read_metadata_rows_chunkwise
 from ..utils.arrays import permute_into_chunks
 
 
@@ -17,22 +14,14 @@ class RowPlan:
 
     permutationsRows: dict[int, dict[int, np.ndarray]]
     coordinatesPermutations: np.ndarray
-    cellOrder: dict[int, dict[int, np.ndarray]]
     nCells: int
     sourceNames: tuple[str, ...]
 
     def resident_bytes(self) -> int:
-        arrays = [
-            self.coordinatesPermutations,
-            *(
-                rows
-                for chunks in self.permutationsRows.values()
-                for rows in chunks.values()
-            ),
-            *(rows for chunks in self.cellOrder.values() for rows in chunks.values()),
-        ]
-        return sum(
-            array.nbytes for array in {id(array): array for array in arrays}.values()
+        return int(self.coordinatesPermutations.nbytes) + sum(
+            int(rows.nbytes)
+            for chunks in self.permutationsRows.values()
+            for rows in chunks.values()
         )
 
 
@@ -74,14 +63,6 @@ def build_row_plan(
         for key, arrays in permutations.items()
     }
 
-    permutations_rows_offset: dict[int, dict[int, np.ndarray]] = {}
-    offset = 0
-    for key, val_dict in permutations_rows.items():
-        permutations_rows_offset[key] = {
-            in_key: arrs + offset for in_key, arrs in val_dict.items()
-        }
-        offset += int(n_cells[key])
-
     coordinates: list[list[int]] = []
     extra: list[list[int]] = []
     for i in range(len(n_cells_per_source)):
@@ -99,36 +80,9 @@ def build_row_plan(
     else:
         coordinates_permutations = np.array(extra, dtype=np.int64)
 
-    if permutations_rows_offset:
-        first = permutations_rows_offset[0][0]
-        if int(first.min()) != 0:
-            raise AssertionError(
-                "ERROR: Randomization of rows failed. The first row should be at 0. "
-                "Please report this issue."
-            )
-        last_source = max(permutations_rows_offset)
-        last_block = max(permutations_rows_offset[last_source])
-        if int(permutations_rows_offset[last_source][last_block].max()) != int(
-            n_cells.sum() - 1
-        ):
-            raise AssertionError(
-                "ERROR: Randomization of rows failed. The last row should be at "
-                "the end of the dataset. Please report this issue."
-            )
-
-    cell_order: dict[int, dict[int, np.ndarray]] = {
-        i: {} for i in range(len(n_cells_per_source))
-    }
-    offset = 0
-    for x, y in coordinates_permutations:
-        size = permutations_rows[int(x)][int(y)].size
-        cell_order[int(x)][int(y)] = np.arange(offset, offset + size, dtype=np.int64)
-        offset += size
-
     return RowPlan(
         permutationsRows=permutations_rows,
         coordinatesPermutations=np.asarray(coordinates_permutations, dtype=np.int64),
-        cellOrder=cell_order,
         nCells=int(n_cells.sum()),
         sourceNames=tuple(source_names),
     )
@@ -150,29 +104,19 @@ def iter_row_plan_segments(
     *,
     segment_rows: int | None = None,
 ) -> Iterator[RowPlanSegment]:
-    """Yield destination-ordered source row segments from a row plan."""
+    """Yield destination-ordered source row segments from a row plan.
+
+    Blocks fill the destination contiguously in ``coordinatesPermutations``
+    order, so each block starts where the previous one ended.
+    """
     if segment_rows is not None and int(segment_rows) < 1:
         raise ValueError("segment_rows must be positive")
 
-    expected_start = 0
+    dest_start = 0
     for source_value, block_value in row_plan.coordinatesPermutations:
         source_idx = int(source_value)
         block_idx = int(block_value)
         local_rows = row_plan.permutationsRows[source_idx][block_idx]
-        destination_rows = row_plan.cellOrder[source_idx][block_idx]
-        if local_rows.size != destination_rows.size:
-            raise AssertionError(
-                "Merged row plan source and destination blocks have different sizes"
-            )
-        if local_rows.size:
-            dest_start = int(destination_rows[0])
-            if dest_start != expected_start:
-                raise AssertionError(
-                    "Merged row plan destination segments are not contiguous"
-                )
-        else:
-            dest_start = expected_start
-
         if local_rows.size:
             width = local_rows.size if segment_rows is None else int(segment_rows)
             for offset in range(0, local_rows.size, width):
@@ -182,9 +126,9 @@ def iter_row_plan_segments(
                     destStart=dest_start + offset,
                     localRows=local_rows[offset : offset + width],
                 )
-        expected_start += int(local_rows.size)
+        dest_start += int(local_rows.size)
 
-    if expected_start != row_plan.nCells:
+    if dest_start != row_plan.nCells:
         raise AssertionError("Merged row plan does not cover every planned cell")
 
 
@@ -225,21 +169,37 @@ def verify_merged_cell_ids(
     *,
     block_rows: int = 100_000,
 ) -> None:
-    """Compare stored cell ids against the row-plan identity generator."""
-    if int(stored_ids.shape[0]) != row_plan.nCells:
+    """Compare stored cell ids against the row-plan identity generator.
+
+    Stored ids are read one whole chunk band at a time. Segments arrive in
+    destination order, so each band is read once.
+    """
+    n_cells = int(stored_ids.shape[0])
+    if n_cells != row_plan.nCells:
         raise ValueError(
             "ERROR: order of cells does not match the one in existing file"
         )
+    chunk_rows = max(1, int(stored_ids.chunks[0]))
+    band_start = 0
+    band = np.asarray(stored_ids[0:0])
     for start, expected in iter_merged_cell_ids(
         row_plan,
         source_cell_tables,
         dtype=stored_ids.dtype,
         block_rows=block_rows,
     ):
-        stop = start + expected.size
-        destination_rows = np.arange(start, stop, dtype=np.int64)
-        actual = read_array_rows_chunkwise(stored_ids, destination_rows)
-        if not np.array_equal(actual, expected):
-            raise ValueError(
-                "ERROR: order of cells does not match the one in existing file"
-            )
+        offset = 0
+        while offset < expected.size:
+            row = start + offset
+            if row >= band_start + band.size:
+                band_start = row - row % chunk_rows
+                band = np.asarray(
+                    stored_ids[band_start : min(band_start + chunk_rows, n_cells)]
+                )
+            width = min(expected.size - offset, band_start + band.size - row)
+            actual = band[row - band_start : row - band_start + width]
+            if not np.array_equal(actual, expected[offset : offset + width]):
+                raise ValueError(
+                    "ERROR: order of cells does not match the one in existing file"
+                )
+            offset += width

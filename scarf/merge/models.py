@@ -11,8 +11,8 @@ type ComponentAction = Literal["write", "resume", "skip", "blocked"]
 class AssayMergePlan:
     """Resolved plan for one assay in a DataStoreMerge.
 
-    ``featureOverlapFraction`` is the share of union feature IDs present in at
-    least two sources with that assay. A modality present in only one source
+    ``featureOverlapFraction`` is the share of union feature keys (IDs, or names
+    when merging by name) present in at least two sources with that assay. A modality present in only one source
     reports ``1.0`` because zero-fill is intentional for the missing sources.
     """
 

@@ -113,9 +113,10 @@ def _fit_gram_pca(
 ) -> tuple[np.ndarray, _GramPcaModel]:
     from scipy.linalg import blas, eigh
     from sklearn.utils.extmath import svd_flip
-    from threadpoolctl import threadpool_limits
+    from threadpoolctl import ThreadpoolController, threadpool_limits
 
     n_features = data.shape[1]
+    controller = ThreadpoolController()
     n_components = dims + 1
     gram = np.zeros(
         (n_features, n_features),
@@ -135,15 +136,18 @@ def _fit_gram_pca(
             if scale is not None:
                 block = scale(block)
             values = np.asfortranarray(block, dtype=np.float64)
-            gram = blas.dsyrk(
-                1.0,
-                values,
-                beta=1.0,
-                c=gram,
-                trans=1,
-                lower=0,
-                overwrite_c=1,
-            )
+            # The block stream clamps BLAS to one thread per reader for its
+            # whole lifetime; the rank update runs here, between blocks.
+            with controller.limit(limits=nthreads, user_api="blas"):
+                gram = blas.dsyrk(
+                    1.0,
+                    values,
+                    beta=1.0,
+                    c=gram,
+                    trans=1,
+                    lower=0,
+                    overwrite_c=1,
+                )
             column_sum += values.sum(axis=0, dtype=np.float64)
             n_samples_seen += len(values)
 
@@ -322,11 +326,9 @@ def _fit_materialized_lsi(
 ) -> np.ndarray:
     from sklearn.decomposition import TruncatedSVD
 
-    matrix = np.vstack(
-        list(
-            data.stream_blocks(nthreads=nthreads, msg="Fitting materialized LSI model")
-        )
-    )
+    # Fill one preallocated matrix instead of holding every block and a
+    # stacked copy at the same time.
+    matrix = data.compute(nthreads=nthreads, msg="Fitting materialized LSI model")
     model = TruncatedSVD(
         n_components=n_components,
         random_state=random_state,
@@ -339,12 +341,62 @@ def _fit_materialized_lsi(
     return np.asarray(components)
 
 
+def _materialized_lsi_bytes(
+    *,
+    n_rows: int,
+    n_features: int,
+    itemsize: int,
+    n_components: int,
+    n_oversamples: int,
+) -> int:
+    """Estimate peak bytes held by the materialized LSI solver.
+
+    The dense input is held once and scikit-learn's explained-variance step
+    allocates a matrix-sized temporary. The randomized SVD keeps a few cell-
+    and feature-length bases with ``n_components + n_oversamples`` columns.
+    """
+    matrix_bytes = int(n_rows) * int(n_features) * int(itemsize)
+    width = min(int(n_rows), int(n_features), int(n_components) + int(n_oversamples))
+    float_bytes = np.dtype(np.float64).itemsize
+    basis_bytes = (
+        4 * (int(n_rows) + int(n_features)) * width * float_bytes
+        + 2 * width * width * float_bytes
+    )
+    return 2 * matrix_bytes + basis_bytes
+
+
+def require_materialized_lsi_budget(
+    *,
+    n_rows: int,
+    n_features: int,
+    itemsize: int,
+    n_components: int,
+    n_oversamples: int,
+    memory_bytes: int,
+) -> None:
+    """Raise MemoryError when the materialized LSI solver exceeds a budget."""
+    required = _materialized_lsi_bytes(
+        n_rows=n_rows,
+        n_features=n_features,
+        itemsize=itemsize,
+        n_components=n_components,
+        n_oversamples=n_oversamples,
+    )
+    if required > memory_bytes:
+        raise MemoryError(
+            f"Materialized LSI needs about {required} bytes to hold the "
+            f"{n_rows} x {n_features} matrix and its SVD workspace, but the "
+            f"operation limit is {memory_bytes} bytes. Use solver='streaming', "
+            "which reads the matrix in bounded blocks."
+        )
+
+
 def _nonnegative_integer(value: Any, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
         raise TypeError(f"{name} must be an integer")
     resolved = int(value)
     if resolved < 0:
-        raise ValueError(f"{name} must be nonnegative")
+        raise ValueError(f"{name} must be non-negative")
     return resolved
 
 

@@ -19,10 +19,12 @@ from ._contracts import (
     StudyDesign,
 )
 from ._data import (
+    _check_feature_count,
+    _fetch_cell_column,
     _resolve_grouping,
+    _summarize_resolved_features,
     coerce_feature_list,
     resolve_feature,
-    summarize_features_by_group,
 )
 from ._deps import require_matplotlib
 from ._display import resolve_categorical_scale
@@ -33,12 +35,12 @@ from ._heatmap_utils import (
     normalize_annotations,
     order_heatmap,
 )
+from ..utils.arrays import sort_categories
 from ._style import (
     apply_figure_chrome,
     capped_figsize,
     continuous_norm,
     scatter_edgecolor,
-    sort_categories,
     theme_context,
 )
 
@@ -238,11 +240,13 @@ def _sample_counts(
     sample_key = study_design.sample_by if study_design is not None else sample_by
     if sample_key is None:
         return None, 0
-    values = (
-        np.asarray(store.cells.fetch(sample_key, key=cell_key), dtype=object)
-        if cell_indices is None
-        else np.asarray(store.cells.fetch_all(sample_key), dtype=object)[cell_indices]
-    )
+    values = _fetch_cell_column(
+        store,
+        sample_key,
+        cell_key=cell_key,
+        cell_idx=cell_indices,
+        labels=True,
+    ).astype(object)
     valid = pd.notna(values) & (values != "")
     return int(pd.Series(values[valid]).nunique()), int((~valid).sum())
 
@@ -309,12 +313,13 @@ def dotplot(
         raise NotImplementedError("dotplot currently supports only linear color scales")
     size_scale_is_explicit = size_scale is not None
     normalization = normalization or NormalizationSpec()
-    group_keys, cell_indices, _group_values = _resolve_grouping(
+    grouping = _resolve_grouping(
         store,
         group_by=group_by,
         groups=groups,
         cell_key=cell_key,
     )
+    group_keys, cell_indices, _group_values, group_missing = grouping
     if marker_linewidth < 0:
         raise ValueError("marker_linewidth must be non-negative")
     if isinstance(group_by, str):
@@ -323,20 +328,21 @@ def dotplot(
             group_by,
             categorical_scale,
         )
+    feature_pairs = coerce_feature_list(features)
+    resolved_features = [
+        resolve_feature(store, feature, from_assay=from_assay)
+        for _, feature in feature_pairs
+    ]
     requested_feature_order = list(
-        dict.fromkeys(
-            resolve_feature(store, feature, from_assay=from_assay).label
-            for _, feature in coerce_feature_list(features)
-        )
+        dict.fromkeys(feature.label for feature in resolved_features)
     )
 
-    aggregate, per_sample = summarize_features_by_group(
+    _check_feature_count(feature_pairs)
+    aggregate, per_sample = _summarize_resolved_features(
         store,
-        features=features,
-        group_by=group_by,
-        groups=groups,
-        cell_key=cell_key,
-        from_assay=from_assay,
+        resolved_features,
+        [group for group, _ in feature_pairs],
+        grouping,
         sample_by=sample_by,
         study_design=study_design,
         normalization=normalization,
@@ -649,6 +655,9 @@ def dotplot(
                 ),
                 "expression_cutoff": expression_cutoff,
                 "dropped_sample_cells": dropped_sample_cells,
+                "dropped_group_cells": (
+                    0 if group_missing is None else int(group_missing.sum())
+                ),
                 "normalization": {
                     "source": normalization.source,
                     "transform": normalization.transform,
@@ -727,20 +736,25 @@ def matrixplot(
             "matrixplot currently supports only linear color scales"
         )
     normalization = normalization or NormalizationSpec()
-    group_keys, cell_indices, _group_values = _resolve_grouping(
+    grouping = _resolve_grouping(
         store,
         group_by=group_by,
         groups=groups,
         cell_key=cell_key,
     )
+    group_keys, cell_indices, _group_values, group_missing = grouping
 
-    aggregate, per_sample = summarize_features_by_group(
+    feature_pairs = coerce_feature_list(features)
+    _check_feature_count(feature_pairs)
+    resolved_features = [
+        resolve_feature(store, feature, from_assay=from_assay)
+        for _, feature in feature_pairs
+    ]
+    aggregate, per_sample = _summarize_resolved_features(
         store,
-        features=features,
-        group_by=group_by,
-        groups=groups,
-        cell_key=cell_key,
-        from_assay=from_assay,
+        resolved_features,
+        [group for group, _ in feature_pairs],
+        grouping,
         sample_by=sample_by,
         study_design=study_design,
         normalization=normalization,
@@ -754,10 +768,7 @@ def matrixplot(
 
     plot_df["group_label"] = _group_axis_labels(plot_df, group_keys)
     requested_feature_order = list(
-        dict.fromkeys(
-            resolve_feature(store, feature, from_assay=from_assay).label
-            for _, feature in coerce_feature_list(features)
-        )
+        dict.fromkeys(feature.label for feature in resolved_features)
     )
     summarized_features = list(dict.fromkeys(plot_df["feature"].tolist()))
     observed_feature_order = [
@@ -966,6 +977,9 @@ def matrixplot(
                 ),
                 "expression_cutoff": expression_cutoff,
                 "dropped_sample_cells": dropped_sample_cells,
+                "dropped_group_cells": (
+                    0 if group_missing is None else int(group_missing.sum())
+                ),
                 "normalization": {
                     "source": normalization.source,
                     "transform": normalization.transform,

@@ -23,7 +23,7 @@ from scarf.storage.artifacts import (
     inspect_artifact,
 )
 from scarf.storage.errors import ArtifactResolutionError
-from scarf.storage.selections import resolve_selection_artifact
+from scarf.storage.selections import resolve_generated_selection_artifact
 from tests.fixtures_datastore import build_neighbourhood_graph
 
 
@@ -86,7 +86,7 @@ def _memory_metadata_root() -> tuple[zarr.Group, ArtifactRef]:
     selection = np.asarray([True, False, True])
     cell_data.create_array("ids", data=cell_ids)
     cell_data.create_array("I", data=selection)
-    selection_ref = resolve_selection_artifact(
+    selection_ref = resolve_generated_selection_artifact(
         root,
         scope="datastore",
         kind="cell_selection",
@@ -96,7 +96,7 @@ def _memory_metadata_root() -> tuple[zarr.Group, ArtifactRef]:
         parameters={},
         inputs={},
         source_column="I",
-    )
+    )[0]
     return root, selection_ref
 
 
@@ -197,7 +197,7 @@ def test_cell_aligned_artifact_resolver_validates_lineage_and_reads_subset(
         {"values": np.asarray([10.0, 30.0])},
     )
     cell_ids = np.asarray(root["cellData"]["ids"][:])
-    target_selection = resolve_selection_artifact(
+    target_selection = resolve_generated_selection_artifact(
         root,
         scope="datastore",
         kind="cell_selection",
@@ -207,7 +207,7 @@ def test_cell_aligned_artifact_resolver_validates_lineage_and_reads_subset(
         parameters={},
         inputs={},
         source_column="artifact",
-    )
+    )[0]
     read_positions: list[np.ndarray] = []
     read_rows = metadata_selection_module.read_array_rows_chunkwise
 
@@ -235,7 +235,7 @@ def test_cell_aligned_artifact_resolver_validates_lineage_and_reads_subset(
     assert len(read_positions) == 1
     np.testing.assert_array_equal(read_positions[0], [1])
 
-    outside_selection = resolve_selection_artifact(
+    outside_selection = resolve_generated_selection_artifact(
         root,
         scope="datastore",
         kind="cell_selection",
@@ -245,7 +245,7 @@ def test_cell_aligned_artifact_resolver_validates_lineage_and_reads_subset(
         parameters={},
         inputs={},
         source_column="artifact",
-    )
+    )[0]
     with pytest.raises(ValueError, match="subset"):
         resolve_cell_aligned_artifact(
             root,
@@ -348,7 +348,9 @@ def test_embedding_and_clustering_are_artifact_only(datastore_ephemeral) -> None
         n_epochs=10,
     )
     leiden = datastore.run_leiden_clustering(graph)
-    paris = datastore.run_paris_clustering(graph, n_clusters=3)
+    # This k=3 graph has several components, and a fixed cut cannot request
+    # fewer clusters than components, so the fixed cut asks for one cluster.
+    paris = datastore.run_paris_clustering(graph, n_clusters=1)
 
     assert embedding.kind == "embedding"
     assert leiden.kind == "cluster_labels"
@@ -582,6 +584,36 @@ def test_imputation_batches_preserve_requested_columns_and_stream_rows(
     monkeypatch.setattr(store, "memoryBytes", 1)
     with pytest.raises(MemoryError, match="fewer features"):
         store.get_imputed([metadata_name, "duplicate"], diffusion)
+
+
+def test_get_imputed_accepts_array_like_feature_names(
+    datastore,
+    connectivity_graph,
+) -> None:
+    diffusion = datastore.run_diffusion_operator(connectivity_graph, t=2)
+    names = [str(name) for name in datastore.RNA.feats.fetch_all("names")[:3]]
+    expected = datastore.get_imputed(names, diffusion)
+
+    for container in (
+        np.asarray(names),
+        np.asarray(names, dtype=object),
+        pd.Series(names),
+        pd.Series(names, index=[7, 3, 5]),
+    ):
+        actual = datastore.get_imputed(container, diffusion)
+        assert actual.shape == expected.shape
+        np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(
+        datastore.get_imputed(np.asarray(names[:1]), diffusion),
+        expected[:, :1],
+    )
+
+    with pytest.raises(ValueError, match="one-dimensional"):
+        datastore.get_imputed(np.asarray([names]), diffusion)
+    with pytest.raises(ValueError, match="non-empty strings"):
+        datastore.get_imputed(np.asarray([], dtype=str), diffusion)
+    with pytest.raises(ValueError, match="non-empty strings"):
+        datastore.get_imputed(pd.Series([names[0], 3]), diffusion)
 
 
 def test_explicit_graph_consumers_ignore_later_live_selection_changes(

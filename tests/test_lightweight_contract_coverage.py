@@ -5,13 +5,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-import scarf.assay
 from scarf.features.enrichment.results import EnrichmentResult
-from scarf.features.markers import batching
 from scarf.matrix._reductions import _Reduction
 from scarf.matrix.blocks import Block
 from scarf.matrix.chunked import ChunkedArray
-from scarf.storage.budget import ResourceBudget
 from scarf.storage.refs import ArtifactRef
 from scarf.trajectory.results import (
     FateMappingResult,
@@ -125,59 +122,6 @@ def test_block_shape_dtype_materialization_and_row_selection() -> None:
     np.testing.assert_array_equal(
         tuple_selected.compute(), np.array([[6.0, 7.0, 8.0], [3.0, 4.0, 5.0]])
     )
-
-
-def test_marker_feature_column_chunk_uses_each_backing_strategy(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[object, int]] = []
-
-    def fake_chunk(backing: object, *, featureAxis: int) -> int:
-        calls.append((backing, featureAxis))
-        return 7 + featureAxis
-
-    class FakeRNA:
-        def __init__(self, raw_data_t: object | None) -> None:
-            self.rawDataT = raw_data_t
-            self.rawData = SimpleNamespace(_backing="rna-cells")
-
-    monkeypatch.setattr(batching, "_feature_column_chunk", fake_chunk)
-    monkeypatch.setattr(scarf.assay, "RNAassay", FakeRNA)
-
-    assert batching.feature_column_chunk(FakeRNA("rna-features"), 99) == 7
-    assert (
-        batching.feature_column_chunk(
-            SimpleNamespace(rawData=SimpleNamespace(_backing="other")), 99
-        )
-        == 8
-    )
-    assert batching.feature_column_chunk(SimpleNamespace(), 4) == 4
-    assert calls == [("rna-features", 0), ("other", 1)]
-
-
-def test_marker_batch_size_respects_chunk_feature_and_memory_caps() -> None:
-    resources = ResourceBudget(memoryBytes=6_400, workers=8)
-    with pytest.warns(DeprecationWarning):
-        assert (
-            batching.resolve_marker_gene_batch_size(
-                n_features=5,
-                n_cells=10,
-                column_chunk=8,
-                resources=resources,
-            )
-            == 5
-        )
-
-    with (
-        pytest.warns(DeprecationWarning),
-        pytest.raises(MemoryError, match="does not fit"),
-    ):
-        batching.resolve_marker_gene_batch_size(
-            n_features=0,
-            n_cells=0,
-            column_chunk=0,
-            resources=ResourceBudget(memoryBytes=1, workers=1),
-        )
 
 
 def test_fate_and_pseudotime_results_reject_each_invalid_dimension() -> None:

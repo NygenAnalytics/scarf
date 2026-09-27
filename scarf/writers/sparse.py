@@ -6,6 +6,7 @@ import pandas as pd
 from scipy.sparse import coo_matrix, csr_matrix
 
 from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.identity import CountSummary, finalize_counts
 from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import (
     StorageProfile,
@@ -151,7 +152,8 @@ class SparseToZarr:
         if batch_size is not None and batch_size <= 0:
             raise ValueError("batch_size must be positive")
         store = load_count_array(self.z, self.assayName, self.workspace)
-        resident_bytes = sparse_matrix_bytes(self.mat)
+        summary = CountSummary(store)
+        resident_bytes = sparse_matrix_bytes(self.mat) + summary.nbytes
         indptr = np.asarray(self.mat.indptr)
 
         def max_window_nnz(window_rows: int) -> int:
@@ -198,6 +200,7 @@ class SparseToZarr:
             producerReserveBytes=plan.producerReserveBytes,
             msg="Writing sparse counts",
             io=self.io,
+            countSummary=summary,
         )
         if e != self.nCells:
             raise AssertionError(
@@ -208,6 +211,7 @@ class SparseToZarr:
             f"Wrote {self.nCells} cells and {self.nFeatures} features "
             f"to assay {self.assayName}"
         )
+        finalize_counts(store, summary=summary)
         from .counts_t import finalize_writer_counts_t
 
         finalize_writer_counts_t(

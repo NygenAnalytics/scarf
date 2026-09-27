@@ -4,7 +4,7 @@ import sys
 import tempfile
 import time
 import traceback
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +29,12 @@ from profiling.config import (
     StorageIoConfig,
     WorkflowParameters,
 )
-from profiling.metrics import ResourceMeasurement, ResourceSampler, StageTimer
+from profiling.metrics import (
+    ResourceMeasurement,
+    ResourceSampler,
+    StageTimer,
+    stage_utilization,
+)
 from profiling.r2 import storage_options
 
 configure_output(progress=False, timestamps=True)
@@ -95,6 +100,7 @@ def profile_stage_inputs(
 
 @dataclass(frozen=True, slots=True)
 class StageRunResult:
+    submissionId: str
     stage: StageName
     nRows: int
     status: str
@@ -122,8 +128,15 @@ class StageRunResult:
     cgroupPeakScope: str | None = None
     processCpuSeconds: float | None = None
     childCpuSeconds: float | None = None
+    workers: int | None = None
+    cpuQuotaCores: float | None = None
+    memoryMaxBytes: int | str | None = None
+    memoryEventsDelta: dict[str, int] | None = None
+    utilization: dict[str, float | None] | None = None
     details: dict[str, Any] | None = None
     provenance: dict[str, Any] | None = None
+    # Stages that ran at the same time; CPU and memory then share a window.
+    concurrentStages: list[str] | None = None
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -150,15 +163,19 @@ def _storage_io_policy(config: StorageIoConfig | None) -> Any:
 
 
 def _wrap_store_probe(
-    storeUri: str, options: dict[str, Any] | None, storeProbe: Any
+    storeUri: str, options: dict[str, Any] | None, storeProbe: Any | None
 ) -> Any:
+    """Return the store location, wrapped so ``storeProbe`` counts its operations."""
+    if storeProbe is None:
+        return storeUri
     from scarf.storage.stores import make_store
+    from zarr.storage import LocalStore
 
     from profiling.recording_store import wrap_recording_store
 
     resolved = make_store(storeUri, storage_options=options)
     if isinstance(resolved, str):
-        return storeUri
+        resolved = LocalStore(resolved.removeprefix("file://"))
     return wrap_recording_store(resolved, probe=storeProbe)
 
 
@@ -172,9 +189,7 @@ def _open_datastore(
     storageIo: StorageIoConfig | None = None,
 ) -> DataStore:
     options = storage_options(storeUri)
-    location: Any = storeUri
-    if storeProbe is not None:
-        location = _wrap_store_probe(storeUri, options, storeProbe)
+    location = _wrap_store_probe(storeUri, options, storeProbe)
     arguments: dict[str, Any] = {
         "nthreads": resources.workers,
         "zarr_mode": "r+",
@@ -194,51 +209,6 @@ def _open_datastore(
     return DataStore(location, **arguments)
 
 
-def _reset_initialization_stats(
-    storeUri: str,
-    workflow: WorkflowParameters,
-) -> None:
-    from scarf.metadata import MetaData
-
-    root = open_store(
-        storeUri,
-        mode="r+",
-        storage_options=storage_options(storeUri),
-    )
-    cells = MetaData(as_zarr_group(root["cellData"], name="cellData"))
-    for name in (
-        f"{workflow.assayName}_nCounts",
-        f"{workflow.assayName}_nFeatures",
-        f"{workflow.assayName}_percentMito",
-        f"{workflow.assayName}_percentRibo",
-    ):
-        if name in cells.columns:
-            cells.drop(name)
-
-    assay = as_zarr_group(root[workflow.assayName], name=workflow.assayName)
-    features = MetaData(
-        as_zarr_group(
-            assay["featureData"],
-            name=f"{workflow.assayName}/featureData",
-        )
-    )
-    for name in ("nCells", "dropOuts"):
-        if name in features.columns:
-            features.drop(name)
-
-    percent_features = assay.attrs.get("percentFeatures", {})
-    if isinstance(percent_features, dict):
-        reset_names = {
-            f"{workflow.assayName}_percentMito",
-            f"{workflow.assayName}_percentRibo",
-        }
-        assay.attrs["percentFeatures"] = {
-            str(name): str(pattern)
-            for name, pattern in percent_features.items()
-            if str(name) not in reset_names
-        }
-
-
 def _close_h5ad_reader(reader: H5adReader) -> None:
     if hasattr(reader, "h5") and hasattr(reader.h5, "close"):
         reader.h5.close()
@@ -255,9 +225,7 @@ def _prepare_create_store(
     storeProbe: Any | None = None,
 ) -> tuple[H5adReader, H5adToZarr]:
     options = storage_options(storeUri)
-    location: Any = storeUri
-    if storeProbe is not None:
-        location = _wrap_store_probe(storeUri, options, storeProbe)
+    location = _wrap_store_probe(storeUri, options, storeProbe)
     reader = H5adReader(
         str(localH5adPath),
         matrix_key="X",
@@ -279,6 +247,8 @@ def _prepare_create_store(
             policy=_count_matrix_policy(countMatrix),
             io=_storage_io_policy(storageIo),
         )
+        # Keep multi-process writes for a wrapped store. The store probe then
+        # counts only the operations of this process.
         writer._parallelWriteLocation = storeUri
     except BaseException:
         _close_h5ad_reader(reader)
@@ -330,82 +300,6 @@ def _stop_child_process(process: subprocess.Popen[bytes]) -> None:
         process.wait()
 
 
-def _read_worker_status(statusPath: Path, *, workerName: str) -> dict[str, Any] | None:
-    if not statusPath.is_file():
-        return None
-    payload = json.loads(statusPath.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"{workerName} status must be a JSON object")
-    return payload
-
-
-def _run_worker_in_subprocess(
-    *,
-    stageLabel: str,
-    workerModule: str,
-    storeUri: str,
-    workflow: WorkflowParameters,
-    resources: StageResources,
-    workDir: Path | None,
-    workDirPrefix: str,
-    invalidateCache: bool = False,
-    requestInputs: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    worker_dir = (
-        workDir if workDir is not None else Path(tempfile.mkdtemp(prefix=workDirPrefix))
-    )
-    worker_dir.mkdir(parents=True, exist_ok=True)
-    request_path = worker_dir / "request.json"
-    status_path = worker_dir / "status.json"
-    status_path.unlink(missing_ok=True)
-    request: dict[str, Any] = {
-        "storeUri": storeUri,
-        "workflow": workflow.model_dump(mode="json"),
-        "resources": resources.model_dump(mode="json"),
-        "statusPath": str(status_path),
-        "invalidateCache": invalidateCache,
-        "inputs": requestInputs or {},
-    }
-    request_path.write_text(json.dumps(request), encoding="utf-8")
-
-    command = [
-        sys.executable,
-        "-m",
-        workerModule,
-        "--request",
-        str(request_path),
-    ]
-    from profiling.metrics import child_cpu_seconds as read_child_cpu_seconds
-
-    cpu_before = read_child_cpu_seconds()
-    process = subprocess.Popen(command)
-    print(
-        f"[{stageLabel}] child started pid={process.pid} module={workerModule} "
-        f"warningSeconds={CHILD_WARNING_SECONDS:.0f}",
-        flush=True,
-    )
-    try:
-        return_code = _monitor_child_process(process, stageLabel=stageLabel)
-    except BaseException:
-        _stop_child_process(process)
-        raise
-
-    child_cpu = max(0.0, read_child_cpu_seconds() - cpu_before)
-    status = _read_worker_status(status_path, workerName=f"{stageLabel} worker")
-    if return_code != 0:
-        detail = status.get("error") if status is not None else None
-        suffix = f": {detail}" if isinstance(detail, str) else ""
-        raise RuntimeError(
-            f"{stageLabel} worker exited with code {return_code}{suffix}"
-        )
-    if status is None or status.get("status") != "ok":
-        raise RuntimeError(f"{stageLabel} worker exited without a successful status")
-    print(f"[{stageLabel}] child completed pid={process.pid}", flush=True)
-    if "childCpuSeconds" not in status:
-        status["childCpuSeconds"] = child_cpu
-    return status
-
-
 def _run_leiden_in_subprocess(
     *,
     storeUri: str,
@@ -415,17 +309,57 @@ def _run_leiden_in_subprocess(
     graph: ArtifactRef,
     invalidateCache: bool = False,
 ) -> dict[str, Any]:
-    return _run_worker_in_subprocess(
-        stageLabel="runLeiden",
-        workerModule="profiling.leiden_worker",
-        storeUri=storeUri,
-        workflow=workflow,
-        resources=resources,
-        workDir=workDir,
-        workDirPrefix="scarf-leiden-",
-        invalidateCache=invalidateCache,
-        requestInputs={"graph": graph.to_dict()},
+    """Run ``profiling.leiden_worker`` in a child process and return its status."""
+    worker_dir = (
+        workDir
+        if workDir is not None
+        else Path(tempfile.mkdtemp(prefix="scarf-leiden-"))
     )
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    request_path = worker_dir / "request.json"
+    status_path = worker_dir / "status.json"
+    status_path.unlink(missing_ok=True)
+    request = {
+        "storeUri": storeUri,
+        "workflow": workflow.model_dump(mode="json"),
+        "resources": resources.model_dump(mode="json"),
+        "statusPath": str(status_path),
+        "invalidateCache": invalidateCache,
+        "inputs": {"graph": graph.to_dict()},
+    }
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "profiling.leiden_worker",
+            "--request",
+            str(request_path),
+        ]
+    )
+    print(
+        f"[runLeiden] child started pid={process.pid} "
+        f"warningSeconds={CHILD_WARNING_SECONDS:.0f}",
+        flush=True,
+    )
+    try:
+        return_code = _monitor_child_process(process, stageLabel="runLeiden")
+    except BaseException:
+        _stop_child_process(process)
+        raise
+    status: dict[str, Any] = (
+        json.loads(status_path.read_text(encoding="utf-8"))
+        if status_path.is_file()
+        else {}
+    )
+    if return_code != 0 or status.get("status") != "ok":
+        detail = status.get("error")
+        suffix = f": {detail}" if isinstance(detail, str) else ""
+        raise RuntimeError(
+            f"runLeiden worker failed with exit code {return_code}{suffix}"
+        )
+    print(f"[runLeiden] child completed pid={process.pid}", flush=True)
+    return status
 
 
 def _peak_cgroup_bytes(measurement: ResourceMeasurement | None) -> int | None:
@@ -439,51 +373,27 @@ def _peak_cgroup_bytes(measurement: ResourceMeasurement | None) -> int | None:
 def summarize_resource_measurement(
     measurement: ResourceMeasurement | None,
 ) -> dict[str, Any]:
+    """Return the resource fields persisted in stage and funnel results."""
+
+    def field(name: str) -> Any:
+        return None if measurement is None else getattr(measurement, name)
+
     return {
-        "peakRssBytes": (
-            measurement.processTreeRssPeakBytes if measurement is not None else None
-        ),
+        "peakRssBytes": field("processTreeRssPeakBytes"),
         "peakCgroupBytes": _peak_cgroup_bytes(measurement),
-        "rssBaselineBytes": (
-            measurement.processTreeRssBaselineBytes if measurement is not None else None
-        ),
-        "rssIncrementalPeakBytes": (
-            measurement.processTreeRssIncrementalPeakBytes
-            if measurement is not None
-            else None
-        ),
-        "rssAfterBytes": (
-            measurement.processTreeRssAfterBytes if measurement is not None else None
-        ),
-        "cgroupCurrentBaselineBytes": (
-            measurement.cgroupMemoryCurrentBaselineBytes
-            if measurement is not None
-            else None
-        ),
-        "cgroupCurrentPeakBytes": (
-            measurement.cgroupMemoryCurrentPeakBytes
-            if measurement is not None
-            else None
-        ),
-        "cgroupCurrentAfterBytes": (
-            measurement.cgroupMemoryCurrentAfterBytes
-            if measurement is not None
-            else None
-        ),
-        "operationBaselineBytes": (
-            measurement.operationBaselineBytes if measurement is not None else None
-        ),
-        "operationIncrementalPeakBytes": (
-            measurement.operationIncrementalPeakBytes
-            if measurement is not None
-            else None
-        ),
-        "operationPeakSource": (
-            measurement.operationPeakSource if measurement is not None else None
-        ),
-        "cgroupPeakScope": (
-            measurement.cgroupMemoryPeakScope if measurement is not None else None
-        ),
+        "rssBaselineBytes": field("processTreeRssBaselineBytes"),
+        "rssIncrementalPeakBytes": field("processTreeRssIncrementalPeakBytes"),
+        "rssAfterBytes": field("processTreeRssAfterBytes"),
+        "cgroupCurrentBaselineBytes": field("cgroupMemoryCurrentBaselineBytes"),
+        "cgroupCurrentPeakBytes": field("cgroupMemoryCurrentPeakBytes"),
+        "cgroupCurrentAfterBytes": field("cgroupMemoryCurrentAfterBytes"),
+        "operationBaselineBytes": field("operationBaselineBytes"),
+        "operationIncrementalPeakBytes": field("operationIncrementalPeakBytes"),
+        "operationPeakSource": field("operationPeakSource"),
+        "cgroupPeakScope": field("cgroupMemoryPeakScope"),
+        "cpuQuotaCores": field("cpuQuotaCores"),
+        "memoryMaxBytes": field("memoryMaxBytes"),
+        "memoryEventsDelta": field("memoryEventsDelta"),
     }
 
 
@@ -507,9 +417,7 @@ def _prepare_counts_t_write(
         workers=resources.workers,
     )
     options = storage_options(storeUri)
-    location: Any = storeUri
-    if storeProbe is not None:
-        location = _wrap_store_probe(storeUri, options, storeProbe)
+    location = _wrap_store_probe(storeUri, options, storeProbe)
     root = open_store(location, mode="r+", storage_options=options)
     group = as_zarr_group(root[assayName], name=assayName)
     counts = as_zarr_array(group["counts"], name=f"{assayName}/counts")
@@ -534,6 +442,7 @@ def _write_counts_t(
 ) -> tuple[Any, dict[str, Any]]:
     from scarf.storage.count_matrix import plan_count_matrix_pair
     from scarf.storage.sharding import write_counts_t
+    from scarf.assay.classification import default_feature_sets
 
     profile = "cloud" if storeUri.startswith("s3://") else "fast_local"
     policy = _count_matrix_policy(countMatrix)
@@ -556,6 +465,12 @@ def _write_counts_t(
         policy=policy,
         io=_storage_io_policy(storageIo),
         metrics=writer_metrics,
+        overwrite=True,
+        featureSets=(
+            default_feature_sets(context.group)
+            if "featureData" in context.group
+            else ()
+        ),
     )
     return counts_t, {
         "writer": "product",
@@ -564,7 +479,6 @@ def _write_counts_t(
         "countsTChunks": list(pair.countsT.chunks),
         "countsTShards": list(pair.countsT.shards or ()),
         "metrics": writer_metrics,
-        "kind": "observed",
     }
 
 
@@ -660,31 +574,16 @@ def _validate_counts_t(
     }
 
 
-def install_stage_zarr_runtime(resources: StageResources) -> None:
-    """Install the process Zarr runtime once from the first stage budget."""
-    from scarf.storage.async_execution import (
-        configure_zarr_runtime,
-        resolve_execution_plan,
-        zarr_runtime_installed,
-    )
+def install_stage_zarr_runtime() -> None:
+    from scarf.storage.async_execution import ensure_zarr_host_ceiling
 
-    if zarr_runtime_installed():
-        return
-    runtime = resolve_execution_plan(
-        resolve_budget(
-            memory=resources.scarfMemoryBudget,
-            workers=resources.workers,
-        )
-    )
-    configure_zarr_runtime(
-        codecWorkers=runtime.codecWorkerLimit,
-        asyncConcurrency=runtime.zarrAsyncConcurrency,
-    )
+    ensure_zarr_host_ceiling()
 
 
 def run_stage(
     stage: StageName,
     *,
+    submissionId: str,
     nRows: int,
     storeUri: str,
     workflow: WorkflowParameters,
@@ -704,7 +603,7 @@ def run_stage(
     inputRefs: dict[str, ArtifactRef] | None = None,
     session: dict[str, Any] | None = None,
 ) -> StageRunResult:
-    install_stage_zarr_runtime(resources)
+    install_stage_zarr_runtime()
     timer = StageTimer()
     cpu_started = time.process_time()
     sampler = ResourceSampler(
@@ -715,30 +614,20 @@ def run_stage(
     status = "ok"
     measurement: ResourceMeasurement | None = None
     details: dict[str, Any] | None = None
-    worker_timings: dict[str, Any] | None = None
+    worker_status: dict[str, Any] | None = None
     store_probe: Any | None = None
     if recordStoreOperations:
         from profiling.recording_store import StoreProbe
 
-        store_probe = StoreProbe(countOnly=True)
+        # A session store stays wrapped with the probe of the stage that opened
+        # it, so all stages of a session share one probe and reset it.
+        store_probe = (session or {}).get("storeProbe") or StoreProbe(countOnly=True)
+        store_probe.reset()
+        if session is not None:
+            session["storeProbe"] = store_probe
     collected_reports: list[Any] = []
 
     from scarf.storage.execution import execution_report_scope
-
-    _shared_store_stages = {
-        "filterCells",
-        "markHvgs",
-        "runNormalization",
-        "runPca",
-        "buildEmbeddingInitialization",
-        "buildAnnIndex",
-        "queryNeighbors",
-        "buildConnectivityMap",
-        "runUmap",
-        "findMarkers",
-        "importClusters",
-        "validateExperiment",
-    }
 
     def _keep_store(opened: DataStore | None) -> None:
         if session is not None and opened is not None:
@@ -849,7 +738,15 @@ def run_stage(
                     store: DataStore | None = None
                     try:
                         if invalidateCache:
-                            _reset_initialization_stats(storeUri, workflow)
+                            root = open_store(
+                                storeUri,
+                                mode="r",
+                                storage_options=storage_options(storeUri),
+                            )
+                            if root[workflow.assayName].attrs.get("prepared") is True:
+                                raise ValueError(
+                                    "Forced initialization of prepared data requires a fresh runTag"
+                                )
                         with timer.operation():
                             store = _open_datastore(
                                 storeUri,
@@ -886,7 +783,7 @@ def run_stage(
                         assay=workflow.assayName,
                     )
                     with timer.operation():
-                        worker_timings = _run_leiden_in_subprocess(
+                        worker_status = _run_leiden_in_subprocess(
                             storeUri=storeUri,
                             workflow=workflow,
                             resources=resources,
@@ -894,12 +791,7 @@ def run_stage(
                             graph=graph,
                             invalidateCache=invalidateCache,
                         )
-                    raw_artifact = worker_timings.get("artifact")
-                    if not isinstance(raw_artifact, dict):
-                        raise RuntimeError(
-                            "runLeiden worker did not return its cluster artifact"
-                        )
-                    cluster_ref = ArtifactRef.from_dict(raw_artifact)
+                    cluster_ref = ArtifactRef.from_dict(worker_status["artifact"])
                     if (
                         cluster_ref.scope != "assay"
                         or cluster_ref.assay != workflow.assayName
@@ -908,14 +800,21 @@ def run_stage(
                         raise RuntimeError(
                             "runLeiden worker returned an incompatible artifact"
                         )
-                    details = {"artifact": cluster_ref.to_dict()}
+                    details = {
+                        "artifact": cluster_ref.to_dict(),
+                        "subprocessSeconds": timer.result.measuredOperationSeconds,
+                        "workerWholeSeconds": worker_status.get("wholeWorkerSeconds"),
+                        "workerProcessCpuSeconds": worker_status.get(
+                            "processCpuSeconds"
+                        ),
+                    }
                     if session is not None:
                         session.setdefault("artifactRefs", {})[stage] = cluster_ref
                 else:
                     store = None
                     reused = (
                         session.get("store")
-                        if session is not None and stage in _shared_store_stages
+                        if session is not None and stage not in CONSUME_STAGES
                         else None
                     )
                     try:
@@ -984,65 +883,20 @@ def run_stage(
     timings = timer.result
     seconds = timings.measuredOperationSeconds
     input_setup_seconds = timings.inputSetupSeconds
+    if worker_status is not None:
+        # Report the store open and clustering inside the child, not its startup.
+        input_setup_seconds = worker_status.get("inputSetupSeconds")
+        seconds = worker_status.get("operationSeconds")
+    # RUSAGE_CHILDREN covers every reaped child, including the Leiden worker.
     measured_child_cpu = max(0.0, read_child_cpu_seconds() - child_cpu_before)
-    child_cpu_seconds: float | None = (
-        measured_child_cpu if measured_child_cpu > 0 else None
-    )
-    if worker_timings is not None:
-        worker_setup = worker_timings.get("inputSetupSeconds")
-        worker_operation = worker_timings.get("operationSeconds")
-        worker_whole = worker_timings.get("wholeWorkerSeconds")
-        worker_child_cpu = worker_timings.get("childCpuSeconds")
-        worker_process_cpu = worker_timings.get("processCpuSeconds")
-        if isinstance(worker_setup, int | float) and not isinstance(worker_setup, bool):
-            input_setup_seconds = float(worker_setup)
-        if isinstance(worker_operation, int | float) and not isinstance(
-            worker_operation, bool
-        ):
-            seconds = float(worker_operation)
-        if isinstance(worker_child_cpu, int | float) and not isinstance(
-            worker_child_cpu, bool
-        ):
-            child_cpu_seconds = float(worker_child_cpu)
-        extra_details: dict[str, Any] = {}
-        if isinstance(worker_whole, int | float) and not isinstance(worker_whole, bool):
-            extra_details["subprocessSeconds"] = timings.measuredOperationSeconds
-            extra_details["workerWholeSeconds"] = float(worker_whole)
-        if isinstance(worker_process_cpu, int | float) and not isinstance(
-            worker_process_cpu, bool
-        ):
-            extra_details["workerProcessCpuSeconds"] = float(worker_process_cpu)
-        label_sha256 = worker_timings.get("labelSha256")
-        if isinstance(label_sha256, str):
-            extra_details["labelSha256"] = label_sha256
-        cluster_count = worker_timings.get("clusterCount")
-        if isinstance(cluster_count, int) and not isinstance(cluster_count, bool):
-            extra_details["clusterCount"] = cluster_count
-        if extra_details:
-            details = {**(details or {}), **extra_details}
-    if stage == "createStore":
-        counts_t_present = False
-        if status == "ok":
-            root = open_store(
-                storeUri,
-                mode="r",
-                storage_options=storage_options(storeUri),
-            )
-            assay = as_zarr_group(
-                root[workflow.assayName],
-                name=workflow.assayName,
-            )
-            counts_t_present = "countsT" in assay
-        details = {
-            "countsWriteSeconds": seconds,
-            "countsOnly": True,
-            "countsTPresent": counts_t_present,
-            **(details or {}),
-        }
+    child_cpu_seconds = measured_child_cpu if measured_child_cpu > 0 else None
     if store_probe is not None:
+        # The Leiden child opens its own store, which this probe cannot observe.
         details = {
             **(details or {}),
-            "storeOperations": store_probe.to_json(),
+            "storeOperations": (
+                None if stage == "runLeiden" else store_probe.to_json()
+            ),
         }
     if collected_reports:
         from scarf.storage.execution import execution_reports_by_kind
@@ -1055,7 +909,8 @@ def run_stage(
     process_cpu_seconds = time.process_time() - cpu_started
     from profiling.provenance import collect_run_provenance
 
-    return StageRunResult(
+    result = StageRunResult(
+        submissionId=submissionId,
         stage=stage,
         nRows=nRows,
         status=status,
@@ -1082,12 +937,20 @@ def run_stage(
         details=details,
         processCpuSeconds=process_cpu_seconds,
         childCpuSeconds=child_cpu_seconds,
+        workers=resources.workers,
         provenance=collect_run_provenance(
             nonpreemptible=True,
             clientProvenance=clientProvenance,
         ),
         **resource_summary,
     )
+    utilization = stage_utilization(result.to_json())
+    print(
+        f"[run_stage] utilization stage={stage} "
+        + " ".join(f"{name}={value}" for name, value in utilization.items()),
+        flush=True,
+    )
+    return replace(result, utilization=utilization)
 
 
 def _feature_consume_details(
@@ -1104,7 +967,6 @@ def _feature_consume_details(
     payload: dict[str, Any] = {
         "workers": resources.workers,
         "scarfMemoryBudget": resources.scarfMemoryBudget,
-        "kind": "observed",
     }
     selected = None
     reports = recorded_execution_reports()
@@ -1298,7 +1160,6 @@ def _import_cluster_labels(
         "labelFingerprint": _ordered_id_digest(np.asarray(labels, dtype=object)),
         "groupCount": len(groups),
         "activeCells": target_selection.selected_count,
-        "kind": "observed",
     }
 
 
@@ -1331,7 +1192,6 @@ def _validate_experiment(
             "complete": marker_status.complete,
             "clustersArtifactId": clusters.artifact_id,
         },
-        "kind": "observed",
     }
 
 
@@ -1698,7 +1558,6 @@ def _run_analysis(
             "nFeatures": n_features,
             "aggrType": aggr_type,
             "clusters": clusters.to_dict(),
-            "kind": "observed",
         }
     if stage in {"runDoublets", "runDoubletsRatio01"}:
         clusters = _profile_input(
@@ -1726,6 +1585,5 @@ def _run_analysis(
             "simulationRatio": simulation_ratio,
             "clusters": clusters.to_dict(),
             "graph": graph.to_dict(),
-            "kind": "observed",
         }
     raise ValueError(f"No analysis operation for {stage}")

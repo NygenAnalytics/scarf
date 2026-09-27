@@ -71,9 +71,11 @@ selections are immutable artifacts aligned to one assay.
 
 ## 1. Inspect QC distributions
 
-On open, Scarf streams the count matrix once to compute initialization statistics: columns such as
-`RNA_nCounts`, `RNA_nFeatures`, and mito/ribo percentages when gene names match the configured
-patterns, plus per-feature detection statistics used by explicit selection producers.
+The first time a store is opened for writing, Scarf prepares each assay. It records per-cell
+columns such as `RNA_nCounts` and `RNA_nFeatures` from totals saved when the counts were written,
+computes mito/ribo percentages when gene names match the configured patterns, and records
+per-feature detection statistics used by explicit selection producers. Later opens validate this
+prepared data instead of recomputing it.
 
 ```{code-cell} ipython3
 qc_cols = [
@@ -205,10 +207,12 @@ study-specific biology. Inspect their distributions before applying upper thresh
 
 The default mitochondrial pattern is now case-insensitive `^MT-`, replacing `MT-|mt`.
 It matches names such as `MT-CO1` and `mt-Co1` without including `MTOR` or metallothioneins.
-Opening an existing store for writing recomputes a cached percentage column if its recorded
-pattern differs, and logs the old and new patterns before replacing the values. A read-only
-open retains the cached values; open the store for writing to refresh them before using the
-corrected metric in a new analysis.
+Percentage columns are fixed when a store is first prepared. That first open for writing discards
+any existing column with a percentage name, logs a warning, and computes the percentage from the
+counts. Later opens keep the stored values when `mito_pattern` and `ribo_pattern` are omitted. An
+explicit pattern that differs from the recorded one raises an error instead of replacing prepared
+data. To apply a different pattern, import the data into a fresh store and pass the pattern on
+its first open, or compute a separate `quality_metric` artifact as shown below.
 
 For another gene set, create an explicit feature selection and calculate its percentage over an
 explicit cell selection. The datastore method returns a `quality_metric` artifact and does not add

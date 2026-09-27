@@ -14,7 +14,7 @@ from scarf.storage.artifacts import (
     inspect_artifact,
 )
 from scarf.storage.errors import ArtifactResolutionError
-from scarf.storage.feature_selection import _ValidatedFeatureSelection
+from scarf.storage.feature_selection import ValidatedFeatureSelection
 from scarf.storage.refs import ArtifactRef, ExternalArtifactRef
 from tests.test_feature_selection_resolution import _selection_store
 
@@ -80,17 +80,17 @@ def test_feature_selection_write_and_feature_table_contracts() -> None:
 
     empty = zarr.open_group(store=MemoryStore(), mode="w")
     with pytest.raises(ArtifactResolutionError) as caught:
-        feature_selection._feature_data(empty, "RNA")
+        feature_selection._feature_ids(empty, "RNA")
     assert caught.value.code == "wrong_assay"
     rna = empty.create_group("RNA")
     rna.create_array("featureData", data=np.arange(2))
     with pytest.raises(ArtifactResolutionError) as caught:
-        feature_selection._feature_data(empty, "RNA")
+        feature_selection._feature_ids(empty, "RNA")
     assert caught.value.code == "corrupt_payload"
     del empty["RNA/featureData"]
     empty.create_group("RNA/featureData")
     with pytest.raises(ArtifactResolutionError) as caught:
-        feature_selection._feature_data(empty, "RNA")
+        feature_selection._feature_ids(empty, "RNA")
     assert caught.value.code == "row_mismatch"
 
 
@@ -103,14 +103,6 @@ def test_feature_ref_scope_payload_and_local_input_contracts() -> None:
     with pytest.raises(ArtifactResolutionError) as caught:
         feature_selection._validate_ref_scope(wrong_assay, "RNA")
     assert caught.value.code == "wrong_assay"
-
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    group = root.create_group("payload")
-    group.create_array("values", data=np.ones(2, dtype=bool))
-    group.create_array("unexpected", data=np.ones(2))
-    with pytest.raises(ArtifactResolutionError) as caught:
-        feature_selection._payload_names(group)
-    assert caught.value.code == "corrupt_payload"
 
     assert feature_selection._local_input_ref(1) is None
     assert (
@@ -182,12 +174,15 @@ def test_feature_summary_parent_wraps_cell_status_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = zarr.open_group(store=MemoryStore(), mode="w")
+    root.create_group("RNA").attrs.update(
+        {"prepared": True, "dataset_fingerprint": "dataset"}
+    )
     summary = _summary_ref()
     cell_ref = ArtifactRef("datastore", "cell_selection", "c" * 64)
     summary_status = _status(
         operation="summarize_rna_features",
         parameters={"normalization_method": "log", "size_factor": 1},
-        inputs={"cell_selection": cell_ref.to_dict()},
+        inputs={"cell_selection": cell_ref.to_dict(), "dataset_fingerprint": "dataset"},
     )
 
     def malformed(_root: zarr.Group, ref: ArtifactRef) -> Any:
@@ -217,6 +212,7 @@ def test_feature_summary_parent_wraps_cell_status_failures(
 def _summary_payload_root() -> tuple[zarr.Group, zarr.Group, ArtifactRef, ArtifactRef]:
     root = zarr.open_group(store=MemoryStore(), mode="w")
     feature_data = root.create_group("RNA/featureData")
+    root["RNA"].attrs.update({"prepared": True, "dataset_fingerprint": "dataset"})
     feature_data.create_array("ids", data=np.asarray(["g1", "g2"]))
     payload = root.create_group("summary_payload")
     for name in ("normed_tot", "normed_n", "sigmas"):
@@ -244,7 +240,7 @@ def _patch_valid_summary_dependencies(
     summary_status = _status(
         operation="summarize_rna_features",
         parameters={"normalization_method": "log", "size_factor": 1},
-        inputs={"cell_selection": cell_ref.to_dict()},
+        inputs={"cell_selection": cell_ref.to_dict(), "dataset_fingerprint": "dataset"},
     )
     monkeypatch.setattr(
         feature_selection,
@@ -352,11 +348,12 @@ def test_feature_selection_provenance_contract_errors(
     )
     monkeypatch.setattr(
         feature_selection,
-        "_validate_feature_selection",
-        lambda *_args, **_kwargs: _ValidatedFeatureSelection(
+        "validate_feature_selection",
+        lambda *_args, **_kwargs: ValidatedFeatureSelection(
             all_ref,
             object(),
             "set_feature_selection",  # type: ignore[arg-type]
+            np.ones(1, dtype=bool),
         ),
     )
     with pytest.raises(ArtifactResolutionError, match="not all_features"):
@@ -412,11 +409,12 @@ def test_feature_selection_snapshot_and_mapping_input_contracts(
     all_ref = _feature_ref("d")
     monkeypatch.setattr(
         feature_selection,
-        "_validate_feature_selection",
-        lambda *_args, **_kwargs: _ValidatedFeatureSelection(
+        "validate_feature_selection",
+        lambda *_args, **_kwargs: ValidatedFeatureSelection(
             all_ref,
             object(),
             "create_all_features",  # type: ignore[arg-type]
+            np.ones(1, dtype=bool),
         ),
     )
     mapping_cases: tuple[tuple[Any, str], ...] = (
@@ -452,22 +450,22 @@ def test_feature_selection_validation_wraps_corrupt_records(
 ) -> None:
     root, _store, ref = _selection_store()
     with pytest.raises(ArtifactResolutionError, match="cycle"):
-        feature_selection._validate_feature_selection(root, "RNA", ref, seen={ref})
+        feature_selection.validate_feature_selection(root, "RNA", ref, seen={ref})
 
     monkeypatch.setattr(
         feature_selection,
-        "inspect_artifact",
+        "open_artifact",
         lambda *_args: (_ for _ in ()).throw(ValueError("bad")),
     )
     with pytest.raises(ArtifactResolutionError) as caught:
-        feature_selection._validate_feature_selection(root, "RNA", ref)
+        feature_selection.validate_feature_selection(root, "RNA", ref)
     assert caught.value.code == "corrupt_payload"
 
     monkeypatch.undo()
     group = artifact_group(root, ref)
     del group["values"]
     with pytest.raises(ArtifactResolutionError) as caught:
-        feature_selection._validate_feature_selection(root, "RNA", ref)
+        feature_selection.validate_feature_selection(root, "RNA", ref)
     assert caught.value.code == "corrupt_payload"
 
 

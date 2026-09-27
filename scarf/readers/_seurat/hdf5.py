@@ -179,7 +179,6 @@ class HDF5DenseMatrixSource(BaseMatrixSource):
 
 
 HDF5ArrayMatrixSource = HDF5DenseMatrixSource
-HDF5ArraySource = HDF5DenseMatrixSource
 
 
 class ReshapedHDF5ArrayMatrixSource(BaseMatrixSource):
@@ -774,9 +773,6 @@ class H5ADMatrixSource(_DelegatingMatrixSource):
             )
 
 
-H5adMatrixSource = H5ADMatrixSource
-
-
 class TenXMatrixSource(HDF5CompressedMatrixSource):
     def __init__(
         self,
@@ -837,4 +833,3 @@ class TenXMatrixSource(HDF5CompressedMatrixSource):
 
 
 TENxMatrixSource = TenXMatrixSource
-TenxMatrixSource = TenXMatrixSource

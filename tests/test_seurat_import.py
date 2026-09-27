@@ -788,13 +788,44 @@ def test_dense_assay_import_rejects_a_budget_below_one_output_band(
         )
         with pytest.raises(
             MemoryError,
-            match="cannot fit one source row and one destination row band",
+            match="One unit needs.*operation limit",
         ):
             writer.dump()
 
     root = zarr.open_group(store=destination, mode="r")
     assert root.attrs["complete"] is False
     assert root.attrs["scarf:import_complete"] is False
+
+
+def test_source_preparation_budget_excludes_resident_count_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scarf.storage.identity import CountSummary
+
+    source = _write_partial_fixture(tmp_path / "prepare-budget.rds")
+    destination = MemoryStore()
+    admitted: list[int] = []
+
+    with SeuratReader(source) as reader:
+        writer = _new_writer(reader, destination)
+        original = reader._prepare_assay
+
+        def tracked(name: str, max_bytes: int) -> None:
+            others = sum(
+                max(0, int(assay.counts.resident_bytes))
+                for assay in writer._assays
+                if assay.name != name
+            )
+            summary_bytes = CountSummary.nbytes_for(*writer.counts[name].shape)
+            admitted.append(max_bytes + others + summary_bytes)
+            original(name, max_bytes)
+
+        monkeypatch.setattr(reader, "_prepare_assay", tracked)
+        writer.dump(batch_size=1)
+
+    assert len(admitted) == len(writer.assayNames)
+    assert set(admitted) == {int(writer.resources.memoryBytes)}
 
 
 @pytest.mark.parametrize("mem_budget", ["64M", "1K"])

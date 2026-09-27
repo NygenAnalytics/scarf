@@ -56,6 +56,9 @@ _WORKQUEUE_CHILD = textwrap.dedent(
         policy=policy,
     )
     counts[:] = values
+    from scarf.storage.identity import finalize_counts
+
+    finalize_counts(counts)
     finalize_writer_counts_t(
         root,
         "RNA",
@@ -136,3 +139,30 @@ def test_numba_workqueue_feature_and_marker_streams_do_not_abort() -> None:
         f"stderr:\n{completed.stderr}"
     )
     assert "WORKQUEUE_OK" in completed.stdout
+
+
+def test_background_tasks_run_inline_on_the_workqueue_layer() -> None:
+    child = textwrap.dedent(
+        """
+        import threading
+
+        from scarf.utils.background import BackgroundTask
+        from scarf.utils.numba import threadsafe_threading_layer
+
+        assert not threadsafe_threading_layer()
+        task = BackgroundTask(threading.current_thread, name="probe")
+        assert task.result() is threading.main_thread()
+        print("INLINE_OK")
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", child],
+        env={**os.environ, "NUMBA_THREADING_LAYER": "workqueue"},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "INLINE_OK" in completed.stdout

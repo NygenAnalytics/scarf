@@ -92,17 +92,27 @@ Scarf checks that those records agree with each other and with the live arrays.
 Missing or mismatched layout metadata is an error.
 There is no silent rewrite on open and no automatic upgrade of older count layouts.
 
+Writers compute the raw-count identity while they write `counts`, so no second pass reads the
+matrix back. `counts` records it as `content_fingerprint`. The sibling `countSummaries` group holds
+per-cell totals (`rowSums`), per-cell detected-feature counts (`rowPositive`), and per-feature
+detected-cell counts (`columnPositive`), and its `source_fingerprint` attribute names the counts
+it describes. Preparation reads these summaries instead of streaming the matrix. Summaries that are
+missing, malformed, or bound to other counts are an error; rebuild the store with `--data-only`.
+
 ## Opening an RNA assay
 
 `RNAassay` construction requires a complete `countsT` on Zarr v3 plus matching layout metadata.
 The open fails if `countsT` is missing, incomplete, unsharded, a Zarr v2 array, or out of agreement with `counts`.
 
-Inspect and `repack_zarr` can open the store without constructing `RNAassay`.
+`repack_zarr --data-only` reads the raw store without constructing `RNAassay`.
 The user-facing repair is to re-import the source or run:
 
 ```bash
-uv run python -m scarf.tools.repack_zarr input.zarr output.zarr --profile fast_local
+uv run python -m scarf.tools.repack_zarr input.zarr output.zarr --profile fast_local --data-only
 ```
+
+Without `--data-only`, `repack_zarr` accepts only a prepared source and preserves its results after
+verifying that the destination has the same dataset identity.
 
 After a rewrite, recompute HVG, normalization, PCA, graph, and marker artefacts.
 Do not resume them from pre-rewrite lineage.

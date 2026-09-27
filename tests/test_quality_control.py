@@ -27,7 +27,7 @@ from scarf.storage.artifacts import (
 )
 from scarf.storage.selections import (
     read_stored_selection_mask,
-    resolve_selection_artifact,
+    resolve_generated_selection_artifact,
 )
 from scarf.storage.schema import load_count_array
 
@@ -430,7 +430,7 @@ def test_selection_equality_uses_validated_immutable_fingerprints(
     values = np.asarray(store.cells.fetch_all("I"), dtype=bool)
     row_ids = np.asarray(store.cells.fetch_all("ids"))
     first = store.snapshot_cell_selection()
-    same_values = resolve_selection_artifact(
+    same_values = resolve_generated_selection_artifact(
         store.zw,
         scope="datastore",
         kind="cell_selection",
@@ -441,10 +441,10 @@ def test_selection_equality_uses_validated_immutable_fingerprints(
         inputs={},
         source_column="artifact",
         invalidate_cache=True,
-    )
+    )[0]
     changed_values = values.copy()
     changed_values[0] = ~changed_values[0]
-    different = resolve_selection_artifact(
+    different = resolve_generated_selection_artifact(
         store.zw,
         scope="datastore",
         kind="cell_selection",
@@ -454,7 +454,7 @@ def test_selection_equality_uses_validated_immutable_fingerprints(
         parameters={},
         inputs={},
         source_column="artifact",
-    )
+    )[0]
 
     assert first != same_values
     assert store._selection_artifacts_match(first, same_values)
@@ -645,7 +645,7 @@ def test_doublet_failure_leaves_no_complete_score(
         owner, name = {
             "features": (datastore, "get_mapping_reference"),
             "scores": (doublets, "score_synthetic_doublets"),
-            "graph": (datastore, "load_graph"),
+            "graph": (datastore, "_load_graph_artifact"),
         }[failure]
         original = getattr(owner, name)
 

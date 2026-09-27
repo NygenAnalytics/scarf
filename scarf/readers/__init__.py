@@ -15,11 +15,11 @@ from ._text import get_file_handle as get_file_handle
 from ._text import read_file as read_file
 
 if TYPE_CHECKING:
-    from .cellranger import CrDirReader, CrH5Reader, CrReader
+    from .cellranger import CrH5Reader, CrReader
     from .csv import CSVReader
     from .h5ad import H5adInspectResult, H5adReader, inspect_h5ad
     from .loom import LoomReader
-    from .mtx import MtxCandidate, MtxReader, inspect_mtx
+    from .mtx import CrDirReader, MtxCandidate, MtxReader, inspect_mtx
     from .seurat import SeuratInspectResult, SeuratReader, inspect_seurat
 
 __all__ = [
@@ -40,7 +40,7 @@ __all__ = [
 ]
 
 _LAZY_EXPORTS = {
-    "CrDirReader": "cellranger",
+    "CrDirReader": "mtx",
     "CrH5Reader": "cellranger",
     "CrReader": "cellranger",
     "CSVReader": "csv",
