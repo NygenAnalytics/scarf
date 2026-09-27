@@ -118,7 +118,8 @@ doublet detection rejects a clustering with missing labels.
 Saved {py:meth}`scarf.datastore.datastore.DataStore.run_marker_search` calls return the exact immutable marker-table reference.
 Pass that reference as `get_markers(marker=ref)` to select the exact feature-specific result.
 Marker tables report `group_id` as a string and list groups in the same order as plot
-categories: numeric labels first in numeric order, so `"2"` precedes `"10"`, then text labels.
+categories: decimal labels first in numeric order, so `"2"` precedes `"10"`, then other labels in
+natural order, so `"1_2"` precedes `"1_10"` and `"2_T"` precedes `"B cell"`.
 `export_markers_to_csv` uses the same column order. An unknown `group_id` raises an error.
 Fresh marker results include score, expression fractions, fold change, AUC, two-sided Mann-Whitney p-values, and Benjamini-Hochberg values adjusted within each one-versus-rest group over tested features.
 These are cell-level marker statistics, not replicate-aware differential expression.

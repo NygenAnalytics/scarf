@@ -1,3 +1,4 @@
+import math
 import warnings
 
 import numpy as np
@@ -15,6 +16,7 @@ from scarf.features.markers import mannwhitneyu_from_ranks
 from scarf.features.statistical import (
     GroupComparisonResult,
     StatisticalTestResult,
+    _mann_whitney_exact_p_value,
     _mann_whitney_p_value_method,
     adjust_pvalues,
     aggregate_samples,
@@ -136,6 +138,21 @@ def test_mann_whitney_small_samples_use_exact_null():
     assert _mann_whitney_p_value_method(10, 10) == "asymptotic"
     assert _mann_whitney_p_value_method(2, 445) == "exact"  # C(447, 2) = 99,681
     assert _mann_whitney_p_value_method(2, 446) == "asymptotic"
+    for n_1, n_2 in ((3, 85), (85, 3), (9, 10), (500_000, 500_000)):
+        splits = math.comb(n_1 + n_2, min(n_1, n_2)) if n_1 < 100 else math.inf
+        expected = "exact" if splits <= 100_000 else "asymptotic"
+        assert _mann_whitney_p_value_method(n_1, n_2) == expected
+
+    # At the split limit, the exact null matches an enumeration of all pairs.
+    ranks = rankdata(rng.integers(0, 40, 447))
+    doubled = np.rint(ranks * 2).astype(np.int64)
+    pair_sums = np.add.outer(doubled, doubled)[np.triu_indices(447, 1)]
+    for pair, n_1 in (((0, 1), 2), ((445, 446), 445)):
+        observed = doubled[list(pair)].sum()
+        tail = min((pair_sums <= observed).sum(), (pair_sums >= observed).sum())
+        assert _mann_whitney_exact_p_value(ranks, n_1) == pytest.approx(
+            min(1.0, 2 * tail / len(pair_sums)), rel=1e-12
+        )
     large_values = np.concatenate([rng.poisson(2, 60), rng.poisson(3, 60)])
     large_groups = np.array(["a"] * 60 + ["b"] * 60, dtype=object)
     large = compare_group_distributions(

@@ -363,6 +363,42 @@ def test_marker_group_order_matches_plot_category_order() -> None:
     # A "nan" label is text, so its position does not depend on input order.
     assert sort_categories(["nan", "2", "10"]) == ["2", "10", "nan"]
     assert sort_categories(["10", "nan", "2"]) == ["2", "10", "nan"]
+    # Digit runs precede text where labels differ in kind, and only decimal
+    # notation is numeric, so "1_10" is not the number 110.
+    assert sort_categories(["B cell", "2_T", "2_1", "1_10", "1_2", "²"]) == [
+        "1_2",
+        "1_10",
+        "2_1",
+        "2_T",
+        "B cell",
+        "²",
+    ]
+    assert sort_categories(["b", "B"]) == sort_categories(["B", "b"]) == ["B", "b"]
+
+
+def test_marker_readers_accept_mixed_digit_and_text_labels(
+    datastore_ephemeral, tmp_path
+) -> None:
+    store = datastore_ephemeral
+    n_cells = len(store.cells.active_index("I"))
+    labels = np.array(["B cell", "2_T", "1_10"])[np.arange(n_cells) % 3]
+    marker = store.run_marker_search(
+        _test_cluster_artifact(store, labels),
+        from_assay="RNA",
+        features=store.set_feature_selection(feature_indexes=np.arange(20)),
+        nthreads=1,
+    )
+    expected = ["1_10", "2_T", "B cell"]
+
+    table = store.get_markers(marker=marker, min_score=-1, min_frac_exp=-1)
+    assert list(dict.fromkeys(table["group_id"])) == expected
+    one = store.get_markers(
+        marker=marker, group_id="2_T", min_score=-1, min_frac_exp=-1
+    )
+    assert set(one["group_id"]) == {"2_T"}
+    out_file = tmp_path / "markers.csv"
+    store.export_markers_to_csv(marker, str(out_file), min_score=-1, min_frac_exp=-1)
+    assert list(pd.read_csv(out_file).columns) == expected
 
 
 def test_saved_marker_refs_keep_feature_specific_results_addressable(

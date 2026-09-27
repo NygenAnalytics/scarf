@@ -11,6 +11,7 @@ from ...metadata.rows import read_metadata_rows_chunkwise
 from ...storage.refs import ArtifactRef
 from ...storage.selections import read_stored_selection_indices
 from ...storage.types import as_zarr_array
+from ...utils.arrays import sort_categories
 from ..config.agent_exec import (
     ImageEvidence,
 )
@@ -474,12 +475,7 @@ def _analysis_visual_content(
         )
         required_marker_columns = {"group_id", "feature_name", "score"}
         if required_marker_columns.issubset(marker_table.columns):
-            marker_groups = sorted(
-                selected.metrics.topMarkerGenes,
-                key=lambda value: (
-                    (0, int(value)) if value.lstrip("-").isdigit() else (1, value)
-                ),
-            )
+            marker_groups = sort_categories(selected.metrics.topMarkerGenes)
             marker_scores = np.zeros(
                 (len(marker_groups), len(marker_genes)),
                 dtype=np.float64,

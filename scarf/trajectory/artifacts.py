@@ -302,8 +302,9 @@ def _normalized_value_parameter_names(
 ) -> frozenset[str]:
     """Return ``names`` plus ``count_arithmetic`` when the record carries it.
 
-    Only results computed from integer counts narrower than 32 bits through
-    ``normed`` record the marker, so records without it stay valid.
+    Only results whose integer-count arithmetic ``normed`` changed record the
+    marker (see ``normalizer_count_arithmetic``), so records without it stay
+    valid.
     """
     if "count_arithmetic" in parameters:
         return names | {"count_arithmetic"}

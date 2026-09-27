@@ -34,7 +34,6 @@ testing" and is not a replacement for replicate-aware differential
 expression (for example DESeq2 or edgeR).
 """
 
-import math
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -432,10 +431,19 @@ def aggregate_samples(
 
 
 def _mann_whitney_p_value_method(n_1: int, n_2: int) -> PValueMethod:
-    """Return how Mann-Whitney p-values are computed for two group sizes."""
-    if math.comb(int(n_1) + int(n_2), int(n_1)) <= MANN_WHITNEY_EXACT_MAX_SPLITS:
-        return "exact"
-    return "asymptotic"
+    """Return how Mann-Whitney p-values are computed for two group sizes.
+
+    The split count ``C(n, k)`` for the smaller size ``k`` is built as
+    ``C(n - k + 1, 1), C(n - k + 2, 2), ...``, which only grows, so counting
+    stops once it passes the limit instead of forming a huge binomial.
+    """
+    small, large = sorted((int(n_1), int(n_2)))
+    splits = 1
+    for chosen in range(1, small + 1):
+        splits = splits * (large + chosen) // chosen
+        if splits > MANN_WHITNEY_EXACT_MAX_SPLITS:
+            return "asymptotic"
+    return "exact"
 
 
 def _mann_whitney_exact_p_value(ranks: np.ndarray, n_1: int) -> float:
@@ -455,12 +463,13 @@ def _mann_whitney_exact_p_value(ranks: np.ndarray, n_1: int) -> float:
         if n_1 <= n_2
         else (n_2, int(doubled[n_1:].sum()))
     )
-    total = int(doubled.sum())
-    counts = np.zeros((size + 1, total + 1), dtype=np.int64)
+    # No subset of ``size`` values sums past the ``size`` largest values.
+    width = int(np.sort(doubled)[len(doubled) - size :].sum()) + 1
+    counts = np.zeros((size + 1, width), dtype=np.int64)
     counts[0, 0] = 1
     for index, value in enumerate(doubled):
         for chosen in range(min(size, index + 1), 0, -1):
-            counts[chosen, value:] += counts[chosen - 1, : total + 1 - value]
+            counts[chosen, value:] += counts[chosen - 1, : width - value]
     distribution = counts[size]
     n_splits = int(distribution.sum())
     lower = int(distribution[: observed + 1].sum())

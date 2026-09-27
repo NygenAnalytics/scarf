@@ -249,7 +249,8 @@ The complete hard-break inventory is:
   references that are not connectivity maps or integrated graphs.
 - `get_markers` returns string `group_id` values in plot category order (numeric labels first in
   numeric order) and raises for an unknown group. `export_markers_to_csv` uses the same column
-  order.
+  order. Only plain decimal labels are numeric, so plots no longer read `"1_10"` as 110; other
+  labels sort naturally, with digit runs before text and case-only ties broken by the exact text.
 - `run_waggr` and `run_aucell` take `ambiguous_targets="drop"` and record
   `dropped_ambiguous_targets`. Enrichment artifacts written before this change load but are not
   reused.
@@ -267,13 +268,15 @@ The complete hard-break inventory is:
   initializations, and `make_bulk` column names.
 - Library-size and CLR normalization promote integer counts to float64 before scaling or taking
   logarithms, so uint8 and int8 stores no longer raise and uint16 and int16 stores no longer wrap.
-  Artifacts computed through `normed` from integer counts narrower than 32 bits record
-  `count_arithmetic="float64"`, so earlier results on those stores are not reused. This covers
-  `run_normalization` payloads for RNA with `renormalize_subset=False` and for CLR, marker tables
-  on the fallback path, pseudotime markers and aggregations that call `normed`, statistical tests
-  of assay-normalized features, and cell-cycle scores computed through `normed`. Identities on
-  32-bit, 64-bit, and floating-point stores and every pipeline artifact identity are unchanged.
-  Grouped ADT assays built from narrow counts must be rebuilt.
+  Artifacts whose values `normed` computes record `count_arithmetic="float64"`, so earlier
+  results are not reused: library-size values from any integer counts, because the integer
+  product could overflow at any width, and CLR values from integer counts narrower than 32 bits.
+  This covers `run_normalization` payloads for RNA with `renormalize_subset=False` and for CLR,
+  marker tables on the fallback path, pseudotime markers and aggregations that call `normed`,
+  statistical tests of assay-normalized features, and cell-cycle scores computed through
+  `normed`. Identities on floating-point stores, CLR identities on 32- and 64-bit counts, and
+  every pipeline artifact identity are unchanged. Grouped ADT assays built from narrow counts
+  must be rebuilt.
 - RNA `normed` without subset renormalization maps a zero library total to 1, so zero-count cells
   normalize to 0 instead of NaN. Normalizations written earlier with `renormalize_subset=False`
   over selections that contain zero-count cells keep their identity and their NaN rows; PCA rejects

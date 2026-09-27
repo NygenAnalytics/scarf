@@ -30,48 +30,51 @@ def has_duplicates(values: Any) -> bool:
     return bool(np.any(ordered[1:] == ordered[:-1]))
 
 
+# Only plain decimal notation is a numeric label, so "1_2" and "inf" are text.
+_NUMERIC_LABEL = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
+
+
 def _category_sort_key(value: Any) -> tuple[Any, ...]:
-    """Sort key: numbers in numeric order, then natural text, then missing."""
+    """Sort key: numbers in numeric order, then natural text, then missing.
+
+    Every token of a text label records whether it is a digit run, so digit
+    runs never compare with text and precede it where two labels differ in
+    kind. The exact text breaks ties between labels that differ only in case,
+    so the order never depends on input order.
+    """
     import pandas as pd
 
     if value is None or (isinstance(value, float) and math.isnan(value)):
-        return (2, ())
+        return (2, (), "")
     try:
         if pd.isna(value):
-            return (2, ())
+            return (2, (), "")
     except (TypeError, ValueError):
         pass
 
     if isinstance(value, (bool, np.bool_)):
-        return (1, (str(bool(value)).lower(),))
-    if isinstance(value, (int, np.integer)):
-        return (0, (float(value),))
-    if isinstance(value, (float, np.floating)) and math.isfinite(float(value)):
-        return (0, (float(value),))
-
-    text = str(value)
-    try:
-        number = float(text)
-    except ValueError:
-        number = math.nan
-    # A "nan" label is text: a NaN key would make the order depend on input.
-    if not math.isnan(number):
-        return (0, (number,))
-
+        text = str(bool(value))
+    elif isinstance(value, (int, np.integer, float, np.floating)):
+        return (0, (float(value),), str(value))
+    else:
+        text = str(value)
+    if _NUMERIC_LABEL.fullmatch(text):
+        return (0, (float(text),), text)
+    # Splitting on a captured pattern puts the digit runs at odd positions.
     tokens = tuple(
-        int(part) if part.isdigit() else part.casefold()
-        for part in re.split(r"(\d+)", text)
-        if part != ""
+        (0, int(part)) if position % 2 else (1, part.casefold())
+        for position, part in enumerate(re.split(r"(\d+)", text))
+        if part
     )
-    return (1, tokens)
+    return (1, tokens, text)
 
 
 def sort_categories(values: Iterable[Any]) -> list[Any]:
     """Order categories naturally, as plots and marker tables show them.
 
-    Numbers and numeric labels come first by value, so ``"2"`` precedes
+    Numbers and decimal labels come first by value, so ``"2"`` precedes
     ``"10"``. Other labels follow in natural text order (``"A2"`` before
-    ``"A10"``), and missing values come last.
+    ``"A10"``, ``"2_T"`` before ``"B"``), and missing values come last.
     """
     return sorted(values, key=_category_sort_key)
 
