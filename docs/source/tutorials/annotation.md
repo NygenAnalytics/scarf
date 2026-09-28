@@ -11,6 +11,7 @@ kernelspec:
   language: python
   name: python3
 ---
+
 (annotation)=
 
 # Cell-Type and State Annotation Primer
@@ -90,12 +91,13 @@ ds.plots.embedding(
     color_by=["CD3D", "CD4", "CD8A", "MS4A1", "CD14", "NKG7", "IL3RA", "FCGR3A", clusters],
     n_columns=3,
     sort_values=True,
+    legend_loc="on_data"
 )
 ```
 
 Here, we can see the UMAP of our select marker genes for our predicted cell types alongside the clusters they may be present inside of.
 
-CD3D lights up clusters that may hold our candidate T cells. MS4A1 marks two separate blocks of potential B cells, CD14 marks the likely monocyte block, and NKG7 marks the NK-like block. Newer literature indicates there may be a circulating subset of plasmacytoid dendritic cells (pDCs), which light up here for IL3RA. FCGR3A is also used to identify a specific type of monocyte, thus why we include it. One small cluster lights up none of the panel genes and stays unresolved for now; the heatmap below resolves it through its own top markers.
+CD3D lights up clusters that may hold our candidate T cells. MS4A1 marks two separate blocks of potential B cells, CD14 marks the likely monocyte block, and NKG7 marks the NK-like block. The prescense of IL3RA also indicates  plasmacytoid dendritic cells (pDCs) being present. FCGR3A is also used to identify a specific type of monocyte, thus why we include it. One small cluster lights up none of the panel genes and stays unresolved for now; the heatmap below resolves it through its own top markers.
 
 To confirm the visual readings on the UMAP, we can now utilize the marker table.
 
@@ -106,6 +108,21 @@ panel_stats = panel_markers[panel_markers["feature_name"].isin(panel_genes)]
 panel_stats.pivot(index="feature_name", columns="group_id", values="score").reindex(
     panel_genes
 )
+
+
+
+panel_genes = ["CD3D", "CD4", "CD8A", "MS4A1", "CD14", "NKG7", "IL3RA", "FCGR3A"]
+panel_markers = ds.get_markers(marker=markers, min_score=-1, min_frac_exp=-1)
+panel_stats = panel_markers[panel_markers["feature_name"].isin(panel_genes)]
+panel_best = (
+    panel_stats.sort_values("score", ascending=False)
+    .groupby("feature_name", sort=False)
+    .head(1)
+    .set_index("feature_name")
+    .reindex(panel_genes)[["group_id", "score", "frac_exp", "auc"]]
+    .round(2)
+)
+panel_best
 ```
 
 With the information in the markers table supporting our interpretation, we can move forward.
@@ -211,7 +228,7 @@ anchor_stats[["group_id", "feature_name", "score", "frac_exp", "auc"]].sort_valu
 
 ## Write & visualize the final reviewed mapping
 
-With all of the analysis we performed above, we can now finalize our annotations as follows. This example records the broad teaching labels supported in {doc}`scrna_seq`. 
+With all of the analysis we performed above, we can now finalize our annotations as follows. This example records the broad teaching labels supported in {doc}`scrna_seq`.
 
 ```{code-cell}
 final_labels = {
@@ -261,10 +278,10 @@ ds.plots.embedding(
 
 **Clustering algorithms discretize continuous biological spectrums:** Graph clustering (such as Leiden) forces cells into rigid, separate categories. In reality, biological processes, such as T-cell activation, monocyte differentiation, and exhausted states, exist along continuous transcriptional trajectories. Neighboring clusters often represent transitional points along a gradient rather than isolated, distinct cell types.
 
-* **Heterotypic doublets may mimic "novel" transitional populations:** Droplets that capture two different cells (e.g., a T cell and a B cell) generate hybrid transcriptomes. Because they express moderate levels of conflicting marker programs, they frequently group into small, intermediate clusters. Always evaluate doublet scores and negative markers before proceeding, thus why quality control is so critical.
-* **Ambient RNA contaminates negative controls:** Cell lysis during tissue dissociation releases highly abundant transcripts (such as lysozyme, hemoglobin, or ribosomal proteins) into the cell suspension. These ambient transcripts enter droplets indiscriminately, meaning negative markers rarely display a literal mathematical zero (`frac_exp` = 0.00). This is why we use other metrics like `score` and `auc`, which become key in ensuring our negative controls stay negative.
-* **Granularity depends on clustering resolution:** The number of clusters discovered is a mathematical function of graph resolution, not an objective count of biological lineages. Coarse resolutions will merge rare populations (such as pDCs or innate lymphoid cells) into dominant clusters, while fine resolutions will artificially fracture homogenous populations into arbitrary sub-clusters. Thus, probing across multiple clusters can be useful to determine the cell types that exist inside of your dataset. Subset graph construction and validation now live in {doc}`clustering`.
-* **Marker statistics are not replicate-aware differential expression:** `p_value_adjusted` applies Benjamini-Hochberg correction within this one-versus-rest marker test over cells. It is useful for marker ranking but does not model biological replicates or study-level variation.
+- **Heterotypic doublets may mimic "novel" transitional populations:** Droplets that capture two different cells (e.g., a T cell and a B cell) generate hybrid transcriptomes. Because they express moderate levels of conflicting marker programs, they frequently group into small, intermediate clusters. Always evaluate doublet scores and negative markers before proceeding, thus why quality control is so critical.
+- **Ambient RNA contaminates negative controls:** Cell lysis during tissue dissociation releases highly abundant transcripts (such as lysozyme, hemoglobin, or ribosomal proteins) into the cell suspension. These ambient transcripts enter droplets indiscriminately, meaning negative markers rarely display a literal mathematical zero (`frac_exp` = 0.00). This is why we use other metrics like `score` and `auc`, which become key in ensuring our negative controls stay negative.
+- **Granularity depends on clustering resolution:** The number of clusters discovered is a mathematical function of graph resolution, not an objective count of biological lineages. Coarse resolutions will merge rare populations (such as pDCs or innate lymphoid cells) into dominant clusters, while fine resolutions will artificially fracture homogenous populations into arbitrary sub-clusters. Thus, probing across multiple clusters can be useful to determine the cell types that exist inside of your dataset. Subset graph construction and validation now live in {doc}`clustering`.
+- **Marker statistics are not replicate-aware differential expression:** `p_value_adjusted` applies Benjamini-Hochberg correction within this one-versus-rest marker test over cells. It is useful for marker ranking but does not model biological replicates or study-level variation.
 
 Keep the label map, marker reference, run ID, and review rationale in the study record. Cluster IDs can change when the graph or partition changes. Overlap-based `smart_label` helps compare two partitions, but it is not ontology annotation; that partition-comparison role belongs in {doc}`clustering`.
 
@@ -274,26 +291,26 @@ For scATAC-seq, {doc}`scatac_seq` uses GeneScores to display marker accessibilit
 
 ### Curated Single-Cell Marker Databases
 
-* **[CellMarker 2.0](http://bio-bigdata.hrbmu.edu.cn/CellMarker/):** A comprehensive, manually curated database cataloging over 13,000 cell markers across human and mouse tissues, including both normal and clinical disease models.
-* **[PanglaoDB](https://panglaodb.se/):** An open database of single-cell RNA-seq markers covering hundreds of cell types across major mammalian organs, providing computational specificity scores for each marker.
-* **[Azimuth / HuBMAP Reference Atlases](https://azimuth.hubmapconsortium.org/):** Pre-annotated, expert-verified reference maps for single-cell data across organs (kidney, lung, pancreas, motor cortex, PBMC). Azimuth allows you to inspect canonical marker hierarchies directly.
-* **[The Human Protein Atlas (Blood &amp; Single-Cell Atlas)](https://www.proteinatlas.org/):** Combines single-cell RNA sequencing data with antibody-based protein profiling across tissues and circulating blood compartments.
+- **[CellMarker 2.0](http://bio-bigdata.hrbmu.edu.cn/CellMarker/):** A comprehensive, manually curated database cataloging over 13,000 cell markers across human and mouse tissues, including both normal and clinical disease models.
+- **[PanglaoDB](https://panglaodb.se/):** An open database of single-cell RNA-seq markers covering hundreds of cell types across major mammalian organs, providing computational specificity scores for each marker.
+- **[Azimuth / HuBMAP Reference Atlases](https://azimuth.hubmapconsortium.org/):** Pre-annotated, expert-verified reference maps for single-cell data across organs (kidney, lung, pancreas, motor cortex, PBMC). Azimuth allows you to inspect canonical marker hierarchies directly.
+- **[The Human Protein Atlas (Blood &amp; Single-Cell Atlas)](https://www.proteinatlas.org/):** Combines single-cell RNA sequencing data with antibody-based protein profiling across tissues and circulating blood compartments.
 
 ### Automated Annotation & Label-Transfer Frameworks
 
-* **[ScType](https://github.com/IanevskiAleksandr/sc-type):** An automated marker-based annotation tool supported by a curated database that explicitly documents both **positive marker sets** and **negative control markers** for hundreds of cell lineages.
-* **[CellTypist](https://www.celltypist.org/):** A machine-learning platform with specialized, pre-trained logistic regression models for immune cell phenotyping across healthy and diseased tissues.
-* **[SingleR](https://bioconductor.org/packages/release/bioc/html/SingleR.html):** Performs unbiased, automated cell-type assignment by computing Spearman rank correlations between your single-cell clusters and bulk/microarray reference datasets (such as Blueprint-ENCODE and HPCA).
-* **[CyteType](https://www.nygen.io/products/cytetype):** Automated annotation and clustering tool created by Nygen.
+- **[ScType](https://github.com/IanevskiAleksandr/sc-type):** An automated marker-based annotation tool supported by a curated database that explicitly documents both **positive marker sets** and **negative control markers** for hundreds of cell lineages.
+- **[CellTypist](https://www.celltypist.org/):** A machine-learning platform with specialized, pre-trained logistic regression models for immune cell phenotyping across healthy and diseased tissues.
+- **[SingleR](https://bioconductor.org/packages/release/bioc/html/SingleR.html):** Performs unbiased, automated cell-type assignment by computing Spearman rank correlations between your single-cell clusters and bulk/microarray reference datasets (such as Blueprint-ENCODE and HPCA).
+- **[CyteType](https://www.nygen.io/products/cytetype):** Automated annotation and clustering tool created by Nygen.
 
 ### Marker-Set Enrichment Platforms
 
 If you have computed the top 10-20 marker genes for an uncharacterized cluster and need to query potential candidate identities:
 
-* **[Enrichr](https://maayanlab.cloud/Enrichr/):** Paste your top marker gene list and evaluate over-representation against the **CellMarker Augmented**, **PanglaoDB Augmented**, or **ARCHS4 Tissues** gene-set libraries.
-* **[ToppGene Suite (ToppFun)](https://toppgene.cchmc.org/):** Matches custom gene lists against cell-type specific signatures, Gene Ontology (GO) terms, and pathway databases to infer functional state and lineage.
+- **[Enrichr](https://maayanlab.cloud/Enrichr/):** Paste your top marker gene list and evaluate over-representation against the **CellMarker Augmented**, **PanglaoDB Augmented**, or **ARCHS4 Tissues** gene-set libraries.
+- **[ToppGene Suite (ToppFun)](https://toppgene.cchmc.org/):** Matches custom gene lists against cell-type specific signatures, Gene Ontology (GO) terms, and pathway databases to infer functional state and lineage.
 
 ### Immunophenotyping & Negative-Gating References
 
-* **[BioLegend Cell Markers](https://www.biolegend.com/en-us/cell-markers) & [BD Biosciences CD Marker Handbooks](https://www.bdbiosciences.com/):** Reference posters and technical guides defining classical immunophenotyping panels, lineage-negative ({math}`\text{Lin}^-`) gating exclusion cocktails, and surface marker hierarchies.
-* **[Optimized Multicolor Immunofluorescence Panels (OMIPs)](https://onlinelibrary.wiley.com/journal/15524930):** Peer-reviewed flow and mass cytometry gating panels published in *Cytometry Part A*, detailing validated gating trees and the negative markers used to dump non-target lineages.
+- **[BioLegend Cell Markers](https://www.biolegend.com/en-us/cell-markers) & [BD Biosciences CD Marker Handbooks](https://www.bdbiosciences.com/):** Reference posters and technical guides defining classical immunophenotyping panels, lineage-negative ({math}`\text{Lin}^-`) gating exclusion cocktails, and surface marker hierarchies.
+- **[Optimized Multicolor Immunofluorescence Panels (OMIPs)](https://onlinelibrary.wiley.com/journal/15524930):** Peer-reviewed flow and mass cytometry gating panels published in *Cytometry Part A*, detailing validated gating trees and the negative markers used to dump non-target lineages.
