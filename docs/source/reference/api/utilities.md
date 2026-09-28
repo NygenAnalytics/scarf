@@ -1,19 +1,8 @@
-# Datasets and utilities API reference
+# Utilities API reference
 
-## Cytebase and store helpers
+For dataset discovery, remote exploration, and example downloads, see {doc}`cytebase`.
 
-```{eval-rst}
-.. autofunction:: scarf.cytebase.list_repositories
-```
-
-```{eval-rst}
-.. autofunction:: scarf.cytebase.connect
-```
-
-```{eval-rst}
-.. autoclass:: scarf.cytebase.Repository
-   :members:
-```
+## Store and computation helpers
 
 ```{eval-rst}
 .. autofunction:: scarf.load_zarr

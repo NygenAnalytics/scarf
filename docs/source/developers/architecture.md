@@ -82,7 +82,11 @@ A domain that persists an artifact may use a narrow, named `storage` adapter.
 
 ### Import and export
 
-- `cytebase/` lists, downloads, and opens public datasets.
+- `cytebase/` discovers datasets and connects to their Scarf datastores. `DatasetEntry` owns
+  catalog metadata and source-record descriptions. `Catalog.open_datastore` and
+  `Catalog.mount_datastore` return `DataStore` objects; module-level embedding helpers resolve
+  imported artifacts from those objects. Cell metadata and plotting use the existing `DataStore`
+  APIs. Repository helpers list and download public example datasets.
 - `readers/` parses supported input formats.
 - `writers/` materializes Scarf stores and exports supported formats.
 - `merge/` combines assays and datasets without importing `DataStore` during normal module loading.
@@ -315,7 +319,8 @@ The complete hard-break inventory is:
 - Operations trust that prepared counts and artifacts do not change during a call. Writing to
   prepared data in place is outside the contract and is not detected.
 - Minimum versions rise to scipy 1.15, statsmodels 0.14.5 (earlier releases fail to import
-  with scipy 1.16), and, for the `agent` and `test` extras, pydantic-ai-slim 2.51.
+  with scipy 1.16), huggingface-hub 2.0, and, for the `agent` and `test` extras,
+  pydantic-ai-slim 2.51.
 - Count layout: plans whose countsT chunks fell below half the chunk target (awkward cell counts
   such as primes) now use whole-target chunks, so stores written with those plans fail layout
   replay and must be re-imported. Count assays require Zarr format 3.

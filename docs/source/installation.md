@@ -93,6 +93,21 @@ python -c "import scarf; print(scarf.__version__)"
 
 The conda package satisfies Scarf's `hnswlib>=0.8` requirement, so pip does not compile it.
 
+## Cytebase SDK
+
+To search Cytebase and connect directly to its cloud-hosted Scarf DataStores, install the
+`cytebase` extra in your local or cloud Python environment:
+
+```bash
+uv pip install --prerelease allow "scarf[cytebase,extra]"
+```
+
+This adds DuckDB for catalog queries and the SDK's plotting dependencies.
+`cytebase.Catalog()` defaults to the public, read-only `Nygen/cytebase` catalog
+without requiring credentials. Set `CYTEBASE_BUCKET` or pass `bucket=` to use
+another catalog, then follow
+{doc}`tutorials/cytebase`. See {doc}`reference/api/cytebase` for the full SDK reference.
+
 ## JupyterLab
 
 Install and launch JupyterLab from the same activated environment as Scarf.

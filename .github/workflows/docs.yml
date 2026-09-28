@@ -48,7 +48,7 @@ jobs:
         with:
           python-version: "3.14"
       - name: Install documentation dependencies
-        run: uv sync --extra docs --extra test --extra extra
+        run: uv sync --extra cytebase --extra docs --extra test --extra extra
       - name: Documentation tests
         run: uv run pytest -n 0 tests/test_docs_cache.py tests/test_docs_structure.py
       - name: Validate committed notebook cache

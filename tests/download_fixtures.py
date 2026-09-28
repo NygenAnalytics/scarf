@@ -24,6 +24,8 @@ _CYTEBASE_FIXTURES = {
     "1K_pbmc_citeseq.h5": (
         "e3dd57c5a8c3426dc5a7dc012a78608554facbddf4c6d1d62671089d197b1053"
     ),
+    # Rebuilt as Zarr v3 with QC summaries. Counts and cell/feature metadata
+    # were compared with the original Zarr v2 fixture before repinning.
     "500_pbmc_atac.zarr.tar.gz": (
         "d702f22d4a6bb21010b0f568ae4ec9872bcafb3ba0e2922c9c6a241dfe3fb571"
     ),

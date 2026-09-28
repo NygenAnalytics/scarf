@@ -67,6 +67,8 @@ subtrees:
         title: Multimodal diagnostics
   - caption: Data, remote, and scale
     entries:
+      - file: tutorials/cytebase
+        title: Explore Cytebase
       - file: tutorials/import_and_export
         title: Import and export
       - file: tutorials/data_organization
@@ -124,8 +126,10 @@ subtrees:
             title: Mapping
           - file: reference/api/plotting
             title: Plotting
+          - file: reference/api/cytebase
+            title: Cytebase
           - file: reference/api/utilities
-            title: Datasets and utilities
+            title: Utilities
       - file: reference/faq
         title: FAQ
       - file: reference/glossary

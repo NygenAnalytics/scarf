@@ -19,7 +19,7 @@ These instructions cover documentation sources, execution, cache management, and
 Install the same documentation and test extras used by CI:
 
 ```bash
-uv sync --extra agent --extra docs --extra test --extra extra
+uv sync --extra agent --extra docs --extra test --extra extra --extra cytebase
 ```
 
 Run the cache tests and strict reference build:
