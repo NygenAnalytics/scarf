@@ -11,7 +11,6 @@ kernelspec:
   language: python
   name: python3
 ---
-
 (annotation)=
 
 # Cell-Type and State Annotation Primer
@@ -105,15 +104,6 @@ To confirm the visual readings on the UMAP, we can now utilize the marker table.
 panel_genes = ["CD3D", "CD4", "CD8A", "MS4A1", "CD14", "NKG7", "IL3RA", "FCGR3A"]
 panel_markers = ds.get_markers(marker=markers, min_score=-1, min_frac_exp=-1)
 panel_stats = panel_markers[panel_markers["feature_name"].isin(panel_genes)]
-panel_stats.pivot(index="feature_name", columns="group_id", values="score").reindex(
-    panel_genes
-)
-
-
-
-panel_genes = ["CD3D", "CD4", "CD8A", "MS4A1", "CD14", "NKG7", "IL3RA", "FCGR3A"]
-panel_markers = ds.get_markers(marker=markers, min_score=-1, min_frac_exp=-1)
-panel_stats = panel_markers[panel_markers["feature_name"].isin(panel_genes)]
 panel_best = (
     panel_stats.sort_values("score", ascending=False)
     .groupby("feature_name", sort=False)
@@ -121,6 +111,7 @@ panel_best = (
     .set_index("feature_name")
     .reindex(panel_genes)[["group_id", "score", "frac_exp", "auc"]]
     .round(2)
+    .reset_index()
 )
 panel_best
 ```
