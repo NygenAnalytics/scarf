@@ -162,6 +162,9 @@ class CSVReader:
             stream,
             desc="Checking CSV consistency",
         ):
+            if df.shape[0] == 0:
+                # A header-only file yields one empty chunk of untyped columns.
+                continue
             n_cells += df.shape[0]
             if collected_cell_ids is not None:
                 collected_cell_ids.extend(df.index.to_numpy())

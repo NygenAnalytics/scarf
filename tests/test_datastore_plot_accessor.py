@@ -462,6 +462,18 @@ def test_embedding_run_adapter_uses_exact_outputs_and_frozen_fields(
             show=False,
         )
 
+    accessor.embedding(run=run, color_by="sample_id", show=False)  # type: ignore[arg-type]
+    _, kwargs = calls.pop()
+    assert kwargs["layout"] == layout
+    with pytest.raises(TypeError, match="layout must name a pipeline output"):
+        accessor.embedding(run=run, layout=3, show=False)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="run must be a PipelineRun"):
+        accessor.embedding(run=object(), layout="umap", show=False)  # type: ignore[arg-type]
+    foreign = FakeRun()
+    foreign._owner = object()
+    with pytest.raises(ValueError, match="opened from this datastore"):
+        accessor.embedding(run=foreign, layout="umap", show=False)  # type: ignore[arg-type]
+
 
 def test_frozen_run_plot_cells_fetch_selected_rows_of_the_run() -> None:
     from scarf.datastore._plot_accessor import _FrozenRunPlotCells

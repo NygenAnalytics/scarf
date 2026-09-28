@@ -2857,6 +2857,87 @@ def test_import_writers_accept_an_explicit_assay_type(tmp_path):
     assert set(zarr.open_group(store=untouched, mode="r").group_keys()) == {"sentinel"}
 
 
+def test_h5ad_worker_messages_reject_closed_pipes_and_worker_errors():
+    from multiprocessing import Pipe
+    from types import SimpleNamespace
+
+    from scarf.writers.h5ad import _worker_messages
+
+    worker = SimpleNamespace(exitcode=None, name="h5ad-writer-0")
+    receiver, sender = Pipe(duplex=False)
+    sender.close()
+    with pytest.raises(RuntimeError, match="writer 0 closed without a result"):
+        list(_worker_messages({receiver: 0}, [worker], "writer"))
+
+    receiver, sender = Pipe(duplex=False)
+    sender.send(("error", "ValueError: boom"))
+    with pytest.raises(RuntimeError, match="producer 0 failed: ValueError: boom"):
+        list(_worker_messages({receiver: 0}, [worker], "producer"))
+    sender.close()
+
+
+def test_h5ad_stop_workers_escalates_and_drains_pipes(monkeypatch):
+    import threading
+    from multiprocessing import Pipe
+    from types import SimpleNamespace
+
+    import scarf.writers.h5ad as h5ad_writer
+
+    class Worker:
+        def __init__(self, survives_terminate: bool) -> None:
+            self.alive = True
+            self.survives_terminate = survives_terminate
+            self.calls: list[str] = []
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def join(self, timeout: float | None = None) -> None:
+            self.calls.append("join")
+
+        def terminate(self) -> None:
+            self.calls.append("terminate")
+            self.alive = self.survives_terminate
+
+        def kill(self) -> None:
+            self.calls.append("kill")
+            self.alive = False
+
+    clock = iter(range(0, 100, 3))
+    monkeypatch.setattr(
+        h5ad_writer, "time", SimpleNamespace(monotonic=lambda: next(clock))
+    )
+    receiver, sender = Pipe(duplex=False)
+    sender.send(("rows", "blocked"))
+    closed, closed_sender = Pipe(duplex=False)
+    closed.close()
+    stop = threading.Event()
+    stubborn, stopping = Worker(True), Worker(False)
+
+    h5ad_writer._stop_workers(stop, [stubborn, stopping], [receiver, closed])
+
+    assert stop.is_set()
+    # One drain pass joins without waiting, then the deadline forces termination.
+    assert stubborn.calls == ["join", "terminate", "join", "kill", "join"]
+    assert stopping.calls == ["join", "terminate", "join"]
+    assert receiver.closed and closed.closed
+    sender.close()
+    closed_sender.close()
+
+
+def test_h5ad_writer_rejects_assay_type_with_assay_split_key(tmp_path):
+    from scarf.writers import H5adToZarr
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        H5adToZarr(
+            None,  # type: ignore[arg-type]
+            str(tmp_path / "out.zarr"),
+            assay_type="RNA",
+            assay_split_key="feature_types",
+        )
+    assert not (tmp_path / "out.zarr").exists()
+
+
 def test_h5ad_worker_messages_wait_for_a_clean_exit_result():
     import threading
     import time

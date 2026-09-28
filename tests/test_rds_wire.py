@@ -1022,3 +1022,52 @@ def test_extended_references_and_singletons_preserve_identity() -> None:
         assert symbol is reference
         assert first_nil is second_nil
         assert first_base is second_base
+
+
+def test_xz_reader_joins_concatenated_streams_and_stops_at_padding() -> None:
+    from scarf.readers._rds._storage import _XzReader
+
+    padding = b"\x00" * 4
+    payload = lzma.compress(b"abc") + padding + lzma.compress(b"def") + padding * 2
+    assert io.BufferedReader(_XzReader(io.BytesIO(payload))).read() == b"abcdef"
+    # Padding longer than one source read still ends the input cleanly.
+    payload = lzma.compress(b"abc") + padding * 20_000
+    assert io.BufferedReader(_XzReader(io.BytesIO(payload))).read() == b"abc"
+    # Other trailing bytes are not a stream and end the input.
+    payload = lzma.compress(b"abc") + b"trailing bytes"
+    assert io.BufferedReader(_XzReader(io.BytesIO(payload))).read() == b"abc"
+
+    truncated = lzma.compress(bytes(range(256)) * 64)[:-12]
+    with pytest.raises(EOFError, match="before its end marker"):
+        io.BufferedReader(_XzReader(io.BytesIO(truncated))).read()
+
+
+def test_xz_reader_returns_buffered_output_across_small_reads() -> None:
+    from scarf.readers._rds._storage import _XzReader
+
+    expected = b"x" * 10_000
+    reader = _XzReader(io.BytesIO(lzma.compress(expected)))
+    buffer = bytearray(16)
+    chunks = []
+    while count := reader.readinto(buffer):
+        chunks.append(bytes(buffer[:count]))
+    assert b"".join(chunks) == expected
+    assert max(len(chunk) for chunk in chunks) == 16
+
+
+@pytest.mark.parametrize(
+    ("raw", "gp", "encoding", "expected"),
+    [
+        (b"\xe9", 1 << 1, None, b"\xe9"),
+        (b"\xe9", 1 << 2, None, "é"),
+        (b"caf\xc3\xa9", 1 << 3, "latin1", "café"),
+        (b"a\xff", 1 << 6, None, "a\udcff"),
+        (b"\xe9", 0, "latin1", "é"),
+        (b"caf\xc3\xa9", 0, "not-a-codec", "café"),
+        (b"caf\xc3\xa9", 0, None, "café"),
+    ],
+)
+def test_r_strings_decode_by_their_encoding_flags(raw, gp, encoding, expected):
+    from scarf.readers._rds._lazy import decode_r_string
+
+    assert decode_r_string(raw, gp, encoding) == expected

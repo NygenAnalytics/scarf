@@ -6,6 +6,8 @@ from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 
 _EXPECTED_EXPORTS = {
     "ArtifactLineage": "scarf.storage.lineage",
@@ -585,6 +587,40 @@ for module_name, export_name in cases:
         ],
         check=True,
     )
+
+
+def test_lazy_facade_imports_submodules_and_exports_on_first_access(
+    tmp_path, monkeypatch
+):
+    import importlib
+
+    from scarf._facade import lazy_facade
+
+    package = tmp_path / "scarf_lazy_probe"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "child.py").write_text("VALUE = 7\n")
+    (package / "source.py").write_text("def exported():\n    return 'exported'\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    names = ("scarf_lazy_probe", "scarf_lazy_probe.child", "scarf_lazy_probe.source")
+    try:
+        module = importlib.import_module("scarf_lazy_probe")
+        module.__getattr__, module.__dir__ = lazy_facade(
+            "scarf_lazy_probe",
+            {"exported": ".source"},
+            modules=("child",),
+        )
+        assert "scarf_lazy_probe.child" not in sys.modules
+        assert module.child.VALUE == 7
+        assert vars(module)["child"] is sys.modules["scarf_lazy_probe.child"]
+        assert module.exported() == "exported"
+        assert {"child", "exported"} <= set(dir(module))
+        with pytest.raises(AttributeError, match="has no attribute 'missing'"):
+            module.missing  # noqa: B018
+    finally:
+        for name in names:
+            sys.modules.pop(name, None)
 
 
 def test_lazy_facade_binding_keeps_patched_exports():

@@ -1732,3 +1732,19 @@ def test_paris_only_pipeline_keeps_paris_as_a_diagnostic_without_clusters(
     assert "cluster_selection" not in run
     assert "leiden_1.0" not in run
     assert list(run).count("paris") == 1
+
+
+def test_pipeline_run_cells_fetch_live_ids_and_the_frozen_selection(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    run = datastore.pipeline.run(**_minimal_run_options())
+
+    ids = run.cells.fetch_all("ids")
+    np.testing.assert_array_equal(ids, datastore.cells.fetch_all("ids"))
+    selection = run.cells.fetch_all("I")
+    assert selection.dtype == np.dtype(bool)
+    assert selection.shape == ids.shape
+    np.testing.assert_array_equal(run.cells.fetch("ids"), ids[selection])
+    with pytest.raises(TypeError, match="non-empty string"):
+        run.cells.fetch_all("")

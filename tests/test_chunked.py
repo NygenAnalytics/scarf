@@ -255,6 +255,12 @@ class TestNumpySemantics:
         copied = np.asarray(reduction, copy=True)
         copied[0] = -1
         assert reduction.compute()[0] == values[:, 0].sum()
+        converted = np.asarray(reduction, dtype=np.float32)
+        assert converted.dtype == np.float32
+        np.testing.assert_array_equal(converted, values.sum(axis=0))
+        with pytest.raises(ValueError, match="avoid copy"):
+            np.asarray(reduction, dtype=np.float32, copy=False)
+        assert np.shares_memory(np.asarray(reduction), reduction.compute())
 
 
 class TestPublicApiCompat:

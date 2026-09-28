@@ -251,6 +251,19 @@ def test_category_scale_shows_observed_categories_with_stable_colors():
         )
 
 
+def test_missing_categories_include_nulls_but_not_containers():
+    import pandas as pd
+
+    from scarf.plotting._style import _is_missing_category
+
+    assert _is_missing_category(None)
+    assert _is_missing_category(float("nan"))
+    assert _is_missing_category(pd.NA)
+    assert not _is_missing_category("a")
+    # A sequence label has no single missingness answer.
+    assert not _is_missing_category((1, None))
+
+
 def test_padded_square_limits_and_colormap_palette():
     from scarf.plotting._style import colormap_palette, padded_square_limits
 
@@ -262,6 +275,8 @@ def test_padded_square_limits_and_colormap_palette():
     assert ylim[1] - ylim[0] == pytest.approx(11.0)
     with pytest.raises(ValueError, match="No finite coordinates"):
         padded_square_limits(np.array([np.nan]), np.array([1.0]))
+    with pytest.raises(ValueError, match="matching shapes"):
+        padded_square_limits(np.zeros(2), np.zeros(3))
 
     _, mpl = require_matplotlib()
     palette = colormap_palette(["a", "b", "c"], "viridis")

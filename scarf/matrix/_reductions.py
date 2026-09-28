@@ -46,18 +46,6 @@ class _Reduction:
     def _arr(self) -> np.ndarray:
         return self.compute()
 
-    def __array__(
-        self,
-        dtype: np.dtype[Any] | None = None,
-        copy: bool | None = None,
-    ) -> np.ndarray:
-        array = self._arr
-        if dtype is not None and np.dtype(dtype) != array.dtype:
-            if copy is False:
-                raise ValueError("Converting a reduction's dtype requires a copy")
-            return array.astype(dtype)
-        return array.copy() if copy else array
-
     def __array_ufunc__(
         self,
         ufunc: Any,

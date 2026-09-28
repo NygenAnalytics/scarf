@@ -907,6 +907,10 @@ def test_run_tsne_orchestration_and_error_paths(
             invalidate_cache=True,
         )
     assert runner.call_args.kwargs["nthreads"] == 2
+    with pytest.raises(TypeError, match="initialization must be an ArtifactRef"):
+        store.run_tsne(graph_ref, initial.tolist())  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="graph must be an ArtifactRef"):
+        store.run_tsne("graph", initial)  # type: ignore[arg-type]
 
     runner_calls = runner.call_count
     graph_loads = load_graph.call_count
@@ -928,6 +932,14 @@ def test_run_tsne_orchestration_and_error_paths(
     # A reused embedding neither loads the graph nor expands its initialization.
     assert load_graph.call_count == graph_loads
     assert get_initial.call_count == initial_loads
+    with pytest.raises(RuntimeError, match="win32 operating system"):
+        store.run_tsne(graph_ref, initial, invalidate_cache=True)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    runner.side_effect = None
+    runner.return_value = embedding[:1]
+    with pytest.raises(ValueError, match="returned an embedding with shape"):
+        store.run_tsne(graph_ref, initial, invalidate_cache=True)
     _assert_metadata_unchanged(store.cells, metadata_before)
 
 

@@ -112,6 +112,16 @@ def characterization() -> FeatureCharacterization:
     )
 
 
+def test_bounded_tool_lists_stop_at_a_positive_limit() -> None:
+    bounded = data_enrichment_tools._bounded_list
+
+    assert bounded(iter(range(10)), limit=3) == [0, 1, 2]
+    assert bounded([1], limit=5) == [1]
+    for limit in (0, True):
+        with pytest.raises(ValueError, match="positive integer"):
+            bounded([1], limit=limit)
+
+
 def test_data_enrichment_models_have_factories_and_camelcase_fields() -> None:
     model_types: list[type[BaseModel]] = [
         DataEnrichmentContext,

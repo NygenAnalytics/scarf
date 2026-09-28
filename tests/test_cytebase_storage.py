@@ -270,10 +270,16 @@ def test_retry_backs_off_and_reports_transient_errors(recorded_sleeps):
 def test_retry_retries_hub_transport_errors(recorded_sleeps):
     import httpx2
 
-    operation, calls = _failing([httpx2.ConnectError("reset")])
+    response = httpx2.Response(503, request=httpx2.Request("GET", "https://x.invalid"))
+    operation, calls = _failing(
+        [
+            httpx2.ConnectError("reset"),
+            httpx2.HTTPStatusError("busy", request=response.request, response=response),
+        ]
+    )
     assert _storage.retry(operation) == "done"
-    assert calls == [0, 1]
-    assert recorded_sleeps == [2.0]
+    assert calls == [0, 1, 2]
+    assert recorded_sleeps == [2.0, 4.0]
 
 
 def test_retry_gives_up_after_three_retries(recorded_sleeps):

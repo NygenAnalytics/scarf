@@ -412,11 +412,14 @@ def test_write_sparse_bands_records_plan_and_respects_write_ceiling() -> None:
             resources=ResourceBudget(2 * 1024 * 1024, 4),
             io=StorageIoPolicy(writeWorkers=1),
         )
-    assert reports
-    report = reports[-1]
-    assert report.unitKind == "countsImportBand"
+    import_reports = [r for r in reports if r.unitKind == "countsImportBand"]
+    assert len(import_reports) == 1
+    report = import_reports[0]
     assert report.plan.writeWorkers == 1
     assert report.actualWriteWorkers <= 1
+    # One writer admits one band per batch, and the import reports them once.
+    assert report.unitsCompleted == 2
+    assert report.extra["batches"] == 2
     np.testing.assert_array_equal(destination[:], expected)
 
 

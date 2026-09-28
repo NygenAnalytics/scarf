@@ -333,6 +333,27 @@ def test_statistical_design_is_validated_before_planning(
         )
 
 
+@pytest.mark.parametrize(
+    ("method", "groups", "comparisons", "message"),
+    [
+        ("mann_whitney", ["g0"], None, "At least two populated groups"),
+        ("wilcoxon", ["g0", "g1", "g2"], None, "wilcoxon requires exactly two"),
+        ("kruskal_wallis", ["g0", "g1"], None, "at least three groups"),
+        ("kruskal_wallis", ["g0", "g1", "g2"], (("g1", "g1"),), "distinct groups"),
+    ],
+)
+def test_statistical_design_rules_reject_unusable_requests(
+    method, groups, comparisons, message
+):
+    from scarf.datastore._operations.features import _validate_statistical_design
+
+    with pytest.raises(ValueError, match=message):
+        _validate_statistical_design(method, groups, comparisons)
+    assert (
+        _validate_statistical_design("mann_whitney", ["a", "b"], (("a", "b"),)) is None
+    )
+
+
 def test_run_statistical_testing_kruskal_dunn(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)

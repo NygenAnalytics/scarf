@@ -1063,6 +1063,37 @@ def test_run_leiden_clustering_rejects_invalid_resolution_or_seed(
     assert datastore.list_artifacts(kind="cluster_labels") == before
 
 
+@pytest.mark.parametrize(
+    ("labels", "error", "message"),
+    [
+        (lambda n: np.zeros(n - 1, dtype=np.int64), ValueError, "one label per"),
+        (lambda n: np.zeros(n, dtype=np.float64), TypeError, "integer labels"),
+    ],
+)
+def test_run_leiden_clustering_rejects_malformed_memberships(
+    datastore,
+    connectivity_graph,
+    monkeypatch,
+    labels,
+    error: type[Exception],
+    message: str,
+) -> None:
+    import scarf.clustering.leiden as leiden
+
+    monkeypatch.setattr(
+        leiden,
+        "leiden_membership",
+        lambda matrix, *args, **kwargs: labels(matrix.shape[0]),
+    )
+    before = datastore.list_artifacts(kind="cluster_labels", complete_only=True)
+    with pytest.raises(error, match=message):
+        datastore.run_leiden_clustering(connectivity_graph, resolution=0.123)
+
+    assert datastore.list_artifacts(kind="cluster_labels", complete_only=True) == (
+        before
+    )
+
+
 def test_int_and_float_resolution_share_identity(
     datastore,
     connectivity_graph,

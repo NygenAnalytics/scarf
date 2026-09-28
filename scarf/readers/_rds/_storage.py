@@ -370,13 +370,17 @@ class _XzReader(io.RawIOBase):
         view = memoryview(buffer).cast("B")
         while not self._finished:
             if self._decoder.eof:
-                data = self._decoder.unused_data or self._source.read(
-                    _DECODER_READ_BYTES
-                )
+                # xz stream padding is null bytes between or after streams.
+                data = self._decoder.unused_data.lstrip(b"\x00")
+                while not data:
+                    data = self._source.read(_DECODER_READ_BYTES)
+                    if not data:
+                        break
+                    data = data.lstrip(b"\x00")
                 if not data:
                     self._finished = True
                     break
-                # Concatenated streams continue; trailing padding ends the input.
+                # Concatenated streams continue; other trailing bytes end the input.
                 self._decoder = lzma.LZMADecompressor(memlimit=_XZ_MEMORY_LIMIT)
                 try:
                     output = self._decoder.decompress(data, len(view))

@@ -778,7 +778,8 @@ def test_early_close_joins_the_producer_and_surfaces_its_failure() -> None:
         stream.close()
 
 
-def test_unordered_stream_closes_when_a_unit_starts_after_stop(monkeypatch) -> None:
+@pytest.mark.parametrize("ordered", [False, True])
+def test_stream_closes_when_a_unit_starts_after_stop(monkeypatch, ordered) -> None:
     import asyncio
     import threading
     import time
@@ -827,6 +828,7 @@ def test_unordered_stream_closes_when_a_unit_starts_after_stop(monkeypatch) -> N
         lambda group: group.featStart,
         resources=ResourceBudget(64 * 1024**2, 2),
         io=StorageIoPolicy(readWorkers=1),
+        orderedCompute=ordered,
     )
     finished = threading.Event()
 

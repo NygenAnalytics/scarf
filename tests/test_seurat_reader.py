@@ -3498,6 +3498,59 @@ def test_altrep_metadata_columns_are_expanded(tmp_path: Path) -> None:
         assert _decoded(metadata.column("deferred"), 0, 3) == ("7", None, "9")
 
 
+@pytest.mark.parametrize(
+    ("name", "state", "message"),
+    [
+        ("compact_intseq", [3, 1, 2], "state is invalid"),
+        ("compact_intseq", [3, 1.5, 1], "state is invalid"),
+        ("compact_realseq", [-1, 0, 1], "state is invalid"),
+        ("compact_realseq", [2.5, 0, 1], "state is invalid"),
+        ("compact_realseq", [3, float("nan"), 1], "state is invalid"),
+        ("compact_bogus", [3, 1, 1], "is not supported"),
+    ],
+)
+def test_invalid_altrep_metadata_columns_are_rejected(
+    tmp_path: Path,
+    name: str,
+    state: list[float],
+    message: str,
+) -> None:
+    wire = _Wire()
+    path = _write_metadata_fixture(
+        tmp_path / "altrep.rds",
+        wire=wire,
+        columns=[("bad", wire.altrep(name, wire.real_vector(state)))],
+    )
+
+    with pytest.raises(SeuratImportError, match=message) as error:
+        with SeuratReader(path) as reader:
+            reader.cellMetadata.column("bad").read_block(0, 1)
+    assert error.value.code == "unsupported_altrep"
+
+
+def test_altrep_sequence_views_read_bounded_windows() -> None:
+    from types import SimpleNamespace
+
+    from scarf.readers.seurat import _CompactSequence, _DeferredIntegerStrings
+
+    sequence = _CompactSequence(5, 10.0, -1.0, np.dtype(np.int32))
+    assert (len(sequence), sequence.nbytes) == (5, 20)
+    np.testing.assert_array_equal(sequence.read_block(1, 4), [9, 8, 7])
+    assert sequence[4] == 6
+    for start, stop in ((-1, 2), (3, 2), (3, 6)):
+        with pytest.raises(IndexError, match="outside"):
+            sequence.read_block(start, stop)
+
+    strings = _DeferredIntegerStrings(sequence)
+    assert len(strings) == 5
+    assert strings.read_block(0, 2) == ("10", "9")
+    assert strings[2] == "8"
+    missing = SimpleNamespace(
+        read_block=lambda start, stop: np.array([1, R_INT_NA], dtype=np.int32)
+    )
+    assert _DeferredIntegerStrings(missing).read_block(0, 2) == ("1", None)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize("real", [False, True])
 def test_missing_count_values_are_rejected(tmp_path: Path, real: bool) -> None:
     wire = _Wire()

@@ -312,6 +312,31 @@ def test_feature_sidecar_suffix_and_column_fallbacks(
         reader.close()
 
 
+@pytest.mark.parametrize(
+    ("contents", "message"),
+    [
+        ("chr1\t10109\nchr1\t180730\n", "chrom, start, and end columns"),
+        ("chr1\tstart\t10357\nchr1\t180730\t181630\n", "must hold integers"),
+    ],
+)
+def test_peak_bed_sidecars_are_validated(
+    tmp_path: Path,
+    contents: str,
+    message: str,
+) -> None:
+    _write_mex(tmp_path, [(1, 1, 1), (2, 1, 2)], n_features=2, n_cells=1)
+    (tmp_path / "features.tsv").unlink()
+    _write_text(tmp_path / "peaks.bed", contents)
+
+    candidate = inspect_mtx(tmp_path)[0]
+    with pytest.raises(ValueError, match=message):
+        reader = MtxReader(candidate)
+        try:
+            reader.feature_names()
+        finally:
+            reader.close()
+
+
 def test_parse_modern_compressed_names_and_feature_name_fallback(
     tmp_path: Path,
 ) -> None:

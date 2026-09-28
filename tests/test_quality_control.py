@@ -138,6 +138,19 @@ def test_sample_cluster_pool_respects_fraction_and_cap():
         )
 
 
+def test_doublet_real_arguments_reject_booleans_and_non_numbers():
+    from scarf.datastore._operations.quality_control import _validated_real
+
+    for value in (True, np.bool_(False), "0.5", None):
+        with pytest.raises(TypeError, match="ratio must be a real number"):
+            _validated_real(value, "ratio", low=0.0)
+    assert _validated_real(np.float32(0.5), "ratio", low=0.0, high=1.0) == 0.5
+    with pytest.raises(ValueError, match=r"ratio must be a finite number > 0"):
+        _validated_real(0, "ratio", low=0.0, include_low=False)
+    with pytest.raises(ValueError, match=r">= 0 and <= 1"):
+        _validated_real(float("nan"), "ratio", low=0.0, high=1.0)
+
+
 def test_assign_cell_cycle_phase_preserves_rule_precedence():
     phases = assign_cell_cycle_phase(
         s_score=np.array([1.0, 0.1, -2.0, 0.0, -1.0]),

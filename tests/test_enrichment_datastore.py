@@ -420,6 +420,16 @@ def test_enrichment_loader_is_read_only_and_validates_artifact(
         with pytest.raises(ValueError, match="missing required metadata"):
             datastore_ephemeral.get_enrichment(ref)
         group.attrs[name] = value
+    for name, value, message in (
+        ("layout", "rows", "unsupported layout"),
+        ("dropped_ambiguous_targets", [""], "invalid dropped_ambiguous_targets"),
+        ("complete", False, "missing or incomplete"),
+    ):
+        original = group.attrs[name]
+        group.attrs[name] = value
+        with pytest.raises(ValueError, match=message):
+            datastore_ephemeral.get_enrichment(ref)
+        group.attrs[name] = original
 
     read_only = DataStore(
         datastore_ephemeral.zarr_loc,

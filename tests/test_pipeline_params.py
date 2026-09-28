@@ -3,6 +3,11 @@ from typing import Any
 import numpy as np
 import pytest
 
+from scarf.datastore._pipeline_recipe import (
+    _parameter_value,
+    _resolve_params,
+    resolve_pipeline_recipe,
+)
 from scarf.storage.feature_selection import read_feature_selection_indices
 
 
@@ -149,3 +154,147 @@ def test_params_and_shortcuts_cannot_set_the_same_setting(datastore_ephemeral):
         store.pipeline.run(umap=False, params={"umap": {"n_epochs": 10}})
 
     assert _run_ids(store) == before
+
+
+_SHORTCUT_DEFAULTS: dict[str, Any] = {
+    "assay": None,
+    "label": None,
+    "cell_key": "I",
+    "filtering": False,
+    "harmony_batch_columns": None,
+    "hvg_count": 1000,
+    "pca_dims": 21,
+    "neighbors_k": 11,
+    "umap": True,
+    "leiden": True,
+    "cell_cycle": True,
+    "paris": True,
+    "doublets": True,
+    "markers": True,
+    "snapshot_columns": (),
+}
+
+
+@pytest.fixture
+def readonly_store(datastore_zarr_root):
+    from scarf.datastore.datastore import DataStore
+
+    return DataStore(datastore_zarr_root, default_assay="RNA", zarr_mode="r")
+
+
+def _resolve(store, **overrides: Any):
+    return resolve_pipeline_recipe(store, **{**_SHORTCUT_DEFAULTS, **overrides})
+
+
+def test_params_values_are_recorded_as_json():
+    assert type(_parameter_value(np.int64(3), "x")) is int
+    assert _parameter_value(np.float32(0.5), "x") == 0.5
+    assert _parameter_value((1, 2), "x") == [1, 2]
+    assert _parameter_value(np.array([1.0, 2.0]), "x") == [1.0, 2.0]
+    assert _parameter_value({"a": [np.bool_(True)]}, "x") == {"a": [True]}
+    with pytest.raises(TypeError, match="keys must be strings"):
+        _parameter_value({1: 2}, "x")
+    for value in (object(), b"raw"):
+        with pytest.raises(TypeError, match="must be a number"):
+            _parameter_value(value, "x")
+    with pytest.raises(ValueError, match="must be finite"):
+        _parameter_value([1.0, float("nan")], "x")
+
+
+def test_params_sections_are_validated():
+    assert _resolve_params(None) == ({}, None)
+    with pytest.raises(TypeError, match="mapping of stage names"):
+        _resolve_params([("pca", {})])  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="filtering"):
+        _resolve_params({"filtering": "mad"})
+    with pytest.raises(TypeError, match="mapping or bool"):
+        _resolve_params({"umap": 400})
+    with pytest.raises(ValueError, match="Unknown markers parameters"):
+        _resolve_params({"markers": {"nthreads": 2}})
+
+    sections, species = _resolve_params(
+        {"markers": False, "species": "mus_musculus", "filtering": {"method": "mad"}}
+    )
+    assert sections == {"markers": False, "filtering": {"method": "mad"}}
+    assert species == "mus_musculus"
+
+
+def test_params_resolve_into_stage_settings(readonly_store):
+    recipe = _resolve(
+        readonly_store,
+        params={
+            "cell_cycle": {"n_bins": 30},
+            "hvg": {"top_n": 500, "keep_bounds": True},
+            "pca": {"dims": 10},
+            "neighbors": {"k": 7, "batch_size": 1000},
+            "umap": {"n_epochs": 400, "umap_dims": 3},
+            "leiden": {"partitions": [0.5, 1.0], "selected": 0.5, "random_seed": 1},
+            "paris": False,
+            "doublets": {"save_k": 3},
+            "tsne": True,
+            "membership_strength": True,
+        },
+    )
+
+    assert (recipe.hvg_count, recipe.pca_dims, recipe.neighbors_k) == (500, 10, 7)
+    assert recipe.params_for("cell_cycle") == {"n_bins": 30}
+    assert recipe.params_for("hvg") == {"keep_bounds": True}
+    assert recipe.params_for("neighbors") == {"batch_size": 1000}
+    assert recipe.params_for("leiden") == {"random_seed": 1}
+    assert recipe.params_for("tsne") == {}
+    assert recipe.leiden_selected == "0.5"
+    assert (recipe.tsne, recipe.membership_strength, recipe.paris) == (
+        True,
+        True,
+        False,
+    )
+    assert {"membership_strength", "tsne"} <= set(recipe.stage_order)
+    config = recipe.to_config()
+    assert config["leiden"] == {"partitions": [0.5, 1.0], "selected": 0.5}
+    assert config["params"]["umap"] == {"n_epochs": 400, "umap_dims": 3}
+    assert config["params"]["doublets"] == {"save_k": 3}
+
+
+@pytest.mark.parametrize(
+    ("shortcut", "params"),
+    [
+        ({"pca_dims": 10}, {"pca": {"dims": 5}}),
+        ({"neighbors_k": 5}, {"neighbors": {"k": 7}}),
+        ({"harmony_batch_columns": ["sample"]}, {"harmony": False}),
+        ({"filtering": {"method": "mad"}}, {"filtering": False}),
+        ({"paris": False}, {"paris": {"n_clusters": 5}}),
+        ({"leiden": False}, {"leiden": {"partitions": [1.0]}}),
+    ],
+)
+def test_params_conflict_with_changed_shortcuts(readonly_store, shortcut, params):
+    with pytest.raises(ValueError, match="not both"):
+        _resolve(readonly_store, **shortcut, params=params)
+
+
+def test_params_stage_rules_are_checked(readonly_store):
+    with pytest.raises(ValueError, match="collide"):
+        _resolve(
+            readonly_store,
+            snapshot_columns=("umap_3",),
+            params={"umap": {"umap_dims": 3}},
+        )
+    with pytest.raises(ValueError, match="needs batch_columns"):
+        _resolve(readonly_store, params={"harmony": {"batch_size": 100}})
+    with pytest.raises(ValueError, match="membership_strength requires"):
+        _resolve(
+            readonly_store,
+            leiden=False,
+            doublets=False,
+            markers=False,
+            params={"membership_strength": True},
+        )
+    assert (
+        _resolve(readonly_store, params={"harmony": False}).harmony_batch_columns == ()
+    )
+    harmony = _resolve(
+        readonly_store,
+        params={"harmony": {"batch_columns": ["ids"], "batch_size": 100}},
+    )
+    assert harmony.harmony_batch_columns == ("ids",)
+    assert harmony.params_for("harmony") == {"batch_size": 100}
+    assert _resolve(readonly_store, params={"pca": {"dims": 0}}).pca_dims == 0

@@ -322,8 +322,6 @@ def _validate_and_load_artifact_mapping_reference(
         if method == "symphony"
         else None
     )
-    if method == "pca" and "batch_correction" in inputs:
-        raise contract_error("Plain PCA reference includes batch correction")
 
     reduction_status = inspect_artifact(datastore.zw, reduction)
     ann_status = inspect_artifact(datastore.zw, ann_index)

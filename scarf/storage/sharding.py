@@ -728,6 +728,11 @@ def write_sparse_bands(
             countSummaries[item.destination.path].update(item.band.start, dense)
         writable(item.destination)[item.band.start : item.band.end, :] = dense
 
+    # Each batch is planned for the bands it holds; report the whole import once,
+    # under the plan of its widest batch.
+    widest: tuple[int, OperationPlan] | None = None
+    batches = 0
+    units = 0
     try:
         fill()
         while pending:
@@ -751,18 +756,24 @@ def write_sparse_bands(
             ):
                 if progress is not None:
                     progress.update()
-            record_execution_report(
-                ExecutionReport(
-                    plan=operation,
-                    unitKind="countsImportBand",
-                    actualReadWorkers=1,
-                    actualComputeWorkers=admitted,
-                    actualWriteWorkers=admitted,
-                    unitsCompleted=len(batch),
-                )
-            )
+            if widest is None or admitted > widest[0]:
+                widest = (admitted, operation)
+            batches += 1
+            units += len(batch)
             del batch
             fill()
+        if widest is not None:
+            record_execution_report(
+                ExecutionReport(
+                    plan=widest[1],
+                    unitKind="countsImportBand",
+                    actualReadWorkers=1,
+                    actualComputeWorkers=widest[0],
+                    actualWriteWorkers=widest[0],
+                    unitsCompleted=units,
+                    extra={"batches": batches},
+                )
+            )
     finally:
         from contextlib import ExitStack
 

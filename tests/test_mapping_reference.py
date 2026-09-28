@@ -326,6 +326,58 @@ def test_symphony_mapping_reference_requires_recorded_batch_levels(
         datastore.build_mapping_reference(neighbors)
 
 
+def test_symphony_mapping_reference_load_rejects_each_tampered_record(
+    analyzed_datastore_ephemeral,
+):
+    from scarf.mapping.artifact import load_artifact_mapping_reference
+
+    datastore = analyzed_datastore_ephemeral
+    reference = datastore.get_mapping_reference(
+        datastore.build_mapping_reference(_symphony_neighbors(datastore))
+    )
+    group = artifact_group(datastore.zw, reference.ref)
+    correction = artifact_group(datastore.zw, reference.batch_correction)
+    original = correction.attrs["provenance"]
+    for section, key, value, message in (
+        (None, "operation", "run_scanorama", "correction is not Harmony"),
+        ("inputs", "reduction", reference.feature_selection.to_dict(), "different PCA"),
+    ):
+        provenance = dict(original)
+        if section is None:
+            provenance[key] = value
+        else:
+            provenance[section] = dict(provenance[section]) | {key: value}
+        correction.attrs["provenance"] = provenance
+        with pytest.raises(ValueError, match=message):
+            load_artifact_mapping_reference(datastore, reference.ref)
+        correction.attrs["provenance"] = original
+
+    for name, index, value, message in (
+        ("sigma", 0, 0.0, "Symphony correction model is invalid"),
+        ("centroids", (0, 0), None, "Symphony model changed from its input"),
+    ):
+        array = group[name]
+        stored = array[index]
+        array[index] = stored + 1.0 if value is None else value
+        with pytest.raises(ValueError, match=message):
+            load_artifact_mapping_reference(datastore, reference.ref)
+        array[index] = stored
+
+    metadata = dict(group.attrs["reference_metadata"])
+    group.attrs["reference_metadata"] = metadata | {"batch_columns": ["other"]}
+    with pytest.raises(ValueError, match="Symphony metadata does not match"):
+        load_artifact_mapping_reference(datastore, reference.ref)
+    group.attrs["reference_metadata"] = metadata
+    assert load_artifact_mapping_reference(datastore, reference.ref).ref == (
+        reference.ref
+    )
+
+    data = correction["data"]
+    data.resize((data.shape[0], data.shape[1] + 1))
+    with pytest.raises(ValueError, match="Harmony coordinates do not match"):
+        load_artifact_mapping_reference(datastore, reference.ref)
+
+
 @pytest.mark.parametrize("missing", ["batch_levels", "batch_columns"])
 def test_symphony_mapping_reference_load_requires_recorded_batch_metadata(
     analyzed_datastore_ephemeral,

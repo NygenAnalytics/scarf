@@ -1640,3 +1640,142 @@ def test_csv_reader_rejects_missing_and_negative_counts(tmp_path, row, message):
 
     with pytest.raises(ValueError, match=message):
         CSVReader(str(path), id_column=0, batch_size=2)
+
+
+@pytest.mark.parametrize(
+    ("text", "kwargs", "error", "message"),
+    [
+        ("g1,g2\n", {}, ValueError, "contains no data rows"),
+        ("g1,g2\n1,x\n", {}, ValueError, "must contain numbers"),
+        ("g1,g2\n1,True\n2,False\n", {}, ValueError, "must contain numbers"),
+        ("g1,g2\n1,2\n", {"cell_data_cols": ["batch"]}, KeyError, "not CSV columns"),
+    ],
+)
+def test_csv_reader_rejects_unusable_files(tmp_path, text, kwargs, error, message):
+    from scarf.readers import CSVReader
+
+    path = tmp_path / "counts.csv"
+    path.write_text(text)
+    with pytest.raises(error, match=message):
+        CSVReader(str(path), **kwargs)
+
+
+def test_loom_reader_closes_its_file_when_validation_fails(tmp_path, monkeypatch):
+    import h5py
+
+    import scarf.readers.loom as loom
+
+    path = tmp_path / "broken.loom"
+    with h5py.File(path, "w") as handle:
+        handle.create_group("col_attrs")
+    opened: list[h5py.File] = []
+    real_file = h5py.File
+
+    def tracking_file(*args, **kwargs):
+        handle = real_file(*args, **kwargs)
+        opened.append(handle)
+        return handle
+
+    monkeypatch.setattr(loom.h5py, "File", tracking_file)
+    with pytest.raises(KeyError, match="Matrix key"):
+        loom.LoomReader(str(path))
+    assert len(opened) == 1
+    assert not opened[0].id.valid
+
+
+def test_h5ad_column_helpers_decode_legacy_layouts(tmp_path) -> None:
+    import h5py
+
+    from scarf.readers._h5ad_columns import (
+        read_column,
+        read_table_column,
+        sparse_encoding,
+        sparse_shape,
+        table_column_dtype,
+    )
+
+    with h5py.File(
+        tmp_path / "columns.h5", "w", driver="core", backing_store=False
+    ) as h5:
+        # AnnData 0.6 stored obs as a compound dataset with codes whose
+        # categories live in uns.
+        obs = h5.create_dataset(
+            "obs",
+            data=np.array(
+                [(b"c1", 1), (b"c2", 0)], dtype=[("index", "S2"), ("batch", "<i4")]
+            ),
+        )
+        h5.create_group("uns")["batch_categories"] = np.array([b"a", b"b"])
+        values, missing = read_table_column(h5, obs, "batch", ())
+        assert values.tolist() == [b"b", b"a"]
+        assert not missing.any()
+        assert table_column_dtype(h5, obs, "batch", ()) == np.dtype("S1")
+        for read in (read_table_column, table_column_dtype):
+            with pytest.raises(KeyError, match="Column 'absent' was not found"):
+                read(h5, obs, "absent", ())
+
+        unsupported = h5.create_group("awkward")
+        unsupported.attrs["encoding-type"] = "awkward-array"
+        with pytest.raises(TypeError, match="unsupported H5AD encoding"):
+            read_column(unsupported)
+
+        matrix = h5.create_group("matrix")
+        assert (sparse_encoding(matrix), sparse_shape(matrix)) == (None, None)
+        matrix.attrs["h5sparse_format"] = "csc"
+        matrix.attrs["h5sparse_shape"] = [2, 3]
+        assert (sparse_encoding(matrix), sparse_shape(matrix)) == ("csc", (2, 3))
+        matrix.attrs["encoding-type"] = "array"
+        matrix.attrs["shape"] = [1, 2, 3]
+        assert (sparse_encoding(matrix), sparse_shape(matrix)) == (None, None)
+
+
+def _add_weird_cluster(obs) -> None:
+    obs.create_group("labels").attrs["encoding-type"] = "awkward-array"
+
+
+def _add_grid_cluster(obs) -> None:
+    obs.create_dataset("labels", data=np.zeros((3, 2), dtype=np.int32))
+
+
+def _add_misaligned_nullable_cluster(obs) -> None:
+    group = obs.create_group("labels")
+    group.create_dataset("values", data=np.arange(3, dtype=np.int32))
+    group.create_dataset("mask", data=np.zeros(2, dtype=bool))
+
+
+@pytest.mark.parametrize(
+    ("add_labels", "error", "message"),
+    [
+        (_add_weird_cluster, TypeError, "unsupported H5AD encoding"),
+        (_add_grid_cluster, TypeError, "one scalar value per cell"),
+        (_add_misaligned_nullable_cluster, ValueError, "misaligned missingness"),
+    ],
+)
+def test_h5ad_reader_validates_cluster_key_encodings(
+    tmp_path, add_labels, error, message
+) -> None:
+    import h5py
+
+    from scarf.readers import H5adReader
+    from tests.test_writers import _write_h5ad
+
+    path = _write_h5ad(tmp_path / "clusters.h5ad", np.ones((3, 4), dtype=np.uint16))
+    with h5py.File(path, "a") as h5:
+        add_labels(h5["obs"])
+    with pytest.raises(error, match=message):
+        H5adReader(str(path), cluster_keys=["labels"])
+
+
+def test_h5ad_reader_requires_a_sparse_matrix_shape(tmp_path) -> None:
+    import h5py
+
+    from scarf.readers import H5adReader
+    from tests.test_writers import _write_h5ad
+
+    path = _write_h5ad(tmp_path / "noshape.h5ad", np.ones((3, 4), dtype=np.uint16))
+    with h5py.File(path, "a") as h5:
+        # Without obs, the cell count comes from the matrix shape.
+        del h5["obs"]
+        del h5["X"].attrs["shape"]
+    with pytest.raises(ValueError, match="has no shape attribute"):
+        H5adReader(str(path))

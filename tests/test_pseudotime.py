@@ -348,6 +348,67 @@ def test_marker_search_returns_an_explicit_artifact_without_feature_writes(
     assert "p_value_adjusted" in result.table.columns
 
 
+def test_marker_search_validates_refs_before_reading(
+    datastore,
+    pseudotime_scoring,
+    detected_features,
+    auto_filter_cells,
+):
+    with pytest.raises(TypeError, match="pseudotime must be an ArtifactRef"):
+        datastore.run_pseudotime_marker_search("ptime", features=detected_features)
+    with pytest.raises(TypeError, match="features must be an ArtifactRef"):
+        datastore.run_pseudotime_marker_search(pseudotime_scoring, features="genes")
+    with pytest.raises(ValueError, match="assay-scoped feature selection"):
+        datastore.run_pseudotime_marker_search(
+            pseudotime_scoring,
+            features=auto_filter_cells,
+        )
+
+
+def test_marker_loader_rejects_each_tampered_record(
+    datastore,
+    pseudotime_markers,
+    detected_features,
+):
+    from scarf.storage.artifacts import artifact_group
+
+    with pytest.raises(TypeError, match="ref must be an ArtifactRef"):
+        datastore.load_pseudotime_markers("markers")
+    with pytest.raises(ValueError, match="assay-scoped pseudotime_markers"):
+        datastore.load_pseudotime_markers(detected_features)
+    group = artifact_group(datastore.zw, pseudotime_markers)
+    original = group.attrs["provenance"]
+    unrelated = detected_features.to_dict()
+    try:
+        for section, key, value, message in (
+            ("parameters", "min_cells", 0, "parameters are malformed"),
+            (
+                "inputs",
+                "ordered_feature_ids_fingerprint",
+                1,
+                "identities are malformed",
+            ),
+            (
+                "inputs",
+                "ordered_feature_ids_fingerprint",
+                "x",
+                "ID identity has changed",
+            ),
+            ("inputs", "dataset_fingerprint", "x", "dataset identity has changed"),
+            ("inputs", "cell_selection", unrelated, "cell selection does not match"),
+        ):
+            provenance = dict(original)
+            provenance[section] = dict(provenance[section]) | {key: value}
+            group.attrs["provenance"] = provenance
+            with pytest.raises(ValueError, match=message):
+                datastore.load_pseudotime_markers(pseudotime_markers)
+    finally:
+        group.attrs["provenance"] = original
+    assert datastore.load_pseudotime_markers(pseudotime_markers).ref == (
+        pseudotime_markers
+    )
+
+
 def test_trajectory_feature_selection_indices_are_read_blockwise(
     datastore,
     detected_features,
