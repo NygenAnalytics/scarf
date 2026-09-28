@@ -1,5 +1,4 @@
 from collections.abc import Mapping, Sequence
-import operator
 from typing import Any
 
 import numpy as np
@@ -17,12 +16,13 @@ from ..storage.artifacts import (
 )
 from ..storage.geometry import array_geometry
 from ..storage.partition import row_band
-from ..storage.selections import validate_stored_selection_integrity
+from ..storage.selections import validate_cell_selection
 from ..storage.types import as_zarr_array, as_zarr_group
 from .parameters import (
     AGGREGATION_ANN_PARAMETER_NAMES,
     AGGREGATION_ANN_STATIC_PARAMETER_NAMES,
 )
+from ..utils.arguments import integer_argument
 from ..utils.arrays import has_duplicates
 
 PSEUDOTIME_INPUTS = frozenset({"connectivity_map", "source_sink", "cell_selection"})
@@ -133,27 +133,6 @@ _MARKER_METHODS = {
 }
 
 
-def _integer_parameter(
-    value: Any,
-    name: str,
-    *,
-    minimum: int | None = None,
-    maximum: int | None = None,
-) -> int:
-    if isinstance(value, bool | np.bool_):
-        raise TypeError(f"{name} must be an integer")
-    try:
-        resolved = operator.index(value)
-    except TypeError:
-        raise TypeError(f"{name} must be an integer") from None
-    result = int(resolved)
-    if minimum is not None and result < minimum:
-        raise ValueError(f"{name} must be at least {minimum}")
-    if maximum is not None and result > maximum:
-        raise ValueError(f"{name} must be at most {maximum}")
-    return result
-
-
 def _real_parameter(
     value: Any,
     name: str,
@@ -254,7 +233,7 @@ def validate_pseudotime_parameters(parameters: Mapping[str, Any]) -> dict[str, A
     if component_policy not in {"largest", "error"}:
         raise ValueError("component_policy must be 'largest' or 'error'")
     return {
-        "n_singular_vals": _integer_parameter(
+        "n_singular_vals": integer_argument(
             parameters["n_singular_vals"],
             "n_singular_vals",
             minimum=2,
@@ -265,7 +244,7 @@ def validate_pseudotime_parameters(parameters: Mapping[str, Any]) -> dict[str, A
             parameters["min_max_norm_ptime"],
             "min_max_norm_ptime",
         ),
-        "random_seed": _integer_parameter(
+        "random_seed": integer_argument(
             parameters["random_seed"],
             "random_seed",
             minimum=0,
@@ -288,7 +267,7 @@ def validate_fate_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
             minimum_open=True,
             maximum_open=True,
         ),
-        "max_iterations": _integer_parameter(
+        "max_iterations": integer_argument(
             parameters["max_iterations"],
             "max_iterations",
             minimum=1,
@@ -323,7 +302,7 @@ def validate_marker_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
             parameters["normalization_method"]
         ),
         "size_factor": _size_factor(parameters["size_factor"]),
-        "min_cells": _integer_parameter(
+        "min_cells": integer_argument(
             parameters["min_cells"],
             "min_cells",
             minimum=1,
@@ -351,7 +330,7 @@ def _ann_parameters(value: Any) -> dict[str, Any]:
             validated[name] = raw
         else:
             minimum = 0 if name == "random_seed" else 1
-            validated[name] = _integer_parameter(
+            validated[name] = integer_argument(
                 raw,
                 f"ann_params.{name}",
                 minimum=minimum,
@@ -378,12 +357,12 @@ def validate_aggregation_parameters(parameters: Mapping[str, Any]) -> dict[str, 
         _normalized_value_parameter_names(parameters, AGGREGATION_PARAMETERS),
         "Pseudotime-aggregation parameters",
     )
-    n_clusters = _integer_parameter(
+    n_clusters = integer_argument(
         parameters["n_clusters"],
         "n_clusters",
         minimum=1,
     )
-    nan_cluster_value = _integer_parameter(
+    nan_cluster_value = integer_argument(
         parameters["nan_cluster_value"],
         "nan_cluster_value",
     )
@@ -396,19 +375,19 @@ def validate_aggregation_parameters(parameters: Mapping[str, Any]) -> dict[str, 
         ),
         "size_factor": _size_factor(parameters["size_factor"]),
         "min_exp": _real_parameter(parameters["min_exp"], "min_exp", minimum=0.0),
-        "window_size": _integer_parameter(
+        "window_size": integer_argument(
             parameters["window_size"],
             "window_size",
             minimum=1,
         ),
-        "chunk_size": _integer_parameter(
+        "chunk_size": integer_argument(
             parameters["chunk_size"],
             "chunk_size",
             minimum=1,
         ),
         "smoothen": _boolean_parameter(parameters["smoothen"], "smoothen"),
         "z_scale": _boolean_parameter(parameters["z_scale"], "z_scale"),
-        "n_neighbours": _integer_parameter(
+        "n_neighbours": integer_argument(
             parameters["n_neighbours"],
             "n_neighbours",
             minimum=1,
@@ -418,12 +397,6 @@ def validate_aggregation_parameters(parameters: Mapping[str, Any]) -> dict[str, 
         "nan_cluster_value": nan_cluster_value,
         **recorded_count_arithmetic(parameters),
     }
-
-
-def artifact_ref_input(raw: Any, label: str) -> ArtifactRef:
-    if not isinstance(raw, dict):
-        raise ValueError(f"{label} artifact reference is malformed")
-    return ArtifactRef.from_dict(raw)
 
 
 def require_exact_record_keys(
@@ -436,15 +409,7 @@ def require_exact_record_keys(
 
 
 def selection_size(root: Any, selection: ArtifactRef) -> int:
-    validated = validate_stored_selection_integrity(
-        root,
-        selection,
-        kind="cell_selection",
-        scope="datastore",
-        assay=None,
-        table_path="cellData",
-    )
-    return int(validated.selected_count)
+    return int(validate_cell_selection(root, selection).selected_count)
 
 
 def true_array_indices(array: Any) -> np.ndarray:
@@ -477,10 +442,7 @@ def load_cell_artifact_values(
     status = inspect_artifact(root, ref)
     if not status.exists or not status.complete:
         raise ValueError("Cell-data artifact is unavailable or incomplete")
-    raw_selection = (status.inputs or {}).get("cell_selection")
-    if not isinstance(raw_selection, dict):
-        raise ValueError("Cell-data artifact has no cell-selection input")
-    selection = ArtifactRef.from_dict(raw_selection)
+    selection = status.input_ref("cell_selection")
     selected_count = selection_size(root, selection)
     canonical_name = value_name or _CELL_VALUE_NAMES.get(ref.kind, "values")
     group = as_zarr_group(root[status.path], name=status.path)

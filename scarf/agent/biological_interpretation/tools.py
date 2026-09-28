@@ -50,6 +50,49 @@ def _check_column(store: Any, column: str, label: str) -> None:
         raise ValueError(f"{label} {column!r} is not present in cell metadata")
 
 
+def _cluster_cell_selection(store: Any, cluster: ArtifactRef) -> ArtifactRef:
+    """Return the exact cell selection recorded by one complete cluster artifact."""
+    status = store.inspect_artifact(cluster)
+    if not getattr(status, "exists", True):
+        raise ValueError("cluster artifact does not exist")
+    if not getattr(status, "complete", False):
+        raise ValueError("cluster artifact is incomplete")
+    raw_selection = (getattr(status, "inputs", None) or {}).get("cell_selection")
+    if not isinstance(raw_selection, Mapping):
+        raise ValueError("cluster artifact has no cell-selection input")
+    cell_selection = ArtifactRef.from_dict(dict(raw_selection))
+    if (
+        cell_selection.scope != "datastore"
+        or cell_selection.kind != "cell_selection"
+        or cell_selection.assay is not None
+    ):
+        raise ValueError("cluster artifact has an invalid cell-selection input")
+    return cell_selection
+
+
+def _require_marker_cluster_link(
+    store: Any,
+    marker: ArtifactRef,
+    cluster: ArtifactRef,
+) -> None:
+    """Require a complete marker table computed from the exact cluster artifact."""
+    status = store.inspect_artifact(marker)
+    if not getattr(status, "exists", True):
+        raise ValueError("marker artifact does not exist")
+    if not getattr(status, "complete", False):
+        raise ValueError("marker artifact is incomplete")
+    stored_clusters = (getattr(status, "inputs", None) or {}).get("clusters")
+    expected_cluster = artifact_reference(cluster)
+    if (
+        not isinstance(stored_clusters, Mapping)
+        or stored_clusters.get("artifact_id") != expected_cluster.artifactId
+        or stored_clusters.get("kind") != expected_cluster.kind
+        or stored_clusters.get("scope") != expected_cluster.scope
+        or stored_clusters.get("assay") != expected_cluster.assay
+    ):
+        raise ValueError("marker artifact is not linked to the exact cluster artifact")
+
+
 async def inspect_cluster_composition(
     ctx: RunContext[BiologicalInterpretationDependencies],
 ) -> ClusterCompositionEvidence:
@@ -84,22 +127,7 @@ async def inspect_cluster_composition(
         raise ValueError("cluster artifact belongs to a different assay")
     if cluster_artifact.scope == "datastore" and cluster_artifact.assay is not None:
         raise ValueError("datastore-scoped cluster artifacts must not name an assay")
-    status = deps.store.inspect_artifact(deps.cluster)
-    if not getattr(status, "exists", True):
-        raise ValueError("cluster artifact does not exist")
-    if not getattr(status, "complete", False):
-        raise ValueError("cluster artifact is incomplete")
-    inputs = getattr(status, "inputs", None) or {}
-    raw_selection = inputs.get("cell_selection")
-    if not isinstance(raw_selection, Mapping):
-        raise ValueError("cluster artifact has no cell-selection input")
-    cell_selection = ArtifactRef.from_dict(dict(raw_selection))
-    if (
-        cell_selection.scope != "datastore"
-        or cell_selection.kind != "cell_selection"
-        or cell_selection.assay is not None
-    ):
-        raise ValueError("cluster artifact has an invalid cell-selection input")
+    cell_selection = _cluster_cell_selection(deps.store, deps.cluster)
     if (
         deps.cellSelection is not None
         and core_artifact_reference(deps.cellSelection) != cell_selection
@@ -366,25 +394,10 @@ async def inspect_cluster_markers(
         raise ModelRetry("marker must identify a marker_table artifact")
     if deps.markerAssay is not None and marker_artifact.assay != deps.markerAssay:
         raise ModelRetry("marker artifact belongs to a different assay")
-    if hasattr(deps.store, "inspect_artifact"):
-        marker_status = deps.store.inspect_artifact(deps.marker)
-        if not getattr(marker_status, "exists", True):
-            raise ModelRetry("marker artifact does not exist")
-        if not getattr(marker_status, "complete", False):
-            raise ModelRetry("marker artifact is incomplete")
-        marker_inputs = getattr(marker_status, "inputs", None) or {}
-        stored_clusters = marker_inputs.get("clusters")
-        expected_cluster = artifact_reference(deps.cluster)
-        if (
-            not isinstance(stored_clusters, Mapping)
-            or stored_clusters.get("artifact_id") != expected_cluster.artifactId
-            or stored_clusters.get("kind") != expected_cluster.kind
-            or stored_clusters.get("scope") != expected_cluster.scope
-            or stored_clusters.get("assay") != expected_cluster.assay
-        ):
-            raise ModelRetry(
-                "marker artifact is not linked to the exact cluster artifact"
-            )
+    try:
+        _require_marker_cluster_link(deps.store, deps.marker, deps.cluster)
+    except ValueError as exc:
+        raise ModelRetry(str(exc)) from exc
 
     frame = deps.store.get_markers(
         deps.marker,

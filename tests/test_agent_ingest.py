@@ -9,6 +9,7 @@ import zarr
 from scipy.sparse import csr_matrix
 
 from scarf.agent.ingest import detect_format, ingest
+from scarf.agent.ingest.common import default_convert_destination
 from scarf.agent.types import Decision
 from scarf.readers import inspect_h5ad
 
@@ -415,6 +416,22 @@ def test_ingest_overwrite_true_replaces_destination(tmp_path: Path) -> None:
     assert not sentinel.exists()
 
 
+def test_default_destination_names_directories_and_drops_gzip(
+    tmp_path: Path,
+) -> None:
+    matrix_dir = tmp_path / "filtered_feature_bc_matrix"
+    matrix_dir.mkdir()
+    assert default_convert_destination(matrix_dir) == tmp_path / (
+        "filtered_feature_bc_matrix.zarr"
+    )
+    assert default_convert_destination(tmp_path / "counts.mtx.gz") == (
+        tmp_path / "counts.zarr"
+    )
+    assert default_convert_destination(tmp_path / "counts.h5ad") == (
+        tmp_path / "counts.zarr"
+    )
+
+
 def test_ingest_derives_destination_without_creating_workflow(tmp_path: Path) -> None:
     path = tmp_path / "counts.h5ad"
     _write_h5ad(path, np.array([[1, 0], [0, 2]], dtype=np.uint16))
@@ -672,6 +689,42 @@ def test_ingest_mtx_conversion_failure_closes_reader(
     assert created_readers[0].close_calls == 1
     assert any("partial store" in note for note in result.notes)
     assert destination.is_dir()
+
+
+def test_ingest_writer_constructor_failure_reports_partial_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
+    readers = importlib.import_module("scarf.readers.mtx")
+    writers = importlib.import_module("scarf.writers.cellranger")
+    source = tmp_path / "matrix-market"
+    source.mkdir()
+    destination = tmp_path / "out.zarr"
+
+    class FakeReader:
+        def __init__(self, _candidate: object) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    class OpeningWriter:
+        def __init__(self, _reader: FakeReader, *, zarr_loc: str) -> None:
+            # Writers open (and may overwrite) the destination before dumping.
+            Path(zarr_loc).mkdir()
+            raise ValueError("invalid feature table")
+
+    monkeypatch.setattr(readers, "inspect_mtx", lambda _path: (object(),))
+    monkeypatch.setattr(readers, "MtxReader", FakeReader)
+    monkeypatch.setattr(writers, "MtxToZarr", OpeningWriter)
+
+    result = ingest(path=source, zarrPath=destination)
+
+    assert result.status == "failed"
+    assert destination.is_dir()
+    assert any("partial store" in note for note in result.notes)
 
 
 def test_ingest_seurat_success_closes_reader(

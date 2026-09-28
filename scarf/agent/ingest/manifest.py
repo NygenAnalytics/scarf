@@ -14,6 +14,7 @@ from ...readers._h5ad_inspect import (
     _matrix_candidates,
     _MatrixCandidate,
     _node_length,
+    _read_text_scalar,
     _select_matrix,
     inspect_h5ad,
 )
@@ -251,7 +252,7 @@ def is_author_label_column(name: str) -> bool:
 
 def _is_missing(values: np.ndarray) -> np.ndarray:
     if values.dtype.kind in {"f", "c"}:
-        return cast(np.ndarray, ~np.isfinite(values))
+        return ~np.isfinite(values)
     if values.dtype.kind in {"S", "U"}:
         return np.asarray([not _as_text(value) for value in values], dtype=bool)
     if values.dtype.kind != "O":
@@ -569,21 +570,6 @@ def _inventory_keys(
     held_out = [name for name in names if hide_author_labels and _is_author_label(name)]
     visible = [name for name in names if name not in held_out]
     return visible[:max_items], max(0, len(visible) - max_items), len(held_out)
-
-
-def _read_text_scalar(
-    h5: h5py.File,
-    paths: tuple[str, ...],
-    *,
-    max_length: int = 500,
-) -> str | None:
-    for path in paths:
-        node = h5.get(path)
-        if not isinstance(node, h5py.Dataset) or node.shape not in {(), (1,)}:
-            continue
-        value = node[()] if node.shape == () else node[0]
-        return _as_text(value)[:max_length]
-    return None
 
 
 def _read_text_vector(
@@ -904,14 +890,14 @@ def inspect_h5ad_manifest(
             author_label_policy=author_label_policy,
             max_items=max_inventory_items,
         )
-        schema_version = _read_text_scalar(
-            h5,
-            ("uns/schema_version", "uns/cellxgene_schema_version"),
-        )
-        schema_reference = _read_text_scalar(
-            h5,
-            ("uns/schema_reference", "uns/cellxgene_schema_reference"),
-        )
+        schema_version = _read_text_scalar(h5, "uns/schema_version", 500)
+        if schema_version is None:
+            schema_version = _read_text_scalar(h5, "uns/cellxgene_schema_version", 500)
+        schema_reference = _read_text_scalar(h5, "uns/schema_reference", 500)
+        if schema_reference is None:
+            schema_reference = _read_text_scalar(
+                h5, "uns/cellxgene_schema_reference", 500
+            )
         declared_batch_columns = _read_text_vector(
             h5,
             ("uns/batch_condition",),

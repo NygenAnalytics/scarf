@@ -98,11 +98,7 @@ def _is_string_like(dtype: np.dtype) -> bool:
 
 
 def _default_fill_value(dtype: np.dtype) -> object:
-    if dtype.kind == "b":
-        return False
-    if dtype.kind in {"i", "u", "f", "c"}:
-        return 0
-    return 0
+    return False if dtype.kind == "b" else 0
 
 
 def _resolve_fill_value(array: zarr.Array, *, numeric_1d: bool) -> object | None:
@@ -311,12 +307,12 @@ def repack_store(
     """Copy prepared data, or rebuild raw data, into a fresh Zarr v3 destination."""
     from ..assay import RNAassay, preset_assay_types
     from ..assay.classification import (
-        DEFAULT_PERCENT_PATTERNS,
+        default_feature_sets,
         is_rna_assay_type,
         lookup_persisted_assay_type,
     )
+    from ..features.gene_families import DEFAULT_PERCENT_PATTERNS
     from ..metadata import MetaData
-    from ..assay.classification import default_feature_sets
 
     if locations_overlap(input_path, output_path):
         raise ValueError("input_path and output_path must not overlap")

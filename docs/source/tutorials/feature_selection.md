@@ -74,36 +74,23 @@ Scarf applies the following case-insensitive regular expression to gene names:
 ```
 
 Matching starts at the beginning of the name.
+Each family is defined once in `scarf.features.gene_families`; `ribosomal` covers RPS, RPL, MRPS, and MRPL.
 Count how many genes in this dataset fall into each family:
 
 ```{code-cell} ipython3
-default_blacklist = (
-    "^MT-|^RPS|^RPL|^MRPS|^MRPL|^CCN|^HLA-|^H2-|^HIST|"
-    "^XIST$|^DDX3Y$|^USP9Y$|^EIF1AY$|^KDM5D$|^SRY$|^ZFY$|^UTY$|^TMSB4Y$|^NLGN4Y$"
-)
-exclusion_families = {
-    "mitochondrial (MT-)": r"^MT-",
-    "ribosomal protein (RPS/RPL)": r"^RPS|^RPL",
-    "mitoribosomal (MRPS/MRPL)": r"^MRPS|^MRPL",
-    "cell cycle (CCN)": r"^CCN",
-    "HLA": r"^HLA-",
-    "H2": r"^H2-",
-    "histone (HIST)": r"^HIST",
-    "sex-linked": (
-        r"^XIST$|^DDX3Y$|^USP9Y$|^EIF1AY$|^KDM5D$"
-        r"|^SRY$|^ZFY$|^UTY$|^TMSB4Y$|^NLGN4Y$"
-    ),
-}
+from scarf.features.gene_families import GENE_FAMILY_PATTERNS
+from scarf.features.variability import DEFAULT_HVG_BLACKLIST
+
 family_counts = pd.Series(
     {
         name: len(ds.RNA.feats.grep(pattern))
-        for name, pattern in exclusion_families.items()
+        for name, pattern in GENE_FAMILY_PATTERNS.items()
     },
     name="genes matching pattern",
 )
 print(
     "Default blacklist matches:",
-    len(ds.RNA.feats.grep(default_blacklist)),
+    len(ds.RNA.feats.grep(DEFAULT_HVG_BLACKLIST)),
 )
 family_counts
 ```

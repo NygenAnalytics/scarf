@@ -11,7 +11,6 @@ from scarf.metrics.association import (
     directional_mapping,
     eta_squared,
     report_confounding,
-    report_technical_nesting,
     spearman_rho,
 )
 
@@ -172,18 +171,6 @@ def test_association_pair_dispatches_kinds() -> None:
         )["measure"]
         == "spearmanRho"
     )
-
-
-def test_report_technical_nesting_finds_nested_batch() -> None:
-    columns = {
-        "sample": np.array(["s1", "s1", "s2", "s2", "s3", "s3"]),
-        "batch": np.array(["b1", "b1", "b1", "b1", "b2", "b2"]),
-        "chemistry": np.array(["v3"] * 6),
-    }
-    reports = report_technical_nesting(columns)
-    assert len(reports) == 1
-    assert (reports[0]["left"], reports[0]["right"]) == ("sample", "batch")
-    assert reports[0]["nesting"] == "leftInRight"
 
 
 def test_coefficient_estimability_detects_alias() -> None:

@@ -9,6 +9,14 @@ from typing import Any, Hashable, Literal
 import numpy as np
 import pandas as pd
 
+from ..features.statistical import (
+    design_fingerprints,
+    distinct_label_keys,
+    select_study_design_rows,
+    tested_column_identity,
+    tested_feature_identity,
+    value_fingerprint,
+)
 from ..metadata.rows import read_metadata_missing_rows, read_metadata_rows
 from ..metadata.selection import (
     resolve_grouping as resolve_grouping_source,
@@ -18,8 +26,6 @@ from ..storage.artifacts import (
     ArtifactRef,
     artifact_group,
     callable_identity,
-    fingerprint_array,
-    fingerprint_strings,
     inspect_artifact,
     provenance_hash,
 )
@@ -44,24 +50,21 @@ from ._data import (
 )
 from ._deps import require_matplotlib, require_seaborn
 from ._display import resolve_categorical_scale
-from ._figure import LegendSpec, PlotResult, normalize_axes_target
-from ..utils.arrays import sort_categories
+from ._figure import (
+    LegendSpec,
+    PlotResult,
+    close_figures_on_error,
+    normalize_axes_target,
+)
 from ._style import (
     MAX_FIGURE_WIDTH_INCHES,
     apply_figure_chrome,
     capped_figsize,
-    categorical_color_map,
     continuous_norm,
+    resolve_category_scale,
+    resolve_color_limits,
     theme_context,
 )
-
-
-def _value_fingerprint(values: Any) -> str:
-    """Match the stable value identity used by statistical-test results."""
-    array = np.asarray(values)
-    if array.dtype.kind in {"O", "S", "U"}:
-        return fingerprint_strings(array)
-    return fingerprint_array(array)
 
 
 def _fetch_metadata_series(
@@ -71,7 +74,6 @@ def _fetch_metadata_series(
 ) -> tuple[np.ndarray, str]:
     """Return mask-aware metadata values and their stable tested-key identity."""
     raw_values = read_metadata_rows(store.cells, column, cell_indices)
-    raw_value_fingerprint = _value_fingerprint(raw_values)
     values = raw_values
     missing = read_metadata_missing_rows(store.cells, column, cell_indices)
     if missing is not None:
@@ -86,17 +88,7 @@ def _fetch_metadata_series(
             else:
                 values = np.asarray(values, dtype=object).copy()
             values[missing] = np.nan
-    identity = provenance_hash(
-        {
-            "source": "cell_metadata",
-            "column": column,
-            "values_fingerprint": raw_value_fingerprint,
-            "missing_fingerprint": (
-                _value_fingerprint(missing) if missing is not None else None
-            ),
-        }
-    )
-    return values, identity
+    return values, tested_column_identity(column, raw_values, missing)
 
 
 def _fetch_series(
@@ -132,15 +124,13 @@ def _fetch_series(
             cell_indices,
             normalization=normalization,
         )
-        identity = provenance_hash(
-            {
-                "source": "feature",
-                "assay": resolved.assay,
-                "ids": tuple(str(identifier) for identifier in resolved.ids),
-                "reduction": resolved.reduction,
-            }
+        return (
+            mat[:, 0],
+            resolved.label,
+            True,
+            tested_feature_identity(resolved),
+            resolved.assay,
         )
-        return mat[:, 0], resolved.label, True, identity, resolved.assay
     values, identity = _fetch_metadata_series(store, str(key), cell_indices)
     return (
         values,
@@ -162,20 +152,6 @@ def _subsample_frame(
         return df, False
     idx = rng.choice(len(df), size=max_points, replace=False)
     return df.iloc[np.sort(idx)], True
-
-
-def _group_palette(
-    order: list[Any],
-    categorical_scale: CategoricalScale | None,
-) -> dict[Any, str]:
-    return categorical_color_map(
-        order,
-        palette=categorical_scale.palette if categorical_scale else None,
-        palette_name=(
-            categorical_scale.palette_name if categorical_scale else "default"
-        ),
-        missing_label=None,
-    )
 
 
 @contextmanager
@@ -477,10 +453,9 @@ def _mean_color_limits(
 ) -> tuple[list[tuple[float, float]], tuple[float, float]]:
     """Resolve per-panel and reference colour limits from group means.
 
-    ``scope="shared"`` gives every stacked row the same limits derived from all
-    pooled group means, so the rows share one continuous scale. Explicit
-    ``vmin`` / ``vmax`` override quantile or observed bounds; a ``vcenter``
-    pivot extends derived bounds so diverging maps work on one-sided data.
+    ``scope="shared"`` gives every stacked row the limits that
+    :func:`~scarf.plotting._style.resolve_color_limits` derives from all pooled
+    group means, so the rows share one continuous scale.
 
     ``scope="panel"`` rescales each row independently by the strict min/max of
     that row's own group means, so the lowest mean maps to 0 and the highest to
@@ -511,49 +486,7 @@ def _mean_color_limits(
                 limits.append((float(np.nanmin(finite)), float(np.nanmax(finite))))
         return limits, (0.0, 1.0)
 
-    def resolve(values: np.ndarray) -> tuple[float, float]:
-        finite = np.asarray(values, dtype=np.float64)
-        finite = finite[np.isfinite(finite)]
-        if finite.size == 0:
-            return 0.0, 1.0
-        if color_scale.quantiles is not None:
-            q0, q1 = color_scale.quantiles
-            lo = float(np.nanquantile(finite, q0))
-            hi = float(np.nanquantile(finite, q1))
-        else:
-            lo = float(np.nanmin(finite))
-            hi = float(np.nanmax(finite))
-        if color_scale.vmin is not None:
-            lo = color_scale.vmin
-        if color_scale.vmax is not None:
-            hi = color_scale.vmax
-        if hi < lo:
-            raise ValueError("vmax must be greater than or equal to vmin")
-        if color_scale.vcenter is not None:
-            if not lo < color_scale.vcenter < hi:
-                if color_scale.vmin is not None or color_scale.vmax is not None:
-                    raise ValueError(
-                        "vcenter must be strictly between the resolved color limits "
-                        "when vmin/vmax are explicit"
-                    )
-                lo = min(lo, color_scale.vcenter)
-                hi = max(hi, color_scale.vcenter)
-                span = hi - lo
-                eps = max(span * 1e-6, 1e-9)
-                if color_scale.vcenter <= lo:
-                    lo = color_scale.vcenter - eps
-                if color_scale.vcenter >= hi:
-                    hi = color_scale.vcenter + eps
-        if hi == lo:
-            # Quantiles commonly collapse for sparse genes (for example when
-            # most group means are zero). Keep the tied value at the midpoint
-            # while allowing outlying means to clip to a colormap endpoint.
-            pad = max(0.5, abs(lo) * 0.05)
-            lo -= pad
-            hi += pad
-        return lo, hi
-
-    reference = resolve(pooled)
+    reference = resolve_color_limits(pooled, color_scale)
     return [reference] * len(arrays), reference
 
 
@@ -855,14 +788,6 @@ def _annotate_distribution_stats(
     return any_drawn
 
 
-def _render_color_limits(lo: float, hi: float) -> tuple[float, float]:
-    """Return colourbar limits, padding degenerate scales so a bar renders."""
-    if hi > lo:
-        return lo, hi
-    pad = max(0.5, abs(lo) * 0.05)
-    return lo - pad, hi + pad
-
-
 def _mean_colorbar_label(
     color_scale: ColorScale,
     row_standardize: bool,
@@ -908,6 +833,7 @@ def _mean_group_palette(
     return palette_map
 
 
+@close_figures_on_error
 def distribution(
     store: Any,
     keys: (
@@ -1214,11 +1140,7 @@ def distribution(
         status = inspect_artifact(store.zw, value_artifact)
         if not status.complete:
             raise ValueError("Cell-cycle artifact is unavailable or incomplete")
-        value_selection = _artifact_cell_selection(
-            store,
-            value_artifact,
-            label="Cell-cycle score",
-        )
+        value_selection = _artifact_cell_selection(store, value_artifact)
         value_cell_indices = read_stored_selection_indices(
             store.zw,
             value_selection,
@@ -1413,26 +1335,16 @@ def distribution(
             category_values=groups_arr,
             groups=groups,
         )
-    dropped_sample_cells = 0
-    if sample_arr is not None:
-        valid_sample = valid_category_mask(
-            sample_arr,
-            missing_mask=sample_missing,
-        )
-        dropped_sample_cells = int((selection_mask & ~valid_sample).sum())
-        selection_mask &= valid_sample
+    # Statistical testing selects sample and pair values the same way. A
+    # selected cell without a pair raises, so no cell is dropped for its pair.
+    selection_mask, dropped_sample_cells = select_study_design_rows(
+        selection_mask,
+        samples=sample_arr,
+        sample_missing=sample_missing,
+        pairs=pair_arr,
+        pair_missing=pair_missing,
+    )
     dropped_pair_cells = 0
-    if pair_arr is not None:
-        valid_pair = valid_category_mask(
-            pair_arr,
-            missing_mask=pair_missing,
-        )
-        dropped_pair_cells = int((selection_mask & ~valid_pair).sum())
-        if dropped_pair_cells:
-            raise ValueError(
-                "pair values must be present for every selected cell when "
-                "stats_results uses a paired study design"
-            )
     dropped_split_cells = 0
     if split_arr is not None:
         valid_split = valid_category_mask(
@@ -1443,28 +1355,23 @@ def distribution(
         selection_mask &= valid_split
     if not selection_mask.any():
         raise ValueError("No cells remain after distribution selections")
-    if not has_grouping:
-        group_order = None
-    elif groups is None:
-        observed_values = list(pd.unique(groups_arr[selection_mask]))
-        if categorical_scale is not None and categorical_scale.order is not None:
-            observed = set(observed_values)
-            missing = [
-                value for value in observed if value not in categorical_scale.order
-            ]
-            if missing:
-                raise ValueError(
-                    "categorical_scale.order is missing observed values: "
-                    + ", ".join(map(str, missing[:10]))
+    group_scale: CategoricalScale | None = None
+    if has_grouping:
+        # Requested groups set the order; a caller's scale still sets colors.
+        group_scale = resolve_category_scale(
+            groups_arr[selection_mask],
+            (
+                categorical_scale
+                if groups is None
+                else replace(
+                    categorical_scale or CategoricalScale(),
+                    order=tuple(group_order or ()),
                 )
-            group_order = [
-                value for value in categorical_scale.order if value in observed
-            ]
-        else:
-            group_order = sort_categories(observed_values)
+            ),
+        )
+        group_order = list(group_scale.order or ())
     else:
-        observed = set(pd.unique(groups_arr[selection_mask]))
-        group_order = [value for value in group_order or [] if value in observed]
+        group_order = None
 
     selected_cell_idx = np.asarray(base_cell_idx[selection_mask], dtype=np.int64)
     series_list = [
@@ -1485,50 +1392,39 @@ def distribution(
     if pair_arr is not None:
         pair_arr = pair_arr[selection_mask]
     n = int(selection_mask.sum())
-    cell_selection_fingerprint = _value_fingerprint(selected_cell_idx)
-    group_fingerprint = _value_fingerprint(groups_arr)
-    sample_fingerprint = (
-        _value_fingerprint(sample_arr) if sample_arr is not None else None
+    fingerprints = design_fingerprints(
+        selected_cell_idx,
+        groups_arr,
+        sample_arr,
+        pair_arr,
     )
-    pair_fingerprint = _value_fingerprint(pair_arr) if pair_arr is not None else None
     any_feature = any(is_feature for _, _, is_feature, _, _ in series_list)
     all_features = all(is_feature for _, _, is_feature, _, _ in series_list)
 
-    panel_keys: list[Hashable] = [label for _, label, _, _, _ in series_list]
-    if len(set(panel_keys)) != len(panel_keys):
-        panel_keys = list(range(len(panel_keys)))
+    # Statistical results key their tables by these panel keys as text.
+    panel_keys: list[Hashable] = list(
+        distinct_label_keys([label for _, label, _, _, _ in series_list])
+    )
 
     n_groups = 1 if not has_grouping else len(group_order or [])
     n_panels = len(panel_keys)
-    palette = (
-        _group_palette(list(group_order), categorical_scale)
-        if has_grouping and group_order is not None
-        else None
-    )
+    palette = group_scale.palette if group_scale is not None else None
     split_order: list[Any] | None = None
     split_palette: dict[Any, str] | None = None
+    resolved_split_scale: CategoricalScale | None = None
     if split_arr is not None:
-        observed_split = list(pd.unique(split_arr))
-        if split_scale is not None and split_scale.order is not None:
-            missing_split = [
-                value for value in observed_split if value not in split_scale.order
-            ]
-            if missing_split:
-                raise ValueError(
-                    "split_scale.order is missing observed values: "
-                    + ", ".join(map(str, missing_split[:10]))
-                )
-            split_order = [
-                value for value in split_scale.order if value in set(observed_split)
-            ]
-        else:
-            split_order = sort_categories(observed_split)
+        resolved_split_scale = resolve_category_scale(
+            split_arr,
+            split_scale,
+            context="split_scale",
+        )
+        split_order = list(resolved_split_scale.order or ())
         if len(split_order) != 2:
             raise ValueError(
                 "split_by must contain exactly two observed categories; "
                 f"found {len(split_order)}"
             )
-        split_palette = _group_palette(split_order, split_scale)
+        split_palette = resolved_split_scale.palette
     # Width scales with category count so rotated labels stay readable; wrap
     # to extra rows before exceeding the page width.
     width_cap = (
@@ -1537,21 +1433,31 @@ def distribution(
     if width_cap <= 0:
         raise ValueError("max_figure_width must be positive or None")
     panel_width = min(width_cap, max(3.6, 0.55 * max(n_groups, 1) + 1.8))
-    if figsize is None and target is None:
-        n_columns = (
-            1
-            if kind == "stacked_violin"
-            else max(1, min(n_panels, int(width_cap // panel_width) or 1))
-        )
-        n_rows = int(np.ceil(n_panels / n_columns))
-        row_height = 1.3 if kind == "stacked_violin" else 4.0
-        figsize = capped_figsize(
-            panel_width * n_columns,
-            max(2.4, row_height * n_rows + 0.8),
-            max_width=max_figure_width,
-        )
+    stacked = kind == "stacked_violin"
+    horizontal_stack = stacked and orientation == "horizontal"
+    if stacked:
+        # Stacked panels share the category axis: one column of vertical
+        # violins, or one row of horizontal ones.
+        n_columns = n_panels if horizontal_stack else 1
+    elif figsize is None and target is None:
+        n_columns = max(1, min(n_panels, int(width_cap // panel_width) or 1))
     else:
         n_columns = n_panels
+    if figsize is None and target is None:
+        if horizontal_stack:
+            figsize = capped_figsize(
+                max(2.4, 1.3 * n_panels + 0.8),
+                panel_width,
+                max_width=max_figure_width,
+            )
+        else:
+            n_rows = int(np.ceil(n_panels / n_columns))
+            row_height = 1.3 if stacked else 4.0
+            figsize = capped_figsize(
+                panel_width * n_columns,
+                max(2.4, row_height * n_rows + 0.8),
+                max_width=max_figure_width,
+            )
 
     # Mean colouring needs a small prepass to resolve shared colour limits.
     # Retain only one Series of group means per panel, not every cell-level
@@ -1577,30 +1483,23 @@ def distribution(
             panel_group_means,
             color_scale,
         )
-    # Limits actually drawn on the colourbar. Degenerate scales (all group
-    # means equal) are padded symmetrically so the key is always visible.
+    # Limits drawn on the colourbar. Panel scope colours each row by its own
+    # 0-to-1 relative scale, so the single colorbar shows the unit range.
     render_limits: tuple[float, float] | None = None
     if mean_limits is not None:
-        if color_scale.scope == "shared":
-            base = mean_limits[0]
-        else:
-            # Panel scope colours each row by its own 0-to-1 relative scale, so
-            # the single colorbar shows the unit range.
-            base = (0.0, 1.0)
-        render_limits = _render_color_limits(*base)
-
-    fig, axes, owns = normalize_axes_target(
-        target,
-        panel_keys=panel_keys,
-        figsize=figsize,
-        n_columns=n_columns,
-    )
+        render_limits = mean_limits[0] if color_scale.scope == "shared" else (0.0, 1.0)
 
     rng = np.random.default_rng(seed)
     any_subsampled = False
     y_limits: list[tuple[float, float]] = []
     panel_tables: list[tuple[str, pd.DataFrame]] = []
     with theme_context(theme):
+        fig, axes, owns = normalize_axes_target(
+            target,
+            panel_keys=panel_keys,
+            figsize=figsize,
+            n_columns=n_columns,
+        )
         for panel_index, (
             (vals, label, is_feature, _identity, _source_assay),
             panel_key,
@@ -1768,11 +1667,12 @@ def distribution(
                         ),
                     )
                     ax.set_ylabel(resolved_group_by or "")
-            if kind == "stacked_violin" and panel_index < n_panels - 1:
-                if orientation == "vertical":
+            # Scarf's stacked layout shares one category axis across panels.
+            if stacked and owns:
+                if not horizontal_stack and panel_index < n_panels - 1:
                     ax.tick_params(axis="x", labelbottom=False)
                     ax.set_xlabel("")
-                else:
+                elif horizontal_stack and panel_index > 0:
                     ax.tick_params(axis="y", labelleft=False)
                     ax.set_ylabel("")
             finite = df["value"].to_numpy(dtype=np.float64)
@@ -1859,7 +1759,7 @@ def distribution(
                     result_for_panel,
                     label=str_label,
                     expected_identity=expected_identity,
-                    expected_value_fingerprint=_value_fingerprint(
+                    expected_value_fingerprint=value_fingerprint(
                         np.asarray(_vals, dtype=np.float64)
                     ),
                     expected_source_assay=expected_source_assay,
@@ -1870,15 +1770,15 @@ def distribution(
                     group_order=display_order,
                     sample_by=sample_by,
                     pair_by=plot_pair_by,
-                    sample_fingerprint=sample_fingerprint,
-                    pair_fingerprint=pair_fingerprint,
+                    sample_fingerprint=fingerprints.sample_fingerprint,
+                    pair_fingerprint=fingerprints.pair_fingerprint,
                     sample_stat=sample_stat,
                     expression_cutoff=expression_cutoff,
                     normalization=normalization,
                     normalization_method=expected_normalization_method,
                     size_factor=expected_size_factor,
-                    cell_selection_fingerprint=cell_selection_fingerprint,
-                    group_fingerprint=group_fingerprint,
+                    cell_selection_fingerprint=fingerprints.cell_selection_fingerprint,
+                    group_fingerprint=fingerprints.group_fingerprint,
                 )
                 if compatibility_issue is not None:
                     _warn_once(
@@ -2021,27 +1921,12 @@ def distribution(
             ),
         )
         scale_specs: tuple[Any, ...] = (resolved_color_scale,)
-    elif split_order is not None:
+    elif resolved_split_scale is not None:
         legend_specs = (LegendSpec(kind="categorical", label=split_by or "split"),)
-        scale_specs = (
-            CategoricalScale(
-                order=tuple(split_order),
-                palette=split_palette,
-                labels=(split_scale.labels if split_scale is not None else None),
-                missing_color=(
-                    split_scale.missing_color if split_scale is not None else "#bdbdbd"
-                ),
-                missing_label=(
-                    split_scale.missing_label if split_scale is not None else "NA"
-                ),
-                palette_name=(
-                    split_scale.palette_name if split_scale is not None else "default"
-                ),
-            ),
-        )
+        scale_specs = (resolved_split_scale,)
     else:
         legend_specs = (LegendSpec(kind="distribution", label=kind),)
-        scale_specs = () if categorical_scale is None else (categorical_scale,)
+        scale_specs = () if group_scale is None else (group_scale,)
 
     result = PlotResult(
         figure=fig,

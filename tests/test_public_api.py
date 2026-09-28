@@ -23,7 +23,6 @@ _EXPECTED_EXPORTS = {
     "DataStoreMerge": "scarf.merge",
     "EnrichmentResult": "scarf.features.enrichment.results",
     "FateMappingResult": "scarf.trajectory.results",
-    "GffReader": "scarf.features.genomic.gff",
     "H5adInspectResult": "scarf.readers",
     "H5adImportResult": "scarf.writers",
     "H5adReader": "scarf.readers",
@@ -49,16 +48,14 @@ _EXPECTED_EXPORTS = {
     "clean_array": "scarf.utils",
     "configure_output": "scarf.utils",
     "controlled_compute": "scarf.utils",
-    "coordinate_melding": "scarf.features.genomic.melding",
     "create_zarr_count_assay": "scarf.writers",
     "create_zarr_dataset": "scarf.writers",
     "create_zarr_obj_array": "scarf.writers",
     "chunked_to_zarr": "scarf.writers",
-    "get_log_level": "scarf.utils",
     "inspect_h5ad": "scarf.readers",
     "inspect_mtx": "scarf.readers",
     "inspect_seurat": "scarf.readers",
-    "load_zarr": "scarf.utils",
+    "load_zarr": "scarf.storage.stores",
     "logger": "scarf.utils",
     "permute_into_chunks": "scarf.utils",
     "read_gmt": "scarf.features.enrichment.net",
@@ -67,7 +64,6 @@ _EXPECTED_EXPORTS = {
     "set_verbosity": "scarf.utils",
     "compute_with_progress": "scarf.utils",
     "subset_assay_zarr": "scarf.writers",
-    "system_call": "scarf.utils",
     "to_h5ad": "scarf.writers",
     "to_mtx": "scarf.writers",
     "tqdmbar": "scarf.utils",
@@ -99,17 +95,12 @@ _EXPECTED_UTILS_EXPORTS = [
     "tqdm_params",
     "configure_output",
     "set_verbosity",
-    "get_log_level",
-    "system_call",
     "rescale_array",
     "clean_array",
-    "load_zarr",
     "permute_into_chunks",
     "compute_with_progress",
     "controlled_compute",
-    "iter_column_blocks",
     "process_rss_mb",
-    "rss_peak_tracker",
     "array_digest",
     "rolling_window",
 ]
@@ -120,7 +111,6 @@ _EXPECTED_PLOTTING_EXPORTS = (
     "ColorScale",
     "DensityOverlay",
     "FeatureRef",
-    "FeatureSummary",
     "Highlight",
     "LegendSpec",
     "NormalizationSpec",
@@ -137,7 +127,6 @@ _EXPECTED_PLOTTING_EXPORTS = (
     "THEMES",
     "cluster_tree",
     "cluster_connectivity",
-    "collect_legends",
     "compose_results",
     "composition",
     "distribution",
@@ -157,7 +146,6 @@ _EXPECTED_PLOTTING_EXPORTS = (
     "modality_weights",
     "pseudotime_heatmap",
     "qc",
-    "register_theme",
     "run_recipe",
     "theme_context",
 )
@@ -245,7 +233,7 @@ print(json.dumps({{
         "heavyModules": [],
         "plotsInDir": False,
         "plottingInDir": False,
-        "scarfModules": ["scarf"],
+        "scarfModules": ["scarf", "scarf._facade"],
         "versionIsSet": True,
     }
 
@@ -277,15 +265,12 @@ print(json.dumps({{
 
 def test_clustering_package_is_lazy():
     exports = [
-        "BalancedCut",
         "CoalesceTree",
         "ParisClusterDiagnostic",
         "ParisClusteringResult",
         "adaptive_cut",
-        "balanced_cut",
         "leiden_membership",
         "make_digraph",
-        "paris_dendrogram",
         "straight_cut",
     ]
     result = _run_probe(
@@ -406,7 +391,7 @@ def test_domain_packages_export_canonical_objects():
             "ParisClusteringResult",
         ): "scarf.clustering.paris_multiscale",
         ("scarf.clustering", "adaptive_cut"): "scarf.clustering.paris_multiscale",
-        ("scarf.embeddings", "run_harmony"): "scarf.embeddings.harmony",
+        ("scarf.embeddings", "fit_harmony"): "scarf.embeddings.harmony",
         ("scarf.features", "binned_sampling"): "scarf.features.scoring",
         ("scarf.features", "fit_lowess"): "scarf.features.variability",
         (
@@ -418,8 +403,6 @@ def test_domain_packages_export_canonical_objects():
             "scarf.features",
             "select_highly_variable_features",
         ): "scarf.features.variability",
-        ("scarf.features", "GffReader"): "scarf.features.genomic.gff",
-        ("scarf.features", "coordinate_melding"): "scarf.features.genomic.melding",
         ("scarf.mapping", "MappingReference"): "scarf.mapping.reference",
         ("scarf.mapping", "MappingResult"): "scarf.mapping.models",
         (
@@ -585,7 +568,7 @@ cases = (
     ("scarf.merge", "DataStoreMerge"),
     ("scarf.utils", "clean_array"),
     ("scarf.neighbors", "calc_snn"),
-    ("scarf.clustering", "balanced_cut"),
+    ("scarf.clustering", "straight_cut"),
     ("scarf.embeddings", "initial_embedding"),
     ("scarf.trajectory", "PseudotimeScoreResult"),
     ("scarf.plotting", "embedding"),
@@ -602,6 +585,53 @@ for module_name, export_name in cases:
         ],
         check=True,
     )
+
+
+def test_lazy_facade_binding_keeps_patched_exports():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import scarf.readers as readers
+
+patched = object()
+readers.H5adReader = patched
+assert readers.inspect_h5ad.__module__ == "scarf.readers"
+assert readers.H5adReader is patched
+""",
+        ],
+        check=True,
+    )
+
+
+def test_lazy_facades_rename_only_objects_they_own():
+    result = _run_probe(
+        """
+import json
+
+import loguru
+
+import scarf
+import scarf.merge as merge
+import scarf.utils as utils
+import scarf.writers as writers
+
+shared = scarf.ArtifactRef.__getstate__
+exports = (merge.MergePlan, writers.H5adImportResult, utils.logger)
+print(json.dumps({
+    "exportModules": [value.__module__ for value in exports[:2]],
+    "loggerPatched": "__module__" in vars(loguru.logger),
+    "sharedModule": shared.__module__,
+}))
+"""
+    )
+
+    assert result == {
+        "exportModules": ["scarf.merge", "scarf.writers"],
+        "loggerPatched": False,
+        "sharedModule": "dataclasses",
+    }
 
 
 def test_zarr_warning_filter_does_not_make_import_eager():

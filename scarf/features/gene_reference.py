@@ -7,7 +7,7 @@ import urllib.request
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TextIO
+from typing import TextIO
 
 __all__ = [
     "GeneReference",
@@ -18,15 +18,12 @@ __all__ = [
     "load_reference",
     "parse_gff3_genes",
     "prefix_species",
-    "reference_summary",
+    "species_for_id",
     "species_registry",
-    "write_reference_fixture",
+    "strip_ensembl_version",
 ]
 
 _ENSEMBL_GFF3 = "https://ftp.ensembl.org/pub/current_gff3/{species}/"
-_ENSEMBL_GENOMES_GFF3 = (
-    "https://ftp.ensemblgenomes.ebi.ac.uk/pub/{division}/current/gff3/{species}/"
-)
 _GENE_TYPES = frozenset({"gene", "ncRNA_gene", "pseudogene"})
 _GFF_NAME = re.compile(
     r"^(?P<label>[^.]+)\.(?P<assembly>[^.]+)\.(?P<release>\d+)\.gff3\.gz$"
@@ -35,13 +32,11 @@ _GFF_NAME = re.compile(
 
 @dataclass(frozen=True, slots=True)
 class SpeciesSpec:
-    """One downloadable species entry in the gene-reference registry."""
+    """One downloadable Ensembl species entry in the gene-reference registry."""
 
     key: str
     label: str
     idPrefix: str
-    source: str
-    division: str | None = None
 
 
 @dataclass
@@ -65,17 +60,13 @@ class GeneReference:
                 continue
             self._by_symbol.setdefault(name, []).append(index)
 
-    @property
-    def nGenes(self) -> int:
-        return len(self.geneId)
-
     def has_gene_id(self, gene_id: str) -> bool:
-        return gene_id in self._by_id or _strip_version(gene_id) in self._by_id
+        return gene_id in self._by_id or strip_ensembl_version(gene_id) in self._by_id
 
     def symbol_for(self, gene_id: str) -> str | None:
         index = self._by_id.get(gene_id)
         if index is None:
-            index = self._by_id.get(_strip_version(gene_id))
+            index = self._by_id.get(strip_ensembl_version(gene_id))
         if index is None:
             return None
         symbol = self.symbol[index]
@@ -84,7 +75,7 @@ class GeneReference:
     def chromosome_for(self, gene_id: str) -> str | None:
         index = self._by_id.get(gene_id)
         if index is None:
-            index = self._by_id.get(_strip_version(gene_id))
+            index = self._by_id.get(strip_ensembl_version(gene_id))
         if index is None:
             return None
         return self.chromosome[index]
@@ -94,13 +85,6 @@ class GeneReference:
 
     def symbols(self) -> set[str]:
         return set(self._by_symbol)
-
-    def mitochondrial_gene_ids(self) -> list[str]:
-        return [
-            gene_id
-            for gene_id, chrom in zip(self.geneId, self.chromosome, strict=True)
-            if chrom.upper() == "MT"
-        ]
 
 
 def species_registry() -> dict[str, SpeciesSpec]:
@@ -114,7 +98,7 @@ def species_registry() -> dict[str, SpeciesSpec]:
         ("caenorhabditis_elegans", "worm", "WBGene"),
     ]
     return {
-        key: SpeciesSpec(key=key, label=label, idPrefix=prefix, source="ensembl")
+        key: SpeciesSpec(key=key, label=label, idPrefix=prefix)
         for key, label, prefix in main
     }
 
@@ -128,7 +112,8 @@ def default_cache_dir() -> Path:
     return root / "scarf" / "gene_reference"
 
 
-def _strip_version(gene_id: str) -> str:
+def strip_ensembl_version(gene_id: str) -> str:
+    """Remove a numeric version suffix such as ``.12`` from a gene ID."""
     if "." in gene_id and gene_id.rsplit(".", 1)[-1].isdigit():
         return gene_id.rsplit(".", 1)[0]
     return gene_id
@@ -222,26 +207,6 @@ def load_reference(
     )
 
 
-def write_reference_fixture(
-    path: Path,
-    *,
-    species: str,
-    release: str,
-    rows: Sequence[tuple[str, str, str]],
-) -> GeneReference:
-    """Write a compact reference table for tests or offline prep."""
-    table_path = path if path.suffix == ".tsv" else path.with_suffix(".tsv")
-    release_path = table_path.with_suffix(".release")
-    _write_reference(table_path, release_path, release=release, rows=rows)
-    return GeneReference(
-        species=species,
-        release=release,
-        geneId=tuple(row[0] for row in rows),
-        symbol=tuple(row[1] for row in rows),
-        chromosome=tuple(row[2] for row in rows),
-    )
-
-
 def _directory_listing(url: str, *, timeout: float) -> str:
     request = urllib.request.Request(url, headers={"Accept": "text/html,text/plain"})
     with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -272,16 +237,6 @@ def _pick_gff3_name(listing: str) -> tuple[str, str]:
         raise FileNotFoundError("no top-level Ensembl GFF3 file found in listing")
     candidates.sort(key=lambda item: int(item[1]), reverse=True)
     return candidates[0]
-
-
-def _species_url(spec: SpeciesSpec) -> str:
-    if spec.source == "ensembl":
-        return _ENSEMBL_GFF3.format(species=spec.key)
-    if spec.source == "ensemblgenomes":
-        if not spec.division:
-            raise ValueError(f"ensemblgenomes species {spec.key} needs a division")
-        return _ENSEMBL_GENOMES_GFF3.format(division=spec.division, species=spec.key)
-    raise ValueError(f"unsupported gene-reference source {spec.source!r}")
 
 
 def _download_gff3(url: str, destination: Path, *, timeout: float) -> None:
@@ -321,8 +276,7 @@ def ensure_reference(
         if cached is not None:
             return cached
 
-    spec = registry[species]
-    base_url = _species_url(spec)
+    base_url = _ENSEMBL_GFF3.format(species=species)
     listing = _directory_listing(base_url, timeout=timeout)
     filename, release = _pick_gff3_name(listing)
     gff_url = f"{base_url.rstrip('/')}/{filename}"
@@ -352,23 +306,37 @@ def cached_species(cacheDir: Path | None = None) -> list[str]:
     return sorted(path.stem for path in cache_dir.glob("*.tsv") if path.stem in known)
 
 
+_ID_PREFIXES = tuple((spec.idPrefix, spec.key) for spec in species_registry().values())
+
+
+def species_for_id(gene_id: str) -> str | None:
+    """Return the registry species whose ID prefix, then a digit, starts an ID.
+
+    The digit keeps other Ensembl species apart from the registry, such as
+    chicken ``ENSGALG`` IDs from human ``ENSG`` IDs. A numeric version suffix
+    is ignored.
+
+    Returns:
+        The species key, or None when the ID has no registry prefix.
+    """
+    stripped = strip_ensembl_version(str(gene_id))
+    for prefix, species in _ID_PREFIXES:
+        if (
+            stripped.startswith(prefix)
+            and stripped[len(prefix) : len(prefix) + 1].isdigit()
+        ):
+            return species
+    return None
+
+
 def prefix_species(gene_ids: Sequence[str]) -> dict[str, int]:
-    """Count Ensembl-style ID prefixes against the registry."""
-    counts = {spec.key: 0 for spec in species_registry().values()}
-    for raw in gene_ids:
-        gene_id = _strip_version(str(raw))
-        for spec in species_registry().values():
-            if gene_id.startswith(spec.idPrefix):
-                counts[spec.key] += 1
-                break
+    """Count gene IDs by the registry species of their prefix.
+
+    Prefixes match as in ``species_for_id``. Species keep registry order.
+    """
+    counts = {species: 0 for _prefix, species in _ID_PREFIXES}
+    for gene_id in gene_ids:
+        species = species_for_id(str(gene_id))
+        if species is not None:
+            counts[species] += 1
     return {key: count for key, count in counts.items() if count}
-
-
-def reference_summary(reference: GeneReference) -> dict[str, Any]:
-    return {
-        "species": reference.species,
-        "release": reference.release,
-        "nGenes": reference.nGenes,
-        "nSymbols": sum(1 for symbol in reference.symbol if symbol),
-        "nMitochondrial": len(reference.mitochondrial_gene_ids()),
-    }

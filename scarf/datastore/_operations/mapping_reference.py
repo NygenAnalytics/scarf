@@ -1,4 +1,3 @@
-from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -13,6 +12,7 @@ from ...mapping.artifact import (
     load_artifact_mapping_reference,
     mapping_reference_payload_matches_sources,
     mapping_reference_source_fingerprint,
+    symphony_batch_metadata,
     validate_artifact_mapping_reference,
     validate_mapping_reference_sources,
     write_artifact_mapping_reference_from_sources,
@@ -103,7 +103,7 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
         )
         if ann_status.operation != "build_ann_index":
             raise ValueError("Mapping references require build_ann_index artifacts")
-        coordinates = _artifact_input(neighbors_status.inputs, "coordinates")
+        coordinates = self._artifact_input_ref(neighbors, "coordinates", None)
         if (
             coordinates.scope != "assay"
             or coordinates.assay != assay_name
@@ -269,7 +269,6 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
             ann_metric,
             n_dims,
             selected_cell_count,
-            require_metadata=True,
         )
 
         symphony_sources: dict[str, Any] | None = None
@@ -352,21 +351,11 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
             "dataset_fingerprint": dataset_fingerprint,
         }
         if correction_status is not None and batch_correction is not None:
-            correction_parameters = correction_status.parameters or {}
-            correction_group = artifact_group(self.zw, batch_correction)
-            batch_levels = correction_group.attrs.get("batch_levels", [])
-            if not isinstance(batch_levels, list):
-                raise ValueError("Harmony batch levels must be a list")
             metadata.update(
-                {
-                    "batch_columns": list(
-                        correction_parameters.get("batch_columns", [])
-                    ),
-                    "harmony_parameters": dict(
-                        correction_parameters.get("harmony_parameters", {})
-                    ),
-                    "batch_levels": batch_levels,
-                }
+                symphony_batch_metadata(
+                    correction_status,
+                    artifact_group(self.zw, batch_correction),
+                )
             )
 
         inputs: dict[str, ArtifactRef] = {
@@ -459,13 +448,3 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
             )
             finish_artifact(group, planned)
         return planned.ref
-
-
-def _artifact_input(
-    inputs: Mapping[str, Any] | None,
-    name: str,
-) -> ArtifactRef:
-    raw_ref = (inputs or {}).get(name)
-    if not isinstance(raw_ref, Mapping):
-        raise ValueError(f"Artifact has no {name!r} input")
-    return ArtifactRef.from_dict(raw_ref)

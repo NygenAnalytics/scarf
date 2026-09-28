@@ -2,6 +2,7 @@ from collections.abc import Iterator
 from typing import Any
 
 import numpy as np
+import pandas as pd
 
 from ..storage.types import as_zarr_group
 from ..readers import CSVReader
@@ -36,6 +37,8 @@ class CSVtoZarr:
                 unitBytes and chunkBytes plan is used.
         io: Optional explicit read, compute, and write widths. Unset values
             stay under automatic planning.
+        assay_type: Preset assay type, such as ``RNA``, for an assay whose name
+                    is not a preset. When None, the assay name decides the type.
 
     Attributes:
         csvr: A CSVReader object
@@ -56,6 +59,7 @@ class CSVtoZarr:
         profile: StorageProfile | None = None,
         policy: CountMatrixPolicy | None = None,
         io: StorageIoPolicy | None = None,
+        assay_type: str | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.schema import (
@@ -64,10 +68,13 @@ class CSVtoZarr:
             validate_assay_name,
         )
         from ..storage.stores import load_zarr
+        from .counts_t import validate_assay_type
 
         self.csvr = cr
         self.assayName = assay_name
         validate_assay_name(self.assayName)
+        validate_assay_type(assay_type)
+        self.assayType = assay_type
         self.resources = resolve_budget(mem_budget, nthreads)
         self.profile = resolve_storage_profile(zarr_loc, profile)
         self.policy = policy
@@ -77,10 +84,7 @@ class CSVtoZarr:
         cell_ids = self.csvr.cell_ids()
         if len(cell_ids) != self.csvr.nCells:
             raise ValueError("Number of cell IDs does not match the CSV row count")
-        if dtype is not None:
-            self.dtype = dtype
-        else:
-            self.dtype = next(self.csvr.consume())[0].dtype
+        self.dtype = self.csvr.countDtype if dtype is None else np.dtype(dtype)
         self.z = load_zarr(zarr_loc, mode="w", storage_options=storage_options)
         _ = create_cell_data(
             root=self.z,
@@ -110,10 +114,9 @@ class CSVtoZarr:
         Returns:
             None
         """
-        from ..storage.arrays import create_zarr_obj_array
         from ..storage.identity import CountSummary, finalize_counts
         from ..storage.schema import load_count_array
-        from ._store import skip_reserved_metadata_columns
+        from ._store import skip_reserved_metadata_columns, write_metadata_column
 
         store = load_count_array(self.z, self.assayName, self.workspace)
         summary = CountSummary(store)
@@ -125,40 +128,28 @@ class CSVtoZarr:
             name=cell_data_path,
         )
         # Each entry pairs a column's position in the reader payload with its
-        # destination array, so skipped reserved columns keep the mapping exact.
-        cell_data = [
-            (
-                position,
-                create_zarr_obj_array(
-                    cell_data_grp,
-                    name=name,
-                    data=None,
-                    dtype="str" if dtype == np.dtype("O") else dtype,
-                    shape=self.csvr.nCells,
-                    profile=self.profile,
-                ),
-            )
-            for name, (position, dtype) in skip_reserved_metadata_columns(
+        # dtype across every row, so skipped reserved columns keep the mapping.
+        metadata = list(
+            skip_reserved_metadata_columns(
                 zip(
                     self.csvr.cellDataCols,
                     enumerate(self.csvr.cellDataDtypes or []),
                 ),
                 "cell",
             )
-        ]
+        )
+        parts: dict[int, list[tuple[np.ndarray, np.ndarray]]] = {
+            position: [] for _name, (position, _dtype) in metadata
+        }
 
         def count_batches() -> Iterator[np.ndarray]:
-            s = 0
-            for a, c in self.csvr.consume():
-                e = s + a.shape[0]
-                if c is not None:
-                    for position, column in cell_data:
-                        column[s:e] = c[:, position]
-                s = e
-                if self.dtype is not None:
-                    yield a.astype(self.dtype)
-                else:
-                    yield a
+            for counts, cell_values in self.csvr.consume():
+                if cell_values is not None:
+                    for _name, (position, dtype) in metadata:
+                        parts[position].append(
+                            _metadata_part(cell_values[:, position], dtype)
+                        )
+                yield counts.astype(self.dtype)
 
         e = write_dense_from_row_batches(
             store,
@@ -174,6 +165,16 @@ class CSVtoZarr:
                 "ERROR: This is a bug in CSVtoZarr. All cells might not have been successfully "
                 "written into the zarr file. Please report this issue"
             )
+        for name, (position, _dtype) in metadata:
+            values = np.concatenate([values for values, _missing in parts[position]])
+            missing = np.concatenate([missing for _values, missing in parts[position]])
+            write_metadata_column(
+                cell_data_grp,
+                name,
+                values,
+                missing,
+                profile=self.profile,
+            )
         logger.info(
             f"Wrote {self.csvr.nCells} cells and {self.csvr.nFeatures} features "
             f"from CSV to assay {self.assayName}"
@@ -185,8 +186,28 @@ class CSVtoZarr:
             self.z,
             self.assayName,
             self.workspace,
+            assay_type=self.assayType,
             resources=self.resources,
             profile=self.profile,
             policy=self.policy,
             io=self.io,
         )
+
+
+def _metadata_part(
+    values: np.ndarray,
+    dtype: np.dtype,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert one chunk of a CSV metadata column to its dtype for every row.
+
+    Blank text cells are missing; blank numeric cells stay NaN.
+    """
+    if dtype.kind != "O":
+        converted = np.asarray(values, dtype=dtype)
+        return converted, np.zeros(converted.shape, dtype=bool)
+    missing = np.asarray(pd.isna(values), dtype=bool)
+    text = np.asarray(
+        ["" if absent else str(value) for value, absent in zip(values, missing)],
+        dtype=str,
+    )
+    return text, missing

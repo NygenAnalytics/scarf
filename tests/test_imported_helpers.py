@@ -3,7 +3,6 @@
 import numpy as np
 import pytest
 from scarf.embeddings.imported import (
-    _positive_block_rows,
     _required_payload_fingerprints,
     _resolve_source,
     _string_block,
@@ -14,13 +13,7 @@ from scarf.embeddings.imported import (
 )
 
 
-def test_positive_block_rows_and_fingerprint_validators():
-    assert _positive_block_rows(4) == 4
-    with pytest.raises(TypeError, match="positive integer"):
-        _positive_block_rows(True)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="greater than zero"):
-        _positive_block_rows(0)
-
+def test_fingerprint_validators():
     good = "a" * 64
     assert _validate_fingerprint(good, "fp") == good
     with pytest.raises(ValueError, match="64-character lowercase"):

@@ -1,6 +1,7 @@
 """Beginner RNA entry point and exact completed-result access."""
 
 from tests.agent_examples import example
+from tests.agent_journal_store import memory_journal
 
 import hashlib
 from pathlib import Path
@@ -138,41 +139,36 @@ def test_doublet_scoring_flag_requires_a_boolean_before_pipeline_work(
         AutomatedWorkflowConfig(scoreDoublets=value)
 
 
-def test_legacy_doublet_policy_preserves_saved_request_bytes_and_checksums():
-    legacy_config = AutomatedWorkflowConfig(screeningCells=50_000).model_dump(
-        mode="json", exclude={"scoreDoublets"}
-    )
-    restored = AutomatedWorkflowConfig.model_validate(legacy_config)
-    assert restored.scoreDoublets is True
-    assert restored.model_dump(mode="json") == legacy_config
-    assert "scoreDoublets" not in AutomatedWorkflowConfig().model_dump(mode="json")
-    assert "scoreDoublets" not in AutomatedWorkflowConfig(
-        scoreDoublets=True
-    ).model_dump(mode="json")
+def test_saved_config_records_every_execution_setting_and_rejects_older_shapes():
+    config = AutomatedWorkflowConfig(screeningCells=50_000).model_dump(mode="json")
+    assert config["inputPolicy"] == "pause"
+    assert config["scoreDoublets"] is True
+    older_config = {
+        key: value
+        for key, value in config.items()
+        if key not in {"inputPolicy", "scoreDoublets"}
+    }
     request = example(AutomatedWorkflowRequest).model_dump(mode="json")
     saved = {
         "recordType": "automatedWorkflowRequest",
         "inputIdentity": {"source": "study.h5ad"},
         "modelIdentity": "test-model",
-        "workflowRunId": "legacy-workflow",
+        "workflowRunId": "older-workflow",
         "createdAtNs": 1,
         "request": request,
-        "config": legacy_config,
+        "config": older_config,
         "requestSha256": hashlib.sha256(canonical_json_bytes(request)).hexdigest(),
-        "configSha256": hashlib.sha256(canonical_json_bytes(legacy_config)).hexdigest(),
+        "configSha256": hashlib.sha256(canonical_json_bytes(older_config)).hexdigest(),
     }
     saved["contentSha256"] = hashlib.sha256(canonical_json_bytes(saved)).hexdigest()
-    original = canonical_json_bytes(saved)
-    loaded = OrchestrationRequestRecord.model_validate_json(original)
-    assert loaded.config.scoreDoublets is True
-    assert canonical_json_bytes(loaded.model_dump(mode="json")) == original
-    assert journal._record_checksum(loaded) == saved["contentSha256"]
-    assert (
-        hashlib.sha256(
-            canonical_json_bytes(loaded.config.model_dump(mode="json"))
-        ).hexdigest()
-        == saved["configSha256"]
+    store, prefix, _ = memory_journal()
+    journal._write_key_once(
+        store.zw,
+        journal._request_key(prefix, "older-workflow"),
+        canonical_json_bytes(saved),
     )
+    with pytest.raises(ValueError, match="identity or checksum is invalid"):
+        journal.read_request(store.zw, prefix, "older-workflow")
 
 
 def test_doublet_policy_cannot_be_changed_while_resuming_saved_work():

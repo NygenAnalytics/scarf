@@ -229,10 +229,59 @@ def test_lazy_coordinate_stages_do_not_hide_a_cross_stage_cache() -> None:
     assert data.read_count == 12
     assert index.get_current_count() == values.shape[0]
     query = NeighborQueryStage(index, k=3, metric="l2")
-    indices, distances = query.query(values.dot(loadings), k=3)
+    indices, distances = query.query(values.dot(loadings))
     assert indices.shape == distances.shape == (values.shape[0], 3)
     assert initialization.model is not None
     assert initialization.labels.shape == (values.shape[0],)
+
+
+def test_streamed_kmeans_keeps_centroids_for_groups_stored_last() -> None:
+    rng = np.random.default_rng(0)
+    # Cells stored grouped by sample, as when samples are concatenated.
+    values = np.vstack(
+        [rng.normal(loc=center, size=(700, 4)) for center in (0.0, 6.0, 12.0)]
+    )
+    stream, _data = _coordinate_stream(values, block_size=500)
+
+    result = KMeansInitializationStage.fit(
+        stream=stream,
+        n_rows=values.shape[0],
+        batch_size=500,
+        n_clusters=3,
+        rand_state=4466,
+        nthreads=1,
+        kmeans_sampling=0.2,
+        kmeans_batch_size=256,
+    )
+
+    np.testing.assert_allclose(
+        np.sort(result.model.cluster_centers_[:, 0]),
+        [0.0, 6.0, 12.0],
+        atol=0.2,
+    )
+    for group in range(3):
+        group_labels = result.labels[group * 700 : (group + 1) * 700]
+        assert np.unique(group_labels).size == 1
+
+
+def test_custom_reduction_requires_loadings() -> None:
+    values, _loadings = _custom_inputs()
+    with pytest.raises(ValueError, match="Custom reduction requires loadings"):
+        ReductionTransform(
+            data=ChunkedArray.from_numpy(values, block_size=4, nthreads=1),
+            method="custom",
+            dims=2,
+            loadings=None,
+            use_for_pca=np.ones(values.shape[0], dtype=bool),
+            mu=np.zeros(values.shape[1]),
+            sigma=np.ones(values.shape[1]),
+            batch_size=4,
+            nthreads=1,
+            rand_state=4466,
+            disable_scaling=True,
+            lsi_skip_first=False,
+            lsi_params={},
+        )
 
 
 def test_neighbor_query_validates_and_converts_metric_distances() -> None:

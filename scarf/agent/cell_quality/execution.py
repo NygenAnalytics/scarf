@@ -7,12 +7,15 @@ from typing import Any, cast
 
 import numpy as np
 
-from ...datastore._operations.quality_control import _validated_named_cell_artifacts
 from ...metadata.artifacts import (
     plan_cell_data_artifact,
     write_cell_data_artifact,
 )
 from ...metadata.selection import NamedCellArtifact, resolve_cell_aligned_artifact
+from ...quality_control.filtering import (
+    validate_cell_filter_sources,
+    validate_named_cell_artifacts,
+)
 from ...storage.artifacts import canonical_bytes, fingerprint_array, fingerprint_strings
 from ...storage.refs import ArtifactRef
 from ...storage.selections import (
@@ -83,13 +86,33 @@ def _validated_expected_counts(
     return flag_counts
 
 
-def _execution_artifacts(
-    metric_artifacts: Sequence[NamedCellArtifact],
-    attrs: Sequence[str],
-) -> list[NamedCellArtifact]:
-    """Name artifact metrics apart from the metadata columns they would shadow."""
-    collisions = set(attrs).intersection(source.name for source in metric_artifacts)
-    return [
+def _validated_sources(
+    attrs: Iterable[str] | None,
+    artifact_metrics: Iterable[NamedCellArtifact] | None,
+    *,
+    sample_column: str | None,
+    sample_artifact: NamedCellArtifact | None,
+) -> tuple[
+    list[str],
+    list[NamedCellArtifact],
+    list[NamedCellArtifact],
+    NamedCellArtifact | None,
+]:
+    """Validate QC sources as core filtering does, after naming metrics apart.
+
+    An artifact metric named like a metadata metric is passed to core filtering
+    under an execution name that includes its artifact ID.
+    """
+    attrs_list = list(attrs or ())
+    metric_artifacts = validate_named_cell_artifacts(
+        artifact_metrics,
+        expected_kind="quality_metric",
+        label="artifact_metrics",
+    )
+    collisions = {attr for attr in attrs_list if isinstance(attr, str)}.intersection(
+        source.name for source in metric_artifacts
+    )
+    execution_artifacts = [
         NamedCellArtifact(
             name=qc_metric_execution_name(
                 source.name,
@@ -100,6 +123,13 @@ def _execution_artifacts(
         )
         for source in metric_artifacts
     ]
+    attrs_list, _, resolved_sample = validate_cell_filter_sources(
+        attrs_list,
+        execution_artifacts,
+        sample_column=sample_column,
+        sample_artifact=sample_artifact,
+    )
+    return attrs_list, metric_artifacts, execution_artifacts, resolved_sample
 
 
 def _metric_values(
@@ -226,23 +256,14 @@ def execute_registered_cell_qc(
         )
     canonical_bytes(parameters)
 
-    attrs_list = list(attrs or ())
-    if any(not isinstance(attr, str) for attr in attrs_list):
-        raise TypeError("attrs must contain only column names")
-    metric_artifacts = _validated_named_cell_artifacts(
-        artifact_metrics,
-        expected_kind="quality_metric",
-        label="artifact_metrics",
+    attrs_list, metric_artifacts, execution_artifacts, resolved_sample_artifact = (
+        _validated_sources(
+            attrs,
+            artifact_metrics,
+            sample_column=sample_column,
+            sample_artifact=sample_artifact,
+        )
     )
-    resolved_sample_artifact: NamedCellArtifact | None = None
-    if sample_artifact is not None:
-        resolved_sample_artifact = _validated_named_cell_artifacts(
-            [sample_artifact],
-            expected_kind="hto_identity",
-            label="sample_artifact",
-        )[0]
-    if sample_column is not None and resolved_sample_artifact is not None:
-        raise ValueError("sample_column and sample_artifact are mutually exclusive")
     capture_profile = profile in {
         "captureMad5",
         "captureMad3Sensitivity",
@@ -264,7 +285,6 @@ def execute_registered_cell_qc(
     if missing:
         joined = ", ".join(repr(attr) for attr in missing)
         raise KeyError(f"Cell metadata columns not found: {joined}")
-    execution_artifacts = _execution_artifacts(metric_artifacts, attrs_list)
 
     validated_prior = store._filter_input_selection(cell_selection)
     prior = validated_prior.ref
@@ -470,28 +490,20 @@ def execute_auto_cell_qc(
     """Verify evidence, call core auto-filtering, and persist its exact flags."""
     if action not in {"globalGaussian", "sampleMad"}:
         raise ValueError(f"Unknown automatic cell-QC action {action!r}")
-    attrs_list = list(attrs or ())
-    if any(not isinstance(attr, str) for attr in attrs_list):
-        raise TypeError("attrs must contain only column names")
-    metric_artifacts = _validated_named_cell_artifacts(
-        artifact_metrics,
-        expected_kind="quality_metric",
-        label="artifact_metrics",
+    attrs_list, metric_artifacts, execution_artifacts, resolved_sample_artifact = (
+        _validated_sources(
+            attrs,
+            artifact_metrics,
+            sample_column=sample_column,
+            sample_artifact=sample_artifact,
+        )
     )
-    sample_sources = _validated_named_cell_artifacts(
-        [sample_artifact] if sample_artifact is not None else [],
-        expected_kind="hto_identity",
-        label="sample_artifact",
-    )
-    capture_sources = _validated_named_cell_artifacts(
+    capture_sources = validate_named_cell_artifacts(
         [capture_artifact] if capture_artifact is not None else [],
         expected_kind="hto_identity",
         label="capture_artifact",
     )
-    resolved_sample_artifact = sample_sources[0] if sample_sources else None
     resolved_capture_artifact = capture_sources[0] if capture_sources else None
-    if sample_column is not None and resolved_sample_artifact is not None:
-        raise ValueError("sample_column and sample_artifact are mutually exclusive")
     if capture_column is not None and resolved_capture_artifact is not None:
         raise ValueError("capture_column and capture_artifact are mutually exclusive")
     if action == "sampleMad" and (
@@ -527,7 +539,6 @@ def execute_auto_cell_qc(
             "Automatic cell-QC active-cell count differs from its evidence"
         )
 
-    execution_artifacts = _execution_artifacts(metric_artifacts, attrs_list)
     values_by_name, metadata_fingerprints = _metric_values(
         store,
         attrs_list,

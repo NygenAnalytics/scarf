@@ -18,11 +18,12 @@ from ...storage.artifacts import (
     callable_identity,
     inspect_artifact,
 )
+from ...storage.budget import ResourceBudget
 from ...storage.feature_selection import resolve_feature_selection
+from ...storage.io_policy import StorageIoPolicy
 from ...storage.selections import validate_stored_selection_integrity
 from ...storage.types import as_zarr_array, as_zarr_group
-from ...utils.arrays import array_digest
-from ...utils.arrays import has_duplicates
+from ...utils.arrays import array_digest, has_duplicates
 
 
 _ENRICHMENT_LAYOUT = "cells_by_sources"
@@ -58,6 +59,8 @@ def _write_enrichment_slot(
     cell_index: np.ndarray,
     matched_feature_index: np.ndarray,
     rank_feature_index: np.ndarray | None,
+    resources: ResourceBudget,
+    io: StorageIoPolicy | None,
 ) -> None:
     from ...storage.arrays import create_metadata_column, create_numeric_array
     from ...storage.layout import normed_array_spec
@@ -144,6 +147,8 @@ def _write_enrichment_slot(
         checked_batches(),
         dtype=np.float32,
         msg=f"Writing {attrs['method']} enrichment",
+        resources=resources,
+        io=io,
     )
     if written != n_cells:
         raise ValueError(
@@ -292,22 +297,18 @@ def _load_enrichment_result(
     *,
     enrichment: ArtifactRef,
     sources: Sequence[str] | None,
-    artifact_root: zarr.Group | None = None,
+    artifact_root: zarr.Group,
 ) -> EnrichmentResult:
+    """Load an enrichment artifact of ``assay`` that the caller already typed."""
+    from ...features.enrichment.aucell import AUCELL_ALGORITHM_VERSION
+    from ...features.enrichment.waggr import WAGGR_ALGORITHM_VERSION
     from ...matrix import ChunkedArray
 
-    if artifact_root is None:
-        raise ValueError("Artifact root is required for enrichment loading")
     ref = enrichment
     label = ref.artifact_id
     status = inspect_artifact(artifact_root, ref)
-    if (
-        ref.kind != "enrichment_scores"
-        or ref.scope != "assay"
-        or ref.assay != assay.name
-        or not status.complete
-    ):
-        raise ValueError("Enrichment artifact reference is invalid")
+    if not status.complete:
+        raise ValueError(f"Enrichment artifact {label!r} is missing or incomplete")
     slot = as_zarr_group(
         artifact_root[status.path],
         name=status.path,
@@ -326,7 +327,9 @@ def _load_enrichment_result(
     required_attrs = {
         "algorithm_version",
         "cell_digest",
+        "dropped_ambiguous_targets",
         "feature_digest",
+        "layout",
         "network_digest",
         "tmin",
     }
@@ -339,11 +342,23 @@ def _load_enrichment_result(
     )
     if not method_attrs.issubset(slot.attrs):
         raise ValueError(f"Enrichment slot {label!r} is missing method metadata")
+    if slot.attrs["layout"] != _ENRICHMENT_LAYOUT:
+        raise ValueError(f"Enrichment slot {label!r} has an unsupported layout")
+    dropped_targets = slot.attrs["dropped_ambiguous_targets"]
+    if not isinstance(dropped_targets, list) or not all(
+        isinstance(target, str) and target for target in dropped_targets
+    ):
+        raise ValueError(
+            f"Enrichment slot {label!r} has invalid dropped_ambiguous_targets metadata"
+        )
     algorithm_version = slot.attrs["algorithm_version"]
+    expected_version = (
+        WAGGR_ALGORITHM_VERSION if method == "waggr" else AUCELL_ALGORITHM_VERSION
+    )
     if (
         isinstance(algorithm_version, bool)
         or not isinstance(algorithm_version, (int, np.integer))
-        or int(algorithm_version) != 1
+        or int(algorithm_version) != expected_version
     ):
         raise ValueError(f"Enrichment slot {label!r} has an unsupported algorithm")
     tmin = slot.attrs["tmin"]

@@ -1,17 +1,18 @@
 """Characterize feature identity, species, families, and exogenous candidates."""
 
-import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from ...assay import RNAassay
+from ...features.gene_families import GENE_FAMILY_PATTERNS, gene_family_mask
 from ...features.gene_reference import (
     GeneReference,
     default_cache_dir,
     ensure_reference,
     load_reference,
-    species_registry,
 )
 from ...features.identity import (
     audit_feature_identity,
@@ -28,9 +29,9 @@ from ...quality_control.cell_cycle_genes import (
     s_phase_genes,
     s_phase_genes_mouse,
 )
+from ...utils.arrays import regex_match_mask
 from .._deps import AGENT_INSTALL_HINT
-from ..decisions.selection import DecisionValidationError, decide
-from ..types import AgentDataModel, Decision, EvidenceItem, StageStatus
+from ..types import AgentDataModel, StageStatus
 
 try:
     from pydantic import Field
@@ -47,27 +48,9 @@ _CELL_CYCLE = {
     "homo_sapiens": {"s": s_phase_genes, "g2m": g2m_phase_genes},
     "mus_musculus": {"s": s_phase_genes_mouse, "g2m": g2m_phase_genes_mouse},
 }
-_SEX_COEFFICIENT_TOKENS = frozenset({"sex", "gender", "Sex", "Gender"})
 _FEATURE_INVENTORY_EXAMPLE_LIMIT = 8
-_CONTEXT_LIMIT = 1200
 _AUTO_DOWNLOAD_SPECIES = frozenset({"homo_sapiens", "mus_musculus"})
 _MAX_EXOGENOUS = 25
-_DEFAULT_HVG_FAMILY_PATTERNS = (
-    ("mitochondrial", r"^MT-"),
-    ("ribosomalProtein", r"^RPS|^RPL"),
-    ("mitoribosomal", r"^MRPS|^MRPL"),
-    ("cellCycleCcn", r"^CCN"),
-    ("hla", r"^HLA-"),
-    ("h2", r"^H2-"),
-    ("histone", r"^HIST"),
-    (
-        "sexLinked",
-        (
-            r"^XIST$|^DDX3Y$|^USP9Y$|^EIF1AY$|^KDM5D$|^SRY$|^ZFY$|^UTY$|"
-            r"^TMSB4Y$|^NLGN4Y$"
-        ),
-    ),
-)
 
 
 class FeatureCharacterization(AgentDataModel):
@@ -75,22 +58,11 @@ class FeatureCharacterization(AgentDataModel):
     auditLog: list[dict[str, Any]] = Field(default_factory=list)
     actions: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
-    decisions: list[dict[str, Any]] = Field(default_factory=list)
     assays: list[dict[str, Any]] = Field(default_factory=list)
 
     @classmethod
     def get_blank(cls) -> "FeatureCharacterization":
         return cls(status="failed")
-
-
-def _bounded_context(study_context: str | None) -> str:
-    text = (study_context or "").strip()
-    return text if len(text) <= _CONTEXT_LIMIT else text[: _CONTEXT_LIMIT - 3] + "..."
-
-
-def _feature_pattern_matches(names: Sequence[str], pattern: str) -> list[str]:
-    compiled = re.compile(pattern.upper())
-    return [name for name in names if compiled.match(name.upper()) is not None]
 
 
 def _bounded_feature_examples(matches: Sequence[str]) -> list[str]:
@@ -104,11 +76,12 @@ def _scarf_default_feature_inventory(
     names: Sequence[str],
 ) -> dict[str, Any]:
     evidence_prefix = f"assay:{assay_name}:scarfDefaultHvg"
-    combined_matches = _feature_pattern_matches(names, DEFAULT_HVG_BLACKLIST)
+    values = np.asarray(names, dtype=object)
+    combined_matches = values[regex_match_mask(values, DEFAULT_HVG_BLACKLIST)].tolist()
     families: list[dict[str, Any]] = []
     family_evidence_ids: list[str] = []
-    for family, pattern in _DEFAULT_HVG_FAMILY_PATTERNS:
-        matches = _feature_pattern_matches(names, pattern)
+    for family, pattern in GENE_FAMILY_PATTERNS.items():
+        matches = values[gene_family_mask(values, family)].tolist()
         evidence_id = f"{evidence_prefix}:family:{family}"
         families.append(
             {
@@ -144,57 +117,6 @@ def _audit(
     **fields: Any,
 ) -> None:
     audit_log.append({"kind": kind, "detail": detail, **fields})
-
-
-def _ask(
-    *,
-    model: Any | None,
-    question: str,
-    evidence: Sequence[EvidenceItem],
-    decisions: list[dict[str, Any]],
-    audit_log: list[dict[str, Any]],
-    task: str,
-    assay: str | None = None,
-) -> Decision | None:
-    if model is None or len(evidence) < 2:
-        return None
-    try:
-        decision = decide(model=model, question=question, evidence=evidence)
-    except DecisionValidationError as exc:
-        _audit(
-            audit_log,
-            kind="decisionInvalid",
-            detail=str(exc),
-            task=task,
-            assay=assay,
-        )
-        return None
-    record: dict[str, Any] = {
-        "task": task,
-        "selectedId": decision.selectedId,
-        "rationale": decision.rationale,
-        "evidenceIds": list(decision.evidenceIds),
-    }
-    if assay is not None:
-        record["assay"] = assay
-    decisions.append(record)
-    return decision
-
-
-def _sex_coefficient_note(
-    covariates: Any | None,
-) -> str | None:
-    if covariates is None:
-        return None
-    coefficients = getattr(covariates, "coefficients", None) or []
-    for item in coefficients:
-        name = item.get("name") if isinstance(item, Mapping) else None
-        if name in _SEX_COEFFICIENT_TOKENS:
-            return (
-                f"Prior covariate characterization marked {name!r} as a coefficient "
-                "of interest; tracked sex-chromosome genes must not be excluded later"
-            )
-    return None
 
 
 def _load_or_fetch_reference(
@@ -241,120 +163,14 @@ def _load_or_fetch_reference(
     return reference
 
 
-def _assist_species(
-    *,
-    model: Any | None,
-    unresolved: Mapping[str, Any],
-    context: str,
-    decisions: list[dict[str, Any]],
-    audit_log: list[dict[str, Any]],
-    assay: str,
-) -> str | None:
-    # Only ask among species that already have overlap evidence. Expanding to the
-    # full registry would let a guess trigger a non-human/mouse download.
-    candidates = [
-        key for key in (unresolved.get("candidates") or []) if key in species_registry()
-    ]
-    if len(candidates) < 2:
-        return None
-    evidence = [
-        EvidenceItem(
-            id=f"species:{key}",
-            label=species_registry()[key].label,
-            summary=(
-                f"overlap hits="
-                f"{(unresolved.get('overlap') or {}).get('scores', {}).get(key, {}).get('hits', 0)}; "
-                f"prefix count="
-                f"{(unresolved.get('prefixCounts') or {}).get(key, 0)}"
-            ),
-        )
-        for key in candidates
-    ]
-    evidence.append(
-        EvidenceItem(
-            id="species:unknown",
-            label="unknown",
-            summary="Cannot settle species from available evidence",
-        )
-    )
-    decision = _ask(
-        model=model,
-        question=(
-            f"Choose the species for assay {assay}. "
-            f"Identity notes: {unresolved.get('reason', '')}. "
-            f"Study context: {context or 'none provided'}."
-        ),
-        evidence=evidence,
-        decisions=decisions,
-        audit_log=audit_log,
-        task="species",
-        assay=assay,
-    )
-    if decision is None:
-        return None
-    selected = decision.selectedId.removeprefix("species:")
-    return selected if selected in species_registry() or selected == "unknown" else None
-
-
-def _classify_exogenous(
-    *,
-    model: Any | None,
-    candidates: Sequence[Mapping[str, Any]],
-    context: str,
-    decisions: list[dict[str, Any]],
-    audit_log: list[dict[str, Any]],
-    assay: str,
-    species: str,
-) -> list[dict[str, Any]]:
-    classified: list[dict[str, Any]] = []
-    for item in candidates:
-        label = item.get("name") or item.get("id") or "feature"
-        evidence = [
-            EvidenceItem(
-                id="exogenous:potentialExogenous",
-                label="potentialExogenous",
-                summary="Spike-in, transgene, guide, antibody tag, or other non-endogenous feature",
-            ),
-            EvidenceItem(
-                id="exogenous:unresolved",
-                label="unresolved",
-                summary="Not enough evidence to treat as exogenous",
-            ),
-        ]
-        decision = _ask(
-            model=model,
-            question=(
-                f"Classify feature {label!r} (id={item.get('id')!r}) for assay {assay} "
-                f"under species {species}. Study context: {context or 'none provided'}."
-            ),
-            evidence=evidence,
-            decisions=decisions,
-            audit_log=audit_log,
-            task="exogenous",
-            assay=assay,
-        )
-        record = dict(item)
-        if decision is None:
-            record["class"] = "unresolved"
-        else:
-            record["class"] = decision.selectedId.removeprefix("exogenous:")
-        classified.append(record)
-    return classified
-
-
 def _characterize_assay(
     store: Any,
     assay_name: str,
     *,
-    model: Any | None,
-    context: str,
-    directions: Mapping[str, Any],
     cache_dir: Path,
     allow_download: bool,
     audit_log: list[dict[str, Any]],
     actions: list[str],
-    decisions: list[dict[str, Any]],
-    sex_note: str | None,
 ) -> dict[str, Any]:
     assay = store.get_assay(assay_name)
     ids = [str(value) for value in assay.feats.fetch_all("ids")]
@@ -394,35 +210,13 @@ def _characterize_assay(
         evidenceIds=default_inventory["evidenceIds"],
     )
 
-    species_by_assay = dict(directions.get("speciesByAssay") or {})
-    directed_species = species_by_assay.get(assay_name)
     resolution = resolve_species(
         ids,
         names,
-        directed=directed_species,
         cacheDir=cache_dir,
         allowDownload=allow_download,
     )
     species = resolution["species"]
-    if species == "unknown" and resolution.get("method") == "inconclusive":
-        assisted = _assist_species(
-            model=model,
-            unresolved=resolution,
-            context=context,
-            decisions=decisions,
-            audit_log=audit_log,
-            assay=assay_name,
-        )
-        if assisted is not None:
-            species = assisted
-            resolution = {
-                **resolution,
-                "species": species,
-                "method": "llmAssist",
-                "reason": "model choice among inconclusive candidates",
-            }
-            actions.append(f"species:{assay_name}->{species}")
-
     record["species"] = species
     record["speciesMethod"] = resolution.get("method")
     record["speciesResolution"] = {
@@ -454,14 +248,11 @@ def _characterize_assay(
         )
         return record
 
-    # Only human/mouse auto-download; any other species needs an explicit direction.
-    may_download = allow_download and (
-        species in _AUTO_DOWNLOAD_SPECIES or directed_species == species
-    )
+    # Only human and mouse references are downloaded automatically.
     reference = _load_or_fetch_reference(
         species,
         cache_dir=cache_dir,
-        allow_download=may_download,
+        allow_download=allow_download and species in _AUTO_DOWNLOAD_SPECIES,
         audit_log=audit_log,
         assay=assay_name,
     )
@@ -496,36 +287,16 @@ def _characterize_assay(
         reference=reference,
         cellCycleGenes=_CELL_CYCLE,
     )
-    if sex_note is not None:
-        record["notes"] = [sex_note]
-        _audit(
-            audit_log,
-            kind="sexCoefficientNote",
-            detail=sex_note,
-            assay=assay_name,
-        )
-    elif species != "unknown":
-        _audit(
-            audit_log,
-            kind="sexChromosomeTracked",
-            detail=(
-                "Sex-chromosome genes are tracked with defaultExclude=false; "
-                "Phase 3 may exclude them when sex is not a coefficient of interest"
-            ),
-            assay=assay_name,
-        )
+    _audit(
+        audit_log,
+        kind="sexChromosomeTracked",
+        detail=(
+            "Sex-chromosome genes are tracked with defaultExclude=false; "
+            "Phase 3 may exclude them when sex is not a coefficient of interest"
+        ),
+        assay=assay_name,
+    )
 
-    raw_max = directions.get("maxExogenousCandidates", _MAX_EXOGENOUS)
-    try:
-        max_exogenous = int(raw_max)
-    except (TypeError, ValueError):
-        _audit(
-            audit_log,
-            kind="invalidDirection",
-            detail=f"maxExogenousCandidates={raw_max!r}; using {_MAX_EXOGENOUS}",
-            assay=assay_name,
-        )
-        max_exogenous = _MAX_EXOGENOUS
     if reference is not None:
         misses = reference_misses(ids, symbols, reference)
         if misses["count"]:
@@ -545,7 +316,7 @@ def _characterize_assay(
         ids,
         symbols,
         reference=reference,
-        maxCandidates=max_exogenous,
+        maxCandidates=_MAX_EXOGENOUS,
     )
     if reference is None and not candidates:
         _audit(
@@ -556,15 +327,8 @@ def _characterize_assay(
             ),
             assay=assay_name,
         )
-    record["exogenous"] = _classify_exogenous(
-        model=model,
-        candidates=candidates,
-        context=context,
-        decisions=decisions,
-        audit_log=audit_log,
-        assay=assay_name,
-        species=species,
-    )
+    # Structural candidates stay unresolved; policies cite them with evidence.
+    record["exogenous"] = [{**item, "class": "unresolved"} for item in candidates]
     actions.append(f"families:{assay_name}")
     return record
 
@@ -572,21 +336,14 @@ def _characterize_assay(
 def characterize_features(
     store: Any,
     *,
-    studyContext: str | None = None,
-    model: Any | None = None,
     assays: Sequence[str] | None = None,
-    directions: Mapping[str, Any] | None = None,
-    covariates: Any | None = None,
     cacheDir: Path | str | None = None,
     allowDownload: bool = False,
 ) -> FeatureCharacterization:
     """Label feature identity, species, families, and exogenous candidates."""
-    direction_map = dict(directions or {})
     audit_log: list[dict[str, Any]] = []
     actions: list[str] = []
-    decisions: list[dict[str, Any]] = []
     notes: list[str] = []
-    context = _bounded_context(studyContext)
     cache_dir = Path(cacheDir) if cacheDir is not None else default_cache_dir()
 
     available = list(store.assay_names)
@@ -597,34 +354,14 @@ def characterize_features(
             status="failed",
             notes=[f"unknown assays: {unknown}"],
         )
-    species_by_assay = direction_map.get("speciesByAssay")
-    if species_by_assay is not None:
-        if not isinstance(species_by_assay, Mapping):
-            return FeatureCharacterization(
-                status="failed",
-                notes=["speciesByAssay must be a mapping"],
-            )
-        bad = sorted(set(species_by_assay) - set(available))
-        if bad:
-            return FeatureCharacterization(
-                status="failed",
-                notes=[f"speciesByAssay cites unknown assays: {bad}"],
-            )
-
-    sex_note = _sex_coefficient_note(covariates)
     assay_records = [
         _characterize_assay(
             store,
             assay_name,
-            model=model,
-            context=context,
-            directions=direction_map,
             cache_dir=cache_dir,
             allow_download=allowDownload,
             audit_log=audit_log,
             actions=actions,
-            decisions=decisions,
-            sex_note=sex_note,
         )
         for assay_name in selected
     ]
@@ -634,6 +371,5 @@ def characterize_features(
         auditLog=audit_log,
         actions=actions,
         notes=notes,
-        decisions=decisions,
         assays=assay_records,
     )

@@ -3,7 +3,6 @@
 import base64
 import hashlib
 import json
-import re
 from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal, cast
 
@@ -12,6 +11,7 @@ import pandas as pd
 from pydantic import Field, create_model, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
+from ...features.gene_families import GENE_FAMILY_PATTERNS, gene_family_mask
 from ...storage.refs import ArtifactRef
 from ...storage.selections import (
     read_stored_selection_indices,
@@ -23,6 +23,7 @@ from ..config.agent_exec import (
     ImageEvidence,
     ImageInputUnsupportedError,
     build_visual_evidence_prompt,
+    configured_image_input,
     run_agent_sync,
 )
 from ..experimental_context.contracts import CovariateComparison
@@ -50,11 +51,10 @@ from ..parameter_tuning.contracts import (
     ParameterTuningReport,
 )
 from ..parameter_tuning.diagnostics import (
-    SCARF_DEFAULT_DIAGNOSTIC_FAMILIES,
-    _family_mask,
     _neighbor_overlap,
     augment_cluster_evaluations,
     augment_pca_evaluations,
+    family_mask,
     population_support_evidence,
     restore_advisory_doublets,
     score_advisory_doublets,
@@ -90,17 +90,8 @@ _STRUCTURED_VISUAL_LIMITATION = (
 )
 
 
-def _configured_image_input(model: Any) -> bool | None:
-    """Honor an explicit input capability without inferring it from image output."""
-    declared = getattr(model, "supports_image_input", None)
-    if isinstance(declared, bool):
-        return declared
-    profile = getattr(model, "profile", None)
-    if isinstance(profile, Mapping):
-        declared = profile.get("supports_image_input")
-        if isinstance(declared, bool):
-            return declared
-    return None
+class TuningAnswerRejected(ValueError):
+    """A caller assessment failed the scientific checks of its saved review."""
 
 
 def screening_sizes(n_cells: int, config: Any) -> tuple[int, ...]:
@@ -457,9 +448,7 @@ class RnaTuningRun:
         self.answers, self.provenance = answers, provenance
         self.previous_provenances = tuple(previous_provenances)
         self.evidence_revision = (
-            hashlib.sha256(record_io.canonical_json_bytes(provenance)).hexdigest()
-            if previous_provenances
-            else None
+            record_io.sha256_json(provenance) if previous_provenances else None
         )
         self.design_comparisons = tuple(design_comparisons)
         self.prefix = journal._ensure_orchestration_store(store)
@@ -508,13 +497,12 @@ class RnaTuningRun:
             )
             if value is not None and study.columnKinds.get(value) != "continuous"
         ]
-        self.family_patterns = {
-            str(row["family"]): str(row["pattern"])
-            for row in (
-                plan.assays[0].featureParameters.get("defaultFeatureInventory") or {}
-            ).get("families", [])
-            if isinstance(row, Mapping) and "family" in row and "pattern" in row
-        }
+        # Family experiments need the saved default-blacklist inventory.
+        self.families: tuple[str, ...] = (
+            tuple(GENE_FAMILY_PATTERNS)
+            if plan.assays[0].featureParameters.get("defaultFeatureInventory")
+            else ()
+        )
 
     def baseline(self, resolution: float = 1.0) -> RnaSetting:
         assert self.handoff.graphFeatures is not None
@@ -607,7 +595,6 @@ class RnaTuningRun:
                 candidates=[parameters],
                 batch_columns=self.batch_columns,
                 preservation_columns=self.study.protectedColumns,
-                pair_harmony_candidates=False,
                 max_candidates=1,
                 min_cluster_cells=1,
             )
@@ -655,7 +642,7 @@ class RnaTuningRun:
             self.store,
             [evaluation],
             feature_selection=features,
-            nominated_families=SCARF_DEFAULT_DIAGNOSTIC_FAMILIES,
+            nominated_families=tuple(GENE_FAMILY_PATTERNS),
             protected_families=self.plan.assays[0].featureParameters.get(
                 "protectFamilies", []
             ),
@@ -731,7 +718,7 @@ class RnaTuningRun:
             marker_features=self.marker_features,
             independent_unit_columns=self.study.independentUnitColumns,
             technical_columns=self.batch_columns,
-            nominated_families=SCARF_DEFAULT_DIAGNOSTIC_FAMILIES,
+            nominated_families=tuple(GENE_FAMILY_PATTERNS),
             protected_families=self.plan.assays[0].featureParameters.get(
                 "protectFamilies", []
             ),
@@ -778,7 +765,6 @@ class RnaTuningRun:
                 candidates=[evaluation.parameters],
                 batch_columns=self.batch_columns,
                 preservation_columns=self.study.protectedColumns,
-                pair_harmony_candidates=False,
                 max_candidates=1,
                 min_cluster_cells=1,
             )
@@ -934,39 +920,39 @@ class RnaTuningRun:
             options["useHarmony:false"] = {"parameter": "useHarmony", "value": False}
         return options
 
+    def _feature_column(self, column: str) -> np.ndarray:
+        """Return one exact feature-metadata column of the tuned assay."""
+        feats = self.store.get_assay(self.handoff.assay).feats
+        return np.asarray(feats.fetch_all(column)).astype(str)
+
+    def _feature_mask(self, selection: ArtifactReferenceModel) -> np.ndarray:
+        """Load one saved boolean feature selection."""
+        return np.asarray(
+            self.store.load_artifact(selection.to_artifact_ref())["values"][:],
+            dtype=bool,
+        )
+
+    def _protected_features(self, names: np.ndarray, ids: np.ndarray) -> np.ndarray:
+        """Mark objective-protected features and protected gene families."""
+        policy = self.plan.assays[0].featureParameters
+        features = policy.get("protectFeatures", [])
+        protected = np.isin(names, features) | np.isin(ids, features)
+        for family in policy.get("protectFamilies", []):
+            mask = family_mask(names, family)
+            if mask is not None:
+                protected |= mask
+        return protected
+
     def _feature_experiments(self, setting: RnaSetting) -> dict[str, dict[str, Any]]:
         """Offer policy changes only when exact eligible genes can change safely."""
         policy = self.plan.assays[0].featureParameters
-        assay = self.store.get_assay(self.handoff.assay)
-        names = np.asarray(assay.feats.fetch_all("names")).astype(str)
-        ids = np.asarray(assay.feats.fetch_all("ids")).astype(str)
-        eligible = np.asarray(
-            self.store.load_artifact(setting.eligibleFeatures.to_artifact_ref())[
-                "values"
-            ][:],
-            dtype=bool,
-        )
-        allowed = np.asarray(
-            self.store.load_artifact(
-                self.handoff.graphFeatureCandidates["eligibleAll"].to_artifact_ref()
-            )["values"][:],
-            dtype=bool,
-        )
-        protected = np.isin(names, policy.get("protectFeatures", [])) | np.isin(
-            ids, policy.get("protectFeatures", [])
-        )
-        for family in policy.get("protectFamilies", []):
-            mask = _family_mask(names, family)
-            if mask is not None:
-                protected |= mask
+        names, ids = self._feature_column("names"), self._feature_column("ids")
+        eligible = self._feature_mask(setting.eligibleFeatures)
+        allowed = self._feature_mask(self.handoff.graphFeatureCandidates["eligibleAll"])
+        protected = self._protected_features(names, ids)
         masks = {
-            ("Family", family): np.asarray(
-                [
-                    re.search(pattern, name, flags=re.IGNORECASE) is not None
-                    for name in names
-                ]
-            )
-            for family, pattern in self.family_patterns.items()
+            ("Family", family): gene_family_mask(names, family)
+            for family in self.families
         }
         masks.update(
             {
@@ -1091,55 +1077,27 @@ class RnaTuningRun:
             "includeFeature",
             "excludeFeature",
         }:
-            mask = np.asarray(
-                self.store.load_artifact(eligible)["values"][:], dtype=bool
-            )
-            names = np.asarray(
-                self.store.get_assay(self.handoff.assay).feats.fetch_all("names")
-            ).astype(str)
-            feature_ids = np.asarray(
-                self.store.get_assay(self.handoff.assay).feats.fetch_all("ids")
-            ).astype(str)
+            mask = self._feature_mask(setting.eligibleFeatures)
+            names = self._feature_column("names")
+            feature_ids = self._feature_column("ids")
             if field.endswith("Family"):
-                pattern = re.compile(self.family_patterns[value], flags=re.IGNORECASE)
-                family_mask = np.asarray(
-                    [pattern.search(name) is not None for name in names]
-                )
+                changed = gene_family_mask(names, value)
             else:
-                family_mask = (names == value) | (feature_ids == value)
-                if not family_mask.any():
+                changed = (names == value) | (feature_ids == value)
+                if not changed.any():
                     raise ValueError(
                         "The nominated exact feature is absent from the assay"
                     )
             if field.startswith("include"):
-                all_eligible = self.handoff.graphFeatureCandidates[
-                    "eligibleAll"
-                ].to_artifact_ref()
-                allowed = np.asarray(
-                    self.store.load_artifact(all_eligible)["values"][:], dtype=bool
+                mask |= changed & self._feature_mask(
+                    self.handoff.graphFeatureCandidates["eligibleAll"]
                 )
-                mask |= allowed & family_mask
             else:
-                policy = self.plan.assays[0].featureParameters
-                protected_mask = np.isin(
-                    names, policy.get("protectFeatures", [])
-                ) | np.isin(feature_ids, policy.get("protectFeatures", []))
-                for family in policy.get("protectFamilies", []):
-                    family_protection = _family_mask(names, family)
-                    if family_protection is not None:
-                        protected_mask |= family_protection
-                    elif family in self.family_patterns:
-                        pattern = re.compile(
-                            self.family_patterns[family], flags=re.IGNORECASE
-                        )
-                        protected_mask |= np.asarray(
-                            [pattern.search(name) is not None for name in names]
-                        )
-                if np.any(family_mask & protected_mask):
+                if np.any(changed & self._protected_features(names, feature_ids)):
                     raise ValueError(
                         "An objective-protected feature or family cannot be excluded"
                     )
-                mask &= ~family_mask
+                mask &= ~changed
             eligible = self.store.set_feature_selection(
                 from_assay=self.handoff.assay, mask=mask, invalidate_cache=False
             )
@@ -1152,27 +1110,25 @@ class RnaTuningRun:
             if ranking_mode == "batchAware" and ranking_column is not None
             else None
         )
-        features = rank_core_hvgs(
-            self.store,
-            eligible=eligible,
-            statistics=self.handoff.graphFeatureCandidates[
-                "eligibleAll"
-            ].to_artifact_ref(),
-            top_n=count,
-            ranking=indices,
+        features = ArtifactReferenceModel.from_artifact_ref(
+            rank_core_hvgs(
+                self.store,
+                eligible=eligible,
+                statistics=self.handoff.graphFeatureCandidates[
+                    "eligibleAll"
+                ].to_artifact_ref(),
+                top_n=count,
+                ranking=indices,
+            )
         )
-        n_features = int(
-            np.asarray(
-                self.store.load_artifact(features)["values"][:], dtype=bool
-            ).sum()
-        )
+        n_features = int(self._feature_mask(features).sum())
         if n_features <= setting.parameters.dimensions:
             raise ValueError(
                 "This feature experiment cannot retain the fixed PCA dimension"
             )
         return setting.model_copy(
             update={
-                "features": ArtifactReferenceModel.from_artifact_ref(features),
+                "features": features,
                 "eligibleFeatures": ArtifactReferenceModel.from_artifact_ref(eligible),
                 "hvgCount": n_features,
                 "ranking": ranking_mode,
@@ -1250,24 +1206,11 @@ class RnaTuningRun:
     def _feature_nomination(self, baseline: RnaSetting) -> dict[str, Any] | None:
         """Find one meaningful, previously justified policy intervention."""
         policy = self.plan.assays[0].featureParameters
-        eligible = np.asarray(
-            self.store.load_artifact(baseline.eligibleFeatures.to_artifact_ref())[
-                "values"
-            ][:],
-            dtype=bool,
+        eligible = self._feature_mask(baseline.eligibleFeatures)
+        all_eligible = self._feature_mask(
+            self.handoff.graphFeatureCandidates["eligibleAll"]
         )
-        all_eligible = np.asarray(
-            self.store.load_artifact(
-                self.handoff.graphFeatureCandidates["eligibleAll"].to_artifact_ref()
-            )["values"][:],
-            dtype=bool,
-        )
-        names = np.asarray(
-            self.store.get_assay(self.handoff.assay).feats.fetch_all("names")
-        ).astype(str)
-        ids = np.asarray(
-            self.store.get_assay(self.handoff.assay).feats.fetch_all("ids")
-        ).astype(str)
+        names, ids = self._feature_column("names"), self._feature_column("ids")
         nominations = [
             *(("includeFeature", value) for value in policy.get("protectFeatures", [])),
             *(("includeFamily", value) for value in policy.get("protectFamilies", [])),
@@ -1280,33 +1223,18 @@ class RnaTuningRun:
                 for value in policy.get("proposedExcludeFamilies", [])
             ),
         ]
-        protected = np.isin(names, policy.get("protectFeatures", [])) | np.isin(
-            ids, policy.get("protectFeatures", [])
-        )
-        for family in policy.get("protectFamilies", []):
-            mask = _family_mask(names, family)
-            if mask is not None:
-                protected |= mask
+        protected = self._protected_features(names, ids)
         for operation, value in nominations:
             if operation.endswith("Family"):
-                mask = _family_mask(names, value)
+                mask = family_mask(names, value)
                 if mask is None:
                     continue
-                if value not in self.family_patterns:
+                if value not in self.families:
                     value = next(
                         (
                             family
-                            for family, pattern in self.family_patterns.items()
-                            if np.array_equal(
-                                mask,
-                                np.asarray(
-                                    [
-                                        re.search(pattern, name, flags=re.IGNORECASE)
-                                        is not None
-                                        for name in names
-                                    ]
-                                ),
-                            )
+                            for family in self.families
+                            if np.array_equal(mask, gene_family_mask(names, family))
                         ),
                         None,
                     )
@@ -1437,12 +1365,8 @@ class RnaTuningRun:
                     if (
                         known.features == setting.features
                         or np.array_equal(
-                            self.store.load_artifact(known.features.to_artifact_ref())[
-                                "values"
-                            ][:],
-                            self.store.load_artifact(
-                                setting.features.to_artifact_ref()
-                            )["values"][:],
+                            self._feature_mask(known.features),
+                            self._feature_mask(setting.features),
                         )
                         or (
                             identifier == "featurePolicy"
@@ -1484,7 +1408,7 @@ class RnaTuningRun:
                 proof.update(
                     kind="noPermittedPolicy",
                     meaningfulPermittedInterventions=0,
-                    registeredFamilies=list(self.family_patterns),
+                    registeredFamilies=list(self.families),
                 )
             if experiment is not None:
                 if experiment["parameter"] in {"dimensions", "neighborsK"}:
@@ -1504,12 +1428,8 @@ class RnaTuningRun:
                     "featurePolicy",
                 }:
                     same_genes = np.array_equal(
-                        self.store.load_artifact(
-                            alternative_setting.features.to_artifact_ref()
-                        )["values"][:],
-                        self.store.load_artifact(setting.features.to_artifact_ref())[
-                            "values"
-                        ][:],
+                        self._feature_mask(alternative_setting.features),
+                        self._feature_mask(setting.features),
                     )
                 if (
                     axis == "featurePolicy"
@@ -1697,12 +1617,7 @@ class RnaTuningRun:
                     ranking=order,
                 )
             )
-        actual_count = int(
-            np.asarray(
-                self.store.load_artifact(features.to_artifact_ref())["values"][:],
-                dtype=bool,
-            ).sum()
-        )
+        actual_count = int(self._feature_mask(features).sum())
         if parameters.dimensions >= min(actual_count, self.scope_sizes[scope]):
             raise ValueError(
                 "Combined settings cannot support the selected PCA dimension"
@@ -1782,9 +1697,7 @@ class RnaTuningRun:
                 self.prefix,
                 self.workflow.workflowRunId,
                 "parameter_tuning/full/targeted_recovery/"
-                + hashlib.sha256(
-                    record_io.canonical_json_bytes(recovery_inputs)
-                ).hexdigest(),
+                + record_io.sha256_json(recovery_inputs),
                 inputs=recovery_inputs,
                 outputs={
                     "purpose": "Resolve the recorded screening concern using full-cohort population, marker, stability and preservation evidence for the proposed settings.",
@@ -1811,32 +1724,19 @@ class RnaTuningRun:
         key = setting.model_dump_json(exclude={"parameters"})
         if key in self.feature_evidence_cache:
             return self.feature_evidence_cache[key]
-        mask = np.asarray(
-            self.store.load_artifact(setting.features.to_artifact_ref())["values"][:],
-            dtype=bool,
-        )
-        eligible = np.asarray(
-            self.store.load_artifact(setting.eligibleFeatures.to_artifact_ref())[
-                "values"
-            ][:],
-            dtype=bool,
-        )
+        mask = self._feature_mask(setting.features)
+        eligible = self._feature_mask(setting.eligibleFeatures)
         reference = self.handoff.graphFeatureCandidates["eligibleAll"].to_artifact_ref()
         variance = np.asarray(
             self.store.load_artifact(reference)["corrected_variance"][:],
             dtype=np.float64,
         )
-        names = np.asarray(
-            self.store.get_assay(self.handoff.assay).feats.fetch_all("names")
-        ).astype(str)
+        names = self._feature_column("names")
         indices = np.flatnonzero(eligible)
         ranked = indices[np.lexsort((indices, -variance[indices]))]
         families = {}
-        for family, pattern in self.family_patterns.items():
-            expression = re.compile(pattern, flags=re.IGNORECASE)
-            membership = np.asarray(
-                [expression.search(name) is not None for name in names]
-            )
+        for family in self.families:
+            membership = gene_family_mask(names, family)
             families[family] = {
                 "eligibleGenes": int((eligible & membership).sum()),
                 "selectedGenes": int((mask & membership).sum()),
@@ -1896,12 +1796,8 @@ class RnaTuningRun:
         }
         committed_review = previous_review
         prepared_inputs = {
-            "candidatesSha256": hashlib.sha256(
-                record_io.canonical_json_bytes(candidate_evidence)
-            ).hexdigest(),
-            "settingsSha256": hashlib.sha256(
-                record_io.canonical_json_bytes(setting_evidence)
-            ).hexdigest(),
+            "candidatesSha256": record_io.sha256_json(candidate_evidence),
+            "settingsSha256": record_io.sha256_json(setting_evidence),
             "coverage": coverage,
             "provenance": self.provenance,
         }
@@ -1949,8 +1845,6 @@ class RnaTuningRun:
             if (
                 candidate.candidateId == selected.candidateId
                 or candidate.cellSelection != selected.cellSelection
-                or other.parameters.reductionMethod
-                != current_setting.parameters.reductionMethod
             ):
                 continue
             changes = setting_changes(
@@ -2037,7 +1931,7 @@ class RnaTuningRun:
                     "basis": "Same frozen cells and k; descriptive response to settings, not independent stability or evidence that correction is beneficial.",
                 }
             )
-        declared_image_input = _configured_image_input(self.owner.model)
+        declared_image_input = configured_image_input(self.owner.model)
         capability_key = "parameter_tuning/structured_evidence"
         capability_inputs = {
             **(
@@ -2335,20 +2229,11 @@ class RnaTuningRun:
                 self.study.correctionLicense == "unsafeConfounded"
                 and action.correctionNeed in {"needed", "notNeeded"}
             ):
-                message = (
+                raise ValueError(
                     "The design confounds the batch columns with protected biology; their association cannot establish a removable technical effect. "
                     "Harmony is not permitted, and a PCA or feature experiment is not a substitute for Harmony. "
                     "Use notApplicable for the prohibited correction with an explicit confounding limitation, or uncertain and defer if an essential question cannot be resolved."
                 )
-                if replay and action.action == "experiment":
-                    self.history.append(
-                        {
-                            "scope": scope,
-                            "reason": "A saved screening rationale claimed identifiable correction necessity despite the confounded design. Its numerical experiment remains in the audit history; that scientific claim must be reassessed from the supplied evidence.",
-                        }
-                    )
-                else:
-                    raise ValueError(message)
             if (
                 self.study.correctionLicense == "safe"
                 and action.correctionNeed == "notApplicable"
@@ -2438,13 +2323,11 @@ class RnaTuningRun:
             self.store, self.prefix, self.workflow.workflowRunId, key, inputs=evidence
         )
         pending_saved = saved is not None and saved["action"]["action"] == "defer"
-        answer = self.answers.get(key)
-        if (
-            answer is None
-            and not self.answer_consumed
-            and (saved is None or pending_saved)
-        ):
-            answer = self.answers.get("parameter_tuning")
+        answer = (
+            self.answers.get("parameter_tuning")
+            if not self.answer_consumed and (saved is None or pending_saved)
+            else None
+        )
         if pending_saved:
             assert saved is not None
             answer_inputs = {**evidence, "deferredAction": saved["action"]}
@@ -2473,7 +2356,12 @@ class RnaTuningRun:
         if saved is not None:
             action = validate(TuningAction.model_validate(saved["action"]), replay=True)
         elif answer is not None:
-            action = validate(TuningAction.model_validate(answer))
+            try:
+                action = validate(TuningAction.model_validate(answer))
+            except ValueError as exc:
+                raise TuningAnswerRejected(
+                    f"The supplied assessment was rejected: {exc}"
+                ) from exc
             self.answer_consumed = True
         else:
             journal.save_checkpoint(
@@ -2622,14 +2510,12 @@ class RnaTuningRun:
                 "review": action.model_dump(mode="json"),
                 "imageHashes": image_hashes,
                 "checkpointKey": key,
-                "checkpointSha256": hashlib.sha256(
-                    record_io.canonical_json_bytes(
-                        {
-                            "inputs": evidence,
-                            "outputs": {"action": action.model_dump(mode="json")},
-                        }
-                    )
-                ).hexdigest(),
+                "checkpointSha256": record_io.sha256_json(
+                    {
+                        "inputs": evidence,
+                        "outputs": {"action": action.model_dump(mode="json")},
+                    }
+                ),
             }
         )
         self.last_action = action
@@ -2848,12 +2734,8 @@ class RnaTuningRun:
                     )
                 prior_setting = self.settings[prior.candidateId]
                 if setting.hvgCount != prior_setting.hvgCount or np.array_equal(
-                    self.store.load_artifact(setting.features.to_artifact_ref())[
-                        "values"
-                    ][:],
-                    self.store.load_artifact(prior_setting.features.to_artifact_ref())[
-                        "values"
-                    ][:],
+                    self._feature_mask(setting.features),
+                    self._feature_mask(prior_setting.features),
                 ):
                     pending_policy.update(
                         status="notApplicable",

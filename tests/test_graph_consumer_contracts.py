@@ -167,19 +167,17 @@ def test_agent_scores_zero_weight_graph(zero_weight_graphs):
     assert warnings == []
 
 
-def test_topacedo_ignores_zero_edges_without_mutating_cached_graph(zero_weight_graphs):
+def test_topacedo_ignores_zero_edges(zero_weight_graphs):
     store, graphs = zero_weight_graphs
     graph = graphs[0]
     clusters = store.run_paris_clustering(graph, n_clusters=2)
-    with store._graph_memory_cache_scope():
-        cached = store.load_graph(graph)
-        sampled = store.run_topacedo_sampler(graph, clusters, density_depth=1)
-        edges = store.load_artifact(sampled)["edges"][:]
-        assert len(edges) > 0
-        assert np.all(np.asarray(cached[edges[:, 0], edges[:, 1]]).ravel() > 0)
-        assert store.load_graph(graph) is cached
-        assert cached.nnz == 18 * 11
-        assert np.count_nonzero(cached.data == 0) == 54
+    loaded = store.load_graph(graph)
+    sampled = store.run_topacedo_sampler(graph, clusters, density_depth=1)
+    edges = store.load_artifact(sampled)["edges"][:]
+    assert len(edges) > 0
+    assert np.all(np.asarray(loaded[edges[:, 0], edges[:, 1]]).ravel() > 0)
+    assert loaded.nnz == 18 * 11
+    assert np.count_nonzero(loaded.data == 0) == 54
 
 
 def _parameter_names(method: object) -> list[str]:
@@ -255,7 +253,6 @@ def test_graph_and_neighbor_consumers_have_no_path_selectors() -> None:
     assert "graph" not in fate_names
 
     neighbor_methods = (
-        DataStore.metric_lisi,
         DataStore.metric_ilisi,
         DataStore.metric_clisi,
         DataStore.metric_graph_silhouette,

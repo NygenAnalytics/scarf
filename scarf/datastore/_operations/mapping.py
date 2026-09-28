@@ -1,4 +1,3 @@
-import os
 from collections.abc import Generator
 from contextlib import closing
 from tempfile import TemporaryFile
@@ -49,7 +48,8 @@ from ...storage.selections import (
     read_stored_selection_indices,
     validate_stored_selection_integrity,
 )
-from ...storage.stores import zarr_root_path
+from ...storage.stores import locations_overlap, zarr_root_path
+from ...utils.arrays import sparse_matrix_bytes
 from ...utils.logging import logger
 from ...storage.feature_selection import (
     _feature_selection_plan,
@@ -87,39 +87,41 @@ def _finite_in_range(
     return resolved
 
 
-def _normalized_store_location(value: object) -> str | None:
-    if not isinstance(value, str) or not value:
-        return None
-    location = value.rstrip("/")
-    if location.startswith("file://"):
-        location = location[7:]
-    if "://" in location:
-        return location
-    return os.path.realpath(os.path.abspath(os.path.expanduser(location)))
+def _label_transfer_threshold(
+    reference_class_group: Any,
+    threshold_fraction: Any,
+    na_val: Any,
+) -> float:
+    """Validate shared label-transfer arguments and return the vote threshold."""
+    if not isinstance(reference_class_group, str) or not reference_class_group:
+        raise TypeError("reference_class_group must be a non-empty string")
+    threshold = _finite_in_range(
+        threshold_fraction,
+        "threshold_fraction must be between zero and one",
+        low=0.0,
+        high=1.0,
+    )
+    if not isinstance(na_val, str):
+        raise TypeError("na_val must be a string")
+    return threshold
 
 
-def _physical_store_tokens(datastore: Any) -> set[tuple[str, str | int]]:
-    root = datastore.z
-    store = root.store
-    tokens: set[tuple[str, str | int]] = {("object", id(store))}
-    root_path = _normalized_store_location(zarr_root_path(root))
-    if root_path is not None:
-        tokens.add(("root", root_path))
-    location = _normalized_store_location(getattr(datastore, "zarr_loc", None))
-    if location is not None:
-        tokens.add(("location", location))
-    store_root = _normalized_store_location(str(getattr(store, "root", "")))
-    if store_root is not None:
-        tokens.add(("root", store_root))
-    return tokens
+def _store_locations(datastore: Any) -> set[str]:
+    candidates = (zarr_root_path(datastore.z), getattr(datastore, "zarr_loc", None))
+    return {value for value in candidates if isinstance(value, str) and value}
 
 
 def _same_physical_store(query: Any, reference: MappingReference) -> bool:
+    """Return whether the two datastores share or nest one Zarr store."""
     reference_datastore = reference.datastore
     if not hasattr(reference_datastore, "z"):
         raise TypeError("reference.datastore must be an open DataStore")
-    return bool(
-        _physical_store_tokens(query) & _physical_store_tokens(reference_datastore)
+    if query.z.store is reference_datastore.z.store:
+        return True
+    return any(
+        locations_overlap(first, second)
+        for first in _store_locations(query)
+        for second in _store_locations(reference_datastore)
     )
 
 
@@ -198,11 +200,7 @@ def _mapping_memory_reservations(
     sum_bytes = count_bytes * symphony.n_dims
     n_terms = n_batches if batch_design is None else batch_design.shape[1]
     if batch_design is not None:
-        resident += 4 * (
-            batch_design.data.nbytes
-            + batch_design.indices.nbytes
-            + batch_design.indptr.nbytes
-        )
+        resident += 4 * sparse_matrix_bytes(batch_design)
     solve_bytes = (
         4 * (n_terms + 1) ** 2 * float_bytes
         + 2 * (n_terms + 1) * symphony.n_dims * float_bytes
@@ -590,6 +588,19 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             raise ValueError("query_batches column names must be unique")
         if query_batches.isna().any().any():
             raise ValueError("query_batches cannot contain missing values")
+        for name, column in query_batches.items():
+            # The batch fingerprint hashes values by their text, so values
+            # such as 1 and "1" would name different batches with one digest.
+            values = pd.unique(column.to_numpy(dtype=object))
+            texts = {
+                value if isinstance(value, bytes) else str(value).encode()
+                for value in values
+            }
+            if len(texts) != len(values):
+                raise ValueError(
+                    f"query_batches column {name!r} has distinct values with the "
+                    "same text, such as 1 and '1'; use one value type per column"
+                )
         rows = pd.MultiIndex.from_frame(query_batches)
         codes, levels = pd.factorize(rows, sort=False)
         resolved = np.asarray(codes, dtype=np.int64)
@@ -766,7 +777,11 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         n_k = int(indices.shape[1])
         block_size = self._projection_block_size(indices)
 
-        from ...mapping.confidence import mapping_score_weights
+        from ...mapping.confidence import (
+            add_mapping_scores,
+            finish_mapping_scores,
+            mapping_score_weights,
+        )
 
         for batch in batches:
             rows = np.full(len(labels), -1, dtype=np.int64)
@@ -775,16 +790,17 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 (len(batch), loaded.reference.selected_cell_count),
                 dtype=np.float64,
             )
-            informative_counts = np.zeros(len(batch), dtype=np.int64)
+            scored_rows = np.zeros(len(batch), dtype=np.int64)
             for start in range(0, loaded.n_cells, block_size):
                 stop = min(start + block_size, loaded.n_cells)
                 block_rows = rows[codes[start:stop]]
-                keep = (block_rows >= 0) & ~np.asarray(
+                # Rows of other groups and uninformative query cells add nothing.
+                skip = (block_rows < 0) | np.asarray(
                     uninformative[start:stop], dtype=bool
                 )
-                if not keep.any():
+                if skip.all():
                     continue
-                block_rows = block_rows[keep]
+                keep = ~skip
                 block_indices = np.asarray(indices[start:stop])[keep]
                 if weighted:
                     block_weights = mapping_score_weights(
@@ -794,20 +810,21 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                     block_weights = np.full(
                         block_indices.shape, weight, dtype=np.float64
                     )
-                np.add.at(
+                add_mapping_scores(
                     scores,
-                    (
-                        np.broadcast_to(block_rows[:, np.newaxis], block_indices.shape),
-                        block_indices,
-                    ),
+                    scored_rows,
+                    block_indices,
                     block_weights,
+                    skip=skip,
+                    groups=block_rows,
                 )
-                informative_counts += np.bincount(block_rows, minlength=len(batch))
-            for row, informative_count in enumerate(informative_counts):
-                if informative_count:
-                    scores[row] *= scale / (int(informative_count) * n_k)
-            if log_transform:
-                np.log1p(scores, out=scores)
+            finish_mapping_scores(
+                scores,
+                scored_rows,
+                n_neighbors=n_k,
+                multiplier=scale,
+                log_transform=log_transform,
+            )
             yield from zip(labels[batch], scores, strict=True)
 
     @staticmethod
@@ -819,6 +836,23 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         valid_codes, categories = pd.factorize(labels[valid], sort=False)
         codes[valid] = valid_codes
         return np.asarray(categories, dtype=object), codes
+
+    def _label_transfer_codes(
+        self,
+        result: ArtifactRef,
+        reference: MappingReference,
+        reference_class_group: str,
+    ) -> tuple[MappingResult, np.ndarray, np.ndarray]:
+        """Load a projection with its reference class labels and label codes."""
+        loaded = self.get_mapping_result(
+            result,
+            reference=reference,
+            load_arrays=False,
+        )
+        class_labels, reference_codes = self._reference_label_codes(
+            loaded.reference, reference_class_group
+        )
+        return loaded, class_labels, reference_codes
 
     def _iter_label_votes(
         self,
@@ -862,24 +896,15 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         na_val: str = "NA",
     ) -> pd.Series:
         """Transfer one reference label column to projected query cells."""
-        if not isinstance(reference_class_group, str) or not reference_class_group:
-            raise TypeError("reference_class_group must be a non-empty string")
-        threshold = _finite_in_range(
+        threshold = _label_transfer_threshold(
+            reference_class_group,
             threshold_fraction,
-            "threshold_fraction must be between zero and one",
-            low=0.0,
-            high=1.0,
+            na_val,
         )
-        if not isinstance(na_val, str):
-            raise TypeError("na_val must be a string")
-
-        loaded = self.get_mapping_result(
+        loaded, class_labels, reference_codes = self._label_transfer_codes(
             result,
-            reference=reference,
-            load_arrays=False,
-        )
-        class_labels, reference_codes = self._reference_label_codes(
-            loaded.reference, reference_class_group
+            reference,
+            reference_class_group,
         )
 
         target_subset_set: dict[int, None] | None = None
@@ -929,16 +954,11 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         ``calibration_nonconformity`` optionally adds split-conformal prediction
         sets. Its calibration rows must be exchangeable with future queries.
         """
-        if not isinstance(reference_class_group, str) or not reference_class_group:
-            raise TypeError("reference_class_group must be a non-empty string")
-        threshold = _finite_in_range(
+        threshold = _label_transfer_threshold(
+            reference_class_group,
             threshold_fraction,
-            "threshold_fraction must be between zero and one",
-            low=0.0,
-            high=1.0,
+            na_val,
         )
-        if not isinstance(na_val, str):
-            raise TypeError("na_val must be a string")
         distance_limit = (
             None
             if max_distance is None
@@ -948,14 +968,10 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 low=0.0,
             )
         )
-
-        loaded = self.get_mapping_result(
+        loaded, class_labels, reference_codes = self._label_transfer_codes(
             result,
-            reference=reference,
-            load_arrays=False,
-        )
-        class_labels, reference_codes = self._reference_label_codes(
-            loaded.reference, reference_class_group
+            reference,
+            reference_class_group,
         )
 
         from ...mapping.confidence import (
@@ -1049,45 +1065,3 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         if prediction_sets is not None:
             evidence["predictionSet"] = prediction_sets
         return evidence
-
-    @staticmethod
-    def calibrate_label_transfer_threshold(
-        vote_fractions: np.ndarray,
-        correct: np.ndarray,
-        target_coverage: float = 0.9,
-    ) -> dict[str, float]:
-        """Choose a vote threshold on held-out, donor-level validation data."""
-        raw_fractions = np.asarray(vote_fractions)
-        raw_correct = np.asarray(correct)
-        if raw_fractions.ndim != 1 or raw_correct.shape != raw_fractions.shape:
-            raise ValueError("vote_fractions and correct must be matching vectors")
-        if raw_fractions.dtype.kind not in {"i", "u", "f"}:
-            raise ValueError("vote_fractions must be real numeric values in [0, 1]")
-        if raw_correct.dtype != np.dtype(bool):
-            raise ValueError("correct must be a boolean vector")
-        fractions = np.asarray(raw_fractions, dtype=np.float64)
-        if (
-            not np.all(np.isfinite(fractions))
-            or np.any(fractions < 0)
-            or np.any(fractions > 1)
-        ):
-            raise ValueError("vote_fractions must be finite values in [0, 1]")
-        coverage = _finite_in_range(
-            target_coverage,
-            "target_coverage must be in (0, 1]",
-            low=0.0,
-            high=1.0,
-            low_open=True,
-        )
-        correct_values = np.asarray(raw_correct, dtype=bool)
-        valid = fractions[correct_values]
-        if valid.size == 0:
-            raise ValueError("At least one correct held-out prediction is required")
-        threshold = float(np.quantile(valid, 1 - coverage))
-        selected = fractions >= threshold
-        accuracy = float(correct_values[selected].mean()) if selected.any() else 0.0
-        return {
-            "voteThreshold": threshold,
-            "validationCoverage": float(selected.mean()),
-            "validationAccuracy": accuracy,
-        }

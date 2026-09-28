@@ -24,18 +24,19 @@ from .fragments import (
 from .hdf5 import (
     H5ADMatrixSource,
     H5SparseMatrixSource,
-    HDF5ArrayMatrixSource,
+    HDF5DenseMatrixSource,
     ReshapedHDF5ArrayMatrixSource,
-    TENxMatrixSource,
+    TenXMatrixSource,
 )
 from .operations import (
     AxisMinimumMatrixSource,
     LinearResidualMatrixSource,
     PearsonResidualMatrixSource,
     ScaleShiftMatrixSource,
+    Subassignment,
     build_matrix_operation,
 )
-from .paths import SidecarPathResolver, require_filesystem_path
+from .paths import SidecarPathResolver
 from .sources import (
     DEFAULT_LIMITS,
     CscMatrixSource,
@@ -44,6 +45,15 @@ from .sources import (
     RenamedMatrixSource,
     SourceLimits,
     TransposeMatrixSource,
+)
+from .values import (
+    class_names,
+    decode_text,
+    logical_scalar,
+    read_bounded,
+    scalar_value,
+    shape_value,
+    vector_length,
 )
 
 
@@ -65,11 +75,8 @@ _CSC_CLASSES = frozenset(
         "lgCMatrix",
         "ngCMatrix",
         "igCMatrix",
-        "CSC",
     }
 )
-_BPCELLS_DIRECTORY_CLASSES = frozenset({"MatrixDir", "BPCellsMatrixDir"})
-_BPCELLS_HDF5_CLASSES = frozenset({"MatrixH5", "BPCellsMatrixH5"})
 _BPCELLS_MEMORY_CLASSES: dict[str, tuple[str, str]] = {
     "PackedMatrixMem_uint32_t": ("packed", "uint"),
     "PackedMatrixMem_float": ("packed", "float"),
@@ -79,7 +86,6 @@ _BPCELLS_MEMORY_CLASSES: dict[str, tuple[str, str]] = {
     "UnpackedMatrixMem_double": ("unpacked", "double"),
 }
 _HDF5_DENSE_CLASSES = frozenset({"HDF5ArraySeed", "Dense_H5ADArraySeed"})
-_HDF5_RESHAPED_CLASSES = frozenset({"ReshapedHDF5ArraySeed"})
 _H5_SPARSE_CLASSES = frozenset(
     {
         "H5SparseMatrixSeed",
@@ -97,8 +103,10 @@ _H5AD_CLASSES = frozenset(
     }
 )
 _TENX_CLASSES = frozenset({"TENxMatrixSeed", "10xMatrixH5"})
-_HDF5_WRAPPER_CLASSES = frozenset(
+_WRAPPER_CLASSES = frozenset(
     {
+        "DelayedArray",
+        "DelayedMatrix",
         "HDF5Array",
         "HDF5Matrix",
         "H5SparseMatrix",
@@ -106,19 +114,8 @@ _HDF5_WRAPPER_CLASSES = frozenset(
         "TENxMatrix",
     }
 )
-
-
-def _class_names(value: Any) -> tuple[str, ...]:
-    if value is None:
-        return ()
-    if isinstance(value, str):
-        return (value,)
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
-        result = tuple(str(item) for item in value)
-        if not result:
-            raise MatrixSourceError("matrix class vector cannot be empty")
-        return result
-    return (str(value),)
+_RENAME_CLASSES = frozenset({"DelayedSetDimnames", "RenameDims"})
+_INHERIT_DIMNAMES = -1
 
 
 def _first_value(slots: Mapping[str, Any], *names: str) -> Any:
@@ -139,63 +136,43 @@ def _optional_value(
     return default
 
 
-def _slot_array(value: Any, *, dtype: Any = None) -> NDArray[Any]:
-    read_block = getattr(value, "read_block", None)
-    raw = read_block(0, len(value)) if callable(read_block) else value
-    return np.asarray(raw, dtype=dtype)
-
-
-def _slot_shape(value: Any, *, object_path: str) -> tuple[int, int]:
-    values = _slot_array(value)
-    if (
-        values.ndim != 1
-        or values.size != 2
-        or not np.issubdtype(values.dtype, np.number)
-        or np.any(~np.isfinite(values))
-        or np.any(values != np.floor(values))
-    ):
-        raise MatrixSourceError(f"dim slot at {object_path} must contain two integers")
-    shape = (int(values[0]), int(values[1]))
-    if min(shape) < 0:
-        raise MatrixSourceError(f"dim slot at {object_path} cannot be negative")
-    return shape
+def _bounded_array(
+    value: Any,
+    *,
+    object_path: str,
+    limits: SourceLimits,
+    dtype: Any = None,
+) -> NDArray[Any]:
+    """Materialize a serialized vector, rejecting lengths beyond the budget."""
+    if isinstance(value, np.ndarray | list | tuple):
+        values = np.asarray(value)
+        return values if dtype is None else values.astype(dtype, copy=False)
+    return read_bounded(
+        value,
+        max_length=max(1, limits.maxMetadataBytes // 8),
+        object_path=object_path,
+        dtype=dtype,
+    )
 
 
 def _slot_text(value: Any, *, slot_name: str, object_path: str) -> str:
     if isinstance(value, str):
         return value
-    values = value.read_block(0, len(value)) if hasattr(value, "read_block") else value
-    if (
-        not isinstance(values, Sequence | np.ndarray)
-        or isinstance(values, bytes | bytearray)
-        or len(values) != 1
-    ):
+    if isinstance(value, bytes | bytearray) or vector_length(value, object_path) != 1:
         raise MatrixSourceError(f"{slot_name} at {object_path} must contain one string")
-    item = values[0]
-    if isinstance(item, bytes):
-        try:
-            return item.decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise MatrixSourceError(
-                f"{slot_name} at {object_path} is not valid UTF-8"
-            ) from error
-    if not isinstance(item, str):
-        raise MatrixSourceError(f"{slot_name} at {object_path} must contain one string")
-    return item
-
-
-def _slot_boolean(
-    value: Any,
-    *,
-    slot_name: str,
-    object_path: str,
-) -> bool:
-    values = _slot_array(value).reshape(-1)
-    if values.size != 1:
-        raise MatrixSourceError(
-            f"{slot_name} at {object_path} must contain one logical value"
+    try:
+        return decode_text(
+            scalar_value(value, object_path), f"{slot_name} at {object_path}"
         )
-    return bool(values[0])
+    except TypeError as error:
+        raise MatrixSourceError(
+            f"{slot_name} at {object_path} must contain one string"
+        ) from error
+
+
+def _slot_flag(slots: Mapping[str, Any], name: str, object_path: str) -> bool:
+    value = slots.get(name)
+    return False if value is None else logical_scalar(value, f"{name} at {object_path}")
 
 
 def _parameter_matrix(
@@ -203,11 +180,12 @@ def _parameter_matrix(
     name: str,
     *,
     object_path: str,
+    limits: SourceLimits,
 ) -> NDArray[Any]:
     value = slots.get(name)
     if value is None:
         return np.empty((0, 0), dtype=np.float64)
-    values = _slot_array(value)
+    values = _bounded_array(value, object_path=f"{object_path}@{name}", limits=limits)
     if values.ndim == 1:
         if values.size == 0:
             return np.empty((0, 0), dtype=values.dtype)
@@ -217,6 +195,28 @@ def _parameter_matrix(
             f"{name} at {object_path} must be a two-dimensional matrix"
         )
     return values
+
+
+def _parameter_vector(
+    slots: Mapping[str, Any],
+    name: str,
+    *,
+    object_path: str,
+    max_length: int,
+) -> NDArray[Any]:
+    value = slots.get(name)
+    if value is None:
+        return np.empty(0, dtype=np.float64)
+    if isinstance(value, np.ndarray | list | tuple):
+        values = np.asarray(value).reshape(-1)
+        if values.size > max_length:
+            raise MatrixSourceError(
+                f"{name} at {object_path} has more than {max_length} values"
+            )
+        return values
+    return read_bounded(
+        value, max_length=max_length, object_path=f"{name} at {object_path}"
+    )
 
 
 def _operation_arguments(
@@ -234,20 +234,18 @@ def _operation_arguments(
         raw_values = (value,)
     output: list[int | float | complex] = []
     for index, raw in enumerate(raw_values):
-        values = _slot_array(raw).reshape(-1)
-        if values.size != 1:
+        try:
+            scalar = scalar_value(raw, f"{object_path}[{index}]")
+        except MatrixSourceError as error:
             raise UnsupportedMatrixOperation(
                 f"{object_path}[{index}]",
                 "delayed-function-argument",
                 None,
                 "only scalar numeric arguments are supported",
-            )
-        scalar = values[0]
-        if isinstance(scalar, np.generic):
-            scalar = scalar.item()
-        if isinstance(scalar, bool) or not isinstance(
+            ) from error
+        if isinstance(scalar, bool | np.bool_) or not isinstance(
             scalar,
-            int | float | complex,
+            int | float | complex | np.number,
         ):
             raise UnsupportedMatrixOperation(
                 f"{object_path}[{index}]",
@@ -255,17 +253,13 @@ def _operation_arguments(
                 None,
                 "only scalar numeric arguments are supported",
             )
-        output.append(scalar)
+        output.append(scalar.item() if isinstance(scalar, np.generic) else scalar)
     return tuple(output)
 
 
 def _dimnames(
     slots: Mapping[str, Any],
-) -> tuple[Sequence[str | bytes] | np.ndarray[Any, Any] | None, ...]:
-    row_names = _optional_value(slots, "rowNames", "row_names")
-    column_names = _optional_value(slots, "columnNames", "column_names")
-    if row_names is not None or column_names is not None:
-        return row_names, column_names
+) -> tuple[Any, Any]:
     values = _optional_value(slots, "Dimnames", "dimnames")
     if values is None:
         return None, None
@@ -278,83 +272,122 @@ def _dimnames(
     return values[0], values[1]
 
 
+def _renamed_axis(value: Any, inherited: tuple[str, ...] | None) -> Any:
+    """Return a rename node's names; DelayedArray marks inherited axes with -1."""
+    if isinstance(value, int | np.integer) and int(value) == _INHERIT_DIMNAMES:
+        return inherited
+    if (
+        value is not None
+        and not isinstance(value, str | bytes)
+        and getattr(value, "dtype", np.dtype(object)).kind in "iu"
+        and vector_length(value, "dimnames") == 1
+        and int(scalar_value(value, "dimnames")) == _INHERIT_DIMNAMES
+    ):
+        return inherited
+    return value
+
+
+def _r_indexes(
+    value: Any,
+    *,
+    slot_name: str,
+    object_path: str,
+    limits: SourceLimits,
+) -> NDArray[np.int64] | None:
+    """Convert a serialized one-based R index vector to zero-based indexes."""
+    if value is None:
+        return None
+    indexes = _bounded_array(
+        value, object_path=f"{slot_name} at {object_path}", limits=limits
+    )
+    if indexes.size == 0:
+        return np.empty(0, dtype=np.int64)
+    if indexes.ndim != 1 or not np.issubdtype(indexes.dtype, np.integer):
+        raise MatrixSourceError(
+            f"{slot_name} at {object_path} must be a one-dimensional integer vector"
+        )
+    indexes = indexes.astype(np.int64, copy=False)
+    if np.any(indexes <= 0):
+        raise MatrixSourceError(
+            f"{slot_name} at {object_path} contains a missing or nonpositive R index"
+        )
+    return indexes - 1
+
+
+def _r_scalar_integer(value: Any, *, slot_name: str, object_path: str) -> int:
+    try:
+        scalar = scalar_value(value, object_path)
+    except MatrixSourceError as error:
+        raise MatrixSourceError(
+            f"{slot_name} at {object_path} must contain one integer"
+        ) from error
+    if isinstance(scalar, bool | np.bool_) or not isinstance(scalar, int | np.integer):
+        raise MatrixSourceError(
+            f"{slot_name} at {object_path} must contain one integer"
+        )
+    return int(scalar)
+
+
 def _sidecar_path(
     value: Any,
     *,
-    rds_path: str | os.PathLike[str] | None,
+    sidecar_root: str | os.PathLike[str] | None,
     absolute_prefix_remaps: Mapping[str | os.PathLike[str], str | os.PathLike[str]]
     | None,
     expect: str,
+    object_path: str,
 ) -> Path:
-    if rds_path is None:
-        if expect == "file":
-            return require_filesystem_path(value)
-        if not isinstance(value, str | os.PathLike):
-            raise TypeError("sidecar directory must be a filesystem path")
-        path = Path(value).expanduser().resolve(strict=False)
-        if not path.exists():
-            raise FileNotFoundError(path)
-        if not path.is_dir():
-            raise UnsafeSidecarError(f"sidecar path {path} is not a directory")
-        return path
+    if sidecar_root is None:
+        raise UnsafeSidecarError(
+            f"sidecar path at {object_path} needs an anchor directory"
+        )
+    path = (
+        value
+        if isinstance(value, os.PathLike)
+        else _slot_text(value, slot_name="sidecar path", object_path=object_path)
+    )
     return SidecarPathResolver(
-        rds_path,
+        sidecar_root,
         absolute_prefix_remaps=absolute_prefix_remaps,
-    ).resolve(value, expect=expect)
+    ).resolve(path, expect=expect)
 
 
 def _finalize_slot_source(
     source: MatrixSource,
     slots: Mapping[str, Any],
-    row_names: Sequence[str | bytes] | np.ndarray[Any, Any] | None,
-    column_names: Sequence[str | bytes] | np.ndarray[Any, Any] | None,
+    row_names: Any,
+    column_names: Any,
     limits: SourceLimits,
+    *,
+    stored_row_major: bool | None = None,
 ) -> MatrixSource:
-    transpose_value = _optional_value(slots, "transpose", default=False)
-    transpose_array = (
-        np.asarray(transpose_value.read_block(0, len(transpose_value)))
-        if hasattr(transpose_value, "read_block")
-        else np.asarray(transpose_value)
+    """Orient a node's source and apply its dimensions and names.
+
+    ``stored_row_major`` describes how a stored leaf lays out its values. A leaf
+    is transposed when the node's ``transpose`` flag disagrees with it. Every
+    other source is already in the node's logical orientation.
+    """
+    transpose_value = slots.get("transpose")
+    transpose = (
+        False
+        if transpose_value is None
+        else logical_scalar(transpose_value, "transpose slot")
     )
-    if transpose_array.size != 1:
-        raise MatrixSourceError("transpose slot must be scalar")
-    expected_shape_value = _optional_value(slots, "Dim", "dim")
-    expected_shape: tuple[int, int] | None = None
-    if expected_shape_value is not None:
-        expected_array = (
-            np.asarray(expected_shape_value.read_block(0, len(expected_shape_value)))
-            if hasattr(expected_shape_value, "read_block")
-            else np.asarray(expected_shape_value)
-        )
-        if (
-            expected_array.ndim != 1
-            or expected_array.size != 2
-            or not np.issubdtype(expected_array.dtype, np.number)
-            or np.any(~np.isfinite(expected_array))
-            or np.any(expected_array != np.floor(expected_array))
-        ):
-            raise MatrixSourceError("dim slot must contain two integers")
-        expected_shape = (int(expected_array[0]), int(expected_array[1]))
-        if min(expected_shape) < 0:
-            raise MatrixSourceError("dim slot cannot contain negative values")
-    should_transpose = bool(transpose_array.reshape(-1)[0])
-    if expected_shape is not None:
-        if source.shape == expected_shape:
-            should_transpose = False
-        elif source.shape[::-1] == expected_shape:
-            should_transpose = True
-        else:
+    if stored_row_major is not None and transpose != stored_row_major:
+        source = TransposeMatrixSource(source, limits=limits)
+    dimensions = _optional_value(slots, "Dim", "dim")
+    if dimensions is not None:
+        expected_shape = shape_value(dimensions, "dim slot")
+        if source.shape != expected_shape:
             raise MatrixSourceError(
                 f"matrix source shape {source.shape} does not match dim slot "
                 f"{expected_shape}"
             )
-    if should_transpose:
-        source = TransposeMatrixSource(source, limits=limits)
     if row_names is not None or column_names is not None:
         source = RenamedMatrixSource(
             source,
-            row_names=row_names,
-            column_names=column_names,
+            row_names=source.row_names if row_names is None else row_names,
+            column_names=source.column_names if column_names is None else column_names,
             limits=limits,
         )
     return source
@@ -374,56 +407,6 @@ _UNARY_TRANSFORM_CLASSES = {
 }
 
 
-def _r_selection(
-    slots: Mapping[str, Any],
-    name: str,
-    zero_dims: NDArray[np.bool_],
-    axis: int,
-) -> NDArray[np.int64] | None:
-    raw = _slot_array(slots.get(name, ()), dtype=np.int64).reshape(-1)
-    if raw.size:
-        if np.any(raw <= 0):
-            raise MatrixSourceError(f"{name} must contain positive R indexes")
-        return raw - 1
-    if zero_dims.size > axis and bool(zero_dims[axis]):
-        return np.empty(0, dtype=np.int64)
-    return None
-
-
-def _r_delayed_selection(
-    value: Any,
-    *,
-    slot_name: str,
-    object_path: str,
-) -> NDArray[np.int64] | None:
-    if value is None:
-        return None
-    indexes = _slot_array(value)
-    if indexes.ndim != 1 or not np.issubdtype(indexes.dtype, np.integer):
-        raise MatrixSourceError(
-            f"{slot_name} at {object_path} must be a one-dimensional integer vector"
-        )
-    indexes = indexes.astype(np.int64, copy=False)
-    if indexes.size and np.any(indexes <= 0):
-        raise MatrixSourceError(
-            f"{slot_name} at {object_path} contains a missing or nonpositive R index"
-        )
-    return indexes - 1
-
-
-def _r_scalar_integer(value: Any, *, slot_name: str, object_path: str) -> int:
-    values = _slot_array(value)
-    if (
-        values.size != 1
-        or not np.issubdtype(values.dtype, np.integer)
-        or isinstance(values.reshape(-1)[0], np.bool_)
-    ):
-        raise MatrixSourceError(
-            f"{slot_name} at {object_path} must contain one integer"
-        )
-    return int(values.reshape(-1)[0])
-
-
 def _inferred_operation_spec(
     primary_class: str,
     classes: tuple[str, ...],
@@ -432,17 +415,10 @@ def _inferred_operation_spec(
     object_path: str,
     resolve_source: Callable[[Any, str], MatrixSource],
     resolve_fragment: Callable[[Any, str], FragmentSource],
+    limits: SourceLimits,
 ) -> dict[str, Any] | None:
     base: dict[str, Any] = {"className": classes}
-    if primary_class in {"DelayedArray", "DelayedMatrix"} | _HDF5_WRAPPER_CLASSES:
-        return {
-            **base,
-            "operation": "rename",
-            "source": resolve_source(
-                _first_value(slots, "seed"),
-                f"{object_path}@seed",
-            ),
-        }
+    transposed = _slot_flag(slots, "transpose", object_path)
     if primary_class == "DelayedSubset":
         source = resolve_source(
             _first_value(slots, "seed"),
@@ -464,19 +440,25 @@ def _inferred_operation_spec(
             **base,
             "operation": "subset",
             "source": source,
-            "featureIndices": _r_delayed_selection(
+            "featureIndices": _r_indexes(
                 index[0],
                 slot_name="index[[1]]",
                 object_path=object_path,
+                limits=limits,
             ),
-            "cellIndices": _r_delayed_selection(
+            "cellIndices": _r_indexes(
                 index[1],
                 slot_name="index[[2]]",
                 object_path=object_path,
+                limits=limits,
             ),
         }
     if primary_class in {"DelayedAperm", "SeedDimPicker"}:
-        permutation = _slot_array(_first_value(slots, "perm", "dim_combination"))
+        permutation = _bounded_array(
+            _first_value(slots, "perm", "dim_combination"),
+            object_path=f"perm at {object_path}",
+            limits=limits,
+        )
         if (
             permutation.ndim != 1
             or permutation.size != 2
@@ -525,14 +507,20 @@ def _inferred_operation_spec(
             "operation": "feature_bind" if along == 1 else "cell_bind",
             "sources": sources,
         }
-    if primary_class == "DelayedSetDimnames":
+    if primary_class in _RENAME_CLASSES:
+        source = resolve_source(
+            _first_value(
+                slots, "seed" if primary_class == "DelayedSetDimnames" else "matrix"
+            ),
+            f"{object_path}@seed",
+        )
+        rows, columns = _dimnames(slots)
         return {
             **base,
             "operation": "rename",
-            "source": resolve_source(
-                _first_value(slots, "seed"),
-                f"{object_path}@seed",
-            ),
+            "source": source,
+            "rowNames": _renamed_axis(rows, source.row_names),
+            "columnNames": _renamed_axis(columns, source.column_names),
         }
     if primary_class == "DelayedSubassign":
         index = _first_value(slots, "Lindex")
@@ -551,15 +539,17 @@ def _inferred_operation_spec(
             _first_value(slots, "seed"),
             f"{object_path}@seed",
         )
-        feature_indices = _r_delayed_selection(
+        feature_indices = _r_indexes(
             index[0],
             slot_name="Lindex[[1]]",
             object_path=object_path,
+            limits=limits,
         )
-        cell_indices = _r_delayed_selection(
+        cell_indices = _r_indexes(
             index[1],
             slot_name="Lindex[[2]]",
             object_path=object_path,
+            limits=limits,
         )
         if feature_indices is None:
             feature_indices = np.arange(source.shape[0], dtype=np.int64)
@@ -567,45 +557,64 @@ def _inferred_operation_spec(
             cell_indices = np.arange(source.shape[1], dtype=np.int64)
         replacement = _first_value(slots, "Rvalue")
         if not isinstance(replacement, MatrixSource):
-            replacement_values = _slot_array(replacement)
-            if replacement_values.size != 1:
+            try:
+                replacement = scalar_value(replacement, f"{object_path}@Rvalue")
+            except MatrixSourceError as error:
                 raise UnsupportedMatrixOperation(
                     object_path,
                     "subassignment",
                     primary_class,
                     "ordinary replacement values must contain one numeric scalar",
-                )
-            replacement = replacement_values.reshape(-1)[0].item()
+                ) from error
         return {
             **base,
             "operation": "subassignment",
             "source": source,
-            "assignments": (
-                {
-                    "featureIndices": feature_indices,
-                    "cellIndices": cell_indices,
-                    "value": replacement,
-                },
-            ),
+            "assignments": (Subassignment(feature_indices, cell_indices, replacement),),
         }
     if primary_class == "MatrixSubset":
         source = resolve_source(
-            _first_value(slots, "matrix", "source", "seed"),
+            _first_value(slots, "matrix"),
             f"{object_path}@matrix",
         )
-        zero_dims = _slot_array(
-            slots.get("zero_dims", slots.get("zeroDims", (False, False))),
+        zero_dims = _bounded_array(
+            slots.get("zero_dims", (False, False)),
+            object_path=f"zero_dims at {object_path}",
+            limits=limits,
             dtype=bool,
         ).reshape(-1)
+        if zero_dims.size != 2:
+            raise MatrixSourceError(f"zero_dims at {object_path} must have two values")
+        rows = _r_indexes(
+            slots.get("row_selection", ()),
+            slot_name="row_selection",
+            object_path=object_path,
+            limits=limits,
+        )
+        columns = _r_indexes(
+            slots.get("col_selection", ()),
+            slot_name="col_selection",
+            object_path=object_path,
+            limits=limits,
+        )
+        selections = [
+            None
+            if selection is None or (selection.size == 0 and not zero)
+            else selection
+            for selection, zero in zip((rows, columns), zero_dims.tolist(), strict=True)
+        ]
+        # BPCells stores selections in storage orientation; a transposed node
+        # selects logical features through col_selection.
+        features, cells = selections[::-1] if transposed else selections
         return {
             **base,
             "operation": "subset",
             "source": source,
-            "featureIndices": _r_selection(slots, "row_selection", zero_dims, 0),
-            "cellIndices": _r_selection(slots, "col_selection", zero_dims, 1),
+            "featureIndices": features,
+            "cellIndices": cells,
         }
     if primary_class in {"RowBindMatrices", "ColBindMatrices"}:
-        values = _first_value(slots, "matrix_list", "sources", "matrices")
+        values = _first_value(slots, "matrix_list")
         if not isinstance(values, Sequence) or isinstance(
             values, (str, bytes, bytearray)
         ):
@@ -614,37 +623,37 @@ def _inferred_operation_spec(
             resolve_source(value, f"{object_path}@matrix_list[{index}]")
             for index, value in enumerate(values)
         ]
+        # A transposed bind binds storage rows, which are logical columns.
+        binds_features = (primary_class == "RowBindMatrices") != transposed
         return {
             **base,
-            "operation": (
-                "feature_bind" if primary_class == "RowBindMatrices" else "cell_bind"
-            ),
+            "operation": "feature_bind" if binds_features else "cell_bind",
             "sources": sources,
         }
-    if primary_class == "RenameDims":
-        return {
-            **base,
-            "operation": "rename",
-            "source": resolve_source(
-                _first_value(slots, "matrix", "source", "seed"),
-                f"{object_path}@matrix",
-            ),
-        }
     if primary_class == "ConvertMatrixType":
-        dtype_value = _first_value(slots, "type", "matrix_type", "matrixType", "dtype")
+        dtype_value = _slot_text(
+            _first_value(slots, "type"),
+            slot_name="type",
+            object_path=object_path,
+        )
         dtype_aliases = {
             "uint32_t": np.dtype(np.uint32),
             "float": np.dtype(np.float32),
             "double": np.dtype(np.float64),
         }
-        dtype = dtype_aliases.get(str(dtype_value))
+        dtype = dtype_aliases.get(dtype_value)
         if dtype is None:
-            dtype = np.dtype(dtype_value)
+            raise UnsupportedMatrixOperation(
+                object_path,
+                "dtype",
+                primary_class,
+                f"unknown BPCells matrix type {dtype_value!r}",
+            )
         return {
             **base,
             "operation": "dtype",
             "source": resolve_source(
-                _first_value(slots, "matrix", "source", "seed"),
+                _first_value(slots, "matrix"),
                 f"{object_path}@matrix",
             ),
             "dtype": dtype,
@@ -652,9 +661,12 @@ def _inferred_operation_spec(
     if primary_class in _UNARY_TRANSFORM_CLASSES:
         parameter: int | None = None
         if primary_class == "TransformRound":
-            parameters = _slot_array(
-                slots.get("global_params", slots.get("globalParams", (0,)))
-            ).reshape(-1)
+            parameters = _parameter_vector(
+                {"global_params": slots.get("global_params", (0,))},
+                "global_params",
+                object_path=object_path,
+                max_length=1,
+            )
             if (
                 parameters.size != 1
                 or not np.isfinite(parameters[0])
@@ -668,7 +680,7 @@ def _inferred_operation_spec(
             **base,
             "operation": "unary",
             "source": resolve_source(
-                _first_value(slots, "matrix", "source", "seed"),
+                _first_value(slots, "matrix"),
                 f"{object_path}@matrix",
             ),
             "function": _UNARY_TRANSFORM_CLASSES[primary_class],
@@ -677,9 +689,9 @@ def _inferred_operation_spec(
             result["parameter"] = parameter
         return result
     if primary_class in {"TransformPow", "TransformMin"}:
-        parameters = _slot_array(
-            _first_value(slots, "global_params", "globalParams")
-        ).reshape(-1)
+        parameters = _parameter_vector(
+            slots, "global_params", object_path=object_path, max_length=2
+        )
         if parameters.size != 1:
             raise MatrixSourceError(
                 f"{primary_class} at {object_path} requires one parameter"
@@ -688,16 +700,16 @@ def _inferred_operation_spec(
             **base,
             "operation": "binary",
             "source": resolve_source(
-                _first_value(slots, "matrix", "source", "seed"),
+                _first_value(slots, "matrix"),
                 f"{object_path}@matrix",
             ),
             "right": parameters[0].item(),
             "function": ("power" if primary_class == "TransformPow" else "minimum"),
         }
     if primary_class == "TransformBinarize":
-        parameters = _slot_array(
-            _first_value(slots, "global_params", "globalParams")
-        ).reshape(-1)
+        parameters = _parameter_vector(
+            slots, "global_params", object_path=object_path, max_length=3
+        )
         if parameters.size != 2:
             raise MatrixSourceError(
                 f"{primary_class} at {object_path} requires two parameters"
@@ -706,7 +718,7 @@ def _inferred_operation_spec(
             **base,
             "operation": "binary",
             "source": resolve_source(
-                _first_value(slots, "matrix", "source", "seed"),
+                _first_value(slots, "matrix"),
                 f"{object_path}@matrix",
             ),
             "right": parameters[0].item(),
@@ -729,38 +741,35 @@ def _inferred_operation_spec(
             **base,
             "operation": "mask",
             "source": resolve_source(
-                _first_value(slots, "matrix", "source"),
+                _first_value(slots, "matrix"),
                 f"{object_path}@matrix",
             ),
             "mask": resolve_source(_first_value(slots, "mask"), f"{object_path}@mask"),
-            "invert": bool(slots.get("invert", False)),
+            "keepNonzero": _slot_flag(slots, "invert", object_path),
         }
     if primary_class == "MatrixRankTransform":
         return {
             **base,
             "operation": "rank",
             "source": resolve_source(
-                _first_value(slots, "matrix", "source"),
+                _first_value(slots, "matrix"),
                 f"{object_path}@matrix",
             ),
-            "axis": "row" if bool(slots.get("transpose", False)) else "column",
+            "axis": "row" if transposed else "column",
         }
     if primary_class == "MatrixMultiply":
-        result = {
+        left = resolve_source(_first_value(slots, "left"), f"{object_path}@left")
+        right = resolve_source(_first_value(slots, "right"), f"{object_path}@right")
+        # BPCells multiplies transposed operands as t(t(y) %*% t(x)), which stores
+        # x %*% y with its operands swapped.
+        if transposed:
+            left, right = right, left
+        return {
             **base,
             "operation": "multiply",
-            "source": resolve_source(
-                _first_value(slots, "left"), f"{object_path}@left"
-            ),
-            "right": resolve_source(
-                _first_value(slots, "right"), f"{object_path}@right"
-            ),
+            "source": left,
+            "right": right,
         }
-        if "dim" in slots:
-            result["dim"] = slots["dim"]
-        elif "Dim" in slots:
-            result["Dim"] = slots["Dim"]
-        return result
     if primary_class in {"PeakMatrix", "TileMatrix"}:
         result = {
             **base,
@@ -770,20 +779,16 @@ def _inferred_operation_spec(
                 _first_value(slots, "fragments"),
                 f"{object_path}@fragments",
             ),
-            "chrId": _first_value(slots, "chr_id", "chrId"),
+            "chrId": _first_value(slots, "chr_id"),
             "start": _first_value(slots, "start"),
             "end": _first_value(slots, "end"),
-            "chrLevels": _first_value(slots, "chr_levels", "chrLevels"),
+            "chrLevels": _first_value(slots, "chr_levels"),
             "mode": _first_value(slots, "mode"),
             "transpose": _optional_value(slots, "transpose", default=True),
-            "shape": _first_value(slots, "dim", "Dim", "shape"),
+            "shape": _first_value(slots, "dim"),
         }
         if primary_class == "TileMatrix":
-            result["tileWidths"] = _first_value(
-                slots,
-                "tile_width",
-                "tileWidths",
-            )
+            result["tileWidths"] = _first_value(slots, "tile_width")
         return result
     return None
 
@@ -792,12 +797,16 @@ def matrix_source_from_slots(
     specification: Mapping[str, Any],
     *,
     object_path: str = "$",
-    class_name: str | None = None,
-    rds_path: str | os.PathLike[str] | None = None,
+    sidecar_root: str | os.PathLike[str] | None = None,
     absolute_prefix_remaps: Mapping[str | os.PathLike[str], str | os.PathLike[str]]
     | None = None,
     limits: SourceLimits = DEFAULT_LIMITS,
 ) -> MatrixSource:
+    """Build a matrix source from serialized R class and slot values.
+
+    Sidecar paths resolve inside ``sidecar_root``; without it, sidecar-backed
+    classes are rejected.
+    """
     if not isinstance(specification, Mapping):
         raise TypeError("matrix source specification must be a mapping")
     nested = specification.get("slots")
@@ -807,17 +816,7 @@ def matrix_source_from_slots(
         slots = nested
     else:
         raise TypeError(f"matrix slots at {object_path} must be a mapping")
-    classes = _class_names(
-        class_name
-        if class_name is not None
-        else specification.get(
-            "className",
-            specification.get(
-                "class",
-                slots.get("className", slots.get("class")),
-            ),
-        )
-    )
+    classes = class_names(specification.get("class", slots.get("class")))
     primary_class = classes[0] if classes else None
 
     def resolve_source(value: Any, path: str) -> MatrixSource:
@@ -827,7 +826,7 @@ def matrix_source_from_slots(
             return matrix_source_from_slots(
                 value,
                 object_path=path,
-                rds_path=rds_path,
+                sidecar_root=sidecar_root,
                 absolute_prefix_remaps=absolute_prefix_remaps,
                 limits=limits,
             )
@@ -840,42 +839,21 @@ def matrix_source_from_slots(
             return fragment_source_from_slots(
                 value,
                 object_path=path,
-                rds_path=rds_path,
+                sidecar_root=sidecar_root,
                 absolute_prefix_remaps=absolute_prefix_remaps,
                 limits=limits,
             )
         raise TypeError(f"fragment input at {path} must be a source or mapping")
 
-    operation = specification.get("operation", specification.get("op"))
-    if operation is not None:
-        operation_spec = dict(specification)
-        operation_spec.update(slots)
-        for key in ("source", "matrix", "seed", "left", "right", "mask"):
-            value = operation_spec.get(key)
-            if isinstance(value, Mapping):
-                operation_spec[key] = resolve_source(value, f"{object_path}@{key}")
-        fragment_value = operation_spec.get("fragments")
-        if isinstance(fragment_value, Mapping):
-            operation_spec["fragments"] = resolve_fragment(
-                fragment_value,
-                f"{object_path}@fragments",
-            )
-        for key in ("sources", "matrices", "matrix_list"):
-            values = operation_spec.get(key)
-            if isinstance(values, Sequence) and not isinstance(
-                values, (str, bytes, bytearray)
-            ):
-                operation_spec[key] = [
-                    resolve_source(value, f"{object_path}@{key}[{index}]")
-                    for index, value in enumerate(values)
-                ]
-        if primary_class is not None:
-            operation_spec["className"] = classes
-        return build_matrix_operation(
-            operation_spec,
+    def sidecar(names: tuple[str, ...], expect: str) -> Path:
+        return _sidecar_path(
+            _first_value(slots, *names),
+            sidecar_root=sidecar_root,
+            absolute_prefix_remaps=absolute_prefix_remaps,
+            expect=expect,
             object_path=object_path,
-            limits=limits,
         )
+
     if primary_class is None:
         raise UnsupportedMatrixOperation(
             object_path, "leaf", None, "matrix class is missing"
@@ -889,13 +867,21 @@ def matrix_source_from_slots(
             "a fragment source cannot be used as a matrix",
         )
     row_names, column_names = _dimnames(slots)
+    if primary_class in _WRAPPER_CLASSES:
+        return _finalize_slot_source(
+            resolve_source(_first_value(slots, "seed"), f"{object_path}@seed"),
+            slots,
+            row_names,
+            column_names,
+            limits,
+        )
     if primary_class in {
         "DelayedUnaryIsoOpStack",
         "DelayedUnaryIsoOpWithArgs",
         "DelayedNaryIsoOp",
     }:
-        operation_value = _first_value(slots, "OP", "op", "function", "OPS")
         if primary_class == "DelayedUnaryIsoOpStack":
+            operation_value = _first_value(slots, "OPS")
             if not isinstance(operation_value, Sequence) or isinstance(
                 operation_value,
                 str | bytes | bytearray,
@@ -924,6 +910,7 @@ def matrix_source_from_slots(
                     limits=limits,
                 )
         elif primary_class == "DelayedNaryIsoOp":
+            operation_value = _first_value(slots, "OP")
             if not isinstance(operation_value, str):
                 raise UnsupportedMatrixOperation(
                     object_path,
@@ -976,6 +963,7 @@ def matrix_source_from_slots(
                     limits=limits,
                 )
         else:
+            operation_value = _first_value(slots, "OP")
             if not isinstance(operation_value, str):
                 raise UnsupportedMatrixOperation(
                     object_path,
@@ -1093,14 +1081,10 @@ def matrix_source_from_slots(
         )
     if primary_class in {"TransformMinByRow", "TransformMinByCol"}:
         source = resolve_source(
-            _first_value(slots, "matrix", "source", "seed"),
+            _first_value(slots, "matrix"),
             f"{object_path}@matrix",
         )
-        transposed = _slot_boolean(
-            _optional_value(slots, "transpose", default=False),
-            slot_name="transpose",
-            object_path=object_path,
-        )
+        transposed = _slot_flag(slots, "transpose", object_path)
         parameter_name = (
             "row_params" if primary_class == "TransformMinByRow" else "col_params"
         )
@@ -1108,6 +1092,7 @@ def matrix_source_from_slots(
             slots,
             parameter_name,
             object_path=object_path,
+            limits=limits,
         )
         axis = (
             "cell"
@@ -1128,16 +1113,14 @@ def matrix_source_from_slots(
         )
     if primary_class == "TransformScaleShift":
         source = resolve_source(
-            _first_value(slots, "matrix", "source", "seed"),
+            _first_value(slots, "matrix"),
             f"{object_path}@matrix",
         )
-        transposed = _slot_boolean(
-            _optional_value(slots, "transpose", default=False),
-            slot_name="transpose",
-            object_path=object_path,
-        )
-        active = _slot_array(
+        transposed = _slot_flag(slots, "transpose", object_path)
+        active = _bounded_array(
             _first_value(slots, "active_transforms"),
+            object_path=f"active_transforms at {object_path}",
+            limits=limits,
             dtype=bool,
         )
         if active.ndim == 1 and active.size == 6:
@@ -1150,16 +1133,17 @@ def matrix_source_from_slots(
             slots,
             "row_params",
             object_path=object_path,
+            limits=limits,
         )
         column_parameters = _parameter_matrix(
             slots,
             "col_params",
             object_path=object_path,
+            limits=limits,
         )
-        global_parameters = _slot_array(
-            slots.get("global_params", ()),
-            dtype=np.float64,
-        ).reshape(-1)
+        global_parameters = _parameter_vector(
+            slots, "global_params", object_path=object_path, max_length=2
+        ).astype(np.float64)
 
         def active_parameters(
             values: NDArray[Any],
@@ -1211,18 +1195,20 @@ def matrix_source_from_slots(
         "SCTransformPearsonTransposeSlow",
     }:
         source = resolve_source(
-            _first_value(slots, "matrix", "source", "seed"),
+            _first_value(slots, "matrix"),
             f"{object_path}@matrix",
         )
         row_parameters = _parameter_matrix(
             slots,
             "row_params",
             object_path=object_path,
+            limits=limits,
         )
         column_parameters = _parameter_matrix(
             slots,
             "col_params",
             object_path=object_path,
+            limits=limits,
         )
         transposed_kernel = "Transpose" in primary_class
         feature_parameters, cell_parameters = (
@@ -1240,8 +1226,8 @@ def matrix_source_from_slots(
                 theta_inverse=feature_parameters[0],
                 gene_beta=feature_parameters[1],
                 cell_read_counts=cell_parameters[0],
-                global_parameters=_slot_array(
-                    _first_value(slots, "global_params"),
+                global_parameters=_parameter_vector(
+                    slots, "global_params", object_path=object_path, max_length=3
                 ),
                 limits=limits,
             ),
@@ -1252,24 +1238,22 @@ def matrix_source_from_slots(
         )
     if primary_class == "TransformLinearResidual":
         source = resolve_source(
-            _first_value(slots, "matrix", "source", "seed"),
+            _first_value(slots, "matrix"),
             f"{object_path}@matrix",
         )
         row_parameters = _parameter_matrix(
             slots,
             "row_params",
             object_path=object_path,
+            limits=limits,
         )
         column_parameters = _parameter_matrix(
             slots,
             "col_params",
             object_path=object_path,
+            limits=limits,
         )
-        transposed = _slot_boolean(
-            _optional_value(slots, "transpose", default=False),
-            slot_name="transpose",
-            object_path=object_path,
-        )
+        transposed = _slot_flag(slots, "transpose", object_path)
         if row_parameters.size == 0 or column_parameters.size == 0:
             residual_source: MatrixSource = source
         else:
@@ -1298,8 +1282,10 @@ def matrix_source_from_slots(
         object_path=object_path,
         resolve_source=resolve_source,
         resolve_fragment=resolve_fragment,
+        limits=limits,
     )
     if inferred is not None:
+        renamed = primary_class in _RENAME_CLASSES
         return _finalize_slot_source(
             build_matrix_operation(
                 inferred,
@@ -1307,18 +1293,17 @@ def matrix_source_from_slots(
                 limits=limits,
             ),
             slots,
-            row_names,
-            column_names,
+            None if renamed else row_names,
+            None if renamed else column_names,
             limits,
         )
     if primary_class in _DENSE_CLASSES:
-        values = _first_value(slots, ".Data", "data", "values", "x")
-        shape = _first_value(slots, "dim", "shape")
+        values = _first_value(slots, ".Data", "x")
+        shape = _first_value(slots, "dim", "Dim")
         return _finalize_slot_source(
             DenseMatrixSource(
                 values,
-                shape,
-                dtype=_optional_value(slots, "dtype"),
+                shape_value(shape, f"dim slot at {object_path}"),
                 limits=limits,
             ),
             slots,
@@ -1332,8 +1317,7 @@ def matrix_source_from_slots(
                 _optional_value(slots, "x"),
                 _first_value(slots, "i"),
                 _first_value(slots, "p"),
-                _first_value(slots, "Dim", "dim", "shape"),
-                dtype=_optional_value(slots, "dtype"),
+                shape_value(_first_value(slots, "Dim"), f"dim slot at {object_path}"),
                 class_name=primary_class,
                 limits=limits,
             ),
@@ -1343,15 +1327,13 @@ def matrix_source_from_slots(
             limits,
         )
     if primary_class == "Iterable_dgCMatrix_wrapper":
-        wrapped = _first_value(slots, "mat")
-        if not isinstance(wrapped, MatrixSource):
-            wrapped = resolve_source(wrapped, f"{object_path}@mat")
         return _finalize_slot_source(
-            wrapped,
+            resolve_source(_first_value(slots, "mat"), f"{object_path}@mat"),
             slots,
             row_names,
             column_names,
             limits,
+            stored_row_major=False,
         )
     if primary_class in _BPCELLS_MEMORY_CLASSES:
         compression, datatype = _BPCELLS_MEMORY_CLASSES[primary_class]
@@ -1365,15 +1347,7 @@ def matrix_source_from_slots(
             raise MatrixSourceError(
                 f"BPCells class {primary_class!r} conflicts with format {version!r}"
             )
-        shape = _slot_shape(
-            _first_value(slots, "dim", "shape"),
-            object_path=object_path,
-        )
-        transpose = _slot_array(
-            _optional_value(slots, "transpose", default=False)
-        ).reshape(-1)
-        if transpose.size != 1:
-            raise MatrixSourceError("transpose slot must be scalar")
+        shape = shape_value(_first_value(slots, "dim"), f"dim slot at {object_path}")
         array_names = {
             "idxptr",
             "index",
@@ -1391,12 +1365,16 @@ def matrix_source_from_slots(
             for name in array_names
             if name in slots and slots[name] is not None
         }
+        # A memory matrix stores its arrays in the orientation its own
+        # transpose flag describes, so it is already logical.
         return _finalize_slot_source(
             BPCellsMemoryMatrixSource(
                 version,
                 arrays,
                 shape=shape,
-                storage_order="row" if bool(transpose[0]) else "col",
+                storage_order=(
+                    "row" if _slot_flag(slots, "transpose", object_path) else "col"
+                ),
                 row_names=row_names,
                 column_names=column_names,
                 float_bit_arrays=(
@@ -1405,62 +1383,55 @@ def matrix_source_from_slots(
                 limits=limits,
             ),
             slots,
-            row_names,
-            column_names,
+            None,
+            None,
             limits,
         )
-    if primary_class in _BPCELLS_DIRECTORY_CLASSES:
-        path = _sidecar_path(
-            _first_value(slots, "dir", "directory", "path"),
-            rds_path=rds_path,
-            absolute_prefix_remaps=absolute_prefix_remaps,
-            expect="directory",
+    if primary_class == "MatrixDir":
+        directory_source = BPCellsDirectoryMatrixSource(
+            sidecar(("dir",), "directory"), limits=limits
         )
         return _finalize_slot_source(
-            BPCellsDirectoryMatrixSource(path, limits=limits),
+            directory_source,
             slots,
             row_names,
             column_names,
             limits,
+            stored_row_major=directory_source.storageOrder == "row",
         )
-    if primary_class in _BPCELLS_HDF5_CLASSES:
-        path = _sidecar_path(
-            _first_value(slots, "filepath", "path"),
-            rds_path=rds_path,
-            absolute_prefix_remaps=absolute_prefix_remaps,
-            expect="file",
-        )
-        return _finalize_slot_source(
-            BPCellsHDF5MatrixSource(
-                path,
-                group=str(_first_value(slots, "group")),
-                limits=limits,
+    if primary_class == "MatrixH5":
+        hdf5_source = BPCellsHDF5MatrixSource(
+            sidecar(("path",), "file"),
+            group=_slot_text(
+                _first_value(slots, "group"),
+                slot_name="group",
+                object_path=object_path,
             ),
+            limits=limits,
+        )
+        return _finalize_slot_source(
+            hdf5_source,
             slots,
             row_names,
             column_names,
             limits,
+            stored_row_major=hdf5_source.storageOrder == "row",
         )
-    if primary_class in _HDF5_RESHAPED_CLASSES:
-        path = _sidecar_path(
-            _first_value(slots, "filepath", "path"),
-            rds_path=rds_path,
-            absolute_prefix_remaps=absolute_prefix_remaps,
-            expect="file",
-        )
-        reshaped = _slot_shape(
-            _first_value(slots, "reshaped_dim", "reshapedDim"),
-            object_path=object_path,
+    if primary_class == "ReshapedHDF5ArraySeed":
+        reshaped = shape_value(
+            _first_value(slots, "reshaped_dim"),
+            f"reshaped_dim at {object_path}",
         )
         return _finalize_slot_source(
             ReshapedHDF5ArrayMatrixSource(
-                path,
-                str(_first_value(slots, "name", "dataset")),
-                reshaped,
-                dtype=_optional_value(slots, "dtype"),
-                as_sparse=bool(
-                    _optional_value(slots, "asSparse", "as_sparse", default=False)
+                sidecar(("filepath",), "file"),
+                _slot_text(
+                    _first_value(slots, "name"),
+                    slot_name="name",
+                    object_path=object_path,
                 ),
+                reshaped,
+                as_sparse=_slot_flag(slots, "as_sparse", object_path),
                 limits=limits,
             ),
             {**slots, "dim": reshaped},
@@ -1469,20 +1440,15 @@ def matrix_source_from_slots(
             limits,
         )
     if primary_class in _HDF5_DENSE_CLASSES:
-        path = _sidecar_path(
-            _first_value(slots, "filepath", "path"),
-            rds_path=rds_path,
-            absolute_prefix_remaps=absolute_prefix_remaps,
-            expect="file",
-        )
         return _finalize_slot_source(
-            HDF5ArrayMatrixSource(
-                path,
-                str(_first_value(slots, "name", "dataset")),
-                dtype=_optional_value(slots, "dtype"),
-                as_sparse=bool(
-                    _optional_value(slots, "asSparse", "as_sparse", default=False)
+            HDF5DenseMatrixSource(
+                sidecar(("filepath",), "file"),
+                _slot_text(
+                    _first_value(slots, "name"),
+                    slot_name="name",
+                    object_path=object_path,
                 ),
+                as_sparse=_slot_flag(slots, "as_sparse", object_path),
                 limits=limits,
             ),
             slots,
@@ -1491,22 +1457,19 @@ def matrix_source_from_slots(
             limits,
         )
     if primary_class in _H5_SPARSE_CLASSES:
-        path = _sidecar_path(
-            _first_value(slots, "filepath", "path"),
-            rds_path=rds_path,
-            absolute_prefix_remaps=absolute_prefix_remaps,
-            expect="file",
-        )
-        sparse_layout = _optional_value(slots, "sparseLayout", "sparse_layout")
-        if sparse_layout is None and primary_class.startswith(("CSC_", "CSR_")):
-            sparse_layout = primary_class[:3]
         return _finalize_slot_source(
             H5SparseMatrixSource(
-                path,
-                str(_first_value(slots, "group")),
-                shape=_optional_value(slots, "dim", "shape"),
-                sparse_layout=sparse_layout,
-                dtype=_optional_value(slots, "dtype"),
+                sidecar(("filepath",), "file"),
+                _slot_text(
+                    _first_value(slots, "group"),
+                    slot_name="group",
+                    object_path=object_path,
+                ),
+                sparse_layout=(
+                    primary_class[:3]
+                    if primary_class.startswith(("CSC_", "CSR_"))
+                    else None
+                ),
                 limits=limits,
             ),
             slots,
@@ -1515,26 +1478,25 @@ def matrix_source_from_slots(
             limits,
         )
     if primary_class in _H5AD_CLASSES:
-        path = _sidecar_path(
-            _first_value(slots, "filepath", "path"),
-            rds_path=rds_path,
-            absolute_prefix_remaps=absolute_prefix_remaps,
-            expect="file",
-        )
+        anndata = primary_class == "AnnDataMatrixH5"
+        layer = _optional_value(slots, "layer")
         return _finalize_slot_source(
             H5ADMatrixSource(
-                path,
+                sidecar(("path",) if anndata else ("filepath",), "file"),
                 layer=(
-                    _optional_value(slots, "layer")
-                    if primary_class != "AnnDataMatrixH5"
-                    else None
+                    None
+                    if anndata or layer is None
+                    else _slot_text(layer, slot_name="layer", object_path=object_path)
                 ),
                 matrix_path=(
-                    _optional_value(slots, "group", default="X")
-                    if primary_class == "AnnDataMatrixH5"
+                    _slot_text(
+                        _optional_value(slots, "group", default="X"),
+                        slot_name="group",
+                        object_path=object_path,
+                    )
+                    if anndata
                     else None
                 ),
-                dtype=_optional_value(slots, "dtype"),
                 limits=limits,
             ),
             slots,
@@ -1543,16 +1505,17 @@ def matrix_source_from_slots(
             limits,
         )
     if primary_class in _TENX_CLASSES:
-        path = _sidecar_path(
-            _first_value(slots, "filepath", "path"),
-            rds_path=rds_path,
-            absolute_prefix_remaps=absolute_prefix_remaps,
-            expect="file",
-        )
         return _finalize_slot_source(
-            TENxMatrixSource(
-                path,
-                group=str(_optional_value(slots, "group", default="matrix")),
+            TenXMatrixSource(
+                sidecar(
+                    ("path",) if primary_class == "10xMatrixH5" else ("filepath",),
+                    "file",
+                ),
+                group=_slot_text(
+                    _optional_value(slots, "group", default="matrix"),
+                    slot_name="group",
+                    object_path=object_path,
+                ),
                 limits=limits,
             ),
             slots,

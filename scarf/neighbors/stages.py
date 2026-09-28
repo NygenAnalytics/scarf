@@ -45,13 +45,12 @@ class ReductionTransform:
         self.batch_size = batch_size
         self.nthreads = nthreads
         self.rand_state = rand_state
-        self.feature_scaling = not disable_scaling
         self.pca: Any | None = None
         self.center = center
         disable_reduction = self.dims is not None and self.dims < 1
 
         if self.method == "pca":
-            if self.loadings is None or len(self.loadings) == 0:
+            if self.loadings is None:
                 if len(use_for_pca) != self.data.shape[0]:
                     raise ValueError(
                         "ERROR: `use_for_pca` does not have sample length as nCells"
@@ -66,7 +65,7 @@ class ReductionTransform:
                 disable_reduction,
             )
         elif self.method == "lsi":
-            if self.loadings is None or len(self.loadings) == 0:
+            if self.loadings is None:
                 if not disable_reduction:
                     with threadpool_limits(limits=self.nthreads):
                         self._fit_lsi(lsi_skip_first, lsi_params)
@@ -74,10 +73,9 @@ class ReductionTransform:
                 self.dims = self.loadings.shape[1]
             self._transform = self._linear_transform(disable_reduction)
         elif self.method == "custom":
-            if self.loadings is None or len(self.loadings) == 0:
-                logger.warning("No loadings provided for manual dimension reduction")
-            else:
-                self.dims = self.loadings.shape[1]
+            if self.loadings is None:
+                raise ValueError("Custom reduction requires loadings")
+            self.dims = self.loadings.shape[1]
             self._transform = self._linear_transform(disable_reduction)
         else:
             raise ValueError(f"ERROR: Unknown reduction method: {self.method}")
@@ -324,14 +322,12 @@ class NeighborQueryStage:
         self,
         values: np.ndarray,
         *,
-        k: int | None = None,
         self_indices: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, int]:
-        use_k = self.k if k is None else k
         if self_indices is None:
-            indices, distances = self.index.knn_query(values, k=use_k)
+            indices, distances = self.index.knn_query(values, k=self.k)
             return np.asarray(indices), self._metric_distances(distances)
-        indices, distances = self.index.knn_query(values, k=use_k + 1)
+        indices, distances = self.index.knn_query(values, k=self.k + 1)
         fixed_indices, fixed_distances, missed = fix_knn_query(
             indices,
             distances,
@@ -402,7 +398,11 @@ class KMeansInitializationStage:
             max(effective_clusters, math.ceil(n_rows * resolved_kmeans_sampling)),
         )
 
-        def make_model(*, init: str | np.ndarray = "k-means++") -> Any:
+        def make_model(
+            *,
+            init: str | np.ndarray = "k-means++",
+            reassignment_ratio: float = 0.01,
+        ) -> Any:
             return MiniBatchKMeans(
                 n_clusters=effective_clusters,
                 random_state=rand_state,
@@ -410,6 +410,7 @@ class KMeansInitializationStage:
                 init_size=init_size,
                 init=init,
                 n_init=1,
+                reassignment_ratio=reassignment_ratio,
             )
 
         def timed_blocks(
@@ -576,7 +577,13 @@ class KMeansInitializationStage:
             )
             del sample, sample_indices
 
-            model = make_model(init=np.asarray(initial_centers))
+            # Updates follow storage order, where cells are often grouped by
+            # sample. Moving rarely used centroids onto the current batch would
+            # pull centroids of later groups onto earlier ones.
+            model = make_model(
+                init=np.asarray(initial_centers),
+                reassignment_ratio=0.0,
+            )
             update_buffer = np.empty(
                 (effective_kmeans_batch_size, coordinate_dims),
                 dtype=coordinate_dtype,

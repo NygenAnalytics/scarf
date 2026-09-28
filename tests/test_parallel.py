@@ -8,7 +8,7 @@ import zarr
 from zarr.storage import MemoryStore
 
 from scarf.matrix import ChunkedArray
-from scarf.storage.parallel import in_shard_context, map_shards, stream_shards
+from scarf.storage.parallel import in_shard_context, stream_shards
 
 
 def test_progress_closes_display_after_producer_cleanup_fails(monkeypatch):
@@ -43,13 +43,7 @@ def test_progress_closes_display_after_producer_cleanup_fails(monkeypatch):
     ]
 
 
-def test_map_shards_preserves_order():
-    ranges = [(i * 10, i * 10 + 10) for i in range(6)]
-    out = map_shards(ranges, lambda idx, s, e: (idx, s, e), workers=8)
-    assert out == [(i, i * 10, i * 10 + 10) for i in range(6)]
-
-
-def test_array_explicit_thread_limit_is_respected():
+def test_array_explicit_thread_limit_is_respected(monkeypatch):
     from scarf.storage.budget import ResourceBudget
 
     array = ChunkedArray.from_numpy(
@@ -57,12 +51,14 @@ def test_array_explicit_thread_limit_is_respected():
     )
     caller = threading.get_ident()
     threads = []
+    original = ChunkedArray._materialize_range
 
-    def block(index, start, end):
+    def materialize(self, start, end):
         threads.append(threading.get_ident())
-        return np.asarray([index])
+        return original(self, start, end)
 
-    array.map_blocks(block, nthreads=1)
+    monkeypatch.setattr(ChunkedArray, "_materialize_range", materialize)
+    np.testing.assert_array_equal(array.sum(axis=0).compute(nthreads=1), [32.0] * 4)
     assert threads == [caller] * 8
 
 
@@ -79,17 +75,12 @@ def test_array_budget_includes_storage_retained_by_operand_views():
     np.testing.assert_array_equal((array + large[:1].copy()).compute(), backing * 2)
 
 
-def test_map_shards_empty():
-    assert map_shards([], lambda i, s, e: i, workers=8) == []
-
-
-def test_map_shards_bounds_in_flight():
+def test_stream_shards_bounds_in_flight():
     lock = threading.Lock()
     in_flight = 0
     max_seen = 0
-    ranges = [(i, i + 1) for i in range(16)]
 
-    def produce(idx, s, e):
+    def produce(value):
         nonlocal in_flight, max_seen
         with lock:
             in_flight += 1
@@ -97,9 +88,9 @@ def test_map_shards_bounds_in_flight():
         time.sleep(0.01)
         with lock:
             in_flight -= 1
-        return idx
+        return value
 
-    map_shards(ranges, produce, workers=8)
+    list(stream_shards(range(16), produce, workers=8))
     assert 1 < max_seen <= 8
 
 
@@ -115,8 +106,8 @@ def test_paused_serial_stream_does_not_mark_its_consumer_as_a_worker():
         assert next(stream) == 1
         assert not in_shard_context()
         assert contexts == [True]
-        worker_threads = map_shards(
-            [(0, 1), (1, 2)], lambda *_: threading.get_ident(), workers=2
+        worker_threads = list(
+            stream_shards([0, 1], lambda _: threading.get_ident(), workers=2)
         )
         assert all(worker != threading.get_ident() for worker in worker_threads)
     finally:
@@ -124,30 +115,32 @@ def test_paused_serial_stream_does_not_mark_its_consumer_as_a_worker():
     assert not in_shard_context()
 
 
-def test_map_shards_serial_backend_runs_inline():
-    seen_context = []
+def test_stream_shards_serial_backend_runs_inline():
+    caller = threading.get_ident()
+    threads = []
 
-    def produce(idx, s, e):
-        seen_context.append(in_shard_context())
-        return idx
+    def produce(value):
+        threads.append(threading.get_ident())
+        return value
 
-    out = map_shards([(0, 1), (1, 2)], produce, workers=8, backend="serial")
+    out = list(stream_shards([0, 1], produce, workers=8, backend="serial"))
     assert out == [0, 1]
+    assert threads == [caller, caller]
 
 
-def test_nested_map_shards_runs_serial():
+def test_nested_stream_shards_run_serial():
     inner_context = []
 
-    def outer(idx, s, e):
+    def outer(value):
         assert in_shard_context() is True
 
-        def inner(j, a, b):
+        def inner(item):
             inner_context.append(in_shard_context())
-            return j
+            return item
 
-        return map_shards([(0, 1), (1, 2), (2, 3)], inner, workers=8)
+        return list(stream_shards([0, 1, 2], inner, workers=8))
 
-    map_shards([(0, 1), (1, 2)], outer, workers=8)
+    list(stream_shards([0, 1], outer, workers=8))
     assert inner_context and all(inner_context)
 
 
@@ -261,31 +254,6 @@ def test_overlapping_parallel_runtimes_share_the_lower_io_limit():
     second.join()
     assert seen == {3: [3], 7: [3]}
     assert zarr.config.get("async.concurrency") == before
-
-
-def test_map_shards_uses_worker_budget_once_across_tasks_and_io():
-    with zarr.config.set({"async.concurrency": 99}):
-        seen = []
-        lock = threading.Lock()
-        in_flight = 0
-        max_in_flight = 0
-
-        def produce(idx, s, e):
-            nonlocal in_flight, max_in_flight
-            with lock:
-                in_flight += 1
-                max_in_flight = max(max_in_flight, in_flight)
-            seen.append(zarr.config.get("async.concurrency"))
-            time.sleep(0.01)
-            with lock:
-                in_flight -= 1
-            return idx
-
-        map_shards([(i, i + 1) for i in range(16)], produce, workers=8)
-        assert seen and all(s == 8 for s in seen)
-        assert max_in_flight > 1
-        assert max_in_flight <= 8
-        assert zarr.config.get("async.concurrency") == 99
 
 
 def _toy_chunked(data, chunk_rows, nthreads):

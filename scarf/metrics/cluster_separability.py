@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from ..utils.arguments import integer_argument
 from ._rows import read_matrix_rows
 from ._types import MatrixData
 
@@ -54,15 +55,6 @@ class ClusterSeparabilityResult:
             raise ValueError("sample_indices must be a one-dimensional integer array")
         indices.setflags(write=False)
         object.__setattr__(self, "sample_indices", indices)
-
-
-def _positive_integer(value: object, name: str, *, minimum: int = 1) -> int:
-    if isinstance(value, bool) or not isinstance(value, int | np.integer):
-        raise TypeError(f"{name} must be an integer")
-    resolved = int(value)
-    if resolved < minimum:
-        raise ValueError(f"{name} must be at least {minimum}")
-    return resolved
 
 
 def _validated_clusterings(
@@ -191,14 +183,19 @@ def evaluate_cluster_separability(
     if n_cells < 1 or n_dimensions < 1:
         raise ValueError("coordinates must contain cells and dimensions")
 
-    n_folds = _positive_integer(n_folds, "n_folds", minimum=2)
-    max_sample_cells = _positive_integer(max_sample_cells, "max_sample_cells")
-    max_silhouette_cells = _positive_integer(
+    n_folds = integer_argument(n_folds, "n_folds", minimum=2)
+    max_sample_cells = integer_argument(
+        max_sample_cells,
+        "max_sample_cells",
+        minimum=1,
+    )
+    max_silhouette_cells = integer_argument(
         max_silhouette_cells,
         "max_silhouette_cells",
+        minimum=1,
     )
-    random_seed = _positive_integer(random_seed, "random_seed", minimum=0)
-    svm_max_iter = _positive_integer(svm_max_iter, "svm_max_iter")
+    random_seed = integer_argument(random_seed, "random_seed", minimum=0)
+    svm_max_iter = integer_argument(svm_max_iter, "svm_max_iter", minimum=1)
     if isinstance(svm_c, bool) or not isinstance(
         svm_c,
         int | float | np.integer | np.floating,

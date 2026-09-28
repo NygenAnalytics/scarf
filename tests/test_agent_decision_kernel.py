@@ -73,8 +73,6 @@ def _decision_spec() -> DecisionSpec:
             ),
         ],
         baselineOptionId="partition:coarse",
-        metricPreferredOptionId="partition:coarse",
-        requireIndependentOverrideEvidence=True,
     )
 
 
@@ -85,10 +83,7 @@ def _decision_record(
     status: str = "apply",
     source: str = "agent",
     evidence_ids: list[str] | None = None,
-    override_of: str | None = None,
-    override_evidence_ids: list[str] | None = None,
     available_evidence_ids: list[str] | None = None,
-    supersedes: str | None = None,
 ) -> DecisionRecord:
     bundle = _evidence_bundle().with_content_sha256()
     assert bundle.contentSha256 is not None
@@ -112,8 +107,6 @@ def _decision_record(
         evidenceIds=evidence_ids or ["evidence:silhouette"],
         rationale="The cited evidence supports this registered option.",
         confidence="medium",
-        overrideOfOptionId=override_of,
-        overrideEvidenceIds=override_evidence_ids or [],
     )
 
 
@@ -180,12 +173,8 @@ def test_evidence_contract_rejects_duplicate_artifacts_and_bad_checksums() -> No
             "evidenceIds must reference only available evidence",
         ),
         (
-            {
-                "overrideOfOptionId": None,
-                "evidenceIds": ["evidence:markers"],
-                "overrideEvidenceIds": ["evidence:markers"],
-            },
-            "overrideEvidenceIds require overrideOfOptionId",
+            {"overrideOfOptionId": "partition:fine"},
+            "Extra inputs are not permitted",
         ),
     ],
 )
@@ -201,21 +190,6 @@ def test_decision_record_rejects_non_exact_references(
 @pytest.mark.parametrize(
     ("changes", "message"),
     [
-        (
-            {
-                "overrideOfOptionId": "partition:fine",
-                "overrideEvidenceIds": ["evidence:stability"],
-            },
-            "overrideEvidenceIds must be included",
-        ),
-        (
-            {"overrideOfOptionId": "partition:invented"},
-            "overrideOfOptionId must reference",
-        ),
-        (
-            {"overrideOfOptionId": "partition:coarse"},
-            "overrideOfOptionId must differ",
-        ),
         (
             {"supersedes": "decision:cluster:1"},
             "Extra inputs are not permitted",
@@ -235,7 +209,7 @@ def test_decision_record_rejects_non_exact_references(
         ),
     ],
 )
-def test_decision_record_rejects_invalid_override_and_lineage_references(
+def test_decision_record_rejects_invalid_lineage_references(
     changes: dict[str, object],
     message: str,
 ) -> None:
@@ -245,11 +219,11 @@ def test_decision_record_rejects_invalid_override_and_lineage_references(
         DecisionRecord.model_validate(values)
 
 
-def test_auditor_accepts_an_exact_metric_preferred_decision() -> None:
+def test_auditor_accepts_an_exact_registered_decision() -> None:
     record = _decision_record()
 
     verification = DeterministicDecisionAuditor.audit(
-        _decision_spec(), _evidence_bundle(), record, created_at_ns=10
+        _decision_spec(), _evidence_bundle(), record
     )
 
     assert all(check.status == "passed" for check in verification)
@@ -305,68 +279,6 @@ def test_auditor_rejects_a_tampered_option_or_evidence_inventory() -> None:
     assert any(check.status == "failed" for check in verification)
     failed = {check.checkId for check in verification if check.status == "failed"}
     assert failed == {"exactOptionInventory", "exactEvidenceInventory"}
-
-
-def test_auditor_requires_two_independent_non_geometric_override_classes() -> None:
-    record = _decision_record(
-        selected_option_id="partition:fine",
-        evidence_ids=["evidence:silhouette", "evidence:markers"],
-        override_of="partition:coarse",
-        override_evidence_ids=["evidence:silhouette", "evidence:markers"],
-    )
-
-    verification = DeterministicDecisionAuditor.audit(
-        _decision_spec(), _evidence_bundle(), record
-    )
-
-    assert any(check.status == "failed" for check in verification)
-    failed = [check for check in verification if check.status == "failed"]
-    assert [check.checkId for check in failed] == ["independentOverrideEvidence"]
-
-
-def test_auditor_accepts_two_independent_non_geometric_override_classes() -> None:
-    record = _decision_record(
-        selected_option_id="partition:fine",
-        evidence_ids=["evidence:markers", "evidence:stability"],
-        override_of="partition:coarse",
-        override_evidence_ids=["evidence:markers", "evidence:stability"],
-    )
-
-    verification = DeterministicDecisionAuditor.audit(
-        _decision_spec(), _evidence_bundle(), record
-    )
-
-    assert all(check.status == "passed" for check in verification)
-
-
-def test_auditor_rejects_override_evidence_from_another_option() -> None:
-    spec_values = _decision_spec().model_dump()
-    spec_values["options"][1]["requiredEvidenceIds"] = [
-        "evidence:markers",
-        "evidence:stability",
-    ]
-    spec = DecisionSpec.model_validate(spec_values)
-    record = _decision_record(
-        selected_option_id="partition:fine",
-        evidence_ids=[
-            "evidence:markers",
-            "evidence:stability",
-            "evidence:replicates",
-        ],
-        override_of="partition:coarse",
-        override_evidence_ids=["evidence:markers", "evidence:replicates"],
-    )
-
-    verification = DeterministicDecisionAuditor.audit(
-        spec,
-        _evidence_bundle(),
-        record,
-    )
-
-    assert any(check.status == "failed" for check in verification)
-    assert [check.checkId for check in verification if check.status == "failed"] == [
-        "independentOverrideEvidence"
-    ]
 
 
 def test_human_choices_obey_the_same_source_and_status_contracts() -> None:

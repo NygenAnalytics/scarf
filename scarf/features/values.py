@@ -11,8 +11,8 @@ from ..metadata.selection import (
     FeatureRef,
     LookupBy,
     NormalizationSpec,
-    Standardize,
 )
+from ..metadata.table import CaseInsensitiveIndex
 
 __all__ = [
     "ResolvedFeature",
@@ -35,21 +35,6 @@ class ResolvedFeature:
     reduction: FeatureReduction | None
     raw: FeatureRef | str
 
-    def scale_key(
-        self,
-        normalization: NormalizationSpec,
-        standardize: Standardize = "none",
-    ) -> tuple[Any, ...]:
-        return (
-            self.assay,
-            self.by,
-            self.ids,
-            self.reduction,
-            normalization.source,
-            normalization.transform,
-            standardize,
-        )
-
 
 class _AssayFeatureIndex:
     """Feature names, ids, and lookup maps read once for one assay."""
@@ -60,16 +45,13 @@ class _AssayFeatureIndex:
         self.n_features = int(assay.feats.N)
         self.names = np.asarray(assay.feats.fetch_all("names"))
         self.ids = np.asarray(assay.feats.fetch_all("ids"))
-        self._by_name: dict[str, list[int]] | None = None
+        self._by_name: CaseInsensitiveIndex | None = None
         self._by_id: dict[str, list[int]] | None = None
 
     def by_name(self, value: str) -> list[int]:
         if self._by_name is None:
-            by_name: dict[str, list[int]] = {}
-            for index, name in enumerate(self.names):
-                by_name.setdefault(str(name).upper(), []).append(index)
-            self._by_name = by_name
-        return self._by_name.get(value.upper(), [])
+            self._by_name = CaseInsensitiveIndex(self.names)
+        return self._by_name.positions(value)
 
     def by_id(self, value: str) -> list[int]:
         if self._by_id is None:

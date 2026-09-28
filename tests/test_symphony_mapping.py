@@ -640,6 +640,28 @@ def test_symphony_r_0_1_3_static_golden_fixture():
     assert not np.allclose(nonzero_corrected, nonzero_query)
 
 
+@pytest.mark.parametrize(
+    "values",
+    [[1, "1", "1", 1], [b"a", "a", "a", b"a"], [1.5, "1.5", 1.5, "1.5"]],
+)
+def test_query_batch_design_rejects_values_that_share_their_text(values):
+    from scarf.datastore._operations.mapping import _MappingOperationsMixin
+
+    # The query batch fingerprint hashes values by their text.
+    batches = pd.DataFrame({"batch": pd.Series(values, dtype=object)})
+    with pytest.raises(ValueError, match="same text"):
+        _MappingOperationsMixin._query_batch_design(batches, len(batches))
+
+
+def test_query_batch_design_keeps_mixed_types_with_distinct_text():
+    from scarf.datastore._operations.mapping import _MappingOperationsMixin
+
+    batches = pd.DataFrame({"batch": pd.Series([1, "2", 1, "2"], dtype=object)})
+    codes, design = _MappingOperationsMixin._query_batch_design(batches, 4)
+    assert codes.tolist() == [0, 1, 0, 1]
+    assert design.shape == (2, 2)
+
+
 @pytest.mark.parametrize("n_variables", [1, 2, 3])
 def test_additive_batch_correction_matches_direct_cell_design(n_variables):
     from scarf.datastore._operations.mapping import _MappingOperationsMixin

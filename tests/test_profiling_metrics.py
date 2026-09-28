@@ -1,8 +1,7 @@
 import json
+import threading
 import time
 from dataclasses import asdict, fields
-
-import pytest
 
 from profiling.metrics import (
     ResourceMeasurement,
@@ -20,6 +19,28 @@ def _write_status(proc_root, pid, parent_pid, rss_kib):
     (process / "status").write_text(
         f"Name:\tprocess-{pid}\nPPid:\t{parent_pid}\nVmRSS:\t{rss_kib} kB\n"
     )
+
+
+class _SampleWatch:
+    """List /proc pids like the sampler does and count how often it samples."""
+
+    def __init__(self) -> None:
+        self.samples = 0
+        self._changed = threading.Condition()
+
+    def __call__(self, proc_root):
+        with self._changed:
+            self.samples += 1
+            self._changed.notify_all()
+        return [
+            int(entry.name) for entry in proc_root.iterdir() if entry.name.isdigit()
+        ]
+
+    def wait_for_fresh_sample(self) -> None:
+        """Return once a sample that started after this call has completed."""
+        with self._changed:
+            target = self.samples + 2
+            assert self._changed.wait_for(lambda: self.samples >= target, timeout=5)
 
 
 def _write_cgroup(cgroup, *, current=100, peak=900):
@@ -51,11 +72,13 @@ def test_sampler_captures_events_limits_cpu_quota_and_operation_peak(tmp_path):
     _write_status(proc_root, 101, 100, 20)
     _write_cgroup(cgroup)
 
+    watch = _SampleWatch()
     sampler = ResourceSampler(
-        sampleIntervalSeconds=60,
+        sampleIntervalSeconds=0.005,
         rootPid=100,
         procRoot=proc_root,
         cgroupPath=cgroup,
+        listPids=watch,
     )
     sampler.start()
 
@@ -64,7 +87,7 @@ def test_sampler_captures_events_limits_cpu_quota_and_operation_peak(tmp_path):
     _write_status(proc_root, 101, 100, 40)
     (cgroup / "memory.current").write_text("350")
     (cgroup / "memory.peak").write_text("420")
-    sampler.sample()
+    watch.wait_for_fresh_sample()
 
     _write_status(proc_root, 100, 1, 15)
     _write_status(proc_root, 101, 100, 10)
@@ -74,7 +97,6 @@ def test_sampler_captures_events_limits_cpu_quota_and_operation_peak(tmp_path):
     )
     result = sampler.stop()
 
-    assert sampler.sampleCount == 3
     assert result.processTreeRssBaselineBytes == 30 * 1024
     assert result.processTreeRssPeakBytes == 70 * 1024
     assert result.processTreeRssIncrementalPeakBytes == 40 * 1024
@@ -108,15 +130,17 @@ def test_unresettable_cgroup_peak_is_labeled_container_lifetime(tmp_path):
     _write_status(proc_root, 100, 1, 10)
     _write_cgroup(cgroup, current=100, peak=1000)
 
+    watch = _SampleWatch()
     sampler = ResourceSampler(
-        sampleIntervalSeconds=60,
+        sampleIntervalSeconds=0.005,
         rootPid=100,
         procRoot=proc_root,
         cgroupPath=cgroup,
         writeText=lambda _path, _value: None,
+        listPids=watch,
     ).start()
     (cgroup / "memory.current").write_text("300")
-    sampler.sample()
+    watch.wait_for_fresh_sample()
     (cgroup / "memory.current").write_text("200")
     result = sampler.stop()
 
@@ -133,17 +157,20 @@ def test_sampler_can_preserve_an_outer_cgroup_peak(tmp_path):
     _write_status(proc_root, 100, 1, 10)
     _write_cgroup(cgroup, current=100, peak=1000)
 
+    watch = _SampleWatch()
     sampler = ResourceSampler(
-        sampleIntervalSeconds=60,
+        sampleIntervalSeconds=0.005,
         rootPid=100,
         procRoot=proc_root,
         cgroupPath=cgroup,
         resetCgroupPeak=False,
+        listPids=watch,
     ).start()
 
     assert (cgroup / "memory.peak").read_text() == "1000"
     (cgroup / "memory.current").write_text("300")
-    sampler.sample()
+    watch.wait_for_fresh_sample()
+    (cgroup / "memory.current").write_text("200")
     result = sampler.stop()
 
     assert result.cgroupMemoryPeakScope == "containerLifetime"
@@ -165,14 +192,17 @@ def test_sampler_reads_cgroup_v1_memory_files(tmp_path):
     (proc / "status").write_text("Name:\tpython\nPPid:\t1\nVmRSS:\t20 kB\n")
     (proc / "cgroup").write_text("6:memory:/job-1\n")
 
+    watch = _SampleWatch()
     sampler = ResourceSampler(
-        sampleIntervalSeconds=60,
+        sampleIntervalSeconds=0.005,
         rootPid=100,
         procRoot=proc_root,
         cgroupRoot=cgroup_root,
+        listPids=watch,
     ).start()
     (memory / "memory.usage_in_bytes").write_text("400")
-    sampler.sample()
+    watch.wait_for_fresh_sample()
+    (memory / "memory.usage_in_bytes").write_text("200")
     result = sampler.stop()
 
     assert result.cgroupMemoryCurrentBaselineBytes == 150
@@ -197,14 +227,17 @@ def test_sampler_falls_back_to_flat_cgroup_v1_memory(tmp_path):
     (proc / "status").write_text("Name:\tpython\nPPid:\t1\nVmRSS:\t20 kB\n")
     (proc / "cgroup").write_text("6:memory:/ta-missing-nested\n")
 
+    watch = _SampleWatch()
     sampler = ResourceSampler(
-        sampleIntervalSeconds=60,
+        sampleIntervalSeconds=0.005,
         rootPid=100,
         procRoot=proc_root,
         cgroupRoot=cgroup_root,
+        listPids=watch,
     ).start()
     (flat / "memory.usage_in_bytes").write_text("300")
-    sampler.sample()
+    watch.wait_for_fresh_sample()
+    (flat / "memory.usage_in_bytes").write_text("150")
     result = sampler.stop()
 
     assert result.cgroupMemoryCurrentBaselineBytes == 120
@@ -221,35 +254,31 @@ def test_background_sampler_observes_process_and_cgroup_peaks(tmp_path):
     cgroup.mkdir()
     (cgroup / "memory.current").write_text("100")
 
+    watch = _SampleWatch()
     sampler = ResourceSampler(
         sampleIntervalSeconds=0.005,
         rootPid=100,
         procRoot=proc_root,
         cgroupPath=cgroup,
+        listPids=watch,
     ).start()
-    count_before_peak = sampler.sampleCount
     _write_status(proc_root, 100, 1, 50)
     _write_status(proc_root, 101, 100, 70)
     (cgroup / "memory.current").write_text("800")
-
-    deadline = time.monotonic() + 1
-    while sampler.sampleCount < count_before_peak + 2:
-        assert time.monotonic() < deadline
-        time.sleep(0.002)
+    watch.wait_for_fresh_sample()
 
     _write_status(proc_root, 100, 1, 5)
     _write_status(proc_root, 101, 100, 5)
     (cgroup / "memory.current").write_text("50")
     result = sampler.stop()
 
-    assert sampler.sampleCount >= 4
     assert result.processTreeRssPeakBytes == 120 * 1024
     assert result.cgroupMemoryCurrentPeakBytes == 800
     assert result.operationPeakBytes == 800
     assert result.cgroupMemoryPeakScope == "unavailable"
 
 
-def test_unavailable_and_protected_metrics_do_not_escape_context(tmp_path):
+def test_unavailable_and_protected_metrics_are_empty_not_errors(tmp_path):
     def unavailable(*_args):
         raise PermissionError("protected")
 
@@ -261,15 +290,10 @@ def test_unavailable_and_protected_metrics_do_not_escape_context(tmp_path):
         readText=unavailable,
         writeText=unavailable,
         listPids=unavailable,
-    )
+    ).start()
+    time.sleep(0.005)
+    result = sampler.stop()
 
-    with pytest.raises(RuntimeError, match="measured failure"):
-        with sampler:
-            time.sleep(0.005)
-            raise RuntimeError("measured failure")
-
-    result = sampler.result
-    assert result is not None
     assert result.processTreeRssPeakBytes is None
     assert result.cgroupMemoryCurrentPeakBytes is None
     assert result.cgroupMemoryPeakBytes is None
@@ -277,7 +301,6 @@ def test_unavailable_and_protected_metrics_do_not_escape_context(tmp_path):
     assert result.memoryEventsDelta is None
     assert result.memoryMaxBytes is None
     assert result.cpuQuotaCores is None
-    assert sampler.sampleCount >= 2
     json.dumps(asdict(result))
 
 
@@ -369,10 +392,10 @@ def test_stage_utilization_leaves_unrecorded_inputs_empty() -> None:
     assert set(stage_utilization({}).values()) == {None}
 
 
-def test_store_probe_count_only_keeps_totals_and_resets() -> None:
+def test_store_probe_keeps_totals_and_resets() -> None:
     from profiling.recording_store import StoreProbe
 
-    probe = StoreProbe(countOnly=True)
+    probe = StoreProbe()
     probe.enter("get", "a/key", requestedBytes=12)
     probe.record_transfer("get", "a/key", 12)
     probe.leave("get")
@@ -380,12 +403,12 @@ def test_store_probe_count_only_keeps_totals_and_resets() -> None:
     probe.record_transfer("set", "b/key", 8)
     probe.leave("set")
 
-    assert probe.ops == []
-    assert probe.transferred_bytes == []
     assert probe.to_json() == {
         "gets": 1,
         "sets": 1,
         "deletes": 0,
+        "deleteDirs": 0,
+        "sizeQueries": 0,
         "rangeGets": 0,
         "partialGets": 0,
         "requestedBytes": 20,
@@ -397,3 +420,76 @@ def test_store_probe_count_only_keeps_totals_and_resets() -> None:
     }
     probe.reset()
     assert set(probe.to_json().values()) == {0}
+
+
+def test_store_probe_reset_keeps_operations_in_flight() -> None:
+    from profiling.recording_store import StoreProbe
+
+    probe = StoreProbe()
+    probe.enter("get", "slow/key")
+    probe.reset()
+    probe.enter("get", "other/key")
+    probe.leave("get")
+    probe.leave("get")
+
+    assert probe.to_json()["maxInFlight"] == 2
+    assert probe.to_json()["gets"] == 1
+
+
+def test_recording_wrapper_forwards_store_specific_operations() -> None:
+    """Profiling must take the wrapped store's own path, not zarr's generic one."""
+    import asyncio
+
+    from obstore.store import MemoryStore as ObjectMemory
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.storage import ObjectStore
+
+    from profiling.recording_store import StoreProbe, wrap_recording_store
+
+    class Spy(ObjectStore):
+        calls: list[str] = []
+
+        async def getsize(self, key):
+            self.calls.append("getsize")
+            return await super().getsize(key)
+
+        async def getsize_prefix(self, prefix):
+            self.calls.append("getsize_prefix")
+            return await super().getsize_prefix(prefix)
+
+        async def set_if_not_exists(self, key, value):
+            self.calls.append("set_if_not_exists")
+            await super().set_if_not_exists(key, value)
+
+        async def delete_dir(self, prefix):
+            self.calls.append("delete_dir")
+            await super().delete_dir(prefix)
+
+    buffer = default_buffer_prototype().buffer
+    inner = Spy(ObjectMemory())
+    probe = StoreProbe()
+    wrapped = wrap_recording_store(inner, probe=probe)
+
+    async def exercise() -> None:
+        await inner.set("big", buffer.from_bytes(b"x" * 1000))
+        assert await wrapped.getsize("big") == 1000
+        assert await wrapped.getsize_prefix("") == 1000
+        await wrapped.set_if_not_exists("big", buffer.from_bytes(b"y"))
+        await inner.set("dir/a", buffer.from_bytes(b"a"))
+        await wrapped.delete_dir("dir")
+
+    asyncio.run(exercise())
+
+    assert Spy.calls == [
+        "getsize",
+        "getsize_prefix",
+        "set_if_not_exists",
+        "delete_dir",
+    ]
+    counts = probe.to_json()
+    # Size queries never download the object they measure.
+    assert counts["gets"] == 0
+    assert counts["readTransferredBytes"] == 0
+    assert counts["sizeQueries"] == 2
+    assert counts["sets"] == 1
+    assert counts["deleteDirs"] == 1

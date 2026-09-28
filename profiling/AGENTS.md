@@ -59,6 +59,10 @@ size `1000000`, R2 backend (`scarf_profiling` env).
 `createStore`, `writeCountsT`, `markHvgs`, and `findMarkers`. Leave other stage envelopes as in
 the example so the gate does not claim the whole 1M funnel fits in 32 GiB.
 
+A funnel reuses the DataStore that `initializeStore` opens through `findMarkers`, so those stages
+must share `workers` and `scarfMemoryBudget`; `run-e2e` and `run-local` refuse a config where they
+differ. Their Modal CPU and memory may differ.
+
 ```bash
 # User action only; agents never deploy.
 uv run --group profiling modal deploy --env scarf_profiling \
@@ -93,7 +97,17 @@ result JSON under the run's `runTag`. Expect hours of Modal time and real cost.
 
 ## Measurement discipline
 
-- Never run two jobs with the same `runTag`.
+- Never run two jobs with the same `runTag`. Stage jobs take a create-only claim per `runTag`,
+  size, and stage and release it when they finish, and they refuse a `runTag` that an e2e
+  funnel holds. A claim left by a killed job names the object to delete once that job has
+  stopped.
+- A stage whose artifact already existed measured a cache lookup and fails. Use `--force` or a
+  fresh `runTag`; `--allow-reuse` accepts it knowingly.
+- `storeUriOverride` and `storeUriBySize` are for consume stages only; other stages refuse them,
+  and `createStore` refuses an existing store unless forced.
+- `prepare-fixture` uploads create-only, so it never replaces a prepared sample. Results record
+  the downloaded dataset's ETag and size, and provenance records the digest of the code that ran
+  next to the client's.
 - Change one measured variable at a time and keep workflow seeds fixed.
 - Compare runs only when dataset, code revision, settings, storage conditions, and resource
   envelope are stated.

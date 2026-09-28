@@ -1,5 +1,4 @@
 import math
-import re
 from typing import Any
 
 import numpy as np
@@ -8,6 +7,7 @@ from scipy.sparse import csr_matrix, diags
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import LinearOperator, gmres, splu
 
+from ..neighbors.graph import csr_symmetry_error
 from ..utils.logging import logger
 
 _GMRES_RESTART = 20
@@ -82,30 +82,6 @@ def _bias_and_normalize_rows(
     return isolated_transient_count
 
 
-@njit(cache=True)
-def _has_symmetric_support(
-    indices: np.ndarray,
-    indptr: np.ndarray,
-) -> bool:
-    for row in range(indptr.shape[0] - 1):
-        for offset in range(indptr[row], indptr[row + 1]):
-            col = indices[offset]
-            if col == row:
-                continue
-            lower = indptr[col]
-            upper = indptr[col + 1]
-            while lower < upper:
-                middle = (lower + upper) // 2
-                candidate = indices[middle]
-                if candidate < row:
-                    lower = middle + 1
-                else:
-                    upper = middle
-            if lower >= indptr[col + 1] or indices[lower] != row:
-                return False
-    return True
-
-
 def _validate_sink_groups(
     labels: np.ndarray,
     sinks: list[Any],
@@ -141,24 +117,6 @@ def _validate_sink_groups(
     if missing:
         raise ValueError(f"Sink labels were not found in the selected cells: {missing}")
     return sink_labels, sink_groups
-
-
-def make_sink_tokens(sinks: tuple[Any, ...]) -> tuple[str, ...]:
-    """Create deterministic metadata-safe tokens for sink labels."""
-    tokens: list[str] = []
-    used: set[str] = set()
-    for index, sink in enumerate(sinks):
-        base = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(sink)).strip("_.-")
-        if not base:
-            base = f"sink_{index + 1}"
-        token = base
-        suffix = 2
-        while token in used:
-            token = f"{base}_{suffix}"
-            suffix += 1
-        used.add(token)
-        tokens.append(token)
-    return tuple(tokens)
 
 
 def _normalize_pseudotime(values: np.ndarray) -> np.ndarray:
@@ -655,9 +613,11 @@ def compute_fate_probabilities(
         component_graph.eliminate_zeros()
     if not np.isfinite(component_graph.data).all():
         raise ValueError("Graph weights became non-finite when duplicates were summed")
-    if not _has_symmetric_support(
-        component_graph.indices,
+    if csr_symmetry_error(
         component_graph.indptr,
+        component_graph.indices,
+        None,
+        True,
     ):
         raise ValueError("Graph support must be symmetric")
     n_components, component_labels = connected_components(

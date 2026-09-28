@@ -7,6 +7,7 @@ import zarr
 from ..assay.classification import (
     default_feature_sets,
     is_rna_assay_type,
+    preset_assay_types,
     resolve_persisted_assay_type,
 )
 from ..storage.budget import ResourceBudget, resolve_budget
@@ -23,6 +24,25 @@ def _workspace_root(z: zarr.Group, workspace: str | None) -> zarr.Group:
     if workspace is None:
         return z
     return as_zarr_group(z[workspace], name=workspace)
+
+
+def validate_assay_type(assay_type: str | None) -> None:
+    """Reject an explicit assay type that is not a known preset.
+
+    Args:
+        assay_type: Preset type requested by an import writer, or None.
+
+    Raises:
+        ValueError: If ``assay_type`` is not a preset such as ``RNA``.
+    """
+    if assay_type is None:
+        return
+    presets = preset_assay_types()
+    if assay_type not in presets:
+        raise ValueError(
+            f"assay_type {assay_type!r} is not a preset; use one of "
+            + ", ".join(sorted(presets))
+        )
 
 
 def seed_assay_type(
@@ -91,8 +111,6 @@ def finalize_writer_counts_t(
     recognized preset (``RNA``, ``ADT``, …). Unknown names persist as
     ``Assay`` and skip ``countsT``. Pass an explicit preset ``assay_type`` to
     declare a custom assay group as RNA (or another modality).
-
-    Returns ``None`` when skipped or when the store is Zarr format < 3.
 
     Args:
         z: Root Zarr group.

@@ -236,11 +236,6 @@ def test_result_and_beginner_cannot_treat_an_array_as_a_workspace(
     ("update", "reason"),
     [
         ({"baselineOptionId": "invented"}, "baselineOptionId must reference"),
-        (
-            {"metricPreferredOptionId": "invented"},
-            "metricPreferredOptionId must reference",
-        ),
-        ({"metricPreferredOptionId": None}, "requires metricPreferredOptionId"),
         ({"allowedSources": []}, "must not be empty"),
         ({"allowedSources": ["agent", "agent"]}, "must not contain duplicates"),
     ],
@@ -256,16 +251,11 @@ def test_closed_decision_spec_rejects_unregistered_authority(
 @pytest.mark.parametrize(
     ("update", "reason"),
     [
-        (
-            {"overrideEvidenceIds": ["uncited"], "overrideOfOptionId": "baseline"},
-            "must be included in evidenceIds",
-        ),
-        ({"overrideEvidenceIds": ["markers"]}, "require overrideOfOptionId"),
-        ({"overrideOfOptionId": "chosen"}, "must differ from selectedOptionId"),
+        ({"overrideOfOptionId": "baseline"}, "Extra inputs are not permitted"),
         ({"selectedOptionId": "invented option with spaces"}, "stable identifier"),
     ],
 )
-def test_model_override_cannot_invent_a_comparator_or_uncited_support(
+def test_model_selection_cannot_invent_a_comparator_or_option(
     update: dict[str, Any], reason: str
 ) -> None:
     payload = {

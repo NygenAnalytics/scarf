@@ -1,10 +1,10 @@
 """Ingest, RNA enrichment, quality metrics, and experimental-context stages."""
 
-import hashlib
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 from ...datastore.datastore import DataStore
+from ...metadata.rows import metadata_column_fingerprint
 from ...utils.logging import logger
 from ..data_enrichment.agent import DataEnrichmentAgent
 from ..data_enrichment.contracts import (
@@ -24,7 +24,7 @@ from ..experimental_context.study import (
 )
 from ..ingest import IngestResult
 from ..ingest.manifest import DatasetManifest, is_author_label_column
-from ..record_io import canonical_json_bytes
+from ..record_io import sha256_json
 from ..types import AgentRunInfo, ArtifactReferenceModel
 from . import journal
 from .models import (
@@ -62,8 +62,6 @@ def _context_metadata_identity(
     store: DataStore, request_record: OrchestrationRequestRecord
 ) -> dict[str, str]:
     """Bind added metadata without repeating the original resume fingerprint scan."""
-    from ..parameter_tuning.execution import _metadata_column_fingerprint
-
     data = request_record.inputIdentity.get("data", {})
     original = data.get("metadata", {})
     assay = data.get("assay")
@@ -73,7 +71,7 @@ def _context_metadata_identity(
     return {
         column: original[column]
         if column in original
-        else _metadata_column_fingerprint(store.cells, column)
+        else metadata_column_fingerprint(store.cells, column)
         for column in sorted(store.cells.columns)
         if column not in covered
     }
@@ -158,19 +156,6 @@ class ContextStagesMixin:
         ingest_result: IngestResult,
         dataset_manifest: DatasetManifest | None = None,
     ) -> WorkflowStageAttempt:
-        existing = journal._validated_done_outcome(
-            store,
-            prefix,
-            workflow.workflowRunId,
-            "ingest",
-            request_record,
-            [],
-        )
-        if existing is not None:
-            logger.debug(
-                f"Workflow {workflow.workflowRunId}: reusing persisted ingest stage"
-            )
-            return existing
         cell_selection = store.snapshot_cell_selection("I")
         cell_selection_model = ArtifactReferenceModel.from_artifact_ref(cell_selection)
         started = journal._start_attempt(
@@ -267,18 +252,17 @@ class ContextStagesMixin:
             f"Workflow {workflow.workflowRunId}: Data Enrichment will inspect "
             f"{len(selected_assays)} assay(s)"
         )
-        unknown = sorted(set(selected_assays) - set(store.assay_names))
-        if unknown:
-            return journal.failed_stage(
-                store,
-                workflow,
-                request_record,
-                "data_enrichment",
-                parents,
-                f"Unknown requested assays: {unknown}",
-                artifacts={"cellSelection": cell_selection},
-                resume_record=resume_record,
-            ), DataEnrichmentReport.get_blank()
+        # An answer must form a valid context before an attempt records it.
+        context_payload: dict[str, Any] = {
+            "studyContext": request.studyContext,
+            "studyObjective": request.studyObjective,
+        }
+        supplied_context = answers.get("dataEnrichmentContext")
+        if isinstance(supplied_context, Mapping):
+            context_payload.update(dict(supplied_context))
+        elif isinstance(supplied_context, str) and supplied_context.strip():
+            context_payload["experimentalDetails"] = [supplied_context.strip()]
+        enrichment_context = DataEnrichmentContext.model_validate(context_payload)
         started = journal._start_attempt(
             store.zw,
             prefix,
@@ -299,16 +283,7 @@ class ContextStagesMixin:
         actions: list[str] = []
         operations: list[dict[str, Any]] = []
         try:
-            context_payload: dict[str, Any] = {
-                "studyContext": request.studyContext,
-                "studyObjective": request.studyObjective,
-            }
-            supplied_context = answers.get("dataEnrichmentContext")
-            if isinstance(supplied_context, Mapping):
-                context_payload.update(dict(supplied_context))
-            elif isinstance(supplied_context, str) and supplied_context.strip():
-                context_payload["experimentalDetails"] = [supplied_context.strip()]
-            enrichment_context = DataEnrichmentContext.model_validate(context_payload)
+            references: list[StageEvidenceReference] = []
             recovered = journal._recover_persisted_stage_report(
                 store,
                 started,
@@ -317,6 +292,7 @@ class ContextStagesMixin:
             if recovered is not None:
                 recovered_report, reference = recovered
                 report = cast(DataEnrichmentReport, recovered_report)
+                references.append(reference)
                 actions.append("recover_persisted_data_enrichment_report")
             else:
                 logger.debug(
@@ -347,70 +323,60 @@ class ContextStagesMixin:
                         },
                     ),
                 )
-                saved_report, reference = journal._save_stage_report(
-                    store,
-                    started,
-                    report,
-                    expected_type=DataEnrichmentReport,
-                )
-                report = cast(DataEnrichmentReport, saved_report)
+                # A failed report holds no scientific result, so a resume asks again.
+                if report.status != "failed":
+                    saved_report, reference = journal._save_stage_report(
+                        store,
+                        started,
+                        report,
+                        expected_type=DataEnrichmentReport,
+                    )
+                    report = cast(DataEnrichmentReport, saved_report)
+                    references.append(reference)
             logger.debug(
                 f"Workflow {workflow.workflowRunId}: Data Enrichment returned "
                 f"status={report.status!r}, policies={len(report.policies)}, "
                 f"inspections={len(report.inspections)}"
             )
             if report.status == "needsInput":
-                if request_record.config.inputPolicy == "unattended":
-                    outcome = journal._complete_attempt(
-                        started,
-                        status="failed",
-                        report_references=[reference],
-                        artifacts={"cellSelection": cell_selection},
-                        actions=actions,
-                        outputs={"operations": operations},
-                        error=(
-                            "The unattended Data Enrichment stage returned an "
-                            "unresolved decision"
-                        ),
-                        notes=report.limitations,
-                    )
-                    journal._save_outcome(store.zw, prefix, outcome)
-                    return outcome, report
-                questions = [
-                    WorkflowQuestion(
-                        questionId="dataEnrichmentContext",
-                        question=(
-                            "\n".join(report.unresolvedQuestions)
-                            or "Provide the missing study-context details."
-                        ),
-                        evidenceIds=list(report.evidenceIds),
-                    )
-                ]
-                outcome = journal._complete_attempt(
+                outcome = journal._pause_or_fail_attempt(
                     started,
-                    status="needsInput",
-                    report_references=[reference],
+                    request_record,
+                    questions=[
+                        WorkflowQuestion(
+                            questionId="dataEnrichmentContext",
+                            question=(
+                                "\n".join(report.unresolvedQuestions)
+                                or "Provide the missing study-context details."
+                            ),
+                            evidenceIds=list(report.evidenceIds),
+                        )
+                    ],
+                    error=(
+                        "The unattended Data Enrichment stage returned an "
+                        "unresolved decision"
+                    ),
+                    report_references=references,
                     artifacts={"cellSelection": cell_selection},
                     actions=actions,
                     outputs={"operations": operations},
-                    needs_input=WorkflowNeedsInput(questions=questions),
                     notes=report.limitations,
                 )
             elif report.status == "failed":
                 outcome = journal._complete_attempt(
                     started,
                     status="failed",
-                    report_references=[reference],
+                    report_references=references,
                     artifacts={"cellSelection": cell_selection},
                     actions=actions,
                     outputs={"operations": operations},
-                    error="; ".join(report.limitations),
+                    error="; ".join(report.limitations) or "Data Enrichment failed",
                 )
             else:
                 outcome = journal._complete_attempt(
                     started,
                     status="done",
-                    report_references=[reference],
+                    report_references=references,
                     artifacts={"cellSelection": cell_selection},
                     actions=actions,
                     outputs={
@@ -587,7 +553,6 @@ class ContextStagesMixin:
         request_record: OrchestrationRequestRecord,
         parents: Sequence[WorkflowStageLink],
         cell_selection: ArtifactReferenceModel,
-        enrichment_reference: StageEvidenceReference,
         quality_metric_artifacts: Sequence[NamedArtifactSource],
         hto_identity_artifacts: Sequence[NamedArtifactSource],
         answers: Mapping[str, Any],
@@ -617,27 +582,10 @@ class ContextStagesMixin:
             parents,
         )
         if existing is not None:
-            saved_metadata = existing.inputs.get("metadataFingerprints")
-            if saved_metadata is not None and saved_metadata != metadata_identity:
+            if existing.inputs.get("metadataFingerprints") != metadata_identity:
                 raise ValueError(
                     "Experimental Context metadata changed; start a new analysis"
                 )
-            if saved_metadata is None:
-                # Older compatible stages may already have committed downstream
-                # metadata identities. Verify them; do not rewrite the old report.
-                for tuning in journal._stage_starts(
-                    store.zw, prefix, workflow.workflowRunId, "parameter_tuning"
-                ):
-                    if any(
-                        metadata_identity.get(column) != digest
-                        for column, digest in tuning.inputs.get(
-                            "metadataFingerprints", {}
-                        ).items()
-                    ):
-                        raise ValueError(
-                            "Experimental Context metadata differs from saved tuning evidence; "
-                            "restore the original inputs or start a new analysis"
-                        )
             logger.debug(
                 f"Workflow {workflow.workflowRunId}: reusing Experimental Context "
                 "report"
@@ -759,6 +707,12 @@ class ContextStagesMixin:
                     *existing_exclusion_list,
                 }
             )
+        # A capture answer must name observed metadata before an attempt records it.
+        physical_capture = directions.get("physicalCaptureColumn")
+        if not isinstance(physical_capture, str) or not physical_capture:
+            physical_capture = None
+        elif physical_capture not in store.cells.columns:
+            raise ValueError("physicalCaptureColumn must identify observed metadata")
         retry_inputs: dict[str, Any] = {}
         failed = journal._validated_done_outcome(
             store,
@@ -958,21 +912,13 @@ class ContextStagesMixin:
                             if key != "retryAfterFailedReport"
                         },
                     }
-                    evidence_key = (
-                        "experimental_context/evidence/"
-                        + hashlib.sha256(
-                            canonical_json_bytes(evidence_inputs)
-                        ).hexdigest()
+                    evidence_key = "experimental_context/evidence/" + sha256_json(
+                        evidence_inputs
                     )
                     result_key = "result"
                     if "retryAfterFailedReport" in retry_inputs:
-                        result_key += (
-                            "/"
-                            + hashlib.sha256(
-                                canonical_json_bytes(
-                                    retry_inputs["retryAfterFailedReport"]
-                                )
-                            ).hexdigest()
+                        result_key += "/" + sha256_json(
+                            retry_inputs["retryAfterFailedReport"]
                         )
 
                     def read_evidence(key: str) -> dict[str, Any] | None:
@@ -1045,37 +991,26 @@ class ContextStagesMixin:
                 f"{report.decision.batchCorrection.action!r}"
             )
             if report.status == "needsInput":
-                if request_record.config.inputPolicy == "unattended":
-                    outcome = journal._complete_attempt(
-                        started,
-                        status="failed",
-                        report_references=[reference],
-                        artifacts=context_artifacts,
-                        error=(
-                            "The unattended Experimental Context stage returned an "
-                            "unresolved decision: "
-                            + "; ".join(report.decision.needsInput or report.notes)
-                        ),
-                        notes=report.notes,
-                    )
-                    journal._save_outcome(store.zw, prefix, outcome)
-                    return outcome, report
-                questions = [
-                    WorkflowQuestion(
-                        questionId="experimentalDirections",
-                        question=(
-                            "\n".join(report.decision.needsInput)
-                            or "Provide the missing experimental-context details."
-                        ),
-                        evidenceIds=list(report.decision.evidenceIds),
-                    )
-                ]
-                outcome = journal._complete_attempt(
+                outcome = journal._pause_or_fail_attempt(
                     started,
-                    status="needsInput",
+                    request_record,
+                    questions=[
+                        WorkflowQuestion(
+                            questionId="experimentalDirections",
+                            question=(
+                                "\n".join(report.decision.needsInput)
+                                or "Provide the missing experimental-context details."
+                            ),
+                            evidenceIds=list(report.decision.evidenceIds),
+                        )
+                    ],
+                    error=(
+                        "The unattended Experimental Context stage returned an "
+                        "unresolved decision: "
+                        + "; ".join(report.decision.needsInput or report.notes)
+                    ),
                     report_references=[reference],
                     artifacts=context_artifacts,
-                    needs_input=WorkflowNeedsInput(questions=questions),
                     notes=report.notes,
                 )
             elif report.status == "failed":
@@ -1119,17 +1054,6 @@ class ContextStagesMixin:
             else:
                 if report.decision.batchCorrection.action == "unsafe":
                     actions.append("evaluate_unsafe_harmony_for_diagnosis")
-                physical_capture = directions.get("physicalCaptureColumn")
-                if not isinstance(physical_capture, str) or not physical_capture:
-                    physical_capture = None
-                elif physical_capture not in {
-                    *store.cells.columns,
-                    *report.htoIdentityColumns,
-                }:
-                    raise ValueError(
-                        "physicalCaptureColumn must identify observed metadata or "
-                        "an exact HTO identity"
-                    )
                 study_contract = build_study_contract(
                     study_context=request_record.request.studyContext,
                     study_objective=request_record.request.studyObjective,
@@ -1141,28 +1065,23 @@ class ContextStagesMixin:
                 try:
                     validate_objective_evidence(study_contract, report)
                 except ValueError as exc:
-                    unattended = request_record.config.inputPolicy == "unattended"
-                    outcome = journal._complete_attempt(
+                    outcome = journal._pause_or_fail_attempt(
                         started,
-                        status="failed" if unattended else "needsInput",
+                        request_record,
+                        questions=[
+                            WorkflowQuestion(
+                                questionId="experimentalDirections",
+                                question=str(exc),
+                                evidenceIds=list(study_contract.evidenceIds),
+                            )
+                        ],
+                        error=str(exc),
                         report_references=[reference],
                         artifacts=context_artifacts,
                         outputs={
                             "studyContract": study_contract.model_dump(mode="json")
                         },
                         actions=actions,
-                        error=str(exc) if unattended else None,
-                        needs_input=None
-                        if unattended
-                        else WorkflowNeedsInput(
-                            questions=[
-                                WorkflowQuestion(
-                                    questionId="experimentalDirections",
-                                    question=str(exc),
-                                    evidenceIds=list(study_contract.evidenceIds),
-                                )
-                            ]
-                        ),
                         notes=[*report.notes, str(exc)],
                     )
                     journal._save_outcome(store.zw, prefix, outcome)

@@ -1,9 +1,7 @@
 from typing import Any
 
-import numpy as np
 import zarr
 
-from ..matrix import ChunkedArray
 from ..metadata import MetaData
 from .base import Assay
 from .normalization import norm_clr
@@ -50,35 +48,3 @@ class ADTassay(Assay):
             **kwargs,
         )
         self.normMethod = norm_clr
-
-    def normed(
-        self,
-        cell_idx: np.ndarray | None = None,
-        feat_idx: np.ndarray | None = None,
-        **kwargs: Any,
-    ) -> ChunkedArray:
-        """This function normalizes the raw and returns a delayed chunked array of
-        the normalized data. This method uses the normalization indicated
-        by attribute self.normMethod which by default is set to `norm_clr`. The
-        centered log-ratio normalization is performed using only the cells and
-        features indicated by the 'cell_idx' and 'feat_idx' parameters.
-
-        Args:
-            cell_idx: Indices of cells to be included in the normalized matrix
-                      (Default value: All those marked True in 'I' column of cell
-                      attribute table)
-            feat_idx: Indices of features to be included in the normalized matrix.
-                      Defaults to the complete physical feature axis.
-            **kwargs:
-
-        Returns: A chunked array (delayed matrix) containing normalized data.
-        """
-        from ..storage.identity import read_dataset_fingerprint
-
-        read_dataset_fingerprint(self.z)
-        if cell_idx is None:
-            cell_idx = self.cells.active_index("I")
-        if feat_idx is None:
-            feat_idx = np.arange(self.feats.N, dtype=np.int64)
-        counts = self.rawData[:, feat_idx][cell_idx, :]
-        return self.normMethod(self, counts)

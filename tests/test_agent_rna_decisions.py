@@ -45,8 +45,6 @@ def _record(
     *,
     source: str = "agent",
     evidence_ids: list[str] | None = None,
-    override_of: str | None = None,
-    override_evidence_ids: list[str] | None = None,
 ) -> DecisionRecord:
     bundle = bundle.with_content_sha256()
     assert bundle.contentSha256 is not None
@@ -68,8 +66,6 @@ def _record(
         else [item.evidenceId for item in bundle.evidence],
         rationale="The exact cited evidence supports this registered option.",
         confidence="medium",
-        overrideOfOptionId=override_of,
-        overrideEvidenceIds=override_evidence_ids or [],
     )
 
 

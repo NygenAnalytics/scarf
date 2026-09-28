@@ -16,9 +16,10 @@ from pathlib import Path
 from typing import Any
 
 from scarf import ArtifactRef, configure_output
+from scarf.storage.artifact_writer import artifact_plan_scope
 
-from profiling.config import StageResources, WorkflowParameters
-from profiling.stages import _open_datastore
+from profiling.config import StageResources, StorageIoConfig, WorkflowParameters
+from profiling.stages import _open_datastore, require_artifact_ref
 
 configure_output(progress=False, timestamps=True)
 
@@ -35,6 +36,12 @@ def run_leiden_worker(requestPath: Path) -> None:
     store_uri = str(request["storeUri"])
     workflow = WorkflowParameters.model_validate(request["workflow"])
     resources = StageResources.model_validate(request["resources"])
+    raw_storage_io = request["storageIo"]
+    storage_io = (
+        None
+        if raw_storage_io is None
+        else StorageIoConfig.model_validate(raw_storage_io)
+    )
     status_path = Path(str(request["statusPath"]))
 
     print(
@@ -49,6 +56,7 @@ def run_leiden_worker(requestPath: Path) -> None:
             workflow,
             resources,
             initialize=False,
+            storageIo=storage_io,
         )
         opened = time.perf_counter()
         print(
@@ -60,13 +68,12 @@ def run_leiden_worker(requestPath: Path) -> None:
             raw_inputs.get("graph"), dict
         ):
             raise ValueError("Leiden worker requires an explicit graph artifact")
-        graph = ArtifactRef.from_dict(raw_inputs["graph"])
-        if (
-            graph.scope != "assay"
-            or graph.assay != workflow.assayName
-            or graph.kind != "connectivity_map"
-        ):
-            raise ValueError("Leiden worker graph artifact is incompatible")
+        graph = require_artifact_ref(
+            ArtifactRef.from_dict(raw_inputs["graph"]),
+            kind="connectivity_map",
+            assay=workflow.assayName,
+            label="The Leiden worker graph",
+        )
         arguments: dict[str, Any] = {
             "resolution": workflow.leidenResolution,
             "backend": workflow.leidenBackend,
@@ -74,11 +81,16 @@ def run_leiden_worker(requestPath: Path) -> None:
         }
         if request.get("invalidateCache") is True:
             arguments["invalidate_cache"] = True
-        clusters = store.run_leiden_clustering(
-            graph,
-            **arguments,
-        )
+        with artifact_plan_scope() as receipts:
+            clusters = store.run_leiden_clustering(
+                graph,
+                **arguments,
+            )
         finished = time.perf_counter()
+        disposition = next(
+            (item.disposition for item in reversed(receipts) if item.ref == clusters),
+            None,
+        )
         del store
     except BaseException as exc:
         error = f"{type(exc).__name__}: {exc}"
@@ -92,6 +104,7 @@ def run_leiden_worker(requestPath: Path) -> None:
             "status": "ok",
             "error": None,
             "artifact": clusters.to_dict(),
+            "artifactDisposition": disposition,
             "inputSetupSeconds": opened - started,
             "operationSeconds": finished - opened,
             "wholeWorkerSeconds": time.perf_counter() - started,

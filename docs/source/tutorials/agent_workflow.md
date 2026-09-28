@@ -638,19 +638,10 @@ def _scripted_workflow_model() -> tuple[FunctionModel, dict[str, Any]]:
                 item["evidenceId"],
             )
             evidence_class_by_id[item["evidenceId"]] = item["evidenceClass"]
-        preferred = decision.get("metricPreferredOptionId")
-        selected = (
-            next(
-                option
-                for option in decision["options"]
-                if option["optionId"] == preferred
-            )
-            if preferred is not None
-            else next(
-                option
-                for option in decision["options"]
-                if option["status"] in {"apply", "skip"}
-            )
+        selected = next(
+            option
+            for option in decision["options"]
+            if option["status"] in {"apply", "skip"}
         )
         evidence_ids = list(selected.get("requiredEvidenceIds", []))
         cited_classes = {

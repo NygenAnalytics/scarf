@@ -4,13 +4,24 @@ from typing import Any
 import h5py
 import numpy as np
 
+from ..utils.arrays import assay_feature_ranges
 from ..utils.logging import logger
 from ._assay_names import (
     AUTO_ASSAY_NAMES,
     auto_name_feat_table,
     make_feat_table_from_types,
 )
-
+from ._h5ad_columns import (
+    SPARSE_KEYS,
+    column_length,
+    index_key as _index_key,
+    is_column,
+    present_column,
+    read_table_column,
+    sparse_encoding,
+    sparse_shape,
+)
+from ._text import as_text as _as_text
 
 _FEATURE_ID_KEYS = (
     "_index",
@@ -39,7 +50,7 @@ _CELL_ID_KEYS = (
     "barcode",
     "barcodes",
 )
-_MATRIX_COMPONENTS = frozenset({"data", "indices", "indptr"})
+_LEGACY_CATEGORY_GROUPS = ("__categories", "categories")
 _NON_MATRIX_PREFIXES = (
     "obs/",
     "var/",
@@ -99,96 +110,22 @@ class _MatrixCandidate:
         return self.encoding in {"csr", "csc"}
 
 
-def _as_text(value: Any) -> str:
-    if isinstance(value, bytes | np.bytes_):
-        return value.decode("utf-8")
-    return str(value)
-
-
 def _node_length(node: h5py.Group | h5py.Dataset | None) -> int | None:
     if node is None:
         return None
     if isinstance(node, h5py.Dataset):
         return int(node.shape[0]) if node.shape else None
 
-    index_key = node.attrs.get("_index")
-    if index_key is not None:
-        index_name = _as_text(index_key)
-        if index_name in node:
-            values = node[index_name]
-            if isinstance(values, h5py.Dataset) and values.shape:
-                return int(values.shape[0])
-            if isinstance(values, h5py.Group) and "codes" in values:
-                return int(values["codes"].shape[0])
-
-    for key in ("_index", "index"):
-        if key in node:
-            values = node[key]
-            if isinstance(values, h5py.Dataset) and values.shape:
-                return int(values.shape[0])
-            if isinstance(values, h5py.Group) and "codes" in values:
-                return int(values["codes"].shape[0])
-
+    for key in (_index_key(node), "_index", "index"):
+        if key is not None and key in node:
+            length = column_length(node[key])
+            if length is not None:
+                return length
     for values in node.values():
-        if isinstance(values, h5py.Dataset) and values.shape:
-            return int(values.shape[0])
-        if (
-            isinstance(values, h5py.Group)
-            and "codes" in values
-            and isinstance(values["codes"], h5py.Dataset)
-        ):
-            return int(values["codes"].shape[0])
+        length = column_length(values)
+        if length is not None:
+            return length
     return None
-
-
-def _sparse_encoding(group: h5py.Group) -> str | None:
-    encoding = group.attrs.get("encoding-type")
-    if encoding is None:
-        encoding = group.attrs.get("h5sparse_format")
-    if encoding is None:
-        return "csr"
-
-    normalized = _as_text(encoding).lower()
-    if normalized in {"csr", "csr_matrix"}:
-        return "csr"
-    if normalized in {"csc", "csc_matrix"}:
-        return "csc"
-    return None
-
-
-def _stored_shape(group: h5py.Group) -> tuple[int, int] | None:
-    shape: Any = group.attrs.get("shape")
-    if shape is None:
-        shape = group.attrs.get("h5sparse_shape")
-    if shape is None and "shape" in group and isinstance(group["shape"], h5py.Dataset):
-        shape = group["shape"][:]
-    if shape is None:
-        return None
-    values = np.asarray(shape).reshape(-1)
-    if values.size != 2:
-        return None
-    return int(values[0]), int(values[1])
-
-
-def _infer_sparse_shape(
-    h5: h5py.File,
-    key: str,
-    group: h5py.Group,
-    encoding: str,
-) -> tuple[int, int]:
-    stored = _stored_shape(group)
-    if stored is not None:
-        return stored
-
-    compressed_axis = int(group["indptr"].shape[0] - 1)
-    indices = group["indices"]
-    observed_axis = int(np.max(indices[:])) + 1 if indices.shape[0] else 0
-    obs_length = _node_length(h5.get("obs"))
-    feature_group = h5.get("raw/var" if key.startswith("raw/") else "var")
-    feature_length = _node_length(feature_group)
-    if encoding == "csr":
-        return compressed_axis, feature_length or observed_axis
-    return obs_length or observed_axis, compressed_axis
 
 
 def _is_integer_like(dataset: h5py.Dataset) -> bool:
@@ -227,18 +164,24 @@ def _matrix_candidates(h5: h5py.File) -> list[_MatrixCandidate]:
     def visit(key: str, node: h5py.Group | h5py.Dataset) -> None:
         if not _is_matrix_path(key):
             return
-        if isinstance(node, h5py.Group) and _MATRIX_COMPONENTS.issubset(node.keys()):
-            encoding = _sparse_encoding(node)
+        if isinstance(node, h5py.Group) and SPARSE_KEYS.issubset(node.keys()):
+            encoding = sparse_encoding(node)
             if encoding is None:
                 logger.warning(
                     f"Ignoring sparse matrix candidate with unknown encoding: {key}"
+                )
+                return
+            shape = sparse_shape(node)
+            if shape is None:
+                logger.warning(
+                    f"Ignoring sparse matrix candidate without a shape attribute: {key}"
                 )
                 return
             candidates.append(
                 _MatrixCandidate(
                     key=key,
                     encoding=encoding,
-                    shape=_infer_sparse_shape(h5, key, node, encoding),
+                    shape=shape,
                     integerLike=_is_integer_like(node["data"]),
                 )
             )
@@ -275,66 +218,21 @@ def _read_column(
     if isinstance(node, h5py.Dataset):
         if node.dtype.names is None or key not in node.dtype.names:
             return None
-        return np.asarray(node[key])
-    if key not in node:
+    elif key not in node or not is_column(node[key]):
         return None
-
-    values = node[key]
-    if isinstance(values, h5py.Dataset):
-        raw = np.asarray(values[:])
-        for category_group_name in ("__categories", "categories"):
-            if category_group_name not in node:
-                continue
-            category_group = node[category_group_name]
-            if isinstance(category_group, h5py.Group) and key in category_group:
-                if not np.issubdtype(raw.dtype, np.integer):
-                    return raw
-                categories = np.asarray(category_group[key][:])
-                valid = (raw >= 0) & (raw < len(categories))
-                decoded = np.empty(raw.shape, dtype=object)
-                decoded[valid] = categories[raw[valid]]
-                decoded[~valid] = None
-                return decoded
-        return raw
-
-    if isinstance(values, h5py.Group) and {"codes", "categories"}.issubset(
-        values.keys()
-    ):
-        codes = np.asarray(values["codes"][:])
-        categories = np.asarray(values["categories"][:])
-        valid = (codes >= 0) & (codes < len(categories))
-        decoded = np.empty(codes.shape, dtype=object)
-        decoded[valid] = categories[codes[valid]]
-        decoded[~valid] = None
-        return decoded
-    return None
+    try:
+        values, missing = read_table_column(
+            node.file, node, key, _LEGACY_CATEGORY_GROUPS
+        )
+    except (TypeError, ValueError):
+        return None
+    return present_column(values, missing)
 
 
 def _column_names(node: h5py.Group | h5py.Dataset) -> list[str]:
     if isinstance(node, h5py.Dataset):
         return list(node.dtype.names or ())
-    return [
-        key
-        for key in node.keys()
-        if key not in {"__categories", "categories"}
-        and (
-            isinstance(node[key], h5py.Dataset)
-            or (
-                isinstance(node[key], h5py.Group)
-                and {"codes", "categories"}.issubset(node[key].keys())
-            )
-        )
-    ]
-
-
-def _index_key(node: h5py.Group | h5py.Dataset) -> str | None:
-    """Return the dataframe index dataset name recorded by AnnData."""
-    if not isinstance(node, h5py.Group):
-        return None
-    index_attr = node.attrs.get("_index")
-    if index_attr is None:
-        return None
-    return _as_text(index_attr)
+    return [key for key, child in node.items() if is_column(child)]
 
 
 def _matching_key(names: list[str], preferences: tuple[str, ...]) -> str | None:
@@ -356,14 +254,22 @@ def _is_string_column(values: np.ndarray) -> bool:
     )
 
 
+def _distinct_count(values: np.ndarray) -> int:
+    return len({None if value is None else _as_text(value) for value in values})
+
+
 def _is_unique(values: np.ndarray, expected_length: int) -> bool:
     if values.ndim != 1 or len(values) != expected_length:
         return False
-    normalized = np.asarray(
-        [None if value is None else _as_text(value) for value in values],
-        dtype=object,
-    )
-    return len(set(normalized.tolist())) == expected_length
+    return _distinct_count(values) == expected_length
+
+
+def _table_index(node: h5py.Group | h5py.Dataset, names: list[str]) -> str | None:
+    """Return the column that holds the dataframe index, if it has one."""
+    for key in (_index_key(node), "_index", "index"):
+        if key is not None and key in names:
+            return key
+    return None
 
 
 def _find_cell_ids(
@@ -409,58 +315,92 @@ def _mean_text_length(values: np.ndarray) -> float:
     return float(np.mean([len(value) for value in sample]))
 
 
+class _FeatureColumns:
+    """Read each candidate feature column once and classify it."""
+
+    def __init__(self, node: h5py.Group | h5py.Dataset, n_features: int) -> None:
+        self._node = node
+        self._n = n_features
+        self._values: dict[str, np.ndarray | None] = {}
+
+    def values(self, name: str) -> np.ndarray | None:
+        if name not in self._values:
+            self._values[name] = _read_column(self._node, name)
+        return self._values[name]
+
+    def text(self, name: str) -> np.ndarray | None:
+        values = self.values(name)
+        if (
+            values is None
+            or values.ndim != 1
+            or len(values) != self._n
+            or not _is_string_column(values)
+        ):
+            return None
+        return values
+
+    def unique_text(self, name: str) -> bool:
+        values = self.text(name)
+        return values is not None and _is_unique(values, self._n)
+
+    def mean_length(self, name: str) -> float:
+        values = self.text(name)
+        return 0.0 if values is None else _mean_text_length(values)
+
+    def varied(self, name: str) -> bool:
+        # Display names are nearly unique; feature types and genome names are
+        # repeated labels.
+        values = self.text(name)
+        return values is not None and 2 * _distinct_count(values) > self._n
+
+
 def _find_features(
     node: h5py.Group | h5py.Dataset,
     n_features: int,
 ) -> tuple[str, str]:
     names = _column_names(node)
-    index_key = _index_key(node)
+    columns = _FeatureColumns(node, n_features)
+    index = _table_index(node, names)
+    explicit_ids = [
+        name
+        for preferred in _FEATURE_ID_KEYS
+        for name in names
+        if name.lower() == preferred and name != index and columns.unique_text(name)
+    ]
     id_key: str | None = None
-    if index_key is not None and index_key in names:
-        values = _read_column(node, index_key)
-        if values is not None and _is_unique(values, n_features):
-            id_key = index_key
-    if id_key is None:
-        id_key = _matching_key(names, _FEATURE_ID_KEYS)
-        if id_key is not None:
-            values = _read_column(node, id_key)
-            if values is None or not _is_unique(values, n_features):
-                id_key = None
+    if index is not None and columns.unique_text(index):
+        # AnnData files often hold display symbols in the index next to an
+        # identifier column such as ``gene_ids``; the identifiers win then.
+        id_key = explicit_ids[0] if explicit_ids else index
+    elif explicit_ids:
+        id_key = explicit_ids[0]
+    else:
+        unique_columns = [name for name in names if columns.unique_text(name)]
+        if unique_columns:
+            id_key = max(
+                unique_columns,
+                key=lambda name: (columns.mean_length(name), name),
+            )
 
     name_key = _matching_key(names, _FEATURE_NAME_KEYS)
-    if name_key is not None:
-        values = _read_column(node, name_key)
-        if (
-            values is None
-            or values.ndim != 1
-            or len(values) != n_features
-            or not _is_string_column(values)
-        ):
-            name_key = None
-
-    string_columns: list[tuple[str, float, bool]] = []
-    for name in names:
-        values = _read_column(node, name)
-        if (
-            values is None
-            or values.ndim != 1
-            or len(values) != n_features
-            or not _is_string_column(values)
-        ):
-            continue
-        string_columns.append(
-            (name, _mean_text_length(values), _is_unique(values, n_features))
-        )
-
-    if id_key is None:
-        unique_columns = [column for column in string_columns if column[2]]
-        if unique_columns:
-            id_key = max(unique_columns, key=lambda column: (column[1], column[0]))[0]
-    if name_key is None and string_columns:
+    if name_key is not None and columns.text(name_key) is None:
+        name_key = None
+    if (
+        name_key is None
+        and index is not None
+        and id_key not in {None, index}
+        and columns.text(index) is not None
+    ):
+        name_key = index
+    if name_key is None:
         alternatives = [
-            column for column in string_columns if column[0] != id_key
-        ] or string_columns
-        name_key = min(alternatives, key=lambda column: (column[1], column[0]))[0]
+            name for name in names if name != id_key and columns.varied(name)
+        ]
+        if alternatives:
+            name_key = min(
+                alternatives,
+                key=lambda name: (columns.mean_length(name), name),
+            )
 
     if id_key is None and name_key is None:
         logger.warning("No feature ID or name column found; generated IDs will be used")
@@ -489,14 +429,12 @@ def _read_text_scalar(
     key: str,
     max_length: int,
 ) -> str | None:
-    if key not in h5:
+    """Return a scalar or one-element text dataset, or None for any other node."""
+    node = h5.get(key)
+    if not isinstance(node, h5py.Dataset) or node.shape not in {(), (1,)}:
         return None
-    node = h5[key]
-    if not isinstance(node, h5py.Dataset):
-        return None
-    value = node[()]
-    text = _as_text(value)
-    return text[:max_length]
+    value = node[()] if node.shape == () else node[0]
+    return _as_text(value)[:max_length]
 
 
 def _feature_group_for(key: str) -> str:
@@ -548,6 +486,15 @@ def _select_matrix(
         )
 
     raise ValueError("No matrix candidate matches the obs and var dimensions")
+
+
+def _suggested_assays(feature_types: list[str]) -> dict[str, int]:
+    ranges = assay_feature_ranges(
+        auto_name_feat_table(make_feat_table_from_types(feature_types))
+    )
+    return {
+        name: sum(end - start for start, end in spans) for name, spans in ranges.items()
+    }
 
 
 def inspect_h5ad(
@@ -628,17 +575,7 @@ def inspect_h5ad(
                     ):
                         assay_split_key = None
                     else:
-                        assay_table = auto_name_feat_table(
-                            make_feat_table_from_types(feature_types)
-                        )
-                        for assay_name in dict.fromkeys(assay_table.columns):
-                            selected = assay_table[assay_name]
-                            count = (
-                                int(selected.loc["nFeatures"].sum())
-                                if selected.ndim == 2
-                                else int(selected.loc["nFeatures"])
-                            )
-                            suggested_assays[str(assay_name)] = count
+                        suggested_assays = _suggested_assays(feature_types)
 
         layers_node = h5.get("layers")
         layers = (

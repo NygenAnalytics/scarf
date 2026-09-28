@@ -7,10 +7,7 @@ _DATASETS_DIR = os.path.join(os.path.dirname(__file__), "datasets")
 
 
 def chunked_total_sum(raw_data) -> int:
-    total = 0
-    for block in raw_data.blocks:
-        total += int(block.compute().sum())
-    return total
+    return sum(int(block.sum()) for block in raw_data.stream_blocks(nthreads=1))
 
 
 def full_path(fn, *args):

@@ -64,10 +64,10 @@ class _MergeAssay:
     @property
     def matrixGroup(self):
         # A prepared assay's saved count summaries match its current counts.
-        from scarf.storage.identity import finalize_counts
+        from tests.storage_helpers import finalize_test_counts
 
         group = zarr.open_group(store=MemoryStore(), mode="w")
-        finalize_counts(
+        finalize_test_counts(
             group.create_array("counts", data=np.asarray(self.rawData.compute()))
         )
         return group
@@ -1344,32 +1344,32 @@ def test_dataset_merge_plan_reports_destination_conflict(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("case", "reason", "expectation"),
+    ("case", "reason"),
     [
-        ("cell_identity", "order of cells", "block"),
-        ("counts_shape", "not finalized", "block"),
-        ("counts_dtype", "not finalized", "block"),
-        ("counts_chunks", "not finalized", "block"),
-        ("counts_shards", "not finalized", "block"),
-        ("feature_ids", "featureData/ids", "block"),
-        ("feature_names", "featureData/names", "block"),
-        ("feature_selection", "featureData/I", "block"),
-        ("metadata_missing_chunks", "missing mask", "block"),
-        ("counts_t_shape", "countsT shape", "block"),
-        ("counts_t_dtype", "countsT dtype", "block"),
-        ("counts_t_chunks", "paired rotateOnce", "rewrite"),
-        ("counts_t_shards", "paired rotateOnce", "rewrite"),
-        ("component_marker", "marked complete", "block"),
-        ("import_source", "foreign import source", "block"),
-        ("root_import_complete", "marked complete", "block"),
-        ("root_complete", "marked complete", "block"),
+        ("cell_identity", "order of cells"),
+        ("counts_shape", "not finalized"),
+        ("counts_dtype", "not finalized"),
+        ("counts_chunks", "not finalized"),
+        ("counts_shards", "not finalized"),
+        ("feature_ids", "featureData/ids"),
+        ("feature_names", "featureData/names"),
+        ("feature_selection", "featureData/I"),
+        ("metadata_missing_chunks", "missing mask"),
+        ("counts_t_shape", "countsT shape"),
+        ("counts_t_dtype", "countsT dtype"),
+        # A completed countsT in another layout is not rewritten in place.
+        ("counts_t_chunks", "Completed countsT for 'RNA' cannot be reused"),
+        ("counts_t_shards", "Completed countsT for 'RNA' cannot be reused"),
+        ("component_marker", "marked complete"),
+        ("import_source", "foreign import source"),
+        ("root_import_complete", "marked complete"),
+        ("root_complete", "marked complete"),
     ],
 )
 def test_dataset_merge_plan_blocks_tampered_components(
     tmp_path,
     case,
     reason,
-    expectation,
 ):
     path = str(tmp_path / f"tampered_{case}.zarr")
     merge_kwargs = (
@@ -1490,13 +1490,9 @@ def test_dataset_merge_plan_blocks_tampered_components(
         blocked_merger.datasets[0].cells._columns["quality"] = np.array([1, 2])
         blocked_merger.datasets[0].cells.columns.append("quality")
     blocked = blocked_merger.plan()
-    if expectation == "rewrite":
-        assert blocked.canDump is True
-        assert blocked.assays[0].countsTAction in {"write", "resume"}
-    else:
-        assert blocked.canDump is False
-        assert blocked.blockedReason is not None
-        assert reason in blocked.blockedReason
+    assert blocked.canDump is False
+    assert blocked.blockedReason is not None
+    assert reason in blocked.blockedReason
 
     if case == "counts_shape":
         restarted = _merge_two_rna(zarr_path=path, overwrite=True)
@@ -1517,7 +1513,7 @@ def test_dataset_merge_manifest_does_not_persist_source_locations(tmp_path):
     assert stored["sourceFeatureCounts"] == {"RNA": [2, 2]}
 
 
-def test_dataset_merge_plan_blocks_counts_t_for_zarr_v2(tmp_path):
+def test_dataset_merge_plan_rejects_a_zarr_v2_destination(tmp_path):
     path = str(tmp_path / "zarr_v2.zarr")
     zarr.open_group(path, mode="w", zarr_format=2)
     merger = _merge_two_rna(
@@ -1525,13 +1521,9 @@ def test_dataset_merge_plan_blocks_counts_t_for_zarr_v2(tmp_path):
         overwrite=True,
     )
 
-    plan = merger.plan()
-
-    assert plan.canDump is False
-    assert plan.blockedReason is not None
-    assert "Zarr v3" in plan.blockedReason
-    with pytest.raises(ValueError, match="Zarr v3"):
-        merger.dump()
+    # Count matrices are paired and sharded, so a Zarr v2 destination is refused.
+    with pytest.raises(ValueError, match="Zarr format 3"):
+        merger.plan()
 
 
 @pytest.mark.parametrize(
@@ -2094,7 +2086,8 @@ def test_dataset_merge_default_counts_t_follows_real_assay_type(
 def test_dataset_merge_skips_counts_t_for_generic_assay_named_rna(tmp_path):
     """A generic Assay whose group is named RNA must not get countsT."""
     from scarf import DataStore
-    from scarf.writers import create_cell_data, create_zarr_count_assay
+    from scarf.storage.schema import create_cell_data
+    from scarf.writers import create_zarr_count_assay
 
     def _generic_named_rna(path: str, values: np.ndarray) -> DataStore:
         root = zarr.open_group(path, mode="w")
@@ -2116,9 +2109,9 @@ def test_dataset_merge_skips_counts_t_for_generic_assay_named_rna(tmp_path):
         )
         root["RNA/counts"][:] = values
         root.attrs["assayTypes"] = {"RNA": "Assay"}
-        from scarf.storage.identity import finalize_counts
+        from tests.storage_helpers import finalize_test_counts
 
-        finalize_counts(root["RNA/counts"])
+        finalize_test_counts(root["RNA/counts"])
         return DataStore(
             path,
             default_assay="RNA",
@@ -3470,3 +3463,267 @@ def test_merge_rejects_ambiguous_feature_identity(feature_ids):
         ValueError, match="Duplicate feature IDs|No overlapping features"
     ):
         align_features([left, right], ["left", "right"])
+
+
+def test_dataset_merge_refuses_destination_holding_other_content():
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.core.sync import sync
+
+    store = MemoryStore()
+    payload = default_buffer_prototype().buffer.from_bytes(b"keep")
+    sync(store.set("notes/keep.txt", payload))
+    merger = _merge_two_rna(zarr_path=store, overwrite=False)
+
+    plan = merger.plan()
+    assert plan.canDump is False
+    assert plan.blockedReason is not None
+    assert "already holds content" in plan.blockedReason
+    with pytest.raises(ValueError, match="already holds content"):
+        merger.dump()
+    assert set(store._store_dict) == {"notes/keep.txt"}
+
+
+@pytest.mark.parametrize("destination", ["parent", "file_parent", "inside"])
+def test_dataset_merge_refuses_destination_overlapping_a_source(tmp_path, destination):
+    project = tmp_path / "project"
+    source = project / "left"
+    source.mkdir(parents=True)
+    keep = source / "keep.txt"
+    keep.write_text("keep")
+    zarr_path = {
+        "parent": str(project),
+        "file_parent": f"file://{project}",
+        "inside": str(source / "merged.zarr"),
+    }[destination]
+    merger = _merge_two_rna(zarr_path=zarr_path, overwrite=False)
+    merger.datasets[0].zarr_loc = str(source)
+
+    plan = merger.plan()
+    assert plan.canDump is False
+    assert plan.blockedReason is not None
+    assert "aliases source DataStore 'left'" in plan.blockedReason
+    with pytest.raises(ValueError, match="aliases source"):
+        merger.dump()
+    assert keep.read_text() == "keep"
+    assert sorted(path.name for path in source.iterdir()) == ["keep.txt"]
+
+
+class _AttributedMeta(_MergeMeta):
+    """Merge metadata whose chosen columns are stored arrays with attributes."""
+
+    def __init__(self, attrs_by_column, **columns):
+        super().__init__(block_rows=2, **columns)
+        root = zarr.open_group(store=MemoryStore(), mode="w")
+        self._arrays = {}
+        for name, attrs in attrs_by_column.items():
+            array = root.create_array(name, data=self._columns[name])
+            array.attrs.update(attrs)
+            self._arrays[name] = array
+
+    def _get_array(self, key):
+        return self._arrays.get(key, self._columns[key])
+
+
+def test_dataset_merge_reconciles_cell_column_attributes(tmp_path):
+    from scarf.utils.logging import logger
+
+    path = str(tmp_path / "attributes.zarr")
+    merger = _merge_two_rna(zarr_path=path, overwrite=False)
+    for dataset, sample, stage, colormap in zip(
+        merger.datasets,
+        ("A", "B"),
+        ("early", "late"),
+        ("viridis", "magma"),
+        strict=True,
+    ):
+        dataset.cells = _AttributedMeta(
+            {
+                "sample": {"levels": [sample], "ordered": False},
+                "stage": {"levels": [stage], "ordered": True},
+                "score": {"display": {"colormap": colormap}, "unit": "count"},
+            },
+            ids=["c0", "c1"],
+            names=["c0", "c1"],
+            I=np.ones(2, dtype=bool),
+            sample=[sample, sample],
+            stage=[stage, stage],
+            score=np.array([1.0, 2.0]),
+        )
+    messages: list[str] = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]),
+        level="WARNING",
+    )
+    try:
+        assert merger.plan().canDump is True
+        merger.dump()
+    finally:
+        logger.remove(sink)
+
+    cell_data = zarr.open_group(path, mode="r")["cellData"]
+    assert dict(cell_data["sample"].attrs) == {
+        "levels": ["A", "B"],
+        "ordered": False,
+    }
+    # Ordered levels cannot be unioned, so both the levels and the order go.
+    assert "levels" not in cell_data["stage"].attrs
+    assert "ordered" not in cell_data["stage"].attrs
+    assert "display" not in cell_data["score"].attrs
+    assert cell_data["score"].attrs["unit"] == "count"
+    dropped = [message for message in messages if "attributes that differ" in message]
+    assert len(dropped) == 1
+    assert "stage (levels, ordered)" in dropped[0]
+    assert "score (display)" in dropped[0]
+
+
+def test_dataset_merge_overwrite_refuses_any_prepared_assay(tmp_path):
+    path = str(tmp_path / "prepared.zarr")
+    left, right = _two_assay_sources()
+
+    def merger(assays, overwrite):
+        return DataStoreMerge(
+            datasets=[left, right],
+            zarr_path=path,
+            names=["left", "right"],
+            prepend_text="",
+            seed=0,
+            assays=assays,
+            overwrite=overwrite,
+        )
+
+    merger(["ADT"], False).dump()
+    zarr.open_group(path, mode="r+")["ADT"].attrs["prepared"] = True
+
+    plan = merger(["RNA"], True).plan()
+    assert plan.canDump is False
+    assert plan.blockedReason is not None
+    assert "['ADT'] are prepared" in plan.blockedReason
+    assert "ADT" in zarr.open_group(path, mode="r")
+
+
+def test_dataset_merge_overwrite_resets_default_assay_and_types(tmp_path):
+    path = str(tmp_path / "reset_defaults.zarr")
+    left, right = _two_assay_sources()
+
+    def merger(assays, overwrite):
+        return DataStoreMerge(
+            datasets=[left, right],
+            zarr_path=path,
+            names=["left", "right"],
+            prepend_text="",
+            seed=0,
+            assays=assays,
+            overwrite=overwrite,
+        )
+
+    merger(None, False).dump()
+    root = zarr.open_group(path, mode="r+")
+    assert set(root.attrs["assayTypes"]) == {"RNA", "ADT"}
+    root.attrs["defaultAssay"] = "ADT"
+
+    merger(["RNA"], True).dump()
+    root = zarr.open_group(path, mode="r")
+    assert "ADT" not in root
+    assert "defaultAssay" not in root.attrs
+    assert set(root.attrs["assayTypes"]) == {"RNA"}
+
+
+def test_dataset_merge_refuses_workspace_slot_of_a_legacy_assay(tmp_path):
+    path = str(tmp_path / "legacy_slot.zarr")
+    root = zarr.open_group(path, mode="w")
+    root.create_group("RNA").attrs["is_assay"] = True
+    merger = _merge_two_rna(zarr_path=path, out_workspace="merged", overwrite=False)
+
+    plan = merger.plan()
+    assert plan.canDump is False
+    assert plan.blockedReason is not None
+    assert "claimed by the legacy assay layout" in plan.blockedReason
+    with pytest.raises(ValueError, match="legacy assay layout"):
+        merger.dump()
+    after = zarr.open_group(path, mode="r")
+    assert "matrices" not in after
+    assert "merged" not in after
+
+
+def test_dataset_merge_resume_requires_the_same_source_counts(tmp_path):
+    path = str(tmp_path / "source_counts.zarr")
+    merger = _merge_two_rna(zarr_path=path, overwrite=False)
+    fingerprints = merger.plan().manifest["sourceCountFingerprints"]["RNA"]
+    assert len(fingerprints) == 2
+    assert all(isinstance(value, str) and value for value in fingerprints)
+    merger.dump()
+
+    changed = _merge_two_rna(zarr_path=path, overwrite=False)
+    changed.datasets[1].get_assay("RNA").rawData = ChunkedArray.from_numpy(
+        np.array([[3, 31], [4, 40]]),
+        block_size=2,
+    )
+    plan = changed.plan()
+    assert plan.canDump is False
+    assert plan.blockedReason is not None
+    assert "different configuration" in plan.blockedReason
+
+
+def test_dataset_merge_rejects_names_containing_the_id_separator():
+    with pytest.raises(ValueError, match="cannot contain '__'"):
+        _merge_two_rna(zarr_path=MemoryStore(), names=["left", "right__b"])
+
+
+def test_dataset_merge_drops_feature_annotations_that_disagree_within_a_source(
+    tmp_path,
+):
+    from scarf.utils.logging import logger
+
+    path = str(tmp_path / "duplicate_names.zarr")
+    left = _MergeAssay(
+        "RNA",
+        [[1, 2, 3], [4, 5, 6]],
+        ["c0", "c1"],
+        ["a1", "a2", "b"],
+        ["A", "A", "B"],
+        block_size=2,
+    )
+    left.feats = _MergeMeta(
+        ids=["a1", "a2", "b"],
+        names=["A", "A", "B"],
+        chrom=["1", "2", "3"],
+        biotype=["coding", "coding", "coding"],
+    )
+    right = _MergeAssay(
+        "RNA",
+        [[7, 8], [9, 10]],
+        ["c0", "c1"],
+        ["a", "b"],
+        ["A", "B"],
+        block_size=2,
+    )
+    right.feats = _MergeMeta(
+        ids=["a", "b"],
+        names=["A", "B"],
+        chrom=["1", "3"],
+        biotype=["coding", "coding"],
+    )
+    messages: list[str] = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]),
+        level="WARNING",
+    )
+    try:
+        DataStoreMerge(
+            datasets=[
+                _MergeDataStore([left], zarr_loc="memory://left"),
+                _MergeDataStore([right], zarr_loc="memory://right"),
+            ],
+            zarr_path=path,
+            names=["left", "right"],
+            prepend_text="",
+            seed=0,
+            feature_key="names",
+        ).dump()
+    finally:
+        logger.remove(sink)
+
+    features = zarr.open_group(path, mode="r")["RNA/featureData"]
+    assert "chrom" not in features
+    np.testing.assert_array_equal(features["biotype"][:], ["coding", "coding"])
+    assert any("were not merged: chrom" in message for message in messages)

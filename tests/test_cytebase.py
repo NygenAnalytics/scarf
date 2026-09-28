@@ -154,7 +154,7 @@ def test_repository_lists_datasets(monkeypatch):
     assert calls == [("Nygen/cytebase", "scarf_docs", False, False)]
 
 
-def test_repository_lists_relative_files(monkeypatch):
+def test_repository_file_listing_is_scoped_and_sorted(monkeypatch):
     from scarf import cytebase
 
     calls = []
@@ -169,12 +169,12 @@ def test_repository_lists_relative_files(monkeypatch):
 
     monkeypatch.setattr(cytebase, "list_bucket_tree", fake_list_bucket_tree)
 
-    files = cytebase.Repository("scarf_docs").list_files(
-        "alpha",
-        recursive=False,
-    )
+    files = cytebase._bucket_files("scarf_docs", "alpha", recursive=False)
 
-    assert files == ["alpha/barcodes.tsv.gz", "alpha/matrix.mtx.gz"]
+    assert [file.path for file in files] == [
+        "scarf_docs/alpha/barcodes.tsv.gz",
+        "scarf_docs/alpha/matrix.mtx.gz",
+    ]
     assert calls == [("Nygen/cytebase", "scarf_docs/alpha", False, False)]
 
 
@@ -266,6 +266,37 @@ def test_download_dataset_copies_local_catalog_zarr(monkeypatch, tmp_path):
     assert dataset_path == destination / "alpha"
     assert copied.read_text(encoding="utf-8") == "{}"
     assert (store / "zarr.json").read_text(encoding="utf-8") == "{}"
+
+
+def test_local_catalog_copy_replaces_only_the_zarr_store(monkeypatch, tmp_path):
+    from scarf import cytebase
+
+    store = tmp_path / "catalog" / "alpha" / "data.zarr"
+    store.mkdir(parents=True)
+    (store / "zarr.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv(cytebase._LOCAL_CATALOG_ENV, str(tmp_path / "catalog"))
+
+    def fail_bucket(*_args, **_kwargs):
+        raise AssertionError("local catalog should not list the remote bucket")
+
+    monkeypatch.setattr(cytebase, "_bucket_files", fail_bucket)
+    dataset = tmp_path / "downloads" / "alpha"
+    (dataset / "data.zarr").mkdir(parents=True)
+    (dataset / "data.zarr" / "stale.json").write_text("old", encoding="utf-8")
+    (dataset / "data.h5").write_bytes(b"raw counts")
+
+    dataset_path = cytebase.Repository("scarf_docs").download_dataset(
+        "alpha",
+        tmp_path / "downloads",
+        zarr=True,
+    )
+
+    assert dataset_path == dataset
+    assert sorted(path.name for path in dataset.iterdir()) == ["data.h5", "data.zarr"]
+    assert (dataset / "data.h5").read_bytes() == b"raw counts"
+    assert sorted(path.name for path in (dataset / "data.zarr").iterdir()) == [
+        "zarr.json"
+    ]
 
 
 def test_download_dataset_selects_and_extracts_zarr_archive(monkeypatch, tmp_path):
@@ -439,40 +470,6 @@ def test_download_rejects_unsafe_tar_member(monkeypatch, tmp_path):
     assert not (tmp_path / "outside.txt").exists()
 
 
-def test_open_zarr_uses_anonymous_read_only_store(monkeypatch):
-    from scarf import cytebase
-    import zarr
-    from zarr.storage import FsspecStore
-
-    calls = []
-    store = object()
-    group = object()
-
-    def fake_from_url(url, storage_options=None, read_only=False):
-        calls.append(("store", url, storage_options, read_only))
-        return store
-
-    def fake_open_group(*, store, mode):
-        calls.append(("group", store, mode))
-        return group
-
-    monkeypatch.setattr(FsspecStore, "from_url", fake_from_url)
-    monkeypatch.setattr(zarr, "open_group", fake_open_group)
-
-    result = cytebase.Repository("cellxgene").open_zarr("atlas/data.zarr")
-
-    assert result is group
-    assert calls == [
-        (
-            "store",
-            "hf://buckets/Nygen/cytebase/cellxgene/atlas/data.zarr",
-            {"token": False},
-            True,
-        ),
-        ("group", store, "r"),
-    ]
-
-
 @pytest.mark.integration
 def test_live_bucket_catalog_is_public():
     from scarf import cytebase
@@ -494,7 +491,12 @@ def test_live_bucket_catalog_is_public():
         "tenx_8K_pbmc_citeseq",
     } <= datasets
     assert "tenx_5K_pbmc_rnaseq_legacy_master" in datasets
-    files = repository.list_files("tenx_5K_pbmc_rnaseq")
+    files = [
+        cytebase._relative_file_path("scarf_docs", file).as_posix()
+        for file in cytebase._bucket_files(
+            "scarf_docs", "tenx_5K_pbmc_rnaseq", recursive=True
+        )
+    ]
     assert {
         "tenx_5K_pbmc_rnaseq/data.h5",
         "tenx_5K_pbmc_rnaseq/data.zarr.tar.gz",

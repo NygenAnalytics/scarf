@@ -302,11 +302,7 @@ def test_import_materializes_metadata_counts_membership_and_pca(
         [[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]],
     )
     np.testing.assert_array_equal(pca["stdev"][:], [2.0, 1.0])
-    assert result.artifactRefs == (
-        result.cellSelection,
-        result.activeIdentity,
-        pca_ref,
-    )
+    assert dict(result.reductionArtifacts) == {"pca": pca_ref}
     assert any(
         notice.code == "ignored_normalized_layer"
         and notice.objectPath == "assays/ADT/layers/data"

@@ -9,6 +9,7 @@ import zarr
 from ..metadata.queries import missing_frame_values
 from ..metadata.rows import (
     MetaDataRowBlock,
+    array_block_rows,
     apply_missing_mask,
     read_array_rows_chunkwise,
 )
@@ -20,7 +21,7 @@ from ..storage.artifacts import (
 from ..storage.errors import ArtifactResolutionError
 from ..storage.feature_selection import resolve_feature_selection
 from ..storage.geometry import array_geometry
-from ..storage.partition import partition_indices, row_band
+from ..storage.partition import partition_indices
 from ..storage.pipeline_runs import (
     PipelineFieldDescriptor,
     PipelineRunRecord,
@@ -331,9 +332,13 @@ class PipelineAxisView:
             )
         return array
 
+    def _selection_mask(self) -> np.ndarray:
+        """Return the stored run selection over the complete axis."""
+        return np.asarray(self._selection_array()[:], dtype=bool)
+
     def _selected_count(self) -> int:
         selection = self._selection_array()
-        block_rows = row_band(array_geometry(selection), unit="chunk", fallback=1)
+        block_rows = array_block_rows(selection, int(selection.shape[0]))
         total = 0
         for start in range(0, int(selection.shape[0]), block_rows):
             stop = min(start + block_rows, int(selection.shape[0]))
@@ -606,17 +611,6 @@ class PipelineAxisView:
             self._validate_descriptor(descriptor, selected_count=selected_count)
 
     @staticmethod
-    def _read_component(
-        array: zarr.Array,
-        value_index: int | None,
-    ) -> np.ndarray:
-        if value_index is None or array.ndim == 1:
-            values: np.ndarray = np.asarray(array[:])
-            return values
-        values = np.asarray(array[:, value_index])
-        return values
-
-    @staticmethod
     def _read_component_slice(
         array: zarr.Array,
         start: int,
@@ -659,29 +653,33 @@ class PipelineAxisView:
             output[block.destinations] = values[block.indices - start]
         return output
 
-    def _raw_values(self, descriptor: PipelineFieldDescriptor) -> np.ndarray:
-        return self._read_component(
-            self._source_array(descriptor),
+    def _read_component(
+        self,
+        descriptor: PipelineFieldDescriptor,
+        *,
+        missing: bool = False,
+    ) -> np.ndarray:
+        array = self._source_array(descriptor, missing=missing)
+        return self._read_component_slice(
+            array,
+            0,
+            int(array.shape[0]),
             descriptor.value_index,
         )
+
+    def _raw_values(self, descriptor: PipelineFieldDescriptor) -> np.ndarray:
+        return self._read_component(descriptor)
 
     def _raw_missing(self, descriptor: PipelineFieldDescriptor) -> np.ndarray | None:
         if descriptor.missing_mask is None:
             return None
-        missing: np.ndarray = np.asarray(
-            self._read_component(
-                self._source_array(descriptor, missing=True),
-                descriptor.value_index,
-            ),
-            dtype=bool,
-        )
-        return missing
+        return np.asarray(self._read_component(descriptor, missing=True), dtype=bool)
 
     def _full_axis_values(self, descriptor: PipelineFieldDescriptor) -> np.ndarray:
         values = self._raw_values(descriptor)
         if len(values) == int(self._live_table.N):
             return values
-        selection = self.fetch_all("I")
+        selection = self._selection_mask()
         if len(values) != int(np.count_nonzero(selection)):
             raise ArtifactResolutionError(
                 f"Pipeline field {descriptor.key!r} no longer aligns to view I",
@@ -704,7 +702,7 @@ class PipelineAxisView:
     def _selected_values(self, descriptor: PipelineFieldDescriptor) -> np.ndarray:
         values = self._raw_values(descriptor)
         if len(values) == int(self._live_table.N):
-            selected: np.ndarray = np.asarray(values[self.fetch_all("I")])
+            selected: np.ndarray = np.asarray(values[self._selection_mask()])
             return selected
         return values
 
@@ -726,7 +724,7 @@ class PipelineAxisView:
             return
         resolve_feature_selection(self._root, self._assay, self._selection_ref)
         selection = self._selection_array()
-        chunk_rows = row_band(array_geometry(selection), unit="chunk", fallback=1)
+        chunk_rows = array_block_rows(selection, int(selection.shape[0]))
         if block_rows is None:
             resolved_rows = chunk_rows
         else:
@@ -872,7 +870,7 @@ class PipelineAxisView:
         if len(missing) == int(self._live_table.N):
             full_missing = missing
         else:
-            selection = self.fetch_all("I")
+            selection = self._selection_mask()
             full_missing = np.zeros(int(self._live_table.N), dtype=bool)
             full_missing[selection] = missing
         return apply_missing_mask(values, full_missing)
@@ -901,41 +899,48 @@ class PipelineAxisView:
             return np.empty(0, dtype=np.int64)
         return np.concatenate(parts)
 
-    def fetch_all(self, column: str) -> np.ndarray:
-        """Return one run field aligned to the complete stored axis."""
+    def _descriptor(self, column: str) -> PipelineFieldDescriptor:
         if not isinstance(column, str) or not column:
             raise TypeError("column must be a non-empty string")
-        self._validate_row_identity()
-        if column == "ids":
-            ids: np.ndarray = np.asarray(self._live_table.fetch_all("ids"))
-            return ids
-        if column == "I":
-            selected: np.ndarray = np.asarray(self._selection_array()[:], dtype=bool)
-            return selected
         descriptor = self._descriptor_by_key.get(column)
         if descriptor is None:
             raise KeyError(
                 f"Pipeline run field {column!r} was not captured on the {self._axis} axis"
             )
-        return self._full_axis_values(descriptor)
+        return descriptor
+
+    def _fetch_all(self, column: str) -> np.ndarray:
+        """Return one full-axis field once row identity has been validated."""
+        if column == "ids":
+            ids: np.ndarray = np.asarray(self._live_table.fetch_all("ids"))
+            return ids
+        if column == "I":
+            return self._selection_mask()
+        return self._full_axis_values(self._descriptor(column))
+
+    def _fetch(self, column: str) -> np.ndarray:
+        """Return one selected-row field once row identity has been validated."""
+        if column == "ids":
+            values = np.asarray(self._live_table.fetch_all("ids"))
+            selected: np.ndarray = np.asarray(values[self._selection_mask()])
+            return selected
+        if column == "I":
+            return np.ones(self._selected_count(), dtype=bool)
+        return self._selected_values(self._descriptor(column))
+
+    def fetch_all(self, column: str) -> np.ndarray:
+        """Return one run field aligned to the complete stored axis."""
+        if not isinstance(column, str) or not column:
+            raise TypeError("column must be a non-empty string")
+        self._validate_row_identity()
+        return self._fetch_all(column)
 
     def fetch(self, column: str) -> np.ndarray:
         """Return one run field for rows selected by the stored run I."""
         if not isinstance(column, str) or not column:
             raise TypeError("column must be a non-empty string")
         self._validate_row_identity()
-        if column == "ids":
-            values = np.asarray(self._live_table.fetch_all("ids"))
-            selected: np.ndarray = np.asarray(values[self.fetch_all("I")])
-            return selected
-        if column == "I":
-            return np.ones(self._selected_count(), dtype=bool)
-        descriptor = self._descriptor_by_key.get(column)
-        if descriptor is None:
-            raise KeyError(
-                f"Pipeline run field {column!r} was not captured on the {self._axis} axis"
-            )
-        return self._selected_values(descriptor)
+        return self._fetch(column)
 
     def _selected_missing(
         self,
@@ -946,7 +951,7 @@ class PipelineAxisView:
             return None
         if len(missing) == int(self._live_table.N):
             selected: np.ndarray = np.asarray(
-                missing[self.fetch_all("I")],
+                missing[self._selection_mask()],
                 dtype=bool,
             )
             return selected
@@ -964,9 +969,10 @@ class PipelineAxisView:
         unknown = [column for column in requested if column not in self.columns]
         if unknown:
             raise KeyError(f"Pipeline run fields were not captured: {unknown!r}")
+        self._validate_row_identity()
         data: dict[str, Any] = {}
         for column in requested:
-            values = self.fetch(column)
+            values = self._fetch(column)
             descriptor = self._descriptor_by_key.get(column)
             missing = None if descriptor is None else self._selected_missing(descriptor)
             data[column] = missing_frame_values(values, missing)

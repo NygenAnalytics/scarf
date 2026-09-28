@@ -241,7 +241,6 @@ def test_validated_pca_artifact_reuse_precedes_numerical_arrays(
             family_masks={},
             covariate_columns=[],
             covariate_roles=[],
-            adjacent_overlap=None,
         )
     assert result[0] == _ref("feature_summary")
     assert counts == {

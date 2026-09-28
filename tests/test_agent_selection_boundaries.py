@@ -192,38 +192,6 @@ def test_harmony_requires_approved_batch_evidence_and_valid_tolerance() -> None:
     assert "No approved batch metric was supplied." in reasons
 
 
-def test_pareto_dominance_marks_one_factor_superiority_idempotently() -> None:
-    native = _evaluation()
-    alternative = _evaluation("neighbors_21", neighborsK=21)
-    alternative.metrics.seedStability = 0.95
-    alternative.metrics.markerCoherence = 0.95
-    native.metrics.technicalAssociation = {"depth": 0.2}
-    alternative.metrics.technicalAssociation = {"depth": 0.2}
-    annotated = selection.annotate_candidate_dominance([native, alternative])
-    assert annotated[0].metrics.dominatedByCandidateIds == ["neighbors_21"]
-    assert annotated[1].metrics.dominatesCandidateIds == ["baseline"]
-    assert selection.annotate_candidate_dominance(annotated) == annotated
-
-
-def test_pareto_does_not_treat_incomparable_or_missing_metrics_as_superiority() -> None:
-    baseline, alternative = _evaluation(), _evaluation("alternative", dimensions=10)
-    alternative.metrics.seedStability = 0.95
-    alternative.metrics.markerCoherence = 0.6
-    assert not selection.annotate_candidate_dominance([baseline, alternative])[
-        0
-    ].metrics.dominatedByCandidateIds
-    alternative.metrics = ParameterMetrics(seedStability=0.95)
-    baseline.metrics = ParameterMetrics(seedStability=0.8)
-    assert not selection.annotate_candidate_dominance([baseline, alternative])[
-        0
-    ].metrics.dominatedByCandidateIds
-    alternative.parameters.useHarmony = True
-    result = selection.annotate_candidate_dominance([baseline, alternative])
-    assert all(item.metrics.paretoOptimal is None for item in result)
-    with pytest.raises(ValueError, match="tolerance"):
-        selection.annotate_candidate_dominance(result, tolerance=float("nan"))
-
-
 @pytest.mark.parametrize(
     ("change", "reason"),
     [
@@ -271,51 +239,44 @@ def test_promoting_selected_artifacts_checks_exact_normalization_lineage(
 
 
 @pytest.mark.parametrize(
-    ("report_change", "candidate_change", "normalized", "limit", "reason"),
+    ("report_change", "candidate_change", "normalized", "reason"),
     [
         (
             {"status": "needsInput"},
             {},
             _artifact("normalized", 1),
-            64,
             "completed native tuning recommendation",
         ),
         (
             {"recommendedCandidateId": "absent"},
             {},
             _artifact("normalized", 1),
-            64,
             "not an eligible execution",
         ),
         (
             {},
             {"artifacts": {}},
             _artifact("normalized", 1),
-            64,
             "exact cluster artifact",
         ),
         (
             {},
             {},
             _artifact("normalized", 1, "ADT"),
-            64,
             "exact normalized assay artifact",
         ),
         (
             {"cellSelection": artifact_reference(_cell_selection(99))},
             {},
             _artifact("normalized", 1),
-            64,
             "report does not match normalized artifact lineage",
         ),
-        ({}, {}, _artifact("normalized", 1), 1, "at least two"),
     ],
 )
 def test_native_promotion_rejects_an_incomplete_or_mismatched_recommendation(
     report_change: dict[str, Any],
     candidate_change: dict[str, Any],
     normalized: Any,
-    limit: int,
     reason: str,
 ) -> None:
     candidate = _evaluation().model_copy(update=candidate_change)
@@ -329,7 +290,7 @@ def test_native_promotion_rejects_an_incomplete_or_mismatched_recommendation(
     store = _FakeStore()
     with pytest.raises(ValueError, match=reason):
         selection.promote_parameter_candidate(
-            store, report=report, normalized=normalized, identity_feature_limit=limit
+            store, report=report, normalized=normalized
         )
     assert not any(
         name in {"run_pca", "run_leiden_clustering"} for name, _, _ in store.calls
@@ -351,13 +312,6 @@ def test_native_promotion_rejects_an_incomplete_or_mismatched_recommendation(
             {},
             "different cell selection",
         ),
-        (
-            {},
-            {},
-            {"native_assay": "RNA", "recommended_integration_id": "unexecuted"},
-            "either an integrated graph",
-        ),
-        ({}, {}, {"recommended_integration_id": "unexecuted"}, "was not evaluated"),
     ],
 )
 def test_finalization_cannot_publish_an_unexecuted_or_unmatched_native_branch(

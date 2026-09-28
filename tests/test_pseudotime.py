@@ -542,6 +542,73 @@ def test_trajectory_operations_require_boolean_cache_invalidation(
         )
 
 
+def test_raw_source_sink_scoring_refuses_read_only_store_before_snapshot(
+    datastore,
+    connectivity_graph,
+):
+    from scipy.sparse.csgraph import connected_components
+
+    from scarf.datastore.datastore import DataStore
+
+    graph = datastore.load_graph(
+        connectivity_graph,
+        symmetric=True,
+        upper_only=False,
+    )
+    _, components = connected_components(graph, directed=False)
+    retained = np.flatnonzero(components == int(np.argmax(np.bincount(components))))
+    source_sink = np.zeros(graph.shape[0], dtype=np.float64)
+    source_sink[retained[1]] = -1.0
+    source_sink[retained[-2]] = 1.0
+    snapshots = datastore.list_artifacts(kind="metadata_snapshot", scope="datastore")
+
+    read_only = DataStore(datastore.zarr_loc, default_assay="RNA", zarr_mode="r")
+    with pytest.raises(PermissionError, match="zarr_mode='r\\+'"):
+        read_only.run_pseudotime_scoring(
+            connectivity_graph,
+            ss_vec=source_sink,
+            n_singular_vals=10,
+        )
+    assert (
+        datastore.list_artifacts(kind="metadata_snapshot", scope="datastore")
+        == snapshots
+    )
+
+
+def test_trajectory_feature_producers_refuse_read_only_stores_before_computing(
+    datastore,
+    pseudotime_scoring,
+    detected_features,
+    monkeypatch,
+):
+    from scarf.datastore.datastore import DataStore
+
+    read_only = DataStore(datastore.zarr_loc, default_assay="RNA", zarr_mode="r")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("a read-only store must refuse before computing")
+
+    monkeypatch.setattr(
+        type(read_only.get_assay("RNA")),
+        "_aggregate_ordering_profiles",
+        forbidden,
+    )
+    monkeypatch.setattr("scarf.features.markers.find_markers_by_regression", forbidden)
+    with pytest.raises(PermissionError, match="run_pseudotime_aggregation"):
+        read_only.run_pseudotime_aggregation(
+            pseudotime_scoring,
+            features=detected_features,
+            window_size=17,
+            n_clusters=3,
+        )
+    with pytest.raises(PermissionError, match="run_pseudotime_marker_search"):
+        read_only.run_pseudotime_marker_search(
+            pseudotime_scoring,
+            features=detected_features,
+            min_cells=7,
+        )
+
+
 def test_marker_identity_change_during_computation_leaves_artifact_incomplete(
     datastore,
     pseudotime_scoring,
@@ -835,12 +902,8 @@ def test_aggregation_rejects_invalid_ordering_and_sizes(
             np.arange(ordering.shape[0]),
             np.arange(assay.expression.shape[1]),
             ordering,
-            min_exp=0.0,
             window_size=window_size,
             chunk_size=chunk_size,
-            smoothen=False,
-            z_scale=False,
-            norm_params={},
         )
 
 

@@ -7,14 +7,13 @@ import zarr
 from ..assay import Assay
 from ..metadata import MetaData
 from ..storage.artifacts import (
-    ArtifactStatus,
     inspect_artifact,
     list_artifacts as list_artifact_refs,
 )
 from ..storage.budget import ResourceBudget, resolve_budget
 from ..storage.profiles import StorageProfile, resolve_storage_profile
 from ..storage.pipeline_runs import list_pipeline_run_records
-from ..storage.refs import ArtifactRef, ArtifactScope
+from ..storage.refs import ArtifactRef
 from ..storage.schema import validate_assay_name
 from ..storage.stores import load_zarr
 from ..storage.types import ZarrMode, as_zarr_group
@@ -127,20 +126,6 @@ class _SummaryStore(Protocol):
 
     def _get_assay(self, from_assay: str | None) -> Assay | _AssaySummaryView: ...
 
-    def list_artifacts(
-        self,
-        *,
-        kind: str | None = None,
-        from_assay: str | None = None,
-        scope: ArtifactScope = "assay",
-        complete_only: bool = False,
-        operation: str | None = None,
-        parameters: Mapping[str, Any] | None = None,
-        inputs: Mapping[str, Any] | None = None,
-    ) -> list[ArtifactRef]: ...
-
-    def inspect_artifact(self, ref: ArtifactRef) -> ArtifactStatus: ...
-
 
 @dataclass(slots=True)
 class _ReadOnlyAssayView:
@@ -227,33 +212,6 @@ class _ReadOnlySummaryStore:
             attrs=assay_group.attrs,
         )
 
-    def list_artifacts(
-        self,
-        *,
-        kind: str | None = None,
-        from_assay: str | None = None,
-        scope: ArtifactScope = "assay",
-        complete_only: bool = False,
-        operation: str | None = None,
-        parameters: Mapping[str, Any] | None = None,
-        inputs: Mapping[str, Any] | None = None,
-    ) -> list[ArtifactRef]:
-        if scope == "assay" and from_assay is None:
-            from_assay = self._defaultAssay
-        return list_artifact_refs(
-            self.zw,
-            scope=scope,
-            assay=from_assay,
-            kind=kind,
-            complete_only=complete_only,
-            operation=operation,
-            parameters=parameters,
-            inputs=inputs,
-        )
-
-    def inspect_artifact(self, ref: ArtifactRef) -> ArtifactStatus:
-        return inspect_artifact(self.zw, ref)
-
 
 def _count_active(metadata: MetaData) -> int:
     if metadata.N == 0:
@@ -265,7 +223,7 @@ def _count_active(metadata: MetaData) -> int:
 
 
 def _summarize_artifacts(
-    store: _SummaryStore,
+    root: zarr.Group,
     refs: list[ArtifactRef],
 ) -> tuple[ArtifactSummary, ...]:
     summaries = []
@@ -273,7 +231,7 @@ def _summarize_artifacts(
         refs,
         key=lambda item: (item.kind, item.assay or "", item.artifact_id),
     ):
-        status = store.inspect_artifact(ref)
+        status = inspect_artifact(root, ref)
         summaries.append(
             ArtifactSummary(
                 ref=ref,
@@ -316,11 +274,8 @@ def build_datastore_summary(
                     str(fingerprint) if fingerprint is not None else None
                 ),
                 artifacts=_summarize_artifacts(
-                    store,
-                    store.list_artifacts(
-                        from_assay=assay_name,
-                        scope="assay",
-                    ),
+                    store.zw,
+                    list_artifact_refs(store.zw, scope="assay", assay=assay_name),
                 ),
             )
         )
@@ -359,8 +314,8 @@ def build_datastore_summary(
         cell_columns=tuple(sorted(store.cells.columns)),
         assays=tuple(assays),
         artifacts=_summarize_artifacts(
-            store,
-            store.list_artifacts(scope="datastore"),
+            store.zw,
+            list_artifact_refs(store.zw, scope="datastore", assay=None),
         ),
         pipeline_run_counts=pipeline_run_counts,
         labeled_pipeline_runs=labeled_pipeline_runs,

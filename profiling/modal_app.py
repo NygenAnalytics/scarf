@@ -44,6 +44,7 @@ from profiling.config import (
     WorkflowParameters,
     bind_cluster_source,
     load_profiling_config,
+    require_consume_only_override,
 )
 from profiling.datasets import (
     SOURCE_SPEC,
@@ -57,10 +58,19 @@ from profiling.modal_resources import (
     BASE_EPHEMERAL_DISK_MB,
     modal_function_options,
     orchestrator_function_options,
+    require_base_ephemeral_disk,
     validate_modal_environment,
+)
+from profiling.modal_support import (
+    MODAL_APP_NAME,
+    MODAL_ENVIRONMENT_NAME,
+    await_function_call,
+    await_function_calls,
+    call_id,
 )
 from profiling.provenance import attach_client_provenance, provenance_from_config
 from profiling.r2 import (
+    ObjectDownload,
     download_file,
     object_exists,
     object_size,
@@ -68,24 +78,23 @@ from profiling.r2 import (
     upload_file,
 )
 from profiling.results import (
+    claim_stage,
     claim_submission,
     load_result,
+    release_stage_claim,
     result_exists,
     write_funnel_result,
     write_result,
 )
-from profiling.spawn_wait import (
-    DEFAULT_GRACE_SECONDS,
-    await_function_call,
-    await_many_function_calls,
-    await_stage_result,
-)
+from profiling.spawn_wait import DEFAULT_GRACE_SECONDS, await_stage_result
 from profiling.metrics import ResourceSampler
 from profiling.stages import (
     StageRunResult,
     discover_consume_inputs,
     profile_stage_inputs,
+    require_artifact_ref,
     run_stage,
+    session_resource_mismatches,
     summarize_resource_measurement,
 )
 
@@ -116,14 +125,12 @@ def _load_stage_artifact_ref(
     artifact = details.get("artifact")
     if not isinstance(artifact, dict):
         raise ValueError(f"{stage} stage result has no artifact reference")
-    ref = ArtifactRef.from_dict(artifact)
-    expected_scope = "datastore" if kind == "cell_selection" else "assay"
-    expected_assay = (
-        None if expected_scope == "datastore" else config.workflow.assayName
+    return require_artifact_ref(
+        ArtifactRef.from_dict(artifact),
+        kind=kind,
+        assay=config.workflow.assayName,
+        label=f"The {stage} stage result artifact",
     )
-    if ref.scope != expected_scope or ref.assay != expected_assay or ref.kind != kind:
-        raise ValueError(f"{stage} stage result has an invalid {kind} artifact")
-    return ref
 
 
 def _load_stage_input_refs(
@@ -153,6 +160,34 @@ def _load_stage_input_refs(
     }
 
 
+def _stage_context(
+    config: ProfilingConfig,
+    stage: StageName,
+    stages: list[StageName] | None,
+) -> tuple[StageName, ...]:
+    """Return the stages of the run that a single stage job belongs to."""
+    selected = tuple(stages) if stages else config.effectiveStages
+    return selected if stage in selected else (*selected, stage)
+
+
+def _store_has_content(storeUri: str) -> bool:
+    if storeUri.startswith("s3://"):
+        return object_exists(f"{storeUri}/zarr.json")
+    return (Path(storeUri.removeprefix("file://")) / "zarr.json").exists()
+
+
+def _dataset_fields(
+    config: ProfilingConfig,
+    nRows: int,
+    download: ObjectDownload,
+) -> dict[str, Any]:
+    return {
+        "datasetUri": config.datasetUri(nRows),
+        "datasetETag": download.eTag,
+        "datasetBytes": download.fileBytes,
+    }
+
+
 def _e2e_conflicting_uris(
     config: ProfilingConfig,
     nRows: int,
@@ -164,10 +199,30 @@ def _e2e_conflicting_uris(
         config.e2eClaimUri(),
         config.funnelResultUri(nRows),
         *(config.resultUri(nRows, stage) for stage in stages),
+        *(config.stageClaimUri(nRows, stage) for stage in stages),
     ]
     if storeOnR2:
         candidates.insert(0, f"{config.storeUri(nRows).rstrip('/')}/zarr.json")
     return [uri for uri in candidates if object_exists(uri)]
+
+
+def _require_funnel_settings(
+    config: ProfilingConfig,
+    nRows: int,
+    stages: tuple[StageName, ...],
+    *,
+    storeOnR2: bool,
+) -> WorkflowParameters:
+    """Reject a funnel whose settings would not run as recorded; return its workflow."""
+    if storeOnR2:
+        require_consume_only_override(config, nRows, stages)
+    mismatches = session_resource_mismatches(stages, config.resourcesFor)
+    if mismatches:
+        raise ValueError(
+            "A funnel reuses one DataStore across its stages, so they must share "
+            "workers and scarfMemoryBudget: " + "; ".join(mismatches)
+        )
+    return bind_cluster_source(config, nRows, stages)
 
 
 def _e2e_function_options(
@@ -221,13 +276,7 @@ def _e2e_resource_envelope(
 ) -> dict[str, int | float]:
     """Size one container to the per-field maximum of the funnel's stages."""
     resources = _e2e_resources(config, stages)
-    requested_ephemeral_disk = max(item.ephemeralDiskMb for item in resources)
-    if requested_ephemeral_disk > BASE_EPHEMERAL_DISK_MB:
-        raise ValueError(
-            "The funnel cannot apply ephemeralDiskMb above "
-            f"{BASE_EPHEMERAL_DISK_MB}; Modal does not allow a dynamic "
-            "ephemeral_disk override"
-        )
+    require_base_ephemeral_disk(max(item.ephemeralDiskMb for item in resources))
     return {
         "modalMemoryRequestMb": max(item.modalMemoryRequestMb for item in resources),
         "modalMemoryLimitMb": max(item.modalMemoryLimitMb for item in resources),
@@ -335,7 +384,11 @@ def prepare_fixture_datasets_job(
     sizes: list[int] | None = None,
     nColumns: int = 500,
 ) -> dict[str, Any]:
-    """Upload tiny synthetic H5ADs so stage jobs can be tested without Cellxgene."""
+    """Upload tiny synthetic H5ADs so stage jobs can be tested without Cellxgene.
+
+    Uploads are create-only, so a fixture never replaces a prepared sample. Point
+    ``datasetPrefixUri`` at a fixture prefix to test stage jobs with them.
+    """
     config = ProfilingConfig.model_validate(configDict)
     os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
     selected = tuple(sizes) if sizes else (10_000,)
@@ -350,7 +403,7 @@ def prepare_fixture_datasets_job(
 
     def _upload_artifact(artifact: Any) -> None:
         uri = config.datasetUri(artifact.targetRows)
-        upload_file(artifact.localPath, uri)
+        upload_file(artifact.localPath, uri, createOnly=True)
         uploaded.append(
             {
                 "nRows": artifact.targetRows,
@@ -386,66 +439,91 @@ def run_stage_job(
     stage: StageName,
     submissionId: str,
     force: bool = False,
+    stages: list[StageName] | None = None,
+    allowReuse: bool = False,
 ) -> dict[str, Any]:
+    """Run one stage of the run over ``stages`` (default: the configured stages).
+
+    A create-only claim per runTag, size, and stage keeps a second job off the
+    same stage, and a runTag held by an e2e funnel is refused.
+    """
     config = ProfilingConfig.model_validate(configDict)
     resources = config.resourcesFor(stage)
     os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
-    workflow = bind_cluster_source(config, nRows)
+    require_consume_only_override(config, nRows, (stage,))
+    workflow = bind_cluster_source(config, nRows, _stage_context(config, stage, stages))
     completed = load_result(config, nRows, stage, submissionId=submissionId)
     if completed is not None:
         return completed
-    claim_submission(config, nRows, stage, submissionId)
-    if result_exists(config, nRows, stage) and not force:
-        raise FileExistsError(
-            "This stage has a previous result; use force or a fresh runTag"
-        )
-
-    work = _fresh_work_dir(_WORK / f"{submissionId}-{nRows}-{stage}")
+    claim_stage(config, nRows, stage, submissionId)
     try:
-        local_h5ad: Path | None = None
-        if stage == "createStore":
-            local_h5ad = work / f"{nRows}.h5ad"
-            download_file(config.datasetUri(nRows), local_h5ad)
+        if object_exists(config.e2eClaimUri()):
+            raise FileExistsError(
+                f"runTag {config.runTag!r} is held by an e2e funnel; use a fresh runTag"
+            )
+        if result_exists(config, nRows, stage) and not force:
+            raise FileExistsError(
+                "This stage has a previous result; use force or a fresh runTag"
+            )
+        store_uri = config.storeUri(nRows)
+        if stage == "createStore" and not force and _store_has_content(store_uri):
+            raise FileExistsError(
+                f"createStore would replace the existing store {store_uri}; "
+                "use force or a fresh runTag"
+            )
 
-        result = run_stage(
-            stage,
-            submissionId=submissionId,
-            nRows=nRows,
-            storeUri=config.storeUri(nRows),
-            workflow=workflow,
-            resources=resources,
-            localH5adPath=local_h5ad,
-            countMatrix=config.countMatrix,
-            storageIo=config.storageIo,
-            workDir=work,
-            invalidateCache=force,
-            clientProvenance=config.clientProvenance,
-            inputRefs=_load_stage_input_refs(
-                config,
-                nRows,
+        work = _fresh_work_dir(_WORK / f"{submissionId}-{nRows}-{stage}")
+        download: ObjectDownload | None = None
+        try:
+            local_h5ad: Path | None = None
+            if stage == "createStore":
+                local_h5ad = work / f"{nRows}.h5ad"
+                download = download_file(config.datasetUri(nRows), local_h5ad)
+
+            result = run_stage(
                 stage,
+                submissionId=submissionId,
+                nRows=nRows,
+                storeUri=store_uri,
                 workflow=workflow,
-            ),
-        )
-    except Exception as exc:
-        from profiling.stages import StageRunResult
-
-        result = StageRunResult(
-            submissionId=submissionId,
-            stage=stage,
-            nRows=nRows,
-            status="error",
-            seconds=None,
-            peakRssBytes=None,
-            peakCgroupBytes=None,
-            modalMemoryMb=resources.modalMemoryLimitMb,
-            scarfMemoryBudget=resources.scarfMemoryBudget,
-            storeUri=config.storeUri(nRows),
-            error=f"{type(exc).__name__}: {exc}",
-            workers=resources.workers,
-        )
-    write_result(config, result, overwrite=force)
-    return result.to_json()
+                resources=resources,
+                localH5adPath=local_h5ad,
+                countMatrix=config.countMatrix,
+                storageIo=config.storageIo,
+                workDir=work,
+                invalidateCache=force,
+                allowArtifactReuse=allowReuse,
+                clientProvenance=config.clientProvenance,
+                inputRefs=_load_stage_input_refs(
+                    config,
+                    nRows,
+                    stage,
+                    workflow=workflow,
+                ),
+            )
+        except Exception as exc:
+            result = StageRunResult(
+                submissionId=submissionId,
+                stage=stage,
+                nRows=nRows,
+                status="error",
+                seconds=None,
+                peakRssBytes=None,
+                peakCgroupBytes=None,
+                modalMemoryMb=resources.modalMemoryLimitMb,
+                scarfMemoryBudget=resources.scarfMemoryBudget,
+                storeUri=store_uri,
+                error=f"{type(exc).__name__}: {exc}",
+                workers=resources.workers,
+            )
+        if download is not None:
+            result = dataclasses.replace(
+                result, **_dataset_fields(config, nRows, download)
+            )
+        write_result(config, result, overwrite=force)
+        return result.to_json()
+    finally:
+        release_stage_claim(config, nRows, stage, submissionId)
 
 
 # Mirrors DataStore.pipeline: each key runs on a worker thread beside the
@@ -476,8 +554,8 @@ def run_funnel_job(
     """Run one funnel in one container and persist its summary to R2.
 
     The store lives on R2 (run-e2e) or on the container's ephemeral disk
-    (run-local). The create-only runTag claim makes the funnel exclusive, so
-    its stages need no claims of their own. Stages in ``BACKGROUND_OVERLAPS``
+    (run-local). The create-only runTag claim makes the funnel exclusive, and
+    stage jobs refuse a runTag it holds. Stages in ``BACKGROUND_OVERLAPS``
     overlap later stages; their CPU and memory figures then share a window,
     and each result lists the stages it ran beside in ``concurrentStages``.
     """
@@ -494,6 +572,8 @@ def run_funnel_job(
         raise ValueError("A funnel must start with createStore")
     local = storeBackend == "local"
     resource_envelope = _e2e_resource_envelope(config, selected)
+    # findMarkers reads imported clusters only when the funnel imports them.
+    workflow = _require_funnel_settings(config, nRows, selected, storeOnR2=not local)
     conflicts = _e2e_conflicting_uris(config, nRows, selected, storeOnR2=not local)
     if conflicts:
         raise FileExistsError(
@@ -512,6 +592,16 @@ def run_funnel_job(
         },
     ):
         raise FileExistsError(f"The runTag was claimed concurrently: {config.runTag}")
+    # A stage job may have claimed a stage between the check and the runTag claim.
+    late_conflicts = [
+        uri
+        for uri in _e2e_conflicting_uris(config, nRows, selected, storeOnR2=not local)
+        if uri != config.e2eClaimUri()
+    ]
+    if late_conflicts:
+        raise FileExistsError(
+            "A stage job started on this runTag: " + ", ".join(late_conflicts)
+        )
     if local:
         # Stages wrap the store to count its operations. A wrapped local store
         # is not a LocalStore, so pin the profile the local path resolves to.
@@ -521,17 +611,12 @@ def run_funnel_job(
     local_h5ad = work / f"{nRows}.h5ad"
     if local:
         store_uri = str(work / f"{nRows}.zarr")
-    # findMarkers reads imported clusters only when the funnel imports them.
-    workflow = (
-        bind_cluster_source(config, nRows)
-        if "importClusters" in selected
-        else config.workflow
-    )
     label = "e2e" if not local else "local"
 
     sampler = ResourceSampler()
     sampler.start()
     started = time.perf_counter()
+    download: ObjectDownload | None = None
     download_seconds: float | None = None
     funnel_seconds: float | None = None
     payloads: dict[StageName, dict[str, Any]] = {}
@@ -581,6 +666,10 @@ def run_funnel_job(
             and (other_end is None or other_end > begin)
         ]
         result = dataclasses.replace(result, concurrentStages=concurrent or None)
+        if stage == "createStore" and download is not None:
+            result = dataclasses.replace(
+                result, **_dataset_fields(config, nRows, download)
+            )
         payload = result.to_json()
         payload["resultUri"] = write_result(config, result)
         payload["storeBackend"] = storeBackend
@@ -592,10 +681,22 @@ def run_funnel_job(
         )
         return result.status == "ok"
 
+    def join_background(names: list[StageName]) -> None:
+        nonlocal failed_stage, error
+        for name in names:
+            try:
+                result = pending.pop(name).result()
+            except Exception as exc:  # noqa: BLE001 - keep the first failure
+                failed_stage = failed_stage or name
+                error = error or f"{type(exc).__name__}: {exc}"
+                continue
+            if not record(name, result):
+                failed_stage = failed_stage or name
+
     try:
         download_started = time.perf_counter()
         print(f"{label} dataset download start: {config.datasetUri(nRows)}", flush=True)
-        download_file(config.datasetUri(nRows), local_h5ad)
+        download = download_file(config.datasetUri(nRows), local_h5ad)
         download_seconds = time.perf_counter() - download_started
         print(
             f"{label} dataset download done: seconds={download_seconds:.1f}",
@@ -603,11 +704,9 @@ def run_funnel_job(
         )
         funnel_started = time.perf_counter()
         for stage in selected:
-            for name in [
-                name for name in pending if stage not in BACKGROUND_OVERLAPS[name]
-            ]:
-                if not record(name, pending.pop(name).result()):
-                    failed_stage = failed_stage or name
+            join_background(
+                [name for name in pending if stage not in BACKGROUND_OVERLAPS[name]]
+            )
             if failed_stage is not None:
                 break
             print(f"{label} stage start: {stage}", flush=True)
@@ -619,19 +718,19 @@ def run_funnel_job(
             elif not record(stage, execute(stage)):
                 failed_stage = stage
                 break
+        # The funnel ends when its last background stage does.
+        join_background(list(pending))
         funnel_seconds = time.perf_counter() - funnel_started
     except Exception as exc:  # noqa: BLE001 - persist a durable failure summary
         status = "error"
         error = f"{type(exc).__name__}: {exc}"
     finally:
         # Record background stages even when a later stage failed.
-        for name in list(pending):
-            try:
-                if not record(name, pending.pop(name).result()):
-                    failed_stage = failed_stage or name
-            except Exception as exc:  # noqa: BLE001 - keep the first failure
-                failed_stage = failed_stage or name
-                error = error or f"{type(exc).__name__}: {exc}"
+        try:
+            join_background(list(pending))
+        except Exception as exc:  # noqa: BLE001 - keep the first failure
+            status = "error"
+            error = error or f"{type(exc).__name__}: {exc}"
         measurement = sampler.stop()
     if failed_stage is not None:
         status = "error"
@@ -649,6 +748,8 @@ def run_funnel_job(
         "storeBackend": storeBackend,
         "storeUri": store_uri,
         "datasetUri": config.datasetUri(nRows),
+        "datasetETag": None if download is None else download.eTag,
+        "datasetBytes": None if download is None else download.fileBytes,
         "datasetDownloadSeconds": download_seconds,
         "funnelSeconds": funnel_seconds,
         "wholeFunctionSeconds": time.perf_counter() - started,
@@ -683,15 +784,18 @@ def run_size_jobs(
     nRows: int,
     submissionId: str,
     stages: list[StageName] | None = None,
+    allowReuse: bool = False,
 ) -> dict[str, Any]:
     config = ProfilingConfig.model_validate(configDict)
     os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
     if nRows not in config.targetSizes:
         raise ValueError(f"size {nRows} is not in config.targetSizes")
-    # The claim stops a second delivery of this coordinator. Each stage job
-    # claims itself and rejects results from earlier submissions.
-    claim_submission(config, nRows, "size", submissionId)
     selected_stages = tuple(stages) if stages else config.effectiveStages
+    require_consume_only_override(config, nRows, selected_stages)
+    bind_cluster_source(config, nRows, selected_stages)
+    # The claim stops a second delivery of this coordinator. Each stage job
+    # claims its stage and rejects results from earlier submissions.
+    claim_submission(config, nRows, "size", submissionId)
     outcomes: list[dict[str, Any]] = []
     for stage in selected_stages:
         resources = config.resourcesFor(stage)
@@ -702,7 +806,13 @@ def run_size_jobs(
             retries=0,
         )
         call = run_stage_job.with_options(**options).spawn(
-            configDict, nRows, stage, submissionId
+            configDict,
+            nRows,
+            stage,
+            submissionId,
+            False,
+            list(selected_stages),
+            allowReuse,
         )
         try:
             result = await_stage_result(
@@ -749,6 +859,7 @@ def run_all_jobs(
     submissionId: str,
     sizes: list[int] | None = None,
     stages: list[StageName] | None = None,
+    allowReuse: bool = False,
 ) -> dict[str, Any]:
     """Run sizes in parallel; stages within each size stay sequential."""
     config = ProfilingConfig.model_validate(configDict)
@@ -758,6 +869,10 @@ def run_all_jobs(
     for n_rows in selected_sizes:
         if n_rows not in config.targetSizes:
             raise ValueError(f"size {n_rows} is not in config.targetSizes")
+    if object_exists(config.e2eClaimUri()):
+        raise FileExistsError(
+            f"runTag {config.runTag!r} is held by an e2e funnel; use a fresh runTag"
+        )
 
     parallel_sizes = max(1, len(selected_sizes))
     orchestrator_options = orchestrator_function_options(
@@ -772,11 +887,13 @@ def run_all_jobs(
             n_rows,
             submissionId,
             stage_list,
+            allowReuse,
         )
         for n_rows in selected_sizes
     ]
-    size_results = await_many_function_calls(
+    size_results = await_function_calls(
         handles,
+        pollSeconds=20.0,
         deadlineSeconds=86_400.0,
     )
     failed = [item for item in size_results if item.get("stopped")]
@@ -814,29 +931,26 @@ def _load_config(path: str) -> ProfilingConfig:
 def _deployed_function(config: ProfilingConfig, name: str) -> modal.Function:
     try:
         return modal.Function.from_name(
-            config.modalAppName,
+            MODAL_APP_NAME,
             name,
-            environment_name=config.modalEnvironmentName,
+            environment_name=MODAL_ENVIRONMENT_NAME,
         )
     except Exception as exc:
         raise SystemExit(
-            f"Could not find deployed function {config.modalAppName}/{name}. "
+            f"Could not find deployed function {MODAL_APP_NAME}/{name}. "
             "Deploy first with:\n"
             "  uv run --group profiling modal deploy "
-            f"--env {config.modalEnvironmentName} -m profiling.modal_app\n"
+            f"--env {MODAL_ENVIRONMENT_NAME} -m profiling.modal_app\n"
             f"Original error: {exc}"
         ) from exc
 
 
 def _print_spawned(label: str, call: Any) -> None:
-    call_id = (
-        getattr(call, "object_id", None) or getattr(call, "call_id", None) or str(call)
-    )
-    print(f"spawned {label}: {call_id}")
+    print(f"spawned {label}: {call_id(call) or call}")
     print("disconnect is safe; watch with:")
     print(
         "  uv run --group profiling modal app logs "
-        "scarf-profiling --env scarf_profiling"
+        f"{MODAL_APP_NAME} --env {MODAL_ENVIRONMENT_NAME}"
     )
 
 
@@ -856,7 +970,7 @@ def _launch(
     call = function.with_options(**options).spawn(*args)
     _print_spawned(label, call)
     if ephemeral:
-        print(await_function_call(call, deadlineSeconds=86_400.0))
+        print(await_function_call(call, pollSeconds=20.0, deadlineSeconds=86_400.0))
 
 
 @app.local_entrypoint()
@@ -875,6 +989,10 @@ def main(*arg_list: str) -> None:
     fixture_parser.add_argument("--sizes", nargs="*", type=int, default=[10_000])
     fixture_parser.add_argument("--n-columns", type=int, default=500)
 
+    allow_reuse_help = (
+        "Accept a stage whose artifact already existed. Its seconds then measure a "
+        "cache lookup, not the computation."
+    )
     run_parser = sub.add_parser("run")
     run_parser.add_argument("--config", required=True)
     run_parser.add_argument("--size", type=int, required=True)
@@ -887,6 +1005,7 @@ def main(*arg_list: str) -> None:
             "and overwrite its stage result JSON."
         ),
     )
+    run_parser.add_argument("--allow-reuse", action="store_true", help=allow_reuse_help)
     run_parser.add_argument(
         "--ephemeral",
         action="store_true",
@@ -899,6 +1018,7 @@ def main(*arg_list: str) -> None:
     all_parser.add_argument(
         "--stages", nargs="*", choices=ALL_STAGE_CHOICES, default=None
     )
+    all_parser.add_argument("--allow-reuse", action="store_true", help=allow_reuse_help)
     all_parser.add_argument(
         "--ephemeral",
         action="store_true",
@@ -953,7 +1073,7 @@ def main(*arg_list: str) -> None:
             .with_options(**smoke_options)
             .spawn(payload)
         )
-        print(await_function_call(call, deadlineSeconds=300.0))
+        print(await_function_call(call, pollSeconds=20.0, deadlineSeconds=300.0))
         return
 
     if args.command == "prepare":
@@ -987,7 +1107,9 @@ def main(*arg_list: str) -> None:
     if args.command == "run":
         if args.size not in config.targetSizes:
             raise SystemExit(f"size {args.size} is not in config.targetSizes")
-        # Fail fast here; the stage job itself also rejects an existing result.
+        # Fail fast here; the stage job checks the same settings again.
+        require_consume_only_override(config, args.size, (args.stage,))
+        bind_cluster_source(config, args.size, _stage_context(config, args.stage, None))
         existing = None if args.force else load_result(config, args.size, args.stage)
         if existing is not None:
             failed = existing.get("status") == "error"
@@ -1002,14 +1124,17 @@ def main(*arg_list: str) -> None:
             if failed:
                 raise SystemExit(1)
             return
-        spawn_args: tuple[Any, ...] = (payload, args.size, args.stage, submission_id)
-        if args.force:
-            spawn_args += (True,)
         _launch(
             config,
             "run_stage_job",
             modal_function_options(config, config.resourcesFor(args.stage), retries=0),
-            *spawn_args,
+            payload,
+            args.size,
+            args.stage,
+            submission_id,
+            args.force,
+            None,
+            args.allow_reuse,
             ephemeral=args.ephemeral,
             label=f"run_stage_job {args.size}/{args.stage}",
         )
@@ -1018,10 +1143,12 @@ def main(*arg_list: str) -> None:
     if args.command == "run-all":
         sizes = list(args.sizes) if args.sizes else None
         stages = list(args.stages) if args.stages else None
-        if sizes:
-            for size in sizes:
-                if size not in config.targetSizes:
-                    raise SystemExit(f"size {size} is not in config.targetSizes")
+        selected_stages = tuple(stages) if stages else config.effectiveStages
+        for size in sizes or config.targetSizes:
+            if size not in config.targetSizes:
+                raise SystemExit(f"size {size} is not in config.targetSizes")
+            require_consume_only_override(config, size, selected_stages)
+            bind_cluster_source(config, size, selected_stages)
         _launch(
             config,
             "run_all_jobs",
@@ -1030,6 +1157,7 @@ def main(*arg_list: str) -> None:
             submission_id,
             sizes,
             stages,
+            args.allow_reuse,
             ephemeral=args.ephemeral,
             label="run_all_jobs",
         )
@@ -1045,6 +1173,9 @@ def main(*arg_list: str) -> None:
             list(CORE_STAGE_ORDER)
             if backend == "r2"
             else list(args.stages or config.effectiveStages)
+        )
+        _require_funnel_settings(
+            config, args.size, tuple(stages), storeOnR2=backend == "r2"
         )
         print(f"result URI (when done): {config.funnelResultUri(args.size)}")
         _launch(

@@ -143,6 +143,10 @@ def ensure_feature_summary(
             "Feature summaries are supported only for RNAassay and ATACassay; "
             f"received {type(assay).__name__}"
         )
+    # Summaries computed through ``normed`` promote integer counts to float64.
+    arithmetic = assay._count_arithmetic("feature_summary")
+    if arithmetic is not None:
+        parameters["count_arithmetic"] = arithmetic
 
     arrays, attributes, reuse_validator = _summary_contract(
         names,

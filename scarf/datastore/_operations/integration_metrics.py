@@ -1,4 +1,4 @@
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -13,17 +13,14 @@ from ...graph.feature_projection import (
     resolve_native_graph_inputs,
 )
 from ...graph.kinds import require_graph_kind
-from ...metadata.artifacts import (
-    artifact_values,
-    plan_cell_data_artifact,
-    write_cell_data_artifact,
-)
 from ...metadata.rows import (
     read_metadata_missing_rows_chunkwise,
     read_metadata_rows_chunkwise,
 )
-from ...metadata.selection import require_complete_cluster_labels
-from ...metrics.lisi import _effective_perplexity
+from ...metadata.selection import (
+    require_complete_cluster_labels,
+    valid_category_mask,
+)
 from ...storage.artifacts import (
     ArtifactRef,
     group_at,
@@ -33,7 +30,6 @@ from ...storage.errors import ArtifactResolutionError
 from ...storage.feature_selection import resolve_feature_selection
 from ...storage.selections import (
     read_stored_selection_indices,
-    resolve_metadata_snapshot,
     validate_stored_selection_integrity,
 )
 from ...storage.types import as_zarr_array, as_zarr_group
@@ -50,11 +46,16 @@ def _read_complete_metric_metadata(
     column: str,
     rows: np.ndarray,
 ) -> np.ndarray:
+    """Read metric labels, rejecting missing, ``NaN``, and blank labels."""
+    if column not in metadata.columns:
+        raise KeyError(f"Cell metadata column {column!r} was not found")
     values = read_metadata_rows_chunkwise(metadata, column, rows)
     missing = read_metadata_missing_rows_chunkwise(metadata, column, rows)
-    if missing is not None:
-        if missing.any():
-            raise ValueError(f"Metric column {column!r} contains missing values")
+    if not valid_category_mask(values, missing_mask=missing).all():
+        raise ValueError(
+            f"Metric column {column!r} contains missing values "
+            "(masked, NaN, None, or blank labels)"
+        )
     return values
 
 
@@ -156,154 +157,6 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
         distances = as_zarr_array(knn_grp["distances"], name="distances")
         indices = as_zarr_array(knn_grp["indices"], name="indices")
         return lineage, cell_indices, distances, indices
-
-    def metric_lisi(
-        self,
-        label_columns: Sequence[str],
-        neighbors: ArtifactRef,
-        *,
-        perplexity: float | None = None,
-        invalidate_cache: bool = False,
-    ) -> ArtifactRef:
-        """Calculate Local Inverse Simpson Index (LISI) scores for cell populations.
-
-        LISI measures how well mixed different cell populations are in the local neighborhood
-        of each cell. Higher scores indicate better mixing of different populations.
-
-        Args:
-            label_columns: Column names from cell metadata containing population labels
-            neighbors: Explicit neighbor artifact to score.
-            perplexity: Effective neighborhood size; None uses floor(k / 3). It is reduced
-                with a warning when the graph has fewer than three times this
-                many neighbors.
-            invalidate_cache: Force creation of a new metric artifact.
-
-        Returns:
-            An immutable quality-metric artifact. Pass it to
-            :meth:`load_metric_lisi` to read the per-cell scores.
-
-        Raises:
-            ValueError: If KNN inputs, perplexity, or labels are invalid
-            KeyError: If label columns not found in cell metadata
-
-        Notes:
-            LISI scores are computed for each label column separately.
-            Scores near 1 indicate cells grouped with similar labels.
-            Higher scores indicate more mixing between different labels.
-            This metadata-column API is for imported annotations and batch or
-            covariate labels. Use :meth:`metric_label_concordance` to compare
-            Scarf-produced clusterings.
-        """
-
-        if isinstance(label_columns, str):
-            raise TypeError("label_columns must be a sequence of column names")
-        label_cols = list(label_columns)
-        if not label_cols:
-            raise ValueError("label_columns must be non-empty")
-        if not all(isinstance(column, str) for column in label_cols):
-            raise TypeError("label_columns must contain only strings")
-        if len(set(label_cols)) != len(label_cols):
-            raise ValueError("label_columns contains duplicate names")
-
-        lineage, cell_indices, distances, indices = self._load_metric_knn(neighbors)
-        perplexity = _effective_perplexity(perplexity, int(distances.shape[1]))
-        try:
-            labels = {
-                column: _read_complete_metric_metadata(
-                    self.cells,
-                    column,
-                    cell_indices,
-                )
-                for column in label_cols
-            }
-        except KeyError:
-            raise KeyError(
-                f"Could not find the column(s) {label_cols} in the cell metadata table."
-            )
-
-        row_ids = read_metadata_rows_chunkwise(
-            self.cells,
-            "ids",
-            cell_indices,
-        )
-        label_snapshots = [
-            {
-                "column": column,
-                "artifact": resolve_metadata_snapshot(
-                    self.zw,
-                    values=np.asarray(labels[column]),
-                    row_ids=np.asarray(row_ids),
-                    operation="snapshot_metric_label",
-                    parameters={"column": column},
-                    inputs={"neighbors": neighbors},
-                    source_columns=[column],
-                    invalidate_cache=invalidate_cache,
-                ),
-            }
-            for column in label_cols
-        ]
-        planned = plan_cell_data_artifact(
-            self.zw,
-            scope="assay",
-            assay=neighbors.assay,
-            kind="quality_metric",
-            operation="metric_lisi",
-            parameters={
-                "label_columns": label_cols,
-                "perplexity": float(perplexity),
-            },
-            inputs={
-                "neighbors": neighbors,
-                "label_snapshots": label_snapshots,
-            },
-            execution_options={},
-            cell_selection=lineage.cell_selection,
-            arrays={"values": ((len(cell_indices), len(label_cols)), "f")},
-            invalidate_cache=invalidate_cache,
-        )
-        if not planned.reused:
-            from ...metrics import compute_lisi
-
-            lisi_scores = compute_lisi(
-                distances,
-                indices,
-                pd.DataFrame(labels),
-                label_cols,
-                perplexity=perplexity,
-            )
-            write_cell_data_artifact(
-                self.zw,
-                planned,
-                {"values": lisi_scores},
-            )
-        return planned.ref
-
-    def load_metric_lisi(
-        self,
-        metric: ArtifactRef,
-    ) -> dict[str, np.ndarray]:
-        """Load per-cell LISI scores from an explicit metric artifact."""
-        if not isinstance(metric, ArtifactRef):
-            raise TypeError("metric must be an ArtifactRef")
-        status = self._require_complete_artifact(metric, "quality_metric")
-        if status.operation != "metric_lisi":
-            raise ValueError("metric must reference a LISI quality-metric artifact")
-        parameters = status.parameters or {}
-        raw_columns = parameters.get("label_columns")
-        if not isinstance(raw_columns, list) or not all(
-            isinstance(column, str) and column for column in raw_columns
-        ):
-            raise ValueError("LISI metric label columns are malformed")
-        label_columns = list(raw_columns)
-        if len(set(label_columns)) != len(label_columns):
-            raise ValueError("LISI metric label columns are malformed")
-        values = artifact_values(group_at(self.zw, status.path), "values")
-        if values.ndim != 2 or values.shape[1] != len(label_columns):
-            raise ValueError("LISI metric values are malformed")
-        return {
-            column: scores.copy()
-            for column, scores in zip(label_columns, values.T, strict=True)
-        }
 
     def metric_ilisi(
         self,
@@ -495,11 +348,11 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
             )
         coordinate_status = inspect_artifact(self.zw, lineage.coordinates)
         coordinate_group = group_at(self.zw, coordinate_status.path)
+        # Distance provenance validation guarantees a recorded ANN metric.
         ann_metric = str(
-            (inspect_artifact(self.zw, lineage.ann_index).parameters or {}).get(
-                "ann_metric",
-                "l2",
-            )
+            (inspect_artifact(self.zw, lineage.ann_index).parameters or {})[
+                "ann_metric"
+            ]
         )
         # Neighbor lineage validation guarantees the coordinate data array.
         metric_data = as_zarr_array(coordinate_group["data"], name="coordinates")

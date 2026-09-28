@@ -16,15 +16,15 @@ from ...storage.artifacts import (
 )
 from ...storage.artifact_writer import (
     ArrayRequirement,
-    finish_artifact,
+    artifact_transaction,
     plan_artifact,
     reused_artifact_group,
-    start_artifact,
 )
 from ...graph.feature_projection import (
     graph_cell_selection,
     resolve_graph_source_assay,
 )
+from ...graph.kinds import require_graph_kind
 from ...metadata.arguments import (
     MembershipStrengthArguments,
     SmartLabelArguments,
@@ -64,6 +64,15 @@ def _row_mode_counts(codes: np.ndarray) -> np.ndarray:
     # Each position's run begins at the latest preceding run start.
     run_origins = np.maximum.accumulate(np.where(run_starts, positions, 0), axis=1)
     return np.asarray((positions - run_origins + 1).max(axis=1), dtype=np.int64)
+
+
+def _letter_suffix(position: int) -> str:
+    """Return a lowercase base-26 suffix: 1 is ``a``, 26 is ``z``, 27 is ``aa``."""
+    letters = ""
+    while position > 0:
+        position, remainder = divmod(position - 1, 26)
+        letters = chr(ord("a") + remainder) + letters
+    return letters
 
 
 def _lift_frozen_umap_to_obsm(adata: Any) -> None:
@@ -345,9 +354,16 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
 
         Returns:
             Reference to the immutable membership-strength artifact.
+
+        Raises:
+            ValueError: If ``graph`` is not a connectivity map or integrated
+                graph.
+            PermissionError: If no matching result exists and the store is
+                not opened with ``zarr_mode='r+'``.
         """
         if not isinstance(graph, ArtifactRef):
             raise TypeError("graph must be an ArtifactRef")
+        require_graph_kind(graph)
         graph_ref = graph
         status = inspect_artifact(self.zw, graph_ref)
         if not status.complete:
@@ -393,6 +409,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         )
         if planned.reused:
             return planned.ref
+        self._require_writable("calc_membership_strength")
         graph_grp = as_zarr_group(self.zw[loc], name=loc)
         edges = as_zarr_array(graph_grp["edges"], name="edges")
         if tuple(edges.shape) != (n_cells * k, 2):
@@ -440,11 +457,12 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         For each unique value in A, the most frequently occurring value in B is
         found. If two or more values in A have maximum overlap with the same
         value in B, then they all get the same label as B along with different
-        suffixes like, 'a', 'b', etc. The suffixes are ordered based on where
-        the largest fraction of the B label lies. If one label from A takes up
-        multiple labels from B then all the labels from B are included, and they
-        are delimited by hyphens. Both artifacts need a label for every cell;
-        labels that a linked missing mask flags raise ``ValueError``.
+        suffixes: 'a' to 'z', then 'aa', 'ab', and so on. The suffixes are
+        ordered based on where the largest fraction of the B label lies. If one
+        label from A takes up multiple labels from B then all the labels from B
+        are included, and they are delimited by hyphens. Both artifacts need a
+        label for every cell; labels that a linked missing mask flags raise
+        ``ValueError``.
 
         Args:
             to_relabel: Explicit axis-aligned label artifact to relabel.
@@ -452,6 +470,12 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
 
         Returns:
             Reference to the immutable relabeled-values artifact.
+
+        Raises:
+            ValueError: If two labels of A would receive the same new name,
+                which hyphen-joined base labels can cause.
+            PermissionError: If no matching result exists and the store is
+                not opened with ``zarr_mode='r+'``.
         """
         relabelled = resolve_complete_labels(self.zw, to_relabel, name="to_relabel")
         base = resolve_complete_labels(self.zw, base_label, name="base_label")
@@ -468,7 +492,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             values=to_relabel,
             base_labels=base_label,
             cell_selection=selection,
-            algorithm_version=2,
+            algorithm_version=3,
             suffix_style="lowercase_letter",
             invalidate_cache=invalidate_cache,
         )
@@ -487,6 +511,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         )
         if planned.reused:
             return planned.ref
+        self._require_writable("smart_label")
         if len(values_to_relabel) == 0:
             write_cell_data_artifact(
                 self.zw,
@@ -501,13 +526,14 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         )
         normed_frac = df.divide(df.sum(axis=1), axis="index")
         idxmax = df.idxmax()
-        new_names = {}
+        bases: dict[Any, str] = {}
+        suffixes: dict[Any, str] = {}
         for i in sorted(idxmax.unique()):
             j = normed_frac[idxmax[idxmax == i].index].loc[i]
             j = j.sort_values(ascending=False).index
             for n, k in enumerate(j, start=1):
-                a = chr(ord("@") + n)
-                new_names[k] = f"{i}{a.lower()}"
+                bases[k] = str(i)
+                suffixes[k] = _letter_suffix(n)
 
         missing_vals = df.index.difference(
             pd.Index(idxmax.unique()),
@@ -516,7 +542,19 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         if len(missing_vals) > 0:
             miss_idxmax = df.loc[missing_vals].idxmax(axis=1).to_dict()
             for k, v in miss_idxmax.items():
-                new_names[v] = f"{new_names[v][:-1]}-{k}{new_names[v][-1]}"
+                bases[v] = f"{bases[v]}-{k}"
+
+        new_names = {label: bases[label] + suffixes[label] for label in bases}
+        labels_by_name: dict[str, list[Any]] = {}
+        for label, name in new_names.items():
+            labels_by_name.setdefault(name, []).append(label)
+        for name, labels in labels_by_name.items():
+            if len(labels) > 1:
+                raise ValueError(
+                    f"smart_label would name labels {labels!r} alike as {name!r}. "
+                    "Rename the base labels so that hyphen-joined names stay "
+                    "distinct."
+                )
 
         values = np.asarray([new_names[x] for x in values_to_relabel])
         write_cell_data_artifact(
@@ -681,15 +719,6 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             subgraph = CoalesceTree(make_digraph(dendrogram), clusters)
             if persist:
                 edge_list = to_pandas_edgelist(subgraph).values
-                coalesced_group = start_artifact(self.zw, coalesced_plan)
-                edge_array = create_zarr_dataset(
-                    coalesced_group,
-                    "edgelist",
-                    (100000,),
-                    "u8",
-                    edge_list.shape,
-                )
-                edge_array[:] = edge_list
                 node_list = []
                 partition_id_values = []
                 for node in subgraph.nodes():
@@ -697,23 +726,31 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
                     node_list.append((node, node_data["nleaves"]))
                     partition_id_values.append(str(node_data.get("partition_id", -1)))
                 node_values = np.asarray(node_list)
-                node_array = create_zarr_dataset(
-                    coalesced_group,
-                    "nodelist",
-                    (100000,),
-                    node_values.dtype,
-                    node_values.shape,
-                )
-                node_array[:] = node_values
-                partition_array = create_zarr_dataset(
-                    coalesced_group,
-                    "partition_id",
-                    (100000,),
-                    str,
-                    (len(partition_id_values),),
-                )
-                partition_array[:] = partition_id_values
-                finish_artifact(coalesced_group, coalesced_plan)
+                with artifact_transaction(self.zw, coalesced_plan) as coalesced_group:
+                    edge_array = create_zarr_dataset(
+                        coalesced_group,
+                        "edgelist",
+                        (100000,),
+                        "u8",
+                        edge_list.shape,
+                    )
+                    edge_array[:] = edge_list
+                    node_array = create_zarr_dataset(
+                        coalesced_group,
+                        "nodelist",
+                        (100000,),
+                        node_values.dtype,
+                        node_values.shape,
+                    )
+                    node_array[:] = node_values
+                    partition_array = create_zarr_dataset(
+                        coalesced_group,
+                        "partition_id",
+                        (100000,),
+                        str,
+                        (len(partition_id_values),),
+                    )
+                    partition_array[:] = partition_id_values
         color_values = None
         color_missing = None
         if fill_by_value is not None:

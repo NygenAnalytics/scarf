@@ -79,14 +79,12 @@ def test_tree_palette_requires_complete_color_key():
 
     with pytest.raises(KeyError, match="missing in `color_key`"):
         _tree_palette(
-            object(),
             ["A", "B"],
             cmap="tab20",
             color_key={"A": "#ff0000"},
         )
     color_key = {"A": "#ff0000", "B": "#00ff00"}
     palette = _tree_palette(
-        object(),
         ["A", "B"],
         cmap="tab20",
         color_key=color_key,
@@ -138,19 +136,34 @@ def test_writable_float64_accumulator_accepts_readonly_blocks() -> None:
     np.testing.assert_array_equal(first, [1.0, 2.0])
 
 
-def test_clip_marker_means_does_not_write_through_readonly_values() -> None:
-    from scarf.plotting.heatmaps import _clip_marker_means
-
-    values = np.array([[-2.0, 0.5], [3.0, 1.0]], dtype=np.float64)
-    values.flags.writeable = False
-    group_means = pd.DataFrame(values, index=["a", "b"], columns=["g1", "g2"])
-
-    matrix = _clip_marker_means(group_means, vmin=-1.0, vmax=2.0)
-
-    assert list(matrix.index) == ["g1", "g2"]
-    assert list(matrix.columns) == ["a", "b"]
-    np.testing.assert_allclose(matrix.to_numpy(), [[-1.0, 2.0], [0.5, 1.0]])
-    assert values[0, 0] == -2.0
+def test_marker_heatmap_display_limits_do_not_change_clustering(
+    marker_search,
+    datastore,
+):
+    results = [
+        splt.marker_heatmap(
+            datastore,
+            marker=marker_search,
+            topn=3,
+            vmin=vmin,
+            vmax=vmax,
+            show=False,
+        )
+        for vmin, vmax in ((-1.0, 2.0), (-0.1, 0.1))
+    ]
+    try:
+        wide, narrow = (result.tables["matrix"] for result in results)
+        # The standardized values are returned unclipped, and the dendrogram
+        # order does not depend on the color limits.
+        pd.testing.assert_frame_equal(wide, narrow)
+        assert np.nanmax(np.abs(narrow.to_numpy())) > 0.1
+        for key in ("row_order", "column_order"):
+            assert (
+                results[0].provenance.extras[key] == results[1].provenance.extras[key]
+            )
+    finally:
+        for result in results:
+            result.close()
 
 
 def test_marker_heatmap_returns_owned_result(
@@ -798,6 +811,26 @@ def test_heatmap_ordering_rejects_malformed_orders(
         )
 
 
+def test_heatmap_clustering_orders_constant_rows_under_correlation():
+    matrix = pd.DataFrame(
+        [[0.0, 0.0, 0.0], [1.0, 2.0, 3.0], [3.0, 1.0, 2.0]],
+        index=["unexpressed", "g1", "g2"],
+        columns=["a", "b", "c"],
+    )
+    for metric in ("correlation", "cosine"):
+        ordered, row_linkage, _ = order_heatmap(
+            matrix,
+            row_order=None,
+            column_order=None,
+            cluster_rows=True,
+            cluster_columns=False,
+            method="average",
+            metric=metric,
+        )
+        assert row_linkage is not None
+        assert set(ordered.index) == set(matrix.index)
+
+
 def test_heatmap_clustering_rejects_infinite_values():
     matrix = pd.DataFrame(
         [[0.0, np.inf], [1.0, 2.0], [3.0, 4.0]],
@@ -843,7 +876,10 @@ def test_heatmap_annotations_validate_empty_alignment_and_scales():
         {"program": ["A", "B"]},
         axis_name="row",
     )
-    with pytest.raises(ValueError, match="scale 'program' is missing values: B"):
+    with pytest.raises(
+        ValueError,
+        match=r"annotation_scales\['program'\]\.order is missing observed values: B",
+    ):
         annotation_colors(
             annotations,
             {"program": splt.CategoricalScale(order=("A",))},

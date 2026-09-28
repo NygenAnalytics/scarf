@@ -26,11 +26,19 @@ from scarf.storage.artifacts import (
     artifact_path,
     inspect_artifact,
     make_provenance,
-    parse_artifact_path,
 )
 from scarf.storage.selections import resolve_generated_selection_artifact
 
 _WNN_GROUP_SIZE = 20
+
+
+def _artifact_ref_at(path: str) -> ArtifactRef:
+    parts = path.strip("/").split("/")
+    if parts[0] == "artifacts":
+        return ArtifactRef(scope="datastore", kind=parts[1], artifact_id=parts[2])
+    return ArtifactRef(
+        scope="assay", assay=parts[0], kind=parts[2], artifact_id=parts[3]
+    )
 
 
 @pytest.fixture(scope="module")
@@ -401,6 +409,91 @@ def test_cluster_tree_renders_continuous_values_and_closes_owned_figure() -> Non
     assert not plt.fignum_exists(figure_number)
 
 
+def test_cluster_tree_pies_skip_absent_categories() -> None:
+    prepared = _prepared_plot_tree(
+        np.asarray(["A", "A", "A", "B", "B", "B"], dtype=object)
+    )
+    store = SimpleNamespace(_prepare_cluster_tree=lambda **_kwargs: prepared)
+    result = splt.cluster_tree(
+        store,
+        graph=prepared["graph_ref"],
+        clusters=prepared["clusters_ref"],
+        fill_by_value="cell_type",
+        color_key={"A": "#ff0000", "B": "#0000ff"},
+        show_labels=False,
+        show=False,
+    )
+    try:
+        # One full wedge per single-category cluster; no zero-width wedges
+        # drawn as radial lines in the absent category's color.
+        wedges = [
+            matplotlib.colors.to_hex(collection.get_facecolor()[0])
+            for collection in result.axes["tree"].collections
+            if len(collection.get_offsets()) == 1
+        ]
+        assert wedges == ["#ff0000", "#0000ff"]
+    finally:
+        result.close()
+
+
+def test_cluster_tree_shows_clusters_without_fill_values_as_missing() -> None:
+    prepared = _prepared_plot_tree(
+        np.asarray([1.0, 2.0, 3.0, 0.0, 0.0, 0.0]),
+        np.asarray([False, False, False, True, True, True]),
+    )
+    store = SimpleNamespace(_prepare_cluster_tree=lambda **_kwargs: prepared)
+    result = splt.cluster_tree(
+        store,
+        graph=prepared["graph_ref"],
+        clusters=prepared["clusters_ref"],
+        fill_by_value="score",
+        force_ints_as_cats=False,
+        show=False,
+    )
+    try:
+        nodes = next(
+            collection
+            for collection in result.axes["tree"].collections
+            if len(collection.get_offsets()) == 3
+        )
+        colors = {
+            node: matplotlib.colors.to_hex(color)
+            for node, color in zip(
+                prepared["graph"].nodes(),
+                nodes.get_facecolors(),
+                strict=True,
+            )
+        }
+        assert colors[1] == splt.ColorScale().missing_color
+        assert colors[0] != colors[1]
+    finally:
+        result.close()
+
+
+def test_composed_cluster_tree_labels_one_panel_and_shares_its_colorbar() -> None:
+    prepared = _prepared_plot_tree(np.asarray([0.0, 1.0, 2.0, 4.0, 5.0, 6.0]))
+    store = SimpleNamespace(_prepare_cluster_tree=lambda **_kwargs: prepared)
+    figure, axis = plt.subplots(figsize=(4, 4), layout="constrained")
+    child = splt.cluster_tree(
+        store,
+        graph=prepared["graph_ref"],
+        clusters=prepared["clusters_ref"],
+        fill_by_value="score",
+        force_ints_as_cats=False,
+        ax=axis,
+        show=False,
+    )
+    try:
+        composite = splt.compose_results(figure, {"tree": child})
+        colorbars = [ax for ax in figure.axes if ax.get_label() == "<colorbar>"]
+        assert len(colorbars) == 1
+        assert [text.get_text() for text in axis.texts if text.get_text() == "A"]
+        assert not [text for text in colorbars[0].texts if text.get_text() == "B"]
+        assert set(composite.axes) == {("tree", "tree")}
+    finally:
+        plt.close(figure)
+
+
 def test_cluster_tree_fill_values_show_masked_rows_as_missing() -> None:
     missing = np.asarray([False, True, False, False])
     labels, labels_are_categorical = _tree_color_series(
@@ -474,11 +567,10 @@ def test_artifact_cluster_tree_reads_the_fill_column_missing_mask(
     )
 
 
-def test_make_digraph_preserves_linkage_topology_and_leaf_clusters() -> None:
+def test_make_digraph_preserves_linkage_topology_and_leaf_counts() -> None:
     dendrogram = _balanced_linkage()
-    clusters = np.asarray([0, 0, 1, 1, 2, 2, 3, 3])
 
-    graph = make_digraph(dendrogram, clust_info=clusters)
+    graph = make_digraph(dendrogram)
 
     assert set(graph.nodes) == set(range(15))
     assert set(graph.edges) == {
@@ -497,20 +589,16 @@ def test_make_digraph_preserves_linkage_topology_and_leaf_clusters() -> None:
         (14, 12),
         (14, 13),
     }
-    assert [graph.nodes[leaf]["cluster"] for leaf in range(8)] == clusters.tolist()
+    assert [graph.nodes[leaf]["nleaves"] for leaf in range(8)] == [0] * 8
     assert graph.nodes[14]["nleaves"] == 8
-    assert graph.nodes[14]["dist"] == 10
-
-
-def test_make_digraph_rejects_mismatched_cluster_info() -> None:
-    dendrogram = _balanced_linkage()
-    with pytest.raises(ValueError, match="cluster information"):
-        make_digraph(dendrogram, clust_info=np.zeros(3))
+    assert {name for _node, data in graph.nodes(data=True) for name in data} == {
+        "nleaves"
+    }
 
 
 def test_coalesce_tree_retains_cluster_holding_nodes_and_ancestors() -> None:
     clusters = np.asarray([0, 0, 1, 1, 2, 2, 3, 3])
-    graph = make_digraph(_balanced_linkage(), clust_info=clusters)
+    graph = make_digraph(_balanced_linkage())
 
     coalesced = CoalesceTree(graph, clusters)
 
@@ -532,7 +620,7 @@ def test_coalesce_tree_retains_cluster_holding_nodes_and_ancestors() -> None:
 
 def test_coalesce_tree_rejects_non_monophyletic_clusters() -> None:
     clusters = np.asarray([0, 1, 0, 1, 2, 2, 3, 3])
-    graph = make_digraph(_balanced_linkage(), clust_info=clusters)
+    graph = make_digraph(_balanced_linkage())
 
     with pytest.raises(ValueError, match="not monophyletic"):
         CoalesceTree(graph, clusters)
@@ -601,7 +689,7 @@ def test_artifact_cluster_tree_invalidation_forces_cache_miss(
     assert invalidated["coalesced_location"] != prepared["coalesced_location"]
     assert inspect_artifact(
         store.zw,
-        parse_artifact_path(invalidated["coalesced_location"]),
+        _artifact_ref_at(invalidated["coalesced_location"]),
     ).complete
 
 
@@ -620,7 +708,7 @@ def test_artifact_cluster_tree_does_not_reuse_incomplete_or_malformed_cache(
 ) -> None:
     store, _refs, _backing = _artifact_cluster_tree_store(monkeypatch)
     prepared = _prepare_artifact_tree(store)
-    coalesced_ref = parse_artifact_path(prepared["coalesced_location"])
+    coalesced_ref = _artifact_ref_at(prepared["coalesced_location"])
     coalesced_group = store.zw[artifact_path(coalesced_ref)]
     coalesced_status = inspect_artifact(store.zw, coalesced_ref)
     assert coalesced_status.inputs is not None
@@ -661,7 +749,7 @@ def test_artifact_cluster_tree_does_not_reuse_incomplete_or_malformed_cache(
     assert repaired["coalesced_location"] != prepared["coalesced_location"]
     assert inspect_artifact(
         store.zw,
-        parse_artifact_path(repaired["coalesced_location"]),
+        _artifact_ref_at(repaired["coalesced_location"]),
     ).complete
 
 

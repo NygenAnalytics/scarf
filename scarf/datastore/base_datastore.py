@@ -13,7 +13,7 @@ from ..storage.artifacts import (
 from ..storage.types import ZarrMode, as_zarr_group
 from ..storage.validation_scope import validation_scoped
 from ..storage.budget import ResourceBudget
-from ..assay.classification import DEFAULT_PERCENT_PATTERNS
+from ..features.gene_families import DEFAULT_PERCENT_PATTERNS
 from ..assay import RNAassay, ATACassay, ADTassay, Assay, preset_assay_types
 from ..metadata import MetaData
 from ..metadata.rows import apply_missing_mask, read_metadata_missing_rows
@@ -114,13 +114,14 @@ class BaseDataStore:
                      'RNA', 'ADT', 'ATAC' or 'GeneActivity'
         default_assay: Name of assay that should be considered as default. It is mandatory to provide this value
                        when DataStore loads a Zarr file for the first time
-        min_features_per_cell: Minimum number of non-zero features in a cell. If lower than this then the cell
-                               will be filtered out.
+        min_features_per_cell: Writable opens remove from ``I`` every cell whose default-assay feature
+                               count is not greater than this value, unless the value exceeds the median
+                               count of the active cells.
         mito_pattern: Feature-name pattern for the ``{assay}_percentMito`` column of each RNA assay.
                       The first writable open replaces any existing column with values computed from
                       this pattern, or ``^MT-`` when None. Later opens keep the stored values when
                       None and reject a pattern that differs from the recorded one.
-        ribo_pattern: The same for ``{assay}_percentRibo``, using ``RPS|RPL|MRPS|MRPL`` when None.
+        ribo_pattern: The same for ``{assay}_percentRibo``, using ``^RPS|^RPL|^MRPS|^MRPL`` when None.
         zarr_mode: For read-write mode use ``r+`` or for read-only use ``r``.
                    (Default value: ``r+``)
         workspace: Workspace name within the Zarr store (None for legacy single-workspace layout).
@@ -231,13 +232,6 @@ class BaseDataStore:
         else:
             ret_val: zarr.Group = self.z[self.workspace]  # type: ignore
         return ret_val
-
-    @property
-    def last_execution_report(self) -> Any:
-        """Return the most recent storage execution report, if any."""
-        from ..storage.execution import last_execution_report
-
-        return last_execution_report()
 
     def inspect_artifact(self, ref: ArtifactRef) -> ArtifactStatus:
         """Inspect a logical artifact without mutating the store."""
@@ -418,6 +412,12 @@ class BaseDataStore:
         if assay_name is None:
             if "defaultAssay" in self.zw.attrs:
                 assay_name = cast(str, self.zw.attrs["defaultAssay"])
+                if assay_name not in self.assay_names:
+                    raise ValueError(
+                        f"ERROR: The stored default assay {assay_name!r} was not "
+                        f"found. Choose one from: {' '.join(self.assay_names)}\n "
+                        "using 'default_assay' parameter."
+                    )
             else:
                 if len(self.assay_names) == 1:
                     assay_name = self.assay_names[0]
@@ -721,48 +721,6 @@ class BaseDataStore:
         if not np.array_equal(keep & active, active):
             self.cells.update_key(keep, key="I")
 
-    @staticmethod
-    def _col_renamer(from_assay: str, cell_key: str, suffix: str) -> str:
-        """A convenience function for internal usage that creates naming rule
-        for the metadata columns.
-
-        Args:
-            from_assay: Name of the assay.
-            cell_key: Cell key to use.
-            suffix: Base name for the column.
-
-        Returns:
-            column name updated as per the naming rule
-        """
-        if cell_key == "I":
-            ret_val = "_".join(list(map(str, [from_assay, suffix])))
-        else:
-            ret_val = "_".join(list(map(str, [from_assay, cell_key, suffix])))
-        return ret_val
-
-    def set_default_assay(self, assay_name: str) -> None:
-        """Override assigning of default assay.
-
-        Args:
-            assay_name: Name of the assay that should be set as default.
-
-        Returns:
-
-        Raises:
-            ValueError: if `assay_name` is not found in attribute `assayNames`
-            PermissionError: if the datastore is read-only. The default assay
-                is left unchanged.
-        """
-        if assay_name not in self.assay_names:
-            available = ", ".join(self.assay_names)
-            raise ValueError(
-                f"Assay {assay_name!r} not found. Available assays: {available}"
-            )
-        self._require_writable("set_default_assay")
-        # Persist first so a failed write leaves the in-memory default unchanged.
-        self.zw.attrs["defaultAssay"] = assay_name
-        self._defaultAssay = assay_name
-
     def get_cell_vals(
         self,
         from_assay: str,
@@ -787,10 +745,15 @@ class BaseDataStore:
                       for the default active-cell key.
             k: Cell metadata column name or feature name whose values are fetched.
             clip_fraction: Fraction (0-1) for soft percentile clipping of numeric values.
+                           Missing values are ignored when the percentiles are computed.
 
         Returns:
             The requested values
         """
+        if clip_fraction < 0 or clip_fraction > 1:
+            raise ValueError(
+                "ERROR: Value for `clip_fraction` parameter should be between 0 and 1"
+            )
         cell_idx = self.cells.active_index(cell_key)
         if k not in self.cells.columns:
             assay = self._get_assay(from_assay)
@@ -810,16 +773,11 @@ class BaseDataStore:
                 self.cells.fetch(k, key=cell_key),
                 read_metadata_missing_rows(self.cells, k, cell_idx),
             )
-        if clip_fraction < 0 or clip_fraction > 1:
-            raise ValueError(
-                "ERROR: Value for `clip_fraction` parameter should be between 0 and 1"
+        if clip_fraction > 0 and vals.dtype.kind in "iuf":
+            low, high = np.nanpercentile(
+                vals, [100 * clip_fraction, 100 - 100 * clip_fraction]
             )
-        if clip_fraction > 0:
-            if vals.dtype in [np.float64, np.uint64]:
-                min_v = np.percentile(vals, 100 * clip_fraction)
-                max_v = np.percentile(vals, 100 - 100 * clip_fraction)
-                vals[vals < min_v] = min_v
-                vals[vals > max_v] = max_v
+            vals = np.clip(vals, low, high).astype(vals.dtype, copy=False)
         return vals
 
     def __repr__(self) -> str:

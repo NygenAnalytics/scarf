@@ -1,5 +1,6 @@
-from importlib import import_module as _import_module
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
+
+from .._facade import lazy_facade as _lazy_facade
 
 if TYPE_CHECKING:
     from .feature_dynamics import (
@@ -38,69 +39,21 @@ __all__ = [
     "validate_pseudotime_regressor",
 ]
 
-_LAZY_EXPORTS = {
-    "aggregate_feature_profiles": (
-        ".feature_dynamics",
-        "aggregate_feature_profiles",
-    ),
-    "make_source_sink_vector": (
-        ".pseudotime",
-        "make_source_sink_vector",
-    ),
-    "random_walk_laplacian_transpose": (
-        ".pseudotime",
-        "random_walk_laplacian_transpose",
-    ),
-    "select_pseudotime_component": (
-        ".pseudotime",
-        "select_pseudotime_component",
-    ),
-    "scatter_feature_clusters": (
-        ".feature_dynamics",
-        "scatter_feature_clusters",
-    ),
-    "truncated_pba_potential": (
-        ".pseudotime",
-        "truncated_pba_potential",
-    ),
-    "validate_source_sink_labels": (
-        ".pseudotime",
-        "validate_source_sink_labels",
-    ),
-    "validate_source_sink_vector": (
-        ".pseudotime",
-        "validate_source_sink_vector",
-    ),
-    "validate_pseudotime_regressor": (
-        ".feature_dynamics",
-        "validate_pseudotime_regressor",
-    ),
-    "FateMappingResult": (
-        ".results",
-        "FateMappingResult",
-    ),
-    "PseudotimeAggregationResult": (
-        ".results",
-        "PseudotimeAggregationResult",
-    ),
-    "PseudotimeMarkerResult": (".results", "PseudotimeMarkerResult"),
-    "PseudotimeScoreResult": (".results", "PseudotimeScoreResult"),
-}
-
-for _export_name in _LAZY_EXPORTS:
-    globals().pop(_export_name, None)
-del _export_name
-
-
-def __getattr__(name: str) -> Any:
-    export = _LAZY_EXPORTS.get(name)
-    if export is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    module_name, attribute_name = export
-    value = getattr(_import_module(module_name, __name__), attribute_name)
-    globals()[name] = value
-    return value
-
-
-def __dir__() -> list[str]:
-    return sorted(set(globals()).union(_LAZY_EXPORTS))
+__getattr__, __dir__ = _lazy_facade(
+    __name__,
+    {
+        "aggregate_feature_profiles": ".feature_dynamics",
+        "make_source_sink_vector": ".pseudotime",
+        "random_walk_laplacian_transpose": ".pseudotime",
+        "select_pseudotime_component": ".pseudotime",
+        "scatter_feature_clusters": ".feature_dynamics",
+        "truncated_pba_potential": ".pseudotime",
+        "validate_source_sink_labels": ".pseudotime",
+        "validate_source_sink_vector": ".pseudotime",
+        "validate_pseudotime_regressor": ".feature_dynamics",
+        "FateMappingResult": ".results",
+        "PseudotimeAggregationResult": ".results",
+        "PseudotimeMarkerResult": ".results",
+        "PseudotimeScoreResult": ".results",
+    },
+)

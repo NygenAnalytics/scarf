@@ -1,5 +1,3 @@
-import gzip
-import io
 import inspect
 import pickle
 import subprocess
@@ -68,7 +66,7 @@ _PUBLIC_CLASS_METHODS = {
         "feature_names",
         "feature_ids",
         "get_feature_attrs",
-        "consume",
+        "consume_dense",
     ),
     CSVReader: (
         "__init__",
@@ -86,7 +84,6 @@ _PUBLIC_CLASS_METHODS = {
         "close",
         "get_assay",
         "get_reduction",
-        "inspect",
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
@@ -94,13 +91,13 @@ _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
     CrH5Reader: "053373f2af2f2fc74a3e00cde9b067c5818aba92c09da3a9ac2e129566ca87b9",
     CrDirReader: "d1d6697ba86d1e34aeb3e176ba84000e4fc50267176cec6f922ef696050b40dc",
     H5adReader: "d8556a75fb03793e802e86bf87a07f0097d1337e55700edd9af68ec7212a2e28",
-    LoomReader: "85c3ff965cb94a4fa201915b9d43890081e1f26e931327fcda6531bee4c3782a",
+    LoomReader: "2436d57c4a6954d8567665eaece4b79b8f7ebc1a76274b143f9153cfcfae88e3",
     CSVReader: "8aa6c17c876afb62765584fc7ff64d2838c66ef53095da10d7198ca60ab83851",
     MtxReader: "06376a32ff98ff0153ae1cc35f327509c88784ce027cb045bf9833b45dbccf2a",
-    SeuratReader: "f90ad28ab745692321245b3fd48e66273cbbe52795a9711f0cf17fb171820d3f",
+    SeuratReader: "c51148f751a74072c2f79448a4b6a25f0dc0c52b0abfbe837fb1b9e0c667368c",
 }
 _MODULE_SIGNATURE_DIGEST = (
-    "06ff8febbf86e3fef017f7126c9f810ed2a0fa5101e9988945bc2417f5e8eae3"
+    "63d01b3ffb7199003584ff37300ce5580b913756da32cd09b86ebbb7e5618382"
 )
 
 
@@ -157,13 +154,13 @@ def test_readers_facade_surface_is_stable():
         "MtxReader",
         "SeuratInspectResult",
         "SeuratReader",
-        "get_file_handle",
         "inspect_h5ad",
         "inspect_mtx",
         "inspect_seurat",
-        "read_file",
     }
-    assert expected.issubset(vars(readers_module))
+    assert expected.issubset(dir(readers_module))
+    assert not hasattr(readers_module, "get_file_handle")
+    assert not hasattr(readers_module, "read_file")
 
 
 def test_readers_facade_loads_format_modules_lazily():
@@ -243,7 +240,7 @@ def test_seurat_exports_load_together_without_loading_the_writer():
 
 
 def test_seurat_reader_facade_objects_resolve_annotations_and_pickle():
-    for name in ("__init__", "get_assay", "get_reduction", "inspect"):
+    for name in ("__init__", "get_assay", "get_reduction"):
         assert get_type_hints(getattr(SeuratReader, name))
     for value in (
         SeuratReader,
@@ -263,11 +260,9 @@ def test_reader_module_function_signatures_are_stable():
     methods = {
         name: getattr(readers_module, name)
         for name in (
-            "get_file_handle",
             "inspect_h5ad",
             "inspect_mtx",
             "inspect_seurat",
-            "read_file",
         )
     }
     assert signature_digest(methods) == _MODULE_SIGNATURE_DIGEST
@@ -290,11 +285,9 @@ def test_reader_public_metadata_remains_on_facade():
     assert MtxCandidate.__module__ == "scarf.readers"
     assert SeuratInspectResult.__module__ == "scarf.readers"
     for name in (
-        "get_file_handle",
         "inspect_h5ad",
         "inspect_mtx",
         "inspect_seurat",
-        "read_file",
     ):
         assert getattr(readers_module, name).__module__ == "scarf.readers"
 
@@ -306,37 +299,6 @@ def test_cellranger_reader_hierarchy_and_abstract_contracts_are_stable():
     assert issubclass(MtxReader, CrReader)
     for name in ("_handle_version", "_read_dataset", "consume"):
         assert getattr(CrReader, name).__isabstractmethod__
-
-
-def test_reader_text_helpers_support_plain_gzip_and_missing_files(tmp_path):
-    plain = tmp_path / "plain.txt"
-    compressed = tmp_path / "compressed.txt.gz"
-    plain.write_text("one \n two\n")
-    with gzip.open(compressed, mode="wt") as handle:
-        handle.write("three\nfour \n")
-
-    assert list(readers_module.read_file(str(plain))) == ["one", " two"]
-    assert list(readers_module.read_file(str(compressed))) == ["three", "four"]
-
-    missing = tmp_path / "missing.txt"
-    try:
-        readers_module.get_file_handle(str(missing))
-    except FileNotFoundError as error:
-        assert str(error) == f"ERROR: FILE NOT FOUND: {missing}"
-    else:
-        raise AssertionError("Missing reader input did not raise FileNotFoundError")
-
-
-def test_get_file_handle_facade_remains_patchable_by_read_file(monkeypatch):
-    handle = io.StringIO("one\ntwo\n")
-    monkeypatch.setattr(
-        readers_module,
-        "get_file_handle",
-        lambda filename: handle,
-    )
-
-    assert list(readers_module.read_file("virtual.txt")) == ["one", "two"]
-    assert handle.closed
 
 
 def test_crreader_reclassifies_noncontiguous_features_atomically(tmp_path):
@@ -421,7 +383,7 @@ def test_loom_reader_preserves_cell_feature_orientation(tmp_path):
 
     reader = LoomReader(str(path))
     try:
-        chunks = [chunk.toarray() for chunk in reader.consume(batch_size=2)]
+        chunks = list(reader.consume_dense(batch_size=2))
     finally:
         reader.h5.close()
 

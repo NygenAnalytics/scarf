@@ -4,12 +4,14 @@ import hashlib
 import re
 from typing import Any, Literal
 
-from ..record_io import canonical_json_bytes
+from ..record_io import sha256_json
 from .contracts import (
     DesignEvidenceCoverage,
     DesignEvidenceRequirement,
     characterization_evidence,
 )
+
+_MAX_REQUIREMENTS = 13
 
 
 def active_batch_safety(result: Any) -> list[Any]:
@@ -222,9 +224,7 @@ def objective_evidence(
     seen: set[str] = set()
     for comparison in characterization.comparisons:
         proposal = comparison.proposal
-        identity = hashlib.sha256(
-            canonical_json_bytes(proposal.model_dump(exclude={"rationale"}))
-        ).hexdigest()
+        identity = sha256_json(proposal.model_dump(exclude={"rationale"}))
         requirement_id = f"designQuestion:{identity}"
         if requirement_id in seen:
             raise ValueError("Objective comparisons must have unique current proposals")
@@ -292,6 +292,7 @@ def objective_evidence(
                 reasons=answer_reasons,
             )
         )
+    unrecorded: list[str] = []
     for quote, names, conditional in requested_design_questions(
         study_context, study_objective, list(records)
     ):
@@ -329,6 +330,11 @@ def objective_evidence(
                         update={"essential": True}
                     )
             continue
+        if len(requirements) >= _MAX_REQUIREMENTS:
+            # The study contract holds at most 13 requirements. Further explicit
+            # requests keep the essential design summary unresolved instead.
+            unrecorded.append(quote)
+            continue
         identifier = "requestedDesign:" + hashlib.sha256(quote.encode()).hexdigest()
         requirements.append(
             DesignEvidenceRequirement(
@@ -348,9 +354,20 @@ def objective_evidence(
                 ],
             )
         )
-    if len(requirements) > 13:
-        raise ValueError(
-            "Objective requirements permit one design summary and eight plus four questions"
+    if unrecorded:
+        design = coverage[0]
+        coverage[0] = design.model_copy(
+            update={
+                "status": "failed" if design.status == "failed" else "unsupported",
+                "reasons": [
+                    *design.reasons,
+                    *(
+                        "Explicitly requested joint or conditional comparison was not "
+                        f"measured: {quote}"
+                        for quote in unrecorded
+                    ),
+                ],
+            }
         )
     return requirements, coverage
 

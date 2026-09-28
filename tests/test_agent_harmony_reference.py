@@ -121,7 +121,6 @@ def test_real_harmony_comparison_measures_batch_and_biological_preservation(
         batchColumns=("batch",),
         preservationColumns=("population",),
         columnKinds={"batch": "categorical", "population": "categorical"},
-        harmonyAuthorized=True,
         maxCandidates=2,
         minClusterCells=10,
     )

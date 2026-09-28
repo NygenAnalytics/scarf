@@ -7,6 +7,7 @@ from scarf.storage.artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
     artifact_plan_scope,
+    artifact_transaction,
     finish_artifact,
     plan_artifact,
     reused_artifact_group,
@@ -250,26 +251,60 @@ def test_exact_dtype_requirement_prevents_reuse() -> None:
     assert not exact.reused
 
 
-def test_planned_artifact_invalidated_forces_new_ref() -> None:
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    arguments = {
-        "scope": "assay",
-        "assay": "RNA",
-        "kind": "normalized",
-        "operation": "run_normalization",
-        "parameters": {"log_transform": True},
-        "inputs": {"selection": {"artifact_id": "e" * 64}},
-        "execution_options": {"batch_size": 50},
-    }
-    planned = plan_artifact(root, **arguments)
-    group = start_artifact(root, planned)
-    group.create_array("data", data=np.array([1.0, 2.0, 3.0]))
-    finish_artifact(group, planned)
+def _planned_normalized(root: zarr.Group, **extra: object):
+    return plan_artifact(
+        root,
+        scope="assay",
+        assay="RNA",
+        kind="normalized",
+        operation="run_normalization",
+        parameters={"log_transform": True},
+        inputs={},
+        execution_options={},
+        required_arrays=(ArrayRequirement("data", shape=(3,)),),
+        **extra,
+    )
 
-    reused = plan_artifact(root, **arguments)
-    assert reused.reused
-    invalidated = reused.invalidated(root)
-    assert not invalidated.reused
-    assert invalidated.ref != reused.ref
-    assert invalidated.provenance == reused.provenance
-    assert invalidated.execution_options == reused.execution_options
+
+def test_artifact_transaction_finishes_the_written_slot() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    planned = _planned_normalized(root)
+    with artifact_transaction(root, planned) as group:
+        assert not inspect_artifact(root, planned.ref).complete
+        group.create_array("data", data=np.arange(3.0))
+    assert inspect_artifact(root, planned.ref).complete
+    assert _planned_normalized(root).ref == planned.ref
+
+
+@pytest.mark.parametrize("error", [RuntimeError("write failed"), KeyboardInterrupt()])
+def test_artifact_transaction_removes_a_failed_slot(error: BaseException) -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    planned = _planned_normalized(root)
+    with pytest.raises(type(error)):
+        with artifact_transaction(root, planned) as group:
+            group.create_array("data", data=np.arange(3.0))
+            raise error
+    assert artifact_path(planned.ref) not in root
+    assert not inspect_artifact(root, planned.ref).exists
+
+
+def test_artifact_transaction_removes_a_slot_that_fails_its_contract() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    planned = _planned_normalized(root)
+    with pytest.raises(ValueError, match="does not satisfy its contract"):
+        with artifact_transaction(root, planned) as group:
+            group.create_array("data", data=np.arange(4.0))
+    assert not inspect_artifact(root, planned.ref).exists
+
+
+def test_start_artifact_refuses_a_read_only_root_before_writing() -> None:
+    store = MemoryStore()
+    zarr.open_group(store=store, mode="w")
+    read_only = zarr.open_group(store=store.with_read_only(True), mode="r")
+    planned = _planned_normalized(read_only)
+    with pytest.raises(PermissionError, match=r"run_normalization.*zarr_mode='r\+'"):
+        start_artifact(read_only, planned)
+    with pytest.raises(PermissionError):
+        with artifact_transaction(read_only, planned):
+            raise AssertionError("the body must not run")
+    assert not inspect_artifact(read_only, planned.ref).exists

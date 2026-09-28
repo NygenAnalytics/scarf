@@ -2,7 +2,6 @@
 
 import json
 import math
-import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
@@ -10,10 +9,16 @@ from typing import Any, Literal, cast
 import numpy as np
 import pandas as pd
 
+from ...features.gene_families import (
+    GENE_FAMILY_PATTERNS,
+    PERCENT_FAMILIES,
+    gene_family_mask,
+)
 from ...metadata.selection import resolve_cell_aligned_artifact
 from ...quality_control.filtering import (
-    _validated_sample_labels,
     gaussian_quantile_bounds,
+    unique_label_keys,
+    validated_sample_labels,
 )
 from ...storage.artifacts import (
     fingerprint_array,
@@ -27,6 +32,7 @@ from ..cell_quality.profiles import (
     QcMetricRole,
     RegisteredCellQcProfile,
     RegisteredQcProjection,
+    _ordered_capture_masks,
     offered_registered_qc_profiles,
     project_auto_filter_profile,
     qc_metric_execution_name,
@@ -39,6 +45,7 @@ from ..tools import (
     persisted_assay_types,
 )
 from ..types import ArtifactReferenceModel
+from .characterization import _paired_coverage
 from .contracts import (
     CaptureFailureEvidence,
     CellQcAction,
@@ -427,20 +434,6 @@ def _qc_metric_sources(
             values_by_execution_name.pop(metric_source.executionName, None)
             if metric_source.metadataColumn in valid_metadata:
                 valid_metadata.remove(metric_source.metadataColumn)
-        for metric_source in artifact_sources:
-            if metric_source.artifact is None:
-                continue
-            execution_name = qc_metric_execution_name(
-                metric_source.metricName,
-                artifact_id=metric_source.artifact.artifactId,
-                collides_with_metadata=metric_source.metricName in valid_metadata,
-            )
-            if execution_name != metric_source.executionName:
-                if metric_source.executionName in values_by_execution_name:
-                    values_by_execution_name[execution_name] = (
-                        values_by_execution_name.pop(metric_source.executionName)
-                    )
-                metric_source.executionName = execution_name
         for role in expected_masks:
             if not any(
                 metric_source.metricRole == role and metric_source.usableForFiltering
@@ -450,6 +443,22 @@ def _qc_metric_sources(
                     f"The {role} percentage has no exact usable artifact; "
                     "QC conclusions cannot claim that this axis was evaluated."
                 )
+    # Execution renames an artifact metric only when it collides with a metadata
+    # metric that filtering actually uses, so evidence must name it the same way.
+    for metric_source in artifact_sources:
+        if metric_source.artifact is None:
+            continue
+        execution_name = qc_metric_execution_name(
+            metric_source.metricName,
+            artifact_id=metric_source.artifact.artifactId,
+            collides_with_metadata=metric_source.metricName in valid_metadata,
+        )
+        if execution_name != metric_source.executionName:
+            if metric_source.executionName in values_by_execution_name:
+                values_by_execution_name[execution_name] = values_by_execution_name.pop(
+                    metric_source.executionName
+                )
+            metric_source.executionName = execution_name
     for left in metadata_sources:
         for right in artifact_sources:
             if left.metricRole != right.metricRole or left.metricRole == "diagnostic":
@@ -537,30 +546,17 @@ def _qc_attributes(store: Any, assay_name: str, assay_type: str) -> list[str]:
 def _rna_percentage_feature_masks(
     store: Any, assay_name: str
 ) -> list[tuple[QcMetricRole, str, str, np.ndarray]]:
-    """Resolve symbol-defined RNA percentages without the ambiguous MT prefix."""
-    assay = store.get_assay(assay_name)
-    feature_ids = np.asarray(assay.feats.fetch_all("ids")).astype(str)
-    feature_names = np.asarray(assay.feats.fetch_all("names")).astype(str)
-    specifications: tuple[tuple[QcMetricRole, str, str], ...] = (
-        ("mitochondrial", "percentMito", r"(?i)^MT-"),
-        ("ribosomal", "percentRibo", r"(?i)^(RPS|RPL|MRPS|MRPL)"),
-    )
-    resolved = []
-    for role, suffix, pattern in specifications:
-        compiled = re.compile(pattern)
-        mask = np.fromiter(
-            (
-                compiled.search(feature_id) is not None
-                or compiled.search(feature_name) is not None
-                for feature_id, feature_name in zip(
-                    feature_ids, feature_names, strict=True
-                )
-            ),
-            dtype=bool,
-            count=assay.feats.N,
+    """Match the default RNA percentage gene families on feature names."""
+    names = np.asarray(store.get_assay(assay_name).feats.fetch_all("names")).astype(str)
+    return [
+        (
+            cast(QcMetricRole, family),
+            suffix,
+            GENE_FAMILY_PATTERNS[family],
+            gene_family_mask(names, family),
         )
-        resolved.append((role, suffix, pattern, mask))
-    return resolved
+        for suffix, family in PERCENT_FAMILIES.items()
+    ]
 
 
 def _derive_missing_percentage_artifacts(
@@ -826,21 +822,20 @@ def _capture_design_safety(
         return [], False, False
     data = deps.qcDesignData
     if not isinstance(data, _QcDesignData):
-        data = _QcDesignData(deps.cells)
-    if data.captureSource is not capture_labels:
-        data = _QcDesignData(deps.cells) if data.captureSource is not None else data
+        raise ValueError("Capture design safety requires frozen QC design data")
+    if data.captureSource is None:
         active = np.ones(len(capture_labels), dtype=bool)
-        normalized = _validated_sample_labels(
+        normalized = validated_sample_labels(
             capture_labels, active, label_name="physical capture labels"
         )
+        codes, uniques = pd.factorize(normalized)
         data.captures = np.asarray(
-            [
-                value.decode("utf-8") if isinstance(value, bytes) else str(value)
-                for value in normalized
-            ],
+            unique_label_keys(uniques, label_name="Physical capture labels"),
             dtype=object,
-        )
+        )[codes]
         data.captureSource = capture_labels
+    elif data.captureSource is not capture_labels:
+        raise ValueError("QC design data belongs to another capture source")
     if capture not in data.exclusions:
         data.exclusions[capture] = _compute_capture_design_safety(
             data, characterization, deps.protectedCombinations, capture
@@ -1005,42 +1000,28 @@ def _compute_capture_design_safety(
         complete_pairs = 0
         incomplete_pairs = 0
         duplicate_pair_groups = 0
-        single_group_pairs = 0
-        if independent_values is not None:
-            pair_groups: dict[str, dict[str, set[str]]] = {}
-            for _, pair_group, observation_value, pair in remaining_units:
-                if pair is None or pair_group is None or observation_value is None:
-                    continue
-                pair_groups.setdefault(pair, {}).setdefault(pair_group, set()).add(
-                    observation_value
-                )
-            required_set = set(required_groups)
-            for groups in pair_groups.values():
-                if len(groups) == 1:
-                    single_group_pairs += 1
-                duplicate_pair_groups += sum(
-                    len(observations) > 1 for observations in groups.values()
-                )
-                if set(groups) == required_set and all(
-                    len(observations) == 1 for observations in groups.values()
-                ):
-                    complete_pairs += 1
-                else:
-                    incomplete_pairs += 1
         original_pair_design = dict(record.get("pairedCoverage") or {}).get("design")
-        pair_structure_safe = (
-            True
-            if independent_values is None
-            else (
-                complete_pairs >= 2
-                and incomplete_pairs == 0
-                and duplicate_pair_groups == 0
+        pair_structure_safe = True
+        if independent_values is not None:
+            # One design row per remaining observation unit, as in characterization.
+            rows = dict.fromkeys(
+                (group, observation_value, pair)
+                for _, group, observation_value, pair in remaining_units
+                if observation_value is not None
             )
-            if original_pair_design == "paired"
-            else (len(pair_groups) >= 2 and single_group_pairs == len(pair_groups))
-            if original_pair_design == "betweenIndependentUnits"
-            else False
-        )
+            pair_coverage = _paired_coverage(
+                pd.DataFrame(list(rows), columns=["group", "observation", "pair"]),
+                coefficient="group",
+                pair_by="pair",
+                group_order=required_groups,
+            )
+            complete_pairs = pair_coverage["completePairs"]
+            incomplete_pairs = pair_coverage["incompletePairs"]
+            duplicate_pair_groups = pair_coverage["duplicatePairGroups"]
+            pair_structure_safe = original_pair_design in {
+                "paired",
+                "betweenIndependentUnits",
+            } and (pair_coverage["design"] == original_pair_design)
         preserves_units = (
             preserves_conditions and minimum_units >= 2 and pair_structure_safe
         )
@@ -1121,25 +1102,10 @@ def _compute_capture_design_safety(
 def _capture_source_missingness(
     sources: Sequence[QcMetricSourceEvidence],
     values_by_source: Mapping[str, np.ndarray],
-    capture_labels: np.ndarray | None,
+    captures: Sequence[tuple[str, np.ndarray]],
 ) -> list[QcMetricSourceEvidence]:
-    if capture_labels is None:
+    if not captures:
         return list(sources)
-    active = np.ones(len(capture_labels), dtype=bool)
-    normalized = _validated_sample_labels(
-        capture_labels,
-        active,
-        label_name="physical capture labels",
-    )
-    captures: list[tuple[str, np.ndarray]] = []
-    seen: set[str] = set()
-    for raw in normalized:
-        value = raw.item() if isinstance(raw, np.generic) else raw
-        key = value.decode("utf-8") if isinstance(value, bytes) else str(value)
-        if key in seen:
-            continue
-        seen.add(key)
-        captures.append((key, normalized == value))
     output: list[QcMetricSourceEvidence] = []
     for source in sources:
         values = values_by_source.get(source.sourceId)
@@ -1217,13 +1183,9 @@ def _design_retention(
     keep: np.ndarray,
 ) -> dict[str, Any]:
     """Check exact categorical conditions, units, and protected joint groups."""
-    cells = (
-        deps.qcDesignData
-        if isinstance(deps.qcDesignData, _QcDesignData)
-        else deps.cells
-        if deps.cells is not None
-        else deps.store.cells
-    )
+    cells = deps.qcDesignData
+    if not isinstance(cells, _QcDesignData):
+        raise ValueError("QC retention requires frozen QC design data")
     retention_columns: list[str] = []
     if characterization is not None:
         kinds = {
@@ -1243,14 +1205,7 @@ def _design_retention(
     unsafe_groups: list[str] = []
     retained = np.asarray(keep, dtype=bool) & np.asarray(active, dtype=bool)
     for column in dict.fromkeys(retention_columns):
-        labels = (
-            cells.encoded(column)
-            if isinstance(cells, _QcDesignData)
-            else np.asarray(
-                [_provenance_label(value) for value in cells.fetch(column)],
-                dtype=object,
-            )
-        )
+        labels = cells.encoded(column)
         if labels.shape != retained.shape:
             raise ValueError(
                 f"QC retention column {column!r} does not align with cellSelection"
@@ -1259,25 +1214,21 @@ def _design_retention(
         present = labels != None  # noqa: E711
         if (np.asarray(active, dtype=bool) & ~present).any():
             unsafe_groups.append(f"{column}:missingValues")
-        for raw_label in np.unique(labels[np.asarray(active, dtype=bool) & present]):
-            label = raw_label.item() if isinstance(raw_label, np.generic) else raw_label
-            key = label.decode("utf-8") if isinstance(label, bytes) else str(label)
+        observed = np.unique(labels[np.asarray(active, dtype=bool) & present])
+        keys = unique_label_keys(
+            observed, label_name=f"QC retention column {column!r} labels"
+        )
+        for raw_label, key in zip(observed, keys, strict=True):
             count = int((retained & (labels == raw_label)).sum())
             counts[key] = count
             if count == 0:
                 unsafe_groups.append(f"{column}={key}")
         retained_by_column[column] = counts
-    from .comparisons import combination_labels
-
     retained_by_combination: dict[str, dict[str, int]] = {}
     for columns in deps.protectedCombinations:
         key = json.dumps(columns, separators=(",", ":"))
         try:
-            labels = (
-                cells.combined(columns)
-                if isinstance(cells, _QcDesignData)
-                else combination_labels(cells, columns)
-            )
+            labels = cells.combined(columns)
         except (KeyError, ValueError):
             unsafe_groups.append(f"combination:{key}:missingValues")
             continue
@@ -1567,6 +1518,7 @@ def _sample_qc_profiles(
     metric_sources: list[QcMetricSourceEvidence],
     source_concordance: list[QcSourceConcordance],
     capture: tuple[str | None, NamedArtifactSource | None, np.ndarray] | None,
+    notes: list[str],
 ) -> list[CellQcProfileEvidence]:
     """Build core-parity sample MAD profiles from exact grouping sources."""
     attributes = list(values_by_attr)
@@ -1634,7 +1586,15 @@ def _sample_qc_profiles(
                 n_mads=3.0,
                 min_cells_per_sample=20,
             )
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:
+            source_label = (
+                sample_column
+                if sample_column is not None
+                else sample_artifact.name
+                if sample_artifact is not None
+                else "grouping"
+            )
+            notes.append(f"Sample MAD QC by {source_label!r} is unavailable: {exc}")
             continue
         profile_id = _qc_profile_id(
             "sampleMad",
@@ -1711,9 +1671,7 @@ def _offered_qc_profiles(
 ) -> list[CellQcProfileEvidence]:
     """Share frozen design summaries across policies, never across changed inputs."""
     previous = deps.qcDesignData
-    deps.qcDesignData = _QcDesignData(
-        deps.cells if deps.cells is not None else deps.store.cells
-    )
+    deps.qcDesignData = _QcDesignData(deps.cells)
     try:
         return _project_qc_profiles(deps, characterization)
     finally:
@@ -1769,23 +1727,15 @@ def _project_qc_profiles(
     capture = _directed_capture_source(deps)
     capture_column: str | None = None
     capture_artifact: NamedArtifactSource | None = None
-    capture_labels: np.ndarray | None = None
-    capture_sizes: dict[str, int] = {}
+    captures: list[tuple[str, np.ndarray]] = []
     if capture is not None:
         capture_column, capture_artifact, capture_labels = capture
-        normalized = _validated_sample_labels(
-            capture_labels,
-            active,
-            label_name="physical capture labels",
-        )
-        for raw in normalized:
-            value = raw.item() if isinstance(raw, np.generic) else raw
-            key = value.decode("utf-8") if isinstance(value, bytes) else str(value)
-            capture_sizes[key] = capture_sizes.get(key, 0) + 1
+        captures = _ordered_capture_masks(capture_labels, active)
+    capture_sizes = {key: int(mask.sum()) for key, mask in captures}
     metric_sources = _capture_source_missingness(
         metric_sources,
         values_by_source,
-        capture_labels,
+        captures,
     )
     deps.qcMetricSources = metric_sources
     deps.qcSourceConcordance = source_concordance
@@ -1838,6 +1788,7 @@ def _project_qc_profiles(
             metric_sources,
             source_concordance,
             capture,
+            attribute_notes,
         )
     )
     profiles.extend(

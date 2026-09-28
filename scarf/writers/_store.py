@@ -1,24 +1,29 @@
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from typing import Any
 
 import numpy as np
 import zarr
 
 from ..storage.arrays import (
+    MISSING_MASK_PREFIX,
     create_zarr_dataset as _create_zarr_dataset,
     create_zarr_obj_array as _create_zarr_obj_array,
 )
 from ..storage.schema import (
-    create_cell_data as _create_cell_data,
     create_zarr_count_assay as _create_zarr_count_assay,
-    load_count_array as _load_count_array,
 )
 from ..storage.count_matrix import CountMatrixPolicy
 from ..storage.profiles import StorageProfile
-from ..storage.stores import load_zarr as load_zarr
+from ..storage.refs import ArtifactRef
 from ..utils.logging import logger
 
 RESERVED_METADATA_COLUMNS = frozenset({"I", "ids", "names"})
+DEFAULT_IMPORT_BLOCK_ROWS = 65_536
+
+
+def is_reserved_metadata_name(name: str) -> bool:
+    """Return whether a source column name collides with Scarf's own columns."""
+    return name in RESERVED_METADATA_COLUMNS or name.startswith(MISSING_MASK_PREFIX)
 
 
 def skip_reserved_metadata_columns[T](
@@ -28,8 +33,9 @@ def skip_reserved_metadata_columns[T](
     """Yield source metadata columns except those with reserved names.
 
     Scarf writes its own ``ids``, ``names``, and ``I`` columns into every cell
-    and feature table. A source column with one of these names is skipped with
-    a warning so that it cannot replace the identifiers or the filter column.
+    and feature table and links missing-value masks through columns named
+    ``__scarf_missing__<name>``. A source column that would replace one of
+    them is skipped with a warning.
 
     Args:
         columns: Pairs of source column name and payload.
@@ -39,13 +45,209 @@ def skip_reserved_metadata_columns[T](
         The pairs whose names are not reserved.
     """
     for name, payload in columns:
-        if name in RESERVED_METADATA_COLUMNS:
+        if is_reserved_metadata_name(name):
             logger.warning(
                 f"Skipped source {axis} metadata column {name!r} because Scarf "
-                "reserves the column names 'I', 'ids', and 'names'"
+                "reserves the column names 'I', 'ids', and 'names' and the "
+                f"prefix {MISSING_MASK_PREFIX!r}"
             )
             continue
         yield name, payload
+
+
+def decode_text(value: Any) -> str:
+    """Return a string value, decoding byte strings as UTF-8."""
+    if isinstance(value, bytes | np.bytes_):
+        try:
+            return bytes(value).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Text values must be valid UTF-8") from exc
+    if isinstance(value, str | np.str_):
+        return str(value)
+    raise TypeError(f"Expected text, found {type(value).__name__}")
+
+
+def _is_missing_value(value: Any) -> bool:
+    return value is None or (
+        isinstance(value, float | np.floating) and bool(np.isnan(value))
+    )
+
+
+def _stored_values(values: np.ndarray, missing: np.ndarray) -> np.ndarray:
+    """Return a typed column whose masked rows hold a placeholder."""
+    if values.dtype.kind == "O":
+        present = values[~missing]
+        if present.size and all(isinstance(v, bool | np.bool_) for v in present):
+            dtype: Any = np.dtype(bool)
+        elif present.size and all(
+            isinstance(v, int | np.integer) and not isinstance(v, bool | np.bool_)
+            for v in present
+        ):
+            dtype = np.dtype(np.int64)
+        elif present.size and all(
+            isinstance(v, int | float | np.number)
+            and not isinstance(v, bool | np.bool_)
+            for v in present
+        ):
+            dtype = np.dtype(np.float64)
+        else:
+            text = [
+                ""
+                if absent
+                else (
+                    decode_text(value)
+                    if isinstance(value, bytes | np.bytes_ | str | np.str_)
+                    else str(value)
+                )
+                for value, absent in zip(values, missing, strict=True)
+            ]
+            width = max((len(value) for value in text), default=1)
+            return np.asarray(text, dtype=f"U{max(width, 1)}")
+        stored = np.zeros(values.shape, dtype=dtype)
+        stored[~missing] = np.asarray(present.tolist(), dtype=dtype)
+        return stored
+    if values.dtype.kind in "SU":
+        text = [
+            "" if absent else decode_text(value)
+            for value, absent in zip(values, missing, strict=True)
+        ]
+        width = max((len(value) for value in text), default=1)
+        return np.asarray(text, dtype=f"U{max(width, 1)}")
+    stored = values.copy()
+    stored[missing] = np.nan if values.dtype.kind in "fc" else 0
+    return stored
+
+
+def write_metadata_column(
+    group: zarr.Group,
+    name: str,
+    values: Any,
+    missing: Any = None,
+    *,
+    profile: StorageProfile | None = None,
+) -> None:
+    """Write one metadata column and link a missing-value mask when needed.
+
+    Args:
+        group: Destination metadata group.
+        name: Column name.
+        values: One value per row.
+        missing: Rows to flag as missing. When None, ``None`` and NaN entries
+            of an object array are missing.
+        profile: Zarr encoding profile. When None, chosen from the store.
+
+    Raises:
+        ValueError: If the values are not one-dimensional or the mask does not
+            align with them.
+    """
+    from ..storage.arrays import MetadataBlock, create_streamed_metadata_column
+
+    array = np.asarray(values)
+    if array.ndim != 1:
+        raise ValueError(
+            f"Metadata column {name!r} must hold one value per row; "
+            f"found shape {array.shape}"
+        )
+    if missing is not None:
+        mask = np.asarray(missing, dtype=bool)
+    elif array.dtype.kind == "O":
+        mask = np.fromiter(
+            (_is_missing_value(value) for value in array),
+            dtype=bool,
+            count=array.size,
+        )
+    else:
+        mask = np.zeros(array.shape, dtype=bool)
+    if mask.shape != array.shape:
+        raise ValueError(f"Metadata column {name!r} has a misaligned missing mask")
+    has_missing = bool(mask.any())
+    stored = (
+        _stored_values(array, mask) if has_missing or array.dtype.kind == "O" else array
+    )
+    if not has_missing:
+        _create_zarr_obj_array(group, name, stored, stored.dtype, profile=profile)
+        return
+    create_streamed_metadata_column(
+        group,
+        name,
+        shape=int(array.size),
+        dtype=stored.dtype,
+        blocks=(MetadataBlock(0, stored, mask),),
+        chunkSize=min(100_000, max(1, int(array.size))),
+        hasMissing=True,
+        profile=profile,
+    )
+
+
+def floating_payload_dtype(dtype: Any, label: str) -> np.dtype[Any]:
+    """Return the floating dtype that stores an imported numeric payload."""
+    source: np.dtype[Any] = np.dtype(dtype)
+    if source.kind == "f":
+        return np.dtype(source.str)
+    if source.kind in "biu":
+        return np.dtype(np.float64)
+    raise TypeError(f"{label} uses unsupported dtype {source}")
+
+
+def bounded_block_rows(
+    requested: int | None,
+    *,
+    row_bytes: int,
+    memory_bytes: int,
+) -> int:
+    """Return rows per import block within an eighth of the memory budget."""
+    bytes_per_row = max(1, int(row_bytes))
+    memory_rows = max(1, int(memory_bytes) // (8 * bytes_per_row))
+    preferred = DEFAULT_IMPORT_BLOCK_ROWS if requested is None else requested
+    return int(max(1, min(int(preferred), memory_rows)))
+
+
+def fingerprint_row_blocks(
+    blocks: Iterable[np.ndarray],
+    shape: tuple[int, ...],
+    dtype: np.dtype[Any],
+    *,
+    label: str,
+) -> str:
+    """Fingerprint row blocks of one payload, rejecting non-finite numbers."""
+    from ..storage.artifacts import ValueFingerprintBuilder
+
+    builder = ValueFingerprintBuilder()
+    builder.begin_array("values", shape, dtype)
+    start = 0
+    for block in blocks:
+        if block.dtype.kind in "fc" and not bool(np.isfinite(block).all()):
+            raise ValueError(f"{label} contains non-finite values")
+        builder.update_array_block(
+            "values",
+            (start, *(0,) * (block.ndim - 1)),
+            block,
+        )
+        start += int(block.shape[0])
+    builder.end_array("values")
+    return str(builder.hexdigest())
+
+
+def resolve_import_cell_selection(
+    root: zarr.Group,
+    *,
+    source: str,
+    inputs: Mapping[str, Any],
+) -> ArtifactRef:
+    """Return the artifact that selects every imported cell."""
+    from ..storage.selections import resolve_stored_selection_artifact
+
+    return resolve_stored_selection_artifact(
+        root,
+        table_path="cellData",
+        id_column="ids",
+        source_column="I",
+        scope="datastore",
+        kind="cell_selection",
+        operation="import_cell_selection",
+        parameters={"source": source},
+        inputs=dict(inputs),
+    )
 
 
 def create_zarr_dataset(
@@ -146,41 +348,3 @@ def create_zarr_count_assay(
         profile=profile,
         policy=policy,
     )
-
-
-def load_count_store(
-    z: zarr.Group, assay_name: str, workspace: str | None
-) -> zarr.Array:
-    """Return the counts Zarr array for an assay in the given workspace.
-
-    Args:
-        z: Root Zarr group.
-        assay_name: Assay that owns the counts array.
-        workspace: Workspace name. None uses the legacy layout.
-
-    Returns:
-        The ``counts`` array.
-    """
-    return _load_count_array(z, assay_name, workspace)
-
-
-def create_cell_data(
-    z: zarr.Group,
-    workspace: str | None,
-    ids: np.ndarray,
-    names: np.ndarray,
-    profile: StorageProfile | None = None,
-) -> zarr.Group:
-    """Create the cellData group with ids, names, and default ``I`` filter column.
-
-    Args:
-        z: Root Zarr group.
-        workspace: Workspace name. None uses the legacy layout.
-        ids: Cell identifiers.
-        names: Cell display names.
-        profile: Zarr encoding profile. When None, chosen from the store.
-
-    Returns:
-        The created ``cellData`` group.
-    """
-    return _create_cell_data(z, workspace, ids, names, profile=profile)

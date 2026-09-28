@@ -51,6 +51,18 @@ def test_require_pydantic_ai_missing_extra_hint(
     assert "uv sync --extra agent" in str(exc_info.value)
 
 
+def test_agent_runtime_disables_the_pydantic_ai_banner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pydantic_ai
+
+    from scarf.agent import _deps
+
+    monkeypatch.setattr(pydantic_ai, "BANNER_ENABLED", True)
+    assert _deps.require_pydantic_ai() is pydantic_ai
+    assert pydantic_ai.BANNER_ENABLED is False
+
+
 def test_import_scarf_does_not_load_pydantic_ai() -> None:
     script = """
 import sys

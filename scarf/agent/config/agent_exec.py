@@ -6,7 +6,7 @@ import math
 import sys
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from inspect import isawaitable, iscoroutinefunction
@@ -307,6 +307,19 @@ def _model_name(model: Any) -> str:
     return type(model).__name__
 
 
+def configured_image_input(model: Any) -> bool | None:
+    """Honor an explicit input capability without inferring it from image output."""
+    declared = getattr(model, "supports_image_input", None)
+    if isinstance(declared, bool):
+        return declared
+    profile = getattr(model, "profile", None)
+    if isinstance(profile, Mapping):
+        declared = profile.get("supports_image_input")
+        if isinstance(declared, bool):
+            return declared
+    return None
+
+
 def _normalize_model(model: Any) -> Any:
     """Avoid worker-thread deadlocks for synchronous test model callbacks."""
     from pydantic_ai.models.function import FunctionModel
@@ -501,8 +514,19 @@ def _run_info(
     provider_audit: _ProviderRequestAudit | None = None,
 ) -> AgentRunInfo:
     from pydantic import ValidationError
-    from pydantic_ai.messages import ModelResponse, RetryPromptPart, ToolCallPart
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        RetryPromptPart,
+        ToolCallPart,
+    )
 
+    # An exhausted run can end with an empty request that was never sent.
+    messages = list(messages)
+    while (
+        messages and isinstance(messages[-1], ModelRequest) and not messages[-1].parts
+    ):
+        messages.pop()
     calls = _tool_calls(messages, allowed_names=_tool_names(tools))
     reported_usage = _usage_info(usage, tool_calls=len(calls))
     if provider_audit is not None:
@@ -783,6 +807,11 @@ def run_agent_sync(
     try:
         asyncio.get_running_loop()
     except RuntimeError:
+        host_loop = False
+    else:
+        host_loop = True
+    # Run outside the probe's handler so failures do not chain its RuntimeError.
+    if not host_loop:
         return asyncio.run(execute())
 
     with ThreadPoolExecutor(max_workers=1) as pool:

@@ -681,7 +681,7 @@ def test_query_projection_reproduces_stored_reference_coordinates(
     projected = np.vstack(
         [
             mapping_operations.project_pca(block.values, reference.model)
-            for block in stream
+            for block in stream.iter_blocks()
         ]
     )
 
@@ -755,7 +755,7 @@ def test_subset_fitted_pca_center_survives_mapping_reference_reload(tmp_path, me
         projected = np.vstack(
             [
                 mapping_operations.project_pca(block.values, reference.model)
-                for block in stream
+                for block in stream.iter_blocks()
             ]
         )
         np.testing.assert_allclose(projected, expected, rtol=1e-6, atol=1e-6)

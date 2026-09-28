@@ -112,6 +112,8 @@ def test_exhausted_attempt_keeps_exact_error_usage_and_every_rejection() -> None
     assert [row.requestIndex for row in info.validationRetries] == [1, 2]
     assert all(item.response == {"value": 1} for item in info.validationRetries)
     assert "marker advantage" in info.error
+    # The synchronous host probe is not part of the model failure.
+    assert "no running event loop" not in info.error
 
 
 def test_failed_request_does_not_invent_provider_usage() -> None:

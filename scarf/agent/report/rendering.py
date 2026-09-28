@@ -464,7 +464,8 @@ def render_analysis_document(payload: Mapping[str, Any]) -> str:
         usage_note = (
             f"<p>Recorded model work: {int(usage['invocations']):,} invocations, "
             f"{int(usage.get('failedInvocations', 0)):,} failed; "
-            f"{int(usage.get('requests', 0)):,} completed responses and "
+            f"{int(usage.get('requests', 0)):,} model requests, including failed and "
+            f"retried requests, and "
             f"{int(usage.get('validationRetries', 0)):,} validation corrections. "
             f"Reported tokens: {int(usage.get('inputTokens', 0)):,} input and "
             f"{int(usage.get('outputTokens', 0)):,} output, including failed invocations.</p>"
@@ -472,8 +473,7 @@ def render_analysis_document(payload: Mapping[str, Any]) -> str:
         if usage.get("availability") != "reported":
             usage_note += (
                 "<p>Provider usage is incomplete or unavailable for some invocations. "
-                "Reported totals are known usage only; missing usage is not zero. "
-                "Failed requests without a response are not included in the response count.</p>"
+                "Reported totals are known usage only; missing usage is not zero.</p>"
             )
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">

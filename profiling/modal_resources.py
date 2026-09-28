@@ -3,31 +3,29 @@ from typing import Any
 import modal
 
 from profiling.config import PrepareResources, ProfilingConfig, StageResources
+from profiling.modal_support import MODAL_ENVIRONMENT_NAME
 
-# Modal currently requires ephemeral disk in this range (MiB).
-MIN_EPHEMERAL_DISK_MB = 524_288
-MAX_EPHEMERAL_DISK_MB = 3_145_728
-BASE_EPHEMERAL_DISK_MB = MIN_EPHEMERAL_DISK_MB
+# Every function declares this ephemeral disk (MiB), the smallest Modal allows, and
+# with_options cannot change it.
+BASE_EPHEMERAL_DISK_MB = 524_288
 
 # Mutating workers never retry. A retry can overlap an in-flight write.
 STAGE_JOB_RETRIES = 0
 
 
-def resolve_ephemeral_disk_mb(requestedMb: int) -> int:
-    if requestedMb > MAX_EPHEMERAL_DISK_MB:
+def require_base_ephemeral_disk(requestedMb: int) -> None:
+    """Refuse an ephemeralDiskMb the fixed function disk cannot provide."""
+    if requestedMb > BASE_EPHEMERAL_DISK_MB:
         raise ValueError(
-            "Requested ephemeral disk is "
-            f"{requestedMb} MiB, but Modal allows at most "
-            f"{MAX_EPHEMERAL_DISK_MB} MiB"
+            f"ephemeralDiskMb {requestedMb} exceeds the {BASE_EPHEMERAL_DISK_MB} MiB "
+            "every profiling function declares; Modal does not allow a dynamic "
+            "ephemeral_disk override"
         )
-    if requestedMb < MIN_EPHEMERAL_DISK_MB:
-        return MIN_EPHEMERAL_DISK_MB
-    return requestedMb
 
 
 def validate_modal_environment(config: ProfilingConfig) -> None:
-    if config.modalEnvironmentName != "scarf_profiling":
-        raise ValueError("Modal environment must be scarf_profiling")
+    if config.modalEnvironmentName != MODAL_ENVIRONMENT_NAME:
+        raise ValueError(f"Modal environment must be {MODAL_ENVIRONMENT_NAME}")
     environment = modal.Environment.from_name(
         config.modalEnvironmentName,
         create_if_missing=False,
@@ -49,8 +47,7 @@ def modal_function_options(
         environment_name=config.modalEnvironmentName,
         required_keys=["R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"],
     )
-    # ephemeral_disk is fixed on @app.function; with_options does not accept it.
-    _ = resolve_ephemeral_disk_mb(resources.ephemeralDiskMb)
+    require_base_ephemeral_disk(resources.ephemeralDiskMb)
     # Do not pass cloud=; pinning aws (or any provider) shrinks Modal capacity.
     return {
         "cpu": (resources.modalCpuRequest, resources.modalCpuLimit),

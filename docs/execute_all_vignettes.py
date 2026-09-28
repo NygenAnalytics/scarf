@@ -23,6 +23,7 @@ from docs.execute_vignette import (  # noqa: E402
     CacheBuildError,
     CacheToolError,
     DEFAULT_CACHE,
+    PageRunner,
     ParsedSource,
     ValidationReport,
     _publish_candidate_locked,
@@ -39,10 +40,8 @@ from docs.execute_vignette import (  # noqa: E402
     validate_cache,
 )
 
-type PageRunner = Callable[[ParsedSource, Path], Path]
 type PageRunnerFactory = Callable[[list[ParsedSource]], PageRunner]
 
-EXECUTE_SCRIPT = DOCS_ROOT / "execute_vignette.py"
 MANIFEST_VERSION = 2
 LOCAL_RUNNER_IDENTITY = "local"
 

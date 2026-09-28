@@ -1,12 +1,13 @@
 """Persistent handles for immutable mapping references."""
 
 import copy
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, cast
 
 import numpy as np
+import zarr
 
 from ..storage.artifacts import (
     ValueFingerprintBuilder,
@@ -14,7 +15,12 @@ from ..storage.artifacts import (
     canonical_bytes,
     inspect_artifact,
 )
-from ..storage.feature_selection import resolve_feature_selection
+from ..storage.feature_selection import (
+    resolve_feature_selection,
+    validate_feature_selection,
+)
+from ..storage.geometry import array_geometry
+from ..storage.partition import row_band
 from ..storage.refs import ArtifactRef, ExternalArtifactRef
 from ..storage.selections import (
     read_stored_selection_indices,
@@ -26,11 +32,55 @@ from ..metadata.rows import (
     read_metadata_rows_chunkwise,
 )
 from ..metadata.selection import valid_category_mask
+from ..utils.arrays import read_only_copy
 from .models import (
     ScaledPCAProjectionModel,
     SymphonyCorrectionModel,
-    _immutable_array,
 )
+
+MAPPING_REFERENCE_REBUILD_MESSAGE = (
+    "Rebuild it with build_mapping_reference(neighbors)."
+)
+
+
+def contract_error(
+    detail: str,
+    remedy: str = MAPPING_REFERENCE_REBUILD_MESSAGE,
+) -> ValueError:
+    """Return an error for a stored mapping artifact outside its contract."""
+    return ValueError(f"{detail}. {remedy}")
+
+
+def payload_fingerprint(
+    arrays_fingerprint: str,
+    label: str,
+    metadata: Mapping[str, Any],
+) -> str:
+    """Combine a stored-array fingerprint with an artifact's metadata."""
+    builder = ValueFingerprintBuilder()
+    builder.update_bytes("arrays", arrays_fingerprint.encode())
+    builder.update_bytes(label, canonical_bytes(metadata))
+    return builder.hexdigest()
+
+
+def iter_feature_selection_blocks(
+    root: zarr.Group,
+    assay: str,
+    feature_selection: ArtifactRef,
+) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    """Yield an assay's feature IDs and selection flags in bounded row blocks."""
+    values = validate_feature_selection(root, assay, feature_selection).values
+    ids = as_zarr_array(
+        root[f"{assay}/featureData/ids"],
+        name=f"{assay}/featureData/ids",
+    )
+    block_rows = min(
+        row_band(array_geometry(ids), unit="chunk", fallback=1),
+        row_band(array_geometry(values), unit="chunk", fallback=1),
+    )
+    for start in range(0, int(values.shape[0]), block_rows):
+        stop = min(start + block_rows, int(values.shape[0]))
+        yield np.asarray(ids[start:stop]), np.asarray(values[start:stop], dtype=bool)
 
 
 class _FrozenList(tuple):
@@ -149,18 +199,18 @@ class MappingReference:
         feature_ids = np.asarray(self.feature_ids)
         if feature_ids.ndim != 1 or feature_ids.dtype.kind not in {"O", "S", "U"}:
             raise TypeError("Mapping reference feature IDs must contain strings")
-        frozen_ids = _immutable_array(feature_ids.astype(str))
+        frozen_ids = read_only_copy(feature_ids.astype(str))
         object.__setattr__(self, "feature_ids", frozen_ids)
         object.__setattr__(self, "metadata", _freeze_metadata(self.metadata))
         object.__setattr__(
             self,
             "reference_distance_quantiles",
-            _immutable_array(np.asarray(self.reference_distance_quantiles)),
+            read_only_copy(np.asarray(self.reference_distance_quantiles)),
         )
         object.__setattr__(
             self,
             "reference_distance_values",
-            _immutable_array(np.asarray(self.reference_distance_values)),
+            read_only_copy(np.asarray(self.reference_distance_values)),
         )
 
     def current_model_digest(self) -> str:
@@ -204,10 +254,9 @@ class MappingReference:
         """Check the reference assay against the fingerprint the handle carries."""
         live = self.datastore._ensure_dataset_fingerprint(self.assay_name)
         if live != self.dataset_fingerprint:
-            raise ValueError(
+            raise contract_error(
                 f"Reference assay {self.assay_name!r} dataset fingerprint mismatch. "
-                f"Expected {self.dataset_fingerprint!r}, received {live!r}. "
-                "Rebuild it with build_mapping_reference(neighbors)."
+                f"Expected {self.dataset_fingerprint!r}, received {live!r}"
             )
 
     def _validate_cell_selection(self) -> None:
@@ -220,10 +269,7 @@ class MappingReference:
             table_path="cellData",
         )
         if selection.selected_count != self.selected_cell_count:
-            raise ValueError(
-                "The selected reference cell count has changed. Rebuild the "
-                "mapping reference with build_mapping_reference(neighbors)."
-            )
+            raise contract_error("The selected reference cell count has changed")
 
     def validate_frozen_axes(self) -> None:
         """Validate the exact stored cell and feature axes used by the reference."""
@@ -254,19 +300,13 @@ class MappingReference:
             table_path="cellData",
         )
         if indices.shape != (self.selected_cell_count,):
-            raise ValueError(
-                "The selected reference cell count has changed. Rebuild the "
-                "mapping reference with build_mapping_reference(neighbors)."
-            )
+            raise contract_error("The selected reference cell count has changed")
         values = np.asarray(
             read_metadata_rows_chunkwise(self.datastore.cells, column, indices)
         )
         missing = read_metadata_missing_rows(self.datastore.cells, column, indices)
         if values.shape != (self.selected_cell_count,):
-            raise ValueError(
-                "The selected reference cell count has changed. Rebuild the "
-                "mapping reference with build_mapping_reference(neighbors)."
-            )
+            raise contract_error("The selected reference cell count has changed")
         return values, missing
 
     def fetch_cell_column(self, column: str) -> np.ndarray:
@@ -282,15 +322,11 @@ class MappingReference:
         )
         return values, valid_category_mask(values, missing_mask=missing)
 
-    def fetch_layout(self, layout: ArtifactRef) -> np.ndarray:
-        """Fetch a two-dimensional layout from one explicit embedding artifact."""
-        from .artifact import validate_mapping_reference_binding
-
-        validate_mapping_reference_binding(self)
-        self.validate_dataset_fingerprint()
-        return self._fetch_layout(layout)
-
     def _fetch_layout(self, layout: ArtifactRef) -> np.ndarray:
+        """Fetch a two-dimensional layout from one explicit embedding artifact.
+
+        Callers validate the handle binding first.
+        """
         self.validate_frozen_axes()
         if not isinstance(layout, ArtifactRef):
             raise TypeError("layout must be an ArtifactRef")

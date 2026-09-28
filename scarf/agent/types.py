@@ -76,18 +76,6 @@ class BatchSafetyEvidence(AgentDataModel):
     evidenceId: str = ""
 
 
-class ExperimentalTuningHandoff(AgentDataModel):
-    """Validated Experimental Context inputs for Parameter Tuning."""
-
-    cellSelection: ArtifactReferenceModel | None = None
-    batchAction: BatchCorrectionAction = "needsInput"
-    batchColumns: list[str] = Field(default_factory=list)
-    preservationColumns: list[str] = Field(default_factory=list)
-    coefficientsOfInterest: list[str] = Field(default_factory=list)
-    batchSafety: list[BatchSafetyEvidence] = Field(default_factory=list)
-    evidenceIds: list[str] = Field(default_factory=list)
-
-
 class ExperimentalBiologyHandoff(AgentDataModel):
     """One explicitly selected experimental coefficient for interpretation."""
 

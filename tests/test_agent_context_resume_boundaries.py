@@ -81,12 +81,14 @@ def test_explicit_context_revision_preserves_rounds_and_complete_study_text(
             "characterization": CovariateCharacterization(
                 status="done", columns=[{"name": "condition"}, {"name": "batch"}]
             ),
+            "designRounds": rounds,
+            # Rejected calls are recorded as tool calls; only designRounds counts.
             "runInfo": AgentRunInfo(
                 agentName="context",
                 modelName="test",
                 toolCalls=[
                     ToolCallInfo(toolName="analyze_experimental_design")
-                    for _ in range(rounds)
+                    for _ in range(3)
                 ],
             ),
         }
@@ -100,7 +102,7 @@ def test_explicit_context_revision_preserves_rounds_and_complete_study_text(
         context_agent, "_derive_missing_percentage_artifacts", lambda *a, **k: []
     )
     monkeypatch.setattr(
-        context_agent,
+        tools,
         "characterize_covariates",
         lambda *a, **k: pytest.fail("A revision must reuse measured characterization"),
     )
@@ -154,7 +156,69 @@ def test_explicit_context_revision_preserves_rounds_and_complete_study_text(
     )
     assert result.status == "failed"
     assert seen == [rounds]
+    assert result.designRounds == rounds
     assert previous.model_dump(mode="json") == saved_previous
+
+
+def test_context_revision_restores_saved_design_for_capture_repair(monkeypatch):
+    store = _Store()
+    directions = {
+        "columnDomains": {"batch": "technical", "condition": "biological"},
+        "coefficientsOfInterest": ["condition"],
+        "unitsOfInference": {"condition": {"observationUnit": "sample"}},
+    }
+    previous = ExperimentalContextResult.get_blank().model_copy(
+        update={
+            "status": "needsInput",
+            "cellSelection": ArtifactReferenceModel.from_artifact_ref(
+                store.cell_selection
+            ),
+            "characterization": CovariateCharacterization(
+                status="done", columns=[{"name": "condition"}, {"name": "batch"}]
+            ),
+            "designRounds": 2,
+            "designDirections": directions,
+        }
+    )
+    previous.decision.needsInput = ["Which column identifies physical capture?"]
+    monkeypatch.setattr(
+        context_agent, "_derive_missing_percentage_artifacts", lambda *a, **k: []
+    )
+    seen = []
+
+    def inspect(**kwargs):
+        deps = kwargs["deps"]
+        analyze = next(
+            tool
+            for tool in kwargs["tools"]
+            if tool.name == "analyze_experimental_design"
+        )
+        seen.append(
+            (
+                deps.designRounds,
+                tools.capture_repair_inputs(deps),
+                tools._prepare_experimental_context_tool(
+                    SimpleNamespace(deps=deps), analyze.tool_def
+                ),
+            )
+        )
+        raise UnexpectedModelBehavior("No additional provider attempt is available")
+
+    monkeypatch.setattr(context_agent, "run_agent_sync", inspect)
+    result = context_agent.ExperimentalContextAgent(object()).run(
+        store,
+        cell_selection=store.cell_selection,
+        study_context="Samples were captured in two batches.",
+        previous_context=previous,
+    )
+    rounds, repair, exposed = seen[0]
+    assert rounds == 2
+    assert repair is not None
+    assert repair["column_domains"] == directions["columnDomains"]
+    assert repair["units_of_inference"] == directions["unitsOfInference"]
+    assert exposed is not None
+    assert result.designRounds == 2
+    assert result.designDirections == directions
 
 
 def test_saved_details_return_complete_inventory_and_policy_without_computation():

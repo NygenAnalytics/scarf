@@ -15,13 +15,26 @@ from scarf.graph.arguments import (
     LsiArguments,
     NeighborQueryArguments,
     NormalizationArguments,
+    OperationArguments,
     PcaArguments,
     artifact_input,
     execution,
     parameter,
 )
 from scarf.storage.artifact_writer import finish_artifact, start_artifact
-from scarf.storage.artifacts import ArtifactRef
+from scarf.storage.artifacts import ArtifactRef, make_provenance, provenance_hash
+
+
+def _identity(arguments: OperationArguments) -> str:
+    """Return the provenance hash an artifact plan records for ``arguments``."""
+    record = arguments.to_record()
+    return provenance_hash(
+        make_provenance(
+            operation=arguments.operation,
+            parameters=record.parameters,
+            inputs=record.inputs,
+        )
+    )
 
 
 def _ref(
@@ -92,9 +105,9 @@ def test_execution_options_do_not_change_provenance_hash() -> None:
         **(common | {"size_factor": 2000.0}),
     )
 
-    assert small_batch.provenance_hash() == invalidated.provenance_hash()
-    assert small_batch.provenance_hash() != changed_parameter.provenance_hash()
-    assert small_batch.provenance_hash() != changed_size_factor.provenance_hash()
+    assert _identity(small_batch) == _identity(invalidated)
+    assert _identity(small_batch) != _identity(changed_parameter)
+    assert _identity(small_batch) != _identity(changed_size_factor)
 
 
 def test_reduction_fingerprints_custom_loadings_as_input() -> None:
@@ -118,8 +131,8 @@ def test_reduction_fingerprints_custom_loadings_as_input() -> None:
         **common,
     )
 
-    assert first.provenance_hash() == copied.provenance_hash()
-    assert first.provenance_hash() != changed.provenance_hash()
+    assert _identity(first) == _identity(copied)
+    assert _identity(first) != _identity(changed)
     assert "value_fingerprint" in first.to_record().inputs["loadings"]
 
 
@@ -196,9 +209,9 @@ def test_reduction_batch_size_does_not_change_reuse() -> None:
     pca_small = PcaArguments(batch_size=100, **pca_common)
     pca_large = PcaArguments(batch_size=500, **pca_common)
 
-    assert scaling_small.provenance_hash() == scaling_large.provenance_hash()
-    assert lsi_small.provenance_hash() == lsi_large.provenance_hash()
-    assert pca_small.provenance_hash() == pca_large.provenance_hash()
+    assert _identity(scaling_small) == _identity(scaling_large)
+    assert _identity(lsi_small) == _identity(lsi_large)
+    assert _identity(pca_small) == _identity(pca_large)
 
 
 def test_embedding_initialization_parameters_change_provenance() -> None:
@@ -226,27 +239,17 @@ def test_embedding_initialization_parameters_change_provenance() -> None:
         kmeans_batch_size=20_000,
         **initialization_common,
     )
-    initialization_new_algorithm = EmbeddingInitializationArguments(
+    initialization_other_algorithm = EmbeddingInitializationArguments(
         batch_size=100,
-        algorithm_version="minibatch_kmeans_v3",
+        algorithm_version="minibatch_kmeans_v2",
         **initialization_common,
     )
 
-    assert (
-        initialization_small.provenance_hash() != initialization_large.provenance_hash()
-    )
-    assert (
-        initialization_small.provenance_hash()
-        != initialization_sampled.provenance_hash()
-    )
-    assert (
-        initialization_small.provenance_hash()
-        != initialization_larger_minibatch.provenance_hash()
-    )
-    assert (
-        initialization_small.provenance_hash()
-        != initialization_new_algorithm.provenance_hash()
-    )
+    assert _identity(initialization_small) != _identity(initialization_large)
+    assert _identity(initialization_small) != _identity(initialization_sampled)
+    assert _identity(initialization_small) != _identity(initialization_larger_minibatch)
+    assert initialization_small.algorithm_version == "minibatch_kmeans_v3"
+    assert _identity(initialization_small) != _identity(initialization_other_algorithm)
 
 
 def test_ann_parallel_is_normal_provenance_not_cache_policy() -> None:
@@ -271,7 +274,7 @@ def test_ann_parallel_is_normal_provenance_not_cache_policy() -> None:
         **common,
     )
 
-    assert serial.provenance_hash() != parallel.provenance_hash()
+    assert _identity(serial) != _identity(parallel)
     assert parallel.to_record().parameters["ann_parallel"] is True
 
 

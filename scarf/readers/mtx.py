@@ -1,6 +1,7 @@
 import csv
 import gc
 import gzip
+import os
 import re
 import shutil
 import stat
@@ -18,8 +19,9 @@ import pandas as pd
 from numpy.typing import DTypeLike
 from scipy.sparse import coo_matrix, csr_matrix
 
+from ..utils.arrays import cumulative_nnz, max_window_nnz
 from .cellranger import CrReader
-from ..utils.arrays import has_duplicates
+from ._text import require_unique_identifiers
 
 type MatrixOrientation = Literal["featuresByCells", "cellsByFeatures"]
 type CoordinateOrder = Literal["cellMajor", "featureMajor"]
@@ -78,6 +80,19 @@ def _is_matrix_path(name: str) -> bool:
 
 def _is_parse_matrix(name: str) -> bool:
     return _matrix_basename(name) in {"count_matrix.mtx", "dge.mtx"}
+
+
+def _is_bed_sidecar(name: str) -> bool:
+    return PurePosixPath(_without_gzip(name)).name.lower().endswith(".bed")
+
+
+def _local_absolute(path: str | Path) -> Path:
+    """Return an absolute path without resolving symbolic links.
+
+    Sidecars are matched by their names, so a symbolic link keeps the name it
+    has in its directory rather than the name of its target.
+    """
+    return Path(os.path.abspath(Path(path).expanduser()))
 
 
 def _matrix_prefix(name: str) -> str:
@@ -376,7 +391,7 @@ def _candidate_from_triplet(
 
 def inspect_mtx(source: str | Path) -> tuple[MtxCandidate, ...]:
     """Return complete Matrix Market import candidates found in one source."""
-    source_path = Path(source).expanduser()
+    source_path = _local_absolute(source)
     if not source_path.exists():
         raise FileNotFoundError(source_path)
 
@@ -408,11 +423,9 @@ def inspect_mtx(source: str | Path) -> tuple[MtxCandidate, ...]:
     else:
         directory = source_path if source_path.is_dir() else source_path.parent
         names = tuple(
-            sorted(
-                str(path.resolve()) for path in directory.iterdir() if path.is_file()
-            )
+            sorted(str(path) for path in directory.iterdir() if path.is_file())
         )
-        selected_matrix = str(source_path.resolve()) if source_path.is_file() else None
+        selected_matrix = str(source_path) if source_path.is_file() else None
         for matrix_name in (name for name in names if _is_matrix_path(name)):
             if selected_matrix is not None and matrix_name != selected_matrix:
                 continue
@@ -452,9 +465,9 @@ def _explicit_candidate(
     cell_metadata_path: str | None,
     feature_reference_path: str | None,
 ) -> MtxCandidate:
-    matrix = str(Path(matrix_path).expanduser().resolve())
-    features = str(Path(feature_path).expanduser().resolve())
-    cells = str(Path(cell_path).expanduser().resolve())
+    matrix = str(_local_absolute(matrix_path))
+    features = str(_local_absolute(feature_path))
+    cells = str(_local_absolute(cell_path))
     for path in (matrix, features, cells):
         if not Path(path).is_file():
             raise FileNotFoundError(path)
@@ -476,24 +489,16 @@ def _explicit_candidate(
             open_text=lambda name: _open_path_text(name),
         ),
         cellMetadataPath=(
-            str(Path(cell_metadata_path).expanduser().resolve())
+            str(_local_absolute(cell_metadata_path))
             if cell_metadata_path is not None
             else None
         ),
         featureReferencePath=(
-            str(Path(feature_reference_path).expanduser().resolve())
+            str(_local_absolute(feature_reference_path))
             if feature_reference_path is not None
             else None
         ),
     )
-
-
-def _require_unique(values: np.ndarray, name: str) -> None:
-    normalized = np.asarray(values, dtype=str)
-    if normalized.ndim != 1 or np.any(np.char.strip(normalized) == ""):
-        raise ValueError(f"{name} must contain non-empty one-dimensional values")
-    if has_duplicates(normalized):
-        raise ValueError(f"{name} must contain unique values")
 
 
 def _column_name(values: tuple[str, ...], preferences: tuple[str, ...]) -> str:
@@ -566,8 +571,8 @@ class _MtxEngine:
                 self._rawCellColumns,
                 self.selectedCellIdKey,
             ) = self._read_cells(cell_id_key)
-            _require_unique(self._rawFeatureIds, "Feature IDs")
-            _require_unique(self._rawCellNames, "Cell IDs")
+            require_unique_identifiers(self._rawFeatureIds, "Feature IDs")
+            require_unique_identifiers(self._rawCellNames, "Cell IDs")
 
             self.coordinateOrder = self._probe_coordinate_order()
             row_nnz: np.ndarray | None = None
@@ -647,12 +652,12 @@ class _MtxEngine:
 
     def _set_row_nnz(self, row_nnz: np.ndarray) -> None:
         self._rowNnz = np.asarray(row_nnz, dtype=np.int64)
-        cumulative = np.empty(self.nCells + 1, dtype=np.int64)
-        cumulative[0] = 0
-        np.cumsum(self._rowNnz, dtype=np.int64, out=cumulative[1:])
-        self._cumulativeRowNnz = cumulative
+        self._cumulativeRowNnz = cumulative_nnz(self._rowNnz)
 
     def _read_features(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if _is_bed_sidecar(self.candidate.featurePath):
+            ids = self._read_bed_features()
+            return ids, ids.copy(), np.full(ids.size, "Peaks", dtype=object)
         if _is_parse_matrix(self.candidate.matrixPath):
             frame = pd.read_csv(self.featurePath, compression="infer")
             columns = tuple(str(value) for value in frame.columns)
@@ -697,6 +702,38 @@ class _MtxEngine:
                 f"Feature sidecar has {ids.size} rows, expected {self.nFeatures}"
             )
         return ids, names, types
+
+    def _read_bed_features(self) -> np.ndarray:
+        """Return ``chrom:start-end`` identifiers for peak BED rows."""
+        frame = pd.read_csv(
+            self.featurePath,
+            sep="\t",
+            header=None,
+            dtype=str,
+            keep_default_na=False,
+            compression="infer",
+        )
+        if frame.shape[1] < 3:
+            raise ValueError(
+                "Peak BED sidecar must contain chrom, start, and end columns"
+            )
+        chrom = frame.iloc[:, 0].astype(str).to_numpy()
+        try:
+            start = frame.iloc[:, 1].astype(np.int64).to_numpy()
+            end = frame.iloc[:, 2].astype(np.int64).to_numpy()
+        except ValueError as exc:
+            raise ValueError(
+                "Peak BED sidecar start and end columns must hold integers"
+            ) from exc
+        ids = np.asarray(
+            [f"{c}:{s}-{e}" for c, s, e in zip(chrom, start, end, strict=True)],
+            dtype=object,
+        )
+        if ids.size != self.nFeatures:
+            raise ValueError(
+                f"Feature sidecar has {ids.size} rows, expected {self.nFeatures}"
+            )
+        return ids
 
     def _read_cells(
         self,
@@ -749,9 +786,15 @@ class _MtxEngine:
         return names, columns, selected_key
 
     def _feature_reference_columns(self) -> dict[str, np.ndarray]:
+        """Align optional feature-reference columns to the matrix features.
+
+        A 10x Feature Reference lists only Feature Barcode features, so rows of
+        other features hold ``None``. The reference never replaces the name or
+        type read from the feature sidecar.
+        """
         reference_path = self.candidate.featureReferencePath
         if reference_path is None:
-            return {"feature_type": self._rawFeatureTypes}
+            return {}
         path = self._local_path(reference_path)
         frame = pd.read_csv(path, compression="infer")
         columns = tuple(str(value) for value in frame.columns)
@@ -760,30 +803,38 @@ class _MtxEngine:
             ("id", "feature_id", "gene_id"),
         )
         reference_ids = frame[id_column].astype(str).to_numpy()
-        _require_unique(reference_ids, "Feature-reference IDs")
-        positions = {value: index for index, value in enumerate(reference_ids)}
-        missing = [value for value in self._rawFeatureIds if value not in positions]
-        extras = set(reference_ids).difference(self._rawFeatureIds)
-        if missing or extras:
+        require_unique_identifiers(reference_ids, "Feature-reference IDs")
+        unknown = sorted(set(reference_ids).difference(self._rawFeatureIds))
+        if unknown:
             raise ValueError(
-                "Feature reference must contain exactly one row for every "
-                "matrix feature ID"
+                "Feature reference lists IDs that are not matrix features: "
+                + ", ".join(unknown[:5])
             )
+        positions = {value: index for index, value in enumerate(reference_ids)}
         order = np.fromiter(
-            (positions[value] for value in self._rawFeatureIds),
+            (positions.get(str(value), -1) for value in self._rawFeatureIds),
             dtype=np.int64,
             count=self.nFeatures,
         )
-        result = {"feature_type": self._rawFeatureTypes}
+        present = order >= 0
+        result: dict[str, np.ndarray] = {}
         for name in frame.columns:
             resolved_name = str(name)
-            if resolved_name == id_column:
+            if resolved_name == id_column or resolved_name.lower() in {
+                "name",
+                "feature_type",
+            }:
                 continue
             if "/" in resolved_name or "\\" in resolved_name:
                 raise ValueError(
                     f"Feature-reference column {resolved_name!r} contains a path separator"
                 )
-            result[resolved_name] = frame[name].to_numpy()[order]
+            source = frame[name].to_numpy(dtype=object)
+            values = np.full(self.nFeatures, None, dtype=object)
+            values[present] = [
+                None if pd.isna(value) else value for value in source[order[present]]
+            ]
+            result[resolved_name] = values
         return result
 
     def _probe_coordinate_order(self) -> CoordinateOrder:
@@ -1285,14 +1336,10 @@ class _MtxEngine:
     def max_window_nnz(self, window_rows: int) -> int:
         if window_rows <= 0:
             raise ValueError("window_rows must be positive")
-        width = min(int(window_rows), self.nCells)
-        if width == 0:
-            return 0
         if self._cumulativeRowNnz is None:
+            width = min(int(window_rows), self.nCells)
             return min(self.matrixEntryCount, width * self.nFeatures)
-        return int(
-            np.max(self._cumulativeRowNnz[width:] - self._cumulativeRowNnz[:-width])
-        )
+        return max_window_nnz(self._cumulativeRowNnz, window_rows)
 
     def producer_staging_bytes(
         self,
@@ -1589,6 +1636,7 @@ class MtxReader(CrReader):
         yield from self._engine.cell_columns()
 
     def get_feature_columns(self) -> Iterator[tuple[str, np.ndarray]]:
+        yield from super().get_feature_columns()
         yield from self._engine.feature_columns()
 
     def _set_sparse_import_lines_in_mem(self, lines_in_mem: int) -> None:

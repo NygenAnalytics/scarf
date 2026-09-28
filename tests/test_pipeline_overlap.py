@@ -156,6 +156,43 @@ def test_interrupted_stage_records_the_background_stage_first() -> None:
     ]
 
 
+def test_grouped_interruption_ends_the_stage_as_that_interruption() -> None:
+    root, ledger, events = _ledger("first", "second")
+    interruption = KeyboardInterrupt("stop")
+
+    def first_stage() -> tuple[()]:
+        raise BaseExceptionGroup(
+            "workers failed",
+            [ValueError("worker"), BaseExceptionGroup("nested", [interruption])],
+        )
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        ledger.run("first", first_stage)
+
+    assert caught.value is interruption
+    assert load_pipeline_run_record(root, ledger.run_id).status == "interrupted"
+    assert _statuses(root, ledger) == {"first": "interrupted"}
+    assert [event.kind for event in events][-2:] == [
+        "stage_interrupted",
+        "pipeline_interrupted",
+    ]
+
+
+def test_grouped_failure_without_interruption_fails_the_stage() -> None:
+    root, ledger, _events = _ledger("first")
+    group = ExceptionGroup("workers failed", [ValueError("a"), ValueError("b")])
+
+    def first_stage() -> tuple[()]:
+        raise group
+
+    with pytest.raises(PipelineExecutionError) as caught:
+        ledger.run("first", first_stage)
+
+    assert caught.value.__cause__ is group
+    assert load_pipeline_run_record(root, ledger.run_id).status == "failed"
+    assert _statuses(root, ledger) == {"first": "failed"}
+
+
 def test_overlap_runs_inline_without_a_threadsafe_numba_layer(monkeypatch) -> None:
     monkeypatch.setattr(background, "threadsafe_threading_layer", lambda: False)
     root, ledger, _events = _ledger("background", "first")

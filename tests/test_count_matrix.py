@@ -1,4 +1,3 @@
-from dataclasses import replace
 from inspect import getsource
 from types import SimpleNamespace
 
@@ -19,7 +18,6 @@ from scarf.storage.count_matrix import (
     policy_from_payload,
     read_group_from_payload,
     require_count_matrix_layout,
-    validate_count_matrix_pair,
     validate_count_matrix_source,
     validate_live_count_matrix_geometry,
 )
@@ -178,7 +176,7 @@ def test_tiny_policy_is_deterministic() -> None:
     policy = CountMatrixPolicy(unitBytes=1_000, chunkBytes=100)
     first = plan_count_matrix_pair(17, 40, "uint16", policy=policy)
     second = plan_count_matrix_pair(17, 40, "uint16", policy=policy)
-    validate_count_matrix_pair(first, expected=second)
+    assert first.fingerprint == second.fingerprint
     assert first.counts.shards[1] == 40
     assert first.countsT.shards[0] % first.countsT.chunks[0] == 0
     assert first.countsT.shards[1] % first.countsT.chunks[1] == 0
@@ -209,6 +207,36 @@ def test_awkward_and_prime_widths_keep_short_last_units() -> None:
         assert plan.countsT.shards[1] % plan.countsT.chunks[1] == 0
         raw = int(plan.counts.chunks[0]) * int(plan.counts.chunks[1]) * plan.itemsize
         assert raw <= _CODEC_MAX_BYTES
+
+
+@pytest.mark.parametrize(
+    ("n_cells", "n_feats", "dtype"),
+    [
+        (17_669, 2_000, "uint32"),
+        (10_007, 20_000, "uint32"),
+        (6_212, 67_694, "uint32"),
+        (35_685, 44_950, "uint16"),
+        (1_065_471, 763, "uint16"),
+    ],
+)
+def test_awkward_cell_counts_keep_counts_t_chunks_near_the_target(
+    n_cells: int, n_feats: int, dtype: str
+) -> None:
+    # A prime or awkward cell extent once left countsT chunks one cell wide.
+    plan = plan_count_matrix_pair(n_cells, n_feats, dtype)
+    itemsize = np.dtype(dtype).itemsize
+    chunk_feats, chunk_cells = plan.countsT.chunks
+    shard_feats, shard_cells = plan.countsT.shards
+    counts_cells, counts_feats = plan.counts.chunks
+    limit = 100_000_000 // (chunk_feats * itemsize)
+
+    assert 2 * chunk_cells >= min(limit, shard_cells)
+    assert chunk_feats * chunk_cells * itemsize <= 100_000_000
+    assert shard_cells % chunk_cells == 0
+    assert shard_cells % counts_cells == 0
+    assert counts_cells * n_feats * itemsize <= 1_000_000_000
+    assert counts_cells * counts_feats * itemsize <= 100_000_000
+    assert shard_feats * shard_cells * itemsize <= 1_000_000_000
 
 
 def test_empty_matrices_persist_a_plan() -> None:
@@ -249,7 +277,7 @@ def test_policy_metadata_round_trip() -> None:
     assert stored["policy"]["unitBytes"] == 1_000_000_000
     assert stored["policy"]["chunkBytes"] == 100_000_000
     replay = plan_count_matrix_pair(10_000, 50_000, "uint16")
-    validate_count_matrix_pair(replay, expected=plan)
+    assert replay.fingerprint == plan.fingerprint
 
 
 def test_require_count_matrix_layout_rejects_read_group_mismatch() -> None:
@@ -305,44 +333,6 @@ def test_count_matrix_policy_and_validation_mismatches() -> None:
 
     policy = CountMatrixPolicy(unitBytes=2_000, chunkBytes=200)
     plan = plan_count_matrix_pair(20, 12, "uint16", policy=policy)
-    other = plan_count_matrix_pair(21, 12, "uint16", policy=policy)
-    with pytest.raises(ValueError, match="fingerprint"):
-        validate_count_matrix_pair(plan, expected=other)
-    with pytest.raises(ValueError, match="counts shape mismatch"):
-        validate_count_matrix_pair(
-            replace(plan, counts=replace(plan.counts, shape=(1, 1))),
-            expected=plan,
-        )
-    with pytest.raises(ValueError, match="countsT shape mismatch"):
-        validate_count_matrix_pair(
-            replace(plan, countsT=replace(plan.countsT, shape=(1, 1))),
-            expected=plan,
-        )
-    with pytest.raises(ValueError, match="counts chunks mismatch"):
-        validate_count_matrix_pair(
-            replace(plan, counts=replace(plan.counts, chunks=(1, 1))),
-            expected=plan,
-        )
-    with pytest.raises(ValueError, match="counts shards mismatch"):
-        validate_count_matrix_pair(
-            replace(plan, counts=replace(plan.counts, shards=(plan.counts.chunks))),
-            expected=plan,
-        )
-    with pytest.raises(ValueError, match="countsT chunks mismatch"):
-        validate_count_matrix_pair(
-            replace(plan, countsT=replace(plan.countsT, chunks=(1, 1))),
-            expected=plan,
-        )
-    with pytest.raises(ValueError, match="countsT shards mismatch"):
-        validate_count_matrix_pair(
-            replace(plan, countsT=replace(plan.countsT, shards=plan.countsT.chunks)),
-            expected=plan,
-        )
-    with pytest.raises(ValueError, match="counts dtype mismatch"):
-        validate_count_matrix_pair(
-            replace(plan, counts=replace(plan.counts, dtype=np.dtype("uint32"))),
-            expected=plan,
-        )
     with pytest.raises(ValueError, match="shape does not match"):
         validate_live_count_matrix_geometry(
             SimpleNamespace(
@@ -478,5 +468,4 @@ def test_create_product_counts_array_rejects_zarr_v2() -> None:
             profile="cloud",
             zarrFormat=2,
         )
-    empty = count_array_spec(0, 4, dtype="uint16", profile="cloud", zarrFormat=2)
-    assert empty.chunks == (1, 1)
+    assert count_array_spec(0, 4, dtype="uint16", profile="cloud").chunks == (1, 1)

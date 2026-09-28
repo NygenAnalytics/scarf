@@ -79,6 +79,8 @@ class StudyContract(AgentDataModel):
             raise ValueError("A condition column cannot be the physical capture")
         if set(self.technicalBatchColumns).intersection(self.conditionColumns):
             raise ValueError("Technical batch columns cannot also be condition columns")
+        if set(self.technicalBatchColumns).intersection(self.protectedColumns):
+            raise ValueError("Technical batch columns cannot also be protected columns")
         if self.correctionLicense == "safe" and not self.technicalBatchColumns:
             raise ValueError("A safe correction license requires batch columns")
         if any(

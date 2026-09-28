@@ -1,6 +1,5 @@
 """Controller for one resumable RNA analysis with checkpoint-owned state."""
 
-import hashlib
 import time
 import uuid
 from collections.abc import Mapping
@@ -11,17 +10,22 @@ import zarr
 
 from ...datastore.datastore import DataStore
 from ...datastore.summary import summarize_zarr_readonly
+from ...metadata.rows import metadata_column_fingerprint
 from ...utils.logging import logger
 from .. import record_io
-from ..config.agent_exec import describe_agent_error
+from ..config.agent_exec import (
+    _model_name,
+    configured_image_input,
+    describe_agent_error,
+)
 from ..experimental_context.study import StudyContract, validate_objective_evidence
 from ..ingest import IngestResult, detect_format, ingest
+from ..ingest.common import default_convert_destination
 from ..ingest.manifest import DatasetManifest, inspect_h5ad_manifest
 from . import journal
 from .context import ContextStagesMixin, _dataset_columns
 from .finalization import FinalizationStagesMixin
 from .models import (
-    _STAGE_ORDER,
     AutomatedWorkflowConfig,
     AutomatedWorkflowRequest,
     AutomatedWorkflowResult,
@@ -31,6 +35,9 @@ from .models import (
     WorkflowIdentity,
     WorkflowNeedsInput,
     WorkflowQuestion,
+    WorkflowStageAttempt,
+    WorkflowStageLink,
+    WorkflowStageName,
 )
 from .preprocessing import PreprocessingStagesMixin
 from .rna import (
@@ -43,23 +50,23 @@ from .rna import (
 from .tuning import TuningStagesMixin
 
 
-def _model_identity(model: Any) -> str:
-    from ..config.agent_exec import _model_name
+def _identity_value(value: Any) -> str:
+    """Describe a setting that has no JSON form, such as an HTTP timeout object."""
+    return f"{type(value).__module__}.{type(value).__qualname__}:{value!r}"
 
+
+def _model_identity(model: Any) -> str:
     settings = getattr(model, "settings", None) or {}
     provider = getattr(model, "provider", None)
-    profile = getattr(model, "profile", None)
-    image_input = getattr(model, "supports_image_input", None)
-    if not isinstance(image_input, bool) and isinstance(profile, Mapping):
-        image_input = profile.get("supports_image_input")
     identity = {
         "settings": settings,
         "system": getattr(model, "system", None),
         "provider": getattr(provider, "name", None),
         "baseUrl": str(getattr(provider, "base_url", "")),
-        "supportsImageInput": image_input if isinstance(image_input, bool) else None,
+        "supportsImageInput": configured_image_input(model),
     }
-    digest = hashlib.sha256(record_io.canonical_json_bytes(identity)).hexdigest()
+    # JSON values keep their digests; only values without a JSON form use their repr.
+    digest = record_io.sha256_json(identity, default=_identity_value)
     return f"{type(model).__module__}.{type(model).__qualname__}:{_model_name(model)}:{digest}"
 
 
@@ -68,7 +75,7 @@ def _submitted_identity(request: AutomatedWorkflowRequest) -> str:
     value["sourcePath"] = str(Path(request.sourcePath).resolve())
     if request.zarrPath is not None:
         value["zarrPath"] = str(Path(request.zarrPath).resolve())
-    return hashlib.sha256(record_io.canonical_json_bytes(value)).hexdigest()
+    return record_io.sha256_json(value)
 
 
 def _source_identity(path: str) -> dict[str, Any]:
@@ -91,8 +98,6 @@ def _data_identity(
     feature_columns: list[str] | None = None,
 ) -> dict[str, Any]:
     """Bind the persisted dataset identity and the remaining metadata columns."""
-    from ..parameter_tuning.execution import _metadata_column_fingerprint
-
     assay = store.get_assay(assay_name)
     cell_covered, feature_covered = _dataset_columns(assay_name)
     names = sorted(
@@ -109,13 +114,87 @@ def _data_identity(
         "assay": assay_name,
         "datasetFingerprint": store._ensure_dataset_fingerprint(assay_name),
         "featureMetadata": {
-            name: _metadata_column_fingerprint(assay.feats, name)
+            name: metadata_column_fingerprint(assay.feats, name)
             for name in feature_names
         },
         "metadata": {
-            name: _metadata_column_fingerprint(store.cells, name) for name in names
+            name: metadata_column_fingerprint(store.cells, name) for name in names
         },
     }
+
+
+def _latest_stage(request: AutomatedWorkflowResumeRequest) -> WorkflowStageName:
+    """Name the most recently started stage for a result that failed before running."""
+    try:
+        root = zarr.open_group(request.zarrPath, mode="r")
+        active = root if request.workspace is None else root[request.workspace]
+        if not isinstance(active, zarr.Group):
+            return "ingest"
+        prefix = record_io.join_key(active.path, "agents", "orchestrations")
+        starts = journal.workflow_starts(active, prefix, request.workflowRunId)
+    except (OSError, KeyError, NotImplementedError, ValueError):
+        return "ingest"
+    return starts[-1].stage if starts else "ingest"
+
+
+def _answerable_pause(
+    store: DataStore,
+    prefix: str,
+    workflow: WorkflowIdentity,
+    latest: Mapping[str, Any] | None,
+    answers: Mapping[str, Any],
+) -> WorkflowStageAttempt | None:
+    """Return the pause that answers resolve, including one whose answer failed."""
+    if latest is None:
+        return None
+    if latest["status"] == "needsInput":
+        return WorkflowStageAttempt.model_validate(
+            {k: v for k, v in latest.items() if k not in {"report", "decisions"}}
+        )
+    answered = latest["inputs"].get("answeredAttempt")
+    if (
+        latest["status"] != "failed"
+        or not answers
+        or not isinstance(answered, Mapping)
+        # Tuning commits accepted answers per review and re-pauses on rejection.
+        or latest["stage"] == "parameter_tuning"
+    ):
+        return None
+    # A corrected answer replaces one whose answering attempt failed.
+    link = WorkflowStageLink.model_validate(answered)
+    if link.stage != latest["stage"]:
+        return None
+    return next(
+        (
+            value
+            for value in journal._stage_outcomes(
+                store.zw, prefix, workflow.workflowRunId, link.stage
+            )
+            if value.status == "needsInput" and journal._parent_link(value) == link
+        ),
+        None,
+    )
+
+
+def _validate_resume_answers(
+    paused: WorkflowStageAttempt, answers: Mapping[str, Any]
+) -> None:
+    """Reject answers whose shape is invalid before any stage attempt records them."""
+    errors = journal._resume_answer_errors(paused, answers)
+    if errors:
+        raise ValueError("; ".join(errors))
+    directions = answers.get("experimentalDirections")
+    if isinstance(directions, Mapping):
+        validate_rna_directions(directions)
+    if paused.stage == "parameter_tuning" and "parameter_tuning" in answers:
+        from .rna_tuning import TuningAction
+
+        try:
+            TuningAction.model_validate(answers["parameter_tuning"])
+        except ValueError as exc:
+            raise ValueError(
+                f"Resume answer for 'parameter_tuning' is not a valid assessment: {exc}"
+            ) from exc
 
 
 class AgentOrchestrator(
@@ -159,7 +238,11 @@ class AgentOrchestrator(
         submitted = request
         try:
             validate_rna_request_fields(request)
-        except ValueError as exc:
+            # Every identity saved with the request must exist before any conversion.
+            _model_identity(self.model)
+            _submitted_identity(request)
+            journal._sha256_model(self.config)
+        except (TypeError, ValueError) as exc:
             return AutomatedWorkflowResult(notes=[describe_agent_error(exc)])
         reused = self._reuse_or_resume(request)
         if reused is not None:
@@ -403,7 +486,7 @@ class AgentOrchestrator(
             + (f"; ignored other assays {ignored}" if ignored else "")
         )
         workflow = WorkflowIdentity(uuid.uuid4().hex, effective_request.workspace)
-        request_record = self.initialize_request(
+        request_record = self._request_record(
             store, workflow, effective_request, submitted
         )
         prefix = journal._ensure_orchestration_store(store)
@@ -414,6 +497,12 @@ class AgentOrchestrator(
             request_record,
             ingest_result,
             dataset_manifest,
+        )
+        # The request commits the workflow, so every resumable history has its ingest.
+        journal._write_model_once(
+            store.zw,
+            journal._request_key(prefix, workflow.workflowRunId),
+            request_record,
         )
         return self._continue(
             store,
@@ -431,13 +520,8 @@ class AgentOrchestrator(
             destination = Path(request.zarrPath)
         elif fmt == "zarr":
             destination = source
-        elif source.is_dir():
-            destination = source.with_name(source.name + ".zarr")
         else:
-            source_stem = (
-                source.with_suffix("") if source.suffix.lower() == ".gz" else source
-            )
-            destination = source_stem.with_suffix(".zarr")
+            destination = default_convert_destination(source)
         if not destination.exists():
             return None
         root = zarr.open_group(str(destination), mode="r")
@@ -482,14 +566,14 @@ class AgentOrchestrator(
             )
         return None
 
-    def initialize_request(
+    def _request_record(
         self,
         store: DataStore,
         workflow: WorkflowIdentity,
         request: AutomatedWorkflowRequest,
         submitted: AutomatedWorkflowRequest | None = None,
     ) -> OrchestrationRequestRecord:
-        prefix = journal._ensure_orchestration_store(store)
+        """Build the immutable request record that is saved after the ingest stage."""
         if request.primaryAssay is None:
             raise ValueError("RNA selection must be resolved before saving the request")
         identity = {
@@ -507,13 +591,9 @@ class AgentOrchestrator(
             modelIdentity=_model_identity(self.model),
             inputIdentity=identity,
         )
-        record = record.model_copy(
+        return record.model_copy(
             update={"contentSha256": journal._record_checksum(record)}
         )
-        journal._write_model_once(
-            store.zw, journal._request_key(prefix, workflow.workflowRunId), record
-        )
-        return record
 
     def load_request_for_resume(
         self, request: AutomatedWorkflowResumeRequest
@@ -551,6 +631,7 @@ class AgentOrchestrator(
             result = self._resume(request)
         except Exception as exc:
             result = AutomatedWorkflowResult(
+                currentStage=_latest_stage(request),
                 zarrPath=request.zarrPath,
                 workspace=request.workspace,
                 workflowRunId=request.workflowRunId,
@@ -602,66 +683,40 @@ class AgentOrchestrator(
         stages = snapshot["stages"]
         latest = stages[-1] if stages else None
         prefix = journal._orchestration_prefix(store)
-        starts = [
-            value
-            for stage in _STAGE_ORDER
-            for value in journal._stage_starts(
-                store.zw, prefix, workflow.workflowRunId, stage
-            )
-        ]
-        latest_start = (
-            max(starts, key=lambda value: value.startedAtNs) if starts else None
-        )
+        starts = journal.workflow_starts(store.zw, prefix, workflow.workflowRunId)
+        latest_start = starts[-1] if starts else None
         answers = dict(request.answers)
         resume_record = None
-        if latest is not None and latest["status"] == "needsInput":
-            from .models import WorkflowStageAttempt
-
-            outcome = WorkflowStageAttempt.model_validate(
-                {k: v for k, v in latest.items() if k not in {"report", "decisions"}}
-            )
-            answered = journal._parent_link(outcome)
+        paused = _answerable_pause(store, prefix, workflow, latest, answers)
+        if paused is not None:
+            answered = journal._parent_link(paused)
             if (
                 not answers
                 and latest_start is not None
-                and latest_start.startedAtNs > outcome.startedAtNs
+                and latest_start.startedAtNs > paused.startedAtNs
+                and latest_start.inputs.get("answeredAttempt")
+                == answered.model_dump(mode="json")
             ):
-                if latest_start.inputs.get("answeredAttempt") == answered.model_dump(
-                    mode="json"
-                ):
-                    answers = dict(latest_start.inputs.get("resumeAnswers", {}))
-            if not answers and outcome.stage != "parameter_tuning":
-                return journal.paused_or_failed_result(store, workflow, record, outcome)
+                answers = dict(latest_start.inputs.get("resumeAnswers", {}))
+            if not answers and paused.stage != "parameter_tuning":
+                return journal.paused_or_failed_result(store, workflow, record, paused)
             if answers:
-                errors = journal._resume_answer_errors(outcome, answers)
-                if errors:
-                    raise ValueError("; ".join(errors))
-                assert outcome.needsInput is not None
+                _validate_resume_answers(paused, answers)
                 resume_record = OrchestrationResumeRecord(
-                    workflowRunId=workflow.workflowRunId,
-                    answeredAttempt=answered,
-                    answers=answers,
-                    questionIds=[q.questionId for q in outcome.needsInput.questions],
+                    answeredAttempt=answered, answers=answers
                 )
             # Tuning replays committed actions and budgets. With no answer it
             # preserves a scientific defer, but retries an uncommitted assessment.
         elif answers:
             raise ValueError("Resume answers require an exact pending stage")
         elif latest_start is not None and latest_start.inputs.get("resumeAnswers"):
-            from .models import WorkflowStageLink
-
             answers = dict(latest_start.inputs["resumeAnswers"])
             resume_record = OrchestrationResumeRecord(
-                workflowRunId=workflow.workflowRunId,
                 answeredAttempt=WorkflowStageLink.model_validate(
                     latest_start.inputs["answeredAttempt"]
                 ),
                 answers=answers,
-                questionIds=list(answers),
             )
-        directions = answers.get("experimentalDirections")
-        if isinstance(directions, Mapping):
-            validate_rna_directions(directions)
         return self._continue(
             store, workflow, record, answers=answers, resume_record=resume_record
         )
@@ -694,6 +749,14 @@ class AgentOrchestrator(
         answers: Mapping[str, Any],
         resume_record: OrchestrationResumeRecord | None = None,
     ) -> AutomatedWorkflowResult:
+        prefix = journal._orchestration_prefix(store)
+        earlier = {
+            value.attemptId
+            for value in journal.workflow_starts(
+                store.zw, prefix, workflow.workflowRunId
+            )
+        }
+        progress: list[WorkflowStageName] = ["ingest"]
         try:
             return self._execute_stages(
                 store,
@@ -701,19 +764,18 @@ class AgentOrchestrator(
                 request_record,
                 answers=answers,
                 resume_record=resume_record,
+                progress=progress,
             )
         except Exception as exc:
-            prefix = journal._orchestration_prefix(store)
-            starts = [
+            # Close only a stage this invocation opened; older orphans keep their history.
+            opened = [
                 value
-                for stage in _STAGE_ORDER
-                for value in journal._stage_starts(
-                    store.zw, prefix, workflow.workflowRunId, stage
+                for value in journal.workflow_starts(
+                    store.zw, prefix, workflow.workflowRunId
                 )
+                if value.attemptId not in earlier
             ]
-            latest = (
-                max(starts, key=lambda value: value.startedAtNs) if starts else None
-            )
+            latest = opened[-1] if opened else None
             if latest is not None and not any(
                 value.attemptId == latest.attemptId
                 for value in journal._stage_outcomes(
@@ -728,7 +790,7 @@ class AgentOrchestrator(
                         + describe_agent_error(persistence_error)
                     )
             return AutomatedWorkflowResult(
-                currentStage=latest.stage if latest else "ingest",
+                currentStage=progress[-1],
                 zarrPath=str(store.zarr_loc),
                 workspace=workflow.workspace,
                 workflowRunId=workflow.workflowRunId,
@@ -743,8 +805,13 @@ class AgentOrchestrator(
         *,
         answers: Mapping[str, Any],
         resume_record: OrchestrationResumeRecord | None = None,
+        progress: list[WorkflowStageName],
     ) -> AutomatedWorkflowResult:
-        """Continue the stage machine from the latest validated checkpoint."""
+        """Continue the stage machine from the latest validated checkpoint.
+
+        ``progress`` receives each stage name before that stage runs, so a failure
+        reports the stage that raised it.
+        """
         logger.debug(f"Running stage sequence for workflow {workflow.workflowRunId}")
         prefix = journal._ensure_orchestration_store(store)
         ingest_outcome = journal._validated_done_outcome(
@@ -764,6 +831,7 @@ class AgentOrchestrator(
             )
         parents = [journal._parent_link(ingest_outcome)]
 
+        progress.append("data_enrichment")
         enrichment_outcome, enrichment = self.data_enrichment_stage(
             store,
             workflow,
@@ -782,6 +850,7 @@ class AgentOrchestrator(
             )
         parents = [journal._parent_link(enrichment_outcome)]
 
+        progress.append("rna_quality_metrics")
         quality_outcome = self._rna_quality_metrics_stage(
             store,
             workflow,
@@ -810,13 +879,13 @@ class AgentOrchestrator(
         )
         parents = [journal._parent_link(quality_outcome)]
 
+        progress.append("experimental_context")
         context_outcome, experimental = self.experimental_context_stage(
             store,
             workflow,
             request_record,
             parents,
             cell_selection,
-            enrichment_outcome.reportReferences[0],
             quality_metric_artifacts,
             hto_identity_artifacts,
             answers,
@@ -835,6 +904,7 @@ class AgentOrchestrator(
         validate_objective_evidence(study_contract, experimental)
         parents = [journal._parent_link(context_outcome)]
 
+        progress.append("preprocessing_plan")
         plan_outcome, preprocessing_plan = self.preprocessing_plan_stage(
             store,
             workflow,
@@ -842,7 +912,6 @@ class AgentOrchestrator(
             parents,
             enrichment,
             experimental,
-            ingest_outcome,
             study_contract,
             answers,
             resume_record=resume_record,
@@ -857,6 +926,7 @@ class AgentOrchestrator(
             )
         parents = [journal._parent_link(plan_outcome)]
 
+        progress.append("preprocessing")
         (
             preprocessing_outcome,
             preprocessed,
@@ -868,8 +938,6 @@ class AgentOrchestrator(
             parents,
             preprocessing_plan,
             experimental,
-            study_contract,
-            answers,
             resume_record=resume_record,
         )
         if preprocessing_outcome.status != "done":
@@ -882,6 +950,7 @@ class AgentOrchestrator(
             )
         parents = [journal._parent_link(preprocessing_outcome)]
 
+        progress.append("parameter_tuning")
         tuning_outcome, tuning_report = self.parameter_tuning_stage(
             store,
             workflow,
@@ -890,7 +959,6 @@ class AgentOrchestrator(
             preprocessing_plan,
             preprocessed,
             experimental,
-            enrichment_outcome.reportReferences[0],
             context_outcome.reportReferences[0],
             answers,
             study_contract=study_contract,
@@ -931,6 +999,7 @@ class AgentOrchestrator(
             for value in preprocessed
         ]
 
+        progress.append("analysis_finalization")
         finalization_outcome, final_analysis = self.analysis_finalization_stage(
             store,
             workflow,

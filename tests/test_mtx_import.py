@@ -262,15 +262,26 @@ def test_archive_discovers_nested_compressed_prefixed_members_and_cleans_up(
 
 
 @pytest.mark.parametrize(
-    ("sidecar_name", "contents", "expected_names"),
+    ("sidecar_name", "contents", "expected_names", "expected_type"),
     [
-        ("features.tsv", "feature-0\nfeature-1\n", ["feature-0", "feature-1"]),
+        (
+            "features.tsv",
+            "feature-0\nfeature-1\n",
+            ["feature-0", "feature-1"],
+            "Gene Expression",
+        ),
         (
             "genes.tsv.gz",
             "feature-0\tGene zero\nfeature-1\tGene one\n",
             ["Gene zero", "Gene one"],
+            "Gene Expression",
         ),
-        ("peaks.bed.gz", "peak-0\npeak-1\n", ["peak-0", "peak-1"]),
+        (
+            "peaks.bed.gz",
+            "chr1\t10109\t10357\nchr1\t180730\t181630\n",
+            ["chr1:10109-10357", "chr1:180730-181630"],
+            "Peaks",
+        ),
     ],
 )
 def test_feature_sidecar_suffix_and_column_fallbacks(
@@ -278,6 +289,7 @@ def test_feature_sidecar_suffix_and_column_fallbacks(
     sidecar_name: str,
     contents: str,
     expected_names: list[str],
+    expected_type: str,
 ) -> None:
     _write_mex(
         tmp_path,
@@ -295,7 +307,7 @@ def test_feature_sidecar_suffix_and_column_fallbacks(
     reader = MtxReader(candidate)
     try:
         assert reader.feature_names() == expected_names
-        assert reader.feature_types() == ["Gene Expression", "Gene Expression"]
+        assert reader.feature_types() == [expected_type, expected_type]
     finally:
         reader.close()
 
@@ -1030,6 +1042,75 @@ def test_bd_guide_reclassification_is_explicit(tmp_path: Path) -> None:
         require_previous="mRNA",
     )
     assert tuple(reader.assayFeats.columns) == ("RNA", "CRISPR")
+
+    store = MemoryStore()
+    MtxToZarr(reader, store, mem_budget="64M").dump(lines_in_mem=2)
+    root = zarr.open_group(store=store, mode="r")
+    np.testing.assert_array_equal(
+        root["CRISPR/featureData/feature_type"][:],
+        ["CRISPR Guide Capture"],
+    )
+    np.testing.assert_array_equal(root["RNA/featureData/feature_type"][:], ["mRNA"])
+
+
+def test_feature_reference_covers_only_feature_barcode_features(
+    tmp_path: Path,
+) -> None:
+    _write_mex(
+        tmp_path,
+        [(1, 1, 3), (2, 1, 1), (3, 1, 7)],
+        n_features=3,
+        n_cells=1,
+        feature_types=["Gene Expression", "Gene Expression", "Antibody Capture"],
+    )
+    # A 10x Feature Reference lists Feature Barcode features only.
+    (tmp_path / "feature_reference.csv").write_text(
+        "id,name,read,pattern,sequence,feature_type\n"
+        "feature-2,CD3,R2,5PNNNNNNNNNN(BC),AACAAGACCCTTGAG,Antibody Capture\n"
+    )
+    reader = MtxReader(inspect_mtx(tmp_path)[0])
+    store = MemoryStore()
+    MtxToZarr(reader, store, mem_budget="64M").dump(lines_in_mem=2)
+
+    root = zarr.open_group(store=store, mode="r")
+    np.testing.assert_array_equal(
+        root["ADT/featureData/sequence"][:], ["AACAAGACCCTTGAG"]
+    )
+    np.testing.assert_array_equal(root["ADT/featureData/names"][:], ["gene-2"])
+    np.testing.assert_array_equal(
+        root["ADT/featureData/feature_type"][:],
+        ["Antibody Capture"],
+    )
+    assert "sequence" not in root["RNA/featureData"]
+
+    (tmp_path / "feature_reference.csv").write_text("id,sequence\nunknown,ACGT\n")
+    with pytest.raises(ValueError, match="not matrix features: unknown"):
+        MtxReader(inspect_mtx(tmp_path)[0])
+
+
+def test_symbolic_link_sidecars_keep_their_names(tmp_path: Path) -> None:
+    content = tmp_path / "objects"
+    content.mkdir()
+    _write_mex(content, [(1, 1, 2)], n_features=1, n_cells=1)
+    work = tmp_path / "work"
+    work.mkdir()
+    for name in ("matrix.mtx", "features.tsv", "barcodes.tsv"):
+        target = content / f"sha256-{name.replace('.', '-')}"
+        (content / name).rename(target)
+        (work / name).symlink_to(target)
+
+    candidates = inspect_mtx(work)
+
+    assert [Path(candidate.matrixPath).name for candidate in candidates] == [
+        "matrix.mtx"
+    ]
+    reader = MtxReader(candidates[0])
+    try:
+        assert np.vstack([batch.toarray() for batch in reader.consume(1)]).tolist() == [
+            [2]
+        ]
+    finally:
+        reader.close()
 
 
 def _write_tagged_h5(path: Path) -> None:

@@ -25,7 +25,6 @@ from ..utils.logging import logger
 from ..utils.progress import iter_progress
 
 
-_DEFAULT_ANALYSIS_BLOCK_ROWS = 65_536
 _SOURCE_DIGEST_BLOCK_BYTES = 1024 * 1024
 
 
@@ -35,7 +34,7 @@ def _count_matrix_bands(
     assay_names: tuple[str, ...],
     projection: tuple[np.ndarray, np.ndarray] | None,
 ) -> Iterator[tuple[str, Any, int]]:
-    from ..storage.sharding import sparse_matrix_bytes
+    from ..utils.arrays import sparse_matrix_bytes
 
     chunk = matrix.tocoo(copy=False)
     source_bytes = sparse_matrix_bytes(matrix, chunk)
@@ -84,6 +83,107 @@ def _finished_count_bands(
             yield assay_name, band, producer_bytes
 
 
+def _run_worker(
+    reader_kwargs: dict[str, Any],
+    connection: Any,
+    work: Any,
+) -> None:
+    """Run one H5AD worker body and report failures over its pipe."""
+    reader: H5adReader | None = None
+    try:
+        reader = H5adReader(**reader_kwargs)
+        work(reader)
+    except BaseException as exc:
+        try:
+            connection.send(("error", f"{type(exc).__name__}: {exc}"))
+        except BaseException:
+            pass
+    finally:
+        if reader is not None:
+            reader.close()
+        connection.close()
+
+
+def _worker_messages(
+    connections: dict[Any, int],
+    workers: list[Any],
+    role: str,
+) -> Iterator[tuple[int, str, Any]]:
+    """Yield ``(worker, kind, payload)`` messages until every worker is done.
+
+    A worker fails only when it exits with a non-zero code; a clean exit whose
+    ``done`` message is still in its pipe is read on the next wait.
+    """
+    from multiprocessing.connection import wait
+
+    active = dict(connections)
+    while active:
+        ready = cast(list[Any], wait(tuple(active), timeout=0.5))
+        if not ready:
+            failed = [
+                workers[index]
+                for index in active.values()
+                if workers[index].exitcode not in (None, 0)
+            ]
+            if failed:
+                details = ", ".join(
+                    f"{worker.name} exitcode={worker.exitcode}" for worker in failed
+                )
+                raise RuntimeError(f"H5AD {role} process failed: {details}")
+            continue
+        for connection in ready:
+            index = active[connection]
+            try:
+                kind, payload = connection.recv()
+            except EOFError as exc:
+                raise RuntimeError(
+                    f"H5AD {role} {index} closed without a result"
+                ) from exc
+            if kind == "error":
+                raise RuntimeError(f"H5AD {role} {index} failed: {payload}")
+            if kind == "done":
+                active.pop(connection)
+                connection.close()
+            yield index, kind, payload
+
+
+def _stop_workers(
+    stop: Any,
+    workers: list[Any],
+    connections: list[Any],
+) -> None:
+    """Stop workers, draining their pipes so a blocked send can finish."""
+    from multiprocessing.connection import wait
+
+    stop.set()
+    deadline = time.monotonic() + 5.0
+    while any(worker.is_alive() for worker in workers) and time.monotonic() < deadline:
+        open_connections = [
+            connection for connection in connections if not connection.closed
+        ]
+        ready = cast(
+            list[Any],
+            wait(tuple(open_connections), timeout=0.05) if open_connections else [],
+        )
+        for connection in ready:
+            try:
+                connection.recv()
+            except (EOFError, OSError):
+                pass
+        for worker in workers:
+            worker.join(timeout=0)
+    for worker in workers:
+        if worker.is_alive():
+            worker.terminate()
+    for worker in workers:
+        worker.join(timeout=1.0)
+        if worker.is_alive():
+            worker.kill()
+            worker.join()
+    for connection in connections:
+        connection.close()
+
+
 def _read_h5ad_process_window(
     reader_kwargs: dict[str, Any],
     batch_size: int,
@@ -97,16 +197,13 @@ def _read_h5ad_process_window(
 ) -> None:
     from ..storage.sharding import SparseShardBuffer
 
-    reader: H5adReader | None = None
-
     def send_band(item: tuple[str, Any, int]) -> bool:
         if stop.is_set():
             return False
         connection.send(("band", item))
         return not stop.is_set()
 
-    try:
-        reader = H5adReader(**reader_kwargs)
+    def work(reader: H5adReader) -> None:
         buffers = {
             assay_name: SparseShardBuffer(
                 destination,
@@ -130,15 +227,8 @@ def _read_h5ad_process_window(
             if not send_band(item):
                 return
         connection.send(("done", None))
-    except BaseException as exc:
-        try:
-            connection.send(("error", f"{type(exc).__name__}: {exc}"))
-        except BaseException:
-            pass
-    finally:
-        if reader is not None:
-            reader.close()
-        connection.close()
+
+    _run_worker(reader_kwargs, connection, work)
 
 
 def _write_h5ad_process_window(
@@ -168,10 +258,7 @@ def _write_h5ad_process_window(
     )
     from ..storage.stores import load_zarr
 
-    reader: H5adReader | None = None
-    try:
-        reader = H5adReader(**reader_kwargs)
-        assert reader is not None
+    def work(reader: H5adReader) -> None:
         root = load_zarr(
             zarr_location,
             mode="a",
@@ -234,15 +321,8 @@ def _write_h5ad_process_window(
         if not stop.is_set():
             windows = {name: summary.window() for name, summary in summaries.items()}
             connection.send(("done", (reports, windows)))
-    except BaseException as exc:
-        try:
-            connection.send(("error", f"{type(exc).__name__}: {exc}"))
-        except BaseException:
-            pass
-    finally:
-        if reader is not None:
-            reader.close()
-        connection.close()
+
+    _run_worker(reader_kwargs, connection, work)
 
 
 def _validate_assay_names(names: tuple[str, ...]) -> None:
@@ -280,14 +360,6 @@ class H5adImportResult:
             self,
             "clusterArtifacts",
             MappingProxyType(dict(self.clusterArtifacts)),
-        )
-
-    @property
-    def artifactRefs(self) -> tuple[ArtifactRef, ...]:
-        return (
-            self.cellSelection,
-            *self.embeddingArtifacts.values(),
-            *self.clusterArtifacts.values(),
         )
 
 
@@ -335,6 +407,9 @@ class H5adToZarr:
         analysis_assay: Imported assay that owns explicitly selected H5AD
                         embeddings and clusters. Required for multi-assay
                         imports with analytical outputs.
+        assay_type: Preset assay type, such as ``RNA``, for a single imported
+                    assay whose name is not a preset. When None, the assay
+                    name decides the type. Not allowed with ``assay_split_key``.
 
     Attributes:
         h5ad: A h5ad object (h5 file with added AnnData structure).
@@ -357,11 +432,19 @@ class H5adToZarr:
         assay_split_key: str | None = None,
         assay_name_map: dict[str, str] | None = None,
         analysis_assay: str | None = None,
+        assay_type: str | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.schema import create_zarr_count_assay
         from ..storage.stores import load_zarr
+        from .counts_t import validate_assay_type
 
+        validate_assay_type(assay_type)
+        if assay_type is not None and assay_split_key is not None:
+            raise ValueError(
+                "assay_type applies to a single assay and cannot be combined "
+                "with assay_split_key"
+            )
         self.h5ad = h5ad
         self.workspace = workspace
         self.storage_options = storage_options
@@ -408,6 +491,9 @@ class H5adToZarr:
                 raise ValueError("analysis_assay must name an imported assay")
             resolved_analysis_assay = analysis_assay
         self.analysisAssay = resolved_analysis_assay
+        self.assayTypes = (
+            {} if assay_type is None else {name: assay_type for name in self.assayNames}
+        )
         self.resources = resolve_budget(mem_budget, nthreads)
         self.profile = resolve_storage_profile(zarr_loc, profile)
         self.policy = policy
@@ -415,11 +501,7 @@ class H5adToZarr:
         self._sourceDigest = self._hash_source() if has_analysis else None
         self.h5ad.infer_storage_dtype(self.resources.memoryBytes)
         self.h5ad.materialize_csc(self.resources.memoryBytes)
-        self.storageDtype = getattr(
-            self.h5ad,
-            "storageDtype",
-            self.h5ad.matrixDtype,
-        )
+        self.storageDtype = self.h5ad.storageDtype
         self.z = load_zarr(zarr_loc=zarr_loc, mode="w", storage_options=storage_options)
         self._ini_cell_data()
         for resolved_assay_name in self.assayNames:
@@ -449,9 +531,8 @@ class H5adToZarr:
         )
 
     def _ini_cell_data(self) -> None:
-        from ..storage.arrays import create_zarr_obj_array
         from ..storage.schema import create_cell_data
-        from ._store import skip_reserved_metadata_columns
+        from ._store import skip_reserved_metadata_columns, write_metadata_column
 
         ids = self.h5ad.cell_ids()
         g = create_cell_data(
@@ -461,14 +542,17 @@ class H5adToZarr:
             names=ids,
             profile=self.profile,
         )
-        for i, j in skip_reserved_metadata_columns(
-            self.h5ad.get_cell_columns(), "cell"
+        for name, (values, missing) in skip_reserved_metadata_columns(
+            (
+                (name, (values, missing))
+                for name, values, missing in self.h5ad._cell_columns()
+            ),
+            "cell",
         ):
-            create_zarr_obj_array(g, i, j, j.dtype, profile=self.profile)
+            write_metadata_column(g, name, values, missing, profile=self.profile)
 
     def _ini_feature_data(self) -> None:
-        from ..storage.arrays import create_zarr_obj_array
-        from ._store import skip_reserved_metadata_columns
+        from ._store import skip_reserved_metadata_columns, write_metadata_column
 
         targets: list[tuple[Any, np.ndarray | None]] = []
         for assay_name in self.assayNames:
@@ -486,18 +570,24 @@ class H5adToZarr:
 
         # Stream one column at a time so a single decoded var column is held in
         # memory rather than every column for the full feature axis at once.
-        for column_name, values in skip_reserved_metadata_columns(
-            self.h5ad.get_feat_columns(), "feature"
+        for column_name, (values, missing) in skip_reserved_metadata_columns(
+            (
+                (name, (values, missing))
+                for name, values, missing in self.h5ad._feature_columns()
+            ),
+            "feature",
         ):
             for feat_group, feature_indexes in targets:
-                selected = (
-                    values if feature_indexes is None else values[feature_indexes]
-                )
-                create_zarr_obj_array(
+                if feature_indexes is None:
+                    selected, selected_missing = values, missing
+                else:
+                    selected = values[feature_indexes]
+                    selected_missing = missing[feature_indexes]
+                write_metadata_column(
                     feat_group,
                     column_name,
                     selected,
-                    selected.dtype,
+                    selected_missing,
                     profile=self.profile,
                 )
 
@@ -521,6 +611,7 @@ class H5adToZarr:
             self.z,
             self.assayNames,
             self.workspace,
+            assay_types=self.assayTypes,
             resources=self.resources,
             profile=self.profile,
             policy=self.policy,
@@ -556,59 +647,18 @@ class H5adToZarr:
         *,
         row_bytes: int,
     ) -> int:
-        bytes_per_row = max(1, int(row_bytes))
-        memory_rows = max(
-            1,
-            int(self.resources.memoryBytes) // (8 * bytes_per_row),
+        from ._store import bounded_block_rows
+
+        return bounded_block_rows(
+            requested,
+            row_bytes=row_bytes,
+            memory_bytes=int(self.resources.memoryBytes),
         )
-        preferred = _DEFAULT_ANALYSIS_BLOCK_ROWS if requested is None else requested
-        return int(max(1, min(int(preferred), memory_rows)))
 
     def _write_cell_selection(self) -> ArtifactRef:
-        from ..storage.selections import resolve_stored_selection_artifact
+        from ._store import resolve_import_cell_selection
 
-        return resolve_stored_selection_artifact(
-            self.root,
-            table_path="cellData",
-            id_column="ids",
-            source_column="I",
-            scope="datastore",
-            kind="cell_selection",
-            operation="import_cell_selection",
-            parameters={"source": "h5ad"},
-            inputs={},
-        )
-
-    @staticmethod
-    def _floating_dtype(dtype: Any) -> np.dtype[Any]:
-        source = np.dtype(dtype)
-        if source.kind == "f":
-            resolved: np.dtype[Any] = np.dtype(source.str)
-            return resolved
-        if source.kind in "biu":
-            return np.dtype(np.float64)
-        raise TypeError(f"Embedding payload uses unsupported dtype {source}")
-
-    def _embedding_fingerprint(
-        self,
-        key: str,
-        block_rows: int,
-        dtype: np.dtype[Any],
-    ) -> str:
-        from ..storage.artifacts import ValueFingerprintBuilder
-
-        source = self.h5ad._obsm_array(key)
-        shape = tuple(int(size) for size in source.shape)
-        builder = ValueFingerprintBuilder()
-        builder.begin_array("values", shape, dtype)
-        start = 0
-        for block in self.h5ad._iter_obsm_blocks(key, block_rows, dtype):
-            if not bool(np.isfinite(block).all()):
-                raise ValueError(f"Embedding key {key!r} contains non-finite values")
-            builder.update_array_block("values", (start, 0), block)
-            start += int(block.shape[0])
-        builder.end_array("values")
-        return builder.hexdigest()
+        return resolve_import_cell_selection(self.root, source="h5ad", inputs={})
 
     def _write_embedding_artifacts(
         self,
@@ -622,17 +672,24 @@ class H5adToZarr:
         if self.analysisAssay is None or self._sourceDigest is None:
             raise RuntimeError("H5AD analytical import was not initialized")
 
+        from ._store import fingerprint_row_blocks, floating_payload_dtype
+
         artifacts: dict[str, ArtifactRef] = {}
         cell_ids = _H5adCellIdSource(self.h5ad)
         for key, role in self.h5ad.embeddingRoles.items():
             source = self.h5ad._obsm_array(key)
             source_shape = (int(source.shape[0]), int(source.shape[1]))
-            dtype = self._floating_dtype(source.dtype)
+            dtype = floating_payload_dtype(source.dtype, "Embedding payload")
             block_rows = self._analysis_block_rows(
                 requested_rows,
                 row_bytes=int(source.shape[1]) * int(dtype.itemsize),
             )
-            fingerprint = self._embedding_fingerprint(key, block_rows, dtype)
+            fingerprint = fingerprint_row_blocks(
+                self.h5ad._iter_obsm_blocks(key, block_rows, dtype),
+                source_shape,
+                dtype,
+                label=f"Embedding key {key!r}",
+            )
 
             def blocks(
                 source_key: str = key,
@@ -671,14 +728,9 @@ class H5adToZarr:
 
     @staticmethod
     def _decode_cluster_text(value: Any) -> str:
-        if isinstance(value, bytes | np.bytes_):
-            try:
-                return bytes(value).decode("utf-8")
-            except UnicodeDecodeError as exc:
-                raise ValueError("H5AD cluster labels contain invalid UTF-8") from exc
-        if isinstance(value, str | np.str_):
-            return str(value)
-        raise TypeError("H5AD string cluster labels must contain strings")
+        from ._store import decode_text
+
+        return decode_text(value)
 
     def _cluster_dtype_and_missing(
         self,
@@ -757,13 +809,18 @@ class H5adToZarr:
         cell_selection: ArtifactRef,
         requested_rows: int | None,
     ) -> dict[str, ArtifactRef]:
-        from ..storage.arrays import MetadataBlock, create_streamed_metadata_column
+        from ..storage.arrays import (
+            MISSING_MASK_PREFIX,
+            MetadataBlock,
+            create_streamed_metadata_column,
+        )
         from ..storage.artifact_writer import (
             ArrayRequirement,
             finish_artifact,
             plan_artifact,
             start_artifact,
         )
+        from ._store import DEFAULT_IMPORT_BLOCK_ROWS
 
         if not self.h5ad.clusterKeys:
             return {}
@@ -784,7 +841,7 @@ class H5adToZarr:
             if has_missing:
                 requirements.append(
                     ArrayRequirement(
-                        "__scarf_missing__values",
+                        f"{MISSING_MASK_PREFIX}values",
                         shape=(self.h5ad.nCells,),
                         dtype=bool,
                     )
@@ -830,14 +887,14 @@ class H5adToZarr:
                 dtype=dtype,
                 blocks=blocks(),
                 chunkSize=min(
-                    _DEFAULT_ANALYSIS_BLOCK_ROWS,
+                    DEFAULT_IMPORT_BLOCK_ROWS,
                     max(1, self.h5ad.nCells),
                 ),
                 hasMissing=has_missing,
                 profile=self.profile,
             )
             if has_missing and values.attrs.get("missing_mask") != (
-                "__scarf_missing__values"
+                f"{MISSING_MASK_PREFIX}values"
             ):
                 raise RuntimeError("Cluster-label missing-mask link is malformed")
             finish_artifact(group, planned)
@@ -889,16 +946,8 @@ class H5adToZarr:
             resident_source_bytes += sum(array.nbytes for array in projection)
         resident_source_bytes += feature_index_bytes
         resident_source_bytes += sum(summary.nbytes for summary in summaries.values())
-        prepare = getattr(self.h5ad, "_prepare_sparse_import", None)
-        if callable(prepare):
-            prepare()
-        reader_resident = getattr(
-            self.h5ad,
-            "_sparse_import_resident_bytes",
-            None,
-        )
-        if callable(reader_resident):
-            resident_source_bytes += max(0, int(reader_resident()))
+        self.h5ad._prepare_sparse_import()
+        resident_source_bytes += max(0, int(self.h5ad._sparse_import_resident_bytes()))
         source_itemsize = np.dtype(self.h5ad.sourceMatrixDtype).itemsize
         projection_value_bytes = max(
             source_itemsize,
@@ -1124,7 +1173,6 @@ class H5adToZarr:
         summaries: dict[str, Any],
     ) -> None:
         from multiprocessing import get_context
-        from multiprocessing.connection import wait
 
         from ..storage.execution import record_execution_report
 
@@ -1164,58 +1212,18 @@ class H5adToZarr:
                 connections[parent_connection] = index
                 workers.append(worker)
 
-            active = dict(connections)
-            while active:
-                ready = cast(list[Any], wait(tuple(active), timeout=0.5))
-                if not ready:
-                    failed = [
-                        workers[index]
-                        for index in active.values()
-                        if workers[index].exitcode is not None
-                    ]
-                    if failed:
-                        details = ", ".join(
-                            f"{worker.name} exitcode={worker.exitcode}"
-                            for worker in failed
-                        )
-                        raise RuntimeError(f"H5AD writer process failed: {details}")
-                    continue
-                for connection in ready:
-                    index = active[connection]
-                    try:
-                        kind, payload = connection.recv()
-                    except EOFError as exc:
-                        raise RuntimeError(
-                            f"H5AD writer {index} closed without a result"
-                        ) from exc
-                    if kind == "error":
-                        raise RuntimeError(f"H5AD writer {index} failed: {payload}")
-                    if kind != "done":
-                        raise RuntimeError(
-                            f"H5AD writer {index} sent an unknown message"
-                        )
-                    reports, summary_windows = payload
-                    for report in reports:
-                        record_execution_report(report)
-                    for assay_name, window in summary_windows.items():
-                        summaries[assay_name].merge(window)
-                    active.pop(connection)
-                    connection.close()
+            for index, kind, payload in _worker_messages(
+                connections, workers, "writer"
+            ):
+                if kind != "done":
+                    raise RuntimeError(f"H5AD writer {index} sent an unknown message")
+                reports, summary_windows = payload
+                for report in reports:
+                    record_execution_report(report)
+                for assay_name, window in summary_windows.items():
+                    summaries[assay_name].merge(window)
         finally:
-            stop.set()
-            deadline = time.monotonic() + 5.0
-            for worker in workers:
-                worker.join(timeout=max(0.0, deadline - time.monotonic()))
-            for worker in workers:
-                if worker.is_alive():
-                    worker.terminate()
-            for worker in workers:
-                worker.join(timeout=1.0)
-                if worker.is_alive():
-                    worker.kill()
-                    worker.join()
-            for connection in connections:
-                connection.close()
+            _stop_workers(stop, workers, list(connections))
 
     def _count_shard_tasks(
         self,
@@ -1253,7 +1261,6 @@ class H5adToZarr:
         windows: list[tuple[int, int]],
     ) -> Iterator[Any]:
         from multiprocessing import get_context
-        from multiprocessing.connection import wait
 
         from ..storage.geometry import array_geometry
         from ..storage.layout import ZarrArraySpec
@@ -1262,7 +1269,6 @@ class H5adToZarr:
         context = get_context("spawn")
         stop = context.Event()
         connections: dict[Any, int] = {}
-        child_connections: list[Any] = []
         workers: list[Any] = []
         destination_specs: dict[str, ZarrArraySpec] = {}
         for assay_name, destination in destinations.items():
@@ -1298,84 +1304,23 @@ class H5adToZarr:
                 worker.start()
                 child_connection.close()
                 connections[parent_connection] = index
-                child_connections.append(parent_connection)
                 workers.append(worker)
 
-            active = dict(connections)
-            while active:
-                ready = cast(list[Any], wait(tuple(active), timeout=0.5))
-                if not ready:
-                    failed = [
-                        workers[index]
-                        for index in active.values()
-                        if workers[index].exitcode is not None
-                    ]
-                    if failed:
-                        details = ", ".join(
-                            f"{worker.name} exitcode={worker.exitcode}"
-                            for worker in failed
-                        )
-                        raise RuntimeError(f"H5AD producer process failed: {details}")
-                    continue
-                for connection in ready:
-                    index = active[connection]
-                    try:
-                        kind, payload = connection.recv()
-                    except EOFError as exc:
-                        raise RuntimeError(
-                            f"H5AD producer {index} closed without a result"
-                        ) from exc
-                    if kind == "error":
-                        raise RuntimeError(f"H5AD producer {index} failed: {payload}")
-                    if kind == "done":
-                        active.pop(connection)
-                        connection.close()
-                        continue
-                    if kind != "band":
-                        raise RuntimeError(
-                            f"H5AD producer {index} sent an unknown message"
-                        )
-                    assay_name, band, producer_bytes = payload
-                    yield SparseWriteBand(
-                        destinations[assay_name],
-                        band,
-                        producer_bytes,
-                    )
-        finally:
-            stop.set()
-            deadline = time.monotonic() + 5.0
-            while (
-                any(worker.is_alive() for worker in workers)
-                and time.monotonic() < deadline
+            for index, kind, payload in _worker_messages(
+                connections, workers, "producer"
             ):
-                open_connections = [
-                    connection
-                    for connection in child_connections
-                    if not connection.closed
-                ]
-                ready = cast(
-                    list[Any],
-                    wait(tuple(open_connections), timeout=0.05)
-                    if open_connections
-                    else [],
+                if kind == "done":
+                    continue
+                if kind != "band":
+                    raise RuntimeError(f"H5AD producer {index} sent an unknown message")
+                assay_name, band, producer_bytes = payload
+                yield SparseWriteBand(
+                    destinations[assay_name],
+                    band,
+                    producer_bytes,
                 )
-                for connection in ready:
-                    try:
-                        connection.recv()
-                    except (EOFError, OSError):
-                        pass
-                for worker in workers:
-                    worker.join(timeout=0)
-            for worker in workers:
-                if worker.is_alive():
-                    worker.terminate()
-            for worker in workers:
-                worker.join(timeout=1.0)
-                if worker.is_alive():
-                    worker.kill()
-                    worker.join()
-            for connection in child_connections:
-                connection.close()
+        finally:
+            _stop_workers(stop, workers, list(connections))
 
     def _emit_count_bands(
         self,

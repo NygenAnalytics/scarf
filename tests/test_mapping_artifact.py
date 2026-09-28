@@ -104,6 +104,21 @@ def test_reference_query_rejects_corrupted_provenance(
         _reference_available_k(reference)
 
 
+def test_reference_query_requires_the_recorded_ann_search_depth(
+    analyzed_datastore_ephemeral,
+):
+    reference = _plain_reference(analyzed_datastore_ephemeral)
+    group = artifact_group(reference.datastore.zw, reference.ann_index)
+    provenance = dict(group.attrs["provenance"])
+    parameters = dict(provenance["parameters"])
+    del parameters["ann_ef"]
+    provenance["parameters"] = parameters
+    group.attrs["provenance"] = provenance
+
+    with pytest.raises(ValueError, match="search depth is invalid"):
+        _reference_available_k(reference)
+
+
 @pytest.mark.parametrize("source", ["ref", "reduction", "ann_index", "neighbors"])
 def test_reference_query_rejects_incomplete_graph_chain(
     analyzed_datastore_ephemeral, source
@@ -303,7 +318,7 @@ def test_load_rejects_versioned_metadata_and_bad_distance_summary(
     metadata = dict(group.attrs["reference_metadata"])
     metadata["schemaVersion"] = 1
     group.attrs["reference_metadata"] = metadata
-    with pytest.raises(ValueError, match="versioned contract"):
+    with pytest.raises(ValueError, match="does not match the current contract"):
         load_artifact_mapping_reference(datastore, reference.ref)
 
     reference = datastore.get_mapping_reference(
@@ -333,8 +348,9 @@ def test_load_rejects_malformed_scoped_and_missing_input_refs(
     malformed_reduction = dict(original_inputs["reduction"])
     malformed_reduction["artifact_id"] = "invalid"
     corruptions = (
-        ("not-a-ref", "input 'reduction' is missing"),
-        (malformed_reduction, "input 'reduction' is malformed"),
+        (None, "has no 'reduction' input"),
+        ("not-a-ref", "malformed 'reduction' input"),
+        (malformed_reduction, "malformed 'reduction' input"),
         (
             _ref(kind="reduction", assay=None, token="d").to_dict(),
             "wrong artifact kind or scope",

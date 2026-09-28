@@ -1,7 +1,5 @@
 """Context evidence revisions append history and reject changed measured metadata."""
 
-from types import SimpleNamespace
-
 import pytest
 
 from scarf.agent.experimental_context import agent as context_agent
@@ -19,7 +17,6 @@ from scarf.agent.orchestrator import (
 from scarf.agent.orchestrator import context, journal
 from scarf.agent.orchestrator.models import (
     OrchestrationRequestRecord,
-    StageEvidenceReference,
     WorkflowIdentity,
 )
 from scarf.agent.types import ArtifactReferenceModel
@@ -27,7 +24,7 @@ from scarf.datastore.datastore import DataStore
 from tests.agent_orchestrator_store import create_store
 
 
-@pytest.mark.parametrize("damage", [None, "currentMetadata", "historicalMetadata"])
+@pytest.mark.parametrize("damage", [None, "currentMetadata"])
 def test_missing_joint_question_appends_revision_without_replacing_completed_context(
     tmp_path, monkeypatch, damage
 ):
@@ -35,9 +32,7 @@ def test_missing_joint_question_appends_revision_without_replacing_completed_con
     store = DataStore(str(path), default_assay="RNA", min_features_per_cell=0)
     selected = store.snapshot_cell_selection("I")
     selection = ArtifactReferenceModel.from_artifact_ref(selected)
-    known = characterize_covariates(
-        store, cellSelection=selected, model=None, directions={}
-    )
+    known = characterize_covariates(store, cellSelection=selected, directions={})
     report = ExperimentalContextResult(
         status="done",
         decision=ExperimentalContextDecision(),
@@ -63,11 +58,11 @@ def test_missing_joint_question_appends_revision_without_replacing_completed_con
     )
     workflow = WorkflowIdentity(request.workflowRunId)
     prefix = journal._ensure_orchestration_store(store)
-    old_inputs = (
-        {"metadataFingerprints": {"ids": "changed"}}
+    old_inputs = {
+        "metadataFingerprints": {"ids": "changed"}
         if damage == "currentMetadata"
-        else {}
-    )
+        else context._context_metadata_identity(store, request)
+    }
     started = journal._start_attempt(
         store.zw,
         prefix,
@@ -89,16 +84,6 @@ def test_missing_joint_question_appends_revision_without_replacing_completed_con
     )
     journal._save_outcome(store.zw, prefix, old)
     original = journal.read_stage_evidence(store, reference)
-    if damage == "historicalMetadata":
-        journal._start_attempt(
-            store.zw,
-            prefix,
-            workflow.workflowRunId,
-            "parameter_tuning",
-            request,
-            [],
-            inputs={"metadataFingerprints": {"ids": "changed"}},
-        )
     observed = []
 
     class Review:
@@ -123,12 +108,6 @@ def test_missing_joint_question_appends_revision_without_replacing_completed_con
             request,
             [],
             selection,
-            StageEvidenceReference(
-                workflowRunId=workflow.workflowRunId,
-                stage="data_enrichment",
-                key="unused",
-                contentSha256="a" * 64,
-            ),
             [],
             [],
             {},
@@ -201,7 +180,6 @@ def test_held_out_author_annotations_cannot_reenter_context_through_nested_direc
             ArtifactReferenceModel.from_artifact_ref(
                 store.snapshot_cell_selection("I")
             ),
-            SimpleNamespace(),
             [],
             [],
             {},

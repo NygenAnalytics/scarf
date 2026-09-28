@@ -4,6 +4,8 @@ import sys
 import tempfile
 import time
 import traceback
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -15,7 +17,14 @@ from scarf.metadata.artifacts import (
     write_cell_data_artifact,
 )
 from scarf.storage import ArtifactRef
+from scarf.storage.artifact_writer import ArtifactPlanReceipt, artifact_plan_scope
 from scarf.storage.budget import resolve_budget
+from scarf.storage.execution import (
+    ExecutionReport,
+    execution_report_scope,
+    execution_reports_by_kind,
+)
+from scarf.storage.profiles import resolve_storage_profile
 from scarf.storage.selections import validate_stored_selection_integrity
 from scarf.storage.stores import open_store
 from scarf.storage.types import as_zarr_array, as_zarr_group
@@ -98,6 +107,64 @@ def profile_stage_inputs(
     return inputs
 
 
+def require_artifact_ref(
+    ref: ArtifactRef,
+    *,
+    kind: str,
+    assay: str,
+    label: str,
+) -> ArtifactRef:
+    """Return ``ref`` when it is the expected kind with the expected scope and assay."""
+    expected_scope = "datastore" if kind == "cell_selection" else "assay"
+    expected_assay = None if expected_scope == "datastore" else assay
+    if ref.scope != expected_scope or ref.assay != expected_assay or ref.kind != kind:
+        raise ValueError(
+            f"{label} must be a {expected_scope}-scoped {kind} artifact for "
+            f"{expected_assay!r}"
+        )
+    return ref
+
+
+# These stages never open the session DataStore: they write through their own
+# handles or, for runLeiden, a child process. Every other non-consume stage of a
+# session reuses the DataStore the first of them opened, with its resources.
+_SESSION_INDEPENDENT_STAGES = frozenset(
+    {"createStore", "writeCountsT", "reopenStore", "runLeiden"}
+)
+
+
+def session_resource_mismatches(
+    stages: Sequence[StageName],
+    resourcesFor: Callable[[StageName], StageResources],
+) -> list[str]:
+    """Describe session stages whose workers or budget differ from the store opener's.
+
+    A shared session DataStore keeps the workers and memory budget it was opened with,
+    so such a stage would run with other resources than its result records.
+    """
+    opener: tuple[StageName, StageResources] | None = None
+    mismatches: list[str] = []
+    for stage in stages:
+        if stage in _SESSION_INDEPENDENT_STAGES or stage in CONSUME_STAGES:
+            continue
+        resources = resourcesFor(stage)
+        if opener is None:
+            opener = (stage, resources)
+            continue
+        owner, owned = opener
+        if (resources.workers, resources.scarfMemoryBudget) != (
+            owned.workers,
+            owned.scarfMemoryBudget,
+        ):
+            mismatches.append(
+                f"{stage} requests workers={resources.workers} and "
+                f"scarfMemoryBudget={resources.scarfMemoryBudget}, but {owner} opens "
+                f"the shared DataStore with workers={owned.workers} and "
+                f"scarfMemoryBudget={owned.scarfMemoryBudget}"
+            )
+    return mismatches
+
+
 @dataclass(frozen=True, slots=True)
 class StageRunResult:
     submissionId: str
@@ -137,9 +204,17 @@ class StageRunResult:
     provenance: dict[str, Any] | None = None
     # Stages that ran at the same time; CPU and memory then share a window.
     concurrentStages: list[str] | None = None
+    # The downloaded input H5AD of a createStore stage.
+    datasetUri: str | None = None
+    datasetETag: str | None = None
+    datasetBytes: int | None = None
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def _storage_profile(uri: str) -> Any:
+    return resolve_storage_profile(uri)
 
 
 def _count_matrix_policy(config: CountMatrixConfig | None) -> Any:
@@ -193,7 +268,7 @@ def _open_datastore(
     arguments: dict[str, Any] = {
         "nthreads": resources.workers,
         "zarr_mode": "r+",
-        "zarrProfile": ("cloud" if storeUri.startswith("s3://") else "fast_local"),
+        "zarrProfile": _storage_profile(storeUri),
         "storage_options": options,
         "mem_budget": resources.scarfMemoryBudget,
         "storageIo": _storage_io_policy(storageIo),
@@ -210,8 +285,7 @@ def _open_datastore(
 
 
 def _close_h5ad_reader(reader: H5adReader) -> None:
-    if hasattr(reader, "h5") and hasattr(reader.h5, "close"):
-        reader.h5.close()
+    reader.h5.close()
 
 
 def _prepare_create_store(
@@ -243,7 +317,7 @@ def _prepare_create_store(
             storage_options=options,
             mem_budget=resources.scarfMemoryBudget,
             nthreads=resources.workers,
-            profile=("cloud" if storeUri.startswith("s3://") else "fast_local"),
+            profile=_storage_profile(storeUri),
             policy=_count_matrix_policy(countMatrix),
             io=_storage_io_policy(storageIo),
         )
@@ -308,6 +382,7 @@ def _run_leiden_in_subprocess(
     workDir: Path | None,
     graph: ArtifactRef,
     invalidateCache: bool = False,
+    storageIo: StorageIoConfig | None = None,
 ) -> dict[str, Any]:
     """Run ``profiling.leiden_worker`` in a child process and return its status."""
     worker_dir = (
@@ -325,6 +400,7 @@ def _run_leiden_in_subprocess(
         "resources": resources.model_dump(mode="json"),
         "statusPath": str(status_path),
         "invalidateCache": invalidateCache,
+        "storageIo": None if storageIo is None else storageIo.model_dump(mode="json"),
         "inputs": {"graph": graph.to_dict()},
     }
     request_path.write_text(json.dumps(request), encoding="utf-8")
@@ -444,7 +520,7 @@ def _write_counts_t(
     from scarf.storage.sharding import write_counts_t
     from scarf.assay.classification import default_feature_sets
 
-    profile = "cloud" if storeUri.startswith("s3://") else "fast_local"
+    profile = _storage_profile(storeUri)
     policy = _count_matrix_policy(countMatrix)
     pair_kwargs: dict[str, Any] = {"profile": profile}
     if policy is not None:
@@ -580,6 +656,67 @@ def install_stage_zarr_runtime() -> None:
     ensure_zarr_host_ceiling()
 
 
+# createStore times only the counts write, which keeps the definition of the
+# published benchmark tables.
+CREATE_STORE_TIMING = (
+    "seconds covers writer._write_counts only; inputSetupSeconds covers opening "
+    "the H5AD and constructing H5adToZarr (dtype scan, cell and feature metadata, "
+    "and assay creation)"
+)
+
+
+def _artifact_plan_details(
+    receipts: Sequence[ArtifactPlanReceipt],
+    details: dict[str, Any],
+) -> dict[str, Any]:
+    """Return whether the stage created its primary artifact and all plan counts."""
+    artifact = details.get("artifact")
+    disposition = None
+    if isinstance(artifact, dict):
+        ref = ArtifactRef.from_dict(artifact)
+        disposition = next(
+            (item.disposition for item in reversed(receipts) if item.ref == ref),
+            None,
+        )
+    return {
+        "artifactDisposition": disposition,
+        "artifactPlans": {
+            "created": sum(item.disposition == "created" for item in receipts),
+            "reused": sum(item.disposition == "reused" for item in receipts),
+        },
+    }
+
+
+def _require_created_artifact(
+    stage: StageName,
+    details: dict[str, Any] | None,
+    *,
+    allowArtifactReuse: bool,
+) -> None:
+    if allowArtifactReuse or details is None:
+        return
+    if details.get("artifactDisposition") != "reused":
+        return
+    artifact_id = (details.get("artifact") or {}).get("artifact_id")
+    raise RuntimeError(
+        f"{stage} reused existing artifact {artifact_id}, so its seconds measure a "
+        "cache lookup. Rerun with force, use a fresh runTag, or allow reuse explicitly"
+    )
+
+
+def _blas_threads() -> list[int]:
+    """Return the distinct thread counts of the loaded BLAS libraries."""
+    from threadpoolctl import threadpool_info
+
+    return sorted(
+        {
+            int(item["num_threads"])
+            for item in threadpool_info()
+            if item.get("user_api") == "blas"
+        }
+    )
+
+
 def run_stage(
     stage: StageName,
     *,
@@ -598,11 +735,18 @@ def run_stage(
     containerCpuLimit: float | None = None,
     resetCgroupPeak: bool = True,
     invalidateCache: bool = False,
+    allowArtifactReuse: bool = False,
     recordStoreOperations: bool = True,
     clientProvenance: dict[str, Any] | None = None,
     inputRefs: dict[str, ArtifactRef] | None = None,
     session: dict[str, Any] | None = None,
 ) -> StageRunResult:
+    """Run and measure one profiling stage.
+
+    ``seconds`` and ``details["storeOperations"]`` cover the same measured operation.
+    A stage that returns an artifact which already existed measured a cache lookup,
+    so it fails unless ``allowArtifactReuse`` is set.
+    """
     install_stage_zarr_runtime()
     timer = StageTimer()
     cpu_started = time.process_time()
@@ -620,14 +764,24 @@ def run_stage(
         from profiling.recording_store import StoreProbe
 
         # A session store stays wrapped with the probe of the stage that opened
-        # it, so all stages of a session share one probe and reset it.
-        store_probe = (session or {}).get("storeProbe") or StoreProbe(countOnly=True)
-        store_probe.reset()
+        # it, so all stages of a session share one probe.
+        store_probe = (session or {}).get("storeProbe") or StoreProbe()
         if session is not None:
             session["storeProbe"] = store_probe
-    collected_reports: list[Any] = []
+    operation_store_ops: dict[str, int] | None = None
 
-    from scarf.storage.execution import execution_report_scope
+    @contextmanager
+    def operation() -> Iterator[None]:
+        # Count store operations over exactly the span that ``seconds`` times.
+        nonlocal operation_store_ops
+        if store_probe is not None:
+            store_probe.reset()
+        try:
+            with timer.operation():
+                yield
+        finally:
+            if store_probe is not None:
+                operation_store_ops = store_probe.to_json()
 
     def _keep_store(opened: DataStore | None) -> None:
         if session is not None and opened is not None:
@@ -647,123 +801,184 @@ def run_stage(
     from profiling.metrics import child_cpu_seconds as read_child_cpu_seconds
 
     child_cpu_before = read_child_cpu_seconds()
-    report_scope = execution_report_scope()
-    collected_reports = report_scope.__enter__()
-    try:
-        with timer:
-            sampler.start()
-            try:
-                if stage == "createStore":
-                    if localH5adPath is None:
-                        raise ValueError("createStore requires localH5adPath")
-                    reader: H5adReader | None = None
-                    writer: H5adToZarr | None = None
-                    try:
-                        with timer.inputSetup():
-                            reader, writer = _prepare_create_store(
-                                localH5adPath=localH5adPath,
-                                storeUri=storeUri,
-                                workflow=workflow,
-                                resources=resources,
-                                countMatrix=countMatrix,
-                                storageIo=storageIo,
-                                storeProbe=store_probe,
-                            )
-                        with timer.operation():
-                            assert writer is not None
-                            # Keep createStore = counts only. writeCountsT owns
-                            # paired countsT so the two stages stay measurable.
-                            writer._write_counts(batch_size=workflow.h5adBatchSize)
-                    finally:
-                        if writer is not None:
-                            details = {
-                                "h5adProducerWorkers": getattr(
-                                    writer,
-                                    "_lastImportProducerCount",
-                                    None,
-                                ),
-                                "h5adWriteWorkers": getattr(
-                                    writer,
-                                    "_lastImportWriteWorkers",
-                                    None,
-                                ),
-                                "h5adWorkersPerProcess": getattr(
-                                    writer,
-                                    "_lastImportWorkersPerProcess",
-                                    None,
-                                ),
-                            }
-                        writer = None
-                        if reader is not None:
-                            _close_h5ad_reader(reader)
-                            reader = None
-                elif stage == "writeCountsT":
-                    counts_context: _CountsTWriteContext | None = None
-                    counts_t: Any = None
-                    try:
-                        with timer.inputSetup():
-                            counts_context = _prepare_counts_t_write(
-                                storeUri=storeUri,
-                                assayName=workflow.assayName,
-                                resources=resources,
-                                storeProbe=store_probe,
-                            )
-                        with timer.operation():
-                            assert counts_context is not None
-                            counts_t, write_details = _write_counts_t(
+    with execution_report_scope() as collected_reports, timer:
+        sampler.start()
+        try:
+            if stage == "createStore":
+                if localH5adPath is None:
+                    raise ValueError("createStore requires localH5adPath")
+                reader: H5adReader | None = None
+                writer: H5adToZarr | None = None
+                try:
+                    with timer.inputSetup():
+                        reader, writer = _prepare_create_store(
+                            localH5adPath=localH5adPath,
+                            storeUri=storeUri,
+                            workflow=workflow,
+                            resources=resources,
+                            countMatrix=countMatrix,
+                            storageIo=storageIo,
+                            storeProbe=store_probe,
+                        )
+                    with operation():
+                        assert writer is not None
+                        # Keep createStore = counts only. writeCountsT owns
+                        # paired countsT so the two stages stay measurable.
+                        writer._write_counts(batch_size=workflow.h5adBatchSize)
+                finally:
+                    if writer is not None:
+                        details = {
+                            "timingDefinition": CREATE_STORE_TIMING,
+                            "h5adProducerWorkers": getattr(
+                                writer,
+                                "_lastImportProducerCount",
+                                None,
+                            ),
+                            "h5adWriteWorkers": getattr(
+                                writer,
+                                "_lastImportWriteWorkers",
+                                None,
+                            ),
+                            "h5adWorkersPerProcess": getattr(
+                                writer,
+                                "_lastImportWorkersPerProcess",
+                                None,
+                            ),
+                        }
+                    writer = None
+                    if reader is not None:
+                        _close_h5ad_reader(reader)
+                        reader = None
+            elif stage == "writeCountsT":
+                counts_context: _CountsTWriteContext | None = None
+                counts_t: Any = None
+                try:
+                    with timer.inputSetup():
+                        counts_context = _prepare_counts_t_write(
+                            storeUri=storeUri,
+                            assayName=workflow.assayName,
+                            resources=resources,
+                            storeProbe=store_probe,
+                        )
+                    with operation():
+                        assert counts_context is not None
+                        counts_t, write_details = _write_counts_t(
+                            counts_context,
+                            storeUri=storeUri,
+                            assayName=workflow.assayName,
+                            countMatrix=countMatrix,
+                            storageIo=storageIo,
+                        )
+                    with timer.validationPersistence():
+                        assert counts_context is not None
+                        details = {
+                            **write_details,
+                            **_validate_counts_t(
                                 counts_context,
+                                counts_t,
                                 storeUri=storeUri,
                                 assayName=workflow.assayName,
-                                countMatrix=countMatrix,
-                                storageIo=storageIo,
+                                resources=resources,
+                                nCheckTiles=3,
+                                seed=0,
+                            ),
+                        }
+                finally:
+                    counts_t = None
+                    counts_context = None
+            elif stage == "initializeStore":
+                store: DataStore | None = None
+                try:
+                    if invalidateCache:
+                        root = open_store(
+                            storeUri,
+                            mode="r",
+                            storage_options=storage_options(storeUri),
+                        )
+                        if root[workflow.assayName].attrs.get("prepared") is True:
+                            raise ValueError(
+                                "Forced initialization of prepared data requires a fresh runTag"
                             )
-                        with timer.validationPersistence():
-                            assert counts_context is not None
-                            details = {
-                                **write_details,
-                                **_validate_counts_t(
-                                    counts_context,
-                                    counts_t,
-                                    storeUri=storeUri,
-                                    assayName=workflow.assayName,
-                                    resources=resources,
-                                    nCheckTiles=3,
-                                    seed=0,
-                                ),
-                            }
-                    finally:
-                        counts_t = None
-                        counts_context = None
-                elif stage == "initializeStore":
-                    store: DataStore | None = None
-                    try:
-                        if invalidateCache:
-                            root = open_store(
-                                storeUri,
-                                mode="r",
-                                storage_options=storage_options(storeUri),
+                    with operation():
+                        store = _open_datastore(
+                            storeUri,
+                            workflow,
+                            resources,
+                            initialize=True,
+                            storeProbe=store_probe,
+                            storageIo=storageIo,
+                        )
+                        _keep_store(store)
+                finally:
+                    if session is None:
+                        store = None
+            elif stage == "reopenStore":
+                store = None
+                try:
+                    with operation():
+                        store = _open_datastore(
+                            storeUri,
+                            workflow,
+                            resources,
+                            initialize=False,
+                            storeProbe=store_probe,
+                            storageIo=storageIo,
+                        )
+                finally:
+                    if session is None:
+                        store = None
+            elif stage == "runLeiden":
+                graph = _profile_input(
+                    resolved_input_refs,
+                    name="graph",
+                    kind="connectivity_map",
+                    assay=workflow.assayName,
+                )
+                with operation():
+                    worker_status = _run_leiden_in_subprocess(
+                        storeUri=storeUri,
+                        workflow=workflow,
+                        resources=resources,
+                        workDir=workDir,
+                        graph=graph,
+                        invalidateCache=invalidateCache,
+                        storageIo=storageIo,
+                    )
+                cluster_ref = require_artifact_ref(
+                    ArtifactRef.from_dict(worker_status["artifact"]),
+                    kind="cluster_labels",
+                    assay=workflow.assayName,
+                    label="The runLeiden worker result",
+                )
+                details = {
+                    "artifact": cluster_ref.to_dict(),
+                    "artifactDisposition": worker_status.get("artifactDisposition"),
+                    "subprocessSeconds": timer.result.measuredOperationSeconds,
+                    "workerWholeSeconds": worker_status.get("wholeWorkerSeconds"),
+                    "workerProcessCpuSeconds": worker_status.get("processCpuSeconds"),
+                }
+                _require_created_artifact(
+                    stage, details, allowArtifactReuse=allowArtifactReuse
+                )
+                if session is not None:
+                    session.setdefault("artifactRefs", {})[stage] = cluster_ref
+            else:
+                store = None
+                reused = (
+                    session.get("store")
+                    if session is not None and stage not in CONSUME_STAGES
+                    else None
+                )
+                try:
+                    if reused is not None:
+                        store = reused
+                    else:
+                        with timer.inputSetup():
+                            print(
+                                f"[run_stage] ENTER open_datastore stage={stage} "
+                                f"store={storeUri}",
+                                flush=True,
                             )
-                            if root[workflow.assayName].attrs.get("prepared") is True:
-                                raise ValueError(
-                                    "Forced initialization of prepared data requires a fresh runTag"
-                                )
-                        with timer.operation():
-                            store = _open_datastore(
-                                storeUri,
-                                workflow,
-                                resources,
-                                initialize=True,
-                                storeProbe=store_probe,
-                                storageIo=storageIo,
-                            )
-                            _keep_store(store)
-                    finally:
-                        if session is None:
-                            store = None
-                elif stage == "reopenStore":
-                    store = None
-                    try:
-                        with timer.operation():
                             store = _open_datastore(
                                 storeUri,
                                 workflow,
@@ -772,113 +987,57 @@ def run_stage(
                                 storeProbe=store_probe,
                                 storageIo=storageIo,
                             )
-                    finally:
-                        if session is None:
-                            store = None
-                elif stage == "runLeiden":
-                    graph = _profile_input(
-                        resolved_input_refs,
-                        name="graph",
-                        kind="connectivity_map",
-                        assay=workflow.assayName,
-                    )
-                    with timer.operation():
-                        worker_status = _run_leiden_in_subprocess(
-                            storeUri=storeUri,
-                            workflow=workflow,
-                            resources=resources,
-                            workDir=workDir,
-                            graph=graph,
+                            _keep_store(store)
+                    blas_start = _blas_threads()
+                    with operation(), artifact_plan_scope() as receipts:
+                        assert store is not None
+                        print(
+                            f"[run_stage] datastore open; ENTER analysis stage={stage}",
+                            flush=True,
+                        )
+                        analysis_details = _run_analysis(
+                            stage,
+                            store,
+                            workflow,
+                            resources,
                             invalidateCache=invalidateCache,
+                            inputRefs=resolved_input_refs,
+                            executionReports=collected_reports,
                         )
-                    cluster_ref = ArtifactRef.from_dict(worker_status["artifact"])
-                    if (
-                        cluster_ref.scope != "assay"
-                        or cluster_ref.assay != workflow.assayName
-                        or cluster_ref.kind != "cluster_labels"
-                    ):
-                        raise RuntimeError(
-                            "runLeiden worker returned an incompatible artifact"
+                        print(
+                            f"[run_stage] analysis DONE stage={stage}",
+                            flush=True,
                         )
-                    details = {
-                        "artifact": cluster_ref.to_dict(),
-                        "subprocessSeconds": timer.result.measuredOperationSeconds,
-                        "workerWholeSeconds": worker_status.get("wholeWorkerSeconds"),
-                        "workerProcessCpuSeconds": worker_status.get(
-                            "processCpuSeconds"
-                        ),
-                    }
-                    if session is not None:
-                        session.setdefault("artifactRefs", {})[stage] = cluster_ref
-                else:
-                    store = None
-                    reused = (
-                        session.get("store")
-                        if session is not None and stage not in CONSUME_STAGES
-                        else None
-                    )
-                    try:
-                        if reused is not None:
-                            store = reused
-                        else:
-                            with timer.inputSetup():
-                                print(
-                                    f"[run_stage] ENTER open_datastore stage={stage} "
-                                    f"store={storeUri}",
-                                    flush=True,
-                                )
-                                store = _open_datastore(
-                                    storeUri,
-                                    workflow,
-                                    resources,
-                                    initialize=False,
-                                    storeProbe=store_probe,
-                                    storageIo=storageIo,
-                                )
-                                _keep_store(store)
-                        with timer.operation():
-                            assert store is not None
-                            print(
-                                f"[run_stage] datastore open; ENTER analysis stage={stage}",
-                                flush=True,
+                    if analysis_details:
+                        details = {
+                            **(details or {}),
+                            **analysis_details,
+                            "blasThreads": {
+                                "start": blas_start,
+                                "end": _blas_threads(),
+                            },
+                            **_artifact_plan_details(receipts, analysis_details),
+                        }
+                        _require_created_artifact(
+                            stage, details, allowArtifactReuse=allowArtifactReuse
+                        )
+                        artifact = analysis_details.get("artifact")
+                        if session is not None and isinstance(artifact, dict):
+                            session.setdefault("artifactRefs", {})[stage] = (
+                                ArtifactRef.from_dict(artifact)
                             )
-                            analysis_details = _run_analysis(
-                                stage,
-                                store,
-                                workflow,
-                                resources,
-                                invalidateCache=invalidateCache,
-                                inputRefs=resolved_input_refs,
-                            )
-                            if analysis_details:
-                                details = {
-                                    **(details or {}),
-                                    **analysis_details,
-                                }
-                                if session is not None:
-                                    artifact = analysis_details.get("artifact")
-                                    if isinstance(artifact, dict):
-                                        session.setdefault("artifactRefs", {})[
-                                            stage
-                                        ] = ArtifactRef.from_dict(artifact)
-                            print(
-                                f"[run_stage] analysis DONE stage={stage}",
-                                flush=True,
-                            )
-                    finally:
-                        if session is None:
-                            store = None
-            except Exception as exc:
-                status = "error"
-                error = (
-                    "".join(traceback.format_exception(exc))
-                    if isinstance(exc, BaseExceptionGroup)
-                    else f"{type(exc).__name__}: {exc}"
-                )
-            finally:
-                measurement = sampler.stop()
-    finally:
-        report_scope.__exit__(None, None, None)
+                finally:
+                    if session is None:
+                        store = None
+        except Exception as exc:
+            status = "error"
+            error = (
+                "".join(traceback.format_exception(exc))
+                if isinstance(exc, BaseExceptionGroup)
+                else f"{type(exc).__name__}: {exc}"
+            )
+        finally:
+            measurement = sampler.stop()
 
     timings = timer.result
     seconds = timings.measuredOperationSeconds
@@ -891,16 +1050,17 @@ def run_stage(
     measured_child_cpu = max(0.0, read_child_cpu_seconds() - child_cpu_before)
     child_cpu_seconds = measured_child_cpu if measured_child_cpu > 0 else None
     if store_probe is not None:
-        # The Leiden child opens its own store, which this probe cannot observe.
+        # The Leiden child opens its own store, which this probe cannot observe. The
+        # multi-process H5AD writers of createStore likewise write through their own.
         details = {
             **(details or {}),
-            "storeOperations": (
-                None if stage == "runLeiden" else store_probe.to_json()
-            ),
+            "storeOperations": None if stage == "runLeiden" else operation_store_ops,
         }
+        if details.get("h5adWorkersPerProcess") is not None:
+            details["storeOperationsScope"] = "operationParentProcessOnly"
+        elif stage != "runLeiden":
+            details["storeOperationsScope"] = "operation"
     if collected_reports:
-        from scarf.storage.execution import execution_reports_by_kind
-
         details = {
             **(details or {}),
             "executionReports": execution_reports_by_kind(collected_reports),
@@ -954,30 +1114,19 @@ def run_stage(
 
 
 def _feature_consume_details(
-    workflow: WorkflowParameters,
     resources: StageResources,
+    reports: Sequence[ExecutionReport],
     *,
-    unitKind: str | None = None,
+    unitKind: str,
 ) -> dict[str, Any]:
-    from scarf.storage.execution import (
-        last_execution_report,
-        recorded_execution_reports,
-    )
-
+    """Summarize the stage's own last execution report of ``unitKind``."""
     payload: dict[str, Any] = {
         "workers": resources.workers,
         "scarfMemoryBudget": resources.scarfMemoryBudget,
     }
-    selected = None
-    reports = recorded_execution_reports()
-    if unitKind is not None:
-        matching = [report for report in reports if report.unitKind == unitKind]
-        if matching:
-            selected = matching[-1]
-    if selected is None:
-        selected = last_execution_report()
-    if selected is not None:
-        payload.update(selected.as_metrics())
+    matching = [report for report in reports if report.unitKind == unitKind]
+    if matching:
+        payload.update(matching[-1].as_metrics())
     return payload
 
 
@@ -1069,7 +1218,7 @@ def _import_cluster_labels(
         source_uri,
         default_assay=workflow.assayName,
         zarr_mode="r",
-        zarrProfile=("cloud" if source_uri.startswith("s3://") else "fast_local"),
+        zarrProfile=_storage_profile(source_uri),
         storage_options=options,
     )
     source_ref = ArtifactRef(
@@ -1253,13 +1402,13 @@ def _graph_from_clusters(root: Any, clusters: ArtifactRef) -> ArtifactRef:
     raw_graph = (status.inputs or {}).get("graph")
     if not isinstance(raw_graph, dict):
         raise ValueError("Leiden artifact has no connectivity_map input")
-    graph = ArtifactRef.from_dict(raw_graph)
-    if (
-        graph.scope != "assay"
-        or graph.assay != clusters.assay
-        or graph.kind != "connectivity_map"
-    ):
-        raise ValueError("Leiden artifact graph input is not a connectivity_map")
+    assert clusters.assay is not None
+    graph = require_artifact_ref(
+        ArtifactRef.from_dict(raw_graph),
+        kind="connectivity_map",
+        assay=clusters.assay,
+        label="The Leiden graph input",
+    )
     graph_status = inspect_artifact(root, graph)
     if not graph_status.exists or not graph_status.complete:
         raise ValueError(f"Leiden graph artifact is unavailable: {graph_status.path}")
@@ -1296,14 +1445,9 @@ def _profile_input(
     ref = inputs.get(name)
     if ref is None:
         raise ValueError(f"Profiling stage requires explicit {name!r} input ({kind})")
-    expected_scope = "datastore" if kind == "cell_selection" else "assay"
-    expected_assay = None if expected_scope == "datastore" else assay
-    if ref.scope != expected_scope or ref.assay != expected_assay or ref.kind != kind:
-        raise ValueError(
-            f"Profiling input {name!r} must be a {expected_scope}-scoped "
-            f"{kind} artifact for {expected_assay!r}"
-        )
-    return ref
+    return require_artifact_ref(
+        ref, kind=kind, assay=assay, label=f"Profiling input {name!r}"
+    )
 
 
 def _run_analysis(
@@ -1314,6 +1458,7 @@ def _run_analysis(
     *,
     invalidateCache: bool = False,
     inputRefs: dict[str, ArtifactRef] | None = None,
+    executionReports: Sequence[ExecutionReport] = (),
 ) -> dict[str, Any] | None:
     inputs = inputRefs or {}
     if stage == "filterCells":
@@ -1343,8 +1488,8 @@ def _run_analysis(
         return {
             "artifact": ref.to_dict(),
             "consume": _feature_consume_details(
-                workflow,
                 resources,
+                executionReports,
                 unitKind="countsTCellBand",
             ),
         }
@@ -1490,8 +1635,8 @@ def _run_analysis(
         return {
             "artifact": ref.to_dict(),
             "consume": _feature_consume_details(
-                workflow,
                 resources,
+                executionReports,
                 unitKind="countsTReadGroup",
             ),
         }

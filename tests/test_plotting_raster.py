@@ -156,9 +156,20 @@ def test_embedding_raster_accepts_explicit_literal_metadata_layout():
     result.close()
 
 
+def _embedding_status(layout, operation: str, inputs: dict):
+    from scarf.storage import ArtifactStatus
+
+    return ArtifactStatus(
+        ref=layout,
+        path="embedding",
+        exists=True,
+        complete=True,
+        provenance={"operation": operation, "parameters": {}, "inputs": inputs},
+    )
+
+
 def test_embedding_lineage_accepts_datastore_scoped_native_layout(monkeypatch):
     import importlib
-    from types import SimpleNamespace
 
     from scarf.storage import ArtifactRef
 
@@ -179,10 +190,10 @@ def test_embedding_lineage_accepts_datastore_scoped_native_layout(monkeypatch):
         kind="embedding",
         artifact_id="3" * 64,
     )
-    status = SimpleNamespace(
-        complete=True,
-        operation="run_umap",
-        inputs={"graph": graph.to_dict(), "cell_selection": selection.to_dict()},
+    status = _embedding_status(
+        layout,
+        "run_umap",
+        {"graph": graph.to_dict(), "cell_selection": selection.to_dict()},
     )
     monkeypatch.setattr(data_module, "inspect_artifact", lambda root, ref: status)
     monkeypatch.setattr(
@@ -199,7 +210,6 @@ def test_embedding_lineage_rejects_unknown_producer_and_graph_selection(
     monkeypatch,
 ):
     import importlib
-    from types import SimpleNamespace
 
     from scarf.storage import ArtifactRef
 
@@ -232,10 +242,10 @@ def test_embedding_lineage_rejects_unknown_producer_and_graph_selection(
     monkeypatch.setattr(
         data_module,
         "inspect_artifact",
-        lambda root, ref: SimpleNamespace(
-            complete=True,
-            operation="foreign_embedding",
-            inputs={"cell_selection": direct_selection.to_dict()},
+        lambda root, ref: _embedding_status(
+            layout,
+            "foreign_embedding",
+            {"cell_selection": direct_selection.to_dict()},
         ),
     )
     with pytest.raises(ValueError, match="must be produced"):
@@ -244,13 +254,10 @@ def test_embedding_lineage_rejects_unknown_producer_and_graph_selection(
     monkeypatch.setattr(
         data_module,
         "inspect_artifact",
-        lambda root, ref: SimpleNamespace(
-            complete=True,
-            operation="run_tsne",
-            inputs={
-                "graph": graph.to_dict(),
-                "cell_selection": direct_selection.to_dict(),
-            },
+        lambda root, ref: _embedding_status(
+            layout,
+            "run_tsne",
+            {"graph": graph.to_dict(), "cell_selection": direct_selection.to_dict()},
         ),
     )
     monkeypatch.setattr(
@@ -354,12 +361,25 @@ def test_artifact_raster_adapter_reads_only_compact_coordinate_slices(monkeypatc
         np.concatenate([block.active_global_indices for block in blocks]),
         [0, 2, 4],
     )
-    np.testing.assert_equal(
+    # Blocks carry stored values; the raster reader applies each live mask once.
+    np.testing.assert_array_equal(
         np.concatenate([block.values["score"] for block in blocks]),
+        [0, 2, 4],
+    )
+    assert view._get_missing_mask_array(raster_module._ARTIFACT_X) is None
+    from scarf.plotting._raster import _MissingMaskRows, _raster_block_values
+
+    masks = _MissingMaskRows(view)
+    np.testing.assert_equal(
+        np.concatenate(
+            [_raster_block_values(masks, block, "score") for block in blocks]
+        ),
         [0.0, np.nan, 4.0],
     )
     np.testing.assert_array_equal(
-        np.concatenate([block.values["keep"] for block in blocks]),
+        np.concatenate(
+            [_raster_block_values(masks, block, "keep") for block in blocks]
+        ),
         [True, True, False],
     )
 

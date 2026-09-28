@@ -9,7 +9,6 @@ from scarf.writers import (
     CSVtoZarr,
     CrToZarr,
     SubsetZarr,
-    bed_to_sparse_array,
     subset_assay_zarr,
 )
 
@@ -357,7 +356,6 @@ def test_h5ad_import_returns_cold_loadable_analytical_artifacts(
     assert set(result.clusterArtifacts) == {"leiden"}
     assert {ref.kind for ref in result.embeddingArtifacts.values()} == {"embedding"}
     assert result.clusterArtifacts["leiden"].kind == "cluster_labels"
-    assert all(isinstance(ref, ArtifactRef) for ref in result.artifactRefs)
     with pytest.raises(TypeError):
         result.embeddingArtifacts["alias"] = result.embeddingArtifacts["X_umap"]  # type: ignore[index]
 
@@ -1075,36 +1073,28 @@ def test_h5adtozarr_spills_csc_with_bounded_resident_memory(tmp_path):
         reader.close()
 
 
-@pytest.mark.parametrize("convert_clone", [False, True])
-def test_h5ad_clones_share_spill_until_the_last_reader_closes(tmp_path, convert_clone):
+@pytest.mark.parametrize("from_inspect", [False, True])
+def test_h5ad_csc_spill_is_removed_when_the_reader_closes(tmp_path, from_inspect):
     from pathlib import Path
     from scarf.readers import H5adReader, inspect_h5ad
 
     values = np.array([[1, 0], [0, 2], [3, 4]], dtype=np.uint16)
-    path = _write_h5ad(tmp_path / "shared_csc.h5ad", values, encoding="csc")
+    path = _write_h5ad(tmp_path / "spilled_csc.h5ad", values, encoding="csc")
     scratch = tmp_path / "scratch"
     scratch.mkdir()
-    if convert_clone:
-        parent = H5adReader.from_inspect(inspect_h5ad(path), temp_dir=scratch)
-        try:
-            reader = parent.open_clone()
-        finally:
-            parent.close()
+    if from_inspect:
+        reader = H5adReader.from_inspect(inspect_h5ad(path), temp_dir=scratch)
     else:
         reader = H5adReader(
             str(path), feature_name_key="feature_name", temp_dir=str(scratch)
         )
-    reader.materialize_csc()
-    directory = Path(reader._convertedCsr._directory.name)
-    clone = reader.open_clone()
     try:
+        reader.materialize_csc()
+        directory = Path(reader._convertedCsr._directory.name)
         assert directory.parent == scratch
-        reader.close()
-        assert directory.exists()
-        np.testing.assert_array_equal(next(clone.consume(3)).toarray(), values)
+        np.testing.assert_array_equal(next(reader.consume(3)).toarray(), values)
     finally:
         reader.close()
-        clone.close()
     assert not directory.exists()
     assert list(scratch.iterdir()) == []
 
@@ -1640,6 +1630,31 @@ def test_subset_assay_zarr_selects_ordered_rows_and_columns():
     )
 
 
+def test_subset_assay_zarr_counts_carry_the_count_matrix_layout():
+    from scarf.storage.counts_t_contract import validate_count_matrix
+
+    store = MemoryStore()
+    root = zarr.open_group(store=store, mode="w")
+    root.create_array("source", data=np.arange(20, dtype=np.uint16).reshape(5, 4))
+    root.create_group("subset")
+
+    subset_assay_zarr(
+        store,
+        in_grp="source",
+        out_grp="subset/counts",
+        cells_idx=np.array([4, 1, 3]),
+        feat_idx=np.array([3, 0]),
+    )
+
+    counts, _ = validate_count_matrix(
+        zarr.open_group(store=store, path="subset", mode="r"),
+        require_transpose=False,
+    )
+    np.testing.assert_array_equal(
+        counts[:], np.arange(20, dtype=np.uint16).reshape(5, 4)[[4, 1, 3]][:, [3, 0]]
+    )
+
+
 @pytest.mark.parametrize(
     "values",
     [
@@ -1663,42 +1678,6 @@ def test_subset_assay_zarr_preserves_numeric_dtype_and_values(values):
 
     assert root["selected"].dtype == values.dtype
     np.testing.assert_array_equal(root["selected"][:], values[::-1, ::-1])
-
-
-def test_bed_to_sparse_array_bins_filters_and_drops_unknown_features(tmp_path):
-    bed_path = tmp_path / "fragments.bed"
-    bed_path.write_text(
-        "# test fragments\n"
-        "chr1\t0\t20\tcellB\t2\n"
-        "chr1\t100\t120\tcellA\t3\n"
-        "chr2\t0\t20\tcellB\t4\n"
-        "chr1\t0\t10\tcellC\t5\n"
-        "chr1\t10\t20\tcellA\t1\n"
-        "chr2\t200\t220\tcellD\t1\n",
-        encoding="utf-8",
-    )
-
-    matrix, cell_ids, feature_ids = bed_to_sparse_array(
-        str(bed_path),
-        bin_size=100,
-        chrom_sizes={"chr1": 199, "chr2": 99},
-        min_counts_per_cell=3,
-        read_chunk_size=2,
-        disable_tqdm=True,
-    )
-
-    assert cell_ids.tolist() == ["cellB", "cellA", "cellC"]
-    assert feature_ids.tolist() == ["chr1_0", "chr1_1", "chr2_0"]
-    np.testing.assert_array_equal(
-        matrix.toarray(),
-        np.array(
-            [
-                [2, 0, 4],
-                [1, 3, 0],
-                [5, 0, 0],
-            ]
-        ),
-    )
 
 
 def test_v2_fixture_read_only(datastore):
@@ -2007,7 +1986,7 @@ def test_to_mtx_preserves_counts_barcodes_and_features(export_assay_store, tmp_p
     out_dir = tmp_path / "toy_mtx"
     to_mtx(assay, str(out_dir), compress=False)
 
-    exported = mmread(out_dir / "matrix.mtx").tocsr()
+    exported = mmread(out_dir / "matrix.mtx", spmatrix=False).tocsr()
     expected = csr_matrix(assay.rawData.compute()).T.tocsr()
     assert exported.shape == (assay.feats.N, assay.cells.N)
     np.testing.assert_array_equal(exported.toarray(), expected.toarray())
@@ -2045,13 +2024,27 @@ def test_to_mtx_compress_writes_gzipped_matrix_market(export_assay_store, tmp_pa
     assert (out_dir / "barcodes.tsv.gz").is_file()
     assert (out_dir / "features.tsv.gz").is_file()
 
-    exported = mmread(gzip.open(out_dir / "matrix.mtx.gz", "rt")).tocsr()
+    exported = mmread(
+        gzip.open(out_dir / "matrix.mtx.gz", "rt"),
+        spmatrix=False,
+    ).tocsr()
     expected = csr_matrix(assay.rawData.compute()).T.tocsr()
     np.testing.assert_array_equal(exported.toarray(), expected.toarray())
 
     with gzip.open(out_dir / "barcodes.tsv.gz", "rt") as handle:
         barcodes = [line.strip() for line in handle if line.strip()]
     assert barcodes == list(assay.cells.fetch_all("ids").astype(str))
+
+    # Cell Ranger 3 readers expect id, name, and feature type columns.
+    with gzip.open(out_dir / "features.tsv.gz", "rt") as handle:
+        features = [line.rstrip("\n").split("\t") for line in handle if line.strip()]
+    assert [row[0] for row in features] == list(
+        assay.feats.fetch_all("ids").astype(str)
+    )
+    assert {len(row) for row in features} == {3}
+    assert {row[2] for row in features} == set(
+        assay.feats.fetch_all("feature_type").astype(str)
+    )
 
 
 @pytest.mark.parametrize("compress", [False, True])
@@ -2077,7 +2070,10 @@ def test_to_mtx_preserves_fractional_counts(tmp_path, compress):
     to_mtx(dataset.RNA, str(out_dir), compress=compress)
 
     filename = "matrix.mtx.gz" if compress else "matrix.mtx"
-    np.testing.assert_array_equal(mmread(out_dir / filename).toarray(), values.T)
+    np.testing.assert_array_equal(
+        mmread(out_dir / filename, spmatrix=False).toarray(),
+        values.T,
+    )
 
 
 def test_zarr_subset(datastore, tmp_path):
@@ -2711,3 +2707,183 @@ def test_source_assay_types_reads_artifact_root() -> None:
     assert _source_assay_types(SimpleNamespace(_artifact_root=untyped)) == {}
     typed = SimpleNamespace(attrs={"assayTypes": {"RNA": "RNA"}})
     assert _source_assay_types(SimpleNamespace(_artifact_root=typed)) == {"RNA": "RNA"}
+
+
+def test_h5ad_import_links_missing_masks_and_keeps_nullable_booleans(tmp_path):
+    import h5py
+
+    from scarf.readers import H5adReader
+    from scarf.storage.arrays import linked_missing_mask
+    from scarf.writers import H5adToZarr
+
+    path = _write_h5ad(tmp_path / "nullable.h5ad", np.eye(3, dtype=np.uint16))
+    text = h5py.string_dtype()
+    with h5py.File(path, "r+") as h5:
+        obs = h5["obs"]
+        batch = obs.create_group("batch")
+        batch.attrs["encoding-type"] = "categorical"
+        batch.create_dataset("codes", data=np.array([0, -1, 1], dtype=np.int8))
+        batch.create_dataset(
+            "categories", data=np.array(["a", "b"], dtype=object), dtype=text
+        )
+        flag = obs.create_group("flag")
+        flag.attrs["encoding-type"] = "nullable-boolean"
+        flag.create_dataset("values", data=np.array([True, False, False]))
+        flag.create_dataset("mask", data=np.array([False, True, False]))
+        note = obs.create_group("note")
+        note.attrs["encoding-type"] = "nullable-string-array"
+        note.create_dataset(
+            "values", data=np.array(["x", "", ""], dtype=object), dtype=text
+        )
+        note.create_dataset("mask", data=np.array([False, True, False]))
+        obs.create_dataset("score", data=np.array([0.5, 1.5, 2.5]))
+
+    reader = H5adReader(str(path), feature_name_key="feature_name")
+    try:
+        writer = H5adToZarr(reader, zarr_loc=MemoryStore(), nthreads=1)
+        writer.dump()
+    finally:
+        reader.close()
+
+    cells = writer.z["cellData"]
+    expected = {
+        "batch": (["a", "", "b"], [False, True, False]),
+        "flag": ([True, False, False], [False, True, False]),
+        # A genuine empty string stays distinct from a missing value.
+        "note": (["x", "", ""], [False, True, False]),
+    }
+    for name, (values, missing) in expected.items():
+        mask = linked_missing_mask(cells, name)
+        assert mask is not None, name
+        np.testing.assert_array_equal(cells[name][:], values)
+        np.testing.assert_array_equal(mask[:], missing)
+    assert cells["flag"].dtype == np.dtype(bool)
+    assert linked_missing_mask(cells, "score") is None
+
+
+def test_to_h5ad_writes_anndata_encodings_that_round_trip(export_assay_store, tmp_path):
+    anndata = pytest.importorskip("anndata")
+    import warnings
+
+    from anndata._warnings import OldFormatWarning
+
+    from scarf.writers import to_h5ad
+
+    assay = export_assay_store.RNA
+    path = tmp_path / "encoded.h5ad"
+    to_h5ad(assay, str(path))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", OldFormatWarning)
+        adata = anndata.read_h5ad(path)
+    assert "_index" not in adata.obs.columns
+    assert "_index" not in adata.var.columns
+    assert list(adata.obs_names) == list(assay.cells.fetch_all("ids").astype(str))
+    rewritten = tmp_path / "rewritten.h5ad"
+    adata.write_h5ad(rewritten)
+    assert anndata.read_h5ad(rewritten).shape == adata.shape
+
+
+def test_to_h5ad_orders_embedding_components_numerically(export_assay_store, tmp_path):
+    import h5py
+
+    from scarf.writers import to_h5ad
+
+    assay = export_assay_store.RNA
+    n_cells = assay.cells.N
+    for component in range(1, 13):
+        assay.cells.insert(
+            f"RNA_PCA{component}",
+            np.full(n_cells, float(component)),
+            overwrite=True,
+        )
+    path = tmp_path / "components.h5ad"
+    to_h5ad(assay, str(path), embeddings_cols=["PCA"])
+
+    with h5py.File(path, "r") as h5:
+        assert set(h5["obsm"]) == {"X_pca"}
+        np.testing.assert_array_equal(h5["obsm/X_pca"][0], np.arange(1, 13))
+
+
+def test_csv_import_keeps_later_fractional_counts_and_missing_text(tmp_path):
+    from scarf.readers import CSVReader
+    from scarf.storage.arrays import linked_missing_mask
+
+    path = tmp_path / "counts.csv"
+    path.write_text("cell,g1,g2,label\nc1,1,0,a\nc2,0,2,b\nc3,2.5,7,\n")
+    reader = CSVReader(str(path), id_column=0, batch_size=2, cell_data_cols=["label"])
+    store = MemoryStore()
+    CSVtoZarr(reader, store, assay_name="RNA", nthreads=1).dump()
+
+    root = zarr.open_group(store=store, mode="r")
+    np.testing.assert_array_equal(root["RNA/counts"][:], [[1, 0], [0, 2], [2.5, 7]])
+    np.testing.assert_array_equal(root["cellData/label"][:], ["a", "b", ""])
+    mask = linked_missing_mask(root["cellData"], "label")
+    assert mask is not None
+    np.testing.assert_array_equal(mask[:], [False, False, True])
+
+
+def test_import_writers_accept_an_explicit_assay_type(tmp_path):
+    from scipy.sparse import csr_matrix
+
+    from scarf.writers import SparseToZarr
+
+    matrix = csr_matrix(np.arange(1, 13, dtype=np.uint32).reshape(4, 3))
+    store = MemoryStore()
+    SparseToZarr(
+        matrix,
+        store,
+        cell_ids=[f"c{i}" for i in range(4)],
+        feature_ids=["g0", "g1", "g2"],
+        assay_name="GEX",
+        assay_type="RNA",
+        nthreads=1,
+    ).dump()
+
+    root = zarr.open_group(store=store, mode="r")
+    assert root.attrs["assayTypes"] == {"GEX": "RNA"}
+    np.testing.assert_array_equal(root["GEX/countsT"][:], matrix.toarray().T)
+
+    untouched = MemoryStore()
+    zarr.open_group(store=untouched, mode="w").create_group("sentinel")
+    with pytest.raises(ValueError, match="assay_type 'rna' is not a preset"):
+        SparseToZarr(
+            matrix,
+            untouched,
+            cell_ids=[f"c{i}" for i in range(4)],
+            feature_ids=["g0", "g1", "g2"],
+            assay_type="rna",
+        )
+    assert set(zarr.open_group(store=untouched, mode="r").group_keys()) == {"sentinel"}
+
+
+def test_h5ad_worker_messages_wait_for_a_clean_exit_result():
+    import threading
+    import time
+    from multiprocessing import Pipe
+    from types import SimpleNamespace
+
+    from scarf.writers.h5ad import _worker_messages
+
+    receiver, sender = Pipe(duplex=False)
+    # The worker already exited cleanly; its result arrives after one wait.
+    worker = SimpleNamespace(exitcode=0, name="h5ad-writer-0")
+
+    def send_late() -> None:
+        time.sleep(0.8)
+        sender.send(("done", "result"))
+        sender.close()
+
+    thread = threading.Thread(target=send_late)
+    thread.start()
+    try:
+        messages = list(_worker_messages({receiver: 0}, [worker], "writer"))
+    finally:
+        thread.join()
+    assert messages == [(0, "done", "result")]
+
+    receiver, sender = Pipe(duplex=False)
+    failed = SimpleNamespace(exitcode=3, name="h5ad-writer-1")
+    with pytest.raises(RuntimeError, match="h5ad-writer-1 exitcode=3"):
+        list(_worker_messages({receiver: 0}, [failed], "writer"))
+    sender.close()

@@ -10,6 +10,7 @@ from scarf.features.enrichment import aucell
 from scarf.features.genomic import intervals
 from scarf.metrics import connectivity
 from scarf.neighbors import diffusion
+from scarf.neighbors import graph as neighbor_graph
 from scarf.trajectory import fate
 
 
@@ -132,37 +133,31 @@ def test_paris_python_contraction_group_kernel_rejects_overlapping_pair() -> Non
         )
 
 
-def test_paris_python_symmetry_kernel_reports_each_failure_mode() -> None:
+def test_csr_symmetry_kernel_reports_each_failure_mode() -> None:
     valid = csr_matrix(np.array([[0.0, 1.0], [1.0, 0.0]]))
     self_loop = csr_matrix(np.array([[1.0, 0.0], [0.0, 0.0]]))
     directed = csr_matrix(np.array([[0.0, 1.0], [0.0, 0.0]]))
     unequal = csr_matrix(np.array([[0.0, 1.0], [2.0, 0.0]]))
+    kernel = neighbor_graph.csr_symmetry_error
 
-    assert (
-        paris_modularity._csr_symmetry_error.py_func(
-            valid.indptr, valid.indices, valid.data
+    def check(graph: csr_matrix, allow_self_loops: bool, compare_values: bool) -> int:
+        arguments = (
+            graph.indptr,
+            graph.indices,
+            graph.data if compare_values else None,
+            allow_self_loops,
         )
-        == paris_modularity._csr_symmetry_error(valid.indptr, valid.indices, valid.data)
-        == 0
-    )
-    assert (
-        paris_modularity._csr_symmetry_error.py_func(
-            self_loop.indptr, self_loop.indices, self_loop.data
-        )
-        == 1
-    )
-    assert (
-        paris_modularity._csr_symmetry_error.py_func(
-            directed.indptr, directed.indices, directed.data
-        )
-        == 2
-    )
-    assert (
-        paris_modularity._csr_symmetry_error.py_func(
-            unequal.indptr, unequal.indices, unequal.data
-        )
-        == 3
-    )
+        python = kernel.py_func(*arguments)
+        assert kernel(*arguments) == python
+        return int(python)
+
+    assert check(valid, False, True) == 0
+    assert check(self_loop, False, True) == 1
+    assert check(self_loop, True, True) == 0
+    assert check(directed, False, True) == 2
+    assert check(directed, True, False) == 2
+    assert check(unequal, False, True) == 3
+    assert check(unequal, True, False) == 0
 
 
 def test_paris_python_union_find_kernels_cover_compression_and_rank_cases() -> None:
@@ -298,12 +293,14 @@ def test_fate_python_row_bias_kernel_handles_self_loops_underflow_and_isolates()
     assert row_zero[1:].sum() == 1.0
 
 
-def test_fate_python_support_kernel_accepts_symmetric_and_rejects_directed() -> None:
+def test_fate_support_check_accepts_self_loops_and_rejects_directed() -> None:
     symmetric = csr_matrix(np.array([[2, 1, 0], [1, 0, 1], [0, 1, 0]]))
     directed = csr_matrix(np.array([[0, 1, 0], [0, 0, 1], [0, 0, 0]]))
+    kernel = neighbor_graph.csr_symmetry_error
 
-    assert fate._has_symmetric_support.py_func(symmetric.indices, symmetric.indptr)
-    assert not fate._has_symmetric_support.py_func(directed.indices, directed.indptr)
+    for check in (kernel, kernel.py_func):
+        assert check(symmetric.indptr, symmetric.indices, None, True) == 0
+        assert check(directed.indptr, directed.indices, None, True) == 2
 
 
 @pytest.mark.parametrize("descending", [False, True])

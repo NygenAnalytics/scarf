@@ -48,9 +48,9 @@ def create_store(
         profile="fast_local",
     )
     counts[:] = values
-    from scarf.storage.identity import finalize_counts
+    from tests.storage_helpers import finalize_test_counts
 
-    finalize_counts(counts)
+    finalize_test_counts(counts)
     count_group = root["RNA"] if workspace is None else root["matrices/RNA"]
     write_counts_t(
         counts,
@@ -71,3 +71,15 @@ def create_store(
         ribo_pattern=ribo_pattern,
     )
     return path
+
+
+def save_request(orchestrator, store, workflow, request):
+    """Save one request record as a workflow commits it after its ingest stage."""
+    from scarf.agent.orchestrator import journal
+
+    record = orchestrator._request_record(store, workflow, request)
+    prefix = journal._ensure_orchestration_store(store)
+    journal._write_model_once(
+        store.zw, journal._request_key(prefix, workflow.workflowRunId), record
+    )
+    return record

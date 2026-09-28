@@ -98,15 +98,13 @@ from scarf.datastore.datastore import DataStore
 from scarf.datastore.graph_datastore import GraphDataStore
 from scarf.datastore.mapping_datastore import MappingDatastore
 from scarf.cytebase import Repository, connect, list_repositories
-from scarf.embeddings.harmony import Harmony, HarmonyResult, fit_harmony, run_harmony
+from scarf.embeddings.harmony import Harmony, HarmonyResult, fit_harmony
 from scarf.features import (
-    GffReader,
-    coordinate_melding,
     find_markers_by_rank,
     fit_lowess,
     select_highly_variable_features,
 )
-from scarf.matrix import Block, ChunkedArray
+from scarf.matrix import ChunkedArray
 from scarf.merge import DataStoreMerge
 from scarf.metadata import MetaData, MetaDataRowBlock
 from scarf.readers import (
@@ -144,10 +142,9 @@ from scarf.writers import (
 assert "site-packages" in Path(scarf.__file__).as_posix()
 assert issubclass(DataStore, MappingDatastore)
 assert issubclass(MappingDatastore, GraphDataStore)
-for harmony_object in (Harmony, HarmonyResult, fit_harmony, run_harmony):
+for harmony_object in (Harmony, HarmonyResult, fit_harmony):
     assert harmony_object.__module__ == "scarf.embeddings.harmony"
-for matrix_class in (Block, ChunkedArray):
-    assert matrix_class.__module__ == "scarf.matrix"
+assert ChunkedArray.__module__ == "scarf.matrix"
 for metadata_class in (MetaData, MetaDataRowBlock):
     assert metadata_class.__module__ == "scarf.metadata"
 assert scarf.DataStoreMerge is scarf.merge.DataStoreMerge is DataStoreMerge
@@ -165,10 +162,7 @@ assert scarf.cytebase.connect is connect
 assert scarf.cytebase.list_repositories is list_repositories
 assert scarf.ArtifactLineage is ArtifactLineage
 assert ArtifactLineage.__module__ == "scarf.storage.lineage"
-assert scarf.GffReader is GffReader
-assert scarf.coordinate_melding is coordinate_melding
 for feature_function in (
-    coordinate_melding,
     find_markers_by_rank,
     fit_lowess,
     select_highly_variable_features,
@@ -216,13 +210,13 @@ for method in (
     "select_hvgs",
     "run_pseudotime_aggregation",
     "run_pseudotime_marker_search",
-    "load_metric_lisi",
-    "metric_lisi",
 ):
     assert callable(getattr(DataStore, method))
 for method in (
     "_load_unified_layout_data",
+    "load_metric_lisi",
     "load_unified_graph",
+    "metric_lisi",
     "run_unified_tsne",
     "run_unified_umap",
 ):

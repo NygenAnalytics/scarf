@@ -1,5 +1,5 @@
-from collections.abc import Iterable, Iterator
-from dataclasses import dataclass, replace
+from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -13,6 +13,7 @@ from ..metadata.rows import (
     read_metadata_rows_chunkwise,
 )
 from ..storage.arrays import (
+    MISSING_MASK_PREFIX,
     MetadataBlock,
     create_streamed_metadata_column,
 )
@@ -30,11 +31,21 @@ from .row_plan import (
     RowPlanSegment,
     iter_row_plan_segments,
     max_row_plan_block_rows,
+    prefixed_cell_ids,
     verify_merged_cell_ids,
 )
 
 
 _PROTECTED = frozenset({"ids", "I", "names"})
+# Column attributes carried into merged metadata; a selection fingerprint
+# describes one source's features and never survives a merge.
+_MERGED_ATTRIBUTES = tuple(
+    key for key in COLUMN_METADATA_ATTRIBUTES if key != "feature_selection_fingerprint"
+)
+
+
+def _cell_data_path(workspace: str | None) -> str:
+    return "cellData" if workspace is None else f"{workspace}/cellData"
 
 
 class _SourceConflict(ValueError):
@@ -52,6 +63,7 @@ class MetadataColumnSpec:
     sourceReadBytesPerRow: int = 0
     maskReadFixedBytes: int = 0
     maskReadBytesPerRow: int = 0
+    attributes: dict[str, Any] = field(default_factory=dict)
 
 
 def _chunk_resident_bytes(dtype: np.dtype[Any], chunk_rows: int) -> int:
@@ -102,6 +114,8 @@ def _band_write_bytes(spec: MetadataColumnSpec, rows: int, chunk_rows: int) -> i
 class CellMetadataPlan:
     columns: tuple[MetadataColumnSpec, ...]
     blockRows: int
+    # Public column name to source column name, per source.
+    sourceColumns: tuple[dict[str, str], ...]
 
     def peak_write_bytes_at(self, rows: int, *, chunk_rows: int) -> int:
         return max(
@@ -345,6 +359,7 @@ def _metadata_column_spec(
     mask_arrays: Iterable[Any] = (),
     role: str | None = None,
     assay: str | None = None,
+    attributes: dict[str, Any] | None = None,
 ) -> MetadataColumnSpec:
     source_fixed, source_per_row = _max_selection_parts(value_arrays)
     mask_fixed, mask_per_row = _max_selection_parts(mask_arrays)
@@ -358,7 +373,42 @@ def _metadata_column_spec(
         sourceReadBytesPerRow=source_per_row,
         maskReadFixedBytes=mask_fixed,
         maskReadBytesPerRow=mask_per_row,
+        attributes={} if attributes is None else attributes,
     )
+
+
+def _reconciled_cell_attributes(
+    arrays: Iterable[Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Merge one cell column's source attributes.
+
+    Equal values are kept. Differing ``levels`` of an unordered column become
+    their union in first-seen order. Any other disagreement drops the
+    attribute, and the dropped names are returned.
+    """
+    found: dict[str, list[Any]] = {}
+    for array in arrays:
+        attrs = getattr(array, "attrs", {})
+        for key in _MERGED_ATTRIBUTES:
+            if key in attrs:
+                found.setdefault(key, []).append(attrs[key])
+    ordered = any(value is True for value in found.get("ordered", ()))
+    kept: dict[str, Any] = {}
+    dropped: list[str] = []
+    for key, values in found.items():
+        if all(value == values[0] for value in values[1:]):
+            kept[key] = values[0]
+        elif key == "levels" and not ordered:
+            kept[key] = list(
+                dict.fromkeys(level for group in values for level in group)
+            )
+        else:
+            dropped.append(key)
+    if "levels" in dropped and "ordered" in kept:
+        # Order is defined by the levels, so it cannot outlive them.
+        del kept["ordered"]
+        dropped.append("ordered")
+    return kept, dropped
 
 
 def plan_cell_metadata(
@@ -413,6 +463,18 @@ def plan_cell_metadata(
         all_public.add(source_column)
 
     columns: list[MetadataColumnSpec] = []
+    dropped_attributes: dict[str, list[str]] = {}
+
+    def attributes_for(public: str) -> dict[str, Any]:
+        kept, dropped = _reconciled_cell_attributes(
+            table._get_array(source_col)
+            for table, mapping in zip(source_cell_tables, per_source, strict=True)
+            if (source_col := mapping.get(public)) is not None
+        )
+        if dropped:
+            dropped_attributes[public] = dropped
+        return kept
+
     # Stable order: ids, names, I, source, membership, then remaining sorted.
     ordered = ["ids", "names", "I"]
     if source_column is not None:
@@ -444,6 +506,7 @@ def plan_cell_metadata(
                     value_arrays=(
                         table._get_array("ids") for table in source_cell_tables
                     ),
+                    attributes=attributes_for(public),
                 )
             )
             continue
@@ -466,6 +529,7 @@ def plan_cell_metadata(
                     value_arrays=(
                         table._get_array("names") for table in source_cell_tables
                     ),
+                    attributes=attributes_for(public),
                 )
             )
             continue
@@ -480,6 +544,7 @@ def plan_cell_metadata(
                         if reset_cell_filter
                         else (table._get_array("I") for table in source_cell_tables)
                     ),
+                    attributes=attributes_for(public),
                 )
             )
             continue
@@ -497,6 +562,7 @@ def plan_cell_metadata(
                     False,
                     role="assay_membership",
                     assay=public[:-2],
+                    attributes=attributes_for(public),
                 )
             )
             continue
@@ -548,12 +614,24 @@ def plan_cell_metadata(
                 has_missing,
                 value_arrays=value_arrays,
                 mask_arrays=mask_arrays,
+                attributes=attributes_for(public),
             )
         )
 
-    # reset_cell_filter only affects values, not schema.
-    _ = reset_cell_filter
-    return CellMetadataPlan(tuple(columns), block_rows)
+    if dropped_attributes:
+        logger.warning(
+            "Cell metadata attributes that differ between merged sources were "
+            "dropped: "
+            + "; ".join(
+                f"{column} ({', '.join(keys)})"
+                for column, keys in dropped_attributes.items()
+            )
+        )
+    return CellMetadataPlan(
+        tuple(columns),
+        block_rows,
+        sourceColumns=tuple(per_source),
+    )
 
 
 def _promote_dtypes(dtypes: list[np.dtype[Any]]) -> np.dtype[Any]:
@@ -583,12 +661,11 @@ def _fill_value(dtype: np.dtype[Any]) -> Any:
 def _merged_column_attributes(arrays: Iterable[Any], name: str) -> dict[str, Any]:
     attributes: dict[str, Any] = {}
     for array in arrays:
-        for key, value in getattr(array, "attrs", {}).items():
-            if (
-                key not in COLUMN_METADATA_ATTRIBUTES
-                or key == "feature_selection_fingerprint"
-            ):
+        attrs = getattr(array, "attrs", {})
+        for key in _MERGED_ATTRIBUTES:
+            if key not in attrs:
                 continue
+            value = attrs[key]
             if key in attributes and attributes[key] != value:
                 raise _SourceConflict(
                     f"Conflicting metadata for column {name!r}: {key}"
@@ -690,8 +767,13 @@ def write_feature_metadata(
                     )
                     if np.any(conflict):
                         raise _SourceConflict(name)
-                    values[positions[present]] = incoming[present]
-                    missing[positions[present]] = False
+                    kept = positions[present]
+                    values[kept] = incoming[present]
+                    # Rows of one source summed into one feature must agree;
+                    # the assignment keeps only the last of them.
+                    if np.any(values[kept] != incoming[present]):
+                        raise _SourceConflict(name)
+                    missing[kept] = False
                 yield MetadataBlock(start=start, values=values, missing=missing)
 
         try:
@@ -736,7 +818,6 @@ def _iter_destination_chunk_segments(
             )
             yield RowPlanSegment(
                 sourceIdx=segment.sourceIdx,
-                blockIdx=segment.blockIdx,
                 destStart=dest_start,
                 localRows=segment.localRows[offset : offset + width],
             )
@@ -748,24 +829,14 @@ def _iter_column_blocks(
     row_plan: RowPlan,
     source_cell_tables: list[Any],
     *,
-    prepend_text: str | None,
+    source_columns: Sequence[dict[str, str]],
     reset_cell_filter: bool,
     source_column: str | None,
     membership_by_source: dict[str, set[str]] | None,
     segment_rows: int,
     chunk_rows: int,
 ) -> Iterator[MetadataBlock]:
-    if prepend_text == "":
-        prepend_text = None
     membership_by_source = membership_by_source or {}
-    per_source_map: list[dict[str, str]] = []
-    for table in source_cell_tables:
-        mapping: dict[str, str] = {}
-        for column in table.columns:
-            public = _public_column_name(column, prepend_text)
-            mapping[public] = column
-        per_source_map.append(mapping)
-
     # Segments fill one destination chunk band at a time, so each band is
     # written with a single whole-chunk write instead of partial updates.
     band_start = 0
@@ -785,9 +856,7 @@ def _iter_column_blocks(
 
         if spec.name == "ids":
             source_values = read_metadata_rows_chunkwise(table, "ids", local_rows)
-            values = np.empty(n, dtype=spec.dtype)
-            for index, value in enumerate(source_values):
-                values[index] = f"{name}__{value}"
+            values = prefixed_cell_ids(name, source_values, spec.dtype)
             del source_values
         elif spec.name == "names":
             source_values = read_metadata_rows_chunkwise(table, "names", local_rows)
@@ -810,7 +879,7 @@ def _iter_column_blocks(
             present = spec.assay in membership_by_source.get(name, set())
             values = np.full(n, present, dtype=bool)
         else:
-            source_col = per_source_map[source_idx].get(spec.name)
+            source_col = source_columns[source_idx].get(spec.name)
             if source_col is None:
                 values = np.full(n, _fill_value(spec.dtype), dtype=spec.dtype)
                 if spec.hasMissing:
@@ -854,33 +923,23 @@ def write_cell_metadata(
     metadata_plan: CellMetadataPlan,
     *,
     profile: StorageProfile,
-    prepend_text: str | None,
     reset_cell_filter: bool,
     source_column: str | None,
     membership_by_source: dict[str, set[str]] | None = None,
-    overwrite: bool = True,
 ) -> zarr.Group:
-    """Stream cell metadata columns in merged row order."""
-    cell_slot = "cellData" if workspace is None else f"{workspace}/cellData"
-    if cell_slot in root and overwrite:
+    """Stream cell metadata columns in merged row order, replacing any partial slot."""
+    cell_slot = _cell_data_path(workspace)
+    if cell_slot in root:
         del root[cell_slot]
     group = root.create_group(cell_slot)
     segment_rows = effective_metadata_segment_rows(metadata_plan, row_plan)
     chunk_size = metadata_chunk_rows(row_plan)
-    source_arrays: dict[str, list[Any]] = {}
-    for table in source_cell_tables:
-        for name in table.columns:
-            public = _public_column_name(name, prepend_text or None)
-            source_arrays.setdefault(public, []).append(table._get_array(name))
     for spec in metadata_plan.columns:
-        attributes = _merged_column_attributes(
-            source_arrays.get(spec.name, []), spec.name
-        )
         blocks = _iter_column_blocks(
             spec,
             row_plan,
             source_cell_tables,
-            prepend_text=prepend_text,
+            source_columns=metadata_plan.sourceColumns,
             reset_cell_filter=reset_cell_filter,
             source_column=source_column,
             membership_by_source=membership_by_source,
@@ -898,11 +957,14 @@ def write_cell_metadata(
             hasMissing=spec.hasMissing,
             profile=profile,
         )
+        # The merge's own membership contract wins over source attributes.
+        attributes = dict(spec.attributes)
         if spec.role is not None:
-            array.attrs["role"] = spec.role
+            attributes["role"] = spec.role
         if spec.assay is not None:
-            array.attrs["assay"] = spec.assay
-        array.attrs.update(attributes)
+            attributes["assay"] = spec.assay
+        if attributes:
+            array.attrs.update(attributes)
     group.attrs["complete"] = True
     return group
 
@@ -918,7 +980,7 @@ def validate_cell_metadata(
     resident_bytes: int,
 ) -> str | None:
     """Return why a completed cellData component cannot be reused."""
-    cell_path = "cellData" if workspace is None else f"{workspace}/cellData"
+    cell_path = _cell_data_path(workspace)
     if cell_path not in root:
         return f"cell metadata group {cell_path!r} is missing"
     group = as_zarr_group(root[cell_path], name=cell_path)
@@ -943,7 +1005,7 @@ def validate_cell_metadata(
             return f"cell metadata column {spec.name!r} has the wrong role"
         if spec.assay is not None and array.attrs.get("assay") != spec.assay:
             return f"cell metadata column {spec.name!r} has the wrong assay"
-        missing_name = f"__scarf_missing__{spec.name}"
+        missing_name = f"{MISSING_MASK_PREFIX}{spec.name}"
         if spec.hasMissing:
             if array.attrs.get("missing_mask") != missing_name:
                 return f"cell metadata column {spec.name!r} has no missing mask"

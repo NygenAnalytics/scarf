@@ -1,12 +1,14 @@
 import math
 import re
 import tomllib
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from profiling.datasets import DEFAULT_TARGET_SIZES
+from profiling.modal_support import MODAL_APP_NAME, MODAL_ENVIRONMENT_NAME
 
 StageName = Literal[
     "createStore",
@@ -315,8 +317,8 @@ class ClusterSourceRef(BaseModel):
 class ProfilingConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    modalEnvironmentName: str = "scarf_profiling"
-    modalAppName: str = "scarf-profiling"
+    modalEnvironmentName: str = MODAL_ENVIRONMENT_NAME
+    modalAppName: str = MODAL_APP_NAME
     modalSecretName: str
     modalRegion: str
     r2EndpointUrl: str
@@ -359,8 +361,10 @@ class ProfilingConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_config(self) -> Self:
-        if self.modalEnvironmentName != "scarf_profiling":
-            raise ValueError("modalEnvironmentName must be scarf_profiling")
+        if self.modalEnvironmentName != MODAL_ENVIRONMENT_NAME:
+            raise ValueError(f"modalEnvironmentName must be {MODAL_ENVIRONMENT_NAME}")
+        if self.modalAppName != MODAL_APP_NAME:
+            raise ValueError(f"modalAppName must be {MODAL_APP_NAME}")
         if not self.datasetPrefixUri.startswith("s3://"):
             raise ValueError("datasetPrefixUri must be an s3:// URI")
         if not self.resultsUri.startswith("s3://"):
@@ -407,12 +411,19 @@ class ProfilingConfig(BaseModel):
             return f"{base}/{self.runTag}"
         return base
 
-    def storeUri(self, nRows: int) -> str:
+    def storeOverrideFor(self, nRows: int) -> str | None:
+        """Return the existing store that replaces the run-tagged store, if any."""
         sized = self.storeUriBySize.get(nRows)
         if sized is not None:
             return sized.rstrip("/")
         if self.storeUriOverride is not None:
             return self.storeUriOverride.rstrip("/")
+        return None
+
+    def storeUri(self, nRows: int) -> str:
+        override = self.storeOverrideFor(nRows)
+        if override is not None:
+            return override
         return f"{self._tagged_prefix('stores')}/{nRows}.zarr"
 
     def resultUri(self, nRows: int, stage: StageName) -> str:
@@ -423,6 +434,9 @@ class ProfilingConfig(BaseModel):
 
     def e2eClaimUri(self) -> str:
         return f"{self._tagged_prefix('results')}/e2e-claim.json"
+
+    def stageClaimUri(self, nRows: int, stage: StageName) -> str:
+        return f"{self._tagged_prefix('results')}/{nRows}/{stage}.claim.json"
 
     def resourcesFor(self, stage: StageName) -> StageResources:
         return self.stageResources[stage]
@@ -450,18 +464,48 @@ def load_profiling_config(path: str | Path) -> ProfilingConfig:
     return config.model_copy(update={"clusterSources": refs})
 
 
-def bind_cluster_source(config: ProfilingConfig, nRows: int) -> WorkflowParameters:
-    if config.workflow.clusterSourceUri:
+def bind_cluster_source(
+    config: ProfilingConfig,
+    nRows: int,
+    stages: Iterable[StageName],
+) -> WorkflowParameters:
+    """Return the workflow of a run over ``stages``.
+
+    Only a run that imports clusters uses a cluster source, so marker search reads
+    the imported labels there and the Leiden labels everywhere else.
+    """
+    if "importClusters" not in set(stages):
+        if config.workflow.clusterSourceUri is not None:
+            raise ValueError(
+                "workflow.clusterSourceUri requires the importClusters stage"
+            )
+        return config.workflow
+    if config.workflow.clusterSourceUri is not None:
         return config.workflow
     source = config.clusterSourceFor(nRows)
     if source is None:
-        return config.workflow
+        raise ValueError(f"importClusters has no cluster source for {nRows} cells")
     return config.workflow.model_copy(
         update={
             "clusterSourceUri": source.storeUri,
             "clusterSourceArtifactId": source.artifactId,
         }
     )
+
+
+def require_consume_only_override(
+    config: ProfilingConfig,
+    nRows: int,
+    stages: Iterable[StageName],
+) -> None:
+    """Refuse stages that would write an existing store selected by an override."""
+    override = config.storeOverrideFor(nRows)
+    blocked = [stage for stage in stages if stage not in CONSUME_STAGES]
+    if override is not None and blocked:
+        raise ValueError(
+            f"The store override {override} for {nRows} cells is only for consume "
+            f"stages; refusing {', '.join(blocked)}"
+        )
 
 
 def _require_store_uri(uri: str, name: str) -> str:

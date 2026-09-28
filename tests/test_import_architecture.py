@@ -510,6 +510,8 @@ def test_extracted_domains_have_only_narrow_storage_dependencies():
         storage_importers = {path for path, _target in storage_edges}
         assert storage_importers == allowed_storage_importers
         if package_name == "features":
+            # Result records need refs; the shared test identities need the
+            # artifact fingerprint helpers.
             statistical_imports = _root_imports(
                 _SCARF_ROOT / "features" / "statistical.py"
             )
@@ -517,7 +519,7 @@ def test_extracted_domains_have_only_narrow_storage_dependencies():
                 target
                 for target in statistical_imports
                 if target == "storage" or target.startswith("storage.")
-            } == {"storage.refs"}
+            } == {"storage.artifacts", "storage.refs"}
 
 
 def test_read_paths_take_chunk_geometry_only_from_the_storage_geometry_module():
@@ -529,7 +531,6 @@ def test_read_paths_take_chunk_geometry_only_from_the_storage_geometry_module():
         "datastore/_operations/graph.py",
         "datastore/_operations/mapping.py",
         "mapping/confidence.py",
-        "mapping/hashing.py",
         "matrix/chunked.py",
         "metadata/rows.py",
         "storage/artifacts.py",
@@ -575,7 +576,6 @@ def test_mapping_does_not_import_orchestration_or_general_io():
         "artifact.py",
         "confidence.py",
         "features.py",
-        "hashing.py",
         "models.py",
         "projection.py",
         "reference.py",
@@ -668,7 +668,6 @@ def test_agent_implementations_live_in_owner_packages():
             "diagnostics.py",
             "execution.py",
             "hvg.py",
-            "prompts.py",
             "selection.py",
         },
         "report": {
@@ -685,6 +684,7 @@ def test_agent_implementations_live_in_owner_packages():
     assert not list((agent_root / "persistence").glob("*.py"))
     assert not list((agent_root / "hypotheses").glob("*.py"))
     assert not (agent_root / "parameter_tuning/sequential.py").exists()
+    assert not (agent_root / "parameter_tuning/prompts.py").exists()
     assert not (agent_root / "report/decision_tree.py").exists()
     for package, names in required.items():
         package_root = agent_root / package
@@ -889,7 +889,7 @@ import scarf
 import scarf.features as features
 
 assert "scarf.features.variability" not in sys.modules
-assert "scarf.features.genomic.gff" not in sys.modules
+assert "scarf.features.genomic.intervals" not in sys.modules
 assert "scarf.features.genomic.melding" not in sys.modules
 assert "scarf.features.markers.search" not in sys.modules
 assert "scarf.features.enrichment" not in sys.modules
@@ -918,8 +918,8 @@ _ = features.compare_group_distributions
 assert "scarf.features.statistical" in sys.modules
 assert "scarf.features.markers.search" in sys.modules
 
-_ = features.GffReader
-assert "scarf.features.genomic.gff" in sys.modules
+_ = features.get_feature_mappings
+assert "scarf.features.genomic.intervals" in sys.modules
 assert "scarf.features.genomic.melding" not in sys.modules
 """,
         ],
@@ -956,13 +956,10 @@ def test_merge_implementations_are_runtime_isolated():
         "writer.py",
     }
     assert {path.name for path in merge_root.glob("*.py")} == required_files
-    assert (
-        _runtime_import_modules(
-            merge_root / "__init__.py",
-            include_function_local=False,
-        )
-        == set()
-    )
+    assert _runtime_import_modules(
+        merge_root / "__init__.py",
+        include_function_local=False,
+    ) == {"_facade"}
 
     forbidden_roots = {"datastore", "mapping", "plotting", "readers", "writers"}
     for path in merge_root.glob("*.py"):
@@ -1009,7 +1006,7 @@ def test_reader_implementations_are_runtime_isolated():
     assert _runtime_import_modules(
         readers_root / "__init__.py",
         include_function_local=False,
-    ) == {"readers._text"}
+    ) == {"_facade"}
 
     forbidden_roots = {"datastore", "merge", "plotting", "storage", "writers"}
     format_modules = {
@@ -1019,6 +1016,19 @@ def test_reader_implementations_are_runtime_isolated():
         "readers.loom",
         "readers.mtx",
         "readers.seurat",
+    }
+    shared_reader_imports = {
+        "cellranger.py": {"readers._assay_names", "readers._sparse", "readers._text"},
+        "csv.py": {"readers._text"},
+        "h5ad.py": {
+            "readers._assay_names",
+            "readers._h5ad_columns",
+            "readers._h5ad_inspect",
+            "readers._sparse",
+            "readers._text",
+        },
+        "loom.py": {"readers._text"},
+        "mtx.py": {"readers._sparse", "readers._text"},
     }
     reader_edges = {
         "readers.mtx": {"readers.cellranger"},
@@ -1053,23 +1063,18 @@ def test_reader_implementations_are_runtime_isolated():
 
         current_module = f"readers.{path.stem}"
         if current_module not in format_modules:
-            assert {
+            assert not {
                 module_name
                 for module_name in runtime_imports
                 if module_name.startswith("readers")
-            } <= {"readers.get_file_handle"}
+            }
             continue
         allowed_edges = reader_edges.get(current_module, set())
         sibling_modules = format_modules - {current_module} - allowed_edges
         assert runtime_imports.isdisjoint(sibling_modules)
 
         allowed_reader_imports: set[str] = set(allowed_edges)
-        if path.name == "cellranger.py":
-            allowed_reader_imports.update({"readers._assay_names", "readers.read_file"})
-        elif path.name == "h5ad.py":
-            allowed_reader_imports.update(
-                {"readers._assay_names", "readers._h5ad_inspect", "readers._sparse"}
-            )
+        allowed_reader_imports.update(shared_reader_imports.get(path.name, set()))
         assert not {
             module_name
             for module_name in runtime_imports
@@ -1097,13 +1102,10 @@ def test_writer_implementations_are_runtime_isolated():
         "seurat.py",
     }
     assert {path.name for path in writers_root.glob("*.py")} == required_files
-    assert (
-        _runtime_import_modules(
-            writers_root / "__init__.py",
-            include_function_local=False,
-        )
-        == set()
-    )
+    assert _runtime_import_modules(
+        writers_root / "__init__.py",
+        include_function_local=False,
+    ) == {"_facade"}
 
     forbidden_roots = {"assay", "datastore", "mapping", "merge", "plotting"}
     # Shared RNA classifier is the intentional write/load boundary for countsT.
@@ -1119,11 +1121,8 @@ def test_writer_implementations_are_runtime_isolated():
     }
     format_names = {name.rsplit(".", 1)[-1] for name in format_modules}
     facade_edges = {
-        "writers.create_cell_data",
         "writers.create_zarr_count_assay",
         "writers.create_zarr_obj_array",
-        "writers.load_count_store",
-        "writers.load_zarr",
     }
     shared_edges = {"writers._materialize", "writers._store", "writers.counts_t"}
     matching_reader_exports = {

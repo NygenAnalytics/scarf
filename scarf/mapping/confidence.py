@@ -67,6 +67,90 @@ def mapping_score_weights(distances: np.ndarray) -> np.ndarray:
     return weights
 
 
+def add_mapping_scores(
+    scores: np.ndarray,
+    scored_rows: np.ndarray,
+    neighbor_indices: np.ndarray,
+    weights: np.ndarray,
+    *,
+    skip: np.ndarray,
+    groups: np.ndarray | None = None,
+) -> None:
+    """Add the neighbor weights of one block of query rows to mapping scores.
+
+    ``scores`` holds one row of reference-cell sums per query group, and
+    ``scored_rows`` counts the query rows added to each group. ``skip`` marks
+    the block's query rows that add nothing, following the caller's policy.
+    ``neighbor_indices`` and ``weights``, such as ``mapping_score_weights``,
+    hold one row for each query row that is not skipped, in block order.
+    ``groups`` gives the group row of every block row; without it, every row
+    belongs to group 0.
+
+    Args:
+        scores: Group-by-reference-cell sums, updated in place.
+        scored_rows: Number of query rows added to each group, updated in
+            place.
+        neighbor_indices: Reference neighbors of the rows that are not
+            skipped.
+        weights: Weight of each of those neighbors.
+        skip: Boolean mask of the block's query rows that add nothing.
+        groups: Optional group row of each block row.
+    """
+    keep = ~np.asarray(skip, dtype=bool)
+    rows = (
+        np.zeros(int(np.count_nonzero(keep)), dtype=np.int64)
+        if groups is None
+        else np.asarray(groups, dtype=np.int64)[keep]
+    )
+    if (
+        neighbor_indices.ndim != 2
+        or neighbor_indices.shape[0] != rows.shape[0]
+        or weights.shape != neighbor_indices.shape
+    ):
+        raise ValueError(
+            "Neighbor indices and weights need one row per query row that is "
+            "not skipped"
+        )
+    np.add.at(
+        scores,
+        (
+            np.broadcast_to(rows[:, np.newaxis], neighbor_indices.shape),
+            neighbor_indices,
+        ),
+        weights,
+    )
+    scored_rows += np.bincount(rows, minlength=len(scored_rows))
+
+
+def finish_mapping_scores(
+    scores: np.ndarray,
+    scored_rows: np.ndarray,
+    *,
+    n_neighbors: int,
+    multiplier: float,
+    log_transform: bool,
+) -> None:
+    """Scale summed mapping-score weights in place.
+
+    Each group's sums are multiplied by ``multiplier`` over its scored query
+    rows times ``n_neighbors``, so a score does not grow with the number of
+    query rows or neighbors. A group without scored rows keeps zeros.
+    ``log_transform`` then replaces every score with its ``log1p``.
+
+    Args:
+        scores: Group-by-reference-cell sums from ``add_mapping_scores``.
+        scored_rows: Number of query rows added to each group.
+        n_neighbors: Neighbors of each query row.
+        multiplier: Scale of a score.
+        log_transform: Whether to take ``log1p`` of the scaled scores.
+    """
+    for row, count in enumerate(scored_rows):
+        if count:
+            scores[row] *= multiplier / (int(count) * n_neighbors)
+    if log_transform:
+        np.log1p(scores, out=scores)
+
+
 def distance_weights(distances: np.ndarray) -> np.ndarray:
     """Convert metric distances into normalized inverse-distance weights."""
     values = _validated_distances(distances)
@@ -163,26 +247,6 @@ def _label_vote_block(
         top_two_margin=top - second,
         is_unknown=(labeled_total <= 0) | (top < threshold) | (ties != 1),
     )
-
-
-def conformal_prediction_sets(
-    label_scores: np.ndarray,
-    calibration_nonconformity: np.ndarray,
-    alpha: float = 0.1,
-) -> np.ndarray:
-    """Return class-membership masks from split-conformal p-values."""
-    scores = np.asarray(label_scores, dtype=np.float64)
-    if scores.ndim != 2:
-        raise ValueError("label_scores must be a two-dimensional array")
-    calibration, resolved_alpha = _validated_conformal_calibration(
-        calibration_nonconformity,
-        alpha,
-    )
-    if not np.all(np.isfinite(scores)):
-        raise ValueError("Conformal inputs must be finite")
-    if np.any(scores < 0) or np.any(scores > 1):
-        raise ValueError("Conformal scores must be in [0, 1]")
-    return _conformal_membership(scores, calibration, resolved_alpha)
 
 
 def _validated_conformal_calibration(

@@ -9,6 +9,8 @@ from scarf.datastore._operations.enrichment_store import (
     _enrichment_artifact_matches,
     _write_enrichment_slot,
 )
+from scarf.storage.budget import resolve_budget
+from scarf.storage.io_policy import StorageIoPolicy
 
 
 def _payload() -> dict[str, object]:
@@ -35,6 +37,8 @@ def test_write_enrichment_slot_persists_and_matches_exact_payload() -> None:
     _write_enrichment_slot(
         slot,
         score_batches=iter([scores[:2], scores[2:]]),
+        resources=resolve_budget(workers=1),
+        io=None,
         **payload,
     )
 
@@ -89,7 +93,35 @@ def test_write_enrichment_slot_rejects_invalid_payloads(
         _write_enrichment_slot(
             slot,
             score_batches=iter(score_batches),
+            resources=resolve_budget(workers=1),
+            io=None,
             **payload,
         )
 
     assert slot.attrs.get("complete") is not True
+
+
+def test_write_enrichment_slot_streams_within_the_datastore_budget(monkeypatch) -> None:
+    import scarf.storage.sharding as sharding
+
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    slot = root.create_group("slot")
+    resources = resolve_budget("64M", workers=1)
+    io = StorageIoPolicy(writeWorkers=1)
+    received: dict[str, object] = {}
+    writer = sharding.write_dense_from_row_batches
+
+    def recording_writer(*args, **kwargs):
+        received.update(resources=kwargs["resources"], io=kwargs["io"])
+        return writer(*args, **kwargs)
+
+    monkeypatch.setattr(sharding, "write_dense_from_row_batches", recording_writer)
+    _write_enrichment_slot(
+        slot,
+        score_batches=iter([np.ones((3, 2))]),
+        resources=resources,
+        io=io,
+        **_payload(),
+    )
+
+    assert received == {"resources": resources, "io": io}

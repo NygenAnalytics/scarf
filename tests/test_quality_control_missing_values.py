@@ -517,6 +517,57 @@ def test_doublet_detection_requires_a_connectivity_graph_and_writable_store(
         read_only.run_doublet_detection(clusters, graph)
 
 
+def test_doublet_detection_validates_arguments_before_any_work(
+    analyzed_datastore_ephemeral,
+) -> None:
+    store = analyzed_datastore_ephemeral
+    (graph,) = store.list_artifacts(kind="connectivity_map")
+    clusters = store.run_leiden_clustering(graph)
+    invalid = (
+        ({"smoothing_t": 0}, ValueError, "smoothing_t"),
+        ({"save_k": True}, TypeError, "save_k"),
+        ({"max_cells_per_cluster": 0}, ValueError, "max_cells_per_cluster"),
+        ({"cluster_sample_fraction": 0.0}, ValueError, "cluster_sample_fraction"),
+        ({"simulation_ratio": -1.0}, ValueError, "simulation_ratio"),
+        ({"heterotypic_fraction": 1.5}, ValueError, "heterotypic_fraction"),
+        ({"random_seed": -1}, ValueError, "random_seed"),
+        ({"normalize_scores": 1}, TypeError, "normalize_scores"),
+    )
+    for options, error, name in invalid:
+        with pytest.raises(error, match=name):
+            store.run_doublet_detection(clusters, graph, **options)
+
+    assert store.list_artifacts(kind="mapping_reference") == []
+    assert store.list_artifacts(kind="doublet_score") == []
+
+
+def test_read_only_selection_and_derived_assay_producers_raise_permission_errors(
+    tmp_path,
+) -> None:
+    storage, _ = _qc_store()
+    writable = _open_qc_store(storage)
+    cells = writable.snapshot_cell_selection("I")
+    kept = writable.filter_cells(["RNA_nCounts"], [0], [None], cell_selection=cells)
+    read_only = _open_qc_store(storage, zarr_mode="r")
+
+    assert (
+        read_only.filter_cells(["RNA_nCounts"], [0], [None], cell_selection=cells)
+        == kept
+    )
+    with pytest.raises(PermissionError, match="filter_cells requires"):
+        read_only.filter_cells(["RNA_nCounts"], [1], [None], cell_selection=cells)
+    with pytest.raises(PermissionError, match="auto_filter_cells requires"):
+        read_only.auto_filter_cells(
+            ["RNA_nCounts"], method="gaussian", cell_selection=cells
+        )
+    with pytest.raises(PermissionError, match="add_grouped_assay requires"):
+        read_only.add_grouped_assay("names", assay_label="GROUPED")
+    with pytest.raises(PermissionError, match="add_melded_assay requires"):
+        read_only.add_melded_assay(
+            external_bed_fn=str(tmp_path / "missing.bed"), assay_label="MELDED"
+        )
+
+
 def test_read_only_qc_producers_reuse_results_and_refuse_new_work(
     datastore_ephemeral,
 ) -> None:

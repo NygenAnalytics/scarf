@@ -1,11 +1,12 @@
 """Read-only feature inspection and lookup tools."""
 
+from collections import Counter
+from collections.abc import Iterable
 from typing import Any, Literal
 
 from ...features.variability import DEFAULT_HVG_BLACKLIST
 from ...utils.logging import logger
 from .._deps import AGENT_INSTALL_HINT
-from ..tools import bounded_list
 from .characterization import characterize_features
 from .contracts import (
     AdtControlEvidence,
@@ -34,6 +35,18 @@ except ImportError as exc:
 _MAX_FEATURE_QUERIES = 50
 
 
+def _bounded_list(values: Iterable[Any], *, limit: int) -> list[Any]:
+    """Return at most ``limit`` JSON-facing values."""
+    if isinstance(limit, bool) or limit < 1:
+        raise ValueError("limit must be a positive integer")
+    output: list[Any] = []
+    for value in values:
+        output.append(value)
+        if len(output) == limit:
+            break
+    return output
+
+
 def _prepare_data_enrichment_tool(
     ctx: RunContext[DataEnrichmentDependencies],
     tool_definition: ToolDefinition,
@@ -53,31 +66,18 @@ def _prepare_data_enrichment_tool(
 
 
 def _assay_modality(
-    assay_type: str | None,
-    assay_kind: str,
-) -> tuple[
-    Literal["RNA", "ATAC", "ADT", "HTO", "unsupported"],
-    str,
-    Literal["persisted", "assayClass", "unknown"],
-]:
-    """Map persisted types to supported routes, with a mock-store class fallback."""
-    if assay_type is not None:
-        if assay_type == "RNA":
-            return "RNA", assay_type, "persisted"
-        if assay_type == "ATAC":
-            return "ATAC", assay_type, "persisted"
-        if assay_type == "ADT":
-            return "ADT", assay_type, "persisted"
-        if assay_type == "HTO":
-            return "HTO", assay_type, "persisted"
-        return "unsupported", assay_type, "persisted"
-    if assay_kind == "RNAassay":
-        return "RNA", assay_kind, "assayClass"
-    if assay_kind == "ATACassay":
-        return "ATAC", assay_kind, "assayClass"
-    if assay_kind:
-        return "unsupported", assay_kind, "assayClass"
-    return "unsupported", "Assay", "unknown"
+    assay_type: str,
+) -> Literal["RNA", "ATAC", "ADT", "HTO", "unsupported"]:
+    """Map a persisted assay type to its supported route."""
+    if assay_type == "RNA":
+        return "RNA"
+    if assay_type == "ATAC":
+        return "ATAC"
+    if assay_type == "ADT":
+        return "ADT"
+    if assay_type == "HTO":
+        return "HTO"
+    return "unsupported"
 
 
 def _feature_tokens(*values: str) -> set[str]:
@@ -163,8 +163,8 @@ def _inspect_atac_features(
         status=coordinate_status,
         totalFeatures=len(feature_ids),
         validFeatures=len(valid_ids),
-        validExamples=bounded_list(valid_ids, limit=5),
-        invalidExamples=bounded_list(invalid_ids, limit=5),
+        validExamples=_bounded_list(valid_ids, limit=5),
+        invalidExamples=_bounded_list(invalid_ids, limit=5),
         evidenceId=f"assay:{assay_name}:atacCoordinates",
     )
 
@@ -173,12 +173,11 @@ def _inspect_modality_features(
     *,
     assay_name: str,
     assay: Any,
-    assay_type: str | None,
-    assay_kind: str,
+    assay_type: str,
     identity: dict[str, Any],
 ) -> AssayModalityEvidence:
     """Build bounded modality evidence from exact observed feature metadata."""
-    modality, resolved_type, type_source = _assay_modality(assay_type, assay_kind)
+    modality = _assay_modality(assay_type)
     modality_evidence_id = f"assay:{assay_name}:modality"
     total_features = int(identity.get("nFeatures", 0))
     evidence_ids = [modality_evidence_id]
@@ -205,7 +204,7 @@ def _inspect_modality_features(
 
     if modality == "ADT":
         control_candidates = _inspect_adt_features(assay_name, feature_rows)
-        adt_controls = bounded_list(
+        adt_controls = _bounded_list(
             control_candidates,
             limit=_MAX_FEATURE_QUERIES,
         )
@@ -214,7 +213,7 @@ def _inspect_modality_features(
         truncated = len(control_candidates) > len(adt_controls)
 
     if modality == "HTO":
-        limited_rows = bounded_list(feature_rows, limit=_MAX_FEATURE_QUERIES)
+        limited_rows = _bounded_list(feature_rows, limit=_MAX_FEATURE_QUERIES)
         hto_tags = _inspect_hto_features(assay_name, limited_rows)
         evidence_ids.extend(item.evidenceId for item in hto_tags)
         reported_features = len(hto_tags)
@@ -232,9 +231,8 @@ def _inspect_modality_features(
         truncated = len(feature_ids) > reported_features
 
     return AssayModalityEvidence(
-        assayType=resolved_type,
+        assayType=assay_type,
         modality=modality,
-        typeSource=type_source,
         graphEligible=graph_eligible,
         markerEligible=marker_eligible,
         demultiplexEligible=modality == "HTO",
@@ -269,8 +267,6 @@ async def inspect_assay_features(
 
     characterization = characterize_features(
         deps.store,
-        studyContext=deps.context.studyContext,
-        model=None,
         assays=[assay_name],
         cacheDir=deps.cacheDir,
         allowDownload=deps.allowDownload,
@@ -341,11 +337,13 @@ async def inspect_assay_features(
     resolution = record.get("speciesResolution") or {}
     assay = deps.store.get_assay(assay_name)
     identity = dict(record.get("identity") or {})
+    assay_type = deps.assayTypes.get(assay_name)
+    if assay_type is None:
+        raise ValueError(f"Assay {assay_name!r} has no persisted assay type")
     modality_evidence = _inspect_modality_features(
         assay_name=assay_name,
         assay=assay,
-        assay_type=deps.assayTypes.get(assay_name),
-        assay_kind=str(record.get("assayKind", "")),
+        assay_type=assay_type,
         identity=identity,
     )
     evidence_ids.extend(modality_evidence.evidenceIds)
@@ -360,7 +358,6 @@ async def inspect_assay_features(
         defaultFeatureInventory=default_inventory,
         exogenous=exogenous_evidence,
         modalityEvidence=modality_evidence,
-        notes=[str(value) for value in record.get("notes", [])],
         evidenceIds=evidence_ids,
     )
     deps.inspections[assay_name] = inspection
@@ -473,6 +470,13 @@ async def find_present_features(
     feature_ids = [str(value) for value in assay.feats.fetch_all("ids")]
     feature_names = [str(value) for value in assay.feats.fetch_all("names")]
     rows = list(zip(feature_ids, feature_names, strict=True))
+    # Policies select rows whose ID or name equals a cited label, so a label is
+    # confirmed only when it identifies exactly one row.
+    label_rows = Counter(
+        label
+        for feature_id, feature_name in rows
+        for label in {feature_id, feature_name}
+    )
     results: list[FeatureMatch] = []
     result_evidence_ids: list[str] = []
     confirmed = deps.confirmedFeatures.setdefault(assay_name, set())
@@ -487,7 +491,7 @@ async def find_present_features(
                 for row in rows
                 if folded == row[0].casefold() or folded == row[1].casefold()
             ]
-        unique_candidates = bounded_list(
+        unique_candidates = _bounded_list(
             dict.fromkeys(candidates),
             limit=10,
         )
@@ -501,7 +505,11 @@ async def find_present_features(
         ]
         if len(references) == 1:
             status: Literal["present", "ambiguous", "absent"] = "present"
-            confirmed.update({references[0].featureId, references[0].featureName})
+            confirmed.update(
+                label
+                for label in (references[0].featureId, references[0].featureName)
+                if label_rows[label] == 1
+            )
             deps.evidenceIds.update(evidence_ids)
             result_evidence_ids.extend(evidence_ids)
         elif references:

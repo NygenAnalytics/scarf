@@ -108,13 +108,14 @@ class DataStore(
                      'RNA', 'ADT', 'ATAC' or 'GeneActivity'.
         default_assay: Name of assay that should be considered as default. It is mandatory to provide this value
                        when DataStore loads a Zarr file for the first time.
-        min_features_per_cell: Minimum number of non-zero features in a cell. If lower than this then the cell
-                               will be filtered out.
+        min_features_per_cell: Writable opens remove from ``I`` every cell whose default-assay feature
+                               count is not greater than this value, unless the value exceeds the median
+                               count of the active cells.
         mito_pattern: Feature-name pattern for the ``{assay}_percentMito`` column of each RNA assay.
                       The first writable open replaces any existing column with values computed from
                       this pattern, or ``^MT-`` when None. Later opens keep the stored values when
                       None and reject a pattern that differs from the recorded one.
-        ribo_pattern: The same for ``{assay}_percentRibo``, using ``RPS|RPL|MRPS|MRPL`` when None.
+        ribo_pattern: The same for ``{assay}_percentRibo``, using ``^RPS|^RPL|^MRPS|^MRPL`` when None.
         nthreads: Maximum worker budget for multi-threaded methods. When None, auto-detected
                   (SCARF_WORKERS env var, else process CPU affinity and cgroup limits). An
                   explicit integer overrides environment detection.
@@ -197,9 +198,9 @@ class DataStore(
         Returns:
             Assay object
         """
-        if assay_name not in self._assayNames:
-            raise ValueError(f"ERROR: Assay {assay_name} not found in the Zarr file")
-        return self._assays[assay_name]
+        if not assay_name:
+            raise ValueError("ERROR: Provide the name of an assay")
+        return self._get_assay(assay_name)
 
     def resolve_features(
         self,
@@ -212,23 +213,6 @@ class DataStore(
             raise TypeError("features must be an ArtifactRef")
         resolved_assay = self.get_assay(assay)
         return resolve_feature_selection(self.zw, resolved_assay.name, features)
-
-    def _create_temporary_datastore(
-        self,
-        zarr_loc: ZarrLocation,
-        *,
-        default_assay: str,
-        assay_types: dict[str, str],
-        nthreads: int,
-    ) -> "DataStore":
-        return DataStore(
-            zarr_loc,
-            default_assay=default_assay,
-            assay_types=assay_types,
-            nthreads=nthreads,
-            mem_budget=self.memoryBytes,
-            storageIo=getattr(self, "storageIo", None),
-        )
 
 
 # One public call validates each input artifact once, however many lineage

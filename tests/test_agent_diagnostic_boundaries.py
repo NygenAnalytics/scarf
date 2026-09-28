@@ -95,51 +95,36 @@ def test_loading_programs_require_exact_finite_feature_axis(damage: str) -> None
 def test_family_influence_distinguishes_representation_programs_without_removing_genes() -> (
     None
 ):
-    names = np.asarray(
-        [
-            "MT-CO1",
-            "MTOR",
-            "RPS3",
-            "MRPS3",
-            "MKI67",
-            "HBA1",
-            "IGHM",
-            "FOS",
-            "ATF3",
-            "XIST",
-            "OTHER",
-        ]
-    )
+    genes = [
+        "MT-CO1",
+        "MTOR",
+        "RPS3",
+        "MRPS3",
+        "MKI67",
+        "CCNB1",
+        "HLA-A",
+        "H2-K1",
+        "HIST1H1C",
+        "XIST",
+        "OTHER",
+    ]
+    names = np.asarray(genes)
     expected = {
         "mitochondrial": {0},
-        "ribosomal": {2},
-        "mitoribosomal": {3},
-        "cellCycle": {4},
-        "hemoglobin": {5},
-        "immuneReceptor": {6},
-        "stress": {7},
-        "dissociation": {7, 8},
+        "ribosomal": {2, 3},
+        "cellCycleCcn": {5},
+        "cellCycle": {4, 5},
+        "hla": {6},
+        "h2": {7},
+        "histone": {8},
+        "sexLinked": {9},
         "sex": {9},
     }
     for family, positions in expected.items():
-        assert set(np.flatnonzero(d._family_mask(names, family))) == positions
-    assert d._family_mask(names, "unregisteredFamily") is None
-    np.testing.assert_array_equal(
-        names,
-        [
-            "MT-CO1",
-            "MTOR",
-            "RPS3",
-            "MRPS3",
-            "MKI67",
-            "HBA1",
-            "IGHM",
-            "FOS",
-            "ATF3",
-            "XIST",
-            "OTHER",
-        ],
-    )
+        assert set(np.flatnonzero(d.family_mask(names, family))) == positions
+    for family in ("mitoribosomal", "ribosomalProtein", "hemoglobin", "invented"):
+        assert d.family_mask(names, family) is None
+    np.testing.assert_array_equal(names, genes)
 
 
 def _variance_inputs(
@@ -428,6 +413,19 @@ def test_native_doublet_reconstruction_uses_pca_and_preserves_selected_parameter
     assert calls[1][2]["k"] == selected.parameters.neighborsK
     assert calls[-1][2]["resolution"] == selected.parameters.leidenResolution
     assert clusters == _ref("cluster_labels") and graph == _ref("connectivity_map")
+    # The rebuilt graph uses the native candidate's settings, not other seeds.
+    assert calls[0][2] == {
+        "ann_metric": "l2",
+        "ann_parallel": False,
+        "rand_state": 4466,
+        "invalidate_cache": False,
+    }
+    assert calls[2][2] == {
+        "local_connectivity": 1.0,
+        "bandwidth": 1.5,
+        "invalidate_cache": False,
+    }
+    assert calls[-1][2]["random_seed"] == 4444
 
 
 def _capture_scoring_store(
@@ -787,7 +785,6 @@ def test_pca_diagnostic_rejects_unmatched_method_or_feature_axis_before_writing(
             family_masks={},
             covariate_columns=[],
             covariate_roles=[],
-            adjacent_overlap=None,
             column_artifacts={"counts": _ref("cluster_labels")}
             if damage == "artifactKind"
             else {},
@@ -812,7 +809,6 @@ def test_reused_pca_evidence_rejects_a_changed_saved_payload(
         "top_loading_values": np.ones((2, 3)),
         "family_enrichment": np.ones((0, 2)),
         "covariate_association": np.ones((0, 2)),
-        "adjacent_neighbor_overlap": np.ones(1),
     }
     for name, values in payload.items():
         saved.create_array(name, data=values)
@@ -848,7 +844,6 @@ def test_reused_pca_evidence_rejects_a_changed_saved_payload(
             family_masks={},
             covariate_columns=[],
             covariate_roles=[],
-            adjacent_overlap=None,
         )
 
 

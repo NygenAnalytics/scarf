@@ -18,6 +18,7 @@ from scarf.agent.cell_quality.execution import (
 )
 from scarf.agent.cell_quality.profiles import (
     RegisteredQcProjection,
+    _ordered_capture_masks,
     offered_registered_qc_profiles,
     project_auto_filter_profile,
     project_registered_qc_profile,
@@ -245,6 +246,7 @@ def _registered_execution_case() -> tuple[
         ("resolvedBoundsType", "resolvedBounds must be a list"),
         ("pooledReferencesType", "must be a list of strings"),
         ("attributeType", "attrs must contain only column names"),
+        ("duplicateAttribute", "duplicate columns"),
         ("artifactType", "NamedCellArtifact"),
         ("artifactKind", "quality_metric"),
         ("duplicateArtifactName", "unique semantic names"),
@@ -289,6 +291,8 @@ def test_registered_qc_execution_rejects_inconsistent_evidence(
         parameters["pooledReferenceCaptures"] = [1]
     elif case == "attributeType":
         arguments["attrs"] = [1]
+    elif case == "duplicateAttribute":
+        arguments["attrs"] = ["RNA_nCounts", "RNA_nCounts"]
     elif case == "artifactType":
         arguments["artifact_metrics"] = [object()]
     elif case == "artifactKind":
@@ -510,6 +514,18 @@ def test_capture_profiles_require_proof_and_minimum_capture_size() -> None:
         "retainWithFlags",
         "globalMad5",
     ]
+
+
+def test_capture_masks_follow_first_seen_order_over_active_cells() -> None:
+    labels = np.asarray([3, 1, 3, 2, 1, 2, 9])
+    active = np.asarray([True, True, True, True, True, True, False])
+
+    captures = _ordered_capture_masks(labels, active)
+
+    assert [key for key, _ in captures] == ["3", "1", "2"]
+    for key, mask in captures:
+        assert mask.dtype == bool and mask.shape == labels.shape
+        np.testing.assert_array_equal(mask, active & (labels == int(key)))
 
 
 def test_capture_profiles_surface_adverse_global_capture_comparison() -> None:
@@ -1356,7 +1372,7 @@ def test_orchestrator_executes_retain_with_flags_instead_of_plain_skip(
     operations: list[dict[str, Any]] = []
     store = Store()
     result = AgentOrchestrator(object()).apply_cell_qc(
-        store, experimental, source, actions, operations
+        store, experimental, source, actions, operations, selected_plan=plan
     )
 
     assert result == selected
@@ -1492,7 +1508,6 @@ def test_audited_core_qc_policy_executes_exact_projected_selection(
         actions,
         operations,
         selected_plan=plan,
-        decision_payload=payload,
     )
     np.testing.assert_array_equal(
         read_stored_selection_mask(

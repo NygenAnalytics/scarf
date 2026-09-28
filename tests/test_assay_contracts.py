@@ -20,6 +20,7 @@ from scarf.assay import (
     norm_lib_size,
     norm_tf_idf,
 )
+from scarf.assay.base import raw_csr
 from scarf.storage.artifacts import ArtifactRef, artifact_group
 from scarf.matrix import ChunkedArray
 from scarf.datastore.datastore import DataStore
@@ -31,9 +32,7 @@ _PUBLIC_CLASS_METHODS = {
     Assay: (
         "__init__",
         "normed",
-        "to_raw_sparse",
         "iter_normed_feature_wise",
-        "mean_features",
         "score_features",
         "__repr__",
     ),
@@ -46,16 +45,13 @@ _PUBLIC_CLASS_METHODS = {
         "__init__",
         "normed",
     ),
-    ADTassay: (
-        "__init__",
-        "normed",
-    ),
+    ADTassay: ("__init__",),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    Assay: "85f3baba45ac65e46add4ad3f01845d02fd267601b3cee4419661c91a0302bd7",
+    Assay: "045ac1edc448b0ef88037663d347adbfe34d70d32d281ea974179ce23f5928f7",
     RNAassay: "74fc5e54bc871c516fa8adca9cd8bcdec92bbcba94c118965b933159b2ef19ac",
     ATACassay: "1732f9ac8b4f368185e0965becb94b9472186db4ee53d372a8a2852d30dd42a4",
-    ADTassay: "1732f9ac8b4f368185e0965becb94b9472186db4ee53d372a8a2852d30dd42a4",
+    ADTassay: "393df3ce24ede0e7affeba88c1970e1a77f0fac31adc07276be28dd40f1c1c4a",
 }
 _MODULE_FUNCTIONS = (
     "lib_size_feature_stream_eligible",
@@ -84,7 +80,6 @@ def test_assay_facade_surface_is_stable():
         "lookup_persisted_assay_type",
         "preset_assay_types",
         "resolve_persisted_assay_type",
-        "rna_assay_type_names",
     ]
     expected = {
         "ADTassay",
@@ -104,7 +99,6 @@ def test_assay_facade_surface_is_stable():
         "norm_tf_idf",
         "preset_assay_types",
         "resolve_persisted_assay_type",
-        "rna_assay_type_names",
     }
     assert expected.issubset(vars(assay_module))
 
@@ -152,8 +146,7 @@ def test_assay_subclass_and_static_method_contracts_are_stable():
     assert issubclass(RNAassay, Assay)
     assert issubclass(ATACassay, Assay)
     assert issubclass(ADTassay, Assay)
-    for name in ("_create_subset_hash",):
-        assert isinstance(inspect.getattr_static(Assay, name), staticmethod)
+    assert "normed" not in vars(ADTassay)
 
 
 def test_default_normalizer_identity_is_stable(monkeypatch):
@@ -210,6 +203,65 @@ def test_clr_normalizes_features_when_chunked_selection_is_square():
     actual = norm_clr(None, counts).compute()
 
     np.testing.assert_allclose(actual, np.log1p(values / expected_scale[None, :]))
+
+
+def test_normalization_kernels_share_arrays_and_chunked_arrays():
+    from scarf.assay.normalization import (
+        clr_values,
+        inverse_document_frequency,
+        library_size_values,
+        stream_document_frequency,
+        term_frequencies,
+        tfidf_values,
+    )
+
+    counts = np.array(
+        [[1, 0, 9], [2, 20, 0], [12, 2, 2], [0, 0, 5]],
+        dtype=np.uint16,
+    )
+    chunked = ChunkedArray.from_numpy(counts, block_size=3)
+    totals = np.array([10.0, 22.0, 16.0, 5.0])
+    idf = inverse_document_frequency(4, np.count_nonzero(counts, axis=0))
+
+    np.testing.assert_array_equal(idf, np.log2(1 + 4 / np.array([4.0, 3.0, 4.0])))
+    np.testing.assert_allclose(
+        clr_values(chunked).compute(), clr_values(counts), rtol=1e-12
+    )
+    np.testing.assert_array_equal(
+        tfidf_values(chunked, totals, idf).compute(),
+        tfidf_values(counts, totals, idf),
+    )
+    np.testing.assert_array_equal(
+        tfidf_values(counts, totals, idf),
+        term_frequencies(counts, totals) * idf,
+    )
+    np.testing.assert_allclose(
+        library_size_values(counts, totals, 1000, dtype=np.float64, log_transform=True),
+        np.log1p(1000 * counts / totals[:, None]),
+    )
+
+    selected = np.array([True, False, True, True])
+    frequency, term_sums = stream_document_frequency(
+        ChunkedArray.from_numpy(counts, block_size=1),
+        memory_bytes=1024**2,
+        nthreads=1,
+        msg="",
+        operation="Test frequency",
+        row_mask=selected,
+        term_totals=totals[selected],
+    )
+    np.testing.assert_array_equal(frequency, np.count_nonzero(counts[selected], axis=0))
+    np.testing.assert_allclose(
+        term_sums, (counts[selected] / totals[selected, None]).sum(axis=0)
+    )
+    with pytest.raises(MemoryError, match="Test frequency needs about"):
+        stream_document_frequency(
+            chunked,
+            memory_bytes=8,
+            nthreads=1,
+            msg="",
+            operation="Test frequency",
+        )
 
 
 def test_clr_does_not_reuse_artifacts_with_ambiguous_axis(monkeypatch):
@@ -326,14 +378,9 @@ def test_base_assay_sparse_export_combines_streamed_blocks():
             yield np.array([[1, 0], [0, 2]])
             yield np.array([[3, 4]])
 
-    assay = SimpleNamespace(
-        rawData=StreamedRaw(),
-        cells=SimpleNamespace(active_index=lambda _key: np.arange(3)),
-        nthreads=1,
-        name="toy",
-    )
+    assay = SimpleNamespace(rawData=StreamedRaw(), nthreads=1, name="toy")
 
-    observed = Assay.to_raw_sparse(assay, "I")
+    observed = raw_csr(assay, np.arange(3))
     np.testing.assert_array_equal(
         observed.toarray(),
         np.array([[1, 0], [0, 2], [3, 4]]),
@@ -368,7 +415,7 @@ def test_feature_percentage_is_datastore_owned_and_artifact_only(
     expected = np.divide(
         100.0 * counts[:, 0],
         counts.sum(axis=1),
-        out=np.zeros(len(cell_index), dtype=np.float64),
+        out=np.full(len(cell_index), np.nan),
         where=counts.sum(axis=1) != 0,
     )
     np.testing.assert_allclose(
@@ -379,57 +426,6 @@ def test_feature_percentage_is_datastore_owned_and_artifact_only(
     assert not hasattr(store.RNA, "add_percent_feature")
     assert set(store.cells.columns) == cell_columns
     assert dict(store.RNA.attrs) == assay_attrs
-
-
-def test_base_assay_subset_hash_encodes_order_and_axis_boundary():
-    first = Assay._create_subset_hash(np.array([0, 1]), np.array([2, 3]))
-    reordered = Assay._create_subset_hash(np.array([1, 0]), np.array([2, 3]))
-    different_boundary = Assay._create_subset_hash(
-        np.array([0, 1, 2]),
-        np.array([3]),
-    )
-
-    assert first != reordered
-    assert first != different_boundary
-
-
-def test_base_assay_mean_features_validates_requests_and_generic_path():
-    class DeferredMean:
-        @staticmethod
-        def mean(axis):
-            assert axis == 1
-            return DeferredMean()
-
-        @staticmethod
-        def compute():
-            return np.array([1.5, 2.5])
-
-    feature_names = np.array(["GeneA", "GeneB", "GeneC"])
-    feats = SimpleNamespace(fetch_all=lambda _key: feature_names)
-    assay = SimpleNamespace(
-        feats=feats,
-        _get_cell_idx=lambda _cell_key: np.array([0, 1]),
-        normed=lambda **_kwargs: DeferredMean(),
-    )
-
-    with pytest.raises(ValueError, match="missing must be"):
-        Assay.mean_features(assay, ["GeneA"], missing="ignore")
-    with pytest.raises(ValueError, match="must be non-empty"):
-        Assay.mean_features(assay, [])
-    with pytest.raises(ValueError, match="duplicate names"):
-        Assay.mean_features(assay, ["GeneA", "genea"])
-    with pytest.raises(ValueError, match="No requested features"):
-        Assay.mean_features(assay, ["Missing"], missing="skip")
-
-    feats.fetch_all = lambda _key: np.array(["GeneA", "genea", "GeneC"])
-    with pytest.raises(ValueError, match="matches multiple"):
-        Assay.mean_features(assay, ["GeneA"])
-
-    feats.fetch_all = lambda _key: feature_names
-    np.testing.assert_array_equal(
-        Assay.mean_features(assay, ["GeneA"]),
-        np.array([1.5, 2.5]),
-    )
 
 
 def test_base_assay_score_features_covers_generic_normalization(
@@ -544,51 +540,6 @@ def test_rna_gene_major_kernel_log_transform_matches_log1p():
         np.testing.assert_allclose(squares, np.square(logged).sum(axis=1))
 
 
-@pytest.mark.parametrize(
-    ("values", "error_type", "match"),
-    [
-        ("0,1", TypeError, "sequence of integer"),
-        ([[0, 1]], ValueError, "one-dimensional"),
-        ([0.5, 1.5], TypeError, "only integer"),
-    ],
-)
-def test_rna_feature_index_validation_rejects_malformed_values(
-    values,
-    error_type,
-    match,
-):
-    from scarf.assay.rna import _as_feature_indexes
-
-    with pytest.raises(error_type, match=match):
-        _as_feature_indexes(
-            values,
-            n_features=3,
-            name="features",
-            require_unique=True,
-        )
-
-
-@pytest.mark.parametrize(
-    ("n_bins", "lowess_frac", "strategy", "error_type", "match"),
-    [
-        (0, 0.1, "adaptive", ValueError, "greater than 0"),
-        (10, "wide", "adaptive", TypeError, "must be numeric"),
-        (10, 1.5, "fixed", ValueError, "between 0 and 1"),
-    ],
-)
-def test_corrected_variance_column_rejects_invalid_parameters(
-    n_bins,
-    lowess_frac,
-    strategy,
-    error_type,
-    match,
-):
-    from scarf.assay.rna import _corrected_variance_column
-
-    with pytest.raises(error_type, match=match):
-        _corrected_variance_column(n_bins, lowess_frac, strategy)
-
-
 def test_rna_requires_zarr_v3_counts_t():
     from scarf.storage.counts_t_contract import validate_count_matrix
 
@@ -633,6 +584,51 @@ def test_rna_normed_zero_total_cells_are_zero(tmp_path):
         store.get_cell_vals(from_assay="RNA", cell_key="everyone", k="g0"),
         [store.RNA.sf * 3 / 4, 0.0, store.RNA.sf * 2 / 4],
     )
+
+
+def _zero_count_store(tmp_path) -> DataStore:
+    raw = np.array([[3, 1, 0, 2], [0, 0, 0, 0], [1, 1, 4, 0]], dtype=np.uint32)
+    path = tmp_path / "zero.zarr"
+    SparseToZarr(
+        csr_matrix(raw),
+        zarr_loc=str(path),
+        cell_ids=["c0", "c1", "c2"],
+        feature_ids=["g0", "g1", "g2", "g3"],
+        feature_names=["MT-A", "MT-B", "G1", "G2"],
+        assay_name="RNA",
+        nthreads=1,
+    ).dump(batch_size=3)
+    return DataStore(str(path), default_assay="RNA", min_features_per_cell=0)
+
+
+def test_feature_percentages_share_one_definition_for_zero_count_cells(tmp_path):
+    store = _zero_count_store(tmp_path)
+    expected = [100 * 4 / 6, np.nan, 100 * 2 / 6]
+
+    np.testing.assert_allclose(store.cells.fetch_all("RNA_percentMito"), expected)
+    np.testing.assert_allclose(
+        store.RNA._compute_feature_percentage(np.arange(3), np.array([0, 1])),
+        expected,
+    )
+    store.cells.insert("everyone", np.ones(3, dtype=bool), overwrite=True)
+    ref = store.run_feature_percentage(
+        store.snapshot_cell_selection("everyone"),
+        store.set_feature_selection(from_assay="RNA", feature_indexes=[0, 1]),
+    )
+    np.testing.assert_allclose(store.load_artifact(ref)["values"][:], expected)
+
+
+def test_subset_normalization_payload_validates_feature_indices(tmp_path):
+    store = _zero_count_store(tmp_path)
+
+    with pytest.raises(IndexError, match="out-of-range"):
+        store.RNA._write_normalized_payload(
+            np.arange(3),
+            np.array([0, 9]),
+            "unused",
+            log_transform=False,
+            renormalize_subset=True,
+        )
 
 
 def test_concurrent_rna_normed_calls_keep_their_own_normalization(

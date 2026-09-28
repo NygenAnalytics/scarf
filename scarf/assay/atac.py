@@ -8,7 +8,11 @@ from ..matrix import ChunkedArray
 from ..metadata import MetaData
 from ..utils.compute import compute_with_progress
 from .base import Assay
-from .normalization import norm_tf_idf
+from .normalization import (
+    inverse_document_frequency,
+    norm_tf_idf,
+    stream_document_frequency,
+)
 
 
 class ATACassay(Assay):
@@ -180,60 +184,16 @@ class ATACassay(Assay):
     ) -> tuple[np.ndarray, np.ndarray]:
         """Compute document frequency and TF-IDF prevalence in one raw-data pass."""
         n_docs = len(cell_idx)
-        n_features = len(feat_idx)
-        if n_docs == 0 or n_features == 0:
-            return (
-                np.zeros(n_features, dtype=np.int64),
-                np.zeros(n_features, dtype=np.float64),
-            )
-
-        counts = self.rawData[:, feat_idx][cell_idx, :]
-        terms_per_document = self._terms_per_document(cell_idx)
-        document_frequency = np.zeros(n_features, dtype=np.int64)
-        term_frequency_sum = np.zeros(n_features, dtype=np.float64)
-        float_itemsize = np.dtype(np.float64).itemsize
-        feature_temporaries = 2 * n_features * float_itemsize
-        static_bytes = (
-            terms_per_document.nbytes
-            + document_frequency.nbytes
-            + term_frequency_sum.nbytes
-            + feature_temporaries
-        )
-        decode_bytes = counts._max_decode_bytes()
-        current_rows = min(int(counts.chunksize[0]), n_docs)
-        owned_bytes_per_row = counts._block_owned_bytes() // current_rows
-        working_bytes_per_row = owned_bytes_per_row + n_features * float_itemsize
-        available_bytes = int(self.resources.memoryBytes) - static_bytes - decode_bytes
-        if available_bytes < working_bytes_per_row:
-            required_bytes = static_bytes + decode_bytes + working_bytes_per_row
-            raise MemoryError(
-                "ATAC peak prevalence needs about "
-                f"{required_bytes} bytes for one row, but the operation limit is "
-                f"{self.resources.memoryBytes} bytes"
-            )
-        block_rows = min(current_rows, available_bytes // working_bytes_per_row)
-        counts = counts._with_block_size(block_rows)
-        resident_bytes = static_bytes + block_rows * n_features * float_itemsize
-        row_offset = 0
-        for raw in counts._stream_blocks(
+        document_frequency, term_frequency_sum = stream_document_frequency(
+            self.rawData[:, feat_idx][cell_idx, :],
+            memory_bytes=int(self.resources.memoryBytes),
             nthreads=self.nthreads,
             msg=f"({self.name}) Calculating peak prevalence across cells",
-            prefetch=1,
-            row_mask=None,
-            resident_bytes=resident_bytes,
-        ):
-            row_stop = row_offset + raw.shape[0]
-            document_frequency += np.count_nonzero(raw, axis=0)
-            scaled = np.asarray(raw, dtype=np.float64)
-            scaled /= terms_per_document[row_offset:row_stop].reshape(-1, 1)
-            term_frequency_sum += scaled.sum(axis=0)
-            row_offset = row_stop
-        if row_offset != n_docs:
-            raise RuntimeError(
-                f"({self.name}) Feature-stat stream produced {row_offset} rows; "
-                f"expected {n_docs}"
-            )
-        idf = np.log2(1 + (n_docs / (document_frequency + 1)))
+            operation="ATAC peak prevalence",
+            term_totals=self._terms_per_document(cell_idx),
+        )
+        assert term_frequency_sum is not None
+        idf = inverse_document_frequency(n_docs, document_frequency)
         return document_frequency, term_frequency_sum * idf
 
     def _compute_feature_summary(

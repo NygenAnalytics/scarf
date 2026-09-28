@@ -1,3 +1,4 @@
+import warnings
 from typing import Any
 
 import numpy as np
@@ -119,9 +120,9 @@ def _stream(
 
 
 def _collect(stream: AlignedFeatureStream) -> np.ndarray:
-    blocks = list(stream)
+    blocks = list(stream.iter_blocks())
     assert [block.row_offset for block in blocks] == [
-        start for start, _ in stream.block_boundaries
+        start for start, _ in stream.row_geometry.boundaries
     ]
     return np.concatenate([block.values for block in blocks], axis=0)
 
@@ -161,21 +162,13 @@ def test_aligned_feature_stream_replays_in_reference_order() -> None:
 
     np.testing.assert_allclose(first, expected)
     np.testing.assert_array_equal(second, first)
-    np.testing.assert_array_equal(stream.reference_feature_ids, ["a", "missing", "b"])
-    np.testing.assert_array_equal(stream.query_index_map, [2, 1])
+    assert first.dtype == np.dtype(np.float64)
     np.testing.assert_array_equal(stream.reference_index_map, [0, 2])
-    np.testing.assert_array_equal(stream.reference_to_query_index_map, [2, -1, 1])
     np.testing.assert_array_equal(stream.query_feature_indices, [2, 1])
-    np.testing.assert_array_equal(stream.reference_feature_indices, [0, 2])
-    np.testing.assert_array_equal(stream.query_cell_indices, cells)
-    assert stream.shape == (3, 3)
-    assert stream.dtype == np.dtype(np.float64)
     assert stream.feature_coverage == pytest.approx(2 / 3)
-    assert len(stream.alignment_map_fingerprint) == 64
-    assert stream.alignment_map_hash == stream.alignment_map_fingerprint
-    assert not stream.reference_feature_ids.flags.writeable
+    assert not stream.reference_index_map.flags.writeable
     with pytest.raises(ValueError, match="cannot set WRITEABLE flag"):
-        stream.reference_feature_ids.flags.writeable = True
+        stream.reference_index_map.flags.writeable = True
 
 
 @pytest.mark.parametrize(
@@ -236,12 +229,13 @@ def test_aligned_feature_stream_renormalizes_over_matched_reference_features() -
         dtype=np.uint32,
     )
     assay, _, _ = _query_assay(counts, ["a", "b", "extra"])
-    stream = _stream(
-        assay,
-        reference_ids=np.array(["b", "missing", "a"]),
-        means=np.array([0.0, 11.0, 0.0]),
-        normalization=_normalization(size_factor=10, renormalize_subset=True),
-    )
+    with pytest.warns(UserWarning, match=r"measures only 66\.7% of them"):
+        stream = _stream(
+            assay,
+            reference_ids=np.array(["b", "missing", "a"]),
+            means=np.array([0.0, 11.0, 0.0]),
+            normalization=_normalization(size_factor=10, renormalize_subset=True),
+        )
 
     np.testing.assert_allclose(
         _collect(stream),
@@ -252,6 +246,34 @@ def test_aligned_feature_stream_renormalizes_over_matched_reference_features() -
             ]
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("reference_ids", "renormalize_subset"),
+    [
+        (["b", "a"], True),
+        (["b", "missing", "a"], False),
+    ],
+    ids=["full-coverage", "library-size-totals"],
+)
+def test_aligned_feature_stream_warns_only_for_partial_subset_totals(
+    reference_ids: list[str],
+    renormalize_subset: bool,
+) -> None:
+    counts = np.array([[2, 3, 100], [0, 0, 7]], dtype=np.uint32)
+    assay, _, _ = _query_assay(counts, ["a", "b", "extra"])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        _stream(
+            assay,
+            reference_ids=np.array(reference_ids),
+            means=np.zeros(len(reference_ids)),
+            normalization=_normalization(
+                size_factor=10,
+                renormalize_subset=renormalize_subset,
+            ),
+        )
 
 
 @pytest.mark.parametrize("renormalize_subset", [False, True])
@@ -282,7 +304,7 @@ def test_aligned_blocks_flag_rows_without_overlap_counts(
         ),
         policy=policy,
     )
-    blocks = list(stream)
+    blocks = list(stream.iter_blocks())
 
     assert len(blocks) > 1
     for block in blocks:
@@ -307,16 +329,16 @@ def test_aligned_feature_stream_bounds_rows_under_tiny_budget() -> None:
     )
     roomy = _stream(assay)
     two_row_budget = ResourceBudget(
-        roomy.resident_bytes + roomy.decoded_chunk_bytes + 2 * roomy.stream_row_bytes,
+        roomy._resident_bytes + roomy._decode_bytes + 2 * roomy._stream_row_bytes,
         8,
     )
     bounded = _stream(assay, resources=two_row_budget)
-    blocks = list(bounded)
+    blocks = list(bounded.iter_blocks())
 
     assert bounded.row_geometry.block_rows == 2
     assert max(len(block.values) for block in blocks) == 2
     assert sum(len(block.values) for block in blocks) == len(counts)
-    assert bounded.block_boundaries == ((0, 2), (2, 4), (4, 6), (6, 7))
+    assert bounded.row_geometry.boundaries == ((0, 2), (2, 4), (4, 6), (6, 7))
 
 
 def test_aligned_feature_stream_reserves_downstream_mapping_memory() -> None:
@@ -328,24 +350,25 @@ def test_aligned_feature_stream_reserves_downstream_mapping_memory() -> None:
     )
     baseline = _stream(assay)
     budget = ResourceBudget(
-        baseline.resident_bytes
-        + baseline.decoded_chunk_bytes
-        + 4 * baseline.stream_row_bytes,
+        baseline._resident_bytes
+        + baseline._decode_bytes
+        + 4 * baseline._stream_row_bytes,
         2,
     )
     reserved = _stream(
         assay,
         resources=budget,
-        reserved_resident_bytes=baseline.stream_row_bytes,
-        reserved_per_row_bytes=baseline.stream_row_bytes,
+        reserved_resident_bytes=baseline._stream_row_bytes,
+        reserved_per_row_bytes=baseline._stream_row_bytes,
     )
 
     assert (
-        reserved.resident_bytes == baseline.resident_bytes + baseline.stream_row_bytes
+        reserved._resident_bytes
+        == baseline._resident_bytes + baseline._stream_row_bytes
     )
-    assert reserved.stream_row_bytes == 2 * baseline.stream_row_bytes
+    assert reserved._stream_row_bytes == 2 * baseline._stream_row_bytes
     assert reserved.row_geometry.block_rows == 1
-    assert sum(len(block.values) for block in reserved) == len(counts)
+    assert sum(len(block.values) for block in reserved.iter_blocks()) == len(counts)
 
 
 def test_aligned_feature_stream_reads_read_only_counts_without_zarr_writes() -> None:

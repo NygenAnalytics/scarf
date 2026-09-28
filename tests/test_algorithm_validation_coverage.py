@@ -12,7 +12,6 @@ from scarf.metrics.lisi import (
     _neighbor_probabilities,
     _simpson_from_probabilities,
     compute_lisi,
-    compute_simpson,
     lisi_batch_mixing_score,
 )
 
@@ -348,21 +347,6 @@ def test_lisi_summary_rejects_invalid_knn_shapes_and_neighbor_count() -> None:
         _lisi_knn_summary(np.ones((2, 3)), np.ones((2, 4)), **kwargs)
     with pytest.raises(ValueError, match="at least three neighbors"):
         _lisi_knn_summary(np.ones((2, 2)), np.ones((2, 2)), **kwargs)
-
-
-def test_compute_simpson_rejects_invalid_shapes_and_missing_labels() -> None:
-    labels = pd.Categorical(["a", "b"])
-    with pytest.raises(ValueError, match="two-dimensional"):
-        compute_simpson(np.ones(2), np.ones((2, 2)), labels, 1.0)
-    with pytest.raises(ValueError, match="matching shapes"):
-        compute_simpson(np.ones((2, 2)), np.ones((2, 3)), labels, 1.0)
-    with pytest.raises(ValueError, match="missing values"):
-        compute_simpson(
-            np.ones((3, 2)),
-            np.zeros((3, 2), dtype=np.int64),
-            pd.Categorical(["a", None]),
-            1.0,
-        )
 
 
 @pytest.mark.parametrize(

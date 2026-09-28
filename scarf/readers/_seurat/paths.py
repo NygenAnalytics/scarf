@@ -8,6 +8,7 @@ import numpy as np
 
 from .errors import MatrixSourceError, ResourceLimitError, UnsafeSidecarError
 from .sources import DEFAULT_LIMITS, SourceLimits
+from .values import decode_text_values, shape_value
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -34,18 +35,21 @@ def _serialized_absolute_path(text: str) -> PurePath | None:
 
 
 class SidecarPathResolver:
+    """Resolve serialized sidecar paths inside one anchor directory.
+
+    Relative paths resolve below ``anchor``. Absolute paths resolve only through an
+    explicit prefix remap. Every resolved path, after following links, must stay
+    inside its allowed root and must exist.
+    """
+
     def __init__(
         self,
-        rds_path: str | os.PathLike[str],
+        anchor: str | os.PathLike[str],
         *,
         absolute_prefix_remaps: Mapping[str | os.PathLike[str], str | os.PathLike[str]]
         | None = None,
-        require_exists: bool = True,
     ) -> None:
-        rds = Path(_path_text(rds_path)).expanduser().resolve(strict=False)
-        self.rdsPath = rds
-        self.anchor = rds.parent
-        self.requireExists = bool(require_exists)
+        self.anchor = Path(_path_text(anchor)).expanduser().resolve(strict=False)
         remaps: list[tuple[PurePath, Path]] = []
         for source, destination in (absolute_prefix_remaps or {}).items():
             source_text = _path_text(source)
@@ -65,6 +69,8 @@ class SidecarPathResolver:
         *,
         expect: str = "any",
     ) -> Path:
+        if expect not in {"any", "file", "directory"}:
+            raise ValueError("expect must be 'any', 'file', or 'directory'")
         text = _path_text(sidecar_path)
         serialized_absolute = _serialized_absolute_path(text)
         if serialized_absolute is not None:
@@ -75,11 +81,7 @@ class SidecarPathResolver:
                 raise UnsafeSidecarError(
                     f"drive-relative sidecar path {text!r} is rejected"
                 )
-            raw = (
-                Path(*windows_relative.parts)
-                if "\\" in text
-                else Path(text).expanduser()
-            )
+            raw = Path(*windows_relative.parts) if "\\" in text else Path(text)
             candidate = self.anchor / raw
             root = self.anchor
         resolved = candidate.resolve(strict=False)
@@ -88,14 +90,12 @@ class SidecarPathResolver:
             raise UnsafeSidecarError(
                 f"sidecar path {text!r} escapes allowed root {str(resolved_root)!r}"
             )
-        if self.requireExists and not resolved.exists():
+        if not resolved.exists():
             raise FileNotFoundError(resolved)
-        if expect == "file" and resolved.exists() and not resolved.is_file():
+        if expect == "file" and not resolved.is_file():
             raise UnsafeSidecarError(f"sidecar path {resolved} is not a regular file")
-        if expect == "directory" and resolved.exists() and not resolved.is_dir():
+        if expect == "directory" and not resolved.is_dir():
             raise UnsafeSidecarError(f"sidecar path {resolved} is not a directory")
-        if expect not in {"any", "file", "directory"}:
-            raise ValueError("expect must be 'any', 'file', or 'directory'")
         return resolved
 
     def _remap_absolute(self, path: PurePath) -> tuple[Path, Path]:
@@ -111,22 +111,6 @@ class SidecarPathResolver:
         raise UnsafeSidecarError(
             f"absolute sidecar path {str(path)!r} has no explicit prefix remap"
         )
-
-
-def resolve_sidecar_path(
-    sidecar_path: str | os.PathLike[str],
-    rds_path: str | os.PathLike[str],
-    *,
-    absolute_prefix_remaps: Mapping[str | os.PathLike[str], str | os.PathLike[str]]
-    | None = None,
-    require_exists: bool = True,
-    expect: str = "any",
-) -> Path:
-    return SidecarPathResolver(
-        rds_path,
-        absolute_prefix_remaps=absolute_prefix_remaps,
-        require_exists=require_exists,
-    ).resolve(sidecar_path, expect=expect)
 
 
 def require_filesystem_path(value: Any, description: str = "HDF5 source") -> Path:
@@ -289,21 +273,35 @@ def validate_hdf5_file(
     return resolved
 
 
-def _decode_hdf5_text(value: Any, object_path: str) -> str:
-    if isinstance(value, bytes | np.bytes_):
-        try:
-            result = bytes(value).decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise MatrixSourceError(
-                f"HDF5 text at {object_path} is not valid UTF-8"
-            ) from error
-    elif isinstance(value, str | np.str_):
-        result = str(value)
-    else:
-        raise MatrixSourceError(f"HDF5 metadata at {object_path} must contain strings")
-    if "\x00" in result:
-        raise MatrixSourceError(f"HDF5 text at {object_path} contains NUL")
-    return result
+def read_hdf5_text(
+    node: h5py.Dataset,
+    object_path: str,
+    *,
+    limits: SourceLimits = DEFAULT_LIMITS,
+) -> tuple[str, ...]:
+    """Decode a scalar or one-dimensional HDF5 string dataset within the budget."""
+    if node.ndim > 1:
+        raise MatrixSourceError(f"HDF5 text {object_path!r} must be scalar or 1D")
+    if _has_reference_dtype(node.dtype):
+        raise UnsafeSidecarError(
+            f"HDF5 reference names at {object_path!r} are rejected"
+        )
+    string_info = h5py.check_string_dtype(node.dtype)
+    if string_info is None:
+        raise MatrixSourceError(f"HDF5 text {object_path!r} must contain strings")
+    count = int(node.size)
+    fixed_bytes = 0 if string_info.length is None else string_info.length
+    if count * (fixed_bytes + 8) > limits.maxMetadataBytes:
+        raise ResourceLimitError(
+            f"HDF5 text {object_path!r} exceeds "
+            f"maxMetadataBytes={limits.maxMetadataBytes}"
+        )
+    values = np.asarray(node[()]).reshape(-1) if node.ndim == 0 else node
+    return decode_text_values(
+        values,
+        object_path=object_path,
+        max_bytes=limits.maxMetadataBytes,
+    )
 
 
 def read_hdf5_names(
@@ -331,39 +329,7 @@ def read_hdf5_names(
             f"HDF5 names dataset {normalized_path!r} has shape {node.shape}; "
             f"expected ({expected_length},)"
         )
-    if _has_reference_dtype(node.dtype):
-        raise UnsafeSidecarError(
-            f"HDF5 reference names at {normalized_path!r} are rejected"
-        )
-    if expected_length * 8 > limits.maxMetadataBytes:
-        raise ResourceLimitError(
-            f"HDF5 names exceed maxMetadataBytes={limits.maxMetadataBytes}"
-        )
-    string_info = h5py.check_string_dtype(node.dtype)
-    if string_info is None:
-        raise MatrixSourceError(
-            f"HDF5 names dataset {normalized_path!r} must contain strings"
-        )
-    if string_info.length is not None:
-        declared_bytes = expected_length * (string_info.length + 8)
-        if declared_bytes > limits.maxMetadataBytes:
-            raise ResourceLimitError(
-                f"HDF5 names exceed maxMetadataBytes={limits.maxMetadataBytes}"
-            )
-    values: list[str] = []
-    size = 0
-    chunk = 4096
-    for start in range(0, expected_length, chunk):
-        stop = min(expected_length, start + chunk)
-        for value in np.asarray(node[start:stop]).reshape(-1):
-            decoded = _decode_hdf5_text(value, normalized_path)
-            size += len(decoded.encode("utf-8")) + 8
-            if size > limits.maxMetadataBytes:
-                raise ResourceLimitError(
-                    f"HDF5 names exceed maxMetadataBytes={limits.maxMetadataBytes}"
-                )
-            values.append(decoded)
-    return tuple(values)
+    return read_hdf5_text(node, normalized_path, limits=limits)
 
 
 def read_hdf5_shape(
@@ -371,16 +337,9 @@ def read_hdf5_shape(
     object_path: str,
 ) -> tuple[int, int]:
     array = np.asarray(value)
-    if array.ndim != 1 or array.size != 2:
-        raise MatrixSourceError(
-            f"HDF5 shape at {object_path} must contain two integers"
-        )
     if not np.issubdtype(array.dtype, np.integer):
         raise TypeError(f"HDF5 shape at {object_path} must contain integers")
-    shape = (int(array[0]), int(array[1]))
-    if shape[0] < 0 or shape[1] < 0:
-        raise MatrixSourceError(f"HDF5 shape at {object_path} cannot contain negatives")
-    return shape
+    return shape_value(array, f"HDF5 shape at {object_path}")
 
 
 def require_hdf5_group(

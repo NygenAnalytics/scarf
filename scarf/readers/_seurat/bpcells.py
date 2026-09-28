@@ -1,24 +1,25 @@
 import math
 import os
 import re
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
 import h5py
 import numpy as np
 from numpy.typing import NDArray
-from scipy.sparse import coo_matrix, csr_matrix
 
 from .errors import MatrixSourceError, ResourceLimitError, UnsafeSidecarError
-from .paths import require_hdf5_group, validate_hdf5_file
+from .paths import read_hdf5_text, require_hdf5_group, validate_hdf5_file
 from .sources import (
     DEFAULT_LIMITS,
-    BaseMatrixSource,
-    MemoryEstimate,
+    CompressedMatrixSource,
     SourceLimits,
     _validate_shape,
+    validate_compressed_pointers,
+    validate_minor_indexes,
 )
+from .values import decode_text, decode_text_values, read_window
 
 
 _NUMERIC_HEADERS: dict[bytes, np.dtype[Any]] = {
@@ -157,66 +158,28 @@ def decode_bp128(
             if np.any(widened > np.iinfo(np.uint32).max):
                 raise MatrixSourceError("BP128 m1 decode overflows uint32")
             values = widened.astype(np.uint32)
-        elif transform in {"d1", "d1z"}:
+        elif transform == "d1":
+            # Unsigned deltas wrap modulo 2**32, as when fragment starts restart
+            # at a chromosome boundary inside one block.
             assert start_values is not None
-            if transform == "d1z":
-                encoded = values.astype(np.uint64)
-                deltas = (encoded >> np.uint64(1)).astype(np.int64) ^ -(
-                    (encoded & np.uint64(1)).astype(np.int64)
-                )
-            else:
-                deltas = values.astype(np.int64)
+            decoded_unsigned = np.cumsum(values.astype(np.uint64), dtype=np.uint64)
+            decoded_unsigned += np.uint64(int(start_values[block]))
+            values = (decoded_unsigned & np.uint64(0xFFFFFFFF)).astype(np.uint32)
+        elif transform == "d1z":
+            assert start_values is not None
+            encoded = values.astype(np.uint64)
+            deltas = (encoded >> np.uint64(1)).astype(np.int64) ^ -(
+                (encoded & np.uint64(1)).astype(np.int64)
+            )
             decoded = np.cumsum(deltas, dtype=np.int64)
             decoded += int(start_values[block])
             if np.any(decoded < 0) or np.any(decoded > np.iinfo(np.uint32).max):
-                raise MatrixSourceError(f"BP128 {transform} decode leaves uint32 range")
+                raise MatrixSourceError("BP128 d1z decode leaves uint32 range")
             values = decoded.astype(np.uint32)
         decoded_blocks.append(values)
     combined = np.concatenate(decoded_blocks)
     local_start = start - first_block * 128
     return combined[local_start : local_start + stop - start]
-
-
-def decode_bp128_m1(
-    data: NDArray[Any],
-    indexes: NDArray[Any],
-    count: int,
-    *,
-    index_offsets: NDArray[Any] | None = None,
-    start: int = 0,
-    stop: int | None = None,
-) -> NDArray[np.uint32]:
-    return decode_bp128(
-        data,
-        indexes,
-        count,
-        index_offsets=index_offsets,
-        transform="m1",
-        start=start,
-        stop=stop,
-    )
-
-
-def decode_bp128_d1z(
-    data: NDArray[Any],
-    indexes: NDArray[Any],
-    starts: NDArray[Any],
-    count: int,
-    *,
-    index_offsets: NDArray[Any] | None = None,
-    start: int = 0,
-    stop: int | None = None,
-) -> NDArray[np.uint32]:
-    return decode_bp128(
-        data,
-        indexes,
-        count,
-        index_offsets=index_offsets,
-        transform="d1z",
-        starts=starts,
-        start=start,
-        stop=stop,
-    )
 
 
 class _BPArrayStore(Protocol):
@@ -235,17 +198,6 @@ class _BPArrayStore(Protocol):
     ) -> NDArray[Any]: ...
 
     def read_text(self, name: str) -> tuple[str, ...]: ...
-
-
-def _read_vector_window(
-    values: Any,
-    start: int,
-    stop: int,
-) -> NDArray[Any]:
-    read_block = getattr(values, "read_block", None)
-    if callable(read_block):
-        return np.asarray(read_block(start, stop))
-    return np.asarray(values[start:stop])
 
 
 class _MemoryArrayStore:
@@ -294,7 +246,9 @@ class _MemoryArrayStore:
                 f"BPCells memory array {name!r} window [{start}, {stop}) "
                 f"is outside [0, {length})"
             )
-        values = _read_vector_window(self._arrays[name], start, stop)
+        values = read_window(
+            self._arrays[name], start, stop, object_path=f"BPCells {name}"
+        )
         if name in self._floatBitArrays:
             if values.dtype.kind not in "iu" or values.dtype.itemsize != 4:
                 raise TypeError(
@@ -319,36 +273,11 @@ class _MemoryArrayStore:
         values = self._text.get(name)
         if values is None:
             raise MatrixSourceError(f"BPCells memory text array {name!r} is missing")
-        output: list[str] = []
-        used_bytes = 0
-        for start in range(0, len(values), 4096):
-            stop = min(len(values), start + 4096)
-            read_block = getattr(values, "read_block", None)
-            block = (
-                read_block(start, stop) if callable(read_block) else values[start:stop]
-            )
-            for value in block:
-                if isinstance(value, bytes):
-                    try:
-                        decoded = value.decode("utf-8")
-                    except UnicodeDecodeError as error:
-                        raise MatrixSourceError(
-                            f"BPCells memory text array {name!r} is not valid UTF-8"
-                        ) from error
-                elif isinstance(value, str):
-                    decoded = value
-                else:
-                    raise TypeError(
-                        f"BPCells memory text array {name!r} must contain strings"
-                    )
-                used_bytes += len(decoded.encode("utf-8")) + 8
-                if used_bytes > self._limits.maxMetadataBytes:
-                    raise ResourceLimitError(
-                        f"BPCells memory text array {name!r} exceeds "
-                        f"maxMetadataBytes={self._limits.maxMetadataBytes}"
-                    )
-                output.append(decoded)
-        return tuple(output)
+        return decode_text_values(
+            values,
+            object_path=f"BPCells memory text array {name!r}",
+            max_bytes=self._limits.maxMetadataBytes,
+        )
 
 
 class _DirectoryArrayStore:
@@ -447,13 +376,11 @@ class _DirectoryArrayStore:
                 f"BPCells text array {name!r} exceeds "
                 f"maxMetadataBytes={self._limits.maxMetadataBytes}"
             )
-        try:
-            text = child.read_text(encoding="utf-8")
-        except UnicodeDecodeError as error:
-            raise MatrixSourceError(
-                f"BPCells text array {name!r} is not valid UTF-8"
-            ) from error
-        return tuple(text.splitlines())
+        text = decode_text(child.read_bytes(), f"BPCells text array {name!r}")
+        if not text:
+            return ()
+        lines = text.split("\n")
+        return tuple(lines[:-1] if text.endswith("\n") else lines)
 
 
 class _HDF5ArrayStore:
@@ -475,13 +402,12 @@ class _HDF5ArrayStore:
             value = np.asarray(node.attrs["version"]).reshape(-1)
             if value.size != 1:
                 raise MatrixSourceError("BPCells HDF5 version attribute must be scalar")
-            scalar = value[0]
-            if isinstance(scalar, bytes | np.bytes_):
-                self._version = bytes(scalar).decode("utf-8")
-            elif isinstance(scalar, str | np.str_):
-                self._version = str(scalar)
-            else:
-                raise MatrixSourceError("BPCells HDF5 version attribute must be text")
+            try:
+                self._version = decode_text(value[0], "BPCells HDF5 version")
+            except TypeError as error:
+                raise MatrixSourceError(
+                    "BPCells HDF5 version attribute must be text"
+                ) from error
 
     @property
     def version(self) -> str:
@@ -535,58 +461,11 @@ class _HDF5ArrayStore:
                 raise MatrixSourceError(f"BPCells HDF5 text array {name!r} is missing")
             node = group[name]
             assert isinstance(node, h5py.Dataset)
-            if node.ndim > 1:
-                raise MatrixSourceError(
-                    f"BPCells HDF5 text array {name!r} must be scalar or 1D"
-                )
-            string_info = h5py.check_string_dtype(node.dtype)
-            if string_info is None:
-                raise MatrixSourceError(
-                    f"BPCells HDF5 text array {name!r} must contain strings"
-                )
-            count = int(node.size)
-            if count * 8 > self._limits.maxMetadataBytes:
-                raise ResourceLimitError(
-                    f"BPCells HDF5 text array {name!r} exceeds "
-                    f"maxMetadataBytes={self._limits.maxMetadataBytes}"
-                )
-            if (
-                string_info.length is not None
-                and count * (string_info.length + 8) > self._limits.maxMetadataBytes
-            ):
-                raise ResourceLimitError(
-                    f"BPCells HDF5 text array {name!r} exceeds "
-                    f"maxMetadataBytes={self._limits.maxMetadataBytes}"
-                )
-            output: list[str] = []
-            size = 0
-            for start in range(0, count, 4096):
-                stop = min(count, start + 4096)
-                values = np.asarray(
-                    node[()] if node.ndim == 0 else node[start:stop]
-                ).reshape(-1)
-                for value in values:
-                    if isinstance(value, bytes | np.bytes_):
-                        try:
-                            decoded = bytes(value).decode("utf-8")
-                        except UnicodeDecodeError as error:
-                            raise MatrixSourceError(
-                                f"BPCells HDF5 text array {name!r} is not valid UTF-8"
-                            ) from error
-                    elif isinstance(value, str | np.str_):
-                        decoded = str(value)
-                    else:
-                        raise MatrixSourceError(
-                            f"BPCells HDF5 text array {name!r} must contain strings"
-                        )
-                    size += len(decoded.encode("utf-8")) + 8
-                    if size > self._limits.maxMetadataBytes:
-                        raise ResourceLimitError(
-                            f"BPCells HDF5 text array {name!r} exceeds "
-                            f"maxMetadataBytes={self._limits.maxMetadataBytes}"
-                        )
-                    output.append(decoded)
-        return tuple(output)
+            return read_hdf5_text(
+                node,
+                f"BPCells HDF5 text array {name!r}",
+                limits=self._limits,
+            )
 
 
 def _require_numeric_array(
@@ -736,7 +615,9 @@ class _StoredBP128Array:
         return output
 
 
-class BPCellsMatrixSource(BaseMatrixSource):
+class BPCellsMatrixSource(CompressedMatrixSource):
+    _decodeWorkingBytes = 128 * np.dtype(np.uint32).itemsize
+
     def __init__(
         self,
         store: _BPArrayStore,
@@ -765,14 +646,16 @@ class BPCellsMatrixSource(BaseMatrixSource):
                 "BPCells storage_order must contain exactly 'row' or 'col'"
             )
         self.storageOrder = order_values[0]
-        compressed_axis = shape[1] if self.storageOrder == "col" else shape[0]
+        cells_compressed = self.storageOrder == "col"
+        compressed_axis = shape[1] if cells_compressed else shape[0]
         pointer_dtype = np.dtype("uint32" if self.formatVersion == 1 else "uint64")
         _require_numeric_array(store, "idxptr", pointer_dtype, compressed_axis + 1)
-        self._nnz = self._validate_pointers(compressed_axis, limits)
-        if self._nnz > limits.maxNnz:
-            raise ResourceLimitError(
-                f"BPCells nnz {self._nnz} exceeds maxNnz={limits.maxNnz}"
-            )
+        nnz = validate_compressed_pointers(
+            lambda start, stop: store.read_numeric("idxptr", start, stop),
+            compressed_axis + 1,
+            limits,
+            label="BPCells idxptr",
+        )
         matrix_dtype: np.dtype[Any]
         self._indexReader: _StoredBP128Array | None
         self._valueReader: _StoredBP128Array | None
@@ -786,7 +669,7 @@ class BPCellsMatrixSource(BaseMatrixSource):
             self._indexReader = _StoredBP128Array(
                 store,
                 "index",
-                self._nnz,
+                nnz,
                 "d1z",
                 require_offsets=self.formatVersion == 2,
                 limits=limits,
@@ -795,7 +678,7 @@ class BPCellsMatrixSource(BaseMatrixSource):
                 _StoredBP128Array(
                     store,
                     "val",
-                    self._nnz,
+                    nnz,
                     "m1",
                     require_offsets=self.formatVersion == 2,
                     limits=limits,
@@ -804,23 +687,30 @@ class BPCellsMatrixSource(BaseMatrixSource):
                 else None
             )
             if datatype != "uint":
-                _require_numeric_array(store, "val", matrix_dtype, self._nnz)
+                _require_numeric_array(store, "val", matrix_dtype, nnz)
         else:
             self._indexReader = None
             self._valueReader = None
-            _require_numeric_array(store, "index", np.dtype("uint32"), self._nnz)
-            _require_numeric_array(store, "val", matrix_dtype, self._nnz)
+            _require_numeric_array(store, "index", np.dtype("uint32"), nnz)
+            _require_numeric_array(store, "val", matrix_dtype, nnz)
         row_names = self._optional_names("row_names", shape[0])
         column_names = self._optional_names("col_names", shape[1])
         super().__init__(
             shape,
             matrix_dtype,
+            cells_compressed=cells_compressed,
+            nnz=nnz,
             row_names=row_names,
             column_names=column_names,
-            is_sparse=True,
             limits=limits,
         )
-        self._validate_indexes(limits)
+        validate_minor_indexes(
+            self._read_indexes,
+            nnz,
+            shape[0] if cells_compressed else shape[1],
+            limits,
+            label="BPCells index",
+        )
 
     def _optional_names(
         self,
@@ -838,28 +728,6 @@ class BPCellsMatrixSource(BaseMatrixSource):
             )
         return values
 
-    def _validate_pointers(
-        self,
-        compressed_axis: int,
-        limits: SourceLimits,
-    ) -> int:
-        previous: int | None = None
-        final = 0
-        chunk = max(1, min(compressed_axis + 1, limits.compressedChunkNnz))
-        for start in range(0, compressed_axis + 1, chunk):
-            stop = min(compressed_axis + 1, start + chunk)
-            values = self.store.read_numeric("idxptr", start, stop)
-            if values.size > 1 and np.any(values[1:] < values[:-1]):
-                raise MatrixSourceError("BPCells idxptr must be nondecreasing")
-            if previous is not None and values.size and int(values[0]) < previous:
-                raise MatrixSourceError("BPCells idxptr must be nondecreasing")
-            if start == 0 and (not values.size or int(values[0]) != 0):
-                raise MatrixSourceError("BPCells idxptr must start at zero")
-            if values.size:
-                previous = int(values[-1])
-                final = previous
-        return final
-
     def _read_indexes(self, start: int, stop: int) -> NDArray[np.uint32]:
         if self._indexReader is not None:
             return self._indexReader.read(start, stop)
@@ -867,24 +735,22 @@ class BPCellsMatrixSource(BaseMatrixSource):
             np.uint32, copy=False
         )
 
-    def _read_values(self, start: int, stop: int) -> NDArray[Any]:
-        if self._valueReader is not None:
-            return self._valueReader.read(start, stop)
-        return self.store.read_numeric("val", start, stop).astype(
-            self.dtype, copy=False
+    def _read_pointers(self, start: int, stop: int) -> NDArray[np.int64]:
+        return self.store.read_numeric("idxptr", start, stop).astype(
+            np.int64, copy=False
         )
 
-    def _validate_indexes(self, limits: SourceLimits) -> None:
-        minor_axis = self.shape[0] if self.storageOrder == "col" else self.shape[1]
-        for start in range(0, self._nnz, limits.compressedChunkNnz):
-            stop = min(self._nnz, start + limits.compressedChunkNnz)
-            indexes = self._read_indexes(start, stop)
-            if indexes.size and np.any(indexes >= minor_axis):
-                raise MatrixSourceError("BPCells index contains an out-of-range value")
-
-    @property
-    def nnz(self) -> int:
-        return self._nnz
+    def _read_entries(
+        self, start: int, stop: int
+    ) -> tuple[NDArray[Any], NDArray[np.int64]]:
+        if self._valueReader is not None:
+            values = self._valueReader.read(start, stop)
+        else:
+            values = self.store.read_numeric("val", start, stop)
+        return (
+            values.astype(self.dtype, copy=False),
+            self._read_indexes(start, stop).astype(np.int64, copy=False),
+        )
 
     @property
     def resident_bytes(self) -> int:
@@ -894,87 +760,6 @@ class BPCellsMatrixSource(BaseMatrixSource):
         if self._valueReader is not None:
             offsets += self._valueReader.indexOffsets.nbytes
         return int(super().resident_bytes + offsets)
-
-    def _bounds(
-        self,
-        start: int,
-        stop: int,
-    ) -> tuple[NDArray[np.int64], int, int]:
-        pointers = self.store.read_numeric("idxptr", start, stop + 1).astype(
-            np.int64, copy=False
-        )
-        data_start = int(pointers[0])
-        data_stop = int(pointers[-1])
-        return pointers - data_start, data_start, data_stop
-
-    def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
-        start, stop = self._window(start, stop)
-        index_size = np.dtype(np.int64).itemsize
-        if self.storageOrder == "col":
-            pointers, data_start, data_stop = self._bounds(start, stop)
-            nnz = data_stop - data_start
-            output = nnz * (self.dtype.itemsize + index_size) + pointers.nbytes
-            working = output + 128 * np.dtype(np.uint32).itemsize
-            return MemoryEstimate(self.resident_bytes, working, output)
-        return self._row_store_memory(
-            start, stop, nnz=self.nnz, source_bytes=(self.n_features + 1) * 8
-        )
-
-    def read_cells(self, start: int, stop: int) -> csr_matrix:
-        start, stop = self._window(start, stop)
-        estimate = self.estimate_read_memory(start, stop)
-        self._admit(estimate)
-        if self.storageOrder == "col":
-            pointers, data_start, data_stop = self._bounds(start, stop)
-            return csr_matrix(
-                (
-                    self._read_values(data_start, data_stop),
-                    self._read_indexes(data_start, data_stop).astype(
-                        np.int64, copy=False
-                    ),
-                    pointers,
-                ),
-                shape=(stop - start, self.n_features),
-                dtype=self.dtype,
-            )
-        if start == stop:
-            return csr_matrix((0, self.n_features), dtype=self.dtype)
-        self._prepare_for_read()
-        assert self._rowStore is not None
-        return self._rowStore.read(start, stop)
-
-    def _prepare_for_read(self) -> None:
-        if self.storageOrder != "col" and self.n_cells:
-            self._prepare_row_store(
-                self._column_chunks, source_bytes=(self.n_features + 1) * 8
-            )
-
-    def _column_chunks(self) -> Iterator[coo_matrix]:
-        chunk_nnz = max(
-            1,
-            min(
-                self._limits.compressedChunkNnz,
-                (
-                    self._limits.maxBlockBytes
-                    - (self.n_cells + 1) * 32
-                    - (self.n_features + 1) * 8
-                )
-                // 384,
-            ),
-        )
-        pointers = self.store.read_numeric("idxptr").astype(np.int64, copy=False)
-        for start in range(0, self.nnz, chunk_nnz):
-            stop = min(self.nnz, start + chunk_nnz)
-            features = (
-                np.searchsorted(pointers, np.arange(start, stop), side="right") - 1
-            )
-            yield coo_matrix(
-                (
-                    self._read_values(start, stop),
-                    (self._read_indexes(start, stop), features),
-                ),
-                shape=(self.n_cells, self.n_features),
-            )
 
 
 class BPCellsMemoryMatrixSource(BPCellsMatrixSource):

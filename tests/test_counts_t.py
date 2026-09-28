@@ -6,11 +6,10 @@ from scipy.sparse import csr_matrix
 from zarr.storage import MemoryStore
 
 from scarf.assay import Assay, RNAassay
-from scarf.features.genomic.melding import coordinate_melding
+from scarf.features.genomic.melding import write_melded_counts
 from scarf.features.markers import find_markers_by_rank, find_markers_by_regression
 from scarf.metadata import MetaData
-from scarf.quality_control.doublets import write_doublet_target_zarr
-from scarf.storage.async_execution import reset_zarr_runtime_for_tests
+from tests.storage_helpers import reset_zarr_runtime
 from scarf.storage.budget import ResourceBudget
 from scarf.storage.counts_t_contract import validate_count_matrix
 from scarf.storage.count_matrix import (
@@ -20,23 +19,20 @@ from scarf.storage.count_matrix import (
     persist_count_matrix_plan,
     plan_count_matrix_pair,
 )
-from scarf.storage.identity import finalize_counts
-from scarf.storage.layout import ZarrArraySpec
+from tests.storage_helpers import finalize_test_counts
 from scarf.storage.profiles import resolve_storage_profile
-from scarf.storage.sharding import counts_t_spec, write_counts_t
-from scarf.writers import (
-    create_cell_data,
-    create_zarr_count_assay,
-)
+from scarf.storage.schema import create_cell_data, derived_assay_transaction
+from scarf.storage.sharding import write_counts_t
+from scarf.writers import create_zarr_count_assay
 from tests.store_probes import RecordingStore
 
 
 def setup_function() -> None:
-    reset_zarr_runtime_for_tests()
+    reset_zarr_runtime()
 
 
 def teardown_function() -> None:
-    reset_zarr_runtime_for_tests()
+    reset_zarr_runtime()
 
 
 def _memory_root() -> zarr.Group:
@@ -72,7 +68,7 @@ def _write_small_assay(
     else:
         counts = root["matrices/RNA/counts"]
     counts[:] = values
-    finalize_counts(counts)
+    finalize_test_counts(counts)
     group = root["RNA"] if workspace is None else root["matrices/RNA"]
     write_counts_t(
         counts,
@@ -100,22 +96,13 @@ def test_explicit_write_counts_t_builds_complete_counts_t(workspace):
     np.testing.assert_array_equal(counts_t[:], values.T)
 
 
-def test_counts_t_spec_matches_write_layout_and_data():
+def test_counts_t_write_matches_paired_plan_and_data():
     values = np.arange(24, dtype=np.uint32).reshape(6, 4)
     group, counts = _counts_array(values)
     profile = resolve_storage_profile(group.store)
-    preview = counts_t_spec(
-        ZarrArraySpec(
-            shape=tuple(int(value) for value in counts.shape),
-            chunks=tuple(int(value) for value in counts.chunks),
-            dtype=counts.dtype,
-            compressors=None,
-            shards=None,
-            fillValue=0,
-            overwrite=True,
-        ),
-        profile=profile,
-    )
+    preview = plan_count_matrix_pair(
+        int(counts.shape[0]), int(counts.shape[1]), counts.dtype, profile=profile
+    ).countsT
     written = write_counts_t(counts, group, profile=profile)
     assert written is not None
     assert tuple(int(value) for value in written.shape) == preview.shape
@@ -593,7 +580,7 @@ def test_renormalize_subset_path_batches_features():
     assert sum(frame.shape[1] for frame in frames) == 7
 
 
-def test_coordinate_melding_leaves_counts_t_on_demand():
+def test_melded_counts_leave_counts_t_on_demand():
     root = _memory_root()
     values = np.array(
         [
@@ -629,7 +616,7 @@ def test_coordinate_melding_leaves_counts_t_on_demand():
     n_cells_per_peak = (values > 0).sum(axis=0).astype(np.float64)
     cells.insert("ATAC_nFeatures", n_features, overwrite=True)
     cells.insert("ATAC_nCounts", n_counts, overwrite=True)
-    finalize_counts(root["ATAC/counts"])
+    finalize_test_counts(root["ATAC/counts"])
     assay = Assay(root, None, "ATAC", cells, nthreads=1)
     assay.feats.insert("nCells", n_cells_per_peak, overwrite=True)
 
@@ -642,14 +629,19 @@ def test_coordinate_melding_leaves_counts_t_on_demand():
             4: ["A", "B", "C"],
         }
     )
-    coordinate_melding(
-        assay,
-        workspace=None,
-        feature_bed=feature_bed,
-        new_assay_name="GENE",
-        peaks_col="ids",
-        renormalization=False,
-    )
+    with derived_assay_transaction(
+        root, "GENE", None, operation="add_melded_assay"
+    ) as transaction:
+        write_melded_counts(
+            transaction,
+            assay,
+            feature_bed,
+            peaks_col="ids",
+            scalar_coeff=1e5,
+            renormalization=False,
+            peaks_coords=None,
+            idf_cell_idx=None,
+        )
     assert "counts" in root["GENE"]
     assert "countsT" not in root["GENE"]
 
@@ -677,26 +669,6 @@ def test_count_assay_leaves_counts_t_on_demand():
     assert "countsT" not in root["PTIME_MODULES"]
 
 
-def test_write_doublet_target_zarr_writes_strip_counts_t(tmp_path):
-    sim = csr_matrix(np.array([[1, 0, 2], [0, 3, 0]], dtype=np.uint32))
-    zarr_loc = str(tmp_path / "doublets.zarr")
-    root = write_doublet_target_zarr(
-        zarr_loc=zarr_loc,
-        assay_name="RNA",
-        sim_counts=sim,
-        feat_ids=np.array(["f0", "f1", "f2"]),
-        feat_names=np.array(["g0", "g1", "g2"]),
-        dtype="uint32",
-    )
-    assert "counts" in root["RNA"]
-    assert "countsT" in root["RNA"]
-    assert root["RNA/countsT"].attrs["complete"] is True
-    np.testing.assert_array_equal(
-        root["RNA/countsT"][:],
-        np.asarray(root["RNA/counts"][:]).T,
-    )
-
-
 def test_custom_assay_name_seeds_generic_type_and_loads(tmp_path):
     from scarf import DataStore
     from scarf.writers import SparseToZarr
@@ -721,7 +693,8 @@ def test_custom_assay_name_seeds_generic_type_and_loads(tmp_path):
 
 
 def test_explicit_assay_type_can_declare_custom_group_as_rna(tmp_path):
-    from scarf.writers import create_cell_data, create_zarr_count_assay
+    from scarf.storage.schema import create_cell_data
+    from scarf.writers import create_zarr_count_assay
     from scarf.writers.counts_t import finalize_writer_counts_t
 
     path = str(tmp_path / "declared_rna.zarr")
@@ -743,28 +716,10 @@ def test_explicit_assay_type_can_declare_custom_group_as_rna(tmp_path):
         dtype="uint32",
     )
     root["CUSTOM_NAME/counts"][:] = values
-    finalize_counts(root["CUSTOM_NAME/counts"])
+    finalize_test_counts(root["CUSTOM_NAME/counts"])
     finalize_writer_counts_t(root, "CUSTOM_NAME", None, assay_type="RNA")
     assert root.attrs["assayTypes"]["CUSTOM_NAME"] == "RNA"
     assert root["CUSTOM_NAME/countsT"].attrs["complete"] is True
-
-
-def test_write_doublet_target_rejects_summary_before_truncating_destination():
-    store = MemoryStore()
-    root = zarr.open_group(store=store, mode="w")
-    root.create_group("sentinel")
-
-    with pytest.raises(ValueError, match=r"reserved for DataStore\.summary"):
-        write_doublet_target_zarr(
-            zarr_loc=store,
-            assay_name="summary",
-            sim_counts=csr_matrix(np.ones((1, 1), dtype=np.uint32)),
-            feat_ids=np.array(["f0"]),
-            feat_names=np.array(["g0"]),
-        )
-
-    preserved = zarr.open_group(store=store, mode="r")
-    assert set(preserved.group_keys()) == {"sentinel"}
 
 
 def _counts_array(
@@ -796,7 +751,7 @@ def _counts_array(
         counts[:] = values
     persist_count_matrix_plan(group, plan)
     persist_count_matrix_plan(counts, plan)
-    finalize_counts(counts)
+    finalize_test_counts(counts)
     return group, counts
 
 
@@ -825,7 +780,7 @@ def test_write_counts_t_geometry_matches_serial_baseline():
     values = _dense_values(22, 7)
     metadata = []
     for workers in (1, 4):
-        reset_zarr_runtime_for_tests()
+        reset_zarr_runtime()
         group, counts = _counts_array(values)
         counts_t = write_counts_t(
             counts,
@@ -944,7 +899,7 @@ def test_write_counts_t_overwrite_leaves_no_stale_chunks():
         overwrite=True,
     )
     counts[:] = smaller
-    finalize_counts(counts)
+    finalize_test_counts(counts)
     persist_count_matrix_plan(group, plan)
     persist_count_matrix_plan(counts, plan)
     counts_t = write_counts_t(
@@ -1092,9 +1047,9 @@ def test_assess_counts_t_reuse_outcomes(tmp_path):
     blocked = assess_counts_t_reuse(
         root, "RNA", None, n_cells=3, n_features=4, dtype="float32"
     )
-    assert blocked.outcome == "block-shape/dtype"
+    assert blocked.outcome == "invalid"
 
-    # Non-strip: rewrite by replacing with an unsharded destination.
+    # A complete countsT in another layout is invalid, not rewritten.
     del root["RNA/countsT"]
     counts = root["RNA/counts"]
     unsharded = root["RNA"].create_array(
@@ -1109,7 +1064,8 @@ def test_assess_counts_t_reuse_outcomes(tmp_path):
     layout = assess_counts_t_reuse(
         root, "RNA", None, n_cells=3, n_features=4, dtype="uint32"
     )
-    assert layout.outcome == "rewrite-layout"
+    assert layout.outcome == "invalid"
+    assert layout.reason
 
 
 def test_assess_counts_t_reuse_keeps_non_default_unit(tmp_path):
@@ -1139,7 +1095,7 @@ def test_assess_counts_t_reuse_keeps_non_default_unit(tmp_path):
     )
     counts = root["RNA/counts"]
     counts[:] = values
-    finalize_counts(counts)
+    finalize_test_counts(counts)
     write_counts_t(
         counts,
         root["RNA"],
@@ -1159,7 +1115,7 @@ def test_assess_counts_t_reuse_keeps_non_default_unit(tmp_path):
     missing = assess_counts_t_reuse(
         root, "RNA", None, n_cells=3, n_features=4, dtype="uint32"
     )
-    assert missing.outcome == "rewrite-layout"
+    assert missing.outcome == "invalid"
 
 
 def test_subset_preserves_gene_activity_alias(tmp_path):
@@ -1273,28 +1229,23 @@ def test_paired_layout_predicates_and_preflight_failures() -> None:
     assert list(SparseShardBuffer(no_rows).finish()) == []
 
 
-def test_counts_t_matches_plan_rejects_incomplete_or_stale_layout() -> None:
-    from scarf.storage.sharding import _counts_t_matches_plan
+def test_write_counts_t_reuses_only_a_valid_matching_counts_t() -> None:
+    values = np.arange(24, dtype=np.uint16).reshape(6, 4)
+    group, counts = _counts_array(values)
+    written = write_counts_t(counts, group)
+    assert write_counts_t(counts, group) == written
 
-    policy = CountMatrixPolicy(unitBytes=2_000, chunkBytes=200)
-    plan = plan_count_matrix_pair(8, 6, "uint16", policy=policy)
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    incomplete = root.create_array(
-        "incomplete_t",
-        shape=plan.countsT.shape,
-        chunks=plan.countsT.chunks,
-        shards=plan.countsT.shards,
-        dtype="uint16",
-    )
-    assert _counts_t_matches_plan(incomplete, plan) is False
-    incomplete.attrs["complete"] = True
-    assert _counts_t_matches_plan(incomplete, plan) is False
-    persist_count_matrix_plan(incomplete, plan)
-    payload = dict(incomplete.attrs[COUNT_MATRIX_LAYOUT_KEY])
-    payload["fingerprint"] = "not-the-replayed-plan"
-    incomplete.attrs[COUNT_MATRIX_LAYOUT_KEY] = payload
-    incomplete.attrs["complete"] = True
-    assert _counts_t_matches_plan(incomplete, plan) is False
+    payload = dict(written.attrs[COUNT_MATRIX_LAYOUT_KEY])
+    written.attrs[COUNT_MATRIX_LAYOUT_KEY] = {**payload, "fingerprint": "stale"}
+    with pytest.raises(ValueError, match="use overwrite=True"):
+        write_counts_t(counts, group)
+    written.attrs[COUNT_MATRIX_LAYOUT_KEY] = payload
+    written.attrs["complete"] = False
+    with pytest.raises(ValueError, match="use overwrite=True"):
+        write_counts_t(counts, group)
+    rewritten = write_counts_t(counts, group, overwrite=True)
+    assert rewritten.attrs["complete"] is True
+    np.testing.assert_array_equal(rewritten[:], values.T)
 
 
 def test_assess_counts_t_reuse_returns_reason_when_missing() -> None:

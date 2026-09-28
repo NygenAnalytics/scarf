@@ -1,6 +1,5 @@
 """One immutable RNA workflow history containing stage evidence and decisions."""
 
-import hashlib
 import json
 import re
 import time
@@ -20,6 +19,7 @@ from .. import record_io
 from ..experimental_context.study import StudyContract
 from ..types import AgentDataModel, AgentRunInfo, ArtifactReferenceModel
 from .models import (
+    _RUN_ID_PATTERN,
     _STAGE_ORDER,
     AutomatedWorkflowConfig,
     AutomatedWorkflowResult,
@@ -29,6 +29,7 @@ from .models import (
     StageEvidenceReference,
     WorkflowIdentity,
     WorkflowNeedsInput,
+    WorkflowQuestion,
     WorkflowStageAttempt,
     WorkflowStageLink,
     WorkflowStageName,
@@ -42,9 +43,13 @@ _INCOMPATIBLE = (
 
 
 def _sha256_model(value: AgentDataModel) -> str:
-    return hashlib.sha256(
-        record_io.canonical_json_bytes(value.model_dump(mode="json"))
-    ).hexdigest()
+    return record_io.sha256_json(value.model_dump(mode="json"))
+
+
+def _validated_run_id(workflow_run_id: str) -> str:
+    if _RUN_ID_PATTERN.fullmatch(workflow_run_id) is None:
+        raise ValueError("Invalid workflow identifier")
+    return workflow_run_id
 
 
 def model_attempt_callback(
@@ -55,7 +60,7 @@ def model_attempt_callback(
     inputs: Mapping[str, Any],
 ) -> Callable[[AgentRunInfo], None]:
     """Save provider attempts beside their exact owning scientific evidence."""
-    identity = hashlib.sha256(record_io.canonical_json_bytes(dict(inputs))).hexdigest()
+    identity = record_io.sha256_json(dict(inputs))
 
     def save(run_info: AgentRunInfo) -> None:
         save_checkpoint(
@@ -151,11 +156,9 @@ def diagnostic_attempt(
 
 
 def _record_checksum(value: AgentDataModel) -> str:
-    return hashlib.sha256(
-        record_io.canonical_json_bytes(
-            value.model_dump(mode="json", exclude={"contentSha256"})
-        )
-    ).hexdigest()
+    return record_io.sha256_json(
+        value.model_dump(mode="json", exclude={"contentSha256"})
+    )
 
 
 def _write_key_once(group: zarr.Group, key: str, payload: bytes) -> None:
@@ -180,9 +183,9 @@ def _checkpoint_key(prefix: str, workflow_run_id: str, key: str) -> str:
         for part in parts
     ):
         raise ValueError("Checkpoint keys must contain safe, non-empty path components")
-    if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", workflow_run_id) is None:
-        raise ValueError("Invalid workflow identifier")
-    return record_io.join_key(prefix, workflow_run_id, "checkpoints", key + ".json")
+    return record_io.join_key(
+        prefix, _validated_run_id(workflow_run_id), "checkpoints", key + ".json"
+    )
 
 
 def read_checkpoint(
@@ -205,8 +208,7 @@ def read_checkpoint(
             "Unsupported RNA checkpoint contract; start a new workflow. Existing analysis artifacts remain accessible."
         )
     payload = {"inputs": value["inputs"], "outputs": value["outputs"]}
-    digest = hashlib.sha256(record_io.canonical_json_bytes(payload)).hexdigest()
-    if value["contentSha256"] != digest:
+    if value["contentSha256"] != record_io.sha256_json(payload):
         raise ValueError("RNA checkpoint checksum does not match its contents")
     if not isinstance(value["inputs"], dict) or not isinstance(value["outputs"], dict):
         raise ValueError("RNA checkpoint inputs and outputs must be mappings")
@@ -239,25 +241,30 @@ def save_checkpoint(
     inputs: Mapping[str, Any],
     outputs: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Commit evidence or admission before its dependent work; exact replay is idempotent."""
-    payload = {"inputs": dict(inputs), "outputs": dict(outputs)}
-    value = {
-        **payload,
-        "contentSha256": hashlib.sha256(
-            record_io.canonical_json_bytes(payload)
-        ).hexdigest(),
-    }
+    """Commit evidence or admission before its dependent work; exact replay is idempotent.
+
+    Outputs are returned as their saved JSON values, so a first write and its
+    replay give callers identical values.
+    """
+    payload = json.loads(
+        record_io.canonical_json_bytes(
+            {"inputs": dict(inputs), "outputs": dict(outputs)}
+        )
+    )
+    value = {**payload, "contentSha256": record_io.sha256_json(payload)}
     path = _checkpoint_key(prefix, workflow_run_id, key)
     try:
         _write_key_once(store.zw, path, record_io.display_json_bytes(value))
     except FileExistsError:
         existing = load_checkpoint(store, prefix, workflow_run_id, key, inputs)
-        if existing != outputs:
+        if existing is None or record_io.canonical_json_bytes(
+            existing
+        ) != record_io.canonical_json_bytes(payload["outputs"]):
             raise ValueError(
                 f"Checkpoint {key!r} already contains a different outcome"
             ) from None
         return existing
-    return dict(outputs)
+    return cast(dict[str, Any], payload["outputs"])
 
 
 def _orchestration_prefix(store: DataStore) -> str:
@@ -266,7 +273,9 @@ def _orchestration_prefix(store: DataStore) -> str:
 
 
 def _request_key(prefix: str, workflow_run_id: str) -> str:
-    return record_io.join_key(prefix, workflow_run_id, "request.json")
+    return record_io.join_key(
+        prefix, _validated_run_id(workflow_run_id), "request.json"
+    )
 
 
 def _stage_prefix(
@@ -274,7 +283,9 @@ def _stage_prefix(
     workflow_run_id: str,
     stage: WorkflowStageName,
 ) -> str:
-    return record_io.join_key(prefix, workflow_run_id, "stages", stage)
+    return record_io.join_key(
+        prefix, _validated_run_id(workflow_run_id), "stages", stage
+    )
 
 
 def _stage_key(
@@ -313,15 +324,17 @@ def _read_model(
 
 
 def _write_model_once(group: zarr.Group, key: str, value: AgentDataModel) -> None:
-    _write_key_once(
-        group,
-        key,
-        record_io.display_json_bytes(value.model_dump(mode="json")),
-    )
-
-
-def _stage_checksum(attempt: WorkflowStageAttempt) -> str:
-    return _record_checksum(attempt)
+    """Write only records that the journal reader accepts unchanged."""
+    payload = record_io.display_json_bytes(value.model_dump(mode="json"))
+    try:
+        saved = type(value).model_validate_json(payload)
+    except ValueError as exc:
+        raise ValueError(
+            f"Refusing to save invalid orchestration record {key!r}"
+        ) from exc
+    if saved.model_dump(mode="json") != value.model_dump(mode="json"):
+        raise ValueError(f"Orchestration record {key!r} does not round-trip exactly")
+    _write_key_once(group, key, payload)
 
 
 def _complete_attempt(
@@ -339,7 +352,8 @@ def _complete_attempt(
     outcome = started.model_copy(
         update={
             "status": status,
-            "completedAtNs": time.time_ns(),
+            # A wall-clock step backwards must not produce an unreadable record.
+            "completedAtNs": max(time.time_ns(), started.startedAtNs),
             "reportReferences": list(report_references),
             "artifacts": dict(artifacts or {}),
             "outputs": dict(outputs or {}),
@@ -349,7 +363,26 @@ def _complete_attempt(
             "error": error,
         }
     )
-    return outcome.model_copy(update={"contentSha256": _stage_checksum(outcome)})
+    return outcome.model_copy(update={"contentSha256": _record_checksum(outcome)})
+
+
+def _pause_or_fail_attempt(
+    started: WorkflowStageAttempt,
+    request_record: OrchestrationRequestRecord,
+    *,
+    questions: Sequence[WorkflowQuestion],
+    error: str,
+    **fields: Any,
+) -> WorkflowStageAttempt:
+    """Pause for caller input, or fail when the workflow runs unattended."""
+    if request_record.config.inputPolicy == "unattended":
+        return _complete_attempt(started, status="failed", error=error, **fields)
+    return _complete_attempt(
+        started,
+        status="needsInput",
+        needs_input=WorkflowNeedsInput(questions=list(questions)),
+        **fields,
+    )
 
 
 def _start_attempt(
@@ -382,7 +415,7 @@ def _start_attempt(
         parentAttempts=list(parent_attempts),
         inputs=attempt_inputs,
     )
-    attempt = attempt.model_copy(update={"contentSha256": _stage_checksum(attempt)})
+    attempt = attempt.model_copy(update={"contentSha256": _record_checksum(attempt)})
     _write_model_once(
         group,
         _stage_key(
@@ -414,11 +447,7 @@ def _save_outcome(
         ),
         outcome,
     )
-    elapsed_seconds = (
-        (outcome.completedAtNs - outcome.startedAtNs) / 1_000_000_000
-        if outcome.completedAtNs is not None
-        else 0.0
-    )
+    elapsed_seconds = (outcome.completedAtNs - outcome.startedAtNs) / 1_000_000_000
     label = outcome.stage.replace("_", " ").capitalize()
     if outcome.status == "failed":
         logger.error(f"{label}: {outcome.error} ({elapsed_seconds:.1f}s)")
@@ -432,32 +461,53 @@ def _save_outcome(
     logger.debug(f"Workflow {outcome.workflowRunId}, attempt {outcome.attemptId}")
 
 
+def _read_stage_record(
+    group: zarr.Group,
+    key: str,
+    workflow_run_id: str,
+    stage: WorkflowStageName,
+    attempt_id: str,
+    filename: Literal["started.json", "outcome.json"],
+) -> WorkflowStageAttempt:
+    """Read one start or outcome record that matches its path and checksum."""
+    record = cast(WorkflowStageAttempt, _read_model(group, key, WorkflowStageAttempt))
+    kind = "start" if filename == "started.json" else "outcome"
+    if (
+        record.workflowRunId != workflow_run_id
+        or record.stage != stage
+        or record.attemptId != attempt_id
+        or (record.status == "started") != (filename == "started.json")
+    ):
+        raise ValueError(f"Stage {kind} identity does not match its path")
+    if record.contentSha256 != _record_checksum(record):
+        raise ValueError(f"Stage {kind} checksum does not match its content")
+    return record
+
+
+def _stage_records(
+    group: zarr.Group,
+    prefix: str,
+    workflow_run_id: str,
+    stage: WorkflowStageName,
+    filename: Literal["started.json", "outcome.json"],
+) -> list[WorkflowStageAttempt]:
+    records = [
+        _read_stage_record(
+            group, key, workflow_run_id, stage, key.rsplit("/", 2)[-2], filename
+        )
+        for key in _list_keys(group, _stage_prefix(prefix, workflow_run_id, stage))
+        if key.endswith("/" + filename)
+    ]
+    return sorted(records, key=lambda value: (value.startedAtNs, value.attemptId))
+
+
 def _stage_outcomes(
     group: zarr.Group,
     prefix: str,
     workflow_run_id: str,
     stage: WorkflowStageName,
 ) -> list[WorkflowStageAttempt]:
-    stage_prefix = _stage_prefix(prefix, workflow_run_id, stage)
-    outcomes: list[WorkflowStageAttempt] = []
-    for key in _list_keys(group, stage_prefix):
-        if not key.endswith("/outcome.json"):
-            continue
-        path_attempt_id = key.rsplit("/", 2)[-2]
-        outcome = cast(
-            WorkflowStageAttempt,
-            _read_model(group, key, WorkflowStageAttempt),
-        )
-        if (
-            outcome.workflowRunId != workflow_run_id
-            or outcome.stage != stage
-            or outcome.attemptId != path_attempt_id
-        ):
-            raise ValueError("Stage outcome identity does not match its path")
-        if outcome.contentSha256 != _stage_checksum(outcome):
-            raise ValueError("Stage outcome checksum does not match its content")
-        outcomes.append(outcome)
-    return sorted(outcomes, key=lambda value: (value.startedAtNs, value.attemptId))
+    return _stage_records(group, prefix, workflow_run_id, stage, "outcome.json")
 
 
 def _stage_starts(
@@ -466,26 +516,18 @@ def _stage_starts(
     workflow_run_id: str,
     stage: WorkflowStageName,
 ) -> list[WorkflowStageAttempt]:
-    stage_prefix = _stage_prefix(prefix, workflow_run_id, stage)
-    starts: list[WorkflowStageAttempt] = []
-    for key in _list_keys(group, stage_prefix):
-        if not key.endswith("/started.json"):
-            continue
-        path_attempt_id = key.rsplit("/", 2)[-2]
-        started = cast(
-            WorkflowStageAttempt,
-            _read_model(group, key, WorkflowStageAttempt),
-        )
-        if (
-            started.workflowRunId != workflow_run_id
-            or started.stage != stage
-            or started.attemptId != path_attempt_id
-            or started.status != "started"
-        ):
-            raise ValueError("Stage start identity does not match its path")
-        if started.contentSha256 != _stage_checksum(started):
-            raise ValueError("Stage start checksum does not match its content")
-        starts.append(started)
+    return _stage_records(group, prefix, workflow_run_id, stage, "started.json")
+
+
+def workflow_starts(
+    group: zarr.Group, prefix: str, workflow_run_id: str
+) -> list[WorkflowStageAttempt]:
+    """Return every validated stage start of one workflow in start order."""
+    starts = [
+        value
+        for stage in _STAGE_ORDER
+        for value in _stage_starts(group, prefix, workflow_run_id, stage)
+    ]
     return sorted(starts, key=lambda value: (value.startedAtNs, value.attemptId))
 
 
@@ -588,23 +630,6 @@ def _resume_answer_errors(
                     "or a non-empty provideClarification response"
                 )
             continue
-        if question.planChecksum is not None:
-            if answer != question.planChecksum:
-                errors.append(
-                    f"Resume answer for {question_id!r} does not match the "
-                    "persisted plan checksum"
-                )
-            continue
-        if question.options and question_id in {
-            "finalGraphOptionId",
-            "primaryCoefficient",
-        }:
-            if not isinstance(answer, str) or answer not in question.options:
-                errors.append(
-                    f"Resume answer for {question_id!r} must be one of the "
-                    f"persisted options {question.options!r}"
-                )
-            continue
         if not _has_resume_answer(answer):
             errors.append(f"Resume answer for {question_id!r} must be non-empty")
     return errors
@@ -665,24 +690,18 @@ def _stage_outcome_resolves(
         raise ValueError("Stage request or configuration checksum is stale")
     if outcome.status == "started":
         raise ValueError("A stage outcome cannot retain started status")
-    started_key = _stage_key(
-        prefix,
+    started = _read_stage_record(
+        store.zw,
+        _stage_key(
+            prefix, workflow_run_id, outcome.stage, outcome.attemptId, "started.json"
+        ),
         workflow_run_id,
         outcome.stage,
         outcome.attemptId,
         "started.json",
     )
-    started = cast(
-        WorkflowStageAttempt,
-        _read_model(store.zw, started_key, WorkflowStageAttempt),
-    )
     if (
-        started.status != "started"
-        or started.contentSha256 != _stage_checksum(started)
-        or started.workflowRunId != workflow_run_id
-        or started.stage != outcome.stage
-        or started.attemptId != outcome.attemptId
-        or started.startedAtNs != outcome.startedAtNs
+        started.startedAtNs != outcome.startedAtNs
         or started.requestSha256 != outcome.requestSha256
         or started.configSha256 != outcome.configSha256
         or started.parentAttempts != outcome.parentAttempts
@@ -747,8 +766,7 @@ def _stage_execution_id(started: WorkflowStageAttempt) -> str:
         ],
         "inputs": inputs,
     }
-    digest = hashlib.sha256(record_io.canonical_json_bytes(payload)).hexdigest()
-    return f"orchestrator_{started.stage}_{digest[:40]}"
+    return f"orchestrator_{started.stage}_{record_io.sha256_json(payload)[:40]}"
 
 
 def _ensure_orchestration_store(store: DataStore) -> str:
@@ -771,12 +789,11 @@ def _ensure_orchestration_store(store: DataStore) -> str:
 def read_request(
     group: zarr.Group, prefix: str, workflow_run_id: str
 ) -> OrchestrationRequestRecord:
+    key = _request_key(prefix, workflow_run_id)
     try:
         value = cast(
             OrchestrationRequestRecord,
-            _read_model(
-                group, _request_key(prefix, workflow_run_id), OrchestrationRequestRecord
-            ),
+            _read_model(group, key, OrchestrationRequestRecord),
         )
     except (ValueError, TypeError) as exc:
         raise ValueError(_INCOMPATIBLE) from exc
@@ -908,8 +925,7 @@ def read_stage_evidence(
     report = value["report"]
     if (
         not isinstance(report, dict)
-        or hashlib.sha256(record_io.canonical_json_bytes(report)).hexdigest()
-        != reference.contentSha256
+        or record_io.sha256_json(report) != reference.contentSha256
     ):
         raise ValueError("Stage evidence does not match its exact reference")
     return report
@@ -923,34 +939,6 @@ def load_stage_report(
     return expected_type.model_validate(
         read_stage_evidence(store, outcome.reportReferences[0])
     )
-
-
-def failed_stage(
-    store: DataStore,
-    workflow: WorkflowIdentity,
-    request_record: OrchestrationRequestRecord,
-    stage: WorkflowStageName,
-    parents: Sequence[WorkflowStageLink],
-    error: str,
-    *,
-    artifacts: Mapping[str, ArtifactReferenceModel] | None = None,
-    resume_record: OrchestrationResumeRecord | None = None,
-) -> WorkflowStageAttempt:
-    prefix = _ensure_orchestration_store(store)
-    started = _start_attempt(
-        store.zw,
-        prefix,
-        workflow.workflowRunId,
-        stage,
-        request_record,
-        parents,
-        resume_record=resume_record,
-    )
-    outcome = _complete_attempt(
-        started, status="failed", artifacts=artifacts, error=error
-    )
-    _save_outcome(store.zw, prefix, outcome)
-    return outcome
 
 
 def finish_exception(
@@ -1081,8 +1069,17 @@ def _analysis_review_views(
             settings = inputs.get("settings", {})
             features = inputs.get("featureEvidence", {})
             candidate_ids = [item["candidateId"] for item in candidates]
+            # Exact screening results reused for validation spend no full allowance.
+            coverage = inputs.get("comparisonCoverage")
+            reused = (
+                coverage.get("validationSources") or {}
+                if isinstance(coverage, Mapping)
+                else {}
+            )
+            charged = [identity for identity in candidate_ids if identity not in reused]
             if (
-                not 0 < len(candidates) <= limit
+                not candidates
+                or len(charged) > limit
                 or len(set(candidate_ids)) != len(candidate_ids)
                 or set(settings) != set(candidate_ids)
                 or set(features) != set(candidate_ids)

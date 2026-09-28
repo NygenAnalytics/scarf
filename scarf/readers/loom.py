@@ -3,10 +3,10 @@ from typing import Any
 
 import h5py
 import numpy as np
-from scipy.sparse import coo_matrix
 
 from ..utils.logging import logger
 from ..utils.progress import iter_progress
+from ._text import require_unique_identifiers
 
 
 class LoomReader:
@@ -55,17 +55,29 @@ class LoomReader:
         dtype: str | None = None,
     ) -> None:
         self.h5: h5py.File = h5py.File(loom_fn, mode="r")
-        self.matrixKey = matrix_key
-        self.cellAttrsKey, self.featureAttrsKey = cell_attrs_key, feature_attrs_key
-        self.cellNamesKey, self.featureNamesKey = cell_names_key, feature_names_key
-        self.featureIdsKey = feature_ids_key
-        self.sourceMatrixDtype = self.h5[self.matrixKey].dtype
-        self.matrixDtype: Any = self.sourceMatrixDtype if dtype is None else dtype
-        if dtype is None and self.sourceMatrixDtype.newbyteorder("=") == np.float16:
-            # float16 is not a count storage dtype.
-            self.matrixDtype = np.dtype(np.float32)
-        self._check_integrity()
-        self.nFeatures, self.nCells = self.h5[self.matrixKey].shape
+        try:
+            self.matrixKey = matrix_key
+            self.cellAttrsKey, self.featureAttrsKey = (
+                cell_attrs_key,
+                feature_attrs_key,
+            )
+            self.cellNamesKey, self.featureNamesKey = (
+                cell_names_key,
+                feature_names_key,
+            )
+            self.featureIdsKey = feature_ids_key
+            self._check_integrity()
+            self.sourceMatrixDtype = self.h5[self.matrixKey].dtype
+            self.matrixDtype: Any = self.sourceMatrixDtype if dtype is None else dtype
+            if dtype is None and self.sourceMatrixDtype.newbyteorder("=") == np.float16:
+                # float16 is not a count storage dtype.
+                self.matrixDtype = np.dtype(np.float32)
+            self.nFeatures, self.nCells = self.h5[self.matrixKey].shape
+            require_unique_identifiers(self.cell_ids(), "Loom cell IDs")
+            require_unique_identifiers(self.feature_ids(), "Loom feature IDs")
+        except BaseException:
+            self.h5.close()
+            raise
 
     def _check_integrity(self) -> bool:
         if self.matrixKey not in self.h5:
@@ -116,12 +128,21 @@ class LoomReader:
                 if i in ignored:
                     continue
                 vals = self.h5[key][i][:]
-                if vals.dtype.names is None:
-                    yield i, vals
-                else:
-                    # Attribute is a structured array
-                    for j in vals.dtype.names:
-                        yield i + "_" + str(j), vals[j]
+                columns = (
+                    [(i, vals)]
+                    if vals.dtype.names is None
+                    else [(f"{i}_{j}", vals[j]) for j in vals.dtype.names]
+                )
+                for name, values in columns:
+                    if values.ndim != 1:
+                        # Multi-dimensional attributes such as embeddings do not
+                        # fit a one-value-per-row metadata column.
+                        logger.warning(
+                            f"Skipping {key} attribute {name!r} with shape "
+                            f"{values.shape}"
+                        )
+                        continue
+                    yield name, values
 
     def get_cell_attrs(self) -> Generator[tuple[str, np.ndarray], None, None]:
         """Returns a Generator that yields the cells' attributes."""
@@ -163,6 +184,7 @@ class LoomReader:
     def consume_dense(
         self, batch_size: int = 1000
     ) -> Generator[np.ndarray, None, None]:
+        """Yield dense cell-row batches of the Loom matrix."""
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
         dset = self.h5[self.matrixKey]
@@ -171,8 +193,3 @@ class LoomReader:
                 dset[:, start : min(start + batch_size, self.nCells)].T,
                 dtype=self.matrixDtype,
             )
-
-    def consume(self, batch_size: int = 1000) -> Generator[np.ndarray, None, None]:
-        """Returns a generator that yield chunks of data."""
-        for values in self.consume_dense(batch_size):
-            yield coo_matrix(values)

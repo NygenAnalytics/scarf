@@ -5,7 +5,14 @@ from typing import Any
 import numpy as np
 import zarr
 
-from .arrays import create_metadata_column
+from .arrays import (
+    MISSING_MASK_PREFIX,
+    _decode_metadata_values,
+    create_metadata_column,
+    linked_missing_mask,
+    stored_metadata_dtype,
+    text_dtype,
+)
 from .artifact_writer import (
     ArrayRequirement,
     finish_artifact,
@@ -22,6 +29,7 @@ from .artifacts import (
     fingerprint_stored_arrays,
     fingerprint_stored_strings,
     fingerprint_strings,
+    fingerprint_text_blocks,
     inspect_artifact,
     open_artifact,
 )
@@ -30,9 +38,6 @@ from .geometry import array_geometry
 from .partition import row_band, scan_band
 from .types import as_zarr_array, as_zarr_group
 from .validation_scope import store_key, validated_once
-
-
-_MISSING_COLUMN_PREFIX = "__scarf_missing__"
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +146,23 @@ def validate_stored_selection_integrity(
             table_path=table_path,
             id_column=id_column,
         ),
+    )
+
+
+def validate_cell_selection(
+    root: zarr.Group,
+    ref: ArtifactRef,
+) -> ValidatedStoredSelection:
+    """Validate a datastore cell selection against its payload and cell rows."""
+    if not isinstance(ref, ArtifactRef):
+        raise TypeError("cell_selection must be an ArtifactRef")
+    return validate_stored_selection_integrity(
+        root,
+        ref,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
     )
 
 
@@ -467,60 +489,6 @@ def read_stored_selection_indices(
     return output
 
 
-def iter_full_axis_selection_blocks(
-    root: zarr.Group,
-    ref: ArtifactRef,
-    compact_values: zarr.Array | np.ndarray,
-    *,
-    fill_value: Any,
-    kind: str,
-    scope: ArtifactScope,
-    assay: str | None,
-    table_path: str,
-    id_column: str = "ids",
-    dtype: Any | None = None,
-    block_rows: int | None = None,
-) -> Iterator[AlignedSelectionBlock]:
-    """Scatter compact selected-row values into bounded full-axis blocks."""
-    selection = validate_stored_selection_integrity(
-        root,
-        ref,
-        kind=kind,
-        scope=scope,
-        assay=assay,
-        table_path=table_path,
-        id_column=id_column,
-    )
-    source = (
-        compact_values
-        if isinstance(compact_values, zarr.Array)
-        else np.asarray(compact_values)
-    )
-    if source.ndim < 1 or int(source.shape[0]) != selection.selected_count:
-        raise ValueError(
-            "Compact values must have one leading row per selected observation"
-        )
-    output_dtype = np.dtype(source.dtype if dtype is None else dtype)
-    trailing_shape = tuple(int(size) for size in source.shape[1:])
-    for block in _iter_validated_selection_blocks(selection, block_rows=block_rows):
-        values = np.full(
-            (block.stop - block.start, *trailing_shape),
-            fill_value,
-            dtype=output_dtype,
-        )
-        if block.compact_stop > block.compact_start:
-            compact = np.asarray(
-                source[block.compact_start : block.compact_stop],
-                dtype=output_dtype,
-            )
-            values[block.mask] = compact
-        yield AlignedSelectionBlock(
-            start=block.start,
-            stop=block.stop,
-            values=values,
-        )
-
-
 def iter_selected_axis_selection_blocks(
     root: zarr.Group,
     ref: ArtifactRef,
@@ -566,45 +534,27 @@ def fingerprint_selected_stored_strings(
         raise ValueError("Stored row IDs and selection must be aligned vectors")
     if np.dtype(selection.dtype) != np.dtype(bool):
         raise TypeError("Stored selection values must be booleans")
-    source_dtype = np.dtype(ids.dtype)
-    if source_dtype.kind not in {"O", "S", "T", "U"}:
+    if np.dtype(ids.dtype).kind not in {"O", "S", "T", "U"}:
         raise TypeError("Stored row IDs must contain strings")
 
     block_rows = min(
         scan_band(array_geometry(ids), fallback=1),
         scan_band(array_geometry(selection), fallback=1),
     )
-    selected_count = 0
-    if source_dtype.hasobject:
-        max_length = 1
-        for start in range(0, int(ids.shape[0]), block_rows):
-            stop = min(start + block_rows, int(ids.shape[0]))
-            mask = np.asarray(selection[start:stop], dtype=bool)
-            values = np.asarray(ids[start:stop])[mask]
-            selected_count += len(values)
-            if values.size:
-                max_length = max(max_length, max(len(str(value)) for value in values))
-        string_dtype = np.dtype(f"U{max_length}")
-    else:
-        for start in range(0, int(ids.shape[0]), block_rows):
-            stop = min(start + block_rows, int(ids.shape[0]))
-            selected_count += int(
-                np.count_nonzero(np.asarray(selection[start:stop], dtype=bool))
-            )
-        string_dtype = np.empty(0, dtype=source_dtype).astype(str).dtype
+    n_rows = int(ids.shape[0])
+    starts = range(0, n_rows, block_rows)
+    selected_count = sum(
+        int(np.count_nonzero(np.asarray(selection[start : start + block_rows])))
+        for start in starts
+    )
 
-    builder = ValueFingerprintBuilder()
-    builder.begin_array("values", (selected_count,), string_dtype)
-    selected_start = 0
-    for start in range(0, int(ids.shape[0]), block_rows):
-        stop = min(start + block_rows, int(ids.shape[0]))
-        mask = np.asarray(selection[start:stop], dtype=bool)
-        values = np.asarray(ids[start:stop])[mask].astype(string_dtype)
-        if values.size:
-            builder.update_array_block("values", (selected_start,), values)
-            selected_start += len(values)
-    builder.end_array("values")
-    return builder.hexdigest(), selected_count
+    def selected_blocks() -> Iterator[np.ndarray]:
+        for start in starts:
+            mask = np.asarray(selection[start : start + block_rows], dtype=bool)
+            yield np.asarray(ids[start : start + block_rows])[mask]
+
+    fingerprint = fingerprint_text_blocks(selected_count, ids.dtype, selected_blocks)
+    return fingerprint, selected_count
 
 
 def resolve_stored_selection_artifact(
@@ -807,31 +757,13 @@ def _snapshot_block_rows(*arrays: zarr.Array) -> int:
     )
 
 
-def _snapshot_text(value: Any) -> str:
-    if isinstance(value, bytes | bytearray | np.bytes_):
-        return bytes(value).decode("utf-8")
-    if value is None:
-        return ""
-    return str(value)
-
-
 def _snapshot_values_dtype(values: zarr.Array) -> np.dtype[Any]:
-    source_dtype: np.dtype[Any] = np.dtype(values.dtype)
-    if not source_dtype.hasobject:
-        return source_dtype
-    max_length = 1
-    block_rows = row_band(array_geometry(values), unit="chunk", fallback=1)
-    for start in range(0, int(values.shape[0]), block_rows):
-        stop = min(start + block_rows, int(values.shape[0]))
-        block = np.asarray(values[start:stop])
-        if block.ndim != 1:
-            raise ValueError("Snapshot metadata columns must be one-dimensional")
-        if block.size:
-            max_length = max(
-                max_length,
-                max(len(_snapshot_text(value)) for value in block),
-            )
-    return np.dtype(f"U{max_length}")
+    rows = row_band(array_geometry(values), unit="chunk", fallback=1)
+    n_rows = int(values.shape[0])
+    return stored_metadata_dtype(
+        values.dtype,
+        lambda: (values[start : start + rows] for start in range(0, n_rows, rows)),
+    )
 
 
 def _snapshot_values_block(
@@ -840,18 +772,9 @@ def _snapshot_values_block(
     stop: int,
     dtype: np.dtype[Any],
 ) -> np.ndarray:
-    block: np.ndarray = np.asarray(values[start:stop])
-    if block.ndim != 1:
-        raise ValueError("Snapshot metadata columns must be one-dimensional")
-    if np.dtype(values.dtype).hasobject:
-        text = [_snapshot_text(value) for value in block]
-        width = dtype.itemsize // np.dtype("U1").itemsize
-        if any(len(value) > width for value in text):
-            raise RuntimeError("Snapshot string values changed while they were copied")
-        return np.asarray(text, dtype=dtype)
-    if block.dtype != dtype:
-        return block.astype(dtype)
-    return block
+    return np.asarray(_decode_metadata_values(values[start:stop])).astype(
+        dtype, copy=False
+    )
 
 
 def _fingerprint_snapshot_column(
@@ -903,7 +826,7 @@ def _snapshot_source_columns(
     if len(set(names)) != len(names):
         raise ValueError("Snapshot columns must be unique")
     invalid_names = [
-        name for name in names if "/" in name or name.startswith(_MISSING_COLUMN_PREFIX)
+        name for name in names if "/" in name or name.startswith(MISSING_MASK_PREFIX)
     ]
     if invalid_names:
         raise ValueError(
@@ -920,27 +843,9 @@ def _snapshot_source_columns(
                 f"Snapshot column {name!r} must align with the full metadata axis"
             )
         snapshot_dtype = _snapshot_values_dtype(values)
-        missing_name = values.attrs.get("missing_mask")
-        missing: zarr.Array | None = None
-        if missing_name is not None:
-            if (
-                not isinstance(missing_name, str)
-                or not missing_name
-                or "/" in missing_name
-                or missing_name not in table
-            ):
-                raise ValueError(
-                    f"Snapshot column {name!r} has an invalid missing mask"
-                )
-            missing = as_zarr_array(table[missing_name], name=missing_name)
-            if (
-                missing.ndim != 1
-                or missing.shape != values.shape
-                or np.dtype(missing.dtype) != np.dtype(bool)
-            ):
-                raise ValueError(
-                    f"Snapshot column {name!r} has a malformed missing mask"
-                )
+        missing = linked_missing_mask(
+            table, name, label=f"Snapshot column {name!r}", values=values
+        )
         resolved.append(
             _SnapshotColumn(
                 name=name,
@@ -962,7 +867,7 @@ def _snapshot_reuse_validator(
 ) -> Callable[[ArtifactRef, zarr.Group], bool]:
     expected_names = {column.name for column in columns}
     expected_names.update(
-        f"{_MISSING_COLUMN_PREFIX}{column.name}"
+        f"{MISSING_MASK_PREFIX}{column.name}"
         for column in columns
         if column.missing is not None
     )
@@ -973,17 +878,11 @@ def _snapshot_reuse_validator(
                 return False
             for column in columns:
                 values = as_zarr_array(group[column.name], name=column.name)
-                missing_name = f"{_MISSING_COLUMN_PREFIX}{column.name}"
-                if column.missing is None:
-                    if "missing_mask" in values.attrs or set(values.attrs):
-                        return False
-                    missing = None
-                else:
-                    if values.attrs.get("missing_mask") != missing_name or set(
-                        values.attrs
-                    ) != {"missing_mask"}:
-                        return False
-                    missing = as_zarr_array(group[missing_name], name=missing_name)
+                missing = linked_missing_mask(group, column.name, values=values)
+                if (missing is None) != (column.missing is None) or set(
+                    values.attrs
+                ) != (set() if missing is None else {"missing_mask"}):
+                    return False
                 if _fingerprint_snapshot_column(values, missing) != column.fingerprint:
                     return False
         except (KeyError, TypeError, ValueError):
@@ -1135,25 +1034,11 @@ def validate_run_metadata_snapshot(
                 or np.dtype(values.dtype).hasobject
             ):
                 raise ValueError("Snapshot values have invalid geometry")
-            missing_name = values.attrs.get("missing_mask")
-            if missing_name is None:
-                if set(values.attrs):
-                    raise ValueError("Snapshot values contain unexpected attributes")
-                missing = None
-            else:
-                canonical_name = f"{_MISSING_COLUMN_PREFIX}{name}"
-                if missing_name != canonical_name or set(values.attrs) != {
-                    "missing_mask"
-                }:
-                    raise ValueError("Snapshot missing-mask link is malformed")
-                missing = as_zarr_array(group[canonical_name], name=canonical_name)
-                if (
-                    missing.ndim != 1
-                    or missing.shape != values.shape
-                    or np.dtype(missing.dtype) != np.dtype(bool)
-                ):
-                    raise ValueError("Snapshot missing mask has invalid geometry")
-                expected_arrays.add(canonical_name)
+            missing = linked_missing_mask(group, name, values=values)
+            if set(values.attrs) != (set() if missing is None else {"missing_mask"}):
+                raise ValueError("Snapshot values contain unexpected attributes")
+            if missing is not None:
+                expected_arrays.add(missing.basename)
             resolved.append((name, values, missing))
         if set(group.array_keys()) != expected_arrays:
             raise ValueError("Snapshot contains unexpected arrays")
@@ -1213,7 +1098,7 @@ def snapshot_run_metadata(
         if column.missing is not None:
             required_arrays.append(
                 ArrayRequirement(
-                    f"{_MISSING_COLUMN_PREFIX}{column.name}",
+                    f"{MISSING_MASK_PREFIX}{column.name}",
                     shape=column.missing.shape,
                     dtype=bool,
                 )
@@ -1260,7 +1145,7 @@ def snapshot_run_metadata(
         )
         missing_output: zarr.Array | None = None
         if column.missing is not None:
-            missing_name = f"{_MISSING_COLUMN_PREFIX}{column.name}"
+            missing_name = f"{MISSING_MASK_PREFIX}{column.name}"
             missing_output = create_metadata_column(
                 group,
                 missing_name,
@@ -1306,14 +1191,11 @@ def resolve_metadata_snapshot(
     if array.ndim < 1 or rows.ndim != 1 or array.shape[0] != len(rows):
         raise ValueError("Metadata values must align with row IDs")
     flattened = array.reshape(-1)
-    stored_values = (
-        flattened.astype(str) if flattened.dtype.kind in {"O", "S", "U"} else flattened
-    )
-    values_fingerprint = (
-        fingerprint_strings(stored_values)
-        if stored_values.dtype.kind in {"O", "S", "U"}
-        else fingerprint_array(stored_values)
-    )
+    stored_values = flattened
+    if flattened.dtype.kind in {"O", "S", "T", "U"}:
+        decoded = _decode_metadata_values(flattened)
+        stored_values = decoded.astype(text_dtype(flattened.dtype, lambda: (decoded,)))
+    values_fingerprint = fingerprint_array(stored_values)
     snapshot_inputs = dict(inputs)
     snapshot_inputs.update(
         {
@@ -1329,8 +1211,6 @@ def resolve_metadata_snapshot(
             candidate = as_zarr_array(group["values"], name="values")
             if candidate.ndim != 1 or candidate.shape != stored_values.shape:
                 return False
-            if stored_values.dtype.kind in {"O", "S", "U"}:
-                return fingerprint_stored_strings(candidate) == values_fingerprint
             return fingerprint_stored_arrays(group, ("values",)) == values_fingerprint
         except (KeyError, TypeError, ValueError):
             return False

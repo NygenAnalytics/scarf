@@ -1,12 +1,14 @@
 import hashlib
 import os
+import time
 import uuid
 from collections.abc import Callable, Sequence
 from contextlib import closing
 from dataclasses import dataclass
+from http.client import HTTPException
 from pathlib import Path
 from typing import Any
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import h5py
 import numpy as np
@@ -31,8 +33,9 @@ _SPLITMIX_MULTIPLIER_2 = 0x94D049BB133111EB
 _SAMPLING_DOMAIN = b"scarf-cellxgene-row-sampling-v1"
 _SOURCE_ROWS_DIGEST_DOMAIN = b"scarf-ordered-source-rows-v1\0"
 _DEFAULT_IO_CHUNK_BYTES = 16 * 1024 * 1024
+# Seconds one source socket operation may block before the download resumes.
+_SOURCE_READ_TIMEOUT_SECONDS = 300.0
 _DEFAULT_ROW_BATCH_SIZE = 1024
-_DEFAULT_COPY_BUFFER_BYTES = 64 * 1024 * 1024
 _DEFAULT_INDPTR_CHUNK_ROWS = 1_000_000
 _DEFAULT_LOAD_CHUNK_ELEMENTS = 8_388_608
 _H5_DATA_CHUNK_BYTES = 4 * 1024 * 1024
@@ -62,7 +65,6 @@ class SourceSpec:
     sourceBytes: int
     matrixKey: str = "X"
     matrixEncoding: str = "csr_matrix"
-    rawCounts: bool = True
     cellIdsKey: str = "obs/_index"
     featureIdsKey: str = "var/_index"
     featureNameKey: str = "var/feature_name"
@@ -83,7 +85,6 @@ class SourceValidation:
     nRows: int
     nColumns: int
     nnz: int
-    finalRowNnz: int
     dataDtype: str
     indicesDtype: str
     indptrDtype: str
@@ -117,17 +118,6 @@ class InMemoryCsrSource:
     cellIds: np.ndarray
     featureIds: np.ndarray
     featureNames: np.ndarray
-
-    @property
-    def residentBytes(self) -> int:
-        return int(
-            self.data.nbytes
-            + self.indices.nbytes
-            + self.indptr.nbytes
-            + self.cellIds.nbytes
-            + self.featureIds.nbytes
-            + self.featureNames.nbytes
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,39 +273,89 @@ def ordered_source_row_digest(
     return digest.hexdigest()
 
 
+def _open_source_range(url: str, offset: int) -> Any:
+    headers = {"Range": f"bytes={offset}-"} if offset else {}
+    return urlopen(Request(url, headers=headers), timeout=_SOURCE_READ_TIMEOUT_SECONDS)
+
+
+def _require_source_response(response: Any, *, offset: int, expectedBytes: int) -> None:
+    headers = getattr(response, "headers", {})
+    if offset == 0:
+        declared = headers.get("Content-Length")
+        if declared is not None and int(declared) != expectedBytes:
+            raise ValueError(
+                f"Source declares {declared} bytes, expected {expectedBytes}"
+            )
+        return
+    content_range = str(headers.get("Content-Range") or "")
+    expected_range = f"bytes {offset}-{expectedBytes - 1}/{expectedBytes}"
+    if getattr(response, "status", None) != 206 or content_range != expected_range:
+        raise ValueError(
+            f"Source did not resume at byte {offset}: status="
+            f"{getattr(response, 'status', None)} Content-Range={content_range!r}"
+        )
+
+
 def download_source(
     destination: str | Path,
     *,
     url: str = SOURCE_SPEC.url,
     expectedBytes: int = SOURCE_SPEC.sourceBytes,
     chunkBytes: int = _DEFAULT_IO_CHUNK_BYTES,
-    opener: Callable[[str], Any] = urlopen,
+    opener: Callable[[str, int], Any] = _open_source_range,
+    maxAttempts: int = 8,
+    retryDelaySeconds: float = 5.0,
 ) -> DownloadResult:
+    """Stream the source to ``destination``, resuming from the last byte on failure.
+
+    ``opener(url, offset)`` returns a response for the bytes from ``offset`` on. Each
+    read is bounded by a socket timeout, so a stalled transfer resumes instead of
+    holding the job until its timeout.
+    """
     if expectedBytes < 0:
         raise ValueError("expectedBytes must be nonnegative")
     if chunkBytes <= 0:
         raise ValueError("chunkBytes must be positive")
+    if maxAttempts < 1:
+        raise ValueError("maxAttempts must be positive")
 
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.part")
     digest = hashlib.sha256()
     file_bytes = 0
+    failures = 0
     try:
-        with closing(opener(url)) as response:
-            headers = getattr(response, "headers", {})
-            declared = headers.get("Content-Length") or headers.get("content-length")
-            if declared is not None and int(declared) != expectedBytes:
-                raise ValueError(
-                    f"Source declares {declared} bytes, expected {expectedBytes}"
-                )
-            with temporary.open("xb") as handle:
-                while chunk := response.read(chunkBytes):
-                    handle.write(chunk)
-                    digest.update(chunk)
-                    file_bytes += len(chunk)
-        if file_bytes != expectedBytes:
-            raise ValueError(f"Downloaded {file_bytes} bytes, expected {expectedBytes}")
+        with temporary.open("xb") as handle:
+            while True:
+                try:
+                    with closing(opener(url, file_bytes)) as response:
+                        _require_source_response(
+                            response, offset=file_bytes, expectedBytes=expectedBytes
+                        )
+                        while chunk := response.read(chunkBytes):
+                            file_bytes += len(chunk)
+                            if file_bytes > expectedBytes:
+                                raise ValueError(
+                                    f"Source exceeds the expected {expectedBytes} bytes"
+                                )
+                            handle.write(chunk)
+                            digest.update(chunk)
+                    if file_bytes == expectedBytes:
+                        break
+                    raise ConnectionError(
+                        f"Source stream ended at byte {file_bytes} of {expectedBytes}"
+                    )
+                except (OSError, HTTPException) as exc:
+                    failures += 1
+                    if failures >= maxAttempts:
+                        raise
+                    print(
+                        f"source download interrupted at byte {file_bytes}: {exc}; "
+                        f"resuming (attempt {failures + 1} of {maxAttempts})",
+                        flush=True,
+                    )
+                    time.sleep(retryDelaySeconds * failures)
         os.replace(temporary, destination)
     except BaseException:
         temporary.unlink(missing_ok=True)
@@ -439,7 +479,7 @@ def _validate_indptr(
     nnz: int,
     expectedDtype: str,
     chunkRows: int,
-) -> int:
+) -> None:
     if chunkRows <= 0:
         raise ValueError("chunkRows must be positive")
     if indptr.shape != (nRows + 1,):
@@ -463,10 +503,6 @@ def _validate_indptr(
             raise ValueError(f"CSR indptr decreases at position {offset}")
         if len(values):
             previous = int(values[-1])
-
-    if nRows == 0:
-        return 0
-    return int(indptr[-1]) - int(indptr[-2])
 
 
 def validate_source_h5ad(
@@ -513,7 +549,7 @@ def validate_source_h5ad(
             raise ValueError(
                 f"CSR indices dtype is {indices.dtype}, expected {spec.indicesDtype}"
             )
-        final_row_nnz = _validate_indptr(
+        _validate_indptr(
             indptr,
             nRows=spec.nRows,
             nnz=spec.nnz,
@@ -550,7 +586,6 @@ def validate_source_h5ad(
         nRows=spec.nRows,
         nColumns=spec.nColumns,
         nnz=spec.nnz,
-        finalRowNnz=final_row_nnz,
         dataDtype=spec.dataDtype,
         indicesDtype=spec.indicesDtype,
         indptrDtype=spec.indptrDtype,
@@ -574,34 +609,6 @@ def _validate_selected_rows(
     if np.any(rows[1:] <= rows[:-1]):
         raise ValueError("sourceRows must be unique and in source order")
     return rows
-
-
-def _row_boundaries(
-    indptr: h5py.Dataset,
-    rows: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    span_rows = int(rows[-1] - rows[0] + 1)
-    if span_rows <= len(rows) * 4:
-        pointers = np.asarray(indptr[int(rows[0]) : int(rows[-1]) + 2])
-        local_rows = rows - rows[0]
-        return pointers[local_rows], pointers[local_rows + 1]
-    return np.asarray(indptr[rows]), np.asarray(indptr[rows + 1])
-
-
-def _selected_nnz(
-    indptr: h5py.Dataset,
-    rows: np.ndarray,
-    rowBatchSize: int,
-) -> int:
-    total = 0
-    for start in range(0, len(rows), rowBatchSize):
-        batch = rows[start : start + rowBatchSize]
-        row_starts, row_ends = _row_boundaries(indptr, batch)
-        counts = row_ends - row_starts
-        if np.any(counts < 0):
-            raise ValueError("Source CSR indptr is not monotonic")
-        total += int(counts.sum(dtype=np.int64))
-    return total
 
 
 def _chunk_elements(length: int, dtype: np.dtype[Any]) -> int:
@@ -659,155 +666,6 @@ def _create_dataframe_group(
         dtype=h5py.string_dtype(encoding="utf-8"),
     )
     return group
-
-
-def _copy_pair_slice(
-    sourceData: h5py.Dataset,
-    sourceIndices: h5py.Dataset,
-    destinationData: h5py.Dataset,
-    destinationIndices: h5py.Dataset,
-    sourceStart: int,
-    sourceEnd: int,
-    destinationStart: int,
-    copyBufferBytes: int,
-) -> int:
-    item_bytes = sourceData.dtype.itemsize + sourceIndices.dtype.itemsize
-    chunk_elements = max(1, copyBufferBytes // max(1, item_bytes))
-    output_position = destinationStart
-    for start in range(sourceStart, sourceEnd, chunk_elements):
-        end = min(start + chunk_elements, sourceEnd)
-        data_values = np.asarray(sourceData[start:end])
-        index_values = np.asarray(sourceIndices[start:end])
-        output_end = output_position + len(data_values)
-        destinationData[output_position:output_end] = data_values
-        destinationIndices[output_position:output_end] = index_values
-        output_position = output_end
-    return output_position
-
-
-def _copy_masked_csr_window(
-    sourceData: h5py.Dataset,
-    sourceIndices: h5py.Dataset,
-    destinationData: h5py.Dataset,
-    destinationIndices: h5py.Dataset,
-    rowStarts: np.ndarray,
-    rowEnds: np.ndarray,
-    destinationStart: int,
-) -> int:
-    span_start = int(rowStarts[0])
-    span_end = int(rowEnds[-1])
-    span_nnz = span_end - span_start
-    selected_nnz = int((rowEnds - rowStarts).sum(dtype=np.int64))
-    if selected_nnz == 0:
-        return destinationStart
-
-    data_values = np.asarray(sourceData[span_start:span_end])
-    index_values = np.asarray(sourceIndices[span_start:span_end])
-    local_starts = rowStarts.astype(np.int64, copy=False) - span_start
-    local_ends = rowEnds.astype(np.int64, copy=False) - span_start
-    deltas = np.zeros(span_nnz + 1, dtype=np.int16)
-    np.add.at(deltas, local_starts, 1)
-    np.add.at(deltas, local_ends, -1)
-    mask = np.cumsum(deltas[:-1], dtype=np.int32) > 0
-    if int(mask.sum()) != selected_nnz:
-        raise ValueError("Selected CSR row mask has an unexpected size")
-
-    destination_end = destinationStart + selected_nnz
-    destinationData[destinationStart:destination_end] = data_values[mask]
-    destinationIndices[destinationStart:destination_end] = index_values[mask]
-    return destination_end
-
-
-def _copy_csr_batch(
-    sourceData: h5py.Dataset,
-    sourceIndices: h5py.Dataset,
-    destinationData: h5py.Dataset,
-    destinationIndices: h5py.Dataset,
-    rows: np.ndarray,
-    rowStarts: np.ndarray,
-    rowEnds: np.ndarray,
-    destinationStart: int,
-    copyBufferBytes: int,
-) -> int:
-    counts = rowEnds - rowStarts
-    selected_nnz = int(counts.sum(dtype=np.int64))
-    if selected_nnz == 0:
-        return destinationStart
-
-    span_start = int(rowStarts[0])
-    span_end = int(rowEnds[-1])
-    span_nnz = span_end - span_start
-    item_bytes = sourceData.dtype.itemsize + sourceIndices.dtype.itemsize
-    estimated_bytes = span_nnz * (2 * item_bytes + 7)
-    if span_nnz <= selected_nnz * 2 and estimated_bytes <= copyBufferBytes:
-        return _copy_masked_csr_window(
-            sourceData,
-            sourceIndices,
-            destinationData,
-            destinationIndices,
-            rowStarts,
-            rowEnds,
-            destinationStart,
-        )
-
-    output_position = destinationStart
-    max_span_nnz = max(1, copyBufferBytes // max(1, 2 * item_bytes + 7))
-    window_start = 0
-    while window_start < len(rows):
-        window_end = window_start + 1
-        while (
-            window_end < len(rows)
-            and int(rowEnds[window_end] - rowStarts[window_start]) <= max_span_nnz
-        ):
-            window_end += 1
-
-        window_starts = rowStarts[window_start:window_end]
-        window_ends = rowEnds[window_start:window_end]
-        if int(window_ends[-1] - window_starts[0]) > max_span_nnz:
-            output_position = _copy_pair_slice(
-                sourceData,
-                sourceIndices,
-                destinationData,
-                destinationIndices,
-                int(window_starts[0]),
-                int(window_ends[0]),
-                output_position,
-                copyBufferBytes,
-            )
-        else:
-            output_position = _copy_masked_csr_window(
-                sourceData,
-                sourceIndices,
-                destinationData,
-                destinationIndices,
-                window_starts,
-                window_ends,
-                output_position,
-            )
-        window_start = window_end
-    if output_position != destinationStart + selected_nnz:
-        raise ValueError("Copied CSR data length does not match selected rows")
-    return output_position
-
-
-def _copy_selected_strings(
-    source: h5py.Dataset,
-    destination: h5py.Dataset,
-    rows: np.ndarray,
-    rowBatchSize: int,
-) -> None:
-    output_start = 0
-    for start in range(0, len(rows), rowBatchSize):
-        batch = rows[start : start + rowBatchSize]
-        span_rows = int(batch[-1] - batch[0] + 1)
-        if span_rows <= len(batch) * 2:
-            values = np.asarray(source[int(batch[0]) : int(batch[-1]) + 1])
-            values = values[batch - batch[0]]
-        else:
-            values = np.asarray(source[batch])
-        output_end = output_start + len(batch)
-        destination[output_start:output_end] = values
-        output_start = output_end
 
 
 def _check_integer_capacity(dtype: np.dtype[Any], maximum: int) -> None:
@@ -1094,173 +952,6 @@ def write_h5ad_sample_from_memory(
         dataDtype=str(source.dataDtype),
         indicesDtype=str(source.indicesDtype),
         indptrDtype=str(source.indptrDtype),
-    )
-
-
-def write_h5ad_sample(
-    sourcePath: str | Path,
-    destinationPath: str | Path,
-    sourceRows: np.ndarray | Sequence[int],
-    *,
-    spec: SourceSpec = SOURCE_SPEC,
-    rowBatchSize: int = _DEFAULT_ROW_BATCH_SIZE,
-    copyBufferBytes: int = _DEFAULT_COPY_BUFFER_BYTES,
-) -> H5adWriteResult:
-    if rowBatchSize <= 0:
-        raise ValueError("rowBatchSize must be positive")
-    if copyBufferBytes <= 0:
-        raise ValueError("copyBufferBytes must be positive")
-
-    source_path = Path(sourcePath)
-    destination_path = Path(destinationPath)
-    destination_path.parent.mkdir(parents=True, exist_ok=True)
-    if destination_path.exists():
-        raise FileExistsError(f"Destination already exists: {destination_path}")
-    temporary_path = destination_path.with_name(
-        f".{destination_path.name}.{uuid.uuid4().hex}.part"
-    )
-
-    try:
-        with (
-            h5py.File(source_path, mode="r") as source,
-            h5py.File(temporary_path, mode="w") as destination,
-        ):
-            source_matrix = _require_group(source, spec.matrixKey)
-            shape = tuple(int(value) for value in source_matrix.attrs.get("shape", ()))
-            if len(shape) != 2:
-                raise ValueError(f"{spec.matrixKey} has invalid shape metadata")
-            n_source_rows, n_columns = shape
-            rows = _validate_selected_rows(sourceRows, n_source_rows)
-
-            source_data = _require_dataset(source, f"{spec.matrixKey}/data")
-            source_indices = _require_dataset(
-                source,
-                f"{spec.matrixKey}/indices",
-            )
-            source_indptr = _require_dataset(
-                source,
-                f"{spec.matrixKey}/indptr",
-            )
-            if source_indptr.shape != (n_source_rows + 1,):
-                raise ValueError("Source CSR indptr length does not match shape")
-            if not np.issubdtype(source_indices.dtype, np.integer):
-                raise ValueError("Source CSR indices must use an integer dtype")
-            if not np.issubdtype(source_indptr.dtype, np.integer):
-                raise ValueError("Source CSR indptr must use an integer dtype")
-            data_dtype = str(source_data.dtype)
-            indices_dtype = str(source_indices.dtype)
-            indptr_dtype = str(source_indptr.dtype)
-
-            nnz = _selected_nnz(source_indptr, rows, rowBatchSize)
-            _check_integer_capacity(source_indptr.dtype, nnz)
-            _check_integer_capacity(source_indices.dtype, n_columns - 1)
-
-            destination.attrs["encoding-type"] = "anndata"
-            destination.attrs["encoding-version"] = "0.1.0"
-            matrix = destination.create_group("X")
-            matrix.attrs["encoding-type"] = "csr_matrix"
-            matrix.attrs["encoding-version"] = "0.1.0"
-            matrix.attrs["shape"] = np.asarray(
-                [len(rows), n_columns],
-                dtype=np.int64,
-            )
-            destination_data = _create_numeric_dataset(
-                matrix,
-                "data",
-                nnz,
-                source_data.dtype,
-            )
-            destination_indices = _create_numeric_dataset(
-                matrix,
-                "indices",
-                nnz,
-                source_indices.dtype,
-            )
-            destination_indptr = _create_numeric_dataset(
-                matrix,
-                "indptr",
-                len(rows) + 1,
-                source_indptr.dtype,
-            )
-            destination_indptr[0] = 0
-
-            output_data_position = 0
-            output_row_position = 0
-            for start in range(0, len(rows), rowBatchSize):
-                batch = rows[start : start + rowBatchSize]
-                row_starts, row_ends = _row_boundaries(source_indptr, batch)
-                counts = row_ends - row_starts
-                cumulative = np.cumsum(counts, dtype=np.int64) + output_data_position
-                output_row_end = output_row_position + len(batch)
-                destination_indptr[output_row_position + 1 : output_row_end + 1] = (
-                    cumulative.astype(source_indptr.dtype, copy=False)
-                )
-                output_data_position = _copy_csr_batch(
-                    source_data,
-                    source_indices,
-                    destination_data,
-                    destination_indices,
-                    batch,
-                    row_starts,
-                    row_ends,
-                    output_data_position,
-                    copyBufferBytes,
-                )
-                output_row_position = output_row_end
-            if output_data_position != nnz:
-                raise ValueError(
-                    f"Copied {output_data_position} values, expected {nnz}"
-                )
-
-            obs = _create_dataframe_group(destination, "obs", ())
-            output_cell_ids = _create_string_dataset(obs, "_index", len(rows))
-            source_cell_ids = _require_dataset(source, spec.cellIdsKey)
-            _copy_selected_strings(
-                source_cell_ids,
-                output_cell_ids,
-                rows,
-                rowBatchSize,
-            )
-
-            var = _create_dataframe_group(
-                destination,
-                "var",
-                ("feature_name",),
-            )
-            output_feature_ids = _create_string_dataset(
-                var,
-                "_index",
-                n_columns,
-            )
-            output_feature_names = _create_string_dataset(
-                var,
-                "feature_name",
-                n_columns,
-            )
-            source_feature_ids = _require_dataset(source, spec.featureIdsKey)
-            source_feature_names = _load_string_column(
-                source,
-                spec.featureNameKey,
-                expectedLength=n_columns,
-            )
-            output_feature_ids[:] = source_feature_ids[:]
-            output_feature_names[:] = source_feature_names[:]
-
-        os.replace(temporary_path, destination_path)
-    except BaseException:
-        temporary_path.unlink(missing_ok=True)
-        raise
-
-    return H5adWriteResult(
-        filePath=destination_path,
-        nRows=len(rows),
-        nColumns=n_columns,
-        nnz=nnz,
-        sourceRowsSha256=ordered_source_row_digest(rows),
-        finalSourceRow=int(rows[-1]),
-        dataDtype=data_dtype,
-        indicesDtype=indices_dtype,
-        indptrDtype=indptr_dtype,
     )
 
 

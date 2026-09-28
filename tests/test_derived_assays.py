@@ -13,7 +13,7 @@ from zarr.storage import MemoryStore
 from scarf.assay.normalization import iter_feature_group_means
 from scarf.datastore.datastore import DataStore
 from scarf.storage.count_matrix import CountMatrixPolicy
-from scarf.storage.identity import finalize_counts
+from tests.storage_helpers import finalize_test_counts
 from scarf.storage.schema import (
     PENDING_ASSAY_ATTR,
     create_cell_data,
@@ -227,7 +227,7 @@ def test_repack_refuses_unfinalized_writer_counts(tmp_path):
     with pytest.raises(ValueError, match="incomplete count matrix"):
         repack_store(str(path), str(tmp_path / "data.zarr"), data_only=True)
 
-    finalize_counts(extra)
+    finalize_test_counts(extra)
     assert extra.attrs["complete"] is True
 
 
@@ -279,7 +279,7 @@ def test_derived_assay_transaction_publishes_only_finalized_counts():
     ) as transaction:
         counts = transaction.create_counts(3, ["f0"], ["f0"])
         counts[:] = 2.0
-        finalize_counts(counts)
+        finalize_test_counts(counts)
         transaction.group.attrs["provenance"] = "kept"
 
     attrs = dict(root["SCORES"].attrs)

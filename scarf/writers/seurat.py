@@ -18,6 +18,7 @@ from ..readers.seurat import (
     SeuratRMatrix,
     SeuratReduction,
 )
+from ..storage.arrays import MISSING_MASK_PREFIX
 from ..storage.count_matrix import CountMatrixPolicy
 from ..storage.artifact_writer import (
     ArrayRequirement,
@@ -28,13 +29,19 @@ from ..storage.artifact_writer import (
 from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import StorageProfile, ZarrLocation
 from ..storage.refs import ArtifactRef
-from ._store import RESERVED_METADATA_COLUMNS
+from ._store import (
+    DEFAULT_IMPORT_BLOCK_ROWS,
+    RESERVED_METADATA_COLUMNS,
+    bounded_block_rows,
+    decode_text,
+    fingerprint_row_blocks,
+    floating_payload_dtype,
+    is_reserved_metadata_name,
+    resolve_import_cell_selection,
+)
 
 if TYPE_CHECKING:
     from ..storage.identity import CountSummary
-
-
-_DEFAULT_BLOCK_ROWS = 65_536
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,14 +71,6 @@ class SeuratImportResult:
             MappingProxyType(dict(self.reductionArtifacts)),
         )
 
-    @property
-    def artifactRefs(self) -> tuple[ArtifactRef, ...]:
-        return (
-            self.cellSelection,
-            self.activeIdentity,
-            *self.reductionArtifacts.values(),
-        )
-
 
 def _string_blocks(
     values: Sequence[str],
@@ -95,11 +94,7 @@ def _bounded_string_dtype(
 
 
 def _decode_text(value: str | bytes | None) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8")
-    return value
+    return "" if value is None else decode_text(value)
 
 
 class SeuratToZarr:
@@ -217,7 +212,7 @@ class SeuratToZarr:
         string_block_rows = max(
             1,
             min(
-                _DEFAULT_BLOCK_ROWS,
+                DEFAULT_IMPORT_BLOCK_ROWS,
                 int(resources.memoryBytes) // (8 * 64),
             ),
         )
@@ -299,12 +294,13 @@ class SeuratToZarr:
 
     @staticmethod
     def _validate_metadata_name(name: str, axis: str) -> None:
+        if not is_reserved_metadata_name(name):
+            return
         if name in RESERVED_METADATA_COLUMNS:
             raise ValueError(f"{axis} metadata column {name!r} is reserved")
-        if name.startswith("__scarf_missing__"):
-            raise ValueError(
-                f"{axis} metadata column {name!r} uses Scarf's internal prefix"
-            )
+        raise ValueError(
+            f"{axis} metadata column {name!r} uses Scarf's internal prefix"
+        )
 
     @classmethod
     def _validate_metadata_names(cls, metadata: SeuratMetadata, axis: str) -> None:
@@ -313,7 +309,7 @@ class SeuratToZarr:
             raise ValueError(f"{axis} metadata contains duplicate column names")
         for name in names:
             cls._validate_metadata_name(name, axis)
-        generated_masks = {f"__scarf_missing__{name}" for name in names}
+        generated_masks = {f"{MISSING_MASK_PREFIX}{name}" for name in names}
         overlap = generated_masks.intersection(names)
         if overlap:
             raise ValueError(
@@ -406,13 +402,11 @@ class SeuratToZarr:
         *,
         row_bytes: int,
     ) -> int:
-        bytes_per_row = max(1, int(row_bytes))
-        memory_rows = max(
-            1,
-            int(self.resources.memoryBytes) // (8 * bytes_per_row),
+        return bounded_block_rows(
+            requested,
+            row_bytes=row_bytes,
+            memory_bytes=int(self.resources.memoryBytes),
         )
-        preferred = _DEFAULT_BLOCK_ROWS if requested is None else requested
-        return int(max(1, min(int(preferred), memory_rows)))
 
     def _write_cell_data(self, block_rows: int) -> None:
         self._write_string_axis(
@@ -548,7 +542,7 @@ class SeuratToZarr:
             dtype=dtype,
             blocks=self._metadata_blocks(column, dtype, block_rows),
             overwrite=True,
-            chunkSize=min(_DEFAULT_BLOCK_ROWS, max(1, column.length)),
+            chunkSize=min(DEFAULT_IMPORT_BLOCK_ROWS, max(1, column.length)),
             hasMissing=True,
             profile=self.profile,
         )
@@ -565,7 +559,7 @@ class SeuratToZarr:
         """Store Seurat's analytical active identity without a live column."""
         column = self._activeIdentity
         dtype = self._metadata_dtype(column, block_rows)
-        missing_name = "__scarf_missing__values"
+        missing_name = f"{MISSING_MASK_PREFIX}values"
         planned = plan_artifact(
             self.root,
             scope="assay",
@@ -629,7 +623,7 @@ class SeuratToZarr:
                 for start in range(0, len(values), block_rows)
             ),
             overwrite=True,
-            chunkSize=min(_DEFAULT_BLOCK_ROWS, max(1, len(values))),
+            chunkSize=min(DEFAULT_IMPORT_BLOCK_ROWS, max(1, len(values))),
             profile=self.profile,
         )
 
@@ -867,29 +861,15 @@ class SeuratToZarr:
             )
 
     def _write_cell_selection(self) -> ArtifactRef:
-        from ..storage.selections import resolve_stored_selection_artifact
-
-        ref = resolve_stored_selection_artifact(
+        return resolve_import_cell_selection(
             self.root,
-            table_path="cellData",
-            id_column="ids",
-            source_column="I",
-            scope="datastore",
-            kind="cell_selection",
-            operation="import_cell_selection",
-            parameters={"source": "seurat"},
+            source="seurat",
             inputs={"source_digest": self._sourceDigest},
         )
-        return ref
 
     @staticmethod
     def _floating_dtype(dtype: Any) -> np.dtype[Any]:
-        source: np.dtype[Any] = np.dtype(dtype)
-        if source.kind == "f":
-            return np.dtype(source.str)
-        if source.kind in "biu":
-            return np.dtype(np.float64)
-        raise TypeError(f"Reduction payload uses unsupported dtype {source}")
+        return floating_payload_dtype(dtype, "Reduction payload")
 
     @staticmethod
     def _matrix_blocks(
@@ -918,16 +898,12 @@ class SeuratToZarr:
         block_rows: int,
         dtype: np.dtype[Any],
     ) -> str:
-        from ..storage.artifacts import ValueFingerprintBuilder
-
-        builder = ValueFingerprintBuilder()
-        builder.begin_array("values", matrix.shape, dtype)
-        start = 0
-        for block in cls._matrix_blocks(matrix, block_rows, dtype):
-            builder.update_array_block("values", (start, 0), block)
-            start += int(block.shape[0])
-        builder.end_array("values")
-        return str(builder.hexdigest())
+        return fingerprint_row_blocks(
+            cls._matrix_blocks(matrix, block_rows, dtype),
+            tuple(matrix.shape),
+            dtype,
+            label="Reduction payload",
+        )
 
     @classmethod
     def _fingerprint_vector(
@@ -936,36 +912,28 @@ class SeuratToZarr:
         block_rows: int,
         dtype: np.dtype[Any],
     ) -> str:
-        from ..storage.artifacts import ValueFingerprintBuilder
-
-        builder = ValueFingerprintBuilder()
-        builder.begin_array("values", (vector.length,), dtype)
-        start = 0
-        for block in cls._vector_blocks(vector, block_rows, dtype):
-            builder.update_array_block("values", (start,), block)
-            start += int(block.shape[0])
-        builder.end_array("values")
-        return str(builder.hexdigest())
+        return fingerprint_row_blocks(
+            cls._vector_blocks(vector, block_rows, dtype),
+            (vector.length,),
+            dtype,
+            label="Reduction payload",
+        )
 
     @staticmethod
     def _fingerprint_feature_ids(
         values: Sequence[str],
         block_rows: int,
     ) -> str:
-        from ..storage.artifacts import ValueFingerprintBuilder
-
         dtype = _bounded_string_dtype(values, block_rows)
-        builder = ValueFingerprintBuilder()
-        builder.begin_array("values", (len(values),), dtype)
-        for start in range(0, len(values), block_rows):
-            stop = min(start + block_rows, len(values))
-            builder.update_array_block(
-                "values",
-                (start,),
-                np.asarray(values[start:stop], dtype=dtype),
-            )
-        builder.end_array("values")
-        return str(builder.hexdigest())
+        return fingerprint_row_blocks(
+            (
+                np.asarray(block, dtype=dtype)
+                for block in _string_blocks(values, block_rows)
+            ),
+            (len(values),),
+            dtype,
+            label="Reduction feature IDs",
+        )
 
     def _reduction_block_rows(
         self,
@@ -1004,14 +972,12 @@ class SeuratToZarr:
             ) -> Iterator[np.ndarray]:
                 return self._matrix_blocks(matrix, rows, dtype)
 
-            normalized_name = reduction.name.casefold()
-            if normalized_name in {"umap", "tsne", "t-sne"}:
-                role = "umap" if normalized_name == "umap" else "tsne"
+            if reduction.role == "displayEmbedding":
                 ref = write_imported_embedding(
                     self.root,
                     assay=reduction.assayUsed,
                     dimreduc_key=reduction.name,
-                    role=role,
+                    role="umap" if reduction.name.casefold() == "umap" else "tsne",
                     coordinates=coordinate_blocks,
                     coordinate_shape=reduction.cellEmbeddings.shape,
                     coordinate_dtype=coordinate_dtype,

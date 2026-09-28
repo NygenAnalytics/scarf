@@ -112,6 +112,37 @@ def interruption_record(
     return None
 
 
+def _as_interruption(error: BaseException) -> BaseException:
+    """Return the interruption that an exception group holds, else ``error``.
+
+    Workers that fail together raise an exception group. A group that holds a
+    ``KeyboardInterrupt`` or ``ShutdownRequested`` leaf ends its stage as that
+    interruption.
+    """
+    if isinstance(error, BaseExceptionGroup):
+        for inner in error.exceptions:
+            leaf = _as_interruption(inner)
+            if interruption_record(leaf) is not None:
+                return leaf
+    return error
+
+
+def end_pipeline_run(root: Any, run_id: str, error: BaseException) -> bool:
+    """End a running pipeline run with ``error``; return whether it wrote.
+
+    A handled interruption marks the run interrupted and any other error marks
+    it failed. A run that has already ended is left unchanged.
+    """
+    if load_pipeline_run_record(root, run_id).complete:
+        return False
+    interruption = interruption_record(error)
+    if interruption is None:
+        fail_pipeline_run_record(root, run_id=run_id, error=error)
+    else:
+        interrupt_pipeline_run_record(root, run_id=run_id, interruption=interruption)
+    return True
+
+
 @dataclass(frozen=True, slots=True)
 class _StageOutcome:
     outputs: tuple[tuple[str, ArtifactRef], ...]
@@ -230,18 +261,15 @@ class RunLedger:
                 self.background.remove(started)
                 self._finish(started)
 
-    def interrupt_pending(self, error: BaseException, stage: str) -> None:
-        interruption = interruption_record(error)
-        if interruption is None:
-            raise TypeError("error is not a handled pipeline interruption")
+    def terminate(self, error: BaseException) -> bool:
+        """Record background stages, then end the run unless it already ended."""
         self._settle_background()
-        current = load_pipeline_run_record(self.root, self.run_id)
-        if not current.complete:
-            interrupt_pipeline_run_record(
-                self.root,
-                run_id=self.run_id,
-                interruption=interruption,
-            )
+        return end_pipeline_run(self.root, self.run_id, error)
+
+    def interrupt_pending(self, error: BaseException, stage: str) -> None:
+        if interruption_record(error) is None:
+            raise TypeError("error is not a handled pipeline interruption")
+        self.terminate(error)
         self.events.emit("pipeline_interrupted", stage, error)
 
     @staticmethod
@@ -278,14 +306,7 @@ class RunLedger:
                 interruption=interruption,
             )
         if end_run:
-            self._settle_background()
-            current_run = load_pipeline_run_record(self.root, self.run_id)
-            if not current_run.complete:
-                interrupt_pipeline_run_record(
-                    self.root,
-                    run_id=self.run_id,
-                    interruption=interruption,
-                )
+            self.terminate(error)
         self.events.emit("stage_interrupted", stage, error)
         if end_run:
             self.events.emit("pipeline_interrupted", stage, error)
@@ -314,8 +335,7 @@ class RunLedger:
                 )
         finally:
             if end_run:
-                self._settle_background()
-                fail_pipeline_run_record(self.root, run_id=self.run_id, error=error)
+                self.terminate(error)
         self.events.emit("stage_failed", stage, error)
 
     def skip(self, stage: str) -> None:
@@ -369,8 +389,7 @@ class RunLedger:
                     metrics=metrics or self._fallback_metrics(wall_started),
                 )
             else:
-                self._settle_background()
-                fail_pipeline_run_record(self.root, run_id=self.run_id, error=error)
+                self.terminate(error)
             raise PipelineExecutionError(self.run_id, stage, error) from error
         self.ordinal += 1
 
@@ -421,8 +440,7 @@ class RunLedger:
                 stage=stage,
             )
         except Exception as error:
-            self._settle_background()
-            fail_pipeline_run_record(self.root, run_id=self.run_id, error=error)
+            self.terminate(error)
             raise PipelineExecutionError(self.run_id, stage, error) from error
         self.ordinal += 1
         logger.info(f"Running pipeline stage: {stage.replace('_', ' ')}")
@@ -450,7 +468,7 @@ class RunLedger:
         outcome = started.task.result()
         stage, ordinal = started.stage, started.ordinal
         plan_records = self._plans(outcome.plans)
-        caught = outcome.error
+        caught = None if outcome.error is None else _as_interruption(outcome.error)
         if caught is None:
             try:
                 finish_pipeline_stage_record(

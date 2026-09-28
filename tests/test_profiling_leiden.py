@@ -7,7 +7,7 @@ import pytest
 import zarr
 
 from profiling import leiden_worker
-from profiling.config import StageResources, WorkflowParameters
+from profiling.config import StageResources, StorageIoConfig, WorkflowParameters
 from profiling.stages import (
     _monitor_child_process,
     _run_leiden_in_subprocess,
@@ -100,8 +100,11 @@ def _resources() -> StageResources:
 
 
 class _Store:
-    def __init__(self, *, error: Exception | None = None) -> None:
+    def __init__(
+        self, *, error: Exception | None = None, reused: bool | None = None
+    ) -> None:
         self.error = error
+        self.reused = reused
         self.arguments: dict[str, object] | None = None
 
     def run_leiden_clustering(
@@ -109,9 +112,23 @@ class _Store:
         graph: ArtifactRef,
         **arguments: object,
     ) -> ArtifactRef:
+        from scarf.storage.artifact_writer import PlannedArtifact, _record_plan
+
         self.arguments = {"graph": graph, **arguments}
         if self.error is not None:
             raise self.error
+        if self.reused is not None:
+            _record_plan(
+                PlannedArtifact(
+                    ref=_CLUSTER_REF,
+                    provenance={"operation": "run_leiden_clustering"},
+                    execution_options={},
+                    reused=self.reused,
+                    required_arrays=(),
+                    required_attributes=(),
+                    reuse_validator=None,
+                )
+            )
         return _CLUSTER_REF
 
 
@@ -120,6 +137,7 @@ def _request(
     *,
     workflow: WorkflowParameters | None = None,
     invalidateCache: bool = False,
+    storageIo: StorageIoConfig | None = None,
 ) -> tuple[Path, Path]:
     status_path = tmpPath / "status.json"
     request_path = tmpPath / "request.json"
@@ -131,6 +149,9 @@ def _request(
                 "resources": _resources().model_dump(mode="json"),
                 "statusPath": str(status_path),
                 "invalidateCache": invalidateCache,
+                "storageIo": (
+                    None if storageIo is None else storageIo.model_dump(mode="json")
+                ),
                 "inputs": {"graph": _GRAPH_REF.to_dict()},
             }
         ),
@@ -143,8 +164,9 @@ def test_worker_runs_leiden(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    store = _Store()
+    store = _Store(reused=False)
     opened: dict[str, object] = {}
+    policy = StorageIoConfig(readWorkers=3, computeWorkers=2, writeWorkers=1)
 
     def fake_open(
         storeUri: str,
@@ -152,22 +174,27 @@ def test_worker_runs_leiden(
         resources: StageResources,
         *,
         initialize: bool,
+        storageIo: StorageIoConfig | None,
     ) -> _Store:
         opened.update(
             storeUri=storeUri,
             workflow=workflow,
             resources=resources,
             initialize=initialize,
+            storageIo=storageIo,
         )
         return store
 
     monkeypatch.setattr(leiden_worker, "_open_datastore", fake_open)
-    request_path, status_path = _request(tmp_path, invalidateCache=True)
+    request_path, status_path = _request(
+        tmp_path, invalidateCache=True, storageIo=policy
+    )
 
     leiden_worker.run_leiden_worker(request_path)
 
     assert opened["storeUri"] == "s3://bucket/store.zarr"
     assert opened["initialize"] is False
+    assert opened["storageIo"] == policy
     assert store.arguments == {
         "graph": _GRAPH_REF,
         "resolution": 1.0,
@@ -179,6 +206,7 @@ def test_worker_runs_leiden(
     assert status["status"] == "ok"
     assert status["error"] is None
     assert status["artifact"] == _CLUSTER_REF.to_dict()
+    assert status["artifactDisposition"] == "created"
     assert status["inputSetupSeconds"] >= 0
     assert status["operationSeconds"] >= 0
     assert status["wholeWorkerSeconds"] >= (
@@ -271,6 +299,7 @@ def test_parent_starts_worker_module(
 
     monkeypatch.setattr("profiling.stages.subprocess.Popen", Process)
 
+    policy = StorageIoConfig(readWorkers=3, computeWorkers=2, writeWorkers=1)
     _run_leiden_in_subprocess(
         storeUri="s3://bucket/store.zarr",
         workflow=WorkflowParameters(),
@@ -278,12 +307,14 @@ def test_parent_starts_worker_module(
         workDir=tmp_path,
         graph=_GRAPH_REF,
         invalidateCache=True,
+        storageIo=policy,
     )
 
     assert commands[0][1:3] == ["-m", "profiling.leiden_worker"]
     request = json.loads((tmp_path / "request.json").read_text(encoding="utf-8"))
     assert request["storeUri"] == "s3://bucket/store.zarr"
     assert request["invalidateCache"] is True
+    assert StorageIoConfig.model_validate(request["storageIo"]) == policy
     assert request["workflow"]["leidenBackend"] == "igraph"
     assert request["inputs"] == {"graph": _GRAPH_REF.to_dict()}
 
@@ -337,3 +368,41 @@ def test_run_stage_routes_leiden_to_child(
     assert called["workDir"] == tmp_path
     assert called["invalidateCache"] is True
     assert called["graph"] == _GRAPH_REF
+
+
+@pytest.mark.parametrize("allowArtifactReuse", [False, True])
+def test_leiden_stage_fails_when_the_child_reused_its_clusters(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    allowArtifactReuse: bool,
+) -> None:
+    monkeypatch.setattr(
+        "profiling.stages._run_leiden_in_subprocess",
+        lambda **_arguments: {
+            "artifact": _CLUSTER_REF.to_dict(),
+            "artifactDisposition": "reused",
+            "inputSetupSeconds": 0.5,
+            "operationSeconds": 0.01,
+        },
+    )
+
+    result = run_stage(
+        "runLeiden",
+        nRows=10_000,
+        storeUri="s3://bucket/store.zarr",
+        workflow=WorkflowParameters(),
+        resources=_resources(),
+        workDir=tmp_path,
+        sampleIntervalSeconds=0.01,
+        allowArtifactReuse=allowArtifactReuse,
+        inputRefs={"graph": _GRAPH_REF},
+        submissionId="testsubmission",
+    )
+
+    assert result.details is not None
+    assert result.details["artifactDisposition"] == "reused"
+    if allowArtifactReuse:
+        assert result.status == "ok"
+    else:
+        assert result.status == "error"
+        assert result.error is not None and "cache lookup" in result.error

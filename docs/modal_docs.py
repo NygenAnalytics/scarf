@@ -9,10 +9,11 @@ import modal
 from docs.execute_all_vignettes import execute_and_publish
 from docs.execute_vignette import ParsedSource, discover_sources, execute_page
 from docs.modal_cache import PageCachePayload, SpawnedPageRunner, pack_page_cache
+from profiling.modal_support import MODAL_ENVIRONMENT_NAME
 
 DOCS_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = DOCS_ROOT.parent
 REMOTE_CACHE = Path("/tmp/scarf-doc-page-cache")
-MODAL_ENVIRONMENT_NAME = "scarf_profiling"
 MODAL_PYTHON_VERSION = "3.14"
 MODAL_RUNNER_IDENTITY = f"modal-python-{MODAL_PYTHON_VERSION}"
 MODAL_TIMEOUT_SECONDS = 7_200
@@ -67,6 +68,17 @@ image = (
     .add_local_file(
         str(DOCS_ROOT / "modal_docs.py"),
         "/root/docs/modal_docs.py",
+        copy=True,
+    )
+    # modal_cache imports the Modal waits shared with the profiling app.
+    .add_local_file(
+        str(REPO_ROOT / "profiling" / "__init__.py"),
+        "/root/profiling/__init__.py",
+        copy=True,
+    )
+    .add_local_file(
+        str(REPO_ROOT / "profiling" / "modal_support.py"),
+        "/root/profiling/modal_support.py",
         copy=True,
     )
 )

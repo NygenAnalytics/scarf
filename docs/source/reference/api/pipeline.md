@@ -51,6 +51,7 @@ def run(
     doublets: bool = True,
     markers: bool = True,
     snapshot_columns: Sequence[str] = (),
+    params: Mapping[str, object] | None = None,
     callback: PipelineCallback | None = None,
 ) -> PipelineRun: ...
 ```
@@ -107,6 +108,67 @@ run = ds.pipeline.run(
     },
 )
 ```
+
+## Configure stages with one mapping
+
+`params` configures the run with one mapping. Each key names a stage, and its value holds the
+keyword arguments the pipeline forwards to that stage's function. The pipeline still supplies the
+artifacts each stage consumes.
+
+```python
+run = ds.pipeline.run(
+    params={
+        "filtering": {"method": "manual", "attrs": ["RNA_nCounts"], "lows": [500], "highs": [20000]},
+        "hvg": {"min_mean": 0.01, "max_mean": 5.0, "keep_bounds": True},
+        "pca": {"dims": 30},
+        "neighbors": {"k": 15},
+        "umap": {"n_epochs": 400, "min_dist": 1.0, "spread": 2.0, "parallel": True},
+        "leiden": {"partitions": [0.6, 0.8, 1.0, 1.2, 1.4], "selected": 1.0},
+        "membership_strength": True,
+        "tsne": {"max_iter": 800, "early_iter": 200, "alpha": 10, "box_h": 0.7},
+        "species": "homo_sapiens",
+    },
+)
+```
+
+| Section | Forwards to | Settings |
+| --- | --- | --- |
+| `filtering` | the `filtering` option | the filtering mapping above, or a bool |
+| `cell_cycle` | cell-cycle scoring | `s_genes`, `g2m_genes`, `ctrl_size`, `log_transform`, `n_bins`, `rand_seed` |
+| `hvg` | {py:meth}`~scarf.datastore.datastore.DataStore.select_hvgs` | `top_n`, `min_cells`, `max_cells`, `min_mean`, `max_mean`, `min_var`, `max_var`, `n_bins`, `lowess_frac`, `blacklist`, `keep_bounds`, `bin_strategy` |
+| `normalization` | {py:meth}`~scarf.DataStore.run_normalization` | `log_transform`, `renormalize_subset` |
+| `pca` | {py:meth}`~scarf.DataStore.run_pca` | `dims`, `feat_scaling`, `batch_size` |
+| `harmony` | {py:meth}`~scarf.DataStore.run_harmony` | `batch_columns` (required), `harmony_params`, `batch_size` |
+| `ann_index` | {py:meth}`~scarf.DataStore.build_ann_index` | `ann_metric`, `ann_efc`, `ann_ef`, `ann_m`, `ann_parallel`, `rand_state`, `batch_size` |
+| `neighbors` | {py:meth}`~scarf.DataStore.query_neighbors` | `k`, `batch_size` |
+| `connectivity` | {py:meth}`~scarf.DataStore.build_connectivity_map` | `local_connectivity`, `bandwidth` |
+| `embedding_initialization` | {py:meth}`~scarf.DataStore.build_embedding_initialization` | `n_centroids`, `rand_state`, `batch_size`, `kmeans_sampling`, `kmeans_batch_size` |
+| `umap` | {py:meth}`~scarf.datastore.datastore.DataStore.run_umap` | `umap_dims`, `spread`, `min_dist`, `n_epochs`, `repulsion_strength`, `initial_alpha`, `negative_sample_rate`, `use_density_map`, `dens_lambda`, `dens_frac`, `dens_var_shift`, `random_seed`, `parallel`, `symmetric_graph`, `graph_upper_only` |
+| `tsne` | {py:meth}`~scarf.datastore.datastore.DataStore.run_tsne` | `tsne_dims`, `lambda_scale`, `max_iter`, `early_iter`, `alpha`, `box_h`, `parallel`, `symmetric_graph`, `graph_upper_only` |
+| `leiden` | {py:meth}`~scarf.datastore.datastore.DataStore.run_leiden_clustering` | `partitions`, `selected`, `backend`, `random_seed`, `symmetric_graph`, `graph_upper_only` |
+| `membership_strength` | {py:meth}`~scarf.datastore.datastore.DataStore.calc_membership_strength` | none; a bool |
+| `paris` | Paris clustering | `n_clusters`, `min_cluster_size` |
+| `doublets` | doublet detection | `cluster_sample_fraction`, `max_cells_per_cluster`, `simulation_ratio`, `heterotypic_fraction`, `save_k`, `smoothing_t`, `normalize_scores`, `random_seed` |
+| `markers` | marker search | none; a bool |
+| `species` | recorded with the run | a species key such as `homo_sapiens` or `mus_musculus` |
+
+Optional stages also accept `True` or `False`: `filtering`, `cell_cycle`, `harmony` (`False`
+only), `umap`, `tsne`, `leiden`, `membership_strength`, `paris`, `doublets`, and `markers`. `tsne`
+and `membership_strength` are off unless requested. t-SNE uses the UMAP graph and embedding
+initialization and runs after UMAP; its coordinates appear as `tsne_1`, `tsne_2`, and so on.
+Membership strength is computed on the saved clustering and appears as `membership_strength`.
+
+`pca` `dims=0` skips PCA. The graph then uses the normalized values of the selected features,
+recorded as the `reduction` output. `leiden` `selected` names one of the partitions as the saved
+clustering, `run["clusters"]`, in place of the silhouette choice, and the cluster-selection stage
+is skipped; the other partitions still run beside it.
+
+Unknown sections or settings, non-finite numbers, and `True` for a stage that always runs are
+rejected before a run record is created. A setting cannot also be given through its shortcut
+argument: `hvg_count` with `hvg.top_n`, `pca_dims` with `pca.dims`, `neighbors_k` with
+`neighbors.k`, `harmony_batch_columns` with `harmony`, or a changed stage switch such as
+`umap=False` with `params["umap"]`. Each stage checks its own values when it runs. The run's
+configuration records the resolved settings under `params`.
 
 The invocation is validated before a run record is created. Unknown options, missing columns,
 invalid stage combinations, reserved snapshot fields, and an already completed label fail without

@@ -274,7 +274,7 @@ ds.plots.dotplot(
 ```
 
 A matrixplot is a heatmap of mean or fraction.
-Features follow the features sequence; default group order comes from the summary table (typically sorted labels).
+Features follow the features sequence; the default group order is the stored display order when the grouping has one, otherwise natural label order, the same as dotplot.
 Override with `group_order` or `cluster_groups=True`.
 Use `feature_order` for an explicit feature order, or `cluster_features=True` to cluster features.
 Here `value="fraction"` colors by detection rate and groups are clustered.

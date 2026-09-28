@@ -72,7 +72,7 @@ def _synthetic_stats_result(
     sample_stat="mean",
     expression_cutoff=0.0,
 ):
-    from scarf.plotting.distribution import _value_fingerprint
+    from scarf.features.statistical import value_fingerprint
     from scarf.storage.artifacts import provenance_hash
 
     values = store.cells.fetch("metric")
@@ -98,27 +98,27 @@ def _synthetic_stats_result(
                 {
                     "source": "cell_metadata",
                     "column": "metric",
-                    "values_fingerprint": _value_fingerprint(values),
+                    "values_fingerprint": value_fingerprint(values),
                     "missing_fingerprint": None,
                 }
             ),
         ),
-        value_fingerprints=(_value_fingerprint(np.asarray(values, dtype=np.float64)),),
+        value_fingerprints=(value_fingerprint(np.asarray(values, dtype=np.float64)),),
         summary_scope="sample" if sample_by is not None else "cell",
         tables={"metric": table},
         posthoc_tables=({"metric": posthoc_table} if posthoc_table is not None else {}),
         cell_selection=None,
-        cell_selection_fingerprint=_value_fingerprint(cell_selection),
-        group_fingerprint=_value_fingerprint(groups),
+        cell_selection_fingerprint=value_fingerprint(cell_selection),
+        group_fingerprint=value_fingerprint(groups),
         group_order=tuple(sorted(unique_groups, key=str)),
         normalization={},
         normalization_method=None,
         size_factor=None,
         source_assays=(None,),
         sample_fingerprint=(
-            _value_fingerprint(samples) if samples is not None else None
+            value_fingerprint(samples) if samples is not None else None
         ),
-        pair_fingerprint=_value_fingerprint(pairs) if pairs is not None else None,
+        pair_fingerprint=value_fingerprint(pairs) if pairs is not None else None,
         artifact=None,
     )
 
@@ -133,15 +133,6 @@ def test_point_size_uses_population_and_panel_area():
         panel_area=4,
     )
     assert resolve_legend_loc(80) == "right"
-
-
-def test_register_theme_extends_rcparams():
-    name = "test-publication-theme"
-    splt.register_theme(name, {"font.size": 7.5}, base="paper")
-    with pytest.raises(ValueError, match="already exists"):
-        splt.register_theme(name, {"font.size": 8})
-    with splt.theme_context(name):
-        assert matplotlib.rcParams["font.size"] == pytest.approx(7.5)
 
 
 def test_stored_display_metadata_does_not_hide_malformed_stores():
@@ -570,36 +561,47 @@ def test_embedding_multi_layout_facets_include_requested_empty_panels():
     result.close()
 
 
-def test_embedding_figure_legend_uses_backend_compatible_fallback(monkeypatch):
-    from matplotlib.figure import Figure
-
-    original_legend = Figure.legend
-    attempted_locations = []
-
-    def reject_outside_location(self, *args, **kwargs):
-        attempted_locations.append(kwargs.get("loc"))
-        if kwargs.get("loc") == "outside right center":
-            raise ValueError("outside legends unsupported")
-        return original_legend(self, *args, **kwargs)
-
-    monkeypatch.setattr(Figure, "legend", reject_outside_location)
+def test_embedding_places_one_side_legend_per_categorical_panel():
+    rng = np.random.default_rng(0)
+    n_cells = 120
     store = _synthetic_plot_store(
-        layout1=[0.0, 1.0, 2.0, 3.0],
-        layout2=[0.0, 1.0, 0.0, 1.0],
-        category=["a", "b", "a", "b"],
+        layout1=rng.normal(size=n_cells),
+        layout2=rng.normal(size=n_cells),
+        cluster=np.repeat(["a", "b", "c", "d"], n_cells // 4),
+        sample=np.tile(["s1", "s2", "s3"], n_cells // 3),
     )
+
+    single = splt.embedding(
+        store,
+        layout_key="layout",
+        color_by="cluster",
+        show=False,
+    )
+    try:
+        assert [legend.get_title().get_text() for legend in single.figure.legends] == [
+            "cluster"
+        ]
+    finally:
+        single.close()
 
     result = splt.embedding(
         store,
         layout_key="layout",
-        color_by=splt.CellField("category", kind="categorical"),
-        legend_loc="right",
+        color_by=["cluster", "sample"],
         show=False,
     )
-
-    assert attempted_locations == ["outside right center", "center left"]
-    assert len(result.figure.legends) == 1
-    result.close()
+    try:
+        figure = result.figure
+        figure.canvas.draw()
+        renderer = figure.canvas.get_renderer()
+        boxes = [legend.get_window_extent(renderer) for legend in figure.legends]
+        assert [legend.get_title().get_text() for legend in figure.legends] == [
+            "cluster",
+            "sample",
+        ]
+        assert not boxes[0].overlaps(boxes[1])
+    finally:
+        result.close()
 
 
 def test_embedding_multi_layout_derives_facets_from_selected_cells():
@@ -749,34 +751,6 @@ def test_embedding_renders_non_linear_continuous_scales(scale, values):
     assert np.isfinite(collection.get_facecolors()).all()
     assert result.scales[0].scale == scale
     result.close()
-
-
-def test_embedding_continuous_limits_handle_degenerate_ranges():
-    from scarf.plotting.embedding import _continuous_limits
-
-    assert _continuous_limits(
-        np.asarray([np.nan, np.inf]),
-        splt.ColorScale(),
-    ) == (0.0, 1.0)
-
-    values = np.asarray([0.0, 1.0, 2.0, 100.0])
-    quantile_scale = splt.ColorScale(quantiles=(0.25, 0.75))
-    assert _continuous_limits(values, quantile_scale) == pytest.approx(
-        tuple(np.quantile(values, (0.25, 0.75)))
-    )
-    assert _continuous_limits(
-        values,
-        splt.ColorScale(vmin=4.0, vmax=4.0),
-    ) == pytest.approx((3.5, 4.5))
-    assert _continuous_limits(
-        values,
-        splt.ColorScale(vmin=2.0, vmax=2.0, scale="log"),
-    ) == pytest.approx((1.98, 2.02))
-    with pytest.raises(ValueError, match="positive values"):
-        _continuous_limits(
-            values,
-            splt.ColorScale(vmin=0.0, vmax=0.0, scale="log"),
-        )
 
 
 def test_imported_embedding_reuse_guard_and_validator_reject_damage():
@@ -1431,10 +1405,10 @@ def test_recipe_execution_is_headless_and_read_only(umap, datastore):
 
     assert not execution.written_paths
     assert not execution.failures
-    assert len(execution.results) == 1
+    assert len(execution.outputs) == 1
     assert frozenset(datastore.cells.columns) == columns_before
     assert frozenset(datastore.list_artifacts()) == artifacts_before
-    result = execution.results[0]
+    result = execution.outputs[0].result
     assert plt.fignum_exists(result.figure.number)
     result.close()
 
@@ -1463,7 +1437,7 @@ def test_recipe_batch_output_closes_owned_figure(umap, datastore, tmp_path):
         artifacts={"umap": umap},
         output_dir=tmp_path,
     )
-    plot_result = execution.results[0]
+    plot_result = execution.outputs[0].result
 
     assert execution.written_paths == (tmp_path / "overview.png",)
     assert execution.written_paths[0].stat().st_size > 0
@@ -1571,11 +1545,10 @@ def test_stacked_violin_mean_color_constant_row(umap, leiden_clustering, datasto
     try:
         table = list(result.tables.values())[0]
         assert np.nanmean(table["display_value"]) == pytest.approx(0, abs=1e-9)
-        # Degenerate scale is padded symmetrically around zero so the colourbar
-        # still renders, labelled for the standardized values.
-        vmin = result.provenance.extras["vmin"]
-        vmax = result.provenance.extras["vmax"]
-        assert vmin == pytest.approx(-vmax)
+        # Tied means follow the shared limit policy: the tied value takes the
+        # low end and the colourbar still renders a unit range.
+        assert result.provenance.extras["vmin"] == pytest.approx(0.0)
+        assert result.provenance.extras["vmax"] == pytest.approx(1.0)
         assert any(ax.get_label().startswith("<colorbar") for ax in result.figure.axes)
         colorbar = next(
             ax for ax in result.figure.axes if ax.get_label().startswith("<colorbar")
@@ -1961,7 +1934,9 @@ def test_stacked_violin_sparse_quantile_limits_preserve_outlier_color():
         hi=limits[0][1],
     )
 
-    assert reference[0] < 0 < reference[1]
+    # Collapsed quantiles keep the tied mean at the low end while the outlying
+    # mean clips to the high end.
+    assert reference == (0.0, 1.0)
     assert palette["a"] != palette["e"]
 
 
@@ -2129,10 +2104,8 @@ def test_distribution_stats_rejects_same_size_different_identity():
 
 
 def test_distribution_stats_rejects_changed_assay_normalization_state():
-    from scarf.plotting.distribution import (
-        _stat_result_compatibility_issue,
-        _value_fingerprint,
-    )
+    from scarf.features.statistical import value_fingerprint
+    from scarf.plotting.distribution import _stat_result_compatibility_issue
 
     store = _synthetic_plot_store(
         I=np.ones(12, dtype=bool),
@@ -2170,8 +2143,8 @@ def test_distribution_stats_rejects_changed_assay_normalization_state():
             normalization=splt.NormalizationSpec(),
             normalization_method=method,
             size_factor=size_factor,
-            cell_selection_fingerprint=_value_fingerprint(cells),
-            group_fingerprint=_value_fingerprint(groups),
+            cell_selection_fingerprint=value_fingerprint(cells),
+            group_fingerprint=value_fingerprint(groups),
         )
 
     assert "normalization method" in compatibility_issue(
@@ -2185,7 +2158,7 @@ def test_distribution_stats_rejects_changed_assay_normalization_state():
 
 
 def test_distribution_stats_and_plot_drop_the_same_invalid_group_labels():
-    from scarf.plotting.distribution import _value_fingerprint
+    from scarf.features.statistical import value_fingerprint
 
     store = _synthetic_plot_store(
         I=np.ones(8, dtype=bool),
@@ -2197,10 +2170,10 @@ def test_distribution_stats_and_plot_drop_the_same_invalid_group_labels():
     retained = np.arange(4, dtype=np.int64)
     stats.n_cells = 4
     stats.n_groups = 2
-    stats.cell_selection_fingerprint = _value_fingerprint(retained)
-    stats.group_fingerprint = _value_fingerprint(store.cells.fetch("group")[:4])
+    stats.cell_selection_fingerprint = value_fingerprint(retained)
+    stats.group_fingerprint = value_fingerprint(store.cells.fetch("group")[:4])
     stats.group_order = ("a", "b")
-    stats.value_fingerprints = (_value_fingerprint(store.cells.fetch("metric")[:4]),)
+    stats.value_fingerprints = (value_fingerprint(store.cells.fetch("metric")[:4]),)
 
     result = splt.distribution(
         store,
@@ -2407,7 +2380,7 @@ def test_distribution_paired_stats_reject_missing_pair_values():
         pair_by="pair",
     )
 
-    with pytest.raises(ValueError, match="pair values must be present"):
+    with pytest.raises(ValueError, match="valid pair value for every cell"):
         splt.distribution(
             store,
             "metric",
@@ -2449,9 +2422,13 @@ def test_distribution_stats_annotations_use_theme_foreground():
         result.close()
 
 
-def test_distribution_stats_annotations_use_custom_dark_theme_foreground():
+def test_distribution_stats_annotations_use_custom_dark_theme_foreground(monkeypatch):
     theme_name = "test-distribution-custom-dark"
-    splt.register_theme(theme_name, {"font.size": 9}, base="dark", overwrite=True)
+    monkeypatch.setitem(
+        splt.THEMES,
+        theme_name,
+        {**splt.THEMES["dark"], "font.size": 9},
+    )
     store = _synthetic_plot_store(
         I=np.ones(12, dtype=bool),
         group=np.repeat(["a", "b", "c"], 4),
@@ -2525,7 +2502,8 @@ def test_distribution_stats_bracket_height_requires_finite_positive_value(height
 
 
 def test_distribution_masks_metadata_placeholders_per_panel():
-    from scarf.plotting.distribution import _fetch_series, _value_fingerprint
+    from scarf.features.statistical import value_fingerprint
+    from scarf.plotting.distribution import _fetch_series
     from scarf.storage.artifacts import provenance_hash
 
     class MaskedCells(_SyntheticCells):
@@ -2576,8 +2554,8 @@ def test_distribution_masks_metadata_placeholders_per_panel():
         {
             "source": "cell_metadata",
             "column": "metric",
-            "values_fingerprint": _value_fingerprint(columns["metric"]),
-            "missing_fingerprint": _value_fingerprint(
+            "values_fingerprint": value_fingerprint(columns["metric"]),
+            "missing_fingerprint": value_fingerprint(
                 np.array([False, True, False, False, False, False])
             ),
         }

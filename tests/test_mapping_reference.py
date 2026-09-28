@@ -248,7 +248,7 @@ def test_plain_mapping_reference_packages_and_loads_existing_chain(
         np.asarray(datastore.cells.fetch_all("ids"))[selected_cells],
     )
     np.testing.assert_array_equal(
-        reference.fetch_layout(planned_layout.ref),
+        reference._fetch_layout(planned_layout.ref),
         expected_layout,
     )
 
@@ -310,6 +310,44 @@ def test_symphony_mapping_reference_has_conditional_state_and_read_only_reload(
         loaded.symphony_state.corrected_centroids,
         reference.symphony_state.corrected_centroids,
     )
+
+
+def test_symphony_mapping_reference_requires_recorded_batch_levels(
+    analyzed_datastore_ephemeral,
+):
+    datastore = analyzed_datastore_ephemeral
+    neighbors = _symphony_neighbors(datastore)
+    correction = ArtifactRef.from_dict(
+        datastore.inspect_artifact(neighbors).inputs["coordinates"]
+    )
+    del artifact_group(datastore.zw, correction).attrs["batch_levels"]
+
+    with pytest.raises(ValueError, match="Re-run run_harmony"):
+        datastore.build_mapping_reference(neighbors)
+
+
+@pytest.mark.parametrize("missing", ["batch_levels", "batch_columns"])
+def test_symphony_mapping_reference_load_requires_recorded_batch_metadata(
+    analyzed_datastore_ephemeral,
+    missing,
+):
+    datastore = analyzed_datastore_ephemeral
+    neighbors = _symphony_neighbors(datastore)
+    reference_ref = datastore.build_mapping_reference(neighbors)
+    correction = ArtifactRef.from_dict(
+        datastore.inspect_artifact(neighbors).inputs["coordinates"]
+    )
+    group = artifact_group(datastore.zw, correction)
+    if missing == "batch_levels":
+        del group.attrs["batch_levels"]
+    else:
+        provenance = dict(group.attrs["provenance"])
+        parameters = dict(provenance["parameters"])
+        del parameters["batch_columns"]
+        group.attrs["provenance"] = {**provenance, "parameters": parameters}
+
+    with pytest.raises(ValueError, match="Re-run run_harmony"):
+        datastore.get_mapping_reference(reference_ref)
 
 
 def test_loaded_mapping_reference_is_deeply_immutable(

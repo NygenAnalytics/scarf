@@ -27,22 +27,22 @@ accepts two exact clustering refs with the same frozen cell selection. None acce
 or an omitted artifact input.
 
 ```python
-mixing_ref = ds.metric_lisi(["batch"], rna_neighbors)
-mixing = ds.load_metric_lisi(mixing_ref)["batch"]
+mixing = ds.metric_ilisi("batch", rna_neighbors)
 connectivity = ds.metric_graph_connectivity("cell_type", snn)
 agreement = ds.metric_label_concordance(rna_clusters, adt_clusters, metric="ari")
 ```
 
-Per-cell LISI is axis-aligned analytical data, so `metric_lisi` returns an artifact and
-`load_metric_lisi` reads its scores. Dataset-level scalar summaries such as iLISI and graph
-connectivity remain direct values.
+The metric methods return dataset-level scalar summaries such as iLISI, cLISI, and graph
+connectivity. {py:func}`scarf.metrics.compute_lisi` returns per-cell LISI values from KNN arrays.
+Metric label columns must label every scored cell: masked, `NaN`, `None`, and blank labels raise
+`ValueError`.
 
 All LISI entry points now resolve `perplexity=None` to `floor(k / 3)`, where `k` is the
-number of neighbours. `compute_lisi` and `metric_lisi` previously defaulted to 30. Pass
+number of neighbours. `compute_lisi` previously defaulted to 30. Pass
 `perplexity=30` explicitly to retain that policy; explicit values are capped at `k / 3`
 with a warning when the graph is too small. With three to five neighbours, the new default
 is 1, so scores can approach 1 when the nearest distance is unique. Tied distances can
-produce larger values. The resolved perplexity is part of a saved metric's identity.
+produce larger values.
 
 Cluster separability summaries now expose `macro_f1_fold_sd`, the sample standard deviation
 of macro F1 across validation folds. This replaces `macro_f1_standard_error`, which reported
@@ -56,8 +56,6 @@ column name and interpret the new value as fold variability.
    :nosignatures:
 
    scarf.DataStore.integrate_assays
-   scarf.DataStore.metric_lisi
-   scarf.DataStore.load_metric_lisi
    scarf.DataStore.metric_ilisi
    scarf.DataStore.metric_clisi
    scarf.DataStore.metric_proportional_batch_mixing
@@ -69,8 +67,6 @@ column name and interpret the new value as fold variability.
 
 ```{eval-rst}
 .. automethod:: scarf.DataStore.integrate_assays
-.. automethod:: scarf.DataStore.metric_lisi
-.. automethod:: scarf.DataStore.load_metric_lisi
 .. automethod:: scarf.DataStore.metric_ilisi
 .. automethod:: scarf.DataStore.metric_clisi
 .. automethod:: scarf.DataStore.metric_proportional_batch_mixing
@@ -81,10 +77,6 @@ column name and interpret the new value as fold variability.
 ```
 
 ## Harmony
-
-```{eval-rst}
-.. autofunction:: scarf.embeddings.run_harmony
-```
 
 ```{eval-rst}
 .. autofunction:: scarf.embeddings.fit_harmony

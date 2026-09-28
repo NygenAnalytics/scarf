@@ -6,6 +6,7 @@ from typing import Any
 from ...datastore.datastore import DataStore
 from ...graph.feature_projection import graph_cell_selection
 from ...utils.logging import logger
+from .._plots import require_final_inputs
 from ..parameter_tuning.contracts import ParameterTuningReport
 from ..parameter_tuning.selection import promote_parameter_candidate
 from ..types import ArtifactReferenceModel
@@ -85,11 +86,7 @@ class FinalizationStagesMixin:
                 raise ValueError(
                     "Finalization requires exact normalized and marker features"
                 )
-            if (
-                tuning_report.status != "done"
-                or tuning_report.recommendedIntegrationId is not None
-                or tuning_report.assayReports
-            ):
+            if tuning_report.status != "done":
                 raise ValueError(
                     "Finalization requires a completed single-RNA recommendation"
                 )
@@ -132,22 +129,22 @@ class FinalizationStagesMixin:
                 raise ValueError(
                     "Selected graph does not contain the full-cohort selection"
                 )
-            for label, ref in (("clusters", clusters), ("markers", markers)):
-                status = store.inspect_artifact(ref.to_artifact_ref())
-                if not status.complete or ref.assay != assay_name:
-                    raise ValueError(
-                        f"Final {label} are incomplete or belong to another assay"
-                    )
-                inputs = status.inputs or {}
-                if inputs.get("cell_selection") != cells_ref.to_dict():
-                    raise ValueError(f"Final {label} use a different cell selection")
-                parent_key, parent = (
-                    ("graph", graph) if label == "clusters" else ("clusters", clusters)
-                )
-                if inputs.get(parent_key) != parent.to_artifact_ref().to_dict():
-                    raise ValueError(
-                        f"Final {label} do not match the selected {parent_key}"
-                    )
+            if clusters.assay != assay_name or markers.assay != assay_name:
+                raise ValueError("Final clusters and markers must use the RNA assay")
+            require_final_inputs(
+                store,
+                clusters.to_artifact_ref(),
+                "clusters",
+                cell_selection=cells_ref,
+                graph=graph_ref,
+            )
+            require_final_inputs(
+                store,
+                markers.to_artifact_ref(),
+                "markers",
+                cell_selection=cells_ref,
+                clusters=clusters.to_artifact_ref(),
+            )
             for ref in selected_artifacts.values():
                 store.load_artifact(ref.to_artifact_ref())
             initialization_ref = store.build_embedding_initialization(

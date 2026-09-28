@@ -24,7 +24,6 @@ from scarf.metadata.queries import missing_frame_values
 from scarf.metadata.rows import MetaDataRowBlock as implementation_row_block
 from scarf.metadata.rows import (
     apply_missing_mask,
-    array_row_selection_peak_bytes,
     iter_metadata_column_blocks,
     metadata_missing_mask,
     read_metadata_missing_rows,
@@ -39,14 +38,11 @@ from tests.signature_contracts import signature_digest
 _METHODS = {
     "__init__",
     "__repr__",
-    "_col_renamer",
-    "_column_map",
+    "_column_names",
     "_fill_to_index",
     "_get_array",
-    "_get_loc",
     "_get_size",
     "_save",
-    "_verify_bool",
     "active_index",
     "default_block_rows",
     "drop",
@@ -59,13 +55,10 @@ _METHODS = {
     "index_to_bool",
     "insert",
     "iter_row_blocks",
-    "mount_location",
     "multi_sift",
-    "remove_trend",
     "reset_key",
     "sift",
     "to_pandas_dataframe",
-    "unmount_location",
     "update_key",
 }
 
@@ -108,7 +101,7 @@ def test_metadata_method_ownership_and_signatures_remain_stable():
     methods = {name: getattr(metadata.MetaData, name) for name in _METHODS}
 
     assert signature_digest(methods) == (
-        "f882e8fb00453f282ab117edfa27a4433ee2e46446b71631f8c4c450f0327d5d"
+        "7a60ae131135bc959cbc4443f91307a33616740779a0a5d50d3f9b2341152508"
     )
 
 
@@ -269,9 +262,6 @@ def test_metadata_row_helpers_preserve_noncontiguous_order_without_span():
             assert column == "score"
             return self._array
 
-        def _verify_bool(self, key):
-            return False
-
         def default_block_rows(self, column="I"):
             return self.N
 
@@ -347,11 +337,6 @@ def test_chunkwise_metadata_rows_preserve_order_and_decode_one_chunk():
             selected = np.asarray(request[0])
         assert np.unique(selected // array.chunks[0]).size == 1
 
-    one_row = array_row_selection_peak_bytes(array, 1)
-    five_rows = array_row_selection_peak_bytes(array, 5)
-    assert one_row > array.chunks[0] * array.dtype.itemsize
-    assert five_rows > one_row
-
 
 def test_metadata_column_blocks_respect_source_chunk_boundaries():
     class ArrayMetadata:
@@ -395,30 +380,6 @@ def test_metadata_column_blocks_respect_source_chunk_boundaries():
         first_bin = request.start // array.chunks[0]
         last_bin = (request.stop - 1) // array.chunks[0]
         assert first_bin == last_bin
-
-
-def test_metadata_remove_trend_preserves_fixed_strategy():
-    from scarf.features.variability import fit_lowess
-
-    rng = np.random.default_rng(5)
-    means = rng.uniform(0.5, 20.0, 80)
-    variances = np.clip(means**1.5 + rng.normal(0, 0.05, len(means)), 0.1, None)
-    group = zarr.open_group(store=MemoryStore(), mode="w")
-    group.create_array("I", data=np.ones(len(means), dtype=bool))
-    group.create_array("means", data=means)
-    group.create_array("variances", data=variances)
-    table = metadata.MetaData(group)
-
-    observed = table.remove_trend("means", "variances", n_bins=8, lowess_frac=0.6)
-    expected = fit_lowess(
-        means,
-        variances,
-        n_bins=8,
-        lowess_frac=0.6,
-        bin_strategy="fixed",
-    )
-
-    np.testing.assert_array_equal(observed, expected)
 
 
 def test_metadata_row_blocks_remain_pickle_resolvable():
@@ -553,7 +514,19 @@ def test_resolve_grouping_validates_field_kind_and_missing_mask(monkeypatch):
         resolve_grouping(None, cells, CellField("group", kind="categorical"))
 
 
-def test_metadata_table_mount_fill_and_error_contracts():
+def test_case_insensitive_index_matches_the_text_of_any_value():
+    from scarf.metadata.table import CaseInsensitiveIndex
+
+    index = CaseInsensitiveIndex(["Gene", "GENE", None, 7, np.nan, "other"])
+
+    assert index.positions("gene") == [0, 1]
+    assert index.positions(7) == [3]
+    assert index.positions("missing") == []
+    index.positions("gene").append(9)
+    assert index.positions("gene") == [0, 1]
+
+
+def test_metadata_table_fill_and_error_contracts():
     empty = zarr.open_group(store=MemoryStore(), mode="w")
     with pytest.raises(ValueError, match="empty zarr group"):
         metadata.MetaData(empty)
@@ -575,39 +548,17 @@ def test_metadata_table_mount_fill_and_error_contracts():
     )
     with pytest.raises(ValueError):
         table._get_size(corrupt)
-    assert table._get_size(empty) == table.N
-    assert table._col_renamer("aux", "score") == "aux_score"
-    assert table._get_loc("I") == ("primary", "I")
+    with pytest.raises(ValueError, match="empty zarr group"):
+        table._get_size(empty)
+    assert table._has_column("I") and not table._has_column("unknown")
     with pytest.raises(KeyError, match="does not exist"):
-        table._get_loc("unknown")
+        table._get_array("unknown")
+    with pytest.raises(KeyError, match="does not exist"):
+        table.drop("unknown")
     with pytest.raises(TypeError, match="boolean type column"):
-        table._verify_bool("score")
+        table._bool_array("score")
+    assert list(table.locations) == ["primary"]
 
-    with pytest.raises(ValueError, match="already mounted"):
-        table.mount_location(primary, "primary")
-    short = zarr.open_group(store=MemoryStore(), mode="w")
-    short.create_array("value", data=np.arange(3), chunks=(2,))
-    with pytest.raises(ValueError, match="index size"):
-        table.mount_location(short, "short")
-    conflict = zarr.open_group(store=MemoryStore(), mode="w")
-    conflict.create_array("value", data=np.arange(4), chunks=(2,))
-    with pytest.raises(ValueError, match="conflict with existing names"):
-        table.mount_location(conflict, "x")
-
-    mounted = zarr.open_group(store=MemoryStore(), mode="w")
-    mounted.create_array("other", data=np.arange(4), chunks=(2,))
-    table.mount_location(mounted, "aux")
-    assert "aux_other" in table.columns
-    np.testing.assert_array_equal(table.fetch_all("aux_other"), np.arange(4))
-    np.testing.assert_array_equal(table.fetch_all("score"), np.arange(4.0))
-    with pytest.raises(ValueError, match="primary location"):
-        table.unmount_location("primary")
-    assert table.unmount_location("missing") is None
-    table.unmount_location("aux")
-    assert "aux" not in table.locations
-
-    with pytest.raises(KeyError, match="has not been mounted"):
-        table._save("value", np.arange(4), location="missing")
     with pytest.raises(ValueError, match="Expected shape"):
         table._save("value", np.arange(2))
 
@@ -624,6 +575,15 @@ def test_metadata_table_mount_fill_and_error_contracts():
     with pytest.raises(TypeError, match="value_targets"):
         table.get_index_by("a", "ids")
     np.testing.assert_array_equal(table.get_index_by(["A"], "ids", key="I"), [0])
+    # With a key, indices are positions among the selected rows.
+    np.testing.assert_array_equal(
+        table.get_index_by(["C", "a"], "ids", key="I"), [1, 0]
+    )
+    # Values and targets that are not text match as text instead of raising.
+    numeric = table.get_index_by([2, "missing"], "x_value")
+    assert numeric.dtype == np.int64
+    assert numeric.tolist() == [2]
+    assert table.get_index_by(["missing"], "ids").dtype == np.int64
     np.testing.assert_array_equal(
         table.index_to_bool(np.array([1]), invert=True), [True, False, True, True]
     )
@@ -643,3 +603,82 @@ def test_metadata_table_mount_fill_and_error_contracts():
 
     with pytest.raises(TypeError, match="boolean type column"):
         table.active_index("score")
+
+
+def _masked_metadata() -> metadata.MetaData:
+    group = zarr.open_group(store=MemoryStore(), mode="w")
+    group.create_array("I", data=np.ones(4, dtype=bool))
+    group.create_array("ids", data=np.array(["a", "b", "c", "d"]))
+    group.create_array("names", data=np.array(["a", "b", "c", "d"]))
+    for name, values in (
+        ("zeta", np.array([1, 0, 7, 2], dtype=np.int64)),
+        ("count", np.array([5, 0, 7, 2], dtype=np.int64)),
+        ("label", np.array(["a", "", "b", "a"])),
+        ("donor", np.array(["x", "", "y", "x"])),
+    ):
+        array = group.create_array(name, data=values)
+        group.create_array(
+            f"__scarf_missing__{name}", data=np.array([False, True, False, False])
+        )
+        array.attrs["missing_mask"] = f"__scarf_missing__{name}"
+    return metadata.MetaData(group)
+
+
+def test_metadata_columns_are_listed_in_a_stable_order():
+    table = _masked_metadata()
+
+    assert table.columns == ["I", "ids", "names", "count", "donor", "label", "zeta"]
+
+
+def test_sift_never_passes_rows_with_a_linked_missing_mask():
+    table = _masked_metadata()
+
+    np.testing.assert_array_equal(
+        table.sift("count", -1, 10), [True, False, True, True]
+    )
+    np.testing.assert_array_equal(
+        table.multi_sift(["count", "zeta"], [-1, -1], [10, 10]),
+        [True, False, True, True],
+    )
+
+
+def test_partition_helpers_treat_masked_rows_as_missing():
+    from scarf.metadata.queries import (
+        column_constant_within,
+        column_partition_digest,
+        columns_same_partition,
+        reduce_observation_units,
+    )
+
+    table = _masked_metadata()
+    digest = column_partition_digest(table, "label")
+
+    assert (digest.nMissing, digest.nLevels, digest.nRows) == (1, 3, 4)
+    assert columns_same_partition(table, "label", "donor")[0]
+    assert column_constant_within(table, "donor", "label")
+    units = reduce_observation_units(table, "donor", ["label"])
+    assert units["donor"].isna().tolist() == [False, True, False]
+    assert units["label"].isna().tolist() == [False, True, False]
+    assert units.dropna()["label"].tolist() == ["a", "b"]
+
+
+def test_insert_keeps_an_explicit_boolean_fill_value():
+    table = _metadata_fixture()
+
+    table.insert("keep", np.array([True, False, False]), fill_value=True)
+    table.insert("drop_rows", np.array([True, False, False]))
+
+    np.testing.assert_array_equal(table.fetch_all("keep"), [True, True, False, False])
+    np.testing.assert_array_equal(
+        table.fetch_all("drop_rows"), [True, False, False, False]
+    )
+
+
+def test_head_reads_only_the_requested_rows(monkeypatch):
+    table = _metadata_fixture()
+
+    def fail(_column):
+        raise AssertionError("head must not read whole columns")
+
+    monkeypatch.setattr(table, "fetch_all", fail)
+    assert table.head(2)["score"].tolist() == [0.5, 2.0]

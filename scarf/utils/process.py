@@ -1,6 +1,4 @@
 import resource
-import shlex
-import subprocess
 import sys
 import threading
 import os
@@ -8,8 +6,6 @@ from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-
-from .logging import logger
 
 
 type _ReadText = Callable[[Path], str]
@@ -126,17 +122,6 @@ class ProcessTreeRssMeasurement:
     sampling_error_count: int
     unavailable_reason: str | None
 
-    def to_stage_metrics(self) -> dict[str, int | float | str | None]:
-        return {
-            "rssBaselineBytes": self.baseline_bytes,
-            "rssPeakBytes": self.peak_bytes,
-            "rssIncrementalPeakBytes": self.incremental_peak_bytes,
-            "sampleIntervalSeconds": self.sample_interval_seconds,
-            "sampleCount": self.sample_count,
-            "samplingErrorCount": self.sampling_error_count,
-            "rssUnavailableReason": self.unavailable_reason,
-        }
-
 
 @contextmanager
 def sample_process_tree_rss(
@@ -212,18 +197,6 @@ def sample_process_tree_rss(
         sample()
 
 
-def system_call(command: str) -> None:
-    """Run a command and forward its output to Scarf's logger."""
-    process = subprocess.Popen(shlex.split(command), stdout=subprocess.PIPE)
-    while True:
-        output = process.stdout.readline()  # type: ignore[union-attr]
-        if process.poll() is not None:
-            break
-        if output:
-            logger.debug(output.strip())
-    process.poll()
-
-
 def _flush_output_streams() -> None:
     """Flush Python and C stdio buffers before file descriptors change."""
     for stream in (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__):
@@ -279,26 +252,3 @@ def process_rss_mb() -> float:
     except OSError:
         pass
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
-
-
-@contextmanager
-def rss_peak_tracker(
-    interval_s: float = 0.25,
-) -> Iterator[Callable[[], float]]:
-    """Track peak resident memory while the context is active."""
-    peak = process_rss_mb()
-    stop = threading.Event()
-
-    def sample_loop() -> None:
-        nonlocal peak
-        while not stop.wait(interval_s):
-            peak = max(peak, process_rss_mb())
-
-    thread = threading.Thread(target=sample_loop, daemon=True)
-    thread.start()
-    try:
-        yield lambda: peak
-    finally:
-        stop.set()
-        thread.join(timeout=2.0)
-        peak = max(peak, process_rss_mb())

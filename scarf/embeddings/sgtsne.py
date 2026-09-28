@@ -98,8 +98,6 @@ def run_sgtsne(
     """Run SG-t-SNE using the CLI or Python backend."""
     n_cells = graph.shape[0]
     ini_embed = np.asarray(ini_embed)
-    if ini_embed.shape == (n_cells * tsne_dims,):
-        ini_embed = ini_embed.reshape(n_cells, tsne_dims)
     if ini_embed.shape != (n_cells, tsne_dims):
         raise ValueError(
             f"ini_embed must have shape ({n_cells}, {tsne_dims}), got {ini_embed.shape}"

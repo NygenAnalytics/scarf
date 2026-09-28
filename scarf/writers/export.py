@@ -1,13 +1,36 @@
 import os
+import re
+from collections import defaultdict
 from typing import Any, cast
 
 import numpy as np
-import pandas as pd
 from scipy.sparse import csr_matrix
 
 from ..metadata.rows import apply_missing_mask, metadata_missing_mask
 from ..utils.compute import compute_with_progress
 from ..utils.logging import logger
+
+
+def _encoded(node: Any, encoding: str, version: str) -> Any:
+    """Record the AnnData element encoding on an HDF5 dataset or group."""
+    node.attrs["encoding-type"] = encoding
+    node.attrs["encoding-version"] = version
+    return node
+
+
+def _write_array(group: Any, name: str, values: np.ndarray) -> None:
+    """Write a numeric, boolean, or text array as an AnnData element."""
+    import h5py
+
+    if values.dtype.kind in "biufc":
+        _encoded(group.create_dataset(name, data=values), "array", "0.2.0")
+        return
+    text = values.astype(str).astype(object)
+    _encoded(
+        group.create_dataset(name, data=text, dtype=h5py.string_dtype()),
+        "string-array",
+        "0.2.0",
+    )
 
 
 def _write_masked_column(
@@ -22,17 +45,14 @@ def _write_masked_column(
     boolean encoding, and other columns become categoricals whose masked rows
     have code -1, as AnnData writes a run-aware export.
     """
-    import h5py
-
     if values.dtype.kind in {"f", "i", "u"}:
-        group.create_dataset(name, data=apply_missing_mask(values, missing))
+        _write_array(group, name, apply_missing_mask(values, missing))
         return
     column = group.create_group(name)
     if values.dtype.kind == "b":
-        column.attrs["encoding-type"] = "nullable-boolean"
-        column.attrs["encoding-version"] = "0.1.0"
-        column.create_dataset("values", data=values)
-        column.create_dataset("mask", data=missing)
+        _encoded(column, "nullable-boolean", "0.1.0")
+        _write_array(column, "values", values)
+        _write_array(column, "mask", missing)
         return
     categories, observed_codes = np.unique(
         values[~missing].astype(str),
@@ -40,15 +60,30 @@ def _write_masked_column(
     )
     codes = np.full(len(values), -1, dtype=np.int32)
     codes[~missing] = observed_codes
-    column.attrs["encoding-type"] = "categorical"
-    column.attrs["encoding-version"] = "0.2.0"
+    _encoded(column, "categorical", "0.2.0")
     column.attrs["ordered"] = False
-    column.create_dataset(
-        "categories",
-        data=categories.astype(object),
-        dtype=h5py.special_dtype(vlen=str),
-    )
-    column.create_dataset("codes", data=codes)
+    _write_array(column, "categories", categories)
+    _write_array(column, "codes", codes)
+
+
+def _embedding_groups(
+    columns: list[str],
+    assay_name: str,
+    prefixes: list[str],
+) -> dict[str, list[str]]:
+    """Group live embedding columns by prefix in numeric component order."""
+    components: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    for column in columns:
+        match = re.fullmatch(r"(.+?)(\d+)", column)
+        if match is None:
+            continue
+        prefix, component = match.groups()
+        if any(prefix.startswith(f"{assay_name}_{name}") for name in prefixes):
+            components[prefix].append((int(component), column))
+    return {
+        prefix: [column for _component, column in sorted(items)]
+        for prefix, items in components.items()
+    }
 
 
 def to_h5ad(
@@ -137,21 +172,18 @@ def to_h5ad(
         if missing is not None and missing.any():
             _write_masked_column(h5[group], col, d, missing)
             return
-        d_type = d.dtype
-        if np.issubdtype(d_type, np.number) or np.issubdtype(d_type, bool):
-            pass
-        else:
-            d_type = h5py.special_dtype(vlen=str)
         try:
-            h5[group].create_dataset(col, data=d.astype(d_type))
+            _write_array(h5[group], col, d)
         except TypeError:
             logger.warning(
                 f"Skipping metadata column {col!r} with unsupported dtype {d.dtype}"
             )
 
     with h5py.File(h5ad_filename, "w") as h5:
-        for i in ["X", "obs", "var", "obsm"]:
+        _encoded(h5, "anndata", "0.1.0")
+        for i in ["X", "obs", "var"]:
             h5.create_group(i)
+        _encoded(h5.create_group("obsm"), "dict", "0.1.0")
 
         # The stream defines CSR row boundaries, even when stored QC is stale.
         capacity = 0
@@ -216,31 +248,30 @@ def to_h5ad(
         for i, j in attrs.items():
             h5["X"].attrs[i] = j
 
-        out_cols = []
-        emb_cols = []
         if embeddings_cols is None:
             embeddings_cols = ["UMAP", "tSNE"]
+        embeddings = _embedding_groups(
+            list(assay.cells.columns),
+            assay.name,
+            embeddings_cols,
+        )
+        embedding_columns = {
+            column for columns in embeddings.values() for column in columns
+        }
+        out_cols = []
         for i in assay.cells.columns:
             if i == "ids":
                 save_attr("obs", "_index", "ids", assay.cells)
-                out_cols.append("_index")
-            else:
-                is_emb = False
-                if len(embeddings_cols) > 0:
-                    for j in embeddings_cols:
-                        if i.startswith(f"{assay.name}_{j}"):
-                            emb_cols.append(i)
-                            is_emb = True
-                            break
-                if is_emb is False:
-                    save_attr("obs", i, i, assay.cells)
-                    out_cols.append(i)
+            elif i not in embedding_columns:
+                save_attr("obs", i, i, assay.cells)
+                out_cols.append(i)
 
+        # The index element is named by ``_index`` and is not a column.
         attrs = {
             "_index": "_index",
             "column-order": np.array(out_cols, dtype=object),
             "encoding-type": "dataframe",
-            "encoding-version": "0.1.0",
+            "encoding-version": "0.2.0",
         }
         for i, j in attrs.items():
             h5["obs"].attrs[i] = j
@@ -249,7 +280,6 @@ def to_h5ad(
         for i in assay.feats.columns:
             if i == "ids":
                 save_attr("var", "_index", "ids", assay.feats)
-                out_cols.append("_index")
             elif i == "names":
                 save_attr("var", "gene_short_name", "names", assay.feats)
                 out_cols.append("gene_short_name")
@@ -261,20 +291,15 @@ def to_h5ad(
             "_index": "_index",
             "column-order": np.array(out_cols, dtype=object),
             "encoding-type": "dataframe",
-            "encoding-version": "0.1.0",
+            "encoding-version": "0.2.0",
         }
         for i, j in attrs.items():
             h5["var"].attrs[i] = j
 
-        if len(emb_cols) > 0:
-            emb_names = np.array(emb_cols)
-            c = pd.Series([x[:-1] for x in emb_names])
-            for i in c.unique():
-                matched = sorted(str(name) for name in emb_names[c == i])
-                data = np.array([assay.cells.fetch_all(x) for x in matched]).T
-                h5["obsm"].create_dataset(
-                    i.lower().replace(f"{assay.name.lower()}_", "X_"), data=data
-                )
+        for prefix, columns in embeddings.items():
+            data = np.array([assay.cells.fetch_all(x) for x in columns]).T
+            name = prefix.lower().replace(f"{assay.name.lower()}_", "X_")
+            _write_array(h5["obsm"], name, data)
 
     logger.info(
         f"Exported {assay.cells.N} cells and {assay.feats.N} features "
@@ -289,14 +314,18 @@ def to_mtx(assay: Any, mtx_directory: str, compress: bool = False) -> None:
     Args:
         assay: Scarf assay. For example: `ds.RNA`
         mtx_directory: Out directory where MTX file will be saved along with barcodes and features file
-        compress: If True, then the files are compressed and saved with .gz extension. (Default value: False).
+        compress: If True, then the files are compressed and saved with .gz extension, using Cell Ranger 3
+                  names; ``features.tsv.gz`` then also holds a feature-type column. (Default value: False).
 
     Returns:
         None
     """
+    import gzip
+
+    import pandas as pd
     from scipy.sparse import coo_matrix
 
-    import gzip
+    from ..assay.classification import is_rna_assay_type
 
     if os.path.isdir(mtx_directory) is False:
         os.mkdir(mtx_directory)
@@ -311,39 +340,56 @@ def to_mtx(assay: Any, mtx_directory: str, compress: bool = False) -> None:
     if compress:
         barcodes_fn = "barcodes.tsv.gz"
         features_fn = "features.tsv.gz"
-        h = gzip.open(os.path.join(mtx_directory, "matrix.mtx.gz"), "wt")
+        matrix_path = os.path.join(mtx_directory, "matrix.mtx.gz")
     else:
         barcodes_fn = "barcodes.tsv"
         features_fn = "genes.tsv"
-        h = open(os.path.join(mtx_directory, "matrix.mtx"), "w")
+        matrix_path = os.path.join(mtx_directory, "matrix.mtx")
     numeric_type = (
         "integer" if np.issubdtype(assay.rawData.dtype, np.integer) else "real"
     )
-    h.write(
-        f"%%MatrixMarket matrix coordinate {numeric_type} general\n% Generated by Scarf\n"
-    )
-    h.write(f"{assay.feats.N} {assay.cells.N} {tot_counts}\n")
-    s = 0
-    for values in assay.rawData.stream_blocks(
-        nthreads=assay.nthreads,
-        msg="Writing Matrix Market counts",
-    ):
-        block = coo_matrix(values)
-        df = pd.DataFrame(
-            {
-                "col": block.col + 1,
-                "row": block.row + s + 1,
-                "d": block.data,
-            }
+    with gzip.open(matrix_path, "wt") if compress else open(matrix_path, "w") as handle:
+        handle.write(
+            f"%%MatrixMarket matrix coordinate {numeric_type} general\n"
+            "% Generated by Scarf\n"
         )
-        df.to_csv(h, sep=" ", header=False, index=False, mode="a", lineterminator="\n")
-        s += block.shape[0]
-    h.close()
+        handle.write(f"{assay.feats.N} {assay.cells.N} {tot_counts}\n")
+        s = 0
+        for values in assay.rawData.stream_blocks(
+            nthreads=assay.nthreads,
+            msg="Writing Matrix Market counts",
+        ):
+            block = coo_matrix(values)
+            df = pd.DataFrame(
+                {
+                    "col": block.col + 1,
+                    "row": block.row + s + 1,
+                    "d": block.data,
+                }
+            )
+            df.to_csv(
+                handle,
+                sep=" ",
+                header=False,
+                index=False,
+                mode="a",
+                lineterminator="\n",
+            )
+            s += block.shape[0]
     assay.cells.to_pandas_dataframe(["ids"]).to_csv(
         os.path.join(mtx_directory, barcodes_fn), sep="\t", header=False, index=False
     )
 
-    assay.feats.to_pandas_dataframe(["ids", "names"]).to_csv(
+    features = assay.feats.to_pandas_dataframe(["ids", "names"])
+    if compress:
+        # Cell Ranger 3 feature files carry a third feature-type column.
+        if "feature_type" in assay.feats.columns:
+            features["feature_type"] = assay.feats.fetch_all("feature_type")
+        else:
+            features["feature_type"] = (
+                "Gene Expression" if is_rna_assay_type(assay) else assay.name
+            )
+    features.to_csv(
         os.path.join(mtx_directory, features_fn), sep="\t", header=False, index=False
     )
     logger.info(

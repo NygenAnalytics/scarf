@@ -27,8 +27,6 @@ class UnsupportedMatrixOperation(NotImplementedError):
             details += f" ({reason})"
         super().__init__("Unsupported matrix operation" + details)
         self.objectPath = object_path
-        self.object_path = object_path
         self.operation = operation
         self.className = class_name
-        self.class_name = class_name
         self.reason = reason

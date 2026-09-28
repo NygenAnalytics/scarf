@@ -6,15 +6,11 @@ from importlib.metadata import version
 from typing import Any, Literal
 
 import numpy as np
-import pandas as pd
 
 from ..metadata.selection import (
     CellField as CellField,
-    FeatureReduction as FeatureReduction,
     FeatureRef as FeatureRef,
-    LookupBy as LookupBy,
     NormalizationSpec as NormalizationSpec,
-    Standardize as Standardize,
     StudyDesign as StudyDesign,
 )
 
@@ -59,8 +55,8 @@ class ColorScale:
             low, high = self.quantiles
             if not (0.0 <= low < high <= 1.0):
                 raise ValueError("quantiles must satisfy 0 <= low < high <= 1")
-        if self.vmin is not None and self.vmax is not None and self.vmax < self.vmin:
-            raise ValueError("vmax must be greater than or equal to vmin")
+        if self.vmin is not None and self.vmax is not None and self.vmax <= self.vmin:
+            raise ValueError("vmax must be greater than vmin")
         if (
             self.vcenter is not None
             and self.vmin is not None
@@ -219,11 +215,3 @@ class PlotProvenance:
     renderer: str = "matplotlib"
     notes: tuple[str, ...] = ()
     extras: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(slots=True)
-class FeatureSummary:
-    """Bounded tables behind summary plots."""
-
-    aggregate: pd.DataFrame
-    per_sample: pd.DataFrame | None = None

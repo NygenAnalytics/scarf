@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from textwrap import dedent
 from typing import TYPE_CHECKING, Any
 
@@ -14,7 +15,7 @@ from ..config import AgentRunConfig
 from ..config.agent_exec import run_agent_sync
 from ..tools import artifact_reference, core_artifact_reference
 from ..types import StageStatus
-from .characterization import _SelectionBoundCells, characterize_covariates
+from .characterization import _SelectionBoundCells
 from .contracts import (
     CellQcPlan,
     ExperimentalContextDecision,
@@ -24,7 +25,6 @@ from .contracts import (
 )
 from .qc_evidence import (
     _derive_missing_percentage_artifacts,
-    _hto_artifact_map,
     _qc_driver,
     _source_ref,
 )
@@ -372,16 +372,11 @@ class ExperimentalContextAgent:
                 item.evidenceId for item in previous_context.batchSafety
             )
             deps.toolCalls = ["inspect_cell_covariates", "analyze_experimental_design"]
-            deps.designRounds = min(
-                2,
-                max(
-                    1,
-                    sum(
-                        item.toolName == "analyze_experimental_design"
-                        for item in previous_context.runInfo.toolCalls
-                    ),
-                ),
-            )
+            deps.designRounds = previous_context.designRounds
+            if previous_context.designDirections:
+                deps.characterizationInputs = {
+                    "directions": deepcopy(previous_context.designDirections)
+                }
             restored = True
         user_prompt = (
             dedent(
@@ -545,15 +540,7 @@ class ExperimentalContextAgent:
         decision = ExperimentalContextDecision.model_validate(execution.output)
         run_info = execution.runInfo
         characterization = deps.characterization
-        if characterization is None:
-            characterization = characterize_covariates(
-                store,
-                cellSelection=cell_selection,
-                studyContext=(f"{study_context}\nStudy objective: {study_objective}"),
-                model=None,
-                directions=direction_map,
-                groupingArtifacts=_hto_artifact_map(deps),
-            )
+        assert characterization is not None
         if characterization.status == "failed":
             status: StageStatus = "failed"
         elif decision.needsInput or decision.batchCorrection.action == "needsInput":
@@ -585,6 +572,10 @@ class ExperimentalContextAgent:
             htoIdentityArtifacts=deps.htoIdentityArtifacts,
             batchSafety=list(deps.batchSafety.values()),
             currentRepresentation=deps.currentRepresentation,
+            designRounds=deps.designRounds,
+            designDirections=deepcopy(
+                deps.characterizationInputs.get("directions", {})
+            ),
             notes=[
                 *characterization.notes,
                 *decision.needsInput,

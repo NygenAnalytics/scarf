@@ -6,6 +6,7 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import ArpackNoConvergence, svds
 
+from ..neighbors.diffusion import inverse_degree_diagonal
 from ..utils.logging import logger
 
 
@@ -116,10 +117,7 @@ def random_walk_laplacian_transpose(graph: csr_matrix) -> csr_matrix:
     if np.any(degree <= 0):
         raise ValueError("The retained graph contains isolated cells")
     n_cells = graph.shape[0]
-    inverse_degree = csr_matrix(
-        (1.0 / degree, (range(n_cells), range(n_cells))),
-        shape=(n_cells, n_cells),
-    )
+    inverse_degree = inverse_degree_diagonal(degree)
     identity = csr_matrix(
         (np.ones(n_cells), (range(n_cells), range(n_cells))),
         shape=(n_cells, n_cells),

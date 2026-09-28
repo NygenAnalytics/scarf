@@ -7,7 +7,6 @@ from zarr.storage import MemoryStore
 
 from scarf.datastore.datastore import DataStore
 from scarf.matrix import ChunkedArray
-from scarf.features.genomic.gff import GffReader
 from scarf.features.genomic.intervals import (
     binary_search,
     create_bed_from_coord_ids,
@@ -15,7 +14,7 @@ from scarf.features.genomic.intervals import (
 )
 from scarf.features.genomic.melding import create_counts_mat
 from scarf.storage.budget import ResourceBudget
-from scarf.storage.sharding import sparse_matrix_bytes
+from scarf.utils.arrays import sparse_matrix_bytes
 from scarf.writers import SparseToZarr, create_zarr_dataset
 
 
@@ -77,12 +76,24 @@ class _FakeRawData:
         row_mask=None,
         resident_bytes=0,
     ):
-        assert row_mask is None
+        # Mirrors ChunkedArray: a row mask skips blocks without selected rows
+        # and yields only the selected rows of the others.
         self.resident_bytes.append(resident_bytes)
-        yield from (np.asarray(block) for block in self.blocks)
+        start = 0
+        for block in self.blocks:
+            values = np.asarray(block)
+            stop = start + len(values)
+            if row_mask is None:
+                yield values
+            elif row_mask[start:stop].any():
+                yield values[row_mask[start:stop]]
+            start = stop
 
     def _max_decode_bytes(self):
         return 0
+
+    def _block_owned_bytes(self):
+        return self.chunksize[0] * self.shape[1] * self.dtype.itemsize
 
     def _with_block_size(self, block_size):
         values = np.vstack(self.blocks)
@@ -238,81 +249,6 @@ def _run_create_counts_mat(
         idf_cell_idx=idf_cell_idx,
     )
     return store[:]
-
-
-GFF_CONTENT = """##gff-version 3
-# test annotation
-chr1\t.\tgene\t1000\t2000\t.\t+\t.\tgene_id=gene_a;gene_name=GENE_A
-chr1\t.\tgene\t3000\t4500\t.\t-\t.\tgene_id=gene_b;gene_name=GENE_B
-chr2\t.\tgene\t500\t1500\t.\t+\t.\tgene_id=gene_c;gene_name=GENE_C
-"""
-
-
-def test_gff_reader_parses_header_and_streams(tmp_path):
-    gff_path = tmp_path / "test.gff"
-    gff_path.write_text(GFF_CONTENT)
-
-    reader = GffReader(str(gff_path), up_offset=500, down_offset=200, chunk_size=2)
-    assert len(reader.header) == 2
-    chunks = list(reader.stream())
-    assert len(chunks) == 2
-    assert chunks[0].shape[0] == 2
-    assert set(chunks[0][2]) == {"gene"}
-
-
-def test_gff_reader_promoter_and_body_coordinates(tmp_path):
-    gff_path = tmp_path / "coords.gff"
-    gff_path.write_text(GFF_CONTENT)
-    reader = GffReader(str(gff_path), up_offset=500, down_offset=200)
-    plus_row = pd.Series([None] * 9)
-    plus_row[3] = 1000
-    plus_row[4] = 2000
-    plus_row[6] = "+"
-
-    promoter_start, promoter_end = reader.get_promoter(plus_row)
-    assert promoter_start == 500
-    assert promoter_end == 1200
-
-    body_start, body_end = reader.get_body(plus_row)
-    assert body_start == 500
-    assert body_end == 2000
-
-    minus_row = plus_row.copy()
-    minus_row[3] = 3000
-    minus_row[4] = 4500
-    minus_row[6] = "-"
-    m_start, m_end = reader.get_promoter(minus_row)
-    assert m_start == 4499 - reader.down
-    assert m_end == 4500 + reader.up
-
-
-def test_gff_reader_get_ids_names():
-    row = pd.Series([None] * 9)
-    row[8] = "gene_id=abc;gene_name=XYZ"
-    gene_id, gene_name = GffReader.get_ids_names(row)
-    assert gene_id == "abc"
-    assert gene_name == "XYZ"
-
-
-def test_gff_reader_to_bed_promoter(tmp_path):
-    gff_path = tmp_path / "genes.gff"
-    gff_path.write_text(GFF_CONTENT)
-    bed_path = tmp_path / "out.bed"
-
-    reader = GffReader(str(gff_path))
-    reader.to_bed(str(bed_path), flavour="promoter")
-
-    bed = pd.read_csv(bed_path, sep="\t", header=None)
-    assert bed.shape[0] == 3
-    assert bed.shape[1] == 6
-
-
-def test_gff_reader_to_bed_rejects_unknown_flavour(tmp_path):
-    gff_path = tmp_path / "genes.gff"
-    gff_path.write_text(GFF_CONTENT)
-    reader = GffReader(str(gff_path))
-    with pytest.raises(ValueError, match="flavour"):
-        reader.to_bed(str(tmp_path / "out.bed"), flavour="exon")
 
 
 def test_create_bed_from_coord_ids_sorts_intervals():

@@ -6,10 +6,11 @@ import tempfile
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, overload
+from typing import Any, cast, overload
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.sparse import issparse, vstack
 
 from ._rds import (
     R_INT_NA,
@@ -43,44 +44,10 @@ from ._seurat import (
     fragment_source_from_slots,
     matrix_source_from_slots,
 )
+from ._seurat.sources import _index_runs
 
 
 _VECTOR_BLOCK_SIZE = 65_536
-_SCALAR_MATRIX_SLOTS = frozenset(
-    {
-        "asSparse",
-        "as_sparse",
-        "dataset",
-        "dir",
-        "directory",
-        "dtype",
-        "along",
-        "buffer_size",
-        "compressed",
-        "filepath",
-        "function",
-        "group",
-        "layer",
-        "name",
-        "mode",
-        "op",
-        "operation",
-        "path",
-        "right",
-        "sparseLayout",
-        "sparse_layout",
-        "threads",
-        "tile_width",
-        "transpose",
-        "type",
-        "version",
-        "fillValue",
-        "fill_value",
-        "invert",
-        "keepNonzero",
-        "keep_nonzero",
-    }
-)
 _MATRIX_PARAMETER_SLOTS = frozenset(
     {"Rvalue", "active_transforms", "col_params", "row_params"}
 )
@@ -162,7 +129,6 @@ class SeuratImportError(ValueError):
     ) -> None:
         self.message = message
         self.objectPath = object_path
-        self.object_path = object_path
         self.code = code
         self.context = dict(context or {})
         super().__init__(f"{message} at {object_path} [{code}]")
@@ -308,6 +274,8 @@ def _parse_cache_loader_list(value: str, *, object_path: str) -> tuple[str, ...]
 
 
 class SeuratStringVector(Sequence[str]):
+    """Validated identifiers read from an RDS character vector in bounded blocks."""
+
     def __init__(
         self,
         values: LazyStringVector,
@@ -319,19 +287,12 @@ class SeuratStringVector(Sequence[str]):
         self._document = document
         self.objectPath = object_path
 
-    @property
-    def shape(self) -> tuple[int]:
-        return (len(self),)
-
     def __len__(self) -> int:
         return len(self._values)
 
-    def _ensure_open(self) -> None:
+    def read_block(self, start: int, stop: int) -> tuple[str, ...]:
         if self._document.closed:
             raise RdsClosedError("RDS document is closed", path=self.objectPath)
-
-    def read_block(self, start: int, stop: int) -> tuple[str, ...]:
-        self._ensure_open()
         if start < 0 or stop < start or stop > len(self):
             raise IndexError(
                 f"identifier window [{start}, {stop}) is outside [0, {len(self)})"
@@ -341,13 +302,11 @@ class SeuratStringVector(Sequence[str]):
             for offset, value in enumerate(self._values.read_block(start, stop))
         )
 
-    def iter_blocks(
-        self, block_size: int = _VECTOR_BLOCK_SIZE
-    ) -> Iterator[tuple[str, ...]]:
-        if block_size <= 0:
-            raise ValueError("block_size must be positive")
-        for start in range(0, len(self), block_size):
-            yield self.read_block(start, min(len(self), start + block_size))
+    def __iter__(self) -> Iterator[str]:
+        for start in range(0, len(self), _VECTOR_BLOCK_SIZE):
+            yield from self.read_block(
+                start, min(len(self), start + _VECTOR_BLOCK_SIZE)
+            )
 
     @overload
     def __getitem__(self, key: int) -> str: ...
@@ -359,59 +318,12 @@ class SeuratStringVector(Sequence[str]):
         if isinstance(key, slice):
             start, stop, step = key.indices(len(self))
             if step == 1:
-                return self.read_block(start, stop)
+                return self.read_block(start, max(start, stop))
             return tuple(self[index] for index in range(start, stop, step))
         index = key + len(self) if key < 0 else key
         if index < 0 or index >= len(self):
             raise IndexError("identifier index out of range")
         return self.read_block(index, index + 1)[0]
-
-    def __eq__(self, other: object) -> bool:
-        return (
-            isinstance(other, Sequence)
-            and not isinstance(other, str | bytes)
-            and _identifiers_equal(self, other)
-        )
-
-
-class _IndexedStringVector(Sequence[str]):
-    def __init__(
-        self,
-        values: Sequence[str],
-        indexes: NDArray[np.int64],
-        *,
-        object_path: str,
-    ) -> None:
-        self._values = values
-        self._indexes = indexes
-        self.objectPath = object_path
-
-    def __len__(self) -> int:
-        return int(self._indexes.size)
-
-    def read_block(self, start: int, stop: int) -> tuple[str, ...]:
-        if start < 0 or stop < start or stop > len(self):
-            raise IndexError(
-                f"identifier window [{start}, {stop}) is outside [0, {len(self)})"
-            )
-        return tuple(self._values[int(index)] for index in self._indexes[start:stop])
-
-    @overload
-    def __getitem__(self, key: int) -> str: ...
-
-    @overload
-    def __getitem__(self, key: slice) -> tuple[str, ...]: ...
-
-    def __getitem__(self, key: int | slice) -> str | tuple[str, ...]:
-        if isinstance(key, slice):
-            start, stop, step = key.indices(len(self))
-            if step == 1:
-                return self.read_block(start, stop)
-            return tuple(self[index] for index in range(start, stop, step))
-        index = key + len(self) if key < 0 else key
-        if index < 0 or index >= len(self):
-            raise IndexError("identifier index out of range")
-        return self._values[int(self._indexes[index])]
 
     def __eq__(self, other: object) -> bool:
         return (
@@ -469,31 +381,139 @@ class SeuratMembership:
         result[self._positions[left:right] - start] = True
         return result
 
-    @overload
-    def __getitem__(self, key: int) -> bool: ...
 
-    @overload
-    def __getitem__(self, key: slice) -> NDArray[np.bool_]: ...
+class _CompactSequence:
+    """Block-readable R compact integer or real sequence (ALTREP)."""
 
-    def __getitem__(self, key: int | slice) -> bool | NDArray[np.bool_]:
-        if isinstance(key, slice):
-            start, stop, step = key.indices(len(self))
-            block = self.read_block(start, stop)
-            return block if step == 1 else block[::step]
-        index = key + len(self) if key < 0 else key
-        if index < 0 or index >= len(self):
-            raise IndexError("membership index out of range")
-        return bool(self.read_block(index, index + 1)[0])
-
-    def __array__(
+    def __init__(
         self,
-        dtype: Any | None = None,
-        copy: bool | None = None,
-    ) -> NDArray[Any]:
-        values = self.read_block(0, len(self))
-        if copy:
-            values = values.copy()
-        return values.astype(dtype, copy=False) if dtype is not None else values
+        length: int,
+        first: float,
+        step: float,
+        dtype: np.dtype[Any],
+    ) -> None:
+        self._length = length
+        self._first = first
+        self._step = step
+        self.dtype = dtype
+
+    def __len__(self) -> int:
+        return self._length
+
+    @property
+    def nbytes(self) -> int:
+        return self._length * self.dtype.itemsize
+
+    def read_block(self, start: int, stop: int) -> NDArray[Any]:
+        if start < 0 or stop < start or stop > self._length:
+            raise IndexError(
+                f"sequence window [{start}, {stop}) is outside [0, {self._length})"
+            )
+        offsets = np.arange(start, stop, dtype=np.float64)
+        return np.asarray(self._first + self._step * offsets).astype(self.dtype)
+
+    def __getitem__(self, index: int) -> Any:
+        return self.read_block(index, index + 1)[0]
+
+
+class _DeferredIntegerStrings:
+    """Block-readable ``as.character`` view of an integer vector (ALTREP)."""
+
+    def __init__(self, values: "LazyAtomicVector | _CompactSequence") -> None:
+        self._values = values
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def read_block(self, start: int, stop: int) -> tuple[str | None, ...]:
+        return tuple(
+            None if value == R_INT_NA else str(value)
+            for value in self._values.read_block(start, stop).tolist()
+        )
+
+    def __getitem__(self, index: int) -> str | None:
+        return self.read_block(index, index + 1)[0]
+
+
+type _AtomicValues = LazyAtomicVector | _CompactSequence
+type _StringValues = LazyStringVector | _DeferredIntegerStrings
+
+_WRAPPER_ALTREP_CLASSES = frozenset(
+    {
+        "wrap_complex",
+        "wrap_integer",
+        "wrap_logical",
+        "wrap_raw",
+        "wrap_real",
+        "wrap_string",
+    }
+)
+
+
+def _vector_values(node: RNode, *, object_path: str) -> tuple[RType, Any]:
+    """Resolve a vector node, expanding the ALTREP forms R serializes."""
+    if node.type is not RType.ALTREP or not isinstance(node.value, AltRepValue):
+        return node.type, node.value
+    altrep = node.value
+    state = altrep.state
+    name = altrep.class_name
+    if (
+        altrep.known
+        and name in _WRAPPER_ALTREP_CLASSES
+        and state.type is RType.PAIRLIST
+        and isinstance(state.value, PairValue)
+    ):
+        return _vector_values(state.value.car, object_path=object_path)
+    if (
+        altrep.known
+        and name in {"compact_intseq", "compact_realseq"}
+        and state.type is RType.REAL
+        and isinstance(state.value, LazyAtomicVector)
+        and len(state.value) == 3
+    ):
+        length, first, step = (float(value) for value in state.value.read_block(0, 3))
+        integer = name == "compact_intseq"
+        if (
+            not all(np.isfinite((length, first, step)))
+            or length < 0
+            or length != np.floor(length)
+            or (integer and (step not in {1.0, -1.0} or first != np.floor(first)))
+        ):
+            raise _error(
+                f"ALTREP {name} state is invalid",
+                object_path=object_path,
+                code="unsupported_altrep",
+                className=name,
+            )
+        return (
+            RType.INTEGER if integer else RType.REAL,
+            _CompactSequence(
+                int(length),
+                first,
+                step,
+                np.dtype(np.int32 if integer else np.float64),
+            ),
+        )
+    if (
+        altrep.known
+        and name == "deferred_string"
+        and state.type is RType.PAIRLIST
+        and isinstance(state.value, PairValue)
+    ):
+        argument_type, argument = _vector_values(
+            state.value.car, object_path=f"{object_path}/state"
+        )
+        if argument_type is RType.INTEGER and isinstance(
+            argument, LazyAtomicVector | _CompactSequence
+        ):
+            return RType.STRING, _DeferredIntegerStrings(argument)
+    raise _error(
+        f"ALTREP class {name!r} is not supported",
+        object_path=object_path,
+        code="unsupported_altrep",
+        className=name,
+        packageName=altrep.package_name,
+    )
 
 
 class SeuratMetadataColumn:
@@ -502,11 +522,12 @@ class SeuratMetadataColumn:
         *,
         name: str,
         kind: str,
-        values: LazyAtomicVector | LazyStringVector,
+        values: _AtomicValues | _StringValues,
         length: int,
         document: RdsDocument,
         source_indices: NDArray[np.int64] | None = None,
         levels: tuple[str, ...] = (),
+        level_codes: NDArray[np.int64] | None = None,
         ordered: bool = False,
         object_path: str,
     ) -> None:
@@ -519,10 +540,7 @@ class SeuratMetadataColumn:
         self._values = values
         self._document = document
         self._sourceIndices = source_indices
-
-    @property
-    def sourceIndices(self) -> NDArray[np.int64] | None:
-        return self._sourceIndices
+        self._levelCodes = level_codes
 
     def _ensure_open(self) -> None:
         if self._document.closed:
@@ -541,29 +559,21 @@ class SeuratMetadataColumn:
 
     def _read_atomic(self, start: int, stop: int) -> NDArray[Any]:
         values = self._values
-        if not isinstance(values, LazyAtomicVector):
+        if not isinstance(values, LazyAtomicVector | _CompactSequence):
             raise TypeError(f"{self.objectPath} is not an atomic column")
         if self._sourceIndices is None:
             return values.read_block(start, stop)
         indexes = self._sourceIndices[start:stop]
         output = np.empty(indexes.size, dtype=values.dtype)
-        run_start = 0
-        for position in range(1, indexes.size + 1):
-            finished = (
-                position == indexes.size
-                or indexes[position] != indexes[position - 1] + 1
+        for offset, run_start, run_stop in _index_runs(indexes):
+            output[offset : offset + run_stop - run_start] = values.read_block(
+                run_start, run_stop
             )
-            if not finished:
-                continue
-            source_start = int(indexes[run_start])
-            source_stop = int(indexes[position - 1]) + 1
-            output[run_start:position] = values.read_block(source_start, source_stop)
-            run_start = position
         return output
 
     def _read_strings(self, start: int, stop: int) -> tuple[str | bytes | None, ...]:
         values = self._values
-        if not isinstance(values, LazyStringVector):
+        if not isinstance(values, LazyStringVector | _DeferredIntegerStrings):
             raise TypeError(f"{self.objectPath} is not a character column")
         if self._sourceIndices is None:
             return tuple(values.read_block(start, stop))
@@ -584,6 +594,11 @@ class SeuratMetadataColumn:
         atomic_values = self._read_atomic(start, stop)
         if self.kind in {"integer", "factor"}:
             atomic_missing = atomic_values == R_INT_NA
+            if self._levelCodes is not None:
+                atomic_values = self._levelCodes[
+                    np.where(atomic_missing, 0, atomic_values)
+                ]
+                atomic_missing = atomic_values == 0
         elif self.kind == "logical":
             atomic_missing = atomic_values == R_INT_NA
             atomic_values = atomic_values == 1
@@ -594,23 +609,6 @@ class SeuratMetadataColumn:
         return SeuratColumnBlock(
             atomic_values,
             np.asarray(atomic_missing, dtype=np.bool_),
-        )
-
-    def read_decoded_block(
-        self, start: int, stop: int
-    ) -> tuple[str | bytes | int | float | bool | None, ...]:
-        block = self.read_block(start, stop)
-        if self.kind == "factor":
-            numeric = np.asarray(block.values)
-            return tuple(
-                None if block.missing[index] else self.levels[int(value) - 1]
-                for index, value in enumerate(numeric)
-            )
-        if isinstance(block.values, tuple):
-            return block.values
-        return tuple(
-            None if block.missing[index] else value.item()
-            for index, value in enumerate(block.values)
         )
 
 
@@ -634,7 +632,7 @@ class SeuratMetadata:
 class SeuratNumericVector:
     def __init__(
         self,
-        values: LazyAtomicVector,
+        values: "_AtomicValues",
         document: RdsDocument,
         *,
         object_path: str,
@@ -663,7 +661,7 @@ class SeuratNumericVector:
 class SeuratRMatrix:
     def __init__(
         self,
-        values: LazyAtomicVector,
+        values: "_AtomicValues",
         shape: tuple[int, int],
         *,
         row_ids: Sequence[str],
@@ -706,21 +704,26 @@ class SeuratRMatrix:
             output[:, column] = self._values.read_block(offset + start, offset + stop)
         return output
 
-    def read_cells(self, start: int, stop: int) -> NDArray[Any]:
-        return self.read_rows(start, stop)
-
 
 class _OwnedMatrixSource:
+    """Assay counts tied to an open RDS document.
+
+    Reads split into windows that fit ``max_block_bytes`` and reject R missing
+    values, which are not counts.
+    """
+
     def __init__(
         self,
         source: MatrixSource,
         document: RdsDocument,
         *,
         object_path: str,
+        max_block_bytes: int,
     ) -> None:
         self._source = source
         self._document = document
         self.objectPath = object_path
+        self._maxBlockBytes = max_block_bytes
 
     def _ensure_open(self) -> None:
         if self._document.closed:
@@ -761,13 +764,51 @@ class _OwnedMatrixSource:
         self._ensure_open()
         return self._source.resident_bytes
 
+    def _admissible_windows(self, start: int, stop: int) -> list[tuple[int, int]]:
+        if stop - start <= 1:
+            return [(start, stop)]
+        estimate = self._source.estimate_read_memory(start, stop)
+        if estimate.blockBytes <= self._maxBlockBytes:
+            return [(start, stop)]
+        middle = (start + stop) // 2
+        return self._admissible_windows(start, middle) + self._admissible_windows(
+            middle, stop
+        )
+
+    def _checked(self, block: MatrixBlock) -> MatrixBlock:
+        values = np.asarray(cast(Any, block).data if issparse(block) else block)
+        if values.dtype.kind == "f":
+            missing = bool(np.any(np.isnan(values)))
+        elif values.dtype == np.dtype(np.int32):
+            missing = bool(np.any(values == R_INT_NA))
+        else:
+            missing = False
+        if missing:
+            raise _error(
+                "assay counts contain missing values",
+                object_path=self.objectPath,
+                code="missing_count_value",
+            )
+        return block
+
     def read_cells(self, start: int, stop: int) -> MatrixBlock:
         self._ensure_open()
         if 0 <= start < stop <= self._source.shape[1]:
             from ._seurat.sources import prepare_matrix_sources
 
             prepare_matrix_sources(self._source)
-        return self._source.read_cells(start, stop)
+            windows = self._admissible_windows(start, stop)
+        else:
+            windows = [(start, stop)]
+        blocks = [
+            self._checked(self._source.read_cells(window_start, window_stop))
+            for window_start, window_stop in windows
+        ]
+        if len(blocks) == 1:
+            return blocks[0]
+        if self._source.is_sparse:
+            return cast(MatrixBlock, vstack(blocks, format="csr"))
+        return np.vstack([np.asarray(block) for block in blocks])
 
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
         self._ensure_open()
@@ -781,15 +822,10 @@ class SeuratAssay:
     counts: MatrixSource
     featureIds: Sequence[str]
     cellIds: Sequence[str]
-    assayCellIds: Sequence[str]
     cellMembership: SeuratMembership
     featureMetadata: SeuratMetadata
     notices: tuple[SeuratNotice, ...]
     objectPath: str
-
-    @property
-    def matrix(self) -> MatrixSource:
-        return self.counts
 
     @property
     def dimensions(self) -> tuple[int, int]:
@@ -805,10 +841,6 @@ class SeuratReduction:
     featureLoadings: SeuratRMatrix | None
     stdev: SeuratNumericVector | None
     assayUsed: str
-    key: str
-    globalReduction: bool
-    imported: bool
-    computedByScarf: bool
     notices: tuple[SeuratNotice, ...]
     objectPath: str
 
@@ -821,7 +853,7 @@ class SeuratReduction:
 class _LogMap:
     rowIds: Sequence[str]
     layerNames: Sequence[str]
-    values: LazyAtomicVector
+    values: "_AtomicValues"
     objectPath: str
     maximumIndexBytes: int
 
@@ -877,7 +909,12 @@ def _error(
     )
 
 
-def _as_text(value: str | bytes | None, *, object_path: str) -> str:
+def _as_text(
+    value: str | bytes | None,
+    *,
+    object_path: str,
+    allow_empty: bool = False,
+) -> str:
     if value is None:
         raise _error(
             "identifier is missing",
@@ -901,7 +938,7 @@ def _as_text(value: str | bytes | None, *, object_path: str) -> str:
             object_path=object_path,
             code="invalid_id_encoding",
         ) from error
-    if not value:
+    if not value and not allow_empty:
         raise _error(
             "identifier is empty",
             object_path=object_path,
@@ -1017,6 +1054,7 @@ def _identifier_database(
     )
     path = file.name
     file.close()
+    connection: sqlite3.Connection | None = None
     try:
         free_bytes = shutil.disk_usage(os.path.dirname(path)).free
         allowed_bytes = min(maximum_bytes, free_bytes)
@@ -1043,6 +1081,8 @@ def _identifier_database(
         )
         return connection, path
     except Exception:
+        if connection is not None:
+            connection.close()
         try:
             os.unlink(path)
         except FileNotFoundError:
@@ -1220,7 +1260,7 @@ def _read_integer_vector(
     node: RNode,
     *,
     object_path: str,
-    expected_length: int | None = None,
+    expected_length: int,
 ) -> NDArray[np.int64]:
     if node.type not in {RType.INTEGER, RType.LOGICAL} or not isinstance(
         node.value, LazyAtomicVector
@@ -1231,7 +1271,7 @@ def _read_integer_vector(
             code="invalid_integer_vector",
             rType=node.type.name,
         )
-    if expected_length is not None and len(node.value) != expected_length:
+    if len(node.value) != expected_length:
         raise _error(
             f"integer vector has length {len(node.value)}; expected {expected_length}",
             object_path=object_path,
@@ -1252,32 +1292,6 @@ def _read_text_scalar(node: RNode, *, object_path: str) -> str:
             actualLength=len(values),
         )
     return _as_text(values[0], object_path=object_path)
-
-
-def _read_logical_scalar(node: RNode, *, object_path: str) -> bool:
-    if node.type is not RType.LOGICAL or not isinstance(node.value, LazyAtomicVector):
-        raise _error(
-            "expected one logical value",
-            object_path=object_path,
-            code="invalid_logical_scalar",
-            rType=node.type.name,
-        )
-    if len(node.value) != 1:
-        raise _error(
-            f"expected one logical value, found {len(node.value)}",
-            object_path=object_path,
-            code="invalid_logical_scalar",
-            actualLength=len(node.value),
-        )
-    value = int(node.value[0])
-    if value not in {0, 1}:
-        raise _error(
-            "logical scalar cannot be missing",
-            object_path=object_path,
-            code="invalid_logical_scalar",
-            value=value,
-        )
-    return bool(value)
 
 
 def _node_has_content(node: RNode) -> bool:
@@ -1363,39 +1377,21 @@ def _matrix_dimnames(
     return axes[0], axes[1]
 
 
-def _unwrap_atomic(node: RNode, *, object_path: str) -> LazyAtomicVector:
-    if node.type in {
+def _unwrap_atomic(node: RNode, *, object_path: str) -> _AtomicValues:
+    value_type, values = _vector_values(node, object_path=object_path)
+    if value_type in {
         RType.LOGICAL,
         RType.INTEGER,
         RType.REAL,
         RType.COMPLEX,
         RType.RAW,
-    } and isinstance(node.value, LazyAtomicVector):
-        return node.value
-    if node.type is RType.ALTREP and isinstance(node.value, AltRepValue):
-        altrep = node.value
-        if altrep.known and altrep.class_name in {
-            "wrap_complex",
-            "wrap_integer",
-            "wrap_logical",
-            "wrap_raw",
-            "wrap_real",
-        }:
-            state = altrep.state
-            if state.type is RType.PAIRLIST and isinstance(state.value, PairValue):
-                return _unwrap_atomic(state.value.car, object_path=object_path)
-        raise _error(
-            f"ALTREP class {altrep.class_name!r} is not usable as an atomic matrix",
-            object_path=object_path,
-            code="unsupported_altrep",
-            className=altrep.class_name,
-            packageName=altrep.package_name,
-        )
+    } and isinstance(values, LazyAtomicVector | _CompactSequence):
+        return values
     raise _error(
         "expected an atomic vector",
         object_path=object_path,
         code="invalid_atomic_vector",
-        rType=node.type.name,
+        rType=value_type.name,
     )
 
 
@@ -1414,55 +1410,53 @@ def _matrix_slot_value(
         RType.REAL,
         RType.COMPLEX,
         RType.RAW,
+        RType.ALTREP,
     }:
+        value_type, values = _vector_values(node, object_path=object_path)
+        if value_type is RType.STRING:
+            return values
         atomic_values = _unwrap_atomic(node, object_path=object_path)
-        if name in _MATRIX_PARAMETER_SLOTS:
-            dimensions = get_attribute(node, "dim")
-            if dimensions is not None:
-                raw_shape = _unwrap_atomic(
-                    dimensions,
+        dimensions = get_attribute(node, "dim")
+        if name in _MATRIX_PARAMETER_SLOTS and dimensions is not None:
+            raw_shape = _unwrap_atomic(
+                dimensions,
+                object_path=f"{object_path}/dim",
+            )
+            if len(raw_shape) != 2:
+                raise _error(
+                    "matrix parameter has invalid dimensions",
                     object_path=f"{object_path}/dim",
+                    code="invalid_matrix_parameter",
                 )
-                shape_values = raw_shape.read_block(0, len(raw_shape))
-                if (
-                    shape_values.ndim != 1
-                    or shape_values.size != 2
-                    or np.any(shape_values < 0)
-                ):
-                    raise _error(
-                        "matrix parameter has invalid dimensions",
-                        object_path=f"{object_path}/dim",
-                        code="invalid_matrix_parameter",
-                    )
-                shape = (int(shape_values[0]), int(shape_values[1]))
-                if shape[0] * shape[1] != len(atomic_values):
-                    raise _error(
-                        "matrix parameter dimensions do not match its values",
-                        object_path=object_path,
-                        code="invalid_matrix_parameter",
-                    )
-                if atomic_values.nbytes > reader._maximumIndexBytes:
-                    raise _error(
-                        "matrix parameter exceeds its metadata memory budget",
-                        object_path=object_path,
-                        code="metadata_index_limit",
-                        requiredBytes=atomic_values.nbytes,
-                        maximumBytes=reader._maximumIndexBytes,
-                    )
-                return atomic_values.read_block(0, len(atomic_values)).reshape(
-                    shape,
-                    order="F",
+            shape_values = raw_shape.read_block(0, 2)
+            if np.any(shape_values < 0):
+                raise _error(
+                    "matrix parameter has invalid dimensions",
+                    object_path=f"{object_path}/dim",
+                    code="invalid_matrix_parameter",
                 )
-        if name in _SCALAR_MATRIX_SLOTS and len(atomic_values) == 1:
-            return atomic_values[0]
+            shape = (int(shape_values[0]), int(shape_values[1]))
+            if shape[0] * shape[1] != len(atomic_values):
+                raise _error(
+                    "matrix parameter dimensions do not match its values",
+                    object_path=object_path,
+                    code="invalid_matrix_parameter",
+                )
+            if atomic_values.nbytes > reader._maximumIndexBytes:
+                raise _error(
+                    "matrix parameter exceeds its metadata memory budget",
+                    object_path=object_path,
+                    code="metadata_index_limit",
+                    requiredBytes=atomic_values.nbytes,
+                    maximumBytes=reader._maximumIndexBytes,
+                )
+            return atomic_values.read_block(0, len(atomic_values)).reshape(
+                shape,
+                order="F",
+            )
         return atomic_values
-    if node.type is RType.ALTREP:
-        return _unwrap_atomic(node, object_path=object_path)
     if node.type is RType.STRING:
-        string_values = _string_values(node, object_path=object_path)
-        if name in _SCALAR_MATRIX_SLOTS and len(string_values) == 1:
-            return _as_text(string_values[0], object_path=object_path)
-        return string_values
+        return _string_values(node, object_path=object_path)
     if node.type is RType.CHAR:
         if isinstance(node.value, str | bytes):
             return _as_text(node.value, object_path=object_path)
@@ -1492,26 +1486,16 @@ def _matrix_slot_value(
         )
     if node.type is RType.VECTOR and isinstance(node.value, tuple):
         if name in {"Dimnames", "dimnames"}:
-            axes: list[LazyStringVector | None] = []
+            axes: list[Any] = []
             for index, axis in enumerate(node.value):
+                axis_path = f"{object_path}/{index}"
                 if axis.is_null:
                     axes.append(None)
+                elif axis.type is RType.STRING:
+                    axes.append(_string_values(axis, object_path=axis_path))
                 else:
-                    axes.append(
-                        _string_values(
-                            axis,
-                            object_path=f"{object_path}/{index}",
-                        )
-                    )
+                    axes.append(_unwrap_atomic(axis, object_path=axis_path))
             return tuple(axes)
-        if name == "sources":
-            return tuple(
-                reader._matrix_source_from_node(
-                    child,
-                    object_path=f"{object_path}/{index}",
-                )
-                for index, child in enumerate(node.value)
-            )
         if name == "fragments_list":
             return tuple(
                 reader._fragment_source_from_node(
@@ -1560,9 +1544,14 @@ def _frame_row_ids(
     *,
     document: RdsDocument,
     object_path: str,
-    expected_length: int,
+    expected_length: int | None,
     compact_ids: Sequence[str] | None,
 ) -> Sequence[str]:
+    """Return a data frame's row identifiers.
+
+    Explicit character row names are required unless ``compact_ids`` supplies the
+    identifiers for R's compact ``c(NA, -n)`` form.
+    """
     row_names = get_attribute(node, "row.names")
     if row_names is None:
         raise _error(
@@ -1579,7 +1568,7 @@ def _frame_row_ids(
             document,
             object_path=f"{object_path}/row.names",
         )
-        if len(result) != expected_length:
+        if expected_length is not None and len(result) != expected_length:
             raise _error(
                 f"data frame has {len(result)} row names; expected {expected_length}",
                 object_path=f"{object_path}/row.names",
@@ -1588,17 +1577,18 @@ def _frame_row_ids(
                 expected=expected_length,
             )
         return result
-    if row_names.type is RType.INTEGER:
+    if (
+        row_names.type is RType.INTEGER
+        and compact_ids is not None
+        and isinstance(row_names.value, LazyAtomicVector)
+        and len(row_names.value) == 2
+    ):
         compact = _read_integer_vector(
             row_names,
             object_path=f"{object_path}/row.names",
+            expected_length=2,
         )
-        if (
-            compact_ids is not None
-            and compact.shape == (2,)
-            and int(compact[0]) == R_INT_NA
-            and abs(int(compact[1])) == expected_length
-        ):
+        if int(compact[0]) == R_INT_NA and abs(int(compact[1])) == len(compact_ids):
             return compact_ids
     raise _error(
         "data frame row.names do not carry explicit identifiers",
@@ -1607,120 +1597,22 @@ def _frame_row_ids(
     )
 
 
-def _alignment(
+def _identifier_positions(
     source_ids: Sequence[str],
     target_ids: Sequence[str],
     *,
     object_path: str,
     scratch_dir: str | os.PathLike[str] | None,
     maximum_bytes: int,
+    bijective: bool,
+    missing_message: str = "metadata row identifiers conflict with the target axis",
+    missing_code: str = "metadata_id_conflict",
 ) -> NDArray[np.int64] | None:
-    if _identifiers_equal(source_ids, target_ids):
-        return None
-    if len(source_ids) * np.dtype(np.int64).itemsize > maximum_bytes:
-        raise _error(
-            "identifier alignment exceeds its memory budget",
-            object_path=object_path,
-            code="metadata_index_limit",
-            requiredBytes=len(source_ids) * np.dtype(np.int64).itemsize,
-            maximumBytes=maximum_bytes,
-        )
-    connection, path = _identifier_database(
-        scratch_dir=scratch_dir,
-        maximum_bytes=maximum_bytes,
-        object_path=object_path,
-    )
-    try:
-        _populate_identifier_database(
-            connection,
-            source_ids,
-            object_path=object_path,
-        )
-        connection.execute(
-            "CREATE TABLE target "
-            "(position INTEGER PRIMARY KEY, value TEXT NOT NULL UNIQUE)"
-        )
-        for start in range(0, len(target_ids), _VECTOR_BLOCK_SIZE):
-            stop = min(len(target_ids), start + _VECTOR_BLOCK_SIZE)
-            block = _identifier_block(
-                target_ids,
-                start,
-                stop,
-                object_path=object_path,
-            )
-            connection.executemany(
-                "INSERT INTO target(position, value) VALUES (?, ?)",
-                ((start + offset, value) for offset, value in enumerate(block)),
-            )
-            connection.commit()
-        missing = tuple(
-            str(row[0])
-            for row in connection.execute(
-                "SELECT target.value FROM target "
-                "LEFT JOIN ids ON ids.value = target.value "
-                "WHERE ids.value IS NULL LIMIT 5"
-            )
-        )
-        extra = tuple(
-            str(row[0])
-            for row in connection.execute(
-                "SELECT ids.value FROM ids "
-                "LEFT JOIN target ON target.value = ids.value "
-                "WHERE target.value IS NULL LIMIT 5"
-            )
-        )
-        if missing or extra or len(source_ids) != len(target_ids):
-            raise _error(
-                "metadata row identifiers conflict with the target axis",
-                object_path=object_path,
-                code="metadata_id_conflict",
-                missing=tuple(missing),
-                extra=extra,
-            )
-        result = np.empty(len(target_ids), dtype=np.int64)
-        cursor = connection.execute(
-            "SELECT ids.position FROM target "
-            "JOIN ids ON ids.value = target.value "
-            "ORDER BY target.position"
-        )
-        start = 0
-        while rows := cursor.fetchmany(_VECTOR_BLOCK_SIZE):
-            stop = start + len(rows)
-            result[start:stop] = np.fromiter(
-                (int(row[0]) for row in rows),
-                dtype=np.int64,
-                count=len(rows),
-            )
-            start = stop
-        if start != len(target_ids):
-            raise RuntimeError("identifier alignment row count changed")
-        return result
-    except sqlite3.IntegrityError as error:
-        raise _error(
-            "target identifiers are duplicated",
-            object_path=object_path,
-            code="duplicate_id",
-        ) from error
-    except sqlite3.OperationalError as error:
-        raise _error(
-            "identifier alignment exceeds its disk budget",
-            object_path=object_path,
-            code="metadata_index_limit",
-        ) from error
-    finally:
-        _close_identifier_database(connection, path)
+    """Map each source identifier to its position in the target identifiers.
 
-
-def _positions_in_target(
-    source_ids: Sequence[str],
-    target_ids: Sequence[str],
-    *,
-    object_path: str,
-    scratch_dir: str | os.PathLike[str] | None,
-    maximum_bytes: int,
-    missing_message: str = "Assay5 LogMap contains cells absent from global metadata",
-    missing_code: str = "assay_cell_id_conflict",
-) -> NDArray[np.int64]:
+    Returns None when the two axes are identical. A bijective mapping also rejects
+    target identifiers that the source does not contain.
+    """
     required_bytes = len(source_ids) * np.dtype(np.int64).itemsize
     if required_bytes > maximum_bytes:
         raise _error(
@@ -1731,7 +1623,7 @@ def _positions_in_target(
             maximumBytes=maximum_bytes,
         )
     if _identifiers_equal(source_ids, target_ids):
-        return np.arange(len(source_ids), dtype=np.int64)
+        return None
     connection, path = _identifier_database(
         scratch_dir=scratch_dir,
         maximum_bytes=maximum_bytes,
@@ -1768,7 +1660,7 @@ def _positions_in_target(
                 "WHERE ids.value IS NULL LIMIT 5"
             )
         )
-        if missing:
+        if missing or (bijective and len(source_ids) != len(target_ids)):
             raise _error(
                 missing_message,
                 object_path=object_path,
@@ -1795,7 +1687,7 @@ def _positions_in_target(
         return result
     except sqlite3.IntegrityError as error:
         raise _error(
-            "source identifiers are duplicated",
+            "identifiers are duplicated",
             object_path=object_path,
             code="duplicate_id",
         ) from error
@@ -1809,11 +1701,55 @@ def _positions_in_target(
         _close_identifier_database(connection, path)
 
 
+def _alignment(
+    source_ids: Sequence[str],
+    target_ids: Sequence[str],
+    *,
+    object_path: str,
+    scratch_dir: str | os.PathLike[str] | None,
+    maximum_bytes: int,
+) -> NDArray[np.int64] | None:
+    """Return, for each target row, the matching source row; None if identical."""
+    return _identifier_positions(
+        target_ids,
+        source_ids,
+        object_path=object_path,
+        scratch_dir=scratch_dir,
+        maximum_bytes=maximum_bytes,
+        bijective=True,
+    )
+
+
+def _positions_in_target(
+    source_ids: Sequence[str],
+    target_ids: Sequence[str],
+    *,
+    object_path: str,
+    scratch_dir: str | os.PathLike[str] | None,
+    maximum_bytes: int,
+    missing_message: str = "Assay5 LogMap contains cells absent from global metadata",
+    missing_code: str = "assay_cell_id_conflict",
+) -> NDArray[np.int64]:
+    positions = _identifier_positions(
+        source_ids,
+        target_ids,
+        object_path=object_path,
+        scratch_dir=scratch_dir,
+        maximum_bytes=maximum_bytes,
+        bijective=False,
+        missing_message=missing_message,
+        missing_code=missing_code,
+    )
+    if positions is None:
+        return np.arange(len(source_ids), dtype=np.int64)
+    return positions
+
+
 def _validate_column_values(
-    values: LazyAtomicVector,
+    values: _AtomicValues,
     *,
     kind: str,
-    levels: tuple[str, ...],
+    level_count: int,
     object_path: str,
 ) -> None:
     if kind not in {"logical", "factor"}:
@@ -1823,7 +1759,7 @@ def _validate_column_values(
         if kind == "logical":
             invalid = (block != 0) & (block != 1) & (block != R_INT_NA)
         else:
-            invalid = (block != R_INT_NA) & ((block < 1) | (block > len(levels)))
+            invalid = (block != R_INT_NA) & ((block < 1) | (block > level_count))
         if np.any(invalid):
             index = int(np.flatnonzero(invalid)[0])
             raise _error(
@@ -1832,6 +1768,41 @@ def _validate_column_values(
                 code=f"invalid_{kind}_value",
                 value=int(block[index]),
             )
+
+
+def _read_factor_levels(
+    node: RNode,
+    *,
+    object_path: str,
+    maximum_bytes: int,
+) -> tuple[str | None, ...]:
+    """Read factor levels; empty levels are kept and NA levels read as None."""
+    values = _string_values(node, object_path=object_path)
+    result: list[str | None] = []
+    used_bytes = 0
+    for start in range(0, len(values), _VECTOR_BLOCK_SIZE):
+        block = values.read_block(start, min(len(values), start + _VECTOR_BLOCK_SIZE))
+        for offset, value in enumerate(block):
+            level = (
+                None
+                if value is None
+                else _as_text(
+                    value,
+                    object_path=f"{object_path}/{start + offset}",
+                    allow_empty=True,
+                )
+            )
+            used_bytes += (0 if level is None else len(level.encode("utf-8"))) + 8
+            if used_bytes > maximum_bytes:
+                raise _error(
+                    "factor levels exceed their metadata memory budget",
+                    object_path=object_path,
+                    code="metadata_index_limit",
+                    requiredBytes=used_bytes,
+                    maximumBytes=maximum_bytes,
+                )
+            result.append(level)
+    return tuple(result)
 
 
 def _metadata_column(
@@ -1845,17 +1816,21 @@ def _metadata_column(
     maximum_metadata_bytes: int,
 ) -> SeuratMetadataColumn:
     classes = _class_names(node, object_path=object_path)
+    value_type, raw_values = _vector_values(node, object_path=object_path)
     levels: tuple[str, ...] = ()
+    level_codes: NDArray[np.int64] | None = None
+    level_count = 0
     ordered = "ordered" in classes
+    values: _AtomicValues | _StringValues
     if "factor" in classes:
-        if node.type is not RType.INTEGER or not isinstance(
-            node.value, LazyAtomicVector
+        if value_type is not RType.INTEGER or not isinstance(
+            raw_values, LazyAtomicVector | _CompactSequence
         ):
             raise _error(
                 "factor column must use integer codes",
                 object_path=object_path,
                 code="invalid_factor",
-                rType=node.type.name,
+                rType=value_type.name,
             )
         levels_node = get_attribute(node, "levels")
         if levels_node is None:
@@ -1864,32 +1839,46 @@ def _metadata_column(
                 object_path=f"{object_path}/levels",
                 code="missing_factor_levels",
             )
-        levels = _read_text_vector(
+        raw_levels = _read_factor_levels(
             levels_node,
             object_path=f"{object_path}/levels",
             maximum_bytes=maximum_metadata_bytes,
         )
+        level_count = len(raw_levels)
+        levels = tuple(level for level in raw_levels if level is not None)
         _validate_unique(levels, object_path=f"{object_path}/levels")
+        if len(levels) != level_count:
+            # R codes pointing at an NA level are missing values; the remaining
+            # levels are renumbered so codes stay one-based.
+            level_codes = np.zeros(level_count + 1, dtype=np.int64)
+            present = np.asarray([level is not None for level in raw_levels])
+            level_codes[1:][present] = np.arange(1, len(levels) + 1)
         kind = "factor"
-        values: LazyAtomicVector | LazyStringVector = node.value
-    elif node.type is RType.LOGICAL and isinstance(node.value, LazyAtomicVector):
+        values = raw_values
+    elif value_type is RType.LOGICAL and isinstance(raw_values, LazyAtomicVector):
         kind = "logical"
-        values = node.value
-    elif node.type is RType.INTEGER and isinstance(node.value, LazyAtomicVector):
+        values = raw_values
+    elif value_type is RType.INTEGER and isinstance(
+        raw_values, LazyAtomicVector | _CompactSequence
+    ):
         kind = "integer"
-        values = node.value
-    elif node.type is RType.REAL and isinstance(node.value, LazyAtomicVector):
+        values = raw_values
+    elif value_type is RType.REAL and isinstance(
+        raw_values, LazyAtomicVector | _CompactSequence
+    ):
         kind = "real"
-        values = node.value
-    elif node.type is RType.STRING and isinstance(node.value, LazyStringVector):
+        values = raw_values
+    elif value_type is RType.STRING and isinstance(
+        raw_values, LazyStringVector | _DeferredIntegerStrings
+    ):
         kind = "character"
-        values = node.value
+        values = raw_values
     else:
         raise _error(
-            f"metadata column uses unsupported R type {node.type.name}",
+            f"metadata column uses unsupported R type {value_type.name}",
             object_path=object_path,
             code="unsupported_metadata_type",
-            rType=node.type.name,
+            rType=value_type.name,
             classNames=classes,
         )
     if len(values) != length:
@@ -1900,11 +1889,11 @@ def _metadata_column(
             actual=len(values),
             expected=length,
         )
-    if isinstance(values, LazyAtomicVector):
+    if isinstance(values, LazyAtomicVector | _CompactSequence):
         _validate_column_values(
             values,
             kind=kind,
-            levels=levels,
+            level_count=level_count,
             object_path=object_path,
         )
     return SeuratMetadataColumn(
@@ -1915,6 +1904,7 @@ def _metadata_column(
         document=document,
         source_indices=alignment,
         levels=levels,
+        level_codes=level_codes,
         ordered=ordered,
         object_path=object_path,
     )
@@ -1989,19 +1979,31 @@ class SeuratReader:
         assays: Sequence[str] | None = None,
         assay_layers: Mapping[str, Sequence[str]] | None = None,
         reductions: Sequence[str] | None = None,
+        sidecar_root: str | os.PathLike[str] | None = None,
         sidecar_path_remaps: Mapping[str | os.PathLike[str], str | os.PathLike[str]]
         | None = None,
         matrix_limits: SourceLimits = DEFAULT_LIMITS,
     ) -> None:
-        self.source = source
+        """Open a serialized Seurat object.
+
+        Sidecar files such as BPCells directories and HDF5 seeds resolve inside
+        ``sidecar_root``, which defaults to the directory of a path ``source``.
+        A reader opened from a stream refuses sidecar-backed layers unless
+        ``sidecar_root`` is given.
+        """
         self._sidecarPathRemaps = sidecar_path_remaps
         self._matrixLimits = matrix_limits
         self._scratchDir = temp_dir
         self._maximumIndexBytes = matrix_limits.maxMetadataBytes
         self._requestedAssayLayers = assay_layers
-        self._rdsPath = (
-            os.fspath(source) if isinstance(source, str | os.PathLike) else None
-        )
+        if sidecar_root is not None:
+            self._sidecarRoot: Path | None = Path(os.fspath(sidecar_root))
+        elif isinstance(source, str | os.PathLike):
+            self._sidecarRoot = (
+                Path(os.fspath(source)).expanduser().resolve(strict=False).parent
+            )
+        else:
+            self._sidecarRoot = None
         self._document = open_rds(source, limits=limits, temp_dir=temp_dir)
         self._assayModels: dict[str, SeuratAssay] = {}
         self._assayErrors: dict[str, SeuratImportError] = {}
@@ -2014,17 +2016,9 @@ class SeuratReader:
             raise
 
     @property
-    def closed(self) -> bool:
-        return self._document.closed
-
-    @property
     def document(self) -> RdsDocument:
         self._ensure_open()
         return self._document
-
-    @property
-    def tempPaths(self) -> tuple[str, ...]:
-        return self._document.temp_paths
 
     @property
     def inspection(self) -> SeuratInspectResult:
@@ -2049,18 +2043,6 @@ class SeuratReader:
     def assayNames(self) -> tuple[str, ...]:
         return self._selectedAssays
 
-    @property
-    def reductionNames(self) -> tuple[str, ...]:
-        return self._selectedReductions
-
-    @property
-    def assays(self) -> tuple[SeuratAssay, ...]:
-        return tuple(self.get_assay(name) for name in self._selectedAssays)
-
-    @property
-    def reductions(self) -> tuple[SeuratReduction, ...]:
-        return tuple(self.get_reduction(name) for name in self._selectedReductions)
-
     def _ensure_open(self) -> None:
         if self._document.closed:
             raise RdsClosedError("RDS document is closed", path="$")
@@ -2068,9 +2050,11 @@ class SeuratReader:
     def close(self) -> None:
         from ._seurat.sources import release_temporary_storage
 
-        for assay in self._assayModels.values():
-            release_temporary_storage(assay.counts)
-        self._document.close()
+        try:
+            for assay in self._assayModels.values():
+                release_temporary_storage(assay.counts)
+        finally:
+            self._document.close()
 
     def _prepare_assay(self, name: str, max_bytes: int) -> None:
         from ._seurat.sources import prepare_matrix_sources
@@ -2088,9 +2072,6 @@ class SeuratReader:
         traceback: object | None,
     ) -> None:
         self.close()
-
-    def inspect(self) -> SeuratInspectResult:
-        return self.inspection
 
     def get_assay(self, name: str | None = None) -> SeuratAssay:
         self._ensure_open()
@@ -2300,7 +2281,7 @@ class SeuratReader:
         ):
             specification = {
                 "class": "MatrixH5",
-                "filepath": cached.path,
+                "path": cached.path,
                 "group": match.group("group"),
             }
         elif cached.package == "BPCells" and (
@@ -2313,7 +2294,7 @@ class SeuratReader:
         ):
             specification = {
                 "class": "AnnDataMatrixH5",
-                "filepath": cached.path,
+                "path": cached.path,
                 "group": match.group("group"),
             }
         elif cached.package == "HDF5Array" and (
@@ -2328,7 +2309,7 @@ class SeuratReader:
                 "class": "HDF5ArraySeed",
                 "filepath": cached.path,
                 "name": match.group("name"),
-                "asSparse": match.group("sparse") == "TRUE",
+                "as_sparse": match.group("sparse") == "TRUE",
             }
         elif cached.package == "HDF5Array" and (
             match := re.fullmatch(
@@ -2358,7 +2339,7 @@ class SeuratReader:
             return matrix_source_from_slots(
                 specification,
                 object_path=f"assays/{cached.assay}/layers/{cached.layer}",
-                rds_path=self._rdsPath,
+                sidecar_root=self._sidecarRoot,
                 absolute_prefix_remaps=self._sidecarPathRemaps,
                 limits=self._matrixLimits,
             )
@@ -2422,13 +2403,7 @@ class SeuratReader:
             metadata_node,
             document=self._document,
             object_path="meta.data",
-            expected_length=len(metadata_node.value[0].value)
-            if metadata_node.value
-            and isinstance(
-                metadata_node.value[0].value,
-                LazyAtomicVector | LazyStringVector,
-            )
-            else self._frame_length(metadata_node, object_path="meta.data"),
+            expected_length=None,
             compact_ids=None,
         )
         _validate_unique_ids(
@@ -2518,46 +2493,6 @@ class SeuratReader:
             cellMetadata=metadata_inspection,
             activeIdentity=active_inspection,
             notices=root_notices,
-        )
-
-    @staticmethod
-    def _frame_length(node: RNode, *, object_path: str) -> int:
-        if node.type is not RType.VECTOR or not isinstance(node.value, tuple):
-            raise _error(
-                "data.frame columns are not stored as a vector",
-                object_path=object_path,
-                code="invalid_data_frame",
-            )
-        if not node.value:
-            row_names = get_attribute(node, "row.names")
-            if row_names is None:
-                return 0
-            if row_names.type is RType.STRING and isinstance(
-                row_names.value, LazyStringVector
-            ):
-                return len(row_names.value)
-            compact = _read_integer_vector(
-                row_names,
-                object_path=f"{object_path}/row.names",
-            )
-            if (
-                compact.shape == (2,)
-                and int(compact[0]) == R_INT_NA
-                and int(compact[1]) <= 0
-            ):
-                return -int(compact[1])
-            raise _error(
-                "cannot determine data.frame row count",
-                object_path=object_path,
-                code="invalid_data_frame",
-            )
-        first = node.value[0].value
-        if isinstance(first, LazyAtomicVector | LazyStringVector):
-            return len(first)
-        raise _error(
-            "first data.frame column is not block-readable",
-            object_path=f"{object_path}/0",
-            code="unsupported_metadata_type",
         )
 
     @staticmethod
@@ -2883,7 +2818,7 @@ class SeuratReader:
             return fragment_source_from_slots(
                 {"class": classes, "slots": slots},
                 object_path=object_path,
-                rds_path=self._rdsPath,
+                sidecar_root=self._sidecarRoot,
                 absolute_prefix_remaps=self._sidecarPathRemaps,
                 limits=self._matrixLimits,
             )
@@ -2922,9 +2857,15 @@ class SeuratReader:
                 "Dimnames": (None, None),
             }
         elif node.type is RType.S4:
+            renamed = bool(classes) and classes[0] in {
+                "DelayedSetDimnames",
+                "RenameDims",
+            }
             slots: dict[str, Any] = {}
             for name, value in iter_attributes(node):
-                if name in {"class", "Dimnames", "dimnames"}:
+                if name == "class" or (
+                    name in {"Dimnames", "dimnames"} and not renamed
+                ):
                     continue
                 slots[name] = _matrix_slot_value(
                     value,
@@ -2932,15 +2873,6 @@ class SeuratReader:
                     object_path=f"{object_path}/{name}",
                     reader=self,
                 )
-            if classes and classes[0] in {
-                "dgeMatrix",
-                "lgeMatrix",
-                "ngeMatrix",
-                "igeMatrix",
-                "denseMatrix",
-            }:
-                if "dim" not in slots and "Dim" in slots:
-                    slots["dim"] = slots["Dim"]
             specification = {"class": classes, "slots": slots}
         else:
             raise _error(
@@ -2954,7 +2886,7 @@ class SeuratReader:
             return matrix_source_from_slots(
                 specification,
                 object_path=object_path,
-                rds_path=self._rdsPath,
+                sidecar_root=self._sidecarRoot,
                 absolute_prefix_remaps=self._sidecarPathRemaps,
                 limits=self._matrixLimits,
             )
@@ -2994,26 +2926,21 @@ class SeuratReader:
         )
         assert feature_ids is not None
         assert cell_ids is not None
+        if (len(feature_ids), len(cell_ids)) != source.shape:
+            raise _error(
+                "counts Dimnames conflict with the matrix dimensions",
+                object_path=f"{object_path}/counts/Dimnames",
+                code="dimnames_length_mismatch",
+                dimensions=source.shape,
+                rowIds=len(feature_ids),
+                columnIds=len(cell_ids),
+            )
         _validate_unique_ids(
             feature_ids,
             object_path=f"{object_path}/counts/Dimnames/0",
             scratch_dir=self._scratchDir,
             maximum_bytes=self._maximumIndexBytes,
         )
-        source_row_conflict = source.row_names is not None and not _identifiers_equal(
-            source.row_names,
-            feature_ids,
-        )
-        source_column_conflict = (
-            source.column_names is not None
-            and not _identifiers_equal(source.column_names, cell_ids)
-        )
-        if source_row_conflict or source_column_conflict:
-            raise _error(
-                "matrix source identifiers conflict with serialized Dimnames",
-                object_path=f"{object_path}/counts/Dimnames",
-                code="matrix_id_conflict",
-            )
         if not _identifiers_equal(cell_ids, self.cellIds):
             raise _error(
                 "legacy assay cell identifiers conflict with global cell order",
@@ -3062,6 +2989,7 @@ class SeuratReader:
             source,
             self._document,
             object_path=f"{object_path}/counts",
+            max_block_bytes=self._matrixLimits.maxBlockBytes,
         )
         return SeuratAssay(
             name=name,
@@ -3069,7 +2997,6 @@ class SeuratReader:
             counts=owned,
             featureIds=feature_ids,
             cellIds=self.cellIds,
-            assayCellIds=cell_ids,
             cellMembership=SeuratMembership(len(self.cellIds)),
             featureMetadata=feature_metadata,
             notices=tuple(notices),
@@ -3332,33 +3259,6 @@ class SeuratReader:
                     featureMembership=int(feature_indices.size),
                     cellMembership=int(assay_cell_indices.size),
                 )
-            expected_features = _IndexedStringVector(
-                features.rowIds,
-                feature_indices,
-                object_path=f"{layer_path}/Dimnames/0",
-            )
-            expected_cells = _IndexedStringVector(
-                cells.rowIds,
-                assay_cell_indices,
-                object_path=f"{layer_path}/Dimnames/1",
-            )
-            if source.row_names is not None and not _identifiers_equal(
-                source.row_names,
-                expected_features,
-            ):
-                raise _error(
-                    "layer feature identifiers conflict with feature LogMap",
-                    object_path=f"{layer_path}/Dimnames/0",
-                    code="layer_feature_id_conflict",
-                )
-            if source.column_names is not None and not _identifiers_equal(
-                source.column_names, expected_cells
-            ):
-                raise _error(
-                    "layer cell identifiers conflict with cell LogMap",
-                    object_path=f"{layer_path}/Dimnames/1",
-                    code="layer_cell_id_conflict",
-                )
             layer_global_positions = global_positions[assay_cell_indices]
             resident_index_bytes += int(layer_global_positions.nbytes)
             if resident_index_bytes * 4 > self._maximumIndexBytes:
@@ -3372,8 +3272,8 @@ class SeuratReader:
             placements.append(
                 LayerPlacement(
                     source,
-                    feature_indices=feature_indices,
-                    cell_indices=layer_global_positions,
+                    featureIndices=feature_indices,
+                    cellIndices=layer_global_positions,
                     name=layer_name,
                 )
             )
@@ -3475,6 +3375,7 @@ class SeuratReader:
             stitched,
             self._document,
             object_path=f"{object_path}/layers",
+            max_block_bytes=self._matrixLimits.maxBlockBytes,
         )
         return SeuratAssay(
             name=name,
@@ -3482,7 +3383,6 @@ class SeuratReader:
             counts=owned,
             featureIds=features.rowIds,
             cellIds=self.cellIds,
-            assayCellIds=cells.rowIds,
             cellMembership=SeuratMembership(
                 len(self.cellIds),
                 global_positions,
@@ -3497,7 +3397,6 @@ class SeuratReader:
         node: RNode,
         *,
         object_path: str,
-        require_names: bool,
     ) -> SeuratRMatrix:
         values = _unwrap_atomic(node, object_path=object_path)
         shape = _matrix_dimensions(node, object_path=object_path)
@@ -3505,12 +3404,10 @@ class SeuratReader:
             node,
             document=self._document,
             object_path=object_path,
-            require_both=require_names,
+            require_both=True,
         )
-        if rows is None:
-            rows = tuple(str(index) for index in range(shape[0]))
-        if columns is None:
-            columns = tuple(str(index) for index in range(shape[1]))
+        assert rows is not None
+        assert columns is not None
         if len(rows) != shape[0] or len(columns) != shape[1]:
             raise _error(
                 "matrix dimensions conflict with Dimnames",
@@ -3520,19 +3417,18 @@ class SeuratReader:
                 rowIds=len(rows),
                 columnIds=len(columns),
             )
-        if require_names:
-            _validate_unique_ids(
-                rows,
-                object_path=f"{object_path}/Dimnames/0",
-                scratch_dir=self._scratchDir,
-                maximum_bytes=self._maximumIndexBytes,
-            )
-            _validate_unique_ids(
-                columns,
-                object_path=f"{object_path}/Dimnames/1",
-                scratch_dir=self._scratchDir,
-                maximum_bytes=self._maximumIndexBytes,
-            )
+        _validate_unique_ids(
+            rows,
+            object_path=f"{object_path}/Dimnames/0",
+            scratch_dir=self._scratchDir,
+            maximum_bytes=self._maximumIndexBytes,
+        )
+        _validate_unique_ids(
+            columns,
+            object_path=f"{object_path}/Dimnames/1",
+            scratch_dir=self._scratchDir,
+            maximum_bytes=self._maximumIndexBytes,
+        )
         return SeuratRMatrix(
             values,
             shape,
@@ -3573,7 +3469,6 @@ class SeuratReader:
         embeddings = self._r_matrix(
             _require_slot(node, "cell.embeddings", object_path=object_path),
             object_path=f"{object_path}/cell.embeddings",
-            require_names=True,
         )
         if not _identifiers_equal(embeddings.rowIds, self.cellIds):
             raise _error(
@@ -3586,14 +3481,6 @@ class SeuratReader:
             object_path=f"{object_path}/assay.used",
         )
         assay = self._assay_for_reduction(assay_used)
-        key = _read_text_scalar(
-            _require_slot(node, "key", object_path=object_path),
-            object_path=f"{object_path}/key",
-        )
-        global_reduction = _read_logical_scalar(
-            _require_slot(node, "global", object_path=object_path),
-            object_path=f"{object_path}/global",
-        )
 
         loadings_node = get_slot(node, "feature.loadings")
         feature_loadings: SeuratRMatrix | None = None
@@ -3617,7 +3504,6 @@ class SeuratReader:
                 feature_loadings = self._r_matrix(
                     loadings_node,
                     object_path=f"{object_path}/feature.loadings",
-                    require_names=True,
                 )
                 if not _identifiers_equal(
                     feature_loadings.columnIds,
@@ -3705,10 +3591,6 @@ class SeuratReader:
             featureLoadings=feature_loadings,
             stdev=stdev,
             assayUsed=assay_used,
-            key=key,
-            globalReduction=global_reduction,
-            imported=True,
-            computedByScarf=False,
             notices=tuple(notices),
             objectPath=object_path,
         )
@@ -3722,6 +3604,7 @@ def inspect_seurat(
     assays: Sequence[str] | None = None,
     assay_layers: Mapping[str, Sequence[str]] | None = None,
     reductions: Sequence[str] | None = None,
+    sidecar_root: str | os.PathLike[str] | None = None,
     sidecar_path_remaps: Mapping[str | os.PathLike[str], str | os.PathLike[str]]
     | None = None,
     matrix_limits: SourceLimits = DEFAULT_LIMITS,
@@ -3733,6 +3616,7 @@ def inspect_seurat(
         assays=assays,
         assay_layers=assay_layers,
         reductions=reductions,
+        sidecar_root=sidecar_root,
         sidecar_path_remaps=sidecar_path_remaps,
         matrix_limits=matrix_limits,
     ) as reader:

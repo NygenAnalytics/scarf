@@ -1,8 +1,9 @@
 """Lazy blockwise matrix operations over NumPy and Zarr arrays."""
 
+import warnings
 from collections.abc import Callable, Iterator
 from functools import partial
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import numpy as np
 import zarr
@@ -15,21 +16,37 @@ from ..storage.budget import (
 )
 from ..storage.io_policy import StorageIoPolicy
 from ..storage.geometry import ArrayGeometry, array_geometry
-from ._indexing import is_contiguous, local_positions
+from ..storage.partition import is_contiguous
+from ._indexing import local_positions
 from ._operations import (
     _Op,
     _binary_op,
     _classify_operand,
-    _matmul_op,
     _unary_op,
 )
 from ._reductions import ReductionOp, _Reduction
-from .blocks import Block
 
 __all__ = ["ChunkedArray"]
 
 type Backing = np.ndarray | zarr.Array
 type BlockFn = Callable[[int, int, int], NDArray[Any]]
+type Axis = Literal[0, 1] | None
+
+# Ufunc keywords a lazy operation can honour; others would be silently dropped.
+_UFUNC_KEYWORDS = frozenset({"dtype", "out"})
+
+
+def _reduction_axis(axis: int | None) -> Axis:
+    """Normalize a reduction axis of a two-dimensional matrix."""
+    if axis is None:
+        return None
+    if isinstance(axis, bool) or not isinstance(axis, int | np.integer):
+        raise TypeError("axis must be an integer or None")
+    if axis in (0, -2):
+        return 0
+    if axis in (1, -1):
+        return 1
+    raise np.exceptions.AxisError(int(axis), 2)
 
 
 class ChunkedArray:
@@ -43,7 +60,6 @@ class ChunkedArray:
         rows: np.ndarray | None = None,
         cols: np.ndarray | None = None,
         ops: list[_Op] | None = None,
-        out_cols: int | None = None,
         block_size: int | None = None,
         nthreads: int = 1,
         resources: ResourceBudget | None = None,
@@ -65,8 +81,7 @@ class ChunkedArray:
         self._is_numpy = is_numpy
         backing_rows, backing_cols = backing.shape
         self._n_rows = backing_rows if self._rows is None else int(self._rows.size)
-        base_cols = backing_cols if self._cols is None else int(self._cols.size)
-        self._out_cols = base_cols if out_cols is None else int(out_cols)
+        self._n_cols = backing_cols if self._cols is None else int(self._cols.size)
         if block_size is None:
             if self._is_numpy:
                 block_size = self._n_rows if self._n_rows > 0 else 1
@@ -98,20 +113,13 @@ class ChunkedArray:
 
     @property
     def shape(self) -> tuple[int, int]:
-        return (self._n_rows, self._out_cols)
-
-    @property
-    def out_cols(self) -> int:
-        return self._out_cols
+        return (self._n_rows, self._n_cols)
 
     @property
     def dtype(self) -> np.dtype[Any]:
         if not self._ops:
             return self._backing.dtype
-        base_columns = (
-            int(self._backing.shape[1]) if self._cols is None else int(self._cols.size)
-        )
-        sample = np.empty((0, base_columns), dtype=self._backing.dtype)
+        sample = np.empty((0, self._n_cols), dtype=self._backing.dtype)
         for operation in self._ops:
             sample = operation.apply(sample, 0, 0)
         return sample.dtype
@@ -120,21 +128,12 @@ class ChunkedArray:
     def chunksize(self) -> tuple[int, int]:
         return (
             min(self._block_size, self._n_rows) if self._n_rows else self._block_size,
-            self._out_cols,
+            self._n_cols,
         )
 
     @property
     def numblocks(self) -> tuple[int, int]:
         return (self._n_block_count(), 1)
-
-    @property
-    def chunks(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        sizes = tuple(end - start for start, end in self._ranges())
-        return (sizes if sizes else (0,), (self._out_cols,))
-
-    @property
-    def nthreads(self) -> int:
-        return self._nthreads
 
     def __len__(self) -> int:
         return self._n_rows
@@ -218,7 +217,7 @@ class ChunkedArray:
     def _block_owned_bytes(self) -> int:
         """Bytes one materialized row block owns, excluding its chunk decode."""
         rows = min(self._block_size, max(1, self._n_rows))
-        elements = rows * max(1, self._out_cols)
+        elements = rows * max(1, self._n_cols)
         input_bytes = elements * max(1, int(self._backing.dtype.itemsize))
         output_bytes = elements * max(1, int(self.dtype.itemsize))
         return input_bytes + (output_bytes if self._ops else 0)
@@ -227,40 +226,41 @@ class ChunkedArray:
         """Bytes one row block owns where its reader decodes one chunk at a time."""
         return self._block_owned_bytes() + self._max_decode_bytes()
 
-    def _map_blocks(
+    def _block_results(
         self,
         fn: BlockFn,
         nthreads: int | None,
         msg: str | None,
-        result_bytes: int | None = None,
-    ) -> list[NDArray[Any]]:
+        result_bytes: int,
+    ) -> Iterator[NDArray[Any]]:
+        """Yield ``fn(index, start, end)`` for every row block in row order.
+
+        ``result_bytes`` bounds what the caller retains from the results.
+        """
         from ..storage.execution import (
             ExecutionReport,
             WorkShape,
             plan_operation,
             record_execution_report,
         )
-        from ..storage.parallel import map_shards, in_shard_context
+        from ..storage.parallel import in_shard_context, stream_shards
 
         ranges = self._ranges()
+        if not ranges:
+            return
         workers = self._nthreads if nthreads is None else max(1, int(nthreads))
         within = 1
         io_concurrency: int | None = None
         planned = None
         if self._resources is not None:
-            retained = (
-                self._n_rows * self._out_cols * self.dtype.itemsize
-                if result_bytes is None
-                else result_bytes
-            )
             planned = plan_operation(
                 ResourceBudget(
                     self._resources.memoryBytes, min(workers, self._resources.workers)
                 ),
                 WorkShape(
-                    nUnits=max(1, len(ranges)),
+                    nUnits=len(ranges),
                     unitBytes=self._block_task_bytes(),
-                    residentBytes=2 * retained + self._resident_bytes(),
+                    residentBytes=2 * result_bytes + self._resident_bytes(),
                     ordered=False,
                 ),
                 policy=self._io,
@@ -270,14 +270,24 @@ class ChunkedArray:
             io_concurrency = planned.ioConcurrency
         if in_shard_context():
             workers = 1
-        results = map_shards(
-            ranges,
-            fn,
+        workers = min(workers, len(ranges))
+
+        def produce(item: tuple[int, tuple[int, int]]) -> NDArray[Any]:
+            index, (start, end) = item
+            return np.asarray(fn(index, start, end))
+
+        completed = 0
+        for result in stream_shards(
+            list(enumerate(ranges)),
+            produce,
             workers=workers,
             within_block_threads=within,
-            io_concurrency=io_concurrency,
+            io_concurrency=workers if io_concurrency is None else io_concurrency,
             msg=msg,
-        )
+            total=len(ranges),
+        ):
+            completed += 1
+            yield result
         if planned is not None:
             record_execution_report(
                 ExecutionReport(
@@ -286,10 +296,23 @@ class ChunkedArray:
                     actualReadWorkers=workers,
                     actualComputeWorkers=workers,
                     actualWriteWorkers=1,
-                    unitsCompleted=len(results),
+                    unitsCompleted=completed,
                 )
             )
-        return [np.asarray(result) for result in results]
+
+    def _accumulate(
+        self,
+        fn: BlockFn,
+        nthreads: int | None,
+        msg: str | None,
+        result_bytes: int,
+    ) -> NDArray[Any]:
+        """Add block results in row order, holding one running total."""
+        total: NDArray[Any] | None = None
+        for part in self._block_results(fn, nthreads, msg, result_bytes):
+            total = part if total is None else total + part
+        assert total is not None
+        return total
 
     def stream_blocks(
         self,
@@ -393,29 +416,20 @@ class ChunkedArray:
                 )
             )
 
-    def map_blocks(
-        self,
-        fn: BlockFn,
-        nthreads: int | None = None,
-        msg: str | None = None,
-    ) -> list[NDArray[Any]]:
-        """Map a function over row blocks in order."""
-        return self._map_blocks(fn, nthreads, msg)
-
     def compute(
         self,
         nthreads: int | None = None,
         msg: str | None = None,
     ) -> np.ndarray:
         if self._n_rows == 0:
-            return np.empty((0, self._out_cols), dtype=self.dtype)
+            return np.empty((0, self._n_cols), dtype=self.dtype)
 
         blocks = self._stream_blocks(
             nthreads=nthreads,
             msg=msg,
             prefetch=None,
             row_mask=None,
-            resident_bytes=self._n_rows * self._out_cols * self.dtype.itemsize,
+            resident_bytes=self._n_rows * self._n_cols * self.dtype.itemsize,
         )
         try:
             first = next(blocks)
@@ -448,34 +462,29 @@ class ChunkedArray:
             retained[id(array)] = array.nbytes
         return sum(retained.values())
 
-    def __array__(self, dtype: np.dtype[Any] | None = None) -> np.ndarray:
-        array = self.compute()
-        return array.astype(dtype) if dtype is not None else array
-
-    @property
-    def blocks(self) -> Iterator[Block]:
-        from ..utils.shutdown import shutdown_checkpoint
-
-        for start, end in self._ranges():
-            shutdown_checkpoint()
-            yield Block(self, start, end)
+    def __array__(
+        self,
+        dtype: np.dtype[Any] | None = None,
+        copy: bool | None = None,
+    ) -> np.ndarray:
+        if copy is False:
+            raise ValueError(
+                "A ChunkedArray is computed from its blocks, so converting it "
+                "always creates a new array"
+            )
+        return np.asarray(self.compute(), dtype=dtype)
 
     def _with_io(self, array: "ChunkedArray") -> "ChunkedArray":
         array._io = self._io
         return array
 
-    def _with_op(
-        self,
-        operation: _Op,
-        out_cols: int | None = None,
-    ) -> "ChunkedArray":
+    def _with_op(self, operation: _Op) -> "ChunkedArray":
         return self._with_io(
             ChunkedArray(
                 self._backing,
                 rows=self._rows,
                 cols=self._cols,
                 ops=self._ops + [operation],
-                out_cols=self._out_cols if out_cols is None else out_cols,
                 block_size=self._block_size,
                 nthreads=self._nthreads,
                 resources=self._resources,
@@ -492,7 +501,6 @@ class ChunkedArray:
                 rows=self._rows,
                 cols=self._cols,
                 ops=self._ops,
-                out_cols=self._out_cols,
                 block_size=block_size,
                 nthreads=self._nthreads,
                 resources=self._resources,
@@ -509,12 +517,17 @@ class ChunkedArray:
         other: object,
         side: str,
     ) -> "ChunkedArray":
+        if isinstance(other, ChunkedArray):
+            raise TypeError(
+                "Operations between two ChunkedArrays are not lazy; combine "
+                "their row blocks explicitly"
+            )
         if isinstance(other, _Reduction):
             other = other._arr
         kind, operand = _classify_operand(
             other,
             self._n_rows,
-            self._out_cols,
+            self._n_cols,
         )
         return self._with_op(_binary_op(func, operand, side, kind))
 
@@ -525,7 +538,11 @@ class ChunkedArray:
         *inputs: Any,
         **kwargs: Any,
     ) -> Any:
-        if method != "__call__" or kwargs.get("out") is not None:
+        if (
+            method != "__call__"
+            or kwargs.get("out") is not None
+            or not _UFUNC_KEYWORDS.issuperset(kwargs)
+        ):
             return NotImplemented
         # A requested dtype sets the ufunc's computation dtype for each block,
         # so integer blocks can be scaled or logged without a cast copy.
@@ -576,17 +593,6 @@ class ChunkedArray:
     def __le__(self, o: object) -> "ChunkedArray":
         return self._binary(np.less_equal, o, "left")
 
-    def dot(self, b: np.ndarray | NDArray[Any]) -> "ChunkedArray":
-        operand_array = np.asarray(b)
-        return self._with_op(
-            _matmul_op(operand_array),
-            out_cols=operand_array.shape[1],
-        )
-
-    @staticmethod
-    def _local_positions(key: object, length: int) -> np.ndarray | None:
-        return local_positions(key, length)
-
     def __getitem__(self, key: object) -> "ChunkedArray":
         if isinstance(key, tuple):
             if len(key) != 2:
@@ -598,19 +604,17 @@ class ChunkedArray:
         rows = self._rows
         cols = self._cols
         operations = self._ops
-        out_cols = self._out_cols
         n_rows = self._n_rows
 
-        col_positions = self._local_positions(col_key, out_cols)
+        col_positions = local_positions(col_key, self._n_cols)
         if col_positions is not None:
             operations = [
                 operation.subset_cols(col_positions) for operation in operations
             ]
             base_cols = cols if cols is not None else np.arange(self._backing.shape[1])
             cols = base_cols[col_positions]
-            out_cols = int(col_positions.size)
 
-        row_positions = self._local_positions(row_key, n_rows)
+        row_positions = local_positions(row_key, n_rows)
         if row_positions is not None:
             operations = [
                 operation.subset_rows(row_positions) for operation in operations
@@ -626,7 +630,6 @@ class ChunkedArray:
                 rows=rows,
                 cols=cols,
                 ops=operations,
-                out_cols=out_cols,
                 block_size=block_size,
                 nthreads=self._nthreads,
                 resources=self._resources,
@@ -635,16 +638,13 @@ class ChunkedArray:
         )
 
     def sum(self, axis: int | None = None) -> _Reduction:
-        return _Reduction(self, "sum", axis)
+        return _Reduction(self, "sum", _reduction_axis(axis))
 
     def mean(self, axis: int | None = None) -> _Reduction:
-        return _Reduction(self, "mean", axis)
+        return _Reduction(self, "mean", _reduction_axis(axis))
 
     def var(self, axis: int | None = None) -> _Reduction:
-        return _Reduction(self, "var", axis)
-
-    def std(self, axis: int | None = None) -> _Reduction:
-        return _Reduction(self, "std", axis)
+        return _Reduction(self, "var", _reduction_axis(axis))
 
     def mean_and_std(
         self,
@@ -653,29 +653,30 @@ class ChunkedArray:
         msg: str | None = None,
     ) -> tuple[NDArray[Any], NDArray[Any]]:
         """Compute column mean and standard deviation in one pass."""
-        if axis != 0:
+        if _reduction_axis(axis) != 0:
             raise NotImplementedError("mean_and_std only supports axis=0")
+        if self._n_rows == 0:
+            missing = np.full(self._n_cols, np.nan)
+            return missing, missing.copy()
 
         def summarize(_: int, start: int, end: int) -> NDArray[Any]:
             return np.asarray(sum_and_squared_sum(self._materialize_range(start, end)))
 
-        parts = self._map_blocks(
+        total, squared_total = self._accumulate(
             summarize,
             nthreads,
             msg,
-            result_bytes=2 * self._out_cols * 8 * (len(self._ranges()) + 4),
+            result_bytes=2 * 2 * self._n_cols * 8,
         )
-        stacked = np.sum(parts, axis=0)
-        total, squared_total = stacked[0], stacked[1]
         mean = total / self._n_rows
         variance = squared_total / self._n_rows - np.square(mean)
         return np.asarray(mean), np.asarray(np.sqrt(np.clip(variance, 0, None)))
 
     def count_nonzero(self, axis: int | None = None) -> _Reduction:
-        return _Reduction(self, "count_nonzero", axis)
+        return _Reduction(self, "count_nonzero", _reduction_axis(axis))
 
     def argmax(self, axis: int | None = None) -> _Reduction:
-        return _Reduction(self, "argmax", axis)
+        return _Reduction(self, "argmax", _reduction_axis(axis))
 
     def _reduce(
         self,
@@ -684,118 +685,104 @@ class ChunkedArray:
         nthreads: int | None,
         msg: str | None,
     ) -> np.ndarray:
-        if axis == 1 or axis is None:
-            return self._reduce_axis1(op, axis, nthreads, msg)
-        return self._reduce_axis0(op, nthreads, msg)
+        if op == "argmax" and axis == 0:
+            raise NotImplementedError("argmax(axis=0) is not supported")
+        if op == "argmax" and axis is None:
+            raise ValueError("Reduction argmax with axis=None is not supported")
+        if self._n_rows == 0:
+            return self._reduce_empty(op, axis)
+        if axis == 1:
+            return self._reduce_rows(op, nthreads, msg)
+        if axis is None:
+            return self._reduce_all(op, nthreads, msg)
+        return self._reduce_columns(op, nthreads, msg)
 
-    def _reduce_axis1(
+    def _reduce_empty(self, op: ReductionOp, axis: int | None) -> np.ndarray:
+        """Reduce a matrix without rows exactly as NumPy reduces one."""
+        empty = np.empty((0, self._n_cols), dtype=self.dtype)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            if op == "count_nonzero":
+                return np.asarray(np.count_nonzero(empty, axis=axis))
+            return np.asarray(getattr(empty, op)(axis=axis))
+
+    def _reduce_rows(
         self,
         op: ReductionOp,
-        axis: int | None,
         nthreads: int | None,
         msg: str | None,
     ) -> np.ndarray:
         def reduce_block(_: int, start: int, end: int) -> NDArray[Any]:
             array = self._materialize_range(start, end)
-            if op == "sum":
-                return np.asarray(array.sum(axis=axis))
-            if op == "mean":
-                return np.asarray(
-                    array.sum() if axis is None else array.mean(axis=axis)
-                )
-            if op == "var":
-                if axis is None:
-                    return np.asarray(sum_and_squared_sum(array, axis=None))
-                return np.asarray(array.var(axis=axis))
-            if op == "std":
-                if axis is None:
-                    return np.asarray(sum_and_squared_sum(array, axis=None))
-                return np.asarray(array.std(axis=axis))
             if op == "count_nonzero":
-                return np.asarray(np.count_nonzero(array, axis=axis))
-            if op == "argmax":
-                return np.asarray(array.argmax(axis=axis))
-            raise ValueError(f"Unknown reduction {op}")
+                return np.asarray(np.count_nonzero(array, axis=1))
+            return np.asarray(getattr(array, op)(axis=1))
 
-        retained = 2 * len(self._ranges()) * 8 if axis is None else self._n_rows * 8
-        parts = self._map_blocks(reduce_block, nthreads, msg, result_bytes=retained)
-        if axis is None:
-            array = np.asarray(parts)
-            if op == "sum":
-                return np.asarray(array.sum())
-            if op == "mean":
-                return np.asarray(array.sum() / (self._n_rows * self._out_cols))
-            if op in ("var", "std"):
-                total, squared_total = np.sum(parts, axis=0)
-                count = self._n_rows * self._out_cols
-                mean = total / count
-                variance = squared_total / count - np.square(mean)
-                if op == "std":
-                    return np.asarray(np.sqrt(max(float(variance), 0.0)))
-                return np.asarray(variance)
-            if op == "count_nonzero":
-                return np.asarray(array.sum())
-            raise ValueError(f"Reduction {op} with axis=None is not supported")
-        return np.concatenate(parts)
+        result: np.ndarray | None = None
+        offset = 0
+        for part in self._block_results(
+            reduce_block,
+            nthreads,
+            msg,
+            result_bytes=self._n_rows * 8,
+        ):
+            if result is None:
+                result = np.empty(self._n_rows, dtype=part.dtype)
+            result[offset : offset + len(part)] = part
+            offset += len(part)
+        assert result is not None
+        return result
 
-    def _reduce_axis0(
+    def _reduce_all(
         self,
         op: ReductionOp,
         nthreads: int | None,
         msg: str | None,
     ) -> np.ndarray:
-        if op in ("sum", "mean"):
+        def reduce_block(_: int, start: int, end: int) -> NDArray[Any]:
+            array = self._materialize_range(start, end)
+            if op == "count_nonzero":
+                return np.asarray(np.count_nonzero(array))
+            if op == "var":
+                return np.asarray(sum_and_squared_sum(array, axis=None))
+            return np.asarray(array.sum())
 
-            def sum_block(_: int, start: int, end: int) -> NDArray[Any]:
-                array = self._materialize_range(start, end)
-                return np.asarray(array.sum(axis=0))
+        total = self._accumulate(reduce_block, nthreads, msg, result_bytes=2 * 16)
+        count = self._n_rows * self._n_cols
+        if op == "mean":
+            return np.asarray(total / count)
+        if op == "var":
+            mean = total[0] / count
+            return np.asarray(total[1] / count - np.square(mean))
+        return np.asarray(total)
 
-            parts = self._map_blocks(
-                sum_block,
-                nthreads,
-                msg,
-                result_bytes=self._out_cols * 8 * (len(self._ranges()) + 2),
-            )
-            total = np.sum(parts, axis=0)
-            if op == "mean":
-                return np.asarray(total / self._n_rows)
-            return np.asarray(total)
-        if op == "count_nonzero":
-
-            def count_block(_: int, start: int, end: int) -> NDArray[Any]:
-                array = self._materialize_range(start, end)
+    def _reduce_columns(
+        self,
+        op: ReductionOp,
+        nthreads: int | None,
+        msg: str | None,
+    ) -> np.ndarray:
+        def reduce_block(_: int, start: int, end: int) -> NDArray[Any]:
+            array = self._materialize_range(start, end)
+            if op == "count_nonzero":
                 return np.asarray(np.count_nonzero(array, axis=0))
+            if op == "var":
+                return np.asarray(sum_and_squared_sum(array))
+            return np.asarray(array.sum(axis=0))
 
-            parts = self._map_blocks(
-                count_block,
-                nthreads,
-                msg,
-                result_bytes=self._out_cols * 8 * (len(self._ranges()) + 1),
-            )
-            return np.asarray(np.sum(parts, axis=0))
-        if op in ("var", "std"):
-
-            def variance_block(_: int, start: int, end: int) -> NDArray[Any]:
-                return np.asarray(
-                    sum_and_squared_sum(self._materialize_range(start, end))
-                )
-
-            parts = self._map_blocks(
-                variance_block,
-                nthreads,
-                msg,
-                result_bytes=2 * self._out_cols * 8 * (len(self._ranges()) + 4),
-            )
-            stacked = np.sum(parts, axis=0)
-            total, squared_total = stacked[0], stacked[1]
-            mean = total / self._n_rows
-            variance = squared_total / self._n_rows - np.square(mean)
-            if op == "std":
-                return np.asarray(np.sqrt(np.clip(variance, 0, None)))
-            return np.asarray(variance)
-        if op == "argmax":
-            raise NotImplementedError("argmax(axis=0) is not supported")
-        raise ValueError(f"Unknown reduction {op}")
+        width = 2 if op == "var" else 1
+        total = self._accumulate(
+            reduce_block,
+            nthreads,
+            msg,
+            result_bytes=2 * width * self._n_cols * 8,
+        )
+        if op == "mean":
+            return np.asarray(total / self._n_rows)
+        if op == "var":
+            mean = total[0] / self._n_rows
+            return np.asarray(total[1] / self._n_rows - np.square(mean))
+        return np.asarray(total)
 
     def __repr__(self) -> str:
         return (

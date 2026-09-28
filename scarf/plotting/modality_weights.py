@@ -6,12 +6,22 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ..storage.artifacts import ArtifactRef, artifact_group, inspect_artifact
+from ..storage.artifacts import (
+    ArtifactRef,
+    artifact_group,
+    inspect_artifact,
+    parse_artifact_ref,
+)
 from ..storage.types import as_zarr_array
 from ._contracts import ColorScale, PlotProvenance
 from ._data import _artifact_cell_selection, _resolve_layout
 from ._deps import require_matplotlib
-from ._figure import LegendSpec, PlotResult, normalize_axes_target
+from ._figure import (
+    LegendSpec,
+    PlotResult,
+    close_figures_on_error,
+    normalize_axes_target,
+)
 from ._style import (
     DEFAULT_PANEL_INCHES,
     DEFAULT_RASTERIZE_THRESHOLD,
@@ -20,19 +30,10 @@ from ._style import (
     default_point_edgewidth,
     default_point_size,
     finish_embedding_axes,
+    padded_square_limits,
     scatter_edgecolor,
-    square_axis_limits,
     theme_context,
 )
-
-
-def _artifact_ref(value: Any, *, label: str) -> ArtifactRef:
-    if not isinstance(value, Mapping):
-        raise ValueError(f"WNN graph has no valid {label} input")
-    try:
-        return ArtifactRef.from_dict(value)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(f"WNN graph has no valid {label} input") from exc
 
 
 def _wnn_assays(
@@ -72,13 +73,15 @@ def _wnn_assays(
         raw_source = inputs[f"source_{index}"]
         if not isinstance(raw_source, Mapping):
             raise ValueError("WNN graph source provenance is malformed")
-        neighbors = _artifact_ref(
+        neighbors = parse_artifact_ref(
             raw_source.get("neighbors"),
-            label=f"source_{index}.neighbors",
+            f"source_{index}.neighbors",
+            owner=graph,
         )
-        coordinates = _artifact_ref(
+        coordinates = parse_artifact_ref(
             raw_source.get("coordinates"),
-            label=f"source_{index}.coordinates",
+            f"source_{index}.coordinates",
+            owner=graph,
         )
         if neighbors.kind != "neighbors" or neighbors.assay != assay:
             raise ValueError("WNN neighbor source order does not match its assays")
@@ -95,7 +98,7 @@ def _wnn_assays(
         raise ValueError("WNN graph payload has no ordered assay list")
     if list(stored_assays) != assays:
         raise ValueError("WNN graph payload assay order disagrees with provenance")
-    return assays, _artifact_cell_selection(store, graph, label="WNN graph")
+    return assays, _artifact_cell_selection(store, graph)
 
 
 def _load_weights(
@@ -127,20 +130,7 @@ def _load_weights(
     return weights
 
 
-def _layout_limits(
-    x: np.ndarray,
-    y: np.ndarray,
-) -> tuple[tuple[float, float], tuple[float, float]]:
-    x_span = float(x.max() - x.min())
-    y_span = float(y.max() - y.min())
-    x_pad = 0.05 * (x_span if x_span > 0 else 1.0)
-    y_pad = 0.05 * (y_span if y_span > 0 else 1.0)
-    return square_axis_limits(
-        (float(x.min() - x_pad), float(x.max() + x_pad)),
-        (float(y.min() - y_pad), float(y.max() + y_pad)),
-    )
-
-
+@close_figures_on_error
 def modality_weights(
     store: Any,
     *,
@@ -186,7 +176,7 @@ def modality_weights(
 
     x = coordinates[:, 0]
     y = coordinates[:, 1]
-    xlim, ylim = _layout_limits(x, y)
+    xlim, ylim = padded_square_limits(x, y)
     resolved_columns = len(assays) if n_columns is None else n_columns
     if (
         isinstance(resolved_columns, bool)
@@ -268,7 +258,6 @@ def modality_weights(
             LegendSpec(
                 kind="colorbar",
                 label="Modality weight",
-                scale_key="modality_weight",
                 extras={"assays": assays},
             ),
         ),

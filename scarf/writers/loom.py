@@ -1,3 +1,4 @@
+from collections.abc import Iterator
 from typing import Any
 
 import numpy as np
@@ -34,6 +35,8 @@ class LoomToZarr:
                 unitBytes and chunkBytes plan is used.
         io: Optional explicit read, compute, and write widths. Unset values
             stay under automatic planning.
+        assay_type: Preset assay type, such as ``RNA``, for an assay whose name
+                    is not a preset. When None, the assay name decides the type.
 
     Attributes:
         loom: A scarf.LoomReader object used to open Loom format file.
@@ -54,12 +57,16 @@ class LoomToZarr:
         profile: StorageProfile | None = None,
         policy: CountMatrixPolicy | None = None,
         io: StorageIoPolicy | None = None,
+        assay_type: str | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.schema import create_zarr_count_assay, validate_assay_name
         from ..storage.stores import load_zarr
+        from .counts_t import validate_assay_type
 
         # TODO: support for multiple assay. Data from within individual layers can be treated as separate assays
+        validate_assay_type(assay_type)
+        self.assayType = assay_type
         self.loom = loom
         self.resources = resolve_budget(mem_budget, nthreads)
         self.profile = resolve_storage_profile(zarr_loc, profile)
@@ -89,9 +96,7 @@ class LoomToZarr:
         self._ini_feature_data()
 
     def _ini_cell_data(self) -> None:
-        from ..storage.arrays import create_zarr_obj_array
         from ..storage.schema import create_cell_data
-        from ._store import skip_reserved_metadata_columns
 
         ids = np.array(self.loom.cell_ids())
         cell_group = create_cell_data(
@@ -101,22 +106,23 @@ class LoomToZarr:
             names=ids,
             profile=self.profile,
         )
-        for i, j in skip_reserved_metadata_columns(self.loom.get_cell_attrs(), "cell"):
+        self._write_attributes(cell_group, self.loom.get_cell_attrs(), "cell")
+
+    def _write_attributes(
+        self,
+        group: Any,
+        attributes: Iterator[tuple[str, np.ndarray]],
+        axis: str,
+    ) -> None:
+        from ._store import skip_reserved_metadata_columns, write_metadata_column
+
+        for name, values in skip_reserved_metadata_columns(attributes, axis):
             try:
-                create_zarr_obj_array(
-                    cell_group,
-                    i,
-                    j,
-                    j.dtype,
-                    profile=self.profile,
-                )
+                write_metadata_column(group, name, values, profile=self.profile)
             except UnicodeDecodeError:
-                logger.warning(f"Could not import {i} cell(column) attribute")
+                logger.warning(f"Could not import the {axis} attribute {name!r}")
 
     def _ini_feature_data(self) -> None:
-        from ..storage.arrays import create_zarr_obj_array
-        from ._store import skip_reserved_metadata_columns
-
         if self.workspace is None:
             feat_group = as_zarr_group(
                 self.z[f"{self.assayName}/featureData"],
@@ -127,16 +133,7 @@ class LoomToZarr:
                 self.z[f"{self.workspace}/{self.assayName}/featureData"],
                 name=f"{self.workspace}/{self.assayName}/featureData",
             )
-        for i, j in skip_reserved_metadata_columns(
-            self.loom.get_feature_attrs(), "feature"
-        ):
-            create_zarr_obj_array(
-                feat_group,
-                i,
-                j,
-                j.dtype,
-                profile=self.profile,
-            )
+        self._write_attributes(feat_group, self.loom.get_feature_attrs(), "feature")
 
     def dump(self, batch_size: int = 1000) -> None:
         """Write Loom matrix data into the Zarr counts array.
@@ -237,6 +234,7 @@ class LoomToZarr:
             self.z,
             self.assayName,
             self.workspace,
+            assay_type=self.assayType,
             resources=self.resources,
             profile=self.profile,
             policy=self.policy,

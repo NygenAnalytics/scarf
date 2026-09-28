@@ -87,7 +87,6 @@ class AssayModalityEvidence(AgentDataModel):
 
     assayType: str = "Assay"
     modality: Literal["RNA", "ATAC", "ADT", "HTO", "unsupported"] = "unsupported"
-    typeSource: Literal["persisted", "assayClass", "unknown"] = "unknown"
     graphEligible: bool = False
     markerEligible: bool = False
     demultiplexEligible: bool = False
@@ -178,7 +177,6 @@ class AssayFeatureInspection(AgentDataModel):
     modalityEvidence: AssayModalityEvidence = Field(
         default_factory=AssayModalityEvidence.get_blank
     )
-    notes: list[str] = Field(default_factory=list)
     evidenceIds: list[str] = Field(default_factory=list)
 
     @classmethod

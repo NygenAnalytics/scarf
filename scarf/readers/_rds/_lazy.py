@@ -16,6 +16,29 @@ STRING_SOURCE_PAYLOAD = 0
 STRING_SOURCE_DECODED = 1
 
 
+def decode_r_string(raw: bytes, gp: int, default_encoding: str | None) -> str | bytes:
+    """Decode one serialized R string using its CHARSXP encoding flags.
+
+    Byte strings stay bytes. Latin-1, UTF-8, and ASCII flags pick their codec;
+    unflagged strings use the writer's native encoding, or UTF-8 when the
+    header names none or an unknown one.
+    """
+    if gp & (1 << 1):
+        return raw
+    if gp & (1 << 2):
+        return raw.decode("latin-1")
+    if gp & (1 << 3):
+        return raw.decode("utf-8", errors="surrogateescape")
+    if gp & (1 << 6):
+        return raw.decode("ascii", errors="surrogateescape")
+    encoding = default_encoding or "utf-8"
+    try:
+        codecs.lookup(encoding)
+    except LookupError:
+        encoding = "utf-8"
+    return raw.decode(encoding, errors="surrogateescape")
+
+
 class LazyVector:
     """Block-readable vector data owned by an RDS document."""
 
@@ -92,16 +115,6 @@ class LazyAtomicVector(LazyVector):
             copy=True,
         )
 
-    def iter_blocks(self, block_size: int) -> Iterator[npt.NDArray[Any]]:
-        if block_size <= 0:
-            raise ValueError("block_size must be positive")
-        for start in range(0, self.length, block_size):
-            yield self.read_block(start, min(self.length, start + block_size))
-
-    def materialize(self) -> npt.NDArray[Any]:
-        """Read the complete vector when the caller explicitly requests it."""
-        return self.read_block(0, self.length)
-
     @overload
     def __getitem__(self, key: int) -> Any: ...
 
@@ -135,7 +148,6 @@ class LazyStringVector(LazyVector, Sequence[str | bytes | None]):
         decoded_storage: RandomAccessStorage | None,
         default_encoding: str | None,
         path: str,
-        element_attributes: dict[int, Any] | None = None,
     ) -> None:
         self._index_storage = index_storage
         self.descriptor_offset = descriptor_offset
@@ -144,7 +156,6 @@ class LazyStringVector(LazyVector, Sequence[str | bytes | None]):
         self._decoded_storage = decoded_storage
         self.default_encoding = default_encoding
         self.path = path
-        self._element_attributes = element_attributes or {}
 
     @property
     def length(self) -> int:
@@ -158,57 +169,10 @@ class LazyStringVector(LazyVector, Sequence[str | bytes | None]):
         )
         return _STRING_DESCRIPTOR.unpack(data)
 
-    def raw(self, index: int) -> bytes | None:
-        """Read one string without decoding it."""
-        if index < 0:
-            index += self.length
-        if index < 0 or index >= self.length:
-            raise IndexError("string vector index out of range")
-        source, offset, length, _gp = self._descriptor(index)
-        if length == -1:
-            return None
-        storage = (
-            self._payload_storage
-            if source == STRING_SOURCE_PAYLOAD
-            else self._decoded_storage
-        )
-        if storage is None:
-            raise RuntimeError("decoded string storage is unavailable")
-        return storage.read_at(offset, length, path=f"{self.path}[{index}]")
-
-    def gp_flags(self, index: int) -> int:
-        """Return the serialized general-purpose character flags."""
-        if index < 0:
-            index += self.length
-        if index < 0 or index >= self.length:
-            raise IndexError("string vector index out of range")
-        return self._descriptor(index)[3]
-
-    def element_attributes(self, index: int) -> Any | None:
-        """Return uncommon attributes attached to a character element."""
-        if index < 0:
-            index += self.length
-        if index < 0 or index >= self.length:
-            raise IndexError("string vector index out of range")
-        return self._element_attributes.get(index)
-
     def _decode(self, raw: bytes | None, gp: int) -> str | bytes | None:
         if raw is None:
             return None
-        if gp & (1 << 1):
-            return raw
-        if gp & (1 << 2):
-            return raw.decode("latin-1")
-        if gp & (1 << 3):
-            return raw.decode("utf-8", errors="surrogateescape")
-        if gp & (1 << 6):
-            return raw.decode("ascii", errors="surrogateescape")
-        encoding = self.default_encoding or "utf-8"
-        try:
-            codecs.lookup(encoding)
-        except LookupError:
-            encoding = "utf-8"
-        return raw.decode(encoding, errors="surrogateescape")
+        return decode_r_string(raw, gp, self.default_encoding)
 
     def read_block(self, start: int, stop: int) -> list[str | bytes | None]:
         """Read and decode a half-open string range."""

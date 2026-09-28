@@ -8,16 +8,17 @@ import pytest
 from scarf.features import gene_reference as gene_reference_module
 from scarf.features.gene_reference import (
     GeneReference,
-    SpeciesSpec,
     cached_species,
     default_cache_dir,
     ensure_reference,
     load_reference,
     parse_gff3_genes,
     prefix_species,
-    reference_summary,
-    write_reference_fixture,
+    species_for_id,
 )
+from scarf.features.identity import resolve_species
+
+from .gene_reference_fixtures import write_reference_fixture
 
 
 _GFF_SNIPPET = """\
@@ -81,7 +82,7 @@ def test_gene_reference_lookups_handle_versions_blanks_and_mt() -> None:
         chromosome=("1", "mt", "X"),
     )
 
-    assert reference.nGenes == 3
+    assert len(reference.geneId) == 3
     assert reference.has_gene_id("ENSG00000000001")
     assert reference.has_gene_id("ENSG00000000001.12")
     assert not reference.has_gene_id("ENSG00000000001.alpha")
@@ -93,7 +94,6 @@ def test_gene_reference_lookups_handle_versions_blanks_and_mt() -> None:
     assert reference.has_symbol("GENEA")
     assert not reference.has_symbol("")
     assert reference.symbols() == {"GENEA"}
-    assert reference.mitochondrial_gene_ids() == ["ENSG00000000002"]
 
 
 def test_parse_gff3_genes_reads_name_and_mt() -> None:
@@ -159,10 +159,7 @@ def test_write_and_load_reference_roundtrip(tmp_path: Path) -> None:
     assert loaded.has_gene_id("ENSG00000198727.1")
     assert loaded.symbol_for("ENSG00000198727") == "MT-CYB"
     assert loaded.chromosome_for("ENSG00000198727") == "MT"
-    assert set(loaded.mitochondrial_gene_ids()) == {
-        "ENSG00000210156",
-        "ENSG00000198727",
-    }
+    assert loaded.chromosome_for("ENSG00000210156") == "MT"
 
 
 def test_load_reference_returns_none_when_table_is_missing(tmp_path: Path) -> None:
@@ -231,6 +228,30 @@ def test_prefix_species_strips_only_numeric_versions() -> None:
     }
 
 
+def test_prefix_species_requires_a_digit_after_the_prefix(tmp_path: Path) -> None:
+    # Chicken, gorilla, and stickleback IDs also start with "ENSG".
+    ids = [
+        *(f"ENSGALG{i:011d}" for i in range(20)),
+        *(f"ENSGGOG{i:011d}" for i in range(20)),
+        *(f"ENSGACG{i:011d}" for i in range(20)),
+    ]
+
+    assert prefix_species(ids) == {}
+    assert prefix_species(["ENSG00000000001", "ENSGALG00000000001"]) == {
+        "homo_sapiens": 1
+    }
+    assert species_for_id("ENSG00000000001.3") == "homo_sapiens"
+    assert species_for_id("ENSMUSG00000000001") == "mus_musculus"
+    assert species_for_id("ENSGALG00000000001") is None
+    assert species_for_id("ENSG") is None
+    resolved = resolve_species(
+        ids,
+        [f"g{i}" for i in range(len(ids))],
+        cacheDir=tmp_path,
+    )
+    assert resolved["species"] == "unknown"
+
+
 def test_default_cache_dir_respects_override(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -297,62 +318,6 @@ def test_pick_gff3_name_rejects_listing_without_top_level_file() -> None:
 
     with pytest.raises(FileNotFoundError, match="no top-level Ensembl GFF3 file"):
         gene_reference_module._pick_gff3_name(listing)
-
-
-@pytest.mark.parametrize(
-    ("spec", "expected"),
-    [
-        (
-            SpeciesSpec(
-                key="homo_sapiens",
-                label="human",
-                idPrefix="ENSG",
-                source="ensembl",
-            ),
-            "https://ftp.ensembl.org/pub/current_gff3/homo_sapiens/",
-        ),
-        (
-            SpeciesSpec(
-                key="arabidopsis_thaliana",
-                label="arabidopsis",
-                idPrefix="AT",
-                source="ensemblgenomes",
-                division="plants",
-            ),
-            (
-                "https://ftp.ensemblgenomes.ebi.ac.uk/pub/plants/current/"
-                "gff3/arabidopsis_thaliana/"
-            ),
-        ),
-    ],
-    ids=["ensembl", "ensembl-genomes"],
-)
-def test_species_url_selects_source(spec: SpeciesSpec, expected: str) -> None:
-    assert gene_reference_module._species_url(spec) == expected
-
-
-def test_species_url_requires_ensembl_genomes_division() -> None:
-    spec = SpeciesSpec(
-        key="arabidopsis_thaliana",
-        label="arabidopsis",
-        idPrefix="AT",
-        source="ensemblgenomes",
-    )
-
-    with pytest.raises(ValueError, match="needs a division"):
-        gene_reference_module._species_url(spec)
-
-
-def test_species_url_rejects_unknown_source() -> None:
-    spec = SpeciesSpec(
-        key="homo_sapiens",
-        label="human",
-        idPrefix="ENSG",
-        source="other",
-    )
-
-    with pytest.raises(ValueError, match="unsupported gene-reference source 'other'"):
-        gene_reference_module._species_url(spec)
 
 
 def test_directory_listing_uses_request_headers_and_timeout(
@@ -497,7 +462,7 @@ def test_ensure_reference_downloads_and_caches_reference(
         ),
     }
     assert reference.release == "113"
-    assert reference.nGenes == 4
+    assert len(reference.geneId) == 4
     assert reference.geneId[0] == "ENSG00000000001"
     assert "ENSG_STALE" not in reference.geneId
     assert raw_path.is_file()
@@ -547,21 +512,3 @@ def test_cached_species_lists_only_known_tables(tmp_path: Path) -> None:
     (cache_dir / "rattus_norvegicus.release").write_text("113\n", encoding="utf-8")
 
     assert cached_species(cache_dir) == ["homo_sapiens", "mus_musculus"]
-
-
-def test_reference_summary_counts_symbols_and_mitochondrial_genes() -> None:
-    reference = GeneReference(
-        species="homo_sapiens",
-        release="113",
-        geneId=("ENSG1", "ENSG2", "ENSG3", "ENSG4"),
-        symbol=("GENEA", "", "MT-A", "GENEA"),
-        chromosome=("1", "X", "MT", "mt"),
-    )
-
-    assert reference_summary(reference) == {
-        "species": "homo_sapiens",
-        "release": "113",
-        "nGenes": 4,
-        "nSymbols": 3,
-        "nMitochondrial": 2,
-    }

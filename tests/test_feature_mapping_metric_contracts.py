@@ -1,5 +1,3 @@
-from scarf.features.genomic.gff import GffReader
-from scarf.features.genomic.melding import coordinate_melding
 from scarf.features.markers.search import (
     find_markers_by_rank,
     find_markers_by_regression,
@@ -11,14 +9,12 @@ from tests.signature_contracts import signature_digest
 
 def test_feature_mapping_and_metric_entry_point_signatures_are_stable():
     methods = {
-        "GffReader.__init__": GffReader.__init__,
         "compute_lisi": compute_lisi,
-        "coordinate_melding": coordinate_melding,
         "find_markers_by_rank": find_markers_by_rank,
         "find_markers_by_regression": find_markers_by_regression,
         "silhouette_scoring": silhouette_scoring,
     }
 
     assert signature_digest(methods) == (
-        "75e8fbb44a3439c1744485621f15507b091883208316397db219cf44cece0e6c"
+        "925f75af33b999be966e88cdd46be314e1f5cfb3da60b29e68ffc00f1e7e8576"
     )

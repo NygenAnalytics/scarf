@@ -8,14 +8,17 @@ import zarr
 
 from ..storage.stores import metadata_workers, run_concurrently
 from ..storage.types import as_zarr_array
-from ..storage.arrays import create_zarr_obj_array, linked_missing_mask
+from ..storage.arrays import (
+    MISSING_MASK_PREFIX,
+    create_zarr_obj_array,
+    linked_missing_mask,
+)
 from ..utils.logging import logger
 from .queries import (
     _all_true,
     grep as _grep,
     head as _head,
     multi_sift as _multi_sift,
-    remove_trend as _remove_trend,
     sift as _sift,
     to_pandas_dataframe as _to_pandas_dataframe,
 )
@@ -25,22 +28,47 @@ from .rows import (
     iter_row_blocks as _iter_row_blocks,
 )
 
-zarrGroup = zarr.Group
-_INTERNAL_METADATA_PREFIX = "__scarf_missing__"
+_RESERVED_COLUMNS = ("I", "ids", "names")
+
+
+class CaseInsensitiveIndex:
+    """Positions of values, matched as case-insensitive text.
+
+    Values and looked-up names both compare as ``str(value).upper()``, so a
+    value of any type can be indexed and looked up. A name that matches no
+    value has no positions; callers decide whether that is an error.
+    """
+
+    __slots__ = ("_positions",)
+
+    def __init__(self, values: Iterable[Any]) -> None:
+        positions: dict[str, list[int]] = {}
+        for position, value in enumerate(values):
+            positions.setdefault(str(value).upper(), []).append(position)
+        self._positions = positions
+
+    def positions(self, name: Any) -> list[int]:
+        """Return the positions of the values that match ``name``, in order."""
+        return list(self._positions.get(str(name).upper(), ()))
 
 
 class MetaData:
-    """Metadata table for cells and features backed by Zarr arrays.
+    """Metadata table for cells and features backed by one Zarr group.
 
     Changes made through this class are synchronized with the backing store.
     """
 
-    def __init__(self, zgrp: zarrGroup):
-        self.locations: dict[str, zarrGroup] = {"primary": zgrp}
-        self.N = self._get_size(self.locations["primary"], strict_mode=True)
+    def __init__(self, zgrp: zarr.Group):
+        self.locations: dict[str, zarr.Group] = {"primary": zgrp}
+        self.N = self._get_size(zgrp)
         self.index = np.array(range(self.N))
 
-    def _get_size(self, zgrp: zarrGroup, strict_mode: bool = False) -> int:
+    @property
+    def _group(self) -> zarr.Group:
+        return self.locations["primary"]
+
+    @staticmethod
+    def _get_size(zgrp: zarr.Group) -> int:
         # members() reads child metadata concurrently; opening each key in turn
         # costs one sequential round trip per column on object stores.
         sizes = {
@@ -48,93 +76,49 @@ class MetaData:
             for _key, child in zgrp.members()
             if isinstance(child, zarr.Array)
         }
-        if sizes:
-            if len(sizes) != 1:
-                raise ValueError(
-                    "ERROR: Metadata table is corrupted. Not all columns are "
-                    "of same length"
-                )
-            return sizes.pop()
-        if strict_mode:
+        if not sizes:
             raise ValueError("Attempted to get size of empty zarr group")
-        return self.N
+        if len(sizes) != 1:
+            raise ValueError(
+                "ERROR: Metadata table is corrupted. Not all columns are of same length"
+            )
+        return sizes.pop()
 
     @staticmethod
-    def _col_renamer(loc: str, col: str) -> str:
-        if loc != "primary":
-            return f"{loc}_{col}"
-        return col
+    def _is_public(column: str) -> bool:
+        return "/" not in column and not column.startswith(MISSING_MASK_PREFIX)
 
-    def _column_map(self) -> dict[str, str | tuple[str, str]]:
-        reserved_cols = ["I", "ids", "names"]
-        col_map: dict[str, str | tuple[str, str]] = {
-            column: "primary" for column in reserved_cols
-        }
-        for location, group in self.locations.items():
-            for column in group.keys():
-                if column.startswith(_INTERNAL_METADATA_PREFIX):
-                    continue
-                public_name = self._col_renamer(location, column)
-                if public_name in col_map and public_name not in reserved_cols:
-                    logger.warning(
-                        f" {column} is duplicate in metadata loc {location}. "
-                        "This means something has failed upstream. This is "
-                        "quite unexpected. Please report this issue."
-                    )
-                col_map[public_name] = (location, column)
-        return col_map
-
-    def _candidate_locs(self, column: str) -> Iterator[tuple[str, str]]:
-        if column in {"I", "ids", "names"}:
-            yield "primary", column
-            return
-        for location in reversed(self.locations):
-            if location == "primary":
-                stored_column = column
-            elif column.startswith(f"{location}_"):
-                stored_column = column[len(location) + 1 :]
-            else:
-                continue
-            if "/" not in stored_column and not stored_column.startswith(
-                _INTERNAL_METADATA_PREFIX
-            ):
-                yield location, stored_column
-
-    def _get_loc(self, column: str) -> tuple[str, str]:
-        for location, stored_column in self._candidate_locs(column):
-            if (
-                column in {"I", "ids", "names"}
-                or stored_column in self.locations[location]
-            ):
-                return location, stored_column
-        raise KeyError(f"{column} does not exist in the metadata columns.")
+    def _column_names(self) -> list[str]:
+        # Zarr lists members in no particular order, so sort them.
+        names = sorted(
+            column
+            for column in self._group.keys()
+            if self._is_public(column) and column not in _RESERVED_COLUMNS
+        )
+        return [*_RESERVED_COLUMNS, *names]
 
     def _has_column(self, column: str) -> bool:
         # Looking up one column avoids listing and opening every column.
-        try:
-            self._get_loc(column)
-        except KeyError:
-            return False
-        return True
+        return column in _RESERVED_COLUMNS or (
+            self._is_public(column) and column in self._group
+        )
 
     def _get_array(self, column: str) -> zarr.Array:
         # One metadata read per column: a membership test before indexing
         # doubles the round trips on object stores.
-        for location, stored_column in self._candidate_locs(column):
+        if self._is_public(column):
             try:
-                node = self.locations[location][stored_column]
+                node = self._group[column]
             except KeyError:
-                continue
-            return as_zarr_array(node, name=stored_column)
+                pass
+            else:
+                return as_zarr_array(node, name=column)
         raise KeyError(f"{column} does not exist in the metadata columns.")
 
     def _get_missing_mask_array(self, column: str) -> zarr.Array | None:
-        location, stored_column = self._get_loc(column)
-        return linked_missing_mask(
-            self.locations[location],
-            stored_column,
-            label=f"Column {column!r}",
-        )
+        if not self._has_column(column):
+            raise KeyError(f"{column} does not exist in the metadata columns.")
+        return linked_missing_mask(self._group, column, label=f"Column {column!r}")
 
     def get_dtype(self, column: str) -> np.dtype[Any]:
         """Return the dtype of a metadata column."""
@@ -148,43 +132,10 @@ class MetaData:
             )
         return array
 
-    def _verify_bool(self, key: str) -> bool:
-        self._bool_array(key)
-        return True
-
-    def mount_location(self, zgrp: zarrGroup, identifier: str) -> None:
-        if identifier in self.locations:
-            raise ValueError(
-                f"ERROR: a location with identifier '{identifier}' already mounted"
-            )
-        size = self._get_size(zgrp)
-        if size != self.N:
-            raise ValueError(
-                f"ERROR: The index size of the mount location ({size}) is not "
-                f"same as primary ({self.N})"
-            )
-        new_cols = [self._col_renamer(identifier, column) for column in zgrp.keys()]
-        conflict_names = [column for column in new_cols if column in self.columns]
-        if conflict_names:
-            conflict_str = " ".join(conflict_names)
-            raise ValueError(
-                "ERROR: These names in location conflict with existing names: "
-                f"{conflict_str}\n. Please try with a different identifier value."
-            )
-        self.locations[identifier] = zgrp
-
-    def unmount_location(self, identifier: str) -> None:
-        if identifier == "primary":
-            raise ValueError("Cannot unmount the primary location")
-        if identifier not in self.locations:
-            logger.warning(f"{identifier} is not mounted. Nothing to unmount")
-            return None
-        self.locations.pop(identifier)
-
     @property
     def columns(self) -> list[str]:
-        """Return all mounted metadata column names."""
-        return list(self._column_map().keys())
+        """Return all metadata column names."""
+        return self._column_names()
 
     def fetch_all(self, column: str) -> np.ndarray:
         """Return all stored values from a metadata column.
@@ -198,7 +149,7 @@ class MetaData:
         """Return several whole columns; object stores read them concurrently."""
         return run_concurrently(
             [partial(self.fetch_all, column) for column in columns],
-            workers=metadata_workers(self.locations["primary"]),
+            workers=metadata_workers(self._group),
         )
 
     def active_index(self, key: str) -> np.ndarray:
@@ -237,16 +188,7 @@ class MetaData:
             block_rows=block_rows,
         )
 
-    def _save(
-        self,
-        column_name: str,
-        values: np.ndarray,
-        location: str = "primary",
-    ) -> None:
-        if location not in self.locations:
-            raise KeyError(
-                f"ERROR: '{location}' has not been mounted. Save data request failed!"
-            )
+    def _save(self, column_name: str, values: np.ndarray) -> None:
         if values.shape != (self.N,):
             raise ValueError(
                 f"ERROR: Values are of shape: {values.shape}. "
@@ -254,12 +196,9 @@ class MetaData:
             )
         from ..storage.identity import clear_column
 
-        if location == "primary" and self._has_column(column_name):
-            location, column_name = self._get_loc(column_name)
-        group = self.locations[location]
-        clear_column(group, column_name)
+        clear_column(self._group, column_name)
         create_zarr_obj_array(
-            group,
+            self._group,
             column_name,
             values,
             values.dtype,
@@ -277,7 +216,9 @@ class MetaData:
             values = np.array(values)
         if auto_fill_disable is False:
             if values.dtype == bool:
-                fill_value = False
+                # Only the default NaN fill is replaced; an explicit value stays.
+                if isinstance(fill_value, float) and np.isnan(fill_value):
+                    fill_value = False
             elif np.issubdtype(values.dtype, np.integer):
                 try:
                     if np.isnan(fill_value):
@@ -310,30 +251,32 @@ class MetaData:
         column: str,
         key: str | None = None,
     ) -> np.ndarray:
-        """Return row indices for requested values in a metadata column."""
+        """Return row indices for requested values in a metadata column.
+
+        Values match as case-insensitive text, as in ``CaseInsensitiveIndex``,
+        and every row that matches a target is returned, in target order. With
+        ``key``, indices are positions among the rows that ``key`` selects. A
+        target that matches no row adds no index and is counted in a warning.
+        """
         if not isinstance(value_targets, Iterable) or isinstance(value_targets, str):
             raise TypeError("ERROR: Please provide the `value_targets` as list")
         if key is None:
             values = self.fetch_all(column)
         else:
             values = self.fetch(column, key)
-        value_map: dict[str, list[int]] = {}
-        for index, value in enumerate(values):
-            normalized = value.upper()
-            value_map.setdefault(normalized, []).append(index)
-        result = []
+        index = CaseInsensitiveIndex(values)
+        result: list[int] = []
         missing_count = 0
         for target in value_targets:
-            normalized = target.upper()
-            if normalized in value_map:
-                result.extend(value_map[normalized])
-            else:
+            positions = index.positions(target)
+            if not positions:
                 missing_count += 1
+            result.extend(positions)
         if missing_count > 0:
             logger.warning(
                 f"{missing_count} values were not found in the table column {column}"
             )
-        return np.array(result)
+        return np.asarray(result, dtype=np.int64)
 
     def index_to_bool(self, idx: np.ndarray, invert: bool = False) -> np.ndarray:
         """Convert row indices into a table-sized boolean array."""
@@ -351,18 +294,16 @@ class MetaData:
         fill_value: Any = np.nan,
         key: str = "I",
         overwrite: bool = False,
-        location: str = "primary",
         force: bool = False,
     ) -> None:
         """Insert a column into the table."""
-        column = self._col_renamer(location, column_name)
-        if column in ["I", "ids"] and force is False:
+        if column_name in ["I", "ids"] and force is False:
             raise ValueError(
-                f"ERROR: {column} is a protected column name in MetaData class."
+                f"ERROR: {column_name} is a protected column name in MetaData class."
             )
-        if overwrite is False and self._has_column(column):
+        if overwrite is False and self._has_column(column_name):
             raise ValueError(
-                f"ERROR: {column} already exists. Please set `overwrite` to "
+                f"ERROR: {column_name} already exists. Please set `overwrite` to "
                 "True to overwrite."
             )
         if isinstance(values, list):
@@ -371,7 +312,7 @@ class MetaData:
                 "expected. The correct dtype may not be assigned to the column"
             )
         filled = self._fill_to_index(np.array(values), fill_value, key)
-        self._save(column_name, filled, location=location)
+        self._save(column_name, filled)
 
     def update_key(self, values: np.ndarray, key: str) -> None:
         """Restrict a boolean metadata key using the supplied values."""
@@ -391,10 +332,11 @@ class MetaData:
                 f"ERROR: {column} is a protected name in MetaData class. "
                 "Cannot be deleted"
             )
-        location, stored_column = self._get_loc(column)
+        if not self._has_column(column):
+            raise KeyError(f"{column} does not exist in the metadata columns.")
         from ..storage.identity import clear_column
 
-        clear_column(self.locations[location], stored_column)
+        clear_column(self._group, column)
 
     def sift(
         self,
@@ -403,7 +345,10 @@ class MetaData:
         max_v: float = np.inf,
         keep_bounds: bool = False,
     ) -> np.ndarray:
-        """Return rows whose values fall within the requested bounds."""
+        """Return rows whose values fall within the requested bounds.
+
+        Rows flagged by the column's linked missing mask never pass.
+        """
         return _sift(self, column, min_v, max_v, keep_bounds)
 
     def multi_sift(
@@ -436,24 +381,6 @@ class MetaData:
     def grep(self, pattern: str, only_valid: bool = False) -> list[str]:
         """Return feature names matching a case-insensitive regex."""
         return _grep(self, pattern, only_valid)
-
-    def remove_trend(
-        self,
-        x: str,
-        y: str,
-        n_bins: int = 200,
-        lowess_frac: float = 0.1,
-        fill_value: float = 0,
-    ) -> np.ndarray:
-        """Remove a LOWESS trend of column ``y`` with respect to column ``x``."""
-        return _remove_trend(
-            self,
-            x,
-            y,
-            n_bins,
-            lowess_frac,
-            fill_value,
-        )
 
     def __repr__(self) -> str:
         return f"MetaData of {self.fetch_all('I').sum()}({self.N}) elements"

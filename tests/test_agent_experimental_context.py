@@ -47,11 +47,7 @@ from scarf.agent.experimental_context.characterization import (
     _SelectionBoundCells,
 )
 from scarf.agent.experimental_context.study import StudyContract, build_study_contract
-from scarf.agent.types import (
-    ArtifactReferenceModel,
-    ExperimentalBiologyHandoff,
-    ExperimentalTuningHandoff,
-)
+from scarf.agent.types import ArtifactReferenceModel
 from scarf.datastore.pipeline_run import PipelineRun
 from scarf.metadata.artifacts import (
     plan_cell_data_artifact,
@@ -422,8 +418,6 @@ def test_agent_models_have_blank_and_example_constructors() -> None:
         RepresentationEvaluation,
         ExperimentalContextResult,
         ExperimentalContextDependencies,
-        ExperimentalTuningHandoff,
-        ExperimentalBiologyHandoff,
     )
     for model in models:
         assert isinstance(model.get_blank(), model)
@@ -471,6 +465,13 @@ def test_system_prompt_does_not_embed_fictional_output_values() -> None:
                 "conditionColumns": ["batch"],
             },
             "cannot also be condition columns",
+        ),
+        (
+            {
+                "technicalBatchColumns": ["batch"],
+                "protectedColumns": ["batch"],
+            },
+            "cannot also be protected columns",
         ),
         (
             {
@@ -615,12 +616,12 @@ def test_agent_runs_only_read_only_tools_and_returns_a_grounded_report() -> None
     assert result.status == "done"
     assert result.decision.batchCorrection.action == "unsafe"
     assert result.batchSafety[0].status == "unsafe"
-    tuning_handoff = result.to_parameter_tuning_handoff()
-    assert tuning_handoff.batchAction == "unsafe"
-    assert tuning_handoff.batchSafety[0].evidenceId in tuning_handoff.evidenceIds
-    biology_handoff = result.to_biological_handoff()
-    assert biology_handoff.conditionColumn == "disease"
-    assert biology_handoff.observationUnit == "sample"
+    assert result.decision.coefficientsOfInterest == ["disease"]
+    assert result.decision.unitsOfInference["disease"].observationUnit == "sample"
+    # The malformed first call is a tool call but not a design round.
+    assert result.designRounds == 1
+    assert result.designDirections["coefficientsOfInterest"] == ["disease"]
+    assert result.designDirections["columnDomains"]["batch"] == "technical"
     assert result.runInfo.agentName == "experimental_context"
     assert result.cellQc == result.decision.cellQc
     assert result.cellQc.action == "skip"
@@ -692,8 +693,6 @@ def test_agent_fails_after_design_tool_retry_exhaustion(
     assert result.cellQc.profileId == ""
     assert result.qcProfiles
     assert result.runInfo.agentName == "experimental_context_failed"
-    with pytest.raises(ValueError, match="must be done"):
-        result.to_parameter_tuning_handoff()
     assert any("did not produce" in note for note in result.notes)
 
 
@@ -742,8 +741,6 @@ def test_agent_rejects_malformed_batch_tool_call_without_default_selection(
 
     assert result.status == "failed"
     assert result.decision.batchCorrection.batchColumns == []
-    with pytest.raises(ValueError, match="must be done"):
-        result.to_parameter_tuning_handoff()
     assert result.runInfo.agentName == "experimental_context_failed"
     assert any("batchassay" in note for note in result.notes)
 
@@ -787,19 +784,6 @@ def test_agent_preserves_validated_design_uncertainty(
         "Physical capture provenance remains unresolved."
     ]
     assert result.runInfo.agentName == "experimental_context"
-    with pytest.raises(ValueError, match="must be done"):
-        result.to_parameter_tuning_handoff()
-
-
-def test_handoff_builders_reject_incomplete_or_ambiguous_results() -> None:
-    incomplete = ExperimentalContextResult.get_blank()
-    with pytest.raises(ValueError, match="must be done"):
-        incomplete.to_parameter_tuning_handoff()
-
-    ambiguous = example(ExperimentalContextResult)
-    ambiguous.decision.coefficientsOfInterest.append("second_coefficient")
-    with pytest.raises(ValueError, match="Select one coefficient explicitly"):
-        ambiguous.to_biological_handoff()
 
 
 def test_tools_build_a_grounded_design_report_without_mutation() -> None:
@@ -1531,8 +1515,6 @@ def test_batch_safety_does_not_depend_on_pairwise_selected_flag(
     }
     characterization = module.characterize_covariates(
         store,
-        studyContext="Case-control study with samples nested in donors.",
-        model=None,
         cellSelection=store.cell_selection,
         directions=directions,
     )
@@ -1820,12 +1802,6 @@ def test_agent_uses_exact_graph_lineage_without_current_state_lookup(
         result.currentRepresentation.connectivityMap.artifactId
         == connectivity_map.artifact_id
     )
-    tuning_handoff = result.to_parameter_tuning_handoff()
-    biology_handoff = result.to_biological_handoff()
-    assert tuning_handoff.cellSelection == result.cellSelection
-    assert biology_handoff.cellSelection == result.cellSelection
-    assert "cellKey" not in tuning_handoff.model_dump()
-    assert "cellKey" not in biology_handoff.model_dump()
     assert store.inspected_artifacts == []
     assert store.metric_calls == [
         ("metric_ilisi", "batch", neighbors),
@@ -1866,11 +1842,8 @@ def test_harmony_requires_resolved_units_and_estimability(
         lambda *_args, **_kwargs: characterization,
     )
     store = _Store()
-    deps = ExperimentalContextDependencies(
-        store=store,
-        cellSelection=store.cell_selection,
-        toolCalls=["inspect_cell_covariates", "analyze_experimental_design"],
-    )
+    deps = _context(store).deps
+    deps.toolCalls = ["inspect_cell_covariates", "analyze_experimental_design"]
     decision = ExperimentalContextDecision(
         columnDomains={
             "batch": "technical",
@@ -1896,7 +1869,7 @@ def test_harmony_rejects_nonbiological_preservation_column() -> None:
     store = _Store()
     context = _context(store)
     decision = _design_decision(action="evaluateHarmony")
-    decision.batchCorrection.preserveColumns.append("batch")
+    decision.batchCorrection.preserveColumns.append("sample")
 
     asyncio.run(inspect_cell_covariates(context))
     asyncio.run(
@@ -2315,66 +2288,6 @@ def test_cell_qc_profile_requires_exact_capture_failure_inventory() -> None:
         )
 
 
-def test_experimental_handoff_validation_edges() -> None:
-    result = example(ExperimentalContextResult)
-    without_selection = result.model_copy(update={"cellSelection": None})
-    with pytest.raises(ValueError, match="lacks a cell selection"):
-        without_selection.to_parameter_tuning_handoff()
-    with pytest.raises(ValueError, match="lacks a cell selection"):
-        without_selection.to_biological_handoff()
-
-    with pytest.raises(ValueError, match="lacks exact batch safety"):
-        result.model_copy(update={"batchSafety": []}).to_parameter_tuning_handoff()
-
-    plan = result.decision.batchCorrection
-    uncited_plan = plan.model_copy(
-        update={
-            "evidenceIds": [
-                value
-                for value in plan.evidenceIds
-                if not value.startswith("batchEstimability:")
-            ]
-        }
-    )
-    with pytest.raises(ValueError, match="does not cite"):
-        result.model_copy(
-            update={
-                "decision": result.decision.model_copy(
-                    update={"batchCorrection": uncited_plan}
-                )
-            }
-        ).to_parameter_tuning_handoff()
-
-    unsafe_safety = result.batchSafety[0].model_copy(update={"status": "unsafe"})
-    with pytest.raises(ValueError, match="non-safe"):
-        result.model_copy(
-            update={"batchSafety": [unsafe_safety]}
-        ).to_parameter_tuning_handoff()
-
-    unsafe_plan = plan.model_copy(update={"action": "unsafe"})
-    with pytest.raises(ValueError, match="lacks exact unsafe"):
-        result.model_copy(
-            update={
-                "decision": result.decision.model_copy(
-                    update={"batchCorrection": unsafe_plan}
-                )
-            }
-        ).to_parameter_tuning_handoff()
-
-    with pytest.raises(ValueError, match="must be done"):
-        result.model_copy(update={"status": "failed"}).to_biological_handoff()
-    with pytest.raises(ValueError, match="Unknown coefficient"):
-        result.to_biological_handoff("unknown")
-    with pytest.raises(ValueError, match="Missing characterization"):
-        result.model_copy(
-            update={
-                "characterization": result.characterization.model_copy(
-                    update={"coefficients": []}
-                )
-            }
-        ).to_biological_handoff("treatment")
-
-
 def test_experimental_context_private_input_guards(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2476,6 +2389,7 @@ def test_core_qc_accepts_constant_metrics_and_rejects_nonfinite_bounds(
     store = _Store()
     context = _context(store)
     deps = context.deps
+    deps.qcDesignData = experimental_context_qc._QcDesignData(deps.cells)
     active = np.ones(store.cells.N, dtype=bool)
     notes: list[str] = []
     profile = experimental_context_qc._global_qc_profile(
@@ -2557,6 +2471,135 @@ def test_design_analysis_rejects_invalid_batch_proposals(
                 batch_columns=[],
             )
         )
+
+
+def test_late_batch_rejection_does_not_consume_a_design_round() -> None:
+    store = _Store()
+    # A constant column passes the inspected-kind check but is dropped again
+    # when the proposed design is characterized.
+    store.cells._values["lane"] = np.array(["L1"] * store.cells.N)
+    context = _context(store)
+    decision = _design_decision()
+    domains = {**decision.columnDomains, "lane": "technical"}
+    asyncio.run(inspect_cell_covariates(context))
+
+    with pytest.raises(ModelRetry, match="'lane' must be classified as technical"):
+        asyncio.run(
+            analyze_experimental_design(
+                context,
+                column_domains=domains,
+                coefficients_of_interest=decision.coefficientsOfInterest,
+                units_of_inference=decision.unitsOfInference,
+                batch_columns=["lane"],
+            )
+        )
+    assert context.deps.designRounds == 0
+
+    asyncio.run(
+        analyze_experimental_design(
+            context,
+            column_domains=domains,
+            coefficients_of_interest=decision.coefficientsOfInterest,
+            units_of_inference=decision.unitsOfInference,
+            batch_columns=["batch"],
+        )
+    )
+    assert context.deps.designRounds == 1
+
+
+def test_capture_with_missing_labels_is_rejected_before_commit_or_round() -> None:
+    from scarf.agent.experimental_context.contracts import CaptureProposal
+
+    store = _Store()
+    lane = np.array(["L1"] * 6 + ["L2"] * 6)
+    lane[3] = ""
+    store.cells._values["lane"] = lane
+    context = _context(store)
+    quote = "Cells were loaded on two lanes; lane identifies the physical capture."
+    context.deps.studyContext = quote
+    decision = _design_decision()
+    asyncio.run(inspect_cell_covariates(context))
+
+    with pytest.raises(ModelRetry, match="missing labels"):
+        asyncio.run(
+            analyze_experimental_design(
+                context,
+                column_domains={**decision.columnDomains, "lane": "design"},
+                coefficients_of_interest=decision.coefficientsOfInterest,
+                units_of_inference=decision.unitsOfInference,
+                batch_columns=[],
+                capture_proposal=CaptureProposal(column="lane", provenanceQuote=quote),
+            )
+        )
+    assert context.deps.captureProposal is None
+    assert context.deps.characterization is not None
+    assert context.deps.characterization.captureProvenance is None
+    assert context.deps.designRounds == 0
+
+
+def test_failed_qc_refresh_rolls_back_an_accepted_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scarf.agent.experimental_context.contracts import CaptureProposal
+
+    store = _Store()
+    context = _context(store)
+    quote = "sample identifies the physical capture."
+    context.deps.studyContext = quote
+    decision = _design_decision()
+    asyncio.run(inspect_cell_covariates(context))
+
+    def unavailable(*_args: Any) -> None:
+        raise RuntimeError("capture quality measurements unavailable")
+
+    monkeypatch.setattr(experimental_context_tools, "_offered_qc_profiles", unavailable)
+    with pytest.raises(RuntimeError, match="measurements unavailable"):
+        asyncio.run(
+            analyze_experimental_design(
+                context,
+                column_domains=decision.columnDomains,
+                coefficients_of_interest=decision.coefficientsOfInterest,
+                units_of_inference=decision.unitsOfInference,
+                batch_columns=[],
+                capture_proposal=CaptureProposal(
+                    column="sample", provenanceQuote=quote
+                ),
+            )
+        )
+    assert context.deps.captureProposal is None
+    assert context.deps.characterization is not None
+    assert context.deps.characterization.captureProvenance is None
+
+
+def test_every_batch_plan_validates_preserved_columns() -> None:
+    store = _Store()
+    context = _context(store)
+    decision = _design_decision(action="unsafe")
+    asyncio.run(inspect_cell_covariates(context))
+    asyncio.run(
+        analyze_experimental_design(
+            context,
+            column_domains=decision.columnDomains,
+            coefficients_of_interest=decision.coefficientsOfInterest,
+            units_of_inference=decision.unitsOfInference,
+            batch_columns=decision.batchCorrection.batchColumns,
+        )
+    )
+    unknown = decision.model_copy(deep=True)
+    unknown.batchCorrection.preserveColumns = ["disease", "no_such_column"]
+    with pytest.raises(ModelRetry, match="Unknown preservation column"):
+        validate_experimental_context(unknown, context.deps)
+    # The assessed batch becomes the contract's technical batch, so it cannot
+    # also be protected, even by a plan that skips correction.
+    skipped = decision.model_copy(deep=True)
+    skipped.batchCorrection = BatchCorrectionPlan(
+        action="skip",
+        preserveColumns=["batch"],
+        rationale="Correction is not needed.",
+        evidenceIds=decision.batchCorrection.evidenceIds,
+    )
+    with pytest.raises(ModelRetry, match="'batch' cannot be a coefficient"):
+        validate_experimental_context(skipped, context.deps)
 
 
 def test_design_analysis_records_not_computed_estimability(

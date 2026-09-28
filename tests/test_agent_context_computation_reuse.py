@@ -11,7 +11,14 @@ import pytest
 from scarf.agent.experimental_context import characterization as characterization_module
 from scarf.agent.experimental_context import qc_evidence
 from scarf.agent.experimental_context.contracts import CovariateCharacterization
+from scarf.metadata.rows import metadata_column_fingerprint
 from tests.test_agent_experimental_context import _Store, _context, _replace_store_cells
+
+
+def _frozen_design(deps: Any) -> Any:
+    """Open one QC design scope, as each policy projection does."""
+    deps.qcDesignData = qc_evidence._QcDesignData(deps.cells)
+    return deps
 
 
 def _capture_context() -> tuple[Any, CovariateCharacterization]:
@@ -57,10 +64,12 @@ def test_capture_design_is_computed_once_across_real_policy_projections(
 ) -> None:
     deps, characterized = _capture_context()
     captures = deps.cells.fetch("capture")
+    _frozen_design(deps)
     expected = {
         label: qc_evidence._capture_design_safety(deps, characterized, captures, label)
         for label in ("d1", "d2", "d3")
     }
+    deps.qcDesignData = None
     calls: Counter[str] = Counter()
     reads: Counter[str] = Counter()
     compute = qc_evidence._compute_capture_design_safety
@@ -109,7 +118,7 @@ def test_continuous_or_unknown_capture_protection_cannot_become_categorical(
     deps.store.cells._values["condition"][0] = np.nan
     characterized.columns[0]["kind"] = kind
     rows, preserves_conditions, preserves_units = qc_evidence._capture_design_safety(
-        deps, characterized, deps.cells.fetch("capture"), "d1"
+        _frozen_design(deps), characterized, deps.cells.fetch("capture"), "d1"
     )
     assert not preserves_conditions and not preserves_units
     assert "requiredGroups" not in rows[0]
@@ -143,8 +152,16 @@ def test_column_inventory_reuse_checks_values_kinds_missingness_and_selection(
             cellSelection=store.cell_selection,
             directions=directions,
             inventory=inventory,
+            fingerprints={
+                column: metadata_column_fingerprint(store.cells, column)
+                for column in store.cells.columns
+            },
         )
 
+    with pytest.raises(ValueError, match="requires value fingerprints"):
+        characterization_module.characterize_covariates(
+            store, cellSelection=store.cell_selection, inventory=inventory
+        )
     first = characterize()
     baseline = calls.copy()
     assert first.status == "done"
@@ -188,13 +205,16 @@ def test_nullable_design_metadata_retains_missingness_as_unresolved_protection()
     deps.store.cells._values["condition"][0] = pd.NA
     characterized.columns[0]["kind"] = "continuous"
     rows, protected, _ = qc_evidence._capture_design_safety(
-        deps, characterized, deps.cells.fetch("capture"), "d3"
+        _frozen_design(deps), characterized, deps.cells.fetch("capture"), "d3"
     )
     assert not protected and rows[0]["missingRowsAfterExclusion"] == 1
     deps.store.cells._values["donor"] = deps.store.cells._values["donor"].astype(object)
     deps.store.cells._values["donor"][0] = None
     retention = qc_evidence._design_retention(
-        deps, characterized, np.ones(24, dtype=bool), np.ones(24, dtype=bool)
+        _frozen_design(deps),
+        characterized,
+        np.ones(24, dtype=bool),
+        np.ones(24, dtype=bool),
     )
     assert "donor:missingValues" in retention["unsafeRetentionGroups"]
     assert "None" not in retention["retainedCellsByColumn"]["donor"]
@@ -208,7 +228,10 @@ def test_unusable_imported_unit_labels_remain_missing_in_retention(
     deps.store.cells._values["donor"] = deps.store.cells._values["donor"].astype(object)
     deps.store.cells._values["donor"][0] = missing
     retention = qc_evidence._design_retention(
-        deps, characterized, np.ones(24, dtype=bool), np.ones(24, dtype=bool)
+        _frozen_design(deps),
+        characterized,
+        np.ones(24, dtype=bool),
+        np.ones(24, dtype=bool),
     )
     assert "donor:missingValues" in retention["unsafeRetentionGroups"]
     assert retention["retainedCellsByColumn"]["donor"] == {"d1": 7, "d2": 8, "d3": 8}
@@ -234,7 +257,7 @@ def test_joint_population_loss_is_visible_despite_preserved_marginal_conditions(
     deps, characterized = _joint_capture_context()
     captures = deps.cells.fetch("capture")
     rows, condition_safe, unit_safe = qc_evidence._capture_design_safety(
-        deps, characterized, captures, "d1"
+        _frozen_design(deps), characterized, captures, "d1"
     )
     assert all(row["preservesConditionCoverage"] for row in rows[:-1])
     assert all(row["preservesIndependentUnitCoverage"] for row in rows[:-1])
@@ -248,11 +271,10 @@ def test_joint_population_loss_is_visible_despite_preserved_marginal_conditions(
     assert any(
         value.startswith("combination:") for value in retention["unsafeRetentionGroups"]
     )
-    deps.qcDesignData = qc_evidence._QcDesignData(deps.cells)
-    cached = qc_evidence._design_retention(
-        deps, characterized, np.ones(24, dtype=bool), captures != "d1"
+    fresh = qc_evidence._design_retention(
+        _frozen_design(deps), characterized, np.ones(24, dtype=bool), captures != "d1"
     )
-    assert cached == retention
+    assert fresh == retention
 
 
 @pytest.mark.parametrize("missing", ["value", "column", "independentColumn"])
@@ -270,7 +292,7 @@ def test_missing_joint_design_inputs_cannot_establish_safe_capture_exclusion(
     else:
         del deps.store.cells._values["donor"]
     rows, condition_safe, unit_safe = qc_evidence._capture_design_safety(
-        deps, characterized, deps.cells.fetch("capture"), "d1"
+        _frozen_design(deps), characterized, deps.cells.fetch("capture"), "d1"
     )
     assert not unit_safe
     if missing != "independentColumn":
@@ -294,17 +316,19 @@ def test_joint_replication_uses_independent_donors_and_scoped_capture_identity()
     deps.store.cells._values["time"] = np.tile(["early", "late"], 12)
     characterized.columns.append({"name": "time", "kind": "categorical"})
     deps.protectedCombinations = [["condition", "time"]]
-    deps.qcDesignData = qc_evidence._QcDesignData(deps.cells)
     captures = deps.cells.fetch("capture")
     rows, condition_safe, unit_safe = qc_evidence._capture_design_safety(
-        deps, characterized, captures, "d1"
+        _frozen_design(deps), characterized, captures, "d1"
     )
     assert condition_safe and unit_safe
     assert rows[-1]["preservesIndependentUnitCoverage"]
     changed_captures = captures.copy()
     changed_captures[changed_captures == "d2"] = "d1"
+    # One design scope belongs to one capture source; changed labels need a new one.
+    with pytest.raises(ValueError, match="another capture source"):
+        qc_evidence._capture_design_safety(deps, characterized, changed_captures, "d1")
     rows, condition_safe, unit_safe = qc_evidence._capture_design_safety(
-        deps, characterized, changed_captures, "d1"
+        _frozen_design(deps), characterized, changed_captures, "d1"
     )
     assert condition_safe and not unit_safe
     assert not rows[-1]["preservesIndependentUnitCoverage"]

@@ -298,48 +298,6 @@ def clisi_knn(
     )
 
 
-def compute_simpson(
-    distances: np.ndarray,
-    indices: np.ndarray,
-    labels: pd.Categorical,
-    perplexity: float,
-    tol: float = 1e-5,
-) -> np.ndarray:
-    """Compute Simpson's diversity index with Gaussian kernel weighting.
-
-    This function implements the core calculation for LISI, computing a diversity score
-    based on the distribution of categories in each cell's neighborhood.
-
-    Args:
-        distances: Distance matrix between points, shape (n_neighbors, n_points)
-        indices: Index matrix for nearest neighbors, shape (n_neighbors, n_points)
-        labels: Categorical labels for each point
-        perplexity: Target perplexity for Gaussian kernel
-        tol: Convergence tolerance for perplexity calibration (default: 1e-5)
-
-    Returns:
-        np.ndarray: Array of Simpson's diversity indices, one per point
-    """
-    distances = np.asarray(distances)
-    indices = np.asarray(indices)
-    if distances.ndim != 2 or indices.ndim != 2:
-        raise ValueError("Distances and indices must be two-dimensional")
-    if distances.shape != indices.shape:
-        raise ValueError("Distances and indices must have matching shapes")
-    if np.any(labels.codes < 0):
-        raise ValueError("Labels contain missing values")
-
-    n_neighbors = distances.shape[0]
-    effective_perplexity = _effective_perplexity(perplexity, n_neighbors)
-    probabilities = _neighbor_probabilities(distances.T, effective_perplexity, tol=tol)
-    return _simpson_from_probabilities(
-        probabilities,
-        indices.T,
-        np.asarray(labels.codes),
-        len(labels.categories),
-    )
-
-
 def lisi_batch_mixing_score(
     lisi_scores: np.ndarray,
     batch_labels: Sequence[object] | np.ndarray,

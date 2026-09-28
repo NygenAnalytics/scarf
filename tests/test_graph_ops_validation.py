@@ -16,6 +16,7 @@ from scarf.graph.feature_projection import (
 from scarf.embeddings.imported_storage import validate_imported_coordinates_artifact
 from scarf.storage.artifacts import (
     ArtifactRef,
+    ArtifactStatus,
     artifact_path,
     fingerprint_array,
     fingerprint_strings,
@@ -148,10 +149,32 @@ def test_require_complete_artifact_rejects_kind_and_assay_before_storage(
     storage_lookup.assert_not_called()
 
 
+def _status(
+    ref: ArtifactRef,
+    *,
+    path: str,
+    inputs: dict[str, object] | None = None,
+    parameters: dict[str, object] | None = None,
+) -> ArtifactStatus:
+    return ArtifactStatus(
+        ref=ref,
+        path=path,
+        exists=True,
+        complete=True,
+        provenance={
+            "operation": "recorded",
+            "parameters": parameters or {},
+            "inputs": inputs or {},
+        },
+    )
+
+
 def test_artifact_input_ref_requires_named_input() -> None:
     store = _bare_store()
     neighbors = _ref("neighbors", "b")
-    store._require_complete_artifact = Mock(return_value=SimpleNamespace(inputs={}))
+    store._require_complete_artifact = Mock(
+        return_value=_status(neighbors, path="neighbors")
+    )
     with pytest.raises(ValueError, match="has no 'coordinates' input"):
         store._artifact_input_ref(neighbors, "coordinates", "reduction")
 
@@ -166,7 +189,7 @@ def test_reduction_entrypoints_validate_and_forward_explicit_normalized_ref() ->
         store.run_lsi(normalized, solver="mystery")
     with pytest.raises(TypeError, match="n_iter must be an integer"):
         store.run_lsi(normalized, n_iter=True)
-    with pytest.raises(ValueError, match="n_oversamples must be non-negative"):
+    with pytest.raises(ValueError, match="n_oversamples must be at least 0"):
         store.run_lsi(normalized, n_oversamples=-1)
     with pytest.raises(ValueError, match="two-dimensional matrix"):
         store.run_custom_reduction(np.arange(4), normalized)
@@ -197,22 +220,61 @@ def test_query_neighbors_rejects_malformed_ann_lineage_before_loading() -> None:
         side_effect=AssertionError("coordinates must not be loaded")
     )
 
-    store._require_complete_artifact = Mock(
-        return_value=SimpleNamespace(inputs={}, parameters={}, path="ann")
-    )
-    with pytest.raises(ValueError, match="has no coordinates input"):
+    store._require_complete_artifact = Mock(return_value=_status(ann, path="ann"))
+    with pytest.raises(ValueError, match="has no 'coordinates' input"):
         store.query_neighbors(ann)
 
     store._require_complete_artifact = Mock(
-        return_value=SimpleNamespace(
+        return_value=_status(
+            ann,
+            path="ann",
             inputs={"coordinates": coordinates.to_dict()},
             parameters={"ann_metric": "l2"},
-            path="ann",
         )
     )
     with pytest.raises(ValueError, match="do not match the ANN artifact input"):
         store.query_neighbors(ann, coordinates=other)
     store._coordinate_source.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("parameters", "message"),
+    [
+        ({"ann_metric": "l2", "parallel_threads": None}, "ann_ef search depth"),
+        (
+            {"ann_metric": "l2", "ann_ef": True, "parallel_threads": None},
+            "ann_ef search depth",
+        ),
+        ({"ann_metric": "l2", "ann_ef": 50}, "parallel_threads record"),
+    ],
+)
+def test_query_neighbors_requires_recorded_ann_search_settings(
+    parameters: dict[str, object],
+    message: str,
+) -> None:
+    store = _bare_store()
+    ann = _ref("ann_index", "6")
+    coordinates = _ref("reduction", "7")
+    store._require_complete_artifact = Mock(
+        side_effect=lambda ref, *_args, **_kwargs: (
+            _status(
+                ann,
+                path="ann",
+                inputs={"coordinates": coordinates.to_dict()},
+                parameters=parameters,
+            )
+            if ref == ann
+            else _status(ref, path="coordinates")
+        )
+    )
+    store._coordinate_source = Mock(return_value=(SimpleNamespace(data=None), 3, 2))
+    store._resolve_ann_index = Mock(
+        side_effect=AssertionError("the ANN index must not be loaded")
+    )
+
+    with pytest.raises(ValueError, match=message):
+        store.query_neighbors(ann)
+    store._resolve_ann_index.assert_not_called()
 
 
 def test_cell_selection_validation_rejects_changed_array_geometry() -> None:
@@ -369,13 +431,14 @@ def test_neighbor_and_connectivity_fail_before_expensive_compute(
     coordinates = _ref("reduction", "e")
     store._require_complete_artifact = Mock(
         side_effect=lambda ref, *_args, **_kwargs: (
-            SimpleNamespace(
+            _status(
+                ann,
+                path="ann",
                 inputs={"coordinates": coordinates.to_dict()},
                 parameters={"ann_metric": "l2"},
-                path="ann",
             )
             if ref == ann
-            else SimpleNamespace(inputs={}, parameters={}, path="coordinates")
+            else _status(ref, path="coordinates")
         )
     )
     store._coordinate_source = Mock(return_value=(SimpleNamespace(data=None), 1, 2))

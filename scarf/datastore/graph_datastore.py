@@ -1,6 +1,3 @@
-from threading import RLock
-from typing import Any
-
 from ._operations.clustering import _ClusteringOperationsMixin
 from ._operations.embeddings import _EmbeddingOperationsMixin
 from ._operations.graph import _GraphOperationsMixin
@@ -28,10 +25,3 @@ class GraphDataStore(
         nthreads: Number of threads to use for this datastore instance.
         z: The Zarr file (directory) used for this datastore instance.
     """
-
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._graphMemoryCache: dict[tuple[str, bool, bool, int | None], Any] | None = (
-            None
-        )
-        self._graphMemoryCacheLock = RLock()

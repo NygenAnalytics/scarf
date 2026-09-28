@@ -10,7 +10,7 @@ from scarf.embeddings.umap import (
     fuzzy_simplicial_set,
     simplicial_set_embedding,
 )
-from scarf.embeddings.harmony import run_harmony
+from scarf.embeddings.harmony import fit_harmony
 
 
 def _ring_graph(n: int) -> coo_matrix:
@@ -163,6 +163,18 @@ def test_initial_embedding_matches_regression_values():
     )
 
 
+def test_initial_embedding_is_repeatable_when_pca_uses_the_randomized_solver():
+    rng = np.random.default_rng(0)
+    # Nearly tied leading variances make an unseeded randomized SVD differ.
+    centers = rng.normal(size=(1000, 150)) * np.linspace(3, 0.1, 150)
+    labels = rng.integers(0, len(centers), 400)
+
+    first = initial_embedding(centers, labels, 2)
+    second = initial_embedding(centers, labels, 2)
+
+    np.testing.assert_array_equal(first, second)
+
+
 def test_initial_embedding_accepts_integral_float_labels_and_rejects_invalid():
     centers = np.eye(3)
     integral = initial_embedding(centers, np.array([0.0, 1.0, 2.0]), 2)
@@ -178,7 +190,7 @@ def test_initial_embedding_accepts_integral_float_labels_and_rejects_invalid():
             initial_embedding(centers, labels, 2)
 
 
-def test_run_harmony_corrects_batch_structure():
+def test_fit_harmony_corrects_batch_structure():
     rng = np.random.default_rng(0)
     n_cells = 180
     n_dims = 12
@@ -189,14 +201,14 @@ def test_run_harmony_corrects_batch_structure():
         data[:, cell_idx] += batch_effect[batch_id]
 
     meta = pd.DataFrame({"batch": [f"batch_{x}" for x in batch]})
-    corrected = run_harmony(
+    corrected = fit_harmony(
         data,
         meta,
         nclust=15,
         max_iter_harmony=4,
         max_iter_kmeans=5,
         random_state=0,
-    )
+    ).corrected
 
     assert corrected.shape == data.shape
     assert np.all(np.isfinite(corrected))

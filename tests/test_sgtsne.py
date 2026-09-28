@@ -23,11 +23,12 @@ def _graph() -> csr_matrix:
     )
 
 
-def test_run_sgtsne_validates_initial_embedding_shape():
+@pytest.mark.parametrize("initial", [np.zeros((3, 3)), np.zeros(6)])
+def test_run_sgtsne_validates_initial_embedding_shape(initial):
     with pytest.raises(ValueError, match=r"must have shape \(3, 2\)"):
         sgtsne_module.run_sgtsne(
             _graph(),
-            np.zeros((3, 3)),
+            initial,
             tsne_dims=2,
         )
 
@@ -111,7 +112,7 @@ def test_run_sgtsne_cli_backend_passes_argv_and_cleans_temporary_files(
     try:
         embedding = sgtsne_module.run_sgtsne(
             graph,
-            np.arange(6),
+            np.arange(6).reshape(3, 2),
             tsne_dims=2,
             max_iter=11,
             early_iter=3,
@@ -148,7 +149,7 @@ def test_run_sgtsne_cli_backend_passes_argv_and_cleans_temporary_files(
         str((work_dir / "fixed_output.txt").resolve()),
         str((work_dir / "fixed.mtx").resolve()),
     ]
-    exported = mmread(record / "graph.mtx")
+    exported = mmread(record / "graph.mtx", spmatrix=False)
     assert exported.nnz == 4
     assert np.all(exported.data > 0)
     np.testing.assert_array_equal(exported.toarray(), graph.toarray())

@@ -25,8 +25,9 @@ def ingest_seurat(
     writer_started = False
     try:
         reader = SeuratReader(str(path))
-        writer = SeuratToZarr(reader, zarr_loc=zarr_path)
+        # Writers open the destination in their constructor.
         writer_started = True
+        writer = SeuratToZarr(reader, zarr_loc=zarr_path)
         writer.dump()
     except CONVERSION_DATA_ERRORS as exc:
         return failed_from_exception(

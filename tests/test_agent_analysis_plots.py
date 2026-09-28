@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from scarf.agent import _plots
+from scarf.plotting._style import resolve_category_scale
 from scarf.storage.refs import ArtifactRef
 
 
@@ -168,5 +169,27 @@ def test_small_map_draws_every_frozen_cell(monkeypatch: pytest.MonkeyPatch) -> N
             [artist.get_offsets()[:, 0] for artist in plot.axes["clusters"].collections]
         )
         np.testing.assert_array_equal(np.sort(offsets), np.arange(12))
+    finally:
+        plot.close()
+
+
+class NaturalLabels(VirtualArray):
+    """Labels whose natural order differs from their text order."""
+
+    def __getitem__(self, selection: slice) -> np.ndarray:
+        return np.asarray([10, 2, 1] * 4)[selection]
+
+
+def test_final_map_uses_plotting_category_order_and_colors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, refs, arrays = display_store(monkeypatch, n=12)
+    arrays["clusters"] = NaturalLabels(12)
+    plot = _plots.plot_final_umap(store, **refs, show=False)
+    try:
+        assert plot.scales[0] == resolve_category_scale(["10", "2", "1"], None)
+        assert plot.scales[0].order == ("1", "2", "10")
+        assert list(plot.tables["cluster_counts"]["cluster"]) == ["1", "2", "10"]
+        assert list(_plots.cluster_counts(store, refs["clusters"])) == ["1", "2", "10"]
     finally:
         plot.close()

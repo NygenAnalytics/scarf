@@ -14,7 +14,6 @@ from .types import array_metadata_shards
 PROFILE_METADATA_CHUNK = 100_000
 _CODEC_MAX_BYTES = 2_147_483_647
 DEFAULT_TARGET_CHUNK_BYTES = 128 * 1024 * 1024
-DEFAULT_TARGET_SHARD_BYTES = 5 * DEFAULT_TARGET_CHUNK_BYTES
 
 
 def _encoded_chunk_bound(rawBytes: int) -> int:
@@ -106,40 +105,17 @@ def count_array_spec(
     *,
     profile: StorageProfile,
     policy: Any | None = None,
-    zarrFormat: int = 3,
 ) -> ZarrArraySpec:
-    """Build an array specification for an assay count matrix.
+    """Build the paired rotateOnce U/Q specification for an assay count matrix."""
+    from .count_matrix import DEFAULT_COUNT_MATRIX_POLICY, plan_count_matrix_pair
 
-    Zarr v3 uses the paired rotateOnce U/Q geometry. Zarr v2 stores plain
-    chunks without shards.
-    """
-    if int(zarrFormat) >= 3:
-        from .count_matrix import DEFAULT_COUNT_MATRIX_POLICY, plan_count_matrix_pair
-
-        return plan_count_matrix_pair(
-            nCells,
-            nFeats,
-            dtype,
-            policy=policy or DEFAULT_COUNT_MATRIX_POLICY,
-            profile=profile,
-        ).counts
-    n_cells = max(0, int(nCells))
-    n_feats = max(0, int(nFeats))
-    itemsize = int(np.dtype(dtype).itemsize)
-    if n_cells == 0 or n_feats == 0:
-        chunks = (1, 1)
-    else:
-        row_bytes = max(1, n_feats * itemsize)
-        chunk_rows = max(1, min(n_cells, DEFAULT_TARGET_CHUNK_BYTES // row_bytes))
-        chunks = (chunk_rows, n_feats)
-    return ZarrArraySpec(
-        shape=(nCells, nFeats),
-        chunks=chunks,
-        shards=None,
-        dtype=dtype,
-        compressors=get_compressors(profile, zarrFormat=zarrFormat),
-        fillValue=0,
-    )
+    return plan_count_matrix_pair(
+        nCells,
+        nFeats,
+        dtype,
+        policy=policy or DEFAULT_COUNT_MATRIX_POLICY,
+        profile=profile,
+    ).counts
 
 
 def normed_array_spec(
@@ -231,7 +207,9 @@ def row_sharded_array_spec(
             key=lambda value: (abs(value - target_rows), value > target_rows),
             default=1,
         )
-        if chunk_rows == 1 and target_rows > 1:
+        # A shard extent without a divisor near the target, such as a prime
+        # or twice a prime row count, would split into tiny chunks.
+        if 2 * chunk_rows < target_rows:
             shard_rows = target_rows
             chunk_rows = target_rows
     else:

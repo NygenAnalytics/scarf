@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ...utils.arguments import integer_argument
 from .models import ClusterFn, HarmonyResult
 
 _DATA_ARGUMENTS = frozenset({"data_mat", "meta_data"})
@@ -20,11 +21,7 @@ def _require_integer(
 ) -> None:
     if name not in values or (optional and values[name] is None):
         return
-    value = values[name]
-    if isinstance(value, bool) or not isinstance(value, int | np.integer):
-        raise TypeError(f"Harmony {name} must be an integer")
-    if value < minimum:
-        raise ValueError(f"Harmony {name} must be at least {minimum}")
+    integer_argument(values[name], f"Harmony {name}", minimum=minimum)
 
 
 def _require_real(
@@ -98,7 +95,7 @@ def validate_harmony_parameters(
         raise ValueError(f"Unsupported Harmony parameters: {', '.join(unsupported)}")
     _require_integer(values, "nclust", 1, optional=True)
     _require_integer(values, "max_iter_harmony", 0)
-    _require_integer(values, "max_iter_kmeans", 0)
+    _require_integer(values, "max_iter_kmeans", 1)
     _require_integer(values, "random_state", 0)
     _require_real(values, "tau", positive=False)
     _require_real(values, "block_size", positive=True)
@@ -111,43 +108,6 @@ def validate_harmony_parameters(
     if not callable(cluster_fn) and cluster_fn != "kmeans":
         raise ValueError("Harmony cluster_fn must be 'kmeans' or a callable")
     return values
-
-
-def run_harmony(
-    data_mat: np.ndarray,
-    meta_data: pd.DataFrame,
-    theta: float | int | np.ndarray | list[float] | None = None,
-    lamb: float | int | np.ndarray | list[float] | None = None,
-    sigma: float | np.ndarray = 0.1,
-    nclust: int | None = None,
-    tau: float = 0,
-    block_size: float = 0.05,
-    max_iter_harmony: int = 50,
-    max_iter_kmeans: int = 20,
-    epsilon_cluster: float = 1e-5,
-    epsilon_harmony: float = 1e-4,
-    random_state: int = 0,
-    cluster_fn: ClusterFn = "kmeans",
-) -> np.ndarray:
-    """Run Harmony batch correction on a PCA embedding."""
-    from .. import fit_harmony
-
-    return fit_harmony(
-        data_mat,
-        meta_data,
-        theta=theta,
-        lamb=lamb,
-        sigma=sigma,
-        nclust=nclust,
-        tau=tau,
-        block_size=block_size,
-        max_iter_harmony=max_iter_harmony,
-        max_iter_kmeans=max_iter_kmeans,
-        epsilon_cluster=epsilon_cluster,
-        epsilon_harmony=epsilon_harmony,
-        random_state=random_state,
-        cluster_fn=cluster_fn,
-    ).corrected
 
 
 def fit_harmony(
@@ -177,6 +137,8 @@ def fit_harmony(
         )
     if data_mat.shape[1] < 2:
         raise ValueError("Harmony requires at least two cells")
+    if max_iter_kmeans < 1:
+        raise ValueError("Harmony max_iter_kmeans must be at least 1")
     if meta_data.empty:
         raise ValueError("Harmony requires at least one batch metadata column")
     if meta_data.columns.duplicated().any():

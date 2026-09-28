@@ -15,7 +15,6 @@ _METHODS = {
         "lineage",
         "list_artifacts",
         "load_artifact",
-        "set_default_assay",
         "snapshot_cell_selection",
         "summary",
     ),
@@ -46,7 +45,6 @@ _METHODS = {
         "run_umap",
     ),
     MappingDatastore: (
-        "calibrate_label_transfer_threshold",
         "get_mapping_result",
         "get_mapping_score",
         "get_target_classes",
@@ -65,7 +63,6 @@ _METHODS = {
         "get_assay",
         "get_enrichment",
         "get_markers",
-        "load_metric_lisi",
         "make_bulk",
         "select_all_features",
         "select_hvgs",
@@ -76,7 +73,6 @@ _METHODS = {
         "metric_graph_silhouette",
         "metric_ilisi",
         "metric_label_concordance",
-        "metric_lisi",
         "metric_proportional_batch_mixing",
         "resolve_features",
         "run_aucell",
@@ -98,10 +94,10 @@ _METHODS = {
 }
 
 _SIGNATURE_DIGESTS = {
-    BaseDataStore: "c37e846f04db4d315c763923651bcca47e675527f0ff343c6d584715cc77fe46",
-    GraphDataStore: "a03fc69081f062a311cbc4ba45c61837e7e64d8755be2b60373439c0ae9df5b8",
-    MappingDatastore: "dd7c11707d882495a767ccc3022e5053344a6c4196e5f1bd9b0a4008a55e78ff",
-    DataStore: "556df680799d5420ad0ee0a6f5119fda795c3e5287e48db8e917b6c699f16eae",
+    BaseDataStore: "b0a25c0e7fcf56aeddafc4a7436f7cb049dcbf9175ba8cb41365c3d878ac30b0",
+    GraphDataStore: "0e3510e49b10db97e8e0cda982d629791dcd748f4f5130e4d3ebcfb9d2b9fa7d",
+    MappingDatastore: "bdcd18e0e07f363a095848aeacc64fa28a83a1641c97aefb13a091be0dc583fb",
+    DataStore: "e3df7f866e8852021d53ca50bc0b6488923c59d8b8728542f639ba0063333944",
 }
 
 
@@ -161,7 +157,6 @@ def test_datastore_static_method_contracts_are_stable():
             "_projection_block_size",
             "_query_batch_design",
             "_reference_label_codes",
-            "calibrate_label_transfer_threshold",
         ),
         DataStore: ("_write_marker_slot",),
     }
@@ -261,50 +256,6 @@ def test_datastore_private_mixin_order_is_stable():
     ]
 
 
-def test_datastore_temporary_factory_uses_parent_budget_and_local_profile(tmp_path):
-    import numpy as np
-    from scipy.sparse import csr_matrix
-
-    from scarf.datastore._operations.quality_control import (
-        _QualityControlOperationsMixin,
-    )
-    from scarf.quality_control.doublets import write_doublet_target_zarr
-
-    descriptor = inspect.getattr_static(DataStore, "_create_temporary_datastore")
-    assert not isinstance(descriptor, staticmethod)
-    assert "_create_temporary_datastore" in DataStore.__dict__
-    assert "_create_temporary_datastore" not in _QualityControlOperationsMixin.__dict__
-
-    class DataStoreSubclass(DataStore):
-        pass
-
-    path = tmp_path / "temporary.zarr"
-    write_doublet_target_zarr(
-        zarr_loc=str(path),
-        assay_name="RNA",
-        sim_counts=csr_matrix(np.array([[1, 0], [0, 2]], dtype=np.uint16)),
-        feat_ids=np.array(["f1", "f2"]),
-        feat_names=np.array(["g1", "g2"]),
-        dtype="uint16",
-        mem_budget=64 * 1024 * 1024,
-        nthreads=1,
-        profile="fast_local",
-    )
-
-    source = object.__new__(DataStoreSubclass)
-    source.memoryBytes = 64 * 1024 * 1024
-    source.storageProfile = "cloud"
-    result = source._create_temporary_datastore(
-        str(path),
-        default_assay="RNA",
-        assay_types={"RNA": "RNA"},
-        nthreads=3,
-    )
-    assert result.memoryBytes == 64 * 1024 * 1024
-    assert result.nthreads == 3
-    assert result.storageProfile == "fast_local"
-
-
 def test_datastore_facades_only_own_composition_methods():
     def defined_methods(cls: type) -> set[str]:
         return {
@@ -314,11 +265,10 @@ def test_datastore_facades_only_own_composition_methods():
             or isinstance(value, (classmethod, staticmethod))
         }
 
-    assert defined_methods(GraphDataStore) == {"__init__"}
+    assert defined_methods(GraphDataStore) == set()
     assert defined_methods(MappingDatastore) == set()
     assert defined_methods(DataStore) == {
         "__init__",
-        "_create_temporary_datastore",
         "get_assay",
         "resolve_features",
     }

@@ -107,21 +107,6 @@ class RNode:
     def is_null(self) -> bool:
         return self.type in {RType.NIL, RType.NIL_VALUE}
 
-    def attribute(self, name: str) -> "RNode | None":
-        return get_attribute(self, name)
-
-    def slot(self, name: str) -> "RNode | None":
-        return get_slot(self, name)
-
-    def named(self, name: str) -> "RNode | None":
-        return get_named(self, name)
-
-    def attribute_items(self) -> "Iterator[tuple[str, RNode]]":
-        return iter_attributes(self)
-
-    def named_items(self) -> "Iterator[tuple[str | bytes | None, RNode]]":
-        return iter_named(self)
-
 
 def symbol_name(node: RNode | None) -> str | None:
     """Return the text carried by a symbol node."""
@@ -203,14 +188,6 @@ def iter_named(node: RNode) -> Iterator[tuple[str | bytes | None, RNode]]:
         )
     for index, value in enumerate(values):
         yield names[index], value
-
-
-def get_named(node: RNode, name: str) -> RNode | None:
-    """Look up the first value with an exact serialized name."""
-    for candidate, value in iter_named(node):
-        if candidate == name:
-            return value
-    return None
 
 
 class RdsDocument:

@@ -128,21 +128,6 @@ class RdsMetadata:
     native_encoding: str | None
     byte_order: str | None
 
-    @staticmethod
-    def unpack_r_version(packed: int) -> tuple[int, int, int]:
-        """Return an R packed version as major, minor, and patch."""
-        major, remainder = divmod(packed, 65536)
-        minor, patch = divmod(remainder, 256)
-        return major, minor, patch
-
-    @property
-    def writer_version_tuple(self) -> tuple[int, int, int]:
-        return self.unpack_r_version(self.writer_version)
-
-    @property
-    def minimum_reader_version_tuple(self) -> tuple[int, int, int]:
-        return self.unpack_r_version(self.minimum_reader_version)
-
 
 class RdsError(Exception):
     """Base class for deterministic RDS errors."""

@@ -241,8 +241,6 @@ def test_atac_marker_heatmap_defaults_to_unlogged_tfidf(
         marker=marker,
         topn=1,
         log_transform=None,
-        vmin=-1,
-        vmax=2,
     )
 
     assert observed_log_transform == [False]

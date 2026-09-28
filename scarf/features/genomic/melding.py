@@ -6,6 +6,11 @@ import zarr
 from scipy.sparse import csc_matrix
 
 from ...assay import Assay
+from ...assay.normalization import (
+    inverse_document_frequency,
+    stream_document_frequency,
+    tfidf_values,
+)
 from ...storage.budget import ResourceBudget
 from ...storage.identity import CountSummary, finalize_counts
 from ...storage.count_matrix import (
@@ -13,12 +18,12 @@ from ...storage.count_matrix import (
     CountMatrixPolicy,
 )
 from ...storage.layout import array_shard_rows
-from ...storage.schema import DerivedAssayTransaction, derived_assay_transaction
-from ...storage.sharding import sparse_matrix_bytes, write_dense_from_row_batches
-from ...utils.arrays import array_digest
+from ...storage.schema import DerivedAssayTransaction
+from ...storage.sharding import write_dense_from_row_batches
+from ...utils.arrays import array_digest, sparse_matrix_bytes
 from .intervals import create_bed_from_coord_ids, get_feature_mappings
 
-__all__ = ["create_counts_mat", "coordinate_melding"]
+__all__ = ["create_counts_mat", "write_melded_counts"]
 
 
 def _source_working_bytes(
@@ -178,7 +183,6 @@ def create_counts_mat(
         dtype=np.float64,
     )
     n_term_per_doc[n_term_per_doc == 0] = 1
-    selected_mask: np.ndarray | None = None
     if selected_cell_count == n_docs:
         n_docs_per_term = np.asarray(
             assay.feats.fetch_all("nCells"),
@@ -188,61 +192,20 @@ def create_counts_mat(
         assert selected_cells is not None
         selected_mask = np.zeros(n_docs, dtype=bool)
         selected_mask[selected_cells] = True
-        n_docs_per_term = np.zeros(n_source_features, dtype=np.int64)
-        feature_temporaries = n_source_features * np.dtype(np.int64).itemsize
-        static_bytes = (
-            mapping_bytes
-            + selected_cells.nbytes
-            + selected_mask.nbytes
-            + n_term_per_doc.nbytes
-            + n_docs_per_term.nbytes
-            + feature_temporaries
-        )
-        current_rows = min(int(assay.rawData.chunksize[0]), n_docs)
-        selected_copy_per_row = n_source_features * source_itemsize
-        stream_owned_per_row = n_source_features * source_itemsize
-        working_bytes_per_row = selected_copy_per_row + stream_owned_per_row
-        available_bytes = int(assay.resources.memoryBytes) - static_bytes - decode_bytes
-        if available_bytes < working_bytes_per_row:
-            required_bytes = static_bytes + decode_bytes + working_bytes_per_row
-            raise MemoryError(
-                "Gene-score document frequency needs about "
-                f"{required_bytes} bytes for one row, but the operation limit is "
-                f"{assay.resources.memoryBytes} bytes"
-            )
-        document_frequency_rows = min(
-            current_rows,
-            available_bytes // working_bytes_per_row,
-        )
-        document_frequency_data = assay.rawData._with_block_size(
-            document_frequency_rows
-        )
-        stream_resident_bytes = (
-            static_bytes + document_frequency_rows * selected_copy_per_row
-        )
-        row_offset = 0
-        for block_values in document_frequency_data._stream_blocks(
+        n_docs_per_term, _ = stream_document_frequency(
+            assay.rawData,
+            memory_bytes=int(assay.resources.memoryBytes),
             nthreads=assay.nthreads,
             msg="Computing gene-score document frequency",
-            prefetch=1,
-            row_mask=None,
-            resident_bytes=stream_resident_bytes,
-        ):
-            row_stop = row_offset + block_values.shape[0]
-            block_mask = selected_mask[row_offset:row_stop]
-            if block_mask.any():
-                n_docs_per_term += np.count_nonzero(
-                    block_values[block_mask],
-                    axis=0,
-                )
-            row_offset = row_stop
-        if row_offset != n_docs:
-            raise RuntimeError(
-                f"Gene-score document-frequency stream produced {row_offset} rows; "
-                f"expected {n_docs}"
-            )
-    idf = np.log2(1 + (selected_cell_count / (n_docs_per_term + 1)))
-    del n_docs_per_term, selected_cells, selected_mask
+            operation="Gene-score document frequency",
+            resident_bytes=(
+                mapping_bytes + selected_cells.nbytes + n_term_per_doc.nbytes
+            ),
+            row_mask=selected_mask,
+        )
+        del selected_mask
+    idf = inverse_document_frequency(selected_cell_count, n_docs_per_term)
+    del n_docs_per_term, selected_cells
 
     shard_rows = array_shard_rows(store)
     store_itemsize = np.dtype(store.dtype).itemsize
@@ -285,10 +248,9 @@ def create_counts_mat(
             while row < block_values.shape[0]:
                 stop = min(row + source_rows, block_values.shape[0])
                 values = np.asarray(block_values[row:stop])
-                tf = values / n_term_per_doc[start : start + values.shape[0]].reshape(
-                    -1, 1
+                tfidf = tfidf_values(
+                    values, n_term_per_doc[start : start + values.shape[0]], idf
                 )
-                tfidf = tf * idf
                 block = np.asarray(tfidf @ mapping, dtype=np.float64)
                 if renormalization:
                     row_sums = block.sum(axis=1)
@@ -312,57 +274,6 @@ def create_counts_mat(
         countSummary=summary,
     )
     finalize_counts(store, summary=summary)
-
-
-def coordinate_melding(
-    assay: Assay,
-    workspace: str | None,
-    feature_bed: pd.DataFrame,
-    new_assay_name: str,
-    peaks_col: str = "ids",
-    scalar_coeff: float = 1e5,
-    renormalization: bool = True,
-    peaks_coords: np.ndarray | None = None,
-    idf_cell_idx: np.ndarray | None = None,
-) -> None:
-    """Transfer coordinate-based assay values to overlapping external features.
-
-    The new assay becomes visible to assay scans only after its counts are
-    complete. A failed or interrupted write removes the partial assay.
-
-    Args:
-        assay: Source assay whose features have genomic coordinates.
-        workspace: Workspace name. None uses the legacy layout.
-        feature_bed: External interval table used as the meld target.
-        new_assay_name: Name of the assay group to create.
-        peaks_col: Feature-metadata column holding source coordinates.
-        scalar_coeff: Scaling coefficient applied during melding.
-        renormalization: If True, rescale melded values after mapping.
-        peaks_coords: Optional precomputed source coordinates. When None,
-                      values are read from ``peaks_col``.
-        idf_cell_idx: Optional cell indices used for IDF statistics.
-
-    Returns:
-        None
-    """
-    from ...storage.stores import zarr_group_root
-
-    with derived_assay_transaction(
-        zarr_group_root(assay.z, mode="r+"),
-        new_assay_name,
-        workspace,
-        operation="coordinate_melding",
-    ) as transaction:
-        write_melded_counts(
-            transaction,
-            assay,
-            feature_bed,
-            peaks_col=peaks_col,
-            scalar_coeff=scalar_coeff,
-            renormalization=renormalization,
-            peaks_coords=peaks_coords,
-            idf_cell_idx=idf_cell_idx,
-        )
 
 
 def write_melded_counts(

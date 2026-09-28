@@ -7,22 +7,21 @@ import numpy as np
 import zarr
 
 from ..storage.types import as_zarr_array
-from ..utils.arrays import regex_match_mask
-
-DEFAULT_PERCENT_PATTERNS = {"percentMito": "^MT-", "percentRibo": "RPS|RPL|MRPS|MRPL"}
 
 
 def default_feature_sets(assay: zarr.Group) -> list[np.ndarray]:
-    """Return the features each default RNA percentage pattern matches.
+    """Return the features of each default RNA percentage gene family.
 
     Writers total these sets while transposing counts, so preparation with the
     default patterns needs no second read of the matrix.
     """
+    from ..features.gene_families import PERCENT_FAMILIES, gene_family_mask
+
     names = as_zarr_array(assay["featureData/names"], name="featureData/names")
     values = np.asarray(names[:]).astype(str)
     return [
-        np.flatnonzero(regex_match_mask(values, pattern))
-        for pattern in DEFAULT_PERCENT_PATTERNS.values()
+        np.flatnonzero(gene_family_mask(values, family))
+        for family in PERCENT_FAMILIES.values()
     ]
 
 
@@ -50,21 +49,6 @@ def preset_assay_types() -> dict[str, type]:
         "URNA": RNAassay,
         "Assay": Assay,
     }
-
-
-def rna_assay_type_names() -> frozenset[str]:
-    """Return preset type strings that map to ``RNAassay``.
-
-    Returns:
-        Names such as ``RNA``, ``GeneActivity``, ``GeneScores``, and ``URNA``.
-    """
-    from .rna import RNAassay
-
-    return frozenset(
-        name
-        for name, assay_cls in preset_assay_types().items()
-        if issubclass(assay_cls, RNAassay)
-    )
 
 
 def resolve_persisted_assay_type(

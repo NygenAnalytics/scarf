@@ -29,22 +29,13 @@ from ._contracts import (
 )
 
 
-def _artifact_cell_selection(
-    store: Any,
-    ref: ArtifactRef,
-    *,
-    label: str,
-) -> ArtifactRef:
-    status = inspect_artifact(store.zw, ref)
-    raw_selection = (status.inputs or {}).get("cell_selection")
-    if not isinstance(raw_selection, Mapping):
-        raise ValueError(f"{label} artifact has no cell-selection input")
-    try:
-        return ArtifactRef.from_dict(raw_selection)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(
-            f"{label} artifact has an invalid cell-selection input"
-        ) from exc
+def _artifact_input(store: Any, ref: ArtifactRef, name: str) -> ArtifactRef:
+    """Return the artifact an artifact's provenance records as input ``name``."""
+    return inspect_artifact(store.zw, ref).input_ref(name)
+
+
+def _artifact_cell_selection(store: Any, ref: ArtifactRef) -> ArtifactRef:
+    return _artifact_input(store, ref, "cell_selection")
 
 
 def _validated_embedding_selection(
@@ -60,7 +51,7 @@ def _validated_embedding_selection(
     if not status.complete:
         raise ValueError("Embedding artifact is unavailable or incomplete")
 
-    selection = _artifact_cell_selection(store, layout, label="Embedding")
+    selection = status.input_ref("cell_selection")
     if status.operation == "import_dimreduc":
         from ..embeddings.imported import validate_imported_embedding_artifact
 
@@ -72,13 +63,7 @@ def _validated_embedding_selection(
             "Embedding artifact must be produced by import_dimreduc, run_umap, "
             "or run_tsne"
         )
-    raw_graph = (status.inputs or {}).get("graph")
-    if not isinstance(raw_graph, Mapping):
-        raise ValueError("Embedding artifact has no graph input")
-    try:
-        graph = ArtifactRef.from_dict(raw_graph)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("Embedding artifact has an invalid graph input") from exc
+    graph = status.input_ref("graph")
     if layout.scope != graph.scope or layout.assay != graph.assay:
         raise ValueError("Embedding artifact scope does not match its graph input")
 
@@ -111,6 +96,42 @@ def _cell_column_missing(
     return np.asarray(read_array_rows_chunkwise(mask, rows), dtype=bool)
 
 
+def _cell_column_values(
+    store: Any,
+    column: str,
+    *,
+    cell_key: str = "I",
+    cell_idx: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Read one cell-metadata column and its missing mask for the plotted rows.
+
+    Rows pass ``cell_key`` unless ``cell_idx`` names exact physical rows. A
+    frozen run view answers for its own selection when that selection holds
+    exactly the requested rows.
+    """
+    cells = store.cells
+    if cell_idx is None:
+        values = np.asarray(cells.fetch(column, key=cell_key))
+    else:
+        selected = (
+            np.asarray(cells.fetch(column, key="I"))
+            if getattr(cells, "_selection_ref", None) is not None
+            else None
+        )
+        values = (
+            selected
+            if selected is not None and selected.shape[0] == len(cell_idx)
+            else np.asarray(np.asarray(cells.fetch_all(column))[cell_idx])
+        )
+    missing = _cell_column_missing(
+        cells,
+        column,
+        cell_key=cell_key,
+        cell_idx=cell_idx,
+    )
+    return values, missing
+
+
 def _fetch_cell_column(
     store: Any,
     column: str,
@@ -123,14 +144,8 @@ def _fetch_cell_column(
 
     See :func:`~scarf.metadata.rows.apply_missing_mask` for ``labels``.
     """
-    cells = store.cells
-    values = np.asarray(
-        cells.fetch(column, key=cell_key)
-        if cell_idx is None
-        else np.asarray(cells.fetch_all(column))[cell_idx]
-    )
-    missing = _cell_column_missing(
-        cells,
+    values, missing = _cell_column_values(
+        store,
         column,
         cell_key=cell_key,
         cell_idx=cell_idx,
@@ -410,64 +425,52 @@ _MAX_SUMMARY_FEATURES = 2000
 _MAX_SUMMARY_SAMPLES = 500
 
 
-def _check_feature_count(
-    pairs: Sequence[tuple[str | None, str | FeatureRef]],
-    *,
-    max_features: int = _MAX_SUMMARY_FEATURES,
-) -> None:
-    """Reject an empty feature list or one longer than ``max_features``."""
+def _check_feature_count(pairs: Sequence[tuple[str | None, str | FeatureRef]]) -> None:
+    """Reject an empty feature list or one longer than a summary plot can show."""
     if not pairs:
         raise ValueError("At least one feature is required")
-    if len(pairs) > max_features:
+    if len(pairs) > _MAX_SUMMARY_FEATURES:
         raise ValueError(
-            f"Too many features ({len(pairs)} > {max_features}). "
-            "Raise max_features explicitly if intentional."
+            f"Too many features ({len(pairs)} > {_MAX_SUMMARY_FEATURES}). "
+            "Summary plots show a bounded feature panel; select fewer features."
         )
 
 
-def summarize_features_by_group(
-    store: Any,
-    *,
-    features: Sequence[str | FeatureRef] | Mapping[str, Sequence[str | FeatureRef]],
-    group_by: str | tuple[str, ...] | None = None,
-    groups: ArtifactRef | None = None,
-    cell_key: str = "I",
-    from_assay: str | None = None,
-    sample_by: str | None = None,
-    study_design: StudyDesign | None = None,
-    normalization: NormalizationSpec | None = None,
-    expression_cutoff: float = 0.0,
-    max_groups: int = _MAX_SUMMARY_GROUPS,
-    max_features: int = _MAX_SUMMARY_FEATURES,
-    max_samples: int = _MAX_SUMMARY_SAMPLES,
-) -> tuple[pd.DataFrame, pd.DataFrame | None]:
-    """Aggregate features by group. With sample_by, samples get equal weight.
+def _explicit_label(feature: ResolvedFeature) -> bool:
+    return isinstance(feature.raw, FeatureRef) and feature.raw.label is not None
 
-    Missing group combinations are omitted (not filled with zeros).
+
+def _check_shared_labels(
+    resolved: Sequence[ResolvedFeature],
+    group_labels: Sequence[str | None],
+) -> None:
+    """Allow shared labels to pool features only when a caller asked for it.
+
+    Features that share a label and bracket group are pooled into one row.
+    That is only accepted for features of one assay that all carry an explicit
+    ``FeatureRef`` label; implicit collisions, such as one gene name in two
+    assays, would silently blend unrelated measurements.
     """
-    pairs = coerce_feature_list(features)
-    _check_feature_count(pairs, max_features=max_features)
-    resolved = [
-        resolve_feature(store, feat, from_assay=from_assay) for _, feat in pairs
-    ]
-    grouping = _resolve_grouping(
-        store,
-        group_by=group_by,
-        groups=groups,
-        cell_key=cell_key,
-    )
-    return _summarize_resolved_features(
-        store,
-        resolved,
-        [g for g, _ in pairs],
-        grouping,
-        sample_by=sample_by,
-        study_design=study_design,
-        normalization=normalization,
-        expression_cutoff=expression_cutoff,
-        max_groups=max_groups,
-        max_samples=max_samples,
-    )
+    members: dict[tuple[str, str | None], list[ResolvedFeature]] = {}
+    for feature, group in zip(resolved, group_labels, strict=True):
+        members.setdefault((feature.label, group), []).append(feature)
+    for (label, _), features in members.items():
+        identities = {
+            (feature.assay, feature.ids, feature.reduction) for feature in features
+        }
+        if len(identities) < 2:
+            continue
+        if len({feature.assay for feature in features}) > 1:
+            raise ValueError(
+                f"Features from different assays share the label {label!r}; "
+                "give each a distinct FeatureRef label"
+            )
+        if not all(_explicit_label(feature) for feature in features):
+            raise ValueError(
+                f"Different features share the label {label!r}; set the same "
+                "FeatureRef label on each to pool them, or distinct labels to "
+                "show them separately"
+            )
 
 
 def _summarize_resolved_features(
@@ -480,15 +483,15 @@ def _summarize_resolved_features(
     study_design: StudyDesign | None = None,
     normalization: NormalizationSpec | None = None,
     expression_cutoff: float = 0.0,
-    max_groups: int = _MAX_SUMMARY_GROUPS,
-    max_samples: int = _MAX_SUMMARY_SAMPLES,
 ) -> tuple[pd.DataFrame, pd.DataFrame | None]:
     """Aggregate resolved features over a grouping from ``_resolve_grouping``.
 
     ``group_labels`` holds each feature's bracket group, aligned with
     ``resolved``. Cells whose grouping label is masked as missing belong to
-    no group.
+    no group. With ``sample_by``, samples get equal weight. Group and feature
+    combinations without cells are omitted.
     """
+    _check_shared_labels(resolved, group_labels)
     condition_by: str | None = None
     if study_design is not None:
         sample_by = study_design.sample_by
@@ -502,10 +505,11 @@ def _summarize_resolved_features(
         else ~np.asarray(group_missing, dtype=bool)
     )
     n_groups = int(base.loc[labelled].drop_duplicates().shape[0])
-    if n_groups > max_groups:
+    if n_groups > _MAX_SUMMARY_GROUPS:
         raise ValueError(
-            f"Too many groups ({n_groups} > {max_groups}). "
-            "Raise max_groups explicitly if intentional."
+            f"Too many groups ({n_groups} > {_MAX_SUMMARY_GROUPS}). "
+            "Summary plots show a bounded group panel; group the cells more "
+            "coarsely."
         )
 
     gb_keys = list(group_keys)
@@ -531,10 +535,11 @@ def _summarize_resolved_features(
         if int(valid.sum()) == 0:
             raise ValueError("No cells with valid sample_by values")
         uniq_samples = pd.unique(np.asarray(samples)[valid])
-        if len(uniq_samples) > max_samples:
+        if len(uniq_samples) > _MAX_SUMMARY_SAMPLES:
             raise ValueError(
-                f"Too many samples ({len(uniq_samples)} > {max_samples}). "
-                "Raise max_samples explicitly if intentional."
+                f"Too many samples ({len(uniq_samples)} > {_MAX_SUMMARY_SAMPLES}). "
+                "Summary plots weight a bounded number of samples; aggregate "
+                "samples more coarsely."
             )
         base = base.loc[valid].copy()
         base["sample"] = np.asarray(samples)[valid]

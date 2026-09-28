@@ -14,7 +14,6 @@ from scarf.storage.arrays import create_metadata_column
 from scarf.storage.errors import ArtifactResolutionError
 from scarf.storage.selections import (
     fingerprint_selected_stored_strings,
-    iter_full_axis_selection_blocks,
     iter_selected_axis_selection_blocks,
     iter_stored_selection_blocks,
     read_stored_selection_indices,
@@ -23,6 +22,7 @@ from scarf.storage.selections import (
     resolve_metadata_snapshot,
     resolve_stored_selection_artifact,
     snapshot_run_metadata,
+    validate_cell_selection,
     validate_run_metadata_snapshot,
     validate_stored_selection_integrity,
     validate_stored_selection_live_alias,
@@ -35,6 +35,25 @@ def test_create_metadata_column_accepts_utf8_byte_strings() -> None:
     column = create_metadata_column(root, "cell_number_loaded", data=values)
     assert column[0] == "1000 cells/\u03bcl"
     assert column[1] == "unknown"
+
+
+# Byte-string ids come from external stores; Zarr warns that v3 has no spec yet.
+@pytest.mark.filterwarnings("ignore::zarr.errors.UnstableSpecificationWarning")
+def test_selected_string_fingerprints_decode_byte_ids_like_full_fingerprints() -> None:
+    from scarf.storage.artifacts import fingerprint_stored_strings
+
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    everyone = root.create_array("everyone", data=np.array([True, True]))
+    fixed = root.create_array(
+        "fixed", data=np.array([b"caf\xc3\xa9", b"tea"], dtype="S5")
+    )
+    variable = root.create_array("variable", shape=(2,), dtype="bytes")
+    variable[:] = np.array([b"caf\xc3\xa9", b"tea"], dtype=object)
+
+    for ids in (fixed, variable):
+        fingerprint, count = fingerprint_selected_stored_strings(ids, everyone)
+        assert count == 2
+        assert fingerprint == fingerprint_stored_strings(ids)
 
 
 def test_fingerprint_selected_stored_strings_rejects_and_hashes() -> None:
@@ -197,6 +216,24 @@ def test_selection_integrity_is_independent_of_live_alias() -> None:
     assert row_error.value.code == "row_identity_mismatch"
 
 
+def test_cell_selection_validator_accepts_only_datastore_cell_selections() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    ref = _create_stored_cell_selection(root, np.array([True, False, True]))
+
+    assert validate_cell_selection(root, ref).selected_count == 2
+    with pytest.raises(TypeError, match="cell_selection must be an ArtifactRef"):
+        validate_cell_selection(root, ref.to_dict())  # type: ignore[arg-type]
+    features = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="feature_selection",
+        artifact_id=ref.artifact_id,
+    )
+    with pytest.raises(ArtifactResolutionError) as caught:
+        validate_cell_selection(root, features)
+    assert caught.value.code == "artifact_reference_mismatch"
+
+
 def test_selection_block_helpers_preserve_compact_and_full_axis_alignment() -> None:
     root = zarr.open_group(store=MemoryStore(), mode="w")
     mask = np.array([False, True, True, False, False, True, False])
@@ -234,21 +271,6 @@ def test_selection_block_helpers_preserve_compact_and_full_axis_alignment() -> N
         read_stored_selection_indices(root, ref, **common),
         np.array([1, 2, 5]),
     )
-
-    compact = np.array([[10.0, 11.0], [20.0, 21.0], [30.0, 31.0]])
-    aligned_blocks = list(
-        iter_full_axis_selection_blocks(
-            root,
-            ref,
-            compact,
-            fill_value=np.nan,
-            **common,
-        )
-    )
-    aligned = np.concatenate([block.values for block in aligned_blocks])
-    expected = np.full((len(mask), 2), np.nan)
-    expected[mask] = compact
-    np.testing.assert_equal(aligned, expected)
 
     full = np.arange(len(mask) * 2).reshape(len(mask), 2)
     selected_blocks = list(

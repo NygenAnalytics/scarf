@@ -64,15 +64,9 @@ def _default_write_text(path: Path, value: str) -> None:
     path.write_text(value, encoding="utf-8")
 
 
-def _default_list_pids(procRoot: Path) -> list[int]:
-    return [
-        int(entry.name)
-        for entry in procRoot.iterdir()
-        if entry.name.isdigit() and entry.is_dir()
-    ]
-
-
 def _optional_read(path: Path, readText: _ReadText) -> str | None:
+    # Unlike scarf.utils.process, any reader failure means "unavailable": a sampler
+    # must never fail the operation it measures.
     try:
         value = readText(path)
     except Exception:
@@ -216,7 +210,7 @@ class ResourceSampler:
         self.resetCgroupPeak = resetCgroupPeak
         self._readText = _default_read_text if readText is None else readText
         self._writeText = _default_write_text if writeText is None else writeText
-        self._listPids = _default_list_pids if listPids is None else listPids
+        self._listPids = listPids
         self._usesDefaultTextIo = readText is None and writeText is None
 
         self._stateLock = threading.Lock()
@@ -230,7 +224,6 @@ class ResourceSampler:
 
     def _reset_values(self) -> None:
         self._result: ResourceMeasurement | None = None
-        self._sampleCount = 0
         self._cgroupPath: Path | None = None
         self._cgroupVersion: Literal[1, 2] | None = None
         self._processTreeBaselineRssBytes: int | None = None
@@ -242,21 +235,6 @@ class ResourceSampler:
         self._cpuQuotaCores: float | None = None
         self._cgroupMemoryPeakInitialBytes: int | None = None
         self._cgroupMemoryPeakScope: PeakScope = "unavailable"
-
-    @property
-    def isRunning(self) -> bool:
-        with self._stateLock:
-            return self._running
-
-    @property
-    def sampleCount(self) -> int:
-        with self._stateLock:
-            return self._sampleCount
-
-    @property
-    def result(self) -> ResourceMeasurement | None:
-        with self._stateLock:
-            return self._result
 
     def _cgroup_file_name(self, name: str) -> str:
         if self._cgroupVersion == 1:
@@ -527,7 +505,6 @@ class ResourceSampler:
                 return sample
             if not force and not self._running:
                 return sample
-            self._sampleCount += 1
             if isBaseline:
                 self._processTreeBaselineRssBytes = sample.processTreeRssBytes
                 self._cgroupMemoryCurrentBaselineBytes = sample.cgroupMemoryCurrentBytes
@@ -610,18 +587,6 @@ class ResourceSampler:
             )
             ready_event.set()
         return self
-
-    def sample(self) -> None:
-        with self._stateLock:
-            generation = self._generation
-            running = self._running
-        if not running:
-            return
-        self._sample_and_record(
-            isBaseline=False,
-            force=False,
-            generation=generation,
-        )
 
     def _build_result(
         self,
@@ -722,21 +687,6 @@ class ResourceSampler:
                 self._stopEvent = None
                 self._thread = None
             return result
-
-    def __enter__(self) -> Self:
-        return self.start()
-
-    def __exit__(
-        self,
-        excType: type[BaseException] | None,
-        exc: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> bool:
-        try:
-            self.stop()
-        except Exception:
-            pass
-        return False
 
 
 class StageTimer:

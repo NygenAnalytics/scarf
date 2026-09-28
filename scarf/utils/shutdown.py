@@ -15,14 +15,6 @@ class ShutdownRequest:
     signal_number: int | None = None
     signal_name: str | None = None
 
-    def to_dict(self) -> dict[str, int | str | None]:
-        return {
-            "requestedAtNs": self.requested_at_ns,
-            "reason": self.reason,
-            "signalNumber": self.signal_number,
-            "signalName": self.signal_name,
-        }
-
 
 class ShutdownRequested(BaseException):
     """Raised at a safe checkpoint after cooperative shutdown was requested."""
@@ -159,7 +151,9 @@ class TemporarySignalGuard:
         )
         for signum in candidates:
             previous = signal.getsignal(signum)
-            if previous == signal.SIG_IGN:
+            # A handler installed outside Python reads as None and could not be
+            # restored, so that signal keeps its current handler.
+            if previous is None or previous == signal.SIG_IGN:
                 continue
 
             def handler(

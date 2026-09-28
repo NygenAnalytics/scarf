@@ -8,6 +8,7 @@ import pytest
 from scipy import sparse
 
 import scarf.datastore._operations.presentation as presentation_operations
+from scarf.assay.base import raw_csr
 from scarf.datastore.datastore import DataStore
 from scarf.datastore._operations.presentation import _PresentationOperationsMixin
 
@@ -156,7 +157,7 @@ def test_to_anndata_exports_empty_raw_cell_selection(export_store) -> None:
     )
     n_features = export_store.RNA.feats.N
 
-    raw = export_store.RNA.to_raw_sparse("empty_export")
+    raw = raw_csr(export_store.RNA, export_store.cells.active_index("empty_export"))
     adata = export_store.to_anndata(
         cell_key="empty_export",
         layers={"raw": "RNA"},
@@ -209,7 +210,7 @@ def test_live_exports_write_masked_metadata_as_missing(export_store, tmp_path) -
 
 def test_raw_feature_subset_matches_full_raw_columns(export_store) -> None:
     cell_indexes = export_store.cells.active_index("I")
-    full = export_store.RNA.to_raw_sparse("I")
+    full = raw_csr(export_store.RNA, cell_indexes)
 
     adata = export_store.to_anndata(feature_indexes=[3, 1])
 
@@ -249,7 +250,9 @@ def test_to_anndata_selects_names_and_aligns_raw_layers(export_store):
         layers={"raw": "RNA"},
     )
 
-    expected = export_store.RNA.to_raw_sparse("I")[:, [2, 0]]
+    expected = raw_csr(export_store.RNA, export_store.cells.active_index("I"))[
+        :, [2, 0]
+    ]
     assert sparse.isspmatrix_csr(adata.X)
     np.testing.assert_array_equal(adata.X.toarray(), expected.toarray())
     np.testing.assert_array_equal(adata.layers["raw"].toarray(), expected.toarray())
@@ -294,7 +297,7 @@ def test_to_anndata_aligns_reordered_layer_ids_without_subset(
 
     np.testing.assert_array_equal(
         adata.layers["reordered"].toarray(),
-        primary.to_raw_sparse("I").toarray(),
+        raw_csr(primary, export_store.cells.active_index("I")).toarray(),
     )
 
 

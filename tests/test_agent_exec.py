@@ -6,9 +6,11 @@ import asyncio
 import json
 import threading
 
-import httpx
-import pydantic_ai.providers.openai as openai_provider_module
+import httpx2
+import pydantic_ai.providers._openai_compatible as openai_client_module
+import pytest
 from openai import AsyncOpenAI
+from pydantic import ValidationError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -134,22 +136,39 @@ def test_model_settings_disable_thinking_across_provider_shapes() -> None:
         "reasoning": {"enabled": False},
     }
 
-    for profile in (
-        "auto",
-        "unified",
-        "ollama",
-        "chatTemplate",
-        "thinkingBody",
-        "reasoningBody",
-    ):
-        assert (
-            get_model_settings(AgentRunConfig(thinkingOffProfile=profile))["extra_body"]
-            == settings["extra_body"]
-        )
     assert get_model_settings(
         AgentRunConfig(extraModelSettings={"extra_body": {"custom": False}}),
         model="ollama:qwen3",
     )["extra_body"] == {"custom": False}
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"extra_headers": {"X-Trace": "1"}},
+        {"api_key": "sk-test"},
+        {"extra_body": {"Authorization": "Bearer token"}},
+        {"extra_body": {"nested": [{"x-api-key": "key"}]}},
+    ],
+)
+def test_agent_run_config_rejects_credentials_in_saved_model_settings(
+    settings: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError, match="must not contain credentials"):
+        AgentRunConfig(extraModelSettings=settings)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"timeoutSeconds": float("nan")},
+        {"timeoutSeconds": float("inf")},
+        {"temperature": float("nan")},
+    ],
+)
+def test_agent_run_config_rejects_non_finite_settings(values: dict[str, float]) -> None:
+    with pytest.raises(ValidationError, match="finite"):
+        AgentRunConfig(**values)
 
 
 def test_agent_run_config_clamps_per_stage_limits() -> None:
@@ -197,9 +216,9 @@ def test_baseten_request_disables_reasoning_at_wire_level() -> None:
     bodies: list[dict[str, object]] = []
 
     async def execute() -> dict[str, object]:
-        async def handle(request: httpx.Request) -> httpx.Response:
+        async def handle(request: httpx2.Request) -> httpx2.Response:
             bodies.append(json.loads(request.content))
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={
                     "id": "chatcmpl-test",
@@ -221,7 +240,7 @@ def test_baseten_request_disables_reasoning_at_wire_level() -> None:
                 },
             )
 
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        async with httpx2.AsyncClient(transport=httpx2.MockTransport(handle)) as client:
             openai_client = AsyncOpenAI(
                 api_key="test-key",
                 base_url="https://inference.baseten.co/v1",
@@ -427,14 +446,14 @@ def test_sync_runner_works_when_an_event_loop_is_already_running() -> None:
 def test_sync_runner_closes_and_reopens_owned_client_between_notebook_calls(
     monkeypatch,
 ) -> None:
-    clients: list[httpx.AsyncClient] = []
+    clients: list[httpx2.AsyncClient] = []
     request_loops: list[asyncio.AbstractEventLoop] = []
 
-    async def respond(request: httpx.Request) -> httpx.Response:
+    async def respond(request: httpx2.Request) -> httpx2.Response:
         request_loops.append(asyncio.get_running_loop())
         payload = json.loads(request.content)
         output_tool_name = payload["tools"][-1]["function"]["name"]
-        return httpx.Response(
+        return httpx2.Response(
             200,
             json={
                 "id": "chatcmpl-scarf-test",
@@ -471,14 +490,15 @@ def test_sync_runner_closes_and_reopens_owned_client_between_notebook_calls(
             },
         )
 
-    def make_client(*_args, **_kwargs) -> httpx.AsyncClient:
-        client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    def make_client(*_args, **_kwargs) -> httpx2.AsyncClient:
+        client = httpx2.AsyncClient(transport=httpx2.MockTransport(respond))
         clients.append(client)
         return client
 
+    # OpenAI-compatible providers create and recreate owned clients here.
     monkeypatch.setattr(
-        openai_provider_module,
-        "create_async_http_client",
+        openai_client_module,
+        "create_async_httpx2_client",
         make_client,
     )
     model = OpenAIChatModel(

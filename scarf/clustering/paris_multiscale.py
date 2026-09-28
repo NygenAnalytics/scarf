@@ -5,6 +5,7 @@ import numpy as np
 
 from ..storage.refs import ArtifactRef
 from ._paris_core import ParisHierarchy
+from ..utils.arguments import integer_argument
 from ..utils.arrays import has_duplicates
 
 _INFEASIBLE = np.uint8(0)
@@ -561,14 +562,7 @@ def adaptive_cut(
     configuration-null modularity guard on top of persistence without changing
     the underlying scoring; passing ``None`` reproduces the unguarded cut.
     """
-    if isinstance(min_cluster_size, (bool, np.bool_)) or not isinstance(
-        min_cluster_size,
-        (int, np.integer),
-    ):
-        raise TypeError("min_cluster_size must be an integer")
-    if min_cluster_size < 2:
-        raise ValueError("min_cluster_size must be at least 2")
-    min_cluster_size = int(min_cluster_size)
+    min_cluster_size = integer_argument(min_cluster_size, "min_cluster_size", minimum=2)
     forest = (
         collapse_equal_height_plateaus(hierarchy)
         if plateau_forest is None

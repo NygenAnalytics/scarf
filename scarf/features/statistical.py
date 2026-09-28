@@ -45,8 +45,10 @@ import pandas as pd
 from scipy.stats import f_oneway, kruskal, norm, ttest_ind, wilcoxon
 
 from ..metadata.selection import CellField, valid_category_mask as _valid_group_mask
+from ..storage.artifacts import fingerprint_array, fingerprint_strings, provenance_hash
 from ..storage.refs import ArtifactRef
-from .markers.rank import mannwhitneyu_from_ranks
+from .markers.rank import mannwhitneyu_from_ranks, tie_sum
+from .values import ResolvedFeature
 
 TestMethod = Literal[
     "auto",
@@ -123,18 +125,10 @@ WELCH_COLUMNS = (
 )
 ANOVA_COLUMNS = ("f_statistic", "df_between", "df_within", "p_value")
 
-_METHOD_COLUMNS: dict[str, tuple[str, ...]] = {
-    "mann_whitney": MANN_WHITNEY_COLUMNS,
-    "kruskal_wallis": KRUSKAL_WALLIS_COLUMNS,
-    "wilcoxon": WILCOXON_COLUMNS,
-    "welch": WELCH_COLUMNS,
-    "t_test": WELCH_COLUMNS,
-    "one_way_anova": ANOVA_COLUMNS,
-}
-
 __all__ = [
     "ANOVA_COLUMNS",
     "DUNN_COLUMNS",
+    "DesignFingerprints",
     "GroupComparisonResult",
     "KRUSKAL_WALLIS_COLUMNS",
     "MANN_WHITNEY_COLUMNS",
@@ -144,7 +138,14 @@ __all__ = [
     "adjust_pvalues",
     "aggregate_samples",
     "compare_group_distributions",
+    "design_fingerprints",
+    "distinct_label_keys",
+    "native_value",
     "resolve_group_order",
+    "select_study_design_rows",
+    "tested_column_identity",
+    "tested_feature_identity",
+    "value_fingerprint",
 ]
 
 
@@ -233,8 +234,150 @@ def adjust_pvalues(
     return adjusted
 
 
-def _native(value: Any) -> Any:
+def native_value(value: Any) -> Any:
+    """Return a NumPy scalar as the equal Python scalar and other values as given."""
     return value.item() if isinstance(value, np.generic) else value
+
+
+# Statistical-test results record the identities below, and distribution plots
+# rebuild them to decide whether a result may annotate a panel. Both sides use
+# these builders so the identities always agree.
+
+
+def value_fingerprint(values: Any) -> str:
+    """Return the fingerprint that statistical-test identities record for values.
+
+    Text and object arrays are fingerprinted as text; other arrays by their
+    dtype and values.
+    """
+    array = np.asarray(values)
+    if array.dtype.kind in {"O", "S", "U"}:
+        return fingerprint_strings(array)
+    return fingerprint_array(array)
+
+
+def tested_feature_identity(feature: ResolvedFeature) -> str:
+    """Return the tested-value identity of a resolved assay feature.
+
+    It covers the assay, the resolved feature IDs, and their reduction.
+    """
+    return provenance_hash(
+        {
+            "source": "feature",
+            "assay": feature.assay,
+            "ids": tuple(str(identifier) for identifier in feature.ids),
+            "reduction": feature.reduction,
+        }
+    )
+
+
+def tested_column_identity(
+    column: str,
+    values: Any,
+    missing: np.ndarray | None,
+) -> str:
+    """Return the tested-value identity of a cell-metadata column.
+
+    It covers the column name, the stored values of the cells that the
+    grouping resolves, and the column's missing mask over those cells.
+    """
+    return provenance_hash(
+        {
+            "source": "cell_metadata",
+            "column": column,
+            "values_fingerprint": value_fingerprint(values),
+            "missing_fingerprint": (
+                value_fingerprint(missing) if missing is not None else None
+            ),
+        }
+    )
+
+
+def distinct_label_keys(labels: Sequence[str]) -> list[str] | list[int]:
+    """Return the labels when they are distinct, or else their positions.
+
+    Statistical results name their tables by these keys as text, and
+    distribution plots key their panels by them.
+    """
+    if len(set(labels)) == len(labels):
+        return list(labels)
+    return list(range(len(labels)))
+
+
+@dataclass(frozen=True, slots=True)
+class DesignFingerprints:
+    """Fingerprints of the cells and design values that a test used."""
+
+    cell_selection_fingerprint: str
+    group_fingerprint: str
+    sample_fingerprint: str | None
+    pair_fingerprint: str | None
+
+
+def design_fingerprints(
+    cell_idx: np.ndarray,
+    groups: np.ndarray,
+    samples: np.ndarray | None = None,
+    pairs: np.ndarray | None = None,
+) -> DesignFingerprints:
+    """Fingerprint the tested cells and their group, sample, and pair values.
+
+    Args:
+        cell_idx: Global indices of the tested cells.
+        groups: Group label of each tested cell.
+        samples: Optional sample label of each tested cell.
+        pairs: Optional pair label of each tested cell.
+    """
+    return DesignFingerprints(
+        cell_selection_fingerprint=value_fingerprint(
+            np.asarray(cell_idx, dtype=np.int64)
+        ),
+        group_fingerprint=value_fingerprint(groups),
+        sample_fingerprint=None if samples is None else value_fingerprint(samples),
+        pair_fingerprint=None if pairs is None else value_fingerprint(pairs),
+    )
+
+
+def select_study_design_rows(
+    selected: np.ndarray,
+    *,
+    samples: np.ndarray | None = None,
+    sample_missing: np.ndarray | None = None,
+    pairs: np.ndarray | None = None,
+    pair_missing: np.ndarray | None = None,
+) -> tuple[np.ndarray, int]:
+    """Narrow a cell selection to cells with a valid sample and pair.
+
+    A selected cell without a valid sample is dropped. A pair is required:
+    a selected cell with a valid sample but no valid pair raises.
+
+    Args:
+        selected: Boolean selection over the cells.
+        samples: Optional sample label of each cell.
+        sample_missing: Optional explicit missing mask of ``samples``.
+        pairs: Optional pair label of each cell.
+        pair_missing: Optional explicit missing mask of ``pairs``.
+
+    Returns:
+        The narrowed selection and the number of selected cells dropped for a
+        missing sample.
+
+    Raises:
+        ValueError: If a selected cell with a valid sample has no valid pair.
+    """
+    mask = np.array(selected, dtype=bool)
+    dropped_samples = 0
+    if samples is not None:
+        valid_samples = _valid_group_mask(samples, missing_mask=sample_missing)
+        dropped_samples = int(np.count_nonzero(mask & ~valid_samples))
+        mask &= valid_samples
+    if pairs is not None and np.any(
+        mask & ~_valid_group_mask(pairs, missing_mask=pair_missing)
+    ):
+        raise ValueError(
+            "pairs must contain a valid pair value for every cell with a valid sample"
+        )
+    return mask, dropped_samples
 
 
 def resolve_group_order(
@@ -271,16 +414,16 @@ def resolve_group_order(
     """
     values = np.asarray(groups, dtype=object)
     valid = _valid_group_mask(values)
-    surviving = [_native(value) for value in pd.unique(values[valid])]
+    surviving = [native_value(value) for value in pd.unique(values[valid])]
     if group_order is None:
         return surviving
-    ordered = [_native(value) for value in group_order]
+    ordered = [native_value(value) for value in group_order]
     if len(set(ordered)) != len(ordered):
         raise ValueError("group_order must not contain duplicate labels")
     surviving_set = set(surviving)
     if full_groups is not None:
         full = np.asarray(full_groups, dtype=object)
-        full_set = {_native(value) for value in pd.unique(full)}
+        full_set = {native_value(value) for value in pd.unique(full)}
         missing = [value for value in ordered if value not in full_set]
         if missing:
             raise ValueError(
@@ -430,6 +573,35 @@ def aggregate_samples(
     return out
 
 
+def _require_two_group_comparisons(
+    comparisons: Sequence[tuple[Any, Any]] | None,
+    g1: Any,
+    g2: Any,
+    test: str,
+) -> None:
+    """Reject listed pairs that differ from the reported ``(g1, g2)`` contrast.
+
+    A two-group test reports ``g1`` against ``g2`` in the resolved group order,
+    so a reversed pair would silently test the opposite direction.
+    """
+    if comparisons is None:
+        return
+    for left, right in comparisons:
+        pair = (native_value(left), native_value(right))
+        if pair == (g1, g2):
+            continue
+        if pair == (g2, g1):
+            raise ValueError(
+                f"{test} comparisons must follow the group order ({g1!r}, "
+                f"{g2!r}); list the groups in the wanted contrast order with "
+                "groups= to compare them the other way round"
+            )
+        raise ValueError(
+            f"{test} comparisons must reference the two selected groups "
+            f"({g1!r}, {g2!r})"
+        )
+
+
 def _mann_whitney_p_value_method(n_1: int, n_2: int) -> PValueMethod:
     """Return how Mann-Whitney p-values are computed for two group sizes.
 
@@ -489,13 +661,7 @@ def _mann_whitney(
             "two groups or kruskal_wallis for three or more"
         )
     g1, g2 = present
-    if comparisons is not None:
-        for left, right in comparisons:
-            if {_native(left), _native(right)} != {g1, g2}:
-                raise ValueError(
-                    "mann_whitney comparisons must reference the two selected "
-                    f"groups ({g1!r}, {g2!r})"
-                )
+    _require_two_group_comparisons(comparisons, g1, g2, "mann_whitney")
     m1 = values[groups == g1]
     m2 = values[groups == g2]
     n1 = len(m1)
@@ -512,15 +678,13 @@ def _mann_whitney(
             n1,
         )
     else:
-        group_vec = np.concatenate([np.repeat(g1, n1), np.repeat(g2, n2)]).astype(
-            object
-        )
+        # Integer codes keep labels of mixed types from being coerced to text.
         p_values = mannwhitneyu_from_ranks(
             ranked,
-            group_vec,
-            np.array([g1, g2], dtype=object),
+            np.repeat(np.array([0, 1]), [n1, n2]),
+            np.array([0, 1]),
         )
-        p_value = float(p_values.loc[g1, "feature"])
+        p_value = float(p_values.loc[0, "feature"])
     u1 = float(ranked.iloc[:n1]["feature"].sum()) - n1 * (n1 + 1) / 2
     mean_1 = float(np.mean(m1))
     mean_2 = float(np.mean(m2))
@@ -558,13 +722,7 @@ def _welch_ttest(
             "groups or one_way_anova for three or more"
         )
     g1, g2 = present
-    if comparisons is not None:
-        for left, right in comparisons:
-            if {_native(left), _native(right)} != {g1, g2}:
-                raise ValueError(
-                    "welch comparisons must reference the two selected "
-                    f"groups ({g1!r}, {g2!r})"
-                )
+    _require_two_group_comparisons(comparisons, g1, g2, "welch")
     m1 = values[groups == g1]
     m2 = values[groups == g2]
     n1 = len(m1)
@@ -582,25 +740,18 @@ def _welch_ttest(
         )
     statistic = float(result.statistic)
     p_value = float(result.pvalue)
-    df_attr = getattr(result, "df", None)
-    if df_attr is not None and np.isfinite(df_attr):
-        df_stat = float(df_attr)
+    # The Welch-Satterthwaite degrees of freedom are undefined when neither
+    # group varies; SciPy then reports a placeholder of 1.
+    if np.ptp(m1) == 0 and np.ptp(m2) == 0:
+        df_stat = float(n1 + n2 - 2)
     else:
-        var_1 = float(np.var(m1, ddof=1))
-        var_2 = float(np.var(m2, ddof=1))
-        numerator = (var_1 / n1 + var_2 / n2) ** 2
-        denominator = (var_1 / n1) ** 2 / (n1 - 1) + (var_2 / n2) ** 2 / (n2 - 1)
-        df_stat = (
-            float(numerator / denominator) if denominator > 0 else float(n1 + n2 - 2)
-        )
+        df_stat = float(result.df)
     all_tied = bool(np.all(m1 == m1[0]) and np.all(m2 == m1[0]))
     if np.isnan(statistic) or np.isnan(p_value):
         if not all_tied:
             raise ValueError("welch returned an undefined statistic for these values")
         statistic = 0.0
         p_value = 1.0
-    if not np.isfinite(df_stat):
-        df_stat = float(n1 + n2 - 2)
     mean_1 = float(np.mean(m1))
     mean_2 = float(np.mean(m2))
     return pd.DataFrame(
@@ -678,20 +829,15 @@ def _kruskal_wallis(
     group_values = [values[groups == g] for g in present]
     if any(len(v) < 2 for v in group_values):
         raise ValueError("kruskal_wallis requires at least two cells in every group")
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        try:
+    pooled = np.concatenate(group_values)
+    if np.all(pooled == pooled[0]):
+        # Every value is tied, which means no evidence of differences. Depending
+        # on its version, scipy raises or returns NaN here, so decide it first.
+        statistic, p_value = 0.0, 1.0
+    else:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
             statistic, p_value = kruskal(*group_values)
-        except ValueError as exc:
-            # scipy <1.15 raises for the degenerate all-tied case where
-            # newer releases return NaN; both mean "no evidence of
-            # differences", so normalize to statistic 0 and p-value 1.
-            if "identical" not in str(exc):
-                raise
-            statistic, p_value = 0.0, 1.0
-    if not np.isfinite(statistic) or not np.isfinite(p_value):
-        statistic = 0.0
-        p_value = 1.0
     return pd.DataFrame(
         [
             {
@@ -712,10 +858,7 @@ def _dunn_posthoc(
 ) -> pd.DataFrame:
     ranked = pd.Series(values).rank(method="average").to_numpy(dtype=np.float64)
     n_total = len(values)
-    _, counts = np.unique(values, return_counts=True)
-    tied = counts[counts > 1]
-    tie_correction = float(np.sum(tied**3 - tied)) if tied.size else 0.0
-    variance = (n_total * (n_total + 1)) / 12 - tie_correction / (12 * (n_total - 1))
+    variance = (n_total * (n_total + 1)) / 12 - tie_sum(values) / (12 * (n_total - 1))
     mean_rank = {g: float(np.mean(ranked[groups == g])) for g in present}
     sizes = {g: int((groups == g).sum()) for g in present}
     pairs = (
@@ -723,7 +866,7 @@ def _dunn_posthoc(
     )
     rows: list[dict[str, Any]] = []
     for left, right in pairs:
-        left, right = _native(left), _native(right)
+        left, right = native_value(left), native_value(right)
         if left not in mean_rank or right not in mean_rank:
             raise ValueError(
                 "comparisons references a group not present in the data: "
@@ -756,13 +899,7 @@ def _wilcoxon_signed_rank(
             "wilcoxon requires exactly two groups on aggregated sample data"
         )
     g1, g2 = present
-    if comparisons is not None:
-        for left, right in comparisons:
-            if {_native(left), _native(right)} != {g1, g2}:
-                raise ValueError(
-                    "wilcoxon comparisons must reference the two selected "
-                    f"groups ({g1!r}, {g2!r})"
-                )
+    _require_two_group_comparisons(comparisons, g1, g2, "wilcoxon")
     pair_group_counts = aggregated.groupby(
         ["pair", "group"],
         observed=False,
@@ -850,9 +987,10 @@ def compare_group_distributions(
     t-test; other tests require ``"two-sided"``. ``posthoc="dunn"`` adds
     pairwise Dunn's tests after Kruskal-Wallis and preserves the omnibus result
     in the returned :class:`GroupComparisonResult`. ``comparisons`` restricts
-    the pairwise rows to the listed group pairs. ``group_order`` selects and
-    orders the groups (and therefore fixes the contrast direction) exactly;
-    when omitted, first-seen order is used, including after sample aggregation.
+    the pairwise rows to the listed group pairs; a two-group test accepts only
+    the pair in resolved group order. ``group_order`` selects and orders the
+    groups (and therefore fixes the contrast direction) exactly; when omitted,
+    first-seen order is used, including after sample aggregation.
     ``adjustment`` corrects p-values within the returned tables when they hold
     multiple comparisons; pass ``"none"`` to adjust across keys in the caller
     instead.
@@ -882,7 +1020,7 @@ def compare_group_distributions(
         )
     if comparisons is not None:
         comparisons = tuple(
-            (_native(left), _native(right)) for left, right in comparisons
+            (native_value(left), native_value(right)) for left, right in comparisons
         )
         if len(comparisons) == 0:
             raise ValueError("comparisons must be non-empty when provided")
@@ -926,13 +1064,13 @@ def compare_group_distributions(
             "other tests are two-sided"
         )
     if group_order is not None:
-        ordered_check = [_native(value) for value in group_order]
+        ordered_check = [native_value(value) for value in group_order]
         if len(set(ordered_check)) != len(ordered_check):
             raise ValueError("group_order must not contain duplicate labels")
     if comparisons is not None:
         seen_pairs: set[tuple[Any, Any]] = set()
         for left, right in comparisons:
-            pair = (_native(left), _native(right))
+            pair = (native_value(left), native_value(right))
             if pair[0] == pair[1]:
                 raise ValueError("comparisons must reference two distinct groups")
             if pair in seen_pairs or (pair[1], pair[0]) in seen_pairs:
@@ -994,7 +1132,10 @@ def compare_group_distributions(
     if comparisons is not None:
         present_set = set(present)
         for left, right in comparisons:
-            if _native(left) not in present_set or _native(right) not in present_set:
+            if (
+                native_value(left) not in present_set
+                or native_value(right) not in present_set
+            ):
                 raise ValueError(
                     "comparisons references a group not present in "
                     f"group_order: {left!r} or {right!r}"

@@ -11,9 +11,10 @@ import re
 import shutil
 import sqlite3
 import sys
-from collections.abc import Iterator, Mapping, MutableMapping
+from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -105,6 +106,9 @@ class ParsedSource:
     uri: str
     notebook: nbformat.NotebookNode
     hashkey: str
+
+
+type PageRunner = Callable[[ParsedSource, Path], Path]
 
 
 @dataclass(frozen=True, slots=True)
@@ -726,10 +730,6 @@ def discover_sources(
     return sources
 
 
-def iter_executable_paths() -> list[Path]:
-    return [source.path for source in discover_sources()]
-
-
 def _source_aliases(source: ParsedSource, source_dir: Path) -> set[str]:
     relative = source.path.relative_to(source_dir.resolve()).as_posix()
     without_suffix = relative.removesuffix(".md")
@@ -753,10 +753,6 @@ def list_executable_docs() -> list[str]:
         else source.path.relative_to(SOURCE_DIR).as_posix().removesuffix(".md")
         for source in sources
     ]
-
-
-def list_vignettes() -> list[str]:
-    return list_executable_docs()
 
 
 def resolve_doc_source(
@@ -792,10 +788,6 @@ def resolve_doc_source(
             f"Ambiguous executable doc {name!r}; use one of: {choices}"
         )
     raise FileNotFoundError(f"Executable doc not found: {name}")
-
-
-def resolve_doc_path(name: str) -> Path:
-    return resolve_doc_source(name).path
 
 
 def transfer_source_bundle(
@@ -1122,6 +1114,7 @@ def execution_fingerprint(
         docs_root / "execute_all_vignettes.py",
         docs_root / "modal_cache.py",
         docs_root / "modal_docs.py",
+        repo_root / "profiling" / "modal_support.py",
         docs_root / "Makefile",
         docs_root / "source" / "conf.py",
     ]
@@ -1138,8 +1131,25 @@ def execution_fingerprint(
     return hasher.hexdigest()
 
 
+def _lock_holder(lock_path: Path) -> str:
+    try:
+        holder = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "holder unknown"
+    if not isinstance(holder, dict):
+        return "holder unknown"
+    return ", ".join(
+        f"{key}={holder.get(key)}" for key in ("pid", "host", "started", "command")
+    )
+
+
 @contextmanager
 def serialization_lock(target_path: Path) -> Iterator[None]:
+    """Hold the cache lock, or fail at once and name the command that holds it.
+
+    Execute, resume, prune, validation, and publication share one cache and one
+    resume area, so a second command must not wait behind or overlap the first.
+    """
     lock_path = target_path.with_name(f"{target_path.name}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+b")
@@ -1152,30 +1162,56 @@ def serialization_lock(target_path: Path) -> Iterator[None]:
                 handle.write(b"\0")
                 handle.flush()
             handle.seek(0)
-            msvcrt.locking(  # type: ignore[attr-defined]
-                handle.fileno(),
-                msvcrt.LK_LOCK,  # type: ignore[attr-defined]
-                1,
-            )
+            try:
+                msvcrt.locking(  # type: ignore[attr-defined]
+                    handle.fileno(),
+                    msvcrt.LK_NBLCK,  # type: ignore[attr-defined]
+                    1,
+                )
+            except OSError as exc:
+                raise CacheToolError(
+                    f"Another documentation cache command holds {lock_path}"
+                ) from exc
         else:
             import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        yield
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise CacheToolError(
+                    f"Another documentation cache command holds {lock_path} "
+                    f"({_lock_holder(lock_path)}); wait for it to finish"
+                ) from exc
+            handle.truncate(0)
+            handle.write(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "host": platform.node(),
+                        "started": datetime.now(UTC).isoformat(timespec="seconds"),
+                        "command": " ".join(sys.argv),
+                    }
+                ).encode("utf-8")
+            )
+            handle.flush()
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(  # type: ignore[attr-defined]
+                    handle.fileno(),
+                    msvcrt.LK_UNLCK,  # type: ignore[attr-defined]
+                    1,
+                )
+            else:
+                import fcntl
+
+                handle.truncate(0)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     finally:
-        if os.name == "nt":
-            import msvcrt
-
-            handle.seek(0)
-            msvcrt.locking(  # type: ignore[attr-defined]
-                handle.fileno(),
-                msvcrt.LK_UNLCK,  # type: ignore[attr-defined]
-                1,
-            )
-        else:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         handle.close()
 
 
@@ -1225,11 +1261,6 @@ def _publish_candidate_locked(candidate_path: Path, target_path: Path) -> None:
             _remove_path(backup)
         except OSError:
             pass
-
-
-def publish_candidate(candidate_path: Path, target_path: Path = DEFAULT_CACHE) -> None:
-    with serialization_lock(target_path):
-        _publish_candidate_locked(candidate_path, target_path)
 
 
 def execute_page(
@@ -1314,19 +1345,6 @@ def execute_page(
         "hashkey": source.hashkey,
         "metadata": metadata,
     }
-
-
-def execute_vignette(
-    name: str,
-    *,
-    cache_path: Path,
-    execution_in_temp: bool = True,
-) -> dict[str, object]:
-    return execute_page(
-        name,
-        cache_path=cache_path,
-        execution_in_temp=execution_in_temp,
-    )
 
 
 def main() -> None:

@@ -228,7 +228,7 @@ def test_native_harmony_visuals_preserve_matching_and_exact_qc_projection(
     }
     assert all(item.data.startswith(b"\x89PNG") for item in outputs)
     assert "MT-CO1 [mitochondrial]" in captured
-    assert "XIST [sex-linked]" in captured
+    assert "XIST [sexLinked]" in captured
     stored = np.linspace(0.1, 1.1, qc_size)
     expected = stored[5:15] if qc_size == 20 else stored
     assert len(violins) == 1

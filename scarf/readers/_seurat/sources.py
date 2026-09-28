@@ -10,16 +10,19 @@ from scipy.sparse import (
     coo_matrix,
     csr_matrix,
     hstack,
-    spmatrix,
+    issparse,
     vstack,
 )
 
 from .errors import MatrixSourceError, ResourceLimitError
+from .values import decode_text_values, read_window
 from .._sparse import SparseRowStore
 from ...utils.arrays import has_duplicates
 
 
 type MatrixBlock = NDArray[Any] | coo_matrix | csr_matrix
+
+_INDEX_BYTES = np.dtype(np.int64).itemsize
 
 
 @dataclass(frozen=True)
@@ -29,8 +32,9 @@ class MemoryEstimate:
     outputBytes: int = 0
 
     @property
-    def peakBytes(self) -> int:
-        return self.residentBytes + self.workingBytes + self.outputBytes
+    def blockBytes(self) -> int:
+        """Bytes allocated while reading one block, excluding resident state."""
+        return self.workingBytes + self.outputBytes
 
 
 @dataclass(frozen=True)
@@ -159,14 +163,14 @@ def prepare_matrix_sources(source: MatrixSource, max_bytes: int | None = None) -
                     limits, maxBlockBytes=min(limits.maxBlockBytes, available)
                 )
                 estimate = current.estimate_read_memory(0, min(1, current.n_cells))
-                if estimate.workingBytes + estimate.outputBytes > available:
+                if estimate.blockBytes > available:
                     raise MemoryError("Seurat source preparation exceeds mem_budget")
             current._prepare_for_read()
         finally:
             current._limits = limits
 
 
-def _metadata_bytes(names: tuple[str, ...] | None) -> int:
+def _metadata_bytes(names: Sequence[str] | None) -> int:
     if names is None:
         return 0
     return sum(len(value.encode("utf-8")) + 8 for value in names)
@@ -180,35 +184,16 @@ def _normalize_names(
 ) -> tuple[str, ...] | None:
     if names is None:
         return None
-    if isinstance(names, str | bytes):
-        raise TypeError(f"{axis} names must be a sequence")
-    values: list[str] = []
-    size = 0
-    for value in names:
-        if isinstance(value, bytes | np.bytes_):
-            try:
-                decoded = bytes(value).decode("utf-8")
-            except UnicodeDecodeError as error:
-                raise MatrixSourceError(
-                    f"{axis} names contain invalid UTF-8"
-                ) from error
-        elif isinstance(value, str | np.str_):
-            decoded = str(value)
-        else:
-            raise TypeError(f"{axis} names must contain only strings")
-        if "\x00" in decoded:
-            raise MatrixSourceError(f"{axis} names contain a NUL character")
-        size += len(decoded.encode("utf-8")) + 8
-        if size > limits.maxMetadataBytes:
-            raise ResourceLimitError(
-                f"{axis} names exceed maxMetadataBytes={limits.maxMetadataBytes}"
-            )
-        values.append(decoded)
+    values = decode_text_values(
+        names,
+        object_path=f"{axis} names",
+        max_bytes=limits.maxMetadataBytes,
+    )
     if len(values) != length:
         raise MatrixSourceError(
             f"{axis} names have length {len(values)}; expected {length}"
         )
-    return tuple(values)
+    return values
 
 
 def _validate_shape(shape: Sequence[int], limits: SourceLimits) -> tuple[int, int]:
@@ -250,39 +235,13 @@ def _array_shape(values: Any) -> tuple[int, ...]:
 
 def _array_dtype(values: Any) -> np.dtype[Any]:
     dtype = getattr(values, "dtype", None)
-    if dtype is None:
-        return np.asarray(values).dtype
-    return cast(np.dtype[Any], np.dtype(dtype))
+    return np.dtype(np.asarray(values).dtype if dtype is None else dtype)
 
 
 def _array_resident_bytes(values: Any) -> int:
     if isinstance(values, np.ndarray):
         return int(values.nbytes)
     return 0
-
-
-def _read_1d(
-    values: Any,
-    start: int,
-    stop: int,
-    *,
-    dtype: DTypeLike | None = None,
-) -> NDArray[Any]:
-    try:
-        result = np.asarray(values[start:stop])
-    except (IndexError, TypeError, ValueError) as error:
-        raise MatrixSourceError(
-            "array-like object does not support bounded slicing"
-        ) from error
-    if result.ndim != 1:
-        result = result.reshape(-1)
-    if result.size != stop - start:
-        raise MatrixSourceError(
-            f"bounded array read returned {result.size} values; expected {stop - start}"
-        )
-    if dtype is not None:
-        result = result.astype(dtype, copy=False)
-    return result
 
 
 def _normalize_indexes(
@@ -301,16 +260,27 @@ def _normalize_indexes(
     return values
 
 
+def _index_runs(indexes: NDArray[np.int64]) -> Iterator[tuple[int, int, int]]:
+    """Yield (offset, start, stop) for each run of consecutive indexes."""
+    if indexes.size == 0:
+        return
+    breaks = np.flatnonzero(np.diff(indexes) != 1) + 1
+    offsets = np.concatenate(([0], breaks))
+    ends = np.concatenate((breaks, [indexes.size]))
+    for offset, end in zip(offsets.tolist(), ends.tolist(), strict=True):
+        yield offset, int(indexes[offset]), int(indexes[end - 1]) + 1
+
+
 def _block_to_csr(
-    block: MatrixBlock | spmatrix,
+    block: Any,
     *,
     dtype: DTypeLike | None = None,
 ) -> csr_matrix:
-    if isinstance(block, spmatrix):
-        result = block.tocsr(copy=False)
+    if issparse(block):
+        result = csr_matrix(block)
         if dtype is not None:
             result = result.astype(dtype, copy=False)
-        return cast(csr_matrix, result)
+        return result
     values = np.asarray(block)
     if values.ndim != 2:
         raise MatrixSourceError("matrix block must be two-dimensional")
@@ -320,11 +290,11 @@ def _block_to_csr(
 
 
 def _block_to_dense(
-    block: MatrixBlock | spmatrix,
+    block: Any,
     *,
     dtype: DTypeLike | None = None,
 ) -> NDArray[Any]:
-    values = block.toarray() if isinstance(block, spmatrix) else np.asarray(block)
+    values = block.toarray() if issparse(block) else np.asarray(block)
     if values.ndim != 2:
         raise MatrixSourceError("matrix block must be two-dimensional")
     if dtype is not None:
@@ -343,24 +313,41 @@ def _empty_block(
     return np.empty((rows, columns), dtype=dtype)
 
 
+def _value_bound(source: MatrixSource, estimate: MemoryEstimate, rows: int) -> int:
+    """Upper bound on the values stored in a block of ``rows`` source cells."""
+    dense = rows * source.shape[0]
+    if not source.is_sparse:
+        return dense
+    per_value = source.dtype.itemsize + _INDEX_BYTES
+    payload = max(0, estimate.outputBytes - (rows + 1) * _INDEX_BYTES)
+    return min(dense, -(-payload // per_value))
+
+
+def _block_output_bytes(
+    dtype: np.dtype[Any],
+    rows: int,
+    columns: int,
+    *,
+    sparse: bool,
+    values: int,
+) -> int:
+    """Output bytes of a block; a sparse block holds at most ``values`` entries."""
+    if not sparse:
+        return rows * columns * dtype.itemsize
+    stored = min(values, rows * columns)
+    return stored * (dtype.itemsize + _INDEX_BYTES) + (rows + 1) * _INDEX_BYTES
+
+
 def _read_selected_cells(
     source: MatrixSource,
     indexes: NDArray[np.int64],
 ) -> MatrixBlock:
     if indexes.size == 0:
         return _empty_block(0, source.shape[0], source.dtype, source.is_sparse)
-    pieces: list[MatrixBlock] = []
-    run_start = 0
-    for position in range(1, indexes.size + 1):
-        run_finished = (
-            position == indexes.size or indexes[position] != indexes[position - 1] + 1
-        )
-        if not run_finished:
-            continue
-        source_start = int(indexes[run_start])
-        source_stop = int(indexes[position - 1]) + 1
-        pieces.append(source.read_cells(source_start, source_stop))
-        run_start = position
+    pieces = [
+        source.read_cells(run_start, run_stop)
+        for _, run_start, run_stop in _index_runs(indexes)
+    ]
     if source.is_sparse:
         return cast(
             MatrixBlock,
@@ -374,6 +361,68 @@ def _read_selected_cells(
         [_block_to_dense(piece, dtype=source.dtype) for piece in pieces],
         dtype=source.dtype,
     )
+
+
+def _selected_estimate(
+    source: MatrixSource,
+    indexes: NDArray[np.int64],
+) -> tuple[int, int]:
+    """Return (block bytes, stored-value bound) for reading selected cells."""
+    block_bytes = 0
+    values = 0
+    for _, run_start, run_stop in _index_runs(indexes):
+        estimate = source.estimate_read_memory(run_start, run_stop)
+        block_bytes += estimate.blockBytes
+        values += _value_bound(source, estimate, run_stop - run_start)
+    return block_bytes, values
+
+
+def validate_compressed_pointers(
+    read: Callable[[int, int], NDArray[Any]],
+    count: int,
+    limits: SourceLimits,
+    *,
+    label: str,
+) -> int:
+    """Validate a nondecreasing pointer vector that starts at zero; return its end."""
+    chunk = max(1, min(limits.compressedChunkNnz, count))
+    previous: int | None = None
+    final = 0
+    for start in range(0, count, chunk):
+        stop = min(count, start + chunk)
+        pointers = read(start, stop)
+        if not np.issubdtype(pointers.dtype, np.integer):
+            raise TypeError(f"{label} must contain integers")
+        if pointers.size > 1 and np.any(pointers[1:] < pointers[:-1]):
+            raise MatrixSourceError(f"{label} must be nondecreasing")
+        if previous is not None and pointers.size and int(pointers[0]) < previous:
+            raise MatrixSourceError(f"{label} must be nondecreasing")
+        if start == 0 and (not pointers.size or int(pointers[0]) != 0):
+            raise MatrixSourceError(f"{label} must start at zero")
+        if pointers.size:
+            previous = int(pointers[-1])
+            final = previous
+    if final > limits.maxNnz:
+        raise ResourceLimitError(f"{label} nnz {final} exceeds maxNnz={limits.maxNnz}")
+    return final
+
+
+def validate_minor_indexes(
+    read: Callable[[int, int], NDArray[Any]],
+    nnz: int,
+    upper_bound: int,
+    limits: SourceLimits,
+    *,
+    label: str,
+) -> None:
+    """Check that every stored minor-axis index lies in [0, upper_bound)."""
+    for start in range(0, nnz, limits.compressedChunkNnz):
+        stop = min(nnz, start + limits.compressedChunkNnz)
+        indexes = read(start, stop)
+        if not np.issubdtype(indexes.dtype, np.integer):
+            raise TypeError(f"{label} must contain integers")
+        if indexes.size and (np.any(indexes < 0) or np.any(indexes >= upper_bound)):
+            raise MatrixSourceError(f"{label} contains an out-of-range value")
 
 
 class BaseMatrixSource:
@@ -428,28 +477,12 @@ class BaseMatrixSource:
         return self._column_names
 
     @property
-    def rowNames(self) -> tuple[str, ...] | None:
-        return self.row_names
-
-    @property
-    def columnNames(self) -> tuple[str, ...] | None:
-        return self.column_names
-
-    @property
     def is_sparse(self) -> bool:
         return self._is_sparse
 
     @property
-    def sparse(self) -> bool:
-        return self.is_sparse
-
-    @property
     def zero_preserving(self) -> bool:
         return self._zero_preserving
-
-    @property
-    def zeroPreserving(self) -> bool:
-        return self.zero_preserving
 
     @property
     def n_features(self) -> int:
@@ -467,20 +500,24 @@ class BaseMatrixSource:
             + (0 if self._rowStore is None else self._rowStore.indptr.nbytes)
         )
 
-    @property
-    def residentBytes(self) -> int:
-        return self.resident_bytes
-
     def _window(self, start: int, stop: int) -> tuple[int, int]:
         return _validate_window(start, stop, self.n_cells)
 
     def _admit(self, estimate: MemoryEstimate) -> None:
-        if estimate.workingBytes + estimate.outputBytes > self._limits.maxBlockBytes:
+        if estimate.blockBytes > self._limits.maxBlockBytes:
             raise ResourceLimitError(
-                "matrix block needs "
-                f"{estimate.workingBytes + estimate.outputBytes} bytes; "
+                f"matrix block needs {estimate.blockBytes} bytes; "
                 f"maxBlockBytes={self._limits.maxBlockBytes}"
             )
+
+    def _output_bytes(self, rows: int, values: int) -> int:
+        return _block_output_bytes(
+            self.dtype,
+            rows,
+            self.n_features,
+            sparse=self.is_sparse,
+            values=values,
+        )
 
     def _row_store_memory(
         self,
@@ -543,17 +580,126 @@ class BaseMatrixSource:
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
         raise NotImplementedError
 
-    def memory_estimate(self, start: int, stop: int) -> MemoryEstimate:
-        return self.estimate_read_memory(start, stop)
 
-    def estimate_read_bytes(self, start: int, stop: int) -> int:
-        return self.estimate_read_memory(start, stop).peakBytes
+class CompressedMatrixSource(BaseMatrixSource):
+    """Sparse source stored as compressed pointers, minor indexes, and values.
 
-    def estimate_memory(self, start: int, stop: int) -> MemoryEstimate:
-        return self.estimate_read_memory(start, stop)
+    When the compressed axis runs over cells, blocks are sliced directly.
+    Otherwise the entries are transposed once into a disk-backed row store.
+    """
 
-    def estimated_peak_bytes(self, start: int, stop: int) -> int:
-        return self.estimate_read_bytes(start, stop)
+    _decodeWorkingBytes = 0
+
+    def __init__(
+        self,
+        shape: Sequence[int],
+        dtype: DTypeLike,
+        *,
+        cells_compressed: bool,
+        nnz: int,
+        row_names: Sequence[str | bytes] | NDArray[Any] | None = None,
+        column_names: Sequence[str | bytes] | NDArray[Any] | None = None,
+        limits: SourceLimits = DEFAULT_LIMITS,
+    ) -> None:
+        super().__init__(
+            shape,
+            dtype,
+            row_names=row_names,
+            column_names=column_names,
+            is_sparse=True,
+            limits=limits,
+        )
+        self._cellsCompressed = bool(cells_compressed)
+        self._nnz = int(nnz)
+
+    @property
+    def nnz(self) -> int:
+        return self._nnz
+
+    def _read_pointers(self, start: int, stop: int) -> NDArray[np.int64]:
+        raise NotImplementedError
+
+    def _read_entries(
+        self, start: int, stop: int
+    ) -> tuple[NDArray[Any], NDArray[np.int64]]:
+        raise NotImplementedError
+
+    def _cell_bounds(
+        self,
+        start: int,
+        stop: int,
+    ) -> tuple[NDArray[np.int64], int, int]:
+        pointers = self._read_pointers(start, stop + 1)
+        data_start = int(pointers[0])
+        data_stop = int(pointers[-1])
+        return pointers - data_start, data_start, data_stop
+
+    def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
+        start, stop = self._window(start, stop)
+        if not self._cellsCompressed:
+            return self._row_store_memory(
+                start,
+                stop,
+                nnz=self.nnz,
+                source_bytes=(self.n_features + 1) * _INDEX_BYTES,
+            )
+        pointers, data_start, data_stop = self._cell_bounds(start, stop)
+        output = (data_stop - data_start) * (
+            self.dtype.itemsize + _INDEX_BYTES
+        ) + pointers.nbytes
+        return MemoryEstimate(
+            self.resident_bytes, output + self._decodeWorkingBytes, output
+        )
+
+    def read_cells(self, start: int, stop: int) -> csr_matrix:
+        start, stop = self._window(start, stop)
+        self._admit(self.estimate_read_memory(start, stop))
+        if self._cellsCompressed:
+            pointers, data_start, data_stop = self._cell_bounds(start, stop)
+            data, indexes = self._read_entries(data_start, data_stop)
+            return csr_matrix(
+                (data, indexes, pointers),
+                shape=(stop - start, self.n_features),
+                dtype=self.dtype,
+            )
+        if start == stop:
+            return csr_matrix((0, self.n_features), dtype=self.dtype)
+        return self._prepare_row_store(
+            self._feature_chunks,
+            source_bytes=(self.n_features + 1) * _INDEX_BYTES,
+        ).read(start, stop)
+
+    def _prepare_for_read(self) -> None:
+        if not self._cellsCompressed and self.n_cells:
+            self._prepare_row_store(
+                self._feature_chunks,
+                source_bytes=(self.n_features + 1) * _INDEX_BYTES,
+            )
+
+    def _feature_chunks(self) -> Iterator[coo_matrix]:
+        chunk_nnz = max(
+            1,
+            min(
+                self._limits.compressedChunkNnz,
+                (
+                    self._limits.maxBlockBytes
+                    - (self.n_cells + 1) * 32
+                    - (self.n_features + 1) * _INDEX_BYTES
+                )
+                // 384,
+            ),
+        )
+        pointers = self._read_pointers(0, self.n_features + 1)
+        for start in range(0, self.nnz, chunk_nnz):
+            stop = min(self.nnz, start + chunk_nnz)
+            features = (
+                np.searchsorted(pointers, np.arange(start, stop), side="right") - 1
+            )
+            data, cells = self._read_entries(start, stop)
+            yield coo_matrix(
+                (data, (cells, features)),
+                shape=(self.n_cells, self.n_features),
+            )
 
 
 class DenseMatrixSource(BaseMatrixSource):
@@ -625,7 +771,7 @@ class DenseMatrixSource(BaseMatrixSource):
         estimate = self.estimate_read_memory(start, stop)
         self._admit(estimate)
         if self._flat:
-            flat = _read_1d(
+            flat = read_window(
                 self._values,
                 start * self.n_features,
                 stop * self.n_features,
@@ -647,7 +793,7 @@ class DenseMatrixSource(BaseMatrixSource):
         return np.ascontiguousarray(feature_by_cell.T, dtype=self.dtype)
 
 
-class CscMatrixSource(BaseMatrixSource):
+class CscMatrixSource(CompressedMatrixSource):
     _SUPPORTED_CLASSES = frozenset(
         {
             "dgCMatrix",
@@ -655,7 +801,6 @@ class CscMatrixSource(BaseMatrixSource):
             "ngCMatrix",
             "igCMatrix",
             "CsparseMatrix",
-            "CSC",
         }
     )
 
@@ -687,69 +832,41 @@ class CscMatrixSource(BaseMatrixSource):
         self._x = x
         self._i = i
         self._p = p
-        self.class_name = class_name
-        self._nnz = self._validate_structure(logical_shape, limits)
+        nnz = validate_compressed_pointers(
+            lambda start, stop: read_window(p, start, stop),
+            logical_shape[1] + 1,
+            limits,
+            label="CSC p slot",
+        )
+        if index_shape != (nnz,):
+            raise MatrixSourceError(
+                f"CSC i slot has length {index_shape[0]}; expected {nnz}"
+            )
+        validate_minor_indexes(
+            lambda start, stop: read_window(i, start, stop),
+            nnz,
+            logical_shape[0],
+            limits,
+            label="CSC i slot",
+        )
         if x is None:
             source_dtype = np.dtype(bool if dtype is None else dtype)
         else:
             value_shape = _array_shape(x)
-            if value_shape != (self._nnz,):
+            if value_shape != (nnz,):
                 raise MatrixSourceError(
-                    f"CSC x slot has shape {value_shape}; expected ({self._nnz},)"
+                    f"CSC x slot has shape {value_shape}; expected ({nnz},)"
                 )
             source_dtype = _array_dtype(x) if dtype is None else np.dtype(dtype)
         super().__init__(
             logical_shape,
             source_dtype,
+            cells_compressed=True,
+            nnz=nnz,
             row_names=row_names,
             column_names=column_names,
-            is_sparse=True,
             limits=limits,
         )
-
-    def _validate_structure(
-        self,
-        shape: tuple[int, int],
-        limits: SourceLimits,
-    ) -> int:
-        chunk_size = max(1, min(limits.compressedChunkNnz, shape[1] + 1))
-        previous: int | None = None
-        last = 0
-        for start in range(0, shape[1] + 1, chunk_size):
-            stop = min(shape[1] + 1, start + chunk_size)
-            pointers = _read_1d(self._p, start, stop)
-            if not np.issubdtype(pointers.dtype, np.integer):
-                raise TypeError("CSC p slot must contain integers")
-            pointers = pointers.astype(np.int64, copy=False)
-            if previous is not None and pointers.size and int(pointers[0]) < previous:
-                raise MatrixSourceError("CSC p slot must be nondecreasing")
-            if pointers.size > 1 and np.any(pointers[1:] < pointers[:-1]):
-                raise MatrixSourceError("CSC p slot must be nondecreasing")
-            if start == 0 and (not pointers.size or int(pointers[0]) != 0):
-                raise MatrixSourceError("CSC p slot must start at zero")
-            if pointers.size:
-                previous = int(pointers[-1])
-                last = previous
-        if last < 0:
-            raise MatrixSourceError("CSC p slot cannot contain negative offsets")
-        if last > limits.maxNnz:
-            raise ResourceLimitError(f"CSC nnz {last} exceeds maxNnz={limits.maxNnz}")
-        if _array_shape(self._i) != (last,):
-            raise MatrixSourceError(
-                f"CSC i slot has length {_array_shape(self._i)[0]}; expected {last}"
-            )
-        for start in range(0, last, limits.compressedChunkNnz):
-            stop = min(last, start + limits.compressedChunkNnz)
-            indexes = _read_1d(self._i, start, stop)
-            if not np.issubdtype(indexes.dtype, np.integer):
-                raise TypeError("CSC i slot must contain integers")
-            if indexes.size and (np.any(indexes < 0) or np.any(indexes >= shape[0])):
-                raise MatrixSourceError("CSC i slot contains an out-of-range row")
-        return last
-
-    @property
-    def nnz(self) -> int:
-        return self._nnz
 
     @property
     def resident_bytes(self) -> int:
@@ -761,39 +878,16 @@ class CscMatrixSource(BaseMatrixSource):
             + _array_resident_bytes(self._p)
         )
 
-    def _range(self, start: int, stop: int) -> tuple[NDArray[Any], int, int]:
-        pointers = _read_1d(self._p, start, stop + 1)
-        if not np.issubdtype(pointers.dtype, np.integer):
-            raise TypeError("CSC p slot must contain integers")
-        pointers = pointers.astype(np.int64, copy=False)
-        data_start = int(pointers[0])
-        data_stop = int(pointers[-1])
-        return pointers - data_start, data_start, data_stop
+    def _read_pointers(self, start: int, stop: int) -> NDArray[np.int64]:
+        return read_window(self._p, start, stop, dtype=np.int64)
 
-    def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
-        start, stop = self._window(start, stop)
-        pointers, data_start, data_stop = self._range(start, stop)
-        nnz = data_stop - data_start
-        index_size = np.dtype(np.int64).itemsize
-        output = nnz * (self.dtype.itemsize + index_size) + pointers.nbytes
-        working = output
-        return MemoryEstimate(self.resident_bytes, working, output)
-
-    def read_cells(self, start: int, stop: int) -> csr_matrix:
-        start, stop = self._window(start, stop)
-        estimate = self.estimate_read_memory(start, stop)
-        self._admit(estimate)
-        pointers, data_start, data_stop = self._range(start, stop)
-        indexes = _read_1d(self._i, data_start, data_stop, dtype=np.int64)
+    def _read_entries(
+        self, start: int, stop: int
+    ) -> tuple[NDArray[Any], NDArray[np.int64]]:
+        indexes = read_window(self._i, start, stop, dtype=np.int64)
         if self._x is None:
-            data = np.ones(data_stop - data_start, dtype=self.dtype)
-        else:
-            data = _read_1d(self._x, data_start, data_stop, dtype=self.dtype)
-        return csr_matrix(
-            (data, indexes, pointers),
-            shape=(stop - start, self.n_features),
-            dtype=self.dtype,
-        )
+            return np.ones(stop - start, dtype=self.dtype), indexes
+        return read_window(self._x, start, stop, dtype=self.dtype), indexes
 
 
 class MappedMatrixSource(BaseMatrixSource):
@@ -803,50 +897,38 @@ class MappedMatrixSource(BaseMatrixSource):
         *,
         feature_indices: Sequence[int] | NDArray[Any] | None = None,
         cell_indices: Sequence[int] | NDArray[Any] | None = None,
-        row_names: Sequence[str | bytes] | NDArray[Any] | None = None,
-        column_names: Sequence[str | bytes] | NDArray[Any] | None = None,
         limits: SourceLimits = DEFAULT_LIMITS,
     ) -> None:
         self.source = source
-        self.feature_indices = (
+        self.featureIndices = (
             None
             if feature_indices is None
             else _normalize_indexes(feature_indices, source.shape[0], "feature")
         )
-        self.cell_indices = (
+        self.cellIndices = (
             None
             if cell_indices is None
             else _normalize_indexes(cell_indices, source.shape[1], "cell")
         )
         n_features = (
             source.shape[0]
-            if self.feature_indices is None
-            else int(self.feature_indices.size)
+            if self.featureIndices is None
+            else int(self.featureIndices.size)
         )
         n_cells = (
-            source.shape[1]
-            if self.cell_indices is None
-            else int(self.cell_indices.size)
+            source.shape[1] if self.cellIndices is None else int(self.cellIndices.size)
         )
-        mapped_rows = row_names
-        if mapped_rows is None and source.row_names is not None:
-            mapped_rows = (
-                source.row_names
-                if self.feature_indices is None
-                else tuple(source.row_names[index] for index in self.feature_indices)
-            )
-        mapped_columns = column_names
-        if mapped_columns is None and source.column_names is not None:
-            mapped_columns = (
-                source.column_names
-                if self.cell_indices is None
-                else tuple(source.column_names[index] for index in self.cell_indices)
-            )
+        row_names = source.row_names
+        if row_names is not None and self.featureIndices is not None:
+            row_names = tuple(row_names[index] for index in self.featureIndices)
+        column_names = source.column_names
+        if column_names is not None and self.cellIndices is not None:
+            column_names = tuple(column_names[index] for index in self.cellIndices)
         super().__init__(
             (n_features, n_cells),
             source.dtype,
-            row_names=mapped_rows,
-            column_names=mapped_columns,
+            row_names=row_names,
+            column_names=column_names,
             is_sparse=source.is_sparse,
             zero_preserving=source.zero_preserving,
             limits=limits,
@@ -855,54 +937,39 @@ class MappedMatrixSource(BaseMatrixSource):
     @property
     def resident_bytes(self) -> int:
         mapping_bytes = 0
-        if self.feature_indices is not None:
-            mapping_bytes += self.feature_indices.nbytes
-        if self.cell_indices is not None:
-            mapping_bytes += self.cell_indices.nbytes
+        if self.featureIndices is not None:
+            mapping_bytes += self.featureIndices.nbytes
+        if self.cellIndices is not None:
+            mapping_bytes += self.cellIndices.nbytes
         return int(super().resident_bytes + self.source.resident_bytes + mapping_bytes)
 
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
         start, stop = self._window(start, stop)
         rows = stop - start
-        if self.cell_indices is None:
-            source_estimate = self.source.estimate_read_memory(start, stop)
-        elif rows == 0:
-            source_estimate = MemoryEstimate()
+        if self.cellIndices is None:
+            estimate = self.source.estimate_read_memory(start, stop)
+            child_bytes = estimate.blockBytes
+            values = _value_bound(self.source, estimate, rows)
         else:
-            selected = self.cell_indices[start:stop]
-            source_estimate = MemoryEstimate(
-                workingBytes=sum(
-                    self.source.estimate_read_memory(
-                        int(index), int(index) + 1
-                    ).peakBytes
-                    for index in selected
-                )
+            child_bytes, values = _selected_estimate(
+                self.source, self.cellIndices[start:stop]
             )
-        output = rows * self.n_features * self.dtype.itemsize
-        if self.is_sparse:
-            output += rows * np.dtype(np.int64).itemsize
-        return MemoryEstimate(
-            self.resident_bytes,
-            source_estimate.workingBytes + output,
-            output,
-        )
+        output = self._output_bytes(rows, values)
+        return MemoryEstimate(self.resident_bytes, child_bytes + output, output)
 
     def read_cells(self, start: int, stop: int) -> MatrixBlock:
         start, stop = self._window(start, stop)
         estimate = self.estimate_read_memory(start, stop)
         self._admit(estimate)
-        if self.cell_indices is None:
+        if self.cellIndices is None:
             block = self.source.read_cells(start, stop)
         else:
-            block = _read_selected_cells(self.source, self.cell_indices[start:stop])
-        if self.feature_indices is None:
+            block = _read_selected_cells(self.source, self.cellIndices[start:stop])
+        if self.featureIndices is None:
             return block
-        if isinstance(block, spmatrix):
-            return cast(
-                MatrixBlock,
-                block.tocsr(copy=False)[:, self.feature_indices].tocsr(),
-            )
-        return np.ascontiguousarray(np.asarray(block)[:, self.feature_indices])
+        if issparse(block):
+            return _block_to_csr(block)[:, self.featureIndices].tocsr()
+        return np.ascontiguousarray(np.asarray(block)[:, self.featureIndices])
 
 
 class TransposeMatrixSource(BaseMatrixSource):
@@ -973,7 +1040,7 @@ class TransposeMatrixSource(BaseMatrixSource):
             width = min(self.tile_cells, self.source.shape[1] - start)
             while True:
                 estimate = self.source.estimate_read_memory(start, start + width)
-                if estimate.workingBytes + estimate.outputBytes <= available // 2:
+                if estimate.blockBytes <= available // 2:
                     break
                 if width == 1:
                     raise ResourceLimitError(
@@ -1129,12 +1196,14 @@ class FeatureBindMatrixSource(BaseMatrixSource):
 
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
         start, stop = self._window(start, stop)
-        child = sum(
-            source.estimate_read_memory(start, stop).peakBytes
-            for source in self.sources
-        )
-        output = (stop - start) * self.n_features * self.dtype.itemsize
-        return MemoryEstimate(self.resident_bytes, child, output)
+        child_bytes = 0
+        values = 0
+        for source in self.sources:
+            estimate = source.estimate_read_memory(start, stop)
+            child_bytes += estimate.blockBytes
+            values += _value_bound(source, estimate, stop - start)
+        output = self._output_bytes(stop - start, values)
+        return MemoryEstimate(self.resident_bytes, child_bytes + output, output)
 
     def read_cells(self, start: int, stop: int) -> MatrixBlock:
         start, stop = self._window(start, stop)
@@ -1214,12 +1283,14 @@ class CellBindMatrixSource(BaseMatrixSource):
 
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
         start, stop = self._window(start, stop)
-        child = sum(
-            source.estimate_read_memory(local_start, local_stop).peakBytes
-            for source, local_start, local_stop in self._pieces(start, stop)
-        )
-        output = (stop - start) * self.n_features * self.dtype.itemsize
-        return MemoryEstimate(self.resident_bytes, child, output)
+        child_bytes = 0
+        values = 0
+        for source, local_start, local_stop in self._pieces(start, stop):
+            estimate = source.estimate_read_memory(local_start, local_stop)
+            child_bytes += estimate.blockBytes
+            values += _value_bound(source, estimate, local_stop - local_start)
+        output = self._output_bytes(stop - start, values)
+        return MemoryEstimate(self.resident_bytes, child_bytes + output, output)
 
     def read_cells(self, start: int, stop: int) -> MatrixBlock:
         start, stop = self._window(start, stop)
@@ -1243,47 +1314,12 @@ class CellBindMatrixSource(BaseMatrixSource):
         return np.vstack([_block_to_dense(block, dtype=self.dtype) for block in blocks])
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class LayerPlacement:
     source: MatrixSource
     featureIndices: Sequence[int] | NDArray[Any] | None = None
     cellIndices: Sequence[int] | NDArray[Any] | None = None
     name: str | None = None
-
-    def __init__(
-        self,
-        source: MatrixSource,
-        feature_indices: Sequence[int] | NDArray[Any] | None = None,
-        cell_indices: Sequence[int] | NDArray[Any] | None = None,
-        name: str | None = None,
-        *,
-        featureIndices: Sequence[int] | NDArray[Any] | None = None,
-        cellIndices: Sequence[int] | NDArray[Any] | None = None,
-    ) -> None:
-        if feature_indices is not None and featureIndices is not None:
-            raise TypeError("provide only one feature index spelling")
-        if cell_indices is not None and cellIndices is not None:
-            raise TypeError("provide only one cell index spelling")
-        object.__setattr__(self, "source", source)
-        object.__setattr__(
-            self,
-            "featureIndices",
-            feature_indices if featureIndices is None else featureIndices,
-        )
-        object.__setattr__(
-            self,
-            "cellIndices",
-            cell_indices if cellIndices is None else cellIndices,
-        )
-        object.__setattr__(self, "name", name)
-
-    @property
-    def feature_indices(self) -> Sequence[int] | NDArray[Any] | None:
-        return self.featureIndices
-
-    @property
-    def cell_indices(self) -> Sequence[int] | NDArray[Any] | None:
-        return self.cellIndices
 
 
 @dataclass(frozen=True)
@@ -1292,6 +1328,15 @@ class _ResolvedLayerPlacement:
     featureIndices: NDArray[np.int64]
     cellIndices: NDArray[np.int64]
     name: str
+    cellsSorted: bool
+
+    def local_cells(self, start: int, stop: int) -> NDArray[np.int64]:
+        if self.cellsSorted:
+            left, right = np.searchsorted(self.cellIndices, (start, stop), side="left")
+            return np.arange(int(left), int(right), dtype=np.int64)
+        return np.flatnonzero(
+            (self.cellIndices >= start) & (self.cellIndices < stop)
+        ).astype(np.int64, copy=False)
 
 
 def _map_names(
@@ -1365,23 +1410,16 @@ class LayerStitchMatrixSource(BaseMatrixSource):
                 raise MatrixSourceError(f"layer {index} repeats a global feature")
             if has_duplicates(cells):
                 raise MatrixSourceError(f"layer {index} repeats a global cell")
-            self._validate_layer_names(
-                placement.source,
-                features,
-                cells,
-                raw_rows,
-                raw_columns,
-                index,
-            )
             resolved.append(
                 _ResolvedLayerPlacement(
                     placement.source,
                     features,
                     cells,
                     placement.name or f"layer[{index}]",
+                    bool(cells.size < 2 or np.all(cells[1:] > cells[:-1])),
                 )
             )
-        self._validate_conflicts(resolved)
+        self._validate_conflicts(resolved, len(raw_rows), len(raw_columns))
         self.layers = tuple(resolved)
         result_dtype = (
             np.result_type(*(layer.source.dtype for layer in resolved))
@@ -1399,38 +1437,20 @@ class LayerStitchMatrixSource(BaseMatrixSource):
         )
 
     @staticmethod
-    def _validate_layer_names(
-        source: MatrixSource,
-        feature_indexes: NDArray[np.int64],
-        cell_indexes: NDArray[np.int64],
-        row_names: tuple[str, ...],
-        column_names: tuple[str, ...],
-        index: int,
-    ) -> None:
-        if source.row_names is not None:
-            expected = tuple(row_names[position] for position in feature_indexes)
-            if source.row_names != expected:
-                raise MatrixSourceError(
-                    f"layer {index} feature names conflict with global mapping"
-                )
-        if source.column_names is not None:
-            expected = tuple(column_names[position] for position in cell_indexes)
-            if source.column_names != expected:
-                raise MatrixSourceError(
-                    f"layer {index} cell names conflict with global mapping"
-                )
-
-    @staticmethod
     def _validate_conflicts(
         layers: Sequence[_ResolvedLayerPlacement],
+        n_features: int,
+        n_cells: int,
     ) -> None:
-        feature_sets = [set(layer.featureIndices.tolist()) for layer in layers]
-        cell_sets = [set(layer.cellIndices.tolist()) for layer in layers]
         for left in range(len(layers)):
+            features = np.zeros(n_features, dtype=bool)
+            cells = np.zeros(n_cells, dtype=bool)
+            features[layers[left].featureIndices] = True
+            cells[layers[left].cellIndices] = True
             for right in range(left + 1, len(layers)):
-                if feature_sets[left].intersection(feature_sets[right]) and cell_sets[
-                    left
-                ].intersection(cell_sets[right]):
+                if np.any(features[layers[right].featureIndices]) and np.any(
+                    cells[layers[right].cellIndices]
+                ):
                     raise MatrixSourceError(
                         f"layer coordinate conflict between "
                         f"{layers[left].name!r} and {layers[right].name!r}"
@@ -1450,19 +1470,16 @@ class LayerStitchMatrixSource(BaseMatrixSource):
 
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
         start, stop = self._window(start, stop)
-        child = 0
+        child_bytes = 0
+        values = 0
         for layer in self.layers:
-            selected = np.flatnonzero(
-                (layer.cellIndices >= start) & (layer.cellIndices < stop)
+            layer_bytes, layer_values = _selected_estimate(
+                layer.source, layer.local_cells(start, stop)
             )
-            child += sum(
-                layer.source.estimate_read_memory(
-                    int(position), int(position) + 1
-                ).peakBytes
-                for position in selected
-            )
-        output = (stop - start) * self.n_features * self.dtype.itemsize
-        return MemoryEstimate(self.resident_bytes, child, output)
+            child_bytes += layer_bytes
+            values += layer_values
+        output = self._output_bytes(stop - start, values)
+        return MemoryEstimate(self.resident_bytes, child_bytes + 2 * output, output)
 
     def read_cells(self, start: int, stop: int) -> csr_matrix:
         start, stop = self._window(start, stop)
@@ -1472,9 +1489,7 @@ class LayerStitchMatrixSource(BaseMatrixSource):
         row_parts: list[NDArray[np.int64]] = []
         column_parts: list[NDArray[np.int64]] = []
         for layer in self.layers:
-            local_cells: NDArray[np.int64] = np.flatnonzero(
-                (layer.cellIndices >= start) & (layer.cellIndices < stop)
-            ).astype(np.int64, copy=False)
+            local_cells = layer.local_cells(start, stop)
             if local_cells.size == 0:
                 continue
             block = _read_selected_cells(layer.source, local_cells)
@@ -1506,22 +1521,22 @@ class LayerStitchMatrixSource(BaseMatrixSource):
 
 
 class RenamedMatrixSource(BaseMatrixSource):
+    """Replace a source's axis names; ``None`` leaves that axis unnamed."""
+
     def __init__(
         self,
         source: MatrixSource,
         *,
-        row_names: Sequence[str | bytes] | NDArray[Any] | None = None,
-        column_names: Sequence[str | bytes] | NDArray[Any] | None = None,
+        row_names: Sequence[str | bytes] | NDArray[Any] | None,
+        column_names: Sequence[str | bytes] | NDArray[Any] | None,
         limits: SourceLimits = DEFAULT_LIMITS,
     ) -> None:
         self.source = source
         super().__init__(
             source.shape,
             source.dtype,
-            row_names=source.row_names if row_names is None else row_names,
-            column_names=(
-                source.column_names if column_names is None else column_names
-            ),
+            row_names=row_names,
+            column_names=column_names,
             is_sparse=source.is_sparse,
             zero_preserving=source.zero_preserving,
             limits=limits,
@@ -1565,14 +1580,16 @@ class DtypeMatrixSource(BaseMatrixSource):
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
         start, stop = self._window(start, stop)
         child = self.source.estimate_read_memory(start, stop)
-        output = (stop - start) * self.n_features * self.dtype.itemsize
-        return MemoryEstimate(self.resident_bytes, child.peakBytes, output)
+        output = self._output_bytes(
+            stop - start, _value_bound(self.source, child, stop - start)
+        )
+        return MemoryEstimate(self.resident_bytes, child.blockBytes, output)
 
     def read_cells(self, start: int, stop: int) -> MatrixBlock:
         start, stop = self._window(start, stop)
         estimate = self.estimate_read_memory(start, stop)
         self._admit(estimate)
         block = self.source.read_cells(start, stop)
-        if isinstance(block, spmatrix):
-            return cast(MatrixBlock, block.astype(self.dtype, copy=False))
+        if issparse(block):
+            return _block_to_csr(block, dtype=self.dtype)
         return np.asarray(block).astype(self.dtype, copy=False)

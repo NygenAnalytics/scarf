@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 import pandas as pd
 
-from ...assay import Assay, ATACassay, RNAassay
+from ...assay import ATACassay, RNAassay
 from ...assay.feature_summary import (
     ensure_feature_summary,
     feature_summary_selected_count,
@@ -19,6 +19,7 @@ from ...graph.kinds import require_graph_kind
 from ...quality_control.cell_cycle import assign_cell_cycle_phase
 from ...quality_control.filtering import (
     filter_cell_metrics,
+    validate_cell_filter_sources,
     validate_filter_bounds,
 )
 from ...quality_control.hto import _hto_demux_method, hto_demux
@@ -40,6 +41,7 @@ from ...metadata.rows import (
     read_metadata_rows_chunkwise,
 )
 from ...metadata.selection import (
+    GROUPING_VALUE_NAMES,
     NamedCellArtifact,
     require_complete_cluster_labels,
     resolve_cell_aligned_artifact,
@@ -48,7 +50,6 @@ from ...storage.arrays import linked_missing_mask
 from ...storage.artifacts import (
     artifact_group,
     artifact_path,
-    canonical_bytes,
     fingerprint_array,
     fingerprint_strings,
 )
@@ -69,6 +70,8 @@ from ...storage.selections import (
     validate_stored_selection_integrity,
 )
 from ...storage.types import as_zarr_array, as_zarr_group
+from ...utils.arguments import integer_argument
+from ...utils.arrays import within_bounds
 from ...utils.compute import controlled_compute
 from ...utils.logging import logger
 
@@ -78,23 +81,26 @@ else:
     _QualityControlOperationsBase = object
 
 
-def _validated_named_cell_artifacts(
-    values: Iterable[NamedCellArtifact] | None,
+def _validated_real(
+    value: object,
+    name: str,
     *,
-    expected_kind: str,
-    label: str,
-) -> list[NamedCellArtifact]:
-    sources = list(values or ())
-    names: set[str] = set()
-    for source in sources:
-        if not isinstance(source, NamedCellArtifact):
-            raise TypeError(f"{label} must contain NamedCellArtifact values")
-        if source.artifact.kind != expected_kind:
-            raise ValueError(f"{label} must reference {expected_kind!r} artifacts")
-        if source.name in names:
-            raise ValueError(f"{label} must use unique semantic names")
-        names.add(source.name)
-    return sources
+    low: float,
+    high: float = np.inf,
+    include_low: bool = True,
+) -> float:
+    if isinstance(value, bool | np.bool_) or not isinstance(value, Real):
+        raise TypeError(f"{name} must be a real number")
+    resolved = float(value)
+    in_range = (resolved >= low if include_low else resolved > low) and (
+        resolved <= high
+    )
+    if not np.isfinite(resolved) or not in_range:
+        bound = f">= {low:g}" if include_low else f"> {low:g}"
+        if np.isfinite(high):
+            bound += f" and <= {high:g}"
+        raise ValueError(f"{name} must be a finite number {bound}")
+    return resolved
 
 
 class _QualityControlOperationsMixin(_QualityControlOperationsBase):
@@ -128,47 +134,47 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             from ...quality_control.cell_cycle_genes import g2m_phase_genes
 
             g2m_genes = list(g2m_phase_genes)
-        control_size = (
-            min(len(s_genes), len(g2m_genes)) if ctrl_size is None else ctrl_size
+        for label, genes in (("s_genes", s_genes), ("g2m_genes", g2m_genes)):
+            if isinstance(genes, str) or not all(
+                isinstance(gene, str) for gene in genes
+            ):
+                raise TypeError(f"{label} must be a sequence of gene names")
+        control_size = integer_argument(
+            min(len(s_genes), len(g2m_genes)) if ctrl_size is None else ctrl_size,
+            "ctrl_size",
+            minimum=1,
         )
-        if isinstance(control_size, (bool, np.bool_)) or not isinstance(
-            control_size, (int, np.integer)
-        ):
-            raise TypeError("ctrl_size must be a positive integer")
-        if control_size < 1:
-            raise ValueError("ctrl_size must be a positive integer")
         if not isinstance(log_transform, bool):
             raise TypeError("log_transform must be a bool")
-        if feature_names is None:
-            s_gene_indices = assay.feats.get_index_by(
-                s_genes,
-                "names",
-                None,
-            ).tolist()
-            g2m_gene_indices = assay.feats.get_index_by(
-                g2m_genes,
-                "names",
-                None,
-            ).tolist()
-        else:
-            names = np.asarray(feature_names)
-            if names.ndim != 1 or len(names) != assay.feats.N:
-                raise ValueError(
-                    "Snapshot feature names must align with the assay feature axis"
+        n_bins = integer_argument(n_bins, "n_bins", minimum=2)
+        rand_seed = integer_argument(rand_seed, "rand_seed", minimum=0)
+        names = np.asarray(
+            assay.feats.fetch_all("names") if feature_names is None else feature_names
+        )
+        if names.ndim != 1 or len(names) != assay.feats.N:
+            raise ValueError("Feature names must align with the assay feature axis")
+        # Names match without case sensitivity; a name shared by several
+        # features selects all of them.
+        by_name: dict[str, list[int]] = {}
+        for index, name in enumerate(names):
+            by_name.setdefault(str(name).upper(), []).append(index)
+
+        def indices_for(targets: list[str], label: str) -> list[int]:
+            unmatched = sum(target.upper() not in by_name for target in targets)
+            if unmatched:
+                logger.warning(
+                    f"{unmatched} of {len(targets)} {label} were not found in "
+                    "the assay feature names"
                 )
-            by_name: dict[str, list[int]] = {}
-            for index, name in enumerate(names):
-                by_name.setdefault(str(name).upper(), []).append(index)
+            indices = [
+                index for target in targets for index in by_name.get(target.upper(), ())
+            ]
+            if not indices:
+                raise ValueError(f"None of the {label} match the assay feature names")
+            return indices
 
-            def indices_for(targets: list[str]) -> list[int]:
-                return [
-                    index
-                    for target in targets
-                    for index in by_name.get(target.upper(), ())
-                ]
-
-            s_gene_indices = indices_for(s_genes)
-            g2m_gene_indices = indices_for(g2m_genes)
+        s_gene_indices = indices_for(s_genes, "s_genes")
+        g2m_gene_indices = indices_for(g2m_genes, "g2m_genes")
         summary_ref = ensure_feature_summary(
             self.zw,
             assay,
@@ -304,11 +310,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         highs = list(highs)
         if not (len(attrs) == len(lows) == len(highs)):
             raise ValueError("attrs, lows, and highs must have the same length")
-        for attr in attrs:
-            if not isinstance(attr, str):
-                raise TypeError("attrs must contain only column names")
-        if len(set(attrs)) != len(attrs):
-            raise ValueError("attrs must not contain duplicate columns")
+        attrs, _, _ = validate_cell_filter_sources(attrs)
         validate_filter_bounds(lows, highs, keep_bounds=keep_bounds)
         available = set(self.cells.columns)
         missing = [attr for attr in attrs if attr not in available]
@@ -388,6 +390,9 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         """Select cells from one numeric or categorical artifact vector.
 
         Numeric values use optional bounds. Categorical values use ``include``.
+        Categorical label artifacts are read from their canonical label array,
+        for example ``phase`` of a ``cell_cycle`` artifact or ``labels`` of a
+        ``cluster_cut``; other artifacts are read from ``values``.
         The artifact must identify its source cell selection in provenance. By
         default the new selection is composed with that source selection. An
         explicit ``cell_selection`` may narrow it further, but cannot add cells
@@ -405,6 +410,9 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
 
         Returns:
             A complete datastore-scoped ``cell_selection`` artifact.
+
+        Raises:
+            ValueError: If no cell is selected.
         """
         if not isinstance(values, ArtifactRef):
             raise TypeError("values must be an ArtifactRef")
@@ -475,9 +483,10 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             self.zw[artifact_path(values)],
             name=values.artifact_id,
         )
-        if "values" not in group:
-            raise ValueError("values artifact has no canonical 'values' array")
-        source_values = as_zarr_array(group["values"], name="values")
+        value_name = GROUPING_VALUE_NAMES.get(values.kind, "values")
+        if value_name not in group:
+            raise ValueError(f"values artifact has no canonical {value_name!r} array")
+        source_values = as_zarr_array(group[value_name], name=value_name)
         if (
             source_values.ndim != 1
             or int(source_values.shape[0]) != source.selected_count
@@ -487,7 +496,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             )
         source_missing = linked_missing_mask(
             group,
-            "values",
+            value_name,
             label="values artifact",
             values=source_values,
         )
@@ -501,7 +510,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             "f",
             "i",
             "O",
-            "S",
             "u",
             "U",
         }:
@@ -509,7 +517,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
 
         resolved_include: tuple[str | int | float | bool, ...] | None = None
         if raw_include is not None:
-            if value_kind in {"O", "S", "U"}:
+            if value_kind in {"O", "U"}:
                 if not all(isinstance(value, str) for value in raw_include):
                     raise TypeError(
                         "include values must be strings for a string artifact"
@@ -583,32 +591,12 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 source_values[block.compact_start : block.compact_stop]
             )
             if resolved_include is not None:
-                if value_kind in {"O", "S", "U"}:
-                    raw_compact = np.asarray(
-                        [
-                            bytes(value).decode("utf-8")
-                            if isinstance(value, bytes | bytearray | np.bytes_)
-                            else value
-                            for value in raw_compact
-                        ],
-                        dtype=object,
-                    )
                 keep = np.isin(raw_compact, resolved_include)
             else:
                 compact = np.asarray(raw_compact, dtype=np.float64)
-                keep = np.isfinite(compact)
-                if resolved_low is not None:
-                    keep &= (
-                        compact >= resolved_low
-                        if keep_bounds
-                        else compact > resolved_low
-                    )
-                if resolved_high is not None:
-                    keep &= (
-                        compact <= resolved_high
-                        if keep_bounds
-                        else compact < resolved_high
-                    )
+                keep = np.isfinite(compact) & within_bounds(
+                    compact, resolved_low, resolved_high, keep_bounds=keep_bounds
+                )
             if source_missing is not None:
                 keep &= ~np.asarray(
                     source_missing[block.compact_start : block.compact_stop],
@@ -617,6 +605,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             block_selected = np.zeros(block.stop - block.start, dtype=bool)
             block_selected[block.mask] = keep
             selected[block.start : block.stop] = block_selected & prior_block
+        if not selected.any():
+            raise ValueError("select_cells retained no cells")
 
         inputs: dict[str, Any] = {
             "values": values,
@@ -784,38 +774,14 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 if i in available:
                     attrs.append(i)
 
-        attrs_list = list(attrs)
-        for attr in attrs_list:
-            if not isinstance(attr, str):
-                raise TypeError("attrs must contain only column names")
-        if len(set(attrs_list)) != len(attrs_list):
-            raise ValueError("attrs must not contain duplicate columns")
-        metric_artifacts = _validated_named_cell_artifacts(
-            artifact_metrics,
-            expected_kind="quality_metric",
-            label="artifact_metrics",
-        )
-        resolved_sample_artifact: NamedCellArtifact | None = None
-        if sample_artifact is not None:
-            resolved_sample_artifact = _validated_named_cell_artifacts(
-                [sample_artifact],
-                expected_kind="hto_identity",
-                label="sample_artifact",
-            )[0]
-        if sample_column is not None and resolved_sample_artifact is not None:
-            raise ValueError("sample_column and sample_artifact are mutually exclusive")
-        if resolved_sample_artifact is not None and resolved_sample_artifact.name in {
-            source.name for source in metric_artifacts
-        }:
-            raise ValueError("Sample and metric artifact names must be distinct")
-        duplicate_names = sorted(
-            set(attrs_list).intersection(source.name for source in metric_artifacts)
-        )
-        if duplicate_names:
-            raise ValueError(
-                "Metadata and artifact QC metrics must use distinct names: "
-                f"{duplicate_names}"
+        attrs_list, metric_artifacts, resolved_sample_artifact = (
+            validate_cell_filter_sources(
+                attrs,
+                artifact_metrics,
+                sample_column=sample_column,
+                sample_artifact=sample_artifact,
             )
+        )
         missing = [attr for attr in attrs_list if attr not in available]
         if missing:
             joined = ", ".join(repr(attr) for attr in missing)
@@ -1004,7 +970,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 for key, value in result.mad_provenance.items()
                 if key != "warnings"
             )
-        fingerprint_inputs: dict[str, Any] = {
+        inputs: dict[str, Any] = {
+            "prior_cell_selection": prior.ref,
             "qc_metric_fingerprints": {
                 attr: fingerprint_array(values_by_attr[attr]) for attr in attrs
             },
@@ -1013,32 +980,14 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             },
         }
         if missing_fingerprints:
-            fingerprint_inputs["missing_mask_fingerprints"] = missing_fingerprints
+            inputs["missing_mask_fingerprints"] = missing_fingerprints
         if sample_column is not None:
             assert result.sample_labels is not None
-            fingerprint_inputs["sample_assignments_fingerprint"] = fingerprint_strings(
+            inputs["sample_assignments_fingerprint"] = fingerprint_strings(
                 result.sample_labels
             )
         elif sample_artifact is not None:
-            fingerprint_inputs["sample_artifact"] = sample_artifact.artifact
-        canonical_bytes(
-            {
-                "operation": "auto_filter_cells",
-                "parameters": parameters,
-                "inputs": fingerprint_inputs,
-            }
-        )
-        inputs: dict[str, Any] = {
-            "prior_cell_selection": prior.ref,
-            **fingerprint_inputs,
-        }
-        canonical_bytes(
-            {
-                "operation": "auto_filter_cells",
-                "parameters": parameters,
-                "inputs": inputs,
-            }
-        )
+            inputs["sample_artifact"] = sample_artifact.artifact
 
         if result.mad_provenance is not None:
             for message in result.mad_provenance["warnings"]:
@@ -1086,8 +1035,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         if features.scope != "assay" or features.assay is None:
             raise ValueError("features must be an assay-scoped ArtifactRef")
         assay = self._get_assay(features.assay)
-        if not isinstance(assay, Assay):
-            raise TypeError("from_assay must resolve to an Assay")
         cell_index = read_stored_selection_indices(
             self.zw,
             cell_selection,
@@ -1263,6 +1210,24 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         from ...storage.execution import admit_stream
 
         require_graph_kind(connectivity)
+        # Arguments are checked before any reference, score, or artifact work.
+        _validated_real(
+            cluster_sample_fraction,
+            "cluster_sample_fraction",
+            low=0.0,
+            high=1.0,
+            include_low=False,
+        )
+        integer_argument(max_cells_per_cluster, "max_cells_per_cluster", minimum=1)
+        _validated_real(
+            simulation_ratio, "simulation_ratio", low=0.0, include_low=False
+        )
+        _validated_real(heterotypic_fraction, "heterotypic_fraction", low=0.0, high=1.0)
+        integer_argument(save_k, "save_k", minimum=1)
+        integer_argument(smoothing_t, "smoothing_t", minimum=1)
+        integer_argument(random_seed, "random_seed", minimum=0)
+        if not isinstance(normalize_scores, bool):
+            raise TypeError("normalize_scores must be a boolean")
         assay_name = source_assay.name
         if feature_names is not None and np.asarray(feature_names).shape != (
             source_assay.feats.N,
@@ -1382,15 +1347,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 "Doublet features do not match the mapping reference order"
             )
 
-        cached_bytes = 0
-        cache = getattr(self, "_graphMemoryCache", None)
-        if cache is not None:
-            with self._graphMemoryCacheLock:
-                matrices = {id(value): value for value in cache.values()}
-                cached_bytes = sum(
-                    matrix.data.nbytes + matrix.indices.nbytes + matrix.indptr.nbytes
-                    for matrix in matrices.values()
-                )
         raw_scores = score_synthetic_doublets(
             source_assay,
             reference,
@@ -1404,7 +1360,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             save_k=save_k,
             random_seed=random_seed,
             resources=self.resources,
-            reserved_resident_bytes=cached_bytes,
         )
         del reference
         if raw_scores.shape != (n_active,):
@@ -1423,8 +1378,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             self.resources,
             nBlocks=1,
             blockBytes=graph_bytes,
-            residentBytes=cached_bytes
-            + active_idx.nbytes
+            residentBytes=active_idx.nbytes
             + labels.nbytes
             + raw_scores.nbytes
             + feature_ids.nbytes
@@ -1551,7 +1505,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         Args:
             from_assay: Assay to use for graph creation. If no value is provided then `defaultAssay` will be used
             cell_selection: Explicit cells used to calculate peak prevalence.
-            top_n: Number of top prevalent peaks to be selected. (Default: 10000)
+            top_n: Number of top prevalent peaks to be selected, from 1 to one
+                fewer than the number of peaks. (Default: 10000)
         Returns:
             The persisted prevalent-peak feature-selection artifact.
         """
@@ -1563,6 +1518,11 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             raise TypeError(
                 f"ERROR: This method of feature selection can only be applied to ATACassay type of assay. "
                 f"The provided assay is {type(assay)} type"
+            )
+        top_n = integer_argument(top_n, "top_n", minimum=1)
+        if top_n >= assay.feats.N:
+            raise ValueError(
+                f"top_n must be less than the number of peaks ({assay.feats.N})"
             )
         summary_ref = ensure_feature_summary(
             self.zw,

@@ -1,4 +1,3 @@
-import os
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -6,23 +5,33 @@ import zarr
 
 from ..storage.budget import resolve_budget
 from ..storage.count_matrix import CountMatrixPolicy
-from ..storage.identity import generated_cell_columns, validate_preparation
+from ..storage.identity import (
+    count_fingerprint,
+    generated_cell_columns,
+    validate_preparation,
+)
 from ..storage.io_policy import StorageIoPolicy
 from ..storage.layout import _group_zarr_format, count_array_spec
 from ..storage.profiles import (
     StorageProfile,
     ZarrLocation,
-    is_local_zarr_path,
     resolve_storage_profile,
 )
 from ..storage.schema import validate_assay_name, validate_workspace_name
 from ..storage.sharding import preflight_counts_t_spec, row_band_task_count
-from ..storage.stores import MATRIX_SOURCE_ATTR, load_zarr, zarr_root_path
-from ..storage.types import as_zarr_group
+from ..storage.stores import (
+    MATRIX_SOURCE_ATTR,
+    load_zarr,
+    locations_overlap,
+    zarr_location_has_content,
+    zarr_root_path,
+)
+from ..storage.types import as_zarr_array, as_zarr_group
 from ..utils.logging import logger
 from .features import FeatureKey, align_features, resolve_merge_dtype
 from .metadata import (
     CellMetadataPlan,
+    _cell_data_path,
     admit_cell_metadata_plan,
     metadata_chunk_rows,
     plan_cell_metadata,
@@ -42,7 +51,6 @@ from .models import (
 from .row_plan import RowPlan, build_row_plan
 from .writer import (
     _assay_metadata_path,
-    _cell_data_path,
     _matrix_group_path,
     assess_counts_t_reuse,
     counts_t_complete,
@@ -58,44 +66,34 @@ _IMPORT_SOURCE = "DataStoreMerge"
 _MANIFEST_ATTR = "scarf:merge_manifest"
 
 
-def _normalized_store_location(value: object) -> str | None:
-    if not isinstance(value, str) or not value:
-        return None
-    location = value.rstrip("/")
-    if location.startswith("file://"):
-        location = location[7:]
-    if not location:
-        return os.path.sep
-    if "://" in location:
-        return location
-    return os.path.realpath(os.path.abspath(os.path.expanduser(location)))
+def _store_location(value: object) -> str | None:
+    """Return a path or URI for a location string or a filesystem store."""
+    if isinstance(value, str):
+        return value
+    root = getattr(value, "root", None)
+    return None if root is None else str(root)
 
 
-def _location_tokens(loc: object) -> set[tuple[str, str | int]]:
-    tokens: set[tuple[str, str | int]] = set()
-    normalized = _normalized_store_location(loc)
-    if normalized is not None:
-        tokens.add(("location", normalized))
-    if isinstance(loc, str) or loc is None:
-        return tokens
-
-    store = getattr(loc, "store", loc)
-    tokens.add(("object", id(store)))
-    store_root = getattr(store, "root", None)
-    if store_root is not None:
-        normalized_root = _normalized_store_location(str(store_root))
-        if normalized_root is not None:
-            tokens.add(("location", normalized_root))
-    return tokens
-
-
-def _dataset_tokens(ds: Any) -> set[tuple[str, str | int]]:
-    tokens = _location_tokens(getattr(ds, "zarr_loc", None))
-    root = getattr(ds, "z", None)
-    if isinstance(root, zarr.Group | zarr.Array):
-        tokens.update(_location_tokens(root.store))
-        tokens.update(_location_tokens(zarr_root_path(root)))
-    return tokens
+def _overlaps_source(destination: ZarrLocation, source: Any) -> bool:
+    """Return whether ``destination`` is, contains, or lies inside a source store."""
+    candidates: list[object] = [getattr(source, "zarr_loc", None)]
+    root = getattr(source, "z", None)
+    if isinstance(root, zarr.Group):
+        candidates.extend((root.store, zarr_root_path(root)))
+    destination_location = _store_location(destination)
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if candidate is destination:
+            return True
+        location = _store_location(candidate)
+        if (
+            location is not None
+            and destination_location is not None
+            and locations_overlap(location, destination_location)
+        ):
+            return True
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,12 +115,17 @@ class DataStoreMerge:
         datasets: Source DataStores to merge. At least two are required.
         zarr_path: Destination Zarr path or store.
         names: Unique name for each source, used in metadata and provenance.
+               Merged cell IDs are ``{name}__{cell_id}``, so a name cannot
+               contain ``__``.
         assays: Optional assay-name filter. None merges every assay present
                 in any source.
         out_workspace: Workspace name in the destination store. None uses
                        the legacy layout without a workspace group.
-        dtype: Optional count dtype override. None promotes from sources.
-        overwrite: If True, replace a blocked or incompatible destination.
+        dtype: Optional count dtype override. None keeps the shared source dtype,
+               widened when features that share a name are summed, and uses
+               float64 when the source dtypes differ.
+        overwrite: If True, replace a merge-owned destination whose assays have
+                   not been prepared by opening it as a DataStore.
         prepend_text: Prefix added to colliding metadata column names.
         reset_cell_filter: If True, mark every merged cell as selected.
         seed: RNG seed for interleaving source cell blocks. None draws a fresh,
@@ -179,6 +182,11 @@ class DataStoreMerge:
             raise ValueError("datasets and names must have the same length")
         if len(names) != len(set(names)):
             raise ValueError("A unique name must be provided for each source DataStore")
+        if any("__" in name for name in names):
+            raise ValueError(
+                "Source names cannot contain '__', which separates the name "
+                "from each merged cell ID"
+            )
         if assays is not None and len(assays) != len(set(assays)):
             raise ValueError("assays must not contain duplicate assay names")
         if missing_assay_policy not in {"zero_fill", "error"}:
@@ -367,6 +375,18 @@ class DataStoreMerge:
                 ]
                 for assay_name in self.uniqueAssays
             },
+            # A resume must read the same source counts as the interrupted run.
+            "sourceCountFingerprints": {
+                assay_name: [
+                    None
+                    if source is None
+                    else count_fingerprint(
+                        as_zarr_array(source.matrixGroup["counts"], name="counts")
+                    )
+                    for source in self._assaySources[assay_name]
+                ]
+                for assay_name in self.uniqueAssays
+            },
             "assays": list(self.uniqueAssays),
             "seed": self.seed,
             "prependText": self.prependText,
@@ -397,14 +417,11 @@ class DataStoreMerge:
         return _cell_data_path(self.outWorkspace)
 
     def _source_destination_alias_reason(self) -> str | None:
-        destination = _location_tokens(self.zarr_path)
-        if not destination:
-            return None
         for source, name in zip(self.datasets, self.names, strict=True):
-            if destination & _dataset_tokens(source):
+            if _overlaps_source(self.zarr_path, source):
                 return (
-                    f"Destination aliases source DataStore {name!r}. "
-                    "Choose a distinct destination store."
+                    f"Destination aliases source DataStore {name!r} or overlaps "
+                    "its location. Choose a destination outside every source store."
                 )
         return None
 
@@ -419,9 +436,7 @@ class DataStoreMerge:
         self,
         root: zarr.Group,
         assay_name: str,
-    ) -> list[str] | None:
-        if assay_name in root:
-            return None
+    ) -> list[str]:
         claimed: list[str] = []
         for workspace in sorted(root.group_keys()):
             if workspace == "matrices":
@@ -468,14 +483,15 @@ class DataStoreMerge:
 
         for assay_name in self.uniqueAssays:
             matrix_path = _matrix_group_path(assay_name, self.outWorkspace)
-            if matrix_path not in root:
-                continue
-            claimers = self._workspaces_claiming_assay(root, assay_name)
-            if claimers is None:
+            # A legacy assay of this name owns the slot before any matrix exists.
+            if assay_name in root:
                 return (
                     f"Destination matrix {matrix_path!r} is claimed by the legacy "
                     "assay layout."
                 )
+            if matrix_path not in root:
+                continue
+            claimers = self._workspaces_claiming_assay(root, assay_name)
             if not claimers:
                 return (
                     f"Destination matrix {matrix_path!r} is orphaned and cannot be "
@@ -491,11 +507,7 @@ class DataStoreMerge:
                 )
         return None
 
-    def _is_fresh_destination_shell(
-        self,
-        root: zarr.Group,
-        attr_root: zarr.Group | None,
-    ) -> bool:
+    def _is_fresh_destination_shell(self, attr_root: zarr.Group | None) -> bool:
         if attr_root is None:
             return self.outWorkspace is not None
         return not (
@@ -553,23 +565,34 @@ class DataStoreMerge:
         if containment_reason is not None:
             return self._blocked_inspection(assay_plans, containment_reason)
         if existing is None:
-            return _DestinationInspection(actions)
-        attr_root = self._existing_attr_root(existing)
-        if self._is_fresh_destination_shell(existing, attr_root):
-            return _DestinationInspection(actions)
-        assert attr_root is not None
-        for assay_plan in assay_plans:
-            name = assay_plan.assayName
-            if (
-                name not in attr_root
-                or attr_root[name].attrs.get("prepared") is not True
+            if zarr_location_has_content(
+                self.zarr_path, storage_options=self.storageOptions
             ):
-                continue
-            if self.overwrite:
                 return self._blocked_inspection(
                     assay_plans,
-                    "Prepared datasets require a fresh destination; overwrite is not allowed",
+                    "Destination already holds content that is not a Zarr group. "
+                    "Choose an empty destination.",
                 )
+            return _DestinationInspection(actions)
+        attr_root = self._existing_attr_root(existing)
+        if self._is_fresh_destination_shell(attr_root):
+            return _DestinationInspection(actions)
+        assert attr_root is not None
+        prepared = sorted(
+            name
+            for name, group in attr_root.groups()
+            if group.attrs.get("prepared") is True
+        )
+        if prepared and self.overwrite:
+            return self._blocked_inspection(
+                assay_plans,
+                f"Destination assays {prepared!r} are prepared; prepared datasets "
+                "require a fresh destination, so overwrite is not allowed",
+            )
+        for assay_plan in assay_plans:
+            name = assay_plan.assayName
+            if name not in prepared:
+                continue
             try:
                 validate_preparation(
                     as_zarr_group(attr_root[name], name=name),
@@ -675,7 +698,7 @@ class DataStoreMerge:
                 )
                 if assessment.outcome == "reusable":
                     actions[f"countsT:{assay_name}"] = "skip"
-                elif assessment.outcome == "block-shape/dtype":
+                elif assessment.outcome == "invalid":
                     return self._blocked_inspection(
                         assay_plans,
                         f"Completed countsT for {assay_name!r} cannot be "
@@ -683,24 +706,18 @@ class DataStoreMerge:
                         "rebuild it.",
                     )
                 else:
-                    # incomplete or rewrite-layout: rewrite paired countsT.
                     actions[f"countsT:{assay_name}"] = "resume"
             else:
                 actions[f"countsT:{assay_name}"] = "resume"
 
         all_complete = all(action == "skip" for action in actions.values())
         if (import_complete or complete) and not all_complete:
-            only_counts_t_layout_rewrites = all(
-                action == "skip" or key.startswith("countsT:")
-                for key, action in actions.items()
+            return self._blocked_inspection(
+                assay_plans,
+                "Destination is marked complete but one or more planned "
+                "components are incomplete. Set overwrite=True to rebuild the "
+                "merge-owned components.",
             )
-            if not only_counts_t_layout_rewrites:
-                return self._blocked_inspection(
-                    assay_plans,
-                    "Destination is marked complete but one or more planned "
-                    "components are incomplete. Set overwrite=True to rebuild the "
-                    "merge-owned components.",
-                )
         return _DestinationInspection(
             actions,
             needsFinalization=all_complete and not (import_complete and complete),
@@ -745,7 +762,11 @@ class DataStoreMerge:
         assert self._metadataPlan is not None
         manifest = self._build_manifest()
         existing = self._open_existing()
-        zarr_format = 3 if existing is None else _group_zarr_format(existing)
+        if existing is not None and _group_zarr_format(existing) < 3:
+            raise ValueError(
+                "Merged count matrices require a Zarr format 3 destination. "
+                "Repack the store to Zarr v3."
+            )
         preliminary_plans: list[AssayMergePlan] = []
         count_specs = {}
         for assay_name in self.uniqueAssays:
@@ -768,7 +789,6 @@ class DataStoreMerge:
                 dtype=dtype,
                 profile=self.profile,
                 policy=self.policy,
-                zarrFormat=zarr_format,
             )
             count_specs[assay_name] = count_spec
             chunks = count_spec.chunks
@@ -796,11 +816,6 @@ class DataStoreMerge:
                 )
             )
         inspection = self._inspect_existing(manifest, preliminary_plans)
-        if any(item.writeCountsT for item in preliminary_plans) and zarr_format < 3:
-            inspection = self._blocked_inspection(
-                preliminary_plans,
-                "countsT requires a Zarr v3 destination. Repack the store to Zarr v3.",
-            )
         if inspection.canDump:
             alignment_bytes = {
                 assay_name: alignment.resident_bytes()
@@ -895,6 +910,22 @@ class DataStoreMerge:
         for path in sorted(paths, key=lambda value: value.count("/"), reverse=True):
             if path in root:
                 del root[path]
+        attr_root = self._existing_attr_root(root)
+        if attr_root is not None:
+            # The default and recorded types described the cleared assays.
+            attributes = {
+                key: value
+                for key, value in attr_root.attrs.items()
+                if key != "defaultAssay"
+            }
+            recorded_types = attributes.get("assayTypes")
+            if isinstance(recorded_types, dict):
+                attributes["assayTypes"] = {
+                    name: assay_type
+                    for name, assay_type in recorded_types.items()
+                    if name not in assay_names
+                }
+            attr_root.attrs.put(attributes)
         pipeline_path = f"{workspace_prefix}pipeline"
         if pipeline_path in root:
             pipeline = as_zarr_group(root[pipeline_path], name=pipeline_path)
@@ -915,18 +946,10 @@ class DataStoreMerge:
         if containment_reason is not None:
             raise ValueError(containment_reason)
         if existing is None:
-            if (
-                is_local_zarr_path(self.zarr_path)
-                and isinstance(self.zarr_path, str)
-                and os.path.exists(self.zarr_path)
-            ):
-                raise ValueError(
-                    f"ERROR: Directory/file with name `{self.zarr_path}`exists. "
-                    f"Either delete it or use another name"
-                )
+            # "w-" refuses a location that gained content since planning.
             root = load_zarr(
                 self.zarr_path,
-                mode="w",
+                mode="w-",
                 storage_options=self.storageOptions,
             )
         else:
@@ -937,7 +960,7 @@ class DataStoreMerge:
             )
             if inspection.restart:
                 current_attr_root = self._existing_attr_root(root)
-                if not self._is_fresh_destination_shell(root, current_attr_root):
+                if not self._is_fresh_destination_shell(current_attr_root):
                     if (
                         current_attr_root is None
                         or current_attr_root.attrs.get("scarf:import_source")
@@ -1017,11 +1040,9 @@ class DataStoreMerge:
                 [ds.cells for ds in self.datasets],
                 self._metadataPlan,
                 profile=self.profile,
-                prepend_text=self.prependText,
                 reset_cell_filter=self.resetCellFilter,
                 source_column=self.sourceColumn,
                 membership_by_source=self._membership_by_source(),
-                overwrite=True,
             )
             components.append(ComponentResult("cellData", cell_action))
         else:
@@ -1094,7 +1115,6 @@ class DataStoreMerge:
                     self._rowPlan,
                     alignment,
                     resources=self.resources,
-                    profile=self.profile,
                     additionalResidentBytes=sum(
                         item.resident_bytes()
                         for name, item in self._alignments.items()

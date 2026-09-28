@@ -4,6 +4,7 @@ import hashlib
 import io
 import lzma
 import struct
+import tracemalloc
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +33,9 @@ from scarf.readers._rds import (
     RdsLimits,
     RType,
     WeakReferenceValue,
+    get_slot,
+    iter_named,
+    iter_pairlist,
     open_rds,
 )
 
@@ -210,7 +214,10 @@ def test_xdr_numeric_vector_is_lazy_and_matches_rdata(tmp_path: Path) -> None:
         assert document.temp_paths == ()
 
         oracle = rdata.parser.parse_data(payload, extension=".rds")
-        np.testing.assert_array_equal(vector.materialize(), oracle.object.value)
+        np.testing.assert_array_equal(
+            vector.read_block(0, len(vector)),
+            oracle.object.value,
+        )
 
 
 @pytest.mark.parametrize("encoding", ["xdr", "ascii"])
@@ -307,7 +314,7 @@ def test_s4_slots_and_named_list_helpers() -> None:
     s4 = wire.integer(wire.flags(RType.S4, attributes=True, object_=True)) + slots
     with open_rds(io.BytesIO(wire.document(s4))) as document:
         assert document.root.type is RType.S4
-        answer = document.root.slot("answer")
+        answer = get_slot(document.root, "answer")
         assert answer is not None
         assert answer.value[0] == 42
 
@@ -321,13 +328,9 @@ def test_s4_slots_and_named_list_helpers() -> None:
         attributes=names,
     )
     with open_rds(io.BytesIO(wire.document(named))) as document:
-        right = document.root.named("right")
-        assert right is not None
-        assert right.value[0] == 2
-        assert [name for name, _value in document.root.named_items()] == [
-            "left",
-            "right",
-        ]
+        items = dict(iter_named(document.root))
+        assert list(items) == ["left", "right"]
+        assert items["right"].value[0] == 2
 
 
 def test_lazy_indexes_share_a_bounded_number_of_temp_files(tmp_path: Path) -> None:
@@ -570,8 +573,6 @@ def test_ascii_octal_and_string_escapes_are_decoded() -> None:
     with open_rds(io.BytesIO(wire.document(root))) as document:
         strings = document.root.value
         assert isinstance(strings, LazyStringVector)
-        assert strings.raw(0) == octal_value
-        assert strings.raw(1) == escaped_value
         assert strings[:] == [
             octal_value.decode("ascii"),
             escaped_value.decode("ascii"),
@@ -676,7 +677,7 @@ def test_extended_reference_indices_are_validated(index: int) -> None:
     assert caught.value.path == "$"
 
 
-def test_character_vector_reference_requires_a_char_target() -> None:
+def test_character_vectors_accept_only_inline_char_elements() -> None:
     wire = Wire()
     referenced_symbol = wire.integer((1 << 8) | RType.REFERENCE)
     strings = wire.integer(RType.STRING) + wire.integer(1) + referenced_symbol
@@ -684,10 +685,88 @@ def test_character_vector_reference_requires_a_char_target() -> None:
 
     with pytest.raises(
         RdsFormatError,
-        match="character vector reference does not target CHAR",
+        match="character vector element has type REFERENCE",
     ) as caught:
         open_rds(io.BytesIO(wire.document(root)))
     assert caught.value.path == "$[1][0]"
+
+    attributed_char = (
+        wire.integer(wire.flags(RType.CHAR, attributes=True, gp=1 << 6))
+        + wire.integer(1)
+        + wire.string(b"x")
+        + wire.nil()
+    )
+    strings = wire.integer(RType.STRING) + wire.integer(1) + attributed_char
+    with pytest.raises(RdsFormatError, match="CHAR node cannot have attributes"):
+        open_rds(io.BytesIO(wire.document(strings)))
+
+
+def test_non_pair_nodes_reject_tags_and_the_any_type() -> None:
+    wire = Wire()
+    tagged = (
+        wire.integer(wire.flags(RType.INTEGER, tag=True))
+        + wire.integer(0)
+        + wire.symbol("tag")
+    )
+    with pytest.raises(RdsFormatError, match="INTEGER node cannot have a tag"):
+        open_rds(io.BytesIO(wire.document(tagged)))
+    with pytest.raises(RdsFormatError, match="unsupported R node type ANY"):
+        open_rds(io.BytesIO(wire.document(wire.integer(RType.ANY))))
+
+
+def test_long_pairlists_parse_without_deep_recursion() -> None:
+    wire = Wire()
+    length = 5_000
+    cells = b"".join(
+        wire.integer(wire.flags(RType.PAIRLIST)) + wire.integer_vector([index])
+        for index in range(length)
+    )
+
+    with open_rds(io.BytesIO(wire.document(cells + wire.nil()))) as document:
+        values = [cell.value.car.value[0] for cell in iter_pairlist(document.root)]
+    assert values == list(range(length))
+
+
+@pytest.mark.parametrize("container", ["pairlist", "list"])
+def test_deep_nesting_raises_the_depth_limit(container: str) -> None:
+    wire = Wire()
+    depth = 5_000
+    if container == "pairlist":
+        # Each cell's CAR is the next cell, so nesting grows with every cell.
+        payload = (
+            wire.integer(wire.flags(RType.PAIRLIST)) * depth
+            + wire.nil()
+            + wire.nil() * depth
+        )
+    else:
+        payload = (wire.integer(RType.VECTOR) + wire.integer(1)) * depth + wire.nil()
+
+    with pytest.raises(RdsLimitError, match="max_depth exceeded"):
+        open_rds(io.BytesIO(wire.document(payload)))
+
+
+def test_bytecode_repetition_count_does_not_reserve_memory() -> None:
+    wire = Wire()
+    payload = wire.document(wire.integer(RType.BYTECODE) + wire.integer(90_000_000))
+
+    tracemalloc.start()
+    try:
+        with pytest.raises(RdsFormatError, match="unexpected end of stream"):
+            open_rds(io.BytesIO(payload))
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 64 * 1024**2
+
+
+def test_xz_decoder_memory_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    wire = Wire()
+    # The default preset records an 8 MiB dictionary in the stream header.
+    payload = lzma.compress(wire.document(wire.integer_vector([1, 2, 3])))
+    monkeypatch.setattr("scarf.readers._rds._storage._XZ_MEMORY_LIMIT", 1024**2)
+
+    with pytest.raises(RdsFormatError, match="invalid xz compressed stream"):
+        open_rds(io.BytesIO(payload))
 
 
 def test_undefined_bytecode_reference_is_rejected() -> None:
@@ -802,7 +881,6 @@ def test_scalar_and_empty_container_nodes_are_preserved() -> None:
             wire.char(b""),
             special,
             builtin,
-            wire.integer(RType.ANY),
             wire.integer_vector([]),
             wire.string_vector([]),
             wire.vector([]),
@@ -816,7 +894,6 @@ def test_scalar_and_empty_container_nodes_are_preserved() -> None:
             empty_char,
             special_node,
             builtin_node,
-            any_node,
             empty_integer,
             empty_string,
             empty_vector,
@@ -826,7 +903,6 @@ def test_scalar_and_empty_container_nodes_are_preserved() -> None:
         assert empty_char.value == ""
         assert special_node.value == "sum"
         assert builtin_node.value == "+"
-        assert any_node.value is None
         assert empty_integer.value[:].size == 0
         assert empty_string.value[:] == []
         assert empty_vector.value == ()

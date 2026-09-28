@@ -169,16 +169,9 @@ def compile_rna_decision(
     definition: RnaDecisionDefinition,
     evidence: EvidenceBundle,
     record: DecisionRecord,
-    *,
-    created_at_ns: int = 0,
 ) -> CompiledRnaDecision:
     """Audit an exact selection and resolve its executor-owned payload."""
-    verification = DeterministicDecisionAuditor.audit(
-        definition.spec,
-        evidence,
-        record,
-        created_at_ns=created_at_ns,
-    )
+    verification = DeterministicDecisionAuditor.audit(definition.spec, evidence, record)
     failed_checks = [
         check.checkId for check in verification if check.status == "failed"
     ]

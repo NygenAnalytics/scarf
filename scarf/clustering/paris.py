@@ -1,20 +1,9 @@
 import numpy as np
-from scipy.sparse import spmatrix
 
 from ._paris_core import (
     ParisHierarchy,
-    fit_paris_hierarchy as _fit_paris_hierarchy,
+    fit_paris_hierarchy as fit_paris_hierarchy,
 )
-from .balanced_cut import BalancedCut
-
-
-def fit_paris_hierarchy(
-    graph: spmatrix,
-    *,
-    nthreads: int | None = None,
-) -> ParisHierarchy:
-    """Fit the canonical component-aware Paris hierarchy."""
-    return _fit_paris_hierarchy(graph, nthreads=nthreads)
 
 
 def hierarchy_to_dendrogram(
@@ -30,16 +19,6 @@ def hierarchy_to_dendrogram(
     if compatibility:
         dendrogram[hierarchy.synthetic_joins, 2] = 0.0
     return dendrogram
-
-
-def paris_dendrogram(
-    graph: spmatrix,
-    *,
-    nthreads: int | None = None,
-) -> np.ndarray:
-    """Fit Paris and map synthetic component joins to zero."""
-    hierarchy = fit_paris_hierarchy(graph, nthreads=nthreads)
-    return hierarchy_to_dendrogram(hierarchy, compatibility=True)
 
 
 def _validate_linkage_children(dendrogram: np.ndarray) -> np.ndarray:
@@ -86,8 +65,73 @@ def _validate_linkage_children(dendrogram: np.ndarray) -> np.ndarray:
     return children
 
 
+def _apply_merge(
+    children: np.ndarray,
+    active: np.ndarray,
+    sizes: np.ndarray,
+    merge_index: int,
+) -> bool:
+    """Merge the two active children of one row into its node."""
+    left, right = children[merge_index]
+    if not (active[left] and active[right]):
+        return False
+    node = children.shape[0] + 1 + merge_index
+    active[left] = False
+    active[right] = False
+    active[node] = True
+    sizes[node] = sizes[left] + sizes[right]
+    return True
+
+
+def _merges_below(
+    children: np.ndarray,
+    heights: np.ndarray,
+    cut_height: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply, in row order, every merge strictly below ``cut_height``.
+
+    Returns which nodes head a current cluster and each merged node's size;
+    a merge that was not applied keeps size zero.
+    """
+    n_leaves = children.shape[0] + 1
+    active = np.zeros(2 * n_leaves - 1, dtype=bool)
+    active[:n_leaves] = True
+    sizes = np.zeros(2 * n_leaves - 1, dtype=np.int64)
+    sizes[:n_leaves] = 1
+    for merge_index in range(n_leaves - 1):
+        if heights[merge_index] < cut_height:
+            _apply_merge(children, active, sizes, merge_index)
+    return active, sizes
+
+
+def _size_ordered_labels(
+    children: np.ndarray,
+    active: np.ndarray,
+    sizes: np.ndarray,
+) -> np.ndarray:
+    """Label clusters from 1 by decreasing size, breaking ties by node order."""
+    n_leaves = children.shape[0] + 1
+    roots = np.flatnonzero(active)
+    roots = roots[np.argsort(-sizes[roots], kind="stable")]
+    labels_by_node = np.full(active.size, -1, dtype=np.int64)
+    labels_by_node[roots] = np.arange(roots.size, dtype=np.int64)
+    for merge_index in range(n_leaves - 2, -1, -1):
+        label = labels_by_node[n_leaves + merge_index]
+        if label >= 0:
+            labels_by_node[children[merge_index]] = label
+    labels = labels_by_node[:n_leaves]
+    if np.any(labels < 0):
+        raise ValueError("dendrogram contains invalid child references")
+    return labels + 1
+
+
 def straight_cut(dendrogram: np.ndarray, n_clusters: int) -> np.ndarray:
-    """Cut a Paris dendrogram into a fixed number of clusters."""
+    """Cut a Paris dendrogram into a fixed number of clusters.
+
+    As in scikit-network, only merges strictly below the cut height are
+    applied, so tied heights can leave more clusters than requested. Clusters
+    are labelled from 1 by decreasing size, and equal sizes by node order.
+    """
     if dendrogram.ndim != 2 or dendrogram.shape[1] != 4:
         raise ValueError("dendrogram must have shape (n_leaves - 1, 4)")
     if isinstance(n_clusters, bool) or not isinstance(
@@ -107,42 +151,8 @@ def straight_cut(dendrogram: np.ndarray, n_clusters: int) -> np.ndarray:
     cut_index = n_leaves - cluster_count
     heights = np.asarray(dendrogram[:, 2])
     cut_height = np.partition(heights, cut_index)[cut_index]
-    n_nodes = 2 * n_leaves - 1
-    active = np.zeros(n_nodes, dtype=bool)
-    active[:n_leaves] = True
-    sizes = np.zeros(n_nodes, dtype=np.int64)
-    sizes[:n_leaves] = 1
-
-    for merge_index, (left, right) in enumerate(children):
-        node = n_leaves + merge_index
-        if (
-            heights[merge_index] < cut_height
-            and 0 <= left < node
-            and 0 <= right < node
-            and active[left]
-            and active[right]
-        ):
-            active[left] = False
-            active[right] = False
-            active[node] = True
-            sizes[node] = sizes[left] + sizes[right]
-
-    roots = np.flatnonzero(active)
-    roots = roots[np.argsort(-sizes[roots])]
-    labels_by_node = np.full(n_nodes, -1, dtype=np.int64)
-    labels_by_node[roots] = np.arange(roots.size, dtype=np.int64)
-    for merge_index in range(n_leaves - 2, -1, -1):
-        node = n_leaves + merge_index
-        label = labels_by_node[node]
-        if label >= 0:
-            left, right = children[merge_index]
-            labels_by_node[left] = label
-            labels_by_node[right] = label
-
-    labels = labels_by_node[:n_leaves]
-    if np.any(labels < 0):
-        raise ValueError("dendrogram contains invalid child references")
-    return labels + 1
+    active, sizes = _merges_below(children, heights, cut_height)
+    return _size_ordered_labels(children, active, sizes)
 
 
 def _merge_tied_overflow(
@@ -155,30 +165,13 @@ def _merge_tied_overflow(
     children = np.asarray(children, dtype=np.int64)
     heights = np.asarray(heights, dtype=np.float64)
     n_leaves = children.shape[0] + 1
-    n_nodes = 2 * n_leaves - 1
-    active = np.zeros(n_nodes, dtype=bool)
-    active[:n_leaves] = True
-    sizes = np.zeros(n_nodes, dtype=np.int64)
-    sizes[:n_leaves] = 1
-    applied = np.zeros(n_leaves - 1, dtype=bool)
-
-    def apply(merge_index: int) -> bool:
-        left, right = children[merge_index]
-        if not (active[left] and active[right]):
-            return False
-        node = n_leaves + merge_index
-        active[left] = False
-        active[right] = False
-        active[node] = True
-        sizes[node] = sizes[left] + sizes[right]
-        applied[merge_index] = True
-        return True
-
-    cut_height = np.partition(heights, n_leaves - n_clusters)[n_leaves - n_clusters]
-    for merge_index in range(n_leaves - 1):
-        if heights[merge_index] < cut_height:
-            apply(merge_index)
-    n_active = n_leaves - int(np.count_nonzero(applied))
+    cut_index = n_leaves - n_clusters
+    active, sizes = _merges_below(
+        children,
+        heights,
+        np.partition(heights, cut_index)[cut_index],
+    )
+    n_active = int(np.count_nonzero(active))
     candidates = np.argsort(heights, kind="stable")
     candidates = candidates[~np.asarray(synthetic_joins, dtype=bool)[candidates]]
     progressed = True
@@ -187,31 +180,27 @@ def _merge_tied_overflow(
         for merge_index in candidates:
             if n_active == n_clusters:
                 break
-            if not applied[merge_index] and apply(int(merge_index)):
+            if sizes[n_leaves + merge_index] == 0 and _apply_merge(
+                children,
+                active,
+                sizes,
+                int(merge_index),
+            ):
                 n_active -= 1
                 progressed = True
     if n_active != n_clusters:
         raise ValueError(f"The hierarchy cannot be cut into {n_clusters} clusters")
-
-    roots = np.flatnonzero(active)
-    roots = roots[np.argsort(-sizes[roots], kind="stable")]
-    labels_by_node = np.full(n_nodes, -1, dtype=np.int64)
-    labels_by_node[roots] = np.arange(roots.size, dtype=np.int64)
-    for merge_index in range(n_leaves - 2, -1, -1):
-        label = labels_by_node[n_leaves + merge_index]
-        if label >= 0:
-            labels_by_node[children[merge_index]] = label
-    return labels_by_node[:n_leaves] + 1
+    return _size_ordered_labels(children, active, sizes)
 
 
 def fixed_cut(hierarchy: ParisHierarchy, n_clusters: int) -> np.ndarray:
     """Cut a Paris hierarchy into exactly ``n_clusters`` clusters labelled from 1.
 
-    :func:`straight_cut` keeps sknetwork's semantics and can leave extra
-    clusters when merge heights tie at the cut. Tied merges inside components
-    are then applied in ascending height, and in hierarchy row order within one
-    height. Synthetic joins between components are never applied, so callers
-    must reject ``1 < n_clusters < n_components``.
+    :func:`straight_cut` can leave extra clusters when merge heights tie at the
+    cut. Tied merges inside components are then applied in ascending height,
+    and in hierarchy row order within one height. Synthetic joins between
+    components are never applied, so callers must reject
+    ``1 < n_clusters < n_components``. Labels follow :func:`straight_cut`.
     """
     labels = straight_cut(hierarchy_to_dendrogram(hierarchy), n_clusters)
     if int(labels.max()) <= n_clusters:
@@ -222,18 +211,3 @@ def fixed_cut(hierarchy: ParisHierarchy, n_clusters: int) -> np.ndarray:
         hierarchy.synthetic_joins,
         n_clusters,
     )
-
-
-def balanced_cut(
-    dendrogram: np.ndarray,
-    max_size: int,
-    min_size: int,
-    max_distance_fc: float,
-) -> np.ndarray:
-    """Cut a hierarchy using balanced size and distance constraints."""
-    return BalancedCut(
-        dendrogram,
-        max_size,
-        min_size,
-        max_distance_fc,
-    ).get_clusters()

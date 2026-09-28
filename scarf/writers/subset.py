@@ -4,8 +4,14 @@ import numpy as np
 import zarr
 
 from ..storage.types import as_zarr_array, as_zarr_group
-from ..storage.arrays import create_numeric_array, create_zarr_obj_array
-from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.arrays import create_zarr_obj_array
+from ..storage.count_matrix import (
+    DEFAULT_COUNT_MATRIX_POLICY,
+    CountMatrixPolicy,
+    create_count_matrix_array,
+    persist_count_matrix_plan,
+    plan_count_matrix_pair,
+)
 from ..storage.copy import copy_zarr_group_tree
 from ..storage.identity import (
     GENERATED_FEATURE_COLUMNS,
@@ -14,7 +20,7 @@ from ..storage.identity import (
     generated_cell_columns,
 )
 from ..storage.io_policy import StorageIoPolicy
-from ..storage.layout import array_shard_rows, count_array_spec
+from ..storage.layout import array_shard_rows
 from ..storage.profiles import (
     StorageProfile,
     ZarrLocation,
@@ -78,14 +84,18 @@ def subset_assay_zarr(
     resolved_profile = resolve_storage_profile(zarr_loc, profile)
     z = load_zarr(zarr_loc, "r+", storage_options=storage_options)
     ig = as_zarr_array(z[in_grp], name=in_grp)
-    spec = count_array_spec(
+    plan = plan_count_matrix_pair(
         len(cells_idx),
         len(feat_idx),
-        dtype=ig.dtype,
+        ig.dtype,
+        policy=policy or DEFAULT_COUNT_MATRIX_POLICY,
         profile=resolved_profile,
-        policy=policy,
     )
-    og = create_numeric_array(z, out_grp, spec)
+    og = create_count_matrix_array(z, out_grp, plan.counts)
+    # The counts and their parent group carry the layout the count contract checks.
+    parent = out_grp.rpartition("/")[0]
+    persist_count_matrix_plan(z if not parent else as_zarr_group(z[parent]), plan)
+    persist_count_matrix_plan(og, plan)
     summary = CountSummary(og)
     write_dense_in_shard_rows(
         og,

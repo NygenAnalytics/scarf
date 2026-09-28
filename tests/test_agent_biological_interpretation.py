@@ -506,6 +506,61 @@ def test_validator_omits_interpretations_without_marker_evidence() -> None:
     )
 
 
+def test_validator_rejects_conflicting_repeated_cluster_records() -> None:
+    store = FakeStore(replicated=True)
+    run_context = context(store, marker=store.marker)
+    run_context.deps.designHandoff = ExperimentalBiologyHandoff(
+        cellSelection=artifact_model(store.cell_selection),
+        conditionColumn="condition",
+        observationUnit="sample",
+        independentUnit="sample",
+        coefficientScope="betweenUnit",
+        estimability={"status": "ok", "coefficientEstimable": True},
+    )
+    composition = asyncio.run(inspect_cluster_composition(run_context))
+    marker = asyncio.run(inspect_cluster_markers(run_context, cluster_id="0"))
+    identities = BiologicalInterpretationReport(
+        status="done",
+        clusterInterpretations=[
+            ClusterInterpretation(
+                clusterId="0",
+                proposedIdentity=identity,
+                evidenceIds=[marker.evidenceId],
+            )
+            for identity in ("T cell-like", "B cell-like")
+        ],
+    )
+    with pytest.raises(ModelRetry, match="one interpretation per cluster"):
+        validate_biological_interpretation_report(identities, run_context.deps)
+
+    evidence_ids = [
+        summary.evidenceId
+        for summary in composition.conditionSummaries
+        if summary.clusterId == "0"
+    ]
+    observations = BiologicalInterpretationReport(
+        status="needsInput",
+        treatmentObservations=[
+            TreatmentObservation(
+                clusterId="0",
+                referenceCondition=reference,
+                comparisonCondition=comparison,
+                direction=direction,
+                evidenceIds=evidence_ids,
+            )
+            for reference, comparison, direction in (
+                ("control", "treated", "lower"),
+                ("treated", "control", "higher"),
+            )
+        ],
+        needsInput=BiologicalInterpretationNeedsInput(
+            question="Run a replicated differential-abundance analysis."
+        ),
+    )
+    with pytest.raises(ModelRetry, match="per cluster and condition pair"):
+        validate_biological_interpretation_report(observations, run_context.deps)
+
+
 def test_done_report_requires_at_least_one_supported_interpretation() -> None:
     store = FakeStore()
     run_context = context(store, marker=store.marker)

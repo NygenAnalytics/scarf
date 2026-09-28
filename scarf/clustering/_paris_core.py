@@ -226,6 +226,22 @@ def _compact_contracted_rows(
     )
 
 
+@njit(cache=True, nogil=True)
+def _raise_to_child_heights(
+    children: np.ndarray,
+    heights: np.ndarray,
+    n_leaves: int,
+) -> None:
+    """Raise each merge height in place to at least its child merge heights."""
+    for merge_index in range(heights.shape[0]):
+        height = heights[merge_index]
+        for side in range(2):
+            child = children[merge_index, side]
+            if child >= n_leaves and heights[child - n_leaves] > height:
+                height = heights[child - n_leaves]
+        heights[merge_index] = height
+
+
 def canonicalize_paris_graph(graph: spmatrix) -> csr_matrix:
     """Build the canonical additive, loop-free Paris graph."""
     if graph.ndim != 2 or graph.shape[0] != graph.shape[1]:
@@ -582,6 +598,9 @@ def fit_paris_hierarchy(
         offset += block_size
     if offset != finite_merge_count:
         raise RuntimeError("Paris hierarchy assembly failed")
+    # Paris distances are reducible, so exact heights never decrease toward the
+    # root. Rounding can leave a merge a few ulps below a tied child merge.
+    _raise_to_child_heights(children[:offset], heights[:offset], n_leaves)
 
     if synthetic_count:
         root = component_roots[0]

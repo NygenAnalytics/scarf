@@ -18,9 +18,9 @@ from scarf.features.markers import (
 )
 from scarf.features.markers.rank import (
     _batch_stats,
-    _batch_stats_gene_major,
     _marker_stats_batch,
     _marker_stats_gene_major,
+    set_two_sided_p_values,
 )
 from scarf.features.markers.regression import (
     _REG_SENTINEL,
@@ -28,6 +28,33 @@ from scarf.features.markers.regression import (
     _regression_r_batch,
 )
 from scarf.storage.artifacts import ArtifactRef
+from scarf.features.statistical import adjust_pvalues
+
+
+def _gene_major_stats(
+    raw: np.ndarray,
+    scalar: np.ndarray,
+    size_factor: float,
+    log_transform: bool,
+    int_indices: np.ndarray,
+    group_counts: np.ndarray,
+    n_total: int,
+) -> np.ndarray:
+    """Run the feature-major kernel over every row and convert z to p-values."""
+    out = np.zeros((raw.shape[0], len(group_counts), 8), dtype=np.float64)
+    _marker_stats_gene_major(
+        np.ascontiguousarray(raw),
+        np.asarray(scalar, dtype=np.float32),
+        np.float32(size_factor),
+        bool(log_transform),
+        np.asarray(int_indices, dtype=np.int64),
+        np.asarray(group_counts, dtype=np.float32),
+        np.float32(n_total),
+        np.arange(raw.shape[0], dtype=np.int64),
+        out,
+    )
+    set_two_sided_p_values(out)
+    return out
 
 
 def test_marker_public_contract_requires_explicit_artifacts() -> None:
@@ -184,7 +211,7 @@ def test_rank_paths_match_scipy_continuity_correction():
     ranked = pd.DataFrame(data).rank(method="average")
     from_ranks = mannwhitneyu_from_ranks(ranked, groups, group_set).to_numpy().T
     cell_major = _batch_stats(data, groups, group_counts, len(groups))[:, :, 6]
-    gene_major = _batch_stats_gene_major(
+    gene_major = _gene_major_stats(
         data.T,
         np.ones(len(groups), dtype=np.float32),
         1.0,
@@ -214,7 +241,7 @@ def test_tie_correction_survives_more_than_two_million_tied_values():
     ranked = pd.DataFrame({"feature": values}).rank(method="average")
     from_ranks = mannwhitneyu_from_ranks(ranked, groups, group_set)["feature"]
     cell_major = _batch_stats(values[:, None], groups, group_counts, n_total)[0, :, 6]
-    gene_major = _batch_stats_gene_major(
+    gene_major = _gene_major_stats(
         values.astype(np.uint32)[None, :],
         np.ones(n_total, dtype=np.float32),
         1.0,
@@ -401,6 +428,73 @@ def test_marker_readers_accept_mixed_digit_and_text_labels(
     assert list(pd.read_csv(out_file).columns) == expected
 
 
+def _tagged_cluster_artifact(store, values: np.ndarray, tag: str) -> ArtifactRef:
+    from scarf.metadata.artifacts import (
+        plan_cell_data_artifact,
+        write_cell_data_artifact,
+    )
+
+    labels = np.asarray(values)
+    planned = plan_cell_data_artifact(
+        store.zw,
+        scope="assay",
+        assay="RNA",
+        kind="cluster_labels",
+        operation="test_cluster_labels",
+        parameters={"tag": tag},
+        inputs={},
+        execution_options={},
+        cell_selection=store.snapshot_cell_selection(),
+        arrays={"values": (labels.shape, None)},
+    )
+    write_cell_data_artifact(store.zw, planned, {"values": labels})
+    return planned.ref
+
+
+def _refuse_marker_search(*_args, **_kwargs):
+    raise AssertionError("the rank marker search must not run")
+
+
+@pytest.mark.parametrize("label", ["NK/T", ".", "..", "", "  "])
+def test_marker_search_rejects_labels_that_cannot_name_a_group_before_search(
+    datastore_ephemeral, monkeypatch, label
+) -> None:
+    import scarf.features.markers as markers_package
+
+    store = datastore_ephemeral
+    n_cells = len(store.cells.active_index("I"))
+    labels = np.where(np.arange(n_cells) % 2 == 0, label, "B")
+    clusters = _tagged_cluster_artifact(store, labels, f"label {label!r}")
+    features = store.set_feature_selection(feature_indexes=np.arange(20))
+    monkeypatch.setattr(markers_package, "find_markers_by_rank", _refuse_marker_search)
+
+    with pytest.raises(ValueError, match="cannot name a stored marker group"):
+        store.run_marker_search(clusters, from_assay="RNA", features=features)
+    assert store.list_artifacts(kind="marker_table", from_assay="RNA") == []
+
+
+def test_marker_search_on_a_read_only_store_reuses_but_never_searches(
+    datastore_ephemeral, monkeypatch
+) -> None:
+    import scarf.features.markers as markers_package
+
+    store = datastore_ephemeral
+    n_cells = len(store.cells.active_index("I"))
+    features = store.set_feature_selection(feature_indexes=np.arange(20))
+    saved = _tagged_cluster_artifact(store, np.arange(n_cells) % 2, "saved")
+    fresh = _tagged_cluster_artifact(store, np.arange(n_cells) % 3, "fresh")
+    marker = store.run_marker_search(saved, from_assay="RNA", features=features)
+    read_only = DataStore(store.zarr_loc, zarr_mode="r", nthreads=1)
+    monkeypatch.setattr(markers_package, "find_markers_by_rank", _refuse_marker_search)
+
+    assert (
+        read_only.run_marker_search(saved, from_assay="RNA", features=features)
+        == marker
+    )
+    with pytest.raises(PermissionError, match="run_marker_search requires"):
+        read_only.run_marker_search(fresh, from_assay="RNA", features=features)
+
+
 def test_saved_marker_refs_keep_feature_specific_results_addressable(
     datastore_ephemeral,
 ) -> None:
@@ -528,7 +622,7 @@ def test_gene_major_zero_aware_kernel_is_bit_identical(
         group_counts,
         n_cells,
     )
-    observed = _batch_stats_gene_major(
+    observed = _gene_major_stats(
         raw.T,
         scalar,
         1000.0,
@@ -977,9 +1071,9 @@ def test_find_markers_fast_raw_path_computes_groupwise_statistics(
             self.raw[:] = values
             persist_count_matrix_plan(root, plan)
             persist_count_matrix_plan(self.raw, plan)
-            from scarf.storage.identity import finalize_counts
+            from tests.storage_helpers import finalize_test_counts
 
-            finalize_counts(self.raw)
+            finalize_test_counts(self.raw)
             counts_t = write_counts_t(self.raw, root)
             assert counts_t is not None
             self.rawDataT = counts_t
@@ -1015,9 +1109,8 @@ def test_compact_marker_save_roundtrip():
     import zarr
     from zarr.storage import MemoryStore
 
-    from scarf.datastore._operations.features import _load_marker_cluster_frame
     from scarf.datastore.datastore import DataStore
-    from scarf.features.markers.table import MARKER_STAT_COLUMNS
+    from scarf.features.markers.table import MARKER_STAT_COLUMNS, load_marker_table
 
     index = np.array([10, 5, 7], dtype=np.int32)
     source = pd.DataFrame(
@@ -1048,7 +1141,7 @@ def test_compact_marker_save_roundtrip():
         feature_names=feature_names,
         feature_ids=feature_ids,
     )
-    loaded = _load_marker_cluster_frame(
+    loaded = load_marker_table(
         slot,
         slot["1"],
         feature_names,
@@ -1551,17 +1644,16 @@ def test_canonical_marker_reader_rejects_negative_feature_index():
 
 
 def test_bh_adjusted_pvalues_match_statsmodels_and_preserve_order():
-    from scarf.features.markers.correction import _bh_adjusted_pvalues
     from statsmodels.stats.multitest import multipletests
 
     p_values = np.array([0.04, 0.01, 0.2, np.nan, 0.03])
-    adjusted = _bh_adjusted_pvalues(p_values)
+    adjusted = adjust_pvalues(p_values, "fdr_bh")
     mask = np.isfinite(p_values)
     _, expected, _, _ = multipletests(p_values[mask], method="fdr_bh")
     assert adjusted[mask].tolist() == pytest.approx(list(expected))
     assert np.isnan(adjusted[3])
     reordered = p_values[[1, 0, 4, 3, 2]]
-    adjusted_reordered = _bh_adjusted_pvalues(reordered)
+    adjusted_reordered = adjust_pvalues(reordered, "fdr_bh")
     restore = np.empty_like(adjusted_reordered)
     restore[[1, 0, 4, 3, 2]] = adjusted_reordered
     np.testing.assert_allclose(restore, adjusted, equal_nan=True)
@@ -1635,8 +1727,6 @@ def test_find_markers_by_rank_rejects_invalid_group_sizes():
 
 
 def test_pseudotime_bh_excludes_untested_features():
-    from scarf.features.markers.correction import _bh_adjusted_pvalues
-
     class Assay:
         @staticmethod
         def iter_normed_feature_wise(**_kwargs):
@@ -1657,7 +1747,7 @@ def test_pseudotime_bh_excludes_untested_features():
     assert np.isfinite(result.loc["tested", "p_value"])
     assert np.isnan(result.loc["untested", "p_value"])
     assert result.loc["tested", "p_value_adjusted"] == pytest.approx(
-        float(_bh_adjusted_pvalues(np.array([result.loc["tested", "p_value"]]))[0])
+        float(adjust_pvalues(np.array([result.loc["tested", "p_value"]]), "fdr_bh")[0])
     )
     assert np.isnan(result.loc["untested", "p_value_adjusted"])
 
@@ -1704,27 +1794,30 @@ def test_marker_feature_value_adapters_and_non_rna_rank_paths() -> None:
     from types import SimpleNamespace
 
     from scarf.assay.normalization import (
+        clr_values,
+        library_size_values,
         norm_clr,
         norm_dummy,
         norm_lib_size,
         norm_tf_idf,
-    )
-    from scarf.features.markers.search import (
-        _clr_feature_values,
-        _lib_size_feature_values,
-        _tfidf_feature_values,
+        tfidf_values,
     )
     from scarf.storage.budget import ResourceBudget
     from scarf.storage.feature_stream import FeatureReadGroup
     from tests.test_feature_stream import _counts_t_with_plan
 
+    # Adapters normalize feature-major countsT batches through their cell-major
+    # transposes with the shared kernels.
     raw = np.array([[1, 0], [3, 4], [2, 0]], dtype=np.uint16)
-    tfidf = _tfidf_feature_values(raw, np.array([2.0, 4.0]), np.array([1.0, 0.5, 2.0]))
+    tfidf = tfidf_values(raw.T, np.array([2.0, 4.0]), np.array([1.0, 0.5, 2.0]))
     assert tfidf.shape == (2, 3)
-    clr = _clr_feature_values(raw)
+    clr = clr_values(np.asarray(raw.T, dtype=np.float64))
     assert clr.shape == (2, 3)
-    linear = _lib_size_feature_values(raw, np.array([1.0, 2.0]), 10.0, False)
-    logged = _lib_size_feature_values(raw, np.array([1.0, 2.0]), 10.0, True)
+    linear = library_size_values(raw.T, np.array([1.0, 2.0]), 10.0, dtype=np.float32)
+    logged = library_size_values(
+        raw.T, np.array([1.0, 2.0]), 10.0, dtype=np.float32, log_transform=True
+    )
+    assert logged.dtype == linear.dtype == np.float32
     assert logged.shape == linear.shape
     assert logged[0, 0] != linear[0, 0]
 

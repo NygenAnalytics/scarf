@@ -1,3 +1,5 @@
+import hashlib
+import json
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -67,15 +69,6 @@ def array_row_selection_parts(array: Any) -> tuple[int, int]:
     return int(decoded + _encoded_chunk_bound(decoded)), int(per_row)
 
 
-def array_row_selection_peak_bytes(array: Any, rows: int) -> int:
-    """Bound one chunk-serial row selection."""
-    width = max(0, int(rows))
-    if width == 0:
-        return 0
-    fixed, per_row = array_row_selection_parts(array)
-    return int(fixed + width * per_row)
-
-
 def read_array_rows_chunkwise(array: Any, rows: np.ndarray) -> np.ndarray:
     """Read distinct selected rows one physical chunk at a time."""
     indices = np.asarray(rows, dtype=np.int64)
@@ -117,15 +110,6 @@ def read_metadata_rows_chunkwise(
     return read_array_rows_chunkwise(metadata._get_array(column), rows)
 
 
-def metadata_row_selection_peak_bytes(
-    metadata: _RowReadableMetaData,
-    column: str,
-    rows: int,
-) -> int:
-    """Bound one chunk-serial metadata row selection."""
-    return array_row_selection_peak_bytes(metadata._get_array(column), rows)
-
-
 def iter_metadata_column_blocks(
     metadata: _RowReadableMetaData,
     column: str,
@@ -158,6 +142,34 @@ def metadata_missing_mask(metadata: Any, column: str) -> Any | None:
     if not callable(get_mask):
         return None
     return get_mask(column)
+
+
+def metadata_column_fingerprint(metadata: _RowReadableMetaData, column: str) -> str:
+    """Hash one metadata column in bounded blocks.
+
+    The digest covers the stored dtype, the type and representation of each
+    object value, and the linked missing mask, so an edit to any of them
+    changes it.
+    """
+    digest = hashlib.sha256()
+    for block in iter_metadata_column_blocks(metadata, column):
+        digest.update(str(block.dtype).encode())
+        digest.update(str(block.shape).encode())
+        digest.update(
+            json.dumps(
+                [(type(value).__name__, repr(value)) for value in block.tolist()]
+            ).encode()
+            if block.dtype.hasobject
+            else block.tobytes()
+        )
+    missing = metadata_missing_mask(metadata, column)
+    digest.update(b"missing:none" if missing is None else b"missing:present")
+    if missing is not None:
+        for start in range(0, len(missing), 65_536):
+            digest.update(
+                np.asarray(missing[start : start + 65_536], dtype=bool).tobytes()
+            )
+    return digest.hexdigest()
 
 
 def read_metadata_missing_rows(
@@ -230,13 +242,17 @@ class MetaDataRowBlock:
     values: dict[str, np.ndarray]
 
 
-def _array_block_rows(array: Any, n_rows: int) -> int:
+def array_block_rows(array: Any, n_rows: int) -> int:
+    """Return a row block size aligned with ``array``'s chunks.
+
+    Arrays without chunk geometry use at most 100,000 of their ``n_rows`` rows.
+    """
     return row_band(array_geometry(array), unit="chunk", fallback=min(n_rows, 100_000))
 
 
 def default_block_rows(metadata: _RowReadableMetaData, column: str = "I") -> int:
     """Return a row block size aligned with the backing Zarr chunks."""
-    return _array_block_rows(metadata._get_array(column), metadata.N)
+    return array_block_rows(metadata._get_array(column), metadata.N)
 
 
 def iter_row_blocks(
@@ -249,7 +265,7 @@ def iter_row_blocks(
     """Yield contiguous active row blocks from a metadata table."""
     key_array = metadata._bool_array(cell_key)
     if block_rows is None:
-        block_rows = _array_block_rows(key_array, metadata.N)
+        block_rows = array_block_rows(key_array, metadata.N)
     if block_rows < 1:
         raise ValueError("block_rows must be >= 1")
     column_arrays = {

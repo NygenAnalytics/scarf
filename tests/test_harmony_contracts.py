@@ -1,6 +1,3 @@
-import inspect
-from types import SimpleNamespace
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -8,7 +5,6 @@ import pytest
 import scarf.embeddings as embeddings
 import scarf.embeddings.harmony as harmony
 from scarf.embeddings.harmony.api import fit_harmony as implementation_fit_harmony
-from scarf.embeddings.harmony.api import run_harmony as implementation_run_harmony
 from scarf.embeddings.harmony.api import validate_harmony_parameters
 from scarf.embeddings.harmony.models import HarmonyResult as implementation_result
 from scarf.embeddings.harmony.optimizer import Harmony as implementation_optimizer
@@ -22,17 +18,16 @@ def test_harmony_facade_exports_canonical_objects():
         "HarmonyResult",
         "fit_harmony",
         "moe_correct_ridge",
-        "run_harmony",
         "safe_entropy",
     ]
     assert harmony.fit_harmony is implementation_fit_harmony
-    assert harmony.run_harmony is implementation_run_harmony
     assert harmony.HarmonyResult is implementation_result
     assert harmony.Harmony is implementation_optimizer
     assert embeddings.Harmony is harmony.Harmony
     assert embeddings.HarmonyResult is harmony.HarmonyResult
     assert embeddings.fit_harmony is harmony.fit_harmony
-    assert embeddings.run_harmony is harmony.run_harmony
+    assert "run_harmony" not in embeddings.__all__
+    assert not hasattr(harmony, "run_harmony")
 
 
 def test_harmony_public_metadata_and_signatures_remain_stable():
@@ -41,38 +36,12 @@ def test_harmony_public_metadata_and_signatures_remain_stable():
         harmony.HarmonyResult,
         harmony.fit_harmony,
         harmony.moe_correct_ridge,
-        harmony.run_harmony,
         harmony.safe_entropy,
     )
     assert {obj.__module__ for obj in public_objects} == {"scarf.embeddings.harmony"}
-    assert signature_digest(
-        {
-            "fit_harmony": harmony.fit_harmony,
-            "run_harmony": harmony.run_harmony,
-        }
-    ) == ("7b192e50655559a92f78d67ba963db2f4bb1df3195f5f7305effc37f913dbf9c")
-    assert (
-        inspect.signature(harmony.fit_harmony).parameters
-        == inspect.signature(harmony.run_harmony).parameters
+    assert signature_digest({"fit_harmony": harmony.fit_harmony}) == (
+        "8db928c01bc083bbf16b1a1603459353ae7de20d72f4e1a7b7f55ecd2d7e70a6"
     )
-
-
-def test_run_harmony_resolves_fit_through_public_facade(monkeypatch):
-    corrected = np.array([[1.0, 2.0]])
-    calls = []
-
-    def fake_fit_harmony(*args, **kwargs):
-        calls.append((args, kwargs))
-        return SimpleNamespace(corrected=corrected)
-
-    monkeypatch.setattr(embeddings, "fit_harmony", fake_fit_harmony)
-    actual = embeddings.run_harmony(
-        np.zeros((1, 2)),
-        pd.DataFrame({"batch": ["a", "b"]}),
-    )
-
-    assert actual is corrected
-    assert len(calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -160,6 +129,12 @@ def test_run_harmony_resolves_fit_through_public_facade(monkeypatch):
             {"nclust": 2, "cluster_fn": "unknown"},
             "cluster_fn must be 'kmeans'",
         ),
+        (
+            np.zeros((2, 4)),
+            pd.DataFrame({"batch": ["a", "b", "a", "b"]}),
+            {"nclust": 2, "max_iter_kmeans": 0},
+            "max_iter_kmeans must be at least 1",
+        ),
     ],
 )
 def test_fit_harmony_rejects_invalid_contracts(values, metadata, kwargs, message):
@@ -203,6 +178,7 @@ def test_harmony_parameters_are_validated_without_data():
         ({"nclust": True}, TypeError, "nclust must be an integer"),
         ({"max_iter_harmony": -1}, ValueError, "max_iter_harmony"),
         ({"max_iter_kmeans": 2.0}, TypeError, "max_iter_kmeans"),
+        ({"max_iter_kmeans": 0}, ValueError, "max_iter_kmeans must be at least 1"),
         ({"random_state": None}, TypeError, "random_state"),
         ({"random_state": -3}, ValueError, "random_state"),
         ({"tau": -1.0}, ValueError, "tau must be finite"),

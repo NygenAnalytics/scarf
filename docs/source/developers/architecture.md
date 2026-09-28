@@ -43,12 +43,11 @@ These calls do not create module-load cycles.
   guards, and artifact lineage reports.
 - `matrix/` owns the lazy blockwise matrix abstraction used over NumPy and Zarr arrays.
   Its arithmetic, indexing, and reduction behavior keeps it separate from low-level storage mechanics.
-- `utils/` owns generic array, compute, logging, prefetch, process, and progress helpers.
+- `utils/` owns generic array, argument validation, compute, logging, process, and progress helpers.
   Zarr-specific helpers belong in `storage`, not `utils`.
 
 Facade aliases do not change implementation ownership.
-`scarf.utils.load_zarr` remains available for compatibility, but its implementation belongs to `storage.stores`.
-Column prefetch uses `storage.parallel` because read-ahead limits and I/O concurrency are governed by the active storage budget.
+`scarf.load_zarr` is a facade alias for `storage.stores.load_zarr`.
 
 ### Data model
 
@@ -73,7 +72,7 @@ They must not import those packages at module load time.
 - `clustering/` owns Leiden clustering and PARIS hierarchy operations.
 - `trajectory/` owns pseudotime scoring, feature-profile aggregation, feature module clustering, and pseudotime result records.
 - `metrics/` owns LISI, silhouette, graph, concordance, and integration scores.
-- `features/` owns variability selection, LOWESS trend fitting, feature scoring, enrichment, rank and regression marker searches, GFF parsing, genomic intervals, and coordinate-based feature construction.
+- `features/` owns variability selection, LOWESS trend fitting, feature scoring, enrichment, rank and regression marker searches, GFF parsing, genomic intervals, coordinate-based feature construction, and the name-based gene-family registry.
   It also owns presentation-independent feature resolution and normalized value fetching used by datastore workflows and plots.
 - `quality_control/` owns filtering, HTO demultiplexing, doublet processing, cell-cycle assignment, and the default cell-cycle gene references.
 - `mapping/` owns reference artifacts, feature alignment, confidence, Symphony-style correction, and mapping results.
@@ -169,8 +168,9 @@ The accessor imports concrete plot implementations only when a method is called,
 
 ### Lazy and eager facades
 
-The lazy facades in `scarf`, `features`, `readers`, `writers`, `merge`, `utils`, `neighbors`, `clustering`, `embeddings`, `trajectory`, and `plotting` are architectural boundaries, not temporary deprecation shims.
+The lazy facades in `scarf`, `agent`, `features` and its subpackages, `readers`, `writers`, `merge`, `utils`, `neighbors`, `clustering`, `embeddings`, `trajectory`, and `plotting` are architectural boundaries, not temporary deprecation shims.
 Their documented 1.x exports preserve stable import paths and defer optional or expensive implementations until an export is accessed.
+All of them use one private helper, `scarf._facade`: an export wins over a same-named submodule, resolving an export never replaces a bound value, and only `readers`, `writers`, `merge`, and `utils` present the objects they own under the facade's `__module__`.
 
 The `assay`, `mapping`, `matrix`, `metadata`, `metrics`, and `quality_control` package initializers are eager domain facades.
 API reference pages and public contract tests define which of their exports carry compatibility guarantees.
@@ -202,6 +202,10 @@ The complete hard-break inventory is:
 - Pipeline run and stage records are strict, exact, and unversioned. Adding, removing, or renaming
   a persisted field in a later release is an accepted hard break. Unknown or incomplete document
   shapes fail closed.
+- `DataStore.pipeline.run` takes a `params` mapping of per-stage settings. Every run records two
+  more stages, `membership_strength` and `tsne`, skipped unless requested, and its configuration
+  records `params`, `species`, `tsne`, `membershipStrength`, and the Leiden `selected`
+  resolution. `pca_dims=0` skips PCA.
 - Mapping references and query projections use only their current exact-lineage contracts.
 - Integration label metrics are split by input contract. `metric_clisi` and
   `metric_graph_connectivity` use the keyword `annotation_column` for imported cell metadata;
@@ -238,8 +242,7 @@ The complete hard-break inventory is:
   `selected_expression_fingerprint`. A query cell with no counts in any shared reference feature
   is uninformative. The diagnostic `zeroNormCellCount` is renamed `uninformativeCellCount`, and
   `queryScaledDispersion` uses shared features only. Older projections fail to load with a
-  request to rerun `run_mapping`. `array_hash` and `array_store_hash` use a length-prefixed
-  encoding, so their values change.
+  request to rerun `run_mapping`.
 - Mann-Whitney uses the exact permutation null when the two groups can be formed in at most
   100,000 ways. Its statistical-test artifacts record `p_value_policy`, and results carry
   `p_value_method`; identities of other tests are unchanged. Saved Mann-Whitney results without
@@ -263,8 +266,8 @@ The complete hard-break inventory is:
   order. Only plain decimal labels are numeric, so plots no longer read `"1_10"` as 110; other
   labels sort naturally, with digit runs before text and case-only ties broken by the exact text.
 - `run_waggr` and `run_aucell` take `ambiguous_targets="drop"` and record
-  `dropped_ambiguous_targets`. Enrichment artifacts written before this change load but are not
-  reused.
+  `dropped_ambiguous_targets`. Enrichment artifacts without `layout` or
+  `dropped_ambiguous_targets` fail to load.
 - `scarf.metrics.silhouette_scoring` and `process_cluster` take no positional `ann_obj` and no
   `data_is_reduced` keyword. `silhouette_scoring` requires the keyword-only `distance_metric` and
   compares rows as given.
@@ -278,9 +281,11 @@ The complete hard-break inventory is:
   `DataStore` attribute has that name and the name does not start with an underscore;
   `get_assay(name)` returns any assay. Assays named like members, such as `cells` or
   `zarr_mode`, no longer break opening or replace the member.
-- Producers that cannot reuse a saved result raise `PermissionError` before computing on a
-  read-only store. This covers statistical testing, enrichment, feature percentages, HTO
-  demultiplexing, doublet detection, and `set_default_assay`.
+- Producers that cannot reuse a saved result raise `PermissionError` on a read-only store before
+  computing or writing. This covers every artifact producer, including marker search,
+  `smart_label`, membership strength, cell filters and selections, graph, embedding, trajectory,
+  and mapping producers, and derived assays. `run_mapping` and `build_mapping_reference` refuse a
+  read-only store before planning.
 - Public arguments are validated before any artifact is written: `load_graph(use_k=...)`,
   `run_lsi` `skip_first` and `rand_state`, `run_custom_reduction` loadings, `run_harmony`
   parameters, `integrate_assays(chunk_size=...)`, `select_hvgs` keywords, `run_umap` array
@@ -309,6 +314,143 @@ The complete hard-break inventory is:
   float16 sources as float32.
 - Operations trust that prepared counts and artifacts do not change during a call. Writing to
   prepared data in place is outside the contract and is not detected.
+- Minimum versions rise to scipy 1.15, statsmodels 0.14.5 (earlier releases fail to import
+  with scipy 1.16), and, for the `agent` and `test` extras, pydantic-ai-slim 2.51.
+- Count layout: plans whose countsT chunks fell below half the chunk target (awkward cell counts
+  such as primes) now use whole-target chunks, so stores written with those plans fail layout
+  replay and must be re-imported. Count assays require Zarr format 3.
+- Stored contracts are strict. ANN indexes carry their complete metadata record including
+  `byte_length`; `query_neighbors` requires recorded `ann_ef` and `parallel_threads`; mapping
+  references require `ann_ef`; building and loading a Symphony mapping reference require recorded
+  Harmony `batch_levels`, `batch_columns`, and `harmony_parameters`. HVG selections record
+  `blacklist_fingerprint` and, for adaptive binning, `variance_estimator` and `variance_quantile`.
+  Statistical-test artifacts missing any recorded attribute fail to load. Earlier artifacts
+  without these records fail to load or are rebuilt.
+- Metadata copies, column clearing, and run snapshots accept only the canonical
+  `__scarf_missing__<name>` link and reject multi-dimensional columns. Copies and snapshots store
+  text as unicode and text fingerprints decode bytes as UTF-8, so identities over byte-string
+  columns change. `MetaData.columns` lists `I`, `ids`, `names`, then the other columns sorted.
+  `MetaData.sift`, `multi_sift`, and covariate partitions treat masked rows as missing, and
+  `insert` keeps an explicit boolean `fill_value`. `MetaData.get_index_by` matches values that
+  are not text by their text and always returns int64 indices.
+- Storage operations raise a single task failure as itself and a cooperative shutdown as
+  `ShutdownRequested`, not as an exception group. A pipeline stage whose exception group holds
+  `KeyboardInterrupt` or `ShutdownRequested` is recorded as interrupted and raises that
+  interruption. Scarf keeps no process-wide execution report history; collect reports with
+  `execution_report_scope`.
+- Recorded artifact inputs have one strict reader, `ArtifactStatus.input_ref(name)`. A missing or
+  malformed input raises `ArtifactResolutionError(code="corrupt_payload")` naming the owning kind
+  and input, in mapping references and projections, graph lineage, trajectory and
+  cluster-selection inputs, plots, and pipeline run records. Query projections validate
+  `cell_selection` with the stored-selection validator, and connectivity-map payloads follow the
+  neighbor dimension rules, so `n_cells` above 2**32 - 1 is rejected.
+- Failed marker, enrichment, statistical-test, coalesced-tree, and cell-data artifact writes
+  delete their incomplete slot. Starting any artifact on a read-only store raises
+  `PermissionError` before writing, so `run_harmony` and `run_pseudotime_scoring(ss_vec=...)` no
+  longer surface the Zarr read-only `ValueError`.
+- Gene families: `scarf.features.gene_families` is the one registry of name-based families, and
+  `ribosomal` always means RPS, RPL, MRPS, and MRPL. `DEFAULT_PERCENT_PATTERNS` moves there from
+  `scarf.assay.classification`, and newly prepared stores record the ribosomal percentage pattern
+  as `^RPS|^RPL|^MRPS|^MRPL`. Genes, percentage values, and the HVG blacklist are unchanged.
+  Feature identity requires a digit after a registry ID prefix, as `prefix_species` does, so IDs
+  of other Ensembl species such as chicken `ENSGALG` are no longer release-drift misses.
+- `ChunkedArray` follows NumPy broadcasting: a one-dimensional operand aligns with columns and
+  rows are scaled with an `(n_rows, 1)` operand. Scalar keys, other axes, ufunc keywords other
+  than `dtype`, and arithmetic between two ChunkedArrays raise; zero-row reductions return NumPy
+  shapes.
+- Identities that change and are not reused: feature summaries computed through `normed` for a
+  non-default `normMethod` on integer counts record `count_arithmetic="float64"`; `run_pca`
+  records `incremental_block_rows` for IncrementalPCA fits over several blocks; embedding
+  initialization records `algorithm_version="minibatch_kmeans_v3"`, seeds its PCA, and no longer
+  reassigns rarely used streamed k-means centroids; `smart_label` records `algorithm_version=3`;
+  default cell-cycle genes use CENPU, PIMREG, and JPT1 (mouse Cenpu, Pimreg, Jpt1); parameter
+  tuning's native doublet graphs use the candidate ANN seed.
+- Results that change while identities stay the same, so earlier artifacts are reused and must be
+  recomputed with `invalidate_cache=True`: Dunn tie corrections are exact for tie groups above
+  about two million values; Welch reports `n1 + n2 - 2` degrees of freedom when neither group
+  varies; fixed-strategy `fit_lowess` returns zero for genes without a positive finite mean and
+  variance; graph artifacts built from NumPy boolean `symmetric_graph` flags may be
+  unsymmetrized; `run_feature_percentage` gives NaN for a cell without counts.
+- Integer arguments share one validator: NumPy integers are accepted, integer-like objects such
+  as 0-d arrays are rejected, and messages read `<name> must be an integer` or
+  `<name> must be at least N`.
+- Paris fits raise each merge to at least its child heights, so hierarchies of tied graphs
+  validate, and straight and fixed cuts number equal-size clusters by hierarchy node order.
+  `load_paris_clustering` rejects cuts that do not name their hierarchy.
+- Inputs are validated before any lookup or write. Graph flags accept only booleans (NumPy
+  booleans included). `run_marker_search` rejects labels that are blank, `.`, `..`, or contain
+  `/`. `smart_label` suffixes continue past `z` (`aa`, `ab`) and colliding names raise.
+  `select_cells` raises when no cell is retained. `make_bulk` and integration metrics leave out or
+  reject NaN, None, blank, and masked labels. Doublet, cell-cycle, prevalent-peak, membership,
+  and statistical-testing arguments are checked first, and two-group tests reject `comparisons`
+  that reverse the resolved group order. `run_mapping` rejects `query_batches` values that share
+  text, such as `1` and `"1"`, and treats nested store locations as one store. `get_cell_vals`
+  clipping covers every real numeric column. A stored `defaultAssay` must name an assay.
+- `DataStoreMerge` refuses destinations that alias, contain, or lie inside a source or that
+  already hold content, and creates destinations with mode "w-". Source names cannot contain
+  `__`. `overwrite=True` refuses destinations with a prepared assay and clears `defaultAssay`.
+  Manifests record `sourceCountFingerprints`, so merges interrupted before this release restart
+  with `overwrite=True`. Differing unordered cell-column `levels` are unioned; other differing
+  attributes are dropped with a warning.
+- Imports: H5AD import stores missing categorical, nullable, and string values under linked
+  masks and keeps nullable booleans as booleans. `inspect_h5ad` reads group-encoded AnnData
+  indexes and prefers an ID column such as `gene_ids`, and reads a one-element `uns` text dataset
+  as its element; `H5adReader` reads the index named by `_index`. H5AD sparse matrices need an encoding and a stored shape. H5AD, Loom, CSV, and Cell
+  Ranger readers reject missing or repeated identifiers. CSV import types values over every row
+  and rejects missing or negative counts. Matrix Market BED sidecars give `chrom:start-end`
+  Peaks, and feature references are left-joined. Cell Ranger HDF5 reads `matrix` and rejects
+  several genome groups. Import writers accept `assay_type`. RDS parsing rejects malformed
+  character vectors and xz payloads that need more than 256 MiB of decoder memory.
+- Seurat: `SeuratReader` and `inspect_seurat` resolve sidecars only inside `sidecar_root`
+  (default: the `.rds` directory), and stream sources need it for sidecar-backed layers. Counts
+  containing R `NA` raise `missing_count_value`. Dimnames and LogMap identifiers override names
+  stored in sidecars. Factor metadata keeps empty levels. Transposed BPCells nodes, MergeFragments
+  peak counts, and RegionSelect boundaries follow BPCells, so re-imported counts can differ.
+  HDF5 sidecars in H5AD layout need `encoding-type` or `h5sparse_format` and take axis names only
+  from the index named by `_index`; other HDF5 sparse groups ignore `sparse_layout` and `layout`
+  attributes.
+- Exports: `to_h5ad` writes AnnData 0.2.0 encodings and omits `_index` from `column-order`;
+  `to_mtx(compress=True)` adds a feature-type column.
+- Plotting: `dotplot` and `matrixplot` pool only features of one assay that share an explicit
+  label and raise for other shared labels; `matrixplot` orders groups like `dotplot`.
+  `marker_heatmap` clusters unclipped z-scores. Continuous color limits follow one policy across
+  plots, category scales show only observed categories, `compose_results` keeps panel and raster
+  colorbars and honors log scales, and plot functions close the figures they created when they
+  raise. `distribution` reports a missing pair value with the `run_statistical_testing` message.
+- Agents: workflow configs always save `inputPolicy` and `scoreDoublets`, so workflows paused
+  before this release cannot resume, and saved decision, preprocessing, tuning, and context
+  records with removed fields fail to load. `extraModelSettings` rejects credential and header
+  keys. Resume answers are validated before any stage attempt, failed enrichment reports are not
+  replayed, and parameter tuning is PCA only. Feature inventories, family diagnostics and
+  policies, and marker tags use the registry families (`ribosomalProtein` and `mitoribosomal`
+  merge into `ribosomal`; `hemoglobin`, `immuneReceptor`, `stress`, and `dissociation` are
+  removed), and derived QC percentages match feature names only, so saved diagnostics are
+  recomputed. `ParameterTuningReport` drops `assayReports` and `recommendedIntegrationId`, and
+  `prepare_parameter_tuning_dependencies` drops `pair_harmony_candidates`. The final UMAP uses
+  Scarf's categorical palette and natural cluster order. Cell QC execution rejects duplicate
+  attributes and a sample artifact named like a metric, and colliding capture label keys raise
+  instead of merging.
+- Removed public API: `scarf.system_call`, `scarf.get_log_level`, `scarf.GffReader`,
+  `scarf.coordinate_melding`, `scarf.utils.iter_column_blocks`, `scarf.utils.rss_peak_tracker`,
+  `scarf.matrix.Block`, `ChunkedArray.blocks`, `map_blocks`, `dot`, `std`, `chunks`, and
+  `nthreads`, `Assay.to_raw_sparse`, `Assay.mean_features`, `scarf.assay.rna_assay_type_names`,
+  `MetaData.mount_location`, `unmount_location`, `remove_trend`, and `insert(location=)`,
+  cytebase `Repository.list_files` and `open_zarr`, `DataStore.set_default_assay`,
+  `last_execution_report`, `calibrate_label_transfer_threshold`, `metric_lisi`, and
+  `load_metric_lisi` (use `scarf.metrics.compute_lisi`), `scarf.clustering.balanced_cut`,
+  `BalancedCut`, and `paris_dendrogram`, `scarf.neighbors.wnn_integration`,
+  `scarf.embeddings.run_harmony` (use `fit_harmony` or `DataStore.run_harmony`),
+  `scarf.metrics.compute_simpson`, `knn_to_csr_matrix`, and `report_technical_nesting`,
+  `scarf.mapping.array_hash`, `array_store_hash`, and `conformal_prediction_sets`,
+  `MappingReference.fetch_layout`, `scarf.quality_control.write_doublet_target_zarr`,
+  `scarf.readers.get_file_handle` and `read_file`, `H5adReader.open_clone`,
+  `LoomReader.consume`, import-result `artifactRefs`, `scarf.writers.bed_to_sparse_array`,
+  `create_cell_data`, `load_count_store`, and `load_zarr`, `scarf.utils.load_zarr` (use
+  `scarf.load_zarr`), `storage.parallel.map_shards`, `scarf.plotting.collect_legends`,
+  `FeatureSummary`, and `register_theme`, `recipes.run_plot_recipe`, `PlotOutput.step_name` and
+  `written_path`, `PlotRecipeResult.results`, several `SeuratReader` members, the parameter
+  tuning handoff, Pareto, WNN, and refinement exports, `AgentRunConfig.thinkingOffProfile`, and
+  `AgentOrchestrator.initialize_request`.
 
 Compatibility exists only where a current public facade or an explicit file-schema test says it
 does. There are no silent migrations, implicit compatibility branches, or forwarding shims for

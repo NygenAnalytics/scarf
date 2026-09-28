@@ -42,9 +42,9 @@ dependencies = [
     "packaging",
     "pandas>=2.2.2",
     "scikit-learn>=1.5",
-    "scipy>=1.13,!=1.17.0",
+    "scipy>=1.15,!=1.17.0",
     "setuptools>=61",
-    "statsmodels>=0.14.2",
+    "statsmodels>=0.14.5",
     "threadpoolctl",
     "tqdm>=4.60",
     "umap-learn>=0.5.12",
@@ -58,7 +58,7 @@ dependencies = [
 
 [project.optional-dependencies]
 agent = [
-    "pydantic-ai-slim[openai]>=2.19.0",
+    "pydantic-ai-slim[openai]>=2.51.0",
 ]
 extra = [
     "anndata>=0.12",
@@ -76,7 +76,7 @@ test = [
     "anndata>=0.12",
     "scikit-network>=0.33.1",
     "rdata>=1.1.0",
-    "pydantic-ai-slim[openai]>=2.19.0",
+    "pydantic-ai-slim[openai]>=2.51.0",
 ]
 docs = [
     "jinja2",

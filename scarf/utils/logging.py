@@ -76,11 +76,6 @@ except ValueError:
 _install_scarf_handler()
 
 
-def get_log_level() -> int:
-    """Return the current minimum Scarf log level."""
-    return logger.level(_config.level).no
-
-
 def progress_enabled() -> bool:
     """Return whether Scarf progress reporting is enabled."""
     return _config.progress

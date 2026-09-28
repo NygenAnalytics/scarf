@@ -11,10 +11,11 @@ from ..metadata import MetaData
 from ..storage.execution import admit_stream
 from ..storage.geometry import array_geometry
 from ..storage.partition import row_band
-from ..storage.types import as_zarr_array, as_zarr_group
+from ..storage.types import as_zarr_group
+from ..utils.arguments import integer_argument
 from ..utils.compute import compute_with_progress
 from ..utils.logging import logger
-from .base import Assay, _stream_byte_count
+from .base import Assay
 from .normalization import (
     NormalizedValueSource,
     _feature_group_positions,
@@ -102,58 +103,6 @@ def _hvg_stats_gene_major(
     )
 
 
-def _as_feature_indexes(
-    values: Sequence[int],
-    *,
-    n_features: int,
-    name: str,
-    require_unique: bool,
-) -> np.ndarray:
-    if isinstance(values, str):
-        raise TypeError(f"{name} must be a sequence of integer feature indexes")
-    indexes = np.asarray(values)
-    if indexes.ndim != 1:
-        raise ValueError(f"{name} must be one-dimensional")
-    if indexes.size == 0:
-        return np.empty(0, dtype=np.int64)
-    if not np.issubdtype(indexes.dtype, np.integer):
-        raise TypeError(f"{name} must contain only integer feature indexes")
-    indexes = indexes.astype(np.int64, copy=False)
-    if np.any(indexes < 0) or np.any(indexes >= n_features):
-        raise IndexError(f"{name} contains an out-of-range feature index")
-    if require_unique and np.unique(indexes).size != indexes.size:
-        raise ValueError(f"{name} contains duplicate feature indexes")
-    return indexes
-
-
-def _corrected_variance_column(
-    n_bins: int,
-    lowess_frac: float,
-    bin_strategy: Literal["fixed", "adaptive"],
-) -> str:
-    if bin_strategy not in ("fixed", "adaptive"):
-        raise ValueError("bin_strategy must be either 'fixed' or 'adaptive'")
-    if bin_strategy == "adaptive":
-        if isinstance(n_bins, (bool, np.bool_)) or not isinstance(
-            n_bins,
-            (int, np.integer),
-        ):
-            raise TypeError("n_bins must be an integer")
-        if n_bins < 1:
-            raise ValueError("n_bins must be greater than 0")
-        if isinstance(lowess_frac, (bool, np.bool_)) or not isinstance(
-            lowess_frac,
-            (int, float, np.integer, np.floating),
-        ):
-            raise TypeError("lowess_frac must be numeric")
-        if not np.isfinite(lowess_frac) or not 0 <= lowess_frac <= 1:
-            raise ValueError("lowess_frac must be between 0 and 1")
-        return f"c_var__adaptive__{n_bins}__{lowess_frac}"
-    if not 0 <= lowess_frac <= 1:
-        raise ValueError("lowess_frac must be between 0 and 1")
-    return f"c_var__{n_bins}__{lowess_frac}"
-
-
 class RNAassay(Assay):
     """This subclass of Assay is designed for feature selection and
     normalization of scRNA-Seq data.
@@ -234,8 +183,10 @@ class RNAassay(Assay):
         feat_idx = np.asarray(feat_idx, dtype=np.int64)
         if cell_idx.ndim != 1 or feat_idx.ndim != 1:
             raise ValueError("cell_idx and feat_idx must be one-dimensional")
-        scratch_itemsize = _stream_byte_count(scratch_itemsize, "scratch_itemsize")
-        resident_bytes = _stream_byte_count(resident_bytes, "resident_bytes")
+        scratch_itemsize = integer_argument(
+            scratch_itemsize, "scratch_itemsize", minimum=0
+        )
+        resident_bytes = integer_argument(resident_bytes, "resident_bytes", minimum=0)
 
         if msg is None:
             msg = ""
@@ -367,12 +318,15 @@ class RNAassay(Assay):
 
         The subset-renormalized payload uses its own float64 kernel, eligible
         feature batches stream ``countsT`` in floating point, and library-size
-        feature scores average in float64. None of them calls ``normed``, so
-        none records the marker.
+        feature scores and summaries accumulate in float64. None of them calls
+        ``normed``, so none records the marker.
         """
         if values == "payload" and renormalize_subset:
             return None
-        if values == "feature_scores" and self.normMethod is norm_lib_size:
+        if (
+            values in ("feature_scores", "feature_summary")
+            and self.normMethod is norm_lib_size
+        ):
             return None
         if values == "feature_batches" and lib_size_feature_stream_eligible(
             self, renormalize_subset=renormalize_subset
@@ -390,9 +344,9 @@ class RNAassay(Assay):
         log_transform: bool,
         renormalize_subset: bool,
         mirror: zarr.Array | None = None,
-    ) -> ChunkedArray:
+    ) -> None:
         if not renormalize_subset:
-            return super()._write_normalized_payload(
+            super()._write_normalized_payload(
                 cell_idx,
                 feat_idx,
                 location,
@@ -400,22 +354,11 @@ class RNAassay(Assay):
                 renormalize_subset=renormalize_subset,
                 mirror=mirror,
             )
+            return
 
         from .normalization import write_renorm_subset_to_zarr
 
-        cell_idx = np.asarray(cell_idx, dtype=np.int64)
-        feat_idx = np.asarray(feat_idx, dtype=np.int64)
-        if cell_idx.ndim != 1 or feat_idx.ndim != 1:
-            raise ValueError("cell_idx and feat_idx must be one-dimensional")
-        if location not in self.z:
-            self.z.create_group(location)
-        if location + "/data" in self.z:
-            return ChunkedArray(
-                as_zarr_array(self.z[location + "/data"], name=location + "/data"),
-                nthreads=self.nthreads,
-                resources=self.resources,
-            )
-
+        cell_idx, feat_idx = self._payload_indices(cell_idx, feat_idx)
         write_renorm_subset_to_zarr(
             self,
             cell_idx,
@@ -426,11 +369,6 @@ class RNAassay(Assay):
             log_transform=log_transform,
             mirror=mirror,
             stats_group=as_zarr_group(self.z[location], name=location),
-        )
-        return ChunkedArray(
-            as_zarr_array(self.z[location + "/data"], name=location + "/data"),
-            nthreads=self.nthreads,
-            resources=self.resources,
         )
 
     def normed(

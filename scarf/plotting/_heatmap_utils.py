@@ -7,8 +7,7 @@ import numpy as np
 import pandas as pd
 
 from ._contracts import CategoricalScale
-from ..utils.arrays import sort_categories
-from ._style import categorical_color_map
+from ._style import category_label, resolve_category_scale
 
 
 def _explicit_order(
@@ -50,6 +49,27 @@ def _finite_linkage_values(values: np.ndarray) -> np.ndarray:
     return data
 
 
+def _linkage(values: np.ndarray, *, method: str, metric: str) -> np.ndarray:
+    """Hierarchically cluster rows, treating undefined distances as the largest.
+
+    Missing values are imputed, but infinite values are rejected. Correlation
+    and cosine distances are undefined for constant or all-zero rows, for
+    example a feature expressed in no group.
+    """
+    from scipy.cluster.hierarchy import linkage
+    from scipy.spatial.distance import pdist
+
+    data = np.asarray(values, dtype=np.float64)
+    if np.isinf(data).any():
+        raise ValueError("Heatmap clustering requires finite values")
+    distances = pdist(_finite_linkage_values(data), metric=metric)
+    undefined = np.isnan(distances)
+    if undefined.any():
+        defined = distances[~undefined]
+        distances[undefined] = float(defined.max()) if defined.size else 1.0
+    return np.asarray(linkage(distances, method=method, optimal_ordering=True))
+
+
 def order_heatmap(
     matrix: pd.DataFrame,
     *,
@@ -60,7 +80,7 @@ def order_heatmap(
     method: str,
     metric: str,
 ) -> tuple[pd.DataFrame, np.ndarray | None, np.ndarray | None]:
-    from scipy.cluster.hierarchy import leaves_list, linkage
+    from scipy.cluster.hierarchy import leaves_list
 
     explicit_rows = _explicit_order(
         list(matrix.index),
@@ -79,22 +99,12 @@ def order_heatmap(
     if explicit_rows is not None:
         resolved_rows = explicit_rows
     elif cluster_rows and matrix.shape[0] > 1:
-        row_linkage = linkage(
-            _finite_linkage_values(matrix.to_numpy()),
-            method=method,
-            metric=metric,
-            optimal_ordering=True,
-        )
+        row_linkage = _linkage(matrix.to_numpy(), method=method, metric=metric)
         resolved_rows = [matrix.index[index] for index in leaves_list(row_linkage)]
     if explicit_columns is not None:
         resolved_columns = explicit_columns
     elif cluster_columns and matrix.shape[1] > 1:
-        column_linkage = linkage(
-            _finite_linkage_values(matrix.to_numpy().T),
-            method=method,
-            metric=metric,
-            optimal_ordering=True,
-        )
+        column_linkage = _linkage(matrix.to_numpy().T, method=method, metric=metric)
         resolved_columns = [
             matrix.columns[index] for index in leaves_list(column_linkage)
         ]
@@ -146,38 +156,44 @@ def annotation_colors(
     resolved_scales: list[CategoricalScale] = []
     for name in annotations:
         values = annotations[name].to_numpy(dtype=object)
-        observed = [value for value in pd.unique(values) if pd.notna(value)]
-        scale = scales.get(name) if scales is not None else None
-        if scale is not None and scale.order is not None:
-            missing = [value for value in observed if value not in scale.order]
-            if missing:
-                raise ValueError(
-                    f"annotation scale {name!r} is missing values: "
-                    + ", ".join(map(str, missing[:10]))
-                )
-            order = [value for value in scale.order if value in set(observed)]
-        else:
-            order = sort_categories(observed)
-        palette = categorical_color_map(
-            order,
-            palette=scale.palette if scale is not None else None,
-            palette_name=scale.palette_name if scale is not None else "default",
+        resolved = resolve_category_scale(
+            values,
+            scales.get(name) if scales is not None else None,
+            context=f"annotation_scales[{name!r}]",
         )
-        missing_color = scale.missing_color if scale is not None else "#bdbdbd"
+        palette = resolved.palette or {}
         colors[name] = [
-            missing_color if pd.isna(value) else palette[value] for value in values
+            resolved.missing_color if pd.isna(value) else palette[value]
+            for value in values
         ]
-        resolved_scales.append(
-            CategoricalScale(
-                order=tuple(order),
-                palette=palette,
-                labels=scale.labels if scale is not None else None,
-                missing_color=missing_color,
-                missing_label=scale.missing_label if scale is not None else "NA",
-                palette_name=(scale.palette_name if scale is not None else "default"),
-            )
-        )
+        resolved_scales.append(resolved)
     return colors, resolved_scales
+
+
+def annotation_legend_handles(
+    mpl: Any,
+    names: Sequence[str],
+    scales: Sequence[CategoricalScale],
+) -> list[Any]:
+    """Square legend handles naming each annotation value and its color."""
+    handles: list[Any] = []
+    for name, scale in zip(names, scales, strict=True):
+        if scale.order is None or scale.palette is None:
+            continue
+        handles.extend(
+            mpl.lines.Line2D(
+                [],
+                [],
+                marker="s",
+                linestyle="",
+                markerfacecolor=scale.palette[value],
+                markeredgecolor="none",
+                markersize=5,
+                label=f"{name}: {category_label(scale, value)}",
+            )
+            for value in scale.order
+        )
+    return handles
 
 
 def draw_annotation_strips(

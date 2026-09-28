@@ -1,6 +1,8 @@
 """Configuration shared by the four Scarf domain agents."""
 
-from typing import Any, Literal
+import math
+from collections.abc import Mapping
+from typing import Any
 from urllib.parse import urlparse
 
 from pydantic import Field, field_validator
@@ -13,9 +15,49 @@ __all__ = [
     "get_usage_limits",
 ]
 
+_CREDENTIAL_SETTING_KEYS = frozenset(
+    {
+        "access_token",
+        "api_key",
+        "apikey",
+        "auth_token",
+        "authorization",
+        "bearer_token",
+        "client_secret",
+        "cookie",
+        "extra_headers",
+        "headers",
+        "password",
+        "proxy_authorization",
+        "secret",
+        "x_api_key",
+        "x_goog_api_key",
+    }
+)
+
+
+def _credential_keys(value: Any) -> list[str]:
+    """Find setting keys that carry credentials at any nesting depth."""
+    if isinstance(value, Mapping):
+        found = [
+            str(key)
+            for key in value
+            if str(key).casefold().replace("-", "_") in _CREDENTIAL_SETTING_KEYS
+        ]
+        return found + [
+            key for child in value.values() for key in _credential_keys(child)
+        ]
+    if isinstance(value, list | tuple):
+        return [key for child in value for key in _credential_keys(child)]
+    return []
+
 
 class AgentRunConfig(AgentDataModel):
-    """Bound one agent run without selecting a scientific workflow."""
+    """Bound one agent run without selecting a scientific workflow.
+
+    Workflows save this configuration, so ``extraModelSettings`` rejects
+    credentials and headers; configure those on the provider instead.
+    """
 
     requestLimit: int = 10
     toolCallLimit: int = 10
@@ -27,15 +69,25 @@ class AgentRunConfig(AgentDataModel):
     temperature: float = 0.0
     seed: int = 4444
     sequentialTools: bool = True
-    thinkingOffProfile: Literal[
-        "auto",
-        "unified",
-        "ollama",
-        "chatTemplate",
-        "thinkingBody",
-        "reasoningBody",
-    ] = "auto"
     extraModelSettings: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("extraModelSettings")
+    @classmethod
+    def validate_extra_model_settings(cls, value: dict[str, Any]) -> dict[str, Any]:
+        credentials = sorted(set(_credential_keys(value)))
+        if credentials:
+            raise ValueError(
+                "extraModelSettings must not contain credentials or headers "
+                f"({', '.join(credentials)}); configure them on the provider"
+            )
+        return value
+
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("temperature must be finite")
+        return value
 
     @field_validator("requestLimit", "toolCallLimit")
     @classmethod
@@ -61,8 +113,8 @@ class AgentRunConfig(AgentDataModel):
     @field_validator("timeoutSeconds")
     @classmethod
     def validate_timeout(cls, value: float) -> float:
-        if value <= 0:
-            raise ValueError("timeoutSeconds must be positive")
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("timeoutSeconds must be positive and finite")
         return float(value)
 
     def with_limits(

@@ -31,12 +31,13 @@ def ingest_loom(
     writer_started = False
     try:
         reader = LoomReader(str(path), **reader_kwargs)
+        # Writers open the destination in their constructor.
+        writer_started = True
         writer = LoomToZarr(
             reader,
             zarr_loc=zarr_path,
             assay_name=directions.get("assayName") or "RNA",
         )
-        writer_started = True
         writer.dump()
     except CONVERSION_DATA_ERRORS as exc:
         return failed_from_exception(

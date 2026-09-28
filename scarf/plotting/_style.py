@@ -1,17 +1,18 @@
 """Themes and categorical palettes for scarf.plotting."""
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 from weakref import WeakKeyDictionary
 
 import numpy as np
+import pandas as pd
 
-# Plots and marker tables share one category order.
-from ._contracts import FrameStyle, LegendLoc
+from ..utils.arrays import sort_categories
+from ._contracts import CategoricalScale, ColorScale, FrameStyle, LegendLoc
 
 # Shared Scarf figure defaults used by embedding-like plots.
-DEFAULT_POINT_EDGEWIDTH = 0.1
 DEFAULT_RASTERIZE_THRESHOLD = 50_000
 DEFAULT_PANEL_INCHES = 3.2
 MAX_FIGURE_WIDTH_INCHES = 7.5
@@ -21,10 +22,20 @@ LEGEND_SIDE_ENTRIES_PER_COLUMN = 20
 LEGEND_SIDE_MAX_COLUMNS = 4
 LEGEND_SIDE_MAX_ENTRIES = LEGEND_SIDE_ENTRIES_PER_COLUMN * LEGEND_SIDE_MAX_COLUMNS
 
-_LAYOUT_POINT_SIZE_SPECS: WeakKeyDictionary[
-    Any,
-    tuple[int, float, float, float],
-] = WeakKeyDictionary()
+
+@dataclass(frozen=True, slots=True)
+class _PointSizeSpec:
+    """How to resize one scatter artist once its panel size is final."""
+
+    n_points: int
+    size_min: float
+    size_max: float
+    multiplier: float
+    edgecolor: str | None
+    edgewidth: float | None
+
+
+_LAYOUT_POINT_SIZE_SPECS: WeakKeyDictionary[Any, _PointSizeSpec] = WeakKeyDictionary()
 
 # Okabe-Ito plus four high-contrast extensions for categorical figures.
 COLORBLIND_PALETTE = [
@@ -327,6 +338,21 @@ def default_point_edgewidth(
     return 0.15
 
 
+def scatter_edges(edgecolor: str, edgewidth: float) -> tuple[str, float]:
+    """Return scatter edge color and width, hiding edges of zero width."""
+    if edgewidth <= 0:
+        return "none", 0.0
+    return edgecolor, float(edgewidth)
+
+
+def panel_area_inches(ax: Any) -> float:
+    """Physical axes area in square inches, floored for collapsed panels."""
+    bounds = ax.get_position()
+    width = max(float(bounds.width * ax.figure.get_figwidth()), 0.1)
+    height = max(float(bounds.height * ax.figure.get_figheight()), 0.1)
+    return width * height
+
+
 def register_layout_point_size(
     collection: Any,
     *,
@@ -334,12 +360,22 @@ def register_layout_point_size(
     size_min: float,
     size_max: float,
     multiplier: float = 1.0,
+    edgecolor: str | None = None,
+    edgewidth: float | None = None,
 ) -> None:
-    _LAYOUT_POINT_SIZE_SPECS[collection] = (
-        int(n_points),
-        float(size_min),
-        float(size_max),
-        float(multiplier),
+    """Mark a scatter artist whose marker area follows its final panel size.
+
+    ``multiplier`` scales the panel point size, for example for highlighted
+    cells. With ``edgecolor``, marker edges are refreshed with the size, using
+    ``edgewidth`` or a width derived from the point size and population.
+    """
+    _LAYOUT_POINT_SIZE_SPECS[collection] = _PointSizeSpec(
+        n_points=int(n_points),
+        size_min=float(size_min),
+        size_max=float(size_max),
+        multiplier=float(multiplier),
+        edgecolor=edgecolor,
+        edgewidth=None if edgewidth is None else float(edgewidth),
     )
 
 
@@ -355,23 +391,33 @@ def refresh_layout_point_sizes(figure: Any) -> None:
         return
     figure.canvas.draw()
     for ax, collection, specification in marked:
-        bbox = ax.get_position()
-        width, height = figure.get_size_inches()
-        panel_area = float(bbox.width * width * bbox.height * height)
-        n_points, size_min, size_max, multiplier = specification
         point_size = default_point_size(
-            n_points,
-            panel_area=panel_area,
-            size_min=size_min,
-            size_max=size_max,
+            specification.n_points,
+            panel_area=panel_area_inches(ax),
+            size_min=specification.size_min,
+            size_max=specification.size_max,
         )
         collection.set_sizes(
             np.full(
                 len(collection.get_offsets()),
-                point_size * multiplier,
+                point_size * specification.multiplier,
                 dtype=np.float64,
             )
         )
+        if specification.edgecolor is not None:
+            edges, linewidth = scatter_edges(
+                specification.edgecolor,
+                (
+                    specification.edgewidth
+                    if specification.edgewidth is not None
+                    else default_point_edgewidth(
+                        specification.n_points,
+                        point_size=point_size,
+                    )
+                ),
+            )
+            collection.set_edgecolors(edges)
+            collection.set_linewidths(linewidth)
 
 
 def resolve_legend_loc(n_categories: int, legend_loc: LegendLoc = "auto") -> LegendLoc:
@@ -450,8 +496,6 @@ def categorical_color_map(
     *,
     palette: Mapping[Any, str] | None = None,
     palette_name: str = "default",
-    missing_label: str | None = None,
-    missing_color: str = "#bdbdbd",
 ) -> dict[Any, str]:
     cats = list(categories)
     if palette is not None:
@@ -459,12 +503,131 @@ def categorical_color_map(
         for cat in cats:
             if cat not in out:
                 raise KeyError(f"Category {cat!r} missing from palette")
+        return out
+    colors = palette_for_n(len(cats), palette_name=palette_name)
+    return dict(zip(cats, colors))
+
+
+def colormap_palette(categories: Sequence[Any], cmap: str) -> dict[Any, str]:
+    """Assign categories evenly spaced colors from a Matplotlib colormap."""
+    from ._deps import require_matplotlib
+
+    _, mpl = require_matplotlib()
+    colormap = mpl.colormaps.get_cmap(cmap)
+    last = max(len(categories) - 1, 1)
+    return {
+        category: mpl.colors.to_hex(colormap(index / last))
+        for index, category in enumerate(categories)
+    }
+
+
+def resolve_category_scale(
+    observed: Sequence[Any] | np.ndarray,
+    scale: CategoricalScale | None,
+    *,
+    context: str = "categorical_scale",
+) -> CategoricalScale:
+    """Resolve the displayed order and colors of the observed categories.
+
+    An explicit ``order`` must list every observed category and sets their
+    display order; categories it lists that no plotted cell carries are left
+    out of the display. Generated colors are assigned over the full explicit
+    order, so they stay stable when a plot shows a subset. Without an order,
+    categories sort naturally. Missing values are never categories.
+    """
+    present = [
+        value
+        for value in pd.unique(np.asarray(observed, dtype=object).ravel())
+        if not _is_missing_category(value)
+    ]
+    if scale is not None and scale.order is not None:
+        full_order = list(scale.order)
+        if len(set(full_order)) != len(full_order):
+            raise ValueError(f"{context}.order cannot contain duplicates")
+        unlisted = [value for value in present if value not in full_order]
+        if unlisted:
+            raise ValueError(
+                f"{context}.order is missing observed values: "
+                + ", ".join(map(str, unlisted[:10]))
+            )
+        shown = set(present)
+        order = [value for value in full_order if value in shown]
     else:
-        colors = palette_for_n(len(cats), palette_name=palette_name)
-        out = dict(zip(cats, colors))
-    if missing_label is not None:
-        out[missing_label] = missing_color
-    return out
+        full_order = sort_categories(present)
+        order = list(full_order)
+    colors = categorical_color_map(
+        full_order,
+        palette=scale.palette if scale is not None else None,
+        palette_name=scale.palette_name if scale is not None else "default",
+    )
+    labels = scale.labels if scale is not None else None
+    return CategoricalScale(
+        order=tuple(order),
+        palette={value: colors[value] for value in order},
+        labels=(
+            None
+            if labels is None
+            else {value: str(labels.get(value, value)) for value in order}
+        ),
+        missing_color=scale.missing_color if scale is not None else "#bdbdbd",
+        missing_label=scale.missing_label if scale is not None else "NA",
+        palette_name=scale.palette_name if scale is not None else "default",
+    )
+
+
+def category_label(scale: CategoricalScale, value: Any) -> str:
+    """Display text for one category of a resolved scale."""
+    if scale.labels is None:
+        return str(value)
+    return str(scale.labels.get(value, value))
+
+
+def _is_missing_category(value: Any) -> bool:
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def resolve_color_limits(values: Any, scale: ColorScale) -> tuple[float, float]:
+    """Resolve continuous color limits under the policy every plot shares.
+
+    Limits come from the finite values, or from their ``quantiles``, and an
+    explicit ``vmin`` or ``vmax`` replaces the matching side. A ``vcenter``
+    pivot widens derived limits so a diverging map works on one-sided values.
+    Tied or inverted limits keep the explicit or lower side and extend the
+    other side by one unit, so a constant value takes the low end of the map.
+    """
+    data = np.asarray(values, dtype=np.float64).ravel()
+    finite = data[np.isfinite(data)]
+    if finite.size == 0:
+        low, high = 0.0, 1.0
+    elif scale.quantiles is not None:
+        low, high = (float(value) for value in np.quantile(finite, scale.quantiles))
+    else:
+        low, high = float(finite.min()), float(finite.max())
+    if scale.vmin is not None:
+        low = float(scale.vmin)
+    if scale.vmax is not None:
+        high = float(scale.vmax)
+    if scale.vcenter is not None:
+        center = float(scale.vcenter)
+        if (scale.vmin is not None and center <= low) or (
+            scale.vmax is not None and center >= high
+        ):
+            raise ValueError("vcenter must be strictly between the color limits")
+        if not low < center < high:
+            margin = max((max(high, center) - min(low, center)) * 1e-6, 1e-9)
+            low = min(low, center - margin)
+            high = max(high, center + margin)
+    elif high <= low:
+        if scale.vmax is not None and scale.vmin is None:
+            low = high - 1.0
+        else:
+            high = low + 1.0
+    if scale.scale == "log" and low <= 0:
+        raise ValueError("Log color scale requires positive values")
+    return low, high
 
 
 def continuous_norm(
@@ -473,14 +636,48 @@ def continuous_norm(
     vmin: float,
     vmax: float,
     vcenter: float | None,
+    scale: str = "linear",
 ) -> Any:
+    """Build the Matplotlib norm for resolved limits and a ColorScale scale."""
     if vmax <= vmin:
         vmax = vmin + 1.0
+    if scale == "log":
+        if vmin <= 0:
+            raise ValueError("Log color scale requires positive values")
+        return mpl.colors.LogNorm(vmin=vmin, vmax=vmax)
+    if scale == "symlog":
+        return mpl.colors.SymLogNorm(
+            linthresh=max(abs(vmax - vmin) * 0.001, 1e-12),
+            vmin=vmin,
+            vmax=vmax,
+        )
     if vcenter is None:
         return mpl.colors.Normalize(vmin=vmin, vmax=vmax)
     if not vmin < vcenter < vmax:
         raise ValueError("vcenter must be strictly between the color limits")
     return mpl.colors.TwoSlopeNorm(vmin=vmin, vcenter=vcenter, vmax=vmax)
+
+
+def padded_square_limits(
+    x: np.ndarray,
+    y: np.ndarray,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Pad finite coordinates by 5% on each axis and square the window."""
+    xx = np.asarray(x, dtype=np.float64)
+    yy = np.asarray(y, dtype=np.float64)
+    if xx.shape != yy.shape:
+        raise ValueError("Coordinate columns must have matching shapes")
+    finite = np.isfinite(xx) & np.isfinite(yy)
+    if not finite.any():
+        raise ValueError("No finite coordinates are available to plot")
+    xx = xx[finite]
+    yy = yy[finite]
+    x_pad = 0.05 * (float(xx.max() - xx.min()) or 1.0)
+    y_pad = 0.05 * (float(yy.max() - yy.min()) or 1.0)
+    return square_axis_limits(
+        (float(xx.min() - x_pad), float(xx.max() + x_pad)),
+        (float(yy.min() - y_pad), float(yy.max() + y_pad)),
+    )
 
 
 def square_axis_limits(
@@ -574,28 +771,3 @@ def theme_context(name: str = "notebook") -> Iterator[None]:
     _, mpl = require_matplotlib()
     with mpl.rc_context(THEMES[name]):
         yield
-
-
-def register_theme(
-    name: str,
-    rcparams: Mapping[str, Any],
-    *,
-    base: str | None = "notebook",
-    overwrite: bool = False,
-) -> None:
-    """Register a Matplotlib rcParams theme for later plot calls."""
-    if not name:
-        raise ValueError("Theme name must be non-empty")
-    if name in THEMES and not overwrite:
-        raise ValueError(f"Theme {name!r} already exists")
-    if base is not None and base not in THEMES:
-        raise KeyError(f"Unknown base theme {base!r}")
-    from ._deps import require_matplotlib
-
-    _, mpl = require_matplotlib()
-    invalid = sorted(set(rcparams) - set(mpl.rcParams))
-    if invalid:
-        raise KeyError(f"Unknown Matplotlib rcParams: {invalid}")
-    values = dict(THEMES[base]) if base is not None else {}
-    values.update(dict(rcparams))
-    THEMES[name] = values

@@ -283,10 +283,40 @@ def test_incremental_pca_propagates_final_fit_failure(monkeypatch):
         )
 
 
-def test_lsi_returns_requested_components_and_mutates_reserved_params():
+def test_incremental_pca_propagates_intermediate_fit_failure(monkeypatch):
+    values = np.random.default_rng(8).normal(size=(24, 10))
+    data = ChunkedArray.from_numpy(values, block_size=8)
+    selected = np.ones(values.shape[0], dtype=bool)
+    original_partial_fit = IncrementalPCA.partial_fit
+    calls = 0
+
+    def fail_first_update(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise np.linalg.LinAlgError("update failed")
+        return original_partial_fit(self, *args, **kwargs)
+
+    monkeypatch.setattr(IncrementalPCA, "partial_fit", fail_first_update)
+
+    # partial_fit centers its input before the SVD can fail, so the block is
+    # not reused for a later update.
+    with pytest.raises(np.linalg.LinAlgError, match="update failed"):
+        fit_incremental_pca(
+            data,
+            dims=2,
+            batch_size=8,
+            use_for_pca=selected,
+            scale=None,
+            nthreads=1,
+        )
+    assert calls == 1
+
+
+def test_lsi_returns_requested_components():
     values = np.random.default_rng(7).uniform(size=(18, 5))
     data = ChunkedArray.from_numpy(values, block_size=6)
-    params = {"n_iter": 4, "n_components": 99, "random_state": 99}
+    params = {"n_iter": 4}
 
     loadings = fit_lsi(
         data,
@@ -300,6 +330,23 @@ def test_lsi_returns_requested_components_and_mutates_reserved_params():
     assert loadings.shape == (5, 2)
     assert params == {"n_iter": 4}
     assert np.all(np.isfinite(loadings))
+
+
+@pytest.mark.parametrize("reserved", ["n_components", "random_state"])
+def test_lsi_rejects_reserved_solver_parameters(reserved):
+    data = ChunkedArray.from_numpy(np.ones((6, 3)), block_size=3)
+    params = {"n_iter": 1, reserved: 2}
+
+    with pytest.raises(ValueError, match=f"cannot set {reserved}"):
+        fit_lsi(
+            data,
+            dims=1,
+            skip_first=False,
+            params=params,
+            random_state=0,
+            nthreads=1,
+        )
+    assert params == {"n_iter": 1, reserved: 2}
 
 
 def test_streaming_lsi_matches_exact_singular_subspace_and_is_deterministic():

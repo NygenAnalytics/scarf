@@ -53,6 +53,19 @@ def _paths_overlap(source: Path, destination: Path) -> bool:
         return False
 
 
+def default_convert_destination(source: Path) -> Path:
+    """Return the Zarr store a conversion writes next to ``source`` by default.
+
+    A directory ``data`` converts to ``data.zarr``. A file replaces its suffix,
+    after dropping a ``.gz`` suffix, so ``data.h5ad`` and ``data.mtx.gz`` convert
+    to ``data.zarr``.
+    """
+    if source.is_dir():
+        return source.with_name(f"{source.name}.zarr")
+    stem = source.with_suffix("") if source.suffix.lower() == ".gz" else source
+    return stem.with_suffix(".zarr")
+
+
 def ensure_convert_destination(
     source: Path,
     zarrPath: str | Path | None,
@@ -61,16 +74,9 @@ def ensure_convert_destination(
     format_name: str,
 ) -> str | IngestResult:
     """Validate conversion destination before inspect, reader, or model work."""
-    if zarrPath is None:
-        if source.is_dir():
-            zarrPath = source.with_name(f"{source.name}.zarr")
-        else:
-            destination_source = (
-                source.with_suffix("") if source.suffix.lower() == ".gz" else source
-            )
-            zarrPath = destination_source.with_suffix(".zarr")
-
-    destination = str(zarrPath)
+    destination = str(
+        default_convert_destination(source) if zarrPath is None else zarrPath
+    )
     overwrite = directions.get("overwrite")
     if overwrite is not None and type(overwrite) is not bool:
         return failed(

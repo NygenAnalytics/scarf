@@ -18,6 +18,7 @@ ANN_INDEX_CHUNK_BYTES = 8 * 1024 * 1024
 ANN_INDEX_IO_BYTES = 8 * ANN_INDEX_CHUNK_BYTES
 ANN_INDEX_FORMAT_VERSION = 1
 _ANN_INDEX_METADATA = (
+    "byte_length",
     "ann_index_format_version",
     "metric",
     "dimensions",
@@ -29,8 +30,12 @@ _ANN_INDEX_METADATA = (
 @dataclass(frozen=True, slots=True)
 class _ValidatedAnnIndexPayload:
     source: zarr.Array
-    stored_count: int | None
-    stored_digest: str | None
+    stored_count: int
+    stored_digest: str
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def has_ann_index(group: zarr.Group, name: str = ANN_INDEX_ARRAY) -> bool:
@@ -98,9 +103,8 @@ def validate_ann_index_contract(
     dim: int,
     expected_count: int | None = None,
     name: str = ANN_INDEX_ARRAY,
-    *,
-    require_metadata: bool,
 ) -> _ValidatedAnnIndexPayload:
+    """Validate ANN payload geometry and its complete metadata record."""
     if name not in group:
         raise FileNotFoundError(f"ANN index array {name!r} not found in group")
     source = as_zarr_array(group[name], name=name)
@@ -110,51 +114,30 @@ def validate_ann_index_contract(
         or np.dtype(source.dtype) != np.dtype(np.uint8)
     ):
         raise ValueError("ANN index payload must be a one-dimensional uint8 array")
-    stored_byte_length = source.attrs.get("byte_length")
-    if stored_byte_length is not None:
-        if isinstance(stored_byte_length, bool) or not isinstance(
-            stored_byte_length, int
-        ):
-            raise ValueError("ANN index byte length is invalid")
-        if stored_byte_length != int(source.shape[0]):
-            raise ValueError("ANN index byte length does not match its payload")
-    present_metadata = {key for key in _ANN_INDEX_METADATA if key in source.attrs}
-    if present_metadata and present_metadata != set(_ANN_INDEX_METADATA):
-        raise ValueError("ANN index metadata is incomplete")
-    if require_metadata and not present_metadata:
-        raise ValueError("ANN index metadata is missing")
-    stored_count: int | None = None
-    stored_digest: str | None = None
-    if present_metadata:
-        stored_version = source.attrs["ann_index_format_version"]
-        stored_metric = source.attrs["metric"]
-        stored_dimensions = source.attrs["dimensions"]
-        stored_element_count = source.attrs["element_count"]
-        payload_digest = source.attrs["payload_sha256"]
-        if (
-            isinstance(stored_version, bool)
-            or not isinstance(stored_version, int)
-            or stored_version != ANN_INDEX_FORMAT_VERSION
-        ):
-            raise ValueError("ANN index format version is unsupported")
-        if not isinstance(stored_metric, str) or stored_metric != space:
-            raise ValueError("ANN index metric does not match artifact provenance")
-        if (
-            isinstance(stored_dimensions, bool)
-            or not isinstance(stored_dimensions, int)
-            or stored_dimensions != dim
-        ):
-            raise ValueError("ANN index dimensions do not match artifact provenance")
-        if isinstance(stored_element_count, bool) or not isinstance(
-            stored_element_count, int
-        ):
-            raise ValueError("ANN index element count is invalid")
-        stored_count = stored_element_count
-        if expected_count is not None and stored_count != int(expected_count):
-            raise ValueError("ANN index element count does not match coordinates")
-        if not isinstance(payload_digest, str):
-            raise ValueError("ANN index payload digest is invalid")
-        stored_digest = payload_digest
+    missing = [key for key in _ANN_INDEX_METADATA if key not in source.attrs]
+    if missing:
+        raise ValueError(f"ANN index metadata is missing: {', '.join(missing)}")
+    attrs = source.attrs
+    if not _is_int(attrs["byte_length"]) or attrs["byte_length"] != int(
+        source.shape[0]
+    ):
+        raise ValueError("ANN index byte length does not match its payload")
+    if attrs["ann_index_format_version"] != ANN_INDEX_FORMAT_VERSION or not _is_int(
+        attrs["ann_index_format_version"]
+    ):
+        raise ValueError("ANN index format version is unsupported")
+    if not isinstance(attrs["metric"], str) or attrs["metric"] != space:
+        raise ValueError("ANN index metric does not match artifact provenance")
+    if not _is_int(attrs["dimensions"]) or attrs["dimensions"] != dim:
+        raise ValueError("ANN index dimensions do not match artifact provenance")
+    stored_count = attrs["element_count"]
+    if isinstance(stored_count, bool) or not isinstance(stored_count, int):
+        raise ValueError("ANN index element count is invalid")
+    if expected_count is not None and stored_count != int(expected_count):
+        raise ValueError("ANN index element count does not match coordinates")
+    stored_digest = attrs["payload_sha256"]
+    if not isinstance(stored_digest, str):
+        raise ValueError("ANN index payload digest is invalid")
     return _ValidatedAnnIndexPayload(
         source=source,
         stored_count=stored_count,
@@ -168,20 +151,9 @@ def validate_ann_index_payload(
     dim: int,
     expected_count: int | None = None,
     name: str = ANN_INDEX_ARRAY,
-    *,
-    require_metadata: bool = False,
 ) -> None:
     """Validate ANN bytes and metadata without instantiating hnswlib."""
-    validated = validate_ann_index_contract(
-        group,
-        space,
-        dim,
-        expected_count,
-        name,
-        require_metadata=require_metadata,
-    )
-    if validated.stored_digest is None:
-        return
+    validated = validate_ann_index_contract(group, space, dim, expected_count, name)
     digest = hashlib.sha256()
     source = validated.source
     for start in range(0, int(source.shape[0]), ANN_INDEX_CHUNK_BYTES):
@@ -201,17 +173,8 @@ def load_ann_index(
     """Load an hnswlib index from a Zarr byte array."""
     import hnswlib
 
-    validated = validate_ann_index_contract(
-        group,
-        space,
-        dim,
-        expected_count,
-        name,
-        require_metadata=False,
-    )
+    validated = validate_ann_index_contract(group, space, dim, expected_count, name)
     source = validated.source
-    stored_count = validated.stored_count
-    stored_digest = validated.stored_digest
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         path = tmp.name
     try:
@@ -229,13 +192,11 @@ def load_ann_index(
                 )
                 digest.update(values)
                 destination.write(memoryview(values))
-        if stored_digest is not None and digest.hexdigest() != stored_digest:
+        if digest.hexdigest() != validated.stored_digest:
             raise ValueError("ANN index payload digest does not match its metadata")
         index = hnswlib.Index(space=space, dim=dim)
         index.load_index(path)
-        actual_count = int(index.get_current_count())
-        required_count = stored_count if expected_count is None else int(expected_count)
-        if required_count is not None and actual_count != required_count:
+        if int(index.get_current_count()) != validated.stored_count:
             raise ValueError("ANN index element count does not match coordinates")
         return index
     finally:

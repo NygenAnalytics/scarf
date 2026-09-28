@@ -62,16 +62,24 @@ def aggregate_rna_groups(
     geometry = array_geometry(counts_t)
     assert geometry is not None
     n_features = int(counts_t.shape[0])
+    # Raw sums keep the dtype NumPy gives a sum of the counts; floating counts
+    # accumulate in float64 because float32 stops adding unit counts at 2**24.
     dtype = (
         np.dtype(np.float64)
         if scalars is not None
         else np.empty(0, dtype=counts_t.dtype).sum().dtype
     )
+    accumulator_dtype = np.dtype(np.float64) if dtype.kind == "f" else dtype
+    cast_itemsize = 0 if accumulator_dtype == dtype else dtype.itemsize
     feature_width, _ = persisted_read_group(counts_t)
     band_features = min(n_features, max(feature_width, geometry.axisChunk(0)))
     band_cells = min(int(counts_t.shape[1]), geometry.axisChunk(1))
     band_elements = band_features * band_cells
-    output_bytes = n_features * n_groups * (dtype.itemsize + 8 * return_fraction)
+    output_bytes = (
+        n_features
+        * n_groups
+        * (accumulator_dtype.itemsize + cast_itemsize + 8 * return_fraction)
+    )
     # Include DataFrame construction/filter copies and selected-cell bookkeeping.
     resident_bytes = 4 * output_bytes + 64 * len(cell_indices) + 16 * n_groups
     # Reserve band-local group codes and normalization scalars.
@@ -97,7 +105,7 @@ def aggregate_rna_groups(
     )
     stream_io = replace(stream_io, readWorkers=plan.readWorkers)
     scratch_bytes += plan.readWorkers * decode_bytes
-    values = np.zeros((n_groups, n_features), dtype=dtype)
+    values = np.zeros((n_groups, n_features), dtype=accumulator_dtype)
     fractions = (
         np.zeros((n_groups, n_features), dtype=np.float64) if return_fraction else None
     )
@@ -131,7 +139,10 @@ def aggregate_rna_groups(
         values /= denominators
     if fractions is not None:
         fractions /= denominators
-    return values.T, None if fractions is None else fractions.T
+    return (
+        values.T.astype(dtype, copy=False),
+        None if fractions is None else fractions.T,
+    )
 
 
 def aggregate_normalized_groups(

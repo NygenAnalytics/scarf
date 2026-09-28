@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -20,14 +21,13 @@ from scarf.storage.artifacts import (
     ARTIFACT_KINDS,
     ArtifactRef,
     ArtifactScope,
+    ArtifactStatus,
     ExternalArtifactRef,
     ValueFingerprintBuilder,
-    artifact_exists,
     artifact_group,
     artifact_path,
     canonical_bytes,
     callable_identity,
-    find_reusable_artifacts,
     fingerprint_array,
     fingerprint_stored_arrays,
     fingerprint_stored_strings,
@@ -37,11 +37,17 @@ from scarf.storage.artifacts import (
     list_artifacts,
     make_provenance,
     new_artifact_id,
-    parse_artifact_path,
+    parse_artifact_ref,
     provenance_hash,
     require_complete_artifact,
+    reusable_artifact_groups,
     serialize_artifact_value,
 )
+from scarf.storage.errors import ArtifactResolutionError
+
+
+def _reusable_refs(root: zarr.Group, **arguments: Any) -> list[ArtifactRef]:
+    return [ref for ref, _group in reusable_artifact_groups(root, **arguments)]
 
 
 def _ref(
@@ -226,8 +232,6 @@ def test_artifact_ids_are_random_storage_addresses() -> None:
     assert artifact_path(assay_ref) == f"RNA/artifacts/normalized/{first}"
     assert artifact_path(datastore_ref) == f"artifacts/integrated_graph/{second}"
     assert ArtifactRef.from_dict(assay_ref.to_dict()) == assay_ref
-    assert parse_artifact_path(artifact_path(assay_ref)) == assay_ref
-    assert parse_artifact_path(artifact_path(datastore_ref)) == datastore_ref
 
 
 def test_artifact_ref_repr_truncates_the_artifact_id() -> None:
@@ -264,8 +268,6 @@ def test_artifact_ref_rejects_malformed_values() -> None:
             kind="normalized__log_true",
             artifact_id="a" * 64,
         )
-    with pytest.raises(ValueError, match="Not an artifact path"):
-        parse_artifact_path("RNA/normed__I__hvgs")
     missing_type = _ref().to_dict()
     del missing_type["type"]
     with pytest.raises(ValueError, match="type must be"):
@@ -281,19 +283,71 @@ def test_artifact_ref_rejects_malformed_values() -> None:
         ArtifactRef.from_dict({**datastore_ref.to_dict(), "assay": "RNA"})
 
 
-def test_artifact_path_parser_normalizes_boundaries_and_rejects_corruption() -> None:
-    ref = _ref(artifact_id="1" * 64)
-    assert parse_artifact_path(f"/{artifact_path(ref)}/") == ref
+def test_parse_artifact_ref_accepts_only_exact_records() -> None:
+    ref = _ref()
+    assert parse_artifact_ref(ref.to_dict(), "plan ref") == ref
 
-    invalid_paths = [
-        (f"artifacts/normalized/{'A' * 64}", "lowercase hex token"),
-        (f"RNA/artifacts/not_a_kind/{'a' * 64}", "Unknown artifact kind"),
-        (f"RNA/artifacts/normalized/{'a' * 64}/payload", "Not an artifact path"),
-        (f"RNA/results/normalized/{'a' * 64}", "Not an artifact path"),
-    ]
-    for path, message in invalid_paths:
-        with pytest.raises(ValueError, match=message):
-            parse_artifact_path(path)
+    malformed = (
+        "not-a-ref",
+        {},
+        {**ref.to_dict(), "path": "RNA/legacy"},
+        {**ref.to_dict(), "artifact_id": "short"},
+        ExternalArtifactRef(dataset_fingerprint="d", ref=ref).to_dict(),
+    )
+    for raw in malformed:
+        with pytest.raises(ArtifactResolutionError) as caught:
+            parse_artifact_ref(raw, "plan ref")
+        assert caught.value.code == "corrupt_payload"
+        assert str(caught.value) == "plan ref is not a valid artifact reference"
+        assert caught.value.context == {"input_name": "plan ref"}
+    with pytest.raises(ArtifactResolutionError, match="plan ref is missing"):
+        parse_artifact_ref(None, "plan ref")
+
+
+def test_artifact_status_input_ref_names_its_owner() -> None:
+    owner = _ref(kind="reduction", artifact_id="c" * 64)
+    selection = ArtifactRef(
+        scope="datastore",
+        kind="cell_selection",
+        artifact_id="d" * 64,
+    )
+
+    def status(inputs: dict[str, Any]) -> ArtifactStatus:
+        return ArtifactStatus(
+            ref=owner,
+            path=artifact_path(owner),
+            exists=True,
+            complete=True,
+            provenance=make_provenance(
+                operation="run_pca",
+                parameters={},
+                inputs=inputs,
+            ),
+        )
+
+    assert status({"cell_selection": selection}).input_ref("cell_selection") == (
+        selection
+    )
+    with pytest.raises(ArtifactResolutionError) as missing:
+        status({}).input_ref("cell_selection")
+    assert str(missing.value) == "reduction artifact has no 'cell_selection' input"
+    assert missing.value.context == {
+        "input_name": "cell_selection",
+        "assay": "RNA",
+        "artifact_id": owner.artifact_id,
+        "actual_kind": "reduction",
+    }
+    extra = {**selection.to_dict(), "assay": None}
+    with pytest.raises(ArtifactResolutionError, match="malformed 'cell_selection'"):
+        status({"cell_selection": extra}).input_ref("cell_selection")
+    absent = ArtifactStatus(
+        ref=owner,
+        path=artifact_path(owner),
+        exists=False,
+        complete=False,
+    )
+    with pytest.raises(ArtifactResolutionError, match="has no 'normalized' input"):
+        absent.input_ref("normalized")
 
 
 def test_external_artifact_ref_round_trips_strictly() -> None:
@@ -814,14 +868,14 @@ def test_artifact_inspection_listing_and_reuse_are_read_only(
     assert status.complete
     assert status.parameters == {"log_transform": True}
     assert status.inputs == provenance["inputs"]
-    assert artifact_exists(root, complete_ref)
-    assert not artifact_exists(root, incomplete_ref)
+    assert inspect_artifact(root, complete_ref).complete
+    assert not inspect_artifact(root, incomplete_ref).complete
     assert list_artifacts(root, scope="assay", assay="RNA") == sorted(
         [complete_ref, incomplete_ref],
         key=lambda ref: ref.artifact_id,
     )
     assert list_artifacts(root, scope="datastore") == [datastore_ref]
-    assert find_reusable_artifacts(
+    assert _reusable_refs(
         root,
         scope="assay",
         assay="RNA",
@@ -829,7 +883,7 @@ def test_artifact_inspection_listing_and_reuse_are_read_only(
         provenance=provenance,
     ) == [complete_ref]
     assert (
-        find_reusable_artifacts(
+        _reusable_refs(
             root,
             scope="assay",
             assay="RNA",
@@ -953,7 +1007,7 @@ def test_artifact_listing_validates_filters_and_malformed_paths() -> None:
         kind="normalized",
         complete_only=True,
     ) == [complete]
-    assert artifact_exists(root, incomplete, require_complete=False)
+    assert inspect_artifact(root, incomplete).exists
     assert (
         list_artifacts(
             root,
@@ -1173,7 +1227,7 @@ def test_reusable_artifacts_skip_incomplete_malformed_and_mismatched_records() -
         }
     )
 
-    assert find_reusable_artifacts(
+    assert _reusable_refs(
         root,
         scope="assay",
         assay="RNA",
@@ -1218,13 +1272,13 @@ def test_reusable_artifacts_require_matching_operation_and_inputs() -> None:
         "assay": "RNA",
         "kind": "normalized",
     }
-    assert find_reusable_artifacts(
+    assert _reusable_refs(
         root,
         **arguments,
         provenance=matching,
     ) == [ref]
     assert (
-        find_reusable_artifacts(
+        _reusable_refs(
             root,
             **arguments,
             provenance=wrong_operation,
@@ -1232,7 +1286,7 @@ def test_reusable_artifacts_require_matching_operation_and_inputs() -> None:
         == []
     )
     assert (
-        find_reusable_artifacts(
+        _reusable_refs(
             root,
             **arguments,
             provenance=wrong_input,
@@ -1256,7 +1310,7 @@ def test_nondeterministic_artifacts_use_normal_provenance_reuse() -> None:
         inputs=provenance["inputs"],
     )
 
-    assert find_reusable_artifacts(
+    assert _reusable_refs(
         root,
         scope="assay",
         assay="RNA",

@@ -7,6 +7,18 @@ from sknetwork.hierarchy import cut_straight as reference_straight_cut
 from scarf.clustering.paris import straight_cut
 
 
+def _assert_matches_reference_partition(
+    labels: np.ndarray,
+    reference: np.ndarray,
+) -> None:
+    """Match scikit-network's clusters, which can number equal sizes otherwise."""
+    pairs = set(zip(labels.tolist(), reference.tolist(), strict=True))
+    assert len(pairs) == np.unique(labels).size == np.unique(reference).size
+    sizes = np.bincount(labels)[1:]
+    assert np.all(sizes > 0)
+    assert np.all(sizes[:-1] >= sizes[1:])
+
+
 @pytest.mark.parametrize("n_leaves", [3, 10, 40])
 def test_straight_cut_matches_scikit_network(n_leaves: int) -> None:
     rng = np.random.default_rng(100 + n_leaves)
@@ -19,7 +31,7 @@ def test_straight_cut_matches_scikit_network(n_leaves: int) -> None:
             dendrogram,
             n_clusters=n_clusters,
         )
-        assert np.array_equal(
+        _assert_matches_reference_partition(
             straight_cut(dendrogram, n_clusters),
             expected + 1,
         )
@@ -42,10 +54,25 @@ def test_straight_cut_matches_non_monotonic_dendrogram() -> None:
             dendrogram,
             n_clusters=n_clusters,
         )
-        assert np.array_equal(
+        _assert_matches_reference_partition(
             straight_cut(dendrogram, n_clusters),
             expected + 1,
         )
+
+
+def test_straight_cut_numbers_equal_sizes_by_node_order() -> None:
+    dendrogram = np.asarray(
+        [
+            [0, 1, 0.5, 2],
+            [2, 3, 0.5, 2],
+            [4, 5, 1.5, 2],
+            [6, 7, 2.0, 4],
+            [8, 9, 1.0, 6],
+        ],
+        dtype=np.float64,
+    )
+
+    assert straight_cut(dendrogram, 3).tolist() == [1, 1, 2, 2, 3, 4]
 
 
 def test_equal_heights_can_return_more_clusters_than_requested() -> None:

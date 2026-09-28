@@ -8,7 +8,7 @@ if TYPE_CHECKING:
     from .chunked import ChunkedArray
 
 
-type ReductionOp = Literal["sum", "mean", "var", "std", "count_nonzero", "argmax"]
+type ReductionOp = Literal["sum", "mean", "var", "count_nonzero", "argmax"]
 type UfuncSide = Literal["left", "right"]
 
 
@@ -46,9 +46,17 @@ class _Reduction:
     def _arr(self) -> np.ndarray:
         return self.compute()
 
-    def __array__(self, dtype: np.dtype[Any] | None = None) -> np.ndarray:
+    def __array__(
+        self,
+        dtype: np.dtype[Any] | None = None,
+        copy: bool | None = None,
+    ) -> np.ndarray:
         array = self._arr
-        return array.astype(dtype) if dtype is not None else array
+        if dtype is not None and np.dtype(dtype) != array.dtype:
+            if copy is False:
+                raise ValueError("Converting a reduction's dtype requires a copy")
+            return array.astype(dtype)
+        return array.copy() if copy else array
 
     def __array_ufunc__(
         self,
@@ -82,6 +90,11 @@ class _Reduction:
         func: Callable[[NDArray[Any], NDArray[Any]], NDArray[Any]],
         side: UfuncSide,
     ) -> NDArray[Any]:
+        from .chunked import ChunkedArray
+
+        # Defer to the matrix, which applies the reduction lazily per block.
+        if isinstance(other, ChunkedArray):
+            return cast(NDArray[Any], NotImplemented)
         other_array = other._arr if isinstance(other, _Reduction) else np.asarray(other)
         if side == "left":
             return func(self._arr, other_array)

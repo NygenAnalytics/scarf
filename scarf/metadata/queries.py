@@ -1,12 +1,13 @@
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, Hashable, Protocol, cast
 
 import numpy as np
 import pandas as pd
 
-from ..utils.arrays import regex_match_mask
-from .rows import apply_missing_mask, metadata_missing_mask
+from ..storage.arrays import MISSING_MASK_PREFIX
+from ..utils.arrays import regex_match_mask, within_bounds
+from .rows import MetaDataRowBlock, apply_missing_mask, metadata_missing_mask
 
 
 class _QueryableMetaData(Protocol):
@@ -21,6 +22,8 @@ class _QueryableMetaData(Protocol):
     def fetch(self, column: str, key: str = "I") -> np.ndarray: ...
 
     def fetch_all(self, column: str) -> np.ndarray: ...
+
+    def _get_array(self, column: str) -> Any: ...
 
     def sift(
         self,
@@ -52,11 +55,17 @@ def sift(
     max_v: float = np.inf,
     keep_bounds: bool = False,
 ) -> np.ndarray:
-    """Return rows whose values fall within the requested bounds."""
-    values = metadata.fetch_all(column)
-    if keep_bounds:
-        return (values >= min_v) & (values <= max_v)
-    return (values > min_v) & (values < max_v)
+    """Return rows whose values fall within the requested bounds.
+
+    Rows flagged by the column's linked missing mask never pass.
+    """
+    selected = within_bounds(
+        metadata.fetch_all(column), min_v, max_v, keep_bounds=keep_bounds
+    )
+    mask = metadata_missing_mask(metadata, column)
+    if mask is not None:
+        selected &= ~np.asarray(mask[:], dtype=bool)
+    return np.asarray(selected)
 
 
 def multi_sift(
@@ -94,7 +103,7 @@ def _frame_column(
     column: str,
     stop: int | None = None,
 ) -> Any:
-    values = metadata.fetch_all(column)[:stop]
+    values = np.asarray(metadata._get_array(column)[:stop])
     mask = metadata_missing_mask(metadata, column)
     return missing_frame_values(values, None if mask is None else mask[:stop])
 
@@ -145,33 +154,7 @@ def grep(
     )
 
 
-def remove_trend(
-    metadata: _QueryableMetaData,
-    x: str,
-    y: str,
-    n_bins: int = 200,
-    lowess_frac: float = 0.1,
-    fill_value: float = 0,
-) -> np.ndarray:
-    """Remove a LOWESS trend from one metadata column."""
-    from ..features.variability import fit_lowess
-
-    x_values = metadata.fetch(x).astype(float)
-    y_values = metadata.fetch(y).astype(float)
-    positive = x_values > 0
-    trend = fit_lowess(
-        x_values[positive],
-        y_values[positive],
-        n_bins,
-        lowess_frac,
-        bin_strategy="fixed",
-    )
-    residuals = np.repeat(fill_value, len(x_values)).astype(float)
-    residuals[positive] = trend
-    return residuals
-
-
-_MISSING_LEVEL: Hashable = ("__scarf_missing__",)
+_MISSING_LEVEL: Hashable = (MISSING_MASK_PREFIX,)
 
 
 def level_key(value: Any) -> Hashable:
@@ -190,6 +173,30 @@ def level_key(value: Any) -> Hashable:
     if isinstance(value, list | tuple | set | dict | np.ndarray):
         return ("__scarf_repr__", repr(value))
     return cast(Hashable, value)
+
+
+def _missing_masks(
+    metadata: _QueryableMetaData,
+    columns: Sequence[str],
+) -> dict[str, Any]:
+    return {column: metadata_missing_mask(metadata, column) for column in columns}
+
+
+def _block_values(
+    block: MetaDataRowBlock,
+    masks: dict[str, Any],
+) -> dict[str, np.ndarray]:
+    """Return block columns whose masked rows read as missing (None)."""
+    rows = np.asarray(block.active_global_indices, dtype=np.int64) - block.start
+    values: dict[str, np.ndarray] = {}
+    for column, mask in masks.items():
+        raw = np.asarray(block.values[column])
+        if mask is None:
+            values[column] = raw
+            continue
+        missing = np.asarray(mask[block.start : block.stop], dtype=bool)[rows]
+        values[column] = apply_missing_mask(raw, missing, labels=True)
+    return values
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,8 +221,9 @@ def column_partition_digest(
     n_missing = 0
     n_rows = 0
     next_code = 0
+    masks = _missing_masks(metadata, [column])
     for block in metadata.iter_row_blocks(cell_key=cell_key, columns=[column]):
-        for value in block.values[column]:
+        for value in _block_values(block, masks)[column]:
             n_rows += 1
             key = level_key(value)
             if key is _MISSING_LEVEL:
@@ -250,9 +258,11 @@ def columns_same_partition(
     forward: dict[Hashable, Hashable] = {}
     backward: dict[Hashable, Hashable] = {}
     samples: list[tuple[Any, Any]] = []
+    masks = _missing_masks(metadata, list(dict.fromkeys([left, right])))
     for block in metadata.iter_row_blocks(cell_key=cell_key, columns=[left, right]):
-        left_values = block.values[left]
-        right_values = block.values[right]
+        values = _block_values(block, masks)
+        left_values = values[left]
+        right_values = values[right]
         for left_value, right_value in zip(left_values, right_values, strict=True):
             left_key = level_key(left_value)
             right_key = level_key(right_value)
@@ -288,10 +298,12 @@ def column_constant_within(
 ) -> bool:
     """True when ``inner`` does not vary inside each ``outer`` level."""
     seen: dict[Hashable, Hashable] = {}
+    masks = _missing_masks(metadata, list(dict.fromkeys([inner, outer])))
     for block in metadata.iter_row_blocks(cell_key=cell_key, columns=[inner, outer]):
+        values = _block_values(block, masks)
         for outer_value, inner_value in zip(
-            block.values[outer],
-            block.values[inner],
+            values[outer],
+            values[inner],
             strict=True,
         ):
             outer_key = level_key(outer_value)
@@ -314,13 +326,14 @@ def reduce_observation_units(
     """Collapse active rows to one record per observation-unit level."""
     ordered = list(dict.fromkeys([observation_unit, *columns]))
     records: dict[Hashable, dict[str, Any]] = {}
+    masks = _missing_masks(metadata, ordered)
     for block in metadata.iter_row_blocks(cell_key=cell_key, columns=ordered):
-        unit_values = block.values[observation_unit]
-        for index, unit_value in enumerate(unit_values):
+        values = _block_values(block, masks)
+        for index, unit_value in enumerate(values[observation_unit]):
             unit_key = level_key(unit_value)
             if unit_key in records:
                 continue
-            records[unit_key] = {name: block.values[name][index] for name in ordered}
+            records[unit_key] = {name: values[name][index] for name in ordered}
     if not records:
         return pd.DataFrame(columns=ordered)
     return pd.DataFrame(list(records.values()), columns=ordered)

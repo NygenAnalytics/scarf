@@ -9,6 +9,7 @@ from scipy.sparse import csr_matrix
 
 from scarf.agent.ingest import ingest
 from scarf.agent.ingest.manifest import inspect_h5ad_manifest
+from scarf.readers._h5ad_inspect import _read_text_scalar
 
 
 def _write_sparse_group(
@@ -441,3 +442,20 @@ def test_h5ad_manifest_caps_domains_while_counting_missing_values(
     assert column.domainSize is None
     assert column.domainValues == []
     assert column.valueCounts == {}
+
+
+def test_text_scalars_accept_only_scalar_or_one_element_datasets(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "text.h5"
+    with h5py.File(path, "w") as h5:
+        uns = h5.create_group("uns")
+        uns.create_dataset("title", data=np.asarray([b"one"]))
+        uns.create_dataset("description", data=np.asarray([b"a", b"b"]))
+        uns.create_dataset("citation", data=np.bytes_("cited"))
+    with h5py.File(path, "r") as h5:
+        assert _read_text_scalar(h5, "uns/title", 500) == "one"
+        assert _read_text_scalar(h5, "uns/description", 500) is None
+        assert _read_text_scalar(h5, "uns/citation", 4) == "cite"
+        assert _read_text_scalar(h5, "uns", 500) is None
+        assert _read_text_scalar(h5, "uns/missing", 500) is None

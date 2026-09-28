@@ -1,3 +1,4 @@
+import tempfile
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
@@ -5,14 +6,12 @@ from typing import Any
 import numpy as np
 
 from ..storage.artifacts import ArtifactRef, artifact_group
+from ..storage.feature_selection import read_feature_selection_indices
 from ..storage.pipeline_runs import (
     PipelineOutputRecord,
     abandon_pipeline_label_claim,
     complete_pipeline_run_record,
     create_pipeline_run_record,
-    fail_pipeline_run_record,
-    interrupt_pipeline_run_record,
-    load_pipeline_run_record,
 )
 from ..storage.selections import (
     resolve_stored_selection_artifact,
@@ -39,6 +38,7 @@ from ._pipeline_ledger import (
     PipelineEventKind as PipelineEventKind,
     PipelineEventEmitter,
     RunLedger,
+    end_pipeline_run,
     interruption_record,
 )
 from ._pipeline_recipe import (
@@ -130,9 +130,42 @@ class PipelineAccessor:
         doublets: bool = True,
         markers: bool = True,
         snapshot_columns: Sequence[str] = (),
+        params: Mapping[str, object] | None = None,
         callback: PipelineCallback | None = None,
     ) -> PipelineRun:
-        """Run the validated rich RNA recipe and return its durable handle."""
+        """Run the validated rich RNA recipe and return its durable handle.
+
+        ``params`` maps a stage name to the keyword arguments the pipeline
+        forwards to that stage's function, so one mapping can configure a run:
+
+        ``{"filtering": {"method": "manual", "lows": [...], "highs": [...]},
+        "hvg": {"min_mean": 0.01, "keep_bounds": True}, "pca": {"dims": 0},
+        "umap": {"n_epochs": 400}, "leiden": {"partitions": [0.8, 1.0],
+        "selected": 1.0}, "tsne": {"max_iter": 800}}``
+
+        Sections:
+
+        - ``filtering``: the ``filtering`` mapping, or a bool.
+        - ``cell_cycle``, ``umap``, ``paris``, ``doublets``, ``markers``: a
+          mapping of settings, or a bool that switches the stage.
+        - ``hvg``, ``normalization``, ``pca``, ``ann_index``, ``neighbors``,
+          ``connectivity``, ``embedding_initialization``: settings for stages
+          that always run. ``pca`` ``dims=0`` skips PCA and builds the graph
+          on the normalized values of the selected features.
+        - ``harmony``: ``batch_columns`` plus Harmony settings, or False.
+        - ``leiden``: ``partitions``, an optional ``selected`` resolution that
+          becomes the saved clustering in place of the silhouette choice, and
+          Leiden settings; or a bool.
+        - ``tsne`` and ``membership_strength``: off unless requested. t-SNE
+          uses the UMAP graph and initialization; membership strength is
+          computed on the saved clustering.
+        - ``species``: a species key recorded with the run.
+
+        Unknown sections or settings raise before anything is written, and a
+        setting cannot also be given through its shortcut argument, such as
+        ``hvg_count`` with ``params["hvg"]["top_n"]``. Each stage validates
+        its own values. The run records the resolved settings.
+        """
         if callback is not None and not callable(callback):
             raise TypeError("callback must be callable")
         store = self._store
@@ -155,6 +188,7 @@ class PipelineAccessor:
             doublets=doublets,
             markers=markers,
             snapshot_columns=snapshot_columns,
+            params=params,
         )
         return self._run_recipe(recipe, callback)
 
@@ -177,23 +211,16 @@ class PipelineAccessor:
                         active_run_id=active_run_id,
                     )
                 except BaseException as error:
-                    interruption = interruption_record(error)
-                    if interruption is not None and active_run_id:
-                        current = load_pipeline_run_record(
-                            self._store.zw,
-                            active_run_id[0],
+                    if (
+                        interruption_record(error) is not None
+                        and active_run_id
+                        and end_pipeline_run(self._store.zw, active_run_id[0], error)
+                    ):
+                        PipelineEventEmitter(callback).emit(
+                            "pipeline_interrupted",
+                            "between_stages",
+                            error,
                         )
-                        if not current.complete:
-                            interrupt_pipeline_run_record(
-                                self._store.zw,
-                                run_id=active_run_id[0],
-                                interruption=interruption,
-                            )
-                            PipelineEventEmitter(callback).emit(
-                                "pipeline_interrupted",
-                                "between_stages",
-                                error,
-                            )
                     raise
         finally:
             if token.requested:
@@ -305,6 +332,7 @@ class PipelineAccessor:
 
             def cell_cycle_stage() -> Sequence[tuple[str, ArtifactRef]]:
                 ref = store._run_cell_cycle_scoring_artifact(
+                    **recipe.params_for("cell_cycle"),
                     assay=assay_obj,
                     cell_selection=analysis_selection,
                     feature_names=frozen_feature_names,
@@ -325,6 +353,7 @@ class PipelineAccessor:
                 feature_snapshot=feature_snapshot,
                 top_n=recipe.hvg_count,
                 show_plot=False,
+                **recipe.params_for("hvg"),
             )
             artifacts["highly_variable_features"] = hvg
             return (("highly_variable_features", hvg),)
@@ -335,6 +364,7 @@ class PipelineAccessor:
             ref = store.run_normalization(
                 analysis_selection,
                 artifacts["highly_variable_features"],
+                **recipe.params_for("normalization"),
             )
             artifacts["normalized"] = ref
             return (("normalized", ref),)
@@ -342,19 +372,41 @@ class PipelineAccessor:
         ledger.run("normalization", normalization_stage)
 
         def pca_stage() -> Sequence[tuple[str, ArtifactRef]]:
-            ref = store.run_pca(artifacts["normalized"], dims=recipe.pca_dims)
+            if recipe.pca_dims == 0:
+                # Without PCA the graph uses the normalized values of the
+                # selected features, registered as an identity reduction.
+                n_features = len(
+                    read_feature_selection_indices(
+                        store.zw,
+                        recipe.assay,
+                        artifacts["highly_variable_features"],
+                    )
+                )
+                ref = store.run_custom_reduction(
+                    np.eye(n_features, dtype=np.float64),
+                    artifacts["normalized"],
+                )
+                artifacts["reduction"] = ref
+                return (("reduction", ref),)
+            ref = store.run_pca(
+                artifacts["normalized"],
+                dims=recipe.pca_dims,
+                **recipe.params_for("pca"),
+            )
             artifacts["pca"] = ref
             return (("pca", ref),)
 
         ledger.run("pca", pca_stage)
-        coordinates = artifacts["pca"]
+        reduction = artifacts["pca"] if recipe.pca_dims else artifacts["reduction"]
+        coordinates = reduction
         if recipe.harmony_batch_columns:
 
             def harmony_stage() -> Sequence[tuple[str, ArtifactRef]]:
                 ref = store._run_harmony_artifact(
-                    artifacts["pca"],
+                    reduction,
                     cell_snapshot,
                     list(recipe.harmony_batch_columns),
+                    **recipe.params_for("harmony"),
                 )
                 artifacts["harmony"] = ref
                 return (("harmony", ref),)
@@ -365,7 +417,7 @@ class PipelineAccessor:
             ledger.skip("harmony")
 
         def ann_stage() -> Sequence[tuple[str, ArtifactRef]]:
-            ref = store.build_ann_index(coordinates)
+            ref = store.build_ann_index(coordinates, **recipe.params_for("ann_index"))
             artifacts["ann_index"] = ref
             return (("ann_index", ref),)
 
@@ -376,6 +428,7 @@ class PipelineAccessor:
                 artifacts["ann_index"],
                 coordinates=coordinates,
                 k=recipe.neighbors_k,
+                **recipe.params_for("neighbors"),
             )
             artifacts["neighbors"] = ref
             return (("neighbors", ref),)
@@ -383,18 +436,22 @@ class PipelineAccessor:
         ledger.run("neighbors", neighbors_stage)
 
         def connectivity_stage() -> Sequence[tuple[str, ArtifactRef]]:
-            ref = store.build_connectivity_map(artifacts["neighbors"])
+            ref = store.build_connectivity_map(
+                artifacts["neighbors"], **recipe.params_for("connectivity")
+            )
             artifacts["connectivity_map"] = ref
             return (("connectivity_map", ref),)
 
         ledger.run("connectivity", connectivity_stage)
 
         def initialization_stage() -> Sequence[tuple[str, ArtifactRef]]:
-            ref = store.build_embedding_initialization(coordinates)
+            ref = store.build_embedding_initialization(
+                coordinates, **recipe.params_for("embedding_initialization")
+            )
             artifacts["embedding_initialization"] = ref
             return (("embedding_initialization", ref),)
 
-        if recipe.umap:
+        if recipe.umap or recipe.tsne:
             ledger.run("embedding_initialization", initialization_stage)
         else:
             ledger.skip("embedding_initialization")
@@ -403,6 +460,7 @@ class PipelineAccessor:
             ref = store._run_umap_artifact(
                 artifacts["connectivity_map"],
                 artifacts["embedding_initialization"],
+                **recipe.params_for("umap"),
             )
             artifacts["umap"] = ref
             return (("umap", ref),)
@@ -426,6 +484,7 @@ class PipelineAccessor:
                     ref = store._run_leiden_artifact(
                         artifacts["connectivity_map"],
                         resolution=resolution,
+                        **recipe.params_for("leiden"),
                     )
                     artifacts[output_key] = ref
                     return ((output_key, ref),)
@@ -435,7 +494,9 @@ class PipelineAccessor:
             if recipe.paris:
 
                 def paris_stage() -> Sequence[tuple[str, ArtifactRef]]:
-                    ref = store._run_paris_artifact(artifacts["connectivity_map"])
+                    ref = store._run_paris_artifact(
+                        artifacts["connectivity_map"], **recipe.params_for("paris")
+                    )
                     artifacts["paris"] = ref
                     return (("paris", ref),)
 
@@ -447,7 +508,12 @@ class PipelineAccessor:
                 (f"leiden_{key}", artifacts[f"leiden_{key}"])
                 for key, _resolution in recipe.leiden_partitions
             ]
-            if clustering_candidates:
+            if recipe.leiden_selected is not None:
+                # The requested resolution is the saved clustering; the other
+                # partitions stay available as candidates.
+                artifacts["clusters"] = artifacts[f"leiden_{recipe.leiden_selected}"]
+                ledger.skip("cluster_selection")
+            elif clustering_candidates:
 
                 def cluster_selection_stage() -> Sequence[tuple[str, ArtifactRef]]:
                     decision, selected_key, selected_ref = run_cluster_selection(
@@ -466,18 +532,50 @@ class PipelineAccessor:
             else:
                 ledger.skip("cluster_selection")
 
+            def membership_strength_stage() -> Sequence[tuple[str, ArtifactRef]]:
+                ref = store.calc_membership_strength(
+                    artifacts["clusters"], artifacts["connectivity_map"]
+                )
+                artifacts["membership_strength"] = ref
+                return (("membership_strength", ref),)
+
+            if recipe.membership_strength:
+                ledger.run("membership_strength", membership_strength_stage)
+            else:
+                ledger.skip("membership_strength")
+
+        def tsne_stage() -> Sequence[tuple[str, ArtifactRef]]:
+            with tempfile.TemporaryDirectory(prefix="scarf-tsne-") as work_dir:
+                ref = store.run_tsne(
+                    artifacts["connectivity_map"],
+                    artifacts["embedding_initialization"],
+                    temp_file_loc=work_dir,
+                    verbose=False,
+                    **recipe.params_for("tsne"),
+                )
+            artifacts["tsne"] = ref
+            return (("tsne", ref),)
+
+        if recipe.tsne:
+            ledger.run("tsne", tsne_stage)
+        else:
+            ledger.skip("tsne")
+
         doublet_graph = artifacts["connectivity_map"]
         if recipe.doublets and recipe.harmony_batch_columns:
 
             def doublet_graph_stage() -> Sequence[tuple[str, ArtifactRef]]:
                 nonlocal doublet_graph
-                ann = store.build_ann_index(artifacts["pca"])
+                ann = store.build_ann_index(reduction, **recipe.params_for("ann_index"))
                 neighbors = store.query_neighbors(
                     ann,
-                    coordinates=artifacts["pca"],
+                    coordinates=reduction,
                     k=recipe.neighbors_k,
+                    **recipe.params_for("neighbors"),
                 )
-                graph = store.build_connectivity_map(neighbors)
+                graph = store.build_connectivity_map(
+                    neighbors, **recipe.params_for("connectivity")
+                )
                 doublet_graph = graph
                 return (
                     ("uncorrected_ann_index", ann),
@@ -501,6 +599,7 @@ class PipelineAccessor:
                     connectivity=doublet_graph,
                     feature_names=frozen_feature_names,
                     feature_snapshot=feature_snapshot,
+                    **recipe.params_for("doublets"),
                 )
                 artifacts["doublets"] = ref
                 return (("doublets", ref),)
@@ -537,6 +636,7 @@ class PipelineAccessor:
             "highly_variable_features",
             "normalized",
             "pca",
+            "reduction",
             "harmony",
             "ann_index",
             "neighbors",
@@ -547,6 +647,8 @@ class PipelineAccessor:
             "paris",
             "cluster_selection",
             "clusters",
+            "membership_strength",
+            "tsne",
             "doublets",
             "markers",
         )
@@ -572,12 +674,6 @@ class PipelineAccessor:
             )
             shutdown_checkpoint()
         except Exception as error:
-            current = load_pipeline_run_record(store.zw, record.run_id)
-            if not current.complete:
-                fail_pipeline_run_record(
-                    store.zw,
-                    run_id=record.run_id,
-                    error=error,
-                )
+            ledger.terminate(error)
             raise PipelineExecutionError(record.run_id, "finalize", error) from error
         return open_pipeline_run(store, run_id=record.run_id)

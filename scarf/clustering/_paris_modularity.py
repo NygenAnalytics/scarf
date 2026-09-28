@@ -4,6 +4,7 @@ import numpy as np
 from numba import njit
 from scipy.sparse import csr_matrix
 
+from ..neighbors.graph import csr_symmetry_error
 from ._paris_core import ParisHierarchy, canonicalize_paris_graph
 from .paris_multiscale import PlateauForest, _validate_hierarchy
 
@@ -64,34 +65,6 @@ class PlateauModularityStatistics:
         )
 
 
-@njit(cache=True, nogil=True)
-def _csr_symmetry_error(
-    indptr: np.ndarray,
-    indices: np.ndarray,
-    data: np.ndarray,
-) -> int:
-    n_vertices = indptr.size - 1
-    for source in range(n_vertices):
-        for offset in range(indptr[source], indptr[source + 1]):
-            target = int(indices[offset])
-            if target == source:
-                return 1
-            lower = int(indptr[target])
-            upper = int(indptr[target + 1])
-            while lower < upper:
-                middle = (lower + upper) // 2
-                candidate = int(indices[middle])
-                if candidate < source:
-                    lower = middle + 1
-                else:
-                    upper = middle
-            if lower >= indptr[target + 1] or int(indices[lower]) != source:
-                return 2
-            if data[lower] != data[offset]:
-                return 3
-    return 0
-
-
 def _validate_canonical_csr(graph: csr_matrix, n_vertices: int | None = None) -> None:
     if not isinstance(graph, csr_matrix):
         raise TypeError("graph must be a scipy.sparse.csr_matrix")
@@ -105,10 +78,11 @@ def _validate_canonical_csr(graph: csr_matrix, n_vertices: int | None = None) ->
         raise ValueError("graph must be a sorted canonical CSR without duplicates")
     if not np.isfinite(graph.data).all() or np.any(graph.data <= 0):
         raise ValueError("canonical graph entries must be finite and positive")
-    symmetry_error = _csr_symmetry_error(
+    symmetry_error = csr_symmetry_error(
         graph.indptr,
         graph.indices,
         graph.data,
+        False,
     )
     if symmetry_error == 1:
         raise ValueError("canonical graph must not contain self-loops")

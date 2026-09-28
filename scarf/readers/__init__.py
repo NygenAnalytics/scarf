@@ -8,11 +8,9 @@
     - LoomReader: A class to read in data in the form of a Loom file.
 """
 
-from importlib import import_module
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from ._text import get_file_handle as get_file_handle
-from ._text import read_file as read_file
+from .._facade import lazy_facade as _lazy_facade
 
 if TYPE_CHECKING:
     from .cellranger import CrH5Reader, CrReader
@@ -39,58 +37,23 @@ __all__ = [
     "CSVReader",
 ]
 
-_LAZY_EXPORTS = {
-    "CrDirReader": "mtx",
-    "CrH5Reader": "cellranger",
-    "CrReader": "cellranger",
-    "CSVReader": "csv",
-    "H5adInspectResult": "h5ad",
-    "H5adReader": "h5ad",
-    "inspect_h5ad": "h5ad",
-    "MtxCandidate": "mtx",
-    "MtxReader": "mtx",
-    "inspect_mtx": "mtx",
-    "SeuratInspectResult": "seurat",
-    "SeuratReader": "seurat",
-    "inspect_seurat": "seurat",
-    "LoomReader": "loom",
-}
-
-for _export_name in _LAZY_EXPORTS:
-    globals().pop(_export_name, None)
-del _export_name
-
-
-def _normalize_export_metadata(value: Any) -> None:
-    value.__module__ = __name__
-    if not isinstance(value, type):
-        return
-    for descriptor in value.__dict__.values():
-        if isinstance(descriptor, classmethod | staticmethod):
-            descriptor.__func__.__module__ = __name__
-        elif callable(descriptor) and hasattr(descriptor, "__module__"):
-            descriptor.__module__ = __name__
-
-
-def __getattr__(name: str) -> Any:
-    module_name = _LAZY_EXPORTS.get(name)
-    if module_name is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-    module = import_module(f".{module_name}", __name__)
-    for export_name, export_module in _LAZY_EXPORTS.items():
-        if export_module != module_name:
-            continue
-        value = getattr(module, export_name)
-        _normalize_export_metadata(value)
-        globals()[export_name] = value
-    return globals()[name]
-
-
-def __dir__() -> list[str]:
-    return sorted(set(globals()) | set(__all__))
-
-
-for _function in (get_file_handle, read_file):
-    _function.__module__ = __name__
-del _function
+__getattr__, __dir__ = _lazy_facade(
+    __name__,
+    {
+        "CrDirReader": ".mtx",
+        "CrH5Reader": ".cellranger",
+        "CrReader": ".cellranger",
+        "CSVReader": ".csv",
+        "H5adInspectResult": ".h5ad",
+        "H5adReader": ".h5ad",
+        "inspect_h5ad": ".h5ad",
+        "MtxCandidate": ".mtx",
+        "MtxReader": ".mtx",
+        "inspect_mtx": ".mtx",
+        "SeuratInspectResult": ".seurat",
+        "SeuratReader": ".seurat",
+        "inspect_seurat": ".seurat",
+        "LoomReader": ".loom",
+    },
+    set_module=True,
+)

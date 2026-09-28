@@ -14,14 +14,16 @@ from ._figure import (
     LegendSpec,
     PlotResult,
     _place_legend_blocks,
+    close_figures_on_error,
     normalize_axes_target,
 )
 from ..utils.arrays import sort_categories
 from ._style import (
     apply_figure_chrome,
     capped_figsize,
-    categorical_color_map,
+    category_label,
     foreground_color,
+    resolve_category_scale,
     scatter_edgecolor,
     theme_context,
 )
@@ -97,30 +99,30 @@ def _attach_sample_meta(
     return per_sample.merge(meta, on="sample", how="left")
 
 
+_PREFERRED_CONDITIONS = (
+    "before",
+    "pre",
+    "baseline",
+    "control",
+    "ctrl",
+    "untreated",
+    "after",
+    "post",
+    "treated",
+    "stimulated",
+    "stim",
+)
+
+
 def _sort_conditions(values: list[Any]) -> list[Any]:
-    """Order conditions for paired plots with a light before/after preference."""
-    preferred = (
-        "before",
-        "pre",
-        "baseline",
-        "control",
-        "ctrl",
-        "untreated",
-        "after",
-        "post",
-        "treated",
-        "stimulated",
-        "stim",
-    )
+    """Order conditions for paired plots with a light before/after preference.
 
-    def key(value: Any) -> tuple[int, str]:
-        text = str(value).lower()
-        try:
-            return preferred.index(text), text
-        except ValueError:
-            return len(preferred), text
-
-    return sorted(values, key=key)
+    Recognized before/after names come first in that order; the others follow
+    in natural category order.
+    """
+    known = [value for value in values if str(value).lower() in _PREFERRED_CONDITIONS]
+    known.sort(key=lambda value: _PREFERRED_CONDITIONS.index(str(value).lower()))
+    return known + sort_categories(value for value in values if value not in known)
 
 
 def _draw_pair_lines(
@@ -303,6 +305,7 @@ def _draw_summary_markers(
         )
 
 
+@close_figures_on_error
 def composition(
     store: Any,
     *,
@@ -410,11 +413,7 @@ def composition(
             cell_key="I",
         )
         grouping_values = np.asarray(resolved_grouping[0], dtype=object)
-        grouping_selection = _artifact_cell_selection(
-            store,
-            grouping,
-            label="Grouping",
-        )
+        grouping_selection = _artifact_cell_selection(store, grouping)
     if categories is None:
         assert category_by is not None
         categorical_scale = resolve_categorical_scale(
@@ -441,11 +440,7 @@ def composition(
             groups=categories,
             cell_key="I",
         )
-        category_selection = _artifact_cell_selection(
-            store,
-            categories,
-            label="Categories",
-        )
+        category_selection = _artifact_cell_selection(store, categories)
         if grouping_selection is not None:
             assert cell_indices is not None
             if category_selection != grouping_selection:
@@ -462,26 +457,10 @@ def composition(
         category_axis_label = "categories"
     if len(cats) == 0:
         raise ValueError(f"No cells selected by cell_key {cell_key!r}")
-    missing_label = (
-        categorical_scale.missing_label if categorical_scale is not None else "NA"
-    )
+    category_scale = resolve_category_scale(cats, categorical_scale)
     missing_mask = pd.isna(cats)
     cats[missing_mask] = _MISSING_CATEGORY
-    observed_categories = [
-        value for value in pd.unique(cats) if value is not _MISSING_CATEGORY
-    ]
-    if categorical_scale and categorical_scale.order is not None:
-        cat_order = list(categorical_scale.order)
-        unlisted = [
-            category for category in observed_categories if category not in cat_order
-        ]
-        if unlisted:
-            raise ValueError(
-                "categorical_scale.order is missing observed values: "
-                + ", ".join(map(str, unlisted[:10]))
-            )
-    else:
-        cat_order = sort_categories(observed_categories)
+    cat_order: list[Any] = list(category_scale.order or ())
     if missing_mask.any():
         cat_order.append(_MISSING_CATEGORY)
 
@@ -532,7 +511,11 @@ def composition(
             }
         )
         ct = pd.crosstab(df["sample"], df["category"])
-        ct = ct.reindex(columns=cat_order, fill_value=0)
+        ct = ct.reindex(
+            index=sort_categories(ct.index),
+            columns=cat_order,
+            fill_value=0,
+        )
         props_mat = ct.div(ct.sum(axis=1).replace(0, np.nan), axis=0)
         cell_counts = ct.stack()
         cell_counts.index = cell_counts.index.set_names(["sample", "category"])
@@ -614,31 +597,14 @@ def composition(
                 uncertainty=resolved_uncertainty,
             )
 
-    nonmissing_order = [
-        category for category in cat_order if category is not _MISSING_CATEGORY
-    ]
-    palette = categorical_color_map(
-        nonmissing_order,
-        palette=categorical_scale.palette if categorical_scale else None,
-        palette_name=(
-            categorical_scale.palette_name if categorical_scale else "default"
-        ),
-    )
-    resolved_missing_color = (
-        categorical_scale.missing_color if categorical_scale is not None else "#bdbdbd"
-    )
+    palette: dict[Any, str] = dict(category_scale.palette or {})
     if missing_mask.any():
-        palette[_MISSING_CATEGORY] = resolved_missing_color
-    display_labels = (
-        categorical_scale.labels
-        if categorical_scale is not None and categorical_scale.labels is not None
-        else {}
-    )
+        palette[_MISSING_CATEGORY] = category_scale.missing_color
 
-    def category_label(value: Any) -> str:
+    def display_label(value: Any) -> str:
         if value is _MISSING_CATEGORY:
-            return missing_label
-        return display_labels.get(value, str(value))
+            return category_scale.missing_label
+        return category_label(category_scale, value)
 
     panel_key: Hashable = "composition"
     resolved_figsize = figsize
@@ -700,7 +666,7 @@ def composition(
                         val,
                         bottom=bottom,
                         color=palette[cat],
-                        label=category_label(cat),
+                        label=display_label(cat),
                         width=bar_width,
                         edgecolor=segment_border,
                         linewidth=segment_linewidth,
@@ -732,7 +698,7 @@ def composition(
                         heights,
                         bottom=bottoms,
                         color=palette[cat],
-                        label=category_label(cat),
+                        label=display_label(cat),
                         width=bar_width,
                         edgecolor=segment_border,
                         linewidth=segment_linewidth,
@@ -837,7 +803,7 @@ def composition(
                 ]
                 ax.set_xticks(centers)
                 ax.set_xticklabels(
-                    [category_label(category) for category in cat_order],
+                    [display_label(category) for category in cat_order],
                     rotation=45,
                     ha="right",
                 )
@@ -856,7 +822,7 @@ def composition(
                         markerfacecolor=palette[cat],
                         markeredgecolor=edgecolor,
                         markersize=6,
-                        label=category_label(cat),
+                        label=display_label(cat),
                     )
                     for cat in cat_order
                 ]
@@ -921,7 +887,7 @@ def composition(
                         s=40,
                         edgecolors=edgecolor,
                         linewidths=0.3,
-                        label=category_label(cat),
+                        label=display_label(cat),
                         zorder=2,
                     )
                 if summary_table is not None:
@@ -934,7 +900,7 @@ def composition(
                     )
                 ax.set_xticks(range(len(cat_order)))
                 ax.set_xticklabels(
-                    [category_label(c) for c in cat_order],
+                    [display_label(c) for c in cat_order],
                     rotation=45,
                     ha="right",
                 )
@@ -1030,24 +996,7 @@ def composition(
         axes=axes,
         tables=tables,
         legends=tuple(legends),
-        scales=(
-            CategoricalScale(
-                order=tuple(nonmissing_order),
-                palette={category: palette[category] for category in nonmissing_order},
-                labels=(dict(display_labels) if display_labels else None),
-                missing_color=resolved_missing_color,
-                missing_label=(
-                    categorical_scale.missing_label
-                    if categorical_scale is not None
-                    else "NA"
-                ),
-                palette_name=(
-                    categorical_scale.palette_name
-                    if categorical_scale is not None
-                    else "default"
-                ),
-            ),
-        ),
+        scales=(category_scale,),
         provenance=PlotProvenance(
             cell_key=(
                 None if categories is not None or grouping is not None else cell_key

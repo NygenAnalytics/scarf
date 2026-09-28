@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .._plots import cluster_counts, plot_final_umap
+from .._plots import cluster_counts, plot_final_umap, require_final_inputs
 from .artifacts import artifact_ref
 
 if TYPE_CHECKING:
@@ -67,16 +67,15 @@ def collect_analysis_artifacts(
     marker_rows: list[dict[str, Any]] = []
     if final.get("markers") is not None:
         marker = artifact_ref(final["markers"])
-        marker_inputs = store.inspect_artifact(marker).inputs or {}
-        if marker_inputs.get("clusters") != clusters.to_dict():
-            raise ValueError("Final marker statistics must use the selected clusters")
-        if (
-            marker_inputs.get("cell_selection")
-            != artifact_ref(final.get("cellSelection")).to_dict()
-        ):
-            raise ValueError("Final markers must use the selected cells")
         if marker.assay != clusters.assay:
             raise ValueError("Final markers must use the selected RNA assay")
+        require_final_inputs(
+            store,
+            marker,
+            "markers",
+            clusters=clusters,
+            cell_selection=artifact_ref(final.get("cellSelection")),
+        )
         for cluster in counts:
             try:
                 table = store.get_markers(marker, group_id=cluster)

@@ -535,9 +535,9 @@ def test_failed_execution_retries_and_doublets_bind_exact_feature_mask(
 
 @pytest.mark.parametrize(
     "protection",
-    [{"protectFamilies": ["ribosomalProtein"]}, {"protectFeatures": ["RPS1"]}],
+    [{"protectFamilies": ["ribosomal"]}, {"protectFeatures": ["RPS1"]}],
 )
-def test_feature_experiments_preserve_aliases_and_exact_protected_genes(
+def test_feature_experiments_preserve_protected_families_and_exact_genes(
     checkpoints: dict[str, Any],
     protection: dict[str, Any],
 ) -> None:
@@ -564,7 +564,7 @@ def test_feature_experiments_preserve_aliases_and_exact_protected_genes(
     )
     selected = example(ParameterCandidateEvaluation)
     run.settings[selected.candidateId] = run.baseline()
-    run.family_patterns = {"ribosomal": "^RP[SL]"}
+    run.families = ("ribosomal",)
     with pytest.raises(ValueError, match="objective-protected"):
         run.apply_experiment(
             selected, {"parameter": "excludeFamily", "value": "ribosomal"}

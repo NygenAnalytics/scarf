@@ -22,7 +22,7 @@ from scarf.agent.orchestrator.models import (
     WorkflowQuestion,
 )
 from tests.agent_journal_store import memory_journal
-from tests.agent_orchestrator_store import create_store
+from tests.agent_orchestrator_store import create_store, save_request
 
 
 def _saved_workflow(path: Path, *, workspace: str | None = None):
@@ -40,8 +40,8 @@ def _saved_workflow(path: Path, *, workspace: str | None = None):
     )
     store = orchestrator.open_store(str(path), request)
     store.cells.insert("condition", np.array(["a", "a", "b", "b"]))
-    record = orchestrator.initialize_request(
-        store, WorkflowIdentity("workflow-1", workspace), request
+    record = save_request(
+        orchestrator, store, WorkflowIdentity("workflow-1", workspace), request
     )
     resume = AutomatedWorkflowResumeRequest(
         zarrPath=str(path), workspace=workspace, workflowRunId="workflow-1"
@@ -108,7 +108,7 @@ def test_resume_never_reads_an_unrelated_latest_workflow(tmp_path, monkeypatch) 
     other_request = record.request.model_copy(
         update={"studyObjective": "A different question"}
     )
-    orchestrator.initialize_request(store, WorkflowIdentity("other-run"), other_request)
+    save_request(orchestrator, store, WorkflowIdentity("other-run"), other_request)
     seen = []
 
     def stop(request):
@@ -189,15 +189,23 @@ def _pause_with_interrupted_answer(
     )
     journal._save_outcome(store.zw, prefix, paused)
     answers = {
-        question_id: {"action": "defer", "rationale": "More evidence is required"}
+        question_id: {
+            "action": "defer",
+            "selectedCandidateId": "baseline",
+            "correctionNeed": "uncertain",
+            "evidenceIds": ["candidate:baseline"],
+            "quantitativeFindings": ["The saved comparison is incomplete."],
+            "qualitativeFindings": ["Marker programs remain unresolved."],
+            "comparisonConclusions": [],
+            "plainLanguageSummary": "More evidence is required.",
+            "objectivePreservation": "Preserve the observed populations.",
+            "rationale": "More evidence is required",
+        }
         if tuning
         else {"organism": "human"}
     }
     resume_record = OrchestrationResumeRecord(
-        workflowRunId=record.workflowRunId,
-        answeredAttempt=journal._parent_link(paused),
-        answers=answers,
-        questionIds=list(answers),
+        answeredAttempt=journal._parent_link(paused), answers=answers
     )
     if not interrupted:
         return store, record, answers, resume_record
@@ -357,7 +365,8 @@ def test_nonstage_failure_keeps_last_stage_and_resume_address(monkeypatch) -> No
     )
     orchestrator = AgentOrchestrator("test-model")
 
-    def fail(*args, **kwargs):
+    def fail(*args, progress, **kwargs):
+        progress.extend(["data_enrichment", "parameter_tuning"])
         raise RuntimeError("The selected full-cohort candidate lacks markers")
 
     monkeypatch.setattr(orchestrator, "_execute_stages", fail)
@@ -401,4 +410,192 @@ def test_provider_configuration_distinguishes_identically_named_models() -> None
     assert _model_identity(first) != _model_identity(text_only)
     assert _model_identity(text_only) == _model_identity(
         SimpleNamespace(**vars(first), profile={"supports_image_input": False})
+    )
+
+
+def test_corrected_answer_replaces_one_whose_answering_attempt_failed(
+    monkeypatch,
+) -> None:
+    store, record, _, original = _pause_with_interrupted_answer(failed=True)
+    orchestrator = AgentOrchestrator("test-model")
+    monkeypatch.setattr(
+        orchestrator, "load_request_for_resume", lambda request: (record, store)
+    )
+    captured = {}
+
+    def continue_work(*args, **kwargs):
+        captured.update(kwargs)
+        return AutomatedWorkflowResult(status="abstained")
+
+    monkeypatch.setattr(orchestrator, "_continue", continue_work)
+    corrected = {"enrichmentDirections": {"organism": "mouse"}}
+    result = orchestrator.resume(
+        AutomatedWorkflowResumeRequest(
+            zarrPath="analysis.zarr",
+            workflowRunId=record.workflowRunId,
+            answers=corrected,
+        )
+    )
+    assert result.status == "abstained"
+    assert captured["answers"] == corrected
+    assert captured["resume_record"].answeredAttempt == original.answeredAttempt
+
+
+def test_failed_tuning_attempt_does_not_replace_its_committed_answer(
+    monkeypatch,
+) -> None:
+    store, record, answers, _ = _pause_with_interrupted_answer(failed=True, tuning=True)
+    orchestrator = AgentOrchestrator("test-model")
+    monkeypatch.setattr(
+        orchestrator, "load_request_for_resume", lambda request: (record, store)
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_continue",
+        lambda *args, **kwargs: pytest.fail("A committed answer must not change"),
+    )
+    result = orchestrator.resume(
+        AutomatedWorkflowResumeRequest(
+            zarrPath="analysis.zarr",
+            workflowRunId=record.workflowRunId,
+            answers=answers,
+        )
+    )
+    assert result.status == "failed"
+    assert "exact pending stage" in result.notes[0]
+
+
+def test_invalid_tuning_answer_is_rejected_before_any_attempt(monkeypatch) -> None:
+    store, record, _, _ = _pause_with_interrupted_answer(tuning=True, interrupted=False)
+    orchestrator = AgentOrchestrator("test-model")
+    monkeypatch.setattr(
+        orchestrator, "load_request_for_resume", lambda request: (record, store)
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_continue",
+        lambda *args, **kwargs: pytest.fail("An invalid answer must not run"),
+    )
+    prefix = journal._orchestration_prefix(store)
+    before = journal._list_keys(store.zw, prefix)
+    result = orchestrator.resume(
+        AutomatedWorkflowResumeRequest(
+            zarrPath="analysis.zarr",
+            workflowRunId=record.workflowRunId,
+            answers={"parameter_tuning": {"action": "accept"}},
+        )
+    )
+    assert result.status == "failed"
+    assert "not a valid assessment" in result.notes[0]
+    assert journal._list_keys(store.zw, prefix) == before
+
+
+def test_resume_failure_reports_the_latest_started_stage(tmp_path) -> None:
+    orchestrator, store, record, resume = _saved_workflow(tmp_path / "rna.zarr")
+    prefix = journal._orchestration_prefix(store)
+    journal._start_attempt(
+        store.zw, prefix, record.workflowRunId, "data_enrichment", record, []
+    )
+    result = orchestrator.resume(
+        resume.model_copy(update={"answers": {"unexpected": "answer"}})
+    )
+    assert result.status == "failed"
+    assert result.currentStage == "data_enrichment"
+    assert "exact pending stage" in result.notes[0]
+
+
+def test_unrelated_failure_leaves_an_earlier_orphan_start_open(monkeypatch) -> None:
+    store, prefix, record = memory_journal()
+    journal._start_attempt(store.zw, prefix, record.workflowRunId, "ingest", record, [])
+    runner = AgentOrchestrator("test-model")
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("Validation failed before any stage attempt")
+
+    monkeypatch.setattr(runner, "_execute_stages", fail)
+    result = runner._continue(
+        store, WorkflowIdentity(record.workflowRunId, None), record, answers={}
+    )
+    assert result.status == "failed"
+    assert (
+        journal._stage_outcomes(store.zw, prefix, record.workflowRunId, "ingest") == []
+    )
+
+
+def test_request_is_committed_only_after_its_ingest_stage(
+    tmp_path, monkeypatch
+) -> None:
+    path = create_store(tmp_path / "rna.zarr")
+    request = AutomatedWorkflowRequest(
+        sourcePath=str(path),
+        studyContext="Independent donors in two conditions",
+        studyObjective="Resolve stable populations",
+        analysisAssays=["RNA"],
+    )
+    interrupted = AgentOrchestrator("test-model")
+
+    def stop(*args, **kwargs):
+        raise KeyboardInterrupt("Interrupted while recording ingest")
+
+    monkeypatch.setattr(interrupted, "record_ingest_stage", stop)
+    with pytest.raises(KeyboardInterrupt):
+        interrupted.run(request)
+    root = zarr.open_group(str(path), mode="r")
+    prefix = "agents/orchestrations"
+    assert not [
+        key for key in journal._list_keys(root, prefix) if key.endswith("/request.json")
+    ]
+
+    def stop_after_commit(self, store, workflow, record, **kwargs):
+        return AutomatedWorkflowResult(
+            status="abstained", workflowRunId=workflow.workflowRunId
+        )
+
+    monkeypatch.setattr(AgentOrchestrator, "_continue", stop_after_commit)
+    result = AgentOrchestrator("test-model").run(request)
+    assert result.status == "abstained"
+    assert result.workflowRunId is not None
+    root = zarr.open_group(str(path), mode="r")
+    assert journal.read_request(root, prefix, result.workflowRunId)
+    [ingest] = journal._stage_outcomes(root, prefix, result.workflowRunId, "ingest")
+    assert ingest.status == "done"
+
+
+def test_identities_are_checked_before_any_input_conversion(tmp_path) -> None:
+    from scarf.agent.config import AgentRunConfig
+
+    config = AutomatedWorkflowConfig(
+        agentRunConfig=AgentRunConfig(extraModelSettings={"opaque": object()})
+    )
+    source = tmp_path / "study.h5ad"
+    result = AgentOrchestrator("test-model", config=config).run(
+        AutomatedWorkflowRequest(
+            sourcePath=str(source),
+            studyContext="Independent donors in two conditions",
+            studyObjective="Resolve stable populations",
+        )
+    )
+    assert result.status == "failed"
+    assert "serialize" in result.notes[0]
+    assert not (tmp_path / "study.zarr").exists()
+
+
+def test_model_identity_keeps_json_digests_and_names_opaque_settings() -> None:
+    import httpx2
+
+    from scarf.agent.orchestrator.main import _model_identity
+
+    assert _model_identity("openai:gpt-4o") == (
+        "builtins.str:openai:gpt-4o:"
+        "5368fcc89da9c6802c8b69174e48c5cf18c2e1946c06c256843b3e6516434145"
+    )
+
+    def opaque() -> SimpleNamespace:
+        return SimpleNamespace(
+            model_name="rna-model", settings={"timeout": httpx2.Timeout(30.0)}
+        )
+
+    assert _model_identity(opaque()) == _model_identity(opaque())
+    assert _model_identity(opaque()) != _model_identity(
+        SimpleNamespace(model_name="rna-model", settings={"timeout": 30.0})
     )

@@ -17,10 +17,20 @@ from scarf.storage.refs import ArtifactRef
 
 def test_cross_unit_support_requires_replication_per_cluster() -> None:
     labels = np.asarray([1, 1, 2, 2])
+    recorded = np.ones(4, dtype=bool)
     units = np.asarray(["a", "b", "a", "a"])
 
-    assert _cross_unit_support(labels, units) == 0.5
-    assert _cross_unit_support(labels, np.asarray(["a"] * 4)) is None
+    assert _cross_unit_support(labels, recorded, units) == 0.5
+    assert _cross_unit_support(labels, recorded, np.asarray(["a"] * 4)) is None
+
+
+def test_cluster_without_recorded_units_counts_as_unsupported() -> None:
+    labels = np.asarray([1, 1, 2, 2, 3, 3])
+    recorded = np.asarray([True, True, True, True, False, False])
+    units = np.asarray(["a", "b", "a", "b"])
+
+    # Cluster 3 has no recorded unit, so it cannot be supported by two units.
+    assert _cross_unit_support(labels, recorded, units) == 2 / 3
 
 
 def test_subsample_partition_stability_reclusters_induced_graph() -> None:

@@ -54,11 +54,7 @@ class _FrozenRunPlotCells:
     def fetch(self, column: str, *, key: str = "I") -> np.ndarray:
         if key != "I":
             raise ValueError("Run plots use the frozen pipeline cell selection")
-        plot_selected = getattr(self._cells, "_plot_fetch_selected", None)
-        if callable(plot_selected):
-            return np.asarray(plot_selected(column))
-        values = self.fetch_all(column)
-        return np.asarray(values[self._cells.fetch_all("I")])
+        return np.asarray(self._cells._plot_fetch_selected(column))
 
     def get_dtype(self, column: str) -> np.dtype[Any]:
         return cast(np.dtype[Any], self._cells._field_dtype(column))
@@ -86,6 +82,45 @@ class _FrozenRunPlotStore:
 
     def _stored_display_metadata(self, column: str) -> dict[str, Any] | None:
         return self.cells._field_display(column)
+
+
+def _require_run(
+    store: "DataStore",
+    run: object,
+    layout_key: object,
+    layout: object,
+    color_by: object,
+) -> tuple[PipelineRun, str]:
+    """Validate the arguments shared by run-backed embedding plots.
+
+    Returns the run and the name of its layout output.
+    """
+    if not isinstance(run, PipelineRun):
+        raise TypeError("run must be a PipelineRun")
+    if run._owner is not store:
+        raise ValueError("run must be opened from this datastore")
+    if layout_key is not None or isinstance(layout, ArtifactRef):
+        raise ValueError(
+            "run is mutually exclusive with layout_key or an ArtifactRef layout"
+        )
+    if layout is None:
+        layout_name = "umap"
+    elif isinstance(layout, str):
+        layout_name = layout
+    else:
+        raise TypeError("layout must name a pipeline output")
+    if not isinstance(color_by, str | type(None)):
+        raise TypeError("color_by must name a frozen cell field or be None")
+    return run, layout_name
+
+
+def _run_cells(run: PipelineRun, *fields: str | None) -> Any:
+    """Return a run's frozen cells after checking the requested fields exist."""
+    cells = run.cells
+    for field in fields:
+        if field is not None and field not in cells.columns:
+            raise KeyError(f"Pipeline run has no frozen cell field {field!r}")
+    return cells
 
 
 @cache
@@ -209,18 +244,9 @@ class DataStorePlotAccessor:
     ) -> "PlotResult":
         """Plot cells in a stored two-dimensional embedding."""
         if run is not None:
-            if not isinstance(run, PipelineRun):
-                raise TypeError("run must be a PipelineRun")
-            if run._owner is not self._store:
-                raise ValueError("run must be opened from this datastore")
-            if layout_key is not None or isinstance(layout, ArtifactRef):
-                raise ValueError(
-                    "run is mutually exclusive with layout_key or an ArtifactRef layout"
-                )
-            if layout is not None and not isinstance(layout, str):
-                raise TypeError("layout must name a pipeline output")
-            if not isinstance(color_by, str | type(None)):
-                raise TypeError("color_by must name a frozen cell field or be None")
+            run, layout_name = _require_run(
+                self._store, run, layout_key, layout, color_by
+            )
             if (
                 cell_key != "I"
                 or from_assay is not None
@@ -240,22 +266,14 @@ class DataStorePlotAccessor:
                 )
             if highlight is not None and highlight.by is not None:
                 raise ValueError("Run embedding highlights cannot use live metadata")
-            cells = run.cells
-            layout_ref = run["umap" if layout is None else layout]
-            if color_by is None:
-                resolved_color: str | None = None
-            elif color_by in cells.columns:
-                resolved_color = color_by
-            else:
-                raise KeyError(f"Pipeline run has no frozen cell field {color_by!r}")
+            cells = _run_cells(run, cast(str | None, color_by))
             # The live-only inputs validated above equal their canonical defaults.
             return self._forward(
                 PlotResult,
                 "embedding",
                 locals(),
                 store=_FrozenRunPlotStore(self._store, assay=run.assay, cells=cells),
-                layout=layout_ref,
-                color_by=resolved_color,
+                layout=run[layout_name],
             )
         if isinstance(layout, str):
             raise TypeError("String layout names require a pipeline run")
@@ -282,38 +300,19 @@ class DataStorePlotAccessor:
     ) -> "PlotResult":
         """Rasterize continuous cell metadata over a stored embedding."""
         if run is not None:
-            if not isinstance(run, PipelineRun):
-                raise TypeError("run must be a PipelineRun")
-            if run._owner is not self._store:
-                raise ValueError("run must be opened from this datastore")
-            if layout_key is not None or isinstance(layout, ArtifactRef):
-                raise ValueError(
-                    "run is mutually exclusive with layout_key or an ArtifactRef layout"
-                )
-            if layout is not None and not isinstance(layout, str):
-                raise TypeError("layout must name a pipeline output")
+            run, layout_name = _require_run(
+                self._store, run, layout_key, layout, color_by
+            )
             if cell_key != "I":
                 raise ValueError("Run raster uses the frozen pipeline cell selection")
-            if not isinstance(color_by, str | type(None)):
-                raise TypeError("color_by must name a frozen cell field or be None")
-            color_key = color_by
-            cells = run.cells
-            plot_store = _FrozenRunPlotStore(
-                self._store,
-                assay=run.assay,
-                cells=cells,
-            )
-            if color_key is not None and color_key not in cells.columns:
-                raise KeyError(f"Pipeline run has no frozen cell field {color_key!r}")
-            if subset_by is not None and subset_by not in cells.columns:
-                raise KeyError(f"Pipeline run has no frozen cell field {subset_by!r}")
+            cells = _run_cells(run, cast(str | None, color_by), subset_by)
             # layout_key and cell_key were validated to their canonical defaults.
             return self._forward(
                 PlotResult,
                 "embedding_raster",
                 locals(),
-                store=plot_store,
-                layout=run["umap" if layout is None else layout],
+                store=_FrozenRunPlotStore(self._store, assay=run.assay, cells=cells),
+                layout=run[layout_name],
             )
         if isinstance(layout, str):
             raise TypeError("String layout names require a pipeline run")

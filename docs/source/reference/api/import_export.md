@@ -43,9 +43,13 @@
 
 Use this before `H5adReader` when you do not know which matrix and metadata keys an H5AD file uses.
 
-`H5adReader` decodes AnnData categorical columns and pandas nullable columns.
+`H5adReader` decodes AnnData categorical columns and pandas nullable columns, including the
+nullable string arrays that AnnData writes for dataframe indexes. By default it reads the index
+that the dataframe's `_index` attribute names.
 Missing categorical or object values become `None`; missing numeric values become `NaN`.
-Unsupported group encodings are skipped with a warning.
+Unsupported group encodings and multi-dimensional columns are skipped with a warning.
+`H5adToZarr` keeps missing rows under a linked missing mask and stores nullable booleans as
+booleans.
 
 Pass `embedding_roles` and `cluster_keys` to select analytical H5AD values for artifact import.
 Selected `obsm` arrays and cluster labels are excluded from live metadata and returned as exact
@@ -53,9 +57,8 @@ refs by `H5adToZarr.dump()`. Other supported `obs` columns remain literal metada
 
 CSC input is converted to temporary row storage on local disk. Pass `temp_dir` to
 `H5adReader` or `H5adReader.from_inspect` to choose its parent directory; the default uses
-the system temporary directory, including `TMPDIR`. Cloned readers inherit this setting
-and share an existing conversion. The temporary files are removed when the last reader
-using them closes.
+the system temporary directory, including `TMPDIR`. The temporary files are removed when the
+reader closes.
 
 ```{eval-rst}
 .. autofunction:: scarf.inspect_h5ad
@@ -89,6 +92,9 @@ Pass one returned candidate to `MtxReader`.
 Import a serialized Seurat object from an `.rds` file.
 Inspect with `inspect_seurat`, open `SeuratReader`, then write with `SeuratToZarr`.
 This path does not attach to a live R session and does not read or write `.h5seurat`.
+Sidecar matrices such as BPCells directories and HDF5 files resolve inside `sidecar_root`, which
+defaults to the directory of the `.rds` file. A reader opened from a stream needs an explicit
+`sidecar_root` before it reads sidecar-backed layers.
 See {doc}`../../tutorials/import_and_export` for the worked contract and {doc}`../../seurat` for
 workflow mapping.
 
@@ -126,9 +132,14 @@ widths. Unset values stay under automatic planning from ``mem_budget`` and
 
 ## Writers
 
-Every writer owns the reserved metadata columns `ids`, `names` and `I`. Source cell or
-feature metadata columns with these names are skipped with a warning, so imported
-identifiers are never replaced.
+Every writer owns the reserved metadata columns `ids`, `names` and `I` and the
+`__scarf_missing__` prefix of missing-value masks. Source cell or feature metadata columns
+with these names are skipped with a warning, so imported identifiers are never replaced.
+The H5AD, Loom, CSV, Matrix Market, and Cell Ranger readers reject missing or repeated cell
+and feature IDs.
+
+Import writers take their assay type from the assay name. Pass `assay_type` (or
+`assay_types` on `CrToZarr`) to declare a custom-named assay as a preset such as `RNA`.
 
 ```{eval-rst}
 .. autoclass:: scarf.writers.CrToZarr
@@ -251,10 +262,21 @@ one input and gene symbols in another, pass `feature_key="names"` to match featu
 The merged feature IDs are then the names, and features that share a name within one input are
 summed.
 Feature annotation columns are merged when the inputs agree. A column whose values differ for a
-shared feature, such as per-dataset highly variable gene flags, is left out with a warning.
+shared feature, such as per-dataset highly variable gene flags, is left out with a warning. The same
+applies when features that share a name within one input disagree.
+Merged cell IDs are `{name}__{cell_id}`, so source names cannot contain `__`. Cell metadata columns
+keep their attributes when the inputs agree. Differing `levels` of an unordered categorical column
+become their union in first-seen order; any other differing attribute, including ordered levels, is
+dropped with a warning.
 RNA assays write both `counts` and a gene-major `countsT` copy, which roughly doubles stored counts for those assays.
 Non-RNA assays never write `countsT`.
+The destination must be empty or hold a merge written by `DataStoreMerge`. A destination that
+aliases, contains, or lies inside a source store, or that already holds other content, is refused.
+`overwrite=True` replaces only a merge-owned destination whose assays have not been prepared by
+opening it as a `DataStore`, and it clears the recorded default assay.
 Interrupted merges resume at whole-component boundaries (`cellData`, each assay `counts`, and each RNA `countsT`) rather than mid-matrix.
+A resume requires the same configuration and the same source counts; a completed `countsT` whose
+layout differs from the plan is not rewritten in place.
 
 ```{eval-rst}
 .. autoclass:: scarf.merge.DataStoreMerge

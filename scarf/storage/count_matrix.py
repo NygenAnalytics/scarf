@@ -185,6 +185,15 @@ def _largest_divisor_at_most(value: int, limit: int) -> int:
     return best
 
 
+def _shard_cells(n_cells: int, step: int, cell_bytes: int, unit_bytes: int) -> int:
+    """Return whole ``step`` cell blocks per shard within the unit byte target."""
+    steps = min(
+        math.ceil(n_cells / step),
+        max(1, unit_bytes // max(1, cell_bytes * step)),
+    )
+    return steps * step
+
+
 def _empty_plan(
     n_cells: int,
     n_feats: int,
@@ -330,27 +339,35 @@ def plan_count_matrix_pair(
         read_feature_limit,
         n_feats,
     )
-    counts_chunks = (counts_shard_cells, counts_chunk_feats)
-    counts_shards = (
-        counts_shard_cells,
-        _pad_to_multiple(n_feats, counts_chunk_feats),
-    )
-
     shard_feats = max(counts_chunk_feats, read_feats)
-    source_rows_per_shard = min(
-        math.ceil(n_cells / counts_shard_cells),
-        max(
-            1,
-            unit_bytes // max(1, shard_feats * counts_shard_cells * itemsize),
-        ),
+    shard_cells = _shard_cells(
+        n_cells, counts_shard_cells, shard_feats * itemsize, unit_bytes
     )
-    shard_cells = source_rows_per_shard * counts_shard_cells
     chunk_feats = read_feats
     chunk_cell_limit = max(
         1,
         chunk_bytes // max(1, chunk_feats * itemsize),
     )
     chunk_cells = _largest_divisor_at_most(shard_cells, chunk_cell_limit)
+    target_cells = min(chunk_cell_limit, shard_cells)
+    if 2 * chunk_cells < target_cells:
+        # An awkward shard extent, such as a prime cell count, has no divisor
+        # near the chunk target. Build the cell axis from whole target chunks
+        # instead: the larger of the counts row chunk and the countsT chunk is
+        # a multiple of the smaller, and the shard is a multiple of both.
+        if counts_shard_cells >= target_cells:
+            chunk_cells = target_cells
+            counts_shard_cells -= counts_shard_cells % chunk_cells
+            step = counts_shard_cells
+        else:
+            chunk_cells = target_cells - target_cells % counts_shard_cells
+            step = chunk_cells
+        shard_cells = _shard_cells(n_cells, step, shard_feats * itemsize, unit_bytes)
+    counts_chunks = (counts_shard_cells, counts_chunk_feats)
+    counts_shards = (
+        counts_shard_cells,
+        _pad_to_multiple(n_feats, counts_chunk_feats),
+    )
     counts_t_chunks = (chunk_feats, chunk_cells)
     counts_t_shards = (shard_feats, shard_cells)
 
@@ -441,29 +458,6 @@ def replay_count_matrix_plan(
         policy=policy,
         profile=profile,
     )
-
-
-def validate_count_matrix_pair(
-    plan: CountMatrixPairPlan,
-    *,
-    expected: CountMatrixPairPlan,
-) -> None:
-    if plan.fingerprint != expected.fingerprint:
-        raise ValueError("count matrix plan fingerprint does not match expected policy")
-    if plan.counts.shape != expected.counts.shape:
-        raise ValueError("counts shape mismatch")
-    if plan.countsT.shape != expected.countsT.shape:
-        raise ValueError("countsT shape mismatch")
-    if plan.counts.chunks != expected.counts.chunks:
-        raise ValueError("counts chunks mismatch")
-    if plan.counts.shards != expected.counts.shards:
-        raise ValueError("counts shards mismatch")
-    if plan.countsT.chunks != expected.countsT.chunks:
-        raise ValueError("countsT chunks mismatch")
-    if plan.countsT.shards != expected.countsT.shards:
-        raise ValueError("countsT shards mismatch")
-    if np.dtype(plan.counts.dtype) != np.dtype(expected.counts.dtype):
-        raise ValueError("counts dtype mismatch")
 
 
 def _array_geometry(

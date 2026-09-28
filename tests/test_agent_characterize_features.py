@@ -11,14 +11,12 @@ from scarf.agent.data_enrichment.characterization import (
     FeatureCharacterization,
     characterize_features,
 )
-from scarf.agent.data_enrichment.characterization import (
-    _assist_species,
-    _load_or_fetch_reference,
-    _sex_coefficient_note,
-)
+from scarf.agent.data_enrichment.characterization import _load_or_fetch_reference
 from scarf.datastore.datastore import DataStore
-from scarf.features.gene_reference import GeneReference, write_reference_fixture
+from scarf.features.gene_reference import GeneReference
 from scarf.writers import SparseToZarr
+
+from .gene_reference_fixtures import write_reference_fixture
 
 
 def _store(
@@ -96,12 +94,7 @@ def test_characterize_features_prefix_species_and_families(tmp_path: Path) -> No
             "ERCC-00002",
         ],
     )
-    result = characterize_features(
-        store,
-        cacheDir=cache,
-        allowDownload=False,
-        directions={"maxExogenousCandidates": 5},
-    )
+    result = characterize_features(store, cacheDir=cache, allowDownload=False)
     assert isinstance(result, FeatureCharacterization)
     assert result.status == "done"
     assay = result.assays[0]
@@ -116,6 +109,7 @@ def test_characterize_features_prefix_species_and_families(tmp_path: Path) -> No
     assert families["mitochondrial"]["defaultExclude"] is True
     assert families["histone"]["examples"] == ["HIST1H4A"]
     assert any(item["name"] == "ERCC-00002" for item in assay["exogenous"])
+    assert all(item["class"] == "unresolved" for item in assay["exogenous"])
     assert any(entry["kind"] == "sexChromosomeTracked" for entry in result.auditLog)
 
 
@@ -153,23 +147,6 @@ def test_characterize_features_backfill_when_names_are_ids(tmp_path: Path) -> No
     assert families["mitochondrial"]["examples"] == ["MT-CYB"]
 
 
-def test_characterize_features_directions_species(tmp_path: Path) -> None:
-    cache = _human_cache(tmp_path)
-    store = _store(
-        tmp_path,
-        feature_ids=["g1", "g2", "g3"],
-        feature_names=["ACTB", "GAPDH", "BRCA1"],
-    )
-    result = characterize_features(
-        store,
-        cacheDir=cache,
-        allowDownload=False,
-        directions={"speciesByAssay": {"RNA": "homo_sapiens"}},
-    )
-    assert result.assays[0]["species"] == "homo_sapiens"
-    assert result.assays[0]["speciesMethod"] == "directions"
-
-
 def test_characterize_features_unknown_species_skips_families(tmp_path: Path) -> None:
     store = _store(
         tmp_path,
@@ -202,76 +179,12 @@ def test_characterize_features_does_not_mutate_store(tmp_path: Path) -> None:
     assert list(store.RNA.feats.fetch_all("names")) == before_names
 
 
-def test_characterize_features_invalid_decision_is_audited(tmp_path: Path) -> None:
-    from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
-    from pydantic_ai.models.function import AgentInfo, FunctionModel
-
-    from scarf.agent.types import Decision
-
-    cache = tmp_path / "cache"
-    cache.mkdir()
-    write_reference_fixture(
-        cache / "homo_sapiens.tsv",
-        species="homo_sapiens",
-        release="test",
-        rows=[("ENSG00000075624", "ACTB", "7")],
-    )
-    write_reference_fixture(
-        cache / "mus_musculus.tsv",
-        species="mus_musculus",
-        release="test",
-        rows=[("ENSMUSG00000029580", "Actb", "5")],
-    )
-    store = _store(
-        tmp_path,
-        feature_ids=["ENSG00000075624", "ENSMUSG00000029580"],
-        feature_names=["ACTB", "Actb"],
-    )
-
-    def reply(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        tool = info.output_tools[0]
-        bad = Decision(
-            selectedId="species:not-a-species",
-            rationale="invalid",
-            evidenceIds=["species:homo_sapiens"],
-        )
-        return ModelResponse(
-            parts=[ToolCallPart(tool_name=tool.name, args=bad.model_dump())]
-        )
-
-    result = characterize_features(
-        store,
-        cacheDir=cache,
-        allowDownload=False,
-        model=FunctionModel(reply),
-    )
-    assert result.status == "done"
-    assert any(
-        entry["kind"] == "decisionInvalid" and entry.get("task") == "species"
-        for entry in result.auditLog
-    )
-
-
-def test_characterize_features_validates_assay_directions_before_loading() -> None:
+def test_characterize_features_validates_assays_before_loading() -> None:
     store = SimpleNamespace(assay_names=["RNA"])
 
     unknown_assay = characterize_features(store, assays=["ADT"])
     assert unknown_assay.status == "failed"
     assert unknown_assay.notes == ["unknown assays: ['ADT']"]
-
-    invalid_mapping = characterize_features(
-        store,
-        directions={"speciesByAssay": ["homo_sapiens"]},
-    )
-    assert invalid_mapping.status == "failed"
-    assert invalid_mapping.notes == ["speciesByAssay must be a mapping"]
-
-    unknown_direction = characterize_features(
-        store,
-        directions={"speciesByAssay": {"ADT": "homo_sapiens"}},
-    )
-    assert unknown_direction.status == "failed"
-    assert unknown_direction.notes == ["speciesByAssay cites unknown assays: ['ADT']"]
 
 
 def test_characterize_features_stops_after_non_rna_identity_audit(
@@ -302,32 +215,21 @@ def test_characterize_features_stops_after_non_rna_identity_audit(
 def test_characterize_features_audits_offline_unassessable_families(
     tmp_path: Path,
 ) -> None:
-    ids = ["ENSG90000000001", "ENSG90000000002"]
+    ids = ["ENSG90000000001", "ENSG90000000002", "ENSG90000000003"]
     store = _store(tmp_path, feature_ids=ids, feature_names=ids)
-    covariates = SimpleNamespace(coefficients=[{"name": "sex"}])
 
     result = characterize_features(
         store,
         cacheDir=tmp_path / "empty-cache",
         allowDownload=False,
-        covariates=covariates,
-        directions={
-            "speciesByAssay": {"RNA": "homo_sapiens"},
-            "maxExogenousCandidates": "many",
-        },
     )
 
     assert result.status == "done"
-    assert result.assays[0]["notes"] == [
-        "Prior covariate characterization marked 'sex' as a coefficient of "
-        "interest; tracked sex-chromosome genes must not be excluded later"
-    ]
+    assert result.assays[0]["species"] == "homo_sapiens"
     kinds = {entry["kind"] for entry in result.auditLog}
     assert {
         "referenceUnavailable",
         "familiesNotAssessable",
-        "sexCoefficientNote",
-        "invalidDirection",
         "exogenousUnresolved",
     } <= kinds
 
@@ -400,7 +302,7 @@ def test_reference_loading_audits_mocked_download_success_and_failure(
     assert "offline" in audit_log[0]["detail"]
 
 
-def test_reference_and_covariate_helpers_handle_noop_inputs(tmp_path: Path) -> None:
+def test_reference_loading_skips_unknown_species(tmp_path: Path) -> None:
     audit_log: list[dict] = []
     assert (
         _load_or_fetch_reference(
@@ -413,98 +315,6 @@ def test_reference_and_covariate_helpers_handle_noop_inputs(tmp_path: Path) -> N
         is None
     )
     assert audit_log == []
-    assert (
-        _sex_coefficient_note(
-            SimpleNamespace(coefficients=[{"name": "batch"}, "not-a-record"])
-        )
-        is None
-    )
-
-
-def test_species_assist_records_grounded_mock_model_decision() -> None:
-    from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
-    from pydantic_ai.models.function import AgentInfo, FunctionModel
-
-    from scarf.agent.types import Decision
-
-    def reply(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        tool = info.output_tools[0]
-        decision = Decision(
-            selectedId="species:homo_sapiens",
-            rationale="human overlap is stronger",
-            evidenceIds=["species:homo_sapiens"],
-        )
-        return ModelResponse(
-            parts=[ToolCallPart(tool_name=tool.name, args=decision.model_dump())]
-        )
-
-    decisions: list[dict] = []
-    audit_log: list[dict] = []
-    selected = _assist_species(
-        model=FunctionModel(reply),
-        unresolved={
-            "candidates": ["homo_sapiens", "mus_musculus"],
-            "overlap": {
-                "scores": {
-                    "homo_sapiens": {"hits": 5},
-                    "mus_musculus": {"hits": 3},
-                }
-            },
-            "prefixCounts": {},
-            "reason": "overlap is close",
-        },
-        context="mixed references",
-        decisions=decisions,
-        audit_log=audit_log,
-        assay="RNA",
-    )
-
-    assert selected == "homo_sapiens"
-    assert decisions[0]["task"] == "species"
-    assert decisions[0]["assay"] == "RNA"
-    assert audit_log == []
-
-
-def test_characterize_features_classifies_exogenous_with_mock_model(
-    tmp_path: Path,
-) -> None:
-    from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
-    from pydantic_ai.models.function import AgentInfo, FunctionModel
-
-    from scarf.agent.types import Decision
-
-    cache = _human_cache(tmp_path)
-    store = _store(
-        tmp_path,
-        feature_ids=["ENSG00000075624", "ERCC-00002"],
-        feature_names=["ACTB", "ERCC-00002"],
-    )
-
-    def reply(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        tool = info.output_tools[0]
-        decision = Decision(
-            selectedId="exogenous:potentialExogenous",
-            rationale="ERCC is a spike-in",
-            evidenceIds=["exogenous:potentialExogenous"],
-        )
-        return ModelResponse(
-            parts=[ToolCallPart(tool_name=tool.name, args=decision.model_dump())]
-        )
-
-    result = characterize_features(
-        store,
-        cacheDir=cache,
-        allowDownload=False,
-        directions={"speciesByAssay": {"RNA": "homo_sapiens"}},
-        model=FunctionModel(reply),
-    )
-
-    assert result.status == "done"
-    ercc = next(
-        item for item in result.assays[0]["exogenous"] if item["name"] == "ERCC-00002"
-    )
-    assert ercc["class"] == "potentialExogenous"
-    assert any(decision["task"] == "exogenous" for decision in result.decisions)
 
 
 def test_characterize_features_audits_reference_release_misses(
