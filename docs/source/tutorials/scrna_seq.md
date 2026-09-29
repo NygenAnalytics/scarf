@@ -57,7 +57,7 @@ the same broad lineage.
 ```{code-cell} ipython3
 cell_type_by_cluster = {
     "1": "CD14 monocytes",
-    "2": "FCGR3A monocytes",
+    "2": "monocytes",
     "3": "B cells",
     "4": "T cells",
     "5": "T cells",
@@ -71,7 +71,7 @@ cell_type_by_cluster = {
 }
 cell_type_order = (
     "CD14 monocytes",
-    "FCGR3A monocytes",
+    "monocytes",
     "B cells",
     "T cells",
     "NK cells",
