@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import h5py
 import httpx
 import numpy as np
 import pytest
@@ -29,10 +30,12 @@ from tests.fixtures_cytebase import (
     VERSION_ID,
     CytebaseBuild,
     FakeHub,
+    cellxgene_dataset,
     dataset_record,
     full_manifest,
     noop,
     source_details,
+    write_categorical,
     write_h5ad,
 )
 
@@ -408,6 +411,33 @@ def test_build_local_inspects_and_converts_a_registered_source(cytebase_build):
     assert (embedding / umap["artifact_id"]).is_dir()
     assert converted["qcSummary"]["active_cells"] == 6
     assert set(cytebase_build.record().timings) == {"inspectSeconds", "convertSeconds"}
+
+
+def test_build_local_drops_obs_columns_that_hdf5_nests(tmp_path):
+    source = write_h5ad(tmp_path / "source.h5ad")
+    with h5py.File(source, "r+") as h5:
+        # HDF5 splits a "/" in a column name into nested groups.
+        write_categorical(
+            h5["obs"], "Baseline eGFR (ml/min/1.73m2) (Binned)", ["30-60", ">60"] * 3
+        )
+    size, checksum = source_details(source)
+    record = DatasetRecord.model_validate(dataset_record())
+    store = tmp_path / "data.zarr"
+
+    manifest, converted = build.build_local(
+        record, source, store, cellxgene_dataset(), size, checksum, noop
+    )
+
+    assert converted["status"] == "done", converted
+    inspection = converted["inspection"]
+    assert inspection["h5ad_keys"]["obs"]["Baseline eGFR (ml"]["dtype"] == "unsupported"
+    assert "Baseline eGFR (ml" not in inspection["obs_summary"]
+    cell_data = zarr.open_group(LocalStore(store, read_only=True), mode="r")["cellData"]
+    columns = set(cell_data.keys())
+    assert {"cell_type", "donor_id"} <= columns
+    assert not any(name.startswith("Baseline eGFR") for name in columns)
+    verification = build.verify_store(str(store), manifest.model_dump(mode="json"))
+    assert verification["countsBlock"] == COUNTS[:3].tolist()
 
 
 def test_build_local_prefers_registration_metadata(tmp_path, monkeypatch):

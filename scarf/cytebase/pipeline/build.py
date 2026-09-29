@@ -16,9 +16,11 @@ import zarr
 
 import scarf
 from scarf import inspect_h5ad
+from scarf.readers._h5ad_columns import column_encoding, is_column
 from scarf.storage.count_matrix import require_count_matrix_layout
 from scarf.storage.profiles import is_remote_zarr_location
 from scarf.storage.stores import make_store
+from scarf.utils.logging import logger
 
 from .._storage import Bucket, dataset_prefix, retry
 from .models import DatasetRecord, Manifest
@@ -389,6 +391,27 @@ def _column_values(node: h5py.Group | h5py.Dataset) -> np.ndarray:
     raise ValueError(f"Unsupported metadata column encoding: {node.name}")
 
 
+def _obs_summary(obs: h5py.Group) -> dict[str, dict[str, Any]]:
+    """Summarize the obs columns that Scarf imports.
+
+    Children that are not decodable columns are skipped with the same warning
+    the H5AD reader logs, since conversion drops them too. A column name that
+    contains ``/`` is one: HDF5 nests it into groups.
+    """
+    summary = {}
+    for name, node in obs.items():
+        if name == "observation_joinid":
+            continue
+        if not is_column(node):
+            logger.warning(
+                f"Skipping obs column {name!r} because its H5AD encoding "
+                f"{column_encoding(node)!r} is not supported"
+            )
+            continue
+        summary[name] = _column_summary(node)
+    return summary
+
+
 def _column_summary(node: h5py.Group | h5py.Dataset) -> dict[str, Any]:
     values = _column_values(node)
     info = _column_info(node)
@@ -525,11 +548,7 @@ def inspect_file(
             },
             **{key: list(h5.get(key, {})) for key in ("obsm", "varm", "obsp", "uns")},
         }
-        obs_summary = {
-            name: _column_summary(node)
-            for name, node in h5["obs"].items()
-            if name != "observation_joinid"
-        }
+        obs_summary = _obs_summary(h5["obs"])
     return {
         "manifest": manifest,
         "h5ad_keys": h5ad_keys,

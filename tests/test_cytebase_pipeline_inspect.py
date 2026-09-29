@@ -27,6 +27,7 @@ from pydantic import ValidationError
 
 from scarf.cytebase.pipeline import build
 from scarf.cytebase.pipeline.models import Manifest
+from scarf.utils.logging import logger
 
 pytestmark = pytest.mark.usefixtures("cytebase_offline")
 
@@ -951,6 +952,35 @@ def test_inspect_file_without_usable_tables_reports_zero_dimensions(tmp_path):
     assert result["uns"] == {}
     assert result["obs_summary"] == {}
     assert "var" not in result["h5ad_keys"]
+
+
+# HDF5 nests a column whose name contains "/", as in some CELLxGENE sources.
+NESTED_COLUMN = "Baseline eGFR (ml/min/1.73m2) (Binned)"
+
+
+def test_inspect_file_skips_obs_children_that_are_not_columns(tmp_path):
+    clean = write_h5ad(tmp_path / "clean.h5ad")
+    path = write_h5ad(tmp_path / "source.h5ad")
+    with h5py.File(path, "r+") as h5:
+        write_categorical(h5["obs"], NESTED_COLUMN, ["30-60", ">60"] * 3)
+        h5["obs"].create_group("unsupported").create_dataset("x", data=np.arange(6))
+    messages: list[str] = []
+    handler = logger.add(messages.append, level="WARNING", format="{message}")
+    try:
+        result = build.inspect_file(path)
+    finally:
+        logger.remove(handler)
+
+    assert result["obs_summary"] == build.inspect_file(clean)["obs_summary"]
+    unsupported = {"dtype": "unsupported", "encoding": None, "categoryCount": None}
+    obs_keys = result["h5ad_keys"]["obs"]
+    assert obs_keys["Baseline eGFR (ml"] == obs_keys["unsupported"] == unsupported
+    assert [m.strip() for m in messages if "Skipping obs column" in m] == [
+        "Skipping obs column 'Baseline eGFR (ml' because its H5AD encoding "
+        "'unknown' is not supported",
+        "Skipping obs column 'unsupported' because its H5AD encoding "
+        "'unknown' is not supported",
+    ]
 
 
 def test_inspect_file_asks_for_input_when_scarf_picks_another_feature_table(
