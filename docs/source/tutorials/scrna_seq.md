@@ -61,13 +61,11 @@ cell_type_by_cluster = {
     "3": "B cells",
     "4": "T cells",
     "5": "T cells",
-    "6": "T cells",
-    "7": "NK cells",
-    "8": "NK cells",
-    "9": "T cells",
-    "10": "B cells",
-    "11": "pDC-like cells",
-    "12": "Platelets",
+    "6": "NK cells",
+    "7": "T cells",
+    "8": "T cells",
+    "9": "B cells",
+    "10": "pDC-like cells",
 }
 cell_type_order = (
     "CD14 monocytes",
@@ -76,7 +74,6 @@ cell_type_order = (
     "T cells",
     "NK cells",
     "pDC-like cells",
-    "Platelets",
 )
 
 cluster_values = np.asarray(run.cells.fetch("clusters"))
@@ -103,7 +100,7 @@ broad_markers = ds.get_markers(
 broad_best = (
     broad_markers[broad_markers["feature_name"].isin(
         ["CD14", "CDKN1C", "TCF7L2", "MS4A1", "CD3D", "NKG7",
-         "IL3RA", "PPBP", "IGHD", "IGHA1"]
+         "IL3RA", "IGHD", "IGHA1"]
     )]
     .sort_values("score", ascending=False)
     .groupby("feature_name", sort=False)
@@ -115,12 +112,11 @@ broad_best = (
 assert broad_best["CD14"] == "1"
 assert broad_best["CDKN1C"] == "2"
 assert broad_best["TCF7L2"] == "2"
-assert broad_best["MS4A1"] in {"3", "10"}
-assert broad_best["CD3D"] in {"4", "5", "6", "9"}
-assert broad_best["NKG7"] in {"7", "8"}
-assert broad_best["IL3RA"] == "11"
-assert broad_best["PPBP"] == "12"
-assert broad_best["IGHD"] == "10"
+assert broad_best["MS4A1"] in {"3", "9"}
+assert broad_best["CD3D"] in {"4", "5", "7", "8"}
+assert broad_best["NKG7"] == "6"
+assert broad_best["IL3RA"] == "10"
+assert broad_best["IGHD"] == "9"
 assert broad_best["IGHA1"] == "3"
 broad_best
 ```
@@ -140,8 +136,8 @@ ds.plots.embedding(
 )
 ```
 
-Monocytes, B cells, T cells, NK cells, a small pDC-like population, and smalller platelets
-occupy coherent neighbourhoods. UMAP position alone did not assign these names; the marker panel is the evidence.
+Monocytes, B cells, T cells, NK cells, and a small pDC-like population occupy coherent
+neighbourhoods. UMAP position alone did not assign these names; the marker panel is the evidence.
 
 ### Question: which markers support each label?
 
@@ -152,7 +148,6 @@ marker_panel = {
     "T cell": ["CD3D", "IL7R"],
     "NK cell": ["NKG7", "GNLY"],
     "pDC-like": ["GZMB", "JCHAIN"],
-    "Platelets": ["PPBP", "PTGS1"],
 }
 ds.plots.dotplot(
     features=marker_panel,
@@ -166,7 +161,7 @@ ds.plots.dotplot(
 
 The two monocyte labels share LST1 but separate along S100A8 and FCGR3A. MS4A1 and CD79A support
 B cells; CD3D and IL7R support T cells; NKG7 and GNLY support NK cells; GZMB with JCHAIN motivates
-the cautious pDC-like label; PPBP with PTGS1 marks the small platelet group. These remain dataset-specific teaching labels and should be reviewed.
+the cautious pDC-like label. These remain dataset-specific teaching labels and should be reviewed
 with additional positive and negative markers in a real study.
 
 ## Substitute your own input
