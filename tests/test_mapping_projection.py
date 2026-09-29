@@ -514,7 +514,7 @@ def test_projection_writer_aborts_after_invalid_block(
     with pytest.raises((TypeError, ValueError), match=message):
         writer.write_block(0, indices, distances, uninformative)
 
-    assert not inspect_artifact(root, plan.ref).complete
+    assert not inspect_artifact(root, plan.ref).exists
     with pytest.raises(RuntimeError, match="aborted"):
         writer.finish(_diagnostics())
 
@@ -539,7 +539,7 @@ def test_projection_writer_constructor_and_start_failures_leave_incomplete_artif
     )
     with pytest.raises(RuntimeError, match="injected array creation failure"):
         ProjectionWriter(root, first, chunk_rows=2)
-    assert not inspect_artifact(root, first.ref).complete
+    assert not inspect_artifact(root, first.ref).exists
 
     monkeypatch.undo()
     second = _plan(
@@ -554,7 +554,7 @@ def test_projection_writer_constructor_and_start_failures_leave_incomplete_artif
     with pytest.raises(TypeError, match="start must be an integer"):
         writer.write_block(True, indices[:1], distances[:1], uninformative[:1])
     _assert_aborted(writer)
-    assert not inspect_artifact(root, second.ref).complete
+    assert not inspect_artifact(root, second.ref).exists
 
 
 def test_projection_writer_requires_contiguous_complete_coverage_and_can_abort() -> (
@@ -570,7 +570,7 @@ def test_projection_writer_requires_contiguous_complete_coverage_and_can_abort()
     with pytest.raises(ValueError, match="wrote 2 of 4"):
         writer.finish(_diagnostics())
     _assert_aborted(writer)
-    assert not inspect_artifact(root, plan.ref).complete
+    assert not inspect_artifact(root, plan.ref).exists
 
     second_plan = _plan(
         root,
@@ -581,7 +581,7 @@ def test_projection_writer_requires_contiguous_complete_coverage_and_can_abort()
     )
     second = ProjectionWriter(root, second_plan, chunk_rows=2)
     second.abort()
-    assert not inspect_artifact(root, second_plan.ref).complete
+    assert not inspect_artifact(root, second_plan.ref).exists
     with pytest.raises(RuntimeError, match="aborted"):
         second.write_block(0, indices, distances, uninformative)
 
@@ -722,7 +722,7 @@ def test_projection_finish_rejects_diagnostics_inconsistent_with_rows() -> None:
     with pytest.raises(ValueError, match="number of uninformative"):
         writer.finish(_diagnostics(uninformative_cell_count=1))
 
-    assert not inspect_artifact(root, plan.ref).complete
+    assert not inspect_artifact(root, plan.ref).exists
 
 
 @pytest.mark.parametrize(
@@ -756,7 +756,7 @@ def test_projection_finish_rejects_invalid_diagnostics_and_aborts(
         writer.finish(diagnostics)
 
     _assert_aborted(writer)
-    assert not inspect_artifact(root, plan.ref).complete
+    assert not inspect_artifact(root, plan.ref).exists
 
 
 def _manual_projection(

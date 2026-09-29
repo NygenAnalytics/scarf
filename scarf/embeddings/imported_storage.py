@@ -1,4 +1,5 @@
 from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,9 +10,8 @@ from ..storage.arrays import create_metadata_column, create_numeric_array
 from ..storage.artifact_writer import (
     ArrayRequirement,
     PlannedArtifact,
-    finish_artifact,
+    artifact_transaction,
     plan_artifact,
-    start_artifact,
 )
 from ..storage.artifacts import (
     ValueFingerprintBuilder,
@@ -84,12 +84,11 @@ class ImportedArtifactStorage:
             reuse_validator=reuse_validator,
         )
 
-    def start(self, planned: PlannedArtifact) -> zarr.Group:
-        return start_artifact(self.root, planned)
-
-    @staticmethod
-    def finish(group: zarr.Group, planned: PlannedArtifact) -> None:
-        finish_artifact(group, planned)
+    def transaction(
+        self, planned: PlannedArtifact
+    ) -> AbstractContextManager[zarr.Group]:
+        """Start ``planned``; a failed write deletes its incomplete group."""
+        return artifact_transaction(self.root, planned)
 
     def artifact_group(self, ref: ArtifactRef) -> zarr.Group:
         return artifact_group(self.root, ref)

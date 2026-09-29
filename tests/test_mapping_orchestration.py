@@ -352,7 +352,7 @@ def test_plain_mapping_is_query_owned_and_reuses_exact_projection(
 
 
 @pytest.mark.parametrize("method", ["pca", "symphony"])
-def test_mapping_failure_leaves_projection_incomplete(
+def test_mapping_failure_discards_the_projection(
     analyzed_datastore_ephemeral,
     tmp_path,
     monkeypatch,
@@ -417,10 +417,8 @@ def test_mapping_failure_leaves_projection_incomplete(
         )
         - before
     )
-    assert len(created) == 1
-    failed = query.inspect_artifact(created.pop())
-    assert failed.exists
-    assert not failed.complete
+    # The aborted projection writer deletes its incomplete slot.
+    assert created == set()
 
 
 def test_mapping_rejects_reference_handles_forged_from_a_stored_reference(

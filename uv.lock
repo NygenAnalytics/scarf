@@ -4035,7 +4035,7 @@ requires-dist = [
     { name = "sphinx-tabs", marker = "extra == 'docs'" },
     { name = "sphinxcontrib-mermaid", marker = "extra == 'docs'", specifier = ">=2.1.0" },
     { name = "statsmodels", specifier = ">=0.14.5" },
-    { name = "threadpoolctl" },
+    { name = "threadpoolctl", specifier = ">=3.5.0" },
     { name = "topacedo", marker = "extra == 'docs'" },
     { name = "topacedo", marker = "extra == 'test'", specifier = ">=0.2.10" },
     { name = "tqdm", specifier = ">=4.60" },

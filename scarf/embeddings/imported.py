@@ -561,42 +561,41 @@ def write_imported_coordinates(
         ),
     )
     if not planned.reused:
-        group = storage.start(planned)
-        _write_numeric_payload(
-            storage,
-            group,
-            "data",
-            data_source,
-            fingerprints["data"],
-            block_rows,
-        )
-        if loading_source is not None:
+        with storage.transaction(planned) as group:
             _write_numeric_payload(
                 storage,
                 group,
-                "loadings",
-                loading_source,
-                fingerprints["loadings"],
+                "data",
+                data_source,
+                fingerprints["data"],
                 block_rows,
             )
-            assert feature_source is not None
-            _write_feature_ids(
-                storage,
-                group,
-                feature_source,
-                fingerprints["feature_ids"],
-                block_rows,
-            )
-        if stdev_source is not None:
-            _write_numeric_payload(
-                storage,
-                group,
-                "stdev",
-                stdev_source,
-                fingerprints["stdev"],
-                block_rows,
-            )
-        storage.finish(group, planned)
+            if loading_source is not None:
+                _write_numeric_payload(
+                    storage,
+                    group,
+                    "loadings",
+                    loading_source,
+                    fingerprints["loadings"],
+                    block_rows,
+                )
+                assert feature_source is not None
+                _write_feature_ids(
+                    storage,
+                    group,
+                    feature_source,
+                    fingerprints["feature_ids"],
+                    block_rows,
+                )
+            if stdev_source is not None:
+                _write_numeric_payload(
+                    storage,
+                    group,
+                    "stdev",
+                    stdev_source,
+                    fingerprints["stdev"],
+                    block_rows,
+                )
     validate_imported_coordinates_artifact(root, planned.ref)
     if selected_count != data_source.shape[0]:
         raise RuntimeError("Imported coordinate selection changed during writing")
@@ -740,15 +739,14 @@ def write_imported_embedding(
         ),
     )
     if not planned.reused:
-        group = storage.start(planned)
-        _write_numeric_payload(
-            storage,
-            group,
-            "values",
-            source,
-            fingerprints["values"],
-            block_rows,
-        )
-        storage.finish(group, planned)
+        with storage.transaction(planned) as group:
+            _write_numeric_payload(
+                storage,
+                group,
+                "values",
+                source,
+                fingerprints["values"],
+                block_rows,
+            )
     validate_imported_embedding_artifact(root, planned.ref)
     return planned.ref

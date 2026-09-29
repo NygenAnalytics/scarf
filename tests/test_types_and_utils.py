@@ -24,7 +24,7 @@ from scarf.utils import (
     compute_with_progress,
     tqdmbar,
 )
-from scarf.utils.arguments import integer_argument
+from scarf.utils.arguments import float_argument, integer_argument
 from scarf.utils.arrays import (
     _rolling_window_kernel,
     assay_feature_ranges,
@@ -359,6 +359,19 @@ def test_integer_argument_accepts_numpy_integers_and_checks_bounds():
         integer_argument(0, "count", minimum=1)
     with pytest.raises(ValueError, match="count must be at most 4"):
         integer_argument(5, "count", minimum=1, maximum=4)
+
+
+def test_float_argument_shares_one_value_across_numeric_spellings():
+    for value in (1, 1.0, np.int64(1), np.float32(1.0)):
+        resolved = float_argument(value, "ratio")
+        assert type(resolved) is float
+        assert resolved == 1.0
+    for value in (True, np.bool_(False), "1", None, 1j):
+        with pytest.raises(TypeError, match="ratio must be a real number"):
+            float_argument(value, "ratio")
+    for value in (float("nan"), float("inf"), np.float64(-np.inf)):
+        with pytest.raises(ValueError, match="ratio must be finite"):
+            float_argument(value, "ratio")
 
 
 def test_read_only_copy_owns_its_values_and_stays_read_only():

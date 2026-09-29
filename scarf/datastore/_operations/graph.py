@@ -64,10 +64,9 @@ from ...storage.arrays import (
 from ...storage.artifact_writer import (
     ArrayRequirement,
     PlannedArtifact,
-    finish_artifact,
+    artifact_transaction,
     plan_artifact,
     reused_artifact_group,
-    start_artifact,
 )
 from ...storage.artifacts import (
     ArtifactRef,
@@ -720,16 +719,17 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         )
         if not planned.reused:
             self._require_writable("run_normalization")
-            group = start_artifact(self.zw, planned)
-            relative_path = artifact_path(planned.ref).removeprefix(f"{assay_name}/")
-            assay._write_normalized_payload(
-                cell_idx,
-                np.flatnonzero(selections.featureMask),
-                relative_path,
-                log_transform=log_transform,
-                renormalize_subset=renormalize_subset,
-            )
-            finish_artifact(group, planned)
+            with artifact_transaction(self.zw, planned):
+                relative_path = artifact_path(planned.ref).removeprefix(
+                    f"{assay_name}/"
+                )
+                assay._write_normalized_payload(
+                    cell_idx,
+                    np.flatnonzero(selections.featureMask),
+                    relative_path,
+                    log_transform=log_transform,
+                    renormalize_subset=renormalize_subset,
+                )
         action = "Reused" if planned.reused else "Stored"
         logger.info(
             f"{action} normalized data for {n_cells} cells and {n_features} features"
@@ -1073,24 +1073,23 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 else:
                     mu = np.array([], dtype=np.float64)
                     sigma = np.array([], dtype=np.float64)
-                scaling_group = start_artifact(self.zw, scaling_plan)
-                mean_array = create_zarr_dataset(
-                    scaling_group,
-                    "mean",
-                    (100000,),
-                    "f8",
-                    mu.shape,
-                )
-                mean_array[:] = mu
-                scale_array = create_zarr_dataset(
-                    scaling_group,
-                    "scale",
-                    (100000,),
-                    "f8",
-                    sigma.shape,
-                )
-                scale_array[:] = sigma
-                finish_artifact(scaling_group, scaling_plan)
+                with artifact_transaction(self.zw, scaling_plan) as scaling_group:
+                    mean_array = create_zarr_dataset(
+                        scaling_group,
+                        "mean",
+                        (100000,),
+                        "f8",
+                        mu.shape,
+                    )
+                    mean_array[:] = mu
+                    scale_array = create_zarr_dataset(
+                        scaling_group,
+                        "scale",
+                        (100000,),
+                        "f8",
+                        sigma.shape,
+                    )
+                    scale_array[:] = sigma
             use_for_pca = (
                 pca_use_values if method == "pca" else np.ones(n_cells, dtype=bool)
             )
@@ -1121,56 +1120,55 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     f"{None if loadings is None else loadings.shape}; expected "
                     f"{(n_features, effective_dims)}"
                 )
-            reduction_group = start_artifact(self.zw, planned)
-            if method == "pca":
-                assert transform.center is not None
-                center_array = create_zarr_dataset(
-                    reduction_group,
-                    "center",
-                    (n_features,),
-                    "f8",
-                    (n_features,),
-                )
-                center_array[:] = transform.center
-            output = create_zarr_dataset(
-                reduction_group,
-                "loadings",
-                normalized_data.chunksize,
-                "f8",
-                loadings.shape,
-            )
-            output[:, :] = loadings
-            scores = create_numeric_array(
-                reduction_group,
-                "data",
-                score_spec,
-            )
-
-            def score_blocks() -> Iterator[np.ndarray]:
-                for block in normalized_data._stream_blocks(
-                    nthreads=self.nthreads,
-                    msg="Calculating reduced coordinates",
-                    prefetch=1,
-                    row_mask=None,
-                    resident_bytes=write_bytes
-                    + producer_bytes
-                    - normalized_data._block_task_bytes(),
-                ):
-                    yield np.asarray(
-                        transform.transform(block),
-                        dtype=np.float32,
+            with artifact_transaction(self.zw, planned) as reduction_group:
+                if method == "pca":
+                    assert transform.center is not None
+                    center_array = create_zarr_dataset(
+                        reduction_group,
+                        "center",
+                        (n_features,),
+                        "f8",
+                        (n_features,),
                     )
+                    center_array[:] = transform.center
+                output = create_zarr_dataset(
+                    reduction_group,
+                    "loadings",
+                    normalized_data.chunksize,
+                    "f8",
+                    loadings.shape,
+                )
+                output[:, :] = loadings
+                scores = create_numeric_array(
+                    reduction_group,
+                    "data",
+                    score_spec,
+                )
 
-            write_dense_from_row_batches(
-                scores,
-                score_blocks(),
-                dtype=np.float32,
-                msg="Writing reduced coordinates",
-                resources=self.resources,
-                io=self.storageIo,
-                producerReserveBytes=producer_bytes,
-            )
-            finish_artifact(reduction_group, planned)
+                def score_blocks() -> Iterator[np.ndarray]:
+                    for block in normalized_data._stream_blocks(
+                        nthreads=self.nthreads,
+                        msg="Calculating reduced coordinates",
+                        prefetch=1,
+                        row_mask=None,
+                        resident_bytes=write_bytes
+                        + producer_bytes
+                        - normalized_data._block_task_bytes(),
+                    ):
+                        yield np.asarray(
+                            transform.transform(block),
+                            dtype=np.float32,
+                        )
+
+                write_dense_from_row_batches(
+                    scores,
+                    score_blocks(),
+                    dtype=np.float32,
+                    msg="Writing reduced coordinates",
+                    resources=self.resources,
+                    io=self.storageIo,
+                    producerReserveBytes=producer_bytes,
+                )
         if show_elbow_plot and method == "pca":
             from ...plotting import elbow
 
@@ -1558,48 +1556,47 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 result.corrected.T,
                 result.assignments,
             )
-            group = start_artifact(self.zw, planned)
-            output = create_numeric_array(
-                group,
-                "data",
-                row_sharded_array_spec(
-                    corrected.shape,
-                    np.float32,
-                    profile=resolve_storage_profile(group.store),
-                    band_rows=min(n_cells, 1_000_000),
-                    zarr_format=_group_zarr_format(group),
-                    fill_value=0.0,
-                ),
-            )
-            for start, stop in iter_shard_row_slices(
-                n_cells,
-                array_shard_rows(output),
-            ):
-                shutdown_checkpoint()
-                output[start:stop, :] = np.asarray(
-                    result.corrected[:, start:stop].T,
-                    dtype=np.float32,
-                )
-            for name, values in (
-                ("cluster_mass", cluster_mass),
-                ("raw_centroids", raw_centroids),
-                ("corrected_centroids", corrected_centroids),
-                ("centroids", result.centroids),
-                ("sigma", result.sigma),
-                ("ridge", result.ridge),
-            ):
-                result_array = create_zarr_dataset(
+            with artifact_transaction(self.zw, planned) as group:
+                output = create_numeric_array(
                     group,
-                    name,
-                    tuple(max(int(size), 1) for size in values.shape),
-                    "f8",
-                    values.shape,
+                    "data",
+                    row_sharded_array_spec(
+                        corrected.shape,
+                        np.float32,
+                        profile=resolve_storage_profile(group.store),
+                        band_rows=min(n_cells, 1_000_000),
+                        zarr_format=_group_zarr_format(group),
+                        fill_value=0.0,
+                    ),
                 )
-                result_array[...] = values
-            group.attrs["batch_levels"] = [
-                list(levels) for levels in result.batch_levels
-            ]
-            finish_artifact(group, planned)
+                for start, stop in iter_shard_row_slices(
+                    n_cells,
+                    array_shard_rows(output),
+                ):
+                    shutdown_checkpoint()
+                    output[start:stop, :] = np.asarray(
+                        result.corrected[:, start:stop].T,
+                        dtype=np.float32,
+                    )
+                for name, values in (
+                    ("cluster_mass", cluster_mass),
+                    ("raw_centroids", raw_centroids),
+                    ("corrected_centroids", corrected_centroids),
+                    ("centroids", result.centroids),
+                    ("sigma", result.sigma),
+                    ("ridge", result.ridge),
+                ):
+                    result_array = create_zarr_dataset(
+                        group,
+                        name,
+                        tuple(max(int(size), 1) for size in values.shape),
+                        "f8",
+                        values.shape,
+                    )
+                    result_array[...] = values
+                group.attrs["batch_levels"] = [
+                    list(levels) for levels in result.batch_levels
+                ]
         action = "Reused" if planned.reused else "Stored"
         logger.info(
             f"{action} Harmony coordinates for {n_cells} cells with {dims} dimensions"
@@ -1694,24 +1691,23 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 kmeans_sampling=resolved_kmeans_sampling,
                 kmeans_batch_size=effective_kmeans_batch_size,
             )
-            group = start_artifact(self.zw, planned)
-            centers = create_zarr_dataset(
-                group,
-                "cluster_centers",
-                (1000, 1000),
-                "f8",
-                initialization.model.cluster_centers_.shape,
-            )
-            centers[:, :] = initialization.model.cluster_centers_
-            labels = create_zarr_dataset(
-                group,
-                "cluster_labels",
-                (100000,),
-                np.uint32,
-                initialization.labels.shape,
-            )
-            labels[:] = initialization.labels
-            finish_artifact(group, planned)
+            with artifact_transaction(self.zw, planned) as group:
+                centers = create_zarr_dataset(
+                    group,
+                    "cluster_centers",
+                    (1000, 1000),
+                    "f8",
+                    initialization.model.cluster_centers_.shape,
+                )
+                centers[:, :] = initialization.model.cluster_centers_
+                labels = create_zarr_dataset(
+                    group,
+                    "cluster_labels",
+                    (100000,),
+                    np.uint32,
+                    initialization.labels.shape,
+                )
+                labels[:] = initialization.labels
         action = "Reused" if planned.reused else "Stored"
         logger.info(
             f"{action} embedding initialization with {effective_clusters} centroids"
@@ -1859,16 +1855,15 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 rand_state=resolved_rand_state,
                 nthreads=(self.nthreads if ann_parallel else 1),
             )
-            group = start_artifact(self.zw, planned)
-            save_ann_index(
-                group,
-                ann_idx,
-                profile=self.storageProfile,
-                metric=ann_metric,
-                dimensions=dims,
-                element_count=n_cells,
-            )
-            finish_artifact(group, planned)
+            with artifact_transaction(self.zw, planned) as group:
+                save_ann_index(
+                    group,
+                    ann_idx,
+                    profile=self.storageProfile,
+                    metric=ann_metric,
+                    dimensions=dims,
+                    element_count=n_cells,
+                )
         action = "Reused" if planned.reused else "Stored"
         logger.info(f"{action} ANN index for {n_cells} cells")
         return planned.ref
@@ -2014,40 +2009,39 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 raise ValueError(
                     f"Coordinate source contains {start} rows, expected {n_cells}"
                 )
-            group = start_artifact(self.zw, planned)
-            array_profile = resolve_storage_profile(group.store)
-            zarr_format = _group_zarr_format(group)
-            indices_array = create_numeric_array(
-                group,
-                "indices",
-                row_sharded_array_spec(
-                    indices.shape,
-                    np.uint32,
-                    profile=array_profile,
-                    band_rows=min(n_cells, 1_000_000),
-                    zarr_format=zarr_format,
-                ),
-            )
-            distances_array = create_numeric_array(
-                group,
-                "distances",
-                row_sharded_array_spec(
-                    distances.shape,
-                    np.float32,
-                    profile=array_profile,
-                    band_rows=min(n_cells, 1_000_000),
-                    zarr_format=zarr_format,
-                    fill_value=0.0,
-                ),
-            )
-            indices_array[:, :] = indices
-            distances_array[:, :] = distances
-            group.attrs["n_cells"] = n_cells
-            group.attrs["n_neighbors"] = effective_k
-            group.attrs["self_hit_rate"] = (
-                100.0 * (n_cells - missed_self_hits) / n_cells
-            )
-            finish_artifact(group, planned)
+            with artifact_transaction(self.zw, planned) as group:
+                array_profile = resolve_storage_profile(group.store)
+                zarr_format = _group_zarr_format(group)
+                indices_array = create_numeric_array(
+                    group,
+                    "indices",
+                    row_sharded_array_spec(
+                        indices.shape,
+                        np.uint32,
+                        profile=array_profile,
+                        band_rows=min(n_cells, 1_000_000),
+                        zarr_format=zarr_format,
+                    ),
+                )
+                distances_array = create_numeric_array(
+                    group,
+                    "distances",
+                    row_sharded_array_spec(
+                        distances.shape,
+                        np.float32,
+                        profile=array_profile,
+                        band_rows=min(n_cells, 1_000_000),
+                        zarr_format=zarr_format,
+                        fill_value=0.0,
+                    ),
+                )
+                indices_array[:, :] = indices
+                distances_array[:, :] = distances
+                group.attrs["n_cells"] = n_cells
+                group.attrs["n_neighbors"] = effective_k
+                group.attrs["self_hit_rate"] = (
+                    100.0 * (n_cells - missed_self_hits) / n_cells
+                )
         action = "Reused" if planned.reused else "Stored"
         logger.info(f"{action} {effective_k} neighbors for each of {n_cells} cells")
         return planned.ref
@@ -2124,38 +2118,37 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 local_connectivity=local_connectivity,
                 bandwidth=bandwidth,
             )
-            output = start_artifact(self.zw, planned)
-            profile = resolve_storage_profile(output.store)
-            zarr_format = _group_zarr_format(output)
-            edge_band_rows = min(n_cells, 1_000_000) * n_neighbors
-            edges = create_numeric_array(
-                output,
-                "edges",
-                row_sharded_array_spec(
-                    edge_values.shape,
-                    np.uint32,
-                    profile=profile,
-                    band_rows=edge_band_rows,
-                    zarr_format=zarr_format,
-                ),
-            )
-            weights = create_numeric_array(
-                output,
-                "weights",
-                row_sharded_array_spec(
-                    weight_values.shape,
-                    np.float32,
-                    profile=profile,
-                    band_rows=edge_band_rows,
-                    zarr_format=zarr_format,
-                    fill_value=0.0,
-                ),
-            )
-            edges[:, :] = edge_values
-            weights[:] = weight_values
-            output.attrs["n_cells"] = n_cells
-            output.attrs["n_neighbors"] = n_neighbors
-            finish_artifact(output, planned)
+            with artifact_transaction(self.zw, planned) as output:
+                profile = resolve_storage_profile(output.store)
+                zarr_format = _group_zarr_format(output)
+                edge_band_rows = min(n_cells, 1_000_000) * n_neighbors
+                edges = create_numeric_array(
+                    output,
+                    "edges",
+                    row_sharded_array_spec(
+                        edge_values.shape,
+                        np.uint32,
+                        profile=profile,
+                        band_rows=edge_band_rows,
+                        zarr_format=zarr_format,
+                    ),
+                )
+                weights = create_numeric_array(
+                    output,
+                    "weights",
+                    row_sharded_array_spec(
+                        weight_values.shape,
+                        np.float32,
+                        profile=profile,
+                        band_rows=edge_band_rows,
+                        zarr_format=zarr_format,
+                        fill_value=0.0,
+                    ),
+                )
+                edges[:, :] = edge_values
+                weights[:] = weight_values
+                output.attrs["n_cells"] = n_cells
+                output.attrs["n_neighbors"] = n_neighbors
         action = "Reused" if planned.reused else "Stored"
         logger.info(f"{action} connectivity map for {n_cells} cells")
         return planned.ref
@@ -2478,38 +2471,37 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         n_cells = merged_graph.shape[0]
         n_neighbors = int(merged_graph.size / n_cells)
 
-        store = start_artifact(self.zw, integrated_plan)
-        store.attrs["n_cells"] = n_cells
-        store.attrs["n_neighbors"] = n_neighbors
-        store.attrs["assays"] = list(assays)
+        with artifact_transaction(self.zw, integrated_plan) as store:
+            store.attrs["n_cells"] = n_cells
+            store.attrs["n_neighbors"] = n_neighbors
+            store.attrs["assays"] = list(assays)
 
-        edge_chunk = chunk_size * n_neighbors
-        zge = create_zarr_dataset(
-            store,
-            "edges",
-            (edge_chunk,),
-            np.uint32,
-            (n_cells * n_neighbors, 2),
-        )
-        zgw = create_zarr_dataset(
-            store,
-            "weights",
-            (edge_chunk,),
-            np.float32,
-            (n_cells * n_neighbors,),
-        )
-
-        zge[:, 0] = merged_graph.row
-        zge[:, 1] = merged_graph.col
-        zgw[:] = merged_graph.data
-        if modality_weights is not None:
-            stored_modality_weights = create_zarr_dataset(
+            edge_chunk = chunk_size * n_neighbors
+            zge = create_zarr_dataset(
                 store,
-                "modality_weights",
-                (min(chunk_size, n_cells), len(assays)),
-                np.float32,
-                modality_weights.shape,
+                "edges",
+                (edge_chunk,),
+                np.uint32,
+                (n_cells * n_neighbors, 2),
             )
-            stored_modality_weights[:, :] = modality_weights
-        finish_artifact(store, integrated_plan)
+            zgw = create_zarr_dataset(
+                store,
+                "weights",
+                (edge_chunk,),
+                np.float32,
+                (n_cells * n_neighbors,),
+            )
+
+            zge[:, 0] = merged_graph.row
+            zge[:, 1] = merged_graph.col
+            zgw[:] = merged_graph.data
+            if modality_weights is not None:
+                stored_modality_weights = create_zarr_dataset(
+                    store,
+                    "modality_weights",
+                    (min(chunk_size, n_cells), len(assays)),
+                    np.float32,
+                    modality_weights.shape,
+                )
+                stored_modality_weights[:, :] = modality_weights
         return integrated_plan.ref

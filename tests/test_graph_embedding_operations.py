@@ -41,11 +41,11 @@ _STANDARD_UMAP_PARAMETERS = {
     "graph_upper_only": False,
     "umap_dims": 2,
     "spread": 2.0,
-    "min_dist": 1,
+    "min_dist": 1.0,
     "n_epochs": 300,
     "repulsion_strength": 1.0,
     "initial_alpha": 1.0,
-    "negative_sample_rate": 5,
+    "negative_sample_rate": 5.0,
     "use_density_map": False,
     "dens_lambda": 2.0,
     "dens_frac": 0.3,
@@ -238,10 +238,44 @@ def test_standard_umap_arguments_keep_their_recorded_identity() -> None:
 
     assert arguments.to_record().parameters == _STANDARD_UMAP_PARAMETERS
     assert _identity(arguments) == (
-        "56a2875652e4dfb859ad7e93d67b38ac422ede7405297d6fb0fa6a44deef16ec"
+        "69bc2f0b8b33b09e4cce0f2a73d1b3cd4ef1f5002a409a2e042c9ec8f671aed5"
     )
     with pytest.raises(ValueError, match="densmap_algorithm_version"):
         dataclasses.replace(arguments, use_density_map=True)
+
+
+def test_umap_parameter_spellings_share_one_canonical_identity(store) -> None:
+    graph = _graph(store)
+    initialization = _initialization(store)
+
+    first = store.run_umap(
+        graph, initialization, n_epochs=5, spread=2, min_dist=1, dens_frac=0.3
+    )
+    parameters = store.inspect_artifact(first).parameters
+    assert parameters is not None
+    for name in ("spread", "min_dist", "negative_sample_rate", "initial_alpha"):
+        assert type(parameters[name]) is float
+    assert type(parameters["n_epochs"]) is int
+    assert (
+        store.run_umap(
+            graph,
+            initialization,
+            n_epochs=np.int64(5),
+            spread=np.float32(2.0),
+            min_dist=1.0,
+            negative_sample_rate=np.int32(5),
+            random_seed=np.uint16(4444),
+        )
+        == first
+    )
+    for kwargs, error, message in (
+        ({"min_dist": True}, TypeError, "min_dist must be a real number"),
+        ({"spread": float("nan")}, ValueError, "spread must be finite"),
+        ({"n_epochs": 5.0}, TypeError, "n_epochs must be an integer"),
+        ({"parallel": 1}, TypeError, "parallel must be a boolean"),
+    ):
+        with pytest.raises(error, match=message):
+            store.run_umap(graph, initialization, **kwargs)
 
 
 def test_densmap_records_its_revision_and_reuses_without_reading_neighbors(

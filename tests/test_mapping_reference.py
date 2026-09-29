@@ -660,8 +660,8 @@ def test_mapping_reference_validates_payload_before_finish(
         )
         - before
     )
-    assert len(created) == 1
-    assert not datastore.inspect_artifact(created.pop()).complete
+    # A failed write deletes its incomplete slot.
+    assert created == set()
 
 
 @pytest.mark.parametrize("array_name", ["loadings", "center"])
@@ -706,8 +706,8 @@ def test_mapping_reference_rejects_source_mutation_during_publication(
         )
         - before
     )
-    assert len(created) == 1
-    assert not datastore.inspect_artifact(created.pop()).complete
+    # A failed write deletes its incomplete slot.
+    assert created == set()
 
 
 def test_mapping_reference_rejects_corrupt_neighbor_payload_on_build_and_load(

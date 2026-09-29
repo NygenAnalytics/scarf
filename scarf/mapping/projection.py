@@ -12,6 +12,7 @@ from ..storage.artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
     PlannedArtifact,
+    discard_artifact,
     finish_artifact,
     plan_artifact,
     start_artifact,
@@ -159,8 +160,7 @@ class ProjectionWriter:
                 profile=profile,
             )
         except BaseException:
-            self._group.attrs["complete"] = False
-            self._aborted = True
+            self._discard()
             raise
 
     @property
@@ -230,8 +230,7 @@ class ProjectionWriter:
             self._next_row = stop
             self._uninformative_count += int(np.count_nonzero(uninformative_values))
         except BaseException:
-            self._group.attrs["complete"] = False
-            self._aborted = True
+            self._discard()
             raise
 
     def finish(self, diagnostics: Mapping[str, Any]) -> ArtifactRef:
@@ -258,18 +257,21 @@ class ProjectionWriter:
             )
             finish_artifact(self._group, self._plan.artifact)
         except BaseException:
-            self._group.attrs["complete"] = False
-            self._aborted = True
+            self._discard()
             raise
         self._finished = True
         return self._plan.ref
 
     def abort(self) -> None:
-        """Leave an unfinished projection explicitly incomplete."""
+        """Delete an unfinished projection's incomplete artifact."""
         if self._finished:
             raise RuntimeError("A completed projection artifact cannot be aborted")
-        self._group.attrs["complete"] = False
-        self._aborted = True
+        self._discard()
+
+    def _discard(self) -> None:
+        if not self._aborted:
+            self._aborted = True
+            discard_artifact(self._root, self._plan.artifact)
 
     def _require_open(self) -> None:
         if self._finished:

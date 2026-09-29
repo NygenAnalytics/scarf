@@ -15,10 +15,9 @@ from .arrays import (
 )
 from .artifact_writer import (
     ArrayRequirement,
-    finish_artifact,
+    artifact_transaction,
     plan_artifact,
     reused_artifact_group,
-    start_artifact,
 )
 from .artifacts import (
     ArtifactRef,
@@ -641,22 +640,21 @@ def resolve_stored_selection(
             reused_artifact_group(root, planned)["values"], name="values"
         )
     else:
-        group = start_artifact(root, planned)
-        values = create_metadata_column(
-            group,
-            "values",
-            dtype=bool,
-            shape=int(source.shape[0]),
-            chunkSize=row_band(array_geometry(source), unit="chunk", fallback=1),
-            overwrite=True,
-        )
-        block_rows = scan_band(array_geometry(source), fallback=1)
-        for start in range(0, int(source.shape[0]), block_rows):
-            stop = min(start + block_rows, int(source.shape[0]))
-            values[start:stop] = source[start:stop]
-        if _stored_selection_fingerprint(values) != values_fingerprint:
-            raise RuntimeError("Selection source changed while it was copied")
-        finish_artifact(group, planned)
+        with artifact_transaction(root, planned) as group:
+            values = create_metadata_column(
+                group,
+                "values",
+                dtype=bool,
+                shape=int(source.shape[0]),
+                chunkSize=row_band(array_geometry(source), unit="chunk", fallback=1),
+                overwrite=True,
+            )
+            block_rows = scan_band(array_geometry(source), fallback=1)
+            for start in range(0, int(source.shape[0]), block_rows):
+                stop = min(start + block_rows, int(source.shape[0]))
+                values[start:stop] = source[start:stop]
+            if _stored_selection_fingerprint(values) != values_fingerprint:
+                raise RuntimeError("Selection source changed while it was copied")
     return ValidatedStoredSelection(
         ref=planned.ref,
         values=values,
@@ -727,17 +725,18 @@ def resolve_generated_selection_artifact(
         group = reused_artifact_group(root, planned)
         stored = as_zarr_array(group["values"], name="values")
         return planned.ref, np.asarray(stored[:], dtype=bool)
-    group = start_artifact(root, planned)
-    output = create_metadata_column(
-        group,
-        "values",
-        data=mask,
-        dtype=bool,
-        overwrite=True,
-    )
-    if _stored_selection_fingerprint(output) != values_fingerprint:
-        raise RuntimeError("Generated selection payload changed while it was stored")
-    finish_artifact(group, planned)
+    with artifact_transaction(root, planned) as group:
+        output = create_metadata_column(
+            group,
+            "values",
+            data=mask,
+            dtype=bool,
+            overwrite=True,
+        )
+        if _stored_selection_fingerprint(output) != values_fingerprint:
+            raise RuntimeError(
+                "Generated selection payload changed while it was stored"
+            )
     return planned.ref, mask
 
 
@@ -1126,52 +1125,54 @@ def snapshot_run_metadata(
     if planned.reused:
         return planned.ref
 
-    group = start_artifact(root, planned)
-    for column in sources:
-        chunk_rows = _snapshot_block_rows(
-            *(
-                (column.values, column.missing)
-                if column.missing is not None
-                else (column.values,)
+    with artifact_transaction(root, planned) as group:
+        for column in sources:
+            chunk_rows = _snapshot_block_rows(
+                *(
+                    (column.values, column.missing)
+                    if column.missing is not None
+                    else (column.values,)
+                )
             )
-        )
-        output = create_metadata_column(
-            group,
-            column.name,
-            dtype=column.dtype,
-            shape=int(column.values.shape[0]),
-            chunkSize=chunk_rows,
-            overwrite=True,
-        )
-        missing_output: zarr.Array | None = None
-        if column.missing is not None:
-            missing_name = f"{MISSING_MASK_PREFIX}{column.name}"
-            missing_output = create_metadata_column(
+            output = create_metadata_column(
                 group,
-                missing_name,
-                dtype=bool,
-                shape=int(column.missing.shape[0]),
+                column.name,
+                dtype=column.dtype,
+                shape=int(column.values.shape[0]),
                 chunkSize=chunk_rows,
                 overwrite=True,
             )
-            output.attrs["missing_mask"] = missing_name
-        for start in range(0, int(column.values.shape[0]), chunk_rows):
-            stop = min(start + chunk_rows, int(column.values.shape[0]))
-            output[start:stop] = _snapshot_values_block(
-                column.values,
-                start,
-                stop,
-                column.dtype,
-            )
-            if missing_output is not None and column.missing is not None:
-                missing_output[start:stop] = column.missing[start:stop]
-        if _fingerprint_snapshot_column(output, missing_output) != column.fingerprint:
-            raise RuntimeError(
-                f"Snapshot column {column.name!r} changed while it was copied"
-            )
-    if fingerprint_stored_strings(row_ids) != ordered_row_ids_fingerprint:
-        raise RuntimeError("Snapshot row IDs changed while metadata was copied")
-    finish_artifact(group, planned)
+            missing_output: zarr.Array | None = None
+            if column.missing is not None:
+                missing_name = f"{MISSING_MASK_PREFIX}{column.name}"
+                missing_output = create_metadata_column(
+                    group,
+                    missing_name,
+                    dtype=bool,
+                    shape=int(column.missing.shape[0]),
+                    chunkSize=chunk_rows,
+                    overwrite=True,
+                )
+                output.attrs["missing_mask"] = missing_name
+            for start in range(0, int(column.values.shape[0]), chunk_rows):
+                stop = min(start + chunk_rows, int(column.values.shape[0]))
+                output[start:stop] = _snapshot_values_block(
+                    column.values,
+                    start,
+                    stop,
+                    column.dtype,
+                )
+                if missing_output is not None and column.missing is not None:
+                    missing_output[start:stop] = column.missing[start:stop]
+            if (
+                _fingerprint_snapshot_column(output, missing_output)
+                != column.fingerprint
+            ):
+                raise RuntimeError(
+                    f"Snapshot column {column.name!r} changed while it was copied"
+                )
+        if fingerprint_stored_strings(row_ids) != ordered_row_ids_fingerprint:
+            raise RuntimeError("Snapshot row IDs changed while metadata was copied")
     return planned.ref
 
 
@@ -1229,13 +1230,12 @@ def resolve_metadata_snapshot(
     )
     if planned.reused:
         return planned.ref
-    group = start_artifact(root, planned)
-    create_metadata_column(
-        group,
-        "values",
-        data=stored_values,
-        dtype=stored_values.dtype,
-        overwrite=True,
-    )
-    finish_artifact(group, planned)
+    with artifact_transaction(root, planned) as group:
+        create_metadata_column(
+            group,
+            "values",
+            data=stored_values,
+            dtype=stored_values.dtype,
+            overwrite=True,
+        )
     return planned.ref

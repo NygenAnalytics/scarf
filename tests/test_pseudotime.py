@@ -670,7 +670,7 @@ def test_trajectory_feature_producers_refuse_read_only_stores_before_computing(
         )
 
 
-def test_marker_identity_change_during_computation_leaves_artifact_incomplete(
+def test_marker_identity_change_during_computation_discards_the_artifact(
     datastore,
     pseudotime_scoring,
     detected_features,
@@ -720,11 +720,11 @@ def test_marker_identity_change_during_computation_leaves_artifact_incomplete(
         )
         - before
     )
-    assert len(created) == 1
-    assert not datastore.inspect_artifact(created.pop()).complete
+    # A failed write deletes its incomplete slot.
+    assert created == set()
 
 
-def test_marker_normalization_change_during_computation_leaves_artifact_incomplete(
+def test_marker_normalization_change_during_computation_discards_the_artifact(
     datastore,
     pseudotime_scoring,
     detected_features,
@@ -772,11 +772,11 @@ def test_marker_normalization_change_during_computation_leaves_artifact_incomple
         )
         - before
     )
-    assert len(created) == 1
-    assert not datastore.inspect_artifact(created.pop()).complete
+    # A failed write deletes its incomplete slot.
+    assert created == set()
 
 
-def test_aggregation_normalization_change_leaves_artifact_incomplete(
+def test_aggregation_normalization_change_discards_the_artifact(
     datastore,
     pseudotime_scoring,
     detected_features,
@@ -825,8 +825,8 @@ def test_aggregation_normalization_change_leaves_artifact_incomplete(
         )
         - before
     )
-    assert len(created) == 1
-    assert not datastore.inspect_artifact(created.pop()).complete
+    # A failed write deletes its incomplete slot.
+    assert created == set()
 
 
 def test_incomplete_pseudotime_marker_artifact_is_recomputed(

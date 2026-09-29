@@ -36,8 +36,7 @@ class UmapArguments(OperationArguments):
     parallel: bool = parameter()
     parallel_threads: int | None = parameter()
     invalidate_cache: bool = execution()
-    # Only densMAP records carry its algorithm revision, so standard UMAP
-    # identities are unchanged.
+    # Only densMAP records carry its algorithm revision.
     densmap_algorithm_version: str | None = parameter(None, omit_if_none=True)
 
     def __post_init__(self) -> None:

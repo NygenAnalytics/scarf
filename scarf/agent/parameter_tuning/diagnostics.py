@@ -24,9 +24,8 @@ from ...storage.arrays import create_zarr_dataset
 from ...storage.artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
-    finish_artifact,
+    artifact_transaction,
     plan_artifact,
-    start_artifact,
 )
 from ...storage.artifacts import fingerprint_stored_arrays
 from ...storage.feature_selection import read_feature_selection_indices
@@ -744,26 +743,25 @@ def _write_pca_diagnostic(
         "covariate_association": associations,
     }
     if not planned.reused:
-        group = start_artifact(store.zw, planned)
-        for name, values in payload.items():
-            chunks = tuple(max(1, min(size, 4096)) for size in values.shape)
-            array = create_zarr_dataset(
+        with artifact_transaction(store.zw, planned) as group:
+            for name, values in payload.items():
+                chunks = tuple(max(1, min(size, 4096)) for size in values.shape)
+                array = create_zarr_dataset(
+                    group,
+                    name,
+                    chunks,
+                    values.dtype,
+                    values.shape,
+                )
+                array[:] = values
+            group.attrs["family_names"] = list(family_masks)
+            group.attrs["covariate_columns"] = list(covariate_columns)
+            group.attrs["covariate_roles"] = list(covariate_roles)
+            group.attrs["covariate_support"] = covariate_support
+            group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
                 group,
-                name,
-                chunks,
-                values.dtype,
-                values.shape,
+                _PCA_DIAGNOSTIC_ARRAYS,
             )
-            array[:] = values
-        group.attrs["family_names"] = list(family_masks)
-        group.attrs["covariate_columns"] = list(covariate_columns)
-        group.attrs["covariate_roles"] = list(covariate_roles)
-        group.attrs["covariate_support"] = covariate_support
-        group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
-            group,
-            _PCA_DIAGNOSTIC_ARRAYS,
-        )
-        finish_artifact(group, planned)
     return (
         planned.ref,
         component_variance,

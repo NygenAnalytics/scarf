@@ -253,7 +253,12 @@ The complete hard-break inventory is:
   `p_value_method` fail to load with a request to recompute. A `StudyDesign`
   pairing column applies only to the paired Wilcoxon test.
 - densMAP embeddings symmetrize neighbor distances and record `densmap_algorithm_version`, so
-  earlier densMAP artifacts are not reused. Standard UMAP identities are unchanged.
+  earlier densMAP artifacts are not reused.
+- `run_umap` records float parameters as floats and integer parameters as Python integers, so
+  `min_dist=1` and `min_dist=1.0` identify the same embedding. The defaults `min_dist=1` and
+  `negative_sample_rate=5` were recorded as integers, so every saved UMAP embedding recomputes on
+  its next run. Numeric parameters reject booleans and non-finite values, `umap_dims`, `n_epochs`,
+  and `random_seed` must be integers, and `parallel` and `use_density_map` must be booleans.
 - Clustering inputs are canonical and strict. `run_leiden_clustering` records resolutions as finite
   positive floats and requires a non-negative integer `random_seed`. Paris is never refitted
   silently: a reused hierarchy that cannot be read raises
@@ -319,8 +324,9 @@ The complete hard-break inventory is:
 - Operations trust that prepared counts and artifacts do not change during a call. Writing to
   prepared data in place is outside the contract and is not detected.
 - Minimum versions rise to scipy 1.15, statsmodels 0.14.5 (earlier releases fail to import
-  with scipy 1.16), huggingface-hub 2.0, and, for the `agent` and `test` extras,
-  pydantic-ai-slim 2.51.
+  with scipy 1.16), threadpoolctl 3.5 (earlier releases cannot see the OpenBLAS in NumPy and
+  SciPy wheels, so BLAS thread limits had no effect), huggingface-hub 2.0, and, for the `agent`
+  and `test` extras, pydantic-ai-slim 2.51.
 - Count layout: plans whose countsT chunks fell below half the chunk target (awkward cell counts
   such as primes) now use whole-target chunks, so stores written with those plans fail layout
   replay and must be re-imported. Count assays require Zarr format 3.
@@ -349,10 +355,11 @@ The complete hard-break inventory is:
   cluster-selection inputs, plots, and pipeline run records. Query projections validate
   `cell_selection` with the stored-selection validator, and connectivity-map payloads follow the
   neighbor dimension rules, so `n_cells` above 2**32 - 1 is rejected.
-- Failed marker, enrichment, statistical-test, coalesced-tree, and cell-data artifact writes
-  delete their incomplete slot. Starting any artifact on a read-only store raises
-  `PermissionError` before writing, so `run_harmony` and `run_pseudotime_scoring(ss_vec=...)` no
-  longer surface the Zarr read-only `ValueError`.
+- A failed or interrupted artifact write deletes its incomplete slot, so `list_artifacts` no
+  longer shows orphaned incomplete artifacts after an error. `ProjectionWriter.abort` deletes the
+  unfinished projection instead of leaving it incomplete. Starting any artifact on a read-only
+  store raises `PermissionError` before writing, so `run_harmony` and
+  `run_pseudotime_scoring(ss_vec=...)` no longer surface the Zarr read-only `ValueError`.
 - Gene families: `scarf.features.gene_families` is the one registry of name-based families, and
   `ribosomal` always means RPS, RPL, MRPS, and MRPL. `DEFAULT_PERCENT_PATTERNS` moves there from
   `scarf.assay.classification`, and newly prepared stores record the ribosomal percentage pattern

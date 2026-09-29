@@ -32,10 +32,9 @@ from ...metadata.table import CaseInsensitiveIndex
 from ...storage.artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
-    finish_artifact,
+    artifact_transaction,
     plan_artifact,
     reused_artifact_group,
-    start_artifact,
 )
 from ...storage.artifacts import (
     ArtifactRef,
@@ -412,9 +411,8 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
                 f"loaded within the memory budget of {self.memoryBytes} bytes; "
                 "increase the memory budget or use a smaller diffusion power t."
             )
-        store = start_artifact(self.zw, planned)
-        write_diffusion_payload(store, diff_op)
-        finish_artifact(store, planned)
+        with artifact_transaction(self.zw, planned) as store:
+            write_diffusion_payload(store, diff_op)
         return planned.ref
 
     def _load_diffusion_operator_with_lineage(
@@ -1667,19 +1665,18 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             raise ValueError(
                 "Pseudotime marker results are not aligned to feature selection"
             )
-        marker_group = start_artifact(self.zw, planned)
-        check_normalization()
-        for name in ("r_value", "p_value", "p_value_adjusted"):
-            values = np.full(assay.feats.N, np.nan, dtype=np.float64)
-            values[feature_index] = np.asarray(markers[name].values)
-            _write_feature_vector(marker_group, name, values)
-        identity.store(marker_group, "pseudotime marker computation")
-        marker_group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
-            marker_group,
-            _MARKER_PAYLOAD,
-        )
-        check_normalization()
-        finish_artifact(marker_group, planned)
+        with artifact_transaction(self.zw, planned) as marker_group:
+            check_normalization()
+            for name in ("r_value", "p_value", "p_value_adjusted"):
+                values = np.full(assay.feats.N, np.nan, dtype=np.float64)
+                values[feature_index] = np.asarray(markers[name].values)
+                _write_feature_vector(marker_group, name, values)
+            identity.store(marker_group, "pseudotime marker computation")
+            marker_group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
+                marker_group,
+                _MARKER_PAYLOAD,
+            )
+            check_normalization()
         logger.info(f"Stored pseudotime marker scores for {len(markers)} features")
         return planned.ref
 
@@ -1978,45 +1975,44 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             ann_params=resolved_ann_params,
         )
         check_normalization()
-        aggregation_group = start_artifact(self.zw, planned)
-        assay._write_aggregated_ordering_group(
-            aggregation_group,
-            data=full_data,
-            feature_indices=stored_feature_indices,
-            valid=valid_features,
-        )
-        stored_feature_clusters = np.full(
-            len(stored_feature_indices),
-            nan_cluster_value,
-            dtype=np.int64,
-        )
-        stored_feature_clusters[valid_features] = clusts
-        _write_feature_vector(
-            aggregation_group,
-            "feature_clusters",
-            stored_feature_clusters,
-        )
-        _write_feature_vector(
-            aggregation_group,
-            "cluster_values",
-            _scatter_feature_clusters_impl(
-                assay.feats.N,
-                valid_feature_indices,
-                clusts,
+        with artifact_transaction(self.zw, planned) as aggregation_group:
+            assay._write_aggregated_ordering_group(
+                aggregation_group,
+                data=full_data,
+                feature_indices=stored_feature_indices,
+                valid=valid_features,
+            )
+            stored_feature_clusters = np.full(
+                len(stored_feature_indices),
                 nan_cluster_value,
-            ),
-        )
-        identity.store(aggregation_group, "pseudotime aggregation")
-        aggregation_group.attrs["input_fingerprints"] = input_fingerprints
-        aggregation_group.attrs["nan_cluster_value"] = nan_cluster_value
-        aggregation_group.attrs["effective_window"] = effective_window
-        aggregation_group.attrs["effective_bins"] = effective_bins
-        aggregation_group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
-            aggregation_group,
-            _AGGREGATION_PAYLOAD,
-        )
-        check_normalization()
-        finish_artifact(aggregation_group, planned)
+                dtype=np.int64,
+            )
+            stored_feature_clusters[valid_features] = clusts
+            _write_feature_vector(
+                aggregation_group,
+                "feature_clusters",
+                stored_feature_clusters,
+            )
+            _write_feature_vector(
+                aggregation_group,
+                "cluster_values",
+                _scatter_feature_clusters_impl(
+                    assay.feats.N,
+                    valid_feature_indices,
+                    clusts,
+                    nan_cluster_value,
+                ),
+            )
+            identity.store(aggregation_group, "pseudotime aggregation")
+            aggregation_group.attrs["input_fingerprints"] = input_fingerprints
+            aggregation_group.attrs["nan_cluster_value"] = nan_cluster_value
+            aggregation_group.attrs["effective_window"] = effective_window
+            aggregation_group.attrs["effective_bins"] = effective_bins
+            aggregation_group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
+                aggregation_group,
+                _AGGREGATION_PAYLOAD,
+            )
+            check_normalization()
         logger.info(f"Stored {np.unique(clusts).size} pseudotime modules")
         return planned.ref
 

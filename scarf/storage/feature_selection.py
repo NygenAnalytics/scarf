@@ -10,9 +10,8 @@ from .artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
     PlannedArtifact,
-    finish_artifact,
+    artifact_transaction,
     plan_artifact,
-    start_artifact,
 )
 from .artifacts import (
     ArtifactRef,
@@ -121,33 +120,32 @@ def _write_feature_selection(
 ) -> None:
     if planned.reused:
         return
-    group = start_artifact(root, planned)
-    n_features = int(np.asarray(payload["values"]).shape[0])
-    chunks = (min(max(n_features, 1), 100_000),)
-    for name in payload_names:
-        values = np.asarray(
-            payload[name],
-            dtype=(bool if name == "values" else np.float64),
-        )
-        if values.shape != (n_features,):
-            raise ValueError(
-                f"Feature-selection array {name!r} has shape {values.shape}; "
-                f"expected ({n_features},)"
+    with artifact_transaction(root, planned) as group:
+        n_features = int(np.asarray(payload["values"]).shape[0])
+        chunks = (min(max(n_features, 1), 100_000),)
+        for name in payload_names:
+            values = np.asarray(
+                payload[name],
+                dtype=(bool if name == "values" else np.float64),
             )
-        output = create_zarr_dataset(
+            if values.shape != (n_features,):
+                raise ValueError(
+                    f"Feature-selection array {name!r} has shape {values.shape}; "
+                    f"expected ({n_features},)"
+                )
+            output = create_zarr_dataset(
+                group,
+                name,
+                chunks,
+                values.dtype,
+                values.shape,
+            )
+            output[:] = values
+        group.attrs["ordered_feature_ids_fingerprint"] = ordered_feature_ids_fingerprint
+        group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
             group,
-            name,
-            chunks,
-            values.dtype,
-            values.shape,
+            payload_names,
         )
-        output[:] = values
-    group.attrs["ordered_feature_ids_fingerprint"] = ordered_feature_ids_fingerprint
-    group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
-        group,
-        payload_names,
-    )
-    finish_artifact(group, planned)
 
 
 def _feature_selection_values(

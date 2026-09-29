@@ -18,9 +18,8 @@ from ..metrics.cluster_selection import (
 from ..storage.artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
-    finish_artifact,
+    artifact_transaction,
     plan_artifact,
-    start_artifact,
 )
 from ..storage.artifacts import (
     ArtifactRef,
@@ -354,32 +353,31 @@ def run_cluster_selection(
         checkpoint=shutdown_checkpoint,
         sample_indices=sample_indices,
     )
-    group = start_artifact(store.zw, planned)
-    sample_array = create_zarr_dataset(
-        group,
-        "sample_indices",
-        (min(result.sample_size, 100_000),),
-        np.int64,
-        result.sample_indices.shape,
-    )
-    sample_array[:] = result.sample_indices
-    score_array = create_zarr_dataset(
-        group,
-        "scores",
-        (max(1, len(result.candidate_keys)),),
-        np.float64,
-        result.scores.shape,
-    )
-    score_array[:] = result.scores
-    group.attrs.update(
-        {
-            "candidateKeys": list(result.candidate_keys),
-            "candidateRefs": [ref.to_dict() for ref in candidate_refs],
-            "invalidReasons": list(result.invalid_reasons),
-            "selectedKey": result.selected_key,
-            "sampleDefinition": dict(result.sample_definition),
-            "tieOrder": list(result.tie_order),
-        }
-    )
-    finish_artifact(group, planned)
+    with artifact_transaction(store.zw, planned) as group:
+        sample_array = create_zarr_dataset(
+            group,
+            "sample_indices",
+            (min(result.sample_size, 100_000),),
+            np.int64,
+            result.sample_indices.shape,
+        )
+        sample_array[:] = result.sample_indices
+        score_array = create_zarr_dataset(
+            group,
+            "scores",
+            (max(1, len(result.candidate_keys)),),
+            np.float64,
+            result.scores.shape,
+        )
+        score_array[:] = result.scores
+        group.attrs.update(
+            {
+                "candidateKeys": list(result.candidate_keys),
+                "candidateRefs": [ref.to_dict() for ref in candidate_refs],
+                "invalidReasons": list(result.invalid_reasons),
+                "selectedKey": result.selected_key,
+                "sampleDefinition": dict(result.sample_definition),
+                "tieOrder": list(result.tie_order),
+            }
+        )
     return planned.ref, result.selected_key, refs_by_key[result.selected_key]

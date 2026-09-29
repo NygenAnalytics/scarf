@@ -19,10 +19,9 @@ from ...storage.artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
     PlannedArtifact,
-    finish_artifact,
+    artifact_transaction,
     plan_artifact,
     reused_artifact_group,
-    start_artifact,
 )
 from ...storage.arrays import create_zarr_dataset
 from ...storage.types import as_zarr_array, as_zarr_group
@@ -170,10 +169,9 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 )
                 shutdown_checkpoint()
                 plateau_forest = collapse_equal_height_plateaus(hierarchy)
-                hierarchy_group = start_artifact(self.zw, hierarchy_plan)
-                write_hierarchy_group(hierarchy_group, hierarchy, plateau_forest)
-                hierarchy_group.attrs["estimated_peak_bytes"] = estimated_peak_bytes
-                finish_artifact(hierarchy_group, hierarchy_plan)
+                with artifact_transaction(self.zw, hierarchy_plan) as hierarchy_group:
+                    write_hierarchy_group(hierarchy_group, hierarchy, plateau_forest)
+                    hierarchy_group.attrs["estimated_peak_bytes"] = estimated_peak_bytes
                 loaded = hierarchy, plateau_forest
             if loaded[0].n_leaves != n_cells:
                 raise ValueError("Paris hierarchy size does not match graph")
@@ -284,20 +282,19 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                     mode="fixed",
                     n_clusters=fixed_cluster_count,
                 )
-            cut_group = start_artifact(self.zw, cut_plan)
-            labels_array = create_zarr_dataset(
-                cut_group,
-                "labels",
-                (min(max(n_cells, 1), 100_000),),
-                "i4",
-                result.labels.shape,
-            )
-            labels_array[:] = result.labels
-            cut_group.attrs["n_clusters"] = int(result.n_clusters)
-            cut_group.attrs["diagnostics"] = [
-                asdict(diagnostic) for diagnostic in result.diagnostics
-            ]
-            finish_artifact(cut_group, cut_plan)
+            with artifact_transaction(self.zw, cut_plan) as cut_group:
+                labels_array = create_zarr_dataset(
+                    cut_group,
+                    "labels",
+                    (min(max(n_cells, 1), 100_000),),
+                    "i4",
+                    result.labels.shape,
+                )
+                labels_array[:] = result.labels
+                cut_group.attrs["n_clusters"] = int(result.n_clusters)
+                cut_group.attrs["diagnostics"] = [
+                    asdict(diagnostic) for diagnostic in result.diagnostics
+                ]
 
         if fixed_cluster_count is not None:
             dendrogram_plan = plan_paris_dendrogram(self.zw, hierarchy_plan.ref)

@@ -22,9 +22,8 @@ from ...mapping.features import _normalization_parameters
 from ...mapping.reference import MappingReference
 from ...storage.artifact_writer import (
     AttributeRequirement,
-    finish_artifact,
+    artifact_transaction,
     plan_artifact,
-    start_artifact,
 )
 from ...storage.ann_index import validate_ann_index_payload
 from ...storage.artifacts import (
@@ -433,18 +432,17 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
             reuse_validator=valid_reference,
         )
         if not planned.reused:
-            group = start_artifact(self.zw, planned)
-            write_artifact_mapping_reference_from_sources(
-                group,
-                feature_means=feature_means,
-                feature_scales=feature_scales,
-                center=center,
-                loadings=loadings,
-                symphony_sources=symphony_sources,
-                feature_ids=feature_ids,
-                metadata=metadata,
-                reference_distance_quantiles=distance_quantiles,
-                reference_distance_values=distance_values,
-            )
-            finish_artifact(group, planned)
+            with artifact_transaction(self.zw, planned) as group:
+                write_artifact_mapping_reference_from_sources(
+                    group,
+                    feature_means=feature_means,
+                    feature_scales=feature_scales,
+                    center=center,
+                    loadings=loadings,
+                    symphony_sources=symphony_sources,
+                    feature_ids=feature_ids,
+                    metadata=metadata,
+                    reference_distance_quantiles=distance_quantiles,
+                    reference_distance_values=distance_values,
+                )
         return planned.ref

@@ -21,6 +21,7 @@ from ...storage.artifacts import (
     inspect_artifact,
 )
 from ...storage.types import as_zarr_array, as_zarr_group
+from ...utils.arguments import float_argument, integer_argument
 from ...utils.logging import logger, progress_enabled
 from ...utils.shutdown import shutdown_checkpoint
 
@@ -366,6 +367,23 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
             symmetric_graph = graph_flag(symmetric_graph, "symmetric_graph")
         if graph_upper_only is not None:
             graph_upper_only = graph_flag(graph_upper_only, "graph_upper_only")
+        # Parameters are recorded canonically, so ``min_dist=1`` and
+        # ``min_dist=1.0`` identify the same embedding.
+        umap_dims = integer_argument(umap_dims, "umap_dims", minimum=1)
+        n_epochs = integer_argument(n_epochs, "n_epochs", minimum=1)
+        random_seed = integer_argument(random_seed, "random_seed", minimum=0)
+        spread = float_argument(spread, "spread")
+        min_dist = float_argument(min_dist, "min_dist")
+        repulsion_strength = float_argument(repulsion_strength, "repulsion_strength")
+        initial_alpha = float_argument(initial_alpha, "initial_alpha")
+        negative_sample_rate = float_argument(
+            negative_sample_rate, "negative_sample_rate"
+        )
+        dens_lambda = float_argument(dens_lambda, "dens_lambda")
+        dens_frac = float_argument(dens_frac, "dens_frac")
+        dens_var_shift = float_argument(dens_var_shift, "dens_var_shift")
+        use_density_map = graph_flag(use_density_map, "use_density_map")
+        parallel = graph_flag(parallel, "parallel")
         # UMAP optimizes its initialization in place and requires C-contiguous
         # float32 coordinates, so an array initialization becomes a private copy.
         cell_selection, n_cells, initialization_input, ini_embed = (
@@ -373,6 +391,7 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
         )
         if nthreads is None:
             nthreads = self.nthreads
+        nthreads = integer_argument(nthreads, "nthreads", minimum=1)
         effective_density_map = use_density_map and graph.kind != "integrated_graph"
         arguments = UmapArguments(
             graph=graph,

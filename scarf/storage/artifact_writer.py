@@ -310,6 +310,19 @@ def finish_artifact(
     group.attrs["complete"] = True
 
 
+def discard_artifact(root: zarr.Group, planned: PlannedArtifact) -> None:
+    """Delete the incomplete group of a started artifact after a failed write.
+
+    A deletion failure is logged, not raised, so the write's own error is the
+    one that propagates.
+    """
+    path = artifact_path(planned.ref)
+    try:
+        del root[path]
+    except Exception as error:
+        logger.warning(f"Could not remove the incomplete artifact at {path}: {error}")
+
+
 @contextmanager
 def artifact_transaction(
     root: zarr.Group,
@@ -326,13 +339,7 @@ def artifact_transaction(
         yield group
         finish_artifact(group, planned)
     except BaseException:
-        path = artifact_path(planned.ref)
-        try:
-            del root[path]
-        except Exception as error:
-            logger.warning(
-                f"Could not remove the incomplete artifact at {path}: {error}"
-            )
+        discard_artifact(root, planned)
         raise
 
 

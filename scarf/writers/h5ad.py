@@ -816,9 +816,8 @@ class H5adToZarr:
         )
         from ..storage.artifact_writer import (
             ArrayRequirement,
-            finish_artifact,
+            artifact_transaction,
             plan_artifact,
-            start_artifact,
         )
         from ._store import DEFAULT_IMPORT_BLOCK_ROWS
 
@@ -863,41 +862,40 @@ class H5adToZarr:
             if planned.reused:
                 artifacts[key] = planned.ref
                 continue
-            group = start_artifact(self.root, planned)
+            with artifact_transaction(self.root, planned) as group:
 
-            def blocks() -> Iterator[MetadataBlock]:
-                for start in range(0, self.h5ad.nCells, block_rows):
-                    stop = min(start + block_rows, self.h5ad.nCells)
-                    values, missing = self._cluster_block(
-                        key,
-                        start,
-                        stop,
-                        dtype,
-                    )
-                    yield MetadataBlock(
-                        start,
-                        values,
-                        missing if has_missing else None,
-                    )
+                def blocks() -> Iterator[MetadataBlock]:
+                    for start in range(0, self.h5ad.nCells, block_rows):
+                        stop = min(start + block_rows, self.h5ad.nCells)
+                        values, missing = self._cluster_block(
+                            key,
+                            start,
+                            stop,
+                            dtype,
+                        )
+                        yield MetadataBlock(
+                            start,
+                            values,
+                            missing if has_missing else None,
+                        )
 
-            values = create_streamed_metadata_column(
-                group,
-                "values",
-                shape=self.h5ad.nCells,
-                dtype=dtype,
-                blocks=blocks(),
-                chunkSize=min(
-                    DEFAULT_IMPORT_BLOCK_ROWS,
-                    max(1, self.h5ad.nCells),
-                ),
-                hasMissing=has_missing,
-                profile=self.profile,
-            )
-            if has_missing and values.attrs.get("missing_mask") != (
-                f"{MISSING_MASK_PREFIX}values"
-            ):
-                raise RuntimeError("Cluster-label missing-mask link is malformed")
-            finish_artifact(group, planned)
+                values = create_streamed_metadata_column(
+                    group,
+                    "values",
+                    shape=self.h5ad.nCells,
+                    dtype=dtype,
+                    blocks=blocks(),
+                    chunkSize=min(
+                        DEFAULT_IMPORT_BLOCK_ROWS,
+                        max(1, self.h5ad.nCells),
+                    ),
+                    hasMissing=has_missing,
+                    profile=self.profile,
+                )
+                if has_missing and values.attrs.get("missing_mask") != (
+                    f"{MISSING_MASK_PREFIX}values"
+                ):
+                    raise RuntimeError("Cluster-label missing-mask link is malformed")
             artifacts[key] = planned.ref
         return artifacts
 

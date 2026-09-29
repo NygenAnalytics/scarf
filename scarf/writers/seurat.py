@@ -22,9 +22,8 @@ from ..storage.arrays import MISSING_MASK_PREFIX
 from ..storage.count_matrix import CountMatrixPolicy
 from ..storage.artifact_writer import (
     ArrayRequirement,
-    finish_artifact,
+    artifact_transaction,
     plan_artifact,
-    start_artifact,
 )
 from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import StorageProfile, ZarrLocation
@@ -588,16 +587,15 @@ class SeuratToZarr:
         )
         if planned.reused:
             return planned.ref
-        group = start_artifact(self.root, planned)
-        values = self._write_metadata_column(
-            group,
-            column,
-            block_rows,
-            name="values",
-        )
-        if values.attrs.get("missing_mask") != missing_name:
-            raise RuntimeError("Active identity missing-mask link is malformed")
-        finish_artifact(group, planned)
+        with artifact_transaction(self.root, planned) as group:
+            values = self._write_metadata_column(
+                group,
+                column,
+                block_rows,
+                name="values",
+            )
+            if values.attrs.get("missing_mask") != missing_name:
+                raise RuntimeError("Active identity missing-mask link is malformed")
         return planned.ref
 
     def _create_boolean_column(
