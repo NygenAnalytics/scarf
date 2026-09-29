@@ -92,6 +92,39 @@ ds.cells.insert("pbmc_cell_type", cell_types, overwrite=True)
 ds.cells.insert("rna_analysis_cells", analysis_cells, overwrite=True)
 ```
 
+The cell below pins the winning cluster of each lineage program with asserts, so the broad labels above stay guarded if the partition ever changes.
+
+```{code-cell} ipython3
+broad_markers = ds.get_markers(
+    marker=run["markers"],
+    min_score=-1,
+    min_frac_exp=-1,
+)
+broad_best = (
+    broad_markers[broad_markers["feature_name"].isin(
+        ["CD14", "CDKN1C", "TCF7L2", "MS4A1", "CD3D", "NKG7",
+         "IL3RA", "PPBP", "IGHD", "IGHA1"]
+    )]
+    .sort_values("score", ascending=False)
+    .groupby("feature_name", sort=False)
+    .head(1)
+    .set_index("feature_name")["group_id"]
+    .astype(str)
+    .to_dict()
+)
+assert broad_best["CD14"] == "1"
+assert broad_best["CDKN1C"] == "2"
+assert broad_best["TCF7L2"] == "2"
+assert broad_best["MS4A1"] in {"3", "10"}
+assert broad_best["CD3D"] in {"4", "5", "6", "9"}
+assert broad_best["NKG7"] in {"7", "8"}
+assert broad_best["IL3RA"] == "11"
+assert broad_best["PPBP"] == "12"
+assert broad_best["IGHD"] == "10"
+assert broad_best["IGHA1"] == "3"
+broad_best
+```
+
 ### Question: where are the broad PBMC populations?
 
 ```{code-cell} ipython3
