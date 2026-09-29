@@ -163,22 +163,28 @@ class CrToZarr:
                 as_zarr_group(self.z[group_path], name=group_path),
                 indexes,
             )
-        columns = list(feature_columns())
-        keys = metadata_column_keys(
-            (name for name, _values in columns),
-            taken={key for group, _indexes in targets.values() for key in group.keys()},
-        )
-        for key, (name, raw_values) in keyed_metadata_columns(
-            ((name, (name, values)) for name, values in columns),
-            keys,
-            "feature",
-        ):
+        columns = []
+        for name, raw_values in feature_columns():
             values = np.asarray(raw_values)
             if values.ndim != 1 or values.size != self.cr.nFeatures:
                 raise ValueError(
                     f"Feature metadata column {name!r} has shape {values.shape}; "
                     f"expected ({self.cr.nFeatures},)"
                 )
+            # A reference column that is empty for every feature is never
+            # written, so it must not claim a key or report a rename.
+            if values.dtype.kind == "O" and all(value is None for value in values):
+                continue
+            columns.append((name, values))
+        keys = metadata_column_keys(
+            (name for name, _values in columns),
+            taken={key for group, _indexes in targets.values() for key in group.keys()},
+        )
+        for key, (name, values) in keyed_metadata_columns(
+            ((name, (name, values)) for name, values in columns),
+            keys,
+            "feature",
+        ):
             for group, indexes in targets.values():
                 selected = values[indexes]
                 if selected.dtype.kind == "O" and all(

@@ -157,3 +157,29 @@ def test_table_members_keeps_a_column_that_a_listed_path_runs_through(obs):
     assert names[:2] == ["b", "q/codes"]
     assert "q" in names
     assert "q" in table_column_names(obs)
+
+
+def test_table_members_keeps_nested_groups_that_hold_unresolved_columns(tmp_path):
+    with h5py.File(tmp_path / "siblings.h5ad", "w") as h5:
+        obs = h5.create_group("obs")
+        obs.attrs["_index"] = "cell/id"
+        obs.create_dataset("cell/id", data=np.asarray(["c1", "c2"], dtype="S"))
+        obs.create_dataset("cell/type", data=np.asarray(["T", "B"], dtype="S"))
+        obs.create_dataset("a/b", data=np.asarray([1, 2]))
+        obs.create_dataset("a/c", data=np.asarray([3, 4]))
+        obs.create_dataset("x/y/z", data=np.asarray([5, 6]))
+        obs.attrs["column-order"] = ["a/b", "x/y/z"]
+
+        names = [name for name, _node in table_members(obs).members]
+
+        # 'cell/type' and 'a/c' are not listed, so their groups stay visible
+        # and the reader reports them instead of dropping them silently.
+        assert names == ["a/b", "x/y/z", "cell/id", "a", "cell"]
+        assert table_column_names(obs) == ["a/b", "x/y/z", "cell/id"]
+
+
+def test_table_column_names_leaves_out_multidimensional_datasets(obs):
+    obs.create_dataset("two_d", data=np.zeros((2, 3)))
+
+    assert "two_d" in [name for name, _node in table_members(obs).members]
+    assert "two_d" not in table_column_names(obs)

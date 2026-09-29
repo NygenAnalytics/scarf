@@ -22,7 +22,11 @@ from ..storage.copy import COLUMN_METADATA_ATTRIBUTES
 from ..storage.execution import admitted_worker_split
 from ..storage.identity import GENERATED_FEATURE_COLUMNS, clear_column
 from ..storage.layout import PROFILE_METADATA_CHUNK, _encoded_chunk_bound
-from ..storage.metadata_keys import validate_metadata_column_name
+from ..storage.metadata_keys import (
+    is_reserved_metadata_name,
+    metadata_column_key,
+    validate_metadata_column_name,
+)
 from ..storage.partition import affordable_width
 from ..storage.profiles import StorageProfile
 from ..storage.types import as_zarr_array, as_zarr_group
@@ -240,6 +244,32 @@ def resolve_identity_validation_rows(
     return int(rows)
 
 
+def validate_prepend_text(prepend_text: str | None) -> None:
+    """Reject a merged-column prefix that would nest or hide columns.
+
+    Raises:
+        TypeError: If ``prepend_text`` is neither a string nor None.
+        ValueError: If it contains ``/`` or ``\\``, which Zarr reads as path
+            separators, or makes prefixed names start with the missing-value
+            mask prefix.
+    """
+    if prepend_text is None:
+        return
+    if not isinstance(prepend_text, str):
+        raise TypeError(
+            f"prepend_text must be a string or None, not {type(prepend_text).__name__}"
+        )
+    if prepend_text and (
+        metadata_column_key(prepend_text) != prepend_text
+        or is_reserved_metadata_name(f"{prepend_text}_")
+    ):
+        raise ValueError(
+            f"prepend_text {prepend_text!r} must not contain '/' or '\\', which "
+            "Zarr reads as path separators, or start with Scarf's missing-value "
+            "mask prefix"
+        )
+
+
 def _public_column_name(
     column: str,
     prepend_text: str | None,
@@ -437,6 +467,7 @@ def plan_cell_metadata(
         )
     if source_column is not None:
         validate_metadata_column_name(source_column)
+    validate_prepend_text(prepend_text)
     if prepend_text == "":
         prepend_text = None
 
@@ -448,6 +479,9 @@ def plan_cell_metadata(
             if excluded_columns is not None and column in excluded_columns[index]:
                 continue
             public = _public_column_name(column, prepend_text)
+            if public not in _PROTECTED:
+                # Settings changed after construction reach the plan unchecked.
+                validate_metadata_column_name(public)
             mapping[public] = column
         per_source.append(mapping)
 

@@ -118,30 +118,69 @@ def table_members(table: h5py.Group) -> H5adTableMembers:
         if isinstance(node, h5py.Group | h5py.Dataset):
             members.append((index, node))
             listed = (*listed, index)
-    nested = {name.split("/", 1)[0] for name in listed if "/" in name}
+    resolved = set(listed)
+    levels = {
+        name.rsplit("/", depth)[0]
+        for name in resolved
+        for depth in range(1, name.count("/") + 1)
+    }
     for name in table.keys():
-        if name in listed:
+        if name in resolved:
             continue
         node = table[name]
         # A decodable column keeps its place even when a listed path runs
-        # through it; only a group of nested levels is dropped.
-        if name in nested and not is_column(node):
-            continue
+        # through it. A group of nested levels is dropped only when resolved
+        # names cover everything in it; otherwise the reader reports it.
+        if name in levels and not is_column(node):
+            if _holds_only(node, name, resolved, levels):
+                continue
         members.append((name, node))
     return H5adTableMembers(tuple(members), tuple(unresolved))
+
+
+def _holds_only(
+    group: h5py.Group,
+    path: str,
+    resolved: set[str],
+    levels: set[str],
+) -> bool:
+    """Return whether resolved names cover every member under ``group``."""
+    for child in group.keys():
+        child_path = f"{path}/{child}"
+        if child_path in resolved:
+            continue
+        node = group[child]
+        if child_path in levels and isinstance(node, h5py.Group):
+            if not is_column(node) and _holds_only(node, child_path, resolved, levels):
+                continue
+        return False
+    return True
+
+
+def is_table_column(node: Any) -> bool:
+    """Return whether a dataframe member imports as one metadata column.
+
+    A dataset holding more than one dimension decodes but is not imported.
+    """
+    if isinstance(node, h5py.Dataset):
+        return int(node.ndim) == 1
+    return is_column(node)
 
 
 def table_column_names(table: Any) -> list[str]:
     """Return the source names of a dataframe's decodable columns.
 
     A compound dataset, as AnnData 0.6 wrote, lists its fields. A group lists
-    the members that :func:`is_column` accepts, in :func:`table_members` order.
+    the members that :func:`is_table_column` accepts, in :func:`table_members`
+    order.
     """
     if isinstance(table, h5py.Dataset):
         return list(table.dtype.names or ())
     if not isinstance(table, h5py.Group):
         return []
-    return [name for name, node in table_members(table).members if is_column(node)]
+    return [
+        name for name, node in table_members(table).members if is_table_column(node)
+    ]
 
 
 def column_length(node: Any) -> int | None:

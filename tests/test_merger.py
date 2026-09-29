@@ -554,6 +554,48 @@ def test_dataset_merge_rejects_path_separator_column_names(tmp_path, options, me
     assert not destination.exists()
 
 
+@pytest.mark.parametrize(
+    ("options", "error", "message"),
+    [
+        ({"prepend_text": 5}, TypeError, "prepend_text must be a string or None"),
+        ({"source_column": "__scarf_missing__x"}, ValueError, "reserves"),
+        ({"prepend_text": "__scarf_missing_"}, ValueError, "mask prefix"),
+    ],
+    ids=["prepend-int", "source-mask-prefix", "prepend-mask-prefix"],
+)
+def test_dataset_merge_rejects_reserved_or_untyped_names(
+    tmp_path, options, error, message
+):
+    left = _MergeDataStore(
+        [_MergeAssay("RNA", [[1], [2]], ["c0", "c1"], ["id_a"], ["A"], block_size=2)],
+        zarr_loc="memory://left",
+    )
+
+    with pytest.raises(error, match=message):
+        DataStoreMerge(
+            datasets=[left, left],
+            zarr_path=str(tmp_path / "reserved.zarr"),
+            names=["left", "right"],
+            **options,
+        )
+
+
+def test_dataset_merge_plan_checks_names_changed_after_construction(tmp_path):
+    left = _MergeDataStore(
+        [_MergeAssay("RNA", [[1], [2]], ["c0", "c1"], ["id_a"], ["A"], block_size=2)],
+        zarr_loc="memory://left",
+    )
+    destination = tmp_path / "late.zarr"
+    merge = DataStoreMerge(
+        datasets=[left, left], zarr_path=str(destination), names=["left", "right"]
+    )
+    merge.prependText = "x/y"
+
+    with pytest.raises(ValueError, match="prepend_text 'x/y' must not contain"):
+        merge.plan()
+    assert not destination.exists()
+
+
 def test_dataset_merge_preserves_order_across_source_block_sizes(tmp_path):
     left = _MergeDataStore(
         [

@@ -469,12 +469,12 @@ def _validate_marker_group_name(name: str) -> None:
 
     Each group's statistics are stored under a child group named by the label.
     """
-    if not name.strip() or name in (".", "..") or "/" in name:
+    if not name.strip() or name in (".", "..") or "/" in name or "\\" in name:
         raise ValueError(
             f"Marker group label {name!r} cannot name a stored marker group: "
             "labels must be non-blank, must not be '.' or '..', and must not "
-            "contain '/'. Rename the labels or select labelled cells with "
-            "select_cells before running run_marker_search."
+            "contain '/' or '\\'. Rename the labels or select labelled cells "
+            "with select_cells before running run_marker_search."
         )
 
 
@@ -1621,7 +1621,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             clusters: Complete ``cluster_labels`` or ``cluster_cut`` artifact
                 with a label for every cell. Labels that its linked missing
                 mask flags raise ``ValueError``, as do labels that are blank,
-                ``'.'`` or ``'..'``, or contain ``'/'``, because each label
+                ``'.'`` or ``'..'``, or contain ``'/'`` or ``'\\'``, because each label
                 names its stored marker group.
             features: Explicit feature-selection artifact.
             nthreads: Threads for marker search.

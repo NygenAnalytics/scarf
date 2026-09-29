@@ -533,7 +533,7 @@ def test_selections_reject_path_separator_column_names(name) -> None:
             axis="cell",
             columns=[name],
         )
-    with pytest.raises(ValueError, match="cannot be a path"):
+    with pytest.raises(ValueError, match="use 'k_b' instead"):
         resolve_stored_selection(
             root,
             table_path="cellData",
@@ -545,6 +545,35 @@ def test_selections_reject_path_separator_column_names(name) -> None:
             parameters={},
             inputs={},
         )
+
+
+def test_selections_name_the_column_and_reject_non_text_or_nested_sources() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    table = root.create_group("cellData")
+    create_metadata_column(table, "ids", data=np.array(["a", "b"]), dtype=str)
+    table.create_array("k/b", data=np.array([True, False]))
+    common = {
+        "table_path": "cellData",
+        "id_column": "ids",
+        "scope": "datastore",
+        "kind": "cell_selection",
+        "operation": "snapshot",
+        "parameters": {},
+        "inputs": {},
+    }
+
+    with pytest.raises(ValueError, match=r"'k/b' \(use 'k_b'\), '\.\.'"):
+        snapshot_run_metadata(
+            root=root,
+            table_path="cellData",
+            id_column="ids",
+            axis="cell",
+            columns=["k/b", ".."],
+        )
+    with pytest.raises(TypeError, match="must be strings, not int"):
+        resolve_stored_selection(root, source_column=123, **common)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="nested group named 'k'"):
+        resolve_stored_selection(root, source_column="k", **common)
 
 
 def test_selection_artifact_rejects_bad_masks_and_ids() -> None:

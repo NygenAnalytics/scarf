@@ -1,6 +1,7 @@
 import pytest
 
 from scarf.storage.metadata_keys import (
+    is_metadata_column_key,
     is_reserved_metadata_name,
     metadata_column_key,
     metadata_column_keys,
@@ -91,3 +92,18 @@ def test_is_reserved_metadata_name_covers_columns_and_mask_prefix():
     assert all(is_reserved_metadata_name(name) for name in ("I", "ids", "names"))
     assert is_reserved_metadata_name("__scarf_missing__cell_type")
     assert not is_reserved_metadata_name("ids_2")
+
+
+@pytest.mark.parametrize(
+    "name", ["__scarf_missing__score", "__scarf/missing__score", "__scarf_missing__"]
+)
+def test_validate_metadata_column_name_rejects_the_mask_prefix(name):
+    with pytest.raises(ValueError, match="reserves for missing-value masks"):
+        validate_metadata_column_name(name)
+
+
+def test_is_metadata_column_key_accepts_only_names_stored_as_given():
+    assert is_metadata_column_key("cell_type")
+    assert not any(
+        is_metadata_column_key(name) for name in ("a/b", "a\\b", "", ".", "..", 3)
+    )

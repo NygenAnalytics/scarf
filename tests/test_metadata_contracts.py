@@ -717,6 +717,42 @@ def test_lookups_of_names_that_are_not_text_raise_key_errors():
             table.fetch_all(column)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("name", ["__scarf_missing__score", "__scarf_missing__new"])
+def test_writes_reject_the_missing_mask_prefix(name):
+    table = _metadata_fixture()
+
+    with pytest.raises(ValueError, match="reserves for missing-value masks"):
+        table.insert(name, np.ones(4, dtype=bool))
+    with pytest.raises(ValueError, match="reserves for missing-value masks"):
+        table.reset_key(name)
+
+    assert set(table._group.keys()) == {"I", "ids", "names", "score"}
+
+
+@pytest.mark.parametrize("name", ["", ".", ".."])
+def test_lookups_of_names_zarr_cannot_store_raise_key_errors(name):
+    table = _metadata_fixture()
+
+    with pytest.raises(KeyError, match="does not exist in the metadata columns"):
+        table.fetch_all(name)
+    with pytest.raises(KeyError, match="does not exist in the metadata columns"):
+        table.drop(name)
+
+
+def test_writes_over_a_nested_group_ask_for_a_new_import():
+    table = _metadata_fixture()
+    table._group.create_array("Baseline (ml/min)", data=np.ones(4))
+
+    for write in (
+        lambda: table.drop("Baseline (ml"),
+        lambda: table.insert("Baseline (ml", np.zeros(4), overwrite=True),
+        lambda: table.reset_key("Baseline (ml"),
+    ):
+        with pytest.raises(TypeError, match="import the source again"):
+            write()
+    assert list(table._group["Baseline (ml"].array_keys()) == ["min)"]
+
+
 def test_nested_group_from_an_older_import_asks_for_a_new_import():
     table = _metadata_fixture()
     # Older imports let Zarr nest a source column named with '/' into groups.

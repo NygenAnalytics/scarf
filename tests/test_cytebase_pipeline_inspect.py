@@ -1054,6 +1054,21 @@ def test_inspect_file_summarizes_clashing_obs_names_under_distinct_keys(tmp_path
     assert warnings == []
 
 
+def test_inspect_file_leaves_multidimensional_obs_datasets_out_of_the_summary(
+    tmp_path,
+):
+    path = write_h5ad(tmp_path / "source.h5ad")
+    with h5py.File(path, "r+") as h5:
+        obs = h5["obs"]
+        obs.create_dataset("two_d", data=np.zeros((6, 2)))
+        write_column_order(obs, [*OBS_COLUMNS, "two_d"])
+
+    result, _warnings = _inspect_with_warnings(path)
+
+    assert "two_d" in result["h5ad_keys"]["obs"]
+    assert "two_d" not in result["obs_summary"]
+
+
 def test_inspect_file_asks_for_input_when_scarf_picks_another_feature_table(
     tmp_path, monkeypatch
 ):

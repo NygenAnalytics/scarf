@@ -14,7 +14,9 @@ from ..storage.arrays import (
     linked_missing_mask,
 )
 from ..storage.metadata_keys import (
+    is_metadata_column_key,
     metadata_column_key,
+    nested_group_error,
     validate_metadata_column_name,
 )
 from ..utils.logging import logger
@@ -90,10 +92,8 @@ class MetaData:
 
     @staticmethod
     def _is_public(column: str) -> bool:
-        return (
-            isinstance(column, str)
-            and metadata_column_key(column) == column
-            and not column.startswith(MISSING_MASK_PREFIX)
+        return is_metadata_column_key(column) and not column.startswith(
+            MISSING_MASK_PREFIX
         )
 
     @staticmethod
@@ -142,12 +142,7 @@ class MetaData:
                 pass
             else:
                 if isinstance(node, zarr.Group):
-                    raise TypeError(
-                        f"The metadata table holds a nested group named {column!r} "
-                        "instead of a column. A source column name containing "
-                        "'/' or '\\' created it; import the source again to "
-                        "store that column under a name with '_' in their place."
-                    )
+                    raise nested_group_error(column)
                 return as_zarr_array(node, name=column)
         raise self._missing_column(column)
 
@@ -226,6 +221,8 @@ class MetaData:
 
     def _save(self, column_name: str, values: np.ndarray) -> None:
         validate_metadata_column_name(column_name)
+        if isinstance(self._group.get(column_name), zarr.Group):
+            raise nested_group_error(column_name)
         if values.shape != (self.N,):
             raise ValueError(
                 f"ERROR: Values are of shape: {values.shape}. "
@@ -376,8 +373,9 @@ class MetaData:
                 f"ERROR: {column} is a protected name in MetaData class. "
                 "Cannot be deleted"
             )
-        if not self._has_column(column):
-            raise self._missing_column(column)
+        # Raises for a missing column and for a nested group left by an
+        # earlier import.
+        self._get_array(column)
         from ..storage.identity import clear_column
 
         clear_column(self._group, column)

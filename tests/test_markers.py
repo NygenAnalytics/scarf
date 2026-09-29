@@ -455,7 +455,7 @@ def _refuse_marker_search(*_args, **_kwargs):
     raise AssertionError("the rank marker search must not run")
 
 
-@pytest.mark.parametrize("label", ["NK/T", ".", "..", "", "  "])
+@pytest.mark.parametrize("label", ["NK/T", "NK\\T", ".", "..", "", "  "])
 def test_marker_search_rejects_labels_that_cannot_name_a_group_before_search(
     datastore_ephemeral, monkeypatch, label
 ) -> None:

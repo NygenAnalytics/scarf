@@ -27,16 +27,42 @@ def metadata_column_key(name: str) -> str:
     return name.replace("/", "_").replace("\\", "_")
 
 
+def is_metadata_column_key(name: object) -> bool:
+    """Return whether ``name`` names one metadata array as it stands."""
+    return (
+        isinstance(name, str)
+        and name not in _UNSTORABLE_NAMES
+        and metadata_column_key(name) == name
+    )
+
+
+def nested_group_error(column: str) -> TypeError:
+    """Return the error for a table member that is a group, not a column.
+
+    Stores written before Scarf renamed imported columns nested a source
+    column whose name contains ``/`` or ``\\`` into groups.
+    """
+    return TypeError(
+        f"The metadata table holds a nested group named {column!r} instead of "
+        "a column. A source column name containing '/' or '\\' created it; "
+        "import the source again to store that column under a name with '_' "
+        "in their place."
+    )
+
+
 def validate_metadata_column_name(name: str) -> None:
     """Reject a metadata column name that Zarr cannot store as one array.
+
+    Names that start with the missing-value mask prefix are rejected too, so
+    a written column can never replace or orphan a linked mask.
 
     Args:
         name: Column name to check.
 
     Raises:
         TypeError: If ``name`` is not a string.
-        ValueError: If ``name`` is empty, ``.``, or ``..``, or contains ``/``
-            or ``\\``.
+        ValueError: If ``name`` is empty, ``.``, or ``..``, contains ``/`` or
+            ``\\``, or starts with ``__scarf_missing__``.
     """
     if not isinstance(name, str):
         raise TypeError(
@@ -45,6 +71,11 @@ def validate_metadata_column_name(name: str) -> None:
     if name in _UNSTORABLE_NAMES:
         raise ValueError(f"Metadata column name {name!r} cannot name a Zarr array")
     key = metadata_column_key(name)
+    if key.startswith(MISSING_MASK_PREFIX):
+        raise ValueError(
+            f"Metadata column name {name!r} uses the prefix "
+            f"{MISSING_MASK_PREFIX!r}, which Scarf reserves for missing-value masks"
+        )
     if key != name:
         raise ValueError(
             f"Metadata column name {name!r} must not contain '/' or '\\' because "

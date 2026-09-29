@@ -19,6 +19,7 @@ from scarf import inspect_h5ad
 from scarf.readers._h5ad_columns import (
     column_encoding,
     is_column,
+    is_table_column,
     table_column_names,
     table_members,
 )
@@ -408,7 +409,7 @@ def _obs_summary(obs: h5py.Group) -> dict[str, dict[str, Any]]:
     logs, since conversion drops them too.
     """
     members = table_members(obs).members
-    keys = metadata_column_keys(name for name, node in members if is_column(node))
+    keys = metadata_column_keys(name for name, node in members if is_table_column(node))
     summary = {}
     for name, node in members:
         if name == "observation_joinid":

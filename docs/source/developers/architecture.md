@@ -344,11 +344,12 @@ The complete hard-break inventory is:
   `MetaData.sift`, `multi_sift`, and covariate partitions treat masked rows as missing, and
   `insert` keeps an explicit boolean `fill_value`. `MetaData.get_index_by` matches values that
   are not text by their text and always returns int64 indices. `MetaData.insert` rejects names
-  that are empty, `.` or `..`, or contain `/` or `\`, because Zarr would nest them into groups;
-  `reset_key` and `update_key` apply the same rule.
-  A lookup of a name with a separator suggests the `_` spelling that imports store. A cell or
-  feature table that holds such a nested group from an earlier import raises an error that
-  asks for the source to be re-imported; stores are not migrated.
+  that are empty, `.` or `..`, contain `/` or `\`, because Zarr would nest them into groups, or
+  start with the `__scarf_missing__` mask prefix; `reset_key` and `update_key` apply the same
+  rule. A lookup of a name with a separator suggests the `_` spelling that imports store, and a
+  lookup of an empty, `.` or `..` name raises `KeyError`. A cell or feature table that holds
+  such a nested group from an earlier import raises an error that asks for the source to be
+  re-imported on every read, write, and drop of that name; stores are not migrated.
 - Storage operations raise a single task failure as itself and a cooperative shutdown as
   `ShutdownRequested`, not as an exception group. A pipeline stage whose exception group holds
   `KeyboardInterrupt` or `ShutdownRequested` is recorded as interrupted and raises that
@@ -396,7 +397,7 @@ The complete hard-break inventory is:
   `load_paris_clustering` rejects cuts that do not name their hierarchy.
 - Inputs are validated before any lookup or write. Graph flags accept only booleans (NumPy
   booleans included). `run_marker_search` rejects labels that are blank, `.`, `..`, or contain
-  `/`. `smart_label` suffixes continue past `z` (`aa`, `ab`) and colliding names raise.
+  `/` or `\`. `smart_label` suffixes continue past `z` (`aa`, `ab`) and colliding names raise.
   `select_cells` raises when no cell is retained. `make_bulk` and integration metrics leave out or
   reject NaN, None, blank, and masked labels. Doublet, cell-cycle, prevalent-peak, membership,
   and statistical-testing arguments are checked first, and two-group tests reject `comparisons`
@@ -432,7 +433,11 @@ The complete hard-break inventory is:
   names, and `uns/batch_condition` columns map to stored names. Cytebase `obs_summary` uses
   stored names while `h5ad_keys` keeps source names. The original name is not recorded in the
   store, and `to_h5ad` exports the stored names. `DataStoreMerge` rejects a `source_column` or
-  `prepend_text` with a separator, and run snapshots and stored selections treat `\` like `/`.
+  `prepend_text` with a separator or the mask prefix, at construction and again when planning,
+  and run snapshots and stored selections treat `\` like `/` and name the `_` spelling. H5AD
+  listing keeps a nested group visible when resolved names do not cover all of it, so the reader
+  reports it, and leaves datasets with more than one dimension out of the planned names. A 10x
+  feature-reference column that is empty for every feature is not planned.
 - Seurat: `SeuratReader` and `inspect_seurat` resolve sidecars only inside `sidecar_root`
   (default: the `.rds` directory), and stream sources need it for sidecar-backed layers. Counts
   containing R `NA` raise `missing_count_value`. Dimnames and LogMap identifiers override names
