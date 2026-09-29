@@ -104,7 +104,7 @@ def _patch_ingest_summary(
 
 def test_detect_format_by_suffix(tmp_path: Path) -> None:
     assert detect_format(tmp_path / "a.h5ad") == "h5ad"
-    assert detect_format(tmp_path / "a.loom") == "loom"
+    assert detect_format(tmp_path / "a.loom") == "unknown"
     assert detect_format(tmp_path / "a.rds") == "seurat"
     assert detect_format(tmp_path / "a.csv") == "csv"
     assert detect_format(tmp_path / "a.zarr") == "zarr"
@@ -323,6 +323,20 @@ def test_ingest_unknown_file_returns_structured_failure(tmp_path: Path) -> None:
 
     assert result.status == "failed"
     assert result.format == "unknown"
+    assert result.actions == []
+    assert result.acceptedActions == []
+    assert not destination.exists()
+
+
+def test_ingest_loom_file_is_an_unsupported_format(tmp_path: Path) -> None:
+    path = tmp_path / "counts.loom"
+    path.write_bytes(b"stub")
+    destination = tmp_path / "out.zarr"
+    result = ingest(path=path, zarrPath=destination)
+
+    assert result.status == "failed"
+    assert result.format == "unknown"
+    assert any("Unsupported input format" in note for note in result.notes)
     assert result.actions == []
     assert result.acceptedActions == []
     assert not destination.exists()
@@ -835,166 +849,6 @@ def test_ingest_seurat_failure_closes_reader(
     assert result.acceptedActions == []
     assert len(created_readers) == 1
     assert created_readers[0].close_calls == 1
-    assert any("partial store" in note for note in result.notes)
-    assert destination.is_dir()
-
-
-def test_ingest_loom_success_forwards_reader_options_and_closes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import importlib
-
-    readers = importlib.import_module("scarf.readers.loom")
-    writers = importlib.import_module("scarf.writers.loom")
-    source = tmp_path / "counts.loom"
-    source.write_bytes(b"stub")
-    destination = tmp_path / "out.zarr"
-
-    class FakeHandle:
-        def __init__(self) -> None:
-            self.close_calls = 0
-
-        def close(self) -> None:
-            self.close_calls += 1
-
-    class FakeReader:
-        def __init__(self, path: str, **kwargs: str) -> None:
-            self.path = path
-            self.kwargs = kwargs
-            self.h5 = FakeHandle()
-
-    class FakeWriter:
-        def __init__(
-            self,
-            reader: FakeReader,
-            *,
-            zarr_loc: str,
-            assay_name: str,
-        ) -> None:
-            self.reader = reader
-            self.zarr_loc = zarr_loc
-            self.assay_name = assay_name
-            self.dump_calls = 0
-
-        def dump(self) -> None:
-            self.dump_calls += 1
-            Path(self.zarr_loc).mkdir()
-
-    created_readers: list[FakeReader] = []
-    created_writers: list[FakeWriter] = []
-
-    def make_reader(path: str, **kwargs: str) -> FakeReader:
-        reader = FakeReader(path, **kwargs)
-        created_readers.append(reader)
-        return reader
-
-    def make_writer(
-        reader: FakeReader,
-        *,
-        zarr_loc: str,
-        assay_name: str,
-    ) -> FakeWriter:
-        writer = FakeWriter(
-            reader,
-            zarr_loc=zarr_loc,
-            assay_name=assay_name,
-        )
-        created_writers.append(writer)
-        return writer
-
-    monkeypatch.setattr(readers, "LoomReader", make_reader)
-    monkeypatch.setattr(writers, "LoomToZarr", make_writer)
-    _patch_ingest_summary(monkeypatch, assay_name="ADT")
-
-    result = ingest(
-        path=source,
-        zarrPath=destination,
-        directions={
-            "cellNamesKey": "cells",
-            "featureNamesKey": "genes",
-            "assayName": "ADT",
-            "defaultAssay": "ADT",
-        },
-    )
-
-    assert result.status == "done"
-    assert result.format == "loom"
-    assert result.assayNames == ["ADT"]
-    assert len(created_readers) == 1
-    assert created_readers[0].path == str(source)
-    assert created_readers[0].kwargs == {
-        "cell_names_key": "cells",
-        "feature_names_key": "genes",
-    }
-    assert created_readers[0].h5.close_calls == 1
-    assert len(created_writers) == 1
-    assert created_writers[0].reader is created_readers[0]
-    assert created_writers[0].assay_name == "ADT"
-    assert created_writers[0].dump_calls == 1
-    assert result.acceptedActions[0]["op"] == "LoomToZarr"
-    assert result.acceptedActions[-1]["op"] == "DataStore"
-    assert result.acceptedActions[-1]["defaultAssay"] == "ADT"
-    assert destination.is_dir()
-
-
-def test_ingest_loom_failure_closes_reader_handle(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import importlib
-
-    readers = importlib.import_module("scarf.readers.loom")
-    writers = importlib.import_module("scarf.writers.loom")
-    source = tmp_path / "counts.loom"
-    source.write_bytes(b"stub")
-    destination = tmp_path / "out.zarr"
-
-    class FakeHandle:
-        def __init__(self) -> None:
-            self.close_calls = 0
-
-        def close(self) -> None:
-            self.close_calls += 1
-
-    class FakeReader:
-        def __init__(self, _path: str, **_kwargs: str) -> None:
-            self.h5 = FakeHandle()
-
-    class FailingWriter:
-        def __init__(
-            self,
-            _reader: FakeReader,
-            *,
-            zarr_loc: str,
-            assay_name: str,
-        ) -> None:
-            del assay_name
-            self.zarr_loc = zarr_loc
-
-        def dump(self) -> None:
-            Path(self.zarr_loc).mkdir()
-            raise OSError("conversion failed")
-
-    created_readers: list[FakeReader] = []
-
-    def make_reader(path: str, **kwargs: str) -> FakeReader:
-        reader = FakeReader(path, **kwargs)
-        created_readers.append(reader)
-        return reader
-
-    monkeypatch.setattr(readers, "LoomReader", make_reader)
-    monkeypatch.setattr(writers, "LoomToZarr", FailingWriter)
-
-    result = ingest(path=source, zarrPath=destination)
-
-    assert result.status == "failed"
-    assert result.format == "loom"
-    assert result.zarrPath == str(destination)
-    assert result.actions == []
-    assert result.acceptedActions == []
-    assert len(created_readers) == 1
-    assert created_readers[0].h5.close_calls == 1
     assert any("partial store" in note for note in result.notes)
     assert destination.is_dir()
 

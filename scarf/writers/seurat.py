@@ -26,16 +26,21 @@ from ..storage.artifact_writer import (
     plan_artifact,
 )
 from ..storage.io_policy import StorageIoPolicy
+from ..storage.metadata_keys import (
+    RESERVED_METADATA_COLUMNS,
+    is_reserved_metadata_name,
+    metadata_column_key,
+    metadata_column_keys,
+)
 from ..storage.profiles import StorageProfile, ZarrLocation
 from ..storage.refs import ArtifactRef
 from ._store import (
     DEFAULT_IMPORT_BLOCK_ROWS,
-    RESERVED_METADATA_COLUMNS,
     bounded_block_rows,
     decode_text,
     fingerprint_row_blocks,
     floating_payload_dtype,
-    is_reserved_metadata_name,
+    keyed_metadata_columns,
     resolve_import_cell_selection,
 )
 
@@ -204,6 +209,19 @@ class SeuratToZarr:
                     f"Assay {assay.name!r} has shape {assay.counts.shape}, "
                     f"expected {expected_shape}"
                 )
+        # Zarr nests a name with '/' or '\\', so such a column is stored with
+        # '_' in their place; a valid name keeps its exact key.
+        cell_metadata_keys = metadata_column_keys(
+            reader.cellMetadata.columnNames,
+            taken={*RESERVED_METADATA_COLUMNS, *membership_names},
+        )
+        feature_metadata_keys = {
+            assay.name: metadata_column_keys(
+                assay.featureMetadata.columnNames,
+                taken=RESERVED_METADATA_COLUMNS,
+            )
+            for assay in assays
+        }
 
         source_digest = bytes.fromhex(reader.document.source.source_sha256)
         if len(source_digest) != 32:
@@ -235,6 +253,8 @@ class SeuratToZarr:
         self._assays = assays
         self._reductions = reductions
         self._activeIdentity = active_identity
+        self._cellMetadataKeys = cell_metadata_keys
+        self._featureMetadataKeys = feature_metadata_keys
         self._sourceDigest = source_digest
         self._notices = self._collect_notices(inspection.notices, assays, reductions)
         self._residentSourceBytes = sum(
@@ -293,7 +313,11 @@ class SeuratToZarr:
 
     @staticmethod
     def _validate_metadata_name(name: str, axis: str) -> None:
-        if not is_reserved_metadata_name(name):
+        if name in {"", ".", ".."}:
+            raise ValueError(
+                f"{axis} metadata column {name!r} cannot name a Zarr array"
+            )
+        if not is_reserved_metadata_name(metadata_column_key(name)):
             return
         if name in RESERVED_METADATA_COLUMNS:
             raise ValueError(f"{axis} metadata column {name!r} is reserved")
@@ -414,8 +438,12 @@ class SeuratToZarr:
             self.reader.cellIds,
             block_rows,
         )
-        for column in self.reader.cellMetadata.columns:
-            self._write_metadata_column(self.cellData, column, block_rows)
+        for key, column in keyed_metadata_columns(
+            ((column.name, column) for column in self.reader.cellMetadata.columns),
+            self._cellMetadataKeys,
+            "cell",
+        ):
+            self._write_metadata_column(self.cellData, column, block_rows, name=key)
         for assay in self._assays:
             if assay.cellMembership.allIncluded:
                 continue
@@ -437,8 +465,12 @@ class SeuratToZarr:
             assay.featureIds,
             block_rows,
         )
-        for column in assay.featureMetadata.columns:
-            self._write_metadata_column(group, column, block_rows)
+        for key, column in keyed_metadata_columns(
+            ((column.name, column) for column in assay.featureMetadata.columns),
+            self._featureMetadataKeys[assay.name],
+            f"{assay.name} feature",
+        ):
+            self._write_metadata_column(group, column, block_rows, name=key)
 
     @staticmethod
     def _write_string_axis(

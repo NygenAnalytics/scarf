@@ -8,9 +8,9 @@ from typing import Any, Literal, cast
 import h5py
 import numpy as np
 
+from ...readers._h5ad_columns import table_column_names
 from ...readers._h5ad_inspect import (
     _as_text,
-    _column_names,
     _matrix_candidates,
     _MatrixCandidate,
     _node_length,
@@ -18,6 +18,7 @@ from ...readers._h5ad_inspect import (
     _select_matrix,
     inspect_h5ad,
 )
+from ...storage.metadata_keys import metadata_column_keys
 from .._deps import AGENT_INSTALL_HINT
 from ..types import AgentDataModel
 
@@ -465,16 +466,18 @@ def _plain_summary(
 
 def _summarize_column(
     table: h5py.Group | h5py.Dataset,
-    name: str,
+    source: str,
     *,
+    name: str,
     row_count: int,
     chunk_values: int,
     max_domain_values: int,
     schema_fields: frozenset[str],
 ) -> MetadataColumnSummary:
+    """Summarize the column read by its ``source`` name under ``name``."""
     chunks, dtype, categories = _column_source(
         table,
-        name,
+        source,
         row_count=row_count,
         chunk_values=chunk_values,
     )
@@ -522,35 +525,42 @@ def _summarize_table(
     if not isinstance(node, h5py.Group | h5py.Dataset):
         return MetadataTableSummary(key=key, rowCount=0)
     row_count = _node_length(node) or 0
-    names = sorted(_column_names(node))
+    # Columns are reported under the keys that conversion stores them as;
+    # columns that conversion skips are left out.
+    keys = metadata_column_keys(table_column_names(node))
     identifiers = _index_columns(node)
     held_out = {
-        name
-        for name in names
+        source
+        for source, name in keys.items()
         if author_label_policy == "holdout" and _is_author_label(name)
     }
     inspectable = [
-        name for name in names if name not in identifiers and name not in held_out
+        source
+        for source in keys
+        if source not in identifiers and source not in held_out
     ]
-    inspectable.sort(key=lambda name: (name.lower() not in schema_fields, name))
+    inspectable.sort(
+        key=lambda source: (keys[source].lower() not in schema_fields, keys[source])
+    )
     selected = inspectable[:max_columns]
     columns = [
         _summarize_column(
             node,
-            name,
+            source,
+            name=keys[source],
             row_count=row_count,
             chunk_values=chunk_values,
             max_domain_values=max_domain_values,
             schema_fields=schema_fields,
         )
-        for name in selected
+        for source in selected
     ]
     return MetadataTableSummary(
         key=key,
         rowCount=row_count,
         columns=columns,
         schemaFields=sorted(summary.name for summary in columns if summary.schemaField),
-        identifierColumns=sorted(identifiers),
+        identifierColumns=sorted(keys.get(name, name) for name in identifiers),
         omittedColumnCount=max(0, len(inspectable) - len(selected)),
         heldOutAuthorColumnCount=len(held_out),
     )
@@ -902,18 +912,15 @@ def inspect_h5ad_manifest(
             h5,
             ("uns/batch_condition",),
         )
-        obs_node = h5.get("obs")
-        obs_columns = (
-            set(_column_names(obs_node))
-            if isinstance(obs_node, h5py.Group | h5py.Dataset)
-            else set()
-        )
-        unknown_batch_columns = sorted(set(declared_batch_columns) - obs_columns)
+        # Downstream batch directions name the columns that conversion stores.
+        obs_keys = metadata_column_keys(table_column_names(h5.get("obs")))
+        unknown_batch_columns = sorted(set(declared_batch_columns) - set(obs_keys))
         if unknown_batch_columns:
             raise ValueError(
-                "uns/batch_condition references unknown obs columns: "
-                f"{unknown_batch_columns}"
+                "uns/batch_condition references obs columns that are missing or "
+                f"that Scarf does not import: {unknown_batch_columns}"
             )
+        declared_batch_columns = [obs_keys[name] for name in declared_batch_columns]
 
     selected_table = raw_var if inspection.featureAttrsKey == "raw/var" else var
     assay = _column_by_name(

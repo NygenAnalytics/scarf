@@ -25,7 +25,7 @@ _HTO_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 
-CONVERT_FORMATS = frozenset({"h5ad", "10x_h5", "10x_dir", "mtx", "loom", "seurat"})
+CONVERT_FORMATS = frozenset({"h5ad", "10x_h5", "10x_dir", "mtx", "seurat"})
 
 # Inspection and summary boundaries expose data, layout, and I/O failures.
 # Some readers use RuntimeError for data-dependent conversion failures, so that

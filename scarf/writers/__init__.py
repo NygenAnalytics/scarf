@@ -15,7 +15,6 @@ if TYPE_CHECKING:
     from .csv import CSVtoZarr
     from .export import to_h5ad, to_mtx
     from .h5ad import H5adImportResult, H5adToZarr
-    from .loom import LoomToZarr
     from .seurat import SeuratImportResult, SeuratToZarr
     from .sparse import SparseToZarr
     from .subset import SubsetZarr, subset_assay_zarr
@@ -32,7 +31,6 @@ __all__ = [
     "MtxToZarr",
     "H5adImportResult",
     "H5adToZarr",
-    "LoomToZarr",
     "SeuratImportResult",
     "SeuratToZarr",
     "SparseToZarr",
@@ -56,7 +54,6 @@ __getattr__, __dir__ = _lazy_facade(
         "to_mtx": ".export",
         "H5adImportResult": ".h5ad",
         "H5adToZarr": ".h5ad",
-        "LoomToZarr": ".loom",
         "SeuratImportResult": ".seurat",
         "SeuratToZarr": ".seurat",
         "SparseToZarr": ".sparse",

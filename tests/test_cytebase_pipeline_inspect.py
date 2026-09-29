@@ -18,6 +18,7 @@ from tests.fixtures_cytebase import (
     COUNTS,
     full_manifest,
     write_categorical,
+    write_column_order,
     write_h5ad,
 )
 
@@ -954,33 +955,103 @@ def test_inspect_file_without_usable_tables_reports_zero_dimensions(tmp_path):
     assert "var" not in result["h5ad_keys"]
 
 
-# HDF5 nests a column whose name contains "/", as in some CELLxGENE sources.
+# Old AnnData versions nested a column whose name contains "/" into HDF5 groups,
+# as in some CELLxGENE sources, while ``column-order`` kept the full name.
 NESTED_COLUMN = "Baseline eGFR (ml/min/1.73m2) (Binned)"
+NESTED_COLUMN_KEY = "Baseline eGFR (ml_min_1.73m2) (Binned)"
+OBS_COLUMNS = ["is_primary_data", "cell_type", "donor_id", "n_genes"]
+UNSUPPORTED = {"dtype": "unsupported", "encoding": None, "categoryCount": None}
 
 
-def test_inspect_file_skips_obs_children_that_are_not_columns(tmp_path):
-    clean = write_h5ad(tmp_path / "clean.h5ad")
-    path = write_h5ad(tmp_path / "source.h5ad")
-    with h5py.File(path, "r+") as h5:
-        write_categorical(h5["obs"], NESTED_COLUMN, ["30-60", ">60"] * 3)
-        h5["obs"].create_group("unsupported").create_dataset("x", data=np.arange(6))
+def _inspect_with_warnings(path) -> tuple[dict[str, Any], list[str]]:
     messages: list[str] = []
     handler = logger.add(messages.append, level="WARNING", format="{message}")
     try:
         result = build.inspect_file(path)
     finally:
         logger.remove(handler)
+    return result, [m.strip() for m in messages if "Skipping obs column" in m]
 
-    assert result["obs_summary"] == build.inspect_file(clean)["obs_summary"]
-    unsupported = {"dtype": "unsupported", "encoding": None, "categoryCount": None}
+
+def test_inspect_file_reads_obs_columns_that_hdf5_nests(tmp_path):
+    clean = write_h5ad(tmp_path / "clean.h5ad")
+    path = write_h5ad(tmp_path / "source.h5ad")
+    with h5py.File(path, "r+") as h5:
+        obs = h5["obs"]
+        write_categorical(obs, NESTED_COLUMN, ["30-60", ">60"] * 3)
+        obs.create_group("unsupported").create_dataset("x", data=np.arange(6))
+        write_column_order(obs, [*OBS_COLUMNS, NESTED_COLUMN, "unsupported"])
+
+    result, warnings = _inspect_with_warnings(path)
+
     obs_keys = result["h5ad_keys"]["obs"]
-    assert obs_keys["Baseline eGFR (ml"] == obs_keys["unsupported"] == unsupported
-    assert [m.strip() for m in messages if "Skipping obs column" in m] == [
+    # The column listing keeps source names; only whole columns are listed.
+    assert obs_keys[NESTED_COLUMN] == {
+        "dtype": "|S5",
+        "encoding": "categorical",
+        "categoryCount": 2,
+    }
+    assert "Baseline eGFR (ml" not in obs_keys
+    assert obs_keys["unsupported"] == UNSUPPORTED
+    # Summaries use the name the column is stored under in the Scarf store.
+    summary = result["obs_summary"]
+    assert summary.pop(NESTED_COLUMN_KEY) == {
+        "uniqueCount": 2,
+        "topValues": [
+            {"value": "30-60", "count": 3},
+            {"value": ">60", "count": 3},
+        ],
+        "missing": 0,
+    }
+    assert summary == build.inspect_file(clean)["obs_summary"]
+    assert warnings == [
+        "Skipping obs column 'unsupported' because its H5AD encoding "
+        "'unknown' is not supported"
+    ]
+
+
+def test_inspect_file_without_column_order_skips_groups_that_hdf5_nests(tmp_path):
+    clean = write_h5ad(tmp_path / "clean.h5ad")
+    path = write_h5ad(tmp_path / "source.h5ad")
+    with h5py.File(path, "r+") as h5:
+        write_categorical(h5["obs"], NESTED_COLUMN, ["30-60", ">60"] * 3)
+        h5["obs"].create_group("unsupported").create_dataset("x", data=np.arange(6))
+
+    result, warnings = _inspect_with_warnings(path)
+
+    # Without column-order only the direct children are known, as in the reader.
+    assert result["obs_summary"] == build.inspect_file(clean)["obs_summary"]
+    obs_keys = result["h5ad_keys"]["obs"]
+    assert obs_keys["Baseline eGFR (ml"] == obs_keys["unsupported"] == UNSUPPORTED
+    assert NESTED_COLUMN not in obs_keys
+    assert warnings == [
         "Skipping obs column 'Baseline eGFR (ml' because its H5AD encoding "
         "'unknown' is not supported",
         "Skipping obs column 'unsupported' because its H5AD encoding "
         "'unknown' is not supported",
     ]
+
+
+def test_inspect_file_summarizes_clashing_obs_names_under_distinct_keys(tmp_path):
+    path = write_h5ad(tmp_path / "source.h5ad")
+    sources = ["a/b", "a\\b", "a_b"]
+    with h5py.File(path, "r+") as h5:
+        obs = h5["obs"]
+        for offset, name in enumerate(sources):
+            obs.create_dataset(name, data=np.arange(6, dtype=np.int64) + 10 * offset)
+        write_column_order(obs, [*OBS_COLUMNS, *sources])
+
+    result, warnings = _inspect_with_warnings(path)
+
+    assert set(sources) <= set(result["h5ad_keys"]["obs"])
+    summary = result["obs_summary"]
+    # The exact valid name keeps its key; renamed columns take suffixes in order.
+    assert {key: summary[key]["min"] for key in ("a_b", "a_b_2", "a_b_3")} == {
+        "a_b": 20.0,
+        "a_b_2": 0.0,
+        "a_b_3": 10.0,
+    }
+    assert warnings == []
 
 
 def test_inspect_file_asks_for_input_when_scarf_picks_another_feature_table(

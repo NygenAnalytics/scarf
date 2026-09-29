@@ -682,3 +682,30 @@ def test_head_reads_only_the_requested_rows(monkeypatch):
 
     monkeypatch.setattr(table, "fetch_all", fail)
     assert table.head(2)["score"].tolist() == [0.5, 2.0]
+
+
+@pytest.mark.parametrize("name", ["a/b", "a\\b"], ids=["slash", "backslash"])
+def test_insert_rejects_zarr_path_separators_before_writing(name):
+    table = _metadata_fixture()
+
+    with pytest.raises(ValueError, match="path separators; use 'a_b' instead"):
+        table.insert(name, np.arange(4.0))
+
+    assert set(table._group.keys()) == {"I", "ids", "names", "score"}
+    assert not table._is_public(name)
+    with pytest.raises(KeyError, match="look for 'a_b' or a numbered variant"):
+        table.fetch_all(name)
+    with pytest.raises(KeyError, match="'a_b_2'"):
+        table.drop(name)
+
+
+def test_nested_group_from_an_older_import_asks_for_a_new_import():
+    table = _metadata_fixture()
+    # Older imports let Zarr nest a source column named with '/' into groups.
+    table._group.create_array("Baseline (ml/min)", data=np.ones(4))
+
+    assert "Baseline (ml" in table.columns
+    with pytest.raises(TypeError, match="nested group named 'Baseline \\(ml'"):
+        table.fetch_all("Baseline (ml")
+    with pytest.raises(TypeError, match="import the source again"):
+        table.head()

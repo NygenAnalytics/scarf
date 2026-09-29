@@ -29,8 +29,6 @@ _EXPECTED_EXPORTS = {
     "H5adImportResult": "scarf.writers",
     "H5adReader": "scarf.readers",
     "H5adToZarr": "scarf.writers",
-    "LoomReader": "scarf.readers",
-    "LoomToZarr": "scarf.writers",
     "MtxReader": "scarf.readers",
     "MtxToZarr": "scarf.writers",
     "SeuratImportResult": "scarf.writers",
@@ -524,6 +522,24 @@ def test_retired_merge_names_are_absent():
     for name in ("DatasetMerge", "AssayMerge"):
         assert not hasattr(scarf, name)
         assert not hasattr(merge_module, name)
+
+
+def test_retired_loom_names_are_absent():
+    from importlib.util import find_spec
+
+    import scarf
+    import scarf.readers as readers_module
+    import scarf.writers as writers_module
+
+    for module in (scarf, readers_module, writers_module):
+        for name in ("LoomReader", "LoomToZarr"):
+            assert not hasattr(module, name)
+    for module_name in (
+        "scarf.readers.loom",
+        "scarf.writers.loom",
+        "scarf.agent.ingest.loom",
+    ):
+        assert find_spec(module_name) is None
 
 
 def test_retired_dask_names_are_absent():

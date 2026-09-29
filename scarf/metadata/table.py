@@ -13,6 +13,10 @@ from ..storage.arrays import (
     create_zarr_obj_array,
     linked_missing_mask,
 )
+from ..storage.metadata_keys import (
+    metadata_column_key,
+    validate_metadata_column_name,
+)
 from ..utils.logging import logger
 from .queries import (
     _all_true,
@@ -86,7 +90,21 @@ class MetaData:
 
     @staticmethod
     def _is_public(column: str) -> bool:
-        return "/" not in column and not column.startswith(MISSING_MASK_PREFIX)
+        return metadata_column_key(column) == column and not column.startswith(
+            MISSING_MASK_PREFIX
+        )
+
+    @staticmethod
+    def _missing_column(column: str) -> KeyError:
+        message = f"{column} does not exist in the metadata columns."
+        key = metadata_column_key(column)
+        if key != column:
+            message += (
+                " Scarf stores imported columns with '_' in place of '/' and "
+                f"'\\'; look for {key!r} or a numbered variant such as "
+                f"'{key}_2'."
+            )
+        return KeyError(message)
 
     def _column_names(self) -> list[str]:
         # Zarr lists members in no particular order, so sort them.
@@ -104,6 +122,15 @@ class MetaData:
         )
 
     def _get_array(self, column: str) -> zarr.Array:
+        """Return the array of a public column.
+
+        Raises:
+            KeyError: If the table has no public column of that name.
+            TypeError: If the name holds a group. Stores written before Scarf
+                renamed imported columns nested a source column whose name
+                contains ``/`` or ``\\`` into groups; such a store must be
+                imported again.
+        """
         # One metadata read per column: a membership test before indexing
         # doubles the round trips on object stores.
         if self._is_public(column):
@@ -112,12 +139,19 @@ class MetaData:
             except KeyError:
                 pass
             else:
+                if isinstance(node, zarr.Group):
+                    raise TypeError(
+                        f"The metadata table holds a nested group named {column!r} "
+                        "instead of a column. A source column name containing "
+                        "'/' or '\\' created it; import the source again to "
+                        "store that column under a name with '_' in their place."
+                    )
                 return as_zarr_array(node, name=column)
-        raise KeyError(f"{column} does not exist in the metadata columns.")
+        raise self._missing_column(column)
 
     def _get_missing_mask_array(self, column: str) -> zarr.Array | None:
         if not self._has_column(column):
-            raise KeyError(f"{column} does not exist in the metadata columns.")
+            raise self._missing_column(column)
         return linked_missing_mask(self._group, column, label=f"Column {column!r}")
 
     def get_dtype(self, column: str) -> np.dtype[Any]:
@@ -296,7 +330,14 @@ class MetaData:
         overwrite: bool = False,
         force: bool = False,
     ) -> None:
-        """Insert a column into the table."""
+        """Insert a column into the table.
+
+        Raises:
+            ValueError: If ``column_name`` is protected, already exists
+                without ``overwrite``, or contains ``/`` or ``\\``, which
+                Zarr reads as path separators.
+        """
+        validate_metadata_column_name(column_name)
         if column_name in ["I", "ids"] and force is False:
             raise ValueError(
                 f"ERROR: {column_name} is a protected column name in MetaData class."
@@ -333,7 +374,7 @@ class MetaData:
                 "Cannot be deleted"
             )
         if not self._has_column(column):
-            raise KeyError(f"{column} does not exist in the metadata columns.")
+            raise self._missing_column(column)
         from ..storage.identity import clear_column
 
         clear_column(self._group, column)

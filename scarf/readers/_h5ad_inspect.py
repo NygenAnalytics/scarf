@@ -20,6 +20,7 @@ from ._h5ad_columns import (
     read_table_column,
     sparse_encoding,
     sparse_shape,
+    table_column_names,
 )
 from ._text import as_text as _as_text
 
@@ -229,12 +230,6 @@ def _read_column(
     return present_column(values, missing)
 
 
-def _column_names(node: h5py.Group | h5py.Dataset) -> list[str]:
-    if isinstance(node, h5py.Dataset):
-        return list(node.dtype.names or ())
-    return [key for key, child in node.items() if is_column(child)]
-
-
 def _matching_key(names: list[str], preferences: tuple[str, ...]) -> str | None:
     normalized = {name.lower(): name for name in names}
     for preferred in preferences:
@@ -278,7 +273,7 @@ def _find_cell_ids(
 ) -> str:
     if node is None:
         return "_index"
-    names = _column_names(node)
+    names = table_column_names(node)
     index_key = _index_key(node)
     if index_key is not None and index_key in names:
         values = _read_column(node, index_key)
@@ -358,7 +353,7 @@ def _find_features(
     node: h5py.Group | h5py.Dataset,
     n_features: int,
 ) -> tuple[str, str]:
-    names = _column_names(node)
+    names = table_column_names(node)
     columns = _FeatureColumns(node, n_features)
     index = _table_index(node, names)
     explicit_ids = [
@@ -556,7 +551,7 @@ def inspect_h5ad(
         assay_split_key = None
         suggested_assays: dict[str, int] = {}
         if isinstance(feature_node, h5py.Group | h5py.Dataset):
-            feature_columns = _column_names(feature_node)
+            feature_columns = table_column_names(feature_node)
             assay_split_key = _matching_key(
                 feature_columns, ("feature_types", "feature_type")
             )

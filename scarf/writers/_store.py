@@ -13,46 +13,80 @@ from ..storage.schema import (
     create_zarr_count_assay as _create_zarr_count_assay,
 )
 from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.metadata_keys import (
+    is_reserved_metadata_name,
+    metadata_column_key,
+    validate_metadata_column_name,
+)
 from ..storage.profiles import StorageProfile
 from ..storage.refs import ArtifactRef
 from ..utils.logging import logger
 
-RESERVED_METADATA_COLUMNS = frozenset({"I", "ids", "names"})
 DEFAULT_IMPORT_BLOCK_ROWS = 65_536
 
 
-def is_reserved_metadata_name(name: str) -> bool:
-    """Return whether a source column name collides with Scarf's own columns."""
-    return name in RESERVED_METADATA_COLUMNS or name.startswith(MISSING_MASK_PREFIX)
-
-
-def skip_reserved_metadata_columns[T](
+def keyed_metadata_columns[T](
     columns: Iterable[tuple[str, T]],
+    keys: Mapping[str, str],
     axis: str,
 ) -> Iterator[tuple[str, T]]:
-    """Yield source metadata columns except those with reserved names.
+    """Yield source metadata columns under the keys planned for them.
 
-    Scarf writes its own ``ids``, ``names``, and ``I`` columns into every cell
-    and feature table and links missing-value masks through columns named
-    ``__scarf_missing__<name>``. A source column that would replace one of
-    them is skipped with a warning.
+    Plan ``keys`` with :func:`~scarf.storage.metadata_keys.metadata_column_keys`
+    over the source column names. Columns stream one at a time, so a caller
+    holds a single column payload in memory. A source name that the plan
+    leaves out is skipped with a warning: it is reserved by Scarf, cannot name
+    a Zarr array, or is already a column of the destination. A repeated source
+    name is skipped after its first column. Scarf keeps no record of a renamed
+    column's source name; the warning is the only report of it.
 
     Args:
-        columns: Pairs of source column name and payload.
-        axis: Table description used in the warning, such as ``cell``.
+        columns: Pairs of source column name and payload, in source order.
+        keys: Destination key of each source name to write.
+        axis: Table description used in warnings, such as ``cell``.
 
     Yields:
-        The pairs whose names are not reserved.
+        Pairs of destination key and payload.
     """
+    seen: set[str] = set()
     for name, payload in columns:
-        if is_reserved_metadata_name(name):
+        if name in seen:
             logger.warning(
-                f"Skipped source {axis} metadata column {name!r} because Scarf "
-                "reserves the column names 'I', 'ids', and 'names' and the "
-                f"prefix {MISSING_MASK_PREFIX!r}"
+                f"Skipped source {axis} metadata column {name!r} because the "
+                "source repeats that column name"
             )
             continue
-        yield name, payload
+        seen.add(name)
+        key = keys.get(name)
+        if key is None:
+            logger.warning(_skipped_column_reason(name, axis))
+            continue
+        if key != name:
+            base = metadata_column_key(name)
+            clash = f", and {base!r} is already used" if key != base else ""
+            logger.warning(
+                f"Stored source {axis} metadata column {name!r} as {key!r} "
+                f"because Zarr reads '/' and '\\' as path separators{clash}"
+            )
+        yield key, payload
+
+
+def _skipped_column_reason(name: str, axis: str) -> str:
+    if is_reserved_metadata_name(metadata_column_key(name)):
+        return (
+            f"Skipped source {axis} metadata column {name!r} because Scarf "
+            "reserves the column names 'I', 'ids', and 'names' and the "
+            f"prefix {MISSING_MASK_PREFIX!r}"
+        )
+    if name in {"", ".", ".."}:
+        return (
+            f"Skipped source {axis} metadata column {name!r} because that name "
+            "cannot name a Zarr array"
+        )
+    return (
+        f"Skipped source {axis} metadata column {name!r} because the "
+        f"destination already has a column named {name!r}"
+    )
 
 
 def decode_text(value: Any) -> str:
@@ -137,11 +171,13 @@ def write_metadata_column(
         profile: Zarr encoding profile. When None, chosen from the store.
 
     Raises:
-        ValueError: If the values are not one-dimensional or the mask does not
-            align with them.
+        TypeError: If ``name`` is not a string.
+        ValueError: If ``name`` cannot name one Zarr array, or the values are
+            not one-dimensional or the mask does not align with them.
     """
     from ..storage.arrays import MetadataBlock, create_streamed_metadata_column
 
+    validate_metadata_column_name(name)
     array = np.asarray(values)
     if array.ndim != 1:
         raise ValueError(

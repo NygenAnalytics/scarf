@@ -786,38 +786,6 @@ def test_h5adtozarr_imports_float16_counts_as_float32(
     np.testing.assert_array_equal(root["RNA/countsT"][:], values.T)
 
 
-def test_loomtozarr_imports_float16_counts_as_float32(tmp_path):
-    import h5py
-
-    from scarf.readers import LoomReader
-    from scarf.writers import LoomToZarr
-
-    values = np.array([[1.5, 0], [0, 2], [3, 4.25]], dtype=np.float16)
-    path = tmp_path / "half.loom"
-    with h5py.File(path, mode="w") as handle:
-        handle.create_dataset("matrix", data=values.T)
-        cells = handle.create_group("col_attrs")
-        cells.create_dataset("obs_names", data=np.array([b"c1", b"c2", b"c3"]))
-        features = handle.create_group("row_attrs")
-        features.create_dataset("var_names", data=np.array([b"g1", b"g2"]))
-
-    reader = LoomReader(str(path))
-    store = MemoryStore()
-    try:
-        assert reader.matrixDtype == np.float32
-        LoomToZarr(
-            reader,
-            zarr_loc=store,
-            policy=CountMatrixPolicy(unitBytes=8, chunkBytes=8),
-        ).dump(batch_size=2)
-    finally:
-        reader.h5.close()
-
-    counts = zarr.open_group(store=store, mode="r")["RNA/counts"]
-    assert counts.dtype == np.dtype("float32")
-    np.testing.assert_array_equal(counts[:], values)
-
-
 def test_float16_is_rejected_as_a_count_storage_dtype(tmp_path):
     from scipy.sparse import csr_matrix
 
@@ -1099,146 +1067,6 @@ def test_h5ad_csc_spill_is_removed_when_the_reader_closes(tmp_path, from_inspect
     assert list(scratch.iterdir()) == []
 
 
-def test_loomtozarr(loom_reader, tmp_path):
-    from scarf.writers import LoomToZarr
-
-    fn = str(tmp_path / "sympathetic.zarr")
-    writer = LoomToZarr(loom_reader, zarr_loc=fn)
-    writer.dump()
-
-
-def test_loomtozarr_preserves_exact_counts_and_transpose(tmp_path):
-    import h5py
-
-    from scarf.readers import LoomReader
-    from scarf.writers import LoomToZarr
-
-    values = np.array([[1, 0], [0, 2], [3, 4]], dtype=np.uint16)
-    path = tmp_path / "exact.loom"
-    with h5py.File(path, mode="w") as handle:
-        handle.create_dataset("matrix", data=values.T)
-        cells = handle.create_group("col_attrs")
-        cells.create_dataset("obs_names", data=np.array([b"c1", b"c2", b"c3"]))
-        features = handle.create_group("row_attrs")
-        features.create_dataset("var_names", data=np.array([b"g1", b"g2"]))
-
-    reader = LoomReader(str(path))
-    store = MemoryStore()
-    try:
-        writer = LoomToZarr(
-            reader,
-            zarr_loc=store,
-            policy=CountMatrixPolicy(unitBytes=8, chunkBytes=8),
-        )
-        writer.dump(batch_size=2)
-    finally:
-        reader.h5.close()
-
-    root = zarr.open_group(store=store, mode="r")
-    np.testing.assert_array_equal(root["RNA/counts"][:], values)
-    assert "countsT" in root["RNA"]
-    assert root["RNA/countsT"].attrs["complete"] is True
-
-
-@pytest.mark.parametrize("batch_size", [0, -1])
-def test_loom_reader_and_writer_reject_nonpositive_batch_sizes(tmp_path, batch_size):
-    import h5py
-    from scarf.readers import LoomReader
-    from scarf.writers import LoomToZarr
-
-    path = tmp_path / "counts.loom"
-    with h5py.File(path, "w") as handle:
-        handle.create_dataset("matrix", data=np.ones((3, 2), dtype=np.uint16))
-    reader = LoomReader(str(path))
-    try:
-        writer = LoomToZarr(reader, MemoryStore(), nthreads=1)
-        with pytest.raises(ValueError, match="batch_size must be positive"):
-            list(reader.consume_dense(batch_size))
-        with pytest.raises(ValueError, match="batch_size must be positive"):
-            writer.dump(batch_size)
-        assert writer.z["RNA/counts"].nchunks_initialized == 0
-    finally:
-        reader.h5.close()
-
-
-def test_loom_import_rejects_budget_smaller_than_a_source_row(tmp_path):
-    import h5py
-    from scarf.readers import LoomReader
-    from scarf.writers import LoomToZarr
-
-    path = tmp_path / "counts.loom"
-    with h5py.File(path, "w") as handle:
-        handle.create_dataset("matrix", data=np.ones((3, 2), dtype=np.uint16))
-    reader = LoomReader(str(path))
-    try:
-        writer = LoomToZarr(reader, MemoryStore(), mem_budget=1, nthreads=1)
-        with pytest.raises(MemoryError, match="Loom import cannot fit"):
-            writer.dump(batch_size=1)
-        assert writer.z["RNA/counts"].nchunks_initialized == 0
-    finally:
-        reader.h5.close()
-
-
-def test_dense_loom_import_fits_a_bounded_memory_budget(tmp_path):
-    import h5py
-    from scarf.readers import LoomReader
-    from scarf.writers import LoomToZarr
-
-    values = np.ones((2000, 512), dtype=np.uint16)
-    values[::3, ::5] = 0
-    path = tmp_path / "dense.loom"
-    with h5py.File(path, "w") as handle:
-        handle.create_dataset("matrix", data=values.T, chunks=(128, 128))
-    reader = LoomReader(str(path), dtype="uint32")
-    try:
-        writer = LoomToZarr(
-            reader,
-            MemoryStore(),
-            mem_budget="8M",
-            nthreads=1,
-            policy=CountMatrixPolicy(unitBytes=256 * 1024, chunkBytes=64 * 1024),
-        )
-        writer.dump()
-        np.testing.assert_array_equal(writer.z["RNA/counts"][:], values)
-        np.testing.assert_array_equal(writer.z["RNA/countsT"][:], values.T)
-    finally:
-        reader.h5.close()
-
-
-@pytest.mark.parametrize("budget", ["10M", "32M"])
-def test_loom_admits_memory_for_incompressible_shard_writes(tmp_path, budget):
-    import h5py
-    from scarf.readers import LoomReader
-    from scarf.writers import LoomToZarr
-
-    values = np.random.default_rng(17).integers(
-        0, 2**32, size=(1024, 1024), dtype=np.uint32
-    )
-    path = tmp_path / "counts.loom"
-    with h5py.File(path, "w") as handle:
-        handle.create_dataset("matrix", data=values.T, chunks=(128, 128))
-    reader = LoomReader(str(path))
-    try:
-        writer = LoomToZarr(
-            reader,
-            str(tmp_path / "counts.zarr"),
-            mem_budget=budget,
-            nthreads=4,
-            profile="fast_local",
-            policy=CountMatrixPolicy(unitBytes=4 * 1024**2, chunkBytes=512 * 1024),
-        )
-        if budget == "10M":
-            with pytest.raises(MemoryError, match="Loom import cannot fit"):
-                writer.dump(batch_size=1)
-            assert writer.z["RNA/counts"].nchunks_initialized == 0
-        else:
-            writer.dump(batch_size=1)
-            np.testing.assert_array_equal(writer.z["RNA/counts"][:], values)
-            np.testing.assert_array_equal(writer.z["RNA/countsT"][:], values.T)
-    finally:
-        reader.h5.close()
-
-
 def test_sparsetozarr(tmp_path):
     from scipy.sparse import csr_matrix
 
@@ -1471,32 +1299,6 @@ def _write_reserved_h5ad(tmp_path):
     return store, ["c0", "c1", "c2"], ["f0", "f1", "f2"]
 
 
-def _write_reserved_loom(tmp_path):
-    import h5py
-
-    from scarf.readers import LoomReader
-    from scarf.writers import LoomToZarr
-
-    path = tmp_path / "reserved.loom"
-    with h5py.File(path, mode="w") as handle:
-        handle.create_dataset("matrix", data=np.eye(3, dtype=np.uint16))
-        cells = handle.create_group("col_attrs")
-        cells.create_dataset("obs_names", data=np.array([b"c0", b"c1", b"c2"]))
-        cells.create_dataset("ids", data=np.array([b"dup", b"dup", b"dup"]))
-        cells.create_dataset("I", data=np.array([False, True, False]))
-        cells.create_dataset("quality", data=np.array([1, 2, 3]))
-        features = handle.create_group("row_attrs")
-        features.create_dataset("var_names", data=np.array([b"g0", b"g1", b"g2"]))
-        features.create_dataset("ids", data=np.array([b"x", b"x", b"x"]))
-    reader = LoomReader(str(path), feature_ids_key="var_names")
-    store = MemoryStore()
-    try:
-        LoomToZarr(reader, zarr_loc=store).dump()
-    finally:
-        reader.h5.close()
-    return store, ["c0", "c1", "c2"], ["g0", "g1", "g2"]
-
-
 def _write_reserved_csv(tmp_path):
     path = tmp_path / "reserved.csv"
     path.write_text(
@@ -1568,11 +1370,10 @@ def _write_reserved_cellranger(tmp_path):
     "write",
     [
         _write_reserved_h5ad,
-        _write_reserved_loom,
         _write_reserved_csv,
         _write_reserved_cellranger,
     ],
-    ids=["h5ad", "loom", "csv", "cellranger"],
+    ids=["h5ad", "csv", "cellranger"],
 )
 def test_writers_skip_reserved_source_metadata_columns(tmp_path, write):
     from loguru import logger

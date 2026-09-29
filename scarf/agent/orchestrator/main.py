@@ -325,7 +325,9 @@ class AgentOrchestrator(
                         currentStage="ingest",
                         notes=[
                             "experimentalDirections.batchColumns must include the "
-                            "CELLxGENE uns/batch_condition columns"
+                            "CELLxGENE uns/batch_condition columns, named as "
+                            "Scarf stores them: "
+                            f"{list(dataset_manifest.declaredBatchColumns)}"
                         ],
                     )
                 request = request.model_copy(

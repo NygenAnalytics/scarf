@@ -1251,28 +1251,6 @@ def test_h5ad_reader_falls_back_without_metadata_groups(tmp_path):
         reader.h5.close()
 
 
-def test_loom_reader(loom_reader):
-    assert loom_reader.nCells == 298 == len(loom_reader.cell_ids())
-    assert loom_reader.nFeatures == 16892 == len(loom_reader.feature_names())
-
-
-def test_loom_reader_streams_metadata_and_counts(loom_reader):
-    cell_attributes = dict(loom_reader.get_cell_attrs())
-    assert cell_attributes.keys() == {"Area", "Cell_cluster"}
-    assert all(
-        values.shape == (loom_reader.nCells,) for values in cell_attributes.values()
-    )
-    assert dict(loom_reader.get_feature_attrs()) == {}
-
-    chunks = list(loom_reader.consume_dense(batch_size=100))
-    assert [chunk.shape for chunk in chunks] == [
-        (100, loom_reader.nFeatures),
-        (100, loom_reader.nFeatures),
-        (98, loom_reader.nFeatures),
-    ]
-    assert sum(np.count_nonzero(chunk) for chunk in chunks) > 0
-
-
 @pytest.mark.parametrize("include_metadata", [True, False])
 def test_csv_reader_preserves_batches_skipped_columns_and_cell_metadata(
     tmp_path, include_metadata
@@ -1585,32 +1563,6 @@ def test_crh5_reader_filters_a_matrix_without_barcodes(tmp_path):
         reader.close()
 
 
-def test_loom_reader_skips_multidimensional_attributes(tmp_path):
-    import h5py
-
-    from scarf.readers import LoomReader
-
-    path = tmp_path / "embeddings.loom"
-    with h5py.File(path, "w") as h5:
-        h5.create_dataset("matrix", data=np.ones((3, 4), dtype=np.float32))
-        cells = h5.create_group("col_attrs")
-        cells.create_dataset(
-            "obs_names", data=np.array([f"c{i}".encode() for i in range(4)])
-        )
-        cells.create_dataset("X_pca", data=np.zeros((4, 2)))
-        cells.create_dataset("tags", data=np.array([[b"a", b"b"]] * 4))
-        cells.create_dataset("batch", data=np.array([b"x", b"y", b"x", b"y"]))
-        h5.create_group("row_attrs").create_dataset(
-            "var_names", data=np.array([b"g0", b"g1", b"g2"])
-        )
-
-    reader = LoomReader(str(path))
-    try:
-        assert set(dict(reader.get_cell_attrs())) == {"batch"}
-    finally:
-        reader.h5.close()
-
-
 def test_csv_reader_resolves_dtypes_from_every_chunk(tmp_path):
     from scarf.readers import CSVReader
 
@@ -1658,29 +1610,6 @@ def test_csv_reader_rejects_unusable_files(tmp_path, text, kwargs, error, messag
     path.write_text(text)
     with pytest.raises(error, match=message):
         CSVReader(str(path), **kwargs)
-
-
-def test_loom_reader_closes_its_file_when_validation_fails(tmp_path, monkeypatch):
-    import h5py
-
-    import scarf.readers.loom as loom
-
-    path = tmp_path / "broken.loom"
-    with h5py.File(path, "w") as handle:
-        handle.create_group("col_attrs")
-    opened: list[h5py.File] = []
-    real_file = h5py.File
-
-    def tracking_file(*args, **kwargs):
-        handle = real_file(*args, **kwargs)
-        opened.append(handle)
-        return handle
-
-    monkeypatch.setattr(loom.h5py, "File", tracking_file)
-    with pytest.raises(KeyError, match="Matrix key"):
-        loom.LoomReader(str(path))
-    assert len(opened) == 1
-    assert not opened[0].id.valid
 
 
 def test_h5ad_column_helpers_decode_legacy_layouts(tmp_path) -> None:

@@ -202,6 +202,13 @@ This materializes the selected metadata columns as a pandas DataFrame, not the
 expression matrix. On a large atlas, metadata and coordinates still require
 memory proportional to the selected cells.
 
+Zarr reads `/` and `\` in a column name as path separators, so Scarf stores a
+source column whose name contains either one under the name with `_` in their
+place. For example, `Baseline eGFR (ml/min/1.73m2) (Binned)` becomes
+`Baseline eGFR (ml_min_1.73m2) (Binned)` in `ds.cells.columns`. The build's
+`scarf_ingest.json` keys its `obs_summary` by these Scarf names, while its
+`h5ad_keys` listing keeps the source names.
+
 ```{code-cell} ipython3
 meta["cell_type"].value_counts().rename("cells").to_frame()
 ```

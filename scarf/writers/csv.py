@@ -116,7 +116,8 @@ class CSVtoZarr:
         """
         from ..storage.identity import CountSummary, finalize_counts
         from ..storage.schema import load_count_array
-        from ._store import skip_reserved_metadata_columns, write_metadata_column
+        from ..storage.metadata_keys import metadata_column_keys
+        from ._store import keyed_metadata_columns, write_metadata_column
 
         store = load_count_array(self.z, self.assayName, self.workspace)
         summary = CountSummary(store)
@@ -128,12 +129,16 @@ class CSVtoZarr:
             name=cell_data_path,
         )
         # Each entry pairs a column's position in the reader payload with its
-        # dtype across every row, so skipped reserved columns keep the mapping.
+        # dtype across every row, so skipped columns keep the mapping.
         metadata = list(
-            skip_reserved_metadata_columns(
+            keyed_metadata_columns(
                 zip(
                     self.csvr.cellDataCols,
                     enumerate(self.csvr.cellDataDtypes or []),
+                ),
+                metadata_column_keys(
+                    self.csvr.cellDataCols,
+                    taken=cell_data_grp.keys(),
                 ),
                 "cell",
             )

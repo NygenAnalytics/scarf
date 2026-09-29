@@ -35,9 +35,6 @@ _CYTEBASE_FIXTURES = {
     "toy_cr_dir_empty.tar.gz": (
         "7b0dad810bb395d837f8b17411b2f7a4a6ff7291c145287cb863ab016c312f35"
     ),
-    "sympathetic.loom": (
-        "63347f66d1180e544ddff257ee3f15934e989e521527d4cdcacbcb733e846120"
-    ),
     "cell_attributes.csv": (
         "cf1edebb1db09918d3d8286dcbe1491bcf8ef5fd7e116bf720e9aef6f078a06c"
     ),

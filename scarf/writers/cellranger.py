@@ -116,23 +116,31 @@ class CrToZarr:
         cell_group: Any,
         assay_names: tuple[str, ...],
     ) -> None:
+        from ..storage.metadata_keys import metadata_column_keys
         from ..storage.types import as_zarr_group
-        from ._store import skip_reserved_metadata_columns, write_metadata_column
+        from ._store import keyed_metadata_columns, write_metadata_column
 
+        # These readers hold their metadata in memory, so listing the columns
+        # to plan their keys reads nothing more from the source.
         cell_columns = getattr(self.cr, "get_cell_columns", None)
         if callable(cell_columns):
-            for name, raw_values in skip_reserved_metadata_columns(
-                cell_columns(), "cell"
+            columns = list(cell_columns())
+            keys = metadata_column_keys(
+                (name for name, _values in columns),
+                taken=cell_group.keys(),
+            )
+            for key, (name, raw_values) in keyed_metadata_columns(
+                ((name, (name, values)) for name, values in columns),
+                keys,
+                "cell",
             ):
-                if name in cell_group:
-                    continue
                 values = np.asarray(raw_values)
                 if values.ndim != 1 or values.size != self.cr.nCells:
                     raise ValueError(
                         f"Cell metadata column {name!r} has shape {values.shape}; "
                         f"expected ({self.cr.nCells},)"
                     )
-                write_metadata_column(cell_group, name, values, profile=self.profile)
+                write_metadata_column(cell_group, key, values, profile=self.profile)
 
         feature_columns = getattr(self.cr, "get_feature_columns", None)
         if not callable(feature_columns):
@@ -155,8 +163,15 @@ class CrToZarr:
                 as_zarr_group(self.z[group_path], name=group_path),
                 indexes,
             )
-        for name, raw_values in skip_reserved_metadata_columns(
-            feature_columns(), "feature"
+        columns = list(feature_columns())
+        keys = metadata_column_keys(
+            (name for name, _values in columns),
+            taken={key for group, _indexes in targets.values() for key in group.keys()},
+        )
+        for key, (name, raw_values) in keyed_metadata_columns(
+            ((name, (name, values)) for name, values in columns),
+            keys,
+            "feature",
         ):
             values = np.asarray(raw_values)
             if values.ndim != 1 or values.size != self.cr.nFeatures:
@@ -165,8 +180,6 @@ class CrToZarr:
                     f"expected ({self.cr.nFeatures},)"
                 )
             for group, indexes in targets.values():
-                if name in group:
-                    continue
                 selected = values[indexes]
                 if selected.dtype.kind == "O" and all(
                     value is None for value in selected
@@ -174,7 +187,7 @@ class CrToZarr:
                     # A 10x feature reference describes only Feature Barcode
                     # features, so its columns do not reach other assays.
                     continue
-                write_metadata_column(group, name, selected, profile=self.profile)
+                write_metadata_column(group, key, selected, profile=self.profile)
 
     @staticmethod
     def _prep_feat_index_offset(

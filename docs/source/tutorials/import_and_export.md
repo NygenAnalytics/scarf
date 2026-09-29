@@ -25,7 +25,6 @@ Most imports follow the same pattern: inspect when the source layout can vary, o
 | Seurat RDS | `inspect_seurat` | `SeuratReader` | `SeuratToZarr` |
 | Dense CSV | | `CSVReader` | `CSVtoZarr` |
 | SciPy CSR | | | `SparseToZarr` |
-| Loom | | `LoomReader` | `LoomToZarr` |
 
 Export paths write Matrix Market or H5AD.
 Scarf does not write Seurat `.rds` or `.h5seurat` files.
@@ -198,6 +197,10 @@ h5ad_import.embeddingArtifacts, h5ad_import.clusterArtifacts
 Categorical columns are decoded from category codes.
 Missing categorical or object values become `None`; missing numeric nullable values become `NaN`.
 Unsupported group-encoded columns are skipped with a warning rather than treated as valid metadata.
+Columns are listed from the file's `column-order`, so a column that an old AnnData version
+nested because its name contains `/` is still imported. Scarf stores such names with `_` in
+place of `/` and `\`: `Baseline eGFR (ml/min/1.73m2) (Binned)` becomes the cell column
+`Baseline eGFR (ml_min_1.73m2) (Binned)`, and the import logs the rename.
 
 `embedding_roles` and `cluster_keys` select analytical values for artifact import.
 The result maps their source names to exact refs in `embeddingArtifacts` and `clusterArtifacts`.
@@ -434,16 +437,11 @@ For a complete `DataStoreMerge` example, continue to {doc}`dataset_merging`.
 
 ## 10. Other import paths
 
-### 10.1 Loom
-
-Loom import remains available through `LoomReader` and `LoomToZarr` with the same dump pattern as the readers above.
-This page does not execute a Loom example.
-
-### 10.2 Chunked arrays
+### 10.1 Chunked arrays
 
 `chunked_to_zarr` writes from a Scarf `ChunkedArray` when lazy out-of-core conversion is needed.
 
-### 10.3 Remote Zarr destinations
+### 10.2 Remote Zarr destinations
 
 Writers also accept remote Zarr locations.
 Choose the `cloud` profile for an object-store destination and pass credentials through the environment or runtime configuration:

@@ -11,8 +11,6 @@ def detect_format(path: str | Path) -> str:
 
     if name.endswith(".h5ad") or suffix.endswith(".h5ad"):
         return "h5ad"
-    if name.endswith(".loom") or suffix.endswith(".loom"):
-        return "loom"
     if name.endswith(".rds") or name.endswith(".h5seurat") or suffix.endswith(".rds"):
         return "seurat"
     if name.endswith(".csv") or name.endswith(".tsv") or name.endswith(".txt"):

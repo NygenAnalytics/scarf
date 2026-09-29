@@ -5,6 +5,8 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+import pytest
+import zarr
 from scipy.sparse import csr_matrix
 
 from scarf.agent.ingest import ingest
@@ -73,6 +75,10 @@ def _write_metadata_table(
             data=np.asarray(filtered, dtype=bool),
         )
     return table
+
+
+def _write_column_order(table: h5py.Group, names: list[str]) -> None:
+    table.attrs.create("column-order", names, dtype=h5py.string_dtype())
 
 
 def _write_cellxgene_h5ad(path: Path) -> None:
@@ -459,3 +465,75 @@ def test_text_scalars_accept_only_scalar_or_one_element_datasets(
         assert _read_text_scalar(h5, "uns/citation", 4) == "cite"
         assert _read_text_scalar(h5, "uns", 500) is None
         assert _read_text_scalar(h5, "uns/missing", 500) is None
+
+
+def _write_batch_condition(h5: h5py.File, *names: str) -> None:
+    uns = h5.require_group("uns")
+    uns.create_dataset(
+        "batch_condition", data=np.asarray([name.encode() for name in names])
+    )
+
+
+def test_h5ad_manifest_names_nested_obs_columns_as_scarf_stores_them(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "nested.h5ad"
+    _write_simple_h5ad(path, np.asarray([[1, 2], [3, 4]], dtype=np.uint16))
+    with h5py.File(path, mode="r+") as h5:
+        obs = h5["obs"]
+        # Old AnnData versions nested a column at each "/" in its name.
+        _write_categorical(
+            obs, "batch/lane", codes=[0, 1], categories=["lane-1", "lane-2"]
+        )
+        _write_column_order(obs, ["donor_id", "batch/lane"])
+        _write_batch_condition(h5, "batch/lane")
+
+    manifest = inspect_h5ad_manifest(path)
+
+    assert manifest.declaredBatchColumns == ["batch_lane"]
+    columns = {column.name: column for column in manifest.obs.columns}
+    assert set(columns) == {"donor_id", "batch_lane"}
+    assert columns["batch_lane"].domainValues == ["lane-1", "lane-2"]
+    assert manifest.obs.identifierColumns == ["_index"]
+
+
+@pytest.mark.parametrize("declared", ["lane", "ids"], ids=["missing", "reserved"])
+def test_h5ad_manifest_rejects_batch_columns_that_scarf_does_not_import(
+    tmp_path: Path,
+    declared: str,
+) -> None:
+    path = tmp_path / "batch.h5ad"
+    _write_simple_h5ad(path, np.asarray([[1, 2], [3, 4]], dtype=np.uint16))
+    with h5py.File(path, mode="r+") as h5:
+        h5["obs"].create_dataset("ids", data=np.asarray([b"x", b"y"]))
+        _write_batch_condition(h5, declared)
+
+    with pytest.raises(ValueError, match="uns/batch_condition references obs"):
+        inspect_h5ad_manifest(path)
+
+
+def test_h5ad_manifest_column_names_match_ingested_cell_columns(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "clash.h5ad"
+    _write_simple_h5ad(path, np.asarray([[1, 2], [3, 4]], dtype=np.uint16))
+    with h5py.File(path, mode="r+") as h5:
+        obs = h5["obs"]
+        obs.create_dataset("a/b", data=np.asarray([1.0, 2.0]))
+        obs.create_dataset("a_b", data=np.asarray([3.0, 4.0]))
+        _write_column_order(obs, ["donor_id", "a/b", "a_b"])
+        _write_batch_condition(h5, "a/b")
+
+    manifest = inspect_h5ad_manifest(path)
+    result = ingest(path=path, zarrPath=tmp_path / "converted.zarr")
+
+    assert result.status == "done"
+    cell_data = zarr.open_group(str(tmp_path / "converted.zarr"), mode="r")["cellData"]
+    columns = {column.name: column for column in manifest.obs.columns}
+    # The exact valid name keeps its key; the renamed column takes a suffix.
+    assert set(columns) == {"donor_id", "a_b", "a_b_2"}
+    assert set(columns) <= set(cell_data.keys())
+    assert manifest.declaredBatchColumns == ["a_b_2"]
+    assert columns["a_b_2"].minimum == 1.0
+    assert cell_data["a_b_2"][:].tolist() == [1.0, 2.0]
+    assert cell_data["a_b"][:].tolist() == [3.0, 4.0]

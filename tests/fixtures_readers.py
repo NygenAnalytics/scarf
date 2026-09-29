@@ -65,16 +65,3 @@ def h5ad_reader(bastidas_ponce_data):
     reader = H5adReader(bastidas_ponce_data)
     yield reader
     reader.h5.close()
-
-
-@pytest.fixture(scope="session")
-def loom_reader():
-    from scarf.readers import LoomReader
-
-    reader = LoomReader(
-        full_path("sympathetic.loom"),
-        cell_names_key="Cell_id",
-        feature_names_key="Gene",
-    )
-    yield reader
-    reader.h5.close()

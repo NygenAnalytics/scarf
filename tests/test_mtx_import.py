@@ -1113,6 +1113,30 @@ def test_feature_reference_covers_only_feature_barcode_features(
         MtxReader(inspect_mtx(tmp_path)[0])
 
 
+def test_feature_reference_column_with_a_separator_is_renamed(
+    tmp_path: Path,
+) -> None:
+    _write_mex(
+        tmp_path,
+        [(1, 1, 3), (2, 1, 7)],
+        n_features=2,
+        n_cells=1,
+        feature_types=["Gene Expression", "Antibody Capture"],
+    )
+    (tmp_path / "feature_reference.csv").write_text(
+        "id,name,read,pattern,sequence,feature_type,tag/x\n"
+        "feature-1,CD3,R2,5PNNNNNNNNNN(BC),AACAAGACCCTTGAG,Antibody Capture,T1\n"
+    )
+    reader = MtxReader(inspect_mtx(tmp_path)[0])
+    store = MemoryStore()
+    MtxToZarr(reader, store, mem_budget="64M").dump(lines_in_mem=2)
+
+    root = zarr.open_group(store=store, mode="r")
+    np.testing.assert_array_equal(root["ADT/featureData/tag_x"][:], ["T1"])
+    assert list(root["ADT/featureData"].group_keys()) == []
+    assert "tag_x" not in root["RNA/featureData"]
+
+
 def test_symbolic_link_sidecars_keep_their_names(tmp_path: Path) -> None:
     content = tmp_path / "objects"
     content.mkdir()

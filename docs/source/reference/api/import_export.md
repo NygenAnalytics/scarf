@@ -30,11 +30,6 @@
 ```
 
 ```{eval-rst}
-.. autoclass:: scarf.readers.LoomReader
-    :members:
-```
-
-```{eval-rst}
 .. autoclass:: scarf.readers.CSVReader
     :members:
 ```
@@ -135,8 +130,13 @@ widths. Unset values stay under automatic planning from ``mem_budget`` and
 Every writer owns the reserved metadata columns `ids`, `names` and `I` and the
 `__scarf_missing__` prefix of missing-value masks. Source cell or feature metadata columns
 with these names are skipped with a warning, so imported identifiers are never replaced.
-The H5AD, Loom, CSV, Matrix Market, and Cell Ranger readers reject missing or repeated cell
-and feature IDs.
+Zarr reads `/` and `\` in a column name as path separators, so writers store a source column
+whose name contains either one under the name with `_` in their place and log the rename. A
+source name that is already valid keeps its name; a renamed column whose name is taken gets
+the first free `_2`, `_3`, and so on. `SeuratToZarr` raises for reserved names instead of
+skipping them.
+The H5AD, CSV, Matrix Market, and Cell Ranger readers reject missing or repeated cell and
+feature IDs.
 
 Import writers take their assay type from the assay name. Pass `assay_type` (or
 `assay_types` on `CrToZarr`) to declare a custom-named assay as a preset such as `RNA`.
@@ -155,11 +155,6 @@ Import writers take their assay type from the assay name. Pass `assay_type` (or
 
 ```{eval-rst}
 .. autoclass:: scarf.writers.H5adToZarr
-    :members:
-```
-
-```{eval-rst}
-.. autoclass:: scarf.writers.LoomToZarr
     :members:
 ```
 

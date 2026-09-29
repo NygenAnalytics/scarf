@@ -998,7 +998,6 @@ def test_reader_implementations_are_runtime_isolated():
         "cellranger.py",
         "csv.py",
         "h5ad.py",
-        "loom.py",
         "mtx.py",
         "seurat.py",
     }
@@ -1013,7 +1012,6 @@ def test_reader_implementations_are_runtime_isolated():
         "readers.cellranger",
         "readers.csv",
         "readers.h5ad",
-        "readers.loom",
         "readers.mtx",
         "readers.seurat",
     }
@@ -1027,7 +1025,6 @@ def test_reader_implementations_are_runtime_isolated():
             "readers._sparse",
             "readers._text",
         },
-        "loom.py": {"readers._text"},
         "mtx.py": {"readers._sparse", "readers._text"},
     }
     reader_edges = {
@@ -1096,7 +1093,6 @@ def test_writer_implementations_are_runtime_isolated():
         "csv.py",
         "export.py",
         "h5ad.py",
-        "loom.py",
         "sparse.py",
         "subset.py",
         "seurat.py",
@@ -1114,7 +1110,6 @@ def test_writer_implementations_are_runtime_isolated():
         "writers.cellranger",
         "writers.csv",
         "writers.h5ad",
-        "writers.loom",
         "writers.sparse",
         "writers.subset",
         "writers.seurat",
@@ -1129,7 +1124,6 @@ def test_writer_implementations_are_runtime_isolated():
         "cellranger.py": {"CrReader"},
         "csv.py": {"CSVReader"},
         "h5ad.py": {"H5adReader"},
-        "loom.py": {"LoomReader"},
         "seurat.py": {"SeuratReader"},
     }
 

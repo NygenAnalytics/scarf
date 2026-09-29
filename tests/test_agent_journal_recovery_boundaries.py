@@ -272,7 +272,7 @@ def test_model_selection_cannot_invent_a_comparator_or_option(
     [
         ("library", "list of exact observation-column names"),
         ([" "], "list of exact observation-column names"),
-        (["donor"], "must include the CELLxGENE"),
+        (["donor"], "named as Scarf stores them: ['library']"),
     ],
 )
 def test_manifest_declared_batch_cannot_be_overridden_before_context_enrichment(

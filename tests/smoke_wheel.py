@@ -9,6 +9,7 @@ from zipfile import ZipFile
 
 _RETIRED_MODULES = {
     "scarf/_types.py",
+    "scarf/agent/ingest/loom.py",
     "scarf/ann.py",
     "scarf/assay.py",
     "scarf/bio_data.py",
@@ -60,6 +61,7 @@ _RETIRED_MODULES = {
     "scarf/plotting/unified.py",
     "scarf/readers.py",
     "scarf/readers/datasets.py",
+    "scarf/readers/loom.py",
     "scarf/results.py",
     "scarf/storage/zarr_store.py",
     "scarf/trajectory/aggregation.py",
@@ -71,6 +73,7 @@ _RETIRED_MODULES = {
     "scarf/utils/storage.py",
     "scarf/utils/system.py",
     "scarf/utils/windows.py",
+    "scarf/writers/loom.py",
     "scarf/writers.py",
 }
 _SOURCE_ROOT = Path(__file__).resolve().parents[1] / "scarf"
@@ -113,7 +116,6 @@ from scarf.readers import (
     CrH5Reader,
     CrReader,
     H5adReader,
-    LoomReader,
     SeuratReader,
     inspect_seurat,
 )
@@ -124,7 +126,6 @@ from scarf.writers import (
     CrToZarr,
     H5adImportResult,
     H5adToZarr,
-    LoomToZarr,
     SeuratImportResult,
     SeuratToZarr,
     SparseToZarr,
@@ -154,6 +155,8 @@ assert not hasattr(scarf, "DatasetMerge")
 assert not hasattr(scarf.merge, "DatasetMerge")
 assert not hasattr(scarf, "ZarrMerge")
 assert not hasattr(scarf.merge, "ZarrMerge")
+assert not hasattr(scarf, "LoomReader")
+assert not hasattr(scarf, "LoomToZarr")
 assert DataStoreMerge.__module__ == "scarf.merge"
 assert scarf.CrH5Reader is scarf.readers.CrH5Reader
 assert scarf.CrToZarr is scarf.writers.CrToZarr
@@ -174,7 +177,6 @@ for reader_class in (
     CrDirReader,
     CrReader,
     H5adReader,
-    LoomReader,
     SeuratReader,
     CSVReader,
 ):
@@ -182,7 +184,6 @@ for reader_class in (
 for writer_class in (
     CrToZarr,
     H5adToZarr,
-    LoomToZarr,
     SeuratToZarr,
     SparseToZarr,
     SubsetZarr,
@@ -239,7 +240,9 @@ for name in (
     "scarf.markers",
     "scarf.meld_assay",
     "scarf.plotting.unified",
+    "scarf.readers.loom",
     "scarf.symphony",
+    "scarf.writers.loom",
 ):
     assert importlib.util.find_spec(name) is None, name
 for name in (

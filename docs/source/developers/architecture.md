@@ -319,8 +319,8 @@ The complete hard-break inventory is:
 - ATAC `normed` no longer leaves its fitted TF-IDF state (`n_term_per_doc`, `n_docs`,
   `n_docs_per_term`) on the assay after the call, and RNA `normed` never changes `normMethod`.
   A `DataStore` is not designed for concurrent use from several threads.
-- float16 is not a count storage dtype. Count writers reject it, and H5AD and Loom imports read
-  float16 sources as float32.
+- float16 is not a count storage dtype. Count writers reject it, and H5AD imports read float16
+  sources as float32.
 - Operations trust that prepared counts and artifacts do not change during a call. Writing to
   prepared data in place is outside the contract and is not detected.
 - Minimum versions rise to scipy 1.15, statsmodels 0.14.5 (earlier releases fail to import
@@ -343,7 +343,11 @@ The complete hard-break inventory is:
   columns change. `MetaData.columns` lists `I`, `ids`, `names`, then the other columns sorted.
   `MetaData.sift`, `multi_sift`, and covariate partitions treat masked rows as missing, and
   `insert` keeps an explicit boolean `fill_value`. `MetaData.get_index_by` matches values that
-  are not text by their text and always returns int64 indices.
+  are not text by their text and always returns int64 indices. `MetaData.insert` rejects names
+  that are empty, `.` or `..`, or contain `/` or `\`, because Zarr would nest them into groups.
+  A lookup of a name with a separator suggests the `_` spelling that imports store. A cell or
+  feature table that holds such a nested group from an earlier import raises an error that
+  asks for the source to be re-imported; stores are not migrated.
 - Storage operations raise a single task failure as itself and a cooperative shutdown as
   `ShutdownRequested`, not as an exception group. A pipeline stage whose exception group holds
   `KeyboardInterrupt` or `ShutdownRequested` is recorded as interrupted and raises that
@@ -407,12 +411,24 @@ The complete hard-break inventory is:
 - Imports: H5AD import stores missing categorical, nullable, and string values under linked
   masks and keeps nullable booleans as booleans. `inspect_h5ad` reads group-encoded AnnData
   indexes and prefers an ID column such as `gene_ids`, and reads a one-element `uns` text dataset
-  as its element; `H5adReader` reads the index named by `_index`. H5AD sparse matrices need an encoding and a stored shape. H5AD, Loom, CSV, and Cell
+  as its element; `H5adReader` reads the index named by `_index`. H5AD sparse matrices need an encoding and a stored shape. H5AD, CSV, and Cell
   Ranger readers reject missing or repeated identifiers. CSV import types values over every row
   and rejects missing or negative counts. Matrix Market BED sidecars give `chrom:start-end`
   Peaks, and feature references are left-joined. Cell Ranger HDF5 reads `matrix` and rejects
   several genome groups. Import writers accept `assay_type`. RDS parsing rejects malformed
   character vectors and xz payloads that need more than 256 MiB of decoder memory.
+- Metadata column names: H5AD readers and inspection list dataframe columns from
+  `column-order` and resolve each listed name as an HDF5 path, so columns that old AnnData
+  versions nested under `/` are imported instead of skipped. Tables without `column-order`
+  still list their direct children. Every import writer stores a source cell or feature column
+  whose name contains `/` or `\` under the name with `_` in their place, and logs the rename.
+  Source names that are already valid keep their name; a renamed column whose name is taken
+  gets the first free `_2`, `_3`, and so on, in source order. Reserved names are checked after
+  renaming. Matrix Market feature-reference columns with separators are renamed instead of
+  rejected. `inspect_h5ad` and the agent manifest see such columns, the manifest reports stored
+  names, and `uns/batch_condition` columns map to stored names. Cytebase `obs_summary` uses
+  stored names while `h5ad_keys` keeps source names. The original name is not recorded in the
+  store, and `to_h5ad` exports the stored names.
 - Seurat: `SeuratReader` and `inspect_seurat` resolve sidecars only inside `sidecar_root`
   (default: the `.rds` directory), and stream sources need it for sidecar-backed layers. Counts
   containing R `NA` raise `missing_count_value`. Dimnames and LogMap identifiers override names
@@ -456,7 +472,8 @@ The complete hard-break inventory is:
   `scarf.mapping.array_hash`, `array_store_hash`, and `conformal_prediction_sets`,
   `MappingReference.fetch_layout`, `scarf.quality_control.write_doublet_target_zarr`,
   `scarf.readers.get_file_handle` and `read_file`, `H5adReader.open_clone`,
-  `LoomReader.consume`, import-result `artifactRefs`, `scarf.writers.bed_to_sparse_array`,
+  `LoomReader` and `LoomToZarr` (Loom import, including agent ingest; convert Loom files to
+  H5AD first), import-result `artifactRefs`, `scarf.writers.bed_to_sparse_array`,
   `create_cell_data`, `load_count_store`, and `load_zarr`, `scarf.utils.load_zarr` (use
   `scarf.load_zarr`), `storage.parallel.map_shards`, `scarf.plotting.collect_legends`,
   `FeatureSummary`, and `register_theme`, `recipes.run_plot_recipe`, `PlotOutput.step_name` and

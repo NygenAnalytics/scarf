@@ -825,10 +825,6 @@ class _MtxEngine:
                 "feature_type",
             }:
                 continue
-            if "/" in resolved_name or "\\" in resolved_name:
-                raise ValueError(
-                    f"Feature-reference column {resolved_name!r} contains a path separator"
-                )
             source = frame[name].to_numpy(dtype=object)
             values = np.full(self.nFeatures, None, dtype=object)
             values[present] = [

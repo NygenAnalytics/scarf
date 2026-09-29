@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Any
 
 import h5py
@@ -32,6 +33,111 @@ def is_nullable(node: Any) -> bool:
 def is_column(node: Any) -> bool:
     """Return whether a dataframe child holds values that can be decoded."""
     return isinstance(node, h5py.Dataset) or is_categorical(node) or is_nullable(node)
+
+
+@dataclass(frozen=True, slots=True)
+class H5adTableMembers:
+    """Children of an H5AD dataframe group, found without reading values.
+
+    Attributes:
+        members: Source name and node of each child. Names listed in
+            ``column-order`` come first, in that order, followed by direct
+            children the attribute does not list, such as the index.
+        unresolved: Names listed in ``column-order`` that name no child.
+    """
+
+    members: tuple[tuple[str, H5adNode], ...]
+    unresolved: tuple[str, ...]
+
+
+def column_order(table: h5py.Group) -> tuple[str, ...] | None:
+    """Return the column names an AnnData dataframe lists in ``column-order``.
+
+    Reading the attribute touches no dataset values. AnnData stores an empty
+    table's attribute as an empty array without a string dtype.
+
+    Returns:
+        The listed names without repeats, or None when the attribute is absent.
+
+    Raises:
+        ValueError: If the attribute holds values that are not text.
+    """
+    raw = table.attrs.get("column-order")
+    if raw is None:
+        return None
+    values = np.asarray(raw).reshape(-1)
+    names = []
+    for value in values.tolist():
+        if not isinstance(value, str | bytes):
+            raise ValueError(
+                f"H5AD table {table.name!r} has a column-order attribute that "
+                "does not list column names"
+            )
+        names.append(as_text(value))
+    return tuple(dict.fromkeys(names))
+
+
+def _is_member_path(name: str) -> bool:
+    # h5py resolves a leading "/" from the file root and "." as the group itself.
+    return not name.startswith("/") and all(
+        part not in {"", ".", ".."} for part in name.split("/")
+    )
+
+
+def table_members(table: h5py.Group) -> H5adTableMembers:
+    """Resolve the children of an AnnData dataframe group by source name.
+
+    Old AnnData versions wrote a column whose name contains ``/`` as nested
+    HDF5 groups, while ``column-order`` kept the full name. Resolving each
+    listed name as an HDF5 path finds such a column; its intermediate groups
+    are not reported. Without ``column-order``, every direct child is a
+    member. This reads one attribute and each member's object header, never
+    column values. The index, which ``column-order`` leaves out, is found
+    through the ``_index`` attribute.
+
+    Args:
+        table: The dataframe group, such as ``obs`` or ``var``.
+
+    Returns:
+        The resolved members and the listed names that resolve to nothing.
+    """
+    order = column_order(table)
+    children = tuple(table.keys())
+    if order is None:
+        return H5adTableMembers(tuple((name, table[name]) for name in children), ())
+    members: list[tuple[str, H5adNode]] = []
+    unresolved: list[str] = []
+    for name in order:
+        node = table.get(name) if _is_member_path(name) else None
+        if isinstance(node, h5py.Group | h5py.Dataset):
+            members.append((name, node))
+        else:
+            unresolved.append(name)
+    # AnnData leaves the index out of column-order, so resolve a nested index
+    # name through the ``_index`` attribute instead.
+    index = index_key(table)
+    listed = order
+    if index is not None and "/" in index and index not in order:
+        listed = (*order, index)
+        node = table.get(index) if _is_member_path(index) else None
+        if isinstance(node, h5py.Group | h5py.Dataset):
+            members.append((index, node))
+    covered = set(listed) | {name.split("/", 1)[0] for name in listed if "/" in name}
+    members.extend((name, table[name]) for name in children if name not in covered)
+    return H5adTableMembers(tuple(members), tuple(unresolved))
+
+
+def table_column_names(table: Any) -> list[str]:
+    """Return the source names of a dataframe's decodable columns.
+
+    A compound dataset, as AnnData 0.6 wrote, lists its fields. A group lists
+    the members that :func:`is_column` accepts, in :func:`table_members` order.
+    """
+    if isinstance(table, h5py.Dataset):
+        return list(table.dtype.names or ())
+    if not isinstance(table, h5py.Group):
+        return []
+    return [name for name, node in table_members(table).members if is_column(node)]
 
 
 def column_length(node: Any) -> int | None:

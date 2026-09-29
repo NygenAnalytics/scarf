@@ -531,8 +531,9 @@ class H5adToZarr:
         )
 
     def _ini_cell_data(self) -> None:
+        from ..storage.metadata_keys import metadata_column_keys
         from ..storage.schema import create_cell_data
-        from ._store import skip_reserved_metadata_columns, write_metadata_column
+        from ._store import keyed_metadata_columns, write_metadata_column
 
         ids = self.h5ad.cell_ids()
         g = create_cell_data(
@@ -542,17 +543,26 @@ class H5adToZarr:
             names=ids,
             profile=self.profile,
         )
-        for name, (values, missing) in skip_reserved_metadata_columns(
+        # Keys are planned over every decodable obs column, including the ID
+        # and cluster columns left out below, so a renamed column takes the
+        # same key whichever columns an import selects.
+        keys = metadata_column_keys(
+            self.h5ad._source_column_names(self.h5ad.cellAttrsKey),
+            taken=g.keys(),
+        )
+        for key, (values, missing) in keyed_metadata_columns(
             (
                 (name, (values, missing))
                 for name, values, missing in self.h5ad._cell_columns()
             ),
+            keys,
             "cell",
         ):
-            write_metadata_column(g, name, values, missing, profile=self.profile)
+            write_metadata_column(g, key, values, missing, profile=self.profile)
 
     def _ini_feature_data(self) -> None:
-        from ._store import skip_reserved_metadata_columns, write_metadata_column
+        from ..storage.metadata_keys import metadata_column_keys
+        from ._store import keyed_metadata_columns, write_metadata_column
 
         targets: list[tuple[Any, np.ndarray | None]] = []
         for assay_name in self.assayNames:
@@ -568,13 +578,18 @@ class H5adToZarr:
             )
             targets.append((feat_group, feature_indexes))
 
+        keys = metadata_column_keys(
+            self.h5ad._source_column_names(self.h5ad.featureAttrsKey),
+            taken={key for group, _indexes in targets for key in group.keys()},
+        )
         # Stream one column at a time so a single decoded var column is held in
         # memory rather than every column for the full feature axis at once.
-        for column_name, (values, missing) in skip_reserved_metadata_columns(
+        for column_name, (values, missing) in keyed_metadata_columns(
             (
                 (name, (values, missing))
                 for name, values, missing in self.h5ad._feature_columns()
             ),
+            keys,
             "feature",
         ):
             for feat_group, feature_indexes in targets:

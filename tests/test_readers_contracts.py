@@ -4,7 +4,6 @@ import subprocess
 import sys
 from typing import get_type_hints
 
-import h5py
 import numpy as np
 import pytest
 import zarr
@@ -17,7 +16,6 @@ from scarf.readers import (
     CrReader,
     H5adInspectResult,
     H5adReader,
-    LoomReader,
     MtxCandidate,
     MtxReader,
     SeuratInspectResult,
@@ -58,16 +56,6 @@ _PUBLIC_CLASS_METHODS = {
         "consume_group",
         "consume",
     ),
-    LoomReader: (
-        "__init__",
-        "cell_names",
-        "cell_ids",
-        "get_cell_attrs",
-        "feature_names",
-        "feature_ids",
-        "get_feature_attrs",
-        "consume_dense",
-    ),
     CSVReader: (
         "__init__",
         "cell_ids",
@@ -91,7 +79,6 @@ _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
     CrH5Reader: "053373f2af2f2fc74a3e00cde9b067c5818aba92c09da3a9ac2e129566ca87b9",
     CrDirReader: "d1d6697ba86d1e34aeb3e176ba84000e4fc50267176cec6f922ef696050b40dc",
     H5adReader: "d8556a75fb03793e802e86bf87a07f0097d1337e55700edd9af68ec7212a2e28",
-    LoomReader: "2436d57c4a6954d8567665eaece4b79b8f7ebc1a76274b143f9153cfcfae88e3",
     CSVReader: "8aa6c17c876afb62765584fc7ff64d2838c66ef53095da10d7198ca60ab83851",
     MtxReader: "06376a32ff98ff0153ae1cc35f327509c88784ce027cb045bf9833b45dbccf2a",
     SeuratReader: "c51148f751a74072c2f79448a4b6a25f0dc0c52b0abfbe837fb1b9e0c667368c",
@@ -139,7 +126,6 @@ def test_readers_facade_surface_is_stable():
         "SeuratInspectResult",
         "SeuratReader",
         "inspect_seurat",
-        "LoomReader",
         "CSVReader",
     ]
     expected = {
@@ -149,7 +135,6 @@ def test_readers_facade_surface_is_stable():
         "CrReader",
         "H5adInspectResult",
         "H5adReader",
-        "LoomReader",
         "MtxCandidate",
         "MtxReader",
         "SeuratInspectResult",
@@ -173,7 +158,6 @@ def test_readers_facade_loads_format_modules_lazily():
                 "assert 'scarf.readers.cellranger' not in sys.modules; "
                 "assert 'scarf.readers.csv' not in sys.modules; "
                 "assert 'scarf.readers.h5ad' not in sys.modules; "
-                "assert 'scarf.readers.loom' not in sys.modules; "
                 "assert 'scarf.readers.mtx' not in sys.modules; "
                 "assert 'scarf.readers.seurat' not in sys.modules; "
                 "assert 'h5py' not in sys.modules; "
@@ -185,7 +169,6 @@ def test_readers_facade_loads_format_modules_lazily():
                 "assert 'scarf.readers.csv' in sys.modules; "
                 "assert 'scarf.readers.cellranger' not in sys.modules; "
                 "assert 'scarf.readers.h5ad' not in sys.modules; "
-                "assert 'scarf.readers.loom' not in sys.modules; "
                 "assert 'scarf.readers.mtx' not in sys.modules; "
                 "assert 'scarf.readers.seurat' not in sys.modules; "
                 "assert 'pandas' in sys.modules; "
@@ -211,8 +194,7 @@ def test_matrix_market_exports_load_together_lazily():
                 "assert readers.inspect_mtx.__module__ == 'scarf.readers'; "
                 "assert readers.CrDirReader.__module__ == 'scarf.readers'; "
                 "assert 'scarf.readers.mtx' in sys.modules; "
-                "assert 'scarf.readers.h5ad' not in sys.modules; "
-                "assert 'scarf.readers.loom' not in sys.modules"
+                "assert 'scarf.readers.h5ad' not in sys.modules"
             ),
         ],
         check=True,
@@ -371,20 +353,3 @@ def test_crreader_reclassification_locks_when_writer_captures_schema(tmp_path):
     np.testing.assert_array_equal(root["ADT/counts"][:], [[5]])
     with pytest.raises(RuntimeError, match="captures the schema"):
         reader.reclassify_features([4], "HTO")
-
-
-def test_loom_reader_preserves_cell_feature_orientation(tmp_path):
-    values = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.uint16)
-    path = tmp_path / "orientation.loom"
-    with h5py.File(path, mode="w") as handle:
-        handle.create_dataset("matrix", data=values)
-        handle.create_group("col_attrs")
-        handle.create_group("row_attrs")
-
-    reader = LoomReader(str(path))
-    try:
-        chunks = list(reader.consume_dense(batch_size=2))
-    finally:
-        reader.h5.close()
-
-    np.testing.assert_array_equal(np.concatenate(chunks), values.T)

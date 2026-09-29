@@ -19,7 +19,6 @@ from scarf.writers import (
     CrToZarr,
     H5adImportResult,
     H5adToZarr,
-    LoomToZarr,
     MtxToZarr,
     SeuratImportResult,
     SeuratToZarr,
@@ -35,10 +34,6 @@ _PUBLIC_CLASS_METHODS = {
         "dump",
     ),
     H5adToZarr: (
-        "__init__",
-        "dump",
-    ),
-    LoomToZarr: (
         "__init__",
         "dump",
     ),
@@ -62,7 +57,6 @@ _PUBLIC_CLASS_METHODS = {
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
     CrToZarr: "04123fcfad28e763a0966995c9333af5066971c02606f1783c4187d2868b2d7e",
     H5adToZarr: "11ef319e746a2750d99d04d778a2c4cc2de9092d44fae2d9b203ec5e747a1d11",
-    LoomToZarr: "c6e61f019a64c305db2aff2dabe790509424a269998248af1549f3b232553ed1",
     SparseToZarr: "00afca68257558e160963a98961cca0cc6f13977effbfc15a59fa863e3ec7090",
     CSVtoZarr: "4e0eeed1aaa26742cfb3097c396c9e27598cfe4f8335054e92f868e146af87fb",
     SubsetZarr: "336779f81466725dacedd61a10ed267ab6514fff8ef4773efb49936ceff92e6d",
@@ -96,7 +90,6 @@ def test_writers_facade_surface_is_stable():
         "MtxToZarr",
         "H5adImportResult",
         "H5adToZarr",
-        "LoomToZarr",
         "SeuratImportResult",
         "SeuratToZarr",
         "SparseToZarr",
@@ -113,6 +106,7 @@ def test_writers_facade_surface_is_stable():
         "create_cell_data",
         "load_count_store",
         "load_zarr",
+        "LoomToZarr",
     ):
         assert not hasattr(writers_module, removed)
     assert MtxToZarr is CrToZarr
@@ -277,11 +271,6 @@ def test_conversion_writers_reject_summary_before_truncating_destination():
             zarr_loc=store,
             assay_name="summary",
         ),
-        "loom": lambda store: LoomToZarr(
-            object(),
-            zarr_loc=store,
-            assay_name="summary",
-        ),
         "sparse": lambda store: SparseToZarr(
             csr_matrix((1, 1), dtype=np.uint32),
             zarr_loc=store,
@@ -341,7 +330,6 @@ writer_formats = {
     "scarf.writers.cellranger",
     "scarf.writers.csv",
     "scarf.writers.h5ad",
-    "scarf.writers.loom",
     "scarf.writers.sparse",
     "scarf.writers.subset",
     "scarf.writers.seurat",
@@ -350,7 +338,6 @@ reader_formats = {
     "scarf.readers.cellranger",
     "scarf.readers.csv",
     "scarf.readers.h5ad",
-    "scarf.readers.loom",
     "scarf.readers.seurat",
 }
 assert not {
