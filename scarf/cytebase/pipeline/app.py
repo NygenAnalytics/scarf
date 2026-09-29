@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import subprocess
+from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -168,6 +169,36 @@ def _progress_summary(counters: dict | None) -> str:
         parts.append(
             f"speed={counters['downloadSpeedBytesPerSecond'] / 1024**2:.1f} MiB/s"
         )
+    return " ".join(parts)
+
+
+def _duration(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    return f"{minutes // 60}h{minutes % 60:02d}m"
+
+
+def _run_progress(
+    total: int, children: dict[str, dict], results: list[dict], elapsed: float
+) -> str:
+    """Summarize a processing run for its once-a-minute progress log."""
+    running = sum(
+        1
+        for key, child in children.items()
+        if key.endswith(":process") and child.get("state") in {"pending", "running"}
+    )
+    done = len(results)
+    outcomes = Counter(row["outcome"] for row in results)
+    parts = [
+        f"done={done}/{total}",
+        f"running={running}",
+        f"queued={max(0, total - done - running)}",
+        *(f"{outcome}={count}" for outcome, count in sorted(outcomes.items())),
+    ]
+    if done and elapsed > 0:
+        rate = done / elapsed * 3600
+        eta = (total - done) / rate * 3600
+        parts += [f"rate={rate:.1f}/h", f"eta={_duration(eta)}"]
+    parts.append(f"elapsed={_duration(elapsed)}")
     return " ".join(parts)
 
 
@@ -569,6 +600,7 @@ class _StartPacer:
 async def run_pipeline(action: str, request: dict) -> dict:
     """Queue submissions, but advance datasets independently inside each submission."""
     storage = _storage()
+    run_started = monotonic()
     if action == "reset":
         return await asyncio.to_thread(_reset, storage, request)
     if action not in {"register", "catalog", "process"}:
@@ -710,6 +742,16 @@ async def run_pipeline(action: str, request: dict) -> dict:
                 )
                 results.extend(task.result() for task in done)
                 if monotonic() - last_publish >= 60:
+                    logger.info(
+                        "Pipeline progress: run=%s %s",
+                        state["runId"],
+                        _run_progress(
+                            len(groups),
+                            state["children"],
+                            results,
+                            monotonic() - run_started,
+                        ),
+                    )
                     if dirty and not uncertain:
                         updates, dirty = list(dirty.values()), {}
                         try:
@@ -763,13 +805,15 @@ async def run_pipeline(action: str, request: dict) -> dict:
             row["collectionId"] for row in catalog_result["failedCollections"]
         ]
     logger.info(
-        "Pipeline finished: run=%s action=%s state=%s successes=%s failures=%s error=%s",
+        "Pipeline finished: run=%s action=%s state=%s successes=%s failures=%s "
+        "error=%s elapsed=%s",
         state["runId"],
         action,
         state["state"],
         len(result["successes"]),
         len(result["failures"]),
         catalog_error,
+        _duration(monotonic() - run_started),
     )
     return result
 

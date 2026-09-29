@@ -1511,6 +1511,33 @@ def test_process_run_reports_unregistered_datasets_without_stopping_others(
     ]
 
 
+@pytest.mark.parametrize(
+    ("results", "elapsed", "summary"),
+    [
+        pytest.param(
+            [],
+            30.0,
+            "done=0/4 running=1 queued=3 elapsed=0h00m",
+            id="nothing-finished",
+        ),
+        pytest.param(
+            [{"outcome": "succeeded"}, {"outcome": "failed"}],
+            3_600.0,
+            "done=2/4 running=1 queued=1 failed=1 succeeded=1 "
+            "rate=2.0/h eta=1h00m elapsed=1h00m",
+            id="half-done",
+        ),
+    ],
+)
+def test_run_progress_summarizes_outcomes_rate_and_eta(results, elapsed, summary):
+    children = {
+        "catalog": _catalog_child(state="running"),
+        PROCESS_KEY: _process_child(state="running"),
+        f"{OTHER_ID}:process": _process_child(OTHER_ID, state="succeeded"),
+    }
+    assert app._run_progress(4, children, results, elapsed) == summary
+
+
 @pytest.mark.parametrize(("quota", "seconds"), [(1000, 15.0), (3000, 5.0), (6000, 2.5)])
 def test_start_interval_keeps_dataset_starts_under_the_hub_quota(quota, seconds):
     assert app._start_interval(quota) == seconds
@@ -1752,10 +1779,20 @@ def _periodic_run(modal_harness, monkeypatch, *, fail_update: bool):
 
 
 def test_process_run_publishes_finished_records_every_minute(
-    modal_harness, monkeypatch
+    modal_harness, monkeypatch, app_logs
 ):
     result, published = _periodic_run(modal_harness, monkeypatch, fail_update=False)
     assert published == [[], [CYTEBASE_ID], [OTHER_ID]]
+    # The minute tick also logs how far the run has come.
+    [progress] = [
+        message
+        for message in app_logs.messages()
+        if message.startswith("Pipeline progress")
+    ]
+    assert progress == (
+        f"Pipeline progress: run={RUN_ID} done=1/2 running=1 queued=0 "
+        "succeeded=1 rate=59.0/h eta=0h01m elapsed=0h01m"
+    )
     assert (result["state"], result["error"]) == ("completed", None)
     assert result["catalog"] == {"status": "done", "updated": [OTHER_ID]}
     assert result["successes"] == [CYTEBASE_ID, OTHER_ID]
