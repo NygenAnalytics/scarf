@@ -639,7 +639,7 @@ def test_interrupted_inventory_keeps_progress_and_skips_queued_requests(
     monkeypatch, tmp_path
 ):
     ids = [_uuid(number) for number in range(1, 7)]
-    first, fifth = ids[0], ids[4]
+    first = ids[0]
     output = tmp_path / "inventory" / "collections.json"
     started = {collection_id: threading.Event() for collection_id in ids}
     release = threading.Event()
@@ -665,9 +665,11 @@ def test_interrupted_inventory_keeps_progress_and_skips_queued_requests(
     def interrupt_after_first_progress(path: Path, snapshot: dict) -> None:
         writes.append(path)
         if len(writes) == 2:
-            # The worker freed by the first collection runs the fifth request,
-            # so all four workers are busy while the sixth is still queued.
-            assert started[fifth].wait(5)
+            # Wait until the second to fifth requests are running, not only
+            # dequeued: a worker marks its future running just before the call,
+            # and a future it has not marked yet would still be cancelled. All
+            # four workers are then busy while the sixth request is queued.
+            assert all(started[key].wait(5) for key in ids[1:5])
         write(path, snapshot)
         if len(writes) == 2:
             raise KeyboardInterrupt
