@@ -421,6 +421,7 @@ def _execute(cytebase_id: str, run_id: str, request: dict) -> dict:
     timeout=86400,
     retries=0,
     max_containers=1,
+    nonpreemptible=True,
 )
 def build_catalog(request: dict, run_id: str) -> dict:
     from .catalog import run_catalog
