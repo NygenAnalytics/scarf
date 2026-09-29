@@ -298,6 +298,63 @@ def test_retry_reports_rate_limits(recorded_sleeps):
     assert recorded_sleeps == [7.0]
 
 
+def test_retry_replaces_the_xet_session_after_a_throttled_transfer(
+    recorded_sleeps, monkeypatch
+):
+    resets = []
+    monkeypatch.setattr(_storage, "_reset_xet_session", lambda: resets.append(True))
+    progress = []
+    operation, calls = _failing(
+        [
+            RuntimeError(
+                "Network error: Request error: HTTP status client error "
+                "(429 Too Many Requests)"
+            ),
+            RuntimeError("Previous task error: Network error: connection reset"),
+        ]
+    )
+    result = _storage.retry(
+        operation, lambda stage, **kwargs: progress.append((stage, kwargs["message"]))
+    )
+    assert result == "done"
+    assert calls == [0, 1, 2]
+    assert resets == [True, True]
+    assert recorded_sleeps == [60.0, 120.0]
+    assert progress == [
+        ("waiting_for_rate_limit", "Retry 1/3 after 60 seconds"),
+        ("retrying_transfer", "Retry 2/3 after 120 seconds"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "error", [RuntimeError("unexpected state"), ConnectionError("refused")]
+)
+def test_retry_raises_other_runtime_errors_without_resetting_xet(
+    recorded_sleeps, monkeypatch, error
+):
+    monkeypatch.setattr(_storage, "_reset_xet_session", _storage_reset_forbidden)
+    operation, calls = _failing([error])
+    with pytest.raises(type(error)):
+        _storage.retry(operation)
+    assert calls == [0]
+    assert recorded_sleeps == []
+
+
+def test_retry_gives_up_on_xet_failures_after_three_retries(
+    recorded_sleeps, monkeypatch
+):
+    monkeypatch.setattr(_storage, "_reset_xet_session", lambda: None)
+    operation, calls = _failing([RuntimeError("Network error: 429") for _ in range(4)])
+    with pytest.raises(RuntimeError, match="429"):
+        _storage.retry(operation)
+    assert calls == [0, 1, 2, 3]
+    assert recorded_sleeps == [60.0, 120.0, 240.0]
+
+
+def _storage_reset_forbidden() -> None:
+    raise AssertionError("Only transient Xet failures replace the session")
+
+
 def test_retry_leaves_long_server_waits_to_the_caller(recorded_sleeps):
     operation, calls = _failing([_status_error(503, {"Retry-After": "301"})])
     with pytest.raises(httpx.HTTPStatusError):

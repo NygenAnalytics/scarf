@@ -30,6 +30,8 @@ def deploy_settings(args: argparse.Namespace) -> dict[str, str]:
         settings["CYTEBASE_PROCESS_CONTAINERS"] = str(args.process_containers)
     if args.download_connections is not None:
         settings["CYTEBASE_DOWNLOAD_CONNECTIONS"] = str(args.download_connections)
+    if args.hub_api_quota is not None:
+        settings["CYTEBASE_HUB_API_QUOTA"] = str(args.hub_api_quota)
     return settings
 
 
@@ -48,6 +50,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--download-connections", type=int, help="Source connections, 1 to 4"
+    )
+    parser.add_argument(
+        "--hub-api-quota",
+        type=int,
+        help=(
+            "Hub API calls the token's account may make per five minutes "
+            "(default 1000); dataset starts are paced to stay under it"
+        ),
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="Print the deployment without running it"

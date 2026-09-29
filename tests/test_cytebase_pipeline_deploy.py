@@ -70,6 +70,18 @@ def test_deploy_passes_container_and_connection_limits(runs):
     assert env["CYTEBASE_DOWNLOAD_CONNECTIONS"] == "3"
 
 
+def test_deploy_passes_the_hub_api_quota(runs):
+    deploy.main(["--hub-api-quota", "3000"])
+    [(_, env)] = runs
+    assert env["CYTEBASE_HUB_API_QUOTA"] == "3000"
+
+
+def test_deploy_leaves_the_hub_api_quota_to_the_app_default(runs):
+    deploy.main([])
+    [(_, env)] = runs
+    assert "CYTEBASE_HUB_API_QUOTA" not in env
+
+
 def test_dry_run_prints_the_deployment_without_running_it(runs, capsys):
     assert deploy.main(["--dry-run", "--dev", "-e", "staging"]) == 0
     assert runs == []

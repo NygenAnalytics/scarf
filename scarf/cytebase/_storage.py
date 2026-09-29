@@ -57,6 +57,32 @@ _RETRYABLE_ERRORS = (
     httpx2.HTTPStatusError,
     HfHubHTTPError,
 )
+# hf_xet reports failed transfers as plain exceptions rather than HTTP errors.
+# A failed token handshake, such as a 429 from the Hub, also breaks the
+# process-wide Xet session: every later transfer then fails with "Previous
+# task error" until the session is replaced.
+_XET_TRANSIENT_MARKERS = (
+    "429",
+    "Too Many Requests",
+    "Network error",
+    "Previous task error",
+)
+_XET_BACKOFF_SECONDS = 60.0
+
+
+def _xet_transient(error: BaseException) -> bool:
+    return isinstance(error, RuntimeError | ConnectionError) and any(
+        marker in str(error) for marker in _XET_TRANSIENT_MARKERS
+    )
+
+
+def _reset_xet_session() -> None:
+    """Discard the global Xet session so the next transfer starts a new one."""
+    # huggingface_hub exposes no public reset; this is the hook it uses itself
+    # after an interrupt. It aborts transfers still running in this process.
+    from huggingface_hub.utils._xet import abort_xet_session
+
+    abort_xet_session()  # type: ignore[no-untyped-call]
 
 
 def _retry_delay(error: httpx.HTTPError | httpx2.HTTPError, attempt: int) -> float:
@@ -96,10 +122,13 @@ def retry[T](
     *,
     stop_event: Event | None = None,
 ) -> T:
-    """Retry transient HTTP failures three times, respecting server backoff.
+    """Retry transient HTTP and Xet transfer failures three times.
 
-    Server waits above five minutes are left for an explicit job retry instead
-    of sleeping indefinitely or retrying before the server permits it.
+    HTTP retries respect server backoff; server waits above five minutes are
+    left for an explicit job retry instead of sleeping indefinitely or retrying
+    before the server permits it. A transient Xet failure first replaces the
+    process-wide Xet session, then waits toward the next quota window, since
+    hf_xet has already retried and reports no server wait.
     A supplied stop event interrupts backoff and prevents another attempt.
     """
     for attempt in range(4):
@@ -119,17 +148,24 @@ def retry[T](
             delay = _retry_delay(error, attempt)
             if delay > 300:
                 raise
-            if progress is not None:
-                progress(
-                    "waiting_for_rate_limit"
-                    if response is not None and response.status_code == 429
-                    else "retrying_transfer",
-                    message=f"Retry {attempt + 1}/3 after {delay:g} seconds",
-                )
-            if stop_event is None:
-                time.sleep(delay)
-            elif stop_event.wait(delay):
-                raise CancelledError("Transfer cancelled") from error
+            limited = response is not None and response.status_code == 429
+            failure: Exception = error
+        except (RuntimeError, ConnectionError) as error:
+            if not _xet_transient(error) or attempt == 3:
+                raise
+            _reset_xet_session()
+            delay = min(300.0, _XET_BACKOFF_SECONDS * 2**attempt)
+            limited = "429" in str(error) or "Too Many Requests" in str(error)
+            failure = error
+        if progress is not None:
+            progress(
+                "waiting_for_rate_limit" if limited else "retrying_transfer",
+                message=f"Retry {attempt + 1}/3 after {delay:g} seconds",
+            )
+        if stop_event is None:
+            time.sleep(delay)
+        elif stop_event.wait(delay):
+            raise CancelledError("Transfer cancelled") from failure
     raise AssertionError("Unreachable retry state")
 
 
