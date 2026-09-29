@@ -344,7 +344,8 @@ The complete hard-break inventory is:
   `MetaData.sift`, `multi_sift`, and covariate partitions treat masked rows as missing, and
   `insert` keeps an explicit boolean `fill_value`. `MetaData.get_index_by` matches values that
   are not text by their text and always returns int64 indices. `MetaData.insert` rejects names
-  that are empty, `.` or `..`, or contain `/` or `\`, because Zarr would nest them into groups.
+  that are empty, `.` or `..`, or contain `/` or `\`, because Zarr would nest them into groups;
+  `reset_key` and `update_key` apply the same rule.
   A lookup of a name with a separator suggests the `_` spelling that imports store. A cell or
   feature table that holds such a nested group from an earlier import raises an error that
   asks for the source to be re-imported; stores are not migrated.
@@ -420,7 +421,9 @@ The complete hard-break inventory is:
 - Metadata column names: H5AD readers and inspection list dataframe columns from
   `column-order` and resolve each listed name as an HDF5 path, so columns that old AnnData
   versions nested under `/` are imported instead of skipped. Tables without `column-order`
-  still list their direct children. Every import writer stores a source cell or feature column
+  still list their direct children, and a nested index named by `_index` resolves either way.
+  `H5adReader` rejects a `column-order` attribute that does not hold names when it is
+  constructed, before a writer opens its destination. Every import writer stores a source cell or feature column
   whose name contains `/` or `\` under the name with `_` in their place, and logs the rename.
   Source names that are already valid keep their name; a renamed column whose name is taken
   gets the first free `_2`, `_3`, and so on, in source order. Reserved names are checked after
@@ -428,7 +431,8 @@ The complete hard-break inventory is:
   rejected. `inspect_h5ad` and the agent manifest see such columns, the manifest reports stored
   names, and `uns/batch_condition` columns map to stored names. Cytebase `obs_summary` uses
   stored names while `h5ad_keys` keeps source names. The original name is not recorded in the
-  store, and `to_h5ad` exports the stored names.
+  store, and `to_h5ad` exports the stored names. `DataStoreMerge` rejects a `source_column` or
+  `prepend_text` with a separator, and run snapshots and stored selections treat `\` like `/`.
 - Seurat: `SeuratReader` and `inspect_seurat` resolve sidecars only inside `sidecar_root`
   (default: the `.rds` directory), and stream sources need it for sidecar-backed layers. Counts
   containing R `NA` raise `missing_count_value`. Dimnames and LogMap identifiers override names

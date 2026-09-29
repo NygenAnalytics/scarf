@@ -20,6 +20,7 @@ from scarf.storage.selections import (
     read_stored_selection_mask,
     resolve_generated_selection_artifact,
     resolve_metadata_snapshot,
+    resolve_stored_selection,
     resolve_stored_selection_artifact,
     snapshot_run_metadata,
     validate_cell_selection,
@@ -514,6 +515,36 @@ def test_run_metadata_snapshot_rejects_ambiguous_or_misaligned_inputs() -> None:
         snapshot_run_metadata(**common, columns=["missing"])
     with pytest.raises(ValueError, match="cannot set an assay"):
         snapshot_run_metadata(**common, columns=["names"], assay="RNA")
+
+
+@pytest.mark.parametrize("name", ["k/b", "k\\b"], ids=["slash", "backslash"])
+def test_selections_reject_path_separator_column_names(name) -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    table = root.create_group("cellData")
+    create_metadata_column(table, "ids", data=np.array(["a", "b"]), dtype=str)
+    # Zarr nests a name with either separator, as older stores did.
+    table.create_array(name, data=np.array([True, False]))
+
+    with pytest.raises(ValueError, match="cannot be paths"):
+        snapshot_run_metadata(
+            root=root,
+            table_path="cellData",
+            id_column="ids",
+            axis="cell",
+            columns=[name],
+        )
+    with pytest.raises(ValueError, match="cannot be a path"):
+        resolve_stored_selection(
+            root,
+            table_path="cellData",
+            id_column="ids",
+            source_column=name,
+            scope="datastore",
+            kind="cell_selection",
+            operation="snapshot",
+            parameters={},
+            inputs={},
+        )
 
 
 def test_selection_artifact_rejects_bad_masks_and_ids() -> None:

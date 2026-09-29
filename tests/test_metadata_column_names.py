@@ -302,6 +302,22 @@ def test_h5ad_reader_reports_column_order_names_the_file_lacks(
     )
 
 
+def test_h5ad_reader_rejects_malformed_column_order_before_any_write(
+    tmp_path: Path,
+) -> None:
+    source = _write_separator_h5ad(tmp_path / "malformed.h5ad")
+    with h5py.File(source, "r+") as h5:
+        h5["obs"].attrs["column-order"] = np.array([1.0, 2.0])
+    store = tmp_path / "existing.zarr"
+    zarr.open_group(str(store), mode="w").attrs["kept"] = True
+
+    with pytest.raises(ValueError, match="does not list column names"):
+        H5adReader(str(source), feature_name_key="feature_name")
+
+    # The reader fails before a writer could open and replace the destination.
+    assert zarr.open_group(str(store), mode="r").attrs["kept"] is True
+
+
 def test_keyed_metadata_columns_explain_each_skipped_or_renamed_column() -> None:
     keys = {"a_b": "a_b", "a/b": "a_b_2", "c\\d": "c_d"}
     columns = [

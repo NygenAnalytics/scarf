@@ -15,6 +15,7 @@ from ._h5ad_columns import (
     SPARSE_KEYS,
     column_encoding,
     column_length,
+    column_order,
     index_key,
     is_column,
     is_nullable,
@@ -112,6 +113,11 @@ class H5adReader:
                 self.obsmAttrsKey: self._validate_group(self.obsmAttrsKey),
                 self.matrixKey: self._validate_group(self.matrixKey),
             }
+            # A malformed column-order must fail here, before a writer opens
+            # its destination.
+            for group in (self.cellAttrsKey, self.featureAttrsKey):
+                if self.groupCodes[group] == 2:
+                    column_order(self.h5[group])
             self.matrixOrientation = self._validate_sparse_matrix()
             self._convertedCsr: SparseRowStore | None = None
             self._indptrCache: np.ndarray | None = None

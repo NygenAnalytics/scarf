@@ -22,6 +22,7 @@ from ..storage.copy import COLUMN_METADATA_ATTRIBUTES
 from ..storage.execution import admitted_worker_split
 from ..storage.identity import GENERATED_FEATURE_COLUMNS, clear_column
 from ..storage.layout import PROFILE_METADATA_CHUNK, _encoded_chunk_bound
+from ..storage.metadata_keys import validate_metadata_column_name
 from ..storage.partition import affordable_width
 from ..storage.profiles import StorageProfile
 from ..storage.types import as_zarr_array, as_zarr_group
@@ -434,6 +435,8 @@ def plan_cell_metadata(
         raise ValueError(
             "source_column must be a non-empty string that is not ids, I, or names"
         )
+    if source_column is not None:
+        validate_metadata_column_name(source_column)
     if prepend_text == "":
         prepend_text = None
 

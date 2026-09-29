@@ -131,3 +131,29 @@ def test_table_members_resolves_an_index_that_hdf5_nests(tmp_path):
         assert [name for name, _node in members.members] == ["b", "cell/id"]
         assert members.unresolved == ()
         assert table_column_names(obs) == ["b", "cell/id"]
+
+
+def test_table_members_resolves_a_nested_index_without_column_order(tmp_path):
+    with h5py.File(tmp_path / "index.h5ad", "w") as h5:
+        obs = h5.create_group("obs")
+        obs.attrs["_index"] = "cell/id"
+        obs.create_dataset("cell/id", data=np.asarray(["c1", "c2"], dtype="S"))
+        obs.create_dataset("b", data=np.asarray([1, 2]))
+
+        members = table_members(obs)
+
+        assert [name for name, _node in members.members] == ["cell/id", "b"]
+        assert table_column_names(obs) == ["cell/id", "b"]
+
+
+def test_table_members_keeps_a_column_that_a_listed_path_runs_through(obs):
+    # A malformed column-order that lists a path inside a real categorical
+    # must not hide that categorical.
+    _write_categorical(obs, "q", ["x", "y"])
+    obs.attrs["column-order"] = ["b", "q/codes"]
+
+    names = [name for name, _node in table_members(obs).members]
+
+    assert names[:2] == ["b", "q/codes"]
+    assert "q" in names
+    assert "q" in table_column_names(obs)

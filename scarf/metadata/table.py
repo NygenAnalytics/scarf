@@ -90,14 +90,16 @@ class MetaData:
 
     @staticmethod
     def _is_public(column: str) -> bool:
-        return metadata_column_key(column) == column and not column.startswith(
-            MISSING_MASK_PREFIX
+        return (
+            isinstance(column, str)
+            and metadata_column_key(column) == column
+            and not column.startswith(MISSING_MASK_PREFIX)
         )
 
     @staticmethod
     def _missing_column(column: str) -> KeyError:
         message = f"{column} does not exist in the metadata columns."
-        key = metadata_column_key(column)
+        key = metadata_column_key(column) if isinstance(column, str) else column
         if key != column:
             message += (
                 " Scarf stores imported columns with '_' in place of '/' and "
@@ -223,6 +225,7 @@ class MetaData:
         )
 
     def _save(self, column_name: str, values: np.ndarray) -> None:
+        validate_metadata_column_name(column_name)
         if values.shape != (self.N,):
             raise ValueError(
                 f"ERROR: Values are of shape: {values.shape}. "

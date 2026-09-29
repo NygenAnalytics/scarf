@@ -699,6 +699,24 @@ def test_insert_rejects_zarr_path_separators_before_writing(name):
         table.drop(name)
 
 
+@pytest.mark.parametrize("name", ["r/k", "r\\k"], ids=["slash", "backslash"])
+def test_reset_key_rejects_zarr_path_separators_before_writing(name):
+    table = _metadata_fixture()
+
+    with pytest.raises(ValueError, match="path separators; use 'r_k' instead"):
+        table.reset_key(name)
+
+    assert set(table._group.keys()) == {"I", "ids", "names", "score"}
+
+
+def test_lookups_of_names_that_are_not_text_raise_key_errors():
+    table = _metadata_fixture()
+
+    for column in (123, None):
+        with pytest.raises(KeyError, match="does not exist in the metadata columns"):
+            table.fetch_all(column)  # type: ignore[arg-type]
+
+
 def test_nested_group_from_an_older_import_asks_for_a_new_import():
     table = _metadata_fixture()
     # Older imports let Zarr nest a source column named with '/' into groups.

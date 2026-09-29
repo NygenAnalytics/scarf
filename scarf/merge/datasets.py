@@ -12,6 +12,10 @@ from ..storage.identity import (
 )
 from ..storage.io_policy import StorageIoPolicy
 from ..storage.layout import _group_zarr_format, count_array_spec
+from ..storage.metadata_keys import (
+    metadata_column_key,
+    validate_metadata_column_name,
+)
 from ..storage.profiles import (
     StorageProfile,
     ZarrLocation,
@@ -195,6 +199,14 @@ class DataStoreMerge:
             )
         if feature_key not in {"ids", "names"}:
             raise ValueError("feature_key must be one of 'ids' or 'names'")
+        # Zarr would nest a merged column whose name holds a path separator.
+        if source_column is not None:
+            validate_metadata_column_name(source_column)
+        if prepend_text and metadata_column_key(prepend_text) != prepend_text:
+            raise ValueError(
+                f"prepend_text {prepend_text!r} must not contain '/' or '\\' "
+                "because Zarr reads them as path separators"
+            )
         self.datasets = datasets
         self.names = list(names)
         self.zarr_path = zarr_path

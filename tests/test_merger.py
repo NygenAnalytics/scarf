@@ -527,6 +527,33 @@ def test_dataset_merge_rejects_source_column_conflict(tmp_path):
         ).plan()
 
 
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"source_column": "src/ds"}, "use 'src_ds' instead"),
+        ({"source_column": "src\\ds"}, "use 'src_ds' instead"),
+        ({"prepend_text": "x/y"}, "prepend_text 'x/y' must not contain"),
+    ],
+    ids=["source-slash", "source-backslash", "prepend-slash"],
+)
+def test_dataset_merge_rejects_path_separator_column_names(tmp_path, options, message):
+    left = _MergeDataStore(
+        [_MergeAssay("RNA", [[1], [2]], ["c0", "c1"], ["id_a"], ["A"], block_size=2)],
+        zarr_loc="memory://left",
+    )
+    destination = tmp_path / "separators.zarr"
+
+    with pytest.raises(ValueError, match=message):
+        DataStoreMerge(
+            datasets=[left, left],
+            zarr_path=str(destination),
+            names=["left", "right"],
+            **options,
+        )
+
+    assert not destination.exists()
+
+
 def test_dataset_merge_preserves_order_across_source_block_sizes(tmp_path):
     left = _MergeDataStore(
         [

@@ -34,6 +34,7 @@ from .artifacts import (
 )
 from .errors import ArtifactErrorContextValue, ArtifactResolutionError
 from .geometry import array_geometry
+from .metadata_keys import metadata_column_key
 from .partition import row_band, scan_band
 from .types import as_zarr_array, as_zarr_group
 from .validation_scope import store_key, validated_once
@@ -606,6 +607,11 @@ def resolve_stored_selection(
     a stored payload with the same fingerprints, so callers need not read the
     artifact again to validate it.
     """
+    if metadata_column_key(source_column) != source_column:
+        raise ValueError(
+            f"Selection source column {source_column!r} cannot be a path; Zarr "
+            "reads '/' and '\\' as path separators"
+        )
     table = as_zarr_group(root[table_path], name=table_path)
     source = as_zarr_array(table[source_column], name=source_column)
     ids = as_zarr_array(table[id_column], name=id_column)
@@ -825,7 +831,9 @@ def _snapshot_source_columns(
     if len(set(names)) != len(names):
         raise ValueError("Snapshot columns must be unique")
     invalid_names = [
-        name for name in names if "/" in name or name.startswith(MISSING_MASK_PREFIX)
+        name
+        for name in names
+        if metadata_column_key(name) != name or name.startswith(MISSING_MASK_PREFIX)
     ]
     if invalid_names:
         raise ValueError(

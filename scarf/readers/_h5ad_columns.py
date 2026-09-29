@@ -89,11 +89,12 @@ def table_members(table: h5py.Group) -> H5adTableMembers:
 
     Old AnnData versions wrote a column whose name contains ``/`` as nested
     HDF5 groups, while ``column-order`` kept the full name. Resolving each
-    listed name as an HDF5 path finds such a column; its intermediate groups
-    are not reported. Without ``column-order``, every direct child is a
-    member. This reads one attribute and each member's object header, never
-    column values. The index, which ``column-order`` leaves out, is found
-    through the ``_index`` attribute.
+    listed name as an HDF5 path finds such a column. The index, which
+    ``column-order`` leaves out, is resolved the same way through the
+    ``_index`` attribute, with or without ``column-order``. Other direct
+    children follow; a group that only holds the nested levels of a resolved
+    name is not reported. This reads one attribute and each member's object
+    header, never column values.
 
     Args:
         table: The dataframe group, such as ``obs`` or ``var``.
@@ -102,28 +103,31 @@ def table_members(table: h5py.Group) -> H5adTableMembers:
         The resolved members and the listed names that resolve to nothing.
     """
     order = column_order(table)
-    children = tuple(table.keys())
-    if order is None:
-        return H5adTableMembers(tuple((name, table[name]) for name in children), ())
+    listed: tuple[str, ...] = () if order is None else order
     members: list[tuple[str, H5adNode]] = []
     unresolved: list[str] = []
-    for name in order:
+    for name in listed:
         node = table.get(name) if _is_member_path(name) else None
         if isinstance(node, h5py.Group | h5py.Dataset):
             members.append((name, node))
         else:
             unresolved.append(name)
-    # AnnData leaves the index out of column-order, so resolve a nested index
-    # name through the ``_index`` attribute instead.
     index = index_key(table)
-    listed = order
-    if index is not None and "/" in index and index not in order:
-        listed = (*order, index)
+    if index is not None and "/" in index and index not in listed:
         node = table.get(index) if _is_member_path(index) else None
         if isinstance(node, h5py.Group | h5py.Dataset):
             members.append((index, node))
-    covered = set(listed) | {name.split("/", 1)[0] for name in listed if "/" in name}
-    members.extend((name, table[name]) for name in children if name not in covered)
+            listed = (*listed, index)
+    nested = {name.split("/", 1)[0] for name in listed if "/" in name}
+    for name in table.keys():
+        if name in listed:
+            continue
+        node = table[name]
+        # A decodable column keeps its place even when a listed path runs
+        # through it; only a group of nested levels is dropped.
+        if name in nested and not is_column(node):
+            continue
+        members.append((name, node))
     return H5adTableMembers(tuple(members), tuple(unresolved))
 
 
