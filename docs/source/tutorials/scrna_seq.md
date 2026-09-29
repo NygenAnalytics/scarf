@@ -60,12 +60,14 @@ cell_type_by_cluster = {
     "2": "FCGR3A monocytes",
     "3": "B cells",
     "4": "T cells",
-    "5": "NK cells",
+    "5": "T cells",
     "6": "T cells",
-    "7": "T cells",
-    "8": "B cells",
+    "7": "NK cells",
+    "8": "NK cells",
     "9": "T cells",
-    "10": "pDC-like cells",
+    "10": "B cells",
+    "11": "pDC-like cells",
+    "12": "Platelets",
 }
 cell_type_order = (
     "CD14 monocytes",
@@ -74,6 +76,7 @@ cell_type_order = (
     "T cells",
     "NK cells",
     "pDC-like cells",
+    "Platelets",
 )
 
 cluster_values = np.asarray(run.cells.fetch("clusters"))
@@ -104,8 +107,8 @@ ds.plots.embedding(
 )
 ```
 
-Monocytes, B cells, T cells, NK cells, and a small pDC-like population occupy coherent
-neighbourhoods. UMAP position alone did not assign these names; the marker panel is the evidence.
+Monocytes, B cells, T cells, NK cells, a small pDC-like population, and smalller platelets
+occupy coherent neighbourhoods. UMAP position alone did not assign these names; the marker panel is the evidence.
 
 ### Question: which markers support each label?
 
@@ -116,6 +119,7 @@ marker_panel = {
     "T cell": ["CD3D", "IL7R"],
     "NK cell": ["NKG7", "GNLY"],
     "pDC-like": ["GZMB", "JCHAIN"],
+    "Platelets": ["PPBP", "PTGS1"],
 }
 ds.plots.dotplot(
     features=marker_panel,
@@ -129,7 +133,7 @@ ds.plots.dotplot(
 
 The two monocyte labels share LST1 but separate along S100A8 and FCGR3A. MS4A1 and CD79A support
 B cells; CD3D and IL7R support T cells; NKG7 and GNLY support NK cells; GZMB with JCHAIN motivates
-the cautious pDC-like label. These remain dataset-specific teaching labels and should be reviewed
+the cautious pDC-like label; PPBP with PTGS1 marks the small platelet group. These remain dataset-specific teaching labels and should be reviewed.
 with additional positive and negative markers in a real study.
 
 ## Substitute your own input
