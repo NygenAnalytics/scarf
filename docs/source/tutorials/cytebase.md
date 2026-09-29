@@ -31,11 +31,10 @@ reads cell annotations, and plots the UMAP coordinates supplied by CELLxGENE.
 Gene expression comes from the published RNA counts; no new embedding or
 analysis pipeline is run in this walkthrough.
 
-**Development preview:** the saved results on this page were generated against
-a development bucket. The SDK now defaults to the public `Nygen/cytebase`
-bucket, which readers can access without credentials. Available datasets may
-differ from this saved snapshot; a configured bucket must contain the example
-dataset to rerun the full walkthrough.
+The saved results on this page were generated against the public
+`Nygen/cytebase` bucket, which readers can access without credentials. The
+catalog grows as datasets are added, so discovery results can differ when you
+rerun the page.
 
 {nb-download}`Download the executed Jupyter notebook <cytebase.ipynb>`.
 
@@ -101,13 +100,15 @@ Results display as Markdown tables and behave as lists of complete row
 dictionaries. Display truncation does not change the underlying values.
 `max_cell_chars=None` shows complete titles, IDs, and label lists.
 
-The example is the small Solé-Boldo human skin dataset. Search its author name,
-then keep the returned identifier rather than constructing an ID yourself.
+The example is a single-nucleus RNA-seq dataset of human kidney cortex from
+donors with and without diabetic kidney disease (Wilson et al., 2022). Search
+for its author and tissue, then keep the returned identifier rather than
+constructing an ID yourself.
 
 ```{code-cell} ipython3
-matches = catalog.search("soleboldo", ready_only=True, max_cell_chars=None)
+matches = catalog.search("wilson kidney cortex", ready_only=True, max_cell_chars=None)
 if not matches:
-    raise RuntimeError("The example skin dataset is not ready in this bucket")
+    raise RuntimeError("The example kidney dataset is not ready in this bucket")
 matches
 ```
 
@@ -205,21 +206,23 @@ memory proportional to the selected cells.
 meta["cell_type"].value_counts().rename("cells").to_frame()
 ```
 
+Compare cell-type composition between the donor groups:
+
 ```{code-cell} ipython3
-if "donor_id" in meta:
-    display(pd.crosstab(meta["cell_type"], meta["donor_id"]))
+if "disease" in meta:
+    display(pd.crosstab(meta["cell_type"], meta["disease"]))
 ```
 
 ## 4. Plot the stored UMAP
 
 `ds.plots.embedding(layout=umap_ref, ...)` uses the exact imported coordinates
-without recomputing UMAP.
-Give categorical legends enough space; a large atlas with many labels is
-better viewed with selected groups or `legend_loc="none"`.
+without recomputing UMAP. With a moderate number of cell types, the default
+legend placement writes each label on its cluster. A large atlas with many
+labels is better viewed with selected groups or `legend_loc="none"`.
 
 ```{code-cell} ipython3
 cell_type_plot = ds.plots.embedding(
-    layout=umap_ref, color_by="cell_type", figsize=(10, 6)
+    layout=umap_ref, color_by="cell_type", figsize=(10, 7)
 )
 ```
 
@@ -236,10 +239,12 @@ ds.plots.embedding(
 
 Gene names come from the published assay feature metadata. Resolve the symbols
 against that table first; not every requested gene is present in every dataset.
-Here the explicit lookup handles differences in letter case.
+Here the explicit lookup handles differences in letter case. The markers are
+UMOD for the thick ascending limb of the loop of Henle, SLC34A1 for the
+proximal tubule, NPHS1 for podocytes, and PECAM1 for endothelial cells.
 
 ```{code-cell} ipython3
-requested_genes = ["PTPRC", "EPCAM", "COL1A1", "PECAM1"]
+requested_genes = ["UMOD", "SLC34A1", "NPHS1", "PECAM1"]
 by_upper = {str(name).upper(): str(name) for name in ds.RNA.feats.fetch_all("names")}
 genes = [by_upper[name.upper()] for name in requested_genes if name.upper() in by_upper]
 print("Found:", genes)
@@ -248,17 +253,18 @@ print("Missing:", [name for name in requested_genes if name.upper() not in by_up
 
 Expression values are normalized on read; this example explicitly requests a
 `log1p` transform. Neither the count matrix nor the imported coordinates are
-modified. Drawing high values last makes expressing cells easier to see.
+modified. Drawing high values last makes expressing cells easier to see. Each
+gene is read from the remote counts, so every panel adds network reads.
 
 ```{code-cell} ipython3
 if genes:
     ds.plots.embedding(
         layout=umap_ref,
-        color_by=genes[:2],
+        color_by=genes,
         normalization=NormalizationSpec(transform="log1p"),
         sort_values=True,
         n_columns=2,
-        figsize=(12, 5),
+        figsize=(12, 10),
     );
 ```
 
