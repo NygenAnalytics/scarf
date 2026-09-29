@@ -5,7 +5,6 @@ from agent output. An agent may select one offered option and cite observed
 evidence, but it cannot add operations or numeric execution parameters.
 """
 
-import hashlib
 import re
 from collections.abc import Iterable
 from typing import Literal
@@ -42,14 +41,6 @@ type ProtectedVariableEffectStatus = Literal[
 
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-_NON_GEOMETRIC_OVERRIDE_CLASSES: frozenset[EvidenceClass] = frozenset(
-    {
-        "markerCoherence",
-        "resamplingStability",
-        "crossUnitSupport",
-        "protectedVariablePreservation",
-    }
-)
 
 
 def _validate_identifier(value: str, field_name: str) -> str:
@@ -146,10 +137,7 @@ class EvidenceBundle(DecisionKernelModel):
         )
         if self.contentSha256 is not None:
             payload = self.model_dump(mode="json", exclude={"contentSha256"})
-            expected = hashlib.sha256(
-                record_io.canonical_json_bytes(payload)
-            ).hexdigest()
-            if self.contentSha256 != expected:
+            if self.contentSha256 != record_io.sha256_json(payload):
                 raise ValueError("contentSha256 does not match the evidence bundle")
         return self
 
@@ -160,7 +148,7 @@ class EvidenceBundle(DecisionKernelModel):
     def with_content_sha256(self) -> "EvidenceBundle":
         """Return this bundle with its canonical content identity."""
         payload = self.model_dump(mode="json", exclude={"contentSha256"})
-        digest = hashlib.sha256(record_io.canonical_json_bytes(payload)).hexdigest()
+        digest = record_io.sha256_json(payload)
         return EvidenceBundle.model_validate({**payload, "contentSha256": digest})
 
 
@@ -214,8 +202,6 @@ class DecisionSpec(DecisionKernelModel):
     evidenceBundleId: str
     options: list[DecisionOption] = Field(min_length=1)
     baselineOptionId: str | None = None
-    metricPreferredOptionId: str | None = None
-    requireIndependentOverrideEvidence: bool = Field(default=False, strict=True)
     allowedSources: list[DecisionSource] = Field(
         default_factory=_default_decision_sources
     )
@@ -253,18 +239,6 @@ class DecisionSpec(DecisionKernelModel):
             and self.baselineOptionId not in option_ids
         ):
             raise ValueError("baselineOptionId must reference an offered option")
-        if (
-            self.metricPreferredOptionId is not None
-            and self.metricPreferredOptionId not in option_ids
-        ):
-            raise ValueError("metricPreferredOptionId must reference an offered option")
-        if (
-            self.requireIndependentOverrideEvidence
-            and self.metricPreferredOptionId is None
-        ):
-            raise ValueError(
-                "requireIndependentOverrideEvidence requires metricPreferredOptionId"
-            )
         return self
 
     def option_by_id(self) -> dict[str, DecisionOption]:
@@ -310,18 +284,13 @@ class DecisionSelection(DecisionKernelModel):
     protectedVariableEffects: list[ProtectedVariableEffect] = Field(
         default_factory=list
     )
-    overrideOfOptionId: str | None = None
-    overrideEvidenceIds: list[str] = Field(default_factory=list)
 
-    @field_validator("selectedOptionId", "overrideOfOptionId")
+    @field_validator("selectedOptionId")
     @classmethod
-    def validate_ids(cls, value: str | None, info: object) -> str | None:
-        if value is None:
-            return None
-        field_name = getattr(info, "field_name", "identifier")
-        return _validate_identifier(value, field_name)
+    def validate_selected_option_id(cls, value: str) -> str:
+        return _validate_identifier(value, "selectedOptionId")
 
-    @field_validator("evidenceIds", "overrideEvidenceIds")
+    @field_validator("evidenceIds")
     @classmethod
     def validate_id_lists(cls, value: list[str], info: object) -> list[str]:
         field_name = getattr(info, "field_name", "identifiers")
@@ -335,16 +304,6 @@ class DecisionSelection(DecisionKernelModel):
         if value != value.strip():
             raise ValueError("rationale must not contain surrounding whitespace")
         return value
-
-    @model_validator(mode="after")
-    def validate_override(self) -> "DecisionSelection":
-        if not set(self.overrideEvidenceIds).issubset(self.evidenceIds):
-            raise ValueError("overrideEvidenceIds must be included in evidenceIds")
-        if self.overrideOfOptionId is None and self.overrideEvidenceIds:
-            raise ValueError("overrideEvidenceIds require overrideOfOptionId")
-        if self.overrideOfOptionId == self.selectedOptionId:
-            raise ValueError("overrideOfOptionId must differ from selectedOptionId")
-        return self
 
 
 class DecisionRecord(DecisionKernelModel):
@@ -366,8 +325,6 @@ class DecisionRecord(DecisionKernelModel):
     protectedVariableEffects: list[ProtectedVariableEffect] = Field(
         default_factory=list
     )
-    overrideOfOptionId: str | None = None
-    overrideEvidenceIds: list[str] = Field(default_factory=list)
     promptSha256: str | None = None
     modelName: str | None = None
     softwareSha256: str | None = None
@@ -378,12 +335,9 @@ class DecisionRecord(DecisionKernelModel):
         "decisionId",
         "evidenceBundleId",
         "selectedOptionId",
-        "overrideOfOptionId",
     )
     @classmethod
-    def validate_ids(cls, value: str | None, info: object) -> str | None:
-        if value is None:
-            return None
+    def validate_ids(cls, value: str, info: object) -> str:
         field_name = getattr(info, "field_name", "identifier")
         return _validate_identifier(value, field_name)
 
@@ -391,7 +345,6 @@ class DecisionRecord(DecisionKernelModel):
         "offeredOptionIds",
         "availableEvidenceIds",
         "evidenceIds",
-        "overrideEvidenceIds",
     )
     @classmethod
     def validate_id_lists(cls, value: list[str], info: object) -> list[str]:
@@ -430,16 +383,11 @@ class DecisionRecord(DecisionKernelModel):
 
     @model_validator(mode="after")
     def validate_references(self) -> "DecisionRecord":
-        offered = set(self.offeredOptionIds)
-        available = set(self.availableEvidenceIds)
-        used = set(self.evidenceIds)
-        override = set(self.overrideEvidenceIds)
-        if self.selectedOptionId not in offered:
+        if self.selectedOptionId not in self.offeredOptionIds:
             raise ValueError("selectedOptionId must reference an offered option")
-        if not used.issubset(available):
+        available = set(self.availableEvidenceIds)
+        if not set(self.evidenceIds).issubset(available):
             raise ValueError("evidenceIds must reference only available evidence")
-        if not override.issubset(used):
-            raise ValueError("overrideEvidenceIds must be included in evidenceIds")
         protected_ids = {
             evidence_id
             for effect in self.protectedVariableEffects
@@ -449,13 +397,6 @@ class DecisionRecord(DecisionKernelModel):
             raise ValueError(
                 "protectedVariableEffects must reference only available evidence"
             )
-        if self.overrideOfOptionId is None and self.overrideEvidenceIds:
-            raise ValueError("overrideEvidenceIds require overrideOfOptionId")
-        if self.overrideOfOptionId is not None:
-            if self.overrideOfOptionId not in offered:
-                raise ValueError("overrideOfOptionId must reference an offered option")
-            if self.overrideOfOptionId == self.selectedOptionId:
-                raise ValueError("overrideOfOptionId must differ from selectedOptionId")
         return self
 
 
@@ -496,8 +437,6 @@ class DeterministicDecisionAuditor:
         spec: DecisionSpec,
         evidence: EvidenceBundle,
         record: DecisionRecord,
-        *,
-        created_at_ns: int = 0,
     ) -> list[VerificationCheck]:
         """Return a deterministic verification without repairing invalid output."""
         checks: list[VerificationCheck] = []
@@ -603,45 +542,6 @@ class DeterministicDecisionAuditor:
             "A protected variable degraded or its evidence was not cited.",
             sorted(protected_evidence_ids),
         )
-
-        metric_override = (
-            spec.requireIndependentOverrideEvidence
-            and spec.metricPreferredOptionId is not None
-            and record.status in {"apply", "skip"}
-            and record.selectedOptionId != spec.metricPreferredOptionId
-        )
-        if metric_override:
-            override_classes = {
-                evidence_by_id[evidence_id].evidenceClass
-                for evidence_id in record.overrideEvidenceIds
-                if evidence_id in evidence_by_id
-            }
-            qualifying_classes = override_classes & _NON_GEOMETRIC_OVERRIDE_CLASSES
-            override_ok = (
-                record.overrideOfOptionId == spec.metricPreferredOptionId
-                and set(record.overrideEvidenceIds).issubset(record.evidenceIds)
-                and (
-                    not required_ids
-                    or set(record.overrideEvidenceIds).issubset(required_ids)
-                )
-                and len(qualifying_classes) >= 2
-            )
-            add_check(
-                "independentOverrideEvidence",
-                override_ok,
-                "The override cites at least two independent non-geometric evidence classes.",
-                "The override requires two independent non-geometric evidence classes.",
-                record.overrideEvidenceIds,
-            )
-        else:
-            add_check(
-                "independentOverrideEvidence",
-                record.overrideOfOptionId is None and not record.overrideEvidenceIds,
-                "No metric override evidence is required.",
-                "Override fields were supplied without an eligible metric override.",
-                record.overrideEvidenceIds,
-            )
-
         return checks
 
 

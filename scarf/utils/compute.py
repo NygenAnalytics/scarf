@@ -1,4 +1,7 @@
-from collections.abc import Callable, Sequence
+import itertools
+import threading
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from typing import Any, TypeVar
 
 import numpy as np
@@ -6,6 +9,65 @@ import numpy as np
 from .logging import progress_enabled
 
 T = TypeVar("T")
+
+_thread_limit_lock = threading.Lock()
+_thread_limit_tokens = itertools.count()
+_active_thread_limits: dict[int, int | None] = {}
+_original_thread_limits: Any | None = None
+
+
+def enter_thread_limit(limits: int | None) -> int:
+    """Start a process-wide native thread-pool limit and return its token.
+
+    Native thread-pool limits apply to the whole process, so scopes held by
+    generators or entered on other threads can end in any order. The first
+    active scope records the limits in force, the most recent remaining request
+    applies while scopes overlap, and the last scope to end restores the
+    recorded limits. ``None`` changes nothing but still takes part.
+    """
+    from threadpoolctl import ThreadpoolController
+
+    global _original_thread_limits
+    with _thread_limit_lock:
+        controller = ThreadpoolController()
+        if not _active_thread_limits:
+            _original_thread_limits = controller.limit(limits=None)
+        token = next(_thread_limit_tokens)
+        _active_thread_limits[token] = limits
+        if limits is not None:
+            controller.limit(limits=limits)
+    return token
+
+
+def exit_thread_limit(token: int) -> None:
+    """End a limit started by ``enter_thread_limit``."""
+    from threadpoolctl import ThreadpoolController
+
+    global _original_thread_limits
+    with _thread_limit_lock:
+        del _active_thread_limits[token]
+        original = _original_thread_limits
+        if original is None:
+            return
+        requested = [
+            limits for limits in _active_thread_limits.values() if limits is not None
+        ]
+        if not _active_thread_limits:
+            _original_thread_limits = None
+        if requested:
+            ThreadpoolController().limit(limits=requested[-1])
+        else:
+            original.restore_original_limits()
+
+
+@contextmanager
+def process_thread_limit(limits: int | None) -> Iterator[None]:
+    """Hold a limit from ``enter_thread_limit`` for the duration of a block."""
+    token = enter_thread_limit(limits)
+    try:
+        yield
+    finally:
+        exit_thread_limit(token)
 
 
 def controlled_compute(arr: Any, nthreads: int) -> np.ndarray:

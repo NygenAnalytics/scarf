@@ -1,7 +1,7 @@
 """Validation and dependency preparation for biological interpretation."""
 
 import math
-from collections.abc import Mapping
+from collections import Counter
 from typing import Any
 
 import numpy as np
@@ -20,6 +20,7 @@ from .contracts import (
     TreatmentDirection,
     TreatmentObservation,
 )
+from .tools import _cluster_cell_selection, _require_marker_cluster_link
 
 try:
     from pydantic_ai import (
@@ -254,6 +255,32 @@ def validate_biological_interpretation_report(
     )
     if unknown_clusters:
         raise ModelRetry(f"Unknown cluster ids: {sorted(unknown_clusters)}")
+    interpretation_counts = Counter(
+        item.clusterId for item in report.clusterInterpretations
+    )
+    repeated_interpretations = sorted(
+        cluster for cluster, count in interpretation_counts.items() if count > 1
+    )
+    if repeated_interpretations:
+        raise ModelRetry(
+            "Return one interpretation per cluster; repeated clusters: "
+            f"{repeated_interpretations}"
+        )
+    observation_counts = Counter(
+        (
+            item.clusterId,
+            *sorted((item.referenceCondition, item.comparisonCondition)),
+        )
+        for item in report.treatmentObservations
+    )
+    repeated_observations = sorted(
+        key for key, count in observation_counts.items() if count > 1
+    )
+    if repeated_observations:
+        raise ModelRetry(
+            "Return one treatment observation per cluster and condition pair; "
+            f"repeated: {repeated_observations}"
+        )
     canonical_interpretations, omitted_interpretation_clusters = (
         _canonicalize_cluster_interpretations(report, deps)
     )
@@ -498,23 +525,7 @@ def _prepare_biological_interpretation_dependencies(
     ):
         raise ValueError("marker feature selection belongs to a different assay")
 
-    cluster_status = store.inspect_artifact(cluster)
-    if not getattr(cluster_status, "exists", True):
-        raise ValueError("cluster artifact does not exist")
-    if not getattr(cluster_status, "complete", False):
-        raise ValueError("cluster artifact is incomplete")
-    raw_selection = (getattr(cluster_status, "inputs", None) or {}).get(
-        "cell_selection"
-    )
-    if not isinstance(raw_selection, Mapping):
-        raise ValueError("cluster artifact has no cell-selection input")
-    cell_selection = ArtifactRef.from_dict(dict(raw_selection))
-    if (
-        cell_selection.scope != "datastore"
-        or cell_selection.kind != "cell_selection"
-        or cell_selection.assay is not None
-    ):
-        raise ValueError("cluster artifact has an invalid cell-selection input")
+    cell_selection = _cluster_cell_selection(store, cluster)
     if any(selection != cell_selection for selection in expected_selections):
         raise ValueError("handoff cell selection conflicts with cluster")
     cell_indices = read_stored_selection_indices(
@@ -526,24 +537,7 @@ def _prepare_biological_interpretation_dependencies(
         table_path="cellData",
     ).astype(np.int64, copy=False)
     if isinstance(marker, ArtifactRef):
-        marker_status = store.inspect_artifact(marker)
-        if not getattr(marker_status, "exists", True):
-            raise ValueError("marker artifact does not exist")
-        if not getattr(marker_status, "complete", False):
-            raise ValueError("marker artifact is incomplete")
-        marker_inputs = getattr(marker_status, "inputs", None) or {}
-        stored_clusters = marker_inputs.get("clusters")
-        expected_cluster = artifact_reference(cluster)
-        if (
-            not isinstance(stored_clusters, Mapping)
-            or stored_clusters.get("artifact_id") != expected_cluster.artifactId
-            or stored_clusters.get("kind") != expected_cluster.kind
-            or stored_clusters.get("scope") != expected_cluster.scope
-            or stored_clusters.get("assay") != expected_cluster.assay
-        ):
-            raise ValueError(
-                "marker artifact is not linked to the exact cluster artifact"
-            )
+        _require_marker_cluster_link(store, marker, cluster)
     return BiologicalInterpretationDependencies(
         store=store,
         cluster=cluster,

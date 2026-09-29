@@ -6,11 +6,11 @@ from scipy.sparse import csr_matrix
 from scarf import DataStore
 from scarf.assay import norm_lib_size_log
 from scarf.features.aggregation import _accumulate_group_counts, aggregate_rna_groups
-from scarf.quality_control.doublets import write_doublet_target_zarr
 from scarf.storage.budget import ResourceBudget
 from scarf.storage.count_matrix import CountMatrixPolicy
 from scarf.writers import SparseToZarr
 
+from .doublet_fixtures import write_doublet_target_zarr
 from .test_feature_stream import _counts_t_with_plan
 
 
@@ -245,6 +245,30 @@ def test_bulk_excludes_masked_labels_like_null_values(tmp_path, aggregation):
         np.testing.assert_array_equal(masked["0_y"], 0)
 
 
+def test_bulk_leaves_nan_none_and_blank_labels_out_of_every_group(tmp_path):
+    counts = np.arange(1, 25, dtype=np.uint16).reshape(6, 4)
+    store, cells = _bulk_store(tmp_path, counts)
+    store.cells.insert("float_group", np.array([1.0, 1.0, np.nan, 2.0, np.nan, 2.0]))
+    store.cells.insert(
+        "text_group",
+        np.array(["a", "", "a", None, "b", " "], dtype=object),
+    )
+    options = {
+        "cell_selection": cells,
+        "aggr_type": "sum",
+        "remove_empty_features": False,
+    }
+
+    by_float = store.make_bulk("float_group", **options)
+    by_text = store.make_bulk("text_group", **options)
+
+    assert list(by_float.columns) == ["1.0", "2.0"]
+    np.testing.assert_array_equal(by_float["1.0"], counts[[0, 1]].sum(axis=0))
+    np.testing.assert_array_equal(by_float["2.0"], counts[[3, 5]].sum(axis=0))
+    assert list(by_text.columns) == ["a", "b"]
+    np.testing.assert_array_equal(by_text["a"], counts[[0, 2]].sum(axis=0))
+
+
 def test_bulk_rejects_colliding_column_names(tmp_path):
     store, cells = _bulk_store(tmp_path, np.ones((4, 3), dtype=np.uint16))
     store.cells.insert("group", np.array(["a_b", "a_b", "a", "a"]))
@@ -359,3 +383,25 @@ def test_bulk_preserves_floating_point_counts_and_sum_dtype(aggregation):
         np.testing.assert_array_equal(
             fractions[:, code], (raw > 0).sum(axis=0) / max(1, members.sum())
         )
+
+
+def test_bulk_sums_of_float_counts_accumulate_in_float64():
+    # Beyond 2**24 a float32 running sum no longer grows by one count, so the
+    # unit counts after the large first value were lost.
+    counts = np.array([[2.0**24], [1.0], [1.0], [1.0]], dtype=np.float32)
+    selected = np.arange(4)
+
+    actual, _ = aggregate_rna_groups(
+        _counts_t_with_plan(counts),
+        selected,
+        np.zeros(4, dtype=np.int64),
+        1,
+        scalars=None,
+        size_factor=1000,
+        return_fraction=False,
+        resources=ResourceBudget(16 * 1024**2, 1),
+    )
+
+    assert actual.dtype == np.float32
+    assert actual[0, 0] == np.float32(2.0**24 + 3)
+    assert actual[0, 0] != np.float32(2.0**24)

@@ -14,9 +14,9 @@ from scarf.metadata import MetaData
 from scarf.storage.artifacts import (
     ArtifactRef,
     artifact_path,
-    find_reusable_artifacts,
     make_provenance,
     new_artifact_id,
+    reusable_artifact_groups,
 )
 from scarf.storage.stores import (
     REMOTE_METADATA_WORKERS,
@@ -143,13 +143,16 @@ def test_reuse_lookup_reads_each_candidate_once() -> None:
         refs.append(ref)
 
     probe.reset()
-    found = find_reusable_artifacts(
-        root,
-        scope="assay",
-        assay="RNA",
-        kind="normalized",
-        provenance=provenance,
-    )
+    found = [
+        ref
+        for ref, _group in reusable_artifact_groups(
+            root,
+            scope="assay",
+            assay="RNA",
+            kind="normalized",
+            provenance=provenance,
+        )
+    ]
 
     assert sorted(found, key=lambda ref: ref.artifact_id) == sorted(
         refs, key=lambda ref: ref.artifact_id

@@ -39,13 +39,7 @@ def test_side_legend_columns_stay_page_sized():
 def test_categorical_color_map_validates_custom_palette():
     with pytest.raises(KeyError, match="missing from palette"):
         categorical_color_map(["a", "b"], palette={"a": "red"})
-    colors = categorical_color_map(
-        ["a"],
-        palette={"a": "red"},
-        missing_label="NA",
-        missing_color="gray",
-    )
-    assert colors == {"a": "red", "NA": "gray"}
+    assert categorical_color_map(["a"], palette={"a": "red"}) == {"a": "red"}
 
 
 def test_continuous_norm_supports_center_and_validates_bounds():
@@ -57,15 +51,10 @@ def test_continuous_norm_supports_center_and_validates_bounds():
 
 
 def test_generated_palette_and_flat_norm_edge_cases():
-    generated = categorical_color_map(
-        ["b", "a"],
-        missing_label="NA",
-        missing_color="#cccccc",
-    )
+    generated = categorical_color_map(["b", "a"])
 
-    assert list(generated) == ["b", "a", "NA"]
-    assert list(generated.values())[:2] == palette_for_n(2)
-    assert generated["NA"] == "#cccccc"
+    assert list(generated) == ["b", "a"]
+    assert list(generated.values()) == palette_for_n(2)
     assert palette_for_n(0) == []
     with pytest.raises(ValueError, match="palette_name"):
         palette_for_n(3, palette_name="unknown")
@@ -157,6 +146,146 @@ def test_registered_layout_point_sizes_follow_resolved_axis_area():
     )
     assert collection.get_sizes() == pytest.approx(np.full(3, expected))
     plt.close(figure)
+
+
+def test_registered_point_sizes_can_refresh_marker_edges():
+    from scarf.plotting._style import (
+        default_point_edgewidth,
+        refresh_layout_point_sizes,
+        register_layout_point_size,
+    )
+
+    plt, mpl = require_matplotlib()
+    figure, axis = plt.subplots(figsize=(4.0, 3.0), layout="constrained")
+    derived = axis.scatter([0.0, 1.0], [0.0, 1.0], s=99, linewidths=3.0)
+    explicit = axis.scatter([0.0, 1.0], [1.0, 0.0], s=99, linewidths=3.0)
+    for collection, edgewidth in ((derived, None), (explicit, 0.0)):
+        register_layout_point_size(
+            collection,
+            n_points=500,
+            size_min=1.0,
+            size_max=28.0,
+            edgecolor="#333333",
+            edgewidth=edgewidth,
+        )
+
+    refresh_layout_point_sizes(figure)
+
+    size = float(derived.get_sizes()[0])
+    assert derived.get_linewidths()[0] == pytest.approx(
+        default_point_edgewidth(500, point_size=size)
+    )
+    assert tuple(derived.get_edgecolors()[0]) == pytest.approx(
+        mpl.colors.to_rgba("#333333")
+    )
+    assert explicit.get_linewidths()[0] == 0.0
+    plt.close(figure)
+
+
+def test_color_limits_share_one_policy():
+    from scarf.plotting._style import resolve_color_limits
+
+    values = np.array([0.0, 1.0, 2.0, 100.0, np.nan, np.inf])
+    assert resolve_color_limits(values, splt.ColorScale()) == (0.0, 100.0)
+    assert resolve_color_limits(
+        values,
+        splt.ColorScale(quantiles=(0.25, 0.75)),
+    ) == pytest.approx(tuple(np.quantile([0.0, 1.0, 2.0, 100.0], (0.25, 0.75))))
+    assert resolve_color_limits(values, splt.ColorScale(vmin=1.0)) == (1.0, 100.0)
+    assert resolve_color_limits([np.nan], splt.ColorScale()) == (0.0, 1.0)
+    # Constant values take the low end of the map.
+    assert resolve_color_limits([3.0, 3.0], splt.ColorScale()) == (3.0, 4.0)
+    # A one-sided explicit bound keeps its side when the data lie beyond it.
+    assert resolve_color_limits([5.0, 6.0], splt.ColorScale(vmax=2.0)) == (1.0, 2.0)
+    assert resolve_color_limits([0.0, 1.0], splt.ColorScale(vmin=5.0)) == (5.0, 6.0)
+    # A pivot widens derived limits so one-sided values still diverge.
+    low, high = resolve_color_limits([1.0, 3.0], splt.ColorScale(vcenter=0.0))
+    assert low < 0.0 < high == 3.0
+    low, high = resolve_color_limits([0.0, 0.0], splt.ColorScale(vcenter=0.0))
+    assert low < 0.0 < high
+    with pytest.raises(ValueError, match="vcenter"):
+        resolve_color_limits([1.0, 3.0], splt.ColorScale(vmin=0.5, vcenter=0.0))
+    with pytest.raises(ValueError, match="positive values"):
+        resolve_color_limits([0.0, 3.0], splt.ColorScale(scale="log"))
+    with pytest.raises(ValueError, match="greater than vmin"):
+        splt.ColorScale(vmin=4.0, vmax=4.0)
+
+
+def test_continuous_norm_follows_color_scale_scale():
+    _, mpl = require_matplotlib()
+    assert isinstance(
+        continuous_norm(mpl, vmin=1.0, vmax=10.0, vcenter=None, scale="log"),
+        mpl.colors.LogNorm,
+    )
+    assert isinstance(
+        continuous_norm(mpl, vmin=-1.0, vmax=10.0, vcenter=None, scale="symlog"),
+        mpl.colors.SymLogNorm,
+    )
+    with pytest.raises(ValueError, match="positive values"):
+        continuous_norm(mpl, vmin=0.0, vmax=10.0, vcenter=None, scale="log")
+
+
+def test_category_scale_shows_observed_categories_with_stable_colors():
+    from scarf.plotting._style import resolve_category_scale
+
+    natural = resolve_category_scale(
+        np.array(["c10", None, "c2", "c1", np.nan], dtype=object),
+        None,
+    )
+    assert natural.order == ("c1", "c2", "c10")
+    assert natural.labels is None
+
+    ordered = splt.CategoricalScale(order=("a", "b", "c"), labels={"a": "Alpha"})
+    subset = resolve_category_scale(np.array(["c", "a"], dtype=object), ordered)
+    full = resolve_category_scale(np.array(["a", "b", "c"], dtype=object), ordered)
+    assert subset.order == ("a", "c")
+    # Generated colors belong to the full explicit order, not the subset.
+    assert subset.palette == {"a": full.palette["a"], "c": full.palette["c"]}
+    assert subset.labels == {"a": "Alpha", "c": "c"}
+    with pytest.raises(ValueError, match=r"categorical_scale\.order is missing"):
+        resolve_category_scale(np.array(["d"], dtype=object), ordered)
+    with pytest.raises(ValueError, match="duplicates"):
+        resolve_category_scale(
+            np.array(["a"], dtype=object),
+            splt.CategoricalScale(order=("a", "a")),
+        )
+
+
+def test_missing_categories_include_nulls_but_not_containers():
+    import pandas as pd
+
+    from scarf.plotting._style import _is_missing_category
+
+    assert _is_missing_category(None)
+    assert _is_missing_category(float("nan"))
+    assert _is_missing_category(pd.NA)
+    assert not _is_missing_category("a")
+    # A sequence label has no single missingness answer.
+    assert not _is_missing_category((1, None))
+
+
+def test_padded_square_limits_and_colormap_palette():
+    from scarf.plotting._style import colormap_palette, padded_square_limits
+
+    xlim, ylim = padded_square_limits(
+        np.array([0.0, 10.0, np.nan]),
+        np.array([0.0, 2.0, 5.0]),
+    )
+    assert xlim == pytest.approx((-0.5, 10.5))
+    assert ylim[1] - ylim[0] == pytest.approx(11.0)
+    with pytest.raises(ValueError, match="No finite coordinates"):
+        padded_square_limits(np.array([np.nan]), np.array([1.0]))
+    with pytest.raises(ValueError, match="matching shapes"):
+        padded_square_limits(np.zeros(2), np.zeros(3))
+
+    _, mpl = require_matplotlib()
+    palette = colormap_palette(["a", "b", "c"], "viridis")
+    colormap = mpl.colormaps["viridis"]
+    assert palette == {
+        "a": mpl.colors.to_hex(colormap(0.0)),
+        "b": mpl.colors.to_hex(colormap(0.5)),
+        "c": mpl.colors.to_hex(colormap(1.0)),
+    }
 
 
 @pytest.mark.parametrize(
@@ -341,35 +470,3 @@ def test_theme_context_restores_state_after_error_and_rejects_unknown_theme():
     with pytest.raises(KeyError, match="Unknown theme"):
         with theme_context("missing-theme"):
             pass
-
-
-def test_register_theme_validates_inputs_and_cleans_up_temporary_theme(monkeypatch):
-    from scarf.plotting._style import THEMES, register_theme
-
-    with pytest.raises(ValueError, match="non-empty"):
-        register_theme("", {})
-    with pytest.raises(ValueError, match="already exists"):
-        register_theme("notebook", {})
-    with pytest.raises(KeyError, match="Unknown base theme"):
-        register_theme("wave4-invalid-base", {}, base="missing")
-    with pytest.raises(KeyError, match="Unknown Matplotlib rcParams"):
-        register_theme("wave4-invalid-key", {"not.a.real.rcparam": 1})
-
-    name = "wave4-temporary-theme"
-    monkeypatch.setitem(THEMES, name, {"font.size": 1})
-    register_theme(
-        name,
-        {"font.size": 7.25},
-        base="paper",
-        overwrite=True,
-    )
-    assert THEMES[name]["font.size"] == pytest.approx(7.25)
-    assert THEMES[name]["axes.labelsize"] == THEMES["paper"]["axes.labelsize"]
-
-    register_theme(
-        name,
-        {"font.size": 11},
-        base=None,
-        overwrite=True,
-    )
-    assert THEMES[name] == {"font.size": 11}

@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import h5py
 import httpx
 import numpy as np
 import pytest
@@ -29,10 +30,13 @@ from tests.fixtures_cytebase import (
     VERSION_ID,
     CytebaseBuild,
     FakeHub,
+    cellxgene_dataset,
     dataset_record,
     full_manifest,
     noop,
     source_details,
+    write_categorical,
+    write_column_order,
     write_h5ad,
 )
 
@@ -408,6 +412,48 @@ def test_build_local_inspects_and_converts_a_registered_source(cytebase_build):
     assert (embedding / umap["artifact_id"]).is_dir()
     assert converted["qcSummary"]["active_cells"] == 6
     assert set(cytebase_build.record().timings) == {"inspectSeconds", "convertSeconds"}
+
+
+def test_build_local_imports_obs_columns_that_hdf5_nests(tmp_path):
+    source = write_h5ad(tmp_path / "source.h5ad")
+    nested = "Baseline eGFR (ml/min/1.73m2) (Binned)"
+    stored = "Baseline eGFR (ml_min_1.73m2) (Binned)"
+    values = ["30-60", ">60"] * 3
+    with h5py.File(source, "r+") as h5:
+        # Old AnnData versions split a "/" in a column name into nested HDF5
+        # groups while column-order kept the full name.
+        obs = h5["obs"]
+        write_categorical(obs, nested, values)
+        write_column_order(
+            obs, ["is_primary_data", "cell_type", "donor_id", "n_genes", nested]
+        )
+    size, checksum = source_details(source)
+    record = DatasetRecord.model_validate(dataset_record())
+    store = tmp_path / "data.zarr"
+
+    manifest, converted = build.build_local(
+        record, source, store, cellxgene_dataset(), size, checksum, noop
+    )
+
+    assert converted["status"] == "done", converted
+    inspection = converted["inspection"]
+    assert inspection["h5ad_keys"]["obs"][nested]["encoding"] == "categorical"
+    assert "Baseline eGFR (ml" not in inspection["h5ad_keys"]["obs"]
+    cell_data = zarr.open_group(LocalStore(store, read_only=True), mode="r")["cellData"]
+    columns = set(cell_data.keys())
+    assert {"cell_type", "donor_id", stored} <= columns
+    # Summaries name the stored columns; the cell IDs are stored as ``ids``.
+    assert set(inspection["obs_summary"]) - {"_index"} <= columns
+    assert stored in inspection["obs_summary"]
+    datastore = scarf.DataStore(
+        str(store), default_assay="RNA", min_features_per_cell=-1
+    )
+    try:
+        assert datastore.cells.fetch_all(stored).tolist() == values
+    finally:
+        datastore.z.store.close()
+    verification = build.verify_store(str(store), manifest.model_dump(mode="json"))
+    assert verification["countsBlock"] == COUNTS[:3].tolist()
 
 
 def test_build_local_prefers_registration_metadata(tmp_path, monkeypatch):

@@ -1,12 +1,9 @@
-import gzip
-import io
 import inspect
 import pickle
 import subprocess
 import sys
 from typing import get_type_hints
 
-import h5py
 import numpy as np
 import pytest
 import zarr
@@ -19,7 +16,6 @@ from scarf.readers import (
     CrReader,
     H5adInspectResult,
     H5adReader,
-    LoomReader,
     MtxCandidate,
     MtxReader,
     SeuratInspectResult,
@@ -60,16 +56,6 @@ _PUBLIC_CLASS_METHODS = {
         "consume_group",
         "consume",
     ),
-    LoomReader: (
-        "__init__",
-        "cell_names",
-        "cell_ids",
-        "get_cell_attrs",
-        "feature_names",
-        "feature_ids",
-        "get_feature_attrs",
-        "consume",
-    ),
     CSVReader: (
         "__init__",
         "cell_ids",
@@ -86,7 +72,6 @@ _PUBLIC_CLASS_METHODS = {
         "close",
         "get_assay",
         "get_reduction",
-        "inspect",
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
@@ -94,13 +79,12 @@ _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
     CrH5Reader: "053373f2af2f2fc74a3e00cde9b067c5818aba92c09da3a9ac2e129566ca87b9",
     CrDirReader: "d1d6697ba86d1e34aeb3e176ba84000e4fc50267176cec6f922ef696050b40dc",
     H5adReader: "d8556a75fb03793e802e86bf87a07f0097d1337e55700edd9af68ec7212a2e28",
-    LoomReader: "85c3ff965cb94a4fa201915b9d43890081e1f26e931327fcda6531bee4c3782a",
     CSVReader: "8aa6c17c876afb62765584fc7ff64d2838c66ef53095da10d7198ca60ab83851",
     MtxReader: "06376a32ff98ff0153ae1cc35f327509c88784ce027cb045bf9833b45dbccf2a",
-    SeuratReader: "f90ad28ab745692321245b3fd48e66273cbbe52795a9711f0cf17fb171820d3f",
+    SeuratReader: "c51148f751a74072c2f79448a4b6a25f0dc0c52b0abfbe837fb1b9e0c667368c",
 }
 _MODULE_SIGNATURE_DIGEST = (
-    "06ff8febbf86e3fef017f7126c9f810ed2a0fa5101e9988945bc2417f5e8eae3"
+    "63d01b3ffb7199003584ff37300ce5580b913756da32cd09b86ebbb7e5618382"
 )
 
 
@@ -142,7 +126,6 @@ def test_readers_facade_surface_is_stable():
         "SeuratInspectResult",
         "SeuratReader",
         "inspect_seurat",
-        "LoomReader",
         "CSVReader",
     ]
     expected = {
@@ -152,18 +135,17 @@ def test_readers_facade_surface_is_stable():
         "CrReader",
         "H5adInspectResult",
         "H5adReader",
-        "LoomReader",
         "MtxCandidate",
         "MtxReader",
         "SeuratInspectResult",
         "SeuratReader",
-        "get_file_handle",
         "inspect_h5ad",
         "inspect_mtx",
         "inspect_seurat",
-        "read_file",
     }
-    assert expected.issubset(vars(readers_module))
+    assert expected.issubset(dir(readers_module))
+    assert not hasattr(readers_module, "get_file_handle")
+    assert not hasattr(readers_module, "read_file")
 
 
 def test_readers_facade_loads_format_modules_lazily():
@@ -176,7 +158,6 @@ def test_readers_facade_loads_format_modules_lazily():
                 "assert 'scarf.readers.cellranger' not in sys.modules; "
                 "assert 'scarf.readers.csv' not in sys.modules; "
                 "assert 'scarf.readers.h5ad' not in sys.modules; "
-                "assert 'scarf.readers.loom' not in sys.modules; "
                 "assert 'scarf.readers.mtx' not in sys.modules; "
                 "assert 'scarf.readers.seurat' not in sys.modules; "
                 "assert 'h5py' not in sys.modules; "
@@ -188,7 +169,6 @@ def test_readers_facade_loads_format_modules_lazily():
                 "assert 'scarf.readers.csv' in sys.modules; "
                 "assert 'scarf.readers.cellranger' not in sys.modules; "
                 "assert 'scarf.readers.h5ad' not in sys.modules; "
-                "assert 'scarf.readers.loom' not in sys.modules; "
                 "assert 'scarf.readers.mtx' not in sys.modules; "
                 "assert 'scarf.readers.seurat' not in sys.modules; "
                 "assert 'pandas' in sys.modules; "
@@ -214,8 +194,7 @@ def test_matrix_market_exports_load_together_lazily():
                 "assert readers.inspect_mtx.__module__ == 'scarf.readers'; "
                 "assert readers.CrDirReader.__module__ == 'scarf.readers'; "
                 "assert 'scarf.readers.mtx' in sys.modules; "
-                "assert 'scarf.readers.h5ad' not in sys.modules; "
-                "assert 'scarf.readers.loom' not in sys.modules"
+                "assert 'scarf.readers.h5ad' not in sys.modules"
             ),
         ],
         check=True,
@@ -243,7 +222,7 @@ def test_seurat_exports_load_together_without_loading_the_writer():
 
 
 def test_seurat_reader_facade_objects_resolve_annotations_and_pickle():
-    for name in ("__init__", "get_assay", "get_reduction", "inspect"):
+    for name in ("__init__", "get_assay", "get_reduction"):
         assert get_type_hints(getattr(SeuratReader, name))
     for value in (
         SeuratReader,
@@ -263,11 +242,9 @@ def test_reader_module_function_signatures_are_stable():
     methods = {
         name: getattr(readers_module, name)
         for name in (
-            "get_file_handle",
             "inspect_h5ad",
             "inspect_mtx",
             "inspect_seurat",
-            "read_file",
         )
     }
     assert signature_digest(methods) == _MODULE_SIGNATURE_DIGEST
@@ -290,11 +267,9 @@ def test_reader_public_metadata_remains_on_facade():
     assert MtxCandidate.__module__ == "scarf.readers"
     assert SeuratInspectResult.__module__ == "scarf.readers"
     for name in (
-        "get_file_handle",
         "inspect_h5ad",
         "inspect_mtx",
         "inspect_seurat",
-        "read_file",
     ):
         assert getattr(readers_module, name).__module__ == "scarf.readers"
 
@@ -306,37 +281,6 @@ def test_cellranger_reader_hierarchy_and_abstract_contracts_are_stable():
     assert issubclass(MtxReader, CrReader)
     for name in ("_handle_version", "_read_dataset", "consume"):
         assert getattr(CrReader, name).__isabstractmethod__
-
-
-def test_reader_text_helpers_support_plain_gzip_and_missing_files(tmp_path):
-    plain = tmp_path / "plain.txt"
-    compressed = tmp_path / "compressed.txt.gz"
-    plain.write_text("one \n two\n")
-    with gzip.open(compressed, mode="wt") as handle:
-        handle.write("three\nfour \n")
-
-    assert list(readers_module.read_file(str(plain))) == ["one", " two"]
-    assert list(readers_module.read_file(str(compressed))) == ["three", "four"]
-
-    missing = tmp_path / "missing.txt"
-    try:
-        readers_module.get_file_handle(str(missing))
-    except FileNotFoundError as error:
-        assert str(error) == f"ERROR: FILE NOT FOUND: {missing}"
-    else:
-        raise AssertionError("Missing reader input did not raise FileNotFoundError")
-
-
-def test_get_file_handle_facade_remains_patchable_by_read_file(monkeypatch):
-    handle = io.StringIO("one\ntwo\n")
-    monkeypatch.setattr(
-        readers_module,
-        "get_file_handle",
-        lambda filename: handle,
-    )
-
-    assert list(readers_module.read_file("virtual.txt")) == ["one", "two"]
-    assert handle.closed
 
 
 def test_crreader_reclassifies_noncontiguous_features_atomically(tmp_path):
@@ -409,20 +353,3 @@ def test_crreader_reclassification_locks_when_writer_captures_schema(tmp_path):
     np.testing.assert_array_equal(root["ADT/counts"][:], [[5]])
     with pytest.raises(RuntimeError, match="captures the schema"):
         reader.reclassify_features([4], "HTO")
-
-
-def test_loom_reader_preserves_cell_feature_orientation(tmp_path):
-    values = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.uint16)
-    path = tmp_path / "orientation.loom"
-    with h5py.File(path, mode="w") as handle:
-        handle.create_dataset("matrix", data=values)
-        handle.create_group("col_attrs")
-        handle.create_group("row_attrs")
-
-    reader = LoomReader(str(path))
-    try:
-        chunks = [chunk.toarray() for chunk in reader.consume(batch_size=2)]
-    finally:
-        reader.h5.close()
-
-    np.testing.assert_array_equal(np.concatenate(chunks), values.T)

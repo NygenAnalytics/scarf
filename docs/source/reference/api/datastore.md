@@ -37,8 +37,8 @@ See {doc}`../../tutorials/remote_stores`.
         lineage, summary, resolve_features, snapshot_cell_selection,
         build_mapping_reference, get_mapping_reference, run_mapping,
         get_mapping_result, get_mapping_score, get_target_classes,
-        get_target_label_evidence, calibrate_label_transfer_threshold,
-        integrate_assays, metric_lisi, load_metric_lisi, metric_ilisi, metric_clisi,
+        get_target_label_evidence,
+        integrate_assays, metric_ilisi, metric_clisi,
         metric_proportional_batch_mixing, metric_graph_connectivity,
         metric_graph_silhouette, metric_label_concordance,
         metric_cluster_separability
@@ -80,7 +80,9 @@ doublets = ds.run_doublet_detection(cluster_ref, graph_ref)
 the explicit diffusion-operator lineage. It accepts one name, a sequence of names, a
 one-dimensional string array, or a Series. A name that exactly matches a live cell metadata
 column, including case, diffuses that column; it takes precedence over an assay feature of the same
-name. Other names match assay feature names case-insensitively, and duplicates are averaged. A
+name. Other names match assay feature names case-insensitively, and duplicates are averaged.
+Metadata columns need no assay, so `from_assay` is required only for feature names from an
+integrated graph's operator; a native graph's operator uses its own assay. A
 metadata column with a missing value in the operator's cell selection raises `ValueError`, because
 diffusion would spread its stored placeholder to neighbouring cells.
 `run_diffusion_operator` raises `MemoryError` before persisting an operator that could not be
@@ -118,8 +120,10 @@ bounds reject non-finite metric values, such as the undefined percentages of zer
 every filter raises when no cell remains.
 {py:meth}`scarf.datastore.datastore.DataStore.select_cells` thresholds the numeric `values` payload
 of an exact cell artifact, or retains categorical values with `include=[...]`, and composes the
-result with its stored source selection. An explicit `cell_selection=` may narrow, but never widen,
-that source selection. Cells whose value the artifact records as missing are never selected.
+result with its stored source selection. Categorical label artifacts are read from their canonical
+label array, such as `phase` of a cell-cycle artifact or `labels` of a Paris cut. An explicit
+`cell_selection=` may narrow, but never widen, that source selection. Cells whose value the
+artifact records as missing are never selected, and a selection that retains no cell raises.
 Doublet detection, `run_marker_search`, `calc_membership_strength`, and `smart_label` reject label
 artifacts with missing labels before reusing or writing a result. Select the labelled cells with
 `select_cells(labels, include=[...])` and derive complete labels for that selection.

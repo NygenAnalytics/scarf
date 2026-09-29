@@ -221,10 +221,6 @@ class PreprocessedAssayHandoff(AgentDataModel):
     graphFeatureCandidates: dict[str, ArtifactReferenceModel] = Field(
         default_factory=dict
     )
-    normalizedCandidates: dict[str, ArtifactReferenceModel] = Field(
-        default_factory=dict
-    )
-    featureCandidateEvaluations: list[dict[str, Any]] = Field(default_factory=list)
     nCells: int = 0
     nFeatures: int = 0
 
@@ -251,16 +247,11 @@ class FinalAnalysisHandoff(AgentDataModel):
 class AutomatedWorkflowConfig(AgentDataModel):
     """Bounded execution policy for automated workflows."""
 
-    inputPolicy: WorkflowInputPolicy = Field(
-        default="pause",
-        exclude_if=lambda value: value == "pause",
-    )
-    # Older requests always scored doublets. Keep their serialized defaults exact.
+    inputPolicy: WorkflowInputPolicy = "pause"
     scoreDoublets: bool = Field(
         default=True,
         strict=True,
-        exclude_if=lambda value: value is True,
-        description="Score advisory doublets; Harmony-eligible runs always retain required doublet diagnostics. The beginner API defaults to false; absent saved fields retain enabled scoring.",
+        description="Score advisory doublets; Harmony-eligible runs always retain required doublet diagnostics. The beginner API defaults to false.",
     )
     screeningCells: int | None = Field(
         default=None,
@@ -472,7 +463,5 @@ class OrchestrationRequestRecord(AgentDataModel):
 class OrchestrationResumeRecord(AgentDataModel):
     """Runtime answers committed as inputs of their owning stage attempt."""
 
-    workflowRunId: str = ""
     answeredAttempt: WorkflowStageLink | None = None
-    questionIds: list[str] = Field(default_factory=list)
     answers: dict[str, Any] = Field(default_factory=dict)

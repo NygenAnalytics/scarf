@@ -17,6 +17,7 @@ from scarf.embeddings.imported import write_imported_coordinates
 from scarf.metadata import MetaData
 from scarf.storage.artifacts import (
     ArtifactRef,
+    ArtifactStatus,
     artifact_path,
     fingerprint_array,
     list_artifacts,
@@ -251,18 +252,6 @@ def _patch_trajectory_graph_resolution(
         (
             False,
             False,
-            0,
-            np.array(
-                [
-                    [0.0, 0.1, 0.0],
-                    [0.3, 0.0, 0.0],
-                    [0.5, 0.0, 0.0],
-                ]
-            ),
-        ),
-        (
-            False,
-            False,
             99,
             np.array(
                 [
@@ -315,76 +304,6 @@ def test_load_graph_option_matrix(
     )
 
     np.testing.assert_allclose(graph.toarray(), expected)
-
-
-def test_graph_memory_cache_is_keyed_and_scoped(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = _memory_graph_store()
-    graph_ref = _add_test_graph(store)
-    original = store._store_to_sparse
-    reads = 0
-
-    def counted_store_to_sparse(
-        location: str,
-        sparse_format: str = "csr",
-        use_k: int | None = None,
-    ):
-        nonlocal reads
-        reads += 1
-        return original(location, sparse_format, use_k)
-
-    monkeypatch.setattr(store, "_store_to_sparse", counted_store_to_sparse)
-
-    with store._graph_memory_cache_scope():
-        raw = store._load_graph_artifact(
-            graph_ref,
-            symmetric=None,
-            upper_only=None,
-            use_k=None,
-        )
-        equivalent = store._load_graph_artifact(
-            graph_ref,
-            symmetric=False,
-            upper_only=True,
-            use_k=None,
-        )
-        symmetric = store._load_graph_artifact(
-            graph_ref,
-            symmetric=True,
-            upper_only=None,
-            use_k=None,
-        )
-        reduced = store._load_graph_artifact(
-            graph_ref,
-            symmetric=None,
-            upper_only=None,
-            use_k=1,
-        )
-
-        assert raw is equivalent
-        assert raw is not symmetric
-        assert raw is not reduced
-        assert reads == 3
-        with store._graph_memory_cache_scope():
-            nested = store._load_graph_artifact(
-                graph_ref,
-                symmetric=None,
-                upper_only=None,
-                use_k=None,
-            )
-            assert nested is raw
-            assert reads == 3
-
-    assert store._graphMemoryCache is None
-    uncached = store._load_graph_artifact(
-        graph_ref,
-        symmetric=None,
-        upper_only=None,
-        use_k=None,
-    )
-    assert uncached is not raw
-    assert reads == 4
 
 
 def test_corrupt_zarr_ann_bytes_raise_artifact_error(
@@ -531,6 +450,61 @@ def test_diffusion_operator_round_trip_and_explicit_imputation(
         )
         == 3
     )
+
+
+def test_metadata_imputation_needs_no_assay_for_integrated_graphs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _memory_graph_store()
+    graph_ref = _add_test_graph(store)
+    selection = _add_test_cell_selection(
+        store,
+        feature_values=np.array([1.0, 2.0, 4.0]),
+    )
+    _patch_trajectory_graph_resolution(monkeypatch, graph_ref, selection)
+    requested: list[str | None] = []
+
+    def resolve_integrated_assay(_root, _graph, from_assay, **_kwargs):
+        requested.append(from_assay)
+        if from_assay is None:
+            raise ValueError("from_assay is required for an integrated graph")
+        return from_assay
+
+    monkeypatch.setattr(
+        "scarf.datastore._operations.trajectory.resolve_graph_source_assay",
+        resolve_integrated_assay,
+    )
+    store._load_graph_artifact = Mock(
+        return_value=csr_matrix(np.ones((3, 3)) - np.eye(3))
+    )
+    diffusion = store.run_diffusion_operator(graph_ref, t=1)
+
+    np.testing.assert_allclose(
+        store.get_imputed("gene", diffusion),
+        np.array([3.0, 2.5, 1.5]),
+    )
+    assert requested == []
+    store.get_imputed("gene", diffusion, from_assay="RNA")
+    assert requested == ["RNA"]
+
+
+def test_load_graph_accepts_numpy_boolean_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _memory_graph_store()
+    graph_ref = _add_test_graph(store)
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.graph_cell_selection",
+        lambda _root, _graph: None,
+    )
+    expected = store.load_graph(graph_ref, symmetric=True, upper_only=True)
+    actual = store.load_graph(graph_ref, symmetric=np.True_, upper_only=np.True_)
+
+    np.testing.assert_allclose(actual.toarray(), expected.toarray())
+    assert not np.allclose(actual.toarray(), store.load_graph(graph_ref).toarray())
+    for flags in ({"symmetric": "yes"}, {"upper_only": 1}):
+        with pytest.raises(TypeError, match="must be a boolean or None"):
+            store.load_graph(graph_ref, **flags)
 
 
 def test_imputation_rejects_budget_before_reading_sparse_payload(
@@ -869,13 +843,15 @@ def test_run_tsne_orchestration_and_error_paths(
         kind="embedding_initialization",
         artifact_id="2" * 64,
     )
-    get_initial = Mock(return_value=(initial, initialization_ref))
+    get_initial = Mock(return_value=initial)
     runner = Mock(return_value=embedding)
     selection_ref = store.snapshot_cell_selection("I")
     monkeypatch.setattr(
         "scarf.datastore._operations.embeddings.graph_cell_selection",
         lambda _root, selected: selection_ref if selected == graph_ref else None,
     )
+    monkeypatch.setattr(store, "_graph_location", lambda _graph: "graph")
+    monkeypatch.setattr(store, "_get_graph_ncells_k", lambda _location: (3, 2))
     monkeypatch.setattr(store, "_load_graph_artifact", load_graph)
     monkeypatch.setattr(store, "_get_ini_embed", get_initial)
     monkeypatch.setattr("scarf.embeddings.sgtsne.run_sgtsne", runner)
@@ -931,8 +907,14 @@ def test_run_tsne_orchestration_and_error_paths(
             invalidate_cache=True,
         )
     assert runner.call_args.kwargs["nthreads"] == 2
+    with pytest.raises(TypeError, match="initialization must be an ArtifactRef"):
+        store.run_tsne(graph_ref, initial.tolist())  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="graph must be an ArtifactRef"):
+        store.run_tsne("graph", initial)  # type: ignore[arg-type]
 
     runner_calls = runner.call_count
+    graph_loads = load_graph.call_count
+    initial_loads = get_initial.call_count
     monkeypatch.setattr(sys, "platform", "win32")
     assert (
         store.run_tsne(
@@ -947,6 +929,17 @@ def test_run_tsne_orchestration_and_error_paths(
         == first_ref
     )
     assert runner.call_count == runner_calls
+    # A reused embedding neither loads the graph nor expands its initialization.
+    assert load_graph.call_count == graph_loads
+    assert get_initial.call_count == initial_loads
+    with pytest.raises(RuntimeError, match="win32 operating system"):
+        store.run_tsne(graph_ref, initial, invalidate_cache=True)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    runner.side_effect = None
+    runner.return_value = embedding[:1]
+    with pytest.raises(ValueError, match="returned an embedding with shape"):
+        store.run_tsne(graph_ref, initial, invalidate_cache=True)
     _assert_metadata_unchanged(store.cells, metadata_before)
 
 
@@ -954,10 +947,6 @@ def test_integrate_assays_snn_writes_and_reuses_exact_sources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _memory_graph_store(["RNA", "ADT"])
-    monkeypatch.setattr(
-        "scarf.datastore._operations.graph.validate_stored_selection_integrity",
-        lambda *_args, **_kwargs: None,
-    )
     selection_ref = ArtifactRef(
         scope="datastore",
         kind="cell_selection",
@@ -997,7 +986,7 @@ def test_integrate_assays_snn_writes_and_reuses_exact_sources(
         lambda *_args: SimpleNamespace(cell_selection=selection_ref),
     )
     monkeypatch.setattr(
-        "scarf.datastore._operations.graph._validate_integration_source_payload",
+        "scarf.datastore._operations.graph.validate_integration_source_payload",
         lambda *_args: 3,
     )
     load_captured = Mock(side_effect=lambda ref, **_kwargs: graphs[ref.assay])
@@ -1102,15 +1091,10 @@ def test_integrate_assays_persists_exact_sources(
             cell_selection=selection,
         ),
     )
-    monkeypatch.setattr(
-        graph_operations,
-        "validate_stored_selection_integrity",
-        Mock(),
-    )
     validate_source = Mock(return_value=3)
     monkeypatch.setattr(
         graph_operations,
-        "_validate_integration_source_payload",
+        "validate_integration_source_payload",
         validate_source,
     )
 
@@ -1251,11 +1235,7 @@ def test_integrate_assays_validation_errors(
         lambda *_args: SimpleNamespace(cell_selection=selection),
     )
     monkeypatch.setattr(
-        "scarf.datastore._operations.graph.validate_stored_selection_integrity",
-        Mock(),
-    )
-    monkeypatch.setattr(
-        "scarf.datastore._operations.graph._validate_integration_source_payload",
+        "scarf.datastore._operations.graph.validate_integration_source_payload",
         Mock(return_value=3),
     )
     duplicate = ArtifactRef(
@@ -1301,10 +1281,6 @@ def test_integrate_assays_rejects_corrupt_sources_before_planning(
             coordinates=coordinates,
             cell_selection=selection,
         ),
-    )
-    monkeypatch.setattr(
-        "scarf.datastore._operations.graph.validate_stored_selection_integrity",
-        lambda *_args, **_kwargs: None,
     )
     plan = Mock(side_effect=AssertionError("artifact planning must not start"))
     monkeypatch.setattr(
@@ -1389,16 +1365,32 @@ def test_query_neighbors_guards_ann_indices_and_coordinate_row_count(
 
     def require(ref, _kind, **_kwargs):
         if ref == ann:
-            return SimpleNamespace(
-                inputs={"coordinates": coordinates.to_dict()},
-                parameters={
-                    "ann_metric": "l2",
-                    "ann_ef": 50,
-                    "parallel_threads": 1,
-                },
+            return ArtifactStatus(
+                ref=ann,
                 path="ann",
+                exists=True,
+                complete=True,
+                provenance=make_provenance(
+                    operation="build_ann_index",
+                    parameters={
+                        "ann_metric": "l2",
+                        "ann_ef": 50,
+                        "parallel_threads": 1,
+                    },
+                    inputs={"coordinates": coordinates},
+                ),
             )
-        return SimpleNamespace(inputs={}, parameters={}, path="coordinates")
+        return ArtifactStatus(
+            ref=ref,
+            path="coordinates",
+            exists=True,
+            complete=True,
+            provenance=make_provenance(
+                operation="run_pca",
+                parameters={},
+                inputs={},
+            ),
+        )
 
     store._require_complete_artifact = Mock(side_effect=require)
     store._plan_assay_artifact = Mock(
@@ -1533,12 +1525,8 @@ def test_wnn_input_helpers_fail_before_integration_compute(
         ),
     )
     monkeypatch.setattr(
-        "scarf.datastore._operations.graph._validate_integration_source_payload",
+        "scarf.datastore._operations.graph.validate_integration_source_payload",
         lambda *_args: 3,
-    )
-    monkeypatch.setattr(
-        "scarf.datastore._operations.graph.validate_stored_selection_integrity",
-        Mock(),
     )
     store._selection_artifacts_match = Mock(return_value=True)
     integrated = ArtifactRef(
@@ -1625,9 +1613,9 @@ def test_wnn_rejects_missing_pca_center_before_reusing_cached_graph() -> None:
         dtype="uint16",
     )
     adt_counts[:] = rng.integers(1, 30, size=(12, 5), dtype=np.uint16)
-    from scarf.storage.identity import finalize_counts
+    from tests.storage_helpers import finalize_test_counts
 
-    finalize_counts(adt_counts)
+    finalize_test_counts(adt_counts)
     finalize_writer_counts_t(writer.z, "ADT", None, nthreads=1)
     store = DataStore(source, default_assay="RNA", min_features_per_cell=0, nthreads=1)
     cells = store.snapshot_cell_selection()
@@ -1653,9 +1641,7 @@ def test_wnn_rejects_missing_pca_center_before_reusing_cached_graph() -> None:
     )
 
 
-def test_ann_storage_fails_closed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_ann_storage_fails_closed() -> None:
     store = _memory_graph_store()
     missing = ArtifactRef(
         scope="assay",
@@ -1666,32 +1652,6 @@ def test_ann_storage_fails_closed(
     with pytest.raises(ArtifactResolutionError) as caught:
         store._resolve_ann_index(missing, "l2", 2)
     assert caught.value.code == "missing_artifact"
-
-    save_index = Mock()
-    monkeypatch.setattr(
-        "scarf.datastore._operations.graph.save_ann_index",
-        save_index,
-    )
-    store.zarr_mode = "r"
-    store._persist_ann_index(
-        "read_only_ann",
-        object(),
-        ann_metric="l2",
-        dimensions=2,
-        element_count=3,
-    )
-    save_index.assert_not_called()
-
-    store.zarr_mode = "r+"
-    store._persist_ann_index(
-        "writable_ann",
-        object(),
-        ann_metric="l2",
-        dimensions=2,
-        element_count=3,
-    )
-    assert "writable_ann" in store.zw
-    save_index.assert_called_once()
 
 
 def test_normalized_local_cache_cleans_up_after_failure(
@@ -1748,6 +1708,38 @@ def test_normalized_local_cache_cleans_up_after_failure(
         with store._cache_normalized_artifact(normalized, True, 2):
             assert normalized in store._normalizedArtifactCache
             raise RuntimeError("downstream failure")
+
+    assert normalized not in store._normalizedArtifactCache
+    assert not cache_base.exists()
+
+
+def test_normalized_local_cache_removes_a_failed_staging_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _memory_graph_store()
+    store.zarr_loc = "remote"
+    store.resources = None
+    normalized = _add_complete_artifact(
+        store,
+        "normalized",
+        arrays={"data": np.arange(6, dtype=np.float32).reshape(3, 2)},
+    )
+    cache_base = tmp_path / "scarf_local_cache_staging"
+    cache_base.mkdir()
+    store._resolve_local_cache_plan = Mock(return_value=(True, str(cache_base), True))
+
+    def interrupted_copy(source, target, **_kwargs):
+        target[:1, :] = source[:1, :]
+        raise ConnectionError("remote read failed while staging")
+
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.copy_zarr_array",
+        interrupted_copy,
+    )
+    with pytest.raises(ConnectionError, match="while staging"):
+        with store._cache_normalized_artifact(normalized, True, 2):
+            raise AssertionError("staging failed, so the block must not run")
 
     assert normalized not in store._normalizedArtifactCache
     assert not cache_base.exists()

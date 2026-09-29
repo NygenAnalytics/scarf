@@ -151,10 +151,11 @@ _CONTRACTS = (
         signature_only={
             **_classified("execution", "local_cache"),
         },
-        model_only=_classified(
-            "resolved_input",
-            "feature_scaling",
-        ),
+        model_only={
+            **_classified("resolved_input", "feature_scaling"),
+            # Set only when IncrementalPCA fits several blocks.
+            **_classified("derived", "incremental_block_rows"),
+        },
     ),
     OperationContract(
         DataStore.run_aucell,

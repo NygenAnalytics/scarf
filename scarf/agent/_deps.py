@@ -14,4 +14,6 @@ def require_pydantic_ai() -> Any:
         import pydantic_ai
     except ImportError as exc:
         raise ImportError(AGENT_INSTALL_HINT) from exc
+    # Scarf logs its own agent progress; suppress Pydantic AI's first-run banner.
+    pydantic_ai.BANNER_ENABLED = False
     return pydantic_ai

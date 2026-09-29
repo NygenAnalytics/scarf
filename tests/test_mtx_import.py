@@ -262,15 +262,26 @@ def test_archive_discovers_nested_compressed_prefixed_members_and_cleans_up(
 
 
 @pytest.mark.parametrize(
-    ("sidecar_name", "contents", "expected_names"),
+    ("sidecar_name", "contents", "expected_names", "expected_type"),
     [
-        ("features.tsv", "feature-0\nfeature-1\n", ["feature-0", "feature-1"]),
+        (
+            "features.tsv",
+            "feature-0\nfeature-1\n",
+            ["feature-0", "feature-1"],
+            "Gene Expression",
+        ),
         (
             "genes.tsv.gz",
             "feature-0\tGene zero\nfeature-1\tGene one\n",
             ["Gene zero", "Gene one"],
+            "Gene Expression",
         ),
-        ("peaks.bed.gz", "peak-0\npeak-1\n", ["peak-0", "peak-1"]),
+        (
+            "peaks.bed.gz",
+            "chr1\t10109\t10357\nchr1\t180730\t181630\n",
+            ["chr1:10109-10357", "chr1:180730-181630"],
+            "Peaks",
+        ),
     ],
 )
 def test_feature_sidecar_suffix_and_column_fallbacks(
@@ -278,6 +289,7 @@ def test_feature_sidecar_suffix_and_column_fallbacks(
     sidecar_name: str,
     contents: str,
     expected_names: list[str],
+    expected_type: str,
 ) -> None:
     _write_mex(
         tmp_path,
@@ -295,9 +307,34 @@ def test_feature_sidecar_suffix_and_column_fallbacks(
     reader = MtxReader(candidate)
     try:
         assert reader.feature_names() == expected_names
-        assert reader.feature_types() == ["Gene Expression", "Gene Expression"]
+        assert reader.feature_types() == [expected_type, expected_type]
     finally:
         reader.close()
+
+
+@pytest.mark.parametrize(
+    ("contents", "message"),
+    [
+        ("chr1\t10109\nchr1\t180730\n", "chrom, start, and end columns"),
+        ("chr1\tstart\t10357\nchr1\t180730\t181630\n", "must hold integers"),
+    ],
+)
+def test_peak_bed_sidecars_are_validated(
+    tmp_path: Path,
+    contents: str,
+    message: str,
+) -> None:
+    _write_mex(tmp_path, [(1, 1, 1), (2, 1, 2)], n_features=2, n_cells=1)
+    (tmp_path / "features.tsv").unlink()
+    _write_text(tmp_path / "peaks.bed", contents)
+
+    candidate = inspect_mtx(tmp_path)[0]
+    with pytest.raises(ValueError, match=message):
+        reader = MtxReader(candidate)
+        try:
+            reader.feature_names()
+        finally:
+            reader.close()
 
 
 def test_parse_modern_compressed_names_and_feature_name_fallback(
@@ -1030,6 +1067,131 @@ def test_bd_guide_reclassification_is_explicit(tmp_path: Path) -> None:
         require_previous="mRNA",
     )
     assert tuple(reader.assayFeats.columns) == ("RNA", "CRISPR")
+
+    store = MemoryStore()
+    MtxToZarr(reader, store, mem_budget="64M").dump(lines_in_mem=2)
+    root = zarr.open_group(store=store, mode="r")
+    np.testing.assert_array_equal(
+        root["CRISPR/featureData/feature_type"][:],
+        ["CRISPR Guide Capture"],
+    )
+    np.testing.assert_array_equal(root["RNA/featureData/feature_type"][:], ["mRNA"])
+
+
+def test_feature_reference_covers_only_feature_barcode_features(
+    tmp_path: Path,
+) -> None:
+    _write_mex(
+        tmp_path,
+        [(1, 1, 3), (2, 1, 1), (3, 1, 7)],
+        n_features=3,
+        n_cells=1,
+        feature_types=["Gene Expression", "Gene Expression", "Antibody Capture"],
+    )
+    # A 10x Feature Reference lists Feature Barcode features only.
+    (tmp_path / "feature_reference.csv").write_text(
+        "id,name,read,pattern,sequence,feature_type\n"
+        "feature-2,CD3,R2,5PNNNNNNNNNN(BC),AACAAGACCCTTGAG,Antibody Capture\n"
+    )
+    reader = MtxReader(inspect_mtx(tmp_path)[0])
+    store = MemoryStore()
+    MtxToZarr(reader, store, mem_budget="64M").dump(lines_in_mem=2)
+
+    root = zarr.open_group(store=store, mode="r")
+    np.testing.assert_array_equal(
+        root["ADT/featureData/sequence"][:], ["AACAAGACCCTTGAG"]
+    )
+    np.testing.assert_array_equal(root["ADT/featureData/names"][:], ["gene-2"])
+    np.testing.assert_array_equal(
+        root["ADT/featureData/feature_type"][:],
+        ["Antibody Capture"],
+    )
+    assert "sequence" not in root["RNA/featureData"]
+
+    (tmp_path / "feature_reference.csv").write_text("id,sequence\nunknown,ACGT\n")
+    with pytest.raises(ValueError, match="not matrix features: unknown"):
+        MtxReader(inspect_mtx(tmp_path)[0])
+
+
+def test_feature_reference_column_with_a_separator_is_renamed(
+    tmp_path: Path,
+) -> None:
+    _write_mex(
+        tmp_path,
+        [(1, 1, 3), (2, 1, 7)],
+        n_features=2,
+        n_cells=1,
+        feature_types=["Gene Expression", "Antibody Capture"],
+    )
+    (tmp_path / "feature_reference.csv").write_text(
+        "id,name,read,pattern,sequence,feature_type,tag/x\n"
+        "feature-1,CD3,R2,5PNNNNNNNNNN(BC),AACAAGACCCTTGAG,Antibody Capture,T1\n"
+    )
+    reader = MtxReader(inspect_mtx(tmp_path)[0])
+    store = MemoryStore()
+    MtxToZarr(reader, store, mem_budget="64M").dump(lines_in_mem=2)
+
+    root = zarr.open_group(store=store, mode="r")
+    np.testing.assert_array_equal(root["ADT/featureData/tag_x"][:], ["T1"])
+    assert list(root["ADT/featureData"].group_keys()) == []
+    assert "tag_x" not in root["RNA/featureData"]
+
+
+def test_feature_reference_column_empty_for_every_feature_takes_no_key(
+    tmp_path: Path,
+) -> None:
+    from scarf.utils.logging import logger
+
+    _write_mex(
+        tmp_path,
+        [(1, 1, 3), (2, 1, 7)],
+        n_features=2,
+        n_cells=1,
+        feature_types=["Gene Expression", "Antibody Capture"],
+    )
+    (tmp_path / "feature_reference.csv").write_text(
+        "id,name,read,pattern,sequence,feature_type,tag/x,tag\\x\n"
+        "feature-1,CD3,R2,5PNNNNNNNNNN(BC),AACAAGACCCTTGAG,Antibody Capture,,T1\n"
+    )
+    reader = MtxReader(inspect_mtx(tmp_path)[0])
+    store = MemoryStore()
+    messages: list[str] = []
+    handler = logger.add(messages.append, level="WARNING", format="{message}")
+    try:
+        MtxToZarr(reader, store, mem_budget="64M").dump(lines_in_mem=2)
+    finally:
+        logger.remove(handler)
+
+    root = zarr.open_group(store=store, mode="r")
+    # The empty 'tag/x' column is never written, so 'tag\\x' keeps the base key.
+    np.testing.assert_array_equal(root["ADT/featureData/tag_x"][:], ["T1"])
+    assert "tag_x_2" not in root["ADT/featureData"]
+    assert not any("'tag/x'" in message for message in messages)
+
+
+def test_symbolic_link_sidecars_keep_their_names(tmp_path: Path) -> None:
+    content = tmp_path / "objects"
+    content.mkdir()
+    _write_mex(content, [(1, 1, 2)], n_features=1, n_cells=1)
+    work = tmp_path / "work"
+    work.mkdir()
+    for name in ("matrix.mtx", "features.tsv", "barcodes.tsv"):
+        target = content / f"sha256-{name.replace('.', '-')}"
+        (content / name).rename(target)
+        (work / name).symlink_to(target)
+
+    candidates = inspect_mtx(work)
+
+    assert [Path(candidate.matrixPath).name for candidate in candidates] == [
+        "matrix.mtx"
+    ]
+    reader = MtxReader(candidates[0])
+    try:
+        assert np.vstack([batch.toarray() for batch in reader.consume(1)]).tolist() == [
+            [2]
+        ]
+    finally:
+        reader.close()
 
 
 def _write_tagged_h5(path: Path) -> None:

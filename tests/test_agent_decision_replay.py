@@ -77,12 +77,12 @@ def test_committed_qc_choice_replays_exact_owner_and_pending_outcome(
     )
     assert result == replay
     if defer:
-        assert owner._pending_decision_question(replay, definition).options == [
+        assert replay.pending is not None
+        assert replay.pending.options == [
             item.optionId for item in definition.spec.options
         ]
     else:
-        with pytest.raises(ValueError, match="no pending question"):
-            owner._pending_decision_question(replay, definition)
+        assert replay.pending is None
     next(iter(saved.values()))["outputs"]["checks"] = []
     with pytest.raises(ValueError, match="checks differ"):
         owner._resolve_rna_decision(

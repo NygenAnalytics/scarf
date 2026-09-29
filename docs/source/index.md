@@ -26,7 +26,7 @@ inputs and parameters produced each result.
 
 In three fixed reference runs, Scarf processed 10 million input cells through conversion, quality
 control, normalization, graph construction, embedding, clustering, and marker search in
-2.78 ± 0.47 hours, with 31.9 GiB mean sampled peak memory on a 16 CPU, 64 GiB container.
+88.8 ± 0.1 minutes, with 38.0 GiB mean sampled peak memory on a 16 CPU, 64 GiB container.
 
 These measurements establish execution and resource use for that dataset, workflow, software
 revision, and cloud resource envelope. They are not a general hardware guarantee, a comparison

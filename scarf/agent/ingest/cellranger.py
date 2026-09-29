@@ -51,8 +51,9 @@ def ingest_cellranger(
         if rename_assays:
             reader.rename_assays(rename_assays)
 
-        writer = CrToZarr(reader, zarr_loc=zarr_path)
+        # Writers open the destination in their constructor.
         writer_started = True
+        writer = CrToZarr(reader, zarr_loc=zarr_path)
         writer.dump()
     except CONVERSION_DATA_ERRORS as exc:
         return failed_from_exception(

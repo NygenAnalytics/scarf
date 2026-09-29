@@ -16,8 +16,6 @@ from huggingface_hub import (
 )
 
 if TYPE_CHECKING:
-    import zarr
-
     from ._embeddings import embedding as embedding
     from ._embeddings import embedding_coordinates as embedding_coordinates
     from ._embeddings import embeddings as embeddings
@@ -176,18 +174,6 @@ class Repository:
                 datasets.append(_safe_name(relative_path, kind="dataset name"))
         return sorted(datasets)
 
-    def list_files(
-        self,
-        path: str | None = None,
-        *,
-        recursive: bool = True,
-    ) -> list[str]:
-        """Return file paths relative to this repository."""
-        return [
-            _relative_file_path(self.name, file).as_posix()
-            for file in _bucket_files(self.name, path, recursive=recursive)
-        ]
-
     def download(
         self,
         path: str,
@@ -236,21 +222,6 @@ class Repository:
         _download_files(self.name, selected, destination)
         return destination / name
 
-    def open_zarr(self, path: str) -> "zarr.Group":
-        """Open an unpacked Zarr group for anonymous read-only access."""
-        relative_path = _safe_relative_path(path, kind="Zarr path")
-        uri = f"hf://buckets/{_BUCKET_ID}/{self.name}/{relative_path.as_posix()}"
-
-        import zarr
-        from zarr.storage import FsspecStore
-
-        store = FsspecStore.from_url(
-            uri,
-            storage_options={"token": False},
-            read_only=True,
-        )
-        return zarr.open_group(store=store, mode="r")
-
 
 def _local_catalog_root() -> Path | None:
     raw = os.environ.get(_LOCAL_CATALOG_ENV, "").strip()
@@ -269,10 +240,17 @@ def _local_dataset_store(name: str) -> Path | None:
 
 
 def _copy_local_dataset(store: Path, target: Path) -> Path:
-    if target.exists():
-        shutil.rmtree(target)
-    target.mkdir(parents=True)
-    shutil.copytree(store, target / "data.zarr")
+    """Replace only ``data.zarr`` in ``target``, keeping any other files."""
+    target.mkdir(parents=True, exist_ok=True)
+    staging_path = Path(tempfile.mkdtemp(dir=target, prefix=".data.zarr.copy-"))
+    backup_path = Path(tempfile.mkdtemp(dir=target, prefix=".data.zarr.backup-"))
+    try:
+        staged = staging_path / "data.zarr"
+        shutil.copytree(store, staged)
+        _replace_staged_paths([(staged, target / "data.zarr")], backup_path)
+    finally:
+        shutil.rmtree(staging_path, ignore_errors=True)
+        shutil.rmtree(backup_path, ignore_errors=True)
     return target
 
 

@@ -1,6 +1,7 @@
 """Diagnostics for reference mapping and label transfer."""
 
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any, Hashable, Literal
 import warnings
 
@@ -15,16 +16,23 @@ from ._contracts import (
     PlotProvenance,
 )
 from ._deps import require_matplotlib
-from ._figure import LegendSpec, PlotResult, normalize_axes_target
+from ._figure import (
+    LegendSpec,
+    PlotResult,
+    close_figures_on_error,
+    normalize_axes_target,
+)
 from ..utils.arrays import sort_categories
 from ._style import (
     apply_figure_chrome,
-    categorical_color_map,
+    category_label,
     continuous_norm,
     default_point_size,
     finish_embedding_axes,
+    padded_square_limits,
+    resolve_category_scale,
+    resolve_color_limits,
     scatter_edgecolor,
-    square_axis_limits,
     theme_context,
 )
 
@@ -61,56 +69,29 @@ def _external_groups(
     return groups
 
 
-def _categorical_contract(
-    values: np.ndarray,
-    scale: CategoricalScale | None,
-) -> tuple[list[Any], dict[Any, str], CategoricalScale]:
-    observed = list(pd.unique(values))
-    if scale is not None and scale.order is not None:
-        missing = [value for value in observed if value not in scale.order]
-        if missing:
-            raise ValueError(
-                "categorical_scale.order is missing values: "
-                + ", ".join(map(str, missing[:10]))
-            )
-        order = [value for value in scale.order if value in set(observed)]
-    else:
-        order = sort_categories(observed)
-    palette = categorical_color_map(
-        order,
-        palette=scale.palette if scale is not None else None,
-        palette_name=scale.palette_name if scale is not None else "default",
-    )
-    return (
-        order,
-        palette,
-        CategoricalScale(
-            order=tuple(order),
-            palette=palette,
-            labels=scale.labels if scale is not None else None,
-            missing_color=scale.missing_color if scale is not None else "#bdbdbd",
-            missing_label=scale.missing_label if scale is not None else "NA",
-            palette_name=scale.palette_name if scale is not None else "default",
+def _check_label_types(
+    known: np.ndarray,
+    predicted: np.ndarray,
+    reference_class_group: str,
+) -> None:
+    """Reject known labels that match transferred labels only as text."""
+    textual_matches = np.fromiter(
+        (
+            str(known_value) == str(predicted_value)
+            for known_value, predicted_value in zip(known, predicted, strict=True)
         ),
+        dtype=bool,
+        count=len(known),
     )
+    if np.any(textual_matches & ~(predicted == known)):
+        raise ValueError(
+            "Some known_labels only equal their transferred labels after text "
+            "conversion. Convert known_labels to the value type stored "
+            f"in {reference_class_group!r}"
+        )
 
 
-def _axis_limits(x: np.ndarray, y: np.ndarray) -> tuple[Any, Any]:
-    if x.shape != y.shape:
-        raise ValueError("Coordinate columns must have matching shapes")
-    finite = np.isfinite(x) & np.isfinite(y)
-    if not finite.any():
-        raise ValueError("No finite coordinates are available to plot")
-    finite_x = x[finite]
-    finite_y = y[finite]
-    xpad = 0.05 * (float(np.ptp(finite_x)) or 1.0)
-    ypad = 0.05 * (float(np.ptp(finite_y)) or 1.0)
-    return square_axis_limits(
-        (float(np.min(finite_x) - xpad), float(np.max(finite_x) + xpad)),
-        (float(np.min(finite_y) - ypad), float(np.max(finite_y) + ypad)),
-    )
-
-
+@close_figures_on_error
 def mapping_score(
     store: Any,
     result: ArtifactRef,
@@ -201,6 +182,7 @@ def mapping_score(
         vmin=0.0,
         quantiles=(0.0, 0.995),
     )
+    color_scale = replace(color_scale, cmap=color_scale.cmap or "magma")
     panel_keys: list[Hashable] = (
         list(labels) if kind in {"embedding", "box"} else ["mapping_score"]
     )
@@ -224,14 +206,14 @@ def mapping_score(
             layout_values = _reference_layout(layout_values, n_reference)
             x = layout_values[:, 0]
             y = layout_values[:, 1]
-            xlim, ylim = _axis_limits(x, y)
+            xlim, ylim = padded_square_limits(x, y)
             shared_values = np.concatenate(
                 [values[np.isfinite(values) & (values > 0)] for values in score_arrays]
             )
             if shared_values.size == 0:
                 shared_values = np.concatenate(score_arrays)
             shared_limits = (
-                _continuous_limits(shared_values, color_scale)
+                resolve_color_limits(shared_values, color_scale)
                 if color_scale.scope == "shared"
                 else None
             )
@@ -243,7 +225,7 @@ def mapping_score(
             for label, values in zip(labels, score_arrays, strict=True):
                 ax = axes[label]
                 positive = values[np.isfinite(values) & (values > 0)]
-                limits = shared_limits or _continuous_limits(
+                limits = shared_limits or resolve_color_limits(
                     positive if positive.size else values,
                     color_scale,
                 )
@@ -252,6 +234,7 @@ def mapping_score(
                     vmin=limits[0],
                     vmax=limits[1],
                     vcenter=color_scale.vcenter,
+                    scale=color_scale.scale,
                 )
                 visible = np.isfinite(x) & np.isfinite(y) & np.isfinite(values)
                 # Draw the full reference cloud first so zero-score cells stay
@@ -286,7 +269,7 @@ def mapping_score(
                     y[order_index],
                     c=values[order_index],
                     s=sizes,
-                    cmap=color_scale.cmap or "magma",
+                    cmap=color_scale.cmap,
                     norm=norm,
                     edgecolors="none",
                     rasterized=n_reference >= 50_000,
@@ -320,10 +303,12 @@ def mapping_score(
             scales.append(color_scale)
         elif kind == "box":
             assert reference_classes is not None
-            class_order, palette, resolved_categorical = _categorical_contract(
+            resolved_categorical = resolve_category_scale(
                 reference_classes,
                 categorical_scale,
             )
+            class_order = list(resolved_categorical.order or ())
+            palette = resolved_categorical.palette or {}
             for label, values in zip(labels, score_arrays, strict=True):
                 ax = axes[label]
                 grouped_values = [
@@ -332,7 +317,10 @@ def mapping_score(
                 ]
                 boxes = ax.boxplot(
                     grouped_values,
-                    tick_labels=[str(class_label) for class_label in class_order],
+                    tick_labels=[
+                        category_label(resolved_categorical, class_label)
+                        for class_label in class_order
+                    ],
                     patch_artist=True,
                     showfliers=False,
                 )
@@ -349,11 +337,12 @@ def mapping_score(
             legends.append(LegendSpec(kind="categorical", label="Reference class"))
             scales.append(resolved_categorical)
         else:
-            group_values = np.asarray(labels, dtype=object)
-            order, palette, resolved_categorical = _categorical_contract(
-                group_values,
+            resolved_categorical = resolve_category_scale(
+                np.asarray(labels, dtype=object),
                 categorical_scale,
             )
+            order = list(resolved_categorical.order or ())
+            palette = resolved_categorical.palette or {}
             ax = axes["mapping_score"]
             finite = np.concatenate(
                 [values[np.isfinite(values)] for values in score_arrays]
@@ -408,26 +397,6 @@ def mapping_score(
     return plot_result
 
 
-def _continuous_limits(
-    values: np.ndarray,
-    scale: ColorScale,
-) -> tuple[float, float]:
-    finite = values[np.isfinite(values)]
-    if len(finite) == 0:
-        return (0.0, 1.0)
-    if scale.quantiles is not None:
-        low, high = np.quantile(finite, scale.quantiles)
-    else:
-        low, high = float(np.min(finite)), float(np.max(finite))
-    if scale.vmin is not None:
-        low = scale.vmin
-    if scale.vmax is not None:
-        high = scale.vmax
-    if high <= low:
-        high = low + 1.0
-    return float(low), float(high)
-
-
 def _label_evidence(
     store: Any,
     result: ArtifactRef,
@@ -451,6 +420,7 @@ def _label_evidence(
     ).copy()
 
 
+@close_figures_on_error
 def mapping_evidence(
     store: Any,
     result: ArtifactRef,
@@ -505,10 +475,9 @@ def mapping_evidence(
         raise KeyError("Unknown evidence metrics: " + ", ".join(missing))
     for metric in requested_metrics:
         evidence[metric] = pd.to_numeric(evidence[metric], errors="coerce")
-    order, palette, resolved_categorical = _categorical_contract(
-        groups,
-        categorical_scale,
-    )
+    resolved_categorical = resolve_category_scale(groups, categorical_scale)
+    order = list(resolved_categorical.order or ())
+    palette = resolved_categorical.palette or {}
     if figsize is None and target is None:
         figsize = (4.0 * min(len(requested_metrics), 3), 3.3)
     plt, _ = require_matplotlib()
@@ -541,7 +510,7 @@ def mapping_evidence(
                         histtype="step",
                         linewidth=1.4,
                         color=palette[group],
-                        label=str(group),
+                        label=category_label(resolved_categorical, group),
                     )
                 ax.set_ylabel("Mapped cells")
             else:
@@ -554,7 +523,9 @@ def mapping_evidence(
                 ]
                 boxes = ax.boxplot(
                     grouped_values,
-                    tick_labels=[str(group) for group in order],
+                    tick_labels=[
+                        category_label(resolved_categorical, group) for group in order
+                    ],
                     patch_artist=True,
                     showfliers=False,
                 )
@@ -599,6 +570,7 @@ def mapping_evidence(
     return plot_result
 
 
+@close_figures_on_error
 def mapping_confusion(
     store: Any,
     result: ArtifactRef,
@@ -637,6 +609,7 @@ def mapping_confusion(
     valid = pd.notna(known)
     truth = known[valid]
     predicted = evidence.loc[valid, "label"].to_numpy(dtype=object)
+    _check_label_types(truth, predicted, reference_class_group)
     observed_known = sort_categories(list(pd.unique(truth)))
     observed_predicted = sort_categories(list(pd.unique(predicted)))
     rows = list(known_order) if known_order is not None else observed_known
@@ -681,7 +654,8 @@ def mapping_confusion(
         display = display / max(float(display.to_numpy().sum()), 1.0)
     display = display.fillna(0)
     color_scale = color_scale or ColorScale(cmap="Blues", vmin=0)
-    limits = _continuous_limits(display.to_numpy(), color_scale)
+    color_scale = replace(color_scale, cmap=color_scale.cmap or "Blues")
+    limits = resolve_color_limits(display.to_numpy(), color_scale)
     _, mpl = require_matplotlib()
     with theme_context(theme):
         figure, axes, owns = normalize_axes_target(
@@ -695,10 +669,11 @@ def mapping_confusion(
             vmin=limits[0],
             vmax=limits[1],
             vcenter=color_scale.vcenter,
+            scale=color_scale.scale,
         )
         image = ax.imshow(
             display.to_numpy(),
-            cmap=color_scale.cmap or "Blues",
+            cmap=color_scale.cmap,
             norm=norm,
             aspect="auto",
             interpolation="nearest",
@@ -773,6 +748,7 @@ def mapping_confusion(
     return plot_result
 
 
+@close_figures_on_error
 def mapping_calibration(
     store: Any,
     result: ArtifactRef,
@@ -840,24 +816,7 @@ def mapping_calibration(
     informative = ~evidence.loc[valid, "isUnknown"].to_numpy(dtype=bool)
     if len(values) == 0:
         raise ValueError("No finite metric values with known labels")
-    textual_matches = np.fromiter(
-        (
-            str(known_value) == str(predicted_value)
-            for known_value, predicted_value in zip(
-                known[valid],
-                predicted[valid],
-                strict=True,
-            )
-        ),
-        dtype=bool,
-        count=len(values),
-    )
-    if np.any(textual_matches & ~correct):
-        raise ValueError(
-            "Some known_labels only equal their transferred labels after text "
-            "conversion. Convert known_labels to the value type stored "
-            f"in {reference_class_group!r}"
-        )
+    _check_label_types(known[valid], predicted[valid], reference_class_group)
     if thresholds is None:
         resolved_thresholds = np.unique(
             np.quantile(values, np.linspace(0, 1, n_thresholds))

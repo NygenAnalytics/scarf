@@ -78,6 +78,12 @@ graphLocalCache = "auto"
 # clusterSourceArtifactId = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 # Tune memory before large runs. Values are examples.
+#
+# run-e2e and run-local open one DataStore in initializeStore and reuse it
+# through findMarkers (runLeiden and reopenStore open their own), so those
+# stages must share workers and scarfMemoryBudget; the funnel refuses a
+# mismatch. Their Modal CPU and memory may still differ: they size the run-all
+# containers and the funnel envelope, which takes the largest of each.
 
 # Pin createStore / writeCountsT / markHvgs / findMarkers to 8 CPU / 32 GiB
 # (scarf budget ~24 GiB). Other stages keep larger envelopes.
@@ -106,7 +112,7 @@ modalMemoryRequestMb = 65536
 modalMemoryLimitMb = 73728
 modalCpuRequest = 8.0
 modalCpuLimit = 8.0
-scarfMemoryBudget = 51539607552
+scarfMemoryBudget = 25769803776
 workers = 8
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288
@@ -146,8 +152,8 @@ modalMemoryRequestMb = 131072
 modalMemoryLimitMb = 147456
 modalCpuRequest = 16.0
 modalCpuLimit = 16.0
-scarfMemoryBudget = 120259084288
-workers = 16
+scarfMemoryBudget = 25769803776
+workers = 8
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288
 
@@ -156,8 +162,8 @@ modalMemoryRequestMb = 131072
 modalMemoryLimitMb = 147456
 modalCpuRequest = 16.0
 modalCpuLimit = 16.0
-scarfMemoryBudget = 120259084288
-workers = 16
+scarfMemoryBudget = 25769803776
+workers = 8
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288
 
@@ -166,8 +172,8 @@ modalMemoryRequestMb = 131072
 modalMemoryLimitMb = 147456
 modalCpuRequest = 16.0
 modalCpuLimit = 16.0
-scarfMemoryBudget = 120259084288
-workers = 16
+scarfMemoryBudget = 25769803776
+workers = 8
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288
 
@@ -176,8 +182,8 @@ modalMemoryRequestMb = 131072
 modalMemoryLimitMb = 147456
 modalCpuRequest = 16.0
 modalCpuLimit = 16.0
-scarfMemoryBudget = 120259084288
-workers = 16
+scarfMemoryBudget = 25769803776
+workers = 8
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288
 
@@ -186,8 +192,8 @@ modalMemoryRequestMb = 131072
 modalMemoryLimitMb = 147456
 modalCpuRequest = 16.0
 modalCpuLimit = 16.0
-scarfMemoryBudget = 120259084288
-workers = 16
+scarfMemoryBudget = 25769803776
+workers = 8
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288
 
@@ -196,8 +202,8 @@ modalMemoryRequestMb = 131072
 modalMemoryLimitMb = 147456
 modalCpuRequest = 16.0
 modalCpuLimit = 16.0
-scarfMemoryBudget = 120259084288
-workers = 16
+scarfMemoryBudget = 25769803776
+workers = 8
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288
 
@@ -206,7 +212,7 @@ modalMemoryRequestMb = 65536
 modalMemoryLimitMb = 73728
 modalCpuRequest = 8.0
 modalCpuLimit = 8.0
-scarfMemoryBudget = 51539607552
+scarfMemoryBudget = 25769803776
 workers = 8
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288
@@ -232,22 +238,22 @@ timeoutSeconds = 82800
 ephemeralDiskMb = 524288
 
 [stageResources.importClusters]
-modalMemoryRequestMb = 16384
-modalMemoryLimitMb = 20480
-modalCpuRequest = 4.0
-modalCpuLimit = 4.0
-scarfMemoryBudget = 12884901888
-workers = 4
+modalMemoryRequestMb = 32768
+modalMemoryLimitMb = 32768
+modalCpuRequest = 8.0
+modalCpuLimit = 8.0
+scarfMemoryBudget = 25769803776
+workers = 8
 timeoutSeconds = 3600
 ephemeralDiskMb = 524288
 
 [stageResources.validateExperiment]
-modalMemoryRequestMb = 16384
-modalMemoryLimitMb = 20480
-modalCpuRequest = 4.0
-modalCpuLimit = 4.0
-scarfMemoryBudget = 12884901888
-workers = 4
+modalMemoryRequestMb = 32768
+modalMemoryLimitMb = 32768
+modalCpuRequest = 8.0
+modalCpuLimit = 8.0
+scarfMemoryBudget = 25769803776
+workers = 8
 timeoutSeconds = 3600
 ephemeralDiskMb = 524288
 

@@ -73,7 +73,6 @@ def test_tuning_reports_survive_pause_failure_and_completion(monkeypatch) -> Non
             [handoff],
             ExperimentalContextResult.get_blank(),
             None,
-            None,
             {},
             study_contract=StudyContract.get_blank(),
         )
@@ -162,3 +161,52 @@ def test_attempt_owned_report_is_immutable_and_input_bound() -> None:
     assert journal.read_stage_evidence(store, reference) == report.model_dump(
         mode="json"
     )
+
+
+def test_rejected_caller_assessment_keeps_the_tuning_stage_paused(monkeypatch) -> None:
+    store, prefix, request = memory_journal()
+    features = SimpleNamespace(
+        N=3,
+        _get_array={
+            "ids": np.asarray(["gene-1", "gene-2", "gene-3"]),
+            "names": np.asarray(["A", "B", "C"]),
+        }.__getitem__,
+        default_block_rows=lambda column: 2,
+    )
+    store.get_assay = lambda assay: SimpleNamespace(feats=features)
+    rejection = rna_tuning.TuningAnswerRejected(
+        "The supplied assessment was rejected: Choose an observed candidate."
+    )
+
+    class Runner:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self):
+            raise rejection
+
+        def summary(self):
+            return {"history": []}
+
+    monkeypatch.setattr(rna_tuning, "RnaTuningRun", Runner)
+    outcome, report = TuningStagesMixin().parameter_tuning_stage(
+        store,
+        WorkflowIdentity(request.workflowRunId),
+        request,
+        [],
+        example(AutomatedPreprocessingPlan),
+        [example(PreprocessedAssayHandoff)],
+        ExperimentalContextResult.get_blank(),
+        None,
+        {"parameter_tuning": {"action": "accept"}},
+        study_contract=StudyContract.get_blank(),
+    )
+    assert outcome.status == "needsInput"
+    assert outcome.needsInput is not None
+    question = outcome.needsInput.questions[0]
+    assert question.questionId == "parameter_tuning"
+    assert "rejected" in question.question
+    assert report == ParameterTuningReport.get_blank()
+    assert journal._stage_outcomes(
+        store.zw, prefix, request.workflowRunId, "parameter_tuning"
+    ) == [outcome]

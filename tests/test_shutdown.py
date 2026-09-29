@@ -97,3 +97,30 @@ def test_signal_guard_reports_non_main_thread_capability(
     with TemporarySignalGuard(ShutdownToken()) as guard:
         assert not guard.available
         assert guard.unavailable_reason == "signal handlers require the main thread"
+
+
+def test_signal_guard_leaves_handlers_installed_outside_python(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(threading, "current_thread", threading.main_thread)
+    installed: dict[int, object] = {}
+    prior = {
+        int(signal.SIGTERM): signal.SIG_DFL,
+        int(signal.SIGINT): signal.default_int_handler,
+        int(signal.SIGHUP): None,
+    }
+    monkeypatch.setattr(signal, "getsignal", lambda number: prior[int(number)])
+    monkeypatch.setattr(
+        signal,
+        "signal",
+        lambda number, handler: installed.__setitem__(int(number), handler),
+    )
+
+    with TemporarySignalGuard(ShutdownToken()) as guard:
+        assert guard.available
+        assert int(signal.SIGHUP) not in installed
+        assert callable(installed[int(signal.SIGTERM)])
+
+    assert installed[int(signal.SIGTERM)] == signal.SIG_DFL
+    assert installed[int(signal.SIGINT)] is signal.default_int_handler
+    assert int(signal.SIGHUP) not in installed

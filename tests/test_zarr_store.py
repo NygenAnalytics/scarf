@@ -7,7 +7,7 @@ from scipy.sparse import csr_matrix
 from zarr.storage import MemoryStore
 
 from scarf.matrix.chunked import ChunkedArray
-from scarf.storage.arrays import create_numeric_array
+from scarf.storage.arrays import create_metadata_column, create_numeric_array
 from scarf.storage.artifacts import fingerprint_stored_strings
 from scarf.storage.budget import ResourceBudget
 from scarf.storage.copy import (
@@ -42,11 +42,11 @@ from scarf.storage.sharding import (
 )
 from scarf.storage.stores import (
     is_remote_datastore,
+    load_zarr,
     make_store,
     open_store,
 )
 from scarf.storage.types import array_metadata_shards
-from scarf.utils import load_zarr
 from tests.store_probes import RecordingStore
 
 
@@ -65,9 +65,9 @@ def _planned_counts(group: zarr.Group, values: np.ndarray, name: str = "counts")
         counts[:] = values
     persist_count_matrix_plan(group, plan)
     persist_count_matrix_plan(counts, plan)
-    from scarf.storage.identity import finalize_counts
+    from tests.storage_helpers import finalize_test_counts
 
-    finalize_counts(counts)
+    finalize_test_counts(counts)
     return counts
 
 
@@ -145,6 +145,24 @@ def test_remote_store_uses_obstore_without_mutating_profile(monkeypatch):
     assert isinstance(store, FakeObjectStore)
     assert store.read_only is True
     assert resolve_storage_profile("/tmp/data.zarr") == "fast_local"
+
+
+def test_remote_store_retries_for_three_minutes_unless_overridden(monkeypatch):
+    from datetime import timedelta
+
+    calls = []
+    fake_module = types.ModuleType("obstore.store")
+    fake_module.from_url = lambda url, **kwargs: calls.append(kwargs)
+    monkeypatch.setitem(__import__("sys").modules, "obstore.store", fake_module)
+    monkeypatch.setattr("zarr.storage.ObjectStore", lambda store, read_only: store)
+
+    make_store("s3://bucket/path", storage_options={"region": "auto"})
+    make_store("s3://bucket/path", storage_options={"retry_config": {"max_retries": 1}})
+
+    assert calls[0]["region"] == "auto"
+    assert calls[0]["retry_config"]["retry_timeout"] == timedelta(minutes=3)
+    assert calls[0]["retry_config"]["max_retries"] > 10
+    assert calls[1]["retry_config"] == {"max_retries": 1}
 
 
 def test_hugging_face_store_uses_fsspec(monkeypatch):
@@ -284,70 +302,16 @@ def test_numeric_array_rejects_a_shard_that_is_not_whole_chunks(shape, chunks, s
         create_numeric_array(root, "counts", spec)
 
 
-@pytest.mark.parametrize("zarr_format", [2, 3])
-def test_assay_records_the_metadata_the_stored_array_actually_has(zarr_format):
-    root = zarr.open_group(store=MemoryStore(), mode="w", zarr_format=zarr_format)
-    counts = create_zarr_count_assay(
-        root,
-        "RNA",
-        None,
-        1_009,
-        [f"f{i}" for i in range(997)],
-        [f"g{i}" for i in range(997)],
-        profile="fast_local",
-    )
-    recorded = root["RNA"].attrs["scarf:zarr_spec"]
-    stored_shards = array_metadata_shards(counts)
-
-    assert recorded["chunks"] == list(counts.chunks)
-    assert recorded["shards"] == (
-        None if stored_shards is None else list(stored_shards)
-    )
-    assert recorded["zarr_format"] == zarr_format
-    if zarr_format == 2:
-        assert stored_shards is None
-
-
-def test_new_assay_in_zarr_v2_stays_chunk_only():
-    root = zarr.open_group(
-        store=MemoryStore(),
-        mode="w",
-        zarr_format=2,
-    )
-    counts = create_zarr_count_assay(
-        root,
-        "RNA",
-        None,
-        8,
-        ["f0", "f1", "f2", "f3"],
-        ["g0", "g1", "g2", "g3"],
-        profile="fast_local",
-    )
-    values = np.arange(32, dtype=np.uint32).reshape(8, 4)
-    counts[:] = values
-
-    assert array_metadata_shards(counts) is None
-    assert root["RNA"].attrs["scarf:zarr_spec"]["zarr_format"] == 2
-    with pytest.raises(ValueError, match="Zarr format 3"):
-        write_counts_t(counts, root["RNA"])
-    np.testing.assert_array_equal(counts[:], values)
-
-
-def test_empty_assay_schema_on_zarr_v2_stays_chunk_only() -> None:
+@pytest.mark.parametrize("empty", [False, True])
+def test_count_assays_require_zarr_v3(empty: bool) -> None:
     from scarf.storage.schema import create_empty_zarr_count_assay
 
-    v2_assay = zarr.open_group(store=MemoryStore(), mode="w", zarr_format=2)
-    create_empty_zarr_count_assay(
-        v2_assay,
-        "RNA",
-        None,
-        3,
-        4,
-        "U10",
-        "U10",
-        "uint16",
-    )
-    assert "counts" in v2_assay["RNA"]
+    root = zarr.open_group(store=MemoryStore(), mode="w", zarr_format=2)
+    with pytest.raises(ValueError, match="Zarr format 3"):
+        if empty:
+            create_empty_zarr_count_assay(root, "RNA", None, 3, 4, "U10", "U10")
+        else:
+            create_zarr_count_assay(root, "RNA", None, 8, ["f0"], ["g0"])
 
 
 def test_normed_plan_respects_codec_limit():
@@ -385,6 +349,38 @@ def test_row_sharded_plan_uses_band_chunks_for_zarr_v2():
 
     assert spec.shards is None
     assert spec.chunks == (5, 3)
+
+
+def test_row_sharded_plan_avoids_tiny_chunks_for_twice_prime_rows():
+    # 999_958 rows have only the divisors 1, 2, 499_979, and 999_958.
+    rows = 2 * 499_979
+    spec = row_sharded_array_spec(
+        (rows, 168), np.float32, profile="cloud", band_rows=rows
+    )
+    target_rows = (128 * 1024**2) // (168 * 4)
+
+    assert 2 * spec.chunks[0] >= target_rows
+    assert spec.shards[0] % spec.chunks[0] == 0
+    assert np.prod(spec.chunks) * 4 <= 128 * 1024**2
+
+
+def test_metadata_columns_accept_empty_values():
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    mask = create_metadata_column(root, "mask", data=np.array([], dtype=bool))
+    ids = create_metadata_column(root, "ids", dtype="U3", shape=0)
+
+    assert mask.shape == ids.shape == (0,)
+    assert mask.chunks == ids.chunks == (1,)
+
+
+def test_copy_group_tree_rejects_multidimensional_metadata():
+    source = zarr.open_group(store=MemoryStore(), mode="w")
+    source.create_array("pairs", data=np.arange(6).reshape(3, 2))
+    target = zarr.open_group(store=MemoryStore(), mode="w")
+
+    with pytest.raises(ValueError, match="one-dimensional"):
+        copy_zarr_group_tree(source, target, row_indices=np.array([2, 0]))
+    assert "pairs" not in target
 
 
 def test_row_sharded_plan_avoids_unit_chunks_for_irregular_rows():
@@ -939,24 +935,6 @@ def test_remote_store_requires_obstore(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", reject_obstore)
     with pytest.raises(ImportError, match="obstore"):
         make_store("s3://bucket/path")
-
-
-def test_store_probe_count_only_skips_per_key_logs() -> None:
-    from tests.store_probes import StoreProbe
-
-    probe = StoreProbe(countOnly=True)
-    probe.enter("get", "a/key", requestedBytes=12)
-    probe.record_transfer("get", "a/key", 12)
-    probe.enter("set", "b/key", requestedBytes=8)
-    probe.record_transfer("set", "b/key", 8)
-    payload = probe.to_json()
-    assert probe.ops == []
-    assert probe.transferred_bytes == []
-    assert payload["gets"] == 1
-    assert payload["sets"] == 1
-    assert payload["readTransferredBytes"] == 12
-    assert payload["writeTransferredBytes"] == 8
-    assert payload["requestedBytes"] == 20
 
 
 @pytest.mark.parametrize(

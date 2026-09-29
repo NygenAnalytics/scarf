@@ -8,11 +8,13 @@ from pydantic import ValidationError
 
 from scarf.agent.experimental_context.comparisons import compare_covariates
 from scarf.agent.experimental_context.contracts import (
+    BatchCorrectionPlan,
     CovariateCharacterization,
     CovariateProposal,
     ExperimentalContextDecision,
     InferenceUnit,
 )
+from scarf.agent.experimental_context.requirements import objective_evidence
 from scarf.agent.experimental_context.study import (
     StudyContract,
     build_study_contract,
@@ -223,4 +225,65 @@ def test_context_role_change_invalidates_previously_computed_design_question():
     contract = _contract(result)
     assert contract.evidenceCoverage[1].status == "unsupported"
     with pytest.raises(ValueError, match="different column roles"):
+        validate_objective_evidence(contract, result)
+
+
+def test_requested_questions_beyond_the_contract_cap_remain_unresolved():
+    tissues = [
+        "lung",
+        "liver",
+        "kidney",
+        "heart",
+        "brain",
+        "skin",
+        "gut",
+        "spleen",
+        "blood",
+        "bone marrow",
+        "thymus",
+        "pancreas",
+        "muscle",
+    ]
+    context = " ".join(
+        f"Samples from the {name} were combined across sex and disease."
+        for name in tissues
+    )
+    objective = "Describe cell populations."
+    result = SimpleNamespace(
+        status="done",
+        characterization=CovariateCharacterization(
+            status="done",
+            columns=[
+                {"name": name, "kind": "categorical", "domain": "biological"}
+                for name in ("sex", "disease", "donor_id")
+            ],
+        ),
+        batchSafety=[],
+        notes=[],
+        decision=ExperimentalContextDecision(
+            batchCorrection=BatchCorrectionPlan(action="skip")
+        ),
+    )
+
+    requirements, coverage = objective_evidence(
+        study_context=context,
+        study_objective=objective,
+        experimental_result=result,
+    )
+
+    # The design summary and twelve questions fill the contract; the thirteenth
+    # request keeps the essential design summary unresolved instead of failing.
+    assert len(requirements) == 13
+    assert coverage[0].requirementId == "studyDesign"
+    assert coverage[0].status == "unsupported"
+    assert coverage[0].reasons[-1] == (
+        "Explicitly requested joint or conditional comparison was not measured: "
+        "Samples from the muscle were combined across sex and disease"
+    )
+    contract = build_study_contract(
+        study_context=context,
+        study_objective=objective,
+        experimental_result=result,
+    )
+    with pytest.raises(ValueError, match="Samples from the muscle"):
         validate_objective_evidence(contract, result)

@@ -4,6 +4,7 @@ import numpy as np
 from numba import njit, prange
 from numpy.typing import NDArray
 
+from ...utils.arrays import read_only_copy
 from .net import PreparedNetwork
 
 __all__ = [
@@ -16,12 +17,6 @@ __all__ = [
 ]
 
 AUCELL_ALGORITHM_VERSION = 1
-
-
-def _owned_readonly(values: np.ndarray) -> np.ndarray:
-    array = np.asarray(values, dtype=np.int64).copy()
-    array.setflags(write=False)
-    return array
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,7 +85,7 @@ def make_rank_permutation(n_features: int, tie_seed: int) -> np.ndarray:
     if tie_seed < 0:
         raise ValueError("tie_seed must be non-negative")
     permutation = np.random.default_rng(tie_seed).permutation(n_features)
-    return _owned_readonly(permutation)
+    return read_only_copy(permutation, np.int64)
 
 
 def build_gene_set_index(
@@ -132,9 +127,9 @@ def build_gene_set_index(
         [np.asarray(sorted(values), dtype=np.int64) for values in per_source]
     )
     return GeneSetIndex(
-        connections=_owned_readonly(connections),
-        starts=_owned_readonly(starts),
-        offsets=_owned_readonly(offsets),
+        connections=read_only_copy(connections, np.int64),
+        starts=read_only_copy(starts, np.int64),
+        offsets=read_only_copy(offsets, np.int64),
     )
 
 

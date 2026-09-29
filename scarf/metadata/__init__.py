@@ -1,7 +1,7 @@
 """Zarr-backed metadata tables."""
 
 from .rows import MetaDataRowBlock
-from .table import MetaData, zarrGroup as zarrGroup
+from .table import MetaData
 
 __all__ = ["MetaData", "MetaDataRowBlock"]
 

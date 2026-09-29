@@ -2,7 +2,6 @@ from collections.abc import Iterator
 from typing import Any
 
 import numpy as np
-import pandas as pd
 
 from ..readers import CrReader
 from ..storage.count_matrix import CountMatrixPolicy
@@ -12,6 +11,7 @@ from ..storage.profiles import (
     ZarrLocation,
     resolve_storage_profile,
 )
+from ..utils.arrays import assay_feature_ranges
 from ..utils.logging import logger
 from ..utils.progress import iter_progress
 
@@ -36,6 +36,9 @@ class CrToZarr:
                 unitBytes and chunkBytes plan is used.
         io: Optional explicit read, compute, and write widths. Unset values
             stay under automatic planning.
+        assay_types: Preset assay types, such as ``{"GEX": "RNA"}``, for
+                     assays whose names are not presets. Other assays take
+                     their type from their name.
 
     Attributes:
         cr: A CrReader object, containing the Cellranger data.
@@ -54,6 +57,7 @@ class CrToZarr:
         profile: StorageProfile | None = None,
         policy: CountMatrixPolicy | None = None,
         io: StorageIoPolicy | None = None,
+        assay_types: dict[str, str] | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.schema import (
@@ -62,6 +66,7 @@ class CrToZarr:
             validate_assay_name,
         )
         from ..storage.stores import load_zarr
+        from .counts_t import validate_assay_type
 
         self.resources = resolve_budget(mem_budget, nthreads)
         self.profile = resolve_storage_profile(zarr_loc, profile)
@@ -76,6 +81,14 @@ class CrToZarr:
         assay_names = tuple(dict.fromkeys(self.cr.assayFeats.columns))
         for assay_name in assay_names:
             validate_assay_name(assay_name)
+        self.assayTypes = dict(assay_types or {})
+        unknown = sorted(set(self.assayTypes).difference(assay_names))
+        if unknown:
+            raise ValueError(
+                f"assay_types names assays that are not imported: {', '.join(unknown)}"
+            )
+        for assay_type in self.assayTypes.values():
+            validate_assay_type(assay_type)
         self.z = load_zarr(zarr_loc=zarr_loc, mode="w", storage_options=storage_options)
         cell_group = create_cell_data(
             root=self.z,
@@ -103,35 +116,36 @@ class CrToZarr:
         cell_group: Any,
         assay_names: tuple[str, ...],
     ) -> None:
-        from ..storage.arrays import create_zarr_obj_array
+        from ..storage.metadata_keys import metadata_column_keys
         from ..storage.types import as_zarr_group
-        from ._store import skip_reserved_metadata_columns
+        from ._store import keyed_metadata_columns, write_metadata_column
 
+        # These readers hold their metadata in memory, so listing the columns
+        # to plan their keys reads nothing more from the source.
         cell_columns = getattr(self.cr, "get_cell_columns", None)
         if callable(cell_columns):
-            for name, raw_values in skip_reserved_metadata_columns(
-                cell_columns(), "cell"
+            columns = list(cell_columns())
+            keys = metadata_column_keys(
+                (name for name, _values in columns),
+                taken=cell_group.keys(),
+            )
+            for key, (name, raw_values) in keyed_metadata_columns(
+                ((name, (name, values)) for name, values in columns),
+                keys,
+                "cell",
             ):
-                if name in cell_group:
-                    continue
                 values = np.asarray(raw_values)
                 if values.ndim != 1 or values.size != self.cr.nCells:
                     raise ValueError(
                         f"Cell metadata column {name!r} has shape {values.shape}; "
                         f"expected ({self.cr.nCells},)"
                     )
-                create_zarr_obj_array(
-                    cell_group,
-                    name,
-                    values,
-                    values.dtype,
-                    profile=self.profile,
-                )
+                write_metadata_column(cell_group, key, values, profile=self.profile)
 
         feature_columns = getattr(self.cr, "get_feature_columns", None)
         if not callable(feature_columns):
             return
-        ranges = self._prep_assay_input_ranges(self.cr.assayFeats)
+        ranges = assay_feature_ranges(self.cr.assayFeats)
         targets: dict[str, tuple[Any, np.ndarray]] = {}
         for assay_name in assay_names:
             indexes = np.concatenate(
@@ -149,47 +163,41 @@ class CrToZarr:
                 as_zarr_group(self.z[group_path], name=group_path),
                 indexes,
             )
-        for name, raw_values in skip_reserved_metadata_columns(
-            feature_columns(), "feature"
-        ):
+        columns = []
+        for name, raw_values in feature_columns():
             values = np.asarray(raw_values)
             if values.ndim != 1 or values.size != self.cr.nFeatures:
                 raise ValueError(
                     f"Feature metadata column {name!r} has shape {values.shape}; "
                     f"expected ({self.cr.nFeatures},)"
                 )
-            for group, indexes in targets.values():
-                if name in group:
-                    continue
-                selected = values[indexes]
-                create_zarr_obj_array(
-                    group,
-                    name,
-                    selected,
-                    selected.dtype,
-                    profile=self.profile,
-                )
-
-    @staticmethod
-    def _prep_assay_input_ranges(af: pd.DataFrame) -> dict[str, list[list[int]]]:
-        assay_order = (
-            af.T.nFeatures.groupby(af.columns).sum().sort_values(ascending=False).index
+            # A reference column that is empty for every feature is never
+            # written, so it must not claim a key or report a rename.
+            if values.dtype.kind == "O" and all(value is None for value in values):
+                continue
+            columns.append((name, values))
+        keys = metadata_column_keys(
+            (name for name, _values in columns),
+            taken={key for group, _indexes in targets.values() for key in group.keys()},
         )
-        ranges = {}
-        for assay in assay_order:
-            temp = []
-            if len(af[assay].shape) == 2:
-                for i in af[assay].values[1:3].T:
-                    temp.append([i[0], i[1]])
-            else:
-                idx = af[assay]
-                temp = [[idx.start, idx.end]]
-            ranges[assay] = temp
-        return ranges
+        for key, (name, values) in keyed_metadata_columns(
+            ((name, (name, values)) for name, values in columns),
+            keys,
+            "feature",
+        ):
+            for group, indexes in targets.values():
+                selected = values[indexes]
+                if selected.dtype.kind == "O" and all(
+                    value is None for value in selected
+                ):
+                    # A 10x feature reference describes only Feature Barcode
+                    # features, so its columns do not reach other assays.
+                    continue
+                write_metadata_column(group, key, selected, profile=self.profile)
 
     @staticmethod
     def _prep_feat_index_offset(
-        ranges: dict[str, list[list[int]]],
+        ranges: dict[str, tuple[tuple[int, int], ...]],
     ) -> dict[str, list[int]]:
         feat_offset: dict[str, list[int]] = {}
         for i in ranges:
@@ -227,15 +235,15 @@ class CrToZarr:
             SparseShardBuffer,
             SparseWriteBand,
             resolve_sparse_import_batch,
-            sparse_matrix_bytes,
             write_sparse_bands,
         )
+        from ..utils.arrays import sparse_matrix_bytes
 
         if batch_size is not None and batch_size <= 0:
             raise ValueError("batch_size must be positive")
         if lines_in_mem <= 0:
             raise ValueError("lines_in_mem must be positive")
-        input_ranges = self._prep_assay_input_ranges(self.cr.assayFeats)
+        input_ranges = assay_feature_ranges(self.cr.assayFeats)
         stores = {
             assay: load_count_array(self.z, assay, self.workspace)
             for assay in input_ranges
@@ -385,6 +393,7 @@ class CrToZarr:
                 self.z,
                 tuple(stores),
                 self.workspace,
+                assay_types=self.assayTypes,
                 resources=self.resources,
                 profile=self.profile,
                 policy=self.policy,

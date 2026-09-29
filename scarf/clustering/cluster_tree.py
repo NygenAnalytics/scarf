@@ -8,42 +8,25 @@ from ..utils.logging import logger
 from ..utils.progress import iter_progress
 
 
-def make_digraph(
-    d: np.ndarray,
-    clust_info: np.ndarray | None = None,
-) -> nx.DiGraph:
-    """Convert a scipy linkage matrix into a directed tree graph."""
+def make_digraph(d: np.ndarray) -> nx.DiGraph:
+    """Convert a scipy linkage matrix into a directed tree graph.
+
+    Each node records ``nleaves``, the leaves below an internal node and zero
+    for a leaf.
+    """
     graph = nx.DiGraph()
     node = d.shape[0] + 1
-    if clust_info is not None:
-        if len(clust_info) != d.shape[0] + 1:
-            raise ValueError(
-                "ERROR: cluster information doesn't match number of leaves in dendrogram"
-            )
-    else:
-        clust_info = np.ones(d.shape[0] + 1) * -1
     for row_values in iter_progress(
         d,
         desc="Constructing graph from dendrogram",
         total=d.shape[0],
     ):
-        distance = row_values[2]
         row = row_values.astype(int)
-        graph.add_node(node, nleaves=row[3], dist=distance)
+        graph.add_node(node, nleaves=row[3])
         if row[0] <= d.shape[0]:
-            graph.add_node(
-                row[0],
-                nleaves=0,
-                dist=distance,
-                cluster=clust_info[row[0]],
-            )
+            graph.add_node(row[0], nleaves=0)
         if row[1] <= d.shape[0]:
-            graph.add_node(
-                row[1],
-                nleaves=0,
-                dist=distance,
-                cluster=clust_info[row[1]],
-            )
+            graph.add_node(row[1], nleaves=0)
         graph.add_edge(node, row[0])
         graph.add_edge(node, row[1])
         node += 1

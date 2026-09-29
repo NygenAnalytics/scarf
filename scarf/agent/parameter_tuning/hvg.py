@@ -2,13 +2,11 @@
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 import numpy as np
 
 from ...storage.refs import ArtifactRef
-
-HVG_CANDIDATE_TARGETS = (1000, 2000, 4000)
 
 
 def core_hvg_evidence(
@@ -86,57 +84,9 @@ class HvgGroupVariability:
 
 @dataclass(frozen=True, slots=True)
 class HvgRanking:
-    """Bounded feature-axis output of global or batch-aware HVG ranking."""
+    """Batch-aware ranking of the exact eligible feature universe."""
 
-    ranking_mode: Literal["global", "batchAware"]
-    eligible: np.ndarray
-    global_corrected_variance: np.ndarray
-    recurrence: np.ndarray
-    mean_within_group_rank: np.ndarray
     ranking: np.ndarray
-    valid_group_count: int
-    candidate_counts: tuple[int, ...]
-
-    @property
-    def eligible_feature_count(self) -> int:
-        return int(self.eligible.sum())
-
-    def candidate_mask(self, top_n: int) -> np.ndarray:
-        """Return one registered nested candidate, never an arbitrary count."""
-        if top_n not in self.candidate_counts:
-            raise ValueError(
-                f"top_n must be one of the registered counts {self.candidate_counts}"
-            )
-        values = np.zeros(self.eligible.shape, dtype=bool)
-        values[self.ranking[:top_n]] = True
-        return values
-
-
-def effective_hvg_candidate_counts(
-    eligible_feature_count: int,
-    targets: Sequence[int] = HVG_CANDIDATE_TARGETS,
-) -> tuple[int, ...]:
-    """Cap registered HVG counts by eligibility and remove capped duplicates."""
-    if isinstance(eligible_feature_count, bool) or not isinstance(
-        eligible_feature_count, int
-    ):
-        raise TypeError("eligible_feature_count must be an integer")
-    if eligible_feature_count < 1:
-        raise ValueError("eligible_feature_count must be greater than 0")
-    if isinstance(targets, str | bytes):
-        raise TypeError("targets must be a sequence of positive integers")
-    resolved: list[int] = []
-    for target in targets:
-        if isinstance(target, bool) or not isinstance(target, int):
-            raise TypeError("HVG candidate targets must be integers")
-        if target < 1:
-            raise ValueError("HVG candidate targets must be greater than 0")
-        effective = min(target, eligible_feature_count)
-        if effective not in resolved:
-            resolved.append(effective)
-    if not resolved:
-        raise ValueError("At least one HVG candidate target is required")
-    return tuple(resolved)
 
 
 def aggregate_hvg_rankings(
@@ -145,9 +95,9 @@ def aggregate_hvg_rankings(
     group_variability: Iterable[HvgGroupVariability],
     *,
     valid_group_count: int,
-    candidate_targets: Sequence[int] = HVG_CANDIDATE_TARGETS,
+    candidate_targets: Sequence[int],
 ) -> HvgRanking:
-    """Aggregate global and optional batch-aware feature rankings."""
+    """Rank eligible features by their recurrence across technical groups."""
     corrected = np.asarray(global_corrected_variance, dtype=np.float64)
     eligible = np.asarray(eligible_features, dtype=bool)
     if corrected.ndim != 1 or eligible.shape != corrected.shape:
@@ -156,35 +106,26 @@ def aggregate_hvg_rankings(
         raise ValueError("Global corrected variability must be finite and non-negative")
     if isinstance(valid_group_count, bool) or not isinstance(valid_group_count, int):
         raise TypeError("valid_group_count must be an integer")
-    if valid_group_count < 0:
-        raise ValueError("valid_group_count must be non-negative")
+    if valid_group_count < 2:
+        raise ValueError("Batch-aware HVG ranking requires at least two groups")
+    if isinstance(candidate_targets, str | bytes):
+        raise TypeError("candidate_targets must be a sequence of positive integers")
+    targets = tuple(candidate_targets)
+    if not targets:
+        raise ValueError("At least one HVG candidate target is required")
+    for target in targets:
+        if isinstance(target, bool) or not isinstance(target, int):
+            raise TypeError("HVG candidate targets must be integers")
+        if target < 1:
+            raise ValueError("HVG candidate targets must be greater than 0")
     eligible_count = int(eligible.sum())
-    counts = effective_hvg_candidate_counts(eligible_count, candidate_targets)
+    if eligible_count < 1:
+        raise ValueError("HVG ranking requires at least one eligible feature")
+    broad_count = min(max(targets), eligible_count)
     indices = np.flatnonzero(eligible)
-    global_order = indices[np.lexsort((indices, -corrected[indices]))].astype(
-        np.int64, copy=False
-    )
     recurrence = np.zeros(corrected.shape, dtype=np.int32)
     mean_rank = np.full(corrected.shape, np.inf, dtype=np.float64)
-
-    if valid_group_count < 2:
-        denominator = max(1, len(global_order))
-        mean_rank[global_order] = (
-            np.arange(1, len(global_order) + 1, dtype=np.float64) / denominator
-        )
-        return HvgRanking(
-            ranking_mode="global",
-            eligible=eligible.copy(),
-            global_corrected_variance=corrected.copy(),
-            recurrence=recurrence,
-            mean_within_group_rank=mean_rank,
-            ranking=global_order.copy(),
-            valid_group_count=valid_group_count,
-            candidate_counts=counts,
-        )
-
     rank_sum = np.zeros(corrected.shape, dtype=np.float64)
-    broad_count = max(counts)
     received = 0
     for group in group_variability:
         received += 1
@@ -236,13 +177,4 @@ def aggregate_hvg_rankings(
             )
         )
     ].astype(np.int64, copy=False)
-    return HvgRanking(
-        ranking_mode="batchAware",
-        eligible=eligible.copy(),
-        global_corrected_variance=corrected.copy(),
-        recurrence=recurrence,
-        mean_within_group_rank=mean_rank,
-        ranking=ranking.copy(),
-        valid_group_count=valid_group_count,
-        candidate_counts=counts,
-    )
+    return HvgRanking(ranking=ranking)

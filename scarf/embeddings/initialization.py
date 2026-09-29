@@ -30,7 +30,12 @@ def initial_embedding(
             "Embedding components cannot exceed the center count or dimensions"
         )
     index_labels = labels.astype(np.intp, copy=False)
-    principal_components = PCA(n_components=n_components).fit_transform(centers)
+    # Many high-dimensional centers select the randomized solver; seed it so
+    # the same centers always give the same coordinates.
+    principal_components = PCA(
+        n_components=n_components,
+        random_state=0,
+    ).fit_transform(centers)
     for component in range(n_components):
         principal_components[:, component] = rescale_array(
             principal_components[:, component]

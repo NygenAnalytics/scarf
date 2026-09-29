@@ -28,9 +28,15 @@ from ._data import (
 )
 from ._deps import require_matplotlib
 from ._display import resolve_categorical_scale
-from ._figure import LegendSpec, PlotResult, normalize_axes_target
+from ._figure import (
+    LegendSpec,
+    PlotResult,
+    close_figures_on_error,
+    normalize_axes_target,
+)
 from ._heatmap_utils import (
     annotation_colors,
+    annotation_legend_handles,
     draw_annotation_strips,
     normalize_annotations,
     order_heatmap,
@@ -40,6 +46,7 @@ from ._style import (
     apply_figure_chrome,
     capped_figsize,
     continuous_norm,
+    resolve_color_limits,
     scatter_edgecolor,
     theme_context,
 )
@@ -73,24 +80,21 @@ def _default_dot_size_scale(ax: Any, *, n_x: int, n_y: int) -> SizeScale:
 
 def _draw_feature_group_brackets(
     ax: Any,
-    feature_order: list[str],
-    feature_groups: Mapping[str, Any],
+    row_groups: Sequence[str | None],
     *,
     swap_axes: bool,
 ) -> int:
+    """Bracket runs of feature rows that belong to one feature group."""
     line_color = ax.xaxis.label.get_color()
     grouped_ranges: list[tuple[str, int, int]] = []
     start = 0
-    while start < len(feature_order):
-        group = feature_groups.get(feature_order[start])
+    while start < len(row_groups):
+        group = row_groups[start]
         end = start
-        while (
-            end + 1 < len(feature_order)
-            and feature_groups.get(feature_order[end + 1]) == group
-        ):
+        while end + 1 < len(row_groups) and row_groups[end + 1] == group:
             end += 1
-        if group is not None and not pd.isna(group):
-            grouped_ranges.append((str(group), start, end))
+        if group is not None:
+            grouped_ranges.append((group, start, end))
         start = end + 1
     left_geometry: tuple[Any, Any, float] | None = None
     if grouped_ranges and not swap_axes:
@@ -192,41 +196,65 @@ def _draw_feature_group_brackets(
 
 
 def _standardize_feature(df: pd.DataFrame, value_col: str = "mean") -> pd.DataFrame:
+    """Z-score each feature row across groups, keeping bracket groups apart."""
     out = df.copy()
-    means = out.groupby("feature", observed=False)[value_col].transform("mean")
-    stds = out.groupby("feature", observed=False)[value_col].transform("std")
-    stds = stds.replace(0, np.nan)
+    rows = out.groupby(["feature", "feature_group"], observed=False, dropna=False)
+    means = rows[value_col].transform("mean")
+    stds = rows[value_col].transform("std").replace(0, np.nan)
     out[value_col] = (out[value_col] - means) / stds
     return out
+
+
+def _feature_group_key(value: Any) -> str | None:
+    return None if pd.isna(value) else str(value)
+
+
+def _label_order(
+    observed: Sequence[str],
+    requested: Sequence[Any] | None,
+    *,
+    name: str,
+    noun: str,
+) -> list[str]:
+    """Order observed labels by a requested sequence, compared as text.
+
+    The request must list every observed label; requested labels that no row
+    carries are left out. Without a request, labels sort naturally.
+    """
+    if requested is None:
+        return sort_categories(observed)
+    order = [str(value) for value in requested]
+    if len(set(order)) != len(order):
+        raise ValueError(f"{name} cannot contain duplicates")
+    missing = [value for value in observed if value not in order]
+    if missing:
+        raise ValueError(
+            f"{name} is missing observed {noun}: " + ", ".join(missing[:10])
+        )
+    present = set(observed)
+    return [value for value in order if value in present]
+
+
+def _group_order(
+    observed: Sequence[str],
+    group_order: Sequence[Any] | None,
+    categorical_scale: CategoricalScale | None,
+) -> list[str]:
+    """Group columns in requested, stored display, or natural order."""
+    requested = (
+        group_order
+        if group_order is not None
+        else categorical_scale.order
+        if categorical_scale is not None
+        else None
+    )
+    return _label_order(observed, requested, name="group order", noun="groups")
 
 
 def _group_axis_labels(df: pd.DataFrame, group_keys: tuple[str, ...]) -> pd.Series:
     if len(group_keys) == 1:
         return df[group_keys[0]].astype(str)
     return df[list(group_keys)].astype(str).agg(" | ".join, axis=1)
-
-
-def _color_limits(values: np.ndarray, scale: ColorScale) -> tuple[float, float]:
-    finite = np.isfinite(values)
-    if finite.any():
-        if scale.quantiles is not None:
-            low, high = scale.quantiles
-            vmin = float(np.nanquantile(values[finite], low))
-            vmax = float(np.nanquantile(values[finite], high))
-        else:
-            vmin = float(np.nanmin(values[finite]))
-            vmax = float(np.nanmax(values[finite]))
-    else:
-        vmin, vmax = 0.0, 1.0
-    if scale.vmin is not None:
-        vmin = scale.vmin
-    if scale.vmax is not None:
-        vmax = scale.vmax
-    if vmax <= vmin:
-        if scale.vmin is not None or scale.vmax is not None:
-            raise ValueError("Color limits must satisfy vmin < vmax")
-        vmax = vmin + 1.0
-    return vmin, vmax
 
 
 def _sample_counts(
@@ -267,6 +295,7 @@ def _feature_assays(
     return assays
 
 
+@close_figures_on_error
 def dotplot(
     store: Any,
     *,
@@ -302,6 +331,9 @@ def dotplot(
     Color is the mean value in the group. Dot size is the fraction of cells
     above ``expression_cutoff``. Pass ``features`` as a list of genes, or as a
     mapping of group name to gene list when you want gene-set brackets.
+    Different features of one assay that carry the same explicit
+    ``FeatureRef.label`` are pooled into one row. Any other label shared by
+    different features raises, including a label shared across assays.
 
     With ``sample_by`` (or ``study_design.sample_by``), each sample contributes
     equally: Scarf first summarizes within sample, then averages across samples.
@@ -329,15 +361,11 @@ def dotplot(
             categorical_scale,
         )
     feature_pairs = coerce_feature_list(features)
+    _check_feature_count(feature_pairs)
     resolved_features = [
         resolve_feature(store, feature, from_assay=from_assay)
         for _, feature in feature_pairs
     ]
-    requested_feature_order = list(
-        dict.fromkeys(feature.label for feature in resolved_features)
-    )
-
-    _check_feature_count(feature_pairs)
     aggregate, per_sample = _summarize_resolved_features(
         store,
         resolved_features,
@@ -355,48 +383,45 @@ def dotplot(
 
     plot_df = aggregate.copy()
     plot_df["group_label"] = _group_axis_labels(plot_df, group_keys)
-    # Preserve feature order from input
-    observed_features = [
-        value
-        for value in requested_feature_order
-        if value in set(plot_df["feature"].tolist())
-    ]
-    observed_groups = list(dict.fromkeys(plot_df["group_label"].tolist()))
-    if feature_order is None:
-        resolved_feature_order = observed_features
-    else:
-        resolved_feature_order = [str(value) for value in feature_order]
-        missing = [
-            value for value in observed_features if value not in resolved_feature_order
-        ]
-        if missing:
-            raise ValueError(
-                "feature_order is missing observed features: "
-                + ", ".join(map(str, missing[:10]))
-            )
-    if group_order is not None:
-        resolved_group_order = [str(value) for value in group_order]
-    elif categorical_scale is not None and categorical_scale.order is not None:
-        resolved_group_order = [str(value) for value in categorical_scale.order]
-    else:
-        resolved_group_order = sort_categories(observed_groups)
-    missing_groups = [
-        value for value in observed_groups if value not in resolved_group_order
-    ]
-    if missing_groups:
-        raise ValueError(
-            "group order is missing observed groups: "
-            + ", ".join(map(str, missing_groups[:10]))
+    # One row per requested feature and bracket group, in input order, so a
+    # feature listed under two groups keeps a row in each.
+    plot_df["row"] = list(
+        zip(
+            (_feature_group_key(value) for value in plot_df["feature_group"]),
+            plot_df["feature"],
+            strict=True,
         )
-    feature_group_map = (
-        plot_df[["feature", "feature_group"]]
-        .drop_duplicates("feature")
-        .set_index("feature")["feature_group"]
-        .to_dict()
     )
-    plot_df["feature"] = pd.Categorical(
-        plot_df["feature"], categories=resolved_feature_order, ordered=True
+    present_rows = set(plot_df["row"])
+    feature_rows = [
+        row
+        for row in dict.fromkeys(
+            (_feature_group_key(group), feature.label)
+            for (group, _), feature in zip(
+                feature_pairs,
+                resolved_features,
+                strict=True,
+            )
+        )
+        if row in present_rows
+    ]
+    if feature_order is not None:
+        label_order = _label_order(
+            list(dict.fromkeys(label for _, label in feature_rows)),
+            feature_order,
+            name="feature_order",
+            noun="features",
+        )
+        feature_rows = [
+            row for label in label_order for row in feature_rows if row[1] == label
+        ]
+    resolved_feature_order = [label for _, label in feature_rows]
+    resolved_group_order = _group_order(
+        list(dict.fromkeys(plot_df["group_label"].tolist())),
+        group_order,
+        categorical_scale,
     )
+    row_index = {row: index for index, row in enumerate(feature_rows)}
     plot_df["group_label"] = pd.Categorical(
         plot_df["group_label"], categories=resolved_group_order, ordered=True
     )
@@ -441,7 +466,7 @@ def dotplot(
             )
 
         vals = plot_df["mean"].to_numpy(dtype=np.float64)
-        vmin, vmax = _color_limits(vals, color_scale)
+        vmin, vmax = resolve_color_limits(vals, color_scale)
         norm = continuous_norm(
             mpl,
             vmin=vmin,
@@ -451,7 +476,7 @@ def dotplot(
 
         areas = size_scale.areas(plot_df["fraction"].to_numpy(dtype=np.float64))
         x = plot_df["group_label"].cat.codes.to_numpy()
-        y = plot_df["feature"].cat.codes.to_numpy()
+        y = plot_df["row"].map(row_index).to_numpy(dtype=np.int64)
 
         edgecolor = marker_edgecolor or scatter_edgecolor(theme)
         x_values = x if not swap_axes else y
@@ -500,8 +525,7 @@ def dotplot(
             ax.set_ylabel("")
         bracket_count = _draw_feature_group_brackets(
             ax,
-            resolved_feature_order,
-            feature_group_map,
+            [group for group, _ in feature_rows],
             swap_axes=swap_axes,
         )
         colorbar_label = (
@@ -681,6 +705,7 @@ def dotplot(
     return result
 
 
+@close_figures_on_error
 def matrixplot(
     store: Any,
     *,
@@ -721,15 +746,23 @@ def matrixplot(
 ) -> PlotResult:
     """Heatmap of mean expression or detection fraction by group.
 
-    Rows and columns preserve input order by default. Set explicit orders or
-    enable hierarchical clustering independently for either axis.
+    Rows follow the feature input order and columns follow the group order of
+    :func:`dotplot`: a stored display order, otherwise natural order. Set
+    explicit orders, compared as text, or enable hierarchical clustering
+    independently for either axis.
     ``value="mean"`` colors by average expression; ``value="fraction"`` colors
-    by the share of cells above ``expression_cutoff``. ``sample_by`` has the
-    same equal-sample weighting behavior as :func:`dotplot`.
+    by the share of cells above ``expression_cutoff``. ``standardize="feature"``
+    applies only to means. ``sample_by`` has the same equal-sample weighting
+    behavior as :func:`dotplot`, and shared feature labels follow the same
+    pooling rule.
     """
     _, mpl = require_matplotlib()
     if value not in ("mean", "fraction"):
         raise ValueError("value must be 'mean' or 'fraction'")
+    if standardize not in ("none", "feature"):
+        raise ValueError("standardize must be 'none' or 'feature'")
+    if standardize == "feature" and value != "mean":
+        raise ValueError("standardize='feature' applies only to value='mean'")
     color_scale = color_scale or ColorScale(cmap="viridis")
     if color_scale.scale != "linear":
         raise NotImplementedError(
@@ -761,27 +794,31 @@ def matrixplot(
         expression_cutoff=expression_cutoff,
     )
     plot_df = aggregate.copy()
-    if value == "mean" and standardize == "feature":
+    if standardize == "feature":
         plot_df = _standardize_feature(plot_df, "mean")
-    elif standardize not in ("none", "feature"):
-        raise ValueError("standardize must be 'none' or 'feature'")
-
     plot_df["group_label"] = _group_axis_labels(plot_df, group_keys)
-    requested_feature_order = list(
-        dict.fromkeys(feature.label for feature in resolved_features)
-    )
-    summarized_features = list(dict.fromkeys(plot_df["feature"].tolist()))
+    summarized_features = set(plot_df["feature"].tolist())
     observed_feature_order = [
         feature
-        for feature in requested_feature_order
-        if feature in set(summarized_features)
+        for feature in dict.fromkeys(feature.label for feature in resolved_features)
+        if feature in summarized_features
     ]
-    observed_feature_order += [
-        feature
-        for feature in summarized_features
-        if feature not in set(observed_feature_order)
-    ]
-    observed_group_order = list(dict.fromkeys(plot_df["group_label"].tolist()))
+    if feature_order is not None:
+        observed_feature_order = _label_order(
+            observed_feature_order,
+            feature_order,
+            name="feature_order",
+            noun="features",
+        )
+    observed_group_order = _group_order(
+        list(dict.fromkeys(plot_df["group_label"].tolist())),
+        group_order,
+        (
+            resolve_categorical_scale(store, group_by, None)
+            if isinstance(group_by, str)
+            else None
+        ),
+    )
     mat = plot_df.pivot_table(
         index="feature",
         columns="group_label",
@@ -800,8 +837,8 @@ def matrixplot(
     )
     mat, row_linkage, column_linkage = order_heatmap(
         mat,
-        row_order=feature_order,
-        column_order=group_order,
+        row_order=None if feature_order is None else observed_feature_order,
+        column_order=None if group_order is None else observed_group_order,
         cluster_rows=cluster_features,
         cluster_columns=cluster_groups,
         method=cluster_method,
@@ -830,7 +867,7 @@ def matrixplot(
             max(4.2, 0.45 * len(resolved_feature_order) + 2.8),
         )
     data = mat.to_numpy(dtype=np.float64)
-    vmin, vmax = _color_limits(data, color_scale)
+    vmin, vmax = resolve_color_limits(data, color_scale)
     norm = continuous_norm(
         mpl,
         vmin=vmin,
@@ -883,35 +920,12 @@ def matrixplot(
                 pad=0.04,
             )
             cb.set_label(colorbar_label)
-            annotation_handles: list[Any] = []
-            for name, scale in zip(
+            annotation_handles = annotation_legend_handles(
+                mpl,
                 list(row_annotation_values.columns)
                 + list(column_annotation_values.columns),
                 resolved_annotation_scales,
-                strict=True,
-            ):
-                if scale.order is None or scale.palette is None:
-                    continue
-                annotation_handles.extend(
-                    mpl.lines.Line2D(
-                        [],
-                        [],
-                        marker="s",
-                        linestyle="",
-                        markerfacecolor=scale.palette[item],
-                        markeredgecolor="none",
-                        markersize=5,
-                        label=(
-                            f"{name}: "
-                            + (
-                                scale.labels.get(item, str(item))
-                                if scale.labels is not None
-                                else str(item)
-                            )
-                        ),
-                    )
-                    for item in scale.order
-                )
+            )
             if annotation_handles:
                 legend_kwargs = {
                     "handles": annotation_handles,

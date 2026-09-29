@@ -18,7 +18,7 @@ from scarf.neighbors.graph import (
     weight_sort_indices,
 )
 from scarf.neighbors.diffusion import bounded_diffusion_operator, transition_matrix
-from scarf.neighbors.integration import _wnn_integration_many, wnn_integration
+from scarf.neighbors.integration import _wnn_integration_many
 from scarf.utils import logger
 
 
@@ -58,6 +58,24 @@ def _grouped_knn_indices(groups: list[list[int]]) -> np.ndarray:
     return graph.indices.reshape(graph.shape[0], degree)
 
 
+def _wnn_pair(
+    name1: str,
+    indices1: np.ndarray,
+    ld1: np.ndarray,
+    name2: str,
+    indices2: np.ndarray,
+    ld2: np.ndarray,
+    nthreads: int,
+    *,
+    l2_normalize: bool = True,
+) -> tuple[coo_matrix, np.ndarray]:
+    return _wnn_integration_many(
+        [(name1, indices1, ld1), (name2, indices2, ld2)],
+        nthreads,
+        l2_normalize=l2_normalize,
+    )
+
+
 @pytest.mark.parametrize("backend", ["igraph", "leidenalg"])
 def test_leiden_membership_preserves_disconnected_partitions(backend):
     graph = _grouped_knn_graph([[0, 1, 2, 3], [4, 5, 6, 7]])
@@ -91,6 +109,22 @@ def test_native_leiden_membership_is_seeded_and_repeatable():
     second = leiden_membership(graph, resolution=1.0, random_seed=4444)
 
     np.testing.assert_array_equal(second, first)
+
+
+def test_leiden_restores_the_seedable_igraph_generator():
+    import random
+
+    import igraph
+
+    def seeded_edges() -> list[tuple[int, int]]:
+        random.seed(7)
+        return igraph.Graph.Erdos_Renyi(n=30, p=0.2).get_edgelist()
+
+    igraph.set_random_number_generator(random)
+    expected = seeded_edges()
+    leiden_membership(_simple_knn_graph(12), resolution=1.0, random_seed=1)
+
+    assert seeded_edges() == expected
 
 
 def test_leiden_membership_rejects_unknown_backend():
@@ -572,6 +606,60 @@ def test_merge_graphs_preserves_shape_and_edge_count():
     assert merged.nnz == g1.nnz
 
 
+def test_merge_graphs_matches_row_wise_reference_and_keeps_dtypes():
+    rng = np.random.default_rng(5)
+    n_cells, n_neighbors = 40, 4
+    graphs = []
+    for _ in range(2):
+        columns = np.stack(
+            [
+                rng.choice(
+                    np.delete(np.arange(n_cells), cell),
+                    size=n_neighbors,
+                    replace=False,
+                )
+                for cell in range(n_cells)
+            ]
+        )
+        weights = rng.random((n_cells, n_neighbors)).astype(np.float32)
+        graphs.append(
+            csr_matrix(
+                (
+                    weights.ravel(),
+                    (np.repeat(np.arange(n_cells), n_neighbors), columns.ravel()),
+                ),
+                shape=(n_cells, n_cells),
+            )
+        )
+    snns = [calc_snn(graph.indices.reshape(n_cells, n_neighbors)) for graph in graphs]
+    expected_columns: list[np.ndarray] = []
+    expected_weights: list[np.ndarray] = []
+    for row in range(n_cells):
+        columns, weights = weight_sort_indices(
+            np.hstack([graph[row].indices for graph in graphs]),
+            np.hstack([graph[row].data for graph in graphs]),
+            np.hstack(
+                [
+                    graph[row].data + snn[row]
+                    for graph, snn in zip(graphs, snns, strict=True)
+                ]
+            ),
+            n_neighbors,
+        )
+        expected_columns.append(columns)
+        expected_weights.append(weights)
+
+    merged = merge_graphs(graphs)
+
+    np.testing.assert_array_equal(
+        merged.row,
+        np.repeat(np.arange(n_cells), n_neighbors),
+    )
+    np.testing.assert_array_equal(merged.col, np.concatenate(expected_columns))
+    np.testing.assert_array_equal(merged.data, np.concatenate(expected_weights))
+    assert merged.data.dtype == np.float32
+
+
 def test_merge_graphs_rejects_mismatched_shapes():
     g1 = _simple_knn_graph(6, k=3)
     g2 = _simple_knn_graph(8, k=3)
@@ -737,7 +825,7 @@ def test_wnn_integration_handles_extreme_affinities_without_runtime_warnings():
 
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
-        merged, modality_weights = wnn_integration(
+        merged, modality_weights = _wnn_pair(
             "RNA",
             indices1,
             ld1,
@@ -768,7 +856,7 @@ def test_wnn_integration_is_invariant_to_cell_order():
     rng = np.random.default_rng(42)
     ld1 = rng.normal(size=(len(indices1), 3))
     ld2 = rng.normal(size=(len(indices2), 4))
-    expected, expected_weights = wnn_integration(
+    expected, expected_weights = _wnn_pair(
         "RNA",
         indices1,
         ld1,
@@ -780,7 +868,7 @@ def test_wnn_integration_is_invariant_to_cell_order():
 
     permutation = np.array([5, 0, 7, 2, 6, 1, 4, 3])
     old_to_new = np.argsort(permutation)
-    permuted, permuted_weights = wnn_integration(
+    permuted, permuted_weights = _wnn_pair(
         "RNA",
         old_to_new[indices1[permutation]],
         ld1[permutation],
@@ -801,7 +889,7 @@ def test_wnn_integration_rejects_mismatched_neighbor_rows():
     indices2 = _simple_knn_indices(7, k=3)
 
     with pytest.raises(ValueError, match="same number of cells"):
-        wnn_integration(
+        _wnn_pair(
             "RNA",
             indices1,
             np.zeros((6, 2)),
@@ -810,33 +898,6 @@ def test_wnn_integration_rejects_mismatched_neighbor_rows():
             np.zeros((7, 2)),
             nthreads=1,
         )
-
-
-def test_two_input_wnn_adapter_preserves_duplicate_diagnostic_names():
-    indices1, ld1, indices2, ld2 = _multimodal_wnn_inputs()
-    expected, expected_weights = wnn_integration(
-        "first",
-        indices1,
-        ld1,
-        "second",
-        indices2,
-        ld2,
-        nthreads=1,
-    )
-    actual, actual_weights = wnn_integration(
-        "same",
-        indices1,
-        ld1,
-        "same",
-        indices2,
-        ld2,
-        nthreads=1,
-    )
-
-    np.testing.assert_array_equal(actual.row, expected.row)
-    np.testing.assert_array_equal(actual.col, expected.col)
-    np.testing.assert_array_equal(actual.data, expected.data)
-    np.testing.assert_array_equal(actual_weights, expected_weights)
 
 
 @pytest.mark.parametrize(
@@ -893,7 +954,7 @@ def test_wnn_integration_rejects_invalid_neighbor_matrices(indices, error, match
     embeddings = np.arange(12, dtype=np.float64).reshape(6, 2)
 
     with pytest.raises(error, match=match):
-        wnn_integration(
+        _wnn_pair(
             "RNA",
             indices,
             embeddings,
@@ -923,7 +984,7 @@ def test_wnn_integration_rejects_invalid_embeddings(embedding, match):
     valid_embedding = np.zeros((6, 2))
 
     with pytest.raises(ValueError, match=match):
-        wnn_integration(
+        _wnn_pair(
             "RNA",
             indices,
             embedding,
@@ -945,7 +1006,7 @@ def test_wnn_integration_uses_minimum_neighbor_count_for_mismatched_graphs():
         lambda message: messages.append(message.record["message"]), level="WARNING"
     )
     try:
-        merged, modality_weights = wnn_integration(
+        merged, modality_weights = _wnn_pair(
             "RNA",
             indices1,
             ld1,
@@ -954,7 +1015,7 @@ def test_wnn_integration_uses_minimum_neighbor_count_for_mismatched_graphs():
             ld2,
             nthreads=1,
         )
-        swapped, swapped_weights = wnn_integration(
+        swapped, swapped_weights = _wnn_pair(
             "ADT",
             indices2,
             ld2,
@@ -981,7 +1042,7 @@ def test_wnn_integration_is_invariant_to_per_modality_scale(
     scale,
 ):
     indices1, ld1, indices2, ld2 = _multimodal_wnn_inputs()
-    expected, expected_weights = wnn_integration(
+    expected, expected_weights = _wnn_pair(
         "RNA",
         indices1,
         ld1,
@@ -996,7 +1057,7 @@ def test_wnn_integration_is_invariant_to_per_modality_scale(
     else:
         ld2 = ld2 * scale
 
-    actual, actual_weights = wnn_integration(
+    actual, actual_weights = _wnn_pair(
         "RNA",
         indices1,
         ld1,
@@ -1022,7 +1083,7 @@ def test_wnn_integration_uses_nearest_to_kth_distance_span_for_bandwidth():
     indices = _simple_knn_indices(5, k=2)
     embedding = np.arange(5, dtype=np.float64).reshape(-1, 1)
 
-    graph, _ = wnn_integration(
+    graph, _ = _wnn_pair(
         "RNA",
         indices,
         embedding,
@@ -1047,7 +1108,7 @@ def test_wnn_integration_handles_degenerate_bandwidth_deterministically():
     embedding1 = np.zeros((len(indices1), 3))
     embedding2 = np.zeros((len(indices2), 2))
 
-    first, first_weights = wnn_integration(
+    first, first_weights = _wnn_pair(
         "RNA",
         indices1,
         embedding1,
@@ -1056,7 +1117,7 @@ def test_wnn_integration_handles_degenerate_bandwidth_deterministically():
         embedding2,
         nthreads=1,
     )
-    second, second_weights = wnn_integration(
+    second, second_weights = _wnn_pair(
         "RNA",
         indices1,
         embedding1,
@@ -1084,7 +1145,7 @@ def test_wnn_integration_matches_scalar_affinity_reference():
         l2_normalize=True,
     )
 
-    actual, actual_weights = wnn_integration(
+    actual, actual_weights = _wnn_pair(
         "RNA",
         indices1,
         ld1,
@@ -1262,7 +1323,7 @@ def test_wnn_integration_follows_informative_modality_across_numeric_scales():
         * 1e9
     )
 
-    graph, modality_weights = wnn_integration(
+    graph, modality_weights = _wnn_pair(
         "RNA",
         indices1,
         informative,
@@ -1322,7 +1383,7 @@ def test_wnn_integration_is_scale_invariant_at_near_degenerate_bandwidth():
     )
 
     results = [
-        wnn_integration(
+        _wnn_pair(
             "RNA",
             indices1,
             ld1 * scale,
@@ -1360,7 +1421,7 @@ def _seurat_golden_wnn() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     inputs = fixture["inputs"]
     indices1 = np.asarray(inputs["rnaIndices"], dtype=np.uint32)
     indices2 = np.asarray(inputs["adtIndices"], dtype=np.uint32)
-    graph, weights = wnn_integration(
+    graph, weights = _wnn_pair(
         "RNA",
         indices1,
         np.asarray(inputs["rnaEmbedding"], dtype=np.float64),
@@ -1510,7 +1571,7 @@ def test_wnn_integration_stays_close_to_seurat_defaults():
 def test_wnn_integration_output_contract():
     indices1, ld1, indices2, ld2 = _multimodal_wnn_inputs()
 
-    graph, modality_weights = wnn_integration(
+    graph, modality_weights = _wnn_pair(
         "RNA",
         indices1,
         ld1,

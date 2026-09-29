@@ -8,9 +8,8 @@ from ..storage.arrays import create_zarr_dataset
 from ..storage.artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
-    finish_artifact,
+    artifact_transaction,
     plan_artifact,
-    start_artifact,
 )
 from ..storage.artifacts import (
     ArtifactRef,
@@ -143,6 +142,10 @@ def ensure_feature_summary(
             "Feature summaries are supported only for RNAassay and ATACassay; "
             f"received {type(assay).__name__}"
         )
+    # Summaries computed through ``normed`` promote integer counts to float64.
+    arithmetic = assay._count_arithmetic("feature_summary")
+    if arithmetic is not None:
+        parameters["count_arithmetic"] = arithmetic
 
     arrays, attributes, reuse_validator = _summary_contract(
         names,
@@ -176,26 +179,25 @@ def ensure_feature_summary(
     else:
         raw_payload = assay._compute_feature_summary(cell_idx, feature_idx)
     payload = {name: np.asarray(raw_payload[name], dtype=np.float64) for name in names}
-    group = start_artifact(root, planned)
-    chunks = (min(max(n_features, 1), 100_000),)
-    for name in names:
-        values = payload[name]
-        if values.shape != (n_features,):
-            raise ValueError(
-                f"Feature summary array {name!r} has shape {values.shape}; "
-                f"expected ({n_features},)"
+    with artifact_transaction(root, planned) as group:
+        chunks = (min(max(n_features, 1), 100_000),)
+        for name in names:
+            values = payload[name]
+            if values.shape != (n_features,):
+                raise ValueError(
+                    f"Feature summary array {name!r} has shape {values.shape}; "
+                    f"expected ({n_features},)"
+                )
+            output = create_zarr_dataset(
+                group,
+                name,
+                chunks,
+                np.float64,
+                (n_features,),
             )
-        output = create_zarr_dataset(
-            group,
-            name,
-            chunks,
-            np.float64,
-            (n_features,),
-        )
-        output[:] = values
-    group.attrs["ordered_feature_ids_fingerprint"] = feature_ids_fingerprint
-    group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(group, names)
-    finish_artifact(group, planned)
+            output[:] = values
+        group.attrs["ordered_feature_ids_fingerprint"] = feature_ids_fingerprint
+        group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(group, names)
     return planned.ref
 
 

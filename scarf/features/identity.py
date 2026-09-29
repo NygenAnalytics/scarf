@@ -4,13 +4,16 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from .gene_families import gene_family_mask
 from .gene_reference import (
     GeneReference,
     cached_species,
     ensure_reference,
     load_reference,
     prefix_species,
+    species_for_id,
     species_registry,
+    strip_ensembl_version,
 )
 
 __all__ = [
@@ -21,10 +24,8 @@ __all__ = [
     "reference_misses",
     "resolve_species",
     "score_symbol_overlap",
-    "strip_ensembl_version",
 ]
 
-_RIBO_PREFIXES = ("RPS", "RPL", "MRPS", "MRPL")
 _SAMPLE = 8
 _OVERLAP_MIN_HITS = 5
 _OVERLAP_MIN_SHARE = 0.05
@@ -35,12 +36,6 @@ _HISTONE_PREFIXES: dict[str, tuple[str, ...]] = {
     "homo_sapiens": ("HIST", "H3F3", "H2AF", "H2BF", "H1F"),
     "mus_musculus": ("Hist", "H3f3", "H2af", "H2bf", "H1f"),
 }
-
-
-def strip_ensembl_version(gene_id: str) -> str:
-    if "." in gene_id and gene_id.rsplit(".", 1)[-1].isdigit():
-        return gene_id.rsplit(".", 1)[0]
-    return gene_id
 
 
 def _as_str_list(values: Sequence[Any]) -> list[str]:
@@ -410,7 +405,13 @@ def observe_families(
             )
         )
 
-    ribo = _match_prefix(symbol_list, _RIBO_PREFIXES)
+    ribo = [
+        symbol
+        for symbol, hit in zip(
+            symbol_list, gene_family_mask(symbol_list, "ribosomal"), strict=True
+        )
+        if hit
+    ]
     families.append(
         _family_record(
             family="ribosomal",
@@ -504,14 +505,15 @@ def reference_misses(
     *,
     maxExamples: int = _SAMPLE,
 ) -> dict[str, Any]:
-    """Ensembl-shaped ids absent from the reference (release drift, not exogenous)."""
+    """Registry-shaped ids absent from the reference (release drift, not exogenous).
+
+    An id is registry-shaped when ``species_for_id`` names its species.
+    """
     id_list = _as_str_list(ids)
     name_list = _as_str_list(names)
-    prefixes = tuple(spec.idPrefix for spec in species_registry().values())
     misses: list[str] = []
     for gene_id, name in zip(id_list, name_list, strict=True):
-        stripped = strip_ensembl_version(gene_id)
-        if not any(stripped.startswith(prefix) for prefix in prefixes):
+        if species_for_id(gene_id) is None:
             continue
         if reference.has_gene_id(gene_id) or (name and reference.has_symbol(name)):
             continue
@@ -531,24 +533,22 @@ def exogenous_candidates(
 ) -> list[dict[str, Any]]:
     """Rank features that look non-endogenous under the available reference.
 
-    Ensembl-shaped ids missing from a loaded reference are release mismatches,
-    not exogenous evidence; use ``reference_misses`` for those. Without a
-    reference, Ensembl-shaped ids are treated as endogenous by construction.
+    Registry-shaped ids, whose species ``species_for_id`` names, are release
+    mismatches when a loaded reference lacks them, not exogenous evidence;
+    use ``reference_misses`` for those. Without a reference, registry-shaped
+    ids are treated as endogenous by construction.
     """
     id_list = _as_str_list(ids)
     name_list = _as_str_list(names)
-    prefixes = tuple(spec.idPrefix for spec in species_registry().values())
     candidates: list[dict[str, Any]] = []
     for gene_id, name in zip(id_list, name_list, strict=True):
-        stripped = strip_ensembl_version(gene_id)
         in_reference = reference is not None and (
             reference.has_gene_id(gene_id) or (name and reference.has_symbol(name))
         )
         if in_reference:
             continue
-        ensembl_shaped = any(stripped.startswith(prefix) for prefix in prefixes)
-        # Ensembl-shaped ids are never exogenous cues; see reference_misses.
-        if ensembl_shaped:
+        # Registry-shaped ids are never exogenous cues; see reference_misses.
+        if species_for_id(gene_id) is not None:
             continue
         label = name or gene_id
         if not label:

@@ -3,7 +3,7 @@ import pytest
 import zarr
 from zarr.storage import MemoryStore
 
-from scarf.storage.async_execution import reset_zarr_runtime_for_tests
+from tests.storage_helpers import reset_zarr_runtime
 from scarf.storage.budget import ResourceBudget
 from scarf.storage.count_matrix import (
     CountMatrixPolicy,
@@ -15,11 +15,11 @@ from scarf.storage.io_policy import StorageIoPolicy
 
 
 def setup_function() -> None:
-    reset_zarr_runtime_for_tests()
+    reset_zarr_runtime()
 
 
 def teardown_function() -> None:
-    reset_zarr_runtime_for_tests()
+    reset_zarr_runtime()
 
 
 def _array(
@@ -528,20 +528,23 @@ def test_feature_stream_empty_selection_and_keep_guard() -> None:
     )
 
 
-def test_feature_group_ranges_skips_overlap_and_merges_adjacent() -> None:
+def test_feature_group_ranges_merge_only_adjacent_chunks() -> None:
     from scarf.storage.feature_stream import _feature_group_ranges
 
-    overlapping = _counts_t_with_plan(
-        np.arange(40 * 80, dtype=np.uint16).reshape(40, 80)
+    counts_t = _counts_t_with_plan(np.arange(40 * 80, dtype=np.uint16).reshape(40, 80))
+    chunk = int(counts_t.chunks[0])
+    n_feats = int(counts_t.shape[0])
+    assert _feature_group_ranges(counts_t, feat_idx=None, featureWidth=10_000) == [
+        (0, n_feats)
+    ]
+    separate = _feature_group_ranges(counts_t, feat_idx=None, featureWidth=chunk)
+    assert separate == [
+        (start, min(start + chunk, n_feats)) for start in range(0, n_feats, chunk)
+    ]
+    gapped = _feature_group_ranges(
+        counts_t, feat_idx=np.array([0, 2 * chunk]), featureWidth=10_000
     )
-    merged = _feature_group_ranges(
-        overlapping,
-        feat_idx=None,
-        feat_starts=[0, 0, overlapping.chunks[0], 2 * overlapping.chunks[0]],
-        featureWidth=10_000,
-    )
-    expected_end = min(3 * int(overlapping.chunks[0]), int(overlapping.shape[0]))
-    assert merged == [(0, expected_end)]
+    assert gapped == [(0, chunk), (2 * chunk, min(3 * chunk, n_feats))]
 
 
 def test_groups_in_flight_is_clamped_and_handoff_is_bounded() -> None:
@@ -773,3 +776,111 @@ def test_early_close_joins_the_producer_and_surfaces_its_failure() -> None:
     assert next(stream) == 1
     with pytest.raises(ValueError, match="producer failed"):
         stream.close()
+
+
+@pytest.mark.parametrize("ordered", [False, True])
+def test_stream_closes_when_a_unit_starts_after_stop(monkeypatch, ordered) -> None:
+    import asyncio
+    import threading
+    import time
+    import types
+
+    import scarf.storage.feature_stream as feature_stream
+
+    counts_t = _counts_t_with_plan(np.arange(40 * 80, dtype=np.uint16).reshape(40, 80))
+    stops: list[threading.Event] = []
+
+    class SlowStop(threading.Event):
+        def __init__(self) -> None:
+            super().__init__()
+            stops.append(self)
+
+        def set(self) -> None:
+            # Widen the gap between acknowledging an item and stopping.
+            time.sleep(0.2)
+            super().set()
+
+    class RacingTaskGroup(asyncio.TaskGroup):
+        created = 0
+
+        def create_task(self, coro, **kwargs):  # type: ignore[no-untyped-def]
+            task = super().create_task(coro, **kwargs)
+            RacingTaskGroup.created += 1
+            if RacingTaskGroup.created == 2:
+                # The scheduler saw no stop request; the unit starts after one.
+                stops[0].wait(10)
+            return task
+
+    # Only the stream's own scheduler sees the patched classes; Zarr reads
+    # start their own task groups.
+    monkeypatch.setattr(
+        feature_stream,
+        "threading",
+        types.SimpleNamespace(Event=SlowStop, Thread=threading.Thread),
+    )
+    patched_asyncio = types.SimpleNamespace(
+        **{name: getattr(asyncio, name) for name in dir(asyncio) if name[0] != "_"}
+    )
+    patched_asyncio.TaskGroup = RacingTaskGroup
+    monkeypatch.setattr(feature_stream, "asyncio", patched_asyncio)
+    stream = feature_stream.map_feature_read_groups(
+        counts_t,
+        lambda group: group.featStart,
+        resources=ResourceBudget(64 * 1024**2, 2),
+        io=StorageIoPolicy(readWorkers=1),
+        orderedCompute=ordered,
+    )
+    finished = threading.Event()
+
+    def consume() -> None:
+        assert next(stream) == 0
+        stream.close()
+        finished.set()
+
+    consumer = threading.Thread(target=consume, daemon=True)
+    consumer.start()
+    consumer.join(10)
+    assert finished.is_set()
+
+
+def test_feature_streams_honor_cooperative_shutdown() -> None:
+    from scarf.storage.feature_stream import map_feature_read_groups
+    from scarf.utils.shutdown import ShutdownRequested, ShutdownToken, shutdown_scope
+
+    counts_t = _counts_t_with_plan(np.arange(40 * 80, dtype=np.uint16).reshape(40, 80))
+    token = ShutdownToken()
+    processed: list[int] = []
+
+    def process(group):  # type: ignore[no-untyped-def]
+        processed.append(group.featStart)
+        token.request(reason="operator stop")
+        return group.featStart
+
+    with shutdown_scope(token), pytest.raises(ShutdownRequested):
+        list(
+            map_feature_read_groups(
+                counts_t,
+                process,
+                resources=ResourceBudget(64 * 1024**2, 2),
+                io=StorageIoPolicy(readWorkers=1),
+                orderedCompute=True,
+            )
+        )
+    assert len(processed) == 1
+
+
+def test_feature_stream_reports_reach_the_callers_report_scope() -> None:
+    from scarf.storage.execution import execution_report_scope
+    from scarf.storage.feature_stream import map_feature_cell_bands
+
+    counts_t = _counts_t_with_plan(np.arange(40 * 80, dtype=np.uint16).reshape(40, 80))
+    with execution_report_scope() as reports:
+        list(
+            map_feature_cell_bands(
+                counts_t,
+                lambda band: band.featStart,
+                resources=ResourceBudget(64 * 1024**2, 2),
+            )
+        )
+    assert [report.unitKind for report in reports] == ["countsTCellBand"]
+    assert reports[0].extra["featureGroupCount"] >= 1

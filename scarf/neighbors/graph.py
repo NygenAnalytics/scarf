@@ -1,7 +1,7 @@
 from numbers import Real
 
 import numpy as np
-from numba import jit
+from numba import jit, njit
 from scipy.sparse import coo_matrix, csr_matrix
 
 from ..utils.progress import iter_progress
@@ -175,31 +175,76 @@ def merge_graphs(csr_mats: list[csr_matrix]) -> coo_matrix:
     nk = neighbor_counts.pop()
     if nk < 2:
         raise ValueError("SNN integration requires at least two neighbors per cell")
-    snns = []
-    for matrix in iter_progress(csr_mats, desc="Identifying SNNs in graphs"):
-        snns.append(calc_snn(matrix.indices.reshape((matrix.shape[0], nk))))
-    columns: list[int] = []
-    data: list[float] = []
-    for row_idx in iter_progress(
-        range(csr_mats[0].shape[0]),
-        desc="Merging graph edges",
-    ):
-        merged_indices = np.hstack([matrix[row_idx].indices for matrix in csr_mats])
-        adjusted_weights = np.hstack(
-            [
-                matrix[row_idx].data + snns[index][row_idx]
-                for index, matrix in enumerate(csr_mats)
-            ]
+    n_cells = csr_mats[0].shape[0]
+    # Regular rows let each graph be read as one cell-by-neighbor matrix.
+    neighbor_rows = [matrix.indices.reshape((n_cells, nk)) for matrix in csr_mats]
+    weight_rows = [matrix.data.reshape((n_cells, nk)) for matrix in csr_mats]
+    snns = [
+        calc_snn(neighbors)
+        for neighbors in iter_progress(
+            neighbor_rows,
+            desc="Identifying SNNs in graphs",
         )
-        merged_weights = np.hstack([matrix[row_idx].data for matrix in csr_mats])
+    ]
+    columns = np.empty(
+        n_cells * nk,
+        dtype=np.result_type(*(neighbors.dtype for neighbors in neighbor_rows)),
+    )
+    data = np.empty(
+        n_cells * nk,
+        dtype=np.result_type(*(weights.dtype for weights in weight_rows)),
+    )
+    for row_idx in iter_progress(range(n_cells), desc="Merging graph edges"):
         merged_indices, merged_weights = weight_sort_indices(
-            merged_indices,
-            merged_weights,
-            adjusted_weights,
+            np.hstack([neighbors[row_idx] for neighbors in neighbor_rows]),
+            np.hstack([weights[row_idx] for weights in weight_rows]),
+            np.hstack(
+                [
+                    weights[row_idx] + snn[row_idx]
+                    for weights, snn in zip(weight_rows, snns, strict=True)
+                ]
+            ),
             nk,
         )
-        columns.extend(merged_indices)
-        data.extend(merged_weights)
-    shape = csr_mats[0].shape
-    rows = np.repeat(range(shape[0]), nk)
-    return coo_matrix((data, (rows, columns)), shape=shape)
+        start = row_idx * nk
+        columns[start : start + nk] = merged_indices
+        data[start : start + nk] = merged_weights
+    rows = np.repeat(np.arange(n_cells), nk)
+    return coo_matrix((data, (rows, columns)), shape=csr_mats[0].shape)
+
+
+@njit(cache=True, nogil=True)
+def csr_symmetry_error(
+    indptr: np.ndarray,
+    indices: np.ndarray,
+    data: np.ndarray | None,
+    allow_self_loops: bool,
+) -> int:
+    """Return the first symmetry defect of a CSR matrix with sorted rows.
+
+    Returns 0 for a symmetric matrix, 1 for a self-loop when
+    ``allow_self_loops`` is false, 2 for an entry without its transpose, and 3
+    for an entry whose transpose holds another value. Passing ``None`` as
+    ``data`` checks only the sparsity structure.
+    """
+    for source in range(indptr.shape[0] - 1):
+        for offset in range(indptr[source], indptr[source + 1]):
+            target = indices[offset]
+            if target == source:
+                if allow_self_loops:
+                    continue
+                return 1
+            lower = indptr[target]
+            upper = indptr[target + 1]
+            while lower < upper:
+                middle = (lower + upper) // 2
+                if indices[middle] < source:
+                    lower = middle + 1
+                else:
+                    upper = middle
+            if lower >= indptr[target + 1] or indices[lower] != source:
+                return 2
+            if data is not None:
+                if data[lower] != data[offset]:
+                    return 3
+    return 0

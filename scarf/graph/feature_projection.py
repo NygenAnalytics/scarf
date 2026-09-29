@@ -9,12 +9,11 @@ from ..storage.artifacts import (
     ArtifactStatus,
     artifact_group,
     inspect_artifact,
+    parse_artifact_ref,
 )
 from ..storage.errors import ArtifactResolutionError
 from ..storage.identity import read_dataset_fingerprint
-from ..storage.selections import (
-    validate_stored_selection_integrity,
-)
+from ..storage.selections import validate_cell_selection
 from ..storage.types import as_zarr_array, as_zarr_group
 from ..storage.validation_scope import store_key, validated_once
 
@@ -66,30 +65,12 @@ def _integrated_contract_error(
     message: str,
     graph: ArtifactRef,
     *,
-    value: object = None,
     input_name: str | None = None,
 ) -> ArtifactResolutionError:
     return _resolution_error(
         message,
         code="corrupt_payload",
         ref=graph,
-        input_name=input_name,
-    )
-
-
-def _named_input_contract_error(
-    message: str,
-    owner: ArtifactRef,
-    *,
-    inputs: Mapping[str, object],
-    input_name: str,
-    value: object,
-) -> ArtifactResolutionError:
-    """Return one strict malformed-edge error for every invalid input shape."""
-    return _resolution_error(
-        message,
-        code="corrupt_payload",
-        ref=owner,
         input_name=input_name,
     )
 
@@ -170,34 +151,7 @@ def _input_ref(
         expected_assay=owner.assay,
         statuses=statuses,
     )
-    inputs = status.inputs or {}
-    raw = inputs.get(name)
-    if not isinstance(raw, Mapping):
-        raise _named_input_contract_error(
-            f"{owner.kind} artifact has no {name!r} artifact input",
-            owner,
-            inputs=inputs,
-            input_name=name,
-            value=raw,
-        )
-    try:
-        value = ArtifactRef.from_dict(raw)
-    except (TypeError, ValueError) as error:
-        raise _named_input_contract_error(
-            f"{owner.kind} artifact has a malformed {name!r} input",
-            owner,
-            inputs=inputs,
-            input_name=name,
-            value=raw,
-        ) from error
-    if set(raw) != set(value.to_dict()):
-        raise _named_input_contract_error(
-            f"{owner.kind} artifact has a malformed {name!r} input",
-            owner,
-            inputs=inputs,
-            input_name=name,
-            value=raw,
-        )
+    value = status.input_ref(name)
     _require_complete(
         root,
         value,
@@ -207,24 +161,6 @@ def _input_ref(
         statuses=statuses,
     )
     return value
-
-
-def _validate_cell_selection(root: zarr.Group, selection: ArtifactRef) -> None:
-    _require_complete(
-        root,
-        selection,
-        expected_kind="cell_selection",
-        expected_scope="datastore",
-        expected_assay=None,
-    )
-    validate_stored_selection_integrity(
-        root,
-        selection,
-        kind="cell_selection",
-        scope="datastore",
-        assay=None,
-        table_path="cellData",
-    )
 
 
 def resolve_coordinate_inputs(
@@ -268,7 +204,7 @@ def resolve_coordinate_inputs(
             expected_assay=None,
             statuses=statuses,
         )
-        _validate_cell_selection(root, cell_selection)
+        validate_cell_selection(root, cell_selection)
         return CoordinateInputs(
             coordinates=coordinates,
             reduction=None,
@@ -442,34 +378,7 @@ def _resolve_native_graph_inputs(
         expected_assay=assay,
         statuses=statuses,
     )
-    neighbor_inputs = neighbor_status.inputs or {}
-    raw_coordinates = neighbor_inputs.get("coordinates")
-    if not isinstance(raw_coordinates, Mapping):
-        raise _named_input_contract_error(
-            "neighbors artifact has no 'coordinates' artifact input",
-            neighbors,
-            inputs=neighbor_inputs,
-            input_name="coordinates",
-            value=raw_coordinates,
-        )
-    try:
-        coordinates = ArtifactRef.from_dict(raw_coordinates)
-    except (TypeError, ValueError) as error:
-        raise _named_input_contract_error(
-            "neighbors artifact has a malformed 'coordinates' input",
-            neighbors,
-            inputs=neighbor_inputs,
-            input_name="coordinates",
-            value=raw_coordinates,
-        ) from error
-    if set(raw_coordinates) != set(coordinates.to_dict()):
-        raise _named_input_contract_error(
-            "neighbors artifact has a malformed 'coordinates' input",
-            neighbors,
-            inputs=neighbor_inputs,
-            input_name="coordinates",
-            value=raw_coordinates,
-        )
+    coordinates = neighbor_status.input_ref("coordinates")
     if coordinates.kind not in {
         "reduction",
         "batch_correction",
@@ -536,7 +445,6 @@ def _integrated_sources(
         raise _integrated_contract_error(
             "Integrated graph has invalid source parameters",
             graph,
-            value={"parameters": parameters, "inputs": status.inputs or {}},
         )
     expected_parameters = (
         {"method", "assays", "l2_normalize"}
@@ -551,7 +459,6 @@ def _integrated_sources(
         raise _integrated_contract_error(
             "Integrated graph has invalid source parameters",
             graph,
-            value=parameters,
         )
     if (
         len(assays) < 2
@@ -561,7 +468,6 @@ def _integrated_sources(
         raise _integrated_contract_error(
             "Integrated graph requires at least two unique assay names",
             graph,
-            value=assays,
         )
     inputs = status.inputs or {}
     expected_inputs = {
@@ -572,36 +478,12 @@ def _integrated_sources(
         raise _integrated_contract_error(
             "Integrated graph source count does not match its assay order",
             graph,
-            value=inputs,
         )
     sources: list[ArtifactRef] = []
     for index, assay in enumerate(assays):
         source_name = f"source_{index}"
         if method == "snn":
-            raw_source = inputs.get(source_name)
-            if not isinstance(raw_source, Mapping):
-                raise _integrated_contract_error(
-                    "Integrated SNN graph has a malformed source",
-                    graph,
-                    value=raw_source,
-                    input_name=source_name,
-                )
-            try:
-                source = ArtifactRef.from_dict(raw_source)
-            except (TypeError, ValueError) as error:
-                raise _integrated_contract_error(
-                    "Integrated SNN graph has a malformed source",
-                    graph,
-                    value=raw_source,
-                    input_name=source_name,
-                ) from error
-            if set(raw_source) != set(source.to_dict()):
-                raise _integrated_contract_error(
-                    "Integrated SNN graph has a malformed source",
-                    graph,
-                    value=raw_source,
-                    input_name=source_name,
-                )
+            source = status.input_ref(source_name)
             _require_complete(
                 root,
                 source,
@@ -619,39 +501,18 @@ def _integrated_sources(
             raise _integrated_contract_error(
                 "Integrated WNN graph has no source bundle",
                 graph,
-                value=raw_bundle,
                 input_name=source_name,
             )
-        raw_neighbors = raw_bundle.get("neighbors")
-        raw_coordinates = raw_bundle.get("coordinates")
-        if not isinstance(raw_neighbors, Mapping) or not isinstance(
-            raw_coordinates, Mapping
-        ):
-            raise _integrated_contract_error(
-                "Integrated WNN source bundle is incomplete",
-                graph,
-                value=raw_bundle,
-                input_name=source_name,
-            )
-        try:
-            neighbors = ArtifactRef.from_dict(raw_neighbors)
-            coordinates = ArtifactRef.from_dict(raw_coordinates)
-        except (TypeError, ValueError) as error:
-            raise _integrated_contract_error(
-                "Integrated WNN source bundle is malformed",
-                graph,
-                value=raw_bundle,
-                input_name=source_name,
-            ) from error
-        if set(raw_neighbors) != set(neighbors.to_dict()) or set(
-            raw_coordinates
-        ) != set(coordinates.to_dict()):
-            raise _integrated_contract_error(
-                "Integrated WNN source bundle is malformed",
-                graph,
-                value=raw_bundle,
-                input_name=source_name,
-            )
+        neighbors = parse_artifact_ref(
+            raw_bundle["neighbors"],
+            f"{source_name}.neighbors",
+            owner=graph,
+        )
+        coordinates = parse_artifact_ref(
+            raw_bundle["coordinates"],
+            f"{source_name}.coordinates",
+            owner=graph,
+        )
         _require_complete(
             root,
             neighbors,
@@ -678,7 +539,6 @@ def _integrated_sources(
             raise _integrated_contract_error(
                 "Integrated WNN source names coordinates that differ from neighbors",
                 graph,
-                value=raw_bundle,
                 input_name=source_name,
             )
         sources.append(neighbors)
@@ -692,30 +552,7 @@ def graph_cell_selection(root: zarr.Group, graph: ArtifactRef) -> ArtifactRef:
         return resolve_native_graph_inputs(root, graph).cell_selection
     if graph.kind == "integrated_graph":
         status, sources = _integrated_sources(root, graph)
-        raw_selection = (status.inputs or {}).get("cell_selection")
-        if not isinstance(raw_selection, Mapping):
-            raise _integrated_contract_error(
-                "Integrated graph has a malformed cell-selection input",
-                graph,
-                value=raw_selection,
-                input_name="cell_selection",
-            )
-        try:
-            selection = ArtifactRef.from_dict(raw_selection)
-        except (TypeError, ValueError) as error:
-            raise _integrated_contract_error(
-                "Integrated graph has a malformed cell-selection input",
-                graph,
-                value=raw_selection,
-                input_name="cell_selection",
-            ) from error
-        if set(raw_selection) != set(selection.to_dict()):
-            raise _integrated_contract_error(
-                "Integrated graph has a malformed cell-selection input",
-                graph,
-                value=raw_selection,
-                input_name="cell_selection",
-            )
+        selection = status.input_ref("cell_selection")
         _require_complete(
             root,
             selection,
@@ -723,13 +560,12 @@ def graph_cell_selection(root: zarr.Group, graph: ArtifactRef) -> ArtifactRef:
             expected_scope="datastore",
             expected_assay=None,
         )
-        _validate_cell_selection(root, selection)
+        validate_cell_selection(root, selection)
         for source in sources:
             if resolve_native_graph_inputs(root, source).cell_selection != selection:
                 raise _integrated_contract_error(
                     "Integrated graph sources do not name its shared cell selection",
                     graph,
-                    value=status.inputs or {},
                     input_name="cell_selection",
                 )
         return selection
@@ -858,31 +694,3 @@ def resolve_graph_assay_inputs(
             expected_assay=assay,
         )
     return matches[0]
-
-
-def project_normalized_feature_selections(
-    root: zarr.Group,
-    graph: ArtifactRef,
-) -> tuple[ArtifactRef, ...]:
-    """Project exact normalized feature-selection ancestry from a graph."""
-
-    if graph.kind in {"connectivity_map", "neighbors"}:
-        selection = resolve_native_graph_inputs(root, graph).feature_selection
-        return () if selection is None else (selection,)
-    if graph.kind != "integrated_graph":
-        raise _resolution_error(
-            "Graph must be connectivity_map, neighbors, or integrated_graph",
-            code="unsupported_graph_kind",
-            ref=graph,
-            expected_kind="connectivity_map,neighbors,integrated_graph",
-        )
-    _status, sources = _integrated_sources(root, graph)
-    graph_cell_selection(root, graph)
-    projected: list[ArtifactRef] = []
-    seen: set[ArtifactRef] = set()
-    for source in sources:
-        selection = resolve_native_graph_inputs(root, source).feature_selection
-        if selection is not None and selection not in seen:
-            seen.add(selection)
-            projected.append(selection)
-    return tuple(projected)

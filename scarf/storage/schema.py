@@ -5,14 +5,10 @@ from typing import Any
 import numpy as np
 import zarr
 
-from .types import array_metadata_shards, as_zarr_array, as_zarr_group
-from .arrays import (
-    create_metadata_column,
-    create_numeric_array,
-    create_zarr_obj_array,
-)
+from .types import as_zarr_array, as_zarr_group
+from .arrays import create_metadata_column, create_zarr_obj_array
 from .count_matrix import CountMatrixPolicy, create_product_counts_array
-from .layout import _group_zarr_format, count_array_spec
+from .layout import _group_zarr_format
 from .profiles import StorageProfile, resolve_storage_profile
 from ..utils.logging import logger
 
@@ -284,6 +280,44 @@ def validate_workspace_name(workspace: str | None) -> None:
         )
 
 
+def _create_count_assay(
+    z: zarr.Group,
+    assay_name: str,
+    workspace: str | None,
+    n_cells: int,
+    n_features: int,
+    dtype: Any,
+    *,
+    profile: StorageProfile | None,
+    policy: CountMatrixPolicy | None,
+    marker: dict[str, Any],
+) -> tuple[zarr.Array, zarr.Group, StorageProfile]:
+    """Create an assay group, its feature group, and incomplete paired counts."""
+    validate_new_assay(z, assay_name, workspace)
+    if n_cells < 0 or n_features < 0:
+        raise ValueError("Assay dimensions must be non-negative")
+    group = z.create_group(
+        assay_name if workspace is None else f"{workspace}/{assay_name}",
+        attributes={**marker, "prepared": False, "misc": {}},
+    )
+    resolved_profile = profile or resolve_storage_profile(group.store)
+    feature_group = group.create_group("featureData")
+    matrix_group = (
+        group if workspace is None else z.create_group(f"matrices/{assay_name}")
+    )
+    counts = create_product_counts_array(
+        matrix_group,
+        n_cells,
+        n_features,
+        dtype,
+        profile=resolved_profile,
+        policy=policy,
+        zarrFormat=_group_zarr_format(matrix_group),
+    )
+    counts.attrs["complete"] = False
+    return counts, feature_group, resolved_profile
+
+
 def create_zarr_count_assay(
     z: zarr.Group,
     assay_name: str,
@@ -304,68 +338,29 @@ def create_zarr_count_assay(
     pending marker instead of ``is_assay``; use
     :func:`derived_assay_transaction` rather than passing it directly.
     """
-    validate_new_assay(z, assay_name, workspace)
-    marker: dict[str, Any] = (
-        {"is_assay": True}
-        if pending_operation is None
-        else {PENDING_ASSAY_ATTR: pending_operation}
+    counts, feature_group, resolved_profile = _create_count_assay(
+        z,
+        assay_name,
+        workspace,
+        n_cells,
+        len(feat_ids),
+        dtype,
+        profile=profile,
+        policy=policy,
+        marker=(
+            {"is_assay": True}
+            if pending_operation is None
+            else {PENDING_ASSAY_ATTR: pending_operation}
+        ),
     )
-    group = z.create_group(
-        assay_name if workspace is None else f"{workspace}/{assay_name}",
-        attributes={**marker, "prepared": False, "misc": {}},
-    )
-    resolved_profile = profile or resolve_storage_profile(group.store)
-    create_zarr_obj_array(
-        group,
-        "featureData/ids",
-        feat_ids,
-        profile=resolved_profile,
-    )
-    create_zarr_obj_array(
-        group,
-        "featureData/names",
-        feat_names,
-        profile=resolved_profile,
-    )
-    create_zarr_obj_array(
-        group,
-        "featureData/I",
-        [True for _ in range(len(feat_ids))],
-        "bool",
-        profile=resolved_profile,
-    )
-    if workspace is not None:
-        group = z.create_group(f"matrices/{assay_name}")
-    n_feats = len(feat_ids)
-    zarr_format = _group_zarr_format(group)
-    if zarr_format >= 3:
-        counts = create_product_counts_array(
-            group,
-            n_cells,
-            n_feats,
-            dtype,
-            profile=resolved_profile,
-            policy=policy,
+    for name, values, column_dtype in (
+        ("ids", feat_ids, None),
+        ("names", feat_names, None),
+        ("I", np.ones(len(feat_ids), dtype=bool), "bool"),
+    ):
+        create_zarr_obj_array(
+            feature_group, name, values, column_dtype, profile=resolved_profile
         )
-    else:
-        spec = count_array_spec(
-            n_cells,
-            n_feats,
-            dtype=dtype,
-            profile=resolved_profile,
-            policy=policy,
-            zarrFormat=zarr_format,
-        )
-        counts = create_numeric_array(group, "counts", spec)
-    counts.attrs["complete"] = False
-    stored_shards = array_metadata_shards(counts)
-    group.attrs["scarf:zarr_spec"] = {
-        "profile": resolved_profile,
-        "dtype": np.dtype(dtype).str,
-        "chunks": list(counts.chunks),
-        "shards": None if stored_shards is None else list(stored_shards),
-        "zarr_format": zarr_format,
-    }
     return counts
 
 
@@ -383,74 +378,24 @@ def create_empty_zarr_count_assay(
     policy: CountMatrixPolicy | None = None,
 ) -> tuple[zarr.Array, zarr.Group]:
     """Create an assay whose feature metadata can be filled blockwise."""
-    validate_new_assay(z, assay_name, workspace)
-    if n_cells < 0 or n_features < 0:
-        raise ValueError("Assay dimensions must be non-negative")
-    assay_path = assay_name if workspace is None else f"{workspace}/{assay_name}"
-    assay_group = z.create_group(assay_path)
-    assay_group.attrs["is_assay"] = True
-    assay_group.attrs["prepared"] = False
-    assay_group.attrs["misc"] = {}
-    resolved_profile = profile or resolve_storage_profile(assay_group.store)
-    feature_group = assay_group.create_group("featureData")
-    create_metadata_column(
+    counts, feature_group, resolved_profile = _create_count_assay(
+        z,
+        assay_name,
+        workspace,
+        n_cells,
+        n_features,
+        dtype,
+        profile=profile,
+        policy=policy,
+        marker={"is_assay": True},
+    )
+    _create_empty_columns(
         feature_group,
-        "ids",
-        dtype=feature_id_dtype,
-        shape=n_features,
-        chunkSize=100_000,
+        n_features,
+        ids_dtype=feature_id_dtype,
+        names_dtype=feature_name_dtype,
         profile=resolved_profile,
     )
-    create_metadata_column(
-        feature_group,
-        "names",
-        dtype=feature_name_dtype,
-        shape=n_features,
-        chunkSize=100_000,
-        profile=resolved_profile,
-    )
-    included = create_metadata_column(
-        feature_group,
-        "I",
-        dtype=bool,
-        shape=n_features,
-        chunkSize=100_000,
-        profile=resolved_profile,
-    )
-    included[:] = True
-
-    matrix_group = (
-        assay_group if workspace is None else z.create_group(f"matrices/{assay_name}")
-    )
-    zarr_format = _group_zarr_format(matrix_group)
-    if zarr_format >= 3:
-        counts = create_product_counts_array(
-            matrix_group,
-            n_cells,
-            n_features,
-            dtype,
-            profile=resolved_profile,
-            policy=policy,
-        )
-    else:
-        spec = count_array_spec(
-            n_cells,
-            n_features,
-            dtype=dtype,
-            profile=resolved_profile,
-            policy=policy,
-            zarrFormat=zarr_format,
-        )
-        counts = create_numeric_array(matrix_group, "counts", spec)
-    counts.attrs["complete"] = False
-    stored_shards = array_metadata_shards(counts)
-    matrix_group.attrs["scarf:zarr_spec"] = {
-        "profile": resolved_profile,
-        "dtype": np.dtype(dtype).str,
-        "chunks": list(counts.chunks),
-        "shards": None if stored_shards is None else list(stored_shards),
-        "zarr_format": zarr_format,
-    }
     return counts, feature_group
 
 
@@ -470,6 +415,32 @@ def load_count_array(
     )
 
 
+def _cell_data_path(workspace: str | None) -> str:
+    return "cellData" if workspace is None else f"{workspace}/cellData"
+
+
+def _create_empty_columns(
+    group: zarr.Group,
+    n_rows: int,
+    *,
+    ids_dtype: Any,
+    names_dtype: Any,
+    profile: StorageProfile | None,
+) -> None:
+    """Create blockwise-fillable ``ids`` and ``names`` and an all-true ``I``."""
+    for name, dtype in (("ids", ids_dtype), ("names", names_dtype), ("I", bool)):
+        column = create_metadata_column(
+            group,
+            name,
+            dtype=dtype,
+            shape=n_rows,
+            chunkSize=100_000,
+            profile=profile,
+        )
+        if name == "I":
+            column[:] = True
+
+
 def create_cell_data(
     root: zarr.Group,
     workspace: str | None,
@@ -477,18 +448,11 @@ def create_cell_data(
     names: np.ndarray,
     profile: StorageProfile | None = None,
 ) -> zarr.Group:
-    if workspace is None:
-        group = root.create_group("cellData")
-    else:
-        group = root.create_group(f"{workspace}/cellData")
+    group = root.create_group(_cell_data_path(workspace))
     create_zarr_obj_array(group, "ids", ids, ids.dtype, profile=profile)
     create_zarr_obj_array(group, "names", names, names.dtype, profile=profile)
     create_zarr_obj_array(
-        group,
-        "I",
-        [True for _ in range(len(ids))],
-        "bool",
-        profile=profile,
+        group, "I", np.ones(len(ids), dtype=bool), "bool", profile=profile
     )
     return group
 
@@ -504,31 +468,8 @@ def create_empty_cell_data(
     """Create cell metadata columns that can be filled blockwise."""
     if n_cells < 0:
         raise ValueError("n_cells must be non-negative")
-    path = "cellData" if workspace is None else f"{workspace}/cellData"
-    group = root.create_group(path)
-    create_metadata_column(
-        group,
-        "ids",
-        dtype=id_dtype,
-        shape=n_cells,
-        chunkSize=100_000,
-        profile=profile,
+    group = root.create_group(_cell_data_path(workspace))
+    _create_empty_columns(
+        group, n_cells, ids_dtype=id_dtype, names_dtype=name_dtype, profile=profile
     )
-    create_metadata_column(
-        group,
-        "names",
-        dtype=name_dtype,
-        shape=n_cells,
-        chunkSize=100_000,
-        profile=profile,
-    )
-    included = create_metadata_column(
-        group,
-        "I",
-        dtype=bool,
-        shape=n_cells,
-        chunkSize=100_000,
-        profile=profile,
-    )
-    included[:] = True
     return group

@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 
-import httpx
+import httpx2
 import pytest
 from pydantic_ai.exceptions import ModelHTTPError, UsageLimitExceeded
 from pydantic_ai.messages import ModelResponse, ToolCallPart
@@ -162,7 +162,7 @@ def test_retry_after_headers_are_preserved(recorded_waits, source):
         headers={"Retry-After": wait} if source != "cause" else None,
     )
     if source == "cause":
-        response = httpx.Response(429, headers={"Retry-After": wait})
+        response = httpx2.Response(429, headers={"Retry-After": wait})
         original = RuntimeError("Throttled request")
         original.response = response
         error.__cause__ = original

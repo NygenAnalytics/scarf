@@ -38,8 +38,8 @@ def _quiet_test_logs() -> None:
 
 @pytest.fixture(autouse=True)
 def _reset_zarr_runtime() -> None:
-    from scarf.storage.async_execution import reset_zarr_runtime_for_tests
+    from tests.storage_helpers import reset_zarr_runtime
 
-    reset_zarr_runtime_for_tests()
+    reset_zarr_runtime()
     yield
-    reset_zarr_runtime_for_tests()
+    reset_zarr_runtime()

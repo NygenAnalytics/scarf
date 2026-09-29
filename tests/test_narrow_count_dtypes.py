@@ -288,6 +288,30 @@ def test_rna_feature_summary_matches_float64_reference(
     )
 
 
+def test_rna_feature_summary_through_normed_records_count_arithmetic(tmp_path):
+    values = _counts(50, 16, 3000)
+    store = _h5ad_store(tmp_path, values)
+    assert store.RNA.rawData.dtype == np.uint16
+    cells = store.snapshot_cell_selection()
+
+    streamed = ensure_feature_summary(store.zw, store.RNA, cells)
+    assert "count_arithmetic" not in (store.inspect_artifact(streamed).parameters or {})
+    store.RNA.normMethod = norm_lib_size_log
+    try:
+        through_normed = ensure_feature_summary(store.zw, store.RNA, cells)
+    finally:
+        store.RNA.normMethod = norm_lib_size
+
+    assert through_normed != streamed
+    parameters = store.inspect_artifact(through_normed).parameters or {}
+    assert parameters["count_arithmetic"] == "float64"
+    np.testing.assert_allclose(
+        artifact_group(store.zw, through_normed)["normed_tot"][:],
+        np.log1p(_lib_size_reference(values)).sum(axis=0),
+        rtol=1e-12,
+    )
+
+
 @pytest.mark.parametrize("renormalize_subset", [False, True])
 @pytest.mark.parametrize(("max_count", "stored"), NARROW)
 def test_rna_feature_batches_match_float64_reference(
@@ -892,7 +916,7 @@ def test_zero_total_divisor_is_recorded_only_when_set():
 
     assert "zero_total_divisor" not in unset.to_record().parameters
     assert marked.to_record().parameters["zero_total_divisor"] == "one"
-    assert unset.provenance_hash() != marked.provenance_hash()
+    assert unset.to_record().parameters != marked.to_record().parameters
 
     reference = _normalization_parameters(
         {**_REFERENCE_RECORD, "zero_total_divisor": "one"}
@@ -1024,8 +1048,8 @@ def test_count_arithmetic_is_recorded_only_when_set():
 
     assert "count_arithmetic" not in unset.to_record().parameters
     assert marked.to_record().parameters["count_arithmetic"] == "float64"
-    assert unset.provenance_hash() == arguments(count_arithmetic=None).provenance_hash()
-    assert unset.provenance_hash() != marked.provenance_hash()
+    assert unset.to_record() == arguments(count_arithmetic=None).to_record()
+    assert unset.to_record().parameters != marked.to_record().parameters
 
 
 _MARKER_RECORD = {

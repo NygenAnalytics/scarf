@@ -11,6 +11,8 @@ import pandas as pd
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
 from ...clustering.leiden import leiden_membership
+from ...features.gene_families import GENE_FAMILY_PATTERNS, gene_family_mask
+from ...metadata.rows import metadata_column_fingerprint
 from ...metadata.selection import resolve_cell_aligned_artifact
 from ...quality_control.cell_cycle_genes import (
     g2m_phase_genes,
@@ -22,9 +24,8 @@ from ...storage.arrays import create_zarr_dataset
 from ...storage.artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
-    finish_artifact,
+    artifact_transaction,
     plan_artifact,
-    start_artifact,
 )
 from ...storage.artifacts import fingerprint_stored_arrays
 from ...storage.feature_selection import read_feature_selection_indices
@@ -35,12 +36,12 @@ from ...utils.logging import logger
 from ..tools import label_filter_bound, mark_missing_rows, read_marked_metadata_rows
 from .contracts import ArtifactRecord, ParameterCandidateEvaluation
 from .execution import (
+    _RANDOM_SEED,
     _cached_candidate_metric,
-    _metadata_column_fingerprint,
+    candidate_graph_steps,
     diagnostic_call,
     diagnostic_reuse,
 )
-from .selection import annotate_candidate_dominance
 
 _PCA_DIAGNOSTIC_ARRAYS = (
     "component_variance",
@@ -49,18 +50,16 @@ _PCA_DIAGNOSTIC_ARRAYS = (
     "top_loading_values",
     "family_enrichment",
     "covariate_association",
-    "adjacent_neighbor_overlap",
 )
 _MAX_DOUBLET_CAPTURES = 512
-SCARF_DEFAULT_DIAGNOSTIC_FAMILIES = (
-    "mitochondrial",
-    "ribosomal",
-    "mitoribosomal",
-    "cellCycleCcn",
-    "hla",
-    "h2",
-    "histone",
-    "sexLinked",
+_CELL_CYCLE_GENES = frozenset(
+    gene.upper()
+    for gene in (
+        *s_phase_genes,
+        *g2m_phase_genes,
+        *s_phase_genes_mouse,
+        *g2m_phase_genes_mouse,
+    )
 )
 
 
@@ -157,101 +156,24 @@ def _selected_feature_names(
     return indices, names[indices]
 
 
-def _family_mask(names: np.ndarray, family: str) -> np.ndarray | None:
-    upper = np.char.upper(names.astype(str))
-    if family == "mitochondrial":
-        return np.char.startswith(upper, "MT-")
-    if family in {"ribosomal", "ribosomalProtein"}:
-        return np.asarray(
-            np.logical_or.reduce(
-                [np.char.startswith(upper, prefix) for prefix in ("RPS", "RPL")]
-            ),
-            dtype=bool,
-        )
-    if family == "mitoribosomal":
-        return np.asarray(
-            np.logical_or.reduce(
-                [np.char.startswith(upper, prefix) for prefix in ("MRPS", "MRPL")]
-            ),
-            dtype=bool,
-        )
-    if family == "cellCycleCcn":
-        return np.char.startswith(upper, "CCN")
+def family_mask(names: np.ndarray, family: str) -> np.ndarray | None:
+    """Match a registered gene family or a family that a feature policy cites.
+
+    Feature policies cite the families that feature identity observes:
+    ``sex`` matches the registered ``sexLinked`` genes, and ``cellCycle`` adds
+    the curated S and G2/M phase genes to ``cellCycleCcn``. Other names that
+    are not registered gene families return None.
+    """
+    if family == "sex":
+        return gene_family_mask(names, "sexLinked")
     if family == "cellCycle":
-        cycle_genes = {
-            *s_phase_genes,
-            *g2m_phase_genes,
-            *s_phase_genes_mouse,
-            *g2m_phase_genes_mouse,
-        }
-        return np.asarray(
-            np.char.startswith(upper, "CCN")
-            | np.isin(upper, [value.upper() for value in cycle_genes]),
-            dtype=bool,
+        upper = np.char.upper(np.asarray(names).astype(str))
+        return gene_family_mask(names, "cellCycleCcn") | np.isin(
+            upper, list(_CELL_CYCLE_GENES)
         )
-    if family in {"hla", "HLA"}:
-        return np.char.startswith(upper, "HLA-")
-    if family in {"h2", "H2"}:
-        return np.char.startswith(upper, "H2-")
-    if family == "histone":
-        return np.char.startswith(upper, "HIST")
-    if family in {"sex", "sexLinked"}:
-        return np.isin(
-            upper,
-            [
-                "XIST",
-                "DDX3Y",
-                "USP9Y",
-                "EIF1AY",
-                "KDM5D",
-                "SRY",
-                "ZFY",
-                "UTY",
-                "TMSB4Y",
-                "NLGN4Y",
-            ],
-        )
-    if family == "hemoglobin":
-        return np.char.startswith(upper, "HB")
-    if family == "immuneReceptor":
-        return np.asarray(
-            np.logical_or.reduce(
-                [
-                    np.char.startswith(upper, prefix)
-                    for prefix in ("IGH", "IGK", "IGL", "TRA", "TRB", "TRD", "TRG")
-                ]
-            ),
-            dtype=bool,
-        )
-    if family == "stress":
-        return np.asarray(
-            np.logical_or.reduce(
-                [
-                    np.char.startswith(upper, prefix)
-                    for prefix in ("FOS", "JUN", "HSP", "DUSP", "EGR")
-                ]
-            ),
-            dtype=bool,
-        )
-    if family == "dissociation":
-        return np.isin(
-            upper,
-            [
-                "ATF3",
-                "BTG1",
-                "BTG2",
-                "DUSP1",
-                "EGR1",
-                "FOS",
-                "FOSB",
-                "IER2",
-                "JUN",
-                "JUNB",
-                "JUND",
-                "ZFP36",
-            ],
-        )
-    return None
+    if family not in GENE_FAMILY_PATTERNS:
+        return None
+    return gene_family_mask(names, family)
 
 
 def _component_variance(values: Any) -> np.ndarray:
@@ -431,9 +353,9 @@ class _SelectionIndices:
 def _column_fingerprint(store: Any, column: str, cache: dict[str, str] | None) -> str:
     """Fingerprint live metadata once per diagnostic pass when a cache is given."""
     if cache is None:
-        return _metadata_column_fingerprint(store.cells, column)
+        return metadata_column_fingerprint(store.cells, column)
     if column not in cache:
-        cache[column] = _metadata_column_fingerprint(store.cells, column)
+        cache[column] = metadata_column_fingerprint(store.cells, column)
     return cache[column]
 
 
@@ -622,7 +544,6 @@ def _write_pca_diagnostic(
     family_masks: Mapping[str, np.ndarray],
     covariate_columns: Sequence[str],
     covariate_roles: Sequence[str],
-    adjacent_overlap: float | None,
     column_kinds: Mapping[str, str] | None = None,
     column_artifacts: Mapping[str, ArtifactRef] | None = None,
     fingerprints: dict[str, str] | None = None,
@@ -692,7 +613,6 @@ def _write_pca_diagnostic(
                 )
                 for column in covariate_columns
             },
-            "adjacent_neighbor_overlap": adjacent_overlap,
             "explained_variance_basis": "scaled_nonconstant_features",
         },
         inputs={
@@ -726,7 +646,6 @@ def _write_pca_diagnostic(
                 shape=(len(covariate_columns), dimensions),
                 dtype=np.float64,
             ),
-            ArrayRequirement("adjacent_neighbor_overlap", shape=(1,), dtype=np.float64),
         ),
         required_attributes=(
             AttributeRequirement("family_names", expected_types=(list,)),
@@ -815,10 +734,6 @@ def _write_pca_diagnostic(
         if evaluation.cellSelection is not None
         else np.zeros((len(covariate_columns), coordinates.shape[1]), dtype=np.float64)
     )
-    overlap_array = np.asarray(
-        [np.nan if adjacent_overlap is None else adjacent_overlap],
-        dtype=np.float64,
-    )
     payload = {
         "component_variance": component_variance,
         "explained_variance_ratio": explained_variance_ratio,
@@ -826,29 +741,27 @@ def _write_pca_diagnostic(
         "top_loading_values": top_values,
         "family_enrichment": family_enrichment,
         "covariate_association": associations,
-        "adjacent_neighbor_overlap": overlap_array,
     }
     if not planned.reused:
-        group = start_artifact(store.zw, planned)
-        for name, values in payload.items():
-            chunks = tuple(max(1, min(size, 4096)) for size in values.shape)
-            array = create_zarr_dataset(
+        with artifact_transaction(store.zw, planned) as group:
+            for name, values in payload.items():
+                chunks = tuple(max(1, min(size, 4096)) for size in values.shape)
+                array = create_zarr_dataset(
+                    group,
+                    name,
+                    chunks,
+                    values.dtype,
+                    values.shape,
+                )
+                array[:] = values
+            group.attrs["family_names"] = list(family_masks)
+            group.attrs["covariate_columns"] = list(covariate_columns)
+            group.attrs["covariate_roles"] = list(covariate_roles)
+            group.attrs["covariate_support"] = covariate_support
+            group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
                 group,
-                name,
-                chunks,
-                values.dtype,
-                values.shape,
+                _PCA_DIAGNOSTIC_ARRAYS,
             )
-            array[:] = values
-        group.attrs["family_names"] = list(family_masks)
-        group.attrs["covariate_columns"] = list(covariate_columns)
-        group.attrs["covariate_roles"] = list(covariate_roles)
-        group.attrs["covariate_support"] = covariate_support
-        group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
-            group,
-            _PCA_DIAGNOSTIC_ARRAYS,
-        )
-        finish_artifact(group, planned)
     return (
         planned.ref,
         component_variance,
@@ -882,7 +795,7 @@ def augment_pca_evaluations(
     family_masks = {
         family: mask
         for family in dict.fromkeys([*nominated_families, *protected_families])
-        for mask in [_family_mask(selected_names, family)]
+        for mask in [family_mask(selected_names, family)]
         if mask is not None and bool(mask.any())
     }
     requested_role_columns = {
@@ -909,40 +822,21 @@ def augment_pca_evaluations(
             ) and column not in columns:
                 columns.append(column)
                 roles.append(role)
-    completed = [
-        evaluation
+    completed = {
+        evaluation.candidateId
         for evaluation in evaluations
         if evaluation.status == "done"
         and evaluation.eligible
         and evaluation.cellSelection is not None
         and "pca" in evaluation.artifacts
         and "neighbors" in evaluation.artifacts
-    ]
-    previous_by_id: dict[str, float | None] = {}
-    previous: ParameterCandidateEvaluation | None = None
-    for evaluation in sorted(
-        completed,
-        key=lambda value: value.parameters.dimensions,
-    ):
-        overlap = (
-            diagnostic_call(
-                "metric.neighborOverlap",
-                _neighbor_overlap,
-                store,
-                _artifact_ref(previous, "neighbors"),
-                _artifact_ref(evaluation, "neighbors"),
-            )
-            if previous is not None
-            else None
-        )
-        previous_by_id[evaluation.candidateId] = overlap
-        previous = evaluation
+    }
 
     fingerprints: dict[str, str] = {}
     selection_indices = _SelectionIndices(store)
     augmented: list[ParameterCandidateEvaluation] = []
     for evaluation in evaluations:
-        if evaluation.candidateId not in previous_by_id:
+        if evaluation.candidateId not in completed:
             augmented.append(evaluation)
             continue
         (
@@ -963,7 +857,6 @@ def augment_pca_evaluations(
             family_masks=family_masks,
             covariate_columns=columns,
             covariate_roles=roles,
-            adjacent_overlap=previous_by_id[evaluation.candidateId],
             column_kinds=column_kinds,
             column_artifacts=qc_artifacts,
             fingerprints=fingerprints,
@@ -1032,7 +925,6 @@ def augment_pca_evaluations(
                 "technicalPcaAssociation": role_associations["technical"],
                 "protectedPcaAssociation": role_associations["protected"],
                 "qcPcaAssociation": role_associations["qc"],
-                "neighborPrefixOverlap": previous_by_id[evaluation.candidateId],
             }
         )
         artifact = ArtifactRecord.from_ref(diagnostic)
@@ -1062,21 +954,13 @@ def augment_pca_evaluations(
                                 ),
                                 f"candidate:{evaluation.candidateId}:pcaLoadings",
                                 f"candidate:{evaluation.candidateId}:pcaCovariates",
-                                *(
-                                    [
-                                        f"candidate:{evaluation.candidateId}:neighborPrefixOverlap"
-                                    ]
-                                    if previous_by_id[evaluation.candidateId]
-                                    is not None
-                                    else []
-                                ),
                             ]
                         )
                     ),
                 }
             )
         )
-    return annotate_candidate_dominance(augmented)
+    return tuple(augmented)
 
 
 def _bounded_score_summary(
@@ -1261,44 +1145,16 @@ def resolve_native_doublet_inputs(
         )
         diagnostic_reuse("diagnostic.nativeDoubletInputs", "artifactReuses")
         return inputs
-    reduction = _artifact_ref(selected, "pca")
-    ann = diagnostic_call(
-        "core.nativeDoubletAnn",
-        store.build_ann_index,
-        reduction,
-        ann_metric="l2",
-        ann_parallel=False,
-        rand_state=4444,
-        invalidate_cache=False,
+    refs = dict(
+        candidate_graph_steps(
+            store,
+            _artifact_ref(selected, "pca"),
+            neighbors_k=parameters.neighborsK,
+            resolution=parameters.leidenResolution,
+            operation_prefix="nativeDoublet",
+        )
     )
-    neighbors = diagnostic_call(
-        "core.nativeDoubletNeighbors",
-        store.query_neighbors,
-        ann,
-        coordinates=reduction,
-        k=parameters.neighborsK,
-        invalidate_cache=False,
-    )
-    graph = diagnostic_call(
-        "core.nativeDoubletGraph",
-        store.build_connectivity_map,
-        neighbors,
-        local_connectivity=1.0,
-        bandwidth=1.5,
-        invalidate_cache=False,
-    )
-    clusters = diagnostic_call(
-        "core.nativeDoubletPartition",
-        store.run_leiden_clustering,
-        graph,
-        resolution=parameters.leidenResolution,
-        backend="igraph",
-        symmetric_graph=False,
-        graph_upper_only=False,
-        random_seed=4444,
-        invalidate_cache=False,
-    )
-    return clusters, graph
+    return refs["clusters"], refs["connectivityMap"]
 
 
 def score_advisory_doublets(
@@ -1440,42 +1296,17 @@ def score_advisory_doublets(
             feat_scaling=True,
             invalidate_cache=False,
         )
-        ann = diagnostic_call(
-            "core.captureAnn",
-            store.build_ann_index,
-            reduction,
-            ann_metric="l2",
-            ann_parallel=False,
-            rand_state=4444,
-            invalidate_cache=False,
+        refs = dict(
+            candidate_graph_steps(
+                store,
+                reduction,
+                neighbors_k=neighbors_k,
+                resolution=selected.parameters.leidenResolution,
+                operation_prefix="capture",
+            )
         )
-        neighbors = diagnostic_call(
-            "core.captureNeighbors",
-            store.query_neighbors,
-            ann,
-            coordinates=reduction,
-            k=neighbors_k,
-            invalidate_cache=False,
-        )
-        graph = diagnostic_call(
-            "core.captureGraph",
-            store.build_connectivity_map,
-            neighbors,
-            local_connectivity=1.0,
-            bandwidth=1.5,
-            invalidate_cache=False,
-        )
-        clusters = diagnostic_call(
-            "core.capturePartition",
-            store.run_leiden_clustering,
-            graph,
-            resolution=selected.parameters.leidenResolution,
-            backend="igraph",
-            symmetric_graph=False,
-            graph_upper_only=False,
-            random_seed=4444,
-            invalidate_cache=False,
-        )
+        graph = refs["connectivityMap"]
+        clusters = refs["clusters"]
         scores.append(
             diagnostic_call(
                 "core.doubletDetection",
@@ -1579,12 +1410,21 @@ def _doublet_concentration(
     return max(enrichments, default=0.0)
 
 
-def _cross_unit_support(labels: np.ndarray, units: np.ndarray) -> float | None:
-    available_units = np.unique(units)
-    if len(available_units) < 2:
+def _cross_unit_support(
+    labels: np.ndarray,
+    recorded: np.ndarray,
+    units: np.ndarray,
+) -> float | None:
+    """Fraction of clusters observed in at least two recorded units.
+
+    A cluster whose cells all lack a unit label has no supporting unit.
+    """
+    if len(np.unique(units)) < 2:
         return None
+    recorded_labels = labels[recorded]
     supported = [
-        len(np.unique(units[labels == cluster])) >= 2 for cluster in np.unique(labels)
+        len(np.unique(units[recorded_labels == cluster])) >= 2
+        for cluster in np.unique(labels)
     ]
     return float(np.mean(supported)) if supported else None
 
@@ -1768,7 +1608,7 @@ def _subsample_partition_stability(
         leiden_membership,
         graph[selected][:, selected],
         resolution,
-        4444,
+        _RANDOM_SEED,
         backend="igraph",
     )
     return float(
@@ -1801,7 +1641,7 @@ def augment_cluster_evaluations(
     family_masks = {
         family: mask
         for family in dict.fromkeys([*nominated_families, *protected_families])
-        for mask in [_family_mask(marker_feature_names, family)]
+        for mask in [family_mask(marker_feature_names, family)]
         if mask is not None and bool(mask.any())
     }
     cell_columns = (
@@ -1944,7 +1784,7 @@ def augment_cluster_evaluations(
         marker_family_enrichment: dict[str, float] = {}
         protected_marker_families: list[str] = []
         for family, mask in family_masks.items():
-            marker_mask = _family_mask(marker_names, family)
+            marker_mask = family_mask(marker_names, family)
             marker_fraction = (
                 float(marker_mask.mean())
                 if marker_mask is not None and marker_mask.size
@@ -1980,7 +1820,8 @@ def augment_cluster_evaluations(
                 diagnostic_call(
                     "metric.crossUnitSupport",
                     _cross_unit_support,
-                    labels[recorded],
+                    labels,
+                    recorded,
                     units,
                 )
             ]
@@ -2149,7 +1990,7 @@ def augment_cluster_evaluations(
                 }
             )
         )
-    return annotate_candidate_dominance(augmented)
+    return tuple(augmented)
 
 
 __all__ = [

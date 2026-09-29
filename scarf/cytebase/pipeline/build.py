@@ -16,9 +16,18 @@ import zarr
 
 import scarf
 from scarf import inspect_h5ad
+from scarf.readers._h5ad_columns import (
+    column_encoding,
+    is_column,
+    is_table_column,
+    table_column_names,
+    table_members,
+)
 from scarf.storage.count_matrix import require_count_matrix_layout
+from scarf.storage.metadata_keys import metadata_column_keys
 from scarf.storage.profiles import is_remote_zarr_location
 from scarf.storage.stores import make_store
+from scarf.utils.logging import logger
 
 from .._storage import Bucket, dataset_prefix, retry
 from .models import DatasetRecord, Manifest
@@ -389,6 +398,34 @@ def _column_values(node: h5py.Group | h5py.Dataset) -> np.ndarray:
     raise ValueError(f"Unsupported metadata column encoding: {node.name}")
 
 
+def _obs_summary(obs: h5py.Group) -> dict[str, dict[str, Any]]:
+    """Summarize the obs columns that Scarf imports, by their Scarf name.
+
+    Columns are found through ``column-order`` as the H5AD reader finds them,
+    so a column whose name old AnnData versions nested into HDF5 groups at
+    each ``/`` is summarized. Each column is keyed by the name conversion
+    stores it under, which replaces ``/`` and ``\\`` with ``_``. Members that
+    are not decodable columns are skipped with the warning the H5AD reader
+    logs, since conversion drops them too.
+    """
+    members = table_members(obs).members
+    keys = metadata_column_keys(name for name, node in members if is_table_column(node))
+    summary = {}
+    for name, node in members:
+        if name == "observation_joinid":
+            continue
+        if not is_column(node):
+            logger.warning(
+                f"Skipping obs column {name!r} because its H5AD encoding "
+                f"{column_encoding(node)!r} is not supported"
+            )
+            continue
+        if name not in keys:
+            continue
+        summary[keys[name]] = _column_summary(node)
+    return summary
+
+
 def _column_summary(node: h5py.Group | h5py.Dataset) -> dict[str, Any]:
     values = _column_values(node)
     info = _column_info(node)
@@ -519,17 +556,16 @@ def inspect_file(
             "apiRawDataLocation": raw_data_location,
             "matrices": matrices,
             **{
-                key: {name: _column_info(node) for name, node in h5[key].items()}
+                key: {
+                    name: _column_info(node)
+                    for name, node in table_members(group).members
+                }
                 for key in ("obs", "var", "raw/var")
-                if key in h5
+                if isinstance(group := h5.get(key), h5py.Group)
             },
             **{key: list(h5.get(key, {})) for key in ("obsm", "varm", "obsp", "uns")},
         }
-        obs_summary = {
-            name: _column_summary(node)
-            for name, node in h5["obs"].items()
-            if name != "observation_joinid"
-        }
+        obs_summary = _obs_summary(h5["obs"])
     return {
         "manifest": manifest,
         "h5ad_keys": h5ad_keys,
@@ -699,7 +735,7 @@ def convert_local(
             return _needs_input(
                 record,
                 "The selected feature-name column is missing. Confirm the feature-name column.",
-                list(h5[inspection.featureAttrsKey]),
+                table_column_names(h5[inspection.featureAttrsKey]),
             )
         embedding_roles = {"X_umap": "umap"} if "obsm/X_umap" in h5 else {}
     record["conversion"]["embeddingRoles"] = embedding_roles

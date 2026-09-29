@@ -18,9 +18,8 @@ from ..metrics.cluster_selection import (
 from ..storage.artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
-    finish_artifact,
+    artifact_transaction,
     plan_artifact,
-    start_artifact,
 )
 from ..storage.artifacts import (
     ArtifactRef,
@@ -30,6 +29,7 @@ from ..storage.artifacts import (
 from ..storage.arrays import create_zarr_dataset
 from ..storage.errors import ArtifactResolutionError
 from ..storage.types import as_zarr_array
+from ..utils.arguments import integer_argument
 from ..utils.shutdown import shutdown_checkpoint
 
 _COORDINATE_OPERATIONS = {
@@ -39,11 +39,11 @@ _COORDINATE_OPERATIONS = {
 
 
 def cluster_label_array(root: zarr.Group, ref: ArtifactRef) -> zarr.Array:
+    """Return the label array of a Leiden cluster-label artifact."""
     group = artifact_group(root, ref)
-    name = "labels" if ref.kind == "cluster_cut" else "values"
-    if name not in group:
-        raise ValueError(f"Cluster candidate {ref!r} has no {name!r} array")
-    values = as_zarr_array(group[name], name=name)
+    if "values" not in group:
+        raise ValueError(f"Cluster candidate {ref!r} has no 'values' array")
+    values = as_zarr_array(group["values"], name="values")
     if values.ndim != 1:
         raise ValueError(f"Cluster candidate {ref!r} is not one-dimensional")
     if np.dtype(values.dtype).kind not in {"i", "u"}:
@@ -55,32 +55,8 @@ def cluster_label_values(root: zarr.Group, ref: ArtifactRef) -> np.ndarray:
     return np.asarray(cluster_label_array(root, ref)[:])
 
 
-def _artifact_input_ref(
-    status_inputs: Mapping[str, Any] | None,
-    name: str,
-    *,
-    owner: str,
-) -> ArtifactRef:
-    raw = (status_inputs or {}).get(name)
-    if not isinstance(raw, Mapping):
-        raise ValueError(f"{owner} has no {name!r} artifact input")
-    try:
-        return ArtifactRef.from_dict(raw)
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"{owner} has a malformed {name!r} artifact input") from error
-
-
 def _lineage_error(error: ArtifactResolutionError) -> ValueError:
     return ValueError(str(error))
-
-
-def _candidate_graph(
-    status_inputs: Mapping[str, Any] | None,
-    *,
-    key: str,
-) -> ArtifactRef:
-    owner = f"Cluster candidate {key!r}"
-    return _artifact_input_ref(status_inputs, "graph", owner=owner)
 
 
 def _validate_inputs(
@@ -158,17 +134,11 @@ def _validate_inputs(
             raise ValueError(
                 f"Cluster candidate {key!r} must reference a Leiden clustering artifact"
             )
-        candidate_selection = _artifact_input_ref(
-            status.inputs,
-            "cell_selection",
-            owner=f"Cluster candidate {key!r}",
-        )
-        if candidate_selection != cell_selection:
+        if status.input_ref("cell_selection") != cell_selection:
             raise ValueError(
                 f"Cluster candidate {key!r} does not use the requested cell selection"
             )
-        candidate_graph = _candidate_graph(status.inputs, key=key)
-        if candidate_graph != connectivity_map:
+        if status.input_ref("graph") != connectivity_map:
             raise ValueError(
                 f"Cluster candidate {key!r} was not partitioned from the "
                 "requested connectivity map"
@@ -183,15 +153,6 @@ def _validate_inputs(
     if len(candidate_keys) != len(set(candidate_keys)):
         raise ValueError("Cluster selection candidate keys must be unique")
     return scored, tuple(validated)
-
-
-def _validated_integer(value: object, name: str, *, minimum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int | np.integer):
-        raise TypeError(f"{name} must be an integer")
-    resolved = int(value)
-    if resolved < minimum:
-        raise ValueError(f"{name} must be at least {minimum}")
-    return resolved
 
 
 def _cluster_selection_reuse_validator(
@@ -291,13 +252,9 @@ def run_cluster_selection(
     min_cluster_quota: int = DEFAULT_MIN_CLUSTER_QUOTA,
 ) -> tuple[ArtifactRef, str, ArtifactRef]:
     """Validate, score, and persist one bounded cluster-selection decision."""
-    seed = _validated_integer(seed, "seed", minimum=0)
-    max_sample_size = _validated_integer(
-        max_sample_size,
-        "max_sample_size",
-        minimum=1,
-    )
-    min_cluster_quota = _validated_integer(
+    seed = integer_argument(seed, "seed", minimum=0)
+    max_sample_size = integer_argument(max_sample_size, "max_sample_size", minimum=1)
+    min_cluster_quota = integer_argument(
         min_cluster_quota,
         "min_cluster_quota",
         minimum=1,
@@ -396,32 +353,31 @@ def run_cluster_selection(
         checkpoint=shutdown_checkpoint,
         sample_indices=sample_indices,
     )
-    group = start_artifact(store.zw, planned)
-    sample_array = create_zarr_dataset(
-        group,
-        "sample_indices",
-        (min(result.sample_size, 100_000),),
-        np.int64,
-        result.sample_indices.shape,
-    )
-    sample_array[:] = result.sample_indices
-    score_array = create_zarr_dataset(
-        group,
-        "scores",
-        (max(1, len(result.candidate_keys)),),
-        np.float64,
-        result.scores.shape,
-    )
-    score_array[:] = result.scores
-    group.attrs.update(
-        {
-            "candidateKeys": list(result.candidate_keys),
-            "candidateRefs": [ref.to_dict() for ref in candidate_refs],
-            "invalidReasons": list(result.invalid_reasons),
-            "selectedKey": result.selected_key,
-            "sampleDefinition": dict(result.sample_definition),
-            "tieOrder": list(result.tie_order),
-        }
-    )
-    finish_artifact(group, planned)
+    with artifact_transaction(store.zw, planned) as group:
+        sample_array = create_zarr_dataset(
+            group,
+            "sample_indices",
+            (min(result.sample_size, 100_000),),
+            np.int64,
+            result.sample_indices.shape,
+        )
+        sample_array[:] = result.sample_indices
+        score_array = create_zarr_dataset(
+            group,
+            "scores",
+            (max(1, len(result.candidate_keys)),),
+            np.float64,
+            result.scores.shape,
+        )
+        score_array[:] = result.scores
+        group.attrs.update(
+            {
+                "candidateKeys": list(result.candidate_keys),
+                "candidateRefs": [ref.to_dict() for ref in candidate_refs],
+                "invalidReasons": list(result.invalid_reasons),
+                "selectedKey": result.selected_key,
+                "sampleDefinition": dict(result.sample_definition),
+                "tieOrder": list(result.tie_order),
+            }
+        )
     return planned.ref, result.selected_key, refs_by_key[result.selected_key]

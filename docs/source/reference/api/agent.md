@@ -93,16 +93,18 @@ result = runner.run(AutomatedWorkflowRequest(
 ```
 
 The advanced interface exposes numerical limits, provider limits, existing-store workspaces, and
-explicit pauses. Inspect its returned status and questions before continuing. The example sets
-`scoreDoublets=False` to match the beginner call. The advanced configuration retains
-`scoreDoublets=True` as its default, including for compatible older saved configurations.
+explicit pauses. Inspect its returned status and questions before continuing. Resume answers are
+validated before any stage records them; an answer that a stage still rejects leaves that question
+open for a corrected answer. The example sets `scoreDoublets=False` to match the beginner call. The
+advanced configuration retains `scoreDoublets=True` as its default. The saved configuration
+includes `agentRunConfig.extraModelSettings`, so those settings reject credentials and headers;
+configure them on the provider instead.
 
 ### Screening and work limits
 
 `screeningCells=None` selects automatic sampling: 10% of the QC-retained cohort, rounded up,
 bounded to 10,000–100,000 cells, and capped by the retained population. An integer of at least 20 sets
-a fixed-size override. A compatible saved integer keeps its exact meaning on resume; the new
-default does not resize an existing screening population.
+a fixed-size override. A resumed workflow keeps its saved screening setting.
 
 | Default allowance | Limit |
 |---|---:|
@@ -139,7 +141,7 @@ The stage journal owns requests, committed evidence, validated decisions, ration
 references. Failed model attempts retain available usage and validation feedback. History
 separates attempted and completed operation calls from restored evidence and confirmed reuse.
 Counts of saved artifacts do not establish how many computations ran: a core call may itself
-reuse work, and older histories without operation records have unknown counts, not zero.
+reuse work.
 
 Compatible histories can append a context-evidence revision when a requested joint or
 conditional question was unanswered. Previous records remain immutable; changed scientific

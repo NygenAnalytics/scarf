@@ -8,6 +8,8 @@ import numpy as np
 import pandas as pd
 
 from ...datastore.datastore import DataStore
+from ...features.gene_families import GENE_FAMILY_PATTERNS, gene_family_mask
+from ...metadata.rows import metadata_column_fingerprint
 from ...metadata.selection import resolve_cell_aligned_artifact
 from ...storage.selections import read_stored_selection_indices
 from ...storage.types import as_zarr_array
@@ -21,10 +23,7 @@ from ..parameter_tuning.contracts import (
     ParameterCandidateEvaluation,
     ParameterTuningReport,
 )
-from ..parameter_tuning.execution import (
-    _metadata_column_fingerprint,
-    candidate_metric_cache,
-)
+from ..parameter_tuning.execution import candidate_metric_cache
 from ..tools import mark_missing_rows, read_marked_metadata_rows
 from ..types import ArtifactReferenceModel
 from . import journal
@@ -40,7 +39,6 @@ from .models import (
     WorkflowQuestion,
     WorkflowStageAttempt,
     WorkflowStageLink,
-    WorkflowStageName,
 )
 
 
@@ -506,36 +504,22 @@ def _analysis_visual_content(
                         score,
                     )
 
-            def tagged_gene(gene: str) -> str:
-                upper = gene.upper()
-                if upper.startswith("MT-"):
-                    return f"{gene} [mitochondrial]"
-                if upper.startswith(("MRPS", "MRPL")):
-                    return f"{gene} [mitoribosomal]"
-                if upper.startswith(("RPS", "RPL")):
-                    return f"{gene} [ribosomal]"
-                if upper.startswith("CCN"):
-                    return f"{gene} [CCN]"
-                if upper.startswith("HLA-"):
-                    return f"{gene} [HLA]"
-                if upper.startswith("H2-"):
-                    return f"{gene} [H2]"
-                if upper.startswith("HIST"):
-                    return f"{gene} [histone]"
-                if upper in {
-                    "XIST",
-                    "DDX3Y",
-                    "USP9Y",
-                    "EIF1AY",
-                    "KDM5D",
-                    "SRY",
-                    "ZFY",
-                    "UTY",
-                    "TMSB4Y",
-                    "NLGN4Y",
-                }:
-                    return f"{gene} [sex-linked]"
-                return gene
+            # Each gene carries the first registered family it belongs to.
+            gene_families = {
+                family: gene_family_mask(marker_genes, family)
+                for family in GENE_FAMILY_PATTERNS
+            }
+            tagged_genes = [
+                next(
+                    (
+                        f"{gene} [{family}]"
+                        for family, members in gene_families.items()
+                        if members[index]
+                    ),
+                    gene,
+                )
+                for index, gene in enumerate(marker_genes)
+            ]
 
             marker_figure = Figure(
                 figsize=(max(9, len(marker_genes) * 0.45), 6),
@@ -550,7 +534,7 @@ def _analysis_visual_content(
             )
             marker_axis.set_xticks(
                 np.arange(len(marker_genes)),
-                [tagged_gene(gene) for gene in marker_genes],
+                tagged_genes,
                 rotation=75,
                 ha="right",
                 fontsize=8,
@@ -782,17 +766,14 @@ class TuningStagesMixin(DecisionStagesMixin):
         plan: AutomatedPreprocessingPlan,
         preprocessed: Sequence[PreprocessedAssayHandoff],
         experimental: ExperimentalContextResult,
-        enrichment_reference: StageEvidenceReference,
         experimental_reference: StageEvidenceReference,
         answers: Mapping[str, Any],
         *,
         study_contract: StudyContract | None = None,
         resume_record: OrchestrationResumeRecord | None = None,
-        stage_name: WorkflowStageName = "parameter_tuning",
     ) -> tuple[WorkflowStageAttempt, ParameterTuningReport]:
-        from .rna_tuning import RnaTuningRun
+        from .rna_tuning import RnaTuningRun, TuningAnswerRejected
 
-        del enrichment_reference
         if len(preprocessed) != 1 or study_contract is None:
             raise ValueError("RNA tuning requires one assay and a study contract")
         handoff = preprocessed[0]
@@ -809,13 +790,13 @@ class TuningStagesMixin(DecisionStagesMixin):
             columns.add(study_contract.physicalCaptureColumn)
         available = set(store.cells.columns) if columns else set()
         metadata_fingerprints = {
-            column: _metadata_column_fingerprint(store.cells, column)
+            column: metadata_column_fingerprint(store.cells, column)
             for column in sorted(columns)
             if column in available
         }
         feature_metadata = store.get_assay(plan.primaryAssay).feats
         feature_fingerprints = {
-            column: _metadata_column_fingerprint(feature_metadata, column)
+            column: metadata_column_fingerprint(feature_metadata, column)
             for column in ("ids", "names")
         }
         inputs = {
@@ -832,13 +813,15 @@ class TuningStagesMixin(DecisionStagesMixin):
             request_record,
             experimental_reference,
             inputs,
-            journal._stage_starts(store.zw, prefix, workflow.workflowRunId, stage_name),
+            journal._stage_starts(
+                store.zw, prefix, workflow.workflowRunId, "parameter_tuning"
+            ),
         )
         existing = journal._validated_done_outcome(
             store,
             prefix,
             workflow.workflowRunId,
-            stage_name,
+            "parameter_tuning",
             request_record,
             parents,
         )
@@ -851,7 +834,7 @@ class TuningStagesMixin(DecisionStagesMixin):
             store.zw,
             prefix,
             workflow.workflowRunId,
-            stage_name,
+            "parameter_tuning",
             request_record,
             parents,
             inputs=inputs,
@@ -923,6 +906,24 @@ class TuningStagesMixin(DecisionStagesMixin):
             )
             journal._save_outcome(store.zw, prefix, outcome)
             return outcome, report
+        except TuningAnswerRejected as exc:
+            # A rejected answer keeps the review open for a corrected answer.
+            outcome = journal._complete_attempt(
+                started,
+                status="needsInput",
+                outputs={"tuningEvidence": runner.summary()},
+                needs_input=WorkflowNeedsInput(
+                    questions=[
+                        WorkflowQuestion(
+                            questionId="parameter_tuning",
+                            question=f"{exc} Provide a corrected assessment.",
+                        )
+                    ]
+                ),
+                notes=[str(exc)],
+            )
+            journal._save_outcome(store.zw, prefix, outcome)
+            return outcome, ParameterTuningReport.get_blank()
         except Exception as exc:
             outcome = journal.finish_exception(
                 store,

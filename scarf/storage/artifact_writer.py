@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -10,6 +10,7 @@ import numpy as np
 import zarr
 from zarr.errors import ContainsArrayError, ContainsGroupError
 
+from ..utils.logging import logger
 from .artifacts import (
     ArtifactRef,
     ArtifactScope,
@@ -77,48 +78,6 @@ class PlannedArtifact:
     required_arrays: tuple[Any, ...]
     required_attributes: tuple[Any, ...]
     reuse_validator: Callable[[ArtifactRef, zarr.Group], bool] | None
-
-    def invalidated(
-        self,
-        root: zarr.Group,
-        *,
-        required_arrays: tuple[Any, ...] | None = None,
-        required_attributes: tuple[Any, ...] | None = None,
-        reuse_validator: Callable[[ArtifactRef, zarr.Group], bool] | None = None,
-    ) -> "PlannedArtifact":
-        if not isinstance(self.provenance, dict):
-            raise TypeError("PlannedArtifact provenance must be a mapping")
-        operation = self.provenance.get("operation")
-        parameters = self.provenance.get("parameters")
-        inputs = self.provenance.get("inputs")
-        if (
-            not isinstance(operation, str)
-            or not isinstance(parameters, dict)
-            or not isinstance(inputs, dict)
-        ):
-            raise TypeError("PlannedArtifact provenance is incomplete for invalidation")
-        return plan_artifact(
-            root,
-            scope=self.ref.scope,
-            assay=self.ref.assay,
-            kind=self.ref.kind,
-            operation=operation,
-            parameters=parameters,
-            inputs=inputs,
-            execution_options=dict(self.execution_options),
-            invalidate_cache=True,
-            required_arrays=(
-                self.required_arrays if required_arrays is None else required_arrays
-            ),
-            required_attributes=(
-                self.required_attributes
-                if required_attributes is None
-                else required_attributes
-            ),
-            reuse_validator=(
-                self.reuse_validator if reuse_validator is None else reuse_validator
-            ),
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,8 +242,18 @@ def plan_artifact(
 
 
 def start_artifact(root: zarr.Group, planned: PlannedArtifact) -> zarr.Group:
+    """Create the incomplete group of a planned artifact.
+
+    Raises:
+        PermissionError: If ``root`` is read-only. Nothing is written.
+    """
     if planned.reused:
         raise ValueError("Cannot start a reused artifact")
+    if root.read_only:
+        raise PermissionError(
+            f"{planned.provenance['operation']} requires a DataStore opened "
+            "with zarr_mode='r+'"
+        )
     path = artifact_path(planned.ref)
     from .. import __version__
 
@@ -339,6 +308,39 @@ def finish_artifact(
     ):
         raise ValueError("Artifact payload does not satisfy its reuse contract")
     group.attrs["complete"] = True
+
+
+def discard_artifact(root: zarr.Group, planned: PlannedArtifact) -> None:
+    """Delete the incomplete group of a started artifact after a failed write.
+
+    A deletion failure is logged, not raised, so the write's own error is the
+    one that propagates.
+    """
+    path = artifact_path(planned.ref)
+    try:
+        del root[path]
+    except Exception as error:
+        logger.warning(f"Could not remove the incomplete artifact at {path}: {error}")
+
+
+@contextmanager
+def artifact_transaction(
+    root: zarr.Group,
+    planned: PlannedArtifact,
+) -> Iterator[zarr.Group]:
+    """Start a planned artifact, yield its group, and finish it after the body.
+
+    If the body or the finish raises, including ``KeyboardInterrupt``, the
+    started group is deleted before the error propagates, so a failed write
+    leaves no incomplete artifact behind.
+    """
+    group = start_artifact(root, planned)
+    try:
+        yield group
+        finish_artifact(group, planned)
+    except BaseException:
+        discard_artifact(root, planned)
+        raise
 
 
 def reused_artifact_group(

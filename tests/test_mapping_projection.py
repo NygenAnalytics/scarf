@@ -30,6 +30,12 @@ from scarf.storage.errors import ArtifactResolutionError
 from scarf.storage.selections import resolve_generated_selection_artifact
 
 
+def _assert_aborted(writer: ProjectionWriter) -> None:
+    indices, distances, uninformative = _blocks()
+    with pytest.raises(RuntimeError, match="Projection writer is aborted"):
+        writer.write_block(0, indices[:1], distances[:1], uninformative[:1])
+
+
 def _selection(
     root: zarr.Group,
     *,
@@ -355,12 +361,10 @@ def test_projection_writer_persists_exact_contract_and_loads_copies() -> None:
     indices, distances, uninformative = _blocks()
     writer = ProjectionWriter(root, plan, chunk_rows=2)
     assert writer.ref == plan.ref
-    assert writer.next_row == 0
     assert not inspect_artifact(root, plan.ref).complete
     writer.write_block(0, indices[:1], distances[:1], uninformative[:1])
     writer.write_block(1, indices[1:3], distances[1:3], uninformative[1:3])
     writer.write_block(3, indices[3:], distances[3:], uninformative[3:])
-    assert writer.next_row == 4
     assert writer.finish(_diagnostics()) == plan.ref
     assert writer.finished
     with pytest.raises(RuntimeError, match="already finished"):
@@ -510,8 +514,7 @@ def test_projection_writer_aborts_after_invalid_block(
     with pytest.raises((TypeError, ValueError), match=message):
         writer.write_block(0, indices, distances, uninformative)
 
-    assert writer.aborted
-    assert not inspect_artifact(root, plan.ref).complete
+    assert not inspect_artifact(root, plan.ref).exists
     with pytest.raises(RuntimeError, match="aborted"):
         writer.finish(_diagnostics())
 
@@ -536,7 +539,7 @@ def test_projection_writer_constructor_and_start_failures_leave_incomplete_artif
     )
     with pytest.raises(RuntimeError, match="injected array creation failure"):
         ProjectionWriter(root, first, chunk_rows=2)
-    assert not inspect_artifact(root, first.ref).complete
+    assert not inspect_artifact(root, first.ref).exists
 
     monkeypatch.undo()
     second = _plan(
@@ -550,8 +553,8 @@ def test_projection_writer_constructor_and_start_failures_leave_incomplete_artif
     indices, distances, uninformative = _blocks()
     with pytest.raises(TypeError, match="start must be an integer"):
         writer.write_block(True, indices[:1], distances[:1], uninformative[:1])
-    assert writer.aborted
-    assert not inspect_artifact(root, second.ref).complete
+    _assert_aborted(writer)
+    assert not inspect_artifact(root, second.ref).exists
 
 
 def test_projection_writer_requires_contiguous_complete_coverage_and_can_abort() -> (
@@ -566,8 +569,8 @@ def test_projection_writer_requires_contiguous_complete_coverage_and_can_abort()
     writer.write_block(0, indices[:2], distances[:2], uninformative[:2])
     with pytest.raises(ValueError, match="wrote 2 of 4"):
         writer.finish(_diagnostics())
-    assert writer.aborted
-    assert not inspect_artifact(root, plan.ref).complete
+    _assert_aborted(writer)
+    assert not inspect_artifact(root, plan.ref).exists
 
     second_plan = _plan(
         root,
@@ -578,8 +581,7 @@ def test_projection_writer_requires_contiguous_complete_coverage_and_can_abort()
     )
     second = ProjectionWriter(root, second_plan, chunk_rows=2)
     second.abort()
-    assert second.aborted
-    assert not inspect_artifact(root, second_plan.ref).complete
+    assert not inspect_artifact(root, second_plan.ref).exists
     with pytest.raises(RuntimeError, match="aborted"):
         second.write_block(0, indices, distances, uninformative)
 
@@ -593,7 +595,7 @@ def test_projection_writer_requires_contiguous_complete_coverage_and_can_abort()
     third = ProjectionWriter(root, third_plan, chunk_rows=2)
     with pytest.raises(ValueError, match="expected 0, received 1"):
         third.write_block(1, indices[:1], distances[:1], uninformative[:1])
-    assert third.aborted
+    _assert_aborted(third)
 
 
 def test_projection_writer_reuses_only_a_valid_complete_artifact() -> None:
@@ -720,7 +722,7 @@ def test_projection_finish_rejects_diagnostics_inconsistent_with_rows() -> None:
     with pytest.raises(ValueError, match="number of uninformative"):
         writer.finish(_diagnostics(uninformative_cell_count=1))
 
-    assert not inspect_artifact(root, plan.ref).complete
+    assert not inspect_artifact(root, plan.ref).exists
 
 
 @pytest.mark.parametrize(
@@ -753,8 +755,8 @@ def test_projection_finish_rejects_invalid_diagnostics_and_aborts(
     with pytest.raises((TypeError, ValueError), match=message):
         writer.finish(diagnostics)
 
-    assert writer.aborted
-    assert not inspect_artifact(root, plan.ref).complete
+    _assert_aborted(writer)
+    assert not inspect_artifact(root, plan.ref).exists
 
 
 def _manual_projection(
@@ -1041,6 +1043,33 @@ def test_projection_written_without_the_dispersion_diagnostic_is_rejected() -> N
         load_projection(root, ref, reference=reference)
 
 
+def test_projection_loader_keeps_the_cause_and_propagates_other_errors(
+    monkeypatch,
+) -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    ref = _write(
+        root,
+        _plan(root, cell_selection, feature_selection, reference.external_ref),
+    )
+    group = artifact_group(root, ref)
+    diagnostics = dict(group.attrs["diagnostics"])
+    del diagnostics["queryScaledDispersion"]
+    group.attrs["diagnostics"] = diagnostics
+
+    with pytest.raises(ValueError, match="Re-run run_mapping") as caught:
+        load_projection(root, ref, reference=reference)
+    assert isinstance(caught.value.__cause__, ValueError)
+    assert "queryScaledDispersion" in str(caught.value.__cause__)
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("injected loader failure")
+
+    monkeypatch.setattr(projection_storage, "_validate_payload", fail)
+    with pytest.raises(RuntimeError, match="injected loader failure"):
+        load_projection(root, ref, reference=reference)
+
+
 def test_projection_loader_validates_and_matches_provided_reference() -> None:
     root, cell_selection, feature_selection = _query_inputs()
     reference, _ = _mapping_reference()
@@ -1200,7 +1229,7 @@ def test_plan_projection_rejects_empty_string_arguments() -> None:
             reference=reference,
             reference_cell_count=3,
         )
-    with pytest.raises(ValueError, match="save_k must be positive"):
+    with pytest.raises(ValueError, match="save_k must be at least 1"):
         plan_projection(
             root,
             query_assay="RNA",
@@ -1248,7 +1277,7 @@ def test_plan_projection_rejects_selection_reference_and_count_mismatches() -> N
             missing_feature_policy="guess",
         )
     with pytest.raises(
-        ValueError, match="cell_selection.*wrong artifact kind or scope"
+        ArtifactResolutionError, match="Expected datastore-scoped cell_selection"
     ):
         _plan(
             root,

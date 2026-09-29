@@ -150,7 +150,11 @@ def knn_clustering(
     import pandas as pd
     from scipy.sparse import csr_matrix
 
-    from ..neighbors.index import fix_knn_query, instantiate_knn_index
+    from ..neighbors.stages import (
+        AnnIndexStage,
+        ChunkedCoordinateStream,
+        NeighborQueryStage,
+    )
     from ..utils.compute import compute_with_progress
 
     if len(d_array.shape) != 2:
@@ -180,27 +184,19 @@ def knn_clustering(
         k: int,
         threads: int,
     ) -> "csr_matrix":
+        stream = ChunkedCoordinateStream(data, threads)
         logger.debug("Pseudotime modules: fitting feature KNN")
-        for block in data.stream_blocks(nthreads=threads, msg="Fitting feature KNN"):
-            if not np.isfinite(block).all():
-                raise ValueError("Feature profiles must contain only finite values")
-            ann_idx.add_items(block)
-        start, end = 0, 0
+        AnnIndexStage.populate(ann_idx, stream)
+        query = NeighborQueryStage(ann_idx, k, str(default_ann_params["space"]))
+        start = 0
         neighbor_indices: list[np.ndarray] = []
         logger.debug("Pseudotime modules: querying feature KNN")
-        for block in data.stream_blocks(
-            nthreads=threads,
-            msg="Identifying feature neighbors",
-        ):
-            end += block.shape[0]
-            indices, distances = ann_idx.knn_query(block, k=k + 1)
-            indices, _, _ = fix_knn_query(
-                indices,
-                distances,
-                np.arange(start, end),
+        for block in stream.iter_coordinate_blocks("Identifying feature neighbors"):
+            stop = start + block.shape[0]
+            neighbor_indices.append(
+                query.query(block, self_indices=np.arange(start, stop))[0]
             )
-            neighbor_indices.append(indices)
-            start = end
+            start = stop
         indices_mat = np.vstack(neighbor_indices)
         assert indices_mat.shape[0] == data.shape[0]
 
@@ -269,14 +265,14 @@ def knn_clustering(
     default_ann_params.setdefault("max_elements", d_array.shape[0])
     if int(default_ann_params["max_elements"]) < int(d_array.shape[0]):
         raise ValueError("ann_params.max_elements is smaller than the feature count")
-    ann_idx = instantiate_knn_index(
-        space=str(default_ann_params["space"]),
-        dim=int(default_ann_params["dim"]),
-        max_elements=int(default_ann_params["max_elements"]),
+    ann_idx = AnnIndexStage.create(
+        metric=str(default_ann_params["space"]),
+        dims=int(default_ann_params["dim"]),
+        n_cells=int(default_ann_params["max_elements"]),
         ef_construction=int(default_ann_params["ef_construction"]),
-        M=int(default_ann_params["M"]),
-        random_seed=int(default_ann_params["random_seed"]),
         ef=int(default_ann_params["ef"]),
+        m=int(default_ann_params["M"]),
+        rand_state=int(default_ann_params["random_seed"]),
         nthreads=int(default_ann_params["num_threads"]),
     )
     return fix_cluster_order(

@@ -1,4 +1,3 @@
-import hashlib
 import json
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -7,7 +6,7 @@ from typing import Any, Literal, cast
 
 import numpy as np
 
-from ...metadata.rows import iter_metadata_column_blocks, metadata_missing_mask
+from ...metadata.rows import metadata_column_fingerprint
 from ...metrics import graph_connectivity
 from ...storage.refs import ArtifactRef
 from ...storage.types import as_zarr_array
@@ -112,30 +111,7 @@ def _metric_metadata_key(store: Any, column: str) -> str | None:
     """Fingerprint live metric inputs so edits cannot reuse stale evidence."""
     if _METRIC_CACHE.get() is None:
         return None
-    return _metadata_column_fingerprint(store.cells, column)
-
-
-def _metadata_column_fingerprint(metadata: Any, column: str) -> str:
-    """Hash metadata values in bounded blocks, including scalar type identity."""
-    digest = hashlib.sha256()
-    for block in iter_metadata_column_blocks(metadata, column):
-        digest.update(str(block.dtype).encode())
-        digest.update(str(block.shape).encode())
-        digest.update(
-            json.dumps(
-                [(type(value).__name__, repr(value)) for value in block.tolist()]
-            ).encode()
-            if block.dtype.hasobject
-            else block.tobytes()
-        )
-    missing = metadata_missing_mask(metadata, column)
-    digest.update(b"missing:none" if missing is None else b"missing:present")
-    if missing is not None:
-        for start in range(0, len(missing), 65_536):
-            digest.update(
-                np.asarray(missing[start : start + 65_536], dtype=bool).tobytes()
-            )
-    return digest.hexdigest()
+    return metadata_column_fingerprint(store.cells, column)
 
 
 def normalized_artifact_shape(store: Any, normalized: Any) -> tuple[int, int]:
@@ -158,10 +134,8 @@ def normalized_artifact_shape(store: Any, normalized: Any) -> tuple[int, int]:
 def validate_parameter_candidate_rank(
     candidate: ParameterCandidate,
     normalized_shape: tuple[int, int],
-    *,
-    identity_feature_limit: int = 64,
 ) -> int:
-    """Validate a candidate before any branch operation and return output rank."""
+    """Validate a candidate before any branch operation and return its PCA rank."""
 
     n_cells, n_features = normalized_shape
     if candidate.neighborsK >= n_cells:
@@ -169,81 +143,77 @@ def validate_parameter_candidate_rank(
             f"neighborsK={candidate.neighborsK} requires more than "
             f"{candidate.neighborsK} selected cells; observed {n_cells}"
         )
-    if candidate.reductionMethod == "pca":
-        if candidate.dimensions + 1 > min(n_cells, n_features):
-            raise ValueError(
-                f"PCA dimensions={candidate.dimensions} requires at least "
-                f"{candidate.dimensions + 1} cells and selected features; "
-                f"observed shape {normalized_shape}"
-            )
-        return candidate.dimensions
-    if candidate.reductionMethod == "lsi":
-        required_rank = candidate.dimensions + 1
-        if required_rank > min(n_cells, n_features):
-            raise ValueError(
-                "LSI dimensions, including the skipped component, exceed the "
-                f"normalized matrix rank for shape {normalized_shape}"
-            )
-        return candidate.dimensions
-    if n_features > identity_feature_limit:
+    if candidate.dimensions + 1 > min(n_cells, n_features):
         raise ValueError(
-            f"Identity reduction supports at most {identity_feature_limit} selected "
-            f"features; observed {n_features}"
+            f"PCA dimensions={candidate.dimensions} requires at least "
+            f"{candidate.dimensions + 1} cells and selected features; "
+            f"observed shape {normalized_shape}"
         )
-    if candidate.dimensions != n_features:
-        raise ValueError(
-            "Identity reduction dimensions must equal the exact normalized feature "
-            f"count {n_features}; received {candidate.dimensions}"
-        )
-    return n_features
+    return candidate.dimensions
 
 
-def run_candidate_reduction(
+def candidate_graph_steps(
     store: Any,
+    coordinates: Any,
     *,
-    normalized: Any,
-    candidate: ParameterCandidate,
-    normalized_shape: tuple[int, int],
-    identity_feature_limit: int = 64,
-) -> tuple[Any, str, int]:
-    """Run one validated modality-aware reduction with public Scarf methods."""
+    neighbors_k: int,
+    resolution: float,
+    operation_prefix: str = "",
+) -> Iterator[tuple[str, Any]]:
+    """Build one candidate's ANN index, neighbors, graph and Leiden partition.
 
-    effective_dimensions = validate_parameter_candidate_rank(
-        candidate,
-        normalized_shape,
-        identity_feature_limit=identity_feature_limit,
-    )
-    if candidate.reductionMethod == "pca":
-        ref = diagnostic_call(
-            "core.pca",
-            store.run_pca,
-            normalized,
-            dims=candidate.dimensions,
-            feat_scaling=True,
-            show_elbow_plot=False,
-            invalidate_cache=False,
-        )
-        return ref, "pca", effective_dimensions
-    if candidate.reductionMethod == "lsi":
-        ref = diagnostic_call(
-            "core.lsi",
-            store.run_lsi,
-            normalized,
-            dims=candidate.dimensions,
-            skip_first=True,
-            rand_state=_PCA_RANDOM_SEED,
-            invalidate_cache=False,
-        )
-        return ref, "lsi", effective_dimensions
-    loadings = np.eye(normalized_shape[1], dtype=np.float64)
-    ref = diagnostic_call(
-        "core.customReduction",
-        store.run_custom_reduction,
-        loadings,
-        normalized,
+    Each completed artifact is yielded under its candidate artifact name. Every
+    branch uses these fixed settings, so a rebuilt graph matches the graph that
+    candidate execution produces for the same parameters.
+    """
+
+    def operation(step: str) -> str:
+        if operation_prefix:
+            return f"core.{operation_prefix}{step}"
+        return f"core.{step.lower()}"
+
+    ann = diagnostic_call(
+        operation("Ann"),
+        store.build_ann_index,
+        coordinates,
+        ann_metric="l2",
+        ann_parallel=False,
+        rand_state=_PCA_RANDOM_SEED,
         invalidate_cache=False,
     )
-    return ref, "identity", effective_dimensions
+    yield "annIndex", ann
+    neighbors = diagnostic_call(
+        operation("Neighbors"),
+        store.query_neighbors,
+        ann,
+        coordinates=coordinates,
+        k=neighbors_k,
+        invalidate_cache=False,
+    )
+    yield "neighbors", neighbors
+    graph = diagnostic_call(
+        operation("Graph"),
+        store.build_connectivity_map,
+        neighbors,
+        local_connectivity=1.0,
+        bandwidth=1.5,
+        invalidate_cache=False,
+    )
+    yield "connectivityMap", graph
+    yield (
+        "clusters",
+        diagnostic_call(
+            operation("Partition"),
+            store.run_leiden_clustering,
+            graph,
+            resolution=resolution,
+            backend="igraph",
+            symmetric_graph=False,
+            graph_upper_only=False,
+            random_seed=_RANDOM_SEED,
+            invalidate_cache=False,
+        ),
+    )
 
 
 def _bounded_membership_summary(
@@ -414,43 +384,42 @@ def _collect_parameter_candidate_metrics(
     except (KeyError, TypeError, ValueError) as exc:
         warnings.append(f"Graph silhouette unavailable: {exc}")
 
-    if candidate.reductionMethod == "pca":
-        try:
+    try:
 
-            def separability_values() -> dict[str, Any]:
-                separability = diagnostic_call(
-                    "core.clusterSeparability",
-                    store.metric_cluster_separability,
-                    reduction_ref,
-                    {cluster_column: cluster_ref},
-                    random_seed=_RANDOM_SEED,
-                )
-                table = separability.clustering_scores
-                rows = table.loc[table["clustering"] == cluster_column]
-                return dict(rows.iloc[0]) if len(rows) else {}
-
-            row = _cached_candidate_metric(
-                (
-                    id(store),
-                    "cluster_separability",
-                    reduction_ref,
-                    cluster_ref,
-                    _RANDOM_SEED,
-                ),
-                separability_values,
+        def separability_values() -> dict[str, Any]:
+            separability = diagnostic_call(
+                "core.clusterSeparability",
+                store.metric_cluster_separability,
+                reduction_ref,
+                {cluster_column: cluster_ref},
+                random_seed=_RANDOM_SEED,
             )
-            if row:
-                for field_name, column_name, evidence_name in (
-                    ("pcaSilhouette", "silhouette_score", "pcaSilhouette"),
-                    ("macroF1", "macro_f1_mean", "macroF1"),
-                    ("weightedF1", "weighted_f1_mean", "weightedF1"),
-                ):
-                    value = row[column_name]
-                    if value is not None and np.isfinite(float(value)):
-                        setattr(metrics, field_name, float(value))
-                        evidence_ids.append(f"candidate:{candidate_id}:{evidence_name}")
-        except (KeyError, TypeError, ValueError) as exc:
-            warnings.append(f"PCA cluster separability unavailable: {exc}")
+            table = separability.clustering_scores
+            rows = table.loc[table["clustering"] == cluster_column]
+            return dict(rows.iloc[0]) if len(rows) else {}
+
+        row = _cached_candidate_metric(
+            (
+                id(store),
+                "cluster_separability",
+                reduction_ref,
+                cluster_ref,
+                _RANDOM_SEED,
+            ),
+            separability_values,
+        )
+        if row:
+            for field_name, column_name, evidence_name in (
+                ("pcaSilhouette", "silhouette_score", "pcaSilhouette"),
+                ("macroF1", "macro_f1_mean", "macroF1"),
+                ("weightedF1", "weighted_f1_mean", "weightedF1"),
+            ):
+                value = row[column_name]
+                if value is not None and np.isfinite(float(value)):
+                    setattr(metrics, field_name, float(value))
+                    evidence_ids.append(f"candidate:{candidate_id}:{evidence_name}")
+    except (KeyError, TypeError, ValueError) as exc:
+        warnings.append(f"PCA cluster separability unavailable: {exc}")
 
     _collect_covariate_metrics(
         deps,
@@ -597,7 +566,13 @@ def _collect_covariate_metrics(
         for columns in deps.protectedCombinations:
             name = "joint:" + json.dumps(list(columns), separators=(",", ":"))
             metadata_key = tuple(live_metadata_key(column) for column in columns)
-            labels = combination_labels(bound_cells, columns)
+            try:
+                labels = combination_labels(bound_cells, columns)
+            except ValueError as exc:
+                warnings.append(
+                    f"Joint preservation for {list(columns)!r} is unavailable: {exc}"
+                )
+                continue
             scores = _cached_candidate_metric(
                 (
                     id(store),
@@ -654,6 +629,7 @@ def refresh_candidate_design_evidence(
         "Batch mixing for ",
         "cLISI for ",
         "Graph connectivity for ",
+        "Joint preservation for ",
         "Matched graph preservation for continuous column ",
     )
     evaluation.warnings = [
@@ -707,7 +683,6 @@ def execute_parameter_candidate(
             )
             return ParameterCandidateEvaluation(
                 candidateId=candidate_id,
-                phase=deps.candidatePhases.get(candidate_id, "initial"),
                 harmonyBatchColumns=(
                     list(deps.batchColumns)
                     if deps.candidates[candidate_id].useHarmony
@@ -722,26 +697,11 @@ def execute_parameter_candidate(
         deps.executionOrder.append(candidate_id)
         logger.debug(f"Executing candidate {candidate_id!r} for {deps.fromAssay!r}")
         logger.info(
-            f"Comparing settings for {deps.fromAssay}: {candidate.reductionMethod.upper()} "
+            f"Comparing settings for {deps.fromAssay}: PCA "
             f"dimensions={candidate.dimensions}, neighbors={candidate.neighborsK}, "
             f"resolution={candidate.leidenResolution}, "
             f"harmony={candidate.useHarmony}"
         )
-        if candidate.useHarmony and not deps.batchColumns:
-            logger.warning(
-                f"Parameter candidate {candidate_id!r} cannot run Harmony because "
-                "no batch columns were authorized"
-            )
-            evaluation = ParameterCandidateEvaluation(
-                candidateId=candidate_id,
-                phase=deps.candidatePhases.get(candidate_id, "initial"),
-                harmonyBatchColumns=[],
-                status="failed",
-                parameters=candidate,
-                error="Harmony candidate requires at least one authorized batch column",
-            )
-            deps.evaluations[candidate_id] = evaluation
-            return evaluation
 
         store = deps.store
         artifacts: dict[str, ArtifactRecord] = {}
@@ -758,20 +718,18 @@ def execute_parameter_candidate(
             effective_dimensions = validate_parameter_candidate_rank(
                 candidate,
                 normalized_shape,
-                identity_feature_limit=deps.identityFeatureLimit,
             )
-            reduction_ref, reduction_key, _ = run_candidate_reduction(
-                store,
-                normalized=deps.normalized,
-                candidate=candidate,
-                normalized_shape=normalized_shape,
-                identity_feature_limit=deps.identityFeatureLimit,
+            reduction_ref = diagnostic_call(
+                "core.pca",
+                store.run_pca,
+                deps.normalized,
+                dims=candidate.dimensions,
+                feat_scaling=True,
+                show_elbow_plot=False,
+                invalidate_cache=False,
             )
-            artifacts[reduction_key] = ArtifactRecord.from_ref(reduction_ref)
-            logger.debug(
-                f"Parameter candidate {candidate_id!r}: completed "
-                f"{reduction_key} reduction"
-            )
+            artifacts["pca"] = ArtifactRecord.from_ref(reduction_ref)
+            logger.debug(f"Parameter candidate {candidate_id!r}: completed PCA")
 
             coordinates_ref = reduction_ref
             if candidate.useHarmony:
@@ -788,61 +746,19 @@ def execute_parameter_candidate(
                     f"using {len(deps.batchColumns)} batch column(s)"
                 )
 
-            ann_ref = diagnostic_call(
-                "core.ann",
-                store.build_ann_index,
+            refs: dict[str, Any] = {}
+            for key, ref in candidate_graph_steps(
+                store,
                 coordinates_ref,
-                ann_metric="l2",
-                ann_parallel=False,
-                rand_state=_PCA_RANDOM_SEED,
-                invalidate_cache=False,
-            )
-            artifacts["annIndex"] = ArtifactRecord.from_ref(ann_ref)
-            logger.debug(
-                f"Parameter candidate {candidate_id!r}: completed ANN indexing"
-            )
-
-            neighbors_ref = diagnostic_call(
-                "core.neighbors",
-                store.query_neighbors,
-                ann_ref,
-                coordinates=coordinates_ref,
-                k=candidate.neighborsK,
-                invalidate_cache=False,
-            )
-            artifacts["neighbors"] = ArtifactRecord.from_ref(neighbors_ref)
-            logger.debug(
-                f"Parameter candidate {candidate_id!r}: completed neighbor query"
-            )
-
-            graph_ref = diagnostic_call(
-                "core.graph",
-                store.build_connectivity_map,
-                neighbors_ref,
-                local_connectivity=1.0,
-                bandwidth=1.5,
-                invalidate_cache=False,
-            )
-            artifacts["connectivityMap"] = ArtifactRecord.from_ref(graph_ref)
-            logger.debug(
-                f"Parameter candidate {candidate_id!r}: completed connectivity map"
-            )
-
-            cluster_ref = diagnostic_call(
-                "core.partition",
-                store.run_leiden_clustering,
-                graph_ref,
+                neighbors_k=candidate.neighborsK,
                 resolution=candidate.leidenResolution,
-                backend="igraph",
-                symmetric_graph=False,
-                graph_upper_only=False,
-                random_seed=_RANDOM_SEED,
-                invalidate_cache=False,
-            )
-            artifacts["clusters"] = ArtifactRecord.from_ref(cluster_ref)
-            logger.debug(
-                f"Parameter candidate {candidate_id!r}: completed Leiden clustering"
-            )
+            ):
+                refs[key] = ref
+                artifacts[key] = ArtifactRecord.from_ref(ref)
+                logger.debug(f"Parameter candidate {candidate_id!r}: completed {key}")
+            neighbors_ref = refs["neighbors"]
+            graph_ref = refs["connectivityMap"]
+            cluster_ref = refs["clusters"]
 
             (
                 metrics,
@@ -867,7 +783,6 @@ def execute_parameter_candidate(
 
             evaluation = ParameterCandidateEvaluation(
                 candidateId=candidate_id,
-                phase=deps.candidatePhases.get(candidate_id, "initial"),
                 harmonyBatchColumns=(
                     list(deps.batchColumns) if candidate.useHarmony else []
                 ),
@@ -892,7 +807,6 @@ def execute_parameter_candidate(
         except (KeyError, TypeError, ValueError, RuntimeError) as exc:
             evaluation = ParameterCandidateEvaluation(
                 candidateId=candidate_id,
-                phase=deps.candidatePhases.get(candidate_id, "initial"),
                 harmonyBatchColumns=(
                     list(deps.batchColumns) if candidate.useHarmony else []
                 ),

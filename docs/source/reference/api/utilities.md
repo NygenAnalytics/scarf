@@ -51,10 +51,6 @@ Read the Docs shows deterministic completed snapshots from the committed noteboo
 Use it when a durable batch log is needed; use `configure_output` for ordinary notebook and console behavior.
 
 ```{eval-rst}
-.. autofunction:: scarf.get_log_level
-```
-
-```{eval-rst}
 .. py:data:: scarf.logger
 
     Scarf's `loguru` logger. Library code logs through this object, so
@@ -75,10 +71,6 @@ Use it when a durable batch log is needed; use `configure_output` for ordinary n
 
 ```{eval-rst}
 .. autofunction:: scarf.compute_with_progress
-```
-
-```{eval-rst}
-.. autofunction:: scarf.system_call
 ```
 
 ## Array helpers

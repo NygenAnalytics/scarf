@@ -173,7 +173,7 @@ def test_confounded_design_can_accept_supported_native_descriptive_analysis(
 
 
 @pytest.mark.parametrize("correction_need", ["needed", "notNeeded"])
-def test_historical_confounded_experiment_replays_with_a_scientific_warning(
+def test_saved_confounded_correction_claim_fails_on_replay(
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
     correction_need: str,
@@ -187,24 +187,16 @@ def test_historical_confounded_experiment_replays_with_a_scientific_warning(
     )
     run.review("full", 0, selected, {})
     key = "parameter_tuning/full/review0"
-    # Represent a committed action produced before this scientific guard existed.
     saved[key]["outputs"]["action"]["correctionNeed"] = correction_need
-    expected = rna_tuning.TuningAction.model_validate(saved[key]["outputs"]["action"])
     before = json.dumps(saved[key], sort_keys=True)
 
     def unexpected(*args: Any, **kwargs: Any) -> Any:
-        pytest.fail(
-            "A committed experiment must replay without new model or support work"
-        )
+        pytest.fail("A committed review must replay without new model work")
 
     monkeypatch.setattr(rna_tuning, "run_agent_sync", unexpected)
-    monkeypatch.setattr(rna_tuning, "population_support_evidence", unexpected)
-    assert run.review("full", 0, selected, {}) == expected
+    with pytest.raises(ValueError, match="design confounds"):
+        run.review("full", 0, selected, {})
     assert json.dumps(saved[key], sort_keys=True) == before
-    assert any(
-        "claimed identifiable correction necessity" in row.get("reason", "")
-        for row in run.history
-    )
 
 
 def _alternative(
@@ -231,8 +223,6 @@ def _alternative(
         alternative.cellSelection = alternative.cellSelection.model_copy(
             update={"artifactId": "f" * 64}
         )
-    elif difference == "reductionMethod":
-        alternative.parameters.reductionMethod = "lsi"
     setting = run.settings[selected.candidateId].model_copy(
         update={"parameters": alternative.parameters}
     )
@@ -245,7 +235,7 @@ def _alternative(
 
 @pytest.mark.parametrize(
     "difference",
-    ["oneParameter", "twoParameters", "selection", "features", "reductionMethod"],
+    ["oneParameter", "twoParameters", "selection", "features"],
 )
 def test_matched_comparisons_require_one_change_on_the_exact_representation(
     monkeypatch: pytest.MonkeyPatch, difference: str

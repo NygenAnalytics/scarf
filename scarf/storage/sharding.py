@@ -1,4 +1,5 @@
 import asyncio
+import time
 from collections import deque
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -39,8 +40,12 @@ from .layout import (
 from .parallel import _close_iterator, in_shard_context, stream_shards
 from .partition import affordable_width
 from .profiles import StorageProfile, resolve_storage_profile
-from .types import array_metadata_shards, as_zarr_array, writable
-from ..utils.arrays import canonicalize_sparse, checked_sparse_cast
+from .types import as_zarr_array, writable
+from ..utils.arrays import (
+    canonicalize_sparse,
+    checked_sparse_cast,
+    sparse_matrix_bytes,
+)
 
 if TYPE_CHECKING:
     from .identity import CountSummary
@@ -111,17 +116,6 @@ def _destination_geometry(
     if resolved is None or len(resolved.shape) != 2:
         raise ValueError("Destinations must be two-dimensional arrays")
     return resolved, np.dtype(destination.dtype)
-
-
-def sparse_matrix_bytes(*matrices: Any) -> int:
-    """Return unique array bytes owned by SciPy sparse matrices."""
-    arrays = (
-        getattr(matrix, name, None)
-        for matrix in matrices
-        for name in ("data", "row", "col", "indices", "indptr")
-    )
-    unique = {id(array): array for array in arrays if isinstance(array, np.ndarray)}
-    return int(sum(array.nbytes for array in unique.values()))
 
 
 def sparse_producer_peak_bytes(
@@ -734,6 +728,11 @@ def write_sparse_bands(
             countSummaries[item.destination.path].update(item.band.start, dense)
         writable(item.destination)[item.band.start : item.band.end, :] = dense
 
+    # Each batch is planned for the bands it holds; report the whole import once,
+    # under the plan of its widest batch.
+    widest: tuple[int, OperationPlan] | None = None
+    batches = 0
+    units = 0
     try:
         fill()
         while pending:
@@ -757,18 +756,24 @@ def write_sparse_bands(
             ):
                 if progress is not None:
                     progress.update()
-            record_execution_report(
-                ExecutionReport(
-                    plan=operation,
-                    unitKind="countsImportBand",
-                    actualReadWorkers=1,
-                    actualComputeWorkers=admitted,
-                    actualWriteWorkers=admitted,
-                    unitsCompleted=len(batch),
-                )
-            )
+            if widest is None or admitted > widest[0]:
+                widest = (admitted, operation)
+            batches += 1
+            units += len(batch)
             del batch
             fill()
+        if widest is not None:
+            record_execution_report(
+                ExecutionReport(
+                    plan=widest[1],
+                    unitKind="countsImportBand",
+                    actualReadWorkers=1,
+                    actualComputeWorkers=widest[0],
+                    actualWriteWorkers=widest[0],
+                    unitsCompleted=units,
+                    extra={"batches": batches},
+                )
+            )
     finally:
         from contextlib import ExitStack
 
@@ -901,11 +906,15 @@ def write_dense_from_row_batches(
             _close_iterator(source)
 
     target = writable(dst)
+    workers = min(operation.computeWorkers, operation.writeWorkers)
+    write_seconds: list[float] = []
 
     def write_band(band: _DenseWriteBand) -> int:
+        started = time.perf_counter()
         if countSummary is not None:
             countSummary.update(band.start, band.values)
         target[band.start : band.end, :] = band.values
+        write_seconds.append(time.perf_counter() - started)
         return band.end - band.start
 
     total_rows = int(
@@ -913,7 +922,7 @@ def write_dense_from_row_batches(
             stream_shards(
                 aligned(),
                 write_band,
-                workers=min(operation.computeWorkers, operation.writeWorkers),
+                workers=workers,
                 within_block_threads=1,
                 io_concurrency=operation.ioConcurrency,
                 msg=msg or "Writing Zarr array",
@@ -925,6 +934,17 @@ def write_dense_from_row_batches(
         raise ValueError(
             f"Dense stream contains {total_rows} rows, expected {dst.shape[0]}"
         )
+    record_execution_report(
+        ExecutionReport(
+            plan=operation,
+            unitKind="denseRowBand",
+            actualReadWorkers=1,
+            actualComputeWorkers=workers,
+            actualWriteWorkers=workers,
+            writeSeconds=sum(write_seconds),
+            unitsCompleted=len(write_seconds),
+        )
+    )
     return total_rows
 
 
@@ -1084,24 +1104,6 @@ def accumulate_sparse_to_shards(
     return buffer.rows
 
 
-def counts_t_spec(
-    counts: ZarrArraySpec,
-    *,
-    profile: StorageProfile,
-) -> ZarrArraySpec:
-    """Return the paired rotateOnce feature-major layout derived from counts."""
-    if len(counts.shape) != 2 or len(counts.chunks) != 2:
-        raise ValueError("counts must be a two-dimensional array specification")
-    n_cells = int(counts.shape[0])
-    n_feats = int(counts.shape[1])
-    return plan_count_matrix_pair(
-        n_cells,
-        n_feats,
-        counts.dtype,
-        profile=profile,
-    ).countsT
-
-
 def is_paired_counts_t_layout(
     *,
     shape: tuple[int, ...],
@@ -1197,24 +1199,6 @@ def preflight_counts_t_spec(
     return plan.countsT
 
 
-def _counts_t_matches_plan(counts_t: zarr.Array, plan: Any) -> bool:
-    if counts_t.attrs.get("complete") is not True:
-        return False
-    try:
-        recorded = load_count_matrix_plan(counts_t)
-    except ValueError:
-        return False
-    if recorded.get("fingerprint") != plan.fingerprint:
-        return False
-    stored = array_metadata_shards(counts_t)
-    stored_shards = None if stored is None else tuple(int(value) for value in stored)
-    return bool(
-        tuple(int(value) for value in counts_t.shape) == plan.countsT.shape
-        and tuple(int(value) for value in counts_t.chunks) == plan.countsT.chunks
-        and stored_shards == plan.countsT.shards
-    )
-
-
 def write_counts_t(
     counts: zarr.Array,
     group: zarr.Group,
@@ -1255,10 +1239,16 @@ def write_counts_t(
 
     source_fingerprint = count_fingerprint(counts)
     if "countsT" in group and not overwrite:
-        existing = as_zarr_array(group["countsT"], name="countsT")
-        if existing.attrs.get(
-            "source_fingerprint"
-        ) == source_fingerprint and _counts_t_matches_plan(existing, plan):
+        from .counts_t_contract import validate_count_matrix
+
+        try:
+            _, existing = validate_count_matrix(group, require_transpose=True)
+        except ValueError:
+            existing = None
+        if (
+            existing is not None
+            and load_count_matrix_plan(existing).get("fingerprint") == plan.fingerprint
+        ):
             return existing
         raise ValueError(
             "Existing countsT is incomplete or mismatched; use overwrite=True to rewrite it"

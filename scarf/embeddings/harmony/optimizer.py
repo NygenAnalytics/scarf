@@ -37,15 +37,12 @@ class Harmony:
         self.Phi_moe = Phi_moe
         self.N = self.Z_corr.shape[1]
         self.Pr_b = Pr_b
-        self.B = self.Phi.shape[0]
-        self.d = self.Z_corr.shape[0]
         self.window_size = 3
         self.epsilon_kmeans = epsilon_kmeans
         self.epsilon_harmony = epsilon_harmony
 
         self.lamb = lamb
         self.sigma = sigma
-        self.sigma_prior = sigma
         self.block_size = block_size
         self.K = K
         self.max_iter_harmony = max_iter_harmony
@@ -54,12 +51,7 @@ class Harmony:
 
         self.objective_harmony: list[float] = []
         self.objective_kmeans: list[float] = []
-        self.objective_kmeans_dist: list[float] = []
-        self.objective_kmeans_entropy: list[float] = []
-        self.objective_kmeans_cross: list[float] = []
-        self.kmeans_rounds: list[int] = []
 
-        self.allocate_buffers()
         resolved_cluster_fn: Callable[[np.ndarray, int], np.ndarray]
         if isinstance(cluster_fn, str):
             resolved_cluster_fn = partial(
@@ -73,14 +65,6 @@ class Harmony:
 
     def result(self) -> np.ndarray:
         return self.Z_corr
-
-    def allocate_buffers(self) -> None:
-        self._scale_dist = np.zeros((self.K, self.N))
-        self.dist_mat = np.zeros((self.K, self.N))
-        self.O = np.zeros((self.K, self.B))
-        self.E = np.zeros((self.K, self.B))
-        self.W = np.zeros((self.B + 1, self.d))
-        self.Phi_Rk = np.zeros((self.B + 1, self.N))
 
     @staticmethod
     def _cluster_kmeans(
@@ -124,9 +108,6 @@ class Harmony:
         w = np.dot(y * z, self.Phi)
         cross_entropy = np.sum(x * w)
         self.objective_kmeans.append(kmeans_error + entropy + cross_entropy)
-        self.objective_kmeans_dist.append(kmeans_error)
-        self.objective_kmeans_entropy.append(entropy)
-        self.objective_kmeans_cross.append(cross_entropy)
 
     def harmonize(self, iter_harmony: int = 10) -> int:
         converged = False
@@ -137,12 +118,10 @@ class Harmony:
         try:
             for _ in range(1, iter_harmony + 1):
                 self.cluster()
-                self.Z_cos, self.Z_corr, self.W, self.Phi_Rk = moe_correct_ridge(
+                self.Z_cos, self.Z_corr = moe_correct_ridge(
                     self.Z_orig,
                     self.R,
-                    self.W,
                     self.K,
-                    self.Phi_Rk,
                     self.Phi_moe,
                     self.lamb,
                 )
@@ -170,22 +149,20 @@ class Harmony:
             self.compute_objective()
             if iteration > self.window_size and self.check_convergence(0):
                 break
-        self.kmeans_rounds.append(iteration)
         self.objective_harmony.append(self.objective_kmeans[-1])
         return 0
 
     def update_R(self) -> int:
-        self._scale_dist = -self.dist_mat
-        self._scale_dist = self._scale_dist / self.sigma[:, None]
-        self._scale_dist -= np.max(self._scale_dist, axis=0)
-        self._scale_dist = np.exp(self._scale_dist)
+        scale_dist = -self.dist_mat / self.sigma[:, None]
+        scale_dist -= np.max(scale_dist, axis=0)
+        scale_dist = np.exp(scale_dist)
         update_order = self._rng.permutation(self.N)
         n_blocks = np.ceil(1 / self.block_size).astype(int)
         blocks = np.array_split(update_order, n_blocks)
         for block in blocks:
             self.E -= np.outer(np.sum(self.R[:, block], axis=1), self.Pr_b)
             self.O -= np.dot(self.R[:, block], self.Phi[:, block].T)
-            self.R[:, block] = self._scale_dist[:, block]
+            self.R[:, block] = scale_dist[:, block]
             self.R[:, block] = np.multiply(
                 self.R[:, block],
                 np.dot(
@@ -235,12 +212,15 @@ def safe_entropy(x: np.ndarray) -> np.ndarray:
 def moe_correct_ridge(
     Z_orig: np.ndarray,
     R: np.ndarray,
-    W: np.ndarray,
     K: int,
-    Phi_Rk: np.ndarray,
     Phi_moe: np.ndarray,
     lamb: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
+    """Regress soft-cluster batch effects out of ``Z_orig``.
+
+    Returns the corrected coordinates scaled to unit norm per cell, and the
+    corrected coordinates themselves.
+    """
     Z_corr = Z_orig.copy()
     for cluster_index in range(K):
         Phi_Rk = np.multiply(Phi_moe, R[cluster_index, :])
@@ -252,7 +232,7 @@ def moe_correct_ridge(
         W[0, :] = 0
         Z_corr -= np.dot(W.T, Phi_Rk)
     Z_cos = _normalize_columns(Z_corr)
-    return Z_cos, Z_corr, W, Phi_Rk
+    return Z_cos, Z_corr
 
 
 def _normalize_columns(values: np.ndarray) -> np.ndarray:

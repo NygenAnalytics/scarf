@@ -1,5 +1,6 @@
-from importlib import import_module as _import_module
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
+
+from ..._facade import lazy_facade as _lazy_facade
 
 if TYPE_CHECKING:
     from .rank import (
@@ -18,27 +19,12 @@ __all__ = [
     "sort_marker_results",
 ]
 
-_LAZY_EXPORTS = {
-    "find_markers_by_rank": (".search", "find_markers_by_rank"),
-    "find_markers_by_regression": (".search", "find_markers_by_regression"),
-    "mannwhitneyu_from_ranks": (".rank", "mannwhitneyu_from_ranks"),
-    "sort_marker_results": (".rank", "sort_marker_results"),
-}
-
-for _export_name in _LAZY_EXPORTS:
-    globals().pop(_export_name, None)
-del _export_name
-
-
-def __getattr__(name: str) -> Any:
-    export = _LAZY_EXPORTS.get(name)
-    if export is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    module_name, attribute_name = export
-    value = getattr(_import_module(module_name, __name__), attribute_name)
-    globals()[name] = value
-    return value
-
-
-def __dir__() -> list[str]:
-    return sorted(set(globals()).union(_LAZY_EXPORTS))
+__getattr__, __dir__ = _lazy_facade(
+    __name__,
+    {
+        "find_markers_by_rank": ".search",
+        "find_markers_by_regression": ".search",
+        "mannwhitneyu_from_ranks": ".rank",
+        "sort_marker_results": ".rank",
+    },
+)

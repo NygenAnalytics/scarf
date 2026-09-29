@@ -14,7 +14,6 @@ try:
     from jupyter_cache.cache.main import NbArtifacts
 
     import docs.execute_vignette as cache_tools
-    import docs.modal_cache as modal_cache
     from docs.execute_all_vignettes import (
         ExecutionBatchError,
         _prepare_resume,
@@ -25,6 +24,7 @@ try:
     )
     from docs.execute_vignette import (
         CacheBuildError,
+        CacheToolError,
         CacheValidationError,
         ProgressRenderError,
         build_candidate,
@@ -32,17 +32,16 @@ try:
         discover_sources,
         execution_fingerprint,
         freeze_progress_outputs,
-        publish_candidate,
         validate_cache,
         validate_progress_outputs,
     )
     from docs.modal_cache import (
         CacheTransportError,
         SpawnedPageRunner,
-        await_page_cache,
         pack_page_cache,
         restore_page_cache,
     )
+    from profiling import modal_support
 except ImportError:
     pytest.skip("documentation dependencies are not installed", allow_module_level=True)
 
@@ -667,10 +666,10 @@ def test_modal_wait_rejects_terminal_failure_status(status: str) -> None:
             ]
 
     with pytest.raises(RuntimeError, match=f"status={status}"):
-        await_page_cache(
+        modal_support.await_function_call(
             FailedCall(),
-            poll_seconds=1,
-            deadline_seconds=10,
+            pollSeconds=1,
+            deadlineSeconds=10,
         )
 
 
@@ -685,13 +684,13 @@ def test_modal_wait_honors_polling_deadline(
             raise TimeoutError
 
     times = iter([0.0, 0.0, 0.0, 2.0])
-    monkeypatch.setattr(modal_cache.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(modal_support.time, "monotonic", lambda: next(times))
 
-    with pytest.raises(TimeoutError, match="within 1 seconds"):
-        await_page_cache(
+    with pytest.raises(TimeoutError, match="within 1s"):
+        modal_support.await_function_call(
             PendingCall(),
-            poll_seconds=0.25,
-            deadline_seconds=1,
+            pollSeconds=0.25,
+            deadlineSeconds=1,
         )
 
     assert observed_timeouts == [0.25]
@@ -855,10 +854,29 @@ def test_publication_failure_restores_target(
     monkeypatch.setattr(cache_tools, "_rename_path", fail_candidate_rename)
 
     with pytest.raises(OSError, match="replacement failed"):
-        publish_candidate(candidate, target)
+        with cache_tools.serialization_lock(target):
+            cache_tools._publish_candidate_locked(candidate, target)
 
     assert _tree_bytes(target) == before
     assert not cache_tools.backup_path(target).exists()
+
+
+def test_second_cache_command_fails_at_once_and_names_the_holder(
+    tmp_path: Path,
+) -> None:
+    import os
+
+    target = tmp_path / ".jupyter_cache"
+
+    with cache_tools.serialization_lock(target):
+        with pytest.raises(CacheToolError, match=f"pid={os.getpid()}"):
+            with cache_tools.serialization_lock(target):
+                pytest.fail("a second command must not enter the lock")
+
+    # Releasing the lock clears its holder, and the next command may run.
+    with cache_tools.serialization_lock(target):
+        pass
+    assert (tmp_path / ".jupyter_cache.lock").read_bytes() == b""
 
 
 def test_next_run_recovers_interrupted_swap(tmp_path: Path) -> None:
@@ -946,19 +964,26 @@ def test_resume_invalidates_runner_identity(tmp_path: Path) -> None:
     assert not (resume_dir / "cache").exists()
 
 
-@pytest.mark.parametrize("filename", ["modal_cache.py", "modal_docs.py"])
+@pytest.mark.parametrize(
+    "filename",
+    ["docs/modal_cache.py", "docs/modal_docs.py", "profiling/modal_support.py"],
+)
 def test_modal_runner_files_participate_in_execution_fingerprint(
     tmp_path: Path,
     filename: str,
 ) -> None:
     repo_root = tmp_path / "repo"
     docs_root = repo_root / "docs"
-    docs_root.mkdir(parents=True)
-    for runner_file in ("modal_cache.py", "modal_docs.py"):
-        (docs_root / runner_file).write_text("original\n", encoding="utf-8")
+    for runner_file in (
+        "docs/modal_cache.py",
+        "docs/modal_docs.py",
+        "profiling/modal_support.py",
+    ):
+        (repo_root / runner_file).parent.mkdir(parents=True, exist_ok=True)
+        (repo_root / runner_file).write_text("original\n", encoding="utf-8")
     before = execution_fingerprint(repo_root, docs_root)
 
-    (docs_root / filename).write_text("changed\n", encoding="utf-8")
+    (repo_root / filename).write_text("changed\n", encoding="utf-8")
 
     assert execution_fingerprint(repo_root, docs_root) != before
 

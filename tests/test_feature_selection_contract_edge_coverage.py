@@ -1,4 +1,3 @@
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -8,6 +7,7 @@ from zarr.storage import MemoryStore
 
 import scarf.storage.feature_selection as feature_selection
 from scarf.storage.artifacts import (
+    ArtifactStatus,
     artifact_group,
     fingerprint_stored_arrays,
     fingerprint_stored_strings,
@@ -42,13 +42,17 @@ def _status(
     parameters: dict[str, Any] | None = None,
     exists: bool = True,
     complete: bool = True,
-) -> Any:
-    return SimpleNamespace(
-        operation=operation,
-        inputs={} if inputs is None else inputs,
-        parameters={} if parameters is None else parameters,
+) -> ArtifactStatus:
+    return ArtifactStatus(
+        ref=_feature_ref("f"),
+        path="artifact",
         exists=exists,
         complete=complete,
+        provenance={
+            "operation": operation,
+            "parameters": {} if parameters is None else parameters,
+            "inputs": {} if inputs is None else inputs,
+        },
     )
 
 
@@ -94,7 +98,7 @@ def test_feature_selection_write_and_feature_table_contracts() -> None:
     assert caught.value.code == "row_mismatch"
 
 
-def test_feature_ref_scope_payload_and_local_input_contracts() -> None:
+def test_feature_ref_scope_contracts() -> None:
     wrong_scope = ArtifactRef("datastore", "feature_selection", "1" * 64)
     with pytest.raises(ArtifactResolutionError) as caught:
         feature_selection._validate_ref_scope(wrong_scope, "RNA")
@@ -103,18 +107,6 @@ def test_feature_ref_scope_payload_and_local_input_contracts() -> None:
     with pytest.raises(ArtifactResolutionError) as caught:
         feature_selection._validate_ref_scope(wrong_assay, "RNA")
     assert caught.value.code == "wrong_assay"
-
-    assert feature_selection._local_input_ref(1) is None
-    assert (
-        feature_selection._local_input_ref(
-            {"type": "external_artifact", "dataset_fingerprint": "x", "ref": {}}
-        )
-        is None
-    )
-    assert feature_selection._local_input_ref({"type": "artifact"}) is None
-    invalid = _feature_ref().to_dict()
-    invalid["artifact_id"] = "bad"
-    assert feature_selection._local_input_ref(invalid) is None
 
 
 def test_feature_summary_parent_reference_and_status_errors(
@@ -250,7 +242,7 @@ def _patch_valid_summary_dependencies(
         ),
     )
     monkeypatch.setattr(
-        feature_selection, "validate_stored_selection_integrity", lambda *_a, **_k: None
+        feature_selection, "validate_cell_selection", lambda *_a, **_k: None
     )
     monkeypatch.setattr(feature_selection, "artifact_group", lambda *_args: payload)
 
@@ -317,7 +309,7 @@ def test_feature_selection_provenance_contract_errors(
                 parameters={"values_fingerprint": "x"},
             ),
             _Keys("values"),
-            "universe input",
+            "malformed 'all_features' input",
         ),
         (
             _status(
@@ -326,7 +318,7 @@ def test_feature_selection_provenance_contract_errors(
                 parameters={"min_cells": 1},
             ),
             _Keys("values"),
-            "summary input",
+            "malformed 'feature_summary' input",
         ),
     )
     for status, group, message in cases:
@@ -396,7 +388,7 @@ def test_feature_selection_snapshot_and_mapping_input_contracts(
         "_validate_feature_summary_parent",
         lambda *_args, **_kwargs: None,
     )
-    with pytest.raises(ArtifactResolutionError, match="snapshot input"):
+    with pytest.raises(ArtifactResolutionError, match="malformed 'feature_snapshot'"):
         feature_selection._validate_feature_selection_provenance(
             root,
             "RNA",

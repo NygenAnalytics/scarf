@@ -98,9 +98,10 @@ Force every page and run a strict Sphinx build:
 3. Execute the page locally with `JOBS=1`, or use the optional Modal target when its environment is available.
 4. Commit the `.md` file and `docs/.jupyter_cache/`.
 
-For Cytebase, `Catalog()` defaults to the public `Nygen/cytebase` bucket. To refresh
-the development snapshot, configure `CYTEBASE_BUCKET` and Hugging Face authentication
-in the execution environment, then run `make -C docs execute-page PAGE=cytebase JOBS=1`.
+For Cytebase, `Catalog()` defaults to the public `Nygen/cytebase` bucket, which
+needs no credentials. To refresh the saved outputs, leave `CYTEBASE_BUCKET` and
+Hugging Face tokens unset so the page reads the public bucket anonymously, then run
+`make -C docs execute-page PAGE=cytebase JOBS=1`.
 The tutorial reads the selected bucket; it does not invoke the
 ingestion pipeline or write to remote stores. Keep private connection values
 out of sources and cached outputs. Its explicit notebook download link uses

@@ -1,21 +1,18 @@
 """Tests for characterize_covariates."""
 
-from collections.abc import Mapping
 from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
-from pydantic_ai.models.function import AgentInfo, FunctionModel
 from scipy.sparse import csr_matrix
 
 from scarf.agent.experimental_context.contracts import CovariateCharacterization
 from scarf.agent.experimental_context.characterization import characterize_covariates
 from scarf.agent.experimental_context.characterization import (
     _Run,
-    _assign_domain,
+    _SelectionBoundStore,
     _characterize_coefficient,
     _infer_kind,
     _is_embedding_column,
@@ -26,41 +23,10 @@ from scarf.agent.experimental_context.characterization import (
     _triage_columns,
     _validate_directions,
 )
-from scarf.agent.decisions.selection import DecisionValidationError
-from scarf.agent.types import ArtifactReferenceModel, Decision, EvidenceItem
+from scarf.agent.types import ArtifactReferenceModel
 from scarf.datastore.datastore import DataStore
 from scarf.storage import ArtifactRef, ArtifactResolutionError
 from scarf.writers import SparseToZarr
-
-
-def _function_model(answers: Mapping[str, Decision]) -> FunctionModel:
-    queue = list(answers.items())
-
-    def reply(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        text = ""
-        for message in messages:
-            for part in getattr(message, "parts", []):
-                content = getattr(part, "content", None)
-                if isinstance(content, str):
-                    text += content
-        selected: Decision | None = None
-        for key, decision in queue:
-            if key in text:
-                selected = decision
-                break
-        if selected is None:
-            selected = next(iter(answers.values()))
-        tool = info.output_tools[0]
-        return ModelResponse(
-            parts=[
-                ToolCallPart(
-                    tool_name=tool.name,
-                    args=selected.model_dump(),
-                )
-            ]
-        )
-
-    return FunctionModel(reply)
 
 
 def _store_with_design(tmp_path: Path) -> DataStore:
@@ -135,8 +101,6 @@ def test_characterize_covariates_directions_only(tmp_path: Path) -> None:
     result = characterize_covariates(
         store,
         cellSelection=cell_selection,
-        studyContext="Case/control retina study across two donors.",
-        model=None,
         directions={
             "columnDomains": {
                 "donor": "design",
@@ -250,108 +214,12 @@ def test_characterize_covariates_stays_headless_without_model(tmp_path: Path) ->
     cell_selection = store.snapshot_cell_selection("I")
     result = characterize_covariates(store, cellSelection=cell_selection)
     assert result.status == "done"
-    assert result.decisions == []
     assert result.coefficients == []
     assert result.confounding == []
     unresolved = {
         entry["column"] for entry in result.auditLog if entry["kind"] == "domainUnknown"
     }
     assert {"donor", "sample", "batch", "disease"} <= unresolved
-
-
-def test_characterize_covariates_function_model_path(tmp_path: Path) -> None:
-    store = _store_with_design(tmp_path)
-    cell_selection = store.snapshot_cell_selection("I")
-    answers = {
-        "Assign a domain for cell metadata column donor": Decision(
-            selectedId="domain:design",
-            rationale="donor is sampling unit",
-            evidenceIds=["domain:design"],
-        ),
-        "Assign a domain for cell metadata column sample": Decision(
-            selectedId="domain:design",
-            rationale="sample is observation unit",
-            evidenceIds=["domain:design"],
-        ),
-        "Assign a domain for cell metadata column batch": Decision(
-            selectedId="domain:technical",
-            rationale="batch is technical",
-            evidenceIds=["domain:technical"],
-        ),
-        "Assign a domain for cell metadata column disease": Decision(
-            selectedId="domain:biological",
-            rationale="disease is biology",
-            evidenceIds=["domain:biological"],
-        ),
-        "Assign a domain for cell metadata column cell_type": Decision(
-            selectedId="domain:biological",
-            rationale="cell type is biology",
-            evidenceIds=["domain:biological"],
-        ),
-        "Assign a domain for cell metadata column author_cell_type": Decision(
-            selectedId="domain:biological",
-            rationale="author annotation is biology",
-            evidenceIds=["domain:biological"],
-        ),
-        "assign every cell to the same groups": Decision(
-            selectedId="equivalent:cell_type",
-            rationale="cell_type carries the readable labels",
-            evidenceIds=["equivalent:cell_type"],
-        ),
-        "Assign a domain for cell metadata column sequencing_depth": Decision(
-            selectedId="domain:technical",
-            rationale="depth is technical",
-            evidenceIds=["domain:technical"],
-        ),
-        "Assign a domain for cell metadata column umi_noise": Decision(
-            selectedId="domain:technical",
-            rationale="umi noise is technical",
-            evidenceIds=["domain:technical"],
-        ),
-        "Should biological column disease": Decision(
-            selectedId="coefficient:yes",
-            rationale="primary contrast",
-            evidenceIds=["coefficient:yes"],
-        ),
-        "Should biological column cell_type": Decision(
-            selectedId="coefficient:no",
-            rationale="composition only",
-            evidenceIds=["coefficient:no"],
-        ),
-        "Choose the observation unit for coefficient disease": Decision(
-            selectedId="unit:sample",
-            rationale="one row per sample",
-            evidenceIds=["unit:sample"],
-        ),
-        "Optional independent unit for coefficient disease": Decision(
-            selectedId="independentUnit:donor",
-            rationale="donor repeats",
-            evidenceIds=["independentUnit:donor"],
-        ),
-    }
-    result = characterize_covariates(
-        store,
-        cellSelection=cell_selection,
-        studyContext="Case control across donors.",
-        model=_function_model(answers),
-    )
-    assert result.status == "done"
-    assert any(decision["task"] == "columnDomain" for decision in result.decisions)
-
-    columns = {column["name"]: column for column in result.columns}
-    assert columns["cell_type"]["aliases"] == ["author_cell_type"]
-    assert "author_cell_type" not in columns
-    collapsed = next(
-        entry for entry in result.auditLog if entry["kind"] == "equivalentColumns"
-    )
-    assert collapsed["representative"] == "cell_type"
-    assert collapsed["levels"] == "AC = alpha; BC = beta"
-
-    coeffs = {item["name"]: item for item in result.coefficients}
-    assert "disease" in coeffs
-    assert coeffs["disease"]["scope"] == "betweenUnit"
-    assert coeffs["disease"]["observationUnit"] == "sample"
-    assert coeffs["disease"]["independentUnit"] == "donor"
 
 
 def test_characterize_covariates_does_not_mutate_store(tmp_path: Path) -> None:
@@ -628,47 +496,6 @@ def test_covariate_direction_validation_reports_structural_errors(
     assert any(message in error for error in errors)
 
 
-def test_run_ask_audits_invalid_mocked_decision(monkeypatch) -> None:
-    characterize_covariates_module = import_module(
-        "scarf.agent.experimental_context.characterization"
-    )
-    run = _Run(
-        store=object(),
-        cell_key="I",
-        n_rows=2,
-        context="",
-        model=object(),
-    )
-
-    def invalid_decision(**_kwargs):
-        raise DecisionValidationError("unknown evidence")
-
-    monkeypatch.setattr(
-        characterize_covariates_module,
-        "decide",
-        invalid_decision,
-    )
-    decision = run.ask(
-        task="columnDomain",
-        question="Choose a domain",
-        evidence=[
-            EvidenceItem(id="domain:design", label="design", summary="sampling"),
-            EvidenceItem(id="domain:ignore", label="ignore", summary="unused"),
-        ],
-        column="sample",
-    )
-
-    assert decision is None
-    assert run.audit == [
-        {
-            "kind": "decisionInvalid",
-            "detail": "unknown evidence",
-            "task": "columnDomain",
-            "column": "sample",
-        }
-    ]
-
-
 def test_covariate_kind_and_summary_handle_non_numeric_and_nonfinite_values() -> None:
     assert _infer_kind(np.array([b"not-a-number"], dtype="S")) == "categorical"
     assert (
@@ -679,47 +506,48 @@ def test_covariate_kind_and_summary_handle_non_numeric_and_nonfinite_values() ->
 
 def test_triage_treats_non_assay_metadata_as_user_owned() -> None:
     store = SimpleNamespace(
-        assay_names=["RNA"],
+        assay_names=["RNA", "HTO"],
         cells=SimpleNamespace(
-            columns=["I", "RNA_nCounts", "derived", "donor"],
+            columns=[
+                "I",
+                "RNA_nCounts",
+                "derived",
+                "donor",
+                "HTO_classification",
+                "HTO_percentMito",
+            ],
+            artifact_columns=[],
         ),
     )
 
     candidates, dropped = _triage_columns(store, cell_key="I", exclude=set())
-    assert candidates == ["derived", "donor"]
-    assert dropped == [("RNA_nCounts", "dropAssayStat")]
+    # Only Scarf's assay statistics are dropped; other assay-prefixed metadata,
+    # such as an imported hashing classification, stays a design candidate.
+    assert candidates == ["HTO_classification", "derived", "donor"]
+    assert dropped == [
+        ("HTO_percentMito", "dropAssayStat"),
+        ("RNA_nCounts", "dropAssayStat"),
+    ]
 
 
-def test_assign_domain_rejects_unsupported_mock_choice(monkeypatch) -> None:
-    run = _Run(
-        store=object(),
-        cell_key="I",
-        n_rows=2,
-        context="",
-        model=object(),
-        profiles={
-            "batch": SimpleNamespace(
-                summary="categorical levels=2",
-            )
-        },
-    )
-    monkeypatch.setattr(
-        run,
-        "ask",
-        lambda **_kwargs: Decision(
-            selectedId="domain:not-real",
-            rationale="invalid",
-            evidenceIds=["domain:not-real"],
-        ),
-    )
+def test_masked_numeric_rows_do_not_change_the_inferred_kind() -> None:
+    from scarf.agent.tools import mark_missing_rows
 
-    assert _assign_domain(run, "batch", {}) == "unknown"
-    assert run.audit[0]["kind"] == "domainUnknown"
-    assert "Unsupported domain" in run.audit[0]["detail"]
+    age = np.random.default_rng(0).integers(20, 90, size=2000)
+    missing = np.zeros(age.shape, dtype=bool)
+    assert _infer_kind(mark_missing_rows(age, missing)) == "continuous"
+    missing[0] = True
+    marked = mark_missing_rows(age, missing)
+    assert marked.dtype == object
+    assert _infer_kind(marked) == "continuous"
+    assert _infer_kind(np.asarray([1, None, 2, 1], dtype=object)) == "categorical"
+    assert _infer_kind(np.asarray([True, None, False], dtype=object)) == "categorical"
+    assert _infer_kind(np.asarray(["a", None, 1], dtype=object)) == "categorical"
 
 
 def test_resolve_units_audits_missing_directed_units(tmp_path: Path) -> None:
-    store = _store_with_design(tmp_path)
+    source = _store_with_design(tmp_path)
+    store = _SelectionBoundStore(source, source.snapshot_cell_selection("I"))
     profiles = {
         name: _profile_column(store, name, cell_key="I")
         for name in ("disease", "sample", "donor")
@@ -727,9 +555,7 @@ def test_resolve_units_audits_missing_directed_units(tmp_path: Path) -> None:
     run = _Run(
         store=store,
         cell_key="I",
-        n_rows=store.cells.N,
-        context="",
-        model=None,
+        n_rows=source.cells.N,
         profiles=profiles,
         domains={
             "disease": "biological",
@@ -742,7 +568,6 @@ def test_resolve_units_audits_missing_directed_units(tmp_path: Path) -> None:
         run,
         "disease",
         directed={"disease": {"observationUnit": "missing"}},
-        design_columns=["sample", "donor"],
         unit_candidates=["sample", "donor"],
     ) == (None, None)
     assert run.audit[-1]["kind"] == "invalidObservationUnit"
@@ -756,7 +581,6 @@ def test_resolve_units_audits_missing_directed_units(tmp_path: Path) -> None:
                 "independentUnit": "missing",
             }
         },
-        design_columns=["sample", "donor"],
         unit_candidates=["sample", "donor"],
     )
     assert observation == "sample"
@@ -809,18 +633,17 @@ def test_technical_nesting_reports_only_directional_relationships(
 def test_characterize_coefficient_rejects_cell_level_observation_unit(
     tmp_path: Path,
 ) -> None:
-    store = _store_with_design(tmp_path)
-    store.cells.insert(
+    source = _store_with_design(tmp_path)
+    source.cells.insert(
         "barcode",
-        np.array([f"cell-{index}" for index in range(store.cells.N)]),
+        np.array([f"cell-{index}" for index in range(source.cells.N)]),
         overwrite=True,
     )
+    store = _SelectionBoundStore(source, source.snapshot_cell_selection("I"))
     run = _Run(
         store=store,
         cell_key="I",
-        n_rows=store.cells.N,
-        context="",
-        model=None,
+        n_rows=source.cells.N,
         profiles={
             name: _profile_column(store, name, cell_key="I")
             for name in ("disease", "barcode")
@@ -839,7 +662,7 @@ def test_characterize_coefficient_rejects_cell_level_observation_unit(
     assert record["scope"] == "unresolvedUnit"
     assert report is None
     assert run.audit[-1]["kind"] == "invalidObservationUnit"
-    assert run.audit[-1]["designRows"] == store.cells.N
+    assert run.audit[-1]["designRows"] == source.cells.N
 
 
 def test_characterize_covariates_rejects_invalid_cell_selection_artifacts(

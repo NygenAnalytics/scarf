@@ -1,3 +1,5 @@
+"""Cell-cycle marker genes with current HGNC symbols (Seurat 2019 update)."""
+
 __all__ = [
     "g2m_phase_genes",
     "g2m_phase_genes_mouse",
@@ -20,7 +22,7 @@ s_phase_genes: list[str] = [
     "DTL",
     "PRIM1",
     "UHRF1",
-    "MLF1IP",
+    "CENPU",
     "HELLS",
     "RFC2",
     "RPA2",
@@ -67,7 +69,7 @@ g2m_phase_genes: list[str] = [
     "TMPO",
     "CENPF",
     "TACC3",
-    "FAM64A",
+    "PIMREG",
     "SMC4",
     "CCNB2",
     "CKAP2L",
@@ -81,7 +83,7 @@ g2m_phase_genes: list[str] = [
     "KIF20B",
     "HJURP",
     "CDCA3",
-    "HN1",
+    "JPT1",
     "CDC20",
     "TTK",
     "CDC25C",

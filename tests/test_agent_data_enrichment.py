@@ -112,6 +112,16 @@ def characterization() -> FeatureCharacterization:
     )
 
 
+def test_bounded_tool_lists_stop_at_a_positive_limit() -> None:
+    bounded = data_enrichment_tools._bounded_list
+
+    assert bounded(iter(range(10)), limit=3) == [0, 1, 2]
+    assert bounded([1], limit=5) == [1]
+    for limit in (0, True):
+        with pytest.raises(ValueError, match="positive integer"):
+            bounded([1], limit=limit)
+
+
 def test_data_enrichment_models_have_factories_and_camelcase_fields() -> None:
     model_types: list[type[BaseModel]] = [
         DataEnrichmentContext,
@@ -254,8 +264,11 @@ def test_data_enrichment_agent_uses_only_read_tools_and_context(
         "find_present_features_batch",
     }
     assert store.features.fetches == ["ids", "names"]
-    assert characterization_calls[0]["model"] is None
-    assert characterization_calls[0]["studyContext"].startswith("Treated human")
+    assert characterization_calls[0] == {
+        "assays": ["RNA"],
+        "cacheDir": None,
+        "allowDownload": False,
+    }
     assert settings[0]["parallel_tool_calls"] is False
     assert settings[0]["extra_body"]["reasoning_effort"] == "none"
 
@@ -607,27 +620,45 @@ def test_feature_lookup_cache_rejects_different_arguments() -> None:
         )
 
 
+def test_feature_lookup_confirms_only_labels_that_identify_one_row() -> None:
+    ids = ["ENSG01", "ENSG02", "ENSG03"]
+    names = ["TBCE", "TBCE", "ACTB"]
+    feats = SimpleNamespace(fetch_all=lambda key: ids if key == "ids" else names)
+    store = SimpleNamespace(get_assay=lambda _name: SimpleNamespace(feats=feats))
+    deps = DataEnrichmentDependencies(store=store, assays=["RNA"], evidenceIds=set())
+    context = SimpleNamespace(deps=deps)
+
+    by_name = asyncio.run(find_present_features(context, "RNA", ["TBCE"]))
+    by_id = asyncio.run(find_present_features(context, "RNA", ["ENSG01", "ACTB"]))
+
+    assert by_name.results[0].status == "ambiguous"
+    assert [item.status for item in by_id.results] == ["present", "present"]
+    # The duplicated symbol still selects two rows, so an ID lookup cannot confirm it.
+    assert deps.confirmedFeatures["RNA"] == {"ENSG01", "ENSG03", "ACTB"}
+    deps.inspections["RNA"] = AssayFeatureInspection(
+        assay="RNA",
+        modalityEvidence=AssayModalityEvidence(
+            modality="RNA", evidenceIds=["assay:RNA:modality"]
+        ),
+    )
+    deps.evidenceIds.add("assay:RNA:modality")
+    with pytest.raises(ValueError, match="before citing individual features"):
+        data_enrichment_validation._validate_feature_policy(
+            deps,
+            FeatureSelectionPolicy(
+                assay="RNA",
+                excludeFeatures=["TBCE"],
+                evidenceIds=list(by_id.evidenceIds),
+            ),
+            StudyContextSummary(),
+        )
+
+
 def test_data_enrichment_tool_helpers_cover_resolution_edges() -> None:
-    assert data_enrichment_tools._assay_modality(None, "RNAassay") == (
-        "RNA",
-        "RNAassay",
-        "assayClass",
-    )
-    assert data_enrichment_tools._assay_modality(None, "ATACassay") == (
-        "ATAC",
-        "ATACassay",
-        "assayClass",
-    )
-    assert data_enrichment_tools._assay_modality(None, "CustomAssay") == (
-        "unsupported",
-        "CustomAssay",
-        "assayClass",
-    )
-    assert data_enrichment_tools._assay_modality(None, "") == (
-        "unsupported",
-        "Assay",
-        "unknown",
-    )
+    assert [
+        data_enrichment_tools._assay_modality(value)
+        for value in ("RNA", "ATAC", "ADT", "HTO", "CRISPR")
+    ] == ["RNA", "ATAC", "ADT", "HTO", "unsupported"]
     assert data_enrichment_tools._valid_peak_coordinate("chr1:10") is False
     assert data_enrichment_tools._valid_peak_coordinate("chr1:start-20") is False
     controls = data_enrichment_tools._inspect_adt_features(

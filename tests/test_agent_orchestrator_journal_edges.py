@@ -222,10 +222,7 @@ def test_resume_answers_are_committed_in_stage_inputs_without_another_ledger() -
     }
     assert journal._resume_answer_errors(pause, bad)
     resume = OrchestrationResumeRecord(
-        workflowRunId=request.workflowRunId,
-        answeredAttempt=journal._parent_link(pause),
-        answers=answers,
-        questionIds=list(answers),
+        answeredAttempt=journal._parent_link(pause), answers=answers
     )
     answered = journal._start_attempt(
         store.zw,
@@ -267,6 +264,69 @@ def test_stage_checksums_and_original_start_are_required() -> None:
     no_listing = SimpleNamespace(store=SimpleNamespace(supports_listing=False))
     with pytest.raises(NotImplementedError, match="listing"):
         journal._list_keys(no_listing, prefix)
+
+
+def test_checkpoint_replay_compares_and_returns_saved_json_values() -> None:
+    store, prefix, record = memory_journal()
+    key = "parameter_tuning/full/review0/evidence/visual"
+    inputs = {"scope": "full"}
+    outputs = {"harmonyGates": {"candidate": (True, ["Matched evidence"])}}
+    saved = {"harmonyGates": {"candidate": [True, ["Matched evidence"]]}}
+    first = journal.save_checkpoint(
+        store, prefix, record.workflowRunId, key, inputs, outputs
+    )
+    replay = journal.save_checkpoint(
+        store, prefix, record.workflowRunId, key, inputs, outputs
+    )
+    assert first == replay == saved
+    with pytest.raises(ValueError, match="different outcome"):
+        journal.save_checkpoint(
+            store,
+            prefix,
+            record.workflowRunId,
+            key,
+            inputs,
+            {"harmonyGates": {"candidate": (False, [])}},
+        )
+
+
+def test_records_that_the_reader_would_reject_are_never_written() -> None:
+    store, prefix, record = memory_journal()
+    start = journal._start_attempt(
+        store.zw, prefix, record.workflowRunId, "data_enrichment", record, []
+    )
+    empty_error = journal._complete_attempt(start, status="failed", error="")
+    before = journal._list_keys(store.zw, prefix)
+    with pytest.raises(ValueError, match="Refusing to save invalid"):
+        journal._save_outcome(store.zw, prefix, empty_error)
+    assert journal._list_keys(store.zw, prefix) == before
+
+
+def test_completion_time_never_precedes_a_start_after_a_clock_step(
+    monkeypatch,
+) -> None:
+    store, prefix, record = memory_journal()
+    start = journal._start_attempt(
+        store.zw, prefix, record.workflowRunId, "ingest", record, []
+    )
+    monkeypatch.setattr(journal.time, "time_ns", lambda: start.startedAtNs - 1_000)
+    outcome = journal._complete_attempt(start, status="done")
+    journal._save_outcome(store.zw, prefix, outcome)
+    assert outcome.completedAtNs == start.startedAtNs
+    assert journal._stage_outcomes(
+        store.zw, prefix, record.workflowRunId, "ingest"
+    ) == [outcome]
+
+
+@pytest.mark.parametrize("identifier", ["../outside", "Workflow", "a/b", ""])
+def test_workflow_identifiers_are_validated_before_any_key_is_read(
+    identifier: str,
+) -> None:
+    store, prefix, _ = memory_journal()
+    with pytest.raises(ValueError, match="Invalid workflow identifier"):
+        journal.read_request(store.zw, prefix, identifier)
+    with pytest.raises(ValueError, match="Invalid workflow identifier"):
+        journal._stage_starts(store.zw, prefix, identifier, "ingest")
 
 
 @pytest.mark.parametrize(

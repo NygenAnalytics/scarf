@@ -6,6 +6,8 @@ from typing import Literal
 import numpy as np
 import zarr
 
+from ..utils.arguments import integer_argument
+from ..utils.arrays import read_only_copy
 from ._rows import read_matrix_rows
 from ._types import MatrixData
 
@@ -14,20 +16,6 @@ type ClusterCandidate = tuple[str, ClusterLabels]
 
 SHARED_CLUSTER_QUOTA_STRATEGY = "sharedClusterQuota"
 DEFAULT_MIN_CLUSTER_QUOTA = 2
-
-
-def _integer(
-    value: object,
-    name: str,
-    *,
-    minimum: int,
-) -> int:
-    if isinstance(value, bool) or not isinstance(value, int | np.integer):
-        raise TypeError(f"{name} must be an integer")
-    resolved = int(value)
-    if resolved < minimum:
-        raise ValueError(f"{name} must be at least {minimum}")
-    return resolved
 
 
 def _read_all_labels(
@@ -54,10 +42,10 @@ def shared_cluster_quota_sample_indices(
     checkpoint: Callable[[], None] | None = None,
 ) -> np.ndarray:
     """Return one seeded sample that covers every cluster in every candidate."""
-    n_cells = _integer(n_cells, "n_cells", minimum=1)
-    seed = _integer(seed, "seed", minimum=0)
-    max_sample_size = _integer(max_sample_size, "max_sample_size", minimum=1)
-    min_cluster_quota = _integer(
+    n_cells = integer_argument(n_cells, "n_cells", minimum=1)
+    seed = integer_argument(seed, "seed", minimum=0)
+    max_sample_size = integer_argument(max_sample_size, "max_sample_size", minimum=1)
+    min_cluster_quota = integer_argument(
         min_cluster_quota,
         "min_cluster_quota",
         minimum=1,
@@ -131,11 +119,7 @@ class ClusterSelectionResult:
             np.integer,
         ):
             raise TypeError("sample_indices must be a one-dimensional integer array")
-        copied_indices = np.array(raw_indices, dtype=np.int64, copy=True)
-        sample_indices = np.frombuffer(
-            copied_indices.tobytes(),
-            dtype=np.int64,
-        )
+        sample_indices = read_only_copy(raw_indices, np.int64)
 
         raw_scores = np.asarray(self.scores)
         if raw_scores.ndim != 1 or not np.issubdtype(
@@ -143,8 +127,7 @@ class ClusterSelectionResult:
             np.floating,
         ):
             raise TypeError("scores must be a one-dimensional floating-point array")
-        copied_scores = np.array(raw_scores, dtype=np.float64, copy=True)
-        scores = np.frombuffer(copied_scores.tobytes(), dtype=np.float64)
+        scores = read_only_copy(raw_scores, np.float64)
         if len(scores) != len(candidate_keys):
             raise ValueError("scores must align with candidate_keys")
 
@@ -160,18 +143,18 @@ class ClusterSelectionResult:
             elif not isinstance(reason, str) or not reason:
                 raise ValueError("invalid scores must have a non-empty reason")
 
-        seed = _integer(self.seed, "seed", minimum=0)
-        population_size = _integer(
+        seed = integer_argument(self.seed, "seed", minimum=0)
+        population_size = integer_argument(
             self.population_size,
             "population_size",
             minimum=1,
         )
-        max_sample_size = _integer(
+        max_sample_size = integer_argument(
             self.max_sample_size,
             "max_sample_size",
             minimum=1,
         )
-        working_memory_mib = _integer(
+        working_memory_mib = integer_argument(
             self.working_memory_mib,
             "working_memory_mib",
             minimum=1,
@@ -183,7 +166,7 @@ class ClusterSelectionResult:
             raise ValueError(
                 f"sample_strategy must be {SHARED_CLUSTER_QUOTA_STRATEGY!r}"
             )
-        min_cluster_quota = _integer(
+        min_cluster_quota = integer_argument(
             self.min_cluster_quota,
             "min_cluster_quota",
             minimum=1,
@@ -285,18 +268,18 @@ def select_clusters_by_silhouette(
     if int(coordinates.shape[1]) <= 0:
         raise ValueError("Coordinates must contain at least one dimension")
 
-    seed = _integer(seed, "seed", minimum=0)
-    max_sample_size = _integer(
+    seed = integer_argument(seed, "seed", minimum=0)
+    max_sample_size = integer_argument(
         max_sample_size,
         "max_sample_size",
         minimum=1,
     )
-    working_memory_mib = _integer(
+    working_memory_mib = integer_argument(
         working_memory_mib,
         "working_memory_mib",
         minimum=1,
     )
-    min_cluster_quota = _integer(
+    min_cluster_quota = integer_argument(
         min_cluster_quota,
         "min_cluster_quota",
         minimum=1,

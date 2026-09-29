@@ -292,6 +292,68 @@ def test_groups_control_contrast_direction(datastore_ephemeral):
     assert ds.get_statistical_tests(backward.artifact).artifact == backward.artifact
 
 
+def test_statistical_design_is_validated_before_planning(
+    datastore_ephemeral, monkeypatch
+):
+    from scarf.metadata.arguments import StatisticalTestingArguments
+
+    ds = datastore_ephemeral
+    _insert_group_columns(ds)
+    grouping = _active_metadata_grouping(ds, "stat_group3")
+
+    def refuse_planning(*_args, **_kwargs):
+        raise AssertionError("an invalid request must not be planned or reused")
+
+    monkeypatch.setattr(StatisticalTestingArguments, "plan", refuse_planning)
+    with pytest.raises(ValueError, match="is reversed"):
+        ds.run_statistical_testing(
+            ["MALAT1"],
+            groups=["g2", "g0"],
+            comparisons=[("g0", "g2")],
+            test="mann_whitney",
+            **grouping,
+        )
+    with pytest.raises(ValueError, match="exactly two groups"):
+        ds.run_statistical_testing(["MALAT1"], test="mann_whitney", **grouping)
+    with pytest.raises(ValueError, match="not present in the data"):
+        ds.run_statistical_testing(
+            ["MALAT1"],
+            test="kruskal_wallis",
+            posthoc="dunn",
+            comparisons=[("g0", "g9")],
+            **grouping,
+        )
+    with pytest.raises(ValueError, match="reversed-duplicate"):
+        ds.run_statistical_testing(
+            ["MALAT1"],
+            test="kruskal_wallis",
+            posthoc="dunn",
+            comparisons=[("g0", "g2"), ("g2", "g0")],
+            **grouping,
+        )
+
+
+@pytest.mark.parametrize(
+    ("method", "groups", "comparisons", "message"),
+    [
+        ("mann_whitney", ["g0"], None, "At least two populated groups"),
+        ("wilcoxon", ["g0", "g1", "g2"], None, "wilcoxon requires exactly two"),
+        ("kruskal_wallis", ["g0", "g1"], None, "at least three groups"),
+        ("kruskal_wallis", ["g0", "g1", "g2"], (("g1", "g1"),), "distinct groups"),
+    ],
+)
+def test_statistical_design_rules_reject_unusable_requests(
+    method, groups, comparisons, message
+):
+    from scarf.datastore._operations.features import _validate_statistical_design
+
+    with pytest.raises(ValueError, match=message):
+        _validate_statistical_design(method, groups, comparisons)
+    assert (
+        _validate_statistical_design("mann_whitney", ["a", "b"], (("a", "b"),)) is None
+    )
+
+
 def test_run_statistical_testing_kruskal_dunn(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
@@ -1237,7 +1299,7 @@ def test_statistical_value_fingerprints_match_single_key_fetch(
     datastore_ephemeral,
     monkeypatch,
 ):
-    from scarf.datastore._operations.features import _value_fingerprint
+    from scarf.features.statistical import value_fingerprint
     from scarf.features.values import fetch_normalized_feature_matrix, resolve_feature
 
     ds = datastore_ephemeral
@@ -1263,7 +1325,7 @@ def test_statistical_value_fingerprints_match_single_key_fetch(
         )
         # The former path fetched and fingerprinted one key at a time.
         single_key = tuple(
-            _value_fingerprint(
+            value_fingerprint(
                 np.asarray(
                     fetch_normalized_feature_matrix(
                         ds,
@@ -1329,6 +1391,16 @@ def test_sample_level_mann_whitney_records_p_value_method(datastore_ephemeral):
     del ds.zw[status.path].attrs["p_value_method"]
     with pytest.raises(ValueError, match="Rerun run_statistical_testing"):
         ds.get_statistical_tests(sample_level.artifact)
+
+    # Every recorded field is required; none falls back to a default.
+    welch_group = ds.zw[ds.inspect_artifact(welch.artifact).path]
+    del welch_group.attrs["sample_stat"]
+    with pytest.raises(ValueError, match=r"missing metadata \(sample_stat\)"):
+        ds.get_statistical_tests(welch.artifact)
+    welch_group.attrs["sample_stat"] = "mean"
+    del welch_group["0"].attrs["group_1_dtype"]
+    with pytest.raises(ValueError, match="'group_1' has invalid dtype metadata"):
+        ds.get_statistical_tests(welch.artifact)
 
 
 def test_study_design_pairs_subjects_only_for_wilcoxon(datastore_ephemeral):

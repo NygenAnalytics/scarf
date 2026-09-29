@@ -6,14 +6,13 @@ from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from typing import Any, Literal
 
-from threadpoolctl import threadpool_limits
 
+from ..utils.compute import process_thread_limit
 from ..utils.shutdown import shutdown_checkpoint
 
-__all__ = ["map_shards", "stream_shards", "in_shard_context"]
+__all__ = ["stream_shards", "in_shard_context"]
 
 type Backend = Literal["thread", "serial"]
-type RangeProduce = Callable[[int, int, int], Any]
 
 _shard_ctx = threading.local()
 
@@ -47,7 +46,7 @@ def _io_concurrency(io: int | None) -> Iterator[None]:
 def _blas_limit(within: int | None) -> Any:
     if within is None or within < 1 or in_shard_context():
         return nullcontext()
-    return threadpool_limits(limits=within)
+    return process_thread_limit(within)
 
 
 def _close_iterator(iterator: Iterator[Any]) -> None:
@@ -170,41 +169,3 @@ def stream_shards(
             within_block_threads=within_block_threads,
         )
         yield from _progress(base, msg, total)
-
-
-def map_shards(
-    ranges: list[tuple[int, int]],
-    produce: RangeProduce,
-    *,
-    workers: int,
-    within_block_threads: int | None = None,
-    io_concurrency: int | None = None,
-    msg: str | None = None,
-    backend: Backend = "thread",
-) -> list[Any]:
-    """Map row ranges in parallel while preserving input order."""
-    n_ranges = len(ranges)
-    if n_ranges == 0:
-        return []
-    if io_concurrency is None:
-        io_concurrency = min(max(1, workers), n_ranges)
-    if within_block_threads is None:
-        within_block_threads = 1
-    indexed = list(enumerate(ranges))
-
-    def call(item: tuple[int, tuple[int, int]]) -> Any:
-        index, (start, end) = item
-        return produce(index, start, end)
-
-    return list(
-        stream_shards(
-            indexed,
-            call,
-            workers=min(max(1, workers), n_ranges),
-            within_block_threads=within_block_threads,
-            io_concurrency=io_concurrency,
-            msg=msg,
-            total=n_ranges,
-            backend=backend,
-        )
-    )

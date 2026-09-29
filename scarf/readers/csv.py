@@ -5,6 +5,47 @@ import numpy as np
 import pandas as pd
 
 from ..utils.progress import iter_progress
+from ._text import require_unique_identifiers
+
+
+def _count_dtype(frame: pd.DataFrame) -> np.dtype[Any]:
+    """Return the dtype of one chunk of count columns after validating it."""
+    for dtype in frame.dtypes:
+        if pd.api.types.is_bool_dtype(dtype) or not pd.api.types.is_numeric_dtype(
+            dtype
+        ):
+            raise ValueError(
+                "CSV count columns must contain numbers; move text columns to "
+                "cell_data_cols or skip_cols"
+            )
+    if frame.shape[1] == 0:
+        return np.dtype(np.int64)
+    if frame.shape[0]:
+        # Column reductions avoid copying the chunk into one array.
+        minimum = frame.min(axis=0, skipna=False).to_numpy(dtype=np.float64)
+        maximum = frame.max(axis=0, skipna=False).to_numpy(dtype=np.float64)
+        if not (np.isfinite(minimum).all() and np.isfinite(maximum).all()):
+            raise ValueError("CSV counts contain missing or non-finite values")
+        if bool((minimum < 0).any()):
+            raise ValueError("CSV counts must not be negative")
+    return np.dtype(np.result_type(*frame.dtypes))
+
+
+def _metadata_dtype(series: pd.Series) -> np.dtype[Any]:
+    """Return a numeric dtype for numeric columns and ``object`` for text."""
+    dtype = series.dtype
+    resolved: np.dtype[Any] = np.dtype(object)
+    if pd.api.types.is_bool_dtype(dtype) or pd.api.types.is_numeric_dtype(dtype):
+        resolved = np.dtype(dtype)
+    return resolved
+
+
+def _merged_dtype(current: np.dtype[Any] | None, dtype: np.dtype[Any]) -> np.dtype[Any]:
+    if current is None:
+        return dtype
+    if current.kind == "O" or dtype.kind == "O":
+        return np.dtype(object)
+    return np.result_type(current, dtype)
 
 
 class CSVReader:
@@ -29,6 +70,9 @@ class CSVReader:
     Attributes:
         nFeatures: Number of features in dataset.
         nCells: Number of cells in dataset.
+        countDtype: Dtype that holds the count values of every row.
+        cellDataDtypes: Dtype of each ``cell_data_cols`` column across every
+                        row; ``object`` marks a text column.
     """
 
     def __init__(
@@ -83,6 +127,7 @@ class CSVReader:
             self.keepCols,
             self.cellDataDtypes,
             self.cellDataIdx,
+            self.countDtype,
         ) = self._consistency_check()
 
     def _get_streamer(self) -> Generator[pd.DataFrame, None, None]:
@@ -99,14 +144,17 @@ class CSVReader:
         list[int] | None,
         list[np.dtype] | None,
         list[int] | None,
+        np.dtype,
     ]:
+        """Stream every row once to fix the shape and the dtypes of all rows."""
         stream = self._get_streamer()
         n_cells = 0
         n_features = 0
         feature_ids: np.ndarray | None = None
+        keep_cols: list[int] | None = None
         cell_data_dtypes: list[np.dtype] | None = None
         cell_data_idx: list[int] | None = None
-        cell_ids: np.ndarray | None = None
+        count_dtype: np.dtype | None = None
         collected_cell_ids: list[Any] | None = None
         if self.pandas_kwargs["index_col"] is not None:
             collected_cell_ids = []
@@ -114,6 +162,9 @@ class CSVReader:
             stream,
             desc="Checking CSV consistency",
         ):
+            if df.shape[0] == 0:
+                # A header-only file yields one empty chunk of untyped columns.
+                continue
             n_cells += df.shape[0]
             if collected_cell_ids is not None:
                 collected_cell_ids.extend(df.index.to_numpy())
@@ -127,29 +178,53 @@ class CSVReader:
                             " skip the right number of rows."
                         )
                     if len(self.cellDataCols) > 0:
-                        cell_data_dtypes = list(df[self.cellDataCols].dtypes.values)
+                        absent = [
+                            name for name in self.cellDataCols if name not in df.columns
+                        ]
+                        if absent:
+                            raise KeyError(
+                                f"cell_data_cols are not CSV columns: {absent}"
+                            )
                         cell_data_idx = df.columns.get_indexer(
                             self.cellDataCols
                         ).tolist()
-            else:
-                if n_features != df.shape[1]:
-                    raise ValueError(
-                        "Number of columns changed in the CSV during consistency check."
-                        " Maybe a problem with the delimiter."
-                    )
+                    skip_names = set(self.skipCols).union(self.cellDataCols)
+                    if skip_names:
+                        keep_cols = [
+                            n for n, x in enumerate(feature_ids) if x not in skip_names
+                        ]
+            elif n_features != df.shape[1]:
+                raise ValueError(
+                    "Number of columns changed in the CSV during consistency check."
+                    " Maybe a problem with the delimiter."
+                )
+            counts = df if keep_cols is None else df.iloc[:, keep_cols]
+            count_dtype = _merged_dtype(count_dtype, _count_dtype(counts))
+            if cell_data_idx is not None:
+                chunk_dtypes = [
+                    _metadata_dtype(df.iloc[:, index]) for index in cell_data_idx
+                ]
+                cell_data_dtypes = (
+                    chunk_dtypes
+                    if cell_data_dtypes is None
+                    else [
+                        _merged_dtype(current, dtype)
+                        for current, dtype in zip(
+                            cell_data_dtypes, chunk_dtypes, strict=True
+                        )
+                    ]
+                )
+        if count_dtype is None:
+            raise ValueError("CSV file contains no data rows")
+        cell_ids: np.ndarray | None = None
         if collected_cell_ids is not None:
             if len(collected_cell_ids) != n_cells:
                 raise ValueError("Number of cell IDs does not match the CSV row count")
             cell_ids = np.asarray(collected_cell_ids)
-        keep_cols: list[int] | None = None
-        if feature_ids is not None:
-            skip_names = list(set(self.skipCols).union(self.cellDataCols))
-            if len(skip_names) > 0:
-                keep_cols = [
-                    n for n, x in enumerate(feature_ids) if x not in skip_names
-                ]
-                feature_ids = feature_ids[keep_cols]
-                n_features = len(keep_cols)
+            require_unique_identifiers(cell_ids, "CSV cell IDs")
+        if feature_ids is not None and keep_cols is not None:
+            feature_ids = feature_ids[keep_cols]
+            n_features = len(keep_cols)
         return (
             n_cells,
             n_features,
@@ -158,6 +233,7 @@ class CSVReader:
             keep_cols,
             cell_data_dtypes,
             cell_data_idx,
+            count_dtype,
         )
 
     def cell_ids(self) -> np.ndarray:

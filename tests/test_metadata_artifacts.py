@@ -258,7 +258,7 @@ def test_cell_aligned_artifact_resolver_validates_lineage_and_reads_subset(
         resolve_cell_aligned_artifact(root, planned.ref)
 
 
-def test_cell_data_artifact_validation_and_failed_write_status() -> None:
+def test_cell_data_artifact_validation_and_failed_write_removes_slot() -> None:
     root, selection = _memory_metadata_root()
     wrong_selection = ArtifactRef(
         scope="datastore",
@@ -302,9 +302,7 @@ def test_cell_data_artifact_validation_and_failed_write_status() -> None:
             {"values": np.asarray([["a"], ["b"]])},
         )
 
-    failed_status = inspect_artifact(root, planned.ref)
-    assert failed_status.exists
-    assert failed_status.complete is False
+    assert not inspect_artifact(root, planned.ref).exists
     retry = plan_cell_data_artifact(
         root,
         **common,
@@ -377,6 +375,39 @@ def test_leiden_backend_is_part_of_artifact_identity(datastore_ephemeral) -> Non
         )
 
 
+def test_leiden_graph_flags_reach_the_graph_loader_as_booleans(
+    datastore_ephemeral,
+    monkeypatch,
+):
+    datastore = datastore_ephemeral
+    graph = _ensure_graph(datastore)
+    loads: list[tuple[object, object]] = []
+    original = datastore._load_graph_artifact
+
+    def recording(graph_ref, *, symmetric, upper_only, use_k):
+        loads.append((symmetric, upper_only))
+        return original(
+            graph_ref, symmetric=symmetric, upper_only=upper_only, use_k=use_k
+        )
+
+    monkeypatch.setattr(datastore, "_load_graph_artifact", recording)
+    ref = datastore.run_leiden_clustering(
+        graph,
+        resolution=0.9,
+        symmetric_graph=np.True_,
+        graph_upper_only=np.False_,
+        invalidate_cache=True,
+    )
+
+    # A numpy True is recorded as True, so it must also symmetrize the graph.
+    assert loads == [(True, False)]
+    assert all(type(flag) is bool for flag in loads[0])
+    assert datastore.inspect_artifact(ref).parameters["symmetric_graph"] is True
+    for flag in ("symmetric_graph", "graph_upper_only"):
+        with pytest.raises(TypeError, match=f"{flag} must be a boolean"):
+            datastore.run_leiden_clustering(graph, **{flag: 1})
+
+
 def test_leiden_does_not_reuse_artifacts_without_edge_weighting(datastore_ephemeral):
     datastore = datastore_ephemeral
     graph = _ensure_graph(datastore)
@@ -410,26 +441,21 @@ def test_leiden_does_not_reuse_artifacts_without_edge_weighting(datastore_epheme
     assert datastore.run_leiden_clustering(graph) == actual
 
 
-def test_membership_smart_labels_and_lisi_are_artifact_only(
+def test_membership_and_smart_labels_are_artifact_only(
     datastore_ephemeral,
 ) -> None:
     datastore = datastore_ephemeral
     graph = _ensure_graph(datastore)
-    neighbors = _graph_neighbors(datastore, graph)
     clusters = datastore.run_leiden_clustering(graph)
     columns_before = set(datastore.cells.columns)
 
     membership = datastore.calc_membership_strength(clusters, graph)
     smart = datastore.smart_label(clusters, clusters)
-    lisi = datastore.metric_lisi(["names"], neighbors, perplexity=1)
 
     assert membership.kind == "membership_strength"
     assert smart.kind == "smart_label"
-    assert lisi.kind == "quality_metric"
     assert datastore.calc_membership_strength(clusters, graph) == membership
     assert datastore.smart_label(clusters, clusters) == smart
-    loaded = datastore.load_metric_lisi(lisi)
-    assert loaded["names"].shape == (datastore.load_graph(graph).shape[0],)
     assert set(datastore.cells.columns) == columns_before
 
 
@@ -551,7 +577,7 @@ def test_imputation_batches_preserve_requested_columns_and_stream_rows(
     )
     original_load = store._load_diffusion_operator_with_lineage
     calls = []
-    original_columns = store.cells._column_map
+    original_columns = store.cells._column_names
     column_scans = []
 
     def columns():
@@ -568,7 +594,7 @@ def test_imputation_batches_preserve_requested_columns_and_stream_rows(
         return original_normed(*args, **kwargs)._with_block_size(29)
 
     monkeypatch.setattr(store, "_load_diffusion_operator_with_lineage", load)
-    monkeypatch.setattr(store.cells, "_column_map", columns)
+    monkeypatch.setattr(store.cells, "_column_names", columns)
     monkeypatch.setattr(store.RNA, "normed", normed)
     actual = store.get_imputed([metadata_name, "DUPLICATE", "duplicate"], diffusion)
     np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
@@ -622,7 +648,6 @@ def test_explicit_graph_consumers_ignore_later_live_selection_changes(
     datastore = datastore_ephemeral
     graph = _ensure_graph(datastore)
     graph_n = datastore.load_graph(graph).shape[0]
-    neighbors = _graph_neighbors(datastore, graph)
     initialization = _graph_initialization(datastore, graph)
     mask = np.asarray(datastore.cells.fetch_all("I"), dtype=bool)
     selected = np.flatnonzero(mask)
@@ -636,14 +661,12 @@ def test_explicit_graph_consumers_ignore_later_live_selection_changes(
     operator = datastore.load_diffusion_operator(diffusion)
     feature_name = str(datastore.RNA.feats.fetch_all("names")[0])
     imputed = datastore.get_imputed(feature_name, diffusion)
-    lisi = datastore.metric_lisi(["names"], neighbors, perplexity=1)
 
     assert clusters.kind == "cluster_labels"
     assert embedding.kind == "embedding"
     assert diffusion.kind == "diffusion_operator"
     assert operator.shape == (graph_n, graph_n)
     assert imputed.shape == (graph_n,)
-    assert datastore.load_metric_lisi(lisi)["names"].shape == (graph_n,)
 
 
 def test_graph_consumers_require_explicit_artifact_refs(datastore_ephemeral) -> None:
@@ -674,7 +697,9 @@ def test_graph_consumers_require_explicit_artifact_refs(datastore_ephemeral) -> 
         datastore.run_umap(coordinates, initialization, n_epochs=10)
 
 
-def test_lisi_rejects_incomplete_ann_dependency(datastore_ephemeral) -> None:
+def test_neighbor_metrics_reject_incomplete_ann_dependency(
+    datastore_ephemeral,
+) -> None:
     datastore = datastore_ephemeral
     graph = _ensure_graph(datastore)
     neighbors = _graph_neighbors(datastore, graph)
@@ -689,7 +714,7 @@ def test_lisi_rejects_incomplete_ann_dependency(datastore_ephemeral) -> None:
             ArtifactResolutionError,
             match=r"(?i)artifact is incomplete",
         ) as error:
-            datastore.metric_lisi(["names"], neighbors=neighbors, perplexity=1)
+            datastore.metric_ilisi("names", neighbors=neighbors, perplexity=1)
         assert error.value.code == "incomplete_artifact"
     finally:
         ann_group.attrs["complete"] = True

@@ -5,6 +5,8 @@ import numpy as np
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
 
+from ..assay.normalization import clr_values
+
 __all__ = ["hto_demux"]
 
 _NORMALIZATION_METHOD = "clr_per_hto"
@@ -93,8 +95,11 @@ def _validated_hto_counts(hto_counts: pd.DataFrame) -> pd.DataFrame:
 
 
 def _clr_normalize(hto_counts: pd.DataFrame) -> pd.DataFrame:
-    scale = np.exp(np.log1p(hto_counts).sum(axis=0) / len(hto_counts))
-    normalized = np.log1p(hto_counts / scale)
+    normalized = pd.DataFrame(
+        clr_values(hto_counts.to_numpy()),
+        index=hto_counts.index,
+        columns=hto_counts.columns,
+    )
     if not np.all(np.isfinite(normalized.to_numpy())):
         raise ValueError("CLR normalization produced non-finite HTO values")
     return normalized

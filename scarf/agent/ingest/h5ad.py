@@ -128,8 +128,9 @@ def ingest_h5ad(
                 writer_kwargs["assay_name_map"] = assay_name_map
         else:
             writer_kwargs["assay_name"] = directions.get("assayName") or "RNA"
-        writer = H5adToZarr(reader, **writer_kwargs)
+        # Writers open the destination in their constructor.
         writer_started = True
+        writer = H5adToZarr(reader, **writer_kwargs)
         writer.dump()
     except CONVERSION_DATA_ERRORS as exc:
         return failed_from_exception(

@@ -1,6 +1,5 @@
 """Characterize cell covariates and study-design confounding."""
 
-import hashlib
 import re
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -19,12 +18,9 @@ from ...metadata.queries import (
 from ...metadata.rows import MetaDataRowBlock
 from ...metadata.selection import resolve_cell_aligned_artifact
 from ...metrics.association import directional_mapping, report_confounding
-from ...storage.artifacts import fingerprint_array
 from ...storage.refs import ArtifactRef
 from ...storage.selections import read_stored_selection_indices
-from ..decisions.selection import DecisionValidationError, decide
 from ..tools import artifact_reference, mark_missing_rows, read_marked_metadata_rows
-from ..types import Decision, EvidenceItem
 from .contracts import CovariateCharacterization
 
 __all__ = [
@@ -52,6 +48,7 @@ _DOMAINS = frozenset({"biological", "technical", "design", "ignore", "unknown"})
 _ANALYSED = frozenset({"biological", "technical", "design"})
 _KINDS = frozenset({"categorical", "continuous"})
 _RESERVED_COLUMNS = frozenset({"I", "ids", "names"})
+_ASSAY_STATISTICS = ("nCounts", "nFeatures", "percentMito", "percentRibo")
 _SHORT_EMBEDDING_PARTS = frozenset({"fa", "dm", "pc"})
 _INDEXED_NAME = re.compile(r"(?P<stem>.+?)[-_]?(?P<index>\d+)")
 _ONTOLOGY_SUFFIX = "_ontology_term_id"
@@ -63,47 +60,6 @@ _DROP_REASONS = {
     "dropEmbedding": "embedding-style column",
     "dropConstant": "single-level column",
 }
-
-
-_DOMAIN_EVIDENCE = [
-    EvidenceItem(
-        id="domain:biological",
-        label="biological",
-        summary="Biology of interest such as disease, sex, genotype, treatment",
-    ),
-    EvidenceItem(
-        id="domain:technical",
-        label="technical",
-        summary="Technical handling such as batch, chemistry, sequencing run",
-    ),
-    EvidenceItem(
-        id="domain:design",
-        label="design",
-        summary="Sampling design such as donor, sample, replicate, subject",
-    ),
-    EvidenceItem(
-        id="domain:ignore",
-        label="ignore",
-        summary="Identifiers, QC metrics, clusters, or other non-design labels",
-    ),
-    EvidenceItem(
-        id="domain:unknown",
-        label="unknown",
-        summary="Cannot classify from available evidence",
-    ),
-]
-_COEFFICIENT_EVIDENCE = [
-    EvidenceItem(
-        id="coefficient:yes",
-        label="yes",
-        summary="Treat this biological column as a coefficient of interest",
-    ),
-    EvidenceItem(
-        id="coefficient:no",
-        label="no",
-        summary="Do not treat this biological column as a coefficient of interest",
-    ),
-]
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,57 +254,19 @@ class _Run:
     store: Any
     cell_key: str
     n_rows: int
-    context: str
-    model: Any | None
     profiles: dict[str, _ColumnProfile] = field(default_factory=dict)
     domains: dict[str, Domain] = field(default_factory=dict)
     audit: list[dict[str, Any]] = field(default_factory=list)
     actions: list[str] = field(default_factory=list)
-    decisions: list[dict[str, Any]] = field(default_factory=list)
 
     def note(self, *, kind: str, detail: str, **fields: Any) -> None:
         self.audit.append({"kind": kind, "detail": detail, **fields})
-
-    def summary(self, name: str) -> str:
-        return self.profiles[name].summary
 
     def kind(self, name: str) -> ColumnKind:
         return self.profiles[name].kind
 
     def digest(self, name: str) -> PartitionDigest:
         return self.profiles[name].digest
-
-    def ask(
-        self,
-        *,
-        task: str,
-        question: str,
-        evidence: Sequence[EvidenceItem],
-        column: str | None = None,
-    ) -> Decision | None:
-        """Run one grounded decision, or return None when it cannot be asked."""
-        if self.model is None or len(evidence) < 2:
-            return None
-        try:
-            decision = decide(model=self.model, question=question, evidence=evidence)
-        except DecisionValidationError as exc:
-            self.note(
-                kind="decisionInvalid",
-                detail=str(exc),
-                task=task,
-                column=column,
-            )
-            return None
-        record: dict[str, Any] = {
-            "task": task,
-            "selectedId": decision.selectedId,
-            "rationale": decision.rationale,
-            "evidenceIds": list(decision.evidenceIds),
-        }
-        if column is not None:
-            record["column"] = column
-        self.decisions.append(record)
-        return decision
 
 
 def _is_embedding_column(name: str) -> bool:
@@ -363,16 +281,24 @@ def _is_embedding_column(name: str) -> bool:
 
 
 def _infer_kind(values: np.ndarray) -> ColumnKind:
-    if (
-        values.dtype == object
-        or np.issubdtype(values.dtype, np.str_)
-        or np.issubdtype(values.dtype, np.bool_)
-    ):
+    if np.issubdtype(values.dtype, np.str_) or np.issubdtype(values.dtype, np.bool_):
         return "categorical"
-    try:
-        numeric = np.asarray(values, dtype=float)
-    except (TypeError, ValueError):
-        return "categorical"
+    if values.dtype == object:
+        # Linked missing masks turn numeric columns into objects; infer from the
+        # recorded values so a missing row does not change the column kind.
+        present = values[~np.asarray(pd.isna(values), dtype=bool)]
+        if not present.size or not all(
+            isinstance(value, int | float | np.integer | np.floating)
+            and not isinstance(value, bool | np.bool_)
+            for value in present
+        ):
+            return "categorical"
+        numeric = np.asarray(present, dtype=float)
+    else:
+        try:
+            numeric = np.asarray(values, dtype=float)
+        except (TypeError, ValueError):
+            return "categorical"
     finite = numeric[np.isfinite(numeric)]
     if finite.size == 0 or not bool(np.all(np.mod(finite, 1) == 0)):
         return "continuous"
@@ -411,23 +337,16 @@ def _profile_column(
     cell_key: str,
     kind: ColumnKind | None = None,
     inventory: dict[str, Any] | None = None,
+    fingerprint: str | None = None,
 ) -> _ColumnProfile:
     values = store.cells.fetch(name, key=cell_key)
     resolved_kind = kind or _infer_kind(values)
-    artifact_source = getattr(store.cells, "artifact_source", lambda _name: None)(name)
+    artifact_source = store.cells.artifact_source(name)
     identity = None
     if inventory is not None:
-        # Metadata are mutable even when the selected cell identities are frozen.
-        value_identity = (
-            hashlib.sha256(
-                "\n".join(
-                    repr((type(value).__name__, value)) for value in values.tolist()
-                ).encode()
-            ).hexdigest()
-            if values.dtype.hasobject
-            else fingerprint_array(values)
-        )
-        identity = (str(values.dtype), value_identity, resolved_kind, artifact_source)
+        if fingerprint is None:
+            raise ValueError("A reusable column profile requires its fingerprint")
+        identity = (fingerprint, resolved_kind, artifact_source)
         saved = inventory.get(name)
         if saved is not None and saved[0] == identity:
             return cast(_ColumnProfile, saved[1])
@@ -456,17 +375,21 @@ def _triage_columns(
     cell_key: str,
     exclude: set[str],
 ) -> tuple[list[str], list[tuple[str, str]]]:
-    """Split cell columns into model candidates and deterministic drops."""
-    assay_prefixes = tuple(f"{name}_" for name in store.assay_names)
-    artifact_columns = set(getattr(store.cells, "artifact_columns", ()))
+    """Split cell columns into candidates and deterministic drops."""
+    statistics = {
+        f"{assay}_{statistic}"
+        for assay in store.assay_names
+        for statistic in _ASSAY_STATISTICS
+    }
+    artifact_columns = set(store.cells.artifact_columns)
     candidates: list[str] = []
     dropped: list[tuple[str, str]] = []
-    for name in store.cells.columns:
+    for name in sorted(store.cells.columns):
         if name in _RESERVED_COLUMNS or name == cell_key or name in exclude:
             continue
         if name in artifact_columns:
             candidates.append(name)
-        elif name.startswith(assay_prefixes):
+        elif name in statistics:
             dropped.append((name, "dropAssayStat"))
         elif _is_embedding_column(name):
             dropped.append((name, "dropEmbedding"))
@@ -579,63 +502,11 @@ def _validate_directions(
     return errors
 
 
-def _choose_representative(
-    run: _Run,
-    members: Sequence[str],
-    correspondence: str,
-) -> str | None:
-    decision = run.ask(
-        task="equivalentColumns",
-        question=(
-            f"Columns {', '.join(members)} assign every cell to the same groups. "
-            f"Their labels line up as {correspondence}. Decide whether they record "
-            "one variable under different labels, and if so whose labels to keep."
-        ),
-        evidence=[
-            EvidenceItem(
-                id="equivalent:distinct",
-                label="distinct variables",
-                summary="Different variables that happen to coincide in this dataset",
-            ),
-            *(
-                EvidenceItem(
-                    id=f"equivalent:{name}",
-                    label=name,
-                    summary=run.summary(name),
-                )
-                for name in members
-            ),
-        ],
-    )
-    selected = (
-        None if decision is None else decision.selectedId.removeprefix("equivalent:")
-    )
-    if selected in set(members):
-        run.actions.append(f"equivalentColumns:{selected}")
-        return selected
-    run.note(
-        kind="equivalentKeptApart",
-        detail=(
-            f"{', '.join(members)} share one partition but were not collapsed "
-            + ("(no model decision)" if decision is None else "(judged distinct)")
-        ),
-        columns=list(members),
-        levels=correspondence,
-    )
-    return None
+def _note_equivalent_columns(run: _Run, candidates: Sequence[str]) -> None:
+    """Record categorical columns that cut the cells into identical groups.
 
-
-def _collapse_equivalent_columns(
-    run: _Run,
-    candidates: Sequence[str],
-    aliases: dict[str, list[str]],
-) -> list[str]:
-    """Collapse categorical columns that cut the cells into identical groups.
-
-    An identical partition is also what perfect confounding looks like, so a
-    class is only eligible when every member carries the same analysis domain,
-    and the representative is a model judgement rather than a name rule.
-    Extends ``aliases`` in place.
+    An identical partition is also what perfect confounding looks like, so the
+    columns are kept apart and the shared partition is reported.
     """
     classes: dict[tuple[bytes, int, int], list[str]] = {}
     for name in candidates:
@@ -644,55 +515,43 @@ def _collapse_equivalent_columns(
         classes.setdefault(_digest_key(run.digest(name)), []).append(name)
 
     # Store column order is not stable, and members of a class are
-    # interchangeable, so order them here to keep prompts and notes reproducible.
-    dropped: set[str] = set()
+    # interchangeable, so order them here to keep notes reproducible.
     for members in sorted(sorted(group) for group in classes.values()):
         if len(members) < 2:
             continue
-        representative_name = members[0]
-        verified: list[str] = [representative_name]
+        verified = [members[0]]
         correspondence = ""
         for other in members[1:]:
             same, corr = columns_same_partition(
                 run.store.cells,
-                representative_name,
+                members[0],
                 other,
                 cell_key=run.cell_key,
             )
-            if not same:
-                continue
-            verified.append(other)
-            correspondence = corr
+            if same:
+                verified.append(other)
+                correspondence = corr
         if len(verified) < 2:
             continue
-        members = verified
-        domains = sorted({run.domains[name] for name in members})
+        domains = sorted({run.domains[name] for name in verified})
         if len(domains) > 1:
             run.note(
                 kind="equivalentAcrossDomains",
                 detail=(
-                    f"{', '.join(members)} share one partition across domains "
+                    f"{', '.join(verified)} share one partition across domains "
                     f"{domains}; kept apart as perfect confounding"
                 ),
-                columns=list(members),
+                columns=list(verified),
                 domains=domains,
                 levels=correspondence,
             )
             continue
-        representative = _choose_representative(run, members, correspondence)
-        if representative is None:
-            continue
-        others = [name for name in members if name != representative]
-        aliases.setdefault(representative, []).extend(others)
-        dropped.update(others)
         run.note(
-            kind="equivalentColumns",
-            detail=f"Collapsed {', '.join(others)} onto {representative}",
-            representative=representative,
-            aliases=others,
+            kind="equivalentKeptApart",
+            detail=f"{', '.join(verified)} share one partition and were kept apart",
+            columns=list(verified),
             levels=correspondence,
         )
-    return [name for name in candidates if name not in dropped]
 
 
 def _assign_domain(run: _Run, name: str, directed: Mapping[str, Domain]) -> Domain:
@@ -700,33 +559,12 @@ def _assign_domain(run: _Run, name: str, directed: Mapping[str, Domain]) -> Doma
         domain = directed[name]
         run.actions.append(f"domain:{name}->{domain} (directions)")
         return domain
-    decision = run.ask(
-        task="columnDomain",
+    run.note(
+        kind="domainUnknown",
+        detail=f"Left {name} as unknown domain",
         column=name,
-        question=(
-            f"Assign a domain for cell metadata column {name}. "
-            f"Column summary: {run.summary(name)}. "
-            f"Study context: {run.context or 'none provided'}."
-        ),
-        evidence=_DOMAIN_EVIDENCE,
     )
-    if decision is None:
-        run.note(
-            kind="domainUnknown",
-            detail=f"Left {name} as unknown domain",
-            column=name,
-        )
-        return "unknown"
-    selected = decision.selectedId.removeprefix("domain:")
-    if selected not in _DOMAINS:
-        run.note(
-            kind="domainUnknown",
-            detail=f"Unsupported domain {selected!r} returned for {name}",
-            column=name,
-        )
-        return "unknown"
-    run.actions.append(f"domain:{name}->{selected}")
-    return cast(Domain, selected)
+    return "unknown"
 
 
 def _select_coefficients(
@@ -741,37 +579,12 @@ def _select_coefficients(
             selected.append(name)
             run.actions.append(f"coefficient:{name} (directions)")
             continue
-        decision = run.ask(
-            task="coefficientOfInterest",
+        run.note(
+            kind="coefficientSkipped",
+            detail=f"No direction for biological column {name}",
             column=name,
-            question=(
-                f"Should biological column {name} be a coefficient of interest? "
-                f"Column summary: {run.summary(name)}. "
-                f"Study context: {run.context or 'none provided'}."
-            ),
-            evidence=_COEFFICIENT_EVIDENCE,
         )
-        if decision is None:
-            run.note(
-                kind="coefficientSkipped",
-                detail=f"No model or direction for biological column {name}",
-                column=name,
-            )
-        elif decision.selectedId == "coefficient:yes":
-            selected.append(name)
-            run.actions.append(f"coefficient:{name}")
     return selected
-
-
-def _unit_evidence(run: _Run, names: Sequence[str], prefix: str) -> list[EvidenceItem]:
-    return [
-        EvidenceItem(
-            id=f"{prefix}:{name}",
-            label=name,
-            summary=(f"domain={run.domains.get(name, 'unknown')}; {run.summary(name)}"),
-        )
-        for name in names
-    ]
 
 
 def _observation_unit_candidates(
@@ -1011,7 +824,6 @@ def _resolve_units(
     coefficient: str,
     *,
     directed: Mapping[str, Any],
-    design_columns: Sequence[str],
     unit_candidates: Sequence[str],
 ) -> tuple[str | None, str | None]:
     unit_map = dict(directed.get(coefficient) or {})
@@ -1050,34 +862,7 @@ def _resolve_units(
     elif len(valid_observation) == 1:
         observation = valid_observation[0]
         run.actions.append(f"observationUnit:{coefficient}->{observation}")
-    elif len(valid_observation) >= 2:
-        decision = run.ask(
-            task="observationUnit",
-            column=coefficient,
-            question=(
-                f"Choose the observation unit for coefficient {coefficient}. "
-                "Only columns where this coefficient is constant within each "
-                "level are listed. Each distinct value is one design-table row. "
-                f"Study context: {run.context or 'none provided'}."
-            ),
-            evidence=_unit_evidence(run, valid_observation, "unit"),
-        )
-        if decision is not None:
-            observation = decision.selectedId.removeprefix("unit:")
-            if observation not in valid_observation:
-                run.note(
-                    kind="invalidObservationUnit",
-                    detail=(
-                        f"Model chose {observation!r}, which is not a valid "
-                        f"observation unit for {coefficient}"
-                    ),
-                    column=coefficient,
-                    observationUnit=observation,
-                )
-                observation = None
-            else:
-                run.actions.append(f"observationUnit:{coefficient}->{observation}")
-    else:
+    elif not valid_observation:
         run.note(
             kind="noValidObservationUnit",
             detail=(
@@ -1089,19 +874,6 @@ def _resolve_units(
 
     if observation is None:
         return None, None
-
-    valid_independent = [
-        name
-        for name in design_columns
-        if name not in {coefficient, observation}
-        and name in run.profiles
-        and _independent_is_coarser(
-            run.store,
-            cell_key=run.cell_key,
-            observation=observation,
-            independent=name,
-        )
-    ]
 
     if independent is not None:
         if independent not in run.profiles:
@@ -1130,40 +902,6 @@ def _resolve_units(
                 independentUnit=independent,
             )
             independent = None
-    elif valid_independent:
-        decision = run.ask(
-            task="independentUnit",
-            column=coefficient,
-            question=(
-                f"Optional independent unit for coefficient {coefficient} "
-                f"with observation unit {observation}. Listed columns are "
-                "coarser than the observation unit (each observation level "
-                "maps to one independent level)."
-            ),
-            evidence=[
-                EvidenceItem(
-                    id="independentUnit:none",
-                    label="none",
-                    summary="No separate independent unit or subject column",
-                ),
-                *_unit_evidence(run, valid_independent, "independentUnit"),
-            ],
-        )
-        if decision is not None and decision.selectedId != "independentUnit:none":
-            chosen = decision.selectedId.removeprefix("independentUnit:")
-            if chosen not in valid_independent:
-                run.note(
-                    kind="invalidIndependentUnit",
-                    detail=(
-                        f"Model chose {chosen!r}, which is not coarser than "
-                        f"observation unit {observation!r}"
-                    ),
-                    column=coefficient,
-                    independentUnit=chosen,
-                )
-            else:
-                independent = chosen
-                run.actions.append(f"independentUnit:{coefficient}->{independent}")
     return observation, independent
 
 
@@ -1444,7 +1182,6 @@ def _characterize_coefficients(
             run,
             coefficient,
             directed=unit_directions,
-            design_columns=design_columns,
             unit_candidates=[*design_columns, *technical],
         )
         record, report = _characterize_coefficient(
@@ -1592,13 +1329,16 @@ def characterize_covariates(
     store: Any,
     *,
     cellSelection: ArtifactRef,
-    studyContext: str | None = None,
-    model: Any | None = None,
     directions: Mapping[str, Any] | None = None,
     groupingArtifacts: Mapping[str, ArtifactRef] | None = None,
     inventory: dict[str, Any] | None = None,
+    fingerprints: Mapping[str, str] | None = None,
 ) -> CovariateCharacterization:
-    """Label cell covariates and record design-level confounding."""
+    """Label cell covariates and record design-level confounding.
+
+    Column profiles are reused from ``inventory`` only when their value
+    ``fingerprints`` match, so an inventory requires the fingerprints.
+    """
     if (
         not isinstance(cellSelection, ArtifactRef)
         or cellSelection.kind != "cell_selection"
@@ -1610,6 +1350,8 @@ def characterize_covariates(
         cellSelection,
         artifacts=grouping_artifacts,
     )
+    if inventory is not None and fingerprints is None:
+        raise ValueError("A column inventory requires value fingerprints")
     if inventory is not None and inventory.get("cellSelection") != cellSelection:
         inventory.clear()
         inventory["cellSelection"] = cellSelection
@@ -1648,6 +1390,7 @@ def characterize_covariates(
             cell_key=cell_key,
             kind=cast(ColumnKind, directed_kind) if directed_kind in _KINDS else None,
             inventory=column_inventory,
+            fingerprint=None if fingerprints is None else fingerprints[name],
         )
         profiles[name] = profile
         n_rows = profile.digest.nRows
@@ -1664,6 +1407,7 @@ def characterize_covariates(
                 cell_key=cell_key,
                 kind="continuous",
                 inventory=column_inventory,
+                fingerprint=None if fingerprints is None else fingerprints[name],
             )
     candidates, aliases, alias_notes = _collapse_ontology_aliases(
         bound_store,
@@ -1676,8 +1420,6 @@ def characterize_covariates(
         store=bound_store,
         cell_key=cell_key,
         n_rows=n_rows,
-        context=(studyContext or "").strip(),
-        model=model,
         profiles=profiles,
     )
     for name, reason in dropped:
@@ -1699,7 +1441,7 @@ def characterize_covariates(
             domain_directions[name] = "design"
     for name in candidates:
         run.domains[name] = _assign_domain(run, name, domain_directions)
-    candidates = _collapse_equivalent_columns(run, candidates, aliases)
+    _note_equivalent_columns(run, candidates)
 
     technical = [name for name in candidates if run.domains[name] == "technical"]
     design_columns = [name for name in candidates if run.domains[name] == "design"]
@@ -1735,7 +1477,6 @@ def characterize_covariates(
             f"Reviewed {reviewed} columns; {len(candidates)} triaged after "
             "deterministic drops and ontology alias collapse"
         ],
-        decisions=run.decisions,
         columns=column_records,
         coefficients=records,
         technicalNesting=(

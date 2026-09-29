@@ -1,109 +1,109 @@
 {
-  "archiveBytes": 509415579,
-  "archiveSha256": "4e449e4588393f45220b5c8749f345f493b1ce649379ee4a393609018edcf0e8",
+  "archiveBytes": 509414486,
+  "archiveSha256": "a1804f1631ecb8bb419962d2dd141d3c79fecc68e16eb042ae27eeca5c53166e",
   "artifacts": [
     {
-      "artifactId": "6ac0ddc8d9771e55c3ee768d0ff0f2b6212ab0446eb97664e0f42d7683614812",
-      "assay": null,
-      "kind": "cell_selection",
-      "operation": "auto_filter_cells",
-      "path": "artifacts/cell_selection/6ac0ddc8d9771e55c3ee768d0ff0f2b6212ab0446eb97664e0f42d7683614812",
-      "scope": "datastore"
-    },
-    {
-      "artifactId": "cf9f2a17be93ae9239b9ffa2e92514324fd5d901087868953a56e16768110214",
+      "artifactId": "12ff7e74fffe6df89dcae7fc3ec5e1b7fc4fc109d1fe5dc96b6fc8c81fcddcbc",
       "assay": null,
       "kind": "cell_selection",
       "operation": "manual_selection",
-      "path": "artifacts/cell_selection/cf9f2a17be93ae9239b9ffa2e92514324fd5d901087868953a56e16768110214",
+      "path": "artifacts/cell_selection/12ff7e74fffe6df89dcae7fc3ec5e1b7fc4fc109d1fe5dc96b6fc8c81fcddcbc",
       "scope": "datastore"
     },
     {
-      "artifactId": "ad202190672c01a6f81753c0b00b1803f46c5257a7e78659100fc214e9666569",
+      "artifactId": "74f0d97168c3d7fe3c2f79eec81c86611e42137bc83eff968b3584a4571ae36b",
+      "assay": null,
+      "kind": "cell_selection",
+      "operation": "auto_filter_cells",
+      "path": "artifacts/cell_selection/74f0d97168c3d7fe3c2f79eec81c86611e42137bc83eff968b3584a4571ae36b",
+      "scope": "datastore"
+    },
+    {
+      "artifactId": "91c0262b607292fd7ee97be177462fe17a49eff8c12bd361876cdc4267d013a4",
       "assay": "ATAC",
       "kind": "ann_index",
       "operation": "build_ann_index",
-      "path": "ATAC/artifacts/ann_index/ad202190672c01a6f81753c0b00b1803f46c5257a7e78659100fc214e9666569",
+      "path": "ATAC/artifacts/ann_index/91c0262b607292fd7ee97be177462fe17a49eff8c12bd361876cdc4267d013a4",
       "scope": "assay"
     },
     {
-      "artifactId": "eeabc5b513494fdd4128589e95bf1ba2bd9adefdf7200ac65dda0d03545542cd",
+      "artifactId": "927d63b5dc46187c00c9cebbf5581aeff66169be486f9d152c70efe2886c93ea",
       "assay": "ATAC",
       "kind": "cluster_labels",
       "operation": "run_leiden_clustering",
-      "path": "ATAC/artifacts/cluster_labels/eeabc5b513494fdd4128589e95bf1ba2bd9adefdf7200ac65dda0d03545542cd",
+      "path": "ATAC/artifacts/cluster_labels/927d63b5dc46187c00c9cebbf5581aeff66169be486f9d152c70efe2886c93ea",
       "scope": "assay"
     },
     {
-      "artifactId": "caf5eb11176c08dbfbbb1fd75822bf9094a2c75774a5f0f0ec8d9b4b104bc9cc",
+      "artifactId": "8efa0e2c593caca1983a00070c52b254cd7e8705c561a7eadaff4f3720052430",
       "assay": "ATAC",
       "kind": "connectivity_map",
       "operation": "build_connectivity_map",
-      "path": "ATAC/artifacts/connectivity_map/caf5eb11176c08dbfbbb1fd75822bf9094a2c75774a5f0f0ec8d9b4b104bc9cc",
+      "path": "ATAC/artifacts/connectivity_map/8efa0e2c593caca1983a00070c52b254cd7e8705c561a7eadaff4f3720052430",
       "scope": "assay"
     },
     {
-      "artifactId": "451ee84fecd1bba0659d9891733fcb8fa9d62c5d71f7960ff583e2c748015e65",
+      "artifactId": "0e776203d155843c5f9c0c640d75067911aa8151816a8ea7ab3d492468f09143",
       "assay": "ATAC",
       "kind": "embedding",
       "operation": "run_umap",
-      "path": "ATAC/artifacts/embedding/451ee84fecd1bba0659d9891733fcb8fa9d62c5d71f7960ff583e2c748015e65",
+      "path": "ATAC/artifacts/embedding/0e776203d155843c5f9c0c640d75067911aa8151816a8ea7ab3d492468f09143",
       "scope": "assay"
     },
     {
-      "artifactId": "a2d3504cc3cf06c7b88e338b97dc83737716a7d46ade476d8c124d583c0319a0",
+      "artifactId": "dfdadf18722da88d239d55472906df8f146780b41b4cb57fe8c506b2f520e3ac",
       "assay": "ATAC",
       "kind": "embedding_initialization",
       "operation": "build_embedding_initialization",
-      "path": "ATAC/artifacts/embedding_initialization/a2d3504cc3cf06c7b88e338b97dc83737716a7d46ade476d8c124d583c0319a0",
+      "path": "ATAC/artifacts/embedding_initialization/dfdadf18722da88d239d55472906df8f146780b41b4cb57fe8c506b2f520e3ac",
       "scope": "assay"
     },
     {
-      "artifactId": "1fc4468006b0e6b19be275cd6b02b29ddc6de169381200df3279b6167a88f7fa",
+      "artifactId": "e15a50c27d7aef074efd41c5782c8222794b07fdc9bfcd40bbd53ef61f45cee3",
       "assay": "ATAC",
       "kind": "feature_scaling",
       "operation": "calculate_feature_scaling",
-      "path": "ATAC/artifacts/feature_scaling/1fc4468006b0e6b19be275cd6b02b29ddc6de169381200df3279b6167a88f7fa",
+      "path": "ATAC/artifacts/feature_scaling/e15a50c27d7aef074efd41c5782c8222794b07fdc9bfcd40bbd53ef61f45cee3",
       "scope": "assay"
     },
     {
-      "artifactId": "0fe2ed72acc396c87e63c73b24623c8f7e08ec8da25e24c59650454649c02468",
+      "artifactId": "cbc259cdd8fa333c974bb06a0fa3e178b3bd54e3eec00a61e3d0fdd869d96c3f",
       "assay": "ATAC",
       "kind": "feature_selection",
       "operation": "select_prevalent_peaks",
-      "path": "ATAC/artifacts/feature_selection/0fe2ed72acc396c87e63c73b24623c8f7e08ec8da25e24c59650454649c02468",
+      "path": "ATAC/artifacts/feature_selection/cbc259cdd8fa333c974bb06a0fa3e178b3bd54e3eec00a61e3d0fdd869d96c3f",
       "scope": "assay"
     },
     {
-      "artifactId": "620df63d0c11c8caaf639fce6dc59af216a67a212168a56cddf905cc7fe7b177",
+      "artifactId": "a025531fc6258da13e17880ddf66e1f0530637080858aa8f67a395a432eaeb1f",
       "assay": "ATAC",
       "kind": "feature_summary",
       "operation": "summarize_atac_features",
-      "path": "ATAC/artifacts/feature_summary/620df63d0c11c8caaf639fce6dc59af216a67a212168a56cddf905cc7fe7b177",
+      "path": "ATAC/artifacts/feature_summary/a025531fc6258da13e17880ddf66e1f0530637080858aa8f67a395a432eaeb1f",
       "scope": "assay"
     },
     {
-      "artifactId": "cca3067c938a254320197cc7b34b14274a08f24bf9cdc5b88e99df64bb49f2a1",
+      "artifactId": "9a79a08716d480cdd7f4da8d72ce158b4f86a94fdae9fdf2860e31845f16e644",
       "assay": "ATAC",
       "kind": "neighbors",
       "operation": "query_neighbors",
-      "path": "ATAC/artifacts/neighbors/cca3067c938a254320197cc7b34b14274a08f24bf9cdc5b88e99df64bb49f2a1",
+      "path": "ATAC/artifacts/neighbors/9a79a08716d480cdd7f4da8d72ce158b4f86a94fdae9fdf2860e31845f16e644",
       "scope": "assay"
     },
     {
-      "artifactId": "de01930fdcf20d350a94cb83587337d186b76a5ff28c3ea75552b775787b8ff7",
+      "artifactId": "87d43e13990e824ef1b4d4be6b5792bd31033bb740009e5c4695f7e44ef137ab",
       "assay": "ATAC",
       "kind": "normalized",
       "operation": "run_normalization",
-      "path": "ATAC/artifacts/normalized/de01930fdcf20d350a94cb83587337d186b76a5ff28c3ea75552b775787b8ff7",
+      "path": "ATAC/artifacts/normalized/87d43e13990e824ef1b4d4be6b5792bd31033bb740009e5c4695f7e44ef137ab",
       "scope": "assay"
     },
     {
-      "artifactId": "b6baf298950b8bab015580b896129fb8200ef151ccf28efb2ce70e5ae36b0244",
+      "artifactId": "c7df16fa4af1ebe813fd1718c8f3d361067da6e4408f2d8ed17077a55f67b6df",
       "assay": "ATAC",
       "kind": "reduction",
       "operation": "run_lsi",
-      "path": "ATAC/artifacts/reduction/b6baf298950b8bab015580b896129fb8200ef151ccf28efb2ce70e5ae36b0244",
+      "path": "ATAC/artifacts/reduction/c7df16fa4af1ebe813fd1718c8f3d361067da6e4408f2d8ed17077a55f67b6df",
       "scope": "assay"
     }
   ],
@@ -119,8 +119,8 @@
     "names"
   ],
   "dataset": "tenx_10K_pbmc-v1_atacseq",
-  "generatedAt": "2026-09-25T10:32:58.453823+00:00",
-  "generatorCommit": "9ed13719811d9d97481627661745a6ab63004420",
+  "generatedAt": "2026-09-28T18:58:09.149815+00:00",
+  "generatorCommit": "594aecb06fb16fb8110a46cc1ef32b83458ef13f",
   "nCellsActive": 8426,
   "nCellsTotal": 8728,
   "pipelineRuns": [],
@@ -130,10 +130,10 @@
   ],
   "recipe": "25000 prevalent peaks, TF-IDF normalization, LSI 50, k=21 graph, UMAP, Leiden 0.6",
   "repository": "scarf_docs",
-  "scarfVersion": "1.0.0rc16.dev1+g9ed137198.d20260925",
+  "scarfVersion": "1.0.0rc16.dev4+g594aecb06.d20260928",
   "sourceDatasets": [],
   "sourceFiles": [
     "data.h5"
   ],
-  "storeBytes": 731951346
+  "storeBytes": 731951417
 }

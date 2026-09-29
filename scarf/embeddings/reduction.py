@@ -5,6 +5,7 @@ from typing import Any
 import numpy as np
 
 from ..matrix import ChunkedArray
+from ..utils.arguments import integer_argument
 from ..utils.logging import logger
 
 _GRAM_PCA_MAX_FEATURES = 4096
@@ -58,7 +59,6 @@ def _fit_sklearn_incremental_pca(
     scale: Callable[[np.ndarray], np.ndarray] | None,
     nthreads: int,
 ) -> tuple[np.ndarray, Any]:
-    from numpy.linalg import LinAlgError
     from sklearn.decomposition import IncrementalPCA
 
     model = IncrementalPCA(
@@ -84,10 +84,9 @@ def _fit_sklearn_incremental_pca(
         if end_reservoir is None:
             end_reservoir = block
             continue
-        try:
-            model.partial_fit(_mutable_fit_block(block), check_input=False)
-        except LinAlgError:
-            carry_over = block
+        # partial_fit centers its input in place, so a failed update is not
+        # retried with the same block.
+        model.partial_fit(_mutable_fit_block(block), check_input=False)
 
     if carry_over is not None:
         fit_batch = (
@@ -277,11 +276,9 @@ def fit_lsi(
     nthreads: int,
 ) -> np.ndarray:
     """Fit uncentered LSI loadings with a streamed or materialized solver."""
-    reserved = {"n_components", "random_state"}
-    for key in list(params):
-        if key in reserved:
-            del params[key]
-            logger.warning(f"Provided parameter, {key}, for LSI model will not be used")
+    reserved = sorted({"n_components", "random_state"}.intersection(params))
+    if reserved:
+        raise ValueError(f"LSI parameters cannot set {', '.join(reserved)}")
 
     n_components = dims + int(skip_first)
     if n_components > min(data.shape):
@@ -391,15 +388,6 @@ def require_materialized_lsi_budget(
         )
 
 
-def _nonnegative_integer(value: Any, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
-        raise TypeError(f"{name} must be an integer")
-    resolved = int(value)
-    if resolved < 0:
-        raise ValueError(f"{name} must be non-negative")
-    return resolved
-
-
 def _streaming_lsi_accumulator_bytes(n_features: int, width: int) -> int:
     itemsize = np.dtype(np.float64).itemsize
     return 3 * n_features * width * itemsize + 2 * width * width * itemsize
@@ -453,8 +441,8 @@ def _fit_streaming_lsi(
     random_state: int,
     nthreads: int,
 ) -> np.ndarray:
-    iterations = _nonnegative_integer(n_iter, "n_iter")
-    oversamples = _nonnegative_integer(n_oversamples, "n_oversamples")
+    iterations = integer_argument(n_iter, "n_iter", minimum=0)
+    oversamples = integer_argument(n_oversamples, "n_oversamples", minimum=0)
     width = min(min(data.shape), n_components + oversamples)
     rng = np.random.default_rng(random_state)
     basis = rng.standard_normal((data.shape[1], width), dtype=np.float64)

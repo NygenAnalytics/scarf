@@ -183,14 +183,8 @@ def validate_saved_rna_history(
                 tuning = ParameterTuningReport.model_validate(
                     journal.read_stage_evidence(store, outcome.reportReferences[0])
                 )
-                if (
-                    tuning.recommendedIntegrationId is not None
-                    or tuning.assayReports
-                    or tuning.fromAssay != selected
-                ):
-                    raise ValueError(
-                        "Saved tuning includes unsupported assays or integration"
-                    )
+                if tuning.fromAssay != selected:
+                    raise ValueError("Saved tuning belongs to another assay")
     validate_analysis_evidence(journal.analysis_snapshot(store, workflow_run_id))
 
 

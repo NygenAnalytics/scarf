@@ -1,16 +1,16 @@
 import copy
-from collections.abc import Generator, Iterator, Mapping
+import warnings
+from collections.abc import Generator, Mapping
 from contextlib import closing
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-from numpy.typing import DTypeLike
 
 from ..assay import RNAassay, _read_block, norm_lib_size
 from ..assay.normalization import recorded_count_arithmetic
 from ..metadata.rows import read_metadata_rows_chunkwise
-from ..storage.artifacts import ValueFingerprintBuilder, callable_identity
+from ..storage.artifacts import callable_identity
 from ..storage.budget import ResourceBudget
 from ..storage.execution import admit_stream
 from ..storage.geometry import ArrayGeometry, array_geometry
@@ -21,6 +21,7 @@ from ..storage.partition import (
     contiguous_ranges,
     row_band,
 )
+from ..utils.arrays import read_only_copy
 
 if TYPE_CHECKING:
     from ..assay import Assay
@@ -50,16 +51,6 @@ class AlignedRowGeometry:
     boundaries: tuple[tuple[int, int], ...]
 
 
-def _read_only_array(
-    values: Any,
-    *,
-    dtype: DTypeLike | None = None,
-) -> np.ndarray:
-    array = np.array(values, dtype=dtype, copy=True)
-    array.setflags(write=False)
-    return array
-
-
 def _feature_ids(values: Any, *, name: str) -> np.ndarray:
     raw = np.asarray(values)
     if raw.ndim != 1:
@@ -77,7 +68,7 @@ def _feature_ids(values: Any, *, name: str) -> np.ndarray:
     if np.any(counts > 1):
         duplicates = unique[counts > 1][:5].tolist()
         raise ValueError(f"{name} must be unique: {duplicates}")
-    return _read_only_array(identifiers)
+    return read_only_copy(identifiers)
 
 
 def _reference_means(values: Any, *, n_features: int) -> np.ndarray:
@@ -94,7 +85,7 @@ def _reference_means(values: Any, *, n_features: int) -> np.ndarray:
         )
     if not np.all(np.isfinite(means)):
         raise ValueError("Reference normalized means must be finite")
-    return _read_only_array(means, dtype=np.float64)
+    return read_only_copy(means, np.float64)
 
 
 def _normalization_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
@@ -236,7 +227,7 @@ class AlignedFeatureStream:
         )
         if cell_indices.size == 0:
             raise ValueError("query_cell_indices cannot be empty")
-        self._query_cell_indices = _read_only_array(cell_indices, dtype=np.int64)
+        self._query_cell_indices = read_only_copy(cell_indices, np.int64)
 
         self._reference_feature_ids = _feature_ids(
             reference_feature_ids,
@@ -290,21 +281,21 @@ class AlignedFeatureStream:
                 f"Query data is missing {missing} required reference features"
             )
         query_indices = reference_to_query[reference_indices]
-        self._reference_to_query_index_map = _read_only_array(
-            reference_to_query,
-            dtype=np.int64,
-        )
-        self._reference_index_map = _read_only_array(
-            reference_indices,
-            dtype=np.int64,
-        )
-        self._query_index_map = _read_only_array(query_indices, dtype=np.int64)
+        self._reference_index_map = read_only_copy(reference_indices, np.int64)
+        self._query_index_map = read_only_copy(query_indices, np.int64)
         self._feature_coverage = float(
             reference_indices.size / len(self._reference_feature_ids)
         )
-        self._alignment_map_fingerprint = self._fingerprint_alignment_map(
-            query_feature_ids
-        )
+        if self.renormalize_subset and self._feature_coverage < 1:
+            warnings.warn(
+                "The reference divides each cell by its total over the reference "
+                "features (renormalize_subset=True), but the query measures only "
+                f"{self._feature_coverage:.1%} of them. Query totals cover the "
+                "shared features alone, so normalized query values are larger "
+                "than the reference would compute for the same cell.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         self._cell_scalars: np.ndarray | None = None
         if not self.renormalize_subset:
@@ -363,47 +354,12 @@ class AlignedFeatureStream:
         self._io_concurrency = io_concurrency
 
     @property
-    def shape(self) -> tuple[int, int]:
-        return (
-            len(self._query_cell_indices),
-            len(self._reference_feature_ids),
-        )
-
-    @property
-    def dtype(self) -> np.dtype[Any]:
-        return np.dtype(np.float64)
-
-    @property
     def row_geometry(self) -> AlignedRowGeometry:
         return self._row_geometry
 
     @property
-    def block_boundaries(self) -> tuple[tuple[int, int], ...]:
-        return self._row_geometry.boundaries
-
-    @property
     def feature_coverage(self) -> float:
         return self._feature_coverage
-
-    @property
-    def reference_feature_ids(self) -> np.ndarray:
-        return self._reference_feature_ids.view()
-
-    @property
-    def reference_normalized_means(self) -> np.ndarray:
-        return self._reference_normalized_means.view()
-
-    @property
-    def query_cell_indices(self) -> np.ndarray:
-        return self._query_cell_indices.view()
-
-    @property
-    def normalization_parameters(self) -> dict[str, Any]:
-        return copy.deepcopy(self._normalization_parameters)
-
-    @property
-    def missing_feature_policy(self) -> str:
-        return self._missing_feature_policy
 
     @property
     def size_factor(self) -> float:
@@ -418,67 +374,26 @@ class AlignedFeatureStream:
         return bool(self._normalization_parameters["renormalize_subset"])
 
     @property
-    def query_index_map(self) -> np.ndarray:
-        return self._query_index_map.view()
-
-    @property
     def reference_index_map(self) -> np.ndarray:
+        """Reference feature positions that the query measures."""
         return self._reference_index_map.view()
-
-    @property
-    def reference_to_query_index_map(self) -> np.ndarray:
-        return self._reference_to_query_index_map.view()
 
     @property
     def query_feature_indices(self) -> np.ndarray:
+        """Query feature positions aligned with ``reference_index_map``."""
         return self._query_index_map.view()
-
-    @property
-    def reference_feature_indices(self) -> np.ndarray:
-        return self._reference_index_map.view()
-
-    @property
-    def alignment_map_fingerprint(self) -> str:
-        return self._alignment_map_fingerprint
-
-    @property
-    def alignment_map_hash(self) -> str:
-        return self._alignment_map_fingerprint
-
-    @property
-    def resident_bytes(self) -> int:
-        return self._resident_bytes
-
-    @property
-    def decoded_chunk_bytes(self) -> int:
-        return self._decode_bytes
-
-    @property
-    def stream_row_bytes(self) -> int:
-        return self._stream_row_bytes
 
     def _calculate_resident_bytes(self) -> int:
         arrays = [
             self._query_cell_indices,
             self._reference_feature_ids,
             self._reference_normalized_means,
-            self._reference_to_query_index_map,
             self._reference_index_map,
             self._query_index_map,
         ]
         if self._cell_scalars is not None:
             arrays.append(self._cell_scalars)
         return sum(array.nbytes for array in arrays) + np.dtype(np.float64).itemsize
-
-    def _fingerprint_alignment_map(self, query_feature_ids: np.ndarray) -> str:
-        builder = ValueFingerprintBuilder()
-        builder.update_array("reference_feature_ids", self._reference_feature_ids)
-        builder.update_array("query_feature_ids", query_feature_ids)
-        builder.update_array(
-            "reference_to_query_index",
-            self._reference_to_query_index_map,
-        )
-        return builder.hexdigest()
 
     def _plan_rows(
         self,
@@ -531,9 +446,6 @@ class AlignedFeatureStream:
             return np.asarray(self._raw_backing[np.ix_(rows, columns)])
         return _read_block(self._raw_backing, rows, columns)
 
-    def __iter__(self) -> Iterator[AlignedFeatureBlock]:
-        return self.iter_blocks()
-
     def iter_blocks(self) -> Generator[AlignedFeatureBlock, None, None]:
         """Return a fresh iterator over normalized aligned row blocks."""
 
@@ -571,7 +483,7 @@ class AlignedFeatureStream:
 
                 values = np.empty(
                     (len(raw), len(self._reference_feature_ids)),
-                    dtype=self.dtype,
+                    dtype=np.float64,
                 )
                 if self._missing_feature_policy == "reference_mean":
                     values[:] = self._reference_normalized_means

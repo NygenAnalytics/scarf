@@ -27,19 +27,21 @@ from ..storage.artifacts import (
     fingerprint_stored_arrays,
     inspect_artifact,
 )
-from ..storage.feature_selection import resolve_feature_selection
 from ..storage.geometry import array_geometry
 from ..storage.partition import row_band
-from ..storage.selections import validate_stored_selection_integrity
-from ..storage.types import as_zarr_array, as_zarr_group
+from ..storage.selections import validate_cell_selection
+from ..storage.types import as_zarr_array
 from .confidence import _distance_quantile_summary
 from .features import _normalization_parameters
 from .models import ScaledPCAProjectionModel, SymphonyCorrectionModel
-from .reference import MappingReference, mapping_reference_model_digest
-
-MAPPING_REFERENCE_REBUILD_MESSAGE = (
-    "Rebuild it with build_mapping_reference(neighbors)."
+from .reference import (
+    MappingReference,
+    contract_error,
+    iter_feature_selection_blocks,
+    mapping_reference_model_digest,
+    payload_fingerprint,
 )
+
 _COMMON_ARRAYS = frozenset(
     {
         "feature_ids",
@@ -95,35 +97,47 @@ _SYMPHONY_METADATA = frozenset(
 )
 
 
+def symphony_batch_metadata(
+    correction: ArtifactStatus,
+    group: zarr.Group,
+) -> dict[str, Any]:
+    """Return the Harmony batch metadata that a Symphony reference records.
+
+    Raises:
+        ValueError: If the Harmony artifact does not record its batch levels,
+            batch columns, and Harmony parameters.
+    """
+    parameters = correction.parameters or {}
+    batch_columns = parameters.get("batch_columns")
+    harmony_parameters = parameters.get("harmony_parameters")
+    batch_levels = group.attrs.get("batch_levels")
+    if (
+        not isinstance(batch_columns, list)
+        or not isinstance(harmony_parameters, Mapping)
+        or not isinstance(batch_levels, list)
+    ):
+        raise ValueError(
+            "Harmony correction has no valid batch levels, batch columns or "
+            "parameters. Re-run run_harmony."
+        )
+    return {
+        "batch_columns": list(batch_columns),
+        "harmony_parameters": dict(harmony_parameters),
+        "batch_levels": batch_levels,
+    }
+
+
 def _selected_feature_ids(
     root: zarr.Group,
     assay: str,
     feature_selection: ArtifactRef,
 ) -> np.ndarray:
     """Read selected feature IDs in exact assay row order, blockwise."""
-    resolve_feature_selection(root, assay, feature_selection)
-    feature_data = as_zarr_group(
-        root[f"{assay}/featureData"],
-        name=f"{assay}/featureData",
-    )
-    ids = as_zarr_array(feature_data["ids"], name="ids")
-    values = as_zarr_array(
-        artifact_group(root, feature_selection)["values"],
-        name="values",
-    )
-    block_rows = min(
-        row_band(array_geometry(ids), unit="chunk", fallback=1),
-        row_band(array_geometry(values), unit="chunk", fallback=1),
-    )
-    selected: list[np.ndarray] = []
-    for start in range(0, int(values.shape[0]), block_rows):
-        stop = min(start + block_rows, int(values.shape[0]))
-        mask = np.asarray(values[start:stop], dtype=bool)
-        if np.any(mask):
-            selected.append(np.asarray(ids[start:stop])[mask])
-    if not selected:
-        return np.asarray(ids[:0])
-    return np.concatenate(selected)
+    selected = [
+        ids[mask]
+        for ids, mask in iter_feature_selection_blocks(root, assay, feature_selection)
+    ]
+    return np.concatenate(selected) if selected else np.empty(0, dtype=object)
 
 
 def write_artifact_mapping_reference_from_sources(
@@ -226,21 +240,21 @@ def _validate_and_load_artifact_mapping_reference(
         or ref.assay is None
         or ref.kind != "mapping_reference"
     ):
-        raise _contract_error("Expected an assay-scoped mapping reference artifact")
+        raise contract_error("Expected an assay-scoped mapping reference artifact")
     status = inspect_artifact(datastore.zw, ref)
     if not status.exists or (require_complete and not status.complete):
-        raise _contract_error("Mapping reference artifact is missing or incomplete")
+        raise contract_error("Mapping reference artifact is missing or incomplete")
     if status.operation != "build_mapping_reference":
-        raise _contract_error("Mapping reference artifact has an old operation")
+        raise contract_error("Mapping reference artifact has an old operation")
 
     parameters = status.parameters or {}
     if set(parameters) != {"method"}:
-        raise _contract_error(
+        raise contract_error(
             "Mapping-reference parameters do not match the current contract"
         )
     method = parameters.get("method")
     if method not in {"pca", "symphony"}:
-        raise _contract_error("Mapping reference method is missing or unsupported")
+        raise contract_error("Mapping reference method is missing or unsupported")
 
     inputs = status.inputs or {}
     expected_inputs = {
@@ -253,12 +267,12 @@ def _validate_and_load_artifact_mapping_reference(
     if method == "symphony":
         expected_inputs.add("batch_correction")
     if set(inputs) != expected_inputs:
-        raise _contract_error(
+        raise contract_error(
             "Mapping reference artifact inputs do not match the current contract"
         )
     reduction = _input_ref(
         datastore.zw,
-        inputs,
+        status,
         "reduction",
         kind="reduction",
         scope="assay",
@@ -266,7 +280,7 @@ def _validate_and_load_artifact_mapping_reference(
     )
     ann_index = _input_ref(
         datastore.zw,
-        inputs,
+        status,
         "ann_index",
         kind="ann_index",
         scope="assay",
@@ -274,7 +288,7 @@ def _validate_and_load_artifact_mapping_reference(
     )
     neighbors = _input_ref(
         datastore.zw,
-        inputs,
+        status,
         "neighbors",
         kind="neighbors",
         scope="assay",
@@ -282,7 +296,7 @@ def _validate_and_load_artifact_mapping_reference(
     )
     cell_selection = _input_ref(
         datastore.zw,
-        inputs,
+        status,
         "cell_selection",
         kind="cell_selection",
         scope="datastore",
@@ -290,7 +304,7 @@ def _validate_and_load_artifact_mapping_reference(
     )
     feature_selection = _input_ref(
         datastore.zw,
-        inputs,
+        status,
         "feature_selection",
         kind="feature_selection",
         scope="assay",
@@ -299,7 +313,7 @@ def _validate_and_load_artifact_mapping_reference(
     batch_correction = (
         _input_ref(
             datastore.zw,
-            inputs,
+            status,
             "batch_correction",
             kind="batch_correction",
             scope="assay",
@@ -308,38 +322,36 @@ def _validate_and_load_artifact_mapping_reference(
         if method == "symphony"
         else None
     )
-    if method == "pca" and "batch_correction" in inputs:
-        raise _contract_error("Plain PCA reference includes batch correction")
 
     reduction_status = inspect_artifact(datastore.zw, reduction)
     ann_status = inspect_artifact(datastore.zw, ann_index)
     neighbors_status = inspect_artifact(datastore.zw, neighbors)
     if reduction_status.operation != "run_pca":
-        raise _contract_error("Mapping reference reduction is not PCA")
+        raise contract_error("Mapping reference reduction is not PCA")
     if (reduction_status.parameters or {}).get("feat_scaling") is not True:
-        raise _contract_error("Mapping reference PCA did not enable feature scaling")
+        raise contract_error("Mapping reference PCA did not enable feature scaling")
     if ann_status.operation != "build_ann_index":
-        raise _contract_error("Mapping reference ANN input has an old operation")
+        raise contract_error("Mapping reference ANN input has an old operation")
     if neighbors_status.operation != "query_neighbors":
-        raise _contract_error("Mapping reference neighbors input has an old operation")
+        raise contract_error("Mapping reference neighbors input has an old operation")
 
     coordinates = batch_correction or reduction
-    if _ref_from_input(ann_status, "coordinates") != coordinates:
-        raise _contract_error("ANN index uses different coordinates")
+    if ann_status.input_ref("coordinates") != coordinates:
+        raise contract_error("ANN index uses different coordinates")
     if (
-        _ref_from_input(neighbors_status, "ann_index") != ann_index
-        or _ref_from_input(neighbors_status, "coordinates") != coordinates
+        neighbors_status.input_ref("ann_index") != ann_index
+        or neighbors_status.input_ref("coordinates") != coordinates
     ):
-        raise _contract_error("Neighbors use a different ANN coordinate chain")
+        raise contract_error("Neighbors use a different ANN coordinate chain")
     if batch_correction is not None:
         correction_status = inspect_artifact(datastore.zw, batch_correction)
         if correction_status.operation != "run_harmony":
-            raise _contract_error("Symphony reference correction is not Harmony")
-        if _ref_from_input(correction_status, "reduction") != reduction:
-            raise _contract_error("Batch correction uses a different PCA reduction")
+            raise contract_error("Symphony reference correction is not Harmony")
+        if correction_status.input_ref("reduction") != reduction:
+            raise contract_error("Batch correction uses a different PCA reduction")
 
-    normalized = _ref_from_input(reduction_status, "normalized")
-    feature_scaling = _ref_from_input(reduction_status, "feature_scaling")
+    normalized = reduction_status.input_ref("normalized")
+    feature_scaling = reduction_status.input_ref("feature_scaling")
     _require_ref(
         normalized,
         kind="normalized",
@@ -361,7 +373,7 @@ def _validate_and_load_artifact_mapping_reference(
         "feature_scaling",
     )
     if normalized_status.operation != "run_normalization":
-        raise _contract_error("Normalized input has an old operation")
+        raise contract_error("Normalized input has an old operation")
     normalized_dataset_fingerprint = (normalized_status.inputs or {}).get(
         "dataset_fingerprint"
     )
@@ -369,75 +381,70 @@ def _validate_and_load_artifact_mapping_reference(
         not isinstance(normalized_dataset_fingerprint, str)
         or not normalized_dataset_fingerprint
     ):
-        raise _contract_error("Normalized input has no dataset fingerprint")
+        raise contract_error("Normalized input has no dataset fingerprint")
     if (
         scaling_status.operation != "calculate_feature_scaling"
         or (scaling_status.parameters or {}).get("enabled") is not True
-        or _ref_from_input(scaling_status, "normalized") != normalized
+        or scaling_status.input_ref("normalized") != normalized
     ):
-        raise _contract_error("Feature scaling does not match the PCA input")
+        raise contract_error("Feature scaling does not match the PCA input")
     if (
-        _ref_from_input(normalized_status, "cell_selection") != cell_selection
-        or _ref_from_input(normalized_status, "feature_selection") != feature_selection
+        normalized_status.input_ref("cell_selection") != cell_selection
+        or normalized_status.input_ref("feature_selection") != feature_selection
     ):
-        raise _contract_error("Stored selections do not match normalized data")
+        raise contract_error("Stored selections do not match normalized data")
 
     group = artifact_group(datastore.zw, ref)
     _validate_payload_names(group, method)
     raw_metadata = group.attrs.get("reference_metadata")
     if not isinstance(raw_metadata, Mapping):
-        raise _contract_error("Mapping reference metadata is missing")
+        raise contract_error("Mapping reference metadata is missing")
     metadata = dict(raw_metadata)
-    if any(
-        name in metadata
-        for name in ("schemaVersion", "schema_version", "modelVersion", "model_version")
-    ):
-        raise _contract_error("Mapping reference metadata uses a versioned contract")
     expected_metadata = set(_COMMON_METADATA)
     if method == "symphony":
         expected_metadata.update(_SYMPHONY_METADATA)
     if set(metadata) != expected_metadata:
-        raise _contract_error(
+        raise contract_error(
             "Mapping reference metadata does not match the current contract"
         )
     assay_name = _metadata_string(metadata, "assay")
     if assay_name != ref.assay or metadata.get("method") != method:
-        raise _contract_error("Mapping reference metadata does not match its artifact")
+        raise contract_error("Mapping reference metadata does not match its artifact")
 
     normalization_parameters = metadata.get("normalization_parameters")
     if not isinstance(normalization_parameters, Mapping):
-        raise _contract_error("Mapping reference normalization parameters are missing")
+        raise contract_error("Mapping reference normalization parameters are missing")
     normalization_parameters = dict(normalization_parameters)
     if normalization_parameters != (normalized_status.parameters or {}):
-        raise _contract_error("Mapping reference normalization parameters changed")
+        raise contract_error("Mapping reference normalization parameters changed")
     try:
         normalization_parameters = _normalization_parameters(normalization_parameters)
     except (TypeError, ValueError) as exc:
-        raise _contract_error(
+        raise contract_error(
             f"Mapping reference normalization is unsupported: {exc}"
         ) from exc
 
     ann_metric = (ann_status.parameters or {}).get("ann_metric")
     if ann_metric not in {"l2", "cosine"}:
-        raise _contract_error("Mapping reference ANN metric is unsupported")
+        raise contract_error("Mapping reference ANN metric is unsupported")
     if (
         metadata.get("ann_metric") != ann_metric
         or (neighbors_status.parameters or {}).get("distance_metric") != ann_metric
     ):
-        raise _contract_error("Mapping reference distance metrics do not agree")
+        raise contract_error("Mapping reference distance metrics do not agree")
     dataset_fingerprint = metadata.get("dataset_fingerprint")
     if not isinstance(dataset_fingerprint, str) or not dataset_fingerprint:
-        raise _contract_error("Mapping reference dataset fingerprint is missing")
+        raise contract_error("Mapping reference dataset fingerprint is missing")
     if dataset_fingerprint != normalized_dataset_fingerprint:
-        raise _contract_error(
+        raise contract_error(
             "Mapping reference dataset fingerprint does not match normalized data"
         )
     assay = datastore._get_assay(assay_name)
     if not isinstance(assay, RNAassay):
-        raise _contract_error("Mapping references currently support RNA assays only")
+        raise contract_error("Mapping references currently support RNA assays only")
     live_dataset_fingerprint = datastore._ensure_dataset_fingerprint(assay_name)
     if live_dataset_fingerprint != dataset_fingerprint:
-        raise _contract_error(
+        raise contract_error(
             "Live assay dataset fingerprint does not match the mapping reference"
         )
 
@@ -447,23 +454,16 @@ def _validate_and_load_artifact_mapping_reference(
         or not isinstance(selected_cell_count, int)
         or selected_cell_count < 1
     ):
-        raise _contract_error("Selected reference cell count is missing")
+        raise contract_error("Selected reference cell count is missing")
     try:
-        validated_cells = validate_stored_selection_integrity(
-            datastore.zw,
-            cell_selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )
+        validated_cells = validate_cell_selection(datastore.zw, cell_selection)
     except (KeyError, TypeError, ValueError) as exc:
-        raise _contract_error(
+        raise contract_error(
             "Mapping reference cell selection no longer matches"
         ) from exc
     selected_count = validated_cells.selected_count
     if selected_count != selected_cell_count:
-        raise _contract_error("Selected reference cell count does not match its input")
+        raise contract_error("Selected reference cell count does not match its input")
 
     feature_ids_array = as_zarr_array(group["feature_ids"], name="feature_ids")
     feature_means_array = _numeric_payload_array(group, "feature_means", ndim=1)
@@ -487,14 +487,14 @@ def _validate_and_load_artifact_mapping_reference(
         or not _numeric_values_are_valid(center_array)
         or not _numeric_values_are_valid(loadings_array)
     ):
-        raise _contract_error("Mapping reference PCA model is invalid")
+        raise contract_error("Mapping reference PCA model is invalid")
     if not _stored_feature_ids_match_selection(
         datastore.zw,
         assay_name,
         feature_selection,
         feature_ids_array,
     ):
-        raise _contract_error(
+        raise contract_error(
             "Mapping reference feature IDs do not match the selected features"
         )
     reduction_group = artifact_group(datastore.zw, reduction)
@@ -502,7 +502,7 @@ def _validate_and_load_artifact_mapping_reference(
     source_feature_means = as_zarr_array(scaling_group["mean"], name="mean")
     source_feature_scales = as_zarr_array(scaling_group["scale"], name="scale")
     if "center" not in reduction_group:
-        raise _contract_error(
+        raise contract_error(
             "Reference PCA has no fitted center; recompute PCA and its descendants"
         )
     source_center = as_zarr_array(reduction_group["center"], name="center")
@@ -513,7 +513,7 @@ def _validate_and_load_artifact_mapping_reference(
         or reduction_data.shape != (selected_cell_count, n_dims)
         or np.dtype(reduction_data.dtype) != np.dtype(np.float32)
     ):
-        raise _contract_error(
+        raise contract_error(
             "Mapping reference PCA coordinates do not match selected cells"
         )
     try:
@@ -522,10 +522,9 @@ def _validate_and_load_artifact_mapping_reference(
             str(ann_metric),
             n_dims,
             selected_cell_count,
-            require_metadata=True,
         )
     except (KeyError, TypeError, ValueError) as exc:
-        raise _contract_error("Mapping reference ANN index payload is invalid") from exc
+        raise contract_error("Mapping reference ANN index payload is invalid") from exc
     if not all(
         (
             _stored_array_matches_array(
@@ -543,7 +542,7 @@ def _validate_and_load_artifact_mapping_reference(
             ),
         )
     ):
-        raise _contract_error("Mapping reference PCA model changed from its inputs")
+        raise contract_error("Mapping reference PCA model changed from its inputs")
 
     symphony_arrays: dict[str, zarr.Array] = {}
     source_arrays: dict[str, zarr.Array] | None = None
@@ -583,12 +582,11 @@ def _validate_and_load_artifact_mapping_reference(
                 positive=True,
             )
         ):
-            raise _contract_error(
+            raise contract_error(
                 "Mapping reference Symphony correction model is invalid"
             )
         assert batch_correction is not None
         correction_status = inspect_artifact(datastore.zw, batch_correction)
-        correction_parameters = correction_status.parameters or {}
         correction_group = artifact_group(datastore.zw, batch_correction)
         correction_data = as_zarr_array(correction_group["data"], name="data")
         if (
@@ -596,25 +594,12 @@ def _validate_and_load_artifact_mapping_reference(
             or correction_data.shape != (selected_cell_count, n_dims)
             or np.dtype(correction_data.dtype) != np.dtype(np.float32)
         ):
-            raise _contract_error(
+            raise contract_error(
                 "Mapping reference Harmony coordinates do not match selected cells"
             )
-        expected_batch_columns = list(correction_parameters.get("batch_columns", []))
-        raw_harmony_parameters = correction_parameters.get("harmony_parameters", {})
-        expected_harmony_parameters = (
-            dict(raw_harmony_parameters)
-            if isinstance(raw_harmony_parameters, Mapping)
-            else None
-        )
-        expected_batch_levels = correction_group.attrs.get("batch_levels", [])
-        if (
-            expected_harmony_parameters is None
-            or not isinstance(expected_batch_levels, list)
-            or metadata.get("batch_columns") != expected_batch_columns
-            or metadata.get("harmony_parameters") != expected_harmony_parameters
-            or metadata.get("batch_levels") != expected_batch_levels
-        ):
-            raise _contract_error(
+        batch_metadata = symphony_batch_metadata(correction_status, correction_group)
+        if any(metadata.get(name) != value for name, value in batch_metadata.items()):
+            raise contract_error(
                 "Mapping reference Symphony metadata does not match batch correction"
             )
         source_arrays = {
@@ -635,7 +620,7 @@ def _validate_and_load_artifact_mapping_reference(
             )
             for name in symphony_arrays
         ):
-            raise _contract_error(
+            raise contract_error(
                 "Mapping reference Symphony model changed from its input"
             )
     try:
@@ -647,7 +632,7 @@ def _validate_and_load_artifact_mapping_reference(
             symphony_sources=source_arrays,
         )
     except (KeyError, TypeError, ValueError) as exc:
-        raise _contract_error(
+        raise contract_error(
             "Mapping reference upstream model arrays are invalid"
         ) from exc
 
@@ -676,7 +661,7 @@ def _validate_and_load_artifact_mapping_reference(
             nondecreasing=True,
         )
     ):
-        raise _contract_error("Mapping reference distance summary is invalid")
+        raise contract_error("Mapping reference distance summary is invalid")
     try:
         validate_distance_provenance(datastore.zw, neighbors)
         neighbor_payload = validate_neighbors_payload(datastore.zw, neighbors)
@@ -686,7 +671,7 @@ def _validate_and_load_artifact_mapping_reference(
             neighbor_payload.distances
         )
     except (KeyError, TypeError, ValueError) as exc:
-        raise _contract_error(
+        raise contract_error(
             "Mapping reference neighbor distances are invalid"
         ) from exc
     if not (
@@ -699,7 +684,7 @@ def _validate_and_load_artifact_mapping_reference(
             expected_distances,
         )
     ):
-        raise _contract_error(
+        raise contract_error(
             "Mapping reference distance summary changed from its neighbor input"
         )
     stored_payload_fingerprint = group.attrs.get("payload_fingerprint")
@@ -708,7 +693,7 @@ def _validate_and_load_artifact_mapping_reference(
         or not stored_payload_fingerprint
         or stored_payload_fingerprint != _payload_fingerprint(group, method, metadata)
     ):
-        raise _contract_error(
+        raise contract_error(
             "Mapping reference payload fingerprint does not match stored output"
         )
 
@@ -795,7 +780,7 @@ def validate_mapping_reference_binding(
     root = reference.datastore.zw
     status = inspect_artifact(root, ref)
     if not status.exists or not status.complete:
-        raise _contract_error("Mapping reference artifact is missing or incomplete")
+        raise contract_error("Mapping reference artifact is missing or incomplete")
     if status.operation != "build_mapping_reference":
         raise mismatch
     method = (status.parameters or {}).get("method")
@@ -811,15 +796,13 @@ def validate_mapping_reference_binding(
         expected_scalars = {
             "ref": ref,
             "assay_name": metadata["assay"],
-            "reduction": _ref_from_input(status, "reduction"),
-            "ann_index": _ref_from_input(status, "ann_index"),
-            "neighbors": _ref_from_input(status, "neighbors"),
-            "cell_selection": _ref_from_input(status, "cell_selection"),
-            "feature_selection": _ref_from_input(status, "feature_selection"),
+            "reduction": status.input_ref("reduction"),
+            "ann_index": status.input_ref("ann_index"),
+            "neighbors": status.input_ref("neighbors"),
+            "cell_selection": status.input_ref("cell_selection"),
+            "feature_selection": status.input_ref("feature_selection"),
             "batch_correction": (
-                _ref_from_input(status, "batch_correction")
-                if method == "symphony"
-                else None
+                status.input_ref("batch_correction") if method == "symphony" else None
             ),
             "dataset_fingerprint": metadata["dataset_fingerprint"],
             "selected_cell_count": metadata["selected_cell_count"],
@@ -1043,7 +1026,7 @@ def _numeric_payload_array(
 ) -> zarr.Array:
     array = as_zarr_array(group[name], name=name)
     if array.ndim != ndim or np.dtype(array.dtype) != np.dtype(np.float64):
-        raise _contract_error(
+        raise contract_error(
             f"Mapping reference array {name!r} has an invalid dtype or shape"
         )
     return array
@@ -1141,27 +1124,9 @@ def _stored_feature_ids_match_selection(
     feature_selection: ArtifactRef,
     stored_feature_ids: zarr.Array,
 ) -> bool:
-    resolve_feature_selection(root, assay, feature_selection)
-    feature_data = as_zarr_group(
-        root[f"{assay}/featureData"],
-        name=f"{assay}/featureData",
-    )
-    live_ids = as_zarr_array(feature_data["ids"], name="ids")
-    selection = as_zarr_array(
-        artifact_group(root, feature_selection)["values"],
-        name="values",
-    )
-    if live_ids.shape != selection.shape:
-        return False
-    block_rows = min(
-        row_band(array_geometry(live_ids), unit="chunk", fallback=1),
-        row_band(array_geometry(selection), unit="chunk", fallback=1),
-    )
     output_offset = 0
-    for start in range(0, int(selection.shape[0]), block_rows):
-        stop = min(start + block_rows, int(selection.shape[0]))
-        mask = np.asarray(selection[start:stop], dtype=bool)
-        selected_ids = np.asarray(live_ids[start:stop])[mask].astype(str)
+    for ids, mask in iter_feature_selection_blocks(root, assay, feature_selection):
+        selected_ids = ids[mask].astype(str)
         output_stop = output_offset + len(selected_ids)
         if output_stop > int(stored_feature_ids.shape[0]) or not np.array_equal(
             np.asarray(stored_feature_ids[output_offset:output_stop]).astype(str),
@@ -1194,20 +1159,14 @@ def _stored_string_values_are_unique(array: zarr.Array) -> bool:
 
 def _input_ref(
     root: zarr.Group,
-    inputs: Mapping[str, Any],
+    status: ArtifactStatus,
     name: str,
     *,
     kind: str,
     scope: str,
     assay: str | None,
 ) -> ArtifactRef:
-    raw_ref = inputs.get(name)
-    if not isinstance(raw_ref, Mapping):
-        raise _contract_error(f"Mapping reference input {name!r} is missing")
-    try:
-        ref = ArtifactRef.from_dict(raw_ref)
-    except (TypeError, ValueError) as exc:
-        raise _contract_error(f"Mapping reference input {name!r} is malformed") from exc
+    ref = status.input_ref(name)
     _require_ref(
         ref,
         kind=kind,
@@ -1228,7 +1187,7 @@ def _require_ref(
     label: str,
 ) -> None:
     if ref.kind != kind or ref.scope != scope or ref.assay != assay:
-        raise _contract_error(
+        raise contract_error(
             f"Mapping reference input {label!r} has the wrong artifact kind or scope"
         )
 
@@ -1240,27 +1199,15 @@ def _complete_status(
 ) -> ArtifactStatus:
     status = inspect_artifact(root, ref)
     if not status.exists or not status.complete:
-        raise _contract_error(
+        raise contract_error(
             f"Mapping reference input {label!r} is missing or incomplete"
         )
     return status
 
 
-def _ref_from_input(status: ArtifactStatus, name: str) -> ArtifactRef:
-    raw_ref = (status.inputs or {}).get(name)
-    if not isinstance(raw_ref, Mapping):
-        raise _contract_error(
-            f"{status.ref.kind} input {name!r} is missing from the graph chain"
-        )
-    try:
-        return ArtifactRef.from_dict(raw_ref)
-    except (TypeError, ValueError) as exc:
-        raise _contract_error(f"{status.ref.kind} input {name!r} is malformed") from exc
-
-
 def _validate_payload_names(group: zarr.Group, method: str) -> None:
     if set(group.group_keys()):
-        raise _contract_error(
+        raise contract_error(
             "Mapping reference contains groups outside the current contract"
         )
     arrays = set(group.array_keys())
@@ -1277,14 +1224,14 @@ def _validate_payload_names(group: zarr.Group, method: str) -> None:
             message += (
                 ". Recompute PCA and its descendants before rebuilding this reference."
             )
-        raise _contract_error(message)
+        raise contract_error(message)
     if unexpected:
-        raise _contract_error(
+        raise contract_error(
             "Mapping reference contains arrays outside the current contract: "
             + ", ".join(sorted(unexpected))
         )
     if any(set(as_zarr_array(group[name], name=name).attrs) for name in expected):
-        raise _contract_error(
+        raise contract_error(
             "Mapping reference array attributes do not match the current contract"
         )
     expected_attributes = {
@@ -1299,11 +1246,11 @@ def _validate_payload_names(group: zarr.Group, method: str) -> None:
         "payload_fingerprint",
     }
     if "reference_metadata" not in group.attrs:
-        raise _contract_error("Mapping reference metadata is missing")
+        raise contract_error("Mapping reference metadata is missing")
     if "payload_fingerprint" not in group.attrs:
-        raise _contract_error("Mapping reference payload fingerprint is missing")
+        raise contract_error("Mapping reference payload fingerprint is missing")
     if set(group.attrs) != expected_attributes:
-        raise _contract_error(
+        raise contract_error(
             "Mapping reference attributes do not match the current contract"
         )
 
@@ -1311,7 +1258,7 @@ def _validate_payload_names(group: zarr.Group, method: str) -> None:
 def _metadata_string(metadata: Mapping[str, Any], name: str) -> str:
     value = metadata.get(name)
     if not isinstance(value, str) or not value:
-        raise _contract_error(f"Mapping reference metadata {name!r} is missing")
+        raise contract_error(f"Mapping reference metadata {name!r} is missing")
     return value
 
 
@@ -1329,13 +1276,11 @@ def _payload_fingerprint(
         if method == "symphony"
         else _COMMON_ARRAY_ORDER
     )
-    builder = ValueFingerprintBuilder()
-    builder.update_bytes(
-        "arrays",
-        fingerprint_stored_arrays(group, names).encode(),
+    return payload_fingerprint(
+        fingerprint_stored_arrays(group, names),
+        "reference_metadata",
+        metadata,
     )
-    builder.update_bytes("reference_metadata", canonical_bytes(metadata))
-    return builder.hexdigest()
 
 
 def _write_array(group: zarr.Group, name: str, values: np.ndarray) -> None:
@@ -1394,30 +1339,21 @@ def _write_array_from_source(
         target[start:stop] = np.asarray(values, dtype=np.float64)
 
 
-def _contract_error(detail: str) -> ValueError:
-    return ValueError(f"{detail}. {MAPPING_REFERENCE_REBUILD_MESSAGE}")
-
-
 def _reference_available_k(reference: MappingReference) -> int:
     root = reference.datastore.zw
-    rebuild = "Rebuild it with build_mapping_reference(neighbors)."
     reference.validate_frozen_axes()
     if reference.ref.assay != reference.assay_name:
-        raise ValueError(f"Mapping reference assay identity is inconsistent. {rebuild}")
+        raise contract_error("Mapping reference assay identity is inconsistent")
     if reference.model.n_features != len(reference.feature_ids):
-        raise ValueError(
-            f"Mapping reference feature dimensions are inconsistent. {rebuild}"
-        )
+        raise contract_error("Mapping reference feature dimensions are inconsistent")
     if reference.method == "pca":
         if reference.symphony_state is not None:
-            raise ValueError(f"Plain mapping reference has Symphony state. {rebuild}")
+            raise contract_error("Plain mapping reference has Symphony state")
     elif reference.method == "symphony":
         if reference.symphony_state is None:
-            raise ValueError(
-                f"Symphony mapping reference has no correction state. {rebuild}"
-            )
+            raise contract_error("Symphony mapping reference has no correction state")
     else:
-        raise ValueError(f"Mapping reference method is unsupported. {rebuild}")
+        raise contract_error("Mapping reference method is unsupported")
 
     expected = (
         (reference.ref, "build_mapping_reference"),
@@ -1429,16 +1365,16 @@ def _reference_available_k(reference: MappingReference) -> int:
     for ref, operation in expected:
         status = inspect_artifact(root, ref)
         if not status.exists or not status.complete or status.operation != operation:
-            raise ValueError(f"Mapping reference graph chain is incomplete. {rebuild}")
+            raise contract_error("Mapping reference graph chain is incomplete")
         statuses[ref] = status
 
     ann_status = statuses[reference.ann_index]
     ann_parameters = ann_status.parameters or {}
     if ann_parameters.get("ann_metric") != reference.ann_metric:
-        raise ValueError(f"Mapping reference ANN metric is inconsistent. {rebuild}")
-    ann_ef = ann_parameters.get("ann_ef", 50)
+        raise contract_error("Mapping reference ANN metric is inconsistent")
+    ann_ef = ann_parameters.get("ann_ef")
     if isinstance(ann_ef, bool) or not isinstance(ann_ef, int) or ann_ef < 1:
-        raise ValueError(f"Mapping reference ANN search depth is invalid. {rebuild}")
+        raise contract_error("Mapping reference ANN search depth is invalid")
 
     neighbors_status = statuses[reference.neighbors]
     raw_ann = (neighbors_status.inputs or {}).get("ann_index")
@@ -1446,15 +1382,11 @@ def _reference_available_k(reference: MappingReference) -> int:
         not isinstance(raw_ann, dict)
         or ArtifactRef.from_dict(raw_ann) != reference.ann_index
     ):
-        raise ValueError(
-            f"Mapping reference neighbors use another ANN index. {rebuild}"
-        )
+        raise contract_error("Mapping reference neighbors use another ANN index")
     if (neighbors_status.parameters or {}).get(
         "distance_metric"
     ) != reference.ann_metric:
-        raise ValueError(
-            f"Mapping reference neighbor metric is inconsistent. {rebuild}"
-        )
+        raise contract_error("Mapping reference neighbor metric is inconsistent")
 
     neighbors_group = artifact_group(root, reference.neighbors)
     indices = as_zarr_array(neighbors_group["indices"], name="indices")
@@ -1465,10 +1397,10 @@ def _reference_available_k(reference: MappingReference) -> int:
         or int(indices.shape[0]) != reference.selected_cell_count
         or int(indices.shape[1]) < 1
     ):
-        raise ValueError(f"Mapping reference neighbor payload is invalid. {rebuild}")
+        raise contract_error("Mapping reference neighbor payload is invalid")
     ann_group = artifact_group(root, reference.ann_index)
     if not has_ann_index(ann_group):
-        raise ValueError(f"Mapping reference ANN index is missing. {rebuild}")
+        raise contract_error("Mapping reference ANN index is missing")
     return int(indices.shape[1])
 
 
@@ -1489,7 +1421,7 @@ def _load_reference_neighbor_query(
     )
     configured = AnnIndexStage.configure(
         index,
-        ef=int(parameters.get("ann_ef", 50)),
+        ef=int(parameters["ann_ef"]),
         threads=workers,
     )
     return NeighborQueryStage(configured, save_k, reference.ann_metric)

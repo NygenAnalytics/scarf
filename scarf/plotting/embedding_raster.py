@@ -7,7 +7,7 @@ from typing import Any, Hashable, cast
 import numpy as np
 
 from ..metadata import MetaDataRowBlock
-from ..metadata.rows import apply_missing_mask, read_metadata_rows_chunkwise
+from ..metadata.rows import metadata_missing_mask, read_metadata_rows_chunkwise
 from ..storage import ArtifactRef
 from ..storage.artifacts import artifact_group
 from ..storage.selections import (
@@ -18,14 +18,15 @@ from ..storage.types import as_zarr_array
 from ._contracts import CellField, ColorScale, PlotProvenance
 from ._data import _validated_embedding_selection
 from ._deps import require_matplotlib
-from ._display import stored_display_metadata
-from ._figure import LegendSpec, PlotResult, normalize_axes_target
-from ._raster import (
-    _MissingMaskRows,
-    draw_raster_canvas,
-    raster_from_metadata,
+from ._display import continuous_display_scale, stored_display_metadata
+from ._figure import (
+    LegendSpec,
+    PlotResult,
+    close_figures_on_error,
+    normalize_axes_target,
 )
-from ._style import apply_figure_chrome, theme_context
+from ._raster import draw_raster_canvas, raster_from_metadata
+from ._style import apply_figure_chrome, resolve_color_limits, theme_context
 
 
 _ARTIFACT_X = "__scarf_artifact_embedding_x"
@@ -65,6 +66,12 @@ class _ArtifactRasterCells:
             if callable(getattr(self._cells, "_iter_selected_blocks", None))
             else "live_metadata"
         )
+
+    def _get_missing_mask_array(self, column: str) -> Any | None:
+        """Live fields keep their missing masks; frozen views apply their own."""
+        if column in {_ARTIFACT_X, _ARTIFACT_Y}:
+            return None
+        return metadata_missing_mask(self._cells, column)
 
     def get_dtype(self, column: str) -> np.dtype[Any]:
         if column in {_ARTIFACT_X, _ARTIFACT_Y}:
@@ -114,7 +121,6 @@ class _ArtifactRasterCells:
                 block_rows=resolved_rows,
             )
 
-        missing_masks = _MissingMaskRows(self._cells)
         compact_start = 0
         for block in source_blocks:
             if isinstance(block, MetaDataRowBlock):
@@ -144,15 +150,10 @@ class _ArtifactRasterCells:
                 elif isinstance(block, MetaDataRowBlock):
                     values[column] = block.values[column]
                 else:
-                    live_values = read_metadata_rows_chunkwise(
+                    values[column] = read_metadata_rows_chunkwise(
                         self._cells,
                         column,
                         row_indices,
-                    )
-                    missing = missing_masks.read(column, row_indices)
-                    values[column] = apply_missing_mask(
-                        live_values,
-                        missing,
                     )
             yield MetaDataRowBlock(
                 start=block.start,
@@ -238,6 +239,7 @@ def _is_categorical_column(
     return True
 
 
+@close_figures_on_error
 def embedding_raster(
     store: Any,
     *,
@@ -346,19 +348,9 @@ def embedding_raster(
 
     if color_scale is None:
         if stored_display is not None and stored_display["kind"] == "continuous":
-            minimum = stored_display["minimum"]
-            maximum = stored_display["maximum"]
-            fixed_limits = (
-                minimum is not None
-                and maximum is not None
-                and float(maximum) > float(minimum)
-            )
-            color_scale = ColorScale(
-                cmap=str(stored_display["colormap"]),
-                vmin=float(minimum) if fixed_limits else None,
-                vmax=float(maximum) if fixed_limits else None,
+            color_scale = replace(
+                continuous_display_scale(stored_display),
                 missing_color="white",
-                scale=str(stored_display["scale"]),  # type: ignore[arg-type]
             )
         else:
             color_scale = ColorScale(
@@ -390,30 +382,25 @@ def embedding_raster(
         quantiles=quantiles,
         seed=seed,
     )
-    if color_scale.vmin is not None or color_scale.vmax is not None:
-        canvas = replace(
-            canvas,
-            vmin=(
-                float(color_scale.vmin) if color_scale.vmin is not None else canvas.vmin
-            ),
-            vmax=(
-                float(color_scale.vmax) if color_scale.vmax is not None else canvas.vmax
-            ),
+    if color_key is not None:
+        # Explicit limits and a pivot refine the streamed value limits.
+        vmin, vmax = resolve_color_limits(
+            np.asarray([canvas.vmin, canvas.vmax]),
+            replace(color_scale, quantiles=None),
         )
-        if canvas.vmax <= canvas.vmin:
-            raise ValueError("Color limits must satisfy vmin < vmax")
+        canvas = replace(canvas, vmin=vmin, vmax=vmax)
 
     panel_key: Hashable = color_label or layout_name
     resolved_figsize = figsize
     if resolved_figsize is None and target is None:
         resolved_figsize = (5.2, 5.0)
-    fig, axes, owns = normalize_axes_target(
-        target,
-        panel_keys=[panel_key],
-        figsize=resolved_figsize,
-    )
-    ax = axes[panel_key]
     with theme_context(theme):
+        fig, axes, owns = normalize_axes_target(
+            target,
+            panel_keys=[panel_key],
+            figsize=resolved_figsize,
+        )
+        ax = axes[panel_key]
         xlim = (canvas.extent[0], canvas.extent[1])
         ylim = (canvas.extent[2], canvas.extent[3])
         im = draw_raster_canvas(
@@ -451,6 +438,7 @@ def embedding_raster(
             LegendSpec(
                 kind="colorbar",
                 label=color_label or "log1p cell count",
+                extras={"vmin": canvas.vmin, "vmax": canvas.vmax},
             ),
         ),
         scales=(color_scale,),

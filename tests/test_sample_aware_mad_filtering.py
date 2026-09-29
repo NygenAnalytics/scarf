@@ -12,10 +12,12 @@ from scarf.utils import logger
 
 from scarf.quality_control.filtering import (
     _apply_bounds,
-    _mad_bounds,
+    mad_bounds,
     _metric_policy,
-    _sample_aware_mad_mask,
+    sample_aware_mad_mask,
     gaussian_quantile_bounds,
+    unique_label_keys,
+    validate_cell_filter_sources,
 )
 
 
@@ -69,7 +71,7 @@ def test_mad_bounds_matches_hand_computed_example():
     values = np.array([1.0, 2.0, 3.0, 4.0, 100.0])
     median = 3.0
     scaled_mad = 1.4826 * np.median(np.abs(values - median))
-    low, high, reported_mad = _mad_bounds(values, n_mads=3.0)
+    low, high, reported_mad = mad_bounds(values, n_mads=3.0)
 
     assert reported_mad == pytest.approx(scaled_mad)
     assert low == pytest.approx(median - 3.0 * scaled_mad)
@@ -98,6 +100,21 @@ def test_apply_bounds_rejects_non_vector_values():
         _apply_bounds(np.ones((2, 2)), 0.0, 2.0)
 
 
+@pytest.mark.parametrize("dtype", [str, object])
+def test_apply_bounds_compares_text_with_an_open_side(dtype):
+    # An open side was compared as infinity, which text cannot be ordered against.
+    values = np.array(["a", "b", "c"], dtype=dtype)
+
+    np.testing.assert_array_equal(
+        _apply_bounds(values, "a", None),
+        [False, True, True],
+    )
+    np.testing.assert_array_equal(
+        _apply_bounds(values, None, "b", keep_bounds=True),
+        [True, True, False],
+    )
+
+
 def test_metric_policy_defaults_and_custom_attrs():
     assert _metric_policy("RNA_nCounts") == {
         "transform": "log1p",
@@ -116,7 +133,7 @@ def test_metric_policy_defaults_and_custom_attrs():
 @pytest.mark.parametrize("attr", ["RNA_nCounts", "RNA_nFeatures"])
 def test_sample_aware_mask_rejects_negative_count_values(attr):
     with pytest.raises(ValueError, match="non-negative before log1p"):
-        _sample_aware_mad_mask(
+        sample_aware_mad_mask(
             values_by_attr={attr: np.array([1.0, 2.0, -2.0])},
             sample_labels=np.array(["A", "A", "A"]),
             active=np.ones(3, dtype=bool),
@@ -128,7 +145,7 @@ def test_sample_aware_mask_rejects_negative_count_values(attr):
 
 def test_sample_aware_mask_rejects_mixed_label_types_without_collision():
     with pytest.raises(ValueError, match="one consistent label type"):
-        _sample_aware_mad_mask(
+        sample_aware_mad_mask(
             values_by_attr={"score": np.arange(8, dtype=float)},
             sample_labels=np.array([1] * 4 + ["1"] * 4, dtype=object),
             active=np.ones(8, dtype=bool),
@@ -138,9 +155,59 @@ def test_sample_aware_mask_rejects_mixed_label_types_without_collision():
         )
 
 
+def test_label_keys_decode_bytes_and_reject_collisions():
+    assert unique_label_keys([b"A", np.int64(2), 1.5], label_name="Sample labels") == [
+        "A",
+        "2",
+        "1.5",
+    ]
+    with pytest.raises(ValueError, match="Sample labels collide"):
+        unique_label_keys([b"A", "A"], label_name="Sample labels")
+
+
+def test_cell_filter_sources_reject_repeated_colliding_and_double_sources():
+    metric = NamedCellArtifact(
+        "RNA_percentMito", ArtifactRef("assay", "quality_metric", "a" * 64, "RNA")
+    )
+    sample = NamedCellArtifact(
+        "sample", ArtifactRef("datastore", "hto_identity", "b" * 64)
+    )
+    assert validate_cell_filter_sources(
+        ["RNA_nCounts"], [metric], sample_artifact=sample
+    ) == (["RNA_nCounts"], [metric], sample)
+    for arguments, error, message in (
+        ({"attrs": [1]}, TypeError, "only column names"),
+        ({"attrs": ["RNA_nCounts"] * 2}, ValueError, "duplicate columns"),
+        (
+            {"attrs": ["RNA_percentMito"], "artifact_metrics": [metric]},
+            ValueError,
+            "distinct names",
+        ),
+        (
+            {
+                "attrs": [],
+                "artifact_metrics": [metric],
+                "sample_artifact": NamedCellArtifact(
+                    "RNA_percentMito", sample.artifact
+                ),
+            },
+            ValueError,
+            "Sample and metric artifact names",
+        ),
+        (
+            {"attrs": [], "sample_column": "sample", "sample_artifact": sample},
+            ValueError,
+            "mutually exclusive",
+        ),
+        ({"attrs": [], "sample_artifact": metric}, ValueError, "hto_identity"),
+    ):
+        with pytest.raises(error, match=message):
+            validate_cell_filter_sources(**arguments)
+
+
 def test_sample_aware_mask_rejects_blank_bytes_labels():
     with pytest.raises(ValueError, match="missing labels"):
-        _sample_aware_mad_mask(
+        sample_aware_mad_mask(
             values_by_attr={"score": np.arange(4, dtype=float)},
             sample_labels=np.array([b"A", b"A", b"  ", b"  "]),
             active=np.ones(4, dtype=bool),
@@ -159,7 +226,7 @@ def test_sample_aware_mask_isolates_outliers_per_sample():
     labels = np.array(["A"] * 20 + ["B"] * 20)
     active = np.ones(40, dtype=bool)
 
-    keep, provenance = _sample_aware_mad_mask(
+    keep, provenance = sample_aware_mad_mask(
         values_by_attr={"RNA_nCounts": n_counts},
         sample_labels=labels,
         active=active,
@@ -188,7 +255,7 @@ def test_sample_aware_mask_uses_log_counts_and_upper_only_percent():
     labels = np.array(["S"] * 11)
     active = np.ones(11, dtype=bool)
 
-    keep, provenance = _sample_aware_mad_mask(
+    keep, provenance = sample_aware_mad_mask(
         values_by_attr={
             "RNA_nCounts": n_counts,
             "RNA_percentMito": percent_mito,
@@ -212,7 +279,7 @@ def test_sample_aware_mask_uses_log_counts_and_upper_only_percent():
     # An unusually low mito percentage must not be filtered by upper-only bounds.
     low_mito = percent_mito.copy()
     low_mito[0] = 0.0
-    keep_low, _ = _sample_aware_mad_mask(
+    keep_low, _ = sample_aware_mad_mask(
         values_by_attr={
             "RNA_nCounts": n_counts,
             "RNA_percentMito": low_mito,
@@ -231,7 +298,7 @@ def test_sample_aware_mask_skips_small_and_zero_mad_groups():
     labels = np.array(["tiny"] * 3 + ["flat"] * 5)
     active = np.ones(8, dtype=bool)
 
-    keep, provenance = _sample_aware_mad_mask(
+    keep, provenance = sample_aware_mad_mask(
         values_by_attr={"custom_score": values},
         sample_labels=labels,
         active=active,
@@ -542,7 +609,7 @@ def test_auto_filter_cells_validates_provenance_before_selection_mutation(
 
     monkeypatch.setattr(
         qc_filtering,
-        "_sample_aware_mad_mask",
+        "sample_aware_mad_mask",
         malformed_provenance,
     )
     with pytest.raises(TypeError, match="Unsupported provenance value"):
@@ -711,7 +778,7 @@ def test_auto_filter_cells_sample_mad_combines_exact_metric_and_hto_artifacts(
         datastore_ephemeral.cells.fetch_all("RNA_nCounts"),
         dtype=float,
     )[active_indices]
-    expected_compact, expected_provenance = _sample_aware_mad_mask(
+    expected_compact, expected_provenance = sample_aware_mad_mask(
         values_by_attr={
             "RNA_nCounts": counts,
             "percentMito": percent_mito,

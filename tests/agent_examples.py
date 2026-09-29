@@ -271,7 +271,6 @@ def _example_19_AssayModalityEvidence(cls):
     return cls(
         assayType="ADT",
         modality="ADT",
-        typeSource="persisted",
         graphEligible=True,
         markerEligible=True,
         adtControls=[control],
@@ -342,7 +341,6 @@ def _example_24_AssayFeatureInspection(cls):
     modality = AssayModalityEvidence(
         assayType="RNA",
         modality="RNA",
-        typeSource="persisted",
         graphEligible=True,
         markerEligible=True,
         totalObservedFeatures=20000,
@@ -848,7 +846,7 @@ def _example_58_AutomatedWorkflowResumeRequest(cls):
 
 
 def _example_59_OrchestrationResumeRecord(cls):
-    return cls(workflowRunId="workflow-1", answers={"approvePlanChecksum": "0" * 64})
+    return cls(answers={"approvePlanChecksum": "0" * 64})
 
 
 def _example_60_ArtifactRecord(cls):
@@ -913,112 +911,6 @@ def _example_63_ParameterCandidateEvaluation(cls):
     )
 
 
-def _example_64_IntegrationMetrics(cls):
-    return cls(
-        nClusters=8,
-        minClusterCells=37,
-        minClusterFraction=0.0185,
-        adjustedRandByAssay={"RNA": 0.71, "ADT": 0.63},
-        normalizedMutualInformationByAssay={"RNA": 0.76, "ADT": 0.69},
-        modalityWeightsValid=True,
-    )
-
-
-def _example_65_IntegrationCandidateEvaluation(cls):
-    from scarf.agent.parameter_tuning.contracts import (
-        ArtifactRecord,
-        ArtifactReferenceModel,
-        IntegrationMetrics,
-    )
-
-    return cls(
-        integrationId="wnn_resolution_1",
-        method="wnn",
-        assays=["RNA", "ADT"],
-        status="done",
-        eligible=True,
-        cellSelection=ArtifactReferenceModel(
-            scope="datastore", assay=None, kind="cell_selection", artifactId="c" * 64
-        ),
-        graphArtifact=ArtifactRecord(
-            scope="datastore", kind="integrated_graph", artifactId="2" * 64
-        ),
-        clusterArtifact=ArtifactRecord(
-            scope="datastore", kind="cluster_labels", artifactId="3" * 64
-        ),
-        clusterColumn="agent_wnn_cluster",
-        metrics=example(IntegrationMetrics),
-        evidenceIds=["integration:wnn_resolution_1:clusters"],
-    )
-
-
-def _example_66_FinalGraphComparison(cls):
-    return cls(
-        optionId="native:ADT:baseline",
-        summary="The RNA-native option better preserves the requested labels.",
-        evidenceIds=[
-            "native:RNA:candidate:baseline:clusters",
-            "native:ADT:candidate:baseline:clusters",
-        ],
-    )
-
-
-def _example_67_FinalGraphNeedsInput(cls):
-    return cls(
-        question="Which biological signal must the final graph preserve?",
-        options=["cell_type", "condition"],
-    )
-
-
-def _example_68_FinalGraphSelection(cls):
-    from scarf.agent.parameter_tuning.contracts import AgentRunInfo
-
-    return cls(
-        status="done",
-        selectedOptionId="native:RNA:baseline",
-        graphMethod="native",
-        nativeAssay="RNA",
-        nativeCandidateId="baseline",
-        markerAssay="RNA",
-        confidence="medium",
-        rationale="The selected native graph has the strongest supported balance.",
-        evidenceIds=["native:RNA:candidate:baseline:clusters"],
-        runInfo=example(AgentRunInfo),
-    )
-
-
-def _example_69_CandidateComparison(cls):
-    return cls(
-        candidateId="pca_15",
-        summary="The selected baseline retains larger minimum clusters.",
-        evidenceIds=["candidate:baseline:clusters", "candidate:pca_15:clusters"],
-    )
-
-
-def _example_70_ParameterSearchPlan(cls):
-    from scarf.agent.parameter_tuning.contracts import AgentRunInfo, ParameterCandidate
-
-    return cls(
-        status="refine",
-        candidates=[
-            ParameterCandidate(
-                candidateId="refined_pca_18",
-                dimensions=18,
-                leidenResolution=1.0,
-                neighborsK=11,
-                useHarmony=False,
-            )
-        ],
-        basedOnCandidateIds=["baseline", "pca_15"],
-        harmonyBatchColumns=[],
-        objectives=["Resolve the dimension tradeoff."],
-        rationale="The initial screen brackets a narrower dimension range.",
-        evidenceIds=["candidate:baseline:clusters", "candidate:pca_15:clusters"],
-        stoppingCriteria=["Run the proposed candidate once."],
-        runInfo=example(AgentRunInfo),
-    )
-
-
 def _example_72_ParameterTuningNeedsInput(cls):
     return cls(
         question="Which trusted biological label should be preserved?",
@@ -1030,7 +922,6 @@ def _example_72_ParameterTuningNeedsInput(cls):
 def _example_73_ParameterTuningReport(cls):
     from scarf.agent.parameter_tuning.contracts import (
         AgentRunInfo,
-        FinalGraphSelection,
         ParameterCandidateEvaluation,
     )
 
@@ -1045,14 +936,12 @@ def _example_73_ParameterTuningReport(cls):
         confidence="medium",
         rationale="The baseline balances separation and cluster size.",
         evidenceIds=["candidate:baseline:clusters"],
-        tradeoffs=["Higher resolutions produced smaller clusters."],
         limitations=["No trusted biological preservation label was supplied."],
         stopReason="All authorized candidates were evaluated.",
         recommendedByAssay={"RNA": evaluation.candidateId},
         totalCandidates=1,
         graphAssay="RNA",
         markerAssay="RNA",
-        finalSelection=example(FinalGraphSelection),
         runInfo=example(AgentRunInfo),
     )
 
@@ -1228,13 +1117,6 @@ _FACTORIES = {
     "scarf.agent.parameter_tuning.contracts.ParameterCandidate": _example_61_ParameterCandidate,
     "scarf.agent.parameter_tuning.contracts.ParameterMetrics": _example_62_ParameterMetrics,
     "scarf.agent.parameter_tuning.contracts.ParameterCandidateEvaluation": _example_63_ParameterCandidateEvaluation,
-    "scarf.agent.parameter_tuning.contracts.IntegrationMetrics": _example_64_IntegrationMetrics,
-    "scarf.agent.parameter_tuning.contracts.IntegrationCandidateEvaluation": _example_65_IntegrationCandidateEvaluation,
-    "scarf.agent.parameter_tuning.contracts.FinalGraphComparison": _example_66_FinalGraphComparison,
-    "scarf.agent.parameter_tuning.contracts.FinalGraphNeedsInput": _example_67_FinalGraphNeedsInput,
-    "scarf.agent.parameter_tuning.contracts.FinalGraphSelection": _example_68_FinalGraphSelection,
-    "scarf.agent.parameter_tuning.contracts.CandidateComparison": _example_69_CandidateComparison,
-    "scarf.agent.parameter_tuning.contracts.ParameterSearchPlan": _example_70_ParameterSearchPlan,
     "scarf.agent.parameter_tuning.contracts.ParameterTuningNeedsInput": _example_72_ParameterTuningNeedsInput,
     "scarf.agent.parameter_tuning.contracts.ParameterTuningReport": _example_73_ParameterTuningReport,
     "scarf.agent.parameter_tuning.contracts.ParameterTuningDependencies": _example_74_ParameterTuningDependencies,

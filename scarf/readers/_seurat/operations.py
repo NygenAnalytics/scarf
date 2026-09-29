@@ -5,7 +5,7 @@ from typing import Any, TypeGuard
 
 import numpy as np
 from numpy.typing import DTypeLike, NDArray
-from scipy.sparse import spmatrix
+from scipy.sparse import csr_matrix, issparse
 
 from .errors import (
     MatrixSourceError,
@@ -30,6 +30,8 @@ from .sources import (
     _block_to_dense,
     _normalize_indexes,
     _read_selected_cells,
+    _selected_estimate,
+    _value_bound,
 )
 
 
@@ -44,11 +46,10 @@ def _is_numeric_scalar(value: object) -> TypeGuard[NumericScalar]:
 
 class MatrixOperation(str, Enum):
     SUBSET = "subset"
-    TRANSPOSE = "transpose"
     APERM = "aperm"
-    ROW_BIND = "rbind"
-    COLUMN_BIND = "cbind"
-    RENAME = "dimnames"
+    FEATURE_BIND = "feature_bind"
+    CELL_BIND = "cell_bind"
+    RENAME = "rename"
     DTYPE = "dtype"
     UNARY = "unary"
     BINARY = "binary"
@@ -57,13 +58,6 @@ class MatrixOperation(str, Enum):
     RANK = "rank"
     MULTIPLY = "multiply"
     FRAGMENT = "fragment-derived"
-
-
-@dataclass(frozen=True)
-class OperationCapability:
-    operation: MatrixOperation
-    aliases: tuple[str, ...]
-    local: bool
 
 
 @dataclass(frozen=True)
@@ -171,7 +165,7 @@ def _result_dtype(
             if right is None
             else function(left_value, np.asarray([right]))
         )
-    dtype = np.asarray(result).dtype
+    dtype: np.dtype[Any] = np.dtype(np.asarray(result).dtype)
     if dtype.kind not in "biufc":
         raise TypeError(f"operation produces unsupported dtype {dtype}")
     return dtype
@@ -186,6 +180,42 @@ def _zero_result(function: Any, right: Any = None) -> bool:
         )
     value = np.asarray(result).reshape(-1)[0]
     return bool(np.isfinite(value) and value == 0)
+
+
+_SPARSE_BINARY_OPERATIONS = frozenset(
+    {
+        "add",
+        "+",
+        "subtract",
+        "sub",
+        "-",
+        "multiply",
+        "mul",
+        "*",
+        "minimum",
+        "pmin",
+        "maximum",
+        "pmax",
+    }
+)
+
+
+def _elementwise_estimate(
+    target: BaseMatrixSource,
+    inputs: Sequence[MatrixSource],
+    start: int,
+    stop: int,
+) -> MemoryEstimate:
+    """Estimate a transform whose sparse output keeps its inputs' stored values."""
+    rows = stop - start
+    child_bytes = 0
+    values = 0
+    for source in inputs:
+        estimate = source.estimate_read_memory(start, stop)
+        child_bytes += estimate.blockBytes
+        values += _value_bound(source, estimate, rows)
+    output = target._output_bytes(rows, values)
+    return MemoryEstimate(target.resident_bytes, child_bytes + output, output)
 
 
 class UnaryTransformMatrixSource(BaseMatrixSource):
@@ -244,9 +274,7 @@ class UnaryTransformMatrixSource(BaseMatrixSource):
 
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
         start, stop = self._window(start, stop)
-        child = self.source.estimate_read_memory(start, stop)
-        output = (stop - start) * self.n_features * self.dtype.itemsize
-        return MemoryEstimate(self.resident_bytes, child.peakBytes, output)
+        return _elementwise_estimate(self, (self.source,), start, stop)
 
     def read_cells(self, start: int, stop: int) -> MatrixBlock:
         start, stop = self._window(start, stop)
@@ -255,9 +283,15 @@ class UnaryTransformMatrixSource(BaseMatrixSource):
         block = self.source.read_cells(start, stop)
         with np.errstate(all="ignore"):
             if self.is_sparse:
-                result = _block_to_csr(block).astype(self.dtype, copy=True)
-                result.data = np.asarray(
-                    self.kernel.function(result.data), dtype=self.dtype
+                sparse = _block_to_csr(block)
+                result = csr_matrix(
+                    (
+                        np.asarray(self.kernel.function(sparse.data), dtype=self.dtype),
+                        sparse.indices.copy(),
+                        sparse.indptr.copy(),
+                    ),
+                    shape=sparse.shape,
+                    dtype=self.dtype,
                 )
                 result.eliminate_zeros()
                 return result
@@ -366,11 +400,20 @@ class BinaryTransformMatrixSource(BaseMatrixSource):
 
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
         start, stop = self._window(start, stop)
-        child = self.left.estimate_read_memory(start, stop).peakBytes
-        if isinstance(self.right, MatrixSource):
-            child += self.right.estimate_read_memory(start, stop).peakBytes
-        output = (stop - start) * self.n_features * self.dtype.itemsize
-        return MemoryEstimate(self.resident_bytes, child, output)
+        if not isinstance(self.right, MatrixSource):
+            return _elementwise_estimate(self, (self.left,), start, stop)
+        estimate = _elementwise_estimate(self, (self.left, self.right), start, stop)
+        if not self.is_sparse or self.operation in _SPARSE_BINARY_OPERATIONS:
+            return estimate
+        dense = (stop - start) * self.n_features
+        dense *= (
+            self.left.dtype.itemsize + self.right.dtype.itemsize + self.dtype.itemsize
+        )
+        return MemoryEstimate(
+            estimate.residentBytes,
+            estimate.workingBytes + dense,
+            estimate.outputBytes,
+        )
 
     def read_cells(self, start: int, stop: int) -> MatrixBlock:
         start, stop = self._window(start, stop)
@@ -384,37 +427,44 @@ class BinaryTransformMatrixSource(BaseMatrixSource):
         )
         with np.errstate(all="ignore"):
             if self.is_sparse:
-                left_sparse = _block_to_csr(left_block, dtype=self.dtype)
+                left_sparse = _block_to_csr(left_block)
                 if isinstance(self.right, MatrixSource):
-                    right_sparse = _block_to_csr(right_block, dtype=self.dtype)
-                    if self.operation in {"add", "+"}:
-                        result = left_sparse + right_sparse
-                    elif self.operation in {"subtract", "sub", "-"}:
-                        result = left_sparse - right_sparse
-                    elif self.operation in {"multiply", "mul", "*"}:
-                        result = left_sparse.multiply(right_sparse)
-                    elif self.operation in {"minimum", "pmin"}:
-                        result = left_sparse.minimum(right_sparse)
-                    elif self.operation in {"maximum", "pmax"}:
-                        result = left_sparse.maximum(right_sparse)
-                    else:
+                    common = np.result_type(left_sparse.dtype, self.right.dtype)
+                    right_sparse = _block_to_csr(right_block, dtype=common)
+                    left_common = left_sparse.astype(common, copy=False)
+                    if self.operation not in _SPARSE_BINARY_OPERATIONS:
                         dense = self.kernel(
-                            left_sparse.toarray(), right_sparse.toarray()
+                            left_sparse.toarray(), _block_to_dense(right_block)
                         )
                         return _block_to_csr(
                             np.asarray(dense, dtype=self.dtype),
                             dtype=self.dtype,
                         )
-                    result = result.tocsr().astype(self.dtype, copy=False)
+                    if self.operation in {"add", "+"}:
+                        result = left_common + right_sparse
+                    elif self.operation in {"subtract", "sub", "-"}:
+                        result = left_common - right_sparse
+                    elif self.operation in {"multiply", "mul", "*"}:
+                        result = left_common.multiply(right_sparse)
+                    elif self.operation in {"minimum", "pmin"}:
+                        result = left_common.minimum(right_sparse)
+                    else:
+                        result = left_common.maximum(right_sparse)
+                    result = _block_to_csr(result, dtype=self.dtype)
                     result.eliminate_zeros()
                     return result
-                result = left_sparse.copy()
-                result.data = np.asarray(
+                values = (
+                    self.kernel(self.right, left_sparse.data)
+                    if self.reverse
+                    else self.kernel(left_sparse.data, self.right)
+                )
+                result = csr_matrix(
                     (
-                        self.kernel(self.right, result.data)
-                        if self.reverse
-                        else self.kernel(result.data, self.right)
+                        np.asarray(values, dtype=self.dtype),
+                        left_sparse.indices.copy(),
+                        left_sparse.indptr.copy(),
                     ),
+                    shape=left_sparse.shape,
                     dtype=self.dtype,
                 )
                 result.eliminate_zeros()
@@ -477,10 +527,14 @@ class MaskMatrixSource(BaseMatrixSource):
 
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
         start, stop = self._window(start, stop)
-        child = self.source.estimate_read_memory(start, stop).peakBytes
-        child += self.mask.estimate_read_memory(start, stop).peakBytes
-        output = (stop - start) * self.n_features * self.dtype.itemsize
-        return MemoryEstimate(self.resident_bytes, child, output)
+        estimate = _elementwise_estimate(self, (self.source,), start, stop)
+        mask = self.mask.estimate_read_memory(start, stop)
+        dense_mask = 0 if self.keepNonzero else (stop - start) * self.n_features
+        return MemoryEstimate(
+            estimate.residentBytes,
+            estimate.workingBytes + mask.blockBytes + dense_mask,
+            estimate.outputBytes,
+        )
 
     def read_cells(self, start: int, stop: int) -> MatrixBlock:
         start, stop = self._window(start, stop)
@@ -506,44 +560,21 @@ class MaskMatrixSource(BaseMatrixSource):
         )
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class Subassignment:
     featureIndices: Sequence[int] | NDArray[Any]
     cellIndices: Sequence[int] | NDArray[Any]
     value: MatrixSource | NDArray[Any] | NumericScalar
 
-    def __init__(
-        self,
-        feature_indices: Sequence[int] | NDArray[Any] | None = None,
-        cell_indices: Sequence[int] | NDArray[Any] | None = None,
-        value: MatrixSource | NDArray[Any] | NumericScalar | None = None,
-        *,
-        featureIndices: Sequence[int] | NDArray[Any] | None = None,
-        cellIndices: Sequence[int] | NDArray[Any] | None = None,
-    ) -> None:
-        if feature_indices is not None and featureIndices is not None:
-            raise TypeError("provide only one feature index spelling")
-        if cell_indices is not None and cellIndices is not None:
-            raise TypeError("provide only one cell index spelling")
-        resolved_features = (
-            feature_indices if featureIndices is None else featureIndices
-        )
-        resolved_cells = cell_indices if cellIndices is None else cellIndices
-        if resolved_features is None or resolved_cells is None or value is None:
+    def __post_init__(self) -> None:
+        if (
+            self.featureIndices is None
+            or self.cellIndices is None
+            or self.value is None
+        ):
             raise TypeError(
                 "subassignment requires feature indexes, cell indexes, and value"
             )
-        object.__setattr__(self, "featureIndices", resolved_features)
-        object.__setattr__(self, "cellIndices", resolved_cells)
-        object.__setattr__(self, "value", value)
-
-    @property
-    def feature_indices(self) -> Sequence[int] | NDArray[Any]:
-        return self.featureIndices
-
-    @property
-    def cell_indices(self) -> Sequence[int] | NDArray[Any]:
-        return self.cellIndices
 
 
 @dataclass(frozen=True)
@@ -631,19 +662,14 @@ class DelayedSubassignmentMatrixSource(BaseMatrixSource):
 
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
         start, stop = self._window(start, stop)
-        child = self.source.estimate_read_memory(start, stop).peakBytes
+        child = self.source.estimate_read_memory(start, stop).blockBytes
         for assignment in self.assignments:
             if not isinstance(assignment.value, MatrixSource):
                 continue
             selected = np.flatnonzero(
                 (assignment.cellIndices >= start) & (assignment.cellIndices < stop)
-            )
-            child += sum(
-                assignment.value.estimate_read_memory(
-                    int(position), int(position) + 1
-                ).peakBytes
-                for position in selected
-            )
+            ).astype(np.int64, copy=False)
+            child += _selected_estimate(assignment.value, selected)[0]
         output = (stop - start) * self.n_features * self.dtype.itemsize
         return MemoryEstimate(self.resident_bytes, child, output)
 
@@ -736,20 +762,14 @@ class AxisMinimumMatrixSource(BaseMatrixSource):
 
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
         start, stop = self._window(start, stop)
-        source = self.source.estimate_read_memory(start, stop)
-        output = (stop - start) * self.n_features * self.dtype.itemsize
-        return MemoryEstimate(
-            self.resident_bytes,
-            source.workingBytes + source.outputBytes + output,
-            output,
-        )
+        return _elementwise_estimate(self, (self.source,), start, stop)
 
     def read_cells(self, start: int, stop: int) -> MatrixBlock:
         start, stop = self._window(start, stop)
         self._admit(self.estimate_read_memory(start, stop))
         block = self.source.read_cells(start, stop)
-        if isinstance(block, spmatrix):
-            result = block.tocsr(copy=True).astype(np.float64)
+        if issparse(block):
+            result = _block_to_csr(block, dtype=np.float64).copy()
             if self.axis == "feature":
                 result.data = np.minimum(
                     result.data,
@@ -859,14 +879,7 @@ class ScaleShiftMatrixSource(BaseMatrixSource):
 
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
         start, stop = self._window(start, stop)
-        source = self.source.estimate_read_memory(start, stop)
-        dense_output = (stop - start) * self.n_features * self.dtype.itemsize
-        output = source.outputBytes if self.is_sparse else dense_output
-        return MemoryEstimate(
-            self.resident_bytes,
-            source.workingBytes + source.outputBytes + dense_output,
-            output,
-        )
+        return _elementwise_estimate(self, (self.source,), start, stop)
 
     def read_cells(self, start: int, stop: int) -> MatrixBlock:
         start, stop = self._window(start, stop)
@@ -875,8 +888,8 @@ class ScaleShiftMatrixSource(BaseMatrixSource):
         feature_scale: float | NDArray[np.float64] = self.globalScale
         if self.featureScale is not None:
             feature_scale = self.featureScale * feature_scale
-        if self.is_sparse and isinstance(block, spmatrix):
-            result = block.tocsr(copy=True).astype(np.float64)
+        if self.is_sparse and issparse(block):
+            result = _block_to_csr(block, dtype=np.float64).copy()
             result.data *= (
                 feature_scale
                 if isinstance(feature_scale, float)
@@ -1054,7 +1067,7 @@ class LinearResidualMatrixSource(BaseMatrixSource):
             dtype=np.float64,
         )
         prediction = self.cellParameters[:, start:stop].T @ self.featureParameters
-        return values - prediction
+        return np.asarray(values - prediction, dtype=np.float64)
 
 
 def _rank_values(values: NDArray[Any], total_size: int) -> NDArray[np.float64]:
@@ -1096,17 +1109,12 @@ class RankMatrixSource(BaseMatrixSource):
         source: MatrixSource,
         *,
         axis: str = "column",
-        object_path: str = "$",
-        class_name: str | None = "RankMatrix",
         limits: SourceLimits = DEFAULT_LIMITS,
     ) -> None:
         if axis not in {"column", "row"}:
             raise MatrixSourceError("rank axis must be 'column' or 'row'")
         self.source = source
         self.axis = axis
-        self.operation = "rank"
-        self.objectPath = object_path
-        self.className = class_name
         super().__init__(
             source.shape,
             np.float64,
@@ -1148,11 +1156,7 @@ class RankMatrixSource(BaseMatrixSource):
                 + sparse_conversion,
                 output,
             )
-        return MemoryEstimate(
-            self.resident_bytes,
-            source.workingBytes + source.outputBytes + output,
-            output,
-        )
+        return _elementwise_estimate(self, (self.source,), start, stop)
 
     def read_cells(self, start: int, stop: int) -> MatrixBlock:
         start, stop = self._window(start, stop)
@@ -1170,8 +1174,8 @@ class RankMatrixSource(BaseMatrixSource):
             for scan_start in range(0, self.n_cells, self._limits.tileCells):
                 scan_stop = min(scan_start + self._limits.tileCells, self.n_cells)
                 scan_block = self.source.read_cells(scan_start, scan_stop)
-                if isinstance(scan_block, spmatrix):
-                    sparse_block = scan_block.tocsc(copy=False)
+                if issparse(scan_block):
+                    sparse_block = _block_to_csr(scan_block).tocsc()
                     for feature in range(self.n_features):
                         data_start = int(sparse_block.indptr[feature])
                         data_stop = int(sparse_block.indptr[feature + 1])
@@ -1227,8 +1231,8 @@ class RankMatrixSource(BaseMatrixSource):
                 standard_rank - zero_rank[np.newaxis, :],
             )
             return _block_to_csr(result) if self.source.is_sparse else result
-        if isinstance(block, spmatrix):
-            result = block.tocsr(copy=True).astype(np.float64)
+        if issparse(block):
+            result = _block_to_csr(block, dtype=np.float64).copy()
             for row in range(result.shape[0]):
                 row_start = int(result.indptr[row])
                 row_stop = int(result.indptr[row + 1])
@@ -1252,10 +1256,7 @@ class MatrixMultiplySource(BaseMatrixSource):
         *,
         right: MatrixSource | None = None,
         shape: Sequence[int] | None = None,
-        row_names: Sequence[str | bytes] | NDArray[Any] | None = None,
-        column_names: Sequence[str | bytes] | NDArray[Any] | None = None,
         object_path: str = "$",
-        class_name: str | None = "MatrixMultiply",
         limits: SourceLimits = DEFAULT_LIMITS,
     ) -> None:
         if right is None:
@@ -1264,9 +1265,6 @@ class MatrixMultiplySource(BaseMatrixSource):
             )
         self.right = right
         self.source = source
-        self.operation = "multiply"
-        self.objectPath = object_path
-        self.className = class_name
         if source.shape[1] != right.shape[0]:
             raise MatrixSourceError(
                 "matrix multiplication inner dimensions do not match"
@@ -1280,8 +1278,8 @@ class MatrixMultiplySource(BaseMatrixSource):
         super().__init__(
             inferred_shape,
             np.result_type(source.dtype, right.dtype),
-            row_names=source.row_names if row_names is None else row_names,
-            column_names=right.column_names if column_names is None else column_names,
+            row_names=source.row_names,
+            column_names=right.column_names,
             is_sparse=False,
             zero_preserving=True,
             limits=limits,
@@ -1343,42 +1341,6 @@ class MatrixMultiplySource(BaseMatrixSource):
         return output
 
 
-_CAPABILITIES = (
-    OperationCapability(MatrixOperation.SUBSET, ("subset", "[", "extract"), True),
-    OperationCapability(MatrixOperation.TRANSPOSE, ("transpose", "t"), True),
-    OperationCapability(MatrixOperation.APERM, ("aperm",), True),
-    OperationCapability(
-        MatrixOperation.ROW_BIND, ("rbind", "row_bind", "feature_bind"), True
-    ),
-    OperationCapability(
-        MatrixOperation.COLUMN_BIND, ("cbind", "column_bind", "cell_bind"), True
-    ),
-    OperationCapability(
-        MatrixOperation.RENAME, ("dimnames", "rename", "set_dimnames"), True
-    ),
-    OperationCapability(MatrixOperation.DTYPE, ("dtype", "cast", "convert_type"), True),
-    OperationCapability(MatrixOperation.UNARY, ("unary", "unary_transform"), True),
-    OperationCapability(MatrixOperation.BINARY, ("binary", "binary_transform"), True),
-    OperationCapability(MatrixOperation.MASK, ("mask",), True),
-    OperationCapability(
-        MatrixOperation.SUBASSIGNMENT,
-        ("subassignment", "subassign", "[<-"),
-        True,
-    ),
-    OperationCapability(MatrixOperation.RANK, ("rank",), False),
-    OperationCapability(
-        MatrixOperation.MULTIPLY,
-        ("multiply", "matrix_multiply", "matmul"),
-        False,
-    ),
-    OperationCapability(
-        MatrixOperation.FRAGMENT,
-        ("fragment-derived", "fragment_matrix"),
-        False,
-    ),
-)
-
-
 _KNOWN_CLASSES = frozenset(
     {
         "DelayedArray",
@@ -1435,302 +1397,30 @@ _KNOWN_CLASSES = frozenset(
         "ConvertMatrixType",
         "PeakMatrix",
         "TileMatrix",
-        "SubsetMatrix",
-        "TransposeMatrix",
-        "ApermMatrix",
-        "RowBindMatrix",
-        "ColumnBindMatrix",
-        "RenameMatrix",
-        "DtypeMatrix",
-        "UnaryMatrix",
-        "BinaryMatrix",
-        "MaskMatrix",
-        "SubassignmentMatrix",
-        "RankMatrix",
         "MatrixMultiply",
-        "FragmentMatrix",
-        "BPCellsMatrix",
     }
 )
 
 
-class MatrixOperationRegistry:
-    def __init__(self) -> None:
-        aliases: dict[str, MatrixOperation] = {}
-        for capability in _CAPABILITIES:
-            for alias in capability.aliases:
-                aliases[alias.lower()] = capability.operation
-        self._aliases = aliases
-        self.capabilities = {
-            capability.operation: capability for capability in _CAPABILITIES
-        }
-
-    def resolve(
-        self,
-        operation: Any,
-        *,
-        object_path: str,
-        class_name: str | None,
-    ) -> MatrixOperation:
-        if not isinstance(operation, str):
-            raise UnsupportedMatrixOperation(
-                object_path,
-                repr(operation),
-                class_name,
-                "custom functions are not executed",
-            )
-        normalized = operation.lower()
-        if normalized not in self._aliases:
-            raise UnsupportedMatrixOperation(
-                object_path, operation, class_name, "unknown operation"
-            )
-        return self._aliases[normalized]
-
-    def build(
-        self,
-        specification: Mapping[str, Any],
-        *,
-        object_path: str = "$",
-        source: MatrixSource | None = None,
-        limits: SourceLimits = DEFAULT_LIMITS,
-    ) -> MatrixSource:
-        if not isinstance(specification, Mapping):
-            raise TypeError("matrix operation specification must be a mapping")
-        operation_value = specification.get("operation", specification.get("op"))
-        class_value = specification.get("className", specification.get("class"))
-        class_names: tuple[str, ...]
-        if class_value is None:
-            class_names = ()
-        elif isinstance(class_value, str):
-            class_names = (class_value,)
-        elif isinstance(class_value, Sequence) and not isinstance(class_value, bytes):
-            class_names = tuple(str(value) for value in class_value)
-            if not class_names:
-                raise UnsupportedMatrixOperation(
-                    object_path,
-                    str(operation_value),
-                    None,
-                    "empty class vector",
-                )
-        else:
-            class_names = (str(class_value),)
-        class_name = class_names[0] if class_names else None
-        unknown_classes = [
-            value for value in class_names if value not in _KNOWN_CLASSES
-        ]
-        if unknown_classes:
-            raise UnsupportedMatrixOperation(
-                object_path,
-                str(operation_value),
-                unknown_classes[0],
-                "unknown or custom class",
-            )
-        operation = self.resolve(
-            operation_value,
-            object_path=object_path,
-            class_name=class_name,
+def _resolve_operation(
+    operation: Any,
+    *,
+    object_path: str,
+    class_name: str | None,
+) -> MatrixOperation:
+    if not isinstance(operation, str):
+        raise UnsupportedMatrixOperation(
+            object_path,
+            repr(operation),
+            class_name,
+            "custom functions are not executed",
         )
-        if operation in {MatrixOperation.ROW_BIND, MatrixOperation.COLUMN_BIND}:
-            inputs = specification.get("sources")
-            if not isinstance(inputs, Sequence) or isinstance(inputs, str | bytes):
-                raise MatrixSourceError(
-                    f"bind operation at {object_path} requires a source sequence"
-                )
-            sources = tuple(inputs)
-            if not all(isinstance(item, MatrixSource) for item in sources):
-                raise TypeError("bind sources must implement MatrixSource")
-            return (
-                FeatureBindMatrixSource(sources, limits=limits)
-                if operation == MatrixOperation.ROW_BIND
-                else CellBindMatrixSource(sources, limits=limits)
-            )
-        primary = specification.get("source", source)
-        if operation == MatrixOperation.FRAGMENT:
-            return build_fragment_matrix_source(
-                specification,
-                object_path=object_path,
-                limits=limits,
-            )
-        if not isinstance(primary, MatrixSource):
-            raise MatrixSourceError(
-                f"matrix operation at {object_path} has no MatrixSource input"
-            )
-        if operation == MatrixOperation.SUBSET:
-            return MappedMatrixSource(
-                primary,
-                feature_indices=specification.get(
-                    "featureIndices",
-                    specification.get(
-                        "featureIndexes",
-                        specification.get(
-                            "feature_indices",
-                            specification.get(
-                                "feature_indexes", specification.get("rows")
-                            ),
-                        ),
-                    ),
-                ),
-                cell_indices=specification.get(
-                    "cellIndices",
-                    specification.get(
-                        "cellIndexes",
-                        specification.get(
-                            "cell_indices",
-                            specification.get(
-                                "cell_indexes", specification.get("columns")
-                            ),
-                        ),
-                    ),
-                ),
-                limits=limits,
-            )
-        if operation in {MatrixOperation.TRANSPOSE, MatrixOperation.APERM}:
-            permutation = specification.get("permutation", (1, 0))
-            normalized_permutation = tuple(int(value) for value in permutation)
-            if normalized_permutation in {(0, 1), (1, 2)}:
-                return primary
-            if normalized_permutation not in {(1, 0), (2, 1)}:
-                raise UnsupportedMatrixOperation(
-                    object_path,
-                    operation.value,
-                    class_name,
-                    f"2D permutation {normalized_permutation!r} is invalid",
-                )
-            return TransposeMatrixSource(primary, limits=limits)
-        if operation == MatrixOperation.RENAME:
-            return RenamedMatrixSource(
-                primary,
-                row_names=specification.get("rowNames", specification.get("row_names")),
-                column_names=specification.get(
-                    "columnNames", specification.get("column_names")
-                ),
-                limits=limits,
-            )
-        if operation == MatrixOperation.DTYPE:
-            if "dtype" not in specification:
-                raise MatrixSourceError(
-                    f"dtype operation at {object_path} has no dtype"
-                )
-            return DtypeMatrixSource(primary, specification["dtype"], limits=limits)
-        if operation == MatrixOperation.UNARY:
-            function = specification.get("function", specification.get("name"))
-            return UnaryTransformMatrixSource(
-                primary,
-                function,
-                dtype=specification.get("dtype"),
-                parameter=specification.get("parameter"),
-                object_path=object_path,
-                class_name=class_name,
-                limits=limits,
-            )
-        if operation == MatrixOperation.BINARY:
-            if "right" not in specification:
-                raise MatrixSourceError(
-                    f"binary operation at {object_path} has no right operand"
-                )
-            function = specification.get("function", specification.get("name"))
-            return BinaryTransformMatrixSource(
-                primary,
-                specification["right"],
-                function,
-                dtype=specification.get("dtype"),
-                reverse=bool(specification.get("reverse", False)),
-                object_path=object_path,
-                class_name=class_name,
-                limits=limits,
-            )
-        if operation == MatrixOperation.MASK:
-            mask = specification.get("mask")
-            if not isinstance(mask, MatrixSource):
-                raise MatrixSourceError(
-                    f"mask operation at {object_path} has no MatrixSource mask"
-                )
-            return MaskMatrixSource(
-                primary,
-                mask,
-                fill_value=specification.get(
-                    "fillValue", specification.get("fill_value", 0)
-                ),
-                keep_nonzero=specification.get(
-                    "keepNonzero",
-                    specification.get(
-                        "keep_nonzero",
-                        (
-                            bool(specification.get("invert", False))
-                            if class_name == "MatrixMask"
-                            else True
-                        ),
-                    ),
-                ),
-                limits=limits,
-            )
-        if operation == MatrixOperation.SUBASSIGNMENT:
-            raw_assignments = specification.get("assignments")
-            if not isinstance(raw_assignments, Sequence) or isinstance(
-                raw_assignments, str | bytes
-            ):
-                raise MatrixSourceError(
-                    f"subassignment at {object_path} requires assignments"
-                )
-            assignments: list[Subassignment] = []
-            for index, assignment in enumerate(raw_assignments):
-                if isinstance(assignment, Subassignment):
-                    assignments.append(assignment)
-                    continue
-                if not isinstance(assignment, Mapping):
-                    raise TypeError(
-                        f"subassignment {index} at {object_path} must be a mapping"
-                    )
-                try:
-                    assignments.append(
-                        Subassignment(
-                            assignment.get(
-                                "featureIndices", assignment.get("feature_indices")
-                            ),
-                            assignment.get(
-                                "cellIndices", assignment.get("cell_indices")
-                            ),
-                            assignment.get("value"),
-                        )
-                    )
-                except TypeError as error:
-                    raise MatrixSourceError(
-                        f"subassignment {index} at {object_path} is incomplete"
-                    ) from error
-            return DelayedSubassignmentMatrixSource(primary, assignments, limits=limits)
-        if operation == MatrixOperation.RANK:
-            return RankMatrixSource(
-                primary,
-                axis=str(specification.get("axis", "column")),
-                object_path=object_path,
-                class_name=class_name,
-                limits=limits,
-            )
-        if operation == MatrixOperation.MULTIPLY:
-            right = specification.get("right")
-            if right is not None and not isinstance(right, MatrixSource):
-                raise TypeError(
-                    "matrix multiplication right operand must implement MatrixSource"
-                )
-            return MatrixMultiplySource(
-                primary,
-                right=right,
-                shape=specification.get(
-                    "shape",
-                    specification.get("Dim", specification.get("dim")),
-                ),
-                row_names=specification.get("rowNames", specification.get("row_names")),
-                column_names=specification.get(
-                    "columnNames", specification.get("column_names")
-                ),
-                object_path=object_path,
-                class_name=class_name,
-                limits=limits,
-            )
-        raise AssertionError(f"unhandled matrix operation {operation}")
-
-
-DEFAULT_OPERATION_REGISTRY = MatrixOperationRegistry()
+    try:
+        return MatrixOperation(operation)
+    except ValueError:
+        raise UnsupportedMatrixOperation(
+            object_path, operation, class_name, "unknown operation"
+        ) from None
 
 
 def build_matrix_operation(
@@ -1740,9 +1430,167 @@ def build_matrix_operation(
     source: MatrixSource | None = None,
     limits: SourceLimits = DEFAULT_LIMITS,
 ) -> MatrixSource:
-    return DEFAULT_OPERATION_REGISTRY.build(
-        specification,
+    if not isinstance(specification, Mapping):
+        raise TypeError("matrix operation specification must be a mapping")
+    operation_value = specification.get("operation")
+    class_value = specification.get("className")
+    class_names: tuple[str, ...]
+    if class_value is None:
+        class_names = ()
+    elif isinstance(class_value, str):
+        class_names = (class_value,)
+    elif isinstance(class_value, Sequence) and not isinstance(class_value, bytes):
+        class_names = tuple(str(value) for value in class_value)
+        if not class_names:
+            raise UnsupportedMatrixOperation(
+                object_path,
+                str(operation_value),
+                None,
+                "empty class vector",
+            )
+    else:
+        class_names = (str(class_value),)
+    class_name = class_names[0] if class_names else None
+    unknown_classes = [value for value in class_names if value not in _KNOWN_CLASSES]
+    if unknown_classes:
+        raise UnsupportedMatrixOperation(
+            object_path,
+            str(operation_value),
+            unknown_classes[0],
+            "unknown or custom class",
+        )
+    operation = _resolve_operation(
+        operation_value,
         object_path=object_path,
-        source=source,
-        limits=limits,
+        class_name=class_name,
     )
+    if operation in {MatrixOperation.FEATURE_BIND, MatrixOperation.CELL_BIND}:
+        inputs = specification.get("sources")
+        if not isinstance(inputs, Sequence) or isinstance(inputs, str | bytes):
+            raise MatrixSourceError(
+                f"bind operation at {object_path} requires a source sequence"
+            )
+        sources = tuple(inputs)
+        if not all(isinstance(item, MatrixSource) for item in sources):
+            raise TypeError("bind sources must implement MatrixSource")
+        return (
+            FeatureBindMatrixSource(sources, limits=limits)
+            if operation == MatrixOperation.FEATURE_BIND
+            else CellBindMatrixSource(sources, limits=limits)
+        )
+    primary = specification.get("source", source)
+    function: Any = specification.get("function")
+    if operation == MatrixOperation.FRAGMENT:
+        return build_fragment_matrix_source(
+            specification,
+            object_path=object_path,
+            limits=limits,
+        )
+    if not isinstance(primary, MatrixSource):
+        raise MatrixSourceError(
+            f"matrix operation at {object_path} has no MatrixSource input"
+        )
+    if operation == MatrixOperation.SUBSET:
+        return MappedMatrixSource(
+            primary,
+            feature_indices=specification.get("featureIndices"),
+            cell_indices=specification.get("cellIndices"),
+            limits=limits,
+        )
+    if operation == MatrixOperation.APERM:
+        permutation = specification.get("permutation", (1, 0))
+        normalized_permutation = tuple(int(value) for value in permutation)
+        if normalized_permutation in {(0, 1), (1, 2)}:
+            return primary
+        if normalized_permutation not in {(1, 0), (2, 1)}:
+            raise UnsupportedMatrixOperation(
+                object_path,
+                operation.value,
+                class_name,
+                f"2D permutation {normalized_permutation!r} is invalid",
+            )
+        return TransposeMatrixSource(primary, limits=limits)
+    if operation == MatrixOperation.RENAME:
+        return RenamedMatrixSource(
+            primary,
+            row_names=specification.get("rowNames"),
+            column_names=specification.get("columnNames"),
+            limits=limits,
+        )
+    if operation == MatrixOperation.DTYPE:
+        if "dtype" not in specification:
+            raise MatrixSourceError(f"dtype operation at {object_path} has no dtype")
+        return DtypeMatrixSource(primary, specification["dtype"], limits=limits)
+    if operation == MatrixOperation.UNARY:
+        return UnaryTransformMatrixSource(
+            primary,
+            function,
+            dtype=specification.get("dtype"),
+            parameter=specification.get("parameter"),
+            object_path=object_path,
+            class_name=class_name,
+            limits=limits,
+        )
+    if operation == MatrixOperation.BINARY:
+        if "right" not in specification:
+            raise MatrixSourceError(
+                f"binary operation at {object_path} has no right operand"
+            )
+        return BinaryTransformMatrixSource(
+            primary,
+            specification["right"],
+            function,
+            dtype=specification.get("dtype"),
+            reverse=bool(specification.get("reverse", False)),
+            object_path=object_path,
+            class_name=class_name,
+            limits=limits,
+        )
+    if operation == MatrixOperation.MASK:
+        mask = specification.get("mask")
+        if not isinstance(mask, MatrixSource):
+            raise MatrixSourceError(
+                f"mask operation at {object_path} has no MatrixSource mask"
+            )
+        return MaskMatrixSource(
+            primary,
+            mask,
+            fill_value=specification.get("fillValue", 0),
+            keep_nonzero=bool(specification.get("keepNonzero", True)),
+            limits=limits,
+        )
+    if operation == MatrixOperation.SUBASSIGNMENT:
+        assignments = specification.get("assignments")
+        if not isinstance(assignments, Sequence) or isinstance(
+            assignments, str | bytes
+        ):
+            raise MatrixSourceError(
+                f"subassignment at {object_path} requires assignments"
+            )
+        if not all(isinstance(item, Subassignment) for item in assignments):
+            raise TypeError(
+                f"subassignments at {object_path} must be Subassignment values"
+            )
+        return DelayedSubassignmentMatrixSource(
+            primary, tuple(assignments), limits=limits
+        )
+    if operation == MatrixOperation.RANK:
+        return RankMatrixSource(
+            primary,
+            axis=str(specification.get("axis", "column")),
+            limits=limits,
+        )
+    if operation == MatrixOperation.MULTIPLY:
+        right = specification.get("right")
+        if right is not None and not isinstance(right, MatrixSource):
+            raise TypeError(
+                "matrix multiplication right operand must implement MatrixSource"
+            )
+        return MatrixMultiplySource(
+            primary,
+            right=right,
+            shape=specification.get("shape"),
+            object_path=object_path,
+            limits=limits,
+        )
+    raise AssertionError(f"unhandled matrix operation {operation}")

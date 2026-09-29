@@ -7,7 +7,12 @@ import pandas as pd
 
 from ._contracts import CategoricalScale, PlotProvenance
 from ._deps import require_kneed, require_matplotlib, require_seaborn
-from ._figure import LegendSpec, PlotResult, normalize_axes_target
+from ._figure import (
+    LegendSpec,
+    PlotResult,
+    close_figures_on_error,
+    normalize_axes_target,
+)
 from ..utils.arrays import sort_categories
 from ._style import apply_figure_chrome, theme_context
 
@@ -26,6 +31,7 @@ def _return_result(result: PlotResult, *, show: bool) -> PlotResult:
     return result
 
 
+@close_figures_on_error
 def qc(
     data: pd.DataFrame,
     color: str = "steelblue",
@@ -222,6 +228,7 @@ def qc(
     return _return_result(result, show=show)
 
 
+@close_figures_on_error
 def elbow(
     variance_explained: np.ndarray | list[float],
     figsize: tuple[float | None, float] = (None, 2),
@@ -293,7 +300,6 @@ def elbow(
                 LegendSpec(
                     kind="line",
                     label="Elbow",
-                    scale_key="component",
                     extras={"component": elbow_component},
                 ),
             )
@@ -315,6 +321,7 @@ def elbow(
     return _return_result(result, show=show)
 
 
+@close_figures_on_error
 def graph_qc(
     graph: Any,
     theme: str = "notebook",
@@ -418,6 +425,7 @@ def graph_qc(
     return _return_result(result, show=show)
 
 
+@close_figures_on_error
 def highly_variable_features(
     mean_nonzero: np.ndarray,
     corrected_variance: np.ndarray,

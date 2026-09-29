@@ -5,7 +5,7 @@ import weakref
 import numpy as np
 import pytest
 import zarr
-from scipy.sparse import coo_matrix
+from scipy.sparse import coo_matrix, csr_matrix
 from zarr.storage import MemoryStore
 
 from scarf.storage.types import (
@@ -24,10 +24,16 @@ from scarf.utils import (
     compute_with_progress,
     tqdmbar,
 )
+from scarf.utils.arguments import float_argument, integer_argument
 from scarf.utils.arrays import (
     _rolling_window_kernel,
+    assay_feature_ranges,
     canonicalize_sparse,
     checked_sparse_cast,
+    cumulative_nnz,
+    max_window_nnz,
+    read_only_copy,
+    sparse_matrix_bytes,
     sum_and_squared_sum,
 )
 from scarf.utils.progress import iter_progress
@@ -341,3 +347,80 @@ def test_canonicalize_sparse_detects_int64_duplicate_overflow():
 def test_array_digest_rejects_object_values():
     with pytest.raises(TypeError, match="object arrays"):
         array_digest(np.array([object()], dtype=object))
+
+
+def test_integer_argument_accepts_numpy_integers_and_checks_bounds():
+    assert integer_argument(np.int64(3), "count", minimum=1) == 3
+    assert type(integer_argument(np.uint8(3), "count")) is int
+    for value in (True, np.bool_(True), 2.0, "2", None):
+        with pytest.raises(TypeError, match="count must be an integer"):
+            integer_argument(value, "count", minimum=1)
+    with pytest.raises(ValueError, match="count must be at least 1"):
+        integer_argument(0, "count", minimum=1)
+    with pytest.raises(ValueError, match="count must be at most 4"):
+        integer_argument(5, "count", minimum=1, maximum=4)
+
+
+def test_float_argument_shares_one_value_across_numeric_spellings():
+    for value in (1, 1.0, np.int64(1), np.float32(1.0)):
+        resolved = float_argument(value, "ratio")
+        assert type(resolved) is float
+        assert resolved == 1.0
+    for value in (True, np.bool_(False), "1", None, 1j):
+        with pytest.raises(TypeError, match="ratio must be a real number"):
+            float_argument(value, "ratio")
+    for value in (float("nan"), float("inf"), np.float64(-np.inf)):
+        with pytest.raises(ValueError, match="ratio must be finite"):
+            float_argument(value, "ratio")
+
+
+def test_read_only_copy_owns_its_values_and_stays_read_only():
+    source = np.arange(6, dtype=np.int32).reshape(2, 3).T
+    copied = read_only_copy(source, np.int64)
+    source[0, 0] = 99
+
+    assert copied.dtype == np.dtype(np.int64)
+    assert copied.flags.c_contiguous
+    np.testing.assert_array_equal(copied, [[0, 3], [1, 4], [2, 5]])
+    with pytest.raises(ValueError, match="read-only"):
+        copied[0, 0] = 1
+    with pytest.raises(ValueError, match="cannot set WRITEABLE flag"):
+        copied.setflags(write=True)
+
+
+def test_sparse_matrix_bytes_counts_shared_arrays_once():
+    matrix = csr_matrix(np.eye(3))
+    single = matrix.data.nbytes + matrix.indices.nbytes + matrix.indptr.nbytes
+    sharing = matrix.copy()
+    sharing.indices = matrix.indices
+    sharing.indptr = matrix.indptr
+
+    assert sparse_matrix_bytes(matrix) == single
+    assert sparse_matrix_bytes(matrix, matrix) == single
+    assert sparse_matrix_bytes(matrix, sharing) == single + sharing.data.nbytes
+
+
+def test_cumulative_and_max_window_nnz_follow_row_prefix_sums():
+    cumulative = cumulative_nnz(np.asarray([2, 0, 5, 1], dtype=np.int32))
+    np.testing.assert_array_equal(cumulative, [0, 2, 2, 7, 8])
+    assert cumulative.dtype == np.int64
+    assert max_window_nnz(cumulative, 1) == 5
+    assert max_window_nnz(cumulative, 2) == 6
+    assert max_window_nnz(cumulative, 10) == 8
+    assert max_window_nnz(cumulative_nnz(np.empty(0, dtype=np.int64)), 3) == 0
+    with pytest.raises(ValueError, match="window_rows must be positive"):
+        max_window_nnz(cumulative, 0)
+
+
+def test_assay_feature_ranges_group_spans_in_first_seen_order():
+    import pandas as pd
+
+    table = pd.DataFrame(
+        [["RNA", 0, 3], ["ADT", 3, 5], ["RNA", 5, 6]],
+        columns=["type", "start", "end"],
+        index=["RNA", "ADT", "RNA"],
+    ).T
+    assert assay_feature_ranges(table) == {
+        "RNA": ((0, 3), (5, 6)),
+        "ADT": ((3, 5),),
+    }

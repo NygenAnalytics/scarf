@@ -1,7 +1,8 @@
 """PlotResult and figure ownership helpers."""
 
+import functools
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Hashable, cast
@@ -11,7 +12,12 @@ import pandas as pd
 
 from ._contracts import CategoricalScale, ColorScale, PlotProvenance, SizeScale
 from ._deps import require_matplotlib
-from ._style import refresh_layout_point_sizes, theme_context
+from ._style import (
+    continuous_norm,
+    legend_side_columns,
+    refresh_layout_point_sizes,
+    theme_context,
+)
 
 
 def _json_ready(value: Any) -> Any:
@@ -40,8 +46,29 @@ class LegendSpec:
 
     kind: str
     label: str | None = None
-    scale_key: Hashable | None = None
     extras: dict[str, Any] = field(default_factory=dict)
+
+
+def close_figures_on_error[**P, R](function: Callable[P, R]) -> Callable[P, R]:
+    """Close pyplot figures a plotting call created when that call raises."""
+
+    @functools.wraps(function)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        plt, _ = require_matplotlib()
+        existing = set(plt.get_fignums())
+        try:
+            return function(*args, **kwargs)
+        except BaseException:
+            for number in set(plt.get_fignums()) - existing:
+                plt.close(number)
+            raise
+
+    return wrapper
+
+
+def is_colorbar_axes(ax: Any) -> bool:
+    """Whether an axes holds a Matplotlib colorbar."""
+    return getattr(ax, "_colorbar", None) is not None or ax.get_label() == "<colorbar>"
 
 
 @dataclass(slots=True)
@@ -366,19 +393,6 @@ def label_panels(
         )
 
 
-def collect_legends(
-    figure: Any,
-    results: Sequence[PlotResult],
-) -> tuple[LegendSpec, ...]:
-    """Combine legend/colorbar descriptors from several plot results."""
-    legends: list[LegendSpec] = []
-    for result in results:
-        legends.extend(result.legends)
-    out = tuple(legends)
-    figure._scarf_legends = out  # type: ignore[attr-defined]
-    return out
-
-
 def _deduplicate_legend_specs(
     legends: Sequence[LegendSpec],
 ) -> tuple[LegendSpec, ...]:
@@ -454,7 +468,7 @@ def _place_legend_blocks(
                 title=title,
                 frameon=False,
                 loc=slot,
-                ncols=max(1, int(np.ceil(len(handles) / 20))),
+                ncols=legend_side_columns(len(handles)),
             )
         )
     if _legend_blocks_overlap(figure, legends):
@@ -467,7 +481,7 @@ def _place_legend_blocks(
             title=title,
             frameon=False,
             loc="outside right center",
-            ncols=max(1, int(np.ceil(len(handles) / 20))),
+            ncols=legend_side_columns(len(handles)),
         )
 
 
@@ -536,42 +550,69 @@ def _render_shared_legends(
                     min(continuous_scale_index, len(continuous) - 1)
                 ]
                 continuous_scale_index += 1
-                vmin = legend.extras.get("vmin", color_scale.vmin)
-                vmax = legend.extras.get("vmax", color_scale.vmax)
-                if vmin is None or vmax is None:
-                    continue
-                continuous_key = (
-                    legend.label,
-                    color_scale.cmap,
-                    float(vmin),
-                    float(vmax),
-                    color_scale.vcenter,
-                )
-                if continuous_key in continuous_seen:
-                    continue
-                continuous_seen.add(continuous_key)
-                if color_scale.vcenter is not None:
-                    norm = mpl.colors.TwoSlopeNorm(
-                        vmin=float(vmin),
-                        vcenter=float(color_scale.vcenter),
-                        vmax=float(vmax),
-                    )
+                panel_limits = legend.extras.get("panel_limits")
+                if panel_limits:
+                    # Per-panel limits keep one colorbar under each panel.
+                    panels = {
+                        str(key): ax
+                        for key, ax in result.axes.items()
+                        if not is_colorbar_axes(ax)
+                    }
+                    targets = [
+                        ([panels[name]], limits[0], limits[1], name)
+                        for name, limits in panel_limits.items()
+                        if name in panels
+                    ]
                 else:
-                    norm = mpl.colors.Normalize(vmin=float(vmin), vmax=float(vmax))
-                mappable = plt.cm.ScalarMappable(
-                    cmap=color_scale.cmap or "viridis",
-                    norm=norm,
-                )
-                colorbar = figure.colorbar(
-                    mappable,
-                    ax=list(dict.fromkeys(result.axes.values())),
-                    location="bottom",
-                    orientation="horizontal",
-                    shrink=0.45,
-                    fraction=0.04,
-                    pad=0.04,
-                )
-                colorbar.set_label(legend.label or "")
+                    vmin = legend.extras.get("vmin", color_scale.vmin)
+                    vmax = legend.extras.get("vmax", color_scale.vmax)
+                    if vmin is None or vmax is None:
+                        continue
+                    targets = [
+                        (
+                            [
+                                ax
+                                for ax in dict.fromkeys(result.axes.values())
+                                if not is_colorbar_axes(ax)
+                            ],
+                            vmin,
+                            vmax,
+                            None,
+                        )
+                    ]
+                for target_axes, vmin, vmax, panel in targets:
+                    continuous_key = (
+                        legend.label,
+                        color_scale.cmap,
+                        float(vmin),
+                        float(vmax),
+                        color_scale.vcenter,
+                        color_scale.scale,
+                        None if panel is None else id(target_axes[0]),
+                    )
+                    if continuous_key in continuous_seen:
+                        continue
+                    continuous_seen.add(continuous_key)
+                    mappable = plt.cm.ScalarMappable(
+                        cmap=color_scale.cmap or "viridis",
+                        norm=continuous_norm(
+                            mpl,
+                            vmin=float(vmin),
+                            vmax=float(vmax),
+                            vcenter=color_scale.vcenter,
+                            scale=color_scale.scale,
+                        ),
+                    )
+                    colorbar = figure.colorbar(
+                        mappable,
+                        ax=target_axes,
+                        location="bottom",
+                        orientation="horizontal",
+                        shrink=0.45 if panel is None else 0.8,
+                        fraction=0.04,
+                        pad=0.04,
+                    )
+                    colorbar.set_label(legend.label or "")
             elif legend.kind == "size" and sizes:
                 size_scale = sizes[min(size_scale_index, len(sizes) - 1)]
                 size_scale_index += 1
@@ -643,20 +684,17 @@ def _render_shared_legends(
 
 
 def _remove_child_legend_artists(figure: Any, axes: Sequence[Any]) -> None:
-    """Remove rendered child legends before drawing shared equivalents."""
+    """Remove rendered child legends and colorbars before shared equivalents."""
     from matplotlib.legend import Legend
 
-    main_axes = set(axes)
-    for ax in main_axes:
+    for ax in set(axes):
         for artist in list(ax.get_children()):
             if isinstance(artist, Legend):
                 artist.remove()
     for legend in list(figure.legends):
         legend.remove()
     for ax in list(figure.axes):
-        if ax in main_axes:
-            continue
-        if getattr(ax, "_colorbar", None) is not None or ax.get_label() == "<colorbar>":
+        if is_colorbar_axes(ax):
             figure.delaxes(ax)
 
 
@@ -680,14 +718,10 @@ def compose_results(
     if any(result.figure is not figure for result in children):
         raise ValueError("All child results must use the supplied figure")
 
-    axes: dict[Hashable, Any] = {}
     tables: dict[str, pd.DataFrame] = {}
     legends: list[LegendSpec] = []
     scales: list[Any] = []
     for namespace, result in named_results:
-        for key, ax in result.axes.items():
-            composite_key: Hashable = (namespace, key)
-            axes[composite_key] = ax
         tables.update(
             {
                 f"{namespace}:{table_name}": table
@@ -698,16 +732,38 @@ def compose_results(
         scales.extend(result.scales)
 
     resolved_theme = theme or children[0].theme
-    label_axes = list(dict.fromkeys(axes.values()))
+    # Each child is one lettered panel; colorbars and strips are not panels.
+    label_axes = [
+        next(
+            (ax for ax in result.axes.values() if not is_colorbar_axes(ax)),
+            next(iter(result.axes.values())),
+        )
+        for result in children
+    ]
     with theme_context(resolved_theme):
         if shared_legends:
-            _remove_child_legend_artists(figure, label_axes)
+            _remove_child_legend_artists(
+                figure,
+                [
+                    ax
+                    for result in children
+                    for ax in result.axes.values()
+                    if not is_colorbar_axes(ax)
+                ],
+            )
         if panel_labels:
             labels = None if panel_labels is True else list(panel_labels)
             label_panels(label_axes, labels=labels)
         if shared_legends:
             _render_shared_legends(figure, children)
         refresh_layout_point_sizes(figure)
+    remaining_axes = set(figure.axes)
+    axes: dict[Hashable, Any] = {
+        (namespace, key): ax
+        for namespace, result in named_results
+        for key, ax in result.axes.items()
+        if ax in remaining_axes
+    }
     provenance = PlotProvenance(
         scarf_version=children[0].provenance.scarf_version,
         n_cells=max(child.provenance.n_cells for child in children),

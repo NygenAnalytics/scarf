@@ -8,6 +8,8 @@ from scarf.quality_control import doublets
 from scarf.storage.budget import ResourceBudget
 from scarf.storage.count_matrix import CountMatrixPolicy
 
+from .doublet_fixtures import write_doublet_target_zarr
+
 
 @pytest.mark.parametrize(
     "save_k,error",
@@ -153,7 +155,7 @@ def test_streamed_doublets_match_materialized_mapping(
         counts[:15, 4:] = 0
     ids = np.array([f"g{i}" for i in range(counts.shape[1])])
     path = str(tmp_path / "reference.zarr")
-    doublets.write_doublet_target_zarr(
+    write_doublet_target_zarr(
         path,
         "RNA",
         csr_matrix(counts),
@@ -193,7 +195,7 @@ def test_streamed_doublets_match_materialized_mapping(
         assert np.median(detected) > 10
         assert np.any(detected <= 10)
     query_path = str(tmp_path / "query.zarr")
-    doublets.write_doublet_target_zarr(
+    write_doublet_target_zarr(
         query_path,
         "RNA",
         simulated,
@@ -265,7 +267,7 @@ def test_doublets_without_selected_feature_counts_are_scored(tmp_path, monkeypat
     counts[np.ix_(labels == 0, feature_indices)] = 0
     ids = np.array([f"g{i}" for i in range(counts.shape[1])])
     path = str(tmp_path / "reference.zarr")
-    doublets.write_doublet_target_zarr(
+    write_doublet_target_zarr(
         path,
         "RNA",
         csr_matrix(counts),

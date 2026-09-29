@@ -15,7 +15,8 @@ import zarr
 
 from threadpoolctl import ThreadpoolController
 
-from ..utils.shutdown import shutdown_checkpoint
+from ..utils.compute import enter_thread_limit, exit_thread_limit
+from ..utils.shutdown import ShutdownRequested, shutdown_checkpoint
 
 from .budget import detect_workers
 from .execution import OperationPlan
@@ -88,6 +89,30 @@ def _ensure_worker_numba_cap(threads: int) -> None:
         return
     _install_numba_thread_cap(threads)
     _WORKER_NUMBA_CAP.applied = threads
+
+
+def _leaves(error: BaseException) -> Iterator[BaseException]:
+    if isinstance(error, BaseExceptionGroup):
+        for inner in error.exceptions:
+            yield from _leaves(inner)
+    else:
+        yield error
+
+
+def _reported_error(error: BaseException) -> BaseException:
+    """Return the error a caller sees for one failed storage operation.
+
+    Task groups wrap even a single failure in an exception group. A shutdown
+    request is reported on its own, and a group with one leaf is replaced by
+    that leaf; groups of distinct failures are kept.
+    """
+    if not isinstance(error, BaseExceptionGroup):
+        return error
+    leaves = list(_leaves(error))
+    for leaf in leaves:
+        if isinstance(leaf, ShutdownRequested):
+            return leaf
+    return leaves[0] if len(leaves) == 1 else error
 
 
 async def _await_completion(future: asyncio.Future[T]) -> T:
@@ -228,40 +253,6 @@ def ensure_zarr_host_ceiling(maxWorkers: int | None = None) -> int:
     return _HOST_THREAD_CEILING
 
 
-def configure_zarr_runtime(
-    *,
-    codecWorkers: int,
-    asyncConcurrency: int,
-) -> None:
-    """Set the process Zarr thread ceiling before opening remote arrays.
-
-    ``asyncConcurrency`` becomes the restored default after each runner.
-    Conflicting explicit ceilings require a fresh process.
-    """
-    codec_workers = int(codecWorkers)
-    async_concurrency = int(asyncConcurrency)
-    if codec_workers < 1 or async_concurrency < 1:
-        raise ValueError("Zarr runtime limits must be positive")
-    with _ZARR_CONFIG_LOCK:
-        if _ACTIVE_IO_LIMITS:
-            raise RuntimeError(
-                "Cannot reconfigure Zarr during active storage operations"
-            )
-        ensure_zarr_host_ceiling(codec_workers)
-        zarr.config.set({"async.concurrency": async_concurrency})
-
-
-def reset_zarr_runtime_for_tests() -> None:
-    global _HOST_THREAD_CEILING
-    zarr.config.set(
-        {
-            "threading.max_workers": None,
-            "async.concurrency": 10,
-        }
-    )
-    _HOST_THREAD_CEILING = None
-
-
 class ByteLedger:
     """Admit Scarf-owned buffers before async tasks are created."""
 
@@ -360,7 +351,7 @@ class AsyncStorageRunner:
         result: Any = None
         errors: list[BaseException] = []
         restore_numba = None
-        blas_state: Any = None
+        blas_token: int | None = None
         io_context = zarr_io_concurrency(self.plan.ioConcurrency)
         io_entered = False
         try:
@@ -375,9 +366,10 @@ class AsyncStorageRunner:
             # once per operation instead of once per compute call.
             self._blas = ThreadpoolController()
             # Compute tasks limit BLAS threads process-wide, and concurrent
-            # limit scopes restore each other's values; restore the limits in
-            # force before the operation once every task has finished.
-            blas_state = self._blas.limit(limits=None)
+            # limit scopes restore each other's values. The shared process
+            # limit restores the limits in force before the operation once
+            # every task and every overlapping scope has finished.
+            blas_token = enter_thread_limit(None)
             self._compute_pool = ThreadPoolExecutor(
                 max_workers=self.plan.computeWorkers,
                 thread_name_prefix="scarf-compute",
@@ -393,7 +385,7 @@ class AsyncStorageRunner:
             result = await operation(self)
             shutdown_checkpoint()
         except BaseException as exc:
-            errors.append(exc)
+            errors.append(_reported_error(exc))
         finally:
             pending = asyncio.all_tasks(loop) - {asyncio.current_task()}
             for task in pending:
@@ -423,8 +415,11 @@ class AsyncStorageRunner:
                 except BaseException as exc:
                     errors.append(exc)
                 self._io_loops = None
-            if blas_state is not None:
-                blas_state.restore_original_limits()
+            if blas_token is not None:
+                try:
+                    exit_thread_limit(blas_token)
+                except BaseException as exc:
+                    errors.append(exc)
             if restore_numba is not None:
                 try:
                     restore_numba()

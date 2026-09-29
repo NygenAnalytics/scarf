@@ -3,31 +3,30 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 
+from ...graph.arguments import graph_flag
 from ...graph.feature_projection import graph_cell_selection
 from ...graph.kinds import require_graph_kind
 from ...metadata.artifacts import (
-    artifact_values,
     plan_cell_data_artifact,
     write_cell_data_artifact,
 )
 from ...metadata.arguments import LeidenArguments, TopacedoArguments
 from ...storage.artifacts import (
     ArtifactRef,
-    artifact_path,
     inspect_artifact,
 )
 from ...storage.artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
     PlannedArtifact,
-    finish_artifact,
+    artifact_transaction,
     plan_artifact,
     reused_artifact_group,
-    start_artifact,
 )
 from ...storage.arrays import create_zarr_dataset
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...storage.errors import ArtifactResolutionError
+from ...utils.arguments import integer_argument
 from ...utils.logging import logger
 from ...utils.shutdown import shutdown_checkpoint
 
@@ -42,21 +41,12 @@ else:
 class _PreparedLeidenClustering:
     planned: PlannedArtifact
     graph: ArtifactRef
-    graph_loc: str
     resolution: float
     backend: Literal["igraph", "leidenalg"]
     symmetric_graph: bool
     graph_upper_only: bool
     random_seed: int
     n_cells: int
-
-    @property
-    def graph_key(self) -> tuple[str, bool, bool]:
-        return (
-            self.graph_loc,
-            self.symmetric_graph,
-            self.graph_upper_only,
-        )
 
 
 class _ClusteringOperationsMixin(_ClusteringOperationsBase):
@@ -179,10 +169,9 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 )
                 shutdown_checkpoint()
                 plateau_forest = collapse_equal_height_plateaus(hierarchy)
-                hierarchy_group = start_artifact(self.zw, hierarchy_plan)
-                write_hierarchy_group(hierarchy_group, hierarchy, plateau_forest)
-                hierarchy_group.attrs["estimated_peak_bytes"] = estimated_peak_bytes
-                finish_artifact(hierarchy_group, hierarchy_plan)
+                with artifact_transaction(self.zw, hierarchy_plan) as hierarchy_group:
+                    write_hierarchy_group(hierarchy_group, hierarchy, plateau_forest)
+                    hierarchy_group.attrs["estimated_peak_bytes"] = estimated_peak_bytes
                 loaded = hierarchy, plateau_forest
             if loaded[0].n_leaves != n_cells:
                 raise ValueError("Paris hierarchy size does not match graph")
@@ -293,20 +282,19 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                     mode="fixed",
                     n_clusters=fixed_cluster_count,
                 )
-            cut_group = start_artifact(self.zw, cut_plan)
-            labels_array = create_zarr_dataset(
-                cut_group,
-                "labels",
-                (min(max(n_cells, 1), 100_000),),
-                "i4",
-                result.labels.shape,
-            )
-            labels_array[:] = result.labels
-            cut_group.attrs["n_clusters"] = int(result.n_clusters)
-            cut_group.attrs["diagnostics"] = [
-                asdict(diagnostic) for diagnostic in result.diagnostics
-            ]
-            finish_artifact(cut_group, cut_plan)
+            with artifact_transaction(self.zw, cut_plan) as cut_group:
+                labels_array = create_zarr_dataset(
+                    cut_group,
+                    "labels",
+                    (min(max(n_cells, 1), 100_000),),
+                    "i4",
+                    result.labels.shape,
+                )
+                labels_array[:] = result.labels
+                cut_group.attrs["n_clusters"] = int(result.n_clusters)
+                cut_group.attrs["diagnostics"] = [
+                    asdict(diagnostic) for diagnostic in result.diagnostics
+                ]
 
         if fixed_cluster_count is not None:
             dendrogram_plan = plan_paris_dendrogram(self.zw, hierarchy_plan.ref)
@@ -345,7 +333,9 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             raise ValueError("backend must be 'igraph' or 'leidenalg'")
         resolution = canonical_resolution(resolution)
         random_seed = canonical_random_seed(random_seed)
-        graph_loc, n_cells, _k = self._clustering_graph(graph)
+        symmetric_graph = graph_flag(symmetric_graph, "symmetric_graph")
+        graph_upper_only = graph_flag(graph_upper_only, "graph_upper_only")
+        _graph_loc, n_cells, _k = self._clustering_graph(graph)
         graph_input = graph
         artifact_scope = graph_input.scope
         selection = graph_cell_selection(self.zw, graph_input)
@@ -376,7 +366,6 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         return _PreparedLeidenClustering(
             planned=planned,
             graph=graph_input,
-            graph_loc=graph_loc,
             resolution=resolution,
             backend=backend,
             symmetric_graph=symmetric_graph,
@@ -384,69 +373,6 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             random_seed=random_seed,
             n_cells=n_cells,
         )
-
-    def _load_prepared_leiden_graph(
-        self,
-        prepared: _PreparedLeidenClustering,
-    ) -> Any:
-        graph = self._load_graph_artifact(
-            prepared.graph,
-            symmetric=prepared.symmetric_graph,
-            upper_only=prepared.graph_upper_only,
-            use_k=None,
-        )
-        return graph.tocsr()
-
-    @staticmethod
-    def _compute_prepared_leiden(
-        prepared: _PreparedLeidenClustering,
-        graph: Any,
-    ) -> np.ndarray:
-        from ...clustering.leiden import leiden_membership
-
-        if prepared.planned.reused:
-            raise ValueError("Cannot recompute a reusable Leiden artifact")
-        shutdown_checkpoint()
-        membership = leiden_membership(
-            graph,
-            prepared.resolution,
-            prepared.random_seed,
-            backend=prepared.backend,
-        )
-        shutdown_checkpoint()
-        return membership
-
-    def _finish_prepared_leiden(
-        self,
-        prepared: _PreparedLeidenClustering,
-        membership: np.ndarray | None,
-    ) -> tuple[np.ndarray, ArtifactRef]:
-        if prepared.planned.reused:
-            artifact_group = as_zarr_group(
-                self.zw[artifact_path(prepared.planned.ref)],
-                name=prepared.planned.ref.artifact_id,
-            )
-            membership = artifact_values(artifact_group, "values")
-        else:
-            if membership is None:
-                raise ValueError("Leiden membership is required for a new artifact")
-            membership = np.asarray(membership)
-            if membership.shape != (prepared.n_cells,):
-                raise ValueError(
-                    "Leiden membership must contain one label per graph cell"
-                )
-            if membership.dtype.kind not in {"i", "u"}:
-                raise TypeError("Leiden membership must contain integer labels")
-            write_cell_data_artifact(
-                self.zw,
-                prepared.planned,
-                {"values": membership},
-            )
-        action = "Reused" if prepared.planned.reused else "Stored"
-        logger.info(
-            f"{action} Leiden clustering with {np.unique(membership).size} clusters"
-        )
-        return membership, prepared.planned.ref
 
     def _run_leiden_artifact(
         self,
@@ -473,6 +399,8 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         Returns:
             Reference to the cluster-labels artifact.
         """
+        from ...clustering.leiden import leiden_membership
+
         prepared = self._prepare_leiden_clustering(
             graph,
             resolution=resolution,
@@ -482,12 +410,34 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             random_seed=random_seed,
             invalidate_cache=invalidate_cache,
         )
-        membership = None
-        if not prepared.planned.reused:
-            graph_matrix = self._load_prepared_leiden_graph(prepared)
-            membership = self._compute_prepared_leiden(prepared, graph_matrix)
-        _membership, ref = self._finish_prepared_leiden(prepared, membership)
-        return ref
+        if prepared.planned.reused:
+            logger.info("Reused Leiden clustering artifact")
+            return prepared.planned.ref
+        graph_matrix = self._load_graph_artifact(
+            prepared.graph,
+            symmetric=prepared.symmetric_graph,
+            upper_only=prepared.graph_upper_only,
+            use_k=None,
+        )
+        shutdown_checkpoint()
+        membership = np.asarray(
+            leiden_membership(
+                graph_matrix,
+                prepared.resolution,
+                prepared.random_seed,
+                backend=prepared.backend,
+            )
+        )
+        shutdown_checkpoint()
+        if membership.shape != (prepared.n_cells,):
+            raise ValueError("Leiden membership must contain one label per graph cell")
+        if membership.dtype.kind not in {"i", "u"}:
+            raise TypeError("Leiden membership must contain integer labels")
+        write_cell_data_artifact(self.zw, prepared.planned, {"values": membership})
+        logger.info(
+            f"Stored Leiden clustering with {np.unique(membership).size} clusters"
+        )
+        return prepared.planned.ref
 
     def run_leiden_clustering(
         self,
@@ -552,14 +502,9 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             if min_cluster_size is None:
                 effective_min_cluster_size = effective_k + 1
             else:
-                if isinstance(min_cluster_size, (bool, np.bool_)) or not isinstance(
-                    min_cluster_size,
-                    (int, np.integer),
-                ):
-                    raise TypeError("min_cluster_size must be an integer")
-                if min_cluster_size < 2:
-                    raise ValueError("min_cluster_size must be at least 2")
-                effective_min_cluster_size = int(min_cluster_size)
+                effective_min_cluster_size = integer_argument(
+                    min_cluster_size, "min_cluster_size", minimum=2
+                )
         else:
             effective_min_cluster_size = None
 
@@ -607,22 +552,21 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 context={"artifact_id": ref.artifact_id},
             ) from error
         raw_hierarchy = (status.inputs or {}).get("cluster_hierarchy")
-        hierarchy_id = (
-            ArtifactRef.from_dict(raw_hierarchy).artifact_id
-            if isinstance(raw_hierarchy, dict)
-            else None
-        )
+        if not isinstance(raw_hierarchy, dict):
+            raise ArtifactResolutionError(
+                f"Paris cut artifact {ref.artifact_id} does not name its hierarchy",
+                code="corrupt_payload",
+                context={"artifact_id": ref.artifact_id},
+            )
         return ParisClusteringResult(
             labels=labels,
             mode=cast(Literal["auto", "fixed"], mode),
             n_clusters=int(cast(int | float | str, group.attrs["n_clusters"])),
             diagnostics=diagnostics,
             min_cluster_size=(
-                int(parameters["min_cluster_size"])
-                if mode == "auto" and parameters.get("min_cluster_size") is not None
-                else None
+                int(parameters["min_cluster_size"]) if mode == "auto" else None
             ),
-            hierarchy_artifact_id=hierarchy_id,
+            hierarchy_artifact_id=ArtifactRef.from_dict(raw_hierarchy).artifact_id,
             ref=ref,
         )
 

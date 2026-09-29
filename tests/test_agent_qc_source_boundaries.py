@@ -141,6 +141,7 @@ def test_capture_exclusion_preserves_margins_but_cannot_claim_complete_repeated_
 ):
     deps, characterized = _capture_context()
     deps.store.cells._values["condition"][16:] = "case"
+    deps.qcDesignData = q._QcDesignData(deps.cells)
     rows, conditions, independent = q._capture_design_safety(
         deps, characterized, deps.cells.fetch("capture"), "d1"
     )
@@ -148,6 +149,7 @@ def test_capture_exclusion_preserves_margins_but_cannot_claim_complete_repeated_
     assert rows[0]["completePairsAfterExclusion"] == 1
     assert rows[0]["incompletePairsAfterExclusion"] == 1
     characterized.coefficients[0]["scope"] = "withinCell"
+    deps.qcDesignData = q._QcDesignData(deps.cells)
     rows, conditions, independent = q._capture_design_safety(
         deps, characterized, deps.cells.fetch("capture"), "d1"
     )
@@ -172,6 +174,27 @@ def test_core_default_failure_is_reported_without_claiming_that_policy_executed(
     )
     assert any(
         "core projection unavailable" in note
+        for profile in profiles
+        for note in profile.notes
+    )
+
+
+def test_unavailable_sample_mad_profile_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deps, characterized = _capture_context()
+    original = q.project_auto_filter_profile
+
+    def reject(action: str, **kwargs: Any) -> Any:
+        if action == "sampleMad":
+            raise ValueError("sample grouping is unusable")
+        return original(action, **kwargs)
+
+    monkeypatch.setattr(q, "project_auto_filter_profile", reject)
+    profiles = q._offered_qc_profiles(deps, characterized)
+    assert profiles and not any(profile.action == "sampleMad" for profile in profiles)
+    assert any(
+        note == "Sample MAD QC by 'capture' is unavailable: sample grouping is unusable"
         for profile in profiles
         for note in profile.notes
     )

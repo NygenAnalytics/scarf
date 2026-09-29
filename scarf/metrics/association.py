@@ -14,7 +14,6 @@ __all__ = [
     "directional_mapping",
     "eta_squared",
     "report_confounding",
-    "report_technical_nesting",
     "spearman_rho",
 ]
 
@@ -266,28 +265,6 @@ def association_pair(
     if leftKind == "categorical" and rightKind == "continuous":
         return eta_squared(right, left)
     return spearman_rho(left, right)
-
-
-def report_technical_nesting(
-    columns: Mapping[str, Any],
-) -> list[dict[str, Any]]:
-    """Directional nesting among categorical technical columns."""
-    names = list(columns)
-    reports: list[dict[str, Any]] = []
-    for index, left_name in enumerate(names):
-        for right_name in names[index + 1 :]:
-            mapping = directional_mapping(columns[left_name], columns[right_name])
-            if mapping["nesting"] == "none":
-                continue
-            reports.append(
-                {
-                    "left": left_name,
-                    "right": right_name,
-                    "nesting": mapping["nesting"],
-                    "directionalMapping": mapping,
-                }
-            )
-    return reports
 
 
 def _one_hot(values: np.ndarray) -> np.ndarray:

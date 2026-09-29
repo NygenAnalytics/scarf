@@ -6,7 +6,6 @@ from scarf.assay import (
     is_rna_assay_type,
     preset_assay_types,
     resolve_persisted_assay_type,
-    rna_assay_type_names,
 )
 
 
@@ -16,9 +15,6 @@ def test_rna_classifier_matches_preset_map():
         expected = issubclass(assay_cls, RNAassay)
         assert is_rna_assay_type(name) is expected
         assert is_rna_assay_type(assay_cls) is expected
-    assert rna_assay_type_names() == frozenset(
-        name for name, cls in presets.items() if issubclass(cls, RNAassay)
-    )
 
 
 def test_rna_classifier_aliases():

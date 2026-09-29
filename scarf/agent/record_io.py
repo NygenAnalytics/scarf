@@ -1,6 +1,8 @@
 """Policy-free byte and key operations for agent JSON records."""
 
+import hashlib
 import json
+from collections.abc import Callable
 from typing import Any
 
 import zarr
@@ -12,14 +14,22 @@ def join_key(*parts: str) -> str:
     return "/".join(part.strip("/") for part in parts if part.strip("/"))
 
 
-def canonical_json_bytes(value: Any) -> bytes:
+def canonical_json_bytes(
+    value: Any, *, default: Callable[[Any], Any] | None = None
+) -> bytes:
     return json.dumps(
         value,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
         allow_nan=False,
+        default=default,
     ).encode("utf-8")
+
+
+def sha256_json(value: Any, *, default: Callable[[Any], Any] | None = None) -> str:
+    """Return the SHA-256 digest of one canonical JSON value."""
+    return hashlib.sha256(canonical_json_bytes(value, default=default)).hexdigest()
 
 
 def display_json_bytes(value: Any) -> bytes:

@@ -16,7 +16,6 @@ from scarf.plotting.recipes import (
     PlotPanelTarget,
     PlotRecipe,
     PlotStep,
-    run_plot_recipe,
     run_recipe,
 )
 
@@ -83,7 +82,7 @@ def test_runner_preserves_order_suppresses_plot_show_and_manages_outputs(
         ]
     )
 
-    result = run_plot_recipe(store, recipe, output_dir=tmp_path, show=True)
+    result = run_recipe(store, recipe, output_dir=tmp_path, show=True)
 
     assert [name for name, _, _ in calls] == ["embedding", "dotplot"]
     assert all(store_arg is store for _, store_arg, _ in calls)
@@ -95,12 +94,11 @@ def test_runner_preserves_order_suppresses_plot_show_and_manages_outputs(
     )
     assert result.written_paths == expected_paths
     assert [output.name for output in result.outputs] == ["overview", "markers"]
-    assert result.results == (
+    assert [output.result for output in result.outputs] == [
         plot_results["embedding"],
         plot_results["dotplot"],
-    )
-    assert result.outputs[0].step_name == "overview"
-    assert result.outputs[0].written_path == expected_paths[0]
+    ]
+    assert result.outputs[0].path == expected_paths[0]
     assert all(path.exists() for path in result.written_paths)
     for name, expected_path in zip(("embedding", "dotplot"), expected_paths):
         plot_result = plot_results[name]
@@ -123,9 +121,9 @@ def test_no_output_mode_leaves_returned_owned_figure_usable(
         [PlotStep(name="overview", plot="embedding", kwargs={"layout_key": "umap"})]
     )
 
-    result = run_plot_recipe(object(), recipe)
+    result = run_recipe(object(), recipe)
 
-    assert result.results == (plot_result,)
+    assert [output.result for output in result.outputs] == [plot_result]
     assert result.written_paths == ()
     assert plot_result.saved == []
     assert plot_result.show_calls == 0
@@ -153,7 +151,7 @@ def test_runner_does_not_close_caller_owned_results(
         ]
     )
 
-    run_plot_recipe(object(), recipe, output_dir=tmp_path, show=True)
+    run_recipe(object(), recipe, output_dir=tmp_path, show=True)
 
     assert plot_result.saved == [tmp_path / "overview.png"]
     assert plot_result.show_calls == 1
@@ -187,15 +185,15 @@ def test_continue_on_error_captures_compact_failures_and_warnings(
     )
 
     with pytest.raises(RuntimeError, match="plot"):
-        run_plot_recipe(object(), recipe)
+        run_recipe(object(), recipe)
     assert calls == ["bad"]
 
     calls.clear()
-    result = run_plot_recipe(object(), recipe, continue_on_error=True)
+    result = run_recipe(object(), recipe, continue_on_error=True)
 
     assert calls == ["bad", "good"]
     assert result.failures == {"bad": "RuntimeError: plot failed"}
-    assert result.results == (successful,)
+    assert [output.result for output in result.outputs] == [successful]
     assert result.warnings == (
         "bad: first warning",
         "good: second warning",
@@ -285,10 +283,10 @@ def test_runner_resolves_json_config_path(
         encoding="utf-8",
     )
 
-    result = run_plot_recipe(object(), path)
+    result = run_recipe(object(), path)
 
     assert seen == [{"layout_key": "umap", "show": False}]
-    assert result.results == (plot_result,)
+    assert [output.result for output in result.outputs] == [plot_result]
 
 
 @pytest.mark.parametrize(
@@ -327,7 +325,7 @@ def test_output_filename_requires_supported_format_and_output_directory() -> Non
         ]
     )
     with pytest.raises(ValueError, match="output_dir"):
-        run_plot_recipe(object(), recipe)
+        run_recipe(object(), recipe)
 
 
 @pytest.mark.parametrize(
@@ -470,13 +468,13 @@ def test_runner_injects_pipeline_artifacts_without_mutating_recipe_kwargs(
         ]
     )
 
-    result = run_plot_recipe(
+    result = run_recipe(
         object(),
         recipe,
         artifacts={"clusterColumn": "RNA_leiden_cluster"},
     )
 
-    assert result.results == (plot_result,)
+    assert [output.result for output in result.outputs] == [plot_result]
     assert seen == [
         {
             "layout_key": "umap",
@@ -486,7 +484,7 @@ def test_runner_injects_pipeline_artifacts_without_mutating_recipe_kwargs(
     ]
     assert dict(recipe.steps[0].kwargs) == {"layout_key": "umap"}
     with pytest.raises(KeyError, match="clusterColumn"):
-        run_plot_recipe(object(), recipe, artifacts={})
+        run_recipe(object(), recipe, artifacts={})
 
 
 def test_recipe_resolves_optional_panel_target_and_output_settings(
@@ -527,7 +525,7 @@ def test_recipe_resolves_optional_panel_target_and_output_settings(
         transparent=True,
         exact_size=False,
     )
-    run_plot_recipe(
+    run_recipe(
         object(),
         recipe,
         targets={"A": "axes-a"},
@@ -549,7 +547,7 @@ def test_recipe_resolves_optional_panel_target_and_output_settings(
         }
     ]
     with pytest.raises(KeyError, match="requires panel"):
-        run_plot_recipe(object(), recipe, targets={}, output_dir=tmp_path)
+        run_recipe(object(), recipe, targets={}, output_dir=tmp_path)
 
 
 def test_json_loader_rejects_duplicate_keys_and_non_object_roots() -> None:
@@ -817,6 +815,72 @@ def test_serialized_contracts_cover_color_and_grouped_feature_shapes() -> None:
     }
 
 
+def test_serialized_contracts_cover_grouping_keys_and_nested_scales() -> None:
+    recipe = PlotRecipe.from_dict(
+        {
+            "steps": [
+                {
+                    "name": "violins",
+                    "plot": "distribution",
+                    "kwargs": {
+                        "keys": [{"key": "nCounts", "label": "Counts"}, "CD3D"],
+                        "grouping": {"key": "cluster", "kind": "categorical"},
+                        "splitBy": "condition",
+                        "splitScale": {"order": ["ctrl", "stim"]},
+                    },
+                },
+                {
+                    "name": "matrix",
+                    "plot": "matrixplot",
+                    "kwargs": {
+                        "features": ["CD3D"],
+                        "groupBy": "cluster",
+                        "annotationScales": {"panel": {"order": ["B", "A"]}},
+                    },
+                },
+                {
+                    "name": "dynamics",
+                    "plot": "pseudotime_heatmap",
+                    "kwargs": {
+                        "featureClusterScale": {"order": [2, 1]},
+                        "pseudotimeScale": {"cmap": "plasma"},
+                    },
+                },
+            ]
+        }
+    )
+
+    violins, matrix, dynamics = (step.kwargs for step in recipe.steps)
+    assert violins["keys"] == [
+        plotting.CellField(key="nCounts", label="Counts"),
+        "CD3D",
+    ]
+    assert violins["grouping"] == plotting.CellField(key="cluster", kind="categorical")
+    assert violins["split_scale"] == plotting.CategoricalScale(order=("ctrl", "stim"))
+    assert matrix["annotation_scales"] == {
+        "panel": plotting.CategoricalScale(order=("B", "A"))
+    }
+    assert dynamics["feature_cluster_scale"] == plotting.CategoricalScale(order=(2, 1))
+    assert dynamics["pseudotime_scale"] == plotting.ColorScale(cmap="plasma")
+
+
+@pytest.mark.parametrize(
+    "filenames",
+    [
+        ("fig.png", "./fig.png"),
+        ("panels/fig.png", "panels//fig.png"),
+        ("Fig.png", "fig.png"),
+    ],
+)
+def test_recipe_rejects_output_names_for_one_file(filenames) -> None:
+    steps = [
+        PlotStep(name=f"step{index}", plot="embedding", output_filename=filename)
+        for index, filename in enumerate(filenames)
+    ]
+    with pytest.raises(ValueError, match="output filenames must be unique"):
+        PlotRecipe(steps)
+
+
 @pytest.mark.parametrize(
     ("color_scale", "error_type", "message"),
     [
@@ -897,8 +961,8 @@ layoutKey = "umap"
 
     assert json_recipe.steps[0].name == "json"
     assert toml_recipe == bytes_recipe
-    assert json_result.results[0].name == "embedding"
-    assert toml_result.results[0].name == "embedding"
+    assert json_result.outputs[0].result.name == "embedding"
+    assert toml_result.outputs[0].result.name == "embedding"
     assert seen == [
         {"layout_key": "umap", "show": False},
         {"layout_key": "umap", "show": False},
@@ -909,9 +973,9 @@ def test_recipe_loader_rejects_invalid_source_types_and_formats(
     tmp_path: Path,
 ) -> None:
     with pytest.raises(TypeError, match="PlotRecipe or a JSON/TOML path"):
-        run_plot_recipe(object(), object())
+        run_recipe(object(), object())
     with pytest.raises(ValueError, match=r"\.json or \.toml"):
-        run_plot_recipe(object(), tmp_path / "recipe.yaml")
+        run_recipe(object(), tmp_path / "recipe.yaml")
     with pytest.raises(ValueError, match="Invalid JSON constant"):
         PlotRecipe.from_json(
             b'{"steps": [{"name": "bad", "plot": "embedding", '
@@ -938,7 +1002,7 @@ def test_output_path_rejects_symlink_escape_before_plotting(
     )
 
     with pytest.raises(ValueError, match="escapes output_dir"):
-        run_plot_recipe(object(), recipe, output_dir=output_root)
+        run_recipe(object(), recipe, output_dir=output_root)
 
 
 def test_runner_rejects_target_defined_in_kwargs_and_panel_reference(
@@ -961,7 +1025,7 @@ def test_runner_rejects_target_defined_in_kwargs_and_panel_reference(
     )
 
     with pytest.raises(ValueError, match="defines target in two places"):
-        run_plot_recipe(object(), recipe, targets={"A": "external"})
+        run_recipe(object(), recipe, targets={"A": "external"})
 
 
 def test_runner_requires_artifact_mapping_before_plotting(
@@ -983,7 +1047,7 @@ def test_runner_requires_artifact_mapping_before_plotting(
     )
 
     with pytest.raises(ValueError, match="requires an artifact mapping"):
-        run_plot_recipe(object(), recipe)
+        run_recipe(object(), recipe)
 
 
 @pytest.mark.parametrize(
@@ -1025,7 +1089,7 @@ def test_runner_closes_owned_result_after_save_or_show_failure(
     )
 
     with pytest.raises(error_type):
-        run_plot_recipe(
+        run_recipe(
             object(),
             recipe,
             output_dir=tmp_path if output_filename is not None else None,
@@ -1063,7 +1127,7 @@ def test_runner_preserves_primary_error_when_owned_result_close_fails(
     )
 
     with pytest.raises(OSError, match="disk full") as error:
-        run_plot_recipe(object(), recipe, output_dir=tmp_path)
+        run_recipe(object(), recipe, output_dir=tmp_path)
 
     assert result.close_calls == 1
     assert error.value.__notes__ == [
@@ -1093,7 +1157,7 @@ def test_runner_does_not_close_caller_owned_result_after_save_failure(
     )
 
     with pytest.raises(OSError, match="disk full"):
-        run_plot_recipe(object(), recipe, output_dir=tmp_path)
+        run_recipe(object(), recipe, output_dir=tmp_path)
 
     assert result.close_calls == 0
     assert result.usable
@@ -1116,7 +1180,7 @@ def test_runner_validates_execution_context(
     recipe = PlotRecipe([PlotStep(name="overview", plot="embedding")])
 
     with pytest.raises(TypeError, match=message):
-        run_plot_recipe(object(), recipe, **{argument: value})
+        run_recipe(object(), recipe, **{argument: value})
 
 
 def test_runner_reports_missing_or_noncallable_plot_exports(
@@ -1127,7 +1191,7 @@ def test_runner_reports_missing_or_noncallable_plot_exports(
     monkeypatch.setattr(recipes_module, "import_module", lambda name: missing_module)
 
     with pytest.raises(RuntimeError, match="not available"):
-        run_plot_recipe(object(), recipe)
+        run_recipe(object(), recipe)
 
     class NonCallablePlotting:
         embedding = object()
@@ -1138,4 +1202,4 @@ def test_runner_reports_missing_or_noncallable_plot_exports(
         lambda name: NonCallablePlotting,
     )
     with pytest.raises(RuntimeError, match="not callable"):
-        run_plot_recipe(object(), recipe)
+        run_recipe(object(), recipe)

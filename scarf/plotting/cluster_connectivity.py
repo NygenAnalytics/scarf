@@ -8,22 +8,32 @@ import pandas as pd
 from scipy import sparse
 
 from ..graph.feature_projection import graph_cell_selection
-from ..storage.artifacts import ArtifactRef, inspect_artifact
+from ..storage.artifacts import ArtifactRef
 from ..storage.selections import validate_stored_selection_live_alias
 from ._contracts import CategoricalScale, PlotProvenance, SizeScale
 from ._deps import require_matplotlib
-from ._data import _fetch_cell_column, _resolve_grouping, _resolve_layout
+from ._data import (
+    _artifact_cell_selection,
+    _fetch_cell_column,
+    _resolve_grouping,
+    _resolve_layout,
+)
 from ._display import resolve_categorical_scale
-from ._figure import LegendSpec, PlotResult, normalize_axes_target
-from ..utils.arrays import sort_categories
+from ._figure import (
+    LegendSpec,
+    PlotResult,
+    close_figures_on_error,
+    normalize_axes_target,
+)
 from ._style import (
     apply_figure_chrome,
-    categorical_color_map,
+    category_label,
     finish_embedding_axes,
+    padded_square_limits,
     refresh_layout_point_sizes,
     register_layout_point_size,
+    resolve_category_scale,
     scatter_edgecolor,
-    square_axis_limits,
     theme_context,
 )
 
@@ -72,72 +82,6 @@ def _fetch_inputs(
     if pd.Series(groups, copy=False).isna().any():
         raise ValueError(f"group_by {group_by!r} contains missing values")
     return x, y, groups
-
-
-def _resolve_categories(
-    groups: np.ndarray,
-    categorical_scale: CategoricalScale | None,
-) -> tuple[list[Any], dict[Any, str], dict[Any, str], CategoricalScale]:
-    try:
-        observed = list(pd.unique(groups))
-        observed_set = set(observed)
-    except TypeError as exc:
-        raise TypeError("group_by values must be hashable categories") from exc
-
-    if categorical_scale is not None and categorical_scale.order is not None:
-        requested_order = list(categorical_scale.order)
-        if len(set(requested_order)) != len(requested_order):
-            raise ValueError("categorical_scale.order cannot contain duplicates")
-        missing = [category for category in observed if category not in requested_order]
-        if missing:
-            raise ValueError(
-                "categorical_scale.order is missing observed values: "
-                + ", ".join(map(str, missing[:10]))
-            )
-        order = [category for category in requested_order if category in observed_set]
-    else:
-        order = sort_categories(observed)
-
-    palette = categorical_color_map(
-        order,
-        palette=(categorical_scale.palette if categorical_scale is not None else None),
-        palette_name=(
-            categorical_scale.palette_name
-            if categorical_scale is not None
-            else "default"
-        ),
-    )
-    explicit_labels = (
-        categorical_scale.labels if categorical_scale is not None else None
-    )
-    display_labels = {
-        category: str(
-            explicit_labels.get(category, category)
-            if explicit_labels is not None
-            else category
-        )
-        for category in order
-    }
-    resolved_labels = dict(display_labels) if explicit_labels is not None else None
-    resolved_scale = CategoricalScale(
-        order=tuple(order),
-        palette=dict(palette),
-        labels=resolved_labels,
-        missing_color=(
-            categorical_scale.missing_color
-            if categorical_scale is not None
-            else "#bdbdbd"
-        ),
-        missing_label=(
-            categorical_scale.missing_label if categorical_scale is not None else "NA"
-        ),
-        palette_name=(
-            categorical_scale.palette_name
-            if categorical_scale is not None
-            else "default"
-        ),
-    )
-    return order, palette, display_labels, resolved_scale
 
 
 def _category_codes(groups: np.ndarray, order: list[Any]) -> np.ndarray:
@@ -337,26 +281,7 @@ def _edge_widths(
     return minimum + scaled * (maximum - minimum)
 
 
-def _axis_limits(
-    x: np.ndarray,
-    y: np.ndarray,
-    node_x: np.ndarray,
-    node_y: np.ndarray,
-    *,
-    include_cells: bool,
-) -> tuple[tuple[float, float], tuple[float, float]]:
-    limit_x = np.concatenate((x, node_x)) if include_cells else node_x
-    limit_y = np.concatenate((y, node_y)) if include_cells else node_y
-    x_span = float(limit_x.max() - limit_x.min())
-    y_span = float(limit_y.max() - limit_y.min())
-    x_pad = 0.05 * (x_span if x_span > 0 else 1.0)
-    y_pad = 0.05 * (y_span if y_span > 0 else 1.0)
-    return square_axis_limits(
-        (float(limit_x.min() - x_pad), float(limit_x.max() + x_pad)),
-        (float(limit_y.min() - y_pad), float(limit_y.max() + y_pad)),
-    )
-
-
+@close_figures_on_error
 def cluster_connectivity(
     store: Any,
     *,
@@ -454,16 +379,7 @@ def cluster_connectivity(
         )
         if group_missing is not None and group_missing.any():
             raise ValueError("groups contains missing labels")
-        group_status = inspect_artifact(store.zw, groups)
-        raw_group_selection = (group_status.inputs or {}).get("cell_selection")
-        if not isinstance(raw_group_selection, Mapping):
-            raise ValueError("Grouping artifact has no cell-selection input")
-        try:
-            group_selection = ArtifactRef.from_dict(raw_group_selection)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(
-                "Grouping artifact has an invalid cell-selection input"
-            ) from exc
+        group_selection = _artifact_cell_selection(store, groups)
         if layout_selection != selection or group_selection != selection:
             raise ValueError(
                 "graph, groups, and layout must share the same cell selection"
@@ -498,9 +414,19 @@ def cluster_connectivity(
             categorical_scale,
         )
         group_label = group_by
-    order, palette, display_labels, resolved_categorical_scale = _resolve_categories(
-        group_values_array, categorical_scale
-    )
+    try:
+        resolved_categorical_scale = resolve_category_scale(
+            group_values_array,
+            categorical_scale,
+        )
+    except TypeError as exc:
+        raise TypeError("group_by values must be hashable categories") from exc
+    order = list(resolved_categorical_scale.order or ())
+    palette = resolved_categorical_scale.palette or {}
+    display_labels = {
+        category: category_label(resolved_categorical_scale, category)
+        for category in order
+    }
     codes = _category_codes(group_values_array, order)
     node_x, node_y = _resolve_node_positions(
         x,
@@ -649,12 +575,10 @@ def cluster_connectivity(
                     zorder=3,
                 )
 
-        xlim, ylim = _axis_limits(
-            x,
-            y,
-            node_x,
-            node_y,
-            include_cells=positions is None or show_cells,
+        include_cells = positions is None or show_cells
+        xlim, ylim = padded_square_limits(
+            np.concatenate((x, node_x)) if include_cells else node_x,
+            np.concatenate((y, node_y)) if include_cells else node_y,
         )
         finish_embedding_axes(
             ax,

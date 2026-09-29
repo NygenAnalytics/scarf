@@ -92,10 +92,10 @@ See {ref}`WNN integration <wnn_integration>` for deviations and trade-offs.
 
 ## How do I compute LISI in Scarf?
 
-Use `metric_lisi` for raw per-cell LISI values.
 Use `metric_ilisi` for a single scIB-scaled batch-mixing score and `metric_clisi` for a scIB-scaled biological-label conservation score.
 Each requires the exact neighbour artifact and reads matching metadata rows through its stored cell
 selection.
+Use `scarf.metrics.compute_lisi` for raw per-cell LISI values from KNN arrays.
 See {ref}`LISI metrics <lisi_metrics>`.
 
 ## Should I use tSNE or UMAP?

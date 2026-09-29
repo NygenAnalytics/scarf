@@ -1,13 +1,14 @@
 import os
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 import h5py
 import numpy as np
 from numpy.typing import DTypeLike, NDArray
-from scipy.sparse import coo_matrix, csr_matrix
+from scipy.sparse import csr_matrix
 
-from .errors import MatrixSourceError, ResourceLimitError
+from .._h5ad_columns import index_key, sparse_encoding
+from .errors import MatrixSourceError
 from .paths import (
     read_hdf5_names,
     read_hdf5_shape,
@@ -18,29 +19,15 @@ from .paths import (
 from .sources import (
     DEFAULT_LIMITS,
     BaseMatrixSource,
+    CompressedMatrixSource,
     MatrixBlock,
     MatrixSource,
     MemoryEstimate,
     SourceLimits,
     _validate_shape,
+    validate_compressed_pointers,
+    validate_minor_indexes,
 )
-
-
-def _text_attribute(value: Any, object_path: str) -> str:
-    array = np.asarray(value)
-    if array.size != 1:
-        raise MatrixSourceError(f"HDF5 attribute {object_path} must be scalar")
-    scalar = array.reshape(-1)[0]
-    if isinstance(scalar, bytes | np.bytes_):
-        try:
-            return bytes(scalar).decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise MatrixSourceError(
-                f"HDF5 attribute {object_path} is not valid UTF-8"
-            ) from error
-    if isinstance(scalar, str | np.str_):
-        return str(scalar)
-    raise MatrixSourceError(f"HDF5 attribute {object_path} must be text")
 
 
 def _shape_from_group(group: h5py.Group) -> tuple[int, int] | None:
@@ -52,54 +39,28 @@ def _shape_from_group(group: h5py.Group) -> tuple[int, int] | None:
     return None
 
 
-def _physical_sparse_layout(group: h5py.Group) -> str | None:
-    for key in ("encoding-type", "h5sparse_format", "sparse_layout", "layout"):
-        if key not in group.attrs:
-            continue
-        value = _text_attribute(group.attrs[key], f"{group.name}@{key}").lower()
-        if value in {"csr", "csr_matrix", "csr-matrix"}:
-            return "csr"
-        if value in {"csc", "csc_matrix", "csc-matrix"}:
-            return "csc"
-    return None
-
-
-def _h5ad_index_path(
-    handle: h5py.File,
-    group_path: str,
-) -> str | None:
-    normalized = "/" + group_path.strip("/")
-    if normalized not in handle:
-        return None
-    node = handle[normalized]
-    if not isinstance(node, h5py.Group):
-        return None
-    key = "_index"
-    if "_index" in node.attrs:
-        key = _text_attribute(node.attrs["_index"], f"{normalized}@_index")
-    if key not in node:
-        return None
-    return f"{normalized}/{key}"
+def _h5ad_index_path(handle: h5py.File, group_path: str) -> str | None:
+    """Return the dataframe index that AnnData names in ``_index``, if any."""
+    key = index_key(handle.get(group_path))
+    return None if key is None else f"{group_path}/{key}"
 
 
 class HDF5DenseMatrixSource(BaseMatrixSource):
+    """Dense HDF5 dataset written from R; its dimensions are reversed."""
+
     def __init__(
         self,
         path: str | os.PathLike[str] | Any,
         dataset: str,
         *,
-        r_transposed: bool = True,
         row_names: Sequence[str | bytes] | NDArray[Any] | None = None,
         column_names: Sequence[str | bytes] | NDArray[Any] | None = None,
-        row_names_path: str | None = None,
-        column_names_path: str | None = None,
         dtype: DTypeLike | None = None,
         as_sparse: bool = False,
         limits: SourceLimits = DEFAULT_LIMITS,
     ) -> None:
         self.path = validate_hdf5_file(path, limits=limits)
         self.dataset = "/" + dataset.strip("/")
-        self.rTransposed = bool(r_transposed)
         with h5py.File(self.path, mode="r") as handle:
             if self.dataset not in handle:
                 raise MatrixSourceError(f"HDF5 dataset {self.dataset!r} is missing")
@@ -115,51 +76,24 @@ class HDF5DenseMatrixSource(BaseMatrixSource):
                     f"HDF5 dense dataset {self.dataset!r} has nonnumeric dtype "
                     f"{node.dtype}"
                 )
-            physical_shape = (int(node.shape[0]), int(node.shape[1]))
-            logical_shape = (
-                (physical_shape[1], physical_shape[0])
-                if self.rTransposed
-                else physical_shape
+            logical_shape = _validate_shape(
+                (int(node.shape[1]), int(node.shape[0])), limits
             )
-            logical_shape = _validate_shape(logical_shape, limits)
             source_dtype = node.dtype if dtype is None else np.dtype(dtype)
-            resolved_rows = (
-                row_names
-                if row_names is not None
-                else read_hdf5_names(
-                    handle,
-                    row_names_path,
-                    logical_shape[0],
-                    limits=limits,
-                )
-            )
-            resolved_columns = (
-                column_names
-                if column_names is not None
-                else read_hdf5_names(
-                    handle,
-                    column_names_path,
-                    logical_shape[1],
-                    limits=limits,
-                )
-            )
         super().__init__(
             logical_shape,
             source_dtype,
-            row_names=resolved_rows,
-            column_names=resolved_columns,
+            row_names=row_names,
+            column_names=column_names,
             is_sparse=as_sparse,
             limits=limits,
         )
 
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
         start, stop = self._window(start, stop)
-        output = (stop - start) * self.n_features * self.dtype.itemsize
-        if self.is_sparse:
-            output += (stop - start + 1 + (stop - start) * self.n_features) * np.dtype(
-                np.int64
-            ).itemsize
-        return MemoryEstimate(self.resident_bytes, output, output)
+        dense = (stop - start) * self.n_features * self.dtype.itemsize
+        output = self._output_bytes(stop - start, (stop - start) * self.n_features)
+        return MemoryEstimate(self.resident_bytes, dense + output, output)
 
     def read_cells(self, start: int, stop: int) -> MatrixBlock:
         start, stop = self._window(start, stop)
@@ -168,17 +102,12 @@ class HDF5DenseMatrixSource(BaseMatrixSource):
         with h5py.File(self.path, mode="r") as handle:
             node = handle[self.dataset]
             assert isinstance(node, h5py.Dataset)
-            if self.rTransposed:
-                values = np.asarray(node[start:stop, :], dtype=self.dtype)
-            else:
-                values = np.asarray(node[:, start:stop], dtype=self.dtype).T
-        values = np.ascontiguousarray(values)
+            values = np.ascontiguousarray(
+                np.asarray(node[start:stop, :], dtype=self.dtype)
+            )
         if self.is_sparse:
             return csr_matrix(values)
         return values
-
-
-HDF5ArrayMatrixSource = HDF5DenseMatrixSource
 
 
 class ReshapedHDF5ArrayMatrixSource(BaseMatrixSource):
@@ -225,13 +154,9 @@ class ReshapedHDF5ArrayMatrixSource(BaseMatrixSource):
 
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
         start, stop = self._window(start, stop)
-        output = (stop - start) * self.n_features * self.dtype.itemsize
-        sparse_extra = 0
-        if self.is_sparse:
-            sparse_extra = (
-                stop - start + 1 + (stop - start) * self.n_features
-            ) * np.dtype(np.int64).itemsize
-        return MemoryEstimate(self.resident_bytes, output + sparse_extra, output)
+        dense = (stop - start) * self.n_features * self.dtype.itemsize
+        output = self._output_bytes(stop - start, (stop - start) * self.n_features)
+        return MemoryEstimate(self.resident_bytes, dense + output, output)
 
     def read_cells(self, start: int, stop: int) -> MatrixBlock:
         start, stop = self._window(start, stop)
@@ -272,7 +197,7 @@ class ReshapedHDF5ArrayMatrixSource(BaseMatrixSource):
         return csr_matrix(values) if self.is_sparse else values
 
 
-class HDF5CompressedMatrixSource(BaseMatrixSource):
+class HDF5CompressedMatrixSource(CompressedMatrixSource):
     def __init__(
         self,
         path: str | os.PathLike[str] | Any,
@@ -281,9 +206,6 @@ class HDF5CompressedMatrixSource(BaseMatrixSource):
         physical_shape: Sequence[int],
         physical_layout: str,
         physical_order: str,
-        data_name: str = "data",
-        indices_name: str = "indices",
-        indptr_name: str = "indptr",
         row_names: Sequence[str | bytes] | NDArray[Any] | None = None,
         column_names: Sequence[str | bytes] | NDArray[Any] | None = None,
         dtype: DTypeLike | None = None,
@@ -300,204 +222,79 @@ class HDF5CompressedMatrixSource(BaseMatrixSource):
             )
         if len(physical_shape) != 2:
             raise MatrixSourceError("physical sparse shape must have length two")
-        self.physicalShape = (int(physical_shape[0]), int(physical_shape[1]))
-        if min(self.physicalShape) < 0:
+        physical = (int(physical_shape[0]), int(physical_shape[1]))
+        if min(physical) < 0:
             raise MatrixSourceError("physical sparse shape cannot be negative")
-        self.physicalLayout = layout
-        self.physicalOrder = physical_order
-        self.dataName = data_name
-        self.indicesName = indices_name
-        self.indptrName = indptr_name
-        logical_shape = (
-            (self.physicalShape[1], self.physicalShape[0])
-            if physical_order == "cell_by_feature"
-            else self.physicalShape
+        cell_by_feature = physical_order == "cell_by_feature"
+        logical_shape = _validate_shape(
+            physical[::-1] if cell_by_feature else physical, limits
         )
-        logical_shape = _validate_shape(logical_shape, limits)
+        compressed_axis = physical[0] if layout == "csr" else physical[1]
+        minor_axis = physical[1] if layout == "csr" else physical[0]
         with h5py.File(self.path, mode="r") as handle:
             sparse_group = require_hdf5_group(handle, self.group)
-            arrays = require_hdf5_datasets(
-                sparse_group, (data_name, indices_name, indptr_name)
-            )
-            data = arrays[data_name]
-            indices = arrays[indices_name]
-            indptr = arrays[indptr_name]
+            arrays = require_hdf5_datasets(sparse_group, ("data", "indices", "indptr"))
+            data = arrays["data"]
+            indices = arrays["indices"]
+            indptr = arrays["indptr"]
             if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1:
                 raise MatrixSourceError(
                     f"HDF5 sparse arrays under {self.group!r} must be one-dimensional"
                 )
             if data.dtype.kind not in "biufc" or data.dtype.hasobject:
                 raise TypeError("HDF5 sparse data must have a numeric dtype")
-            if not np.issubdtype(indices.dtype, np.integer):
-                raise TypeError("HDF5 sparse indices must contain integers")
-            if not np.issubdtype(indptr.dtype, np.integer):
-                raise TypeError("HDF5 sparse indptr must contain integers")
-            compressed_axis = (
-                self.physicalShape[0] if layout == "csr" else self.physicalShape[1]
-            )
             if indptr.shape != (compressed_axis + 1,):
                 raise MatrixSourceError(
                     f"HDF5 sparse indptr has shape {indptr.shape}; "
                     f"expected ({compressed_axis + 1},)"
                 )
-            self._nnz = self._validate_structure(data, indices, indptr, limits)
+            nnz = validate_compressed_pointers(
+                lambda start, stop: np.asarray(indptr[start:stop]),
+                compressed_axis + 1,
+                limits,
+                label="HDF5 sparse indptr",
+            )
+            if int(data.size) != nnz or int(indices.size) != nnz:
+                raise MatrixSourceError(
+                    "HDF5 sparse data, indices, and indptr lengths are inconsistent"
+                )
+            validate_minor_indexes(
+                lambda start, stop: np.asarray(indices[start:stop]),
+                nnz,
+                minor_axis,
+                limits,
+                label="HDF5 sparse indices",
+            )
             source_dtype = data.dtype if dtype is None else np.dtype(dtype)
-        self._direct = (layout == "csr" and physical_order == "cell_by_feature") or (
-            layout == "csc" and physical_order == "feature_by_cell"
-        )
         super().__init__(
             logical_shape,
             source_dtype,
+            cells_compressed=(layout == "csr") == cell_by_feature,
+            nnz=nnz,
             row_names=row_names,
             column_names=column_names,
-            is_sparse=True,
             limits=limits,
         )
 
-    def _validate_structure(
-        self,
-        data: h5py.Dataset,
-        indices: h5py.Dataset,
-        indptr: h5py.Dataset,
-        limits: SourceLimits,
-    ) -> int:
-        previous: int | None = None
-        chunk = max(1, min(limits.compressedChunkNnz, int(indptr.size)))
-        final = 0
-        for start in range(0, int(indptr.size), chunk):
-            stop = min(int(indptr.size), start + chunk)
-            pointers = np.asarray(indptr[start:stop])
-            if pointers.size > 1 and np.any(pointers[1:] < pointers[:-1]):
-                raise MatrixSourceError("HDF5 sparse indptr must be nondecreasing")
-            if previous is not None and pointers.size and int(pointers[0]) < previous:
-                raise MatrixSourceError("HDF5 sparse indptr must be nondecreasing")
-            if start == 0 and (not pointers.size or int(pointers[0]) != 0):
-                raise MatrixSourceError("HDF5 sparse indptr must start at zero")
-            if pointers.size:
-                previous = int(pointers[-1])
-                final = previous
-        if final < 0:
-            raise MatrixSourceError("HDF5 sparse indptr contains negative offsets")
-        if final > limits.maxNnz:
-            raise ResourceLimitError(
-                f"HDF5 sparse nnz {final} exceeds maxNnz={limits.maxNnz}"
-            )
-        if int(data.size) != final or int(indices.size) != final:
-            raise MatrixSourceError(
-                "HDF5 sparse data, indices, and indptr lengths are inconsistent"
-            )
-        minor_axis = (
-            self.physicalShape[1]
-            if self.physicalLayout == "csr"
-            else self.physicalShape[0]
-        )
-        for start in range(0, final, limits.compressedChunkNnz):
-            stop = min(final, start + limits.compressedChunkNnz)
-            values = np.asarray(indices[start:stop])
-            if values.size and (np.any(values < 0) or np.any(values >= minor_axis)):
-                raise MatrixSourceError(
-                    "HDF5 sparse indices contain an out-of-range value"
-                )
-        return final
-
-    @property
-    def nnz(self) -> int:
-        return self._nnz
-
-    def _direct_bounds(
-        self,
-        start: int,
-        stop: int,
-    ) -> tuple[NDArray[np.int64], int, int]:
+    def _read_pointers(self, start: int, stop: int) -> NDArray[np.int64]:
         with h5py.File(self.path, mode="r") as handle:
-            group = require_hdf5_group(handle, self.group)
-            node = group[self.indptrName]
+            node = require_hdf5_group(handle, self.group)["indptr"]
             assert isinstance(node, h5py.Dataset)
-            pointers = np.asarray(node[start : stop + 1], dtype=np.int64)
-        data_start = int(pointers[0])
-        data_stop = int(pointers[-1])
-        return pointers - data_start, data_start, data_stop
+            return np.asarray(node[start:stop], dtype=np.int64)
 
-    def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
-        start, stop = self._window(start, stop)
-        index_size = np.dtype(np.int64).itemsize
-        if self._direct:
-            pointers, data_start, data_stop = self._direct_bounds(start, stop)
-            nnz = data_stop - data_start
-            output = nnz * (self.dtype.itemsize + index_size) + pointers.nbytes
-            return MemoryEstimate(self.resident_bytes, output, output)
-        return self._row_store_memory(
-            start, stop, nnz=self.nnz, source_bytes=(self.n_features + 1) * 8
-        )
-
-    def read_cells(self, start: int, stop: int) -> csr_matrix:
-        start, stop = self._window(start, stop)
-        estimate = self.estimate_read_memory(start, stop)
-        self._admit(estimate)
-        if self._direct:
-            return self._read_direct(start, stop)
-        if start == stop:
-            return csr_matrix((0, self.n_features), dtype=self.dtype)
-        self._prepare_for_read()
-        assert self._rowStore is not None
-        return self._rowStore.read(start, stop)
-
-    def _prepare_for_read(self) -> None:
-        if not self._direct and self.n_cells:
-            self._prepare_row_store(
-                self._column_chunks, source_bytes=(self.n_features + 1) * 8
+    def _read_entries(
+        self, start: int, stop: int
+    ) -> tuple[NDArray[Any], NDArray[np.int64]]:
+        with h5py.File(self.path, mode="r") as handle:
+            group = require_hdf5_group(handle, self.group)
+            data_node = group["data"]
+            index_node = group["indices"]
+            assert isinstance(data_node, h5py.Dataset)
+            assert isinstance(index_node, h5py.Dataset)
+            return (
+                np.asarray(data_node[start:stop], dtype=self.dtype),
+                np.asarray(index_node[start:stop], dtype=np.int64),
             )
-
-    def _read_direct(self, start: int, stop: int) -> csr_matrix:
-        pointers, data_start, data_stop = self._direct_bounds(start, stop)
-        with h5py.File(self.path, mode="r") as handle:
-            group = require_hdf5_group(handle, self.group)
-            data_node = group[self.dataName]
-            index_node = group[self.indicesName]
-            assert isinstance(data_node, h5py.Dataset)
-            assert isinstance(index_node, h5py.Dataset)
-            data = np.asarray(data_node[data_start:data_stop], dtype=self.dtype)
-            indices = np.asarray(index_node[data_start:data_stop], dtype=np.int64)
-        return csr_matrix(
-            (data, indices, pointers),
-            shape=(stop - start, self.n_features),
-            dtype=self.dtype,
-        )
-
-    def _column_chunks(self) -> Iterator[coo_matrix]:
-        chunk_nnz = max(
-            1,
-            min(
-                self._limits.compressedChunkNnz,
-                (
-                    self._limits.maxBlockBytes
-                    - (self.n_cells + 1) * 32
-                    - (self.n_features + 1) * 8
-                )
-                // 384,
-            ),
-        )
-        with h5py.File(self.path, mode="r") as handle:
-            group = require_hdf5_group(handle, self.group)
-            data_node = group[self.dataName]
-            index_node = group[self.indicesName]
-            pointer_node = group[self.indptrName]
-            assert isinstance(data_node, h5py.Dataset)
-            assert isinstance(index_node, h5py.Dataset)
-            assert isinstance(pointer_node, h5py.Dataset)
-            pointers = np.asarray(pointer_node[:], dtype=np.int64)
-            for start in range(0, self.nnz, chunk_nnz):
-                stop = min(self.nnz, start + chunk_nnz)
-                features = (
-                    np.searchsorted(pointers, np.arange(start, stop), side="right") - 1
-                )
-                yield coo_matrix(
-                    (
-                        np.asarray(data_node[start:stop], dtype=self.dtype),
-                        (np.asarray(index_node[start:stop]), features),
-                    ),
-                    shape=(self.n_cells, self.n_features),
-                )
 
 
 class H5SparseMatrixSource(HDF5CompressedMatrixSource):
@@ -508,10 +305,6 @@ class H5SparseMatrixSource(HDF5CompressedMatrixSource):
         *,
         shape: Sequence[int] | None = None,
         sparse_layout: str | None = None,
-        row_names: Sequence[str | bytes] | NDArray[Any] | None = None,
-        column_names: Sequence[str | bytes] | NDArray[Any] | None = None,
-        row_names_path: str | None = None,
-        column_names_path: str | None = None,
         dtype: DTypeLike | None = None,
         limits: SourceLimits = DEFAULT_LIMITS,
     ) -> None:
@@ -526,35 +319,32 @@ class H5SparseMatrixSource(HDF5CompressedMatrixSource):
                         f"HDF5 sparse group {group_path!r} has no shape metadata"
                     )
                 physical_shape = stored_shape
-                logical_shape = (stored_shape[1], stored_shape[0])
             else:
                 if len(shape) != 2:
                     raise MatrixSourceError(
                         "H5 sparse logical shape must have length two"
                     )
-                logical_shape = (int(shape[0]), int(shape[1]))
-                physical_shape = (logical_shape[1], logical_shape[0])
+                physical_shape = (int(shape[1]), int(shape[0]))
                 if stored_shape is not None and stored_shape != physical_shape:
                     raise MatrixSourceError(
                         f"HDF5 sparse stored shape {stored_shape} conflicts with "
-                        f"logical shape {logical_shape}"
+                        f"logical shape {physical_shape[::-1]}"
                     )
             if sparse_layout is None:
-                physical_layout = _physical_sparse_layout(sparse_group)
+                physical_layout = sparse_encoding(sparse_group)
                 if physical_layout is None:
                     pointer = sparse_group.get("indptr")
                     if not isinstance(pointer, h5py.Dataset):
                         raise MatrixSourceError(
                             f"HDF5 sparse group {group_path!r} has no indptr"
                         )
-                    if int(pointer.size) == physical_shape[0] + 1:
-                        physical_layout = "csr"
-                    elif int(pointer.size) == physical_shape[1] + 1:
-                        physical_layout = "csc"
-                    else:
+                    csr = int(pointer.size) == physical_shape[0] + 1
+                    csc = int(pointer.size) == physical_shape[1] + 1
+                    if csr == csc:
                         raise MatrixSourceError(
                             "cannot infer HDF5 sparse physical layout"
                         )
+                    physical_layout = "csr" if csr else "csc"
             else:
                 logical_layout = sparse_layout.lower()
                 if logical_layout not in {"csr", "csc"}:
@@ -562,34 +352,12 @@ class H5SparseMatrixSource(HDF5CompressedMatrixSource):
                         "sparse_layout must describe logical CSR or CSC storage"
                     )
                 physical_layout = "csc" if logical_layout == "csr" else "csr"
-            resolved_rows = (
-                row_names
-                if row_names is not None
-                else read_hdf5_names(
-                    handle,
-                    row_names_path,
-                    logical_shape[0],
-                    limits=limits,
-                )
-            )
-            resolved_columns = (
-                column_names
-                if column_names is not None
-                else read_hdf5_names(
-                    handle,
-                    column_names_path,
-                    logical_shape[1],
-                    limits=limits,
-                )
-            )
         super().__init__(
             resolved,
             group_path,
             physical_shape=physical_shape,
             physical_layout=physical_layout,
             physical_order="cell_by_feature",
-            row_names=resolved_rows,
-            column_names=resolved_columns,
             dtype=dtype,
             limits=limits,
         )
@@ -615,59 +383,19 @@ class _DelegatingMatrixSource:
         return self._delegate.column_names
 
     @property
-    def rowNames(self) -> tuple[str, ...] | None:
-        return self.row_names
-
-    @property
-    def columnNames(self) -> tuple[str, ...] | None:
-        return self.column_names
-
-    @property
-    def n_features(self) -> int:
-        return self.shape[0]
-
-    @property
-    def n_cells(self) -> int:
-        return self.shape[1]
-
-    @property
     def is_sparse(self) -> bool:
         return self._delegate.is_sparse
-
-    @property
-    def sparse(self) -> bool:
-        return self.is_sparse
 
     @property
     def zero_preserving(self) -> bool:
         return self._delegate.zero_preserving
 
     @property
-    def zeroPreserving(self) -> bool:
-        return self.zero_preserving
-
-    @property
     def resident_bytes(self) -> int:
         return self._delegate.resident_bytes
 
-    @property
-    def residentBytes(self) -> int:
-        return self.resident_bytes
-
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
         return self._delegate.estimate_read_memory(start, stop)
-
-    def memory_estimate(self, start: int, stop: int) -> MemoryEstimate:
-        return self.estimate_read_memory(start, stop)
-
-    def estimate_read_bytes(self, start: int, stop: int) -> int:
-        return self.estimate_read_memory(start, stop).peakBytes
-
-    def estimate_memory(self, start: int, stop: int) -> MemoryEstimate:
-        return self.estimate_read_memory(start, stop)
-
-    def estimated_peak_bytes(self, start: int, stop: int) -> int:
-        return self.estimate_read_bytes(start, stop)
 
     def read_cells(self, start: int, stop: int) -> MatrixBlock:
         return self._delegate.read_cells(start, stop)
@@ -680,8 +408,6 @@ class H5ADMatrixSource(_DelegatingMatrixSource):
         *,
         layer: str | None = None,
         matrix_path: str | None = None,
-        row_names_path: str | None = None,
-        column_names_path: str | None = None,
         dtype: DTypeLike | None = None,
         limits: SourceLimits = DEFAULT_LIMITS,
     ) -> None:
@@ -715,7 +441,7 @@ class H5ADMatrixSource(_DelegatingMatrixSource):
                         "has no shape metadata"
                     )
                 physical_shape = group_shape
-                layout = _physical_sparse_layout(matrix)
+                layout = sparse_encoding(matrix)
                 if layout is None:
                     raise MatrixSourceError(
                         f"H5AD sparse matrix {resolved_matrix_path!r} "
@@ -726,34 +452,22 @@ class H5ADMatrixSource(_DelegatingMatrixSource):
                     f"H5AD matrix path {resolved_matrix_path!r} "
                     "has an unsupported node type"
                 )
-            logical_shape = (physical_shape[1], physical_shape[0])
-            feature_names_path = (
-                row_names_path
-                if row_names_path is not None
-                else _h5ad_index_path(handle, "/var")
-            )
-            cell_names_path = (
-                column_names_path
-                if column_names_path is not None
-                else _h5ad_index_path(handle, "/obs")
-            )
             row_names = read_hdf5_names(
                 handle,
-                feature_names_path,
-                logical_shape[0],
+                _h5ad_index_path(handle, "/var"),
+                physical_shape[1],
                 limits=limits,
             )
             column_names = read_hdf5_names(
                 handle,
-                cell_names_path,
-                logical_shape[1],
+                _h5ad_index_path(handle, "/obs"),
+                physical_shape[0],
                 limits=limits,
             )
         if layout is None:
             self._delegate = HDF5DenseMatrixSource(
                 resolved,
                 resolved_matrix_path,
-                r_transposed=True,
                 row_names=row_names,
                 column_names=column_names,
                 dtype=dtype,
@@ -779,7 +493,6 @@ class TenXMatrixSource(HDF5CompressedMatrixSource):
         path: str | os.PathLike[str] | Any,
         *,
         group: str = "matrix",
-        feature_names: str = "name",
         dtype: DTypeLike | None = None,
         limits: SourceLimits = DEFAULT_LIMITS,
     ) -> None:
@@ -796,7 +509,7 @@ class TenXMatrixSource(HDF5CompressedMatrixSource):
                 raise MatrixSourceError("10x shape path must be a dataset")
             physical_shape = read_hdf5_shape(shape_node[:], f"{group_path}/shape")
             feature_candidates = (
-                f"{group_path}/features/{feature_names}",
+                f"{group_path}/features/name",
                 f"{group_path}/features/id",
                 f"{group_path}/gene_names",
                 f"{group_path}/genes",
@@ -830,6 +543,3 @@ class TenXMatrixSource(HDF5CompressedMatrixSource):
             dtype=dtype,
             limits=limits,
         )
-
-
-TENxMatrixSource = TenXMatrixSource

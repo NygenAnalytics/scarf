@@ -15,7 +15,6 @@ from scarf.trajectory.fate import (
     _make_transition,
     _normalize_pseudotime,
     compute_fate_probabilities,
-    make_sink_tokens,
 )
 from scarf.trajectory.results import FateMappingResult
 
@@ -434,11 +433,6 @@ def test_compute_fate_rejects_invalid_parameters_and_inputs():
         )
 
 
-def test_make_sink_tokens_fallback_and_collision_suffixes():
-    assert make_sink_tokens(("!!!", "!!!", "A")) == ("sink_1", "sink_2", "A")
-    assert make_sink_tokens(("A!", "A_", "A")) == ("A", "A_2", "A_3")
-
-
 def test_malformed_csr_structure_is_rejected():
     graph, pseudotime, labels = _y_graph()
     graph.indices[0] = graph.shape[0]
@@ -484,10 +478,6 @@ def test_reordering_sinks_only_reorders_probability_columns():
     )
 
     np.testing.assert_allclose(forward, reverse[:, ::-1], rtol=1e-5, atol=1e-7)
-
-
-def test_sink_tokens_remain_unique_after_sanitization():
-    assert make_sink_tokens(("A", "A_2", "A!")) == ("A", "A_2", "A_3")
 
 
 @pytest.mark.parametrize(
@@ -632,7 +622,7 @@ def test_localized_solver_error_fails_residual_validation(
 @pytest.mark.parametrize(
     "include_disconnected_cells", [False, True], ids=["all-cells", "largest-component"]
 )
-def test_datastore_fate_mapping_preserves_cached_graph(
+def test_datastore_fate_mapping_is_reproducible_and_keeps_the_graph(
     include_disconnected_cells: bool,
 ):
     graph, _, label_values = _y_graph()
@@ -677,35 +667,29 @@ def test_datastore_fate_mapping_preserves_cached_graph(
         source_columns=["label"],
     )
 
-    with store._graph_memory_cache_scope():
-        cached_graph = store.load_graph(graph_ref, symmetric=True, upper_only=False)
-        original_graph = cached_graph.copy()
-        cached_results = {}
-        for beta in (10.0, 5.0):
-            ref = store.run_fate_mapping(
-                pseudotime, labels, sinks=["A", "B"], beta=beta
-            )
-            cached_results[beta] = store.load_fate_mapping(ref)
-        assert (
-            store.run_fate_mapping(pseudotime, labels, sinks=["A", "B"], beta=5.0)
-            == cached_results[5.0].ref
-        )
-        assert (
-            store.load_graph(graph_ref, symmetric=True, upper_only=False)
-            is cached_graph
-        )
-        np.testing.assert_array_equal(cached_graph.data, original_graph.data)
-        np.testing.assert_array_equal(cached_graph.indices, original_graph.indices)
-        np.testing.assert_array_equal(cached_graph.indptr, original_graph.indptr)
+    original_graph = store.load_graph(graph_ref, symmetric=True, upper_only=False)
+    results = {}
+    for beta in (10.0, 5.0):
+        ref = store.run_fate_mapping(pseudotime, labels, sinks=["A", "B"], beta=beta)
+        results[beta] = store.load_fate_mapping(ref)
+    assert (
+        store.run_fate_mapping(pseudotime, labels, sinks=["A", "B"], beta=5.0)
+        == results[5.0].ref
+    )
+    # The solve biases its own copy of the graph, never the stored edges.
+    reloaded_graph = store.load_graph(graph_ref, symmetric=True, upper_only=False)
+    np.testing.assert_array_equal(reloaded_graph.data, original_graph.data)
+    np.testing.assert_array_equal(reloaded_graph.indices, original_graph.indices)
+    np.testing.assert_array_equal(reloaded_graph.indptr, original_graph.indptr)
 
-    for beta, cached_result in cached_results.items():
+    for beta, result in results.items():
         fresh = store.run_fate_mapping(
             pseudotime, labels, sinks=["A", "B"], beta=beta, invalidate_cache=True
         )
         fresh_result = store.load_fate_mapping(fresh)
-        np.testing.assert_array_equal(cached_result.valid, np.arange(len(cell_ids)) < 5)
-        np.testing.assert_array_equal(cached_result.valid, fresh_result.valid)
-        np.testing.assert_array_equal(cached_result.values, fresh_result.values)
+        np.testing.assert_array_equal(result.valid, np.arange(len(cell_ids)) < 5)
+        np.testing.assert_array_equal(result.valid, fresh_result.valid)
+        np.testing.assert_array_equal(result.values, fresh_result.values)
 
 
 def test_datastore_fate_mapping_returns_an_artifact_without_metadata_writes(

@@ -22,7 +22,8 @@ from scarf.trajectory.results import (
     PseudotimeMarkerResult,
     PseudotimeScoreResult,
 )
-from scarf.writers import create_cell_data, create_zarr_count_assay
+from scarf.storage.schema import create_cell_data
+from scarf.writers import create_zarr_count_assay
 from tests.fixtures_datastore import build_neighbourhood_graph
 from tests.store_probes import RecordingStore
 
@@ -67,10 +68,10 @@ def _qc_store() -> tuple[RecordingStore, int]:
     )
     counts[:] = _QC_VALUES
     assert counts.shards is not None
-    from scarf.storage.identity import finalize_counts
+    from tests.storage_helpers import finalize_test_counts
     from scarf.writers.counts_t import finalize_writer_counts_t
 
-    finalize_counts(counts)
+    finalize_test_counts(counts)
 
     finalize_writer_counts_t(root, "RNA", None, profile="fast_local")
     expected_reads = int(np.ceil(n_cells / counts.shards[0]))
@@ -720,10 +721,14 @@ def test_ann_index_rejects_non_coordinates_and_missing_reduction_values():
 @pytest.mark.parametrize(
     ("options", "error", "message"),
     [
-        ({"ctrl_size": True}, TypeError, "ctrl_size must be a positive integer"),
-        ({"ctrl_size": 2.0}, TypeError, "ctrl_size must be a positive integer"),
-        ({"ctrl_size": 0}, ValueError, "ctrl_size must be a positive integer"),
+        ({"ctrl_size": True}, TypeError, "ctrl_size must be an integer"),
+        ({"ctrl_size": 2.0}, TypeError, "ctrl_size must be an integer"),
+        ({"ctrl_size": 0}, ValueError, "ctrl_size must be at least 1"),
         ({"log_transform": 1}, TypeError, "log_transform must be a bool"),
+        ({"n_bins": 1}, ValueError, "n_bins must be at least 2"),
+        ({"rand_seed": -1}, ValueError, "rand_seed must be at least 0"),
+        ({"s_genes": "GENE_A"}, TypeError, "s_genes must be a sequence"),
+        ({"s_genes": ["NOT_A_GENE"]}, ValueError, "None of the s_genes match"),
     ],
 )
 def test_cell_cycle_rejects_invalid_controls_before_summarizing(
@@ -737,7 +742,7 @@ def test_cell_cycle_rejects_invalid_controls_before_summarizing(
 
     with pytest.raises(error, match=message):
         dataset.run_cell_cycle_scoring(
-            cells, s_genes=["GENE_A"], g2m_genes=["RPS3"], **options
+            cells, **{"s_genes": ["GENE_A"], "g2m_genes": ["RPS3"], **options}
         )
 
     assert not list_artifacts(
@@ -861,26 +866,39 @@ def toy_store_path(toy_crdir_writer, tmp_path) -> str:
     return str(destination)
 
 
-def test_set_default_assay_is_atomic_on_read_only_store(toy_store_path) -> None:
-    store = DataStore(
-        toy_store_path,
-        default_assay="RNA",
-        min_features_per_cell=0,
-        zarr_mode="r",
+def test_stored_default_assay_must_name_an_assay(toy_store_path) -> None:
+    zarr.open_group(toy_store_path, mode="r+").attrs["defaultAssay"] = "missing"
+
+    for mode in ("r+", "r"):
+        with pytest.raises(ValueError, match="stored default assay 'missing'"):
+            DataStore(toy_store_path, min_features_per_cell=0, zarr_mode=mode)
+    store = DataStore(toy_store_path, default_assay="ADT", min_features_per_cell=0)
+    assert store._defaultAssay == "ADT"
+    assert zarr.open_group(toy_store_path, mode="r").attrs["defaultAssay"] == "ADT"
+
+
+def test_get_cell_vals_clips_any_numeric_column_ignoring_missing_values(
+    toy_store_path,
+) -> None:
+    store = DataStore(toy_store_path, default_assay="RNA", min_features_per_cell=0)
+    n_active = int(store.cells.fetch_all("I").sum())
+    values = np.arange(store.cells.N, dtype=np.float32)
+    values[0] = np.nan
+    store.cells.insert("score", values, overwrite=True)
+
+    raw = store.get_cell_vals(from_assay="RNA", cell_key="I", k="score")
+    clipped = store.get_cell_vals(
+        from_assay="RNA", cell_key="I", k="score", clip_fraction=0.2
     )
 
-    with pytest.raises(ValueError, match="not found"):
-        store.set_default_assay("missing")
-    with pytest.raises(PermissionError, match="zarr_mode='r\\+'"):
-        store.set_default_assay("ADT")
-
-    assert store._defaultAssay == "RNA"
-    assert store.zw.attrs["defaultAssay"] == "RNA"
-    assert store._get_assay(None) is store.RNA
-    writable = DataStore(toy_store_path, min_features_per_cell=0)
-    writable.set_default_assay("ADT")
-    assert writable._get_assay(None) is writable.ADT
-    assert DataStore(toy_store_path, min_features_per_cell=0)._defaultAssay == "ADT"
+    assert raw.dtype == np.float32 and clipped.dtype == np.float32
+    assert len(clipped) == n_active
+    low, high = np.nanpercentile(raw, [20, 80])
+    np.testing.assert_allclose(np.nanmin(clipped), low, rtol=1e-6)
+    np.testing.assert_allclose(np.nanmax(clipped), high, rtol=1e-6)
+    np.testing.assert_array_equal(np.isnan(clipped), np.isnan(raw))
+    with pytest.raises(ValueError, match="clip_fraction"):
+        store.get_cell_vals(from_assay="RNA", cell_key="I", k="score", clip_fraction=2)
 
 
 def test_get_assay_rejects_unknown_and_non_assay_names(toy_store_path) -> None:
@@ -896,7 +914,7 @@ def test_get_assay_rejects_unknown_and_non_assay_names(toy_store_path) -> None:
 
 
 def _store_with_assay(name: str) -> MemoryStore:
-    from scarf.storage.identity import finalize_counts
+    from tests.storage_helpers import finalize_test_counts
     from scarf.writers.counts_t import finalize_writer_counts_t
 
     store = MemoryStore()
@@ -915,7 +933,7 @@ def _store_with_assay(name: str) -> MemoryStore:
             dtype="uint32",
         )
         counts[:] = _QC_VALUES
-        finalize_counts(counts)
+        finalize_test_counts(counts)
         finalize_writer_counts_t(root, assay, None, assay_type="RNA")
     return store
 
@@ -1043,6 +1061,37 @@ def test_run_leiden_clustering_rejects_invalid_resolution_or_seed(
         datastore.run_leiden_clustering(connectivity_graph, **{argument: value})
 
     assert datastore.list_artifacts(kind="cluster_labels") == before
+
+
+@pytest.mark.parametrize(
+    ("labels", "error", "message"),
+    [
+        (lambda n: np.zeros(n - 1, dtype=np.int64), ValueError, "one label per"),
+        (lambda n: np.zeros(n, dtype=np.float64), TypeError, "integer labels"),
+    ],
+)
+def test_run_leiden_clustering_rejects_malformed_memberships(
+    datastore,
+    connectivity_graph,
+    monkeypatch,
+    labels,
+    error: type[Exception],
+    message: str,
+) -> None:
+    import scarf.clustering.leiden as leiden
+
+    monkeypatch.setattr(
+        leiden,
+        "leiden_membership",
+        lambda matrix, *args, **kwargs: labels(matrix.shape[0]),
+    )
+    before = datastore.list_artifacts(kind="cluster_labels", complete_only=True)
+    with pytest.raises(error, match=message):
+        datastore.run_leiden_clustering(connectivity_graph, resolution=0.123)
+
+    assert datastore.list_artifacts(kind="cluster_labels", complete_only=True) == (
+        before
+    )
 
 
 def test_int_and_float_resolution_share_identity(
@@ -1543,28 +1592,6 @@ class TestDataStore:
         )
         assert smoother.std() < values.std()
 
-    def test_mean_features(self, datastore):
-        import pytest
-
-        names = list(datastore.RNA.feats.fetch("names", key="I")[:3])
-        values = datastore.RNA.mean_features(names)
-        active = datastore.cells.active_index("I")
-        feat_idx = datastore.RNA.feats.get_index_by(names, "names", None)
-        expected = (
-            datastore.RNA.normed(cell_idx=active, feat_idx=np.sort(feat_idx))
-            .mean(axis=1)
-            .compute()
-        )
-        assert values.shape == (len(active),)
-        np.testing.assert_allclose(values, expected)
-        with pytest.raises(ValueError, match="not found"):
-            datastore.RNA.mean_features(["__missing_feature__"])
-        skipped = datastore.RNA.mean_features(
-            [names[0], "__missing_feature__"],
-            missing="skip",
-        )
-        assert skipped.shape == (len(active),)
-
     def test_run_doublet_detection(
         self,
         connectivity_graph,
@@ -1805,9 +1832,11 @@ class TestDataStore:
         assert adata.n_vars == datastore.RNA.feats.N
         assert list(adata.obs_names) == list(datastore.cells.fetch("ids", key="I"))
         assert list(adata.var_names) == list(datastore.RNA.feats.fetch_all("ids"))
+        from scarf.assay.base import raw_csr
+
         np.testing.assert_array_equal(
             adata.X.toarray(),
-            datastore.RNA.to_raw_sparse("I").toarray(),
+            raw_csr(datastore.RNA, datastore.cells.active_index("I")).toarray(),
         )
 
     def test_run_topacedo_sampler(
@@ -2026,6 +2055,35 @@ class TestDataStore:
             )
         assert set(atac_datastore.ATAC.feats.columns) == columns_before
         assert atac_datastore.inspect_artifact(ref).complete
+
+    def test_mark_prevalent_peaks_validates_top_n_before_summarizing(
+        self,
+        mark_prevalent_peaks,
+        atac_datastore,
+        monkeypatch,
+    ):
+        import scarf.datastore._operations.quality_control as quality_control
+
+        cells = atac_datastore.snapshot_cell_selection()
+        n_peaks = atac_datastore.ATAC.feats.N
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                quality_control,
+                "ensure_feature_summary",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("top_n must be checked before summarizing")
+                ),
+            )
+            for top_n, error in ((0, ValueError), (n_peaks, ValueError)):
+                with pytest.raises(error, match="top_n must"):
+                    atac_datastore.select_prevalent_peaks(cells, top_n=top_n)
+            with pytest.raises(TypeError, match="top_n must"):
+                atac_datastore.select_prevalent_peaks(cells, top_n=True)
+
+        assert (
+            atac_datastore.select_prevalent_peaks(cells, top_n=np.int64(5000))
+            == mark_prevalent_peaks
+        )
 
     def test_run_marker_search_requires_explicit_clusters(self, datastore, mark_hvgs):
         with pytest.raises(TypeError, match="ArtifactRef"):

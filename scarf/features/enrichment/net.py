@@ -5,19 +5,13 @@ from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
-from numpy.typing import DTypeLike
-from ...utils.arrays import has_duplicates
+from ...metadata.table import CaseInsensitiveIndex
+from ...utils.arrays import has_duplicates, read_only_copy
 from ...utils.logging import logger
 
 __all__ = ["AmbiguousTargets", "PreparedNetwork", "prepare_network", "read_gmt"]
 
 AmbiguousTargets = Literal["drop", "error"]
-
-
-def _owned_readonly(values: np.ndarray, dtype: DTypeLike) -> np.ndarray:
-    array = np.asarray(values, dtype=dtype).copy()
-    array.setflags(write=False)
-    return array
 
 
 def _update_text(digest: Any, value: str) -> None:
@@ -264,15 +258,12 @@ def prepare_network(
     else:
         frame["weight"] = 1.0
 
-    name_to_indices: dict[str, list[int]] = {}
-    for name, index in zip(feature_names, feature_index, strict=True):
-        name_to_indices.setdefault(str(name).upper(), []).append(int(index))
-
+    names = CaseInsensitiveIndex(feature_names)
     matched_rows: list[int] = []
     matched_indices: list[int] = []
     ambiguous: set[str] = set()
     for row_index, target in zip(frame.index, frame["target"], strict=True):
-        matches = name_to_indices.get(str(target).upper(), [])
+        matches = names.positions(target)
         if not matches:
             continue
         if len(matches) > 1:
@@ -284,7 +275,7 @@ def prepare_network(
             ambiguous.add(str(target))
             continue
         matched_rows.append(int(row_index))
-        matched_indices.append(matches[0])
+        matched_indices.append(int(feature_index[matches[0]]))
 
     dropped_ambiguous_targets = tuple(sorted(ambiguous))
     if dropped_ambiguous_targets:
@@ -342,12 +333,12 @@ def prepare_network(
     )
 
     return PreparedNetwork(
-        source_names=_owned_readonly(source_names, source_names.dtype),
-        source_sizes=_owned_readonly(source_sizes, np.int64),
-        matched_feature_index=_owned_readonly(matched_feature_index, np.int64),
-        edge_source_index=_owned_readonly(edge_source_index, np.int64),
-        edge_feature_index=_owned_readonly(edge_feature_index, np.int64),
-        edge_weight=_owned_readonly(edge_weight, np.float64),
+        source_names=read_only_copy(source_names, source_names.dtype),
+        source_sizes=read_only_copy(source_sizes, np.int64),
+        matched_feature_index=read_only_copy(matched_feature_index, np.int64),
+        edge_source_index=read_only_copy(edge_source_index, np.int64),
+        edge_feature_index=read_only_copy(edge_feature_index, np.int64),
+        edge_weight=read_only_copy(edge_weight, np.float64),
         network_digest=digest,
         dropped_ambiguous_targets=dropped_ambiguous_targets,
     )

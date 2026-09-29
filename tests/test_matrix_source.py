@@ -23,10 +23,8 @@ from scarf.storage.stores import (
     resolve_matrix_source,
 )
 from tests.fixtures_datastore import build_neighbourhood_graph
-from scarf.writers import (
-    create_cell_data,
-    create_zarr_count_assay,
-)
+from scarf.storage.schema import create_cell_data
+from scarf.writers import create_zarr_count_assay
 
 
 def _write_assay(
@@ -54,9 +52,9 @@ def _write_assay(
         counts = root[f"matrices/{assay_name}/counts"]
         assay = root[f"{workspace}/{assay_name}"]
     counts[:] = values
-    from scarf.storage.identity import finalize_counts
+    from tests.storage_helpers import finalize_test_counts
 
-    finalize_counts(counts)
+    finalize_test_counts(counts)
     matrix_group = (
         root[assay_name] if workspace is None else root[f"matrices/{assay_name}"]
     )

@@ -1,6 +1,5 @@
 """Write-ahead admissions for bounded RNA experiments in the workflow journal."""
 
-import hashlib
 from typing import Any, cast
 
 from .. import record_io
@@ -20,7 +19,7 @@ def candidate_identity(inputs: dict[str, Any], *, graph: bool = False) -> str:
     if graph:
         parameters.pop("leidenResolution", None)
     values["parameters"] = parameters
-    return hashlib.sha256(record_io.canonical_json_bytes(values)).hexdigest()
+    return record_io.sha256_json(values)
 
 
 class CandidateBudget:
@@ -98,7 +97,7 @@ class CandidateBudget:
         ]
         scopes = {"parameter_tuning/full"} | {
             "parameter_tuning/evidence_revisions/"
-            + hashlib.sha256(record_io.canonical_json_bytes(provenance)).hexdigest()
+            + record_io.sha256_json(provenance)
             + "/full"
             for provenance in (self.provenance, *previous_provenances)
         }
@@ -116,9 +115,7 @@ class CandidateBudget:
                 continue
             if key in repair_keys:
                 inputs = record["inputs"]
-                identity = hashlib.sha256(
-                    record_io.canonical_json_bytes(inputs)
-                ).hexdigest()
+                identity = record_io.sha256_json(inputs)
                 if record["outputs"] != {"identity": identity, "reserved": True}:
                     raise ValueError("Full-cohort repair admission is inconsistent")
                 repairs[identity] = inputs
@@ -148,9 +145,7 @@ class CandidateBudget:
                 evidence["settings"][candidate_id],
                 experiment,
             )
-            identity = hashlib.sha256(
-                record_io.canonical_json_bytes(inputs)
-            ).hexdigest()
+            identity = record_io.sha256_json(inputs)
             repairs[identity] = inputs
         if len(repairs) > self.config.maxFullRepairs:
             raise CandidateBudgetExceeded(
@@ -163,7 +158,7 @@ class CandidateBudget:
     ) -> None:
         """Reserve one global full-cohort repair before executing its intervention."""
         inputs = self._repair_inputs(cells, setting, experiment)
-        identity = hashlib.sha256(record_io.canonical_json_bytes(inputs)).hexdigest()
+        identity = record_io.sha256_json(inputs)
         if identity in self.repairs:
             return
         if len(self.repairs) >= self.config.maxFullRepairs:

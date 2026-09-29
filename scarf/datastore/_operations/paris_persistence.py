@@ -11,9 +11,8 @@ from ...storage.artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
     PlannedArtifact,
-    finish_artifact,
+    artifact_transaction,
     plan_artifact,
-    start_artifact,
 )
 from ...storage.artifacts import ArtifactRef
 from ...storage.arrays import create_zarr_dataset
@@ -397,16 +396,15 @@ def write_paris_dendrogram(
     dendrogram: np.ndarray,
 ) -> None:
     """Write and complete a planned Paris dendrogram artifact."""
-    group = start_artifact(zw, plan)
-    output = create_zarr_dataset(
-        group,
-        "data",
-        (min(max(dendrogram.shape[0], 1), 5000), 4),
-        "f8",
-        dendrogram.shape,
-    )
-    output[:] = dendrogram
-    finish_artifact(group, plan)
+    with artifact_transaction(zw, plan) as group:
+        output = create_zarr_dataset(
+            group,
+            "data",
+            (min(max(dendrogram.shape[0], 1), 5000), 4),
+            "f8",
+            dendrogram.shape,
+        )
+        output[:] = dendrogram
 
 
 def _read_array(group: zarr.Group, name: str) -> np.ndarray:

@@ -3,22 +3,18 @@
 import io
 import shutil
 import tarfile
-import time
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from threading import Lock
 from typing import Any
 
-from docs.execute_vignette import ParsedSource
+from docs.execute_vignette import PageRunner, ParsedSource
+from profiling.modal_support import await_function_call
 
 type PageCachePayload = tuple[str, str, bytes]
-type PageRunner = Callable[[ParsedSource, Path], Path]
 type PageCallSpawner = Callable[[ParsedSource], Any]
 
 _REQUIRED_CACHE_FILES = frozenset({"__version__.txt", "global.db"})
-_TERMINAL_FAILURE_STATUSES = frozenset(
-    {"FAILURE", "INIT_FAILURE", "TERMINATED", "TIMEOUT"}
-)
 
 
 class CacheTransportError(RuntimeError):
@@ -89,9 +85,9 @@ def _validated_members(archive: tarfile.TarFile) -> list[tarfile.TarInfo]:
 
     missing = _REQUIRED_CACHE_FILES - file_names
     if missing:
-        names = ", ".join(sorted(missing))
         raise CacheTransportError(
-            f"Page cache archive is missing required files: {names}"
+            "Page cache archive is missing required files: "
+            + ", ".join(sorted(missing))
         )
     return members
 
@@ -141,69 +137,6 @@ def restore_page_cache(
     return destination
 
 
-def _call_id(call: Any) -> str | None:
-    if hasattr(call, "hydrate"):
-        try:
-            call.hydrate()
-        except Exception:
-            pass
-    try:
-        object_id = call.object_id
-    except Exception:
-        object_id = None
-    if object_id:
-        return str(object_id)
-    call_id = getattr(call, "call_id", None)
-    return str(call_id) if call_id else None
-
-
-def _input_status_name(call: Any) -> str | None:
-    call_id = _call_id(call)
-    if not call_id or not hasattr(call, "get_call_graph"):
-        return None
-    try:
-        graph = call.get_call_graph()
-    except Exception:
-        return None
-    stack = list(graph or [])
-    while stack:
-        node = stack.pop()
-        if getattr(node, "function_call_id", None) == call_id:
-            status = getattr(node, "status", None)
-            if status is None:
-                return None
-            return str(getattr(status, "name", status))
-        stack.extend(getattr(node, "children", None) or [])
-    return None
-
-
-def await_page_cache(
-    call: Any,
-    *,
-    poll_seconds: float,
-    deadline_seconds: float,
-) -> PageCachePayload:
-    if poll_seconds <= 0:
-        raise ValueError("poll_seconds must be positive")
-    if deadline_seconds <= 0:
-        raise ValueError("deadline_seconds must be positive")
-
-    deadline = time.monotonic() + deadline_seconds
-    while time.monotonic() < deadline:
-        remaining = max(0.1, deadline - time.monotonic())
-        try:
-            return call.get(timeout=min(poll_seconds, remaining))
-        except TimeoutError:
-            status = _input_status_name(call)
-            if status in _TERMINAL_FAILURE_STATUSES:
-                raise RuntimeError(
-                    f"Modal call {_call_id(call) or '<unknown>'} ended with status={status}"
-                ) from None
-    raise TimeoutError(
-        f"Modal page call did not finish within {deadline_seconds:.0f} seconds"
-    )
-
-
 class SpawnedPageRunner:
     def __init__(
         self,
@@ -242,10 +175,10 @@ class SpawnedPageRunner:
             ) from exc
         with self._lock:
             self._claimed.add(source.uri)
-        payload = await_page_cache(
+        payload = await_function_call(
             call,
-            poll_seconds=self._poll_seconds,
-            deadline_seconds=self._deadline_seconds,
+            pollSeconds=self._poll_seconds,
+            deadlineSeconds=self._deadline_seconds,
         )
         return restore_page_cache(
             payload,

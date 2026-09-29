@@ -158,8 +158,8 @@ def test_pipeline_scalar_and_json_contract_rejections() -> None:
         run_storage._json_value({1: "bad"}, "value")
     with pytest.raises(TypeError, match="unsupported"):
         run_storage._json_value({1, 2}, "value")
-    with pytest.raises(ValueError, match="ArtifactRef"):
-        run_storage._artifact_ref({}, "value")
+    with pytest.raises(ValueError, match="output artifact is not a valid artifact"):
+        PipelineOutputRecord.from_dict({"key": "out", "artifact": {}})
     with pytest.raises(TypeError, match="raised directly"):
         run_storage._raise_type("raised directly")
 
@@ -414,8 +414,6 @@ def _recipe_kwargs() -> dict[str, Any]:
 
 
 def test_pipeline_recipe_helper_validation() -> None:
-    with pytest.raises(ValueError, match="positive integer"):
-        recipe_module._positive_int(True, "count")
     for value in ("name", ["ok", ""], ["same", "same"]):
         with pytest.raises((TypeError, ValueError)):
             recipe_module._column_sequence(value, "columns")
@@ -566,7 +564,8 @@ def test_resolve_pipeline_recipe_contract_errors(
         ({"snapshot_columns": ["missing"]}, KeyError, "Snapshot columns"),
         ({"harmony_batch_columns": []}, ValueError, "must not be empty"),
         ({"harmony_batch_columns": ["missing"]}, KeyError, "Harmony columns"),
-        ({"hvg_count": 0}, ValueError, "positive integer"),
+        ({"hvg_count": 0}, ValueError, "hvg_count must be at least 1"),
+        ({"hvg_count": 2.0}, TypeError, "hvg_count must be an integer"),
     ]
     for changes, error_type, message in cases:
         with pytest.raises(error_type, match=message):
@@ -641,6 +640,11 @@ def test_run_ledger_records_and_interruption_helpers(
 def test_run_ledger_skip_failure_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ledger_module, "sample_process_tree_rss", _sample_rss)
     monkeypatch.setattr(
+        ledger_module,
+        "load_pipeline_run_record",
+        lambda *_args: SimpleNamespace(complete=False),
+    )
+    monkeypatch.setattr(
         ledger_module, "start_pipeline_stage_record", lambda *a, **k: None
     )
     monkeypatch.setattr(
@@ -705,6 +709,11 @@ def test_run_ledger_skip_failure_paths(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_run_ledger_run_failure_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ledger_module, "sample_process_tree_rss", _sample_rss)
+    monkeypatch.setattr(
+        ledger_module,
+        "load_pipeline_run_record",
+        lambda *_args: SimpleNamespace(complete=False),
+    )
     monkeypatch.setattr(ledger_module, "shutdown_checkpoint", lambda: None)
     monkeypatch.setattr(ledger_module, "fail_pipeline_run_record", lambda *a, **k: None)
     monkeypatch.setattr(
@@ -813,3 +822,30 @@ def test_pipeline_record_storage_rejects_torn_and_invalid_queries() -> None:
     stages.create_group("bad")
     with pytest.raises(ValueError, match="child name"):
         run_storage.load_pipeline_stage_records(root, record.run_id)
+
+
+def test_end_pipeline_run_records_once_and_keeps_terminal_runs() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+
+    def new_run() -> str:
+        return run_storage.create_pipeline_run_record(
+            root,
+            recipe="basic",
+            requested_label=None,
+            assay="RNA",
+            config={},
+            stage_order=("one",),
+            scarf_version="1.0",
+        ).run_id
+
+    failed = new_run()
+    assert ledger_module.end_pipeline_run(root, failed, ValueError("bad")) is True
+    assert ledger_module.end_pipeline_run(root, failed, KeyboardInterrupt()) is False
+    assert run_storage.load_pipeline_run_record(root, failed).status == "failed"
+
+    interrupted = new_run()
+    assert ledger_module.end_pipeline_run(root, interrupted, KeyboardInterrupt())
+    record = run_storage.load_pipeline_run_record(root, interrupted)
+    assert record.status == "interrupted"
+    assert record.interruption is not None
+    assert record.interruption.kind == "keyboard_interrupt"

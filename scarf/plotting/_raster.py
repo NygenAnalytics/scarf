@@ -10,8 +10,9 @@ from ..metadata.rows import (
     metadata_missing_mask,
     read_array_rows_chunkwise,
 )
+from ._contracts import ColorScale
 from ._deps import require_matplotlib
-from ._style import continuous_norm, square_axis_limits
+from ._style import continuous_norm, resolve_color_limits, square_axis_limits
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,11 +210,12 @@ def raster_from_metadata(
                 _raster_block_values(missing_masks, block, color_key),
                 dtype=np.float64,
             )[finite]
-            mm = _finite_minmax(c)
-            if mm is not None:
-                cmin = min(cmin, mm[0])
-                cmax = max(cmax, mm[1])
-            if quantiles is not None:
+            if quantiles is None:
+                mm = _finite_minmax(c)
+                if mm is not None:
+                    cmin = min(cmin, mm[0])
+                    cmax = max(cmax, mm[1])
+            else:
                 sample_values, sample_priorities, n_sampled = _priority_sample_update(
                     sample_values,
                     sample_priorities,
@@ -237,17 +239,14 @@ def raster_from_metadata(
 
     if color_key is None:
         vmin, vmax = 0.0, 1.0
-    elif not np.isfinite(cmin):
-        vmin, vmax = 0.0, 1.0
-    elif quantiles is not None and n_sampled > 0:
-        sample = sample_values[:n_sampled]
-        q0, q1 = quantiles
-        vmin = float(np.quantile(sample, q0))
-        vmax = float(np.quantile(sample, q1))
-        if vmax <= vmin:
-            vmin, vmax = float(cmin), float(cmax if cmax > cmin else cmin + 1.0)
     else:
-        vmin, vmax = float(cmin), float(cmax if cmax > cmin else cmin + 1.0)
+        # A uniform sample stands in for the values when limits use quantiles.
+        vmin, vmax = resolve_color_limits(
+            sample_values[:n_sampled]
+            if quantiles is not None
+            else np.asarray([cmin, cmax]),
+            ColorScale(quantiles=quantiles),
+        )
 
     # Pad extent slightly so edge points land inside bins.
     dx = xmax - xmin

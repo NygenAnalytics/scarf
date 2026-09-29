@@ -41,7 +41,6 @@ from scarf.agent.orchestrator import (
 )
 from scarf.agent.orchestrator.models import (
     AutomatedPreprocessingPlan,
-    WorkflowStageAttempt,
 )
 from scarf.agent.orchestrator.models import OrchestrationRequestRecord, WorkflowIdentity
 from scarf.agent.parameter_tuning import (
@@ -91,7 +90,6 @@ def _measured_context_characterization(store, cell_selection):
     return characterize_covariates(
         store,
         cellSelection=cell_selection.to_artifact_ref(),
-        model=None,
         directions={
             "columnDomains": {
                 "sample": "design",
@@ -196,7 +194,6 @@ def _planning_inputs(
     OrchestrationRequestRecord,
     DataEnrichmentReport,
     ExperimentalContextResult,
-    WorkflowStageAttempt,
     CellQcPlan,
 ]:
     store = _PlanningStore(assays)
@@ -229,21 +226,11 @@ def _planning_inputs(
         config=config or AutomatedWorkflowConfig(),
     )
     experimental = example(ExperimentalContextResult)
-    ingest_outcome = WorkflowStageAttempt(
-        workflowRunId="planning-test",
-        stage="ingest",
-        attemptId="ingest-test",
-        status="done",
-        startedAtNs=1,
-        completedAtNs=2,
-        outputs={"format": "zarr"},
-    )
     return (
         store,
         request_record,
         enrichment,
         experimental,
-        ingest_outcome,
         example(CellQcPlan),
     )
 
@@ -287,9 +274,7 @@ def test_unsafe_experimental_context_pauses_and_explicit_skip_reuses_evidence(
             studyObjective="Preserve treatment while discovering populations.",
         ),
     )
-    enrichment_reference = _save_input_evidence(
-        store, workflow, request_record, enrichment
-    )
+    _save_input_evidence(store, workflow, request_record, enrichment)
     sample_context = example(ExperimentalContextResult)
     evidence_id = "batchEstimability:treatment:batch"
     unsafe_plan = sample_context.decision.batchCorrection.model_copy(
@@ -348,7 +333,6 @@ def test_unsafe_experimental_context_pauses_and_explicit_skip_reuses_evidence(
         request_record,
         [],
         cell_selection,
-        enrichment_reference,
         [],
         [],
         {},
@@ -386,7 +370,6 @@ def test_unsafe_experimental_context_pauses_and_explicit_skip_reuses_evidence(
         request_record,
         [],
         cell_selection,
-        enrichment_reference,
         [],
         [],
         {"experimentalDirections": "skipHarmony"},
@@ -436,9 +419,7 @@ def test_failed_context_retries_without_overwriting_or_replaying_failure(
             studyObjective="Preserve treatment while discovering populations.",
         ),
     )
-    enrichment_ref = _save_input_evidence(
-        store, workflow, request, example(DataEnrichmentReport)
-    )
+    _save_input_evidence(store, workflow, request, example(DataEnrichmentReport))
     report = example(ExperimentalContextResult).model_copy(
         update={
             "characterization": _measured_context_characterization(store, selection),
@@ -504,7 +485,7 @@ def test_failed_context_retries_without_overwriting_or_replaying_failure(
 
     def execute():
         return orchestrator.experimental_context_stage(
-            store, workflow, request, [], selection, enrichment_ref, [], [], {}
+            store, workflow, request, [], selection, [], [], {}
         )
 
     first, _ = execute()
@@ -602,9 +583,7 @@ def test_explicit_no_inference_skip_resolves_context_without_provider_rerun(
             studyObjective="Discover stable RNA populations.",
         ),
     )
-    enrichment_reference = _save_input_evidence(
-        store, workflow, request_record, enrichment
-    )
+    _save_input_evidence(store, workflow, request_record, enrichment)
     sample_context = example(ExperimentalContextResult)
     needs_input_plan = sample_context.decision.batchCorrection.model_copy(
         update={
@@ -660,7 +639,6 @@ def test_explicit_no_inference_skip_resolves_context_without_provider_rerun(
         request_record,
         [],
         cell_selection,
-        enrichment_reference,
         [],
         [],
         {},
@@ -673,7 +651,6 @@ def test_explicit_no_inference_skip_resolves_context_without_provider_rerun(
         request_record,
         [],
         cell_selection,
-        enrichment_reference,
         [],
         [],
         {
@@ -801,7 +778,6 @@ def test_converted_input_preserves_exact_selection_and_typed_qc() -> None:
     request_record = inputs[1]
     request = request_record.request.model_copy(update={"sourcePath": "dataset.h5ad"})
     inputs[1] = request_record.model_copy(update={"request": request})
-    inputs[4] = inputs[4].model_copy(update={"outputs": {"format": "h5ad"}})
 
     plan = AgentOrchestrator(object()).build_preprocessing_plan(*inputs)
 
@@ -891,10 +867,10 @@ def test_percent_features_use_exact_symbols_even_when_enrichment_omits_a_family(
         "RNA_percentRibo",
     ]
     assert outcome.outputs["percentageDefinitions"] == [
-        {"family": "mitochondrial", "pattern": r"(?i)^MT-", "matchedGenes": 1},
+        {"family": "mitochondrial", "pattern": "^MT-", "matchedGenes": 1},
         {
             "family": "ribosomal",
-            "pattern": r"(?i)^(RPS|RPL|MRPS|MRPL)",
+            "pattern": "^RPS|^RPL|^MRPS|^MRPL",
             "matchedGenes": 1,
         },
     ]
@@ -976,6 +952,7 @@ def test_percent_features_use_exact_symbols_even_when_enrichment_omits_a_family(
         ),
         qc_actions,
         qc_operations,
+        selected_plan=experimental.cellQc,
     )
 
     filtered_status = store.inspect_artifact(filtered)
@@ -1193,6 +1170,7 @@ def test_selected_sample_mad_qc_passes_exact_artifact_sources(
         ),
         actions,
         operations,
+        selected_plan=experimental.cellQc,
     )
 
     assert result == output_selection
@@ -1337,6 +1315,7 @@ def test_cell_qc_artifact_and_execution_validation_edges() -> None:
             selection,
             [],
             [],
+            selected_plan=skip_plan,
         )
     with pytest.raises(ValueError, match="does not match"):
         orchestrator.apply_cell_qc(
@@ -1345,6 +1324,7 @@ def test_cell_qc_artifact_and_execution_validation_edges() -> None:
             selection,
             [],
             [],
+            selected_plan=skip_plan.model_copy(update={"driverAssay": "RNA"}),
         )
 
     global_profile = CellQcProfileEvidence(
@@ -1365,6 +1345,7 @@ def test_cell_qc_artifact_and_execution_validation_edges() -> None:
             selection,
             [],
             [],
+            selected_plan=global_plan,
         )
 
     sample_profile = CellQcProfileEvidence(
@@ -1395,6 +1376,7 @@ def test_cell_qc_artifact_and_execution_validation_edges() -> None:
             selection,
             [],
             [],
+            selected_plan=sample_plan,
         )
 
     actions: list[str] = []
@@ -1406,6 +1388,7 @@ def test_cell_qc_artifact_and_execution_validation_edges() -> None:
             selection,
             actions,
             operations,
+            selected_plan=skip_plan,
         )
         == selection
     )
@@ -1422,6 +1405,7 @@ def test_cell_qc_artifact_and_execution_validation_edges() -> None:
             selection,
             [],
             [],
+            selected_plan=invalid_global_plan,
         )
     invalid_sample_plan = sample_plan.model_copy(update={"sampleArtifact": None})
     invalid_sample_profile = sample_profile.model_copy(update={"sampleArtifact": None})
@@ -1432,6 +1416,7 @@ def test_cell_qc_artifact_and_execution_validation_edges() -> None:
             selection,
             [],
             [],
+            selected_plan=invalid_sample_plan,
         )
     unsupported_plan = skip_plan.model_copy(update={"action": "unsupported"})
     unsupported_profile = skip_profile.model_copy(update={"action": "unsupported"})
@@ -1442,6 +1427,37 @@ def test_cell_qc_artifact_and_execution_validation_edges() -> None:
             selection,
             [],
             [],
+            selected_plan=unsupported_plan,
+        )
+
+
+def test_preprocessing_executes_only_its_audited_cell_qc_plan() -> None:
+    from scarf.agent.decisions.rna import CellQualityExecutorPayload
+
+    plan = CellQcPlan(
+        action="globalGaussian",
+        profileId="global",
+        driverAssay="RNA",
+        driverAssayType="RNA",
+        attributes=["RNA_nCounts"],
+        evidenceIds=["qcProfile:global"],
+    )
+    payload = CellQualityExecutorPayload(
+        profile="coreGlobalGaussian",
+        groupByCapture=False,
+        pooledReference=False,
+        sensitivityOnly=False,
+    )
+    PreprocessingStagesMixin._require_audited_cell_qc(plan, payload)
+    with pytest.raises(ValueError, match="requires an audited cell-quality payload"):
+        PreprocessingStagesMixin._require_audited_cell_qc(plan, None)
+    with pytest.raises(ValueError, match="plan differs from its audited payload"):
+        PreprocessingStagesMixin._require_audited_cell_qc(
+            plan.model_copy(update={"action": "sampleMad"}), payload
+        )
+    with pytest.raises(ValueError, match="capture source differs"):
+        PreprocessingStagesMixin._require_audited_cell_qc(
+            plan.model_copy(update={"sampleColumn": "sample"}), payload
         )
 
 
@@ -1698,3 +1714,87 @@ def test_screening_coverage_leaves_masked_labels_out_of_every_group() -> None:
     assert groups["1"]["populationFraction"] == pytest.approx(20 / 60)
     assert groups["1"]["screeningFraction"] == pytest.approx(20 / 30)
     assert concerns == ["lane=2: 0 sampled of 20 cells"]
+
+
+def _rna_memory_journal():
+    from tests.agent_journal_store import memory_journal
+
+    store, prefix, record = memory_journal()
+    store.assay_names = ["RNA"]
+    store.zw.attrs["assayTypes"] = {"RNA": "RNA"}
+    record = record.model_copy(update={"inputIdentity": {}})
+    cells = ArtifactReferenceModel(
+        scope="datastore", kind="cell_selection", artifactId="a" * 64
+    )
+    return store, prefix, record, cells
+
+
+def test_failed_enrichment_report_is_not_replayed_on_resume(monkeypatch) -> None:
+    store, prefix, record, cells = _rna_memory_journal()
+    reports = [
+        DataEnrichmentReport(
+            status="failed",
+            limitations=["UnexpectedModelBehavior: Exceeded maximum output retries"],
+        ),
+        example(DataEnrichmentReport),
+    ]
+    calls: list[int] = []
+
+    class Agent:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def run(self, *args: Any, **kwargs: Any) -> DataEnrichmentReport:
+            calls.append(1)
+            return reports[len(calls) - 1]
+
+    monkeypatch.setattr(context_module, "DataEnrichmentAgent", Agent)
+    orchestrator = AgentOrchestrator(object())
+    workflow = WorkflowIdentity(record.workflowRunId)
+    first, _ = orchestrator.data_enrichment_stage(
+        store, workflow, record, [], cells, {}
+    )
+    second, report = orchestrator.data_enrichment_stage(
+        store, workflow, record, [], cells, {}
+    )
+    assert (first.status, second.status) == ("failed", "done")
+    assert "Exceeded maximum output retries" in first.error
+    assert first.reportReferences == []
+    assert report == reports[1]
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("answers", "stage"),
+    [
+        ({"dataEnrichmentContext": {"unknownContext": "value"}}, "data_enrichment"),
+        (
+            {"experimentalDirections": {"physicalCaptureColumn": "capture"}},
+            "experimental_context",
+        ),
+    ],
+)
+def test_invalid_answers_fail_before_a_stage_attempt_records_them(
+    monkeypatch, answers: dict[str, Any], stage: str
+) -> None:
+    store, prefix, record, cells = _rna_memory_journal()
+    monkeypatch.setattr(
+        context_module,
+        "DataEnrichmentAgent",
+        lambda *args, **kwargs: pytest.fail("Invalid answers must not run a model"),
+    )
+    orchestrator = AgentOrchestrator(object())
+    workflow = WorkflowIdentity(record.workflowRunId)
+    with pytest.raises(ValueError):
+        if stage == "data_enrichment":
+            orchestrator.data_enrichment_stage(
+                store, workflow, record, [], cells, answers
+            )
+        else:
+            orchestrator.experimental_context_stage(
+                store, workflow, record, [], cells, [], [], answers
+            )
+    assert (
+        journal_module._stage_starts(store.zw, prefix, record.workflowRunId, stage)
+        == []
+    )

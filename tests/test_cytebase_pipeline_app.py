@@ -411,8 +411,33 @@ def test_storage_opens_the_configured_bucket_with_the_worker_token(monkeypatch):
 
 def test_storage_requires_a_bucket(monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "hf_workerToken")
-    with pytest.raises(ValueError, match="CYTEBASE_BUCKET"):
+    with pytest.raises(
+        RuntimeError, match="Missing required environment variable: CYTEBASE_BUCKET$"
+    ):
         app._storage()
+
+
+def test_dev_storage_opens_the_dev_bucket(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "hf_workerToken")
+    monkeypatch.setenv("CYTEBASE_BUCKET_KEY", "CYTEBASE_BUCKET_DEV")
+    monkeypatch.setenv("CYTEBASE_BUCKET", BUCKET_ID)
+    monkeypatch.setenv("CYTEBASE_BUCKET_DEV", "test/cytebase-dev")
+    assert app._storage().bucket_id == "test/cytebase-dev"
+
+
+def test_dev_storage_never_falls_back_to_the_production_bucket(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "hf_workerToken")
+    monkeypatch.setenv("CYTEBASE_BUCKET_KEY", "CYTEBASE_BUCKET_DEV")
+    monkeypatch.setenv("CYTEBASE_BUCKET", BUCKET_ID)
+    with pytest.raises(RuntimeError, match="CYTEBASE_BUCKET_DEV"):
+        app._storage()
+
+
+@pytest.mark.parametrize("key", ["HF_TOKEN", "CYTEBASE_BUCKET_PROD", ""])
+def test_bucket_key_rejects_other_secret_keys(monkeypatch, key):
+    monkeypatch.setenv("CYTEBASE_BUCKET_KEY", key)
+    with pytest.raises(ValueError, match="CYTEBASE_BUCKET_KEY must be one of"):
+        app._bucket_key()
 
 
 def test_now_is_an_aware_utc_timestamp():

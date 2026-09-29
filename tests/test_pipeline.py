@@ -1,6 +1,7 @@
 import inspect
 import pickle
 from collections.abc import Mapping
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -89,6 +90,8 @@ def test_pipeline_field_display_summaries_read_stored_chunks() -> None:
             self.shape = values.shape
             self.dtype = values.dtype
             self.chunks = (chunk_rows, *values.shape[1:])
+            # Stored arrays expose their shard layout through metadata.
+            self.metadata = SimpleNamespace(shards=None)
             self.reads: list[slice] = []
 
         def __getitem__(self, key):
@@ -358,6 +361,7 @@ def test_pipeline_run_has_one_small_public_invocation() -> None:
         "doublets",
         "markers",
         "snapshot_columns",
+        "params",
         "callback",
     )
     assert tuple(inspect.signature(PipelineAccessor.open).parameters) == (
@@ -730,7 +734,7 @@ def test_pending_shutdown_propagates_when_interruption_cleanup_fails(
 
     monkeypatch.setattr(type(datastore.pipeline), "_execute_recipe", request_shutdown)
     monkeypatch.setattr(
-        "scarf.datastore.pipeline_accessor.load_pipeline_run_record",
+        "scarf.datastore._pipeline_ledger.load_pipeline_run_record",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             RuntimeError("cleanup bookkeeping failed")
         ),
@@ -1410,7 +1414,7 @@ def test_cluster_selection_adapter_rejects_detached_lineage() -> None:
         values={"values": np.asarray([0, 0, 1, 1], dtype=np.int32)},
         inputs={"graph": graph},
     )
-    with pytest.raises(ValueError, match="has no 'cell_selection' artifact input"):
+    with pytest.raises(ValueError, match="has no 'cell_selection' input"):
         _select_clusters(store, lineage, (("clusters", missing_selection),))
 
     malformed_selection = _array_artifact(
@@ -1423,7 +1427,7 @@ def test_cluster_selection_adapter_rejects_detached_lineage() -> None:
             "cell_selection": {"type": "artifact", "scope": "nope"},
         },
     )
-    with pytest.raises(ValueError, match="malformed 'cell_selection' artifact input"):
+    with pytest.raises(ValueError, match="malformed 'cell_selection' input"):
         _select_clusters(store, lineage, (("clusters", malformed_selection),))
 
     paris_cut = _array_artifact(
@@ -1728,3 +1732,19 @@ def test_paris_only_pipeline_keeps_paris_as_a_diagnostic_without_clusters(
     assert "cluster_selection" not in run
     assert "leiden_1.0" not in run
     assert list(run).count("paris") == 1
+
+
+def test_pipeline_run_cells_fetch_live_ids_and_the_frozen_selection(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    run = datastore.pipeline.run(**_minimal_run_options())
+
+    ids = run.cells.fetch_all("ids")
+    np.testing.assert_array_equal(ids, datastore.cells.fetch_all("ids"))
+    selection = run.cells.fetch_all("I")
+    assert selection.dtype == np.dtype(bool)
+    assert selection.shape == ids.shape
+    np.testing.assert_array_equal(run.cells.fetch("ids"), ids[selection])
+    with pytest.raises(TypeError, match="non-empty string"):
+        run.cells.fetch_all("")

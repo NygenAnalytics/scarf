@@ -11,7 +11,8 @@ from scarf.storage.artifacts import ArtifactRef
 from scarf.storage.budget import ResourceBudget
 from scarf.storage.sharding import write_counts_t
 from scarf.utils.arrays import array_digest
-from scarf.writers import create_cell_data, create_zarr_count_assay
+from scarf.storage.schema import create_cell_data
+from scarf.writers import create_zarr_count_assay
 
 pytestmark = pytest.mark.slow
 
@@ -413,6 +414,22 @@ def test_enrichment_loader_is_read_only_and_validates_artifact(
     with pytest.raises(ValueError, match="unknown method"):
         datastore_ephemeral.get_enrichment(ref)
     group.attrs["method"] = "waggr"
+    for name in ("dropped_ambiguous_targets", "layout"):
+        value = group.attrs[name]
+        del group.attrs[name]
+        with pytest.raises(ValueError, match="missing required metadata"):
+            datastore_ephemeral.get_enrichment(ref)
+        group.attrs[name] = value
+    for name, value, message in (
+        ("layout", "rows", "unsupported layout"),
+        ("dropped_ambiguous_targets", [""], "invalid dropped_ambiguous_targets"),
+        ("complete", False, "missing or incomplete"),
+    ):
+        original = group.attrs[name]
+        group.attrs[name] = value
+        with pytest.raises(ValueError, match=message):
+            datastore_ephemeral.get_enrichment(ref)
+        group.attrs[name] = original
 
     read_only = DataStore(
         datastore_ephemeral.zarr_loc,
@@ -493,9 +510,9 @@ def test_workspace_results_live_in_the_assay_artifact_tree(tmp_path) -> None:
         ],
         dtype=np.uint32,
     )
-    from scarf.storage.identity import finalize_counts
+    from tests.storage_helpers import finalize_test_counts
 
-    finalize_counts(counts)
+    finalize_test_counts(counts)
     write_counts_t(
         counts,
         root["matrices/RNA"],

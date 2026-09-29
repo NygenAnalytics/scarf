@@ -137,6 +137,49 @@ def test_context_details_restore_exact_capture_bounds_and_missingness(monkeypatc
         )
 
 
+def test_sample_mad_details_return_only_the_requested_sample_bounds():
+    import asyncio
+
+    bounds = {
+        "s1": {"counts": {"low": 10.0, "high": 90.0}},
+        "s2": {"counts": {"low": 12.0, "high": 95.0}},
+    }
+    sample_profile = CellQcProfileEvidence(
+        profileId="sample-policy",
+        action="sampleMad",
+        attributes=["counts"],
+        sampleColumn="sample",
+        resolvedBounds=bounds,
+    )
+    global_profile = CellQcProfileEvidence(
+        profileId="global-policy",
+        action="globalGaussian",
+        attributes=["counts"],
+        resolvedBounds={"counts": {"low": 11.0, "high": 92.0}},
+    )
+    deps = ExperimentalContextDependencies(
+        characterization=CovariateCharacterization(status="done"),
+        qcProfiles={
+            profile.profileId: profile for profile in (sample_profile, global_profile)
+        },
+    )
+    context = SimpleNamespace(deps=deps)
+
+    detail = asyncio.run(
+        tools.inspect_context_evidence(context, "qcProfile", "sample-policy", "s2")
+    )
+    assert detail == {
+        "profileId": "sample-policy",
+        "capture": None,
+        "resolvedBounds": bounds["s2"],
+    }
+    for record_id, sample in (("sample-policy", "s3"), ("global-policy", "s1")):
+        with pytest.raises(ModelRetry, match="Choose one capture"):
+            asyncio.run(
+                tools.inspect_context_evidence(context, "qcProfile", record_id, sample)
+            )
+
+
 def test_compact_context_keeps_repeated_donor_failures_and_full_details():
     import asyncio
 
@@ -256,8 +299,8 @@ def test_exact_context_characterization_reuses_work_and_invalidates_changes(
 def test_context_identity_binds_added_columns_without_repeating_resume_scan(
     monkeypatch,
 ):
+    from scarf.agent.orchestrator import context as orchestrator_context
     from scarf.agent.orchestrator.context import _context_metadata_identity
-    from scarf.agent.parameter_tuning import execution
 
     values = {"capture": "first"}
     measured = []
@@ -266,7 +309,9 @@ def test_context_identity_binds_added_columns_without_repeating_resume_scan(
         measured.append(column)
         return values[column]
 
-    monkeypatch.setattr(execution, "_metadata_column_fingerprint", fingerprint)
+    monkeypatch.setattr(
+        orchestrator_context, "metadata_column_fingerprint", fingerprint
+    )
     store = SimpleNamespace(
         cells=SimpleNamespace(
             columns=["original", "capture", "ids", "RNA_nCounts", "RNA_nFeatures"]

@@ -3,8 +3,9 @@ from typing import Any, Literal
 import numpy as np
 import pandas as pd
 
-from ..utils.arrays import regex_match_mask
+from ..utils.arrays import regex_match_mask, within_bounds
 from ..utils.logging import logger
+from .gene_families import GENE_FAMILY_PATTERNS
 
 __all__ = [
     "DEFAULT_HVG_BLACKLIST",
@@ -15,12 +16,14 @@ __all__ = [
 
 _ADAPTIVE_MIN_SUPPORT = 50
 _ADAPTIVE_QUANTILE = 0.25
+# Largest gradient entry at which a local fit whose line search stopped counts as
+# converged. Gradient entries of the weighted data term never exceed 0.75, so one
+# absolute bound suits every window.
+_STALLED_FIT_GRADIENT = float(np.sqrt(np.finfo(np.float64).eps))
 
-# Patterns match names case-insensitively unless a scoped regex flag overrides it.
-DEFAULT_HVG_BLACKLIST = (
-    "^MT-|^RPS|^RPL|^MRPS|^MRPL|^CCN|^HLA-|^H2-|^HIST|"
-    "^XIST$|^DDX3Y$|^USP9Y$|^EIF1AY$|^KDM5D$|^SRY$|^ZFY$|^UTY$|^TMSB4Y$|^NLGN4Y$"
-)
+# Excludes every registered gene family. Patterns match names case-insensitively
+# unless a scoped regex flag overrides it.
+DEFAULT_HVG_BLACKLIST = "|".join(GENE_FAMILY_PATTERNS.values())
 HVG_UBIQUITOUS_SLACK = 20
 
 
@@ -81,7 +84,13 @@ def _fit_local_quantile(
             method="L-BFGS-B",
             options={"ftol": 1e-15, "gtol": 1e-10, "maxiter": 300, "maxls": 50},
         )
-        if not result.success or not np.all(np.isfinite(result.x)):
+        # The line search stops (status 2) when the fit already sits at the optimum
+        # to machine precision, which depends on the scipy version and BLAS
+        # threading. Accept that stop only once the gradient has vanished.
+        stalled = (
+            result.status == 2 and np.max(np.abs(result.jac)) <= _STALLED_FIT_GRADIENT
+        )
+        if not (result.success or stalled) or not np.all(np.isfinite(result.x)):
             raise ValueError(f"Adaptive variance trend fit failed: {result.message}")
 
         # Continue linearly outside the interior support instead of extrapolating
@@ -115,16 +124,30 @@ def _fit_local_quantile(
     return float(prediction)
 
 
+def _trend_inputs(
+    a: np.ndarray,
+    b: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return float means and variances and where both are finite and positive.
+
+    Only those genes enter a trend fit; the others receive a corrected value of
+    zero.
+    """
+    means = np.asarray(a, dtype=float)
+    variances = np.asarray(b, dtype=float)
+    if means.ndim != 1 or variances.ndim != 1 or means.shape != variances.shape:
+        raise ValueError("LOWESS inputs must be one-dimensional arrays of equal length")
+    valid = np.isfinite(means) & np.isfinite(variances) & (means > 0) & (variances > 0)
+    return means, variances, valid
+
+
 def _fit_lowess_adaptive(
     a: np.ndarray,
     b: np.ndarray,
     n_bins: int,
     lowess_frac: float,
 ) -> np.ndarray:
-    means = np.asarray(a, dtype=float)
-    variances = np.asarray(b, dtype=float)
-    if means.ndim != 1 or variances.ndim != 1 or means.shape != variances.shape:
-        raise ValueError("LOWESS inputs must be one-dimensional arrays of equal length")
+    means, variances, valid = _trend_inputs(a, b)
     if isinstance(n_bins, (bool, np.bool_)) or not isinstance(
         n_bins,
         (int, np.integer),
@@ -141,7 +164,6 @@ def _fit_lowess_adaptive(
         raise ValueError("lowess_frac must be between 0 and 1")
 
     corrected = np.zeros(means.shape, dtype=float)
-    valid = np.isfinite(means) & np.isfinite(variances) & (means > 0) & (variances > 0)
     if not valid.any():
         return corrected
     if valid.sum() < 3:
@@ -247,15 +269,26 @@ def fit_lowess(
     range. Minimum support is 50 genes, or 8 where smooth curvature warrants it.
     Smaller inputs use all available genes. The background is the lower quartile.
     Fixed fits use LOWESS over the minimum-variance gene in each equal-width bin.
+    Both strategies fit only genes whose mean and variance are finite and
+    positive; every other gene receives zero.
     """
     if bin_strategy == "adaptive":
-        return _fit_lowess_adaptive(a, b, n_bins, lowess_frac)
+        from threadpoolctl import threadpool_limits
+
+        # The adaptive fit solves many tiny least-squares problems, where extra
+        # BLAS threads cost far more in synchronization than they save.
+        with threadpool_limits(limits=1, user_api="blas"):
+            return _fit_lowess_adaptive(a, b, n_bins, lowess_frac)
     if bin_strategy != "fixed":
         raise ValueError("bin_strategy must be either 'fixed' or 'adaptive'")
 
     from statsmodels.nonparametric.smoothers_lowess import lowess
 
-    stats = pd.DataFrame({"a": a, "b": b}).apply(np.log)
+    means, variances, valid = _trend_inputs(a, b)
+    corrected = np.zeros(means.shape, dtype=float)
+    if not valid.any():
+        return corrected
+    stats = pd.DataFrame({"a": means[valid], "b": variances[valid]}).apply(np.log)
     bin_edges = np.histogram(stats.a, bins=n_bins)[1]
     bin_edges[-1] += 0.1
     bin_idx: list[list[Any]] = []
@@ -282,19 +315,8 @@ def fit_lowess(
     for correction, indices in zip(bin_cor_fac, bin_idx):
         for idx in indices:
             fixed_var[idx] = np.e ** (stats.b[idx] - correction)
-    return np.array([fixed_var[index] for index in range(len(a))])
-
-
-def _bounded(
-    values: np.ndarray,
-    lower: float,
-    upper: float,
-    *,
-    keep_bounds: bool,
-) -> np.ndarray:
-    if keep_bounds:
-        return (values >= lower) & (values <= upper)
-    return (values > lower) & (values < upper)
+    corrected[valid] = [fixed_var[index] for index in range(len(stats))]
+    return corrected
 
 
 def _linear_threshold(value: float, unbounded_value: float) -> float:
@@ -356,7 +378,7 @@ def select_highly_variable_features(
     )
     candidates = (
         cell_count_candidates
-        & _bounded(mean_nonzero, min_mean, max_mean, keep_bounds=keep_bounds)
+        & within_bounds(mean_nonzero, min_mean, max_mean, keep_bounds=keep_bounds)
         & active_features
         & allowed
     )
@@ -392,9 +414,9 @@ def select_highly_variable_features(
         selected[ranked[:top_n]] = True
         return np.asarray(
             selected
-            & _bounded(
+            & within_bounds(
                 corrected_variance,
-                -np.inf,
+                None,
                 max_var,
                 keep_bounds=keep_bounds,
             ),
@@ -403,7 +425,7 @@ def select_highly_variable_features(
 
     return np.asarray(
         candidates
-        & _bounded(
+        & within_bounds(
             corrected_variance,
             min_var,
             max_var,

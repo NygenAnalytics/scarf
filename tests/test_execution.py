@@ -6,7 +6,7 @@ from scarf.storage.execution import (
     ExecutionReport,
     WorkShape,
     auto_read_width,
-    last_execution_report,
+    execution_report_scope,
     plan_operation,
 )
 from scarf.storage.io_policy import StorageIoPolicy
@@ -204,19 +204,20 @@ def test_map_feature_process_is_not_on_event_loop_thread() -> None:
             on_loop.append(True)
         return group.featStart
 
-    starts = list(
-        map_feature_read_groups(
-            counts_t,
-            process,
-            resources=ResourceBudget(8 * 1024 * 1024, 2),
-            io=StorageIoPolicy(readWorkers=2),
+    with execution_report_scope() as reports:
+        starts = list(
+            map_feature_read_groups(
+                counts_t,
+                process,
+                resources=ResourceBudget(8 * 1024 * 1024, 2),
+                io=StorageIoPolicy(readWorkers=2),
+            )
         )
-    )
     assert starts
     assert on_loop
     assert not any(on_loop)
-    report = last_execution_report()
-    assert report is not None
+    assert reports
+    report = reports[-1]
     assert report.unitKind == "countsTReadGroup"
     assert report.unitsCompleted == len(starts)
     assert report.fetchSeconds >= 0.0
@@ -302,17 +303,18 @@ def test_write_counts_t_records_execution_report() -> None:
     counts[:] = values
     persist_count_matrix_plan(group, layout)
     persist_count_matrix_plan(counts, layout)
-    from scarf.storage.identity import finalize_counts
+    from tests.storage_helpers import finalize_test_counts
 
-    finalize_counts(counts)
-    write_counts_t(
-        counts,
-        group,
-        policy=policy,
-        resources=ResourceBudget(16 * 1024 * 1024, 4),
-    )
-    report = last_execution_report()
-    assert report is not None
+    finalize_test_counts(counts)
+    with execution_report_scope() as reports:
+        write_counts_t(
+            counts,
+            group,
+            policy=policy,
+            resources=ResourceBudget(16 * 1024 * 1024, 4),
+        )
+    assert reports
+    report = reports[-1]
     assert report.unitKind == "countsRowShard"
     assert report.plan.reservedBytes <= 16 * 1024 * 1024
     np.testing.assert_array_equal(np.asarray(group["countsT"][:]), values.T)
@@ -354,17 +356,18 @@ def test_recorded_report_includes_external_limits(
         ResourceBudget(8 * 1024 * 1024, 4),
         WorkShape(nUnits=8, unitBytes=1024),
     )
-    report = record_execution_report(
-        ExecutionReport(
-            plan=plan,
-            unitKind="countsRowBlock",
-            actualReadWorkers=plan.readWorkers,
-            actualComputeWorkers=plan.computeWorkers,
-            actualWriteWorkers=1,
+    with execution_report_scope() as reports:
+        report = record_execution_report(
+            ExecutionReport(
+                plan=plan,
+                unitKind="countsRowBlock",
+                actualReadWorkers=plan.readWorkers,
+                actualComputeWorkers=plan.computeWorkers,
+                actualWriteWorkers=1,
+            )
         )
-    )
     assert report.extra["externalLimits"]["NUMBA_NUM_THREADS"] == 2
-    assert last_execution_report() is report
+    assert reports == [report]
 
 
 def test_write_sparse_bands_records_plan_and_respects_write_ceiling() -> None:
@@ -403,16 +406,20 @@ def test_write_sparse_bands_records_plan_and_respects_write_ceiling() -> None:
                 ),
             )
 
-    write_sparse_bands(
-        writes(),
-        resources=ResourceBudget(2 * 1024 * 1024, 4),
-        io=StorageIoPolicy(writeWorkers=1),
-    )
-    report = last_execution_report()
-    assert report is not None
-    assert report.unitKind == "countsImportBand"
+    with execution_report_scope() as reports:
+        write_sparse_bands(
+            writes(),
+            resources=ResourceBudget(2 * 1024 * 1024, 4),
+            io=StorageIoPolicy(writeWorkers=1),
+        )
+    import_reports = [r for r in reports if r.unitKind == "countsImportBand"]
+    assert len(import_reports) == 1
+    report = import_reports[0]
     assert report.plan.writeWorkers == 1
     assert report.actualWriteWorkers <= 1
+    # One writer admits one band per batch, and the import reports them once.
+    assert report.unitsCompleted == 2
+    assert report.extra["batches"] == 2
     np.testing.assert_array_equal(destination[:], expected)
 
 
@@ -438,11 +445,12 @@ def test_chunked_row_stream_uses_shared_plan() -> None:
         resources=ResourceBudget(4 * 1024 * 1024, 8),
     )
     matrix._io = StorageIoPolicy(readWorkers=2, computeWorkers=1)
-    blocks = list(matrix.stream_blocks())
+    with execution_report_scope() as reports:
+        blocks = list(matrix.stream_blocks())
     assert blocks
     np.testing.assert_array_equal(np.vstack(blocks), values)
-    report = last_execution_report()
-    assert report is not None
+    assert reports
+    report = reports[-1]
     assert report.unitKind == "countsRowBlock"
     assert report.plan.readWorkers <= 2
     assert report.plan.computeWorkers == 1
@@ -465,11 +473,12 @@ def test_h5ad_import_records_execution_report(tmp_path) -> None:  # type: ignore
             nthreads=2,
             io=StorageIoPolicy(writeWorkers=1),
         )
-        writer.dump()
+        with execution_report_scope() as reports:
+            writer.dump()
     finally:
         reader.h5.close()
-    report = last_execution_report()
-    assert report is not None
+    assert reports
+    report = reports[-1]
     assert report.unitKind in {"countsImportBand", "countsRowShard"}
     assert report.plan.writeWorkers <= 2
     assert report.actualWriteWorkers <= 2
@@ -491,46 +500,28 @@ def _dummy_report(unitKind: str) -> ExecutionReport:
 
 def test_execution_reports_collect_by_kind_and_scope() -> None:
     from scarf.storage.execution import (
-        clear_execution_reports,
-        execution_report_scope,
         execution_reports_by_kind,
         record_execution_report,
-        recorded_execution_reports,
     )
 
-    clear_execution_reports()
     first = record_execution_report(_dummy_report("countsTCellBand"))
     with execution_report_scope() as scoped:
         second = record_execution_report(_dummy_report("countsTReadGroup"))
         third = record_execution_report(_dummy_report("countsTCellBand"))
-    assert last_execution_report() is third
-    assert recorded_execution_reports() == (first, second, third)
     assert scoped == [second, third]
-    grouped = execution_reports_by_kind(recorded_execution_reports())
+    grouped = execution_reports_by_kind([first, *scoped])
     assert [item["unitKind"] for item in grouped["countsTCellBand"]] == [
         "countsTCellBand",
         "countsTCellBand",
     ]
     assert len(grouped["countsTReadGroup"]) == 1
-    clear_execution_reports()
-    assert last_execution_report() is None
-    assert recorded_execution_reports() == ()
 
 
 def test_feature_consume_details_uses_matching_kind_after_later_reports() -> None:
-    from scarf.storage.execution import (
-        clear_execution_reports,
-        record_execution_report,
-    )
-
     from profiling.stages import _feature_consume_details
-    from profiling.config import StageResources, WorkflowParameters
+    from profiling.config import StageResources
 
-    clear_execution_reports()
-    record_execution_report(_dummy_report("countsTCellBand"))
-    record_execution_report(_dummy_report("countsRowBlock"))
     payload = _feature_consume_details(
-        WorkflowParameters(),
         StageResources(
             modalMemoryRequestMb=1024,
             modalMemoryLimitMb=1024,
@@ -541,10 +532,10 @@ def test_feature_consume_details_uses_matching_kind_after_later_reports() -> Non
             timeoutSeconds=60,
             ephemeralDiskMb=1024,
         ),
+        [_dummy_report("countsTCellBand"), _dummy_report("countsRowBlock")],
         unitKind="countsTCellBand",
     )
     assert payload["unitKind"] == "countsTCellBand"
-    clear_execution_reports()
 
 
 def test_pairwise_merge_tree_is_independent_of_completion_order() -> None:
@@ -626,3 +617,29 @@ def test_plan_operation_error_and_reason_branches() -> None:
     )
     assert compute_capped.reductionReason is not None
     assert "compute workers used" in compute_capped.reductionReason
+
+
+def test_execution_report_scopes_close_exactly_and_follow_the_context() -> None:
+    import threading
+
+    from scarf.storage.execution import execution_report_scope, record_execution_report
+
+    outer_scope = execution_report_scope()
+    outer = outer_scope.__enter__()
+    inner_scope = execution_report_scope()
+    inner = inner_scope.__enter__()
+    # Scopes may close out of order; each removes only itself.
+    outer_scope.__exit__(None, None, None)
+    report = record_execution_report(_dummy_report("countsRowBlock"))
+    inner_scope.__exit__(None, None, None)
+    record_execution_report(_dummy_report("countsRowBlock"))
+    assert outer == []
+    assert inner == [report]
+
+    with execution_report_scope() as scoped:
+        thread = threading.Thread(
+            target=record_execution_report, args=(_dummy_report("countsRowBlock"),)
+        )
+        thread.start()
+        thread.join()
+    assert scoped == []

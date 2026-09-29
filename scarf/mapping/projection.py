@@ -12,16 +12,17 @@ from ..storage.artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
     PlannedArtifact,
+    discard_artifact,
     finish_artifact,
     plan_artifact,
     start_artifact,
 )
 from ..storage.artifacts import (
     ArtifactRef,
+    ArtifactStatus,
     ExternalArtifactRef,
     ValueFingerprintBuilder,
     artifact_group,
-    canonical_bytes,
     fingerprint_array,
     fingerprint_stored_arrays,
     inspect_artifact,
@@ -32,10 +33,16 @@ from ..storage.geometry import array_geometry
 from ..storage.identity import read_dataset_fingerprint
 from ..storage.partition import row_band
 from ..storage.profiles import StorageProfile
-from ..storage.selections import validate_stored_selection_integrity
+from ..storage.selections import validate_cell_selection
 from ..storage.types import as_zarr_array, as_zarr_group
+from ..utils.arguments import integer_argument
 from .models import MappingResult, _MappingResultAxes
-from .reference import MappingReference
+from .reference import (
+    MappingReference,
+    contract_error,
+    iter_feature_selection_blocks,
+    payload_fingerprint,
+)
 
 PROJECTION_RERUN_MESSAGE = "Re-run run_mapping to create a new query projection."
 NO_QUERY_BATCH_FINGERPRINT = fingerprint_array(np.empty(0, dtype=np.int64))
@@ -118,7 +125,7 @@ class ProjectionWriter:
             raise TypeError("plan must be a ProjectionPlan")
         if plan.reused:
             raise ValueError("A reused projection plan must be loaded without a writer")
-        resolved_chunk_rows = _positive_int(chunk_rows, "chunk_rows")
+        resolved_chunk_rows = integer_argument(chunk_rows, "chunk_rows", minimum=1)
         self._root = root
         self._plan = plan
         self._next_row = 0
@@ -153,8 +160,7 @@ class ProjectionWriter:
                 profile=profile,
             )
         except BaseException:
-            self._group.attrs["complete"] = False
-            self._aborted = True
+            self._discard()
             raise
 
     @property
@@ -162,16 +168,8 @@ class ProjectionWriter:
         return self._plan.ref
 
     @property
-    def next_row(self) -> int:
-        return self._next_row
-
-    @property
     def finished(self) -> bool:
         return self._finished
-
-    @property
-    def aborted(self) -> bool:
-        return self._aborted
 
     def write_block(
         self,
@@ -232,8 +230,7 @@ class ProjectionWriter:
             self._next_row = stop
             self._uninformative_count += int(np.count_nonzero(uninformative_values))
         except BaseException:
-            self._group.attrs["complete"] = False
-            self._aborted = True
+            self._discard()
             raise
 
     def finish(self, diagnostics: Mapping[str, Any]) -> ArtifactRef:
@@ -260,18 +257,21 @@ class ProjectionWriter:
             )
             finish_artifact(self._group, self._plan.artifact)
         except BaseException:
-            self._group.attrs["complete"] = False
-            self._aborted = True
+            self._discard()
             raise
         self._finished = True
         return self._plan.ref
 
     def abort(self) -> None:
-        """Leave an unfinished projection explicitly incomplete."""
+        """Delete an unfinished projection's incomplete artifact."""
         if self._finished:
             raise RuntimeError("A completed projection artifact cannot be aborted")
-        self._group.attrs["complete"] = False
-        self._aborted = True
+        self._discard()
+
+    def _discard(self) -> None:
+        if not self._aborted:
+            self._aborted = True
+            discard_artifact(self._root, self._plan.artifact)
 
     def _require_open(self) -> None:
         if self._finished:
@@ -300,11 +300,10 @@ def plan_projection(
 ) -> ProjectionPlan:
     """Plan one immutable query-owned projection."""
     assay = _nonempty_string(query_assay, "query_assay")
-    resolved_n_cells = _positive_int(n_cells, "n_cells")
-    resolved_save_k = _positive_int(save_k, "save_k")
-    resolved_reference_cell_count = _positive_int(
-        reference_cell_count,
-        "reference_cell_count",
+    resolved_n_cells = integer_argument(n_cells, "n_cells", minimum=1)
+    resolved_save_k = integer_argument(save_k, "save_k", minimum=1)
+    resolved_reference_cell_count = integer_argument(
+        reference_cell_count, "reference_cell_count", minimum=1
     )
     policy = _nonempty_string(missing_feature_policy, "missing_feature_policy")
     if policy not in {"reference_mean", "zero", "error"}:
@@ -322,9 +321,8 @@ def plan_projection(
         query_batch_fingerprint,
         "query_batch_fingerprint",
     )
-    resolved_query_batch_count = _positive_int(
-        query_batch_count,
-        "query_batch_count",
+    resolved_query_batch_count = integer_argument(
+        query_batch_count, "query_batch_count", minimum=1
     )
     if resolved_query_batch_count > resolved_n_cells:
         raise ValueError("query_batch_count cannot exceed n_cells")
@@ -339,10 +337,7 @@ def plan_projection(
     expected_correction = "symphony" if reference.method == "symphony" else "none"
     if correction != expected_correction:
         raise ValueError("correction_method does not match reference")
-    validated_cells = _validate_cell_selection(
-        root,
-        cell_selection,
-    )
+    validated_cells = validate_cell_selection(root, cell_selection)
     if validated_cells.selected_count != resolved_n_cells:
         raise ValueError("n_cells must equal the selected row count in cell_selection")
     feature_coverage = _validate_mapping_overlap_selection(
@@ -446,8 +441,8 @@ def load_projection(
         )
     except ArtifactResolutionError:
         raise
-    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
-        raise _contract_error(str(exc)) from None
+    except (KeyError, TypeError, ValueError) as exc:
+        raise contract_error(str(exc), PROJECTION_RERUN_MESSAGE) from exc
 
 
 def _load_projection(
@@ -475,7 +470,7 @@ def _load_projection(
         parameter_names = parameter_names | {"query_batch_model"}
     if set(parameters) != parameter_names:
         raise ValueError("Projection parameters do not match the map_query contract")
-    save_k = _positive_int(parameters["save_k"], "save_k")
+    save_k = integer_argument(parameters["save_k"], "save_k", minimum=1)
     policy = _nonempty_string(
         parameters["missing_feature_policy"],
         "missing_feature_policy",
@@ -493,14 +488,14 @@ def _load_projection(
     if set(inputs) != _INPUT_NAMES:
         raise ValueError("Projection inputs do not match the map_query contract")
     cell_selection = _local_ref_from_input(
-        inputs,
+        status,
         "cell_selection",
         kind="cell_selection",
         scope="datastore",
         assay=None,
     )
     feature_selection = _local_ref_from_input(
-        inputs,
+        status,
         "feature_selection",
         kind="feature_selection",
         scope="assay",
@@ -514,9 +509,8 @@ def _load_projection(
         inputs["query_batch_fingerprint"],
         "query_batch_fingerprint",
     )
-    query_batch_count = _positive_int(
-        inputs["query_batch_count"],
-        "query_batch_count",
+    query_batch_count = integer_argument(
+        inputs["query_batch_count"], "query_batch_count", minimum=1
     )
     raw_external = inputs["mapping_reference"]
     if not isinstance(raw_external, Mapping):
@@ -536,15 +530,13 @@ def _load_projection(
         raise ValueError(
             "Projection correction method does not match its mapping reference"
         )
-    reference_cell_count = _positive_int(
+    reference_cell_count = integer_argument(
         reference.selected_cell_count,
         "Mapping reference selected_cell_count",
+        minimum=1,
     )
     _validate_query_dataset_fingerprint(root, assay, query_dataset_fingerprint)
-    validated_cells = _validate_cell_selection(
-        root,
-        cell_selection,
-    )
+    validated_cells = validate_cell_selection(root, cell_selection)
     feature_coverage = _validate_mapping_overlap_selection(
         root,
         assay,
@@ -714,13 +706,7 @@ def _payload_fingerprint(
         array_fingerprint = fingerprint_stored_arrays(
             group, tuple(sorted(_ARRAY_NAMES))
         )
-    builder = ValueFingerprintBuilder()
-    builder.update_bytes(
-        "arrays",
-        array_fingerprint.encode(),
-    )
-    builder.update_bytes("diagnostics", canonical_bytes(diagnostics))
-    return builder.hexdigest()
+    return payload_fingerprint(array_fingerprint, "diagnostics", diagnostics)
 
 
 def _validated_diagnostics(
@@ -755,9 +741,8 @@ def _validated_diagnostics(
         atol=np.finfo(np.float64).eps,
     ):
         raise ValueError("featureCoverage does not match the reference overlap")
-    query_batch_count = _positive_int(
-        diagnostics["queryBatchCount"],
-        "queryBatchCount",
+    query_batch_count = integer_argument(
+        diagnostics["queryBatchCount"], "queryBatchCount", minimum=1
     )
     if query_batch_count > n_cells:
         raise ValueError("queryBatchCount cannot exceed the projection cell count")
@@ -775,9 +760,8 @@ def _validated_diagnostics(
         and algorithm_variant != expected_algorithm_variant
     ):
         raise ValueError("algorithmVariant does not match the correction method")
-    uninformative_cell_count = _nonnegative_int(
-        diagnostics["uninformativeCellCount"],
-        "uninformativeCellCount",
+    uninformative_cell_count = integer_argument(
+        diagnostics["uninformativeCellCount"], "uninformativeCellCount", minimum=0
     )
     if uninformative_cell_count > n_cells:
         raise ValueError(
@@ -869,32 +853,16 @@ def _validate_mapping_overlap_selection(
         raise ValueError("Mapping reference feature identifiers are malformed")
     reference_ids = raw_reference_ids.astype(str)
     reference_id_set = set(reference_ids.tolist())
-    feature_ids = as_zarr_array(
-        root[f"{assay}/featureData/ids"],
-        name=f"{assay}/featureData/ids",
-    )
-    values = as_zarr_array(
-        artifact_group(root, ref)["values"],
-        name="feature_selection.values",
-    )
-    block_rows = min(
-        row_band(array_geometry(feature_ids), unit="chunk", fallback=1),
-        row_band(array_geometry(values), unit="chunk", fallback=1),
-    )
     overlap_count = 0
-    for start in range(0, int(feature_ids.shape[0]), block_rows):
-        stop = min(start + block_rows, int(feature_ids.shape[0]))
-        query_ids = np.asarray(feature_ids[start:stop]).astype(str)
+    for ids, mask in iter_feature_selection_blocks(root, assay, ref):
+        query_ids = ids.astype(str)
         expected = np.fromiter(
             (identifier in reference_id_set for identifier in query_ids),
             dtype=bool,
             count=len(query_ids),
         )
         overlap_count += int(np.count_nonzero(expected))
-        if not np.array_equal(
-            np.asarray(values[start:stop], dtype=bool),
-            expected,
-        ):
+        if not np.array_equal(mask, expected):
             raise ValueError(
                 "Projection feature selection does not match the reference overlap"
             )
@@ -904,67 +872,17 @@ def _validate_mapping_overlap_selection(
 
 
 def _local_ref_from_input(
-    inputs: Mapping[str, Any],
+    status: ArtifactStatus,
     name: str,
     *,
     kind: str,
     scope: str,
     assay: str | None,
 ) -> ArtifactRef:
-    raw_ref = inputs[name]
-    if not isinstance(raw_ref, Mapping):
-        raise TypeError(f"Projection input {name!r} must be an ArtifactRef")
-    expected_keys = {"type", "scope", "kind", "artifact_id"}
-    if scope == "assay":
-        expected_keys.add("assay")
-    if set(raw_ref) != expected_keys:
-        raise ValueError(f"Projection input {name!r} is malformed")
-    ref = ArtifactRef.from_dict(raw_ref)
+    ref = status.input_ref(name)
     if ref.kind != kind or ref.scope != scope or ref.assay != assay:
         raise ValueError(f"Projection input {name!r} has the wrong kind or scope")
     return ref
-
-
-def _validate_local_selection(
-    root: zarr.Group,
-    ref: ArtifactRef,
-    *,
-    kind: str,
-    scope: str,
-    assay: str | None,
-) -> None:
-    if not isinstance(ref, ArtifactRef):
-        raise TypeError(f"{kind} must be an ArtifactRef")
-    if ref.kind != kind or ref.scope != scope or ref.assay != assay:
-        raise ValueError(f"{kind} has the wrong artifact kind or scope")
-    status = inspect_artifact(root, ref)
-    if not status.exists or not status.complete:
-        raise ValueError(f"{kind} must be a complete local artifact")
-    values = as_zarr_array(
-        artifact_group(root, ref)["values"],
-        name=f"{kind}.values",
-    )
-    if values.ndim != 1 or np.dtype(values.dtype) != np.dtype(bool):
-        raise TypeError(f"{kind} values must be a boolean row vector")
-
-
-def _validate_cell_selection(root: zarr.Group, ref: ArtifactRef) -> Any:
-    """Validate a query selection against its immutable payload and row axis."""
-    _validate_local_selection(
-        root,
-        ref,
-        kind="cell_selection",
-        scope="datastore",
-        assay=None,
-    )
-    return validate_stored_selection_integrity(
-        root,
-        ref,
-        kind="cell_selection",
-        scope="datastore",
-        assay=None,
-        table_path="cellData",
-    )
 
 
 def _created_at_ns(group: zarr.Group) -> int:
@@ -982,23 +900,3 @@ def _nonempty_string(value: Any, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise TypeError(f"{name} must be a non-empty string")
     return value
-
-
-def _positive_int(value: Any, name: str) -> int:
-    resolved = _nonnegative_int(value, name)
-    if resolved < 1:
-        raise ValueError(f"{name} must be positive")
-    return resolved
-
-
-def _nonnegative_int(value: Any, name: str) -> int:
-    if isinstance(value, bool | np.bool_) or not isinstance(value, int | np.integer):
-        raise TypeError(f"{name} must be an integer")
-    resolved = int(value)
-    if resolved < 0:
-        raise ValueError(f"{name} must be non-negative")
-    return resolved
-
-
-def _contract_error(detail: str) -> ValueError:
-    return ValueError(f"{detail}. {PROJECTION_RERUN_MESSAGE}")

@@ -52,11 +52,11 @@ contain modality weights.
 Store-backed plotters and diagnostics generally return a `PlotResult` and render by default with `show=True`.
 Pass `show=False` before accessing, saving, or reusing an owned figure.
 `run_recipe` returns a `PlotRecipeResult` and defaults to `show=False`.
-Helpers differ: `label_panels` and `register_theme` return `None`, `collect_legends` returns a tuple, `theme_context` is an iterator, and `compose_results` returns a `PlotResult` without a `show` parameter.
+Helpers differ: `label_panels` returns `None`, `theme_context` is an iterator, and `compose_results` returns a `PlotResult` without a `show` parameter.
 
 ```{eval-rst}
 .. automodule:: scarf.plotting
-    :members: embedding, embedding_raster, dotplot, matrixplot, modality_weights, composition, distribution, cluster_connectivity, mapping_score, mapping_evidence, mapping_confusion, mapping_calibration, qc, graph_qc, elbow, highly_variable_features, label_panels, collect_legends, compose_results, register_theme, theme_context, marker_heatmap, cluster_tree, pseudotime_heatmap, run_recipe
+    :members: embedding, embedding_raster, dotplot, matrixplot, modality_weights, composition, distribution, cluster_connectivity, mapping_score, mapping_evidence, mapping_confusion, mapping_calibration, qc, graph_qc, elbow, highly_variable_features, label_panels, compose_results, theme_context, marker_heatmap, cluster_tree, pseudotime_heatmap, run_recipe
     :imported-members:
     :undoc-members:
     :show-inheritance:
@@ -134,11 +134,6 @@ Helpers differ: `label_panels` and `register_theme` return `None`, `collect_lege
 
 ```{eval-rst}
 .. autoclass:: scarf.plotting.PlotProvenance
-    :members:
-```
-
-```{eval-rst}
-.. autoclass:: scarf.plotting.FeatureSummary
     :members:
 ```
 

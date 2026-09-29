@@ -7,6 +7,8 @@ from typing import Literal
 import numpy as np
 from scipy.sparse import spmatrix
 
+from ..utils.arguments import integer_argument
+
 
 type LeidenBackend = Literal["igraph", "leidenalg"]
 
@@ -29,14 +31,12 @@ def canonical_resolution(value: object) -> float:
 
 def canonical_random_seed(value: object) -> int:
     """Return a Leiden random seed as a non-negative Python integer."""
-    if isinstance(value, bool | np.bool_) or not isinstance(value, int | np.integer):
+    if value is None:
         raise TypeError(
-            "random_seed must be a non-negative integer; Leiden labels are "
-            "reused, so an unseeded run is not supported"
+            "random_seed must be an integer; Leiden labels are reused, so an "
+            "unseeded run is not supported"
         )
-    if value < 0:
-        raise ValueError("random_seed must be a non-negative integer")
-    return int(value)
+    return integer_argument(value, "random_seed", minimum=0)
 
 
 def _igraph_membership(
@@ -69,7 +69,9 @@ def _igraph_membership(
                 n_iterations=2,
             )
         finally:
-            igraph.set_random_number_generator(None)
+            # Restore igraph's default generator, the seedable random module.
+            # None would switch to the C-layer generator, which cannot be seeded.
+            igraph.set_random_number_generator(random)
     return np.array(partition.membership) + 1
 
 

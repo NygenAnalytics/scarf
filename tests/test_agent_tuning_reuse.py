@@ -18,6 +18,7 @@ from scarf.agent.parameter_tuning.contracts import (
     ParameterTuningDependencies,
 )
 from scarf.agent.types import ArtifactReferenceModel
+from scarf.metadata import rows as metadata_rows
 from scarf.storage.artifacts import fingerprint_stored_arrays
 from tests.test_agent_parameter_tuning import _FakeStore, _artifact, _cell_selection
 
@@ -29,7 +30,7 @@ def test_stage_metric_reuse_tracks_artifacts_and_live_metadata(
     metadata = {"batch": np.asarray(["a", "b"], dtype=object)}
     store.cells = metadata
     monkeypatch.setattr(
-        execution,
+        metadata_rows,
         "iter_metadata_column_blocks",
         lambda cells, column: iter([cells[column]]),
     )
@@ -105,7 +106,6 @@ def test_pca_diagnostic_reuse_precedes_numerical_work(
         "top_loading_values": np.ones((2, 3)),
         "family_enrichment": np.ones((1, 2)),
         "covariate_association": np.ones((1, 2)),
-        "adjacent_neighbor_overlap": np.asarray([0.8]),
     }
     for name, values in payload.items():
         stored.create_array(name, data=values)
@@ -131,7 +131,7 @@ def test_pca_diagnostic_reuse_precedes_numerical_work(
 
     monkeypatch.setattr(diagnostics, "plan_artifact", reuse)
     monkeypatch.setattr(
-        diagnostics, "_metadata_column_fingerprint", lambda *_: "current"
+        diagnostics, "metadata_column_fingerprint", lambda *_: "current"
     )
     for name in (
         "_component_variance",
@@ -156,7 +156,6 @@ def test_pca_diagnostic_reuse_precedes_numerical_work(
         family_masks={"protected": np.asarray([True, False, False])},
         covariate_columns=("batch",),
         covariate_roles=("technical",),
-        adjacent_overlap=0.8,
         column_kinds={"batch": kind},
         column_artifacts=covariate_artifacts,
     )

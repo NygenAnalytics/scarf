@@ -426,3 +426,32 @@ def test_pipeline_interruption_markdown_report() -> None:
     report = run.report(format="markdown")
     assert "## Interruption" in report
     assert "No completed outputs" in report
+
+
+def test_pipeline_view_calls_validate_row_identity_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cells = _completed_run(_root()).cells
+    fingerprint = pipeline_run_module.fingerprint_stored_strings
+    calls = 0
+
+    def counting(array: Any) -> str:
+        nonlocal calls
+        calls += 1
+        return fingerprint(array)
+
+    monkeypatch.setattr(pipeline_run_module, "fingerprint_stored_strings", counting)
+    operations = (
+        lambda: cells.to_pandas_dataframe(cells.columns),
+        lambda: cells.fetch("clusters"),
+        lambda: cells.fetch("ids"),
+        lambda: cells.fetch_all("clusters"),
+        lambda: cells._plot_fetch_all("nullable_score"),
+        lambda: cells._plot_fetch_selected("nullable_score"),
+    )
+    for operation in operations:
+        calls = 0
+        operation()
+        assert calls == 1
+    frame = cells.to_pandas_dataframe(["ids", "clusters", "nullable_score"])
+    assert list(frame["nullable_score"].isna()) == [False, True]

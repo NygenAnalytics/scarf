@@ -1,5 +1,6 @@
 """Experimental-context canonicalization and explicit model failures."""
 
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
 
@@ -51,7 +52,7 @@ def _validate_batch_correction_plan(
     }
     plan = decision.batchCorrection
     try:
-        active_batch_safety(
+        active_safety = active_batch_safety(
             SimpleNamespace(
                 decision=decision, batchSafety=list(deps.batchSafety.values())
             )
@@ -116,9 +117,29 @@ def _validate_batch_correction_plan(
             raise ModelRetry(
                 f"Batch column {batch_column!r} must be categorical for Harmony"
             )
-        if batch_column in requested_coefficients or batch_column in unit_columns:
+    # The assessed batch set becomes the contract's technical batch columns even
+    # when the plan skips correction, so it cannot overlap protected roles.
+    assessed_batch_columns = {
+        *plan.batchColumns,
+        *(column for item in active_safety for column in item.batchColumns),
+    }
+    for batch_column in sorted(assessed_batch_columns):
+        if (
+            batch_column in requested_coefficients
+            or batch_column in unit_columns
+            or batch_column in plan.preserveColumns
+        ):
             raise ModelRetry(
-                f"Batch column {batch_column!r} cannot be a coefficient or unit of inference"
+                f"Batch column {batch_column!r} cannot be a coefficient, unit of "
+                "inference, or preserved column"
+            )
+    for preserve_column in plan.preserveColumns:
+        record = records.get(preserve_column)
+        if record is None:
+            raise ModelRetry(f"Unknown preservation column {preserve_column!r}")
+        if record.get("domain") != "biological":
+            raise ModelRetry(
+                f"Preservation column {preserve_column!r} must be biological"
             )
 
     if plan.action == "evaluateHarmony":
@@ -153,14 +174,6 @@ def _validate_batch_correction_plan(
                 "matching estimability report; use needsInput or unsafe for: "
                 f"{unresolved_coefficients}"
             )
-        for preserve_column in plan.preserveColumns:
-            record = records.get(preserve_column)
-            if record is None:
-                raise ModelRetry(f"Unknown preservation column {preserve_column!r}")
-            if record.get("domain") != "biological":
-                raise ModelRetry(
-                    f"Preservation column {preserve_column!r} must be biological"
-                )
 
     matched_safety: list[BatchSafetyEvidence] = []
     if plan.action in {"evaluateHarmony", "unsafe"}:
@@ -493,6 +506,8 @@ def failed_experimental_context_result(
         htoIdentityArtifacts=deps.htoIdentityArtifacts,
         batchSafety=list(deps.batchSafety.values()),
         currentRepresentation=deps.currentRepresentation,
+        designRounds=deps.designRounds,
+        designDirections=deepcopy(deps.characterizationInputs.get("directions", {})),
         notes=[
             "The model did not produce a validated experimental-context decision.",
             f"Model failure: {model_detail}",

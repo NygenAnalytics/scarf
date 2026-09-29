@@ -1,6 +1,5 @@
 """Preprocessing planning and execution stages."""
 
-import hashlib
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -49,11 +48,9 @@ from .models import (
     OrchestrationResumeRecord,
     PreprocessedAssayHandoff,
     WorkflowIdentity,
-    WorkflowNeedsInput,
     WorkflowQuestion,
     WorkflowStageAttempt,
     WorkflowStageLink,
-    WorkflowStageName,
 )
 from .rna import (
     selected_store_rna_assay,
@@ -129,11 +126,9 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
         decision_id: str,
         evidence: list[DecisionEvidence],
     ) -> EvidenceBundle:
-        digest = hashlib.sha256(
-            record_io.canonical_json_bytes(
-                [item.model_dump(mode="json") for item in evidence]
-            )
-        ).hexdigest()
+        digest = record_io.sha256_json(
+            [item.model_dump(mode="json") for item in evidence]
+        )
         return EvidenceBundle(
             bundleId=f"bundle:{decision_id}:{digest[:24]}",
             decisionId=decision_id,
@@ -173,7 +168,7 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
         shared: dict[str, Any] = {}
 
         def reference(value: Any) -> str:
-            digest = hashlib.sha256(record_io.canonical_json_bytes(value)).hexdigest()
+            digest = record_io.sha256_json(value)
             shared[digest] = value
             return digest
 
@@ -420,10 +415,8 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
             qc_evidence=self._qc_decision_evidence(profiles),
         )
         if resolution.compiled is None:
-            raise _DecisionNeedsInput(
-                self._pending_decision_question(resolution, definition),
-                resolution.checkpointSha256,
-            )
+            assert resolution.pending is not None
+            raise _DecisionNeedsInput(resolution.pending, resolution.checkpointSha256)
         payload = resolution.compiled.executorPayload
         if not isinstance(payload, QcGroupingExecutorPayload):
             raise TypeError("QC-grouping decision compiled an unexpected payload")
@@ -495,10 +488,8 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
             qc_evidence=self._qc_decision_evidence(all_profiles),
         )
         if resolution.compiled is None:
-            raise _DecisionNeedsInput(
-                self._pending_decision_question(resolution, definition),
-                resolution.checkpointSha256,
-            )
+            assert resolution.pending is not None
+            raise _DecisionNeedsInput(resolution.pending, resolution.checkpointSha256)
         payload = resolution.compiled.executorPayload
         if not isinstance(payload, CellQualityExecutorPayload):
             raise TypeError("Cell-quality decision compiled an unexpected payload")
@@ -548,11 +539,9 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
             for assay in plan.assays
         ]
         updated = plan.model_copy(update={"assays": assays, "planChecksum": ""})
-        checksum = hashlib.sha256(
-            record_io.canonical_json_bytes(
-                updated.model_dump(mode="json", exclude={"planChecksum"})
-            )
-        ).hexdigest()
+        checksum = record_io.sha256_json(
+            updated.model_dump(mode="json", exclude={"planChecksum"})
+        )
         return updated.model_copy(update={"planChecksum": checksum})
 
     def preprocessing_plan_stage(
@@ -563,7 +552,6 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
         parents: Sequence[WorkflowStageLink],
         enrichment: DataEnrichmentReport,
         experimental: ExperimentalContextResult,
-        ingest_outcome: WorkflowStageAttempt,
         study_contract: StudyContract,
         answers: Mapping[str, Any],
         *,
@@ -630,7 +618,6 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
                 request_record,
                 enrichment,
                 experimental,
-                ingest_outcome,
                 cell_qc,
             )
             validate_rna_plan(plan, selected)
@@ -647,32 +634,21 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
                 f"routes=[{route_summary}])"
             )
         except _DecisionNeedsInput as pending:
-            if request_record.config.inputPolicy == "unattended":
-                outcome = journal._complete_attempt(
-                    started,
-                    status="failed",
-                    artifacts={
-                        "cellSelection": experimental.cellSelection,
-                        **cell_qc_artifacts,
-                    },
-                    outputs={"decisionCheckpointSha256": pending.checkpointSha256},
-                    error=(
-                        "The unattended preprocessing plan returned an unresolved "
-                        "registered decision"
-                    ),
-                )
-            else:
-                outcome = journal._complete_attempt(
-                    started,
-                    status="needsInput",
-                    artifacts={
-                        "cellSelection": experimental.cellSelection,
-                        **cell_qc_artifacts,
-                    },
-                    outputs={"decisionCheckpointSha256": pending.checkpointSha256},
-                    needs_input=WorkflowNeedsInput(questions=[pending.question]),
-                    notes=["A registered filtering decision requires input."],
-                )
+            outcome = journal._pause_or_fail_attempt(
+                started,
+                request_record,
+                questions=[pending.question],
+                error=(
+                    "The unattended preprocessing plan returned an unresolved "
+                    "registered decision"
+                ),
+                artifacts={
+                    "cellSelection": experimental.cellSelection,
+                    **cell_qc_artifacts,
+                },
+                outputs={"decisionCheckpointSha256": pending.checkpointSha256},
+                notes=["A registered filtering decision requires input."],
+            )
             journal._save_outcome(store.zw, prefix, outcome)
             return outcome, AutomatedPreprocessingPlan.get_blank()
         except Exception as exc:
@@ -719,10 +695,8 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
         request_record: OrchestrationRequestRecord,
         enrichment: DataEnrichmentReport,
         experimental: ExperimentalContextResult,
-        ingest_outcome: WorkflowStageAttempt,
         cell_qc: CellQcPlan,
     ) -> AutomatedPreprocessingPlan:
-        del ingest_outcome
         request = request_record.request
         selected = selected_store_rna_assay(store, request)
         policy = next(
@@ -750,11 +724,9 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
             assays=[assay_plan],
             limitations=list(dict.fromkeys(enrichment.limitations)),
         )
-        checksum = hashlib.sha256(
-            record_io.canonical_json_bytes(
-                final_plan.model_dump(mode="json", exclude={"planChecksum"})
-            )
-        ).hexdigest()
+        checksum = record_io.sha256_json(
+            final_plan.model_dump(mode="json", exclude={"planChecksum"})
+        )
         return final_plan.model_copy(update={"planChecksum": checksum})
 
     def build_assay_preprocessing_plan(
@@ -819,11 +791,8 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
         parents: Sequence[WorkflowStageLink],
         plan: AutomatedPreprocessingPlan,
         experimental: ExperimentalContextResult,
-        study_contract: StudyContract,
-        answers: Mapping[str, Any],
         *,
         resume_record: OrchestrationResumeRecord | None = None,
-        stage_name: WorkflowStageName = "preprocessing",
     ) -> tuple[
         WorkflowStageAttempt,
         list[PreprocessedAssayHandoff],
@@ -837,7 +806,7 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
             store,
             prefix,
             workflow.workflowRunId,
-            stage_name,
+            "preprocessing",
             request_record,
             parents,
         )
@@ -866,7 +835,7 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
             store.zw,
             prefix,
             workflow.workflowRunId,
-            stage_name,
+            "preprocessing",
             request_record,
             parents,
             inputs={
@@ -882,11 +851,7 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
             **self._cell_qc_stage_artifacts(plan.cellQc),
         }
         try:
-            if plan.cellQualityPayload is None:
-                raise ValueError(
-                    "Decision-driven preprocessing requires an audited "
-                    "cell-quality payload"
-                )
+            self._require_audited_cell_qc(plan.cellQc, plan.cellQualityPayload)
             cell_selection = self.apply_cell_qc(
                 store,
                 experimental,
@@ -894,7 +859,6 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
                 actions,
                 operations,
                 selected_plan=plan.cellQc,
-                decision_payload=plan.cellQualityPayload,
             )
             cell_selection_model = ArtifactReferenceModel.from_artifact_ref(
                 cell_selection
@@ -954,9 +918,6 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
                             cell_selection=cell_selection,
                             cell_selection_model=cell_selection_model,
                             active_cells=active_cells,
-                            request_record=request_record,
-                            study_contract=study_contract,
-                            answers=answers,
                             actions=actions,
                             operations=operations,
                             artifacts=artifacts,
@@ -969,11 +930,7 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
             outcome = journal._complete_attempt(
                 started,
                 status="done",
-                artifacts={
-                    name: value
-                    for name, value in artifacts.items()
-                    if value is not None
-                },
+                artifacts=artifacts,
                 outputs={
                     "assays": [value.model_dump(mode="json") for value in handoffs],
                     "cellSelection": cell_selection_model.model_dump(mode="json"),
@@ -988,45 +945,6 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
                 f"{len(handoffs)} graph-ready assay handoff(s)"
             )
             return outcome, handoffs, resolved_plan
-        except _DecisionNeedsInput as pending:
-            if request_record.config.inputPolicy == "unattended":
-                outcome = journal._complete_attempt(
-                    started,
-                    status="failed",
-                    artifacts={
-                        name: value
-                        for name, value in artifacts.items()
-                        if value is not None
-                    },
-                    outputs={
-                        "operations": operations,
-                        "decisionCheckpointSha256": pending.checkpointSha256,
-                    },
-                    actions=actions,
-                    error=(
-                        "The unattended preprocessing stage returned an unresolved "
-                        "registered decision"
-                    ),
-                )
-            else:
-                outcome = journal._complete_attempt(
-                    started,
-                    status="needsInput",
-                    artifacts={
-                        name: value
-                        for name, value in artifacts.items()
-                        if value is not None
-                    },
-                    outputs={
-                        "operations": operations,
-                        "decisionCheckpointSha256": pending.checkpointSha256,
-                    },
-                    needs_input=WorkflowNeedsInput(questions=[pending.question]),
-                    actions=actions,
-                    notes=["A registered RNA preprocessing decision requires input."],
-                )
-            journal._save_outcome(store.zw, prefix, outcome)
-            return outcome, [], plan
         except Exception as exc:
             outcome = journal.finish_exception(
                 store,
@@ -1048,15 +966,11 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
         cell_selection: ArtifactRef,
         cell_selection_model: ArtifactReferenceModel,
         active_cells: int,
-        request_record: OrchestrationRequestRecord | None = None,
-        study_contract: StudyContract | None = None,
-        answers: Mapping[str, Any] | None = None,
         actions: list[str],
         operations: list[dict[str, Any]],
         artifacts: dict[str, ArtifactReferenceModel],
     ) -> PreprocessedAssayHandoff:
         """Prepare exact core defaults and feature evidence without a graph search."""
-        del request_record, study_contract, answers
         assay = store.get_assay(assay_plan.assay)
         if not isinstance(assay, RNAassay):
             raise TypeError("RNA preprocessing requires an RNAassay")
@@ -1117,6 +1031,28 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
             nFeatures=selected_count,
         )
 
+    @staticmethod
+    def _require_audited_cell_qc(
+        plan: CellQcPlan, payload: CellQualityExecutorPayload | None
+    ) -> None:
+        """Execute only the cell-QC plan that its audited decision selected."""
+        if payload is None:
+            raise ValueError(
+                "Decision-driven preprocessing requires an audited cell-quality payload"
+            )
+        if cell_qc_policy(plan.action, plan.registeredProfile) != payload.profile:
+            raise ValueError("Cell-QC execution plan differs from its audited payload")
+        expected_capture = payload.profile in {
+            "coreSampleMad3",
+            "captureMad5",
+            "captureMad3Sensitivity",
+            "pooledReferenceMad5",
+        }
+        if expected_capture != (
+            plan.sampleColumn is not None or plan.sampleArtifact is not None
+        ):
+            raise ValueError("Cell-QC capture source differs from its audited payload")
+
     def apply_cell_qc(
         self,
         store: DataStore,
@@ -1125,30 +1061,9 @@ class PreprocessingStagesMixin(DecisionStagesMixin):
         actions: list[str],
         operations: list[dict[str, Any]],
         *,
-        selected_plan: CellQcPlan | None = None,
-        decision_payload: CellQualityExecutorPayload | None = None,
+        selected_plan: CellQcPlan,
     ) -> ArtifactRef:
-        plan = selected_plan or experimental.cellQc
-        if decision_payload is not None:
-            if (
-                cell_qc_policy(plan.action, plan.registeredProfile)
-                != decision_payload.profile
-            ):
-                raise ValueError(
-                    "Cell-QC execution plan differs from its audited payload"
-                )
-            expected_capture = decision_payload.profile in {
-                "coreSampleMad3",
-                "captureMad5",
-                "captureMad3Sensitivity",
-                "pooledReferenceMad5",
-            }
-            if expected_capture != (
-                plan.sampleColumn is not None or plan.sampleArtifact is not None
-            ):
-                raise ValueError(
-                    "Cell-QC capture source differs from its audited payload"
-                )
+        plan = selected_plan
         input_model = ArtifactReferenceModel.from_artifact_ref(cell_selection)
         logger.info(
             f"Applying cell QC action={plan.action!r}, profile={plan.profileId!r}"

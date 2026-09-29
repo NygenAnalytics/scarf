@@ -165,12 +165,6 @@ class _Store(_ClusteringOperationsMixin):
 
     _load_graph_artifact = load_graph
 
-    @staticmethod
-    def _col_renamer(from_assay: str, cell_key: str, label: str) -> str:
-        if cell_key == "I":
-            return f"{from_assay}_{label}"
-        return f"{from_assay}_{cell_key}_{label}"
-
     def get_cell_vals(
         self,
         *,
@@ -1070,6 +1064,21 @@ def test_fixed_cut_merges_tied_heights_to_the_requested_count() -> None:
         result = _run_paris(store, n_clusters=n_clusters)
         assert result.n_clusters == n_clusters
         assert np.unique(result.labels).size == n_clusters
+
+
+def test_tied_clique_graph_supports_fixed_and_adaptive_cuts() -> None:
+    n_cells = 45
+    rows, cols = np.nonzero(~np.eye(n_cells, dtype=bool))
+    store = _Store(
+        csr_matrix((np.ones(rows.size), (rows, cols)), shape=(n_cells, n_cells))
+    )
+
+    fixed = _run_paris(store, n_clusters=2)
+    adaptive = _run_paris(store, min_cluster_size=2)
+
+    assert fixed.n_clusters == 2
+    assert np.unique(fixed.labels).size == 2
+    assert adaptive.labels.shape == (n_cells,)
 
 
 @pytest.mark.parametrize("recorded_count", [3, 0, True, "2"])

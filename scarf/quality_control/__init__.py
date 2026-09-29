@@ -5,11 +5,7 @@ from .cell_cycle_genes import (
     s_phase_genes,
     s_phase_genes_mouse,
 )
-from .doublets import (
-    sample_cluster_pool,
-    simulate_doublet_pairs,
-    write_doublet_target_zarr,
-)
+from .doublets import sample_cluster_pool, simulate_doublet_pairs
 from .filtering import gaussian_quantile_bounds
 from .hto import hto_demux
 
@@ -23,5 +19,4 @@ __all__ = [
     "s_phase_genes",
     "s_phase_genes_mouse",
     "simulate_doublet_pairs",
-    "write_doublet_target_zarr",
 ]

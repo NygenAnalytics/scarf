@@ -3,6 +3,7 @@
 import os
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -18,19 +19,16 @@ __all__ = [
     "OperationPlan",
     "WorkShape",
     "auto_read_width",
-    "clear_execution_reports",
     "detect_external_thread_caps",
     "execution_report_scope",
     "execution_reports_by_kind",
-    "last_execution_report",
     "plan_operation",
     "record_execution_report",
-    "recorded_execution_reports",
 ]
 
-_LAST_REPORT: "ExecutionReport | None" = None
-_REPORTS: list["ExecutionReport"] = []
-_SCOPES: list[list["ExecutionReport"]] = []
+_SCOPES: ContextVar[tuple[list["ExecutionReport"], ...]] = ContextVar(
+    "execution_report_scopes", default=()
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,33 +171,19 @@ def detect_external_thread_caps() -> dict[str, int]:
     return caps
 
 
-def last_execution_report() -> ExecutionReport | None:
-    """Return the most recent recorded execution report, if any."""
-    return _LAST_REPORT
-
-
-def recorded_execution_reports() -> tuple[ExecutionReport, ...]:
-    """Return every report recorded since the last clear."""
-    return tuple(_REPORTS)
-
-
-def clear_execution_reports() -> None:
-    """Drop the process-wide report collection."""
-    global _LAST_REPORT
-    _LAST_REPORT = None
-    _REPORTS.clear()
-
-
 @contextmanager
 def execution_report_scope() -> Iterator[list[ExecutionReport]]:
-    """Collect reports recorded inside this block, keyed later by unit kind."""
+    """Collect reports recorded inside this block, keyed later by unit kind.
+
+    Scopes follow the context, so threads started with a copy of it report
+    into the same scope and concurrent operations do not share one.
+    """
     collected: list[ExecutionReport] = []
-    _SCOPES.append(collected)
+    _SCOPES.set((*_SCOPES.get(), collected))
     try:
         yield collected
     finally:
-        if _SCOPES and _SCOPES[-1] is collected:
-            _SCOPES.pop()
+        _SCOPES.set(tuple(scope for scope in _SCOPES.get() if scope is not collected))
 
 
 def execution_reports_by_kind(
@@ -213,13 +197,10 @@ def execution_reports_by_kind(
 
 
 def record_execution_report(report: ExecutionReport) -> ExecutionReport:
-    """Retain the report, append it to active scopes, and emit one log line."""
-    global _LAST_REPORT
+    """Append the report to active scopes and emit one log line."""
     if "externalLimits" not in report.extra:
         report.extra["externalLimits"] = detect_external_thread_caps()
-    _LAST_REPORT = report
-    _REPORTS.append(report)
-    for scope in _SCOPES:
+    for scope in _SCOPES.get():
         scope.append(report)
     logger.info(report.log_line())
     return report

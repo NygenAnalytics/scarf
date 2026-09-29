@@ -1658,3 +1658,76 @@ def test_pipeline_execution_error_exposes_durable_identity() -> None:
     assert error.run_id == "a" * 64
     assert error.stage == "pca"
     assert str(error) == f"Pipeline run {'a' * 64} failed during stage 'pca': bad pca"
+
+
+class _MetadataWrites(MemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.writes: list[str] = []
+
+    async def set(self, key: str, value: Any, byte_range: Any = None) -> None:
+        self.writes.append(key)
+        await super().set(key, value)
+
+
+def test_stage_record_is_created_with_one_metadata_write() -> None:
+    store = _MetadataWrites()
+    root = _root(store=store)
+    run = create_pipeline_run_record(
+        root,
+        recipe="basic_rna_analysis",
+        requested_label=None,
+        assay="RNA",
+        config={},
+        stage_order=("input_snapshot",),
+        scarf_version="1.0",
+    )
+    store.writes.clear()
+    start_pipeline_stage_record(
+        root, run_id=run.run_id, ordinal=0, stage="input_snapshot"
+    )
+
+    stage_key = f"pipeline/runs/{run.run_id}/stages/0/zarr.json"
+    assert store.writes == [stage_key]
+    assert load_pipeline_stage_record(root, run.run_id, 0).status == "running"
+    with pytest.raises(FileExistsError, match="already exists"):
+        start_pipeline_stage_record(
+            root, run_id=run.run_id, ordinal=0, stage="input_snapshot"
+        )
+
+
+def test_terminal_records_survive_a_wall_clock_step_back(monkeypatch) -> None:
+    root = _root()
+    started = 2_000_000_000_000_000_000
+    run = create_pipeline_run_record(
+        root,
+        recipe="basic_rna_analysis",
+        requested_label=None,
+        assay="RNA",
+        config={},
+        stage_order=("input_snapshot",),
+        scarf_version="1.0",
+        started_at_ns=started,
+    )
+    start_pipeline_stage_record(
+        root,
+        run_id=run.run_id,
+        ordinal=0,
+        stage="input_snapshot",
+        started_at_ns=started,
+    )
+    monkeypatch.setattr(pipeline_run_storage.time, "time_ns", lambda: started - 1)
+
+    stage = finish_pipeline_stage_record(
+        root,
+        run_id=run.run_id,
+        ordinal=0,
+        status="completed",
+        metrics=_metrics(),
+    )
+    failed = fail_pipeline_run_record(
+        root, run_id=run.run_id, error=RuntimeError("stopped")
+    )
+
+    assert stage.finished_at_ns == started
+    assert failed.finished_at_ns == started

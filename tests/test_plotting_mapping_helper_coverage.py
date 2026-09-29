@@ -20,7 +20,7 @@ from scarf.mapping.models import (
 from scarf.mapping.reference import MappingReference
 from scarf.plotting import _data as plotting_data
 from scarf.plotting._contracts import CellField, ColorScale, NormalizationSpec
-from scarf.storage.artifacts import ArtifactRef, callable_identity
+from scarf.storage.artifacts import ArtifactRef, ArtifactStatus, callable_identity
 from scarf.storage.budget import ResourceBudget
 
 
@@ -38,6 +38,21 @@ def _ref(
         assay=assay,
         kind=kind,
         artifact_id=token * 64,
+    )
+
+
+def _status(
+    ref: ArtifactRef,
+    inputs: dict[str, Any],
+    *,
+    operation: str = "run_umap",
+) -> ArtifactStatus:
+    return ArtifactStatus(
+        ref=ref,
+        path="artifact",
+        exists=True,
+        complete=True,
+        provenance={"operation": operation, "parameters": {}, "inputs": inputs},
     )
 
 
@@ -147,18 +162,18 @@ def test_plot_data_rejects_malformed_artifact_inputs(monkeypatch) -> None:
     monkeypatch.setattr(
         plotting_data,
         "inspect_artifact",
-        lambda *_: SimpleNamespace(inputs={}),
+        lambda *_: _status(layout, {}),
     )
-    with pytest.raises(ValueError, match="no cell-selection"):
-        plotting_data._artifact_cell_selection(store, layout, label="Plot")
+    with pytest.raises(ValueError, match="has no 'cell_selection' input"):
+        plotting_data._artifact_cell_selection(store, layout)
 
     monkeypatch.setattr(
         plotting_data,
         "inspect_artifact",
-        lambda *_: SimpleNamespace(inputs={"cell_selection": {}}),
+        lambda *_: _status(layout, {"cell_selection": {}}),
     )
-    with pytest.raises(ValueError, match="invalid cell-selection"):
-        plotting_data._artifact_cell_selection(store, layout, label="Plot")
+    with pytest.raises(ValueError, match="malformed 'cell_selection' input"):
+        plotting_data._artifact_cell_selection(store, layout)
 
     with pytest.raises(TypeError, match="ArtifactRef"):
         plotting_data._validated_embedding_selection(store, "umap")  # type: ignore[arg-type]
@@ -171,23 +186,18 @@ def test_plot_data_rejects_malformed_artifact_inputs(monkeypatch) -> None:
     with pytest.raises(ValueError, match="unavailable or incomplete"):
         plotting_data._validated_embedding_selection(store, layout)
 
-    monkeypatch.setattr(
-        plotting_data,
-        "_artifact_cell_selection",
-        lambda *_args, **_kwargs: selection,
-    )
-    status = SimpleNamespace(complete=True, operation="run_umap", inputs={})
-    monkeypatch.setattr(plotting_data, "inspect_artifact", lambda *_: status)
-    with pytest.raises(ValueError, match="no graph input"):
-        plotting_data._validated_embedding_selection(store, layout)
-
-    status.inputs = {"graph": {}}
-    with pytest.raises(ValueError, match="invalid graph input"):
-        plotting_data._validated_embedding_selection(store, layout)
-
-    status.inputs = {"graph": _ref("neighbors", "3", assay="ATAC").to_dict()}
-    with pytest.raises(ValueError, match="scope does not match"):
-        plotting_data._validated_embedding_selection(store, layout)
+    for graph_input, message in (
+        (None, "has no 'graph' input"),
+        ({}, "malformed 'graph' input"),
+        (_ref("neighbors", "3", assay="ATAC").to_dict(), "scope does not match"),
+    ):
+        inputs: dict[str, Any] = {"cell_selection": selection.to_dict()}
+        if graph_input is not None:
+            inputs["graph"] = graph_input
+        status = _status(layout, inputs)
+        monkeypatch.setattr(plotting_data, "inspect_artifact", lambda *_: status)
+        with pytest.raises(ValueError, match=message):
+            plotting_data._validated_embedding_selection(store, layout)
 
 
 def test_plot_data_grouping_and_layout_validation(monkeypatch) -> None:
@@ -438,30 +448,10 @@ def test_distribution_panel_and_color_limit_edges() -> None:
     assert panel_limits == [(0.0, 1.0), (2.0, 4.0)]
     assert reference == (0.0, 1.0)
 
-    invalid_limits = SimpleNamespace(
-        scope="shared",
-        quantiles=None,
-        vmin=2.0,
-        vmax=1.0,
-        vcenter=None,
-    )
-    with pytest.raises(ValueError, match="vmax"):
-        distribution_plot._mean_color_limits(
-            [pd.Series([1.0, 2.0])],
-            invalid_limits,  # type: ignore[arg-type]
-        )
-
-    invalid_center = SimpleNamespace(
-        scope="shared",
-        quantiles=None,
-        vmin=0.0,
-        vmax=1.0,
-        vcenter=2.0,
-    )
     with pytest.raises(ValueError, match="vcenter"):
         distribution_plot._mean_color_limits(
             [pd.Series([0.0, 1.0])],
-            invalid_center,  # type: ignore[arg-type]
+            ColorScale(scope="shared", vmin=0.5, vcenter=0.0),
         )
 
     limits, _ = distribution_plot._mean_color_limits(
@@ -470,7 +460,13 @@ def test_distribution_panel_and_color_limit_edges() -> None:
     )
     assert limits[0][0] == 0.0
     assert limits[0][1] > 2.0
-    assert distribution_plot._render_color_limits(3.0, 3.0) == (2.5, 3.5)
+    # Tied shared means follow the shared limit policy and take the low end.
+    limits, reference = distribution_plot._mean_color_limits(
+        [pd.Series([3.0, 3.0])],
+        ColorScale(scope="shared"),
+    )
+    assert limits == [(3.0, 4.0)]
+    assert reference == (3.0, 4.0)
 
     with pytest.raises(ValueError, match="Unknown colormap"):
         distribution_plot._mean_group_palette(
@@ -832,13 +828,6 @@ def test_mapping_feature_helper_validation_and_lightweight_methods() -> None:
         )
 
     stream = object.__new__(mapping_features.AlignedFeatureStream)
-    stream._reference_normalized_means = np.array([1.0])
-    stream._normalization_parameters = normalization
-    stream._missing_feature_policy = "zero"
-    assert stream.reference_normalized_means.tolist() == [1.0]
-    assert stream.normalization_parameters == normalization
-    assert stream.missing_feature_policy == "zero"
-
     stream._query_cell_indices = np.array([0])
     stream._resident_bytes = 10
     stream._decode_bytes = 0
@@ -933,45 +922,40 @@ def test_mapping_reference_axis_and_layout_validation(monkeypatch) -> None:
         reference._selected_cell_values("label", validate_binding=False)
 
     monkeypatch.setattr(MappingReference, "validate_frozen_axes", lambda _self: None)
-    monkeypatch.setattr(
-        mapping_artifact,
-        "validate_mapping_reference_binding",
-        lambda value: value,
-    )
     layout = _ref("embedding", "9")
     status = SimpleNamespace(complete=False, inputs={})
     monkeypatch.setattr(mapping_reference, "inspect_artifact", lambda *_: status)
     with pytest.raises(ValueError, match="unavailable or incomplete"):
-        reference.fetch_layout(layout)
+        reference._fetch_layout(layout)
 
     status.complete = True
     with pytest.raises(ValueError, match="no cell-selection"):
-        reference.fetch_layout(layout)
+        reference._fetch_layout(layout)
     status.inputs = {"cell_selection": {}}
     with pytest.raises(ValueError, match="invalid cell-selection"):
-        reference.fetch_layout(layout)
+        reference._fetch_layout(layout)
     status.inputs = {
         "cell_selection": _ref("cell_selection", "0", assay=None).to_dict()
     }
     with pytest.raises(ValueError, match="different cell selections"):
-        reference.fetch_layout(layout)
+        reference._fetch_layout(layout)
 
     status.inputs = {"cell_selection": reference.cell_selection.to_dict()}
     payload: dict[str, Any] = {}
     monkeypatch.setattr(mapping_reference, "artifact_group", lambda *_: payload)
     monkeypatch.setattr(mapping_reference, "as_zarr_array", lambda value, **_: value)
     with pytest.raises(ValueError, match="no canonical values"):
-        reference.fetch_layout(layout)
+        reference._fetch_layout(layout)
 
     payload["values"] = np.array([["bad", "coordinates"], ["x", "y"]])
     with pytest.raises(TypeError, match="must be numeric"):
-        reference.fetch_layout(layout)
+        reference._fetch_layout(layout)
     payload["values"] = np.ones((2, 1))
     with pytest.raises(ValueError, match="two columns"):
-        reference.fetch_layout(layout)
+        reference._fetch_layout(layout)
     payload["values"] = np.array([[0.0, 1.0], [np.inf, 2.0]])
     with pytest.raises(ValueError, match="infinite"):
-        reference.fetch_layout(layout)
+        reference._fetch_layout(layout)
 
 
 def test_mapping_artifact_writer_contract_edges(monkeypatch) -> None:
@@ -1200,13 +1184,6 @@ def test_mapping_artifact_contract_helpers(monkeypatch) -> None:
     )
     monkeypatch.setattr(mapping_artifact, "array_geometry", lambda _array: None)
     root = _root()
-    status = SimpleNamespace(ref=_ref("neighbors", "1"), inputs={})
-    with pytest.raises(ValueError, match="missing from the graph chain"):
-        mapping_artifact._ref_from_input(status, "coordinates")
-    status.inputs = {"coordinates": {}}
-    with pytest.raises(ValueError, match="malformed"):
-        mapping_artifact._ref_from_input(status, "coordinates")
-
     names_group = root.create_group("names")
     for name in mapping_artifact._COMMON_ARRAYS:
         _array(names_group, name, np.ones(1))

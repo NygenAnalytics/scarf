@@ -1,5 +1,4 @@
 import hashlib
-from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -12,7 +11,6 @@ from scarf.embeddings.imported import write_imported_coordinates
 from scarf.graph.feature_projection import (
     graph_cell_selection,
     graph_source_assays,
-    project_normalized_feature_selections,
     resolve_graph_assay_inputs,
     resolve_native_graph_inputs,
 )
@@ -250,7 +248,7 @@ def test_native_projection_follows_named_inputs(
     assert ancestry.neighbors == neighbors
     assert ancestry.coordinates == coordinates
     assert graph_cell_selection(root, connectivity) == cells
-    assert project_normalized_feature_selections(root, connectivity) == (features,)
+    assert ancestry.feature_selection == features
 
 
 def test_imported_projection_has_no_feature_selection(root: zarr.Group) -> None:
@@ -263,7 +261,7 @@ def test_imported_projection_has_no_feature_selection(root: zarr.Group) -> None:
     )
 
     assert graph_cell_selection(root, connectivity) == cells
-    assert project_normalized_feature_selections(root, connectivity) == ()
+    assert resolve_native_graph_inputs(root, connectivity).feature_selection is None
 
 
 def test_native_projection_ignores_live_cell_alias_drift(root: zarr.Group) -> None:
@@ -552,146 +550,6 @@ def test_integrated_snn_resolves_persisted_assay_branch(root: zarr.Group) -> Non
     assert caught.value.context["expected_assay"] == "ATAC"
 
 
-def test_integrated_snn_with_imported_branches_projects_no_features(
-    root: zarr.Group,
-) -> None:
-    cells = _cell_selection(root)
-    rna_connectivity, _rna_neighbors, _rna_coordinates = _native_chain(
-        root,
-        "RNA",
-        cell_selection=cells,
-        imported=True,
-    )
-    adt_connectivity, _adt_neighbors, _adt_coordinates = _native_chain(
-        root,
-        "ADT",
-        cell_selection=cells,
-        imported=True,
-    )
-    integrated = _artifact(
-        root,
-        "integrated_graph",
-        assay=None,
-        inputs={
-            "source_0": rna_connectivity,
-            "source_1": adt_connectivity,
-            "cell_selection": cells,
-        },
-        parameters={"method": "snn", "assays": ["RNA", "ADT"]},
-        operation="integrate_assays",
-    )
-
-    assert project_normalized_feature_selections(root, integrated) == ()
-
-
-def test_integrated_snn_projects_only_native_branches_in_persisted_order(
-    root: zarr.Group,
-) -> None:
-    cells = _cell_selection(root)
-    rna_features = _feature_selection(root, "RNA")
-    rna_connectivity, _rna_neighbors, _rna_coordinates = _native_chain(
-        root,
-        "RNA",
-        cell_selection=cells,
-        feature_selection=rna_features,
-    )
-    adt_features = _feature_selection(root, "ADT")
-    adt_connectivity, _adt_neighbors, _adt_coordinates = _native_chain(
-        root,
-        "ADT",
-        cell_selection=cells,
-        feature_selection=adt_features,
-    )
-    atac_connectivity, _atac_neighbors, _atac_coordinates = _native_chain(
-        root,
-        "ATAC",
-        cell_selection=cells,
-        imported=True,
-    )
-    integrated = _artifact(
-        root,
-        "integrated_graph",
-        assay=None,
-        inputs={
-            "source_0": atac_connectivity,
-            "source_1": adt_connectivity,
-            "source_2": rna_connectivity,
-            "cell_selection": cells,
-        },
-        parameters={"method": "snn", "assays": ["ATAC", "ADT", "RNA"]},
-        operation="integrate_assays",
-    )
-
-    assert project_normalized_feature_selections(root, integrated) == (
-        adt_features,
-        rna_features,
-    )
-
-
-def test_integrated_projection_deduplicates_exact_refs_in_first_seen_order(
-    root: zarr.Group,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cells = _cell_selection(root)
-    rna_features = _feature_selection(root, "RNA")
-    adt_features = _feature_selection(root, "ADT")
-    sources: list[ArtifactRef] = []
-    ancestry_by_source = {}
-    for assay in ("RNA", "ADT", "ATAC"):
-        features = (
-            rna_features
-            if assay == "RNA"
-            else adt_features
-            if assay == "ADT"
-            else _feature_selection(root, assay)
-        )
-        connectivity, _neighbors, _coordinates = _native_chain(
-            root,
-            assay,
-            cell_selection=cells,
-            feature_selection=features,
-        )
-        sources.append(connectivity)
-        ancestry_by_source[connectivity] = resolve_native_graph_inputs(
-            root,
-            connectivity,
-        )
-    integrated = _artifact(
-        root,
-        "integrated_graph",
-        assay=None,
-        inputs={
-            **{f"source_{index}": source for index, source in enumerate(sources)},
-            "cell_selection": cells,
-        },
-        parameters={"method": "snn", "assays": ["RNA", "ADT", "ATAC"]},
-        operation="integrate_assays",
-    )
-    projected_by_source = {
-        sources[0]: rna_features,
-        sources[1]: adt_features,
-        sources[2]: rna_features,
-    }
-
-    def resolve_with_duplicate(source_root, source):
-        assert source_root is root
-        return replace(
-            ancestry_by_source[source],
-            feature_selection=projected_by_source[source],
-        )
-
-    monkeypatch.setattr(
-        feature_projection_module,
-        "resolve_native_graph_inputs",
-        resolve_with_duplicate,
-    )
-
-    assert project_normalized_feature_selections(root, integrated) == (
-        rna_features,
-        adt_features,
-    )
-
-
 def test_integrated_snn_rejects_extra_source_ref_fields(
     root: zarr.Group,
 ) -> None:
@@ -776,10 +634,7 @@ def test_integrated_wnn_projection_validates_coordinate_bundle(
     )
 
     assert graph_cell_selection(root, integrated) == cells
-    assert project_normalized_feature_selections(root, integrated) == (
-        features,
-        adt_features,
-    )
+    assert graph_source_assays(root, integrated) == ("RNA", "ADT")
     branch = resolve_graph_assay_inputs(root, integrated, "RNA")
     assert branch.neighbors == neighbors
     assert branch.coordinates == coordinates
@@ -847,7 +702,7 @@ def test_integrated_wnn_projection_validates_coordinate_bundle(
         operation="integrate_assays",
     )
     with pytest.raises(ArtifactResolutionError) as caught:
-        project_normalized_feature_selections(root, broken)
+        graph_source_assays(root, broken)
     assert caught.value.code == "corrupt_payload"
 
 
@@ -888,7 +743,7 @@ def test_integrated_wnn_rejects_imported_coordinates(root: zarr.Group) -> None:
     )
 
     with pytest.raises(ArtifactResolutionError) as caught:
-        project_normalized_feature_selections(root, integrated)
+        graph_source_assays(root, integrated)
     assert caught.value.code == "wrong_kind"
 
 

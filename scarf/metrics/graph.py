@@ -6,59 +6,6 @@ from ._types import NeighborMetric, ZarrArray
 _EDGE_BATCH_ROWS = 100_000
 
 
-def knn_to_csr_matrix(
-    neighbor_indices: np.ndarray,
-    neighbor_distances: np.ndarray,
-    *,
-    use_affinities: bool = False,
-) -> csr_matrix:
-    """Convert k-nearest neighbors data to a Compressed Sparse Row (CSR) matrix.
-
-    Creates a sparse adjacency matrix representation of a KNN graph. Distances
-    can optionally be converted to affinities.
-
-    Args:
-        neighbor_indices: Indices matrix from k-nearest neighbors, shape (n_samples, k)
-        neighbor_distances: Distances matrix from k-nearest neighbors, shape (n_samples, k)
-        use_affinities: Convert distances using ``1 / (log1p(distance) + 1)``.
-
-    Returns:
-        scipy.sparse.csr_matrix: Sparse adjacency matrix of shape (n_samples, n_samples)
-        where non-zero entries represent neighbor weights
-    """
-    neighbor_indices = np.asarray(neighbor_indices)
-    neighbor_distances = np.asarray(neighbor_distances, dtype=np.float64)
-    if neighbor_indices.ndim != 2 or neighbor_distances.ndim != 2:
-        raise ValueError("Neighbor indices and distances must be two-dimensional")
-    if neighbor_indices.shape != neighbor_distances.shape:
-        raise ValueError("Neighbor indices and distances must have matching shapes")
-    if not np.issubdtype(neighbor_indices.dtype, np.integer):
-        raise TypeError("Neighbor indices must contain integers")
-    if not np.all(np.isfinite(neighbor_distances)) or np.any(neighbor_distances < 0):
-        raise ValueError("Neighbor distances must be finite and non-negative")
-
-    num_samples, num_neighbors = neighbor_indices.shape
-    if num_samples == 0 or num_neighbors == 0:
-        raise ValueError("KNN data must contain cells and neighbors")
-    if np.any(neighbor_indices < 0) or np.any(neighbor_indices >= num_samples):
-        raise IndexError("Neighbor index is outside the graph")
-
-    weights = neighbor_distances
-    if use_affinities:
-        weights = 1 / (np.log1p(neighbor_distances) + 1)
-
-    indptr = np.arange(
-        0,
-        num_samples * num_neighbors + 1,
-        num_neighbors,
-        dtype=np.int64,
-    )
-    return csr_matrix(
-        (weights.reshape(-1), neighbor_indices.reshape(-1), indptr),
-        shape=(num_samples, num_samples),
-    )
-
-
 def _validated_cluster_labels(
     cluster_labels: np.ndarray, n_nodes: int
 ) -> tuple[np.ndarray, int]:
@@ -210,6 +157,10 @@ def calculate_top_k_neighbor_distances(
         matrix_a: First set of points, shape (m, d)
         matrix_b: Second set of points, shape (n, d)
         k: Number of nearest neighbors to find
+        metric: ``"l2"`` for Euclidean distance, ``"cosine"`` for one minus
+            cosine similarity, or ``"ip"`` for one minus the inner product.
+            Inner-product distances are clipped at zero, so pairs whose inner
+            product exceeds one all have distance zero.
 
     Returns:
         np.ndarray: Matrix of shape (m, k) containing the distances to the
@@ -257,4 +208,4 @@ def calculate_top_k_neighbor_distances(
         raise ValueError(f"Unsupported neighbor metric: {metric}")
 
     # Find the k smallest distances for each point in matrix_a
-    return np.partition(distances, k - 1, axis=1)[:, :k]
+    return np.asarray(np.partition(distances, k - 1, axis=1)[:, :k])

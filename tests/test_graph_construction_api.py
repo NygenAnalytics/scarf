@@ -664,11 +664,11 @@ def test_ann_index_rejects_invalid_runtime_parameters(
 
     for values, error, match in (
         ({"ann_metric": "ip"}, ValueError, "l2, cosine"),
-        ({"ann_efc": 1.5}, TypeError, "positive integer"),
-        ({"ann_ef": True}, TypeError, "positive integer"),
+        ({"ann_efc": 1.5}, TypeError, "ann_efc must be an integer"),
+        ({"ann_ef": True}, TypeError, "ann_ef must be an integer"),
         ({"ann_m": 1}, ValueError, "at least two"),
-        ({"rand_state": 0}, ValueError, "greater than zero"),
-        ({"batch_size": 0}, ValueError, "greater than zero"),
+        ({"rand_state": 0}, ValueError, "rand_state must be at least 1"),
+        ({"batch_size": 0}, ValueError, "batch_size must be at least 1"),
     ):
         with pytest.raises(error, match=match):
             datastore.build_ann_index(
@@ -855,6 +855,31 @@ def test_reduction_and_harmony_keep_immutable_selection_after_live_alias_change(
     )
     assert datastore.inspect_artifact(new_reduction).complete
     assert datastore.inspect_artifact(corrected).complete
+
+
+def test_run_harmony_refuses_read_only_store_before_writing_a_snapshot(
+    datastore_ephemeral,
+) -> None:
+    from scarf.datastore.datastore import DataStore
+
+    datastore = datastore_ephemeral
+    cell_selection, features = _prepare_graph_features(datastore)
+    datastore.cells.insert(
+        "graph_batch",
+        np.where(np.arange(datastore.cells.N) % 2, "a", "b"),
+        overwrite=True,
+    )
+    normalized = datastore.run_normalization(cell_selection, features)
+    pca = datastore.run_pca(normalized, dims=5)
+    snapshots = datastore.list_artifacts(kind="metadata_snapshot", scope="datastore")
+
+    read_only = DataStore(datastore.zarr_loc, default_assay="RNA", zarr_mode="r")
+    with pytest.raises(PermissionError, match="snapshot_run_metadata"):
+        read_only.run_harmony(pca, ["graph_batch"], harmony_params={"nclust": 5})
+    assert (
+        datastore.list_artifacts(kind="metadata_snapshot", scope="datastore")
+        == snapshots
+    )
 
 
 def test_datastore_inspects_and_loads_artifact_read_only(
@@ -1097,6 +1122,7 @@ def test_ann_reuse_checks_metadata_and_explicit_validation_checks_bytes(
     assert datastore.build_ann_index(reduction) == repaired
     assert datastore.inspect_artifact(repaired).complete
 
+    # An index without its metadata record is not reused; a new one is built.
     legacy_group = datastore.zw[artifact_path(repaired)]["ann_idx_bytes"]
     for attribute in (
         "ann_index_format_version",
@@ -1106,4 +1132,8 @@ def test_ann_reuse_checks_metadata_and_explicit_validation_checks_bytes(
         "payload_sha256",
     ):
         del legacy_group.attrs[attribute]
-    assert datastore.build_ann_index(reduction) == repaired
+    rebuilt = datastore.build_ann_index(reduction)
+    assert rebuilt != repaired
+    assert datastore.inspect_artifact(rebuilt).complete
+    with pytest.raises(ValueError, match="metadata is missing"):
+        validate_ann_index_payload(datastore.zw[artifact_path(repaired)], "l2", 3)

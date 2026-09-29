@@ -1,4 +1,5 @@
 from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,15 +10,13 @@ from ..storage.arrays import create_metadata_column, create_numeric_array
 from ..storage.artifact_writer import (
     ArrayRequirement,
     PlannedArtifact,
-    finish_artifact,
+    artifact_transaction,
     plan_artifact,
-    start_artifact,
 )
 from ..storage.artifacts import (
     ValueFingerprintBuilder,
     artifact_group,
     fingerprint_stored_strings,
-    fingerprint_strings,
     inspect_artifact,
     require_complete_artifact,
 )
@@ -32,7 +31,7 @@ from ..storage.selections import (
     fingerprint_selected_stored_strings,
     validate_stored_selection_integrity,
 )
-from ..storage.types import as_zarr_array, as_zarr_group
+from ..storage.types import as_zarr_array
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,12 +84,11 @@ class ImportedArtifactStorage:
             reuse_validator=reuse_validator,
         )
 
-    def start(self, planned: PlannedArtifact) -> zarr.Group:
-        return start_artifact(self.root, planned)
-
-    @staticmethod
-    def finish(group: zarr.Group, planned: PlannedArtifact) -> None:
-        finish_artifact(group, planned)
+    def transaction(
+        self, planned: PlannedArtifact
+    ) -> AbstractContextManager[zarr.Group]:
+        """Start ``planned``; a failed write deletes its incomplete group."""
+        return artifact_transaction(self.root, planned)
 
     def artifact_group(self, ref: ArtifactRef) -> zarr.Group:
         return artifact_group(self.root, ref)
@@ -116,20 +114,8 @@ class ImportedArtifactStorage:
         return as_zarr_array(node, name=name)
 
     @staticmethod
-    def as_group(node: zarr.Array | zarr.Group, name: str) -> zarr.Group:
-        return as_zarr_group(node, name=name)
-
-    @staticmethod
     def fingerprint_builder() -> ValueFingerprintBuilder:
         return ValueFingerprintBuilder()
-
-    @staticmethod
-    def fingerprint_strings(values: np.ndarray) -> str:
-        return fingerprint_strings(values)
-
-    @staticmethod
-    def fingerprint_stored_strings(array: zarr.Array) -> str:
-        return fingerprint_stored_strings(array)
 
     @staticmethod
     def fingerprint_selected_strings(
@@ -137,10 +123,6 @@ class ImportedArtifactStorage:
         selection: zarr.Array,
     ) -> tuple[str, int]:
         return fingerprint_selected_stored_strings(ids, selection)
-
-    @staticmethod
-    def block_rows(array: zarr.Array) -> int:
-        return row_band(array_geometry(array), unit="chunk", fallback=1)
 
     @staticmethod
     def create_numeric(
@@ -206,27 +188,120 @@ def _require_artifact_ref(
         )
 
 
-def _stored_value_fingerprint(array: zarr.Array) -> str:
+def payload_fingerprint(group: zarr.Group, name: str) -> str:
+    """Fingerprint one stored imported payload in bounded row blocks."""
+    array = as_zarr_array(group[name], name=name)
+    if name == "feature_ids":
+        return fingerprint_stored_strings(array)
     builder = ValueFingerprintBuilder()
     builder.begin_array("values", array.shape, array.dtype)
     block_rows = row_band(array_geometry(array), unit="chunk", fallback=1)
     for start in range(0, int(array.shape[0]), block_rows):
         stop = min(start + block_rows, int(array.shape[0]))
-        block = np.asarray(array[start:stop])
         builder.update_array_block(
             "values",
             (start,) + (0,) * (array.ndim - 1),
-            block,
+            np.asarray(array[start:stop]),
         )
     builder.end_array("values")
     return builder.hexdigest()
 
 
-def _payload_fingerprint(group: zarr.Group, name: str) -> str:
-    array = as_zarr_array(group[name], name=name)
-    if name == "feature_ids":
-        return fingerprint_stored_strings(array)
-    return _stored_value_fingerprint(array)
+def require_positive_block_rows(
+    execution_options: Mapping[str, Any] | None,
+    *,
+    label: str,
+    context: Mapping[str, Any],
+) -> None:
+    """Reject an imported record whose ``block_rows`` is not a positive integer."""
+    block_rows = (execution_options or {}).get("block_rows")
+    if (
+        isinstance(block_rows, bool)
+        or not isinstance(block_rows, int | np.integer)
+        or int(block_rows) < 1
+    ):
+        raise ArtifactResolutionError(
+            f"{label} block_rows is invalid",
+            code="corrupt_payload",
+            context=context,
+        )
+
+
+def require_source_digest(
+    inputs: Mapping[str, Any],
+    *,
+    label: str,
+    context: Mapping[str, Any],
+) -> None:
+    """Reject an imported record without a hexadecimal 32-byte source digest."""
+    source_digest = inputs.get("source_digest")
+    if (
+        not isinstance(source_digest, Mapping)
+        or set(source_digest) != {"bytes_hex"}
+        or not isinstance(source_digest.get("bytes_hex"), str)
+        or len(source_digest["bytes_hex"]) != 64
+        or source_digest["bytes_hex"].lower() != source_digest["bytes_hex"]
+    ):
+        raise ArtifactResolutionError(
+            f"{label} source digest is missing",
+            code="corrupt_payload",
+            context=context,
+        )
+    try:
+        bytes.fromhex(source_digest["bytes_hex"])
+    except ValueError as exc:
+        raise ArtifactResolutionError(
+            f"{label} source digest is not hexadecimal",
+            code="corrupt_payload",
+            context=context,
+        ) from exc
+
+
+def require_selected_row_order(
+    selection: ValidatedStoredSelection,
+    *,
+    row_count: int,
+    ordered_fingerprint: object,
+    label: str,
+    context: Mapping[str, Any],
+) -> None:
+    """Reject imported rows that differ from the selected cells or their order."""
+    try:
+        selected_fingerprint, selected_count = fingerprint_selected_stored_strings(
+            selection.row_ids,
+            selection.values,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ArtifactResolutionError(
+            f"{label} cell alignment payload is malformed",
+            code="corrupt_payload",
+            context=context,
+        ) from exc
+    if row_count != selected_count:
+        raise ArtifactResolutionError(
+            f"{label} rows do not match the exact cell selection",
+            code="dimreduc_row_count_mismatch",
+            context={
+                **context,
+                "coordinate_rows": row_count,
+                "selected_count": selected_count,
+            },
+        )
+    if (
+        not isinstance(ordered_fingerprint, str)
+        or ordered_fingerprint != selected_fingerprint
+    ):
+        raise ArtifactResolutionError(
+            f"{label} cell IDs do not match the selected cell order",
+            code="dimreduc_cell_identity_mismatch",
+            context={
+                **context,
+                "expected_fingerprint": ordered_fingerprint
+                if isinstance(ordered_fingerprint, str)
+                else None,
+                "actual_fingerprint": selected_fingerprint,
+            },
+        )
 
 
 def validate_imported_coordinates_artifact(
@@ -281,18 +356,12 @@ def validate_imported_coordinates_artifact(
             code="corrupt_payload",
             context=error_context,
         )
-    execution = status.execution_options or {}
-    block_rows = execution.get("block_rows")
-    if (
-        isinstance(block_rows, bool)
-        or not isinstance(block_rows, int | np.integer)
-        or int(block_rows) < 1
-    ):
-        raise ArtifactResolutionError(
-            "Imported-coordinate block_rows is invalid",
-            code="corrupt_payload",
-            context=error_context,
-        )
+    label = "Imported-coordinate"
+    require_positive_block_rows(
+        status.execution_options,
+        label=label,
+        context=error_context,
+    )
 
     inputs = status.inputs or {}
     raw_selection = inputs.get("cell_selection")
@@ -319,27 +388,7 @@ def validate_imported_coordinates_artifact(
         table_path="cellData",
     )
 
-    source_digest = inputs.get("source_digest")
-    if (
-        not isinstance(source_digest, Mapping)
-        or set(source_digest) != {"bytes_hex"}
-        or not isinstance(source_digest.get("bytes_hex"), str)
-        or len(source_digest["bytes_hex"]) != 64
-        or source_digest["bytes_hex"].lower() != source_digest["bytes_hex"]
-    ):
-        raise ArtifactResolutionError(
-            "Imported-coordinate source digest is missing",
-            code="corrupt_payload",
-            context=error_context,
-        )
-    try:
-        bytes.fromhex(source_digest["bytes_hex"])
-    except ValueError as exc:
-        raise ArtifactResolutionError(
-            "Imported-coordinate source digest is not hexadecimal",
-            code="corrupt_payload",
-            context=error_context,
-        ) from exc
+    require_source_digest(inputs, label=label, context=error_context)
 
     payload_fingerprints = inputs.get("payload_fingerprints")
     if not isinstance(payload_fingerprints, Mapping) or not all(
@@ -417,52 +466,13 @@ def validate_imported_coordinates_artifact(
             context=error_context,
         )
 
-    try:
-        mask = validated_selection.values
-        row_ids = validated_selection.row_ids
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ArtifactResolutionError(
-            "Imported-coordinate cell alignment payload is malformed",
-            code="corrupt_payload",
-            context=error_context,
-        ) from exc
-    try:
-        selected_fingerprint, selected_count = fingerprint_selected_stored_strings(
-            row_ids,
-            mask,
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ArtifactResolutionError(
-            "Imported-coordinate cell alignment payload is malformed",
-            code="corrupt_payload",
-            context=error_context,
-        ) from exc
-    if int(data.shape[0]) != selected_count:
-        raise ArtifactResolutionError(
-            "Imported-coordinate rows do not match the exact cell selection",
-            code="dimreduc_row_count_mismatch",
-            context={
-                **error_context,
-                "coordinate_rows": int(data.shape[0]),
-                "selected_count": selected_count,
-            },
-        )
-    ordered_fingerprint = inputs.get("ordered_cell_ids_fingerprint")
-    if (
-        not isinstance(ordered_fingerprint, str)
-        or ordered_fingerprint != selected_fingerprint
-    ):
-        raise ArtifactResolutionError(
-            "Imported-coordinate cell IDs do not match the selected cell order",
-            code="dimreduc_cell_identity_mismatch",
-            context={
-                **error_context,
-                "expected_fingerprint": ordered_fingerprint
-                if isinstance(ordered_fingerprint, str)
-                else None,
-                "actual_fingerprint": selected_fingerprint,
-            },
-        )
+    require_selected_row_order(
+        validated_selection,
+        row_count=int(data.shape[0]),
+        ordered_fingerprint=inputs.get("ordered_cell_ids_fingerprint"),
+        label=label,
+        context=error_context,
+    )
 
     optional = {
         "loadings": parameters.get("loadings_stored"),
@@ -545,7 +555,7 @@ def validate_imported_coordinates_artifact(
                 context={**error_context, "payload": name},
             )
         try:
-            actual = _payload_fingerprint(group, name)
+            actual = payload_fingerprint(group, name)
         except (KeyError, TypeError, ValueError) as exc:
             raise ArtifactResolutionError(
                 f"Imported-coordinate payload fingerprint for {name!r} is unreadable",

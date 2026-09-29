@@ -94,9 +94,9 @@ def _graph_store(root: zarr.Group) -> DataStore:
     features.create_array("I", data=np.ones(4, dtype=bool))
     assay.attrs.update({"prepared": False, "is_assay": True})
     root.attrs["assayTypes"] = {"RNA": "RNA"}
-    from scarf.storage.identity import finalize_counts
+    from tests.storage_helpers import finalize_test_counts
 
-    finalize_counts(counts)
+    finalize_test_counts(counts)
     finalize_writer_counts_t(root, "RNA", None, nthreads=1)
     return DataStore(
         root.store, default_assay="RNA", min_features_per_cell=0, nthreads=1
@@ -502,9 +502,9 @@ def test_imported_coordinates_reject_invalid_block_rows_and_fingerprints() -> No
         payload_fingerprints=fingerprints,
     )
 
-    with pytest.raises(TypeError, match="block_rows must be a positive integer"):
+    with pytest.raises(TypeError, match="block_rows must be an integer"):
         write_imported_coordinates(root, block_rows=0.5, **common)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="block_rows must be greater than zero"):
+    with pytest.raises(ValueError, match="block_rows must be at least 1"):
         write_imported_coordinates(root, block_rows=0, **common)
     with pytest.raises(ValueError, match="64-character lowercase hex"):
         write_imported_coordinates(
@@ -1109,7 +1109,7 @@ def test_imported_embedding_validates_role_and_source_key(
             "provenance",
             ("inputs", "ordered_cell_ids_fingerprint"),
             "0" * 64,
-            "cell IDs are out of order",
+            "cell IDs do not match the selected cell order",
         ),
         (
             "provenance",
@@ -1219,7 +1219,7 @@ def test_imported_embedding_validation_rechecks_selection_size() -> None:
         ("inputs", "payload_fingerprints"),
         {"values": fingerprint_array(replacement)},
     )
-    with pytest.raises(ValueError, match="rows do not match its cell selection"):
+    with pytest.raises(ValueError, match="rows do not match the exact cell selection"):
         validate_imported_embedding_artifact(root, ref)
 
 

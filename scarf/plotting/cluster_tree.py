@@ -10,11 +10,18 @@ from ..metadata.rows import apply_missing_mask
 from ..storage.artifacts import ArtifactRef
 from ._contracts import CategoricalScale, ColorScale, PlotProvenance, SizeScale
 from ._deps import require_matplotlib
-from ._figure import LegendSpec, PlotResult, normalize_axes_target
+from ._figure import (
+    LegendSpec,
+    PlotResult,
+    close_figures_on_error,
+    normalize_axes_target,
+)
 from ..utils.arrays import sort_categories
 from ._style import (
     apply_figure_chrome,
+    colormap_palette,
     continuous_norm,
+    resolve_color_limits,
     theme_context,
 )
 
@@ -148,7 +155,6 @@ def _tree_color_series(
 
 
 def _tree_palette(
-    mpl: Any,
     categories: list[Any],
     *,
     cmap: str,
@@ -160,11 +166,7 @@ def _tree_palette(
         if missing:
             raise KeyError(f"ERROR: key {missing[0]} missing in `color_key`")
         return palette
-    colormap = mpl.colormaps.get_cmap(cmap).resampled(max(len(categories), 1))
-    return {
-        category: mpl.colors.to_hex(colormap(index))
-        for index, category in enumerate(categories)
-    }
+    return colormap_palette(categories, cmap)
 
 
 def _draw_tree_pie(
@@ -187,6 +189,7 @@ def _draw_tree_pie(
         ax.scatter([x], [y], marker=marker, s=size, c=color, zorder=3)
 
 
+@close_figures_on_error
 def cluster_tree(
     store: Any,
     *,
@@ -266,7 +269,6 @@ def cluster_tree(
     if categorical:
         categories = sort_categories(list(color_values.dropna().unique()))
         palette = _tree_palette(
-            mpl,
             categories,
             cmap=cmap,
             color_key=color_key,
@@ -277,8 +279,10 @@ def cluster_tree(
             .groupby("cluster", observed=False)["value"]
             .mean()
         )
-        color_min = float(cluster_means.min())
-        color_max = float(cluster_means.max())
+        color_min, color_max = resolve_color_limits(
+            cluster_means.to_numpy(dtype=np.float64),
+            ColorScale(),
+        )
         norm = continuous_norm(
             mpl,
             vmin=color_min,
@@ -299,8 +303,12 @@ def cluster_tree(
                 node_sizes.append(max(float(cluster_sizes[cluster_id]), min_node_size))
             elif not categorical:
                 assert cluster_means is not None and norm is not None
+                mean = float(cluster_means.loc[cluster_id])
+                # A cluster whose fill values are all missing shows as missing.
                 node_colors.append(
-                    mpl.colors.to_hex(colormap(norm(cluster_means.loc[cluster_id])))
+                    mpl.colors.to_hex(colormap(norm(mean)))
+                    if np.isfinite(mean)
+                    else ColorScale().missing_color
                 )
                 node_sizes.append(max(float(cluster_sizes[cluster_id]), min_node_size))
             else:
@@ -348,6 +356,10 @@ def cluster_tree(
                     continue
                 cluster_id = node_data["partition_id"]
                 counts = color_values[cluster_values == cluster_id].value_counts()
+                # Categories absent from this cluster would draw empty wedges.
+                counts = counts[counts > 0]
+                if counts.empty:
+                    continue
                 _draw_tree_pie(
                     tree_ax,
                     counts.to_numpy(),
@@ -417,11 +429,7 @@ def cluster_tree(
             label=fill_by_value or "clusters",
         )
     else:
-        assert cluster_means is not None
-        color_min = float(cluster_means.min())
-        color_max = float(cluster_means.max())
-        if color_max <= color_min:
-            color_max = color_min + 1.0
+        assert norm is not None
         color_scale = ColorScale(
             cmap=cmap,
             vmin=color_min,

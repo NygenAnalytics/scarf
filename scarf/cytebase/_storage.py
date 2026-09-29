@@ -13,6 +13,7 @@ from tempfile import TemporaryDirectory
 from threading import Event
 
 import httpx
+import httpx2
 from huggingface_hub import (
     BucketFile,
     batch_bucket_files,
@@ -48,7 +49,17 @@ def error_message(error: Exception) -> str:
     return re.sub(r"hf_[A-Za-z0-9]+", "[redacted]", message)
 
 
-def _retry_delay(error: httpx.HTTPError, attempt: int) -> float:
+# Scarf's own requests use httpx; huggingface_hub 2 raises httpx2 errors.
+_TRANSPORT_ERRORS = (httpx.TransportError, httpx2.TransportError)
+_RETRYABLE_ERRORS = (
+    *_TRANSPORT_ERRORS,
+    httpx.HTTPStatusError,
+    httpx2.HTTPStatusError,
+    HfHubHTTPError,
+)
+
+
+def _retry_delay(error: httpx.HTTPError | httpx2.HTTPError, attempt: int) -> float:
     delay = float(2 ** (attempt + 1))
     response = getattr(error, "response", None)
     if response is None:
@@ -96,10 +107,10 @@ def retry[T](
             raise CancelledError("Transfer cancelled")
         try:
             return operation()
-        except (httpx.TransportError, httpx.HTTPStatusError, HfHubHTTPError) as error:
+        except _RETRYABLE_ERRORS as error:
             response = getattr(error, "response", None)
             transient = (
-                isinstance(error, httpx.TransportError)
+                isinstance(error, _TRANSPORT_ERRORS)
                 or response is not None
                 and (response.status_code in {408, 429} or response.status_code >= 500)
             )

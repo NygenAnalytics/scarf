@@ -4,6 +4,7 @@ from typing import Any
 import numpy as np
 from scipy.sparse import csr_matrix, issparse
 
+from ..utils.compute import process_thread_limit
 from ..utils.logging import logger
 from ..utils.numba import restore_numba_threads
 from ..utils.progress import tqdm_params as default_tqdm_params
@@ -100,7 +101,6 @@ def simplicial_set_embedding(
     """Run UMAP simplicial-set embedding with optional densMAP."""
     import numba
     from sklearn.utils import check_random_state
-    from threadpoolctl import threadpool_limits
     from umap.layouts import optimize_layout_euclidean
     from umap.umap_ import make_epochs_per_sample
 
@@ -115,7 +115,7 @@ def simplicial_set_embedding(
         numba.set_num_threads(nthreads)
 
     if densmap_kwds != {}:
-        with threadpool_limits(limits=nthreads):
+        with process_thread_limit(nthreads):
             mu_sum, standardized_ro = calc_dens_map_params(
                 g,
                 densmap_kwds["knn_dists"],

@@ -42,10 +42,22 @@ if not logger.handlers:
     handler.setFormatter(_LogFormatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)
 
+_BUCKET_KEYS = ("CYTEBASE_BUCKET", "CYTEBASE_BUCKET_DEV")
+
+
+def _bucket_key() -> str:
+    """Return the ``scarf-env`` key that names this deployment's bucket."""
+    key = os.environ.get("CYTEBASE_BUCKET_KEY", "CYTEBASE_BUCKET")
+    if key not in _BUCKET_KEYS:
+        raise ValueError(
+            f"CYTEBASE_BUCKET_KEY must be one of {', '.join(_BUCKET_KEYS)}"
+        )
+    return key
+
+
+BUCKET_KEY = _bucket_key()
 app = modal.App("cytebase")
-secret = modal.Secret.from_name(
-    "scarf-env", required_keys=["HF_TOKEN", "CYTEBASE_BUCKET"]
-)
+secret = modal.Secret.from_name("scarf-env", required_keys=["HF_TOKEN", BUCKET_KEY])
 progress_store = modal.Dict.from_name("cytebase-progress", create_if_missing=True)
 RUN_PATH = "_internal/pipeline.json"
 
@@ -85,6 +97,7 @@ image = (
     .env(
         {
             "CYTEBASE_PIPELINE_VERSION": _SHA,
+            "CYTEBASE_BUCKET_KEY": BUCKET_KEY,
             "CYTEBASE_DOWNLOAD_CONNECTIONS": str(download_connections()),
             "CYTEBASE_PROCESS_CONTAINERS": str(PROCESS_CONTAINERS),
             "HF_HUB_DISABLE_PROGRESS_BARS": "1",
@@ -97,7 +110,11 @@ def _storage() -> Bucket:
     token = os.environ.get("HF_TOKEN", "").strip()
     if not token:
         raise RuntimeError("Missing required environment variable: HF_TOKEN")
-    return Bucket(token=token)
+    key = _bucket_key()
+    bucket = os.environ.get(key, "").strip()
+    if not bucket:
+        raise RuntimeError(f"Missing required environment variable: {key}")
+    return Bucket(bucket, token=token)
 
 
 def _now() -> str:

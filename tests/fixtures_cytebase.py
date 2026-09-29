@@ -123,6 +123,8 @@ def cytebase_offline(monkeypatch, tmp_path):
         "HF_TOKEN",
         "HUGGING_FACE_HUB_TOKEN",
         "CYTEBASE_BUCKET",
+        "CYTEBASE_BUCKET_DEV",
+        "CYTEBASE_BUCKET_KEY",
         "CYTEBASE_PIPELINE_VERSION",
         "CYTEBASE_DOWNLOAD_CONNECTIONS",
         "CYTEBASE_PROCESS_CONTAINERS",
@@ -492,6 +494,20 @@ def write_categorical(parent: Any, name: str, values: list[str | None]) -> None:
 
 def _write_names(parent: Any, name: str, values: list[str]) -> None:
     parent.create_dataset(name, data=np.array([value.encode() for value in values]))
+
+
+def write_column_order(group: Any, names: list[str], index: str = "_index") -> None:
+    """Write the dataframe attributes AnnData records on ``obs`` or ``var``.
+
+    ``column-order`` lists each column by its full name, as AnnData does even
+    for a name containing ``/`` that old versions nested into HDF5 groups.
+    """
+    import h5py
+
+    group.attrs["encoding-type"] = "dataframe"
+    group.attrs["encoding-version"] = "0.2.0"
+    group.attrs["_index"] = index
+    group.attrs.create("column-order", names, dtype=h5py.string_dtype())
 
 
 def write_h5ad(

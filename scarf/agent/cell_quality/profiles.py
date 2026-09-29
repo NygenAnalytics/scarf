@@ -5,17 +5,19 @@ from dataclasses import dataclass, field
 from typing import Literal, cast
 
 import numpy as np
+import pandas as pd
 
 from ...quality_control.filtering import (
-    _apply_bounds,
-    _clamp_metric_bound,
-    _from_work_scale,
-    _mad_bounds,
-    _sample_aware_mad_mask,
-    _validated_sample_labels,
-    _validated_work_scale,
+    clamp_metric_bound,
+    from_work_scale,
     gaussian_quantile_bounds,
+    mad_bounds,
+    sample_aware_mad_mask,
+    unique_label_keys,
+    validated_sample_labels,
+    validated_work_scale,
 )
+from ...utils.arrays import within_bounds
 
 type RegisteredCellQcProfile = Literal[
     "retainWithFlags",
@@ -281,12 +283,12 @@ def _threshold(
 ) -> RegisteredQcThreshold:
     role = registered_qc_metric_role(metric)
     transform, removal_direction = _metric_policy(role)
-    work = _validated_work_scale(values[reference], attr=metric, transform=transform)
+    work = validated_work_scale(values[reference], attr=metric, transform=transform)
     median_work = float(np.median(work))
-    low_work, high_work, scaled_mad = _mad_bounds(work, n_mads)
+    low_work, high_work, scaled_mad = mad_bounds(work, n_mads)
     if scaled_mad == 0.0:
-        median = _clamp_metric_bound(
-            _from_work_scale(median_work, transform),
+        median = clamp_metric_bound(
+            from_work_scale(median_work, transform),
             transform=transform,
             is_percent=role in {"mitochondrial", "ribosomal"},
         )
@@ -305,18 +307,18 @@ def _threshold(
             skipReason="zeroMad",
         )
 
-    median = _clamp_metric_bound(
-        _from_work_scale(median_work, transform),
+    median = clamp_metric_bound(
+        from_work_scale(median_work, transform),
         transform=transform,
         is_percent=role in {"mitochondrial", "ribosomal"},
     )
-    low = _clamp_metric_bound(
-        _from_work_scale(low_work, transform),
+    low = clamp_metric_bound(
+        from_work_scale(low_work, transform),
         transform=transform,
         is_percent=role in {"mitochondrial", "ribosomal"},
     )
-    high = _clamp_metric_bound(
-        _from_work_scale(high_work, transform),
+    high = clamp_metric_bound(
+        from_work_scale(high_work, transform),
         transform=transform,
         is_percent=role in {"mitochondrial", "ribosomal"},
     )
@@ -372,26 +374,22 @@ def _ordered_capture_masks(
     capture_labels: np.ndarray,
     active: np.ndarray,
 ) -> list[tuple[str, np.ndarray]]:
-    labels = _validated_sample_labels(
+    labels = validated_sample_labels(
         capture_labels,
         active,
         label_name="physical capture labels",
     )
+    active_mask = np.asarray(active, dtype=bool)
+    # Factorizing keeps first-seen order, as the core sample MAD mask does, and
+    # replaces per-cell label comparisons with integer codes.
+    active_idx = np.flatnonzero(active_mask)
+    codes, uniques = pd.factorize(labels[active_mask])
+    keys = unique_label_keys(uniques, label_name="Physical capture labels")
     captures: list[tuple[str, np.ndarray]] = []
-    seen_values: list[object] = []
-    seen_keys: set[str] = set()
-    for raw in labels[active]:
-        value = raw.item() if isinstance(raw, np.generic) else raw
-        if any(value == seen for seen in seen_values):
-            continue
-        key = value.decode("utf-8") if isinstance(value, bytes) else str(value)
-        if key in seen_keys:
-            raise ValueError(
-                "Physical capture labels collide after provenance encoding"
-            )
-        seen_values.append(value)
-        seen_keys.add(key)
-        captures.append((key, active & (labels == raw)))
+    for code, key in enumerate(keys):
+        mask = np.zeros(active_mask.shape, dtype=bool)
+        mask[active_idx[codes == code]] = True
+        captures.append((key, mask))
     return captures
 
 
@@ -419,14 +417,14 @@ def _global_capture_comparisons(
         for metric, threshold in global_thresholds.items():
             role = threshold.role
             transform, _ = _metric_policy(role)
-            capture_work = _validated_work_scale(
+            capture_work = validated_work_scale(
                 values_by_metric[metric][mask],
                 attr=metric,
                 transform=transform,
             )
             capture_median_work = float(np.median(capture_work))
-            capture_median = _clamp_metric_bound(
-                _from_work_scale(capture_median_work, transform),
+            capture_median = clamp_metric_bound(
+                from_work_scale(capture_median_work, transform),
                 transform=transform,
                 is_percent=role in {"mitochondrial", "ribosomal"},
             )
@@ -721,7 +719,7 @@ def project_auto_filter_profile(
                     f"QC metric {metric!r} produced non-finite Gaussian bounds"
                 )
             resolved_bounds[metric] = {"low": low, "high": high}
-            keep &= _apply_bounds(metric_values, low, high, keep_bounds=low == high)
+            keep &= within_bounds(metric_values, low, high, keep_bounds=low == high)
             _auto_bound_flags(
                 metric=metric,
                 values=metric_values,
@@ -751,7 +749,7 @@ def project_auto_filter_profile(
                 "sampleMad requires the core Gaussian probabilities to remain "
                 "at 0.01 and 0.99"
             )
-        keep_from_core, provenance = _sample_aware_mad_mask(
+        keep_from_core, provenance = sample_aware_mad_mask(
             values_by_attr=values,
             sample_labels=np.asarray(sample_labels),
             active=active_mask,

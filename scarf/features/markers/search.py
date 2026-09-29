@@ -4,22 +4,26 @@ import numba
 import numpy as np
 import pandas as pd
 from numba import set_num_threads
-from scipy.special import ndtr
 
 from ...assay import Assay, ATACassay, RNAassay, lib_size_feature_stream_eligible
 from ...assay.normalization import (
+    clr_values,
+    inverse_document_frequency,
+    library_size_values,
     norm_clr,
     norm_dummy,
     norm_tf_idf,
     reject_unknown_normalization_params,
+    tfidf_values,
 )
 from ...utils.logging import logger
 from ...utils.numba import restore_numba_threads
-from .correction import _bh_adjusted_pvalues
+from ..statistical import adjust_pvalues
 from .rank import (
     _batch_stats,
     _marker_stats_gene_major,
     gene_major_rank_scratch_bytes,
+    set_two_sided_p_values,
     sort_marker_results,
 )
 from .regression import (
@@ -43,37 +47,6 @@ _KERNEL_STAT_COLUMNS = (
     "p_value",
     "auc",
 )
-
-
-def _tfidf_feature_values(
-    raw: np.ndarray,
-    cell_scale: np.ndarray,
-    feature_scale: np.ndarray,
-) -> np.ndarray:
-    cells = np.asarray(raw.T, dtype=np.float64)
-    denom = np.asarray(cell_scale, dtype=np.float64).reshape(-1, 1)
-    scale = np.asarray(feature_scale, dtype=np.float64).reshape(1, -1)
-    return np.asarray((cells / denom) * scale, dtype=np.float64)
-
-
-def _clr_feature_values(raw: np.ndarray) -> np.ndarray:
-    cells = np.asarray(raw.T, dtype=np.float64)
-    scale = np.exp(np.log1p(cells).sum(axis=0) / max(1, cells.shape[0]))
-    return np.asarray(np.log1p(cells / scale), dtype=np.float64)
-
-
-def _lib_size_feature_values(
-    raw: np.ndarray,
-    scalar: np.ndarray,
-    size_factor: float,
-    log_transform: bool,
-) -> np.ndarray:
-    cells = (
-        np.float32(size_factor) * raw.T.astype(np.float32, copy=False)
-    ) / np.asarray(scalar, dtype=np.float32).reshape(-1, 1)
-    if log_transform:
-        cells = np.log1p(cells)
-    return np.asarray(cells, dtype=np.float32)
 
 
 def _validate_rank_marker_groups(group_counts: np.ndarray, n_total: int) -> None:
@@ -204,13 +177,15 @@ def find_markers_by_rank(
     feature_scale: np.ndarray | None = None
     scalar_values: np.ndarray | None = None
     size_factor = 1.0
-    if adapter == "rna_lib_size_unsigned":
-        assert isinstance(assay, RNAassay)
-        scalar = assay.cells.fetch_all(assay.name + "_nCounts")[cell_idx]
-        size_factor = float(assay.sf) if assay.sf is not None else 1.0
+    if adapter in ("rna_lib_size_unsigned", "lib_size"):
+        # Both library-size adapters normalize in float32.
         if assay.sf is None:
             raise ValueError("RNA library-size normalization requires a size factor")
-        scalar_values = np.asarray(scalar, dtype=np.float32)
+        size_factor = float(assay.sf)
+        scalar_values = np.asarray(
+            assay.cells.fetch_all(assay.name + "_nCounts")[cell_idx],
+            dtype=np.float32,
+        )
         scalar_values[scalar_values == 0] = 1
     elif adapter == "tfidf":
         if not isinstance(assay, ATACassay):
@@ -219,15 +194,7 @@ def find_markers_by_rank(
             cell_idx, feat_idx, **norm_params
         )
         cell_scale = np.asarray(term_totals, dtype=np.float64)
-        feature_scale = np.log2(
-            1.0
-            + (float(n_docs) / (np.asarray(document_frequency, dtype=np.float64) + 1.0))
-        )
-    elif adapter == "lib_size":
-        scalar = assay.cells.fetch_all(assay.name + "_nCounts")[cell_idx]
-        size_factor = float(assay.sf) if assay.sf is not None else 1.0
-        scalar_values = np.asarray(scalar, dtype=np.float32)
-        scalar_values[scalar_values == 0] = 1
+        feature_scale = inverse_document_frequency(n_docs, document_frequency)
 
     if adapter is not None:
         # Every adapter reads countsT, so its presence selects one.
@@ -284,17 +251,21 @@ def find_markers_by_rank(
             if adapter == "tfidf":
                 assert cell_scale is not None
                 assert feature_scale is not None
-                values = _tfidf_feature_values(
-                    raw, cell_scale, feature_scale[destinations]
-                )
+                values = tfidf_values(raw.T, cell_scale, feature_scale[destinations])
             elif adapter == "clr":
-                values = _clr_feature_values(raw)
+                # Every selected cell is in the batch, so CLR is fitted on all
+                # of them. The adapter computes it in float64 for every dtype.
+                values = clr_values(np.asarray(raw.T, dtype=np.float64))
             elif adapter == "dummy":
                 values = np.asarray(raw.T)
             else:
                 assert scalar_values is not None
-                values = _lib_size_feature_values(
-                    raw, scalar_values, size_factor, log_transform
+                values = library_size_values(
+                    raw.T,
+                    scalar_values,
+                    size_factor,
+                    dtype=np.float32,
+                    log_transform=log_transform,
                 )
             stats_matrix[destinations] = _batch_stats(
                 values,
@@ -334,8 +305,7 @@ def find_markers_by_rank(
         finally:
             set_num_threads(previous_threads)
         if adapter == "rna_lib_size_unsigned":
-            z_values = np.asarray(stats_matrix[:, :, 6], dtype=np.float64)
-            stats_matrix[:, :, 6] = 2.0 * ndtr(-np.abs(z_values))
+            set_two_sided_p_values(stats_matrix)
     else:
         batch_stats = []
         iterator = iter(
@@ -372,7 +342,7 @@ def find_markers_by_rank(
         for position, name in enumerate(_KERNEL_STAT_COLUMNS):
             values = np.asarray(stats_matrix[:, n, position], dtype=np.float64)
             columns[name] = values if name == "p_value" else np.round(values, 5)
-        columns["p_value_adjusted"] = _bh_adjusted_pvalues(columns["p_value"])
+        columns["p_value_adjusted"] = adjust_pvalues(columns["p_value"], "fdr_bh")
         frame = pd.DataFrame(columns, index=feat_idx)
         results[i] = sort_marker_results(frame)[out_cols]
     return results
@@ -466,7 +436,7 @@ def find_markers_by_regression(
     adjusted = np.full(p_values.shape, np.nan, dtype=np.float64)
     tested = status == _REG_OK
     if np.any(tested):
-        adjusted[tested] = _bh_adjusted_pvalues(p_values[tested])
+        adjusted[tested] = adjust_pvalues(p_values[tested], "fdr_bh")
     untested = status == _REG_SENTINEL
     p_values = p_values.astype(np.float64, copy=True)
     p_values[untested] = np.nan

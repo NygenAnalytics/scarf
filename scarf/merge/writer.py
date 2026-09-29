@@ -12,7 +12,7 @@ from ..storage.count_matrix import CountMatrixPolicy
 from ..storage.io_policy import StorageIoPolicy
 from ..storage.layout import ZarrArraySpec
 from ..storage.profiles import StorageProfile
-from ..storage.schema import create_zarr_count_assay, load_count_array
+from ..storage.schema import _assay_paths, create_zarr_count_assay, load_count_array
 from ..storage.sharding import (
     accumulate_sparse_to_shards,
     resolve_sparse_import_batch,
@@ -20,7 +20,7 @@ from ..storage.sharding import (
     write_counts_t,
 )
 from ..storage.types import array_metadata_shards, as_zarr_array, as_zarr_group
-from ..utils.arrays import canonicalize_sparse
+from ..utils.arrays import canonicalize_sparse, max_window_nnz
 from ..utils.compute import controlled_compute
 from ..utils.logging import logger
 from ..utils.progress import iter_progress
@@ -28,12 +28,7 @@ from .features import FeatureAlignment
 from .row_plan import RowPlan, iter_row_plan_segments
 
 
-CountsTReuseOutcome = Literal[
-    "reusable",
-    "rewrite-layout",
-    "incomplete",
-    "block-shape/dtype",
-]
+CountsTReuseOutcome = Literal["reusable", "incomplete", "invalid"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,15 +40,12 @@ class CountsTReuseAssessment:
 
 
 def _matrix_group_path(assay_name: str, workspace: str | None) -> str:
-    return assay_name if workspace is None else f"matrices/{assay_name}"
+    logical, matrix = _assay_paths(assay_name, workspace)
+    return logical if matrix is None else matrix
 
 
 def _assay_metadata_path(assay_name: str, workspace: str | None) -> str:
-    return assay_name if workspace is None else f"{workspace}/{assay_name}"
-
-
-def _cell_data_path(workspace: str | None) -> str:
-    return "cellData" if workspace is None else f"{workspace}/cellData"
+    return _assay_paths(assay_name, workspace)[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,16 +187,6 @@ def _merge_import_requirements(
         resources,
         resident_bytes=base_resident,
     )
-    n_ordered = row_plan.nCells
-
-    def max_window_nnz(window_rows: int) -> int:
-        if n_ordered == 0:
-            return 0
-        width = min(max(0, int(window_rows)), n_ordered)
-        if width == 0:
-            return 0
-        return int(np.max(cumulative[width:] - cumulative[:-width]))
-
     present = [assay for assay in assays if assay is not None]
     source_dtype = (
         np.result_type(*(assay.rawData.dtype for assay in present))
@@ -243,7 +225,7 @@ def _merge_import_requirements(
         return int(dense_bytes + remap_bytes + max_decode_bytes)
 
     return _MergeImportRequirements(
-        maxWindowNnz=max_window_nnz,
+        maxWindowNnz=lambda rows: max_window_nnz(cumulative, rows),
         sourceDtype=np.dtype(source_dtype),
         residentBytes=resident_bytes,
         extraProducerBytes=extra_producer_bytes,
@@ -288,13 +270,11 @@ def write_assay_counts(
     alignment: FeatureAlignment,
     *,
     resources: ResourceBudget,
-    profile: StorageProfile,
     additionalResidentBytes: int = 0,
     io: StorageIoPolicy | None = None,
 ) -> int:
     """Stream remapped source blocks into the destination counts array."""
     destination = load_count_array(root, assay_name, workspace)
-    _ = profile
     summary = CountSummary(destination)
     requirements = _merge_import_requirements(
         assays,
@@ -538,9 +518,9 @@ def assess_counts_t_reuse(
 
     Outcomes:
     - ``reusable``: complete paired layout matching the planned geometry
-    - ``rewrite-layout``: present but not the locked rotateOnce layout
     - ``incomplete``: missing or ``complete`` is not True
-    - ``block-shape/dtype``: complete array that disagrees with the merge plan
+    - ``invalid``: complete array whose shape, dtype, or paired layout
+      disagrees with the merge plan
     """
     from ..storage.counts_t_contract import validate_count_matrix
 
@@ -569,7 +549,7 @@ def assess_counts_t_reuse(
     actual_shape = tuple(int(value) for value in counts_t.shape)
     if actual_shape != expected_shape:
         return CountsTReuseAssessment(
-            outcome="block-shape/dtype",
+            outcome="invalid",
             reason=(
                 f"countsT shape for {assay_name!r} is {actual_shape}, "
                 f"expected {expected_shape}"
@@ -577,7 +557,7 @@ def assess_counts_t_reuse(
         )
     if np.dtype(counts_t.dtype) != np.dtype(dtype):
         return CountsTReuseAssessment(
-            outcome="block-shape/dtype",
+            outcome="invalid",
             reason=(
                 f"countsT dtype for {assay_name!r} is {np.dtype(counts_t.dtype)}, "
                 f"expected {np.dtype(dtype)}"
@@ -586,8 +566,5 @@ def assess_counts_t_reuse(
     try:
         validate_count_matrix(matrix_group, require_transpose=True)
     except ValueError as exc:
-        return CountsTReuseAssessment(
-            outcome="rewrite-layout",
-            reason=str(exc),
-        )
+        return CountsTReuseAssessment(outcome="invalid", reason=str(exc))
     return CountsTReuseAssessment(outcome="reusable", reason=None)

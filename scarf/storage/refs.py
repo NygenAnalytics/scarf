@@ -195,21 +195,3 @@ def artifact_path(ref: ArtifactRef) -> str:
     if ref.scope == "assay":
         return f"{ref.assay}/artifacts/{ref.kind}/{ref.artifact_id}"
     return f"artifacts/{ref.kind}/{ref.artifact_id}"
-
-
-def parse_artifact_path(path: str) -> ArtifactRef:
-    parts = path.strip("/").split("/")
-    if len(parts) == 3 and parts[0] == "artifacts":
-        return ArtifactRef(
-            scope="datastore",
-            kind=parts[1],
-            artifact_id=parts[2],
-        )
-    if len(parts) == 4 and parts[1] == "artifacts":
-        return ArtifactRef(
-            scope="assay",
-            assay=parts[0],
-            kind=parts[2],
-            artifact_id=parts[3],
-        )
-    raise ValueError(f"Not an artifact path: {path!r}")

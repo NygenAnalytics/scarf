@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from ...graph.arguments import graph_flag
 from ...graph.distances import validate_distance_provenance
 from ...graph.feature_projection import (
     graph_cell_selection,
@@ -20,6 +21,7 @@ from ...storage.artifacts import (
     inspect_artifact,
 )
 from ...storage.types import as_zarr_array, as_zarr_group
+from ...utils.arguments import float_argument, integer_argument
 from ...utils.logging import logger, progress_enabled
 from ...utils.shutdown import shutdown_checkpoint
 
@@ -44,13 +46,20 @@ def _checked_initialization(
     return copy
 
 
+def _check_initial_shape(ini_embed: np.ndarray, n_cells: int, n_comps: int) -> None:
+    if ini_embed.shape != (n_cells, n_comps):
+        raise ValueError(
+            f"Initial embedding has an invalid shape; expected {(n_cells, n_comps)}"
+        )
+
+
 class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
     def _get_ini_embed(
         self,
         initialization: ArtifactRef,
         graph: ArtifactRef,
         n_comps: int,
-    ) -> tuple[np.ndarray, ArtifactRef]:
+    ) -> np.ndarray:
         """Runs PCA on kmeans cluster centers and ascribes the PC values to
         individual cells based on their cluster labels. This is used in
         `run_umap` and `run_tsne` for initial embedding of cells. Uses
@@ -103,7 +112,33 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
         clusters = np.asarray(
             as_zarr_array(kmeans_grp["cluster_labels"], name="cluster_labels")[:]
         )
-        return initial_embedding(cluster_centers, clusters, n_comps), initialization
+        return initial_embedding(cluster_centers, clusters, n_comps)
+
+    def _embedding_inputs(
+        self,
+        graph: ArtifactRef,
+        initialization: ArtifactRef | np.ndarray,
+        n_comps: int,
+        dtype: type[np.floating[Any]] | None,
+    ) -> tuple[ArtifactRef, int, object, np.ndarray | None]:
+        """Validate embedding inputs without loading the graph.
+
+        Returns the graph cell selection, the graph cell count, the
+        initialization identity input, and an array initialization when one
+        was given. An initialization artifact is expanded only when needed.
+        """
+        if not isinstance(graph, ArtifactRef):
+            raise TypeError("graph must be an ArtifactRef")
+        cell_selection = graph_cell_selection(self.zw, graph)
+        n_cells = self._get_graph_ncells_k(self._graph_location(graph))[0]
+        if isinstance(initialization, ArtifactRef):
+            return cell_selection, n_cells, initialization, None
+        if not isinstance(initialization, np.ndarray):
+            raise TypeError("initialization must be an ArtifactRef or numpy array")
+        ini_embed = _checked_initialization(initialization, dtype)
+        _check_initial_shape(ini_embed, n_cells, n_comps)
+        identity = {"value_fingerprint": fingerprint_array(ini_embed)}
+        return cell_selection, n_cells, identity, ini_embed
 
     def run_tsne(
         self,
@@ -157,33 +192,11 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
         Returns:
             Reference to the immutable embedding artifact.
         """
-        if not isinstance(graph, ArtifactRef):
-            raise TypeError("graph must be an ArtifactRef")
-        graph_input = graph
-        cell_selection = graph_cell_selection(self.zw, graph_input)
-        graph_matrix = self._load_graph_artifact(
-            graph_input,
-            symmetric=symmetric_graph,
-            upper_only=graph_upper_only,
-            use_k=None,
+        symmetric_graph = graph_flag(symmetric_graph, "symmetric_graph")
+        graph_upper_only = graph_flag(graph_upper_only, "graph_upper_only")
+        cell_selection, n_cells, initialization_input, ini_embed = (
+            self._embedding_inputs(graph, initialization, tsne_dims, None)
         )
-        initialization_input: object
-        if isinstance(initialization, ArtifactRef):
-            ini_embed, initialization_input = self._get_ini_embed(
-                initialization,
-                graph_input,
-                tsne_dims,
-            )
-        elif isinstance(initialization, np.ndarray):
-            ini_embed = _checked_initialization(initialization)
-            initialization_input = {"value_fingerprint": fingerprint_array(ini_embed)}
-        else:
-            raise TypeError("initialization must be an ArtifactRef or numpy array")
-        if ini_embed.shape != (graph_matrix.shape[0], tsne_dims):
-            raise ValueError(
-                "Initial embedding has an invalid shape; expected "
-                f"{(graph_matrix.shape[0], tsne_dims)}"
-            )
         if parallel:
             if nthreads is None:
                 nthreads = self.nthreads
@@ -191,9 +204,8 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
                 assert isinstance(nthreads, int)
         else:
             nthreads = 1
-        artifact_scope = graph_input.scope
         arguments = TsneArguments(
-            graph=graph_input,
+            graph=graph,
             initialization=initialization_input,
             symmetric_graph=symmetric_graph,
             graph_upper_only=graph_upper_only,
@@ -212,68 +224,72 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
         record = arguments.to_record()
         planned = plan_cell_data_artifact(
             self.zw,
-            scope=artifact_scope,
-            assay=(graph_input.assay if graph_input.scope == "assay" else None),
+            scope=graph.scope,
+            assay=(graph.assay if graph.scope == "assay" else None),
             kind=arguments.artifact_kind,
             operation=arguments.operation,
             parameters=record.parameters,
             inputs=record.inputs,
             execution_options=record.execution_options,
             cell_selection=cell_selection,
-            arrays={"values": ((graph_matrix.shape[0], tsne_dims), "f")},
+            arrays={"values": ((n_cells, tsne_dims), "f")},
             invalidate_cache=invalidate_cache,
         )
         if planned.reused:
-            values_count = graph_matrix.shape[0]
-        else:
-            import sys
-
-            if sys.platform not in ["posix", "linux"]:
-                raise RuntimeError(
-                    f"{sys.platform} operating system is currently not supported."
-                )
-            from ...embeddings.sgtsne import run_sgtsne
-
-            try:
-                shutdown_checkpoint()
-                raw_embedding = np.asarray(
-                    run_sgtsne(
-                        graph_matrix,
-                        ini_embed,
-                        tsne_dims=tsne_dims,
-                        max_iter=max_iter,
-                        early_iter=early_iter,
-                        alpha=alpha,
-                        lambda_scale=lambda_scale,
-                        box_h=box_h,
-                        temp_file_loc=temp_file_loc,
-                        verbose=verbose,
-                        parallel=parallel,
-                        nthreads=nthreads,
-                    )
-                )
-                shutdown_checkpoint()
-            except (FileNotFoundError, ImportError) as exc:
-                raise RuntimeError(
-                    "SG-tSNE failed, possibly due to missing sgtsne executable or "
-                    f"sgtsnepi package: {exc}"
-                ) from exc
-            if raw_embedding.shape != (tsne_dims, graph_matrix.shape[0]):
-                raise ValueError(
-                    "SG-tSNE returned an embedding with shape "
-                    f"{raw_embedding.shape}; "
-                    f"expected {(tsne_dims, graph_matrix.shape[0])}"
-                )
-            values = raw_embedding.T
-            write_cell_data_artifact(
-                self.zw,
-                planned,
-                {"values": values},
+            logger.info(
+                f"Reused {tsne_dims}-dimensional t-SNE embedding for {n_cells} cells"
             )
-            values_count = len(values)
-        action = "Reused" if planned.reused else "Stored"
+            return planned.ref
+        import sys
+
+        if sys.platform != "linux":
+            raise RuntimeError(
+                f"{sys.platform} operating system is currently not supported."
+            )
+        from ...embeddings.sgtsne import run_sgtsne
+
+        graph_matrix = self._load_graph_artifact(
+            graph,
+            symmetric=symmetric_graph,
+            upper_only=graph_upper_only,
+            use_k=None,
+        )
+        if ini_embed is None:
+            assert isinstance(initialization, ArtifactRef)
+            ini_embed = self._get_ini_embed(initialization, graph, tsne_dims)
+            _check_initial_shape(ini_embed, n_cells, tsne_dims)
+        try:
+            shutdown_checkpoint()
+            raw_embedding = np.asarray(
+                run_sgtsne(
+                    graph_matrix,
+                    ini_embed,
+                    tsne_dims=tsne_dims,
+                    max_iter=max_iter,
+                    early_iter=early_iter,
+                    alpha=alpha,
+                    lambda_scale=lambda_scale,
+                    box_h=box_h,
+                    temp_file_loc=temp_file_loc,
+                    verbose=verbose,
+                    parallel=parallel,
+                    nthreads=nthreads,
+                )
+            )
+            shutdown_checkpoint()
+        except (FileNotFoundError, ImportError) as exc:
+            raise RuntimeError(
+                "SG-tSNE failed, possibly due to missing sgtsne executable or "
+                f"sgtsnepi package: {exc}"
+            ) from exc
+        if raw_embedding.shape != (tsne_dims, n_cells):
+            raise ValueError(
+                "SG-tSNE returned an embedding with shape "
+                f"{raw_embedding.shape}; expected {(tsne_dims, n_cells)}"
+            )
+        write_cell_data_artifact(self.zw, planned, {"values": raw_embedding.T})
         logger.info(
-            f"{action} {tsne_dims}-dimensional t-SNE embedding for {values_count} cells"
+            f"Stored {tsne_dims}-dimensional t-SNE embedding for {n_cells} cells"
         )
         return planned.ref
 
@@ -347,43 +363,38 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
             fit_transform,
         )
 
-        if not isinstance(graph, ArtifactRef):
-            raise TypeError("graph must be an ArtifactRef")
-        graph_input = graph
-        cell_selection = graph_cell_selection(self.zw, graph_input)
-        graph_matrix = self._load_graph_artifact(
-            graph_input,
-            symmetric=symmetric_graph,
-            upper_only=graph_upper_only,
-            use_k=None,
+        if symmetric_graph is not None:
+            symmetric_graph = graph_flag(symmetric_graph, "symmetric_graph")
+        if graph_upper_only is not None:
+            graph_upper_only = graph_flag(graph_upper_only, "graph_upper_only")
+        # Parameters are recorded canonically, so ``min_dist=1`` and
+        # ``min_dist=1.0`` identify the same embedding.
+        umap_dims = integer_argument(umap_dims, "umap_dims", minimum=1)
+        n_epochs = integer_argument(n_epochs, "n_epochs", minimum=1)
+        random_seed = integer_argument(random_seed, "random_seed", minimum=0)
+        spread = float_argument(spread, "spread")
+        min_dist = float_argument(min_dist, "min_dist")
+        repulsion_strength = float_argument(repulsion_strength, "repulsion_strength")
+        initial_alpha = float_argument(initial_alpha, "initial_alpha")
+        negative_sample_rate = float_argument(
+            negative_sample_rate, "negative_sample_rate"
         )
-        initialization_input: object
-        if isinstance(initialization, ArtifactRef):
-            ini_embed, initialization_input = self._get_ini_embed(
-                initialization,
-                graph_input,
-                umap_dims,
-            )
-        elif isinstance(initialization, np.ndarray):
-            # UMAP optimizes its initialization in place and requires
-            # C-contiguous float32 coordinates, so it works on a private copy.
-            ini_embed = _checked_initialization(initialization, np.float32)
-            initialization_input = {"value_fingerprint": fingerprint_array(ini_embed)}
-        else:
-            raise TypeError("initialization must be an ArtifactRef or numpy array")
-        if ini_embed.shape != (graph_matrix.shape[0], umap_dims):
-            raise ValueError(
-                "Initial embedding has an invalid shape; expected "
-                f"{(graph_matrix.shape[0], umap_dims)}"
-            )
+        dens_lambda = float_argument(dens_lambda, "dens_lambda")
+        dens_frac = float_argument(dens_frac, "dens_frac")
+        dens_var_shift = float_argument(dens_var_shift, "dens_var_shift")
+        use_density_map = graph_flag(use_density_map, "use_density_map")
+        parallel = graph_flag(parallel, "parallel")
+        # UMAP optimizes its initialization in place and requires C-contiguous
+        # float32 coordinates, so an array initialization becomes a private copy.
+        cell_selection, n_cells, initialization_input, ini_embed = (
+            self._embedding_inputs(graph, initialization, umap_dims, np.float32)
+        )
         if nthreads is None:
             nthreads = self.nthreads
-        effective_density_map = (
-            use_density_map and graph_input.kind != "integrated_graph"
-        )
-        artifact_scope = graph_input.scope
+        nthreads = integer_argument(nthreads, "nthreads", minimum=1)
+        effective_density_map = use_density_map and graph.kind != "integrated_graph"
         arguments = UmapArguments(
-            graph=graph_input,
+            graph=graph,
             initialization=initialization_input,
             symmetric_graph=symmetric_graph,
             graph_upper_only=graph_upper_only,
@@ -409,72 +420,75 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
         record = arguments.to_record()
         planned = plan_cell_data_artifact(
             self.zw,
-            scope=artifact_scope,
-            assay=(graph_input.assay if graph_input.scope == "assay" else None),
+            scope=graph.scope,
+            assay=(graph.assay if graph.scope == "assay" else None),
             kind=arguments.artifact_kind,
             operation=arguments.operation,
             parameters=record.parameters,
             inputs=record.inputs,
             execution_options=record.execution_options,
             cell_selection=cell_selection,
-            arrays={"values": ((graph_matrix.shape[0], umap_dims), "f")},
+            arrays={"values": ((n_cells, umap_dims), "f")},
             invalidate_cache=invalidate_cache,
         )
-        verbose = progress_enabled()
-
-        if use_density_map and graph_input.kind == "integrated_graph":
+        if use_density_map and graph.kind == "integrated_graph":
             logger.warning(
                 "DensMap is not available for integrated graphs. Running standard UMAP."
             )
-        if not planned.reused:
-            densmap_kwds: dict[str, Any] = {}
-            if effective_density_map:
-                lineage = resolve_native_graph_inputs(self.zw, graph_input)
-                knn_loc = inspect_artifact(self.zw, lineage.neighbors).path
-                logger.trace(f"Loading KNN dists and indices from {knn_loc}")
-                validate_distance_provenance(self.zw, lineage.neighbors)
-                knn_group = as_zarr_group(self.zw[knn_loc], name=knn_loc)
-                dists = np.asarray(
-                    as_zarr_array(knn_group["distances"], name="distances")[:]
-                )
-                indices = np.asarray(
-                    as_zarr_array(knn_group["indices"], name="indices")[:]
-                )
-                densmap_kwds = {
-                    "lambda": dens_lambda,
-                    "frac": dens_frac,
-                    "var_shift": dens_var_shift,
-                    "n_neighbors": dists.shape[1],
-                    "knn_dists": densmap_distance_graph(indices, dists),
-                }
-                logger.trace("Created symmetric sparse KNN distances")
-            shutdown_checkpoint()
-            t, _a, _b = fit_transform(
-                graph=graph_matrix.tocoo(),
-                ini_embed=ini_embed,
-                spread=spread,
-                min_dist=min_dist,
-                n_epochs=n_epochs,
-                random_seed=random_seed,
-                repulsion_strength=repulsion_strength,
-                initial_alpha=initial_alpha,
-                negative_sample_rate=negative_sample_rate,
-                densmap_kwds=densmap_kwds,
-                parallel=parallel,
-                nthreads=nthreads,
-                verbose=verbose,
+        if planned.reused:
+            logger.info(
+                f"Reused {umap_dims}-dimensional UMAP embedding for {n_cells} cells"
             )
-            shutdown_checkpoint()
-            write_cell_data_artifact(
-                self.zw,
-                planned,
-                {"values": t},
+            return planned.ref
+        graph_matrix = self._load_graph_artifact(
+            graph,
+            symmetric=symmetric_graph,
+            upper_only=graph_upper_only,
+            use_k=None,
+        )
+        if ini_embed is None:
+            assert isinstance(initialization, ArtifactRef)
+            ini_embed = self._get_ini_embed(initialization, graph, umap_dims)
+            _check_initial_shape(ini_embed, n_cells, umap_dims)
+        densmap_kwds: dict[str, Any] = {}
+        if effective_density_map:
+            lineage = resolve_native_graph_inputs(self.zw, graph)
+            knn_loc = inspect_artifact(self.zw, lineage.neighbors).path
+            logger.trace(f"Loading KNN dists and indices from {knn_loc}")
+            validate_distance_provenance(self.zw, lineage.neighbors)
+            knn_group = as_zarr_group(self.zw[knn_loc], name=knn_loc)
+            dists = np.asarray(
+                as_zarr_array(knn_group["distances"], name="distances")[:]
             )
-
-        action = "Reused" if planned.reused else "Stored"
+            indices = np.asarray(as_zarr_array(knn_group["indices"], name="indices")[:])
+            densmap_kwds = {
+                "lambda": dens_lambda,
+                "frac": dens_frac,
+                "var_shift": dens_var_shift,
+                "n_neighbors": dists.shape[1],
+                "knn_dists": densmap_distance_graph(indices, dists),
+            }
+            logger.trace("Created symmetric sparse KNN distances")
+        shutdown_checkpoint()
+        t, _a, _b = fit_transform(
+            graph=graph_matrix.tocoo(),
+            ini_embed=ini_embed,
+            spread=spread,
+            min_dist=min_dist,
+            n_epochs=n_epochs,
+            random_seed=random_seed,
+            repulsion_strength=repulsion_strength,
+            initial_alpha=initial_alpha,
+            negative_sample_rate=negative_sample_rate,
+            densmap_kwds=densmap_kwds,
+            parallel=parallel,
+            nthreads=nthreads,
+            verbose=progress_enabled(),
+        )
+        shutdown_checkpoint()
+        write_cell_data_artifact(self.zw, planned, {"values": t})
         logger.info(
-            f"{action} {umap_dims}-dimensional UMAP embedding for "
-            f"{graph_matrix.shape[0]} cells"
+            f"Stored {umap_dims}-dimensional UMAP embedding for {n_cells} cells"
         )
         return planned.ref
 

@@ -5,15 +5,19 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from scarf.agent.experimental_context import qc_evidence
 from scarf.agent.experimental_context.characterization import _SelectionBoundCells
-from scarf.agent.experimental_context.contracts import ExperimentalContextDependencies
+from scarf.agent.experimental_context.contracts import (
+    ExperimentalContextDependencies,
+    NamedArtifactSource,
+)
 from scarf.agent.experimental_context.qc_evidence import (
     _derive_missing_percentage_artifacts,
     _offered_qc_profiles,
     _qc_metric_sources,
 )
 from scarf.agent.cell_quality.execution import execute_registered_cell_qc
-from scarf.agent.tools import core_artifact_reference
+from scarf.agent.tools import artifact_reference, core_artifact_reference
 from scarf.agent.parameter_tuning.diagnostics import _covariate_associations
 from scarf.datastore.datastore import DataStore
 from scarf.metadata.selection import NamedCellArtifact
@@ -268,3 +272,63 @@ def test_masked_percentage_rows_keep_an_artifact_from_driving_filtering(
     assert source.missingCells == 1
     assert "RNA_percentMito" not in values
     assert "RNA_percentMito" not in {item.name for item in artifacts}
+
+
+def test_non_rna_driver_names_artifact_metrics_as_execution_does(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = create_store(tmp_path / "driver.zarr", mito_pattern="", ribo_pattern="")
+    store = DataStore(
+        str(path),
+        default_assay="RNA",
+        min_features_per_cell=-1,
+        mito_pattern="",
+        ribo_pattern="",
+        zarr_mode="r+",
+    )
+    selected = store.snapshot_cell_selection("I")
+    mito = np.zeros(store.get_assay("RNA").feats.N, dtype=bool)
+    mito[0] = True
+    features = store.set_feature_selection(from_assay="RNA", mask=mito)
+    metric = store.run_feature_percentage(selected, features)
+    # A same-named imported column is unusable, so execution does not rename
+    # the artifact metric; the offered evidence must use the same name.
+    imported = np.asarray(store.load_artifact(metric)["values"][:], dtype=float)
+    imported[1] = np.nan
+    store.cells.insert("RNA_percentMito", imported)
+    deps = ExperimentalContextDependencies(
+        store=store,
+        cellSelection=selected,
+        cells=_SelectionBoundCells(store.zw, store.cells, selected),
+        qualityMetricArtifacts=[
+            NamedArtifactSource(
+                name="RNA_percentMito", artifact=artifact_reference(metric)
+            )
+        ],
+    )
+    monkeypatch.setattr(qc_evidence, "_qc_driver", lambda *_args: ("RNA", "ATAC"))
+
+    profile = next(
+        value
+        for value in _offered_qc_profiles(deps)
+        if value.registeredProfile == "globalMad5"
+    )
+
+    assert "RNA_percentMito" in {bound["metric"] for bound in profile.resolvedBounds}
+    execute_registered_cell_qc(
+        store,
+        "globalMad5",
+        profile_parameters=profile.parameters,
+        expected_active_cells=profile.activeCells,
+        expected_retained_cells=profile.retainedCells,
+        expected_flag_counts=profile.flaggedCells,
+        attrs=profile.attributes,
+        artifact_metrics=[
+            NamedCellArtifact(
+                name=item.name, artifact=core_artifact_reference(item.artifact)
+            )
+            for item in profile.artifactMetrics
+        ],
+        cell_selection=selected,
+    )

@@ -13,20 +13,39 @@ from scarf.embeddings.umap import (
     calc_dens_map_params,
     densmap_distance_graph,
 )
+from scarf.graph.arguments import OperationArguments
 from scarf.metadata.arguments import UmapArguments
-from scarf.storage.artifacts import ArtifactRef, fingerprint_array
+from scarf.storage.artifacts import (
+    ArtifactRef,
+    fingerprint_array,
+    make_provenance,
+    provenance_hash,
+)
 from scarf.storage.budget import ResourceBudget
+
+
+def _identity(arguments: OperationArguments) -> str:
+    """Return the provenance hash an artifact plan records for ``arguments``."""
+    record = arguments.to_record()
+    return provenance_hash(
+        make_provenance(
+            operation=arguments.operation,
+            parameters=record.parameters,
+            inputs=record.inputs,
+        )
+    )
+
 
 _STANDARD_UMAP_PARAMETERS = {
     "symmetric_graph": False,
     "graph_upper_only": False,
     "umap_dims": 2,
     "spread": 2.0,
-    "min_dist": 1,
+    "min_dist": 1.0,
     "n_epochs": 300,
     "repulsion_strength": 1.0,
     "initial_alpha": 1.0,
-    "negative_sample_rate": 5,
+    "negative_sample_rate": 5.0,
     "use_density_map": False,
     "dens_lambda": 2.0,
     "dens_frac": 0.3,
@@ -147,6 +166,58 @@ def test_run_tsne_rejects_invalid_numpy_initialization(store) -> None:
         store.run_tsne(graph, np.zeros((n_cells, 2), dtype=bool))
 
 
+def test_embedding_graph_flags_reach_the_graph_loader_as_booleans(
+    store,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _graph(store)
+    initialization = _initialization(store)
+    loads: list[tuple[object, object]] = []
+    original = store._load_graph_artifact
+
+    def recording(graph_ref, *, symmetric, upper_only, use_k):
+        loads.append((symmetric, upper_only))
+        return original(
+            graph_ref, symmetric=symmetric, upper_only=upper_only, use_k=use_k
+        )
+
+    monkeypatch.setattr(store, "_load_graph_artifact", recording)
+    ref = store.run_umap(
+        graph,
+        initialization,
+        n_epochs=5,
+        symmetric_graph=np.True_,
+        graph_upper_only=np.False_,
+        invalidate_cache=True,
+    )
+
+    assert loads == [(True, False)]
+    assert all(type(flag) is bool for flag in loads[0])
+    assert store.inspect_artifact(ref).parameters["symmetric_graph"] is True
+    for method, flag in (
+        (store.run_umap, "symmetric_graph"),
+        (store.run_tsne, "graph_upper_only"),
+    ):
+        with pytest.raises(TypeError, match=f"{flag} must be a boolean"):
+            method(graph, initialization, **{flag: 1})
+
+
+def test_reused_umap_neither_loads_the_graph_nor_expands_initialization(
+    store,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _graph(store)
+    initialization = _initialization(store)
+    ref = store.run_umap(graph, initialization, n_epochs=5)
+
+    def fail(*_args, **_kwargs):
+        raise AssertionError("a reused embedding must not read its inputs")
+
+    monkeypatch.setattr(store, "_load_graph_artifact", fail)
+    monkeypatch.setattr(store, "_get_ini_embed", fail)
+    assert store.run_umap(graph, initialization, n_epochs=5) == ref
+
+
 def test_standard_umap_arguments_keep_their_recorded_identity() -> None:
     arguments = UmapArguments(
         graph=ArtifactRef(
@@ -166,11 +237,45 @@ def test_standard_umap_arguments_keep_their_recorded_identity() -> None:
     )
 
     assert arguments.to_record().parameters == _STANDARD_UMAP_PARAMETERS
-    assert arguments.provenance_hash() == (
-        "56a2875652e4dfb859ad7e93d67b38ac422ede7405297d6fb0fa6a44deef16ec"
+    assert _identity(arguments) == (
+        "69bc2f0b8b33b09e4cce0f2a73d1b3cd4ef1f5002a409a2e042c9ec8f671aed5"
     )
     with pytest.raises(ValueError, match="densmap_algorithm_version"):
         dataclasses.replace(arguments, use_density_map=True)
+
+
+def test_umap_parameter_spellings_share_one_canonical_identity(store) -> None:
+    graph = _graph(store)
+    initialization = _initialization(store)
+
+    first = store.run_umap(
+        graph, initialization, n_epochs=5, spread=2, min_dist=1, dens_frac=0.3
+    )
+    parameters = store.inspect_artifact(first).parameters
+    assert parameters is not None
+    for name in ("spread", "min_dist", "negative_sample_rate", "initial_alpha"):
+        assert type(parameters[name]) is float
+    assert type(parameters["n_epochs"]) is int
+    assert (
+        store.run_umap(
+            graph,
+            initialization,
+            n_epochs=np.int64(5),
+            spread=np.float32(2.0),
+            min_dist=1.0,
+            negative_sample_rate=np.int32(5),
+            random_seed=np.uint16(4444),
+        )
+        == first
+    )
+    for kwargs, error, message in (
+        ({"min_dist": True}, TypeError, "min_dist must be a real number"),
+        ({"spread": float("nan")}, ValueError, "spread must be finite"),
+        ({"n_epochs": 5.0}, TypeError, "n_epochs must be an integer"),
+        ({"parallel": 1}, TypeError, "parallel must be a boolean"),
+    ):
+        with pytest.raises(error, match=message):
+            store.run_umap(graph, initialization, **kwargs)
 
 
 def test_densmap_records_its_revision_and_reuses_without_reading_neighbors(
@@ -293,7 +398,7 @@ def test_run_lsi_validates_skip_first_and_rand_state(store) -> None:
     for value in (None, True, 1.5):
         with pytest.raises(TypeError, match="rand_state must be an integer"):
             store.run_lsi(normalized, dims=3, rand_state=value)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="rand_state must be non-negative"):
+    with pytest.raises(ValueError, match="rand_state must be at least 0"):
         store.run_lsi(normalized, dims=3, rand_state=-1)
     with pytest.raises(ValueError, match="loadings have shape"):
         store._run_reduction_artifact(
@@ -350,6 +455,51 @@ def test_run_harmony_validates_arguments_before_snapshotting_metadata(store) -> 
             store.run_harmony(reduction, ["ids"], **kwargs)
 
     assert snapshots() == before
+
+
+def test_pca_identity_records_incremental_block_rows(store) -> None:
+    normalized = _normalized(store)
+    n_cells, n_features = store.load_artifact(normalized)["data"].shape
+    block_rows = n_features // 2
+    assert 6 < block_rows < n_cells
+
+    # Blocks as wide as the features give an exact fit; narrower blocks use
+    # IncrementalPCA, whose result depends on the block size.
+    exact = store.run_pca(normalized, dims=5, batch_size=n_features)
+    incremental = store.run_pca(normalized, dims=5, batch_size=block_rows)
+
+    assert incremental != exact
+    assert "incremental_block_rows" not in store.inspect_artifact(exact).parameters
+    assert (
+        store.inspect_artifact(incremental).parameters["incremental_block_rows"]
+        == block_rows
+    )
+    assert store.run_pca(normalized, dims=5, batch_size=block_rows) == incremental
+    wider = store.run_pca(normalized, dims=5, batch_size=block_rows + 1)
+    assert wider not in {exact, incremental}
+
+
+def test_graph_producers_refuse_read_only_stores_before_computing(
+    store,
+    monkeypatch,
+) -> None:
+    read_only = DataStore(store.zarr_loc, default_assay="RNA", zarr_mode="r")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("a read-only store must refuse before computing")
+
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.AnnIndexStage.fit",
+        forbidden,
+    )
+    monkeypatch.setattr("scarf.neighbors.graph.build_connectivity_arrays", forbidden)
+    with pytest.raises(PermissionError, match="build_ann_index"):
+        read_only.build_ann_index(_reduction(store), ann_efc=37)
+    neighbors = _input(store, _graph(store), "neighbors")
+    with pytest.raises(PermissionError, match="build_connectivity_map"):
+        read_only.build_connectivity_map(neighbors, bandwidth=1.25)
+    with pytest.raises(PermissionError, match="run_pca"):
+        read_only.run_pca(_normalized(store), dims=4)
 
 
 def test_integrate_assays_validates_chunk_size_first(store) -> None:

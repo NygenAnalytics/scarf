@@ -42,16 +42,16 @@ dependencies = [
     "packaging",
     "pandas>=2.2.2",
     "scikit-learn>=1.5",
-    "scipy>=1.13,!=1.17.0",
+    "scipy>=1.15,!=1.17.0",
     "setuptools>=61",
-    "statsmodels>=0.14.2",
-    "threadpoolctl",
+    "statsmodels>=0.14.5",
+    "threadpoolctl>=3.5.0",
     "tqdm>=4.60",
     "umap-learn>=0.5.12",
     "zarr>=3.2.0",
     "obstore>=0.5.1",
     "sgtsnepi",
-    "huggingface-hub>=1.24.0",
+    "huggingface-hub>=2.0.0",
     "zstandard>=0.25.0",
     "igraph>=1.0.0",
 ]
@@ -59,12 +59,13 @@ dependencies = [
 [project.optional-dependencies]
 cytebase = [
     "duckdb>=1.5.5",
+    "httpx>=0.28.1",
     "matplotlib>=3.9",
     "pytz>=2026.3.post1",
     "seaborn>=0.13",
 ]
 agent = [
-    "pydantic-ai-slim[openai]>=2.19.0",
+    "pydantic-ai-slim[openai]>=2.51.0",
 ]
 extra = [
     "anndata>=0.12",
@@ -82,7 +83,7 @@ test = [
     "anndata>=0.12",
     "scikit-network>=0.33.1",
     "rdata>=1.1.0",
-    "pydantic-ai-slim[openai]>=2.19.0",
+    "pydantic-ai-slim[openai]>=2.51.0",
 ]
 docs = [
     "jinja2",

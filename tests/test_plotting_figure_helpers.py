@@ -929,17 +929,11 @@ def test_child_legend_removal_clears_all_axis_and_figure_legends():
     plt.close(figure)
 
 
-def test_panel_labels_and_legend_collection(umap, leiden_clustering, datastore):
+def test_panel_labels_follow_result_axes(umap, leiden_clustering, datastore):
     first = splt.embedding(
         datastore,
         layout=umap,
         color_by=leiden_clustering,
-        show=False,
-    )
-    second = splt.embedding(
-        datastore,
-        layout=umap,
-        color_by="RNA_nCounts",
         show=False,
     )
     axes = list(first.axes.values())
@@ -947,8 +941,4 @@ def test_panel_labels_and_legend_collection(umap, leiden_clustering, datastore):
     assert axes[0].texts[-1].get_text() == "A"
     with pytest.raises(ValueError, match="labels length"):
         splt.label_panels(first.axes, labels=["A", "B"])
-
-    legends = splt.collect_legends(first.figure, [first, second])
-    assert legends == first.legends + second.legends
     first.close()
-    second.close()

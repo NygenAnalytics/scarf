@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 from scipy.sparse import coo_matrix, csr_matrix
 
-from ..utils.arrays import canonicalize_sparse
+from ..utils.arrays import canonicalize_sparse, cumulative_nnz
 
 
 class SparseRowStore:
@@ -38,9 +38,7 @@ class SparseRowStore:
         nnz = int(counts.sum())
         if counts.size and int(counts.max()) > entries_per_bucket:
             raise MemoryError("One sparse row exceeds the conversion memory limit")
-        cumulative = np.empty(shape[0] + 1, dtype=np.int64)
-        cumulative[0] = 0
-        np.cumsum(counts, out=cumulative[1:])
+        cumulative = cumulative_nnz(counts)
         boundaries = np.empty(shape[0] + 1, dtype=np.int64)
         boundaries[0] = 0
         bucket_count = 0

@@ -56,9 +56,9 @@ _WORKQUEUE_CHILD = textwrap.dedent(
         policy=policy,
     )
     counts[:] = values
-    from scarf.storage.identity import finalize_counts
+    from tests.storage_helpers import finalize_test_counts
 
-    finalize_counts(counts)
+    finalize_test_counts(counts)
     finalize_writer_counts_t(
         root,
         "RNA",

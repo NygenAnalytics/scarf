@@ -9,6 +9,7 @@ from zipfile import ZipFile
 
 _RETIRED_MODULES = {
     "scarf/_types.py",
+    "scarf/agent/ingest/loom.py",
     "scarf/ann.py",
     "scarf/assay.py",
     "scarf/bio_data.py",
@@ -60,6 +61,7 @@ _RETIRED_MODULES = {
     "scarf/plotting/unified.py",
     "scarf/readers.py",
     "scarf/readers/datasets.py",
+    "scarf/readers/loom.py",
     "scarf/results.py",
     "scarf/storage/zarr_store.py",
     "scarf/trajectory/aggregation.py",
@@ -71,6 +73,7 @@ _RETIRED_MODULES = {
     "scarf/utils/storage.py",
     "scarf/utils/system.py",
     "scarf/utils/windows.py",
+    "scarf/writers/loom.py",
     "scarf/writers.py",
 }
 _SOURCE_ROOT = Path(__file__).resolve().parents[1] / "scarf"
@@ -98,15 +101,13 @@ from scarf.datastore.datastore import DataStore
 from scarf.datastore.graph_datastore import GraphDataStore
 from scarf.datastore.mapping_datastore import MappingDatastore
 from scarf.cytebase import Repository, connect, list_repositories
-from scarf.embeddings.harmony import Harmony, HarmonyResult, fit_harmony, run_harmony
+from scarf.embeddings.harmony import Harmony, HarmonyResult, fit_harmony
 from scarf.features import (
-    GffReader,
-    coordinate_melding,
     find_markers_by_rank,
     fit_lowess,
     select_highly_variable_features,
 )
-from scarf.matrix import Block, ChunkedArray
+from scarf.matrix import ChunkedArray
 from scarf.merge import DataStoreMerge
 from scarf.metadata import MetaData, MetaDataRowBlock
 from scarf.readers import (
@@ -115,7 +116,6 @@ from scarf.readers import (
     CrH5Reader,
     CrReader,
     H5adReader,
-    LoomReader,
     SeuratReader,
     inspect_seurat,
 )
@@ -126,7 +126,6 @@ from scarf.writers import (
     CrToZarr,
     H5adImportResult,
     H5adToZarr,
-    LoomToZarr,
     SeuratImportResult,
     SeuratToZarr,
     SparseToZarr,
@@ -144,10 +143,9 @@ from scarf.writers import (
 assert "site-packages" in Path(scarf.__file__).as_posix()
 assert issubclass(DataStore, MappingDatastore)
 assert issubclass(MappingDatastore, GraphDataStore)
-for harmony_object in (Harmony, HarmonyResult, fit_harmony, run_harmony):
+for harmony_object in (Harmony, HarmonyResult, fit_harmony):
     assert harmony_object.__module__ == "scarf.embeddings.harmony"
-for matrix_class in (Block, ChunkedArray):
-    assert matrix_class.__module__ == "scarf.matrix"
+assert ChunkedArray.__module__ == "scarf.matrix"
 for metadata_class in (MetaData, MetaDataRowBlock):
     assert metadata_class.__module__ == "scarf.metadata"
 assert scarf.DataStoreMerge is scarf.merge.DataStoreMerge is DataStoreMerge
@@ -157,6 +155,8 @@ assert not hasattr(scarf, "DatasetMerge")
 assert not hasattr(scarf.merge, "DatasetMerge")
 assert not hasattr(scarf, "ZarrMerge")
 assert not hasattr(scarf.merge, "ZarrMerge")
+assert not hasattr(scarf, "LoomReader")
+assert not hasattr(scarf, "LoomToZarr")
 assert DataStoreMerge.__module__ == "scarf.merge"
 assert scarf.CrH5Reader is scarf.readers.CrH5Reader
 assert scarf.CrToZarr is scarf.writers.CrToZarr
@@ -165,10 +165,7 @@ assert scarf.cytebase.connect is connect
 assert scarf.cytebase.list_repositories is list_repositories
 assert scarf.ArtifactLineage is ArtifactLineage
 assert ArtifactLineage.__module__ == "scarf.storage.lineage"
-assert scarf.GffReader is GffReader
-assert scarf.coordinate_melding is coordinate_melding
 for feature_function in (
-    coordinate_melding,
     find_markers_by_rank,
     fit_lowess,
     select_highly_variable_features,
@@ -180,7 +177,6 @@ for reader_class in (
     CrDirReader,
     CrReader,
     H5adReader,
-    LoomReader,
     SeuratReader,
     CSVReader,
 ):
@@ -188,7 +184,6 @@ for reader_class in (
 for writer_class in (
     CrToZarr,
     H5adToZarr,
-    LoomToZarr,
     SeuratToZarr,
     SparseToZarr,
     SubsetZarr,
@@ -216,13 +211,13 @@ for method in (
     "select_hvgs",
     "run_pseudotime_aggregation",
     "run_pseudotime_marker_search",
-    "load_metric_lisi",
-    "metric_lisi",
 ):
     assert callable(getattr(DataStore, method))
 for method in (
     "_load_unified_layout_data",
+    "load_metric_lisi",
     "load_unified_graph",
+    "metric_lisi",
     "run_unified_tsne",
     "run_unified_umap",
 ):
@@ -245,7 +240,9 @@ for name in (
     "scarf.markers",
     "scarf.meld_assay",
     "scarf.plotting.unified",
+    "scarf.readers.loom",
     "scarf.symphony",
+    "scarf.writers.loom",
 ):
     assert importlib.util.find_spec(name) is None, name
 for name in (

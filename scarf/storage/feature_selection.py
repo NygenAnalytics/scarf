@@ -10,9 +10,8 @@ from .artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
     PlannedArtifact,
-    finish_artifact,
+    artifact_transaction,
     plan_artifact,
-    start_artifact,
 )
 from .artifacts import (
     ArtifactRef,
@@ -30,10 +29,7 @@ from .partition import row_band
 from .types import as_zarr_array, as_zarr_group
 from .validation_scope import store_key, validated_once
 from .refs import ExternalArtifactRef
-from .selections import (
-    validate_run_metadata_snapshot,
-    validate_stored_selection_integrity,
-)
+from .selections import validate_cell_selection, validate_run_metadata_snapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,33 +120,32 @@ def _write_feature_selection(
 ) -> None:
     if planned.reused:
         return
-    group = start_artifact(root, planned)
-    n_features = int(np.asarray(payload["values"]).shape[0])
-    chunks = (min(max(n_features, 1), 100_000),)
-    for name in payload_names:
-        values = np.asarray(
-            payload[name],
-            dtype=(bool if name == "values" else np.float64),
-        )
-        if values.shape != (n_features,):
-            raise ValueError(
-                f"Feature-selection array {name!r} has shape {values.shape}; "
-                f"expected ({n_features},)"
+    with artifact_transaction(root, planned) as group:
+        n_features = int(np.asarray(payload["values"]).shape[0])
+        chunks = (min(max(n_features, 1), 100_000),)
+        for name in payload_names:
+            values = np.asarray(
+                payload[name],
+                dtype=(bool if name == "values" else np.float64),
             )
-        output = create_zarr_dataset(
+            if values.shape != (n_features,):
+                raise ValueError(
+                    f"Feature-selection array {name!r} has shape {values.shape}; "
+                    f"expected ({n_features},)"
+                )
+            output = create_zarr_dataset(
+                group,
+                name,
+                chunks,
+                values.dtype,
+                values.shape,
+            )
+            output[:] = values
+        group.attrs["ordered_feature_ids_fingerprint"] = ordered_feature_ids_fingerprint
+        group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
             group,
-            name,
-            chunks,
-            values.dtype,
-            values.shape,
+            payload_names,
         )
-        output[:] = values
-    group.attrs["ordered_feature_ids_fingerprint"] = ordered_feature_ids_fingerprint
-    group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
-        group,
-        payload_names,
-    )
-    finish_artifact(group, planned)
 
 
 def _feature_selection_values(
@@ -271,22 +266,6 @@ _FEATURE_SELECTION_CONTRACTS = {
 }
 
 
-def _local_input_ref(raw: Any) -> ArtifactRef | None:
-    if not isinstance(raw, Mapping):
-        return None
-    if raw.get("type") == "external_artifact":
-        return None
-    expected_keys = {"type", "scope", "kind", "artifact_id"}
-    if raw.get("scope") == "assay":
-        expected_keys.add("assay")
-    if set(raw) != expected_keys:
-        return None
-    try:
-        return ArtifactRef.from_dict(raw)
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
 def _validate_feature_summary_parent(
     root: zarr.Group,
     assay: str,
@@ -363,13 +342,8 @@ def _validate_feature_summary_parent(
             code="corrupt_payload",
             context=context,
         )
-    raw_cell_selection = (status.inputs or {}).get("cell_selection")
-    cell_selection = _local_input_ref(raw_cell_selection)
-    if (
-        cell_selection is None
-        or cell_selection.kind != "cell_selection"
-        or cell_selection.scope != "datastore"
-    ):
+    cell_selection = status.input_ref("cell_selection")
+    if cell_selection.kind != "cell_selection" or cell_selection.scope != "datastore":
         raise ArtifactResolutionError(
             "Feature-summary cell-selection input is malformed",
             code="corrupt_payload",
@@ -395,14 +369,7 @@ def _validate_feature_summary_parent(
             code="incomplete_artifact",
             context=context,
         )
-    validate_stored_selection_integrity(
-        root,
-        cell_selection,
-        kind="cell_selection",
-        scope="datastore",
-        assay=None,
-        table_path="cellData",
-    )
+    validate_cell_selection(root, cell_selection)
     ids = _feature_ids(root, assay)
     group = artifact_group(root, ref)
     # One listing opens every payload array; reuse them below.
@@ -450,6 +417,51 @@ def _validate_feature_summary_parent(
         )
 
 
+def _hvg_optional_parameters(
+    parameters: Mapping[str, Any], context: dict[str, str | None]
+) -> frozenset[str]:
+    """Return the HVG parameters its blacklist and binning strategy require."""
+    names: set[str] = set()
+    if parameters.get("blacklist") or "blacklist_fingerprint" in parameters:
+        fingerprint = parameters.get("blacklist_fingerprint")
+        if (
+            not parameters.get("blacklist")
+            or not isinstance(fingerprint, str)
+            or len(fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in fingerprint)
+        ):
+            raise ArtifactResolutionError(
+                "HVG blacklist fingerprint is incompatible",
+                code="corrupt_payload",
+                context=context,
+            )
+        names.add("blacklist_fingerprint")
+    adaptive = parameters.get("bin_strategy") == "adaptive"
+    if adaptive or "variance_estimator" in parameters:
+        if (
+            not adaptive
+            or parameters.get("variance_estimator") != "regularized_local_quantile"
+        ):
+            raise ArtifactResolutionError(
+                "HVG variance estimator is incompatible",
+                code="corrupt_payload",
+                context=context,
+            )
+        quantile = parameters.get("variance_quantile")
+        if (
+            isinstance(quantile, bool)
+            or not isinstance(quantile, int | float)
+            or not 0 < quantile < 1
+        ):
+            raise ArtifactResolutionError(
+                "HVG variance quantile is incompatible",
+                code="corrupt_payload",
+                context=context,
+            )
+        names.update({"variance_estimator", "variance_quantile"})
+    return frozenset(names)
+
+
 def _validate_feature_selection_provenance(
     root: zarr.Group,
     assay: str,
@@ -482,46 +494,10 @@ def _validate_feature_selection_provenance(
                 code="corrupt_payload",
                 context=context,
             )
-    if status.operation == "select_hvgs" and "blacklist_fingerprint" in parameters:
-        fingerprint = parameters["blacklist_fingerprint"]
-        if (
-            not isinstance(fingerprint, str)
-            or len(fingerprint) != 64
-            or any(character not in "0123456789abcdef" for character in fingerprint)
-            or not parameters.get("blacklist")
-        ):
-            raise ArtifactResolutionError(
-                "HVG blacklist fingerprint is incompatible",
-                code="corrupt_payload",
-                context=context,
-            )
-        # Older selections remain readable; new requests bind the matched features.
-        parameter_names = parameter_names | {"blacklist_fingerprint"}
-    if status.operation == "select_hvgs" and "variance_estimator" in parameters:
-        if (
-            parameters.get("bin_strategy") != "adaptive"
-            or parameters["variance_estimator"] != "regularized_local_quantile"
-        ):
-            raise ArtifactResolutionError(
-                "HVG variance estimator is incompatible",
-                code="corrupt_payload",
-                context=context,
-            )
-        # Selections without this field remain readable with their original scores.
-        parameter_names = parameter_names | {"variance_estimator"}
-        if "variance_quantile" in parameters:
-            quantile = parameters["variance_quantile"]
-            if (
-                isinstance(quantile, bool)
-                or not isinstance(quantile, (int, float))
-                or not 0 < quantile < 1
-            ):
-                raise ArtifactResolutionError(
-                    "HVG variance quantile is incompatible",
-                    code="corrupt_payload",
-                    context=context,
-                )
-            parameter_names = parameter_names | {"variance_quantile"}
+    if status.operation == "select_hvgs":
+        parameter_names = parameter_names | _hvg_optional_parameters(
+            parameters, context
+        )
     received_inputs = set(inputs)
     if received_inputs != input_names or set(parameters) != parameter_names:
         raise ArtifactResolutionError(
@@ -536,17 +512,10 @@ def _validate_feature_selection_provenance(
             context=context,
         )
     if "all_features" in inputs:
-        all_features = _local_input_ref(inputs["all_features"])
-        if all_features is None:
-            raise ArtifactResolutionError(
-                "Feature-selection universe input is malformed",
-                code="corrupt_payload",
-                context=context,
-            )
         validated = validate_feature_selection(
             root,
             assay,
-            all_features,
+            status.input_ref("all_features"),
             seen=seen,
             row_fingerprint=row_fingerprint,
         )
@@ -557,21 +526,16 @@ def _validate_feature_selection_provenance(
                 context=context,
             )
     if "feature_summary" in inputs:
-        summary = _local_input_ref(inputs["feature_summary"])
-        if summary is None:
-            raise ArtifactResolutionError(
-                "Feature-selection summary input is malformed",
-                code="corrupt_payload",
-                context=context,
-            )
         _validate_feature_summary_parent(
-            root, assay, summary, row_fingerprint=row_fingerprint
+            root,
+            assay,
+            status.input_ref("feature_summary"),
+            row_fingerprint=row_fingerprint,
         )
     if "feature_snapshot" in inputs:
-        snapshot = _local_input_ref(inputs["feature_snapshot"])
+        snapshot = status.input_ref("feature_snapshot")
         if (
-            snapshot is None
-            or snapshot.kind != "metadata_snapshot"
+            snapshot.kind != "metadata_snapshot"
             or snapshot.scope != "assay"
             or snapshot.assay != assay
         ):

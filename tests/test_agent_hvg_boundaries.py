@@ -10,7 +10,6 @@ import pytest
 from scarf.agent.parameter_tuning.hvg import (
     HvgGroupVariability,
     aggregate_hvg_rankings,
-    effective_hvg_candidate_counts,
     rank_core_hvgs,
 )
 from scarf.storage.refs import ArtifactRef
@@ -117,38 +116,34 @@ def test_ranked_feature_intervention_rejects_incomplete_evidence_before_persiste
     assert saved == []
 
 
-@pytest.mark.parametrize(
-    "count,targets",
-    [(True, (1,)), (0, (1,)), (10, "123"), (10, (True,)), (10, (0,)), (10, ())],
-)
-def test_hvg_search_requires_valid_registered_counts(count: Any, targets: Any) -> None:
+@pytest.mark.parametrize("targets", ["123", (True,), (0,), ()])
+def test_hvg_ranking_requires_valid_candidate_targets(targets: Any) -> None:
+    group = HvgGroupVariability(
+        "batch_a", 10, np.asarray([3.0, 2, 1]), np.ones(3, dtype=bool)
+    )
     with pytest.raises((TypeError, ValueError)):
-        effective_hvg_candidate_counts(count, targets)
-
-
-def test_one_supported_group_is_explicit_global_evidence_and_masks_remain_nested() -> (
-    None
-):
-    def unavailable_groups() -> Any:
-        raise AssertionError(
-            "An unsupported batch ranking must not consume group summaries"
+        aggregate_hvg_rankings(
+            np.asarray([3.0, 2, 1]),
+            np.ones(3, dtype=bool),
+            [group, replace(group, group_id="batch_b")],
+            valid_group_count=2,
+            candidate_targets=targets,
         )
+
+
+def test_hvg_ranking_requires_two_supported_groups() -> None:
+    def unavailable_groups() -> Any:
+        raise AssertionError("A ranking without two groups must not read summaries")
         yield
 
-    ranking = aggregate_hvg_rankings(
-        np.asarray([3.0, 9, 2, 1]),
-        np.asarray([True, False, True, True]),
-        unavailable_groups(),
-        valid_group_count=1,
-        candidate_targets=(2, 3, 5),
-    )
-    assert ranking.ranking_mode == "global"
-    assert ranking.eligible_feature_count == 3
-    assert ranking.candidate_counts == (2, 3)
-    np.testing.assert_array_equal(ranking.candidate_mask(2), [True, False, True, False])
-    assert np.all(ranking.candidate_mask(2) <= ranking.candidate_mask(3))
-    with pytest.raises(ValueError, match="registered counts"):
-        ranking.candidate_mask(1)
+    with pytest.raises(ValueError, match="at least two groups"):
+        aggregate_hvg_rankings(
+            np.asarray([3.0, 9, 2, 1]),
+            np.asarray([True, False, True, True]),
+            unavailable_groups(),
+            valid_group_count=1,
+            candidate_targets=(2,),
+        )
 
 
 @pytest.mark.parametrize(
@@ -208,4 +203,10 @@ def test_batch_aware_ranking_cannot_claim_unavailable_group_evidence(
     else:
         groups[0] = replace(first, detected_features=np.zeros(3, dtype=bool))
     with pytest.raises((TypeError, ValueError)):
-        aggregate_hvg_rankings(corrected, eligible, groups, valid_group_count=declared)
+        aggregate_hvg_rankings(
+            corrected,
+            eligible,
+            groups,
+            valid_group_count=declared,
+            candidate_targets=(2,),
+        )

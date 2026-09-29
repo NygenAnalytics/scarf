@@ -10,9 +10,7 @@ from zarr.storage import MemoryStore
 from scarf.storage.async_execution import (
     AsyncStorageRunner,
     ByteLedger,
-    configure_zarr_runtime,
     ensure_zarr_host_ceiling,
-    reset_zarr_runtime_for_tests,
     zarr_io_concurrency,
 )
 from scarf.storage.budget import ResourceBudget, detect_workers
@@ -24,13 +22,14 @@ from scarf.storage.count_matrix import (
 from scarf.storage.execution import WorkShape, plan_operation
 from scarf.storage.io_policy import StorageIoPolicy
 from scarf.storage.sharding import write_counts_t
+from tests.storage_helpers import reset_zarr_runtime
 
 
 @pytest.fixture(autouse=True)
 def _reset_runtime() -> None:
-    reset_zarr_runtime_for_tests()
+    reset_zarr_runtime()
     yield
-    reset_zarr_runtime_for_tests()
+    reset_zarr_runtime()
 
 
 def _runner(
@@ -72,9 +71,9 @@ def _write_counts(values: np.ndarray) -> tuple[zarr.Group, zarr.Array]:
     counts[:] = values
     persist_count_matrix_plan(group, plan)
     persist_count_matrix_plan(counts, plan)
-    from scarf.storage.identity import finalize_counts
+    from tests.storage_helpers import finalize_test_counts
 
-    finalize_counts(counts)
+    finalize_test_counts(counts)
     return group, counts
 
 
@@ -441,7 +440,8 @@ def test_runner_scopes_async_concurrency_and_restores_configured_default(
     monkeypatch.setattr(
         "scarf.storage.async_execution._active_zarr_workers", lambda: None
     )
-    configure_zarr_runtime(codecWorkers=3, asyncConcurrency=3)
+    ensure_zarr_host_ceiling(3)
+    zarr.config.set({"async.concurrency": 3})
     runner = _runner(
         ResourceBudget(1024, 4),
         chunksPerShard=1,
@@ -474,25 +474,6 @@ def test_overlapping_io_limits_restore_the_remaining_operation() -> None:
         finally:
             release.set()
     assert zarr.config.get("async.concurrency") == 10
-
-
-def test_runtime_reconfiguration_cannot_override_an_active_io_limit(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        "scarf.storage.async_execution._active_zarr_workers", lambda: None
-    )
-    configure_zarr_runtime(codecWorkers=3, asyncConcurrency=6)
-    ceiling = zarr.config.get("threading.max_workers")
-    with zarr_io_concurrency(2):
-        with pytest.raises(RuntimeError, match="during active storage operations"):
-            configure_zarr_runtime(codecWorkers=5, asyncConcurrency=8)
-        assert zarr.config.get("async.concurrency") == 2
-        assert zarr.config.get("threading.max_workers") == ceiling
-    assert zarr.config.get("async.concurrency") == 6
-    with pytest.raises(RuntimeError, match="fresh process"):
-        configure_zarr_runtime(codecWorkers=5, asyncConcurrency=8)
-    assert zarr.config.get("async.concurrency") == 6
 
 
 def test_runner_restores_async_concurrency_after_failure() -> None:
@@ -595,7 +576,8 @@ def test_writer_completes_when_numba_and_many_compute_workers() -> None:
         dtype=np.uint32,
     )
     from scarf.storage.count_matrix import CountMatrixPolicy
-    from scarf.writers import create_cell_data, create_zarr_count_assay
+    from scarf.storage.schema import create_cell_data
+    from scarf.writers import create_zarr_count_assay
     from scarf.writers.counts_t import finalize_writer_counts_t
 
     root = zarr.open_group(store=MemoryStore(), mode="w")
@@ -618,9 +600,9 @@ def test_writer_completes_when_numba_and_many_compute_workers() -> None:
         policy=CountMatrixPolicy(unitBytes=48, chunkBytes=16),
     )
     counts[:] = values
-    from scarf.storage.identity import finalize_counts
+    from tests.storage_helpers import finalize_test_counts
 
-    finalize_counts(counts)
+    finalize_test_counts(counts)
     finalize_writer_counts_t(
         root,
         "RNA",
@@ -670,8 +652,6 @@ def test_async_runner_nested_loop_bounded_io_and_leaks() -> None:
 
     with pytest.raises(ValueError, match="must be positive"):
         ByteLedger(0)
-    with pytest.raises(ValueError, match="must be positive"):
-        configure_zarr_runtime(codecWorkers=0, asyncConcurrency=1)
     with pytest.raises(ValueError, match="must be positive"):
         StorageIoPolicy(readWorkers=0)
 
@@ -947,3 +927,114 @@ def test_operation_restores_blas_limits_left_by_concurrent_compute_tasks():
             pytest.skip("needs a multi-threaded BLAS")
         runner.run(operation)
         assert blas_threads() == before
+
+
+def test_overlapping_thread_limits_restore_the_original_in_any_order():
+    from threadpoolctl import ThreadpoolController, threadpool_limits
+
+    from scarf.utils.compute import enter_thread_limit, exit_thread_limit
+
+    def blas_threads() -> set[int]:
+        return {
+            lib.num_threads
+            for lib in ThreadpoolController().lib_controllers
+            if lib.user_api == "blas"
+        }
+
+    # The test session pins BLAS to one thread; raise it so a change shows.
+    with threadpool_limits(limits=2, user_api="blas"):
+        if not blas_threads() or max(blas_threads()) < 2:
+            pytest.skip("needs a multi-threaded BLAS")
+        first = enter_thread_limit(1)
+        second = enter_thread_limit(1)
+        # A generator-held scope can end before a scope entered after it.
+        exit_thread_limit(first)
+        assert blas_threads() == {1}
+        exit_thread_limit(second)
+        assert blas_threads() == {2}
+
+
+def test_runner_reports_one_task_group_failure_by_itself() -> None:
+    runner = _runner(ResourceBudget(1024, 2))
+
+    async def operation(_active: AsyncStorageRunner) -> None:
+        async def fail() -> None:
+            raise ValueError("one read failed")
+
+        async with asyncio.TaskGroup() as outer:
+            outer.create_task(fail())
+
+    with pytest.raises(ValueError, match="one read failed"):
+        runner.run(operation)
+
+
+def test_runner_reports_shutdown_from_nested_task_groups() -> None:
+    from scarf.utils.shutdown import ShutdownRequest, ShutdownRequested
+
+    request = ShutdownRequest(requested_at_ns=1, reason="operator stop")
+    runner = _runner(ResourceBudget(1024, 2))
+
+    async def operation(_active: AsyncStorageRunner) -> None:
+        async def stop() -> None:
+            raise ShutdownRequested(request)
+
+        async def inner() -> None:
+            async with asyncio.TaskGroup() as tasks:
+                tasks.create_task(stop())
+                tasks.create_task(stop())
+
+        async with asyncio.TaskGroup() as outer:
+            outer.create_task(inner())
+
+    with pytest.raises(ShutdownRequested, match="operator stop"):
+        runner.run(operation)
+
+
+def test_runner_keeps_groups_of_distinct_failures() -> None:
+    runner = _runner(ResourceBudget(1024, 2))
+
+    async def operation(_active: AsyncStorageRunner) -> None:
+        async def fail(message: str) -> None:
+            raise ValueError(message)
+
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(fail("first"))
+            tasks.create_task(fail("second"))
+
+    with pytest.raises(ExceptionGroup) as raised:
+        runner.run(operation)
+    assert {str(error) for error in raised.value.exceptions} == {"first", "second"}
+
+
+def test_blas_restore_failure_does_not_skip_later_cleanup(monkeypatch) -> None:
+    from threadpoolctl import ThreadpoolController
+
+    restored: list[bool] = []
+
+    class FailingRestore:
+        def restore_original_limits(self) -> None:
+            raise RuntimeError("blas restore failed")
+
+    original_limit = ThreadpoolController.limit
+
+    def limit(self, *, limits=None, user_api=None):  # type: ignore[no-untyped-def]
+        if limits is None:
+            return FailingRestore()
+        return original_limit(self, limits=limits, user_api=user_api)
+
+    def install(_threads: int):  # type: ignore[no-untyped-def]
+        return lambda: restored.append(True)
+
+    monkeypatch.setattr(ThreadpoolController, "limit", limit)
+    monkeypatch.setattr(
+        "scarf.storage.async_execution._install_numba_thread_cap", install
+    )
+    runner = _runner(ResourceBudget(1024, 2), chunksPerShard=2)
+
+    async def operation(_active: AsyncStorageRunner) -> int:
+        return 1
+
+    with pytest.raises(RuntimeError, match="blas restore failed"):
+        runner.run(operation)
+    assert restored == [True]
+    assert zarr.config.get("async.concurrency") == 10

@@ -348,6 +348,67 @@ def test_marker_search_returns_an_explicit_artifact_without_feature_writes(
     assert "p_value_adjusted" in result.table.columns
 
 
+def test_marker_search_validates_refs_before_reading(
+    datastore,
+    pseudotime_scoring,
+    detected_features,
+    auto_filter_cells,
+):
+    with pytest.raises(TypeError, match="pseudotime must be an ArtifactRef"):
+        datastore.run_pseudotime_marker_search("ptime", features=detected_features)
+    with pytest.raises(TypeError, match="features must be an ArtifactRef"):
+        datastore.run_pseudotime_marker_search(pseudotime_scoring, features="genes")
+    with pytest.raises(ValueError, match="assay-scoped feature selection"):
+        datastore.run_pseudotime_marker_search(
+            pseudotime_scoring,
+            features=auto_filter_cells,
+        )
+
+
+def test_marker_loader_rejects_each_tampered_record(
+    datastore,
+    pseudotime_markers,
+    detected_features,
+):
+    from scarf.storage.artifacts import artifact_group
+
+    with pytest.raises(TypeError, match="ref must be an ArtifactRef"):
+        datastore.load_pseudotime_markers("markers")
+    with pytest.raises(ValueError, match="assay-scoped pseudotime_markers"):
+        datastore.load_pseudotime_markers(detected_features)
+    group = artifact_group(datastore.zw, pseudotime_markers)
+    original = group.attrs["provenance"]
+    unrelated = detected_features.to_dict()
+    try:
+        for section, key, value, message in (
+            ("parameters", "min_cells", 0, "parameters are malformed"),
+            (
+                "inputs",
+                "ordered_feature_ids_fingerprint",
+                1,
+                "identities are malformed",
+            ),
+            (
+                "inputs",
+                "ordered_feature_ids_fingerprint",
+                "x",
+                "ID identity has changed",
+            ),
+            ("inputs", "dataset_fingerprint", "x", "dataset identity has changed"),
+            ("inputs", "cell_selection", unrelated, "cell selection does not match"),
+        ):
+            provenance = dict(original)
+            provenance[section] = dict(provenance[section]) | {key: value}
+            group.attrs["provenance"] = provenance
+            with pytest.raises(ValueError, match=message):
+                datastore.load_pseudotime_markers(pseudotime_markers)
+    finally:
+        group.attrs["provenance"] = original
+    assert datastore.load_pseudotime_markers(pseudotime_markers).ref == (
+        pseudotime_markers
+    )
+
+
 def test_trajectory_feature_selection_indices_are_read_blockwise(
     datastore,
     detected_features,
@@ -542,7 +603,74 @@ def test_trajectory_operations_require_boolean_cache_invalidation(
         )
 
 
-def test_marker_identity_change_during_computation_leaves_artifact_incomplete(
+def test_raw_source_sink_scoring_refuses_read_only_store_before_snapshot(
+    datastore,
+    connectivity_graph,
+):
+    from scipy.sparse.csgraph import connected_components
+
+    from scarf.datastore.datastore import DataStore
+
+    graph = datastore.load_graph(
+        connectivity_graph,
+        symmetric=True,
+        upper_only=False,
+    )
+    _, components = connected_components(graph, directed=False)
+    retained = np.flatnonzero(components == int(np.argmax(np.bincount(components))))
+    source_sink = np.zeros(graph.shape[0], dtype=np.float64)
+    source_sink[retained[1]] = -1.0
+    source_sink[retained[-2]] = 1.0
+    snapshots = datastore.list_artifacts(kind="metadata_snapshot", scope="datastore")
+
+    read_only = DataStore(datastore.zarr_loc, default_assay="RNA", zarr_mode="r")
+    with pytest.raises(PermissionError, match="zarr_mode='r\\+'"):
+        read_only.run_pseudotime_scoring(
+            connectivity_graph,
+            ss_vec=source_sink,
+            n_singular_vals=10,
+        )
+    assert (
+        datastore.list_artifacts(kind="metadata_snapshot", scope="datastore")
+        == snapshots
+    )
+
+
+def test_trajectory_feature_producers_refuse_read_only_stores_before_computing(
+    datastore,
+    pseudotime_scoring,
+    detected_features,
+    monkeypatch,
+):
+    from scarf.datastore.datastore import DataStore
+
+    read_only = DataStore(datastore.zarr_loc, default_assay="RNA", zarr_mode="r")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("a read-only store must refuse before computing")
+
+    monkeypatch.setattr(
+        type(read_only.get_assay("RNA")),
+        "_aggregate_ordering_profiles",
+        forbidden,
+    )
+    monkeypatch.setattr("scarf.features.markers.find_markers_by_regression", forbidden)
+    with pytest.raises(PermissionError, match="run_pseudotime_aggregation"):
+        read_only.run_pseudotime_aggregation(
+            pseudotime_scoring,
+            features=detected_features,
+            window_size=17,
+            n_clusters=3,
+        )
+    with pytest.raises(PermissionError, match="run_pseudotime_marker_search"):
+        read_only.run_pseudotime_marker_search(
+            pseudotime_scoring,
+            features=detected_features,
+            min_cells=7,
+        )
+
+
+def test_marker_identity_change_during_computation_discards_the_artifact(
     datastore,
     pseudotime_scoring,
     detected_features,
@@ -592,11 +720,11 @@ def test_marker_identity_change_during_computation_leaves_artifact_incomplete(
         )
         - before
     )
-    assert len(created) == 1
-    assert not datastore.inspect_artifact(created.pop()).complete
+    # A failed write deletes its incomplete slot.
+    assert created == set()
 
 
-def test_marker_normalization_change_during_computation_leaves_artifact_incomplete(
+def test_marker_normalization_change_during_computation_discards_the_artifact(
     datastore,
     pseudotime_scoring,
     detected_features,
@@ -644,11 +772,11 @@ def test_marker_normalization_change_during_computation_leaves_artifact_incomple
         )
         - before
     )
-    assert len(created) == 1
-    assert not datastore.inspect_artifact(created.pop()).complete
+    # A failed write deletes its incomplete slot.
+    assert created == set()
 
 
-def test_aggregation_normalization_change_leaves_artifact_incomplete(
+def test_aggregation_normalization_change_discards_the_artifact(
     datastore,
     pseudotime_scoring,
     detected_features,
@@ -697,8 +825,8 @@ def test_aggregation_normalization_change_leaves_artifact_incomplete(
         )
         - before
     )
-    assert len(created) == 1
-    assert not datastore.inspect_artifact(created.pop()).complete
+    # A failed write deletes its incomplete slot.
+    assert created == set()
 
 
 def test_incomplete_pseudotime_marker_artifact_is_recomputed(
@@ -835,12 +963,8 @@ def test_aggregation_rejects_invalid_ordering_and_sizes(
             np.arange(ordering.shape[0]),
             np.arange(assay.expression.shape[1]),
             ordering,
-            min_exp=0.0,
             window_size=window_size,
             chunk_size=chunk_size,
-            smoothen=False,
-            z_scale=False,
-            norm_params={},
         )
 
 

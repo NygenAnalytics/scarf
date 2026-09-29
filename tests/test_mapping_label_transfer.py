@@ -10,7 +10,11 @@ import pytest
 import scarf.datastore._operations.mapping as mapping_operations
 import scarf.mapping.projection as projection_storage
 from scarf.datastore.datastore import DataStore
-from scarf.mapping.confidence import conformal_prediction_sets, distance_weights
+from scarf.mapping.confidence import (
+    _conformal_membership,
+    _validated_conformal_calibration,
+    distance_weights,
+)
 from scarf.mapping.projection import (
     NO_QUERY_BATCH_FINGERPRINT,
     ProjectionWriter,
@@ -727,102 +731,23 @@ def test_vote_entropy_is_conditional_on_available_labels() -> None:
     assert votes.is_unknown[0]
 
 
-def test_label_transfer_calibration_is_deterministic_and_validated() -> None:
-    calibrated = DataStore.calibrate_label_transfer_threshold(
-        vote_fractions=np.array([0.2, 0.6, 0.8, 0.9]),
-        correct=np.array([False, True, True, False]),
-        target_coverage=0.5,
-    )
-
-    assert calibrated == {
-        "voteThreshold": pytest.approx(0.7),
-        "validationCoverage": pytest.approx(0.5),
-        "validationAccuracy": pytest.approx(0.5),
-    }
-
-    with pytest.raises(ValueError, match="matching vectors"):
-        DataStore.calibrate_label_transfer_threshold(
-            np.ones((1, 2)),
-            np.ones(2, dtype=bool),
-        )
-    for coverage in (0.0, 1.1):
-        with pytest.raises(ValueError, match="target_coverage"):
-            DataStore.calibrate_label_transfer_threshold(
-                np.array([0.5]),
-                np.array([True]),
-                target_coverage=coverage,
-            )
-    with pytest.raises(ValueError, match="correct held-out prediction"):
-        DataStore.calibrate_label_transfer_threshold(
-            np.array([0.2, 0.8]),
-            np.array([False, False]),
-        )
-    for invalid in (np.nan, np.inf, -0.1, 1.1):
-        with pytest.raises(ValueError, match=r"finite values in \[0, 1\]"):
-            DataStore.calibrate_label_transfer_threshold(
-                np.array([0.5, invalid]),
-                np.array([True, False]),
-            )
-    with pytest.raises(ValueError, match="real numeric"):
-        DataStore.calibrate_label_transfer_threshold(
-            np.array([True, False]),
-            np.array([True, False]),
-        )
-    with pytest.raises(ValueError, match="boolean vector"):
-        DataStore.calibrate_label_transfer_threshold(
-            np.array([0.5, 0.6]),
-            np.array([1, 0]),
-        )
-    for invalid_coverage in (True, np.nan):
-        with pytest.raises(ValueError, match="target_coverage"):
-            DataStore.calibrate_label_transfer_threshold(
-                np.array([0.5]),
-                np.array([True]),
-                target_coverage=invalid_coverage,
-            )
-
-
 def test_confidence_helpers_reject_invalid_shapes_calibration_and_alpha() -> None:
     with pytest.raises(ValueError, match="two-dimensional distance"):
         distance_weights(np.array([1.0, 2.0]))
-    with pytest.raises(ValueError, match="two-dimensional array"):
-        conformal_prediction_sets(
-            np.array([0.8, 0.2]),
-            np.array([0.1]),
-        )
     with pytest.raises(ValueError, match="non-empty vector"):
-        conformal_prediction_sets(
-            np.array([[0.8, 0.2]]),
-            np.array([]),
-        )
+        _validated_conformal_calibration(np.array([]), 0.1)
     with pytest.raises(ValueError, match="strictly between"):
-        conformal_prediction_sets(
-            np.array([[0.8, 0.2]]),
-            np.array([0.1]),
-            alpha=1.0,
-        )
+        _validated_conformal_calibration(np.array([0.1]), 1.0)
     with pytest.raises(ValueError, match="finite"):
-        conformal_prediction_sets(
-            np.array([[np.nan, 0.2]]),
-            np.array([0.1]),
-        )
-    with pytest.raises(ValueError, match="scores must be in"):
-        conformal_prediction_sets(
-            np.array([[1.1, 0.2]]),
-            np.array([0.1]),
-        )
+        _validated_conformal_calibration(np.array([np.nan]), 0.1)
     with pytest.raises(ValueError, match="nonconformity must be in"):
-        conformal_prediction_sets(
-            np.array([[0.8, 0.2]]),
-            np.array([-0.1]),
-        )
+        _validated_conformal_calibration(np.array([-0.1]), 0.1)
 
-    calibration = np.r_[np.zeros(7), np.ones(14)]
-    exact_boundary = conformal_prediction_sets(
-        np.array([[0.0]]),
-        calibration,
-        alpha=15 / 22,
+    calibration, alpha = _validated_conformal_calibration(
+        np.r_[np.zeros(7), np.ones(14)],
+        15 / 22,
     )
+    exact_boundary = _conformal_membership(np.array([[0.0]]), calibration, alpha)
     assert not exact_boundary[0, 0]
 
 
@@ -924,7 +849,7 @@ def test_reference_layout_requires_an_explicit_complete_embedding(
         name="explicit_layout",
     )
     with pytest.raises(TypeError, match="layout must be an ArtifactRef"):
-        reference.fetch_layout("explicit_layout")
+        reference._fetch_layout("explicit_layout")
     wrong = ArtifactRef(
         scope="assay",
         assay=reference.assay_name,
@@ -932,7 +857,7 @@ def test_reference_layout_requires_an_explicit_complete_embedding(
         artifact_id=layout.artifact_id,
     )
     with pytest.raises(ValueError, match="embedding artifact"):
-        reference.fetch_layout(wrong)
+        reference._fetch_layout(wrong)
 
 
 def test_reference_layout_reads_explicit_immutable_artifact(
@@ -949,7 +874,7 @@ def test_reference_layout_reads_explicit_immutable_artifact(
         overwrite=True,
     )
 
-    np.testing.assert_array_equal(reference.fetch_layout(layout), expected)
+    np.testing.assert_array_equal(reference._fetch_layout(layout), expected)
 
 
 def test_every_mapping_consumer_rejects_old_projection_artifacts(
@@ -1117,7 +1042,9 @@ def test_reused_reference_rejects_reordered_cells(
             result, "reference_labels", reference=reference
         ),
         "column": lambda: reference.fetch_cell_column("reference_labels"),
-        "layout": lambda: reference.fetch_layout(layout),
+        "layout": lambda: query._mapping_score_data(
+            result, reference=reference, layout=layout
+        ),
         "result": lambda: query.get_mapping_result(result, reference=reference),
         "result_arrays": lambda: query.get_mapping_result(
             result, reference=reference, load_arrays=True
@@ -1174,13 +1101,14 @@ def test_reused_reference_rejects_changed_array_metadata(
     query.get_mapping_result(result, reference=reference)
     loadings = reference.model.loadings
     assert not loadings.flags.writeable
-    original = getattr(loadings, attribute)
+    # NumPy 2.5 deprecates assigning dtype or shape, so swap in a reinterpreted
+    # view of the same bytes instead of editing the array in place.
     changed = (
-        np.dtype(f"u{loadings.dtype.itemsize}")
+        loadings.view(np.dtype(f"u{loadings.dtype.itemsize}"))
         if attribute == "dtype"
-        else (loadings.size,)
+        else loadings.reshape(loadings.size)
     )
-    setattr(loadings, attribute, changed)
+    object.__setattr__(reference.model, "loadings", changed)
     try:
         consumers = (
             lambda: query.get_mapping_result(result, reference=reference),
@@ -1193,5 +1121,5 @@ def test_reused_reference_rejects_changed_array_metadata(
             with pytest.raises(ValueError, match="does not match its stored artifact"):
                 consume()
     finally:
-        setattr(loadings, attribute, original)
+        object.__setattr__(reference.model, "loadings", loadings)
     assert query.get_mapping_result(result, reference=reference).n_cells == 2

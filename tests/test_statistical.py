@@ -36,7 +36,7 @@ def _dunn_reference(values, groups):
     ranks = rankdata(values, method="average")
     n_total = len(values)
     _, counts = np.unique(values, return_counts=True)
-    tied = counts[counts > 1]
+    tied = counts[counts > 1].astype(np.float64)
     tie_correction = float(np.sum(tied**3 - tied)) if tied.size else 0.0
     variance = (n_total * (n_total + 1)) / 12 - tie_correction / (12 * (n_total - 1))
     rows = []
@@ -1111,3 +1111,109 @@ def test_statistical_test_result_identity_defaults_are_optional():
     assert result.source_assays == ()
     assert result.source_dataset_fingerprint is None
     assert result.value_fingerprints == ()
+
+
+def test_dunn_tie_correction_survives_more_than_two_million_tied_values():
+    # A cubed int64 tie count wraps once a group holds about 2.1 million equal
+    # values, which inflated the variance and shrank every z statistic.
+    rng = np.random.default_rng(41)
+    n_zeros = 2_200_000
+    values = np.zeros(n_zeros + 3000)
+    values[n_zeros:] = rng.random(3000) + 1.0
+    groups = np.array(["a", "b", "c"], dtype=object)[rng.integers(0, 3, len(values))]
+    groups[n_zeros : n_zeros + 1000] = "a"
+
+    table = compare_group_distributions(
+        values,
+        groups,
+        test="kruskal_wallis",
+        posthoc="dunn",
+        group_order=["a", "b", "c"],
+    ).posthoc_table
+    reference = _dunn_reference(values, groups)
+
+    assert table is not None
+    np.testing.assert_allclose(table["z"], reference["z"], rtol=1e-9)
+    np.testing.assert_allclose(table["p_value"], reference["p_value"], rtol=1e-6)
+    assert table.loc[0, "z"] > 20
+
+
+def test_mann_whitney_asymptotic_p_value_accepts_mixed_label_types():
+    rng = np.random.default_rng(42)
+    values = np.concatenate([rng.normal(0, 1, 20), rng.normal(1, 1, 20)])
+    groups = np.array([1] * 20 + ["b"] * 20, dtype=object)
+
+    result = compare_group_distributions(values, groups, test="mann_whitney")
+    expected = scipy_mannwhitneyu(
+        values[:20],
+        values[20:],
+        method="asymptotic",
+        use_continuity=True,
+    ).pvalue
+
+    assert result.p_value_method == "asymptotic"
+    assert result.table.loc[0, "p_value"] == pytest.approx(expected, rel=1e-12)
+    assert result.table.loc[0, "p_value"] < 1e-3
+
+
+@pytest.mark.parametrize("test", ["mann_whitney", "welch", "wilcoxon"])
+def test_two_group_comparisons_must_follow_group_order(test):
+    rng = np.random.default_rng(43)
+    n = 12
+    values = np.concatenate([rng.normal(0, 1, n), rng.normal(1, 1, n)])
+    groups = np.array(["A"] * n + ["B"] * n, dtype=object)
+    paired = {}
+    if test == "wilcoxon":
+        paired = {
+            "samples": np.array(
+                [f"s{i % 6}{group}" for i, group in enumerate(groups)], dtype=object
+            ),
+            "pairs": np.array([f"p{i % 6}" for i in range(2 * n)], dtype=object),
+        }
+
+    kept = compare_group_distributions(
+        values,
+        groups,
+        test=test,
+        comparisons=[("A", "B")],
+        **paired,
+    ).table
+    assert (kept.loc[0, "group_1"], kept.loc[0, "group_2"]) == ("A", "B")
+
+    with pytest.raises(ValueError, match="must follow the group order"):
+        compare_group_distributions(
+            values,
+            groups,
+            test=test,
+            comparisons=[("B", "A")],
+            **paired,
+        )
+
+    swapped = compare_group_distributions(
+        values,
+        groups,
+        test=test,
+        group_order=["B", "A"],
+        comparisons=[("B", "A")],
+        **paired,
+    ).table
+    assert (swapped.loc[0, "group_1"], swapped.loc[0, "group_2"]) == ("B", "A")
+
+
+def test_welch_zero_variance_reports_pooled_degrees_of_freedom():
+    groups = np.array(["a"] * 3 + ["b"] * 4, dtype=object)
+
+    separated = compare_group_distributions(
+        np.array([1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0]), groups, test="welch"
+    ).table
+    tied = compare_group_distributions(np.ones(7), groups, test="welch").table
+    one_varies = compare_group_distributions(
+        np.array([1.0, 1.0, 1.0, 2.0, 3.0, 2.5, 2.0]), groups, test="welch"
+    ).table
+
+    assert separated.loc[0, "df"] == 5.0
+    assert np.isneginf(separated.loc[0, "t_statistic"])
+    assert tied.loc[0, "df"] == 5.0
+    assert tied.loc[0, "p_value"] == 1.0
+    # With one varying group the Welch degrees of freedom equal its n - 1.
+    assert one_varies.loc[0, "df"] == pytest.approx(3.0)

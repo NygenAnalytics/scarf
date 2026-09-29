@@ -1,5 +1,6 @@
 import os
 import posixpath
+from datetime import timedelta
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit, urlunsplit
 from collections.abc import Callable, Sequence
@@ -18,6 +19,9 @@ from .profiles import (
 )
 
 MATRIX_SOURCE_ATTR = "matrixSource"
+# Object stores stop after 10 retries by default, which is about nine seconds
+# of backoff. Keep retrying transient errors for up to three minutes instead.
+_REMOTE_RETRY_CONFIG = {"max_retries": 100, "retry_timeout": timedelta(minutes=3)}
 _ASSAY_COPY_ATTRS = ("is_assay", "misc", "percentFeatures", "size_factor")
 _WORKSPACE_COPY_ATTRS = ("defaultAssay", "assayTypes")
 
@@ -151,7 +155,8 @@ def make_store(
                 from zarr.storage import ObjectStore
             except ImportError as exc:
                 raise ImportError("Remote Zarr stores require obstore.") from exc
-            obstore = obstore_from_url(location, **(storage_options or {}))
+            options = {"retry_config": _REMOTE_RETRY_CONFIG, **(storage_options or {})}
+            obstore = obstore_from_url(location, **options)
             return ObjectStore(store=obstore, read_only=read_only)  # type: ignore[type-var]
         return location
 

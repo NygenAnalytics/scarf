@@ -44,14 +44,3 @@ do not accept an `ArtifactRef`.
 .. autoclass:: scarf.metadata.MetaData
     :members:
 ```
-
-## ATAC coordinate melding
-
-```{eval-rst}
-.. autoclass:: scarf.GffReader
-    :members:
-```
-
-```{eval-rst}
-.. autofunction:: scarf.coordinate_melding
-```

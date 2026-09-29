@@ -2,14 +2,18 @@ import numpy as np
 from numba import njit
 from scipy.sparse import csr_matrix
 
+from ..utils.arrays import sparse_matrix_bytes
+
 _INT32_MAX = int(np.iinfo(np.int32).max)
 _FLOAT64_SIZE = int(np.dtype(np.float64).itemsize)
 
 
-def _inverse_degree_diagonal(graph: csr_matrix) -> csr_matrix:
-    inverse_degree = np.ravel(graph.sum(axis=1))
-    inverse_degree[inverse_degree != 0] = 1 / inverse_degree[inverse_degree != 0]
-    n_cells = graph.shape[0]
+def inverse_degree_diagonal(degree: np.ndarray) -> csr_matrix:
+    """Return a sparse diagonal of reciprocal degrees; zero degrees stay zero."""
+    inverse_degree = np.array(degree, copy=True)
+    nonzero = inverse_degree != 0
+    inverse_degree[nonzero] = 1 / inverse_degree[nonzero]
+    n_cells = inverse_degree.shape[0]
     return csr_matrix(
         (
             inverse_degree,
@@ -19,6 +23,10 @@ def _inverse_degree_diagonal(graph: csr_matrix) -> csr_matrix:
     )
 
 
+def _row_degree_diagonal(graph: csr_matrix) -> csr_matrix:
+    return inverse_degree_diagonal(np.ravel(graph.sum(axis=1)))
+
+
 def transition_matrix(graph: csr_matrix) -> csr_matrix:
     """Return the row-normalized graph, one step of graph diffusion.
 
@@ -26,7 +34,7 @@ def transition_matrix(graph: csr_matrix) -> csr_matrix:
     result has the entries of ``graph``, so it needs about as much memory as
     the graph itself.
     """
-    return _inverse_degree_diagonal(graph).dot(graph)
+    return _row_degree_diagonal(graph).dot(graph)
 
 
 @njit(cache=True)
@@ -66,15 +74,6 @@ def _product_nnz(
                     last_row[col] = row
                     total += 1
     return total
-
-
-def _csr_bytes(*matrices: csr_matrix) -> int:
-    """Return the bytes of distinct CSR matrices, counting an aliased one once."""
-    unique = {id(matrix): matrix for matrix in matrices}
-    return sum(
-        int(matrix.data.nbytes + matrix.indices.nbytes + matrix.indptr.nbytes)
-        for matrix in unique.values()
-    )
 
 
 def _product_bytes(left: csr_matrix, right: csr_matrix, nnz: int) -> int:
@@ -120,7 +119,7 @@ def bounded_diffusion_operator(
         right: csr_matrix,
         held: tuple[csr_matrix, ...],
     ) -> None:
-        held_bytes = _csr_bytes(graph, *held)
+        held_bytes = sparse_matrix_bytes(graph, *held)
         n_cols = int(right.shape[1])
         bound = int(
             _product_nnz_bound(
@@ -149,7 +148,7 @@ def bounded_diffusion_operator(
                 "increase the memory budget or use a smaller diffusion power t."
             )
 
-    diagonal = _inverse_degree_diagonal(graph)
+    diagonal = _row_degree_diagonal(graph)
     reserve(diagonal, graph, (diagonal,))
     del diagonal
     transition = transition_matrix(graph)

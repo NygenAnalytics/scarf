@@ -1,6 +1,6 @@
 """Harmony correction for reduced cell embeddings."""
 
-from .api import fit_harmony, run_harmony
+from .api import fit_harmony
 from .models import ClusterFn, HarmonyResult
 from .optimizer import Harmony, moe_correct_ridge, safe_entropy
 
@@ -10,7 +10,6 @@ __all__ = [
     "HarmonyResult",
     "fit_harmony",
     "moe_correct_ridge",
-    "run_harmony",
     "safe_entropy",
 ]
 
@@ -19,7 +18,6 @@ for _public_object in (
     HarmonyResult,
     fit_harmony,
     moe_correct_ridge,
-    run_harmony,
     safe_entropy,
 ):
     _public_object.__module__ = __name__

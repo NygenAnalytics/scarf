@@ -1,4 +1,3 @@
-import operator
 from collections.abc import Callable, Mapping
 from dataclasses import MISSING, dataclass, field, fields
 from types import MappingProxyType
@@ -16,24 +15,17 @@ from ..storage.artifact_writer import (
 from ..storage.artifacts import (
     ArtifactRef,
     ArtifactScope,
-    make_provenance,
-    provenance_hash,
     serialize_artifact_value,
 )
 
 type ArgumentRole = Literal["input", "parameter", "execution"]
 
 
-def _positive_integer(value: Any, name: str) -> int:
-    if isinstance(value, bool):
-        raise TypeError(f"{name} must be a positive integer")
-    try:
-        resolved = operator.index(value)
-    except TypeError:
-        raise TypeError(f"{name} must be a positive integer") from None
-    if resolved < 1:
-        raise ValueError(f"{name} must be greater than zero")
-    return int(resolved)
+def graph_flag(value: object, name: str) -> bool:
+    """Return a graph-loading flag as a Python bool; NumPy bools are accepted."""
+    if isinstance(value, bool | np.bool_):
+        return bool(value)
+    raise TypeError(f"{name} must be a boolean")
 
 
 def parameter(
@@ -125,17 +117,6 @@ class OperationArguments:
             inputs=partitions["input"],
         )
 
-    def provenance(self) -> dict[str, Any]:
-        record = self.to_record()
-        return make_provenance(
-            operation=self.operation,
-            parameters=record.parameters,
-            inputs=record.inputs,
-        )
-
-    def provenance_hash(self) -> str:
-        return provenance_hash(self.provenance())
-
     def plan(
         self,
         root: zarr.Group,
@@ -207,6 +188,9 @@ class PcaArguments(OperationArguments):
     batch_size: int = execution()
     show_elbow_plot: bool = execution()
     invalidate_cache: bool = execution(False)
+    # Rows per block when IncrementalPCA fits several blocks, whose result
+    # depends on the block size. Exact fits leave it unset.
+    incremental_block_rows: int | None = parameter(None, omit_if_none=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,5 +306,5 @@ class EmbeddingInitializationArguments(OperationArguments):
     batch_size: int = parameter()
     kmeans_sampling: float = parameter(0.1)
     kmeans_batch_size: int = parameter(10_000)
-    algorithm_version: str = parameter("minibatch_kmeans_v2")
+    algorithm_version: str = parameter("minibatch_kmeans_v3")
     invalidate_cache: bool = execution(False)

@@ -170,11 +170,12 @@ def test_fresh_local_run_rejects_old_results_before_deleting_data(
 def test_claims_stay_at_funnel_and_job_level(object_store, monkeypatch, tmp_path):
     config = _config()
     monkeypatch.setattr(modal_app, "_WORK", tmp_path)
-    monkeypatch.setattr(
-        modal_app,
-        "download_file",
-        lambda _uri, destination: Path(destination).write_bytes(b"h5ad"),
-    )
+
+    def download(_uri, destination):
+        Path(destination).write_bytes(b"h5ad")
+        return r2.ObjectDownload(fileBytes=4, eTag=None)
+
+    monkeypatch.setattr(modal_app, "download_file", download)
     monkeypatch.setattr(
         modal_app, "run_stage", lambda stage, **_kwargs: _stage_result(stage)
     )
@@ -198,9 +199,117 @@ def test_claims_stay_at_funnel_and_job_level(object_store, monkeypatch, tmp_path
     monkeypatch.setattr(
         modal_app, "orchestrator_function_options", lambda *_args, **_kwargs: {}
     )
-    modal_app.run_all_jobs.local(config.model_dump(mode="python"), "testsubmission")
+    # The funnel holds this runTag, so a stage fan-out on it is refused.
+    with pytest.raises(FileExistsError, match="held by an e2e funnel"):
+        modal_app.run_all_jobs.local(config.model_dump(mode="python"), "testsubmission")
 
     keys = [item["path"] for batch in object_store.list() for item in batch]
     assert any(key.endswith("/e2e-claim.json") for key in keys)
-    assert not [key for key in keys if ".submissions/" in key]
+    assert not [key for key in keys if ".submissions/" in key or ".claim.json" in key]
     assert not [key for key in keys if "/0/" in key]
+
+
+def _run_stage_job(config, stage: str, submission: str, *args):
+    return modal_app.run_stage_job.local(
+        config.model_dump(mode="python"), 10_000, stage, submission, *args
+    )
+
+
+def test_second_submission_cannot_run_a_claimed_stage(
+    object_store, monkeypatch, tmp_path
+):
+    config = _config(runTag="shared")
+    monkeypatch.setattr(modal_app, "_WORK", tmp_path)
+    started = Event()
+    finish = Event()
+    calls = []
+
+    def run(stage, **kwargs):
+        calls.append(kwargs["submissionId"])
+        started.set()
+        assert finish.wait(10)
+        return _stage_result(stage)
+
+    monkeypatch.setattr(modal_app, "run_stage", run)
+    with ThreadPoolExecutor(1) as pool:
+        owner = pool.submit(_run_stage_job, config, "initializeStore", "first")
+        try:
+            assert started.wait(10)
+            with pytest.raises(FileExistsError, match="claimed by submission first"):
+                _run_stage_job(config, "initializeStore", "second")
+        finally:
+            finish.set()
+        owner.result(timeout=10)
+    assert calls == ["first"]
+
+    # The owner released its claim, so a forced rerun may take the stage.
+    monkeypatch.setattr(
+        modal_app, "run_stage", lambda stage, **_kwargs: _stage_result(stage)
+    )
+    assert _run_stage_job(config, "initializeStore", "third", True)["status"] == "ok"
+    keys = [item["path"] for batch in object_store.list() for item in batch]
+    assert not [key for key in keys if key.endswith(".claim.json")]
+
+
+def test_stage_job_refuses_a_run_tag_held_by_a_funnel(
+    object_store, monkeypatch, tmp_path
+):
+    config = _config(runTag="funnel-owned")
+    monkeypatch.setattr(modal_app, "_WORK", tmp_path)
+    monkeypatch.setattr(
+        modal_app,
+        "run_stage",
+        lambda *_args, **_kwargs: pytest.fail("a funnel-owned stage must not run"),
+    )
+    r2.put_json(config.e2eClaimUri(), {"runTag": config.runTag})
+
+    with pytest.raises(FileExistsError, match="held by an e2e funnel"):
+        _run_stage_job(config, "filterCells", "late")
+    keys = [item["path"] for batch in object_store.list() for item in batch]
+    assert not [key for key in keys if key.endswith(".claim.json")]
+
+
+def test_create_store_refuses_an_existing_store_unless_forced(
+    object_store, monkeypatch, tmp_path
+):
+    config = _config(runTag="existing-store")
+    monkeypatch.setattr(modal_app, "_WORK", tmp_path)
+    object_store.put(urlsplit(config.datasetUri(10_000)).path.lstrip("/"), b"h5ad")
+    object_store.put(
+        urlsplit(f"{config.storeUri(10_000)}/zarr.json").path.lstrip("/"), b"{}"
+    )
+    runs = []
+    monkeypatch.setattr(
+        modal_app,
+        "run_stage",
+        lambda stage, **kwargs: runs.append(kwargs) or _stage_result(stage),
+    )
+
+    with pytest.raises(FileExistsError, match="would replace the existing store"):
+        _run_stage_job(config, "createStore", "unforced")
+    assert runs == []
+
+    payload = _run_stage_job(config, "createStore", "forced", True)
+    assert runs and runs[0]["invalidateCache"] is True
+    assert payload["datasetUri"] == config.datasetUri(10_000)
+    assert payload["datasetBytes"] == 4
+    assert payload["datasetETag"]
+
+
+def test_stage_job_refuses_an_override_for_non_consume_stages(
+    object_store, monkeypatch, tmp_path
+):
+    config = _config(runTag="consume-ab").model_copy(
+        update={"storeUriOverride": "s3://bucket/existing.zarr"}
+    )
+    monkeypatch.setattr(modal_app, "_WORK", tmp_path)
+    monkeypatch.setattr(
+        modal_app,
+        "run_stage",
+        lambda *_args, **_kwargs: pytest.fail("an overridden store must not change"),
+    )
+
+    with pytest.raises(
+        ValueError, match="only for consume stages; refusing createStore"
+    ):
+        _run_stage_job(config, "createStore", "wipe")

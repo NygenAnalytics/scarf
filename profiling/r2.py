@@ -104,36 +104,6 @@ def object_size(uri: str) -> int | None:
     return int(meta["size"])
 
 
-def list_objects(
-    prefixUri: str,
-    *,
-    maxKeys: int = 256,
-) -> list[dict[str, Any]]:
-    if maxKeys < 1:
-        raise ValueError("maxKeys must be positive")
-    parsed = urlsplit(prefixUri)
-    if parsed.scheme != "s3" or not parsed.netloc:
-        raise ValueError(f"Expected an s3:// object URI, got: {prefixUri}")
-    prefix = parsed.path.lstrip("/")
-    store, _key = open_r2_object(prefixUri if prefix else f"{prefixUri.rstrip('/')}/.")
-    listed: list[dict[str, Any]] = []
-    for batch in store.list(prefix=prefix or None, chunk_size=min(50, maxKeys)):
-        for item in batch:
-            path = str(item["path"])
-            e_tag = item.get("e_tag")
-            listed.append(
-                {
-                    "uri": f"s3://{parsed.netloc}/{path}",
-                    "path": path,
-                    "size": int(item["size"]),
-                    "eTag": str(e_tag) if e_tag else None,
-                }
-            )
-            if len(listed) >= maxKeys:
-                return listed
-    return listed
-
-
 def get_json(uri: str) -> dict[str, Any]:
     store, key = open_r2_object(uri)
     payload = json.loads(bytes(store.get(key).bytes()).decode("utf-8"))
@@ -169,7 +139,12 @@ def download_file(
     chunkBytes: int = _DEFAULT_TRANSFER_CHUNK_BYTES,
     maxWorkers: int | None = None,
 ) -> ObjectDownload:
-    """Download with concurrent ranged GETs into a preallocated file."""
+    """Download one object version with concurrent ranged GETs into a preallocated file.
+
+    Every range is pinned to the ETag the initial HEAD returned, so a replaced object
+    fails the download instead of mixing versions, and every range must return exactly
+    the requested bytes.
+    """
     if chunkBytes <= 0:
         raise ValueError("chunkBytes must be positive")
 
@@ -178,56 +153,66 @@ def download_file(
     destination_path.parent.mkdir(parents=True, exist_ok=True)
     meta = store.head(key)
     total = int(meta["size"])
+    raw_e_tag = meta.get("e_tag")
+    e_tag = str(raw_e_tag) if raw_e_tag else None
     part_path = destination_path.with_name(f".{destination_path.name}.part")
-    if part_path.is_file() and part_path.stat().st_size != total:
-        part_path.unlink()
-    if total == 0:
-        part_path.write_bytes(b"")
-        os.replace(part_path, destination_path)
-        e_tag = meta.get("e_tag")
-        return ObjectDownload(fileBytes=0, eTag=str(e_tag) if e_tag else None)
-
-    ranges = [
-        (start, min(start + chunkBytes, total)) for start in range(0, total, chunkBytes)
-    ]
-    workers = max(1, int(maxWorkers) if maxWorkers is not None else min(8, len(ranges)))
     with part_path.open("wb") as handle:
         handle.truncate(total)
 
     def fetch_range(start: int, end: int) -> None:
-        chunk = bytes(store.get_range(key, start=start, end=end))
-        if not chunk:
-            raise RuntimeError(f"Empty range response for {uri} at offset {start}")
-        if start + len(chunk) > end:
+        options: dict[str, Any] = {"range": (start, end)}
+        if e_tag is not None:
+            options["if_match"] = e_tag
+        chunk = bytes(store.get(key, options=options).bytes())
+        if len(chunk) != end - start:
             raise RuntimeError(
-                f"Range response for {uri} at offset {start} exceeded "
-                f"{end - start} bytes"
+                f"Range response for {uri} at offset {start} returned {len(chunk)} "
+                f"bytes, expected {end - start}"
             )
         with part_path.open("r+b") as handle:
             handle.seek(start)
             handle.write(chunk)
 
-    if workers == 1 or len(ranges) == 1:
-        for start, end in ranges:
-            fetch_range(start, end)
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(fetch_range, start, end) for start, end in ranges]
-            for future in as_completed(futures):
-                future.result()
-
-    if part_path.stat().st_size != total:
-        raise RuntimeError(
-            f"Downloaded {part_path.stat().st_size} bytes from {uri}, expected {total}"
-        )
+    ranges = [
+        (start, min(start + chunkBytes, total)) for start in range(0, total, chunkBytes)
+    ]
+    workers = max(1, int(maxWorkers) if maxWorkers is not None else min(8, len(ranges)))
+    try:
+        if workers == 1 or len(ranges) <= 1:
+            for start, end in ranges:
+                fetch_range(start, end)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(fetch_range, start, end) for start, end in ranges
+                ]
+                for future in as_completed(futures):
+                    future.result()
+    except BaseException:
+        part_path.unlink(missing_ok=True)
+        raise
     os.replace(part_path, destination_path)
-    e_tag = meta.get("e_tag")
-    return ObjectDownload(fileBytes=total, eTag=str(e_tag) if e_tag else None)
+    return ObjectDownload(fileBytes=total, eTag=e_tag)
 
 
-def upload_file(source: str | Path, uri: str) -> None:
+def upload_file(source: str | Path, uri: str, *, createOnly: bool = False) -> None:
+    """Upload a file; ``createOnly`` refuses to replace an existing object.
+
+    A create-only upload is a single request, so use it only for small files.
+    """
     source_path = Path(source)
     if not source_path.is_file():
         raise FileNotFoundError(source_path)
     store, key = open_r2_object(uri)
-    store.put(key, source_path, use_multipart=True)
+    if not createOnly:
+        store.put(key, source_path, use_multipart=True)
+        return
+    try:
+        store.put(key, source_path, mode="create", use_multipart=False)
+    except AlreadyExistsError as exc:
+        raise FileExistsError(f"Refusing to replace existing object {uri}") from exc
+
+
+def delete_object(uri: str) -> None:
+    store, key = open_r2_object(uri)
+    store.delete(key)

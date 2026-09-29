@@ -104,6 +104,21 @@ def test_reference_query_rejects_corrupted_provenance(
         _reference_available_k(reference)
 
 
+def test_reference_query_requires_the_recorded_ann_search_depth(
+    analyzed_datastore_ephemeral,
+):
+    reference = _plain_reference(analyzed_datastore_ephemeral)
+    group = artifact_group(reference.datastore.zw, reference.ann_index)
+    provenance = dict(group.attrs["provenance"])
+    parameters = dict(provenance["parameters"])
+    del parameters["ann_ef"]
+    provenance["parameters"] = parameters
+    group.attrs["provenance"] = provenance
+
+    with pytest.raises(ValueError, match="search depth is invalid"):
+        _reference_available_k(reference)
+
+
 @pytest.mark.parametrize("source", ["ref", "reduction", "ann_index", "neighbors"])
 def test_reference_query_rejects_incomplete_graph_chain(
     analyzed_datastore_ephemeral, source
@@ -303,7 +318,7 @@ def test_load_rejects_versioned_metadata_and_bad_distance_summary(
     metadata = dict(group.attrs["reference_metadata"])
     metadata["schemaVersion"] = 1
     group.attrs["reference_metadata"] = metadata
-    with pytest.raises(ValueError, match="versioned contract"):
+    with pytest.raises(ValueError, match="does not match the current contract"):
         load_artifact_mapping_reference(datastore, reference.ref)
 
     reference = datastore.get_mapping_reference(
@@ -333,8 +348,9 @@ def test_load_rejects_malformed_scoped_and_missing_input_refs(
     malformed_reduction = dict(original_inputs["reduction"])
     malformed_reduction["artifact_id"] = "invalid"
     corruptions = (
-        ("not-a-ref", "input 'reduction' is missing"),
-        (malformed_reduction, "input 'reduction' is malformed"),
+        (None, "has no 'reduction' input"),
+        ("not-a-ref", "malformed 'reduction' input"),
+        (malformed_reduction, "malformed 'reduction' input"),
         (
             _ref(kind="reduction", assay=None, token="d").to_dict(),
             "wrong artifact kind or scope",
@@ -621,3 +637,131 @@ def test_mapping_reference_source_validation_is_strict_and_semantic() -> None:
             loadings=float32_loadings,
             symphony_sources=None,
         )
+
+
+def _edit_provenance(group, section, key, value) -> None:
+    provenance = dict(group.attrs["provenance"])
+    if section is None:
+        provenance[key] = value
+    else:
+        provenance[section] = dict(provenance[section]) | {key: value}
+    group.attrs["provenance"] = provenance
+
+
+def test_load_rejects_each_tampered_graph_chain_record(
+    analyzed_datastore_ephemeral,
+) -> None:
+    datastore = analyzed_datastore_ephemeral
+    reference = _plain_reference(datastore)
+    reduction_status = datastore.inspect_artifact(reference.reduction)
+    groups = {
+        "reference": artifact_group(datastore.zw, reference.ref),
+        "reduction": artifact_group(datastore.zw, reference.reduction),
+        "ann_index": artifact_group(datastore.zw, reference.ann_index),
+        "neighbors": artifact_group(datastore.zw, reference.neighbors),
+        "normalized": artifact_group(
+            datastore.zw, reduction_status.input_ref("normalized")
+        ),
+        "scaling": artifact_group(
+            datastore.zw, reduction_status.input_ref("feature_scaling")
+        ),
+    }
+    unrelated = reference.feature_selection.to_dict()
+    other_ref = reference.reduction.to_dict()
+    for target, section, key, value, message in (
+        ("reference", "parameters", "extra", 1, "parameters do not match"),
+        ("reduction", None, "operation", "run_svd", "reduction is not PCA"),
+        ("reduction", "parameters", "feat_scaling", False, "feature scaling"),
+        ("ann_index", None, "operation", "old_ann", "ANN input has an old operation"),
+        ("neighbors", None, "operation", "old_knn", "neighbors input has an old"),
+        ("neighbors", "inputs", "coordinates", unrelated, "ANN coordinate chain"),
+        ("normalized", None, "operation", "old_norm", "Normalized input has an old"),
+        ("normalized", "inputs", "dataset_fingerprint", "", "no dataset fingerprint"),
+        ("scaling", "parameters", "enabled", False, "Feature scaling does not match"),
+        ("normalized", "inputs", "feature_selection", other_ref, "Stored selections"),
+        ("ann_index", "parameters", "ann_metric", "manhattan", "metric is unsupported"),
+    ):
+        group = groups[target]
+        original = group.attrs["provenance"]
+        _edit_provenance(group, section, key, value)
+        with pytest.raises(ValueError, match=message):
+            load_artifact_mapping_reference(datastore, reference.ref)
+        group.attrs["provenance"] = original
+    assert load_artifact_mapping_reference(datastore, reference.ref).ref == (
+        reference.ref
+    )
+
+
+def test_load_rejects_each_inconsistent_reference_record(
+    analyzed_datastore_ephemeral,
+    monkeypatch,
+) -> None:
+    import scarf.mapping.artifact as artifact_module
+
+    datastore = analyzed_datastore_ephemeral
+    reference = _plain_reference(datastore)
+    group = artifact_group(datastore.zw, reference.ref)
+    normalized_group = artifact_group(
+        datastore.zw,
+        datastore.inspect_artifact(reference.reduction).input_ref("normalized"),
+    )
+    original = dict(group.attrs["reference_metadata"])
+    parameters = dict(original["normalization_parameters"])
+    for changes, message in (
+        (
+            {"normalization_parameters": parameters | {"unexpected": 1}},
+            "normalization parameters changed",
+        ),
+        ({"ann_metric": "unexpected"}, "distance metrics do not agree"),
+        ({"dataset_fingerprint": ""}, "dataset fingerprint is missing"),
+        ({"dataset_fingerprint": "other"}, "does not match normalized data"),
+        ({"selected_cell_count": True}, "cell count is missing"),
+    ):
+        group.attrs["reference_metadata"] = original | changes
+        with pytest.raises(ValueError, match=message):
+            load_artifact_mapping_reference(datastore, reference.ref)
+    group.attrs["reference_metadata"] = ["not", "a", "mapping"]
+    with pytest.raises(ValueError, match="metadata is missing"):
+        load_artifact_mapping_reference(datastore, reference.ref)
+
+    normalized_provenance = normalized_group.attrs["provenance"]
+    _edit_provenance(normalized_group, "parameters", "unexpected", 1)
+    group.attrs["reference_metadata"] = original | {
+        "normalization_parameters": parameters | {"unexpected": 1}
+    }
+    with pytest.raises(ValueError, match="normalization is unsupported"):
+        load_artifact_mapping_reference(datastore, reference.ref)
+    normalized_group.attrs["provenance"] = normalized_provenance
+    group.attrs["reference_metadata"] = original
+
+    fingerprint = group.attrs["payload_fingerprint"]
+    group.attrs["payload_fingerprint"] = "changed"
+    with pytest.raises(ValueError, match="payload fingerprint does not match"):
+        load_artifact_mapping_reference(datastore, reference.ref)
+    group.attrs["payload_fingerprint"] = fingerprint
+
+    def reject(*args, **kwargs):
+        raise ValueError("rejected")
+
+    for owner, name, replacement, message in (
+        (artifact_module, "validate_cell_selection", reject, "no longer matches"),
+        (
+            artifact_module,
+            "validate_mapping_reference_sources",
+            reject,
+            "upstream model arrays are invalid",
+        ),
+        (datastore, "_get_assay", lambda name: object(), "RNA assays only"),
+    ):
+        with monkeypatch.context() as patch:
+            patch.setattr(owner, name, replacement)
+            with pytest.raises(ValueError, match=message):
+                load_artifact_mapping_reference(datastore, reference.ref)
+    assert load_artifact_mapping_reference(datastore, reference.ref).ref == (
+        reference.ref
+    )
+
+    data = artifact_group(datastore.zw, reference.reduction)["data"]
+    data.resize((data.shape[0], data.shape[1] + 1))
+    with pytest.raises(ValueError, match="PCA coordinates do not match"):
+        load_artifact_mapping_reference(datastore, reference.ref)

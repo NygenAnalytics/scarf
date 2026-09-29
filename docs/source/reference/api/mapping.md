@@ -59,7 +59,6 @@ Projections written before this contract are rejected with an instruction to re-
    scarf.DataStore.get_mapping_score
    scarf.DataStore.get_target_classes
    scarf.DataStore.get_target_label_evidence
-   scarf.DataStore.calibrate_label_transfer_threshold
 ```
 
 ```{eval-rst}
@@ -70,7 +69,6 @@ Projections written before this contract are rejected with an instruction to re-
 .. automethod:: scarf.DataStore.get_mapping_score
 .. automethod:: scarf.DataStore.get_target_classes
 .. automethod:: scarf.DataStore.get_target_label_evidence
-.. automethod:: scarf.DataStore.calibrate_label_transfer_threshold
 ```
 
 Mapping diagnostics are documented in the {doc}`plotting` API reference.

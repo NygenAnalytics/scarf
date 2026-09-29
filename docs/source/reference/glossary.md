@@ -85,7 +85,7 @@ partial PCA
 LISI
   Local Inverse Simpson Index.
   Per-cell measure of local label mixing in the KNN graph.
-  Computed with `metric_lisi`.
+  Computed per cell with `scarf.metrics.compute_lisi`.
 
 iLISI
   Integration LISI.

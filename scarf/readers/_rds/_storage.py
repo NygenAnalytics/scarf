@@ -67,11 +67,6 @@ class RandomAccessStorage:
             self._ensure_open()
             return self._file.seek(offset, whence)
 
-    def read(self, size: int = -1) -> bytes:
-        with self._lock:
-            self._ensure_open()
-            return self._file.read(size)
-
     def read_at(self, offset: int, size: int, *, path: str = "$") -> bytes:
         if offset < 0 or size < 0:
             raise ValueError("offset and size must be nonnegative")
@@ -153,16 +148,8 @@ class TempManager:
         self._lock = threading.RLock()
 
     @property
-    def used_bytes(self) -> int:
-        return self._used
-
-    @property
     def paths(self) -> tuple[pathlib.Path, ...]:
         return tuple(self._paths)
-
-    @property
-    def storages(self) -> tuple[RandomAccessStorage, ...]:
-        return tuple(self._storages)
 
     def create(self, label: str) -> RandomAccessStorage:
         with self._lock:
@@ -298,6 +285,11 @@ class _OpenedInput:
     owned: bool
 
 
+# R writes xz payloads with a 64 MiB dictionary; a crafted header must not be
+# able to make the decoder reserve more memory than this.
+_XZ_MEMORY_LIMIT = 256 * 1024**2
+_DECODER_READ_BYTES = 64 * 1024
+
 _COMPRESSION_MAGIC: tuple[tuple[bytes, RdsCompression], ...] = (
     (b"\x1f\x8b", RdsCompression.GZIP),
     (b"BZh", RdsCompression.BZIP2),
@@ -363,6 +355,51 @@ def _sha256_range(file: BinaryStream, start: int, stop: int) -> str:
     return digest.hexdigest()
 
 
+class _XzReader(io.RawIOBase):
+    """Decode xz streams with a bounded decoder memory limit."""
+
+    def __init__(self, source: BinaryStream) -> None:
+        self._source = source
+        self._decoder = lzma.LZMADecompressor(memlimit=_XZ_MEMORY_LIMIT)
+        self._finished = False
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        view = memoryview(buffer).cast("B")
+        while not self._finished:
+            if self._decoder.eof:
+                # xz stream padding is null bytes between or after streams.
+                data = self._decoder.unused_data.lstrip(b"\x00")
+                while not data:
+                    data = self._source.read(_DECODER_READ_BYTES)
+                    if not data:
+                        break
+                    data = data.lstrip(b"\x00")
+                if not data:
+                    self._finished = True
+                    break
+                # Concatenated streams continue; other trailing bytes end the input.
+                self._decoder = lzma.LZMADecompressor(memlimit=_XZ_MEMORY_LIMIT)
+                try:
+                    output = self._decoder.decompress(data, len(view))
+                except lzma.LZMAError:
+                    self._finished = True
+                    break
+            elif self._decoder.needs_input:
+                data = self._source.read(_DECODER_READ_BYTES)
+                if not data:
+                    raise EOFError("xz stream ended before its end marker")
+                output = self._decoder.decompress(data, len(view))
+            else:
+                output = self._decoder.decompress(b"", len(view))
+            if output:
+                view[: len(output)] = output
+                return len(output)
+        return 0
+
+
 def _decompressor(
     compression: RdsCompression,
     source: BinaryStream,
@@ -372,7 +409,7 @@ def _decompressor(
     if compression is RdsCompression.BZIP2:
         return cast(BinaryStream, bz2.BZ2File(cast(Any, source), mode="rb"))
     if compression is RdsCompression.XZ:
-        return cast(BinaryStream, lzma.LZMAFile(cast(Any, source), mode="rb"))
+        return cast(BinaryStream, io.BufferedReader(_XzReader(source)))
     if compression is RdsCompression.ZSTD:
         import zstandard
 

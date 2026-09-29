@@ -14,10 +14,7 @@ from scarf.agent.data_enrichment.contracts import (
     StudyContextSummary,
 )
 from scarf.agent.data_enrichment.validation import _ground_study_context_summary
-from scarf.agent.parameter_tuning.contracts import (
-    FinalGraphSelection,
-    ParameterTuningReport,
-)
+from scarf.agent.parameter_tuning.contracts import ParameterTuningReport
 from tests.agent_examples import example
 
 
@@ -36,13 +33,8 @@ from tests.agent_examples import example
         ),
         (
             ParameterTuningReport,
-            {"evaluations", "selectedArtifacts", "runInfo", "finalSelection"},
-            {"recommendedCandidateId", "rationale", "comparisons", "assayReports"},
-        ),
-        (
-            FinalGraphSelection,
-            {"graphMethod", "nativeAssay", "integrationId", "runInfo"},
-            {"selectedOptionId", "rationale", "comparisons"},
+            {"evaluations", "selectedArtifacts", "runInfo"},
+            {"recommendedCandidateId", "rationale", "confidence"},
         ),
         (
             BiologicalInterpretationReport,

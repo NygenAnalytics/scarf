@@ -16,7 +16,7 @@ def _read_block(
     order of the index arrays. This centralizes the read path so callers never
     hand-roll ``slice(idx[0], idx[-1] + 1)``.
     """
-    from ..matrix._indexing import is_contiguous
+    from ..storage.partition import is_contiguous
 
     def axis_sel(idx: np.ndarray) -> slice | np.ndarray:
         idx = np.asarray(idx)

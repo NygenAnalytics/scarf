@@ -462,19 +462,28 @@ def test_embedding_run_adapter_uses_exact_outputs_and_frozen_fields(
             show=False,
         )
 
+    accessor.embedding(run=run, color_by="sample_id", show=False)  # type: ignore[arg-type]
+    _, kwargs = calls.pop()
+    assert kwargs["layout"] == layout
+    with pytest.raises(TypeError, match="layout must name a pipeline output"):
+        accessor.embedding(run=run, layout=3, show=False)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="run must be a PipelineRun"):
+        accessor.embedding(run=object(), layout="umap", show=False)  # type: ignore[arg-type]
+    foreign = FakeRun()
+    foreign._owner = object()
+    with pytest.raises(ValueError, match="opened from this datastore"):
+        accessor.embedding(run=foreign, layout="umap", show=False)  # type: ignore[arg-type]
 
-def test_frozen_run_plot_cells_falls_back_without_selected_fetch() -> None:
+
+def test_frozen_run_plot_cells_fetch_selected_rows_of_the_run() -> None:
     from scarf.datastore._plot_accessor import _FrozenRunPlotCells
 
     class CompactCells:
         columns = ("clusters",)
 
-        def _plot_fetch_all(self, column: str) -> np.ndarray:
-            return np.asarray([0, -1, 1, -1])
-
-        def fetch_all(self, column: str) -> np.ndarray:
-            assert column == "I"
-            return np.asarray([True, False, True, False])
+        def _plot_fetch_selected(self, column: str) -> np.ndarray:
+            assert column == "clusters"
+            return np.asarray([0, 1])
 
     cells = _FrozenRunPlotCells(CompactCells())
     np.testing.assert_array_equal(cells.fetch("clusters"), [0, 1])
@@ -522,37 +531,21 @@ def test_selected_metadata_column_uses_frozen_fetch_or_full_axis_fallback() -> N
     )
     np.testing.assert_array_equal(fallback, [10, 30])
 
-    class KeylessCells:
-        def fetch(self, column: str) -> np.ndarray:
+    class LiveCells:
+        def fetch(self, column: str, key: str = "I") -> np.ndarray:
+            assert key == "filtered"
             return np.asarray([7, 8])
 
         def fetch_all(self, column: str) -> np.ndarray:
             raise AssertionError("live fetch without indices must not expand")
 
     live = _selected_metadata_column(
-        SimpleNamespace(cells=KeylessCells()),
+        SimpleNamespace(cells=LiveCells()),
         "clusters",
-        cell_key="I",
+        cell_key="filtered",
         cell_indices=None,
     )
     np.testing.assert_array_equal(live, [7, 8])
-
-    class KeylessFrozenCells:
-        _selection_ref = object()
-
-        def fetch(self, column: str) -> np.ndarray:
-            return np.asarray([4, 5])
-
-        def fetch_all(self, column: str) -> np.ndarray:
-            raise AssertionError("keyless frozen fetch must not expand")
-
-    keyless_frozen = _selected_metadata_column(
-        SimpleNamespace(cells=KeylessFrozenCells()),
-        "clusters",
-        cell_key="I",
-        cell_indices=np.asarray([1, 2]),
-    )
-    np.testing.assert_array_equal(keyless_frozen, [4, 5])
 
 
 def test_datastore_plots_returns_a_fresh_store_bound_namespace():

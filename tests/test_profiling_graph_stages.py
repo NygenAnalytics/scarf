@@ -474,14 +474,12 @@ def test_run_stage_persists_every_execution_report_and_wire_counts(
     from scarf.storage.execution import (
         ExecutionReport,
         WorkShape,
-        clear_execution_reports,
         plan_operation,
         record_execution_report,
     )
 
     from profiling.stages import run_stage
 
-    clear_execution_reports()
     plan = plan_operation(
         ResourceBudget(8 * 1024 * 1024, 4),
         WorkShape(nUnits=4, unitBytes=1024),
@@ -534,3 +532,133 @@ def test_run_stage_persists_every_execution_report_and_wire_counts(
     assert reports["countsTCellBand"][-1]["readerWaitSeconds"] == 0.25
     assert result.details["storeOperations"]["gets"] == 0
     assert result.details["consume"]["unitKind"] == "countsTCellBand"
+
+
+def test_store_operations_cover_only_the_measured_operation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    probes: list[Any] = []
+
+    def open_store(*_args: Any, storeProbe: Any = None, **_kwargs: Any) -> object:
+        # Opening the store reads its metadata before the measured operation.
+        probes.append(storeProbe)
+        for key in ("zarr.json", "RNA/zarr.json"):
+            storeProbe.enter("get", key)
+            storeProbe.record_transfer("get", key, 100)
+            storeProbe.leave("get")
+        return object()
+
+    def run_analysis(*_args: Any, **_kwargs: Any) -> None:
+        for key in ("out/zarr.json", "out/c/0"):
+            probes[0].enter("set", key, requestedBytes=10)
+            probes[0].record_transfer("set", key, 10)
+            probes[0].leave("set")
+
+    monkeypatch.setattr("profiling.stages._open_datastore", open_store)
+    monkeypatch.setattr("profiling.stages._run_analysis", run_analysis)
+
+    result = run_stage(
+        "runPca",
+        nRows=1000,
+        storeUri=str(tmp_path / "store.zarr"),
+        workflow=WorkflowParameters(),
+        resources=_resources(),
+        sampleIntervalSeconds=0.01,
+        submissionId="testsubmission",
+    )
+
+    assert result.status == "ok"
+    assert result.details is not None
+    operations = result.details["storeOperations"]
+    assert (operations["gets"], operations["sets"]) == (0, 2)
+    assert operations["writeTransferredBytes"] == 20
+    assert result.details["storeOperationsScope"] == "operation"
+
+
+def test_consume_details_use_only_the_stage_reports() -> None:
+    from scarf.storage.budget import ResourceBudget
+    from scarf.storage.execution import (
+        ExecutionReport,
+        WorkShape,
+        plan_operation,
+        record_execution_report,
+    )
+
+    plan = plan_operation(
+        ResourceBudget(8 * 1024 * 1024, 4),
+        WorkShape(nUnits=4, unitBytes=1024),
+    )
+    # An earlier stage of the same process recorded a report of the same kind.
+    record_execution_report(
+        ExecutionReport(
+            plan=plan,
+            unitKind="countsTCellBand",
+            actualReadWorkers=1,
+            actualComputeWorkers=1,
+            actualWriteWorkers=1,
+            fetchSeconds=9.0,
+        )
+    )
+
+    details = _run_analysis(
+        "markHvgs",
+        _RecordingStore(),
+        WorkflowParameters(),
+        _resources(),
+        inputRefs={"cells": _CELL_SELECTION},
+    )
+
+    assert details is not None
+    assert details["consume"] == {"workers": 3, "scarfMemoryBudget": 2 * 1024**3}
+
+
+def test_rerun_stage_that_reuses_its_artifact_fails_unless_allowed(
+    tmp_path: Path,
+) -> None:
+    from profiling.datasets import write_fixture_h5ad
+    from profiling.stages import process_rss_mb
+
+    h5ad = write_fixture_h5ad(tmp_path / "cells.h5ad", nRows=200, nColumns=60)
+    workflow = WorkflowParameters(
+        filterAttrs=("RNA_nCounts", "RNA_nFeatures"),
+        minFeaturesPerCell=1,
+    )
+    resources = _resources().model_copy(
+        update={
+            "workers": 1,
+            "scarfMemoryBudget": int(process_rss_mb() * 1024**2) + 2 * 1024**3,
+        }
+    )
+    common = {
+        "nRows": 200,
+        "storeUri": str(tmp_path / "store.zarr"),
+        "workflow": workflow,
+        "resources": resources,
+        "sampleIntervalSeconds": 0.01,
+        "submissionId": "testsubmission",
+    }
+    for stage in ("createStore", "writeCountsT", "initializeStore"):
+        prepared = run_stage(
+            stage,
+            localH5adPath=h5ad.localPath if stage == "createStore" else None,
+            **common,
+        )
+        assert prepared.status == "ok", prepared.error
+
+    first = run_stage("filterCells", **common)
+    repeated = run_stage("filterCells", **common)
+    allowed = run_stage("filterCells", allowArtifactReuse=True, **common)
+    forced = run_stage("filterCells", invalidateCache=True, **common)
+
+    assert first.status == "ok", first.error
+    assert first.details is not None
+    assert first.details["artifactDisposition"] == "created"
+    assert repeated.status == "error"
+    assert repeated.error is not None and "cache lookup" in repeated.error
+    assert repeated.details is not None
+    assert repeated.details["artifactDisposition"] == "reused"
+    assert allowed.status == "ok"
+    assert forced.status == "ok", forced.error
+    assert forced.details is not None
+    assert forced.details["artifactDisposition"] == "created"

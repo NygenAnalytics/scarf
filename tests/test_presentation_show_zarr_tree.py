@@ -14,6 +14,7 @@ from scarf.matrix import ChunkedArray
 from scarf.storage.artifacts import (
     ArtifactRef,
     artifact_path,
+    inspect_artifact,
     make_provenance,
     new_artifact_id,
 )
@@ -23,6 +24,12 @@ from scarf.storage.selections import resolve_generated_selection_artifact
 class _PresentationStore(_PresentationOperationsMixin):
     def __init__(self, root: zarr.Group) -> None:
         self.zw = root
+
+    def _require_writable(self, operation: str) -> None:
+        if self.zw.read_only:
+            raise PermissionError(
+                f"{operation} requires a DataStore opened with zarr_mode='r+'"
+            )
 
 
 def _presentation_store() -> tuple[_PresentationStore, MemoryStore]:
@@ -319,6 +326,53 @@ def test_membership_strength_matches_reference_counts(
     assert stored.tobytes() == reference.tobytes()
 
 
+def test_membership_strength_needs_a_writable_store_only_for_new_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, backing = _presentation_store()
+    selection = _write_cell_selection(store.zw, np.ones(4, dtype=bool))
+    edges = np.asarray([[0, 1], [1, 0], [2, 3], [3, 2]], dtype=np.uint64)
+    graph_ref = _write_complete_artifact(
+        store.zw, "connectivity_map", arrays={"edges": edges}
+    )
+    clusters, other_clusters = (
+        _write_complete_artifact(
+            store.zw,
+            "cluster_labels",
+            inputs={"cell_selection": selection},
+            arrays={"values": values},
+        )
+        for values in (np.asarray([0, 0, 1, 1]), np.asarray([0, 1, 1, 1]))
+    )
+    _patch_graph_resolution(monkeypatch, graph_ref, selection=selection)
+    store._get_graph_ncells_k = Mock(return_value=(4, 1))
+    ref = store.calc_membership_strength(clusters, graph_ref)
+    read_only = _PresentationStore(zarr.open_group(store=backing, mode="r"))
+    read_only._get_graph_ncells_k = Mock(return_value=(4, 1))
+
+    assert read_only.calc_membership_strength(clusters, graph_ref) == ref
+    with pytest.raises(PermissionError, match="calc_membership_strength requires"):
+        read_only.calc_membership_strength(other_clusters, graph_ref)
+
+
+def test_membership_strength_rejects_non_graph_kinds_before_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scarf.datastore._operations.presentation as presentation
+
+    store, _backing = _presentation_store()
+    neighbors = _write_complete_artifact(store.zw, "neighbors")
+    clusters = _write_complete_artifact(store.zw, "cluster_labels")
+
+    def refuse_lookup(*_args, **_kwargs):
+        raise AssertionError("a non-graph input must not be inspected or planned")
+
+    monkeypatch.setattr(presentation, "inspect_artifact", refuse_lookup)
+    monkeypatch.setattr(presentation, "plan_cell_data_artifact", refuse_lookup)
+    with pytest.raises(ValueError, match="connectivity_map or integrated_graph"):
+        store.calc_membership_strength(clusters, neighbors)
+
+
 def test_membership_strength_rejects_a_different_graph_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -379,6 +433,76 @@ def test_smart_label_returns_an_artifact_and_handles_unmatched_base_labels() -> 
         "X-Ya",
     ]
     assert set(store.zw["cellData"].array_keys()) == {"ids"}
+
+
+def _smart_label_inputs(
+    store: _PresentationStore,
+    to_relabel: np.ndarray,
+    base_labels: np.ndarray,
+) -> tuple[ArtifactRef, ArtifactRef]:
+    selection = _write_cell_selection(store.zw, np.ones(len(to_relabel), dtype=bool))
+    clusters = _write_complete_artifact(
+        store.zw,
+        "cluster_labels",
+        assay=None,
+        inputs={"cell_selection": selection},
+        arrays={"values": to_relabel},
+    )
+    base = _write_complete_artifact(
+        store.zw,
+        "hto_identity",
+        assay=None,
+        inputs={"cell_selection": selection},
+        arrays={"values": base_labels},
+    )
+    return clusters, base
+
+
+def test_smart_label_suffixes_continue_past_z_without_merging_labels() -> None:
+    store, _backing = _presentation_store()
+    to_relabel = np.repeat(np.arange(40), 2)
+    clusters, base = _smart_label_inputs(
+        store, to_relabel, np.full(len(to_relabel), "T")
+    )
+
+    ref = store.smart_label(clusters, base)
+
+    names = store.zw[artifact_path(ref)]["values"][:].astype(str)
+    by_label = dict(zip(to_relabel.tolist(), names.tolist(), strict=True))
+    letters = [chr(ord("a") + index) for index in range(26)]
+    expected = [f"T{letter}" for letter in letters]
+    expected += [f"Ta{letter}" for letter in letters[:14]]
+    assert sorted(by_label.values()) == sorted(expected)
+    assert inspect_artifact(store.zw, ref).parameters["algorithm_version"] == 3
+
+
+def test_smart_label_rejects_hyphen_joined_names_that_collide() -> None:
+    store, _backing = _presentation_store()
+    # Cluster 1 absorbs base label X and becomes T-Xa, the name of cluster 2.
+    clusters, base = _smart_label_inputs(
+        store,
+        np.asarray([1] * 10 + [2] * 10),
+        np.asarray(["T"] * 8 + ["X"] * 2 + ["T-X"] * 10),
+    )
+
+    with pytest.raises(ValueError, match="'T-Xa'"):
+        store.smart_label(clusters, base)
+
+
+def test_smart_label_needs_a_writable_store_only_for_new_results() -> None:
+    store, backing = _presentation_store()
+    clusters, base = _smart_label_inputs(
+        store, np.asarray([0, 0, 1, 1]), np.asarray(["A", "A", "B", "B"])
+    )
+    other_clusters, _ = _smart_label_inputs(
+        store, np.asarray([0, 1, 1, 1]), np.asarray(["A", "A", "B", "B"])
+    )
+    ref = store.smart_label(clusters, base)
+    read_only = _PresentationStore(zarr.open_group(store=backing, mode="r"))
+
+    assert read_only.smart_label(clusters, base) == ref
+    with pytest.raises(PermissionError, match="smart_label requires"):
+        read_only.smart_label(other_clusters, base)
 
 
 def test_prepare_cluster_tree_rejects_unresolved_inputs(

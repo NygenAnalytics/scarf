@@ -9,6 +9,7 @@ from scarf.storage.budget import ResourceBudget
 from scarf.storage.execution import admit_stream
 from scarf.storage.feature_stream import plan_feature_stream
 from scarf.storage.geometry import ArrayGeometry, array_geometry
+from scarf.storage.parallel import stream_shards
 from scarf.storage.partition import (
     affordable_width,
     checked_indices,
@@ -16,7 +17,6 @@ from scarf.storage.partition import (
     partition_indices,
     row_band,
 )
-from scarf.utils.prefetch import iter_column_blocks
 
 from .store_probes import RecordingStore
 
@@ -477,8 +477,8 @@ def test_planned_reads_never_decode_more_chunks_than_budgeted() -> None:
 
     store.reset()
     blocks = list(
-        iter_column_blocks(
-            len(plan.blocks),
+        stream_shards(
+            range(len(plan.blocks)),
             lambda index: _read_block(array, cells, plan.blocks[index].indices),
             workers=plan.readWorkers,
             io_concurrency=plan.ioConcurrency,

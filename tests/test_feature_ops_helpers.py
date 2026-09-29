@@ -7,7 +7,6 @@ import zarr
 from zarr.storage import MemoryStore
 
 from scarf.datastore._operations.features import (
-    _MARKER_STAT_COLUMNS,
     _group_assignment_digest,
     _marker_stats_matrix,
     _shared_marker_feature_index,
@@ -74,7 +73,7 @@ def test_marker_stats_matrix_requires_finite_aligned_values():
 
     finite = _marker_frame([0, 1], score=2.0)
     matrix = _marker_stats_matrix(finite, np.array([0, 1], dtype=np.int32))
-    assert matrix.shape == (2, len(_MARKER_STAT_COLUMNS))
+    assert matrix.shape == (2, len(MARKER_STAT_COLUMNS))
     np.testing.assert_allclose(matrix, 2.0)
 
     poisoned = finite.copy()

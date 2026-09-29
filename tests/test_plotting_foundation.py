@@ -94,6 +94,38 @@ class _ArrayStore:
         return None
 
 
+def _summarize(
+    store,
+    *,
+    features,
+    group_by=None,
+    groups=None,
+    from_assay=None,
+    **options,
+):
+    """Aggregate features the way dotplot and matrixplot do, without drawing."""
+    from scarf.plotting._data import (
+        _check_feature_count,
+        _resolve_grouping,
+        _summarize_resolved_features,
+        coerce_feature_list,
+        resolve_feature,
+    )
+
+    pairs = coerce_feature_list(features)
+    _check_feature_count(pairs)
+    return _summarize_resolved_features(
+        store,
+        [
+            resolve_feature(store, feature, from_assay=from_assay)
+            for _, feature in pairs
+        ],
+        [group for group, _ in pairs],
+        _resolve_grouping(store, group_by=group_by, groups=groups, cell_key="I"),
+        **options,
+    )
+
+
 @pytest.fixture
 def synthetic_plot_store():
     sample = np.repeat(["s1", "s2", "s3", "s4"], 3).astype(object)
@@ -135,7 +167,6 @@ def test_import_plotting_exports():
     function_names = (
         "cluster_connectivity",
         "cluster_tree",
-        "collect_legends",
         "compose_results",
         "composition",
         "distribution",
@@ -155,7 +186,6 @@ def test_import_plotting_exports():
         "modality_weights",
         "pseudotime_heatmap",
         "qc",
-        "register_theme",
         "run_recipe",
         "theme_context",
     )
@@ -357,7 +387,6 @@ def test_feature_summary_matches_cell_table_across_blocks(
     import zarr
 
     from scarf.matrix import ChunkedArray
-    from scarf.plotting._data import summarize_features_by_group
 
     store = synthetic_plot_store
     values = store.RNA._values.copy()
@@ -401,7 +430,7 @@ def test_feature_summary_matches_cell_table_across_blocks(
         .reset_index()
     )
 
-    aggregate, per_sample = summarize_features_by_group(
+    aggregate, per_sample = _summarize(
         store,
         features=features,
         group_by=("category", "split"),
@@ -436,7 +465,6 @@ def test_feature_summary_rejects_infinite_values(
     import zarr
 
     from scarf.matrix import ChunkedArray
-    from scarf.plotting._data import summarize_features_by_group
 
     store = synthetic_plot_store
     values = store.RNA._values.copy()
@@ -444,7 +472,7 @@ def test_feature_summary_rejects_infinite_values(
     store.RNA.rawData = ChunkedArray(zarr.array(values, chunks=(block_size, 2)))
 
     with pytest.raises(ValueError, match="infinity after normalization"):
-        summarize_features_by_group(
+        _summarize(
             store,
             features=["GeneA"],
             group_by="group",
@@ -456,11 +484,9 @@ def test_feature_summary_rejects_infinite_values(
 def test_feature_summary_excludes_invalid_samples_before_infinity_check(
     synthetic_plot_store,
 ):
-    from scarf.plotting._data import summarize_features_by_group
-
     store = synthetic_plot_store
     store.RNA.rawData[0, 0] = np.inf
-    aggregate, _ = summarize_features_by_group(
+    aggregate, _ = _summarize(
         store,
         features=["GeneA"],
         group_by="group",
@@ -477,7 +503,6 @@ def test_feature_summary_releases_source_blocks(synthetic_plot_store, monkeypatc
     import zarr
 
     from scarf.matrix import ChunkedArray
-    from scarf.plotting._data import summarize_features_by_group
 
     store = synthetic_plot_store
     store.RNA.rawData = ChunkedArray(zarr.array(store.RNA._values, chunks=(1, 2)))
@@ -493,7 +518,7 @@ def test_feature_summary_releases_source_blocks(synthetic_plot_store, monkeypatc
         return block
 
     monkeypatch.setattr(ChunkedArray, "_materialize_range", materialize)
-    aggregate, _ = summarize_features_by_group(
+    aggregate, _ = _summarize(
         store,
         features=["GeneA", "GeneB"],
         group_by="group",
@@ -515,8 +540,6 @@ def test_feature_summary_releases_source_blocks(synthetic_plot_store, monkeypatc
 def test_feature_summary_preserves_assay_normalization(
     request, fixture_name, assay_name
 ):
-    from scarf.plotting._data import summarize_features_by_group
-
     store = request.getfixturevalue(fixture_name)
     cell_idx = store.cells.active_index("I")
     expected = np.log1p(
@@ -524,7 +547,7 @@ def test_feature_summary_preserves_assay_normalization(
         .normed(cell_idx=cell_idx, feat_idx=np.array([0, 1]))
         .compute()
     )
-    aggregate, per_sample = summarize_features_by_group(
+    aggregate, per_sample = _summarize(
         store,
         features=[
             splt.FeatureRef(index, by="index", label=f"feature-{index}")
@@ -766,8 +789,6 @@ def test_summary_and_composition_accept_foreign_targets(leiden_clustering, datas
 
 
 def test_sample_by_equal_weight_on_datastore(leiden_clustering, datastore):
-    from scarf.plotting._data import summarize_features_by_group
-
     ds = datastore
     active_n = len(ds.cells.active_index("I"))
     # Unbalanced samples among active cells: 5 vs rest
@@ -776,7 +797,7 @@ def test_sample_by_equal_weight_on_datastore(leiden_clustering, datastore):
     ds.cells.insert("plot_sample_id", sample, overwrite=True)
 
     gene = str(ds.RNA.feats.fetch_all("names")[0])
-    agg, per = summarize_features_by_group(
+    agg, per = _summarize(
         ds,
         features=[gene],
         groups=leiden_clustering,
@@ -1329,7 +1350,7 @@ def test_resolve_feature_by_index(datastore):
     assert resolved.label
 
 
-def test_label_panels_and_collect_legends(umap, leiden_clustering, datastore):
+def test_label_panels_on_caller_owned_embeddings(umap, leiden_clustering, datastore):
     import matplotlib.pyplot as plt
 
     ds = datastore
@@ -1350,8 +1371,9 @@ def test_label_panels_and_collect_legends(umap, leiden_clustering, datastore):
         show=False,
     )
     splt.label_panels({"A": axes["A"], "B": axes["B"]}, labels=["A", "B"])
-    legends = splt.collect_legends(fig, [a, b])
-    assert len(legends) >= 1
+    assert [text.get_text() for text in axes["A"].texts][-1] == "A"
+    assert [text.get_text() for text in axes["B"].texts][-1] == "B"
+    assert a.legends and b.legends
     a.close()
     b.close()
     plt.close(fig)
@@ -1920,56 +1942,66 @@ def test_cell_selection_adapter_validates_masks_groups_and_natural_order():
 def test_summary_adapter_validates_group_sample_and_condition_inputs(
     synthetic_plot_store,
 ):
-    from scarf.plotting._data import summarize_features_by_group
+    import matplotlib.pyplot as plt
 
-    with pytest.raises(ValueError, match="At least one feature"):
-        summarize_features_by_group(synthetic_plot_store, features=[], group_by="group")
-    with pytest.raises(ValueError, match="Too many features"):
-        summarize_features_by_group(
-            synthetic_plot_store,
-            features=["GeneA", "GeneB"],
-            group_by="group",
-            max_features=1,
-        )
-    for group_by in ((), ("group", "category", "condition")):
-        with pytest.raises(ValueError, match="group_by must have 1 or 2 keys"):
-            summarize_features_by_group(
+    from scarf.plotting import _data
+
+    existing = set(plt.get_fignums())
+    for plot in (splt.dotplot, splt.matrixplot):
+        with pytest.raises(ValueError, match="At least one feature"):
+            plot(synthetic_plot_store, features=[], group_by="group", show=False)
+        for group_by in ((), ("group", "category", "condition")):
+            with pytest.raises(ValueError, match="group_by must have 1 or 2 keys"):
+                plot(
+                    synthetic_plot_store,
+                    features=["GeneA"],
+                    group_by=group_by,
+                    show=False,
+                )
+        with pytest.raises(ValueError, match="No cells with valid sample_by"):
+            plot(
                 synthetic_plot_store,
                 features=["GeneA"],
-                group_by=group_by,
+                group_by="group",
+                sample_by="invalid_sample",
+                show=False,
             )
-    with pytest.raises(ValueError, match="Too many groups"):
-        summarize_features_by_group(
-            synthetic_plot_store,
-            features=["GeneA"],
-            group_by="group",
-            max_groups=2,
-        )
-    with pytest.raises(ValueError, match="No cells with valid sample_by"):
-        summarize_features_by_group(
-            synthetic_plot_store,
-            features=["GeneA"],
-            group_by="group",
-            sample_by="invalid_sample",
-        )
-    with pytest.raises(ValueError, match="Too many samples"):
-        summarize_features_by_group(
-            synthetic_plot_store,
-            features=["GeneA"],
-            group_by="group",
-            sample_by="sample",
-            max_samples=2,
-        )
-    with pytest.raises(ValueError, match="condition_by is not constant"):
-        summarize_features_by_group(
-            synthetic_plot_store,
-            features=["GeneA"],
-            group_by="category",
-            study_design=splt.StudyDesign(
-                sample_by="sample",
-                condition_by="group",
+        with pytest.raises(ValueError, match="condition_by is not constant"):
+            plot(
+                synthetic_plot_store,
+                features=["GeneA"],
+                group_by="category",
+                study_design=splt.StudyDesign(
+                    sample_by="sample",
+                    condition_by="group",
+                ),
+                show=False,
+            )
+        # Summary panels are bounded; the limits name what to reduce.
+        for limit, options, message in (
+            (
+                "_MAX_SUMMARY_FEATURES",
+                {"features": ["GeneA", "GeneB"], "group_by": "group"},
+                "Too many features .*select fewer features",
             ),
-        )
+            (
+                "_MAX_SUMMARY_GROUPS",
+                {"features": ["GeneA"], "group_by": "group"},
+                "Too many groups .*group the cells more",
+            ),
+            (
+                "_MAX_SUMMARY_SAMPLES",
+                {"features": ["GeneA"], "group_by": "group", "sample_by": "sample"},
+                "Too many samples .*aggregate",
+            ),
+        ):
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(
+                    _data, limit, 1 if limit == "_MAX_SUMMARY_FEATURES" else 2
+                )
+                with pytest.raises(ValueError, match=message):
+                    plot(synthetic_plot_store, show=False, **options)
+    assert set(plt.get_fignums()) == existing
 
 
 def test_composition_orders_missing_category_and_labels_segments(
@@ -2246,9 +2278,8 @@ def test_summary_panels_use_explicit_feature_group_orders(
     matrix.close()
 
 
-def test_summary_helpers_validate_labels_standardization_and_color_limits():
+def test_summary_helpers_validate_labels_and_standardization():
     from scarf.plotting.summary import (
-        _color_limits,
         _group_axis_labels,
         _standardize_feature,
         _wrap_tick_labels,
@@ -2263,29 +2294,27 @@ def test_summary_helpers_validate_labels_standardization_and_color_limits():
 
     values = pd.DataFrame(
         {
-            "feature": ["a", "a", "b", "b"],
-            "mean": [1.0, 3.0, 2.0, 2.0],
+            "feature": ["a", "a", "b", "b", "a", "a"],
+            "feature_group": ["T", "T", "T", "T", "B", "B"],
+            "mean": [1.0, 3.0, 2.0, 2.0, 1.0, 3.0],
         }
     )
     standardized = _standardize_feature(values)
-    assert standardized.loc[standardized["feature"] == "a", "mean"].mean() == (
-        pytest.approx(0.0)
+    first = standardized.loc[standardized["feature_group"] == "T"]
+    assert first.loc[first["feature"] == "a", "mean"].mean() == pytest.approx(0.0)
+    assert first.loc[first["feature"] == "b", "mean"].isna().all()
+    # A feature listed under two bracket groups is standardized once per group,
+    # so both rows carry the same values.
+    np.testing.assert_allclose(
+        standardized.loc[
+            (standardized["feature"] == "a") & (standardized["feature_group"] == "T"),
+            "mean",
+        ],
+        standardized.loc[
+            (standardized["feature"] == "a") & (standardized["feature_group"] == "B"),
+            "mean",
+        ],
     )
-    assert standardized.loc[standardized["feature"] == "b", "mean"].isna().all()
-
-    assert _color_limits(
-        np.array([np.nan, np.inf]),
-        splt.ColorScale(),
-    ) == (0.0, 1.0)
-    assert _color_limits(
-        np.arange(5, dtype=float),
-        splt.ColorScale(quantiles=(0.25, 0.75)),
-    ) == pytest.approx((1.0, 3.0))
-    with pytest.raises(ValueError, match="vmin < vmax"):
-        _color_limits(
-            np.array([1.0, 1.0]),
-            splt.ColorScale(vmin=1.0, vmax=1.0),
-        )
 
 
 def test_summary_panels_reject_incomplete_orders_and_unsupported_scales(

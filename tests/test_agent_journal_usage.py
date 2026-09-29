@@ -100,9 +100,7 @@ def test_uncaught_stage_failure_preserves_cause_and_invocation_usage(
     monkeypatch: Any,
 ) -> None:
     store, prefix, record = memory_journal()
-    started = journal._start_attempt(
-        store.zw, prefix, record.workflowRunId, "ingest", record, []
-    )
+    opened: list[Any] = []
     info = AgentRunInfo(
         runId="failed-call",
         status="failed",
@@ -113,6 +111,11 @@ def test_uncaught_stage_failure_preserves_cause_and_invocation_usage(
     error.agent_run_info = info
 
     def fail(*_args: Any, **_kwargs: Any) -> None:
+        opened.append(
+            journal._start_attempt(
+                store.zw, prefix, record.workflowRunId, "ingest", record, []
+            )
+        )
         raise error
 
     runner = AgentOrchestrator("test-model")
@@ -127,7 +130,7 @@ def test_uncaught_stage_failure_preserves_cause_and_invocation_usage(
     outcome = journal._stage_outcomes(store.zw, prefix, record.workflowRunId, "ingest")[
         0
     ]
-    assert outcome.attemptId == started.attemptId
+    assert outcome.attemptId == opened[0].attemptId
     assert outcome.outputs["runInfo"] == info.model_dump(mode="json")
     snapshot = journal.analysis_snapshot(store, record.workflowRunId)
     assert snapshot["modelUsage"]["inputTokens"] == 9

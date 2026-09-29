@@ -3,7 +3,6 @@
 from collections.abc import Iterator
 
 import numpy as np
-import zarr
 from numpy.typing import NDArray
 from scipy.sparse import csr_matrix, vstack
 from threadpoolctl import threadpool_limits
@@ -11,7 +10,11 @@ from threadpoolctl import threadpool_limits
 from ..assay import RNAassay
 from ..assay.persistence import _read_block
 from ..mapping.artifact import _load_reference_neighbor_query, _reference_available_k
-from ..mapping.confidence import mapping_score_weights
+from ..mapping.confidence import (
+    add_mapping_scores,
+    finish_mapping_scores,
+    mapping_score_weights,
+)
 from ..mapping.features import normalize_reference_counts
 from ..mapping.reference import MappingReference
 from ..mapping.symphony import project_pca, zero_norm_rows
@@ -25,17 +28,13 @@ from ..storage.geometry import array_geometry
 from ..storage.parallel import stream_shards
 from ..storage.partition import affordable_width, row_band
 from ..storage.types import as_zarr_array
-
-from ..storage.count_matrix import CountMatrixPolicy
-from ..storage.io_policy import StorageIoPolicy
-from ..storage.profiles import StorageProfile
+from ..utils.arrays import sparse_matrix_bytes
 from ..utils.logging import logger
 
 __all__ = [
     "sample_cluster_pool",
     "simulate_doublet_pairs",
     "sum_doublet_pairs",
-    "write_doublet_target_zarr",
 ]
 
 
@@ -106,10 +105,6 @@ def sum_doublet_pairs(
         if overflow:
             raise OverflowError(f"Synthetic doublet counts exceed the range of {dtype}")
     return (first + second).tocsr()
-
-
-def _csr_bytes(values: csr_matrix) -> int:
-    return int(values.data.nbytes + values.indices.nbytes + values.indptr.nbytes)
 
 
 def _doublet_batch_rows(
@@ -214,7 +209,7 @@ def _doublet_statistics(
         resources,
         min(preferred_rows, len(left)),
         _pair_row_bytes(pool),
-        resident_bytes + _csr_bytes(pool) + 24 * len(left),
+        resident_bytes + sparse_matrix_bytes(pool) + 24 * len(left),
     )
     totals = np.empty(len(left), dtype=np.float64)
     n_features = np.empty(len(left), dtype=np.int64)
@@ -246,7 +241,6 @@ def score_synthetic_doublets(
     save_k: int,
     random_seed: int,
     resources: ResourceBudget,
-    reserved_resident_bytes: int = 0,
 ) -> np.ndarray:
     """Score reference cells by their neighbor weights from simulated doublets.
 
@@ -270,7 +264,7 @@ def score_synthetic_doublets(
         logger.warning(f"`save_k` was decreased to {available_k}")
     n_k = min(int(save_k), available_k)
     model = reference.model
-    resident = reserved_resident_bytes + sum(
+    resident = sum(
         values.nbytes
         for values in (
             active_indices,
@@ -337,12 +331,12 @@ def score_synthetic_doublets(
         blockBytes=max(
             1, 2 * subset_bytes + 8 * (pool.shape[1] + len(feature_indices))
         ),
-        residentBytes=resident + _csr_bytes(pool),
+        residentBytes=resident + sparse_matrix_bytes(pool),
         requested=1,
     )
     selected_pool = pool[:, feature_indices].tocsr()
     del pool
-    resident += _csr_bytes(selected_pool) + 8 * len(active_indices)
+    resident += sparse_matrix_bytes(selected_pool) + 8 * len(active_indices)
 
     ann = as_zarr_array(
         artifact_group(reference.datastore.zw, reference.ann_index)[ANN_INDEX_ARRAY],
@@ -372,8 +366,8 @@ def score_synthetic_doublets(
         save_k=n_k,
         workers=resources.workers,
     )
-    scores = np.zeros(reference.selected_cell_count, dtype=np.float64)
-    scored_count = 0
+    scores = np.zeros((1, reference.selected_cell_count), dtype=np.float64)
+    scored_rows = np.zeros(1, dtype=np.int64)
     parameters = reference.normalization_parameters
     with threadpool_limits(limits=resources.workers):
         for start in range(0, n_sim, batch_rows):
@@ -403,20 +397,28 @@ def score_synthetic_doublets(
             del normalized
             # Skip rows projected exactly onto the reference PCA center. The
             # check is on the projection, so no row is skipped for being empty
-            # in the selected features.
-            scored = ~zero_norm_rows(coordinates)
-            if scored.any():
-                result = query.query(coordinates[scored])
+            # in the selected features. Skipped rows are not queried.
+            skip = zero_norm_rows(coordinates)
+            if not skip.all():
+                result = query.query(coordinates[~skip])
                 indices, distances = result[:2]
-                weights = mapping_score_weights(distances)
-                np.add.at(scores, indices.ravel(), weights.ravel())
-                scored_count += int(scored.sum())
-                del result, indices, distances, weights
+                add_mapping_scores(
+                    scores,
+                    scored_rows,
+                    indices,
+                    mapping_score_weights(distances),
+                    skip=skip,
+                )
+                del result, indices, distances
             del coordinates
-    if scored_count:
-        scores *= 1_000 / (scored_count * n_k)
-    np.log1p(scores, out=scores)
-    return scores
+    finish_mapping_scores(
+        scores,
+        scored_rows,
+        n_neighbors=n_k,
+        multiplier=1_000,
+        log_transform=True,
+    )
+    return scores.reshape(-1)
 
 
 def smooth_doublet_scores(
@@ -437,96 +439,3 @@ def smooth_doublet_scores(
         lo, hi = scores.min(), scores.max()
         scores = (scores - lo) / (hi - lo) if hi > lo else np.zeros_like(scores)
     return scores
-
-
-def write_doublet_target_zarr(
-    zarr_loc: str,
-    assay_name: str,
-    sim_counts: csr_matrix,
-    feat_ids: NDArray,
-    feat_names: NDArray,
-    dtype: str = "uint32",
-    mem_budget: int | str | None = None,
-    nthreads: int | None = None,
-    profile: StorageProfile | None = None,
-    policy: CountMatrixPolicy | None = None,
-    io: StorageIoPolicy | None = None,
-) -> zarr.Group:
-    """Materialise simulated doublet counts as a minimal Scarf Zarr hierarchy."""
-    from ..storage.schema import (
-        create_cell_data,
-        create_zarr_count_assay,
-        load_count_array,
-        validate_assay_name,
-    )
-    from ..storage.sharding import write_dense_in_shard_rows
-    from ..storage.budget import resolve_budget
-    from ..storage.profiles import resolve_storage_profile
-    from ..storage.stores import load_zarr
-
-    validate_assay_name(assay_name)
-    resources = resolve_budget(mem_budget, nthreads)
-    resolved_profile = resolve_storage_profile(zarr_loc, profile)
-    n_sim = sim_counts.shape[0]
-    z = load_zarr(zarr_loc=zarr_loc, mode="w")
-    ids = np.array([f"doublet_{i}" for i in range(n_sim)])
-    create_cell_data(z, workspace=None, ids=ids, names=ids)
-    create_zarr_count_assay(
-        z=z,
-        assay_name=assay_name,
-        workspace=None,
-        n_cells=n_sim,
-        feat_ids=np.asarray(feat_ids),
-        feat_names=np.asarray(feat_names),
-        dtype=dtype,
-        profile=resolved_profile,
-        policy=policy,
-    )
-    store = load_count_array(z, assay_name, None)
-    from ..storage.identity import CountSummary, finalize_counts
-
-    summary = CountSummary(store)
-    write_dense_in_shard_rows(
-        store,
-        lambda s, e: sim_counts[s:e].toarray().astype(dtype),
-        msg="Writing simulated doublets",
-        resources=resources,
-        io=io,
-        residentBytes=sim_counts.data.nbytes
-        + sim_counts.indices.nbytes
-        + sim_counts.indptr.nbytes
-        + summary.nbytes,
-        producerBytes=min(n_sim, store.shards[0] if store.shards else store.chunks[0])
-        * sim_counts.shape[1]
-        * sim_counts.dtype.itemsize,
-        countSummary=summary,
-    )
-    from ..assay.classification import (
-        is_rna_assay_type,
-        resolve_persisted_assay_type,
-    )
-    from ..storage.sharding import write_counts_t
-    from ..storage.types import as_zarr_group
-
-    type_name = resolve_persisted_assay_type(assay_name)
-    raw_types = z.attrs.get("assayTypes", {})
-    types = (
-        {str(k): str(v) for k, v in raw_types.items()}
-        if isinstance(raw_types, dict)
-        else {}
-    )
-    types[assay_name] = type_name
-    z.attrs["assayTypes"] = types
-    finalize_counts(store, summary=summary)
-    if is_rna_assay_type(type_name):
-        group = as_zarr_group(z[assay_name], name=assay_name)
-        write_counts_t(
-            store,
-            group,
-            profile=resolved_profile,
-            resources=resources,
-            policy=policy,
-            io=io,
-        )
-    logger.debug(f"Wrote {n_sim} simulated doublets to {zarr_loc}")
-    return z

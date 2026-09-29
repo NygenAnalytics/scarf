@@ -10,7 +10,6 @@ from scarf.quality_control.doublets import (
     sample_cluster_pool,
     simulate_doublet_pairs,
     sum_doublet_pairs,
-    write_doublet_target_zarr,
 )
 from scarf.quality_control.filtering import gaussian_quantile_bounds
 from scarf.graph.feature_projection import resolve_native_graph_inputs
@@ -29,25 +28,14 @@ from scarf.storage.selections import (
     read_stored_selection_mask,
     resolve_generated_selection_artifact,
 )
-from scarf.storage.schema import load_count_array
 
 
-def test_doublet_pair_counts_are_widened_and_stored_without_overflow(tmp_path):
+def test_doublet_pair_counts_are_widened_without_overflow():
     counts = csr_matrix(np.array([[200, 0], [200, 9]], dtype=np.uint8))
     summed = sum_doublet_pairs(counts, np.array([0]), np.array([1]))
-    root = write_doublet_target_zarr(
-        str(tmp_path / "doublets.zarr"),
-        "RNA",
-        summed,
-        np.array(["g1", "g2"]),
-        np.array(["g1", "g2"]),
-        dtype=str(summed.dtype),
-        nthreads=1,
-    )
 
-    stored = load_count_array(root, "RNA", None)
-    assert stored.dtype == np.dtype("uint16")
-    np.testing.assert_array_equal(stored[:], [[400, 9]])
+    assert summed.dtype == np.dtype("uint16")
+    np.testing.assert_array_equal(summed.toarray(), [[400, 9]])
 
 
 @pytest.mark.parametrize(
@@ -148,6 +136,19 @@ def test_sample_cluster_pool_respects_fraction_and_cap():
             max_per_cluster=2,
             rng=np.random.default_rng(0),
         )
+
+
+def test_doublet_real_arguments_reject_booleans_and_non_numbers():
+    from scarf.datastore._operations.quality_control import _validated_real
+
+    for value in (True, np.bool_(False), "0.5", None):
+        with pytest.raises(TypeError, match="ratio must be a real number"):
+            _validated_real(value, "ratio", low=0.0)
+    assert _validated_real(np.float32(0.5), "ratio", low=0.0, high=1.0) == 0.5
+    with pytest.raises(ValueError, match=r"ratio must be a finite number > 0"):
+        _validated_real(0, "ratio", low=0.0, include_low=False)
+    with pytest.raises(ValueError, match=r">= 0 and <= 1"):
+        _validated_real(float("nan"), "ratio", low=0.0, high=1.0)
 
 
 def test_assign_cell_cycle_phase_preserves_rule_precedence():
@@ -397,6 +398,51 @@ def test_select_cells_includes_categorical_artifact_values(
         store.select_cells(identities)
 
 
+def test_select_cells_reads_canonical_label_arrays_and_rejects_empty_results(
+    datastore_ephemeral,
+) -> None:
+    store = datastore_ephemeral
+    store.cells.insert(
+        "I",
+        np.ones(store.cells.N, dtype=bool),
+        overwrite=True,
+        force=True,
+    )
+    source = store.snapshot_cell_selection()
+    n_cells = store.cells.N
+    phases = np.resize(np.asarray(["G1", "S", "G2M"]), n_cells)
+    planned = plan_cell_data_artifact(
+        store.zw,
+        scope="assay",
+        assay="RNA",
+        kind="cell_cycle",
+        operation="fixture_cell_cycle",
+        parameters={},
+        inputs={},
+        execution_options={},
+        cell_selection=source,
+        arrays={
+            "s_score": ((n_cells,), "f"),
+            "g2m_score": ((n_cells,), "f"),
+            "phase": ((n_cells,), None),
+        },
+    )
+    write_cell_data_artifact(
+        store.zw,
+        planned,
+        {"s_score": np.zeros(n_cells), "g2m_score": np.zeros(n_cells), "phase": phases},
+    )
+    metric = _fixture_quality_metric(store, source, np.zeros(n_cells))
+
+    selected = store.select_cells(planned.ref, include=["G1"])
+
+    np.testing.assert_array_equal(_selection_values(store, selected), phases == "G1")
+    with pytest.raises(ValueError, match="retained no cells"):
+        store.select_cells(planned.ref, include=["M"])
+    with pytest.raises(ValueError, match="retained no cells"):
+        store.select_cells(metric, low=1.0)
+
+
 def test_select_cells_rejects_lossy_categorical_include_values(
     datastore_ephemeral,
 ) -> None:
@@ -516,24 +562,20 @@ def test_doublet_scores_preserve_artifacts_without_materializing_queries(
         )
 
     monkeypatch.setattr(type(datastore), "run_mapping", forbidden)
-    monkeypatch.setattr(type(datastore), "_create_temporary_datastore", forbidden)
-    monkeypatch.setattr(doublets, "write_doublet_target_zarr", forbidden)
     diffusion_before = set(
         datastore.list_artifacts(kind="diffusion_operator", from_assay="RNA")
     )
 
-    with datastore._graph_memory_cache_scope():
-        datastore.load_graph(selected_connectivity, symmetric=True, upper_only=False)
-        score_ref = datastore.run_doublet_detection(
-            clusters,
-            selected_connectivity,
-            cluster_sample_fraction=0.01,
-            max_cells_per_cluster=2,
-            simulation_ratio=0.01,
-            save_k=3,
-            smoothing_t=1,
-            random_seed=19,
-        )
+    score_ref = datastore.run_doublet_detection(
+        clusters,
+        selected_connectivity,
+        cluster_sample_fraction=0.01,
+        max_cells_per_cluster=2,
+        simulation_ratio=0.01,
+        save_k=3,
+        smoothing_t=1,
+        random_seed=19,
+    )
 
     assert score_ref != previous.ref
     assert datastore.inspect_artifact(score_ref).parameters["count_arithmetic"] == (
@@ -691,7 +733,6 @@ def test_doublet_failure_leaves_no_complete_score(
 
 def test_doublet_detection_rejects_symphony_connectivity_chain(
     analyzed_datastore_ephemeral,
-    monkeypatch,
 ) -> None:
     datastore = analyzed_datastore_ephemeral
     native_graph = _fixture_graph(datastore)
@@ -721,15 +762,6 @@ def test_doublet_detection_rejects_symphony_connectivity_chain(
             kind="mapping_reference",
             from_assay="RNA",
         )
-    )
-
-    def fail_temporary_store(*_args, **_kwargs):
-        raise AssertionError("Temporary query store must not be created")
-
-    monkeypatch.setattr(
-        datastore,
-        "_create_temporary_datastore",
-        fail_temporary_store,
     )
 
     with pytest.raises(

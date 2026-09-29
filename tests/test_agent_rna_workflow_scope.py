@@ -35,7 +35,7 @@ from scarf.datastore.datastore import DataStore
 from scarf.storage.budget import ResourceBudget
 from scarf.storage.schema import create_zarr_count_assay
 from scarf.storage.sharding import write_counts_t
-from tests.agent_orchestrator_store import create_store
+from tests.agent_orchestrator_store import create_store, save_request
 
 
 def _request(path: str = "study.zarr", **values: Any) -> AutomatedWorkflowRequest:
@@ -62,9 +62,9 @@ def _add_assay(path: Path, name: str, assay_type: str) -> None:
         profile="fast_local",
     )
     counts[:] = values
-    from scarf.storage.identity import finalize_counts
+    from tests.storage_helpers import finalize_test_counts
 
-    finalize_counts(counts)
+    finalize_test_counts(counts)
     write_counts_t(counts, root[name], resources=ResourceBudget(1024**3, 2))
     root.attrs["assayTypes"] = {**dict(root.attrs["assayTypes"]), name: assay_type}
     from scarf import DataStore
@@ -213,7 +213,8 @@ def test_resume_rejects_unsupported_saved_route_before_writable_open(
     store = DataStore(str(path), default_assay="RNA", min_features_per_cell=-1)
     orchestrator = AgentOrchestrator(object())
     workflow = WorkflowIdentity("resume-rna")
-    record = orchestrator.initialize_request(
+    record = save_request(
+        orchestrator,
         store,
         workflow,
         _request(

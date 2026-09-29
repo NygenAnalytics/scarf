@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 
 from ..metadata.artifacts import categorical_display, continuous_display
+from ..metadata.rows import array_block_rows
 from ..storage.arrays import linked_missing_mask
 from ..storage.artifacts import ArtifactRef, artifact_group
 from ..storage.pipeline_runs import PipelineFieldDescriptor
@@ -17,21 +18,15 @@ def artifact_array(root: Any, ref: ArtifactRef, name: str) -> Any:
     return as_zarr_array(group[name], name=name)
 
 
-def _array_block_rows(array: Any) -> int:
-    chunks = getattr(array, "chunks", None)
-    if chunks and len(chunks) == len(array.shape):
-        return max(1, int(chunks[0]))
-    return max(1, min(int(array.shape[0]), 65_536))
-
-
 def _iter_array_blocks(
     array: Any,
     *,
     value_index: int | None = None,
 ) -> Iterator[np.ndarray]:
-    block_rows = _array_block_rows(array)
-    for start in range(0, int(array.shape[0]), block_rows):
-        stop = min(start + block_rows, int(array.shape[0]))
+    n_rows = int(array.shape[0])
+    block_rows = array_block_rows(array, n_rows)
+    for start in range(0, n_rows, block_rows):
+        stop = min(start + block_rows, n_rows)
         if value_index is None:
             yield np.asarray(array[start:stop])
         else:
@@ -189,13 +184,15 @@ def build_pipeline_fields(
                 display=categorical_array_display(phase),
             )
         )
-    if "umap" in artifacts:
-        ref = artifacts["umap"]
+    for embedding in ("umap", "tsne"):
+        if embedding not in artifacts:
+            continue
+        ref = artifacts[embedding]
         values = artifact_array(store.zw, ref, "values")
         for index in range(values.shape[1]):
             fields.append(
                 _field(
-                    key=f"umap_{index + 1}",
+                    key=f"{embedding}_{index + 1}",
                     axis="cells",
                     ref=ref,
                     source_value="values",
@@ -234,18 +231,30 @@ def build_pipeline_fields(
             )
         )
     if "clusters" in artifacts:
+        # The selected clustering is always a Leiden candidate.
         ref = artifacts["clusters"]
-        cluster_group = artifact_group(store.zw, ref)
-        source_value = "values" if "values" in cluster_group else "labels"
-        values = artifact_array(store.zw, ref, source_value)
+        values = artifact_array(store.zw, ref, "values")
         fields.append(
             _field(
                 key="clusters",
                 axis="cells",
                 ref=ref,
-                source_value=source_value,
+                source_value="values",
                 dtype=values.dtype,
                 display=categorical_array_display(values),
+            )
+        )
+    if "membership_strength" in artifacts:
+        ref = artifacts["membership_strength"]
+        values = artifact_array(store.zw, ref, "values")
+        fields.append(
+            _field(
+                key="membership_strength",
+                axis="cells",
+                ref=ref,
+                source_value="values",
+                dtype=values.dtype,
+                display=continuous_array_display(values),
             )
         )
     if "doublets" in artifacts:

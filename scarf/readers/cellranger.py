@@ -14,7 +14,13 @@ from ._assay_names import (
     auto_name_feat_table,
     make_feat_table_from_types,
 )
-from ..utils.arrays import has_duplicates
+from ._text import as_text, require_unique_identifiers
+from ..utils.arrays import (
+    assay_feature_ranges,
+    cumulative_nnz,
+    has_duplicates,
+    max_window_nnz,
+)
 
 
 class CrReader(ABC):
@@ -98,20 +104,10 @@ class CrReader(ABC):
     def _subset_by_assay(self, v: list[Any], assay: str | None) -> list[Any]:
         if assay is None:
             return v
-        elif assay not in self.assayFeats:
+        ranges = assay_feature_ranges(self.assayFeats)
+        if assay not in ranges:
             raise ValueError(f"ERROR: Assay ID {assay} is not valid")
-        if len(self.assayFeats[assay].shape) == 2:
-            ret_val: list[Any] = []
-            for i in self.assayFeats[assay].values[1:3].T:
-                ret_val.extend(list(v[i[0] : i[1]]))
-            return ret_val
-        elif len(self.assayFeats[assay].shape) == 1:
-            idx = self.assayFeats[assay]
-            return v[idx.start : idx.end]
-        else:
-            raise ValueError(
-                "ERROR: assay feats is 3D. Something went really wrong. Create a github issue"
-            )
+        return [value for start, end in ranges[assay] for value in v[start:end]]
 
     @staticmethod
     def _make_feat_table_from_types(feature_types: Sequence[str]) -> pd.DataFrame:
@@ -302,15 +298,34 @@ class CrH5Reader(CrReader):
         self.validBarcodeIdx: np.ndarray | None = None
         self._indptrCache: np.ndarray | None = None
         self._cumulativeRowNnz: np.ndarray | None = None
-        super().__init__(self._handle_version())
-        if is_filtered:
-            self.validBarcodeIdx = np.array(range(self.nCells))
-        else:
-            self.validBarcodeIdx = self._get_valid_barcodes(filtering_cutoff)
-        self.nCells = len(self.validBarcodeIdx)
+        try:
+            super().__init__(self._handle_version())
+            require_unique_identifiers(self.cell_names(), "Cell Ranger barcodes")
+            require_unique_identifiers(self.feature_ids(), "Cell Ranger feature IDs")
+            if is_filtered:
+                self.validBarcodeIdx = np.arange(self.nCells)
+            else:
+                self.validBarcodeIdx = self._get_valid_barcodes(filtering_cutoff)
+            self.nCells = len(self.validBarcodeIdx)
+        except BaseException:
+            self.h5obj.close()
+            raise
 
     def _handle_version(self) -> dict[str, str | None]:
-        root_key = list(self.h5obj.keys())[0]
+        root_keys = list(self.h5obj.keys())
+        if "matrix" in root_keys:
+            root_key = "matrix"
+        else:
+            # Cell Ranger 2 keeps one group per genome at the root.
+            genomes = [
+                key for key in root_keys if isinstance(self.h5obj[key], h5py.Group)
+            ]
+            if len(genomes) != 1:
+                raise ValueError(
+                    "Cell Ranger HDF5 input needs a `matrix` group or exactly one "
+                    f"genome group; found: {', '.join(genomes) or 'none'}"
+                )
+            root_key = genomes[0]
         self.grp = self.h5obj[root_key]
         if root_key == "matrix":
             grps: dict[str, str | None] = {
@@ -331,25 +346,24 @@ class CrH5Reader(CrReader):
     def _get_valid_barcodes(
         self, filtering_cutoff: int, batch_size: int = 1000
     ) -> np.ndarray:
-        valid_idx = []
-        test_counter = 0
         indptr = self._source_indptr()
-        for s in iter_progress(
-            range(0, len(indptr) - 1, batch_size),
+        n_barcodes = len(indptr) - 1
+        if int(indptr[-1]) != int(self.grp["data"].shape[0]):
+            raise ValueError("Cell Ranger matrix pointers do not match its data")
+        valid = np.zeros(n_barcodes, dtype=bool)
+        for start in iter_progress(
+            range(0, n_barcodes, batch_size),
             desc="Filtering out background barcodes",
         ):
-            idx = indptr[s : s + batch_size + 1]
-            data = self.grp["data"][idx[0] : idx[-1]]
-            indices = self.grp["indices"][idx[0] : idx[-1]]
-            cell_idx = np.repeat(range(len(idx) - 1), np.diff(idx))
-            mat = coo_matrix(
-                (data, (cell_idx, indices)), shape=(len(idx) - 1, self.nFeatures)
+            stop = min(start + batch_size, n_barcodes)
+            data = np.asarray(self.grp["data"][indptr[start] : indptr[stop]])
+            rows = np.repeat(
+                np.arange(stop - start),
+                np.diff(indptr[start : stop + 1]),
             )
-            valid_idx.append(np.array(mat.sum(axis=1)).T[0] > filtering_cutoff)
-            test_counter += data.shape[0]
-        assert test_counter == self.grp["data"].shape[0]
-        assert len(indptr) == (s + len(idx))
-        return np.where(np.hstack(valid_idx))[0]
+            totals = np.bincount(rows, weights=data, minlength=stop - start)
+            valid[start:stop] = totals > filtering_cutoff
+        return np.flatnonzero(valid)
 
     def _source_indptr(self) -> np.ndarray:
         if self._indptrCache is None:
@@ -360,11 +374,9 @@ class CrH5Reader(CrReader):
         if self._cumulativeRowNnz is None:
             valid_idx = self.validBarcodeIdx
             assert valid_idx is not None
-            row_nnz = np.diff(self._source_indptr())[valid_idx]
-            cumulative = np.empty(row_nnz.size + 1, dtype=np.int64)
-            cumulative[0] = 0
-            np.cumsum(row_nnz, dtype=np.int64, out=cumulative[1:])
-            self._cumulativeRowNnz = cumulative
+            self._cumulativeRowNnz = cumulative_nnz(
+                np.diff(self._source_indptr())[valid_idx]
+            )
         return self._cumulativeRowNnz
 
     @property
@@ -376,7 +388,7 @@ class CrH5Reader(CrReader):
         if key is None:
             raise ValueError("Dataset key must be provided")
         grp_key = self.grpNames[key]
-        return [x.decode("UTF-8") for x in self.grp[grp_key][:]]
+        return [as_text(x) for x in self.grp[grp_key][:]]
 
     def cell_names(self) -> list[str]:
         """Returns a list of names of the cells in the dataset."""
@@ -394,11 +406,7 @@ class CrH5Reader(CrReader):
             return
         raw_keys = np.asarray(features["_all_tag_keys"][:]).reshape(-1)
         for raw_key in raw_keys:
-            key = (
-                raw_key.decode("utf-8")
-                if isinstance(raw_key, bytes | np.bytes_)
-                else str(raw_key)
-            )
+            key = as_text(raw_key)
             if key in {"id", "name", "feature_type"} or key not in features:
                 continue
             values = features[key]
@@ -462,15 +470,7 @@ class CrH5Reader(CrReader):
 
     def max_window_nnz(self, window_rows: int) -> int:
         """Return the largest selected-cell row-window nnz."""
-        if window_rows <= 0:
-            raise ValueError("window_rows must be positive")
-        valid_idx = self.validBarcodeIdx
-        assert valid_idx is not None
-        width = min(window_rows, len(valid_idx))
-        if width == 0:
-            return 0
-        cumulative = self._selected_cumulative_nnz()
-        return int(np.max(cumulative[width:] - cumulative[:-width]))
+        return max_window_nnz(self._selected_cumulative_nnz(), window_rows)
 
     def producer_staging_bytes(
         self,

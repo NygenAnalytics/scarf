@@ -1,6 +1,5 @@
 """Read-only Pydantic AI tools for experimental context."""
 
-import hashlib
 import json
 import math
 from collections.abc import Sequence
@@ -9,15 +8,14 @@ from functools import wraps
 from types import SimpleNamespace
 from typing import Any, Literal
 
-import numpy as np
 
 from ...metadata.queries import reduce_observation_units
+from ...metadata.rows import metadata_column_fingerprint
 from ...metrics.association import coefficient_estimability
-from ...storage.artifacts import fingerprint_array
 from ...storage.refs import ArtifactRef
 from ...utils.logging import logger
 from .._deps import AGENT_INSTALL_HINT
-from ..record_io import canonical_json_bytes
+from ..record_io import sha256_json
 from ..tools import artifact_reference, core_artifact_reference
 from ..types import BatchSafetyEvidence, BatchSafetyStatus
 from .characterization import characterize_covariates
@@ -145,7 +143,7 @@ def compact_context_evidence(evidence: CovariateEvidence) -> dict[str, Any]:
                     "quantilesAfterExclusion",
                 ):
                     check.pop(name, None)
-            identity = hashlib.sha256(canonical_json_bytes(safety)).hexdigest()
+            identity = sha256_json(safety)
             shared_safety[identity] = safety
             failure["designSafetyRef"] = identity
             missingness = failure.pop("metricMissingFractions", {})
@@ -192,15 +190,23 @@ async def inspect_context_evidence(
                 ),
                 None,
             )
-            if failure is None:
-                raise ModelRetry("Choose one capture recorded in this QC profile")
             bounds = profile.resolvedBounds
+            if isinstance(bounds, list):
+                selected: Any = [row for row in bounds if row.get("group") == capture]
+                recorded = bool(selected)
+            elif profile.action == "sampleMad":
+                # Sample MAD bounds are keyed by the capture or sample itself.
+                selected = deepcopy(bounds.get(capture))
+                recorded = capture in bounds
+            else:
+                selected = deepcopy(bounds)
+                recorded = False
+            if failure is None and not (profile.action == "sampleMad" and recorded):
+                raise ModelRetry("Choose one capture recorded in this QC profile")
             return {
                 "profileId": record_id,
-                "capture": failure.model_dump(mode="json"),
-                "resolvedBounds": [row for row in bounds if row.get("group") == capture]
-                if isinstance(bounds, list)
-                else deepcopy(bounds),
+                "capture": failure.model_dump(mode="json") if failure else None,
+                "resolvedBounds": selected,
             }
         result = profile.model_dump(mode="json")
         result.pop("captureFailureEvidence", None)
@@ -341,23 +347,17 @@ def characterize_context(
     deps: ExperimentalContextDependencies, directions: dict[str, Any]
 ) -> CovariateCharacterization:
     """Reuse characterization for the exact frozen stage and declared design."""
-    metadata = {}
+    metadata: dict[str, str] = {}
     for column in deps.cells.columns:
-        values = np.asarray(deps.cells.fetch(column))
+        artifact = deps.cells.artifact_source(column)
         metadata[column] = (
-            hashlib.sha256(
-                repr(
-                    [(type(value).__name__, value) for value in values.tolist()]
-                ).encode()
-            ).hexdigest()
-            if values.dtype.hasobject
-            else fingerprint_array(values)
+            f"artifact:{artifact.kind}:{artifact.artifact_id}"
+            if artifact is not None
+            else metadata_column_fingerprint(deps.store.cells, column)
         )
     inputs = {
         "directions": deepcopy(directions),
         "cellSelection": deps.cellSelection.to_dict(),
-        "studyContext": deps.studyContext,
-        "studyObjective": deps.studyObjective,
         "metadata": metadata,
     }
     if deps.characterization is not None and deps.characterizationInputs == inputs:
@@ -365,11 +365,10 @@ def characterize_context(
     result = characterize_covariates(
         deps.store,
         cellSelection=deps.cellSelection,
-        studyContext=f"{deps.studyContext}\nStudy objective: {deps.studyObjective}",
-        model=None,
         directions=directions,
         groupingArtifacts=_hto_artifact_map(deps),
         inventory=deps.inventoryData,
+        fingerprints=metadata,
     )
     if result.status != "failed":
         deps.characterization = result
@@ -918,42 +917,7 @@ async def analyze_experimental_design(
     # columns below are rejected. A bounded retry or resumed decision can reuse
     # the evidence without rescanning metadata or accepting an unsafe choice.
     ctx.deps.characterization = characterization
-    try:
-        if not capture_repair:
-            evaluate_proposals(ctx.deps, characterization, proposals or ())
-        if capture_proposal is not None:
-            accept_capture_proposal(ctx.deps, characterization, capture_proposal)
-    except ValueError as exc:
-        raise ModelRetry(str(exc)) from exc
-    if not ctx.deps.htoIdentityColumns:
-        ctx.deps.htoIdentityColumns = _hto_identity_columns(ctx.deps)
-    try:
-        qc_profiles = _offered_qc_profiles(ctx.deps, characterization)
-    except Exception:
-        if capture_repair:
-            ctx.deps.captureProposal = None
-            characterization.captureProvenance = None
-        raise
-    contrast_plans = contrast_plans_from_characterization(characterization)
-    ctx.deps.contrastPlans = {plan.coefficient: plan for plan in contrast_plans}
-    evidence_ids = characterization_evidence(characterization)
-    evidence_ids.update(profile.evidenceId for profile in qc_profiles)
-    evidence_ids.update(source.sourceId for source in ctx.deps.qcMetricSources)
-    evidence_ids.update(item.evidenceId for item in ctx.deps.qcSourceConcordance)
-    evidence_ids.update(plan.evidenceId for plan in contrast_plans)
-    evidence_ids.update(
-        failure.evidenceId
-        for profile in qc_profiles
-        for failure in profile.captureFailureEvidence
-    )
-    evidence_ids.update(
-        f"htoIdentity:{column}" for column in ctx.deps.htoIdentityColumns
-    )
-    evidence_ids.update(
-        _artifact_evidence_id(source) for source in ctx.deps.htoIdentityArtifacts
-    )
-    ctx.deps.evidenceIds.update(evidence_ids)
-
+    # Reject batch columns before a design round is consumed.
     column_records = {
         record.get("name"): record
         for record in characterization.columns
@@ -985,6 +949,46 @@ async def analyze_experimental_design(
             raise ModelRetry(
                 f"Batch column {batch_column!r} must be categorical for Harmony"
             )
+
+    # Validate the capture before a design round is consumed; both steps reject
+    # invalid input before changing state, so a retry starts from the same round.
+    previous_capture = ctx.deps.captureProposal
+    try:
+        if capture_proposal is not None:
+            accept_capture_proposal(ctx.deps, characterization, capture_proposal)
+        if not capture_repair:
+            evaluate_proposals(ctx.deps, characterization, proposals or ())
+    except ValueError as exc:
+        ctx.deps.captureProposal = previous_capture
+        characterization.captureProvenance = previous_capture
+        raise ModelRetry(str(exc)) from exc
+    if not ctx.deps.htoIdentityColumns:
+        ctx.deps.htoIdentityColumns = _hto_identity_columns(ctx.deps)
+    try:
+        qc_profiles = _offered_qc_profiles(ctx.deps, characterization)
+    except Exception:
+        ctx.deps.captureProposal = previous_capture
+        characterization.captureProvenance = previous_capture
+        raise
+    contrast_plans = contrast_plans_from_characterization(characterization)
+    ctx.deps.contrastPlans = {plan.coefficient: plan for plan in contrast_plans}
+    evidence_ids = characterization_evidence(characterization)
+    evidence_ids.update(profile.evidenceId for profile in qc_profiles)
+    evidence_ids.update(source.sourceId for source in ctx.deps.qcMetricSources)
+    evidence_ids.update(item.evidenceId for item in ctx.deps.qcSourceConcordance)
+    evidence_ids.update(plan.evidenceId for plan in contrast_plans)
+    evidence_ids.update(
+        failure.evidenceId
+        for profile in qc_profiles
+        for failure in profile.captureFailureEvidence
+    )
+    evidence_ids.update(
+        f"htoIdentity:{column}" for column in ctx.deps.htoIdentityColumns
+    )
+    evidence_ids.update(
+        _artifact_evidence_id(source) for source in ctx.deps.htoIdentityArtifacts
+    )
+    ctx.deps.evidenceIds.update(evidence_ids)
 
     batch_safety = (
         list(ctx.deps.batchSafety.values())

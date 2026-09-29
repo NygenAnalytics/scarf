@@ -51,9 +51,9 @@ def _seed_counts(root_path, values: np.ndarray) -> None:
         overwrite=True,
     )
     counts[:] = values
-    from scarf.storage.identity import finalize_counts
+    from tests.storage_helpers import finalize_test_counts
 
-    finalize_counts(counts)
+    finalize_test_counts(counts)
     persist_count_matrix_plan(group, plan)
     persist_count_matrix_plan(counts, plan)
 
@@ -138,9 +138,9 @@ def test_write_counts_t_accounts_for_process_resident_memory(tmp_path):
 
 
 def test_write_counts_t_forwards_storage_io(tmp_path):
-    from scarf.storage.async_execution import reset_zarr_runtime_for_tests
+    from tests.storage_helpers import reset_zarr_runtime
 
-    reset_zarr_runtime_for_tests()
+    reset_zarr_runtime()
     root_path = tmp_path / "store.zarr"
     values = np.arange(24, dtype=np.uint32).reshape(6, 4)
     _seed_counts(root_path, values)
@@ -169,7 +169,7 @@ def test_write_counts_t_forwards_storage_io(tmp_path):
     assert metrics["requestedDestCommitsInFlight"] == 2
     reopened = zarr.open_group(str(root_path), mode="r")
     np.testing.assert_array_equal(reopened["RNA/countsT"][:], values.T)
-    reset_zarr_runtime_for_tests()
+    reset_zarr_runtime()
 
 
 def test_create_store_defers_counts_t_to_write_stage(tmp_path):
@@ -216,6 +216,10 @@ def test_create_store_defers_counts_t_to_write_stage(tmp_path):
     assert create.status == "ok"
     assert create.details is not None
     assert create.details["storeOperations"]["sets"] > 0
+    # The published tables time the counts write only; the result says so.
+    assert create.details["timingDefinition"].startswith(
+        "seconds covers writer._write_counts only"
+    )
     after_create = zarr.open_group(str(store_path), mode="r")
     assert "countsT" not in after_create["RNA"]
     np.testing.assert_array_equal(after_create["RNA/counts"][:], values)

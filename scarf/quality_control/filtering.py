@@ -1,4 +1,4 @@
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Real
 from typing import Literal, TypedDict
@@ -6,6 +6,9 @@ from typing import Literal, TypedDict
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
+
+from ..metadata.selection import NamedCellArtifact
+from ..utils.arrays import within_bounds
 
 __all__ = ["gaussian_quantile_bounds"]
 
@@ -39,7 +42,7 @@ def gaussian_quantile_bounds(
     return float(dist.ppf(min_p)), float(dist.ppf(max_p))
 
 
-def _mad_bounds(values: np.ndarray, n_mads: float) -> tuple[float, float, float]:
+def mad_bounds(values: np.ndarray, n_mads: float) -> tuple[float, float, float]:
     """Return ``(low, high, scaled_mad)`` for robust per-sample thresholds.
 
     ``scaled_mad`` is ``1.4826 * MAD``. Callers must treat a zero scaled MAD as a
@@ -71,7 +74,7 @@ def _metric_policy(attr: str) -> dict[str, str]:
     return {"transform": "identity", "bound_direction": "two_sided"}
 
 
-def _validated_work_scale(
+def validated_work_scale(
     values: np.ndarray,
     *,
     attr: str,
@@ -93,7 +96,7 @@ def _validated_work_scale(
     return work
 
 
-def _from_work_scale(bound: float, transform: str) -> float:
+def from_work_scale(bound: float, transform: str) -> float:
     if transform == "log1p":
         with np.errstate(over="ignore", invalid="ignore"):
             resolved = float(np.expm1(bound))
@@ -106,7 +109,7 @@ def _from_work_scale(bound: float, transform: str) -> float:
     return resolved
 
 
-def _clamp_metric_bound(
+def clamp_metric_bound(
     bound: float,
     *,
     transform: str,
@@ -125,12 +128,18 @@ def _clamp_metric_bound(
     return resolved
 
 
-def _validated_sample_labels(
+def validated_sample_labels(
     sample_labels: np.ndarray,
     active: np.ndarray,
     *,
     label_name: str = "sample labels",
 ) -> np.ndarray:
+    """Check the sample labels of active rows and return an object copy.
+
+    Active labels must be present, non-blank, finite, and of one kind: text,
+    UTF-8 bytes, booleans, integers, or floats. They are Python scalars in the
+    returned copy.
+    """
     labels = np.asarray(sample_labels)
     active_mask = np.asarray(active)
     if labels.ndim != 1 or active_mask.ndim != 1 or labels.shape != active_mask.shape:
@@ -156,6 +165,24 @@ def _validated_sample_labels(
             f"{label_name} must use one consistent label type among active cells"
         )
     return normalized
+
+
+def unique_label_keys(labels: Iterable[object], *, label_name: str) -> list[str]:
+    """Return the text that provenance records for each distinct label.
+
+    Byte strings decode as UTF-8 and other labels use ``str``, so sample,
+    capture, and group labels share one key encoding.
+
+    Raises:
+        ValueError: If two distinct labels have the same key.
+    """
+    keys = []
+    for label in labels:
+        value = label.item() if isinstance(label, np.generic) else label
+        keys.append(value.decode("utf-8") if isinstance(value, bytes) else str(value))
+    if len(set(keys)) != len(keys):
+        raise ValueError(f"{label_name} collide after provenance encoding")
+    return keys
 
 
 def _sample_label_kind(value: object, label_name: str) -> str:
@@ -192,23 +219,19 @@ def _sample_label_kind(value: object, label_name: str) -> str:
 
 def _apply_bounds(
     values: np.ndarray,
-    low: float | None,
-    high: float | None,
+    low: float | str | None,
+    high: float | str | None,
     *,
     keep_bounds: bool = False,
 ) -> np.ndarray:
-    """Return a boolean mask for one-dimensional values within numeric bounds."""
+    """Return a boolean mask for one-dimensional values within bounds."""
     resolved = np.asarray(values)
     if resolved.ndim != 1:
         raise ValueError("Filter values must be a one-dimensional array")
-    lower = -np.inf if low is None else low
-    upper = np.inf if high is None else high
-    if keep_bounds:
-        return np.asarray((resolved >= lower) & (resolved <= upper), dtype=bool)
-    return np.asarray((resolved > lower) & (resolved < upper), dtype=bool)
+    return within_bounds(resolved, low, high, keep_bounds=keep_bounds)
 
 
-def _sample_aware_mad_mask(
+def sample_aware_mad_mask(
     *,
     values_by_attr: dict[str, np.ndarray],
     sample_labels: np.ndarray | None,
@@ -227,7 +250,7 @@ def _sample_aware_mad_mask(
     sample_labels = (
         np.full(n_cells, "all")
         if sample_labels is None
-        else _validated_sample_labels(sample_labels, active)
+        else validated_sample_labels(sample_labels, active)
     )
     keep = np.ones(n_cells, dtype=bool)
     policies = {attr: _metric_policy(attr) for attr in attrs}
@@ -237,7 +260,7 @@ def _sample_aware_mad_mask(
         raw = np.asarray(values_by_attr[attr], dtype=float)
         raw_values_by_attr[attr] = raw
         work = np.empty(n_cells, dtype=float)
-        work[active] = _validated_work_scale(
+        work[active] = validated_work_scale(
             raw[active],
             attr=attr,
             transform=policies[attr]["transform"],
@@ -252,19 +275,9 @@ def _sample_aware_mad_mask(
     # and turns per-sample label comparisons into integer comparisons.
     active_idx = np.flatnonzero(active)
     sample_codes, sample_uniques = pd.factorize(sample_labels[active])
-    ordered_samples = [
-        label.item() if isinstance(label, np.generic) else label
-        for label in sample_uniques
-    ]
+    sample_keys = unique_label_keys(sample_uniques, label_name="Sample labels")
 
-    for code, sample in enumerate(ordered_samples):
-        sample_key = (
-            sample.decode("utf-8") if isinstance(sample, bytes) else str(sample)
-        )
-        if sample_key in sample_sizes:
-            raise ValueError(
-                "Sample labels collide after deterministic provenance encoding"
-            )
+    for code, sample_key in enumerate(sample_keys):
         sample_idx = active_idx[sample_codes == code]
         sample_sizes[sample_key] = int(sample_idx.shape[0])
         resolved_bounds[sample_key] = {}
@@ -286,7 +299,7 @@ def _sample_aware_mad_mask(
             is_percent = direction == "upper" and transform == "identity"
             raw = raw_values_by_attr[attr][sample_idx]
             work = work_values_by_attr[attr][sample_idx]
-            low_t, high_t, scaled_mad = _mad_bounds(work, n_mads)
+            low_t, high_t, scaled_mad = mad_bounds(work, n_mads)
             if scaled_mad == 0.0:
                 resolved_bounds[sample_key][attr] = {
                     "low": None,
@@ -306,19 +319,19 @@ def _sample_aware_mad_mask(
             high: float | None
             if direction == "upper":
                 low = None
-                high = _clamp_metric_bound(
-                    _from_work_scale(high_t, transform),
+                high = clamp_metric_bound(
+                    from_work_scale(high_t, transform),
                     transform=transform,
                     is_percent=is_percent,
                 )
             else:
-                low = _clamp_metric_bound(
-                    _from_work_scale(low_t, transform),
+                low = clamp_metric_bound(
+                    from_work_scale(low_t, transform),
                     transform=transform,
                     is_percent=is_percent,
                 )
-                high = _clamp_metric_bound(
-                    _from_work_scale(high_t, transform),
+                high = clamp_metric_bound(
+                    from_work_scale(high_t, transform),
                     transform=transform,
                     is_percent=is_percent,
                 )
@@ -369,6 +382,94 @@ def _check_filter_bound(value: object, name: str) -> None:
         raise TypeError(f"{name} values must be finite numbers, text, or None")
     if not np.isfinite(float(value)):
         raise ValueError(f"{name} values must be finite; use None for no bound")
+
+
+def validate_named_cell_artifacts(
+    values: Iterable[NamedCellArtifact] | None,
+    *,
+    expected_kind: str,
+    label: str,
+) -> list[NamedCellArtifact]:
+    """Check that named cell artifacts reference one kind under unique names.
+
+    Args:
+        values: Named cell-aligned artifacts, or None for none.
+        expected_kind: The artifact kind every value must reference.
+        label: The argument name that error messages use.
+
+    Returns:
+        The values as a list.
+
+    Raises:
+        TypeError: If a value is not a ``NamedCellArtifact``.
+        ValueError: If a value references another kind or repeats a name.
+    """
+    sources = list(values or ())
+    names: set[str] = set()
+    for source in sources:
+        if not isinstance(source, NamedCellArtifact):
+            raise TypeError(f"{label} must contain NamedCellArtifact values")
+        if source.artifact.kind != expected_kind:
+            raise ValueError(f"{label} must reference {expected_kind!r} artifacts")
+        if source.name in names:
+            raise ValueError(f"{label} must use unique semantic names")
+        names.add(source.name)
+    return sources
+
+
+def validate_cell_filter_sources(
+    attrs: Iterable[str],
+    artifact_metrics: Iterable[NamedCellArtifact] | None = None,
+    *,
+    sample_column: str | None = None,
+    sample_artifact: NamedCellArtifact | None = None,
+) -> tuple[list[str], list[NamedCellArtifact], NamedCellArtifact | None]:
+    """Check the metric and sample sources of a cell filter before any read.
+
+    Metadata metrics are distinct column names. Artifact metrics reference
+    ``quality_metric`` artifacts under unique names that no metadata metric
+    uses. Sample labels come from a metadata column or from a named
+    ``hto_identity`` artifact, not both, and a sample artifact name differs
+    from every artifact metric name.
+
+    Returns:
+        The metadata metrics, the artifact metrics, and the sample artifact.
+
+    Raises:
+        TypeError: If a metric or sample source has an invalid type.
+        ValueError: If names repeat or collide, an artifact has another kind,
+            or both sample sources are given.
+    """
+    attrs_list = list(attrs)
+    if any(not isinstance(attr, str) for attr in attrs_list):
+        raise TypeError("attrs must contain only column names")
+    if len(set(attrs_list)) != len(attrs_list):
+        raise ValueError("attrs must not contain duplicate columns")
+    metrics = validate_named_cell_artifacts(
+        artifact_metrics,
+        expected_kind="quality_metric",
+        label="artifact_metrics",
+    )
+    sample = (
+        None
+        if sample_artifact is None
+        else validate_named_cell_artifacts(
+            [sample_artifact],
+            expected_kind="hto_identity",
+            label="sample_artifact",
+        )[0]
+    )
+    if sample_column is not None and sample is not None:
+        raise ValueError("sample_column and sample_artifact are mutually exclusive")
+    metric_names = {source.name for source in metrics}
+    if sample is not None and sample.name in metric_names:
+        raise ValueError("Sample and metric artifact names must be distinct")
+    collisions = sorted(metric_names.intersection(attrs_list))
+    if collisions:
+        raise ValueError(
+            f"Metadata and artifact QC metrics must use distinct names: {collisions}"
+        )
+    return attrs_list, metrics, sample
 
 
 def validate_filter_bounds(
@@ -472,7 +573,7 @@ def filter_cell_metrics(
                 raise ValueError(
                     f"{sample_label_name} contains missing labels among active cells"
                 )
-            validated_labels = _validated_sample_labels(
+            validated_labels = validated_sample_labels(
                 sample_labels,
                 active_mask,
                 label_name=sample_label_name,
@@ -492,7 +593,7 @@ def filter_cell_metrics(
         elif attrs:
             # Typed labels keep their dtype so the second validation checks
             # each distinct label once instead of every cell.
-            mad_keep, mad_provenance = _sample_aware_mad_mask(
+            mad_keep, mad_provenance = sample_aware_mad_mask(
                 values_by_attr=dict(values_by_attr),
                 sample_labels=sample_labels,
                 active=complete,

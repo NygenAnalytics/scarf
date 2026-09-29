@@ -35,10 +35,6 @@ class DecisionResolution:
     pending: WorkflowQuestion | None = None
 
 
-def _sha256(value: object) -> str:
-    return hashlib.sha256(record_io.canonical_json_bytes(value)).hexdigest()
-
-
 def _record_from_selection(
     definition: RnaDecisionDefinition,
     evidence: EvidenceBundle,
@@ -54,7 +50,7 @@ def _record_from_selection(
     if option is None:
         raise ValueError("Selected option is not offered")
     return DecisionRecord(
-        recordId=f"decision:{definition.spec.decisionId}:{_sha256(selection.model_dump(mode='json'))[:24]}",
+        recordId=f"decision:{definition.spec.decisionId}:{record_io.sha256_json(selection.model_dump(mode='json'))[:24]}",
         decisionId=definition.spec.decisionId,
         definitionVersion=definition.spec.definitionVersion,
         evidenceBundleId=evidence.bundleId,
@@ -68,12 +64,10 @@ def _record_from_selection(
         rationale=selection.rationale,
         confidence=selection.confidence,
         protectedVariableEffects=list(selection.protectedVariableEffects),
-        overrideOfOptionId=selection.overrideOfOptionId,
-        overrideEvidenceIds=list(selection.overrideEvidenceIds),
         modelName=model_name,
         promptSha256=prompt_sha256,
         createdAtNs=created_at_ns,
-        softwareSha256=_sha256(definition.model_dump(mode="json")),
+        softwareSha256=record_io.sha256_json(definition.model_dump(mode="json")),
     )
 
 
@@ -110,41 +104,11 @@ def _human_selection(
         if not option.requiredEvidenceClasses
         or v.evidenceClass in option.requiredEvidenceClasses
     ]
-    ids = list(dict.fromkeys([*option.requiredEvidenceIds, *ids]))
-    override = (
-        definition.spec.requireIndependentOverrideEvidence
-        and definition.spec.metricPreferredOptionId is not None
-        and option.optionId != definition.spec.metricPreferredOptionId
-        and option.status in {"apply", "skip"}
-    )
-    override_ids = (
-        [
-            v.evidenceId
-            for v in evidence.evidence
-            if v.evidenceClass
-            in {
-                "markerCoherence",
-                "resamplingStability",
-                "crossUnitSupport",
-                "protectedVariablePreservation",
-            }
-            and (
-                not option.requiredEvidenceIds
-                or v.evidenceId in option.requiredEvidenceIds
-            )
-        ]
-        if override
-        else []
-    )
     return DecisionSelection(
         selectedOptionId=option.optionId,
-        evidenceIds=list(dict.fromkeys([*ids, *override_ids])),
+        evidenceIds=list(dict.fromkeys([*option.requiredEvidenceIds, *ids])),
         rationale=answer["rationale"],
         confidence="notApplicable",
-        overrideOfOptionId=definition.spec.metricPreferredOptionId
-        if override
-        else None,
-        overrideEvidenceIds=override_ids,
     )
 
 
@@ -199,7 +163,7 @@ class DecisionStagesMixin:
         }
         if qc_evidence is not None:
             identity["qcPolicyEvidence"] = dict(qc_evidence)
-        digest = _sha256(identity)
+        digest = record_io.sha256_json(identity)
         key = f"{stage}/decisions/{decision_id}/{digest}"
         prefix = journal._ensure_orchestration_store(store)
         saved = journal.load_checkpoint(
@@ -328,11 +292,3 @@ class DecisionStagesMixin:
         return DecisionResolution(
             record, None if pending else compiled, digest, pending
         )
-
-    @staticmethod
-    def _pending_decision_question(
-        resolution: DecisionResolution, definition: RnaDecisionDefinition
-    ) -> WorkflowQuestion:
-        if resolution.pending is None:
-            raise ValueError("Decision has no pending question")
-        return resolution.pending

@@ -81,7 +81,9 @@ def test_hvg_regex_correction_recomputes_without_rewriting_saved_selection(
         store.load_artifact(corrected)["values"][:][indices], [False, True]
     )
     assert store.select_hvgs(cells, **options) == corrected
-    assert store.resolve_features("RNA", original) == original
+    # A blacklisted selection without its matched-feature fingerprint fails closed.
+    with pytest.raises(ArtifactResolutionError, match="blacklist fingerprint"):
+        store.resolve_features("RNA", original)
     assert dict(old_group.attrs) == old_attributes
     np.testing.assert_array_equal(old_group["values"][:], old_values)
 
@@ -194,7 +196,11 @@ def test_select_hvgs_reuse_accounts_for_variance_estimator(
 
     assert (selected != existing) == (bin_strategy == "adaptive")
     assert store.select_hvgs(cell_selection, **options) == selected
-    assert store.resolve_features("RNA", existing) == existing
+    if bin_strategy == "adaptive":
+        with pytest.raises(ArtifactResolutionError, match="variance estimator"):
+            store.resolve_features("RNA", existing)
+    else:
+        assert store.resolve_features("RNA", existing) == existing
     preserved = store.load_artifact(existing)
     assert dict(preserved.attrs) == stored_attributes
     np.testing.assert_array_equal(preserved["values"][:], stored_values)
@@ -224,7 +230,11 @@ def test_select_hvgs_recomputes_when_background_quantile_changes(
 
     assert selected != existing
     assert store.select_hvgs(cells, show_plot=False) == selected
-    assert store.resolve_features("RNA", existing) == existing
+    if stored_quantile is None:
+        with pytest.raises(ArtifactResolutionError, match="variance quantile"):
+            store.resolve_features("RNA", existing)
+    else:
+        assert store.resolve_features("RNA", existing) == existing
     assert dict(group.attrs) == stored_attributes
     np.testing.assert_array_equal(group["corrected_variance"][:], stored_scores)
     assert inspect_artifact(store.zw, selected).parameters["variance_quantile"] == 0.25

@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from scarf.plotting import DensityOverlay, Highlight
+from scarf.plotting._style import scatter_edges
 from scarf.plotting.embedding import (
     _color_labels,
     _density_selection_mask,
@@ -14,7 +15,6 @@ from scarf.plotting.embedding import (
     _multi_layout_facets,
     _resolve_highlight_mask,
     _retain_strongest_hotspots,
-    _scatter_edges,
     _smoothed_local_mean,
     _soft_clip,
     _weighted_quantiles,
@@ -113,7 +113,7 @@ def test_highlight_and_density_masks_validate_selected_metadata(monkeypatch):
 
 
 def test_embedding_numeric_helpers_cover_degenerate_inputs():
-    assert _scatter_edges("black", 0) == ("none", 0.0)
+    assert scatter_edges("black", 0) == ("none", 0.0)
     np.testing.assert_allclose(
         _weighted_quantiles(
             np.array([3.0, 1.0, 2.0]),

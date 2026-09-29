@@ -13,8 +13,8 @@ from scarf.clustering._paris_core import (
 from scarf.clustering.paris import (
     fit_paris_hierarchy,
     hierarchy_to_dendrogram,
-    paris_dendrogram,
 )
+from scarf.clustering.paris_multiscale import collapse_equal_height_plateaus
 
 
 def _leaf_sets(dendrogram: np.ndarray) -> dict[frozenset[int], float]:
@@ -89,6 +89,27 @@ def test_output_is_identical_across_thread_counts() -> None:
         assert np.array_equal(result.sizes, reference.sizes)
         assert np.array_equal(result.component_roots, reference.component_roots)
         assert np.array_equal(result.synthetic_joins, reference.synthetic_joins)
+
+
+@pytest.mark.parametrize("n_vertices", [45, 61, 77])
+def test_tied_clique_heights_stay_monotone_through_rounding(n_vertices) -> None:
+    # Every merge of a unit clique ties exactly; rounding used to leave some
+    # merges a few ulps below their child merges.
+    rows, cols = np.nonzero(~np.eye(n_vertices, dtype=bool))
+    graph = csr_matrix(
+        (np.ones(rows.size), (rows, cols)),
+        shape=(n_vertices, n_vertices),
+    )
+
+    hierarchy = fit_paris_hierarchy(graph, nthreads=1)
+
+    child_heights = np.where(
+        hierarchy.children >= n_vertices,
+        hierarchy.heights[np.maximum(hierarchy.children - n_vertices, 0)],
+        0.0,
+    )
+    assert np.all(child_heights.max(axis=1) <= hierarchy.heights)
+    collapse_equal_height_plateaus(hierarchy)
 
 
 def test_contraction_diagnostics_account_for_each_phase() -> None:
@@ -259,7 +280,6 @@ def test_components_isolates_and_synthetic_joins_are_explicit() -> None:
     assert hierarchy.synthetic_joins.tolist() == [False, False, True, True]
     assert np.isinf(raw[hierarchy.synthetic_joins, 2]).all()
     assert np.all(compatibility[hierarchy.synthetic_joins, 2] == 0)
-    assert np.array_equal(paris_dendrogram(graph), compatibility)
     assert hierarchy.children.dtype == np.int32
     assert hierarchy.sizes.dtype == np.int32
     assert hierarchy.heights.dtype == np.float64

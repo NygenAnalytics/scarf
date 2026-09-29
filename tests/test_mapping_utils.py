@@ -4,63 +4,68 @@ import zarr
 from zarr.storage import MemoryStore
 
 from scarf.mapping.confidence import (
+    _conformal_membership,
     _distance_quantile_summary,
-    conformal_prediction_sets,
+    _validated_conformal_calibration,
+    add_mapping_scores,
     distance_weights,
+    finish_mapping_scores,
     mapping_score_weights,
 )
 from scarf.mapping.features import _feature_ids
-from scarf.mapping.hashing import array_hash, array_store_hash
 
 
-def test_mapping_array_hashes_match_golden_values():
-    # The length-prefixed encoding replaced separator-joined identifiers, so
-    # these values intentionally differ from the previous release.
-    numeric = np.array([[1.5, -2.0], [0.0, 4.25]], dtype=np.float64)
-    identifiers = np.array(["gene_a", "gene_b"], dtype="<U6")
-
-    assert (
-        array_hash(numeric)
-        == "cd8f2c493797778faf739739e7e7e5fd535f0d772d001c0e92099a81d9399faf"
+def test_mapping_score_kernel_skips_rows_and_scales_each_group():
+    scores = np.zeros((3, 4))
+    scored_rows = np.zeros(3, dtype=np.int64)
+    # The second block row is skipped, so the neighbors cover rows 0 and 2.
+    weights = mapping_score_weights(np.array([[0.0, 1.0], [0.0, 0.0]]))
+    add_mapping_scores(
+        scores,
+        scored_rows,
+        np.array([[0, 1], [2, 3]]),
+        weights,
+        skip=np.array([False, True, False]),
+        groups=np.array([0, 0, 1]),
     )
-    assert (
-        array_store_hash(numeric)
-        == "cd8f2c493797778faf739739e7e7e5fd535f0d772d001c0e92099a81d9399faf"
-    )
-    assert (
-        array_hash(identifiers)
-        == "5c78c9ed0b0ce3f452f5592d9a6be9de0456ab14aa165d5738dddc074c6316a7"
-    )
-    assert (
-        array_store_hash(identifiers)
-        == "5c78c9ed0b0ce3f452f5592d9a6be9de0456ab14aa165d5738dddc074c6316a7"
+    finish_mapping_scores(
+        scores,
+        scored_rows,
+        n_neighbors=2,
+        multiplier=1000.0,
+        log_transform=False,
     )
 
+    assert scored_rows.tolist() == [1, 1, 0]
+    np.testing.assert_allclose(scores[0], [500.0, 500.0 / (np.log(2) + 1), 0, 0])
+    np.testing.assert_allclose(scores[1], [0.0, 0.0, 500.0, 500.0])
+    np.testing.assert_array_equal(scores[2], 0.0)
 
-def test_mapping_identifier_hashes_are_unambiguous():
-    assert array_hash(["a\x1fb", "c"]) != array_hash(["a", "b\x1fc"])
-    assert array_hash(["ab", ""]) != array_hash(["a", "b"])
-    assert array_hash(["a", "b"]) != array_hash([["a", "b"]])
-
-
-def test_mapping_identifier_hashes_agree_across_string_storage():
-    identifiers = ["gene_a", "gene_bb", "g"]
-    expected = array_hash(identifiers)
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    stored = root.create_array(
-        "ids",
-        shape=(len(identifiers),),
-        dtype=np.dtypes.StringDType(),
-        chunks=(2,),
+    single = np.zeros((1, 2))
+    single_rows = np.zeros(1, dtype=np.int64)
+    add_mapping_scores(
+        single,
+        single_rows,
+        np.array([[1, 1]]),
+        np.ones((1, 2)),
+        skip=np.array([True, False]),
     )
-    stored[:] = np.array(identifiers, dtype=np.dtypes.StringDType())
-    assert np.dtype(stored.dtype).kind == "T"
-
-    assert array_store_hash(stored) == expected
-    for dtype in (object, "U", "S", np.dtypes.StringDType()):
-        values = np.array(identifiers, dtype=dtype)
-        assert array_hash(values) == expected
-        assert array_store_hash(values) == expected
+    finish_mapping_scores(
+        single,
+        single_rows,
+        n_neighbors=2,
+        multiplier=1000,
+        log_transform=True,
+    )
+    np.testing.assert_allclose(single, np.log1p([[0.0, 1000.0]]))
+    with pytest.raises(ValueError, match="one row per query row"):
+        add_mapping_scores(
+            single,
+            single_rows,
+            np.array([[0, 1]]),
+            np.ones((1, 2)),
+            skip=np.zeros(2, dtype=bool),
+        )
 
 
 def test_mapping_score_weights_stay_absolute_across_query_cells():
@@ -151,11 +156,15 @@ def test_distance_quantile_summary_handles_vectors_and_neighbor_matrices():
     np.testing.assert_allclose(matrix_summary[1], vector_summary[1])
 
 
-def test_conformal_prediction_sets_include_high_score_labels():
-    sets = conformal_prediction_sets(
-        np.array([[0.95, 0.1], [0.7, 0.7]]),
+def test_conformal_membership_includes_high_score_labels():
+    calibration, alpha = _validated_conformal_calibration(
         np.array([0.05, 0.1, 0.2, 0.25]),
-        alpha=0.2,
+        0.2,
+    )
+    sets = _conformal_membership(
+        np.array([[0.95, 0.1], [0.7, 0.7]]),
+        calibration,
+        alpha,
     )
 
     assert sets.shape == (2, 2)
@@ -246,3 +255,24 @@ def test_label_votes_preserve_ties_thresholds_and_large_class_codes():
     )
     assert not at_threshold.is_unknown[0]
     assert above_threshold.is_unknown[0]
+
+
+def test_same_physical_store_matches_normalized_and_nested_locations(tmp_path):
+    from types import SimpleNamespace
+
+    from scarf.datastore._operations.mapping import _same_physical_store
+
+    def datastore(location, zarr_loc=None):
+        root = zarr.open_group(str(location), mode="a")
+        return SimpleNamespace(z=root, zarr_loc=zarr_loc)
+
+    reference_path = tmp_path / "reference.zarr"
+    reference = SimpleNamespace(datastore=datastore(reference_path))
+    for query in (
+        datastore(reference_path, zarr_loc=f"file://{reference_path}/"),
+        datastore(reference_path / "nested.zarr"),
+    ):
+        assert _same_physical_store(query, reference)
+    assert not _same_physical_store(datastore(tmp_path / "query.zarr"), reference)
+    shared = SimpleNamespace(z=zarr.open_group(store=MemoryStore(), mode="w"))
+    assert _same_physical_store(shared, SimpleNamespace(datastore=shared))

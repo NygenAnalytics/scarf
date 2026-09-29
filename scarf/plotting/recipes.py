@@ -102,6 +102,10 @@ def _validate_output_filename(value: str) -> None:
         )
 
 
+def _normalized_output_name(value: str) -> str:
+    return PurePosixPath(PureWindowsPath(value).as_posix()).as_posix().casefold()
+
+
 def _camel_to_snake(value: str) -> str:
     return re.sub(r"(?<!^)(?=[A-Z])", "_", value).lower()
 
@@ -184,15 +188,26 @@ def _coerce_feature_reference(value: Any, *, context: str) -> Any:
     return value
 
 
+def _coerce_field_or_feature(value: Any, *, context: str) -> Any:
+    """Read a serialized ``CellField`` (with ``key``) or ``FeatureRef``."""
+    if not isinstance(value, Mapping):
+        return value
+    contract = CellField if "key" in value else FeatureRef
+    return _contract_from_mapping(contract, value, context=context)
+
+
 def _coerce_serialized_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     out = dict(kwargs)
     contract_kwargs: dict[str, type[Any]] = {
         "categorical_scale": CategoricalScale,
         "color_scale": ColorScale,
         "density_overlay": DensityOverlay,
+        "feature_cluster_scale": CategoricalScale,
         "highlight": Highlight,
         "normalization": NormalizationSpec,
+        "pseudotime_scale": ColorScale,
         "size_scale": SizeScale,
+        "split_scale": CategoricalScale,
         "study_design": StudyDesign,
     }
     for name, contract in contract_kwargs.items():
@@ -202,20 +217,31 @@ def _coerce_serialized_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
                 out[name],
                 context=name,
             )
-    if "color_by" in out:
-        color_by = out["color_by"]
-
-        def coerce_color(value: Any) -> Any:
-            if not isinstance(value, Mapping):
-                return value
-            if "key" in value:
-                return _contract_from_mapping(CellField, value, context="colorBy")
-            return _contract_from_mapping(FeatureRef, value, context="colorBy")
-
-        if isinstance(color_by, Sequence) and not isinstance(color_by, str | bytes):
-            out["color_by"] = [coerce_color(value) for value in color_by]
+    if isinstance(out.get("annotation_scales"), Mapping):
+        out["annotation_scales"] = {
+            annotation: _contract_from_mapping(
+                CategoricalScale,
+                scale,
+                context=f"annotationScales.{annotation}",
+            )
+            for annotation, scale in out["annotation_scales"].items()
+        }
+    if isinstance(out.get("grouping"), Mapping):
+        out["grouping"] = _contract_from_mapping(
+            CellField,
+            out["grouping"],
+            context="grouping",
+        )
+    for name, context in (("color_by", "colorBy"), ("keys", "keys")):
+        if name not in out:
+            continue
+        value = out[name]
+        if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+            out[name] = [
+                _coerce_field_or_feature(item, context=context) for item in value
+            ]
         else:
-            out["color_by"] = coerce_color(color_by)
+            out[name] = _coerce_field_or_feature(value, context=context)
     if "features" in out:
         feature_value = out["features"]
         if isinstance(feature_value, Mapping):
@@ -369,11 +395,17 @@ class PlotRecipe:
         if duplicates:
             joined = ", ".join(repr(name) for name in duplicates)
             raise ValueError(f"Plot step names must be unique; duplicates: {joined}")
-        output_names = [
-            step.output_filename for step in steps if step.output_filename is not None
-        ]
+        # Compare normalized, case-folded paths: "fig.png", "./fig.png", and
+        # "Fig.png" can all name one file.
+        output_names: dict[str, list[str]] = {}
+        for step in steps:
+            if step.output_filename is not None:
+                output_names.setdefault(
+                    _normalized_output_name(step.output_filename),
+                    [],
+                ).append(step.output_filename)
         duplicate_outputs = sorted(
-            {name for name in output_names if output_names.count(name) > 1}
+            name for names in output_names.values() if len(names) > 1 for name in names
         )
         if duplicate_outputs:
             raise ValueError(
@@ -504,14 +536,6 @@ class PlotOutput:
     result: Any = field(repr=False)
     path: Path | None = None
 
-    @property
-    def step_name(self) -> str:
-        return self.name
-
-    @property
-    def written_path(self) -> Path | None:
-        return self.path
-
 
 @dataclass(frozen=True, slots=True)
 class PlotRecipeResult:
@@ -531,10 +555,6 @@ class PlotRecipeResult:
             "failures",
             MappingProxyType(dict(self.failures)),
         )
-
-    @property
-    def results(self) -> tuple[Any, ...]:
-        return tuple(output.result for output in self.outputs)
 
 
 def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -687,7 +707,7 @@ def _run_step(
     return PlotOutput(name=step.name, result=plot_result, path=output_path)
 
 
-def run_plot_recipe(
+def run_recipe(
     store: Any,
     recipe: PlotRecipe | str | Path,
     *,
@@ -697,8 +717,10 @@ def run_plot_recipe(
     show: bool = False,
     continue_on_error: bool = False,
 ) -> PlotRecipeResult:
-    """Run recipe steps in order without allowing plots to display themselves."""
+    """Run a plotting recipe's steps in order after any analysis has completed.
 
+    Plots do not display themselves unless ``show`` is set.
+    """
     resolved_recipe = _load_recipe(recipe)
     if not isinstance(show, bool):
         raise TypeError("show must be a boolean")
@@ -770,28 +792,6 @@ def run_plot_recipe(
     )
 
 
-def run_recipe(
-    store: Any,
-    recipe: PlotRecipe | str | Path,
-    *,
-    artifacts: Mapping[str, Any] | None = None,
-    targets: Mapping[str, Any] | None = None,
-    output_dir: str | Path | None = None,
-    show: bool = False,
-    continue_on_error: bool = False,
-) -> PlotRecipeResult:
-    """Run a plotting recipe after any analysis pipeline has completed."""
-    return run_plot_recipe(
-        store,
-        recipe,
-        artifacts=artifacts,
-        targets=targets,
-        output_dir=output_dir,
-        show=show,
-        continue_on_error=continue_on_error,
-    )
-
-
 __all__ = [
     "ALLOWED_OUTPUT_FORMATS",
     "ALLOWED_PLOTS",
@@ -802,5 +802,4 @@ __all__ = [
     "PlotRecipeResult",
     "PlotStep",
     "run_recipe",
-    "run_plot_recipe",
 ]

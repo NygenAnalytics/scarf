@@ -6,12 +6,9 @@ from typing import Any
 import numpy as np
 import zarr
 
-from .arrays import _decode_metadata_values
+from .arrays import _decode_metadata_values, linked_missing_mask
 from .artifacts import ValueFingerprintBuilder, canonical_bytes
-from .budget import ResourceBudget, resolve_budget
-from .execution import WorkShape, plan_operation
 from .geometry import array_geometry
-from .parallel import stream_shards
 from .partition import scan_band
 from .stores import metadata_workers, run_concurrently
 from .types import as_zarr_array, as_zarr_group
@@ -188,45 +185,11 @@ class CountSummary:
             self.columnPositive += columns
 
 
-def finalize_counts(
-    counts: zarr.Array,
-    resources: ResourceBudget | None = None,
-    summary: CountSummary | None = None,
-) -> str:
+def finalize_counts(counts: zarr.Array, summary: CountSummary) -> str:
     """Publish the content fingerprint and raw totals of finalized counts.
 
-    Writers pass the summary they filled while writing. Without one, the
-    counts are read once in chunk-aligned row bands.
+    Writers pass the summary they filled while writing the counts.
     """
-    if summary is None:
-        counts.attrs.update({"complete": False, "content_fingerprint": None})
-        summary = computed = CountSummary(counts)
-        resources = resources or resolve_budget()
-        itemsize = counts.dtype.itemsize
-        chunk_rows = max(1, int(counts.chunks[0]))
-        band_bytes = chunk_rows * max(1, summary.shape[1]) * itemsize
-        rows = chunk_rows * max(1, 64 * 1024**2 // band_bytes)
-        ranges = [
-            (start, min(start + rows, summary.shape[0]))
-            for start in range(0, summary.shape[0], rows)
-        ]
-        operation = plan_operation(
-            resources,
-            WorkShape(
-                nUnits=len(ranges),
-                unitBytes=rows * max(1, summary.shape[1]) * itemsize,
-                residentBytes=summary.nbytes,
-                decodeBytes=int(np.prod(counts.chunks)) * itemsize,
-                chunksPerShard=-(-summary.shape[1] // max(1, int(counts.chunks[1]))),
-            ),
-        )
-        for _ in stream_shards(
-            ranges,
-            lambda bounds: computed.update(bounds[0], counts[bounds[0] : bounds[1]]),
-            workers=operation.computeWorkers,
-            io_concurrency=operation.ioConcurrency,
-        ):
-            pass
     fingerprint = summary.hexdigest()
     matrix = zarr.open_group(
         store=counts.store, path=counts.path.rpartition("/")[0], mode="r+"
@@ -495,8 +458,11 @@ def publish_preparation(
         raise ValueError(
             "Copied dataset identity differs from the source; saved results cannot be used"
         )
-    fresh_group(assay).attrs.update(
+    group = fresh_group(assay)
+    # One metadata write publishes the identity together with the prepared flag.
+    group.attrs.put(
         {
+            **group.attrs.asdict(),
             "prepared": True,
             "dataset_fingerprint": fingerprint,
             "counts_fingerprint": count_fingerprint(counts),
@@ -547,20 +513,8 @@ def clear_column(group: zarr.Group, column: str) -> None:
     except KeyError:
         return
     protect_metadata_column(group, column)
-    missing: Any = array.attrs.get("missing_mask")
-    if missing is not None:
-        if (
-            not isinstance(missing, str)
-            or "/" in missing
-            or missing == column
-            or missing not in group
-        ):
-            raise ValueError(
-                f"Column {column!r} has a malformed missing-value dependency"
-            )
-        mask = as_zarr_array(group[missing], name=missing)
-        if mask.dtype != np.dtype(bool) or mask.shape != array.shape:
-            raise ValueError(f"Column {column!r} has a malformed missing-value array")
+    # Resolve the mask before deleting anything, so a malformed link fails closed.
+    mask = linked_missing_mask(group, column, label=f"Column {column!r}", values=array)
     del group[column]
-    if missing is not None:
-        del group[missing]
+    if mask is not None:
+        del group[mask.basename]

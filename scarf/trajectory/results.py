@@ -6,13 +6,7 @@ import pandas as pd
 
 from ..matrix import ChunkedArray
 from ..storage.refs import ArtifactRef
-
-
-def _immutable_array(values: np.ndarray) -> np.ndarray:
-    array = np.ascontiguousarray(np.asarray(values))
-    return np.frombuffer(array.tobytes(order="C"), dtype=array.dtype).reshape(
-        array.shape
-    )
+from ..utils.arrays import read_only_copy
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,8 +19,8 @@ class _PseudotimeAggregationFeatureIdentity:
         ids = np.asarray(self.ids)
         if names.ndim != 1 or ids.ndim != 1 or names.shape != ids.shape:
             raise ValueError("Frozen feature names and IDs must align")
-        object.__setattr__(self, "names", _immutable_array(names))
-        object.__setattr__(self, "ids", _immutable_array(ids))
+        object.__setattr__(self, "names", read_only_copy(names))
+        object.__setattr__(self, "ids", read_only_copy(ids))
 
 
 class _PseudotimeAggregationIdentityCarrier:

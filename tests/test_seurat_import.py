@@ -302,11 +302,7 @@ def test_import_materializes_metadata_counts_membership_and_pca(
         [[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]],
     )
     np.testing.assert_array_equal(pca["stdev"][:], [2.0, 1.0])
-    assert result.artifactRefs == (
-        result.cellSelection,
-        result.activeIdentity,
-        pca_ref,
-    )
+    assert dict(result.reductionArtifacts) == {"pca": pca_ref}
     assert any(
         notice.code == "ignored_normalized_layer"
         and notice.objectPath == "assays/ADT/layers/data"
@@ -680,6 +676,11 @@ def test_writer_preserves_reduction_names_without_normalized_name_constraints(
             id="internal-prefix",
         ),
         pytest.param(
+            "__scarf/missing__quality",
+            "uses Scarf's internal prefix",
+            id="internal-prefix-after-renaming",
+        ),
+        pytest.param(
             "ADT_I",
             "membership columns conflict with cell metadata",
             id="assay-membership",
@@ -702,6 +703,34 @@ def test_writer_rejects_conflicting_metadata_before_mutating_destination(
             _new_writer(reader, destination)
 
     _assert_destination_untouched(destination)
+
+
+@pytest.mark.parametrize(
+    ("column_name", "key"),
+    [
+        pytest.param("quality/score", "quality_score", id="slash"),
+        # The assay membership column already uses ``ADT_I``.
+        pytest.param("ADT/I", "ADT_I_2", id="membership-clash"),
+    ],
+)
+def test_writer_stores_separator_named_metadata_under_underscore_keys(
+    tmp_path: Path,
+    column_name: str,
+    key: str,
+) -> None:
+    source = _write_partial_fixture(
+        tmp_path / "separator-metadata.rds",
+        extra_cell_metadata_name=column_name,
+    )
+    destination = MemoryStore()
+
+    with SeuratReader(source) as reader:
+        _new_writer(reader, destination).dump(batch_size=1)
+
+    cells = zarr.open_group(store=destination, mode="r")["cellData"]
+    np.testing.assert_array_equal(cells[key][:], ["x", "y", "z"])
+    assert cells["ADT_I"].attrs["role"] == "assay_membership"
+    assert list(cells.group_keys()) == []
 
 
 def test_dump_rejects_boolean_batch_size_and_stays_incomplete(

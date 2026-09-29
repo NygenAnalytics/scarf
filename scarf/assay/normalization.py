@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import numpy as np
 import zarr
 from numba import njit
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, DTypeLike, NDArray
 
 from ..matrix import ChunkedArray
 from ..storage.arrays import create_numeric_array
@@ -116,16 +116,206 @@ def reject_unknown_normalization_params(
             raise TypeError(f"{caller}() got an unexpected keyword argument {name!r}")
 
 
-def _scale_count_rows(
-    counts: NDArray[Any],
-    totals: NDArray[Any],
+def library_size_values(
+    counts: ArrayLike,
+    totals: ArrayLike,
+    size_factor: float,
     *,
-    factor: float,
+    dtype: DTypeLike,
+    log_transform: bool = False,
 ) -> NDArray[Any]:
-    """Return ``factor * counts / totals`` in float64 with one output buffer."""
-    scaled: NDArray[Any] = np.multiply(counts, factor, dtype=np.float64)
-    scaled /= totals
-    return scaled
+    """Scale each row of counts to ``size_factor`` over its library total.
+
+    Every step runs in ``dtype``: ``size_factor * counts / totals``, then
+    ``log1p`` when ``log_transform`` is true. The result is one new array.
+
+    Args:
+        counts: Counts with one row per cell.
+        totals: Nonzero library total of each row.
+        size_factor: Library size that each row is scaled to.
+        dtype: Floating-point dtype of the arithmetic and the result.
+        log_transform: Whether to return ``log1p`` of the scaled values.
+
+    Returns:
+        Normalized values with the shape of ``counts``.
+    """
+    values: NDArray[Any] = np.multiply(counts, size_factor, dtype=dtype)
+    values /= np.asarray(totals, dtype=dtype).reshape(-1, 1)
+    if log_transform:
+        np.log1p(values, out=values)
+    return values
+
+
+def clr_values[T: (np.ndarray, ChunkedArray)](counts: T) -> T:
+    """Return the centered log-ratio of each feature over the cells.
+
+    Each column is divided by the exponential of its mean ``log1p`` value and
+    then ``log1p`` transformed, so ``counts`` must hold every cell of the
+    normalization. Integer counts are logged in float64; floating-point counts
+    keep their dtype. A ``ChunkedArray`` is reduced once and returned lazily.
+
+    Args:
+        counts: Counts with cells as rows and features as columns.
+
+    Returns:
+        CLR values with the shape of ``counts``.
+    """
+    # log1p of uint8 or uint16 counts is float16 or float32, whose sum over
+    # many cells overflows or loses precision. Integer counts are logged in
+    # float64, as 32- and 64-bit counts already were.
+    log_dtype = np.float64 if counts.dtype.kind in "iu" else None
+    scale = np.exp(np.log1p(counts, dtype=log_dtype).sum(axis=0) / len(counts))
+    # A ufunc of a ChunkedArray stays lazy, though NumPy types it as an array.
+    values: Any = np.log1p(counts / scale.reshape(1, -1))
+    return cast(T, values)
+
+
+def term_frequencies[T: (np.ndarray, ChunkedArray)](
+    counts: T,
+    term_totals: ArrayLike,
+) -> T:
+    """Return TF-IDF term frequencies: each row of counts over its total.
+
+    Args:
+        counts: Counts with documents (cells) as rows.
+        term_totals: Nonzero term-frequency denominator of each row.
+
+    Returns:
+        Term frequencies with the shape of ``counts``.
+    """
+    frequencies: Any = counts / np.asarray(term_totals).reshape(-1, 1)
+    return cast(T, frequencies)
+
+
+def inverse_document_frequency(
+    n_docs: int,
+    document_frequency: ArrayLike,
+) -> NDArray[np.float64]:
+    """Return the TF-IDF weight ``log2(1 + n_docs / (df + 1))`` of each feature.
+
+    Args:
+        n_docs: Number of documents (cells) the frequencies were counted over.
+        document_frequency: Number of those documents in which each feature
+            occurs.
+
+    Returns:
+        The float64 inverse document frequency of each feature.
+    """
+    frequency = np.asarray(document_frequency, dtype=np.float64)
+    return np.log2(1 + (n_docs / (frequency + 1)))
+
+
+def tfidf_values[T: (np.ndarray, ChunkedArray)](
+    counts: T,
+    term_totals: ArrayLike,
+    idf: ArrayLike,
+) -> T:
+    """Return TF-IDF values: term frequencies weighted by feature IDF.
+
+    Args:
+        counts: Counts with documents (cells) as rows and features as columns.
+        term_totals: Nonzero term-frequency denominator of each row.
+        idf: Inverse document frequency of each column, as returned by
+            ``inverse_document_frequency``.
+
+    Returns:
+        TF-IDF values with the shape of ``counts``.
+    """
+    weights = np.asarray(idf).reshape(1, -1)
+    values: Any = term_frequencies(counts, term_totals) * weights
+    return cast(T, values)
+
+
+def stream_document_frequency(
+    counts: ChunkedArray,
+    *,
+    memory_bytes: int,
+    nthreads: int,
+    msg: str,
+    operation: str,
+    resident_bytes: int = 0,
+    row_mask: np.ndarray | None = None,
+    term_totals: np.ndarray | None = None,
+) -> tuple[NDArray[np.int64], NDArray[np.float64] | None]:
+    """Count the rows in which each column of ``counts`` is nonzero.
+
+    This is the TF-IDF document frequency, counted in one pass over row
+    blocks. ``row_mask`` counts only the rows it selects. With
+    ``term_totals``, one denominator per counted row, the pass also sums each
+    column's term frequencies. Blocks hold at most the rows of one block of
+    ``counts`` and fewer when the pass would exceed ``memory_bytes`` beside
+    the ``resident_bytes`` that the caller keeps.
+
+    Args:
+        counts: Counts with documents (cells) as rows.
+        memory_bytes: Memory limit of the operation.
+        nthreads: Threads that read row blocks.
+        msg: Progress message.
+        operation: Name of the operation in errors.
+        resident_bytes: Bytes that the caller keeps during the pass.
+        row_mask: Optional boolean mask of the rows to count.
+        term_totals: Optional term-frequency denominators of the counted rows.
+
+    Returns:
+        The document frequency of each column and, with ``term_totals``, the
+        summed term frequency of each column.
+
+    Raises:
+        MemoryError: If one row does not fit the memory limit.
+    """
+    n_rows, n_columns = counts.shape
+    document_frequency = np.zeros(n_columns, dtype=np.int64)
+    term_frequency_sum = (
+        None if term_totals is None else np.zeros(n_columns, dtype=np.float64)
+    )
+    if n_rows == 0 or n_columns == 0:
+        return document_frequency, term_frequency_sum
+    column_bytes = n_columns * np.dtype(np.float64).itemsize
+    # The running counts and one column reduction per block stay resident.
+    static_bytes = int(resident_bytes) + document_frequency.nbytes + column_bytes
+    scratch_bytes_per_row = 0
+    if row_mask is not None:
+        static_bytes += row_mask.nbytes
+        # Each block's selected rows are copied.
+        scratch_bytes_per_row += n_columns * counts.dtype.itemsize
+    if term_totals is not None and term_frequency_sum is not None:
+        static_bytes += term_totals.nbytes + term_frequency_sum.nbytes + column_bytes
+        # Each block's term frequencies are computed in float64.
+        scratch_bytes_per_row += column_bytes
+    decode_bytes = counts._max_decode_bytes()
+    current_rows = min(int(counts.chunksize[0]), n_rows)
+    working_bytes_per_row = (
+        counts._block_owned_bytes() // current_rows + scratch_bytes_per_row
+    )
+    available_bytes = int(memory_bytes) - static_bytes - decode_bytes
+    if available_bytes < working_bytes_per_row:
+        required_bytes = static_bytes + decode_bytes + working_bytes_per_row
+        raise MemoryError(
+            f"{operation} needs about {required_bytes} bytes for one row, but "
+            f"the operation limit is {memory_bytes} bytes"
+        )
+    block_rows = min(current_rows, available_bytes // working_bytes_per_row)
+    row_offset = 0
+    for block in counts._with_block_size(block_rows)._stream_blocks(
+        nthreads=nthreads,
+        msg=msg,
+        prefetch=1,
+        row_mask=row_mask,
+        resident_bytes=static_bytes + block_rows * scratch_bytes_per_row,
+    ):
+        row_stop = row_offset + block.shape[0]
+        document_frequency += np.count_nonzero(block, axis=0)
+        if term_totals is not None and term_frequency_sum is not None:
+            term_frequency_sum += term_frequencies(
+                block, term_totals[row_offset:row_stop]
+            ).sum(axis=0)
+        row_offset = row_stop
+    expected_rows = n_rows if row_mask is None else int(np.count_nonzero(row_mask))
+    if row_offset != expected_rows:
+        raise RuntimeError(
+            f"{operation} streamed {row_offset} rows; expected {expected_rows}"
+        )
+    return document_frequency, term_frequency_sum
 
 
 def _library_size_scaled(assay: "Assay", counts: ChunkedArray) -> ChunkedArray:
@@ -138,7 +328,7 @@ def _library_size_scaled(assay: "Assay", counts: ChunkedArray) -> ChunkedArray:
     totals = assay.scalar.reshape(-1, 1)
     if counts.dtype.kind not in "iu":
         return assay.sf * counts / totals
-    scale = partial(_scale_count_rows, factor=assay.sf)
+    scale = partial(library_size_values, size_factor=assay.sf, dtype=np.float64)
     if isinstance(counts, ChunkedArray):
         return counts._binary(scale, totals, "left")
     return cast(ChunkedArray, scale(counts, totals))
@@ -206,14 +396,7 @@ def norm_clr(_: "Assay", counts: ChunkedArray) -> ChunkedArray:
 
     Returns: A chunked array (delayed matrix) containing normalized data.
     """
-    # log1p of uint8 or uint16 counts is float16 or float32, whose sum over
-    # many cells overflows or loses precision. Integer counts are logged in
-    # float64, as 32- and 64-bit counts already were.
-    log_dtype = np.float64 if counts.dtype.kind in "iu" else None
-    f = np.exp(
-        cast(NDArray[Any], np.log1p(counts, dtype=log_dtype).sum(axis=0)) / len(counts)
-    )
-    return cast(ChunkedArray, np.log1p(counts / f.reshape(1, -1)))
+    return clr_values(counts)
 
 
 norm_clr.artifact_identity = "scarf.assay.norm_clr:feature-axis"  # type: ignore[attr-defined]
@@ -234,10 +417,8 @@ def norm_tf_idf(assay: "Assay", counts: ChunkedArray) -> ChunkedArray:
         and assay.n_docs is not None
         and assay.n_docs_per_term is not None
     )
-    t_f = counts / assay.n_term_per_doc.reshape(-1, 1)
-    # TODO: Split TF and IDF functionality to make it similar to norml_lib and zscaling
-    idf = np.log2(1 + (assay.n_docs / (assay.n_docs_per_term + 1)))
-    return t_f * idf.reshape(1, -1)
+    idf = inverse_document_frequency(assay.n_docs, assay.n_docs_per_term)
+    return tfidf_values(counts, assay.n_term_per_doc, idf)
 
 
 norm_tf_idf.artifact_identity = (  # type: ignore[attr-defined]
@@ -248,7 +429,7 @@ norm_tf_idf.artifact_identity = (  # type: ignore[attr-defined]
 COUNT_ARITHMETIC: Literal["float64"] = "float64"
 
 type NormalizedValueSource = Literal[
-    "normed", "payload", "feature_batches", "feature_scores"
+    "normed", "payload", "feature_batches", "feature_scores", "feature_summary"
 ]
 
 
@@ -385,11 +566,13 @@ def _normalize_count_block(
     rows_per_batch = max(1, _NORMALIZATION_WORK_BYTES // bytes_per_row)
     for start in range(0, int(block.shape[0]), rows_per_batch):
         end = min(start + rows_per_batch, int(block.shape[0]))
-        work = scaleFactor * block[start:end]
-        work /= row_sum[start:end, np.newaxis]
-        if logTransform:
-            np.log1p(work, out=work)
-        normalized[start:end] = work
+        normalized[start:end] = library_size_values(
+            block[start:end],
+            row_sum[start:end],
+            scaleFactor,
+            dtype=block.dtype,
+            log_transform=logTransform,
+        )
     return normalized
 
 
@@ -540,12 +723,28 @@ def write_renorm_subset_to_zarr(
     if assay.rawDataT is not None and mirror is None:
         summary: tuple[np.ndarray, np.ndarray] | None = None
         summary_bytes = 2 * len(feat_idx) * np.dtype(np.float64).itemsize
-        writer_plan = plan_dense_write(
+        writer_resident = summary_bytes if stats_group is not None else 0
+        single_writer = plan_dense_write(
             output,
             resources,
             1,
             io=StorageIoPolicy(readWorkers=1, computeWorkers=1, writeWorkers=1),
-            residentBytes=summary_bytes if stats_group is not None else 0,
+            residentBytes=writer_resident,
+        )
+        # The producer holds only a few in-flight bands. Give the writer up to a
+        # quarter of the budget, never less than one writer, so output chunks
+        # encode and upload in parallel instead of stalling the ordered stream.
+        writer_memory = min(
+            resources.memoryBytes,
+            max(single_writer.reservedBytes, resources.memoryBytes // 4),
+        )
+        n_bands = -(-int(output.shape[0]) // array_shard_rows(output))
+        writer_plan = plan_dense_write(
+            output,
+            ResourceBudget(writer_memory, resources.workers),
+            n_bands,
+            io=assay.storageIo,
+            residentBytes=writer_resident,
         )
         producer_memory = resources.memoryBytes - writer_plan.reservedBytes
         if producer_memory < 1:

@@ -112,7 +112,15 @@ def _wnn_integration_many(
     *,
     l2_normalize: bool = True,
 ) -> tuple[coo_matrix, np.ndarray]:
-    """Build an N-modality WNN graph using Scarf's bounded candidate pool."""
+    """Build an N-modality WNN graph and per-cell modality weights.
+
+    Candidates are the union of each modality's self-free neighbour row. Each
+    modality turns distances into affinities with its own nearest and k-th
+    neighbour distances, and rows are L2-normalized during scoring by default.
+    This bounded pool and bandwidth differ from Seurat's wider search and
+    SNN-far bandwidth. The COO graph stores blended affinities as float32
+    edge weights, and the second array holds float32 modality weights.
+    """
     if not isinstance(l2_normalize, bool | np.bool_):
         raise TypeError("l2_normalize must be a boolean")
     if len(modalities) < 2:
@@ -293,39 +301,3 @@ def _wnn_integration_many(
         shape=(n_cells, n_cells),
     )
     return graph, modality_weights
-
-
-def wnn_integration(
-    name1: str,
-    indices1: np.ndarray,
-    ld1: np.ndarray,
-    name2: str,
-    indices2: np.ndarray,
-    ld2: np.ndarray,
-    nthreads: int,
-    *,
-    l2_normalize: bool = True,
-) -> tuple[coo_matrix, np.ndarray]:
-    """Build a two-modality WNN graph and per-cell modality weights.
-
-    Candidates are the union of two self-free neighbour-index rows. Each
-    modality uses its own nearest and k-th-neighbour distances to convert
-    distances into affinities. Rows are L2-normalized during scoring by default.
-    The returned COO graph stores blended affinity as float32 edge weights, and
-    the second array stores two float32 modality weights per cell.
-
-    This bounded candidate pool and simple bandwidth differ from Seurat's
-    default wider search and SNN-far bandwidth. This adapter is the
-    two-modality special case of Scarf's private N-modality implementation.
-    """
-    private_names = (
-        (name1, name2) if name1 != name2 else (f"{name1} [first]", f"{name2} [second]")
-    )
-    return _wnn_integration_many(
-        [
-            (private_names[0], indices1, ld1),
-            (private_names[1], indices2, ld2),
-        ],
-        nthreads,
-        l2_normalize=l2_normalize,
-    )

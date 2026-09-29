@@ -1,6 +1,5 @@
 """Bounded, objective-led comparisons of metadata on independent study units."""
 
-import hashlib
 import json
 import re
 from collections.abc import Sequence
@@ -10,8 +9,10 @@ import numpy as np
 import pandas as pd
 
 from ...metrics.association import association_pair, coefficient_estimability
+from ...quality_control.filtering import validated_sample_labels
+from ...utils.logging import logger
 from .. import record_io
-from .characterization import _json_scalar, _paired_coverage
+from .characterization import _json_scalar, _ordered_group_values, _paired_coverage
 from .contracts import (
     CaptureProposal,
     CovariateCharacterization,
@@ -52,9 +53,7 @@ def _tuple_labels(arrays: Sequence[np.ndarray]) -> np.ndarray:
 
 
 def _proposal_key(proposal: CovariateProposal) -> str:
-    return hashlib.sha256(
-        record_io.canonical_json_bytes(proposal.model_dump(exclude={"rationale"}))
-    ).hexdigest()
+    return record_io.sha256_json(proposal.model_dump(exclude={"rationale"}))
 
 
 def _association(
@@ -135,7 +134,7 @@ def _descriptive_design(
                 design,
                 coefficient=name,
                 pair_by=independent,
-                group_order=list(design[name].unique()),
+                group_order=_ordered_group_values(design[name]),
             )
     if categorical:
         groups = design.groupby(categorical, sort=False, observed=True)
@@ -391,18 +390,25 @@ def compare_covariates(
             for name in proposal.explanatoryColumns
         ):
             reasons.append("protectedCombinationsMustBeCategoricalBiology")
-    evidence_id = (
-        "designComparison:"
-        + hashlib.sha256(
-            record_io.canonical_json_bytes(
-                {
-                    "selection": selection_identity,
-                    "proposal": proposal.model_dump(),
-                    "evidence": evidence,
-                    "reasons": reasons,
-                }
-            )
-        ).hexdigest()
+    return _comparison_record(
+        proposal, evidence, reasons, selection_identity=selection_identity
+    )
+
+
+def _comparison_record(
+    proposal: CovariateProposal,
+    evidence: dict[str, Any],
+    reasons: list[str],
+    *,
+    selection_identity: dict[str, Any],
+) -> CovariateComparison:
+    evidence_id = "designComparison:" + record_io.sha256_json(
+        {
+            "selection": selection_identity,
+            "proposal": proposal.model_dump(),
+            "evidence": evidence,
+            "reasons": reasons,
+        }
     )
     return CovariateComparison(
         proposal=proposal,
@@ -479,12 +485,25 @@ def evaluate_proposals(
         if key not in previous:
             if prior is not None:
                 deps.comparisons.remove(prior)
-            comparison = compare_covariates(
-                deps.cells,
-                characterization,
-                proposal,
-                selection_identity=deps.cellSelection.to_dict(),
-            )
+            selection_identity = deps.cellSelection.to_dict()
+            try:
+                comparison = compare_covariates(
+                    deps.cells,
+                    characterization,
+                    proposal,
+                    selection_identity=selection_identity,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning(
+                    "Experimental Context could not measure a proposed comparison: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                comparison = _comparison_record(
+                    proposal,
+                    {"error": f"{type(exc).__name__}: {exc}"},
+                    ["comparisonCouldNotBeMeasured"],
+                    selection_identity=selection_identity,
+                )
             deps.comparisons.append(comparison)
             previous[key] = comparison
     deps.protectedCombinations = []
@@ -568,7 +587,14 @@ def accept_capture_proposal(
     )
 
     proposed_deps = deps.model_copy(update={"captureProposal": proposal})
-    _directed_capture_source(proposed_deps)
+    capture = _directed_capture_source(proposed_deps)
+    assert capture is not None
+    capture_labels = capture[2]
+    validated_sample_labels(
+        capture_labels,
+        np.ones(len(capture_labels), dtype=bool),
+        label_name="physical capture labels",
+    )
     _directed_pooled_reference_captures(proposed_deps)
     deps.captureProposal = proposal
     characterization.captureProvenance = proposal

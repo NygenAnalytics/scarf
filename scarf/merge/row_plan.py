@@ -28,7 +28,6 @@ class RowPlan:
 @dataclass(frozen=True, slots=True)
 class RowPlanSegment:
     sourceIdx: int
-    blockIdx: int
     destStart: int
     localRows: np.ndarray
 
@@ -122,7 +121,6 @@ def iter_row_plan_segments(
             for offset in range(0, local_rows.size, width):
                 yield RowPlanSegment(
                     sourceIdx=source_idx,
-                    blockIdx=block_idx,
                     destStart=dest_start + offset,
                     localRows=local_rows[offset : offset + width],
                 )
@@ -130,6 +128,14 @@ def iter_row_plan_segments(
 
     if dest_start != row_plan.nCells:
         raise AssertionError("Merged row plan does not cover every planned cell")
+
+
+def prefixed_cell_ids(name: str, source_ids: np.ndarray, dtype: Any) -> np.ndarray:
+    """Return source cell IDs prefixed with ``{name}__`` in the merged dtype."""
+    merged = np.empty(source_ids.size, dtype=np.dtype(dtype))
+    for index, value in enumerate(source_ids):
+        merged[index] = f"{name}__{value}"
+    return merged
 
 
 def iter_merged_cell_ids(
@@ -154,10 +160,7 @@ def iter_merged_cell_ids(
             "ids",
             segment.localRows,
         )
-        name = row_plan.sourceNames[source_idx]
-        merged = np.empty(source_ids.size, dtype=np.dtype(dtype))
-        for index, value in enumerate(source_ids):
-            merged[index] = f"{name}__{value}"
+        merged = prefixed_cell_ids(row_plan.sourceNames[source_idx], source_ids, dtype)
         del source_ids
         yield segment.destStart, merged
 

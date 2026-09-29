@@ -158,6 +158,7 @@ nitpick_ignore = [
     ("py:class", "scarf.metadata.selection.NamedCellArtifact"),
     ("py:class", "scarf.datastore.mapping_datastore.MappingDatastore"),
     ("py:obj", "numpy.typing.DTypeLike"),
+    ("py:obj", "numpy.typing.NDArray"),
     ("py:data", "typing.Any"),
     ("py:data", "typing.Literal"),
     ("py:data", "typing.Optional"),

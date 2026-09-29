@@ -21,7 +21,7 @@ from zarr.storage import (
     WrapperStore,
 )
 
-from .artifacts import require_complete_artifact
+from .artifacts import parse_artifact_ref, require_complete_artifact
 from .refs import ArtifactRef
 from .types import as_zarr_group
 
@@ -245,13 +245,6 @@ def _json_mapping(value: Any, name: str) -> dict[str, Any]:
     return result
 
 
-def _artifact_ref(value: Any, name: str) -> ArtifactRef:
-    try:
-        return ArtifactRef.from_dict(_mapping(value, name))
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} is not a valid ArtifactRef") from exc
-
-
 def _raise_type(message: str) -> Any:
     raise TypeError(message)
 
@@ -367,7 +360,7 @@ class PipelineOutputRecord:
         raw = _exact_mapping(value, _OUTPUT_FIELDS, "pipeline output")
         return cls(
             key=_validate_non_empty_string(raw["key"], "output key"),
-            artifact=_artifact_ref(raw["artifact"], "output artifact"),
+            artifact=parse_artifact_ref(raw["artifact"], "output artifact"),
         )
 
 
@@ -395,7 +388,7 @@ class PipelineStageOutputRecord:
         raw = _exact_mapping(value, _STAGE_OUTPUT_FIELDS, "pipeline stage output")
         return cls(
             output_key=_validate_non_empty_string(raw["outputKey"], "output key"),
-            artifact=_artifact_ref(raw["artifact"], "stage output artifact"),
+            artifact=parse_artifact_ref(raw["artifact"], "stage output artifact"),
             reused=_validate_bool(raw["reused"], "stage output reused"),
         )
 
@@ -428,7 +421,7 @@ class PipelinePlanRecord:
             raise ValueError(f"Invalid artifact plan disposition: {disposition!r}")
         return cls(
             operation=_validate_non_empty_string(raw["operation"], "plan operation"),
-            ref=_artifact_ref(raw["ref"], "plan ref"),
+            ref=parse_artifact_ref(raw["ref"], "plan ref"),
             disposition=disposition,
         )
 
@@ -603,7 +596,7 @@ class PipelineFieldDescriptor:
         return cls(
             key=_validate_non_empty_string(raw["key"], "field key"),
             axis=axis,
-            artifact=_artifact_ref(raw["artifact"], "field artifact"),
+            artifact=parse_artifact_ref(raw["artifact"], "field artifact"),
             source_value=_validate_non_empty_string(
                 raw["sourceValue"],
                 "field sourceValue",
@@ -972,6 +965,17 @@ def _read_attrs(group: zarr.Group) -> dict[str, Any]:
     return {str(key): value for key, value in group.attrs.items()}
 
 
+def _finish_time(started_at_ns: int, finished_at_ns: int | None) -> int:
+    """Return an explicit finish time, or now, never before the start.
+
+    The wall clock can step backwards while a run executes; an automatic
+    finish time is held at the start time so the terminal record stays valid.
+    """
+    if finished_at_ns is not None:
+        return finished_at_ns
+    return max(time.time_ns(), started_at_ns)
+
+
 def _write_terminal_attrs(group: zarr.Group, value: Mapping[str, Any]) -> None:
     """Commit a terminal record with complete as the final write."""
 
@@ -1057,6 +1061,17 @@ def _group_store_prefix(root: zarr.Group) -> str:
     return f"{path}/" if path else ""
 
 
+def _require_label_claim_container(node: Any, *, location: str = "") -> None:
+    """Reject a label-claim container that is not a zero-length uint8 array."""
+    if (
+        not isinstance(node, zarr.Array)
+        or tuple(node.shape) != (0,)
+        or node.dtype != "uint8"
+    ):
+        suffix = f": {location}" if location else ""
+        raise ValueError(f"Pipeline label claim container is incompatible{suffix}")
+
+
 def _pipeline_label_claim_namespaces(root: zarr.Group) -> tuple[str, ...]:
     namespaces: list[str] = []
 
@@ -1066,15 +1081,7 @@ def _pipeline_label_claim_namespaces(root: zarr.Group) -> tuple[str, ...]:
             if isinstance(pipeline, zarr.Group) and "runs" in pipeline:
                 runs = pipeline["runs"]
                 if isinstance(runs, zarr.Group) and _PIPELINE_LABEL_CLAIMS_NAME in runs:
-                    container = runs[_PIPELINE_LABEL_CLAIMS_NAME]
-                    if (
-                        not isinstance(container, zarr.Array)
-                        or tuple(container.shape) != (0,)
-                        or container.dtype != "uint8"
-                    ):
-                        raise ValueError(
-                            "Pipeline label claim container is incompatible"
-                        )
+                    _require_label_claim_container(runs[_PIPELINE_LABEL_CLAIMS_NAME])
                     namespace = f"{relative_path}/{_PIPELINE_LABEL_CLAIMS_PATH}"
                     namespaces.append(namespace.lstrip("/"))
         for name in group.group_keys():
@@ -1135,22 +1142,22 @@ def _validate_pipeline_label_claim_container(root: zarr.Group) -> None:
         return
     if _PIPELINE_LABEL_CLAIMS_NAME not in runs:
         return
-    container = runs[_PIPELINE_LABEL_CLAIMS_NAME]
-    if (
-        not isinstance(container, zarr.Array)
-        or tuple(container.shape) != (0,)
-        or container.dtype != "uint8"
-    ):
-        raise ValueError("Pipeline label claim container is incompatible")
+    _require_label_claim_container(runs[_PIPELINE_LABEL_CLAIMS_NAME])
+
+
+def _parse_label_claim(stored: Buffer) -> tuple[str, str]:
+    """Return the ``(label, runId)`` of a stored claim or raise if malformed."""
+    value = json.loads(stored.to_bytes().decode("utf-8"))
+    raw = _exact_mapping(value, _LABEL_CLAIM_FIELDS, "pipeline label claim")
+    label = _validate_non_empty_string(raw["label"], "claim label")
+    run_id = _validate_non_empty_string(raw["runId"], "claim runId")
+    _validate_run_id(run_id)
+    return label, run_id
 
 
 def _decode_pipeline_label_claim(stored: Buffer, label: str) -> str:
     try:
-        value = json.loads(stored.to_bytes().decode("utf-8"))
-        raw = _exact_mapping(value, _LABEL_CLAIM_FIELDS, "pipeline label claim")
-        stored_label = _validate_non_empty_string(raw["label"], "claim label")
-        run_id = _validate_non_empty_string(raw["runId"], "claim runId")
-        _validate_run_id(run_id)
+        stored_label, run_id = _parse_label_claim(stored)
     except (TypeError, ValueError) as exc:
         raise ValueError(
             f"Pipeline label {label!r} has an invalid durable claim"
@@ -1249,14 +1256,7 @@ def _copy_pipeline_label_claims(
             raise ValueError(
                 f"Pipeline label claim container is missing: {namespace}"
             ) from error
-        if (
-            not isinstance(destination_container, zarr.Array)
-            or tuple(destination_container.shape) != (0,)
-            or destination_container.dtype != "uint8"
-        ):
-            raise ValueError(
-                f"Pipeline label claim container is incompatible: {namespace}"
-            )
+        _require_label_claim_container(destination_container, location=namespace)
         claim_prefix = f"{namespace}/"
         source_claim_prefix = f"{source_prefix}{claim_prefix}"
         claim_keys = sorted(
@@ -1281,11 +1281,7 @@ def _copy_pipeline_label_claims(
                     f"Pipeline label claim disappeared during copy: {relative}"
                 )
             try:
-                value = json.loads(stored.to_bytes().decode("utf-8"))
-                raw = _exact_mapping(value, _LABEL_CLAIM_FIELDS, "pipeline label claim")
-                label = _validate_non_empty_string(raw["label"], "claim label")
-                run_id = _validate_non_empty_string(raw["runId"], "claim runId")
-                _validate_run_id(run_id)
+                label, _run_id = _parse_label_claim(stored)
             except (TypeError, ValueError) as error:
                 raise ValueError(
                     f"Pipeline label claim is invalid: {relative}"
@@ -1378,7 +1374,11 @@ def start_pipeline_stage_record(
         f"{pipeline_run_path(run_id)}/stages",
         "Pipeline stages",
     )
-    stages.create_group(str(ordinal)).attrs.put(record.to_dict())
+    try:
+        # One metadata write creates the stage with its record.
+        stages.create_group(str(ordinal), attributes=record.to_dict())
+    except (ContainsArrayError, ContainsGroupError) as exc:
+        raise FileExistsError(f"Pipeline stage {ordinal} already exists") from exc
     return record
 
 
@@ -1433,7 +1433,7 @@ def finish_pipeline_stage_record(
         stage=current.stage,
         ordinal=current.ordinal,
         started_at_ns=current.started_at_ns,
-        finished_at_ns=time.time_ns() if finished_at_ns is None else finished_at_ns,
+        finished_at_ns=_finish_time(current.started_at_ns, finished_at_ns),
         status=status,
         complete=True,
         outputs=resolved_outputs,
@@ -1512,7 +1512,7 @@ def complete_pipeline_run_record(
     record = replace(
         run,
         label=run.requested_label,
-        finished_at_ns=time.time_ns() if finished_at_ns is None else finished_at_ns,
+        finished_at_ns=_finish_time(run.started_at_ns, finished_at_ns),
         status="completed",
         complete=True,
         outputs=resolved_outputs,
@@ -1545,7 +1545,7 @@ def fail_pipeline_run_record(
     record = replace(
         run,
         label=None,
-        finished_at_ns=time.time_ns() if finished_at_ns is None else finished_at_ns,
+        finished_at_ns=_finish_time(run.started_at_ns, finished_at_ns),
         status="failed",
         complete=True,
         outputs=(),
@@ -1573,7 +1573,7 @@ def interrupt_pipeline_run_record(
     record = replace(
         run,
         label=None,
-        finished_at_ns=time.time_ns() if finished_at_ns is None else finished_at_ns,
+        finished_at_ns=_finish_time(run.started_at_ns, finished_at_ns),
         status="interrupted",
         complete=True,
         outputs=(),

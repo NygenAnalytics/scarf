@@ -36,7 +36,8 @@ from scarf.agent.experimental_context.contracts import (
     ExperimentalContextDependencies,
 )
 from scarf.agent.experimental_context.study import build_study_contract
-from scarf.agent.parameter_tuning import diagnostics, execution
+from scarf.agent.parameter_tuning import diagnostics
+from scarf.metadata.rows import metadata_column_fingerprint
 from scarf.storage.refs import ArtifactRef
 
 
@@ -47,6 +48,9 @@ class _Cells:
 
     def fetch(self, column: str) -> np.ndarray:
         return self.frame[column].to_numpy()
+
+    def artifact_source(self, _column: str) -> None:
+        return None
 
 
 def _design() -> tuple[_Cells, CovariateCharacterization]:
@@ -416,6 +420,9 @@ def test_design_tool_schema_and_retry_correct_proposals_before_computation(
         return batch_safety(*args, **kwargs)
 
     monkeypatch.setattr(tools, "characterize_covariates", characterize)
+    monkeypatch.setattr(
+        tools, "metadata_column_fingerprint", lambda _metadata, column: column
+    )
     monkeypatch.setattr(tools, "_offered_qc_profiles", lambda *_args: [])
     monkeypatch.setattr(tools, "_batch_safety_evidence", record_batch_safety)
     requests = 0
@@ -492,6 +499,86 @@ def test_design_tool_schema_and_retry_correct_proposals_before_computation(
     assert deps.comparisons[0].proposal == _proposal()
 
 
+def _typed_group_design(
+    values: list[object],
+) -> tuple[_Cells, CovariateCharacterization]:
+    frame = pd.DataFrame(
+        {
+            "sample": [f"s{i}" for i in range(8)],
+            "donor": [f"d{i // 2}" for i in range(8)],
+            "group": values,
+            "condition": ["a", "b"] * 4,
+        }
+    )
+    cells = _Cells(frame.loc[frame.index.repeat(3)].reset_index(drop=True))
+    characterization = CovariateCharacterization(
+        status="done",
+        columns=[
+            {"name": "sample", "kind": "categorical", "domain": "design"},
+            {"name": "donor", "kind": "categorical", "domain": "design"},
+            {"name": "group", "kind": "categorical", "domain": "biological"},
+            {"name": "condition", "kind": "categorical", "domain": "biological"},
+        ],
+    )
+    return cells, characterization
+
+
+@pytest.mark.parametrize(
+    ("values", "labels"),
+    [
+        ([0, 7, 7, 0] * 2, [0, 7]),
+        ([True, False, False, True] * 2, [True, False]),
+    ],
+)
+def test_integer_and_boolean_groups_are_compared_like_string_labels(
+    values: list[object], labels: list[object]
+) -> None:
+    proposal = CovariateProposal(
+        response="condition",
+        explanatoryColumns=["group"],
+        observationUnit="sample",
+        independentUnit="donor",
+        rationale="Group coverage across donors.",
+    )
+    typed = compare_covariates(
+        *_typed_group_design(values), proposal, selection_identity={}
+    )
+    text = compare_covariates(
+        *_typed_group_design([str(value) for value in values]),
+        proposal,
+        selection_identity={},
+    )
+
+    assert (typed.status, typed.reasons) == (text.status, text.reasons)
+    coverage = typed.model_dump(mode="json")["evidence"]["descriptiveDesign"][
+        "pairedCoverage"
+    ]["group"]
+    assert coverage["requiredGroups"] == labels
+    assert coverage["design"] == "paired"
+
+
+def test_unmeasurable_proposal_is_recorded_as_unsupported_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scarf.agent.experimental_context import comparisons
+
+    cells, characterization = _design()
+    deps = _deps(cells)
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise TypeError("labels are not JSON scalars")
+
+    monkeypatch.setattr(comparisons, "compare_covariates", fail)
+    evaluate_proposals(deps, characterization, [_proposal()])
+
+    assert deps.designRounds == 1
+    [comparison] = deps.comparisons
+    assert comparison.status == "unsupported"
+    assert comparison.reasons == ["comparisonCouldNotBeMeasured"]
+    assert "labels are not JSON scalars" in comparison.evidence["error"]
+    assert comparison.evidenceId.startswith("designComparison:")
+
+
 def test_combinations_preserve_typed_values_and_reject_missing() -> None:
     cells = _Cells(
         pd.DataFrame({"a": ["x,y", "x", 1, "1"], "b": ["z", "y,z", "a", "a"]})
@@ -556,6 +643,7 @@ def test_qc_retention_checks_joint_groups_beside_marginal_groups() -> None:
     characterization.coefficients = [{"name": "treatment"}, {"name": "time"}]
     deps = _deps(cells)
     deps.protectedCombinations = [["treatment", "time"]]
+    deps.qcDesignData = qc_evidence._QcDesignData(cells)
     keep = ~((cells.fetch("treatment") == "a") & (cells.fetch("time") == "early"))
     mito = np.where(keep, np.linspace(1, 3, len(keep)), 80.0)
     projection = project_registered_qc_profile(
@@ -749,11 +837,11 @@ def test_metric_fingerprint_changes_when_only_missing_mask_changes() -> None:
         default_block_rows=lambda _column: 2,
         _get_missing_mask_array=lambda _column: missing,
     )
-    first = execution._metadata_column_fingerprint(metadata, "age")
+    first = metadata_column_fingerprint(metadata, "age")
     missing[1] = True
-    assert execution._metadata_column_fingerprint(metadata, "age") != first
+    assert metadata_column_fingerprint(metadata, "age") != first
     missing[1] = False
-    assert execution._metadata_column_fingerprint(metadata, "age") == first
+    assert metadata_column_fingerprint(metadata, "age") == first
 
 
 def test_single_cluster_keeps_diagnostics_without_running_marker_contrasts(

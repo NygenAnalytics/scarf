@@ -4,17 +4,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from ..storage.refs import ArtifactRef
+from ..utils.arrays import read_only_copy
 
 if TYPE_CHECKING:
     from .reference import MappingReference
-
-
-def _immutable_array(values: np.ndarray) -> np.ndarray:
-    """Own one C-contiguous array through an immutable bytes buffer."""
-    array = np.ascontiguousarray(np.asarray(values))
-    return np.frombuffer(array.tobytes(order="C"), dtype=array.dtype).reshape(
-        array.shape
-    )
 
 
 @dataclass(frozen=True)
@@ -50,10 +43,10 @@ class ScaledPCAProjectionModel:
                 raise ValueError(
                     "Reference projection model contains non-finite values"
                 )
-        object.__setattr__(self, "feature_means", _immutable_array(feature_means))
-        object.__setattr__(self, "feature_scales", _immutable_array(feature_scales))
-        object.__setattr__(self, "center", _immutable_array(center))
-        object.__setattr__(self, "loadings", _immutable_array(loadings))
+        object.__setattr__(self, "feature_means", read_only_copy(feature_means))
+        object.__setattr__(self, "feature_scales", read_only_copy(feature_scales))
+        object.__setattr__(self, "center", read_only_copy(center))
+        object.__setattr__(self, "loadings", read_only_copy(loadings))
 
     @property
     def n_features(self) -> int:
@@ -101,15 +94,15 @@ class SymphonyCorrectionModel:
         ):
             if not np.all(np.isfinite(values)):
                 raise ValueError("Symphony correction model contains non-finite values")
-        object.__setattr__(self, "centroids", _immutable_array(centroids))
-        object.__setattr__(self, "raw_centroids", _immutable_array(raw_centroids))
+        object.__setattr__(self, "centroids", read_only_copy(centroids))
+        object.__setattr__(self, "raw_centroids", read_only_copy(raw_centroids))
         object.__setattr__(
             self,
             "corrected_centroids",
-            _immutable_array(corrected_centroids),
+            read_only_copy(corrected_centroids),
         )
-        object.__setattr__(self, "cluster_mass", _immutable_array(cluster_mass))
-        object.__setattr__(self, "sigma", _immutable_array(sigma))
+        object.__setattr__(self, "cluster_mass", read_only_copy(cluster_mass))
+        object.__setattr__(self, "sigma", read_only_copy(sigma))
 
     @property
     def n_dims(self) -> int:
@@ -136,8 +129,8 @@ class QueryCorrection:
             raise ValueError("Batch counts must match batch offsets")
         if not np.all(np.isfinite(batch_offsets)):
             raise ValueError("Batch offsets contain non-finite values")
-        object.__setattr__(self, "batch_offsets", _immutable_array(batch_offsets))
-        object.__setattr__(self, "batch_counts", _immutable_array(batch_counts))
+        object.__setattr__(self, "batch_offsets", read_only_copy(batch_offsets))
+        object.__setattr__(self, "batch_counts", read_only_copy(batch_counts))
 
 
 @dataclass(frozen=True, slots=True)

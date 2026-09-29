@@ -248,7 +248,7 @@ def test_plain_mapping_reference_packages_and_loads_existing_chain(
         np.asarray(datastore.cells.fetch_all("ids"))[selected_cells],
     )
     np.testing.assert_array_equal(
-        reference.fetch_layout(planned_layout.ref),
+        reference._fetch_layout(planned_layout.ref),
         expected_layout,
     )
 
@@ -310,6 +310,96 @@ def test_symphony_mapping_reference_has_conditional_state_and_read_only_reload(
         loaded.symphony_state.corrected_centroids,
         reference.symphony_state.corrected_centroids,
     )
+
+
+def test_symphony_mapping_reference_requires_recorded_batch_levels(
+    analyzed_datastore_ephemeral,
+):
+    datastore = analyzed_datastore_ephemeral
+    neighbors = _symphony_neighbors(datastore)
+    correction = ArtifactRef.from_dict(
+        datastore.inspect_artifact(neighbors).inputs["coordinates"]
+    )
+    del artifact_group(datastore.zw, correction).attrs["batch_levels"]
+
+    with pytest.raises(ValueError, match="Re-run run_harmony"):
+        datastore.build_mapping_reference(neighbors)
+
+
+def test_symphony_mapping_reference_load_rejects_each_tampered_record(
+    analyzed_datastore_ephemeral,
+):
+    from scarf.mapping.artifact import load_artifact_mapping_reference
+
+    datastore = analyzed_datastore_ephemeral
+    reference = datastore.get_mapping_reference(
+        datastore.build_mapping_reference(_symphony_neighbors(datastore))
+    )
+    group = artifact_group(datastore.zw, reference.ref)
+    correction = artifact_group(datastore.zw, reference.batch_correction)
+    original = correction.attrs["provenance"]
+    for section, key, value, message in (
+        (None, "operation", "run_scanorama", "correction is not Harmony"),
+        ("inputs", "reduction", reference.feature_selection.to_dict(), "different PCA"),
+    ):
+        provenance = dict(original)
+        if section is None:
+            provenance[key] = value
+        else:
+            provenance[section] = dict(provenance[section]) | {key: value}
+        correction.attrs["provenance"] = provenance
+        with pytest.raises(ValueError, match=message):
+            load_artifact_mapping_reference(datastore, reference.ref)
+        correction.attrs["provenance"] = original
+
+    for name, index, value, message in (
+        ("sigma", 0, 0.0, "Symphony correction model is invalid"),
+        ("centroids", (0, 0), None, "Symphony model changed from its input"),
+    ):
+        array = group[name]
+        stored = array[index]
+        array[index] = stored + 1.0 if value is None else value
+        with pytest.raises(ValueError, match=message):
+            load_artifact_mapping_reference(datastore, reference.ref)
+        array[index] = stored
+
+    metadata = dict(group.attrs["reference_metadata"])
+    group.attrs["reference_metadata"] = metadata | {"batch_columns": ["other"]}
+    with pytest.raises(ValueError, match="Symphony metadata does not match"):
+        load_artifact_mapping_reference(datastore, reference.ref)
+    group.attrs["reference_metadata"] = metadata
+    assert load_artifact_mapping_reference(datastore, reference.ref).ref == (
+        reference.ref
+    )
+
+    data = correction["data"]
+    data.resize((data.shape[0], data.shape[1] + 1))
+    with pytest.raises(ValueError, match="Harmony coordinates do not match"):
+        load_artifact_mapping_reference(datastore, reference.ref)
+
+
+@pytest.mark.parametrize("missing", ["batch_levels", "batch_columns"])
+def test_symphony_mapping_reference_load_requires_recorded_batch_metadata(
+    analyzed_datastore_ephemeral,
+    missing,
+):
+    datastore = analyzed_datastore_ephemeral
+    neighbors = _symphony_neighbors(datastore)
+    reference_ref = datastore.build_mapping_reference(neighbors)
+    correction = ArtifactRef.from_dict(
+        datastore.inspect_artifact(neighbors).inputs["coordinates"]
+    )
+    group = artifact_group(datastore.zw, correction)
+    if missing == "batch_levels":
+        del group.attrs["batch_levels"]
+    else:
+        provenance = dict(group.attrs["provenance"])
+        parameters = dict(provenance["parameters"])
+        del parameters["batch_columns"]
+        group.attrs["provenance"] = {**provenance, "parameters": parameters}
+
+    with pytest.raises(ValueError, match="Re-run run_harmony"):
+        datastore.get_mapping_reference(reference_ref)
 
 
 def test_loaded_mapping_reference_is_deeply_immutable(
@@ -570,8 +660,8 @@ def test_mapping_reference_validates_payload_before_finish(
         )
         - before
     )
-    assert len(created) == 1
-    assert not datastore.inspect_artifact(created.pop()).complete
+    # A failed write deletes its incomplete slot.
+    assert created == set()
 
 
 @pytest.mark.parametrize("array_name", ["loadings", "center"])
@@ -616,8 +706,8 @@ def test_mapping_reference_rejects_source_mutation_during_publication(
         )
         - before
     )
-    assert len(created) == 1
-    assert not datastore.inspect_artifact(created.pop()).complete
+    # A failed write deletes its incomplete slot.
+    assert created == set()
 
 
 def test_mapping_reference_rejects_corrupt_neighbor_payload_on_build_and_load(

@@ -19,7 +19,6 @@ from scarf.writers import (
     CrToZarr,
     H5adImportResult,
     H5adToZarr,
-    LoomToZarr,
     MtxToZarr,
     SeuratImportResult,
     SeuratToZarr,
@@ -35,10 +34,6 @@ _PUBLIC_CLASS_METHODS = {
         "dump",
     ),
     H5adToZarr: (
-        "__init__",
-        "dump",
-    ),
-    LoomToZarr: (
         "__init__",
         "dump",
     ),
@@ -60,11 +55,10 @@ _PUBLIC_CLASS_METHODS = {
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    CrToZarr: "7b24b552fb00d9624015641a4b9d5bfa715288afcd9943e80601402ec622e37d",
-    H5adToZarr: "150858bef35ec818c6c9170fb5566a9592c457e12d3d5b6f7eff760f42f24ec9",
-    LoomToZarr: "49707df259ee16c345fdb533866697da4dd1830638425a39e1ca0f4d24072fcf",
-    SparseToZarr: "a535ea51f1b26618f234d248af1e7e6900ba6f50a7aa14223079d95a8e0b68bb",
-    CSVtoZarr: "d2904c1662d71f2822ccd0b373d624eddd28938bf99bb4294c6f3badc72eb224",
+    CrToZarr: "04123fcfad28e763a0966995c9333af5066971c02606f1783c4187d2868b2d7e",
+    H5adToZarr: "11ef319e746a2750d99d04d778a2c4cc2de9092d44fae2d9b203ec5e747a1d11",
+    SparseToZarr: "00afca68257558e160963a98961cca0cc6f13977effbfc15a59fa863e3ec7090",
+    CSVtoZarr: "4e0eeed1aaa26742cfb3097c396c9e27598cfe4f8335054e92f868e146af87fb",
     SubsetZarr: "336779f81466725dacedd61a10ed267ab6514fff8ef4773efb49936ceff92e6d",
     SeuratToZarr: "f004e56b22727b4d229824a37b8b877655a650c8b4bab235693a4449acaf7111",
 }
@@ -96,7 +90,6 @@ def test_writers_facade_surface_is_stable():
         "MtxToZarr",
         "H5adImportResult",
         "H5adToZarr",
-        "LoomToZarr",
         "SeuratImportResult",
         "SeuratToZarr",
         "SparseToZarr",
@@ -104,15 +97,18 @@ def test_writers_facade_surface_is_stable():
         "to_mtx",
         "CSVtoZarr",
     ]
-    expected = set(writers_module.__all__) | {
+    expected = set(writers_module.__all__)
+    assert expected.issubset(dir(writers_module))
+    assert all(getattr(writers_module, name) is not None for name in expected)
+    for removed in (
+        "sparse_writer",
         "bed_to_sparse_array",
         "create_cell_data",
         "load_count_store",
         "load_zarr",
-    }
-    assert expected.issubset(dir(writers_module))
-    assert all(getattr(writers_module, name) is not None for name in expected)
-    assert not hasattr(writers_module, "sparse_writer")
+        "LoomToZarr",
+    ):
+        assert not hasattr(writers_module, removed)
     assert MtxToZarr is CrToZarr
 
 
@@ -147,7 +143,7 @@ def test_writer_public_metadata_remains_on_facade():
 
 def test_writer_static_method_contracts_are_stable():
     for cls, names in {
-        CrToZarr: ("_prep_assay_input_ranges", "_prep_feat_index_offset"),
+        CrToZarr: ("_prep_feat_index_offset",),
         SubsetZarr: ("_check_assays",),
     }.items():
         for name in names:
@@ -167,7 +163,6 @@ def test_writer_storage_wrappers_remain_distinct_objects(
         writers_module.create_zarr_count_assay
         is not storage_schema.create_zarr_count_assay
     )
-    assert writers_module.create_cell_data is not storage_schema.create_cell_data
     assert writers_module.chunked_to_zarr is not storage_materialize.chunked_to_zarr
     assert (
         writers_module.write_renorm_subset_to_zarr
@@ -276,11 +271,6 @@ def test_conversion_writers_reject_summary_before_truncating_destination():
             zarr_loc=store,
             assay_name="summary",
         ),
-        "loom": lambda store: LoomToZarr(
-            object(),
-            zarr_loc=store,
-            assay_name="summary",
-        ),
         "sparse": lambda store: SparseToZarr(
             csr_matrix((1, 1), dtype=np.uint32),
             zarr_loc=store,
@@ -340,7 +330,6 @@ writer_formats = {
     "scarf.writers.cellranger",
     "scarf.writers.csv",
     "scarf.writers.h5ad",
-    "scarf.writers.loom",
     "scarf.writers.sparse",
     "scarf.writers.subset",
     "scarf.writers.seurat",
@@ -349,7 +338,6 @@ reader_formats = {
     "scarf.readers.cellranger",
     "scarf.readers.csv",
     "scarf.readers.h5ad",
-    "scarf.readers.loom",
     "scarf.readers.seurat",
 }
 assert not {

@@ -474,6 +474,20 @@ def test_screening_that_uses_all_cells_is_not_labeled_as_a_sample() -> None:
     assert "Screening sample" not in document
 
 
+def test_model_usage_counts_every_request_including_failures() -> None:
+    payload = scientific_summary(snapshot()) | display_payload()
+    payload["modelUsage"] = {
+        "invocations": 1,
+        "failedInvocations": 1,
+        "requests": 2,
+        "availability": "partial",
+    }
+    document = render_analysis_document(payload)
+    assert "2 model requests, including failed and retried requests" in document
+    assert "completed responses" not in document
+    assert "not included in the response count" not in document
+
+
 @pytest.mark.parametrize("mode", ["visual", "structured"])
 @pytest.mark.parametrize("damage", [None, "digest", "scope", "action", "genes", "mode"])
 @pytest.mark.parametrize("revised", [False, True])
@@ -782,3 +796,85 @@ def test_invalid_map_lineage_is_not_hidden_as_optional_display_failure(
     with pytest.raises(ValueError, match="exact frozen cell selection"):
         plots.collect_analysis_artifacts(store, final, tmp_path)
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("reused", [False, True])
+def test_full_review_allowance_excludes_reused_screening_evidence(
+    monkeypatch: pytest.MonkeyPatch, reused: bool
+) -> None:
+    from scarf.agent import record_io
+    from scarf.agent.orchestrator.models import AutomatedWorkflowConfig
+    from scarf.agent.orchestrator.rna_tuning import TuningAction
+
+    view = snapshot()["analysisReviews"][0]
+    template = next(
+        item for item in view["candidates"] if item["candidateId"] == "candidate-two"
+    )
+    features = ArtifactReferenceModel(
+        assay="RNA2", kind="feature_selection", artifactId="4" * 64
+    ).model_dump(mode="json")
+    candidates, settings, evidence = [], {}, {}
+    for identity in ("candidate-two", "candidate-screened"):
+        candidate = copy.deepcopy(template) | {
+            "candidateId": identity,
+            "artifacts": {"graphFeatures": features},
+        }
+        candidates.append(candidate)
+        settings[identity] = {
+            **view["settings"]["candidate-two"],
+            "parameters": candidate["parameters"],
+            "features": features,
+        }
+        evidence[identity] = view["featureEvidence"]["candidate-two"]
+    coverage = copy.deepcopy(view["comparisonCoverage"])
+    coverage["validationSources"] = (
+        {"candidate-screened": {"scope": "sample0", "slot": 0, "identity": "b" * 64}}
+        if reused
+        else {}
+    )
+    action = {
+        key: value for key, value in view.items() if key in TuningAction.model_fields
+    }
+    payload = {
+        "inputs": {
+            "scope": "full",
+            "imageHashes": {},
+            "evidenceMode": "structured",
+            "visualInspection": "unavailable",
+            "candidates": candidates,
+            "settings": settings,
+            "featureEvidence": evidence,
+            "comparisonCoverage": coverage,
+            "coverage": view["coverage"],
+        },
+        "outputs": {"action": action},
+    }
+    digest = record_io.sha256_json(payload)
+    record = record_io.canonical_json_bytes({**payload, "contentSha256": digest})
+    monkeypatch.setattr(record_io, "read_key", lambda *_args: record)
+    entry = {
+        "scope": "full",
+        "review": action,
+        "checkpointKey": "parameter_tuning/full/review0",
+        "checkpointSha256": digest,
+        "imageHashes": {},
+        "evidenceMode": "structured",
+        "visualInspection": "unavailable",
+    }
+    arguments = (
+        SimpleNamespace(zw=object()),
+        "agents/orchestrations",
+        "workflow",
+        [
+            {
+                "stage": "parameter_tuning",
+                "outputs": {"tuningEvidence": {"history": [entry]}},
+            }
+        ],
+        AutomatedWorkflowConfig(maxFullPartitions=1),
+    )
+    if reused:
+        assert len(journal._analysis_review_views(*arguments)[0]["candidates"]) == 2
+    else:
+        with pytest.raises(ValueError, match="candidate evidence does not align"):
+            journal._analysis_review_views(*arguments)

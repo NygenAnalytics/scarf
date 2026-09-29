@@ -1,4 +1,6 @@
 import gzip
+import io
+import sqlite3
 import struct
 from pathlib import Path
 
@@ -19,15 +21,30 @@ from scarf.readers._seurat import (
 from scarf.readers.seurat import (
     SeuratImportError,
     SeuratMembership,
+    SeuratMetadataColumn,
     SeuratReader,
     SeuratStringVector,
     inspect_seurat,
 )
+from tests.test_seurat_matrix_sources import _bpcells_payload, _write_bpcells_directory
 
 
 _FIXTURES = Path(__file__).resolve().parent / "datasets"
 _V4_FIXTURE = _FIXTURES / "seurat_v4_1_3_pbmc_mye.rds"
 _V5_FIXTURE = _FIXTURES / "seurat_assay5_synthetic.rds"
+
+
+def _decoded(
+    column: SeuratMetadataColumn, start: int, stop: int
+) -> tuple[str | bytes | None, ...]:
+    """Return a factor or character column window as values, None when missing."""
+    block = column.read_block(start, stop)
+    if column.kind == "character":
+        return tuple(block.values)
+    return tuple(
+        None if missing else column.levels[int(code) - 1]
+        for code, missing in zip(block.values, block.missing, strict=True)
+    )
 
 
 class _Wire:
@@ -85,6 +102,16 @@ class _Wire:
 
     def closure(self) -> bytes:
         return self.integer(self.flags(RType.CLOSURE)) + self.nil() + self.nil()
+
+    def untagged_pair(self, car: bytes, cdr: bytes) -> bytes:
+        return self.integer(self.flags(RType.PAIRLIST)) + car + cdr
+
+    def altrep(self, class_name: str, state: bytes) -> bytes:
+        info = self.untagged_pair(
+            self.symbol(class_name),
+            self.untagged_pair(self.symbol("base"), self.nil()),
+        )
+        return self.integer(RType.ALTREP) + info + state + self.nil()
 
     def pair(self, car: bytes, cdr: bytes, *, tag: str) -> bytes:
         return (
@@ -518,6 +545,27 @@ def _write_single_assay_fixture(
     return path
 
 
+def _write_metadata_fixture(
+    path: Path,
+    *,
+    wire: _Wire,
+    columns: list[tuple[str, bytes]],
+) -> Path:
+    cells = ["c1", "c2", "c3"]
+    root = wire.s4(
+        [
+            ("assays", wire.vector([_legacy_assay(wire)], names=["RNA"])),
+            ("meta.data", wire.data_frame(columns, cells)),
+            ("active.assay", wire.string_vector(["RNA"])),
+            ("active.ident", wire.factor([1, 1, 1], ["cells"], names=cells)),
+            ("reductions", wire.vector([], names=[])),
+            ("class", wire.string_vector(["Seurat"])),
+        ]
+    )
+    path.write_bytes(wire.document(root))
+    return path
+
+
 def _write_cached_sidecar_fixture(
     path: Path,
     *,
@@ -918,7 +966,7 @@ def test_empty_unnamed_reductions_are_accepted(tmp_path: Path) -> None:
     )
 
     with SeuratReader(path) as reader:
-        assert reader.reductionNames == ()
+        assert reader.inspection.reductions == ()
         assert reader.inspection.assay("RNA").importable
 
 
@@ -1083,9 +1131,9 @@ def test_mixed_assay_dispatch_metadata_and_reduction(tmp_path: Path) -> None:
         assert character.values == ("a", None, "c")
         group = reader.cellMetadata.column("group")
         assert group.levels == ("first", "second")
-        assert group.read_decoded_block(0, 3) == ("first", "second", None)
+        assert _decoded(group, 0, 3) == ("first", "second", None)
         assert reader.activeIdentity.levels == ("zero", "one")
-        assert reader.activeIdentity.read_decoded_block(0, 3) == (
+        assert _decoded(reader.activeIdentity, 0, 3) == (
             "zero",
             None,
             "one",
@@ -1099,8 +1147,6 @@ def test_mixed_assay_dispatch_metadata_and_reduction(tmp_path: Path) -> None:
         assert pca.role == "graphCoordinates"
         assert pca.dimensions == (3, 2)
         assert pca.assayUsed == "RNA"
-        assert pca.imported
-        assert not pca.computedByScarf
         np.testing.assert_array_equal(
             pca.cellEmbeddings.read_rows(1, 3),
             [[2.0, 5.0], [3.0, 6.0]],
@@ -1520,22 +1566,23 @@ def test_public_reader_containers_and_accessors_are_consistent(
         path,
         assay_layers={"RNA": ["counts"]},
     ) as reader:
-        assert not reader.closed
-        assert reader.document.source.name == str(path)
-        temp_paths = reader.tempPaths
-        assert temp_paths == reader.document.temp_paths
+        document = reader.document
+        assert not document.closed
+        assert document.source.name == str(path)
+        temp_paths = reader.document.temp_paths
         assert temp_paths
         assert all(Path(temp_path).exists() for temp_path in temp_paths)
-        assert reader.inspect() is reader.inspection
         assert reader.assayNames == ("RNA", "ADT")
-        assert reader.reductionNames == ("pca",)
-        assert tuple(assay.name for assay in reader.assays) == ("RNA", "ADT")
-        assert tuple(reduction.name for reduction in reader.reductions) == ("pca",)
+        assert tuple(item.name for item in reader.inspection.assays) == (
+            "RNA",
+            "ADT",
+        )
+        assert tuple(item.name for item in reader.inspection.reductions) == ("pca",)
 
-        assert reader.cellIds.shape == (3,)
+        assert len(reader.cellIds) == 3
         assert reader.cellIds[-1] == "c3"
         assert reader.cellIds[::-1] == ("c3", "c2", "c1")
-        assert tuple(reader.cellIds.iter_blocks(2)) == (("c1", "c2"), ("c3",))
+        assert tuple(reader.cellIds) == ("c1", "c2", "c3")
         assert reader.cellIds == ("c1", "c2", "c3")
         assert reader.cellMetadata.rowIds == reader.cellIds
         with pytest.raises(KeyError, match="missing"):
@@ -1547,7 +1594,6 @@ def test_public_reader_containers_and_accessors_are_consistent(
 
         assay = reader.get_assay()
         assert assay is reader.get_assay("RNA")
-        assert assay.matrix is assay.counts
         assert assay.dimensions == (2, 3)
         assert assay.counts.shape == assay.dimensions
         assert assay.counts.dtype == np.dtype(np.int32)
@@ -1556,7 +1602,7 @@ def test_public_reader_containers_and_accessors_are_consistent(
         assert assay.counts.resident_bytes >= 0
         assert assay.counts.row_names is None
         assert assay.counts.column_names is None
-        assert assay.counts.estimate_read_memory(0, 1).peakBytes > 0
+        assert assay.counts.estimate_read_memory(0, 1).blockBytes > 0
 
         reduction = reader.get_reduction("pca")
         assert reduction.stdev is not None
@@ -1564,19 +1610,19 @@ def test_public_reader_containers_and_accessors_are_consistent(
         assert reduction.stdev.dtype == np.dtype(np.float64)
         np.testing.assert_array_equal(reduction.stdev.read_block(0, 2), [2.0, 1.0])
         np.testing.assert_array_equal(
-            reduction.cellEmbeddings.read_cells(0, 1),
+            reduction.cellEmbeddings.read_rows(0, 1),
             [[1.0, 4.0]],
         )
-        assert reader.activeIdentity.sourceIndices is not None
-        np.testing.assert_array_equal(reader.activeIdentity.sourceIndices, [1, 2, 0])
-        assert reader.cellMetadata.column("character").read_decoded_block(0, 3) == (
+        assert _decoded(reader.cellMetadata.column("character"), 0, 3) == (
             "a",
             None,
             "c",
         )
 
-    assert reader.closed
+    assert document.closed
     assert all(not Path(temp_path).exists() for temp_path in temp_paths)
+    with pytest.raises(RdsClosedError):
+        _ = reader.inspection
     with pytest.raises(RdsClosedError):
         _ = reader.cellIds[0]
     with pytest.raises(RdsClosedError):
@@ -1588,8 +1634,6 @@ def test_public_reader_containers_and_accessors_are_consistent(
 def test_public_sequence_bounds_and_membership_validation(tmp_path: Path) -> None:
     path = _write_fixture(tmp_path / "public-bounds.rds")
     with SeuratReader(path) as reader:
-        with pytest.raises(ValueError, match="block_size must be positive"):
-            tuple(reader.cellIds.iter_blocks(0))
         with pytest.raises(IndexError, match="identifier window"):
             reader.cellIds.read_block(-1, 1)
         with pytest.raises(IndexError, match="identifier index out of range"):
@@ -1614,20 +1658,10 @@ def test_public_sequence_bounds_and_membership_validation(tmp_path: Path) -> Non
         membership.read_block(0, 4),
         [False, True, False, True],
     )
-    np.testing.assert_array_equal(membership[::2], [False, False])
-    assert membership[-1]
-    np.testing.assert_array_equal(
-        np.asarray(membership, dtype=np.uint8),
-        [0, 1, 0, 1],
-    )
-    np.testing.assert_array_equal(
-        np.array(membership, dtype=np.uint8, copy=True),
-        [0, 1, 0, 1],
-    )
+    np.testing.assert_array_equal(membership.read_block(1, 3), [True, False])
+    assert SeuratMembership(2, np.asarray([1, 0])).allIncluded
     with pytest.raises(IndexError, match="membership window"):
         membership.read_block(0, 5)
-    with pytest.raises(IndexError, match="membership index out of range"):
-        _ = membership[4]
     with pytest.raises(ValueError, match="cannot be negative"):
         SeuratMembership(-1)
     with pytest.raises(ValueError, match="one-dimensional"):
@@ -1853,9 +1887,7 @@ def test_factory_materializes_additional_structural_nodes() -> None:
             "class": ["DelayedSetDimnames", "DelayedUnaryOp"],
             "slots": {
                 "seed": leaf,
-                "rowNames": ["f1", "f2"],
-                "columnNames": ["c1", "c2"],
-                "dim": [2, 2],
+                "dimnames": [["f1", "f2"], ["c1", "c2"]],
             },
         }
     )
@@ -2124,7 +2156,7 @@ def test_factory_rejects_invalid_structural_nodes(case: str) -> None:
                 "transpose": [0, 1],
             },
             MatrixSourceError,
-            "transpose slot must be scalar",
+            "transpose at .* must contain one logical value",
         ),
         "bad-dim": (
             {
@@ -2391,7 +2423,7 @@ def test_factory_validates_serialized_slot_forms(case: str) -> None:
                 },
             },
             MatrixSourceError,
-            "cannot be negative",
+            "cannot contain negative values",
         ),
         "memory-transpose-vector": (
             {
@@ -2403,7 +2435,7 @@ def test_factory_validates_serialized_slot_forms(case: str) -> None:
                 },
             },
             MatrixSourceError,
-            "transpose slot must be scalar",
+            "transpose at .* must contain one logical value",
         ),
         "boolean-scalar-axis": (
             {
@@ -2647,7 +2679,11 @@ def test_fragment_factory_wrappers_expose_resources_and_records() -> None:
     )
     assert region.residentBytes > base.residentBytes
     assert region.metadataBytes > base.metadataBytes
-    assert sum(block.size for block in region.iter_chromosome(0)) == 3
+    region_blocks = tuple(region.iter_chromosome(0))
+    np.testing.assert_array_equal(
+        np.concatenate([block.starts for block in region_blocks]),
+        [0, 5],
+    )
 
     merged = fragment_source_from_slots(
         {
@@ -2658,10 +2694,13 @@ def test_fragment_factory_wrappers_expose_resources_and_records() -> None:
     assert merged.recordCount == 2 * base.recordCount
     assert merged.residentBytes == 2 * base.residentBytes
     assert merged.metadataBytes > 2 * base.metadataBytes
-    assert merged.blockWorkingBytes == 2 * base.blockWorkingBytes
+    # Buffered source blocks plus the merged output block.
+    assert merged.blockWorkingBytes == 4 * base.blockWorkingBytes
     merged_blocks = tuple(merged.iter_chromosome(0))
-    assert len(merged_blocks) == 2
-    assert int(merged_blocks[1].cellIds.min()) >= len(base.cellNames)
+    merged_starts = np.concatenate([block.starts for block in merged_blocks])
+    merged_cells = np.concatenate([block.cellIds for block in merged_blocks])
+    np.testing.assert_array_equal(merged_starts, [0, 0, 5, 5, 10, 10, 12, 12, 20, 20])
+    assert set(merged_cells[merged_starts == 0].tolist()) == {0, len(base.cellNames)}
     with pytest.raises(IndexError, match="out of range"):
         tuple(merged.iter_chromosome(2))
 
@@ -2927,8 +2966,8 @@ def test_fragment_factory_rejects_invalid_graphs(case: str) -> None:
                     "invert_selection": [2],
                 },
             },
-            TypeError,
-            "must be TRUE or FALSE",
+            MatrixSourceError,
+            "invert_selection must contain one logical value",
         ),
         "missing-version": (
             {
@@ -2973,7 +3012,7 @@ def test_fragment_factory_rejects_invalid_graphs(case: str) -> None:
                 "slots": base_slots,
             },
             MatrixSourceError,
-            "must be positive",
+            "must be a positive 32-bit integer",
         ),
         "invalid-prefix-utf8": (
             {
@@ -3168,7 +3207,7 @@ def test_fragment_matrix_factory_validates_materialized_ranges(case: str) -> Non
         "negative-shape": (
             specification(dim=[-1, 3]),
             MatrixSourceError,
-            "must contain two integers",
+            "cannot contain negative values",
         ),
         "nonnumeric-chromosome": (
             specification(chr_id=["chr1"]),
@@ -3200,7 +3239,7 @@ def test_real_seurat_v4_fixture() -> None:
             "nFeature_RNA",
         )
         assert reader.activeIdentity.levels == ("DC", "Mono CD14", "Mono FCGR3A")
-        assert reader.activeIdentity.read_decoded_block(0, 3) == (
+        assert _decoded(reader.activeIdentity, 0, 3) == (
             "Mono CD14",
             "Mono CD14",
             "Mono CD14",
@@ -3220,11 +3259,412 @@ def test_real_seurat_v5_fixture() -> None:
         assert assay.dimensions == (500, 300)
         assert assay.featureIds[:3] == ("Gene1", "Gene2", "Gene3")
         assert assay.counts.read_cells(11, 13).shape == (2, 500)
-        assert np.all(assay.cellMembership)
-        assert reader.activeIdentity.read_decoded_block(0, 3) == ("1", "0", "2")
+        assert assay.cellMembership.allIncluded
+        assert _decoded(reader.activeIdentity, 0, 3) == ("1", "0", "2")
         pca = reader.get_reduction("pca")
         assert pca.dimensions == (300, 20)
         assert pca.featureLoadings is not None
         assert pca.featureLoadings.shape == (200, 20)
         assert reader.get_reduction("umap").dimensions == (300, 2)
         assert reader.get_reduction("umap").role == "displayEmbedding"
+
+
+def test_stream_reader_needs_a_sidecar_root_for_sidecar_layers(
+    tmp_path: Path,
+) -> None:
+    path = _write_delayed_hdf5array_fixture(tmp_path / "sidecar.rds")
+    payload = path.read_bytes()
+
+    with SeuratReader(io.BytesIO(payload), reductions=[]) as reader:
+        diagnostic = reader.inspection.assay("RNA").blockingDiagnostic
+        assert diagnostic is not None
+        assert diagnostic.code == "invalid_matrix"
+        assert diagnostic.context == {"causeType": "UnsafeSidecarError"}
+        assert "needs an anchor directory" in diagnostic.message
+
+    with SeuratReader(
+        io.BytesIO(payload),
+        reductions=[],
+        sidecar_root=tmp_path,
+    ) as reader:
+        np.testing.assert_array_equal(
+            reader.get_assay("RNA").counts.read_cells(0, 3).toarray(),
+            [[1, 0], [0, 2], [3, 0]],
+        )
+
+
+def _matrix_dir_node(wire: _Wire, directory: str, shape: tuple[int, int]) -> bytes:
+    return wire.s4(
+        [
+            ("dir", wire.string_vector([directory])),
+            ("compressed", wire.logical_vector([0])),
+            ("buffer_size", wire.integer_vector([8192])),
+            ("type", wire.string_vector(["uint32_t"])),
+            ("dim", wire.real_vector([float(shape[0]), float(shape[1])])),
+            ("transpose", wire.logical_vector([0])),
+            ("dimnames", wire.vector([wire.nil(), wire.nil()])),
+            ("class", wire.string_vector(["MatrixDir"])),
+        ]
+    )
+
+
+def test_rename_dims_over_a_bpcells_directory_replaces_stale_names(
+    tmp_path: Path,
+) -> None:
+    logical = np.asarray([[1, 0, 2, 0], [0, 3, 0, 4], [5, 0, 6, 0]], dtype=np.uint32)
+    # The directory keeps its original names, f0..f2 and c0..c3.
+    _write_bpcells_directory(
+        tmp_path / "counts",
+        _bpcells_payload(logical, packed=False, version=2, storage_order="col"),
+        version=2,
+    )
+    wire = _Wire()
+    genes = ["g0", "g1", "g2"]
+    cells = ["c1", "c2", "c3", "c4"]
+    renamed = wire.s4(
+        [
+            ("matrix", _matrix_dir_node(wire, "counts", logical.shape)),
+            ("dim", wire.real_vector([3.0, 4.0])),
+            ("transpose", wire.logical_vector([0])),
+            ("dimnames", wire.dimnames(genes, cells)),
+            ("class", wire.string_vector(["RenameDims"])),
+        ]
+    )
+    assay = wire.s4(
+        [
+            ("counts", renamed),
+            ("meta.features", wire.data_frame([], 3)),
+            ("class", wire.string_vector(["Assay"])),
+        ]
+    )
+    root = wire.s4(
+        [
+            ("assays", wire.vector([assay], names=["RNA"])),
+            (
+                "meta.data",
+                wire.data_frame([("group", wire.string_vector(["a"] * 4))], cells),
+            ),
+            ("active.assay", wire.string_vector(["RNA"])),
+            ("active.ident", wire.factor([1] * 4, ["cells"], names=cells)),
+            ("reductions", wire.vector([], names=[])),
+            ("class", wire.string_vector(["Seurat"])),
+        ]
+    )
+    path = tmp_path / "renamed.rds"
+    path.write_bytes(wire.document(root))
+
+    with SeuratReader(path) as reader:
+        assay_model = reader.get_assay("RNA")
+        assert assay_model.featureIds == tuple(genes)
+        assert assay_model.counts.row_names == tuple(genes)
+        np.testing.assert_array_equal(
+            assay_model.counts.read_cells(0, 4).toarray(), logical.T
+        )
+
+
+def test_assay5_logmap_names_place_layers_with_stale_sidecar_names(
+    tmp_path: Path,
+) -> None:
+    logical = np.asarray([[1, 0, 2, 0], [0, 3, 0, 4], [5, 0, 6, 0]], dtype=np.uint32)
+    _write_bpcells_directory(
+        tmp_path / "counts",
+        _bpcells_payload(logical, packed=False, version=2, storage_order="col"),
+        version=2,
+    )
+    wire = _Wire()
+    genes = ["f0", "f1", "f2"]
+    # merge(add.cell.ids = "A") renames only the LogMap and meta.data.
+    cells = ["A_c0", "A_c1", "A_c2", "A_c3"]
+    assay = wire.s4(
+        [
+            (
+                "layers",
+                wire.vector(
+                    [_matrix_dir_node(wire, "counts", logical.shape)],
+                    names=["counts"],
+                ),
+            ),
+            ("cells", wire.logmap([1] * 4, cells, ["counts"])),
+            ("features", wire.logmap([1] * 3, genes, ["counts"])),
+            ("meta.data", wire.data_frame([], 3)),
+            ("class", wire.string_vector(["Assay5"])),
+        ]
+    )
+    root = wire.s4(
+        [
+            ("assays", wire.vector([assay], names=["RNA"])),
+            (
+                "meta.data",
+                wire.data_frame([("group", wire.string_vector(["a"] * 4))], cells),
+            ),
+            ("active.assay", wire.string_vector(["RNA"])),
+            ("active.ident", wire.factor([1] * 4, ["cells"], names=cells)),
+            ("reductions", wire.vector([], names=[])),
+            ("class", wire.string_vector(["Seurat"])),
+        ]
+    )
+    path = tmp_path / "renamed-cells.rds"
+    path.write_bytes(wire.document(root))
+
+    with SeuratReader(path) as reader:
+        assay_model = reader.get_assay("RNA")
+        assert assay_model.cellIds == tuple(cells)
+        assert assay_model.counts.column_names == tuple(cells)
+        np.testing.assert_array_equal(
+            assay_model.counts.read_cells(0, 4).toarray(), logical.T
+        )
+
+
+@pytest.mark.parametrize(
+    ("levels", "expected_levels", "expected"),
+    [
+        (["", "A", "B"], ("", "A", "B"), ("A", "", "B")),
+        ([None, "A", "B"], ("A", "B"), ("A", None, "B")),
+    ],
+)
+def test_factor_levels_may_be_empty_or_missing(
+    tmp_path: Path,
+    levels: list[str | None],
+    expected_levels: tuple[str, ...],
+    expected: tuple[str | None, ...],
+) -> None:
+    wire = _Wire()
+    path = _write_metadata_fixture(
+        tmp_path / "levels.rds",
+        wire=wire,
+        columns=[("sample", wire.factor([2, 1, 3], levels))],  # type: ignore[arg-type]
+    )
+
+    with SeuratReader(path) as reader:
+        column = reader.cellMetadata.column("sample")
+        assert column.levels == expected_levels
+        assert _decoded(column, 0, 3) == expected
+
+
+def test_altrep_metadata_columns_are_expanded(tmp_path: Path) -> None:
+    wire = _Wire()
+    path = _write_metadata_fixture(
+        tmp_path / "altrep.rds",
+        wire=wire,
+        columns=[
+            # 1:3
+            ("sequence", wire.altrep("compact_intseq", wire.real_vector([3, 1, 1]))),
+            # seq(2.5, by = -1, length.out = 3)
+            (
+                "decreasing",
+                wire.altrep("compact_realseq", wire.real_vector([3, 2.5, -1])),
+            ),
+            (
+                "wrapped",
+                wire.altrep(
+                    "wrap_real",
+                    wire.untagged_pair(
+                        wire.real_vector([0.5, 1.5, 2.5]),
+                        wire.integer_vector([0, 0]),
+                    ),
+                ),
+            ),
+            # as.character(c(7L, NA, 9L))
+            (
+                "deferred",
+                wire.altrep(
+                    "deferred_string",
+                    wire.untagged_pair(
+                        wire.integer_vector([7, R_INT_NA, 9]),
+                        wire.integer_vector([0]),
+                    ),
+                ),
+            ),
+        ],
+    )
+
+    with SeuratReader(path) as reader:
+        metadata = reader.cellMetadata
+        assert [metadata.column(name).kind for name in metadata.columnNames] == [
+            "integer",
+            "real",
+            "real",
+            "character",
+        ]
+        np.testing.assert_array_equal(
+            metadata.column("sequence").read_block(0, 3).values, [1, 2, 3]
+        )
+        np.testing.assert_array_equal(
+            metadata.column("decreasing").read_block(1, 3).values, [1.5, 0.5]
+        )
+        np.testing.assert_array_equal(
+            metadata.column("wrapped").read_block(0, 3).values, [0.5, 1.5, 2.5]
+        )
+        assert _decoded(metadata.column("deferred"), 0, 3) == ("7", None, "9")
+
+
+@pytest.mark.parametrize(
+    ("name", "state", "message"),
+    [
+        ("compact_intseq", [3, 1, 2], "state is invalid"),
+        ("compact_intseq", [3, 1.5, 1], "state is invalid"),
+        ("compact_realseq", [-1, 0, 1], "state is invalid"),
+        ("compact_realseq", [2.5, 0, 1], "state is invalid"),
+        ("compact_realseq", [3, float("nan"), 1], "state is invalid"),
+        ("compact_bogus", [3, 1, 1], "is not supported"),
+    ],
+)
+def test_invalid_altrep_metadata_columns_are_rejected(
+    tmp_path: Path,
+    name: str,
+    state: list[float],
+    message: str,
+) -> None:
+    wire = _Wire()
+    path = _write_metadata_fixture(
+        tmp_path / "altrep.rds",
+        wire=wire,
+        columns=[("bad", wire.altrep(name, wire.real_vector(state)))],
+    )
+
+    with pytest.raises(SeuratImportError, match=message) as error:
+        with SeuratReader(path) as reader:
+            reader.cellMetadata.column("bad").read_block(0, 1)
+    assert error.value.code == "unsupported_altrep"
+
+
+def test_altrep_sequence_views_read_bounded_windows() -> None:
+    from types import SimpleNamespace
+
+    from scarf.readers.seurat import _CompactSequence, _DeferredIntegerStrings
+
+    sequence = _CompactSequence(5, 10.0, -1.0, np.dtype(np.int32))
+    assert (len(sequence), sequence.nbytes) == (5, 20)
+    np.testing.assert_array_equal(sequence.read_block(1, 4), [9, 8, 7])
+    assert sequence[4] == 6
+    for start, stop in ((-1, 2), (3, 2), (3, 6)):
+        with pytest.raises(IndexError, match="outside"):
+            sequence.read_block(start, stop)
+
+    strings = _DeferredIntegerStrings(sequence)
+    assert len(strings) == 5
+    assert strings.read_block(0, 2) == ("10", "9")
+    assert strings[2] == "8"
+    missing = SimpleNamespace(
+        read_block=lambda start, stop: np.array([1, R_INT_NA], dtype=np.int32)
+    )
+    assert _DeferredIntegerStrings(missing).read_block(0, 2) == ("1", None)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("real", [False, True])
+def test_missing_count_values_are_rejected(tmp_path: Path, real: bool) -> None:
+    wire = _Wire()
+    missing: int | float = float("nan") if real else R_INT_NA
+    assay = wire.s4(
+        [
+            (
+                "counts",
+                wire.matrix(
+                    [1, missing, 0, 2, 3, 0],  # type: ignore[list-item]
+                    (2, 3),
+                    rows=["g1", "g2"],
+                    columns=["c1", "c2", "c3"],
+                    real=real,
+                ),
+            ),
+            ("meta.features", wire.data_frame([], ["g1", "g2"])),
+            ("class", wire.string_vector(["Assay"])),
+        ]
+    )
+    path = _write_single_assay_fixture(tmp_path / "missing.rds", wire=wire, assay=assay)
+
+    with SeuratReader(path) as reader:
+        counts = reader.get_assay("RNA").counts
+        np.testing.assert_array_equal(counts.read_cells(1, 3), [[0, 2], [3, 0]])
+        with pytest.raises(SeuratImportError) as error:
+            counts.read_cells(0, 3)
+    assert error.value.code == "missing_count_value"
+    assert error.value.objectPath == "assays/RNA/counts"
+
+
+def test_assay_counts_split_reads_that_exceed_the_block_limit(tmp_path: Path) -> None:
+    path = _write_fixture(tmp_path / "split.rds")
+    with SeuratReader(
+        path,
+        assays=["RNA"],
+        reductions=[],
+        matrix_limits=SourceLimits(maxBlockBytes=20),
+    ) as reader:
+        counts = reader.get_assay("RNA").counts
+        assert counts.estimate_read_memory(0, 3).blockBytes > 20
+        np.testing.assert_array_equal(
+            counts.read_cells(0, 3),
+            [[1, 0], [0, 2], [3, 0]],
+        )
+
+
+def test_identifier_iteration_reads_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Values:
+        def __init__(self) -> None:
+            self.reads: list[tuple[int, int]] = []
+
+        def __len__(self) -> int:
+            return 5
+
+        def read_block(self, start: int, stop: int) -> list[str]:
+            self.reads.append((start, stop))
+            return [f"c{index}" for index in range(start, stop)]
+
+    class _Document:
+        closed = False
+
+    monkeypatch.setattr(seurat_module, "_VECTOR_BLOCK_SIZE", 2)
+    values = _Values()
+    vector = SeuratStringVector(
+        values,  # type: ignore[arg-type]
+        _Document(),  # type: ignore[arg-type]
+        object_path="cells",
+    )
+    assert tuple(vector) == ("c0", "c1", "c2", "c3", "c4")
+    assert values.reads == [(0, 2), (2, 4), (4, 5)]
+
+
+def test_identifier_database_closes_its_connection_when_setup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed: list[bool] = []
+
+    class _Connection:
+        def execute(self, statement: str) -> "_Connection":
+            if statement.startswith("CREATE TABLE"):
+                raise sqlite3.OperationalError("disk I/O error")
+            return self
+
+        def fetchone(self) -> tuple[int]:
+            return (4096,)
+
+        def close(self) -> None:
+            closed.append(True)
+
+    monkeypatch.setattr(sqlite3, "connect", lambda path: _Connection())
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        seurat_module._identifier_database(
+            scratch_dir=tmp_path,
+            maximum_bytes=1024 * 1024,
+            object_path="ids",
+        )
+    assert closed == [True]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_close_releases_the_document_when_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scarf.readers._seurat.sources as sources_module
+
+    def fail(source: object) -> None:
+        raise OSError("cleanup failed")
+
+    reader = SeuratReader(_write_fixture(tmp_path / "cleanup.rds"), reductions=[])
+    document = reader.document
+    monkeypatch.setattr(sources_module, "release_temporary_storage", fail)
+    with pytest.raises(OSError, match="cleanup failed"):
+        reader.close()
+    assert document.closed

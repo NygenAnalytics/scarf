@@ -3,17 +3,16 @@ import os
 import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from threading import RLock
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 import pandas as pd
 import zarr
 from numpy.typing import NDArray
-from scipy.sparse import coo_matrix, csr_matrix
+from scipy.sparse import csr_matrix
 
 from ...embeddings.reduction import (
-    _nonnegative_integer,
+    _gram_pca_dispatch,
     _streaming_lsi_accumulator_bytes,
     require_materialized_lsi_budget,
 )
@@ -29,11 +28,11 @@ from ...graph.arguments import (
     NeighborQueryArguments,
     NormalizationArguments,
     PcaArguments,
-    _positive_integer,
 )
 from ...graph.distances import (
+    payload_error,
     validate_distance_provenance,
-    validate_neighbors_payload,
+    validate_integration_source_payload,
 )
 from ...graph.feature_projection import (
     graph_cell_selection,
@@ -65,13 +64,13 @@ from ...storage.arrays import (
 from ...storage.artifact_writer import (
     ArrayRequirement,
     PlannedArtifact,
-    finish_artifact,
+    artifact_transaction,
     plan_artifact,
     reused_artifact_group,
-    start_artifact,
 )
 from ...storage.artifacts import (
     ArtifactRef,
+    ArtifactStatus,
     artifact_group,
     artifact_path,
     group_at,
@@ -100,10 +99,11 @@ from ...storage.selections import (
     iter_selected_axis_selection_blocks,
     read_stored_selection_mask,
     snapshot_run_metadata,
+    validate_cell_selection,
     validate_run_metadata_snapshot,
-    validate_stored_selection_integrity,
 )
 from ...utils.arrays import clean_array
+from ...utils.arguments import integer_argument
 from ...utils.logging import logger
 from ...utils.shutdown import shutdown_checkpoint
 
@@ -130,7 +130,7 @@ def _row_block(
     if requested is None:
         resolved = min(band, n_rows)
     else:
-        resolved = min(_positive_integer(requested, "batch_size"), n_rows)
+        resolved = min(integer_argument(requested, "batch_size", minimum=1), n_rows)
     if minimum is not None and resolved < minimum:
         aligned = min(n_rows, ((minimum + band - 1) // band) * band)
         if requested is not None:
@@ -146,136 +146,6 @@ def _row_block(
             "them. Leave batch_size unset to follow the stored layout."
         )
     return resolved
-
-
-def _integration_payload_error(
-    ref: ArtifactRef,
-    message: str,
-    *,
-    payload: str | None = None,
-) -> ArtifactResolutionError:
-    context: dict[str, Any] = {
-        "assay": ref.assay,
-        "artifact_id": ref.artifact_id,
-        "actual_kind": ref.kind,
-    }
-    if payload is not None:
-        context["payload"] = payload
-    return ArtifactResolutionError(
-        message,
-        code="corrupt_payload",
-        context=context,
-    )
-
-
-def _integration_array_block_rows(array: zarr.Array) -> int:
-    chunks = array.chunks
-    if chunks and chunks[0]:
-        return max(1, int(chunks[0]))
-    return max(1, min(int(array.shape[0]), 100_000))
-
-
-def _integration_payload_dimensions(
-    group: zarr.Group,
-    ref: ArtifactRef,
-) -> tuple[int, int]:
-    raw_cells = group.attrs.get("n_cells")
-    raw_neighbors = group.attrs.get("n_neighbors")
-    if (
-        isinstance(raw_cells, bool)
-        or not isinstance(raw_cells, int | np.integer)
-        or int(raw_cells) < 1
-        or isinstance(raw_neighbors, bool)
-        or not isinstance(raw_neighbors, int | np.integer)
-        or int(raw_neighbors) < 1
-    ):
-        raise _integration_payload_error(
-            ref,
-            f"{ref.kind} artifact has invalid n_cells or n_neighbors metadata",
-        )
-    n_cells = int(raw_cells)
-    n_neighbors = int(raw_neighbors)
-    if n_neighbors >= n_cells:
-        raise _integration_payload_error(
-            ref,
-            f"{ref.kind} artifact has an invalid neighbor count",
-        )
-    return n_cells, n_neighbors
-
-
-def _validate_integration_connectivity_payload(
-    root: zarr.Group,
-    ref: ArtifactRef,
-) -> int:
-    try:
-        group = artifact_group(root, ref)
-        edges = as_zarr_array(group["edges"], name="edges")
-        weights = as_zarr_array(group["weights"], name="weights")
-    except Exception as error:
-        raise _integration_payload_error(
-            ref,
-            "Connectivity-map artifact payload is unreadable",
-        ) from error
-    n_cells, n_neighbors = _integration_payload_dimensions(group, ref)
-    expected_edges = n_cells * n_neighbors
-    if (
-        edges.ndim != 2
-        or tuple(map(int, edges.shape)) != (expected_edges, 2)
-        or np.dtype(edges.dtype) != np.dtype(np.uint32)
-        or weights.ndim != 1
-        or tuple(map(int, weights.shape)) != (expected_edges,)
-        or np.dtype(weights.dtype) != np.dtype(np.float32)
-    ):
-        raise _integration_payload_error(
-            ref,
-            "Connectivity-map arrays do not match their stored dimensions",
-        )
-
-    row_counts = np.zeros(n_cells, dtype=np.uint64)
-    block_rows = _integration_array_block_rows(edges)
-    for start in range(0, expected_edges, block_rows):
-        stop = min(start + block_rows, expected_edges)
-        try:
-            edge_block = np.asarray(edges[start:stop])
-            weight_block = np.asarray(weights[start:stop])
-        except Exception as error:
-            raise _integration_payload_error(
-                ref,
-                "Connectivity-map arrays are unreadable",
-            ) from error
-        if (
-            np.any(edge_block >= n_cells)
-            or not np.all(np.isfinite(weight_block))
-            or np.any(weight_block < 0)
-        ):
-            raise _integration_payload_error(
-                ref,
-                "Connectivity-map arrays contain invalid edge or weight values",
-            )
-        row_counts += np.bincount(
-            edge_block[:, 0],
-            minlength=n_cells,
-        ).astype(np.uint64, copy=False)
-    if np.any(row_counts != n_neighbors):
-        raise _integration_payload_error(
-            ref,
-            "Connectivity-map rows do not match n_neighbors",
-        )
-    return n_cells
-
-
-def _validate_integration_source_payload(
-    root: zarr.Group,
-    ref: ArtifactRef,
-) -> int:
-    if ref.kind == "connectivity_map":
-        return _validate_integration_connectivity_payload(root, ref)
-    if ref.kind == "neighbors":
-        return validate_neighbors_payload(root, ref).n_cells
-    raise _integration_payload_error(
-        ref,
-        "Integration source has an unsupported artifact kind",
-    )
 
 
 def _streaming_lsi_block_rows(
@@ -366,57 +236,42 @@ def _sampling_fraction(value: Any, name: str) -> float:
     return resolved
 
 
+def _validated_harmony_request(
+    batch_columns: Any,
+    harmony_params: dict[str, Any] | None,
+    batch_size: int | None,
+) -> tuple[dict[str, Any], int | None]:
+    """Return resolved Harmony parameters and the optional block size."""
+    from ...embeddings.harmony.api import validate_harmony_parameters
+
+    if not isinstance(batch_columns, list) or not batch_columns:
+        raise ValueError("batch_columns must be a non-empty list")
+    if any(not isinstance(column, str) or not column for column in batch_columns):
+        raise ValueError("batch_columns must contain non-empty strings")
+    if len(set(batch_columns)) != len(batch_columns):
+        raise ValueError("batch_columns must be unique")
+    requested_batch_size = (
+        None
+        if batch_size is None
+        else integer_argument(batch_size, "batch_size", minimum=1)
+    )
+    return validate_harmony_parameters(harmony_params), requested_batch_size
+
+
+def _requested_block_rows(
+    source: CoordinateSource,
+    requested: int | None,
+    n_cells: int,
+) -> int:
+    """Return the requested block size, or the coordinate chunk rows, capped."""
+    source_data = getattr(source, "data", None)
+    source_rows = int(source_data.chunksize[0]) if source_data is not None else n_cells
+    return min(source_rows if requested is None else int(requested), n_cells)
+
+
 class _GraphOperationsMixin(_GraphOperationsBase):
     _normalizedArtifactCache: dict[ArtifactRef, ChunkedArray]
     _artifactExecutionContext: dict[str, Any]
-    _graphMemoryCache: dict[tuple[str, bool, bool, int | None], csr_matrix] | None
-    _graphMemoryCacheLock: Any
-
-    @contextmanager
-    def _graph_memory_cache_scope(self) -> Iterator[None]:
-        """Bound graph reuse to one product pipeline section."""
-        existing = getattr(self, "_graphMemoryCache", None)
-        if existing is not None:
-            yield
-            return
-
-        cache: dict[tuple[str, bool, bool, int | None], csr_matrix] = {}
-        lock = getattr(self, "_graphMemoryCacheLock", None)
-        if lock is None:
-            lock = RLock()
-            self._graphMemoryCacheLock = lock
-        self._graphMemoryCache = cache
-        try:
-            yield
-        finally:
-            with lock:
-                cache.clear()
-                if self._graphMemoryCache is cache:
-                    self._graphMemoryCache = None
-
-    if TYPE_CHECKING:
-
-        def select_all_features(
-            self,
-            *,
-            from_assay: str | None = None,
-        ) -> ArtifactRef: ...
-
-        def resolve_features(
-            self,
-            assay: str,
-            features: ArtifactRef,
-        ) -> ArtifactRef: ...
-
-        def _build_mapping_reference_artifact(
-            self,
-            *,
-            reduction: ArtifactRef,
-            batch_correction: ArtifactRef,
-            ann_index: ArtifactRef,
-            neighbors: ArtifactRef,
-            invalidate_cache: bool,
-        ) -> ArtifactRef: ...
 
     def _resolve_ann_index(
         self,
@@ -497,30 +352,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 context=context,
             ) from error
 
-    def _persist_ann_index(
-        self,
-        ann_loc: str,
-        ann_idx: Any,
-        *,
-        ann_metric: str,
-        dimensions: int,
-        element_count: int,
-    ) -> None:
-        """Save an hnswlib index into the Zarr hierarchy."""
-        if self.zarr_mode != "r+":
-            logger.debug("Skipping ANN index persistence on read-only store")
-            return
-        if ann_loc not in self.zw:
-            self.zw.create_group(ann_loc, overwrite=True)
-        save_ann_index(
-            as_zarr_group(self.zw[ann_loc], name=ann_loc),
-            ann_idx,
-            profile=self.storageProfile,
-            metric=ann_metric,
-            dimensions=dimensions,
-            element_count=element_count,
-        )
-
     def _get_graph_ncells_k(self, graph_loc: str) -> tuple[int, int]:
         """
 
@@ -538,42 +369,21 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             int(cast(int | float | str, graph_group.attrs["n_neighbors"])),
         )
 
-    def _store_to_sparse(
-        self, graph_loc: str, sparse_format: str = "csr", use_k: int | None = None
-    ) -> tuple[int, csr_matrix | coo_matrix]:
-        """
+    def _store_to_sparse(self, graph_loc: str, use_k: int | None) -> csr_matrix:
+        """Read a stored graph as CSR, keeping each cell's ``use_k`` nearest edges.
 
-        Args:
-            graph_loc:
-            sparse_format:
-            use_k:
-
-        Returns:
-
+        Callers validate ``use_k`` against the graph's ``k``; None keeps every edge.
         """
         logger.debug(f"Loading graph from location: {graph_loc}")
         store = as_zarr_group(self.zw[graph_loc], name=graph_loc)
         n_cells, k = self._get_graph_ncells_k(graph_loc)
-        if use_k is None:
-            use_k = k
-        if use_k > k:
-            use_k = k
-        if use_k < 1:
-            use_k = 1
         w = np.asarray(as_zarr_array(store["weights"], name="weights")[:])
         e = np.asarray(as_zarr_array(store["edges"], name="edges")[:])
-        if use_k != k:
+        if use_k is not None and use_k != k:
             from ...neighbors.graph import take_nearest_per_row
 
             w, e = take_nearest_per_row(w, e, n_cells, use_k)
-        if sparse_format == "csr":
-            return n_cells, csr_matrix(
-                (w, (e[:, 0], e[:, 1])), shape=(n_cells, n_cells)
-            )
-        else:
-            return n_cells, coo_matrix(
-                (w, (e[:, 0], e[:, 1])), shape=(n_cells, n_cells)
-            )
+        return csr_matrix((w, (e[:, 0], e[:, 1])), shape=(n_cells, n_cells))
 
     @staticmethod
     def _resolve_local_cache_plan(
@@ -581,7 +391,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         group: zarr.Group,
         local_cache: bool | str,
     ) -> tuple[bool, str | None, bool]:
-        """Return whether to stage, cache base directory, and remove-on-success flag."""
+        """Return the staging flag, cache directory, and delete-after-use flag."""
         if local_cache is False or not is_remote_datastore(zarr_loc, group):
             return False, None, False
         if local_cache is True or local_cache == "auto":
@@ -599,7 +409,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         kind: str,
         *,
         assay: str | None = None,
-    ) -> Any:
+    ) -> ArtifactStatus:
         if ref.kind != kind:
             raise ValueError(f"Expected {kind!r} artifact, got {ref.kind!r}")
         if assay is not None and (ref.scope != "assay" or ref.assay != assay):
@@ -610,17 +420,18 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         self,
         ref: ArtifactRef,
         name: str,
-        kind: str,
-        *,
-        require_input_complete: bool = True,
+        kind: str | None,
     ) -> ArtifactRef:
+        """Return the complete ``name`` input of a complete artifact.
+
+        ``kind`` is the required input kind; None accepts the recorded kind.
+        """
         status = self._require_complete_artifact(ref, ref.kind)
-        raw_ref = (status.inputs or {}).get(name)
-        if not isinstance(raw_ref, dict):
-            raise ValueError(f"{ref.kind} artifact has no {name!r} input")
-        input_ref = ArtifactRef.from_dict(raw_ref)
-        if require_input_complete:
-            self._require_complete_artifact(input_ref, kind)
+        input_ref = status.input_ref(name)
+        self._require_complete_artifact(
+            input_ref,
+            input_ref.kind if kind is None else kind,
+        )
         return input_ref
 
     def _load_normalized_artifact(
@@ -659,7 +470,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         if already_cached:
             yield
             return
-        enabled, cache_base, remove_on_success = self._resolve_local_cache_plan(
+        enabled, cache_base, remove_after_use = self._resolve_local_cache_plan(
             self.zarr_loc,
             self.z,
             local_cache,
@@ -667,45 +478,47 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         if not enabled:
             yield
             return
-        if cache_base is None:
-            raise RuntimeError("Local cache path is missing")
-        status = self._require_complete_artifact(ref, "normalized")
-        source_group = group_at(self.zw, status.path)
-        source = as_zarr_array(source_group["data"], name="data")
-        cache_path = os.path.join(
-            cache_base,
-            ref.artifact_id,
-            "normed.zarr",
-        )
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        staged = create_or_open_staged_normed_array(
-            cache_path,
-            (int(source.shape[0]), int(source.shape[1])),
-        )
-        if not bool(staged.attrs.get("complete", False)):
-            copy_zarr_array(
-                source,
-                staged,
-                msg="Staging normalized data locally",
-                resources=self.resources,
-            )
-            staged.attrs["complete"] = True
         try:
             cache = self._normalizedArtifactCache
         except AttributeError:
             cache = {}
             self._normalizedArtifactCache = cache
-        cache[ref] = ChunkedArray(
-            staged,
-            block_size=_row_block(staged, batch_size),
-            nthreads=self.nthreads,
-            resources=self.resources,
-        )
+        # A staging copy that fails or is interrupted is removed with the rest
+        # of a temporary cache directory.
         try:
+            if cache_base is None:
+                raise RuntimeError("Local cache path is missing")
+            status = self._require_complete_artifact(ref, "normalized")
+            source_group = group_at(self.zw, status.path)
+            source = as_zarr_array(source_group["data"], name="data")
+            cache_path = os.path.join(
+                cache_base,
+                ref.artifact_id,
+                "normed.zarr",
+            )
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            staged = create_or_open_staged_normed_array(
+                cache_path,
+                (int(source.shape[0]), int(source.shape[1])),
+            )
+            if not bool(staged.attrs.get("complete", False)):
+                copy_zarr_array(
+                    source,
+                    staged,
+                    msg="Staging normalized data locally",
+                    resources=self.resources,
+                )
+                staged.attrs["complete"] = True
+            cache[ref] = ChunkedArray(
+                staged,
+                block_size=_row_block(staged, batch_size),
+                nthreads=self.nthreads,
+                resources=self.resources,
+            )
             yield
         finally:
             cache.pop(ref, None)
-            if remove_on_success:
+            if remove_after_use and cache_base is not None:
                 import shutil
 
                 shutil.rmtree(cache_base, ignore_errors=True)
@@ -905,16 +718,18 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             reuse_validator=valid_shape,
         )
         if not planned.reused:
-            group = start_artifact(self.zw, planned)
-            relative_path = artifact_path(planned.ref).removeprefix(f"{assay_name}/")
-            assay._write_normalized_payload(
-                cell_idx,
-                np.flatnonzero(selections.featureMask),
-                relative_path,
-                log_transform=log_transform,
-                renormalize_subset=renormalize_subset,
-            )
-            finish_artifact(group, planned)
+            self._require_writable("run_normalization")
+            with artifact_transaction(self.zw, planned):
+                relative_path = artifact_path(planned.ref).removeprefix(
+                    f"{assay_name}/"
+                )
+                assay._write_normalized_payload(
+                    cell_idx,
+                    np.flatnonzero(selections.featureMask),
+                    relative_path,
+                    log_transform=log_transform,
+                    renormalize_subset=renormalize_subset,
+                )
         action = "Reused" if planned.reused else "Stored"
         logger.info(
             f"{action} normalized data for {n_cells} cells and {n_features} features"
@@ -940,9 +755,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         lsi_n_iter: int = 5,
         lsi_n_oversamples: int = 10,
     ) -> ArtifactRef:
-        requested_dims = _positive_integer(dims, "dims")
+        requested_dims = integer_argument(dims, "dims", minimum=1)
         if batch_size is not None:
-            _positive_integer(batch_size, "batch_size")
+            integer_argument(batch_size, "batch_size", minimum=1)
         if not isinstance(normalized, ArtifactRef):
             raise TypeError("normalized must be an ArtifactRef")
         normalized_ref = normalized
@@ -1019,10 +834,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         data_array = as_zarr_array(data_group["data"], name="data")
         n_cells, n_features = map(int, data_array.shape)
         effective_batch_size = min(
-            _positive_integer(batch_size, "batch_size"),
+            integer_argument(batch_size, "batch_size", minimum=1),
             n_cells,
         )
-        effective_dims = _positive_integer(dims, "dims")
+        effective_dims = integer_argument(dims, "dims", minimum=1)
         if custom_loadings is not None:
             if custom_loadings.ndim != 2:
                 raise ValueError("Custom loadings must be a two-dimensional matrix")
@@ -1098,12 +913,22 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         )
         if method == "pca":
             assert pca_selection is not None
+            n_blocks = -(-n_cells // effective_batch_size)
+            use_gram, _reason = _gram_pca_dispatch(
+                n_features,
+                effective_batch_size,
+                n_blocks,
+            )
             arguments: Any = PcaArguments(
                 normalized=normalized_ref,
                 feature_scaling=scaling_plan.ref,
                 pca_cell_selection=pca_selection,
                 dims=effective_dims,
                 feat_scaling=feat_scaling,
+                # IncrementalPCA over several blocks depends on the block size.
+                incremental_block_rows=(
+                    effective_batch_size if n_blocks > 1 and not use_gram else None
+                ),
                 batch_size=effective_batch_size,
                 show_elbow_plot=show_elbow_plot,
                 invalidate_cache=invalidate_cache,
@@ -1162,6 +987,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 f"with {effective_dims} dimensions"
             )
             return planned.ref
+        self._require_writable(
+            {"pca": "run_pca", "lsi": "run_lsi"}.get(method, "run_custom_reduction")
+        )
         if method == "lsi" and lsi_solver == "materialized":
             require_materialized_lsi_budget(
                 n_rows=n_cells,
@@ -1245,24 +1073,23 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 else:
                     mu = np.array([], dtype=np.float64)
                     sigma = np.array([], dtype=np.float64)
-                scaling_group = start_artifact(self.zw, scaling_plan)
-                mean_array = create_zarr_dataset(
-                    scaling_group,
-                    "mean",
-                    (100000,),
-                    "f8",
-                    mu.shape,
-                )
-                mean_array[:] = mu
-                scale_array = create_zarr_dataset(
-                    scaling_group,
-                    "scale",
-                    (100000,),
-                    "f8",
-                    sigma.shape,
-                )
-                scale_array[:] = sigma
-                finish_artifact(scaling_group, scaling_plan)
+                with artifact_transaction(self.zw, scaling_plan) as scaling_group:
+                    mean_array = create_zarr_dataset(
+                        scaling_group,
+                        "mean",
+                        (100000,),
+                        "f8",
+                        mu.shape,
+                    )
+                    mean_array[:] = mu
+                    scale_array = create_zarr_dataset(
+                        scaling_group,
+                        "scale",
+                        (100000,),
+                        "f8",
+                        sigma.shape,
+                    )
+                    scale_array[:] = sigma
             use_for_pca = (
                 pca_use_values if method == "pca" else np.ones(n_cells, dtype=bool)
             )
@@ -1293,56 +1120,55 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     f"{None if loadings is None else loadings.shape}; expected "
                     f"{(n_features, effective_dims)}"
                 )
-            reduction_group = start_artifact(self.zw, planned)
-            if method == "pca":
-                assert transform.center is not None
-                center_array = create_zarr_dataset(
-                    reduction_group,
-                    "center",
-                    (n_features,),
-                    "f8",
-                    (n_features,),
-                )
-                center_array[:] = transform.center
-            output = create_zarr_dataset(
-                reduction_group,
-                "loadings",
-                normalized_data.chunksize,
-                "f8",
-                loadings.shape,
-            )
-            output[:, :] = loadings
-            scores = create_numeric_array(
-                reduction_group,
-                "data",
-                score_spec,
-            )
-
-            def score_blocks() -> Iterator[np.ndarray]:
-                for block in normalized_data._stream_blocks(
-                    nthreads=self.nthreads,
-                    msg="Calculating reduced coordinates",
-                    prefetch=1,
-                    row_mask=None,
-                    resident_bytes=write_bytes
-                    + producer_bytes
-                    - normalized_data._block_task_bytes(),
-                ):
-                    yield np.asarray(
-                        transform.transform(block),
-                        dtype=np.float32,
+            with artifact_transaction(self.zw, planned) as reduction_group:
+                if method == "pca":
+                    assert transform.center is not None
+                    center_array = create_zarr_dataset(
+                        reduction_group,
+                        "center",
+                        (n_features,),
+                        "f8",
+                        (n_features,),
                     )
+                    center_array[:] = transform.center
+                output = create_zarr_dataset(
+                    reduction_group,
+                    "loadings",
+                    normalized_data.chunksize,
+                    "f8",
+                    loadings.shape,
+                )
+                output[:, :] = loadings
+                scores = create_numeric_array(
+                    reduction_group,
+                    "data",
+                    score_spec,
+                )
 
-            write_dense_from_row_batches(
-                scores,
-                score_blocks(),
-                dtype=np.float32,
-                msg="Writing reduced coordinates",
-                resources=self.resources,
-                io=self.storageIo,
-                producerReserveBytes=producer_bytes,
-            )
-            finish_artifact(reduction_group, planned)
+                def score_blocks() -> Iterator[np.ndarray]:
+                    for block in normalized_data._stream_blocks(
+                        nthreads=self.nthreads,
+                        msg="Calculating reduced coordinates",
+                        prefetch=1,
+                        row_mask=None,
+                        resident_bytes=write_bytes
+                        + producer_bytes
+                        - normalized_data._block_task_bytes(),
+                    ):
+                        yield np.asarray(
+                            transform.transform(block),
+                            dtype=np.float32,
+                        )
+
+                write_dense_from_row_batches(
+                    scores,
+                    score_blocks(),
+                    dtype=np.float32,
+                    msg="Writing reduced coordinates",
+                    resources=self.resources,
+                    io=self.storageIo,
+                    producerReserveBytes=producer_bytes,
+                )
         if show_elbow_plot and method == "pca":
             from ...plotting import elbow
 
@@ -1383,7 +1209,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             batch_size: Number of selected cells processed per block. When
                 omitted, whole stored row bands are combined as needed to fit
                 at least ``dims + 1`` rows. An explicit smaller value is
-                expanded to that aligned minimum with a warning.
+                expanded to that aligned minimum with a warning. Several
+                blocks narrower than the selected features, or more than 4096
+                features, are fitted with IncrementalPCA, whose result depends
+                on the block size, so the block size then joins the artifact
+                identity.
             local_cache: Local staging policy for normalized data on remote
                 stores.
             show_elbow_plot: Whether to display explained variance after a new
@@ -1446,11 +1276,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         """
         if solver not in {"streaming", "materialized"}:
             raise ValueError("solver must be 'streaming' or 'materialized'")
-        n_iter = _nonnegative_integer(n_iter, "n_iter")
-        n_oversamples = _nonnegative_integer(n_oversamples, "n_oversamples")
+        n_iter = integer_argument(n_iter, "n_iter", minimum=0)
+        n_oversamples = integer_argument(n_oversamples, "n_oversamples", minimum=0)
         if not isinstance(skip_first, bool | np.bool_):
             raise TypeError("skip_first must be a boolean")
-        rand_state = _nonnegative_integer(rand_state, "rand_state")
+        rand_state = integer_argument(rand_state, "rand_state", minimum=0)
         return self._run_reduction_artifact(
             method="lsi",
             normalized=normalized,
@@ -1527,18 +1357,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
         """Snapshot live batch columns, then fit or reuse Harmony correction."""
-        from ...embeddings.harmony.api import validate_harmony_parameters
-
+        # Validate before the snapshot is written; the fit validates again
+        # because the pipeline calls it with its own snapshot.
         self._resolve_harmony_reduction(reduction)
-        if not isinstance(batch_columns, list) or not batch_columns:
-            raise ValueError("batch_columns must be a non-empty list")
-        if any(not isinstance(column, str) or not column for column in batch_columns):
-            raise ValueError("batch_columns must contain non-empty strings")
-        if len(set(batch_columns)) != len(batch_columns):
-            raise ValueError("batch_columns must be unique")
-        if batch_size is not None:
-            _positive_integer(batch_size, "batch_size")
-        validate_harmony_parameters(harmony_params)
+        _validated_harmony_request(batch_columns, harmony_params, batch_size)
         batch_snapshot = snapshot_run_metadata(
             self.zw,
             table_path="cellData",
@@ -1578,14 +1400,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             "cell_selection",
             "cell_selection",
         )
-        validated_cells = validate_stored_selection_integrity(
-            self.zw,
-            cell_selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )
+        validated_cells = validate_cell_selection(self.zw, cell_selection)
         return reduction_ref.assay, cell_selection, validated_cells
 
     def _run_harmony_artifact(
@@ -1599,23 +1414,16 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
         """Fit Harmony from an explicit immutable metadata snapshot."""
-        from ...embeddings.harmony.api import validate_harmony_parameters
-
         if not isinstance(batch_snapshot, ArtifactRef):
             raise TypeError("batch_snapshot must be an ArtifactRef")
-        resolved_harmony_params = validate_harmony_parameters(harmony_params)
         reduction_ref = reduction
         reduction_assay, cell_selection, validated_cells = (
             self._resolve_harmony_reduction(reduction_ref)
         )
-        if not isinstance(batch_columns, list) or not batch_columns:
-            raise ValueError("batch_columns must be a non-empty list")
-        if any(not isinstance(column, str) or not column for column in batch_columns):
-            raise ValueError("batch_columns must contain non-empty strings")
-        if len(set(batch_columns)) != len(batch_columns):
-            raise ValueError("batch_columns must be unique")
-        requested_batch_size = (
-            None if batch_size is None else _positive_integer(batch_size, "batch_size")
+        resolved_harmony_params, requested_batch_size = _validated_harmony_request(
+            batch_columns,
+            harmony_params,
+            batch_size,
         )
         snapshot = validate_run_metadata_snapshot(
             self.zw,
@@ -1690,12 +1498,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     "selected_count": validated_cells.selected_count,
                 },
             )
-        source_data = getattr(source, "data", None)
-        source_batch_size = (
-            int(source_data.chunksize[0]) if source_data is not None else n_cells
-        )
-        effective_batch_size = min(
-            source_batch_size if requested_batch_size is None else requested_batch_size,
+        effective_batch_size = _requested_block_rows(
+            source,
+            requested_batch_size,
             n_cells,
         )
         arguments = HarmonyArguments(
@@ -1726,6 +1531,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             invalidate_cache=invalidate_cache,
         )
         if not planned.reused:
+            self._require_writable("run_harmony")
             correction = BatchCorrectionStage(
                 stream=source,
                 n_cells=n_cells,
@@ -1750,48 +1556,47 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 result.corrected.T,
                 result.assignments,
             )
-            group = start_artifact(self.zw, planned)
-            output = create_numeric_array(
-                group,
-                "data",
-                row_sharded_array_spec(
-                    corrected.shape,
-                    np.float32,
-                    profile=resolve_storage_profile(group.store),
-                    band_rows=min(n_cells, 1_000_000),
-                    zarr_format=_group_zarr_format(group),
-                    fill_value=0.0,
-                ),
-            )
-            for start, stop in iter_shard_row_slices(
-                n_cells,
-                array_shard_rows(output),
-            ):
-                shutdown_checkpoint()
-                output[start:stop, :] = np.asarray(
-                    result.corrected[:, start:stop].T,
-                    dtype=np.float32,
-                )
-            for name, values in (
-                ("cluster_mass", cluster_mass),
-                ("raw_centroids", raw_centroids),
-                ("corrected_centroids", corrected_centroids),
-                ("centroids", result.centroids),
-                ("sigma", result.sigma),
-                ("ridge", result.ridge),
-            ):
-                result_array = create_zarr_dataset(
+            with artifact_transaction(self.zw, planned) as group:
+                output = create_numeric_array(
                     group,
-                    name,
-                    tuple(max(int(size), 1) for size in values.shape),
-                    "f8",
-                    values.shape,
+                    "data",
+                    row_sharded_array_spec(
+                        corrected.shape,
+                        np.float32,
+                        profile=resolve_storage_profile(group.store),
+                        band_rows=min(n_cells, 1_000_000),
+                        zarr_format=_group_zarr_format(group),
+                        fill_value=0.0,
+                    ),
                 )
-                result_array[...] = values
-            group.attrs["batch_levels"] = [
-                list(levels) for levels in result.batch_levels
-            ]
-            finish_artifact(group, planned)
+                for start, stop in iter_shard_row_slices(
+                    n_cells,
+                    array_shard_rows(output),
+                ):
+                    shutdown_checkpoint()
+                    output[start:stop, :] = np.asarray(
+                        result.corrected[:, start:stop].T,
+                        dtype=np.float32,
+                    )
+                for name, values in (
+                    ("cluster_mass", cluster_mass),
+                    ("raw_centroids", raw_centroids),
+                    ("corrected_centroids", corrected_centroids),
+                    ("centroids", result.centroids),
+                    ("sigma", result.sigma),
+                    ("ridge", result.ridge),
+                ):
+                    result_array = create_zarr_dataset(
+                        group,
+                        name,
+                        tuple(max(int(size), 1) for size in values.shape),
+                        "f8",
+                        values.shape,
+                    )
+                    result_array[...] = values
+                group.attrs["batch_levels"] = [
+                    list(levels) for levels in result.batch_levels
+                ]
         action = "Reused" if planned.reused else "Stored"
         logger.info(
             f"{action} Harmony coordinates for {n_cells} cells with {dims} dimensions"
@@ -1808,35 +1613,33 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         invalidate_cache: bool,
         kmeans_sampling: float = 0.1,
         kmeans_batch_size: int = 10_000,
-        algorithm_version: str = "minibatch_kmeans_v2",
+        algorithm_version: str = "minibatch_kmeans_v3",
     ) -> ArtifactRef:
         if coordinates.assay is None:
             raise ValueError("Coordinate artifact has no assay")
         resolved_batch_size = (
-            None if batch_size is None else _positive_integer(batch_size, "batch_size")
+            None
+            if batch_size is None
+            else integer_argument(batch_size, "batch_size", minimum=1)
         )
-        requested_clusters = _positive_integer(n_centroids, "n_centroids")
-        resolved_rand_state = _positive_integer(rand_state, "rand_state")
+        requested_clusters = integer_argument(n_centroids, "n_centroids", minimum=1)
+        resolved_rand_state = integer_argument(rand_state, "rand_state", minimum=1)
         resolved_kmeans_sampling = _sampling_fraction(
             kmeans_sampling,
             "kmeans_sampling",
         )
-        requested_kmeans_batch_size = _positive_integer(
-            kmeans_batch_size,
-            "kmeans_batch_size",
+        requested_kmeans_batch_size = integer_argument(
+            kmeans_batch_size, "kmeans_batch_size", minimum=1
         )
         stream, n_cells, coordinate_dims = self._coordinate_source(
             coordinates,
             batch_size=resolved_batch_size,
         )
-        source_data = getattr(stream, "data", None)
-        source_batch_size = (
-            int(source_data.chunksize[0]) if source_data is not None else n_cells
+        effective_batch_size = _requested_block_rows(
+            stream,
+            resolved_batch_size,
+            n_cells,
         )
-        requested_batch_size = (
-            source_batch_size if resolved_batch_size is None else resolved_batch_size
-        )
-        effective_batch_size = min(int(requested_batch_size), n_cells)
         if requested_clusters < 2 or n_cells < 2:
             raise ValueError(
                 "Embedding initialization requires at least two cells and centroids"
@@ -1877,6 +1680,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             invalidate_cache=invalidate_cache,
         )
         if not planned.reused:
+            self._require_writable("build_embedding_initialization")
             initialization = KMeansInitializationStage.fit(
                 stream=stream,
                 n_rows=n_cells,
@@ -1887,24 +1691,23 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 kmeans_sampling=resolved_kmeans_sampling,
                 kmeans_batch_size=effective_kmeans_batch_size,
             )
-            group = start_artifact(self.zw, planned)
-            centers = create_zarr_dataset(
-                group,
-                "cluster_centers",
-                (1000, 1000),
-                "f8",
-                initialization.model.cluster_centers_.shape,
-            )
-            centers[:, :] = initialization.model.cluster_centers_
-            labels = create_zarr_dataset(
-                group,
-                "cluster_labels",
-                (100000,),
-                np.uint32,
-                initialization.labels.shape,
-            )
-            labels[:] = initialization.labels
-            finish_artifact(group, planned)
+            with artifact_transaction(self.zw, planned) as group:
+                centers = create_zarr_dataset(
+                    group,
+                    "cluster_centers",
+                    (1000, 1000),
+                    "f8",
+                    initialization.model.cluster_centers_.shape,
+                )
+                centers[:, :] = initialization.model.cluster_centers_
+                labels = create_zarr_dataset(
+                    group,
+                    "cluster_labels",
+                    (100000,),
+                    np.uint32,
+                    initialization.labels.shape,
+                )
+                labels[:] = initialization.labels
         action = "Reused" if planned.reused else "Stored"
         logger.info(
             f"{action} embedding initialization with {effective_clusters} centroids"
@@ -1970,16 +1773,18 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             raise ValueError("Coordinate artifact has no assay")
         if ann_metric not in {"l2", "cosine"}:
             raise ValueError("ann_metric must be one of: l2, cosine")
-        resolved_ann_efc = _positive_integer(ann_efc, "ann_efc")
-        resolved_ann_ef = _positive_integer(ann_ef, "ann_ef")
-        resolved_ann_m = _positive_integer(ann_m, "ann_m")
-        resolved_rand_state = _positive_integer(rand_state, "rand_state")
+        resolved_ann_efc = integer_argument(ann_efc, "ann_efc", minimum=1)
+        resolved_ann_ef = integer_argument(ann_ef, "ann_ef", minimum=1)
+        resolved_ann_m = integer_argument(ann_m, "ann_m", minimum=1)
+        resolved_rand_state = integer_argument(rand_state, "rand_state", minimum=1)
         if resolved_ann_m < 2:
             raise ValueError("ann_m must be at least two")
         if not isinstance(ann_parallel, bool):
             raise TypeError("ann_parallel must be a boolean")
         resolved_batch_size = (
-            None if batch_size is None else _positive_integer(batch_size, "batch_size")
+            None
+            if batch_size is None
+            else integer_argument(batch_size, "batch_size", minimum=1)
         )
         if coordinates.kind not in {
             "reduction",
@@ -1994,14 +1799,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             coordinates,
             batch_size=resolved_batch_size,
         )
-        source_data = getattr(coordinate_source, "data", None)
-        source_batch_size = (
-            int(source_data.chunksize[0]) if source_data is not None else n_cells
+        effective_batch_size = _requested_block_rows(
+            coordinate_source,
+            resolved_batch_size,
+            n_cells,
         )
-        requested_batch_size = (
-            source_batch_size if resolved_batch_size is None else resolved_batch_size
-        )
-        effective_batch_size = min(int(requested_batch_size), n_cells)
         parallel_threads = self.nthreads if ann_parallel else None
         arguments = AnnIndexArguments(
             coordinates=coordinates,
@@ -2028,7 +1830,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     ann_metric,
                     dims,
                     expected_count=n_cells,
-                    require_metadata=False,
                 )
             except (FileNotFoundError, RuntimeError, ValueError):
                 return False
@@ -2042,6 +1843,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             reuse_validator=valid_ann_artifact,
         )
         if not planned.reused:
+            self._require_writable("build_ann_index")
             ann_idx = AnnIndexStage.fit(
                 coordinates=coordinate_source,
                 metric=ann_metric,
@@ -2053,15 +1855,15 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 rand_state=resolved_rand_state,
                 nthreads=(self.nthreads if ann_parallel else 1),
             )
-            group = start_artifact(self.zw, planned)
-            self._persist_ann_index(
-                artifact_path(planned.ref),
-                ann_idx,
-                ann_metric=ann_metric,
-                dimensions=dims,
-                element_count=n_cells,
-            )
-            finish_artifact(group, planned)
+            with artifact_transaction(self.zw, planned) as group:
+                save_ann_index(
+                    group,
+                    ann_idx,
+                    profile=self.storageProfile,
+                    metric=ann_metric,
+                    dimensions=dims,
+                    element_count=n_cells,
+                )
         action = "Reused" if planned.reused else "Stored"
         logger.info(f"{action} ANN index for {n_cells} cells")
         return planned.ref
@@ -2085,10 +1887,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         )
         if ann_ref.assay is None:
             raise ValueError("ANN artifact has no assay")
-        raw_coordinates = (ann_status.inputs or {}).get("coordinates")
-        if not isinstance(raw_coordinates, dict):
-            raise ValueError("ANN artifact has no coordinates input")
-        stored_coordinates = ArtifactRef.from_dict(raw_coordinates)
+        stored_coordinates = self._artifact_input_ref(ann_ref, "coordinates", None)
         if stored_coordinates.kind not in {
             "reduction",
             "batch_correction",
@@ -2098,15 +1897,13 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 "ANN coordinates must be reduction, batch_correction, "
                 "or imported_coordinates"
             )
-        self._require_complete_artifact(
-            stored_coordinates,
-            stored_coordinates.kind,
-        )
         if coordinates is not None and coordinates != stored_coordinates:
             raise ValueError("coordinates do not match the ANN artifact input")
-        requested_k = _positive_integer(k, "k")
+        requested_k = integer_argument(k, "k", minimum=1)
         resolved_batch_size = (
-            None if batch_size is None else _positive_integer(batch_size, "batch_size")
+            None
+            if batch_size is None
+            else integer_argument(batch_size, "batch_size", minimum=1)
         )
         coordinate_source, n_cells, dims = self._coordinate_source(
             stored_coordinates,
@@ -2117,18 +1914,24 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         effective_k = min(requested_k, n_cells - 1)
         if n_cells - 1 > np.iinfo(np.uint32).max:
             raise ValueError("Neighbor indices require fewer than 2**32 cells")
-        source_data = getattr(coordinate_source, "data", None)
-        source_batch_size = (
-            int(source_data.chunksize[0]) if source_data is not None else n_cells
+        effective_batch_size = _requested_block_rows(
+            coordinate_source,
+            resolved_batch_size,
+            n_cells,
         )
-        requested_batch_size = (
-            source_batch_size if resolved_batch_size is None else resolved_batch_size
-        )
-        effective_batch_size = min(int(requested_batch_size), n_cells)
         ann_parameters = ann_status.parameters or {}
         ann_metric = ann_parameters.get("ann_metric")
         if ann_metric not in {"l2", "cosine"}:
             raise ValueError("ANN artifact has no supported distance metric")
+        ann_ef = ann_parameters.get("ann_ef")
+        if isinstance(ann_ef, bool) or not isinstance(ann_ef, int) or ann_ef < 1:
+            raise ValueError(
+                "ANN artifact has no valid ann_ef search depth. Re-run build_ann_index."
+            )
+        if "parallel_threads" not in ann_parameters:
+            raise ValueError(
+                "ANN artifact has no parallel_threads record. Re-run build_ann_index."
+            )
         from ...storage.ann_index import validate_ann_index_contract
 
         validate_ann_index_contract(
@@ -2136,7 +1939,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             str(ann_metric),
             dims,
             expected_count=n_cells,
-            require_metadata=True,
         )
         arguments = NeighborQueryArguments(
             ann_index=ann_ref,
@@ -2164,6 +1966,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             invalidate_cache=invalidate_cache,
         )
         if not planned.reused:
+            self._require_writable("query_neighbors")
             ann_idx = self._resolve_ann_index(
                 ann_ref,
                 str(ann_metric),
@@ -2172,8 +1975,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             )
             ann_idx = AnnIndexStage.configure(
                 ann_idx,
-                ef=int(ann_parameters.get("ann_ef", 50)),
-                threads=(int(ann_parameters.get("parallel_threads") or 1)),
+                ef=ann_ef,
+                threads=int(ann_parameters["parallel_threads"] or 1),
             )
             query = NeighborQueryStage(
                 ann_idx,
@@ -2206,40 +2009,39 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 raise ValueError(
                     f"Coordinate source contains {start} rows, expected {n_cells}"
                 )
-            group = start_artifact(self.zw, planned)
-            array_profile = resolve_storage_profile(group.store)
-            zarr_format = _group_zarr_format(group)
-            indices_array = create_numeric_array(
-                group,
-                "indices",
-                row_sharded_array_spec(
-                    indices.shape,
-                    np.uint32,
-                    profile=array_profile,
-                    band_rows=min(n_cells, 1_000_000),
-                    zarr_format=zarr_format,
-                ),
-            )
-            distances_array = create_numeric_array(
-                group,
-                "distances",
-                row_sharded_array_spec(
-                    distances.shape,
-                    np.float32,
-                    profile=array_profile,
-                    band_rows=min(n_cells, 1_000_000),
-                    zarr_format=zarr_format,
-                    fill_value=0.0,
-                ),
-            )
-            indices_array[:, :] = indices
-            distances_array[:, :] = distances
-            group.attrs["n_cells"] = n_cells
-            group.attrs["n_neighbors"] = effective_k
-            group.attrs["self_hit_rate"] = (
-                100.0 * (n_cells - missed_self_hits) / n_cells
-            )
-            finish_artifact(group, planned)
+            with artifact_transaction(self.zw, planned) as group:
+                array_profile = resolve_storage_profile(group.store)
+                zarr_format = _group_zarr_format(group)
+                indices_array = create_numeric_array(
+                    group,
+                    "indices",
+                    row_sharded_array_spec(
+                        indices.shape,
+                        np.uint32,
+                        profile=array_profile,
+                        band_rows=min(n_cells, 1_000_000),
+                        zarr_format=zarr_format,
+                    ),
+                )
+                distances_array = create_numeric_array(
+                    group,
+                    "distances",
+                    row_sharded_array_spec(
+                        distances.shape,
+                        np.float32,
+                        profile=array_profile,
+                        band_rows=min(n_cells, 1_000_000),
+                        zarr_format=zarr_format,
+                        fill_value=0.0,
+                    ),
+                )
+                indices_array[:, :] = indices
+                distances_array[:, :] = distances
+                group.attrs["n_cells"] = n_cells
+                group.attrs["n_neighbors"] = effective_k
+                group.attrs["self_hit_rate"] = (
+                    100.0 * (n_cells - missed_self_hits) / n_cells
+                )
         action = "Reused" if planned.reused else "Stored"
         logger.info(f"{action} {effective_k} neighbors for each of {n_cells} cells")
         return planned.ref
@@ -2303,6 +2105,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         if not planned.reused:
             from ...neighbors.graph import build_connectivity_arrays
 
+            self._require_writable("build_connectivity_map")
             distance_values = np.asarray(
                 as_zarr_array(
                     group["distances"],
@@ -2315,38 +2118,37 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 local_connectivity=local_connectivity,
                 bandwidth=bandwidth,
             )
-            output = start_artifact(self.zw, planned)
-            profile = resolve_storage_profile(output.store)
-            zarr_format = _group_zarr_format(output)
-            edge_band_rows = min(n_cells, 1_000_000) * n_neighbors
-            edges = create_numeric_array(
-                output,
-                "edges",
-                row_sharded_array_spec(
-                    edge_values.shape,
-                    np.uint32,
-                    profile=profile,
-                    band_rows=edge_band_rows,
-                    zarr_format=zarr_format,
-                ),
-            )
-            weights = create_numeric_array(
-                output,
-                "weights",
-                row_sharded_array_spec(
-                    weight_values.shape,
-                    np.float32,
-                    profile=profile,
-                    band_rows=edge_band_rows,
-                    zarr_format=zarr_format,
-                    fill_value=0.0,
-                ),
-            )
-            edges[:, :] = edge_values
-            weights[:] = weight_values
-            output.attrs["n_cells"] = n_cells
-            output.attrs["n_neighbors"] = n_neighbors
-            finish_artifact(output, planned)
+            with artifact_transaction(self.zw, planned) as output:
+                profile = resolve_storage_profile(output.store)
+                zarr_format = _group_zarr_format(output)
+                edge_band_rows = min(n_cells, 1_000_000) * n_neighbors
+                edges = create_numeric_array(
+                    output,
+                    "edges",
+                    row_sharded_array_spec(
+                        edge_values.shape,
+                        np.uint32,
+                        profile=profile,
+                        band_rows=edge_band_rows,
+                        zarr_format=zarr_format,
+                    ),
+                )
+                weights = create_numeric_array(
+                    output,
+                    "weights",
+                    row_sharded_array_spec(
+                        weight_values.shape,
+                        np.float32,
+                        profile=profile,
+                        band_rows=edge_band_rows,
+                        zarr_format=zarr_format,
+                        fill_value=0.0,
+                    ),
+                )
+                edges[:, :] = edge_values
+                weights[:] = weight_values
+                output.attrs["n_cells"] = n_cells
+                output.attrs["n_neighbors"] = n_neighbors
         action = "Reused" if planned.reused else "Stored"
         logger.info(f"{action} connectivity map for {n_cells} cells")
         return planned.ref
@@ -2365,38 +2167,14 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         use_k: int | None,
     ) -> csr_matrix:
         """Load one already captured and validated graph reference."""
-
-        def symmetrize(g: csr_matrix) -> csr_matrix:
-            t = g + g.T
-            t = t - g.multiply(g.T)
-            return t
-
         from scipy.sparse import triu
 
-        graph_loc = self._graph_location(graph)
-        cache_key = (
-            graph_loc,
-            symmetric is True,
-            symmetric is True and upper_only is True,
-            use_k,
-        )
-        cache = getattr(self, "_graphMemoryCache", None)
-        if cache is not None:
-            with self._graphMemoryCacheLock:
-                cached = cache.get(cache_key)
-            if cached is not None:
-                return cached
-        _n_cells, matrix = self._store_to_sparse(graph_loc, "csr", use_k)
-        assert isinstance(matrix, csr_matrix)
-        if symmetric is True:
-            matrix = symmetrize(matrix)
-            if upper_only is True:
+        matrix = self._store_to_sparse(self._graph_location(graph), use_k)
+        if symmetric:
+            # Fuzzy union of the directed edge weights.
+            matrix = (matrix + matrix.T) - matrix.multiply(matrix.T)
+            if upper_only:
                 matrix = triu(matrix).tocsr()
-        if cache is not None:
-            with self._graphMemoryCacheLock:
-                active_cache = getattr(self, "_graphMemoryCache", None)
-                if active_cache is cache:
-                    matrix = active_cache.setdefault(cache_key, matrix)
         return matrix
 
     def load_graph(
@@ -2423,6 +2201,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
         if not isinstance(graph, ArtifactRef):
             raise TypeError("graph must be an ArtifactRef")
+        for name, flag in (("symmetric", symmetric), ("upper_only", upper_only)):
+            if flag is not None and not isinstance(flag, bool | np.bool_):
+                raise TypeError(f"{name} must be a boolean or None")
         if use_k is not None and (
             isinstance(use_k, bool) or not isinstance(use_k, int | np.integer)
         ):
@@ -2437,8 +2218,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 )
         return self._load_graph_artifact(
             graph,
-            symmetric=symmetric,
-            upper_only=upper_only,
+            symmetric=bool(symmetric),
+            upper_only=bool(upper_only),
             use_k=use_k,
         )
 
@@ -2486,7 +2267,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             raise ValueError(
                 f"Method {method} not supported, choose one of these: 'snn', 'wnn'"
             )
-        chunk_size = _positive_integer(chunk_size, "chunk_size")
+        chunk_size = integer_argument(chunk_size, "chunk_size", minimum=1)
         if len(sources) < 2:
             raise ValueError("Assay integration requires at least two assays")
         if not all(isinstance(source, ArtifactRef) for source in sources):
@@ -2563,7 +2344,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                         "expected_kind": "reduction,batch_correction",
                     },
                 )
-            source_n_cells = _validate_integration_source_payload(self.zw, source)
+            source_n_cells = validate_integration_source_payload(self.zw, source)
             if method == "wnn" and ancestry.reduction is not None:
                 reduction_status = inspect_artifact(self.zw, ancestry.reduction)
                 if reduction_status.operation == "run_pca":
@@ -2571,7 +2352,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             if shared_source_n_cells is None:
                 shared_source_n_cells = source_n_cells
             elif source_n_cells != shared_source_n_cells:
-                raise _integration_payload_error(
+                raise payload_error(
                     source,
                     "Integration sources contain different cell counts",
                 )
@@ -2627,6 +2408,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
         if integrated_plan.reused:
             return integrated_plan.ref
+        self._require_writable("integrate_assays")
 
         def load_wnn_inputs(
             index: int,
@@ -2689,38 +2471,37 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         n_cells = merged_graph.shape[0]
         n_neighbors = int(merged_graph.size / n_cells)
 
-        store = start_artifact(self.zw, integrated_plan)
-        store.attrs["n_cells"] = n_cells
-        store.attrs["n_neighbors"] = n_neighbors
-        store.attrs["assays"] = list(assays)
+        with artifact_transaction(self.zw, integrated_plan) as store:
+            store.attrs["n_cells"] = n_cells
+            store.attrs["n_neighbors"] = n_neighbors
+            store.attrs["assays"] = list(assays)
 
-        edge_chunk = chunk_size * n_neighbors
-        zge = create_zarr_dataset(
-            store,
-            "edges",
-            (edge_chunk,),
-            np.uint32,
-            (n_cells * n_neighbors, 2),
-        )
-        zgw = create_zarr_dataset(
-            store,
-            "weights",
-            (edge_chunk,),
-            np.float32,
-            (n_cells * n_neighbors,),
-        )
-
-        zge[:, 0] = merged_graph.row
-        zge[:, 1] = merged_graph.col
-        zgw[:] = merged_graph.data
-        if modality_weights is not None:
-            stored_modality_weights = create_zarr_dataset(
+            edge_chunk = chunk_size * n_neighbors
+            zge = create_zarr_dataset(
                 store,
-                "modality_weights",
-                (min(chunk_size, n_cells), len(assays)),
-                np.float32,
-                modality_weights.shape,
+                "edges",
+                (edge_chunk,),
+                np.uint32,
+                (n_cells * n_neighbors, 2),
             )
-            stored_modality_weights[:, :] = modality_weights
-        finish_artifact(store, integrated_plan)
+            zgw = create_zarr_dataset(
+                store,
+                "weights",
+                (edge_chunk,),
+                np.float32,
+                (n_cells * n_neighbors,),
+            )
+
+            zge[:, 0] = merged_graph.row
+            zge[:, 1] = merged_graph.col
+            zgw[:] = merged_graph.data
+            if modality_weights is not None:
+                stored_modality_weights = create_zarr_dataset(
+                    store,
+                    "modality_weights",
+                    (min(chunk_size, n_cells), len(assays)),
+                    np.float32,
+                    modality_weights.shape,
+                )
+                stored_modality_weights[:, :] = modality_weights
         return integrated_plan.ref

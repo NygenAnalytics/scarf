@@ -1,14 +1,16 @@
-import codecs
 import math
 import os
 import struct
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field
+from types import FrameType
 
 from ._lazy import (
     STRING_SOURCE_DECODED,
     STRING_SOURCE_PAYLOAD,
     LazyAtomicVector,
     LazyStringVector,
+    decode_r_string,
     pack_string_descriptor,
 )
 from ._model import (
@@ -68,6 +70,19 @@ _SINGLETON_TYPES = {
     RType.MISSING_ARGUMENT,
     RType.BASE_NAMESPACE,
 }
+_BYTECODE_PAIR_MARKERS = {
+    RType.LANGUAGE,
+    RType.PAIRLIST,
+    RType.BYTECODE_DEFINITION,
+    RType.BYTECODE_REFERENCE,
+    RType.BYTECODE_ATTR_LANGUAGE,
+    RType.BYTECODE_ATTR_PAIRLIST,
+}
+# Nested values recurse through at most two parser frames per level; one more
+# keeps a safety margin. The caller's stack plus a margin must also fit under
+# the interpreter limit.
+_FRAMES_PER_LEVEL = 3
+_STACK_MARGIN = 64
 _KNOWN_ALTREP = {
     "compact_intseq",
     "compact_realseq",
@@ -88,6 +103,23 @@ class _ObjectInfo:
     has_attributes: bool
     has_tag: bool
     gp: int
+
+
+@dataclass(slots=True)
+class _BytecodeRepetitions:
+    """Language cells that compiled R code shares within one bytecode tree."""
+
+    count: int
+    nodes: dict[int, RNode] = field(default_factory=dict)
+
+
+def _stack_depth() -> int:
+    depth = 0
+    frame: FrameType | None = sys._getframe()
+    while frame is not None:
+        depth += 1
+        frame = frame.f_back
+    return depth
 
 
 class _WireReader:
@@ -309,8 +341,15 @@ class _Parser:
         self._objects = 0
         self._references: list[RNode] = []
         self._singletons: dict[RType, RNode] = {}
+        self._maximumDepth = limits.max_depth
 
     def parse(self) -> RNode:
+        # Deep input must end in RdsLimitError rather than RecursionError, so
+        # the depth limit never exceeds what the remaining Python stack holds.
+        stack_levels = (
+            sys.getrecursionlimit() - _stack_depth() - _STACK_MARGIN
+        ) // _FRAMES_PER_LEVEL
+        self._maximumDepth = max(0, min(self.limits.max_depth, stack_levels))
         self.reader, self.metadata = self._parse_header()
         root = self._parse_node("$", 0)
         self._check_complete()
@@ -429,11 +468,11 @@ class _Parser:
 
     def _start_object(self, path: str, depth: int) -> int:
         offset = self.reader.tell()
-        if depth > self.limits.max_depth:
+        if depth > self._maximumDepth:
             raise RdsLimitError(
                 "max_depth",
                 depth,
-                self.limits.max_depth,
+                self._maximumDepth,
                 path=path,
                 offset=offset,
             )
@@ -468,10 +507,19 @@ class _Parser:
             gp=(flags >> 12) & 0xFFFF,
         )
 
-    def _parse_node(self, path: str, depth: int) -> RNode:
-        offset = self._start_object(path, depth)
-        flags = self.reader.read_int(path=path)
-        info = self._parse_info(flags, path=path, offset=offset)
+    def _parse_node(
+        self,
+        path: str,
+        depth: int,
+        header: tuple[int, _ObjectInfo, int] | None = None,
+    ) -> RNode:
+        """Parse one item; ``header`` passes flags already read by the caller."""
+        if header is None:
+            offset = self._start_object(path, depth)
+            flags = self.reader.read_int(path=path)
+            info = self._parse_info(flags, path=path, offset=offset)
+        else:
+            flags, info, offset = header
         r_type = info.type
 
         if r_type in _SINGLETON_TYPES:
@@ -567,8 +615,6 @@ class _Parser:
             )
         elif r_type is RType.S4:
             node.value = None
-        elif r_type is RType.ANY:
-            node.value = None
         else:
             raise RdsFormatError(
                 f"unsupported R node type {r_type.name}",
@@ -577,7 +623,12 @@ class _Parser:
             )
 
         if info.has_tag:
-            node.tag = self._null_to_none(self._parse_node(f"{path}.tag", depth + 1))
+            # R writes tags only on pairlist-like cells.
+            raise RdsFormatError(
+                f"{r_type.name} node cannot have a tag",
+                path=path,
+                offset=offset,
+            )
         if info.has_attributes:
             node.attributes = self._null_to_none(
                 self._parse_node(f"{path}.attributes", depth + 1)
@@ -642,31 +693,75 @@ class _Parser:
         depth: int,
         offset: int,
     ) -> RNode:
-        attributes = (
-            self._parse_node(f"{path}.attributes", depth + 1)
-            if info.has_attributes
-            else None
-        )
-        tag = self._parse_node(f"{path}.tag", depth + 1) if info.has_tag else None
-        car = self._parse_node(f"{path}.car", depth + 1)
-        cdr = self._parse_node(f"{path}.cdr", depth + 1)
-        normalized_tag = self._null_to_none(tag)
-        node = RNode(
-            info.type,
-            attributes=self._null_to_none(attributes),
-            tag=normalized_tag,
-            object=info.object,
-            gp=info.gp,
-            path=path,
-            offset=offset,
-        )
-        if info.type is RType.CLOSURE:
-            node.value = ClosureValue(normalized_tag, car, cdr)
-        elif info.type is RType.PROMISE:
-            node.value = PromiseValue(normalized_tag, car, cdr)
-        else:
-            node.value = PairValue(car, cdr)
-        return node
+        """Parse a pairlist chain, following CDR cells iteratively.
+
+        The cells after the first share one depth, so a long pairlist is
+        bounded by ``max_objects`` rather than by the nesting limit.
+        """
+        head: RNode | None = None
+        previous: tuple[RNode, RNode] | None = None
+        cell_info, cell_path, cell_depth, cell_offset = info, path, depth, offset
+        index = 0
+        while True:
+            attributes = (
+                self._parse_node(f"{cell_path}.attributes", cell_depth + 1)
+                if cell_info.has_attributes
+                else None
+            )
+            tag = (
+                self._parse_node(f"{cell_path}.tag", cell_depth + 1)
+                if cell_info.has_tag
+                else None
+            )
+            car = self._parse_node(f"{cell_path}.car", cell_depth + 1)
+            cell = RNode(
+                cell_info.type,
+                attributes=self._null_to_none(attributes),
+                tag=self._null_to_none(tag),
+                object=cell_info.object,
+                gp=cell_info.gp,
+                path=cell_path,
+                offset=cell_offset,
+            )
+            if previous is None:
+                head = cell
+            else:
+                previous[0].value = self._pair_value(previous[0], previous[1], cell)
+            previous = (cell, car)
+
+            index += 1
+            cdr_path = f"{path}.cdr" if index == 1 else f"{path}.cdr[{index}]"
+            cdr_offset = self._start_object(cdr_path, depth + 1)
+            flags = self.reader.read_int(path=cdr_path)
+            cdr_info = self._parse_info(flags, path=cdr_path, offset=cdr_offset)
+            if cdr_info.type not in _PAIR_TYPES:
+                cdr = self._parse_node(
+                    cdr_path,
+                    depth + 1,
+                    (flags, cdr_info, cdr_offset),
+                )
+                cell.value = self._pair_value(cell, car, cdr)
+                if head is None:
+                    raise AssertionError("pairlist chain lost its head")
+                return head
+            cell_info, cell_path, cell_depth, cell_offset = (
+                cdr_info,
+                cdr_path,
+                depth + 1,
+                cdr_offset,
+            )
+
+    @staticmethod
+    def _pair_value(
+        cell: RNode,
+        car: RNode,
+        cdr: RNode,
+    ) -> PairValue | ClosureValue | PromiseValue:
+        if cell.type is RType.CLOSURE:
+            return ClosureValue(cell.tag, car, cdr)
+        if cell.type is RType.PROMISE:
+            return PromiseValue(cell.tag, car, cdr)
+        return PairValue(car, cdr)
 
     def _parse_altrep(
         self,
@@ -719,20 +814,7 @@ class _Parser:
         return self._decode_char(raw, gp)
 
     def _decode_char(self, raw: bytes, gp: int) -> str | bytes:
-        if gp & (1 << 1):
-            return raw
-        if gp & (1 << 2):
-            return raw.decode("latin-1")
-        if gp & (1 << 3):
-            return raw.decode("utf-8", errors="surrogateescape")
-        if gp & (1 << 6):
-            return raw.decode("ascii", errors="surrogateescape")
-        encoding = self.metadata.native_encoding or "utf-8"
-        try:
-            codecs.lookup(encoding)
-        except LookupError:
-            encoding = "utf-8"
-        return raw.decode(encoding, errors="surrogateescape")
+        return decode_r_string(raw, gp, self.metadata.native_encoding)
 
     def _parse_atomic_vector(self, r_type: RType, *, path: str) -> LazyAtomicVector:
         length = self._read_length(path=f"{path}.length")
@@ -812,103 +894,66 @@ class _Parser:
         descriptor_offset = descriptor_writer.position
         decoded_storage: RandomAccessStorage | None = None
         decoded_writer: BufferedTempWriter | None = None
-        element_attributes: dict[int, RNode] = {}
 
         for index in range(length):
             item_path = f"{path}[{index}]"
             item_offset = self._start_object(item_path, depth + 1)
             flags = self.reader.read_int(path=item_path)
             info = self._parse_info(flags, path=item_path, offset=item_offset)
-            if info.type is RType.REFERENCE:
-                referenced = self._read_reference(
-                    flags,
-                    path=item_path,
-                    offset=item_offset,
-                )
-                if referenced.type is not RType.CHAR:
-                    raise RdsFormatError(
-                        "character vector reference does not target CHAR",
-                        path=item_path,
-                        offset=item_offset,
-                    )
-                raw, gp = self._encoded_materialized_char(referenced, item_path)
-                if raw is None:
-                    descriptor = pack_string_descriptor(0, 0, -1, gp)
-                else:
-                    if decoded_storage is None:
-                        decoded_storage = self.temp_manager.shared("string-data")
-                        decoded_writer = BufferedTempWriter(
-                            self.temp_manager,
-                            decoded_storage,
-                        )
-                    if decoded_writer is None:
-                        raise AssertionError("decoded writer was not initialized")
-                    data_offset = decoded_writer.write(raw, path=item_path)
-                    descriptor = pack_string_descriptor(
-                        STRING_SOURCE_DECODED,
-                        data_offset,
-                        len(raw),
-                        gp,
-                    )
-                if referenced.attributes is not None:
-                    element_attributes[index] = referenced.attributes
-            elif info.type is RType.CHAR:
-                string_length = self.reader.read_int(path=f"{item_path}.length")
-                self._check_string_length(
-                    string_length,
-                    path=item_path,
-                    offset=self.reader.tell(),
-                    allow_missing=True,
-                )
-                if string_length == -1:
-                    descriptor = pack_string_descriptor(0, 0, -1, info.gp)
-                elif self.reader.encoding is RdsEncoding.ASCII:
-                    raw = self.reader.read_ascii_string(
-                        string_length,
-                        path=item_path,
-                    )
-                    if decoded_storage is None:
-                        decoded_storage = self.temp_manager.shared("string-data")
-                        decoded_writer = BufferedTempWriter(
-                            self.temp_manager,
-                            decoded_storage,
-                        )
-                    if decoded_writer is None:
-                        raise AssertionError("decoded writer was not initialized")
-                    data_offset = decoded_writer.write(raw, path=item_path)
-                    descriptor = pack_string_descriptor(
-                        STRING_SOURCE_DECODED,
-                        data_offset,
-                        string_length,
-                        info.gp,
-                    )
-                else:
-                    data_offset = self.reader.skip(string_length, path=item_path)
-                    descriptor = pack_string_descriptor(
-                        STRING_SOURCE_PAYLOAD,
-                        data_offset,
-                        string_length,
-                        info.gp,
-                    )
-                if info.has_attributes:
-                    attributes = self._parse_node(
-                        f"{item_path}.attributes",
-                        depth + 2,
-                    )
-                    normalized = self._null_to_none(attributes)
-                    if normalized is not None:
-                        element_attributes[index] = normalized
-                if info.has_tag:
-                    raise RdsFormatError(
-                        "CHAR node cannot have a tag",
-                        path=item_path,
-                        offset=item_offset,
-                    )
-            else:
+            # R never references a CHARSXP and never writes its tag or
+            # attributes, so each element is one inline CHAR node.
+            if info.type is not RType.CHAR:
                 raise RdsFormatError(
                     f"character vector element has type {info.type.name}",
                     path=item_path,
                     offset=item_offset,
+                )
+            if info.has_tag:
+                raise RdsFormatError(
+                    "CHAR node cannot have a tag",
+                    path=item_path,
+                    offset=item_offset,
+                )
+            if info.has_attributes:
+                raise RdsFormatError(
+                    "CHAR node cannot have attributes",
+                    path=item_path,
+                    offset=item_offset,
+                )
+            string_length = self.reader.read_int(path=f"{item_path}.length")
+            self._check_string_length(
+                string_length,
+                path=item_path,
+                offset=self.reader.tell(),
+                allow_missing=True,
+            )
+            if string_length == -1:
+                descriptor = pack_string_descriptor(0, 0, -1, info.gp)
+            elif self.reader.encoding is RdsEncoding.ASCII:
+                raw = self.reader.read_ascii_string(
+                    string_length,
+                    path=item_path,
+                )
+                if decoded_writer is None:
+                    decoded_storage = self.temp_manager.shared("string-data")
+                    decoded_writer = BufferedTempWriter(
+                        self.temp_manager,
+                        decoded_storage,
+                    )
+                data_offset = decoded_writer.write(raw, path=item_path)
+                descriptor = pack_string_descriptor(
+                    STRING_SOURCE_DECODED,
+                    data_offset,
+                    string_length,
+                    info.gp,
+                )
+            else:
+                data_offset = self.reader.skip(string_length, path=item_path)
+                descriptor = pack_string_descriptor(
+                    STRING_SOURCE_PAYLOAD,
+                    data_offset,
+                    string_length,
+                    info.gp,
                 )
             descriptor_writer.write(descriptor, path=item_path)
 
@@ -926,29 +971,6 @@ class _Parser:
             decoded_storage=decoded_storage,
             default_encoding=self.metadata.native_encoding,
             path=path,
-            element_attributes=element_attributes,
-        )
-
-    def _encoded_materialized_char(
-        self,
-        node: RNode,
-        path: str,
-    ) -> tuple[bytes | None, int]:
-        value = node.value
-        if value is None:
-            return None, node.gp
-        if isinstance(value, bytes):
-            return value, node.gp
-        if isinstance(value, str):
-            encoding = self.metadata.native_encoding or "utf-8"
-            try:
-                return value.encode(encoding, errors="surrogateescape"), node.gp
-            except LookupError:
-                return value.encode("utf-8", errors="surrogateescape"), node.gp
-        raise RdsFormatError(
-            "referenced CHAR has no string value",
-            path=path,
-            offset=node.offset,
         )
 
     def _parse_persistent_strings(
@@ -968,20 +990,15 @@ class _Parser:
     def _parse_bytecode(self, *, path: str, depth: int) -> BytecodeValue:
         repeated = self.reader.read_int(path=f"{path}.repeatedCount")
         self._check_count(repeated, path=f"{path}.repeatedCount")
-        self._check_materialized_children(
-            repeated,
-            path=f"{path}.repeatedCount",
-        )
-        repetitions: list[RNode | None] = [None] * repeated
         return self._parse_bytecode_body(
-            repetitions,
+            _BytecodeRepetitions(repeated),
             path=path,
             depth=depth + 1,
         )
 
     def _parse_bytecode_body(
         self,
-        repetitions: list[RNode | None],
+        repetitions: _BytecodeRepetitions,
         *,
         path: str,
         depth: int,
@@ -1007,70 +1024,101 @@ class _Parser:
                     path=constant_path,
                     offset=marker_offset,
                 )
-            elif marker in {
-                RType.LANGUAGE,
-                RType.PAIRLIST,
-                RType.BYTECODE_DEFINITION,
-                RType.BYTECODE_REFERENCE,
-                RType.BYTECODE_ATTR_LANGUAGE,
-                RType.BYTECODE_ATTR_PAIRLIST,
-            }:
+            else:
                 value = self._parse_bytecode_language(
-                    int(marker),
+                    marker,
                     repetitions,
                     path=constant_path,
                     depth=depth + 1,
                 )
-            else:
-                value = self._parse_node(constant_path, depth + 1)
             constants.append(value)
         return BytecodeValue(code=code, constants=tuple(constants))
 
     def _parse_bytecode_language(
         self,
         marker: int,
-        repetitions: list[RNode | None],
+        repetitions: _BytecodeRepetitions,
         *,
         path: str,
         depth: int,
     ) -> RNode:
-        special_markers = {
-            RType.LANGUAGE,
-            RType.PAIRLIST,
-            RType.BYTECODE_DEFINITION,
-            RType.BYTECODE_REFERENCE,
-            RType.BYTECODE_ATTR_LANGUAGE,
-            RType.BYTECODE_ATTR_PAIRLIST,
-        }
-        if marker not in special_markers:
-            return self._parse_node(path, depth)
+        """Parse one bytecode constant, following CDR cells iteratively."""
+        head: RNode | None = None
+        pending: tuple[RNode, RNode] | None = None
+        cell_path = path
+        cell_depth = depth
+        index = 0
+        while True:
+            if marker not in _BYTECODE_PAIR_MARKERS:
+                # R pads other constants with a zero marker before the item.
+                result = self._parse_node(cell_path, cell_depth)
+            else:
+                marker_offset = self._start_object(cell_path, cell_depth)
+                if marker == RType.BYTECODE_REFERENCE:
+                    result = self._bytecode_reference(
+                        repetitions,
+                        path=cell_path,
+                        offset=marker_offset,
+                    )
+                else:
+                    cell, car = self._parse_bytecode_cell(
+                        marker,
+                        repetitions,
+                        path=cell_path,
+                        depth=cell_depth,
+                        offset=marker_offset,
+                    )
+                    if pending is None:
+                        head = cell
+                    else:
+                        pending[0].value = PairValue(pending[1], cell)
+                    pending = (cell, car)
+                    index += 1
+                    cell_path = f"{path}.cdr" if index == 1 else f"{path}.cdr[{index}]"
+                    cell_depth = depth + 1
+                    marker = self.reader.read_int(path=f"{cell_path}.marker")
+                    continue
+            if pending is None:
+                return result
+            pending[0].value = PairValue(pending[1], result)
+            if head is None:
+                raise AssertionError("bytecode pair chain lost its head")
+            return head
 
-        marker_offset = self._start_object(path, depth)
-        if marker == RType.BYTECODE_REFERENCE:
-            position = self.reader.read_int(path=f"{path}.position")
-            if (
-                position < 0
-                or position >= len(repetitions)
-                or repetitions[position] is None
-            ):
-                raise RdsFormatError(
-                    f"bytecode reference {position} is out of range",
-                    path=path,
-                    offset=marker_offset,
-                )
-            result = repetitions[position]
-            if result is None:
-                raise AssertionError("checked bytecode reference is missing")
-            return result
+    def _bytecode_reference(
+        self,
+        repetitions: _BytecodeRepetitions,
+        *,
+        path: str,
+        offset: int,
+    ) -> RNode:
+        position = self.reader.read_int(path=f"{path}.position")
+        node = repetitions.nodes.get(position)
+        if position < 0 or position >= repetitions.count or node is None:
+            raise RdsFormatError(
+                f"bytecode reference {position} is out of range",
+                path=path,
+                offset=offset,
+            )
+        return node
 
+    def _parse_bytecode_cell(
+        self,
+        marker: int,
+        repetitions: _BytecodeRepetitions,
+        *,
+        path: str,
+        depth: int,
+        offset: int,
+    ) -> tuple[RNode, RNode]:
         repetition_position: int | None = None
         if marker == RType.BYTECODE_DEFINITION:
             repetition_position = self.reader.read_int(path=f"{path}.position")
-            if repetition_position < 0 or repetition_position >= len(repetitions):
+            if not 0 <= repetition_position < repetitions.count:
                 raise RdsFormatError(
                     f"bytecode definition {repetition_position} is out of range",
                     path=path,
-                    offset=marker_offset,
+                    offset=offset,
                 )
             marker = self.reader.read_int(path=f"{path}.type")
 
@@ -1086,12 +1134,12 @@ class _Parser:
             raise RdsFormatError(
                 f"invalid bytecode pair definition type {marker}",
                 path=path,
-                offset=marker_offset,
+                offset=offset,
             )
 
-        node = RNode(r_type, path=path, offset=marker_offset)
+        node = RNode(r_type, path=path, offset=offset)
         if repetition_position is not None:
-            repetitions[repetition_position] = node
+            repetitions.nodes[repetition_position] = node
         if has_attributes:
             node.attributes = self._null_to_none(
                 self._parse_node(f"{path}.attributes", depth + 1)
@@ -1104,15 +1152,7 @@ class _Parser:
             path=f"{path}.car",
             depth=depth + 1,
         )
-        cdr_marker = self.reader.read_int(path=f"{path}.cdr.marker")
-        cdr = self._parse_bytecode_language(
-            cdr_marker,
-            repetitions,
-            path=f"{path}.cdr",
-            depth=depth + 1,
-        )
-        node.value = PairValue(car, cdr)
-        return node
+        return node, car
 
     def _read_length(self, *, path: str) -> int:
         offset = self.reader.tell()

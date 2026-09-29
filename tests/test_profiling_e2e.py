@@ -12,6 +12,7 @@ from profiling.config import (
     load_profiling_config,
 )
 from profiling.metrics import ResourceMeasurement
+from profiling.r2 import ObjectDownload
 from profiling.stages import StageRunResult
 from scarf.storage import ArtifactRef
 
@@ -181,8 +182,9 @@ def _mock_e2e_dependencies(
     monkeypatch.setattr(modal_app, "ResourceSampler", _Sampler)
     monkeypatch.setattr(modal_app, "put_json_if_absent", lambda *_args: True)
 
-    def download(_uri: str, destination: Path) -> None:
+    def download(_uri: str, destination: Path) -> ObjectDownload:
         destination.write_bytes(b"h5ad")
+        return ObjectDownload(fileBytes=4, eTag="etag-h5ad")
 
     def write_stage(_config: ProfilingConfig, result: StageRunResult) -> str:
         stage_results.append(result)
@@ -251,6 +253,12 @@ def test_e2e_funnel_runs_graph_construction_core_once_on_r2(
     ]
     assert summary["status"] == "ok"
     assert summary["storeBackend"] == "r2"
+    assert (summary["datasetETag"], summary["datasetBytes"]) == ("etag-h5ad", 4)
+    created = next(
+        item for item in summary["outcomes"] if item["stage"] == "createStore"
+    )
+    assert created["datasetUri"] == config.datasetUri(10_000)
+    assert (created["datasetETag"], created["datasetBytes"]) == ("etag-h5ad", 4)
     assert summary["funnelSeconds"] is not None
     assert summary["completedStages"] == list(CORE_STAGE_ORDER)
     assert summary["peakRssBytes"] == 350
@@ -605,12 +613,16 @@ def test_targeted_run_requires_force_to_overwrite_an_existing_result(
     assert "waitTimeout" not in captured
 
     modal_app.main(*base_args, "--force")
-    payload, n_rows, stage, submission_id, force = captured["spawnArgs"]
+    payload, n_rows, stage, submission_id, force, stages, allow_reuse = captured[
+        "spawnArgs"
+    ]
     assert submission_id
     assert payload["runTag"] == "e2e-test"
     assert n_rows == 10_000
     assert stage == "findMarkers"
     assert force is True
+    assert stages is None
+    assert allow_reuse is False
     assert 0 < captured["waitTimeout"] <= 20
 
 
@@ -741,3 +753,123 @@ def test_funnel_overlaps_background_stages_like_the_pipeline(
     # Budget-planned findMarkers waits for UMAP, and UMAP waits for its input.
     assert finished.index("runUmap") < finished.index("findMarkers")
     assert finished.index("buildEmbeddingInitialization") < finished.index("runUmap")
+
+
+def test_funnel_seconds_include_a_trailing_background_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import time
+
+    config = _config(runTag="e2e-tail")
+    _mock_e2e_dependencies(monkeypatch, tmp_path)
+    # The local backend pins the storage profile for its whole process, so let
+    # monkeypatch restore the variable after this test.
+    monkeypatch.setenv("SCARF_ZARR_PROFILE", "fast_local")
+
+    def run_stage(stage: StageName, **_kwargs: Any) -> StageRunResult:
+        if stage == "runUmap":
+            time.sleep(0.3)
+        return _stage_result(stage)
+
+    monkeypatch.setattr(modal_app, "run_stage", run_stage)
+    stages = list(CORE_STAGE_ORDER[: CORE_STAGE_ORDER.index("runLeiden") + 1])
+
+    summary = modal_app.run_funnel_job.local(
+        config.model_dump(mode="python"), 10_000, "testsubmission", "local", stages
+    )
+
+    assert summary["status"] == "ok"
+    assert summary["completedStages"] == stages
+    assert summary["funnelSeconds"] >= 0.3
+
+
+def test_funnel_refuses_stages_that_would_share_other_resources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = _config(runTag="e2e-mismatch")
+    resources = dict(config.stageResources)
+    resources["markHvgs"] = resources["markHvgs"].model_copy(
+        update={"scarfMemoryBudget": 2 * resources["markHvgs"].scarfMemoryBudget}
+    )
+    config = config.model_copy(update={"stageResources": resources})
+    _mock_e2e_dependencies(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        modal_app,
+        "run_stage",
+        lambda *_args, **_kwargs: pytest.fail("a mismatched funnel must not start"),
+    )
+
+    with pytest.raises(ValueError, match="markHvgs requests workers=8"):
+        _run_e2e(config)
+    with pytest.raises(ValueError, match="initializeStore opens the shared DataStore"):
+        modal_app._require_funnel_settings(
+            config, 10_000, CORE_STAGE_ORDER, storeOnR2=True
+        )
+    # Stages that open their own store may differ.
+    resources["markHvgs"] = config.resourcesFor("initializeStore")
+    resources["runLeiden"] = resources["runLeiden"].model_copy(update={"workers": 1})
+    uniform = config.model_copy(update={"stageResources": resources})
+    modal_app._require_funnel_settings(
+        uniform, 10_000, CORE_STAGE_ORDER, storeOnR2=True
+    )
+
+
+def test_funnel_refuses_a_store_override_and_an_unused_cluster_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _mock_e2e_dependencies(monkeypatch, tmp_path)
+    overridden = _config(runTag="e2e-override").model_copy(
+        update={"storeUriBySize": {10_000: "s3://bucket/existing.zarr"}}
+    )
+    with pytest.raises(ValueError, match="only for consume stages"):
+        _run_e2e(overridden)
+
+    config = _config(runTag="e2e-cluster-source")
+    config = config.model_copy(
+        update={
+            "workflow": config.workflow.model_copy(
+                update={
+                    "clusterSourceUri": "s3://bucket/source.zarr",
+                    "clusterSourceArtifactId": "d" * 64,
+                }
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="requires the importClusters stage"):
+        _run_e2e(config)
+
+
+def test_funnel_refuses_a_stage_claimed_during_its_own_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = _config(runTag="e2e-late-claim")
+    _mock_e2e_dependencies(monkeypatch, tmp_path)
+    checks: list[int] = []
+
+    def conflicts(*_args: Any, **_kwargs: Any) -> list[str]:
+        checks.append(1)
+        if len(checks) == 1:
+            return []
+        return [config.e2eClaimUri(), config.stageClaimUri(10_000, "createStore")]
+
+    monkeypatch.setattr(modal_app, "_e2e_conflicting_uris", conflicts)
+    monkeypatch.setattr(
+        modal_app,
+        "run_stage",
+        lambda *_args, **_kwargs: pytest.fail("a contested funnel must not start"),
+    )
+
+    with pytest.raises(FileExistsError, match="createStore.claim.json"):
+        _run_e2e(config)
+
+
+def test_e2e_freshness_checks_stage_claims(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _config()
+    claimed = config.stageClaimUri(10_000, "markHvgs")
+    monkeypatch.setattr(modal_app, "object_exists", lambda uri: uri == claimed)
+
+    assert modal_app._e2e_conflicting_uris(config, 10_000) == [claimed]

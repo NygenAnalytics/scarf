@@ -6,8 +6,13 @@ import numpy as np
 import zarr
 
 from ..storage.refs import ArtifactRef
+from ..utils.arguments import integer_argument
 from .imported_storage import (
     ImportedArtifactStorage,
+    payload_fingerprint,
+    require_positive_block_rows,
+    require_selected_row_order,
+    require_source_digest,
     validate_imported_coordinates_artifact,
 )
 
@@ -26,14 +31,6 @@ class _ArraySource:
     dtype: np.dtype[Any]
     produce: Callable[[], Iterator[np.ndarray]]
     reusable: bool
-
-
-def _positive_block_rows(value: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int | np.integer):
-        raise TypeError("block_rows must be a positive integer")
-    if int(value) < 1:
-        raise ValueError("block_rows must be greater than zero")
-    return int(value)
 
 
 def _resolve_source(
@@ -397,36 +394,6 @@ def _write_feature_ids(
     return destination
 
 
-def _stored_numeric_fingerprint(
-    storage: ImportedArtifactStorage,
-    array: zarr.Array,
-) -> str:
-    builder = storage.fingerprint_builder()
-    builder.begin_array("values", array.shape, array.dtype)
-    block_rows = storage.block_rows(array)
-    for start in range(0, int(array.shape[0]), block_rows):
-        stop = min(start + block_rows, int(array.shape[0]))
-        block = np.asarray(array[start:stop])
-        builder.update_array_block(
-            "values",
-            (start,) + (0,) * (array.ndim - 1),
-            block,
-        )
-    builder.end_array("values")
-    return builder.hexdigest()
-
-
-def _stored_payload_fingerprint(
-    storage: ImportedArtifactStorage,
-    group: zarr.Group,
-    name: str,
-) -> str:
-    array = storage.as_array(group[name], name)
-    if name == "feature_ids":
-        return storage.fingerprint_stored_strings(array)
-    return _stored_numeric_fingerprint(storage, array)
-
-
 def _payloads_match(
     storage: ImportedArtifactStorage,
     group: zarr.Group,
@@ -441,7 +408,7 @@ def _payloads_match(
             array = storage.as_array(group[name], name)
             if tuple(array.shape) != tuple(shape):
                 return False
-            if _stored_payload_fingerprint(storage, group, name) != fingerprints[name]:
+            if payload_fingerprint(group, name) != fingerprints[name]:
                 return False
     except (KeyError, TypeError, ValueError):
         return False
@@ -479,7 +446,7 @@ def write_imported_coordinates(
         raise ValueError("dimreduc_key must be a non-empty string")
     if not isinstance(role, str) or not role or role.lower() in {"umap", "tsne"}:
         raise ValueError("Imported graph coordinates require a non-layout role")
-    block_rows = _positive_block_rows(block_rows)
+    block_rows = integer_argument(block_rows, "block_rows", minimum=1)
     data_source = _resolve_source(
         coordinates,
         name="coordinate",
@@ -594,42 +561,41 @@ def write_imported_coordinates(
         ),
     )
     if not planned.reused:
-        group = storage.start(planned)
-        _write_numeric_payload(
-            storage,
-            group,
-            "data",
-            data_source,
-            fingerprints["data"],
-            block_rows,
-        )
-        if loading_source is not None:
+        with storage.transaction(planned) as group:
             _write_numeric_payload(
                 storage,
                 group,
-                "loadings",
-                loading_source,
-                fingerprints["loadings"],
+                "data",
+                data_source,
+                fingerprints["data"],
                 block_rows,
             )
-            assert feature_source is not None
-            _write_feature_ids(
-                storage,
-                group,
-                feature_source,
-                fingerprints["feature_ids"],
-                block_rows,
-            )
-        if stdev_source is not None:
-            _write_numeric_payload(
-                storage,
-                group,
-                "stdev",
-                stdev_source,
-                fingerprints["stdev"],
-                block_rows,
-            )
-        storage.finish(group, planned)
+            if loading_source is not None:
+                _write_numeric_payload(
+                    storage,
+                    group,
+                    "loadings",
+                    loading_source,
+                    fingerprints["loadings"],
+                    block_rows,
+                )
+                assert feature_source is not None
+                _write_feature_ids(
+                    storage,
+                    group,
+                    feature_source,
+                    fingerprints["feature_ids"],
+                    block_rows,
+                )
+            if stdev_source is not None:
+                _write_numeric_payload(
+                    storage,
+                    group,
+                    "stdev",
+                    stdev_source,
+                    fingerprints["stdev"],
+                    block_rows,
+                )
     validate_imported_coordinates_artifact(root, planned.ref)
     if selected_count != data_source.shape[0]:
         raise RuntimeError("Imported coordinate selection changed during writing")
@@ -646,14 +612,17 @@ def validate_imported_embedding_artifact(
     status = storage.require_complete(ref)
     if status.operation != "import_dimreduc":
         raise ValueError("Imported embedding operation must be 'import_dimreduc'")
-    execution = status.execution_options or {}
-    block_rows = execution.get("block_rows")
-    if (
-        isinstance(block_rows, bool)
-        or not isinstance(block_rows, int | np.integer)
-        or int(block_rows) < 1
-    ):
-        raise ValueError("Imported embedding block_rows is invalid")
+    label = "Imported embedding"
+    context = {
+        "assay": ref.assay,
+        "artifact_id": ref.artifact_id,
+        "actual_kind": ref.kind,
+    }
+    require_positive_block_rows(
+        status.execution_options,
+        label=label,
+        context=context,
+    )
     inputs = status.inputs or {}
     raw_selection = inputs.get("cell_selection")
     if not isinstance(raw_selection, Mapping):
@@ -681,32 +650,19 @@ def validate_imported_embedding_artifact(
         or role not in {"umap", "tsne"}
     ):
         raise ValueError("Imported embedding payload is malformed")
-    selected_fingerprint, selected_count = storage.fingerprint_selected_strings(
-        validated_selection.row_ids,
-        validated_selection.values,
+    require_selected_row_order(
+        validated_selection,
+        row_count=int(values.shape[0]),
+        ordered_fingerprint=inputs.get("ordered_cell_ids_fingerprint"),
+        label=label,
+        context=context,
     )
-    if int(values.shape[0]) != selected_count:
-        raise ValueError("Imported embedding rows do not match its cell selection")
-    if inputs.get("ordered_cell_ids_fingerprint") != selected_fingerprint:
-        raise ValueError("Imported embedding cell IDs are out of order")
-    source_digest = inputs.get("source_digest")
-    if (
-        not isinstance(source_digest, Mapping)
-        or set(source_digest) != {"bytes_hex"}
-        or not isinstance(source_digest.get("bytes_hex"), str)
-        or len(source_digest["bytes_hex"]) != 64
-        or source_digest["bytes_hex"].lower() != source_digest["bytes_hex"]
-    ):
-        raise ValueError("Imported embedding source digest is missing")
-    try:
-        bytes.fromhex(source_digest["bytes_hex"])
-    except ValueError as exc:
-        raise ValueError("Imported embedding source digest is not hexadecimal") from exc
+    require_source_digest(inputs, label=label, context=context)
     fingerprints = inputs.get("payload_fingerprints")
     if (
         not isinstance(fingerprints, Mapping)
         or set(fingerprints) != {"values"}
-        or fingerprints.get("values") != _stored_numeric_fingerprint(storage, values)
+        or fingerprints.get("values") != payload_fingerprint(group, "values")
     ):
         raise ValueError("Imported embedding payload fingerprint does not match")
 
@@ -736,7 +692,7 @@ def write_imported_embedding(
     source_digest = _validate_source_digest(source_digest)
     if not isinstance(dimreduc_key, str) or not dimreduc_key:
         raise ValueError("dimreduc_key must be a non-empty string")
-    block_rows = _positive_block_rows(block_rows)
+    block_rows = integer_argument(block_rows, "block_rows", minimum=1)
     source = _resolve_source(
         coordinates,
         name="coordinate",
@@ -783,15 +739,14 @@ def write_imported_embedding(
         ),
     )
     if not planned.reused:
-        group = storage.start(planned)
-        _write_numeric_payload(
-            storage,
-            group,
-            "values",
-            source,
-            fingerprints["values"],
-            block_rows,
-        )
-        storage.finish(group, planned)
+        with storage.transaction(planned) as group:
+            _write_numeric_payload(
+                storage,
+                group,
+                "values",
+                source,
+                fingerprints["values"],
+                block_rows,
+            )
     validate_imported_embedding_artifact(root, planned.ref)
     return planned.ref

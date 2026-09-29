@@ -11,17 +11,16 @@ from ..storage.artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
     PlannedArtifact,
-    finish_artifact,
+    artifact_transaction,
     plan_artifact,
     reused_artifact_group,
-    start_artifact,
 )
 from ..storage.artifacts import (
     ArtifactRef,
     ArtifactScope,
     fingerprint_stored_arrays,
 )
-from ..storage.selections import validate_stored_selection_integrity
+from ..storage.selections import validate_cell_selection
 from ..storage.types import as_zarr_array, as_zarr_group
 
 _CATEGORY_COLORS = (
@@ -156,15 +155,7 @@ def plan_cell_data_artifact(
 ) -> PlannedArtifact:
     if cell_selection.kind != "cell_selection":
         raise ValueError("cell_selection must reference a cell-selection artifact")
-    selection = validate_stored_selection_integrity(
-        root,
-        cell_selection,
-        kind="cell_selection",
-        scope="datastore",
-        assay=None,
-        table_path="cellData",
-    )
-    selected_count = int(selection.selected_count)
+    selected_count = int(validate_cell_selection(root, cell_selection).selected_count)
     if any(shape[0] != selected_count for shape, _kind in arrays.values()):
         raise ValueError("Artifact arrays must align with the selected cell count")
     artifact_inputs = {**inputs, "cell_selection": cell_selection}
@@ -197,40 +188,39 @@ def write_cell_data_artifact(
 ) -> zarr.Group:
     if planned.reused:
         return reused_artifact_group(root, planned)
-    group = start_artifact(root, planned)
-    for name, raw_values in arrays.items():
-        values = np.asarray(raw_values)
-        if values.ndim < 1:
-            raise ValueError("Artifact arrays must have at least one dimension")
-        if values.dtype.kind in {"O", "S", "U"}:
-            if values.ndim != 1:
-                raise ValueError("String artifact arrays must be one-dimensional")
-            create_metadata_column(
+    with artifact_transaction(root, planned) as group:
+        for name, raw_values in arrays.items():
+            values = np.asarray(raw_values)
+            if values.ndim < 1:
+                raise ValueError("Artifact arrays must have at least one dimension")
+            if values.dtype.kind in {"O", "S", "U"}:
+                if values.ndim != 1:
+                    raise ValueError("String artifact arrays must be one-dimensional")
+                create_metadata_column(
+                    group,
+                    name,
+                    data=values.astype(str),
+                    overwrite=True,
+                    chunkSize=min(max(int(values.shape[0]), 1), 100_000),
+                )
+            else:
+                chunks = (
+                    min(max(int(values.shape[0]), 1), 100_000),
+                    *values.shape[1:],
+                )
+                output = create_zarr_dataset(
+                    group,
+                    name,
+                    chunks,
+                    values.dtype,
+                    values.shape,
+                )
+                output[...] = values
+        if fingerprint_payload:
+            group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
                 group,
-                name,
-                data=values.astype(str),
-                overwrite=True,
-                chunkSize=min(max(int(values.shape[0]), 1), 100_000),
+                tuple(arrays),
             )
-        else:
-            chunks = (
-                min(max(int(values.shape[0]), 1), 100_000),
-                *values.shape[1:],
-            )
-            output = create_zarr_dataset(
-                group,
-                name,
-                chunks,
-                values.dtype,
-                values.shape,
-            )
-            output[...] = values
-    if fingerprint_payload:
-        group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
-            group,
-            tuple(arrays),
-        )
-    finish_artifact(group, planned)
     return group
 
 

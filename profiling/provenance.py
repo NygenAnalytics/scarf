@@ -13,6 +13,8 @@ from typing import Any
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+_SOURCE_PACKAGES = ("scarf", "profiling")
+_SOURCE_FILES = ("pyproject.toml", "uv.lock")
 # Code and config identity. The submitting client captures it once and every
 # stage and funnel result carries it under these flat keys.
 _IDENTITY_KEYS = (
@@ -65,58 +67,36 @@ def _hash_file(path: Path) -> str | None:
     return _hash_bytes(path.read_bytes())
 
 
-def _source_tree_digest() -> str | None:
-    """Digest tracked source files that affect package/profiling behavior."""
-    try:
-        completed = subprocess.run(
-            [
-                "git",
-                "ls-files",
-                "-z",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-                "--",
-                "scarf",
-                "profiling",
-                "pyproject.toml",
-                "uv.lock",
-            ],
-            cwd=_REPO_ROOT,
-            check=False,
-            capture_output=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
+def source_tree_files(root: Path) -> list[str]:
+    """Return the code files under ``root`` that identify a profiling run.
+
+    The Modal image ships exactly these files at the same relative paths: the Python
+    sources of ``scarf`` and ``profiling`` plus the dependency definition. The client
+    and the container therefore hash the same list, and uncommitted edits count.
+    """
+    names = [
+        path.relative_to(root).as_posix()
+        for package in _SOURCE_PACKAGES
+        for path in (root / package).rglob("*.py")
+        if path.is_file()
+    ]
+    names.extend(name for name in _SOURCE_FILES if (root / name).is_file())
+    return sorted(names)
+
+
+def source_tree_digest(root: Path) -> str:
     digest = hashlib.sha256()
-    if completed.returncode == 0:
-        names = [
-            name.decode("utf-8", errors="surrogateescape")
-            for name in completed.stdout.split(b"\0")
-            if name
-        ]
-    else:
-        names = []
-        for root_name in ("scarf", "profiling"):
-            root = _REPO_ROOT / root_name
-            names.extend(
-                str(path.relative_to(_REPO_ROOT))
-                for pattern in ("*.py", "*.pyi")
-                for path in root.rglob(pattern)
-                if "__pycache__" not in path.parts
-            )
-        names.extend(("pyproject.toml", "uv.lock"))
-    for name in sorted(set(names)):
-        encoded_name = name.encode("utf-8", errors="surrogateescape")
-        path = _REPO_ROOT / name
-        if not path.is_file():
-            continue
-        digest.update(encoded_name)
+    for name in source_tree_files(root):
+        digest.update(name.encode("utf-8", errors="surrogateescape"))
         digest.update(b"\0")
-        digest.update(path.read_bytes())
+        digest.update((root / name).read_bytes())
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+@lru_cache(maxsize=1)
+def _executed_source_tree_digest() -> str:
+    return source_tree_digest(_REPO_ROOT)
 
 
 def _git_diff_digest() -> str | None:
@@ -174,7 +154,7 @@ def collect_client_code_identity(
         "gitDescribe": _run_git("describe", "--always", "--dirty", "--tags"),
         "gitDirty": bool(dirty) if dirty is not None else None,
         "gitDiffSha256": _git_diff_digest(),
-        "sourceTreeSha256": _source_tree_digest(),
+        "sourceTreeSha256": source_tree_digest(_REPO_ROOT),
         "lockfileSha256": _lockfile_digest(),
         "configSha256": config_digest(configPayload),
         "packageVersions": {
@@ -207,10 +187,13 @@ def collect_run_provenance(
     """Return a JSON-serializable provenance payload for stage/funnel results.
 
     Code identity comes from ``clientProvenance`` when the submitting client
-    captured it. Otherwise this process collects it.
+    captured it. Otherwise this process collects it. The digest of the code this
+    process runs is recorded beside it, so a stale deployment shows as a mismatch.
     """
     identity = clientProvenance or collect_client_code_identity()
     provenance = {key: identity.get(key) for key in _IDENTITY_KEYS}
+    executed_digest = _executed_source_tree_digest()
+    client_digest = provenance["sourceTreeSha256"] if clientProvenance else None
     if provenance["configSha256"] is None:
         provenance["configSha256"] = configDigestValue
     zarr_pipeline = None
@@ -245,8 +228,10 @@ def collect_run_provenance(
             "zarrAsyncConcurrency": zarr_async_concurrency,
             "scarfZarrProfile": os.environ.get("SCARF_ZARR_PROFILE"),
             "nonpreemptible": nonpreemptible,
-            "hasClientCodeIdentity": bool(
-                clientProvenance and clientProvenance.get("sourceTreeSha256")
+            "hasClientCodeIdentity": client_digest is not None,
+            "executedSourceTreeSha256": executed_digest,
+            "sourceTreeMatchesClient": (
+                None if client_digest is None else client_digest == executed_digest
             ),
         }
     )

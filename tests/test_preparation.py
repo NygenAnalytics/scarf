@@ -4,17 +4,19 @@ import zarr
 
 from scarf import DataStore
 from scarf.datastore.datastore import mount_datastore
+from scarf.features.gene_families import DEFAULT_PERCENT_PATTERNS
 from scarf.metadata import MetaData
 from scarf.metadata.rows import read_metadata_missing_rows
 from scarf.metadata.selection import CellField, resolve_grouping, valid_category_mask
 from scarf.storage.copy import copy_zarr_group_tree
 from scarf.storage.count_matrix import CountMatrixPolicy
-from scarf.storage.identity import finalize_counts, read_dataset_fingerprint
+from scarf.storage.identity import read_dataset_fingerprint
 from scarf.storage.schema import create_cell_data, create_zarr_count_assay
 from scarf.tools.repack_zarr import repack_store
 from scarf.writers.counts_t import finalize_writer_counts_t
 from scarf.utils.logging import logger
 from scarf.writers.subset import SubsetZarr
+from tests.storage_helpers import finalize_test_counts
 from tests.test_datastore import (
     _QC_FEATURE_NAMES,
     _QC_VALUES,
@@ -42,7 +44,7 @@ def _create_store(path):
         policy=CountMatrixPolicy(unitBytes=48, chunkBytes=16),
     )
     counts[:] = _QC_VALUES
-    finalize_counts(counts)
+    finalize_test_counts(counts)
     finalize_writer_counts_t(root, "RNA", None)
     store = DataStore(
         str(path), default_assay="RNA", min_features_per_cell=0, nthreads=1
@@ -173,8 +175,8 @@ def test_unchanged_copy_preserves_percentage_proof_and_missing_values(
     copied = DataStore(
         str(target),
         zarr_mode="r",
-        mito_pattern="^MT-",
-        ribo_pattern="RPS|RPL|MRPS|MRPL",
+        mito_pattern=DEFAULT_PERCENT_PATTERNS["percentMito"],
+        ribo_pattern=DEFAULT_PERCENT_PATTERNS["percentRibo"],
         nthreads=1,
     )
     assert read_dataset_fingerprint(copied.RNA.z) == read_dataset_fingerprint(
@@ -238,7 +240,7 @@ def test_metadata_copy_rejects_missing_dependency_before_writes():
     source.create_array("value", data=np.array(["a", "b"]))
     source["value"].attrs["missing_mask"] = "absent"
     destination = zarr.group()
-    with pytest.raises(ValueError, match="missing-value dependency"):
+    with pytest.raises(ValueError, match="malformed missing-mask link"):
         copy_zarr_group_tree(source, destination)
     assert list(destination.members()) == []
 
@@ -250,8 +252,8 @@ def test_count_identity_detects_changes_with_equal_summaries():
     a = root.create_array("a", data=first, chunks=(1, 2))
     b = root.create_array("b", data=second, chunks=(2, 1))
     c = root.create_array("c", data=first.astype(">u4"), chunks=(2, 1))
-    assert finalize_counts(a) != finalize_counts(b)
-    assert finalize_counts(a) == finalize_counts(c)
+    assert finalize_test_counts(a) != finalize_test_counts(b)
+    assert finalize_test_counts(a) == finalize_test_counts(c)
 
 
 def test_shared_physical_matrix_collision_fails_before_writes():
@@ -314,3 +316,40 @@ def test_prepared_store_explains_how_to_add_a_missing_percentage():
     assert "fresh store" in message
     assert "run_feature_percentage" in message
     assert "repack" not in message
+
+
+def test_clear_column_fails_closed_on_a_noncanonical_mask_link():
+    from scarf.storage.identity import clear_column
+
+    cells = zarr.group().create_group("cellData")
+    cells.create_array("label", data=np.array(["a", "b"]))
+    cells.create_array("mask", data=np.array([False, True]))
+    cells["label"].attrs["missing_mask"] = "mask"
+
+    with pytest.raises(ValueError, match="malformed missing-mask link"):
+        clear_column(cells, "label")
+    assert {"label", "mask"} <= set(cells.array_keys())
+
+
+def test_first_preparation_publishes_identity_with_the_prepared_flag(monkeypatch):
+    import json
+
+    storage, _ = _qc_store()
+    documents = []
+    store_type = type(storage)
+    original_set = store_type.set
+
+    async def recording_set(self, key, value, *args, **kwargs):
+        if key == "RNA/zarr.json":
+            documents.append(json.loads(value.to_bytes())["attributes"])
+        return await original_set(self, key, value, *args, **kwargs)
+
+    monkeypatch.setattr(store_type, "set", recording_set)
+    _open_qc_store(storage)
+
+    prepared = [attrs for attrs in documents if attrs.get("prepared") is True]
+    assert prepared
+    assert all(
+        attrs.get("dataset_fingerprint") and attrs.get("counts_fingerprint")
+        for attrs in prepared
+    )

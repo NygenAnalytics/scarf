@@ -11,6 +11,7 @@ from ..graph.feature_projection import graph_cell_selection
 from ..storage.refs import ArtifactRef
 from ..storage.selections import validate_stored_selection_integrity
 from ..storage.types import as_zarr_array
+from ..utils.arrays import sort_categories
 
 if TYPE_CHECKING:
     from ..datastore.datastore import DataStore
@@ -22,7 +23,10 @@ DISPLAY_BLOCK_ROWS = 100_000
 
 
 def cluster_counts(store: "DataStore", clusters: ArtifactRef) -> dict[str, int]:
-    """Count every saved cluster label while retaining only one row block."""
+    """Count every saved cluster label while retaining only one row block.
+
+    Labels are ordered naturally, as plots show categories.
+    """
     values = as_zarr_array(store.load_artifact(clusters)["values"], name="values")
     if values.ndim != 1:
         raise ValueError("Cluster labels must be one-dimensional")
@@ -33,17 +37,22 @@ def cluster_counts(store: "DataStore", clusters: ArtifactRef) -> dict[str, int]:
             return_counts=True,
         )
         counts.update(dict(zip(labels.tolist(), frequencies.tolist(), strict=True)))
-    return dict(sorted(counts.items()))
+    return {label: counts[label] for label in sort_categories(counts)}
 
 
-def _selection_input(store: "DataStore", ref: ArtifactRef) -> ArtifactRef:
+def require_final_inputs(
+    store: "DataStore", ref: ArtifactRef, label: str, **inputs: ArtifactRef
+) -> Any:
+    """Return a complete final artifact's status after checking its exact inputs."""
     status = store.inspect_artifact(ref)
     if not status.complete:
-        raise ValueError("The selected analysis artifact is incomplete")
-    raw = (status.inputs or {}).get("cell_selection")
-    if not isinstance(raw, Mapping):
-        raise ValueError("The selected artifact has no frozen cell selection")
-    return ArtifactRef.from_dict(raw)
+        raise ValueError(f"The final {label} artifact is incomplete")
+    recorded = status.inputs or {}
+    for name, expected in inputs.items():
+        raw = recorded.get(name)
+        if not isinstance(raw, Mapping) or ArtifactRef.from_dict(raw) != expected:
+            raise ValueError(f"The final {label} does not use the selected {name}")
+    return status
 
 
 def _sample_quotas(counts: Mapping[str, int], maximum: int) -> dict[str, int]:
@@ -117,7 +126,8 @@ def plot_final_umap(
     Population counts always include every cell. Display sampling changes no
     saved selection, coordinates, labels, markers, or other analysis result.
     """
-    from ..plotting import CategoricalScale, LegendSpec, PlotProvenance, PlotResult
+    from ..plotting import LegendSpec, PlotProvenance, PlotResult
+    from ..plotting._style import resolve_category_scale
 
     if (
         isinstance(max_points, bool)
@@ -129,23 +139,16 @@ def plot_final_umap(
         raise ValueError("The final map requires embedding and cluster-label artifacts")
     if umap.assay != clusters.assay or umap.scope != clusters.scope:
         raise ValueError("The final UMAP and clusters must belong to the same assay")
-    for ref in (umap, clusters):
-        if _selection_input(store, ref) != cell_selection:
-            raise ValueError(
-                "Final artifacts must share the exact frozen cell selection"
-            )
+    embedding_status = require_final_inputs(
+        store, umap, "UMAP", cell_selection=cell_selection, graph=graph
+    )
+    require_final_inputs(
+        store, clusters, "clusters", cell_selection=cell_selection, graph=graph
+    )
     if graph_cell_selection(store.zw, graph) != cell_selection:
         raise ValueError("The final graph must use the exact frozen cell selection")
-    embedding_status = store.inspect_artifact(umap)
     if embedding_status.operation != "run_umap":
         raise ValueError("The final UMAP must be a saved run_umap artifact")
-    for ref in (umap, clusters):
-        raw_graph = (store.inspect_artifact(ref).inputs or {}).get("graph")
-        if (
-            not isinstance(raw_graph, Mapping)
-            or ArtifactRef.from_dict(raw_graph) != graph
-        ):
-            raise ValueError("The final UMAP and clusters must use the selected graph")
     selection = validate_stored_selection_integrity(
         store.zw,
         cell_selection,
@@ -181,24 +184,13 @@ def plot_final_umap(
 
     import matplotlib.pyplot as plt
     import pandas as pd
-    from matplotlib.colors import to_hex
     from matplotlib.figure import Figure
     from matplotlib.lines import Line2D
 
-    categories = tuple(counts)
-    cmap = plt.get_cmap(
-        "tab10"
-        if len(categories) <= 10
-        else "tab20"
-        if len(categories) <= 20
-        else "gist_rainbow"
-    )
-    palette = {
-        label: to_hex(
-            cmap(index if len(categories) <= 20 else index / (len(categories) - 1))
-        )
-        for index, label in enumerate(categories)
-    }
+    # Clusters take the order and colors that Scarf plots give categories.
+    scale = resolve_category_scale(list(counts), None, context="clusters")
+    categories = scale.order or ()
+    palette = scale.palette or {}
     if show:
         figure, axis = plt.subplots(figsize=figsize, constrained_layout=True)
     else:
@@ -253,7 +245,7 @@ def plot_final_umap(
                 )
             },
             legends=(LegendSpec(kind="categorical", label="Cluster (all cells)"),),
-            scales=(CategoricalScale(order=categories, palette=palette),),
+            scales=(scale,),
             provenance=PlotProvenance(
                 assay=umap.assay,
                 n_cells=len(rows),

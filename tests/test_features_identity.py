@@ -2,7 +2,6 @@
 
 from pathlib import Path
 
-from scarf.features.gene_reference import write_reference_fixture
 from scarf.features.identity import (
     audit_feature_identity,
     backfill_symbols,
@@ -18,6 +17,8 @@ from scarf.quality_control.cell_cycle_genes import (
     s_phase_genes,
     s_phase_genes_mouse,
 )
+
+from .gene_reference_fixtures import write_reference_fixture
 
 
 def _human_reference(tmp_path: Path):
@@ -198,6 +199,22 @@ def test_exogenous_candidates_skip_ensembl_reference_misses(tmp_path: Path) -> N
     )
     assert misses["count"] == 1
     assert misses["examples"] == ["ENSG00000999999"]
+
+
+def test_identity_helpers_require_a_digit_after_registry_prefixes(
+    tmp_path: Path,
+) -> None:
+    # Chicken IDs start with "ENSG" but are not human registry IDs, as in
+    # prefix_species, so they are exogenous rather than release drift.
+    reference = _human_reference(tmp_path)
+    ids = ["ENSG00000999999", "ENSGALG00000000001"]
+    names = ["", ""]
+
+    misses = reference_misses(ids, names, reference)
+    ranked = exogenous_candidates(ids, names, reference=reference)
+
+    assert misses["examples"] == ["ENSG00000999999"]
+    assert [item["id"] for item in ranked] == ["ENSGALG00000000001"]
 
 
 def test_observe_families_flags_zero_prefix_matches_as_catalog_suspect(

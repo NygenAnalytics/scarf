@@ -1,18 +1,18 @@
 import os
 from collections.abc import Iterator
-from typing import Any
 
 import numpy as np
 import zarr
 
 from .types import as_zarr_array
 from .arrays import (
+    MISSING_MASK_PREFIX,
     _decode_metadata_values,
-    create_metadata_column,
     create_numeric_array,
-    dtype_fix,
+    linked_missing_mask,
     MetadataBlock,
     create_streamed_metadata_column,
+    stored_metadata_dtype,
 )
 from .budget import ResourceBudget
 from .geometry import array_geometry
@@ -61,32 +61,6 @@ def _metadata_block_rows(array: zarr.Array) -> int:
     )
 
 
-def _resolve_metadata_dtype(
-    array: zarr.Array,
-    block_rows: int,
-) -> np.dtype[Any]:
-    dtype: np.dtype[Any] = np.dtype(array.dtype)
-    if not (dtype.kind in {"O", "S"} or dtype.hasobject):
-        return dtype
-    if dtype.kind == "S":
-        return np.empty(0, dtype=dtype).astype(str).dtype
-    n_rows = int(array.shape[0])
-    if n_rows == 0:
-        return np.dtype("U1")
-    max_len = 1
-    for start in range(0, n_rows, block_rows):
-        stop = min(start + block_rows, n_rows)
-        block = np.asarray(array[start:stop])
-        if block.size == 0:
-            continue
-        resolved: np.dtype[Any] = np.dtype(dtype_fix(dtype, block))
-        if resolved.kind == "U":
-            max_len = max(max_len, resolved.itemsize // 4)
-        else:
-            return resolved
-    return np.dtype(f"U{max_len}")
-
-
 def _copy_metadata_array(
     src: zarr.Array,
     dst: zarr.Group,
@@ -98,56 +72,51 @@ def _copy_metadata_array(
     missing: zarr.Array | None = None,
 ) -> None:
     if src.ndim != 1:
-        create_metadata_column(
-            dst,
-            name,
-            data=np.asarray(src[:]),
-            dtype=src.dtype,
-            overwrite=overwrite,
-            chunkSize=PROFILE_METADATA_CHUNK,
-            profile=profile,
+        raise ValueError(
+            f"Metadata column {name!r} has {src.ndim} dimensions; metadata columns "
+            "must be one-dimensional"
         )
-        target = as_zarr_array(dst[name], name=name)
-    else:
-        block_rows = _metadata_block_rows(src)
-        dtype = _resolve_metadata_dtype(src, block_rows)
-        n_rows = int(src.shape[0]) if row_indices is None else len(row_indices)
+    block_rows = _metadata_block_rows(src)
+    n_source = int(src.shape[0])
+    dtype = stored_metadata_dtype(
+        src.dtype,
+        lambda: (
+            src[start : start + block_rows] for start in range(0, n_source, block_rows)
+        ),
+    )
+    n_rows = n_source if row_indices is None else len(row_indices)
 
-        def blocks() -> Iterator[MetadataBlock]:
-            for start in range(0, n_rows, block_rows):
-                stop = min(start + block_rows, n_rows)
-                rows = (
-                    slice(start, stop)
-                    if row_indices is None
-                    else row_indices[start:stop]
+    def blocks() -> Iterator[MetadataBlock]:
+        for start in range(0, n_rows, block_rows):
+            stop = min(start + block_rows, n_rows)
+            rows = (
+                slice(start, stop) if row_indices is None else row_indices[start:stop]
+            )
+            values = src[rows] if isinstance(rows, slice) else src.oindex[rows]
+            mask = (
+                None
+                if missing is None
+                else (
+                    missing[rows] if isinstance(rows, slice) else missing.oindex[rows]
                 )
-                values = src[rows] if isinstance(rows, slice) else src.oindex[rows]
-                mask = (
-                    None
-                    if missing is None
-                    else (
-                        missing[rows]
-                        if isinstance(rows, slice)
-                        else missing.oindex[rows]
-                    )
-                )
-                yield MetadataBlock(
-                    start=start,
-                    values=np.asarray(_decode_metadata_values(values), dtype=dtype),
-                    missing=None if mask is None else np.asarray(mask, dtype=bool),
-                )
+            )
+            yield MetadataBlock(
+                start=start,
+                values=np.asarray(_decode_metadata_values(values)).astype(dtype),
+                missing=None if mask is None else np.asarray(mask, dtype=bool),
+            )
 
-        target = create_streamed_metadata_column(
-            dst,
-            name,
-            dtype=dtype,
-            overwrite=overwrite,
-            chunkSize=PROFILE_METADATA_CHUNK,
-            shape=n_rows,
-            profile=profile,
-            blocks=blocks(),
-            hasMissing=missing is not None,
-        )
+    target = create_streamed_metadata_column(
+        dst,
+        name,
+        dtype=dtype,
+        overwrite=overwrite,
+        chunkSize=PROFILE_METADATA_CHUNK,
+        shape=n_rows,
+        profile=profile,
+        blocks=blocks(),
+        hasMissing=missing is not None,
+    )
     for attribute in COLUMN_METADATA_ATTRIBUTES:
         if attribute in src.attrs:
             target.attrs[attribute] = src.attrs[attribute]
@@ -190,15 +159,11 @@ def copy_zarr_group_tree(
     groups are copied recursively without inheriting the parent exclusions.
     """
     masks = validate_metadata_dependencies(src, exclude_members=exclude_members)
-    hidden = {
-        link
-        for _, array in src.arrays()
-        if isinstance(link := array.attrs.get("missing_mask"), str) and "/" not in link
-    }
     for name, node in src.members():
         if exclude_members is not None and name in exclude_members:
             continue
-        if name in hidden or name.startswith("__scarf_missing__"):
+        # A mask is copied together with the column that links it.
+        if name.startswith(MISSING_MASK_PREFIX):
             continue
         if isinstance(node, zarr.Group):
             child = dst.create_group(name, overwrite=overwrite)
@@ -231,26 +196,9 @@ def validate_metadata_dependencies(
     for name, array in group.arrays():
         if exclude_members is not None and name in exclude_members:
             continue
-        link = array.attrs.get("missing_mask")
-        if link is None:
-            continue
-        if (
-            not isinstance(link, str)
-            or "/" in link
-            or link == name
-            or link not in group
-        ):
-            raise ValueError(
-                f"Column {name!r} has a missing or malformed missing-value dependency"
-            )
-        mask = as_zarr_array(group[link], name=link)
-        if (
-            mask.dtype != np.dtype(bool)
-            or mask.shape != array.shape
-            or mask.attrs.get("missing_mask") is not None
-        ):
-            raise ValueError(f"Column {name!r} has a malformed missing-value array")
-        masks[name] = mask
+        mask = linked_missing_mask(group, name, label=f"Column {name!r}", values=array)
+        if mask is not None:
+            masks[name] = mask
     return masks
 
 

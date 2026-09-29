@@ -12,6 +12,7 @@ from ..metadata import MetaData
 from ..storage.artifacts import provenance_hash
 from ..storage.budget import ResourceBudget, resolve_budget
 from ..storage.types import as_zarr_array, as_zarr_group
+from ..utils.arguments import integer_argument
 from ..utils.arrays import array_digest, regex_match_mask
 from ..utils.compute import controlled_compute
 from ..utils.logging import logger
@@ -53,12 +54,13 @@ def raw_csr(
     return cast(csr_matrix, vstack(blocks, format="csr"))
 
 
-def _stream_byte_count(value: Any, name: str) -> int:
-    if isinstance(value, bool | np.bool_) or not isinstance(value, int | np.integer):
-        raise TypeError(f"{name} must be a non-negative integer")
-    if value < 0:
-        raise ValueError(f"{name} must be a non-negative integer")
-    return int(value)
+def _percentage(part: np.ndarray, total: np.ndarray) -> np.ndarray:
+    """Return ``100 * part / total``; a cell without counts has no percentage."""
+    part = np.asarray(part, dtype=np.float64)
+    total = np.asarray(total, dtype=np.float64)
+    percentages = np.full(part.shape, np.nan, dtype=np.float64)
+    np.divide(100.0 * part, total, out=percentages, where=total != 0)
+    return percentages
 
 
 class Assay:
@@ -67,7 +69,7 @@ class Assay:
 
     Args:
         z (zarr.Group): Zarr hierarchy where raw data is located
-        workspace: Workspace name when assays live under ``matrices/`` (None for legacy layout)
+        workspace: Workspace name when assays live under ``matrices/`` (None for a root datastore)
         name (str): A label/name for assay.
         cell_data: Metadata class object for the cell attributes.
         nthreads: number of threads to use for parallel computations
@@ -188,20 +190,6 @@ class Assay:
             feat_idx = np.arange(self.feats.N, dtype=np.int64)
         counts = self.rawData[:, feat_idx][cell_idx, :]
         return self.normMethod(self, counts)
-
-    def to_raw_sparse(self, cell_key: str) -> csr_matrix:
-        """
-
-        Args:
-            cell_key: A column from cell attribute table. This column must be a boolean
-                      type. The data will be exported for only those that have a True value
-                      in this column.
-
-        Returns: A sparse matrix containing raw data. An empty cell selection
-            returns a matrix with zero rows and one column per feature.
-
-        """
-        return raw_csr(self, self.cells.active_index(cell_key))
 
     requiresCountsT = False
 
@@ -416,16 +404,7 @@ class Assay:
     ) -> None:
         if n_counts is None:
             n_counts = self.cells.fetch_all(self.name + "_nCounts")
-        self.cells.insert(
-            name,
-            np.divide(
-                100 * total,
-                n_counts,
-                out=np.full(total.shape, np.nan, dtype=np.float64),
-                where=n_counts != 0,
-            ),
-            overwrite=False,
-        )
+        self.cells.insert(name, _percentage(total, n_counts), overwrite=False)
         self.cells._get_array(name).attrs["feature_selection_fingerprint"] = (
             feature_fingerprint
         )
@@ -454,12 +433,7 @@ class Assay:
                 dtype=np.float64,
             )
             stop = offset + len(counts)
-            values[offset:stop] = np.divide(
-                100.0 * numerator,
-                denominator,
-                out=np.zeros_like(numerator),
-                where=denominator != 0,
-            )
+            values[offset:stop] = _percentage(numerator, denominator)
             offset = stop
         if offset != len(values):
             raise RuntimeError(
@@ -475,21 +449,6 @@ class Assay:
                 f"ERROR: Either {cell_key} does not exist or is not bool type"
             )
         return self.cells.active_index(cell_key)
-
-    @staticmethod
-    def _create_subset_hash(cell_idx: np.ndarray, feat_idx: np.ndarray) -> str:
-        """Return a stable content digest for ordered cell and feature selections.
-
-        The digest is persisted as a normalized-data cache key, so it must be
-        deterministic across processes and Python runtimes.
-        """
-        cells = np.ascontiguousarray(np.asarray(cell_idx), dtype=np.int64)
-        feats = np.ascontiguousarray(np.asarray(feat_idx), dtype=np.int64)
-        # Prefix the cell count so the cell/feature boundary is encoded. Without
-        # it, concatenation alone lets different splits (e.g. cells=[0,1],
-        # feats=[2,3] versus cells=[0,1,2], feats=[3]) collide to one digest.
-        boundary = np.array([cells.shape[0]], dtype=np.int64)
-        return array_digest(np.concatenate([boundary, cells, feats]))
 
     def _count_arithmetic(
         self,
@@ -522,20 +481,12 @@ class Assay:
         """
         yield from iter_feature_group_means(self, cell_idx, feature_groups)
 
-    def _write_normalized_payload(
+    def _payload_indices(
         self,
         cell_idx: np.ndarray,
         feat_idx: np.ndarray,
-        location: str,
-        *,
-        log_transform: bool,
-        renormalize_subset: bool,
-        mirror: zarr.Array | None = None,
-    ) -> ChunkedArray:
-        """Write one planned normalization artifact payload."""
-
-        from ..storage.materialize import chunked_to_zarr
-
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Validate the ordered cell and feature indices of a payload."""
         cell_idx = np.asarray(cell_idx, dtype=np.int64)
         feat_idx = np.asarray(feat_idx, dtype=np.int64)
         if cell_idx.ndim != 1 or feat_idx.ndim != 1:
@@ -547,14 +498,23 @@ class Assay:
             or np.any(feat_idx >= self.feats.N)
         ):
             raise IndexError("cell_idx or feat_idx contains an out-of-range index")
-        if location not in self.z:
-            self.z.create_group(location)
-        if location + "/data" in self.z:
-            return ChunkedArray(
-                as_zarr_array(self.z[location + "/data"], name=location + "/data"),
-                nthreads=self.nthreads,
-                resources=self.resources,
-            )
+        return cell_idx, feat_idx
+
+    def _write_normalized_payload(
+        self,
+        cell_idx: np.ndarray,
+        feat_idx: np.ndarray,
+        location: str,
+        *,
+        log_transform: bool,
+        renormalize_subset: bool,
+        mirror: zarr.Array | None = None,
+    ) -> None:
+        """Write one normalization payload into its started artifact group."""
+
+        from ..storage.materialize import chunked_to_zarr
+
+        cell_idx, feat_idx = self._payload_indices(cell_idx, feat_idx)
         vals = self.normed(
             cell_idx,
             feat_idx,
@@ -569,11 +529,6 @@ class Assay:
             mirror=mirror,
             resources=self.resources,
             stats_group=as_zarr_group(self.z[location], name=location),
-        )
-        return ChunkedArray(
-            as_zarr_array(self.z[location + "/data"], name=location + "/data"),
-            nthreads=self.nthreads,
-            resources=self.resources,
         )
 
     def iter_normed_feature_wise(
@@ -614,8 +569,10 @@ class Assay:
         feat_idx = np.asarray(feat_idx, dtype=np.int64)
         if cell_idx.ndim != 1 or feat_idx.ndim != 1:
             raise ValueError("cell_idx and feat_idx must be one-dimensional")
-        scratch_itemsize = _stream_byte_count(scratch_itemsize, "scratch_itemsize")
-        resident_bytes = _stream_byte_count(resident_bytes, "resident_bytes")
+        scratch_itemsize = integer_argument(
+            scratch_itemsize, "scratch_itemsize", minimum=0
+        )
+        resident_bytes = integer_argument(resident_bytes, "resident_bytes", minimum=0)
         if msg is None:
             msg = ""
         data: ChunkedArray = self.normed(
@@ -664,12 +621,8 @@ class Assay:
         feat_idx: np.ndarray,
         cell_ordering: np.ndarray,
         *,
-        min_exp: float,
         window_size: int,
         chunk_size: int,
-        smoothen: bool,
-        z_scale: bool,
-        norm_params: dict[str, Any],
     ) -> tuple[
         np.ndarray,
         np.ndarray,
@@ -677,7 +630,6 @@ class Assay:
         int,
         int,
         list[str],
-        dict[str, Any],
     ]:
         cell_idx = np.asarray(cell_idx, dtype=np.int64)
         feat_idx = np.asarray(feat_idx, dtype=np.int64)
@@ -724,16 +676,6 @@ class Assay:
                 "for the selected cell count"
             )
         hashes = [array_digest(x) for x in (cell_idx, feat_idx, cell_ordering)]
-        params = {
-            "min_exp": min_exp,
-            "window_size": window_size,
-            "effective_window": effective_window,
-            "chunk_size": chunk_size,
-            "effective_bins": effective_bins,
-            "smoothen": smoothen,
-            "z_scale": z_scale,
-            "norm_params": norm_params,
-        }
         return (
             cell_ordering,
             cell_idx,
@@ -741,7 +683,6 @@ class Assay:
             effective_window,
             effective_bins,
             hashes,
-            params,
         )
 
     def _aggregate_ordering_profiles(
@@ -852,66 +793,6 @@ class Assay:
             (len(valid),),
         )
         valid_array[:] = valid
-
-    def mean_features(
-        self,
-        feature_names: Sequence[str],
-        cell_key: str = "I",
-        *,
-        missing: Literal["error", "skip"] = "error",
-    ) -> np.ndarray:
-        """Per-cell mean normalized expression over named features.
-
-        Returns one value per active cell under ``cell_key``. Does not write
-        cell metadata. Distinct from ``score_features``, which subtracts a
-        control-gene background.
-        """
-        from .rna import RNAassay
-
-        if missing not in ("error", "skip"):
-            raise ValueError("missing must be 'error' or 'skip'")
-        if not feature_names:
-            raise ValueError("feature_names must be non-empty")
-
-        requested = [str(name) for name in feature_names]
-        if len(set(name.upper() for name in requested)) != len(requested):
-            raise ValueError("feature_names contains duplicate names")
-
-        name_to_indices: dict[str, list[int]] = {}
-        for index, name in enumerate(self.feats.fetch_all("names")):
-            key = str(name).upper()
-            name_to_indices.setdefault(key, []).append(index)
-
-        feature_idx: list[int] = []
-        missing_names: list[str] = []
-        for name in requested:
-            matches = name_to_indices.get(name.upper(), [])
-            if not matches:
-                missing_names.append(name)
-                continue
-            if len(matches) > 1:
-                raise ValueError(f"Feature name {name!r} matches multiple features")
-            feature_idx.append(matches[0])
-
-        if missing_names:
-            if missing == "error":
-                raise ValueError("Features not found: " + ", ".join(missing_names))
-            if not feature_idx:
-                raise ValueError("No requested features were found")
-
-        cell_idx = self._get_cell_idx(cell_key)
-        feat_idx = np.asarray(feature_idx, dtype=int)
-        if isinstance(self, RNAassay) and self.normMethod is norm_lib_size:
-            means = self._mean_normed_feature_groups(
-                cell_idx,
-                {"target": feat_idx},
-            )
-            return np.asarray(means["target"])
-        return np.asarray(
-            self.normed(cell_idx=cell_idx, feat_idx=np.sort(feat_idx))
-            .mean(axis=1)
-            .compute()
-        )
 
     def score_features(
         self,

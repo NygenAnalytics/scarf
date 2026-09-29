@@ -7,7 +7,6 @@ import pytest
 
 from scarf.features.enrichment.results import EnrichmentResult
 from scarf.matrix._reductions import _Reduction
-from scarf.matrix.blocks import Block
 from scarf.matrix.chunked import ChunkedArray
 from scarf.storage.refs import ArtifactRef
 from scarf.trajectory.results import (
@@ -31,14 +30,6 @@ class _ReductionParent:
     ) -> np.ndarray:
         self.calls.append((op, axis, nthreads, msg))
         return np.array([1.0, 2.0, 4.0])
-
-
-class _BlockParent:
-    out_cols = 3
-    dtype = np.dtype(np.float64)
-
-    def _materialize_range(self, start: int, end: int) -> np.ndarray:
-        return np.arange(start * 3, end * 3, dtype=np.float64).reshape(-1, 3)
 
 
 def _ref(
@@ -100,28 +91,6 @@ def test_reduction_ufunc_and_binary_operator_protocols() -> None:
     np.testing.assert_array_equal(left < 2, [True, False, False])
     np.testing.assert_array_equal(left >= 2, [False, True, True])
     np.testing.assert_array_equal(left <= 2, [True, True, False])
-
-
-def test_block_shape_dtype_materialization_and_row_selection() -> None:
-    parent = cast(Any, _BlockParent())
-    block = Block(parent, 1, 4)
-
-    assert block.shape == (3, 3)
-    assert block.dtype == np.dtype(np.float64)
-    np.testing.assert_array_equal(
-        block.compute(), np.arange(3, 12, dtype=np.float64).reshape(3, 3)
-    )
-    assert np.asarray(block, dtype=np.float32).dtype == np.float32
-
-    selected = block[[2, 0]]
-    tuple_selected = block[([1, 0], slice(None))]
-    assert selected.shape == (2, 3)
-    np.testing.assert_array_equal(
-        selected.compute(), np.array([[9.0, 10.0, 11.0], [3.0, 4.0, 5.0]])
-    )
-    np.testing.assert_array_equal(
-        tuple_selected.compute(), np.array([[6.0, 7.0, 8.0], [3.0, 4.0, 5.0]])
-    )
 
 
 def test_fate_and_pseudotime_results_reject_each_invalid_dimension() -> None:

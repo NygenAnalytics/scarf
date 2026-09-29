@@ -66,7 +66,8 @@ unavailable, use the local targets.
 ## Concurrency and publication safety
 
 - Never start two execute, resume, prune, or publication commands at once, including from separate
-  agents. They share one cache and one resume area.
+  agents. They share one cache and one resume area. A second command fails at once and names the
+  process that holds the cache lock.
 - Prefer one command covering the full changed scope over independent page commands.
 - The runner rejects code-cell and execution-input changes during execution. Prose-only edits are
   not part of that comparison, but do not edit executable pages while a run is active.

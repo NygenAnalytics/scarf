@@ -8,7 +8,6 @@ from .cellranger import ingest_cellranger
 from .common import CONVERT_FORMATS, ensure_convert_destination
 from .detect import detect_format
 from .h5ad import ingest_h5ad
-from .loom import ingest_loom
 from .manifest import (
     DatasetManifest,
     DatasetManifestDecision,
@@ -109,14 +108,6 @@ def ingest(
     if format_name == "mtx":
         assert destination is not None
         return ingest_mtx(
-            source,
-            zarrPath=destination,
-            directions=direction_map,
-            notes=notes,
-        )
-    if format_name == "loom":
-        assert destination is not None
-        return ingest_loom(
             source,
             zarrPath=destination,
             directions=direction_map,

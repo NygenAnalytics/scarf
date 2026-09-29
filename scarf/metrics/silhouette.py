@@ -90,7 +90,9 @@ def silhouette_scoring(
         assay_type: Type of assay (e.g., 'RNA', 'ATAC')
         res_label: Label for clustering resolution
         distance_metric: Neighbor metric used to compare sampled rows: 'l2',
-            'cosine', or 'ip'
+            'cosine', or 'ip'. Inner-product distances are one minus the inner
+            product, clipped at zero, so rows whose inner products exceed one
+            compare as identical.
 
     Returns:
         np.ndarray | None: Array of silhouette scores for each cluster,

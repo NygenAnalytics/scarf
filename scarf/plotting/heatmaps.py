@@ -1,6 +1,7 @@
 """Native heatmap and cluster-tree plotting."""
 
 from collections.abc import Hashable, Mapping, Sequence
+from dataclasses import replace
 from typing import Any, cast
 
 import numpy as np
@@ -8,14 +9,22 @@ import pandas as pd
 
 from ..assay import ATACassay
 from ..features.markers.table import load_marker_table
+from ..metadata.selection import GROUPING_VALUE_NAMES
 from ..storage.artifacts import ArtifactRef, artifact_path
 from ..storage.selections import read_stored_selection_indices
 from ..storage.types import as_zarr_array, as_zarr_group
 from ._contracts import CategoricalScale, ColorScale, PlotProvenance
+from ._data import _artifact_input
 from ._deps import require_matplotlib, require_seaborn
-from ._figure import LegendSpec, PlotResult, normalize_axes_target
+from ._figure import (
+    LegendSpec,
+    PlotResult,
+    close_figures_on_error,
+    normalize_axes_target,
+)
 from ._heatmap_utils import (
     annotation_colors,
+    annotation_legend_handles,
     draw_annotation_strips,
     normalize_annotations,
     order_heatmap,
@@ -23,8 +32,10 @@ from ._heatmap_utils import (
 from ..utils.arrays import sort_categories
 from ._style import (
     apply_figure_chrome,
-    categorical_color_map,
+    colormap_palette,
     continuous_norm,
+    resolve_category_scale,
+    resolve_color_limits,
     theme_context,
 )
 
@@ -98,42 +109,18 @@ def _writable_float64(values: np.ndarray) -> np.ndarray:
     return np.array(values, dtype=np.float64, copy=True)
 
 
-def _clip_marker_means(
-    group_means: pd.DataFrame, vmin: float, vmax: float
-) -> pd.DataFrame:
-    """Clip group means without writing through a possibly read-only view."""
-    values = np.clip(
-        group_means.to_numpy(dtype=np.float64, copy=True).T,
-        vmin,
-        vmax,
-    )
-    return pd.DataFrame(
-        values,
-        index=group_means.columns,
-        columns=group_means.index,
-    )
-
-
 def _prepare_marker_heatmap(
     store: Any,
     *,
     marker: ArtifactRef,
     topn: int,
     log_transform: bool | None,
-    vmin: float,
-    vmax: float,
 ) -> dict[str, Any]:
     if not isinstance(marker, ArtifactRef):
         raise TypeError("marker must be an ArtifactRef")
     assay, marker_slot = store._resolve_marker_group(marker)
-    marker_status = store.inspect_artifact(marker)
-    marker_inputs = marker_status.inputs or {}
-    raw_selection = marker_inputs.get("cell_selection")
-    raw_clusters = marker_inputs.get("clusters")
-    if not isinstance(raw_selection, dict) or not isinstance(raw_clusters, dict):
-        raise ValueError("Marker artifact lineage is incomplete")
-    selection_ref = ArtifactRef.from_dict(raw_selection)
-    clusters_ref = ArtifactRef.from_dict(raw_clusters)
+    selection_ref = _artifact_input(store, marker, "cell_selection")
+    clusters_ref = _artifact_input(store, marker, "clusters")
     cell_index = read_stored_selection_indices(
         store.zw,
         selection_ref,
@@ -146,7 +133,7 @@ def _prepare_marker_heatmap(
         store.zw[artifact_path(clusters_ref)],
         name=clusters_ref.artifact_id,
     )
-    cluster_value_name = "values" if clusters_ref.kind == "cluster_labels" else "labels"
+    cluster_value_name = GROUPING_VALUE_NAMES.get(clusters_ref.kind, "values")
     groups = np.asarray(
         as_zarr_array(
             cluster_group[cluster_value_name],
@@ -229,7 +216,13 @@ def _prepare_marker_heatmap(
         axis=0,
     )
     group_means.columns = feature_names[feature_index]
-    matrix = _clip_marker_means(group_means, vmin, vmax)
+    # Features become rows. Display limits clip colors only, so they cannot
+    # change the clustering or the returned values.
+    matrix = pd.DataFrame(
+        group_means.to_numpy(dtype=np.float64, copy=True).T,
+        index=group_means.columns,
+        columns=group_means.index,
+    )
 
     marker_table = pd.DataFrame(marker_rows)
     marker_table["feature"] = feature_names[
@@ -246,6 +239,7 @@ def _prepare_marker_heatmap(
     }
 
 
+@close_figures_on_error
 def marker_heatmap(
     store: Any,
     *,
@@ -320,8 +314,6 @@ def marker_heatmap(
         marker=marker,
         topn=topn,
         log_transform=log_transform,
-        vmin=resolved_vmin,
-        vmax=resolved_vmax,
     )
     matrix = cast(pd.DataFrame, prepared["matrix"])
     row_annotation_values = normalize_annotations(
@@ -486,34 +478,11 @@ def marker_heatmap(
         displayed_matrix = ordered_matrix
 
     if show_legend and resolved_annotation_scales:
-        annotation_handles: list[Any] = []
-        for name, scale in zip(
+        annotation_handles = annotation_legend_handles(
+            mpl,
             annotation_names,
             resolved_annotation_scales,
-            strict=True,
-        ):
-            if scale.order is None or scale.palette is None:
-                continue
-            annotation_handles.extend(
-                mpl.lines.Line2D(
-                    [],
-                    [],
-                    marker="s",
-                    linestyle="",
-                    markerfacecolor=scale.palette[value],
-                    markeredgecolor="none",
-                    markersize=5,
-                    label=(
-                        f"{name}: "
-                        + (
-                            scale.labels.get(value, str(value))
-                            if scale.labels is not None
-                            else str(value)
-                        )
-                    ),
-                )
-                for value in scale.order
-            )
+        )
         if annotation_handles:
             if owns_figure:
                 _place_clustermap_annotation_legend(
@@ -662,6 +631,7 @@ def _prepare_pseudotime_heatmap(
     }
 
 
+@close_figures_on_error
 def pseudotime_heatmap(
     store: Any,
     *,
@@ -716,37 +686,43 @@ def pseudotime_heatmap(
     pseudotime = np.asarray(prepared["pseudotime"], dtype=float)
     show_features = [] if show_features is None else list(show_features)
     resolved_heatmap_cmap = resolved_color_scale.cmap or heatmap_cmap or "coolwarm"
-    resolved_pseudotime_scale = pseudotime_scale or ColorScale(
+    pseudotime_color_scale = pseudotime_scale or ColorScale(
         cmap=pseudotime_cmap or "viridis",
-        vmin=float(np.min(pseudotime)),
-        vmax=float(np.max(pseudotime)),
     )
-    if resolved_pseudotime_scale.scale != "linear":
+    if pseudotime_color_scale.scale != "linear":
         raise NotImplementedError("pseudotime annotations support linear scales")
     resolved_pseudotime_cmap = (
-        resolved_pseudotime_scale.cmap or pseudotime_cmap or "viridis"
+        pseudotime_color_scale.cmap or pseudotime_cmap or "viridis"
     )
-    observed_clusters = list(pd.unique(feature_clusters))
-    requested_cluster_order = (
-        list(feature_cluster_order)
-        if feature_cluster_order is not None
-        else list(feature_cluster_scale.order)
-        if feature_cluster_scale is not None and feature_cluster_scale.order is not None
-        else sort_categories(observed_clusters)
+    pseudotime_vmin, pseudotime_vmax = resolve_color_limits(
+        pseudotime,
+        pseudotime_color_scale,
     )
-    if len(requested_cluster_order) != len(set(requested_cluster_order)):
-        raise ValueError("feature_cluster_order cannot contain duplicates")
-    missing_clusters = [
-        value for value in observed_clusters if value not in requested_cluster_order
-    ]
-    unexpected_clusters = [
-        value for value in requested_cluster_order if value not in observed_clusters
-    ]
-    if missing_clusters or unexpected_clusters:
-        raise ValueError(
-            "feature_cluster_order must contain every observed feature cluster"
+    cluster_source = feature_cluster_scale
+    if feature_cluster_order is not None:
+        requested_cluster_order = list(feature_cluster_order)
+        if len(requested_cluster_order) != len(set(requested_cluster_order)):
+            raise ValueError("feature_cluster_order cannot contain duplicates")
+        if set(requested_cluster_order) != set(pd.unique(feature_clusters)):
+            raise ValueError(
+                "feature_cluster_order must contain every observed feature cluster"
+            )
+        cluster_source = replace(
+            feature_cluster_scale or CategoricalScale(),
+            order=tuple(requested_cluster_order),
         )
-    cluster_order = requested_cluster_order
+    resolved_feature_cluster_scale = resolve_category_scale(
+        feature_clusters,
+        cluster_source,
+        context="feature_cluster_scale",
+    )
+    cluster_order = list(resolved_feature_cluster_scale.order or ())
+    if feature_cluster_scale is None:
+        resolved_feature_cluster_scale = replace(
+            resolved_feature_cluster_scale,
+            palette=colormap_palette(cluster_order, clusterbar_cmap or "tab20"),
+        )
+    cluster_palette = resolved_feature_cluster_scale.palette or {}
     if feature_order is not None:
         requested_features = list(feature_order)
         if len(requested_features) != len(set(requested_features)):
@@ -782,54 +758,8 @@ def pseudotime_heatmap(
     )
 
     plt, mpl = require_matplotlib()
-    if feature_cluster_scale is not None:
-        cluster_palette = categorical_color_map(
-            cluster_order,
-            palette=feature_cluster_scale.palette,
-            palette_name=feature_cluster_scale.palette_name,
-        )
-    else:
-        legacy_cluster_cmap = plt.get_cmap(clusterbar_cmap or "tab20")
-        cluster_palette = {
-            cluster: mpl.colors.to_hex(
-                legacy_cluster_cmap(index / max(len(cluster_order) - 1, 1))
-            )
-            for index, cluster in enumerate(cluster_order)
-        }
-    resolved_feature_cluster_scale = CategoricalScale(
-        order=tuple(cluster_order),
-        palette=cluster_palette,
-        labels=(
-            feature_cluster_scale.labels if feature_cluster_scale is not None else None
-        ),
-        missing_color=(
-            feature_cluster_scale.missing_color
-            if feature_cluster_scale is not None
-            else "#bdbdbd"
-        ),
-        missing_label=(
-            feature_cluster_scale.missing_label
-            if feature_cluster_scale is not None
-            else "NA"
-        ),
-        palette_name=(
-            feature_cluster_scale.palette_name
-            if feature_cluster_scale is not None
-            else "default"
-        ),
-    )
     cluster_cmap = mpl.colors.ListedColormap(
         [cluster_palette[cluster] for cluster in cluster_order]
-    )
-    pseudotime_vmin = (
-        float(resolved_pseudotime_scale.vmin)
-        if resolved_pseudotime_scale.vmin is not None
-        else float(np.min(pseudotime))
-    )
-    pseudotime_vmax = (
-        float(resolved_pseudotime_scale.vmax)
-        if resolved_pseudotime_scale.vmax is not None
-        else float(np.max(pseudotime))
     )
     with theme_context(theme):
         if target is None:

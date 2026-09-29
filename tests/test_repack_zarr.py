@@ -11,7 +11,7 @@ from scarf.storage.ann_index import (
     ANN_INDEX_FORMAT_VERSION,
     _ANN_INDEX_METADATA,
 )
-from scarf.storage.identity import finalize_counts
+from tests.storage_helpers import finalize_test_counts
 from scarf.storage.layout import normalize_chunks
 from scarf.storage.pipeline_runs import (
     PipelineOutputRecord,
@@ -76,7 +76,7 @@ def _prepare_source(root):
         )
         counts[:] = values
         namespace[name].attrs["prepared"] = False
-        finalize_counts(counts)
+        finalize_test_counts(counts)
         finalize_writer_counts_t(root, name, workspace)
         assay = preset_assay_types()[name](
             z=root,

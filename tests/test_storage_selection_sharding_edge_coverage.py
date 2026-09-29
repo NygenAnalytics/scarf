@@ -8,7 +8,7 @@ from zarr.storage import MemoryStore
 
 import scarf.storage.selections as selections
 import scarf.storage.sharding as sharding
-from scarf.storage.arrays import create_metadata_column
+from scarf.storage.arrays import create_metadata_column, text_value
 from scarf.storage.artifacts import artifact_group
 from scarf.storage.budget import ResourceBudget
 from scarf.storage.errors import ArtifactResolutionError
@@ -223,16 +223,6 @@ def test_selection_rechecks_rows_on_each_request_and_live_alias_changes(
 
 def test_selection_alignment_rejects_bad_source_lengths() -> None:
     root, ref = _selection_root()
-    with pytest.raises(ValueError, match="Compact values"):
-        list(
-            selections.iter_full_axis_selection_blocks(
-                root,
-                ref,
-                np.arange(3),
-                fill_value=-1,
-                **_selection_kwargs(),
-            )
-        )
     with pytest.raises(ValueError, match="Full-axis values"):
         list(
             selections.iter_selected_axis_selection_blocks(
@@ -356,35 +346,14 @@ def test_selection_producers_reject_drift_and_invalid_sources(
 
 
 def test_snapshot_scalar_and_source_column_contracts() -> None:
-    assert selections._snapshot_text(b"caf\xc3\xa9") == "caf\u00e9"
-    assert selections._snapshot_text(None) == ""
+    assert text_value(b"caf\xc3\xa9") == "caf\u00e9"
+    assert text_value(None) == ""
     assert selections._snapshot_values_dtype(_ObjectStrings(["a", "long"])) == np.dtype(
         "U4"
     )
-
-    class MatrixValues(_ObjectStrings):
-        ndim = 2
-
-        def __init__(self) -> None:
-            self.values = np.asarray([["a"], ["b"]], dtype=object)
-            self.shape = self.values.shape
-
-    with pytest.raises(ValueError, match="one-dimensional"):
-        selections._snapshot_values_dtype(MatrixValues())  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="one-dimensional"):
-        selections._snapshot_values_block(
-            MatrixValues(),  # type: ignore[arg-type]
-            0,
-            2,
-            np.dtype("U1"),
-        )
-    with pytest.raises(RuntimeError, match="changed"):
-        selections._snapshot_values_block(
-            _ObjectStrings(["too-long"]),  # type: ignore[arg-type]
-            0,
-            1,
-            np.dtype("U2"),
-        )
+    assert selections._snapshot_values_dtype(
+        _ObjectStrings([b"caf\xc3\xa9", None])  # type: ignore[arg-type]
+    ) == np.dtype("U4")
 
     root = zarr.open_group(store=MemoryStore(), mode="w")
     table = root.create_group("table")
@@ -413,15 +382,16 @@ def test_snapshot_scalar_and_source_column_contracts() -> None:
             row_count=4,
         )
     table["value"].attrs["missing_mask"] = "absent"
-    with pytest.raises(ValueError, match="invalid missing mask"):
+    with pytest.raises(ValueError, match="malformed missing-mask link"):
         selections._snapshot_source_columns(
             table,
             table_path="table",
             columns=("value",),
             row_count=3,
         )
-    table.create_array("absent", data=np.arange(3))
-    with pytest.raises(ValueError, match="malformed missing mask"):
+    table["value"].attrs["missing_mask"] = "__scarf_missing__value"
+    table.create_array("__scarf_missing__value", data=np.arange(3))
+    with pytest.raises(ValueError, match="malformed missing-mask array"):
         selections._snapshot_source_columns(
             table,
             table_path="table",
@@ -734,8 +704,6 @@ def test_dense_shard_writer_contract_errors() -> None:
 
 
 def test_counts_t_shape_and_layout_contracts() -> None:
-    with pytest.raises(ValueError, match="two-dimensional"):
-        sharding.counts_t_spec(_spec((3,), (3,)), profile="local")
     assert not sharding.is_paired_counts_t_layout(
         shape=(-1, 2),
         chunks=(1, 1),

@@ -4,7 +4,7 @@ import json
 import math
 import secrets
 import struct
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,7 +12,8 @@ from typing import Any
 import numpy as np
 import zarr
 
-from .arrays import _decode_metadata_values
+from .arrays import _decode_metadata_values, text_dtype
+from .errors import ArtifactErrorContextValue, ArtifactResolutionError
 from .geometry import array_geometry
 from .partition import scan_band
 from .refs import (
@@ -23,7 +24,6 @@ from .refs import (
     _validate_artifact_kind,
     _validate_name,
     artifact_path as artifact_path,
-    parse_artifact_path as parse_artifact_path,
 )
 from .types import as_zarr_array, as_zarr_group
 
@@ -265,42 +265,52 @@ def fingerprint_stored_arrays(
     return builder.hexdigest()
 
 
-def fingerprint_stored_strings(array: Any) -> str:
-    """Fingerprint a stored or in-memory string column in bounded bands."""
-    if array.ndim != 1:
-        raise ValueError("Stored string fingerprints require a one-dimensional array")
+def fingerprint_text_blocks(
+    n_values: int,
+    source_dtype: Any,
+    blocks: Callable[[], Iterable[Any]],
+) -> str:
+    """Fingerprint consecutive blocks of values as decoded fixed-width text.
 
-    chunk_rows = _stored_array_chunk_rows(array)
-    source_dtype = np.dtype(array.dtype)
-    if source_dtype.hasobject:
-        max_length = 1
-        for start in range(0, array.shape[0], chunk_rows):
-            stop = min(start + chunk_rows, array.shape[0])
-            values = _decode_metadata_values(array[start:stop])
-            if values.size:
-                max_length = max(
-                    max_length,
-                    max(len(str(value)) for value in values),
-                )
-        string_dtype = np.dtype(f"U{max_length}")
-    else:
-        string_dtype = np.empty(0, dtype=source_dtype).astype(str).dtype
-
+    ``blocks`` returns a fresh iterator on each call; object and variable-width
+    values are read twice, once to measure the text width.
+    """
+    dtype = text_dtype(
+        source_dtype,
+        lambda: (_decode_metadata_values(block) for block in blocks()),
+    )
     builder = ValueFingerprintBuilder()
-    builder.begin_array("values", array.shape, string_dtype)
-    for start in range(0, array.shape[0], chunk_rows):
-        stop = min(start + chunk_rows, array.shape[0])
-        block = np.asarray(
-            _decode_metadata_values(array[start:stop]),
-        ).astype(string_dtype)
-        builder.update_array_block("values", (start,), block)
+    builder.begin_array("values", (n_values,), dtype)
+    offset = 0
+    for block in blocks():
+        values = np.asarray(_decode_metadata_values(block)).astype(dtype)
+        if values.size:
+            builder.update_array_block("values", (offset,), values)
+            offset += len(values)
     builder.end_array("values")
     return builder.hexdigest()
 
 
+def fingerprint_stored_strings(array: Any) -> str:
+    """Fingerprint a stored or in-memory string column in bounded bands."""
+    if array.ndim != 1:
+        raise ValueError("Stored string fingerprints require a one-dimensional array")
+    rows = _stored_array_chunk_rows(array)
+    n_rows = int(array.shape[0])
+    return fingerprint_text_blocks(
+        n_rows,
+        array.dtype,
+        lambda: (array[start : start + rows] for start in range(0, n_rows, rows)),
+    )
+
+
 def fingerprint_strings(values: np.ndarray) -> str:
-    strings = np.asarray(values).astype(str)
-    return fingerprint_array(strings)
+    """Fingerprint in-memory values as decoded text, keeping their shape."""
+    array = np.asarray(values)
+    decoded = _decode_metadata_values(array)
+    return fingerprint_array(
+        decoded.astype(text_dtype(array.dtype, lambda: (decoded,)))
+    )
 
 
 def callable_identity(value: Any) -> dict[str, str]:
@@ -370,6 +380,49 @@ def provenance_hash(provenance: Mapping[str, Any]) -> str:
     return digest.hexdigest()
 
 
+def parse_artifact_ref(
+    raw: Any,
+    name: str,
+    *,
+    owner: ArtifactRef | None = None,
+) -> ArtifactRef:
+    """Parse a persisted reference that holds exactly the ``ArtifactRef`` fields.
+
+    Args:
+        raw: The recorded value.
+        name: What the value is, such as the input name an artifact records.
+        owner: The artifact that records the value, when there is one.
+
+    Raises:
+        ArtifactResolutionError: With code ``corrupt_payload`` when ``raw`` is
+            missing or is not an exact artifact reference.
+    """
+    context: dict[str, ArtifactErrorContextValue] = {"input_name": name}
+    if owner is None:
+        missing = f"{name} is missing"
+        malformed = f"{name} is not a valid artifact reference"
+    else:
+        context.update(
+            {
+                "assay": owner.assay,
+                "artifact_id": owner.artifact_id,
+                "actual_kind": owner.kind,
+            }
+        )
+        missing = f"{owner.kind} artifact has no {name!r} input"
+        malformed = f"{owner.kind} artifact has a malformed {name!r} input"
+    if raw is None:
+        raise ArtifactResolutionError(missing, code="corrupt_payload", context=context)
+    try:
+        return ArtifactRef.from_dict(raw)
+    except (TypeError, ValueError) as error:
+        raise ArtifactResolutionError(
+            malformed,
+            code="corrupt_payload",
+            context=context,
+        ) from error
+
+
 @dataclass(frozen=True, slots=True)
 class ArtifactStatus:
     ref: ArtifactRef
@@ -401,6 +454,15 @@ class ArtifactStatus:
             return None
         value = self.provenance.get("inputs")
         return dict(value) if isinstance(value, Mapping) else None
+
+    def input_ref(self, name: str) -> ArtifactRef:
+        """Return the exact artifact reference recorded as input ``name``.
+
+        Raises:
+            ArtifactResolutionError: With code ``corrupt_payload`` when the
+                input is missing or is not an exact artifact reference.
+        """
+        return parse_artifact_ref((self.inputs or {}).get(name), name, owner=self.ref)
 
 
 def _mapping_attr(group: zarr.Group, name: str) -> dict[str, Any] | None:
@@ -504,16 +566,6 @@ def _artifact_status(group: zarr.Group, ref: ArtifactRef, path: str) -> Artifact
         created_at_ns=created_at_ns,
         scarf_version=raw_scarf_version,
     )
-
-
-def artifact_exists(
-    root: zarr.Group,
-    ref: ArtifactRef,
-    *,
-    require_complete: bool = True,
-) -> bool:
-    status = inspect_artifact(root, ref)
-    return status.exists and (status.complete or not require_complete)
 
 
 def list_artifacts(
@@ -623,28 +675,6 @@ def _artifact_groups(
                 continue
             found.append((ref, group))
     return found
-
-
-def find_reusable_artifacts(
-    root: zarr.Group,
-    *,
-    scope: ArtifactScope,
-    kind: str,
-    provenance: Mapping[str, Any],
-    assay: str | None = None,
-    invalidate_cache: bool = False,
-) -> list[ArtifactRef]:
-    return [
-        ref
-        for ref, _group in reusable_artifact_groups(
-            root,
-            scope=scope,
-            kind=kind,
-            provenance=provenance,
-            assay=assay,
-            invalidate_cache=invalidate_cache,
-        )
-    ]
 
 
 def reusable_artifact_groups(

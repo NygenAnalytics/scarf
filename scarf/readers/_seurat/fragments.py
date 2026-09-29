@@ -24,13 +24,24 @@ from .errors import (
     UnsafeSidecarError,
     UnsupportedMatrixOperation,
 )
-from .paths import SidecarPathResolver, require_filesystem_path
+from .paths import SidecarPathResolver
 from .sources import (
     DEFAULT_LIMITS,
     BaseMatrixSource,
     MemoryEstimate,
     SourceLimits,
+    _metadata_bytes,
     _normalize_names,
+)
+from .values import (
+    class_names,
+    decode_text,
+    decode_text_values,
+    logical_scalar,
+    read_window,
+    scalar_value,
+    shape_value,
+    vector_length,
 )
 
 
@@ -77,14 +88,6 @@ class FragmentCapabilityRegistry:
         self.capabilities = {
             capability.className: capability for capability in _FRAGMENT_CAPABILITIES
         }
-
-    @property
-    def acceptedClasses(self) -> tuple[str, ...]:
-        return tuple(
-            capability.className
-            for capability in _FRAGMENT_CAPABILITIES
-            if capability.accepted
-        )
 
     def recognizes(self, class_name: str | None) -> bool:
         return class_name in self.capabilities
@@ -364,6 +367,8 @@ class RenamedFragmentSource(_FragmentWrapper):
 
 
 class RegionSelectedFragmentSource(_FragmentWrapper):
+    """Keep fragments overlapping half-open regions [start, end), or the rest."""
+
     def __init__(
         self,
         source: FragmentSource,
@@ -373,7 +378,13 @@ class RegionSelectedFragmentSource(_FragmentWrapper):
         metadata_bytes: int,
     ) -> None:
         super().__init__(source)
-        self.regions = dict(regions)
+        self.regions: dict[int, tuple[NDArray[np.int64], NDArray[np.int64]]] = {}
+        for chromosome_id, (starts, ends) in regions.items():
+            order = np.argsort(starts, kind="stable")
+            self.regions[chromosome_id] = (
+                np.asarray(starts, dtype=np.int64)[order],
+                np.maximum.accumulate(np.asarray(ends, dtype=np.int64)[order]),
+            )
         self.invert = invert
         self._regionMetadataBytes = metadata_bytes
 
@@ -389,12 +400,13 @@ class RegionSelectedFragmentSource(_FragmentWrapper):
         region = self.regions.get(chromosome_id)
         for block in self.source.iter_chromosome(chromosome_id):
             overlaps = np.zeros(block.size, dtype=bool)
-            if region is not None:
-                starts, ends = region
-                for region_start, region_end in zip(starts, ends, strict=True):
-                    overlaps |= (block.starts <= region_end) & (
-                        block.ends >= region_start
-                    )
+            if region is not None and block.size:
+                starts, end_maxima = region
+                preceding = np.searchsorted(starts, block.ends, side="left")
+                has_region = preceding > 0
+                overlaps[has_region] = end_maxima[
+                    preceding[has_region] - 1
+                ] > block.starts[has_region].astype(np.int64)
             keep = ~overlaps if self.invert else overlaps
             if np.any(keep):
                 yield FragmentBlock(
@@ -404,17 +416,27 @@ class RegionSelectedFragmentSource(_FragmentWrapper):
                 )
 
 
+def _first_positions(names: Sequence[str]) -> dict[str, int]:
+    """Map each name to the position of its first occurrence."""
+    positions: dict[str, int] = {}
+    for index, name in enumerate(names):
+        positions.setdefault(name, index)
+    return positions
+
+
 class MergedFragmentSource:
     def __init__(self, sources: Sequence[FragmentSource]) -> None:
         if not sources:
             raise MatrixSourceError("fragment merge requires at least one source")
         self.sources = tuple(sources)
-        chromosome_names: list[str] = []
-        for source in self.sources:
-            for name in source.chromosomeNames:
-                if name not in chromosome_names:
-                    chromosome_names.append(name)
-        self._chromosomeNames = tuple(chromosome_names)
+        self._chromosomeIndexes = tuple(
+            _first_positions(source.chromosomeNames) for source in self.sources
+        )
+        self._chromosomeNames = tuple(
+            dict.fromkeys(
+                name for indexes in self._chromosomeIndexes for name in indexes
+            )
+        )
         self._cellNames = tuple(
             name for source in self.sources for name in source.cellNames
         )
@@ -448,42 +470,70 @@ class MergedFragmentSource:
 
     @property
     def blockWorkingBytes(self) -> int:
-        return 2 * max(source.blockWorkingBytes for source in self.sources)
+        return 2 * sum(source.blockWorkingBytes for source in self.sources)
 
     def iter_chromosome(self, chromosome_id: int) -> Iterator[FragmentBlock]:
+        """Merge the sources' fragments of one chromosome in start order."""
         if chromosome_id < 0 or chromosome_id >= len(self.chromosomeNames):
             raise IndexError("fragment chromosome ID is out of range")
         name = self.chromosomeNames[chromosome_id]
-        for source, cell_offset in zip(
-            self.sources,
-            self._cellOffsets,
-            strict=True,
+        iterators: list[Iterator[FragmentBlock] | None] = []
+        offsets: list[int] = []
+        for source, indexes, cell_offset in zip(
+            self.sources, self._chromosomeIndexes, self._cellOffsets, strict=True
         ):
-            if name not in source.chromosomeNames:
-                continue
-            source_id = source.chromosomeNames.index(name)
-            for block in source.iter_chromosome(source_id):
-                shifted_cells = block.cellIds.astype(np.uint64) + cell_offset
-                if np.any(shifted_cells > _UINT32_MAX):
-                    raise MatrixSourceError("merged fragment cell IDs overflow uint32")
-                yield FragmentBlock(
-                    shifted_cells.astype(np.uint32),
-                    block.starts,
-                    block.ends,
+            if name in indexes:
+                iterators.append(source.iter_chromosome(indexes[name]))
+                offsets.append(cell_offset)
+        buffers: list[FragmentBlock | None] = [None] * len(iterators)
+        while True:
+            for index, cell_offset in enumerate(offsets):
+                iterator = iterators[index]
+                buffer = buffers[index]
+                while iterator is not None and (buffer is None or buffer.size == 0):
+                    block = next(iterator, None)
+                    if block is None:
+                        iterator = None
+                        buffer = None
+                    else:
+                        buffer = self._offset_cells(block, cell_offset)
+                iterators[index] = iterator
+                buffers[index] = buffer
+            filled = [
+                (index, buffer)
+                for index, buffer in enumerate(buffers)
+                if buffer is not None and buffer.size
+            ]
+            if not filled:
+                return
+            # Later fragments of a source never start before its buffered ones,
+            # so everything up to the smallest buffered final start is in order.
+            limit = min(int(buffer.starts[-1]) for _, buffer in filled)
+            parts: list[FragmentBlock] = []
+            for index, buffer in filled:
+                take = int(np.searchsorted(buffer.starts, limit, side="right"))
+                parts.append(
+                    FragmentBlock(
+                        buffer.cellIds[:take], buffer.starts[:take], buffer.ends[:take]
+                    )
                 )
+                buffers[index] = FragmentBlock(
+                    buffer.cellIds[take:], buffer.starts[take:], buffer.ends[take:]
+                )
+            starts = np.concatenate([part.starts for part in parts])
+            order = np.argsort(starts, kind="stable")
+            yield FragmentBlock(
+                np.concatenate([part.cellIds for part in parts])[order],
+                starts[order],
+                np.concatenate([part.ends for part in parts])[order],
+            )
 
-
-def _class_names(value: Any) -> tuple[str, ...]:
-    if value is None:
-        return ()
-    if isinstance(value, str):
-        return (value,)
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
-        result = tuple(str(item) for item in value)
-        if not result:
-            raise MatrixSourceError("fragment class vector cannot be empty")
-        return result
-    return (str(value),)
+    @staticmethod
+    def _offset_cells(block: FragmentBlock, cell_offset: int) -> FragmentBlock:
+        shifted_cells = block.cellIds.astype(np.uint64) + cell_offset
+        if np.any(shifted_cells > _UINT32_MAX):
+            raise MatrixSourceError("merged fragment cell IDs overflow uint32")
+        return FragmentBlock(shifted_cells.astype(np.uint32), block.starts, block.ends)
 
 
 def _slot_mapping(
@@ -497,135 +547,8 @@ def _slot_mapping(
     return nested
 
 
-def _vector_length(value: Any, object_path: str) -> int:
-    try:
-        return len(value)
-    except TypeError:
-        shape = getattr(value, "shape", None)
-        if shape is None:
-            raise TypeError(f"vector at {object_path} has no bounded length") from None
-        normalized = tuple(int(item) for item in shape)
-        if len(normalized) != 1:
-            raise MatrixSourceError(f"vector at {object_path} must be one-dimensional")
-        return normalized[0]
-
-
-def _read_vector_slice(
-    value: Any,
-    start: int,
-    stop: int,
-    object_path: str,
-) -> NDArray[Any]:
-    if hasattr(value, "read_block"):
-        result = np.asarray(value.read_block(start, stop))
-    else:
-        try:
-            result = np.asarray(value[start:stop])
-        except (IndexError, TypeError, ValueError) as error:
-            raise MatrixSourceError(
-                f"vector at {object_path} does not support bounded slicing"
-            ) from error
-    if result.ndim != 1:
-        result = result.reshape(-1)
-    if result.size != stop - start:
-        raise MatrixSourceError(
-            f"vector at {object_path} returned {result.size} values; "
-            f"expected {stop - start}"
-        )
-    return result
-
-
-def _single_value(value: Any, object_path: str) -> Any:
-    if isinstance(value, os.PathLike):
-        return value
-    if isinstance(
-        value,
-        str
-        | bytes
-        | bool
-        | int
-        | float
-        | np.str_
-        | np.bytes_
-        | np.bool_
-        | np.integer
-        | np.floating,
-    ):
-        return value
-    length = _vector_length(value, object_path)
-    if length != 1:
-        raise MatrixSourceError(f"value at {object_path} must be scalar")
-    return _read_vector_slice(value, 0, 1, object_path)[0]
-
-
-def _decode_text(value: Any, object_path: str) -> str:
-    if isinstance(value, bytes | np.bytes_):
-        try:
-            result = bytes(value).decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise MatrixSourceError(
-                f"text at {object_path} is not valid UTF-8"
-            ) from error
-    elif isinstance(value, str | np.str_):
-        result = str(value)
-    else:
-        raise TypeError(f"text at {object_path} must contain strings")
-    if "\x00" in result:
-        raise MatrixSourceError(f"text at {object_path} contains a NUL character")
-    return result
-
-
 def _text_scalar(value: Any, object_path: str) -> str:
-    return _decode_text(_single_value(value, object_path), object_path)
-
-
-def _bool_scalar(value: Any, object_path: str) -> bool:
-    scalar = _single_value(value, object_path)
-    if isinstance(scalar, bool | np.bool_):
-        return bool(scalar)
-    if isinstance(scalar, int | np.integer) and int(scalar) in {0, 1}:
-        return bool(scalar)
-    raise TypeError(f"logical value at {object_path} must be TRUE or FALSE")
-
-
-def _positive_int_scalar(value: Any, object_path: str) -> int:
-    scalar = _single_value(value, object_path)
-    if isinstance(scalar, bool | np.bool_) or not isinstance(
-        scalar, int | float | np.integer | np.floating
-    ):
-        raise TypeError(f"integer value at {object_path} must be numeric")
-    numeric = float(scalar)
-    if not math.isfinite(numeric) or not numeric.is_integer() or numeric <= 0:
-        raise MatrixSourceError(f"integer value at {object_path} must be positive")
-    return int(numeric)
-
-
-def _integer_scalar(
-    value: Any,
-    object_path: str,
-    *,
-    allow_missing: bool = False,
-) -> int | None:
-    scalar = _single_value(value, object_path)
-    if isinstance(scalar, bool | np.bool_) or not isinstance(
-        scalar, int | float | np.integer | np.floating
-    ):
-        raise TypeError(f"integer value at {object_path} must be numeric")
-    numeric = float(scalar)
-    if (
-        allow_missing
-        and isinstance(scalar, int | np.integer)
-        and int(scalar) == np.iinfo(np.int32).min
-    ):
-        return None
-    if (
-        not math.isfinite(numeric)
-        or not numeric.is_integer()
-        or numeric < np.iinfo(np.int32).min
-        or numeric > np.iinfo(np.int32).max
-    ):
-        raise MatrixSourceError(f"integer value at {object_path} is invalid")
-    return int(numeric)
+    return decode_text(scalar_value(value, object_path), object_path)
 
 
 def _text_values(
@@ -634,61 +557,64 @@ def _text_values(
     limits: SourceLimits,
 ) -> tuple[str, ...]:
     if isinstance(value, str | bytes | np.str_ | np.bytes_):
-        raw_values: Sequence[Any] = (value,)
-    else:
-        raw_values = value
-    length = _vector_length(raw_values, object_path)
-    if length * 8 > limits.maxMetadataBytes:
-        raise ResourceLimitError(
-            f"text at {object_path} exceeds maxMetadataBytes={limits.maxMetadataBytes}"
+        value = (value,)
+    return decode_text_values(
+        value,
+        object_path=object_path,
+        max_bytes=limits.maxMetadataBytes,
+    )
+
+
+def _integer_scalar(
+    value: Any,
+    object_path: str,
+    *,
+    allow_missing: bool = False,
+    positive: bool = False,
+) -> int | None:
+    scalar = scalar_value(value, object_path)
+    if isinstance(scalar, bool | np.bool_) or not isinstance(
+        scalar, int | float | np.integer | np.floating
+    ):
+        raise TypeError(f"integer value at {object_path} must be numeric")
+    if (
+        allow_missing
+        and isinstance(scalar, int | np.integer)
+        and int(scalar) == np.iinfo(np.int32).min
+    ):
+        return None
+    numeric = float(scalar)
+    if (
+        not math.isfinite(numeric)
+        or not numeric.is_integer()
+        or numeric < (1 if positive else np.iinfo(np.int32).min)
+        or numeric > np.iinfo(np.int32).max
+    ):
+        raise MatrixSourceError(
+            f"integer value at {object_path} must be a "
+            f"{'positive' if positive else 'finite'} 32-bit integer"
         )
-    output: list[str] = []
-    total = 0
-    for start in range(0, length, 4096):
-        stop = min(length, start + 4096)
-        if hasattr(raw_values, "read_block"):
-            values = raw_values.read_block(start, stop)
-        else:
-            values = raw_values[start:stop]
-        for index, value_item in enumerate(values, start=start):
-            decoded = _decode_text(value_item, f"{object_path}[{index}]")
-            total += len(decoded.encode("utf-8")) + 8
-            if total > limits.maxMetadataBytes:
-                raise ResourceLimitError(
-                    f"text at {object_path} exceeds "
-                    f"maxMetadataBytes={limits.maxMetadataBytes}"
-                )
-            output.append(decoded)
-    return tuple(output)
-
-
-def _metadata_bytes(values: Sequence[str]) -> int:
-    return sum(len(value.encode("utf-8")) + 8 for value in values)
+    return int(numeric)
 
 
 def _resolve_sidecar(
     value: Any,
     *,
-    rds_path: str | os.PathLike[str] | None,
+    sidecar_root: str | os.PathLike[str] | None,
     absolute_prefix_remaps: Mapping[str | os.PathLike[str], str | os.PathLike[str]]
     | None,
     expect: str,
+    object_path: str,
 ) -> Path:
-    if rds_path is not None:
-        return SidecarPathResolver(
-            rds_path,
-            absolute_prefix_remaps=absolute_prefix_remaps,
-        ).resolve(value, expect=expect)
-    if expect == "file":
-        return require_filesystem_path(value, "fragment HDF5 source")
-    if not isinstance(value, str | os.PathLike):
-        raise TypeError("fragment sidecar directory must be a filesystem path")
-    path = Path(value).expanduser().resolve(strict=False)
-    if not path.exists():
-        raise FileNotFoundError(path)
-    if not path.is_dir():
-        raise UnsafeSidecarError(f"fragment sidecar path {path} is not a directory")
-    return path
+    if sidecar_root is None:
+        raise UnsafeSidecarError(
+            f"sidecar path at {object_path} needs an anchor directory"
+        )
+    path = value if isinstance(value, os.PathLike) else _text_scalar(value, object_path)
+    return SidecarPathResolver(
+        sidecar_root,
+        absolute_prefix_remaps=absolute_prefix_remaps,
+    ).resolve(path, expect=expect)
 
 
 def _coerce_unsigned(
@@ -706,9 +632,7 @@ def _coerce_unsigned(
     if raw.dtype.kind in "iu":
         if raw.dtype.kind == "i" and np.any(raw < 0):
             raise MatrixSourceError(f"array at {object_path} contains a negative value")
-        widened = raw.astype(object)
-        upper = int(np.iinfo(dtype).max)
-        if any(int(value) > upper for value in widened):
+        if raw.size and int(raw.max()) > int(np.iinfo(dtype).max):
             raise MatrixSourceError(f"array at {object_path} exceeds {dtype}")
         return raw.astype(dtype)
     if raw.dtype.kind == "f":
@@ -766,7 +690,7 @@ class _MemoryArrayStore:
         if name not in self.dtypes:
             raise MatrixSourceError(f"BPCells array {name!r} is not numeric")
         value = self.slots[name]
-        length = _vector_length(value, f"{self.objectPath}@{name}")
+        length = vector_length(value, f"{self.objectPath}@{name}")
         return self.dtypes[name], length
 
     def read_numeric(
@@ -783,11 +707,11 @@ class _MemoryArrayStore:
                 f"BPCells memory array {name!r} window [{start}, {stop}) "
                 f"is outside [0, {length})"
             )
-        values = _read_vector_slice(
+        values = read_window(
             self.slots[name],
             start,
             stop,
-            f"{self.objectPath}@{name}",
+            object_path=f"{self.objectPath}@{name}",
         )
         return _coerce_unsigned(values, dtype, f"{self.objectPath}@{name}")
 
@@ -826,66 +750,6 @@ def _memory_dtypes(version: str) -> dict[str, np.dtype[Any]]:
             result[f"{prefix}_idx_offsets"] = np.dtype(np.uint64)
         result["start_starts"] = np.dtype(np.uint32)
     return result
-
-
-class _PackedD1Reader:
-    def __init__(
-        self,
-        store: _BPArrayStore,
-        count: int,
-        *,
-        require_offsets: bool,
-        limits: SourceLimits,
-    ) -> None:
-        self.store = store
-        self.count = count
-        self.reader = _StoredBP128Array(
-            store,
-            "start",
-            count,
-            "plain",
-            require_offsets=require_offsets,
-            limits=limits,
-        )
-        self.blockCount = math.ceil(count / 128)
-        _require_numeric_array(
-            store,
-            "start_starts",
-            np.dtype(np.uint32),
-            self.blockCount,
-        )
-
-    @property
-    def indexOffsets(self) -> NDArray[np.int64]:
-        return self.reader.indexOffsets
-
-    def read(self, start: int, stop: int) -> NDArray[np.uint32]:
-        start = int(start)
-        stop = int(stop)
-        if start < 0 or stop < start or stop > self.count:
-            raise IndexError(
-                f"BPCells packed start window [{start}, {stop}) "
-                f"is outside [0, {self.count})"
-            )
-        if start == stop:
-            return np.empty(0, dtype=np.uint32)
-        first_block = start // 128
-        final_block = (stop - 1) // 128
-        decoded: list[NDArray[np.uint32]] = []
-        for block in range(first_block, final_block + 1):
-            block_start = block * 128
-            block_stop = min(self.count, block_start + 128)
-            deltas = self.reader.read(block_start, block_stop).astype(
-                np.uint64, copy=False
-            )
-            initial = int(self.store.read_numeric("start_starts", block, block + 1)[0])
-            values = (
-                np.cumsum(deltas, dtype=np.uint64) + np.uint64(initial)
-            ) & np.uint64(_UINT32_MAX)
-            decoded.append(values.astype(np.uint32))
-        combined = np.concatenate(decoded)
-        local_start = start - first_block * 128
-        return combined[local_start : local_start + stop - start]
 
 
 class StoredFragmentSource:
@@ -963,7 +827,7 @@ class StoredFragmentSource:
         self._chromosomeNames = normalized_chromosomes
         self._cellNames = normalized_cells
         self._cellReader: _StoredBP128Array | None = None
-        self._startReader: _PackedD1Reader | None = None
+        self._startReader: _StoredBP128Array | None = None
         self._endReader: _StoredBP128Array | None = None
         offset_bytes = 0
         if compression == "unpacked":
@@ -984,9 +848,11 @@ class StoredFragmentSource:
                 require_offsets=require_offsets,
                 limits=limits,
             )
-            self._startReader = _PackedD1Reader(
+            self._startReader = _StoredBP128Array(
                 store,
+                "start",
                 self._recordCount,
+                "d1",
                 require_offsets=require_offsets,
                 limits=limits,
             )
@@ -1224,7 +1090,7 @@ def fragment_source_from_slots(
     specification: Mapping[str, Any],
     *,
     object_path: str = "$",
-    rds_path: str | os.PathLike[str] | None = None,
+    sidecar_root: str | os.PathLike[str] | None = None,
     absolute_prefix_remaps: Mapping[str | os.PathLike[str], str | os.PathLike[str]]
     | None = None,
     limits: SourceLimits = DEFAULT_LIMITS,
@@ -1232,7 +1098,7 @@ def fragment_source_from_slots(
     if not isinstance(specification, Mapping):
         raise TypeError(f"fragment source at {object_path} must be a mapping")
     slots = _slot_mapping(specification, object_path)
-    classes = _class_names(
+    classes = class_names(
         specification.get(
             "className",
             specification.get(
@@ -1254,7 +1120,7 @@ def fragment_source_from_slots(
             return fragment_source_from_slots(
                 value,
                 object_path=path,
-                rds_path=rds_path,
+                sidecar_root=sidecar_root,
                 absolute_prefix_remaps=absolute_prefix_remaps,
                 limits=limits,
             )
@@ -1320,12 +1186,13 @@ def fragment_source_from_slots(
                     raise MatrixSourceError(
                         "fragment chromosome selection contains duplicates"
                     )
-                missing = [name for name in names if name not in source.chromosomeNames]
+                chromosome_lookup = _first_positions(source.chromosomeNames)
+                missing = [name for name in names if name not in chromosome_lookup]
                 if missing:
                     raise MatrixSourceError(
                         f"fragment chromosome selection contains unknown names {missing!r}"
                     )
-                selection = tuple(source.chromosomeNames.index(name) for name in names)
+                selection = tuple(chromosome_lookup[name] for name in names)
             else:
                 raw = _unsigned_vector(
                     slots.get("chr_index_selection"),
@@ -1355,12 +1222,13 @@ def fragment_source_from_slots(
                     raise MatrixSourceError(
                         "fragment cell selection contains duplicates"
                     )
-                missing = [name for name in names if name not in source.cellNames]
+                cell_lookup = _first_positions(source.cellNames)
+                missing = [name for name in names if name not in cell_lookup]
                 if missing:
                     raise MatrixSourceError(
                         f"fragment cell selection contains unknown names {missing!r}"
                     )
-                selection = tuple(source.cellNames.index(name) for name in names)
+                selection = tuple(cell_lookup[name] for name in names)
             else:
                 raw = _unsigned_vector(
                     slots.get("cell_index_selection"),
@@ -1430,6 +1298,12 @@ def fragment_source_from_slots(
                 slots.get("prefix"),
                 f"{object_path}@prefix",
             )
+            prefix_bytes = len(prefix.encode("utf-8")) * len(source.cellNames)
+            if prefix_bytes + source.metadataBytes > limits.maxMetadataBytes:
+                raise ResourceLimitError(
+                    f"prefixed cell names at {object_path} exceed "
+                    f"maxMetadataBytes={limits.maxMetadataBytes}"
+                )
             return RenamedFragmentSource(
                 source,
                 cell_names=tuple(prefix + name for name in source.cellNames),
@@ -1464,35 +1338,25 @@ def fragment_source_from_slots(
                 raise MatrixSourceError("fragment region metadata is inconsistent")
             if np.any(ends < starts):
                 raise MatrixSourceError("fragment region end precedes its start")
-            source_regions: dict[
-                int,
-                tuple[list[np.uint32], list[np.uint32]],
-            ] = {}
-            for chromosome_id, start, end in zip(
-                chromosome_ids,
-                starts,
-                ends,
-                strict=True,
-            ):
-                name = chromosome_levels[int(chromosome_id)]
-                if name not in source.chromosomeNames:
-                    continue
-                source_id = source.chromosomeNames.index(name)
-                region_starts, region_ends = source_regions.setdefault(
-                    source_id,
-                    ([], []),
-                )
-                region_starts.append(start)
-                region_ends.append(end)
+            chromosome_lookup = {
+                chromosome: index
+                for index, chromosome in enumerate(source.chromosomeNames)
+            }
+            level_sources = np.asarray(
+                [chromosome_lookup.get(name, -1) for name in chromosome_levels],
+                dtype=np.int64,
+            )
+            region_sources = (
+                level_sources[chromosome_ids.astype(np.int64)]
+                if chromosome_ids.size
+                else np.empty(0, dtype=np.int64)
+            )
             normalized_regions = {
-                chromosome_id: (
-                    np.asarray(region_starts, dtype=np.uint32),
-                    np.asarray(region_ends, dtype=np.uint32),
+                int(source_id): (
+                    starts[region_sources == source_id],
+                    ends[region_sources == source_id],
                 )
-                for chromosome_id, (
-                    region_starts,
-                    region_ends,
-                ) in source_regions.items()
+                for source_id in np.unique(region_sources[region_sources >= 0])
             }
             metadata_bytes = (
                 chromosome_ids.nbytes
@@ -1508,7 +1372,7 @@ def fragment_source_from_slots(
             return RegionSelectedFragmentSource(
                 source,
                 normalized_regions,
-                invert=_bool_scalar(
+                invert=logical_scalar(
                     slots.get("invert_selection", False),
                     f"{object_path}@invert_selection",
                 ),
@@ -1539,8 +1403,9 @@ def fragment_source_from_slots(
         if "dir" not in slots:
             raise MatrixSourceError(f"fragment source at {object_path} has no dir slot")
         path = _resolve_sidecar(
-            _single_value(slots["dir"], f"{object_path}@dir"),
-            rds_path=rds_path,
+            slots["dir"],
+            sidecar_root=sidecar_root,
+            object_path=f"{object_path}@dir",
             absolute_prefix_remaps=absolute_prefix_remaps,
             expect="directory",
         )
@@ -1556,8 +1421,9 @@ def fragment_source_from_slots(
                 f"fragment source at {object_path} requires path and group slots"
             )
         path = _resolve_sidecar(
-            _single_value(path_value, f"{object_path}@path"),
-            rds_path=rds_path,
+            path_value,
+            sidecar_root=sidecar_root,
+            object_path=f"{object_path}@path",
             absolute_prefix_remaps=absolute_prefix_remaps,
             expect="file",
         )
@@ -1586,7 +1452,7 @@ def fragment_source_from_slots(
             raise MatrixSourceError(
                 f"fragment source at {object_path} has no compressed slot"
             )
-        declared_compressed = _bool_scalar(
+        declared_compressed = logical_scalar(
             slots["compressed"],
             f"{object_path}@compressed",
         )
@@ -1596,7 +1462,9 @@ def fragment_source_from_slots(
                 f"format {store.version!r}"
             )
     if "buffer_size" in slots:
-        _positive_int_scalar(slots["buffer_size"], f"{object_path}@buffer_size")
+        _integer_scalar(
+            slots["buffer_size"], f"{object_path}@buffer_size", positive=True
+        )
     return StoredFragmentSource(
         store,
         chromosome_names=chromosome_names,
@@ -1613,14 +1481,13 @@ def _unsigned_vector(
     object_path: str,
     limits: SourceLimits,
 ) -> NDArray[np.uint32]:
-    length = _vector_length(value, f"{object_path}@{name}")
-    required = length * np.dtype(np.uint32).itemsize
-    if required > limits.maxMetadataBytes:
+    length = vector_length(value, f"{object_path}@{name}")
+    if length * np.dtype(np.uint32).itemsize > limits.maxMetadataBytes:
         raise ResourceLimitError(
             f"{name} at {object_path} exceeds "
             f"maxMetadataBytes={limits.maxMetadataBytes}"
         )
-    raw = _read_vector_slice(value, 0, length, f"{object_path}@{name}")
+    raw = read_window(value, 0, length, object_path=f"{object_path}@{name}")
     if raw.dtype.kind not in "iuf":
         raise TypeError(f"{name} at {object_path} must contain integers")
     if raw.dtype.kind == "f":
@@ -1641,28 +1508,6 @@ def _unsigned_vector(
     return numeric.astype(np.uint32)
 
 
-def _shape_value(
-    value: Any,
-    object_path: str,
-) -> tuple[int, int]:
-    raw = _read_vector_slice(
-        value,
-        0,
-        _vector_length(value, object_path),
-        object_path,
-    )
-    if raw.size != 2 or raw.dtype.kind not in "iuf":
-        raise MatrixSourceError(f"dim at {object_path} must contain two integers")
-    numeric = raw.astype(np.float64, copy=False)
-    if (
-        np.any(~np.isfinite(numeric))
-        or np.any(numeric < 0)
-        or np.any(numeric != np.floor(numeric))
-    ):
-        raise MatrixSourceError(f"dim at {object_path} must contain two integers")
-    return int(numeric[0]), int(numeric[1])
-
-
 class FragmentDerivedMatrixSource(BaseMatrixSource):
     def __init__(
         self,
@@ -1677,8 +1522,6 @@ class FragmentDerivedMatrixSource(BaseMatrixSource):
         tile_widths: Any | None = None,
         transpose: Any = True,
         shape: Any | None = None,
-        row_names: Sequence[str | bytes] | NDArray[Any] | None = None,
-        column_names: Sequence[str | bytes] | NDArray[Any] | None = None,
         object_path: str = "$",
         limits: SourceLimits = DEFAULT_LIMITS,
     ) -> None:
@@ -1696,8 +1539,7 @@ class FragmentDerivedMatrixSource(BaseMatrixSource):
         self.fragments = fragments
         self.matrixType = matrix_type
         self.objectPath = object_path
-        self.operation = "fragment-derived"
-        self.logicalTranspose = _bool_scalar(transpose, f"{object_path}@transpose")
+        self.logicalTranspose = logical_scalar(transpose, f"{object_path}@transpose")
         self.chromosomeIds = _unsigned_vector(
             chromosome_ids, "chr_id", object_path, limits
         )
@@ -1777,7 +1619,7 @@ class FragmentDerivedMatrixSource(BaseMatrixSource):
         native_shape = (len(fragments.cellNames), derived_features)
         logical_shape = native_shape[::-1] if self.logicalTranspose else native_shape
         if shape is not None:
-            declared_shape = _shape_value(shape, f"{object_path}@dim")
+            declared_shape = shape_value(shape, f"{object_path}@dim")
             if declared_shape != logical_shape:
                 raise MatrixSourceError(
                     f"{matrix_type} dim {declared_shape} at {object_path} does not "
@@ -1802,8 +1644,6 @@ class FragmentDerivedMatrixSource(BaseMatrixSource):
         super().__init__(
             logical_shape,
             np.uint32,
-            row_names=row_names,
-            column_names=column_names,
             is_sparse=True,
             limits=limits,
         )
@@ -2103,14 +1943,7 @@ def build_fragment_matrix_source(
     object_path: str = "$",
     limits: SourceLimits = DEFAULT_LIMITS,
 ) -> FragmentDerivedMatrixSource:
-    class_value = specification.get(
-        "matrixType",
-        specification.get(
-            "matrix_type",
-            specification.get("className", specification.get("class")),
-        ),
-    )
-    classes = _class_names(class_value)
+    classes = class_names(specification.get("matrixType"))
     matrix_type = classes[0] if classes else ""
     fragments = specification.get("fragments")
     if not isinstance(fragments, FragmentSource):
@@ -2118,16 +1951,10 @@ def build_fragment_matrix_source(
             f"fragment input at {object_path}@fragments is not a FragmentSource"
         )
     required = {
-        "chromosome_ids": specification.get(
-            "chrId",
-            specification.get("chr_id"),
-        ),
+        "chromosome_ids": specification.get("chrId"),
         "starts": specification.get("start"),
         "ends": specification.get("end"),
-        "chromosome_levels": specification.get(
-            "chrLevels",
-            specification.get("chr_levels"),
-        ),
+        "chromosome_levels": specification.get("chrLevels"),
         "mode": specification.get("mode"),
     }
     missing = [name for name, value in required.items() if value is None]
@@ -2144,23 +1971,9 @@ def build_fragment_matrix_source(
         ends=required["ends"],
         chromosome_levels=required["chromosome_levels"],
         mode=required["mode"],
-        tile_widths=specification.get(
-            "tileWidths",
-            specification.get("tile_width"),
-        ),
+        tile_widths=specification.get("tileWidths"),
         transpose=specification.get("transpose", True),
-        shape=specification.get(
-            "shape",
-            specification.get("Dim", specification.get("dim")),
-        ),
-        row_names=specification.get(
-            "rowNames",
-            specification.get("row_names"),
-        ),
-        column_names=specification.get(
-            "columnNames",
-            specification.get("column_names"),
-        ),
+        shape=specification.get("shape"),
         object_path=object_path,
         limits=limits,
     )

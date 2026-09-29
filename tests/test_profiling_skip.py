@@ -14,6 +14,7 @@ from profiling.config import (
     _normalize_raw_config,
     bind_cluster_source,
     load_profiling_config,
+    require_consume_only_override,
 )
 from profiling.results import result_exists
 from profiling.stages import StageRunResult
@@ -95,8 +96,8 @@ def test_cluster_source_requires_an_explicit_artifact_id() -> None:
         )
 
 
-def test_bound_cluster_source_preserves_the_explicit_artifact() -> None:
-    config = load_profiling_config(_EXAMPLE_CONFIG).model_copy(
+def _with_cluster_source() -> ProfilingConfig:
+    return load_profiling_config(_EXAMPLE_CONFIG).model_copy(
         update={
             "clusterSources": (
                 ClusterSourceRef(
@@ -108,10 +109,75 @@ def test_bound_cluster_source_preserves_the_explicit_artifact() -> None:
         }
     )
 
-    workflow = bind_cluster_source(config, 10_000)
+
+def test_bound_cluster_source_preserves_the_explicit_artifact() -> None:
+    workflow = bind_cluster_source(_with_cluster_source(), 10_000, SELECTED_STAGE_ORDER)
 
     assert workflow.clusterSourceUri == "s3://bucket/source.zarr"
     assert workflow.clusterSourceArtifactId == "d" * 64
+
+
+def test_cluster_source_binds_only_when_the_run_imports_clusters() -> None:
+    from profiling.stages import profile_stage_inputs
+
+    config = _with_cluster_source()
+
+    workflow = bind_cluster_source(config, 10_000, CORE_STAGE_ORDER)
+
+    assert workflow.clusterSourceUri is None
+    assert profile_stage_inputs(workflow, "findMarkers") == {
+        "clusters": ("runLeiden", "cluster_labels")
+    }
+    with pytest.raises(ValueError, match="no cluster source for 25000"):
+        bind_cluster_source(config, 25_000, SELECTED_STAGE_ORDER)
+
+
+def test_explicit_cluster_source_requires_the_import_stage() -> None:
+    config = load_profiling_config(_EXAMPLE_CONFIG)
+    config = config.model_copy(
+        update={
+            "workflow": config.workflow.model_copy(
+                update={
+                    "clusterSourceUri": "s3://bucket/source.zarr",
+                    "clusterSourceArtifactId": "d" * 64,
+                }
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires the importClusters stage"):
+        bind_cluster_source(config, 10_000, CORE_STAGE_ORDER)
+    assert bind_cluster_source(config, 10_000, SELECTED_STAGE_ORDER) is config.workflow
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"storeUriOverride": "s3://bucket/existing.zarr"},
+        {"storeUriBySize": {10_000: "s3://bucket/existing-10000.zarr"}},
+    ],
+)
+def test_store_override_is_reserved_for_consume_stages(
+    override: dict[str, object],
+) -> None:
+    config = load_profiling_config(_EXAMPLE_CONFIG).model_copy(update=override)
+
+    require_consume_only_override(config, 10_000, CONSUME_STAGE_ORDER)
+    with pytest.raises(
+        ValueError, match="only for consume stages; refusing createStore"
+    ):
+        require_consume_only_override(config, 10_000, ("createStore", "runDoublets"))
+    # Sizes without an override keep their run-tagged store.
+    if "storeUriBySize" in override:
+        require_consume_only_override(config, 25_000, CORE_STAGE_ORDER)
+        assert config.storeOverrideFor(25_000) is None
+
+
+def test_modal_names_are_fixed() -> None:
+    payload = load_profiling_config(_EXAMPLE_CONFIG).model_dump(mode="python")
+    payload["modalAppName"] = "another-app"
+    with pytest.raises(ValueError, match="modalAppName must be scarf-profiling"):
+        ProfilingConfig.model_validate(payload)
 
 
 def test_result_exists_skips_when_object_present(monkeypatch):

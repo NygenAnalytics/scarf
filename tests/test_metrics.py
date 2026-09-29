@@ -12,10 +12,8 @@ from scarf.metrics import (
     calculate_weighted_cluster_similarity,
     clisi_knn,
     compute_lisi,
-    compute_simpson,
     graph_connectivity,
     ilisi_knn,
-    knn_to_csr_matrix,
     label_concordance_score,
     lisi_batch_mixing_score,
     silhouette_scoring,
@@ -194,22 +192,6 @@ def test_neighbor_probabilities_calibrate_diffuse_and_concentrated_rows():
 
     assert np.allclose(probabilities.sum(axis=1), 1.0)
     assert np.allclose(calibrated_perplexity, 2.0, rtol=1e-7)
-
-
-def test_compute_simpson_with_uniform_neighbor_weights():
-    distances = np.ones((3, 2), dtype=np.float64)
-    indices = np.array(
-        [
-            [0, 1],
-            [1, 2],
-            [2, 3],
-        ]
-    )
-    labels = pd.Categorical([0, 0, 1, 1])
-
-    simpson = compute_simpson(distances, indices, labels, perplexity=1)
-
-    assert np.allclose(simpson, 5 / 9)
 
 
 def test_compute_lisi_rejects_invalid_neighbor_distances():
@@ -424,85 +406,6 @@ def test_graph_connectivity_validates_inputs():
         )
 
 
-def test_knn_without_affinities_preserves_distances():
-    indices = np.array([[1, 2], [0, 2], [0, 1]])
-    distances = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
-
-    graph = knn_to_csr_matrix(indices, distances)
-
-    assert np.array_equal(
-        graph.toarray(),
-        np.array(
-            [
-                [0.0, 1.0, 2.0],
-                [3.0, 0.0, 4.0],
-                [5.0, 6.0, 0.0],
-            ]
-        ),
-    )
-
-
-@pytest.mark.parametrize(
-    ("indices", "distances"),
-    [
-        (np.array([0, 1]), np.ones((2, 1))),
-        (np.zeros((2, 1), dtype=np.int64), np.array([1.0, 2.0])),
-    ],
-)
-def test_knn_to_csr_matrix_requires_two_dimensional_inputs(indices, distances):
-    with pytest.raises(ValueError, match="two-dimensional"):
-        knn_to_csr_matrix(indices, distances)
-
-
-def test_knn_to_csr_matrix_requires_matching_shapes_and_integer_indices():
-    with pytest.raises(ValueError, match="matching shapes"):
-        knn_to_csr_matrix(
-            np.array([[1], [0]]),
-            np.ones((2, 2)),
-        )
-    with pytest.raises(TypeError, match="indices must contain integers"):
-        knn_to_csr_matrix(
-            np.array([[1.0], [0.0]]),
-            np.ones((2, 1)),
-        )
-
-
-@pytest.mark.parametrize("invalid_distance", [-1.0, np.nan, np.inf])
-def test_knn_to_csr_matrix_rejects_invalid_distances(invalid_distance):
-    distances = np.ones((2, 1))
-    distances[0, 0] = invalid_distance
-
-    with pytest.raises(ValueError, match="finite and non-negative"):
-        knn_to_csr_matrix(np.array([[1], [0]]), distances)
-
-
-@pytest.mark.parametrize("shape", [(0, 1), (1, 0)])
-def test_knn_to_csr_matrix_rejects_empty_axes(shape):
-    with pytest.raises(ValueError, match="contain cells and neighbors"):
-        knn_to_csr_matrix(
-            np.empty(shape, dtype=np.int64),
-            np.empty(shape, dtype=np.float64),
-        )
-
-
-@pytest.mark.parametrize("invalid_index", [-1, 2])
-def test_knn_to_csr_matrix_rejects_out_of_range_indices(invalid_index):
-    with pytest.raises(IndexError, match="outside the graph"):
-        knn_to_csr_matrix(
-            np.array([[invalid_index], [0]]),
-            np.ones((2, 1)),
-        )
-
-
-def test_knn_affinities_decrease_with_distance():
-    indices = np.array([[1, 2], [0, 2], [3, 0], [2, 1]])
-    distances = np.array([[0.1, 10.0], [0.1, 3.0], [0.2, 4.0], [0.2, 5.0]])
-
-    graph = knn_to_csr_matrix(indices, distances, use_affinities=True)
-
-    assert graph[0, 1] > graph[0, 2]
-
-
 def test_cluster_similarity_is_symmetric_with_unit_diagonal():
     graph = csr_matrix(
         np.array(
@@ -548,7 +451,13 @@ def test_streamed_knn_similarity_matches_csr_similarity():
     indices = np.array([[1, 2], [0, 2], [3, 0], [2, 1]])
     distances = np.array([[0.1, 10.0], [0.1, 3.0], [0.2, 4.0], [0.2, 5.0]])
     labels = np.array([0, 0, 1, 1])
-    graph = knn_to_csr_matrix(indices, distances, use_affinities=True)
+    graph = csr_matrix(
+        (
+            (1 / (np.log1p(distances) + 1)).ravel(),
+            (np.repeat(np.arange(len(indices)), indices.shape[1]), indices.ravel()),
+        ),
+        shape=(len(indices), len(indices)),
+    )
 
     streamed = calculate_knn_cluster_similarity(
         indices,
@@ -1066,20 +975,6 @@ def test_datastore_scib_metrics(datastore, connectivity_graph):
         values=batches,
         overwrite=True,
     )
-    lisi_ref = datastore.metric_lisi(
-        label_columns=["metric_annotations"],
-        neighbors=neighbors,
-    )
-    assert lisi_ref.kind == "quality_metric"
-    lisi = datastore.load_metric_lisi(lisi_ref)
-    assert np.isfinite(lisi["metric_annotations"]).all()
-    width = datastore.zw[datastore.inspect_artifact(neighbors).path]["indices"].shape[1]
-    assert datastore.inspect_artifact(lisi_ref).parameters["perplexity"] == width // 3
-    assert (
-        datastore.metric_lisi(["metric_annotations"], neighbors, perplexity=width // 3)
-        == lisi_ref
-    )
-
     ilisi = datastore.metric_ilisi("metric_batches", neighbors)
     clisi = datastore.metric_clisi(
         annotation_column="metric_annotations",
@@ -1135,8 +1030,6 @@ def test_datastore_metrics_reject_missing_metadata_labels(
     cell_data[column].attrs["missing_mask"] = missing_name
 
     with pytest.raises(ValueError, match="contains missing values"):
-        datastore.metric_lisi([column], neighbors)
-    with pytest.raises(ValueError, match="contains missing values"):
         datastore.metric_ilisi(column, neighbors)
     with pytest.raises(ValueError, match="contains missing values"):
         datastore.metric_clisi(column, neighbors)
@@ -1144,6 +1037,29 @@ def test_datastore_metrics_reject_missing_metadata_labels(
         datastore.metric_graph_connectivity(column, connectivity_graph)
     with pytest.raises(ValueError, match="contains missing values"):
         datastore.metric_proportional_batch_mixing(column, neighbors)
+
+
+def test_datastore_metrics_reject_blank_labels_and_name_missing_columns(
+    datastore,
+    connectivity_graph,
+):
+    neighbors = _graph_neighbors(datastore, connectivity_graph)
+    column = "blank_metric_labels"
+    labels = np.resize(np.asarray(["", "a", "b"], dtype=object), datastore.cells.N)
+    datastore.cells.insert(column_name=column, values=labels, overwrite=True)
+    try:
+        with pytest.raises(ValueError, match="contains missing values"):
+            datastore.metric_ilisi(column, neighbors)
+        with pytest.raises(ValueError, match="contains missing values"):
+            datastore.metric_clisi(column, neighbors)
+        with pytest.raises(ValueError, match="contains missing values"):
+            datastore.metric_graph_connectivity(column, connectivity_graph)
+        with pytest.raises(ValueError, match="contains missing values"):
+            datastore.metric_proportional_batch_mixing(column, neighbors)
+    finally:
+        datastore.cells.drop(column)
+    with pytest.raises(KeyError, match="'absent_metric_labels' was not found"):
+        datastore.metric_ilisi("absent_metric_labels", neighbors)
 
 
 @pytest.mark.parametrize(
@@ -1187,123 +1103,6 @@ def test_datastore_metrics_reject_malformed_metadata_missing_masks(
         for name in (column, missing_name):
             if name in cell_data:
                 del cell_data[name]
-
-
-def test_metric_lisi_rejects_invalid_inputs(datastore, connectivity_graph):
-    neighbors = _graph_neighbors(datastore, connectivity_graph)
-    with pytest.raises(TypeError, match="sequence of column names"):
-        datastore.metric_lisi("names", neighbors)
-    with pytest.raises(ValueError, match="non-empty"):
-        datastore.metric_lisi([], neighbors)
-    with pytest.raises(TypeError, match="only strings"):
-        datastore.metric_lisi(["names", 1], neighbors)
-    with pytest.raises(ValueError, match="duplicate names"):
-        datastore.metric_lisi(["names", "names"], neighbors)
-    with pytest.raises(KeyError, match="__missing_lisi_column__"):
-        datastore.metric_lisi(
-            ["__missing_lisi_column__"],
-            neighbors,
-        )
-    with pytest.raises(TypeError, match="artifact reference"):
-        datastore.metric_lisi(
-            ["names"],
-            neighbors="not-a-ref",
-        )
-    with pytest.raises(ValueError, match="neighbors artifact"):
-        datastore.metric_lisi(
-            ["names"],
-            neighbors=connectivity_graph,
-        )
-
-
-def test_metric_lisi_uses_explicit_neighbor_selection_after_live_alias_changes(
-    datastore,
-    connectivity_graph,
-):
-    neighbors = _graph_neighbors(datastore, connectivity_graph)
-    column = datastore.zw["cellData/I"]
-    original = np.asarray(column[:], dtype=bool)
-    selected = np.flatnonzero(original)
-    assert selected.size
-    changed = original.copy()
-    changed[selected[0]] = False
-    column[:] = changed
-
-    try:
-        metric = datastore.metric_lisi(
-            ["names"],
-            neighbors=neighbors,
-            perplexity=1,
-        )
-        scores = datastore.load_metric_lisi(metric)
-        raw_selection = datastore.inspect_artifact(metric).inputs["cell_selection"]
-        selection = ArtifactRef.from_dict(raw_selection)
-        selected_count = int(
-            np.asarray(
-                datastore.load_artifact(selection)["values"][:], dtype=bool
-            ).sum()
-        )
-        assert scores["names"].shape == (selected_count,)
-        assert selected_count != int(changed.sum())
-    finally:
-        column[:] = original
-
-
-def test_metric_lisi_snapshots_mutable_label_inputs(
-    datastore,
-    connectivity_graph,
-):
-    neighbors = _graph_neighbors(datastore, connectivity_graph)
-    labels = np.zeros(datastore.cells.N, dtype=np.int8)
-    datastore.cells.insert("lisi_snapshot_labels", labels, overwrite=True)
-    first = datastore.metric_lisi(
-        ["lisi_snapshot_labels"],
-        neighbors,
-        perplexity=1,
-    )
-    assert (
-        datastore.metric_lisi(
-            ["lisi_snapshot_labels"],
-            neighbors,
-            perplexity=1,
-        )
-        == first
-    )
-    first_values = datastore.load_metric_lisi(first)["lisi_snapshot_labels"]
-
-    column = datastore.zw["cellData/lisi_snapshot_labels"]
-    status = datastore.inspect_artifact(first)
-    raw_selection = status.inputs["cell_selection"]
-    selection = ArtifactRef.from_dict(raw_selection)
-    selection_mask = np.asarray(
-        datastore.load_artifact(selection)["values"][:],
-        dtype=bool,
-    )
-    raw_snapshots = status.inputs["label_snapshots"]
-    assert len(raw_snapshots) == 1
-    assert raw_snapshots[0]["column"] == "lisi_snapshot_labels"
-    snapshot = ArtifactRef.from_dict(raw_snapshots[0]["artifact"])
-    assert snapshot.kind == "metadata_snapshot"
-    assert datastore.inspect_artifact(snapshot).operation == "snapshot_metric_label"
-    np.testing.assert_array_equal(
-        datastore.load_artifact(snapshot)["values"][:],
-        labels[selection_mask],
-    )
-    selected_index = int(np.flatnonzero(selection_mask)[0])
-    column[selected_index] = 1
-    try:
-        second = datastore.metric_lisi(
-            ["lisi_snapshot_labels"],
-            neighbors,
-            perplexity=1,
-        )
-        assert second != first
-        np.testing.assert_array_equal(
-            datastore.load_metric_lisi(first)["lisi_snapshot_labels"],
-            first_values,
-        )
-    finally:
-        column[:] = labels
 
 
 def test_silhouette_scoring_missing_cluster_labels(datastore):

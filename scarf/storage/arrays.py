@@ -1,4 +1,4 @@
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,7 +14,8 @@ from .layout import (
 from .profiles import StorageProfile, resolve_storage_profile
 from .types import as_zarr_array
 
-_MISSING_COLUMN_PREFIX = "__scarf_missing__"
+MISSING_MASK_PREFIX = "__scarf_missing__"
+"""Name prefix of the boolean array that flags missing values of a column."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,7 +47,7 @@ def linked_missing_mask(
     if "missing_mask" not in values.attrs:
         return None
     subject = f"Array {name!r}" if label is None else label
-    missing_name = f"{_MISSING_COLUMN_PREFIX}{name}"
+    missing_name = f"{MISSING_MASK_PREFIX}{name}"
     if values.attrs["missing_mask"] != missing_name:
         raise ValueError(f"{subject} has a malformed missing-mask link")
     try:
@@ -57,6 +58,7 @@ def linked_missing_mask(
         not isinstance(mask, zarr.Array)
         or mask.dtype != np.dtype(bool)
         or mask.shape != values.shape
+        or "missing_mask" in mask.attrs
     ):
         raise ValueError(f"{subject} has a malformed missing-mask array")
     return mask
@@ -108,47 +110,60 @@ def create_numeric_array(
     return group.create_array(name, **kwargs)
 
 
-def dtype_fix(dtype: Any, data: np.ndarray) -> Any:
-    """Infer or adjust a metadata dtype from sample values."""
-
-    def _text(value: Any) -> str:
-        if isinstance(value, bytes | bytearray | np.bytes_):
-            return bytes(value).decode("utf-8")
-        if value is None:
-            return ""
-        return str(value)
-
-    if dtype is None or np.dtype(dtype).kind == "O":
-        width = max((len(_text(value)) for value in data), default=1)
-        return f"U{max(width, 1)}"
-    if np.issubdtype(data.dtype, np.dtype("S")):
-        try:
-            decoded = data.astype("U")
-        except UnicodeDecodeError:
-            decoded = np.array([_text(value) for value in data]).astype("U")
-        return decoded.dtype
-    return dtype
+def text_value(value: Any) -> str:
+    """Return one metadata value as text, decoding UTF-8 bytes and None as empty."""
+    if isinstance(value, bytes | bytearray | np.bytes_):
+        return bytes(value).decode("utf-8")
+    if value is None:
+        return ""
+    return str(value)
 
 
 def _decode_metadata_values(data: Any) -> np.ndarray:
-    """Decode UTF-8 byte strings before writing metadata columns."""
+    """Decode UTF-8 byte strings and missing values, keeping the array shape."""
     values = np.asarray(data)
-    if values.dtype.kind == "S":
-        return np.asarray([bytes(value).decode("utf-8") for value in values.flat])
-    if values.dtype.kind == "O" and any(
-        value is None or isinstance(value, bytes | bytearray | np.bytes_)
-        for value in values.flat
+    if values.dtype.kind == "S" or (
+        values.dtype.hasobject
+        and any(
+            value is None or isinstance(value, bytes | bytearray | np.bytes_)
+            for value in values.flat
+        )
     ):
-        decoded: list[str] = []
-        for value in values.flat:
-            if isinstance(value, bytes | bytearray | np.bytes_):
-                decoded.append(bytes(value).decode("utf-8"))
-            elif value is None:
-                decoded.append("")
-            else:
-                decoded.append(str(value))
-        return np.asarray(decoded)
+        return np.asarray(
+            [text_value(value) for value in values.flat], dtype=str
+        ).reshape(values.shape)
     return values
+
+
+def _measured_text_dtype(blocks: Iterable[Any]) -> np.dtype[Any]:
+    width = 1
+    for block in blocks:
+        for value in np.asarray(block).flat:
+            width = max(width, len(text_value(value)))
+    return np.dtype(f"U{width}")
+
+
+def text_dtype(dtype: Any, blocks: Callable[[], Iterable[Any]]) -> np.dtype[Any]:
+    """Return the fixed-width unicode dtype that holds values as decoded text.
+
+    Fixed-width strings keep their declared width, because UTF-8 decoding never
+    adds characters, and other fixed-width types use NumPy's text width. Object
+    and variable-width string values are measured from the ``blocks`` callable.
+    """
+    resolved: np.dtype[Any] = np.dtype(dtype)
+    if not resolved.hasobject:
+        return np.empty(0, dtype=resolved).astype(str).dtype
+    return _measured_text_dtype(blocks())
+
+
+def stored_metadata_dtype(
+    dtype: Any, blocks: Callable[[], Iterable[Any]]
+) -> np.dtype[Any]:
+    """Return the dtype a copied column is stored with: text as fixed-width unicode."""
+    resolved: np.dtype[Any] = np.dtype(dtype)
+    if resolved.kind in {"S", "U"} or resolved.hasobject:
+        return text_dtype(resolved, blocks)
+    return resolved
 
 
 def create_metadata_column(
@@ -174,16 +189,20 @@ def create_metadata_column(
     )
 
     if data is not None:
-        values = _decode_metadata_values(data)
-        # Decoded byte strings need a unicode width; ignore the original S/O dtype.
-        use_dtype = (
-            None
-            if values.dtype.kind == "U" and np.asarray(data).dtype.kind in {"S", "O"}
-            else dtype
-        )
-        values = np.asarray(values, dtype=dtype_fix(use_dtype, values))
+        raw = np.asarray(data)
+        values = _decode_metadata_values(raw)
+        # Text is stored at its decoded width, whatever the source S or O dtype.
+        if (
+            dtype is None
+            or np.dtype(dtype).kind == "O"
+            or raw.dtype.kind in {"S", "O"}
+            and values.dtype.kind == "U"
+        ):
+            values = values.astype(_measured_text_dtype((values,)))
+        else:
+            values = np.asarray(values, dtype=dtype)
         if chunks is False:
-            chunks = (len(values),)
+            chunks = (max(1, len(values)),)
         return group.create_array(
             name,
             data=values,
@@ -195,7 +214,7 @@ def create_metadata_column(
     if shape is None:
         raise ValueError("shape is required when data is None")
     if chunks is False:
-        chunks = (shape,)
+        chunks = (max(1, shape),)
     return group.create_array(
         name,
         shape=(shape,),
@@ -234,7 +253,7 @@ def create_streamed_metadata_column(
     )
     missing_output: zarr.Array | None = None
     if hasMissing:
-        missing_name = f"{_MISSING_COLUMN_PREFIX}{name}"
+        missing_name = f"{MISSING_MASK_PREFIX}{name}"
         missing_output = create_metadata_column(
             group,
             missing_name,

@@ -43,11 +43,7 @@ def feature_run(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest)
         ArtifactReferenceModel.from_artifact_ref(allowed)
     )
     run.plan.assays[0].featureParameters = {}
-    run.family_patterns = {
-        "mitochondrial": "^MT-",
-        "ribosomal": "^RP[LS]",
-        "sexLinked": "^XIST$",
-    }
+    run.families = ("mitochondrial", "ribosomal", "sexLinked")
     run.store = SimpleNamespace(
         load_artifact=lambda reference: {
             key: value.copy() for key, value in arrays[reference.artifact_id].items()

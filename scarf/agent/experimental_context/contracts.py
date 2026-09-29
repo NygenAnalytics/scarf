@@ -11,8 +11,6 @@ from ..types import (
     ArtifactReferenceModel,
     BatchCorrectionAction,
     BatchSafetyEvidence,
-    ExperimentalBiologyHandoff,
-    ExperimentalTuningHandoff,
     StageStatus,
 )
 
@@ -184,7 +182,6 @@ class CovariateCharacterization(AgentDataModel):
     auditLog: list[dict[str, Any]] = Field(default_factory=list)
     actions: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
-    decisions: list[dict[str, Any]] = Field(default_factory=list)
     columns: list[dict[str, Any]] = Field(default_factory=list)
     coefficients: list[dict[str, Any]] = Field(default_factory=list)
     technicalNesting: list[dict[str, Any]] = Field(default_factory=list)
@@ -697,6 +694,8 @@ class ExperimentalContextResult(AgentDataModel):
     currentRepresentation: RepresentationEvaluation = Field(
         default_factory=RepresentationEvaluation.get_blank
     )
+    designRounds: int = Field(default=0, ge=0, le=2)
+    designDirections: dict[str, Any] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
     runInfo: AgentRunInfo = Field(default_factory=AgentRunInfo)
 
@@ -706,115 +705,6 @@ class ExperimentalContextResult(AgentDataModel):
             status="needsInput",
             decision=ExperimentalContextDecision.get_blank(),
             characterization=CovariateCharacterization(status="needsInput"),
-        )
-
-    def to_parameter_tuning_handoff(self) -> ExperimentalTuningHandoff:
-        """Return validated integration inputs for Parameter Tuning."""
-        if self.status != "done":
-            raise ValueError(
-                "Experimental Context must be done before creating a tuning handoff"
-            )
-        if self.cellSelection is None:
-            raise ValueError("Experimental Context result lacks a cell selection")
-        plan = self.decision.batchCorrection
-        batch_columns = sorted(plan.batchColumns)
-        safety = sorted(
-            (
-                item
-                for item in self.batchSafety
-                if item.batchColumns == batch_columns
-                and item.coefficient in self.decision.coefficientsOfInterest
-            ),
-            key=lambda item: item.coefficient,
-        )
-        if plan.action in {"evaluateHarmony", "unsafe"}:
-            expected = set(self.decision.coefficientsOfInterest)
-            if {item.coefficient for item in safety} != expected:
-                raise ValueError(
-                    "Experimental Context result lacks exact batch safety evidence"
-                )
-            if any(item.evidenceId not in plan.evidenceIds for item in safety):
-                raise ValueError(
-                    "Batch-correction plan does not cite its exact safety evidence"
-                )
-            if plan.action == "evaluateHarmony" and any(
-                item.status != "safe" for item in safety
-            ):
-                raise ValueError("Harmony plan contains non-safe batch evidence")
-            if plan.action == "unsafe" and (
-                any(item.status == "notComputed" for item in safety)
-                or not any(item.status == "unsafe" for item in safety)
-            ):
-                raise ValueError("Unsafe plan lacks exact unsafe batch evidence")
-        return ExperimentalTuningHandoff(
-            cellSelection=self.cellSelection,
-            batchAction=plan.action,
-            batchColumns=batch_columns,
-            preservationColumns=list(plan.preserveColumns),
-            coefficientsOfInterest=list(self.decision.coefficientsOfInterest),
-            batchSafety=safety,
-            evidenceIds=sorted({*self.decision.evidenceIds, *plan.evidenceIds}),
-        )
-
-    def to_biological_handoff(
-        self,
-        coefficient: str | None = None,
-    ) -> ExperimentalBiologyHandoff:
-        """Return one explicitly resolved biological coefficient."""
-        if self.status != "done":
-            raise ValueError(
-                "Experimental Context must be done before creating a biology handoff"
-            )
-        if self.cellSelection is None:
-            raise ValueError("Experimental Context result lacks a cell selection")
-        coefficients = list(self.decision.coefficientsOfInterest)
-        if coefficient is None:
-            if len(coefficients) != 1:
-                raise ValueError(
-                    "Select one coefficient explicitly for biological interpretation"
-                )
-            coefficient = coefficients[0]
-        if coefficient not in coefficients:
-            raise ValueError(f"Unknown coefficient of interest {coefficient!r}")
-        records = {
-            record.get("name"): record
-            for record in self.characterization.coefficients
-            if isinstance(record.get("name"), str)
-        }
-        record = records.get(coefficient)
-        if record is None:
-            raise ValueError(f"Missing characterization for {coefficient!r}")
-        reports = {
-            report.get("coefficient"): report
-            for report in self.characterization.confounding
-            if isinstance(report.get("coefficient"), str)
-        }
-        report = reports.get(coefficient)
-        known_evidence = characterization_evidence(self.characterization)
-        relevant_evidence = {
-            f"column:{coefficient}",
-            f"coefficient:{coefficient}",
-            f"estimability:{coefficient}",
-            *(
-                evidence_id
-                for evidence_id in known_evidence
-                if evidence_id.startswith(f"confounding:{coefficient}:")
-            ),
-        }
-        for unit_name in (
-            record.get("observationUnit"),
-            record.get("independentUnit"),
-        ):
-            if isinstance(unit_name, str):
-                relevant_evidence.add(f"column:{unit_name}")
-        return ExperimentalBiologyHandoff(
-            cellSelection=self.cellSelection,
-            conditionColumn=coefficient,
-            observationUnit=record.get("observationUnit"),
-            independentUnit=record.get("independentUnit"),
-            coefficientScope=str(record.get("scope", "")),
-            estimability=dict(report.get("estimability") or {}) if report else {},
-            evidenceIds=sorted(relevant_evidence.intersection(known_evidence)),
         )
 
 

@@ -1,6 +1,6 @@
 """Small helpers shared by Scarf domain-agent tools."""
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
@@ -14,7 +14,6 @@ from ..types import ArtifactReferenceModel
 
 __all__ = [
     "artifact_reference",
-    "bounded_list",
     "core_artifact_reference",
     "label_filter_bound",
     "mark_missing_rows",
@@ -47,18 +46,6 @@ def read_marked_metadata_rows(
         values,
         read_metadata_missing_rows_chunkwise(metadata, column, rows),
     )
-
-
-def bounded_list(values: Iterable[Any], *, limit: int) -> list[Any]:
-    """Return at most ``limit`` JSON-facing values."""
-    if isinstance(limit, bool) or limit < 1:
-        raise ValueError("limit must be a positive integer")
-    output: list[Any] = []
-    for value in values:
-        output.append(value)
-        if len(output) == limit:
-            break
-    return output
 
 
 def label_filter_bound(value: Any) -> Any:

@@ -225,6 +225,62 @@ def test_fit_lowess_adaptive_resists_single_low_variance_outlier():
     assert log_change.max() < 0.05
 
 
+@pytest.mark.parametrize(("gradient", "accepted"), [(1e-10, True), (1e-6, False)])
+def test_fit_lowess_adaptive_accepts_a_stopped_line_search_only_at_the_optimum(
+    monkeypatch, gradient, accepted
+):
+    # L-BFGS-B can stop its line search at a fit that is optimal to machine
+    # precision, depending on the scipy version and BLAS threading.
+    import scipy.optimize
+
+    means = np.exp(np.random.default_rng(17).normal(0, 2, 2_000))
+    variance = means**1.4
+    expected = fit_lowess(means, variance, n_bins=200, lowess_frac=0.1)
+    minimize = scipy.optimize.minimize
+
+    def stopped_minimize(*args, **kwargs):
+        result = minimize(*args, **kwargs)
+        result.status = 2
+        result.success = False
+        result.message = "ABNORMAL: "
+        result.jac = np.full_like(result.jac, gradient)
+        return result
+
+    monkeypatch.setattr(scipy.optimize, "minimize", stopped_minimize)
+    if accepted:
+        np.testing.assert_array_equal(
+            fit_lowess(means, variance, n_bins=200, lowess_frac=0.1), expected
+        )
+    else:
+        with pytest.raises(ValueError, match="trend fit failed: ABNORMAL"):
+            fit_lowess(means, variance, n_bins=200, lowess_frac=0.1)
+
+
+def test_fit_lowess_fixed_fits_only_positive_finite_genes():
+    # A zero variance became log(0) = -inf, was chosen as its bin minimum, and
+    # turned every fixed-mode correction into NaN.
+    rng = np.random.default_rng(3)
+    means = np.exp(rng.uniform(0.0, 5.0, 400))
+    variances = means * (1 + 0.2 * means) * np.exp(rng.normal(0.0, 0.3, 400))
+    invalid = np.array([3, 7, 50, 51])
+    poisoned = variances.copy()
+    poisoned[[3, 50]] = 0.0
+    poisoned[7] = np.nan
+    poisoned[51] = -1.0
+    valid = np.ones(len(means), dtype=bool)
+    valid[invalid] = False
+
+    corrected = fit_lowess(means, poisoned, 20, 0.3, bin_strategy="fixed")
+    expected = fit_lowess(means[valid], variances[valid], 20, 0.3, bin_strategy="fixed")
+
+    np.testing.assert_array_equal(corrected[invalid], np.zeros(len(invalid)))
+    np.testing.assert_allclose(corrected[valid], expected, rtol=1e-12)
+    np.testing.assert_array_equal(
+        fit_lowess(np.array([1.0, 2.0]), np.zeros(2), 4, 0.5, bin_strategy="fixed"),
+        np.zeros(2),
+    )
+
+
 def test_fit_lowess_adaptive_handles_small_and_invalid_inputs():
     mean_expr = np.array([1.0, 2.0, 3.0, 4.0, np.nan, 0.0, 8.0])
     variance = np.array([1.0, 0.0, -1.0, 4.0, 2.0, 2.0, 16.0])
