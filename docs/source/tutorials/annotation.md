@@ -92,11 +92,25 @@ ds.plots.embedding(
     sort_values=True,
     legend_loc="on_data"
 )
+
+ds.plots.embedding(
+    layout=run["umap"],
+    color_by=["CD14", "CD19", "CD8A", "CD4", "NCAM1", "IL3RA", "CD68", clusters],
+    n_columns=3,
+    sort_values=True,
+    legend_loc="on_data"
+)
+#CD14 FOR MONOCTYES
+#CD19 for B cells
+#CD8A/CD4 for T cells
+#CD56 for NK cells
+#IL3RA for pdcs
+#cd68 for macrophages
 ```
 
 Here, we can see the UMAP of our select marker genes for our predicted cell types alongside the clusters they may be present inside of.
 
-CD3D lights up clusters that may hold our candidate T cells. MS4A1 marks two separate blocks of potential B cells, CD14 marks the likely monocyte block, and NKG7 marks the NK-like block. The prescense of IL3RA also indicates  plasmacytoid dendritic cells (pDCs) being present. FCGR3A is also used to identify a specific type of monocyte, thus why we include it. One small cluster lights up none of the panel genes and stays unresolved for now; the heatmap below resolves it through its own top markers.
+CD3D lights up clusters that may hold our candidate T cells: cluster 4-6. MS4A1 marks two separate blocks of potential B cells, clusters 3 & 10; CD14 marks the likely monocyte block, cluster 1; and NKG7 marks the NK-like block, like clusters 2, 7 and 8. The prescense of IL3RA in cluster indicates plasmacytoid dendritic cells (pDCs) being present. FCGR3A is also used to alternative subtypes  a specific type of monocyte, thus why we include it. One small cluster lights up none of the panel genes and stays unresolved for now; the heatmap below resolves it through its own top markers.
 
 To confirm the visual readings on the UMAP, we can now utilize the marker table.
 
