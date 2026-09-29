@@ -5,7 +5,7 @@ These empirical reference runs measure one fixed object-store workflow, dataset,
 revision, and cloud resource envelope. Execution used S3-compatible object storage in the Modal
 EU region. The largest completed size processed 10 million input cells through conversion,
 quality control, normalization, graph construction, embedding, clustering, and marker search in
-2.78 hours on average, with 31.9 GiB mean sampled peak memory on a 16 CPU, 64 GiB container.
+88.8 minutes on average, with 38.0 GiB mean sampled peak memory on a 16 CPU, 64 GiB container.
 
 The results establish execution and resource use for this recorded configuration. No local
 filesystem baseline was collected, so they do not measure an object-store penalty or compare
@@ -19,46 +19,46 @@ size.
 
 | Input cells | CPU | Container | n | Wall time | Peak memory |
 | ----------: | --: | --------: | -: | --------: | ----------: |
-| 10,000 | 4 | 16 GiB | 3 | 6.0 ± 0.4 min | 2.7 GiB |
-| 50,000 | 4 | 16 GiB | 3 | 7.1 ± 1.0 min | 7.0 GiB |
-| 100,000 | 4 | 16 GiB | 3 | 7.7 ± 1.0 min | 8.5 GiB |
-| 500,000 | 8 | 32 GiB | 3 | 17.8 ± 0.1 min | 15.0 GiB |
-| 1,000,000 | 8 | 32 GiB | 3 | 26.0 ± 2.3 min | 12.9 GiB |
-| 5,000,000 | 16 | 64 GiB | 3 | 1.45 ± 0.13 h | 32.1 GiB |
-| 10,000,000 | 16 | 64 GiB | 3 | 2.78 ± 0.47 h | 31.9 GiB |
+| 10,000 | 4 | 16 GiB | 3 | 5.1 ± 1.8 min | 2.7 GiB |
+| 50,000 | 4 | 16 GiB | 3 | 4.6 ± 0.4 min | 7.1 GiB |
+| 100,000 | 4 | 16 GiB | 3 | 5.7 ± 0.7 min | 8.7 GiB |
+| 500,000 | 8 | 32 GiB | 3 | 9.7 ± 0.3 min | 15.7 GiB |
+| 1,000,000 | 8 | 32 GiB | 3 | 15.3 ± 1.7 min | 16.5 GiB |
+| 5,000,000 | 16 | 64 GiB | 3 | 41.4 ± 2.6 min | 46.6 GiB |
+| 10,000,000 | 16 | 64 GiB | 3 | 88.8 ± 0.1 min | 38.0 GiB |
 
-`±` is the sample standard deviation. Peak memory is sampled
-`memory.current`. Individual replicate totals are in the table below.
+`±` is the sample standard deviation. Peak memory is the sampled resident
+memory of the process tree. Individual replicate totals are in the table below.
 
 | Input cells | Replicate | Wall time (s) | Peak memory (GiB) |
 | ----------: | --- | ------------: | ----------------: |
-| 10,000 | r1 | 367.4 | 2.63 |
-| 10,000 | r2 | 377.6 | 2.71 |
-| 10,000 | r3 | 335.1 | 2.84 |
-| 50,000 | r1 | 360.0 | 7.11 |
-| 50,000 | r2 | 472.8 | 6.67 |
-| 50,000 | r3 | 448.1 | 7.22 |
-| 100,000 | r1 | 450.1 | 8.70 |
-| 100,000 | r2 | 416.1 | 8.81 |
-| 100,000 | r3 | 528.6 | 8.06 |
-| 500,000 | r1 | 1,069.0 | 16.12 |
-| 500,000 | r2 | 1,056.5 | 13.52 |
-| 500,000 | r3 | 1,071.7 | 15.26 |
-| 1,000,000 | r1 | 1,717.6 | 13.26 |
-| 1,000,000 | r2 | 1,489.8 | 12.99 |
-| 1,000,000 | r3 | 1,468.8 | 12.55 |
-| 5,000,000 | r1 | 5,421.4 | 31.44 |
-| 5,000,000 | r2 | 5,530.7 | 32.40 |
-| 5,000,000 | r3 | 4,667.6 | 32.43 |
-| 10,000,000 | r1 | 8,075.3 | 33.75 |
-| 10,000,000 | r2 | 11,211.4 | 29.87 |
-| 10,000,000 | r3 | 10,754.4 | 32.12 |
+| 10,000 | r1 | 430.8 | 2.74 |
+| 10,000 | r2 | 237.7 | 2.69 |
+| 10,000 | r3 | 252.1 | 2.74 |
+| 50,000 | r1 | 294.8 | 6.84 |
+| 50,000 | r2 | 280.6 | 8.06 |
+| 50,000 | r3 | 248.2 | 6.42 |
+| 100,000 | r1 | 365.5 | 9.03 |
+| 100,000 | r2 | 372.4 | 7.92 |
+| 100,000 | r3 | 294.3 | 9.04 |
+| 500,000 | r1 | 601.0 | 15.95 |
+| 500,000 | r2 | 581.6 | 15.36 |
+| 500,000 | r3 | 562.2 | 15.90 |
+| 1,000,000 | r1 | 907.7 | 16.64 |
+| 1,000,000 | r2 | 1,027.3 | 16.07 |
+| 1,000,000 | r3 | 818.2 | 16.79 |
+| 5,000,000 | r1 | 2,667.2 | 51.60 |
+| 5,000,000 | r2 | 2,379.4 | 43.12 |
+| 5,000,000 | r3 | 2,412.9 | 45.16 |
+| 10,000,000 | r1 | 5,319.5 | 38.27 |
+| 10,000,000 | r2 | 5,322.8 | 36.81 |
+| 10,000,000 | r3 | 5,334.4 | 38.97 |
 
 (umap-gallery)=
 ## 2. UMAPs across scale
 
-These embeddings show the saved output from three reference runs, colored by
-CELLxGENE development stage.
+These embeddings show saved output from three runs of the earlier 2026-08-21
+measurement at commit `84ab362`, colored by CELLxGENE development stage.
 
 ::::{container} benchmark-gallery
 :::{figure} ../_static/benchmarks/umap_development_stage_100000.png
@@ -98,30 +98,33 @@ mapping. These panels provide visual context, not biological validation.
 
 Values are elapsed seconds for each stage. All columns are means of three
 replicates. Stage values exclude orchestration, while dataset download is shown
-separately.
+separately. UMAP runs in the background beside Leiden, as in
+`DataStore.pipeline`, so the two stages overlap in time and share their memory
+window.
 
 | Stage | 10k | 50k | 100k | 500k | 1M | 5M | 10M |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Dataset download | 1.2 | 1.8 | 4.5 | 14.9 | 20.7 | 143.4 | 328.2 |
-| Create count store | 5.4 | 19.6 | 29.2 | 88.2 | 161.3 | 489.4 | 1,018.5 |
-| Write `countsT` | 7.5 | 20.2 | 31.6 | 172.6 | 259.5 | 1,041.8 | 1,668.7 |
-| Initialize datastore | 17.8 | 19.6 | 20.2 | 55.4 | 75.8 | 370.4 | 686.7 |
-| Reopen datastore | 6.3 | 5.8 | 5.7 | 6.1 | 6.5 | 8.0 | 12.5 |
-| Filter cells | 17.2 | 16.0 | 14.6 | 16.7 | 18.8 | 32.1 | 62.6 |
-| Select HVGs | 35.5 | 36.9 | 36.9 | 67.0 | 93.7 | 158.0 | 492.4 |
-| Normalize | 19.5 | 21.8 | 23.5 | 53.8 | 84.2 | 212.6 | 481.0 |
-| PCA | 20.8 | 21.5 | 21.3 | 39.5 | 51.6 | 181.6 | 370.6 |
-| Build embedding initialization | 6.2 | 6.7 | 6.3 | 10.6 | 14.3 | 62.6 | 109.8 |
-| Build ANN index | 10.9 | 11.3 | 13.4 | 32.7 | 63.0 | 210.6 | 469.3 |
-| Query neighbours | 12.6 | 11.9 | 12.7 | 22.6 | 31.5 | 94.9 | 207.4 |
-| Build connectivity map | 34.3 | 34.7 | 32.2 | 41.5 | 43.0 | 54.5 | 84.9 |
-| UMAP | 39.3 | 51.3 | 58.6 | 131.8 | 226.5 | 565.3 | 1,233.8 |
-| Leiden | 33.4 | 40.7 | 38.6 | 53.4 | 78.7 | 256.5 | 501.5 |
-| Marker search | 57.5 | 68.0 | 78.1 | 188.6 | 226.3 | 783.7 | 1,280.4 |
+| Dataset download | 1.9 | 1.6 | 16.1 | 31.6 | 17.5 | 139.1 | 323.2 |
+| Create count store | 9.4 | 17.6 | 26.1 | 56.3 | 131.5 | 346.6 | 644.4 |
+| Write `countsT` | 12.8 | 14.0 | 23.0 | 46.8 | 78.6 | 156.4 | 429.2 |
+| Initialize datastore | 15.4 | 24.3 | 20.2 | 17.6 | 23.0 | 35.7 | 50.6 |
+| Reopen datastore | 3.0 | 2.7 | 2.9 | 2.9 | 3.2 | 3.4 | 4.5 |
+| Filter cells | 15.8 | 5.6 | 6.2 | 6.6 | 9.0 | 13.9 | 19.7 |
+| Select HVGs | 50.6 | 18.0 | 21.8 | 32.5 | 55.2 | 110.0 | 334.3 |
+| Normalize | 9.1 | 10.4 | 12.3 | 20.3 | 37.6 | 142.6 | 321.9 |
+| PCA | 17.8 | 13.9 | 17.3 | 33.3 | 55.8 | 123.7 | 277.3 |
+| Build embedding initialization | 12.0 | 9.0 | 11.5 | 16.1 | 23.4 | 74.0 | 140.6 |
+| Build ANN index | 10.9 | 9.1 | 10.6 | 16.3 | 26.6 | 61.9 | 121.0 |
+| Query neighbours | 10.8 | 19.6 | 12.8 | 18.7 | 36.1 | 67.7 | 119.1 |
+| Build connectivity map | 59.8 | 40.3 | 65.1 | 70.2 | 62.1 | 57.9 | 60.0 |
+| UMAP | 18.4 | 27.1 | 42.3 | 107.2 | 194.5 | 501.9 | 1,125.3 |
+| Leiden | 8.1 | 20.9 | 10.6 | 22.7 | 40.8 | 183.6 | 404.3 |
+| Marker search | 41.7 | 32.1 | 32.3 | 47.0 | 72.8 | 149.8 | 409.9 |
 
-At 10M, writing `countsT` was the largest stage; marker search and UMAP were
-next. At the smallest sizes, fixed work makes the 10k and 50k totals similar
-despite the difference in cell count.
+At 10M, UMAP was the largest stage and creating the count store was next.
+Leiden ran within the UMAP window, so its seconds overlap UMAP's instead of
+adding to the total. At the smallest sizes, fixed work dominates, so the 10k,
+50k, and 100k totals are similar despite the difference in cell count.
 
 (what-was-measured)=
 (shared-analysis-settings)=
@@ -131,18 +134,21 @@ despite the difference in cell count.
 
 | Item | Recorded setting |
 | --- | --- |
-| Measurement | Completed 2026-08-21 from commit `84ab362345c66d34a0083af5e2609c7762d321a5` |
+| Measurement | Completed 2026-09-29 from commit `7291ed45106ec1478750d7363392f0d4020f8ba4` |
 | Source | CELLxGENE dataset `dcfd4feb-18a3-4b30-81d7-1b0c544a8ab3`, version `1bc30289-9565-4099-abf9-3326328c11ac` |
 | Sampling | Nested deterministic samples, seed 0 |
 | Analysis | 1,000 highly variable features, 21 PCA dimensions, 11 neighbours, 1,000 embedding centroids |
 | Graph and clustering | Graph seed 4466; 300 UMAP epochs; UMAP and Leiden seed 4444; igraph Leiden at resolution 1.0 |
 | Filtering | 1st and 99th cell quantiles; minimum 10 features per cell and 20 cells per feature |
-| Execution | Parallel ANN and UMAP on S3-compatible object storage in the Modal EU region; one worker per CPU; 1 GB count-matrix units and 100 MB chunks |
+| Execution | Parallel ANN and UMAP on S3-compatible object storage in the Modal EU region; one worker per CPU; 1 GB count-matrix units and 100 MB chunks; UMAP in the background beside Leiden |
 | Memory planning | Scarf budget set to 75% of each container memory limit |
 
 - Machine size grew with input size. Compare rows only with their recorded
   resource envelope.
 - Peak values are sampled, so short memory spikes may be missed.
+- Memory still held from earlier stages adds to what an operation plans, so a
+  run's peak can exceed the budget. The 5M r1 peak of 51.6 GiB exceeded its
+  48 GiB budget; marker search alone added about 32 GiB.
 - Three replicates show run-to-run drift but are insufficient for a useful
   confidence interval.
 - Parallel ANN and UMAP mean graph-derived outputs are not bitwise
