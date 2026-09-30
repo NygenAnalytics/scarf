@@ -37,6 +37,8 @@ catalog grows as datasets are added, so discovery results can differ when you
 rerun the page.
 
 {nb-download}`Download the executed Jupyter notebook <cytebase.ipynb>`.
+For longer worked examples, see the
+{ref}`example notebooks <cytebase_example_notebooks>` published in the bucket.
 
 ## Prerequisites
 
@@ -56,7 +58,8 @@ private bucket names out of notebook source and outputs.
 
 ## What you will learn
 
-- Search by text or exact ontology labels and run local catalog SQL
+- Summarize the collection and run local catalog SQL across studies
+- Search by text or exact ontology labels
 - Open an RNA assay read-only and read selected cell metadata
 - Plot imported UMAP coordinates by cell type and gene expression
 - Export coordinates for custom figures and mount a datastore for writable analysis
@@ -86,6 +89,64 @@ the published SHA-256 and verify the local copy. An unchanged catalog is reused
 silently. Its files are `~/.scarf/cytebase.duckdb` and
 `~/.scarf/cytebase.duckdb.sha256` on Unix, or under `%LOCALAPPDATA%\scarf` on
 Windows. This is a catalog cache, not a download of the count matrices.
+
+### The collection at a glance
+
+The catalog has two tables. `datasets` holds one row per dataset, with its title,
+citation, cell count, and a list of labels for each facet. `dataset_terms` holds
+one row per dataset and label, with columns `cytebase_id`, `facet`, `term_id`,
+`label`, and `label_rank`. A study is a CELLxGENE collection, usually one
+publication, and many studies publish several datasets.
+
+```{code-cell} ipython3
+READY = (
+    "status = 'ready' AND processed_version_id = latest_version_id"
+    " AND zarr_uri IS NOT NULL"
+)
+catalog.query(
+    f"""
+    SELECT count(*) AS datasets,
+           count(DISTINCT collection_id) AS studies,
+           sum(cell_count) AS cells
+    FROM datasets
+    WHERE {READY}
+    """
+)
+```
+
+`catalog.connect_catalog()` returns a read-only DuckDB connection, which is
+convenient when you want a pandas DataFrame, for example to plot it. Close it
+after use with a `with` block. A dataset with several labels in one facet, such
+as a multi-tissue atlas, counts once toward each label.
+
+```{code-cell} ipython3
+def top_labels(facet, n=10):
+    with catalog.connect_catalog() as connection:
+        return connection.execute(
+            f"""
+            SELECT t.label, count(*) AS datasets
+            FROM dataset_terms AS t JOIN datasets USING (cytebase_id)
+            WHERE t.facet = ? AND {READY}
+            GROUP BY t.label
+            ORDER BY datasets DESC, t.label
+            LIMIT ?
+            """,
+            [facet, n],
+        ).df()
+
+
+fig, axes = plt.subplots(1, 3, figsize=(13, 4.5), layout="constrained")
+for ax, facet in zip(axes, ["organism", "assay", "tissue"]):
+    counts = top_labels(facet)
+    ax.barh(counts["label"], counts["datasets"], color="#2a78d6")
+    ax.invert_yaxis()
+    ax.bar_label(ax.containers[0], fmt="{:,.0f}", padding=2, fontsize=8)
+    ax.margins(x=0.12)
+    ax.set(title=f"Top {facet} labels", xlabel="Datasets")
+    ax.spines[["top", "right"]].set_visible(False)
+plt.show()
+plt.close(fig)
+```
 
 By default, discovery returns datasets whose latest registered version is ready
 to open. Pass `ready_only=False` to also discover registered datasets that have
@@ -155,6 +216,36 @@ catalog.query(
     LIMIT 10
     """,
     parameters=["ready"],
+)
+```
+
+### SQL across studies
+
+`dataset_terms` keeps questions that span studies short. Which human tissues have
+datasets that contain microglia, the resident immune cells of the brain and
+retina? The catalog records which cell types each dataset contains, not how many
+cells of each type, so `cells` is the total size of the matching datasets.
+
+```{code-cell} ipython3
+catalog.query(
+    f"""
+    WITH hits AS (
+        SELECT DISTINCT cytebase_id FROM dataset_terms
+        WHERE facet = 'cell_type' AND label = ?
+    )
+    SELECT t.label AS tissue,
+           count(DISTINCT d.collection_id) AS studies,
+           count(*) AS datasets,
+           sum(d.cell_count) AS cells
+    FROM hits
+    JOIN datasets AS d USING (cytebase_id)
+    JOIN dataset_terms AS t ON t.cytebase_id = d.cytebase_id AND t.facet = 'tissue'
+    WHERE {READY} AND list_contains(d.organism_labels, ?)
+    GROUP BY t.label
+    ORDER BY datasets DESC, cells DESC
+    LIMIT 10
+    """,
+    parameters=["microglial cell", "Homo sapiens"],
 )
 ```
 
@@ -390,6 +481,36 @@ analysis results and annotations as well as the underlying counts, and mount
 those stores for further analysis. This is a planned addition; the examples
 above explore the currently imported CELLxGENE annotations and embeddings.
 
+(cytebase_example_notebooks)=
+
+## Example notebooks
+
+The bucket's
+[`notebooks` folder](https://huggingface.co/buckets/Nygen/cytebase/tree/notebooks)
+holds three executed notebooks that extend this walkthrough. Each one opens
+public datasets without credentials and keeps its outputs, so you can read the
+results before running anything. The Hugging Face file viewer does not display
+notebooks of this size, so the links below open rendered copies on
+[nbviewer](https://nbviewer.org). The case study is also available as the
+{doc}`cytebase_covid19` page in this documentation.
+
+| Notebook | What it shows |
+| --- | --- |
+| [Catalog tour](https://nbviewer.org/urls/huggingface.co/buckets/Nygen/cytebase/resolve/notebooks/cytebase_01_catalog_tour.ipynb) | The collection at a glance by organism, assay, tissue, disease and publication year; search by text, exact labels and SQL across studies; then one dataset's UMAP |
+| [COVID-19 case study](https://nbviewer.org/urls/huggingface.co/buckets/Nygen/cytebase/resolve/notebooks/cytebase_02_covid19_pbmc_case_study.ipynb) | COVID-19 and healthy blood from Wilk et al. (2020): study design from metadata, composition per donor, a marker dot plot that checks the published labels, and an interferon response compared between donors |
+| [UMAP gallery](https://nbviewer.org/urls/huggingface.co/buckets/Nygen/cytebase/resolve/notebooks/cytebase_03_umap_gallery.ipynb) | Published UMAPs from several tissues and species in one figure; labels, palettes, highlights, facets, density contours and themes; blockwise rasters of 1.1 million Tabula Sapiens cells; and a custom matplotlib figure |
+
+Download a notebook from the folder and open it in the environment from the
+prerequisites above:
+
+```bash
+curl -LO https://huggingface.co/buckets/Nygen/cytebase/resolve/notebooks/cytebase_01_catalog_tour.ipynb
+```
+
+The catalog tour runs in about two minutes, the case study in about five, and
+the gallery in about fifteen; most of that time is spent reading from the
+network. Their saved outputs reflect the catalog when they were executed.
+
 ## Common issues
 
 - **No matching dataset:** check bucket selection, access, and whether the desired
@@ -402,6 +523,11 @@ above explore the currently imported CELLxGENE annotations and embeddings.
 - **Unexpected expression costs:** count blocks are remote, and a single-gene
   request may read a larger storage chunk. Start with a small dataset and a few genes.
 - **Writing to a read-only store:** use a local mount for analysis that saves results.
+- **`429 Too Many Requests`:** anonymous Hugging Face access allows 500 API
+  requests per 5 minutes per IP address, and opening a store and reading its
+  metadata uses a share of them. Wait for the window to reset and rerun the
+  cell, or sign in with `hf auth login`. `Catalog()` then reads with your token,
+  which has a higher limit.
 
 See the [Cytebase API reference](../reference/api/cytebase.md) for the full SDK
 and [Remote stores](remote_stores.md) for mounted analysis mechanics. Saved

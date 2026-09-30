@@ -4,7 +4,8 @@ The Cytebase SDK connects directly to cloud-hosted Scarf DataStores for explorat
 analysis without downloading a complete dataset first. Search the catalog, open a shared
 store read-only, or mount it for writable analysis with remote counts. Install the `cytebase`
 extra described in {doc}`../../installation` and follow {doc}`../../tutorials/cytebase` for
-an executable walkthrough.
+an executable walkthrough. Its {ref}`example notebooks <cytebase_example_notebooks>` show
+longer use cases.
 
 Use the same SDK from a local notebook or cloud compute. Operations read metadata and count
 blocks over the network and run in your Python environment; the SDK does not provision compute.

@@ -48,6 +48,7 @@
 ## Data, remote, and scale
 
 - [Explore Cytebase](tutorials/cytebase.html): connect directly to cloud-hosted Scarf DataStores without a full dataset download; search, plot, and mount for analysis
+- [Cytebase case study: COVID-19 blood](tutorials/cytebase_covid19.html): compare disease and healthy donors in a remote dataset with metadata, the published UMAP, and donor-level gene summaries
 - [Import and export](tutorials/import_and_export.html): source formats, saved Seurat import, and output contracts
 - [Data organization](tutorials/data_organization.html): assays, cell data, feature data, and metadata
 - [Remote stores](tutorials/remote_stores.html): local mounted-store execution and an explicit object-store template
