@@ -17,7 +17,7 @@ kernelspec:
 
 Single-cell RNA sequencing measures mRNA counts cell by cell, but the resulting capture of mRNA molecules is sparse (anywhere from 10-40% on average). Many genes in many cells record zero counts even when the gene is expressed, because its transcripts were simply not captured and sequenced. This dropout means observed zeros mix true absence with missed molecules, and biologically coherent marker signals can look patchy and unreliable on a UMAP.
 
-Graph imputation addresses dropout by borrowing information across similar cells. The general concept of graph imputation is this, in which it helps to address noisy transcriptomic measurements by propagating expression signals across a network of transcriptomically similar cells. SCARF does this through building a k-nearest-neighbors graph connecting cells with similar profiles, converts it into a transition matrix where each cell distributes weight across its neighbors, and diffuses each feature over that graph. The imputed value for a cell is therefore a weighted average of its graph neighborhood rather than its own counts alone, reflecting the overall transcriptional similarity of the neighborhood.
+Graph imputation addresses dropout by borrowing information across similar cells. The general concept of graph imputation is this, in which it helps to address noisy transcriptomic measurements by propagating expression signals across a network of transcriptomically similar cells. SCARF does this through building a k-nearest-neighbors graph connecting cells with similar profiles, converts it into a transition matrix where each cell distributes weight across its neighbors, and diffuses each feature over that graph. The imputed value for a cell is therefore a weighted average of its graph neighborhood rather than its own counts alone. This allows for one to observe the overall transcriptional similarity of the neighborhood.
 
 It is important to note that graph imputation is strictly a visualization and exploratory aid, as it creates no new molecular observations and must not be used for any downstream differential expression or marker significance testing.
 
@@ -51,7 +51,9 @@ graph = run["connectivity_map"]
 
 ## Conduct graph diffusion on CD4 & compare observed and diffused values
 
-For graph imputation in SCARF, the key hyperparameter is `t`, which controls diffusion depth. We can conceptually think about our values of `t` as the number of diffusion steps. During the diffusion progress, when `t` = 1, each cell is averaging only its directly adjacent cells. When `t` = 2, each step has each cell averages 2-hops (a neighbor of a neighbor and so on and so forth), resulting in the smoothing over a wider neighborhood, rather than the adjacent cells (SCARF's default). As we approach `t` = 3, each cell now averages 3-hops, resulting in a broader smoothing of the global signal and potential borrowing from unrelated populations.
+For graph imputation in SCARF, the key hyperparameter is `t`, which controls diffusion depth. We can conceptually think about our values of `t` as the number of diffusion steps. During the diffusion progress, when `t` = 1, each cell is averaging only its directly adjacent cells. When `t` = 2, each step has each  2-hops, thus concurrently averages a neighbor of a neighbor and so on and so forth for greater `t`, resulting in the smoothing over a wider neighborhood, rather than the adjacent cells. As we approach `t` = 3, each cell now averages 3-hops, resulting in a broader smoothing of the global signal and potential borrowing from unrelated populations. 
+
+SCARF's default is `t` = 2
 
 ```{code-cell}
 diffusion_operators = {
@@ -88,7 +90,7 @@ cd4_summary
 
 The summary table above can be read from top to bottom, with the first column representing the observed data. We see that generally, when `t` = 1, the mean should look about the same as the observed mean, while the max drops a little as peak signal spreads to directly adjacent cells. When `t` = 2, the max drops further and more zeros fill in, since each cell now pulls from a wider neighborhood, thus the max drops further as more cells are added to the average. As we approach `t` = 3, even more zeros fill in, but this filling happens by design as each cell reaches further, so more filling alone does not mean a better result. Ideally, you want to find the balance between the t that fills the gaps inside your neighborhood that already has expression, without pulling the signal from other clusters.
 
-Higher `t` values increase diffusion, which can blend distinct phenotypes, creating smooth "gradients" between cell types that are biologically distinct; comparing these results against our observed or "true" data is critical. This means that as `t` approaches infinity, the resulting graph collapses into a global average where every cell in the connected graph now has the exact same global average expression.
+Higher `t` values increase diffusion, which can blend distinct phenotypes, creating smooth "gradients" between cell types that are biologically distinct; comparing these results against our observed or "true" data is critical. This means that as `t` approaches infinity, the resulting graph collapses into a global average where every cell in the connected graph now has the nearly the exact same global average expression.
 
 **With this understanding, we can now see our smoothing results in the form of UMAPs below.**
 
@@ -99,7 +101,7 @@ ds.plots.embedding(
     run=run,
     layout="umap",
     color_by="clusters",
-    legend_loc="on"
+    legend_loc="on_data"
 )
 ```
 
