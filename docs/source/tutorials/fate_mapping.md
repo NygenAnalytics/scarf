@@ -36,11 +36,11 @@ Here, we use a pre-run analysis of the developing pancreas to orient a graph fro
 ## Reuse the prepared graph and sink labels
 
 ```{code-cell}
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 import scarf
+import scarf.plotting as splt
 
 scarf.configure_output(level="WARNING", progress=False)
 
@@ -122,7 +122,7 @@ pd.DataFrame(
 )
 ```
 
-The three labels above come from lineage markers, not from ranking pseudotime, and the table reports each pick's majority share so the mapping stays auditable. That choice breaks a loop worth naming: had the sinks been picked by greatest mean pseudotime, annotations would have oriented the graph, the orientation would have produced pseudotime, and pseudotime would then have picked the sinks, rewarding sequencing-depth artifacts, outlier populations, or technical dead ends with terminus status. Never copy a highest-pseudotime rule into a real pipeline as endpoint discovery. In a real analysis, endpoints must come from study-specific evidence (for example, marker-supported terminal states reviewed against negative controls, as in {doc}`annotation`), because every downstream probability inherits the choice. A defensible sink is one whose probability mass concentrates near its own label on the map below; a sink whose probability spreads evenly or peaks elsewhere is a rejected hypothesis, not a discovery.
+The three results we have above come from lineage markers (not shown here), not from ranking pseudotime. The table reports each pick's majority share of where it likely may be mapped. In a real analysis, endpoints must come from study-specific evidence (for example, marker-supported terminal states reviewed against negative controls, as in {doc}`annotation`), because every downstream probability inherits the selected endpoin choice. A defensible sink is one whose probability mass concentrates near its own label on the map below; a sink whose probability spreads evenly or peaks elsewhere is a rejected hypothesis or a improper sink.
 
 ## Compute the fate probabilities
 
@@ -142,8 +142,6 @@ fate = ds.load_fate_mapping(fate_ref)
 }
 ```
 
-The producer writes one artifact containing all probability columns and validity, leaving cell
-metadata unchanged. The loaded `fate` object carries the probability matrix (`values`, one row per selected cell), the validity mask (`valid`), the exact producing refs (`ref`, `pseudotime`, `sink_labels`), and the sink label order matching the matrix columns. Keep all of these together in the analysis record: a probability matrix without its pseudotime and sink-label refs cannot be reinterpreted later.
 
 ```{code-cell}
 valid_probabilities = fate.values[fate.valid]
@@ -158,32 +156,41 @@ probability_summary["row-sum error"] = np.abs(
 probability_summary.agg(["min", "median", "max"])
 ```
 
-The summary above is the depth check for this page. Each row is one valid cell, each probability column is one sink, and `row-sum error` measures how far that cell's probabilities deviate from summing to one. Require finite, non-negative values with row-sum error near zero. Cells excluded by the validity mask do not appear here at all: a clean table over few valid cells can hide a large excluded population, so always compare the valid count against the cluster map before trusting the picture. Rows sum to one because the final sink column is the remainder after the others, so a tidy row sum validates arithmetic, not biology. Cells in graph components containing no sink cells are excluded as invalid, because a walk starting there can never reach a boundary.
+The summary table above is the depth check for this page. Each row is one valid cell, each probability column is one sink, and `row-sum error measures how far that cell's probabilities deviate from summing to one. THis
 
-The probability panels below are drawn directly with matplotlib: one panel per sink, coloring the shared UMAP by that sink's probability column for valid cells only. Read names, not numbers: each title pairs the sink label with its majority annotation from the table above. Expect smooth color gradients from the progenitor pool into each sink. That smoothness is guaranteed output shape: the solver returns the smoothest interpolation consistent with the pinned boundaries, so a gradient cannot prove cells commit gradually in vivo, where circuits such as Pax4/Arx cross-repression can flip abruptly.
+We can visualize the probability panels below using the same recipe as {doc}`imputation`: each sink's probability column is inserted as live cell metadata, then one shared-scale panel per sink colors the frozen UMAP. Each title pairs the sink label with its majority annotation from the table above. We can expect smooth color gradients from the progenitor pool into each sink as thats the ground biology. The smoothness is guaranteed output shape because the solver returns the smoothest interpolation consistent with the pinned boundaries, so a gradient cannot prove cells commit gradually in vivo, where circuits such as Pax4/Arx cross-repression can flip abruptly.
 
 ```{code-cell}
-umap = np.asarray(ds.load_artifact(analysis_run["umap"])["values"][:])
 num_sinks = len(fate.sink_labels)
-figure, axes = plt.subplots(1, num_sinks, figsize=(4 * num_sinks, 3.5))
 for index, label in enumerate(fate.sink_labels):
-    axis = axes[index]
-    points = axis.scatter(
-        umap[fate.valid, 0],
-        umap[fate.valid, 1],
-        c=fate.values[fate.valid, index],
-        cmap="viridis",
-        vmin=0.0,
-        vmax=1.0,
-        s=3,
+    ds.cells.insert(
+        f"fate_prob_{sink_names[int(label)]}",
+        fate.values[:, index],
+        key="I",
+        overwrite=True,
     )
-    # Biological lineage name paired with the integer sink label.
-    axis.set_title(f"Fate Probability: {label} ({sink_names[int(label)]})")
-    axis.set_xticks([])
-    axis.set_yticks([])
-    figure.colorbar(points, ax=axis, fraction=0.046, pad=0.04)
-figure.tight_layout()
-figure
+fate_titles = [
+    f"Fate Probability: {label} ({sink_names[int(label)]})"
+    for label in fate.sink_labels
+]
+fate_comparison = ds.plots.embedding(
+    layout=analysis_run["umap"],
+    color_by=[
+        f"fate_prob_{sink_names[int(label)]}" for label in fate.sink_labels
+    ],
+    n_columns=num_sinks,
+    color_scale=splt.ColorScale(scope="shared"),
+    sort_values=True,
+    show_titles=False,
+    show=False,
+)
+for axis, title in zip(
+    fate_comparison.axes.values(),
+    fate_titles,
+    strict=True,
+):
+    axis.set_title(title)
+fate_comparison.figure
 ```
 
 ## Important caveats to consider regarding fate mapping
