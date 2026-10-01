@@ -11,33 +11,28 @@ kernelspec:
   language: python
   name: python3
 ---
-
 # Comparing biological conditions with statistical testing
 
-This workflow asks one narrow question: do matched rheumatoid arthritis (RA) and control donors differ in gamma-delta T-cell expression of six selected genes?
-The donor is the unit of inference.
-Cells are averaged within donors, and a paired Wilcoxon signed-rank test compares the 18 matched RA-control pairs.
-This avoids treating 1,386 cells as independent biological replicates.
+Comparing biological conditions with statistical testing can be used for exploratory analysis to see differences in potential gene expression across conditions. In this tutorial, we ask a simple and narrow question, do matched rheumatoid arthritis (RA) and control donors differ in gamma-delta T-cell expression of the 6 genes of our choice? For the general analysis here, we average cells within donors, and then conduct a paired Wilcoxon signed-rank test across the 18 matched RA-control donor pairs.
 
-The result is a sample-level distribution test on normalized expression.
-It is not a raw-count pseudobulk differential expression model.
+This avoids treating 1,386 cells as independent biological replicates, avoiding the issue of **pseudoreplication**.
+
+The result is a sample-level distribution test on normalized expression, not a raw-count pseudobulk differential expression model.
 
 ## Dataset and prerequisites
 
-The data come from the [CELLxGENE collection](https://cellxgene.cziscience.com/collections/e1a9ca56-f2ee-435d-980a-4f49ab7a952b) for the [Binvignat et al. paper](https://doi.org/10.1172/jci.insight.178499).
-This page pins the versioned CELLxGENE H5AD rather than depending on a mutable collection download.
-You need enough local disk space for both the H5AD and its converted Zarr store, plus network access on the first run.
+The data for this tutorial comes from the [CELLxGENE collection](https://cellxgene.cziscience.com/collections/e1a9ca56-f2ee-435d-980a-4f49ab7a952b) from the [Binvignat et al. paper](https://doi.org/10.1172/jci.insight.178499).
+This page takes the extracted CELLxGENE H5AD. Because of this, to replicate this tutorial, ensure you have enough local disk space for both the H5AD and its converted Zarr store, plus network access on the first run.
 
-The dataset URL below is used only to download a file.
-Scarf does not compute against the URL: inspection reads the local H5AD, and every analysis step reads a local Zarr count source.
+The dataset URL below is used only to download a file; SCARF **does not** download the model for you.
 
-## 1. Download, inspect, and mount the count source
+## Download, inspect, and mount the count source
 
 Download the H5AD if it is absent, then inspect it before conversion.
 The assertions pin the matrix choice and dimensions used for this analysis.
 `raw/X` contains integer-like counts, while `X` is also present as another matrix candidate.
 
-```{code-cell} ipython3
+```{code-cell}
 from os import environ
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -81,7 +76,7 @@ assert (inspection.nCells, inspection.nFeatures) == (108_717, 21_648)
 Convert only when the reusable local source store is absent.
 The reader is built from the inspected keys rather than from assumptions about the H5AD layout.
 
-```{code-cell} ipython3
+```{code-cell}
 if not source_store.exists():
     with TemporaryDirectory(dir=dataset_directory) as conversion_directory:
         staged_store = Path(conversion_directory) / source_store.name
@@ -102,7 +97,7 @@ Initialize the count source with no feature-count filter, then mount it into a t
 The source continues to own the count matrix.
 The mounted target owns the cell selection and statistical artifacts created below.
 
-```{code-cell} ipython3
+```{code-cell}
 source = scarf.DataStore(
     str(source_store),
     default_assay="RNA",
@@ -121,12 +116,11 @@ ds = scarf.mount_datastore(
 )
 ```
 
-## 2. Freeze the matched gamma-delta T-cell cohort
+## Freeze the matched gamma-delta T-cell cohort
 
-The H5AD records the paper's fine annotation as `fine_annot` and its matched case-control index as `pair_index_CW`.
-Keep only cells labeled exactly `yd T cells` with a finite pair index, then freeze that mask as an immutable selection.
+Here, all we do is select our cells of interest that publication has already labeled, `yd T cells` .
 
-```{code-cell} ipython3
+```{code-cell}
 GROUPS = ["normal", "rheumatoid arthritis"]
 
 fine_annotation = np.asarray(ds.cells.fetch_all("fine_annot"), dtype=object)
@@ -146,10 +140,9 @@ ds.cells.insert(
 cells = ds.snapshot_cell_selection("matched_yd_t_cells")
 ```
 
-Check the inferential structure, not just the cell count.
-Each donor must map to one disease group and one pair, and every pair must contain one donor from each group.
+Before you run any tests, ensure that each donor must map to one disease group and one pair, and every pair must contain one donor from each group.
 
-```{code-cell} ipython3
+```{code-cell}
 donor_id = np.asarray(ds.cells.fetch_all("donor_id"), dtype=object)
 disease = np.asarray(ds.cells.fetch_all("disease"), dtype=object)
 
@@ -186,15 +179,14 @@ print(
 )
 ```
 
-This selection contains 1,386 cells from 36 donors in 18 matched pairs.
+This resulting check now leads too 1,386 cells from 36 donors in 18 matched donor pairs.
 
-## 3. Run the paired donor-level test
+## Run the paired donor-level test
 
-For each gene, Scarf first averages normalized expression within each donor.
-`pair_by` then aligns the RA donor and control donor carrying the same `pair_index_CW` value before the signed-rank test.
-The explicit group order fixes the labels as normal and RA; the test remains two-sided.
+For each gene, Scarf first averages normalized expression within each donor. Then, SCARF uses `pair_by` to aligns the RA donor and control donor carrying the same `pair_index_CW` value before the signed-rank test.
+The explicit group order fixes the labels as normal and RA, with the test being two-sided.
 
-```{code-cell} ipython3
+```{code-cell}
 panel = ["IFNG", "IFIT2", "TNF", "GZMA", "ISG15", "S100A4"]
 condition = CellField("disease")
 
@@ -232,16 +224,15 @@ assert not panel_table["p_value_adjusted"].le(0.05).any()
 panel_table
 ```
 
-The Benjamini-Hochberg correction is pooled across all six tests.
-In the validated run, none of these genes passed the `p_value_adjusted <= 0.05` threshold.
+We also perform a Benjamini-Hochberg correction for multiple hypothesis testing. In a true setting, we'd want our genes to have passed the `p_value_adjusted <= 0.05` threshold.
 
-## 4. Plot the donor-level distributions
+## Plot the donor-level expression distributions
 
 `distribution` supports the same sample and pairing identity through `StudyDesign`.
 The plot below contains donor means, not cell-level observations, and reuses the persisted adjusted p-values for its brackets.
 It does not recompute the tests.
 
-```{code-cell} ipython3
+```{code-cell}
 plot_design = StudyDesign(
     sample_by="donor_id",
     condition_by="disease",
@@ -262,24 +253,15 @@ ds.plots.distribution(
     point_alpha=0.55,
     stats_results=paired_result,
     stats_show_p=False,
-    figsize=(7.0, 9.0),
+    figsize=(7.0, 12.0),
     title="Matched donor means in gamma-delta T cells",
 )
 ```
 
-Each row has its own value scale, so compare the two disease distributions within a gene, not violin heights across genes.
-Each point is one donor mean, with 18 donors in each disease group.
-The `ns` brackets reflect the paired tests and their pooled false-discovery-rate correction.
-Pairing affects the test, but this plot does not connect matched donors with lines.
+Each row runs on its own different scale, so compare normal versus rheumatoid arthritis within a row, not the violin heights between rows. Each point is one donor mean, with 18 donors in each disease group. The `ns` brackets summarize the paired Wilcoxon tests with pooled false-discovery-rate correction: nothing here reaches significance; to understand why, we discuss these further in the caveats section. Note that pairing went into the test only; the plot itself does not join matched donors with lines.
 
-## Interpretation and limits
+## Important caveats to consider regarding condition comparisons
 
-This simple paired Wilcoxon panel did not survive pooled false-discovery-rate correction.
-It also did not reproduce the paper's count-model pseudobulk result for gamma-delta T cells.
-That is not a contradiction: this workflow tests six donor-mean normalized-expression distributions with a signed-rank test, while a count model uses raw sample-level counts and models their mean-variance relationship.
-
-Matching does not remove every processing effect. One selected pair spans batches 2 and 3, and
-this paired Wilcoxon test has no batch term, so a batch contribution cannot be separated here.
-
-Do not generalize this null six-gene panel to the full transcriptome, and do not treat it as a reanalysis of every paper contrast or covariate.
-For a count-model analysis, export raw counts aggregated by biological sample and carry the design into DESeq2, edgeR, or another suitable method; see {doc}`pseudobulk_and_differential_expression`.
+- **Statistical model disconnect (donor means vs. count models):** Unweighted cell averaging flattens measurement uncertainty, treating a donor with 5 cells identically to one with 120. Unlike parametric pseudobulk GLMs (such as DESeq2 or edgeR) that explicitly model library sizes and negative binomial count dispersion, a Wilcoxon signed-rank test discards magnitude in favor of relative ranks, sacrificing statistical power.
+- **Unmodeled confounding and covariates:** While donor pairing controls for matched baseline variables, a paired univariate test cannot model multi-factor covariates (such as batch effects or processing date). Any technical batch divergence across pairs or subtle sub-lineage shifts (e.g., {math}`V\delta1` versus {math}`V\delta2` composition changes) leaks directly into the donor differences.
+- **Power constraints vs. biological truth:** Failing to reach adjusted significance ({math}`q \le 0.05`) across six candidate genes at {math}`N = 18` matched pairs reflects the conservative penalty of non-parametric ranking and FDR pooling. A null result on a targeted exploratory panel is an absence of statistical power for small effect sizes, not proof that {math}`\gamma\delta` T cells are transcriptionally identical in vivo.
