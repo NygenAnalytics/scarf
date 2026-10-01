@@ -220,6 +220,14 @@ def progress_store(monkeypatch) -> FakeProgressStore:
     return store
 
 
+@pytest.fixture(autouse=True)
+def run_store(monkeypatch) -> FakeProgressStore:
+    """Keep every test off the deployed run store; the harness installs its own."""
+    store = FakeProgressStore()
+    monkeypatch.setattr(app, "run_store", store)
+    return store
+
+
 @pytest.fixture
 def worker(fake_hub, monkeypatch) -> Worker:
     stub = Worker(fake_hub)
@@ -283,11 +291,9 @@ def _process_child(
     *,
     call_id: str | None = WORKER_ID,
     state: str = "running",
-    version: str = VERSION_ID,
 ) -> dict[str, Any]:
     return {
         "cytebaseId": cytebase_id,
-        "datasetVersionId": version,
         "stage": "process",
         "callId": call_id,
         "state": state,
@@ -298,6 +304,15 @@ def _catalog_child(
     *, call_id: str | None = CATALOG_WORKER_ID, state: str = "running"
 ) -> dict[str, Any]:
     return {"stage": "catalog", "callId": call_id, "state": state}
+
+
+def _seed_runs(store: FakeProgressStore, run: dict[str, Any] | None) -> None:
+    """Mirror a run file into the run store the way the orchestrator keeps it."""
+    if run is None:
+        return
+    store.put(app.CURRENT_RUN, {"runId": run["runId"], "state": run["state"]})
+    for key, child in run["children"].items():
+        store.put(app._child_key(run["runId"], key), child)
 
 
 def _snapshot(hub) -> dict[str, bytes]:
@@ -507,14 +522,6 @@ def test_progress_summary_describes_worker_counters(counters, summary):
     assert app._progress_summary(counters) == summary
 
 
-def _owner_storage(state: dict | None) -> SimpleNamespace:
-    def read_json(path: str) -> dict | None:
-        assert path == app.RUN_PATH
-        return state
-
-    return SimpleNamespace(read_json=read_json)
-
-
 @pytest.mark.parametrize(
     "state",
     [
@@ -538,9 +545,10 @@ def _owner_storage(state: dict | None) -> SimpleNamespace:
         ),
     ],
 )
-def test_owner_rejects_workers_without_the_current_reservation(state):
+def test_owner_rejects_workers_without_the_current_reservation(run_store, state):
+    _seed_runs(run_store, state)
     with pytest.raises(RuntimeError, match=UNOWNED):
-        app._owner(_owner_storage(state), RUN_ID, "catalog", CATALOG_WORKER_ID)
+        app._owner(RUN_ID, "catalog", CATALOG_WORKER_ID)
 
 
 @pytest.mark.parametrize(
@@ -550,9 +558,9 @@ def test_owner_rejects_workers_without_the_current_reservation(state):
         _catalog_child(call_id=CATALOG_WORKER_ID, state="running"),
     ],
 )
-def test_owner_accepts_the_reserved_worker(child):
-    state = _run_file({"catalog": child})
-    app._owner(_owner_storage(state), RUN_ID, "catalog", CATALOG_WORKER_ID)
+def test_owner_accepts_the_reserved_worker(run_store, child):
+    _seed_runs(run_store, _run_file({"catalog": child}))
+    app._owner(RUN_ID, "catalog", CATALOG_WORKER_ID)
 
 
 WORKER = SimpleNamespace(
@@ -928,7 +936,7 @@ def test_process_dataset_records_the_attempt_before_and_after_work(
         pipelineVersion="old-pipeline",
         timings={"downloadSeconds": 9.0},
     )
-    hub.put(app.RUN_PATH, _run_file({PROCESS_KEY: _process_child()}))
+    _seed_runs(modal_harness.run_store, _run_file({PROCESS_KEY: _process_child()}))
     seen = {}
 
     def run_dataset(record, request, storage, progress, check):
@@ -1019,7 +1027,7 @@ def test_process_dataset_saves_unfinished_outcomes_as_errors(
 ):
     hub = modal_harness.hub
     _register(hub)
-    hub.put(app.RUN_PATH, _run_file({PROCESS_KEY: _process_child()}))
+    _seed_runs(modal_harness.run_store, _run_file({PROCESS_KEY: _process_child()}))
     monkeypatch.setattr(app, "_run_dataset", lambda *args: dict(outcome))
     result = _process_worker(modal_harness)
     saved = hub.read_json(RECORD_PATH)
@@ -1034,7 +1042,7 @@ def test_process_dataset_saves_unfinished_outcomes_as_errors(
 def test_process_dataset_saves_a_redacted_failure(modal_harness, monkeypatch, app_logs):
     hub = modal_harness.hub
     _register(hub)
-    hub.put(app.RUN_PATH, _run_file({PROCESS_KEY: _process_child()}))
+    _seed_runs(modal_harness.run_store, _run_file({PROCESS_KEY: _process_child()}))
 
     def run_dataset(*args: Any) -> None:
         raise RuntimeError("aria2c rejected hf_offlineTestToken")
@@ -1067,29 +1075,14 @@ def test_process_dataset_saves_a_redacted_failure(modal_harness, monkeypatch, ap
     assert "hf_offlineTestToken" not in formatted
 
 
-@pytest.mark.parametrize(
-    ("child", "error", "match"),
-    [
-        pytest.param(
-            _process_child(call_id="fc-process-9"), RuntimeError, UNOWNED, id="worker"
-        ),
-        pytest.param(
-            _process_child(version=NEW_VERSION_ID),
-            ValueError,
-            "Registered version changed after submission",
-            id="version",
-        ),
-    ],
-)
-def test_process_dataset_refuses_work_it_cannot_claim(
-    modal_harness, monkeypatch, child, error, match
-):
+def test_process_dataset_refuses_work_it_cannot_claim(modal_harness, monkeypatch):
     hub = modal_harness.hub
     _register(hub)
-    hub.put(app.RUN_PATH, _run_file({PROCESS_KEY: child}))
+    child = _process_child(call_id="fc-process-9")
+    _seed_runs(modal_harness.run_store, _run_file({PROCESS_KEY: child}))
     before = hub.read(RECORD_PATH)
     monkeypatch.setattr(app, "_run_dataset", _unexpected)
-    with pytest.raises(error, match=match):
+    with pytest.raises(RuntimeError, match=UNOWNED):
         _process_worker(modal_harness)
     assert hub.read(RECORD_PATH) == before
     assert modal_harness.progress_store.puts == []
@@ -1100,11 +1093,14 @@ def test_process_dataset_does_not_save_results_after_losing_ownership(
 ):
     hub = modal_harness.hub
     _register(hub)
-    hub.put(app.RUN_PATH, _run_file({PROCESS_KEY: _process_child()}))
+    _seed_runs(modal_harness.run_store, _run_file({PROCESS_KEY: _process_child()}))
 
     def run_dataset(*args: Any) -> dict:
         # An operator resets the run while this worker is still busy.
-        hub.put(app.RUN_PATH, _run_file({PROCESS_KEY: _process_child()}, state="reset"))
+        _seed_runs(
+            modal_harness.run_store,
+            _run_file({PROCESS_KEY: _process_child()}, state="reset"),
+        )
         return {"outcome": "succeeded"}
 
     monkeypatch.setattr(app, "_run_dataset", run_dataset)
@@ -1122,7 +1118,7 @@ def _catalog_worker(harness, request: dict, *, call_id: str = CATALOG_WORKER_ID)
 def test_build_catalog_runs_the_catalog_as_the_reserved_worker(
     modal_harness, monkeypatch, app_logs
 ):
-    modal_harness.hub.put(app.RUN_PATH, _run_file({"catalog": _catalog_child()}))
+    _seed_runs(modal_harness.run_store, _run_file({"catalog": _catalog_child()}))
     calls = []
 
     def run_catalog(request, storage, check):
@@ -1139,7 +1135,7 @@ def test_build_catalog_runs_the_catalog_as_the_reserved_worker(
 
 
 def test_build_catalog_logs_and_reraises_failures(modal_harness, monkeypatch, app_logs):
-    modal_harness.hub.put(app.RUN_PATH, _run_file({"catalog": _catalog_child()}))
+    _seed_runs(modal_harness.run_store, _run_file({"catalog": _catalog_child()}))
 
     def run_catalog(request, storage, check):
         raise RuntimeError("catalog upload failed")
@@ -1155,8 +1151,9 @@ def test_build_catalog_logs_and_reraises_failures(modal_harness, monkeypatch, ap
 
 
 def test_build_catalog_requires_the_catalog_reservation(modal_harness, monkeypatch):
-    modal_harness.hub.put(
-        app.RUN_PATH, _run_file({"catalog": _catalog_child(call_id="fc-catalog-2")})
+    _seed_runs(
+        modal_harness.run_store,
+        _run_file({"catalog": _catalog_child(call_id="fc-catalog-2")}),
     )
     monkeypatch.setattr(pipeline_catalog, "run_catalog", _unexpected)
     with pytest.raises(RuntimeError, match=UNOWNED):
@@ -1194,7 +1191,7 @@ def test_reset_requires_drain_confirmation_for_the_current_run(
 
 
 def test_reset_accepts_finished_failed_and_timed_out_calls(
-    fake_hub, monkeypatch, app_logs
+    fake_hub, monkeypatch, app_logs, run_store
 ):
     _register(fake_hub)
     _register(fake_hub, cytebaseId=OTHER_ID, datasetId=OTHER_DATASET_ID)
@@ -1209,6 +1206,7 @@ def test_reset_accepts_finished_failed_and_timed_out_calls(
         state="blocked",
     )
     fake_hub.put(app.RUN_PATH, state)
+    _seed_runs(run_store, state)
     calls = Calls(
         {
             RUN_ID: modal.exception.FunctionTimeoutError("Function timed out"),
@@ -1220,7 +1218,9 @@ def test_reset_accepts_finished_failed_and_timed_out_calls(
 
     assert app._reset(fake_hub.bucket(), RESET) == {"runId": RUN_ID, "state": "reset"}
 
-    assert calls.polled == [(RUN_ID, 0), (CATALOG_WORKER_ID, 0), (WORKER_ID, 0)]
+    # Finished children need no draining; the pending one was never spawned.
+    assert calls.polled == [(RUN_ID, 0), (WORKER_ID, 0)]
+    assert run_store.get(app.CURRENT_RUN) == {"runId": RUN_ID, "state": "reset"}
     assert app_logs.messages(logging.WARNING) == [
         f"Using explicit worker-drain confirmation for call {WORKER_ID}: "
         "RuntimeError: worker crashed with [redacted]"
@@ -1238,10 +1238,11 @@ def test_reset_accepts_finished_failed_and_timed_out_calls(
     ],
 )
 def test_reset_relies_on_drain_confirmation_when_results_are_unavailable(
-    fake_hub, monkeypatch, app_logs, error
+    fake_hub, monkeypatch, app_logs, run_store, error
 ):
     _register(fake_hub)
     fake_hub.put(app.RUN_PATH, BLOCKED)
+    _seed_runs(run_store, BLOCKED)
     monkeypatch.setattr(modal, "FunctionCall", Calls({WORKER_ID: error}))
     assert app._reset(fake_hub.bucket(), RESET)["state"] == "reset"
     [warning] = app_logs.messages(logging.WARNING)
@@ -1250,9 +1251,12 @@ def test_reset_relies_on_drain_confirmation_when_results_are_unavailable(
     )
 
 
-def test_reset_refuses_while_a_worker_is_still_running(fake_hub, monkeypatch):
+def test_reset_refuses_while_a_worker_is_still_running(
+    fake_hub, monkeypatch, run_store
+):
     _register(fake_hub, runId=RUN_ID, stageOutcome="running", status="processing")
     fake_hub.put(app.RUN_PATH, BLOCKED)
+    _seed_runs(run_store, BLOCKED)
     monkeypatch.setattr(modal, "FunctionCall", Calls({WORKER_ID: TimeoutError()}))
     before = _snapshot(fake_hub)
     with pytest.raises(
@@ -1293,10 +1297,11 @@ def test_reset_refuses_while_a_worker_is_still_running(fake_hub, monkeypatch):
     ],
 )
 def test_reset_fails_only_records_this_run_left_running(
-    fake_hub, monkeypatch, overrides, expected, rewritten
+    fake_hub, monkeypatch, run_store, overrides, expected, rewritten
 ):
     _register(fake_hub, **overrides)
     fake_hub.put(app.RUN_PATH, BLOCKED)
+    _seed_runs(run_store, BLOCKED)
     monkeypatch.setattr(modal, "FunctionCall", Calls())
     app._reset(fake_hub.bucket(), RESET)
     saved = fake_hub.read_json(RECORD_PATH)
@@ -1493,15 +1498,167 @@ def test_process_run_reports_unregistered_datasets_without_stopping_others(
     )
     saved = hub.read_json(app.RUN_PATH)
     assert saved["state"] == "completed"
-    assert saved["children"] == {
-        "catalog": _catalog_child(call_id="fc-catalog-2", state="succeeded"),
-        PROCESS_KEY: _process_child(state="succeeded"),
+    # Workers start concurrently, so call IDs are not in a fixed order.
+    assert {key: child["state"] for key, child in saved["children"].items()} == {
+        "catalog": "succeeded",
+        PROCESS_KEY: "succeeded",
+        "missing_dataset:process": "failed",
     }
-    # The catalog is refreshed first, then receives the processed record.
+    # The catalog is refreshed first, then receives only the processed record.
     assert [args[0] for args in modal_harness.build_catalog.spawned] == [
         {"updates": []},
         {"updates": [hub.read_json(RECORD_PATH)]},
     ]
+
+
+@pytest.mark.parametrize(
+    ("results", "elapsed", "summary"),
+    [
+        pytest.param(
+            [],
+            30.0,
+            "done=0/4 running=1 queued=3 elapsed=0h00m",
+            id="nothing-finished",
+        ),
+        pytest.param(
+            [{"outcome": "succeeded"}, {"outcome": "failed"}],
+            3_600.0,
+            "done=2/4 running=1 queued=1 failed=1 succeeded=1 "
+            "rate=2.0/h eta=1h00m elapsed=1h00m",
+            id="half-done",
+        ),
+    ],
+)
+def test_run_progress_summarizes_outcomes_rate_and_eta(results, elapsed, summary):
+    children = {
+        "catalog": _catalog_child(state="running"),
+        PROCESS_KEY: _process_child(state="running"),
+        f"{OTHER_ID}:process": _process_child(OTHER_ID, state="succeeded"),
+    }
+    assert app._run_progress(4, children, results, elapsed) == summary
+
+
+@pytest.mark.parametrize(("quota", "seconds"), [(1000, 15.0), (3000, 5.0), (6000, 2.5)])
+def test_start_interval_keeps_dataset_starts_under_the_hub_quota(quota, seconds):
+    assert app._start_interval(quota) == seconds
+
+
+def test_start_pacer_spaces_starts_by_its_interval(monkeypatch):
+    clock, slept = Clock(), []
+
+    async def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        clock.advance(seconds)
+
+    monkeypatch.setattr(app, "monotonic", clock)
+    monkeypatch.setattr(app.asyncio, "sleep", sleep)
+
+    async def three_starts() -> list[float]:
+        pacer, started = app._StartPacer(15.0), []
+        for _ in range(3):
+            await pacer.wait()
+            started.append(clock.now)
+            clock.advance(4.0)
+        return started
+
+    assert app.asyncio.run(three_starts()) == [1_000.0, 1_015.0, 1_030.0]
+    assert slept == [11.0, 11.0]
+
+
+def _three_datasets(hub) -> list[str]:
+    third = "roe_2022_kidney_atlas_66666666"
+    _register(hub)
+    _register(hub, cytebaseId=OTHER_ID, datasetId=OTHER_DATASET_ID)
+    _register(hub, cytebaseId=third, datasetId="66666666-6666-4666-8666-666666666666")
+    return [CYTEBASE_ID, OTHER_ID, third]
+
+
+def test_process_run_keeps_at_most_the_container_limit_running(
+    modal_harness, monkeypatch
+):
+    keys = _three_datasets(modal_harness.hub)
+    lock, running, peak = threading.Lock(), [0], [0]
+
+    def run_dataset(record, request, storage, progress, check):
+        with lock:
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+        try:
+            return _succeed(record, request, storage, progress, check)
+        finally:
+            with lock:
+                running[0] -= 1
+
+    monkeypatch.setattr(app, "_run_dataset", run_dataset)
+    monkeypatch.setattr(app, "PROCESS_CONTAINERS", 1)
+    result = modal_harness.run("process", {"cytebaseIds": keys}, run_id=RUN_ID)
+
+    assert (result["state"], sorted(result["successes"])) == ("completed", sorted(keys))
+    assert peak[0] == 1
+
+
+def test_process_run_paces_every_dataset_start(modal_harness, monkeypatch):
+    keys = _three_datasets(modal_harness.hub)
+    events: list[str] = []
+
+    class Pacer:
+        def __init__(self, interval: float) -> None:
+            events.append(f"interval={interval}")
+
+        async def wait(self) -> None:
+            events.append("wait")
+
+    workers = modal_harness.process_dataset
+    spawn = workers.spawn.aio
+
+    async def spawn_after_pacing(*args):
+        events.append("spawn")
+        return await spawn(*args)
+
+    monkeypatch.setattr(app, "_StartPacer", Pacer)
+    monkeypatch.setattr(app, "DATASET_START_INTERVAL", 15.0)
+    monkeypatch.setattr(workers, "spawn", SimpleNamespace(aio=spawn_after_pacing))
+    monkeypatch.setattr(app, "_run_dataset", _succeed)
+    modal_harness.run("process", {"cytebaseIds": keys}, run_id=RUN_ID)
+
+    assert events[0] == "interval=15.0"
+    assert events.count("wait") == events.count("spawn") == 3
+    # Each start waits for the pacer before its worker is spawned.
+    assert all(
+        events[: index + 1].count("wait") > events[:index].count("spawn")
+        for index, event in enumerate(events)
+        if event == "spawn"
+    )
+
+
+def test_process_run_state_costs_a_fixed_number_of_bucket_calls(
+    modal_harness, monkeypatch
+):
+    hub = modal_harness.hub
+    keys = _three_datasets(hub)
+    monkeypatch.setattr(app, "_run_dataset", _succeed)
+    modal_harness.run("process", {"cytebaseIds": keys}, run_id=RUN_ID)
+
+    reads = [
+        call
+        for call in hub.calls
+        if call[0] == "download_bucket_files" and app.RUN_PATH in call[2]
+    ]
+    writes = [path for paths in _writes(hub) for path in paths if path == app.RUN_PATH]
+    # One read to check the previous run, and one write each at start and end,
+    # however many datasets run; claims and checks live in the run store.
+    assert (len(reads), len(writes)) == (1, 2)
+    assert {
+        key: value["state"]
+        for key, value in modal_harness.run_store.values.items()
+        if key.startswith(f"{RUN_ID}:")
+    } == {f"{RUN_ID}:{key}:process": "succeeded" for key in keys} | {
+        f"{RUN_ID}:catalog": "succeeded"
+    }
+    assert modal_harness.run_store.get(app.CURRENT_RUN) == {
+        "runId": RUN_ID,
+        "state": "completed",
+    }
 
 
 def test_process_run_forwards_only_each_datasets_approved_paths(
@@ -1622,10 +1779,20 @@ def _periodic_run(modal_harness, monkeypatch, *, fail_update: bool):
 
 
 def test_process_run_publishes_finished_records_every_minute(
-    modal_harness, monkeypatch
+    modal_harness, monkeypatch, app_logs
 ):
     result, published = _periodic_run(modal_harness, monkeypatch, fail_update=False)
     assert published == [[], [CYTEBASE_ID], [OTHER_ID]]
+    # The minute tick also logs how far the run has come.
+    [progress] = [
+        message
+        for message in app_logs.messages()
+        if message.startswith("Pipeline progress")
+    ]
+    assert progress == (
+        f"Pipeline progress: run={RUN_ID} done=1/2 running=1 queued=0 "
+        "succeeded=1 rate=59.0/h eta=0h01m elapsed=0h01m"
+    )
     assert (result["state"], result["error"]) == ("completed", None)
     assert result["catalog"] == {"status": "done", "updated": [OTHER_ID]}
     assert result["successes"] == [CYTEBASE_ID, OTHER_ID]
@@ -1704,7 +1871,8 @@ def test_blocked_run_must_be_reset_before_new_work(modal_harness, monkeypatch):
     monkeypatch.setattr(modal, "FunctionCall", calls)
     reset = modal_harness.run("reset", RESET, run_id="fc-run-3")
     assert reset == {"runId": RUN_ID, "state": "reset"}
-    assert calls.polled == [(RUN_ID, 0), (CATALOG_WORKER_ID, 0), (WORKER_ID, 0)]
+    # Only the worker whose result was lost is still marked running.
+    assert calls.polled == [(RUN_ID, 0), (WORKER_ID, 0)]
 
     assert modal_harness.run("catalog", {}, run_id="fc-run-4")["state"] == "completed"
     assert hub.read_json(app.RUN_PATH)["runId"] == "fc-run-4"

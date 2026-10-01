@@ -128,6 +128,7 @@ def cytebase_offline(monkeypatch, tmp_path):
         "CYTEBASE_PIPELINE_VERSION",
         "CYTEBASE_DOWNLOAD_CONNECTIONS",
         "CYTEBASE_PROCESS_CONTAINERS",
+        "CYTEBASE_HUB_API_QUOTA",
         "SCARF_CYTEBASE_LOCAL",
         "LOCALAPPDATA",
         "MODAL_IS_REMOTE",
@@ -702,7 +703,10 @@ CALL_ID: ContextVar[str | None] = ContextVar("cytebase_test_call_id", default=No
 
 
 class FakeProgressStore:
-    """In-memory replacement for the deployed ``modal.Dict``."""
+    """In-memory replacement for a deployed ``modal.Dict``.
+
+    Used for both the progress store and the run store.
+    """
 
     def __init__(self, fail: bool = False) -> None:
         self.values: dict[str, Any] = {}
@@ -716,7 +720,10 @@ class FakeProgressStore:
         self.values[key] = copy.deepcopy(value)
 
     def get(self, key: str, default: Any = None) -> Any:
-        return self.values.get(key, default)
+        return copy.deepcopy(self.values.get(key, default))
+
+    def items(self) -> list[tuple[str, Any]]:
+        return copy.deepcopy(list(self.values.items()))
 
 
 class FakeFunction:
@@ -776,6 +783,7 @@ class ModalHarness:
     hub: FakeHub
     bucket: "Bucket"
     progress_store: FakeProgressStore
+    run_store: FakeProgressStore
     build_catalog: FakeFunction
     process_dataset: FakeFunction
 
@@ -798,6 +806,10 @@ def modal_harness(pipeline_app, fake_hub, monkeypatch) -> ModalHarness:
     monkeypatch.setattr(modal, "current_function_call_id", CALL_ID.get)
     store = FakeProgressStore()
     monkeypatch.setattr(pipeline_app, "progress_store", store)
+    runs = FakeProgressStore()
+    monkeypatch.setattr(pipeline_app, "run_store", runs)
+    # Pacing is covered by its own tests; here datasets start at once.
+    monkeypatch.setattr(pipeline_app, "DATASET_START_INTERVAL", 0.0)
     build_catalog = FakeFunction(pipeline_app.build_catalog.local, "catalog")
     process_dataset = FakeFunction(pipeline_app.process_dataset.local, "process")
     monkeypatch.setattr(pipeline_app, "build_catalog", build_catalog)
@@ -807,6 +819,7 @@ def modal_harness(pipeline_app, fake_hub, monkeypatch) -> ModalHarness:
         fake_hub,
         fake_hub.bucket(),
         store,
+        runs,
         build_catalog,
         process_dataset,
     )

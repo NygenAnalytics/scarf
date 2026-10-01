@@ -18,6 +18,7 @@ from zarr.storage import LocalStore
 import scarf
 from scarf.cytebase.pipeline import build
 from scarf.cytebase.pipeline.models import DatasetRecord, Manifest
+from scarf.utils.logging import logger
 from tests.fixtures_cytebase import (
     COLLECTION_ID,
     COUNTS,
@@ -452,6 +453,50 @@ def test_build_local_imports_obs_columns_that_hdf5_nests(tmp_path):
         assert datastore.cells.fetch_all(stored).tolist() == values
     finally:
         datastore.z.store.close()
+    verification = build.verify_store(str(store), manifest.model_dump(mode="json"))
+    assert verification["countsBlock"] == COUNTS[:3].tolist()
+
+
+@pytest.mark.parametrize(
+    ("damage", "problem"),
+    [
+        pytest.param("nan", "contains non-finite values", id="non-finite"),
+        pytest.param("shape", "has shape (6, 0), expected 6 rows", id="shape"),
+    ],
+)
+def test_build_local_converts_without_a_umap_scarf_cannot_import(
+    tmp_path, damage, problem
+):
+    source = write_h5ad(tmp_path / "source.h5ad")
+    with h5py.File(source, "r+") as h5:
+        umap = h5["obsm/X_umap"]
+        if damage == "nan":
+            # Visium spots left out of a UMAP are stored as NaN coordinates.
+            coordinates = umap[:]
+            coordinates[2] = np.nan
+            umap[...] = coordinates
+        else:
+            del h5["obsm/X_umap"]
+            h5["obsm"].create_dataset("X_umap", shape=(6, 0), dtype="float32")
+    size, checksum = source_details(source)
+    record = DatasetRecord.model_validate(dataset_record())
+    store = tmp_path / "data.zarr"
+    messages: list[str] = []
+    handler = logger.add(messages.append, level="WARNING", format="{message}")
+    try:
+        manifest, converted = build.build_local(
+            record, source, store, cellxgene_dataset(), size, checksum, noop
+        )
+    finally:
+        logger.remove(handler)
+
+    assert converted["status"] == "done", converted
+    assert converted["conversion"]["embeddingRoles"] == {}
+    assert converted["conversion"]["skippedEmbeddings"] == {"X_umap": problem}
+    assert converted["importedArtifacts"]["embeddings"] == {}
+    assert f"Skipping the source UMAP because it {problem}" in [
+        message.strip() for message in messages
+    ]
     verification = build.verify_store(str(store), manifest.model_dump(mode="json"))
     assert verification["countsBlock"] == COUNTS[:3].tolist()
 

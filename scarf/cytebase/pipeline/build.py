@@ -639,6 +639,29 @@ def _validated_manifest(value: dict) -> dict:
     return manifest
 
 
+_UMAP_KEY = "obsm/X_umap"
+_EMBEDDING_BLOCK_ROWS = 1_000_000
+
+
+def _umap_problem(h5: h5py.File, n_obs: int) -> str | None:
+    """Return why the source UMAP cannot be imported, or None when it can.
+
+    Mirrors the checks Scarf applies while importing an embedding, and reads
+    the coordinates in row blocks so large datasets stay within memory.
+    """
+    node = h5[_UMAP_KEY]
+    if not isinstance(node, h5py.Dataset):
+        return "is not a dense array"
+    if node.ndim != 2 or node.shape[0] != n_obs or node.shape[1] < 1:
+        return f"has shape {node.shape}, expected {n_obs} rows"
+    if np.dtype(node.dtype).kind not in "biuf":
+        return f"has non-numeric dtype {node.dtype}"
+    for start in range(0, n_obs, _EMBEDDING_BLOCK_ROWS):
+        if not np.isfinite(node[start : start + _EMBEDDING_BLOCK_ROWS]).all():
+            return "contains non-finite values"
+    return None
+
+
 def convert_local(
     source: Path,
     destination: Path,
@@ -737,7 +760,16 @@ def convert_local(
                 "The selected feature-name column is missing. Confirm the feature-name column.",
                 table_column_names(h5[inspection.featureAttrsKey]),
             )
-        embedding_roles = {"X_umap": "umap"} if "obsm/X_umap" in h5 else {}
+        embedding_roles = {}
+        if _UMAP_KEY in h5:
+            # The UMAP is an optional extra; one Scarf cannot import is left
+            # out so the counts and metadata still convert.
+            problem = _umap_problem(h5, manifest["nObs"])
+            if problem is None:
+                embedding_roles = {"X_umap": "umap"}
+            else:
+                logger.warning(f"Skipping the source UMAP because it {problem}")
+                record["conversion"]["skippedEmbeddings"] = {"X_umap": problem}
     record["conversion"]["embeddingRoles"] = embedding_roles
     record["conversion"]["scarfSuggestedFeatureNameKey"] = inspection.featureNameKey
 

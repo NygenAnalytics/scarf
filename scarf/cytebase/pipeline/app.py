@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import subprocess
+from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -59,17 +60,36 @@ BUCKET_KEY = _bucket_key()
 app = modal.App("cytebase")
 secret = modal.Secret.from_name("scarf-env", required_keys=["HF_TOKEN", BUCKET_KEY])
 progress_store = modal.Dict.from_name("cytebase-progress", create_if_missing=True)
+# Live run and child state for ownership checks. Keeping it in a modal.Dict
+# means claiming, checking and finishing work spends no Hugging Face quota;
+# the bucket keeps only the run's start and final record at RUN_PATH.
+run_store = modal.Dict.from_name("cytebase-runs", create_if_missing=True)
+CURRENT_RUN = "current"
 RUN_PATH = "_internal/pipeline.json"
 
 
-def _limit(name: str) -> int:
-    value = int(os.environ.get(name, "4"))
+def _limit(name: str, default: int = 4) -> int:
+    value = int(os.environ.get(name, str(default)))
     if value < 1:
         raise ValueError(f"{name} must be positive")
     return value
 
 
 PROCESS_CONTAINERS = _limit("CYTEBASE_PROCESS_CONTAINERS")
+# Hugging Face counts Hub API calls per account in fixed five-minute windows.
+# A processed dataset makes about 35 such calls over its lifetime; planning for
+# 40 and spending 80% of the quota leaves room for the catalog and status reads.
+_QUOTA_WINDOW_SECONDS = 300
+_HUB_CALLS_PER_DATASET = 40
+
+
+def _start_interval(quota: int) -> float:
+    """Return the seconds between dataset starts that keep calls under ``quota``."""
+    return _QUOTA_WINDOW_SECONDS * _HUB_CALLS_PER_DATASET / (0.8 * quota)
+
+
+HUB_API_QUOTA = _limit("CYTEBASE_HUB_API_QUOTA", 1000)
+DATASET_START_INTERVAL = _start_interval(HUB_API_QUOTA)
 _SHA = (
     subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent, text=True
@@ -100,6 +120,7 @@ image = (
             "CYTEBASE_BUCKET_KEY": BUCKET_KEY,
             "CYTEBASE_DOWNLOAD_CONNECTIONS": str(download_connections()),
             "CYTEBASE_PROCESS_CONTAINERS": str(PROCESS_CONTAINERS),
+            "CYTEBASE_HUB_API_QUOTA": str(HUB_API_QUOTA),
             "HF_HUB_DISABLE_PROGRESS_BARS": "1",
         }
     )
@@ -151,12 +172,46 @@ def _progress_summary(counters: dict | None) -> str:
     return " ".join(parts)
 
 
-def _owner(storage: Bucket, run_id: str, key: str, call_id: str | None) -> None:
-    state = storage.read_json(RUN_PATH) or {}
-    child = state.get("children", {}).get(key, {})
+def _duration(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    return f"{minutes // 60}h{minutes % 60:02d}m"
+
+
+def _run_progress(
+    total: int, children: dict[str, dict], results: list[dict], elapsed: float
+) -> str:
+    """Summarize a processing run for its once-a-minute progress log."""
+    running = sum(
+        1
+        for key, child in children.items()
+        if key.endswith(":process") and child.get("state") in {"pending", "running"}
+    )
+    done = len(results)
+    outcomes = Counter(row["outcome"] for row in results)
+    parts = [
+        f"done={done}/{total}",
+        f"running={running}",
+        f"queued={max(0, total - done - running)}",
+        *(f"{outcome}={count}" for outcome, count in sorted(outcomes.items())),
+    ]
+    if done and elapsed > 0:
+        rate = done / elapsed * 3600
+        eta = (total - done) / rate * 3600
+        parts += [f"rate={rate:.1f}/h", f"eta={_duration(eta)}"]
+    parts.append(f"elapsed={_duration(elapsed)}")
+    return " ".join(parts)
+
+
+def _child_key(run_id: str, key: str) -> str:
+    return f"{run_id}:{key}"
+
+
+def _owner(run_id: str, key: str, call_id: str | None) -> None:
+    current = run_store.get(CURRENT_RUN) or {}
+    child = run_store.get(_child_key(run_id, key)) or {}
     if (
-        state.get("runId") != run_id
-        or state.get("state") != "running"
+        current.get("runId") != run_id
+        or current.get("state") != "running"
         or child.get("state") not in {"pending", "running"}
         or child.get("callId") not in {None, call_id}
     ):
@@ -351,15 +406,19 @@ def _execute(cytebase_id: str, run_id: str, request: dict) -> dict:
     key = f"{cytebase_id}:process"
 
     def check() -> None:
-        _owner(storage, run_id, key, call_id)
+        _owner(run_id, key, call_id)
 
     check()
-    record = load_record(storage, cytebase_id)
-    state = storage.read_json(RUN_PATH)
-    if state is None:
-        raise RuntimeError("Pipeline state is missing")
-    if str(record.latestVersionId) != state["children"][key]["datasetVersionId"]:
-        raise ValueError("Registered version changed after submission")
+    try:
+        record = load_record(storage, cytebase_id)
+    except FileNotFoundError as error:
+        # Nothing is registered to update, so this is an ordinary failed
+        # outcome rather than an unknown one that would block the run.
+        return {
+            "cytebaseId": cytebase_id,
+            "outcome": "failed",
+            "message": error_message(error),
+        }
     record.attempt += 1
     record.runId, record.callId, record.stage = run_id, call_id, "process"
     record.pipelineVersion = os.environ["CYTEBASE_PIPELINE_VERSION"]
@@ -421,6 +480,7 @@ def _execute(cytebase_id: str, run_id: str, request: dict) -> dict:
     timeout=86400,
     retries=0,
     max_containers=1,
+    nonpreemptible=True,
 )
 def build_catalog(request: dict, run_id: str) -> dict:
     from .catalog import run_catalog
@@ -428,7 +488,7 @@ def build_catalog(request: dict, run_id: str) -> dict:
     storage = _storage()
 
     def check() -> None:
-        _owner(storage, run_id, "catalog", modal.current_function_call_id())
+        _owner(run_id, "catalog", modal.current_function_call_id())
 
     check()
     started = monotonic()
@@ -466,10 +526,13 @@ def _reset(storage: Bucket, request: dict) -> dict:
         raise ValueError(
             "Reset requires the exact expected run ID and explicit workersDrained confirmation"
         )
-    ids = [
-        state.get("callId"),
-        *(child.get("callId") for child in state.get("children", {}).values()),
+    prefix = _child_key(state["runId"], "")
+    unfinished = [
+        child
+        for key, child in run_store.items()
+        if key.startswith(prefix) and child.get("state") in {"pending", "running"}
     ]
+    ids = [state.get("callId"), *(child.get("callId") for child in unfinished)]
     for call_id in filter(None, ids):
         try:
             modal.FunctionCall.from_id(call_id).get(timeout=0)
@@ -488,11 +551,7 @@ def _reset(storage: Bucket, request: dict) -> dict:
                 call_id,
                 error_message(error),
             )
-    affected = {
-        child["cytebaseId"]
-        for child in state.get("children", {}).values()
-        if child.get("cytebaseId")
-    }
+    affected = {child["cytebaseId"] for child in unfinished if child.get("cytebaseId")}
     for key in affected:
         record = load_record(storage, key)
         if record.runId == state["runId"] and record.stageOutcome == "running":
@@ -507,8 +566,25 @@ def _reset(storage: Bucket, request: dict) -> dict:
                 f"{dataset_prefix(key)}/dataset.json", record.model_dump(mode="json")
             )
     state.update(state="reset", updatedAt=_now())
+    run_store.put(CURRENT_RUN, {"runId": state["runId"], "state": "reset"})
     storage.write_json(RUN_PATH, state)
     return {"runId": state["runId"], "state": "reset"}
+
+
+class _StartPacer:
+    """Spaces dataset starts at least ``interval`` seconds apart."""
+
+    def __init__(self, interval: float) -> None:
+        self.interval = interval
+        self._next = 0.0
+        self._lock = asyncio.Lock()
+
+    async def wait(self) -> None:
+        async with self._lock:
+            delay = self._next - monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._next = monotonic() + self.interval
 
 
 @app.function(
@@ -524,6 +600,7 @@ def _reset(storage: Bucket, request: dict) -> dict:
 async def run_pipeline(action: str, request: dict) -> dict:
     """Queue submissions, but advance datasets independently inside each submission."""
     storage = _storage()
+    run_started = monotonic()
     if action == "reset":
         return await asyncio.to_thread(_reset, storage, request)
     if action not in {"register", "catalog", "process"}:
@@ -548,14 +625,26 @@ async def run_pipeline(action: str, request: dict) -> dict:
         "children": {},
     }
     await asyncio.to_thread(storage.write_json, RUN_PATH, state)
+    await asyncio.to_thread(
+        run_store.put, CURRENT_RUN, {"runId": state["runId"], "state": "running"}
+    )
     logger.info(
-        "Pipeline started: run=%s action=%s datasets=%s",
+        "Pipeline started: run=%s action=%s datasets=%s slots=%s startInterval=%.1fs",
         state["runId"],
         action,
         len(groups),
+        PROCESS_CONTAINERS,
+        DATASET_START_INTERVAL,
     )
-    lock = asyncio.Lock()
     uncertain = False
+
+    async def save_child(key: str) -> None:
+        state["updatedAt"] = _now()
+        await asyncio.to_thread(
+            run_store.put,
+            _child_key(state["runId"], key),
+            dict(state["children"][key]),
+        )
 
     async def invoke(
         function: modal.Function[..., dict, Any],
@@ -565,27 +654,20 @@ async def run_pipeline(action: str, request: dict) -> dict:
     ) -> dict:
         nonlocal uncertain
         try:
-            async with lock:
-                state["children"][key] = reservation | {
-                    "callId": None,
-                    "state": "pending",
-                }
-                state["updatedAt"] = _now()
-                await asyncio.to_thread(storage.write_json, RUN_PATH, state)
-                call = await function.spawn.aio(*args)
-                logger.info(
-                    "Worker submitted: run=%s work=%s call=%s",
-                    state["runId"],
-                    key,
-                    call.object_id,
-                )
-                state["children"][key].update(callId=call.object_id, state="running")
-                await asyncio.to_thread(storage.write_json, RUN_PATH, state)
+            state["children"][key] = reservation | {"callId": None, "state": "pending"}
+            await save_child(key)
+            call = await function.spawn.aio(*args)
+            logger.info(
+                "Worker submitted: run=%s work=%s call=%s",
+                state["runId"],
+                key,
+                call.object_id,
+            )
+            state["children"][key].update(callId=call.object_id, state="running")
+            await save_child(key)
             result = await call.get.aio()
-            async with lock:
-                state["children"][key]["state"] = result.get("outcome", "succeeded")
-                state["updatedAt"] = _now()
-                await asyncio.to_thread(storage.write_json, RUN_PATH, state)
+            state["children"][key]["state"] = result.get("outcome", "succeeded")
+            await save_child(key)
             return result
         except Exception:
             logger.exception(
@@ -611,10 +693,18 @@ async def run_pipeline(action: str, request: dict) -> dict:
             # Refresh before processing without scanning every remote dataset on
             # subsequent snapshots. Only completed stage records are merged.
             catalog_result = await publish({"updates": []})
+            # Each dataset waits for a free worker slot and then for the pacer,
+            # so long jobs hold slots while short ones cannot burst the quota.
+            slots = asyncio.Semaphore(PROCESS_CONTAINERS)
+            pacer = _StartPacer(DATASET_START_INTERVAL)
 
             async def one(key: str, payload: dict) -> dict:
+                async with slots:
+                    await pacer.wait()
+                    return await dispatch(key, payload)
+
+            async def dispatch(key: str, payload: dict) -> dict:
                 try:
-                    record = await asyncio.to_thread(load_record, storage, key)
                     arguments = payload | {
                         "approvedDeletionPaths": [
                             path
@@ -626,13 +716,11 @@ async def run_pipeline(action: str, request: dict) -> dict:
                         process_dataset,
                         f"{key}:process",
                         (key, state["runId"], arguments),
-                        {
-                            "cytebaseId": key,
-                            "datasetVersionId": str(record.latestVersionId),
-                            "stage": "process",
-                        },
+                        {"cytebaseId": key, "stage": "process"},
                     )
-                    dirty[key] = result.pop("record")
+                    record = result.pop("record", None)
+                    if record is not None:
+                        dirty[key] = record
                     return result
                 except Exception as error:
                     return {
@@ -654,6 +742,16 @@ async def run_pipeline(action: str, request: dict) -> dict:
                 )
                 results.extend(task.result() for task in done)
                 if monotonic() - last_publish >= 60:
+                    logger.info(
+                        "Pipeline progress: run=%s %s",
+                        state["runId"],
+                        _run_progress(
+                            len(groups),
+                            state["children"],
+                            results,
+                            monotonic() - run_started,
+                        ),
+                    )
                     if dirty and not uncertain:
                         updates, dirty = list(dirty.values()), {}
                         try:
@@ -676,6 +774,9 @@ async def run_pipeline(action: str, request: dict) -> dict:
         if catalog_error
         else "completed",
         updatedAt=_now(),
+    )
+    await asyncio.to_thread(
+        run_store.put, CURRENT_RUN, {"runId": state["runId"], "state": state["state"]}
     )
     await asyncio.to_thread(storage.write_json, RUN_PATH, state)
     result: dict[str, Any] = {
@@ -704,13 +805,15 @@ async def run_pipeline(action: str, request: dict) -> dict:
             row["collectionId"] for row in catalog_result["failedCollections"]
         ]
     logger.info(
-        "Pipeline finished: run=%s action=%s state=%s successes=%s failures=%s error=%s",
+        "Pipeline finished: run=%s action=%s state=%s successes=%s failures=%s "
+        "error=%s elapsed=%s",
         state["runId"],
         action,
         state["state"],
         len(result["successes"]),
         len(result["failures"]),
         catalog_error,
+        _duration(monotonic() - run_started),
     )
     return result
 

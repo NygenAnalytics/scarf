@@ -475,7 +475,6 @@ def _check_processing(
             },
             PROCESS_KEY: {
                 "cytebaseId": CYTEBASE_ID,
-                "datasetVersionId": VERSION_ID,
                 "stage": "process",
                 "callId": "fc-process-1",
                 "state": "succeeded",
@@ -528,7 +527,6 @@ def _check_skipped_rerun(
     assert (run["runId"], run["state"]) == ("fc-again", "completed")
     assert run["children"][PROCESS_KEY] == {
         "cytebaseId": CYTEBASE_ID,
-        "datasetVersionId": VERSION_ID,
         "stage": "process",
         "callId": "fc-process-2",
         "state": "skipped",
