@@ -417,6 +417,8 @@ def test_external_artifact_ref_names_an_anchor_assay_when_needed() -> None:
         ExternalArtifactRef("reference-dataset", _ref(), anchor_assay="RNA")
     with pytest.raises(ValueError, match="assay name"):
         ExternalArtifactRef("reference-dataset", datastore_ref, anchor_assay="a/b")
+    with pytest.raises(TypeError, match="anchor_assay must be a string or None"):
+        ExternalArtifactRef("reference-dataset", datastore_ref, anchor_assay=3)
     with pytest.raises(TypeError, match="anchor_assay must be a string"):
         ExternalArtifactRef.from_dict({**serialized, "anchor_assay": None})
 

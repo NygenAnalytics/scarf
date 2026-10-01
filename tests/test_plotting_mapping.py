@@ -769,7 +769,27 @@ def test_mapping_calibration_keeps_the_transfers_other_rules():
     marked.close()
 
 
+def test_label_transfer_plots_require_a_transfer_loader_and_label():
+    with pytest.raises(TypeError, match="does not provide label transfers"):
+        plotting_mapping.mapping_evidence(object(), _TRANSFER_REF, show=False)
+    evidence = pd.DataFrame({"label": ["A"], "voteFraction": [0.9]})
+    store = _controlled_mapping_store(evidence=evidence)
+    for label in ("", None):
+        with pytest.raises(TypeError, match="abstention_label must be"):
+            plotting_mapping.mapping_confusion(
+                store,
+                _TRANSFER_REF,
+                known_labels=np.asarray(["A"]),
+                abstention_label=label,
+                show=False,
+            )
+
+
 def test_mapping_score_rejects_a_malformed_reference_label_source():
+    with pytest.raises(ValueError, match="reference_labels is required"):
+        plotting_mapping.mapping_score(
+            object(), _RESULT_REF, reference=object(), kind="box", show=False
+        )
     for source in ("", 3):
         with pytest.raises(TypeError, match="reference_labels must be"):
             plotting_mapping.mapping_score(
