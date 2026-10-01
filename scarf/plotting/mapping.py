@@ -8,6 +8,7 @@ import warnings
 import numpy as np
 import pandas as pd
 
+from ..mapping.label_transfer import validate_reference_label_source
 from ..mapping.reference import MappingReference
 from ..storage.refs import ArtifactRef
 from ._contracts import (
@@ -140,14 +141,8 @@ def mapping_score(
         raise ValueError("size_by_score is only supported for kind='embedding'")
     if bins < 1:
         raise ValueError("bins must be positive")
-    if reference_labels is not None and not (
-        isinstance(reference_labels, ArtifactRef)
-        or (isinstance(reference_labels, str) and reference_labels)
-    ):
-        raise TypeError(
-            "reference_labels must be a non-empty reference column name or an "
-            "ArtifactRef"
-        )
+    if reference_labels is not None:
+        reference_labels = validate_reference_label_source(reference_labels)
     score_loader = getattr(store, "_mapping_score_data", None)
     if not callable(score_loader):
         raise TypeError("store does not provide mapping score data")
@@ -770,9 +765,11 @@ def mapping_calibration(
     ``transfer`` is a ``label_transfer`` artifact from
     ``DataStore.run_label_transfer``. Each threshold on ``metric`` is applied
     to the transfer's saved candidate labels while its other rules, such as
-    ``max_distance``, stay fixed, so no transfer is recomputed. Without a
-    ``chosen_threshold``, a ``voteFraction`` plot marks the transfer's own
-    ``threshold_fraction``.
+    ``max_distance``, stay fixed, so no transfer is recomputed.
+    ``chosen_threshold`` is added to the thresholds and marked. Without it, a
+    ``voteFraction`` plot marks the transfer's own ``threshold_fraction``; it
+    joins the default thresholds, and with explicit ``thresholds`` it is marked
+    only when it is one of them.
     """
     if n_thresholds < 2:
         raise ValueError("n_thresholds must be at least 2")
@@ -824,8 +821,6 @@ def mapping_calibration(
     if len(values) == 0:
         raise ValueError("No finite metric values with known labels")
     _check_label_types(known[valid & eligible], candidates[valid & eligible])
-    if chosen_threshold is None and metric == "voteFraction":
-        chosen_threshold = label_transfer.threshold_fraction
     if thresholds is None:
         resolved_thresholds = np.unique(
             np.quantile(values, np.linspace(0, 1, n_thresholds))
@@ -838,12 +833,22 @@ def mapping_calibration(
             or not np.isfinite(resolved_thresholds).all()
         ):
             raise ValueError("thresholds must contain finite numeric values")
+    # An explicit chosen_threshold always joins the thresholds. The transfer's
+    # own threshold is marked only on a voteFraction plot, and joins only the
+    # default thresholds, so explicit thresholds are evaluated exactly.
+    marked_threshold = chosen_threshold
     if chosen_threshold is not None:
         if not np.isfinite(chosen_threshold):
             raise ValueError("chosen_threshold must be finite")
         resolved_thresholds = np.unique(
             np.append(resolved_thresholds, chosen_threshold)
         )
+    elif metric == "voteFraction":
+        marked_threshold = label_transfer.threshold_fraction
+        if thresholds is None:
+            resolved_thresholds = np.unique(
+                np.append(resolved_thresholds, marked_threshold)
+            )
     rows: list[dict[str, float | int]] = []
     z_value = 1.959963984540054
     for threshold in resolved_thresholds:
@@ -886,18 +891,20 @@ def mapping_calibration(
         kind="stable",
     ).reset_index(drop=True)
     if (
-        chosen_threshold is not None
+        marked_threshold is not None
         and not np.isclose(
             calibration["threshold"],
-            chosen_threshold,
+            marked_threshold,
         ).any()
     ):
-        warnings.warn(
-            f"chosen_threshold={chosen_threshold:g} retained no mapped cells; "
-            "the threshold marker was omitted",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+        if chosen_threshold is not None:
+            warnings.warn(
+                f"chosen_threshold={chosen_threshold:g} retained no mapped cells; "
+                "the threshold marker was omitted",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        marked_threshold = None
     with theme_context(theme):
         figure, axes, owns = normalize_axes_target(
             target,
@@ -923,9 +930,9 @@ def mapping_calibration(
             color="#2b6cb0",
             linewidth=1.4,
         )
-        if chosen_threshold is not None:
+        if marked_threshold is not None:
             chosen = calibration.loc[
-                np.isclose(calibration["threshold"], chosen_threshold)
+                np.isclose(calibration["threshold"], marked_threshold)
             ]
             if not chosen.empty:
                 selected = chosen.iloc[0]
@@ -939,7 +946,7 @@ def mapping_calibration(
                     zorder=3,
                 )
                 ax.annotate(
-                    f"{metric} = {chosen_threshold:g}",
+                    f"{metric} = {marked_threshold:g}",
                     (
                         float(selected["coverage"]),
                         float(selected["accuracy"]),
@@ -980,6 +987,7 @@ def mapping_calibration(
                 "direction": resolved_direction,
                 "n_thresholds": len(resolved_thresholds),
                 "chosen_threshold": chosen_threshold,
+                "marked_threshold": marked_threshold,
             },
         ),
         owns_figure=owns,

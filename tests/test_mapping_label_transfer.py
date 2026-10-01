@@ -679,6 +679,9 @@ def test_label_transfer_excludes_explicitly_missing_reference_labels(
     )
     # Integer reference labels stay integers.
     assert permissive.labels.tolist() == [1, 1]
+    np.testing.assert_allclose(permissive.label_vote_shares([1, 1]), [0.1, 0.1])
+    with pytest.raises(ValueError, match="only as text"):
+        permissive.label_vote_shares(["1", "1"])
 
 
 def test_label_transfer_excludes_nan_reference_labels(
@@ -808,10 +811,15 @@ def test_label_transfer_reuses_matches_and_refuses_read_only_writes(
         distances=np.array([[1.0, 9.0], [1.0, 9.0]]),
         uninformative=np.array([False, False]),
     )
-    first, _ = _transfer(query, result, reference)
+    first, first_result = _transfer(query, result, reference)
     assert _transfer(query, result, reference)[0] == first
-    refreshed, _ = _transfer(query, result, reference, invalidate_cache=True)
+    refreshed, refreshed_result = _transfer(
+        query, result, reference, invalidate_cache=True
+    )
     assert refreshed != first
+    # The frozen labels are an exact copy, so a forced recompute reuses them.
+    assert refreshed_result.reference_labels == first_result.reference_labels
+    assert len(query.list_artifacts(kind="reference_labels", scope="datastore")) == 1
 
     read_only = DataStore(query.zarr_loc, default_assay="RNA", zarr_mode="r")
     assert read_only.run_label_transfer(
@@ -979,6 +987,103 @@ def test_label_vote_shares_calibrate_prediction_sets(mapping_consumer_context):
     assert sets.name == "predictionSet"
     assert "winner" in sets[0]
     assert sets[1] == ()
+
+
+def test_label_transfer_reads_its_payload_once(mapping_consumer_context, monkeypatch):
+    _, reference, query = mapping_consumer_context
+    _write_reference_labels(reference)
+    result = _write_projection(
+        query,
+        reference,
+        indices=np.array([[0, 1], [0, 1], [1, 0]]),
+        distances=np.array([[1.0, 9.0], [1.0, 9.0], [1.0, 9.0]]),
+        uninformative=np.array([False, True, False]),
+    )
+    query_backing_store = query.zw.store
+    keys: list[str] = []
+    store_type = type(query_backing_store)
+    original_get = store_type.get
+
+    async def recording_get(store, key, prototype, byte_range=None):
+        if store is query_backing_store:
+            keys.append(key)
+        return await original_get(store, key, prototype, byte_range)
+
+    monkeypatch.setattr(store_type, "get", recording_get)
+    metadata = ("zarr.json", ".zarray", ".zattrs", ".zgroup")
+
+    def payload_reads() -> Counter:
+        return Counter(
+            key
+            for key in keys
+            if "/artifacts/label_transfer/" in key and not key.endswith(metadata)
+        )
+
+    transfer = query.run_label_transfer(
+        result,
+        reference=reference,
+        reference_labels="reference_labels",
+    )
+    written = payload_reads()
+    # Blocks are digested as they are written, so only the completion check
+    # reads the payload back, once.
+    assert written and set(written.values()) == {1}
+    keys.clear()
+    query.get_label_transfer(transfer)
+    loaded = payload_reads()
+    assert set(loaded) == set(written)
+    assert set(loaded.values()) == {1}
+
+
+def test_label_transfer_writes_with_the_datastore_storage_profile(
+    mapping_consumer_context,
+    monkeypatch,
+):
+    import scarf.mapping.label_transfer as label_transfer
+
+    _, reference, query = mapping_consumer_context
+    _write_reference_labels(reference)
+    result = _write_projection(
+        query,
+        reference,
+        indices=np.array([[0, 1], [1, 0]]),
+        distances=np.array([[1.0, 9.0], [1.0, 9.0]]),
+        uninformative=np.array([False, False]),
+    )
+    assert query.storageProfile is not None
+    profiles: list[object] = []
+    for name in ("create_metadata_column", "create_zarr_dataset"):
+        original = getattr(label_transfer, name)
+
+        def recording(*args, _original=original, **kwargs):
+            profiles.append(kwargs.get("profile"))
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(label_transfer, name, recording)
+
+    query.run_label_transfer(
+        result,
+        reference=reference,
+        reference_labels="reference_labels",
+    )
+
+    # Frozen reference labels and the transfer share the datastore's profile.
+    assert len(profiles) > 2
+    assert all(profile is query.storageProfile for profile in profiles)
+
+
+def test_unsigned_reference_labels_keep_their_values() -> None:
+    from scarf.mapping.label_transfer import encode_reference_labels
+
+    values = np.array([2**64 - 1, 7, 2**64 - 1], dtype=np.uint64)
+    categories, codes = encode_reference_labels(
+        values,
+        np.array([True, True, False]),
+    )
+
+    assert categories.dtype == np.uint64
+    assert categories.tolist() == [2**64 - 1, 7]
+    assert codes.tolist() == [0, 1, -1]
 
 
 def test_vote_entropy_is_conditional_on_available_labels() -> None:

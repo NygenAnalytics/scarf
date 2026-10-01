@@ -661,11 +661,7 @@ def test_mapping_calibration_rejects_nonfinite_or_unretained_evidence():
         )
 
     finite_evidence = evidence.assign(voteFraction=[0.8, 0.2])
-    # The transfer's own threshold is marked too, so it must retain nothing.
-    store = _controlled_mapping_store(
-        evidence=finite_evidence,
-        threshold_fraction=1.0,
-    )
+    store = _controlled_mapping_store(evidence=finite_evidence)
     with pytest.raises(ValueError, match="No threshold retained"):
         plotting_mapping.mapping_calibration(
             store,
@@ -674,6 +670,65 @@ def test_mapping_calibration_rejects_nonfinite_or_unretained_evidence():
             thresholds=[2.0],
             show=False,
         )
+
+
+def test_mapping_calibration_marks_the_transfer_threshold_without_extra_rows():
+    import warnings
+
+    evidence = pd.DataFrame(
+        {
+            "label": ["A", "B", "B", "A"],
+            "candidateLabel": ["A", "B", "B", "A"],
+            "voteFraction": [0.9, 0.7, 0.4, 0.1],
+        }
+    )
+    known = np.asarray(["A", "B", "A", "B"])
+    store = _controlled_mapping_store(evidence=evidence, threshold_fraction=0.5)
+
+    default = plotting_mapping.mapping_calibration(
+        store, _TRANSFER_REF, known_labels=known, show=False
+    )
+    explicit = plotting_mapping.mapping_calibration(
+        store,
+        _TRANSFER_REF,
+        known_labels=known,
+        thresholds=[0.6, 0.8],
+        show=False,
+    )
+    unreachable = _controlled_mapping_store(evidence=evidence, threshold_fraction=0.95)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        silent = plotting_mapping.mapping_calibration(
+            unreachable, _TRANSFER_REF, known_labels=known, show=False
+        )
+
+    assert 0.5 in default.tables["calibration"]["threshold"].tolist()
+    assert default.provenance.extras["marked_threshold"] == 0.5
+    assert any(
+        text.get_text() == "voteFraction = 0.5"
+        for text in default.axes["mapping_calibration"].texts
+    )
+    # Explicit thresholds are evaluated exactly, without the transfer's own.
+    assert sorted(explicit.tables["calibration"]["threshold"]) == [0.6, 0.8]
+    assert explicit.provenance.extras["marked_threshold"] is None
+    assert explicit.provenance.extras["chosen_threshold"] is None
+    # An implicit marker that retains no cells is omitted without a warning.
+    assert silent.provenance.extras["marked_threshold"] is None
+    for plot in (default, explicit, silent):
+        plot.close()
+
+
+def test_mapping_score_rejects_a_malformed_reference_label_source():
+    for source in ("", 3):
+        with pytest.raises(TypeError, match="reference_labels must be"):
+            plotting_mapping.mapping_score(
+                object(),
+                _RESULT_REF,
+                reference=object(),
+                kind="box",
+                reference_labels=source,
+                show=False,
+            )
 
 
 @pytest.mark.parametrize("bins", [0, -1])

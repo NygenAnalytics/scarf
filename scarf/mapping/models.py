@@ -276,15 +276,16 @@ class LabelTransferResult:
         if values.shape != (self.n_cells,):
             raise ValueError("labels must have one value per projected query cell")
         categories = self.categories.tolist()
-        code_of = {category: code for code, category in enumerate(categories)}
-        category_texts = {str(category) for category in categories}
         missing = np.asarray(pd.isna(values), dtype=bool)
-        codes = np.full(self.n_cells, -1, dtype=np.int64)
-        for row in np.flatnonzero(~missing):
-            code = code_of.get(values[row])
-            if code is not None:
-                codes[row] = code
-            elif str(values[row]) in category_texts:
+        codes = np.asarray(
+            pd.Index(categories, dtype=object).get_indexer(values),
+            dtype=np.int64,
+        )
+        codes[missing] = -1
+        unmatched = (codes < 0) & ~missing
+        if unmatched.any():
+            category_texts = pd.Index([str(category) for category in categories])
+            if (category_texts.get_indexer(values[unmatched].astype(str)) >= 0).any():
                 raise ValueError(
                     "Some labels match a reference class only as text. Convert "
                     "labels to the value type of the reference labels"

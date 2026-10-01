@@ -125,6 +125,20 @@ _TRANSFER_PARAMETERS = frozenset(
 _TRANSFER_INPUTS = frozenset({"projection", "reference_labels", "cell_selection"})
 
 
+def validate_reference_label_source(source: Any) -> str | ArtifactRef:
+    """Return ``source`` when it can name reference labels.
+
+    Reference labels are a non-empty cell-metadata column name, or a
+    cell-label ``ArtifactRef``, of the reference datastore.
+
+    Raises:
+        TypeError: If ``source`` is neither.
+    """
+    if isinstance(source, ArtifactRef) or (isinstance(source, str) and source):
+        return source
+    raise TypeError(_SOURCE_MESSAGE)
+
+
 def read_reference_labels(
     reference: MappingReference,
     source: str | ArtifactRef,
@@ -136,11 +150,10 @@ def read_reference_labels(
     or ``smart_label``. Byte strings are decoded. Missing, blank, and masked
     labels are not usable. Callers validate the reference binding first.
     """
+    source = validate_reference_label_source(source)
     if isinstance(source, str):
-        if not source:
-            raise TypeError(_SOURCE_MESSAGE)
         values, valid = reference._fetch_cell_labels(source)
-    elif isinstance(source, ArtifactRef):
+    else:
         if source.kind not in GROUPING_VALUE_NAMES:
             raise ValueError(
                 "reference_labels artifacts must hold cell labels, such as "
@@ -155,8 +168,6 @@ def read_reference_labels(
         )
         values = resolved.values
         valid = valid_category_mask(values, missing_mask=resolved.missing_mask)
-    else:
-        raise TypeError(_SOURCE_MESSAGE)
     labels = np.asarray(values)
     usable = np.asarray(valid, dtype=bool)
     expected_shape = (reference.selected_cell_count,)
@@ -173,9 +184,9 @@ def encode_reference_labels(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return the reference classes and one class code per reference cell.
 
-    Classes keep the order in which they first occur. Integer, floating, and
-    boolean labels keep their value type; other labels are stored as text.
-    Unusable labels get code -1.
+    Classes keep the order in which they first occur. Signed and unsigned
+    integer, floating, and boolean labels keep their value type; other labels
+    are stored as text. Unusable labels get code -1.
     """
     labels = np.asarray(values)
     usable = np.asarray(valid, dtype=bool)
@@ -189,8 +200,10 @@ def encode_reference_labels(
 
 def _stored_categories(classes: np.ndarray, source_dtype: np.dtype[Any]) -> np.ndarray:
     kind = np.dtype(source_dtype).kind
-    if kind in "iu":
+    if kind == "i":
         return np.asarray(classes, dtype=np.int64)
+    if kind == "u":
+        return np.asarray(classes, dtype=np.uint64)
     if kind == "f":
         return np.asarray(classes, dtype=np.float64)
     if kind == "b":
@@ -305,13 +318,18 @@ def plan_reference_labels(
     )
 
 
-def write_reference_labels(root: zarr.Group, plan: ReferenceLabelsPlan) -> ArtifactRef:
+def write_reference_labels(
+    root: zarr.Group,
+    plan: ReferenceLabelsPlan,
+    *,
+    profile: StorageProfile | None = None,
+) -> ArtifactRef:
     """Write planned frozen reference labels unless a matching copy exists."""
     if plan.reused:
         return plan.ref
     with artifact_transaction(root, plan.artifact) as group:
-        _write_vector(group, "categories", plan.categories)
-        _write_vector(group, "codes", plan.codes)
+        _write_vector(group, "categories", plan.categories, profile)
+        _write_vector(group, "codes", plan.codes, profile)
     return plan.ref
 
 
@@ -609,6 +627,10 @@ def write_label_transfer(
     categories = plan.categories
     with artifact_transaction(root, plan.artifact) as group:
         arrays = _create_transfer_arrays(group, plan, rows_per_chunk, profile)
+        # Digest the blocks as they are written, so the payload is not read
+        # back to fingerprint it.
+        digests = _BlockDigests(arrays)
+        digests.add("categories", 0, categories)
         next_row = 0
         for start, block in blocks:
             if start != next_row:
@@ -622,24 +644,79 @@ def write_label_transfer(
             abstained = block.label_codes < 0
             labels = np.zeros(len(abstained), dtype=categories.dtype)
             labels[~abstained] = categories[block.label_codes[~abstained]]
-            arrays[_LABELS][start:stop] = labels
-            arrays[_LABELS_MISSING][start:stop] = abstained
-            arrays["abstention_reason"][start:stop] = block.abstention_reason
-            arrays["vote_class_codes"][start:stop] = block.vote_class_codes
-            arrays["vote_class_fractions"][start:stop] = block.vote_class_fractions
-            for name in _EVIDENCE_ARRAYS:
-                arrays[name][start:stop] = getattr(block, name)
+            rows = {
+                _LABELS: labels,
+                _LABELS_MISSING: abstained,
+                "abstention_reason": block.abstention_reason,
+                "vote_class_codes": block.vote_class_codes,
+                "vote_class_fractions": block.vote_class_fractions,
+                **{name: getattr(block, name) for name in _EVIDENCE_ARRAYS},
+            }
+            for name, values in rows.items():
+                arrays[name][start:stop] = values
+                digests.add(name, start, values)
             next_row = stop
         if next_row != plan.n_cells:
             raise RuntimeError(
                 "Label transfer did not cover every projected query cell"
             )
-        group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
-            group,
-            _TRANSFER_ARRAYS,
-            arrays=arrays,
-        )
+        group.attrs["payload_fingerprint"] = _payload_fingerprint(digests.finish())
     return plan.ref
+
+
+class _BlockDigests:
+    """Digest each payload array from the contiguous blocks written to it."""
+
+    def __init__(self, arrays: Mapping[str, zarr.Array]) -> None:
+        self._builders: dict[str, ValueFingerprintBuilder] = {}
+        for name, array in arrays.items():
+            builder = ValueFingerprintBuilder()
+            builder.begin_array(name, tuple(array.shape), np.dtype(array.dtype))
+            self._builders[name] = builder
+
+    def add(self, name: str, start: int, values: np.ndarray) -> None:
+        block = np.asarray(values)
+        offset = (start,) + (0,) * (block.ndim - 1)
+        self._builders[name].update_array_block(name, offset, block)
+
+    def finish(self) -> dict[str, str]:
+        digests = {}
+        for name, builder in self._builders.items():
+            builder.end_array(name)
+            digests[name] = builder.hexdigest()
+        return digests
+
+
+def _array_digest(name: str, values: np.ndarray) -> str:
+    """Digest one payload array held in memory."""
+    builder = ValueFingerprintBuilder()
+    builder.update_array(name, values)
+    return builder.hexdigest()
+
+
+def _payload_fingerprint(array_digests: Mapping[str, str]) -> str:
+    """Combine one digest per payload array into the payload fingerprint.
+
+    Each array is digested on its own, so a writer can fingerprint the blocks
+    it writes and a loader the arrays it reads, without another pass.
+    """
+    if set(array_digests) != set(_TRANSFER_ARRAYS):
+        raise ValueError("Label transfer digests do not cover its payload arrays")
+    builder = ValueFingerprintBuilder()
+    for name in _TRANSFER_ARRAYS:
+        builder.update_bytes(name, array_digests[name].encode())
+    return builder.hexdigest()
+
+
+def _require_payload_fingerprint(
+    group: zarr.Group,
+    array_digests: Mapping[str, str],
+) -> None:
+    stored_fingerprint = group.attrs["payload_fingerprint"]
+    if not isinstance(stored_fingerprint, str) or stored_fingerprint != (
+        _payload_fingerprint(array_digests)
+    ):
+        raise ValueError("Label transfer payload fingerprint does not match its arrays")
 
 
 def _create_transfer_arrays(
@@ -713,13 +790,13 @@ def _create_transfer_arrays(
     return arrays
 
 
-def _validate_transfer_payload(
+def _transfer_payload_arrays(
     group: zarr.Group,
     *,
     n_cells: int | None = None,
     n_neighbors: int | None = None,
-    categories: np.ndarray | None = None,
 ) -> dict[str, zarr.Array]:
+    """Open the payload arrays after checking their layout, without reading them."""
     if set(group.group_keys()):
         raise ValueError("Label transfer payload contains unexpected groups")
     if set(group.array_keys()) != set(_TRANSFER_ARRAYS):
@@ -756,15 +833,26 @@ def _validate_transfer_payload(
         raise ValueError("Label transfer labels have no linked missing-label mask")
     if any(set(array.attrs) for name, array in arrays.items() if name != _LABELS):
         raise ValueError("Label transfer arrays carry unexpected attributes")
-    if categories is not None:
-        stored = np.asarray(stored_categories[:])
-        if stored.dtype != categories.dtype or not np.array_equal(stored, categories):
-            raise ValueError("Label transfer classes differ from its reference labels")
-    stored_fingerprint = group.attrs["payload_fingerprint"]
-    if not isinstance(stored_fingerprint, str) or stored_fingerprint != (
-        fingerprint_stored_arrays(group, _TRANSFER_ARRAYS, arrays=arrays)
-    ):
-        raise ValueError("Label transfer payload fingerprint does not match its arrays")
+    return arrays
+
+
+def _validate_transfer_payload(
+    group: zarr.Group,
+    *,
+    n_cells: int,
+    n_neighbors: int,
+    categories: np.ndarray,
+) -> dict[str, zarr.Array]:
+    """Validate the payload layout, classes, and fingerprint in one read."""
+    arrays = _transfer_payload_arrays(group, n_cells=n_cells, n_neighbors=n_neighbors)
+    digests = {
+        name: fingerprint_stored_arrays(group, (name,), arrays=arrays)
+        for name in _TRANSFER_ARRAYS
+    }
+    # Equal digests mean equal classes, so the classes are not read twice.
+    if digests["categories"] != _array_digest("categories", categories):
+        raise ValueError("Label transfer classes differ from its reference labels")
+    _require_payload_fingerprint(group, digests)
     return arrays
 
 
@@ -804,10 +892,11 @@ def _load_label_transfer(root: zarr.Group, ref: ArtifactRef) -> LabelTransferRes
     projection = _input_ref(status, "projection", kind="projection", assay=ref.assay)
     reference_labels = _input_ref(status, "reference_labels", kind="reference_labels")
     cell_selection = _input_ref(status, "cell_selection", kind="cell_selection")
-    arrays = _validate_transfer_payload(artifact_group(root, ref))
+    group = artifact_group(root, ref)
+    arrays = _transfer_payload_arrays(group)
     n_cells, n_neighbors = (int(size) for size in arrays["vote_class_codes"].shape)
     _validate_projection_input(root, projection, cell_selection, n_neighbors)
-    source = _reference_label_source(root, reference_labels)
+    source = _stored_reference_label_source(root, reference_labels)
     if validate_cell_selection(root, cell_selection).selected_count != n_cells:
         raise ValueError("Label transfer rows do not match its query cell selection")
     cell_idx = read_stored_selection_indices(
@@ -819,7 +908,12 @@ def _load_label_transfer(root: zarr.Group, ref: ArtifactRef) -> LabelTransferRes
         table_path="cellData",
     ).astype(np.int64, copy=False)
 
+    # Read each array once and verify the fingerprint on the values read.
     values = {name: np.asarray(array[:]) for name, array in arrays.items()}
+    _require_payload_fingerprint(
+        group,
+        {name: _array_digest(name, values[name]) for name in _TRANSFER_ARRAYS},
+    )
     categories = values["categories"]
     reason = values["abstention_reason"]
     abstained = values[_LABELS_MISSING].astype(bool)
@@ -938,10 +1032,11 @@ def _validate_projection_input(
         raise ValueError("Label transfer votes do not match the projection neighbors")
 
 
-def _reference_label_source(
+def _stored_reference_label_source(
     root: zarr.Group,
     ref: ArtifactRef,
 ) -> str | ExternalArtifactRef:
+    """Return the label source that a frozen reference_labels artifact records."""
     status = inspect_artifact(root, ref)
     if not status.exists or not status.complete:
         raise ValueError(

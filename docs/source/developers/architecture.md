@@ -216,11 +216,16 @@ The complete hard-break inventory is:
   reference cell-label artifact, into the query datastore as a `reference_labels` artifact and saves
   a `label_transfer` artifact; `get_label_transfer` loads it without the reference. An abstention is
   a missing label with an `abstentionReason` rather than an `na_val` string, `max_distance` applies
-  to the saved labels, and `target_subset` is removed. `mapping_evidence`, `mapping_confusion`, and
-  `mapping_calibration` take the transfer ref instead of a projection, reference, and threshold;
-  `mapping_calibration` marks the transfer's own threshold by default, and `mapping_confusion`
-  names the abstention column with `abstention_label`. `mapping_score` takes `reference_labels` in
-  place of `reference_class_group`. `ExternalArtifactRef` gains `anchor_assay` for an artifact of
+  to the saved labels, and `target_subset` is removed. Evidence renames `isUnknown` to `abstained`
+  and adds `candidateLabel` and `nearestDistance`. It no longer repeats the projection's
+  `featureCoverage` and `queryScaledDispersion` on every row; read them from
+  `get_mapping_result(...).diagnostics`. Conformal sets come from
+  `LabelTransferResult.prediction_sets` instead of a `predictionSet` column. `mapping_evidence`,
+  `mapping_confusion`, and `mapping_calibration` take the transfer ref instead of a projection,
+  reference, and threshold. Without a `chosen_threshold`, `mapping_calibration` marks the
+  transfer's own threshold on a `voteFraction` plot, and `mapping_confusion` names the abstention
+  column with `abstention_label`. `mapping_score` takes `reference_labels` in place of
+  `reference_class_group`. `ExternalArtifactRef` gains `anchor_assay` for an artifact of
   another datastore that is not scoped to the assay its dataset fingerprint describes.
 - Integration label metrics are split by input contract. `metric_clisi` and
   `metric_graph_connectivity` use the keyword `annotation_column` for imported cell metadata;

@@ -31,6 +31,7 @@ from ...mapping.label_transfer import (
     plan_reference_labels,
     read_reference_labels,
     transfer_label_block,
+    validate_reference_label_source,
     write_label_transfer,
     write_reference_labels,
 )
@@ -95,16 +96,6 @@ def _finite_in_range(
     if high is not None and resolved > high:
         raise ValueError(message)
     return resolved
-
-
-def _reference_label_source(value: Any) -> str | ArtifactRef:
-    """Validate a reference label source: a column name or a label artifact."""
-    if isinstance(value, ArtifactRef) or (isinstance(value, str) and value):
-        return value
-    raise TypeError(
-        "reference_labels must be a non-empty reference cell-metadata column "
-        "name or an ArtifactRef of a reference cell-label artifact"
-    )
 
 
 def _store_locations(datastore: Any) -> set[str]:
@@ -694,7 +685,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         label artifact; a reference cell without a usable label has class None.
         """
         if reference_labels is not None:
-            reference_labels = _reference_label_source(reference_labels)
+            reference_labels = validate_reference_label_source(reference_labels)
         loaded = self.get_mapping_result(result, reference=reference, load_arrays=False)
         scores = list(
             self._mapping_scores(
@@ -871,7 +862,8 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             max_distance: Largest distance to the nearest reference neighbor
                 that assigns a label. ``None`` sets no distance limit.
             invalidate_cache: Compute a new transfer even when a matching one
-                exists.
+                exists. Frozen reference labels with the same fingerprint are
+                still reused, because they are an exact copy.
 
         Returns:
             Reference to the immutable ``label_transfer`` artifact. Load it
@@ -886,7 +878,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             raise TypeError("projection must be an ArtifactRef")
         if not isinstance(reference, MappingReference):
             raise TypeError("reference must be a MappingReference")
-        source = _reference_label_source(reference_labels)
+        source = validate_reference_label_source(reference_labels)
         threshold = _finite_in_range(
             threshold_fraction,
             "threshold_fraction must be between zero and one",
@@ -909,12 +901,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             reference=reference,
             load_arrays=False,
         )
-        frozen_labels = plan_reference_labels(
-            self.zw,
-            loaded.reference,
-            source,
-            invalidate_cache=invalidate_cache,
-        )
+        frozen_labels = plan_reference_labels(self.zw, loaded.reference, source)
         indices, distances, uninformative = self._projection_arrays(loaded.ref)
         transfer = plan_label_transfer(
             self.zw,
@@ -931,7 +918,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         if transfer.reused:
             return transfer.ref
         self._require_writable("run_label_transfer")
-        write_reference_labels(self.zw, frozen_labels)
+        write_reference_labels(self.zw, frozen_labels, profile=self.storageProfile)
         reference_codes = frozen_labels.codes
         distance_percentiles = ReferenceDistancePercentiles.from_reference(
             loaded.reference
