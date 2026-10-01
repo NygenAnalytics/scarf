@@ -135,7 +135,6 @@ pd.Series(
 )
 ```
 
-
 ```{code-cell}
 figure, axes = plt.subplots(2, 3, figsize=(11, 7))
 panels = (
@@ -167,12 +166,11 @@ axes.flat[-1].set_visible(False)
 figure.tight_layout()
 ```
 
-CD3, CD19, CD14, and CD56 support T-cell, B-cell, monocyte, and NK-like regions on the integrated layout. Agreement with imported publication labels is useful evidence, not proof that every local
-WNN relationship is correct.
+CD3, CD19, CD14, and CD56 light up the T-cell, B-cell, monocyte, and NK-like regions of the integrated layout, respectively. Agreement with the imported publication labels is useful evidence, not proof that every local WNN relationship is correct.
 
 ## Inspect all three modality weights
 
-### Question: where does each local neighbourhood contribute most strongly?
+It can be also be useful on the final WNN graph to see how each individual weight of each assay contributes to the overall graph. We can ask from this, from each of the 3 modalities, for each local neighborhood, what assay contributes the strongest?
 
 ```{code-cell}
 ds.plots.modality_weights(
@@ -181,17 +179,4 @@ ds.plots.modality_weights(
 )
 ```
 
-The plotting API validates that the stored weights are finite, non-negative, sum to one per cell,
-follow the persisted assay order, and align to the exact WNN layout selection. A high weight reports
-relative local predictability under these reductions and neighbourhoods. It is not molecular
-abundance, global assay quality, or causal importance.
-
-The N-way weighting equations, candidate construction, and differences from Seurat belong in the
-{doc}`../reference/api/integration` contract. The prepared UMAP is a Scarf result and is not intended
-to reproduce the publication UMAP.
-
-Data attribution:
-
-- Swanson et al. (2021), [TEA-seq](https://doi.org/10.7554/eLife.63632)
-- [GEO GSM5123951](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSM5123951)
-- eLife Figure 4 source data 2
+For interpretation, a high weight means that assay best predicts the cell's own neighbors under these specific assay, nothing else really. It is not how much of said molecule/protein/open chromatin that was measured, not which assay is better overall, and not proof that one modality causes the cell's identity. It is simply a way to see what assay is driving the construction of the final WNN graph.
