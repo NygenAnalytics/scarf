@@ -85,7 +85,9 @@ counts in Cytebase.
 
 A planned extension will also host `data.zarr` stores processed and annotated
 through Scarf's agent workflow, so users can connect to those published results
-as well. See {doc}`tutorials/cytebase` for the current connection and analysis workflow.
+as well. See {doc}`tutorials/cytebase` for the current connection and analysis workflow,
+{doc}`tutorials/cytebase_covid19` for a disease case study, and the
+{ref}`example notebooks <cytebase_example_notebooks>` for a catalog tour and a UMAP gallery.
 
 ### Scratch acceleration with local_cache
 
