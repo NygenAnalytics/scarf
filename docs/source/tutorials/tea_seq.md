@@ -11,7 +11,6 @@ kernelspec:
   language: python
   name: python3
 ---
-
 # Three-way WNN with TEA-seq
 
 TEA-seq measures RNA, chromatin accessibility, and surface proteins in the same cells. This
@@ -29,7 +28,7 @@ Published Figure 4 labels cover 6,333 well-W3 cells. Exact barcode matching find
 labels in the pinned object, and only those matches are active for this analysis. The missing 139
 publication cells are not replaced with arbitrary unlabeled cells.
 
-```{code-cell} ipython3
+```{code-cell}
 import matplotlib.pyplot as plt
 import pandas as pd
 
@@ -51,7 +50,7 @@ ds = scarf.DataStore(
 
 The raw feature counts stay on disk. This summary reads only array shapes and active feature masks.
 
-```{code-cell} ipython3
+```{code-cell}
 pd.DataFrame.from_dict(
     {
         assay: {
@@ -73,7 +72,9 @@ has a self-free 20-neighbour row over the same 6,194 cells.
 
 ## Compare the modality-specific views
 
-```{code-cell} ipython3
+With our initial data from the seq, its important to ask if all the 3 assays contain the same coarse populations in roughly the arrangement in all 3 maps. Essentially, we want to see similar sizes of our cell types across the data modalities to see if they agree, telling us which populations exist and roughly where do they sit relative to each other.
+
+```{code-cell}
 modality_layouts = {}
 for assay in ("RNA", "ATAC", "ADT"):
     [modality_layouts[assay]] = ds.list_artifacts(
@@ -82,11 +83,8 @@ for assay in ("RNA", "ATAC", "ADT"):
         operation="run_umap",
         complete_only=True,
     )
-```
 
-### Question: do all three assays retain the broad publication populations?
 
-```{code-cell} ipython3
 figure, axes = plt.subplots(1, 3, figsize=(12, 4))
 for axis, (assay, layout) in zip(
     axes,
@@ -106,12 +104,11 @@ for axis, (assay, layout) in zip(
 figure.tight_layout()
 ```
 
-Broad agreement supports a shared signal. Local rearrangements can reflect complementary
-measurement or modality-specific noise, so visual compactness alone is not validation.
-
 ## Reopen the three-way WNN result
 
-```{code-cell} ipython3
+After we confirm the above, we now want to understand if the jointly generated map preserve the similar cell type labels and protein landmarks? The WNN approach is better explained in {doc}`cite_seq` & {doc}`multimodal_diagnostics` if you want to gain a more deep understanding of the method.
+
+```{code-cell}
 [wnn_graph] = ds.list_artifacts(
     scope="datastore",
     kind="integrated_graph",
@@ -138,9 +135,8 @@ pd.Series(
 )
 ```
 
-### Question: does the joint map preserve labels and protein landmarks?
 
-```{code-cell} ipython3
+```{code-cell}
 figure, axes = plt.subplots(2, 3, figsize=(11, 7))
 panels = (
     (None, None, "Publication cell type"),
@@ -171,15 +167,14 @@ axes.flat[-1].set_visible(False)
 figure.tight_layout()
 ```
 
-CD3, CD19, CD14, and CD56 support T-cell, B-cell, monocyte, and NK-like regions on the integrated
-layout. Agreement with imported publication labels is useful evidence, not proof that every local
+CD3, CD19, CD14, and CD56 support T-cell, B-cell, monocyte, and NK-like regions on the integrated layout. Agreement with imported publication labels is useful evidence, not proof that every local
 WNN relationship is correct.
 
 ## Inspect all three modality weights
 
 ### Question: where does each local neighbourhood contribute most strongly?
 
-```{code-cell} ipython3
+```{code-cell}
 ds.plots.modality_weights(
     graph=wnn_graph,
     layout=wnn_layout,
