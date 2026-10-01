@@ -13,7 +13,7 @@ kernelspec:
 ---
 # Fate Mapping Primer
 
-During embryonic development, the pancreas builds its hormone-producing endocrine cells from a pool of progenitor cells. Around embryonic day 15.5 in the mouse, Ductal-like progenitors differentiate into the three major endocrine fates: Alpha cells (glucagon), Beta cells (insulin), and Delta cells (somatostatin). Single-cell RNA sequencing captures cells at discrete points along this transition, but each measurement is a snapshot. It shows cell states, not the direction of travel between them; Fate mapping can be utilized to speculate the end result of the cell state.
+During embryonic development, the pancreas builds its hormone-producing endocrine cells from a pool of progenitor cells. Around embryonic day 15.5 in the mouse, Ductal-like progenitors differentiate into the three major endocrine fates: Alpha cells (glucagon), Beta cells (insulin), and Delta cells (somatostatin). Single-cell RNA sequencing captures cells at discrete points along this transition, but each measurement is a snapshot. It shows cell states, not the direction of travel between them; fate mapping speculates about the end result of the cell state.
 
 Fate mapping models branching as an **absorbing Markov chain** over the cell graph, with random walks directed forward along pseudotime:
 
@@ -23,17 +23,17 @@ Fate mapping models branching as an **absorbing Markov chain** over the cell gra
 
 We can think of pseudotime analysis and fate mapping as answering two fundamentally different questions on a branching path:
 
-- Pseudotime measures how far a cell has traveled along differentiation (like a single progress bar), but the issue is that, a single number cannot represent a fork in the road, or a cell differentiating into a different state. Pseudotime can indicate that a cell si differentiating, but not down what math
+- Pseudotime measures how far a cell has traveled along differentiation (like a single progress bar), but the issue is that, a single number cannot represent a fork in the road, or a cell differentiating into a different state. Pseudotime can indicate that a cell is differentiating, but not down what path.
 - Fate mapping estimates which branch that cell is likely to take, being a step further than pseudotime. For each cell we have, fate mapping will output a probability for every candidate destination.
 
-These probabilities are an exploratory mathematical summary, and do not provide biological proof that a cell is pursuing this lineage. Fate mapping simply reflects how closely a cell is connected to your chosen endpoints across this specific graph in terms of the mathematics. They do not track living cells over time, and they cannot rescue bad biological assumptions: if you pick the wrong terminal endpoints, the algorithm will still produce clean, confident probabilities toward the wrong destinations, thus maintaing an accurate biological context is key before performing psuedotime mapping.
+These probabilities are an exploratory mathematical summary, and do not provide biological proof that a cell is pursuing this lineage. Fate mapping simply reflects how closely a cell is connected to your chosen endpoints across this specific graph in terms of the mathematics. They do not track living cells over time, and they cannot rescue bad biological assumptions: if you pick the wrong terminal endpoints, the algorithm will still produce clean, confident probabilities toward the wrong destinations, thus maintaining an accurate biological context is key before performing pseudotime mapping.
 
 
 # Estimate terminal-outcome probabilities with fate mapping
 
-Here, we use a pre-run analysis of the developing pancreas to orient a graph from Ductal progenitors toward Alpha, Beta, and Delta fates, then estimate how terminal probability distributes across three candidate sinks. The objective is learning to supervise endpoints and read probability artifacts, not establishing the true lineage of this tissue.
+Here, we use a pre-run analysis of the developing pancreas to orient a graph from Ductal progenitor cells we discussed toward final fates of Alpha, Beta, or Delta cells. Following this, we use this information to estimate how terminal probability distributes across all three candidate outcomes.
 
-## 1. Reuse the prepared graph and sink labels
+## Reuse the prepared graph and sink labels
 
 ```{code-cell}
 import matplotlib.pyplot as plt
@@ -71,15 +71,16 @@ sink_labels_ref = analysis_run["clusters"]
 sink_labels = analysis_run.cells.fetch("clusters")
 ```
 
-The rebuilt catalog store contains the completed `docs_default` pipeline run. This page reuses its
-exact graph, selected clustering, and UMAP. The literal `clusters` column contains the published
-cell-type annotations used only to orient pseudotime. The new pseudotime and fate results remain
-exact artifacts.
+Since single-cell neighbor graphs are undirected, a connection between two cells means they look similar, not that one comes before the other (one cell is a precursor of another). To give the graph an arrow of time, we define a potential gradient with the source/sink vector. We can conceptually think of the source/sink vector as (bear with me) a pressure difference across a plumbing network; by pumping water in at the progenitor cells (the start of the graph) and opening the drains at the mature cell types (the terminal of the graph), we can create a continuous downhill slope across the graph that guides flow through the intermediate states.
 
-The source/sink vector above is the supervision. Ductal cells each carry an equal share of negative source mass while the sink cells share positive mass, so the vector sums to zero by construction; `run_pseudotime_scoring` rejects vectors that do not. Note the two kinds of objects in play: `sink_labels_ref` is the immutable cluster artifact the fate operator records as lineage, while `sink_labels` holds the live label values used for the terminal-label arithmetic.
+In this plumbing analogy, the total volume pumped in must exactly equal the volume draining out. The negative source mass ({math}`-1.0`) is divided evenly across all Ductal cells, marking the "start here" point (where the water flows in), and the positive sink mass ({math}`+1.0`) is shared across the mature Alpha, Beta, and Delta cells, marking the "end here" ends (where the water flows out). With this, the total sum is at zero.
 
-Rather than picking endpoints with an automated heuristic such as highest pseudotime, this page selects terminal sinks the way a real analysis should: from known lineage markers. In the murine embryonic pancreas, Ductal progenitors differentiate into Alpha (glucagon, *Gcg*), Beta (insulin, *Ins1*/*Ins2*), and Delta (somatostatin, *Sst*) hormone lineages. The cell below resolves those three biological names to the run's integer sink labels through majority annotation, and fails loudly if a fate is missing or ambiguous. A real analysis should choose and validate endpoints from
-study-specific evidence.
+This per-cell weighting is deliberate feature here, as dividing mass by group size prevents abundant populations from exerting an unfair gravitational pull over rarer cell types simply due to having a larger cell count. The resulting pressure drop turns undirected neighbor links into a directed downstream flow; Once again, our undirected neighbors are simply are similar cells in a neighborhood. Scoring the graph against it yields pseudotime, which is the continuous coordinate that tracks how far each cell has drifted from the initial progenitor pool (THE START).
+
+
+To truly start the fate-mapping, we need to define the clusters we want to study. These clusters are defined via unsupervised clustering, which assigns cells to arbitrary numbers like cluster 3 or cluster 11. The issue is that developmental biology is defined by functional marker expression, not by clusters: Alpha cells produce glucagon (Gcg), Beta cells produce insulin (Ins1/Ins2), and Delta cells produce somatostatin (Sst). Rather than taking a circular shortcut, such as crowning whichever clusters score the highest pseudotime, we define terminal sinks directly from these biological priors, because only marker-grounded endpoints can support a trustworthy fate map.
+
+
 
 ```{code-cell}
 candidate_fates = ["Alpha", "Beta", "Delta"]
@@ -123,7 +124,7 @@ pd.DataFrame(
 
 The three labels above come from lineage markers, not from ranking pseudotime, and the table reports each pick's majority share so the mapping stays auditable. That choice breaks a loop worth naming: had the sinks been picked by greatest mean pseudotime, annotations would have oriented the graph, the orientation would have produced pseudotime, and pseudotime would then have picked the sinks, rewarding sequencing-depth artifacts, outlier populations, or technical dead ends with terminus status. Never copy a highest-pseudotime rule into a real pipeline as endpoint discovery. In a real analysis, endpoints must come from study-specific evidence (for example, marker-supported terminal states reviewed against negative controls, as in {doc}`annotation`), because every downstream probability inherits the choice. A defensible sink is one whose probability mass concentrates near its own label on the map below; a sink whose probability spreads evenly or peaks elsewhere is a rejected hypothesis, not a discovery.
 
-## 2. Compute fate probabilities
+## Compute the fate probabilities
 
 ```{code-cell}
 # Execute fate mapping across all three lineages.
