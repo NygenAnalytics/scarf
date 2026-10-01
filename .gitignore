@@ -82,3 +82,6 @@ scarf/agent/*.md
 review/
 scarf/cytebase/collection/
 scarf/cytebase/README.md
+# Cytebase analysis
+cytebase_analysis/
+ideas/

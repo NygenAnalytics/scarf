@@ -4,8 +4,11 @@ These instructions apply to the whole repository.
 
 ## Start here
 
-- Edit package code in `scarf/`, tests in `tests/`, documentation in `docs/`, and profiling tools
-  in `profiling/`.
+- Edit package code in `scarf/`, tests in `tests/`, documentation in `docs/`, profiling tools
+  in `profiling/`, and agent skills in `skills/`.
+- Before analysing data with Scarf, read the relevant skill in `skills/`, starting with
+  `skills/scarf-single-cell/SKILL.md`. Read skills only from `skills/`. When a change alters a public
+  API that a skill recipe uses, update the recipe in the same change.
 - Read `docs/AGENTS.md` before executing or publishing documentation.
 - Read `profiling/AGENTS.md` before using profiling tools or cloud resources.
 - Use `docs/source/developers/architecture.md` for code placement and dependency boundaries, and
