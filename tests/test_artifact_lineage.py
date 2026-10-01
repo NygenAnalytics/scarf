@@ -577,3 +577,55 @@ def test_datastore_lineage_validates_reference_fingerprints_and_root_conflicts(
     del first_root["RNA"].attrs["dataset_fingerprint"]
     with pytest.raises(ValueError, match="not prepared"):
         datastore.lineage(target, references=first)
+
+
+def test_lineage_resolves_anchored_external_datastore_inputs() -> None:
+    query_root = zarr.open_group(store=MemoryStore(), mode="w")
+    reference_root = zarr.open_group(store=MemoryStore(), mode="w")
+    reference_root.create_group("RNA").attrs["dataset_fingerprint"] = (
+        "reference-dataset"
+    )
+    cell_selection = _ref("cell_selection", "6", scope="datastore")
+    labels = _ref("smart_label", "7", scope="datastore")
+    _write_artifact(
+        reference_root,
+        cell_selection,
+        operation="manual_selection",
+        inputs={},
+    )
+    _write_artifact(
+        reference_root,
+        labels,
+        operation="smart_label",
+        inputs={"cell_selection": cell_selection},
+    )
+    external_labels = ExternalArtifactRef(
+        "reference-dataset",
+        labels,
+        anchor_assay="RNA",
+    )
+    frozen = _ref("reference_labels", "8", scope="datastore")
+    _write_artifact(
+        query_root,
+        frozen,
+        operation="freeze_reference_labels",
+        inputs={"source_labels": external_labels},
+    )
+
+    lineage = ArtifactLineage.from_store(
+        query_root,
+        frozen,
+        external_roots={"reference-dataset": reference_root},
+    )
+    external_selection = ExternalArtifactRef(
+        "reference-dataset",
+        cell_selection,
+        anchor_assay="RNA",
+    )
+
+    assert set(lineage.graph) == {frozen, external_labels, external_selection}
+    assert lineage.graph.nodes[external_labels]["status"].operation == "smart_label"
+    assert lineage.graph.edges[external_selection, external_labels]["inputs"] == (
+        "cell_selection",
+    )
+    assert "unresolved external" not in lineage.to_markdown()

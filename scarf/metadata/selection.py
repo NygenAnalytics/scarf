@@ -52,6 +52,7 @@ GROUPING_VALUE_NAMES: dict[str, str] = {
     "cluster_cut": "labels",
     "cluster_labels": "values",
     "hto_identity": "values",
+    "label_transfer": "labels",
     "smart_label": "values",
 }
 

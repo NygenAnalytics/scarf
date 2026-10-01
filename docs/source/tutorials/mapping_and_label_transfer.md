@@ -108,7 +108,8 @@ Its `feature_selection` field pins the exact reference feature artifact rather t
 Its feature order, scaling, PCA loadings, neighbour index, and selected cells stay fixed in the reference datastore.
 `reference_layout` is the immutable UMAP from the same run and is used only to show where query
 weight landed.
-The mapping reference does not contain that layout or copy the reference labels.
+The mapping reference does not contain that layout or the reference labels. Label transfer
+freezes the labels it uses when it runs (section 5).
 
 This example intentionally uses a plain PCA reference. A Harmony-backed Symphony reference is
 appropriate only when the reference neighbours were corrected using genuine technical-batch
@@ -123,11 +124,15 @@ technical batch. When no defensible technical batch exists, use the plain-PCA pa
 It aligns query features to the reference panel, applies the reference normalization and scaling, projects into the reference PCA space, and stores the nearest neighbours.
 Query cells are never inserted into the reference index.
 
+We map the cells of the query's own pipeline run, so that the results can be drawn on that run's
+UMAP later.
+
 ```{code-cell} ipython3
-query_cell_selection = ds_stim.snapshot_cell_selection("I")
+query_run = ds_stim.pipeline.open(label="docs_default")
+query_layout = query_run["umap"]
 mapping_ref = ds_stim.run_mapping(
     reference,
-    query_cell_selection,
+    query_run["analysis_cell_selection"],
     query_assay="RNA",
     save_k=5,
     missing_feature_policy="reference_mean",
@@ -170,9 +175,12 @@ mapping.diagnostics
 A mapping score tells you which reference cells received neighbour weight from the query. This can be plotted on the reference UMAP.
 Since one panel for the whole query becomes hard to read due to the weight being spread across many cells,
 we can split by a few known query populations to see whether each population lands on the matching reference region.
+The author labels of the mapped cells are read in the order of the run's cells.
 
 ```{code-cell} ipython3
-query_labels = np.asarray(ds_stim.cells.fetch("cluster_labels")).astype(str)
+mapped_rows = np.flatnonzero(query_run.cells.fetch_all("I"))
+query_labels = np.asarray(ds_stim.cells.fetch_all("cluster_labels"))[mapped_rows]
+query_labels = query_labels.astype(str)
 focus = {"CD 14 Mono", "CD4 Memory T", "CD4 naive T", "NK"}
 score_groups = np.array(
     [label if label in focus else "other" for label in query_labels],
@@ -196,64 +204,70 @@ Alternatively, concentration in an unrelated pocket suggests a domain shift or a
 ## 5. Transfer labels and inspect evidence
 
 Label transfer aggregates neighbour weights for each query cell.
-The winning label must clear `threshold_fraction`; otherwise Scarf returns `NA`.
+The winning label must clear `threshold_fraction`; otherwise the cell abstains and gets no label.
 A high vote fraction only means the neighbours agreed.
 It is not a calibrated probability that the label is biologically correct.
 
+`run_label_transfer` saves the result as an immutable `label_transfer` artifact in the query
+datastore and returns its reference. It first freezes the reference labels it reads into the query
+datastore, so later edits to the reference annotations cannot change this result.
+
 ```{code-cell} ipython3
-transferred_labels = ds_stim.get_target_classes(
+transfer_ref = ds_stim.run_label_transfer(
     mapping_ref,
-    reference_class_group="cluster_labels",
     reference=reference,
+    reference_labels="cluster_labels",
     threshold_fraction=0.6,
 )
-ds_stim.cells.insert(
-    "transferred_labels",
-    transferred_labels.to_numpy(),
-    overwrite=True,
-)
-accepted = transferred_labels.notna() & transferred_labels.ne("NA")
-accepted.value_counts().rename(
-    index={True: "accepted", False: "abstained"}
+transfer = ds_stim.get_label_transfer(transfer_ref)
+transfer.labels.notna().value_counts().rename(
+    index={True: "labelled", False: "abstained"}
 ).rename("query cells")
 ```
 
-Plot the transferred labels on the query UMAP.
-In the plot below, the `NA` category is abstention geography, i.e. those cells did not clear the vote threshold.
+An abstained cell has a missing label, and the `abstentionReason` column of `transfer.evidence`
+says why:
 
-`get_target_classes()` sets `NA` under the circumstances when:
-- the winning vote fraction is below `threshold_fraction`
-- neighbour votes tie, or
-- the cell is uninformative, i.e. it has no counts in any reference feature that the query measured.
+- `below_threshold`: the winning vote fraction is below `threshold_fraction`
+- `tied_vote`: two labels received the same neighbour weight
+- `uninformative_cell`: the cell has no counts in any reference feature that the query measured
+- `no_labeled_neighbors`: no neighbour has a usable reference label
+- `beyond_max_distance`: the nearest reference neighbour is farther than `max_distance`, when one is set
 
 Uninformative cells also add nothing to mapping scores.
 
+```{code-cell} ipython3
+transfer.evidence["abstentionReason"].value_counts()
+```
+
+Plot the transferred labels on the query UMAP.
+A label artifact colours an embedding directly, so nothing is written into the query cell metadata.
+Abstained cells are drawn as missing, which shows the geography of abstention.
 
 ```{code-cell} ipython3
 ds_stim.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by=["cluster_labels", "transferred_labels"],
+    layout=query_layout,
+    color_by=["cluster_labels", transfer_ref],
     figsize=(10, 4),
 )
 ```
 
-`mapping_evidence` plots diagnostics from `get_target_label_evidence`; they do not trigger abstention on their own:
+`mapping_evidence` plots the evidence saved with the transfer. These metrics do not trigger
+abstention on their own:
 
 - `voteFraction`: how much neighbour weight supports the winning label
 - `topTwoMargin`: how far the winner sits above the runner-up
 - `referenceDistancePercentile`: how unusual the query cell is relative to reference neighbour distances
 
-To force abstention by distance, pass `max_distance` to the evidence APIs.
+To also abstain by distance, pass `max_distance` to `run_label_transfer`. That saves a second
+transfer and leaves this one unchanged.
 
 ```{code-cell} ipython3
 ds_stim.plots.mapping_evidence(
-    mapping_ref,
-    reference=reference,
-    reference_class_group="cluster_labels",
+    transfer_ref,
     target_groups=query_labels,
     metrics=("voteFraction", "topTwoMargin", "referenceDistancePercentile"),
     kind="box",
-    threshold_fraction=0.6,
     figsize=(14, 4),
 )
 ```
@@ -263,31 +277,26 @@ with the transferred labels.
 
 ```{code-cell} ipython3
 ds_stim.plots.mapping_confusion(
-    mapping_ref,
-    reference=reference,
-    reference_class_group="cluster_labels",
+    transfer_ref,
     known_labels=query_labels,
     normalize="true",
-    threshold_fraction=0.6,
 )
 ```
 
 The diagonal is recall within each known query label.
 Off-diagonal blocks are systematic swaps.
-The `NA` predicted label here represents the abstention, cells that did not receive a transferred label.
+The `Abstained` column holds the cells that did not receive a transferred label.
 Take note of the monocyte rows in this figure: stimulated CD14 Mono and DC often spill into CD16 Mono rather than a clean match, which is a domain-shift failure mode rather than a plotting artifact.
 
 Because known labels are available, `mapping_calibration` shows how label accuracy trades off against retained coverage as the vote threshold rises.
-The red marker is the `threshold_fraction` used above.
+It applies each threshold to the candidate labels saved with the transfer, so nothing is recomputed.
+The red marker is the transfer's own `threshold_fraction`.
 Higher thresholds keep fewer cells and usually raise accuracy among the cells that remain.
 
 ```{code-cell} ipython3
 ds_stim.plots.mapping_calibration(
-    mapping_ref,
-    reference=reference,
-    reference_class_group="cluster_labels",
+    transfer_ref,
     known_labels=query_labels,
-    chosen_threshold=0.6,
 )
 ```
 
@@ -353,7 +362,9 @@ If the scores were spread across multiple unrelated clusters, then it would be r
 
 ## 7. Reuse and govern a prepared atlas
 
-In a later session, retain the mapping-reference and projection artifact refs, reopen both stores, and reload the exact results:
+In a later session, retain the mapping-reference, projection, and label-transfer artifact refs,
+reopen both stores, and reload the exact results. A saved transfer loads from the query datastore
+alone:
 
 ```{code-cell} ipython3
 reference = ds_ctrl.get_mapping_reference(reference_ref)
@@ -361,18 +372,35 @@ reloaded_mapping = ds_stim.get_mapping_result(
     mapping_ref,
     reference=reference,
 )
-reloaded_mapping.n_cells, reloaded_mapping.correction_method
+reloaded_transfer = ds_stim.get_label_transfer(transfer_ref)
+(
+    reloaded_mapping.n_cells,
+    reloaded_mapping.correction_method,
+    reloaded_transfer.reference_label_source,
+    reloaded_transfer.threshold_fraction,
+)
 ```
 
 For repeated use, reopen the prepared reference datastore read-only and run each mapping in a
 separate writable query datastore. If query counts come from a read-only source or the same physical
 store used to prepare the reference, use `mount_datastore` to create that separate query store.
 
-Reference labels are resolved from `reference_class_group` when labels are transferred; they are not
-frozen inside `MappingReference`. Treat a published reference store as read-only. If annotations
-must change, name their column for its biological meaning, such as `curated_cell_type`, and select
-that column explicitly in the mapping workflow. Retain the layout artifact separately when mapping
-scores must be displayed on the original reference UMAP.
+Reference labels are frozen when labels are transferred. `run_label_transfer` copies the labels it
+reads into the query datastore as a `reference_labels` artifact, which records their source column
+or artifact and a fingerprint of their values. Transferring again with unchanged labels and settings
+reuses the saved transfer. After the reference annotations change, the same call saves a new
+transfer next to the old one, and the old transfer keeps its labels. Reference labels can also be a
+cell-label artifact of the reference datastore, such as a clustering or a `smart_label`
+relabelling. Retain the layout artifact separately when mapping scores must be displayed on the
+original reference UMAP.
+
+The lineage of a transfer follows its inputs into the reference datastore: from the query labels
+through the threshold, the frozen reference labels, and the projection, to the reference model and
+the cells it was built from.
+
+```{code-cell} ipython3
+ds_stim.lineage(transfer_ref, references=reference)
+```
 
 Validate a reused atlas with feature coverage, mapping evidence, abstention, and score concentration.
 When independent query labels exist, also inspect confusion and threshold calibration. A visually

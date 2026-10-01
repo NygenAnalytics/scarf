@@ -35,6 +35,7 @@ _EXPECTED_EXPORTS = {
     "SeuratInspectResult": "scarf.readers",
     "SeuratReader": "scarf.readers",
     "SeuratToZarr": "scarf.writers",
+    "LabelTransferResult": "scarf.mapping.models",
     "MappingReference": "scarf.mapping.reference",
     "MappingResult": "scarf.mapping.models",
     "mount_datastore": "scarf.datastore.datastore",
@@ -403,6 +404,7 @@ def test_domain_packages_export_canonical_objects():
             "scarf.features",
             "select_highly_variable_features",
         ): "scarf.features.variability",
+        ("scarf.mapping", "LabelTransferResult"): "scarf.mapping.models",
         ("scarf.mapping", "MappingReference"): "scarf.mapping.reference",
         ("scarf.mapping", "MappingResult"): "scarf.mapping.models",
         (

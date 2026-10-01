@@ -164,6 +164,13 @@ mermaid_source = lineage.to_mermaid()
 This identifies the exact selections, normalization, coordinates, and graph behind a result and
 shows where branches diverge.
 
+An input stored in another datastore, such as the mapping reference behind a query projection, is
+recorded as an `ExternalArtifactRef`. It names the other datastore by the prepared dataset
+fingerprint of one of its assays; `anchor_assay` names that assay when the artifact is
+datastore-scoped or belongs to another assay. Pass the mapping references to
+`DataStore.lineage(target, references=...)` to follow such inputs into their datastores; without
+them, an external input is shown as unresolved.
+
 `ArtifactResolutionError` is a `ValueError` with a machine-readable `code` and JSON-safe
 `context`. Failures distinguish missing or incomplete artifacts, wrong kind/scope/assay, changed
 row identity or selection values, corrupt payloads, and incompatible artifact contracts. The error

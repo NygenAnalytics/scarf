@@ -45,10 +45,10 @@ _METHODS = {
         "run_umap",
     ),
     MappingDatastore: (
+        "get_label_transfer",
         "get_mapping_result",
         "get_mapping_score",
-        "get_target_classes",
-        "get_target_label_evidence",
+        "run_label_transfer",
         "run_mapping",
     ),
     DataStore: (
@@ -96,7 +96,7 @@ _METHODS = {
 _SIGNATURE_DIGESTS = {
     BaseDataStore: "b0a25c0e7fcf56aeddafc4a7436f7cb049dcbf9175ba8cb41365c3d878ac30b0",
     GraphDataStore: "0e3510e49b10db97e8e0cda982d629791dcd748f4f5130e4d3ebcfb9d2b9fa7d",
-    MappingDatastore: "bdcd18e0e07f363a095848aeacc64fa28a83a1641c97aefb13a091be0dc583fb",
+    MappingDatastore: "541a98e827777344e20a9ef41447117de26bfdf97278890336217acba3c95b88",
     DataStore: "e3df7f866e8852021d53ca50bc0b6488923c59d8b8728542f639ba0063333944",
 }
 
@@ -119,6 +119,19 @@ def test_datastore_public_class_chain_is_stable():
     assert MappingDatastore.__module__ == "scarf.datastore.mapping_datastore"
     assert GraphDataStore.__module__ == "scarf.datastore.graph_datastore"
     assert BaseDataStore.__module__ == "scarf.datastore.base_datastore"
+
+
+def test_live_label_transfer_readers_are_removed():
+    # Label transfer is a saved artifact: run_label_transfer produces it and
+    # get_label_transfer loads it.
+    for name in (
+        "get_target_classes",
+        "get_target_label_evidence",
+        "_label_transfer_codes",
+        "_reference_label_codes",
+        "_iter_label_votes",
+    ):
+        assert not hasattr(MappingDatastore, name)
 
 
 def test_stored_graph_path_lookup_is_removed():
@@ -156,7 +169,6 @@ def test_datastore_static_method_contracts_are_stable():
         MappingDatastore: (
             "_projection_block_size",
             "_query_batch_design",
-            "_reference_label_codes",
         ),
         DataStore: ("_write_marker_slot",),
     }

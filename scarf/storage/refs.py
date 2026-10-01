@@ -33,6 +33,7 @@ ARTIFACT_KINDS = frozenset(
         "hto_identity",
         "integrated_graph",
         "imported_coordinates",
+        "label_transfer",
         "mapping_reference",
         "marker_table",
         "membership_strength",
@@ -45,6 +46,7 @@ ARTIFACT_KINDS = frozenset(
         "pseudotime_markers",
         "quality_metric",
         "reduction",
+        "reference_labels",
         "sampling",
         "smart_label",
         "statistical_tests",
@@ -136,8 +138,17 @@ class ArtifactRef:
 
 @dataclass(frozen=True, slots=True)
 class ExternalArtifactRef:
+    """One exact artifact in another datastore.
+
+    ``dataset_fingerprint`` identifies the other datastore by the prepared
+    dataset fingerprint of one of its assays, the anchor assay. The anchor is
+    the artifact's own assay unless ``anchor_assay`` names another one, which
+    a datastore-scoped artifact, or an artifact of a different assay, must do.
+    """
+
     dataset_fingerprint: str
     ref: ArtifactRef
+    anchor_assay: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.dataset_fingerprint, str):
@@ -146,27 +157,49 @@ class ExternalArtifactRef:
             raise ValueError("dataset_fingerprint must be non-empty")
         if not isinstance(self.ref, ArtifactRef):
             raise TypeError("ref must be an ArtifactRef")
-        if self.ref.scope != "assay" or self.ref.assay is None:
+        if self.anchor_assay is None:
+            if self.ref.scope != "assay" or self.ref.assay is None:
+                raise ValueError(
+                    "External artifact references require an assay-scoped "
+                    "ArtifactRef or an anchor_assay"
+                )
+            return
+        if not isinstance(self.anchor_assay, str):
+            raise TypeError("anchor_assay must be a string or None")
+        if not self.anchor_assay or "/" in self.anchor_assay:
+            raise ValueError("anchor_assay must be an assay name")
+        if self.anchor_assay == self.ref.assay:
             raise ValueError(
-                "External artifact references require an assay-scoped ArtifactRef"
+                "anchor_assay is set only when it differs from the artifact's assay"
             )
 
+    @property
+    def fingerprint_assay(self) -> str:
+        """The assay of the other datastore that ``dataset_fingerprint`` describes."""
+        assay = self.ref.assay if self.anchor_assay is None else self.anchor_assay
+        assert assay is not None
+        return assay
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value: dict[str, Any] = {
             "type": "external_artifact",
             "dataset_fingerprint": self.dataset_fingerprint,
             "ref": self.ref.to_dict(),
         }
+        if self.anchor_assay is not None:
+            value["anchor_assay"] = self.anchor_assay
+        return value
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ExternalArtifactRef":
         if not isinstance(value, Mapping):
             raise TypeError("External artifact reference must be a mapping")
-        expected_keys = {"type", "dataset_fingerprint", "ref"}
-        if set(value) != expected_keys:
+        required_keys = {"type", "dataset_fingerprint", "ref"}
+        if set(value) not in (required_keys, required_keys | {"anchor_assay"}):
             raise ValueError(
                 "External artifact reference must contain exactly "
-                "'type', 'dataset_fingerprint', and 'ref'"
+                "'type', 'dataset_fingerprint', and 'ref', and may add "
+                "'anchor_assay'"
             )
         if value["type"] != "external_artifact":
             raise ValueError(
@@ -178,13 +211,13 @@ class ExternalArtifactRef:
         raw_ref = value["ref"]
         if not isinstance(raw_ref, Mapping):
             raise TypeError("External artifact ref must be a mapping")
-        if set(raw_ref) != {"type", "scope", "kind", "artifact_id", "assay"}:
-            raise ValueError(
-                "External artifact ref must be a complete assay artifact reference"
-            )
+        anchor_assay = value.get("anchor_assay")
+        if "anchor_assay" in value and not isinstance(anchor_assay, str):
+            raise TypeError("anchor_assay must be a string")
         return cls(
             dataset_fingerprint=dataset_fingerprint,
             ref=ArtifactRef.from_dict(raw_ref),
+            anchor_assay=anchor_assay,
         )
 
 

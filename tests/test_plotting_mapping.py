@@ -24,6 +24,9 @@ from tests.test_mapping_label_transfer import (
 _RESULT_REF = ArtifactRef(
     scope="assay", assay="RNA", kind="projection", artifact_id="a" * 64
 )
+_TRANSFER_REF = ArtifactRef(
+    scope="assay", assay="RNA", kind="label_transfer", artifact_id="b" * 64
+)
 
 
 @pytest.fixture
@@ -91,6 +94,11 @@ def plotting_mapping_context(analyzed_datastore_ephemeral, tmp_path: Path):
         distances=distances,
         uninformative=uninformative,
     )
+    transfer = query.run_label_transfer(
+        result,
+        reference=reference,
+        reference_labels="mapping_label",
+    )
     return {
         "reference": reference,
         "reference_layout": reference_layout,
@@ -98,6 +106,7 @@ def plotting_mapping_context(analyzed_datastore_ephemeral, tmp_path: Path):
         "reference_labels": reference_labels,
         "query": query,
         "result": result,
+        "transfer": transfer,
         "query_groups": np.asarray(["q1", "q1", "q2", "q2", "q1", "q2"]),
         "known_labels": np.asarray(["A", "A", "B", "B", "A", "B"]),
     }
@@ -112,6 +121,8 @@ def _controlled_mapping_store(
     evidence: pd.DataFrame | None = None,
     score_rows: list[tuple[object, np.ndarray]] | None = None,
     n_reference: int | None = None,
+    threshold_fraction: float = 0.5,
+    max_distance: float | None = None,
 ):
     if n_reference is None:
         if score_rows:
@@ -127,7 +138,11 @@ def _controlled_mapping_store(
     )
     methods = {}
     if evidence is not None:
-        methods["get_target_label_evidence"] = lambda *_args, **_kwargs: evidence.copy()
+        methods["get_label_transfer"] = lambda *_args, **_kwargs: SimpleNamespace(
+            evidence=evidence.copy(),
+            threshold_fraction=threshold_fraction,
+            max_distance=max_distance,
+        )
     if score_rows is not None:
         methods["_mapping_score_data"] = lambda *_args, **_kwargs: (
             mapping,
@@ -174,11 +189,10 @@ def test_mapping_plot_families_use_query_result_and_reference_semantics(
         layout=context["layout_ref"],
         show=False,
     )
+    transfer = context["transfer"]
     evidence = splt.mapping_evidence(
         query,
-        result,
-        reference=reference,
-        reference_class_group="mapping_label",
+        transfer,
         target_groups=query_groups,
         metrics=("voteFraction", "topTwoMargin"),
         show=False,
@@ -189,7 +203,7 @@ def test_mapping_plot_families_use_query_result_and_reference_semantics(
         reference=reference,
         target_groups=query_groups,
         kind="box",
-        reference_class_group="mapping_label",
+        reference_labels="mapping_label",
         show=False,
     )
     sized = splt.mapping_score(
@@ -203,17 +217,13 @@ def test_mapping_plot_families_use_query_result_and_reference_semantics(
     )
     confusion = splt.mapping_confusion(
         query,
-        result,
-        reference=reference,
-        reference_class_group="mapping_label",
+        transfer,
         known_labels=known_labels,
         show=False,
     )
     calibration = splt.mapping_calibration(
         query,
-        result,
-        reference=reference,
-        reference_class_group="mapping_label",
+        transfer,
         known_labels=known_labels,
         n_thresholds=3,
         chosen_threshold=0.75,
@@ -244,13 +254,20 @@ def test_mapping_plot_families_use_query_result_and_reference_semantics(
     mapped_sizes = sized_collections[1].get_sizes()
     assert mapped_sizes.min() > background_sizes.max()
     assert np.ptp(mapped_sizes) > 0
-    assert confusion.tables["counts"].set_index("known").loc["A", "A"] >= 2
+    counts = confusion.tables["counts"].set_index("known")
+    assert counts.loc["A", "A"] == 2
+    assert counts.loc["A", "Abstained"] == 1
+    assert counts.loc["B", "B"] == 3
     assert {"precision", "recall", "support"} <= set(confusion.tables["perClass"])
     assert {"coverage", "accuracy", "accuracyLower", "accuracyUpper"} <= set(
         calibration.tables["calibration"]
     )
     assert calibration.tables["calibration"]["coverage"].between(0, 1).all()
-    assert binding_checks == 6
+    for plot in (evidence, confusion, calibration):
+        assert plot.provenance.extras["label_transfer"] == transfer.to_dict()
+    assert evidence.provenance.extras["threshold_fraction"] == 0.5
+    # Only the score plots read the reference; transfer plots read saved results.
+    assert binding_checks == 3
 
     for plot in (
         score,
@@ -285,9 +302,7 @@ def test_mapping_evidence_box_kind_draws_one_box_per_query_group(
     context = plotting_mapping_context
     evidence = splt.mapping_evidence(
         context["query"],
-        context["result"],
-        reference=context["reference"],
-        reference_class_group="mapping_label",
+        context["transfer"],
         target_groups=context["query_groups"],
         metrics=("voteFraction",),
         kind="box",
@@ -310,7 +325,7 @@ def test_mapping_score_box_kind_groups_by_reference_class(
         reference=context["reference"],
         target_groups=context["query_groups"],
         kind="box",
-        reference_class_group="mapping_label",
+        reference_labels="mapping_label",
         show=False,
     )
 
@@ -343,9 +358,7 @@ def test_mapping_calibration_allows_genuine_zero_accuracy(
     context = plotting_mapping_context
     plot = splt.mapping_calibration(
         context["query"],
-        context["result"],
-        reference=context["reference"],
-        reference_class_group="mapping_label",
+        context["transfer"],
         known_labels=np.asarray(["B", "B", "A", "A", "B", "A"]),
         n_thresholds=3,
         show=False,
@@ -363,13 +376,16 @@ def test_mapping_calibration_rejects_pairwise_label_type_mismatch(
     numeric_labels = np.zeros(reference.selected_cell_count, dtype=np.int64)
     numeric_labels[:4] = [1, 1, 2, 2]
     _write_reference_column(reference, "mapping_numeric_label", numeric_labels)
+    transfer = context["query"].run_label_transfer(
+        context["result"],
+        reference=reference,
+        reference_labels="mapping_numeric_label",
+    )
 
     with pytest.raises(ValueError, match="after text conversion"):
         splt.mapping_calibration(
             context["query"],
-            context["result"],
-            reference=reference,
-            reference_class_group="mapping_numeric_label",
+            transfer,
             known_labels=np.asarray(["1", "1", "2", "2", "1", "2"]),
             n_thresholds=3,
             show=False,
@@ -383,9 +399,7 @@ def test_mapping_calibration_warns_when_threshold_retains_nothing(
     with pytest.warns(RuntimeWarning, match="retained no mapped cells"):
         plot = splt.mapping_calibration(
             context["query"],
-            context["result"],
-            reference=context["reference"],
-            reference_class_group="mapping_label",
+            context["transfer"],
             known_labels=context["known_labels"],
             chosen_threshold=2.0,
             n_thresholds=3,
@@ -408,9 +422,7 @@ def test_mapping_diagnostic_plots_accept_caller_owned_targets(
     figure, axes = pyplot.subplots(1, 2)
     plot = splt.mapping_evidence(
         context["query"],
-        context["result"],
-        reference=context["reference"],
-        reference_class_group="mapping_label",
+        context["transfer"],
         metrics=("voteFraction", "topTwoMargin"),
         target={
             "voteFraction": axes[0],
@@ -430,9 +442,12 @@ def test_mapping_plots_do_not_project_or_weight_coordinates(
     plotting_mapping_context,
     monkeypatch: pytest.MonkeyPatch,
 ):
+    import scarf.mapping.label_transfer as label_transfer
+
     context = plotting_mapping_context
     query = context["query"]
     result = context["result"]
+    transfer = context["transfer"]
     reference = context["reference"]
     score_rows = list(
         query.get_mapping_score(
@@ -441,24 +456,18 @@ def test_mapping_plots_do_not_project_or_weight_coordinates(
             reference=reference,
         )
     )
-    evidence = query.get_target_label_evidence(
-        result,
-        reference_class_group="mapping_label",
-        reference=reference,
-    )
 
     def cached_scores(*args, **kwargs):
         yield from score_rows
-
-    def cached_evidence(*args, **kwargs):
-        return evidence.copy()
 
     def unexpected(*args, **kwargs):
         raise AssertionError("plotting attempted mapping computation")
 
     monkeypatch.setattr(type(query), "_mapping_scores", cached_scores)
-    monkeypatch.setattr(type(query), "get_target_label_evidence", cached_evidence)
     monkeypatch.setattr(mapping_confidence, "distance_weights", unexpected)
+    # Transfer plots read the saved votes and never vote again.
+    monkeypatch.setattr(label_transfer, "distance_weights", unexpected)
+    monkeypatch.setattr(label_transfer, "_label_vote_block", unexpected)
 
     plots = (
         splt.mapping_score(
@@ -475,14 +484,12 @@ def test_mapping_plots_do_not_project_or_weight_coordinates(
             reference=reference,
             target_groups=context["query_groups"],
             kind="box",
-            reference_class_group="mapping_label",
+            reference_labels="mapping_label",
             show=False,
         ),
         splt.mapping_evidence(
             query,
-            result,
-            reference=reference,
-            reference_class_group="mapping_label",
+            transfer,
             target_groups=context["query_groups"],
             metrics=("voteFraction",),
             kind="box",
@@ -490,17 +497,13 @@ def test_mapping_plots_do_not_project_or_weight_coordinates(
         ),
         splt.mapping_confusion(
             query,
-            result,
-            reference=reference,
-            reference_class_group="mapping_label",
+            transfer,
             known_labels=context["known_labels"],
             show=False,
         ),
         splt.mapping_calibration(
             query,
-            result,
-            reference=reference,
-            reference_class_group="mapping_label",
+            transfer,
             known_labels=context["known_labels"],
             n_thresholds=3,
             show=False,
@@ -515,7 +518,7 @@ def test_mapping_calibration_respects_direction_and_draws_uncertainty():
     evidence = pd.DataFrame(
         {
             "label": ["A", "B", "B", "A"],
-            "isUnknown": [False, False, False, False],
+            "candidateLabel": ["A", "B", "B", "A"],
             "voteFraction": [0.9, 0.7, 0.4, 0.1],
             "meanNeighborDistance": [0.1, 0.3, 0.6, 0.9],
             "customConfidence": [0.9, 0.7, 0.4, 0.1],
@@ -526,9 +529,7 @@ def test_mapping_calibration_respects_direction_and_draws_uncertainty():
 
     higher = plotting_mapping.mapping_calibration(
         store,
-        _RESULT_REF,
-        reference=object(),
-        reference_class_group="label",
+        _TRANSFER_REF,
         known_labels=known,
         metric="voteFraction",
         direction="auto",
@@ -538,9 +539,7 @@ def test_mapping_calibration_respects_direction_and_draws_uncertainty():
     )
     lower = plotting_mapping.mapping_calibration(
         store,
-        _RESULT_REF,
-        reference=object(),
-        reference_class_group="label",
+        _TRANSFER_REF,
         known_labels=known,
         metric="meanNeighborDistance",
         direction="auto",
@@ -549,9 +548,7 @@ def test_mapping_calibration_respects_direction_and_draws_uncertainty():
     )
     explicit = plotting_mapping.mapping_calibration(
         store,
-        _RESULT_REF,
-        reference=object(),
-        reference_class_group="label",
+        _TRANSFER_REF,
         known_labels=known,
         metric="customConfidence",
         direction="higher",
@@ -629,7 +626,7 @@ def test_mapping_calibration_rejects_malformed_threshold_controls(
     evidence = pd.DataFrame(
         {
             "label": ["A", "B"],
-            "isUnknown": [False, False],
+            "candidateLabel": ["A", "B"],
             "voteFraction": [0.8, 0.2],
             "customConfidence": [0.8, 0.2],
         }
@@ -639,9 +636,7 @@ def test_mapping_calibration_rejects_malformed_threshold_controls(
     with pytest.raises(ValueError, match=message):
         plotting_mapping.mapping_calibration(
             store,
-            _RESULT_REF,
-            reference=object(),
-            reference_class_group="label",
+            _TRANSFER_REF,
             known_labels=np.asarray(["A", "B"]),
             show=False,
             **kwargs,
@@ -652,7 +647,7 @@ def test_mapping_calibration_rejects_nonfinite_or_unretained_evidence():
     evidence = pd.DataFrame(
         {
             "label": ["A", "B"],
-            "isUnknown": [False, False],
+            "candidateLabel": ["A", "B"],
             "voteFraction": [np.nan, np.nan],
         }
     )
@@ -660,21 +655,21 @@ def test_mapping_calibration_rejects_nonfinite_or_unretained_evidence():
     with pytest.raises(ValueError, match="No finite metric values"):
         plotting_mapping.mapping_calibration(
             store,
-            _RESULT_REF,
-            reference=object(),
-            reference_class_group="label",
+            _TRANSFER_REF,
             known_labels=np.asarray(["A", "B"]),
             show=False,
         )
 
     finite_evidence = evidence.assign(voteFraction=[0.8, 0.2])
-    store = _controlled_mapping_store(evidence=finite_evidence)
+    # The transfer's own threshold is marked too, so it must retain nothing.
+    store = _controlled_mapping_store(
+        evidence=finite_evidence,
+        threshold_fraction=1.0,
+    )
     with pytest.raises(ValueError, match="No threshold retained"):
         plotting_mapping.mapping_calibration(
             store,
-            _RESULT_REF,
-            reference=object(),
-            reference_class_group="label",
+            _TRANSFER_REF,
             known_labels=np.asarray(["A", "B"]),
             thresholds=[2.0],
             show=False,
@@ -727,7 +722,7 @@ def test_mapping_plots_reject_empty_and_misaligned_data():
     evidence = pd.DataFrame(
         {
             "label": ["A", "B"],
-            "isUnknown": [False, False],
+            "candidateLabel": ["A", "B"],
             "voteFraction": [0.8, 0.2],
         }
     )
@@ -735,9 +730,7 @@ def test_mapping_plots_reject_empty_and_misaligned_data():
     with pytest.raises(ValueError, match="one value per mapped cell"):
         plotting_mapping.mapping_evidence(
             evidence_store,
-            _RESULT_REF,
-            reference=object(),
-            reference_class_group="label",
+            _TRANSFER_REF,
             target_groups=["only-one"],
             metrics=("voteFraction",),
             show=False,
@@ -745,9 +738,7 @@ def test_mapping_plots_reject_empty_and_misaligned_data():
     with pytest.raises(ValueError, match="cannot contain missing values"):
         plotting_mapping.mapping_evidence(
             evidence_store,
-            _RESULT_REF,
-            reference=object(),
-            reference_class_group="label",
+            _TRANSFER_REF,
             target_groups=["first", None],
             metrics=("voteFraction",),
             show=False,
@@ -755,18 +746,14 @@ def test_mapping_plots_reject_empty_and_misaligned_data():
     with pytest.raises(ValueError, match="metrics must be non-empty"):
         plotting_mapping.mapping_evidence(
             evidence_store,
-            _RESULT_REF,
-            reference=object(),
-            reference_class_group="label",
+            _TRANSFER_REF,
             metrics=(),
             show=False,
         )
     with pytest.raises(KeyError, match="Unknown evidence metrics"):
         plotting_mapping.mapping_evidence(
             evidence_store,
-            _RESULT_REF,
-            reference=object(),
-            reference_class_group="label",
+            _TRANSFER_REF,
             metrics=("missingMetric",),
             show=False,
         )
@@ -790,7 +777,7 @@ def test_mapping_categorical_legends_serialize_and_owned_figures_close(
     evidence = pd.DataFrame(
         {
             "label": ["A", "B", "A"],
-            "isUnknown": [False, False, False],
+            "candidateLabel": ["A", "B", "A"],
             "voteFraction": [0.9, 0.4, 0.7],
         }
     )
@@ -817,9 +804,7 @@ def test_mapping_categorical_legends_serialize_and_owned_figures_close(
     )
     evidence_plot = plotting_mapping.mapping_evidence(
         store,
-        _RESULT_REF,
-        reference=object(),
-        reference_class_group="label",
+        _TRANSFER_REF,
         target_groups=["beta", "alpha", "beta"],
         metrics=("voteFraction",),
         categorical_scale=scale,

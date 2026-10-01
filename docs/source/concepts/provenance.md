@@ -29,6 +29,11 @@ flowchart LR
 The branches share counts, selections, and normalization. Their reductions and downstream graphs
 remain distinct because those inputs differ. No branch becomes an implicit current result.
 
+Inputs that could change are frozen before a result uses them. Label transfer, for example, copies
+the reference labels it reads into the query datastore, so the saved query labels keep pointing at
+the exact annotations, threshold, and projection that produced them, even after the reference
+atlas is re-annotated.
+
 A {py:class}`~scarf.PipelineRun` adds one durable record for a complete workflow invocation. It
 binds named outputs and frozen cell and feature views without changing the artifact identity rules.
 

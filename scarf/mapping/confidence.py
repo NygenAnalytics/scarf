@@ -177,19 +177,28 @@ def distance_weights(distances: np.ndarray) -> np.ndarray:
 
 @dataclass(slots=True)
 class _LabelVotes:
+    """Weighted neighbor votes of a block of query rows, before any decision.
+
+    ``class_codes`` lists the classes that each row's neighbors voted for, in
+    the order of their first neighbor and padded with -1, and ``fractions``
+    gives each class's share of the row's neighbor weight. ``winner_codes`` is
+    the class with the largest share; it is decisive only where
+    ``has_labeled_votes`` is true and ``is_tied`` is false.
+    """
+
     class_codes: np.ndarray
     fractions: np.ndarray
-    prediction_codes: np.ndarray
+    winner_codes: np.ndarray
     vote_fraction: np.ndarray
     vote_entropy: np.ndarray
     top_two_margin: np.ndarray
-    is_unknown: np.ndarray
+    has_labeled_votes: np.ndarray
+    is_tied: np.ndarray
 
 
 def _label_vote_block(
     neighbor_codes: np.ndarray,
     weights: np.ndarray,
-    threshold: float,
 ) -> _LabelVotes:
     """Aggregate categorical votes in neighbor order using bounded row buffers."""
     n_rows, n_neighbors = neighbor_codes.shape
@@ -241,11 +250,12 @@ def _label_vote_block(
     return _LabelVotes(
         class_codes=class_codes,
         fractions=fractions,
-        prediction_codes=class_codes[np.arange(n_rows), best],
+        winner_codes=class_codes[np.arange(n_rows), best],
         vote_fraction=top,
         vote_entropy=entropy,
         top_two_margin=top - second,
-        is_unknown=(labeled_total <= 0) | (top < threshold) | (ties != 1),
+        has_labeled_votes=labeled_total > 0,
+        is_tied=ties > 1,
     )
 
 

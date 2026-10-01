@@ -69,11 +69,7 @@ def _external_groups(
     return groups
 
 
-def _check_label_types(
-    known: np.ndarray,
-    predicted: np.ndarray,
-    reference_class_group: str,
-) -> None:
+def _check_label_types(known: np.ndarray, predicted: np.ndarray) -> None:
     """Reject known labels that match transferred labels only as text."""
     textual_matches = np.fromiter(
         (
@@ -86,9 +82,21 @@ def _check_label_types(
     if np.any(textual_matches & ~(predicted == known)):
         raise ValueError(
             "Some known_labels only equal their transferred labels after text "
-            "conversion. Convert known_labels to the value type stored "
-            f"in {reference_class_group!r}"
+            "conversion. Convert known_labels to the value type of the "
+            "reference labels"
         )
+
+
+def _label_transfer(store: Any, transfer: ArtifactRef) -> Any:
+    """Load one saved label transfer through the store's narrow loader."""
+    loader = getattr(store, "get_label_transfer", None)
+    if not callable(loader):
+        raise TypeError("store does not provide label transfers")
+    return loader(transfer)
+
+
+def _artifact_record(ref: Any) -> dict[str, Any] | None:
+    return ref.to_dict() if isinstance(ref, ArtifactRef) else None
 
 
 @close_figures_on_error
@@ -100,7 +108,7 @@ def mapping_score(
     target_groups: Sequence[Any] | np.ndarray | None = None,
     layout: ArtifactRef | None = None,
     kind: Literal["embedding", "histogram", "box"] = "embedding",
-    reference_class_group: str | None = None,
+    reference_labels: str | ArtifactRef | None = None,
     size_by_score: bool = False,
     log_transform: bool = True,
     multiplier: float = 1000,
@@ -116,21 +124,30 @@ def mapping_score(
     show_legend: bool = True,
     show: bool = True,
 ) -> PlotResult:
-    """Plot reference-cell mapping scores for one or more query groups."""
+    """Plot reference-cell mapping scores for one or more query groups.
+
+    ``kind="box"`` groups reference cells by ``reference_labels``, a cell
+    column or cell-label artifact of the reference datastore. Reference cells
+    without a usable label are left out of the boxes.
+    """
     if kind not in ("embedding", "histogram", "box"):
         raise ValueError("kind must be 'embedding', 'histogram', or 'box'")
     if kind == "embedding" and layout is None:
         raise ValueError("layout is required for an embedding mapping score")
-    if kind == "box" and reference_class_group is None:
-        raise ValueError("reference_class_group is required for a box mapping score")
+    if kind == "box" and reference_labels is None:
+        raise ValueError("reference_labels is required for a box mapping score")
     if size_by_score and kind != "embedding":
         raise ValueError("size_by_score is only supported for kind='embedding'")
     if bins < 1:
         raise ValueError("bins must be positive")
-    if reference_class_group is not None and (
-        not isinstance(reference_class_group, str) or not reference_class_group
+    if reference_labels is not None and not (
+        isinstance(reference_labels, ArtifactRef)
+        or (isinstance(reference_labels, str) and reference_labels)
     ):
-        raise TypeError("reference_class_group must be a non-empty string")
+        raise TypeError(
+            "reference_labels must be a non-empty reference column name or an "
+            "ArtifactRef"
+        )
     score_loader = getattr(store, "_mapping_score_data", None)
     if not callable(score_loader):
         raise TypeError("store does not provide mapping score data")
@@ -139,7 +156,7 @@ def mapping_score(
         target_groups=(None if target_groups is None else np.asarray(target_groups)),
         reference=reference,
         layout=layout if kind == "embedding" else None,
-        reference_class_group=reference_class_group,
+        reference_labels=reference_labels,
         log_transform=log_transform,
         multiplier=multiplier,
         weighted=weighted,
@@ -382,7 +399,11 @@ def mapping_score(
             extras={
                 "layout": layout.to_dict() if layout is not None else None,
                 "groups": list(labels),
-                "reference_class_group": reference_class_group,
+                "reference_labels": (
+                    reference_labels.to_dict()
+                    if isinstance(reference_labels, ArtifactRef)
+                    else reference_labels
+                ),
                 "size_by_score": size_by_score,
                 "log_transform": log_transform,
                 "multiplier": multiplier,
@@ -397,36 +418,11 @@ def mapping_score(
     return plot_result
 
 
-def _label_evidence(
-    store: Any,
-    result: ArtifactRef,
-    *,
-    reference: MappingReference,
-    reference_class_group: str,
-    threshold_fraction: float,
-    na_val: str,
-    max_distance: float | None,
-) -> pd.DataFrame:
-    loader = getattr(store, "get_target_label_evidence", None)
-    if not callable(loader):
-        raise TypeError("store does not provide mapping evidence data")
-    return loader(
-        result,
-        reference_class_group=reference_class_group,
-        reference=reference,
-        threshold_fraction=threshold_fraction,
-        na_val=na_val,
-        max_distance=max_distance,
-    ).copy()
-
-
 @close_figures_on_error
 def mapping_evidence(
     store: Any,
-    result: ArtifactRef,
+    transfer: ArtifactRef,
     *,
-    reference: MappingReference,
-    reference_class_group: str,
     target_groups: Sequence[Any] | np.ndarray | None = None,
     metrics: Sequence[str] = (
         "voteFraction",
@@ -436,9 +432,6 @@ def mapping_evidence(
     ),
     kind: Literal["histogram", "box"] = "histogram",
     bins: int = 30,
-    threshold_fraction: float = 0.5,
-    na_val: str = "NA",
-    max_distance: float | None = None,
     categorical_scale: CategoricalScale | None = None,
     target: Any | None = None,
     figsize: tuple[float, float] | None = None,
@@ -446,20 +439,18 @@ def mapping_evidence(
     show_legend: bool = True,
     show: bool = True,
 ) -> PlotResult:
-    """Plot query-level label-transfer evidence."""
+    """Plot the saved evidence of one label transfer for query groups.
+
+    ``transfer`` is a ``label_transfer`` artifact from
+    ``DataStore.run_label_transfer``. The plot reads its saved evidence, so it
+    shows exactly the votes and distances that decided the saved labels.
+    """
     if kind not in ("histogram", "box"):
         raise ValueError("kind must be 'histogram' or 'box'")
     if bins < 1:
         raise ValueError("bins must be positive")
-    evidence = _label_evidence(
-        store,
-        result,
-        reference=reference,
-        reference_class_group=reference_class_group,
-        threshold_fraction=threshold_fraction,
-        na_val=na_val,
-        max_distance=max_distance,
-    )
+    label_transfer = _label_transfer(store, transfer)
+    evidence = label_transfer.evidence.copy()
     groups = _external_groups(
         target_groups,
         len(evidence),
@@ -550,16 +541,16 @@ def mapping_evidence(
         legends=tuple(legend_specs),
         scales=(resolved_categorical,),
         provenance=PlotProvenance(
-            assay=result.assay,
+            assay=transfer.assay,
             cell_key=None,
             n_cells=len(evidence),
             renderer="matplotlib",
             notes=("mapping_evidence", kind),
             extras={
-                "reference_class_group": reference_class_group,
+                "label_transfer": _artifact_record(transfer),
                 "metrics": requested_metrics,
-                "threshold_fraction": threshold_fraction,
-                "max_distance": max_distance,
+                "threshold_fraction": label_transfer.threshold_fraction,
+                "max_distance": label_transfer.max_distance,
             },
         ),
         owns_figure=owns,
@@ -573,17 +564,13 @@ def mapping_evidence(
 @close_figures_on_error
 def mapping_confusion(
     store: Any,
-    result: ArtifactRef,
+    transfer: ArtifactRef,
     *,
-    reference: MappingReference,
-    reference_class_group: str,
     known_labels: Sequence[Any] | np.ndarray,
     normalize: Literal["none", "true", "predicted", "all"] = "true",
     known_order: Sequence[Any] | None = None,
     predicted_order: Sequence[Any] | None = None,
-    threshold_fraction: float = 0.5,
-    na_val: str = "NA",
-    max_distance: float | None = None,
+    abstention_label: str = "Abstained",
     color_scale: ColorScale | None = None,
     target: Any | None = None,
     figsize: tuple[float, float] | None = None,
@@ -591,25 +578,37 @@ def mapping_confusion(
     show_legend: bool = True,
     show: bool = True,
 ) -> PlotResult:
-    """Plot known query labels against transferred labels."""
+    """Plot known query labels against the labels of one saved transfer.
+
+    ``transfer`` is a ``label_transfer`` artifact from
+    ``DataStore.run_label_transfer``. Cells that abstained form the
+    ``abstention_label`` column, which must differ from every known and
+    transferred label.
+    """
     if normalize not in ("none", "true", "predicted", "all"):
         raise ValueError("normalize must be 'none', 'true', 'predicted', or 'all'")
-    evidence = _label_evidence(
-        store,
-        result,
-        reference=reference,
-        reference_class_group=reference_class_group,
-        threshold_fraction=threshold_fraction,
-        na_val=na_val,
-        max_distance=max_distance,
-    )
+    if not isinstance(abstention_label, str) or not abstention_label:
+        raise TypeError("abstention_label must be a non-empty string")
+    label_transfer = _label_transfer(store, transfer)
+    evidence = label_transfer.evidence.copy()
     known = np.asarray(known_labels, dtype=object)
     if known.ndim != 1 or len(known) != len(evidence):
         raise ValueError("known_labels must have one value per mapped cell")
     valid = pd.notna(known)
     truth = known[valid]
-    predicted = evidence.loc[valid, "label"].to_numpy(dtype=object)
-    _check_label_types(truth, predicted, reference_class_group)
+    transferred = evidence.loc[valid, "label"].to_numpy(dtype=object)
+    abstained = np.asarray(pd.isna(transferred), dtype=bool)
+    _check_label_types(truth[~abstained], transferred[~abstained])
+    if any(
+        label == abstention_label
+        for label in (*pd.unique(truth), *pd.unique(transferred[~abstained]))
+    ):
+        raise ValueError(
+            f"abstention_label {abstention_label!r} is also a known or transferred "
+            "label; choose another abstention_label"
+        )
+    predicted = transferred.copy()
+    predicted[abstained] = abstention_label
     observed_known = sort_categories(list(pd.unique(truth)))
     observed_predicted = sort_categories(list(pd.unique(predicted)))
     rows = list(known_order) if known_order is not None else observed_known
@@ -728,15 +727,17 @@ def mapping_confusion(
         ),
         scales=(color_scale,),
         provenance=PlotProvenance(
-            assay=result.assay,
+            assay=transfer.assay,
             cell_key=None,
             n_cells=int(valid.sum()),
             renderer="matplotlib",
             notes=("mapping_confusion",),
             extras={
-                "reference_class_group": reference_class_group,
+                "label_transfer": _artifact_record(transfer),
                 "normalize": normalize,
-                "threshold_fraction": threshold_fraction,
+                "threshold_fraction": label_transfer.threshold_fraction,
+                "max_distance": label_transfer.max_distance,
+                "abstention_label": abstention_label,
                 "dropped_missing_truth": int((~valid).sum()),
             },
         ),
@@ -751,24 +752,28 @@ def mapping_confusion(
 @close_figures_on_error
 def mapping_calibration(
     store: Any,
-    result: ArtifactRef,
+    transfer: ArtifactRef,
     *,
-    reference: MappingReference,
-    reference_class_group: str,
     known_labels: Sequence[Any] | np.ndarray,
     metric: str = "voteFraction",
     direction: Literal["auto", "higher", "lower"] = "auto",
     thresholds: Sequence[float] | np.ndarray | None = None,
     n_thresholds: int = 50,
     chosen_threshold: float | None = None,
-    na_val: str = "NA",
-    max_distance: float | None = None,
     target: Any | None = None,
     figsize: tuple[float, float] | None = None,
     theme: str = "notebook",
     show: bool = True,
 ) -> PlotResult:
-    """Plot held-out label accuracy against retained mapping coverage."""
+    """Plot held-out label accuracy against retained coverage per threshold.
+
+    ``transfer`` is a ``label_transfer`` artifact from
+    ``DataStore.run_label_transfer``. Each threshold on ``metric`` is applied
+    to the transfer's saved candidate labels while its other rules, such as
+    ``max_distance``, stay fixed, so no transfer is recomputed. Without a
+    ``chosen_threshold``, a ``voteFraction`` plot marks the transfer's own
+    ``threshold_fraction``.
+    """
     if n_thresholds < 2:
         raise ValueError("n_thresholds must be at least 2")
     if direction not in ("auto", "higher", "lower"):
@@ -778,6 +783,7 @@ def mapping_calibration(
             resolved_direction = "higher"
         elif metric in {
             "voteEntropy",
+            "nearestDistance",
             "referenceDistancePercentile",
             "meanNeighborDistance",
         }:
@@ -789,15 +795,8 @@ def mapping_calibration(
             )
     else:
         resolved_direction = direction
-    evidence = _label_evidence(
-        store,
-        result,
-        reference=reference,
-        reference_class_group=reference_class_group,
-        threshold_fraction=0.0,
-        na_val=na_val,
-        max_distance=max_distance,
-    )
+    label_transfer = _label_transfer(store, transfer)
+    evidence = label_transfer.evidence.copy()
     if metric not in evidence:
         raise KeyError(f"Evidence has no threshold metric {metric!r}")
     known = np.asarray(known_labels, dtype=object)
@@ -807,16 +806,26 @@ def mapping_calibration(
         evidence[metric],
         errors="coerce",
     ).to_numpy(dtype=np.float64)
-    predicted = evidence["label"].to_numpy(dtype=object)
+    # A cell can pass a threshold only when its vote favored one label and it
+    # meets the transfer's other rules.
+    candidates = evidence["candidateLabel"].to_numpy(dtype=object)
+    eligible = ~np.asarray(pd.isna(candidates), dtype=bool)
+    if label_transfer.max_distance is not None:
+        eligible &= (
+            evidence["nearestDistance"].to_numpy(dtype=np.float64)
+            <= label_transfer.max_distance
+        )
     valid = pd.notna(known) & np.isfinite(metric_values)
     values = metric_values[valid]
-    correct = predicted[valid] == known[valid]
+    correct = candidates[valid] == known[valid]
     correct_all = np.zeros(len(evidence), dtype=bool)
     correct_all[valid] = correct
-    informative = ~evidence.loc[valid, "isUnknown"].to_numpy(dtype=bool)
+    informative = eligible[valid]
     if len(values) == 0:
         raise ValueError("No finite metric values with known labels")
-    _check_label_types(known[valid], predicted[valid], reference_class_group)
+    _check_label_types(known[valid & eligible], candidates[valid & eligible])
+    if chosen_threshold is None and metric == "voteFraction":
+        chosen_threshold = label_transfer.threshold_fraction
     if thresholds is None:
         resolved_thresholds = np.unique(
             np.quantile(values, np.linspace(0, 1, n_thresholds))
@@ -959,13 +968,14 @@ def mapping_calibration(
         legends=(),
         scales=(),
         provenance=PlotProvenance(
-            assay=result.assay,
+            assay=transfer.assay,
             cell_key=None,
             n_cells=int(valid.sum()),
             renderer="matplotlib",
             notes=("mapping_calibration",),
             extras={
-                "reference_class_group": reference_class_group,
+                "label_transfer": _artifact_record(transfer),
+                "max_distance": label_transfer.max_distance,
                 "metric": metric,
                 "direction": resolved_direction,
                 "n_thresholds": len(resolved_thresholds),

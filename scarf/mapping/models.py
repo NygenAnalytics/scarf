@@ -1,10 +1,13 @@
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import pandas as pd
 
-from ..storage.refs import ArtifactRef
+from ..storage.refs import ArtifactRef, ExternalArtifactRef
 from ..utils.arrays import read_only_copy
+from .confidence import _conformal_membership, _validated_conformal_calibration
 
 if TYPE_CHECKING:
     from .reference import MappingReference
@@ -191,4 +194,148 @@ class MappingResult:
             f"correction_method={self.correction_method!r}, "
             f"diagnostics={self.diagnostics!r}, "
             f"arrays={loaded or 'not loaded'})"
+        )
+
+
+@dataclass(frozen=True)
+class LabelTransferResult:
+    """One loaded label transfer: transferred query labels and their evidence.
+
+    ``evidence`` has one row per projected query cell, in the order of
+    ``cell_selection``; ``cell_idx`` gives the matching query cell rows.
+    ``label`` is the transferred label and is missing where the cell
+    abstained. ``abstentionReason`` says why a cell abstained:
+    ``uninformative_cell`` (no counts in any measured reference feature),
+    ``no_labeled_neighbors``, ``tied_vote``, ``below_threshold``
+    (``voteFraction`` below ``threshold_fraction``), or
+    ``beyond_max_distance`` (``nearestDistance`` above ``max_distance``).
+    ``candidateLabel`` is the label that the vote favored before the threshold
+    and distance rules, so other thresholds can be compared without a new
+    transfer.
+
+    ``reference_labels`` is the frozen copy of the reference labels in the
+    query datastore, and ``reference_label_source`` names where they were
+    read: a reference cell-metadata column, or a reference label artifact.
+    ``vote_class_codes`` and ``vote_class_fractions`` hold, for each cell, the
+    reference classes that its neighbors voted for, as positions in
+    ``categories``, padded with -1, and each class's share of the neighbor
+    weight.
+    """
+
+    ref: ArtifactRef
+    projection: ArtifactRef
+    reference_labels: ArtifactRef
+    reference_label_source: "str | ExternalArtifactRef"
+    cell_selection: ArtifactRef
+    cell_idx: np.ndarray = field(repr=False, compare=False)
+    threshold_fraction: float
+    max_distance: float | None
+    categories: np.ndarray = field(repr=False, compare=False)
+    evidence: pd.DataFrame = field(repr=False, compare=False)
+    vote_class_codes: np.ndarray = field(repr=False, compare=False)
+    vote_class_fractions: np.ndarray = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        for name in (
+            "cell_idx",
+            "categories",
+            "vote_class_codes",
+            "vote_class_fractions",
+        ):
+            object.__setattr__(self, name, read_only_copy(getattr(self, name)))
+        n_cells = len(self.evidence)
+        if self.cell_idx.shape != (n_cells,):
+            raise ValueError("cell_idx must have one row per projected query cell")
+        if (
+            self.vote_class_codes.ndim != 2
+            or self.vote_class_codes.shape[0] != n_cells
+            or self.vote_class_fractions.shape != self.vote_class_codes.shape
+        ):
+            raise ValueError("Vote arrays must have one row per projected query cell")
+
+    @property
+    def labels(self) -> pd.Series:
+        """Transferred labels, missing where a cell abstained."""
+        return self.evidence["label"].copy()
+
+    @property
+    def n_cells(self) -> int:
+        """Number of projected query cells."""
+        return len(self.evidence)
+
+    def label_vote_shares(self, labels: Sequence[Any] | np.ndarray) -> np.ndarray:
+        """Return each cell's share of neighbor vote weight for a given label.
+
+        ``labels`` holds one label per projected query cell, such as the known
+        labels of held-out calibration cells. A label that is not a reference
+        class has a share of zero. Missing labels and uninformative cells give
+        NaN. One minus these shares is the nonconformity that
+        :meth:`prediction_sets` calibrates with.
+        """
+        values = np.asarray(labels, dtype=object)
+        if values.shape != (self.n_cells,):
+            raise ValueError("labels must have one value per projected query cell")
+        categories = self.categories.tolist()
+        code_of = {category: code for code, category in enumerate(categories)}
+        category_texts = {str(category) for category in categories}
+        missing = np.asarray(pd.isna(values), dtype=bool)
+        codes = np.full(self.n_cells, -1, dtype=np.int64)
+        for row in np.flatnonzero(~missing):
+            code = code_of.get(values[row])
+            if code is not None:
+                codes[row] = code
+            elif str(values[row]) in category_texts:
+                raise ValueError(
+                    "Some labels match a reference class only as text. Convert "
+                    "labels to the value type of the reference labels"
+                )
+        voted = (self.vote_class_codes == codes[:, np.newaxis]) & (
+            codes[:, np.newaxis] >= 0
+        )
+        shares = np.where(voted, self.vote_class_fractions, 0.0).sum(axis=1)
+        uninformative = (
+            self.evidence["abstentionReason"].to_numpy(dtype=object)
+            == "uninformative_cell"
+        )
+        shares[missing | uninformative] = np.nan
+        return shares
+
+    def prediction_sets(
+        self,
+        calibration_nonconformity: np.ndarray,
+        alpha: float = 0.1,
+    ) -> pd.Series:
+        """Return split-conformal prediction sets from the stored votes.
+
+        ``calibration_nonconformity`` holds one minus the vote share of the
+        true label for held-out calibration cells, which must be exchangeable
+        with these query cells; :meth:`label_vote_shares` computes those
+        shares. A class joins a cell's set when its nonconformity is not
+        exceeded by more than a fraction ``alpha`` of the calibration cells.
+        Cells without labeled votes get an empty set.
+        """
+        calibration, resolved_alpha = _validated_conformal_calibration(
+            calibration_nonconformity,
+            alpha,
+        )
+        sets: list[tuple[Any, ...]] = [()] * self.n_cells
+        vote_fraction = self.evidence["voteFraction"].to_numpy(dtype=np.float64)
+        for row in np.flatnonzero(vote_fraction > 0):
+            # One row of class scores at a time bounds memory by the class count.
+            scores = np.zeros(len(self.categories), dtype=np.float64)
+            voted = self.vote_class_codes[row] >= 0
+            scores[self.vote_class_codes[row, voted]] = self.vote_class_fractions[
+                row, voted
+            ]
+            members = _conformal_membership(scores, calibration, resolved_alpha)
+            sets[row] = tuple(self.categories[members].tolist())
+        return pd.Series(sets, name="predictionSet")
+
+    def __repr__(self) -> str:
+        abstained = int(self.evidence["abstained"].sum())
+        return (
+            f"LabelTransferResult(ref={self.ref!r}, n_cells={self.n_cells}, "
+            f"abstained={abstained}, threshold_fraction={self.threshold_fraction!r}, "
+            f"max_distance={self.max_distance!r}, "
+            f"reference_label_source={self.reference_label_source!r})"
         )

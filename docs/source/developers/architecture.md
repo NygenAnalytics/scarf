@@ -75,7 +75,7 @@ They must not import those packages at module load time.
 - `features/` owns variability selection, LOWESS trend fitting, feature scoring, enrichment, rank and regression marker searches, GFF parsing, genomic intervals, coordinate-based feature construction, and the name-based gene-family registry.
   It also owns presentation-independent feature resolution and normalized value fetching used by datastore workflows and plots.
 - `quality_control/` owns filtering, HTO demultiplexing, doublet processing, cell-cycle assignment, and the default cell-cycle gene references.
-- `mapping/` owns reference artifacts, feature alignment, confidence, Symphony-style correction, and mapping results.
+- `mapping/` owns reference artifacts, feature alignment, confidence, Symphony-style correction, label transfer, and mapping results.
 
 Domain algorithm packages must not import `datastore`, `plotting`, or general import/export packages at module load time.
 A domain that persists an artifact may use a narrow, named `storage` adapter.
@@ -211,6 +211,17 @@ The complete hard-break inventory is:
   records `params`, `species`, `tsne`, `membershipStrength`, and the Leiden `selected`
   resolution. `pca_dims=0` skips PCA.
 - Mapping references and query projections use only their current exact-lineage contracts.
+- Label transfer is a saved artifact. `get_target_classes` and `get_target_label_evidence` are
+  removed. `run_label_transfer` freezes the reference labels it reads, from a reference column or a
+  reference cell-label artifact, into the query datastore as a `reference_labels` artifact and saves
+  a `label_transfer` artifact; `get_label_transfer` loads it without the reference. An abstention is
+  a missing label with an `abstentionReason` rather than an `na_val` string, `max_distance` applies
+  to the saved labels, and `target_subset` is removed. `mapping_evidence`, `mapping_confusion`, and
+  `mapping_calibration` take the transfer ref instead of a projection, reference, and threshold;
+  `mapping_calibration` marks the transfer's own threshold by default, and `mapping_confusion`
+  names the abstention column with `abstention_label`. `mapping_score` takes `reference_labels` in
+  place of `reference_class_group`. `ExternalArtifactRef` gains `anchor_assay` for an artifact of
+  another datastore that is not scoped to the assay its dataset fingerprint describes.
 - Integration label metrics are split by input contract. `metric_clisi` and
   `metric_graph_connectivity` use the keyword `annotation_column` for imported cell metadata;
   `metric_label_concordance(first, second, metric=...)` compares exact clustering artifacts.
