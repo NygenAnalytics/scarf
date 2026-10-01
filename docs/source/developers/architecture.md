@@ -222,9 +222,9 @@ The complete hard-break inventory is:
   `get_mapping_result(...).diagnostics`. Conformal sets come from
   `LabelTransferResult.prediction_sets` instead of a `predictionSet` column. `mapping_evidence`,
   `mapping_confusion`, and `mapping_calibration` take the transfer ref instead of a projection,
-  reference, and threshold. Without a `chosen_threshold`, `mapping_calibration` marks the
-  transfer's own threshold on a `voteFraction` plot, and `mapping_confusion` names the abstention
-  column with `abstention_label`. `mapping_score` takes `reference_labels` in place of
+  reference, and threshold. `mapping_calibration` keeps the transfer's saved rules except the one
+  on the swept metric, and without a `chosen_threshold` it marks that rule's own threshold.
+  `mapping_confusion` names the abstention column with `abstention_label`. `mapping_score` takes `reference_labels` in place of
   `reference_class_group`. `ExternalArtifactRef` gains `anchor_assay` for an artifact of
   another datastore that is not scoped to the assay its dataset fingerprint describes.
 - Integration label metrics are split by input contract. `metric_clisi` and

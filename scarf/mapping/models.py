@@ -197,6 +197,26 @@ class MappingResult:
         )
 
 
+_VOTE_BLOCK_ROWS = 65_536
+
+
+def _frozen_array(values: Any) -> np.ndarray:
+    """Return ``values`` as a read-only array, copying only changeable data.
+
+    An array whose underlying data no owner can change, such as one a loader
+    froze, is kept as a read-only view, so large loaded arrays are not copied.
+    """
+    array = np.asarray(values)
+    owner = array
+    while isinstance(owner.base, np.ndarray):
+        owner = owner.base
+    if owner.flags.writeable:
+        return read_only_copy(array)
+    frozen = array.view()
+    frozen.setflags(write=False)
+    return frozen
+
+
 @dataclass(frozen=True)
 class LabelTransferResult:
     """One loaded label transfer: transferred query labels and their evidence.
@@ -219,7 +239,10 @@ class LabelTransferResult:
     ``vote_class_codes`` and ``vote_class_fractions`` hold, for each cell, the
     reference classes that its neighbors voted for, as positions in
     ``categories``, padded with -1, and each class's share of the neighbor
-    weight.
+    weight. These matrices hold one column per saved neighbor, so they are
+    loaded only when requested, with ``get_label_transfer(transfer,
+    load_votes=True)``; :meth:`label_vote_shares` and :meth:`prediction_sets`
+    need them.
     """
 
     ref: ArtifactRef
@@ -232,26 +255,39 @@ class LabelTransferResult:
     max_distance: float | None
     categories: np.ndarray = field(repr=False, compare=False)
     evidence: pd.DataFrame = field(repr=False, compare=False)
-    vote_class_codes: np.ndarray = field(repr=False, compare=False)
-    vote_class_fractions: np.ndarray = field(repr=False, compare=False)
+    vote_class_codes: np.ndarray | None = field(default=None, repr=False, compare=False)
+    vote_class_fractions: np.ndarray | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
-        for name in (
-            "cell_idx",
-            "categories",
-            "vote_class_codes",
-            "vote_class_fractions",
-        ):
-            object.__setattr__(self, name, read_only_copy(getattr(self, name)))
+        for name in ("cell_idx", "categories"):
+            object.__setattr__(self, name, _frozen_array(getattr(self, name)))
         n_cells = len(self.evidence)
         if self.cell_idx.shape != (n_cells,):
             raise ValueError("cell_idx must have one row per projected query cell")
+        if (self.vote_class_codes is None) != (self.vote_class_fractions is None):
+            raise ValueError("Vote class codes and fractions are loaded together")
+        if self.vote_class_codes is None or self.vote_class_fractions is None:
+            return
+        codes = _frozen_array(self.vote_class_codes)
+        fractions = _frozen_array(self.vote_class_fractions)
         if (
-            self.vote_class_codes.ndim != 2
-            or self.vote_class_codes.shape[0] != n_cells
-            or self.vote_class_fractions.shape != self.vote_class_codes.shape
+            codes.ndim != 2
+            or codes.shape[0] != n_cells
+            or fractions.shape != codes.shape
         ):
             raise ValueError("Vote arrays must have one row per projected query cell")
+        object.__setattr__(self, "vote_class_codes", codes)
+        object.__setattr__(self, "vote_class_fractions", fractions)
+
+    def _votes(self) -> tuple[np.ndarray, np.ndarray]:
+        if self.vote_class_codes is None or self.vote_class_fractions is None:
+            raise ValueError(
+                "This label transfer was loaded without its votes. Load it with "
+                "get_label_transfer(transfer, load_votes=True)"
+            )
+        return self.vote_class_codes, self.vote_class_fractions
 
     @property
     def labels(self) -> pd.Series:
@@ -290,10 +326,16 @@ class LabelTransferResult:
                     "Some labels match a reference class only as text. Convert "
                     "labels to the value type of the reference labels"
                 )
-        voted = (self.vote_class_codes == codes[:, np.newaxis]) & (
-            codes[:, np.newaxis] >= 0
-        )
-        shares = np.where(voted, self.vote_class_fractions, 0.0).sum(axis=1)
+        vote_codes, vote_fractions = self._votes()
+        shares = np.zeros(self.n_cells, dtype=np.float64)
+        # Bounded row blocks keep the temporaries small next to the votes.
+        for start in range(0, self.n_cells, _VOTE_BLOCK_ROWS):
+            stop = min(start + _VOTE_BLOCK_ROWS, self.n_cells)
+            label_codes = codes[start:stop, np.newaxis]
+            voted = (vote_codes[start:stop] == label_codes) & (label_codes >= 0)
+            shares[start:stop] = np.where(voted, vote_fractions[start:stop], 0.0).sum(
+                axis=1
+            )
         uninformative = (
             self.evidence["abstentionReason"].to_numpy(dtype=object)
             == "uninformative_cell"
@@ -319,15 +361,14 @@ class LabelTransferResult:
             calibration_nonconformity,
             alpha,
         )
+        vote_codes, vote_fractions = self._votes()
         sets: list[tuple[Any, ...]] = [()] * self.n_cells
         vote_fraction = self.evidence["voteFraction"].to_numpy(dtype=np.float64)
         for row in np.flatnonzero(vote_fraction > 0):
             # One row of class scores at a time bounds memory by the class count.
             scores = np.zeros(len(self.categories), dtype=np.float64)
-            voted = self.vote_class_codes[row] >= 0
-            scores[self.vote_class_codes[row, voted]] = self.vote_class_fractions[
-                row, voted
-            ]
+            voted = vote_codes[row] >= 0
+            scores[vote_codes[row, voted]] = vote_fractions[row, voted]
             members = _conformal_membership(scores, calibration, resolved_alpha)
             sets[row] = tuple(self.categories[members].tolist())
         return pd.Series(sets, name="predictionSet")

@@ -764,10 +764,14 @@ def mapping_calibration(
 
     ``transfer`` is a ``label_transfer`` artifact from
     ``DataStore.run_label_transfer``. Each threshold on ``metric`` is applied
-    to the transfer's saved candidate labels while its other rules, such as
-    ``max_distance``, stay fixed, so no transfer is recomputed.
-    ``chosen_threshold`` is added to the thresholds and marked. Without it, a
-    ``voteFraction`` plot marks the transfer's own ``threshold_fraction``; it
+    to the transfer's saved candidate labels, so no transfer is recomputed.
+    The thresholds replace the transfer's own rule on the swept metric,
+    ``threshold_fraction`` for ``voteFraction`` and ``max_distance`` for
+    ``nearestDistance``, and every other saved rule still applies. Any other
+    metric is therefore calibrated among the cells that the transfer labelled.
+
+    ``chosen_threshold`` is added to the thresholds and marked. Without it, the
+    transfer's own rule on the swept metric, when it has one, is marked: it
     joins the default thresholds, and with explicit ``thresholds`` it is marked
     only when it is one of them.
     """
@@ -804,10 +808,15 @@ def mapping_calibration(
         errors="coerce",
     ).to_numpy(dtype=np.float64)
     # A cell can pass a threshold only when its vote favored one label and it
-    # meets the transfer's other rules.
+    # meets every saved rule except the one on the swept metric.
     candidates = evidence["candidateLabel"].to_numpy(dtype=object)
     eligible = ~np.asarray(pd.isna(candidates), dtype=bool)
-    if label_transfer.max_distance is not None:
+    if metric != "voteFraction":
+        eligible &= (
+            evidence["voteFraction"].to_numpy(dtype=np.float64)
+            >= label_transfer.threshold_fraction
+        )
+    if label_transfer.max_distance is not None and metric != "nearestDistance":
         eligible &= (
             evidence["nearestDistance"].to_numpy(dtype=np.float64)
             <= label_transfer.max_distance
@@ -833,8 +842,8 @@ def mapping_calibration(
             or not np.isfinite(resolved_thresholds).all()
         ):
             raise ValueError("thresholds must contain finite numeric values")
-    # An explicit chosen_threshold always joins the thresholds. The transfer's
-    # own threshold is marked only on a voteFraction plot, and joins only the
+    # An explicit chosen_threshold always joins the thresholds. Otherwise the
+    # transfer's own rule on the swept metric is marked, joining only the
     # default thresholds, so explicit thresholds are evaluated exactly.
     marked_threshold = chosen_threshold
     if chosen_threshold is not None:
@@ -843,9 +852,12 @@ def mapping_calibration(
         resolved_thresholds = np.unique(
             np.append(resolved_thresholds, chosen_threshold)
         )
-    elif metric == "voteFraction":
-        marked_threshold = label_transfer.threshold_fraction
-        if thresholds is None:
+    else:
+        marked_threshold = {
+            "voteFraction": label_transfer.threshold_fraction,
+            "nearestDistance": label_transfer.max_distance,
+        }.get(metric)
+        if marked_threshold is not None and thresholds is None:
             resolved_thresholds = np.unique(
                 np.append(resolved_thresholds, marked_threshold)
             )

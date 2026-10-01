@@ -948,7 +948,12 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             profile=self.storageProfile,
         )
 
-    def get_label_transfer(self, transfer: ArtifactRef) -> LabelTransferResult:
+    def get_label_transfer(
+        self,
+        transfer: ArtifactRef,
+        *,
+        load_votes: bool = False,
+    ) -> LabelTransferResult:
         """Load one complete label transfer from this query datastore.
 
         Loading reads only this datastore, so the reference datastore is not
@@ -956,10 +961,14 @@ class _MappingOperationsMixin(_MappingOperationsBase):
 
         Args:
             transfer: Label transfer returned by :meth:`run_label_transfer`.
+            load_votes: Also load each cell's neighbor votes, which
+                ``label_vote_shares`` and ``prediction_sets`` need. The vote
+                matrices hold one column per saved neighbor, so they are
+                skipped by default.
 
         Returns:
             The transferred labels, their evidence, and the exact inputs.
         """
         if not isinstance(transfer, ArtifactRef):
             raise TypeError("transfer must be an ArtifactRef")
-        return load_label_transfer(self.zw, transfer)
+        return load_label_transfer(self.zw, transfer, load_votes=load_votes)

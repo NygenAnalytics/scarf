@@ -88,10 +88,14 @@ the transfer into the reference datastore.
 | `abstentionReason` | `uninformative_cell`, `no_labeled_neighbors`, `tied_vote`, `below_threshold`, or `beyond_max_distance` |
 
 Vote metrics are NaN for uninformative cells. Projection-level diagnostics such as
-`featureCoverage` and `queryScaledDispersion` stay in `get_mapping_result(...).diagnostics`. `label_vote_shares(labels)` returns each cell's vote
-share for given labels, and `prediction_sets(calibration_nonconformity, alpha)` forms
-split-conformal prediction sets from the saved votes, calibrated with one minus those shares on
-held-out cells.
+`featureCoverage` and `queryScaledDispersion` stay in `get_mapping_result(...).diagnostics`.
+
+`label_vote_shares(labels)` returns each cell's vote share for given labels, and
+`prediction_sets(calibration_nonconformity, alpha)` forms split-conformal prediction sets from the
+saved votes, calibrated with one minus those shares on held-out cells. Both need the per-neighbour
+vote matrices, which hold one column per saved neighbour, so `get_label_transfer` loads them only
+with `load_votes=True`. Each array that a load reads is checked against the digest recorded when the
+transfer was written.
 
 ```{eval-rst}
 .. autoclass:: scarf.MappingReference

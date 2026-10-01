@@ -503,7 +503,7 @@ def _transfer(query, result, reference, labels="reference_labels", **options):
         reference_labels=labels,
         **options,
     )
-    return ref, query.get_label_transfer(ref)
+    return ref, query.get_label_transfer(ref, load_votes=True)
 
 
 def test_label_transfer_saves_labels_frozen_inputs_and_evidence(
@@ -1028,11 +1028,107 @@ def test_label_transfer_reads_its_payload_once(mapping_consumer_context, monkeyp
     # Blocks are digested as they are written, so only the completion check
     # reads the payload back, once.
     assert written and set(written.values()) == {1}
+    vote_chunks = {
+        key
+        for key in written
+        if "/vote_class_codes/" in key or "/vote_class_fractions/" in key
+    }
+    assert vote_chunks
+
+    # A default load reads every chunk except the votes, once each.
     keys.clear()
     query.get_label_transfer(transfer)
     loaded = payload_reads()
-    assert set(loaded) == set(written)
+    assert set(loaded) == set(written) - vote_chunks
     assert set(loaded.values()) == {1}
+
+    keys.clear()
+    query.get_label_transfer(transfer, load_votes=True)
+    with_votes = payload_reads()
+    assert set(with_votes) == set(written)
+    assert set(with_votes.values()) == {1}
+
+
+def test_label_transfer_loads_votes_only_on_request_without_copies(
+    mapping_consumer_context,
+    monkeypatch,
+):
+    _, reference, query = mapping_consumer_context
+    _write_reference_labels(reference)
+    result = _write_projection(
+        query,
+        reference,
+        indices=np.array([[0, 1], [1, 0]]),
+        distances=np.array([[1.0, 9.0], [1.0, 9.0]]),
+        uninformative=np.array([False, False]),
+    )
+    transfer = query.run_label_transfer(
+        result,
+        reference=reference,
+        reference_labels="reference_labels",
+    )
+
+    without_votes = query.get_label_transfer(transfer)
+    assert without_votes.vote_class_codes is None
+    assert without_votes.vote_class_fractions is None
+    assert without_votes.evidence["candidateLabel"].tolist() == ["winner", "runner_up"]
+    for use_votes in (
+        lambda: without_votes.prediction_sets(np.array([0.1, 0.2])),
+        lambda: without_votes.label_vote_shares(["winner", "winner"]),
+    ):
+        with pytest.raises(ValueError, match="load_votes=True"):
+            use_votes()
+    with pytest.raises(TypeError, match="load_votes must be a boolean"):
+        query.get_label_transfer(transfer, load_votes=1)
+
+    # The loader freezes the arrays it reads, so the result keeps them as
+    # read-only views instead of copying them.
+    def no_copy(*_args, **_kwargs):
+        raise AssertionError("a loaded array was copied")
+
+    monkeypatch.setattr(mapping_models, "read_only_copy", no_copy)
+    with_votes = query.get_label_transfer(transfer, load_votes=True)
+    for array in (
+        with_votes.vote_class_codes,
+        with_votes.vote_class_fractions,
+        with_votes.cell_idx,
+        with_votes.categories,
+    ):
+        assert not array.flags.writeable
+        with pytest.raises(ValueError):
+            array.setflags(write=True)
+    pd.testing.assert_frame_equal(with_votes.evidence, without_votes.evidence)
+
+
+def test_label_transfer_result_copies_arrays_that_callers_can_change(
+    mapping_consumer_context,
+):
+    from dataclasses import replace as replace_fields
+
+    _, reference, query = mapping_consumer_context
+    _write_reference_labels(reference)
+    result = _write_projection(
+        query,
+        reference,
+        indices=np.array([[0, 1], [1, 0]]),
+        distances=np.array([[1.0, 9.0], [1.0, 9.0]]),
+        uninformative=np.array([False, False]),
+    )
+    _, loaded = _transfer(query, result, reference)
+    codes = np.array(loaded.vote_class_codes)
+    fractions = np.array(loaded.vote_class_fractions)
+
+    rebuilt = replace_fields(
+        loaded,
+        vote_class_codes=codes,
+        vote_class_fractions=fractions,
+    )
+    codes[:] = -1
+
+    assert not np.shares_memory(rebuilt.vote_class_codes, codes)
+    assert (rebuilt.vote_class_codes == loaded.vote_class_codes).all()
+    with pytest.raises(ValueError, match="loaded together"):
+        replace_fields(loaded, vote_class_codes=None)
 
 
 def test_label_transfer_writes_with_the_datastore_storage_profile(

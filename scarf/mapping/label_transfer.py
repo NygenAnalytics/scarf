@@ -94,15 +94,16 @@ _EVIDENCE_ARRAYS = (
     "nearest_distance",
     "reference_distance_percentile",
 )
+_VOTE_ARRAYS = ("vote_class_codes", "vote_class_fractions")
 _TRANSFER_ARRAYS = tuple(
     sorted(
         (
             "abstention_reason",
+            "candidate_codes",
             "categories",
             _LABELS,
             _LABELS_MISSING,
-            "vote_class_codes",
-            "vote_class_fractions",
+            *_VOTE_ARRAYS,
             *_EVIDENCE_ARRAYS,
         )
     )
@@ -116,6 +117,7 @@ _TRANSFER_ATTRIBUTES = frozenset(
         "created_at_ns",
         "scarf_version",
         "complete",
+        "array_digests",
         "payload_fingerprint",
     }
 )
@@ -399,10 +401,13 @@ class LabelTransferBlock:
 
     ``label_codes`` holds the transferred class code of each cell, or -1 where
     the cell abstained, and ``abstention_reason`` the reason code.
+    ``candidate_codes`` holds the class that the vote favored before the
+    threshold and distance rules, or -1 where the vote favored no single class.
     """
 
     label_codes: np.ndarray
     abstention_reason: np.ndarray
+    candidate_codes: np.ndarray
     vote_class_codes: np.ndarray
     vote_class_fractions: np.ndarray
     vote_fraction: np.ndarray
@@ -438,6 +443,7 @@ def transfer_label_block(
         raise ValueError("Uninformative flags must have one value per query cell")
     reason = np.full(n_rows, UNINFORMATIVE_CELL, dtype=np.uint8)
     label_codes = np.full(n_rows, -1, dtype=np.int64)
+    candidate_codes = np.full(n_rows, -1, dtype=np.int64)
     vote_class_codes = np.full((n_rows, n_neighbors), -1, dtype=np.int64)
     vote_class_fractions = np.zeros((n_rows, n_neighbors), dtype=np.float64)
     evidence = {name: np.full(n_rows, np.nan) for name in _EVIDENCE_ARRAYS}
@@ -460,6 +466,11 @@ def transfer_label_block(
             votes.winner_codes,
             -1,
         )
+        candidate_codes[informative] = np.where(
+            votes.has_labeled_votes & ~votes.is_tied,
+            votes.winner_codes,
+            -1,
+        )
         vote_class_codes[informative] = votes.class_codes
         vote_class_fractions[informative] = votes.fractions
         evidence["vote_fraction"][informative] = votes.vote_fraction
@@ -472,6 +483,7 @@ def transfer_label_block(
     return LabelTransferBlock(
         label_codes=label_codes,
         abstention_reason=reason,
+        candidate_codes=candidate_codes,
         vote_class_codes=vote_class_codes,
         vote_class_fractions=vote_class_fractions,
         **evidence,
@@ -572,6 +584,7 @@ def plan_label_transfer(
             class_dtype=classes.dtype,
         ),
         required_attributes=(
+            AttributeRequirement("array_digests", expected_types=(dict,)),
             AttributeRequirement("payload_fingerprint", expected_types=(str,)),
         ),
         reuse_validator=payload_matches,
@@ -596,6 +609,7 @@ def _transfer_array_requirements(
         ArrayRequirement(_LABELS, shape=(n_cells,), dtype=class_dtype),
         ArrayRequirement(_LABELS_MISSING, shape=(n_cells,), dtype=bool),
         ArrayRequirement("abstention_reason", shape=(n_cells,), dtype=np.uint8),
+        ArrayRequirement("candidate_codes", shape=(n_cells,), dtype=np.int64),
         ArrayRequirement(
             "vote_class_codes", shape=(n_cells, n_neighbors), dtype=np.int64
         ),
@@ -648,6 +662,7 @@ def write_label_transfer(
                 _LABELS: labels,
                 _LABELS_MISSING: abstained,
                 "abstention_reason": block.abstention_reason,
+                "candidate_codes": block.candidate_codes,
                 "vote_class_codes": block.vote_class_codes,
                 "vote_class_fractions": block.vote_class_fractions,
                 **{name: getattr(block, name) for name in _EVIDENCE_ARRAYS},
@@ -660,7 +675,11 @@ def write_label_transfer(
             raise RuntimeError(
                 "Label transfer did not cover every projected query cell"
             )
-        group.attrs["payload_fingerprint"] = _payload_fingerprint(digests.finish())
+        array_digests = digests.finish()
+        # Each array's digest is recorded, so a loader verifies exactly the
+        # arrays it reads; the fingerprint binds the digests together.
+        group.attrs["array_digests"] = array_digests
+        group.attrs["payload_fingerprint"] = _payload_fingerprint(array_digests)
     return plan.ref
 
 
@@ -698,7 +717,7 @@ def _payload_fingerprint(array_digests: Mapping[str, str]) -> str:
     """Combine one digest per payload array into the payload fingerprint.
 
     Each array is digested on its own, so a writer can fingerprint the blocks
-    it writes and a loader the arrays it reads, without another pass.
+    it writes, and a loader can verify only the arrays it reads.
     """
     if set(array_digests) != set(_TRANSFER_ARRAYS):
         raise ValueError("Label transfer digests do not cover its payload arrays")
@@ -708,15 +727,34 @@ def _payload_fingerprint(array_digests: Mapping[str, str]) -> str:
     return builder.hexdigest()
 
 
-def _require_payload_fingerprint(
-    group: zarr.Group,
-    array_digests: Mapping[str, str],
+def _recorded_array_digests(group: zarr.Group) -> dict[str, str]:
+    """Return the recorded array digests once the payload fingerprint binds them."""
+    recorded = group.attrs["array_digests"]
+    if not isinstance(recorded, Mapping) or set(recorded) != set(_TRANSFER_ARRAYS):
+        raise ValueError("Label transfer array digests are malformed")
+    digests: dict[str, str] = {}
+    for name, digest in recorded.items():
+        if not isinstance(digest, str):
+            raise ValueError("Label transfer array digests are malformed")
+        digests[name] = digest
+    fingerprint = group.attrs["payload_fingerprint"]
+    if not isinstance(fingerprint, str) or fingerprint != _payload_fingerprint(digests):
+        raise ValueError(
+            "Label transfer payload fingerprint does not match its array digests"
+        )
+    return digests
+
+
+def _require_array_digests(
+    recorded: Mapping[str, str],
+    measured: Mapping[str, str],
 ) -> None:
-    stored_fingerprint = group.attrs["payload_fingerprint"]
-    if not isinstance(stored_fingerprint, str) or stored_fingerprint != (
-        _payload_fingerprint(array_digests)
-    ):
-        raise ValueError("Label transfer payload fingerprint does not match its arrays")
+    changed = sorted(name for name in measured if measured[name] != recorded[name])
+    if changed:
+        raise ValueError(
+            "Label transfer arrays differ from their recorded digests: "
+            + ", ".join(changed)
+        )
 
 
 def _create_transfer_arrays(
@@ -766,6 +804,14 @@ def _create_transfer_arrays(
         (n_cells,),
         profile=profile,
     )
+    arrays["candidate_codes"] = create_zarr_dataset(
+        group,
+        "candidate_codes",
+        (chunk_rows,),
+        np.int64,
+        (n_cells,),
+        profile=profile,
+    )
     for name, dtype in (
         ("vote_class_codes", np.int64),
         ("vote_class_fractions", np.float64),
@@ -795,8 +841,8 @@ def _transfer_payload_arrays(
     *,
     n_cells: int | None = None,
     n_neighbors: int | None = None,
-) -> dict[str, zarr.Array]:
-    """Open the payload arrays after checking their layout, without reading them."""
+) -> tuple[dict[str, zarr.Array], dict[str, str]]:
+    """Open the payload arrays and their recorded digests without reading data."""
     if set(group.group_keys()):
         raise ValueError("Label transfer payload contains unexpected groups")
     if set(group.array_keys()) != set(_TRANSFER_ARRAYS):
@@ -833,7 +879,7 @@ def _transfer_payload_arrays(
         raise ValueError("Label transfer labels have no linked missing-label mask")
     if any(set(array.attrs) for name, array in arrays.items() if name != _LABELS):
         raise ValueError("Label transfer arrays carry unexpected attributes")
-    return arrays
+    return arrays, _recorded_array_digests(group)
 
 
 def _validate_transfer_payload(
@@ -843,23 +889,36 @@ def _validate_transfer_payload(
     n_neighbors: int,
     categories: np.ndarray,
 ) -> dict[str, zarr.Array]:
-    """Validate the payload layout, classes, and fingerprint in one read."""
-    arrays = _transfer_payload_arrays(group, n_cells=n_cells, n_neighbors=n_neighbors)
-    digests = {
-        name: fingerprint_stored_arrays(group, (name,), arrays=arrays)
-        for name in _TRANSFER_ARRAYS
-    }
-    # Equal digests mean equal classes, so the classes are not read twice.
-    if digests["categories"] != _array_digest("categories", categories):
+    """Validate the payload layout, classes, and every array in one read."""
+    arrays, recorded = _transfer_payload_arrays(
+        group,
+        n_cells=n_cells,
+        n_neighbors=n_neighbors,
+    )
+    _require_array_digests(
+        recorded,
+        {
+            name: fingerprint_stored_arrays(group, (name,), arrays=arrays)
+            for name in _TRANSFER_ARRAYS
+        },
+    )
+    # Verified digests stand for the stored classes, which are not read again.
+    if recorded["categories"] != _array_digest("categories", categories):
         raise ValueError("Label transfer classes differ from its reference labels")
-    _require_payload_fingerprint(group, digests)
     return arrays
 
 
-def load_label_transfer(root: zarr.Group, ref: ArtifactRef) -> LabelTransferResult:
+def load_label_transfer(
+    root: zarr.Group,
+    ref: ArtifactRef,
+    *,
+    load_votes: bool = False,
+) -> LabelTransferResult:
     """Load one complete label transfer after validating its contract.
 
-    Loading reads only the query datastore, never the reference.
+    Loading reads only the query datastore, never the reference. The neighbor
+    vote matrices are read only with ``load_votes``. Every array that is read
+    is checked against the digest recorded when it was written.
     """
     if (
         not isinstance(ref, ArtifactRef)
@@ -870,15 +929,22 @@ def load_label_transfer(root: zarr.Group, ref: ArtifactRef) -> LabelTransferResu
         raise ValueError(
             "transfer must identify an assay-scoped label_transfer artifact"
         )
+    if not isinstance(load_votes, bool):
+        raise TypeError("load_votes must be a boolean")
     try:
-        return _load_label_transfer(root, ref)
+        return _load_label_transfer(root, ref, load_votes=load_votes)
     except ArtifactResolutionError:
         raise
     except (KeyError, TypeError, ValueError) as exc:
         raise contract_error(str(exc), LABEL_TRANSFER_RERUN_MESSAGE) from exc
 
 
-def _load_label_transfer(root: zarr.Group, ref: ArtifactRef) -> LabelTransferResult:
+def _load_label_transfer(
+    root: zarr.Group,
+    ref: ArtifactRef,
+    *,
+    load_votes: bool,
+) -> LabelTransferResult:
     status = inspect_artifact(root, ref)
     if not status.exists or not status.complete:
         raise ValueError("Label transfer artifact is missing or incomplete")
@@ -893,7 +959,7 @@ def _load_label_transfer(root: zarr.Group, ref: ArtifactRef) -> LabelTransferRes
     reference_labels = _input_ref(status, "reference_labels", kind="reference_labels")
     cell_selection = _input_ref(status, "cell_selection", kind="cell_selection")
     group = artifact_group(root, ref)
-    arrays = _transfer_payload_arrays(group)
+    arrays, recorded = _transfer_payload_arrays(group)
     n_cells, n_neighbors = (int(size) for size in arrays["vote_class_codes"].shape)
     _validate_projection_input(root, projection, cell_selection, n_neighbors)
     source = _stored_reference_label_source(root, reference_labels)
@@ -907,50 +973,60 @@ def _load_label_transfer(root: zarr.Group, ref: ArtifactRef) -> LabelTransferRes
         assay=None,
         table_path="cellData",
     ).astype(np.int64, copy=False)
+    cell_idx.setflags(write=False)
 
-    # Read each array once and verify the fingerprint on the values read.
-    values = {name: np.asarray(array[:]) for name, array in arrays.items()}
-    _require_payload_fingerprint(
-        group,
-        {name: _array_digest(name, values[name]) for name in _TRANSFER_ARRAYS},
+    # Read each needed array once and check it against its recorded digest.
+    # The arrays are frozen in place, so the result keeps them without copies.
+    values: dict[str, np.ndarray] = {}
+    for name in _TRANSFER_ARRAYS:
+        if name in _VOTE_ARRAYS and not load_votes:
+            continue
+        array = np.asarray(arrays[name][:])
+        array.setflags(write=False)
+        values[name] = array
+    _require_array_digests(
+        recorded,
+        {name: _array_digest(name, array) for name, array in values.items()},
     )
     categories = values["categories"]
     reason = values["abstention_reason"]
-    abstained = values[_LABELS_MISSING].astype(bool)
-    vote_class_codes = values["vote_class_codes"]
-    vote_class_fractions = values["vote_class_fractions"]
+    abstained = values[_LABELS_MISSING]
+    candidates = values["candidate_codes"]
     if reason.size and int(reason.max()) > len(ABSTENTION_REASONS):
         raise ValueError("Label transfer has an unknown abstention reason")
     if not np.array_equal(abstained, reason != ASSIGNED):
         raise ValueError("Label transfer abstentions do not match their reasons")
-    if vote_class_codes.size and (
-        int(vote_class_codes.min()) < -1
-        or int(vote_class_codes.max()) >= len(categories)
+    if candidates.size and (
+        int(candidates.min()) < -1 or int(candidates.max()) >= len(categories)
     ):
-        raise ValueError("Label transfer votes name an unknown reference class")
-    rows = np.arange(n_cells)
-    winner_codes = vote_class_codes[rows, np.argmax(vote_class_fractions, axis=1)]
+        raise ValueError("Label transfer candidates name an unknown reference class")
     decisive = ~np.isin(reason, (UNINFORMATIVE_CELL, NO_LABELED_NEIGHBORS, TIED_VOTE))
-    if (winner_codes[decisive] < 0).any():
-        raise ValueError("A decided label transfer vote has no winning class")
+    if not np.array_equal(decisive, candidates >= 0):
+        raise ValueError("Label transfer candidates do not match their reasons")
     assigned = reason == ASSIGNED
-    if not np.array_equal(
-        values[_LABELS][assigned], categories[winner_codes[assigned]]
-    ):
-        raise ValueError("Label transfer labels do not match their votes")
+    if not np.array_equal(values[_LABELS][assigned], categories[candidates[assigned]]):
+        raise ValueError("Label transfer labels do not match their candidates")
+    if load_votes:
+        _check_votes(
+            values["vote_class_codes"],
+            values["vote_class_fractions"],
+            candidates,
+            decisive,
+            n_classes=len(categories),
+        )
 
     classes = np.asarray(categories.tolist(), dtype=object)
     labels = np.full(n_cells, None, dtype=object)
-    labels[assigned] = classes[winner_codes[assigned]]
-    candidates = np.full(n_cells, None, dtype=object)
-    candidates[decisive] = classes[winner_codes[decisive]]
+    labels[assigned] = classes[candidates[assigned]]
+    candidate_labels = np.full(n_cells, None, dtype=object)
+    candidate_labels[decisive] = classes[candidates[decisive]]
     reason_names = np.asarray((None, *ABSTENTION_REASONS), dtype=object)[reason]
     evidence = pd.DataFrame(
         {
             # Labels keep their value type, so these columns stay object-typed
             # rather than being inferred as text, and missing values are None.
             "label": pd.Series(labels, dtype=object),
-            "candidateLabel": pd.Series(candidates, dtype=object),
+            "candidateLabel": pd.Series(candidate_labels, dtype=object),
             "voteFraction": values["vote_fraction"],
             "topTwoMargin": values["top_two_margin"],
             "voteEntropy": values["vote_entropy"],
@@ -971,9 +1047,28 @@ def _load_label_transfer(root: zarr.Group, ref: ArtifactRef) -> LabelTransferRes
         max_distance=max_distance,
         categories=categories,
         evidence=evidence,
-        vote_class_codes=vote_class_codes,
-        vote_class_fractions=vote_class_fractions,
+        vote_class_codes=values.get("vote_class_codes"),
+        vote_class_fractions=values.get("vote_class_fractions"),
     )
+
+
+def _check_votes(
+    vote_class_codes: np.ndarray,
+    vote_class_fractions: np.ndarray,
+    candidates: np.ndarray,
+    decisive: np.ndarray,
+    *,
+    n_classes: int,
+) -> None:
+    """Check that the saved votes name known classes and favor the candidates."""
+    if vote_class_codes.size and (
+        int(vote_class_codes.min()) < -1 or int(vote_class_codes.max()) >= n_classes
+    ):
+        raise ValueError("Label transfer votes name an unknown reference class")
+    rows = np.arange(len(candidates))
+    winners = vote_class_codes[rows, np.argmax(vote_class_fractions, axis=1)]
+    if not np.array_equal(winners[decisive], candidates[decisive]):
+        raise ValueError("Label transfer candidates do not match their votes")
 
 
 def _transfer_parameters(parameters: Mapping[str, Any]) -> tuple[float, float | None]:

@@ -524,7 +524,8 @@ def test_mapping_calibration_respects_direction_and_draws_uncertainty():
             "customConfidence": [0.9, 0.7, 0.4, 0.1],
         }
     )
-    store = _controlled_mapping_store(evidence=evidence)
+    # A zero vote cutoff keeps every candidate eligible for the other metrics.
+    store = _controlled_mapping_store(evidence=evidence, threshold_fraction=0.0)
     known = np.asarray(["A", "B", "A", "B"])
 
     higher = plotting_mapping.mapping_calibration(
@@ -716,6 +717,56 @@ def test_mapping_calibration_marks_the_transfer_threshold_without_extra_rows():
     assert silent.provenance.extras["marked_threshold"] is None
     for plot in (default, explicit, silent):
         plot.close()
+
+
+def test_mapping_calibration_keeps_the_transfers_other_rules():
+    evidence = pd.DataFrame(
+        {
+            "label": ["A", None, None],
+            "candidateLabel": ["A", "B", "A"],
+            "voteFraction": [0.9, 0.6, 0.95],
+            "topTwoMargin": [0.8, 0.2, 0.9],
+            "nearestDistance": [1.0, 1.0, 5.0],
+        }
+    )
+    known = np.asarray(["A", "A", "B"])
+    # The second cell falls below the vote cutoff and the third lies beyond
+    # the distance limit, so the transfer labels only the first.
+    store = _controlled_mapping_store(
+        evidence=evidence,
+        threshold_fraction=0.8,
+        max_distance=2.0,
+    )
+
+    def first_row(metric: str) -> dict[str, float]:
+        plot = plotting_mapping.mapping_calibration(
+            store,
+            _TRANSFER_REF,
+            known_labels=known,
+            metric=metric,
+            direction="higher" if metric != "nearestDistance" else "lower",
+            thresholds=[0.0] if metric != "nearestDistance" else [10.0],
+            show=False,
+        )
+        row = plot.tables["calibration"].iloc[0]
+        plot.close()
+        return {"coverage": row["coverage"], "accuracy": row["accuracy"]}
+
+    # Another metric is calibrated among the cells the transfer labelled.
+    assert first_row("topTwoMargin") == {"coverage": 1 / 3, "accuracy": 1.0}
+    # Sweeping a rule's own metric replaces that rule and keeps the other one.
+    assert first_row("voteFraction") == {"coverage": 2 / 3, "accuracy": 0.5}
+    assert first_row("nearestDistance") == {"coverage": 2 / 3, "accuracy": 0.5}
+
+    marked = plotting_mapping.mapping_calibration(
+        store,
+        _TRANSFER_REF,
+        known_labels=known,
+        metric="nearestDistance",
+        show=False,
+    )
+    assert marked.provenance.extras["marked_threshold"] == 2.0
+    marked.close()
 
 
 def test_mapping_score_rejects_a_malformed_reference_label_source():
