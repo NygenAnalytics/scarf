@@ -25,12 +25,11 @@ It is important to note that graph imputation it is strictly a visualization and
 
 In this tutorial, we utilize a preconducted PBMC analysis to smooth the expression of the T-cell marker CD4 and check whether diffusion fills missing gaps inside the expected populations of where we would see CD4. CD4 is a good teaching example because it is dropout-prone and biologically tricky, as it serves one of the key examples of how mRNA expression can differ heavily from protein expression.
 
-During this tutorial, its important to note that since human monocytes also express CD4, multiple genes are required to properly annotate a cluster, a point further discussed in in {doc}`annotation`. The core {doc}`scrna_seq` workflow shows the broad PBMC map this page reuses, and {doc}`graph_construction` covers how the underlying neighborhood graph is chosen.
+During this tutorial, its important to note that this is for exploratory analysis, and that this information can't be solely used to assign cell types. For examples, since human moncoytes also express CD4, the signal we observe could be from T-cells or monocytes; Thus, multiple genes are required to properly annotate a cluster, a point further discussed in in {doc}`annotation`. The core {doc}`scrna_seq` workflow shows the PBMC map this page uses, and {doc}`graph_construction` covers how the underlying neighborhood graph is chosen and built.
 
-## 1. Open the prepared baseline
+## Open the prepared result
 
 Diffusion needs a the completed k-nearest-neighbourhood graph, thus we pull that information alongside its 2 dimensional embedding (the UMAP).
-
 
 ```{code-cell}
 import pandas as pd
@@ -50,23 +49,9 @@ run = ds.pipeline.open(label="docs_default")
 graph = run["connectivity_map"]
 ```
 
-## 2. Diffuse one feature
+## Conduct graph diffusion on CD4
 
-For graph imputation in SCARF, the key hyperparameter is `t`, which controls diffusion depth. 
-
-
-
- the number of graph steps each cell's signal mixes across.
-`t=1` is a light touch over immediate neighbors, the default `t=2` smooths a little further,
-and `t=4` spreads signal widely and can erase real boundaries between populations.
-A larger operator is also denser in memory, so if a large `t` raises a memory error,
-retry with a smaller `t` or a larger datastore memory budget.
-
-Read the summary table in the next cell as a depth check. Mean should stay near the observed
-level while max falls with `t` as peak signal spreads across neighbors. `zero_fraction`
-falls and `filled_zeros` rises with `t` by construction, so more filling is not by itself
-better. Prefer the smallest `t` that fills gaps inside the same high-expression
-neighborhoods without pushing signal into unrelated clusters.
+For graph imputation in SCARF, the key hyperparameter is `t`, which controls diffusion depth. We can conceptually think about our vaues of `t` as the number of diffusion steps. During the diffusion progress, when `t`= 1, each cell is averaging only its directly adjacent cells. When`t`= 2, each step has each cell averages 2-hops (a neighbor of a neighbor and so on so forth), resulting in the smoothing over a wider neighborhood, rather than the adjacdent cells (SCARF'S default). As we approach`t` = 3, each cell now averages 3-hops, resulting in a broader smoothing of the global signal and potential borrowing from unrelated populations.
 
 ```{code-cell}
 diffusion_operators = {
@@ -101,25 +86,26 @@ cd4_summary = pd.DataFrame(
 cd4_summary
 ```
 
-## 3. Compare observed and diffused values
+The summary table above can be read from top to bottom, with the first column representing the observed data. We see that generally, when `t `= 1, the mean should look about the same as the observed mean, while the max drops a little as peak signal spreads to directly adjacent cells. When `t  `= 2, the max drops further and more zeros fill in, since each cell now pulls from a wider neighborhood, thus the max drops further as more cells are added to the average. As we approach `t` = 3, even more zeros fill in, but this filling happens by design as each cell reaches further, so more filling alone does not mean a better result. Ideally, you want to find the balance between the t that fills the gaps inside your neighborhood that already has epression, without pulling the signal from other clusters. Higher `t` values increase diffusion, which can blend distinct phenotypes, creating smooth "gradients" between cell types that are biologically distinct; comparing these results again our observed or "true" data is critical.
+
+
+## Compare observed and diffused values
 
 Mean stays near the observed level while max falls with `t` as diffusion spreads peak signal across neighbours.
-`zero_fraction` also falls with `t`.
-`filled_zeros` counts active cells that were zero for observed CD4 and became nonzero after diffusion.
-That count is the size of the nonzero-as-detection mistake for this feature.
+`zero_fraction` also falls as `t` increases.
 
-The frozen selected clustering gives population context for the CD4 panels below.
+Now, to compare our observed vs. diffusion values throughout our clusters of interest, we can first start by viewing our clustering results to gain a population context for the CD4 panels below.
 
 ```{code-cell}
 ds.plots.embedding(
     run=run,
     layout="umap",
     color_by="clusters",
+    legend_loc="on"
 )
 ```
 
-The comparison uses the exact UMAP artifact from the same run while coloring by the live columns
-created above.
+Now, using this UMAP as a starting point, we can compare our observed vs. diffused values of CD4 visually. 
 
 ```{code-cell}
 imputation_comparison = ds.plots.embedding(
@@ -146,10 +132,12 @@ imputation_comparison.figure
 ```
 
 The imputed panels should fill gaps inside the same high-expression neighbourhoods visible in the observed panel.
-Use the cluster map to check that high CD4 stays inside T-cell-like partitions rather than spreading into unrelated populations.
-Signal across unrelated clusters indicates excessive diffusion or a graph that does not represent the intended biology.
+Use the cluster map to check that high CD4 stays inside clusters of interest rather than spreading into unrelated populations. Signal across unrelated clusters indicates excessive diffusion or a graph that does not represent the intended biology.
 
-## 4. Caveats
+If we also want to view our results through the same table format, we can run the following:
+
+
+## Caveats
 
 The result depends on the immutable cell selection and graph captured by each diffusion artifact.
 Repeating `run_diffusion_operator` with the same graph and `t` reuses the complete stored artifact.
