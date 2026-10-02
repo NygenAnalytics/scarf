@@ -208,7 +208,10 @@ def canonicalize_sparse(coo: Any, dtype: Any | None = None) -> Any:
             canonical = coo_matrix((data, (coo.row, coo.col)), shape=coo.shape)
             canonical.sum_duplicates()
         else:
+            # A canonical CSR converts to a COO in canonical order, but SciPy
+            # marks that COO canonical only from 1.17.
             canonical = canonical.tocoo()
+            canonical.has_canonical_format = True
     if dtype is not None:
         canonical.data = checked_sparse_cast(canonical.data, dtype)
     return canonical
