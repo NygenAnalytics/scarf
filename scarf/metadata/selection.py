@@ -380,12 +380,16 @@ def resolve_complete_labels(
     labels: ArtifactRef,
     *,
     name: str,
+    remedy: str | None = None,
 ) -> ResolvedCellArtifact:
     """Resolve artifact labels that must assign every selected cell to a group.
 
     Producers that persist a per-group result cannot treat a stored
     placeholder as a label, so labels whose linked mask flags a row are
-    rejected before any result is reused or written.
+    rejected before any result is reused or written. The error ends with
+    ``remedy``, which says how to make labels that the caller accepts. The
+    default narrows the labels to their labelled cells, which suits a
+    caller that takes labels over any cell selection.
     """
     if not isinstance(labels, ArtifactRef):
         raise TypeError(f"{name} must be an ArtifactRef")
@@ -396,11 +400,13 @@ def resolve_complete_labels(
         expected_kind=labels.kind,
     )
     if resolved.missing_mask is not None and bool(resolved.missing_mask.any()):
-        raise ValueError(
-            f"{name} contains missing labels. Select the labelled cells with "
-            f"select_cells({name}, include=...) and derive complete labels for "
-            "that selection"
-        )
+        if remedy is None:
+            remedy = (
+                f"Select the labelled cells with select_cells({name}, include=[...]) "
+                f"and freeze their labels with snapshot_cluster_labels({name}, "
+                "cell_selection=...)"
+            )
+        raise ValueError(f"{name} contains missing labels. {remedy}")
     return resolved
 
 

@@ -138,12 +138,15 @@ class ArtifactRef:
 
 @dataclass(frozen=True, slots=True)
 class ExternalArtifactRef:
-    """One exact artifact in another datastore.
+    """One exact artifact held by another datastore.
 
-    ``dataset_fingerprint`` identifies the other datastore by the prepared
-    dataset fingerprint of one of its assays, the anchor assay. The anchor is
-    the artifact's own assay unless ``anchor_assay`` names another one, which
-    a datastore-scoped artifact, or an artifact of a different assay, must do.
+    ``dataset_fingerprint`` names the dataset whose axes the artifact is
+    aligned to: the prepared dataset fingerprint of one of its assays, the
+    anchor assay. It names a dataset, not a datastore, so a mount and its
+    source share it, and the caller supplies the datastore that holds the
+    artifact. The anchor is the artifact's own assay unless ``anchor_assay``
+    names another one, which a datastore-scoped artifact, or an artifact of a
+    different assay, must do.
     """
 
     dataset_fingerprint: str

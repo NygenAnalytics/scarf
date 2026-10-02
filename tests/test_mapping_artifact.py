@@ -729,7 +729,13 @@ def test_load_rejects_each_inconsistent_reference_record(
     group.attrs["reference_metadata"] = original | {
         "normalization_parameters": parameters | {"unexpected": 1}
     }
-    with pytest.raises(ValueError, match="normalization is unsupported"):
+    with pytest.raises(
+        ValueError,
+        match=r"normalization is unsupported: Unsupported reference normalization "
+        r"parameters: unexpected\. Recompute the normalization with "
+        r"run_normalization, then PCA and its descendants\. Rebuild it with "
+        r"build_mapping_reference\(neighbors\)\.$",
+    ):
         load_artifact_mapping_reference(datastore, reference.ref)
     normalized_group.attrs["provenance"] = normalized_provenance
     group.attrs["reference_metadata"] = original

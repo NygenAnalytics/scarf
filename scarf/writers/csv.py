@@ -6,6 +6,7 @@ import pandas as pd
 
 from ..storage.types import as_zarr_group
 from ..readers import CSVReader
+from ..storage.count_dtype import count_storage_dtype
 from ..storage.count_matrix import CountMatrixPolicy
 from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import (
@@ -26,19 +27,26 @@ class CSVtoZarr:
         assay_name: A label for the assay. Ex. "RNA" or "ATAC"
         workspace: Workspace name in the destination store. None uses the
                    legacy layout without a workspace group.
-        dtype: the dtype of the data.
         storage_options: Backend options passed when opening the Zarr store.
         mem_budget: Memory available to the conversion. Accepts bytes, a
                     suffixed size (e.g. '8G'), or a fraction of total system memory (e.g. '0.6').
         nthreads: Worker count for write-time concurrency. When None, auto-detected.
         profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
                  None, chosen from the destination location.
-        policy: Count-matrix geometry policy. When None, the default
-                unitBytes and chunkBytes plan is used.
+        policy: Count-matrix geometry policy, used exactly. When None, the
+                default policy is used with unitBytes and chunkBytes halved
+                together until the counts write and the countsT transpose
+                fit ``mem_budget``. Either way, an import that does not fit
+                raises MemoryError before the destination is created.
         io: Optional explicit read, compute, and write widths. Unset values
             stay under automatic planning.
         assay_type: Preset assay type, such as ``RNA``, for an assay whose name
                     is not a preset. When None, the assay name decides the type.
+
+    The counts are stored in the dtype that
+    :func:`~scarf.storage.count_dtype.count_storage_dtype` resolves from the
+    range the reader found in its first pass over every row. A count that
+    the stored dtype cannot hold raises instead of wrapping.
 
     Attributes:
         csvr: A CSVReader object
@@ -52,7 +60,6 @@ class CSVtoZarr:
         zarr_loc: ZarrLocation,
         assay_name: str,
         workspace: str | None = None,
-        dtype: np.dtype | None = None,
         storage_options: dict[str, Any] | None = None,
         mem_budget: int | str | None = None,
         nthreads: int | None = None,
@@ -77,14 +84,13 @@ class CSVtoZarr:
         self.assayType = assay_type
         self.resources = resolve_budget(mem_budget, nthreads)
         self.profile = resolve_storage_profile(zarr_loc, profile)
-        self.policy = policy
         self.io = io
         self.workspace = workspace
         self.storage_options = storage_options
         cell_ids = self.csvr.cell_ids()
-        if len(cell_ids) != self.csvr.nCells:
-            raise ValueError("Number of cell IDs does not match the CSV row count")
-        self.dtype = self.csvr.countDtype if dtype is None else np.dtype(dtype)
+        storage_dtype = count_storage_dtype(self.csvr.countDtype, self.csvr.countRange)
+        # A layout that does not fit fails here, before the destination exists.
+        layout = self._fit_count_layout(storage_dtype, policy)
         self.z = load_zarr(zarr_loc, mode="w", storage_options=storage_options)
         _ = create_cell_data(
             root=self.z,
@@ -100,16 +106,52 @@ class CSVtoZarr:
             n_cells=self.csvr.nCells,
             feat_ids=self.csvr.feature_ids(),
             feat_names=self.csvr.feature_ids(),
-            dtype=str(self.dtype),
+            dtype=storage_dtype,
             profile=self.profile,
-            policy=policy,
+            policy=layout,
+        )
+
+    def _count_import_requirements(self) -> tuple[int, int]:
+        """Return the resident and source batch bytes of the counts write.
+
+        A batch is one reader chunk of every count column, held with its
+        DataFrame. The layout fit and the write plan the same import from
+        these.
+        """
+        from ..storage.identity import CountSummary
+
+        rows = min(int(self.csvr.pandas_kwargs["chunksize"]), self.csvr.nCells)
+        batch_bytes = rows * self.csvr.nFeatures * self.csvr.countDtype.itemsize
+        resident = CountSummary.nbytes_for(self.csvr.nCells, self.csvr.nFeatures)
+        return resident, 2 * batch_bytes
+
+    def _fit_count_layout(
+        self, storage_dtype: Any, requested: CountMatrixPolicy | None
+    ) -> CountMatrixPolicy:
+        """Return the count layout whose import and ``countsT`` fit the budget."""
+        from ..storage.sharding import dense_counts_admission, fit_count_layout
+        from .counts_t import counts_t_assays
+
+        resident, producer_reserve = self._count_import_requirements()
+        assay_types = {} if self.assayType is None else {self.assayName: self.assayType}
+        return fit_count_layout(
+            {self.assayName: (self.csvr.nFeatures, storage_dtype)},
+            nCells=self.csvr.nCells,
+            profile=self.profile,
+            memoryBytes=self.resources.memoryBytes,
+            transposed=counts_t_assays((self.assayName,), assay_types),
+            admitCounts=dense_counts_admission(resident + producer_reserve),
+            requested=requested,
         )
 
     def dump(self) -> None:
         """Writes the count values into the Zarr matrix.
 
         Raises:
-            AssertionError: Catches eventual bugs in the class, if number of cells does not match after transformation.
+            OverflowError: If a count no longer fits the stored dtype because
+                the file changed after the reader's pass.
+            ValueError: If the file no longer holds the rows that the
+                reader's pass counted.
 
         Returns:
             None
@@ -121,6 +163,7 @@ class CSVtoZarr:
 
         store = load_count_array(self.z, self.assayName, self.workspace)
         summary = CountSummary(store)
+        resident, producer_reserve = self._count_import_requirements()
         cell_data_path = (
             "cellData" if self.workspace is None else f"{self.workspace}/cellData"
         )
@@ -154,22 +197,20 @@ class CSVtoZarr:
                         parts[position].append(
                             _metadata_part(cell_values[:, position], dtype)
                         )
-                yield counts.astype(self.dtype)
+                # The writer casts to the stored dtype and rejects a count
+                # that dtype cannot hold.
+                yield counts
 
-        e = write_dense_from_row_batches(
+        write_dense_from_row_batches(
             store,
             count_batches(),
             msg="Writing CSV counts",
             resources=self.resources,
-            residentBytes=summary.nbytes,
             io=self.io,
+            producerReserveBytes=producer_reserve,
+            residentBytes=resident,
             countSummary=summary,
         )
-        if e != self.csvr.nCells:
-            raise AssertionError(
-                "ERROR: This is a bug in CSVtoZarr. All cells might not have been successfully "
-                "written into the zarr file. Please report this issue"
-            )
         for name, (position, _dtype) in metadata:
             values = np.concatenate([values for values, _missing in parts[position]])
             missing = np.concatenate([missing for _values, missing in parts[position]])
@@ -194,7 +235,6 @@ class CSVtoZarr:
             assay_type=self.assayType,
             resources=self.resources,
             profile=self.profile,
-            policy=self.policy,
             io=self.io,
         )
 

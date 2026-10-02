@@ -423,7 +423,8 @@ def _check_processing(
     ) == {
         "nObs": 6,
         "nVars": 5,
-        "countsDtype": "int32",
+        # The int32 source counts are small non-negative integers.
+        "countsDtype": "uint8",
         "countsTShape": [5, 6],
         "countsTComplete": True,
         "countsTMatches": True,
@@ -717,7 +718,7 @@ def test_cellxgene_collection_becomes_an_openable_cytebase_dataset(
             "verifiedAt": record["buildReceipt"]["verifiedAt"],
             "nObs": 6,
             "nVars": 5,
-            "countsDtype": "int32",
+            "countsDtype": "uint8",
         }
 
         # 6. Rerunning the ready dataset skips it and keeps the verified build.

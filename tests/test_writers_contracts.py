@@ -55,11 +55,11 @@ _PUBLIC_CLASS_METHODS = {
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    CrToZarr: "04123fcfad28e763a0966995c9333af5066971c02606f1783c4187d2868b2d7e",
+    CrToZarr: "dcd79c317ee80f91a6990bb2139290f098833400c7ff4db24c1b9f85c6b2f1fa",
     H5adToZarr: "11ef319e746a2750d99d04d778a2c4cc2de9092d44fae2d9b203ec5e747a1d11",
-    SparseToZarr: "00afca68257558e160963a98961cca0cc6f13977effbfc15a59fa863e3ec7090",
-    CSVtoZarr: "4e0eeed1aaa26742cfb3097c396c9e27598cfe4f8335054e92f868e146af87fb",
-    SubsetZarr: "336779f81466725dacedd61a10ed267ab6514fff8ef4773efb49936ceff92e6d",
+    SparseToZarr: "3b376a0b1f1888596d352fb32ea94d2c422ad7977f36f7e8c7893e2dc345171e",
+    CSVtoZarr: "8e1f46c23a50c6cb52a89df4a87fd4b8911c30527244856c20c448a50931d1dd",
+    SubsetZarr: "76fd6326d68a545065ce07fed9411ec7f02d3f080041db627c3623bda5fe4ed8",
     SeuratToZarr: "f004e56b22727b4d229824a37b8b877655a650c8b4bab235693a4449acaf7111",
 }
 _MODULE_FUNCTIONS = (
@@ -73,7 +73,7 @@ _MODULE_FUNCTIONS = (
     "write_renorm_subset_to_zarr",
 )
 _MODULE_SIGNATURE_DIGEST = (
-    "e179c717241fa271ec1a3609b9dfc72ff7b8c4be4d14ca491b521ea918ea9ac9"
+    "878ad602360bfdcbda3bd69cbfa8138ef20ee8a3b77e0324f73da7836e17f39f"
 )
 
 
@@ -219,6 +219,7 @@ def test_writer_rejects_reserved_assay_name_before_mutation():
             2,
             ["g1", "g2"],
             ["Gene 1", "Gene 2"],
+            np.uint8,
         )
 
     assert list(root.group_keys()) == []
@@ -231,6 +232,7 @@ def test_writer_rejects_reserved_assay_name_before_mutation():
             2,
             ["g1", "g2"],
             ["Gene 1", "Gene 2"],
+            np.uint8,
         )
 
     assert list(root.group_keys()) == []
@@ -243,6 +245,7 @@ def test_writer_rejects_reserved_assay_name_before_mutation():
             2,
             ["g1", "g2"],
             ["Gene 1", "Gene 2"],
+            np.uint8,
         )
 
     assert list(root.group_keys()) == []
@@ -264,7 +267,6 @@ def test_conversion_writers_reject_summary_before_truncating_destination():
             object(),
             zarr_loc=store,
             assay_name="summary",
-            dtype=np.dtype("uint32"),
         ),
         "h5ad": lambda store: H5adToZarr(
             object(),

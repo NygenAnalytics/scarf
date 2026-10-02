@@ -153,20 +153,31 @@ def dtype_for_integer_sum(dtype: np.dtype[Any], copies: int) -> np.dtype[Any]:
 def resolve_merge_dtype(
     assays: list[Any | None],
     feat_order_map: list[np.ndarray],
-    explicit: str | None,
 ) -> str:
-    if explicit is not None:
-        return explicit
-    present = [
-        assay
+    """Return the count dtype of a merged assay.
+
+    It is the common type of the source count dtypes, widened so that
+    features summed by name cannot overflow it. An assay that has no features
+    in any source holds no counts and is stored as uint8, as an empty import
+    is.
+
+    Raises:
+        ValueError: If integer sources have no common integer dtype.
+    """
+    dtypes = [
+        np.dtype(assay.rawData.dtype)
         for assay in assays
         if assay is not None and int(getattr(assay.feats, "N", 0)) > 0
     ]
-    if not present:
-        return "uint32"
-    dtypes = {str(assay.rawData.dtype) for assay in present}
-    if len(dtypes) != 1:
-        return "float"
+    if not dtypes:
+        return "uint8"
+    common = np.result_type(*dtypes)
+    if all(dtype.kind in "biu" for dtype in dtypes) and common.kind not in "biu":
+        raise ValueError(
+            "Source counts stored as "
+            + ", ".join(sorted({dtype.name for dtype in dtypes}))
+            + " have no common integer dtype"
+        )
     max_copies = max(
         (
             int(np.unique(order_map, return_counts=True)[1].max())
@@ -175,4 +186,4 @@ def resolve_merge_dtype(
         ),
         default=1,
     )
-    return str(dtype_for_integer_sum(np.dtype(present[0].rawData.dtype), max_copies))
+    return str(dtype_for_integer_sum(common, max_copies))

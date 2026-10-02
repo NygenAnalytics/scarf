@@ -103,6 +103,7 @@ from scarf.datastore.mapping_datastore import MappingDatastore
 from scarf.cytebase import Repository, connect, list_repositories
 from scarf.embeddings.harmony import Harmony, HarmonyResult, fit_harmony
 from scarf.features import (
+    RankMarkerResult,
     find_markers_by_rank,
     fit_lowess,
     select_highly_variable_features,
@@ -171,6 +172,8 @@ for feature_function in (
     select_highly_variable_features,
 ):
     assert callable(feature_function)
+assert RankMarkerResult.__module__ == "scarf.features.markers.table"
+assert scarf.features.markers.RankMarkerResult is RankMarkerResult
 assert callable(knn_clustering)
 for reader_class in (
     CrH5Reader,

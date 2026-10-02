@@ -18,6 +18,7 @@ from scarf.storage.sharding import (
     row_band_task_count,
 )
 from scarf.storage.types import array_metadata_shards
+from scarf.utils.count_values import CountValueRange
 from scarf.writers import CrToZarr, H5adToZarr, SparseToZarr
 
 
@@ -94,7 +95,7 @@ def test_sparse_import_planner_prefers_geometry_and_shrinks_monotonically() -> N
     large = resolve_sparse_import_batch(
         destinations,
         nRows=12,
-        resources=ResourceBudget(15_000, 2),
+        resources=ResourceBudget(13_000, 2),
         maxWindowNnz=lambda rows: min(rows, 12) * 4,
         sourceDtype=np.uint32,
         producerStagingBytes=lambda rows: rows * 1_000,
@@ -110,7 +111,7 @@ def test_sparse_import_planner_prefers_geometry_and_shrinks_monotonically() -> N
     wider = resolve_sparse_import_batch(
         destinations,
         nRows=12,
-        resources=ResourceBudget(15_000, 2),
+        resources=ResourceBudget(13_000, 2),
         maxWindowNnz=lambda rows: min(rows, 12) * 8,
         sourceDtype=np.uint32,
         producerStagingBytes=lambda rows: rows * 1_000,
@@ -119,22 +120,141 @@ def test_sparse_import_planner_prefers_geometry_and_shrinks_monotonically() -> N
     assert large.batchRows == 4
     assert large.producerReserveBytes == 8_272
     assert large.writeTasks == 5
-    assert small.batchRows == 1
+    assert small.batchRows == 2
     assert small.producerReserveBytes < large.producerReserveBytes
     assert wider.batchRows < large.batchRows
 
 
-def test_sparse_import_planner_preserves_override_and_fails_one_band() -> None:
-    destinations = _planner_destinations()
-    explicit = resolve_sparse_import_batch(
-        destinations,
-        nRows=12,
-        resources=ResourceBudget(1_000_000, 2),
-        maxWindowNnz=lambda rows: min(rows, 12) * 4,
-        sourceDtype=np.uint32,
-        batchRows=7,
+def test_sparse_admission_checks_the_pull_and_write_phases_separately() -> None:
+    from scarf.storage.sharding import (
+        _band_geometry,
+        _row_band_task_peak,
+        sparse_producer_peak_bytes,
     )
-    assert explicit.batchRows == 7
+
+    destination = zarr.open_group(store=MemoryStore(), mode="w").create_array(
+        "counts", shape=(64, 8), chunks=(16, 8), shards=(16, 8), dtype=np.float32
+    )
+
+    def window_nnz(rows: int) -> int:
+        return min(rows, 64) * 8
+
+    def admits(memory: int) -> bool:
+        try:
+            resolve_sparse_import_batch(
+                (destination,),
+                nRows=64,
+                resources=ResourceBudget(memory, 1),
+                maxWindowNnz=window_nnz,
+                sourceDtype=np.float32,
+                batchRows=1,
+            )
+        except MemoryError:
+            return False
+        return True
+
+    low, high = 0, 1_000_000
+    while high - low > 1:
+        middle = (low + high) // 2
+        low, high = (low, middle) if admits(middle) else (middle, high)
+
+    # The in-process producer buffers one source row and the next band while
+    # no band is written, and holds only its source row while a band is.
+    buffering = sparse_producer_peak_bytes(window_nnz(1 + 16), window_nnz(1), 4)
+    held = sparse_producer_peak_bytes(0, window_nnz(1), 4)
+    band = window_nnz(16) * (4 + 2 * 8)
+    dense, inner, chunks = _band_geometry(destination)
+    task = _row_band_task_peak(
+        sourceBytes=0,
+        denseBytes=dense,
+        innerChunkBytes=inner,
+        nChunks=chunks,
+        innerConcurrency=1,
+    )
+    assert high == max(buffering + 1, held + band + task)
+    # Summing the buffering peak into the write task would refuse this budget.
+    assert high < buffering + band + task
+
+
+@pytest.mark.parametrize(
+    ("columns", "dtype", "memory_bytes", "reserve_bytes"),
+    [
+        # The producer's buffering peak leaves no room for a second pending
+        # band.
+        (3, np.uint16, 60_000, 59_900),
+        # A second pending band fits beside the buffering peak, but no band
+        # write would fit beside both. Each dense band holds 20,400 sparse
+        # bytes.
+        (300, np.uint8, 40_800, 20_400),
+    ],
+)
+def test_sparse_writer_writes_pending_bands_before_a_pull_that_would_not_fit(
+    columns, dtype, memory_bytes, reserve_bytes
+):
+    from scarf.storage.sharding import (
+        SparseRowBand,
+        SparseWriteBand,
+        write_sparse_bands,
+    )
+
+    destination = zarr.open_group(store=MemoryStore(), mode="w").create_array(
+        "counts",
+        shape=(12, columns),
+        chunks=(4, columns),
+        shards=(4, columns),
+        dtype=dtype,
+        fill_value=0,
+    )
+    expected = (np.arange(12 * columns) % 50 + 1).astype(dtype).reshape(12, columns)
+    written_before_pull: list[bool] = []
+
+    def writes():
+        for start in range(0, 12, 4):
+            written_before_pull.append(
+                np.array_equal(destination[:start], expected[:start])
+            )
+            band = coo_matrix(expected[start : start + 4])
+            yield SparseWriteBand(
+                destination=destination,
+                band=SparseRowBand(
+                    start=start,
+                    end=start + 4,
+                    nColumns=columns,
+                    row=band.row.astype(np.int64),
+                    column=band.col.astype(np.int64),
+                    data=band.data,
+                    dtype=dtype,
+                ),
+            )
+
+    # Four workers have room to write several bands at once.
+    write_sparse_bands(
+        writes(),
+        resources=ResourceBudget(memory_bytes, 4),
+        producerReserveBytes=reserve_bytes,
+    )
+    # Every earlier band is written before the producer is pulled again.
+    assert written_before_pull == [True, True, True]
+    np.testing.assert_array_equal(destination[:], expected)
+
+
+def test_sparse_import_planner_keeps_an_explicit_batch_up_to_one_band() -> None:
+    destinations = _planner_destinations()
+
+    def explicit(rows: int) -> int:
+        return resolve_sparse_import_batch(
+            destinations,
+            nRows=12,
+            resources=ResourceBudget(1_000_000, 2),
+            maxWindowNnz=lambda width: min(width, 12) * 4,
+            sourceDtype=np.uint32,
+            batchRows=rows,
+        ).batchRows
+
+    # The shortest destination band holds four rows; a wider batch would
+    # only buffer more source rows than the layout fit admitted.
+    assert explicit(3) == 3
+    assert explicit(7) == 4
     with pytest.raises(ValueError, match="batch_size must be positive"):
         resolve_sparse_import_batch(
             destinations,
@@ -187,6 +307,13 @@ class _PlanningReader:
         for start in range(0, self.nCells, batch_size):
             yield coo_matrix(self.values[start : start + batch_size])
 
+    def count_value_ranges(
+        self, maxBytes: int, featureGroups: np.ndarray | None = None
+    ) -> list[CountValueRange]:
+        value_range = CountValueRange()
+        value_range.update(self.values)
+        return [value_range]
+
     def max_window_nnz(self, window_rows: int) -> int:
         self.windowRequests.append(window_rows)
         width = min(window_rows, self.nCells)
@@ -223,12 +350,12 @@ def test_crtozarr_automatic_rows_and_preflight_before_consume(
     monkeypatch.setattr(sharding, "write_sparse_bands", recording_write)
     values = np.eye(8, 4, dtype=np.uint16)
     reader = _PlanningReader(values)
+    # The counts store as uint8, so 16 bytes give four-row shards.
     writer = CrToZarr(
         reader,
         MemoryStore(),
-        dtype="uint16",
         mem_budget="64M",
-        policy=CountMatrixPolicy(unitBytes=32, chunkBytes=16),
+        policy=CountMatrixPolicy(unitBytes=16, chunkBytes=8),
     )
     writer.dump()
 
@@ -239,16 +366,17 @@ def test_crtozarr_automatic_rows_and_preflight_before_consume(
     assert writer._lastImportPlan.writeTasks == 2
 
     rejected = _PlanningReader(values)
-    writer = CrToZarr(
-        rejected,
-        MemoryStore(),
-        dtype="uint16",
-        mem_budget=1,
-        policy=CountMatrixPolicy(unitBytes=32, chunkBytes=16),
-    )
-    with pytest.raises(MemoryError, match="one source row"):
-        writer.dump()
+    destination = MemoryStore()
+    with pytest.raises(MemoryError, match="requested count-matrix policy"):
+        CrToZarr(
+            rejected,
+            destination,
+            mem_budget=1,
+            policy=CountMatrixPolicy(unitBytes=16, chunkBytes=8),
+        )
     assert rejected.consumed == []
+    with pytest.raises(FileNotFoundError):
+        zarr.open_group(store=destination, mode="r")
 
 
 class _TrackingCsr(csr_matrix):
@@ -407,19 +535,19 @@ def test_cellranger_h5_automatic_matches_explicit_and_caches_planning(
     stores = [MemoryStore(), MemoryStore()]
     readers = [CrH5Reader(str(path)), CrH5Reader(str(path))]
     try:
+        # The uint16 source stores as uint8, so half the byte targets of the
+        # uint16 layout give the same geometry.
         automatic = CrToZarr(
             readers[0],
             stores[0],
-            dtype="uint16",
             mem_budget="64M",
-            policy=CountMatrixPolicy(unitBytes=48, chunkBytes=24),
+            policy=CountMatrixPolicy(unitBytes=24, chunkBytes=12),
         )
         explicit = CrToZarr(
             readers[1],
             stores[1],
-            dtype="uint16",
             mem_budget="64M",
-            policy=CountMatrixPolicy(unitBytes=48, chunkBytes=24),
+            policy=CountMatrixPolicy(unitBytes=24, chunkBytes=12),
         )
         automatic.dump()
         explicit.dump(batch_size=3)
@@ -458,7 +586,7 @@ def test_cellranger_h5_automatic_matches_explicit_and_caches_planning(
             explicit_arrays,
             strict=True,
         ):
-            assert automatic_array.dtype == explicit_array.dtype == np.dtype(np.uint16)
+            assert automatic_array.dtype == explicit_array.dtype == np.dtype(np.uint8)
             assert automatic_array.chunks == explicit_array.chunks
             assert array_shard_rows(automatic_array) == array_shard_rows(explicit_array)
     finally:
@@ -483,19 +611,21 @@ def test_h5ad_automatic_matches_explicit_for_split_assays(
         H5adReader(str(path), feature_name_key="feature_name"),
     ]
     try:
+        # These counts store as uint8, so half the byte targets of the uint16
+        # imports in this module give the same geometry.
         automatic = H5adToZarr(
             readers[0],
             stores[0],
             assay_split_key="feature_types",
             mem_budget="64M",
-            policy=CountMatrixPolicy(unitBytes=48, chunkBytes=24),
+            policy=CountMatrixPolicy(unitBytes=24, chunkBytes=12),
         )
         explicit = H5adToZarr(
             readers[1],
             stores[1],
             assay_split_key="feature_types",
             mem_budget="64M",
-            policy=CountMatrixPolicy(unitBytes=48, chunkBytes=24),
+            policy=CountMatrixPolicy(unitBytes=24, chunkBytes=12),
         )
         automatic.dump()
         explicit.dump(batch_size=3)
@@ -527,7 +657,8 @@ def test_h5ad_automatic_matches_explicit_for_split_assays(
             explicit_arrays,
             strict=True,
         ):
-            assert automatic_array.dtype == explicit_array.dtype == np.dtype(np.uint16)
+            # Counts up to 6 store as uint8 whatever the source dtype.
+            assert automatic_array.dtype == explicit_array.dtype == np.dtype(np.uint8)
             assert automatic_array.chunks == explicit_array.chunks
             assert array_shard_rows(automatic_array) == array_shard_rows(explicit_array)
     finally:
@@ -548,7 +679,7 @@ def test_sparse_automatic_matches_explicit() -> None:
             cell_ids=[f"cell-{index}" for index in range(values.shape[0])],
             feature_ids=[f"feature-{index}" for index in range(values.shape[1])],
             mem_budget="64M",
-            policy=CountMatrixPolicy(unitBytes=48, chunkBytes=24),
+            policy=CountMatrixPolicy(unitBytes=24, chunkBytes=12),
         )
         for store in stores
     ]
@@ -563,7 +694,7 @@ def test_sparse_automatic_matches_explicit() -> None:
         values.shape[0],
     )
     assert writers[1]._lastImportPlan.batchRows == 3
-    assert automatic_array.dtype == explicit_array.dtype == np.dtype(np.uint16)
+    assert automatic_array.dtype == explicit_array.dtype == np.dtype(np.uint8)
     assert automatic_array.chunks == explicit_array.chunks
     assert array_shard_rows(automatic_array) == array_shard_rows(explicit_array)
     np.testing.assert_array_equal(automatic_array[:], explicit_array[:])

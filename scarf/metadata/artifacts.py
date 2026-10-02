@@ -6,7 +6,12 @@ from typing import Any
 import numpy as np
 import zarr
 
-from ..storage.arrays import create_metadata_column, create_zarr_dataset
+from ..storage.arrays import (
+    _decode_metadata_values,
+    _measured_text_dtype,
+    create_metadata_column,
+    create_zarr_dataset,
+)
 from ..storage.artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
@@ -18,10 +23,12 @@ from ..storage.artifact_writer import (
 from ..storage.artifacts import (
     ArtifactRef,
     ArtifactScope,
+    fingerprint_array,
     fingerprint_stored_arrays,
 )
 from ..storage.selections import validate_cell_selection
 from ..storage.types import as_zarr_array, as_zarr_group
+from .selection import CellField, resolve_grouping, valid_category_mask
 
 _CATEGORY_COLORS = (
     "#4e79a7",
@@ -36,6 +43,11 @@ _CATEGORY_COLORS = (
     "#bab0ab",
 )
 _HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
+_TEXT_LABEL_KINDS = frozenset({"O", "S", "T", "U"})
+_LABEL_KINDS = _TEXT_LABEL_KINDS | {"b", "i", "u"}
+# int64 holds the whole numbers in [-_INT64_BOUND, _INT64_BOUND). A float64
+# bound, unlike a Python float, compares with float16 labels without overflow.
+_INT64_BOUND = np.float64(2.0**63)
 
 
 def validate_display_metadata(
@@ -222,6 +234,114 @@ def write_cell_data_artifact(
                 tuple(arrays),
             )
     return group
+
+
+def snapshot_cluster_labels(
+    root: zarr.Group,
+    cells: Any,
+    labels: str | ArtifactRef,
+    *,
+    cell_selection: ArtifactRef,
+) -> ArtifactRef:
+    """Freeze one label per selected cell as a ``cluster_labels`` artifact.
+
+    ``labels`` names a column of ``cells`` or references a cell-label
+    artifact, whose own cell selection must contain ``cell_selection``.
+    Labels must be text, integer, or boolean values, or floating-point whole
+    numbers within the int64 range, such as the float64 ids that pandas
+    writes for integer ids with missing values. Other floating-point labels
+    are rejected whether or not they hold NaN, and every selected cell needs
+    a label that is not missing, masked, or blank. Text is stored at the
+    width of the selected labels, so the declared width and encoding of the
+    source do not change the identity; floating-point whole numbers are
+    stored as int64, and integer and boolean labels keep their dtype. The
+    identity holds the source column name or source artifact, the cell
+    selection, and a fingerprint of the stored labels, and a match is
+    reused only while its payload is exactly those labels.
+
+    Raises:
+        TypeError: If ``labels`` or ``cell_selection`` has the wrong type, or
+            if a label is not a text, integer, boolean, or whole-number
+            value.
+        ValueError: If a selected cell has no label.
+        PermissionError: If no snapshot matches and ``root`` is read-only.
+    """
+    source: ArtifactRef | CellField
+    parameters: dict[str, Any]
+    inputs: dict[str, Any]
+    if isinstance(labels, str):
+        source = CellField(labels, kind="categorical")
+        described = f"column {labels!r}"
+        example = "snapshot_cell_selection of a boolean column that marks them"
+        parameters, inputs = {"source_column": labels}, {}
+    elif isinstance(labels, ArtifactRef):
+        source = labels
+        described = f"the {labels.kind} artifact"
+        example = "select_cells(labels, include=[...])"
+        parameters, inputs = {}, {"source_labels": labels}
+    else:
+        raise TypeError(
+            "labels must be a cell metadata column name or a cell-label ArtifactRef"
+        )
+    if not isinstance(cell_selection, ArtifactRef):
+        raise TypeError("cell_selection must be an ArtifactRef")
+    resolved = resolve_grouping(root, cells, source, cell_selection=cell_selection)
+    valid = valid_category_mask(resolved.labels, missing_mask=resolved.missing_mask)
+    kind = resolved.labels.dtype.kind
+    if kind == "f":
+        # Checked before completeness but over labelled cells only, so neither
+        # NaN nor a masked placeholder decides whether the floats are ids.
+        labelled = resolved.labels[valid]
+        whole = (labelled >= -_INT64_BOUND) & (labelled < _INT64_BOUND)
+        whole &= labelled == np.trunc(labelled)
+        if not whole.all():
+            raise TypeError(
+                "Floating-point cluster labels must be whole numbers within the "
+                f"int64 range, but {described} holds {labelled[~whole][0]!s}"
+            )
+    elif kind not in _LABEL_KINDS:
+        raise TypeError(
+            "Cluster labels must be text, integer, boolean, or whole-number "
+            f"values, but {described} holds {resolved.labels.dtype} values"
+        )
+    unlabelled = int(np.count_nonzero(~valid))
+    if unlabelled:
+        raise ValueError(
+            f"{unlabelled} of {valid.size} selected cells have no label in "
+            f"{described}. Pass a cell_selection of labelled cells only, such "
+            f"as {example}"
+        )
+    values = _decode_metadata_values(resolved.labels)
+    if kind == "f":
+        values = values.astype(np.int64)
+    elif kind in _TEXT_LABEL_KINDS:
+        values = values.astype(_measured_text_dtype((values,)))
+    fingerprint = fingerprint_array(values)
+    inputs["values_fingerprint"] = fingerprint
+
+    def payload_matches(_ref: ArtifactRef, group: zarr.Group) -> bool:
+        # Reuse and completion checks call this only after the values array
+        # matched the planned shape and dtype kind.
+        return (
+            not set(group.group_keys())
+            and set(group.array_keys()) == {"values"}
+            and fingerprint_stored_arrays(group, ("values",)) == fingerprint
+        )
+
+    planned = plan_cell_data_artifact(
+        root,
+        scope="datastore",
+        kind="cluster_labels",
+        operation="snapshot_cluster_labels",
+        parameters=parameters,
+        inputs=inputs,
+        execution_options={},
+        cell_selection=cell_selection,
+        arrays={"values": (values.shape, values.dtype.kind)},
+        reuse_validator=payload_matches,
+    )
+    write_cell_data_artifact(root, planned, {"values": values})
+    return planned.ref
 
 
 def artifact_values(

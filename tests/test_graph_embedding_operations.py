@@ -542,9 +542,11 @@ def test_reduction_write_budget_fails_before_fitting(
         return fit_lsi(*args, **kwargs)
 
     monkeypatch.setattr(reduction_module, "fit_lsi", recorded_fit)
-    store.resources = ResourceBudget(2_000_000, 1)
+    store.resources = ResourceBudget(1_000_000, 1)
 
-    # The streaming solver fits this budget; writing its coordinates does not.
+    # The streaming solver fits smaller blocks within this budget, but the
+    # coordinate write holds three decoded chunks, which leave no room for a
+    # block of any size.
     with pytest.raises(MemoryError, match="One unit needs|Resident data needs"):
         store.run_lsi(normalized, dims=5, local_cache=False, invalidate_cache=True)
 

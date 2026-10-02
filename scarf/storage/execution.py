@@ -33,7 +33,12 @@ _SCOPES: ContextVar[tuple[list["ExecutionReport"], ...]] = ContextVar(
 
 @dataclass(frozen=True, slots=True)
 class WorkShape:
-    """Independent on-disk units for one operation."""
+    """Independent on-disk units for one operation.
+
+    ``maxUnitsInFlight`` bounds the units an operation holds at once apart
+    from its read width, which then counts the reads of all those units;
+    ``maxInnerReads`` gives each unit its share of them.
+    """
 
     nUnits: int
     unitBytes: int
@@ -42,6 +47,7 @@ class WorkShape:
     decodeBytes: int = 0
     innerReadBytes: int = 0
     maxInnerReads: int | None = None
+    maxUnitsInFlight: int | None = None
     ordered: bool = False
     writes: bool = False
     chunksPerShard: int = 1
@@ -329,8 +335,14 @@ def plan_operation(
         if requested_read is not None
         else read_auto
     )
+    units_in_flight = (
+        None if shape.maxUnitsInFlight is None else max(1, int(shape.maxUnitsInFlight))
+    )
+    if units_in_flight is not None:
+        read_limit = min(read_limit, units_in_flight)
     read_limit = max(1, read_limit)
 
+    inner_limit = 1
     if inner_read > 0:
         inner_limit = chunks if max_inner_reads is None else max_inner_reads
         if requested_read is not None:
@@ -354,11 +366,9 @@ def plan_operation(
         write_workers = min(write_workers, read_workers)
     compute_workers = min(compute_workers, read_workers)
 
+    # Compute and write widths never exceed the workers, so their threads fit.
     active = max(compute_workers, write_workers if shape.writes else 1, 1)
     threads = max(1, workers // active)
-    while active * threads > workers:
-        threads -= 1
-    threads = max(1, threads)
 
     io_concurrency = (
         inner_reads if inner_read > 0 else min(chunks, max(1, read_workers))
@@ -369,7 +379,20 @@ def plan_operation(
     requested_read_baseline = requested_read or read_auto
     requested_compute_baseline = requested_compute or (1 if shape.ordered else workers)
     requested_write_baseline = requested_write or (workers if shape.writes else 1)
-    if read_workers < requested_read_baseline:
+    if units_in_flight is not None:
+        reads = read_workers * inner_reads
+        if reads < requested_read_baseline:
+            if inner_reads < inner_limit or read_workers < min(units, units_in_flight):
+                reasons.append(
+                    f"{reads} reads used because each unit needs {per_unit} "
+                    f"bytes and each read {inner_read} bytes"
+                )
+            else:
+                reasons.append(
+                    f"{reads} reads used because {read_workers} units in flight "
+                    f"hold at most {inner_limit} reads each"
+                )
+    elif read_workers < requested_read_baseline:
         if read_workers == memory_live:
             reasons.append(
                 f"{read_workers} readers used because each unit needs {per_unit} bytes"
@@ -378,12 +401,11 @@ def plan_operation(
             reasons.append(
                 f"{read_workers} readers used because there are {n_units} units"
             )
-        elif inner_read > 0:
+        else:
+            # Without inner reads, readers stop only at the memory or unit limit.
             reasons.append(
                 f"{read_workers} readers used to reserve {inner_reads} inner reads"
             )
-        else:
-            reasons.append(f"{read_workers} readers used")
     if compute_workers < requested_compute_baseline:
         if shape.ordered:
             reasons.append("1 compute worker used because results accumulate in order")
@@ -412,28 +434,9 @@ def plan_operation(
             reasons.append(f"{write_workers} writers used")
     reduction = "; ".join(reasons) if reasons else None
 
-    live_slots = read_workers
-    if shape.writes:
-        live_slots = max(live_slots, write_workers)
-    reserved = (
-        resident
-        + scratch
-        + live_slots * per_unit
-        + read_workers * inner_read * inner_reads
-    )
-    while reserved > int(resources.memoryBytes) and inner_reads > 1:
-        inner_reads -= 1
-        reserved = (
-            resident
-            + scratch
-            + live_slots * per_unit
-            + read_workers * inner_read * inner_reads
-        )
-    if reserved > int(resources.memoryBytes):
-        raise MemoryError(
-            f"Planned reservation is {reserved} bytes, but the operation "
-            f"limit is {resources.memoryBytes} bytes"
-        )
+    # Compute and write workers hold units that readers admitted, and readers
+    # were sized so that their units and inner reads fit the available bytes.
+    reserved = resident + scratch + read_workers * (per_unit + inner_read * inner_reads)
     return OperationPlan(
         readWorkers=read_workers,
         computeWorkers=compute_workers,

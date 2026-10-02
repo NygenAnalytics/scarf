@@ -6,6 +6,7 @@ from collections.abc import Callable
 
 import numpy as np
 import zarr
+from zarr.core.sync import sync
 
 from scarf.storage.arrays import create_numeric_array
 from scarf.storage.budget import ResourceBudget, resolve_budget
@@ -24,6 +25,7 @@ from scarf.storage.identity import (
 )
 from scarf.storage.count_matrix import (
     COUNT_MATRIX_LAYOUT_KEY,
+    CountMatrixPolicy,
     create_product_counts_array,
 )
 from scarf.storage.layout import (
@@ -35,8 +37,14 @@ from scarf.storage.layout import (
 from scarf.storage.pipeline_runs import _copy_pipeline_label_claims
 from scarf.storage.profiles import StorageProfile
 from scarf.storage.schema import pending_assay_message, pending_assays
-from scarf.storage.sharding import write_counts_t, write_dense_in_shard_rows
+from scarf.storage.sharding import (
+    dense_counts_admission,
+    fit_count_layout,
+    write_counts_t,
+    write_dense_in_shard_rows,
+)
 from scarf.storage.stores import (
+    mount_artifact_namespace,
     open_store,
     resolve_matrix_source,
     locations_overlap,
@@ -74,15 +82,8 @@ def _retired_assay_state_paths(store: zarr.Group) -> frozenset[str]:
     return frozenset(paths)
 
 
-def _copy_array_attrs(
-    src: zarr.Array,
-    dst: zarr.Array,
-    *,
-    strip_keys: frozenset[str] = frozenset(),
-) -> None:
+def _copy_array_attrs(src: zarr.Array, dst: zarr.Array) -> None:
     for attr_key, attr_val in src.attrs.items():
-        if attr_key in strip_keys:
-            continue
         dst.attrs[attr_key] = attr_val
 
 
@@ -93,40 +94,47 @@ def _row_block_producer(source: zarr.Array) -> Callable[[int, int], np.ndarray]:
     return produce
 
 
+def _fit_counts_layout(
+    source: zarr.Array,
+    *,
+    profile: StorageProfile,
+    resources: ResourceBudget,
+    transposed: bool,
+) -> CountMatrixPolicy:
+    """Return the layout whose rebuilt counts and ``countsT`` fit the budget.
+
+    The rebuilt counts keep the dtype of the source counts.
+    """
+    n_cells, n_features = (int(value) for value in source.shape)
+    producer = int(np.prod(source.chunks)) * source.dtype.itemsize
+    return fit_count_layout(
+        {"counts": (n_features, source.dtype)},
+        nCells=n_cells,
+        profile=profile,
+        memoryBytes=resources.memoryBytes,
+        transposed=("counts",) if transposed else (),
+        admitCounts=dense_counts_admission(
+            CountSummary.nbytes_for(n_cells, n_features), lambda _rows: producer
+        ),
+    )
+
+
 def _is_string_like(dtype: np.dtype) -> bool:
     return dtype.kind in {"O", "S", "U"} or dtype.hasobject
-
-
-def _default_fill_value(dtype: np.dtype) -> object:
-    return False if dtype.kind == "b" else 0
-
-
-def _resolve_fill_value(array: zarr.Array, *, numeric_1d: bool) -> object | None:
-    fill_value: object | None = getattr(array, "fill_value", None)
-    if fill_value is not None:
-        return fill_value
-    if numeric_1d:
-        return _default_fill_value(np.dtype(array.dtype))
-    return None
 
 
 def _realign_shards(
     chunks: tuple[int, ...],
     shards: tuple[int, ...] | None,
 ) -> tuple[int, ...] | None:
-    if shards is None or len(shards) != len(chunks):
+    if shards is None:
         return None
-    aligned: list[int] = []
-    for chunk, shard in zip(chunks, shards, strict=True):
-        chunk_size = int(chunk)
-        shard_size = int(shard)
-        if shard_size % chunk_size == 0 and shard_size >= chunk_size:
-            aligned.append(shard_size)
-        elif shard_size >= chunk_size:
-            aligned.append(chunk_size * max(1, shard_size // chunk_size))
-        else:
-            aligned.append(chunk_size)
-    return tuple(aligned)
+    # A source shard holds whole source chunks, so it is at least one chunk
+    # clamped to the shape; keep the largest multiple of that chunk it holds.
+    return tuple(
+        int(chunk) * (int(shard) // int(chunk))
+        for chunk, shard in zip(chunks, shards, strict=True)
+    )
 
 
 def _copy_numeric_1d(
@@ -143,7 +151,9 @@ def _copy_numeric_1d(
         dtype=array.dtype,
         compressors=get_compressors(profile, zarrFormat=3),
         shards=None,
-        fillValue=_resolve_fill_value(array, numeric_1d=True),
+        # Only full repacks copy these arrays, and they require a prepared,
+        # so Zarr v3, source, whose arrays all record a fill value.
+        fillValue=array.fill_value,
     )
     dst_array = create_numeric_array(dst, key, spec)
     n_rows = shape[0]
@@ -174,7 +184,7 @@ def _copy_numeric_2d(
         dtype=array.dtype,
         compressors=get_compressors(profile, zarrFormat=3),
         shards=shards,
-        fillValue=_resolve_fill_value(array, numeric_1d=False),
+        fillValue=array.fill_value,
     )
     dst_array = create_numeric_array(dst, key, spec)
     write_dense_in_shard_rows(
@@ -304,7 +314,12 @@ def repack_store(
     *,
     data_only: bool = False,
 ) -> None:
-    """Copy prepared data, or rebuild raw data, into a fresh Zarr v3 destination."""
+    """Copy prepared data, or rebuild raw data, into a fresh Zarr v3 destination.
+
+    A mounted target is read with its source's counts and artifacts, so the
+    destination is a self-contained store that no longer needs the source. A
+    repack that fails after it creates the destination removes it.
+    """
     from ..assay import RNAassay, preset_assay_types
     from ..assay.classification import (
         default_feature_sets,
@@ -328,6 +343,10 @@ def repack_store(
             raise ValueError("The destination overlaps the mounted count owner")
     resolved = resolve_matrix_source(src, storage_options=storage_options)
     mounted_owner = None if resolved is None else resolved[0]
+    if resolved is not None:
+        # A mount's results can use its source's artifacts, so the copy reads
+        # the mounted namespace and holds every artifact they depend on.
+        src = mount_artifact_namespace(src, *resolved)
     pending = pending_assays(src)
     if pending:
         raise ValueError(
@@ -415,95 +434,117 @@ def repack_store(
                 as_zarr_group(src[table], name=table), exclude_members=excluded
             )
 
-    dst = open_store(output_path, mode="w-", storage_options=storage_options)
-    for key, value in src.attrs.items():
-        if key == MATRIX_SOURCE_ATTR or (
-            data_only and key not in {"defaultAssay", "assayTypes"}
-        ):
-            continue
-        dst.attrs[key] = value
-    _copy_group(
-        src,
-        dst,
-        profile,
-        resources=resources,
-        skipPaths=frozenset(skip_paths),
-        keepPaths=frozenset(keep_paths) if data_only else None,
-    )
-    for path, source_counts in counts_to_copy.items():
-        group_path = path.rsplit("/", 1)[0]
-        group = dst.require_group(group_path)
-        counts = create_product_counts_array(
-            group,
-            source_counts.shape[0],
-            source_counts.shape[1],
-            source_counts.dtype,
+    # A layout that does not fit fails here, before the destination exists.
+    layouts = {
+        path: _fit_counts_layout(
+            source_counts,
             profile=profile,
-        )
-        summary = CountSummary(counts)
-        write_dense_in_shard_rows(
-            counts,
-            _row_block_producer(source_counts),
             resources=resources,
-            msg=f"Repacking {path}",
-            producerBytes=int(np.prod(source_counts.chunks))
-            * source_counts.dtype.itemsize,
-            residentBytes=summary.nbytes,
-            countSummary=summary,
+            transposed=path in required_transposes,
         )
-        finalize_counts(counts, summary=summary)
-        if path in required_transposes:
-            write_counts_t(
-                counts,
+        for path, source_counts in counts_to_copy.items()
+    }
+    dst = open_store(output_path, mode="w-", storage_options=storage_options)
+    try:
+        for key, value in src.attrs.items():
+            if key == MATRIX_SOURCE_ATTR or (
+                data_only and key not in {"defaultAssay", "assayTypes"}
+            ):
+                continue
+            dst.attrs[key] = value
+        _copy_group(
+            src,
+            dst,
+            profile,
+            resources=resources,
+            skipPaths=frozenset(skip_paths),
+            keepPaths=frozenset(keep_paths) if data_only else None,
+        )
+        for path, source_counts in counts_to_copy.items():
+            group_path = path.rsplit("/", 1)[0]
+            group = dst.require_group(group_path)
+            counts = create_product_counts_array(
                 group,
-                resources=resources,
+                source_counts.shape[0],
+                source_counts.shape[1],
+                source_counts.dtype,
                 profile=profile,
-                featureSets=default_feature_sets(
-                    as_zarr_group(dst[feature_tables[path]], name=feature_tables[path])
-                ),
+                policy=layouts[path],
             )
-        print(f"  {path}: {array_info(counts)}")
-    for name, workspace in assays:
-        attr_root = (
-            dst if workspace is None else as_zarr_group(dst[workspace], name=workspace)
-        )
-        assay_group = as_zarr_group(attr_root[name], name=name)
-        cells = as_zarr_group(attr_root["cellData"], name="cellData")
-        matrix_path = name if workspace is None else f"matrices/{name}"
-        matrix = as_zarr_group(dst[matrix_path], name=matrix_path)
-        type_name = assay_types[name, workspace]
-        raw_types = attr_root.attrs.get("assayTypes", {})
-        types = dict(raw_types) if isinstance(raw_types, dict) else {}
-        types[name] = type_name
-        attr_root.attrs["assayTypes"] = types
-        if data_only:
-            assay = preset_assay_types()[type_name](
-                z=dst,
-                workspace=workspace,
-                name=name,
-                cell_data=MetaData(cells),
-                nthreads=resources.workers,
+            summary = CountSummary(counts)
+            write_dense_in_shard_rows(
+                counts,
+                _row_block_producer(source_counts),
                 resources=resources,
+                msg=f"Repacking {path}",
+                producerBytes=int(np.prod(source_counts.chunks))
+                * source_counts.dtype.itemsize,
+                residentBytes=summary.nbytes,
+                countSummary=summary,
             )
-            patterns = (
-                {
-                    f"{name}_{suffix}": pattern
-                    for suffix, pattern in DEFAULT_PERCENT_PATTERNS.items()
-                }
-                if isinstance(assay, RNAassay)
-                else {}
+            finalize_counts(counts, summary=summary)
+            if path in required_transposes:
+                write_counts_t(
+                    counts,
+                    group,
+                    resources=resources,
+                    profile=profile,
+                    featureSets=default_feature_sets(
+                        as_zarr_group(
+                            dst[feature_tables[path]], name=feature_tables[path]
+                        )
+                    ),
+                )
+            print(f"  {path}: {array_info(counts)}")
+        for name, workspace in assays:
+            attr_root = (
+                dst
+                if workspace is None
+                else as_zarr_group(dst[workspace], name=workspace)
             )
-            assay.prepare(patterns)
-        else:
-            publish_preparation(
-                assay_group,
-                cells,
-                matrix,
-                require_transpose=is_rna_assay_type(type_name),
-                expected_fingerprint=source_fingerprints[name, workspace],
-            )
-    if not data_only:
-        _copy_pipeline_label_claims(src, dst)
+            assay_group = as_zarr_group(attr_root[name], name=name)
+            cells = as_zarr_group(attr_root["cellData"], name="cellData")
+            matrix_path = name if workspace is None else f"matrices/{name}"
+            matrix = as_zarr_group(dst[matrix_path], name=matrix_path)
+            type_name = assay_types[name, workspace]
+            raw_types = attr_root.attrs.get("assayTypes", {})
+            types = dict(raw_types) if isinstance(raw_types, dict) else {}
+            types[name] = type_name
+            attr_root.attrs["assayTypes"] = types
+            if data_only:
+                assay = preset_assay_types()[type_name](
+                    z=dst,
+                    workspace=workspace,
+                    name=name,
+                    cell_data=MetaData(cells),
+                    nthreads=resources.workers,
+                    resources=resources,
+                )
+                patterns = (
+                    {
+                        f"{name}_{suffix}": pattern
+                        for suffix, pattern in DEFAULT_PERCENT_PATTERNS.items()
+                    }
+                    if isinstance(assay, RNAassay)
+                    else {}
+                )
+                assay.prepare(patterns)
+            else:
+                publish_preparation(
+                    assay_group,
+                    cells,
+                    matrix,
+                    require_transpose=is_rna_assay_type(type_name),
+                    expected_fingerprint=source_fingerprints[name, workspace],
+                )
+        if not data_only:
+            _copy_pipeline_label_claims(src, dst)
+    except BaseException:
+        # The destination did not exist before this call, so a failed repack
+        # removes it rather than leave a store that opens without all its
+        # data, such as the label claims copied last.
+        sync(dst.store_path.delete_dir())
+        raise
 
 
 def _parse_storage_options(raw: str | None) -> dict | None:

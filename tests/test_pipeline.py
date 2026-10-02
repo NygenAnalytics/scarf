@@ -1,6 +1,8 @@
 import inspect
 import pickle
+import threading
 from collections.abc import Mapping
+from itertools import pairwise
 from types import SimpleNamespace
 from typing import Any
 
@@ -25,6 +27,7 @@ from scarf.storage.artifacts import (
     fingerprint_stored_strings,
     require_complete_artifact,
 )
+from scarf.storage.pipeline_runs import load_pipeline_stage_records
 from scarf.storage.refs import ArtifactScope
 from scarf.storage.selections import resolve_stored_selection_artifact
 from scarf.utils.shutdown import ShutdownRequested, current_shutdown_token
@@ -998,6 +1001,47 @@ def test_custom_leiden_uses_only_the_requested_candidate_set(
         "leiden_0.8",
     )
     assert "leiden_1.0" not in run
+
+
+def test_pipeline_runs_umap_and_leiden_stages_one_at_a_time(
+    datastore_ephemeral,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    datastore = datastore_ephemeral
+    umap_threads: list[threading.Thread] = []
+    run_umap = type(datastore)._run_umap_artifact
+
+    def recorded_umap(self, *args, **kwargs):
+        umap_threads.append(threading.current_thread())
+        return run_umap(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(datastore), "_run_umap_artifact", recorded_umap)
+    events: list[PipelineEvent] = []
+    options = _minimal_run_options()
+    options.update(umap=True, leiden={"partitions": [0.5, 1.0]})
+
+    run = datastore.pipeline.run(callback=events.append, **options)
+
+    assert umap_threads == [threading.current_thread()]
+    stages = [
+        stage
+        for stage in load_pipeline_stage_records(datastore.zw, run.run_id)
+        if stage.status != "skipped"
+    ]
+    assert [stage.stage for stage in stages][-5:] == [
+        "embedding_initialization",
+        "umap",
+        "leiden_0.5",
+        "leiden_1.0",
+        "cluster_selection",
+    ]
+    for earlier, later in pairwise(stages):
+        assert earlier.finished_at_ns <= later.started_at_ns
+    assert [(event.kind, event.stage) for event in events] == [
+        (kind, stage.stage)
+        for stage in stages
+        for kind in ("stage_started", "stage_completed")
+    ]
 
 
 def test_cluster_selection_records_invalid_candidates_ties_and_reuse(

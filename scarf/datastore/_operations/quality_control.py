@@ -121,11 +121,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
     ) -> ArtifactRef:
         """Create or reuse cell-cycle scores without creating metadata columns."""
         self._require_writable("run_cell_cycle_scoring")
-        if not isinstance(assay, RNAassay):
-            raise TypeError(
-                "Cell-cycle scoring can only be applied to an RNAassay; "
-                f"received {type(assay).__name__}"
-            )
         if s_genes is None:
             from ...quality_control.cell_cycle_genes import s_phase_genes
 
@@ -151,8 +146,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         names = np.asarray(
             assay.feats.fetch_all("names") if feature_names is None else feature_names
         )
-        if names.ndim != 1 or len(names) != assay.feats.N:
-            raise ValueError("Feature names must align with the assay feature axis")
         # Names match without case sensitivity; a name shared by several
         # features selects all of them.
         by_name: dict[str, list[int]] = {}
@@ -182,11 +175,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             log_transform=log_transform,
             invalidate_cache=invalidate_cache,
         )
-        n_cells = feature_summary_selected_count(
-            self.zw,
-            cell_selection,
-            n_cells=assay.cells.N,
-        )
+        n_cells = feature_summary_selected_count(self.zw, cell_selection)
         arguments = CellCycleArguments(
             feature_summary=summary_ref,
             cell_selection=cell_selection,
@@ -197,7 +186,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             n_bins=n_bins,
             rand_seed=rand_seed,
             invalidate_cache=invalidate_cache,
-            count_arithmetic=assay._count_arithmetic("feature_scores"),
         )
         record = arguments.to_record()
         inputs = dict(record.inputs)
@@ -552,9 +540,14 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                     raise TypeError(
                         "include values must be numeric for a floating artifact"
                     )
-                normalized = {float(value) for value in raw_include}
-                if not all(np.isfinite(value) for value in normalized):
-                    raise ValueError("include must contain only finite values")
+                # Float values are already finite, so only an integer beyond
+                # the float64 range fails to convert.
+                try:
+                    normalized = {float(value) for value in raw_include}
+                except OverflowError as exc:
+                    raise ValueError(
+                        "include contains an out-of-range integer"
+                    ) from exc
                 resolved_include = tuple(sorted(normalized))
 
         prior_selection = source_selection
@@ -1061,8 +1054,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             np.int64,
             copy=False,
         )
-        if len(feature_index) == 0:
-            raise ValueError("features must select at least one feature")
 
         planned = plan_cell_data_artifact(
             self.zw,
@@ -1190,7 +1181,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         clusters: ArtifactRef,
         cluster_values: np.ndarray,
         connectivity: ArtifactRef,
-        feature_names: np.ndarray | None = None,
         feature_snapshot: ArtifactRef | None = None,
         cluster_sample_fraction: float = 0.05,
         max_cells_per_cluster: int = 100,
@@ -1229,12 +1219,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         if not isinstance(normalize_scores, bool):
             raise TypeError("normalize_scores must be a boolean")
         assay_name = source_assay.name
-        if feature_names is not None and np.asarray(feature_names).shape != (
-            source_assay.feats.N,
-        ):
-            raise ValueError(
-                "Snapshot feature names must align with the assay feature axis"
-            )
         connectivity_status = self._require_complete_artifact(
             connectivity,
             connectivity.kind,
@@ -1252,12 +1236,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             assay_name,
         )
         neighbors = lineage.neighbors
-        graph_selection = graph_cell_selection(self.zw, connectivity)
-        if not self._selection_artifacts_match(
-            graph_selection,
-            cell_selection,
-        ):
-            raise ValueError("Cell selection does not match the graph")
         coordinates = lineage.coordinates
         if coordinates.kind != "reduction":
             raise ValueError("Doublet detection requires an uncorrected PCA graph")
@@ -1273,8 +1251,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         if labels.ndim != 1 or len(labels) != len(active_idx):
             raise ValueError("Cluster values must contain one label per selected cell")
         n_active = len(active_idx)
-        if n_active < 1:
-            raise ValueError("Doublet detection requires selected cells")
         arguments = DoubletScoreArguments(
             clusters=clusters,
             connectivity_map=connectivity,
@@ -1286,7 +1262,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             save_k=save_k,
             smoothing_t=smoothing_t,
             normalize_scores=normalize_scores,
-            count_arithmetic="checked_integer_sum",
             random_seed=random_seed,
             invalidate_cache=invalidate_cache,
         )
@@ -1312,23 +1287,10 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         self._require_writable("run_doublet_detection")
 
         feature_selection = lineage.feature_selection
-        if feature_selection is None:
-            raise ValueError(
-                "Doublet detection requires normalized feature-selection ancestry"
-            )
+        # A reduction's lineage always names its normalized feature selection.
+        assert feature_selection is not None
         reference_ref = self.build_mapping_reference(neighbors)
         reference = self.get_mapping_reference(reference_ref)
-        if (
-            reference.neighbors != neighbors
-            or reference.assay_name != assay_name
-            or reference.feature_selection != feature_selection
-            or reference.method != "pca"
-            or reference.batch_correction is not None
-            or reference.symphony_state is not None
-        ):
-            raise RuntimeError(
-                "The mapping reference does not match the uncorrected RNA graph"
-            )
 
         feature_indices = read_feature_selection_indices(
             self.zw,
@@ -1549,11 +1511,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             invalidate_cache=invalidate_cache,
         )
         if not planned.reused:
-            n_selected = feature_summary_selected_count(
-                self.zw,
-                cell_selection,
-                n_cells=assay.cells.N,
-            )
+            n_selected = feature_summary_selected_count(self.zw, cell_selection)
             summary = feature_summary_values(
                 self.zw,
                 summary_ref,

@@ -1,8 +1,9 @@
+import math
 from typing import cast
 
 import numpy as np
 from numba import njit, prange
-from scipy.stats import linregress, t as student_t
+from scipy.stats import t as student_t
 
 _LINREGRESS_TINY = 1.0e-20
 _REG_OK = 0
@@ -27,7 +28,13 @@ def _regression_r_batch(
     min_cells: int,
     eps: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Calculate Pearson r per feature and return per-feature status codes."""
+    """Calculate Pearson r per feature and return per-feature status codes.
+
+    ``x_centered`` is the centered regressor and ``ssxm`` its mean square.
+    Each feature's values are scaled by a power of two below one in magnitude
+    before they are summed: the scale is exact and r does not depend on it,
+    and it keeps the centered sums finite.
+    """
     n_cells = data.shape[0]
     n_genes = data.shape[1]
     r_out = np.empty(n_genes, dtype=np.float64)
@@ -39,13 +46,11 @@ def _regression_r_batch(
         nz = 0
         vmin = v[0]
         vmax = v[0]
-        y_sum = 0.0
         for c in range(n_cells):
             val = v[c]
             if not np.isfinite(val):
                 finite = False
                 break
-            y_sum += val
             if val > 0.0:
                 nz += 1
             if val < vmin:
@@ -60,11 +65,16 @@ def _regression_r_batch(
             r_out[g] = 0.0
             status[g] = _REG_SENTINEL
             continue
+        # The values span more than eps, so the scale is at most 2**52.
+        scale = math.ldexp(1.0, -math.frexp(max(-vmin, vmax))[1])
+        y_sum = 0.0
+        for c in range(n_cells):
+            y_sum += v[c] * scale
         y_mean = y_sum * inv_n
         ssym = 0.0
         ssxym = 0.0
         for c in range(n_cells):
-            yd = v[c] - y_mean
+            yd = v[c] * scale - y_mean
             ssym += yd * yd
             ssxym += x_centered[c] * yd
         ssym *= inv_n
@@ -114,8 +124,10 @@ def _regression_batch_results(
                     "normalized values"
                 )
             if (v > 0).sum() >= min_cells and np.ptp(v) > eps:
-                lin_obj = linregress(regressor, v)
-                r_vals[g] = float(lin_obj.rvalue)
+                # Two distinct points correlate exactly along their slope.
+                r_vals[g] = float(
+                    np.sign(regressor[1] - regressor[0]) * np.sign(v[1] - v[0])
+                )
             else:
                 r_vals[g] = 0.0
         return r_vals, p_vals, status

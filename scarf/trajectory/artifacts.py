@@ -5,7 +5,6 @@ import numpy as np
 import zarr
 from scipy.sparse import coo_matrix, csr_matrix
 
-from ..assay.normalization import recorded_count_arithmetic
 from ..storage.arrays import create_zarr_dataset, linked_missing_mask
 from ..storage.artifacts import (
     ArtifactRef,
@@ -23,7 +22,6 @@ from .parameters import (
     AGGREGATION_ANN_STATIC_PARAMETER_NAMES,
 )
 from ..utils.arguments import integer_argument
-from ..utils.arrays import has_duplicates
 
 PSEUDOTIME_INPUTS = frozenset({"connectivity_map", "source_sink", "cell_selection"})
 PSEUDOTIME_PARAMETERS = frozenset(
@@ -275,25 +273,10 @@ def validate_fate_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _normalized_value_parameter_names(
-    parameters: Mapping[str, Any],
-    names: frozenset[str],
-) -> frozenset[str]:
-    """Return ``names`` plus ``count_arithmetic`` when the record carries it.
-
-    Only results whose integer-count arithmetic ``normed`` changed record the
-    marker (see ``normalizer_count_arithmetic``), so records without it stay
-    valid.
-    """
-    if "count_arithmetic" in parameters:
-        return names | {"count_arithmetic"}
-    return names
-
-
 def validate_marker_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
     require_exact_record_keys(
         parameters,
-        _normalized_value_parameter_names(parameters, MARKER_PARAMETERS),
+        MARKER_PARAMETERS,
         "Pseudotime-marker parameters",
     )
     validated: dict[str, Any] = {
@@ -312,7 +295,6 @@ def validate_marker_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
         if parameters[name] != expected:
             raise ValueError(f"{name} must be {expected!r}")
         validated[name] = expected
-    validated.update(recorded_count_arithmetic(parameters))
     return validated
 
 
@@ -354,7 +336,7 @@ def validate_resolved_ann_parameters(
 def validate_aggregation_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
     require_exact_record_keys(
         parameters,
-        _normalized_value_parameter_names(parameters, AGGREGATION_PARAMETERS),
+        AGGREGATION_PARAMETERS,
         "Pseudotime-aggregation parameters",
     )
     n_clusters = integer_argument(
@@ -395,7 +377,6 @@ def validate_aggregation_parameters(parameters: Mapping[str, Any]) -> dict[str, 
         "n_clusters": n_clusters,
         "ann_params": _ann_parameters(parameters["ann_params"]),
         "nan_cluster_value": nan_cluster_value,
-        **recorded_count_arithmetic(parameters),
     }
 
 
@@ -413,10 +394,8 @@ def selection_size(root: Any, selection: ArtifactRef) -> int:
 
 
 def true_array_indices(array: Any) -> np.ndarray:
-    """Return true-row indices from a stored boolean vector in bounded blocks."""
+    """Return true-row indices from a non-empty stored boolean vector in blocks."""
     values = as_zarr_array(array, name="boolean values")
-    if values.ndim != 1 or np.dtype(values.dtype) != np.dtype(bool):
-        raise ValueError("Stored validity values must be a boolean vector")
     block_rows = row_band(array_geometry(values), unit="chunk", fallback=1)
     parts: list[np.ndarray] = []
     for start in range(0, int(values.shape[0]), block_rows):
@@ -424,10 +403,7 @@ def true_array_indices(array: Any) -> np.ndarray:
         block_indices = np.flatnonzero(
             np.asarray(values[start:stop], dtype=bool)
         ).astype(np.int64, copy=False)
-        if block_indices.size:
-            parts.append(block_indices + start)
-    if not parts:
-        return np.empty(0, dtype=np.int64)
+        parts.append(block_indices + start)
     return np.concatenate(parts)
 
 
@@ -476,8 +452,6 @@ def labels_with_missing_mask(
         raise ValueError(f"{label} must be one-dimensional")
     if missing is None:
         return labels
-    if missing.shape != labels.shape:
-        raise ValueError(f"{label} missing mask is misaligned")
     masked = labels.astype(object)
     masked[missing] = _MISSING_LABEL
     return masked
@@ -553,8 +527,6 @@ def write_diffusion_payload(group: zarr.Group, diffusion: csr_matrix) -> None:
     one block of widened indices is held in memory.
     """
     n_cells = int(diffusion.shape[0])
-    if diffusion.shape != (n_cells, n_cells):
-        raise ValueError("Diffusion operator must be square")
     nnz = int(diffusion.indptr[-1])
     shape = (nnz,)
     chunks = (_DIFFUSION_BLOCK_ENTRIES,)
@@ -664,8 +636,6 @@ def pseudotime_payload_is_valid(
     if not payload_fingerprint_matches(group, PSEUDOTIME_PAYLOAD):
         return False
     expected = np.asarray(expected_valid, dtype=bool)
-    if expected.shape != (n_cells,):
-        return False
     block_rows = min(
         row_band(array_geometry(values_array), unit="chunk", fallback=1),
         row_band(array_geometry(valid_array), unit="chunk", fallback=1),
@@ -673,7 +643,6 @@ def pseudotime_payload_is_valid(
     minimum = np.inf
     maximum = -np.inf
     maximum_absolute = 0.0
-    valid_count = 0
     for start in range(0, n_cells, block_rows):
         stop = min(start + block_rows, n_cells)
         values = np.asarray(values_array[start:stop], dtype=np.float64)
@@ -684,7 +653,6 @@ def pseudotime_payload_is_valid(
         if valid_values.size:
             if not np.isfinite(valid_values).all():
                 return False
-            valid_count += int(valid_values.size)
             minimum = min(minimum, float(valid_values.min()))
             maximum = max(maximum, float(valid_values.max()))
             maximum_absolute = max(
@@ -693,8 +661,7 @@ def pseudotime_payload_is_valid(
             )
         if np.any(~valid) and not np.isnan(values[~valid]).all():
             return False
-    if valid_count == 0:
-        return False
+    # Without valid cells the range stays at -inf and is rejected below.
     value_range = maximum - minimum
     scale = max(1.0, maximum_absolute)
     if value_range <= np.finfo(np.float64).eps * scale:
@@ -737,8 +704,6 @@ def fate_payload_is_valid(
     valid = np.asarray(valid_array[:], dtype=bool)
     expected_valid = np.asarray(pseudotime_valid, dtype=bool)
     if expected_valid.shape != (n_cells,) or not np.array_equal(valid, expected_valid):
-        return False
-    if not valid.any():
         return False
     tolerance = 1e-3
     for sink in sink_labels:
@@ -796,6 +761,11 @@ def marker_payload_is_valid(
     expected_feature_ids_fingerprint: str,
     expected_feature_names_fingerprint: str,
 ) -> bool:
+    """Check a stored marker payload against the selected features.
+
+    ``selected_features`` are the indices of a feature selection, so they are
+    unique and smaller than ``n_features``.
+    """
     if set(group.attrs) != _RESULT_ATTRIBUTES:
         return False
     if not payload_fingerprint_matches(group, MARKER_PAYLOAD):
@@ -842,13 +812,6 @@ def marker_payload_is_valid(
     if not identities_match:
         return False
     selected_indices = np.asarray(selected_features, dtype=np.int64)
-    if (
-        selected_indices.ndim != 1
-        or np.any(selected_indices < 0)
-        or np.any(selected_indices >= n_features)
-        or has_duplicates(selected_indices)
-    ):
-        return False
     block_rows = min(
         row_band(array_geometry(array), unit="chunk", fallback=1)
         for array in (
@@ -899,6 +862,11 @@ def aggregation_payload_is_valid(
     expected_feature_names_fingerprint: str,
     effective_window: int,
 ) -> bool:
+    """Check a stored aggregation payload against the selected features.
+
+    ``selected_features`` are the indices of a feature selection, so they
+    increase strictly and are smaller than ``n_features``.
+    """
     try:
         ann_params = validate_resolved_ann_parameters(ann_params, dim=n_bins)
     except (TypeError, ValueError):
@@ -979,13 +947,6 @@ def aggregation_payload_is_valid(
     if group.attrs.get("effective_bins") != n_bins:
         return False
     expected_indices = np.asarray(selected_features, dtype=np.int64)
-    if (
-        expected_indices.shape != (n_selected,)
-        or np.any(expected_indices < 0)
-        or np.any(expected_indices >= n_features)
-        or (n_selected > 1 and np.any(np.diff(expected_indices) <= 0))
-    ):
-        return False
     try:
         identities_match = (
             fingerprint_stored_strings(ids_array) == expected_feature_ids_fingerprint
@@ -1024,8 +985,6 @@ def aggregation_payload_is_valid(
         or not 1 <= n_neighbours < valid_count
         or not 1 <= n_clusters <= valid_count
     ):
-        return False
-    if "dim" in ann_params and ann_params["dim"] != n_bins:
         return False
     if "max_elements" in ann_params and ann_params["max_elements"] < valid_count:
         return False

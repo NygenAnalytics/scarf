@@ -143,7 +143,7 @@ def _import_mtx(tmp_path: Path) -> _Imported:
     reader = MtxReader(inspect_mtx(tmp_path)[0])
     store = MemoryStore()
     try:
-        MtxToZarr(reader, store, mem_budget="64M").dump(lines_in_mem=2)
+        MtxToZarr(reader, store, mem_budget="64M", lines_in_mem=2).dump()
     finally:
         reader.close()
     return _Imported(

@@ -458,7 +458,8 @@ def test_open_datastore_reads_the_published_store_without_writing(ready_dataset)
         assert {"cell_type", "donor_id", "is_primary_data"} <= set(
             datastore.cells.columns
         )
-        assert np.dtype(datastore.RNA.rawData.dtype) == np.int32
+        # The int32 source counts are small non-negative integers.
+        assert np.dtype(datastore.RNA.rawData.dtype) == np.uint8
     finally:
         connector._close(datastore)
     assert _file_contents(ready_dataset.store) == before

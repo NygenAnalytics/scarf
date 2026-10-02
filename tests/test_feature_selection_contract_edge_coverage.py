@@ -9,6 +9,7 @@ import scarf.storage.feature_selection as feature_selection
 from scarf.storage.artifacts import (
     ArtifactStatus,
     artifact_group,
+    artifact_path,
     fingerprint_stored_arrays,
     fingerprint_stored_strings,
     inspect_artifact,
@@ -54,6 +55,14 @@ def _status(
             "inputs": {} if inputs is None else inputs,
         },
     )
+
+
+def _store_short_chunk(root: zarr.Group, path: str) -> None:
+    """Give a one-chunk array a chunk one value short, as a broken writer could."""
+    short = root.create_array("short", data=np.asarray(root[path][:-1]))
+    chunks = root.store._store_dict
+    chunks[f"{path}/c/0"] = chunks[f"{short.path}/c/0"]
+    del root["short"]
 
 
 def test_feature_selection_write_and_feature_table_contracts() -> None:
@@ -201,6 +210,42 @@ def test_feature_summary_parent_wraps_cell_status_failures(
         assert caught.value.code == code
 
 
+@pytest.mark.parametrize(
+    ("cell_selection", "dataset_fingerprint", "message"),
+    [
+        (
+            ArtifactRef("datastore", "cell_selection", "c" * 64),
+            "other dataset",
+            "does not match the current prepared dataset",
+        ),
+        (_feature_ref("c"), "dataset", "cell-selection input is malformed"),
+    ],
+)
+def test_feature_summary_parent_rejects_inputs_edited_outside_scarf(
+    monkeypatch: pytest.MonkeyPatch,
+    cell_selection: ArtifactRef,
+    dataset_fingerprint: str,
+    message: str,
+) -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    root.create_group("RNA").attrs.update(
+        {"prepared": True, "dataset_fingerprint": "dataset"}
+    )
+    status = _status(
+        operation="summarize_rna_features",
+        parameters={"normalization_method": "log", "size_factor": 1},
+        inputs={
+            "cell_selection": cell_selection.to_dict(),
+            "dataset_fingerprint": dataset_fingerprint,
+        },
+    )
+    monkeypatch.setattr(feature_selection, "inspect_artifact", lambda *_args: status)
+
+    with pytest.raises(ArtifactResolutionError, match=message) as caught:
+        feature_selection._validate_feature_summary_parent(root, "RNA", _summary_ref())
+    assert caught.value.code == "corrupt_payload"
+
+
 def _summary_payload_root() -> tuple[zarr.Group, zarr.Group, ArtifactRef, ArtifactRef]:
     root = zarr.open_group(store=MemoryStore(), mode="w")
     feature_data = root.create_group("RNA/featureData")
@@ -276,6 +321,13 @@ def test_feature_summary_payload_contract_errors(
     _patch_valid_summary_dependencies(monkeypatch, payload, summary, cell_ref)
     payload.attrs["payload_fingerprint"] = "changed"
     with pytest.raises(ArtifactResolutionError) as caught:
+        feature_selection._validate_feature_summary_parent(root, "RNA", summary)
+    assert caught.value.code == "corrupt_payload"
+
+    root, payload, summary, cell_ref = _summary_payload_root()
+    _patch_valid_summary_dependencies(monkeypatch, payload, summary, cell_ref)
+    _store_short_chunk(root, "summary_payload/sigmas")
+    with pytest.raises(ArtifactResolutionError, match="payload is malformed") as caught:
         feature_selection._validate_feature_summary_parent(root, "RNA", summary)
     assert caught.value.code == "corrupt_payload"
 
@@ -397,6 +449,24 @@ def test_feature_selection_snapshot_and_mapping_input_contracts(
             _Keys("values", "corrected_variance"),  # type: ignore[arg-type]
             seen=set(),
         )
+    # A well-formed reference to an artifact of another kind.
+    status = _status(
+        operation="select_hvgs",
+        inputs={
+            "feature_snapshot": _summary_ref("c").to_dict(),
+            "feature_summary": _summary_ref().to_dict(),
+        },
+        parameters=hvg_parameters,
+    )
+    with pytest.raises(ArtifactResolutionError, match="snapshot input is malformed"):
+        feature_selection._validate_feature_selection_provenance(
+            root,
+            "RNA",
+            ref,
+            status,
+            _Keys("values", "corrected_variance"),  # type: ignore[arg-type]
+            seen=set(),
+        )
 
     all_ref = _feature_ref("d")
     monkeypatch.setattr(
@@ -461,10 +531,83 @@ def test_feature_selection_validation_wraps_corrupt_records(
     assert caught.value.code == "corrupt_payload"
 
 
-def test_feature_universe_and_empty_index_contracts() -> None:
+@pytest.mark.parametrize(
+    ("edit", "message", "code"),
+    [
+        (
+            lambda root, ref: artifact_group(root, ref).create_array(
+                "values", data=np.ones(4), overwrite=True
+            ),
+            "values do not align",
+            "corrupt_payload",
+        ),
+        (
+            lambda root, ref: _store_short_chunk(root, f"{artifact_path(ref)}/values"),
+            "payload cannot be fingerprinted",
+            "corrupt_payload",
+        ),
+        (
+            lambda root, _ref: _store_short_chunk(root, "RNA/featureData/ids"),
+            "row identifiers are malformed",
+            "row_mismatch",
+        ),
+        # The feature universe of the selection records an earlier dataset.
+        (
+            lambda root, _ref: root["RNA"].attrs.update({"dataset_fingerprint": "new"}),
+            "does not match the current prepared dataset",
+            "corrupt_payload",
+        ),
+    ],
+    ids=["float_values", "short_values_chunk", "short_ids_chunk", "new_dataset"],
+)
+def test_feature_selection_validation_rejects_records_edited_outside_scarf(
+    edit: Any, message: str, code: str
+) -> None:
+    root, _store, ref = _selection_store()
+    edit(root, ref)
+
+    with pytest.raises(ArtifactResolutionError, match=message) as caught:
+        feature_selection.resolve_feature_selection(root, "RNA", ref)
+    assert caught.value.code == code
+
+
+def test_feature_selection_with_an_unreadable_payload_is_not_reused() -> None:
+    root, _store, ref = _selection_store()
+    status = inspect_artifact(root, ref)
+
+    def plan() -> Any:
+        return feature_selection._feature_selection_plan(
+            root,
+            assay="RNA",
+            n_features=4,
+            ordered_feature_ids_fingerprint=fingerprint_stored_strings(
+                root["RNA/featureData/ids"]
+            ),
+            operation="set_feature_selection",
+            parameters=status.parameters or {},
+            inputs={"all_features": status.input_ref("all_features")},
+            execution_options={},
+        )
+
+    reused = plan()
+    assert reused.reused and reused.ref == ref
+    _store_short_chunk(root, f"{artifact_path(ref)}/values")
+    assert not plan().reused
+
+
+def test_feature_universe_and_empty_selection_contracts() -> None:
     root, _store, ref = _selection_store(np.zeros(4, dtype=bool))
-    indices = feature_selection.read_feature_selection_indices(root, "RNA", ref)
-    assert indices.dtype == np.intp and indices.size == 0
+    # Every reader applies the one rule, so no consumer sees an empty index.
+    for read in (
+        feature_selection.validate_feature_selection,
+        feature_selection.resolve_feature_selection,
+        feature_selection.read_feature_selection_indices,
+    ):
+        with pytest.raises(
+            ArtifactResolutionError, match="at least one feature"
+        ) as caught:
+            read(root, "RNA", ref)
+        assert caught.value.code == "corrupt_payload"
 
     status = inspect_artifact(root, ref)
     parent = ArtifactRef.from_dict((status.inputs or {})["all_features"])
